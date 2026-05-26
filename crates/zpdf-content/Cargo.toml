@@ -1,0 +1,16 @@
+[package]
+name = "zpdf-content"
+description = "PDF content stream tokenizer and operator interpreter"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+authors.workspace = true
+
+[dependencies]
+zpdf-core.workspace = true
+zpdf-document.workspace = true
+zpdf-display-list.workspace = true
+zpdf-font = { workspace = true }
+zpdf-image.workspace = true
+zpdf-color.workspace = true
+tracing.workspace = true

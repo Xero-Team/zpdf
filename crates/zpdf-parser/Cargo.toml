@@ -1,0 +1,13 @@
+[package]
+name = "zpdf-parser"
+description = "PDF file parser: lexer, objects, xref, trailer, stream filters"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+authors.workspace = true
+
+[dependencies]
+zpdf-core.workspace = true
+winnow.workspace = true
+flate2.workspace = true
+tracing.workspace = true

@@ -1,0 +1,53 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/zpdf",
+    "crates/zpdf-core",
+    "crates/zpdf-parser",
+    "crates/zpdf-document",
+    "crates/zpdf-content",
+    "crates/zpdf-display-list",
+    "crates/zpdf-font",
+    "crates/zpdf-image",
+    "crates/zpdf-color",
+    "crates/zpdf-render",
+    "crates/zpdf-render-cpu",
+    "crates/zpdf-render-wgpu",
+    "crates/zpdf-cli",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+version = "0.1.0"
+authors = ["zpdf contributors"]
+
+[workspace.dependencies]
+# internal
+zpdf-core = { path = "crates/zpdf-core", version = "0.1.0" }
+zpdf-parser = { path = "crates/zpdf-parser", version = "0.1.0" }
+zpdf-document = { path = "crates/zpdf-document", version = "0.1.0" }
+zpdf-content = { path = "crates/zpdf-content", version = "0.1.0" }
+zpdf-display-list = { path = "crates/zpdf-display-list", version = "0.1.0" }
+zpdf-font = { path = "crates/zpdf-font", version = "0.1.0" }
+zpdf-image = { path = "crates/zpdf-image", version = "0.1.0" }
+zpdf-color = { path = "crates/zpdf-color", version = "0.1.0" }
+zpdf-render = { path = "crates/zpdf-render", version = "0.1.0" }
+zpdf-render-cpu = { path = "crates/zpdf-render-cpu", version = "0.1.0" }
+zpdf-render-wgpu = { path = "crates/zpdf-render-wgpu", version = "0.1.0" }
+zpdf = { path = "crates/zpdf", version = "0.1.0" }
+
+# external
+thiserror = "2"
+tracing = "0.1"
+smallvec = "1"
+bitflags = "2"
+bytemuck = { version = "1", features = ["derive"] }
+winnow = "0.7"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+zune-jpeg = "0.5"
+image = { version = "0.25", default-features = false, features = ["png"] }
+wgpu = "29"
+lyon = "1"
+tiny-skia = "0.11"
+ttf-parser = "0.25"

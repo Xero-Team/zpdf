@@ -1,0 +1,13 @@
+[package]
+name = "zpdf-document"
+description = "PDF document model: catalog, page tree, resource inheritance"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+authors.workspace = true
+
+[dependencies]
+zpdf-core.workspace = true
+zpdf-parser.workspace = true
+zpdf-font.workspace = true
+tracing.workspace = true

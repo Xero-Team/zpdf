@@ -1,0 +1,11 @@
+[package]
+name = "zpdf-display-list"
+description = "Render-backend-agnostic display list: paths, text, images, clips"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+authors.workspace = true
+
+[dependencies]
+zpdf-core.workspace = true
+smallvec.workspace = true

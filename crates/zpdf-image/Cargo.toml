@@ -1,0 +1,12 @@
+[package]
+name = "zpdf-image"
+description = "PDF image decoding: JPEG, JPEG2000, CCITT, Flate, image masks"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+authors.workspace = true
+
+[dependencies]
+zpdf-core.workspace = true
+zune-jpeg.workspace = true
+tracing.workspace = true

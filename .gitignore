@@ -1,0 +1,10 @@
+/target
+/wgpu
+/tests
+/.claude
+Cargo.lock
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db

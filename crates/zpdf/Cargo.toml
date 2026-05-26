@@ -1,0 +1,25 @@
+[package]
+name = "zpdf"
+description = "Pure Rust PDF parsing library with wgpu GPU rendering"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+authors.workspace = true
+
+[features]
+default = ["cpu-render"]
+cpu-render = ["dep:zpdf-render-cpu"]
+gpu-render = ["dep:zpdf-render-wgpu"]
+
+[dependencies]
+zpdf-core.workspace = true
+zpdf-parser.workspace = true
+zpdf-document.workspace = true
+zpdf-content.workspace = true
+zpdf-display-list.workspace = true
+zpdf-font.workspace = true
+zpdf-image.workspace = true
+zpdf-color.workspace = true
+zpdf-render.workspace = true
+zpdf-render-cpu = { workspace = true, optional = true }
+zpdf-render-wgpu = { workspace = true, optional = true }

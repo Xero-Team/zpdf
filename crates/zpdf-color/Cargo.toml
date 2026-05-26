@@ -1,0 +1,10 @@
+[package]
+name = "zpdf-color"
+description = "PDF color spaces: DeviceRGB/CMYK/Gray, ICC, Lab, Indexed"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+authors.workspace = true
+
+[dependencies]
+zpdf-core.workspace = true

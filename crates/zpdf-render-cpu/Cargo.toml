@@ -1,0 +1,17 @@
+[package]
+name = "zpdf-render-cpu"
+description = "CPU reference renderer using tiny-skia"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+authors.workspace = true
+
+[dependencies]
+zpdf-core.workspace = true
+zpdf-content.workspace = true
+zpdf-display-list.workspace = true
+zpdf-font.workspace = true
+zpdf-render.workspace = true
+tiny-skia.workspace = true
+image.workspace = true
+thiserror.workspace = true

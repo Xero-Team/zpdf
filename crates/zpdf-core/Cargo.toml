@@ -1,0 +1,11 @@
+[package]
+name = "zpdf-core"
+description = "Core types for zpdf: PDF object model, geometry, errors"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+authors.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+smallvec.workspace = true

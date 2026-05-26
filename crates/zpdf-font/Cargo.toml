@@ -1,0 +1,12 @@
+[package]
+name = "zpdf-font"
+description = "PDF font engine: Type1, TrueType, CIDFont, CMap, ToUnicode"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+authors.workspace = true
+
+[dependencies]
+zpdf-core.workspace = true
+tracing.workspace = true
+ttf-parser.workspace = true

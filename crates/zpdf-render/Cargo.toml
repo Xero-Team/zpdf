@@ -1,0 +1,11 @@
+[package]
+name = "zpdf-render"
+description = "Backend-agnostic render trait for zpdf"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+authors.workspace = true
+
+[dependencies]
+zpdf-core.workspace = true
+zpdf-display-list.workspace = true
