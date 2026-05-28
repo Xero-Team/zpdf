@@ -139,7 +139,11 @@ fn cmd_render(args: &[String]) -> zpdf::Result<()> {
     println!("  Content stream: {} bytes decoded", content_bytes.len());
 
     // Interpret content stream → display list
-    let interpreter = zpdf::ContentInterpreter::new(page.media_box).with_fonts(&font_cache);
+    let mut image_cache = zpdf::ImageCache::new();
+    let interpreter = zpdf::ContentInterpreter::new(page.media_box)
+        .with_fonts(&font_cache)
+        .with_document(doc.file(), &page.resources)
+        .with_images(&mut image_cache);
     let display_list = interpreter.interpret(&content_bytes);
     println!("  Display list: {} commands", display_list.commands.len());
 
@@ -148,21 +152,25 @@ fn cmd_render(args: &[String]) -> zpdf::Result<()> {
     let mut strokes = 0;
     let mut glyphs = 0;
     let mut clips = 0;
+    let mut images = 0;
     for cmd in &display_list.commands {
         match cmd {
             zpdf::display_list::RenderCommand::FillPath { .. } => fills += 1,
             zpdf::display_list::RenderCommand::StrokePath { .. } => strokes += 1,
             zpdf::display_list::RenderCommand::DrawGlyphRun(_) => glyphs += 1,
             zpdf::display_list::RenderCommand::PushClip { .. } => clips += 1,
+            zpdf::display_list::RenderCommand::DrawImage(_) => images += 1,
             _ => {}
         }
     }
-    println!("    Fills: {fills}, Strokes: {strokes}, Glyph runs: {glyphs}, Clips: {clips}");
+    println!("    Fills: {fills}, Strokes: {strokes}, Glyph runs: {glyphs}, Clips: {clips}, Images: {images}");
 
     // Render with CPU backend
     use zpdf::RenderBackend;
     let scale = dpi / 72.0;
-    let mut renderer = zpdf::cpu::CpuRenderer::new().with_fonts(&font_cache);
+    let mut renderer = zpdf::cpu::CpuRenderer::new()
+        .with_fonts(&font_cache)
+        .with_images(&image_cache);
     let rendered: zpdf::cpu::RenderedPage = renderer
         .render_display_list(&display_list, scale)
         .map_err(|e| zpdf::Error::StreamDecode(e.to_string()))?;

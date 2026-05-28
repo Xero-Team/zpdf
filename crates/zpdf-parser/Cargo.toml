@@ -10,4 +10,5 @@ authors.workspace = true
 zpdf-core.workspace = true
 winnow.workspace = true
 flate2.workspace = true
+zune-jpeg.workspace = true
 tracing.workspace = true

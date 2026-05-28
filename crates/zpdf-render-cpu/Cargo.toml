@@ -11,6 +11,7 @@ zpdf-core.workspace = true
 zpdf-content.workspace = true
 zpdf-display-list.workspace = true
 zpdf-font.workspace = true
+zpdf-image.workspace = true
 zpdf-render.workspace = true
 tiny-skia.workspace = true
 image.workspace = true

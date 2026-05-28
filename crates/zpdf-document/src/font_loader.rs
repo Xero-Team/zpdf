@@ -168,17 +168,29 @@ fn load_type3_font(
         units_per_em: 1000.0,
         ascent: 880.0,
         descent: -120.0,
+        cid_to_gid: None,
     };
 
     Ok(font)
 }
 
 fn load_type1_font(
-    _file: &PdfFile,
+    file: &PdfFile,
     dict: &zpdf_core::PdfDict,
     base_font: String,
 ) -> Result<LoadedFont> {
-    Ok(LoadedFont::new_placeholder(base_font))
+    let cid_widths = parse_simple_widths(dict);
+    let font_data = extract_font_file_from_descriptor(file, dict);
+
+    match font_data {
+        Some(data) => Ok(LoadedFont::new_with_data(
+            PdfFontType::Type1,
+            base_font,
+            data,
+            cid_widths,
+        )),
+        None => Ok(LoadedFont::new_placeholder(base_font)),
+    }
 }
 
 /// Extract embedded font binary from FontDescriptor → FontFile2 (TrueType).

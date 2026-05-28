@@ -1,6 +1,9 @@
 use zpdf_core::{Matrix, PdfObject, Point, Rect};
 use zpdf_display_list::*;
+use zpdf_document::page::ResourceDict;
 use zpdf_font::FontCache;
+use zpdf_image::ImageCache;
+use zpdf_parser::PdfFile;
 
 use crate::tokenizer::{ContentToken, ContentTokenizer};
 
@@ -16,6 +19,30 @@ pub struct ContentInterpreter<'a> {
     text_line_matrix: Matrix,
     font_cache: Option<&'a FontCache>,
     current_font_id: Option<zpdf_font::FontId>,
+    file: Option<&'a PdfFile>,
+    resources: Option<&'a ResourceDict>,
+    image_cache: Option<&'a mut ImageCache>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ActiveColorSpace {
+    DeviceGray,
+    DeviceRGB,
+    DeviceCMYK,
+    ICCBased(u8),
+    Pattern,
+}
+
+impl ActiveColorSpace {
+    fn components(&self) -> usize {
+        match self {
+            Self::DeviceGray => 1,
+            Self::DeviceRGB => 3,
+            Self::DeviceCMYK => 4,
+            Self::ICCBased(n) => *n as usize,
+            Self::Pattern => 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -38,6 +65,9 @@ struct GraphicsState {
     leading: f32,
     rise: f32,
     render_mode: u8,
+    clip_depth: u32,
+    fill_cs: ActiveColorSpace,
+    stroke_cs: ActiveColorSpace,
 }
 
 impl Default for GraphicsState {
@@ -61,6 +91,9 @@ impl Default for GraphicsState {
             leading: 0.0,
             rise: 0.0,
             render_mode: 0,
+            clip_depth: 0,
+            fill_cs: ActiveColorSpace::DeviceGray,
+            stroke_cs: ActiveColorSpace::DeviceGray,
         }
     }
 }
@@ -78,11 +111,25 @@ impl<'a> ContentInterpreter<'a> {
             text_line_matrix: Matrix::identity(),
             font_cache: None,
             current_font_id: None,
+            file: None,
+            resources: None,
+            image_cache: None,
         }
     }
 
     pub fn with_fonts(mut self, cache: &'a FontCache) -> Self {
         self.font_cache = Some(cache);
+        self
+    }
+
+    pub fn with_document(mut self, file: &'a PdfFile, resources: &'a ResourceDict) -> Self {
+        self.file = Some(file);
+        self.resources = Some(resources);
+        self
+    }
+
+    pub fn with_images(mut self, cache: &'a mut ImageCache) -> Self {
+        self.image_cache = Some(cache);
         self
     }
 
@@ -138,8 +185,15 @@ impl<'a> ContentInterpreter<'a> {
     fn execute_operator(&mut self, op: &str) {
         match op {
             // -- Graphics state --
-            "q" => self.state_stack.push(self.current.clone()),
+            "q" => {
+                self.state_stack.push(self.current.clone());
+                self.current.clip_depth = 0;
+            }
             "Q" => {
+                // Pop any clips that were pushed in this state level
+                for _ in 0..self.current.clip_depth {
+                    self.display_list.push(RenderCommand::PopClip);
+                }
                 if let Some(state) = self.state_stack.pop() {
                     self.current = state;
                 }
@@ -184,8 +238,12 @@ impl<'a> ContentInterpreter<'a> {
                     }
                 }
             }
-            "i" | "ri" | "gs" => {
-                // flatness, rendering intent, ExtGState - consume operands
+            "i" | "ri" => {
+                // flatness, rendering intent - consume operands
+            }
+            "gs" => {
+                let name = self.pop_name();
+                self.apply_ext_gstate(&name);
             }
 
             // -- Path construction --
@@ -273,18 +331,20 @@ impl<'a> ContentInterpreter<'a> {
 
             // -- Clipping --
             "W" => {
-                let path = self.current_path.clone();
+                let path = self.transform_path_to_page_space(&self.current_path.clone());
                 self.display_list.push(RenderCommand::PushClip {
                     path,
                     rule: FillRule::NonZero,
                 });
+                self.current.clip_depth += 1;
             }
             "W*" => {
-                let path = self.current_path.clone();
+                let path = self.transform_path_to_page_space(&self.current_path.clone());
                 self.display_list.push(RenderCommand::PushClip {
                     path,
                     rule: FillRule::EvenOdd,
                 });
+                self.current.clip_depth += 1;
             }
 
             // -- Color --
@@ -328,8 +388,19 @@ impl<'a> ContentInterpreter<'a> {
                 let b = (1.0 - y_val) * (1.0 - k_val);
                 self.current.stroke_color = Color::rgb(r, g, b);
             }
-            "cs" | "CS" | "sc" | "SC" | "scn" | "SCN" => {
-                // Named/complex color spaces - consume operands, use black fallback
+            "cs" => {
+                let name = self.pop_name();
+                self.current.fill_cs = self.resolve_color_space(&name);
+            }
+            "CS" => {
+                let name = self.pop_name();
+                self.current.stroke_cs = self.resolve_color_space(&name);
+            }
+            "sc" | "scn" => {
+                self.current.fill_color = self.pop_color(self.current.fill_cs);
+            }
+            "SC" | "SCN" => {
+                self.current.stroke_color = self.pop_color(self.current.stroke_cs);
             }
 
             // -- Text --
@@ -434,9 +505,8 @@ impl<'a> ContentInterpreter<'a> {
 
             // -- XObject --
             "Do" => {
-                // Consume XObject name
-                let _name = self.pop_name();
-                // TODO: resolve XObject and render
+                let name = self.pop_name();
+                self.execute_do(&name);
             }
 
             // -- Type3 glyph operators --
@@ -454,6 +524,344 @@ impl<'a> ContentInterpreter<'a> {
         }
     }
 
+    fn resolve_color_space(&self, name: &str) -> ActiveColorSpace {
+        match name {
+            "DeviceGray" | "G" => ActiveColorSpace::DeviceGray,
+            "DeviceRGB" | "RGB" => ActiveColorSpace::DeviceRGB,
+            "DeviceCMYK" | "CMYK" => ActiveColorSpace::DeviceCMYK,
+            "Pattern" => ActiveColorSpace::Pattern,
+            _ => {
+                // Look up in resources.color_spaces → resolve the array
+                let (file, resources) = match (self.file, self.resources) {
+                    (Some(f), Some(r)) => (f, r),
+                    _ => return ActiveColorSpace::DeviceGray,
+                };
+                let cs_id = match resources.color_spaces.get(name) {
+                    Some(&id) => id,
+                    None => return ActiveColorSpace::DeviceGray,
+                };
+                let obj = match file.resolve(cs_id) {
+                    Ok(o) => o,
+                    Err(_) => return ActiveColorSpace::DeviceGray,
+                };
+                match &obj {
+                    PdfObject::Name(n) => self.resolve_color_space(&n.0),
+                    PdfObject::Array(arr) => {
+                        if let Some(PdfObject::Name(cs_name)) = arr.first() {
+                            match cs_name.as_str() {
+                                "ICCBased" => {
+                                    // arr[1] is a ref to ICC profile stream with /N components
+                                    if let Some(PdfObject::Ref(r)) = arr.get(1) {
+                                        if let Ok(icc_obj) = file.resolve(*r) {
+                                            if let Ok(icc_dict) = icc_obj.as_dict() {
+                                                let n = icc_dict.get_i64("N").unwrap_or(3) as u8;
+                                                return ActiveColorSpace::ICCBased(n);
+                                            }
+                                            if let Ok(icc_stream) = icc_obj.as_stream() {
+                                                let n = icc_stream.dict.get_i64("N").unwrap_or(3) as u8;
+                                                return ActiveColorSpace::ICCBased(n);
+                                            }
+                                        }
+                                    }
+                                    ActiveColorSpace::ICCBased(3)
+                                }
+                                "Separation" => {
+                                    // Separation spaces have 1 component (tint)
+                                    ActiveColorSpace::DeviceGray
+                                }
+                                "DeviceN" => {
+                                    // DeviceN: arr[1] is names array
+                                    if let Some(PdfObject::Array(names)) = arr.get(1) {
+                                        ActiveColorSpace::ICCBased(names.len() as u8)
+                                    } else {
+                                        ActiveColorSpace::DeviceRGB
+                                    }
+                                }
+                                "Indexed" | "I" => {
+                                    // Indexed: 1 component (index byte)
+                                    ActiveColorSpace::DeviceGray
+                                }
+                                "CalGray" => ActiveColorSpace::DeviceGray,
+                                "CalRGB" => ActiveColorSpace::DeviceRGB,
+                                "Lab" => ActiveColorSpace::ICCBased(3),
+                                _ => ActiveColorSpace::DeviceGray,
+                            }
+                        } else {
+                            ActiveColorSpace::DeviceGray
+                        }
+                    }
+                    _ => ActiveColorSpace::DeviceGray,
+                }
+            }
+        }
+    }
+
+    fn pop_color(&mut self, cs: ActiveColorSpace) -> Color {
+        let n = cs.components();
+        let mut vals = Vec::with_capacity(n);
+        for _ in 0..n {
+            vals.push(self.pop_f64() as f32);
+        }
+        vals.reverse();
+
+        match cs {
+            ActiveColorSpace::DeviceGray => {
+                let g = vals.first().copied().unwrap_or(0.0);
+                Color::gray(g)
+            }
+            ActiveColorSpace::DeviceRGB | ActiveColorSpace::ICCBased(3) => {
+                let r = vals.first().copied().unwrap_or(0.0);
+                let g = vals.get(1).copied().unwrap_or(0.0);
+                let b = vals.get(2).copied().unwrap_or(0.0);
+                Color::rgb(r, g, b)
+            }
+            ActiveColorSpace::DeviceCMYK | ActiveColorSpace::ICCBased(4) => {
+                let c = vals.first().copied().unwrap_or(0.0);
+                let m = vals.get(1).copied().unwrap_or(0.0);
+                let y = vals.get(2).copied().unwrap_or(0.0);
+                let k = vals.get(3).copied().unwrap_or(0.0);
+                Color::rgb(
+                    (1.0 - c) * (1.0 - k),
+                    (1.0 - m) * (1.0 - k),
+                    (1.0 - y) * (1.0 - k),
+                )
+            }
+            ActiveColorSpace::ICCBased(1) => {
+                let g = vals.first().copied().unwrap_or(0.0);
+                Color::gray(g)
+            }
+            ActiveColorSpace::ICCBased(_) => {
+                // Unknown component count — best-effort: treat as gray from first component
+                let g = vals.first().copied().unwrap_or(0.0);
+                Color::gray(g)
+            }
+            ActiveColorSpace::Pattern => {
+                // Pattern color — operand is a pattern name, not numeric
+                // Pop the name that was pushed as operand
+                Color::black()
+            }
+        }
+    }
+
+    fn apply_ext_gstate(&mut self, name: &str) {
+        let (file, resources) = match (self.file, self.resources) {
+            (Some(f), Some(r)) => (f, r),
+            _ => return,
+        };
+
+        let gs_id = match resources.ext_g_state.get(name) {
+            Some(&id) => id,
+            None => return,
+        };
+
+        let obj = match file.resolve(gs_id) {
+            Ok(o) => o,
+            Err(_) => return,
+        };
+
+        let dict = match obj.as_dict() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+
+        // ca — non-stroking (fill) alpha
+        if let Ok(a) = dict.get_f64("ca") {
+            self.current.fill_alpha = a as f32;
+        }
+        // CA — stroking alpha
+        if let Ok(a) = dict.get_f64("CA") {
+            self.current.stroke_alpha = a as f32;
+        }
+        // LW — line width
+        if let Ok(w) = dict.get_f64("LW") {
+            self.current.line_width = w as f32;
+        }
+        // LC — line cap
+        if let Ok(c) = dict.get_i64("LC") {
+            self.current.line_cap = match c as u8 {
+                1 => LineCap::Round,
+                2 => LineCap::Square,
+                _ => LineCap::Butt,
+            };
+        }
+        // LJ — line join
+        if let Ok(j) = dict.get_i64("LJ") {
+            self.current.line_join = match j as u8 {
+                1 => LineJoin::Round,
+                2 => LineJoin::Bevel,
+                _ => LineJoin::Miter,
+            };
+        }
+        // ML — miter limit
+        if let Ok(m) = dict.get_f64("ML") {
+            self.current.miter_limit = m as f32;
+        }
+    }
+
+    fn execute_do(&mut self, name: &str) {
+        let (file, resources) = match (self.file, self.resources) {
+            (Some(f), Some(r)) => (f, r),
+            _ => return,
+        };
+
+        let xobj_id = match resources.xobjects.get(name) {
+            Some(&id) => id,
+            None => {
+                tracing::warn!("XObject not found: {name}");
+                return;
+            }
+        };
+
+        let obj = match file.resolve(xobj_id) {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::warn!("failed to resolve XObject {name}: {e}");
+                return;
+            }
+        };
+
+        let stream = match obj.as_stream() {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+
+        let subtype = stream.dict.get_name("Subtype").unwrap_or_default();
+
+        match &*subtype {
+            "Image" => self.do_image_xobject(xobj_id, stream),
+            "Form" => self.do_form_xobject(stream, file),
+            _ => {
+                tracing::warn!("unknown XObject subtype: {subtype}");
+            }
+        }
+    }
+
+    fn do_image_xobject(&mut self, obj_id: zpdf_core::ObjectId, stream: &zpdf_core::PdfStream) {
+        let file = match self.file {
+            Some(f) => f,
+            None => return,
+        };
+
+        let decoded_data = match file.resolve_stream_data(obj_id) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!("failed to decode image stream: {e}");
+                return;
+            }
+        };
+
+        let image = match zpdf_image::decode_image_xobject(&decoded_data, &stream.dict) {
+            Ok(img) => img,
+            Err(e) => {
+                tracing::warn!("failed to decode image: {e}");
+                return;
+            }
+        };
+
+        // Handle SMask (soft mask for transparency)
+        if let Ok(smask_ref) = stream.dict.get_ref("SMask") {
+            if let Ok(smask_obj) = file.resolve(smask_ref) {
+                if let Ok(smask_stream) = smask_obj.as_stream() {
+                    let smask_w = smask_stream.dict.get_i64("Width").unwrap_or(0) as u32;
+                    let smask_h = smask_stream.dict.get_i64("Height").unwrap_or(0) as u32;
+                    if let Ok(smask_data) = file.resolve_stream_data(smask_ref) {
+                        let mut img = image;
+                        zpdf_image::apply_smask(&mut img, &smask_data, smask_w, smask_h);
+                        self.emit_draw_image(img);
+                        return;
+                    }
+                }
+            }
+        }
+
+        self.emit_draw_image(image);
+    }
+
+    fn emit_draw_image(&mut self, image: zpdf_image::DecodedImage) {
+        let image_cache = match self.image_cache.as_mut() {
+            Some(c) => c,
+            None => return,
+        };
+        let image_id = image_cache.insert(image);
+        self.display_list.push(RenderCommand::DrawImage(ImageDraw {
+            image_id,
+            transform: self.current.ctm,
+            alpha: self.current.fill_alpha,
+        }));
+    }
+
+    fn do_form_xobject(&mut self, stream: &zpdf_core::PdfStream, _file: &PdfFile) {
+        let decoded = match zpdf_parser::filters::decode_stream(&stream.data, &stream.dict) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!("failed to decode form XObject: {e}");
+                return;
+            }
+        };
+
+        // Apply the form's Matrix if present
+        let form_matrix = if let Ok(arr) = stream.dict.get_array("Matrix") {
+            let vals: Vec<f64> = arr.iter().filter_map(|o| o.as_f64().ok()).collect();
+            if vals.len() == 6 {
+                Matrix::new(vals[0], vals[1], vals[2], vals[3], vals[4], vals[5])
+            } else {
+                Matrix::identity()
+            }
+        } else {
+            Matrix::identity()
+        };
+
+        // Save state, apply form matrix, interpret content, restore
+        self.state_stack.push(self.current.clone());
+        self.current.ctm = self.current.ctm.concat(&form_matrix);
+
+        let tokenizer = ContentTokenizer::new(&decoded);
+        for token in tokenizer {
+            match token {
+                ContentToken::Operand(obj) => {
+                    self.operand_stack.push(obj);
+                }
+                ContentToken::Operator(op) => {
+                    self.execute_operator(&op);
+                    self.operand_stack.clear();
+                }
+            }
+        }
+
+        if let Some(state) = self.state_stack.pop() {
+            self.current = state;
+        }
+    }
+
+    fn transform_path_to_page_space(&self, path: &Path) -> Path {
+        let ctm = &self.current.ctm;
+        if *ctm == Matrix::identity() {
+            return path.clone();
+        }
+        let mut result = Path::new();
+        for elem in &path.elements {
+            match *elem {
+                PathElement::MoveTo(p) => {
+                    result.move_to(p.transform(ctm));
+                }
+                PathElement::LineTo(p) => {
+                    result.line_to(p.transform(ctm));
+                }
+                PathElement::CurveTo(c1, c2, end) => {
+                    result.curve_to(
+                        c1.transform(ctm),
+                        c2.transform(ctm),
+                        end.transform(ctm),
+                    );
+                }
+                PathElement::Close => {
+                    result.close();
+                }
+            }
+        }
+        result
+    }
+
     fn current_point(&self) -> Point {
         for elem in self.current_path.elements.iter().rev() {
             match *elem {
@@ -466,19 +874,31 @@ impl<'a> ContentInterpreter<'a> {
         Point::zero()
     }
 
+    fn ctm_scale_factor(&self) -> f32 {
+        let ctm = &self.current.ctm;
+        ((ctm.a * ctm.a + ctm.b * ctm.b).sqrt() as f32
+            + (ctm.c * ctm.c + ctm.d * ctm.d).sqrt() as f32)
+            / 2.0
+    }
+
     fn paint_stroke(&mut self) {
         let path = std::mem::take(&mut self.current_path);
         if path.is_empty() {
             return;
         }
+        let page_path = self.transform_path_to_page_space(&path);
+        let scale = self.ctm_scale_factor();
         self.display_list.push(RenderCommand::StrokePath {
-            path,
+            path: page_path,
             style: StrokeStyle {
-                width: self.current.line_width,
+                width: self.current.line_width * scale,
                 cap: self.current.line_cap,
                 join: self.current.line_join,
                 miter_limit: self.current.miter_limit,
-                dash: self.current.dash.clone(),
+                dash: self.current.dash.as_ref().map(|d| DashPattern {
+                    array: d.array.iter().map(|v| v * scale).collect(),
+                    phase: d.phase * scale,
+                }),
             },
             paint: Paint::Solid(self.current.stroke_color),
             alpha: self.current.stroke_alpha,
@@ -490,8 +910,9 @@ impl<'a> ContentInterpreter<'a> {
         if path.is_empty() {
             return;
         }
+        let page_path = self.transform_path_to_page_space(&path);
         self.display_list.push(RenderCommand::FillPath {
-            path,
+            path: page_path,
             rule,
             paint: Paint::Solid(self.current.fill_color),
             alpha: self.current.fill_alpha,
@@ -503,20 +924,25 @@ impl<'a> ContentInterpreter<'a> {
         if path.is_empty() {
             return;
         }
+        let page_path = self.transform_path_to_page_space(&path);
+        let scale = self.ctm_scale_factor();
         self.display_list.push(RenderCommand::FillPath {
-            path: path.clone(),
+            path: page_path.clone(),
             rule,
             paint: Paint::Solid(self.current.fill_color),
             alpha: self.current.fill_alpha,
         });
         self.display_list.push(RenderCommand::StrokePath {
-            path,
+            path: page_path,
             style: StrokeStyle {
-                width: self.current.line_width,
+                width: self.current.line_width * scale,
                 cap: self.current.line_cap,
                 join: self.current.line_join,
                 miter_limit: self.current.miter_limit,
-                dash: self.current.dash.clone(),
+                dash: self.current.dash.as_ref().map(|d| DashPattern {
+                    array: d.array.iter().map(|v| v * scale).collect(),
+                    phase: d.phase * scale,
+                }),
             },
             paint: Paint::Solid(self.current.stroke_color),
             alpha: self.current.stroke_alpha,

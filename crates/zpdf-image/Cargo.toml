@@ -10,3 +10,5 @@ authors.workspace = true
 zpdf-core.workspace = true
 zune-jpeg.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]

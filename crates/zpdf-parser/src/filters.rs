@@ -35,6 +35,7 @@ fn apply_filter(filter: &PdfName, data: &[u8]) -> Result<Vec<u8>> {
         "ASCIIHexDecode" | "AHx" => decode_ascii_hex(data),
         "ASCII85Decode" | "A85" => decode_ascii85(data),
         "RunLengthDecode" | "RL" => decode_run_length(data),
+        "DCTDecode" | "DCT" => decode_dct(data),
         other => Err(Error::UnsupportedFilter(other.to_string())),
     }
 }
@@ -140,6 +141,14 @@ fn decode_ascii85(data: &[u8]) -> Result<Vec<u8>> {
     }
 
     Ok(output)
+}
+
+fn decode_dct(data: &[u8]) -> Result<Vec<u8>> {
+    use zune_jpeg::JpegDecoder;
+    let mut decoder = JpegDecoder::new(std::io::Cursor::new(data));
+    decoder
+        .decode()
+        .map_err(|e| Error::StreamDecode(format!("DCTDecode: {e}")))
 }
 
 fn decode_run_length(data: &[u8]) -> Result<Vec<u8>> {

@@ -8,6 +8,7 @@ authors.workspace = true
 
 [dependencies]
 zpdf-core.workspace = true
+zpdf-parser.workspace = true
 zpdf-document.workspace = true
 zpdf-display-list.workspace = true
 zpdf-font = { workspace = true }

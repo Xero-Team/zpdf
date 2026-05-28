@@ -1,6 +1,6 @@
-use zpdf_core::Rect;
 use zpdf_display_list::*;
 use zpdf_font::{FontCache, GlyphOutline, OutlineCommand};
+use zpdf_image::ImageCache;
 use zpdf_render::{PageRenderInfo, RenderBackend};
 
 pub struct CpuRenderer<'a> {
@@ -8,6 +8,15 @@ pub struct CpuRenderer<'a> {
     scale: f32,
     page_height: f32,
     font_cache: Option<&'a FontCache>,
+    image_cache: Option<&'a ImageCache>,
+    clip_stack: Vec<tiny_skia::Mask>,
+    current_clip: Option<tiny_skia::Mask>,
+    blend_stack: Vec<BlendEntry>,
+}
+
+struct BlendEntry {
+    pixmap: tiny_skia::Pixmap,
+    blend_mode: BlendMode,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -27,11 +36,20 @@ impl<'a> CpuRenderer<'a> {
             scale: 1.0,
             page_height: 0.0,
             font_cache: None,
+            image_cache: None,
+            clip_stack: Vec::new(),
+            current_clip: None,
+            blend_stack: Vec::new(),
         }
     }
 
     pub fn with_fonts(mut self, cache: &'a FontCache) -> Self {
         self.font_cache = Some(cache);
+        self
+    }
+
+    pub fn with_images(mut self, cache: &'a ImageCache) -> Self {
+        self.image_cache = Some(cache);
         self
     }
 
@@ -112,7 +130,7 @@ impl<'a> CpuRenderer<'a> {
                 &paint,
                 fill_rule,
                 tiny_skia::Transform::identity(),
-                None,
+                self.current_clip.as_ref(),
             );
         }
     }
@@ -152,7 +170,7 @@ impl<'a> CpuRenderer<'a> {
                 &paint,
                 &stroke,
                 tiny_skia::Transform::identity(),
-                None,
+                self.current_clip.as_ref(),
             );
         }
     }
@@ -180,6 +198,231 @@ impl<'a> CpuRenderer<'a> {
         } else {
             self.render_outline_glyphs(run, font, &paint);
         }
+    }
+
+    fn push_clip(&mut self, path: &Path, rule: &FillRule) {
+        let pixmap = match self.pixmap.as_ref() {
+            Some(p) => p,
+            None => return,
+        };
+
+        let Some(skia_path) = self.build_skia_path(path) else {
+            return;
+        };
+
+        let mut mask = tiny_skia::Mask::new(pixmap.width(), pixmap.height())
+            .unwrap_or_else(|| tiny_skia::Mask::new(1, 1).unwrap());
+
+        mask.fill_path(
+            &skia_path,
+            Self::fill_rule_to_skia(rule),
+            false,
+            tiny_skia::Transform::identity(),
+        );
+
+        // Intersect with current clip if any
+        if let Some(ref current) = self.current_clip {
+            let current_data = current.data();
+            let mask_data = mask.data_mut();
+            for (m, c) in mask_data.iter_mut().zip(current_data.iter()) {
+                *m = ((*m as u16 * *c as u16) / 255) as u8;
+            }
+        }
+
+        // Save current clip and set new one
+        if let Some(old) = self.current_clip.take() {
+            self.clip_stack.push(old);
+        } else {
+            // Push a sentinel empty entry to know we had no clip before
+            let sentinel = tiny_skia::Mask::new(1, 1).unwrap();
+            self.clip_stack.push(sentinel);
+        }
+        self.current_clip = Some(mask);
+    }
+
+    fn pop_clip(&mut self) {
+        if let Some(prev) = self.clip_stack.pop() {
+            if prev.width() == 1 && prev.height() == 1 {
+                self.current_clip = None;
+            } else {
+                self.current_clip = Some(prev);
+            }
+        } else {
+            self.current_clip = None;
+        }
+    }
+
+    fn push_blend_group(&mut self, blend_mode: BlendMode) {
+        let pixmap = match self.pixmap.take() {
+            Some(p) => p,
+            None => return,
+        };
+        let w = pixmap.width();
+        let h = pixmap.height();
+
+        self.blend_stack.push(BlendEntry {
+            pixmap,
+            blend_mode,
+        });
+
+        self.pixmap = tiny_skia::Pixmap::new(w, h);
+    }
+
+    fn pop_blend_group(&mut self) {
+        let entry = match self.blend_stack.pop() {
+            Some(e) => e,
+            None => return,
+        };
+
+        let group_pixmap = match self.pixmap.take() {
+            Some(p) => p,
+            None => {
+                self.pixmap = Some(entry.pixmap);
+                return;
+            }
+        };
+
+        let mut base = entry.pixmap;
+        let blend = Self::blend_mode_to_skia(entry.blend_mode);
+
+        let paint = tiny_skia::PixmapPaint {
+            blend_mode: blend,
+            ..Default::default()
+        };
+
+        base.draw_pixmap(
+            0,
+            0,
+            group_pixmap.as_ref(),
+            &paint,
+            tiny_skia::Transform::identity(),
+            None,
+        );
+
+        self.pixmap = Some(base);
+    }
+
+    fn blend_mode_to_skia(mode: BlendMode) -> tiny_skia::BlendMode {
+        match mode {
+            BlendMode::Normal => tiny_skia::BlendMode::SourceOver,
+            BlendMode::Multiply => tiny_skia::BlendMode::Multiply,
+            BlendMode::Screen => tiny_skia::BlendMode::Screen,
+            BlendMode::Overlay => tiny_skia::BlendMode::Overlay,
+            BlendMode::Darken => tiny_skia::BlendMode::Darken,
+            BlendMode::Lighten => tiny_skia::BlendMode::Lighten,
+            BlendMode::ColorDodge => tiny_skia::BlendMode::ColorDodge,
+            BlendMode::ColorBurn => tiny_skia::BlendMode::ColorBurn,
+            BlendMode::HardLight => tiny_skia::BlendMode::HardLight,
+            BlendMode::SoftLight => tiny_skia::BlendMode::SoftLight,
+            BlendMode::Difference => tiny_skia::BlendMode::Difference,
+            BlendMode::Exclusion => tiny_skia::BlendMode::Exclusion,
+            BlendMode::Hue => tiny_skia::BlendMode::Hue,
+            BlendMode::Saturation => tiny_skia::BlendMode::Saturation,
+            BlendMode::Color => tiny_skia::BlendMode::Color,
+            BlendMode::Luminosity => tiny_skia::BlendMode::Luminosity,
+        }
+    }
+
+    fn render_image(&mut self, draw: &ImageDraw) {
+        let image_cache = match self.image_cache {
+            Some(c) => c,
+            None => return,
+        };
+        let image = match image_cache.get(draw.image_id) {
+            Some(img) => img,
+            None => return,
+        };
+        let pixmap = match self.pixmap.as_mut() {
+            Some(p) => p,
+            None => return,
+        };
+
+        let src = match tiny_skia::PixmapRef::from_bytes(&image.data, image.width, image.height) {
+            Some(p) => p,
+            None => return,
+        };
+
+        // PDF images live in a 1x1 unit square, transformed by the CTM.
+        // CTM maps (0,0)→(1,1) in image space to page coordinates.
+        // We need: image_pixel → [0,1] → CTM → page_coords → screen_pixels
+        let tm = &draw.transform;
+        let s = self.scale;
+        let ph = self.page_height;
+        let iw = image.width as f32;
+        let ih = image.height as f32;
+
+        // Build affine: image_pixel_coords → screen_pixel_coords
+        // Step 1: image pixels → unit square: scale by 1/w, 1/h
+        // Step 2: unit square → page coords via CTM (a,b,c,d,e,f)
+        // Step 3: page coords → screen pixels: x*scale, (page_height-y)*scale
+        //
+        // Combined: for image pixel (ix, iy):
+        //   ux = ix/iw, uy = (ih-iy)/ih  (flip Y: image top=0 → PDF bottom)
+        //   px = a*ux + c*uy + e
+        //   py = b*ux + d*uy + f
+        //   sx = px * scale
+        //   sy = (ph - py) * scale
+        //
+        // But if CTM already flips Y, handle that.
+        let ctm_flips_y = tm.d < 0.0 || (tm.d == 0.0 && tm.b != 0.0);
+
+        // tiny-skia Transform is: [sx kx ky sy tx ty]
+        // maps (x,y) → (sx*x + kx*y + tx, ky*x + sy*y + ty)
+        //
+        // We need: (ix, iy) image pixel →
+        //   ux = ix/iw, uy = 1 - iy/ih
+        //   page_x = a*ux + c*uy + e
+        //   page_y = b*ux + d*uy + f
+        //   screen_x = page_x * s
+        //   screen_y = (ph - page_y) * s   [or page_y*s if CTM flips]
+        //
+        // Compose as a single affine:
+        let (a, b, c, d, e, f) = (
+            tm.a as f32, tm.b as f32, tm.c as f32,
+            tm.d as f32, tm.e as f32, tm.f as f32,
+        );
+
+        let (t_sx, t_kx, t_ky, t_sy, t_tx, t_ty) = if ctm_flips_y {
+            // screen_x = (a * ix/iw + c * (1 - iy/ih) + e) * s
+            //          = (a*s/iw)*ix + (-c*s/ih)*iy + (c + e)*s
+            // screen_y = (b * ix/iw + d * (1 - iy/ih) + f) * s
+            //          = (b*s/iw)*ix + (-d*s/ih)*iy + (d + f)*s
+            (
+                a * s / iw,       // sx: screen_x per ix
+                -c * s / ih,      // kx: screen_x per iy
+                b * s / iw,       // ky: screen_y per ix
+                -d * s / ih,      // sy: screen_y per iy
+                (c + e) * s,      // tx
+                (d + f) * s,      // ty
+            )
+        } else {
+            // screen_x = (a * ix/iw + c * (1 - iy/ih) + e) * s
+            // screen_y = (ph - (b * ix/iw + d * (1 - iy/ih) + f)) * s
+            //          = ph*s - (b*s/iw)*ix - (-d*s/ih)*iy - (d+f)*s
+            //          = (-b*s/iw)*ix + (d*s/ih)*iy + (ph - d - f)*s
+            (
+                a * s / iw,
+                -c * s / ih,
+                -b * s / iw,
+                d * s / ih,
+                (c + e) * s,
+                (ph - d - f) * s,
+            )
+        };
+
+        let transform = tiny_skia::Transform::from_row(t_sx, t_ky, t_kx, t_sy, t_tx, t_ty);
+
+        let mut paint = tiny_skia::PixmapPaint::default();
+        paint.opacity = draw.alpha;
+
+        pixmap.draw_pixmap(
+            0,
+            0,
+            src,
+            &paint,
+            transform,
+            self.current_clip.as_ref(),
+        );
     }
 
     fn render_outline_glyphs(
@@ -210,7 +453,7 @@ impl<'a> CpuRenderer<'a> {
                         paint,
                         tiny_skia::FillRule::Winding,
                         tiny_skia::Transform::identity(),
-                        None,
+                        self.current_clip.as_ref(),
                     );
                 }
             }
@@ -341,7 +584,7 @@ impl<'a> CpuRenderer<'a> {
                                     paint,
                                     Self::fill_rule_to_skia(rule),
                                     tiny_skia::Transform::identity(),
-                                    None,
+                                    self.current_clip.as_ref(),
                                 );
                             }
                         }
@@ -367,7 +610,7 @@ impl<'a> CpuRenderer<'a> {
                                     paint,
                                     &stroke,
                                     tiny_skia::Transform::identity(),
-                                    None,
+                                    self.current_clip.as_ref(),
                                 );
                             }
                         }
@@ -465,52 +708,6 @@ impl<'a> CpuRenderer<'a> {
         (px, py)
     }
 
-    fn build_glyph_path(
-        &self,
-        outline: &GlyphOutline,
-        px: f32,
-        py: f32,
-        scale: f32,
-    ) -> Option<tiny_skia::Path> {
-        let mut pb = tiny_skia::PathBuilder::new();
-
-        for cmd in &outline.commands {
-            match *cmd {
-                OutlineCommand::MoveTo(x, y) => {
-                    pb.move_to(
-                        px + x as f32 * scale,
-                        py - y as f32 * scale, // glyph Y is up, screen Y is down
-                    );
-                }
-                OutlineCommand::LineTo(x, y) => {
-                    pb.line_to(px + x as f32 * scale, py - y as f32 * scale);
-                }
-                OutlineCommand::QuadTo(x1, y1, x, y) => {
-                    pb.quad_to(
-                        px + x1 as f32 * scale,
-                        py - y1 as f32 * scale,
-                        px + x as f32 * scale,
-                        py - y as f32 * scale,
-                    );
-                }
-                OutlineCommand::CurveTo(x1, y1, x2, y2, x, y) => {
-                    pb.cubic_to(
-                        px + x1 as f32 * scale,
-                        py - y1 as f32 * scale,
-                        px + x2 as f32 * scale,
-                        py - y2 as f32 * scale,
-                        px + x as f32 * scale,
-                        py - y as f32 * scale,
-                    );
-                }
-                OutlineCommand::Close => {
-                    pb.close();
-                }
-            }
-        }
-
-        pb.finish()
-    }
 }
 
 impl<'a> Default for CpuRenderer<'a> {
@@ -577,14 +774,20 @@ impl<'a> RenderBackend for CpuRenderer<'a> {
             RenderCommand::DrawGlyphRun(glyph_run) => {
                 self.render_glyph_run(glyph_run);
             }
-            RenderCommand::DrawImage(_image_draw) => {
-                // Phase 2 later: render images
+            RenderCommand::DrawImage(image_draw) => {
+                self.render_image(image_draw);
             }
-            RenderCommand::PushClip { .. } | RenderCommand::PopClip => {
-                // TODO: stencil clip
+            RenderCommand::PushClip { path, rule } => {
+                self.push_clip(path, rule);
             }
-            RenderCommand::PushBlendGroup { .. } | RenderCommand::PopBlendGroup => {
-                // TODO: transparency groups
+            RenderCommand::PopClip => {
+                self.pop_clip();
+            }
+            RenderCommand::PushBlendGroup { blend_mode, .. } => {
+                self.push_blend_group(*blend_mode);
+            }
+            RenderCommand::PopBlendGroup => {
+                self.pop_blend_group();
             }
         }
         Ok(())
