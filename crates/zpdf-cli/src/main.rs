@@ -124,14 +124,15 @@ fn cmd_render(args: &[String]) -> zpdf::Result<()> {
     );
 
     // Load page fonts
-    let font_cache = doc.load_page_fonts(&page);
-    let fonts_with_data = (0..font_cache.len())
+    let mut font_cache = doc.load_page_fonts(&page);
+    let initial_fonts = font_cache.len();
+    let initial_with_data = (0..initial_fonts)
         .filter(|&i| font_cache.get(i as u32).map(|f| f.has_font_data()).unwrap_or(false))
         .count();
     println!(
         "  Fonts loaded: {} ({} with embedded data)",
-        font_cache.len(),
-        fonts_with_data
+        initial_fonts,
+        initial_with_data
     );
 
     // Decode content stream
@@ -141,10 +142,17 @@ fn cmd_render(args: &[String]) -> zpdf::Result<()> {
     // Interpret content stream → display list
     let mut image_cache = zpdf::ImageCache::new();
     let interpreter = zpdf::ContentInterpreter::new(page.media_box)
-        .with_fonts(&font_cache)
+        .with_fonts(&mut font_cache)
         .with_document(doc.file(), &page.resources)
         .with_images(&mut image_cache);
     let display_list = interpreter.interpret(&content_bytes);
+
+    if font_cache.len() > initial_fonts {
+        println!(
+            "  Form XObject fonts: {} additional",
+            font_cache.len() - initial_fonts
+        );
+    }
     println!("  Display list: {} commands", display_list.commands.len());
 
     // Count command types

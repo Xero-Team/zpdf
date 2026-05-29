@@ -23,7 +23,7 @@ pub fn load_page_fonts(file: &PdfFile, page: &PdfPage) -> FontCache {
     cache
 }
 
-fn load_single_font(file: &PdfFile, font_ref: ObjectId) -> Result<LoadedFont> {
+pub fn load_single_font(file: &PdfFile, font_ref: ObjectId) -> Result<LoadedFont> {
     let obj = file.resolve(font_ref)?;
     let dict = obj.as_dict()?;
 
@@ -83,7 +83,8 @@ fn load_truetype_font(
             data,
             cid_widths,
         )),
-        None => Ok(LoadedFont::new_placeholder(base_font)),
+        None => Ok(LoadedFont::new_standard(base_font.clone())
+            .unwrap_or_else(|| LoadedFont::new_placeholder(base_font))),
     }
 }
 
@@ -189,7 +190,8 @@ fn load_type1_font(
             data,
             cid_widths,
         )),
-        None => Ok(LoadedFont::new_placeholder(base_font)),
+        None => Ok(LoadedFont::new_standard(base_font.clone())
+            .unwrap_or_else(|| LoadedFont::new_placeholder(base_font))),
     }
 }
 

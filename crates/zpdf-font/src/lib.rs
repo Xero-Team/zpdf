@@ -1,3 +1,5 @@
+pub mod standard_fonts;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -85,38 +87,68 @@ impl LoadedFont {
             font_data
         };
 
-        let (units_per_em, ascent, descent) = if let Ok(face) =
-            ttf_parser::Face::parse(&font_data, 0)
-        {
-            (
-                face.units_per_em() as f64,
-                face.ascender() as f64,
-                face.descender() as f64,
-            )
-        } else {
-            (1000.0, 800.0, -200.0)
-        };
+        if let Ok(face) = ttf_parser::Face::parse(&font_data, 0) {
+            let units_per_em = face.units_per_em() as f64;
+            let ascent = face.ascender() as f64;
+            let descent = face.descender() as f64;
 
-        let cid_to_gid = if was_raw_cff {
-            match font_type {
-                PdfFontType::Type0CidType2 => build_cff_cid_to_gid_map(&font_data),
-                PdfFontType::Type1 | PdfFontType::TrueType => build_cff_encoding_map(&font_data),
-                _ => None,
+            let cid_to_gid = if was_raw_cff {
+                match font_type {
+                    PdfFontType::Type0CidType2 => build_cff_cid_to_gid_map(&font_data),
+                    PdfFontType::Type1 | PdfFontType::TrueType => {
+                        build_cff_encoding_map(&font_data)
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+
+            Self {
+                font_type,
+                base_font,
+                font_data: Some(Arc::from(font_data)),
+                cid_widths,
+                units_per_em,
+                ascent,
+                descent,
+                cid_to_gid,
             }
         } else {
-            None
-        };
-
-        Self {
-            font_type,
-            base_font,
-            font_data: Some(Arc::from(font_data)),
-            cid_widths,
-            units_per_em,
-            ascent,
-            descent,
-            cid_to_gid,
+            tracing::debug!(
+                "font {base_font}: embedded data not parseable by ttf-parser, using widths only"
+            );
+            Self {
+                font_type,
+                base_font,
+                font_data: None,
+                cid_widths,
+                units_per_em: 1000.0,
+                ascent: 800.0,
+                descent: -200.0,
+                cid_to_gid: None,
+            }
         }
+    }
+
+    pub fn new_standard(base_font: String) -> Option<Self> {
+        let metrics = standard_fonts::lookup(&base_font)?;
+        let mut cid_widths = CidWidths::new(500.0);
+        for (code, &w) in metrics.widths.iter().enumerate() {
+            if w > 0 {
+                cid_widths.set(code as u16, w as f64);
+            }
+        }
+        Some(Self {
+            font_type: PdfFontType::Type1,
+            base_font,
+            font_data: None,
+            cid_widths,
+            units_per_em: 1000.0,
+            ascent: metrics.ascent,
+            descent: metrics.descent,
+            cid_to_gid: None,
+        })
     }
 
     pub fn new_placeholder(base_font: String) -> Self {

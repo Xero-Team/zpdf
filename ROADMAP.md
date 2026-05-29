@@ -20,8 +20,8 @@
 - [x] 传统 xref table 解析
 - [x] Trailer 字典解析
 - [x] `/Prev` 增量更新链追踪
-- [ ] Xref stream 解析（PDF 1.5+, `/Type /XRef`）
-- [ ] Object stream 解析（`/Type /ObjStm`）
+- [x] Xref stream 解析（PDF 1.5+, `/Type /XRef`）
+- [x] Object stream 解析（`/Type /ObjStm`）
 - [ ] 尾部扫描 fallback（损坏 xref 恢复）
 
 ### P1.4 — Stream Filters
@@ -30,7 +30,7 @@
 - [x] ASCIIHexDecode
 - [x] ASCII85Decode
 - [x] RunLengthDecode
-- [ ] DecodeParms / Predictor 支持
+- [x] DecodeParms / Predictor 支持
 
 ### P1.5 — 文档对象模型
 - [x] Catalog 解析
@@ -73,12 +73,12 @@ cargo run -p zpdf-cli -- dump tests/corpus/minimal.pdf 1 0
 - [x] 路径绘制：S/s/f/F/f*/B/B*/b/b*/n
 - [x] 裁剪路径：W/W*
 - [x] 线型状态：w/J/j/M/d
-- [ ] ExtGState (gs) — 部分
+- [x] ExtGState (gs) — ca/CA/LW/LC/LJ/ML
 
 ### P2.3 — 颜色操作
 - [x] DeviceGray/DeviceRGB/DeviceCMYK 设置
-- [ ] CS/cs 颜色空间切换
-- [ ] SC/SCN/sc/scn 颜色值设置
+- [x] CS/cs 颜色空间切换
+- [x] SC/SCN/sc/scn 颜色值设置
 - [x] 快捷操作符：G/g/RG/rg/K/k
 - [x] CMYK → RGB 简单转换
 
@@ -92,17 +92,17 @@ cargo run -p zpdf-cli -- dump tests/corpus/minimal.pdf 1 0
 - [x] TrueType 嵌入字体（ttf-parser 字形轮廓）
 - [x] Type0/CID 字体（Identity-H, FontFile2）
 - [x] CID /W 宽度数组解析
-- [ ] 基础字体：Type1 标准 14 字体
+- [x] 基础字体：Type1 标准 14 字体
 - [ ] Simple Encoding (WinAnsi/MacRoman/custom)
 - [ ] ToUnicode CMap 解析
 
 ### P2.5 — 图像渲染
-- [ ] Image XObject 解析 (Do)
-- [ ] FlateDecode 图像
-- [ ] DCTDecode (JPEG) 图像
-- [ ] Image Mask
-- [ ] 颜色空间 → RGBA 转换
-- [ ] Form XObject 递归解释
+- [x] Image XObject 解析 (Do)
+- [x] FlateDecode 图像
+- [x] DCTDecode (JPEG) 图像
+- [x] Image Mask / SMask
+- [x] 颜色空间 → RGBA 转换
+- [x] Form XObject 递归解释
 
 ### P2.6 — Display List 与 CPU 渲染
 - [x] ContentInterpreter → DisplayList 完整管线
@@ -110,8 +110,8 @@ cargo run -p zpdf-cli -- dump tests/corpus/minimal.pdf 1 0
 - [x] zpdf-render-cpu: tiny-skia 实现
   - [x] 路径 fill/stroke
   - [x] 文字渲染（Type3 字形轮廓 + TrueType 轮廓 → tiny-skia path）
-  - [ ] 图像绘制
-  - [ ] 裁剪（stencil）
+  - [x] 图像绘制
+  - [x] 裁剪（stencil）
 - [x] PNG 输出
 - [x] zpdf-cli: `render` 命令
 

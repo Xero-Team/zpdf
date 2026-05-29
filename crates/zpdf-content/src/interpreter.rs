@@ -1,4 +1,6 @@
-use zpdf_core::{Matrix, PdfObject, Point, Rect};
+use std::collections::HashMap;
+
+use zpdf_core::{Matrix, ObjectId, PdfObject, Point, Rect};
 use zpdf_display_list::*;
 use zpdf_document::page::ResourceDict;
 use zpdf_font::FontCache;
@@ -17,11 +19,12 @@ pub struct ContentInterpreter<'a> {
     text_active: bool,
     text_matrix: Matrix,
     text_line_matrix: Matrix,
-    font_cache: Option<&'a FontCache>,
+    font_cache: Option<&'a mut FontCache>,
     current_font_id: Option<zpdf_font::FontId>,
     file: Option<&'a PdfFile>,
     resources: Option<&'a ResourceDict>,
     image_cache: Option<&'a mut ImageCache>,
+    form_font_overrides: Vec<HashMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -114,10 +117,11 @@ impl<'a> ContentInterpreter<'a> {
             file: None,
             resources: None,
             image_cache: None,
+            form_font_overrides: Vec::new(),
         }
     }
 
-    pub fn with_fonts(mut self, cache: &'a FontCache) -> Self {
+    pub fn with_fonts(mut self, cache: &'a mut FontCache) -> Self {
         self.font_cache = Some(cache);
         self
     }
@@ -417,8 +421,9 @@ impl<'a> ContentInterpreter<'a> {
                 let name = self.pop_name();
                 self.current.font_name = name.clone();
                 self.current.font_size = size;
-                if let Some(fc) = self.font_cache {
-                    if let Some((fid, _font)) = fc.get_by_name(&name) {
+                let lookup_name = self.resolve_font_name(&name);
+                if let Some(fc) = self.font_cache.as_ref() {
+                    if let Some((fid, _font)) = fc.get_by_name(&lookup_name) {
                         self.current_font_id = Some(fid);
                     }
                 }
@@ -644,9 +649,20 @@ impl<'a> ContentInterpreter<'a> {
     }
 
     fn apply_ext_gstate(&mut self, name: &str) {
-        let (file, resources) = match (self.file, self.resources) {
-            (Some(f), Some(r)) => (f, r),
+        let resources = match self.resources {
+            Some(r) => r,
             _ => return,
+        };
+
+        // Try inline dict first (common in TikZ/PGF-generated PDFs)
+        if let Some(dict) = resources.ext_g_state_inline.get(name) {
+            self.apply_ext_gstate_dict(dict);
+            return;
+        }
+
+        let file = match self.file {
+            Some(f) => f,
+            None => return,
         };
 
         let gs_id = match resources.ext_g_state.get(name) {
@@ -659,24 +675,21 @@ impl<'a> ContentInterpreter<'a> {
             Err(_) => return,
         };
 
-        let dict = match obj.as_dict() {
-            Ok(d) => d,
-            Err(_) => return,
-        };
+        if let Ok(dict) = obj.as_dict() {
+            self.apply_ext_gstate_dict(dict);
+        }
+    }
 
-        // ca — non-stroking (fill) alpha
+    fn apply_ext_gstate_dict(&mut self, dict: &zpdf_core::PdfDict) {
         if let Ok(a) = dict.get_f64("ca") {
             self.current.fill_alpha = a as f32;
         }
-        // CA — stroking alpha
         if let Ok(a) = dict.get_f64("CA") {
             self.current.stroke_alpha = a as f32;
         }
-        // LW — line width
         if let Ok(w) = dict.get_f64("LW") {
             self.current.line_width = w as f32;
         }
-        // LC — line cap
         if let Ok(c) = dict.get_i64("LC") {
             self.current.line_cap = match c as u8 {
                 1 => LineCap::Round,
@@ -684,7 +697,6 @@ impl<'a> ContentInterpreter<'a> {
                 _ => LineCap::Butt,
             };
         }
-        // LJ — line join
         if let Ok(j) = dict.get_i64("LJ") {
             self.current.line_join = match j as u8 {
                 1 => LineJoin::Round,
@@ -692,7 +704,6 @@ impl<'a> ContentInterpreter<'a> {
                 _ => LineJoin::Miter,
             };
         }
-        // ML — miter limit
         if let Ok(m) = dict.get_f64("ML") {
             self.current.miter_limit = m as f32;
         }
@@ -790,7 +801,7 @@ impl<'a> ContentInterpreter<'a> {
         }));
     }
 
-    fn do_form_xobject(&mut self, stream: &zpdf_core::PdfStream, _file: &PdfFile) {
+    fn do_form_xobject(&mut self, stream: &zpdf_core::PdfStream, file: &PdfFile) {
         let decoded = match zpdf_parser::filters::decode_stream(&stream.data, &stream.dict) {
             Ok(d) => d,
             Err(e) => {
@@ -811,9 +822,18 @@ impl<'a> ContentInterpreter<'a> {
             Matrix::identity()
         };
 
-        // Save state, apply form matrix, interpret content, restore
+        // Load fonts from the form's own Resources into the FontCache
+        self.load_form_fonts(&stream.dict, file);
+
+        // Save full state including text matrices
         self.state_stack.push(self.current.clone());
+        let saved_text_matrix = self.text_matrix;
+        let saved_text_line_matrix = self.text_line_matrix;
+        let saved_operand_stack = std::mem::take(&mut self.operand_stack);
+
         self.current.ctm = self.current.ctm.concat(&form_matrix);
+        self.text_matrix = Matrix::identity();
+        self.text_line_matrix = Matrix::identity();
 
         let tokenizer = ContentTokenizer::new(&decoded);
         for token in tokenizer {
@@ -831,6 +851,117 @@ impl<'a> ContentInterpreter<'a> {
         if let Some(state) = self.state_stack.pop() {
             self.current = state;
         }
+        self.text_matrix = saved_text_matrix;
+        self.text_line_matrix = saved_text_line_matrix;
+        self.operand_stack = saved_operand_stack;
+        self.form_font_overrides.pop();
+    }
+
+    fn resolve_font_name(&self, name: &str) -> String {
+        for overrides in self.form_font_overrides.iter().rev() {
+            if let Some(mapped) = overrides.get(name) {
+                return mapped.clone();
+            }
+        }
+        name.to_string()
+    }
+
+    fn load_form_fonts(&mut self, form_dict: &zpdf_core::PdfDict, file: &PdfFile) {
+        let fonts_dict = match form_dict.get("Resources") {
+            Some(PdfObject::Dict(res)) => match res.get("Font") {
+                Some(PdfObject::Dict(f)) => Some(f.clone()),
+                _ => None,
+            },
+            Some(PdfObject::Ref(r)) => file
+                .resolve(*r)
+                .ok()
+                .and_then(|o| o.as_dict().ok().cloned())
+                .and_then(|d| match d.get("Font") {
+                    Some(PdfObject::Dict(f)) => Some(f.clone()),
+                    _ => None,
+                }),
+            _ => None,
+        };
+
+        let fonts = match fonts_dict {
+            Some(f) => f,
+            None => {
+                self.form_font_overrides.push(HashMap::new());
+                return;
+            }
+        };
+
+        // Build page font ObjectId mapping for collision detection
+        let page_font_ids: HashMap<String, ObjectId> = self
+            .resources
+            .map(|r| {
+                r.fonts
+                    .iter()
+                    .map(|(k, v)| (k.clone(), *v))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let mut overrides = HashMap::new();
+        let form_depth = self.form_font_overrides.len();
+
+        let fc = match self.font_cache.as_mut() {
+            Some(fc) => fc,
+            None => {
+                self.form_font_overrides.push(HashMap::new());
+                return;
+            }
+        };
+
+        for (name, obj) in &fonts.0 {
+            if let PdfObject::Ref(font_ref) = obj {
+                let page_has_same_name = page_font_ids.contains_key(&name.0);
+                let page_has_same_obj = page_font_ids
+                    .get(&name.0)
+                    .map(|id| *id == *font_ref)
+                    .unwrap_or(false);
+
+                if page_has_same_name && page_has_same_obj {
+                    continue;
+                }
+
+                if page_has_same_name && !page_has_same_obj {
+                    let unique_name = format!("__form{}_{}", form_depth, name.0);
+                    if fc.get_by_name(&unique_name).is_none() {
+                        match zpdf_document::font_loader::load_single_font(file, *font_ref) {
+                            Ok(font) => {
+                                fc.insert(unique_name.clone(), font);
+                            }
+                            Err(e) => {
+                                tracing::debug!("form font {}: {e}", name.0);
+                                fc.insert(
+                                    unique_name.clone(),
+                                    zpdf_font::LoadedFont::new_placeholder(name.0.clone()),
+                                );
+                            }
+                        }
+                    }
+                    overrides.insert(name.0.clone(), unique_name);
+                } else {
+                    if fc.get_by_name(&name.0).is_none() {
+                        match zpdf_document::font_loader::load_single_font(file, *font_ref) {
+                            Ok(font) => {
+                                fc.insert(name.0.clone(), font);
+                            }
+                            Err(e) => {
+                                tracing::debug!("form font {}: {e}", name.0);
+                                fc.insert(
+                                    name.0.clone(),
+                                    zpdf_font::LoadedFont::new_placeholder(name.0.clone()),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        self.form_font_overrides.push(overrides);
     }
 
     fn transform_path_to_page_space(&self, path: &Path) -> Path {
@@ -959,6 +1090,7 @@ impl<'a> ContentInterpreter<'a> {
 
         let font_and_id = self.current_font_id.and_then(|fid| {
             self.font_cache
+                .as_ref()
                 .and_then(|fc| fc.get(fid).map(|f| (fid, f)))
         });
 
@@ -1031,9 +1163,9 @@ impl<'a> ContentInterpreter<'a> {
                 }));
         }
 
-        // Advance text matrix: x_offset is in user/text space units
+        // Advance text matrix along baseline direction
         let advance = Matrix::translate(x_offset as f64, 0.0);
-        self.text_matrix = advance.concat(&self.text_matrix);
+        self.text_matrix = self.text_matrix.concat(&advance);
     }
 
     fn adjust_text_position(&mut self, amount: f64) {

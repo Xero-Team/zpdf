@@ -18,6 +18,7 @@ pub struct ResourceDict {
     pub fonts: HashMap<String, ObjectId>,
     pub xobjects: HashMap<String, ObjectId>,
     pub ext_g_state: HashMap<String, ObjectId>,
+    pub ext_g_state_inline: HashMap<String, zpdf_core::PdfDict>,
     pub color_spaces: HashMap<String, ObjectId>,
     pub patterns: HashMap<String, ObjectId>,
 }
@@ -49,11 +50,11 @@ impl PdfPage {
         };
 
         let resources = match dict.get("Resources") {
-            Some(PdfObject::Dict(d)) => parse_resource_dict(d)?,
+            Some(PdfObject::Dict(d)) => parse_resource_dict(d, file)?,
             Some(PdfObject::Ref(r)) => {
                 let res_obj = file.resolve(*r)?;
                 let res_dict = res_obj.as_dict()?;
-                parse_resource_dict(res_dict)?
+                parse_resource_dict(res_dict, file)?
             }
             _ => ResourceDict::default(),
         };
@@ -95,10 +96,28 @@ impl PdfPage {
     }
 }
 
-fn parse_resource_dict(dict: &zpdf_core::PdfDict) -> Result<ResourceDict> {
+fn resolve_sub_dict<'a>(
+    dict: &'a zpdf_core::PdfDict,
+    key: &str,
+    file: &'a PdfFile,
+) -> Option<std::borrow::Cow<'a, zpdf_core::PdfDict>> {
+    match dict.get(key) {
+        Some(PdfObject::Dict(d)) => Some(std::borrow::Cow::Borrowed(d)),
+        Some(PdfObject::Ref(r)) => file
+            .resolve(*r)
+            .ok()
+            .and_then(|o| match o {
+                PdfObject::Dict(d) => Some(std::borrow::Cow::Owned(d)),
+                _ => None,
+            }),
+        _ => None,
+    }
+}
+
+pub fn parse_resource_dict(dict: &zpdf_core::PdfDict, file: &PdfFile) -> Result<ResourceDict> {
     let mut res = ResourceDict::default();
 
-    if let Ok(fonts) = dict.get_dict("Font") {
+    if let Some(fonts) = resolve_sub_dict(dict, "Font", file) {
         for (name, obj) in &fonts.0 {
             if let PdfObject::Ref(r) = obj {
                 res.fonts.insert(name.0.clone(), *r);
@@ -106,7 +125,7 @@ fn parse_resource_dict(dict: &zpdf_core::PdfDict) -> Result<ResourceDict> {
         }
     }
 
-    if let Ok(xobjects) = dict.get_dict("XObject") {
+    if let Some(xobjects) = resolve_sub_dict(dict, "XObject", file) {
         for (name, obj) in &xobjects.0 {
             if let PdfObject::Ref(r) = obj {
                 res.xobjects.insert(name.0.clone(), *r);
@@ -114,15 +133,21 @@ fn parse_resource_dict(dict: &zpdf_core::PdfDict) -> Result<ResourceDict> {
         }
     }
 
-    if let Ok(gs) = dict.get_dict("ExtGState") {
+    if let Some(gs) = resolve_sub_dict(dict, "ExtGState", file) {
         for (name, obj) in &gs.0 {
-            if let PdfObject::Ref(r) = obj {
-                res.ext_g_state.insert(name.0.clone(), *r);
+            match obj {
+                PdfObject::Ref(r) => {
+                    res.ext_g_state.insert(name.0.clone(), *r);
+                }
+                PdfObject::Dict(d) => {
+                    res.ext_g_state_inline.insert(name.0.clone(), d.clone());
+                }
+                _ => {}
             }
         }
     }
 
-    if let Ok(cs) = dict.get_dict("ColorSpace") {
+    if let Some(cs) = resolve_sub_dict(dict, "ColorSpace", file) {
         for (name, obj) in &cs.0 {
             if let PdfObject::Ref(r) = obj {
                 res.color_spaces.insert(name.0.clone(), *r);
@@ -130,7 +155,7 @@ fn parse_resource_dict(dict: &zpdf_core::PdfDict) -> Result<ResourceDict> {
         }
     }
 
-    if let Ok(pat) = dict.get_dict("Pattern") {
+    if let Some(pat) = resolve_sub_dict(dict, "Pattern", file) {
         for (name, obj) in &pat.0 {
             if let PdfObject::Ref(r) = obj {
                 res.patterns.insert(name.0.clone(), *r);
