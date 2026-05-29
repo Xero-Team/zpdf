@@ -5,6 +5,12 @@ use zpdf_core::{PdfName, PdfObject, PdfString, Result};
 pub enum ContentToken {
     Operand(PdfObject),
     Operator(String),
+    /// An inline image (`BI … ID <binary> EI`) with its raw parameter dict
+    /// (abbreviated keys/values not yet normalized) and the raw sample bytes.
+    InlineImage {
+        dict: zpdf_core::PdfDict,
+        data: Vec<u8>,
+    },
 }
 
 /// Tokenizer for PDF content streams.
@@ -93,6 +99,9 @@ impl<'a> ContentTokenizer<'a> {
             }
             _ if b.is_ascii_alphabetic() || b == b'\'' || b == b'"' || b == b'*' => {
                 let op = self.read_operator();
+                if op == "BI" {
+                    return Some(self.read_inline_image());
+                }
                 Some(ContentToken::Operator(op))
             }
             _ => {
@@ -159,9 +168,32 @@ impl<'a> ContentTokenizer<'a> {
                             b'n' => buf.push(b'\n'),
                             b'r' => buf.push(b'\r'),
                             b't' => buf.push(b'\t'),
+                            b'b' => buf.push(0x08),
+                            b'f' => buf.push(0x0c),
                             b'(' => buf.push(b'('),
                             b')' => buf.push(b')'),
                             b'\\' => buf.push(b'\\'),
+                            // Line continuation: a backslash before an EOL is elided.
+                            b'\n' => {}
+                            b'\r' => {
+                                if self.data.get(self.pos) == Some(&b'\n') {
+                                    self.pos += 1;
+                                }
+                            }
+                            // Octal escape: \ddd (1-3 octal digits).
+                            b'0'..=b'7' => {
+                                let mut val = (esc - b'0') as u16;
+                                for _ in 0..2 {
+                                    match self.data.get(self.pos) {
+                                        Some(&d @ b'0'..=b'7') => {
+                                            val = val * 8 + (d - b'0') as u16;
+                                            self.pos += 1;
+                                        }
+                                        _ => break,
+                                    }
+                                }
+                                buf.push(val as u8);
+                            }
                             _ => buf.push(esc),
                         }
                     }
@@ -240,6 +272,153 @@ impl<'a> ContentTokenizer<'a> {
         }
         String::from_utf8_lossy(&self.data[start..self.pos]).into_owned()
     }
+
+    /// Parse the body of an inline image after the `BI` operator: the parameter
+    /// pairs up to `ID`, then the raw sample bytes up to `EI`.
+    fn read_inline_image(&mut self) -> ContentToken {
+        let mut dict = zpdf_core::PdfDict::new();
+
+        // Parameter key/value pairs, terminated by the `ID` operator.
+        loop {
+            self.skip_whitespace();
+            if self.is_eof() {
+                return ContentToken::InlineImage { dict, data: Vec::new() };
+            }
+            if self.peek() == Some(b'/') {
+                let key = self.read_name();
+                self.skip_whitespace();
+                if let Some(ContentToken::Operand(val)) = self.next_token() {
+                    dict.insert(key, val);
+                }
+            } else {
+                let op = self.read_operator();
+                if op == "ID" {
+                    break;
+                }
+                if op.is_empty() {
+                    self.pos += 1; // guard against stalling on stray bytes
+                } else {
+                    // Malformed parameters (no `ID`): recover by skipping past the
+                    // `EI` terminator so the binary section is never re-tokenized.
+                    let end = self.scan_for_ei(self.pos);
+                    self.pos = end;
+                    self.skip_whitespace();
+                    if self.data[self.pos..].starts_with(b"EI") {
+                        self.pos += 2;
+                    }
+                    return ContentToken::InlineImage { dict, data: Vec::new() };
+                }
+            }
+        }
+
+        // A single EOL separates `ID` from the binary data; accept CRLF as one unit.
+        if self.data[self.pos..].starts_with(b"\r\n") {
+            self.pos += 2;
+        } else if matches!(self.peek(), Some(b) if is_whitespace(b)) {
+            self.pos += 1;
+        }
+
+        let data_start = self.pos;
+        let data_end = self.inline_image_data_end(&dict, data_start);
+        let data = self.data[data_start..data_end.min(self.data.len())].to_vec();
+        self.pos = data_end.min(self.data.len());
+
+        // Consume the trailing `EI` marker.
+        self.skip_whitespace();
+        if self.data[self.pos..].starts_with(b"EI") {
+            self.pos += 2;
+        }
+
+        ContentToken::InlineImage { dict, data }
+    }
+
+    /// Determine where the inline-image sample data ends. For uncompressed data
+    /// the exact byte length is computed from W·H·components·bpc (robust against
+    /// `EI` byte collisions); otherwise we scan for a whitespace-delimited `EI`.
+    fn inline_image_data_end(&self, dict: &zpdf_core::PdfDict, start: usize) -> usize {
+        let has_filter = dict.get("Filter").or_else(|| dict.get("F")).is_some();
+        if !has_filter {
+            let w = dict.get_i64("Width").or_else(|_| dict.get_i64("W"));
+            let h = dict.get_i64("Height").or_else(|_| dict.get_i64("H"));
+            if let (Ok(w), Ok(h), Some(comps)) = (w, h, inline_image_components(dict)) {
+                let is_mask = matches!(
+                    dict.get("ImageMask").or_else(|| dict.get("IM")),
+                    Some(PdfObject::Bool(true))
+                );
+                // Image masks are always 1 bit per component regardless of /BPC.
+                let bpc = if is_mask {
+                    1usize
+                } else {
+                    dict.get_i64("BitsPerComponent")
+                        .or_else(|_| dict.get_i64("BPC"))
+                        .unwrap_or(8)
+                        .clamp(1, 16) as usize
+                };
+                // Checked arithmetic: dimensions are attacker-controlled and must
+                // not overflow (debug panic / release wrap).
+                let len = (w.max(0) as usize)
+                    .checked_mul(comps)
+                    .and_then(|x| x.checked_mul(bpc))
+                    .map(|bits| bits.saturating_add(7) / 8)
+                    .and_then(|row| row.checked_mul(h.max(0) as usize));
+                if let Some(len) = len {
+                    if let Some(end) = start.checked_add(len) {
+                        if end <= self.data.len() {
+                            return end;
+                        }
+                    }
+                }
+            }
+        }
+        self.scan_for_ei(start)
+    }
+
+    fn scan_for_ei(&self, start: usize) -> usize {
+        let data = self.data;
+        let mut i = start;
+        while i + 2 <= data.len() {
+            if &data[i..i + 2] == b"EI" {
+                let prev_ws = i == start || is_whitespace(data[i - 1]);
+                let next_ok = i + 2 >= data.len()
+                    || is_whitespace(data[i + 2])
+                    || is_delimiter(data[i + 2]);
+                if prev_ws && next_ok {
+                    let mut end = i;
+                    if end > start && is_whitespace(data[end - 1]) {
+                        end -= 1;
+                    }
+                    return end;
+                }
+            }
+            i += 1;
+        }
+        data.len()
+    }
+}
+
+/// Components per sample for an inline image, from its (raw) dict; `None` when the
+/// colour space is an array/unknown (caller falls back to scanning).
+fn inline_image_components(dict: &zpdf_core::PdfDict) -> Option<usize> {
+    if matches!(
+        dict.get("ImageMask").or_else(|| dict.get("IM")),
+        Some(PdfObject::Bool(true))
+    ) {
+        return Some(1);
+    }
+    match dict.get("ColorSpace").or_else(|| dict.get("CS")) {
+        Some(PdfObject::Name(n)) => Some(match n.as_str() {
+            "DeviceRGB" | "RGB" | "CalRGB" => 3,
+            "DeviceCMYK" | "CMYK" => 4,
+            "DeviceGray" | "G" | "CalGray" | "Indexed" | "I" => 1,
+            _ => return None,
+        }),
+        // Array color space, e.g. [/Indexed base hival lut] — one index per sample.
+        Some(PdfObject::Array(arr)) => match arr.first() {
+            Some(PdfObject::Name(n)) if matches!(n.as_str(), "Indexed" | "I") => Some(1),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 impl<'a> Iterator for ContentTokenizer<'a> {
@@ -270,6 +449,60 @@ mod tests {
         assert!(matches!(&tokens[1], ContentToken::Operand(PdfObject::Name(n)) if n.as_str() == "F1"));
         assert!(matches!(&tokens[2], ContentToken::Operand(PdfObject::Integer(12))));
         assert!(matches!(&tokens[3], ContentToken::Operator(s) if s == "Tf"));
+    }
+
+    #[test]
+    fn literal_string_octal_and_continuation() {
+        // \101 = octal 0o101 = 'A'; \\ -> backslash; backslash-newline elided.
+        let data = b"(\\101\\\\B\\\n C) Tj";
+        let tokens: Vec<_> = ContentTokenizer::new(data).collect();
+        match &tokens[0] {
+            ContentToken::Operand(PdfObject::String(s)) => {
+                assert_eq!(s.0, b"A\\B C");
+            }
+            other => panic!("expected string, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tokenize_inline_image() {
+        // 2x2, 1-component (gray), 8bpc, uncompressed => exactly 4 data bytes.
+        let data = b"q BI /W 2 /H 2 /CS /G /BPC 8 ID \x00\xFF\xFF\x00 EI Q";
+        let tokens: Vec<_> = ContentTokenizer::new(data).collect();
+        assert_eq!(tokens.len(), 3, "expected q, InlineImage, Q");
+        match &tokens[1] {
+            ContentToken::InlineImage { dict, data } => {
+                assert_eq!(dict.get_i64("W").unwrap(), 2);
+                assert_eq!(dict.get_i64("H").unwrap(), 2);
+                assert_eq!(data.as_slice(), &[0x00, 0xFF, 0xFF, 0x00]);
+            }
+            other => panic!("expected inline image, got {other:?}"),
+        }
+        assert!(matches!(&tokens[2], ContentToken::Operator(s) if s == "Q"));
+    }
+
+    #[test]
+    fn inline_image_mask_defaults_bpc_1() {
+        // 8x1 image mask, no /BPC => 1 bit per sample => (8+7)/8 = 1 data byte.
+        let data = b"BI /W 8 /H 1 /IM true ID \xAA EI";
+        let tokens: Vec<_> = ContentTokenizer::new(data).collect();
+        match &tokens[0] {
+            ContentToken::InlineImage { data, .. } => assert_eq!(data.as_slice(), &[0xAA]),
+            other => panic!("expected inline image, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inline_image_crlf_after_id() {
+        // ID terminated by CRLF: the leading \n must not bleed into the data.
+        let mut data = b"BI /W 2 /H 1 /CS /G /BPC 8 ID\r\n".to_vec();
+        data.extend_from_slice(&[0x11, 0x22]);
+        data.extend_from_slice(b"\nEI");
+        let tokens: Vec<_> = ContentTokenizer::new(&data).collect();
+        match &tokens[0] {
+            ContentToken::InlineImage { data, .. } => assert_eq!(data.as_slice(), &[0x11, 0x22]),
+            other => panic!("expected inline image, got {other:?}"),
+        }
     }
 
     #[test]

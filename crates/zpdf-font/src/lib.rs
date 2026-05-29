@@ -1,3 +1,6 @@
+pub mod cmap;
+pub mod encoding;
+pub mod glyph_list;
 pub mod standard_fonts;
 
 use std::collections::HashMap;
@@ -43,6 +46,11 @@ impl CidWidths {
     pub fn get(&self, cid: u16) -> f64 {
         self.widths.get(&cid).copied().unwrap_or(self.default_width)
     }
+
+    /// Explicitly-set width for `cid`, or `None` if it falls back to the default.
+    pub fn get_opt(&self, cid: u16) -> Option<f64> {
+        self.widths.get(&cid).copied()
+    }
 }
 
 /// A loaded font with embedded TrueType/CFF data.
@@ -55,6 +63,13 @@ pub struct LoadedFont {
     pub ascent: f64,
     pub descent: f64,
     pub cid_to_gid: Option<HashMap<u16, u16>>,
+    /// Simple-font character-code → glyph-name mapping (base encoding + /Differences).
+    /// `None` for composite (Type0/CID) fonts and fully symbolic fonts.
+    pub encoding: Option<encoding::Encoding>,
+    /// /ToUnicode CMap for text extraction (code → Unicode string).
+    pub to_unicode: Option<cmap::ToUnicodeMap>,
+    /// Symbolic flag from the FontDescriptor (use the font's built-in cmap, not a base encoding).
+    pub symbolic: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -113,6 +128,9 @@ impl LoadedFont {
                 ascent,
                 descent,
                 cid_to_gid,
+                encoding: None,
+                to_unicode: None,
+                symbolic: false,
             }
         } else {
             tracing::debug!(
@@ -127,6 +145,9 @@ impl LoadedFont {
                 ascent: 800.0,
                 descent: -200.0,
                 cid_to_gid: None,
+                encoding: None,
+                to_unicode: None,
+                symbolic: false,
             }
         }
     }
@@ -148,6 +169,9 @@ impl LoadedFont {
             ascent: metrics.ascent,
             descent: metrics.descent,
             cid_to_gid: None,
+            encoding: None,
+            to_unicode: None,
+            symbolic: false,
         })
     }
 
@@ -161,6 +185,9 @@ impl LoadedFont {
             ascent: 800.0,
             descent: -200.0,
             cid_to_gid: None,
+            encoding: None,
+            to_unicode: None,
+            symbolic: false,
         }
     }
 
@@ -224,6 +251,129 @@ impl LoadedFont {
             PdfFontType::Type3 { .. } => self.units_per_em,
             _ => self.units_per_em,
         }
+    }
+
+    /// Map a 1-byte character code to a glyph ID for a *simple* font, using the
+    /// font's /Encoding (→ glyph name) and the embedded program's cmap/charset.
+    /// Returns `None` if no glyph data is available or no mapping is found
+    /// (callers typically fall back to treating the code as the GID).
+    pub fn code_to_gid(&self, code: u16) -> Option<u16> {
+        let data = self.font_data.as_ref()?;
+        let face = ttf_parser::Face::parse(data, 0).ok()?;
+        let code8 = code as u8;
+
+        // 1. /Encoding → glyph name → (by-name lookup, else name→Unicode→cmap).
+        if let Some(enc) = &self.encoding {
+            if let Some(name) = enc.glyph_name(code8) {
+                if let Some(g) = face.glyph_index_by_name(name) {
+                    return Some(g.0);
+                }
+                if let Some(ch) = glyph_list::glyph_name_to_char(name) {
+                    if let Some(g) = face.glyph_index(ch) {
+                        return Some(g.0);
+                    }
+                }
+            }
+        }
+
+        // 2. Built-in cmap subtables — common for symbolic embedded fonts.
+        if let Some(cmap) = face.tables().cmap {
+            // (3,0) Windows Symbol: try the 0xF000 PUA offset then the raw code.
+            for st in cmap.subtables {
+                if st.platform_id == ttf_parser::PlatformId::Windows && st.encoding_id == 0 {
+                    if let Some(g) = st
+                        .glyph_index(0xF000 | code as u32)
+                        .or_else(|| st.glyph_index(code as u32))
+                    {
+                        return Some(g.0);
+                    }
+                }
+            }
+            // (1,0) Macintosh Roman: try the raw code.
+            for st in cmap.subtables {
+                if st.platform_id == ttf_parser::PlatformId::Macintosh && st.encoding_id == 0 {
+                    if let Some(g) = st.glyph_index(code as u32) {
+                        return Some(g.0);
+                    }
+                }
+            }
+        }
+
+        // 3. Treat the code as Latin-1 and consult the Unicode cmap.
+        if let Some(g) = face.glyph_index(code8 as char) {
+            return Some(g.0);
+        }
+
+        None
+    }
+
+    /// Advance for a simple-font glyph, in font units consistent with
+    /// [`advance_divisor`](Self::advance_divisor). Prefers the PDF /Widths entry
+    /// (keyed by character *code*, authoritative per the spec) over the font's hmtx.
+    pub fn simple_glyph_advance(&self, code: u16, gid: u16) -> f64 {
+        // PDF /Widths are in 1/1000 glyph-space units; rescale to font units.
+        if let Some(w) = self.cid_widths.get_opt(code) {
+            return w / 1000.0 * self.units_per_em;
+        }
+        if let Some(data) = &self.font_data {
+            if let Ok(face) = ttf_parser::Face::parse(data, 0) {
+                if let Some(a) = face.glyph_hor_advance(ttf_parser::GlyphId(gid)) {
+                    return a as f64;
+                }
+            }
+        }
+        self.cid_widths.get(code) / 1000.0 * self.units_per_em
+    }
+
+    /// Decode a show-text byte string to Unicode for text extraction.
+    /// Uses /ToUnicode when present, else /Encoding + the Adobe Glyph List.
+    pub fn decode_to_string(&self, bytes: &[u8]) -> String {
+        let mut out = String::new();
+        if matches!(self.font_type, PdfFontType::Type0CidType2) {
+            // Composite font (Identity-H by default → 2-byte codes). Only /ToUnicode
+            // can map these; honour its codespace byte-length when it is a single
+            // fixed width (e.g. a 1-byte composite CMap), else fall back to 2.
+            let width = match &self.to_unicode {
+                Some(tu) => match tu.code_byte_lengths() {
+                    [n] if *n >= 1 => *n as usize,
+                    _ => 2,
+                },
+                None => 2,
+            };
+            for chunk in bytes.chunks(width) {
+                let mut code = 0u32;
+                for &b in chunk {
+                    code = (code << 8) | b as u32;
+                }
+                if let Some(tu) = &self.to_unicode {
+                    if let Some(s) = tu.lookup(code) {
+                        out.push_str(s);
+                    }
+                }
+            }
+        } else {
+            for &b in bytes {
+                let code = b as u32;
+                if let Some(tu) = &self.to_unicode {
+                    if let Some(s) = tu.lookup(code) {
+                        out.push_str(s);
+                        continue;
+                    }
+                }
+                if let Some(enc) = &self.encoding {
+                    if let Some(name) = enc.glyph_name(b) {
+                        if let Some(s) = glyph_list::glyph_name_to_string(name) {
+                            out.push_str(&s);
+                            continue;
+                        }
+                    }
+                }
+                if b >= 0x20 && b != 0x7f {
+                    out.push(b as char);
+                }
+            }
+        }
+        out
     }
 
     pub fn has_font_data(&self) -> bool {
@@ -456,7 +606,8 @@ fn parse_charset_to_gid_sid(cff: &[u8], charset_offset: usize, num_glyphs: usize
                 let first = u16::from_be_bytes([cff[p], cff[p + 1]]);
                 let n_left = cff[p + 2] as u16;
                 for j in 0..=n_left {
-                    gid_to_sid.insert(gid, first + j);
+                    let Some(sid) = first.checked_add(j) else { break; };
+                    gid_to_sid.insert(gid, sid);
                     gid += 1;
                     if gid >= num_glyphs as u16 { break; }
                 }
@@ -469,7 +620,8 @@ fn parse_charset_to_gid_sid(cff: &[u8], charset_offset: usize, num_glyphs: usize
                 let first = u16::from_be_bytes([cff[p], cff[p + 1]]);
                 let n_left = u16::from_be_bytes([cff[p + 2], cff[p + 3]]);
                 for j in 0..=n_left {
-                    gid_to_sid.insert(gid, first + j);
+                    let Some(sid) = first.checked_add(j) else { break; };
+                    gid_to_sid.insert(gid, sid);
                     gid += 1;
                     if gid >= num_glyphs as u16 { break; }
                 }
@@ -677,7 +829,8 @@ fn parse_cff_charset(cff: &[u8]) -> Option<HashMap<u16, u16>> {
                 let first = u16::from_be_bytes([cff[p], cff[p + 1]]);
                 let n_left = cff[p + 2] as u16;
                 for j in 0..=n_left {
-                    map.insert(first + j, gid);
+                    let Some(sid) = first.checked_add(j) else { break; };
+                    map.insert(sid, gid);
                     gid += 1;
                     if gid >= num_glyphs as u16 { break; }
                 }
@@ -691,7 +844,8 @@ fn parse_cff_charset(cff: &[u8]) -> Option<HashMap<u16, u16>> {
                 let first = u16::from_be_bytes([cff[p], cff[p + 1]]);
                 let n_left = u16::from_be_bytes([cff[p + 2], cff[p + 3]]);
                 for j in 0..=n_left {
-                    map.insert(first + j, gid);
+                    let Some(sid) = first.checked_add(j) else { break; };
+                    map.insert(sid, gid);
                     gid += 1;
                     if gid >= num_glyphs as u16 { break; }
                 }

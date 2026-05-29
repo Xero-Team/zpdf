@@ -7,7 +7,7 @@ fn main() {
 
     if args.len() < 2 {
         eprintln!("Usage: zpdf <command> [args...]");
-        eprintln!("Commands: info, dump, render");
+        eprintln!("Commands: info, dump, render, text, debug-stream");
         process::exit(1);
     }
 
@@ -15,6 +15,7 @@ fn main() {
         "info" => cmd_info(&args[2..]),
         "dump" => cmd_dump(&args[2..]),
         "render" => cmd_render(&args[2..]),
+        "text" => cmd_text(&args[2..]),
         "debug-stream" => cmd_debug_stream(&args[2..]),
         other => {
             eprintln!("Unknown command: {other}");
@@ -72,6 +73,64 @@ fn cmd_dump(args: &[String]) -> zpdf::Result<()> {
 
     let obj = doc.file().resolve(id)?;
     println!("{obj}");
+
+    Ok(())
+}
+
+fn cmd_text(args: &[String]) -> zpdf::Result<()> {
+    if args.is_empty() {
+        eprintln!("Usage: zpdf text <file.pdf> [-p <page>] [--all]");
+        process::exit(1);
+    }
+
+    let pdf_path = &args[0];
+    let mut page_num: usize = 1;
+    let mut all = false;
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-p" => {
+                i += 1;
+                page_num = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(1);
+            }
+            "--all" => all = true,
+            _ => {}
+        }
+        i += 1;
+    }
+
+    let data = fs::read(pdf_path).map_err(zpdf::Error::Io)?;
+    let doc = zpdf::PdfDocument::open(data)?;
+
+    let page_indices: Vec<usize> = if all {
+        (0..doc.page_count()).collect()
+    } else {
+        vec![page_num.saturating_sub(1)]
+    };
+
+    for &pi in &page_indices {
+        let page = doc.page(pi)?;
+        let mut font_cache = doc.load_page_fonts(&page);
+        let content_bytes = doc.page_content_bytes(&page)?;
+        let mut image_cache = zpdf::ImageCache::new();
+
+        let mut spans: Vec<zpdf::TextSpan> = Vec::new();
+        {
+            let interpreter = zpdf::ContentInterpreter::new(page.media_box)
+                .with_fonts(&mut font_cache)
+                .with_document(doc.file(), &page.resources)
+                .with_images(&mut image_cache)
+                .with_text_sink(&mut spans);
+            let _ = interpreter.interpret(&content_bytes);
+        }
+
+        if all {
+            println!("===== Page {} =====", pi + 1);
+        }
+        let text = zpdf::spans_to_text(spans, 2.0);
+        println!("{text}");
+    }
 
     Ok(())
 }

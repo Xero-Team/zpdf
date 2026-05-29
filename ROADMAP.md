@@ -64,7 +64,7 @@ cargo run -p zpdf-cli -- dump tests/corpus/minimal.pdf 1 0
 ### P2.1 — 内容流 Tokenizer
 - [x] 操作符/操作数 tokenizer
 - [x] 操作数类型识别（数字、字符串、Name、数组）
-- [ ] inline image (BI/ID/EI) 解析
+- [x] inline image (BI/ID/EI) 解析（缩写键/色彩空间归一化 + 长度/EI 扫描）
 
 ### P2.2 — Graphics State 与操作符解释
 - [x] GraphicsState 栈（q/Q）
@@ -93,8 +93,8 @@ cargo run -p zpdf-cli -- dump tests/corpus/minimal.pdf 1 0
 - [x] Type0/CID 字体（Identity-H, FontFile2）
 - [x] CID /W 宽度数组解析
 - [x] 基础字体：Type1 标准 14 字体
-- [ ] Simple Encoding (WinAnsi/MacRoman/custom)
-- [ ] ToUnicode CMap 解析
+- [x] Simple Encoding (Standard/WinAnsi/MacRoman/PDFDoc/Symbol/ZapfDingbats + /Differences)
+- [x] ToUnicode CMap 解析（bfchar/bfrange，UTF-16BE 代理对）
 
 ### P2.5 — 图像渲染
 - [x] Image XObject 解析 (Do)
@@ -116,9 +116,9 @@ cargo run -p zpdf-cli -- dump tests/corpus/minimal.pdf 1 0
 - [x] zpdf-cli: `render` 命令
 
 ### P2.7 — 文本提取
-- [ ] 基于 ToUnicode + Encoding 的文本提取
-- [ ] 字符坐标与排序
-- [ ] zpdf-cli: `text` 命令
+- [x] 基于 ToUnicode + Encoding 的文本提取
+- [x] 字符坐标与排序（按行 Y 分组 + 行内 X 排序，自适应行距）
+- [x] zpdf-cli: `text` 命令（`-p <page>` / `--all`）
 
 ### P2 里程碑验收
 ```

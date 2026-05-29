@@ -7,6 +7,7 @@ use zpdf_font::FontCache;
 use zpdf_image::ImageCache;
 use zpdf_parser::PdfFile;
 
+use crate::text::TextSpan;
 use crate::tokenizer::{ContentToken, ContentTokenizer};
 
 /// Interprets a PDF content stream and produces a DisplayList.
@@ -25,6 +26,7 @@ pub struct ContentInterpreter<'a> {
     resources: Option<&'a ResourceDict>,
     image_cache: Option<&'a mut ImageCache>,
     form_font_overrides: Vec<HashMap<String, String>>,
+    text_sink: Option<&'a mut Vec<TextSpan>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -118,11 +120,19 @@ impl<'a> ContentInterpreter<'a> {
             resources: None,
             image_cache: None,
             form_font_overrides: Vec::new(),
+            text_sink: None,
         }
     }
 
     pub fn with_fonts(mut self, cache: &'a mut FontCache) -> Self {
         self.font_cache = Some(cache);
+        self
+    }
+
+    /// Collect decoded text spans (for the `text` command / extraction) in addition
+    /// to building the display list.
+    pub fn with_text_sink(mut self, sink: &'a mut Vec<TextSpan>) -> Self {
+        self.text_sink = Some(sink);
         self
     }
 
@@ -147,6 +157,10 @@ impl<'a> ContentInterpreter<'a> {
                 }
                 ContentToken::Operator(op) => {
                     self.execute_operator(&op);
+                    self.operand_stack.clear();
+                }
+                ContentToken::InlineImage { dict, data } => {
+                    self.do_inline_image(dict, data);
                     self.operand_stack.clear();
                 }
             }
@@ -788,6 +802,24 @@ impl<'a> ContentInterpreter<'a> {
         self.emit_draw_image(image);
     }
 
+    fn do_inline_image(&mut self, dict: zpdf_core::PdfDict, data: Vec<u8>) {
+        if self.image_cache.is_none() {
+            return;
+        }
+        let norm = normalize_inline_image_dict(&dict);
+        let decoded = match zpdf_parser::filters::decode_stream(&data, &norm) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!("inline image: filter decode failed: {e}");
+                return;
+            }
+        };
+        match zpdf_image::decode_image_xobject(&decoded, &norm) {
+            Ok(img) => self.emit_draw_image(img),
+            Err(e) => tracing::warn!("inline image: {e}"),
+        }
+    }
+
     fn emit_draw_image(&mut self, image: zpdf_image::DecodedImage) {
         let image_cache = match self.image_cache.as_mut() {
             Some(c) => c,
@@ -843,6 +875,10 @@ impl<'a> ContentInterpreter<'a> {
                 }
                 ContentToken::Operator(op) => {
                     self.execute_operator(&op);
+                    self.operand_stack.clear();
+                }
+                ContentToken::InlineImage { dict, data } => {
+                    self.do_inline_image(dict, data);
                     self.operand_stack.clear();
                 }
             }
@@ -1087,6 +1123,10 @@ impl<'a> ContentInterpreter<'a> {
 
         let font_size = self.current.font_size;
         let h_scale = self.current.h_scaling / 100.0;
+        let char_spacing = self.current.char_spacing;
+        let word_spacing = self.current.word_spacing;
+        let rise = self.current.rise;
+        let want_text = self.text_sink.is_some();
 
         let font_and_id = self.current_font_id.and_then(|fid| {
             self.font_cache
@@ -1094,15 +1134,15 @@ impl<'a> ContentInterpreter<'a> {
                 .and_then(|fc| fc.get(fid).map(|f| (fid, f)))
         });
 
-        // Determine if 2-byte (CID) encoding
+        // 2-byte = composite (Type0/CID) font. With no loaded font, assume a
+        // simple single-byte font rather than guessing from the bytes.
         let is_two_byte = font_and_id
             .map(|(_, f)| matches!(f.font_type, zpdf_font::PdfFontType::Type0CidType2))
-            .unwrap_or(bytes.len() % 2 == 0 && bytes.iter().any(|&b| b > 127));
+            .unwrap_or(false);
 
         let advance_divisor = font_and_id
             .map(|(_, f)| f.advance_divisor())
             .unwrap_or(1000.0);
-
         let scale_factor = font_size / advance_divisor as f32;
 
         let mut glyphs = Vec::new();
@@ -1110,6 +1150,7 @@ impl<'a> ContentInterpreter<'a> {
 
         if is_two_byte {
             for chunk in bytes.chunks(2) {
+                // For Identity-H the code is the CID; glyph_outline maps CID→GID.
                 let glyph_id = if chunk.len() == 2 {
                     ((chunk[0] as u16) << 8) | chunk[1] as u16
                 } else {
@@ -1126,15 +1167,20 @@ impl<'a> ContentInterpreter<'a> {
                     y: 0.0,
                     advance,
                 });
-                x_offset += advance + self.current.char_spacing;
+                // Per PDF 9.4.4, char/word spacing are inside the ·Th product.
+                x_offset += advance + char_spacing * h_scale;
             }
         } else {
             for &byte in bytes {
-                let glyph_id = byte as u16;
-                let advance = if let Some((_, font)) = font_and_id {
-                    font.glyph_advance(glyph_id) as f32 * scale_factor * h_scale
+                let code = byte as u16;
+                // Map the character code through /Encoding + the font's cmap/charset
+                // to the real glyph ID. Without font data, fall back to the raw code.
+                let (glyph_id, advance) = if let Some((_, font)) = font_and_id {
+                    let gid = font.code_to_gid(code).unwrap_or(code);
+                    let adv = font.simple_glyph_advance(code, gid) as f32 * scale_factor * h_scale;
+                    (gid, adv)
                 } else {
-                    font_size * 0.6 * h_scale
+                    (code, font_size * 0.6 * h_scale)
                 };
                 glyphs.push(PositionedGlyph {
                     glyph_id,
@@ -1142,37 +1188,133 @@ impl<'a> ContentInterpreter<'a> {
                     y: 0.0,
                     advance,
                 });
-                x_offset += advance + self.current.char_spacing;
+                x_offset += advance + char_spacing * h_scale;
+                // Word spacing applies only to the single-byte code 32.
                 if byte == b' ' {
-                    x_offset += self.current.word_spacing;
+                    x_offset += word_spacing * h_scale;
                 }
             }
         }
 
-        let font_id = self.current_font_id.unwrap_or(0);
+        // Decode the text and compute its user-space placement for extraction,
+        // while the immutable font borrow is still live.
+        let text_span = if want_text {
+            let decoded = font_and_id
+                .map(|(_, f)| f.decode_to_string(bytes))
+                .unwrap_or_else(|| {
+                    bytes
+                        .iter()
+                        .filter(|&&b| b >= 0x20 && b != 0x7f)
+                        .map(|&b| b as char)
+                        .collect()
+                });
+            let start = Point::new(0.0, rise as f64).transform(&combined);
+            let end = Point::new(x_offset as f64, rise as f64).transform(&combined);
+            let dx = end.x - start.x;
+            let cscale = ((combined.a * combined.a + combined.b * combined.b).sqrt()
+                + (combined.c * combined.c + combined.d * combined.d).sqrt())
+                / 2.0;
+            Some(TextSpan {
+                text: decoded,
+                x: start.x,
+                y: start.y,
+                size: (font_size as f64 * cscale) as f32,
+                // Signed horizontal extent of the run (end.x − start.x) so the
+                // extraction gap heuristic stays correct under scaling/rotation.
+                advance: dx,
+            })
+        } else {
+            None
+        };
 
-        if !glyphs.is_empty() {
-            self.display_list
-                .push(RenderCommand::DrawGlyphRun(GlyphRun {
-                    font_id,
-                    font_size,
-                    glyphs,
-                    paint: Paint::Solid(self.current.fill_color),
-                    alpha: self.current.fill_alpha,
-                    transform: combined,
-                }));
+        // Only emit a glyph run when a font is actually active; with no font the
+        // glyph IDs would be raw, unmappable codes aliased onto font 0.
+        if let Some(font_id) = self.current_font_id {
+            if !glyphs.is_empty() {
+                self.display_list
+                    .push(RenderCommand::DrawGlyphRun(GlyphRun {
+                        font_id,
+                        font_size,
+                        glyphs,
+                        paint: Paint::Solid(self.current.fill_color),
+                        alpha: self.current.fill_alpha,
+                        transform: combined,
+                    }));
+            }
         }
 
-        // Advance text matrix along baseline direction
+        if let (Some(span), Some(sink)) = (text_span, self.text_sink.as_mut()) {
+            if !span.text.is_empty() {
+                sink.push(span);
+            }
+        }
+
+        // Advance the text matrix along the baseline direction.
         let advance = Matrix::translate(x_offset as f64, 0.0);
         self.text_matrix = self.text_matrix.concat(&advance);
     }
 
     fn adjust_text_position(&mut self, amount: f64) {
-        // TJ displacement: amount is in thousandths of a unit of text space
-        let displacement = amount / 1000.0 * self.current.font_size as f64;
+        // TJ displacement: amount is in thousandths of a unit of text space,
+        // scaled by the horizontal scaling Th (PDF 9.4.4).
+        let displacement = amount / 1000.0
+            * self.current.font_size as f64
+            * (self.current.h_scaling as f64 / 100.0);
         let advance = Matrix::translate(displacement, 0.0);
         self.text_matrix = self.text_matrix.concat(&advance);
+    }
+}
+
+/// Expand the abbreviated keys/values of an inline-image parameter dict to their
+/// full XObject-image equivalents so the shared filter/image decoders accept it.
+fn normalize_inline_image_dict(dict: &zpdf_core::PdfDict) -> zpdf_core::PdfDict {
+    use zpdf_core::PdfName;
+    let mut out = zpdf_core::PdfDict::new();
+    for (k, v) in &dict.0 {
+        let key = match k.as_str() {
+            "W" => "Width",
+            "H" => "Height",
+            "BPC" => "BitsPerComponent",
+            "CS" => "ColorSpace",
+            "F" => "Filter",
+            "IM" => "ImageMask",
+            "D" => "Decode",
+            "DP" => "DecodeParms",
+            "I" => "Interpolate",
+            other => other,
+        };
+        let value = if key == "ColorSpace" {
+            normalize_cs_value(v)
+        } else {
+            v.clone()
+        };
+        out.insert(PdfName::new(key.to_string()), value);
+    }
+    out
+}
+
+fn normalize_cs_value(v: &PdfObject) -> PdfObject {
+    use zpdf_core::PdfName;
+    match v {
+        PdfObject::Name(n) => PdfObject::Name(PdfName::new(expand_cs_name(n.as_str()).to_string())),
+        PdfObject::Array(arr) => {
+            let mut new_arr = arr.clone();
+            if let Some(PdfObject::Name(n)) = new_arr.first().cloned() {
+                new_arr[0] = PdfObject::Name(PdfName::new(expand_cs_name(n.as_str()).to_string()));
+            }
+            PdfObject::Array(new_arr)
+        }
+        other => other.clone(),
+    }
+}
+
+fn expand_cs_name(n: &str) -> &str {
+    match n {
+        "G" => "DeviceGray",
+        "RGB" => "DeviceRGB",
+        "CMYK" => "DeviceCMYK",
+        "I" => "Indexed",
+        other => other,
     }
 }
 
@@ -1197,11 +1339,25 @@ mod tests {
         assert_eq!(dl.commands.len(), 2);
     }
 
+    /// A FontCache with a single placeholder font registered as `F1`, so that a
+    /// `/F1 Tf` selects an active font and text operators emit glyph runs.
+    fn cache_with_f1() -> FontCache {
+        let mut fc = FontCache::new();
+        fc.insert(
+            "F1".to_string(),
+            zpdf_font::LoadedFont::new_placeholder("F1".to_string()),
+        );
+        fc
+    }
+
     #[test]
     fn interpret_text_block() {
         let content = b"BT /F1 12 Tf 100 700 Td (Hello World) Tj ET";
         let page_rect = Rect::new(0.0, 0.0, 612.0, 792.0);
-        let dl = ContentInterpreter::new(page_rect).interpret(content);
+        let mut fc = cache_with_f1();
+        let dl = ContentInterpreter::new(page_rect)
+            .with_fonts(&mut fc)
+            .interpret(content);
         assert_eq!(dl.commands.len(), 1);
         assert!(matches!(&dl.commands[0], RenderCommand::DrawGlyphRun(_)));
     }
@@ -1210,8 +1366,21 @@ mod tests {
     fn interpret_tj_array() {
         let content = b"BT /F1 12 Tf 100 700 Td [(AB) -200 (CD)] TJ ET";
         let page_rect = Rect::new(0.0, 0.0, 612.0, 792.0);
-        let dl = ContentInterpreter::new(page_rect).interpret(content);
+        let mut fc = cache_with_f1();
+        let dl = ContentInterpreter::new(page_rect)
+            .with_fonts(&mut fc)
+            .interpret(content);
         assert_eq!(dl.commands.len(), 2); // two glyph runs
+    }
+
+    #[test]
+    fn no_font_emits_no_glyph_run() {
+        // Text shown without a selectable font must not emit a glyph run aliased
+        // onto font id 0 (it would render with an unrelated font).
+        let content = b"BT /F1 12 Tf 100 700 Td (Hello) Tj ET";
+        let page_rect = Rect::new(0.0, 0.0, 612.0, 792.0);
+        let dl = ContentInterpreter::new(page_rect).interpret(content);
+        assert_eq!(dl.commands.len(), 0);
     }
 
     #[test]
