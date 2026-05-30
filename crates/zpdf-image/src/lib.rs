@@ -52,10 +52,7 @@ pub enum ImageColorSpace {
     DeviceCMYK,
 }
 
-pub fn decode_image_xobject(
-    decoded_data: &[u8],
-    dict: &PdfDict,
-) -> Result<DecodedImage> {
+pub fn decode_image_xobject(decoded_data: &[u8], dict: &PdfDict) -> Result<DecodedImage> {
     let width = dict.get_i64("Width")? as u32;
     let height = dict.get_i64("Height")? as u32;
     let bpc = dict.get_i64("BitsPerComponent").unwrap_or(8) as u8;
@@ -68,18 +65,10 @@ pub fn decode_image_xobject(
     }
 
     match (cs, bpc) {
-        (ImageColorSpace::DeviceRGB, 8) => {
-            samples_rgb8_to_rgba(decoded_data, width, height)
-        }
-        (ImageColorSpace::DeviceGray, 8) => {
-            samples_gray8_to_rgba(decoded_data, width, height)
-        }
-        (ImageColorSpace::DeviceCMYK, 8) => {
-            samples_cmyk8_to_rgba(decoded_data, width, height)
-        }
-        (ImageColorSpace::DeviceGray, 1) => {
-            samples_gray1_to_rgba(decoded_data, width, height)
-        }
+        (ImageColorSpace::DeviceRGB, 8) => samples_rgb8_to_rgba(decoded_data, width, height),
+        (ImageColorSpace::DeviceGray, 8) => samples_gray8_to_rgba(decoded_data, width, height),
+        (ImageColorSpace::DeviceCMYK, 8) => samples_cmyk8_to_rgba(decoded_data, width, height),
+        (ImageColorSpace::DeviceGray, 1) => samples_gray1_to_rgba(decoded_data, width, height),
         _ => {
             tracing::warn!("unsupported image format: {cs:?} {bpc}bpc, treating as gray");
             samples_gray8_to_rgba(decoded_data, width, height)
@@ -134,9 +123,9 @@ fn parse_colorspace(dict: &PdfDict) -> ImageColorSpace {
 fn is_dct_encoded(dict: &PdfDict) -> bool {
     match dict.get("Filter") {
         Some(PdfObject::Name(n)) => matches!(n.as_str(), "DCTDecode" | "DCT"),
-        Some(PdfObject::Array(arr)) => arr.iter().any(|o| {
-            matches!(o, PdfObject::Name(n) if matches!(n.as_str(), "DCTDecode" | "DCT"))
-        }),
+        Some(PdfObject::Array(arr)) => arr
+            .iter()
+            .any(|o| matches!(o, PdfObject::Name(n) if matches!(n.as_str(), "DCTDecode" | "DCT"))),
         _ => false,
     }
 }
@@ -162,7 +151,9 @@ fn decode_dct_image(
     } else {
         Err(Error::StreamDecode(format!(
             "DCT decoded data too short: {} bytes for {}x{} image",
-            decoded_data.len(), width, height
+            decoded_data.len(),
+            width,
+            height
         )))
     }
 }

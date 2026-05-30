@@ -95,12 +95,7 @@ fn decode_tiff_predictor(
     Ok(output)
 }
 
-fn decode_png_predictor(
-    data: &[u8],
-    colors: usize,
-    bpc: usize,
-    columns: usize,
-) -> Result<Vec<u8>> {
+fn decode_png_predictor(data: &[u8], colors: usize, bpc: usize, columns: usize) -> Result<Vec<u8>> {
     let row_bytes = (colors * bpc * columns + 7) / 8;
     let bpp = (colors * bpc + 7) / 8; // bytes per pixel for Sub/Paeth
     let stride = 1 + row_bytes; // filter byte + row data
@@ -158,7 +153,11 @@ fn decode_png_predictor(
                 for i in 0..row_bytes {
                     let left = if i >= bpp { row[i - bpp] as i32 } else { 0 };
                     let above = prev_row[i] as i32;
-                    let upper_left = if i >= bpp { prev_row[i - bpp] as i32 } else { 0 };
+                    let upper_left = if i >= bpp {
+                        prev_row[i - bpp] as i32
+                    } else {
+                        0
+                    };
                     row[i] = row[i].wrapping_add(paeth(left, above, upper_left));
                 }
             }

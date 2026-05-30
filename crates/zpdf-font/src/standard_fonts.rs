@@ -37,90 +37,132 @@ fn normalize_name(name: &str) -> &str {
 }
 
 static STANDARD_FONTS: &[(&str, StandardFontMetrics)] = &[
-    ("Helvetica", StandardFontMetrics {
-        widths: &HELVETICA_WIDTHS,
-        ascent: 718.0,
-        descent: -207.0,
-        bbox: [-166.0, -225.0, 1000.0, 931.0],
-    }),
-    ("Helvetica-Bold", StandardFontMetrics {
-        widths: &HELVETICA_BOLD_WIDTHS,
-        ascent: 718.0,
-        descent: -207.0,
-        bbox: [-170.0, -228.0, 1003.0, 962.0],
-    }),
-    ("Helvetica-Oblique", StandardFontMetrics {
-        widths: &HELVETICA_WIDTHS, // same widths as Helvetica
-        ascent: 718.0,
-        descent: -207.0,
-        bbox: [-170.0, -225.0, 1116.0, 931.0],
-    }),
-    ("Helvetica-BoldOblique", StandardFontMetrics {
-        widths: &HELVETICA_BOLD_WIDTHS,
-        ascent: 718.0,
-        descent: -207.0,
-        bbox: [-174.0, -228.0, 1114.0, 962.0],
-    }),
-    ("Times-Roman", StandardFontMetrics {
-        widths: &TIMES_ROMAN_WIDTHS,
-        ascent: 683.0,
-        descent: -217.0,
-        bbox: [-168.0, -218.0, 1000.0, 898.0],
-    }),
-    ("Times-Bold", StandardFontMetrics {
-        widths: &TIMES_BOLD_WIDTHS,
-        ascent: 683.0,
-        descent: -217.0,
-        bbox: [-168.0, -218.0, 1000.0, 935.0],
-    }),
-    ("Times-Italic", StandardFontMetrics {
-        widths: &TIMES_ITALIC_WIDTHS,
-        ascent: 683.0,
-        descent: -217.0,
-        bbox: [-169.0, -217.0, 1010.0, 883.0],
-    }),
-    ("Times-BoldItalic", StandardFontMetrics {
-        widths: &TIMES_BOLD_ITALIC_WIDTHS,
-        ascent: 683.0,
-        descent: -217.0,
-        bbox: [-200.0, -218.0, 996.0, 921.0],
-    }),
-    ("Courier", StandardFontMetrics {
-        widths: &COURIER_WIDTHS,
-        ascent: 629.0,
-        descent: -157.0,
-        bbox: [-23.0, -250.0, 715.0, 805.0],
-    }),
-    ("Courier-Bold", StandardFontMetrics {
-        widths: &COURIER_WIDTHS, // all Courier variants are monospaced 600
-        ascent: 629.0,
-        descent: -157.0,
-        bbox: [-113.0, -250.0, 749.0, 801.0],
-    }),
-    ("Courier-Oblique", StandardFontMetrics {
-        widths: &COURIER_WIDTHS,
-        ascent: 629.0,
-        descent: -157.0,
-        bbox: [-27.0, -250.0, 849.0, 805.0],
-    }),
-    ("Courier-BoldOblique", StandardFontMetrics {
-        widths: &COURIER_WIDTHS,
-        ascent: 629.0,
-        descent: -157.0,
-        bbox: [-57.0, -250.0, 869.0, 801.0],
-    }),
-    ("Symbol", StandardFontMetrics {
-        widths: &SYMBOL_WIDTHS,
-        ascent: 800.0,
-        descent: -200.0,
-        bbox: [-180.0, -293.0, 1090.0, 1010.0],
-    }),
-    ("ZapfDingbats", StandardFontMetrics {
-        widths: &ZAPF_DINGBATS_WIDTHS,
-        ascent: 800.0,
-        descent: -200.0,
-        bbox: [-1.0, -143.0, 981.0, 820.0],
-    }),
+    (
+        "Helvetica",
+        StandardFontMetrics {
+            widths: &HELVETICA_WIDTHS,
+            ascent: 718.0,
+            descent: -207.0,
+            bbox: [-166.0, -225.0, 1000.0, 931.0],
+        },
+    ),
+    (
+        "Helvetica-Bold",
+        StandardFontMetrics {
+            widths: &HELVETICA_BOLD_WIDTHS,
+            ascent: 718.0,
+            descent: -207.0,
+            bbox: [-170.0, -228.0, 1003.0, 962.0],
+        },
+    ),
+    (
+        "Helvetica-Oblique",
+        StandardFontMetrics {
+            widths: &HELVETICA_WIDTHS, // same widths as Helvetica
+            ascent: 718.0,
+            descent: -207.0,
+            bbox: [-170.0, -225.0, 1116.0, 931.0],
+        },
+    ),
+    (
+        "Helvetica-BoldOblique",
+        StandardFontMetrics {
+            widths: &HELVETICA_BOLD_WIDTHS,
+            ascent: 718.0,
+            descent: -207.0,
+            bbox: [-174.0, -228.0, 1114.0, 962.0],
+        },
+    ),
+    (
+        "Times-Roman",
+        StandardFontMetrics {
+            widths: &TIMES_ROMAN_WIDTHS,
+            ascent: 683.0,
+            descent: -217.0,
+            bbox: [-168.0, -218.0, 1000.0, 898.0],
+        },
+    ),
+    (
+        "Times-Bold",
+        StandardFontMetrics {
+            widths: &TIMES_BOLD_WIDTHS,
+            ascent: 683.0,
+            descent: -217.0,
+            bbox: [-168.0, -218.0, 1000.0, 935.0],
+        },
+    ),
+    (
+        "Times-Italic",
+        StandardFontMetrics {
+            widths: &TIMES_ITALIC_WIDTHS,
+            ascent: 683.0,
+            descent: -217.0,
+            bbox: [-169.0, -217.0, 1010.0, 883.0],
+        },
+    ),
+    (
+        "Times-BoldItalic",
+        StandardFontMetrics {
+            widths: &TIMES_BOLD_ITALIC_WIDTHS,
+            ascent: 683.0,
+            descent: -217.0,
+            bbox: [-200.0, -218.0, 996.0, 921.0],
+        },
+    ),
+    (
+        "Courier",
+        StandardFontMetrics {
+            widths: &COURIER_WIDTHS,
+            ascent: 629.0,
+            descent: -157.0,
+            bbox: [-23.0, -250.0, 715.0, 805.0],
+        },
+    ),
+    (
+        "Courier-Bold",
+        StandardFontMetrics {
+            widths: &COURIER_WIDTHS, // all Courier variants are monospaced 600
+            ascent: 629.0,
+            descent: -157.0,
+            bbox: [-113.0, -250.0, 749.0, 801.0],
+        },
+    ),
+    (
+        "Courier-Oblique",
+        StandardFontMetrics {
+            widths: &COURIER_WIDTHS,
+            ascent: 629.0,
+            descent: -157.0,
+            bbox: [-27.0, -250.0, 849.0, 805.0],
+        },
+    ),
+    (
+        "Courier-BoldOblique",
+        StandardFontMetrics {
+            widths: &COURIER_WIDTHS,
+            ascent: 629.0,
+            descent: -157.0,
+            bbox: [-57.0, -250.0, 869.0, 801.0],
+        },
+    ),
+    (
+        "Symbol",
+        StandardFontMetrics {
+            widths: &SYMBOL_WIDTHS,
+            ascent: 800.0,
+            descent: -200.0,
+            bbox: [-180.0, -293.0, 1090.0, 1010.0],
+        },
+    ),
+    (
+        "ZapfDingbats",
+        StandardFontMetrics {
+            widths: &ZAPF_DINGBATS_WIDTHS,
+            ascent: 800.0,
+            descent: -200.0,
+            bbox: [-1.0, -143.0, 981.0, 820.0],
+        },
+    ),
 ];
 
 // Helvetica — WinAnsiEncoding widths (char codes 0-255)

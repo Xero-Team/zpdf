@@ -7,7 +7,7 @@ fn main() {
 
     if args.len() < 2 {
         eprintln!("Usage: zpdf <command> [args...]");
-        eprintln!("Commands: info, dump, render, text, debug-stream");
+        eprintln!("Commands: info, dump, render, text, compare, debug-stream");
         process::exit(1);
     }
 
@@ -16,6 +16,7 @@ fn main() {
         "dump" => cmd_dump(&args[2..]),
         "render" => cmd_render(&args[2..]),
         "text" => cmd_text(&args[2..]),
+        "compare" => cmd_compare(&args[2..]),
         "debug-stream" => cmd_debug_stream(&args[2..]),
         other => {
             eprintln!("Unknown command: {other}");
@@ -73,6 +74,108 @@ fn cmd_dump(args: &[String]) -> zpdf::Result<()> {
 
     let obj = doc.file().resolve(id)?;
     println!("{obj}");
+
+    Ok(())
+}
+
+/// Pixel-compare two PNGs and report difference metrics. Serves as the
+/// CPU↔reference (and, in Phase 3, GPU↔CPU) rendering comparison harness.
+fn cmd_compare(args: &[String]) -> zpdf::Result<()> {
+    if args.len() < 2 {
+        eprintln!("Usage: zpdf compare <a.png> <b.png> [--out <diff.png>] [--threshold <0-255>]");
+        process::exit(1);
+    }
+    let a_path = &args[0];
+    let b_path = &args[1];
+    let mut out_path: Option<String> = None;
+    let mut threshold: u8 = 16;
+
+    let mut i = 2;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--out" => {
+                i += 1;
+                out_path = args.get(i).cloned();
+            }
+            "--threshold" => {
+                i += 1;
+                threshold = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(16);
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    let load = |p: &str| {
+        image::open(p)
+            .map(|img| img.to_rgba8())
+            .map_err(|e| zpdf::Error::StreamDecode(format!("open {p}: {e}")))
+    };
+    let a = load(a_path)?;
+    let b = load(b_path)?;
+
+    if a.dimensions() != b.dimensions() {
+        println!(
+            "DIMENSION MISMATCH: {:?} ({a_path}) vs {:?} ({b_path})",
+            a.dimensions(),
+            b.dimensions()
+        );
+        process::exit(2);
+    }
+
+    let (w, h) = a.dimensions();
+    let total = w as u64 * h as u64;
+    let mut diff_pixels: u64 = 0;
+    let mut sum_abs: u64 = 0;
+    let mut sum_sq: u64 = 0;
+    let mut max_diff: u8 = 0;
+    let mut heatmap = out_path.as_ref().map(|_| image::RgbaImage::new(w, h));
+
+    for y in 0..h {
+        for x in 0..w {
+            let pa = a.get_pixel(x, y).0;
+            let pb = b.get_pixel(x, y).0;
+            let mut pix_max = 0u8;
+            for c in 0..3 {
+                let d = (pa[c] as i32 - pb[c] as i32).unsigned_abs() as u8;
+                sum_abs += d as u64;
+                sum_sq += d as u64 * d as u64;
+                pix_max = pix_max.max(d);
+            }
+            max_diff = max_diff.max(pix_max);
+            if pix_max > threshold {
+                diff_pixels += 1;
+            }
+            if let Some(hm) = heatmap.as_mut() {
+                // Dim grayscale of A, with differing pixels glowing red.
+                let base = ((pa[0] as u16 + pa[1] as u16 + pa[2] as u16) / 3) as u8;
+                let dim = base / 3 + 30;
+                let r = (pix_max as u16 * 4).min(255) as u8;
+                let other = if pix_max > threshold { dim / 2 } else { dim };
+                hm.put_pixel(
+                    x,
+                    y,
+                    image::Rgba([dim.saturating_add(r), other, other, 255]),
+                );
+            }
+        }
+    }
+
+    let channels = (total * 3) as f64;
+    let mae = sum_abs as f64 / channels;
+    let rmse = (sum_sq as f64 / channels).sqrt();
+    let pct = diff_pixels as f64 / total as f64 * 100.0;
+
+    println!("Compare: {a_path}  vs  {b_path}");
+    println!("  Size: {w}x{h} ({total} px)");
+    println!("  Differing pixels (>{threshold}/channel): {diff_pixels} ({pct:.3}%)");
+    println!("  MAE: {mae:.3}/255    RMSE: {rmse:.3}/255    Max channel diff: {max_diff}/255");
+
+    if let (Some(hm), Some(op)) = (heatmap, out_path) {
+        hm.save(&op)
+            .map_err(|e| zpdf::Error::StreamDecode(format!("save {op}: {e}")))?;
+        println!("  Diff heatmap: {op}");
+    }
 
     Ok(())
 }
@@ -186,12 +289,16 @@ fn cmd_render(args: &[String]) -> zpdf::Result<()> {
     let mut font_cache = doc.load_page_fonts(&page);
     let initial_fonts = font_cache.len();
     let initial_with_data = (0..initial_fonts)
-        .filter(|&i| font_cache.get(i as u32).map(|f| f.has_font_data()).unwrap_or(false))
+        .filter(|&i| {
+            font_cache
+                .get(i as u32)
+                .map(|f| f.has_font_data())
+                .unwrap_or(false)
+        })
         .count();
     println!(
         "  Fonts loaded: {} ({} with embedded data)",
-        initial_fonts,
-        initial_with_data
+        initial_fonts, initial_with_data
     );
 
     // Decode content stream
@@ -242,10 +349,7 @@ fn cmd_render(args: &[String]) -> zpdf::Result<()> {
         .render_display_list(&display_list, scale)
         .map_err(|e| zpdf::Error::StreamDecode(e.to_string()))?;
 
-    println!(
-        "  Rendered: {}x{} pixels",
-        rendered.width, rendered.height
-    );
+    println!("  Rendered: {}x{} pixels", rendered.width, rendered.height);
 
     // Save PNG
     rendered

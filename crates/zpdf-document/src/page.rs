@@ -30,12 +30,9 @@ impl PdfPage {
 
         let media_box = Self::inherit_rect(file, dict, "MediaBox")?
             .ok_or_else(|| zpdf_core::Error::MissingKey("MediaBox".into()))?;
-        let crop_box = Self::inherit_rect(file, dict, "CropBox")?
-            .unwrap_or(media_box);
+        let crop_box = Self::inherit_rect(file, dict, "CropBox")?.unwrap_or(media_box);
 
-        let rotate = dict
-            .get_i64("Rotate")
-            .unwrap_or(0) as i32;
+        let rotate = dict.get_i64("Rotate").unwrap_or(0) as i32;
 
         let contents = match dict.get("Contents") {
             Some(PdfObject::Ref(r)) => vec![*r],
@@ -69,11 +66,7 @@ impl PdfPage {
         })
     }
 
-    fn inherit_rect(
-        file: &PdfFile,
-        dict: &zpdf_core::PdfDict,
-        key: &str,
-    ) -> Result<Option<Rect>> {
+    fn inherit_rect(file: &PdfFile, dict: &zpdf_core::PdfDict, key: &str) -> Result<Option<Rect>> {
         if let Ok(r) = dict.get_rect(key) {
             return Ok(Some(r));
         }
@@ -103,13 +96,10 @@ fn resolve_sub_dict<'a>(
 ) -> Option<std::borrow::Cow<'a, zpdf_core::PdfDict>> {
     match dict.get(key) {
         Some(PdfObject::Dict(d)) => Some(std::borrow::Cow::Borrowed(d)),
-        Some(PdfObject::Ref(r)) => file
-            .resolve(*r)
-            .ok()
-            .and_then(|o| match o {
-                PdfObject::Dict(d) => Some(std::borrow::Cow::Owned(d)),
-                _ => None,
-            }),
+        Some(PdfObject::Ref(r)) => file.resolve(*r).ok().and_then(|o| match o {
+            PdfObject::Dict(d) => Some(std::borrow::Cow::Owned(d)),
+            _ => None,
+        }),
         _ => None,
     }
 }

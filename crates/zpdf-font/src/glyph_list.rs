@@ -426,7 +426,6 @@ fn lookup_agl(name: &str) -> Option<&'static str> {
         "Chi" => "\u{03A7}",
         "Psi" => "\u{03A8}",
         // "Omega" handled in symbols block (U+03A9).
-
         _ => return None,
     })
 }
@@ -446,14 +445,29 @@ mod tests {
 
     #[test]
     fn typographic_punctuation() {
-        assert_eq!(glyph_name_to_string("quoteleft"), Some("\u{2018}".to_string()));
-        assert_eq!(glyph_name_to_string("quoteright"), Some("\u{2019}".to_string()));
-        assert_eq!(glyph_name_to_string("quotesingle"), Some("\u{0027}".to_string()));
+        assert_eq!(
+            glyph_name_to_string("quoteleft"),
+            Some("\u{2018}".to_string())
+        );
+        assert_eq!(
+            glyph_name_to_string("quoteright"),
+            Some("\u{2019}".to_string())
+        );
+        assert_eq!(
+            glyph_name_to_string("quotesingle"),
+            Some("\u{0027}".to_string())
+        );
         assert_eq!(glyph_name_to_string("bullet"), Some("\u{2022}".to_string()));
         assert_eq!(glyph_name_to_string("endash"), Some("\u{2013}".to_string()));
         assert_eq!(glyph_name_to_string("emdash"), Some("\u{2014}".to_string()));
-        assert_eq!(glyph_name_to_string("ellipsis"), Some("\u{2026}".to_string()));
-        assert_eq!(glyph_name_to_string("trademark"), Some("\u{2122}".to_string()));
+        assert_eq!(
+            glyph_name_to_string("ellipsis"),
+            Some("\u{2026}".to_string())
+        );
+        assert_eq!(
+            glyph_name_to_string("trademark"),
+            Some("\u{2122}".to_string())
+        );
     }
 
     #[test]
@@ -474,10 +488,22 @@ mod tests {
     #[test]
     fn latin1_letters() {
         assert_eq!(glyph_name_to_string("aacute"), Some("\u{00E1}".to_string()));
-        assert_eq!(glyph_name_to_string("Adieresis"), Some("\u{00C4}".to_string()));
-        assert_eq!(glyph_name_to_string("germandbls"), Some("\u{00DF}".to_string()));
-        assert_eq!(glyph_name_to_string("ydieresis"), Some("\u{00FF}".to_string()));
-        assert_eq!(glyph_name_to_string("Ydieresis"), Some("\u{0178}".to_string()));
+        assert_eq!(
+            glyph_name_to_string("Adieresis"),
+            Some("\u{00C4}".to_string())
+        );
+        assert_eq!(
+            glyph_name_to_string("germandbls"),
+            Some("\u{00DF}".to_string())
+        );
+        assert_eq!(
+            glyph_name_to_string("ydieresis"),
+            Some("\u{00FF}".to_string())
+        );
+        assert_eq!(
+            glyph_name_to_string("Ydieresis"),
+            Some("\u{0178}".to_string())
+        );
         assert_eq!(glyph_name_to_string("OE"), Some("\u{0152}".to_string()));
         assert_eq!(glyph_name_to_string("oe"), Some("\u{0153}".to_string()));
         assert_eq!(glyph_name_to_string("Lslash"), Some("\u{0141}".to_string()));
@@ -507,13 +533,13 @@ mod tests {
     #[test]
     fn uni_decoding() {
         // U+4E2D = 中
-        assert_eq!(glyph_name_to_string("uni4E2D"), Some("\u{4E2D}".to_string()));
+        assert_eq!(
+            glyph_name_to_string("uni4E2D"),
+            Some("\u{4E2D}".to_string())
+        );
         assert_eq!(glyph_name_to_string("uni0041"), Some("A".to_string()));
         // Multiple groups concatenated.
-        assert_eq!(
-            glyph_name_to_string("uni00410042"),
-            Some("AB".to_string())
-        );
+        assert_eq!(glyph_name_to_string("uni00410042"), Some("AB".to_string()));
         // Surrogate half is skipped; with only a surrogate group the result is None.
         assert_eq!(glyph_name_to_string("uniD800"), None);
         // Mixed: valid + surrogate -> just the valid char.
@@ -528,8 +554,14 @@ mod tests {
     fn u_decoding() {
         // 4 to 6 uppercase hex digits.
         assert_eq!(glyph_name_to_string("u4E2D"), Some("\u{4E2D}".to_string()));
-        assert_eq!(glyph_name_to_string("u1F600"), Some("\u{1F600}".to_string()));
-        assert_eq!(glyph_name_to_string("u10FFFF"), Some("\u{10FFFF}".to_string()));
+        assert_eq!(
+            glyph_name_to_string("u1F600"),
+            Some("\u{1F600}".to_string())
+        );
+        assert_eq!(
+            glyph_name_to_string("u10FFFF"),
+            Some("\u{10FFFF}".to_string())
+        );
         // Too short (3) and too long (7) -> None.
         assert_eq!(glyph_name_to_string("u4E2"), None);
         assert_eq!(glyph_name_to_string("u10FFFFF"), None);

@@ -234,10 +234,7 @@ impl<'a> Lexer<'a> {
             b"false" => Ok(PdfObject::Bool(false)),
             _ => Err(Error::InvalidObject(
                 start as u64,
-                format!(
-                    "unexpected keyword: {}",
-                    String::from_utf8_lossy(word)
-                ),
+                format!("unexpected keyword: {}", String::from_utf8_lossy(word)),
             )),
         }
     }
@@ -255,10 +252,7 @@ impl<'a> Lexer<'a> {
             b"null" => Ok(PdfObject::Null),
             _ => Err(Error::InvalidObject(
                 start as u64,
-                format!(
-                    "unexpected keyword: {}",
-                    String::from_utf8_lossy(word)
-                ),
+                format!("unexpected keyword: {}", String::from_utf8_lossy(word)),
             )),
         }
     }
@@ -399,9 +393,9 @@ mod tests {
 
     #[test]
     fn lex_negative_real() {
-        let mut lex = Lexer::new(b"-3.14 ", 0);
+        let mut lex = Lexer::new(b"-3.5 ", 0);
         match lex.next_token().unwrap() {
-            PdfObject::Real(n) => assert!((n - (-3.14)).abs() < 1e-10),
+            PdfObject::Real(n) => assert!((n - (-3.5)).abs() < 1e-10),
             other => panic!("expected Real, got {other:?}"),
         }
     }
@@ -420,20 +414,14 @@ mod tests {
     fn lex_literal_string_nested_parens() {
         let mut lex = Lexer::new(b"(a (b) c)", 0);
         let obj = lex.next_token().unwrap();
-        assert_eq!(
-            obj,
-            PdfObject::String(PdfString::new(b"a (b) c".to_vec()))
-        );
+        assert_eq!(obj, PdfObject::String(PdfString::new(b"a (b) c".to_vec())));
     }
 
     #[test]
     fn lex_hex_string() {
         let mut lex = Lexer::new(b"<48656C6C6F>", 0);
         let obj = lex.next_token().unwrap();
-        assert_eq!(
-            obj,
-            PdfObject::String(PdfString::new(b"Hello".to_vec()))
-        );
+        assert_eq!(obj, PdfObject::String(PdfString::new(b"Hello".to_vec())));
     }
 
     #[test]
@@ -479,10 +467,7 @@ mod tests {
     fn lex_indirect_ref_in_array() {
         let mut lex = Lexer::new(b"[12 0 R]", 0);
         let obj = lex.next_token().unwrap();
-        assert_eq!(
-            obj,
-            PdfObject::Array(vec![PdfObject::Ref(ObjectId(12, 0))])
-        );
+        assert_eq!(obj, PdfObject::Array(vec![PdfObject::Ref(ObjectId(12, 0))]));
     }
 
     #[test]

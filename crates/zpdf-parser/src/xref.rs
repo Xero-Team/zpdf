@@ -6,9 +6,18 @@ use crate::lexer::Lexer;
 
 #[derive(Debug, Clone)]
 pub enum XrefEntry {
-    InUse { offset: u64, gen: u16 },
-    Free { next: u32, gen: u16 },
-    Compressed { stream_obj: u32, index_in_stream: u32 },
+    InUse {
+        offset: u64,
+        gen: u16,
+    },
+    Free {
+        next: u32,
+        gen: u16,
+    },
+    Compressed {
+        stream_obj: u32,
+        index_in_stream: u32,
+    },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -142,16 +151,22 @@ fn parse_xref_stream(
 
             match entry_type {
                 0 => {
-                    table.insert(id, XrefEntry::Free {
-                        next: field2 as u32,
-                        gen: field3 as u16,
-                    });
+                    table.insert(
+                        id,
+                        XrefEntry::Free {
+                            next: field2 as u32,
+                            gen: field3 as u16,
+                        },
+                    );
                 }
                 1 => {
-                    table.insert(id, XrefEntry::InUse {
-                        offset: field2,
-                        gen: field3 as u16,
-                    });
+                    table.insert(
+                        id,
+                        XrefEntry::InUse {
+                            offset: field2,
+                            gen: field3 as u16,
+                        },
+                    );
                 }
                 2 => {
                     table.insert(
@@ -169,12 +184,10 @@ fn parse_xref_stream(
 
     // The xref stream dict itself serves as the trailer
     let trailer = dict.clone();
-    let prev = trailer
-        .get("Prev")
-        .and_then(|obj| match obj {
-            PdfObject::Integer(n) => Some(*n as u64),
-            _ => None,
-        });
+    let prev = trailer.get("Prev").and_then(|obj| match obj {
+        PdfObject::Integer(n) => Some(*n as u64),
+        _ => None,
+    });
 
     Ok((trailer, prev))
 }
@@ -215,9 +228,21 @@ fn parse_traditional_xref(
             let id = ObjectId(first_obj + i, gen);
 
             if in_use {
-                table.insert(id, XrefEntry::InUse { offset: entry_offset, gen });
+                table.insert(
+                    id,
+                    XrefEntry::InUse {
+                        offset: entry_offset,
+                        gen,
+                    },
+                );
             } else {
-                table.insert(id, XrefEntry::Free { next: entry_offset as u32, gen });
+                table.insert(
+                    id,
+                    XrefEntry::Free {
+                        next: entry_offset as u32,
+                        gen,
+                    },
+                );
             }
 
             // Advance past the 20-byte entry
@@ -233,12 +258,10 @@ fn parse_traditional_xref(
         _ => return Err(Error::InvalidXref(pos as u64)),
     };
 
-    let prev = trailer
-        .get("Prev")
-        .and_then(|obj| match obj {
-            PdfObject::Integer(n) => Some(*n as u64),
-            _ => None,
-        });
+    let prev = trailer.get("Prev").and_then(|obj| match obj {
+        PdfObject::Integer(n) => Some(*n as u64),
+        _ => None,
+    });
 
     Ok((trailer, prev))
 }
@@ -265,11 +288,9 @@ fn find_startxref(data: &[u8]) -> Result<usize> {
         .position(|b| !b.is_ascii_digit())
         .unwrap_or(num_bytes.len());
 
-    let offset_str = std::str::from_utf8(&num_bytes[..num_end])
-        .map_err(|_| Error::InvalidXref(0))?;
-    let offset: usize = offset_str
-        .parse()
-        .map_err(|_| Error::InvalidXref(0))?;
+    let offset_str =
+        std::str::from_utf8(&num_bytes[..num_end]).map_err(|_| Error::InvalidXref(0))?;
+    let offset: usize = offset_str.parse().map_err(|_| Error::InvalidXref(0))?;
 
     Ok(offset)
 }

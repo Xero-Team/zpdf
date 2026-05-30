@@ -7,7 +7,7 @@
 ### P1.1 — 项目骨架
 - [x] Cargo workspace 搭建
 - [x] zpdf-core: 对象模型、错误类型、几何基础类型
-- [ ] CI 配置（cargo fmt / clippy / test）
+- [x] CI 配置（GitHub Actions：fmt / clippy / test 多平台 + tag 触发 release）
 
 ### P1.2 — Lexer 与 Object 解析
 - [x] PDF header 解析（`%PDF-X.Y`）
@@ -90,6 +90,7 @@ cargo run -p zpdf-cli -- dump tests/corpus/minimal.pdf 1 0
 - [x] Tc/Tw/Tz/TL/Ts/Tr 文本状态
 - [x] Type3 字体（CharProcs 内容流字形）
 - [x] TrueType 嵌入字体（ttf-parser 字形轮廓）
+- [x] Type1 嵌入字体（PostScript FontFile：eexec/charstring 解释器 + subrs/flex/seac）
 - [x] Type0/CID 字体（Identity-H, FontFile2）
 - [x] CID /W 宽度数组解析
 - [x] 基础字体：Type1 标准 14 字体
@@ -188,6 +189,8 @@ cargo run -p zpdf-cli -- render tests/corpus/sample.pdf -p 1 -o gpu_output.png -
 cargo run --example viewer -- tests/corpus/sample.pdf
 # 交互式 PDF 浏览器，60fps 缩放/翻页
 ```
+> 像素对比工具已就绪：`zpdf compare <a.png> <b.png> [--out diff.png] [--threshold N]`
+> 输出 差异像素% / MAE / RMSE / 最大通道差，并生成差异热力图（GPU↔CPU 验收可直接复用）。
 
 ---
 
@@ -244,8 +247,8 @@ cargo run --example viewer -- tests/corpus/sample.pdf
 - [ ] Crypt filter
 
 ### P4.8 — 文本提取增强
-- [ ] 结构化文本提取（坐标、字体、大小）
-- [ ] 阅读顺序启发式
+- [x] 结构化文本提取（坐标、大小：TextSpan）
+- [x] 阅读顺序启发式（递归 XY-cut：列检测 + 整行重组）
 - [ ] 表格检测
 
 ### P4.9 — PDF 2.0

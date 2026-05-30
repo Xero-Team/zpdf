@@ -1,5 +1,7 @@
 # zpdf
 
+[![CI](https://github.com/Xero-Team/zpdf/actions/workflows/ci.yml/badge.svg)](https://github.com/Xero-Team/zpdf/actions/workflows/ci.yml)
+
 Pure Rust PDF parsing and rendering library with wgpu GPU acceleration support.
 
 ## Features

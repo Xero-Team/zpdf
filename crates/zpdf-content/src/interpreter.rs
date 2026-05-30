@@ -577,7 +577,8 @@ impl<'a> ContentInterpreter<'a> {
                                                 return ActiveColorSpace::ICCBased(n);
                                             }
                                             if let Ok(icc_stream) = icc_obj.as_stream() {
-                                                let n = icc_stream.dict.get_i64("N").unwrap_or(3) as u8;
+                                                let n =
+                                                    icc_stream.dict.get_i64("N").unwrap_or(3) as u8;
                                                 return ActiveColorSpace::ICCBased(n);
                                             }
                                         }
@@ -930,12 +931,7 @@ impl<'a> ContentInterpreter<'a> {
         // Build page font ObjectId mapping for collision detection
         let page_font_ids: HashMap<String, ObjectId> = self
             .resources
-            .map(|r| {
-                r.fonts
-                    .iter()
-                    .map(|(k, v)| (k.clone(), *v))
-                    .collect()
-            })
+            .map(|r| r.fonts.iter().map(|(k, v)| (k.clone(), *v)).collect())
             .unwrap_or_default();
 
         let mut overrides = HashMap::new();
@@ -1015,11 +1011,7 @@ impl<'a> ContentInterpreter<'a> {
                     result.line_to(p.transform(ctm));
                 }
                 PathElement::CurveTo(c1, c2, end) => {
-                    result.curve_to(
-                        c1.transform(ctm),
-                        c2.transform(ctm),
-                        end.transform(ctm),
-                    );
+                    result.curve_to(c1.transform(ctm), c2.transform(ctm), end.transform(ctm));
                 }
                 PathElement::Close => {
                     result.close();
@@ -1032,9 +1024,9 @@ impl<'a> ContentInterpreter<'a> {
     fn current_point(&self) -> Point {
         for elem in self.current_path.elements.iter().rev() {
             match *elem {
-                PathElement::MoveTo(p)
-                | PathElement::LineTo(p)
-                | PathElement::CurveTo(_, _, p) => return p,
+                PathElement::MoveTo(p) | PathElement::LineTo(p) | PathElement::CurveTo(_, _, p) => {
+                    return p
+                }
                 PathElement::Close => {}
             }
         }

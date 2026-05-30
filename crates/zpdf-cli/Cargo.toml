@@ -1,6 +1,6 @@
 [package]
 name = "zpdf-cli"
-description = "Command-line tool for zpdf: info, dump, render, text"
+description = "Command-line tool for zpdf: info, dump, render, text, compare"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
@@ -12,3 +12,4 @@ path = "src/main.rs"
 
 [dependencies]
 zpdf.workspace = true
+image.workspace = true

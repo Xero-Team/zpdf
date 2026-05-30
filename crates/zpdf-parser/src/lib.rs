@@ -51,9 +51,7 @@ impl PdfFile {
             XrefEntry::Compressed {
                 stream_obj,
                 index_in_stream,
-            } => {
-                self.extract_from_object_stream(*stream_obj, *index_in_stream)
-            }
+            } => self.extract_from_object_stream(*stream_obj, *index_in_stream),
             XrefEntry::Free { .. } => Err(zpdf_core::Error::ObjectNotFound(id)),
         }
     }

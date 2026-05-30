@@ -2,6 +2,7 @@ pub mod cmap;
 pub mod encoding;
 pub mod glyph_list;
 pub mod standard_fonts;
+pub mod type1;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -70,6 +71,9 @@ pub struct LoadedFont {
     pub to_unicode: Option<cmap::ToUnicodeMap>,
     /// Symbolic flag from the FontDescriptor (use the font's built-in cmap, not a base encoding).
     pub symbolic: bool,
+    /// Parsed embedded Type 1 (PostScript) font program, when the embedded data is
+    /// Type 1 rather than sfnt/CFF (ttf-parser cannot handle Type 1).
+    pub type1: Option<type1::Type1Font>,
 }
 
 #[derive(Debug, Clone)]
@@ -131,6 +135,24 @@ impl LoadedFont {
                 encoding: None,
                 to_unicode: None,
                 symbolic: false,
+                type1: None,
+            }
+        } else if let Some(t1) = type1::Type1Font::parse(&font_data) {
+            // Embedded Type 1 (PostScript) program — ttf-parser cannot parse it.
+            let units_per_em = t1.units_per_em;
+            Self {
+                font_type,
+                base_font,
+                font_data: None,
+                cid_widths,
+                units_per_em,
+                ascent: units_per_em * 0.8,
+                descent: -units_per_em * 0.2,
+                cid_to_gid: None,
+                encoding: None,
+                to_unicode: None,
+                symbolic: false,
+                type1: Some(t1),
             }
         } else {
             tracing::debug!(
@@ -148,6 +170,7 @@ impl LoadedFont {
                 encoding: None,
                 to_unicode: None,
                 symbolic: false,
+                type1: None,
             }
         }
     }
@@ -172,6 +195,7 @@ impl LoadedFont {
             encoding: None,
             to_unicode: None,
             symbolic: false,
+            type1: None,
         })
     }
 
@@ -188,11 +212,15 @@ impl LoadedFont {
             encoding: None,
             to_unicode: None,
             symbolic: false,
+            type1: None,
         }
     }
 
     /// Get glyph outline for a given glyph ID (or CID for CID fonts).
     pub fn glyph_outline(&self, glyph_id: u16) -> Option<GlyphOutline> {
+        if let Some(t1) = &self.type1 {
+            return t1.glyph_outline_by_gid(glyph_id);
+        }
         let data = self.font_data.as_ref()?;
         let face = ttf_parser::Face::parse(data, 0).ok()?;
 
@@ -258,6 +286,25 @@ impl LoadedFont {
     /// Returns `None` if no glyph data is available or no mapping is found
     /// (callers typically fall back to treating the code as the GID).
     pub fn code_to_gid(&self, code: u16) -> Option<u16> {
+        // Embedded Type 1: resolve via the PDF /Encoding (or the font's built-in
+        // encoding) to a glyph name, then to the synthetic Type 1 glyph id.
+        if let Some(t1) = &self.type1 {
+            let code8 = code as u8;
+            if let Some(enc) = &self.encoding {
+                if let Some(name) = enc.glyph_name(code8) {
+                    if let Some(g) = t1.gid_for_name(name) {
+                        return Some(g);
+                    }
+                }
+            }
+            if let Some(name) = t1.builtin_name(code8) {
+                if let Some(g) = t1.gid_for_name(name) {
+                    return Some(g);
+                }
+            }
+            return None;
+        }
+
         let data = self.font_data.as_ref()?;
         let face = ttf_parser::Face::parse(data, 0).ok()?;
         let code8 = code as u8;
@@ -377,7 +424,7 @@ impl LoadedFont {
     }
 
     pub fn has_font_data(&self) -> bool {
-        self.font_data.is_some() || self.is_type3()
+        self.font_data.is_some() || self.is_type3() || self.type1.is_some()
     }
 
     pub fn is_type3(&self) -> bool {
@@ -410,9 +457,7 @@ impl LoadedFont {
     pub fn type3_glyph_width(&self, char_code: u16) -> f64 {
         match &self.font_type {
             PdfFontType::Type3 {
-                widths,
-                first_char,
-                ..
+                widths, first_char, ..
             } => {
                 let idx = char_code.checked_sub(*first_char).unwrap_or(0) as usize;
                 widths.get(idx).copied().unwrap_or(1000.0)
@@ -474,7 +519,9 @@ fn build_cff_encoding_map(otf_data: &[u8]) -> Option<HashMap<u16, u16>> {
 }
 
 fn parse_cff_encoding(cff: &[u8]) -> Option<HashMap<u16, u16>> {
-    if cff.len() < 5 { return None; }
+    if cff.len() < 5 {
+        return None;
+    }
     let header_size = cff[2] as usize;
 
     // Skip Name INDEX
@@ -483,9 +530,13 @@ fn parse_cff_encoding(cff: &[u8]) -> Option<HashMap<u16, u16>> {
 
     // Top DICT INDEX
     let top_dict_index_start = pos;
-    if pos + 2 > cff.len() { return None; }
+    if pos + 2 > cff.len() {
+        return None;
+    }
     let count = u16::from_be_bytes([cff[pos], cff[pos + 1]]) as usize;
-    if count == 0 { return None; }
+    if count == 0 {
+        return None;
+    }
     pos += 2;
     let off_size = cff[pos] as usize;
     pos += 1;
@@ -546,29 +597,39 @@ fn parse_cff_encoding(cff: &[u8]) -> Option<HashMap<u16, u16>> {
 
     // Custom encoding
     let enc = encoding_offset as usize;
-    if enc >= cff.len() { return None; }
+    if enc >= cff.len() {
+        return None;
+    }
     let format = cff[enc] & 0x7f;
     let mut map = HashMap::new();
 
     match format {
         0 => {
             // Format 0: nCodes, then array of codes
-            if enc + 1 >= cff.len() { return None; }
+            if enc + 1 >= cff.len() {
+                return None;
+            }
             let n_codes = cff[enc + 1] as usize;
             for i in 0..n_codes {
-                if enc + 2 + i >= cff.len() { break; }
+                if enc + 2 + i >= cff.len() {
+                    break;
+                }
                 let code = cff[enc + 2 + i] as u16;
                 map.insert(code, (i + 1) as u16);
             }
         }
         1 => {
             // Format 1: nRanges, then [first, nLeft] pairs
-            if enc + 1 >= cff.len() { return None; }
+            if enc + 1 >= cff.len() {
+                return None;
+            }
             let n_ranges = cff[enc + 1] as usize;
             let mut gid: u16 = 1;
             let mut p = enc + 2;
             for _ in 0..n_ranges {
-                if p + 2 > cff.len() { break; }
+                if p + 2 > cff.len() {
+                    break;
+                }
                 let first = cff[p] as u16;
                 let n_left = cff[p + 1] as u16;
                 for j in 0..=n_left {
@@ -581,11 +642,22 @@ fn parse_cff_encoding(cff: &[u8]) -> Option<HashMap<u16, u16>> {
         _ => return None,
     }
 
-    if map.is_empty() { None } else { Some(map) }
+    if map.is_empty() {
+        None
+    } else {
+        Some(map)
+    }
 }
 
-fn parse_charset_to_gid_sid(cff: &[u8], charset_offset: usize, num_glyphs: usize, gid_to_sid: &mut HashMap<u16, u16>) {
-    if charset_offset >= cff.len() { return; }
+fn parse_charset_to_gid_sid(
+    cff: &[u8],
+    charset_offset: usize,
+    num_glyphs: usize,
+    gid_to_sid: &mut HashMap<u16, u16>,
+) {
+    if charset_offset >= cff.len() {
+        return;
+    }
     let format = cff[charset_offset];
     let mut p = charset_offset + 1;
     let mut gid: u16 = 1;
@@ -593,7 +665,9 @@ fn parse_charset_to_gid_sid(cff: &[u8], charset_offset: usize, num_glyphs: usize
     match format {
         0 => {
             while gid < num_glyphs as u16 {
-                if p + 2 > cff.len() { break; }
+                if p + 2 > cff.len() {
+                    break;
+                }
                 let sid = u16::from_be_bytes([cff[p], cff[p + 1]]);
                 gid_to_sid.insert(gid, sid);
                 p += 2;
@@ -602,28 +676,40 @@ fn parse_charset_to_gid_sid(cff: &[u8], charset_offset: usize, num_glyphs: usize
         }
         1 => {
             while gid < num_glyphs as u16 {
-                if p + 3 > cff.len() { break; }
+                if p + 3 > cff.len() {
+                    break;
+                }
                 let first = u16::from_be_bytes([cff[p], cff[p + 1]]);
                 let n_left = cff[p + 2] as u16;
                 for j in 0..=n_left {
-                    let Some(sid) = first.checked_add(j) else { break; };
+                    let Some(sid) = first.checked_add(j) else {
+                        break;
+                    };
                     gid_to_sid.insert(gid, sid);
                     gid += 1;
-                    if gid >= num_glyphs as u16 { break; }
+                    if gid >= num_glyphs as u16 {
+                        break;
+                    }
                 }
                 p += 3;
             }
         }
         2 => {
             while gid < num_glyphs as u16 {
-                if p + 4 > cff.len() { break; }
+                if p + 4 > cff.len() {
+                    break;
+                }
                 let first = u16::from_be_bytes([cff[p], cff[p + 1]]);
                 let n_left = u16::from_be_bytes([cff[p + 2], cff[p + 3]]);
                 for j in 0..=n_left {
-                    let Some(sid) = first.checked_add(j) else { break; };
+                    let Some(sid) = first.checked_add(j) else {
+                        break;
+                    };
                     gid_to_sid.insert(gid, sid);
                     gid += 1;
-                    if gid >= num_glyphs as u16 { break; }
+                    if gid >= num_glyphs as u16 {
+                        break;
+                    }
                 }
                 p += 4;
             }
@@ -652,7 +738,9 @@ fn standard_encoding() -> [u16; 256] {
     enc[45] = 14; // hyphen
     enc[46] = 15; // period
     enc[47] = 16; // slash
-    for i in 48..=57 { enc[i] = (i - 48 + 17) as u16; } // 0-9
+    for i in 48..=57 {
+        enc[i] = (i - 48 + 17) as u16;
+    } // 0-9
     enc[58] = 27; // colon
     enc[59] = 28; // semicolon
     enc[60] = 29; // less
@@ -660,14 +748,18 @@ fn standard_encoding() -> [u16; 256] {
     enc[62] = 31; // greater
     enc[63] = 32; // question
     enc[64] = 33; // at
-    for i in 65..=90 { enc[i] = (i - 65 + 34) as u16; } // A-Z
+    for i in 65..=90 {
+        enc[i] = (i - 65 + 34) as u16;
+    } // A-Z
     enc[91] = 60; // bracketleft
     enc[92] = 61; // backslash
     enc[93] = 62; // bracketright
     enc[94] = 63; // asciicircum
     enc[95] = 64; // underscore
     enc[96] = 65; // quoteleft
-    for i in 97..=122 { enc[i] = (i - 97 + 66) as u16; } // a-z
+    for i in 97..=122 {
+        enc[i] = (i - 97 + 66) as u16;
+    } // a-z
     enc[123] = 92; // braceleft
     enc[124] = 93; // bar
     enc[125] = 94; // braceright
@@ -730,14 +822,25 @@ fn standard_encoding() -> [u16; 256] {
 }
 
 fn find_cff_table(data: &[u8]) -> Option<&[u8]> {
-    if data.len() < 12 { return None; }
+    if data.len() < 12 {
+        return None;
+    }
     let num_tables = u16::from_be_bytes([data[4], data[5]]) as usize;
     for i in 0..num_tables {
         let rec = 12 + i * 16;
-        if rec + 16 > data.len() { break; }
+        if rec + 16 > data.len() {
+            break;
+        }
         if &data[rec..rec + 4] == b"CFF " {
-            let offset = u32::from_be_bytes([data[rec + 8], data[rec + 9], data[rec + 10], data[rec + 11]]) as usize;
-            let length = u32::from_be_bytes([data[rec + 12], data[rec + 13], data[rec + 14], data[rec + 15]]) as usize;
+            let offset =
+                u32::from_be_bytes([data[rec + 8], data[rec + 9], data[rec + 10], data[rec + 11]])
+                    as usize;
+            let length = u32::from_be_bytes([
+                data[rec + 12],
+                data[rec + 13],
+                data[rec + 14],
+                data[rec + 15],
+            ]) as usize;
             if offset + length <= data.len() {
                 return Some(&data[offset..offset + length]);
             }
@@ -747,7 +850,9 @@ fn find_cff_table(data: &[u8]) -> Option<&[u8]> {
 }
 
 fn parse_cff_charset(cff: &[u8]) -> Option<HashMap<u16, u16>> {
-    if cff.len() < 5 { return None; }
+    if cff.len() < 5 {
+        return None;
+    }
     let header_size = cff[2] as usize;
 
     // Skip Name INDEX
@@ -759,9 +864,13 @@ fn parse_cff_charset(cff: &[u8]) -> Option<HashMap<u16, u16>> {
     let top_dict_index_end = skip_cff_index(cff, pos)?;
 
     // Parse Top DICT INDEX to get the data
-    if pos + 2 > cff.len() { return None; }
+    if pos + 2 > cff.len() {
+        return None;
+    }
     let count = u16::from_be_bytes([cff[pos], cff[pos + 1]]) as usize;
-    if count == 0 { return None; }
+    if count == 0 {
+        return None;
+    }
     pos += 2;
     let off_size = cff[pos] as usize;
     pos += 1;
@@ -805,7 +914,9 @@ fn parse_cff_charset(cff: &[u8]) -> Option<HashMap<u16, u16>> {
     }
 
     let cs = charset_offset as usize;
-    if cs >= cff.len() { return None; }
+    if cs >= cff.len() {
+        return None;
+    }
 
     let format = cff[cs];
     let mut p = cs + 1;
@@ -815,7 +926,9 @@ fn parse_cff_charset(cff: &[u8]) -> Option<HashMap<u16, u16>> {
         0 => {
             // Format 0: array of SID/CIDs
             while gid < num_glyphs as u16 {
-                if p + 2 > cff.len() { break; }
+                if p + 2 > cff.len() {
+                    break;
+                }
                 let sid = u16::from_be_bytes([cff[p], cff[p + 1]]);
                 map.insert(sid, gid);
                 p += 2;
@@ -825,14 +938,20 @@ fn parse_cff_charset(cff: &[u8]) -> Option<HashMap<u16, u16>> {
         1 => {
             // Format 1: ranges [first_sid, n_left (u8)]
             while gid < num_glyphs as u16 {
-                if p + 3 > cff.len() { break; }
+                if p + 3 > cff.len() {
+                    break;
+                }
                 let first = u16::from_be_bytes([cff[p], cff[p + 1]]);
                 let n_left = cff[p + 2] as u16;
                 for j in 0..=n_left {
-                    let Some(sid) = first.checked_add(j) else { break; };
+                    let Some(sid) = first.checked_add(j) else {
+                        break;
+                    };
                     map.insert(sid, gid);
                     gid += 1;
-                    if gid >= num_glyphs as u16 { break; }
+                    if gid >= num_glyphs as u16 {
+                        break;
+                    }
                 }
                 p += 3;
             }
@@ -840,14 +959,20 @@ fn parse_cff_charset(cff: &[u8]) -> Option<HashMap<u16, u16>> {
         2 => {
             // Format 2: ranges [first_sid, n_left (u16)]
             while gid < num_glyphs as u16 {
-                if p + 4 > cff.len() { break; }
+                if p + 4 > cff.len() {
+                    break;
+                }
                 let first = u16::from_be_bytes([cff[p], cff[p + 1]]);
                 let n_left = u16::from_be_bytes([cff[p + 2], cff[p + 3]]);
                 for j in 0..=n_left {
-                    let Some(sid) = first.checked_add(j) else { break; };
+                    let Some(sid) = first.checked_add(j) else {
+                        break;
+                    };
                     map.insert(sid, gid);
                     gid += 1;
-                    if gid >= num_glyphs as u16 { break; }
+                    if gid >= num_glyphs as u16 {
+                        break;
+                    }
                 }
                 p += 4;
             }
@@ -859,20 +984,28 @@ fn parse_cff_charset(cff: &[u8]) -> Option<HashMap<u16, u16>> {
 }
 
 fn skip_cff_index(cff: &[u8], pos: usize) -> Option<usize> {
-    if pos + 2 > cff.len() { return None; }
+    if pos + 2 > cff.len() {
+        return None;
+    }
     let count = u16::from_be_bytes([cff[pos], cff[pos + 1]]) as usize;
-    if count == 0 { return Some(pos + 2); }
+    if count == 0 {
+        return Some(pos + 2);
+    }
     let off_size = cff[pos + 2] as usize;
     let offsets_start = pos + 3;
     let last_offset_pos = offsets_start + count * off_size;
-    if last_offset_pos + off_size > cff.len() { return None; }
+    if last_offset_pos + off_size > cff.len() {
+        return None;
+    }
     let last_offset = read_cff_offset(cff, last_offset_pos, off_size)?;
     let data_start = offsets_start + (count + 1) * off_size;
     Some(data_start + last_offset - 1)
 }
 
 fn read_cff_offset(cff: &[u8], pos: usize, size: usize) -> Option<usize> {
-    if pos + size > cff.len() { return None; }
+    if pos + size > cff.len() {
+        return None;
+    }
     let mut val = 0usize;
     for i in 0..size {
         val = (val << 8) | cff[pos + i] as usize;
@@ -881,7 +1014,9 @@ fn read_cff_offset(cff: &[u8], pos: usize, size: usize) -> Option<usize> {
 }
 
 fn count_cff_index_entries(cff: &[u8], pos: usize) -> Option<usize> {
-    if pos + 2 > cff.len() { return None; }
+    if pos + 2 > cff.len() {
+        return None;
+    }
     Some(u16::from_be_bytes([cff[pos], cff[pos + 1]]) as usize)
 }
 
@@ -904,7 +1039,9 @@ fn parse_top_dict_int(dict_data: &[u8], target_key: u8) -> Option<usize> {
             0..=21 => {
                 let key = if b0 == 12 {
                     pos += 1;
-                    if pos >= dict_data.len() { break; }
+                    if pos >= dict_data.len() {
+                        break;
+                    }
                     256 + dict_data[pos] as u16
                 } else {
                     b0 as u16
@@ -917,14 +1054,23 @@ fn parse_top_dict_int(dict_data: &[u8], target_key: u8) -> Option<usize> {
             }
             // Integer operands
             28 => {
-                if pos + 2 >= dict_data.len() { break; }
+                if pos + 2 >= dict_data.len() {
+                    break;
+                }
                 let val = i16::from_be_bytes([dict_data[pos + 1], dict_data[pos + 2]]) as i64;
                 operand_stack.push(val);
                 pos += 3;
             }
             29 => {
-                if pos + 4 >= dict_data.len() { break; }
-                let val = i32::from_be_bytes([dict_data[pos + 1], dict_data[pos + 2], dict_data[pos + 3], dict_data[pos + 4]]) as i64;
+                if pos + 4 >= dict_data.len() {
+                    break;
+                }
+                let val = i32::from_be_bytes([
+                    dict_data[pos + 1],
+                    dict_data[pos + 2],
+                    dict_data[pos + 3],
+                    dict_data[pos + 4],
+                ]) as i64;
                 operand_stack.push(val);
                 pos += 5;
             }
@@ -934,7 +1080,9 @@ fn parse_top_dict_int(dict_data: &[u8], target_key: u8) -> Option<usize> {
                 while pos < dict_data.len() {
                     let byte = dict_data[pos];
                     pos += 1;
-                    if (byte & 0x0f) == 0x0f || (byte >> 4) == 0x0f { break; }
+                    if (byte & 0x0f) == 0x0f || (byte >> 4) == 0x0f {
+                        break;
+                    }
                 }
                 operand_stack.push(0); // placeholder
             }
@@ -943,26 +1091,31 @@ fn parse_top_dict_int(dict_data: &[u8], target_key: u8) -> Option<usize> {
                 pos += 1;
             }
             247..=250 => {
-                if pos + 1 >= dict_data.len() { break; }
+                if pos + 1 >= dict_data.len() {
+                    break;
+                }
                 let val = (b0 as i64 - 247) * 256 + dict_data[pos + 1] as i64 + 108;
                 operand_stack.push(val);
                 pos += 2;
             }
             251..=254 => {
-                if pos + 1 >= dict_data.len() { break; }
+                if pos + 1 >= dict_data.len() {
+                    break;
+                }
                 let val = -(b0 as i64 - 251) * 256 - dict_data[pos + 1] as i64 - 108;
                 operand_stack.push(val);
                 pos += 2;
             }
-            _ => { pos += 1; }
+            _ => {
+                pos += 1;
+            }
         }
     }
     None
 }
 
 fn is_raw_cff(data: &[u8]) -> bool {
-    data.len() >= 4 && data[0] == 0x01 && data[1] == 0x00
-        && data[2] >= 1 && data[2] <= 8
+    data.len() >= 4 && data[0] == 0x01 && data[1] == 0x00 && data[2] >= 1 && data[2] <= 8
 }
 
 fn wrap_cff_in_otf(cff_data: &[u8]) -> Vec<u8> {
@@ -973,12 +1126,19 @@ fn wrap_cff_in_otf(cff_data: &[u8]) -> Vec<u8> {
 
     let header_size = 12 + num_tables as usize * 16;
 
-    fn pad4(n: u32) -> u32 { (n + 3) & !3 }
+    fn pad4(n: u32) -> u32 {
+        (n + 3) & !3
+    }
     fn compute_checksum(data: &[u8]) -> u32 {
         let mut sum: u32 = 0;
         let chunks = data.len() / 4;
         for i in 0..chunks {
-            let val = u32::from_be_bytes([data[i * 4], data[i * 4 + 1], data[i * 4 + 2], data[i * 4 + 3]]);
+            let val = u32::from_be_bytes([
+                data[i * 4],
+                data[i * 4 + 1],
+                data[i * 4 + 2],
+                data[i * 4 + 3],
+            ]);
             sum = sum.wrapping_add(val);
         }
         let remainder = data.len() % 4;

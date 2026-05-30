@@ -20,7 +20,10 @@ fn build_pdf(font_obj: &str, content: &str) -> Vec<u8> {
     push(&mut buf, "1 0 obj\n<</Type/Catalog/Pages 2 0 R>>\nendobj\n");
 
     offsets[2] = buf.len();
-    push(&mut buf, "2 0 obj\n<</Type/Pages/Kids[3 0 R]/Count 1>>\nendobj\n");
+    push(
+        &mut buf,
+        "2 0 obj\n<</Type/Pages/Kids[3 0 R]/Count 1>>\nendobj\n",
+    );
 
     offsets[3] = buf.len();
     push(

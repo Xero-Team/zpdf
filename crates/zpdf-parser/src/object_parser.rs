@@ -114,10 +114,7 @@ mod tests {
     #[test]
     fn parse_stream_object() {
         let content = b"BT /F1 12 Tf (Hello) Tj ET";
-        let obj_bytes = format!(
-            "5 0 obj\n<< /Length {} >>\nstream\n",
-            content.len()
-        );
+        let obj_bytes = format!("5 0 obj\n<< /Length {} >>\nstream\n", content.len());
         let mut data = obj_bytes.into_bytes();
         data.extend_from_slice(content);
         data.extend_from_slice(b"\nendstream\nendobj\n");

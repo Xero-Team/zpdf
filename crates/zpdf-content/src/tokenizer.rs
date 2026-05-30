@@ -155,10 +155,15 @@ impl<'a> ContentTokenizer<'a> {
         while let Some(b) = self.data.get(self.pos).copied() {
             self.pos += 1;
             match b {
-                b'(' => { depth += 1; buf.push(b'('); }
+                b'(' => {
+                    depth += 1;
+                    buf.push(b'(');
+                }
                 b')' => {
                     depth -= 1;
-                    if depth == 0 { break; }
+                    if depth == 0 {
+                        break;
+                    }
                     buf.push(b')');
                 }
                 b'\\' => {
@@ -210,8 +215,12 @@ impl<'a> ContentTokenizer<'a> {
         let mut high: Option<u8> = None;
         while let Some(&b) = self.data.get(self.pos) {
             self.pos += 1;
-            if b == b'>' { break; }
-            if is_whitespace(b) { continue; }
+            if b == b'>' {
+                break;
+            }
+            if is_whitespace(b) {
+                continue;
+            }
             let nibble = match b {
                 b'0'..=b'9' => b - b'0',
                 b'a'..=b'f' => b - b'a' + 10,
@@ -220,10 +229,15 @@ impl<'a> ContentTokenizer<'a> {
             };
             match high {
                 None => high = Some(nibble),
-                Some(h) => { buf.push((h << 4) | nibble); high = None; }
+                Some(h) => {
+                    buf.push((h << 4) | nibble);
+                    high = None;
+                }
             }
         }
-        if let Some(h) = high { buf.push(h << 4); }
+        if let Some(h) = high {
+            buf.push(h << 4);
+        }
         PdfString::new(buf)
     }
 
@@ -236,7 +250,9 @@ impl<'a> ContentTokenizer<'a> {
                 self.pos += 1;
                 break;
             }
-            if self.is_eof() { break; }
+            if self.is_eof() {
+                break;
+            }
             if let Some(ContentToken::Operand(obj)) = self.next_token() {
                 items.push(obj);
             }
@@ -253,7 +269,9 @@ impl<'a> ContentTokenizer<'a> {
                 self.pos += 2;
                 break;
             }
-            if self.is_eof() { break; }
+            if self.is_eof() {
+                break;
+            }
             let key = self.read_name();
             if let Some(ContentToken::Operand(val)) = self.next_token() {
                 dict.insert(key, val);
@@ -282,7 +300,10 @@ impl<'a> ContentTokenizer<'a> {
         loop {
             self.skip_whitespace();
             if self.is_eof() {
-                return ContentToken::InlineImage { dict, data: Vec::new() };
+                return ContentToken::InlineImage {
+                    dict,
+                    data: Vec::new(),
+                };
             }
             if self.peek() == Some(b'/') {
                 let key = self.read_name();
@@ -306,7 +327,10 @@ impl<'a> ContentTokenizer<'a> {
                     if self.data[self.pos..].starts_with(b"EI") {
                         self.pos += 2;
                     }
-                    return ContentToken::InlineImage { dict, data: Vec::new() };
+                    return ContentToken::InlineImage {
+                        dict,
+                        data: Vec::new(),
+                    };
                 }
             }
         }
@@ -379,9 +403,8 @@ impl<'a> ContentTokenizer<'a> {
         while i + 2 <= data.len() {
             if &data[i..i + 2] == b"EI" {
                 let prev_ws = i == start || is_whitespace(data[i - 1]);
-                let next_ok = i + 2 >= data.len()
-                    || is_whitespace(data[i + 2])
-                    || is_delimiter(data[i + 2]);
+                let next_ok =
+                    i + 2 >= data.len() || is_whitespace(data[i + 2]) || is_delimiter(data[i + 2]);
                 if prev_ws && next_ok {
                     let mut end = i;
                     if end > start && is_whitespace(data[end - 1]) {
@@ -434,7 +457,10 @@ fn is_whitespace(b: u8) -> bool {
 }
 
 fn is_delimiter(b: u8) -> bool {
-    matches!(b, b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%')
+    matches!(
+        b,
+        b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%'
+    )
 }
 
 #[cfg(test)]
@@ -446,8 +472,13 @@ mod tests {
         let data = b"BT /F1 12 Tf (Hello) Tj ET";
         let tokens: Vec<_> = ContentTokenizer::new(data).collect();
         assert!(matches!(&tokens[0], ContentToken::Operator(s) if s == "BT"));
-        assert!(matches!(&tokens[1], ContentToken::Operand(PdfObject::Name(n)) if n.as_str() == "F1"));
-        assert!(matches!(&tokens[2], ContentToken::Operand(PdfObject::Integer(12))));
+        assert!(
+            matches!(&tokens[1], ContentToken::Operand(PdfObject::Name(n)) if n.as_str() == "F1")
+        );
+        assert!(matches!(
+            &tokens[2],
+            ContentToken::Operand(PdfObject::Integer(12))
+        ));
         assert!(matches!(&tokens[3], ContentToken::Operator(s) if s == "Tf"));
     }
 

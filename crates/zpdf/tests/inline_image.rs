@@ -15,14 +15,20 @@ fn build_pdf(content: &[u8]) -> Vec<u8> {
     offsets[1] = buf.len();
     push(&mut buf, "1 0 obj\n<</Type/Catalog/Pages 2 0 R>>\nendobj\n");
     offsets[2] = buf.len();
-    push(&mut buf, "2 0 obj\n<</Type/Pages/Kids[3 0 R]/Count 1>>\nendobj\n");
+    push(
+        &mut buf,
+        "2 0 obj\n<</Type/Pages/Kids[3 0 R]/Count 1>>\nendobj\n",
+    );
     offsets[3] = buf.len();
     push(
         &mut buf,
         "3 0 obj\n<</Type/Page/Parent 2 0 R/MediaBox[0 0 100 100]/Resources<<>>/Contents 4 0 R>>\nendobj\n",
     );
     offsets[4] = buf.len();
-    push(&mut buf, &format!("4 0 obj\n<</Length {}>>\nstream\n", content.len()));
+    push(
+        &mut buf,
+        &format!("4 0 obj\n<</Length {}>>\nstream\n", content.len()),
+    );
     buf.extend_from_slice(content);
     push(&mut buf, "\nendstream\nendobj\n");
 
@@ -66,5 +72,8 @@ fn inline_image_emits_draw_image() {
         .iter()
         .filter(|c| matches!(c, RenderCommand::DrawImage(_)))
         .count();
-    assert_eq!(draw_images, 1, "expected exactly one DrawImage from the inline image");
+    assert_eq!(
+        draw_images, 1,
+        "expected exactly one DrawImage from the inline image"
+    );
 }

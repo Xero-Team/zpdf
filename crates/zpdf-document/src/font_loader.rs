@@ -302,6 +302,7 @@ fn load_type3_font(
         encoding: None,
         to_unicode: None,
         symbolic: false,
+        type1: None,
     };
 
     Ok(font)

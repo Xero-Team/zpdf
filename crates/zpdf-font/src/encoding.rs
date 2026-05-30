@@ -136,10 +136,7 @@ const fn build_from(pairs: &[(u8, &'static str)]) -> EncodingTable {
 
 /// Seed a table with the shared printable-ASCII region, then apply extras.
 /// `standard_quotes` chooses the Standard spelling of codes 39 and 96.
-const fn build_ascii_based(
-    standard_quotes: bool,
-    extras: &[(u8, &'static str)],
-) -> EncodingTable {
+const fn build_ascii_based(standard_quotes: bool, extras: &[(u8, &'static str)]) -> EncodingTable {
     let mut table = build_from(&ASCII_COMMON);
     if standard_quotes {
         table[39] = Some("quoteright");

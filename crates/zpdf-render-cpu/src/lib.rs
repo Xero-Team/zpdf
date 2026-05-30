@@ -109,13 +109,7 @@ impl<'a> CpuRenderer<'a> {
         }
     }
 
-    fn render_fill(
-        &mut self,
-        path: &Path,
-        rule: &FillRule,
-        paint_spec: &Paint,
-        alpha: f32,
-    ) {
+    fn render_fill(&mut self, path: &Path, rule: &FillRule, paint_spec: &Paint, alpha: f32) {
         let Some(skia_path) = self.build_skia_path(path) else {
             return;
         };
@@ -135,13 +129,7 @@ impl<'a> CpuRenderer<'a> {
         }
     }
 
-    fn render_stroke(
-        &mut self,
-        path: &Path,
-        style: &StrokeStyle,
-        paint_spec: &Paint,
-        alpha: f32,
-    ) {
+    fn render_stroke(&mut self, path: &Path, style: &StrokeStyle, paint_spec: &Paint, alpha: f32) {
         let Some(skia_path) = self.build_skia_path(path) else {
             return;
         };
@@ -260,10 +248,7 @@ impl<'a> CpuRenderer<'a> {
         let w = pixmap.width();
         let h = pixmap.height();
 
-        self.blend_stack.push(BlendEntry {
-            pixmap,
-            blend_mode,
-        });
+        self.blend_stack.push(BlendEntry { pixmap, blend_mode });
 
         self.pixmap = tiny_skia::Pixmap::new(w, h);
     }
@@ -378,8 +363,12 @@ impl<'a> CpuRenderer<'a> {
         //
         // Compose as a single affine:
         let (a, b, c, d, e, f) = (
-            tm.a as f32, tm.b as f32, tm.c as f32,
-            tm.d as f32, tm.e as f32, tm.f as f32,
+            tm.a as f32,
+            tm.b as f32,
+            tm.c as f32,
+            tm.d as f32,
+            tm.e as f32,
+            tm.f as f32,
         );
 
         let (t_sx, t_kx, t_ky, t_sy, t_tx, t_ty) = if ctm_flips_y {
@@ -388,12 +377,12 @@ impl<'a> CpuRenderer<'a> {
             // screen_y = (b * ix/iw + d * (1 - iy/ih) + f) * s
             //          = (b*s/iw)*ix + (-d*s/ih)*iy + (d + f)*s
             (
-                a * s / iw,       // sx: screen_x per ix
-                -c * s / ih,      // kx: screen_x per iy
-                b * s / iw,       // ky: screen_y per ix
-                -d * s / ih,      // sy: screen_y per iy
-                (c + e) * s,      // tx
-                (d + f) * s,      // ty
+                a * s / iw,  // sx: screen_x per ix
+                -c * s / ih, // kx: screen_x per iy
+                b * s / iw,  // ky: screen_y per ix
+                -d * s / ih, // sy: screen_y per iy
+                (c + e) * s, // tx
+                (d + f) * s, // ty
             )
         } else {
             // screen_x = (a * ix/iw + c * (1 - iy/ih) + e) * s
@@ -415,14 +404,7 @@ impl<'a> CpuRenderer<'a> {
         let mut paint = tiny_skia::PixmapPaint::default();
         paint.opacity = draw.alpha;
 
-        pixmap.draw_pixmap(
-            0,
-            0,
-            src,
-            &paint,
-            transform,
-            self.current_clip.as_ref(),
-        );
+        pixmap.draw_pixmap(0, 0, src, &paint, transform, self.current_clip.as_ref());
     }
 
     fn render_outline_glyphs(
@@ -443,9 +425,8 @@ impl<'a> CpuRenderer<'a> {
 
             // Transform each glyph outline point:
             // glyph_coord (font units) → text space → user space → page space → pixel space
-            let skia_path = self.build_outline_transformed_path(
-                &outline, upem, font_size, tm, glyph.x,
-            );
+            let skia_path =
+                self.build_outline_transformed_path(&outline, upem, font_size, tm, glyph.x);
             if let Some(path) = skia_path {
                 if let Some(ref mut pixmap) = self.pixmap {
                     pixmap.fill_path(
@@ -473,36 +454,25 @@ impl<'a> CpuRenderer<'a> {
         for cmd in &outline.commands {
             match *cmd {
                 OutlineCommand::MoveTo(x, y) => {
-                    let (px, py) = self.outline_to_pixel(
-                        x, y, upem, font_size, tm, glyph_x_offset,
-                    );
+                    let (px, py) = self.outline_to_pixel(x, y, upem, font_size, tm, glyph_x_offset);
                     pb.move_to(px, py);
                 }
                 OutlineCommand::LineTo(x, y) => {
-                    let (px, py) = self.outline_to_pixel(
-                        x, y, upem, font_size, tm, glyph_x_offset,
-                    );
+                    let (px, py) = self.outline_to_pixel(x, y, upem, font_size, tm, glyph_x_offset);
                     pb.line_to(px, py);
                 }
                 OutlineCommand::QuadTo(x1, y1, x, y) => {
-                    let (px1, py1) = self.outline_to_pixel(
-                        x1, y1, upem, font_size, tm, glyph_x_offset,
-                    );
-                    let (px, py) = self.outline_to_pixel(
-                        x, y, upem, font_size, tm, glyph_x_offset,
-                    );
+                    let (px1, py1) =
+                        self.outline_to_pixel(x1, y1, upem, font_size, tm, glyph_x_offset);
+                    let (px, py) = self.outline_to_pixel(x, y, upem, font_size, tm, glyph_x_offset);
                     pb.quad_to(px1, py1, px, py);
                 }
                 OutlineCommand::CurveTo(x1, y1, x2, y2, x, y) => {
-                    let (px1, py1) = self.outline_to_pixel(
-                        x1, y1, upem, font_size, tm, glyph_x_offset,
-                    );
-                    let (px2, py2) = self.outline_to_pixel(
-                        x2, y2, upem, font_size, tm, glyph_x_offset,
-                    );
-                    let (px, py) = self.outline_to_pixel(
-                        x, y, upem, font_size, tm, glyph_x_offset,
-                    );
+                    let (px1, py1) =
+                        self.outline_to_pixel(x1, y1, upem, font_size, tm, glyph_x_offset);
+                    let (px2, py2) =
+                        self.outline_to_pixel(x2, y2, upem, font_size, tm, glyph_x_offset);
+                    let (px, py) = self.outline_to_pixel(x, y, upem, font_size, tm, glyph_x_offset);
                     pb.cubic_to(px1, py1, px2, py2, px, py);
                 }
                 OutlineCommand::Close => pb.close(),
@@ -598,7 +568,8 @@ impl<'a> CpuRenderer<'a> {
                             glyph.x,
                         ) {
                             let stroke = tiny_skia::Stroke {
-                                width: (style.width * font_matrix[0].abs() as f32
+                                width: (style.width
+                                    * font_matrix[0].abs() as f32
                                     * font_size
                                     * self.scale)
                                     .max(0.5),
@@ -635,26 +606,27 @@ impl<'a> CpuRenderer<'a> {
         for elem in &path.elements {
             match *elem {
                 PathElement::MoveTo(p) => {
-                    let (px, py) = self.type3_to_pixel(
-                        p.x, p.y, font_matrix, font_size, tm, glyph_x_offset,
-                    );
+                    let (px, py) =
+                        self.type3_to_pixel(p.x, p.y, font_matrix, font_size, tm, glyph_x_offset);
                     pb.move_to(px, py);
                 }
                 PathElement::LineTo(p) => {
-                    let (px, py) = self.type3_to_pixel(
-                        p.x, p.y, font_matrix, font_size, tm, glyph_x_offset,
-                    );
+                    let (px, py) =
+                        self.type3_to_pixel(p.x, p.y, font_matrix, font_size, tm, glyph_x_offset);
                     pb.line_to(px, py);
                 }
                 PathElement::CurveTo(c1, c2, end) => {
-                    let (x1, y1) = self.type3_to_pixel(
-                        c1.x, c1.y, font_matrix, font_size, tm, glyph_x_offset,
-                    );
-                    let (x2, y2) = self.type3_to_pixel(
-                        c2.x, c2.y, font_matrix, font_size, tm, glyph_x_offset,
-                    );
+                    let (x1, y1) =
+                        self.type3_to_pixel(c1.x, c1.y, font_matrix, font_size, tm, glyph_x_offset);
+                    let (x2, y2) =
+                        self.type3_to_pixel(c2.x, c2.y, font_matrix, font_size, tm, glyph_x_offset);
                     let (x, y) = self.type3_to_pixel(
-                        end.x, end.y, font_matrix, font_size, tm, glyph_x_offset,
+                        end.x,
+                        end.y,
+                        font_matrix,
+                        font_size,
+                        tm,
+                        glyph_x_offset,
                     );
                     pb.cubic_to(x1, y1, x2, y2, x, y);
                 }
@@ -707,7 +679,6 @@ impl<'a> CpuRenderer<'a> {
 
         (px, py)
     }
-
 }
 
 impl<'a> Default for CpuRenderer<'a> {
@@ -743,11 +714,12 @@ impl<'a> RenderBackend for CpuRenderer<'a> {
         let w = (info.page_rect.width() * info.scale as f64) as u32;
         let h = (info.page_rect.height() * info.scale as f64) as u32;
 
-        let mut pixmap =
-            tiny_skia::Pixmap::new(w, h).ok_or(CpuRenderError::PixmapCreation)?;
+        let mut pixmap = tiny_skia::Pixmap::new(w, h).ok_or(CpuRenderError::PixmapCreation)?;
 
         let bg = &info.background;
-        pixmap.fill(tiny_skia::Color::from_rgba(bg.r, bg.g, bg.b, bg.a).unwrap_or(tiny_skia::Color::WHITE));
+        pixmap.fill(
+            tiny_skia::Color::from_rgba(bg.r, bg.g, bg.b, bg.a).unwrap_or(tiny_skia::Color::WHITE),
+        );
 
         self.pixmap = Some(pixmap);
         Ok(())
