@@ -1,0 +1,62 @@
+name: Release
+
+# Build the `zpdf` CLI for each platform and attach the archives to the GitHub
+# Release for the pushed tag (e.g. `git tag v0.1.0 && git push origin v0.1.0`).
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # required to create/update the GitHub Release
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: macos-latest
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release -p zpdf-cli --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          dist="zpdf-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir "$dist"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "target/${{ matrix.target }}/release/zpdf.exe" "$dist/"
+          else
+            cp "target/${{ matrix.target }}/release/zpdf" "$dist/"
+          fi
+          cp README.md ROADMAP.md LICENSE* "$dist/" 2>/dev/null || true
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            7z a "${dist}.zip" "$dist" >/dev/null
+            echo "ASSET=${dist}.zip" >> "$GITHUB_ENV"
+          else
+            tar czf "${dist}.tar.gz" "$dist"
+            echo "ASSET=${dist}.tar.gz" >> "$GITHUB_ENV"
+          fi
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ASSET }}
+          generate_release_notes: true
