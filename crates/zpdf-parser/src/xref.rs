@@ -38,6 +38,14 @@ impl XrefTable {
         self.entries.entry(id).or_insert(entry);
     }
 
+    /// Insert overwriting any existing entry. Used by tail-scan recovery, where a
+    /// later byte offset for the same ObjectId supersedes an earlier one
+    /// (incremental-update semantics). The regular `insert` is first-wins because
+    /// the /Prev chain walks newest-to-oldest.
+    pub fn insert_overwrite(&mut self, id: ObjectId, entry: XrefEntry) {
+        self.entries.insert(id, entry);
+    }
+
     pub fn len(&self) -> usize {
         self.entries.len()
     }
@@ -58,9 +66,16 @@ pub fn parse_xref_and_trailer(data: &[u8], limits: &ParseLimits) -> Result<(Xref
     let xref_offset = startxref_offset;
     let (trailer, next_prev) = parse_xref_section(data, xref_offset, &mut table, limits)?;
 
-    // Follow /Prev chain for incremental updates
+    // Follow /Prev chain for incremental updates. Track visited offsets so a
+    // malformed /Prev cycle (a section pointing at itself, or two pointing at
+    // each other) terminates instead of looping forever.
+    let mut visited = std::collections::HashSet::new();
+    visited.insert(xref_offset);
     let mut prev = next_prev;
     while let Some(prev_offset) = prev {
+        if !visited.insert(prev_offset as usize) {
+            break;
+        }
         let (_, next) = parse_xref_section(data, prev_offset as usize, &mut table, limits)?;
         prev = next;
     }
@@ -74,8 +89,14 @@ fn parse_xref_section(
     table: &mut XrefTable,
     limits: &ParseLimits,
 ) -> Result<(PdfDict, Option<u64>)> {
+    // Guard against a garbage `startxref`/`/Prev` offset pointing past EOF.
+    // Returning Err (rather than panicking on the slice below) lets the caller
+    // fall back to tail-scan recovery.
+    if offset >= data.len() {
+        return Err(Error::InvalidXref(offset as u64));
+    }
     if data[offset..].starts_with(b"xref") {
-        parse_traditional_xref(data, offset, table)
+        parse_traditional_xref(data, offset, table, limits)
     } else {
         parse_xref_stream(data, offset, table, limits)
     }
@@ -194,8 +215,8 @@ fn parse_xref_stream(
 
 fn read_field(data: &[u8], width: usize) -> u64 {
     let mut val = 0u64;
-    for i in 0..width {
-        val = (val << 8) | data[i] as u64;
+    for &byte in &data[..width] {
+        val = (val << 8) | byte as u64;
     }
     val
 }
@@ -204,6 +225,7 @@ fn parse_traditional_xref(
     data: &[u8],
     offset: usize,
     table: &mut XrefTable,
+    limits: &ParseLimits,
 ) -> Result<(PdfDict, Option<u64>)> {
     let mut pos = offset + 4; // skip "xref"
     skip_eol(data, &mut pos);
@@ -211,6 +233,13 @@ fn parse_traditional_xref(
     // Parse subsections
     loop {
         skip_whitespace(data, &mut pos);
+
+        // Guard against a malformed/truncated table that ran the cursor off the
+        // end (e.g. a subsection /count larger than the entries that fit).
+        // Returning Err routes to tail-scan recovery instead of panicking.
+        if pos >= data.len() {
+            return Err(Error::InvalidXref(pos as u64));
+        }
 
         if data[pos..].starts_with(b"trailer") {
             pos += 7;
@@ -222,7 +251,14 @@ fn parse_traditional_xref(
 
         for i in 0..count {
             skip_whitespace(data, &mut pos);
-            let entry_data = &data[pos..pos + 20.min(data.len() - pos)];
+            // A standard entry is 20 bytes ("nnnnnnnnnn ggggg n \r\n"); 18 are
+            // the minimum parse_xref_entry needs. If fewer remain, the table is
+            // truncated/corrupt — bail to recovery rather than under/overflowing.
+            let avail = data.len().saturating_sub(pos);
+            if avail < 18 {
+                return Err(Error::InvalidXref(pos as u64));
+            }
+            let entry_data = &data[pos..pos + avail.min(20)];
 
             let (entry_offset, gen, in_use) = parse_xref_entry(entry_data)?;
             let id = ObjectId(first_obj + i, gen);
@@ -251,7 +287,7 @@ fn parse_traditional_xref(
     }
 
     // Parse trailer dictionary
-    let mut lex = Lexer::new(data, pos);
+    let mut lex = Lexer::new(data, pos, limits);
     let trailer_obj = lex.next_token()?;
     let trailer = match trailer_obj {
         PdfObject::Dict(d) => d,

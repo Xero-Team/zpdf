@@ -12,3 +12,9 @@ winnow.workspace = true
 flate2.workspace = true
 zune-jpeg.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+# Pure-Rust LZW codec (the backend used by the `tiff`/`gif` crates). Used ONLY
+# in tests as an independent, spec-conformant reference encoder so the LZW
+# decoder is validated against an external producer, not its own paired encoder.
+weezl = "0.1"

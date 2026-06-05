@@ -43,6 +43,9 @@ pub enum Error {
     #[error("stream size exceeded (max {0} bytes)")]
     StreamSizeLimit(u64),
 
+    #[error("string length exceeded (max {0} bytes)")]
+    StringLengthLimit(u32),
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }

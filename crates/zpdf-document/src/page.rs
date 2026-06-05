@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use zpdf_core::{Error, ObjectId, PdfName, PdfObject, Rect, Result};
+use zpdf_core::{ObjectId, PdfObject, Rect, Result};
 use zpdf_parser::PdfFile;
 
 #[derive(Debug)]

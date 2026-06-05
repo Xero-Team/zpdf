@@ -401,8 +401,10 @@ impl<'a> CpuRenderer<'a> {
 
         let transform = tiny_skia::Transform::from_row(t_sx, t_ky, t_kx, t_sy, t_tx, t_ty);
 
-        let mut paint = tiny_skia::PixmapPaint::default();
-        paint.opacity = draw.alpha;
+        let paint = tiny_skia::PixmapPaint {
+            opacity: draw.alpha,
+            ..Default::default()
+        };
 
         pixmap.draw_pixmap(0, 0, src, &paint, transform, self.current_clip.as_ref());
     }
@@ -674,7 +676,7 @@ impl<'a> CpuRenderer<'a> {
             page_y as f32 * self.scale
         } else {
             // Standard PDF coords: flip Y
-            (self.page_height as f32 - page_y as f32) * self.scale
+            (self.page_height - page_y as f32) * self.scale
         };
 
         (px, py)

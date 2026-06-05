@@ -1,11 +1,9 @@
 mod catalog;
 pub mod font_loader;
 pub mod page;
-mod resolver;
 
 pub use catalog::Catalog;
 pub use page::{PdfPage, ResourceDict};
-pub use resolver::Resolver;
 
 use std::sync::Arc;
 use zpdf_core::{ParseLimits, Result};

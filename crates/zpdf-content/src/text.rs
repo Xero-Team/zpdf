@@ -210,7 +210,7 @@ fn vertical_cut(idx: &[usize], spans: &[TextSpan], unit: f64) -> Option<(Vec<usi
     // Require the river to be supported by at least half the rows. A real column
     // gutter runs through most rows; a tabular field-gap (number | title) only
     // covers the subset of rows whose field happens to be short there.
-    if best_depth < ((rows.len() + 1) / 2).max(2) {
+    if best_depth < rows.len().div_ceil(2).max(2) {
         return None;
     }
 
@@ -250,16 +250,16 @@ fn horizontal_cut(
 
     let (mut best_gap, mut best_cut) = (0.0f64, 0.0f64);
     let mut cur_top = iv[0].1;
-    for k in 1..iv.len() {
-        if iv[k].0 > cur_top {
-            let gap = iv[k].0 - cur_top;
+    for &(lo, hi) in &iv[1..] {
+        if lo > cur_top {
+            let gap = lo - cur_top;
             if gap > best_gap {
                 best_gap = gap;
-                best_cut = (cur_top + iv[k].0) / 2.0;
+                best_cut = (cur_top + lo) / 2.0;
             }
-            cur_top = iv[k].1;
+            cur_top = hi;
         } else {
-            cur_top = cur_top.max(iv[k].1);
+            cur_top = cur_top.max(hi);
         }
     }
     if best_gap < thresh {
@@ -300,7 +300,6 @@ fn block_to_text(block: &[usize], spans: &[TextSpan], line_tol: f64) -> String {
         if (current_y - s.y).abs() > thresh {
             out.push('\n');
             current_y = s.y;
-            prev_end_x = None;
         } else if let Some(prev_x) = prev_end_x {
             let gap = s.x_bounds().0 - prev_x;
             let needs_space = gap > s.size as f64 * 0.25
@@ -384,5 +383,17 @@ mod tests {
             },
         ];
         assert_eq!(spans_to_text(spans, 2.0), "Hello World");
+    }
+
+    #[test]
+    fn new_line_has_no_leading_gap_space() {
+        // Line 1 ends far to the right; line 2 starts at the left. The line break
+        // must not produce a leading space on line 2 — this guards the removal of
+        // the dead `prev_end_x = None` store in the new-line branch.
+        let spans = vec![
+            span("AAAAAAAAAA", 50.0, 700.0, 12.0),
+            span("B", 50.0, 686.0, 12.0),
+        ];
+        assert_eq!(spans_to_text(spans, 2.0), "AAAAAAAAAA\nB");
     }
 }

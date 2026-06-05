@@ -17,7 +17,7 @@ impl<'a> ObjectParser<'a> {
     /// Parse an indirect object at the given byte offset.
     /// Expected format: `<num> <gen> obj <value> endobj`
     pub fn parse_indirect_at(&self, offset: usize) -> Result<PdfObject> {
-        let mut lex = Lexer::new(self.data, offset);
+        let mut lex = Lexer::new(self.data, offset, self.limits);
 
         let _obj_num = lex.next_token()?;
         let _gen_num = lex.next_token()?;
@@ -65,7 +65,7 @@ impl<'a> ObjectParser<'a> {
     fn read_stream(&self, dict: PdfDict, keyword_pos: usize) -> Result<PdfStream> {
         let mut pos = keyword_pos + b"stream".len();
 
-        // Skip stream keyword EOL: \r\n or \n
+        // Skip stream keyword EOL: \r\n or \n (a lone \r is tolerated too).
         if self.data.get(pos) == Some(&b'\r') {
             pos += 1;
         }
@@ -73,15 +73,31 @@ impl<'a> ObjectParser<'a> {
             pos += 1;
         }
 
-        let length = dict.get_i64("Length").unwrap_or(0) as usize;
+        // Determine the stream's byte length. Trust a direct, non-negative
+        // /Length ONLY if `endstream` actually follows it; otherwise (missing,
+        // indirect `N G R`, negative, or simply wrong) fall back to scanning for
+        // the `endstream` keyword. The low-level parser cannot resolve an
+        // indirect /Length, so without this fallback such streams (very common,
+        // e.g. Acrobat output) would decode to empty/garbage data.
+        let declared = match dict.get("Length") {
+            Some(PdfObject::Integer(n)) if *n >= 0 => Some(*n as usize),
+            _ => None,
+        };
 
-        if length as u64 > self.limits.max_stream_bytes {
+        let end = match declared {
+            Some(len)
+                if pos
+                    .checked_add(len)
+                    .is_some_and(|e| self.endstream_follows(e)) =>
+            {
+                pos + len
+            }
+            _ => self.scan_for_endstream(pos)?,
+        };
+
+        let length = (end - pos) as u64;
+        if length > self.limits.max_stream_bytes {
             return Err(Error::StreamSizeLimit(self.limits.max_stream_bytes));
-        }
-
-        let end = pos + length;
-        if end > self.data.len() {
-            return Err(Error::UnexpectedEof(end as u64));
         }
 
         let stream_data = self.data[pos..end].to_vec();
@@ -90,12 +106,57 @@ impl<'a> ObjectParser<'a> {
             data: Arc::from(stream_data),
         })
     }
+
+    /// True if (after optional whitespace) the bytes at `at` begin the
+    /// `endstream` keyword. Used to validate a declared /Length before trusting it.
+    fn endstream_follows(&self, at: usize) -> bool {
+        let mut p = at;
+        while let Some(&b) = self.data.get(p) {
+            if matches!(b, b' ' | b'\t' | b'\r' | b'\n' | b'\x00' | b'\x0c') {
+                p += 1;
+            } else {
+                break;
+            }
+        }
+        self.data
+            .get(p..)
+            .is_some_and(|s| s.starts_with(b"endstream"))
+    }
+
+    /// Find the stream's data end by scanning for the `endstream` keyword,
+    /// stripping the single EOL that precedes it (per spec, not part of the
+    /// data). The search is bounded by `max_stream_bytes` so a stream missing
+    /// its `endstream` cannot force an unbounded scan.
+    fn scan_for_endstream(&self, pos: usize) -> Result<usize> {
+        let cap = (self.limits.max_stream_bytes as usize).saturating_add(b"endstream".len() + 2);
+        let search_end = pos.saturating_add(cap).min(self.data.len());
+        let hay = self
+            .data
+            .get(pos..search_end)
+            .ok_or(Error::UnexpectedEof(pos as u64))?;
+        let rel = hay
+            .windows(b"endstream".len())
+            .position(|w| w == b"endstream")
+            .ok_or_else(|| {
+                Error::InvalidObject(pos as u64, "stream: no endstream within size limit".into())
+            })?;
+        let mut end = pos + rel;
+        // Strip the EOL immediately before `endstream` (CRLF, LF, or lone CR).
+        if end > pos && self.data[end - 1] == b'\n' {
+            end -= 1;
+            if end > pos && self.data[end - 1] == b'\r' {
+                end -= 1;
+            }
+        } else if end > pos && self.data[end - 1] == b'\r' {
+            end -= 1;
+        }
+        Ok(end)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zpdf_core::PdfName;
 
     #[test]
     fn parse_simple_indirect() {
@@ -129,5 +190,109 @@ mod tests {
             }
             other => panic!("expected Stream, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn reject_oversized_stream_length() {
+        let limits = ParseLimits {
+            max_stream_bytes: 16,
+            ..Default::default()
+        };
+        let body = b"0123456789ABCDEFGHIJ"; // 20 bytes > 16
+        let obj_bytes = format!("5 0 obj\n<< /Length {} >>\nstream\n", body.len());
+        let mut data = obj_bytes.into_bytes();
+        data.extend_from_slice(body);
+        data.extend_from_slice(b"\nendstream\nendobj\n");
+        let parser = ObjectParser::new(&data, &limits);
+        let err = parser.parse_indirect_at(0).unwrap_err();
+        assert!(matches!(err, Error::StreamSizeLimit(16)), "got {err:?}");
+    }
+
+    /// Helper: parse a single stream object and return its decoded data bytes.
+    fn stream_data(data: &[u8]) -> Vec<u8> {
+        let limits = ParseLimits::default();
+        let parser = ObjectParser::new(data, &limits);
+        match parser.parse_indirect_at(0).unwrap() {
+            PdfObject::Stream(s) => s.data.to_vec(),
+            other => panic!("expected Stream, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn indirect_length_recovers_via_endstream_scan() {
+        // `/Length 99 0 R` is an indirect ref the low-level parser cannot
+        // resolve; it must fall back to scanning for `endstream`.
+        let mut data = b"5 0 obj\n<< /Length 99 0 R >>\nstream\n".to_vec();
+        data.extend_from_slice(b"Hello, world!");
+        data.extend_from_slice(b"\nendstream\nendobj\n");
+        assert_eq!(stream_data(&data), b"Hello, world!");
+    }
+
+    #[test]
+    fn missing_length_recovers_via_endstream_scan() {
+        let mut data = b"5 0 obj\n<< /Type /Whatever >>\nstream\n".to_vec();
+        data.extend_from_slice(b"payload bytes");
+        data.extend_from_slice(b"\nendstream\nendobj\n");
+        assert_eq!(stream_data(&data), b"payload bytes");
+    }
+
+    #[test]
+    fn wrong_length_recovers_via_endstream_scan() {
+        // Declared /Length 3 but the real body is 5 bytes; `endstream` does not
+        // follow at +3, so the scan recovers the true extent.
+        let mut data = b"5 0 obj\n<< /Length 3 >>\nstream\n".to_vec();
+        data.extend_from_slice(b"Hello");
+        data.extend_from_slice(b"\nendstream\nendobj\n");
+        assert_eq!(stream_data(&data), b"Hello");
+    }
+
+    #[test]
+    fn negative_length_recovers_via_endstream_scan() {
+        let mut data = b"5 0 obj\n<< /Length -1 >>\nstream\n".to_vec();
+        data.extend_from_slice(b"abc");
+        data.extend_from_slice(b"\nendstream\nendobj\n");
+        assert_eq!(stream_data(&data), b"abc");
+    }
+
+    #[test]
+    fn correct_length_trusted_even_if_data_contains_endstream_bytes() {
+        // A correct /Length must be trusted so binary data that happens to
+        // contain the bytes "endstream" is not truncated at the wrong place.
+        let body: &[u8] = b"AAendstreamBB"; // 13 bytes, literal "endstream" inside
+        let mut data = format!("5 0 obj\n<< /Length {} >>\nstream\n", body.len()).into_bytes();
+        data.extend_from_slice(body);
+        data.extend_from_slice(b"\nendstream\nendobj\n");
+        assert_eq!(stream_data(&data), body);
+    }
+
+    #[test]
+    fn crlf_before_endstream_is_stripped_on_scan() {
+        // When scanning, a CRLF preceding `endstream` must not be included.
+        let mut data = b"5 0 obj\n<< >>\nstream\n".to_vec();
+        data.extend_from_slice(b"data");
+        data.extend_from_slice(b"\r\nendstream\nendobj\n");
+        assert_eq!(stream_data(&data), b"data");
+    }
+
+    #[test]
+    fn deeply_nested_value_in_indirect_object_errors() {
+        // The recursion guard must fire even when reached via parse_indirect_at.
+        let limits = ParseLimits {
+            max_object_depth: 4,
+            ..Default::default()
+        };
+        let n = 20usize;
+        let mut inner = String::new();
+        for _ in 0..n {
+            inner.push('[');
+        }
+        inner.push('1');
+        for _ in 0..n {
+            inner.push(']');
+        }
+        let data = format!("1 0 obj\n{inner}\nendobj\n").into_bytes();
+        let parser = ObjectParser::new(&data, &limits);
+        let err = parser.parse_indirect_at(0).unwrap_err();
+        assert!(matches!(err, Error::RecursionLimit(4)), "got {err:?}");
     }
 }

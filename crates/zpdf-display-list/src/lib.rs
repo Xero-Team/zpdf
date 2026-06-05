@@ -228,8 +228,9 @@ pub struct ImageDraw {
 
 // -- Blend --
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BlendMode {
+    #[default]
     Normal,
     Multiply,
     Screen,
@@ -246,10 +247,4 @@ pub enum BlendMode {
     Saturation,
     Color,
     Luminosity,
-}
-
-impl Default for BlendMode {
-    fn default() -> Self {
-        Self::Normal
-    }
 }

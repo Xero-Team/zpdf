@@ -12,7 +12,7 @@ fn build_pdf(font_obj: &str, content: &str) -> Vec<u8> {
     let mut buf: Vec<u8> = Vec::new();
     let mut offsets = [0usize; 6];
 
-    let mut push = |buf: &mut Vec<u8>, s: &str| buf.extend_from_slice(s.as_bytes());
+    let push = |buf: &mut Vec<u8>, s: &str| buf.extend_from_slice(s.as_bytes());
 
     push(&mut buf, "%PDF-1.7\n");
 

@@ -1,4 +1,4 @@
-use zpdf_core::{PdfName, PdfObject, PdfString, Result};
+use zpdf_core::{PdfName, PdfObject, PdfString};
 
 /// A token from a PDF content stream: either an operand or an operator.
 #[derive(Debug, Clone)]
@@ -13,16 +13,27 @@ pub enum ContentToken {
     },
 }
 
+/// Maximum array/dict nesting depth in a content stream. Real content is shallow;
+/// this only exists to bound recursion so adversarial deeply-nested input cannot
+/// overflow the native stack.
+const MAX_CONTENT_DEPTH: u32 = 200;
+
 /// Tokenizer for PDF content streams.
 /// Content streams contain sequences of: operand* operator
 pub struct ContentTokenizer<'a> {
     data: &'a [u8],
     pos: usize,
+    /// Current array/dict nesting depth (see `MAX_CONTENT_DEPTH`).
+    depth: u32,
 }
 
 impl<'a> ContentTokenizer<'a> {
     pub fn new(data: &'a [u8]) -> Self {
-        Self { data, pos: 0 }
+        Self {
+            data,
+            pos: 0,
+            depth: 0,
+        }
     }
 
     fn peek(&self) -> Option<u8> {
@@ -243,6 +254,13 @@ impl<'a> ContentTokenizer<'a> {
 
     fn read_array(&mut self) -> Vec<PdfObject> {
         self.pos += 1; // skip '['
+        self.depth += 1;
+        // Bail out (without recursing) on pathologically deep nesting. `pos` has
+        // already advanced past '[', so forward progress is guaranteed.
+        if self.depth > MAX_CONTENT_DEPTH {
+            self.depth -= 1;
+            return Vec::new();
+        }
         let mut items = Vec::new();
         loop {
             self.skip_whitespace();
@@ -257,11 +275,17 @@ impl<'a> ContentTokenizer<'a> {
                 items.push(obj);
             }
         }
+        self.depth -= 1;
         items
     }
 
     fn read_dict(&mut self) -> PdfObject {
         self.pos += 2; // skip '<<'
+        self.depth += 1;
+        if self.depth > MAX_CONTENT_DEPTH {
+            self.depth -= 1;
+            return PdfObject::Dict(zpdf_core::PdfDict::new());
+        }
         let mut dict = zpdf_core::PdfDict::new();
         loop {
             self.skip_whitespace();
@@ -277,6 +301,7 @@ impl<'a> ContentTokenizer<'a> {
                 dict.insert(key, val);
             }
         }
+        self.depth -= 1;
         PdfObject::Dict(dict)
     }
 
@@ -466,6 +491,32 @@ fn is_delimiter(b: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deeply_nested_array_does_not_overflow() {
+        // 100k unbalanced '[' would blow the native stack with unguarded
+        // recursion; the depth cap must keep it bounded and terminating.
+        let data = vec![b'['; 100_000];
+        let mut tk = ContentTokenizer::new(&data);
+        let mut tokens = 0u32;
+        while tk.next_token().is_some() {
+            tokens += 1;
+            if tokens > 200_000 {
+                break; // safety: must terminate well before this
+            }
+        }
+        // Reaching here without a stack overflow is the assertion.
+    }
+
+    #[test]
+    fn deeply_nested_dict_does_not_overflow() {
+        let mut data = Vec::new();
+        for _ in 0..100_000 {
+            data.extend_from_slice(b"<<");
+        }
+        let mut tk = ContentTokenizer::new(&data);
+        let _ = tk.next_token();
+    }
 
     #[test]
     fn tokenize_simple_content() {

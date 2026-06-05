@@ -1,4 +1,4 @@
-use zpdf_core::{Error, ObjectId, PdfObject, Result};
+use zpdf_core::{Error, ObjectId, Result};
 use zpdf_parser::PdfFile;
 
 use crate::page::PdfPage;

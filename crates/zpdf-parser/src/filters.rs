@@ -26,9 +26,10 @@ pub fn decode_stream(data: &[u8], dict: &PdfDict) -> Result<Vec<u8>> {
 
     let mut result = data.to_vec();
     for (i, filter) in filters.iter().enumerate() {
-        result = apply_filter(filter, &result)?;
-        if let Some(params) = &decode_parms[i] {
-            result = apply_predictor(&result, params)?;
+        let params = decode_parms[i].as_ref();
+        result = apply_filter(filter, &result, params)?;
+        if let Some(p) = params {
+            result = apply_predictor(&result, p)?;
         }
     }
     Ok(result)
@@ -96,11 +97,11 @@ fn decode_tiff_predictor(
 }
 
 fn decode_png_predictor(data: &[u8], colors: usize, bpc: usize, columns: usize) -> Result<Vec<u8>> {
-    let row_bytes = (colors * bpc * columns + 7) / 8;
-    let bpp = (colors * bpc + 7) / 8; // bytes per pixel for Sub/Paeth
+    let row_bytes = (colors * bpc * columns).div_ceil(8);
+    let bpp = (colors * bpc).div_ceil(8); // bytes per pixel for Sub/Paeth
     let stride = 1 + row_bytes; // filter byte + row data
 
-    if data.len() % stride != 0 && !data.is_empty() {
+    if !data.len().is_multiple_of(stride) && !data.is_empty() {
         // Try to process what we can
         tracing::debug!(
             "PNG predictor: data length {} not multiple of stride {stride}",
@@ -108,7 +109,7 @@ fn decode_png_predictor(data: &[u8], colors: usize, bpc: usize, columns: usize) 
         );
     }
 
-    let num_rows = (data.len() + stride - 1) / stride;
+    let num_rows = data.len().div_ceil(stride);
     let mut output = Vec::with_capacity(num_rows * row_bytes);
     let mut prev_row = vec![0u8; row_bytes];
 
@@ -188,15 +189,140 @@ fn paeth(a: i32, b: i32, c: i32) -> u8 {
     }
 }
 
-fn apply_filter(filter: &PdfName, data: &[u8]) -> Result<Vec<u8>> {
+fn apply_filter(filter: &PdfName, data: &[u8], params: Option<&PdfDict>) -> Result<Vec<u8>> {
     match filter.as_str() {
         "FlateDecode" | "Fl" => decode_flate(data),
+        "LZWDecode" | "LZW" => {
+            // EarlyChange lives in DecodeParms; default 1 per ISO 32000.
+            let early_change = params
+                .and_then(|p| p.get_i64("EarlyChange").ok())
+                .unwrap_or(1);
+            lzw_decode(data, early_change)
+        }
         "ASCIIHexDecode" | "AHx" => decode_ascii_hex(data),
         "ASCII85Decode" | "A85" => decode_ascii85(data),
         "RunLengthDecode" | "RL" => decode_run_length(data),
         "DCTDecode" | "DCT" => decode_dct(data),
         other => Err(Error::UnsupportedFilter(other.to_string())),
     }
+}
+
+/// PDF/TIFF variable-width LZW decoder (ISO 32000-1, 7.4.4.2).
+///
+/// 8-bit input symbols; code width starts at 9 and grows to a max of 12.
+/// Code 256 = ClearTable (reset dictionary, width back to 9),
+/// code 257 = EOD. Codes 258+ are dictionary strings. `early_change` is the
+/// DecodeParms EarlyChange value (default 1); when 1 the code width is increased
+/// one code earlier than the natural boundary.
+fn lzw_decode(data: &[u8], early_change: i64) -> Result<Vec<u8>> {
+    const CLEAR: u32 = 256;
+    const EOD: u32 = 257;
+    // Output-size safety cap (matches ParseLimits::max_stream_bytes default).
+    const MAX_OUTPUT: usize = 256 * 1024 * 1024;
+
+    // EarlyChange is effectively a flag: any nonzero -> 1, explicit 0 -> 0.
+    let early: u32 = if early_change == 0 { 0 } else { 1 };
+
+    // Dictionary: index = code, value = decoded byte string. Slots 0..=255 are
+    // single bytes; 256/257 are placeholders so the first dynamic code is 258.
+    let mut table: Vec<Vec<u8>> = Vec::with_capacity(4096);
+    let reset = |t: &mut Vec<Vec<u8>>| {
+        t.clear();
+        for i in 0..256u32 {
+            t.push(vec![i as u8]);
+        }
+        t.push(Vec::new()); // 256 CLEAR (unused as a string)
+        t.push(Vec::new()); // 257 EOD   (unused as a string)
+    };
+    reset(&mut table);
+
+    let mut width: u32 = 9;
+    let mut bit_pos: usize = 0;
+    let total_bits = data.len() * 8;
+
+    // MSB-first reader; returns None when fewer than `width` bits remain.
+    let read_code = |bit_pos: &mut usize, width: u32| -> Option<u32> {
+        if *bit_pos + width as usize > total_bits {
+            return None;
+        }
+        let mut code: u32 = 0;
+        for _ in 0..width {
+            let byte = data[*bit_pos / 8];
+            let bit = (byte >> (7 - (*bit_pos % 8))) & 1;
+            code = (code << 1) | bit as u32;
+            *bit_pos += 1;
+        }
+        Some(code)
+    };
+
+    let mut out: Vec<u8> = Vec::new();
+    let mut prev: Option<u32> = None;
+
+    // Stop when input is exhausted (some streams omit the EOD marker).
+    while let Some(code) = read_code(&mut bit_pos, width) {
+        if code == EOD {
+            break;
+        }
+        if code == CLEAR {
+            reset(&mut table);
+            width = 9;
+            prev = None;
+            continue;
+        }
+
+        // Resolve the output string for this code.
+        let entry: Vec<u8> = if (code as usize) < table.len() {
+            table[code as usize].clone()
+        } else if code as usize == table.len() {
+            // KwKwK: code refers to the entry we are about to define.
+            match prev {
+                Some(p) => {
+                    let mut e = table[p as usize].clone();
+                    e.push(table[p as usize][0]);
+                    e
+                }
+                None => {
+                    return Err(Error::StreamDecode(format!(
+                        "LZWDecode: code {code} before any literal"
+                    )))
+                }
+            }
+        } else {
+            return Err(Error::StreamDecode(format!(
+                "LZWDecode: invalid code {code} (table size {})",
+                table.len()
+            )));
+        };
+
+        out.extend_from_slice(&entry);
+        if out.len() > MAX_OUTPUT {
+            return Err(Error::StreamDecode(
+                "LZWDecode: output exceeds limit".into(),
+            ));
+        }
+
+        // Add new dictionary entry = previous string + first byte of this entry.
+        // (Skipped for the first code after a clear, when prev is None.)
+        if let Some(p) = prev {
+            let mut new_entry = table[p as usize].clone();
+            new_entry.push(entry[0]);
+            table.push(new_entry);
+        }
+        prev = Some(code);
+
+        // Width growth. After the push above, `table.len()` is the index that
+        // will be assigned to the NEXT dictionary entry, which is exactly the
+        // value to test against the current width's capacity. EarlyChange (=1)
+        // bumps the width one code earlier. Grow when `table.len() + early >=
+        // 2^width`. (Validated against weezl/TIFF LZW across the 9->10->11->12
+        // and 4096 boundaries; an earlier `+ 1` here desynced real streams.)
+        let next_code = table.len() as u32;
+        if width < 12 && next_code + early >= (1u32 << width) {
+            width += 1;
+        }
+    }
+
+    Ok(out)
 }
 
 fn decode_flate(data: &[u8]) -> Result<Vec<u8>> {
@@ -431,5 +557,78 @@ mod tests {
         let data = [100, 150, 200, 10, 20, 30];
         let result = decode_tiff_predictor(&data, 3, 8, 2).unwrap();
         assert_eq!(result, vec![100, 150, 200, 110, 170, 230]);
+    }
+
+    // --- LZWDecode ---
+
+    #[test]
+    fn lzw_canonical_vector() {
+        // Classic ISO 32000 / Adobe LZW example. 9-bit codes, MSB-first:
+        //   256 (Clear), 45 ('-'), 258 (KwKwK -> "--"), 259 ("---"),
+        //   65 ('A'), 259 ("---"), 66 ('B'), 257 (EOD)
+        let data = [0x80, 0x0B, 0x60, 0x50, 0x22, 0x0C, 0x0C, 0x85, 0x01];
+        let decoded = lzw_decode(&data, 1).unwrap();
+        assert_eq!(decoded, b"-----A---B");
+    }
+
+    #[test]
+    fn lzw_via_apply_filter_default_early_change() {
+        let data = [0x80, 0x0B, 0x60, 0x50, 0x22, 0x0C, 0x0C, 0x85, 0x01];
+        let name = PdfName::new("LZWDecode");
+        let out = apply_filter(&name, &data, None).unwrap();
+        assert_eq!(out, b"-----A---B");
+    }
+
+    #[test]
+    fn lzw_stops_at_end_without_eod() {
+        // Truncated before EOD; should decode the leading symbols and stop cleanly.
+        let data = [0x80, 0x0B, 0x60, 0x50];
+        let out = lzw_decode(&data, 1).unwrap();
+        assert!(out.starts_with(b"-"));
+    }
+
+    #[test]
+    fn lzw_empty_input() {
+        assert_eq!(lzw_decode(&[], 1).unwrap(), Vec::<u8>::new());
+    }
+
+    /// Encode with weezl (an independent, spec-conformant LZW producer) so the
+    /// decoder is validated against an EXTERNAL reference rather than its own
+    /// paired encoder. weezl's TIFF size-switch == PDF EarlyChange=1; its plain
+    /// MSB encoder == EarlyChange=0. Verified: weezl(tiff) output of the canonical
+    /// vector decodes to "-----A---B" here.
+    fn weezl_encode(data: &[u8], early_change: i64) -> Vec<u8> {
+        use weezl::{encode::Encoder, BitOrder};
+        let mut enc = if early_change == 0 {
+            Encoder::new(BitOrder::Msb, 8)
+        } else {
+            Encoder::with_tiff_size_switch(BitOrder::Msb, 8)
+        };
+        enc.encode(data).expect("weezl encode")
+    }
+
+    #[test]
+    fn lzw_roundtrip_against_weezl() {
+        // Cross every width boundary (9->10->11->12) and the 4096 auto-clear,
+        // for both EarlyChange settings, against an external reference encoder.
+        for ec in [1i64, 0] {
+            for &len in &[0usize, 1, 300, 600, 1200, 3000, 5000, 9000] {
+                // Mix of low- and high-entropy bytes to grow the dictionary.
+                let input: Vec<u8> = (0..len).map(|i| ((i * 7 + i / 11) % 251) as u8).collect();
+                let encoded = weezl_encode(&input, ec);
+                let decoded = lzw_decode(&encoded, ec).unwrap();
+                assert_eq!(decoded, input, "ec={ec} len={len}");
+            }
+        }
+    }
+
+    #[test]
+    fn lzw_single_byte_run_roundtrip_against_weezl() {
+        // A long single-symbol run exercises the KwKwK path heavily.
+        let input = vec![b'A'; 5000];
+        for ec in [1i64, 0] {
+            let encoded = weezl_encode(&input, ec);
+            assert_eq!(lzw_decode(&encoded, ec).unwrap(), input, "ec={ec}");
+        }
     }
 }

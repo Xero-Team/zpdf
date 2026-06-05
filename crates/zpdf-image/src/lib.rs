@@ -81,8 +81,8 @@ pub fn apply_smask(image: &mut DecodedImage, mask_data: &[u8], mask_width: u32, 
         return;
     }
     let pixel_count = (image.width * image.height) as usize;
-    for i in 0..pixel_count.min(mask_data.len()) {
-        image.data[i * 4 + 3] = mask_data[i];
+    for (i, &m) in mask_data.iter().take(pixel_count).enumerate() {
+        image.data[i * 4 + 3] = m;
     }
     image.has_alpha = true;
 }
@@ -230,7 +230,7 @@ fn samples_cmyk8_to_rgba(data: &[u8], width: u32, height: u32) -> Result<Decoded
 
 fn samples_gray1_to_rgba(data: &[u8], width: u32, height: u32) -> Result<DecodedImage> {
     let pixel_count = (width * height) as usize;
-    let row_bytes = (width as usize + 7) / 8;
+    let row_bytes = (width as usize).div_ceil(8);
     let mut rgba = Vec::with_capacity(pixel_count * 4);
 
     for row in 0..height as usize {

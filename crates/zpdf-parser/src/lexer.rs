@@ -1,13 +1,34 @@
-use zpdf_core::{Error, ObjectId, PdfName, PdfObject, PdfString, Result};
+use zpdf_core::{Error, ObjectId, ParseLimits, PdfName, PdfObject, PdfString, Result};
 
 pub struct Lexer<'a> {
     data: &'a [u8],
     pos: usize,
+    limits: &'a ParseLimits,
+    depth: u32,
 }
 
 impl<'a> Lexer<'a> {
-    pub fn new(data: &'a [u8], pos: usize) -> Self {
-        Self { data, pos }
+    pub fn new(data: &'a [u8], pos: usize, limits: &'a ParseLimits) -> Self {
+        Self {
+            data,
+            pos,
+            limits,
+            depth: 0,
+        }
+    }
+
+    /// Increment container-nesting depth, erroring if it exceeds the limit.
+    /// Call once on entry to `read_array`/`read_dict`.
+    fn enter_container(&mut self) -> Result<()> {
+        self.depth += 1;
+        if self.depth > self.limits.max_object_depth {
+            return Err(Error::RecursionLimit(self.limits.max_object_depth));
+        }
+        Ok(())
+    }
+
+    fn leave_container(&mut self) {
+        self.depth = self.depth.saturating_sub(1);
     }
 
     pub fn pos(&self) -> usize {
@@ -98,6 +119,7 @@ impl<'a> Lexer<'a> {
         self.advance(); // skip '('
         let mut buf = Vec::new();
         let mut depth = 1u32;
+        let max = self.limits.max_string_length as usize;
 
         while let Some(b) = self.advance() {
             match b {
@@ -148,6 +170,11 @@ impl<'a> Lexer<'a> {
                 }
                 _ => buf.push(b),
             }
+            // Each iteration pushes at most one byte, so a single post-match
+            // check is sufficient to bound total string growth.
+            if buf.len() > max {
+                return Err(Error::StringLengthLimit(self.limits.max_string_length));
+            }
         }
 
         Ok(PdfObject::String(PdfString::new(buf)))
@@ -157,6 +184,7 @@ impl<'a> Lexer<'a> {
         self.advance(); // skip '<'
         let mut buf = Vec::new();
         let mut high: Option<u8> = None;
+        let max = self.limits.max_string_length as usize;
 
         loop {
             match self.advance() {
@@ -171,6 +199,11 @@ impl<'a> Lexer<'a> {
                         Some(h) => {
                             buf.push((h << 4) | nibble);
                             high = None;
+                            if buf.len() > max {
+                                return Err(Error::StringLengthLimit(
+                                    self.limits.max_string_length,
+                                ));
+                            }
                         }
                     }
                 }
@@ -258,6 +291,7 @@ impl<'a> Lexer<'a> {
     }
 
     fn read_array(&mut self) -> Result<PdfObject> {
+        self.enter_container()?;
         self.advance(); // skip '['
         let mut items = Vec::new();
         loop {
@@ -272,10 +306,12 @@ impl<'a> Lexer<'a> {
             let obj = self.next_token()?;
             items.push(self.maybe_resolve_ref(obj)?);
         }
+        self.leave_container();
         Ok(PdfObject::Array(items))
     }
 
     fn read_dict(&mut self) -> Result<PdfObject> {
+        self.enter_container()?;
         self.pos += 2; // skip '<<'
         let mut dict = zpdf_core::PdfDict::new();
         loop {
@@ -300,6 +336,7 @@ impl<'a> Lexer<'a> {
             let value = self.maybe_resolve_ref(value)?;
             dict.insert(key, value);
         }
+        self.leave_container();
         Ok(PdfObject::Dict(dict))
     }
 
@@ -371,29 +408,37 @@ fn decode_name(raw: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    fn lim() -> ParseLimits {
+        ParseLimits::default()
+    }
+
     #[test]
     fn lex_name() {
-        let mut lex = Lexer::new(b"/Type", 0);
+        let l = lim();
+        let mut lex = Lexer::new(b"/Type", 0, &l);
         let obj = lex.next_token().unwrap();
         assert_eq!(obj, PdfObject::Name(PdfName::new("Type")));
     }
 
     #[test]
     fn lex_name_with_hex_escape() {
-        let mut lex = Lexer::new(b"/A#20B", 0);
+        let l = lim();
+        let mut lex = Lexer::new(b"/A#20B", 0, &l);
         let obj = lex.next_token().unwrap();
         assert_eq!(obj, PdfObject::Name(PdfName::new("A B")));
     }
 
     #[test]
     fn lex_integer() {
-        let mut lex = Lexer::new(b"42 ", 0);
+        let l = lim();
+        let mut lex = Lexer::new(b"42 ", 0, &l);
         assert_eq!(lex.next_token().unwrap(), PdfObject::Integer(42));
     }
 
     #[test]
     fn lex_negative_real() {
-        let mut lex = Lexer::new(b"-3.5 ", 0);
+        let l = lim();
+        let mut lex = Lexer::new(b"-3.5 ", 0, &l);
         match lex.next_token().unwrap() {
             PdfObject::Real(n) => assert!((n - (-3.5)).abs() < 1e-10),
             other => panic!("expected Real, got {other:?}"),
@@ -402,7 +447,8 @@ mod tests {
 
     #[test]
     fn lex_literal_string() {
-        let mut lex = Lexer::new(b"(hello world)", 0);
+        let l = lim();
+        let mut lex = Lexer::new(b"(hello world)", 0, &l);
         let obj = lex.next_token().unwrap();
         assert_eq!(
             obj,
@@ -412,21 +458,24 @@ mod tests {
 
     #[test]
     fn lex_literal_string_nested_parens() {
-        let mut lex = Lexer::new(b"(a (b) c)", 0);
+        let l = lim();
+        let mut lex = Lexer::new(b"(a (b) c)", 0, &l);
         let obj = lex.next_token().unwrap();
         assert_eq!(obj, PdfObject::String(PdfString::new(b"a (b) c".to_vec())));
     }
 
     #[test]
     fn lex_hex_string() {
-        let mut lex = Lexer::new(b"<48656C6C6F>", 0);
+        let l = lim();
+        let mut lex = Lexer::new(b"<48656C6C6F>", 0, &l);
         let obj = lex.next_token().unwrap();
         assert_eq!(obj, PdfObject::String(PdfString::new(b"Hello".to_vec())));
     }
 
     #[test]
     fn lex_array() {
-        let mut lex = Lexer::new(b"[1 2 3]", 0);
+        let l = lim();
+        let mut lex = Lexer::new(b"[1 2 3]", 0, &l);
         let obj = lex.next_token().unwrap();
         assert_eq!(
             obj,
@@ -440,7 +489,8 @@ mod tests {
 
     #[test]
     fn lex_dict() {
-        let mut lex = Lexer::new(b"<< /Type /Page /Count 5 >>", 0);
+        let l = lim();
+        let mut lex = Lexer::new(b"<< /Type /Page /Count 5 >>", 0, &l);
         let obj = lex.next_token().unwrap();
         match obj {
             PdfObject::Dict(d) => {
@@ -453,26 +503,103 @@ mod tests {
 
     #[test]
     fn lex_bool_and_null() {
-        let mut lex = Lexer::new(b"true", 0);
+        let l = lim();
+        let mut lex = Lexer::new(b"true", 0, &l);
         assert_eq!(lex.next_token().unwrap(), PdfObject::Bool(true));
 
-        let mut lex = Lexer::new(b"false", 0);
+        let mut lex = Lexer::new(b"false", 0, &l);
         assert_eq!(lex.next_token().unwrap(), PdfObject::Bool(false));
 
-        let mut lex = Lexer::new(b"null", 0);
+        let mut lex = Lexer::new(b"null", 0, &l);
         assert_eq!(lex.next_token().unwrap(), PdfObject::Null);
     }
 
     #[test]
     fn lex_indirect_ref_in_array() {
-        let mut lex = Lexer::new(b"[12 0 R]", 0);
+        let l = lim();
+        let mut lex = Lexer::new(b"[12 0 R]", 0, &l);
         let obj = lex.next_token().unwrap();
         assert_eq!(obj, PdfObject::Array(vec![PdfObject::Ref(ObjectId(12, 0))]));
     }
 
     #[test]
     fn skip_comments() {
-        let mut lex = Lexer::new(b"% comment\n42 ", 0);
+        let l = lim();
+        let mut lex = Lexer::new(b"% comment\n42 ", 0, &l);
         assert_eq!(lex.next_token().unwrap(), PdfObject::Integer(42));
+    }
+
+    #[test]
+    fn reject_deeply_nested_array() {
+        let mut l = lim();
+        l.max_object_depth = 10;
+        let depth = 50usize;
+        let mut data = vec![b'['; depth];
+        data.extend(std::iter::repeat_n(b']', depth));
+        let mut lex = Lexer::new(&data, 0, &l);
+        let err = lex.next_token().unwrap_err();
+        assert!(matches!(err, Error::RecursionLimit(10)), "got {err:?}");
+    }
+
+    #[test]
+    fn reject_deeply_nested_dict() {
+        let mut l = lim();
+        l.max_object_depth = 5;
+        let n = 20usize;
+        let mut s = String::new();
+        for _ in 0..n {
+            s.push_str("<< /a ");
+        }
+        s.push('1');
+        for _ in 0..n {
+            s.push_str(" >>");
+        }
+        let data = s.into_bytes();
+        let mut lex = Lexer::new(&data, 0, &l);
+        let err = lex.next_token().unwrap_err();
+        assert!(matches!(err, Error::RecursionLimit(5)), "got {err:?}");
+    }
+
+    #[test]
+    fn nested_within_limit_ok() {
+        let l = lim(); // depth limit 100
+        let data = b"[[[[[1]]]]]"; // depth 5
+        let mut lex = Lexer::new(data, 0, &l);
+        assert!(lex.next_token().is_ok());
+    }
+
+    #[test]
+    fn reject_oversized_literal_string() {
+        let mut l = lim();
+        l.max_string_length = 8;
+        let mut data = vec![b'('];
+        data.extend(std::iter::repeat_n(b'a', 100));
+        data.push(b')');
+        let mut lex = Lexer::new(&data, 0, &l);
+        let err = lex.next_token().unwrap_err();
+        assert!(matches!(err, Error::StringLengthLimit(8)), "got {err:?}");
+    }
+
+    #[test]
+    fn reject_oversized_hex_string() {
+        let mut l = lim();
+        l.max_string_length = 4;
+        // 20 hex digits => 10 raw bytes > 4
+        let mut data = vec![b'<'];
+        data.extend(std::iter::repeat_n(b'4', 20));
+        data.push(b'>');
+        let mut lex = Lexer::new(&data, 0, &l);
+        let err = lex.next_token().unwrap_err();
+        assert!(matches!(err, Error::StringLengthLimit(4)), "got {err:?}");
+    }
+
+    #[test]
+    fn small_string_within_limit_ok() {
+        let l = lim(); // 65536
+        let mut lex = Lexer::new(b"(hello)", 0, &l);
+        assert_eq!(
+            lex.next_token().unwrap(),
+            PdfObject::String(PdfString::new(b"hello".to_vec()))
+        );
     }
 }

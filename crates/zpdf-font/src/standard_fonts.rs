@@ -1,7 +1,7 @@
-/// Built-in metrics for the 14 standard PDF fonts (PDF spec, Appendix D).
-///
-/// Width tables indexed by WinAnsiEncoding character code (0-255).
-/// Values are in 1/1000 of a text space unit.
+//! Built-in metrics for the 14 standard PDF fonts (PDF spec, Appendix D).
+//!
+//! Width tables indexed by WinAnsiEncoding character code (0-255).
+//! Values are in 1/1000 of a text space unit.
 
 pub struct StandardFontMetrics {
     pub widths: &'static [u16; 256],

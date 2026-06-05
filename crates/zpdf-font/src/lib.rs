@@ -459,7 +459,7 @@ impl LoadedFont {
             PdfFontType::Type3 {
                 widths, first_char, ..
             } => {
-                let idx = char_code.checked_sub(*first_char).unwrap_or(0) as usize;
+                let idx = char_code.saturating_sub(*first_char) as usize;
                 widths.get(idx).copied().unwrap_or(1000.0)
             }
             _ => 1000.0,
@@ -738,8 +738,8 @@ fn standard_encoding() -> [u16; 256] {
     enc[45] = 14; // hyphen
     enc[46] = 15; // period
     enc[47] = 16; // slash
-    for i in 48..=57 {
-        enc[i] = (i - 48 + 17) as u16;
+    for (offset, slot) in enc[48..=57].iter_mut().enumerate() {
+        *slot = (offset + 17) as u16;
     } // 0-9
     enc[58] = 27; // colon
     enc[59] = 28; // semicolon
@@ -748,8 +748,8 @@ fn standard_encoding() -> [u16; 256] {
     enc[62] = 31; // greater
     enc[63] = 32; // question
     enc[64] = 33; // at
-    for i in 65..=90 {
-        enc[i] = (i - 65 + 34) as u16;
+    for (offset, slot) in enc[65..=90].iter_mut().enumerate() {
+        *slot = (offset + 34) as u16;
     } // A-Z
     enc[91] = 60; // bracketleft
     enc[92] = 61; // backslash
@@ -757,8 +757,8 @@ fn standard_encoding() -> [u16; 256] {
     enc[94] = 63; // asciicircum
     enc[95] = 64; // underscore
     enc[96] = 65; // quoteleft
-    for i in 97..=122 {
-        enc[i] = (i - 97 + 66) as u16;
+    for (offset, slot) in enc[97..=122].iter_mut().enumerate() {
+        *slot = (offset + 66) as u16;
     } // a-z
     enc[123] = 92; // braceleft
     enc[124] = 93; // bar
@@ -860,7 +860,6 @@ fn parse_cff_charset(cff: &[u8]) -> Option<HashMap<u16, u16>> {
     pos = skip_cff_index(cff, pos)?;
 
     // Top DICT INDEX — we need to read it to find charset offset
-    let top_dict_start = pos;
     let top_dict_index_end = skip_cff_index(cff, pos)?;
 
     // Parse Top DICT INDEX to get the data

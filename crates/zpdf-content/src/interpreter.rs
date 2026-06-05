@@ -753,7 +753,7 @@ impl<'a> ContentInterpreter<'a> {
 
         let subtype = stream.dict.get_name("Subtype").unwrap_or_default();
 
-        match &*subtype {
+        match subtype {
             "Image" => self.do_image_xobject(xobj_id, stream),
             "Form" => self.do_form_xobject(stream, file),
             _ => {
@@ -974,19 +974,17 @@ impl<'a> ContentInterpreter<'a> {
                         }
                     }
                     overrides.insert(name.0.clone(), unique_name);
-                } else {
-                    if fc.get_by_name(&name.0).is_none() {
-                        match zpdf_document::font_loader::load_single_font(file, *font_ref) {
-                            Ok(font) => {
-                                fc.insert(name.0.clone(), font);
-                            }
-                            Err(e) => {
-                                tracing::debug!("form font {}: {e}", name.0);
-                                fc.insert(
-                                    name.0.clone(),
-                                    zpdf_font::LoadedFont::new_placeholder(name.0.clone()),
-                                );
-                            }
+                } else if fc.get_by_name(&name.0).is_none() {
+                    match zpdf_document::font_loader::load_single_font(file, *font_ref) {
+                        Ok(font) => {
+                            fc.insert(name.0.clone(), font);
+                        }
+                        Err(e) => {
+                            tracing::debug!("form font {}: {e}", name.0);
+                            fc.insert(
+                                name.0.clone(),
+                                zpdf_font::LoadedFont::new_placeholder(name.0.clone()),
+                            );
                         }
                     }
                 }
