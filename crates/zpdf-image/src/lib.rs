@@ -53,9 +53,36 @@ pub enum ImageColorSpace {
 }
 
 pub fn decode_image_xobject(decoded_data: &[u8], dict: &PdfDict) -> Result<DecodedImage> {
+    decode_image_xobject_with_fill(decoded_data, dict, [0, 0, 0])
+}
+
+/// Decode an image XObject, painting `/ImageMask true` stencils in `fill_rgb`
+/// (the current graphics-state fill colour). Non-mask images ignore `fill_rgb`.
+pub fn decode_image_xobject_with_fill(
+    decoded_data: &[u8],
+    dict: &PdfDict,
+    fill_rgb: [u8; 3],
+) -> Result<DecodedImage> {
     let width = dict.get_i64("Width")? as u32;
     let height = dict.get_i64("Height")? as u32;
     let bpc = dict.get_i64("BitsPerComponent").unwrap_or(8) as u8;
+
+    // Bound the RGBA allocation (4 bytes/pixel) against the ParseLimits default
+    // so a crafted /Width × /Height cannot OOM — applies to every image path,
+    // including the 1-bpp stencil below.
+    const MAX_IMAGE_PIXELS: u64 = 100_000_000;
+    if (width as u64).saturating_mul(height as u64) > MAX_IMAGE_PIXELS {
+        return Err(Error::StreamDecode(format!(
+            "image {width}x{height} exceeds the {MAX_IMAGE_PIXELS}-pixel limit"
+        )));
+    }
+
+    // Stencil mask: 1 bpc, paints `fill_rgb` where the sample selects the page
+    // (default /Decode [0 1] → sample 0 paints; [1 0] inverts).
+    if is_image_mask(dict) {
+        let invert = mask_decode_inverts(dict);
+        return decode_image_mask(decoded_data, width, height, fill_rgb, invert);
+    }
 
     let cs = parse_colorspace(dict);
     let is_dct = is_dct_encoded(dict);
@@ -85,6 +112,65 @@ pub fn apply_smask(image: &mut DecodedImage, mask_data: &[u8], mask_width: u32, 
         image.data[i * 4 + 3] = m;
     }
     image.has_alpha = true;
+}
+
+fn is_image_mask(dict: &PdfDict) -> bool {
+    matches!(dict.get("ImageMask"), Some(PdfObject::Bool(true)))
+}
+
+/// An ImageMask's `/Decode [1 0]` inverts which sample value paints. Default
+/// `[0 1]` means sample 0 paints (marks the page).
+fn mask_decode_inverts(dict: &PdfDict) -> bool {
+    match dict.get("Decode") {
+        Some(PdfObject::Array(a)) => {
+            let first = a.first().and_then(|o| match o {
+                PdfObject::Integer(n) => Some(*n),
+                PdfObject::Real(r) => Some(*r as i64),
+                _ => None,
+            });
+            first == Some(1)
+        }
+        _ => false,
+    }
+}
+
+/// Build a stencil: paint `fill` (opaque) where the 1-bpp sample selects the
+/// page, transparent elsewhere. `invert` flips the paint polarity (`/Decode
+/// [1 0]`). Output alpha is 0 or 255, so the straight bytes are also valid
+/// premultiplied RGBA for the rasterizer.
+fn decode_image_mask(
+    data: &[u8],
+    width: u32,
+    height: u32,
+    fill: [u8; 3],
+    invert: bool,
+) -> Result<DecodedImage> {
+    let row_bytes = (width as usize).div_ceil(8);
+    let mut rgba = Vec::with_capacity((width as usize) * (height as usize) * 4);
+    for row in 0..height as usize {
+        for col in 0..width as usize {
+            let byte_idx = row * row_bytes + col / 8;
+            // Out-of-range (short data) reads as sample 1 → unpainted.
+            let sample = if byte_idx < data.len() {
+                (data[byte_idx] >> (7 - (col % 8))) & 1
+            } else {
+                1
+            };
+            let paint = if invert { sample == 1 } else { sample == 0 };
+            if paint {
+                rgba.extend_from_slice(&[fill[0], fill[1], fill[2], 255]);
+            } else {
+                rgba.extend_from_slice(&[0, 0, 0, 0]);
+            }
+        }
+    }
+    Ok(DecodedImage {
+        width,
+        height,
+        data: rgba,
+        has_alpha: true,
+        premultiplied: false,
+    })
 }
 
 fn parse_colorspace(dict: &PdfDict) -> ImageColorSpace {

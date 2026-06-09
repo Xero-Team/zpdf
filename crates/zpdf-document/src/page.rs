@@ -34,17 +34,7 @@ impl PdfPage {
 
         let rotate = dict.get_i64("Rotate").unwrap_or(0) as i32;
 
-        let contents = match dict.get("Contents") {
-            Some(PdfObject::Ref(r)) => vec![*r],
-            Some(PdfObject::Array(arr)) => arr
-                .iter()
-                .filter_map(|o| match o {
-                    PdfObject::Ref(r) => Some(*r),
-                    _ => None,
-                })
-                .collect(),
-            _ => vec![],
-        };
+        let contents = Self::collect_content_refs(file, dict.get("Contents"));
 
         let resources = match dict.get("Resources") {
             Some(PdfObject::Dict(d)) => parse_resource_dict(d, file)?,
@@ -64,6 +54,35 @@ impl PdfPage {
             resources,
             contents,
         })
+    }
+
+    /// Collect the page's content-stream object ids from `/Contents`, which may
+    /// be: a single stream ref; a direct array of stream refs; or — as some
+    /// scanners emit — an indirect ref *to* an array of stream refs (double
+    /// indirection). The latter is resolved one level so the array is flattened
+    /// rather than mistaken for a single (non-stream) object.
+    fn collect_content_refs(file: &PdfFile, contents: Option<&PdfObject>) -> Vec<ObjectId> {
+        fn refs_from_array(arr: &[PdfObject]) -> Vec<ObjectId> {
+            arr.iter()
+                .filter_map(|o| match o {
+                    PdfObject::Ref(r) => Some(*r),
+                    _ => None,
+                })
+                .collect()
+        }
+        match contents {
+            Some(PdfObject::Array(arr)) => refs_from_array(arr),
+            Some(PdfObject::Ref(r)) => match file.resolve(*r) {
+                // Ref → array of stream refs: flatten it.
+                Ok(PdfObject::Array(arr)) => refs_from_array(&arr),
+                // Ref → a single content stream: keep the ref itself.
+                Ok(PdfObject::Stream(_)) => vec![*r],
+                // Anything else (incl. resolve failure): treat as the lone ref so
+                // a later resolve attempt surfaces the real error.
+                _ => vec![*r],
+            },
+            _ => vec![],
+        }
     }
 
     fn inherit_rect(file: &PdfFile, dict: &zpdf_core::PdfDict, key: &str) -> Result<Option<Rect>> {

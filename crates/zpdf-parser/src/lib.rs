@@ -1,3 +1,5 @@
+mod ccitt;
+mod crypt;
 pub mod filters;
 mod header;
 mod lexer;
@@ -33,6 +35,10 @@ pub struct PdfFile {
     pub xref: XrefTable,
     pub trailer: zpdf_core::PdfDict,
     limits: ParseLimits,
+    /// Standard-security-handler decryptor, built once at open time from the
+    /// trailer `/Encrypt` dict. `None` for unencrypted (or unsupported-handler)
+    /// documents, in which case `resolve`/object-stream decoding are unchanged.
+    decryptor: Option<crypt::Decryptor>,
     /// Cache of resolved top-level indirect objects, keyed by ObjectId.
     /// `RefCell` suffices: `PdfFile` is never shared across threads in this
     /// workspace (swap to `Mutex` if that ever changes).
@@ -79,15 +85,52 @@ impl PdfFile {
             }
         };
 
-        Ok(Self {
+        let mut file = Self {
             data,
             header,
             xref,
             trailer,
             limits,
+            decryptor: None,
             object_cache: RefCell::new(HashMap::new()),
             objstm_cache: RefCell::new(HashMap::new()),
-        })
+        };
+        // Build the decryptor *after* construction so it can use `resolve` to
+        // fetch the (never-encrypted) /Encrypt dict; `decryptor` is still `None`
+        // at this point, so that resolve does not try to decrypt it.
+        file.decryptor = file.build_decryptor();
+        Ok(file)
+    }
+
+    /// Construct the Standard-security-handler decryptor from the trailer
+    /// `/Encrypt` dictionary and the first element of `/ID`. Returns `None` for
+    /// unencrypted documents or unsupported handlers (AES, non-Standard).
+    fn build_decryptor(&self) -> Option<crypt::Decryptor> {
+        let encrypt_ref = self.trailer.get_ref("Encrypt").ok()?;
+        // The /Encrypt dict is itself never encrypted; resolve it directly.
+        let enc_obj = self.resolve(encrypt_ref).ok()?;
+        let enc_dict = enc_obj.as_dict().ok()?;
+        let id_first = self.first_id_bytes();
+        crypt::Decryptor::from_encrypt_dict(enc_dict, &id_first, Some(encrypt_ref))
+    }
+
+    /// Raw bytes of the first element of the trailer `/ID` array (used in the
+    /// encryption key derivation). `/ID` is normally a direct array but may be an
+    /// indirect reference; resolve it (safe — `decryptor` is still `None` here,
+    /// and `/ID` is never encrypted). Empty if absent or malformed.
+    fn first_id_bytes(&self) -> Vec<u8> {
+        let arr = match self.trailer.get("ID") {
+            Some(PdfObject::Array(a)) => Some(std::borrow::Cow::Borrowed(a.as_slice())),
+            Some(PdfObject::Ref(r)) => self
+                .resolve(*r)
+                .ok()
+                .and_then(|o| o.as_array().ok().map(|a| std::borrow::Cow::Owned(a.to_vec()))),
+            _ => None,
+        };
+        match arr.as_deref().and_then(|a| a.first()) {
+            Some(PdfObject::String(s)) => s.0.clone(),
+            _ => Vec::new(),
+        }
     }
 
     pub fn resolve(&self, id: zpdf_core::ObjectId) -> Result<PdfObject> {
@@ -103,7 +146,16 @@ impl PdfFile {
         let obj = match entry {
             XrefEntry::InUse { offset, .. } => {
                 let parser = ObjectParser::new(&self.data, &self.limits);
-                parser.parse_indirect_at(*offset as usize)?
+                let mut obj = parser.parse_indirect_at(*offset as usize)?;
+                // Top-level objects parsed straight from the file are encrypted;
+                // RC4-decrypt their strings and stream bytes in place (the
+                // decryptor skips the /Encrypt object itself). Objects pulled
+                // from an ObjStm take the Compressed arm and are already
+                // plaintext (the container was decrypted in get_or_decode_objstm).
+                if let Some(dec) = &self.decryptor {
+                    dec.decrypt_object(&mut obj, id);
+                }
+                obj
             }
             XrefEntry::Compressed {
                 stream_obj,
@@ -203,7 +255,16 @@ impl PdfFile {
         let n = usize::try_from(stream.dict.get_i64("N")?).map_err(|_| neg("/N"))?;
         let first = usize::try_from(stream.dict.get_i64("First")?).map_err(|_| neg("/First"))?;
 
-        let decoded = filters::decode_stream(&stream.data, &stream.dict)?;
+        // An encrypted document encrypts the ObjStm *container* once (keyed by
+        // the container's own object id); its member objects are not separately
+        // encrypted. Decrypt the raw bytes before running the filter pipeline.
+        let raw: std::borrow::Cow<[u8]> = match &self.decryptor {
+            Some(dec) => std::borrow::Cow::Owned(
+                dec.decrypt_stream_bytes(zpdf_core::ObjectId(stream_obj_num, 0), &stream.data),
+            ),
+            None => std::borrow::Cow::Borrowed(&stream.data),
+        };
+        let decoded = filters::decode_stream(&raw, &stream.dict)?;
 
         // Parse the header: N pairs of (obj_num, offset_within_data). Capacity is
         // bounded by the header length to avoid a huge allocation on a bogus /N.

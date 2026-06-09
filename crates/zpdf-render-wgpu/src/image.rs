@@ -8,8 +8,12 @@ use crate::context::GpuContext;
 use crate::transform::TexturedVertex;
 
 /// Build the four quad corners (device pixels) + UVs for an image, reproducing the
-/// affine in `render_image` (both `ctm_flips_y` branches). Coefficients are computed
-/// in f32, matching the CPU. `alpha` is the per-draw opacity (`PixmapPaint::opacity`).
+/// affine in `render_image`. Coefficients are computed in f32, matching the CPU.
+/// `alpha` is the per-draw opacity (`PixmapPaint::opacity`).
+///
+/// The image sample → unit-square → CTM → page-flip chain is a single affine that
+/// is correct for every CTM (a negative `d` is just ordinary geometry, honored via
+/// the fixed page Y-flip). See `CpuRenderer::render_image` for the derivation.
 pub fn image_quad(
     iw: f32,
     ih: f32,
@@ -28,15 +32,16 @@ pub fn image_quad(
         tm.e as f32,
         tm.f as f32,
     );
-    let ctm_flips_y = tm.d < 0.0 || (tm.d == 0.0 && tm.b != 0.0);
 
-    // (t_sx, t_kx, t_ky, t_sy, t_tx, t_ty): screen = (t_sx*ix + t_kx*iy + t_tx,
-    //                                                  t_ky*ix + t_sy*iy + t_ty)
-    let (t_sx, t_kx, t_ky, t_sy, t_tx, t_ty) = if ctm_flips_y {
-        (a * s / iw, -c * s / ih, b * s / iw, -d * s / ih, (c + e) * s, (d + f) * s)
-    } else {
-        (a * s / iw, -c * s / ih, -b * s / iw, d * s / ih, (c + e) * s, (ph - d - f) * s)
-    };
+    // screen = (t_sx*ix + t_kx*iy + t_tx, t_ky*ix + t_sy*iy + t_ty)
+    let (t_sx, t_kx, t_ky, t_sy, t_tx, t_ty) = (
+        a * s / iw,
+        -c * s / ih,
+        -b * s / iw,
+        d * s / ih,
+        (c + e) * s,
+        (ph - d - f) * s,
+    );
 
     let pt = |ix: f32, iy: f32| [t_sx * ix + t_kx * iy + t_tx, t_ky * ix + t_sy * iy + t_ty];
     let color = [1.0, 1.0, 1.0, alpha];

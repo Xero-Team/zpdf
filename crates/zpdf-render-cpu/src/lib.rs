@@ -327,41 +327,29 @@ impl<'a> CpuRenderer<'a> {
             None => return,
         };
 
-        // PDF images live in a 1x1 unit square, transformed by the CTM.
-        // CTM maps (0,0)→(1,1) in image space to page coordinates.
-        // We need: image_pixel → [0,1] → CTM → page_coords → screen_pixels
+        // PDF images occupy the unit square [0,1]×[0,1] in user space, mapped by
+        // the CTM. Image sample space has its origin at the TOP-left with y
+        // pointing DOWN (PDF spec §8.9.5.2), so sample row 0 maps to the top
+        // edge of the unit square (v = 1). The renderer then applies its fixed
+        // page Y-flip — the same one used for every path and glyph — so the
+        // CTM's own orientation (including a negative `d`, common in scanned
+        // PDFs that store the JPEG upside down) is honored as ordinary geometry.
+        //
+        // Full chain for image pixel (ix, iy):
+        //   ux = ix/iw,  uy = 1 - iy/ih              (sample → unit square)
+        //   px = a*ux + c*uy + e                     (unit square → user space)
+        //   py = b*ux + d*uy + f
+        //   screen_x = px * s                        (user space → screen px)
+        //   screen_y = (ph - py) * s                 (fixed page flip)
+        //
+        // Composed into a single affine in image-pixel coordinates:
+        //   screen_x = (a*s/iw)*ix + (-c*s/ih)*iy + (c + e)*s
+        //   screen_y = (-b*s/iw)*ix + (d*s/ih)*iy + (ph - d - f)*s
         let tm = &draw.transform;
         let s = self.scale;
         let ph = self.page_height;
         let iw = image.width as f32;
         let ih = image.height as f32;
-
-        // Build affine: image_pixel_coords → screen_pixel_coords
-        // Step 1: image pixels → unit square: scale by 1/w, 1/h
-        // Step 2: unit square → page coords via CTM (a,b,c,d,e,f)
-        // Step 3: page coords → screen pixels: x*scale, (page_height-y)*scale
-        //
-        // Combined: for image pixel (ix, iy):
-        //   ux = ix/iw, uy = (ih-iy)/ih  (flip Y: image top=0 → PDF bottom)
-        //   px = a*ux + c*uy + e
-        //   py = b*ux + d*uy + f
-        //   sx = px * scale
-        //   sy = (ph - py) * scale
-        //
-        // But if CTM already flips Y, handle that.
-        let ctm_flips_y = tm.d < 0.0 || (tm.d == 0.0 && tm.b != 0.0);
-
-        // tiny-skia Transform is: [sx kx ky sy tx ty]
-        // maps (x,y) → (sx*x + kx*y + tx, ky*x + sy*y + ty)
-        //
-        // We need: (ix, iy) image pixel →
-        //   ux = ix/iw, uy = 1 - iy/ih
-        //   page_x = a*ux + c*uy + e
-        //   page_y = b*ux + d*uy + f
-        //   screen_x = page_x * s
-        //   screen_y = (ph - page_y) * s   [or page_y*s if CTM flips]
-        //
-        // Compose as a single affine:
         let (a, b, c, d, e, f) = (
             tm.a as f32,
             tm.b as f32,
@@ -371,35 +359,16 @@ impl<'a> CpuRenderer<'a> {
             tm.f as f32,
         );
 
-        let (t_sx, t_kx, t_ky, t_sy, t_tx, t_ty) = if ctm_flips_y {
-            // screen_x = (a * ix/iw + c * (1 - iy/ih) + e) * s
-            //          = (a*s/iw)*ix + (-c*s/ih)*iy + (c + e)*s
-            // screen_y = (b * ix/iw + d * (1 - iy/ih) + f) * s
-            //          = (b*s/iw)*ix + (-d*s/ih)*iy + (d + f)*s
-            (
-                a * s / iw,  // sx: screen_x per ix
-                -c * s / ih, // kx: screen_x per iy
-                b * s / iw,  // ky: screen_y per ix
-                -d * s / ih, // sy: screen_y per iy
-                (c + e) * s, // tx
-                (d + f) * s, // ty
-            )
-        } else {
-            // screen_x = (a * ix/iw + c * (1 - iy/ih) + e) * s
-            // screen_y = (ph - (b * ix/iw + d * (1 - iy/ih) + f)) * s
-            //          = ph*s - (b*s/iw)*ix - (-d*s/ih)*iy - (d+f)*s
-            //          = (-b*s/iw)*ix + (d*s/ih)*iy + (ph - d - f)*s
-            (
-                a * s / iw,
-                -c * s / ih,
-                -b * s / iw,
-                d * s / ih,
-                (c + e) * s,
-                (ph - d - f) * s,
-            )
-        };
-
-        let transform = tiny_skia::Transform::from_row(t_sx, t_ky, t_kx, t_sy, t_tx, t_ty);
+        // tiny-skia `Transform::from_row(sx, ky, kx, sy, tx, ty)` maps
+        // (x,y) → (sx*x + kx*y + tx, ky*x + sy*y + ty).
+        let transform = tiny_skia::Transform::from_row(
+            a * s / iw,        // sx: screen_x per ix
+            -b * s / iw,       // ky: screen_y per ix
+            -c * s / ih,       // kx: screen_x per iy
+            d * s / ih,        // sy: screen_y per iy
+            (c + e) * s,       // tx
+            (ph - d - f) * s,  // ty
+        );
 
         let paint = tiny_skia::PixmapPaint {
             opacity: draw.alpha,

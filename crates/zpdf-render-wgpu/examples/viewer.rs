@@ -110,10 +110,16 @@ impl Gfx {
             compatible_surface: Some(&surface),
         }))
         .expect("adapter");
+        // Start from the broadly-compatible downlevel limits, but raise the max
+        // texture dimension to what the adapter actually supports — a page tile
+        // at RENDER_DPI (e.g. test5 is 2480 px wide) routinely exceeds the
+        // downlevel 2048 cap and would otherwise fail texture creation.
+        let mut required_limits = wgpu::Limits::downlevel_defaults();
+        required_limits.max_texture_dimension_2d = adapter.limits().max_texture_dimension_2d;
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("viewer-device"),
             required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::downlevel_defaults(),
+            required_limits,
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
             memory_hints: wgpu::MemoryHints::MemoryUsage,
             trace: wgpu::Trace::Off,

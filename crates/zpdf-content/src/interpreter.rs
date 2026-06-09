@@ -776,7 +776,14 @@ impl<'a> ContentInterpreter<'a> {
             }
         };
 
-        let image = match zpdf_image::decode_image_xobject(&decoded_data, &stream.dict) {
+        // Image metadata keys may be indirect references; resolve them so e.g.
+        // an indirect /Decode does not silently invert an /ImageMask stencil.
+        let image_dict = resolve_image_metadata(file, &stream.dict);
+        let image = match zpdf_image::decode_image_xobject_with_fill(
+            &decoded_data,
+            &image_dict,
+            self.fill_rgb_u8(),
+        ) {
             Ok(img) => img,
             Err(e) => {
                 tracing::warn!("failed to decode image: {e}");
@@ -815,10 +822,17 @@ impl<'a> ContentInterpreter<'a> {
                 return;
             }
         };
-        match zpdf_image::decode_image_xobject(&decoded, &norm) {
+        match zpdf_image::decode_image_xobject_with_fill(&decoded, &norm, self.fill_rgb_u8()) {
             Ok(img) => self.emit_draw_image(img),
             Err(e) => tracing::warn!("inline image: {e}"),
         }
+    }
+
+    /// Current fill colour as 8-bit RGB, for painting `/ImageMask` stencils.
+    fn fill_rgb_u8(&self) -> [u8; 3] {
+        let c = self.current.fill_color;
+        let to_u8 = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+        [to_u8(c.r), to_u8(c.g), to_u8(c.b)]
     }
 
     fn emit_draw_image(&mut self, image: zpdf_image::DecodedImage) {
@@ -1253,6 +1267,35 @@ impl<'a> ContentInterpreter<'a> {
         let advance = Matrix::translate(displacement, 0.0);
         self.text_matrix = self.text_matrix.concat(&advance);
     }
+}
+
+/// Resolve any indirect-reference values among an image XObject's scalar
+/// metadata keys so the image decoder sees concrete values — notably an indirect
+/// `/Decode` must be resolved or an `/ImageMask` stencil would paint with the
+/// wrong polarity. `/SMask` and `/Mask` are intentionally left as references
+/// (handled separately, and they are streams we don't want to inline here).
+fn resolve_image_metadata(file: &PdfFile, dict: &zpdf_core::PdfDict) -> zpdf_core::PdfDict {
+    use zpdf_core::{PdfName, PdfObject};
+    let mut out = dict.clone();
+    for key in [
+        "Width",
+        "Height",
+        "BitsPerComponent",
+        "ImageMask",
+        "Decode",
+        "ColorSpace",
+    ] {
+        let r = match out.get(key) {
+            Some(PdfObject::Ref(r)) => Some(*r),
+            _ => None,
+        };
+        if let Some(r) = r {
+            if let Ok(v) = file.resolve(r) {
+                out.insert(PdfName::new(key), v);
+            }
+        }
+    }
+    out
 }
 
 /// Expand the abbreviated keys/values of an inline-image parameter dict to their

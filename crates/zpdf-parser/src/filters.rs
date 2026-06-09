@@ -203,6 +203,10 @@ fn apply_filter(filter: &PdfName, data: &[u8], params: Option<&PdfDict>) -> Resu
         "ASCII85Decode" | "A85" => decode_ascii85(data),
         "RunLengthDecode" | "RL" => decode_run_length(data),
         "DCTDecode" | "DCT" => decode_dct(data),
+        "CCITTFaxDecode" | "CCF" => {
+            let ccitt_params = crate::ccitt::CcittParams::from_dict(params);
+            crate::ccitt::decode(data, &ccitt_params)
+        }
         other => Err(Error::UnsupportedFilter(other.to_string())),
     }
 }
