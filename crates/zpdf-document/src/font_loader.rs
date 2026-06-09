@@ -182,7 +182,7 @@ fn load_type0_font(
     let desc_obj = file.resolve(desc_ref)?;
     let desc_dict = desc_obj.as_dict()?;
 
-    let cid_widths = parse_cid_widths(desc_dict);
+    let cid_widths = parse_cid_widths(file, desc_dict);
 
     let font_data = extract_font_file(file, desc_dict);
 
@@ -202,7 +202,7 @@ fn load_truetype_font(
     dict: &zpdf_core::PdfDict,
     base_font: String,
 ) -> Result<LoadedFont> {
-    let cid_widths = parse_simple_widths(dict);
+    let cid_widths = parse_simple_widths(file, dict);
     let font_data = extract_font_file_from_descriptor(file, dict);
 
     match font_data {
@@ -313,7 +313,7 @@ fn load_type1_font(
     dict: &zpdf_core::PdfDict,
     base_font: String,
 ) -> Result<LoadedFont> {
-    let cid_widths = parse_simple_widths(dict);
+    let cid_widths = parse_simple_widths(file, dict);
     let font_data = extract_font_file_from_descriptor(file, dict);
 
     match font_data {
@@ -367,14 +367,28 @@ fn extract_font_file_from_descriptor(
     None
 }
 
+/// Fetch an array value, resolving one level of indirect reference. pdftex (and
+/// many other producers) commonly emit `/Widths` and `/W` as indirect objects,
+/// which a plain `get_array` would miss (leaving every glyph at the default width).
+fn resolve_array(file: &PdfFile, dict: &zpdf_core::PdfDict, key: &str) -> Option<Vec<PdfObject>> {
+    match dict.get(key) {
+        Some(PdfObject::Array(a)) => Some(a.clone()),
+        Some(PdfObject::Ref(id)) => file
+            .resolve(*id)
+            .ok()
+            .and_then(|o| o.as_array().ok().map(|a| a.to_vec())),
+        _ => None,
+    }
+}
+
 /// Parse CID /W array: format is [cid [w1 w2 ...]] or [cid_first cid_last w]
-fn parse_cid_widths(dict: &zpdf_core::PdfDict) -> CidWidths {
+fn parse_cid_widths(file: &PdfFile, dict: &zpdf_core::PdfDict) -> CidWidths {
     let dw = dict.get_f64("DW").unwrap_or(1000.0);
     let mut widths = CidWidths::new(dw);
 
-    let w_array = match dict.get_array("W") {
-        Ok(arr) => arr.to_vec(),
-        Err(_) => return widths,
+    let w_array = match resolve_array(file, dict, "W") {
+        Some(arr) => arr,
+        None => return widths,
     };
 
     let mut i = 0;
@@ -422,11 +436,11 @@ fn parse_cid_widths(dict: &zpdf_core::PdfDict) -> CidWidths {
     widths
 }
 
-fn parse_simple_widths(dict: &zpdf_core::PdfDict) -> CidWidths {
+fn parse_simple_widths(file: &PdfFile, dict: &zpdf_core::PdfDict) -> CidWidths {
     let first_char = dict.get_i64("FirstChar").unwrap_or(0) as u16;
     let mut widths = CidWidths::new(1000.0);
 
-    if let Ok(arr) = dict.get_array("Widths") {
+    if let Some(arr) = resolve_array(file, dict, "Widths") {
         for (j, obj) in arr.iter().enumerate() {
             let Some(code) = first_char.checked_add(j as u16) else {
                 break;
