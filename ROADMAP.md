@@ -136,58 +136,69 @@ cargo run -p zpdf-cli -- text tests/corpus/sample.pdf -p 1
 > 目标：用 GPU 渲染 Phase 2 的 DisplayList，达到交互帧率。
 
 ### P3.1 — wgpu 上下文
-- [ ] WgpuContext: Instance/Adapter/Device/Queue
-- [ ] Surface 配置（窗口模式）
-- [ ] Offscreen 渲染（headless）
-- [ ] MSAA 支持
+- [x] WgpuContext: Instance/Adapter/Device/Queue（headless，pollster 阻塞）
+- [ ] Surface 配置（窗口模式）— 留待 viewer (M9)
+- [x] Offscreen 渲染（headless）— PageTarget + copy_texture_to_buffer 回读
+- [x] MSAA 支持（4x/1x 协商，含 Stencil8 同采样数）
 
 ### P3.2 — 渲染管线
-- [ ] solid_fill pipeline（纯色路径）
-- [ ] textured pipeline（图像）
-- [ ] glyph pipeline（文字，R8 atlas 采样）
-- [ ] stencil_fill pipeline（裁剪）
-- [ ] WGSL shader 编写
+- [x] solid_fill pipeline（纯色路径，premultiplied blend + D5 stencil 测试）
+- [ ] textured pipeline（图像）— M7
+- [x] glyph 渲染：矢量填充基线（轮廓 + Type3 走 solid_fill，精确 outline_to_pixel）；R8 atlas 优化留待 M6b
+- [x] stencil_fill pipeline（裁剪：clip_write + clip_reset）
+- [x] WGSL shader 编写（solid.wgsl：pixel→NDC + premultiplied 实色；其余 shader 待后续里程碑）
 
 ### P3.3 — 路径渲染
-- [ ] lyon tessellation 集成（BezPath → TriangleList）
-- [ ] Fill: non-zero / even-odd
-- [ ] Stroke: 线宽/端点/接合/虚线
-- [ ] 顶点缓冲区管理
+- [x] lyon tessellation 集成（BezPath → TriangleList，device-pixel 空间）
+- [x] Fill: non-zero / even-odd
+- [x] Stroke: 线宽/端点/接合（虚线刻意忽略，与 CPU oracle 对齐）
+- [x] 顶点缓冲区管理（per-page 合并 vertex/index buffer，Immediate 模式）
 
 ### P3.4 — 文字渲染
-- [ ] GlyphAtlas: R8Unorm 纹理图集
-- [ ] LRU 淘汰策略
-- [ ] 字形 quad 生成（位置 + UV）
-- [ ] 批量绘制
+- [x] 矢量填充基线（M6a）：轮廓字形按 CPU 精确坐标 lyon 三角化 → solid_fill；Type3 经 ContentInterpreter 子 DisplayList 渲染。3 个真实 PDF compare 0.34–0.58%，Type3 合成用例 0.000%
+- [ ] GlyphAtlas: R8Unorm 纹理图集 — M6b（可选优化，仅轴对齐字形）
+- [ ] LRU 淘汰策略 — M6b
+- [ ] 字形 quad 生成（位置 + UV）— M6b
+- [ ] 批量绘制 — M6b（当前走共享 arena / Immediate）
 
 ### P3.5 — 图像渲染
-- [ ] TextureCache: 图像上传 + BindGroup 缓存
-- [ ] 变换矩阵 → uniform buffer
-- [ ] 带 alpha 的图像混合
+- [x] 图像上传（Rgba8Unorm，write_texture）+ per-image BindGroup（按 image_id 缓存）
+- [x] 变换矩阵（render_image 仿射两分支烘焙进 quad 顶点，含 ctm_flips_y）
+- [x] 带 alpha 的图像混合（texel 视为 premultiplied 匹配 tiny-skia + 逐 draw opacity；裁剪 stencil 测试）
+> 真实图像页 compare 0.015%；image_rgb（3 图含 Y 翻转）0.559%；image_under_clip 0.481%
 
 ### P3.6 — 裁剪与混合
-- [ ] ClipStack: stencil buffer 管理
-- [ ] IncrWrap/DecrWrap clip 层级
-- [ ] Alpha blending (Normal blend mode)
-- [ ] Premultiplied alpha 管线
+- [x] ClipStack: stencil buffer 管理（Stencil8，有序 op 列表 replay）
+- [x] 嵌套 clip 层级（clip_write IncrementClamp 累积交集 + PopClip 全屏 reset 重建）
+- [x] Alpha blending (Normal blend mode)（premultiplied source-over）
+- [x] Premultiplied alpha 管线
+- [x] Blend group 离屏合成（M8：RenderLayer 栈 + scratch composite，多 pass）/ 16 种 blend mode（composite.wgsl，W3C premultiplied 公式）
+> 注：内容解释器尚未发出 PushBlendGroup（CPU/GPU 后端均已实现该 op）；M8 经程序化 DisplayList 验证：Multiply 叠加 = 黑（精确），6 种模式与 CPU oracle 一致 <1%
 
-### P3.7 — 批处理优化
-- [ ] BatchBuilder: 按 pipeline/texture/clip 排序
-- [ ] 合并连续同类 draw call
-- [ ] Uniform buffer 复用
+### P3.7 — 批处理优化（延后：可选性能项）
+- [~] 当前为 Immediate 模式（每命令一个 draw_indexed，共享 per-page arena buffer），正确且对现有负载足够快
+- [ ] BatchBuilder: 按 pipeline/texture/clip 排序合并 — 延后，仅在吞吐成为瓶颈时实现
+- [x] Uniform buffer 复用（page uniform 单 buffer；pipeline 切换最小化）
 
-### P3.8 — 示例 Viewer
-- [ ] winit 窗口 + wgpu surface
-- [ ] 缩放/平移/翻页
-- [ ] 渲染缓存（page tile）
-- [ ] GPU timing 统计
+### P3.8 — CLI 后端 + 示例 Viewer
+- [x] CLI `--backend [cpu|wgpu]`（M3，hand-rolled parser + 显式校验 + save_rgba 共享）
+- [x] winit 0.30 窗口 + wgpu surface（examples/viewer.rs，winit 仅 dev-dependency）
+- [x] 缩放/平移/翻页（滚轮/+/- 缩放，WASD/方向键，PageUp/Down 翻页）
+- [x] 渲染缓存（page tile：每页渲染一次 → blit；翻页才重栅格化）
+- [ ] GPU timing 统计 — 未实现（性能遥测，延后）
+- [x] CI 验收 harness：crates/zpdf/tests/gpu_acceptance.rs（gpu-render gated，7 合成用例 GPU vs CPU <1%，无 adapter 时优雅跳过）
 
-### P3 里程碑验收
+### P3 里程碑验收 — ✅ 基本达成（M1–M9）
+> GPU 后端渲染填充/描边/曲线/裁剪/文本/图像/混合组，均与 CPU oracle 对齐。
+> 合成语料 + 真实 PDF 单页均 <1%；真实 16→62 页中文文档 52/62 页 <1%（其余 1.0–1.4%，
+> 为致密 CJK 的 analytic-vs-MSAA AA 差异，R1 已知限制，threshold≈24–32 下全部通过）。
+> 批处理（P3.7）与 GPU timing 延后；blend group op 解释器尚未发出（后端已就绪）。
 ```
-cargo run -p zpdf-cli -- render tests/corpus/sample.pdf -p 1 -o gpu_output.png --backend wgpu
-# GPU 渲染输出 PNG，与 CPU 渲染结果 < 1% 像素差异
-cargo run --example viewer -- tests/corpus/sample.pdf
-# 交互式 PDF 浏览器，60fps 缩放/翻页
+cargo run -p zpdf-cli --features gpu -- render <file.pdf> -p 1 -o gpu.png --backend wgpu
+cargo run -p zpdf-cli --features gpu -- render <file.pdf> -p 1 -o cpu.png --backend cpu
+cargo run -p zpdf-cli -- compare cpu.png gpu.png        # <1% 差异
+cargo test -p zpdf --features gpu-render                # 验收 harness
+cargo run -p zpdf-render-wgpu --example viewer -- <file.pdf>   # 交互浏览器
 ```
 > 像素对比工具已就绪：`zpdf compare <a.png> <b.png> [--out diff.png] [--threshold N]`
 > 输出 差异像素% / MAE / RMSE / 最大通道差，并生成差异热力图（GPU↔CPU 验收可直接复用）。
@@ -215,10 +226,10 @@ cargo run --example viewer -- tests/corpus/sample.pdf
 - [ ] Rendering Intent
 
 ### P4.3 — 透明度与混合
-- [ ] 全部 16 种 blend mode（GPU shader 实现）
+- [x] 全部 16 种 blend mode（GPU composite.wgsl 实现，W3C 公式）— M8
 - [ ] Soft Mask (luminosity/alpha)
-- [ ] Transparency Group (isolated/knockout)
-- [ ] Offscreen render pass 合成
+- [~] Transparency Group：离屏合成已实现；isolated/knockout 当前忽略（与 CPU 一致）
+- [x] Offscreen render pass 合成（M8 RenderLayer + scratch swap）
 
 ### P4.4 — Pattern 与 Shading
 - [ ] Tiling Pattern (colored/uncolored)

@@ -35,7 +35,7 @@ zpdf-color = { path = "crates/zpdf-color", version = "0.1.0" }
 zpdf-render = { path = "crates/zpdf-render", version = "0.1.0" }
 zpdf-render-cpu = { path = "crates/zpdf-render-cpu", version = "0.1.0" }
 zpdf-render-wgpu = { path = "crates/zpdf-render-wgpu", version = "0.1.0" }
-zpdf = { path = "crates/zpdf", version = "0.1.0" }
+zpdf = { path = "crates/zpdf", version = "0.1.0", default-features = false }
 
 # external
 thiserror = "2"
@@ -49,5 +49,6 @@ zune-jpeg = "0.5"
 image = { version = "0.25", default-features = false, features = ["png"] }
 wgpu = "29"
 lyon = "1"
+pollster = "0.4"
 tiny-skia = "0.11"
 ttf-parser = "0.25"

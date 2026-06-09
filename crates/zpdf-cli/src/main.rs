@@ -240,7 +240,9 @@ fn cmd_text(args: &[String]) -> zpdf::Result<()> {
 
 fn cmd_render(args: &[String]) -> zpdf::Result<()> {
     if args.is_empty() {
-        eprintln!("Usage: zpdf render <file.pdf> [-p <page>] [-o <output.png>] [--dpi <dpi>]");
+        eprintln!(
+            "Usage: zpdf render <file.pdf> [-p <page>] [-o <output.png>] [--dpi <dpi>] [--backend cpu|wgpu]"
+        );
         process::exit(1);
     }
 
@@ -248,6 +250,7 @@ fn cmd_render(args: &[String]) -> zpdf::Result<()> {
     let mut page_num: usize = 1;
     let mut output = String::from("output.png");
     let mut dpi: f32 = 150.0;
+    let mut backend = String::from("cpu");
 
     let mut i = 1;
     while i < args.len() {
@@ -265,6 +268,16 @@ fn cmd_render(args: &[String]) -> zpdf::Result<()> {
             "--dpi" => {
                 i += 1;
                 dpi = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(150.0);
+            }
+            "--backend" => {
+                i += 1;
+                // The `_ => {}` arm below silently ignores unknown flags, so an
+                // unparsed/typo'd backend value would otherwise render CPU silently.
+                // Capture and validate explicitly at render time.
+                backend = args.get(i).cloned().unwrap_or_else(|| {
+                    eprintln!("--backend requires a value (cpu|wgpu)");
+                    process::exit(2);
+                });
             }
             _ => {}
         }
@@ -339,26 +352,63 @@ fn cmd_render(args: &[String]) -> zpdf::Result<()> {
     }
     println!("    Fills: {fills}, Strokes: {strokes}, Glyph runs: {glyphs}, Clips: {clips}, Images: {images}");
 
-    // Render with CPU backend
+    // Render with the selected backend. The DisplayList above is backend-agnostic;
+    // we branch only here. Both arms route through `save_rgba` for one encoder path.
+    #[allow(unused_imports)]
     use zpdf::RenderBackend;
     let scale = dpi / 72.0;
-    let mut renderer = zpdf::cpu::CpuRenderer::new()
-        .with_fonts(&font_cache)
-        .with_images(&image_cache);
-    let rendered: zpdf::cpu::RenderedPage = renderer
-        .render_display_list(&display_list, scale)
-        .map_err(|e| zpdf::Error::StreamDecode(e.to_string()))?;
 
-    println!("  Rendered: {}x{} pixels", rendered.width, rendered.height);
-
-    // Save PNG
-    rendered
-        .save_png(&output)
-        .map_err(|e| zpdf::Error::StreamDecode(e.to_string()))?;
+    match backend.as_str() {
+        #[cfg(feature = "cpu")]
+        "cpu" => {
+            let mut renderer = zpdf::cpu::CpuRenderer::new()
+                .with_fonts(&font_cache)
+                .with_images(&image_cache);
+            let rendered: zpdf::cpu::RenderedPage = renderer
+                .render_display_list(&display_list, scale)
+                .map_err(|e| zpdf::Error::StreamDecode(e.to_string()))?;
+            println!("  Rendered (cpu): {}x{} pixels", rendered.width, rendered.height);
+            save_rgba(&output, rendered.width, rendered.height, &rendered.data)?;
+        }
+        #[cfg(not(feature = "cpu"))]
+        "cpu" => {
+            eprintln!("--backend cpu requires building with --features cpu");
+            process::exit(1);
+        }
+        #[cfg(feature = "gpu")]
+        "wgpu" => {
+            let mut renderer = zpdf::gpu::WgpuRenderer::new()
+                .with_fonts(&font_cache)
+                .with_images(&image_cache);
+            let rendered = renderer
+                .render_display_list(&display_list, scale)
+                .map_err(|e| zpdf::Error::StreamDecode(e.to_string()))?;
+            println!("  Rendered (wgpu): {}x{} pixels", rendered.width, rendered.height);
+            save_rgba(&output, rendered.width, rendered.height, &rendered.data)?;
+        }
+        #[cfg(not(feature = "gpu"))]
+        "wgpu" => {
+            eprintln!("--backend wgpu requires building with --features gpu");
+            process::exit(1);
+        }
+        other => {
+            eprintln!("unknown --backend '{other}' (expected cpu|wgpu)");
+            process::exit(2);
+        }
+    }
 
     println!("  Saved to: {output}");
 
     Ok(())
+}
+
+/// Save a tight RGBA8 buffer (top-left origin, `len == w*h*4`) as a PNG. Shared by
+/// both render backends so output goes through a single encoder path.
+fn save_rgba(path: &str, w: u32, h: u32, data: &[u8]) -> zpdf::Result<()> {
+    let img = image::RgbaImage::from_raw(w, h, data.to_vec())
+        .ok_or_else(|| zpdf::Error::StreamDecode("rgba buffer size mismatch".into()))?;
+    img.save(path)
+        .map_err(|e| zpdf::Error::StreamDecode(format!("save {path}: {e}")))
 }
 
 fn cmd_debug_stream(args: &[String]) -> zpdf::Result<()> {

@@ -2,147 +2,160 @@
 
 [![CI](https://github.com/Xero-Team/zpdf/actions/workflows/ci.yml/badge.svg)](https://github.com/Xero-Team/zpdf/actions/workflows/ci.yml)
 
-Pure Rust PDF parsing and rendering library with wgpu GPU acceleration support.
+Pure-Rust PDF parsing and rendering, with interchangeable CPU (tiny-skia) and
+GPU (wgpu) renderers whose output matches within <1% of pixels.
 
 ## Features
 
-- **Pure Rust** — zero C/C++ dependencies, fully safe
-- **PDF parsing** — header, xref, trailer, object model, stream filters (Flate/ASCII85/AsciiHex/RunLength)
-- **Content stream interpretation** — graphics state, path construction, text positioning, color operations
-- **Font rendering** — Type3 glyph outlines (CJK), embedded TrueType (ttf-parser), CID/Type0 fonts
-- **CPU rendering** — tiny-skia backend outputs PNG at arbitrary DPI
-- **GPU rendering** — wgpu backend (Phase 3, architecture ready)
+- **Pure Rust** — zero C/C++ dependencies, fully safe.
+- **PDF parsing** — header, traditional xref + xref/object streams, trailer chains,
+  object model, stream filters (Flate / ASCII85 / ASCIIHex / RunLength + predictors).
+- **Content interpretation** — graphics state, paths, clipping, text, color, inline &
+  XObject images, Form XObjects.
+- **Fonts** — embedded TrueType, Type1, CID/Type0 (Identity-H, `/W`), Type3, the
+  standard-14 fonts; encodings + `/Differences`; `/ToUnicode` text extraction.
+- **CPU rendering** — tiny-skia backend, PNG output at any DPI.
+- **GPU rendering** — wgpu backend (fills, strokes, clips, text, images, blend groups);
+  matches the CPU renderer within <1% pixels.
+- **Tooling** — CLI (`info`/`render`/`text`/`compare`/`dump`/`debug-stream`) and an
+  interactive winit viewer.
 
-## Quick Start
+## Documentation
+
+- **[docs/user-guide.md](docs/user-guide.md)** — the `zpdf` command-line tool.
+- **[docs/library.md](docs/library.md)** — using zpdf as a Rust library + architecture.
+- **[docs/CHANGELOG.md](docs/CHANGELOG.md)** — release notes.
+- **[ROADMAP.md](ROADMAP.md)** — development plan.
+
+## Quick start
 
 ```bash
-# Show PDF metadata
+# Inspect a document
 cargo run -p zpdf-cli -- info document.pdf
 
-# Render page 1 at 150 DPI
-cargo run -p zpdf-cli -- render document.pdf -p 1 -o output.png --dpi 150
+# Render page 1 at 150 DPI (CPU)
+cargo run -p zpdf-cli -- render document.pdf -p 1 -o out.png --dpi 150
 
-# Dump a specific PDF object
-cargo run -p zpdf-cli -- dump document.pdf 4 0
+# Render on the GPU (requires the `gpu` feature)
+cargo run -p zpdf-cli --features gpu -- render document.pdf -p 1 -o gpu.png --backend wgpu
+
+# Extract text, and compare two renders
+cargo run -p zpdf-cli -- text document.pdf -p 1
+cargo run -p zpdf-cli -- compare out.png gpu.png --out diff.png
+
+# Interactive viewer (pan/zoom/page-flip)
+cargo run -p zpdf-render-wgpu --example viewer -- document.pdf
 ```
 
-## Library Usage
+## Library usage
 
 ```rust
-use zpdf::{PdfDocument, RenderBackend};
+use zpdf::{ContentInterpreter, ImageCache, PdfDocument, RenderBackend};
 
-// Open and inspect
-let data = std::fs::read("document.pdf")?;
+let data = std::fs::read("document.pdf").map_err(zpdf::Error::Io)?;
 let doc = PdfDocument::open(data)?;
-println!("Pages: {}", doc.page_count());
 
-// Render a page
-let page = doc.page(0)?;
-let font_cache = doc.load_page_fonts(&page);
+let page = doc.page(0)?;                        // 0-based
+let mut fonts = doc.load_page_fonts(&page);
+let mut images = ImageCache::new();
 let content = doc.page_content_bytes(&page)?;
 
-let interpreter = zpdf::ContentInterpreter::new(page.media_box)
-    .with_fonts(&font_cache);
-let display_list = interpreter.interpret(&content);
+let display_list = ContentInterpreter::new(page.media_box)
+    .with_fonts(&mut fonts)
+    .with_document(doc.file(), &page.resources)
+    .with_images(&mut images)
+    .interpret(&content);
 
 let mut renderer = zpdf::cpu::CpuRenderer::new()
-    .with_fonts(&font_cache);
-let rendered = renderer.render_display_list(&display_list, 2.0)?; // 144 DPI
-rendered.save_png("output.png")?;
+    .with_fonts(&fonts)
+    .with_images(&images);
+let page_img = renderer.render_display_list(&display_list, 150.0 / 72.0)?; // 150 DPI
+page_img.save_png("out.png")?;
 ```
+
+Switch `zpdf::cpu::CpuRenderer` for `zpdf::gpu::WgpuRenderer` (with `features = ["gpu-render"]`)
+to render on the GPU — everything upstream is identical. See [docs/library.md](docs/library.md).
 
 ## Architecture
 
+13-crate workspace with a strict one-direction dependency flow. **Render backends
+depend only on `zpdf-display-list`, never on the parser** — parsing and rendering stay
+fully decoupled.
+
 ```
-zpdf-core           Base types: PdfObject, Matrix, Rect, Error
-  │
-  ├─ zpdf-parser     PDF file parser: lexer, xref, trailer, stream filters
-  │    │
-  │    └─ zpdf-document   Document model: catalog, page tree, font loading
-  │         │
-  │         └─ zpdf-content   Content stream interpreter → DisplayList
-  │
-  ├─ zpdf-font       Font engine: Type3, TrueType, CID (ttf-parser)
-  ├─ zpdf-image      Image decoding (JPEG, Flate)
-  ├─ zpdf-color      Color spaces (RGB, CMYK, Gray)
-  │
-  ├─ zpdf-display-list   Render commands: paths, glyphs, images, clips
-  │
-  ├─ zpdf-render     Backend-agnostic RenderBackend trait
-  │    ├─ zpdf-render-cpu    CPU renderer (tiny-skia)
-  │    └─ zpdf-render-wgpu   GPU renderer (wgpu, Phase 3)
-  │
-  ├─ zpdf-cli        CLI tool: info, dump, render
-  └─ zpdf            Facade crate, re-exports everything
+zpdf-core            Shared types: ObjectId, PdfObject, Matrix, Rect, Error, ParseLimits
+  ├─ zpdf-parser     Lexer, xref/trailer, object & stream decoding, filters
+  │   └─ zpdf-document   Catalog, page tree, resource inheritance, font loading
+  │       └─ zpdf-content   Content-stream interpreter → DisplayList
+  ├─ zpdf-font       Type1 / TrueType / CID / Type3 fonts, CMap, encodings
+  ├─ zpdf-image      JPEG / Flate / masks → RGBA
+  ├─ zpdf-color      DeviceGray / RGB / CMYK / Indexed / Lab
+  ├─ zpdf-display-list   Flat RenderCommand sequence (the backend contract)
+  ├─ zpdf-render          RenderBackend trait
+  │   ├─ zpdf-render-cpu   tiny-skia backend
+  │   └─ zpdf-render-wgpu  wgpu backend (+ viewer example)
+  ├─ zpdf-cli        CLI tool
+  └─ zpdf            Facade crate (re-exports; feature-gates cpu / gpu)
 ```
 
-Key design constraint: render backends depend only on `zpdf-display-list`, never on `zpdf-parser`. This keeps parsing and rendering fully decoupled.
+## Supported PDF features
 
-## Supported PDF Features
-
-| Feature                                      | Status  |
-| -------------------------------------------- | ------- |
-| PDF 1.0–2.0 header                          | Done    |
-| Traditional xref table                       | Done    |
-| Xref streams (PDF 1.5+)                      | Planned |
-| FlateDecode / ASCII85 / AsciiHex / RunLength | Done    |
-| DCTDecode (JPEG)                             | Planned |
-| Page tree traversal                          | Done    |
-| Resource inheritance                         | Done    |
-| Graphics state (q/Q/cm/w/J/j/M/d)            | Done    |
-| Path ops (m/l/c/v/y/h/re)                    | Done    |
-| Path painting (S/s/f/F/f\*/B/B\*/b/b\*/n)    | Done    |
-| Clipping (W/W\*)                             | Done    |
-| DeviceGray / DeviceRGB / DeviceCMYK          | Done    |
-| Text (BT/ET/Tf/Td/TD/Tm/T\*/Tj/TJ/'/")       | Done    |
-| Text state (Tc/Tw/Tz/TL/Ts/Tr)               | Done    |
-| Type3 fonts (CharProcs glyph streams)        | Done    |
-| TrueType embedded fonts                      | Done    |
-| CID/Type0 fonts (Identity-H, /W widths)      | Done    |
-| Image XObject (Do)                           | Planned |
-| Form XObject                                 | Planned |
-| ExtGState (transparency)                     | Planned |
-| ICC color profiles                           | Planned |
-| Blend modes                                  | Planned |
-| Annotations                                  | Planned |
-| Encryption                                   | Planned |
-| ToUnicode text extraction                    | Planned |
+| Feature | Status |
+| --- | --- |
+| PDF 1.0–2.0 header | ✅ |
+| Traditional xref + xref/object streams | ✅ |
+| Incremental update (`/Prev`) chains | ✅ |
+| Flate / ASCII85 / ASCIIHex / RunLength + predictors | ✅ |
+| DCTDecode (JPEG) | ✅ |
+| Page tree + resource inheritance | ✅ |
+| Graphics state, paths, painting, clipping | ✅ |
+| DeviceGray / DeviceRGB / DeviceCMYK | ✅ |
+| Text + text state operators | ✅ |
+| Type3 / TrueType / Type1 / CID-Type0 / standard-14 fonts | ✅ |
+| Encodings + `/Differences`, `/ToUnicode` extraction | ✅ |
+| Inline & XObject images, image/soft masks | ✅ |
+| Form XObjects | ✅ |
+| CPU rendering (PNG) | ✅ |
+| GPU rendering (wgpu) | ✅ |
+| 16 blend modes (GPU) | ✅ backend; not yet emitted by the interpreter |
+| ICC color profiles | Planned |
+| Annotations | Planned |
+| Encryption | Planned |
+| LZW / CCITT / JBIG2 / JPX filters | Planned |
 
 ## Dependencies
 
 All pure Rust:
 
-| Crate                 | Purpose                        |
-| --------------------- | ------------------------------ |
-| ttf-parser            | TrueType/OpenType font parsing |
-| tiny-skia             | CPU 2D rasterization           |
-| flate2 (rust_backend) | FlateDecode stream filter      |
-| image                 | PNG output                     |
-| winnow                | Parser combinators             |
-| wgpu                  | GPU rendering (Phase 3)        |
-| lyon                  | Path tessellation for GPU      |
+| Crate | Purpose |
+| --- | --- |
+| `ttf-parser` | TrueType / OpenType / CFF font parsing |
+| `tiny-skia` | CPU 2D rasterization |
+| `flate2` (`rust_backend`) | FlateDecode |
+| `zune-jpeg` | JPEG (DCTDecode) |
+| `image` | PNG I/O |
+| `winnow` | Parsing helpers |
+| `wgpu` + `lyon` + `pollster` | GPU rendering (`gpu-render` feature) |
+| `winit` | Viewer example only (dev-dependency) |
 
 ## Development
 
 ```bash
-# Build everything
-cargo build
-
-# Run tests
-cargo test
-
-# Render a test PDF
-cargo run -p zpdf-cli -- render tests/your-file.pdf -p 1 -o output.png --dpi 200
+cargo build                                   # CPU-only (default)
+cargo build --features gpu-render             # include the wgpu backend
+cargo test                                    # all tests
+cargo test -p zpdf --features gpu-render      # + the GPU↔CPU acceptance harness
+cargo clippy --workspace
 ```
 
 ## Roadmap
 
-See [ROADMAP.md](ROADMAP.md) for the full development plan.
+See [ROADMAP.md](ROADMAP.md).
 
-- **Phase 1** — PDF parsing (done)
-- **Phase 2** — Content stream + CPU rendering (in progress)
-- **Phase 3** — wgpu GPU rendering
-- **Phase 4** — Advanced features (ICC, blend modes, encryption)
+- **Phase 1** — PDF parsing — done
+- **Phase 2** — Content interpretation + CPU rendering — done
+- **Phase 3** — wgpu GPU rendering — done
+- **Phase 4** — Advanced features (ICC, soft masks, annotations, encryption) — planned
 
 ## License
 

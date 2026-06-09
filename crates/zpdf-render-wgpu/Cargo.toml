@@ -10,8 +10,26 @@ authors.workspace = true
 zpdf-core.workspace = true
 zpdf-display-list.workspace = true
 zpdf-render.workspace = true
+zpdf-font.workspace = true        # LoadedFont/GlyphOutline (glyph atlas, Type3)
+zpdf-image.workspace = true       # ImageCache/DecodedImage (image textures)
+zpdf-content.workspace = true     # ContentInterpreter (Type3 char-procs)
 wgpu.workspace = true
 lyon.workspace = true
 bytemuck.workspace = true
+tiny-skia.workspace = true        # pure-Rust glyph-coverage raster (AA parity)
+pollster.workspace = true         # block_on for headless device/readback
 tracing.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+# CPU backend is the oracle for blend-group parity tests (built programmatically,
+# since the content interpreter does not yet emit PushBlendGroup ops).
+zpdf-render-cpu.workspace = true
+# Facade (parsing pipeline only) + winit for the interactive viewer example.
+# winit stays a dev-dependency so headless library/CLI builds never link a windowing stack.
+zpdf = { workspace = true, default-features = false }
+winit = "0.30"
+pollster.workspace = true
+
+[[example]]
+name = "viewer"
