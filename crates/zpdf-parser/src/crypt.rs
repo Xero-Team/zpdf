@@ -167,11 +167,10 @@ impl Decryptor {
 
     fn walk(&self, obj: &mut PdfObject, id: ObjectId) {
         match obj {
-            PdfObject::String(s) => {
-                if self.str_algo != Algo::Identity {
-                    *s = PdfString(self.decrypt(id, &s.0, self.str_algo));
-                }
+            PdfObject::String(s) if self.str_algo != Algo::Identity => {
+                *s = PdfString(self.decrypt(id, &s.0, self.str_algo));
             }
+            PdfObject::String(_) => {}
             PdfObject::Array(a) => {
                 for o in a.iter_mut() {
                     self.walk(o, id);
