@@ -64,6 +64,15 @@ pub struct LoadedFont {
     pub ascent: f64,
     pub descent: f64,
     pub cid_to_gid: Option<HashMap<u16, u16>>,
+    /// Character-code → GID table from the embedded CFF program's built-in
+    /// encoding (simple fonts with raw CFF data only). Consulted as a fallback
+    /// in [`code_to_gid`](Self::code_to_gid) — never applied to a resolved GID,
+    /// since its keys are character codes, not glyph ids.
+    pub builtin_encoding_gids: Option<HashMap<u16, u16>>,
+    /// GIDs > 0 whose CFF charset name is literally ".notdef" (SID 0). Quartz
+    /// subsets use this for glyphs it could not give a MacRoman-compatible
+    /// name; see [`map_unencoded_orphans`](Self::map_unencoded_orphans).
+    pub orphan_gids: Vec<u16>,
     /// Simple-font character-code → glyph-name mapping (base encoding + /Differences).
     /// `None` for composite (Type0/CID) fonts and fully symbolic fonts.
     pub encoding: Option<encoding::Encoding>,
@@ -111,16 +120,36 @@ impl LoadedFont {
             let ascent = face.ascender() as f64;
             let descent = face.descender() as f64;
 
-            let cid_to_gid = if was_raw_cff {
+            // For composite fonts the charset maps CID → GID and glyph_outline
+            // applies it to incoming CIDs. For simple fonts the CFF built-in
+            // encoding maps character codes → GIDs, which belongs to the
+            // code_to_gid resolution chain instead.
+            let (cid_to_gid, builtin_encoding_gids, orphan_gids) = if was_raw_cff {
                 match font_type {
-                    PdfFontType::Type0CidType2 => build_cff_cid_to_gid_map(&font_data),
-                    PdfFontType::Type1 | PdfFontType::TrueType => {
-                        build_cff_encoding_map(&font_data)
+                    PdfFontType::Type0CidType2 => {
+                        (build_cff_cid_to_gid_map(&font_data), None, Vec::new())
                     }
-                    _ => None,
+                    PdfFontType::Type1 | PdfFontType::TrueType => (
+                        None,
+                        build_cff_encoding_map(&font_data),
+                        find_cff_table(&font_data)
+                            .and_then(parse_cff_orphan_gids)
+                            .unwrap_or_default(),
+                    ),
+                    _ => (None, None, Vec::new()),
                 }
+            } else if matches!(font_type, PdfFontType::Type0CidType2) {
+                // FontFile3 /Subtype /OpenType: an sfnt wrapper whose glyph data
+                // is a CID-keyed CFF table. The charset still carries CID → GID,
+                // without which CIDs would be misread as GIDs. A non-CID-keyed
+                // CFF (no /ROS) is left alone — there the charset holds
+                // glyph-name SIDs, not CIDs, and the identity mapping is correct.
+                let map = find_cff_table(&font_data)
+                    .filter(|cff| cff_is_cid_keyed(cff))
+                    .and_then(parse_cff_charset);
+                (map, None, Vec::new())
             } else {
-                None
+                (None, None, Vec::new())
             };
 
             Self {
@@ -132,6 +161,8 @@ impl LoadedFont {
                 ascent,
                 descent,
                 cid_to_gid,
+                builtin_encoding_gids,
+                orphan_gids,
                 encoding: None,
                 to_unicode: None,
                 symbolic: false,
@@ -149,6 +180,8 @@ impl LoadedFont {
                 ascent: units_per_em * 0.8,
                 descent: -units_per_em * 0.2,
                 cid_to_gid: None,
+                builtin_encoding_gids: None,
+                orphan_gids: Vec::new(),
                 encoding: None,
                 to_unicode: None,
                 symbolic: false,
@@ -167,6 +200,8 @@ impl LoadedFont {
                 ascent: 800.0,
                 descent: -200.0,
                 cid_to_gid: None,
+                builtin_encoding_gids: None,
+                orphan_gids: Vec::new(),
                 encoding: None,
                 to_unicode: None,
                 symbolic: false,
@@ -192,6 +227,8 @@ impl LoadedFont {
             ascent: metrics.ascent,
             descent: metrics.descent,
             cid_to_gid: None,
+            builtin_encoding_gids: None,
+            orphan_gids: Vec::new(),
             encoding: None,
             to_unicode: None,
             symbolic: false,
@@ -209,6 +246,8 @@ impl LoadedFont {
             ascent: 800.0,
             descent: -200.0,
             cid_to_gid: None,
+            builtin_encoding_gids: None,
+            orphan_gids: Vec::new(),
             encoding: None,
             to_unicode: None,
             symbolic: false,
@@ -323,7 +362,16 @@ impl LoadedFont {
             }
         }
 
-        // 2. Built-in cmap subtables — common for symbolic embedded fonts.
+        // 2. The embedded CFF program's built-in encoding (charcode → GID),
+        //    for codes the PDF /Encoding doesn't resolve (symbolic fonts, or
+        //    subset fonts whose glyph names the /Encoding tables don't know).
+        if let Some(map) = &self.builtin_encoding_gids {
+            if let Some(&g) = map.get(&code) {
+                return Some(g);
+            }
+        }
+
+        // 3. Built-in cmap subtables — common for symbolic embedded fonts.
         if let Some(cmap) = face.tables().cmap {
             // (3,0) Windows Symbol: try the 0xF000 PUA offset then the raw code.
             for st in cmap.subtables {
@@ -336,22 +384,72 @@ impl LoadedFont {
                     }
                 }
             }
-            // (1,0) Macintosh Roman: try the raw code.
+            // (3,1) Windows Unicode at the 0xF000 PUA offset: symbolic fonts
+            // often park their glyphs in the PUA but ship only a Unicode
+            // subtable (the raw code is retried as Latin-1 in step 4).
+            if self.symbolic {
+                for st in cmap.subtables {
+                    if st.platform_id == ttf_parser::PlatformId::Windows && st.encoding_id == 1 {
+                        if let Some(g) = st.glyph_index(0xF000 | code as u32) {
+                            return Some(g.0);
+                        }
+                    }
+                }
+            }
+            // (1,0) Macintosh Roman: try the raw code, then the MacRoman slot
+            // of the /Encoding glyph name — the subtable is MacRoman-indexed,
+            // so a PDF encoding that differs from MacRoman needs the name detour.
             for st in cmap.subtables {
                 if st.platform_id == ttf_parser::PlatformId::Macintosh && st.encoding_id == 0 {
                     if let Some(g) = st.glyph_index(code as u32) {
                         return Some(g.0);
                     }
+                    if let Some(mac) = self
+                        .encoding
+                        .as_ref()
+                        .and_then(|e| e.glyph_name(code8))
+                        .and_then(mac_roman_code_for_name)
+                    {
+                        if let Some(g) = st.glyph_index(mac) {
+                            return Some(g.0);
+                        }
+                    }
                 }
             }
         }
 
-        // 3. Treat the code as Latin-1 and consult the Unicode cmap.
+        // 4. Treat the code as Latin-1 and consult the Unicode cmap.
         if let Some(g) = face.glyph_index(code8 as char) {
             return Some(g.0);
         }
 
         None
+    }
+
+    /// Recover glyphs that no encoding can reach in Quartz (macOS) subsets.
+    ///
+    /// Quartz names each subset glyph after the MacRoman slot it re-encoded the
+    /// text to, and names glyphs with no MacRoman-compatible slot literally
+    /// ".notdef" (charset SID 0), addressing them by their original Type 1 code
+    /// — e.g. the CMSY minus at code 0. Pair the /Widths-declared codes that no
+    /// resolution step maps with those orphan GIDs, both in ascending order.
+    /// Call after `encoding` and `cid_widths` are attached.
+    pub fn map_unencoded_orphans(&mut self) {
+        if self.orphan_gids.is_empty() {
+            return;
+        }
+        let unmapped: Vec<u16> = (0..=255u16)
+            .filter(|&c| self.cid_widths.get_opt(c).is_some_and(|w| w > 0.0))
+            .filter(|&c| self.code_to_gid(c).is_none())
+            .collect();
+        if unmapped.is_empty() {
+            return;
+        }
+        let orphans = self.orphan_gids.clone();
+        let map = self.builtin_encoding_gids.get_or_insert_with(HashMap::new);
+        for (&code, &gid) in unmapped.iter().zip(&orphans) {
+            map.entry(code).or_insert(gid);
+        }
     }
 
     /// Advance for a simple-font glyph, in font units consistent with
@@ -438,11 +536,11 @@ impl LoadedFont {
                 font_matrix,
                 char_procs,
                 encoding,
-                first_char,
                 ..
             } => {
-                let idx = char_code.checked_sub(*first_char)? as usize;
-                let glyph_name = encoding.get(idx)?;
+                // `encoding` is indexed by absolute character code (the
+                // /Differences codes), unlike /Widths which is /FirstChar-based.
+                let glyph_name = encoding.get(char_code as usize)?;
                 if glyph_name == "g0" || glyph_name.is_empty() {
                     return None;
                 }
@@ -507,10 +605,53 @@ impl ttf_parser::OutlineBuilder for OutlineBuilder {
     }
 }
 
+/// MacRoman character code for a glyph name (inverse of MAC_ROMAN_ENCODING).
+fn mac_roman_code_for_name(name: &str) -> Option<u32> {
+    encoding::MAC_ROMAN_ENCODING
+        .iter()
+        .position(|slot| *slot == Some(name))
+        .map(|i| i as u32)
+}
+
 fn build_cff_cid_to_gid_map(otf_data: &[u8]) -> Option<HashMap<u16, u16>> {
     // Find the CFF table in the OTF container
     let cff_data = find_cff_table(otf_data)?;
     parse_cff_charset(cff_data)
+}
+
+/// CFF Top DICT operator 12 30 (/ROS) — present iff the font is CID-keyed.
+const CFF_OP_ROS: u16 = 256 + 30;
+
+/// Whether a CFF table is CID-keyed (its Top DICT carries a /ROS operator).
+fn cff_is_cid_keyed(cff: &[u8]) -> bool {
+    cff_top_dict(cff).is_some_and(|dict| parse_top_dict_int(dict, CFF_OP_ROS).is_some())
+}
+
+/// Slice of the first Top DICT in a CFF table.
+fn cff_top_dict(cff: &[u8]) -> Option<&[u8]> {
+    if cff.len() < 5 {
+        return None;
+    }
+    let header_size = cff[2] as usize;
+    // Skip the Name INDEX, then read the first Top DICT INDEX entry.
+    let mut pos = skip_cff_index(cff, header_size)?;
+    if pos + 2 > cff.len() {
+        return None;
+    }
+    let count = u16::from_be_bytes([cff[pos], cff[pos + 1]]) as usize;
+    if count == 0 {
+        return None;
+    }
+    pos += 2;
+    let off_size = cff[pos] as usize;
+    pos += 1;
+    let start = read_cff_offset(cff, pos, off_size)?;
+    let end = read_cff_offset(cff, pos + off_size, off_size)?;
+    let data_start = pos + (count + 1) * off_size;
+    if start < 1 || end < start || data_start + end - 1 > cff.len() {
+        return None;
+    }
+    Some(&cff[data_start + start - 1..data_start + end - 1])
 }
 
 fn build_cff_encoding_map(otf_data: &[u8]) -> Option<HashMap<u16, u16>> {
@@ -566,9 +707,10 @@ fn parse_cff_encoding(cff: &[u8]) -> Option<HashMap<u16, u16>> {
         // For Standard Encoding, we need to map through the charset
         // charset maps GlyphId → SID, standard encoding maps charcode → SID
         let charset_offset = parse_top_dict_int(dict_data, 15).unwrap_or(0);
-        if charset_offset == 0 {
-            // ISOAdobe charset — identity for first 228 glyphs
-            return None; // identity works
+        if charset_offset <= 2 {
+            // Predefined charset (0 ISOAdobe / 1 Expert / 2 ExpertSubset),
+            // not an offset. ISOAdobe is identity for the first 228 glyphs.
+            return None;
         }
 
         // Build GlyphId → SID from charset
@@ -646,6 +788,61 @@ fn parse_cff_encoding(cff: &[u8]) -> Option<HashMap<u16, u16>> {
         None
     } else {
         Some(map)
+    }
+}
+
+/// GIDs > 0 mapped to SID 0 (".notdef") by the charset — real glyphs that a
+/// (Quartz) subsetter declined to name. Predefined charsets have none.
+fn parse_cff_orphan_gids(cff: &[u8]) -> Option<Vec<u16>> {
+    if cff.len() < 5 {
+        return None;
+    }
+    let header_size = cff[2] as usize;
+
+    // Skip Name INDEX, then read the first Top DICT.
+    let mut pos = skip_cff_index(cff, header_size)?;
+    if pos + 2 > cff.len() {
+        return None;
+    }
+    let count = u16::from_be_bytes([cff[pos], cff[pos + 1]]) as usize;
+    if count == 0 {
+        return None;
+    }
+    pos += 2;
+    let off_size = cff[pos] as usize;
+    pos += 1;
+    let mut offsets = Vec::with_capacity(count + 1);
+    for _ in 0..=count {
+        offsets.push(read_cff_offset(cff, pos, off_size)?);
+        pos += off_size;
+    }
+    if offsets[0] < 1 || pos + offsets[1] - 1 > cff.len() || offsets[1] < offsets[0] {
+        return None;
+    }
+    let dict_data = &cff[pos + offsets[0] - 1..pos + offsets[1] - 1];
+
+    let charset_offset = parse_top_dict_int(dict_data, 15).unwrap_or(0);
+    // 0/1/2 are predefined charsets (ISOAdobe/Expert/ExpertSubset), not
+    // offsets — and predefined charsets never contain orphans.
+    if charset_offset <= 2 {
+        return None;
+    }
+    let charstrings_offset = parse_top_dict_charstrings(dict_data)?;
+    let num_glyphs = count_cff_index_entries(cff, charstrings_offset)?;
+
+    let mut gid_to_sid = HashMap::new();
+    parse_charset_to_gid_sid(cff, charset_offset, num_glyphs, &mut gid_to_sid);
+
+    let mut orphans: Vec<u16> = gid_to_sid
+        .iter()
+        .filter(|&(&gid, &sid)| gid != 0 && sid == 0)
+        .map(|(&gid, _)| gid)
+        .collect();
+    orphans.sort_unstable();
+    if orphans.is_empty() {
+        None
+    } else {
+        Some(orphans)
     }
 }
 
@@ -911,6 +1108,10 @@ fn parse_cff_charset(cff: &[u8]) -> Option<HashMap<u16, u16>> {
         }
         return Some(map);
     }
+    if charset_offset <= 2 {
+        // Predefined Expert/ExpertSubset charsets, not offsets — no mapping.
+        return None;
+    }
 
     let cs = charset_offset as usize;
     if cs >= cff.len() {
@@ -1027,7 +1228,9 @@ fn parse_top_dict_charstrings(dict_data: &[u8]) -> Option<usize> {
     parse_top_dict_int(dict_data, 17)
 }
 
-fn parse_top_dict_int(dict_data: &[u8], target_key: u8) -> Option<usize> {
+/// Last integer operand of `target_key` in a CFF Top DICT. Two-byte operators
+/// (12 x) are addressed as `256 + x` (e.g. [`CFF_OP_ROS`]).
+fn parse_top_dict_int(dict_data: &[u8], target_key: u16) -> Option<usize> {
     let mut pos = 0;
     let mut operand_stack: Vec<i64> = Vec::new();
 
@@ -1045,7 +1248,7 @@ fn parse_top_dict_int(dict_data: &[u8], target_key: u8) -> Option<usize> {
                 } else {
                     b0 as u16
                 };
-                if key == target_key as u16 {
+                if key == target_key {
                     return operand_stack.last().map(|&v| v as usize);
                 }
                 operand_stack.clear();
@@ -1276,5 +1479,233 @@ impl FontCache {
 impl Default for FontCache {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ----- synthetic sfnt / cmap fixtures -----
+
+    /// Assemble an sfnt from (tag, data) pairs. Tags must be pre-sorted —
+    /// ttf-parser binary-searches the table directory.
+    fn build_sfnt(tables: &[([u8; 4], Vec<u8>)]) -> Vec<u8> {
+        let header_size = 12 + tables.len() * 16;
+        let mut offsets = Vec::new();
+        let mut pos = header_size;
+        for (_, data) in tables {
+            offsets.push(pos);
+            pos += (data.len() + 3) & !3;
+        }
+        let mut buf = vec![0u8; pos];
+        buf[0..4].copy_from_slice(&0x00010000u32.to_be_bytes());
+        buf[4..6].copy_from_slice(&(tables.len() as u16).to_be_bytes());
+        for (i, (tag, data)) in tables.iter().enumerate() {
+            let rec = 12 + i * 16;
+            buf[rec..rec + 4].copy_from_slice(tag);
+            buf[rec + 8..rec + 12].copy_from_slice(&(offsets[i] as u32).to_be_bytes());
+            buf[rec + 12..rec + 16].copy_from_slice(&(data.len() as u32).to_be_bytes());
+            buf[offsets[i]..offsets[i] + data.len()].copy_from_slice(data);
+        }
+        buf
+    }
+
+    fn head_table() -> Vec<u8> {
+        let mut d = vec![0u8; 54];
+        d[0..4].copy_from_slice(&0x00010000u32.to_be_bytes());
+        d[12..16].copy_from_slice(&0x5F0F3CF5u32.to_be_bytes()); // magic
+        d[16..18].copy_from_slice(&0x000Bu16.to_be_bytes()); // flags
+        d[18..20].copy_from_slice(&1000u16.to_be_bytes()); // unitsPerEm
+        d
+    }
+
+    fn hhea_table() -> Vec<u8> {
+        let mut d = vec![0u8; 36];
+        d[0..4].copy_from_slice(&0x00010000u32.to_be_bytes());
+        d[4..6].copy_from_slice(&800i16.to_be_bytes());
+        d[6..8].copy_from_slice(&(-200i16).to_be_bytes());
+        d
+    }
+
+    fn maxp_table(num_glyphs: u16) -> Vec<u8> {
+        let mut d = vec![0u8; 6];
+        d[0..4].copy_from_slice(&0x00005000u32.to_be_bytes()); // version 0.5
+        d[4..6].copy_from_slice(&num_glyphs.to_be_bytes());
+        d
+    }
+
+    fn build_cmap(subtables: &[(u16, u16, Vec<u8>)]) -> Vec<u8> {
+        let mut d = Vec::new();
+        d.extend_from_slice(&0u16.to_be_bytes());
+        d.extend_from_slice(&(subtables.len() as u16).to_be_bytes());
+        let mut offset = 4 + subtables.len() * 8;
+        for (plat, enc, data) in subtables {
+            d.extend_from_slice(&plat.to_be_bytes());
+            d.extend_from_slice(&enc.to_be_bytes());
+            d.extend_from_slice(&(offset as u32).to_be_bytes());
+            offset += data.len();
+        }
+        for (_, _, data) in subtables {
+            d.extend_from_slice(data);
+        }
+        d
+    }
+
+    /// cmap format 4 subtable mapping the single code point `code` → `gid`.
+    fn cmap_format4_single(code: u16, gid: u16) -> Vec<u8> {
+        let mut d = Vec::new();
+        d.extend_from_slice(&4u16.to_be_bytes()); // format
+        d.extend_from_slice(&32u16.to_be_bytes()); // length
+        d.extend_from_slice(&0u16.to_be_bytes()); // language
+        d.extend_from_slice(&4u16.to_be_bytes()); // segCountX2
+        d.extend_from_slice(&4u16.to_be_bytes()); // searchRange
+        d.extend_from_slice(&1u16.to_be_bytes()); // entrySelector
+        d.extend_from_slice(&0u16.to_be_bytes()); // rangeShift
+        d.extend_from_slice(&code.to_be_bytes()); // endCode[0]
+        d.extend_from_slice(&0xFFFFu16.to_be_bytes()); // endCode[1]
+        d.extend_from_slice(&0u16.to_be_bytes()); // reservedPad
+        d.extend_from_slice(&code.to_be_bytes()); // startCode[0]
+        d.extend_from_slice(&0xFFFFu16.to_be_bytes()); // startCode[1]
+        d.extend_from_slice(&gid.wrapping_sub(code).to_be_bytes()); // idDelta[0]
+        d.extend_from_slice(&1u16.to_be_bytes()); // idDelta[1] (0xFFFF → 0)
+        d.extend_from_slice(&0u16.to_be_bytes()); // idRangeOffset[0]
+        d.extend_from_slice(&0u16.to_be_bytes()); // idRangeOffset[1]
+        d
+    }
+
+    /// cmap format 0 (byte-encoded, MacRoman-indexed) subtable.
+    fn cmap_format0(glyph_ids: &[u8; 256]) -> Vec<u8> {
+        let mut d = Vec::new();
+        d.extend_from_slice(&0u16.to_be_bytes()); // format
+        d.extend_from_slice(&262u16.to_be_bytes()); // length
+        d.extend_from_slice(&0u16.to_be_bytes()); // language
+        d.extend_from_slice(glyph_ids);
+        d
+    }
+
+    fn font_with_cmap(cmap: Vec<u8>) -> LoadedFont {
+        let data = build_sfnt(&[
+            (*b"cmap", cmap),
+            (*b"head", head_table()),
+            (*b"hhea", hhea_table()),
+            (*b"maxp", maxp_table(16)),
+        ]);
+        let font =
+            LoadedFont::new_with_data(PdfFontType::TrueType, "Test".into(), data, CidWidths::new(500.0));
+        assert!(font.font_data.is_some(), "synthetic sfnt must parse");
+        font
+    }
+
+    // ----- code_to_gid cmap fallbacks -----
+
+    #[test]
+    fn symbolic_f000_retry_on_windows_unicode_subtable() {
+        // Only a (3,1) subtable, glyph parked at PUA 0xF041.
+        let cmap = build_cmap(&[(3, 1, cmap_format4_single(0xF041, 5))]);
+        let mut font = font_with_cmap(cmap);
+
+        // Non-symbolic: 0x41 is not in the subtable, no PUA retry.
+        assert_eq!(font.code_to_gid(0x41), None);
+
+        font.symbolic = true;
+        assert_eq!(font.code_to_gid(0x41), Some(5));
+    }
+
+    #[test]
+    fn glyph_name_resolves_via_macroman_slot_on_mac_subtable() {
+        // WinAnsi maps 0x95 → "bullet"; MacRoman slots bullet at 0xA5, which
+        // is where the (1,0) subtable indexes it.
+        let mut glyph_ids = [0u8; 256];
+        glyph_ids[0xA5] = 7;
+        let cmap = build_cmap(&[(1, 0, cmap_format0(&glyph_ids))]);
+        let mut font = font_with_cmap(cmap);
+
+        // Without an /Encoding there is no name to detour through.
+        assert_eq!(font.code_to_gid(0x95), None);
+
+        font.encoding = Some(encoding::Encoding::from_base(
+            &encoding::WIN_ANSI_ENCODING,
+        ));
+        assert_eq!(font.code_to_gid(0x95), Some(7));
+        // Raw-code hits still win where the PDF encoding agrees with MacRoman.
+        assert_eq!(font.code_to_gid(0xA5), Some(7));
+    }
+
+    #[test]
+    fn mac_roman_inverse_lookup() {
+        assert_eq!(mac_roman_code_for_name("bullet"), Some(0xA5));
+        assert_eq!(mac_roman_code_for_name("A"), Some(0x41));
+        assert_eq!(mac_roman_code_for_name("nosuchglyphname"), None);
+    }
+
+    // ----- OTF-wrapped CID-keyed CFF -----
+
+    /// Minimal CFF table: Name INDEX ("T"), Top DICT (optionally with /ROS),
+    /// empty String/GSubr INDEXes, format-0 charset (GID 1 → CID 5,
+    /// GID 2 → CID 9), and a 3-entry empty CharStrings INDEX.
+    fn build_test_cff(cid_keyed: bool) -> Vec<u8> {
+        let dict_len: usize = 12 + if cid_keyed { 9 } else { 0 };
+        let charset_off = 19 + dict_len;
+        let charstrings_off = charset_off + 5;
+
+        let mut cff = vec![1, 0, 4, 4]; // header
+        cff.extend_from_slice(&[0x00, 0x01, 0x01, 0x01, 0x02, b'T']); // Name INDEX
+        // Top DICT INDEX: one entry of dict_len bytes.
+        cff.extend_from_slice(&[0x00, 0x01, 0x01, 0x01, dict_len as u8 + 1]);
+        if cid_keyed {
+            cff.extend_from_slice(&[28, 0x01, 0x87]); // SID 391 (registry)
+            cff.extend_from_slice(&[28, 0x01, 0x88]); // SID 392 (ordering)
+            cff.push(139); // supplement 0
+            cff.extend_from_slice(&[12, 30]); // ROS
+        }
+        cff.push(29);
+        cff.extend_from_slice(&(charset_off as i32).to_be_bytes());
+        cff.push(15); // charset
+        cff.push(29);
+        cff.extend_from_slice(&(charstrings_off as i32).to_be_bytes());
+        cff.push(17); // CharStrings
+        cff.extend_from_slice(&[0x00, 0x00]); // String INDEX (empty)
+        cff.extend_from_slice(&[0x00, 0x00]); // Global Subr INDEX (empty)
+        cff.extend_from_slice(&[0, 0x00, 0x05, 0x00, 0x09]); // charset fmt 0
+        cff.extend_from_slice(&[0x00, 0x03, 0x01, 0x01, 0x01, 0x01, 0x01]); // CharStrings
+        assert_eq!(cff.len(), charstrings_off + 7);
+        cff
+    }
+
+    #[test]
+    fn cff_cid_keyed_detection() {
+        assert!(cff_is_cid_keyed(&build_test_cff(true)));
+        assert!(!cff_is_cid_keyed(&build_test_cff(false)));
+    }
+
+    #[test]
+    fn otf_wrapped_cid_keyed_cff_builds_cid_to_gid() {
+        // FontFile3 /Subtype /OpenType: data arrives as an sfnt, not raw CFF,
+        // so the charset CID → GID map must still be built from the CFF table.
+        let otf = wrap_cff_in_otf(&build_test_cff(true));
+        assert!(!is_raw_cff(&otf));
+        let font = LoadedFont::new_with_data(
+            PdfFontType::Type0CidType2,
+            "Test".into(),
+            otf,
+            CidWidths::new(1000.0),
+        );
+        let map = font.cid_to_gid.expect("charset-derived map");
+        assert_eq!(map.get(&5), Some(&1));
+        assert_eq!(map.get(&9), Some(&2));
+    }
+
+    #[test]
+    fn otf_wrapped_plain_cff_keeps_identity_mapping() {
+        // No /ROS: the charset holds glyph-name SIDs, not CIDs — no remap.
+        let otf = wrap_cff_in_otf(&build_test_cff(false));
+        let font = LoadedFont::new_with_data(
+            PdfFontType::Type0CidType2,
+            "Test".into(),
+            otf,
+            CidWidths::new(1000.0),
+        );
+        assert!(font.cid_to_gid.is_none());
     }
 }

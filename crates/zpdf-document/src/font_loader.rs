@@ -78,6 +78,10 @@ fn attach_text_mappings(
     if let Some(enc) = encoding {
         font.encoding = Some(enc);
     }
+
+    // With encoding and widths in place, recover Quartz-subset glyphs that are
+    // reachable through no declared encoding (charset entries named ".notdef").
+    font.map_unencoded_orphans();
 }
 
 /// The built-in encoding for the Symbol / ZapfDingbats standard fonts, matched by
@@ -187,13 +191,66 @@ fn load_type0_font(
     let font_data = extract_font_file(file, desc_dict);
 
     match font_data {
-        Some(data) => Ok(LoadedFont::new_with_data(
-            PdfFontType::Type0CidType2,
-            base_font,
-            data,
-            cid_widths,
-        )),
+        Some(data) => {
+            let mut font = LoadedFont::new_with_data(
+                PdfFontType::Type0CidType2,
+                base_font,
+                data,
+                cid_widths,
+            );
+            // /CIDToGIDMap stream: explicit CID → GID table, authoritative for
+            // CIDFontType2 (TrueType-based) descendants. A raw-CFF CIDFontType0
+            // descendant keeps its charset-derived map built in new_with_data —
+            // there /CIDToGIDMap is not even a legal key.
+            if let Some(map) = parse_cid_to_gid_stream(file, desc_dict) {
+                let subtype = desc_dict.get_name("Subtype").unwrap_or("");
+                if subtype == "CIDFontType2" || font.cid_to_gid.is_none() {
+                    font.cid_to_gid = Some(map);
+                }
+            }
+            Ok(font)
+        }
         None => Ok(LoadedFont::new_placeholder(base_font)),
+    }
+}
+
+/// Decode a /CIDToGIDMap stream into a CID → GID table: two bytes per CID,
+/// big-endian, indexed by CID. Returns `None` for /Identity, absence, or any
+/// non-stream form, which keeps the identity (or charset-derived) behavior.
+/// CIDs mapped to GID 0 (.notdef) are omitted — `glyph_outline` treats a
+/// missing entry as "no glyph", which matches the spec semantics.
+fn parse_cid_to_gid_stream(
+    file: &PdfFile,
+    desc_dict: &zpdf_core::PdfDict,
+) -> Option<std::collections::HashMap<u16, u16>> {
+    let stream_ref = match desc_dict.get("CIDToGIDMap") {
+        Some(PdfObject::Ref(r)) => *r,
+        // /Identity (the common name form), absent, or malformed.
+        _ => return None,
+    };
+    let data = match file.resolve_stream_data(stream_ref) {
+        Ok(d) => d,
+        Err(e) => {
+            // e.g. an indirect /Identity name, or an undecodable stream.
+            tracing::debug!("CIDToGIDMap {stream_ref}: not a decodable stream - {e}");
+            return None;
+        }
+    };
+    let mut map = std::collections::HashMap::new();
+    for (cid, gid_bytes) in data
+        .chunks_exact(2)
+        .enumerate()
+        .take(u16::MAX as usize + 1)
+    {
+        let gid = u16::from_be_bytes([gid_bytes[0], gid_bytes[1]]);
+        if gid != 0 {
+            map.insert(cid as u16, gid);
+        }
+    }
+    if map.is_empty() {
+        None
+    } else {
+        Some(map)
     }
 }
 
@@ -224,25 +281,28 @@ fn load_type3_font(
 ) -> Result<LoadedFont> {
     use std::sync::Arc;
 
+    // All four Type3 keys are commonly emitted as indirect objects; a direct-only
+    // read would silently drop every glyph, so resolve one level of indirection.
+
     // FontMatrix: typically [0.001 0 0 -0.001 0 0] for 1000-unit glyph space
-    let font_matrix = if let Ok(arr) = dict.get_array("FontMatrix") {
+    let font_matrix = {
         let mut m = [0.001, 0.0, 0.0, -0.001, 0.0, 0.0];
-        for (i, obj) in arr.iter().enumerate().take(6) {
-            if let Ok(v) = obj.as_f64() {
-                m[i] = v;
+        if let Some(arr) = resolve_array(file, dict, "FontMatrix") {
+            for (i, obj) in arr.iter().enumerate().take(6) {
+                if let Ok(v) = obj.as_f64() {
+                    m[i] = v;
+                }
             }
         }
         m
-    } else {
-        [0.001, 0.0, 0.0, -0.001, 0.0, 0.0]
     };
 
     // Encoding/Differences → glyph name list
     let mut encoding = Vec::new();
-    if let Some(PdfObject::Dict(enc_dict)) = dict.get("Encoding") {
-        if let Ok(diffs) = enc_dict.get_array("Differences") {
+    if let Some(enc_dict) = resolve_dict(file, dict, "Encoding") {
+        if let Some(diffs) = resolve_array(file, &enc_dict, "Differences") {
             let mut current_code = 0usize;
-            for obj in diffs {
+            for obj in &diffs {
                 match obj {
                     PdfObject::Integer(n) => {
                         current_code = *n as usize;
@@ -265,7 +325,7 @@ fn load_type3_font(
 
     // CharProcs: name → stream ref
     let mut char_procs = std::collections::HashMap::new();
-    if let Ok(cp_dict) = dict.get_dict("CharProcs") {
+    if let Some(cp_dict) = resolve_dict(file, dict, "CharProcs") {
         for (name, obj) in &cp_dict.0 {
             if let PdfObject::Ref(r) = obj {
                 if let Ok(data) = file.resolve_stream_data(*r) {
@@ -277,9 +337,8 @@ fn load_type3_font(
 
     // Widths
     let first_char = dict.get_i64("FirstChar").unwrap_or(0) as u16;
-    let widths: Vec<f64> = dict
-        .get_array("Widths")
-        .unwrap_or(&[])
+    let widths: Vec<f64> = resolve_array(file, dict, "Widths")
+        .unwrap_or_default()
         .iter()
         .map(|o| o.as_f64().unwrap_or(0.0))
         .collect();
@@ -299,6 +358,8 @@ fn load_type3_font(
         ascent: 880.0,
         descent: -120.0,
         cid_to_gid: None,
+        builtin_encoding_gids: None,
+        orphan_gids: Vec::new(),
         encoding: None,
         to_unicode: None,
         symbolic: false,
@@ -377,6 +438,24 @@ fn resolve_array(file: &PdfFile, dict: &zpdf_core::PdfDict, key: &str) -> Option
             .resolve(*id)
             .ok()
             .and_then(|o| o.as_array().ok().map(|a| a.to_vec())),
+        _ => None,
+    }
+}
+
+/// Fetch a dictionary value, resolving one level of indirect reference, in the
+/// same spirit as [`resolve_array`] (Type3 producers commonly emit /CharProcs
+/// and /Encoding as indirect objects).
+fn resolve_dict(
+    file: &PdfFile,
+    dict: &zpdf_core::PdfDict,
+    key: &str,
+) -> Option<zpdf_core::PdfDict> {
+    match dict.get(key) {
+        Some(PdfObject::Dict(d)) => Some(d.clone()),
+        Some(PdfObject::Ref(id)) => file
+            .resolve(*id)
+            .ok()
+            .and_then(|o| o.as_dict().ok().cloned()),
         _ => None,
     }
 }

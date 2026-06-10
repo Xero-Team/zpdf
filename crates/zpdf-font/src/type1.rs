@@ -31,6 +31,10 @@ pub struct Type1Font {
     name_to_gid: HashMap<String, u16>,
     /// units-per-em derived from the FontMatrix (usually 1000).
     pub units_per_em: f64,
+    /// Full /FontMatrix from the font program. Usually the plain diagonal
+    /// `[1/upem 0 0 1/upem 0 0]`, but dvips SlantFont/ExtendFont variants carry
+    /// skew or unequal scales that must be applied to the outlines.
+    font_matrix: [f64; 6],
 }
 
 impl Type1Font {
@@ -53,15 +57,13 @@ impl Type1Font {
         };
         let private = decrypt(&binary, EEXEC_R, 4);
 
-        let units_per_em = parse_font_matrix(clear)
-            .map(|m| {
-                if m[0].abs() > 1e-12 {
-                    1.0 / m[0]
-                } else {
-                    1000.0
-                }
-            })
-            .unwrap_or(1000.0);
+        let font_matrix =
+            parse_font_matrix(clear).unwrap_or([0.001, 0.0, 0.0, 0.001, 0.0, 0.0]);
+        let units_per_em = if font_matrix[0].abs() > 1e-12 {
+            1.0 / font_matrix[0]
+        } else {
+            1000.0
+        };
         let builtin_encoding = parse_builtin_encoding(clear);
 
         let len_iv = parse_len_iv(&private).unwrap_or(4);
@@ -91,6 +93,7 @@ impl Type1Font {
             gid_to_name: names,
             name_to_gid,
             units_per_em,
+            font_matrix,
         })
     }
 
@@ -112,8 +115,18 @@ impl Type1Font {
         self.glyph_outline_by_name(name)
     }
 
-    /// Outline for a glyph name, interpreting its charstring.
+    /// Outline for a glyph name, interpreting its charstring. The font's
+    /// /FontMatrix is honored in full: skew/extension components are baked
+    /// into the returned commands (normalized to `units_per_em` space).
     pub fn glyph_outline_by_name(&self, name: &str) -> Option<GlyphOutline> {
+        let outline = self.raw_outline_by_name(name)?;
+        Some(self.apply_font_matrix(outline))
+    }
+
+    /// Outline in raw charstring space (no FontMatrix applied). `seac`
+    /// composites offset base/accent in this space, so the matrix must only
+    /// be applied once, at the public boundary.
+    fn raw_outline_by_name(&self, name: &str) -> Option<GlyphOutline> {
         let cs = self.char_strings.get(name)?;
         let mut interp = Interp::new(&self.subrs);
         interp.run(cs, 0);
@@ -130,6 +143,46 @@ impl Type1Font {
         })
     }
 
+    /// Apply the font program's /FontMatrix to an outline. The plain diagonal
+    /// matrix `[1/upem 0 0 1/upem 0 0]` is already accounted for by consumers
+    /// dividing by `units_per_em`, so it is left untouched (bit-exact);
+    /// slanted/extended matrices are normalized into that same upem space:
+    /// `p' = M(p) * units_per_em`. The advance is unchanged — its horizontal
+    /// component under M is `a*w`, and `a * units_per_em == 1`.
+    fn apply_font_matrix(&self, mut outline: GlyphOutline) -> GlyphOutline {
+        let [a, b, c, d, e, f] = self.font_matrix;
+        if b == 0.0 && c == 0.0 && e == 0.0 && f == 0.0 && a == d {
+            return outline;
+        }
+        let s = self.units_per_em;
+        let tx = |x: f64, y: f64| ((a * x + c * y + e) * s, (b * x + d * y + f) * s);
+        for cmd in &mut outline.commands {
+            *cmd = match *cmd {
+                OutlineCommand::MoveTo(x, y) => {
+                    let (x, y) = tx(x, y);
+                    OutlineCommand::MoveTo(x, y)
+                }
+                OutlineCommand::LineTo(x, y) => {
+                    let (x, y) = tx(x, y);
+                    OutlineCommand::LineTo(x, y)
+                }
+                OutlineCommand::QuadTo(x1, y1, x, y) => {
+                    let (x1, y1) = tx(x1, y1);
+                    let (x, y) = tx(x, y);
+                    OutlineCommand::QuadTo(x1, y1, x, y)
+                }
+                OutlineCommand::CurveTo(x1, y1, x2, y2, x, y) => {
+                    let (x1, y1) = tx(x1, y1);
+                    let (x2, y2) = tx(x2, y2);
+                    let (x, y) = tx(x, y);
+                    OutlineCommand::CurveTo(x1, y1, x2, y2, x, y)
+                }
+                OutlineCommand::Close => OutlineCommand::Close,
+            };
+        }
+        outline
+    }
+
     /// Build a `seac` accented composite (base glyph + offset accent glyph).
     fn compose_seac(&self, interp: &Interp, seac: Seac) -> Option<GlyphOutline> {
         let bname = STANDARD_ENCODING
@@ -140,8 +193,8 @@ impl Type1Font {
             .get(seac.achar as usize)
             .copied()
             .flatten()?;
-        let base = self.glyph_outline_by_name(bname)?;
-        let accent = self.glyph_outline_by_name(aname)?;
+        let base = self.raw_outline_by_name(bname)?;
+        let accent = self.raw_outline_by_name(aname)?;
 
         let dx = interp.sbx + seac.adx - seac.asb;
         let dy = seac.ady;
@@ -911,5 +964,91 @@ mod tests {
         let hay = b"/Encoding StandardEncoding def";
         assert!(find_token(hay, b"StandardEncoding").is_some());
         assert!(find_token(b"xStandardEncodingy", b"StandardEncoding").is_none());
+    }
+
+    #[test]
+    fn parse_font_matrix_reads_full_six_tuple() {
+        let clear = b"/FontMatrix [0.001 0 0.000167 0.001 0 0] readonly def";
+        let m = parse_font_matrix(clear).expect("matrix");
+        assert_eq!(m, [0.001, 0.0, 0.000167, 0.001, 0.0, 0.0]);
+    }
+
+    /// Type1Font with a single glyph "A":
+    /// hsbw 0 500; rmoveto 0 100; rlineto 100 0; endchar.
+    fn font_with_matrix(font_matrix: [f64; 6]) -> Type1Font {
+        let mut char_strings = HashMap::new();
+        // 139 = 0; (248, 136) = 500; 13 = hsbw; 239 = 100;
+        // 21 = rmoveto; 5 = rlineto; 14 = endchar.
+        char_strings.insert(
+            "A".to_string(),
+            vec![139, 248, 136, 13, 139, 239, 21, 239, 139, 5, 14],
+        );
+        Type1Font {
+            char_strings,
+            subrs: Vec::new(),
+            builtin_encoding: vec![None; 256],
+            gid_to_name: vec!["A".to_string()],
+            name_to_gid: HashMap::from([("A".to_string(), 0u16)]),
+            units_per_em: 1000.0,
+            font_matrix,
+        }
+    }
+
+    #[test]
+    fn standard_font_matrix_leaves_outline_untouched() {
+        let font = font_with_matrix([0.001, 0.0, 0.0, 0.001, 0.0, 0.0]);
+        let outline = font.glyph_outline_by_name("A").expect("outline");
+        assert_eq!(outline.advance_width, 500.0);
+        match outline.commands[0] {
+            OutlineCommand::MoveTo(x, y) => assert_eq!((x, y), (0.0, 100.0)),
+            ref c => panic!("expected MoveTo, got {c:?}"),
+        }
+        match outline.commands[1] {
+            OutlineCommand::LineTo(x, y) => assert_eq!((x, y), (100.0, 100.0)),
+            ref c => panic!("expected LineTo, got {c:?}"),
+        }
+    }
+
+    #[test]
+    fn slanted_font_matrix_skews_outline() {
+        // dvips SlantFont 0.25: [0.001 0 0.00025 0.001 0 0].
+        let font = font_with_matrix([0.001, 0.0, 0.00025, 0.001, 0.0, 0.0]);
+        let outline = font.glyph_outline_by_name("A").expect("outline");
+        // Advance is the matrix x-scale times upem — unchanged.
+        assert_eq!(outline.advance_width, 500.0);
+        // (0, 100) → x' = (0 + 0.00025*100) * 1000 = 25, y' = 100.
+        match outline.commands[0] {
+            OutlineCommand::MoveTo(x, y) => {
+                assert!((x - 25.0).abs() < 1e-9, "x = {x}");
+                assert!((y - 100.0).abs() < 1e-9, "y = {y}");
+            }
+            ref c => panic!("expected MoveTo, got {c:?}"),
+        }
+        // (100, 100) → x' = (0.1 + 0.025) * 1000 = 125, y' = 100.
+        match outline.commands[1] {
+            OutlineCommand::LineTo(x, y) => {
+                assert!((x - 125.0).abs() < 1e-9, "x = {x}");
+                assert!((y - 100.0).abs() < 1e-9, "y = {y}");
+            }
+            ref c => panic!("expected LineTo, got {c:?}"),
+        }
+    }
+
+    #[test]
+    fn extended_font_matrix_rescales_y_relative_to_x() {
+        // ExtendFont 1.2: x-scale 0.0012, y-scale 0.001. units_per_em = 1/a,
+        // so x stays put and y shrinks by d/a relative to it.
+        let font = Type1Font {
+            units_per_em: 1.0 / 0.0012,
+            ..font_with_matrix([0.0012, 0.0, 0.0, 0.001, 0.0, 0.0])
+        };
+        let outline = font.glyph_outline_by_name("A").expect("outline");
+        match outline.commands[1] {
+            OutlineCommand::LineTo(x, y) => {
+                assert!((x - 100.0).abs() < 1e-9, "x = {x}");
+                assert!((y - 100.0 * 0.001 / 0.0012).abs() < 1e-9, "y = {y}");
+            }
+            ref c => panic!("expected LineTo, got {c:?}"),
+        }
     }
 }
