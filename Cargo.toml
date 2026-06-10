@@ -45,6 +45,11 @@ bitflags = "2"
 bytemuck = { version = "1", features = ["derive"] }
 winnow = "0.7"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+# Pure-Rust crypto (RustCrypto) for the Standard security handler's AES paths.
+# NB: cbc 0.1 is the release that matches aes 0.8 (both speak `cipher` 0.4).
+aes = "0.8"
+cbc = "0.1"
+sha2 = "0.10"
 zune-jpeg = "0.5"
 image = { version = "0.25", default-features = false, features = ["png"] }
 wgpu = "29"

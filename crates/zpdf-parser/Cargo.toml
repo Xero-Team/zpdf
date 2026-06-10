@@ -12,6 +12,9 @@ winnow.workspace = true
 flate2.workspace = true
 zune-jpeg.workspace = true
 tracing.workspace = true
+aes.workspace = true
+cbc.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 # Pure-Rust LZW codec (the backend used by the `tiff`/`gif` crates). Used ONLY
