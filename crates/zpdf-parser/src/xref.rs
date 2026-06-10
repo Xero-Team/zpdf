@@ -456,7 +456,8 @@ mod tests {
     #[test]
     fn parse_xref_entry_in_use() {
         let mut pos = 0usize;
-        let (offset, gen, in_use) = parse_xref_entry_at(b"0000000010 00000 n \r\n", &mut pos).unwrap();
+        let (offset, gen, in_use) =
+            parse_xref_entry_at(b"0000000010 00000 n \r\n", &mut pos).unwrap();
         assert_eq!(offset, 10);
         assert_eq!(gen, 0);
         assert!(in_use);
@@ -466,7 +467,8 @@ mod tests {
     #[test]
     fn parse_xref_entry_free() {
         let mut pos = 0usize;
-        let (offset, gen, in_use) = parse_xref_entry_at(b"0000000000 65535 f \r\n", &mut pos).unwrap();
+        let (offset, gen, in_use) =
+            parse_xref_entry_at(b"0000000000 65535 f \r\n", &mut pos).unwrap();
         assert_eq!(offset, 0);
         assert_eq!(gen, 65535);
         assert!(!in_use);

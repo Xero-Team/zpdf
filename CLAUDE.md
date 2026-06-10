@@ -24,14 +24,14 @@ Features: `cpu-render` (default, tiny-skia), `gpu-render` (wgpu). Set on the roo
 
 ```
 PDF bytes
-  → zpdf-parser     (lexer, xref, object/stream decoding, filters)
-  → zpdf-document   (catalog, page tree, resource inheritance)
-  → zpdf-content    (content stream tokenizer → operator interpreter)
+  → zpdf-parser     (lexer, xref incl. /XRefStm + lazy repair, object/stream decoding, filters, RC4/AES decryption)
+  → zpdf-document   (catalog, page tree + attribute inheritance, effective_box/CropBox, font loading)
+  → zpdf-content    (content stream tokenizer → operator interpreter; shading.rs evaluates axial/radial gradients)
   → zpdf-display-list (flat RenderCommand sequence)
   → zpdf-render-cpu | zpdf-render-wgpu  (implements RenderBackend trait from zpdf-render)
 ```
 
-Supporting crates feed into zpdf-content: **zpdf-font** (Type1/TrueType/CID, CMap, encoding), **zpdf-image** (JPEG/Flate/masks → RGBA), **zpdf-color** (DeviceGray/RGB/CMYK/Indexed/Lab).
+Supporting crates feed into zpdf-content: **zpdf-font** (Type1/TrueType/CID, CMap, encoding), **zpdf-image** (JPEG/Flate/CCITT/masks/palettes → RGBA), **zpdf-color** (device/Indexed/Lab conversion + the PDF function evaluator in `function.rs` — types 0/2/3/4, used by tint transforms and shadings).
 
 **zpdf-core** provides shared types used everywhere: `ObjectId`, `PdfObject`, `Matrix`, `Rect`, `Error`, `ParseLimits`.
 
@@ -41,9 +41,9 @@ Supporting crates feed into zpdf-content: **zpdf-font** (Type1/TrueType/CID, CMa
 
 ## Key Design Constraints
 
-- **Pure Rust, zero C/C++ deps.** flate2 uses `rust_backend`; image uses only `png` feature. This is intentional — do not add C dependencies.
+- **Pure Rust, zero C/C++ deps.** flate2 uses `rust_backend`; image uses only `png` feature; crypto via RustCrypto (aes/cbc/sha2). This is intentional — do not add C dependencies.
 - **ParseLimits** (zpdf-core) enforces safety limits at parse time: max recursion depth, stream size, image pixels, operator count. Always respect these when adding parsing code.
-- **PDF coordinate system:** origin bottom-left, Y+ upward. CPU renderer flips Y: `(page_height - y) * scale`. Scale = DPI / 72.0.
+- **PDF coordinate system:** origin bottom-left, Y+ upward. Backends honor the page rect origin and flip Y: `((x - rect.x0) * scale, (rect.y1 - y) * scale)`. Scale = DPI / 72.0; raster dims use ceil. Pages render at `PdfPage::effective_box()` (CropBox ∩ MediaBox), with `/Rotate` baked in by `ContentInterpreter::with_page_rotation`.
 - **DisplayList is flat** — no nesting. Clip/blend grouping uses Push/Pop pairs. Backends only consume `Vec<RenderCommand>`, never PDF objects.
 - **Lazy parsing with caching** — objects decoded on-demand via xref offset, cached in ObjectStore. Font/image caches are per-page.
 

@@ -66,3 +66,33 @@ impl PdfDocument {
         font_loader::load_page_fonts(self.file(), page)
     }
 }
+
+#[cfg(test)]
+pub(crate) mod test_util {
+    /// Build a synthetic PDF from numbered object bodies (index `i` becomes
+    /// object `i + 1`), with a correct xref table and a trailer whose /Root is
+    /// object 1. Offsets are computed, so bodies can be edited freely.
+    pub fn build_pdf(objects: &[&str]) -> Vec<u8> {
+        let mut buf = Vec::from(&b"%PDF-1.7\n"[..]);
+        let mut offsets = Vec::with_capacity(objects.len());
+        for (i, body) in objects.iter().enumerate() {
+            offsets.push(buf.len());
+            buf.extend_from_slice(format!("{} 0 obj\n{body}\nendobj\n", i + 1).as_bytes());
+        }
+        let xref_off = buf.len();
+        buf.extend_from_slice(
+            format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+        );
+        for off in &offsets {
+            buf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        buf.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_off}\n%%EOF\n",
+                objects.len() + 1
+            )
+            .as_bytes(),
+        );
+        buf
+    }
+}

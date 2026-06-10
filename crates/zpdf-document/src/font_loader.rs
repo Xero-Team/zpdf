@@ -192,12 +192,8 @@ fn load_type0_font(
 
     match font_data {
         Some(data) => {
-            let mut font = LoadedFont::new_with_data(
-                PdfFontType::Type0CidType2,
-                base_font,
-                data,
-                cid_widths,
-            );
+            let mut font =
+                LoadedFont::new_with_data(PdfFontType::Type0CidType2, base_font, data, cid_widths);
             // /CIDToGIDMap stream: explicit CID → GID table, authoritative for
             // CIDFontType2 (TrueType-based) descendants. A raw-CFF CIDFontType0
             // descendant keeps its charset-derived map built in new_with_data —
@@ -237,11 +233,7 @@ fn parse_cid_to_gid_stream(
         }
     };
     let mut map = std::collections::HashMap::new();
-    for (cid, gid_bytes) in data
-        .chunks_exact(2)
-        .enumerate()
-        .take(u16::MAX as usize + 1)
-    {
+    for (cid, gid_bytes) in data.chunks_exact(2).enumerate().take(u16::MAX as usize + 1) {
         let gid = u16::from_be_bytes([gid_bytes[0], gid_bytes[1]]);
         if gid != 0 {
             map.insert(cid as u16, gid);

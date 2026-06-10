@@ -8,17 +8,31 @@ GPU (wgpu) renderers whose output matches within <1% of pixels.
 ## Features
 
 - **Pure Rust** — zero C/C++ dependencies, fully safe.
-- **PDF parsing** — header, traditional xref + xref/object streams, trailer chains,
-  object model, stream filters (Flate / ASCII85 / ASCIIHex / RunLength + predictors).
-- **Content interpretation** — graphics state, paths, clipping, text, color, inline &
-  XObject images, Form XObjects.
-- **Fonts** — embedded TrueType, Type1, CID/Type0 (Identity-H, `/W`), Type3, the
-  standard-14 fonts; encodings + `/Differences`; `/ToUnicode` text extraction.
+- **PDF parsing** — header, traditional xref + xref/object streams + hybrid
+  `/XRefStm`, trailer chains, lazy xref repair, object model, stream filters
+  (Flate / LZW / ASCII85 / ASCIIHex / RunLength / DCT / CCITT G3-G4 +
+  predictors) with corrupt-stream salvage.
+- **Encryption** — RC4 (40/128-bit) and AES-128 / AES-256 (V5 R5/R6) standard
+  security handler with crypt filters (empty user password).
+- **Content interpretation** — graphics state, paths, clipping, text (incl.
+  render modes and rise), inline & XObject images, Form XObjects (full
+  resources, `/BBox` clip), axial/radial shadings, shading patterns, all 16
+  blend modes, dash patterns.
+- **Color** — DeviceGray/RGB/CMYK, ICCBased (`/N`), Indexed, Lab,
+  Separation/DeviceN via a full PDF function evaluator (types 0/2/3/4).
+- **Fonts** — embedded TrueType, Type1, Type1C/CFF, CID/Type0 (Identity-H,
+  `/W`, `/CIDToGIDMap` streams), Type3, the standard-14 fonts; encodings +
+  `/Differences`; Quartz-subset recovery; `/ToUnicode` text extraction.
+- **Images** — 1/2/4/8/16-bpc, `/Decode`, soft masks, stencil & color-key
+  masks, Indexed palettes, CMYK JPEG; bilinear sampling with box-filter
+  minification.
+- **Page geometry** — CropBox-aware rendering, page-tree attribute
+  inheritance (`/Rotate`, `/Resources`, boxes), page rotation.
 - **CPU rendering** — tiny-skia backend, PNG output at any DPI.
-- **GPU rendering** — wgpu backend (fills, strokes, clips, text, images, blend groups);
-  matches the CPU renderer within <1% pixels.
-- **Tooling** — CLI (`info`/`render`/`text`/`compare`/`dump`/`debug-stream`) and an
-  interactive winit viewer.
+- **GPU rendering** — wgpu backend (fills, strokes, clips, text, images, blend
+  groups); matches the CPU renderer within <1% pixels.
+- **Tooling** — CLI (`info`/`render`/`text`/`compare`/`dump`/`debug-stream`)
+  and an interactive winit viewer.
 
 ## Documentation
 
@@ -60,7 +74,8 @@ let mut fonts = doc.load_page_fonts(&page);
 let mut images = ImageCache::new();
 let content = doc.page_content_bytes(&page)?;
 
-let display_list = ContentInterpreter::new(page.media_box)
+let display_list = ContentInterpreter::new(page.effective_box()) // CropBox ∩ MediaBox
+    .with_page_rotation(page.rotate)
     .with_fonts(&mut fonts)
     .with_document(doc.file(), &page.resources)
     .with_images(&mut images)
@@ -88,8 +103,8 @@ zpdf-core            Shared types: ObjectId, PdfObject, Matrix, Rect, Error, Par
   │   └─ zpdf-document   Catalog, page tree, resource inheritance, font loading
   │       └─ zpdf-content   Content-stream interpreter → DisplayList
   ├─ zpdf-font       Type1 / TrueType / CID / Type3 fonts, CMap, encodings
-  ├─ zpdf-image      JPEG / Flate / masks → RGBA
-  ├─ zpdf-color      DeviceGray / RGB / CMYK / Indexed / Lab
+  ├─ zpdf-image      JPEG / Flate / CCITT / masks / palettes → RGBA
+  ├─ zpdf-color      Device / Indexed / Lab color + PDF function evaluator
   ├─ zpdf-display-list   Flat RenderCommand sequence (the backend contract)
   ├─ zpdf-render          RenderBackend trait
   │   ├─ zpdf-render-cpu   tiny-skia backend
@@ -103,25 +118,34 @@ zpdf-core            Shared types: ObjectId, PdfObject, Matrix, Rect, Error, Par
 | Feature | Status |
 | --- | --- |
 | PDF 1.0–2.0 header | ✅ |
-| Traditional xref + xref/object streams | ✅ |
-| Incremental update (`/Prev`) chains | ✅ |
-| Flate / ASCII85 / ASCIIHex / RunLength + predictors | ✅ |
-| DCTDecode (JPEG) | ✅ |
-| Page tree + resource inheritance | ✅ |
-| Graphics state, paths, painting, clipping | ✅ |
-| DeviceGray / DeviceRGB / DeviceCMYK | ✅ |
-| Text + text state operators | ✅ |
-| Type3 / TrueType / Type1 / CID-Type0 / standard-14 fonts | ✅ |
+| Traditional xref + xref/object streams + hybrid `/XRefStm` | ✅ |
+| Incremental update (`/Prev`) chains, lazy xref repair | ✅ |
+| Flate / LZW / ASCII85 / ASCIIHex / RunLength + predictors | ✅ with corrupt-stream salvage |
+| DCTDecode (JPEG, incl. CMYK) / CCITTFaxDecode (G3/G4) | ✅ |
+| Encryption: RC4 40/128, AES-128, AES-256 (R5/R6), crypt filters | ✅ empty user password |
+| Page tree + attribute inheritance (`/Rotate`, `/Resources`, boxes) | ✅ |
+| CropBox-aware rendering + page rotation | ✅ |
+| Graphics state, paths, painting, clipping, dash patterns | ✅ |
+| DeviceGray / DeviceRGB / DeviceCMYK / ICCBased (`/N`) | ✅ |
+| Indexed / Lab / Separation / DeviceN (tint transforms) | ✅ |
+| PDF functions (sampled / exponential / stitching / PostScript) | ✅ |
+| Axial & radial shadings (`sh` + shading patterns) | ✅ |
+| Tiling patterns | Placeholder (solid mid-gray) |
+| 16 blend modes (`/BM`) | ✅ both backends |
+| Text + text state operators, render modes, rise | ✅ (text-as-clip approximated) |
+| Type3 / TrueType / Type1 / Type1C / CID-Type0 / standard-14 fonts | ✅ |
 | Encodings + `/Differences`, `/ToUnicode` extraction | ✅ |
-| Inline & XObject images, image/soft masks | ✅ |
-| Form XObjects | ✅ |
+| `/CIDToGIDMap` streams, OpenType-wrapped CID CFF | ✅ |
+| Inline & XObject images: 1–16 bpc, `/Decode`, SMask, `/Mask`, palettes | ✅ |
+| Form XObjects (full resources, `/BBox` clip, recursion guards) | ✅ |
 | CPU rendering (PNG) | ✅ |
 | GPU rendering (wgpu) | ✅ |
-| 16 blend modes (GPU) | ✅ backend; not yet emitted by the interpreter |
-| ICC color profiles | Planned |
-| Annotations | Planned |
-| Encryption | Planned |
-| LZW / CCITT / JBIG2 / JPX filters | Planned |
+| ExtGState soft masks (`/SMask`), transparency groups | Planned |
+| ICC color profiles (real color management) | Planned (component-count fallback today) |
+| Annotation appearance streams | Planned (`/Annots` parsed) |
+| Non-embedded CJK font fallback | Planned |
+| JBIG2 / JPX filters | Planned |
+| Optional content groups (layers) | Planned |
 
 ## Dependencies
 
@@ -133,6 +157,7 @@ All pure Rust:
 | `tiny-skia` | CPU 2D rasterization |
 | `flate2` (`rust_backend`) | FlateDecode |
 | `zune-jpeg` | JPEG (DCTDecode) |
+| `aes` + `cbc` + `sha2` | AES decryption (RustCrypto) |
 | `image` | PNG I/O |
 | `winnow` | Parsing helpers |
 | `wgpu` + `lyon` + `pollster` | GPU rendering (`gpu-render` feature) |
@@ -155,7 +180,9 @@ See [ROADMAP.md](ROADMAP.md).
 - **Phase 1** — PDF parsing — done
 - **Phase 2** — Content interpretation + CPU rendering — done
 - **Phase 3** — wgpu GPU rendering — done
-- **Phase 4** — Advanced features (ICC, soft masks, annotations, encryption) — planned
+- **Phase 4** — Advanced features — largely done (encryption incl. AES,
+  shadings, blend modes, spot color, CropBox/rotation); remaining: soft masks,
+  tiling-pattern cells, annotations, ICC profiles, JBIG2/JPX, CJK fallback
 
 ## License
 

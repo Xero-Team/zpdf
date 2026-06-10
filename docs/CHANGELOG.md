@@ -1,5 +1,216 @@
 # Changelog
 
+## 0.3.0 — PDF compatibility campaign
+
+A broad correctness and compatibility release. Starting from a garbled-text bug
+report on a macOS-Quartz PDF, the whole stack was audited against ISO 32000 and
+validated page-by-page against pdfium (Chromium's renderer): a 56-page sweep
+across seven real-world documents (LaTeX/CJK, Quartz, scanned & encrypted books,
+Word-style forms) now renders every sampled page visually equal to the
+reference — and on several pages (TeX minus signs, recovered Quartz glyphs)
+*better* than it.
+
+### Highlights
+
+- **Encryption** — AES-128 (V4/AESV2) and AES-256 (V5/AESV3 R5+R6) decryption
+  with crypt-filter (`/CF`/`/StmF`/`/StrF`) support, joining the existing RC4.
+  Modern encrypted PDFs (empty user password) now open and render.
+- **Gradients** — axial and radial shadings: the `sh` operator and
+  PatternType 2 shading-pattern fills, driven by a new PDF function evaluator
+  (all four types: sampled, exponential, stitching, PostScript calculator).
+- **Blend modes** — ExtGState `/BM` is now wired into the display list; all 16
+  blend modes composite in both backends.
+- **Spot & special color** — Separation/DeviceN tint transforms, Lab, Indexed
+  palettes (fills *and* images), ICCBased `/N` resolution, and colorspace
+  resources given as direct arrays (previously dropped — matplotlib/Quartz
+  plots rendered gray instead of colored).
+- **CropBox and `/Rotate`** — pages render at their effective crop
+  (CropBox ∩ MediaBox) with page-tree-inherited rotation; scanned-book covers
+  no longer render as the full untrimmed spread.
+- **Quartz font fix** — embedded Type1C (CFF) simple fonts no longer remap an
+  already-resolved glyph id through the font's built-in encoding (the
+  double-mapping garbled virtually all text in macOS-generated PDFs), and
+  glyphs the Quartz subsetter left unnamed (charset SID 0, e.g. the CMSY
+  minus at code 0) are recovered by pairing them with their declared widths —
+  these render blank even in pdfium.
+- **Image quality** — bilinear sampling with box-filter pre-downscale (both
+  backends); scanned pages stop looking jagged/broken at screen resolutions.
+- **Robustness** — xref repair, hybrid `/XRefStm`, corrupt-stream salvage,
+  dangling references resolve to null per spec, cycle/recursion guards
+  throughout.
+
+### Encryption (`zpdf-parser/src/crypt.rs`)
+
+- **AESV2 (V4 R4, AES-128-CBC):** crypt-filter dictionaries parsed; separate
+  stream/string ciphers per `/StmF`/`/StrF`; per-object key derivation with the
+  `sAlT` extension; IV-prefixed payloads; defensive PKCS#5 unpadding.
+- **AESV3 (V5 R5/R6, AES-256-CBC):** ISO 32000-2 Algorithm 2.A key derivation,
+  including the R6 hardened hash; file key unwrapped from `/UE` (or the owner
+  `/O`+`/OE` path as fallback).
+- `/StmF`/`/StrF` = `/Identity` correctly means *no* decryption (previously
+  mangled by an RC4 fallback); a direct (non-reference) `/Encrypt` dict no
+  longer disables decryption; `/EncryptMetadata false` metadata streams are
+  left intact.
+- End-to-end fixtures (`crates/zpdf-parser/tests/fixtures/`) generated with
+  pypdf validate AES-128/256 decryption through the full parse path, plus NIST
+  CBC known-answer vectors.
+
+### Parsing robustness (`zpdf-parser`)
+
+- References to missing or free objects resolve to `null` per ISO 32000 7.3.10
+  instead of failing the document; ref→ref chains are followed with a cycle
+  guard.
+- **Hybrid-reference files:** the trailer's `/XRefStm` cross-reference stream
+  is parsed (precedence: main table > XRefStm > `/Prev` chain).
+- **Object-header validation + lazy repair:** resolving an object whose header
+  doesn't match the xref entry triggers a one-time whole-file object scan and
+  retry — files with shifted/wrong xref offsets now render instead of silently
+  reading the wrong object.
+- **FlateDecode tolerance:** truncated/corrupt streams salvage the bytes
+  decoded so far; raw-deflate (headerless) streams and leading garbage are
+  detected and handled; decode output is capped (anti-decompression-bomb), the
+  same cap now also applying to LZW and RunLength.
+- ASCII85/ASCIIHex accept stray bytes and data after EOD; traditional xref
+  entries parse by tokens (19-byte line endings no longer drift); xref-stream
+  `/W` widths are validated (no panic on hostile values); indirect `/Filter` /
+  `/DecodeParms` are resolved.
+
+### Color (`zpdf-color`, interpreter)
+
+- **New module `zpdf_color::function`** — evaluator for PDF function types 0
+  (sampled, multilinear, 1–32-bit samples), 2 (exponential), 3 (stitching) and
+  4 (PostScript calculator with the full operator set), used by tint
+  transforms and shadings.
+- **Separation / DeviceN** evaluate their tint transform through the alternate
+  space (a 100%-tint spot color used to render *white*); without a usable
+  transform the fallback is polarity-correct gray.
+- **Lab** converts analytically (Lab → XYZ → sRGB; new
+  `zpdf_color::lab_to_rgb`); **Indexed** palettes are applied for `sc` fills
+  including Indexed-over-Lab.
+- ICCBased spaces resolve `/N` (1/3/4 → Gray/RGB/CMYK); colorspace resources
+  whose value is a **direct array** (not a reference) are honored; `cs`/`CS`
+  reset the color to the space's initial value; `g`/`rg`/`k` update the
+  tracked space. CMYK→RGB conversion is centralized in
+  `zpdf_color::cmyk_to_rgb`.
+
+### Shadings, patterns, blend modes (`zpdf-content`)
+
+- **New module `zpdf_content::shading`** — axial (type 2) and radial (type 3)
+  shading evaluation with `/Domain`, `/Extend` and spec-correct radial root
+  selection, rasterized through the ordinary image pipeline so both backends
+  benefit identically.
+- The **`sh` operator** paints the current clip region; **PatternType 2**
+  shading patterns fill paths (clipped to the path) and approximate strokes
+  with the gradient's average color. PatternType 1 (tiling) renders a neutral
+  mid-gray placeholder instead of solid black.
+- **ExtGState `/BM`** parses all 16 blend modes; painting commands are
+  bracketed in `PushBlendGroup`/`PopBlendGroup`, which both backends already
+  implemented (previously dead code).
+
+### Fonts (`zpdf-font`, `zpdf-document`)
+
+- **Simple-font CFF mapping rework:** the CFF built-in encoding
+  (charcode→GID) moved out of the glyph-outline path into `code_to_gid`'s
+  resolution chain — `/Encoding` glyph names resolved against the charset are
+  no longer remapped a second time. Fixes garbled text in Quartz (macOS)
+  PDFs; regression-tested against the real corpus file.
+- **Quartz orphan-glyph recovery:** subset glyphs named `.notdef` (SID 0) at
+  GID > 0 are paired with declared-width codes that no encoding maps — e.g.
+  the CMSY minus at code 0 — recovering glyphs pdfium renders blank.
+- `/CIDToGIDMap` **streams** are honored for CIDFontType2 descendants;
+  FontFile3 `/OpenType`-wrapped **CID-keyed CFF** gets its charset CID→GID
+  map; predefined Expert charset ids are no longer misread as offsets.
+- Type3 fonts resolve **indirect** `/CharProcs`/`/Encoding`/`/Widths`/
+  `/FontMatrix`, and a lookup bug rendered every Type3 font with
+  `FirstChar ≠ 0` blank — fixed.
+- TrueType cmap fallbacks: `0xF000|code` retry on (3,1) subtables for symbolic
+  fonts and a glyph-name→MacRoman→(1,0) detour. Type1 `/FontMatrix` honors the
+  full six-tuple (dvips slant/extend).
+
+### Images (`zpdf-image`)
+
+- 1-bpc DeviceGray polarity fixed (bitonal images rendered as negatives);
+  2/4-bpc expansion and 16-bpc support added.
+- `/Decode` arrays honored for Gray/RGB/CMYK/Indexed images.
+- **SMask pipeline:** masks decode through the full image path (DCT, predictors,
+  any bit depth, `/Decode`), resample bilinearly when sized differently from
+  the image (previously dropped), and RGB is premultiplied at fold time
+  (transparent regions no longer bleed).
+- `/Mask` support: stencil-mask streams and color-key arrays (applied to raw
+  samples before color conversion).
+- Indexed palettes and ICCBased `/N` resolved by the interpreter and passed in
+  via the new `ResolvedColorSpace` API; CMYK JPEG handling verified against an
+  Adobe-APP14 fixture.
+
+### Text & content interpretation (`zpdf-content`)
+
+- **Text render modes:** mode 3 (invisible — the OCR-overlay case) and mode 7
+  no longer paint; stroke modes approximate with the stroke color. Text rise
+  (`Ts`) is applied to glyph placement.
+- **Form XObjects:** the form's full `/Resources` (xobjects, gstates,
+  colorspaces, patterns, shadings) now shadow the page's (previously only
+  fonts); `/BBox` clips the content; unbalanced `q`/`Q`/`W` inside a form can
+  no longer corrupt page-level state (state-stack floor + clip rebalancing);
+  recursion is depth-limited. Form streams decode through the decrypting,
+  filter-ref-resolving path.
+- Inline-image `/CS` names resolve against the page's colorspace resources;
+  `Tf` with an unresolvable font no longer leaves the previous font active.
+
+### Document structure (`zpdf-document`)
+
+- **CropBox:** new `PdfPage::effective_box()` (CropBox ∩ MediaBox, normalized,
+  with fallbacks) is used by the CLI and viewer as the render rect; both
+  backends honor a nonzero rect origin.
+- `/Rotate` and `/Resources` are **inherited** through the page tree (PDF
+  Table 31), joining MediaBox/CropBox; the in-flight page-rotation support
+  applies the inherited value.
+- Page-tree walks are cycle- and depth-guarded, tolerate missing `/Type`, and
+  resolve indirect box arrays; dangling/null kids are skipped with a warning.
+- Page `/Annots` are parsed into `PdfPage::annots` (rendering of appearance
+  streams is future work).
+
+### Rendering backends
+
+- **Thin strokes** clamp to a 1-device-pixel hairline (pdfium semantics) in
+  both backends; the wgpu backend's zero-width strokes rendered nothing —
+  fixed.
+- **Image sampling** is bilinear in both backends, with a box-filter
+  pre-downscale below 0.5× on the CPU (scanned pages no longer break thin
+  strokes when minified).
+- **Dash patterns** are rendered: tiny-skia native on the CPU; flattened into
+  solid sub-segments before tessellation on the GPU (shared helper in
+  `zpdf_render::dash`).
+- CPU clip masks are anti-aliased; raster dimensions use `ceil` (output sizes
+  now match pdfium exactly — e.g. 910×1287 at 110 DPI for A4).
+
+### Validation
+
+- 56-page render sweep across the seven-document test corpus compared
+  page-by-page against pdfium: all sampled pages visually match; ten
+  previously-defective pages verified fixed; no regressions.
+- Workspace test count grew from 168 to 292 (new unit tests across parser,
+  crypt, color, content, image, font, document, render crates plus
+  encrypted-PDF and Quartz-font integration fixtures); clippy clean.
+- An adversarial review pass of the new shading/function/interpreter code
+  found and fixed three bugs before release (radial root fallback, PostScript
+  stack-top results, form `Q`-imbalance state corruption).
+
+### Known limitations (current top gaps)
+
+- Tiling patterns paint a neutral mid-gray placeholder (no cell replication).
+- ExtGState `/SMask` soft masks and transparency-group isolation/knockout are
+  not yet emitted.
+- Non-embedded CJK fonts render no glyphs (system-font fallback planned).
+- Annotation appearance streams (`/AP`) are parsed but not painted.
+- JBIG2Decode and JPXDecode filters are unsupported (affected images drop).
+- Optional-content groups (layers) always render; non-Identity CMaps and
+  vertical writing are unsupported; ICC profile data is not color-managed
+  (component-count fallback).
+
+### Dependencies added
+
+`aes 0.8`, `cbc 0.1`, `sha2 0.10` (RustCrypto, pure Rust) — AES decryption.
+
 ## 0.2.0 — wgpu GPU rendering backend
 
 This release adds a complete, GPU-accelerated rendering backend (`zpdf-render-wgpu`)

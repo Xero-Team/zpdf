@@ -220,7 +220,7 @@ fn cmd_text(args: &[String]) -> zpdf::Result<()> {
 
         let mut spans: Vec<zpdf::TextSpan> = Vec::new();
         {
-            let interpreter = zpdf::ContentInterpreter::new(page.media_box)
+            let interpreter = zpdf::ContentInterpreter::new(page.effective_box())
                 .with_fonts(&mut font_cache)
                 .with_document(doc.file(), &page.resources)
                 .with_images(&mut image_cache)
@@ -290,11 +290,14 @@ fn cmd_render(args: &[String]) -> zpdf::Result<()> {
     let page_index = page_num.saturating_sub(1);
     let page = doc.page(page_index)?;
 
+    // CropBox ∩ MediaBox: the rect actually rendered (falls back to MediaBox).
+    let page_box = page.effective_box();
+
     println!(
         "Rendering page {} ({:.0}x{:.0} pt) at {} DPI...",
         page_num,
-        page.width(),
-        page.height(),
+        page_box.width(),
+        page_box.height(),
         dpi
     );
 
@@ -320,7 +323,8 @@ fn cmd_render(args: &[String]) -> zpdf::Result<()> {
 
     // Interpret content stream → display list
     let mut image_cache = zpdf::ImageCache::new();
-    let interpreter = zpdf::ContentInterpreter::new(page.media_box)
+    let interpreter = zpdf::ContentInterpreter::new(page_box)
+        .with_page_rotation(page.rotate)
         .with_fonts(&mut font_cache)
         .with_document(doc.file(), &page.resources)
         .with_images(&mut image_cache);
@@ -367,7 +371,10 @@ fn cmd_render(args: &[String]) -> zpdf::Result<()> {
             let rendered: zpdf::cpu::RenderedPage = renderer
                 .render_display_list(&display_list, scale)
                 .map_err(|e| zpdf::Error::StreamDecode(e.to_string()))?;
-            println!("  Rendered (cpu): {}x{} pixels", rendered.width, rendered.height);
+            println!(
+                "  Rendered (cpu): {}x{} pixels",
+                rendered.width, rendered.height
+            );
             save_rgba(&output, rendered.width, rendered.height, &rendered.data)?;
         }
         #[cfg(not(feature = "cpu"))]
@@ -383,7 +390,10 @@ fn cmd_render(args: &[String]) -> zpdf::Result<()> {
             let rendered = renderer
                 .render_display_list(&display_list, scale)
                 .map_err(|e| zpdf::Error::StreamDecode(e.to_string()))?;
-            println!("  Rendered (wgpu): {}x{} pixels", rendered.width, rendered.height);
+            println!(
+                "  Rendered (wgpu): {}x{} pixels",
+                rendered.width, rendered.height
+            );
             save_rgba(&output, rendered.width, rendered.height, &rendered.data)?;
         }
         #[cfg(not(feature = "gpu"))]

@@ -6,9 +6,9 @@
 //! MacRoman-compatible name stay charset SID 0 (".notdef") and are addressed
 //! by their original Type 1 code (CMSY minus at code 0).
 
+use zpdf_core::ObjectId;
 use zpdf_document::font_loader::load_single_font;
 use zpdf_document::PdfDocument;
-use zpdf_core::ObjectId;
 
 const PDF_PATH: &str = "../../tests/test7/1.pdf";
 

@@ -76,7 +76,9 @@ impl Decryptor {
     ) -> Option<Self> {
         let filter = dict.get_name("Filter").unwrap_or("");
         if filter != "Standard" {
-            tracing::warn!("unsupported security handler /Filter {filter}; document will not decrypt");
+            tracing::warn!(
+                "unsupported security handler /Filter {filter}; document will not decrypt"
+            );
             return None;
         }
 
@@ -398,7 +400,10 @@ fn compute_key_v5(dict: &PdfDict, r: i64) -> Option<Vec<u8>> {
 /// intermediate key, a zero IV, and no padding.
 fn decrypt_file_key(intermediate: &[u8; 32], encrypted: &[u8], which: &str) -> Option<Vec<u8>> {
     if encrypted.len() != 32 {
-        tracing::warn!("/{which} must be 32 bytes, got {}; document will not decrypt", encrypted.len());
+        tracing::warn!(
+            "/{which} must be 32 bytes, got {}; document will not decrypt",
+            encrypted.len()
+        );
         return None;
     }
     let mut buf = encrypted.to_vec();
@@ -486,7 +491,10 @@ fn aes_cbc_decrypt(key: &[u8], data: &[u8]) -> Vec<u8> {
     let (iv, ct) = data.split_at(16);
     let mut buf = ct.to_vec();
     if !cbc_decrypt_in_place(key, iv, &mut buf) {
-        tracing::warn!("invalid AES key length {}; leaving data unmodified", key.len());
+        tracing::warn!(
+            "invalid AES key length {}; leaving data unmodified",
+            key.len()
+        );
         return data.to_vec();
     }
     strip_pkcs5_padding(buf)
@@ -564,9 +572,7 @@ fn rc4(key: &[u8], data: &[u8]) -> Vec<u8> {
     }
     let mut j: u8 = 0;
     for i in 0..256 {
-        j = j
-            .wrapping_add(s[i])
-            .wrapping_add(key[i % key.len()]);
+        j = j.wrapping_add(s[i]).wrapping_add(key[i % key.len()]);
         s.swap(i, j as usize);
     }
 
@@ -641,10 +647,7 @@ pub fn md5(data: &[u8]) -> [u8; 16] {
                 32..=47 => (b ^ c ^ d, (3 * i + 5) % 16),
                 _ => (c ^ (b | !d), (7 * i) % 16),
             };
-            let f = f
-                .wrapping_add(a)
-                .wrapping_add(MD5_K[i])
-                .wrapping_add(m[g]);
+            let f = f.wrapping_add(a).wrapping_add(MD5_K[i]).wrapping_add(m[g]);
             a = d;
             d = c;
             c = b;
@@ -744,7 +747,11 @@ mod tests {
             encrypt_metadata: true,
         };
         let objkey = dec.object_key(ObjectId(1652, 0), Algo::Rc4);
-        assert_eq!(hex(&objkey), "30dadd6463d5f9765abc", "per-object key (Algorithm 1)");
+        assert_eq!(
+            hex(&objkey),
+            "30dadd6463d5f9765abc",
+            "per-object key (Algorithm 1)"
+        );
     }
 
     #[test]
@@ -851,7 +858,10 @@ mod tests {
 
         // Structurally impossible lengths are returned unmodified.
         assert_eq!(aes_cbc_decrypt(&key, &[1, 2, 3]), vec![1, 2, 3]);
-        assert_eq!(aes_cbc_decrypt(&key, &payload[..17]), payload[..17].to_vec());
+        assert_eq!(
+            aes_cbc_decrypt(&key, &payload[..17]),
+            payload[..17].to_vec()
+        );
         assert_eq!(aes_cbc_decrypt(&key, b""), Vec::<u8>::new());
         // An empty ciphertext (IV only) decodes to an empty plaintext.
         assert_eq!(aes_cbc_decrypt(&key, &iv), Vec::<u8>::new());
@@ -917,11 +927,17 @@ mod tests {
         let mut cf = PdfDict::new();
         cf.insert(PdfName::new("StdCF"), PdfObject::Dict(stdcf));
         let mut dict = PdfDict::new();
-        dict.insert(PdfName::new("Filter"), PdfObject::Name(PdfName::new("Standard")));
+        dict.insert(
+            PdfName::new("Filter"),
+            PdfObject::Name(PdfName::new("Standard")),
+        );
         dict.insert(PdfName::new("V"), PdfObject::Integer(4));
         dict.insert(PdfName::new("R"), PdfObject::Integer(4));
         dict.insert(PdfName::new("CF"), PdfObject::Dict(cf));
-        dict.insert(PdfName::new("StmF"), PdfObject::Name(PdfName::new("Identity")));
+        dict.insert(
+            PdfName::new("StmF"),
+            PdfObject::Name(PdfName::new("Identity")),
+        );
         dict.insert(PdfName::new("StrF"), PdfObject::Name(PdfName::new("StdCF")));
 
         let dec = Decryptor::from_encrypt_dict(&dict, &[], None).expect("decryptor");
@@ -935,13 +951,26 @@ mod tests {
             PdfObject::String(PdfString(string_data.clone())),
         ]);
         dec.decrypt_object(&mut arr, ObjectId(9, 0));
-        let PdfObject::Array(items) = &arr else { unreachable!() };
-        let PdfObject::Stream(s) = &items[0] else { unreachable!() };
-        assert_eq!(&s.data[..], &stream_data[..], "Identity /StmF must not touch streams");
-        let PdfObject::String(st) = &items[1] else { unreachable!() };
+        let PdfObject::Array(items) = &arr else {
+            unreachable!()
+        };
+        let PdfObject::Stream(s) = &items[0] else {
+            unreachable!()
+        };
+        assert_eq!(
+            &s.data[..],
+            &stream_data[..],
+            "Identity /StmF must not touch streams"
+        );
+        let PdfObject::String(st) = &items[1] else {
+            unreachable!()
+        };
         assert_ne!(st.0, string_data, "/StrF StdCF must decrypt strings");
         // ObjStm container bytes go through the stream filter → untouched too.
-        assert_eq!(dec.decrypt_stream_bytes(ObjectId(9, 0), b"objstm"), b"objstm");
+        assert_eq!(
+            dec.decrypt_stream_bytes(ObjectId(9, 0), b"objstm"),
+            b"objstm"
+        );
     }
 
     /// /EncryptMetadata false leaves /Type /Metadata stream payloads alone.
@@ -956,16 +985,27 @@ mod tests {
         };
         let xmp = b"<x:xmpmeta/>".to_vec();
         let mut meta_dict = PdfDict::new();
-        meta_dict.insert(PdfName::new("Type"), PdfObject::Name(PdfName::new("Metadata")));
+        meta_dict.insert(
+            PdfName::new("Type"),
+            PdfObject::Name(PdfName::new("Metadata")),
+        );
         let mut meta = PdfObject::Stream(PdfStream::new(meta_dict, xmp.clone()));
         dec.decrypt_object(&mut meta, ObjectId(7, 0));
-        let PdfObject::Stream(s) = &meta else { unreachable!() };
-        assert_eq!(&s.data[..], &xmp[..], "plaintext metadata must not be corrupted");
+        let PdfObject::Stream(s) = &meta else {
+            unreachable!()
+        };
+        assert_eq!(
+            &s.data[..],
+            &xmp[..],
+            "plaintext metadata must not be corrupted"
+        );
 
         // A regular stream under the same decryptor IS decrypted.
         let mut other = PdfObject::Stream(PdfStream::new(PdfDict::new(), xmp.clone()));
         dec.decrypt_object(&mut other, ObjectId(7, 0));
-        let PdfObject::Stream(s) = &other else { unreachable!() };
+        let PdfObject::Stream(s) = &other else {
+            unreachable!()
+        };
         assert_ne!(&s.data[..], &xmp[..]);
     }
 
@@ -980,9 +1020,7 @@ mod tests {
         let file = crate::PdfFile::parse(bytes.to_vec()).expect("parse encrypted fixture");
         let content = content_stream_bytes(&file);
         assert!(
-            content
-                .windows(AES_MARKER.len())
-                .any(|w| w == AES_MARKER),
+            content.windows(AES_MARKER.len()).any(|w| w == AES_MARKER),
             "decrypted content stream should contain the known marker, got: {:?}",
             String::from_utf8_lossy(&content)
         );

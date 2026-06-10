@@ -95,8 +95,8 @@ fn corpus() -> Vec<(&'static str, Vec<u8>)> {
     image_rgb.extend_from_slice(&inline_img(2, 2, &img_a));
     image_rgb.extend_from_slice(b" Q");
 
-    let mut img_clip = b"1 1 0 rg 0 0 200 200 re f\nq 50 50 100 100 re W n\nq 200 0 0 200 0 0 cm "
-        .to_vec();
+    let mut img_clip =
+        b"1 1 0 rg 0 0 200 200 re f\nq 50 50 100 100 re W n\nq 200 0 0 200 0 0 cm ".to_vec();
     img_clip.extend_from_slice(&inline_img(2, 2, &img_b));
     img_clip.extend_from_slice(b" Q\nQ");
 
@@ -202,7 +202,10 @@ fn gpu_matches_cpu_on_corpus() {
                 break;
             }
             Some((pct, cdim, gdim)) => {
-                assert_eq!(cdim, gdim, "{name}: dimension mismatch {cdim:?} vs {gdim:?}");
+                assert_eq!(
+                    cdim, gdim,
+                    "{name}: dimension mismatch {cdim:?} vs {gdim:?}"
+                );
                 println!("  {name}: {pct:.3}% differing");
                 assert!(
                     pct < MAX_DIFF_PCT,

@@ -131,10 +131,11 @@ impl PdfFile {
     fn first_id_bytes(&self) -> Vec<u8> {
         let arr = match self.trailer.get("ID") {
             Some(PdfObject::Array(a)) => Some(std::borrow::Cow::Borrowed(a.as_slice())),
-            Some(PdfObject::Ref(r)) => self
-                .resolve(*r)
-                .ok()
-                .and_then(|o| o.as_array().ok().map(|a| std::borrow::Cow::Owned(a.to_vec()))),
+            Some(PdfObject::Ref(r)) => self.resolve(*r).ok().and_then(|o| {
+                o.as_array()
+                    .ok()
+                    .map(|a| std::borrow::Cow::Owned(a.to_vec()))
+            }),
             _ => None,
         };
         match arr.as_deref().and_then(|a| a.first()) {
@@ -295,10 +296,7 @@ impl PdfFile {
             PdfObject::Array(a) => a.iter().any(|e| matches!(e, PdfObject::Ref(_))),
             _ => false,
         };
-        if !KEYS
-            .iter()
-            .any(|k| dict.get(k).is_some_and(needs_resolve))
-        {
+        if !KEYS.iter().any(|k| dict.get(k).is_some_and(needs_resolve)) {
             return None;
         }
 

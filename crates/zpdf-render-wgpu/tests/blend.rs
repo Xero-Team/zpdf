@@ -3,9 +3,7 @@
 //! layered path against (a) explicit blend math and (b) the CPU oracle.
 
 use zpdf_core::Rect;
-use zpdf_display_list::{
-    BlendMode, Color, DisplayList, FillRule, Paint, Path, RenderCommand,
-};
+use zpdf_display_list::{BlendMode, Color, DisplayList, FillRule, Paint, Path, RenderCommand};
 use zpdf_render::RenderBackend;
 use zpdf_render_cpu::CpuRenderer;
 use zpdf_render_wgpu::WgpuRenderer;
@@ -70,7 +68,10 @@ fn multiply_group_blends_correctly() {
     };
     let left = px(&data, w, w / 4, w / 4); // device px, left half -> blue
     let right = px(&data, w, w * 3 / 4, w / 4); // right half -> black (multiply)
-    assert!(left[2] > 200 && left[0] < 40, "left should be blue, got {left:?}");
+    assert!(
+        left[2] > 200 && left[0] < 40,
+        "left should be blue, got {left:?}"
+    );
     assert!(
         right[0] < 40 && right[1] < 40 && right[2] < 40,
         "right (multiply) should be ~black, got {right:?}"
@@ -108,7 +109,11 @@ fn blend_groups_match_cpu_oracle() {
         let cpu = CpuRenderer::new()
             .render_display_list(&dl, SCALE)
             .expect("cpu render");
-        assert_eq!((gw, gh), (cpu.width, cpu.height), "dims differ for {mode:?}");
+        assert_eq!(
+            (gw, gh),
+            (cpu.width, cpu.height),
+            "dims differ for {mode:?}"
+        );
 
         let total = (gw * gh) as u64;
         let mut diff = 0u64;

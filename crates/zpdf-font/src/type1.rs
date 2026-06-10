@@ -57,8 +57,7 @@ impl Type1Font {
         };
         let private = decrypt(&binary, EEXEC_R, 4);
 
-        let font_matrix =
-            parse_font_matrix(clear).unwrap_or([0.001, 0.0, 0.0, 0.001, 0.0, 0.0]);
+        let font_matrix = parse_font_matrix(clear).unwrap_or([0.001, 0.0, 0.0, 0.001, 0.0, 0.0]);
         let units_per_em = if font_matrix[0].abs() > 1e-12 {
             1.0 / font_matrix[0]
         } else {

@@ -1591,8 +1591,12 @@ mod tests {
             (*b"hhea", hhea_table()),
             (*b"maxp", maxp_table(16)),
         ]);
-        let font =
-            LoadedFont::new_with_data(PdfFontType::TrueType, "Test".into(), data, CidWidths::new(500.0));
+        let font = LoadedFont::new_with_data(
+            PdfFontType::TrueType,
+            "Test".into(),
+            data,
+            CidWidths::new(500.0),
+        );
         assert!(font.font_data.is_some(), "synthetic sfnt must parse");
         font
     }
@@ -1624,9 +1628,7 @@ mod tests {
         // Without an /Encoding there is no name to detour through.
         assert_eq!(font.code_to_gid(0x95), None);
 
-        font.encoding = Some(encoding::Encoding::from_base(
-            &encoding::WIN_ANSI_ENCODING,
-        ));
+        font.encoding = Some(encoding::Encoding::from_base(&encoding::WIN_ANSI_ENCODING));
         assert_eq!(font.code_to_gid(0x95), Some(7));
         // Raw-code hits still win where the PDF encoding agrees with MacRoman.
         assert_eq!(font.code_to_gid(0xA5), Some(7));
@@ -1651,7 +1653,7 @@ mod tests {
 
         let mut cff = vec![1, 0, 4, 4]; // header
         cff.extend_from_slice(&[0x00, 0x01, 0x01, 0x01, 0x02, b'T']); // Name INDEX
-        // Top DICT INDEX: one entry of dict_len bytes.
+                                                                      // Top DICT INDEX: one entry of dict_len bytes.
         cff.extend_from_slice(&[0x00, 0x01, 0x01, 0x01, dict_len as u8 + 1]);
         if cid_keyed {
             cff.extend_from_slice(&[28, 0x01, 0x87]); // SID 391 (registry)

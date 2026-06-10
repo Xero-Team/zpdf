@@ -56,7 +56,11 @@ fn render_first_page(path: &str, out: &str) -> zpdf::Result<()> {
     // Interpret operators into a DisplayList. The interpreter borrows the caches
     // mutably (it may add Form-XObject fonts / decode images) and is consumed by
     // `interpret`, releasing those borrows.
-    let display_list = ContentInterpreter::new(page.media_box)
+    //
+    // effective_box() = CropBox ∩ MediaBox (what a viewer shows); pass
+    // page.rotate so /Rotate'd pages come out upright.
+    let display_list = ContentInterpreter::new(page.effective_box())
+        .with_page_rotation(page.rotate)
         .with_fonts(&mut fonts)
         .with_document(doc.file(), &page.resources)
         .with_images(&mut images)
@@ -108,14 +112,14 @@ let content = doc.page_content_bytes(&page)?;
 
 let mut spans: Vec<TextSpan> = Vec::new();
 {
-    let interp = ContentInterpreter::new(page.media_box)
+    let interp = ContentInterpreter::new(page.effective_box())
         .with_fonts(&mut fonts)
         .with_document(doc.file(), &page.resources)
         .with_images(&mut images)
         .with_text_sink(&mut spans);
     let _ = interp.interpret(&content);
 }
-let text = spans_to_text(spans, 2.0); // line_gap factor for line grouping
+let text = spans_to_text(spans, 2.0); // line-merge tolerance (pt-relative)
 println!("{text}");
 ```
 
@@ -125,14 +129,21 @@ your own layout/extraction logic instead of using `spans_to_text`.
 ## Inspecting documents
 
 ```rust
-let doc = PdfDocument::open(bytes)?;
+let doc = PdfDocument::open(bytes)?;       // decrypts RC4/AES (empty password) transparently
 let (major, minor) = doc.version();        // e.g. (1, 7)
 let n = doc.page_count();
 let page = doc.page(i)?;
-let (w, h) = (page.width(), page.height()); // points
+let (w, h) = (page.width(), page.height()); // MediaBox, points
+let visible = page.effective_box();         // CropBox ∩ MediaBox (render rect)
+let rot = page.rotate;                      // inherited /Rotate (degrees)
+let annots = &page.annots;                  // /Annots object ids (not yet rendered)
 let obj = doc.file().resolve(zpdf::ObjectId(4, 0))?;          // a PdfObject
 let stream = doc.file().resolve_stream_data(zpdf::ObjectId(7, 0))?; // decoded bytes
 ```
+
+Encrypted documents (RC4 and AES-128/256, empty user password) open and decrypt
+transparently in `PdfDocument::open`; password-protected files degrade to a
+warning and render blank.
 
 ## Architecture
 
@@ -141,14 +152,17 @@ never depend on the parser** — they consume only `zpdf-display-list`.
 
 ```
 zpdf-core            Shared types: ObjectId, PdfObject, Matrix, Rect, Error, ParseLimits
-  ├─ zpdf-parser     Lexer, xref/trailer, object & stream decoding, filters
-  │   └─ zpdf-document   Catalog, page tree, resource inheritance, font loading
-  │       └─ zpdf-content   Content-stream tokenizer → operator interpreter
+  ├─ zpdf-parser     Lexer, xref/trailer (+ hybrid /XRefStm, lazy repair),
+  │   │              object & stream decoding, filters, RC4/AES decryption
+  │   └─ zpdf-document   Catalog, page tree + attribute inheritance, font loading
+  │       └─ zpdf-content   Content-stream tokenizer → operator interpreter,
+  │                         shading evaluation (zpdf_content::shading)
   ├─ zpdf-font       Type1 / TrueType / CID fonts, CMap, encodings, glyph outlines
-  ├─ zpdf-image      JPEG / Flate / masks → RGBA
-  ├─ zpdf-color      DeviceGray / RGB / CMYK / Indexed / Lab
+  ├─ zpdf-image      JPEG / Flate / CCITT / masks / palettes → RGBA
+  ├─ zpdf-color      Device/Indexed/Lab color conversion + the PDF function
+  │                  evaluator (zpdf_color::function, types 0/2/3/4)
   ├─ zpdf-display-list   Flat RenderCommand sequence (the backend contract)
-  ├─ zpdf-render          RenderBackend trait + PageRenderInfo
+  ├─ zpdf-render          RenderBackend trait + PageRenderInfo + dash flattening
   │   ├─ zpdf-render-cpu   tiny-skia backend  → RenderedPage
   │   └─ zpdf-render-wgpu  wgpu backend       → GpuTexture
   ├─ zpdf-cli        Binary: info / dump / render / text / compare / debug-stream
@@ -161,8 +175,10 @@ zpdf-core            Shared types: ObjectId, PdfObject, Matrix, Rect, Error, Par
   only its `png` feature.
 - **`ParseLimits`** (in `zpdf-core`) bounds recursion depth, stream size, image pixels,
   and operator counts at parse time.
-- **PDF coordinates** are origin-bottom-left, +Y up. Renderers flip Y:
-  `(page_height − y) · scale`, where `scale = dpi / 72`.
+- **PDF coordinates** are origin-bottom-left, +Y up. Renderers honor the page
+  rect's origin and flip Y: `((x − rect.x0) · scale, (rect.y1 − y) · scale)`,
+  where `scale = dpi / 72` — so CropBoxes and nonzero MediaBox origins render
+  correctly. Raster dimensions are `ceil(rect_size · scale)`.
 - **The `DisplayList` is flat** — no nesting. Clip and blend grouping use Push/Pop pairs.
 - File data is shared zero-copy as `Arc<[u8]>`.
 

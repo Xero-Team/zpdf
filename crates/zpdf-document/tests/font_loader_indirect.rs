@@ -74,7 +74,12 @@ fn cid_keyed_cff() -> Vec<u8> {
 }
 
 /// Type0/CIDFontType2 font whose /CIDToGIDMap is the given object body.
-fn type0_pdf(cid_to_gid_map: &str, font_file_key: &str, font_data: &[u8], map_obj: Vec<u8>) -> Vec<u8> {
+fn type0_pdf(
+    cid_to_gid_map: &str,
+    font_file_key: &str,
+    font_data: &[u8],
+    map_obj: Vec<u8>,
+) -> Vec<u8> {
     build_pdf(&[
         dict_obj("<< /Type /Catalog >>"),
         dict_obj(
@@ -136,7 +141,12 @@ fn cid_to_gid_stream_does_not_clobber_cff_charset_map() {
     let mut map_data = vec![0u8; 12];
     map_data[10] = 0;
     map_data[11] = 42; // CID 5 → GID 42
-    let pdf = type0_pdf("5 0 R", "FontFile3", &cid_keyed_cff(), stream_obj(&map_data));
+    let pdf = type0_pdf(
+        "5 0 R",
+        "FontFile3",
+        &cid_keyed_cff(),
+        stream_obj(&map_data),
+    );
 
     let file = PdfFile::parse(pdf).expect("parse synthetic pdf");
     let font = load_single_font(&file, ObjectId(2, 0)).expect("load font");

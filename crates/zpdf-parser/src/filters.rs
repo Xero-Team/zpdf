@@ -618,7 +618,9 @@ mod tests {
         let mut state = 0x2545F491u64;
         let original: Vec<u8> = (0..64 * 1024)
             .map(|_| {
-                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 (state >> 33) as u8
             })
             .collect();
@@ -630,7 +632,11 @@ mod tests {
         let decoded = decode_flate(truncated).unwrap();
         assert!(!decoded.is_empty(), "partial output must be salvaged");
         assert!(decoded.len() < original.len());
-        assert_eq!(&original[..decoded.len()], &decoded[..], "salvaged bytes are a prefix");
+        assert_eq!(
+            &original[..decoded.len()],
+            &decoded[..],
+            "salvaged bytes are a prefix"
+        );
     }
 
     #[test]

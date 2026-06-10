@@ -208,51 +208,63 @@ cargo run -p zpdf-render-wgpu --example viewer -- <file.pdf>   # 交互浏览器
 ## Phase 4：高级功能
 
 > 目标：覆盖 PDF 1.7 / 2.0 常见复杂文件。
+>
+> **0.3.0 兼容性专项**（见 docs/CHANGELOG.md）完成了本阶段大部分条目，并补强了
+> Phase 1/2 范围外的健壮性：混合 xref（/XRefStm）、xref 偏移修复、损坏 Flate 流
+> 抢救、悬空引用按规范解析为 null、CropBox 渲染、/Rotate //Resources 页面树继承、
+> 虚线、细线 hairline、双线性图像采样、文本渲染模式（OCR 隐藏文本）等。
+> 56 页真实文档对照 pdfium 逐页验证。
 
 ### P4.1 — 完整字体支持
-- [ ] CIDFont (Type0 composite fonts)
-- [ ] CMap 解析（预定义 + 嵌入）
+- [x] CIDFont (Type0 composite fonts)：Identity-H、`/W`、`/CIDToGIDMap` 流、
+      OpenType 包装的 CID-keyed CFF
+- [ ] CMap 解析（预定义 + 嵌入）— 仅 Identity-H/ToUnicode；非 Identity CMap 未支持
 - [ ] Vertical writing mode
-- [ ] Type3 font (字形由内容流定义)
-- [ ] Font fallback (缺失字体替代)
+- [x] Type3 font (字形由内容流定义)：含间接 /CharProcs //Encoding //Widths，
+      FirstChar≠0 修复
+- [ ] Font fallback (缺失字体替代) — 未嵌入 CJK 字体仍渲染空白
 - [ ] Variable fonts
 
 ### P4.2 — 完整颜色管理
-- [ ] ICCBased 颜色空间（moxcms 集成）
-- [ ] CalGray / CalRGB / Lab
-- [ ] Indexed 颜色空间
-- [ ] Separation / DeviceN
+- [~] ICCBased 颜色空间：按 /N 解析为设备空间；moxcms 真正色彩管理未集成
+- [x] CalGray / CalRGB / Lab（Lab→XYZ→sRGB 解析转换；CalGray/CalRGB 近似设备空间）
+- [x] Indexed 颜色空间（填充 + 图像调色板，含 Indexed-over-Lab）
+- [x] Separation / DeviceN（经 PDF 函数评估器走 tint transform → alternate）
+- [x] PDF 函数评估器（type 0/2/3/4，zpdf-color/src/function.rs）
 - [ ] Overprint
 - [ ] Rendering Intent
 
 ### P4.3 — 透明度与混合
 - [x] 全部 16 种 blend mode（GPU composite.wgsl 实现，W3C 公式）— M8
+- [x] 解释器发出 /BM → PushBlendGroup（双后端生效）
 - [ ] Soft Mask (luminosity/alpha)
 - [~] Transparency Group：离屏合成已实现；isolated/knockout 当前忽略（与 CPU 一致）
 - [x] Offscreen render pass 合成（M8 RenderLayer + scratch swap）
 
 ### P4.4 — Pattern 与 Shading
-- [ ] Tiling Pattern (colored/uncolored)
-- [ ] Axial Shading (Type 2)
-- [ ] Radial Shading (Type 3)
+- [~] Tiling Pattern (colored/uncolored) — 当前以中性灰占位，未做 cell 平铺
+- [x] Axial Shading (Type 2)：`sh` 算子 + PatternType 2 填充（栅格化为图像）
+- [x] Radial Shading (Type 3)：同上，含 /Extend 与谱系根选择
 - [ ] Free-form Gouraud (Type 4)
 - [ ] Coons/Tensor Patch (Type 6/7)
 
 ### P4.5 — 注释与表单
-- [ ] Annotation appearance stream
+- [~] 页面 /Annots 已解析（PdfPage::annots）；appearance stream 渲染未实现
 - [ ] Link / Text / Highlight annotation
 - [ ] Widget annotation (form fields)
 - [ ] AcroForm 字段解析
 - [ ] Appearance regeneration
 
 ### P4.6 — 加密
-- [ ] Standard Security Handler
-- [ ] RC4 / AES-128 / AES-256 解密
-- [ ] 权限检查
+- [x] Standard Security Handler（含直接 /Encrypt 字典、/StmF //StrF /Identity）
+- [x] RC4 / AES-128 / AES-256 解密（V1-V5，R2-R6；空用户口令；pypdf 加密
+      fixtures 端到端验证）
+- [ ] 权限检查（/P 仅用于密钥派生）
+- [ ] 口令 API（非空用户口令的文档无法打开）
 
 ### P4.7 — 附加 Filters
-- [ ] LZWDecode
-- [ ] CCITTFaxDecode (Group 3/4)
+- [x] LZWDecode
+- [x] CCITTFaxDecode (Group 3/4)
 - [ ] JBIG2Decode
 - [ ] JPXDecode (JPEG2000)
 - [ ] Crypt filter

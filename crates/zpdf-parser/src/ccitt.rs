@@ -22,11 +22,8 @@ pub struct CcittParams {
 
 impl CcittParams {
     pub fn from_dict(params: Option<&PdfDict>) -> Self {
-        let g = |key: &str, default: i64| {
-            params
-                .and_then(|p| p.get_i64(key).ok())
-                .unwrap_or(default)
-        };
+        let g =
+            |key: &str, default: i64| params.and_then(|p| p.get_i64(key).ok()).unwrap_or(default);
         let b = |key: &str| {
             params
                 .and_then(|p| match p.get(key) {
@@ -185,7 +182,11 @@ fn decode_row_1d(reader: &mut BitReader, columns: usize) -> Option<Vec<usize>> {
 }
 
 /// Decode one 2-D (READ) coded row against the reference line → transition cols.
-fn decode_row_2d(reader: &mut BitReader, reference: &[usize], columns: usize) -> Option<Vec<usize>> {
+fn decode_row_2d(
+    reader: &mut BitReader,
+    reference: &[usize],
+    columns: usize,
+) -> Option<Vec<usize>> {
     let mut changes = Vec::new();
     let mut a0: i64 = -1;
     let mut color_white = true; // current coding colour
@@ -475,7 +476,13 @@ mod tests {
     fn one_d_simple_row() {
         let bits = "100110000110111";
         let data = bits_to_bytes(bits);
-        let p = CcittParams { k: 0, columns: 8, rows: 1, black_is_1: false, byte_align: false };
+        let p = CcittParams {
+            k: 0,
+            columns: 8,
+            rows: 1,
+            black_is_1: false,
+            byte_align: false,
+        };
         let out = decode(&data, &p).unwrap();
         // 8 white pixels, BlackIs1 false → white = sample 1 → 0xFF
         assert_eq!(out, vec![0xFF]);
@@ -487,7 +494,13 @@ mod tests {
         // white 3 = 1000, black 2 = 11, white 3 = 1000
         let bits = "1000111000";
         let data = bits_to_bytes(bits);
-        let p = CcittParams { k: 0, columns: 8, rows: 1, black_is_1: false, byte_align: false };
+        let p = CcittParams {
+            k: 0,
+            columns: 8,
+            rows: 1,
+            black_is_1: false,
+            byte_align: false,
+        };
         let out = decode(&data, &p).unwrap();
         // pixels WWWBBWWW, white=1 black=0 → 1110 0111 = 0xE7
         assert_eq!(out, vec![0b11100111]);
@@ -498,7 +511,13 @@ mod tests {
     fn black_is_1_inverts() {
         let bits = "1000111000";
         let data = bits_to_bytes(bits);
-        let p = CcittParams { k: 0, columns: 8, rows: 1, black_is_1: true, byte_align: false };
+        let p = CcittParams {
+            k: 0,
+            columns: 8,
+            rows: 1,
+            black_is_1: true,
+            byte_align: false,
+        };
         let out = decode(&data, &p).unwrap();
         // WWWBBWWW, white=0 black=1 → 0001 1000 = 0x18
         assert_eq!(out, vec![0b00011000]);

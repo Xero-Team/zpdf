@@ -59,8 +59,14 @@ cargo run -p zpdf-cli -- render document.pdf -p 1 -o out.png --dpi 150
 | --- | --- | --- |
 | `-p <page>` | `1` | 1-based page number. |
 | `-o <file>` | `output.png` | Output PNG path. |
-| `--dpi <n>` | `150` | Render resolution. Pixel size = `page_pt × dpi / 72`. |
+| `--dpi <n>` | `150` | Render resolution. Pixel size = `ceil(page_pt × dpi / 72)`. |
 | `--backend [cpu\|wgpu]` | `cpu` | Renderer. `wgpu` requires `--features gpu`. |
+
+Pages render at their **effective box** (CropBox ∩ MediaBox — what desktop
+viewers show, e.g. a trimmed scan rather than the full sheet) and honor the
+page's `/Rotate` entry, including values inherited from the page tree.
+Encrypted documents (RC4 and AES-128/256 with an empty user password — the
+common "owner-locked" case) open and render transparently.
 
 GPU rendering (requires a GPU/`gpu` feature):
 
@@ -138,7 +144,8 @@ the current page and zoom. It requires a working GPU adapter.
 ## DPI, sizes, and coordinates
 
 PDF pages are measured in points (1 pt = 1/72 inch). The rendered pixel dimensions are
-`round_down(page_points × dpi / 72)`. For a US-Letter page (612 × 792 pt):
+`ceil(page_points × dpi / 72)` of the page's effective (cropped) box — matching
+what pdfium/Chromium produces. For a US-Letter page (612 × 792 pt):
 
 | DPI | Pixels |
 | --- | --- |
@@ -148,18 +155,28 @@ PDF pages are measured in points (1 pt = 1/72 inch). The rendered pixel dimensio
 
 ## Supported content
 
-Rendering covers: vector paths (fill/stroke, non-zero & even-odd, all caps/joins),
-clipping, embedded **TrueType / Type1 / CID-Type0** and **Type3** fonts, the standard-14
-fonts, **inline and XObject images** (Flate, JPEG/DCT, image masks / soft masks),
-**Form XObjects**, and DeviceGray/RGB/CMYK color.
+Rendering covers: vector paths (fill/stroke, non-zero & even-odd, all caps/joins,
+dash patterns), clipping, embedded **TrueType / Type1 / Type1C / CID-Type0** and
+**Type3** fonts, the standard-14 fonts, **inline and XObject images** (Flate,
+JPEG/DCT incl. CMYK, CCITT G3/G4, 1–16 bpc, `/Decode`, soft masks, stencil and
+color-key masks, Indexed palettes), **Form XObjects**, **axial/radial gradients**
+(`sh` and shading patterns), all 16 **blend modes**, and
+DeviceGray/RGB/CMYK/ICCBased/Indexed/Lab/Separation/DeviceN color. **Encrypted**
+documents (RC4, AES-128, AES-256; empty user password) decrypt transparently.
+Pages honor CropBox and `/Rotate`. Invisible OCR text layers (text render
+mode 3) are correctly not painted over scanned images.
 
 ## Known limitations
 
+- **Tiling patterns** (hatches/textures) paint a neutral gray placeholder.
+- **ExtGState soft masks** (vignettes, gradient-faded groups) are ignored.
+- **Non-embedded CJK fonts** render no glyphs yet (embedded fonts are fine).
+- **Annotations** (form fields, stamps, highlights) are not yet drawn.
+- **JBIG2 / JPEG-2000** compressed images are skipped.
+- **Password-protected PDFs** (non-empty user password) won't decrypt — there
+  is no password prompt/API yet.
 - **Dense CJK text** can differ from the CPU renderer by ~1–1.4% of pixels at threshold
   16 (anti-aliasing only — the text is correct). It passes at threshold ~24–32.
-- **Transparency-group blend modes** are implemented in the GPU backend but the content
-  interpreter does not yet emit them, so they don't trigger on real PDFs.
-- **No encryption support** yet — encrypted PDFs won't open.
 
 ## Troubleshooting
 
@@ -167,4 +184,6 @@ fonts, **inline and XObject images** (Flate, JPEG/DCT, image masks / soft masks)
 | --- | --- |
 | `--backend wgpu requires building with --features gpu` | Rebuild with `--features gpu`. |
 | GPU render errors with "no compatible GPU adapter found" | No usable GPU. Use `--backend cpu`, or set `ZPDF_GPU_FORCE_FALLBACK=1` if a software adapter (e.g. lavapipe/WARP) is installed. |
-| Blank / wrong output on an unusual PDF | Some features (encryption, exotic filters) are not yet supported — see [CHANGELOG.md](CHANGELOG.md). |
+| Encrypted PDF renders blank | A non-empty user password is required to open it; only empty-password (owner-locked) decryption is supported. |
+| Blank image areas on a scanned PDF | The images may be JBIG2 or JPEG-2000 compressed — not yet supported, see [CHANGELOG.md](CHANGELOG.md). |
+| Output size differs by 1px from an old golden image | Raster dims now use `ceil` (matches pdfium); re-bless goldens. |

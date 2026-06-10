@@ -65,7 +65,8 @@ fn render_page(doc: &PdfDocument, idx: usize, slot: &mut Option<GpuContext>) -> 
     let mut fonts = doc.load_page_fonts(&page);
     let content = doc.page_content_bytes(&page).ok()?;
     let mut images = ImageCache::new();
-    let dl = ContentInterpreter::new(page.media_box)
+    let dl = ContentInterpreter::new(page.effective_box())
+        .with_page_rotation(page.rotate)
         .with_fonts(&mut fonts)
         .with_document(doc.file(), &page.resources)
         .with_images(&mut images)
@@ -318,7 +319,17 @@ impl App {
         for i in 0..doc.page_count() {
             let (w, h) = doc
                 .page(i)
-                .map(|p| (p.width() as f32 * s, p.height() as f32 * s))
+                .map(|p| {
+                    // Tiles are rasterized at the effective (CropBox ∩ MediaBox)
+                    // size, so the layout must use the same rect.
+                    let eb = p.effective_box();
+                    let (pw, ph) = (eb.width() as f32 * s, eb.height() as f32 * s);
+                    // 90°/270° pages display with width and height swapped.
+                    match p.rotate.rem_euclid(360) {
+                        90 | 270 => (ph, pw),
+                        _ => (pw, ph),
+                    }
+                })
                 .unwrap_or((612.0 * s, 792.0 * s));
             layout.push(PageLayout { top: y, w, h });
             max_w = max_w.max(w);
@@ -466,17 +477,30 @@ impl App {
             let sy = (p.top - scroll) * zoom;
             let (sw, sh) = (p.w * zoom, p.h * zoom);
             verts.extend_from_slice(&[
-                Vertex { pos: ndc(sx, sy), uv: [0.0, 0.0] },
-                Vertex { pos: ndc(sx + sw, sy), uv: [1.0, 0.0] },
-                Vertex { pos: ndc(sx + sw, sy + sh), uv: [1.0, 1.0] },
-                Vertex { pos: ndc(sx, sy + sh), uv: [0.0, 1.0] },
+                Vertex {
+                    pos: ndc(sx, sy),
+                    uv: [0.0, 0.0],
+                },
+                Vertex {
+                    pos: ndc(sx + sw, sy),
+                    uv: [1.0, 0.0],
+                },
+                Vertex {
+                    pos: ndc(sx + sw, sy + sh),
+                    uv: [1.0, 1.0],
+                },
+                Vertex {
+                    pos: ndc(sx, sy + sh),
+                    uv: [0.0, 1.0],
+                },
             ]);
             draws.push(&tile.bind_group);
         }
 
         // Present.
         let frame = match gfx.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
+            wgpu::CurrentSurfaceTexture::Success(f)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 gfx.surface.configure(&gfx.device, &gfx.config);
                 self.request_redraw();
@@ -485,7 +509,8 @@ impl App {
             _ => return,
         };
         if !verts.is_empty() {
-            gfx.queue.write_buffer(&gfx.vbuf, 0, bytemuck::cast_slice(&verts));
+            gfx.queue
+                .write_buffer(&gfx.vbuf, 0, bytemuck::cast_slice(&verts));
         }
         let view = frame
             .texture
