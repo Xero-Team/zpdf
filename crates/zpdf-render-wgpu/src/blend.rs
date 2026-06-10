@@ -116,7 +116,10 @@ impl RenderLayer {
 
     /// Color attachment that always resolves and stores MSAA (so a later pass can
     /// Load it). `load` clears (first pass) or loads (resume) the layer.
-    pub fn color_attachment(&self, load: wgpu::LoadOp<wgpu::Color>) -> wgpu::RenderPassColorAttachment<'_> {
+    pub fn color_attachment(
+        &self,
+        load: wgpu::LoadOp<wgpu::Color>,
+    ) -> wgpu::RenderPassColorAttachment<'_> {
         wgpu::RenderPassColorAttachment {
             view: &self.color_view,
             depth_slice: None,
@@ -128,7 +131,10 @@ impl RenderLayer {
         }
     }
 
-    pub fn stencil_attachment(&self, load: wgpu::LoadOp<u32>) -> wgpu::RenderPassDepthStencilAttachment<'_> {
+    pub fn stencil_attachment(
+        &self,
+        load: wgpu::LoadOp<u32>,
+    ) -> wgpu::RenderPassDepthStencilAttachment<'_> {
         wgpu::RenderPassDepthStencilAttachment {
             view: &self.stencil_view,
             depth_ops: None,

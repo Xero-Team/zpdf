@@ -196,7 +196,9 @@ impl PageRecorder {
     }
 
     pub fn has_blend_groups(&self) -> bool {
-        self.ops.iter().any(|o| matches!(o, PageOp::PushBlend { .. }))
+        self.ops
+            .iter()
+            .any(|o| matches!(o, PageOp::PushBlend { .. }))
     }
 
     /// True if any `ResetStencil` op was recorded (i.e. clips were popped) and a
@@ -227,7 +229,9 @@ mod tests {
     fn map() -> PageMap {
         PageMap {
             scale: 1.0,
-            page_height: 100.0,
+            x0: 0.0,
+            y0: 0.0,
+            y1: 100.0,
         }
     }
 
@@ -248,7 +252,12 @@ mod tests {
         // push two clips, draw inside, pop both.
         r.push_clip(&rect(10.0, 10.0, 90.0, 90.0), FillRule::NonZero, &m);
         r.push_clip(&rect(20.0, 20.0, 80.0, 80.0), FillRule::NonZero, &m);
-        r.add_fill(&rect(0.0, 0.0, 100.0, 100.0), FillRule::NonZero, [1.0, 0.0, 0.0, 1.0], &m);
+        r.add_fill(
+            &rect(0.0, 0.0, 100.0, 100.0),
+            FillRule::NonZero,
+            [1.0, 0.0, 0.0, 1.0],
+            &m,
+        );
         r.pop_clip();
         r.pop_clip();
 
@@ -264,7 +273,11 @@ mod tests {
             })
             .collect();
         assert_eq!(draws, vec![2], "content draw tests stencil == depth 2");
-        let resets = r.ops.iter().filter(|o| matches!(o, PageOp::ResetStencil)).count();
+        let resets = r
+            .ops
+            .iter()
+            .filter(|o| matches!(o, PageOp::ResetStencil))
+            .count();
         assert_eq!(resets, 2, "each pop emits a reset");
         assert_eq!(r.clip_depth, 0, "depth balanced back to 0");
     }

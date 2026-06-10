@@ -1,3 +1,5 @@
+pub mod dash;
+
 use zpdf_core::Rect;
 use zpdf_display_list::{Color, DisplayList, RenderCommand};
 

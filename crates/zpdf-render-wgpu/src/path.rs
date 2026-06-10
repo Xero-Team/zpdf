@@ -26,19 +26,24 @@ pub fn fill_mesh(path: &DlPath, rule: FillRule, color: [f32; 4], map: &PageMap) 
     fill_lyon_path(&lyon_path, rule, color)
 }
 
-/// Tessellate a stroked display-list path. Returns `None` when the device-space
-/// width is <= 0 (tiny-skia produces no geometry there — skip, don't hairline-clamp).
+/// Tessellate a stroked display-list path. The device-space width is clamped to
+/// one device pixel (pdfium's hairline boost, mirrored by the CPU backend): PDF
+/// zero-width strokes are 1px hairlines, and sub-pixel widths stay legible.
 pub fn stroke_mesh(
     path: &DlPath,
     style: &StrokeStyle,
     color: [f32; 4],
     map: &PageMap,
 ) -> Option<Mesh> {
-    let width = style.width * map.scale;
-    if width <= 0.0 {
-        return None;
+    let width = (style.width * map.scale).max(1.0);
+    let mut lyon_path = build_lyon_path(path, map)?;
+    if let Some(dash) = &style.dash {
+        if !zpdf_render::dash::is_degenerate(&dash.array) {
+            // lyon has no dashing: flatten into solid sub-segments (each gets
+            // start/end caps from the stroke options, like a real dash).
+            lyon_path = dash_lyon_path(&lyon_path, &dash.array, dash.phase, map.scale)?;
+        }
     }
-    let lyon_path = build_lyon_path(path, map)?;
     let opts = StrokeOptions::tolerance(TOLERANCE)
         .with_line_width(width)
         .with_start_cap(map_cap(style.cap))
@@ -47,11 +52,62 @@ pub fn stroke_mesh(
         // lyon asserts miter_limit >= 1.0; PDF limits are >= 1 by spec, so this
         // only guards malformed files (documented oracle divergence).
         .with_miter_limit(style.miter_limit.max(1.0));
-    if style.dash.is_some() {
-        // CPU drops dashes; stroking solid keeps parity.
-        tracing::debug!("dash pattern ignored (parity with CPU)");
-    }
     stroke_lyon_path(&lyon_path, &opts, color)
+}
+
+/// Flatten a (device-pixel) lyon path into the "on" runs of a dash pattern and
+/// rebuild it as open polyline sub-paths. The dash array/phase are page-unit
+/// values, scaled into device pixels here. Returns `None` when no run survives
+/// (e.g. a short path entirely inside an "off" interval).
+fn dash_lyon_path(path: &LyonPath, array: &[f32], phase: f32, scale: f32) -> Option<LyonPath> {
+    use lyon::path::iterator::PathIterator;
+    use lyon::path::PathEvent;
+
+    let scaled: Vec<f32> = array.iter().map(|v| v * scale).collect();
+    let phase = phase * scale;
+
+    // Collect flattened polylines; closed sub-paths repeat their first point so
+    // the dash walks the closing edge too (the pattern restarts per sub-path).
+    let mut polylines: Vec<Vec<[f32; 2]>> = Vec::new();
+    let mut cur: Vec<[f32; 2]> = Vec::new();
+    for ev in path.iter().flattened(TOLERANCE) {
+        match ev {
+            PathEvent::Begin { at } => {
+                cur.clear();
+                cur.push([at.x, at.y]);
+            }
+            PathEvent::Line { to, .. } => cur.push([to.x, to.y]),
+            PathEvent::End { first, close, .. } => {
+                if close {
+                    cur.push([first.x, first.y]);
+                }
+                if cur.len() >= 2 {
+                    polylines.push(std::mem::take(&mut cur));
+                } else {
+                    cur.clear();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut b = LyonPath::builder();
+    let mut any = false;
+    for polyline in &polylines {
+        for run in zpdf_render::dash::dash_polyline(polyline, &scaled, phase) {
+            // Skip zero-length runs (dots): lyon emits no geometry for them.
+            if run.len() < 2 || run.iter().all(|p| *p == run[0]) {
+                continue;
+            }
+            b.begin(lyon::math::point(run[0][0], run[0][1]));
+            for p in &run[1..] {
+                b.line_to(lyon::math::point(p[0], p[1]));
+            }
+            b.end(false);
+            any = true;
+        }
+    }
+    any.then(|| b.build())
 }
 
 /// Tessellate an already-built lyon path as a fill. Shared by display-list fills,
@@ -63,9 +119,11 @@ pub fn fill_lyon_path(path: &LyonPath, rule: FillRule, color: [f32; 4]) -> Optio
     });
     let mut mesh = Mesh::new();
     let mut tess = FillTessellator::new();
-    if let Err(e) =
-        tess.tessellate_path(path, &opts, &mut BuffersBuilder::new(&mut mesh, SolidCtor { color }))
-    {
+    if let Err(e) = tess.tessellate_path(
+        path,
+        &opts,
+        &mut BuffersBuilder::new(&mut mesh, SolidCtor { color }),
+    ) {
         tracing::debug!("fill tessellation failed: {e:?}");
         return None;
     }
@@ -76,9 +134,11 @@ pub fn fill_lyon_path(path: &LyonPath, rule: FillRule, color: [f32; 4]) -> Optio
 pub fn stroke_lyon_path(path: &LyonPath, opts: &StrokeOptions, color: [f32; 4]) -> Option<Mesh> {
     let mut mesh = Mesh::new();
     let mut tess = StrokeTessellator::new();
-    if let Err(e) =
-        tess.tessellate_path(path, opts, &mut BuffersBuilder::new(&mut mesh, SolidCtor { color }))
-    {
+    if let Err(e) = tess.tessellate_path(
+        path,
+        opts,
+        &mut BuffersBuilder::new(&mut mesh, SolidCtor { color }),
+    ) {
         tracing::debug!("stroke tessellation failed: {e:?}");
         return None;
     }
@@ -182,7 +242,9 @@ mod tests {
     fn map() -> PageMap {
         PageMap {
             scale: 1.0,
-            page_height: 100.0,
+            x0: 0.0,
+            y0: 0.0,
+            y1: 100.0,
         }
     }
 
@@ -192,7 +254,9 @@ mod tests {
     }
 
     #[test]
-    fn zero_width_stroke_is_none() {
+    fn zero_width_stroke_renders_hairline() {
+        // PDF zero-width strokes are 1-device-pixel hairlines (pdfium semantics,
+        // mirrored by the CPU backend's 1px clamp) — geometry MUST be produced.
         let mut p = DlPath::new();
         p.move_to(Point::new(0.0, 0.0));
         p.line_to(Point::new(10.0, 10.0));
@@ -200,7 +264,88 @@ mod tests {
             width: 0.0,
             ..Default::default()
         };
-        assert!(stroke_mesh(&p, &style, [0.0; 4], &map()).is_none());
+        let mesh = stroke_mesh(&p, &style, [0.0; 4], &map()).expect("hairline geometry");
+        assert!(!mesh.indices.is_empty());
+        // The quad spans ~1px across the line: vertex extents reflect width 1.
+        let (min_x, max_x) = mesh
+            .vertices
+            .iter()
+            .fold((f32::MAX, f32::MIN), |(lo, hi), v| {
+                (lo.min(v.pos[0]), hi.max(v.pos[0]))
+            });
+        assert!(
+            max_x - min_x <= 12.0,
+            "hairline must not be wider than ~1px"
+        );
+    }
+
+    #[test]
+    fn dashed_stroke_splits_into_segments() {
+        // Horizontal line of length 20 with [4 on, 4 off]: three on-runs, so the
+        // mesh has vertices at the interior dash boundaries (x = 4 and x = 8).
+        let mut p = DlPath::new();
+        p.move_to(Point::new(0.0, 50.0));
+        p.line_to(Point::new(20.0, 50.0));
+        let style = StrokeStyle {
+            width: 2.0,
+            dash: Some(zpdf_display_list::DashPattern {
+                array: vec![4.0, 4.0],
+                phase: 0.0,
+            }),
+            ..Default::default()
+        };
+        let dashed = stroke_mesh(&p, &style, [0.0; 4], &map()).expect("dashed geometry");
+        let solid = stroke_mesh(
+            &p,
+            &StrokeStyle {
+                width: 2.0,
+                ..Default::default()
+            },
+            [0.0; 4],
+            &map(),
+        )
+        .expect("solid geometry");
+        assert!(
+            dashed.vertices.len() > solid.vertices.len(),
+            "dash runs add segment endpoints"
+        );
+        let has_x = |x: f32| dashed.vertices.iter().any(|v| (v.pos[0] - x).abs() < 0.01);
+        assert!(has_x(4.0) && has_x(8.0), "dash boundaries at x=4 and x=8");
+        // Gap interiors carry no geometry.
+        assert!(
+            !dashed
+                .vertices
+                .iter()
+                .any(|v| v.pos[0] > 4.01 && v.pos[0] < 7.99),
+            "no vertices inside the off interval"
+        );
+    }
+
+    #[test]
+    fn degenerate_dash_strokes_solid() {
+        let mut p = DlPath::new();
+        p.move_to(Point::new(0.0, 50.0));
+        p.line_to(Point::new(20.0, 50.0));
+        let style = StrokeStyle {
+            width: 2.0,
+            dash: Some(zpdf_display_list::DashPattern {
+                array: vec![0.0, 0.0],
+                phase: 0.0,
+            }),
+            ..Default::default()
+        };
+        let dashed = stroke_mesh(&p, &style, [0.0; 4], &map()).expect("solid geometry");
+        let solid = stroke_mesh(
+            &p,
+            &StrokeStyle {
+                width: 2.0,
+                ..Default::default()
+            },
+            [0.0; 4],
+            &map(),
+        )
+        .expect("solid geometry");
+        assert_eq!(dashed.vertices.len(), solid.vertices.len());
     }
 
     #[test]

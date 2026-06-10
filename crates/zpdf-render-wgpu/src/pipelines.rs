@@ -15,7 +15,8 @@ pub struct Pipelines {
     pub page_bgl: wgpu::BindGroupLayout,
     /// Bind group 1 (textured pipeline): image texture + sampler.
     pub tex_bgl: wgpu::BindGroupLayout,
-    /// Shared Nearest / ClampToEdge sampler (matches tiny-skia's default).
+    /// Shared bilinear / ClampToEdge sampler (matches the CPU backend's
+    /// `FilterQuality::Bilinear` image sampling).
     pub sampler: wgpu::Sampler,
     /// Solid fill / stroke / Type3 pipeline.
     pub solid_fill: wgpu::RenderPipeline,
@@ -122,22 +123,21 @@ impl Pipelines {
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             address_mode_w: wgpu::AddressMode::ClampToEdge,
-            // tiny-skia's PixmapPaint default is Nearest.
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
+            // Bilinear filtering, matching the CPU backend's
+            // `FilterQuality::Bilinear` image sampling (pdfium-quality scaling).
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
             mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
         });
 
-        let tex_shader =
-            device.create_shader_module(wgpu::include_wgsl!("shaders/textured.wgsl"));
+        let tex_shader = device.create_shader_module(wgpu::include_wgsl!("shaders/textured.wgsl"));
         let tex_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("zpdf-textured-layout"),
             bind_group_layouts: &[Some(&page_bgl), Some(&tex_bgl)],
             immediate_size: 0,
         });
-        let tex_attrs =
-            wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x4];
+        let tex_attrs = wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x4];
         let tex_vbl = wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<TexturedVertex>() as u64,
             step_mode: wgpu::VertexStepMode::Vertex,

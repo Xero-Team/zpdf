@@ -123,11 +123,12 @@ impl<'a> RenderBackend for WgpuRenderer<'a> {
         let ctx = self.ctx.as_ref().unwrap();
 
         let scale = info.scale;
-        // Truncating cast in f64, exactly like the CPU's `(width() * scale as f64) as u32`
-        // (computing in f32 would round differently at the integer boundary — e.g.
-        // 612 * 2.0833 gives 1274 in f64 but 1275 in f32).
-        let width = ((info.page_rect.width() * scale as f64) as u32).max(1);
-        let height = ((info.page_rect.height() * scale as f64) as u32).max(1);
+        // ceil() in f64, exactly like the CPU's `(width() * scale as f64).ceil()`
+        // (pdfium semantics: a 595x842pt page at 110 DPI is a 910x1287 raster, so
+        // no content is sliced off the right/bottom edges; f32 math would round
+        // differently at integer boundaries).
+        let width = ((info.page_rect.width() * scale as f64).ceil() as u32).max(1);
+        let height = ((info.page_rect.height() * scale as f64).ceil() as u32).max(1);
         if width > ctx.max_texture_dim || height > ctx.max_texture_dim {
             return Err(WgpuRenderError::Unsupported(format!(
                 "page {width}x{height} exceeds adapter max texture dim {}",
@@ -148,13 +149,12 @@ impl<'a> RenderBackend for WgpuRenderer<'a> {
             a: q(bg.a),
         };
 
-        let page_height = info.page_rect.height() as f32;
-        let map = PageMap { scale, page_height };
+        let map = PageMap::new(info.page_rect, scale);
         let uniform = PageUniform {
             w_px: width as f32,
             h_px: height as f32,
             scale,
-            page_height,
+            page_height: info.page_rect.height() as f32,
         };
 
         self.page = Some(PageState {
@@ -198,13 +198,7 @@ impl<'a> RenderBackend for WgpuRenderer<'a> {
             }
             RenderCommand::DrawGlyphRun(run) => {
                 if let Some(fonts) = self.font_cache {
-                    glyph::render_glyph_run(
-                        &mut page.recorder,
-                        fonts,
-                        page.map.scale,
-                        page.map.page_height,
-                        run,
-                    );
+                    glyph::render_glyph_run(&mut page.recorder, fonts, &page.map, run);
                 }
             }
             RenderCommand::DrawImage(draw) => {
@@ -214,8 +208,7 @@ impl<'a> RenderBackend for WgpuRenderer<'a> {
                             img.width as f32,
                             img.height as f32,
                             &draw.transform,
-                            page.map.scale,
-                            page.map.page_height,
+                            &page.map,
                             draw.alpha,
                         );
                         page.recorder.add_image(quad, draw.image_id);
@@ -491,7 +484,12 @@ fn init_layer(
     clips: &[record::ClipStamp],
     res: &ReplayRes,
 ) {
-    let mut pass = begin_layer_pass(encoder, layer, wgpu::LoadOp::Clear(clear), wgpu::LoadOp::Clear(0));
+    let mut pass = begin_layer_pass(
+        encoder,
+        layer,
+        wgpu::LoadOp::Clear(clear),
+        wgpu::LoadOp::Clear(0),
+    );
     pass.set_bind_group(0, Some(res.bind_group), &[]);
     stamp_clips(&mut pass, clips, res);
 }
@@ -539,8 +537,12 @@ fn render_layered(
         }
         if start < i {
             let cur = *active.last().unwrap();
-            let mut pass =
-                begin_layer_pass(&mut encoder, &layers[cur], wgpu::LoadOp::Load, wgpu::LoadOp::Load);
+            let mut pass = begin_layer_pass(
+                &mut encoder,
+                &layers[cur],
+                wgpu::LoadOp::Load,
+                wgpu::LoadOp::Load,
+            );
             replay_ops(&mut pass, &ops[start..i], res);
             drop(pass);
         }
@@ -551,13 +553,21 @@ fn render_layered(
             PageOp::PushBlend { mode, clips } => {
                 let g = layers.len();
                 layers.push(blend::RenderLayer::new(device, w, h, sc));
-                init_layer(&mut encoder, &layers[g], wgpu::Color::TRANSPARENT, clips, res);
+                init_layer(
+                    &mut encoder,
+                    &layers[g],
+                    wgpu::Color::TRANSPARENT,
+                    clips,
+                    res,
+                );
                 active.push(g);
                 blend_info.push((*mode, clips.clone()));
             }
             PageOp::PopBlend => {
                 let group = active.pop().unwrap_or(0);
-                let (mode, clips) = blend_info.pop().unwrap_or((zpdf_display_list::BlendMode::Normal, Vec::new()));
+                let (mode, clips) = blend_info
+                    .pop()
+                    .unwrap_or((zpdf_display_list::BlendMode::Normal, Vec::new()));
                 let parent = *active.last().unwrap_or(&0);
                 let scratch = layers.len();
                 layers.push(blend::RenderLayer::new(device, w, h, sc));
@@ -574,11 +584,15 @@ fn render_layered(
                     entries: &[
                         wgpu::BindGroupEntry {
                             binding: 0,
-                            resource: wgpu::BindingResource::TextureView(layers[parent].sampleable_view()),
+                            resource: wgpu::BindingResource::TextureView(
+                                layers[parent].sampleable_view(),
+                            ),
                         },
                         wgpu::BindGroupEntry {
                             binding: 1,
-                            resource: wgpu::BindingResource::TextureView(layers[group].sampleable_view()),
+                            resource: wgpu::BindingResource::TextureView(
+                                layers[group].sampleable_view(),
+                            ),
                         },
                         wgpu::BindGroupEntry {
                             binding: 2,

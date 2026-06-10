@@ -6,7 +6,11 @@ use zpdf_render::{PageRenderInfo, RenderBackend};
 pub struct CpuRenderer<'a> {
     pixmap: Option<tiny_skia::Pixmap>,
     scale: f32,
-    page_height: f32,
+    /// Page rect bounds (supports CropBox / nonzero MediaBox origins):
+    /// device x = (x - rect_x0) * scale, device y = (rect_y1 - y) * scale.
+    rect_x0: f32,
+    rect_y0: f32,
+    rect_y1: f32,
     font_cache: Option<&'a FontCache>,
     image_cache: Option<&'a ImageCache>,
     clip_stack: Vec<tiny_skia::Mask>,
@@ -34,7 +38,9 @@ impl<'a> CpuRenderer<'a> {
         Self {
             pixmap: None,
             scale: 1.0,
-            page_height: 0.0,
+            rect_x0: 0.0,
+            rect_y0: 0.0,
+            rect_y1: 0.0,
             font_cache: None,
             image_cache: None,
             clip_stack: Vec::new(),
@@ -53,13 +59,14 @@ impl<'a> CpuRenderer<'a> {
         self
     }
 
-    /// Convert PDF Y coordinate (origin bottom-left) to pixel Y (origin top-left).
+    /// Convert PDF Y coordinate (origin bottom-left) to pixel Y (origin top-left),
+    /// relative to the page rect's top edge.
     fn flip_y(&self, y: f32) -> f32 {
-        (self.page_height - y) * self.scale
+        (self.rect_y1 - y) * self.scale
     }
 
     fn to_pixel_x(&self, x: f32) -> f32 {
-        x * self.scale
+        (x - self.rect_x0) * self.scale
     }
 
     fn build_skia_path(&self, path: &Path) -> Option<tiny_skia::Path> {
@@ -138,7 +145,10 @@ impl<'a> CpuRenderer<'a> {
             _ => return,
         };
         let stroke = tiny_skia::Stroke {
-            width: style.width * self.scale,
+            // Hairline boost: never let a stroke fall below one device pixel
+            // (matches pdfium; keeps thin diagram strokes legible at low DPI,
+            // and renders PDF zero-width strokes as 1px hairlines).
+            width: (style.width * self.scale).max(1.0),
             line_cap: match style.cap {
                 LineCap::Butt => tiny_skia::LineCap::Butt,
                 LineCap::Round => tiny_skia::LineCap::Round,
@@ -150,7 +160,7 @@ impl<'a> CpuRenderer<'a> {
                 LineJoin::Bevel => tiny_skia::LineJoin::Bevel,
             },
             miter_limit: style.miter_limit,
-            ..Default::default()
+            dash: self.build_stroke_dash(style),
         };
         if let Some(ref mut pixmap) = self.pixmap {
             pixmap.stroke_path(
@@ -161,6 +171,23 @@ impl<'a> CpuRenderer<'a> {
                 self.current_clip.as_ref(),
             );
         }
+    }
+
+    /// Build a device-space tiny-skia dash from the stroke style. Degenerate
+    /// patterns (empty/all-zero/negative entries) return `None` → solid stroke.
+    /// PDF allows odd-length dash arrays (the pattern repeats, so `[3]` means
+    /// 3 on / 3 off); tiny-skia requires an even count, so odd arrays are doubled.
+    fn build_stroke_dash(&self, style: &StrokeStyle) -> Option<tiny_skia::StrokeDash> {
+        let dash = style.dash.as_ref()?;
+        if zpdf_render::dash::is_degenerate(&dash.array) {
+            return None;
+        }
+        let mut array: Vec<f32> = dash.array.iter().map(|v| v * self.scale).collect();
+        if array.len() % 2 == 1 {
+            let doubled = array.clone();
+            array.extend(doubled);
+        }
+        tiny_skia::StrokeDash::new(array, dash.phase * self.scale)
     }
 
     fn render_glyph_run(&mut self, run: &GlyphRun) {
@@ -204,7 +231,7 @@ impl<'a> CpuRenderer<'a> {
         mask.fill_path(
             &skia_path,
             Self::fill_rule_to_skia(rule),
-            false,
+            true, // anti-alias clip edges (fills/strokes are AA'd too)
             tiny_skia::Transform::identity(),
         );
 
@@ -322,11 +349,6 @@ impl<'a> CpuRenderer<'a> {
             None => return,
         };
 
-        let src = match tiny_skia::PixmapRef::from_bytes(&image.data, image.width, image.height) {
-            Some(p) => p,
-            None => return,
-        };
-
         // PDF images occupy the unit square [0,1]×[0,1] in user space, mapped by
         // the CTM. Image sample space has its origin at the TOP-left with y
         // pointing DOWN (PDF spec §8.9.5.2), so sample row 0 maps to the top
@@ -339,17 +361,14 @@ impl<'a> CpuRenderer<'a> {
         //   ux = ix/iw,  uy = 1 - iy/ih              (sample → unit square)
         //   px = a*ux + c*uy + e                     (unit square → user space)
         //   py = b*ux + d*uy + f
-        //   screen_x = px * s                        (user space → screen px)
-        //   screen_y = (ph - py) * s                 (fixed page flip)
+        //   screen_x = (px - x0) * s                 (user space → screen px)
+        //   screen_y = (y1 - py) * s                 (fixed page flip)
         //
         // Composed into a single affine in image-pixel coordinates:
-        //   screen_x = (a*s/iw)*ix + (-c*s/ih)*iy + (c + e)*s
-        //   screen_y = (-b*s/iw)*ix + (d*s/ih)*iy + (ph - d - f)*s
+        //   screen_x = (a*s/iw)*ix + (-c*s/ih)*iy + (c + e - x0)*s
+        //   screen_y = (-b*s/iw)*ix + (d*s/ih)*iy + (y1 - d - f)*s
         let tm = &draw.transform;
         let s = self.scale;
-        let ph = self.page_height;
-        let iw = image.width as f32;
-        let ih = image.height as f32;
         let (a, b, c, d, e, f) = (
             tm.a as f32,
             tm.b as f32,
@@ -359,19 +378,52 @@ impl<'a> CpuRenderer<'a> {
             tm.f as f32,
         );
 
+        // Device-space footprint of the unit square's axes: how many device
+        // pixels one image axis spans (column lengths of the scaled CTM).
+        let dev_w = (a * a + b * b).sqrt() * s;
+        let dev_h = (c * c + d * d).sqrt() * s;
+        let fx = dev_w / image.width as f32;
+        let fy = dev_h / image.height as f32;
+
+        // Below ~0.5x per axis, bilinear sampling starts skipping source pixels
+        // entirely (thin strokes in downscaled scans break up). Pre-downscale
+        // with a box filter (plain average) to the target device scale first.
+        let mut downscaled: Option<(Vec<u8>, u32, u32)> = None;
+        if fx < 0.5 || fy < 0.5 {
+            let tw = ((image.width as f32 * fx.min(1.0)).ceil() as u32).clamp(1, image.width);
+            let th = ((image.height as f32 * fy.min(1.0)).ceil() as u32).clamp(1, image.height);
+            if tw < image.width || th < image.height {
+                let data = box_downscale_rgba(&image.data, image.width, image.height, tw, th);
+                downscaled = Some((data, tw, th));
+            }
+        }
+        let (data, w, h) = match &downscaled {
+            Some((data, w, h)) => (data.as_slice(), *w, *h),
+            None => (image.data.as_slice(), image.width, image.height),
+        };
+        let src = match tiny_skia::PixmapRef::from_bytes(data, w, h) {
+            Some(p) => p,
+            None => return,
+        };
+        let iw = w as f32;
+        let ih = h as f32;
+
         // tiny-skia `Transform::from_row(sx, ky, kx, sy, tx, ty)` maps
         // (x,y) → (sx*x + kx*y + tx, ky*x + sy*y + ty).
         let transform = tiny_skia::Transform::from_row(
-            a * s / iw,        // sx: screen_x per ix
-            -b * s / iw,       // ky: screen_y per ix
-            -c * s / ih,       // kx: screen_x per iy
-            d * s / ih,        // sy: screen_y per iy
-            (c + e) * s,       // tx
-            (ph - d - f) * s,  // ty
+            a * s / iw,                 // sx: screen_x per ix
+            -b * s / iw,                // ky: screen_y per ix
+            -c * s / ih,                // kx: screen_x per iy
+            d * s / ih,                 // sy: screen_y per iy
+            (c + e - self.rect_x0) * s, // tx
+            (self.rect_y1 - d - f) * s, // ty
         );
 
         let paint = tiny_skia::PixmapPaint {
             opacity: draw.alpha,
+            // Bilinear sampling (matches pdfium); nearest leaves blocky upscales
+            // and aliased downscales.
+            quality: tiny_skia::FilterQuality::Bilinear,
             ..Default::default()
         };
 
@@ -471,11 +523,11 @@ impl<'a> CpuRenderer<'a> {
 
         // page space → pixel space
         let ctm_flips_y = tm.d < 0.0 || (tm.d == 0.0 && tm.b != 0.0);
-        let px = page_x as f32 * self.scale;
+        let px = (page_x as f32 - self.rect_x0) * self.scale;
         let py = if ctm_flips_y {
-            page_y as f32 * self.scale
+            (page_y as f32 - self.rect_y0) * self.scale
         } else {
-            (self.page_height - page_y as f32) * self.scale
+            (self.rect_y1 - page_y as f32) * self.scale
         };
         (px, py)
     }
@@ -639,13 +691,13 @@ impl<'a> CpuRenderer<'a> {
         // in top-down order. We detect this by checking if CTM has negative Y scale.
         let ctm_flips_y = tm.d < 0.0 || (tm.d == 0.0 && tm.b != 0.0);
 
-        let px = page_x as f32 * self.scale;
+        let px = (page_x as f32 - self.rect_x0) * self.scale;
         let py = if ctm_flips_y {
             // CTM already flipped Y into screen coordinates
-            page_y as f32 * self.scale
+            (page_y as f32 - self.rect_y0) * self.scale
         } else {
             // Standard PDF coords: flip Y
-            (self.page_height - page_y as f32) * self.scale
+            (self.rect_y1 - page_y as f32) * self.scale
         };
 
         (px, py)
@@ -656,6 +708,41 @@ impl<'a> Default for CpuRenderer<'a> {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Box-filter (area-average) downscale of a tight RGBA8 buffer. Each target
+/// pixel averages its covering source block, so no source pixel is dropped —
+/// unlike point/bilinear sampling at strong minification. Channels are averaged
+/// independently, which is correct for the premultiplied data tiny-skia consumes.
+fn box_downscale_rgba(data: &[u8], sw: u32, sh: u32, tw: u32, th: u32) -> Vec<u8> {
+    debug_assert!(tw >= 1 && th >= 1 && tw <= sw && th <= sh);
+    let mut out = vec![0u8; tw as usize * th as usize * 4];
+    let (sw64, sh64, tw64, th64) = (sw as u64, sh as u64, tw as u64, th as u64);
+    for ty in 0..th as u64 {
+        let y0 = (ty * sh64 / th64) as u32;
+        let y1 = (((ty + 1) * sh64).div_ceil(th64) as u32).clamp(y0 + 1, sh);
+        for tx in 0..tw as u64 {
+            let x0 = (tx * sw64 / tw64) as u32;
+            let x1 = (((tx + 1) * sw64).div_ceil(tw64) as u32).clamp(x0 + 1, sw);
+            let mut acc = [0u64; 4];
+            for sy in y0..y1 {
+                let row = (sy as usize * sw as usize + x0 as usize) * 4;
+                for sx in 0..(x1 - x0) as usize {
+                    let px = row + sx * 4;
+                    acc[0] += data[px] as u64;
+                    acc[1] += data[px + 1] as u64;
+                    acc[2] += data[px + 2] as u64;
+                    acc[3] += data[px + 3] as u64;
+                }
+            }
+            let n = ((x1 - x0) as u64) * ((y1 - y0) as u64);
+            let o = (ty as usize * tw as usize + tx as usize) * 4;
+            for ch in 0..4 {
+                out[o + ch] = ((acc[ch] + n / 2) / n) as u8;
+            }
+        }
+    }
+    out
 }
 
 /// RGBA pixel buffer output.
@@ -680,10 +767,15 @@ impl<'a> RenderBackend for CpuRenderer<'a> {
 
     fn begin_page(&mut self, info: &PageRenderInfo) -> Result<(), Self::Error> {
         self.scale = info.scale;
-        self.page_height = info.page_rect.height() as f32;
+        self.rect_x0 = info.page_rect.x0 as f32;
+        self.rect_y0 = info.page_rect.y0 as f32;
+        self.rect_y1 = info.page_rect.y1 as f32;
 
-        let w = (info.page_rect.width() * info.scale as f64) as u32;
-        let h = (info.page_rect.height() * info.scale as f64) as u32;
+        // ceil(), not truncation: a 595x842pt page at 110 DPI is 909.03x1286.6px
+        // and must produce a 910x1287 raster (pdfium semantics) so no content is
+        // sliced off the right/bottom edges.
+        let w = ((info.page_rect.width() * info.scale as f64).ceil() as u32).max(1);
+        let h = ((info.page_rect.height() * info.scale as f64).ceil() as u32).max(1);
 
         let mut pixmap = tiny_skia::Pixmap::new(w, h).ok_or(CpuRenderError::PixmapCreation)?;
 
@@ -743,5 +835,273 @@ impl<'a> RenderBackend for CpuRenderer<'a> {
             height: pixmap.height(),
             data: pixmap.data().to_vec(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zpdf_core::{Matrix, Point, Rect};
+    use zpdf_image::DecodedImage;
+
+    fn px(page: &RenderedPage, x: u32, y: u32) -> [u8; 4] {
+        let i = ((y * page.width + x) * 4) as usize;
+        [
+            page.data[i],
+            page.data[i + 1],
+            page.data[i + 2],
+            page.data[i + 3],
+        ]
+    }
+
+    fn line_path(x0: f64, y0: f64, x1: f64, y1: f64) -> Path {
+        let mut p = Path::new();
+        p.move_to(Point::new(x0, y0));
+        p.line_to(Point::new(x1, y1));
+        p
+    }
+
+    fn stroke_cmd(path: Path, style: StrokeStyle) -> RenderCommand {
+        RenderCommand::StrokePath {
+            path,
+            style,
+            paint: Paint::Solid(Color::rgb(0.0, 0.0, 0.0)),
+            alpha: 1.0,
+        }
+    }
+
+    fn render(dl: &DisplayList, scale: f32) -> RenderedPage {
+        CpuRenderer::new()
+            .render_display_list(dl, scale)
+            .expect("render")
+    }
+
+    #[test]
+    fn hairline_stroke_clamps_to_one_device_pixel() {
+        // 0.05pt stroke at scale 1 → clamped to 1px. Centered at device y=10.5,
+        // it covers row 10 fully; without the clamp the row stays ~95% white.
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 20.0, 20.0));
+        let style = StrokeStyle {
+            width: 0.05,
+            ..Default::default()
+        };
+        dl.push(stroke_cmd(line_path(2.0, 9.5, 18.0, 9.5), style));
+        let page = render(&dl, 1.0);
+        let p = px(&page, 10, 10);
+        assert!(p[0] < 60, "hairline row should be dark, got {p:?}");
+    }
+
+    #[test]
+    fn dash_pattern_produces_gaps() {
+        // [4 on, 4 off] along y=9.5 (device row 10): on [0,4), [8,12), [16,20).
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 20.0, 20.0));
+        let style = StrokeStyle {
+            width: 2.0,
+            dash: Some(DashPattern {
+                array: vec![4.0, 4.0],
+                phase: 0.0,
+            }),
+            ..Default::default()
+        };
+        dl.push(stroke_cmd(line_path(0.0, 9.5, 20.0, 9.5), style));
+        let page = render(&dl, 1.0);
+        let on = px(&page, 2, 10);
+        let off = px(&page, 6, 10);
+        assert!(on[0] < 60, "dash 'on' segment should be dark, got {on:?}");
+        assert!(
+            off[0] > 200,
+            "dash 'off' gap should stay white, got {off:?}"
+        );
+    }
+
+    #[test]
+    fn odd_dash_array_repeats_like_doubled() {
+        // PDF [4] == 4 on / 4 off (tiny-skia needs the doubled even array).
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 20.0, 20.0));
+        let style = StrokeStyle {
+            width: 2.0,
+            dash: Some(DashPattern {
+                array: vec![4.0],
+                phase: 0.0,
+            }),
+            ..Default::default()
+        };
+        dl.push(stroke_cmd(line_path(0.0, 9.5, 20.0, 9.5), style));
+        let page = render(&dl, 1.0);
+        assert!(px(&page, 2, 10)[0] < 60);
+        assert!(px(&page, 6, 10)[0] > 200);
+    }
+
+    #[test]
+    fn degenerate_dash_strokes_solid() {
+        // All-zero array is invalid → solid stroke, no gaps.
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 20.0, 20.0));
+        let style = StrokeStyle {
+            width: 2.0,
+            dash: Some(DashPattern {
+                array: vec![0.0, 0.0],
+                phase: 0.0,
+            }),
+            ..Default::default()
+        };
+        dl.push(stroke_cmd(line_path(0.0, 9.5, 20.0, 9.5), style));
+        let page = render(&dl, 1.0);
+        assert!(px(&page, 6, 10)[0] < 60, "degenerate dash must draw solid");
+    }
+
+    #[test]
+    fn raster_dims_use_ceil() {
+        // 595x842pt (A4) at 110 DPI: 909.03x1286.6 → 910x1287 (pdfium parity).
+        let dl = DisplayList::new(Rect::new(0.0, 0.0, 595.0, 842.0));
+        let page = render(&dl, 110.0 / 72.0);
+        assert_eq!((page.width, page.height), (910, 1287));
+
+        // Exact integer sizes are unchanged by ceil().
+        let dl = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 50.0));
+        let page = render(&dl, 2.0);
+        assert_eq!((page.width, page.height), (200, 100));
+    }
+
+    #[test]
+    fn page_rect_origin_offsets_geometry() {
+        // CropBox-style rect (100,50)-(120,70): raster is 20x20 and content is
+        // positioned relative to the rect origin.
+        let mut dl = DisplayList::new(Rect::new(100.0, 50.0, 120.0, 70.0));
+        let mut path = Path::new();
+        path.rect(Rect::new(105.0, 55.0, 115.0, 65.0));
+        dl.push(RenderCommand::FillPath {
+            path,
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(1.0, 0.0, 0.0)),
+            alpha: 1.0,
+        });
+        let page = render(&dl, 1.0);
+        assert_eq!((page.width, page.height), (20, 20));
+        let center = px(&page, 10, 10);
+        assert!(
+            center[0] > 200 && center[1] < 60,
+            "center red, got {center:?}"
+        );
+        let corner = px(&page, 2, 2);
+        assert!(
+            corner[0] > 200 && corner[1] > 200,
+            "corner white, got {corner:?}"
+        );
+    }
+
+    #[test]
+    fn clip_mask_is_antialiased() {
+        // Clip to the lower-left triangle, fill black: the diagonal edge passes
+        // through pixel (10,10) at 50% coverage — AA must leave it mid-gray.
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 20.0, 20.0));
+        let mut tri = Path::new();
+        tri.move_to(Point::new(0.0, 0.0));
+        tri.line_to(Point::new(20.0, 0.0));
+        tri.line_to(Point::new(0.0, 20.0));
+        tri.close();
+        dl.push(RenderCommand::PushClip {
+            path: tri,
+            rule: FillRule::NonZero,
+        });
+        let mut full = Path::new();
+        full.rect(Rect::new(0.0, 0.0, 20.0, 20.0));
+        dl.push(RenderCommand::FillPath {
+            path: full,
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(0.0, 0.0, 0.0)),
+            alpha: 1.0,
+        });
+        dl.push(RenderCommand::PopClip);
+        let page = render(&dl, 1.0);
+        let edge = px(&page, 10, 10);
+        assert!(
+            edge[0] > 30 && edge[0] < 225,
+            "clip edge should be AA gray, got {edge:?}"
+        );
+    }
+
+    #[test]
+    fn image_upscale_is_bilinear() {
+        // 2x2 black/white checker scaled to 20x20: bilinear leaves the center
+        // mid-gray; nearest would snap to pure black/white.
+        let mut images = ImageCache::new();
+        #[rustfmt::skip]
+        let data = vec![
+            0, 0, 0, 255,        255, 255, 255, 255,
+            255, 255, 255, 255,  0, 0, 0, 255,
+        ];
+        let id = images.insert(DecodedImage {
+            width: 2,
+            height: 2,
+            data,
+            has_alpha: false,
+            premultiplied: true,
+        });
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 20.0, 20.0));
+        dl.push(RenderCommand::DrawImage(ImageDraw {
+            image_id: id,
+            transform: Matrix::new(20.0, 0.0, 0.0, 20.0, 0.0, 0.0),
+            alpha: 1.0,
+        }));
+        let page = CpuRenderer::new()
+            .with_images(&images)
+            .render_display_list(&dl, 1.0)
+            .expect("render");
+        let center = px(&page, 10, 10);
+        assert!(
+            center[0] > 60 && center[0] < 200,
+            "center should interpolate to gray, got {center:?}"
+        );
+    }
+
+    #[test]
+    fn strong_minification_box_filters() {
+        // 16x16 image of alternating 1px black/white columns drawn into 4x4
+        // device pixels (0.25x): the box pre-downscale averages every column to
+        // ~50% gray; nearest/bilinear at that ratio would skip columns entirely.
+        let mut images = ImageCache::new();
+        let mut data = Vec::with_capacity(16 * 16 * 4);
+        for _y in 0..16 {
+            for x in 0..16u32 {
+                let v = if x % 2 == 0 { 0u8 } else { 255u8 };
+                data.extend_from_slice(&[v, v, v, 255]);
+            }
+        }
+        let id = images.insert(DecodedImage {
+            width: 16,
+            height: 16,
+            data,
+            has_alpha: false,
+            premultiplied: true,
+        });
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 8.0, 8.0));
+        dl.push(RenderCommand::DrawImage(ImageDraw {
+            image_id: id,
+            transform: Matrix::new(4.0, 0.0, 0.0, 4.0, 2.0, 2.0),
+            alpha: 1.0,
+        }));
+        let page = CpuRenderer::new()
+            .with_images(&images)
+            .render_display_list(&dl, 1.0)
+            .expect("render");
+        let inside = px(&page, 4, 4);
+        assert!(
+            inside[0] > 60 && inside[0] < 200,
+            "minified stripes should average to gray, got {inside:?}"
+        );
+    }
+
+    #[test]
+    fn box_downscale_averages_blocks() {
+        // 4x2 → 2x1: each output pixel averages a 2x2 block.
+        let data = vec![
+            0, 0, 0, 255, 255, 255, 255, 255, 100, 100, 100, 255, 200, 200, 200, 255, //
+            0, 0, 0, 255, 255, 255, 255, 255, 100, 100, 100, 255, 200, 200, 200, 255,
+        ];
+        let out = box_downscale_rgba(&data, 4, 2, 2, 1);
+        assert_eq!(out.len(), 8);
+        assert_eq!(out[0], 128); // round((0+255+0+255)/4)
+        assert_eq!(out[4], 150); // (100+200+100+200)/4
+        assert_eq!(out[3], 255);
     }
 }

@@ -2,11 +2,12 @@
 //!
 //! The page->NDC mapping is the correctness keystone. The CPU oracle maps a PDF
 //! page-unit point `(x, y)` (origin bottom-left, +Y up) to a device pixel
-//! (origin top-left, +Y down) as:
+//! (origin top-left, +Y down), relative to the page rect (CropBox / nonzero
+//! MediaBox origins shift it), as:
 //!
 //! ```text
-//! px = x * scale
-//! py = (page_height - y) * scale       scale = dpi / 72
+//! px = (x - rect.x0) * scale
+//! py = (rect.y1 - y) * scale           scale = dpi / 72
 //! ```
 //!
 //! Fills/strokes are tessellated in **device-pixel space** (baking `scale` +
@@ -47,19 +48,33 @@ pub struct TexturedVertex {
 
 /// Host-side page-units -> device-pixel mapping, identical to the CPU oracle's
 /// `to_pixel_x` / `flip_y`. The CTM is already baked into display-list path
-/// coordinates by the interpreter, so this is just scale + Y flip.
+/// coordinates by the interpreter, so this is origin shift + scale + Y flip.
 #[derive(Copy, Clone)]
 pub struct PageMap {
     pub scale: f32,
-    pub page_height: f32,
+    /// Page rect bounds (f32, matching the CPU's stored fields): the left edge,
+    /// bottom edge, and top edge of the rendered page rect in page units.
+    pub x0: f32,
+    pub y0: f32,
+    pub y1: f32,
 }
 
 impl PageMap {
+    pub fn new(rect: zpdf_core::Rect, scale: f32) -> Self {
+        Self {
+            scale,
+            x0: rect.x0 as f32,
+            y0: rect.y0 as f32,
+            y1: rect.y1 as f32,
+        }
+    }
+
     /// Map a page-space point to a device-pixel lyon point. Casts the f64 page
-    /// coordinate to f32 *before* scaling, exactly as `build_skia_path` does.
+    /// coordinate to f32 *before* the origin shift + scale, exactly as
+    /// `build_skia_path` does.
     pub fn pt(&self, p: Point) -> lyon::math::Point {
-        let x = (p.x as f32) * self.scale;
-        let y = (self.page_height - p.y as f32) * self.scale;
+        let x = (p.x as f32 - self.x0) * self.scale;
+        let y = (self.y1 - p.y as f32) * self.scale;
         lyon::math::point(x, y)
     }
 }
@@ -107,11 +122,23 @@ mod tests {
     fn page_map_flips_y_like_cpu() {
         let m = PageMap {
             scale: 2.0,
-            page_height: 100.0,
+            x0: 0.0,
+            y0: 0.0,
+            y1: 100.0,
         };
         // (10, 80) page -> (20, (100-80)*2 = 40) device pixels.
         let p = m.pt(Point::new(10.0, 80.0));
         assert_eq!(p.x, 20.0);
         assert_eq!(p.y, 40.0);
+    }
+
+    #[test]
+    fn page_map_honors_nonzero_origin() {
+        // CropBox-style rect (100,50)-(120,70).
+        let m = PageMap::new(zpdf_core::Rect::new(100.0, 50.0, 120.0, 70.0), 2.0);
+        // (105, 55) page -> ((105-100)*2, (70-55)*2) = (10, 30) device pixels.
+        let p = m.pt(Point::new(105.0, 55.0));
+        assert_eq!(p.x, 10.0);
+        assert_eq!(p.y, 30.0);
     }
 }

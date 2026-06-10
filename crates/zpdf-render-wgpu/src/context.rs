@@ -113,7 +113,10 @@ impl GpuContext {
             1
         };
         if sample_count < 4 {
-            tracing::warn!(sample_count, "MSAA-x4 unavailable on this adapter (worse AA)");
+            tracing::warn!(
+                sample_count,
+                "MSAA-x4 unavailable on this adapter (worse AA)"
+            );
         }
 
         tracing::debug!(
