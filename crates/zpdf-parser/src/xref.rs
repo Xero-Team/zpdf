@@ -71,16 +71,51 @@ pub fn parse_xref_and_trailer(data: &[u8], limits: &ParseLimits) -> Result<(Xref
     // each other) terminates instead of looping forever.
     let mut visited = std::collections::HashSet::new();
     visited.insert(xref_offset);
+    // Hybrid-reference file: parse the trailer's /XRefStm BEFORE following
+    // /Prev, so first-wins insertion yields main table > XRefStm > /Prev.
+    parse_hybrid_xrefstm(data, &trailer, &mut table, limits, &mut visited);
     let mut prev = next_prev;
     while let Some(prev_offset) = prev {
         if !visited.insert(prev_offset as usize) {
             break;
         }
-        let (_, next) = parse_xref_section(data, prev_offset as usize, &mut table, limits)?;
+        let (section_trailer, next) =
+            parse_xref_section(data, prev_offset as usize, &mut table, limits)?;
+        parse_hybrid_xrefstm(data, &section_trailer, &mut table, limits, &mut visited);
         prev = next;
     }
 
     Ok((table, trailer))
+}
+
+/// Hybrid-reference files (ISO 32000-1, 7.5.8.4): a traditional trailer may
+/// carry `/XRefStm`, the byte offset of a cross-reference *stream* holding the
+/// entries (typically the compressed-object ones) that pre-1.5 readers ignore.
+/// The stream is parsed after the section that referenced it but before that
+/// section's /Prev; with first-wins insertion this gives the spec precedence
+/// main-table > XRefStm > /Prev chain. Never fatal: a broken /XRefStm only
+/// loses the hybrid entries.
+fn parse_hybrid_xrefstm(
+    data: &[u8],
+    trailer: &PdfDict,
+    table: &mut XrefTable,
+    limits: &ParseLimits,
+    visited: &mut std::collections::HashSet<usize>,
+) {
+    let Some(PdfObject::Integer(off)) = trailer.get("XRefStm") else {
+        return;
+    };
+    let Ok(off) = usize::try_from(*off) else {
+        tracing::warn!("/XRefStm offset {off} is negative; ignoring");
+        return;
+    };
+    // Guard against /XRefStm cycles via the same visited set as /Prev.
+    if !visited.insert(off) {
+        return;
+    }
+    if let Err(e) = parse_xref_stream(data, off, table, limits) {
+        tracing::warn!("failed to parse /XRefStm at offset {off}: {e}");
+    }
 }
 
 fn parse_xref_section(
@@ -125,15 +160,27 @@ fn parse_xref_stream(
 
     let size = dict.get_i64("Size")? as u32;
 
-    // /W [w1 w2 w3] — field widths
+    // /W [w1 w2 w3] — field widths. Attacker-controlled: a negative width cast
+    // to usize would explode entry_size, and widths above 8 cannot fit the u64
+    // accumulator in read_field; reject both with a clean error.
     let w_arr = dict.get_array("W")?;
     if w_arr.len() != 3 {
         return Err(Error::InvalidXref(offset as u64));
     }
-    let w1 = w_arr[0].as_i64()? as usize;
-    let w2 = w_arr[1].as_i64()? as usize;
-    let w3 = w_arr[2].as_i64()? as usize;
+    let field_width = |obj: &PdfObject| -> Result<usize> {
+        let w = obj.as_i64()?;
+        if !(0..=8).contains(&w) {
+            return Err(Error::InvalidXref(offset as u64));
+        }
+        Ok(w as usize)
+    };
+    let w1 = field_width(&w_arr[0])?;
+    let w2 = field_width(&w_arr[1])?;
+    let w3 = field_width(&w_arr[2])?;
     let entry_size = w1 + w2 + w3;
+    if entry_size == 0 {
+        return Err(Error::InvalidXref(offset as u64));
+    }
 
     // Decode stream data
     let decoded = filters::decode_stream(&stream.data, dict)?;
@@ -251,16 +298,12 @@ fn parse_traditional_xref(
 
         for i in 0..count {
             skip_whitespace(data, &mut pos);
-            // A standard entry is 20 bytes ("nnnnnnnnnn ggggg n \r\n"); 18 are
-            // the minimum parse_xref_entry needs. If fewer remain, the table is
-            // truncated/corrupt — bail to recovery rather than under/overflowing.
-            let avail = data.len().saturating_sub(pos);
-            if avail < 18 {
-                return Err(Error::InvalidXref(pos as u64));
-            }
-            let entry_data = &data[pos..pos + avail.min(20)];
-
-            let (entry_offset, gen, in_use) = parse_xref_entry(entry_data)?;
+            // An entry is nominally 20 bytes ("nnnnnnnnnn ggggg n \r\n"), but
+            // real files contain 19-byte variants (lone \n or \r terminator).
+            // Parse by tokens, not a fixed stride, so short entries cannot
+            // desync the rest of the table. A truncated/corrupt entry Errs out
+            // to tail-scan recovery rather than under/overflowing.
+            let (entry_offset, gen, in_use) = parse_xref_entry_at(data, &mut pos)?;
             let id = ObjectId(first_obj + i, gen);
 
             if in_use {
@@ -280,9 +323,6 @@ fn parse_traditional_xref(
                     },
                 );
             }
-
-            // Advance past the 20-byte entry
-            pos += 20;
         }
     }
 
@@ -356,27 +396,38 @@ fn parse_subsection_header(data: &[u8], pos: &mut usize) -> Result<(u32, u32)> {
     Ok((first, count))
 }
 
-fn parse_xref_entry(data: &[u8]) -> Result<(u64, u16, bool)> {
-    // Format: "0000000000 65535 f \n" (20 bytes)
-    if data.len() < 18 {
-        return Err(Error::InvalidXref(0));
-    }
-
-    let offset: u64 = std::str::from_utf8(&data[..10])
-        .map_err(|_| Error::InvalidXref(0))?
-        .trim()
-        .parse()
-        .map_err(|_| Error::InvalidXref(0))?;
-
-    let gen: u16 = std::str::from_utf8(&data[11..16])
-        .map_err(|_| Error::InvalidXref(0))?
-        .trim()
-        .parse()
-        .map_err(|_| Error::InvalidXref(0))?;
-
-    let in_use = data[17] == b'n';
-
+/// Parse a single traditional xref entry ("nnnnnnnnnn ggggg n") at `*pos`,
+/// advancing the cursor just past the type letter. Field widths are not
+/// assumed: digit runs of any length and any amount of inter-field whitespace
+/// are accepted, which tolerates the 19-byte entries some writers emit.
+fn parse_xref_entry_at(data: &[u8], pos: &mut usize) -> Result<(u64, u16, bool)> {
+    let start = *pos as u64;
+    let offset = read_decimal(data, pos).ok_or(Error::InvalidXref(start))?;
+    skip_whitespace(data, pos);
+    let gen = read_decimal(data, pos)
+        .and_then(|g| u16::try_from(g).ok())
+        .ok_or(Error::InvalidXref(start))?;
+    skip_whitespace(data, pos);
+    let in_use = match data.get(*pos) {
+        Some(b'n') => true,
+        Some(b'f') => false,
+        _ => return Err(Error::InvalidXref(start)),
+    };
+    *pos += 1;
     Ok((offset, gen, in_use))
+}
+
+/// Read a run of ASCII digits at `*pos` as a u64, advancing past it.
+/// `None` if there is no digit at `*pos` or the value overflows.
+fn read_decimal(data: &[u8], pos: &mut usize) -> Option<u64> {
+    let start = *pos;
+    while *pos < data.len() && data[*pos].is_ascii_digit() {
+        *pos += 1;
+    }
+    if *pos == start {
+        return None;
+    }
+    std::str::from_utf8(&data[start..*pos]).ok()?.parse().ok()
 }
 
 fn skip_whitespace(data: &[u8], pos: &mut usize) {
@@ -404,19 +455,162 @@ mod tests {
 
     #[test]
     fn parse_xref_entry_in_use() {
-        let entry = b"0000000010 00000 n \r\n";
-        let (offset, gen, in_use) = parse_xref_entry(entry).unwrap();
+        let mut pos = 0usize;
+        let (offset, gen, in_use) = parse_xref_entry_at(b"0000000010 00000 n \r\n", &mut pos).unwrap();
         assert_eq!(offset, 10);
         assert_eq!(gen, 0);
         assert!(in_use);
+        assert_eq!(pos, 18, "cursor stops just past the type letter");
     }
 
     #[test]
     fn parse_xref_entry_free() {
-        let entry = b"0000000000 65535 f \r\n";
-        let (offset, gen, in_use) = parse_xref_entry(entry).unwrap();
+        let mut pos = 0usize;
+        let (offset, gen, in_use) = parse_xref_entry_at(b"0000000000 65535 f \r\n", &mut pos).unwrap();
         assert_eq!(offset, 0);
         assert_eq!(gen, 65535);
         assert!(!in_use);
+    }
+
+    #[test]
+    fn parse_xref_entry_truncated_errors() {
+        let mut pos = 0usize;
+        assert!(parse_xref_entry_at(b"0000000010 000", &mut pos).is_err());
+    }
+
+    #[test]
+    fn traditional_xref_with_19_byte_entries() {
+        // Entries terminated by a lone \n (19 bytes) must not desync the table.
+        let mut d = Vec::new();
+        d.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = d.len();
+        d.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        let off2 = d.len();
+        d.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n");
+        let xref_off = d.len();
+        d.extend_from_slice(b"xref\n0 3\n");
+        d.extend_from_slice(b"0000000000 65535 f\n"); // 19 bytes
+        d.extend_from_slice(format!("{off1:010} 00000 n\n").as_bytes()); // 19 bytes
+        d.extend_from_slice(format!("{off2:010} 00000 n\n").as_bytes()); // 19 bytes
+        d.extend_from_slice(
+            format!("trailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n{xref_off}\n%%EOF\n")
+                .as_bytes(),
+        );
+
+        let (table, trailer) = parse_xref_and_trailer(&d, &ParseLimits::default()).unwrap();
+        assert_eq!(trailer.get_ref("Root").unwrap(), ObjectId(1, 0));
+        match table.get(ObjectId(1, 0)).unwrap() {
+            XrefEntry::InUse { offset, .. } => assert_eq!(*offset as usize, off1),
+            other => panic!("expected InUse, got {other:?}"),
+        }
+        match table.get(ObjectId(2, 0)).unwrap() {
+            XrefEntry::InUse { offset, .. } => assert_eq!(*offset as usize, off2),
+            other => panic!("expected InUse, got {other:?}"),
+        }
+    }
+
+    /// Build a minimal xref-stream object at offset 0 with the given /W array
+    /// and raw (unfiltered) entry data.
+    fn xref_stream_bytes(w: &str, size: u32, index: &str, body: &[u8]) -> Vec<u8> {
+        let mut d = format!(
+            "9 0 obj\n<< /Type /XRef /Size {size} /W {w} {index} /Length {} >>\nstream\n",
+            body.len()
+        )
+        .into_bytes();
+        d.extend_from_slice(body);
+        d.extend_from_slice(b"\nendstream\nendobj\n");
+        d
+    }
+
+    #[test]
+    fn xref_stream_rejects_negative_w_width() {
+        let d = xref_stream_bytes("[1 -2 2]", 1, "", &[]);
+        let mut table = XrefTable::new();
+        assert!(parse_xref_stream(&d, 0, &mut table, &ParseLimits::default()).is_err());
+    }
+
+    #[test]
+    fn xref_stream_rejects_oversized_w_width() {
+        let d = xref_stream_bytes("[9 4 2]", 1, "", &[]);
+        let mut table = XrefTable::new();
+        assert!(parse_xref_stream(&d, 0, &mut table, &ParseLimits::default()).is_err());
+    }
+
+    #[test]
+    fn xref_stream_rejects_zero_entry_size() {
+        let d = xref_stream_bytes("[0 0 0]", 1, "", &[]);
+        let mut table = XrefTable::new();
+        assert!(parse_xref_stream(&d, 0, &mut table, &ParseLimits::default()).is_err());
+    }
+
+    #[test]
+    fn hybrid_xrefstm_is_parsed_with_correct_precedence() {
+        // Hybrid-reference layout: the traditional table covers objects 0,1,4;
+        // the trailer's /XRefStm points at an xref stream that covers 4 and 5.
+        // Object 5 must come from the stream; object 4 must keep the
+        // main-table offset (main table wins over /XRefStm).
+        let mut d = Vec::new();
+        d.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = d.len();
+        d.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        let off4_table = d.len();
+        d.extend_from_slice(b"4 0 obj\n<< /Marker /FromTable >>\nendobj\n");
+        let off4_stm = d.len();
+        d.extend_from_slice(b"4 0 obj\n<< /Marker /FromStm >>\nendobj\n");
+        let off5 = d.len();
+        d.extend_from_slice(b"5 0 obj\n<< /Marker /StmOnly >>\nendobj\n");
+
+        // Xref stream (object 6): /W [1 4 2], /Index [4 2], raw (no filter).
+        let mut body = Vec::new();
+        for (off, gen) in [(off4_stm as u32, 0u16), (off5 as u32, 0)] {
+            body.push(1u8); // type 1: in use
+            body.extend_from_slice(&off.to_be_bytes());
+            body.extend_from_slice(&gen.to_be_bytes());
+        }
+        let off6 = d.len();
+        d.extend_from_slice(
+            format!(
+                "6 0 obj\n<< /Type /XRef /Size 7 /W [1 4 2] /Index [4 2] /Length {} >>\nstream\n",
+                body.len()
+            )
+            .as_bytes(),
+        );
+        d.extend_from_slice(&body);
+        d.extend_from_slice(b"\nendstream\nendobj\n");
+
+        let xref_off = d.len();
+        d.extend_from_slice(b"xref\n0 2\n0000000000 65535 f \n");
+        d.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+        d.extend_from_slice(b"4 1\n");
+        d.extend_from_slice(format!("{off4_table:010} 00000 n \n").as_bytes());
+        d.extend_from_slice(
+            format!(
+                "trailer\n<< /Size 7 /Root 1 0 R /XRefStm {off6} >>\nstartxref\n{xref_off}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+
+        let (table, trailer) = parse_xref_and_trailer(&d, &ParseLimits::default()).unwrap();
+        assert_eq!(trailer.get_ref("Root").unwrap(), ObjectId(1, 0));
+        // Object 5 exists only via the /XRefStm.
+        match table.get(ObjectId(5, 0)).unwrap() {
+            XrefEntry::InUse { offset, .. } => assert_eq!(*offset as usize, off5),
+            other => panic!("expected InUse from XRefStm, got {other:?}"),
+        }
+        // Object 4: the traditional table's offset wins over the stream's.
+        match table.get(ObjectId(4, 0)).unwrap() {
+            XrefEntry::InUse { offset, .. } => assert_eq!(*offset as usize, off4_table),
+            other => panic!("expected InUse, got {other:?}"),
+        }
+
+        // End-to-end: the document opens and the stream-only object resolves.
+        let file = crate::PdfFile::parse(d).unwrap();
+        let o5 = file.resolve(ObjectId(5, 0)).unwrap();
+        assert_eq!(o5.as_dict().unwrap().get_name("Marker").unwrap(), "StmOnly");
+        let o4 = file.resolve(ObjectId(4, 0)).unwrap();
+        assert_eq!(
+            o4.as_dict().unwrap().get_name("Marker").unwrap(),
+            "FromTable"
+        );
     }
 }

@@ -1,21 +1,29 @@
 //! PDF **Standard Security Handler** decryption.
 //!
 //! Implements the empty-user-password decryption path for the Standard
-//! security handler: key derivation (PDF 1.7 §7.6.3, Algorithms 2 & 1) and the
-//! RC4 cipher (V1/V2, R2–R4). AES (V4 `AESV2` / V5 `AESV3`) is detected and
-//! reported as unsupported rather than producing garbage.
+//! security handler:
+//! - RC4 (V1/V2, R2–R4) with MD5 key derivation (PDF 1.7 §7.6.3, Algorithms 2 & 1)
+//! - AES-128-CBC (V4/R4, crypt filter `AESV2`) — per-object key = MD5(file key
+//!   ‖ objnum ‖ gen ‖ `sAlT`); the first 16 bytes of each payload are the IV
+//! - AES-256-CBC (V5, R5/R6, crypt filter `AESV3`) — file key recovered from
+//!   `/UE` (or `/OE`) per ISO 32000-2 Algorithm 2.A, with the R6 hardened hash
+//!   (Algorithm 2.B); no per-object key derivation
 //!
-//! Pure Rust, zero external dependencies — MD5 and RC4 are implemented inline.
+//! MD5 and RC4 are implemented inline; AES-CBC and SHA-2 come from the
+//! pure-Rust RustCrypto crates (`aes`, `cbc`, `sha2`). Zero C/C++ deps.
 //!
 //! ## How it plugs in
 //! [`Decryptor`] is built once at file-open time from the `/Encrypt` dictionary
 //! and the first element of the trailer `/ID`. Every top-level object parsed
 //! straight from the file (xref `InUse` entries) is then walked with
-//! [`Decryptor::decrypt_object`], which RC4-decrypts every string and stream in
-//! place using a per-object key. Objects pulled out of a `/Type /ObjStm`
+//! [`Decryptor::decrypt_object`], which decrypts every string and stream in
+//! place (streams with the `/StmF` cipher, strings with the `/StrF` cipher —
+//! either may be `Identity`). Objects pulled out of a `/Type /ObjStm`
 //! compressed stream are **not** decrypted individually (the container stream
 //! is), and the `/Encrypt` dictionary itself is never decrypted.
 
+use aes::cipher::{generic_array::GenericArray, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
+use sha2::Digest;
 use std::sync::Arc;
 use zpdf_core::{ObjectId, PdfDict, PdfObject, PdfString};
 
@@ -27,31 +35,40 @@ const PAD: [u8; 32] = [
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Algo {
-    /// RC4 (V1/V2).
+    /// No encryption for this class (`/StmF` or `/StrF` is `Identity`, or the
+    /// crypt filter's `/CFM` is `None`).
+    Identity,
+    /// RC4 (V1/V2, or a V4 crypt filter with `/CFM /V2`).
     Rc4,
-    /// AES-128 CBC (V4, crypt filter `AESV2`) — not yet implemented.
+    /// AES-128 CBC (V4, crypt filter `AESV2`).
     AesV2,
-    /// AES-256 CBC (V5/R6, crypt filter `AESV3`) — not yet implemented.
+    /// AES-256 CBC (V5 R5/R6, crypt filter `AESV3`).
     AesV3,
 }
 
 /// A built Standard-security-handler decryptor for one file.
 pub struct Decryptor {
-    /// File-level encryption key (Algorithm 2 output), `n` bytes.
+    /// File-level encryption key (Algorithm 2 or 2.A output), `n` bytes.
     key: Vec<u8>,
-    algo: Algo,
-    /// Revision (`/R`) — affects per-object key length & key derivation.
-    revision: i64,
+    /// Cipher for stream payloads (`/StmF` crypt filter).
+    stm_algo: Algo,
+    /// Cipher for strings (`/StrF` crypt filter).
+    str_algo: Algo,
     /// The `/Encrypt` dictionary's own object id, which must never be
-    /// decrypted (its strings are stored in the clear).
+    /// decrypted (its strings are stored in the clear). `None` when the
+    /// trailer carries a direct (non-reference) `/Encrypt` dict.
     encrypt_id: Option<ObjectId>,
+    /// `/EncryptMetadata` (default true). When false, the document-level
+    /// `/Type /Metadata` stream payload is stored in the clear and must not be
+    /// "decrypted" (which would corrupt it).
+    encrypt_metadata: bool,
 }
 
 impl Decryptor {
     /// Build a decryptor from the `/Encrypt` dictionary and the first element of
-    /// the trailer `/ID`. Returns `Ok(None)` (with a warning) for security
-    /// handlers we don't support yet (non-`Standard` filter, AES) so the caller
-    /// degrades gracefully instead of emitting garbage.
+    /// the trailer `/ID`. Returns `None` (with a warning) for security handlers
+    /// we don't support (non-`Standard` filter, password-protected documents)
+    /// so the caller degrades gracefully instead of emitting garbage.
     pub fn from_encrypt_dict(
         dict: &PdfDict,
         id_first: &[u8],
@@ -66,52 +83,66 @@ impl Decryptor {
         let v = dict.get_i64("V").unwrap_or(0);
         let r = dict.get_i64("R").unwrap_or(0);
 
-        let o = string_bytes(dict, "O");
-        let u = string_bytes(dict, "U");
-        // /P is an integer bit-field, but some producers write it as a Real.
-        let p = match dict.get("P") {
-            Some(PdfObject::Integer(n)) => *n as i32,
-            Some(PdfObject::Real(n)) => *n as i32,
-            _ => 0,
+        // Per-class ciphers. V<4: one document-wide RC4 cipher for everything.
+        // V4/V5: `/CF` crypt filters selected by `/StmF` (streams) and `/StrF`
+        // (strings); per spec the default for each is `Identity` (no
+        // encryption for that class).
+        let (stm_algo, str_algo) = if v >= 4 {
+            (
+                algo_for_filter(dict, dict.get_name("StmF").unwrap_or("Identity")),
+                algo_for_filter(dict, dict.get_name("StrF").unwrap_or("Identity")),
+            )
+        } else {
+            (Algo::Rc4, Algo::Rc4)
         };
+
         // Default true (R<4 has no such key and always encrypts metadata).
         let encrypt_metadata = match dict.get("EncryptMetadata") {
             Some(PdfObject::Bool(b)) => *b,
             _ => true,
         };
 
-        let algo = classify_algo(dict, v);
-        if matches!(algo, Algo::AesV2 | Algo::AesV3) {
-            tracing::warn!(
-                "AES-encrypted PDF (V={v} R={r}) is not yet supported; document will not decrypt"
-            );
-            return None;
-        }
-        if v >= 5 {
-            tracing::warn!("encryption V={v} (AES-256) is not yet supported");
-            return None;
-        }
+        let key = if v >= 5 {
+            // V5 (AESV3): ISO 32000-2 Algorithm 2.A. Validates the (empty)
+            // password and recovers the 32-byte file key from /UE or /OE.
+            compute_key_v5(dict, r)?
+        } else {
+            let o = string_bytes(dict, "O");
+            let u = string_bytes(dict, "U");
+            // /P is an integer bit-field, but some producers write it as a Real.
+            let p = match dict.get("P") {
+                Some(PdfObject::Integer(n)) => *n as i32,
+                Some(PdfObject::Real(n)) => *n as i32,
+                _ => 0,
+            };
+            // AESV2 always uses a 128-bit key regardless of what /Length says.
+            let length_bits = if stm_algo == Algo::AesV2 || str_algo == Algo::AesV2 {
+                128
+            } else {
+                key_length_bits(dict, v)
+            };
+            let key = compute_key_rc4(&o, p, id_first, r, length_bits, encrypt_metadata);
 
-        let length_bits = key_length_bits(dict, v);
-        let key = compute_key_rc4(&o, p, id_first, r, length_bits, encrypt_metadata);
-
-        // Diagnostic: a correct empty-user-password key reproduces /U
-        // (Algorithm 4/6). A mismatch means a wrong key was derived (e.g. the
-        // document needs a password, or /ID//P were malformed) — surface it
-        // instead of silently rendering garbage. We still proceed, so a quirk in
-        // this check can never break a document that would otherwise decrypt.
-        if !validate_user_password(&key, &u, id_first, r) {
-            tracing::warn!(
-                "encryption key did not validate against /U (V={v} R={r}); the PDF may require a \
-                 password — decrypted content may be garbage"
-            );
-        }
+            // Diagnostic: a correct empty-user-password key reproduces /U
+            // (Algorithm 4/6). A mismatch means a wrong key was derived (e.g. the
+            // document needs a password, or /ID//P were malformed) — surface it
+            // instead of silently rendering garbage. We still proceed, so a quirk in
+            // this check can never break a document that would otherwise decrypt.
+            if !validate_user_password(&key, &u, id_first, r) {
+                tracing::warn!(
+                    "encryption key did not validate against /U (V={v} R={r}); the PDF may require \
+                     a password — decrypted content may be garbage"
+                );
+            }
+            key
+        };
 
         Some(Self {
             key,
-            algo,
-            revision: r,
+            stm_algo,
+            str_algo,
             encrypt_id,
+            encrypt_metadata,
         })
     }
 
@@ -129,13 +160,15 @@ impl Decryptor {
     /// for the `/Type /ObjStm` container, which is decrypted directly (not via
     /// [`decrypt_object`](Self::decrypt_object)) before its filter pipeline.
     pub fn decrypt_stream_bytes(&self, id: ObjectId, data: &[u8]) -> Vec<u8> {
-        self.decrypt(id, data)
+        self.decrypt(id, data, self.stm_algo)
     }
 
     fn walk(&self, obj: &mut PdfObject, id: ObjectId) {
         match obj {
             PdfObject::String(s) => {
-                *s = PdfString(self.decrypt(id, &s.0));
+                if self.str_algo != Algo::Identity {
+                    *s = PdfString(self.decrypt(id, &s.0, self.str_algo));
+                }
             }
             PdfObject::Array(a) => {
                 for o in a.iter_mut() {
@@ -148,10 +181,17 @@ impl Decryptor {
                 }
             }
             PdfObject::Stream(s) => {
+                let typ = s.dict.get_name("Type").unwrap_or("");
                 // Cross-reference streams are never encrypted (PDF 1.7 §7.6.1).
-                let is_xref = s.dict.get_name("Type").map(|t| t == "XRef").unwrap_or(false);
-                if !is_xref {
-                    let dec = self.decrypt(id, &s.data);
+                let is_xref = typ == "XRef";
+                // /EncryptMetadata false: metadata stream payloads are stored
+                // in the clear; "decrypting" them would corrupt the XMP.
+                // Limitation: only streams self-identifying as /Type /Metadata
+                // are detectable here (we don't know if this object is the
+                // catalog's /Metadata target) — that covers conforming files.
+                let plain_meta = !self.encrypt_metadata && typ == "Metadata";
+                if !is_xref && !plain_meta && self.stm_algo != Algo::Identity {
+                    let dec = self.decrypt(id, &s.data, self.stm_algo);
                     s.data = Arc::from(dec);
                 }
                 for v in s.dict.0.values_mut() {
@@ -164,20 +204,19 @@ impl Decryptor {
     }
 
     /// Per-object key derivation (Algorithm 1) + cipher application.
-    fn decrypt(&self, id: ObjectId, data: &[u8]) -> Vec<u8> {
-        let obj_key = self.object_key(id);
-        match self.algo {
-            Algo::Rc4 => rc4(&obj_key, data),
-            // Unreachable: AES handlers return None from `from_encrypt_dict`.
-            Algo::AesV2 | Algo::AesV3 => data.to_vec(),
+    fn decrypt(&self, id: ObjectId, data: &[u8], algo: Algo) -> Vec<u8> {
+        match algo {
+            Algo::Identity => data.to_vec(),
+            Algo::Rc4 => rc4(&self.object_key(id, algo), data),
+            Algo::AesV2 | Algo::AesV3 => aes_cbc_decrypt(&self.object_key(id, algo), data),
         }
     }
 
     /// Algorithm 1: object key = MD5(file_key || obj_num[3 LE] || gen[2 LE]
-    /// [|| "sAlT" for AES]), truncated to min(n+5, 16) bytes.
-    fn object_key(&self, id: ObjectId) -> Vec<u8> {
-        // V5 (R6) uses the file key directly with no per-object derivation.
-        if self.revision >= 6 {
+    /// [|| "sAlT" for AESV2]), truncated to min(n+5, 16) bytes. AESV3 (V5) has
+    /// no per-object derivation — the 32-byte file key is used directly.
+    fn object_key(&self, id: ObjectId, algo: Algo) -> Vec<u8> {
+        if algo == Algo::AesV3 {
             return self.key.clone();
         }
         let mut input = Vec::with_capacity(self.key.len() + 9);
@@ -186,7 +225,7 @@ impl Decryptor {
         input.extend_from_slice(&num[..3]);
         let gen = id.1.to_le_bytes();
         input.extend_from_slice(&gen[..2]);
-        if matches!(self.algo, Algo::AesV2 | Algo::AesV3) {
+        if algo == Algo::AesV2 {
             input.extend_from_slice(b"sAlT");
         }
         let hash = md5(&input);
@@ -244,31 +283,29 @@ fn validate_user_password(key: &[u8], u: &[u8], id_first: &[u8], r: i64) -> bool
     u.len() >= 16 && x.len() >= 16 && x[..16] == u[..16]
 }
 
-/// Decide the cipher. For V<4 it's always RC4. For V≥4 the `/StmF` crypt filter
-/// (in `/CF`) names `V2` (RC4), `AESV2`, or `AESV3`.
-fn classify_algo(dict: &PdfDict, v: i64) -> Algo {
-    if v < 4 {
-        return Algo::Rc4;
-    }
-    // V4/V5: look up the stream crypt filter's /CFM.
-    let stmf = dict.get_name("StmF").unwrap_or("Identity");
-    if stmf == "Identity" {
-        return Algo::Rc4; // no stream encryption; harmless default
+/// Map a `/StmF`-or-`/StrF` crypt-filter name to a cipher. `Identity` (also the
+/// spec default) means no encryption for that class. Otherwise the named filter
+/// in `/CF` declares its method via `/CFM`: `V2` (RC4), `AESV2`, `AESV3`, or
+/// `None`.
+fn algo_for_filter(dict: &PdfDict, filter_name: &str) -> Algo {
+    if filter_name == "Identity" {
+        return Algo::Identity;
     }
     let cfm = dict
         .get_dict("CF")
         .ok()
-        .and_then(|cf| cf.get_dict(stmf).ok())
+        .and_then(|cf| cf.get_dict(filter_name).ok())
         .and_then(|f| f.get_name("CFM").ok())
         .unwrap_or("V2");
     match cfm {
         "AESV2" => Algo::AesV2,
         "AESV3" => Algo::AesV3,
+        "None" => Algo::Identity,
         _ => Algo::Rc4,
     }
 }
 
-/// Algorithm 2 (RC4/AES key, revisions 2–4): derive the file encryption key
+/// Algorithm 2 (RC4/AES-128 key, revisions 2–4): derive the file encryption key
 /// from the empty user password.
 fn compute_key_rc4(
     o: &[u8],
@@ -311,12 +348,204 @@ fn compute_key_rc4(
     hash[..n].to_vec()
 }
 
+// ----------------------------------------------------------------------------
+// V5 (AES-256) key derivation — ISO 32000-2 §7.6.4.3.3/4, Algorithms 2.A & 2.B
+// ----------------------------------------------------------------------------
+
+/// Algorithm 2.A: validate the **empty** user password against `/U` and recover
+/// the 32-byte file key from `/UE`; fall back to the empty **owner** password
+/// (`/O` with the first 48 bytes of `/U` appended to the hash input) and `/OE`.
+/// Returns `None` (with a warning) when neither validates — the document needs
+/// a real password.
+fn compute_key_v5(dict: &PdfDict, r: i64) -> Option<Vec<u8>> {
+    let o = string_bytes(dict, "O");
+    let u = string_bytes(dict, "U");
+    let oe = string_bytes(dict, "OE");
+    let ue = string_bytes(dict, "UE");
+    // Only the empty password is supported (no password prompt in this crate).
+    let password: &[u8] = b"";
+
+    // Algorithm 11 (user): /U = hash[32] || validation-salt[8] || key-salt[8].
+    // On a validation hit but a broken /UE, fall through to the owner path.
+    if u.len() >= 48 {
+        let (vsalt, ksalt) = (&u[32..40], &u[40..48]);
+        if hash_v5(r, password, vsalt, &[])[..] == u[..32] {
+            let ik = hash_v5(r, password, ksalt, &[]);
+            if let Some(key) = decrypt_file_key(&ik, &ue, "UE") {
+                return Some(key);
+            }
+        }
+    }
+    // Algorithm 12 (owner): same layout, with U[0..48] appended to the input.
+    if o.len() >= 48 && u.len() >= 48 {
+        let u48 = &u[..48];
+        let (vsalt, ksalt) = (&o[32..40], &o[40..48]);
+        if hash_v5(r, password, vsalt, u48)[..] == o[..32] {
+            let ik = hash_v5(r, password, ksalt, u48);
+            if let Some(key) = decrypt_file_key(&ik, &oe, "OE") {
+                return Some(key);
+            }
+        }
+    }
+    tracing::warn!(
+        "V5/R{r} password validation failed (the PDF likely requires a password); \
+         document will not decrypt"
+    );
+    None
+}
+
+/// Decrypt the 32-byte file key from `/UE` or `/OE`: AES-256-CBC with the
+/// intermediate key, a zero IV, and no padding.
+fn decrypt_file_key(intermediate: &[u8; 32], encrypted: &[u8], which: &str) -> Option<Vec<u8>> {
+    if encrypted.len() != 32 {
+        tracing::warn!("/{which} must be 32 bytes, got {}; document will not decrypt", encrypted.len());
+        return None;
+    }
+    let mut buf = encrypted.to_vec();
+    if !cbc_decrypt_in_place(intermediate, &[0u8; 16], &mut buf) {
+        return None;
+    }
+    Some(buf)
+}
+
+/// The V5 password hash: SHA-256(password ‖ salt ‖ udata), hardened with
+/// Algorithm 2.B for R6.
+fn hash_v5(r: i64, password: &[u8], salt: &[u8], udata: &[u8]) -> [u8; 32] {
+    let mut input = Vec::with_capacity(password.len() + salt.len() + udata.len());
+    input.extend_from_slice(password);
+    input.extend_from_slice(salt);
+    input.extend_from_slice(udata);
+    let initial: [u8; 32] = sha2::Sha256::digest(&input).into();
+    if r >= 6 {
+        hash_r6(initial, password, udata)
+    } else {
+        initial
+    }
+}
+
+/// Algorithm 2.B (R6 hardened hash): iterate AES-128-CBC over 64 repetitions of
+/// (password ‖ K ‖ udata), re-hashing K with SHA-256/384/512 chosen by the
+/// first 16 bytes of the ciphertext mod 3. At least 64 rounds; stop once the
+/// last ciphertext byte is ≤ (round − 32).
+fn hash_r6(initial: [u8; 32], password: &[u8], udata: &[u8]) -> [u8; 32] {
+    let mut k: Vec<u8> = initial.to_vec();
+    let mut e_last: u8 = 0;
+    let mut round: i64 = 0;
+    while round < 64 || i64::from(e_last) > round - 32 {
+        // K1 = 64 repetitions of (password || K || udata). Its length is always
+        // a multiple of 16 (any unit length × 64 is a multiple of 64).
+        let mut k1 = Vec::with_capacity(64 * (password.len() + k.len() + udata.len()));
+        for _ in 0..64 {
+            k1.extend_from_slice(password);
+            k1.extend_from_slice(&k);
+            k1.extend_from_slice(udata);
+        }
+        let e = aes128_cbc_encrypt_nopad(&k[..16], &k[16..32], &k1);
+        e_last = *e.last().unwrap_or(&0);
+        let m = e[..16].iter().map(|&b| u32::from(b)).sum::<u32>() % 3;
+        k = match m {
+            0 => sha2::Sha256::digest(&e).to_vec(),
+            1 => sha2::Sha384::digest(&e).to_vec(),
+            _ => sha2::Sha512::digest(&e).to_vec(),
+        };
+        round += 1;
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&k[..32]);
+    out
+}
+
 /// Read a PDF string entry's raw bytes from a dict (empty if absent/non-string).
 fn string_bytes(dict: &PdfDict, key: &str) -> Vec<u8> {
     match dict.get(key) {
         Some(PdfObject::String(s)) => s.0.clone(),
         _ => Vec::new(),
     }
+}
+
+// ----------------------------------------------------------------------------
+// AES-CBC (pure-Rust RustCrypto `aes` + `cbc`)
+// ----------------------------------------------------------------------------
+
+/// Decrypt an AES-CBC payload as stored in a PDF: the first 16 bytes are the
+/// IV, the rest is ciphertext with PKCS#5 padding. The padding is stripped
+/// defensively — on invalid padding the unpadded plaintext is kept (with a
+/// warning) rather than truncated arbitrarily. A structurally impossible
+/// payload (length not 16+16k) or a bad key length returns the input unchanged.
+fn aes_cbc_decrypt(key: &[u8], data: &[u8]) -> Vec<u8> {
+    if data.is_empty() {
+        return Vec::new();
+    }
+    if data.len() < 16 || !(data.len() - 16).is_multiple_of(16) {
+        tracing::warn!(
+            "AES-CBC payload length {} is not 16+16k; leaving data unmodified",
+            data.len()
+        );
+        return data.to_vec();
+    }
+    let (iv, ct) = data.split_at(16);
+    let mut buf = ct.to_vec();
+    if !cbc_decrypt_in_place(key, iv, &mut buf) {
+        tracing::warn!("invalid AES key length {}; leaving data unmodified", key.len());
+        return data.to_vec();
+    }
+    strip_pkcs5_padding(buf)
+}
+
+/// Strip PKCS#5/7 padding in place; on malformed padding keep the data and warn.
+fn strip_pkcs5_padding(mut buf: Vec<u8>) -> Vec<u8> {
+    let Some(&last) = buf.last() else { return buf };
+    let pad = last as usize;
+    if (1..=16).contains(&pad)
+        && pad <= buf.len()
+        && buf[buf.len() - pad..].iter().all(|&b| b == last)
+    {
+        buf.truncate(buf.len() - pad);
+    } else {
+        tracing::warn!("invalid PKCS#5 padding byte {last}; keeping unpadded data");
+    }
+    buf
+}
+
+/// AES-CBC decrypt `buf` in place with no padding handling. Key length selects
+/// AES-128 vs AES-256. Returns `false` for an unsupported key or IV length.
+fn cbc_decrypt_in_place(key: &[u8], iv: &[u8], buf: &mut [u8]) -> bool {
+    debug_assert_eq!(buf.len() % 16, 0);
+    match key.len() {
+        16 => {
+            let Ok(mut dec) = cbc::Decryptor::<aes::Aes128>::new_from_slices(key, iv) else {
+                return false;
+            };
+            for block in buf.chunks_exact_mut(16) {
+                dec.decrypt_block_mut(GenericArray::from_mut_slice(block));
+            }
+            true
+        }
+        32 => {
+            let Ok(mut dec) = cbc::Decryptor::<aes::Aes256>::new_from_slices(key, iv) else {
+                return false;
+            };
+            for block in buf.chunks_exact_mut(16) {
+                dec.decrypt_block_mut(GenericArray::from_mut_slice(block));
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+/// AES-128-CBC **encrypt** with no padding (input length must be a multiple of
+/// 16). Used only by the R6 hardened hash (Algorithm 2.B).
+fn aes128_cbc_encrypt_nopad(key: &[u8], iv: &[u8], data: &[u8]) -> Vec<u8> {
+    debug_assert_eq!(data.len() % 16, 0);
+    let mut buf = data.to_vec();
+    let Ok(mut enc) = cbc::Encryptor::<aes::Aes128>::new_from_slices(key, iv) else {
+        return buf; // unreachable: callers always pass 16-byte key/iv slices
+    };
+    for block in buf.chunks_exact_mut(16) {
+        enc.encrypt_block_mut(GenericArray::from_mut_slice(block));
+    }
+    buf
 }
 
 // ----------------------------------------------------------------------------
@@ -439,6 +668,7 @@ pub fn md5(data: &[u8]) -> [u8; 16] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zpdf_core::{PdfName, PdfStream};
 
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -449,6 +679,33 @@ mod tests {
             .step_by(2)
             .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
             .collect()
+    }
+
+    /// AES-256-CBC encrypt with no padding — test-only helper for building V5
+    /// fixtures (the production code only ever decrypts with AES-256).
+    fn aes256_cbc_encrypt_nopad(key: &[u8], iv: &[u8], data: &[u8]) -> Vec<u8> {
+        let mut buf = data.to_vec();
+        let mut enc = cbc::Encryptor::<aes::Aes256>::new_from_slices(key, iv).unwrap();
+        for block in buf.chunks_exact_mut(16) {
+            enc.encrypt_block_mut(GenericArray::from_mut_slice(block));
+        }
+        buf
+    }
+
+    /// Navigate Root → Pages → Kids[0] → Contents and decode the stream.
+    fn content_stream_bytes(file: &crate::PdfFile) -> Vec<u8> {
+        let root = file.trailer.get_ref("Root").expect("trailer /Root");
+        let cat = file.resolve(root).expect("resolve catalog");
+        let pages_ref = cat.as_dict().unwrap().get_ref("Pages").unwrap();
+        let pages = file.resolve(pages_ref).expect("resolve pages");
+        let kids = pages.as_dict().unwrap().get_array("Kids").unwrap().to_vec();
+        let PdfObject::Ref(page_ref) = kids[0] else {
+            panic!("Kids[0] is not a reference")
+        };
+        let page = file.resolve(page_ref).expect("resolve page");
+        let contents_ref = page.as_dict().unwrap().get_ref("Contents").unwrap();
+        file.resolve_stream_data(contents_ref)
+            .expect("decode content stream")
     }
 
     /// Validates the full RC4-40 key-derivation pipeline against reference
@@ -481,11 +738,12 @@ mod tests {
         // Algorithm 1 → per-object key for the page-1 content stream (1652, 0).
         let dec = Decryptor {
             key,
-            algo: Algo::Rc4,
-            revision: 2,
+            stm_algo: Algo::Rc4,
+            str_algo: Algo::Rc4,
             encrypt_id: None,
+            encrypt_metadata: true,
         };
-        let objkey = dec.object_key(ObjectId(1652, 0));
+        let objkey = dec.object_key(ObjectId(1652, 0), Algo::Rc4);
         assert_eq!(hex(&objkey), "30dadd6463d5f9765abc", "per-object key (Algorithm 1)");
     }
 
@@ -514,7 +772,6 @@ mod tests {
 
     #[test]
     fn v4_rc4_key_length_from_crypt_filter() {
-        use zpdf_core::{PdfDict, PdfName, PdfObject};
         // A /V 4 /R 4 RC4-128 handler that records its key size only in the
         // crypt filter (/CF/StdCF/Length 16 bytes), with no top-level /Length.
         let mut stdcf = PdfDict::new();
@@ -530,7 +787,9 @@ mod tests {
         // Must read 16 bytes → 128 bits from the crypt filter, not default to 40.
         assert_eq!(key_length_bits(&dict, 4), 128);
         // And the cipher must classify as RC4 (CFM == V2).
-        assert_eq!(classify_algo(&dict, 4), Algo::Rc4);
+        assert_eq!(algo_for_filter(&dict, "StdCF"), Algo::Rc4);
+        // /Identity and /CFM /None mean "no encryption for this class".
+        assert_eq!(algo_for_filter(&dict, "Identity"), Algo::Identity);
     }
 
     #[test]
@@ -546,5 +805,282 @@ mod tests {
 
         let ct = rc4(b"Secret", b"Attack at dawn");
         assert_eq!(hex(&ct), "45a01f645fc35b383552544b9bf5");
+    }
+
+    #[test]
+    fn aes_cbc_known_answers() {
+        // NIST SP 800-38A F.2.1 (CBC-AES128.Encrypt), first block.
+        let key = unhex("2b7e151628aed2a6abf7158809cf4f3c");
+        let iv = unhex("000102030405060708090a0b0c0d0e0f");
+        let pt = unhex("6bc1bee22e409f96e93d7e117393172a");
+        let ct = aes128_cbc_encrypt_nopad(&key, &iv, &pt);
+        assert_eq!(hex(&ct), "7649abac8119b246cee98e9b12e9197d");
+        // Decrypt round-trips.
+        let mut buf = ct.clone();
+        assert!(cbc_decrypt_in_place(&key, &iv, &mut buf));
+        assert_eq!(buf, pt);
+
+        // NIST SP 800-38A F.2.5 (CBC-AES256.Encrypt), first block.
+        let key = unhex("603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4");
+        let ct256 = aes256_cbc_encrypt_nopad(&key, &iv, &pt);
+        assert_eq!(hex(&ct256), "f58c4c04d6e5f1ba779eabfb5f7bfbd6");
+        let mut buf = ct256.clone();
+        assert!(cbc_decrypt_in_place(&key, &iv, &mut buf));
+        assert_eq!(buf, pt);
+    }
+
+    #[test]
+    fn aes_iv_prefix_and_padding() {
+        let key = unhex("000102030405060708090a0b0c0d0e0f");
+        let iv = [0x42u8; 16];
+        let plaintext = b"attack at dawn".to_vec(); // 14 bytes → 2 bytes padding
+
+        // Build a PDF-style payload: IV || AES-CBC(plaintext + PKCS#5 pad).
+        let mut padded = plaintext.clone();
+        padded.extend_from_slice(&[2, 2]);
+        let mut payload = iv.to_vec();
+        payload.extend_from_slice(&aes128_cbc_encrypt_nopad(&key, &iv, &padded));
+        assert_eq!(aes_cbc_decrypt(&key, &payload), plaintext);
+
+        // Invalid padding (last byte 0 / out of range): keep the data, warn.
+        let mut bad = plaintext.clone();
+        bad.extend_from_slice(&[2, 0]);
+        let mut payload = iv.to_vec();
+        payload.extend_from_slice(&aes128_cbc_encrypt_nopad(&key, &iv, &bad));
+        assert_eq!(aes_cbc_decrypt(&key, &payload), bad);
+
+        // Structurally impossible lengths are returned unmodified.
+        assert_eq!(aes_cbc_decrypt(&key, &[1, 2, 3]), vec![1, 2, 3]);
+        assert_eq!(aes_cbc_decrypt(&key, &payload[..17]), payload[..17].to_vec());
+        assert_eq!(aes_cbc_decrypt(&key, b""), Vec::<u8>::new());
+        // An empty ciphertext (IV only) decodes to an empty plaintext.
+        assert_eq!(aes_cbc_decrypt(&key, &iv), Vec::<u8>::new());
+    }
+
+    /// Round-trip ISO 32000-2 Algorithm 2.A against a synthetic /Encrypt dict
+    /// built with the writer-side algorithms (8 & 9): both the user (/U + /UE)
+    /// and owner (/O + /OE) paths must recover the same file key.
+    #[test]
+    fn v5_key_derivation_roundtrip() {
+        for r in [5i64, 6] {
+            let file_key = [0xA5u8; 32];
+            let (uvsalt, uksalt) = ([0x11u8; 8], [0x22u8; 8]);
+
+            // Algorithm 8: /U and /UE for the empty user password.
+            let mut u = hash_v5(r, b"", &uvsalt, &[]).to_vec();
+            u.extend_from_slice(&uvsalt);
+            u.extend_from_slice(&uksalt);
+            let ik = hash_v5(r, b"", &uksalt, &[]);
+            let ue = aes256_cbc_encrypt_nopad(&ik, &[0u8; 16], &file_key);
+
+            // Algorithm 9: /O and /OE for the empty owner password (over U).
+            let (ovsalt, oksalt) = ([0x33u8; 8], [0x44u8; 8]);
+            let mut o = hash_v5(r, b"", &ovsalt, &u[..48]).to_vec();
+            o.extend_from_slice(&ovsalt);
+            o.extend_from_slice(&oksalt);
+            let oik = hash_v5(r, b"", &oksalt, &u[..48]);
+            let oe = aes256_cbc_encrypt_nopad(&oik, &[0u8; 16], &file_key);
+
+            let mut dict = PdfDict::new();
+            dict.insert(PdfName::new("U"), PdfObject::String(PdfString(u.clone())));
+            dict.insert(PdfName::new("UE"), PdfObject::String(PdfString(ue)));
+            dict.insert(PdfName::new("O"), PdfObject::String(PdfString(o.clone())));
+            dict.insert(PdfName::new("OE"), PdfObject::String(PdfString(oe.clone())));
+            assert_eq!(
+                compute_key_v5(&dict, r).as_deref(),
+                Some(&file_key[..]),
+                "user-password path, R{r}"
+            );
+
+            // Omit /UE: the user hash still validates but the file key cannot
+            // be recovered from it, so the owner (/O + /OE) path must take
+            // over. (The owner hashes bind to the original /U, so /U itself
+            // must stay intact.)
+            let mut dict2 = PdfDict::new();
+            dict2.insert(PdfName::new("U"), PdfObject::String(PdfString(u)));
+            dict2.insert(PdfName::new("O"), PdfObject::String(PdfString(o)));
+            dict2.insert(PdfName::new("OE"), PdfObject::String(PdfString(oe)));
+            assert_eq!(
+                compute_key_v5(&dict2, r).as_deref(),
+                Some(&file_key[..]),
+                "owner-password fallback, R{r}"
+            );
+        }
+    }
+
+    /// /StmF Identity + /StrF StdCF(RC4): strings decrypt, streams pass through.
+    #[test]
+    fn v4_identity_stream_filter_leaves_streams_alone() {
+        let mut stdcf = PdfDict::new();
+        stdcf.insert(PdfName::new("CFM"), PdfObject::Name(PdfName::new("V2")));
+        stdcf.insert(PdfName::new("Length"), PdfObject::Integer(16));
+        let mut cf = PdfDict::new();
+        cf.insert(PdfName::new("StdCF"), PdfObject::Dict(stdcf));
+        let mut dict = PdfDict::new();
+        dict.insert(PdfName::new("Filter"), PdfObject::Name(PdfName::new("Standard")));
+        dict.insert(PdfName::new("V"), PdfObject::Integer(4));
+        dict.insert(PdfName::new("R"), PdfObject::Integer(4));
+        dict.insert(PdfName::new("CF"), PdfObject::Dict(cf));
+        dict.insert(PdfName::new("StmF"), PdfObject::Name(PdfName::new("Identity")));
+        dict.insert(PdfName::new("StrF"), PdfObject::Name(PdfName::new("StdCF")));
+
+        let dec = Decryptor::from_encrypt_dict(&dict, &[], None).expect("decryptor");
+        assert_eq!(dec.stm_algo, Algo::Identity);
+        assert_eq!(dec.str_algo, Algo::Rc4);
+
+        let stream_data = b"stream payload".to_vec();
+        let string_data = b"string payload".to_vec();
+        let mut arr = PdfObject::Array(vec![
+            PdfObject::Stream(PdfStream::new(PdfDict::new(), stream_data.clone())),
+            PdfObject::String(PdfString(string_data.clone())),
+        ]);
+        dec.decrypt_object(&mut arr, ObjectId(9, 0));
+        let PdfObject::Array(items) = &arr else { unreachable!() };
+        let PdfObject::Stream(s) = &items[0] else { unreachable!() };
+        assert_eq!(&s.data[..], &stream_data[..], "Identity /StmF must not touch streams");
+        let PdfObject::String(st) = &items[1] else { unreachable!() };
+        assert_ne!(st.0, string_data, "/StrF StdCF must decrypt strings");
+        // ObjStm container bytes go through the stream filter → untouched too.
+        assert_eq!(dec.decrypt_stream_bytes(ObjectId(9, 0), b"objstm"), b"objstm");
+    }
+
+    /// /EncryptMetadata false leaves /Type /Metadata stream payloads alone.
+    #[test]
+    fn encrypt_metadata_false_skips_metadata_stream() {
+        let dec = Decryptor {
+            key: vec![1, 2, 3, 4, 5],
+            stm_algo: Algo::Rc4,
+            str_algo: Algo::Rc4,
+            encrypt_id: None,
+            encrypt_metadata: false,
+        };
+        let xmp = b"<x:xmpmeta/>".to_vec();
+        let mut meta_dict = PdfDict::new();
+        meta_dict.insert(PdfName::new("Type"), PdfObject::Name(PdfName::new("Metadata")));
+        let mut meta = PdfObject::Stream(PdfStream::new(meta_dict, xmp.clone()));
+        dec.decrypt_object(&mut meta, ObjectId(7, 0));
+        let PdfObject::Stream(s) = &meta else { unreachable!() };
+        assert_eq!(&s.data[..], &xmp[..], "plaintext metadata must not be corrupted");
+
+        // A regular stream under the same decryptor IS decrypted.
+        let mut other = PdfObject::Stream(PdfStream::new(PdfDict::new(), xmp.clone()));
+        dec.decrypt_object(&mut other, ObjectId(7, 0));
+        let PdfObject::Stream(s) = &other else { unreachable!() };
+        assert_ne!(&s.data[..], &xmp[..]);
+    }
+
+    // ------------------------------------------------------------------
+    // End-to-end fixtures (generated by target/crypto_fixtures/make_fixtures.py
+    // via pypdf, empty user password). See tests/fixtures/.
+    // ------------------------------------------------------------------
+
+    const AES_MARKER: &[u8] = b"(Hello AES zpdf fixture) Tj";
+
+    fn assert_fixture_decrypts(bytes: &[u8]) {
+        let file = crate::PdfFile::parse(bytes.to_vec()).expect("parse encrypted fixture");
+        let content = content_stream_bytes(&file);
+        assert!(
+            content
+                .windows(AES_MARKER.len())
+                .any(|w| w == AES_MARKER),
+            "decrypted content stream should contain the known marker, got: {:?}",
+            String::from_utf8_lossy(&content)
+        );
+    }
+
+    /// V4/R4 crypt filter AESV2 (AES-128-CBC), empty user password.
+    #[test]
+    fn aesv2_r4_decrypts_end_to_end() {
+        assert_fixture_decrypts(include_bytes!("../tests/fixtures/aesv2_r4.pdf"));
+    }
+
+    /// V5/R5 crypt filter AESV3 (AES-256-CBC, plain SHA-256 hash).
+    #[test]
+    fn aesv3_r5_decrypts_end_to_end() {
+        assert_fixture_decrypts(include_bytes!("../tests/fixtures/aesv3_r5.pdf"));
+    }
+
+    /// V5/R6 crypt filter AESV3 (AES-256-CBC, Algorithm 2.B hardened hash).
+    #[test]
+    fn aesv3_r6_decrypts_end_to_end() {
+        assert_fixture_decrypts(include_bytes!("../tests/fixtures/aesv3_r6.pdf"));
+    }
+
+    // ------------------------------------------------------------------
+    // Direct (non-reference) /Encrypt dict in the trailer + RC4 regression
+    // ------------------------------------------------------------------
+
+    fn hexstr(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    /// Hand-build a tiny V1/R2 RC4-40 PDF whose trailer carries the /Encrypt
+    /// dictionary **directly** (not as an indirect reference).
+    fn build_rc4_direct_encrypt_pdf(content_plain: &[u8]) -> Vec<u8> {
+        // Algorithm 3 (R2): /O = RC4(MD5(padded owner pwd)[..5], padded user pwd),
+        // both passwords empty → both pads.
+        let okey = md5(&PAD);
+        let o = rc4(&okey[..5], &PAD);
+        let id0: Vec<u8> = (0u8..16).collect();
+        let p: i32 = -1;
+        let key = compute_key_rc4(&o, p, &id0, 2, 40, true);
+        let u = rc4(&key, &PAD); // Algorithm 4
+
+        // RC4 is symmetric: "decrypting" the plaintext produces the ciphertext.
+        let enc = Decryptor {
+            key,
+            stm_algo: Algo::Rc4,
+            str_algo: Algo::Rc4,
+            encrypt_id: None,
+            encrypt_metadata: true,
+        };
+        let content_enc = enc.decrypt_stream_bytes(ObjectId(5, 0), content_plain);
+
+        let mut stream_obj = format!("<< /Length {} >>\nstream\n", content_enc.len()).into_bytes();
+        stream_obj.extend_from_slice(&content_enc);
+        stream_obj.extend_from_slice(b"\nendstream");
+        let bodies: Vec<Vec<u8>> = vec![
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 5 0 R >>".to_vec(),
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+            stream_obj,
+        ];
+
+        let mut out: Vec<u8> = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        for (i, body) in bodies.iter().enumerate() {
+            offsets.push(out.len());
+            out.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+            out.extend_from_slice(body);
+            out.extend_from_slice(b"\nendobj\n");
+        }
+        let xref_pos = out.len();
+        out.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+        for off in &offsets {
+            out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        out.extend_from_slice(
+            format!(
+                "trailer\n<< /Size 6 /Root 1 0 R /ID [<{id}> <{id}>] /Encrypt << /Filter \
+                 /Standard /V 1 /R 2 /Length 40 /O <{o}> /U <{u}> /P {p} >> >>\nstartxref\n\
+                 {xref_pos}\n%%EOF\n",
+                id = hexstr(&id0),
+                o = hexstr(&o),
+                u = hexstr(&u),
+            )
+            .as_bytes(),
+        );
+        out
+    }
+
+    /// A direct /Encrypt dict must still enable decryption (regression: it used
+    /// to silently disable it), and the plain RC4 path must keep working.
+    #[test]
+    fn rc4_direct_encrypt_dict_in_trailer() {
+        let plain = b"BT /F1 12 Tf (direct encrypt dict) Tj ET";
+        let pdf = build_rc4_direct_encrypt_pdf(plain);
+        let file = crate::PdfFile::parse(pdf).expect("parse hand-built encrypted PDF");
+        assert_eq!(content_stream_bytes(&file), plain);
     }
 }

@@ -340,7 +340,7 @@ impl<'a> Lexer<'a> {
         Ok(PdfObject::Dict(dict))
     }
 
-    fn maybe_resolve_ref(&mut self, obj: PdfObject) -> Result<PdfObject> {
+    pub(crate) fn maybe_resolve_ref(&mut self, obj: PdfObject) -> Result<PdfObject> {
         if let PdfObject::Integer(num) = obj {
             let saved = self.pos;
             self.skip_whitespace_and_comments();

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use zpdf_core::{Error, ParseLimits, PdfDict, PdfObject, PdfStream, Result};
+use zpdf_core::{Error, ObjectId, ParseLimits, PdfDict, PdfObject, PdfStream, Result};
 
 use crate::lexer::Lexer;
 
@@ -17,26 +17,58 @@ impl<'a> ObjectParser<'a> {
     /// Parse an indirect object at the given byte offset.
     /// Expected format: `<num> <gen> obj <value> endobj`
     pub fn parse_indirect_at(&self, offset: usize) -> Result<PdfObject> {
+        self.parse_indirect_with_id(offset).map(|(_, obj)| obj)
+    }
+
+    /// Like [`parse_indirect_at`](Self::parse_indirect_at), but also returns
+    /// the `(num, gen)` actually present in the object header. Callers that
+    /// arrived here via an xref entry can compare it against the id they asked
+    /// for and trigger repair on a mismatch (stale/corrupt offsets are common
+    /// in damaged files).
+    pub fn parse_indirect_with_id(&self, offset: usize) -> Result<(ObjectId, PdfObject)> {
         let mut lex = Lexer::new(self.data, offset, self.limits);
 
-        let _obj_num = lex.next_token()?;
-        let _gen_num = lex.next_token()?;
+        let num_tok = lex.next_token()?;
+        let gen_tok = lex.next_token()?;
+        let id = match (&num_tok, &gen_tok) {
+            (PdfObject::Integer(n), PdfObject::Integer(g)) => {
+                match (u32::try_from(*n), u16::try_from(*g)) {
+                    (Ok(n), Ok(g)) => ObjectId(n, g),
+                    _ => {
+                        return Err(Error::InvalidObject(
+                            offset as u64,
+                            format!("object header out of range: {n} {g} obj"),
+                        ))
+                    }
+                }
+            }
+            _ => {
+                return Err(Error::InvalidObject(
+                    offset as u64,
+                    "object header is not '<int> <int> obj'".into(),
+                ))
+            }
+        };
 
         lex.skip_whitespace_and_comments();
         self.expect_keyword(&mut lex, b"obj")?;
 
         let obj = lex.next_token()?;
+        // A top-level body may itself be an indirect reference (`N G R`), which
+        // the plain tokenizer reads as a bare integer; promote it so resolve()
+        // can follow ref-to-ref chains.
+        let obj = lex.maybe_resolve_ref(obj)?;
 
         // Check if this is a stream object
         lex.skip_whitespace_and_comments();
         if let PdfObject::Dict(dict) = &obj {
             if self.starts_with_at(lex.pos(), b"stream") {
                 let stream = self.read_stream(dict.clone(), lex.pos())?;
-                return Ok(PdfObject::Stream(stream));
+                return Ok((id, PdfObject::Stream(stream)));
             }
         }
 
-        Ok(obj)
+        Ok((id, obj))
     }
 
     fn expect_keyword(&self, lex: &mut Lexer, keyword: &[u8]) -> Result<()> {
@@ -272,6 +304,34 @@ mod tests {
         data.extend_from_slice(b"data");
         data.extend_from_slice(b"\r\nendstream\nendobj\n");
         assert_eq!(stream_data(&data), b"data");
+    }
+
+    #[test]
+    fn parse_indirect_with_id_returns_header_id() {
+        let data = b"7 2 obj\n<< /Type /Catalog >>\nendobj\n";
+        let limits = ParseLimits::default();
+        let parser = ObjectParser::new(data, &limits);
+        let (id, obj) = parser.parse_indirect_with_id(0).unwrap();
+        assert_eq!(id, ObjectId(7, 2));
+        assert!(obj.as_dict().is_ok());
+    }
+
+    #[test]
+    fn parse_indirect_with_id_rejects_non_integer_header() {
+        let data = b"/Name 0 obj\n42\nendobj\n";
+        let limits = ParseLimits::default();
+        let parser = ObjectParser::new(data, &limits);
+        assert!(parser.parse_indirect_with_id(0).is_err());
+    }
+
+    #[test]
+    fn top_level_ref_body_parses_as_ref() {
+        // `4 0 obj 5 0 R endobj` — the body is itself an indirect reference.
+        let data = b"4 0 obj\n5 0 R\nendobj\n";
+        let limits = ParseLimits::default();
+        let parser = ObjectParser::new(data, &limits);
+        let obj = parser.parse_indirect_at(0).unwrap();
+        assert_eq!(obj, PdfObject::Ref(ObjectId(5, 0)));
     }
 
     #[test]

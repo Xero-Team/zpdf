@@ -1,5 +1,10 @@
 use zpdf_core::{Error, PdfDict, PdfName, PdfObject, Result};
 
+/// Hard cap on the bytes produced by any single decompression filter (Flate,
+/// LZW, RunLength). Stops decompression bombs even though `ParseLimits` is not
+/// threaded into this layer (filter functions see only bytes + dict).
+const MAX_DECODED_OUTPUT: usize = 1 << 30; // 1 GiB
+
 pub fn decode_stream(data: &[u8], dict: &PdfDict) -> Result<Vec<u8>> {
     let filters = match dict.get("Filter") {
         Some(PdfObject::Name(n)) => vec![n.clone()],
@@ -221,8 +226,6 @@ fn apply_filter(filter: &PdfName, data: &[u8], params: Option<&PdfDict>) -> Resu
 fn lzw_decode(data: &[u8], early_change: i64) -> Result<Vec<u8>> {
     const CLEAR: u32 = 256;
     const EOD: u32 = 257;
-    // Output-size safety cap (matches ParseLimits::max_stream_bytes default).
-    const MAX_OUTPUT: usize = 256 * 1024 * 1024;
 
     // EarlyChange is effectively a flag: any nonzero -> 1, explicit 0 -> 0.
     let early: u32 = if early_change == 0 { 0 } else { 1 };
@@ -299,9 +302,9 @@ fn lzw_decode(data: &[u8], early_change: i64) -> Result<Vec<u8>> {
         };
 
         out.extend_from_slice(&entry);
-        if out.len() > MAX_OUTPUT {
+        if out.len() > MAX_DECODED_OUTPUT {
             return Err(Error::StreamDecode(
-                "LZWDecode: output exceeds limit".into(),
+                "LZWDecode: output exceeds decompression limit".into(),
             ));
         }
 
@@ -329,27 +332,123 @@ fn lzw_decode(data: &[u8], early_change: i64) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-fn decode_flate(data: &[u8]) -> Result<Vec<u8>> {
-    use flate2::read::ZlibDecoder;
-    use std::io::Read;
-
-    let mut decoder = ZlibDecoder::new(data);
-    let mut output = Vec::new();
-    decoder
-        .read_to_end(&mut output)
-        .map_err(|e| Error::StreamDecode(format!("FlateDecode: {e}")))?;
-    Ok(output)
+/// Outcome of one chunked inflate attempt: either the reader ran to a clean
+/// EOF, or it failed partway with whatever bytes were recovered first.
+enum InflateOutcome {
+    Complete(Vec<u8>),
+    Failed(Vec<u8>, String),
 }
 
+/// Drive `reader` to completion in fixed-size chunks so that a mid-stream
+/// error still yields the bytes decoded before it. Output is capped at
+/// [`MAX_DECODED_OUTPUT`]; hitting the cap is a hard error (a decompression
+/// bomb is not salvageable data).
+fn inflate_chunked(mut reader: impl std::io::Read) -> Result<InflateOutcome> {
+    let mut out = Vec::new();
+    let mut buf = [0u8; 16 * 1024];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => return Ok(InflateOutcome::Complete(out)),
+            Ok(n) => {
+                if out.len() + n > MAX_DECODED_OUTPUT {
+                    return Err(Error::StreamDecode(
+                        "FlateDecode: output exceeds decompression limit".into(),
+                    ));
+                }
+                out.extend_from_slice(&buf[..n]);
+            }
+            Err(e) => return Ok(InflateOutcome::Failed(out, e.to_string())),
+        }
+    }
+}
+
+/// FlateDecode with real-world tolerance: salvages partial output from
+/// truncated/corrupt zlib streams, retries headerless data as raw deflate,
+/// and skips a bounded run of leading garbage before a plausible zlib header.
+fn decode_flate(data: &[u8]) -> Result<Vec<u8>> {
+    use flate2::read::{DeflateDecoder, ZlibDecoder};
+
+    // Lenient: an empty stream decodes to nothing.
+    if data.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Plausible zlib header at `i`: CM (low nibble of CMF) is 8 (deflate) and
+    // the FCHECK property holds (CMF<<8 | FLG divisible by 31).
+    let plausible_zlib = |i: usize| {
+        data.len() >= i + 2
+            && data[i] & 0x0f == 8
+            && ((data[i] as u32) << 8 | data[i + 1] as u32).is_multiple_of(31)
+    };
+
+    let mut zlib_err: Option<String> = None;
+    if plausible_zlib(0) {
+        match inflate_chunked(ZlibDecoder::new(data))? {
+            InflateOutcome::Complete(out) => return Ok(out),
+            InflateOutcome::Failed(partial, err) if !partial.is_empty() => {
+                tracing::warn!(
+                    "FlateDecode: zlib stream failed after {} bytes ({err}); keeping partial output",
+                    partial.len()
+                );
+                return Ok(partial);
+            }
+            InflateOutcome::Failed(_, err) => zlib_err = Some(err),
+        }
+    }
+
+    // The header was implausible (or decoded to nothing): look for a plausible
+    // CMF/FLG pair after a bounded garbage/whitespace prefix.
+    const MAX_HEADER_SCAN: usize = 64;
+    if let Some(k) = (1..data.len().min(MAX_HEADER_SCAN)).find(|&k| plausible_zlib(k)) {
+        match inflate_chunked(ZlibDecoder::new(&data[k..]))? {
+            InflateOutcome::Complete(out) => {
+                tracing::warn!("FlateDecode: skipped {k} bytes of leading garbage");
+                return Ok(out);
+            }
+            InflateOutcome::Failed(partial, err) if !partial.is_empty() => {
+                tracing::warn!(
+                    "FlateDecode: zlib stream at offset {k} failed ({err}); keeping {} partial bytes",
+                    partial.len()
+                );
+                return Ok(partial);
+            }
+            InflateOutcome::Failed(..) => {}
+        }
+    }
+
+    // Last resort: some writers emit raw deflate with no zlib wrapper.
+    match inflate_chunked(DeflateDecoder::new(data))? {
+        InflateOutcome::Complete(out) => {
+            tracing::warn!("FlateDecode: decoded as raw deflate (missing zlib header)");
+            Ok(out)
+        }
+        InflateOutcome::Failed(partial, err) if !partial.is_empty() => {
+            tracing::warn!(
+                "FlateDecode: raw deflate failed ({err}); keeping {} partial bytes",
+                partial.len()
+            );
+            Ok(partial)
+        }
+        InflateOutcome::Failed(_, err) => Err(Error::StreamDecode(format!(
+            "FlateDecode: {}",
+            zlib_err.unwrap_or(err)
+        ))),
+    }
+}
+
+/// Lenient ASCIIHexDecode: whitespace is ignored anywhere, stray non-hex bytes
+/// are skipped (warned, not fatal), and anything after the `>` EOD marker is
+/// ignored, so partial/dirty streams still decode.
 fn decode_ascii_hex(data: &[u8]) -> Result<Vec<u8>> {
     let mut output = Vec::with_capacity(data.len() / 2);
     let mut high: Option<u8> = None;
+    let mut stray = 0usize;
 
     for &b in data {
         if b == b'>' {
-            break;
+            break; // EOD; bytes after it are ignored
         }
-        if b.is_ascii_whitespace() {
+        if b.is_ascii_whitespace() || b == 0 {
             continue;
         }
         let nibble = match b {
@@ -357,9 +456,8 @@ fn decode_ascii_hex(data: &[u8]) -> Result<Vec<u8>> {
             b'a'..=b'f' => b - b'a' + 10,
             b'A'..=b'F' => b - b'A' + 10,
             _ => {
-                return Err(Error::StreamDecode(format!(
-                    "ASCIIHexDecode: invalid byte 0x{b:02x}"
-                )))
+                stray += 1;
+                continue;
             }
         };
 
@@ -375,23 +473,29 @@ fn decode_ascii_hex(data: &[u8]) -> Result<Vec<u8>> {
     if let Some(h) = high {
         output.push(h << 4);
     }
+    if stray > 0 {
+        tracing::warn!("ASCIIHexDecode: ignored {stray} invalid byte(s)");
+    }
 
     Ok(output)
 }
 
+/// Lenient ASCII85Decode: whitespace is ignored anywhere, stray bytes outside
+/// the alphabet are skipped (warned, not fatal), and everything from the `~`
+/// of the `~>` EOD marker on is ignored, salvaging partial output.
 fn decode_ascii85(data: &[u8]) -> Result<Vec<u8>> {
     let mut output = Vec::new();
-    let mut tuple: u32 = 0;
-    let mut count = 0;
-
-    let data = if data.ends_with(b"~>") {
-        &data[..data.len() - 2]
-    } else {
-        data
-    };
+    // u64 accumulator: a 5-char group of bytes near 'u' encodes a value just
+    // above u32::MAX; the spec calls it invalid, but it must not overflow.
+    let mut tuple: u64 = 0;
+    let mut count = 0usize;
+    let mut stray = 0usize;
 
     for &b in data {
-        if b.is_ascii_whitespace() {
+        if b == b'~' {
+            break; // start of the "~>" EOD marker; ignore it and the rest
+        }
+        if b.is_ascii_whitespace() || b == 0 {
             continue;
         }
 
@@ -401,19 +505,16 @@ fn decode_ascii85(data: &[u8]) -> Result<Vec<u8>> {
         }
 
         if !(b'!'..=b'u').contains(&b) {
-            return Err(Error::StreamDecode(format!(
-                "ASCII85Decode: invalid byte 0x{b:02x}"
-            )));
+            stray += 1;
+            continue;
         }
 
-        tuple = tuple * 85 + (b - b'!') as u32;
+        tuple = tuple * 85 + (b - b'!') as u64;
         count += 1;
 
         if count == 5 {
-            output.push((tuple >> 24) as u8);
-            output.push((tuple >> 16) as u8);
-            output.push((tuple >> 8) as u8);
-            output.push(tuple as u8);
+            let t = (tuple & 0xFFFF_FFFF) as u32;
+            output.extend_from_slice(&t.to_be_bytes());
             tuple = 0;
             count = 0;
         }
@@ -424,9 +525,13 @@ fn decode_ascii85(data: &[u8]) -> Result<Vec<u8>> {
         for _ in count..5 {
             tuple = tuple * 85 + 84; // pad with 'u'
         }
+        let t = (tuple & 0xFFFF_FFFF) as u32;
         for i in 0..(count - 1) {
-            output.push((tuple >> (24 - i * 8)) as u8);
+            output.push((t >> (24 - i * 8)) as u8);
         }
+    }
+    if stray > 0 {
+        tracing::warn!("ASCII85Decode: ignored {stray} invalid byte(s)");
     }
 
     Ok(output)
@@ -456,6 +561,11 @@ fn decode_run_length(data: &[u8]) -> Result<Vec<u8>> {
             if i + count > data.len() {
                 return Err(Error::StreamDecode("RunLengthDecode: truncated".into()));
             }
+            if output.len() + count > MAX_DECODED_OUTPUT {
+                return Err(Error::StreamDecode(
+                    "RunLengthDecode: output exceeds decompression limit".into(),
+                ));
+            }
             output.extend_from_slice(&data[i..i + count]);
             i += count;
         } else {
@@ -463,6 +573,11 @@ fn decode_run_length(data: &[u8]) -> Result<Vec<u8>> {
             let count = 257 - length_byte as usize;
             if i >= data.len() {
                 return Err(Error::StreamDecode("RunLengthDecode: truncated".into()));
+            }
+            if output.len() + count > MAX_DECODED_OUTPUT {
+                return Err(Error::StreamDecode(
+                    "RunLengthDecode: output exceeds decompression limit".into(),
+                ));
             }
             let byte = data[i];
             i += 1;
@@ -493,8 +608,85 @@ mod tests {
     }
 
     #[test]
+    fn flate_partial_salvage_on_truncation() {
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        // Deterministic, mostly-incompressible data so the compressed stream
+        // is long and a truncation still leaves plenty of decodable input.
+        let mut state = 0x2545F491u64;
+        let original: Vec<u8> = (0..64 * 1024)
+            .map(|_| {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (state >> 33) as u8
+            })
+            .collect();
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&original).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let truncated = &compressed[..compressed.len() / 2];
+        let decoded = decode_flate(truncated).unwrap();
+        assert!(!decoded.is_empty(), "partial output must be salvaged");
+        assert!(decoded.len() < original.len());
+        assert_eq!(&original[..decoded.len()], &decoded[..], "salvaged bytes are a prefix");
+    }
+
+    #[test]
+    fn flate_raw_deflate_fallback() {
+        use flate2::write::DeflateEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let original = b"raw deflate stream without a zlib wrapper".to_vec();
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&original).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let decoded = decode_flate(&compressed).unwrap();
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn flate_skips_leading_garbage() {
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let original = b"zlib data behind a garbage prefix".to_vec();
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&original).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        // \r\n\xff: no byte pair in the prefix forms a plausible zlib header.
+        let mut data = b"\r\n\xff".to_vec();
+        data.extend_from_slice(&compressed);
+        let decoded = decode_flate(&data).unwrap();
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn flate_empty_input_is_empty_output() {
+        assert_eq!(decode_flate(&[]).unwrap(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn flate_garbage_still_errors() {
+        // Pure ASCII text: implausible zlib header, invalid deflate.
+        assert!(decode_flate(b"this is not compressed data at all....").is_err());
+    }
+
+    #[test]
     fn ascii_hex() {
         let decoded = decode_ascii_hex(b"48 65 6C 6C 6F>").unwrap();
+        assert_eq!(decoded, b"Hello");
+    }
+
+    #[test]
+    fn ascii_hex_tolerates_stray_bytes_and_data_after_eod() {
+        // 'x'/'!' are not hex digits (skipped); '>' is EOD (rest ignored).
+        let decoded = decode_ascii_hex(b"48 65 x6C!6C 6F> trailing garbage \xff").unwrap();
         assert_eq!(decoded, b"Hello");
     }
 
@@ -503,6 +695,27 @@ mod tests {
         // "Man " encodes to "9jqo^" in ASCII85
         let decoded = decode_ascii85(b"9jqo^~>").unwrap();
         assert_eq!(decoded, b"Man ");
+    }
+
+    #[test]
+    fn ascii85_ignores_bytes_after_eod() {
+        let decoded = decode_ascii85(b"9jqo^~> stray bytes \xff\xfe after EOD").unwrap();
+        assert_eq!(decoded, b"Man ");
+    }
+
+    #[test]
+    fn ascii85_skips_stray_bytes_and_whitespace() {
+        // NUL and 0xFF are outside the alphabet: skipped, not fatal.
+        // Whitespace inside a group is ignored.
+        let decoded = decode_ascii85(b"9j\x00qo\xff ^~>").unwrap();
+        assert_eq!(decoded, b"Man ");
+    }
+
+    #[test]
+    fn ascii85_overflowing_group_does_not_panic() {
+        // "uuuuu" encodes a value above u32::MAX — invalid per spec, but must
+        // decode leniently (truncated) instead of overflowing.
+        assert!(decode_ascii85(b"uuuuu~>").is_ok());
     }
 
     #[test]

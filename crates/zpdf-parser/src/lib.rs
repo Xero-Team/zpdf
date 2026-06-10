@@ -12,10 +12,10 @@ pub use lexer::Lexer;
 pub use object_parser::ObjectParser;
 pub use xref::{XrefEntry, XrefTable};
 
-use std::cell::RefCell;
+use std::cell::{OnceCell, RefCell};
 use std::collections::HashMap;
 use std::sync::Arc;
-use zpdf_core::{ObjectId, ParseLimits, PdfObject, PdfStream, Result};
+use zpdf_core::{ObjectId, ParseLimits, PdfDict, PdfName, PdfObject, PdfStream, Result};
 
 /// One fully-decoded /Type /ObjStm: decoded bytes + parsed offset table, shared
 /// via Arc so a cache hit is a refcount bump, not a copy of the decoded buffer.
@@ -46,6 +46,11 @@ pub struct PdfFile {
     /// Cache of decoded object streams, keyed by the ObjStm object number.
     /// Avoids re-decoding the whole stream for every compressed object it holds.
     objstm_cache: RefCell<HashMap<u32, Arc<DecodedObjStm>>>,
+    /// Lazily-built repair table: populated at most once by a full-file object
+    /// scan, the first time an xref offset turns out to hold the wrong object
+    /// (or no parseable object at all). The inner `None` means the scan itself
+    /// failed and is not retried. Open-time recovery is independent of this.
+    repair_table: OnceCell<Option<XrefTable>>,
 }
 
 impl PdfFile {
@@ -94,6 +99,7 @@ impl PdfFile {
             decryptor: None,
             object_cache: RefCell::new(HashMap::new()),
             objstm_cache: RefCell::new(HashMap::new()),
+            repair_table: OnceCell::new(),
         };
         // Build the decryptor *after* construction so it can use `resolve` to
         // fetch the (never-encrypted) /Encrypt dict; `decryptor` is still `None`
@@ -106,12 +112,16 @@ impl PdfFile {
     /// `/Encrypt` dictionary and the first element of `/ID`. Returns `None` for
     /// unencrypted documents or unsupported handlers (AES, non-Standard).
     fn build_decryptor(&self) -> Option<crypt::Decryptor> {
-        let encrypt_ref = self.trailer.get_ref("Encrypt").ok()?;
+        // /Encrypt is normally an indirect reference, but a direct dict is
+        // legal too (a direct dict has no object id to exempt from decryption).
         // The /Encrypt dict is itself never encrypted; resolve it directly.
-        let enc_obj = self.resolve(encrypt_ref).ok()?;
+        let (enc_obj, encrypt_ref) = match self.trailer.get("Encrypt")? {
+            PdfObject::Ref(r) => (self.resolve(*r).ok()?, Some(*r)),
+            direct => (direct.clone(), None),
+        };
         let enc_dict = enc_obj.as_dict().ok()?;
         let id_first = self.first_id_bytes();
-        crypt::Decryptor::from_encrypt_dict(enc_dict, &id_first, Some(encrypt_ref))
+        crypt::Decryptor::from_encrypt_dict(enc_dict, &id_first, encrypt_ref)
     }
 
     /// Raw bytes of the first element of the trailer `/ID` array (used in the
@@ -134,19 +144,65 @@ impl PdfFile {
     }
 
     pub fn resolve(&self, id: zpdf_core::ObjectId) -> Result<PdfObject> {
+        self.resolve_depth(id, 0)
+    }
+
+    fn resolve_depth(&self, id: ObjectId, depth: u32) -> Result<PdfObject> {
+        /// Maximum length of a ref-to-ref chain (`1 0 obj 2 0 R endobj` ...)
+        /// followed before the reference is treated as null. Guards against
+        /// reference cycles (`A -> B -> A`) without a per-call visited set.
+        const MAX_REF_CHAIN: u32 = 32;
+        if depth > MAX_REF_CHAIN {
+            tracing::warn!(
+                "indirect reference chain longer than {MAX_REF_CHAIN} at {id}; treating as null"
+            );
+            return Ok(PdfObject::Null);
+        }
+
         // Fast path: already resolved. The borrow ends with this block.
         if let Some(obj) = self.object_cache.borrow().get(&id) {
             return Ok(obj.clone());
         }
 
-        let entry = self
-            .xref
-            .get(id)
-            .ok_or(zpdf_core::Error::ObjectNotFound(id))?;
+        // ISO 32000-1, 7.3.10: a reference to an object that is missing from
+        // the xref, or marked free, is a reference to the null object — not an
+        // error. Cache the Null so the warning fires once per object.
+        let Some(entry) = self.xref.get(id) else {
+            tracing::warn!("reference to missing object {id}; treating as null");
+            self.object_cache.borrow_mut().insert(id, PdfObject::Null);
+            return Ok(PdfObject::Null);
+        };
         let obj = match entry {
-            XrefEntry::InUse { offset, .. } => {
-                let parser = ObjectParser::new(&self.data, &self.limits);
-                let mut obj = parser.parse_indirect_at(*offset as usize)?;
+            XrefEntry::InUse { offset, .. } => self.parse_at_offset_checked(*offset, id)?,
+            XrefEntry::Compressed {
+                stream_obj,
+                index_in_stream,
+            } => self.extract_from_object_stream(*stream_obj, *index_in_stream)?,
+            XrefEntry::Free { .. } => {
+                tracing::warn!("reference to free object {id}; treating as null");
+                PdfObject::Null
+            }
+        };
+
+        // A top-level object body may itself be an indirect reference; follow
+        // the chain (depth-limited) so callers always get a direct value.
+        let obj = match obj {
+            PdfObject::Ref(next) => self.resolve_depth(next, depth + 1)?,
+            other => other,
+        };
+
+        self.object_cache.borrow_mut().insert(id, obj.clone());
+        Ok(obj)
+    }
+
+    /// Parse the indirect object at `offset`, validating that the header's
+    /// `(num, gen)` matches the id the xref claimed lives there. On mismatch or
+    /// parse failure, consult the lazily-built repair table (full-file object
+    /// scan, run at most once) before giving up.
+    fn parse_at_offset_checked(&self, offset: u64, id: ObjectId) -> Result<PdfObject> {
+        let parser = ObjectParser::new(&self.data, &self.limits);
+        match parser.parse_indirect_with_id(offset as usize) {
+            Ok((pid, mut obj)) if pid == id => {
                 // Top-level objects parsed straight from the file are encrypted;
                 // RC4-decrypt their strings and stream bytes in place (the
                 // decryptor skips the /Encrypt object itself). Objects pulled
@@ -155,24 +211,112 @@ impl PdfFile {
                 if let Some(dec) = &self.decryptor {
                     dec.decrypt_object(&mut obj, id);
                 }
-                obj
+                Ok(obj)
+            }
+            Ok((pid, _)) => {
+                tracing::warn!("xref offset {offset} for {id} holds object {pid}; trying repair");
+                self.repaired_object(id).ok_or_else(|| {
+                    zpdf_core::Error::InvalidObject(
+                        offset,
+                        format!("xref entry for {id} points at object {pid}"),
+                    )
+                })
+            }
+            Err(e) => {
+                tracing::warn!("failed to parse {id} at xref offset {offset} ({e}); trying repair");
+                match self.repaired_object(id) {
+                    Some(obj) => Ok(obj),
+                    None => Err(e),
+                }
+            }
+        }
+    }
+
+    /// Look up `id` in the repair table, building the table on first use by
+    /// running tail-scan recovery over the whole file (memoized; the scan runs
+    /// at most once per `PdfFile`). Returns `None` if the scan failed, the id
+    /// is not in it, or the repaired entry does not actually hold `id`.
+    fn repaired_object(&self, id: ObjectId) -> Option<PdfObject> {
+        let table = self
+            .repair_table
+            .get_or_init(
+                || match recovery::scan_all_objects(&self.data, &self.limits) {
+                    Ok((table, _trailer)) => Some(table),
+                    Err(e) => {
+                        tracing::warn!("repair object scan failed: {e}");
+                        None
+                    }
+                },
+            )
+            .as_ref()?;
+        match table.get(id)? {
+            XrefEntry::InUse { offset, .. } => {
+                let parser = ObjectParser::new(&self.data, &self.limits);
+                let (pid, mut obj) = parser.parse_indirect_with_id(*offset as usize).ok()?;
+                if pid != id {
+                    return None;
+                }
+                if let Some(dec) = &self.decryptor {
+                    dec.decrypt_object(&mut obj, id);
+                }
+                Some(obj)
             }
             XrefEntry::Compressed {
                 stream_obj,
                 index_in_stream,
-            } => self.extract_from_object_stream(*stream_obj, *index_in_stream)?,
-            XrefEntry::Free { .. } => return Err(zpdf_core::Error::ObjectNotFound(id)),
-        };
-
-        self.object_cache.borrow_mut().insert(id, obj.clone());
-        Ok(obj)
+            } => self
+                .extract_from_object_stream(*stream_obj, *index_in_stream)
+                .ok(),
+            XrefEntry::Free { .. } => None,
+        }
     }
 
     /// Resolve a stream object and decode its data through the filter pipeline.
+    /// `/Filter` and `/DecodeParms` may be indirect references (or arrays
+    /// containing them); resolve those before handing the dict to the filter
+    /// layer, which has no access to the file.
     pub fn resolve_stream_data(&self, id: zpdf_core::ObjectId) -> Result<Vec<u8>> {
         let obj = self.resolve(id)?;
         let stream = obj.as_stream()?;
-        filters::decode_stream(&stream.data, &stream.dict)
+        match self.dict_with_resolved_filters(&stream.dict) {
+            Some(resolved) => filters::decode_stream(&stream.data, &resolved),
+            None => filters::decode_stream(&stream.data, &stream.dict),
+        }
+    }
+
+    /// If `/Filter`, `/DecodeParms`, or `/DP` is an indirect reference (or an
+    /// array containing one), return a clone of `dict` with those values
+    /// resolved one level. `None` when nothing needs resolving (common case —
+    /// avoids cloning the dict).
+    fn dict_with_resolved_filters(&self, dict: &PdfDict) -> Option<PdfDict> {
+        const KEYS: [&str; 3] = ["Filter", "DecodeParms", "DP"];
+        let needs_resolve = |obj: &PdfObject| match obj {
+            PdfObject::Ref(_) => true,
+            PdfObject::Array(a) => a.iter().any(|e| matches!(e, PdfObject::Ref(_))),
+            _ => false,
+        };
+        if !KEYS
+            .iter()
+            .any(|k| dict.get(k).is_some_and(needs_resolve))
+        {
+            return None;
+        }
+
+        let resolve_shallow = |obj: &PdfObject| match obj {
+            PdfObject::Ref(r) => self.resolve(*r).unwrap_or(PdfObject::Null),
+            other => other.clone(),
+        };
+        let mut out = dict.clone();
+        for key in KEYS {
+            let Some(value) = dict.get(key) else { continue };
+            let resolved = match resolve_shallow(value) {
+                // Also resolve refs *inside* a (possibly itself indirect) array.
+                PdfObject::Array(a) => PdfObject::Array(a.iter().map(resolve_shallow).collect()),
+                other => other,
+            };
+            out.insert(PdfName::new(key), resolved);
+        }
+        Some(out)
     }
 
     /// Extract an object from a compressed object stream (/Type /ObjStm).
@@ -372,5 +516,164 @@ mod tests {
             .next_token()
             .unwrap();
         assert_eq!(n.as_i64().unwrap(), 42);
+    }
+
+    /// Assemble a minimal PDF: the given `(num, body)` objects at gen 0, a
+    /// traditional xref covering each (one single-entry subsection apiece),
+    /// and a trailer pointing /Root at `root`.
+    fn build_pdf(objects: &[(u32, &str)], root: u32) -> Vec<u8> {
+        let mut d = Vec::from(&b"%PDF-1.4\n"[..]);
+        let mut offsets = Vec::new();
+        for (num, body) in objects {
+            offsets.push((*num, d.len()));
+            d.extend_from_slice(format!("{num} 0 obj\n{body}\nendobj\n").as_bytes());
+        }
+        let xref_off = d.len();
+        d.extend_from_slice(b"xref\n0 1\n0000000000 65535 f \n");
+        for (num, off) in &offsets {
+            d.extend_from_slice(format!("{num} 1\n{off:010} 00000 n \n").as_bytes());
+        }
+        let size = objects.iter().map(|(n, _)| n + 1).max().unwrap_or(1);
+        d.extend_from_slice(
+            format!("trailer\n<< /Size {size} /Root {root} 0 R >>\nstartxref\n{xref_off}\n%%EOF\n")
+                .as_bytes(),
+        );
+        d
+    }
+
+    #[test]
+    fn dangling_ref_resolves_to_null() {
+        // Object 9 is referenced but absent from the xref entirely: per
+        // ISO 32000 7.3.10 it resolves to null, not an error.
+        let pdf = build_pdf(&[(1, "<< /Type /Catalog /Pages 9 0 R >>")], 1);
+        let file = PdfFile::parse(pdf).unwrap();
+        assert_eq!(file.resolve(ObjectId(9, 0)).unwrap(), PdfObject::Null);
+        // Second resolve hits the cache (warn fires once).
+        assert_eq!(file.resolve(ObjectId(9, 0)).unwrap(), PdfObject::Null);
+    }
+
+    #[test]
+    fn free_entry_resolves_to_null() {
+        let mut d = Vec::from(&b"%PDF-1.4\n"[..]);
+        let off1 = d.len();
+        d.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        let xref_off = d.len();
+        d.extend_from_slice(b"xref\n0 1\n0000000000 65535 f \n1 1\n");
+        d.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+        d.extend_from_slice(b"2 1\n0000000000 00000 f \n");
+        d.extend_from_slice(
+            format!("trailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n{xref_off}\n%%EOF\n")
+                .as_bytes(),
+        );
+
+        let file = PdfFile::parse(d).unwrap();
+        assert!(matches!(
+            file.xref.get(ObjectId(2, 0)),
+            Some(XrefEntry::Free { .. })
+        ));
+        assert_eq!(file.resolve(ObjectId(2, 0)).unwrap(), PdfObject::Null);
+    }
+
+    #[test]
+    fn header_mismatch_triggers_lazy_repair() {
+        // The xref entry for object 3 points at object 2's offset; the real
+        // object 3 lives elsewhere. resolve(3) must repair via the lazy scan.
+        let mut d = Vec::from(&b"%PDF-1.4\n"[..]);
+        let off1 = d.len();
+        d.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        let off2 = d.len();
+        d.extend_from_slice(b"2 0 obj\n<< /Marker /Wrong >>\nendobj\n");
+        // Real object 3 — its offset is deliberately NOT in the xref.
+        d.extend_from_slice(b"3 0 obj\n<< /Marker /Real >>\nendobj\n");
+        let xref_off = d.len();
+        d.extend_from_slice(b"xref\n0 1\n0000000000 65535 f \n");
+        d.extend_from_slice(format!("1 1\n{off1:010} 00000 n \n").as_bytes());
+        d.extend_from_slice(format!("2 1\n{off2:010} 00000 n \n").as_bytes());
+        d.extend_from_slice(format!("3 1\n{off2:010} 00000 n \n").as_bytes()); // wrong!
+        d.extend_from_slice(
+            format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_off}\n%%EOF\n")
+                .as_bytes(),
+        );
+
+        let file = PdfFile::parse(d).unwrap();
+        let obj = file.resolve(ObjectId(3, 0)).unwrap();
+        assert_eq!(obj.as_dict().unwrap().get_name("Marker").unwrap(), "Real");
+        // Object 2 still resolves normally (its entry was correct).
+        let obj2 = file.resolve(ObjectId(2, 0)).unwrap();
+        assert_eq!(obj2.as_dict().unwrap().get_name("Marker").unwrap(), "Wrong");
+    }
+
+    #[test]
+    fn ref_to_ref_chain_resolves() {
+        let pdf = build_pdf(
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+                (4, "5 0 R"),
+                (5, "42"),
+            ],
+            1,
+        );
+        let file = PdfFile::parse(pdf).unwrap();
+        assert_eq!(
+            file.resolve(ObjectId(4, 0)).unwrap(),
+            PdfObject::Integer(42)
+        );
+    }
+
+    #[test]
+    fn ref_cycle_resolves_to_null() {
+        // 4 -> 5 -> 4: the chain guard must terminate (no hang/stack overflow)
+        // and degrade the value to null.
+        let pdf = build_pdf(
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+                (4, "5 0 R"),
+                (5, "4 0 R"),
+            ],
+            1,
+        );
+        let file = PdfFile::parse(pdf).unwrap();
+        assert_eq!(file.resolve(ObjectId(4, 0)).unwrap(), PdfObject::Null);
+    }
+
+    #[test]
+    fn indirect_filter_is_resolved() {
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let payload = b"indirect filter payload";
+        let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(payload).unwrap();
+        let compressed = enc.finish().unwrap();
+
+        let mut d = Vec::from(&b"%PDF-1.4\n"[..]);
+        let off1 = d.len();
+        d.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        let off3 = d.len();
+        d.extend_from_slice(
+            format!(
+                "3 0 obj\n<< /Length {} /Filter 4 0 R >>\nstream\n",
+                compressed.len()
+            )
+            .as_bytes(),
+        );
+        d.extend_from_slice(&compressed);
+        d.extend_from_slice(b"\nendstream\nendobj\n");
+        let off4 = d.len();
+        d.extend_from_slice(b"4 0 obj\n/FlateDecode\nendobj\n");
+        let xref_off = d.len();
+        d.extend_from_slice(b"xref\n0 1\n0000000000 65535 f \n");
+        d.extend_from_slice(format!("1 1\n{off1:010} 00000 n \n").as_bytes());
+        d.extend_from_slice(format!("3 1\n{off3:010} 00000 n \n").as_bytes());
+        d.extend_from_slice(format!("4 1\n{off4:010} 00000 n \n").as_bytes());
+        d.extend_from_slice(
+            format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_off}\n%%EOF\n")
+                .as_bytes(),
+        );
+
+        let file = PdfFile::parse(d).unwrap();
+        let data = file.resolve_stream_data(ObjectId(3, 0)).unwrap();
+        assert_eq!(data, payload);
     }
 }
