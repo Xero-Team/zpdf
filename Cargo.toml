@@ -13,6 +13,7 @@ members = [
     "crates/zpdf-render",
     "crates/zpdf-render-cpu",
     "crates/zpdf-render-wgpu",
+    "crates/zpdf-viewer-gpui",
     "crates/zpdf-cli",
 ]
 
@@ -57,3 +58,5 @@ lyon = "1"
 pollster = "0.4"
 tiny-skia = "0.11"
 ttf-parser = "0.25"
+gpui = { git = "https://github.com/zed-industries/zed.git", rev = "d989c7c5cdd057de2375a55bdc109ff61409801c", package = "gpui", default-features = false }
+gpui_platform = { git = "https://github.com/zed-industries/zed.git", rev = "d989c7c5cdd057de2375a55bdc109ff61409801c", package = "gpui_platform", default-features = false }
