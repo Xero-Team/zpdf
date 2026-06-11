@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 version.workspace = true
 authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 zpdf-core.workspace = true
@@ -22,12 +27,15 @@ tracing.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+# Workspace siblings are PATH-ONLY here (no version) so cargo strips them
+# from the published package — the facade's dev-dep would otherwise form a
+# publish cycle (zpdf → zpdf-render-wgpu → dev → zpdf).
 # CPU backend is the oracle for blend-group parity tests (built programmatically,
 # since the content interpreter does not yet emit PushBlendGroup ops).
-zpdf-render-cpu.workspace = true
+zpdf-render-cpu = { path = "../zpdf-render-cpu" }
 # Facade (parsing pipeline only) + winit for the simple viewer example.
 # winit stays a dev-dependency so headless library/CLI builds never link a windowing stack.
-zpdf = { workspace = true, default-features = false }
+zpdf = { path = "../zpdf", default-features = false }
 winit = "0.30"
 pollster.workspace = true
 

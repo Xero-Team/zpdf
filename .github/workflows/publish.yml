@@ -1,0 +1,113 @@
+name: Publish (crates.io)
+
+# Publishes every publishable workspace crate to crates.io when a version tag
+# is pushed (e.g. `git tag v0.4.0 && git push origin v0.4.0`), after the full
+# CI gate passes. `cargo publish --workspace` (Cargo ≥ 1.90) resolves the
+# dependency order automatically and skips `publish = false` crates
+# (zpdf-viewer-gpui, which carries git dependencies crates.io forbids).
+#
+# Authentication, in order of preference:
+#  1. Trusted Publishing (OIDC) — once each crate exists on crates.io,
+#     configure it under the crate's Settings → Trusted Publishing with
+#     repository `Xero-Team/zpdf` and workflow `publish.yml`, then DELETE the
+#     CARGO_REGISTRY_TOKEN secret. The workflow mints a short-lived token via
+#     rust-lang/crates-io-auth-action.
+#  2. Classic API token — required for the FIRST publish of each crate
+#     (crates.io only lets you configure Trusted Publishing for existing
+#     crates). Create a token at https://crates.io/settings/tokens with the
+#     `publish-new` + `publish-update` scopes and store it as the
+#     `CARGO_REGISTRY_TOKEN` repository secret.
+#
+# A manual dry run is available from the Actions tab (workflow_dispatch):
+# it packages + verifies everything without uploading and needs no token.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: "Package and verify only (no upload)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  id-token: write # OIDC token exchange for Trusted Publishing
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    name: gate (version + fmt + clippy + tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Linux GUI deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libfontconfig-dev \
+            libwayland-dev \
+            libx11-xcb-dev \
+            libxkbcommon-x11-dev
+
+      - name: Tag must match the workspace version
+        if: github.ref_type == 'tag'
+        run: |
+          versions=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '[.packages[].version] | unique')
+          count=$(echo "$versions" | jq 'length')
+          version=$(echo "$versions" | jq -r '.[0]')
+          if [ "$count" != "1" ]; then
+            echo "::error::workspace crates disagree on version: $versions"
+            exit 1
+          fi
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME != workspace version v$version"
+            exit 1
+          fi
+
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  publish:
+    name: cargo publish --workspace
+    needs: verify
+    runs-on: ubuntu-latest
+    environment: crates-io
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Dry run (workflow_dispatch)
+        if: github.event_name == 'workflow_dispatch' && inputs.dry-run
+        run: cargo publish --workspace --dry-run
+
+      # Trusted Publishing: only attempted when no classic token secret is
+      # configured. The step itself fails if the crates aren't (yet) set up
+      # for it on crates.io — bootstrap with CARGO_REGISTRY_TOKEN instead.
+      - name: Check for a classic token secret
+        id: token
+        if: github.ref_type == 'tag' || !inputs.dry-run
+        env:
+          SECRET_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: echo "has_secret=${SECRET_TOKEN:+true}" >> "$GITHUB_OUTPUT"
+
+      - name: Mint a Trusted Publishing token (OIDC)
+        id: auth
+        if: steps.token.outcome == 'success' && steps.token.outputs.has_secret != 'true'
+        uses: rust-lang/crates-io-auth-action@v1
+
+      - name: Publish
+        if: github.ref_type == 'tag' || !inputs.dry-run
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN || steps.auth.outputs.token }}
+        run: cargo publish --workspace
