@@ -966,10 +966,8 @@ impl Decoder {
                 return Err(err(format!("implausible symbol height {hc_height}")));
             }
             let mut sym_width: i64 = 0;
-            loop {
-                let Some(dw) = decode_int(&mut mq, &mut iadw) else {
-                    break; // OOB: height class complete
-                };
+            // OOB from IADW ends the height class.
+            while let Some(dw) = decode_int(&mut mq, &mut iadw) {
                 sym_width += dw;
                 if sym_width <= 0 || sym_width > MAX_DIMENSION as i64 {
                     return Err(err(format!("implausible symbol width {sym_width}")));
