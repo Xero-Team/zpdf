@@ -52,6 +52,10 @@ aes = "0.8"
 cbc = "0.1"
 sha2 = "0.10"
 zune-jpeg = "0.5"
+# Pure-Rust JPEG 2000 decoder (JPXDecode) from the hayro PDF renderer family.
+# Hand-written, #![forbid(unsafe_code)] at the crate level; the optional `simd`
+# feature (fearless_simd, also pure Rust) is the only unsafe. No C toolchain.
+hayro-jpeg2000 = { version = "0.3.5", default-features = false, features = ["std", "simd"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 wgpu = "29"
 lyon = "1"

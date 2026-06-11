@@ -212,6 +212,11 @@ fn apply_filter(filter: &PdfName, data: &[u8], params: Option<&PdfDict>) -> Resu
             let ccitt_params = crate::ccitt::CcittParams::from_dict(params);
             crate::ccitt::decode(data, &ccitt_params)
         }
+        // JPXDecode output is decoded *pixels*, not raw samples, and JPEG 2000
+        // carries its own colour-space/alpha metadata that a bytes-only filter
+        // cannot return. Pass the codestream through unchanged; zpdf-image
+        // sniffs it (filter name + JP2/SOC magic) and runs the real decode.
+        "JPXDecode" => Ok(data.to_vec()),
         other => Err(Error::UnsupportedFilter(other.to_string())),
     }
 }

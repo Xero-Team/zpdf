@@ -138,6 +138,13 @@ pub fn decode_image_xobject_resolved(
         return decode_image_mask(decoded_data, width, height, fill_rgb, invert);
     }
 
+    // JPEG 2000 first: the codestream carries its own dimensions, colour
+    // space, bit depth and alpha, and /ColorSpace + /BitsPerComponent may
+    // legally be absent from the dict (spec 7.4.9).
+    if is_jpx_encoded(dict, decoded_data) {
+        return decode_jpx_image(decoded_data, dict);
+    }
+
     let cs = colorspace.unwrap_or_else(|| infer_colorspace(dict));
 
     if is_dct_encoded(dict) {
@@ -337,6 +344,127 @@ fn infer_colorspace_array(arr: &[PdfObject]) -> ResolvedColorSpace {
             ResolvedColorSpace::Gray
         }
     }
+}
+
+/// JP2 signature box — the first 12 bytes of a `.jp2` container file.
+const JP2_SIGNATURE: &[u8] = b"\x00\x00\x00\x0C\x6A\x50\x20\x20\x0D\x0A\x87\x0A";
+/// Raw JPEG 2000 codestream — SOC marker immediately followed by SIZ.
+const J2K_SOC_SIZ: &[u8] = b"\xFF\x4F\xFF\x51";
+
+/// A JPX image is detected by `/Filter` naming `JPXDecode` (the parser's
+/// filter chain passes the codestream bytes through untouched), or — for
+/// robustness against broken producers — by the post-filter data starting
+/// with the JP2 signature box or a bare SOC+SIZ codestream.
+fn is_jpx_encoded(dict: &PdfDict, data: &[u8]) -> bool {
+    let filter_says = match dict.get("Filter") {
+        Some(PdfObject::Name(n)) => n.as_str() == "JPXDecode",
+        Some(PdfObject::Array(arr)) => arr
+            .iter()
+            .any(|o| matches!(o, PdfObject::Name(n) if n.as_str() == "JPXDecode")),
+        _ => false,
+    };
+    filter_says || data.starts_with(JP2_SIGNATURE) || data.starts_with(J2K_SOC_SIZ)
+}
+
+/// Decode a JPEG 2000 (JPXDecode) image to RGBA via hayro-jpeg2000.
+///
+/// The codestream is authoritative for dimensions, colour space and alpha;
+/// the PDF dict only contributes `/SMaskInData` (spec 7.4.9: 0/absent =
+/// ignore any codestream soft mask, 1 = alpha is unpremultiplied, 2 = colour
+/// channels are already premultiplied). `/Decode` is only meaningful for
+/// Indexed JPX images per spec table 89 and is not applied here.
+fn decode_jpx_image(data: &[u8], dict: &PdfDict) -> Result<DecodedImage> {
+    use hayro_jpeg2000::{ColorSpace as JpxColorSpace, DecodeSettings, Image};
+
+    let image = Image::new(data, &DecodeSettings::default())
+        .map_err(|e| Error::StreamDecode(format!("JPXDecode: {e}")))?;
+
+    // Re-check the pixel limit against the *codestream* header dims, which
+    // are authoritative and may differ from the dict's /Width × /Height.
+    let (width, height) = (image.width(), image.height());
+    let pixel_count = (width as u64).saturating_mul(height as u64);
+    if pixel_count == 0 || pixel_count > MAX_IMAGE_PIXELS {
+        return Err(Error::StreamDecode(format!(
+            "JPX codestream {width}x{height} exceeds the {MAX_IMAGE_PIXELS}-pixel limit"
+        )));
+    }
+    let dict_w = dict.get_i64("Width").unwrap_or(width as i64);
+    let dict_h = dict.get_i64("Height").unwrap_or(height as i64);
+    if (dict_w, dict_h) != (width as i64, height as i64) {
+        tracing::warn!(
+            "JPX codestream is {width}x{height} but the dict says {dict_w}x{dict_h}; \
+             using the codestream dimensions"
+        );
+    }
+
+    // Colour channels per pixel (alpha excluded). ICC profiles are not
+    // applied — consistent with ICCBased handling elsewhere in zpdf, the
+    // samples are treated as device values of the matching channel count.
+    let ncolor = match image.color_space() {
+        JpxColorSpace::Gray => 1usize,
+        JpxColorSpace::RGB => 3,
+        JpxColorSpace::CMYK => 4,
+        JpxColorSpace::Icc { num_channels, .. } | JpxColorSpace::Unknown { num_channels } => {
+            match num_channels {
+                1 => 1,
+                3 => 3,
+                4 => 4,
+                n => {
+                    return Err(Error::StreamDecode(format!(
+                        "JPX image with unsupported channel count {n}"
+                    )))
+                }
+            }
+        }
+    };
+    let has_alpha = image.has_alpha();
+    let channels = ncolor + usize::from(has_alpha);
+
+    let samples = image
+        .decode()
+        .map_err(|e| Error::StreamDecode(format!("JPXDecode: {e}")))?;
+    if samples.len() < pixel_count as usize * channels {
+        return Err(Error::StreamDecode(format!(
+            "JPX decoded data too short: {} bytes for {width}x{height}x{channels}",
+            samples.len()
+        )));
+    }
+
+    let smask_in_data = dict.get_i64("SMaskInData").unwrap_or(0);
+    let use_alpha = has_alpha && smask_in_data != 0;
+    if has_alpha && !use_alpha {
+        tracing::warn!("JPX codestream has an alpha channel but /SMaskInData is 0/absent; ignoring it per spec");
+    }
+    if dict.get("Decode").is_some() {
+        tracing::debug!("/Decode on a JPXDecode image is ignored (non-Indexed)");
+    }
+
+    let mut rgba = Vec::with_capacity(pixel_count as usize * 4);
+    for px in samples.chunks_exact(channels).take(pixel_count as usize) {
+        let [mut r, mut g, mut b] = match ncolor {
+            1 => [px[0]; 3],
+            3 => [px[0], px[1], px[2]],
+            _ => cmyk_to_rgb(&[px[0], px[1], px[2], px[3]]),
+        };
+        let a = if use_alpha { px[ncolor] } else { 255 };
+        // /SMaskInData 2 means the codestream colour channels are already
+        // premultiplied; 1 means we premultiply here (both render backends
+        // treat the RGBA bytes as premultiplied).
+        if use_alpha && smask_in_data != 2 {
+            r = mul255(r, a);
+            g = mul255(g, a);
+            b = mul255(b, a);
+        }
+        rgba.extend_from_slice(&[r, g, b, a]);
+    }
+
+    Ok(DecodedImage {
+        width,
+        height,
+        data: rgba,
+        has_alpha: use_alpha,
+        premultiplied: use_alpha,
+    })
 }
 
 fn is_dct_encoded(dict: &PdfDict) -> bool {
@@ -700,6 +828,45 @@ mod tests {
         let dict = image_dict(1, 1, 8, Some("DeviceCMYK"));
         let img = decode_image_xobject(&samples, &dict).unwrap();
         assert_eq!(pixel(&img, 0), &[0, 0, 0, 255]);
+    }
+
+    // ---- JPX signature sniffing (decode itself is tested in tests/jpx.rs) ----
+
+    #[test]
+    fn jpx_sniffing_filter_name_and_array() {
+        let mut d = image_dict(1, 1, 8, None);
+        d.insert(
+            PdfName::new("Filter"),
+            PdfObject::Name(PdfName::new("JPXDecode")),
+        );
+        assert!(is_jpx_encoded(&d, b""));
+
+        // Filter chains keep the name in an array (e.g. [/FlateDecode /JPXDecode]).
+        let mut d = image_dict(1, 1, 8, None);
+        d.insert(
+            PdfName::new("Filter"),
+            PdfObject::Array(vec![
+                PdfObject::Name(PdfName::new("FlateDecode")),
+                PdfObject::Name(PdfName::new("JPXDecode")),
+            ]),
+        );
+        assert!(is_jpx_encoded(&d, b""));
+
+        let d = image_dict(1, 1, 8, None);
+        assert!(!is_jpx_encoded(&d, b"plain sample bytes"));
+    }
+
+    #[test]
+    fn jpx_sniffing_magic_bytes() {
+        let d = image_dict(1, 1, 8, None);
+        assert!(is_jpx_encoded(
+            &d,
+            b"\x00\x00\x00\x0C\x6A\x50\x20\x20\x0D\x0A\x87\x0Arest"
+        ));
+        assert!(is_jpx_encoded(&d, b"\xFF\x4F\xFF\x51rest"));
+        // A truncated signature box must not match.
+        assert!(!is_jpx_encoded(&d, b"\x00\x00\x00\x0C\x6A\x50\x20\x20"));
+        assert!(!is_jpx_encoded(&d, b"\xFF\x4F\xFF\x52"));
     }
 
     // ---- item 1: bitonal polarity + 2/4/16 bpc expansion ----
