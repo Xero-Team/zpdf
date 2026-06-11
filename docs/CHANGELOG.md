@@ -1,5 +1,153 @@
 # Changelog
 
+## 0.4.0 — closing the 0.3.0 gaps
+
+Every item on the 0.3.0 "known limitations" list is now implemented, still
+with zero C/C++ dependencies. The trigger was a real-world regression report
+(tests/test8: a Word-generated formula collection rendering almost no text),
+which turned out to be two distinct font bugs — both fixed here.
+
+### Highlights
+
+- **System-font fallback** — non-embedded fonts (ArialMT, SimSun, MS Mincho…)
+  now render through an installed substitute instead of dropping every glyph.
+- **Tiling patterns** — real cell replication (colored and uncolored),
+  replacing the mid-gray placeholder.
+- **Soft masks & transparency groups** — ExtGState `/SMask` (luminosity +
+  alpha, `/TR`, `/BC`) and form `/Group` compositing with group alpha.
+- **Annotations** — `/AP` appearance streams are painted (12.5.5 BBox→Rect
+  mapping, `/AS` states, Hidden/NoView flags).
+- **Optional content** — OCG `/OFF` layers, OCMD policies and `/VE`
+  visibility expressions are honored everywhere (`BDC /OC`, XObject `/OC`,
+  annotation `/OC`).
+- **Composite-font CMaps & vertical writing** — embedded CMap streams, the
+  predefined Unicode CMap families, `Identity-V`/`WMode 1` vertical layout.
+- **JBIG2 + JPEG 2000** — both filters decode (hand-rolled T.88 decoder;
+  `hayro-jpeg2000`), so scanned/bitonal and JPX images stop dropping.
+- **ICC color management** — ICCBased spaces convert through their embedded
+  profiles via `moxcms` (vector, shading, palette and image paths).
+
+### Fonts (`zpdf-font`, `zpdf-document`)
+
+- **Bug fix:** `/DescendantFonts` given as an indirect reference to the array
+  failed the whole Type0 font load (placeholder under the resource name —
+  the main text killer in tests/test8).
+- **New module `zpdf_font::system`** — scans platform font directories once
+  (Windows/macOS/Linux paths + `ZPDF_FONT_DIRS`), indexing every face by
+  PostScript name, full name, and family+style with bounded partial reads
+  (sfnt directory + `name` table only; TTC collections enumerated per face).
+  Resolution: exact PostScript match → suffix-stripped family+style
+  ("TimesNewRomanPS-BoldMT" → timesnewroman + bold) → aliases
+  (Helvetica→Arial, STSong→SimSun…) → CID-ordering defaults (GB1 → YaHei/
+  SimSun, Japan1 → Yu Gothic/MS Gothic…) → serif/sans/mono generics from the
+  FontDescriptor flags. File bytes load (and cache) only on an actual hit.
+- `LoadedFont` carries a TTC `face_index`; PDF `/Widths`//`/W` stay
+  authoritative for substituted fonts. Substituted composite fonts synthesize
+  CID→GID through `/ToUnicode` + the substitute's Unicode cmap.
+- **Composite-font CMaps** (`zpdf_font::cmap::CidCMap`): embedded CMap
+  streams parse fully (codespacerange — variable 1–4-byte codes — cidrange,
+  cidchar, `usecmap`, `/WMode`); the predefined Identity and
+  UniGB/UniCNS/UniJIS/UniKS UCS2/UTF16 families resolve (Unicode-coded:
+  code→Unicode→GID); legacy byte-encoded CMaps (RKSJ/EUC/Big5/GBK) fall back
+  to Identity with a warning.
+- **Vertical writing**: `WMode 1` advances by `/DW2` (default [880 −1000])
+  with glyph origin centering; the CPU backend honors per-glyph y-offsets.
+
+### Patterns & transparency (`zpdf-content`, `zpdf-display-list`, `zpdf-render-cpu`)
+
+- **Tiling patterns (PatternType 1):** the cell content stream is replayed
+  per tile (form-XObject machinery: own resources/fonts, BBox clip, state
+  floor), anchored to pattern space (`base CTM · /Matrix`), honoring
+  `/XStep`/`/YStep` (negative/fractional ok) over the fill's pattern-space
+  bounds, clipped to the fill path. Uncolored patterns (PaintType 2) paint
+  with the `scn` color — the `[/Pattern base]` underlying space is now
+  retained and the cell's own color operators are ignored per spec. A
+  4096-tile clamp falls back to the old gray approximation.
+- **Soft masks:** ExtGState `/SMask` parses `/S` (Luminosity|Alpha), `/G`
+  (interpreted at `gs` time into a nested DisplayList — geometry fixed per
+  11.6.5.2), `/BC` (luminosity approximation), `/TR` (pre-sampled 256-entry
+  LUT); `PushBlendGroup` gained `alpha` + `mask` fields; the CPU backend
+  rasterizes the mask group offscreen (backdrop-seeded for luminosity),
+  converts via Rec. 601 luma or coverage, applies `/TR`, and multiplies the
+  group before compositing.
+- **Transparency groups:** form `/Group /S /Transparency` pushes a real blend
+  group consuming `/ca`+`/BM`+`/SMask` (reset to defaults inside per 11.6.6);
+  `/I` isolation and `/K` knockout are recorded (CPU composite approximates
+  non-isolated as isolated, knockout pending). The wgpu backend composites
+  groups with their blend mode but does not yet apply masks/group alpha
+  (tracked for Phase 3 parity).
+
+### Annotations & optional content (`zpdf-document`, `zpdf-content`)
+
+- **New `zpdf_document::annotation`** — `/Annots` entries resolve to
+  `{subtype, /Rect, /F flags, /AS-selected /AP /N stream, /OC}`;
+  `PdfDocument::page_annotations()`. The interpreter paints them after the
+  page body: `/BBox` transformed by the form `/Matrix`, its bounding box
+  mapped onto `/Rect` (degenerate guards), Hidden/NoView/Popup skipped.
+- **New `zpdf_document::optional_content`** — `/OCProperties /D` default
+  config (`/OFF`, `/ON`, `/BaseState`); `PdfDocument::oc_config()`. The
+  interpreter suppresses painting inside hidden `BDC /OC … EMC` ranges
+  (nesting-correct, form-recursion-safe), for XObjects with hidden `/OC`,
+  and for annotations in hidden groups; OCMD `/P` AnyOn/AllOn/AnyOff/AllOff
+  and `/VE` Not/And/Or expressions are evaluated. `/Properties` resource
+  lookups added to `ResourceDict`. Hidden layers also extract no text.
+
+### Image filters (`zpdf-parser`, `zpdf-image`)
+
+- **JBIG2Decode** — new hand-rolled, zero-dependency ITU-T T.88 decoder
+  (`zpdf-parser/src/jbig2.rs`): MQ arithmetic coder (passes the Annex H.2
+  conformance vector), generic regions (templates 0–3, TPGDON, custom AT
+  pixels; MMR via the existing CCITT G4 code), symbol dictionaries + text
+  regions (all REFCORNERs, transposed, OR/AND/XOR/XNOR), striped pages,
+  `/JBIG2Globals` (resolved through the filter pipeline, cycle-safe).
+  Refinement/aggregation, Huffman tables and halftone regions are
+  warn-and-blank. Output is packed 1-bpp PDF-polarity rows, flowing through
+  the existing bitonal image path unchanged.
+- **JPXDecode** — `hayro-jpeg2000` (pure Rust, `#![forbid(unsafe_code)]`):
+  5/3 + 9/7 wavelets, RCT/ICT, tiling, subsampling, JP2 boxes. The parser
+  passes codestreams through; `zpdf-image` sniffs them (filter name + JP2/SOC
+  magic) and decodes — codestream dimensions/components are authoritative
+  (`/ColorSpace`//`/BitsPerComponent` may legally be absent), `/SMaskInData`
+  0/1/2 handled, JPX-encoded `/SMask` streams fold correctly.
+
+### Color management (`zpdf-color`)
+
+- **New module `zpdf_color::icc`** — `IccTransform` compiles embedded ICC
+  profiles (gray/RGB/Lab/CMYK, v2 + v4 LUT profiles) into →sRGB transforms
+  via `moxcms`; `IccCache` memoizes per profile `ObjectId` (failures cached).
+  Wired through `ContentInterpreter::with_colors`: fills/strokes, shading
+  LUTs, Indexed palettes (baked at resolve time) and images (one buffer-level
+  transform per image; CMYK JPEGs go through profile LUTs). Unusable
+  profiles keep the exact old `/N` component-count behavior.
+
+### Validation
+
+- Workspace test count grew from 292 to 372: tiling/soft-mask/annotation/OCG
+  pixel-level acceptance tests (CPU backend, synthetic PDFs), CidCMap and
+  system-font unit tests, JBIG2 round-trip fixtures anchored to the T.88
+  conformance vector, byte-exact JPEG 2000 fixtures vs OpenJPEG references,
+  ICC tone-curve/LUT/fallback tests. Clippy clean.
+- tests/test8 (44-page Word formula collection): page text renders complete
+  (was: math-only fragments); spot-checked pages 1/3/14/26 against the
+  pre-change output and the embedded-font corpus PDFs for no regressions.
+
+### Dependencies added
+
+`hayro-jpeg2000 0.3` (JPEG 2000), `moxcms 0.8` (ICC), `tracing-subscriber`
+(CLI diagnostics only) — all pure Rust.
+
+### Known limitations (current top gaps)
+
+- Knockout groups composite as non-knockout; non-isolated groups composite as
+  isolated; the wgpu backend ignores soft masks and group alpha.
+- Legacy byte-encoded predefined CMaps (90ms-RKSJ, ETen-B5, GBK-EUC…) fall
+  back to Identity; per-CID vertical metrics (`/W2`) are not parsed.
+- JBIG2 Huffman/refinement/halftone segments render blank (warn); JPX ICC
+  profiles inside the codestream use the channel-count fallback.
+- `/RenderingIntent` is ignored (media-relative colorimetric throughout).
+- Stroked paths take a solid approximation of pattern paints; text filled
+  with patterns paints solid.
+
 ## 0.3.0 — PDF compatibility campaign
 
 A broad correctness and compatibility release. Starting from a garbled-text bug
