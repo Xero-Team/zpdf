@@ -106,8 +106,76 @@ jobs:
         if: steps.token.outcome == 'success' && steps.token.outputs.has_secret != 'true'
         uses: rust-lang/crates-io-auth-action@v1
 
-      - name: Publish
+      # crates.io rate-limits NEW crates to a burst of ~5, then 1 per 10
+      # minutes (https://crates.io/docs/rate-limits) — too tight for a
+      # 13-crate workspace. And cargo hard-fails when any selected crate is
+      # already published, so a naive re-run cannot resume a partial publish.
+      # This loop therefore (a) excludes crates whose name@version already
+      # exists on the sparse index, and (b) on 429 sleeps until the retry
+      # time the server states, then resumes. Version bumps of existing
+      # crates fall under the much higher 30-crate burst and finish in one
+      # pass.
+      - name: Publish (resumable, rate-limit aware)
         if: github.ref_type == 'tag' || !inputs.dry-run
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN || steps.auth.outputs.token }}
-        run: cargo publish --workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          meta=$(cargo metadata --no-deps --format-version 1)
+          version=$(echo "$meta" | jq -r '.packages[0].version')
+          # publish == null means unrestricted; [] means publish = false.
+          mapfile -t crates < <(echo "$meta" | jq -r '.packages[] | select(.publish == null) | .name')
+
+          index_path() {
+            local n=$1
+            case ${#n} in
+              1) echo "1/$n" ;;
+              2) echo "2/$n" ;;
+              3) echo "3/${n:0:1}/$n" ;;
+              *) echo "${n:0:2}/${n:2:2}/$n" ;;
+            esac
+          }
+
+          for attempt in $(seq 1 40); do
+            excludes=()
+            remaining=()
+            for c in "${crates[@]}"; do
+              if curl -fsSL "https://index.crates.io/$(index_path "$c")" 2>/dev/null \
+                   | grep -q "\"vers\":\"$version\""; then
+                excludes+=(--exclude "$c")
+              else
+                remaining+=("$c")
+              fi
+            done
+
+            if [ ${#remaining[@]} -eq 0 ]; then
+              echo "all ${#crates[@]} crates already published at $version"
+              exit 0
+            fi
+            echo "attempt $attempt: publishing ${#remaining[@]} crate(s): ${remaining[*]}"
+
+            set +e
+            out=$(cargo publish --workspace "${excludes[@]}" 2>&1 | tee /dev/stderr)
+            status=$?
+            set -e
+            [ $status -eq 0 ] && exit 0
+
+            if ! grep -q "429 Too Many Requests" <<<"$out"; then
+              echo "::error::publish failed for a reason other than rate limiting"
+              exit $status
+            fi
+
+            # "Please try again after Thu, 11 Jun 2026 15:54:55 GMT"
+            retry_at=$(grep -oE 'try again after [A-Za-z]+, [0-9]{1,2} [A-Za-z]+ [0-9]{4} [0-9:]{8} GMT' <<<"$out" \
+              | head -1 | sed 's/^try again after //')
+            now=$(date -u +%s)
+            target=$(date -u -d "$retry_at" +%s 2>/dev/null || echo $((now + 600)))
+            wait=$((target - now + 30))
+            [ "$wait" -lt 30 ] && wait=30
+            [ "$wait" -gt 1800 ] && wait=1800
+            echo "crates.io rate limit; sleeping ${wait}s (server says: ${retry_at:-unknown})"
+            sleep "$wait"
+          done
+          echo "::error::rate-limit retries exhausted"
+          exit 1
