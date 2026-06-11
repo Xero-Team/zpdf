@@ -212,6 +212,10 @@ fn apply_filter(filter: &PdfName, data: &[u8], params: Option<&PdfDict>) -> Resu
             let ccitt_params = crate::ccitt::CcittParams::from_dict(params);
             crate::ccitt::decode(data, &ccitt_params)
         }
+        "JBIG2Decode" => {
+            let jbig2_params = crate::jbig2::Jbig2Params::from_dict(params);
+            crate::jbig2::decode(data, &jbig2_params)
+        }
         other => Err(Error::UnsupportedFilter(other.to_string())),
     }
 }
