@@ -216,6 +216,11 @@ fn apply_filter(filter: &PdfName, data: &[u8], params: Option<&PdfDict>) -> Resu
             let jbig2_params = crate::jbig2::Jbig2Params::from_dict(params);
             crate::jbig2::decode(data, &jbig2_params)
         }
+        // JPXDecode output is decoded *pixels*, not raw samples, and JPEG 2000
+        // carries its own colour-space/alpha metadata that a bytes-only filter
+        // cannot return. Pass the codestream through unchanged; zpdf-image
+        // sniffs it (filter name + JP2/SOC magic) and runs the real decode.
+        "JPXDecode" => Ok(data.to_vec()),
         other => Err(Error::UnsupportedFilter(other.to_string())),
     }
 }

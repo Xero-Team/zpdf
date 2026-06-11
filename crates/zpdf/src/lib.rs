@@ -5,7 +5,7 @@ pub use zpdf_display_list as display_list;
 pub use zpdf_display_list::DisplayList;
 pub use zpdf_document::{PdfDocument, PdfPage, ResourceDict};
 pub use zpdf_font::FontCache;
-pub use zpdf_image::ImageCache;
+pub use zpdf_image::{DecodedImage, ImageCache};
 pub use zpdf_parser::PdfFile;
 pub use zpdf_render::RenderBackend;
 
