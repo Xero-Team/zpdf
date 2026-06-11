@@ -1,6 +1,7 @@
 mod ccitt;
 mod crypt;
 pub mod filters;
+mod jbig2;
 mod header;
 mod lexer;
 mod object_parser;
@@ -277,9 +278,13 @@ impl PdfFile {
     /// containing them); resolve those before handing the dict to the filter
     /// layer, which has no access to the file.
     pub fn resolve_stream_data(&self, id: zpdf_core::ObjectId) -> Result<Vec<u8>> {
+        self.resolve_stream_data_inner(id, true)
+    }
+
+    fn resolve_stream_data_inner(&self, id: zpdf_core::ObjectId, inline_globals: bool) -> Result<Vec<u8>> {
         let obj = self.resolve(id)?;
         let stream = obj.as_stream()?;
-        match self.dict_with_resolved_filters(&stream.dict) {
+        match self.dict_with_resolved_filters(&stream.dict, inline_globals) {
             Some(resolved) => filters::decode_stream(&stream.data, &resolved),
             None => filters::decode_stream(&stream.data, &stream.dict),
         }
@@ -288,13 +293,24 @@ impl PdfFile {
     /// If `/Filter`, `/DecodeParms`, or `/DP` is an indirect reference (or an
     /// array containing one), return a clone of `dict` with those values
     /// resolved one level. `None` when nothing needs resolving (common case —
-    /// avoids cloning the dict).
-    fn dict_with_resolved_filters(&self, dict: &PdfDict) -> Option<PdfDict> {
+    /// avoids cloning the dict). When `inline_globals` is set, a DecodeParms
+    /// `/JBIG2Globals` stream reference is also inlined (see
+    /// [`Self::inline_jbig2_globals`]).
+    fn dict_with_resolved_filters(&self, dict: &PdfDict, inline_globals: bool) -> Option<PdfDict> {
         const KEYS: [&str; 3] = ["Filter", "DecodeParms", "DP"];
+        // A DecodeParms dict containing a /JBIG2Globals reference needs the
+        // globals stream inlined even though the dict itself is direct.
+        let dict_needs_globals = |obj: &PdfObject| {
+            inline_globals
+                && matches!(obj, PdfObject::Dict(d)
+                    if matches!(d.get("JBIG2Globals"), Some(PdfObject::Ref(_))))
+        };
         let needs_resolve = |obj: &PdfObject| match obj {
             PdfObject::Ref(_) => true,
-            PdfObject::Array(a) => a.iter().any(|e| matches!(e, PdfObject::Ref(_))),
-            _ => false,
+            PdfObject::Array(a) => a
+                .iter()
+                .any(|e| matches!(e, PdfObject::Ref(_)) || dict_needs_globals(e)),
+            other => dict_needs_globals(other),
         };
         if !KEYS.iter().any(|k| dict.get(k).is_some_and(needs_resolve)) {
             return None;
@@ -304,17 +320,48 @@ impl PdfFile {
             PdfObject::Ref(r) => self.resolve(*r).unwrap_or(PdfObject::Null),
             other => other.clone(),
         };
+        let inline = |obj: PdfObject| {
+            if inline_globals {
+                self.inline_jbig2_globals(obj)
+            } else {
+                obj
+            }
+        };
         let mut out = dict.clone();
         for key in KEYS {
             let Some(value) = dict.get(key) else { continue };
             let resolved = match resolve_shallow(value) {
                 // Also resolve refs *inside* a (possibly itself indirect) array.
-                PdfObject::Array(a) => PdfObject::Array(a.iter().map(resolve_shallow).collect()),
-                other => other,
+                PdfObject::Array(a) => {
+                    PdfObject::Array(a.iter().map(resolve_shallow).map(inline).collect())
+                }
+                other => inline(other),
             };
             out.insert(PdfName::new(key), resolved);
         }
         Some(out)
+    }
+
+    /// If `obj` is a DecodeParms dict whose `/JBIG2Globals` is an indirect
+    /// stream reference, replace the reference with an inline string holding
+    /// the globals stream's *decoded* bytes — the filter layer has no file
+    /// access to chase references itself. The globals stream is decoded
+    /// without globals inlining of its own, so a crafted reference cycle
+    /// cannot recurse. Anything else passes through unchanged.
+    fn inline_jbig2_globals(&self, obj: PdfObject) -> PdfObject {
+        let PdfObject::Dict(mut d) = obj else { return obj };
+        if let Some(PdfObject::Ref(r)) = d.get("JBIG2Globals") {
+            let r = *r;
+            let value = match self.resolve_stream_data_inner(r, false) {
+                Ok(bytes) => PdfObject::String(zpdf_core::PdfString(bytes)),
+                Err(e) => {
+                    tracing::warn!("failed to decode /JBIG2Globals stream {r}: {e}");
+                    PdfObject::Null
+                }
+            };
+            d.insert(PdfName::new("JBIG2Globals"), value);
+        }
+        PdfObject::Dict(d)
     }
 
     /// Extract an object from a compressed object stream (/Type /ObjStm).
@@ -673,5 +720,78 @@ mod tests {
         let file = PdfFile::parse(d).unwrap();
         let data = file.resolve_stream_data(ObjectId(3, 0)).unwrap();
         assert_eq!(data, payload);
+    }
+
+    /// An image stream with /Filter /JBIG2Decode whose /DecodeParms holds an
+    /// indirect /JBIG2Globals stream: the globals reference must be resolved,
+    /// decoded (here through its own FlateDecode), and inlined before the
+    /// filter layer runs. The globals carry the page-info segment; the image
+    /// stream carries an MMR generic region (two "WWWBBWWW" rows).
+    #[test]
+    fn jbig2_globals_stream_is_resolved_and_decoded() {
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        // Globals: segment 0, type 48 (page information), page 1, 8x2 page.
+        let globals: Vec<u8> = [
+            &[0, 0, 0, 0, 0x30, 0x00, 0x01, 0, 0, 0, 19][..], // header, length 19
+            &[0, 0, 0, 8, 0, 0, 0, 2][..],                    // width 8, height 2
+            &[0; 8][..],                                      // x/y resolution
+            &[0x00, 0, 0][..],                                // flags, striping
+        ]
+        .concat();
+        let mut gz = ZlibEncoder::new(Vec::new(), Compression::default());
+        gz.write_all(&globals).unwrap();
+        let globals_z = gz.finish().unwrap();
+
+        // Image stream: segment 1, type 38 (immediate generic region), MMR
+        // payload 0x31 0xF8 = T.6-coded WWWBBWWW twice.
+        let image: Vec<u8> = [
+            &[0, 0, 0, 1, 0x26, 0x00, 0x01, 0, 0, 0, 20][..], // header, length 20
+            &[0, 0, 0, 8, 0, 0, 0, 2][..],                    // region 8x2 …
+            &[0, 0, 0, 0, 0, 0, 0, 0, 0x00][..],              // … at (0,0), OR
+            &[0x01, 0x31, 0xF8][..],                          // MMR flag + data
+        ]
+        .concat();
+
+        let mut d = Vec::from(&b"%PDF-1.4\n"[..]);
+        let off1 = d.len();
+        d.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        let off3 = d.len();
+        d.extend_from_slice(
+            format!(
+                "3 0 obj\n<< /Length {} /Filter /JBIG2Decode \
+                 /DecodeParms << /JBIG2Globals 4 0 R >> >>\nstream\n",
+                image.len()
+            )
+            .as_bytes(),
+        );
+        d.extend_from_slice(&image);
+        d.extend_from_slice(b"\nendstream\nendobj\n");
+        let off4 = d.len();
+        d.extend_from_slice(
+            format!(
+                "4 0 obj\n<< /Length {} /Filter /FlateDecode >>\nstream\n",
+                globals_z.len()
+            )
+            .as_bytes(),
+        );
+        d.extend_from_slice(&globals_z);
+        d.extend_from_slice(b"\nendstream\nendobj\n");
+        let xref_off = d.len();
+        d.extend_from_slice(b"xref\n0 1\n0000000000 65535 f \n");
+        d.extend_from_slice(format!("1 1\n{off1:010} 00000 n \n").as_bytes());
+        d.extend_from_slice(format!("3 1\n{off3:010} 00000 n \n").as_bytes());
+        d.extend_from_slice(format!("4 1\n{off4:010} 00000 n \n").as_bytes());
+        d.extend_from_slice(
+            format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_off}\n%%EOF\n")
+                .as_bytes(),
+        );
+
+        let file = PdfFile::parse(d).unwrap();
+        let data = file.resolve_stream_data(ObjectId(3, 0)).unwrap();
+        // WWWBBWWW in PDF 1-bpc polarity (black = 0): 1110 0111, both rows.
+        assert_eq!(data, vec![0xE7, 0xE7]);
     }
 }
