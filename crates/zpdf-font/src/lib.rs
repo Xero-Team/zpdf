@@ -297,13 +297,27 @@ impl LoadedFont {
         };
         let mut map = HashMap::new();
         for (code, s) in tu.iter() {
-            if code > u16::MAX as u32 {
+            let Some(ch) = s.chars().next() else { continue };
+            // glyph_outline receives CIDs, so key the map by CID — under a
+            // non-Identity encoding CMap the code is not the CID.
+            let cid = match &self.cid_cmap {
+                Some(cm) if !cm.identity => {
+                    let len = if code > 0xFF { 2 } else { 1 };
+                    let cid = cm.code_to_cid(code, len);
+                    if cid == 0 && len == 1 {
+                        cm.code_to_cid(code, 2)
+                    } else {
+                        cid
+                    }
+                }
+                _ => code,
+            };
+            if cid == 0 || cid > u16::MAX as u32 {
                 continue;
             }
-            let Some(ch) = s.chars().next() else { continue };
             if let Some(g) = face.glyph_index(ch) {
                 if g.0 != 0 {
-                    map.insert(code as u16, g.0);
+                    map.insert(cid as u16, g.0);
                 }
             }
         }
@@ -377,6 +391,33 @@ impl LoadedFont {
             .as_ref()
             .map(|c| c.codes_are_unicode)
             .unwrap_or(false)
+    }
+
+    /// Downgrade a Unicode-coded CMap to Identity when the font program has
+    /// no Unicode cmap table to resolve against (e.g. an embedded CID-keyed
+    /// CFF) — codes then pass through as CIDs, which the charset or
+    /// /CIDToGIDMap path can still map, instead of every glyph landing on
+    /// .notdef. Call after `cid_cmap` is attached.
+    pub fn validate_cid_cmap(&mut self) {
+        let Some(cm) = &self.cid_cmap else { return };
+        if !cm.codes_are_unicode {
+            return;
+        }
+        let has_unicode_cmap = self
+            .font_data
+            .as_deref()
+            .and_then(|d| ttf_parser::Face::parse(d, self.face_index).ok())
+            .and_then(|f| f.tables().cmap)
+            .map(|c| c.subtables.into_iter().any(|s| s.is_unicode()))
+            .unwrap_or(false);
+        if !has_unicode_cmap {
+            tracing::warn!(
+                "font {}: Unicode CMap but no Unicode cmap table; treating codes as CIDs",
+                self.base_font
+            );
+            let wmode = cm.wmode;
+            self.cid_cmap = Some(cmap::CidCMap::identity(wmode));
+        }
     }
 
     /// Resolve a Unicode code point to (GID, advance) for Unicode-coded

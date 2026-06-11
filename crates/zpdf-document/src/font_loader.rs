@@ -231,16 +231,24 @@ fn apply_differences(enc_dict: &zpdf_core::PdfDict, encoding: &mut zpdf_font::en
 /// Identity-H with a warning.
 fn parse_type0_encoding(file: &PdfFile, dict: &zpdf_core::PdfDict) -> zpdf_font::cmap::CidCMap {
     use zpdf_font::cmap::CidCMap;
+    // Unknown (legacy byte-encoded) CMaps degrade to Identity, but the
+    // writing mode is still known from the -V suffix and kept.
+    fn identity_fallback(name: &str) -> CidCMap {
+        let wmode = name.ends_with("-V") as u8;
+        tracing::warn!(
+            "unsupported predefined CMap {name}; using Identity-{}",
+            if wmode == 1 { "V" } else { "H" }
+        );
+        CidCMap::identity(wmode)
+    }
     match dict.get("Encoding") {
-        Some(PdfObject::Name(n)) => CidCMap::predefined(n.as_str()).unwrap_or_else(|| {
-            tracing::warn!("unsupported predefined CMap {}; using Identity-H", n.0);
-            CidCMap::identity(0)
-        }),
+        Some(PdfObject::Name(n)) => {
+            CidCMap::predefined(n.as_str()).unwrap_or_else(|| identity_fallback(n.as_str()))
+        }
         Some(PdfObject::Ref(r)) => match file.resolve(*r) {
-            Ok(PdfObject::Name(n)) => CidCMap::predefined(n.as_str()).unwrap_or_else(|| {
-                tracing::warn!("unsupported predefined CMap {}; using Identity-H", n.0);
-                CidCMap::identity(0)
-            }),
+            Ok(PdfObject::Name(n)) => {
+                CidCMap::predefined(n.as_str()).unwrap_or_else(|| identity_fallback(n.as_str()))
+            }
             Ok(PdfObject::Stream(s)) => {
                 let data = file
                     .resolve_stream_data(*r)
@@ -342,6 +350,9 @@ fn load_type0_font(
     };
     font.cid_cmap = Some(cmap);
     font.dw2 = dw2;
+    // A Unicode-coded CMap is only usable when the font program can resolve
+    // Unicode; otherwise fall back to Identity (codes pass through as CIDs).
+    font.validate_cid_cmap();
     Ok(font)
 }
 

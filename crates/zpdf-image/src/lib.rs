@@ -181,9 +181,10 @@ pub fn decode_image_xobject_resolved(
 
     // JPEG 2000 first: the codestream carries its own dimensions, colour
     // space, bit depth and alpha, and /ColorSpace + /BitsPerComponent may
-    // legally be absent from the dict (spec 7.4.9).
+    // legally be absent from the dict (spec 7.4.9). A present /ColorSpace
+    // overrides the codestream's colour declaration.
     if is_jpx_encoded(dict, decoded_data) {
-        return decode_jpx_image(decoded_data, dict);
+        return decode_jpx_image(decoded_data, dict, colorspace.as_ref());
     }
 
     let cs = colorspace.unwrap_or_else(|| infer_colorspace(dict));
@@ -414,7 +415,11 @@ fn is_jpx_encoded(dict: &PdfDict, data: &[u8]) -> bool {
 /// ignore any codestream soft mask, 1 = alpha is unpremultiplied, 2 = colour
 /// channels are already premultiplied). `/Decode` is only meaningful for
 /// Indexed JPX images per spec table 89 and is not applied here.
-fn decode_jpx_image(data: &[u8], dict: &PdfDict) -> Result<DecodedImage> {
+fn decode_jpx_image(
+    data: &[u8],
+    dict: &PdfDict,
+    colorspace: Option<&ResolvedColorSpace>,
+) -> Result<DecodedImage> {
     use hayro_jpeg2000::{ColorSpace as JpxColorSpace, DecodeSettings, Image};
 
     let image = Image::new(data, &DecodeSettings::default())
@@ -438,9 +443,10 @@ fn decode_jpx_image(data: &[u8], dict: &PdfDict) -> Result<DecodedImage> {
         );
     }
 
-    // Colour channels per pixel (alpha excluded). ICC profiles are not
-    // applied — consistent with ICCBased handling elsewhere in zpdf, the
-    // samples are treated as device values of the matching channel count.
+    // Colour channels per pixel (alpha excluded). Codestream-internal ICC
+    // profiles are not applied (channel-count fallback); a PDF-level
+    // /ColorSpace — including a compiled ICCBased transform or an Indexed
+    // palette — overrides below per spec 7.4.9.
     let ncolor = match image.color_space() {
         JpxColorSpace::Gray => 1usize,
         JpxColorSpace::RGB => 3,
@@ -480,12 +486,38 @@ fn decode_jpx_image(data: &[u8], dict: &PdfDict) -> Result<DecodedImage> {
         tracing::debug!("/Decode on a JPXDecode image is ignored (non-Indexed)");
     }
 
+    // A present /ColorSpace overrides the codestream's colour declaration
+    // (7.4.9) when its component count matches the colour channel count —
+    // required for Indexed palettes and ICC-managed spaces.
+    let override_cs = colorspace.filter(|cs| {
+        let n = cs.components();
+        if n == ncolor {
+            true
+        } else {
+            tracing::warn!(
+                "JPX /ColorSpace expects {n} components but the codestream has {ncolor}; \
+                 using the codestream interpretation"
+            );
+            false
+        }
+    });
+
     let mut rgba = Vec::with_capacity(pixel_count as usize * 4);
     for px in samples.chunks_exact(channels).take(pixel_count as usize) {
-        let [mut r, mut g, mut b] = match ncolor {
-            1 => [px[0]; 3],
-            3 => [px[0], px[1], px[2]],
-            _ => cmyk_to_rgb(&[px[0], px[1], px[2], px[3]]),
+        let [mut r, mut g, mut b] = match override_cs {
+            Some(cs) => {
+                let mut comps = [0u8; 4];
+                comps[..ncolor].copy_from_slice(&px[..ncolor]);
+                if let ResolvedColorSpace::Indexed { hival, .. } = cs {
+                    comps[0] = comps[0].min(*hival);
+                }
+                components_to_rgb(cs, &comps)
+            }
+            None => match ncolor {
+                1 => [px[0]; 3],
+                3 => [px[0], px[1], px[2]],
+                _ => cmyk_to_rgb(&[px[0], px[1], px[2], px[3]]),
+            },
         };
         let a = if use_alpha { px[ncolor] } else { 255 };
         // /SMaskInData 2 means the codestream colour channels are already

@@ -152,6 +152,33 @@ fn ocg_off_layers_are_hidden() {
     assert_near(px(&page, 50.0, 150.0), [255, 255, 255], "XObject /OC hidden");
 }
 
+/// Annotations render from the page's initial state: a top-level `W n` clip
+/// and a trailing unbalanced hidden `BDC /OC` in the content stream must not
+/// clip away or suppress the appearance streams (12.5.5).
+#[test]
+fn annotations_unaffected_by_leftover_page_state() {
+    let ap: &[u8] = b"1 0 0 rg 0 0 10 10 re f";
+    // Tiny top-level clip (not in q/Q) + an unbalanced hidden BDC at the end.
+    let content: &[u8] = b"0 1 0 rg 0 0 200 200 re f\n1 1 1 1 re W n\n/OC /L0 BDC";
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R /OCProperties << /OCGs [7 0 R] \
+          /D << /OFF [7 0 R] >> >> >>"
+            .to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R \
+          /Resources << /Properties << /L0 7 0 R >> >> /Annots [5 0 R] >>"
+            .to_vec(),
+        stream_obj("", content),
+        b"<< /Type /Annot /Subtype /Square /Rect [50 50 150 150] /F 4 \
+          /AP << /N 6 0 R >> >>"
+            .to_vec(),
+        stream_obj("/Type /XObject /Subtype /Form /BBox [0 0 10 10]", ap),
+        b"<< /Type /OCG /Name (off) >>".to_vec(),
+    ]);
+    let page = render(pdf);
+    assert_near(px(&page, 100.0, 100.0), [255, 0, 0], "annotation paints despite leftover state");
+}
+
 /// /OCMD with /P /AllOn over one ON and one OFF group → hidden; the /VE
 /// expression ["Not", off-group] → visible.
 #[test]

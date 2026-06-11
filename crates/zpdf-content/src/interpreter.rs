@@ -331,6 +331,29 @@ impl<'a> ContentInterpreter<'a> {
             }
         }
 
+        // Annotation appearances render independently of wherever the page
+        // content stream left the graphics state (12.5.5): rebalance any
+        // unclosed q-levels and top-level W clips, then reset to the page's
+        // initial state (an unbalanced BDC /OC must not blank annotations).
+        while self.state_stack.len() > self.state_floor {
+            for _ in 0..self.current.clip_depth {
+                self.display_list.push(RenderCommand::PopClip);
+            }
+            if let Some(state) = self.state_stack.pop() {
+                self.current = state;
+            }
+        }
+        for _ in 0..self.current.clip_depth {
+            self.display_list.push(RenderCommand::PopClip);
+        }
+        self.current = GraphicsState {
+            ctm: self.base_ctm,
+            ..GraphicsState::default()
+        };
+        self.mc_depth = 0;
+        self.oc_hidden_from = None;
+        self.suppress_color_ops = false;
+
         self.paint_annotations();
 
         self.display_list
@@ -1758,16 +1781,20 @@ impl<'a> ContentInterpreter<'a> {
         };
 
         // Interpret the mask group into a detached command list with a clean
-        // paint state — the mask itself is not blended, masked, or alpha'd.
+        // paint state — the mask itself is not blended, masked, or alpha'd,
+        // and a surrounding hidden BDC /OC block must not blank it (the gs
+        // takes effect later, possibly in visible content).
         let page_rect = self.display_list.page_rect;
         let saved_dl = std::mem::replace(&mut self.display_list, DisplayList::new(page_rect));
         let saved_state = self.current.clone();
+        let saved_oc_hidden = self.oc_hidden_from.take();
         self.current.soft_mask = None;
         self.current.blend_mode = BlendMode::Normal;
         self.current.fill_alpha = 1.0;
         self.current.stroke_alpha = 1.0;
         self.do_form_xobject(g_ref, &g_stream, file);
         self.current = saved_state;
+        self.oc_hidden_from = saved_oc_hidden;
         let mask_dl = std::mem::replace(&mut self.display_list, saved_dl);
 
         // /BC components live in the group's /CS; the mean is a serviceable
@@ -2046,6 +2073,10 @@ impl<'a> ContentInterpreter<'a> {
         let saved_oc_hidden = self.oc_hidden_from;
 
         self.current.ctm = self.current.ctm.concat(&form_matrix);
+        // Pattern space inside the form anchors to the form's default space
+        // (the CTM established by Do + the form /Matrix), not the page's.
+        let saved_base_ctm = self.base_ctm;
+        self.base_ctm = self.current.ctm;
         self.text_matrix = Matrix::identity();
         self.text_line_matrix = Matrix::identity();
         self.current.clip_depth = 0;
@@ -2143,6 +2174,7 @@ impl<'a> ContentInterpreter<'a> {
         self.operand_stack = saved_operand_stack;
         self.mc_depth = saved_mc_depth;
         self.oc_hidden_from = saved_oc_hidden;
+        self.base_ctm = saved_base_ctm;
         self.form_font_overrides.pop();
         if pushed_resources {
             self.form_resources.pop();
@@ -2440,8 +2472,10 @@ impl<'a> ContentInterpreter<'a> {
         };
         let (i0, i1) = range(px0, px1, def.bbox.x0, def.bbox.x1, def.x_step);
         let (j0, j1) = range(py0, py1, def.bbox.y0, def.bbox.y1, def.y_step);
-        let nx = i1 - i0 + 1;
-        let ny = j1 - j0 + 1;
+        // Saturating: pathologically small steps push the f64→i64 casts to
+        // the integer extremes, and the raw subtraction would overflow.
+        let nx = i1.saturating_sub(i0).saturating_add(1);
+        let ny = j1.saturating_sub(j0).saturating_add(1);
         if nx <= 0 || ny <= 0 {
             return false;
         }
@@ -2474,6 +2508,12 @@ impl<'a> ContentInterpreter<'a> {
         let saved_text_line_matrix = self.text_line_matrix;
         let saved_operand_stack = std::mem::take(&mut self.operand_stack);
         let saved_suppress = self.suppress_color_ops;
+        // Unbalanced BDC/EMC inside a cell must not leak marked-content
+        // suppression into later tiles or the rest of the page.
+        let saved_mc_depth = self.mc_depth;
+        let saved_oc_hidden = self.oc_hidden_from;
+        // Patterns selected inside the cell anchor to the cell's space.
+        let saved_base_ctm = self.base_ctm;
         let uncolored = def.paint_type == 2;
         // The scn-time color paints an uncolored cell.
         let pattern_color = self.current.fill_color;
@@ -2510,6 +2550,7 @@ impl<'a> ContentInterpreter<'a> {
                 }
                 self.text_matrix = Matrix::identity();
                 self.text_line_matrix = Matrix::identity();
+                self.base_ctm = tile_ctm;
 
                 // Clip the cell to its /BBox.
                 let mut bbox_path = Path::new();
@@ -2553,6 +2594,9 @@ impl<'a> ContentInterpreter<'a> {
                 self.display_list.push(RenderCommand::PopClip);
                 self.state_floor = saved_floor;
                 self.suppress_color_ops = saved_suppress;
+                self.mc_depth = saved_mc_depth;
+                self.oc_hidden_from = saved_oc_hidden;
+                self.base_ctm = saved_base_ctm;
             }
         }
         self.form_depth -= 1;
@@ -2645,7 +2689,9 @@ impl<'a> ContentInterpreter<'a> {
 
                 if vertical {
                     // Vertical writing (9.7.4.3): the glyph's horizontal origin
-                    // sits at pen − v, v = (w0/2, vy); the pen advances by w1y.
+                    // sits at pen − v, v = (w0/2, vy); the pen advances by
+                    // ty = w1·Tfs + Tc (+ Tw for 1-byte code 32) per 9.4.4 —
+                    // no Th factor in vertical mode.
                     let w0 = adv_units as f32 * scale_factor;
                     let vy = dw2.0 as f32 * scale_factor;
                     let advance = dw2.1 as f32 * scale_factor;
@@ -2655,7 +2701,10 @@ impl<'a> ContentInterpreter<'a> {
                         y: x_offset - vy,
                         advance,
                     });
-                    x_offset += advance - char_spacing;
+                    x_offset += advance + char_spacing;
+                    if len == 1 && code == 32 {
+                        x_offset += word_spacing;
+                    }
                 } else {
                     let advance = adv_units as f32 * scale_factor * h_scale;
                     glyphs.push(PositionedGlyph {
@@ -2779,12 +2828,24 @@ impl<'a> ContentInterpreter<'a> {
     }
 
     fn adjust_text_position(&mut self, amount: f64) {
-        // TJ displacement: amount is in thousandths of a unit of text space,
-        // scaled by the horizontal scaling Th (PDF 9.4.4).
-        let displacement = amount / 1000.0
-            * self.current.font_size as f64
-            * (self.current.h_scaling as f64 / 100.0);
-        let advance = Matrix::translate(displacement, 0.0);
+        // TJ displacement: amount is in thousandths of a unit of text space.
+        // Per PDF 9.4.4 it moves tx (scaled by Th) in horizontal mode but ty
+        // (no Th factor) in vertical writing mode.
+        let vertical = self
+            .current_font_id
+            .and_then(|fid| self.font_cache.as_ref().and_then(|fc| fc.get(fid)))
+            .and_then(|f| f.cid_cmap.as_ref())
+            .map(|c| c.wmode == 1)
+            .unwrap_or(false);
+        let advance = if vertical {
+            let displacement = amount / 1000.0 * self.current.font_size as f64;
+            Matrix::translate(0.0, displacement)
+        } else {
+            let displacement = amount / 1000.0
+                * self.current.font_size as f64
+                * (self.current.h_scaling as f64 / 100.0);
+            Matrix::translate(displacement, 0.0)
+        };
         self.text_matrix = self.text_matrix.concat(&advance);
     }
 }
@@ -2804,6 +2865,9 @@ fn resolve_image_metadata(file: &PdfFile, dict: &zpdf_core::PdfDict) -> zpdf_cor
         "ImageMask",
         "Decode",
         "ColorSpace",
+        // zpdf-image sniffs /Filter (DCT/JPX detection); an indirect filter
+        // value would make decoded JPEG pixels look like raw samples.
+        "Filter",
         // Inlines a colour-key /Mask array hiding behind a ref; a stencil
         // /Mask stream ref stays a ref in the original dict and is handled by
         // fold_stencil_mask.
@@ -2816,6 +2880,19 @@ fn resolve_image_metadata(file: &PdfFile, dict: &zpdf_core::PdfDict) -> zpdf_cor
         if let Some(r) = r {
             if let Ok(v) = file.resolve(r) {
                 out.insert(PdfName::new(key), v);
+            }
+        }
+        // A /Filter array may itself hold indirect name elements.
+        if key == "Filter" {
+            if let Some(PdfObject::Array(arr)) = out.get(key) {
+                let resolved: Vec<PdfObject> = arr
+                    .iter()
+                    .map(|o| match o {
+                        PdfObject::Ref(r) => file.resolve(*r).unwrap_or(PdfObject::Null),
+                        other => other.clone(),
+                    })
+                    .collect();
+                out.insert(PdfName::new(key), PdfObject::Array(resolved));
             }
         }
     }

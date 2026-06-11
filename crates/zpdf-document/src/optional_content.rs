@@ -21,13 +21,15 @@ pub struct OcConfig {
 }
 
 impl OcConfig {
-    /// Visibility of a single optional-content group.
+    /// Visibility of a single optional-content group. Per 8.11.4.3 the
+    /// config applies in order BaseState → /ON → /OFF, so OFF wins when a
+    /// group is listed in both arrays.
     pub fn group_visible(&self, id: ObjectId) -> bool {
-        if self.on.contains(&id) {
-            return true;
-        }
         if self.off.contains(&id) {
             return false;
+        }
+        if self.on.contains(&id) {
+            return true;
         }
         !self.base_state_off
     }

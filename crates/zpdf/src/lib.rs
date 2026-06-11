@@ -3,7 +3,7 @@ pub use zpdf_content::text::{spans_to_text, TextSpan};
 pub use zpdf_core::*;
 pub use zpdf_display_list as display_list;
 pub use zpdf_display_list::DisplayList;
-pub use zpdf_document::{PdfDocument, PdfPage, ResourceDict};
+pub use zpdf_document::{Annotation, OcConfig, PdfDocument, PdfPage, ResourceDict};
 pub use zpdf_color::{IccCache, IccTransform};
 pub use zpdf_font::FontCache;
 pub use zpdf_image::{DecodedImage, ImageCache};

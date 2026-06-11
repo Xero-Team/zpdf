@@ -133,6 +133,52 @@ fn uncolored_tiling_pattern_takes_scn_color() {
     assert_rgbish(px(&page, 20.5, 20.5), [255, 255, 255], "uncolored cell gap");
 }
 
+/// A pattern cell containing an unmatched `BDC /OC` over a hidden layer must
+/// not leak marked-content suppression into later tiles or page content.
+#[test]
+fn tiling_cell_oc_leak_does_not_suppress_page() {
+    // The cell paints red inside a never-closed hidden /OC block.
+    let cell: &[u8] = b"/OC /L0 BDC 1 0 0 rg 2 2 16 16 re f";
+    let pat = "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+               /BBox [0 0 20 20] /XStep 20 /YStep 20 \
+               /Resources << /Properties << /L0 6 0 R >> >>";
+    let content: &[u8] = b"/Pattern cs /P0 scn 10 110 80 80 re f\n0 0 1 rg 120 20 60 60 re f";
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R /OCProperties << /OCGs [6 0 R] \
+          /D << /OFF [6 0 R] >> >> >>"
+            .to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R \
+          /Resources << /Pattern << /P0 5 0 R >> >> >>"
+            .to_vec(),
+        stream_obj("", content),
+        stream_obj(pat, cell),
+        b"<< /Type /OCG /Name (off) >>".to_vec(),
+    ]);
+    let doc = zpdf::PdfDocument::open(pdf).expect("open pdf");
+    let page = doc.page(0).expect("page 0");
+    let mut fonts = doc.load_page_fonts(&page);
+    let content_bytes = doc.page_content_bytes(&page).expect("content");
+    let mut images = zpdf::ImageCache::new();
+    let oc = doc.oc_config().expect("oc config");
+    let dl = ContentInterpreter::new(page.media_box)
+        .with_fonts(&mut fonts)
+        .with_document(doc.file(), &page.resources)
+        .with_images(&mut images)
+        .with_optional_content(&oc)
+        .interpret(&content_bytes);
+    let page = zpdf::cpu::CpuRenderer::new()
+        .with_fonts(&fonts)
+        .with_images(&images)
+        .render_display_list(&dl, SCALE)
+        .expect("cpu render");
+
+    // The hidden cell content stays hidden…
+    assert_rgbish(px(&page, 25.0, 125.0), [255, 255, 255], "hidden cell content");
+    // …but the page content AFTER the patterned fill must still paint.
+    assert_rgbish(px(&page, 150.0, 50.0), [0, 0, 255], "post-pattern page fill");
+}
+
 /// A pattern /Matrix offsets the tiling grid: shifting the pattern by (10, 10)
 /// moves the red square from cell-space [2,9]² to page [12,19]².
 #[test]
