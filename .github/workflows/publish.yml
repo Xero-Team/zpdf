@@ -161,21 +161,35 @@ jobs:
             set -e
             [ $status -eq 0 ] && exit 0
 
-            if ! grep -q "429 Too Many Requests" <<<"$out"; then
-              echo "::error::publish failed for a reason other than rate limiting"
-              exit $status
+            if grep -q "429 Too Many Requests" <<<"$out"; then
+              # "Please try again after Thu, 11 Jun 2026 15:54:55 GMT"
+              retry_at=$(grep -oE 'try again after [A-Za-z]+, [0-9]{1,2} [A-Za-z]+ [0-9]{4} [0-9:]{8} GMT' <<<"$out" \
+                | head -1 | sed 's/^try again after //')
+              now=$(date -u +%s)
+              target=$(date -u -d "$retry_at" +%s 2>/dev/null || echo $((now + 600)))
+              wait=$((target - now + 30))
+              [ "$wait" -lt 30 ] && wait=30
+              [ "$wait" -gt 1800 ] && wait=1800
+              echo "crates.io rate limit; sleeping ${wait}s (server says: ${retry_at:-unknown})"
+              sleep "$wait"
+              continue
             fi
 
-            # "Please try again after Thu, 11 Jun 2026 15:54:55 GMT"
-            retry_at=$(grep -oE 'try again after [A-Za-z]+, [0-9]{1,2} [A-Za-z]+ [0-9]{4} [0-9:]{8} GMT' <<<"$out" \
-              | head -1 | sed 's/^try again after //')
-            now=$(date -u +%s)
-            target=$(date -u -d "$retry_at" +%s 2>/dev/null || echo $((now + 600)))
-            wait=$((target - now + 30))
-            [ "$wait" -lt 30 ] && wait=30
-            [ "$wait" -gt 1800 ] && wait=1800
-            echo "crates.io rate limit; sleeping ${wait}s (server says: ${retry_at:-unknown})"
-            sleep "$wait"
+            # cargo's multi-package publish can abort with an internal error
+            # ("no packages ready to publish ... awaiting confirmation",
+            # rust-lang/cargo scheduler bug seen on 1.96) while its uploads
+            # are still propagating to the index. Progress persists on the
+            # registry, so re-resolve the published set and resume. The same
+            # recovery covers index lag making our probe miss a crate that
+            # cargo then reports as "already exists".
+            if grep -Eq "no packages ready to publish|unexpected cargo internal error|already exists on" <<<"$out"; then
+              echo "transient publish failure; re-resolving published crates in 60s"
+              sleep 60
+              continue
+            fi
+
+            echo "::error::publish failed for a reason other than rate limiting"
+            exit $status
           done
           echo "::error::rate-limit retries exhausted"
           exit 1
