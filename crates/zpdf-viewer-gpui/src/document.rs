@@ -6,7 +6,7 @@ use image::{Frame, RgbaImage};
 use smallvec::SmallVec;
 use thiserror::Error;
 use zpdf::gpu::{GpuContext, WgpuRenderError, WgpuRenderer};
-use zpdf::{ContentInterpreter, ImageCache, PdfDocument, RenderBackend};
+use zpdf::{ContentInterpreter, IccCache, ImageCache, PdfDocument, RenderBackend};
 
 pub struct LoadedDocument {
     pub summary: DocumentSummary,
@@ -135,10 +135,12 @@ impl LoadedDocument {
             }
         })?;
         let mut images = ImageCache::new();
+        let mut colors = IccCache::new();
         let display_list = ContentInterpreter::new(page.media_box)
             .with_fonts(&mut fonts)
             .with_document(self.pdf.file(), &page.resources)
             .with_images(&mut images)
+            .with_colors(&mut colors)
             .interpret(&content);
 
         let mut renderer = WgpuRenderer::new().with_fonts(&fonts).with_images(&images);

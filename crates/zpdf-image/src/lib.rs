@@ -46,15 +46,21 @@ impl Default for ImageCache {
 }
 
 /// Image colour space pre-resolved by the caller. The interpreter has
-/// `PdfFile` access to chase indirect references (ICCBased `/N`, Indexed
+/// `PdfFile` access to chase indirect references (ICCBased profiles, Indexed
 /// palettes stored in streams); zpdf-image does not, so it consumes this
 /// digested form. Pass `None` to [`decode_image_xobject_resolved`] to fall
 /// back to inferring the space from the image dictionary alone.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum ResolvedColorSpace {
     Gray,
     Rgb,
     Cmyk,
+    /// ICCBased with a compiled profile→sRGB transform built by the caller.
+    /// `ncomp` mirrors `transform.components()` for cheap access.
+    Icc {
+        ncomp: u8,
+        transform: std::sync::Arc<zpdf_color::IccTransform>,
+    },
     /// `[/Indexed base hival lookup]`: stream samples are palette indices into
     /// `lookup`, which holds `hival + 1` entries of `base.components()` bytes.
     Indexed {
@@ -62,6 +68,40 @@ pub enum ResolvedColorSpace {
         hival: u8,
         lookup: Vec<u8>,
     },
+}
+
+/// Manual impl because transforms have no structural equality: two `Icc`
+/// spaces are equal when they share the same compiled transform (used by the
+/// DCT component sniffer and tests, not as a cache key).
+impl PartialEq for ResolvedColorSpace {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Gray, Self::Gray) | (Self::Rgb, Self::Rgb) | (Self::Cmyk, Self::Cmyk) => true,
+            (
+                Self::Icc {
+                    ncomp: n1,
+                    transform: t1,
+                },
+                Self::Icc {
+                    ncomp: n2,
+                    transform: t2,
+                },
+            ) => n1 == n2 && std::sync::Arc::ptr_eq(t1, t2),
+            (
+                Self::Indexed {
+                    base: b1,
+                    hival: h1,
+                    lookup: l1,
+                },
+                Self::Indexed {
+                    base: b2,
+                    hival: h2,
+                    lookup: l2,
+                },
+            ) => b1 == b2 && h1 == h2 && l1 == l2,
+            _ => false,
+        }
+    }
 }
 
 impl ResolvedColorSpace {
@@ -72,6 +112,7 @@ impl ResolvedColorSpace {
             Self::Gray | Self::Indexed { .. } => 1,
             Self::Rgb => 3,
             Self::Cmyk => 4,
+            Self::Icc { ncomp, .. } => (*ncomp).max(1) as usize,
         }
     }
 }
@@ -488,16 +529,25 @@ fn decode_dct_image(
     // default options), which converts YCbCr/CMYK/YCCK to RGB — including the
     // Adobe APP14 transform and CMYK inversion — so the data is normally
     // 3 bytes/pixel regardless of the PDF colour space. Sniff the component
-    // count from the data length to stay robust if that ever changes.
+    // count from the data length to stay robust if that ever changes. An ICC
+    // space whose component count matches the sniffed one is kept, so its
+    // transform applies to the JPEG's output samples.
     let pixel_count = (width as usize) * (height as usize);
-    let (sniffed, ncomp) =
-        if decoded_data.len() >= pixel_count * 4 && *cs == ResolvedColorSpace::Cmyk {
-            (ResolvedColorSpace::Cmyk, 4)
-        } else if decoded_data.len() >= pixel_count * 3 {
-            (ResolvedColorSpace::Rgb, 3)
-        } else if decoded_data.len() >= pixel_count {
-            (ResolvedColorSpace::Gray, 1)
-        } else {
+    let cs_is_cmyk =
+        *cs == ResolvedColorSpace::Cmyk || matches!(cs, ResolvedColorSpace::Icc { ncomp: 4, .. });
+    let (sniffed, ncomp) = if decoded_data.len() >= pixel_count * 4 && cs_is_cmyk {
+        (cs.clone(), 4)
+    } else if decoded_data.len() >= pixel_count * 3 {
+        match cs {
+            ResolvedColorSpace::Icc { ncomp: 3, .. } => (cs.clone(), 3),
+            _ => (ResolvedColorSpace::Rgb, 3),
+        }
+    } else if decoded_data.len() >= pixel_count {
+        match cs {
+            ResolvedColorSpace::Icc { ncomp: 1, .. } => (cs.clone(), 1),
+            _ => (ResolvedColorSpace::Gray, 1),
+        }
+    } else {
             return Err(Error::StreamDecode(format!(
                 "DCT decoded data too short: {} bytes for {}x{} image",
                 decoded_data.len(),
@@ -579,6 +629,10 @@ fn decode_raw_samples(
     decode: Option<&[f32]>,
     color_key: Option<&[(u16, u16)]>,
 ) -> Result<DecodedImage> {
+    if let ResolvedColorSpace::Icc { transform, .. } = cs {
+        return decode_raw_samples_icc(data, width, height, bpc, cs, transform, decode, color_key);
+    }
+
     let ncomp = cs.components();
     let pixel_count = (width as usize) * (height as usize);
     let luts = build_component_luts(bpc, cs, decode);
@@ -617,6 +671,83 @@ fn decode_raw_samples(
             }
             let [r, g, b] = components_to_rgb(cs, &comps);
             rgba.extend_from_slice(&[r, g, b, 255]);
+        }
+    }
+
+    Ok(DecodedImage {
+        width,
+        height,
+        data: rgba,
+        has_alpha: any_masked,
+        // Colour-key holes are transparent black, which is valid premultiplied
+        // RGBA — the backends treat the bytes as premultiplied.
+        premultiplied: any_masked,
+    })
+}
+
+/// ICC variant of [`decode_raw_samples`]: unpack and /Decode-map the whole
+/// image into a component buffer first, run ONE buffer-level CMS transform
+/// (far cheaper than per-pixel calls), then interleave RGBA. Colour-key
+/// masking still applies to the raw samples; masked pixels' transformed RGB
+/// is simply discarded.
+#[allow(clippy::too_many_arguments)]
+fn decode_raw_samples_icc(
+    data: &[u8],
+    width: u32,
+    height: u32,
+    bpc: u8,
+    cs: &ResolvedColorSpace,
+    transform: &zpdf_color::IccTransform,
+    decode: Option<&[f32]>,
+    color_key: Option<&[(u16, u16)]>,
+) -> Result<DecodedImage> {
+    let ncomp = cs.components();
+    let pixel_count = (width as usize) * (height as usize);
+    let luts = build_component_luts(bpc, cs, decode);
+    let row_bytes = (width as usize * ncomp * bpc as usize).div_ceil(8);
+
+    let mut comps = Vec::with_capacity(pixel_count * ncomp);
+    let mut masked = vec![false; if color_key.is_some() { pixel_count } else { 0 }];
+    let mut any_masked = false;
+
+    for row in 0..height as usize {
+        let row_start = row * row_bytes;
+        let mut bit = 0usize;
+        for col in 0..width as usize {
+            let mut raw = [0u16; 4];
+            for r in raw.iter_mut().take(ncomp) {
+                *r = read_sample(data, row_start, &mut bit, bpc);
+            }
+            if let Some(ranges) = color_key {
+                if ranges
+                    .iter()
+                    .zip(&raw)
+                    .all(|(&(lo, hi), &v)| lo <= v && v <= hi)
+                {
+                    masked[row * width as usize + col] = true;
+                    any_masked = true;
+                }
+            }
+            for c in 0..ncomp {
+                let idx = if bpc == 16 {
+                    (raw[c] >> 8) as usize
+                } else {
+                    raw[c] as usize
+                };
+                comps.push(luts[c][idx]);
+            }
+        }
+    }
+
+    let mut rgb = vec![0u8; pixel_count * 3];
+    transform.slice_to_rgb(&comps, &mut rgb)?;
+
+    let mut rgba = Vec::with_capacity(pixel_count * 4);
+    for (i, px) in rgb.chunks_exact(3).enumerate() {
+        if any_masked && masked[i] {
+            rgba.extend_from_slice(&[0, 0, 0, 0]);
+        } else {
+            rgba.extend_from_slice(&[px[0], px[1], px[2], 255]);
         }
     }
 
@@ -694,6 +825,10 @@ fn components_to_rgb(cs: &ResolvedColorSpace, comps: &[u8; 4]) -> [u8; 3] {
         ResolvedColorSpace::Gray => [comps[0]; 3],
         ResolvedColorSpace::Rgb => [comps[0], comps[1], comps[2]],
         ResolvedColorSpace::Cmyk => cmyk_to_rgb(comps),
+        // Whole images take the buffer-level path in decode_raw_samples_icc;
+        // this per-pixel call serves Indexed bases built without the
+        // interpreter's palette pre-baking.
+        ResolvedColorSpace::Icc { transform, .. } => transform.comps8_to_rgb8(comps),
         ResolvedColorSpace::Indexed { base, lookup, .. } => {
             let n = base.components();
             let off = comps[0] as usize * n;
@@ -1202,6 +1337,80 @@ mod tests {
         assert!(px[1] > 180, "G too low: {px:?}");
         assert!(px[2] > 180, "B too low: {px:?}");
         assert_eq!(px[3], 255);
+    }
+
+    // ---- ICCBased colour spaces (buffer-level CMS transforms) ----
+
+    fn icc_cs(profile: &[u8]) -> ResolvedColorSpace {
+        let t = zpdf_color::IccTransform::from_profile_bytes(profile).unwrap();
+        ResolvedColorSpace::Icc {
+            ncomp: t.components() as u8,
+            transform: std::sync::Arc::new(t),
+        }
+    }
+
+    #[test]
+    fn icc_gray_image_applies_tone_curve() {
+        // Linear gray re-encoded into sRGB: 128 → ≈188 (the old /N fallback
+        // would have left 128 untouched).
+        let cs = icc_cs(include_bytes!("testdata/gray_linear.icc"));
+        let dict = image_dict(3, 1, 8, None);
+        let img =
+            decode_image_xobject_resolved(&[0, 128, 255], &dict, [0, 0, 0], Some(cs)).unwrap();
+        assert_eq!(pixel(&img, 0), &[0, 0, 0, 255]);
+        assert!((pixel(&img, 1)[0] as i16 - 188).abs() <= 2, "{:?}", pixel(&img, 1));
+        assert_eq!(pixel(&img, 2), &[255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn icc_cmyk_image_converts_through_lut() {
+        let cs = icc_cs(include_bytes!("testdata/cmyk_lut.icc"));
+        // white, K-black, cyan
+        let samples = vec![0u8, 0, 0, 0, 0, 0, 0, 255, 255, 0, 0, 0];
+        let dict = image_dict(3, 1, 8, None);
+        let img = decode_image_xobject_resolved(&samples, &dict, [0, 0, 0], Some(cs)).unwrap();
+        let w = pixel(&img, 0);
+        let k = pixel(&img, 1);
+        let c = pixel(&img, 2);
+        assert!(w[0] > 220 && w[1] > 220 && w[2] > 220, "white {w:?}");
+        assert!(k[0] < 30 && k[1] < 30 && k[2] < 30, "black {k:?}");
+        assert!(c[0] < 60 && c[1] > 180 && c[2] > 180, "cyan {c:?}");
+    }
+
+    #[test]
+    fn icc_image_honors_decode_and_color_key() {
+        // /Decode [1 0] inverts the gray samples before the CMS transform;
+        // the colour key still matches RAW values.
+        let cs = icc_cs(include_bytes!("testdata/gray_linear.icc"));
+        let mut dict = image_dict(2, 1, 8, None);
+        dict.insert(PdfName::new("Decode"), int_array(&[1, 0]));
+        dict.insert(PdfName::new("Mask"), int_array(&[0, 0])); // key out raw 0
+        let img =
+            decode_image_xobject_resolved(&[0, 255], &dict, [0, 0, 0], Some(cs)).unwrap();
+        assert!(img.has_alpha);
+        assert_eq!(pixel(&img, 0), &[0, 0, 0, 0]); // raw 0 keyed out
+        assert_eq!(pixel(&img, 1), &[0, 0, 0, 255]); // raw 255 → decoded 0 → black
+    }
+
+    #[test]
+    fn icc_cmyk_jpeg_applies_transform() {
+        // Same CMYK JPEG as cmyk_jpeg_decodes_to_cyan, but resolved through
+        // the LUT profile: the DCT sniffer must keep the ICC space.
+        let jpeg = include_bytes!("testdata/cmyk_cyan_8x8.jpg");
+        let mut decoder = zune_jpeg::JpegDecoder::new(std::io::Cursor::new(&jpeg[..]));
+        let decoded = decoder.decode().expect("zune-jpeg decode");
+
+        let mut dict = image_dict(8, 8, 8, Some("DeviceCMYK"));
+        dict.insert(
+            PdfName::new("Filter"),
+            PdfObject::Name(PdfName::new("DCTDecode")),
+        );
+        let cs = icc_cs(include_bytes!("testdata/cmyk_lut.icc"));
+        let img = decode_image_xobject_resolved(&decoded, &dict, [0, 0, 0], Some(cs)).unwrap();
+        let px = pixel(&img, 0);
+        assert!(px[0] < 60, "R too high: {px:?}");
+        assert!(px[1] > 180, "G too low: {px:?}");
+        assert!(px[2] > 180, "B too low: {px:?}");
     }
 
     // ---- ImageMask stencil (pre-existing behaviour) ----

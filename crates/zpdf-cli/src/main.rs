@@ -219,6 +219,9 @@ fn cmd_text(args: &[String]) -> zpdf::Result<()> {
         vec![page_num.saturating_sub(1)]
     };
 
+    // ICC transforms are per-document; share the cache across pages.
+    let mut icc_cache = zpdf::IccCache::new();
+
     for &pi in &page_indices {
         let page = doc.page(pi)?;
         let mut font_cache = doc.load_page_fonts(&page);
@@ -231,6 +234,7 @@ fn cmd_text(args: &[String]) -> zpdf::Result<()> {
                 .with_fonts(&mut font_cache)
                 .with_document(doc.file(), &page.resources)
                 .with_images(&mut image_cache)
+                .with_colors(&mut icc_cache)
                 .with_text_sink(&mut spans);
             let _ = interpreter.interpret(&content_bytes);
         }
@@ -332,11 +336,13 @@ fn cmd_render(args: &[String]) -> zpdf::Result<()> {
     let mut image_cache = zpdf::ImageCache::new();
     let annotations = doc.page_annotations(&page);
     let oc_config = doc.oc_config();
+    let mut icc_cache = zpdf::IccCache::new();
     let mut interpreter = zpdf::ContentInterpreter::new(page_box)
         .with_page_rotation(page.rotate)
         .with_fonts(&mut font_cache)
         .with_document(doc.file(), &page.resources)
         .with_images(&mut image_cache)
+        .with_colors(&mut icc_cache)
         .with_annotations(&annotations);
     if let Some(oc) = &oc_config {
         interpreter = interpreter.with_optional_content(oc);

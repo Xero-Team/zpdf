@@ -1,8 +1,10 @@
 //! PDF color space definitions and conversion.
 
 pub mod function;
+pub mod icc;
 
 pub use function::PdfFunction;
+pub use icc::{IccCache, IccTransform};
 
 #[derive(Debug, Clone)]
 pub enum ColorSpace {
@@ -12,7 +14,7 @@ pub enum ColorSpace {
     CalGray(CalGrayParams),
     CalRGB(CalRGBParams),
     Lab(LabParams),
-    ICCBased(ICCProfile),
+    ICCBased(std::sync::Arc<IccTransform>),
     Indexed {
         base: Box<ColorSpace>,
         max_index: u8,
@@ -49,12 +51,6 @@ pub struct LabParams {
     pub white_point: [f64; 3],
     pub black_point: [f64; 3],
     pub range: [f64; 4],
-}
-
-#[derive(Debug, Clone)]
-pub struct ICCProfile {
-    pub num_components: u8,
-    pub data: Vec<u8>,
 }
 
 /// Convert CMYK values to RGB (simple approximation).

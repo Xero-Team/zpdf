@@ -57,6 +57,9 @@ zune-jpeg = "0.5"
 # Hand-written, #![forbid(unsafe_code)] at the crate level; the optional `simd`
 # feature (fearless_simd, also pure Rust) is the only unsafe. No C toolchain.
 hayro-jpeg2000 = { version = "0.3.5", default-features = false, features = ["std", "simd"] }
+# Pure-Rust ICC color management (profile parsing + device→sRGB transforms);
+# its only deps (num-traits, pxfm) are pure Rust as well.
+moxcms = "0.8"
 image = { version = "0.25", default-features = false, features = ["png"] }
 wgpu = "29"
 lyon = "1"

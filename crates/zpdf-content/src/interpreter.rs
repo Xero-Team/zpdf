@@ -25,6 +25,7 @@ pub struct ContentInterpreter<'a> {
     file: Option<&'a PdfFile>,
     resources: Option<&'a ResourceDict>,
     image_cache: Option<&'a mut ImageCache>,
+    icc_cache: Option<&'a mut zpdf_color::IccCache>,
     form_font_overrides: Vec<HashMap<String, String>>,
     /// Owned /Resources of the form XObjects currently being interpreted,
     /// innermost last. Lookups search these before the page resources.
@@ -58,6 +59,10 @@ enum ActiveColorSpace {
     DeviceRGB,
     DeviceCMYK,
     ICCBased(u8),
+    /// ICCBased with a compiled profile→sRGB transform (shared through the
+    /// document's `IccCache`). Without a usable profile the space resolves to
+    /// the `/N`-matched device space (or `ICCBased(n)` for odd `/N`) instead.
+    Icc(std::sync::Arc<zpdf_color::IccTransform>),
     Lab {
         white_point: [f64; 3],
         range: [f64; 4],
@@ -89,6 +94,7 @@ impl ActiveColorSpace {
             Self::DeviceRGB => 3,
             Self::DeviceCMYK => 4,
             Self::ICCBased(n) => (*n).max(1) as usize,
+            Self::Icc(t) => t.components(),
             Self::Lab { .. } => 3,
             Self::Indexed { .. } => 1,
             Self::Tint { n, .. } => (*n).max(1),
@@ -200,6 +206,7 @@ impl<'a> ContentInterpreter<'a> {
             file: None,
             resources: None,
             image_cache: None,
+            icc_cache: None,
             form_font_overrides: Vec::new(),
             form_resources: Vec::new(),
             form_depth: 0,
@@ -293,6 +300,15 @@ impl<'a> ContentInterpreter<'a> {
     /// Paint these annotations' appearance streams after the page content.
     pub fn with_annotations(mut self, annots: &'a [zpdf_document::Annotation]) -> Self {
         self.annotations = Some(annots);
+        self
+    }
+
+    /// Inject the per-document ICC transform cache. With it, ICCBased colour
+    /// spaces (vector and image) convert through their embedded profiles;
+    /// without it (or when a profile is unusable) they keep the `/N`
+    /// component-count fallback.
+    pub fn with_colors(mut self, cache: &'a mut zpdf_color::IccCache) -> Self {
+        self.icc_cache = Some(cache);
         self
     }
 
@@ -787,7 +803,7 @@ impl<'a> ContentInterpreter<'a> {
         }
     }
 
-    fn resolve_color_space(&self, name: &str) -> ActiveColorSpace {
+    fn resolve_color_space(&mut self, name: &str) -> ActiveColorSpace {
         match name {
             "DeviceGray" | "G" => ActiveColorSpace::DeviceGray,
             "DeviceRGB" | "RGB" => ActiveColorSpace::DeviceRGB,
@@ -812,7 +828,7 @@ impl<'a> ContentInterpreter<'a> {
     }
 
     /// Resolve a colorspace object (name or array) into an evaluatable space.
-    fn resolve_color_space_obj(&self, obj: &PdfObject, depth: u8) -> ActiveColorSpace {
+    fn resolve_color_space_obj(&mut self, obj: &PdfObject, depth: u8) -> ActiveColorSpace {
         if depth > 4 {
             return ActiveColorSpace::DeviceGray;
         }
@@ -843,6 +859,9 @@ impl<'a> ContentInterpreter<'a> {
                     .and_then(|o| self.resolve_dict_of(o))
                     .and_then(|d| d.get_i64("N").ok())
                     .unwrap_or(3);
+                if let Some(t) = self.resolve_icc_transform(arr.get(1), n) {
+                    return ActiveColorSpace::Icc(t);
+                }
                 match n {
                     1 => ActiveColorSpace::DeviceGray,
                     4 => ActiveColorSpace::DeviceCMYK,
@@ -888,11 +907,21 @@ impl<'a> ContentInterpreter<'a> {
                     _ => None,
                 };
                 match lookup {
-                    Some(lookup) if !lookup.is_empty() => ActiveColorSpace::Indexed {
-                        base: Box::new(base),
-                        hival,
-                        lookup: std::sync::Arc::from(lookup),
-                    },
+                    Some(lookup) if !lookup.is_empty() => {
+                        // Bake an ICC base into the palette here (one buffer
+                        // transform) so per-colour lookups stay device-RGB.
+                        let (base, lookup) = match base {
+                            ActiveColorSpace::Icc(t) => {
+                                (ActiveColorSpace::DeviceRGB, t.palette_to_rgb(&lookup))
+                            }
+                            other => (other, lookup),
+                        };
+                        ActiveColorSpace::Indexed {
+                            base: Box::new(base),
+                            hival,
+                            lookup: std::sync::Arc::from(lookup),
+                        }
+                    }
                     _ => ActiveColorSpace::DeviceGray,
                 }
             }
@@ -928,6 +957,39 @@ impl<'a> ContentInterpreter<'a> {
             },
             _ => ActiveColorSpace::DeviceGray,
         }
+    }
+
+    /// Compile (through the document's `IccCache`) the ICCBased profile
+    /// stream `obj` into a transform. Any failure — no cache injected, an
+    /// unresolvable stream, a malformed/unsupported profile, or a profile
+    /// whose channel count contradicts `/N` — yields `None` so the caller
+    /// keeps the component-count fallback.
+    fn resolve_icc_transform(
+        &mut self,
+        obj: Option<&PdfObject>,
+        n: i64,
+    ) -> Option<std::sync::Arc<zpdf_color::IccTransform>> {
+        self.icc_cache.as_ref()?;
+        let file = self.file;
+        let transform = match obj? {
+            PdfObject::Ref(r) => {
+                let file = file?;
+                let cache = self.icc_cache.as_deref_mut()?;
+                cache.get_or_build(*r, || file.resolve_stream_data(*r).ok())
+            }
+            // Inline profile streams (synthetic content; the spec requires an
+            // indirect stream) have no object id to cache under.
+            PdfObject::Stream(s) => build_inline_icc_transform(s),
+            _ => None,
+        }?;
+        if transform.components() != n.max(1) as usize {
+            tracing::warn!(
+                "ICC profile has {} components but /N is {n}; using /N fallback",
+                transform.components()
+            );
+            return None;
+        }
+        Some(transform)
     }
 
     /// Resolve one level of indirection, returning the object itself otherwise.
@@ -1009,6 +1071,10 @@ impl<'a> ContentInterpreter<'a> {
                 Color::rgb(r as f32, g as f32, b as f32)
             }
             ActiveColorSpace::ICCBased(_) => Color::gray(get(0) as f32),
+            ActiveColorSpace::Icc(transform) => {
+                let (r, g, b) = transform.color_to_rgb(vals);
+                Color::rgb(r as f32, g as f32, b as f32)
+            }
             ActiveColorSpace::Lab { white_point, range } => {
                 let l = get(0).clamp(0.0, 100.0);
                 let a = get(1).clamp(range[0], range[1]);
@@ -1067,7 +1133,7 @@ impl<'a> ContentInterpreter<'a> {
     /// Resolve a pattern name selected via `scn`/`SCN`. Returns the pattern
     /// paint (if usable) plus a solid approximation color for paths that
     /// cannot take the real paint (e.g. shading-pattern strokes).
-    fn resolve_pattern(&self, name: &str) -> (Option<PatternPaint>, Color) {
+    fn resolve_pattern(&mut self, name: &str) -> (Option<PatternPaint>, Color) {
         let Some(file) = self.file else {
             return (None, Color::gray(0.5));
         };
@@ -1187,7 +1253,7 @@ impl<'a> ContentInterpreter<'a> {
     /// Build an evaluatable shading from a /Shading dict (type 2/3 only).
     /// `to_page` maps shading space to page space.
     fn build_shading(
-        &self,
+        &mut self,
         obj: &PdfObject,
         to_page: Matrix,
     ) -> Option<crate::shading::ShadingDef> {
@@ -1809,7 +1875,12 @@ impl<'a> ContentInterpreter<'a> {
         // Image metadata keys may be indirect references; resolve them so e.g.
         // an indirect /Decode does not silently invert an /ImageMask stencil.
         let image_dict = resolve_image_metadata(file, &stream.dict);
-        let colorspace = resolve_image_colorspace(Some(file), image_dict.get("ColorSpace"), 0);
+        let colorspace = resolve_image_colorspace(
+            Some(file),
+            self.icc_cache.as_deref_mut(),
+            image_dict.get("ColorSpace"),
+            0,
+        );
         let mut image = match zpdf_image::decode_image_xobject_resolved(
             &decoded_data,
             &image_dict,
@@ -1867,7 +1938,12 @@ impl<'a> ContentInterpreter<'a> {
                 }
             }
         }
-        let colorspace = resolve_image_colorspace(self.file, norm.get("ColorSpace"), 0);
+        let colorspace = resolve_image_colorspace(
+            self.file,
+            self.icc_cache.as_deref_mut(),
+            norm.get("ColorSpace"),
+            0,
+        );
         match zpdf_image::decode_image_xobject_resolved(
             &decoded,
             &norm,
@@ -2746,14 +2822,30 @@ fn resolve_image_metadata(file: &PdfFile, dict: &zpdf_core::PdfDict) -> zpdf_cor
     out
 }
 
+/// Build an ICC transform from an inline (synthetic) profile stream,
+/// bypassing the cache — inline streams have no object id to key on.
+fn build_inline_icc_transform(
+    s: &zpdf_core::PdfStream,
+) -> Option<std::sync::Arc<zpdf_color::IccTransform>> {
+    let data = zpdf_parser::filters::decode_stream(&s.data, &s.dict).ok()?;
+    match zpdf_color::IccTransform::from_profile_bytes(&data) {
+        Ok(t) => Some(std::sync::Arc::new(t)),
+        Err(e) => {
+            tracing::warn!("inline ICC profile rejected: {e}; using /N fallback");
+            None
+        }
+    }
+}
+
 /// Resolve a PDF `/ColorSpace` object into the pre-digested form consumed by
 /// zpdf-image (which has no `PdfFile` access): chases indirect refs, ICCBased
-/// `/N` (1/3/4 → gray/RGB/CMYK) and Indexed palettes (string or stream).
-/// Returns `None` for spaces it cannot resolve, letting zpdf-image fall back
-/// to its own inference. Kept as a small free helper so the next-wave
-/// interpreter colour-space rework can reuse it.
+/// profiles (compiled into transforms through `icc`, falling back to `/N`
+/// 1/3/4 → gray/RGB/CMYK) and Indexed palettes (string or stream; an ICC base
+/// is baked into the palette). Returns `None` for spaces it cannot resolve,
+/// letting zpdf-image fall back to its own inference.
 fn resolve_image_colorspace(
     file: Option<&PdfFile>,
+    icc: Option<&mut zpdf_color::IccCache>,
     cs: Option<&PdfObject>,
     depth: u8,
 ) -> Option<zpdf_image::ResolvedColorSpace> {
@@ -2778,15 +2870,39 @@ fn resolve_image_colorspace(
             };
             match head {
                 "ICCBased" => {
+                    let elem = arr.get(1)?;
                     let profile;
-                    let stream_obj = match arr.get(1)? {
+                    let (stream_ref, stream_obj) = match elem {
                         PdfObject::Ref(r) => {
                             profile = file?.resolve(*r).ok()?;
-                            &profile
+                            (Some(*r), &profile)
                         }
-                        other => other,
+                        other => (None, other),
                     };
-                    match stream_obj.as_stream().ok()?.dict.get_i64("N").ok()? {
+                    let stream = stream_obj.as_stream().ok()?;
+                    let n = stream.dict.get_i64("N").ok()?;
+                    if let Some(cache) = icc {
+                        let transform = match (stream_ref, file) {
+                            (Some(id), Some(f)) => {
+                                cache.get_or_build(id, || f.resolve_stream_data(id).ok())
+                            }
+                            (None, _) => build_inline_icc_transform(stream),
+                            _ => None,
+                        };
+                        if let Some(t) = transform {
+                            if t.components() == n.max(1) as usize {
+                                return Some(Rcs::Icc {
+                                    ncomp: t.components() as u8,
+                                    transform: t,
+                                });
+                            }
+                            tracing::warn!(
+                                "ICC profile has {} components but /N is {n}; using /N fallback",
+                                t.components()
+                            );
+                        }
+                    }
+                    match n {
                         1 => Some(Rcs::Gray),
                         3 => Some(Rcs::Rgb),
                         4 => Some(Rcs::Cmyk),
@@ -2797,7 +2913,7 @@ fn resolve_image_colorspace(
                     }
                 }
                 "Indexed" | "I" => {
-                    let base = resolve_image_colorspace(file, arr.get(1), depth + 1)?;
+                    let base = resolve_image_colorspace(file, icc, arr.get(1), depth + 1)?;
                     let hival = arr.get(2)?.as_f64().ok()?;
                     if !(0.0..=255.0).contains(&hival) {
                         return None;
@@ -2809,6 +2925,12 @@ fn resolve_image_colorspace(
                             zpdf_parser::filters::decode_stream(&s.data, &s.dict).ok()?
                         }
                         _ => return None,
+                    };
+                    // Bake an ICC base into the palette (one buffer transform)
+                    // so per-pixel lookups stay plain RGB.
+                    let (base, lookup) = match base {
+                        Rcs::Icc { transform, .. } => (Rcs::Rgb, transform.palette_to_rgb(&lookup)),
+                        other => (other, lookup),
                     };
                     Some(Rcs::Indexed {
                         base: Box::new(base),
@@ -3031,16 +3153,16 @@ mod tests {
         use zpdf_image::ResolvedColorSpace as Rcs;
         let cs = PdfObject::Name(PdfName::new("DeviceCMYK"));
         assert_eq!(
-            resolve_image_colorspace(None, Some(&cs), 0),
+            resolve_image_colorspace(None, None, Some(&cs), 0),
             Some(Rcs::Cmyk)
         );
         let cs = PdfObject::Name(PdfName::new("CalGray"));
         assert_eq!(
-            resolve_image_colorspace(None, Some(&cs), 0),
+            resolve_image_colorspace(None, None, Some(&cs), 0),
             Some(Rcs::Gray)
         );
         let cs = PdfObject::Name(PdfName::new("Pattern"));
-        assert_eq!(resolve_image_colorspace(None, Some(&cs), 0), None);
+        assert_eq!(resolve_image_colorspace(None, None, Some(&cs), 0), None);
     }
 
     #[test]
@@ -3056,7 +3178,7 @@ mod tests {
             PdfObject::Stream(PdfStream::new(profile_dict, vec![])),
         ]);
         assert_eq!(
-            resolve_image_colorspace(None, Some(&cs), 0),
+            resolve_image_colorspace(None, None, Some(&cs), 0),
             Some(Rcs::Cmyk)
         );
     }
@@ -3071,7 +3193,7 @@ mod tests {
             PdfObject::Integer(1),
             PdfObject::String(PdfString::new(vec![255, 0, 0, 0, 0, 255])),
         ]);
-        match resolve_image_colorspace(None, Some(&cs), 0) {
+        match resolve_image_colorspace(None, None, Some(&cs), 0) {
             Some(Rcs::Indexed {
                 base,
                 hival,
@@ -3096,6 +3218,106 @@ mod tests {
             PdfObject::Integer(1),
             PdfObject::Ref(ObjectId(7, 0)),
         ]);
-        assert_eq!(resolve_image_colorspace(None, Some(&cs), 0), None);
+        assert_eq!(resolve_image_colorspace(None, None, Some(&cs), 0), None);
+    }
+
+    // ---- ICCBased with real profile transforms ----
+
+    /// sRGB IEC61966-2.1 (built by littlecms), 3 components.
+    const SRGB_ICC: &[u8] = include_bytes!("testdata/srgb.icc");
+
+    /// `[/ICCBased <inline stream /N n>]` carrying `profile` as its data.
+    fn iccbased_cs(profile: &[u8], n: i64) -> PdfObject {
+        use zpdf_core::{PdfName, PdfStream};
+        let mut profile_dict = zpdf_core::PdfDict::new();
+        profile_dict.insert(PdfName::new("N"), PdfObject::Integer(n));
+        PdfObject::Array(vec![
+            PdfObject::Name(PdfName::new("ICCBased")),
+            PdfObject::Stream(PdfStream::new(profile_dict, profile.to_vec())),
+        ])
+    }
+
+    #[test]
+    fn iccbased_with_profile_builds_transform() {
+        let mut cache = zpdf_color::IccCache::new();
+        let page_rect = Rect::new(0.0, 0.0, 612.0, 792.0);
+        let mut interp = ContentInterpreter::new(page_rect).with_colors(&mut cache);
+        let acs = interp.resolve_color_space_obj(&iccbased_cs(SRGB_ICC, 3), 0);
+        assert!(matches!(acs, ActiveColorSpace::Icc(_)), "got {acs:?}");
+        assert_eq!(acs.components(), 3);
+        // sRGB → sRGB is an identity: saturated red stays red.
+        let c = interp.components_to_rgb(&acs, &[1.0, 0.0, 0.0]);
+        assert!(c.r > 0.98 && c.g < 0.02 && c.b < 0.02, "got {c:?}");
+    }
+
+    #[test]
+    fn iccbased_garbage_profile_falls_back_to_n() {
+        let mut cache = zpdf_color::IccCache::new();
+        let page_rect = Rect::new(0.0, 0.0, 612.0, 792.0);
+        let mut interp = ContentInterpreter::new(page_rect).with_colors(&mut cache);
+        let acs = interp.resolve_color_space_obj(&iccbased_cs(&[0u8; 64], 3), 0);
+        assert!(matches!(acs, ActiveColorSpace::DeviceRGB), "got {acs:?}");
+        let acs = interp.resolve_color_space_obj(&iccbased_cs(b"junk", 4), 0);
+        assert!(matches!(acs, ActiveColorSpace::DeviceCMYK), "got {acs:?}");
+    }
+
+    #[test]
+    fn iccbased_n_mismatch_falls_back_to_n() {
+        // A 3-channel profile declared with /N 4 contradicts the operand
+        // count the content stream will supply: keep the /N fallback.
+        let mut cache = zpdf_color::IccCache::new();
+        let page_rect = Rect::new(0.0, 0.0, 612.0, 792.0);
+        let mut interp = ContentInterpreter::new(page_rect).with_colors(&mut cache);
+        let acs = interp.resolve_color_space_obj(&iccbased_cs(SRGB_ICC, 4), 0);
+        assert!(matches!(acs, ActiveColorSpace::DeviceCMYK), "got {acs:?}");
+    }
+
+    #[test]
+    fn iccbased_without_cache_keeps_old_behavior() {
+        let page_rect = Rect::new(0.0, 0.0, 612.0, 792.0);
+        let mut interp = ContentInterpreter::new(page_rect);
+        let acs = interp.resolve_color_space_obj(&iccbased_cs(SRGB_ICC, 3), 0);
+        assert!(matches!(acs, ActiveColorSpace::DeviceRGB), "got {acs:?}");
+    }
+
+    #[test]
+    fn image_iccbased_with_profile_builds_transform() {
+        use zpdf_image::ResolvedColorSpace as Rcs;
+        let mut cache = zpdf_color::IccCache::new();
+        let cs = iccbased_cs(SRGB_ICC, 3);
+        match resolve_image_colorspace(None, Some(&mut cache), Some(&cs), 0) {
+            Some(Rcs::Icc { ncomp: 3, .. }) => {}
+            other => panic!("expected Icc, got {other:?}"),
+        }
+        // Garbage profile: back to the /N mapping.
+        let cs = iccbased_cs(&[0u8; 64], 4);
+        assert_eq!(
+            resolve_image_colorspace(None, Some(&mut cache), Some(&cs), 0),
+            Some(Rcs::Cmyk)
+        );
+    }
+
+    #[test]
+    fn indexed_with_icc_base_bakes_palette() {
+        use zpdf_core::{PdfName, PdfString};
+        use zpdf_image::ResolvedColorSpace as Rcs;
+        let mut cache = zpdf_color::IccCache::new();
+        // Indexed over ICCBased sRGB: the palette converts ≈unchanged and the
+        // base demotes to plain RGB.
+        let cs = PdfObject::Array(vec![
+            PdfObject::Name(PdfName::new("Indexed")),
+            iccbased_cs(SRGB_ICC, 3),
+            PdfObject::Integer(1),
+            PdfObject::String(PdfString::new(vec![255, 0, 0, 0, 0, 255])),
+        ]);
+        match resolve_image_colorspace(None, Some(&mut cache), Some(&cs), 0) {
+            Some(Rcs::Indexed { base, lookup, .. }) => {
+                assert_eq!(*base, Rcs::Rgb);
+                assert_eq!(lookup.len(), 6);
+                assert!(lookup[0] > 250 && lookup[1] < 5 && lookup[2] < 5, "{lookup:?}");
+                assert!(lookup[3] < 5 && lookup[4] < 5 && lookup[5] > 250, "{lookup:?}");
+            }
+            other => panic!("expected Indexed, got {other:?}"),
+        }
     }
 }
