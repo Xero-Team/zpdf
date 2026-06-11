@@ -25,11 +25,11 @@ thiserror.workspace = true
 # CPU backend is the oracle for blend-group parity tests (built programmatically,
 # since the content interpreter does not yet emit PushBlendGroup ops).
 zpdf-render-cpu.workspace = true
-# Facade (parsing pipeline only) + winit for the interactive viewer example.
+# Facade (parsing pipeline only) + winit for the simple viewer example.
 # winit stays a dev-dependency so headless library/CLI builds never link a windowing stack.
 zpdf = { workspace = true, default-features = false }
 winit = "0.30"
 pollster.workspace = true
 
 [[example]]
-name = "viewer"
+name = "simple-viewer"

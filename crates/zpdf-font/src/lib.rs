@@ -702,7 +702,7 @@ fn parse_cff_encoding(cff: &[u8]) -> Option<HashMap<u16, u16>> {
         let string_end = skip_cff_index(cff, top_dict_end)?;
         let _global_subr_end = skip_cff_index(cff, string_end)?;
         let charstrings_offset = parse_top_dict_charstrings(dict_data)?;
-        let num_glyphs = count_cff_index_entries(cff, charstrings_offset as usize)?;
+        let num_glyphs = count_cff_index_entries(cff, charstrings_offset)?;
 
         // For Standard Encoding, we need to map through the charset
         // charset maps GlyphId → SID, standard encoding maps charcode → SID
@@ -738,7 +738,7 @@ fn parse_cff_encoding(cff: &[u8]) -> Option<HashMap<u16, u16>> {
     }
 
     // Custom encoding
-    let enc = encoding_offset as usize;
+    let enc = encoding_offset;
     if enc >= cff.len() {
         return None;
     }
@@ -1095,7 +1095,7 @@ fn parse_cff_charset(cff: &[u8]) -> Option<HashMap<u16, u16>> {
     // Now count charstrings to know how many glyphs
     // Find CharStrings INDEX — its offset is in Top DICT (key 17)
     let charstrings_offset = parse_top_dict_charstrings(dict_data)?;
-    let num_glyphs = count_cff_index_entries(cff, charstrings_offset as usize)?;
+    let num_glyphs = count_cff_index_entries(cff, charstrings_offset)?;
 
     // Parse charset at the given offset
     let mut map = HashMap::new();
@@ -1113,7 +1113,7 @@ fn parse_cff_charset(cff: &[u8]) -> Option<HashMap<u16, u16>> {
         return None;
     }
 
-    let cs = charset_offset as usize;
+    let cs = charset_offset;
     if cs >= cff.len() {
         return None;
     }

@@ -122,12 +122,14 @@ cargo run -p zpdf-cli -- dump document.pdf 4 0
 cargo run -p zpdf-cli -- debug-stream document.pdf 7 0
 ```
 
-## Interactive viewer
+## Window viewers
+
+### `simple-viewer`
 
 A windowed viewer (winit + wgpu) ships as an example of the GPU backend:
 
 ```bash
-cargo run -p zpdf-render-wgpu --example viewer -- document.pdf
+cargo run -p zpdf-render-wgpu --example simple-viewer -- document.pdf
 ```
 
 | Input | Action |
@@ -140,6 +142,18 @@ cargo run -p zpdf-render-wgpu --example viewer -- document.pdf
 
 The viewer renders each page on the GPU and blits it to the window; the title bar shows
 the current page and zoom. It requires a working GPU adapter.
+
+### `zpdf-viewer-gpui`
+
+An experimental GPUI desktop frontend is also available:
+
+```bash
+cargo run -p zpdf-viewer-gpui -- document.pdf
+```
+
+This version rasterizes bitmap previews for pages and provides basic page
+navigation plus zoom controls. It is still intentionally small in scope: no
+search, annotations, or advanced continuous-scroll behavior yet.
 
 ## DPI, sizes, and coordinates
 

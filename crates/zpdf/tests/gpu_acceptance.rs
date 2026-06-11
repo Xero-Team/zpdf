@@ -141,7 +141,9 @@ fn corpus() -> Vec<(&'static str, Vec<u8>)> {
 
 /// Render one PDF with both backends; returns (differing %, CPU dims, GPU dims),
 /// or `None` if no GPU adapter is available.
-fn compare_backends(pdf: Vec<u8>) -> Option<(f64, (u32, u32), (u32, u32))> {
+type BackendDiff = (f64, (u32, u32), (u32, u32));
+
+fn compare_backends(pdf: Vec<u8>) -> Option<BackendDiff> {
     let doc = PdfDocument::open(pdf).expect("open pdf");
     let page = doc.page(0).expect("page 0");
     let mut fonts = doc.load_page_fonts(&page);

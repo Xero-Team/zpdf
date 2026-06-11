@@ -1,0 +1,23 @@
+[package]
+name = "zpdf-viewer-gpui"
+publish = false
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+authors.workspace = true
+
+[dependencies]
+gpui.workspace = true
+zpdf = { workspace = true, features = ["gpu-render"] }
+image.workspace = true
+smallvec.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+gpui_platform = { workspace = true, features = ["font-kit", "runtime_shaders"] }
+
+[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
+gpui_platform = { workspace = true, features = ["wayland", "x11"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+gpui_platform.workspace = true
