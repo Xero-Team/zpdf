@@ -46,7 +46,10 @@ pub fn load_single_font(file: &PdfFile, font_ref: ObjectId) -> Result<LoadedFont
 }
 
 /// FontDescriptor-derived hints for system-font substitution.
-fn substitute_hints(file: &PdfFile, dict: &zpdf_core::PdfDict) -> zpdf_font::system::SubstituteHints {
+fn substitute_hints(
+    file: &PdfFile,
+    dict: &zpdf_core::PdfDict,
+) -> zpdf_font::system::SubstituteHints {
     let mut hints = zpdf_font::system::SubstituteHints::default();
     if let Ok(fd_ref) = dict.get_ref("FontDescriptor") {
         if let Ok(fd) = file.resolve(fd_ref) {
@@ -324,27 +327,25 @@ fn load_type0_font(
             // Non-embedded composite font (typically CJK): substitute a system
             // face. CIDs are remapped through /ToUnicode once it is attached
             // (see build_substitute_cid_to_gid in load_single_font).
-            let ordering = resolve_dict(file, desc_dict, "CIDSystemInfo")
-                .and_then(|csi| match csi.get("Ordering") {
-                    Some(PdfObject::String(s)) => Some(s.to_string_lossy()),
-                    Some(PdfObject::Name(n)) => Some(n.as_str().to_string()),
-                    _ => None,
-                });
-            let hints = substitute_hints(file, desc_dict);
-            let substituted = zpdf_font::system::find_system_font(
-                &base_font,
-                hints,
-                ordering.as_deref(),
-            )
-            .and_then(|m| {
-                LoadedFont::new_substitute(
-                    PdfFontType::Type0CidType2,
-                    base_font.clone(),
-                    m.data,
-                    m.face_index,
-                    cid_widths,
-                )
+            let ordering = resolve_dict(file, desc_dict, "CIDSystemInfo").and_then(|csi| match csi
+                .get("Ordering")
+            {
+                Some(PdfObject::String(s)) => Some(s.to_string_lossy()),
+                Some(PdfObject::Name(n)) => Some(n.as_str().to_string()),
+                _ => None,
             });
+            let hints = substitute_hints(file, desc_dict);
+            let substituted =
+                zpdf_font::system::find_system_font(&base_font, hints, ordering.as_deref())
+                    .and_then(|m| {
+                        LoadedFont::new_substitute(
+                            PdfFontType::Type0CidType2,
+                            base_font.clone(),
+                            m.data,
+                            m.face_index,
+                            cid_widths,
+                        )
+                    });
             substituted.unwrap_or_else(|| LoadedFont::new_placeholder(base_font))
         }
     };
@@ -407,11 +408,15 @@ fn load_truetype_font(
             data,
             cid_widths,
         )),
-        None => Ok(
-            try_system_substitute_simple(file, dict, &base_font, PdfFontType::TrueType, cid_widths)
-                .or_else(|| LoadedFont::new_standard(base_font.clone()))
-                .unwrap_or_else(|| LoadedFont::new_placeholder(base_font)),
-        ),
+        None => Ok(try_system_substitute_simple(
+            file,
+            dict,
+            &base_font,
+            PdfFontType::TrueType,
+            cid_widths,
+        )
+        .or_else(|| LoadedFont::new_standard(base_font.clone()))
+        .unwrap_or_else(|| LoadedFont::new_placeholder(base_font))),
     }
 }
 
@@ -529,11 +534,15 @@ fn load_type1_font(
             data,
             cid_widths,
         )),
-        None => Ok(
-            try_system_substitute_simple(file, dict, &base_font, PdfFontType::Type1, cid_widths)
-                .or_else(|| LoadedFont::new_standard(base_font.clone()))
-                .unwrap_or_else(|| LoadedFont::new_placeholder(base_font)),
-        ),
+        None => Ok(try_system_substitute_simple(
+            file,
+            dict,
+            &base_font,
+            PdfFontType::Type1,
+            cid_widths,
+        )
+        .or_else(|| LoadedFont::new_standard(base_font.clone()))
+        .unwrap_or_else(|| LoadedFont::new_placeholder(base_font))),
     }
 }
 

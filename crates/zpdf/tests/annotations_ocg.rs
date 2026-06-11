@@ -97,7 +97,11 @@ fn annotation_appearance_paints_into_rect() {
 
     assert_near(px(&page, 100.0, 100.0), [255, 0, 0], "AP inside /Rect");
     assert_near(px(&page, 60.0, 140.0), [255, 0, 0], "AP fills whole /Rect");
-    assert_near(px(&page, 30.0, 100.0), [0, 255, 0], "outside /Rect untouched");
+    assert_near(
+        px(&page, 30.0, 100.0),
+        [0, 255, 0],
+        "outside /Rect untouched",
+    );
 }
 
 /// A hidden (/F 2) annotation paints nothing.
@@ -117,7 +121,11 @@ fn hidden_annotation_is_skipped() {
         stream_obj("/Type /XObject /Subtype /Form /BBox [0 0 10 10]", ap),
     ]);
     let page = render(pdf);
-    assert_near(px(&page, 100.0, 100.0), [0, 255, 0], "hidden annot not painted");
+    assert_near(
+        px(&page, 100.0, 100.0),
+        [0, 255, 0],
+        "hidden annot not painted",
+    );
 }
 
 /// Two BDC /OC blocks: the OFF layer's red square is suppressed, the ON
@@ -149,7 +157,11 @@ fn ocg_off_layers_are_hidden() {
 
     assert_near(px(&page, 50.0, 50.0), [255, 255, 255], "OFF layer hidden");
     assert_near(px(&page, 150.0, 50.0), [0, 0, 255], "ON layer painted");
-    assert_near(px(&page, 50.0, 150.0), [255, 255, 255], "XObject /OC hidden");
+    assert_near(
+        px(&page, 50.0, 150.0),
+        [255, 255, 255],
+        "XObject /OC hidden",
+    );
 }
 
 /// Annotations render from the page's initial state: a top-level `W n` clip
@@ -176,7 +188,11 @@ fn annotations_unaffected_by_leftover_page_state() {
         b"<< /Type /OCG /Name (off) >>".to_vec(),
     ]);
     let page = render(pdf);
-    assert_near(px(&page, 100.0, 100.0), [255, 0, 0], "annotation paints despite leftover state");
+    assert_near(
+        px(&page, 100.0, 100.0),
+        [255, 0, 0],
+        "annotation paints despite leftover state",
+    );
 }
 
 /// /OCMD with /P /AllOn over one ON and one OFF group → hidden; the /VE
@@ -201,6 +217,10 @@ fn ocmd_policies_and_visibility_expressions() {
     ]);
     let page = render(pdf);
 
-    assert_near(px(&page, 50.0, 50.0), [255, 255, 255], "AllOn with OFF member");
+    assert_near(
+        px(&page, 50.0, 50.0),
+        [255, 255, 255],
+        "AllOn with OFF member",
+    );
     assert_near(px(&page, 150.0, 50.0), [0, 0, 255], "VE Not(off) visible");
 }

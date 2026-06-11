@@ -84,10 +84,8 @@ fn smask_pdf(tr: &str) -> Vec<u8> {
           /Resources << /ExtGState << /GS0 5 0 R >> >> >>"
             .to_vec(),
         stream_obj("", content),
-        format!(
-            "<< /Type /ExtGState /SMask << /Type /Mask /S /Luminosity /G 6 0 R {tr} >> >>"
-        )
-        .into_bytes(),
+        format!("<< /Type /ExtGState /SMask << /Type /Mask /S /Luminosity /G 6 0 R {tr} >> >>")
+            .into_bytes(),
         stream_obj(
             "/Type /XObject /Subtype /Form /BBox [0 0 200 200] \
              /Group << /S /Transparency /CS /DeviceRGB >>",
@@ -112,7 +110,12 @@ fn smask_transfer_function_inverts() {
         "/TR << /FunctionType 2 /Domain [0 1] /C0 [1] /C1 [0] /N 1 >>",
     ));
     assert_near(px(&page, 50.0, 100.0), [255, 0, 0], 12, "left now masked");
-    assert_near(px(&page, 150.0, 100.0), [0, 0, 255], 12, "right now visible");
+    assert_near(
+        px(&page, 150.0, 100.0),
+        [0, 0, 255],
+        12,
+        "right now visible",
+    );
 }
 
 /// Group-level constant alpha: a transparency-group form painted with

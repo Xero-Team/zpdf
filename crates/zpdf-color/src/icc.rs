@@ -108,7 +108,9 @@ impl IccTransform {
         let mut dst = [0u8; 3];
         // The executor only errs on slice-length mismatches, which the fixed
         // sizes here rule out; keep black as the impossible-case fallback.
-        let _ = self.executor.transform(&comps[..self.components()], &mut dst);
+        let _ = self
+            .executor
+            .transform(&comps[..self.components()], &mut dst);
         dst
     }
 
@@ -187,7 +189,8 @@ mod tests {
         let t = IccTransform::from_profile_bytes(SRGB).unwrap();
         assert_eq!(t.components(), 3);
         let mut out = [0u8; 6];
-        t.slice_to_rgb(&[10, 128, 240, 0, 255, 64], &mut out).unwrap();
+        t.slice_to_rgb(&[10, 128, 240, 0, 255, 64], &mut out)
+            .unwrap();
         for (a, b) in out.iter().zip([10u8, 128, 240, 0, 255, 64]) {
             assert!((*a as i16 - b as i16).abs() <= 2, "not identity: {out:?}");
         }
@@ -231,7 +234,10 @@ mod tests {
         let src = [0u8, 0, 0, 0, 0, 0, 0, 255, 255, 0, 0, 0];
         let mut out = [0u8; 9];
         t.slice_to_rgb(&src, &mut out).unwrap();
-        assert!(out[0] > 220 && out[1] > 220 && out[2] > 220, "white: {out:?}");
+        assert!(
+            out[0] > 220 && out[1] > 220 && out[2] > 220,
+            "white: {out:?}"
+        );
         assert!(out[3] < 30 && out[4] < 30 && out[5] < 30, "black: {out:?}");
         assert!(out[6] < 60 && out[7] > 180 && out[8] > 180, "cyan: {out:?}");
     }

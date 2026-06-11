@@ -65,8 +65,9 @@ fn px(page: &zpdf::cpu::RenderedPage, x: f64, y: f64) -> [u8; 3] {
 }
 
 fn assert_rgbish(c: [u8; 3], want: [u8; 3], what: &str) {
-    let close =
-        |a: u8, b: u8| (a as i32 - b as i32).abs() <= 40 || (a > 200) == (b > 200) && (a < 60) == (b < 60);
+    let close = |a: u8, b: u8| {
+        (a as i32 - b as i32).abs() <= 40 || (a > 200) == (b > 200) && (a < 60) == (b < 60)
+    };
     assert!(
         close(c[0], want[0]) && close(c[1], want[1]) && close(c[2], want[2]),
         "{what}: got {c:?}, want ≈{want:?}"
@@ -112,7 +113,8 @@ fn uncolored_tiling_pattern_takes_scn_color() {
     let cell: &[u8] = b"2 2 16 16 re f";
     let pat = "/Type /Pattern /PatternType 1 /PaintType 2 /TilingType 1 \
                /BBox [0 0 20 20] /XStep 20 /YStep 20 /Resources << >>";
-    let content: &[u8] = b"/CS0 cs\n1 0 0 /P0 scn 10 10 80 180 re f\n0 0 1 /P0 scn 110 10 80 180 re f";
+    let content: &[u8] =
+        b"/CS0 cs\n1 0 0 /P0 scn 10 10 80 180 re f\n0 0 1 /P0 scn 110 10 80 180 re f";
     let pdf = assemble(&[
         b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
         b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
@@ -126,9 +128,17 @@ fn uncolored_tiling_pattern_takes_scn_color() {
     let page = render(pdf);
 
     // (30, 30): cell-space (10, 10) → inside the square → scn red.
-    assert_rgbish(px(&page, 30.0, 30.0), [255, 0, 0], "uncolored cell, red scn");
+    assert_rgbish(
+        px(&page, 30.0, 30.0),
+        [255, 0, 0],
+        "uncolored cell, red scn",
+    );
     // (130, 30): same cell in the right rect → scn blue.
-    assert_rgbish(px(&page, 130.0, 30.0), [0, 0, 255], "uncolored cell, blue scn");
+    assert_rgbish(
+        px(&page, 130.0, 30.0),
+        [0, 0, 255],
+        "uncolored cell, blue scn",
+    );
     // (20.5, 20.5): cell-space (0.5, 0.5) → in the 2pt gap → background.
     assert_rgbish(px(&page, 20.5, 20.5), [255, 255, 255], "uncolored cell gap");
 }
@@ -174,9 +184,17 @@ fn tiling_cell_oc_leak_does_not_suppress_page() {
         .expect("cpu render");
 
     // The hidden cell content stays hidden…
-    assert_rgbish(px(&page, 25.0, 125.0), [255, 255, 255], "hidden cell content");
+    assert_rgbish(
+        px(&page, 25.0, 125.0),
+        [255, 255, 255],
+        "hidden cell content",
+    );
     // …but the page content AFTER the patterned fill must still paint.
-    assert_rgbish(px(&page, 150.0, 50.0), [0, 0, 255], "post-pattern page fill");
+    assert_rgbish(
+        px(&page, 150.0, 50.0),
+        [0, 0, 255],
+        "post-pattern page fill",
+    );
 }
 
 /// A pattern /Matrix offsets the tiling grid: shifting the pattern by (10, 10)

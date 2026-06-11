@@ -1583,7 +1583,9 @@ impl<'a> ContentInterpreter<'a> {
                 }
             }
             let Some(ap_id) = a.appearance else { continue };
-            let Ok(obj) = file.resolve(ap_id) else { continue };
+            let Ok(obj) = file.resolve(ap_id) else {
+                continue;
+            };
             let PdfObject::Stream(stream) = obj else {
                 continue;
             };
@@ -2522,8 +2524,7 @@ impl<'a> ContentInterpreter<'a> {
         self.form_depth += 1;
         for j in j0..=j1 {
             for i in i0..=i1 {
-                let tile_offset =
-                    Matrix::translate(i as f64 * def.x_step, j as f64 * def.y_step);
+                let tile_offset = Matrix::translate(i as f64 * def.x_step, j as f64 * def.y_step);
                 let tile_ctm = to_page.concat(&tile_offset);
 
                 // Per-tile state: cells start from a clean color state (and
@@ -3391,8 +3392,14 @@ mod tests {
             Some(Rcs::Indexed { base, lookup, .. }) => {
                 assert_eq!(*base, Rcs::Rgb);
                 assert_eq!(lookup.len(), 6);
-                assert!(lookup[0] > 250 && lookup[1] < 5 && lookup[2] < 5, "{lookup:?}");
-                assert!(lookup[3] < 5 && lookup[4] < 5 && lookup[5] > 250, "{lookup:?}");
+                assert!(
+                    lookup[0] > 250 && lookup[1] < 5 && lookup[2] < 5,
+                    "{lookup:?}"
+                );
+                assert!(
+                    lookup[3] < 5 && lookup[4] < 5 && lookup[5] > 250,
+                    "{lookup:?}"
+                );
             }
             other => panic!("expected Indexed, got {other:?}"),
         }

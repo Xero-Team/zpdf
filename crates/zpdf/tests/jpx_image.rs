@@ -24,7 +24,9 @@ fn build_pdf(objects: &[Vec<u8>]) -> Vec<u8> {
         buf.extend_from_slice(b"\nendobj\n");
     }
     let xref_off = buf.len();
-    buf.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes());
+    buf.extend_from_slice(
+        format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+    );
     for off in &offsets {
         buf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
     }
@@ -83,10 +85,7 @@ fn interpret_jpx_pdf(image_extra: &str, with_smask: bool) -> (Vec<RenderCommand>
     (dl.commands, images)
 }
 
-fn drawn_image<'a>(
-    commands: &[RenderCommand],
-    images: &'a ImageCache,
-) -> &'a zpdf::DecodedImage {
+fn drawn_image<'a>(commands: &[RenderCommand], images: &'a ImageCache) -> &'a zpdf::DecodedImage {
     let draw = commands
         .iter()
         .find_map(|c| match c {

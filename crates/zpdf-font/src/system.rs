@@ -57,9 +57,8 @@ pub fn find_system_font(
     let name = strip_subset_prefix(base_font);
     let (family_part, style_part) = split_family_style(name);
     let lower = name.to_ascii_lowercase();
-    let bold = hints.bold
-        || style_part.to_ascii_lowercase().contains("bold")
-        || lower.contains("bold");
+    let bold =
+        hints.bold || style_part.to_ascii_lowercase().contains("bold") || lower.contains("bold");
     let italic = hints.italic
         || {
             let sp = style_part.to_ascii_lowercase();
@@ -197,7 +196,13 @@ fn ordering_defaults(ordering: Option<&str>) -> &'static [&'static str] {
     match ordering {
         Some("GB1") => &["microsoftyahei", "simsun", "simhei", "notosanscjksc"],
         Some("CNS1") => &["microsoftjhenghei", "mingliu", "pmingliu", "notosanscjktc"],
-        Some("Japan1") => &["yugothic", "msgothic", "meiryo", "msmincho", "notosanscjkjp"],
+        Some("Japan1") => &[
+            "yugothic",
+            "msgothic",
+            "meiryo",
+            "msmincho",
+            "notosanscjkjp",
+        ],
         Some("Korea1" | "KR") => &["malgungothic", "batang", "gulim", "notosanscjkkr"],
         _ => &[],
     }
@@ -208,9 +213,22 @@ fn generic_defaults(hints: SubstituteHints) -> &'static [&'static str] {
     if hints.fixed_pitch {
         &["couriernew", "consolas", "dejavusansmono", "liberationmono"]
     } else if hints.serif {
-        &["timesnewroman", "georgia", "dejavuserif", "liberationserif", "notoserif"]
+        &[
+            "timesnewroman",
+            "georgia",
+            "dejavuserif",
+            "liberationserif",
+            "notoserif",
+        ]
     } else {
-        &["arial", "segoeui", "helvetica", "dejavusans", "liberationsans", "notosans"]
+        &[
+            "arial",
+            "segoeui",
+            "helvetica",
+            "dejavusans",
+            "liberationsans",
+            "notosans",
+        ]
     }
 }
 
@@ -306,10 +324,12 @@ fn scan_dir(dir: &Path, depth: usize, faces: &mut HashMap<String, (PathBuf, u32)
             scan_dir(&path, depth + 1, faces);
             continue;
         }
-        let is_font = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "ttf" | "otf" | "ttc" | "otc"));
+        let is_font = path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+            matches!(
+                e.to_ascii_lowercase().as_str(),
+                "ttf" | "otf" | "ttc" | "otc"
+            )
+        });
         if is_font {
             scan_font_file(&path, faces);
         }
@@ -535,13 +555,19 @@ mod tests {
         assert_eq!(normalize("Times New Roman PS-MT"), "timesnewromanpsmt");
         assert_eq!(strip_ps_suffixes("timesnewromanpsmt"), "timesnewroman");
         assert_eq!(strip_ps_suffixes("arialmt"), "arial");
-        assert_eq!(strip_ps_suffixes("courierneWps".to_ascii_lowercase().as_str()), "couriernew");
+        assert_eq!(
+            strip_ps_suffixes("courierneWps".to_ascii_lowercase().as_str()),
+            "couriernew"
+        );
     }
 
     #[test]
     fn family_style_splitting() {
         assert_eq!(split_family_style("Arial-BoldMT"), ("Arial", "BoldMT"));
-        assert_eq!(split_family_style("Frutiger,Italic"), ("Frutiger", "Italic"));
+        assert_eq!(
+            split_family_style("Frutiger,Italic"),
+            ("Frutiger", "Italic")
+        );
         assert_eq!(split_family_style("Verdana"), ("Verdana", ""));
     }
 
@@ -557,7 +583,10 @@ mod tests {
     fn name_table_parsing_prefers_windows_unicode() {
         // Two records for nameID 6: Mac Roman "MacName", Windows en-US "WinName".
         let mac = b"MacName";
-        let win: Vec<u8> = "WinName".encode_utf16().flat_map(|u| u.to_be_bytes()).collect();
+        let win: Vec<u8> = "WinName"
+            .encode_utf16()
+            .flat_map(|u| u.to_be_bytes())
+            .collect();
         let mut table = Vec::new();
         table.extend_from_slice(&0u16.to_be_bytes()); // format
         table.extend_from_slice(&2u16.to_be_bytes()); // count

@@ -49,8 +49,7 @@ fn rgb_jp2_decodes_pixel_exact() {
 fn gray_raw_codestream_decodes_pixel_exact() {
     let img = decode_image_xobject(GRAY_J2K, &jpx_dict(W as i64, H as i64)).unwrap();
     assert_eq!((img.width, img.height), (W, H));
-    for i in 0..(W * H) as usize {
-        let g = GRAY_REF[i];
+    for (i, &g) in GRAY_REF.iter().enumerate().take((W * H) as usize) {
         assert_eq!(px(&img, i), &[g, g, g, 255], "pixel {i}");
     }
 }

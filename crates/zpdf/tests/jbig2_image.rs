@@ -125,11 +125,7 @@ fn jbig2_image_xobject_decodes_through_pipeline() {
         for x in 0..8 {
             let px = &img.data[(y * 8 + x) * 4..(y * 8 + x) * 4 + 4];
             let expected = if (3..=4).contains(&x) { 0 } else { 255 };
-            assert_eq!(
-                px,
-                [expected, expected, expected, 255],
-                "pixel ({x},{y})"
-            );
+            assert_eq!(px, [expected, expected, expected, 255], "pixel ({x},{y})");
         }
     }
 }

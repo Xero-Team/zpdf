@@ -828,7 +828,8 @@ impl Decoder {
             warn!("JBIG2Decode: striped page growth clamped to {new_h} rows");
         }
         if new_h > page.height {
-            page.data.resize(new_h * page.width, self.page_default_pixel);
+            page.data
+                .resize(new_h * page.width, self.page_default_pixel);
             page.height = new_h;
         }
     }
@@ -998,7 +999,8 @@ impl Decoder {
         let mut idx = 0usize;
         let mut exporting = false;
         while idx < total {
-            let run = decode_int(&mut mq, &mut iaex).ok_or_else(|| err("unexpected OOB in IAEX"))?;
+            let run =
+                decode_int(&mut mq, &mut iaex).ok_or_else(|| err("unexpected OOB in IAEX"))?;
             if run < 0 || idx as i64 + run > total as i64 {
                 return Err(err("invalid symbol export run length"));
             }
@@ -1092,7 +1094,8 @@ impl Decoder {
         'instances: while inst < num_instances {
             let dt = decode_int(&mut mq, &mut iadt).ok_or_else(|| err("unexpected OOB in IADT"))?;
             stript += dt * strips;
-            let dfs = decode_int(&mut mq, &mut iafs).ok_or_else(|| err("unexpected OOB in IAFS"))?;
+            let dfs =
+                decode_int(&mut mq, &mut iafs).ok_or_else(|| err("unexpected OOB in IAFS"))?;
             firsts += dfs;
             let mut curs = firsts;
             let mut first = true;
@@ -1117,8 +1120,8 @@ impl Decoder {
                 let t = stript + curt;
                 let id = decode_iaid(&mut mq, &mut iaid, sym_code_len);
                 if sb_refine {
-                    let ri =
-                        decode_int(&mut mq, &mut iari).ok_or_else(|| err("unexpected OOB in IARI"))?;
+                    let ri = decode_int(&mut mq, &mut iari)
+                        .ok_or_else(|| err("unexpected OOB in IARI"))?;
                     if ri != 0 {
                         return Err(err("text region symbol refinement is unsupported"));
                     }
@@ -1424,7 +1427,12 @@ mod tests {
     fn nominal_at(template: u8) -> [(i8, i8); 4] {
         match template {
             0 => [(3, -1), (-3, -1), (2, -2), (-2, -2)],
-            1 | 2 => [(if template == 1 { 3 } else { 2 }, -1), (0, 0), (0, 0), (0, 0)],
+            1 | 2 => [
+                (if template == 1 { 3 } else { 2 }, -1),
+                (0, 0),
+                (0, 0),
+                (0, 0),
+            ],
             _ => [(2, -1), (0, 0), (0, 0), (0, 0)],
         }
     }
@@ -1505,7 +1513,16 @@ mod tests {
         }
         let mut enc = MqEncoder::new();
         let mut cx = vec![0u8; 1 << 16];
-        encode_generic(&mut enc, &mut cx, bm, &GenericParams { template, tpgdon, at });
+        encode_generic(
+            &mut enc,
+            &mut cx,
+            bm,
+            &GenericParams {
+                template,
+                tpgdon,
+                at,
+            },
+        );
         p.extend_from_slice(&enc.finish());
         p
     }
@@ -1619,7 +1636,10 @@ mod tests {
         for i in 0..256 {
             enc.encode(&mut cx, 0, (H2_INPUT[i / 8] >> (7 - i % 8)) & 1);
         }
-        assert_eq!(format!("{:02X?}", enc.finish()), format!("{:02X?}", H2_ENCODED));
+        assert_eq!(
+            format!("{:02X?}", enc.finish()),
+            format!("{:02X?}", H2_ENCODED)
+        );
     }
 
     #[test]
@@ -1650,10 +1670,31 @@ mod tests {
     #[test]
     fn integer_decoding_round_trip_all_buckets() {
         let values: Vec<Option<i64>> = vec![
-            Some(0), Some(1), Some(3), Some(4), Some(19), Some(20), Some(83), Some(84),
-            Some(339), Some(340), Some(4435), Some(4436), Some(100_000), Some(1 << 30),
-            Some(-1), Some(-4), Some(-20), Some(-84), Some(-340), Some(-4436), Some(-99_999),
-            None, Some(7), None, Some(-2),
+            Some(0),
+            Some(1),
+            Some(3),
+            Some(4),
+            Some(19),
+            Some(20),
+            Some(83),
+            Some(84),
+            Some(339),
+            Some(340),
+            Some(4435),
+            Some(4436),
+            Some(100_000),
+            Some(1 << 30),
+            Some(-1),
+            Some(-4),
+            Some(-20),
+            Some(-84),
+            Some(-340),
+            Some(-4436),
+            Some(-99_999),
+            None,
+            Some(7),
+            None,
+            Some(-2),
         ];
         let mut enc = MqEncoder::new();
         let mut cx = vec![0u8; INT_CTX_SIZE];
@@ -1726,12 +1767,7 @@ mod tests {
     fn generic_region_round_trip_tpgdon() {
         // Repeated rows exercise the typical-prediction (LTP) path.
         let bm = bitmap_from(&[
-            "........",
-            "..####..",
-            "..####..",
-            "..####..",
-            "........",
-            "........",
+            "........", "..####..", "..####..", "..####..", "........", "........",
         ]);
         for template in 0..4u8 {
             let p = GenericParams {
@@ -1861,7 +1897,11 @@ mod tests {
                 &generic_region_payload(&bm, template, tpgdon),
             ));
             let out = decode(&stream, &Jbig2Params { globals: None }).unwrap();
-            assert_eq!(out, packed_from(&art), "template {template} tpgdon {tpgdon}");
+            assert_eq!(
+                out,
+                packed_from(&art),
+                "template {template} tpgdon {tpgdon}"
+            );
         }
     }
 
@@ -1885,7 +1925,13 @@ mod tests {
         // TOPLEFT placement on one strip: sym0 at S=0, then IDS=2 advances S
         // from 2 (= 0 + w-1) to 4 for sym1.
         let mut stream = segment(0, 48, &[], 1, &page_info_payload(10, 4, 0));
-        stream.extend_from_slice(&segment(1, 0, &[], 1, &symbol_dict_payload(&[&sym0, &sym1])));
+        stream.extend_from_slice(&segment(
+            1,
+            0,
+            &[],
+            1,
+            &symbol_dict_payload(&[&sym0, &sym1]),
+        ));
         stream.extend_from_slice(&segment(
             2,
             6, // immediate text region
@@ -1894,12 +1940,7 @@ mod tests {
             &text_region_payload(10, 4, 2, &[(0, 0), (1, 2)]),
         ));
         let out = decode(&stream, &Jbig2Params { globals: None }).unwrap();
-        let expected = packed_from(&[
-            "#.#...#...",
-            ".#...#....",
-            "#.#.#.....",
-            "..........",
-        ]);
+        let expected = packed_from(&["#.#...#...", ".#...#....", "#.#.#.....", ".........."]);
         assert_eq!(out, expected);
     }
 

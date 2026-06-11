@@ -349,11 +349,7 @@ impl CidCMap {
                     i += 1;
                     while i + 2 < tokens.len() {
                         match (&tokens[i], &tokens[i + 1], &tokens[i + 2]) {
-                            (
-                                Token::HexString(lo),
-                                Token::HexString(hi),
-                                Token::Number(cid),
-                            ) => {
+                            (Token::HexString(lo), Token::HexString(hi), Token::Number(cid)) => {
                                 let len = lo.len().clamp(1, 4) as u8;
                                 let first = ascii_to_u32(cid);
                                 cmap.cid_ranges.push((
@@ -994,7 +990,7 @@ mod tests {
         // 1-byte code within <00>..<80>.
         assert_eq!(m.next_code(b"\x41\x42"), (0x41, 1));
         assert_eq!(m.code_to_cid(0x41, 1), 0x42); // 1 + (0x41 - 0)
-        // 2-byte code within <8140>..<FEFF>.
+                                                  // 2-byte code within <8140>..<FEFF>.
         assert_eq!(m.next_code(b"\x81\x41"), (0x8141, 2));
         assert_eq!(m.code_to_cid(0x8141, 2), 634);
         // cidchar single.

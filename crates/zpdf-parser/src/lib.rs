@@ -1,8 +1,8 @@
 mod ccitt;
 mod crypt;
 pub mod filters;
-mod jbig2;
 mod header;
+mod jbig2;
 mod lexer;
 mod object_parser;
 mod recovery;
@@ -281,7 +281,11 @@ impl PdfFile {
         self.resolve_stream_data_inner(id, true)
     }
 
-    fn resolve_stream_data_inner(&self, id: zpdf_core::ObjectId, inline_globals: bool) -> Result<Vec<u8>> {
+    fn resolve_stream_data_inner(
+        &self,
+        id: zpdf_core::ObjectId,
+        inline_globals: bool,
+    ) -> Result<Vec<u8>> {
         let obj = self.resolve(id)?;
         let stream = obj.as_stream()?;
         match self.dict_with_resolved_filters(&stream.dict, inline_globals) {
@@ -349,7 +353,9 @@ impl PdfFile {
     /// without globals inlining of its own, so a crafted reference cycle
     /// cannot recurse. Anything else passes through unchanged.
     fn inline_jbig2_globals(&self, obj: PdfObject) -> PdfObject {
-        let PdfObject::Dict(mut d) = obj else { return obj };
+        let PdfObject::Dict(mut d) = obj else {
+            return obj;
+        };
         if let Some(PdfObject::Ref(r)) = d.get("JBIG2Globals") {
             let r = *r;
             let value = match self.resolve_stream_data_inner(r, false) {

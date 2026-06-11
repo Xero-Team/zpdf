@@ -391,7 +391,8 @@ impl<'a> CpuRenderer<'a> {
                     } else {
                         let d = px.demultiply();
                         // Rec. 601 luma.
-                        (0.299 * d.red() as f32 + 0.587 * d.green() as f32
+                        (0.299 * d.red() as f32
+                            + 0.587 * d.green() as f32
                             + 0.114 * d.blue() as f32)
                             .round()
                             .min(255.0) as u8
@@ -542,14 +543,8 @@ impl<'a> CpuRenderer<'a> {
 
             // Transform each glyph outline point:
             // glyph_coord (font units) → text space → user space → page space → pixel space
-            let skia_path = self.build_outline_transformed_path(
-                &outline,
-                upem,
-                font_size,
-                tm,
-                glyph.x,
-                glyph.y,
-            );
+            let skia_path = self
+                .build_outline_transformed_path(&outline, upem, font_size, tm, glyph.x, glyph.y);
             if let Some(path) = skia_path {
                 if let Some(ref mut pixmap) = self.pixmap {
                     pixmap.fill_path(

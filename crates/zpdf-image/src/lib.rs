@@ -580,13 +580,13 @@ fn decode_dct_image(
             _ => (ResolvedColorSpace::Gray, 1),
         }
     } else {
-            return Err(Error::StreamDecode(format!(
-                "DCT decoded data too short: {} bytes for {}x{} image",
-                decoded_data.len(),
-                width,
-                height
-            )));
-        };
+        return Err(Error::StreamDecode(format!(
+            "DCT decoded data too short: {} bytes for {}x{} image",
+            decoded_data.len(),
+            width,
+            height
+        )));
+    };
 
     // /Decode and colour-key /Mask entries apply to the JPEG's output
     // components; only honour them when their length matches what the JPEG
@@ -1390,7 +1390,11 @@ mod tests {
         let img =
             decode_image_xobject_resolved(&[0, 128, 255], &dict, [0, 0, 0], Some(cs)).unwrap();
         assert_eq!(pixel(&img, 0), &[0, 0, 0, 255]);
-        assert!((pixel(&img, 1)[0] as i16 - 188).abs() <= 2, "{:?}", pixel(&img, 1));
+        assert!(
+            (pixel(&img, 1)[0] as i16 - 188).abs() <= 2,
+            "{:?}",
+            pixel(&img, 1)
+        );
         assert_eq!(pixel(&img, 2), &[255, 255, 255, 255]);
     }
 
@@ -1417,8 +1421,7 @@ mod tests {
         let mut dict = image_dict(2, 1, 8, None);
         dict.insert(PdfName::new("Decode"), int_array(&[1, 0]));
         dict.insert(PdfName::new("Mask"), int_array(&[0, 0])); // key out raw 0
-        let img =
-            decode_image_xobject_resolved(&[0, 255], &dict, [0, 0, 0], Some(cs)).unwrap();
+        let img = decode_image_xobject_resolved(&[0, 255], &dict, [0, 0, 0], Some(cs)).unwrap();
         assert!(img.has_alpha);
         assert_eq!(pixel(&img, 0), &[0, 0, 0, 0]); // raw 0 keyed out
         assert_eq!(pixel(&img, 1), &[0, 0, 0, 255]); // raw 255 → decoded 0 → black
