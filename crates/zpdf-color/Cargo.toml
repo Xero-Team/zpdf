@@ -8,3 +8,5 @@ authors.workspace = true
 
 [dependencies]
 zpdf-core.workspace = true
+moxcms.workspace = true
+tracing.workspace = true

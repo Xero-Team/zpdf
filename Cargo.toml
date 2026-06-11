@@ -52,6 +52,9 @@ aes = "0.8"
 cbc = "0.1"
 sha2 = "0.10"
 zune-jpeg = "0.5"
+# Pure-Rust ICC color management (profile parsing + device→sRGB transforms);
+# its only deps (num-traits, pxfm) are pure Rust as well.
+moxcms = "0.8"
 image = { version = "0.25", default-features = false, features = ["png"] }
 wgpu = "29"
 lyon = "1"

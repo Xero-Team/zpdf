@@ -17,7 +17,7 @@ use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
 
-use zpdf::{ContentInterpreter, ImageCache, PdfDocument, RenderBackend};
+use zpdf::{ContentInterpreter, IccCache, ImageCache, PdfDocument, RenderBackend};
 use zpdf_render_wgpu::{GpuContext, WgpuRenderer};
 
 /// Resolution each page tile is rasterized at. Zoom scales the blit; this is the
@@ -65,10 +65,12 @@ fn render_page(doc: &PdfDocument, idx: usize, slot: &mut Option<GpuContext>) -> 
     let mut fonts = doc.load_page_fonts(&page);
     let content = doc.page_content_bytes(&page).ok()?;
     let mut images = ImageCache::new();
+    let mut colors = IccCache::new();
     let dl = ContentInterpreter::new(page.media_box)
         .with_fonts(&mut fonts)
         .with_document(doc.file(), &page.resources)
         .with_images(&mut images)
+        .with_colors(&mut colors)
         .interpret(&content);
 
     let mut renderer = WgpuRenderer::new().with_fonts(&fonts).with_images(&images);

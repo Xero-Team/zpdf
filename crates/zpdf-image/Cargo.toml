@@ -8,6 +8,7 @@ authors.workspace = true
 
 [dependencies]
 zpdf-core.workspace = true
+zpdf-color.workspace = true
 zune-jpeg.workspace = true
 tracing.workspace = true
 
