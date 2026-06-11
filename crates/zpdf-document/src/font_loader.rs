@@ -39,7 +39,61 @@ pub fn load_single_font(file: &PdfFile, font_ref: ObjectId) -> Result<LoadedFont
     };
 
     attach_text_mappings(file, dict, subtype, &mut font);
+    // A substituted composite font needs /ToUnicode (attached just above) to
+    // route CIDs through the system face's Unicode cmap.
+    font.build_substitute_cid_to_gid();
     Ok(font)
+}
+
+/// FontDescriptor-derived hints for system-font substitution.
+fn substitute_hints(file: &PdfFile, dict: &zpdf_core::PdfDict) -> zpdf_font::system::SubstituteHints {
+    let mut hints = zpdf_font::system::SubstituteHints::default();
+    if let Ok(fd_ref) = dict.get_ref("FontDescriptor") {
+        if let Ok(fd) = file.resolve(fd_ref) {
+            if let Ok(fd) = fd.as_dict() {
+                if let Ok(flags) = fd.get_i64("Flags") {
+                    hints.fixed_pitch = flags & 1 != 0;
+                    hints.serif = flags & 2 != 0;
+                    hints.italic = flags & 64 != 0;
+                    hints.bold = flags & (1 << 18) != 0; // ForceBold
+                }
+                if let Ok(w) = fd.get_f64("StemV") {
+                    hints.bold |= w >= 160.0;
+                }
+            }
+        }
+    }
+    hints
+}
+
+/// Try to substitute an installed system font for a non-embedded simple font.
+/// The PDF /Widths stay authoritative for advances when present; otherwise the
+/// standard-14 metrics (if the name matches one) seed the widths.
+fn try_system_substitute_simple(
+    file: &PdfFile,
+    dict: &zpdf_core::PdfDict,
+    base_font: &str,
+    font_type: PdfFontType,
+    mut cid_widths: CidWidths,
+) -> Option<LoadedFont> {
+    let hints = substitute_hints(file, dict);
+    let m = zpdf_font::system::find_system_font(base_font, hints, None)?;
+    if cid_widths.is_empty() {
+        if let Some(metrics) = zpdf_font::standard_fonts::lookup(base_font) {
+            for (code, &w) in metrics.widths.iter().enumerate() {
+                if w > 0 {
+                    cid_widths.set(code as u16, w as f64);
+                }
+            }
+        }
+    }
+    LoadedFont::new_substitute(
+        font_type,
+        base_font.to_string(),
+        m.data,
+        m.face_index,
+        cid_widths,
+    )
 }
 
 /// Attach the simple-font /Encoding, the symbolic flag, and /ToUnicode (for
@@ -172,12 +226,62 @@ fn apply_differences(enc_dict: &zpdf_core::PdfDict, encoding: &mut zpdf_font::en
     }
 }
 
+/// Resolve a Type0 font's /Encoding into a code → CID CMap: a predefined
+/// name, or an embedded CMap stream. Unknown legacy CMaps fall back to
+/// Identity-H with a warning.
+fn parse_type0_encoding(file: &PdfFile, dict: &zpdf_core::PdfDict) -> zpdf_font::cmap::CidCMap {
+    use zpdf_font::cmap::CidCMap;
+    match dict.get("Encoding") {
+        Some(PdfObject::Name(n)) => CidCMap::predefined(n.as_str()).unwrap_or_else(|| {
+            tracing::warn!("unsupported predefined CMap {}; using Identity-H", n.0);
+            CidCMap::identity(0)
+        }),
+        Some(PdfObject::Ref(r)) => match file.resolve(*r) {
+            Ok(PdfObject::Name(n)) => CidCMap::predefined(n.as_str()).unwrap_or_else(|| {
+                tracing::warn!("unsupported predefined CMap {}; using Identity-H", n.0);
+                CidCMap::identity(0)
+            }),
+            Ok(PdfObject::Stream(s)) => {
+                let data = file
+                    .resolve_stream_data(*r)
+                    .or_else(|_| zpdf_parser::filters::decode_stream(&s.data, &s.dict));
+                let mut cmap = match data {
+                    Ok(d) => CidCMap::parse(&d),
+                    Err(e) => {
+                        tracing::warn!("undecodable embedded CMap: {e}; using Identity-H");
+                        CidCMap::identity(0)
+                    }
+                };
+                // /WMode may also live on the stream dict.
+                if let Ok(1) = s.dict.get_i64("WMode") {
+                    cmap.wmode = 1;
+                }
+                cmap
+            }
+            _ => CidCMap::identity(0),
+        },
+        _ => CidCMap::identity(0),
+    }
+}
+
+/// /DW2 vertical metrics from a CID font dict: [vy w1y], default [880 −1000].
+fn parse_dw2(file: &PdfFile, desc_dict: &zpdf_core::PdfDict) -> (f64, f64) {
+    resolve_array(file, desc_dict, "DW2")
+        .and_then(|arr| {
+            let v: Vec<f64> = arr.iter().filter_map(|o| o.as_f64().ok()).collect();
+            (v.len() >= 2).then(|| (v[0], v[1]))
+        })
+        .unwrap_or((880.0, -1000.0))
+}
+
 fn load_type0_font(
     file: &PdfFile,
     dict: &zpdf_core::PdfDict,
     base_font: String,
 ) -> Result<LoadedFont> {
-    let descendants = dict.get_array("DescendantFonts")?;
+    // /DescendantFonts is commonly an indirect reference to the array.
+    let descendants = resolve_array(file, dict, "DescendantFonts")
+        .ok_or_else(|| zpdf_core::Error::MissingKey("DescendantFonts".into()))?;
     let desc_ref = descendants
         .first()
         .ok_or_else(|| zpdf_core::Error::MissingKey("DescendantFonts[0]".into()))?
@@ -187,10 +291,12 @@ fn load_type0_font(
     let desc_dict = desc_obj.as_dict()?;
 
     let cid_widths = parse_cid_widths(file, desc_dict);
+    let cmap = parse_type0_encoding(file, dict);
+    let dw2 = parse_dw2(file, desc_dict);
 
     let font_data = extract_font_file(file, desc_dict);
 
-    match font_data {
+    let mut font = match font_data {
         Some(data) => {
             let mut font =
                 LoadedFont::new_with_data(PdfFontType::Type0CidType2, base_font, data, cid_widths);
@@ -204,10 +310,39 @@ fn load_type0_font(
                     font.cid_to_gid = Some(map);
                 }
             }
-            Ok(font)
+            font
         }
-        None => Ok(LoadedFont::new_placeholder(base_font)),
-    }
+        None => {
+            // Non-embedded composite font (typically CJK): substitute a system
+            // face. CIDs are remapped through /ToUnicode once it is attached
+            // (see build_substitute_cid_to_gid in load_single_font).
+            let ordering = resolve_dict(file, desc_dict, "CIDSystemInfo")
+                .and_then(|csi| match csi.get("Ordering") {
+                    Some(PdfObject::String(s)) => Some(s.to_string_lossy()),
+                    Some(PdfObject::Name(n)) => Some(n.as_str().to_string()),
+                    _ => None,
+                });
+            let hints = substitute_hints(file, desc_dict);
+            let substituted = zpdf_font::system::find_system_font(
+                &base_font,
+                hints,
+                ordering.as_deref(),
+            )
+            .and_then(|m| {
+                LoadedFont::new_substitute(
+                    PdfFontType::Type0CidType2,
+                    base_font.clone(),
+                    m.data,
+                    m.face_index,
+                    cid_widths,
+                )
+            });
+            substituted.unwrap_or_else(|| LoadedFont::new_placeholder(base_font))
+        }
+    };
+    font.cid_cmap = Some(cmap);
+    font.dw2 = dw2;
+    Ok(font)
 }
 
 /// Decode a /CIDToGIDMap stream into a CID → GID table: two bytes per CID,
@@ -261,8 +396,11 @@ fn load_truetype_font(
             data,
             cid_widths,
         )),
-        None => Ok(LoadedFont::new_standard(base_font.clone())
-            .unwrap_or_else(|| LoadedFont::new_placeholder(base_font))),
+        None => Ok(
+            try_system_substitute_simple(file, dict, &base_font, PdfFontType::TrueType, cid_widths)
+                .or_else(|| LoadedFont::new_standard(base_font.clone()))
+                .unwrap_or_else(|| LoadedFont::new_placeholder(base_font)),
+        ),
     }
 }
 
@@ -345,6 +483,8 @@ fn load_type3_font(
         },
         base_font,
         font_data: None,
+        face_index: 0,
+        is_substitute: false,
         cid_widths: CidWidths::new(1000.0),
         units_per_em: 1000.0,
         ascent: 880.0,
@@ -356,6 +496,8 @@ fn load_type3_font(
         to_unicode: None,
         symbolic: false,
         type1: None,
+        cid_cmap: None,
+        dw2: (880.0, -1000.0),
     };
 
     Ok(font)
@@ -376,8 +518,11 @@ fn load_type1_font(
             data,
             cid_widths,
         )),
-        None => Ok(LoadedFont::new_standard(base_font.clone())
-            .unwrap_or_else(|| LoadedFont::new_placeholder(base_font))),
+        None => Ok(
+            try_system_substitute_simple(file, dict, &base_font, PdfFontType::Type1, cid_widths)
+                .or_else(|| LoadedFont::new_standard(base_font.clone()))
+                .unwrap_or_else(|| LoadedFont::new_placeholder(base_font)),
+        ),
     }
 }
 

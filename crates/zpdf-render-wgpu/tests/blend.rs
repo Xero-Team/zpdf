@@ -36,6 +36,8 @@ fn build(mode: BlendMode) -> DisplayList {
         isolated: false,
         knockout: false,
         bounds: Rect::new(0.0, 0.0, W, H),
+        alpha: 1.0,
+        mask: None,
     });
     dl.push(fill(Color::rgb(1.0, 0.0, 0.0), (W / 2.0, 0.0, W, H))); // group: red, right half
     dl.push(RenderCommand::PopBlendGroup);

@@ -41,6 +41,7 @@ zpdf = { path = "crates/zpdf", version = "0.1.0", default-features = false }
 # external
 thiserror = "2"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 smallvec = "1"
 bitflags = "2"
 bytemuck = { version = "1", features = ["derive"] }

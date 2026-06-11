@@ -45,8 +45,37 @@ pub enum RenderCommand {
         isolated: bool,
         knockout: bool,
         bounds: Rect,
+        /// Group constant alpha applied when compositing onto the backdrop
+        /// (the ExtGState /ca in effect when a transparency group is painted).
+        alpha: f32,
+        /// ExtGState /SMask soft mask modulating the group composite.
+        mask: Option<SoftMask>,
     },
     PopBlendGroup,
+}
+
+/// An ExtGState /SMask soft mask: the mask group's content pre-interpreted
+/// into page-space commands (geometry is fixed at `gs` time per PDF
+/// 11.6.5.2), rasterized by the backend at composite resolution.
+#[derive(Debug, Clone)]
+pub struct SoftMask {
+    pub kind: SoftMaskKind,
+    /// The /G transparency group's interpreted content. Font/image ids refer
+    /// to the same caches as the surrounding display list.
+    pub commands: std::sync::Arc<DisplayList>,
+    /// /BC backdrop luminosity (0..1) for areas the group leaves unpainted.
+    /// Luminosity masks default to 0 (fully masked out).
+    pub backdrop_luma: f32,
+    /// /TR transfer function, pre-sampled over [0,1] into 256 steps.
+    pub transfer: Option<std::sync::Arc<[u8; 256]>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SoftMaskKind {
+    /// Mask value = group luminosity over the /BC backdrop.
+    Luminosity,
+    /// Mask value = group alpha.
+    Alpha,
 }
 
 // -- Path --

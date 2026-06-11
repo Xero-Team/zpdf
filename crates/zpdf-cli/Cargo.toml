@@ -19,3 +19,4 @@ gpu = ["zpdf/gpu-render"]
 zpdf = { workspace = true, default-features = false }
 # Direct CLI dep (NOT feature-gated): compare/text/render use image::open/RgbaImage.
 image.workspace = true
+tracing-subscriber.workspace = true

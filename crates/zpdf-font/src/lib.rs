@@ -2,6 +2,7 @@ pub mod cmap;
 pub mod encoding;
 pub mod glyph_list;
 pub mod standard_fonts;
+pub mod system;
 pub mod type1;
 
 use std::collections::HashMap;
@@ -52,6 +53,11 @@ impl CidWidths {
     pub fn get_opt(&self, cid: u16) -> Option<f64> {
         self.widths.get(&cid).copied()
     }
+
+    /// True when no per-glyph widths were set (every code falls to the default).
+    pub fn is_empty(&self) -> bool {
+        self.widths.is_empty()
+    }
 }
 
 /// A loaded font with embedded TrueType/CFF data.
@@ -59,6 +65,12 @@ pub struct LoadedFont {
     pub font_type: PdfFontType,
     pub base_font: String,
     pub font_data: Option<Arc<[u8]>>,
+    /// Face index within `font_data` (non-zero only for faces from TTC
+    /// collections supplied by the system-font fallback).
+    pub face_index: u32,
+    /// True when `font_data` is a substituted system font rather than the
+    /// PDF-embedded program. PDF metrics (/Widths, /W) stay authoritative.
+    pub is_substitute: bool,
     pub cid_widths: CidWidths,
     pub units_per_em: f64,
     pub ascent: f64,
@@ -83,6 +95,12 @@ pub struct LoadedFont {
     /// Parsed embedded Type 1 (PostScript) font program, when the embedded data is
     /// Type 1 rather than sfnt/CFF (ttf-parser cannot handle Type 1).
     pub type1: Option<type1::Type1Font>,
+    /// Composite-font code → CID CMap from the Type0 /Encoding (None for
+    /// simple fonts; Identity-H behavior when absent on a composite font).
+    pub cid_cmap: Option<cmap::CidCMap>,
+    /// /DW2 vertical-writing defaults: (origin-shift vy, advance w1y), in
+    /// 1/1000 glyph-space units (PDF defaults [880 −1000]).
+    pub dw2: (f64, f64),
 }
 
 #[derive(Debug, Clone)]
@@ -156,6 +174,8 @@ impl LoadedFont {
                 font_type,
                 base_font,
                 font_data: Some(Arc::from(font_data)),
+                face_index: 0,
+                is_substitute: false,
                 cid_widths,
                 units_per_em,
                 ascent,
@@ -167,6 +187,8 @@ impl LoadedFont {
                 to_unicode: None,
                 symbolic: false,
                 type1: None,
+                cid_cmap: None,
+                dw2: (880.0, -1000.0),
             }
         } else if let Some(t1) = type1::Type1Font::parse(&font_data) {
             // Embedded Type 1 (PostScript) program — ttf-parser cannot parse it.
@@ -175,6 +197,8 @@ impl LoadedFont {
                 font_type,
                 base_font,
                 font_data: None,
+                face_index: 0,
+                is_substitute: false,
                 cid_widths,
                 units_per_em,
                 ascent: units_per_em * 0.8,
@@ -186,6 +210,8 @@ impl LoadedFont {
                 to_unicode: None,
                 symbolic: false,
                 type1: Some(t1),
+                cid_cmap: None,
+                dw2: (880.0, -1000.0),
             }
         } else {
             tracing::debug!(
@@ -195,6 +221,8 @@ impl LoadedFont {
                 font_type,
                 base_font,
                 font_data: None,
+                face_index: 0,
+                is_substitute: false,
                 cid_widths,
                 units_per_em: 1000.0,
                 ascent: 800.0,
@@ -206,7 +234,86 @@ impl LoadedFont {
                 to_unicode: None,
                 symbolic: false,
                 type1: None,
+                cid_cmap: None,
+                dw2: (880.0, -1000.0),
             }
+        }
+    }
+
+    /// Build a font around a substituted *system* font program (whole file
+    /// bytes + face index, from [`system::find_system_font`]). The PDF's own
+    /// metrics (`cid_widths`) remain authoritative for advances; the system
+    /// face provides outlines, cmap and name tables for glyph resolution.
+    pub fn new_substitute(
+        font_type: PdfFontType,
+        base_font: String,
+        data: Arc<[u8]>,
+        face_index: u32,
+        cid_widths: CidWidths,
+    ) -> Option<Self> {
+        let face = ttf_parser::Face::parse(&data, face_index).ok()?;
+        let units_per_em = face.units_per_em() as f64;
+        let ascent = face.ascender() as f64;
+        let descent = face.descender() as f64;
+        Some(Self {
+            font_type,
+            base_font,
+            font_data: Some(data),
+            face_index,
+            is_substitute: true,
+            cid_widths,
+            units_per_em,
+            ascent,
+            descent,
+            cid_to_gid: None,
+            builtin_encoding_gids: None,
+            orphan_gids: Vec::new(),
+            encoding: None,
+            to_unicode: None,
+            symbolic: false,
+            type1: None,
+            cid_cmap: None,
+            dw2: (880.0, -1000.0),
+        })
+    }
+
+    /// For a substituted composite (Type0) font: synthesize the CID → GID
+    /// table by routing each /ToUnicode mapping through the system face's
+    /// Unicode cmap. Without this, CIDs (which index the *original* embedded
+    /// subset) would be misread as GIDs of the substitute. Call after
+    /// /ToUnicode is attached.
+    pub fn build_substitute_cid_to_gid(&mut self) {
+        if !self.is_substitute || !matches!(self.font_type, PdfFontType::Type0CidType2) {
+            return;
+        }
+        // Unicode-coded CMaps resolve straight to GIDs — no CID table needed.
+        if self.unicode_coded() {
+            return;
+        }
+        let Some(tu) = &self.to_unicode else { return };
+        let Some(data) = &self.font_data else { return };
+        let Ok(face) = ttf_parser::Face::parse(data, self.face_index) else {
+            return;
+        };
+        let mut map = HashMap::new();
+        for (code, s) in tu.iter() {
+            if code > u16::MAX as u32 {
+                continue;
+            }
+            let Some(ch) = s.chars().next() else { continue };
+            if let Some(g) = face.glyph_index(ch) {
+                if g.0 != 0 {
+                    map.insert(code as u16, g.0);
+                }
+            }
+        }
+        if map.is_empty() {
+            tracing::debug!(
+                "substitute {}: no ToUnicode-derived CID mapping; composite glyphs will drop",
+                self.base_font
+            );
+        } else {
+            self.cid_to_gid = Some(map);
         }
     }
 
@@ -222,6 +329,8 @@ impl LoadedFont {
             font_type: PdfFontType::Type1,
             base_font,
             font_data: None,
+            face_index: 0,
+            is_substitute: false,
             cid_widths,
             units_per_em: 1000.0,
             ascent: metrics.ascent,
@@ -233,6 +342,8 @@ impl LoadedFont {
             to_unicode: None,
             symbolic: false,
             type1: None,
+            cid_cmap: None,
+            dw2: (880.0, -1000.0),
         })
     }
 
@@ -241,6 +352,8 @@ impl LoadedFont {
             font_type: PdfFontType::Type1,
             base_font,
             font_data: None,
+            face_index: 0,
+            is_substitute: false,
             cid_widths: CidWidths::new(500.0),
             units_per_em: 1000.0,
             ascent: 800.0,
@@ -252,7 +365,33 @@ impl LoadedFont {
             to_unicode: None,
             symbolic: false,
             type1: None,
+            cid_cmap: None,
+            dw2: (880.0, -1000.0),
         }
+    }
+
+    /// True when the composite-font code values are Unicode and glyph ids in
+    /// glyph runs are already real GIDs (no CID → GID mapping applies).
+    fn unicode_coded(&self) -> bool {
+        self.cid_cmap
+            .as_ref()
+            .map(|c| c.codes_are_unicode)
+            .unwrap_or(false)
+    }
+
+    /// Resolve a Unicode code point to (GID, advance) for Unicode-coded
+    /// composite fonts. The advance is normalized to 1/1000 text-space units
+    /// (the composite-font convention).
+    pub fn unicode_glyph(&self, code: u32) -> Option<(u16, f64)> {
+        let data = self.font_data.as_ref()?;
+        let face = ttf_parser::Face::parse(data, self.face_index).ok()?;
+        let ch = char::from_u32(code)?;
+        let gid = face.glyph_index(ch)?;
+        let adv = face
+            .glyph_hor_advance(gid)
+            .map(|a| a as f64 * 1000.0 / self.units_per_em)
+            .unwrap_or(500.0);
+        Some((gid.0, adv))
     }
 
     /// Get glyph outline for a given glyph ID (or CID for CID fonts).
@@ -261,9 +400,12 @@ impl LoadedFont {
             return t1.glyph_outline_by_gid(glyph_id);
         }
         let data = self.font_data.as_ref()?;
-        let face = ttf_parser::Face::parse(data, 0).ok()?;
+        let face = ttf_parser::Face::parse(data, self.face_index).ok()?;
 
-        let actual_gid = if let Some(map) = &self.cid_to_gid {
+        let actual_gid = if self.unicode_coded() {
+            // Unicode-coded composite fonts already carry real GIDs.
+            glyph_id
+        } else if let Some(map) = &self.cid_to_gid {
             *map.get(&glyph_id)?
         } else {
             glyph_id
@@ -300,7 +442,7 @@ impl LoadedFont {
         }
         // For simple TrueType, try the font program's hmtx table
         if let Some(data) = &self.font_data {
-            if let Ok(face) = ttf_parser::Face::parse(data, 0) {
+            if let Ok(face) = ttf_parser::Face::parse(data, self.face_index) {
                 let gid = ttf_parser::GlyphId(glyph_id);
                 if let Some(a) = face.glyph_hor_advance(gid) {
                     return a as f64;
@@ -345,7 +487,7 @@ impl LoadedFont {
         }
 
         let data = self.font_data.as_ref()?;
-        let face = ttf_parser::Face::parse(data, 0).ok()?;
+        let face = ttf_parser::Face::parse(data, self.face_index).ok()?;
         let code8 = code as u8;
 
         // 1. /Encoding → glyph name → (by-name lookup, else name→Unicode→cmap).
@@ -461,7 +603,7 @@ impl LoadedFont {
             return w / 1000.0 * self.units_per_em;
         }
         if let Some(data) = &self.font_data {
-            if let Ok(face) = ttf_parser::Face::parse(data, 0) {
+            if let Ok(face) = ttf_parser::Face::parse(data, self.face_index) {
                 if let Some(a) = face.glyph_hor_advance(ttf_parser::GlyphId(gid)) {
                     return a as f64;
                 }
@@ -475,9 +617,24 @@ impl LoadedFont {
     pub fn decode_to_string(&self, bytes: &[u8]) -> String {
         let mut out = String::new();
         if matches!(self.font_type, PdfFontType::Type0CidType2) {
-            // Composite font (Identity-H by default → 2-byte codes). Only /ToUnicode
-            // can map these; honour its codespace byte-length when it is a single
-            // fixed width (e.g. a 1-byte composite CMap), else fall back to 2.
+            // Composite font: segment codes through the /Encoding CMap when
+            // present (variable-length codespaces), else fall back to the
+            // /ToUnicode codespace width or the 2-byte Identity convention.
+            if let Some(cm) = &self.cid_cmap {
+                let mut i = 0usize;
+                while i < bytes.len() {
+                    let (code, len) = cm.next_code(&bytes[i..]);
+                    i += len.max(1);
+                    if let Some(s) = self.to_unicode.as_ref().and_then(|tu| tu.lookup(code)) {
+                        out.push_str(s);
+                    } else if cm.codes_are_unicode {
+                        if let Some(c) = char::from_u32(code) {
+                            out.push(c);
+                        }
+                    }
+                }
+                return out;
+            }
             let width = match &self.to_unicode {
                 Some(tu) => match tu.code_byte_lengths() {
                     [n] if *n >= 1 => *n as usize,

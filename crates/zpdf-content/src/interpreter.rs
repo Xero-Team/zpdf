@@ -35,6 +35,21 @@ pub struct ContentInterpreter<'a> {
     /// form cannot corrupt the page-level state.
     state_floor: usize,
     text_sink: Option<&'a mut Vec<TextSpan>>,
+    /// The CTM at page-content start (identity or the baked page rotation).
+    /// Pattern space is anchored to this, not to the CTM at fill time.
+    base_ctm: Matrix,
+    /// Inside an uncolored (PaintType 2) tiling-pattern cell: color operators
+    /// are ignored so the cell paints with the pattern's `scn` color.
+    suppress_color_ops: bool,
+    /// Default optional-content configuration; `None` renders everything.
+    oc_config: Option<&'a zpdf_document::OcConfig>,
+    /// Annotations painted after the page content (appearance streams).
+    annotations: Option<&'a [zpdf_document::Annotation]>,
+    /// Marked-content nesting depth (BMC/BDC vs EMC).
+    mc_depth: u32,
+    /// Depth at which a hidden `BDC /OC` block began; painting is suppressed
+    /// until the matching EMC.
+    oc_hidden_from: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -60,7 +75,11 @@ enum ActiveColorSpace {
         transform: Option<std::sync::Arc<zpdf_color::PdfFunction>>,
         alternate: Box<ActiveColorSpace>,
     },
-    Pattern,
+    Pattern {
+        /// Underlying space of `[/Pattern base]` — the color operands that
+        /// accompany an uncolored (PaintType 2) tiling pattern in `scn`.
+        base: Option<Box<ActiveColorSpace>>,
+    },
 }
 
 impl ActiveColorSpace {
@@ -73,7 +92,7 @@ impl ActiveColorSpace {
             Self::Lab { .. } => 3,
             Self::Indexed { .. } => 1,
             Self::Tint { n, .. } => (*n).max(1),
-            Self::Pattern => 0,
+            Self::Pattern { .. } => 0,
         }
     }
 }
@@ -82,9 +101,25 @@ impl ActiveColorSpace {
 #[derive(Debug, Clone)]
 enum PatternPaint {
     Shading(std::sync::Arc<crate::shading::ShadingDef>),
-    /// Tiling patterns are approximated with a solid mid-gray until cell
-    /// replication is implemented.
-    Tiling,
+    Tiling(std::sync::Arc<TilingPatternDef>),
+}
+
+/// A tiling pattern (PatternType 1), resolved at `scn` time and replicated
+/// cell-by-cell at fill time.
+#[derive(Debug)]
+struct TilingPatternDef {
+    /// Decoded cell content stream.
+    content: Vec<u8>,
+    /// The pattern's raw stream dict (fonts/resources are loaded at paint time).
+    dict: zpdf_core::PdfDict,
+    bbox: Rect,
+    x_step: f64,
+    y_step: f64,
+    /// Pattern space → default page user space.
+    matrix: Matrix,
+    /// 1 = colored, 2 = uncolored (cell ignores color operators and paints
+    /// with the color given alongside the pattern name in `scn`).
+    paint_type: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -113,6 +148,8 @@ struct GraphicsState {
     fill_pattern: Option<PatternPaint>,
     stroke_pattern: Option<PatternPaint>,
     blend_mode: BlendMode,
+    /// ExtGState /SMask currently in effect (None = no soft mask).
+    soft_mask: Option<SoftMask>,
 }
 
 impl Default for GraphicsState {
@@ -142,6 +179,7 @@ impl Default for GraphicsState {
             fill_pattern: None,
             stroke_pattern: None,
             blend_mode: BlendMode::Normal,
+            soft_mask: None,
         }
     }
 }
@@ -167,6 +205,12 @@ impl<'a> ContentInterpreter<'a> {
             form_depth: 0,
             state_floor: 0,
             text_sink: None,
+            base_ctm: Matrix::identity(),
+            suppress_color_ops: false,
+            oc_config: None,
+            annotations: None,
+            mc_depth: 0,
+            oc_hidden_from: None,
         }
     }
 
@@ -211,6 +255,7 @@ impl<'a> ContentInterpreter<'a> {
             _ => return self,
         };
         self.current.ctm = base;
+        self.base_ctm = base;
         self.display_list.page_rect = rotated;
         self
     }
@@ -238,6 +283,19 @@ impl<'a> ContentInterpreter<'a> {
         self
     }
 
+    /// Honor the document's optional-content configuration: content in groups
+    /// turned off (BDC /OC blocks, XObject /OC, annotation /OC) is skipped.
+    pub fn with_optional_content(mut self, config: &'a zpdf_document::OcConfig) -> Self {
+        self.oc_config = Some(config);
+        self
+    }
+
+    /// Paint these annotations' appearance streams after the page content.
+    pub fn with_annotations(mut self, annots: &'a [zpdf_document::Annotation]) -> Self {
+        self.annotations = Some(annots);
+        self
+    }
+
     pub fn interpret(mut self, content: &[u8]) -> DisplayList {
         let tokenizer = ContentTokenizer::new(content);
 
@@ -256,6 +314,8 @@ impl<'a> ContentInterpreter<'a> {
                 }
             }
         }
+
+        self.paint_annotations();
 
         self.display_list
     }
@@ -292,6 +352,16 @@ impl<'a> ContentInterpreter<'a> {
     }
 
     fn execute_operator(&mut self, op: &str) {
+        // Uncolored (PaintType 2) pattern cells paint exclusively with the
+        // color given at `scn` time; their own color operators are ignored.
+        if self.suppress_color_ops
+            && matches!(
+                op,
+                "g" | "G" | "rg" | "RG" | "k" | "K" | "cs" | "CS" | "sc" | "scn" | "SC" | "SCN"
+            )
+        {
+            return;
+        }
         match op {
             // -- Graphics state --
             "q" => {
@@ -518,7 +588,7 @@ impl<'a> ContentInterpreter<'a> {
                 self.current.fill_pattern = None;
                 // Per spec, cs resets the color to the space's initial value
                 // (black / index 0 / tint 1.0 all paint-as-dark; Pattern has none).
-                if !matches!(self.current.fill_cs, ActiveColorSpace::Pattern) {
+                if !matches!(self.current.fill_cs, ActiveColorSpace::Pattern { .. }) {
                     self.current.fill_color = self.initial_color(&self.current.fill_cs);
                 }
             }
@@ -526,14 +596,19 @@ impl<'a> ContentInterpreter<'a> {
                 let name = self.pop_name();
                 self.current.stroke_cs = self.resolve_color_space(&name);
                 self.current.stroke_pattern = None;
-                if !matches!(self.current.stroke_cs, ActiveColorSpace::Pattern) {
+                if !matches!(self.current.stroke_cs, ActiveColorSpace::Pattern { .. }) {
                     self.current.stroke_color = self.initial_color(&self.current.stroke_cs);
                 }
             }
             "sc" | "scn" => {
-                if matches!(self.current.fill_cs, ActiveColorSpace::Pattern) {
+                if let ActiveColorSpace::Pattern { base } = self.current.fill_cs.clone() {
                     let name = self.pop_name();
-                    let (pattern, approx) = self.resolve_pattern(&name);
+                    let (pattern, mut approx) = self.resolve_pattern(&name);
+                    // Uncolored tiling pattern: the operands before the name
+                    // are the cell color in the pattern's base space.
+                    if let Some(c) = self.uncolored_pattern_color(&pattern, base.as_deref()) {
+                        approx = c;
+                    }
                     self.current.fill_pattern = pattern;
                     self.current.fill_color = approx;
                 } else {
@@ -542,9 +617,12 @@ impl<'a> ContentInterpreter<'a> {
                 }
             }
             "SC" | "SCN" => {
-                if matches!(self.current.stroke_cs, ActiveColorSpace::Pattern) {
+                if let ActiveColorSpace::Pattern { base } = self.current.stroke_cs.clone() {
                     let name = self.pop_name();
-                    let (pattern, approx) = self.resolve_pattern(&name);
+                    let (pattern, mut approx) = self.resolve_pattern(&name);
+                    if let Some(c) = self.uncolored_pattern_color(&pattern, base.as_deref()) {
+                        approx = c;
+                    }
                     self.current.stroke_pattern = pattern;
                     self.current.stroke_color = approx;
                 } else {
@@ -677,7 +755,33 @@ impl<'a> ContentInterpreter<'a> {
             }
 
             // -- Marked content --
-            "BMC" | "BDC" | "EMC" | "MP" | "DP" => {}
+            "BMC" => {
+                self.mc_depth += 1;
+            }
+            "BDC" => {
+                // Operands: tag (first) then properties (top of stack).
+                let props = self.operand_stack.pop();
+                let tag = match self.operand_stack.pop() {
+                    Some(PdfObject::Name(n)) => n.0,
+                    _ => String::new(),
+                };
+                self.mc_depth += 1;
+                if tag == "OC" && self.oc_hidden_from.is_none() {
+                    let visible = props
+                        .map(|p| self.oc_properties_visible(&p))
+                        .unwrap_or(true);
+                    if !visible {
+                        self.oc_hidden_from = Some(self.mc_depth);
+                    }
+                }
+            }
+            "EMC" => {
+                if self.oc_hidden_from == Some(self.mc_depth) {
+                    self.oc_hidden_from = None;
+                }
+                self.mc_depth = self.mc_depth.saturating_sub(1);
+            }
+            "MP" | "DP" => {}
 
             _ => {}
         }
@@ -688,7 +792,7 @@ impl<'a> ContentInterpreter<'a> {
             "DeviceGray" | "G" => ActiveColorSpace::DeviceGray,
             "DeviceRGB" | "RGB" => ActiveColorSpace::DeviceRGB,
             "DeviceCMYK" | "CMYK" => ActiveColorSpace::DeviceCMYK,
-            "Pattern" => ActiveColorSpace::Pattern,
+            "Pattern" => ActiveColorSpace::Pattern { base: None },
             _ => {
                 // Resource lookup: direct (inline) values first, then refs.
                 if let Some(obj) = self.lookup_res(|r| r.color_spaces_inline.get(name).cloned()) {
@@ -816,7 +920,12 @@ impl<'a> ContentInterpreter<'a> {
             }
             "CalGray" => ActiveColorSpace::DeviceGray,
             "CalRGB" => ActiveColorSpace::DeviceRGB,
-            "Pattern" => ActiveColorSpace::Pattern,
+            // `[/Pattern base]` — retain the base space for uncolored patterns.
+            "Pattern" => ActiveColorSpace::Pattern {
+                base: arr
+                    .get(1)
+                    .map(|o| Box::new(self.resolve_color_space_obj(o, depth + 1))),
+            },
             _ => ActiveColorSpace::DeviceGray,
         }
     }
@@ -951,7 +1060,7 @@ impl<'a> ContentInterpreter<'a> {
                     .fold(0.0f64, |acc, &v| acc.max(v.clamp(0.0, 1.0)));
                 Color::gray(1.0 - max_tint as f32)
             }
-            ActiveColorSpace::Pattern => Color::black(),
+            ActiveColorSpace::Pattern { .. } => Color::black(),
         }
     }
 
@@ -997,9 +1106,82 @@ impl<'a> ContentInterpreter<'a> {
             }
             return (None, Color::gray(0.5));
         }
-        // Tiling pattern: not replicated yet — neutral gray placeholder beats
-        // solid black for hatches/textures.
-        (Some(PatternPaint::Tiling), Color::gray(0.5))
+
+        // Tiling pattern (PatternType 1): capture everything needed to replay
+        // the cell at fill time. The gray approximation remains the fallback
+        // for paths that cannot take the real paint (e.g. strokes).
+        let PdfObject::Stream(stream) = &obj else {
+            return (None, Color::gray(0.5));
+        };
+        let content = match file
+            .resolve_stream_data(pat_id)
+            .or_else(|_| zpdf_parser::filters::decode_stream(&stream.data, &stream.dict))
+        {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::debug!("tiling pattern {name}: undecodable stream - {e}");
+                return (None, Color::gray(0.5));
+            }
+        };
+        let get4 = |key: &str| {
+            dict.get_array(key).ok().and_then(|arr| {
+                let v: Vec<f64> = arr.iter().filter_map(|o| o.as_f64().ok()).collect();
+                (v.len() == 4).then(|| {
+                    Rect::new(
+                        v[0].min(v[2]),
+                        v[1].min(v[3]),
+                        v[0].max(v[2]),
+                        v[1].max(v[3]),
+                    )
+                })
+            })
+        };
+        let Some(bbox) = get4("BBox").filter(|b| b.width() > 0.0 && b.height() > 0.0) else {
+            tracing::debug!("tiling pattern {name}: missing/degenerate BBox");
+            return (None, Color::gray(0.5));
+        };
+        // Steps default to the cell size; zero/non-finite steps are degenerate.
+        let x_step = dict.get_f64("XStep").unwrap_or(bbox.width());
+        let y_step = dict.get_f64("YStep").unwrap_or(bbox.height());
+        if !x_step.is_finite() || !y_step.is_finite() || x_step == 0.0 || y_step == 0.0 {
+            tracing::debug!("tiling pattern {name}: degenerate steps");
+            return (None, Color::gray(0.5));
+        }
+        let paint_type = dict.get_i64("PaintType").unwrap_or(1);
+        let def = TilingPatternDef {
+            content,
+            dict: dict.clone(),
+            bbox,
+            x_step,
+            y_step,
+            matrix,
+            paint_type,
+        };
+        (
+            Some(PatternPaint::Tiling(std::sync::Arc::new(def))),
+            Color::gray(0.5),
+        )
+    }
+
+    /// For an uncolored (PaintType 2) tiling pattern selected by `scn`, pop the
+    /// color operands that precede the pattern name and convert them in the
+    /// Pattern colorspace's base space.
+    fn uncolored_pattern_color(
+        &mut self,
+        pattern: &Option<PatternPaint>,
+        base: Option<&ActiveColorSpace>,
+    ) -> Option<Color> {
+        let Some(PatternPaint::Tiling(def)) = pattern else {
+            return None;
+        };
+        if def.paint_type != 2 {
+            return None;
+        }
+        let base = base?.clone();
+        if self.operand_stack.len() < base.components() {
+            return None;
+        }
+        Some(self.pop_color(&base))
     }
 
     /// Build an evaluatable shading from a /Shading dict (type 2/3 only).
@@ -1186,15 +1368,209 @@ impl<'a> ContentInterpreter<'a> {
             .then(|| Rect::new(min.x, min.y, max.x, max.y))
     }
 
+    /// True while painting is suppressed by a hidden optional-content block.
+    fn oc_suppressed(&self) -> bool {
+        self.oc_hidden_from.is_some()
+    }
+
+    /// Visibility of a BDC /OC properties operand: an inline dict, or a name
+    /// looked up in the /Properties resource.
+    fn oc_properties_visible(&self, props: &PdfObject) -> bool {
+        match props {
+            PdfObject::Name(n) => {
+                let obj = self
+                    .lookup_res(|r| r.properties_inline.get(n.as_str()).cloned())
+                    .map(PdfObject::Dict)
+                    .or_else(|| {
+                        self.lookup_res(|r| r.properties.get(n.as_str()).copied())
+                            .map(PdfObject::Ref)
+                    });
+                match obj {
+                    Some(o) => self.oc_object_visible(&o, 0),
+                    None => true,
+                }
+            }
+            other => self.oc_object_visible(other, 0),
+        }
+    }
+
+    /// Visibility of an /OC value: an OCG ref, or an OCMD with /OCGs + /P
+    /// policy or a /VE visibility expression (which takes precedence).
+    fn oc_object_visible(&self, obj: &PdfObject, depth: u8) -> bool {
+        if depth > 8 {
+            return true;
+        }
+        let Some(config) = self.oc_config else {
+            return true;
+        };
+        // Track the id so direct OCG refs use set membership.
+        let (id, resolved) = match obj {
+            PdfObject::Ref(r) => match self.file.map(|f| f.resolve(*r)) {
+                Some(Ok(o)) => (Some(*r), o),
+                _ => return true,
+            },
+            other => (None, other.clone()),
+        };
+        let Ok(dict) = resolved.as_dict() else {
+            return true;
+        };
+
+        match dict.get_name("Type") {
+            Ok("OCMD") => {
+                // /VE visibility expression wins over /OCGs per 8.11.2.3.
+                if let Some(ve) = dict.get("VE") {
+                    return self.oc_expression_visible(ve, depth + 1);
+                }
+                let groups: Vec<bool> = match dict.get("OCGs") {
+                    Some(PdfObject::Array(arr)) => arr
+                        .iter()
+                        .filter_map(|o| match o {
+                            PdfObject::Ref(r) => Some(config.group_visible(*r)),
+                            _ => None,
+                        })
+                        .collect(),
+                    Some(PdfObject::Ref(r)) => vec![config.group_visible(*r)],
+                    _ => return true,
+                };
+                if groups.is_empty() {
+                    return true;
+                }
+                match dict.get_name("P") {
+                    Ok("AllOn") => groups.iter().all(|&v| v),
+                    Ok("AnyOff") => groups.iter().any(|&v| !v),
+                    Ok("AllOff") => groups.iter().all(|&v| !v),
+                    // Default policy: AnyOn.
+                    _ => groups.iter().any(|&v| v),
+                }
+            }
+            // An OCG (or untyped dict): membership is by object id.
+            _ => id.map(|i| config.group_visible(i)).unwrap_or(true),
+        }
+    }
+
+    /// Evaluate a /VE visibility expression: ["Not", x], ["And", ...],
+    /// ["Or", ...] with OCG refs (or nested expressions) as operands.
+    fn oc_expression_visible(&self, ve: &PdfObject, depth: u8) -> bool {
+        if depth > 8 {
+            return true;
+        }
+        let arr = match &self.resolve_plain(ve) {
+            PdfObject::Array(a) => a.clone(),
+            _ => return true,
+        };
+        let Some(PdfObject::Name(op)) = arr.first() else {
+            return true;
+        };
+        let operand = |o: &PdfObject| -> bool {
+            match o {
+                PdfObject::Array(_) => self.oc_expression_visible(o, depth + 1),
+                other => self.oc_object_visible(other, depth + 1),
+            }
+        };
+        match op.as_str() {
+            "Not" => arr.get(1).map(|o| !operand(o)).unwrap_or(true),
+            "And" => arr[1..].iter().all(operand),
+            "Or" => arr[1..].iter().any(operand),
+            _ => true,
+        }
+    }
+
+    /// Paint annotation appearance streams (PDF 12.5.5): each /AP form's
+    /// /Matrix-transformed /BBox is mapped onto the annotation /Rect.
+    fn paint_annotations(&mut self) {
+        let Some(annots) = self.annotations.take() else {
+            return;
+        };
+        let Some(file) = self.file else {
+            return;
+        };
+        for a in annots {
+            if !a.is_viewable() {
+                continue;
+            }
+            if let Some(oc) = &a.oc {
+                if !self.oc_object_visible(oc, 0) {
+                    continue;
+                }
+            }
+            let Some(ap_id) = a.appearance else { continue };
+            let Ok(obj) = file.resolve(ap_id) else { continue };
+            let PdfObject::Stream(stream) = obj else {
+                continue;
+            };
+
+            // Form /BBox, transformed by the form /Matrix, mapped onto /Rect.
+            let bbox = stream.dict.get_array("BBox").ok().and_then(|arr| {
+                let v: Vec<f64> = arr.iter().filter_map(|o| o.as_f64().ok()).collect();
+                (v.len() == 4).then(|| {
+                    Rect::new(
+                        v[0].min(v[2]),
+                        v[1].min(v[3]),
+                        v[0].max(v[2]),
+                        v[1].max(v[3]),
+                    )
+                })
+            });
+            let Some(bbox) = bbox.filter(|b| b.width() > 0.0 && b.height() > 0.0) else {
+                continue;
+            };
+            let matrix = stream
+                .dict
+                .get_array("Matrix")
+                .ok()
+                .and_then(|arr| {
+                    let v: Vec<f64> = arr.iter().filter_map(|o| o.as_f64().ok()).collect();
+                    (v.len() == 6).then(|| Matrix::new(v[0], v[1], v[2], v[3], v[4], v[5]))
+                })
+                .unwrap_or_else(Matrix::identity);
+
+            // Bounding box of the transformed BBox corners.
+            let corners = [
+                Point::new(bbox.x0, bbox.y0),
+                Point::new(bbox.x1, bbox.y0),
+                Point::new(bbox.x0, bbox.y1),
+                Point::new(bbox.x1, bbox.y1),
+            ];
+            let (mut tx0, mut ty0) = (f64::INFINITY, f64::INFINITY);
+            let (mut tx1, mut ty1) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+            for c in &corners {
+                let p = c.transform(&matrix);
+                tx0 = tx0.min(p.x);
+                ty0 = ty0.min(p.y);
+                tx1 = tx1.max(p.x);
+                ty1 = ty1.max(p.y);
+            }
+            let (tw, th) = (tx1 - tx0, ty1 - ty0);
+            if !(tw.is_finite() && th.is_finite()) || tw <= 1e-9 || th <= 1e-9 {
+                continue;
+            }
+
+            let a_mat = Matrix::translate(a.rect.x0, a.rect.y0)
+                .concat(&Matrix::scale(a.rect.width() / tw, a.rect.height() / th))
+                .concat(&Matrix::translate(-tx0, -ty0));
+
+            let saved_ctm = self.current.ctm;
+            self.current.ctm = self.base_ctm.concat(&a_mat);
+            self.do_form_xobject(ap_id, &stream, file);
+            self.current.ctm = saved_ctm;
+        }
+    }
+
     /// Emit a painting command, bracketed in a blend group when a non-Normal
-    /// blend mode is active (backends composite the group with that mode).
+    /// blend mode or a soft mask is active (backends composite the group with
+    /// that mode/mask).
     fn emit_painted(&mut self, cmd: RenderCommand) {
-        if self.current.blend_mode != BlendMode::Normal {
+        if self.oc_suppressed() {
+            return;
+        }
+        if self.current.blend_mode != BlendMode::Normal || self.current.soft_mask.is_some() {
             self.display_list.push(RenderCommand::PushBlendGroup {
                 blend_mode: self.current.blend_mode,
                 isolated: false,
                 knockout: false,
                 bounds: self.display_list.page_rect,
+                alpha: 1.0,
+                mask: self.current.soft_mask.clone(),
             });
             self.display_list.push(cmd);
             self.display_list.push(RenderCommand::PopBlendGroup);
@@ -1287,6 +1663,84 @@ impl<'a> ContentInterpreter<'a> {
                 _ => BlendMode::Normal,
             };
         }
+        // /SMask: a soft-mask dict, or the name /None to clear.
+        match dict.get("SMask").map(|o| self.resolve_plain(o)) {
+            Some(PdfObject::Name(n)) if n.as_str() == "None" => {
+                self.current.soft_mask = None;
+            }
+            Some(PdfObject::Dict(sm)) => {
+                self.current.soft_mask = self.build_soft_mask(&sm);
+            }
+            _ => {}
+        }
+    }
+
+    /// Build a [`SoftMask`] from an ExtGState /SMask dict: interpret the /G
+    /// transparency group into its own command list (geometry fixed at `gs`
+    /// time), pre-sample /TR, and approximate the /BC backdrop luminosity.
+    fn build_soft_mask(&mut self, sm: &zpdf_core::PdfDict) -> Option<SoftMask> {
+        let file = self.file?;
+        let kind = match sm.get_name("S") {
+            Ok("Alpha") => SoftMaskKind::Alpha,
+            _ => SoftMaskKind::Luminosity,
+        };
+        let g_ref = sm.get_ref("G").ok()?;
+        let g_obj = file.resolve(g_ref).ok()?;
+        let PdfObject::Stream(g_stream) = g_obj else {
+            tracing::debug!("/SMask /G is not a stream");
+            return None;
+        };
+
+        // Interpret the mask group into a detached command list with a clean
+        // paint state — the mask itself is not blended, masked, or alpha'd.
+        let page_rect = self.display_list.page_rect;
+        let saved_dl = std::mem::replace(&mut self.display_list, DisplayList::new(page_rect));
+        let saved_state = self.current.clone();
+        self.current.soft_mask = None;
+        self.current.blend_mode = BlendMode::Normal;
+        self.current.fill_alpha = 1.0;
+        self.current.stroke_alpha = 1.0;
+        self.do_form_xobject(g_ref, &g_stream, file);
+        self.current = saved_state;
+        let mask_dl = std::mem::replace(&mut self.display_list, saved_dl);
+
+        // /BC components live in the group's /CS; the mean is a serviceable
+        // luminosity approximation (gray and achromatic RGB are exact).
+        let backdrop_luma = sm
+            .get_array("BC")
+            .ok()
+            .map(|arr| {
+                let v: Vec<f64> = arr.iter().filter_map(|o| o.as_f64().ok()).collect();
+                if v.is_empty() {
+                    0.0
+                } else {
+                    (v.iter().sum::<f64>() / v.len() as f64).clamp(0.0, 1.0) as f32
+                }
+            })
+            .unwrap_or(0.0);
+
+        let transfer = sm.get("TR").and_then(|o| {
+            if matches!(&self.resolve_plain(o), PdfObject::Name(n) if n.as_str() == "Identity") {
+                return None;
+            }
+            let f = self.parse_function(o)?;
+            let mut lut = [0u8; 256];
+            for (i, slot) in lut.iter_mut().enumerate() {
+                let out = f
+                    .eval(&[i as f64 / 255.0])
+                    .and_then(|v| v.first().copied())
+                    .unwrap_or(i as f64 / 255.0);
+                *slot = (out.clamp(0.0, 1.0) * 255.0).round() as u8;
+            }
+            Some(std::sync::Arc::new(lut))
+        });
+
+        Some(SoftMask {
+            kind,
+            commands: std::sync::Arc::new(mask_dl),
+            backdrop_luma,
+            transfer,
+        })
     }
 
     fn execute_do(&mut self, name: &str) {
@@ -1315,6 +1769,17 @@ impl<'a> ContentInterpreter<'a> {
             Ok(s) => s,
             Err(_) => return,
         };
+
+        // Hidden optional content: skip the XObject entirely (both the
+        // surrounding BDC /OC state and the XObject's own /OC key).
+        if self.oc_suppressed() {
+            return;
+        }
+        if let Some(oc) = stream.dict.get("OC") {
+            if !self.oc_object_visible(oc, 0) {
+                return;
+            }
+        }
 
         let subtype = stream.dict.get_name("Subtype").unwrap_or_default();
 
@@ -1372,7 +1837,7 @@ impl<'a> ContentInterpreter<'a> {
     }
 
     fn do_inline_image(&mut self, dict: zpdf_core::PdfDict, data: Vec<u8>) {
-        if self.image_cache.is_none() {
+        if self.image_cache.is_none() || self.oc_suppressed() {
             return;
         }
         let mut norm = normalize_inline_image_dict(&dict);
@@ -1499,6 +1964,10 @@ impl<'a> ContentInterpreter<'a> {
         let saved_text_matrix = self.text_matrix;
         let saved_text_line_matrix = self.text_line_matrix;
         let saved_operand_stack = std::mem::take(&mut self.operand_stack);
+        // An unbalanced EMC inside the form must not unsuppress (or leave
+        // suppressed) page-level marked-content state.
+        let saved_mc_depth = self.mc_depth;
+        let saved_oc_hidden = self.oc_hidden_from;
 
         self.current.ctm = self.current.ctm.concat(&form_matrix);
         self.text_matrix = Matrix::identity();
@@ -1507,6 +1976,7 @@ impl<'a> ContentInterpreter<'a> {
 
         // /BBox clips the form's content (transformed by the form matrix + CTM).
         let mut bbox_clip = false;
+        let mut bbox_bounds: Option<Rect> = None;
         if let Ok(arr) = stream.dict.get_array("BBox") {
             let v: Vec<f64> = arr.iter().filter_map(|o| o.as_f64().ok()).collect();
             if v.len() == 4 {
@@ -1516,6 +1986,7 @@ impl<'a> ContentInterpreter<'a> {
                     let mut bbox_path = Path::new();
                     bbox_path.rect(Rect::new(x0, y0, x1, y1));
                     let page_path = self.transform_path_to_page_space(&bbox_path);
+                    bbox_bounds = Self::path_bounds(&page_path);
                     self.display_list.push(RenderCommand::PushClip {
                         path: page_path,
                         rule: FillRule::NonZero,
@@ -1523,6 +1994,30 @@ impl<'a> ContentInterpreter<'a> {
                     bbox_clip = true;
                 }
             }
+        }
+
+        // /Group /S /Transparency: composite the form as a unit, consuming the
+        // current alpha / blend mode / soft mask (PDF 11.6.6 — they reset to
+        // defaults inside the group).
+        let group = stream
+            .dict
+            .get("Group")
+            .and_then(|o| self.resolve_dict_of(o))
+            .filter(|g| matches!(g.get_name("S"), Ok("Transparency")));
+        let in_group = group.is_some();
+        if let Some(g) = group {
+            let flag = |key| matches!(g.get(key), Some(PdfObject::Bool(true)));
+            self.display_list.push(RenderCommand::PushBlendGroup {
+                blend_mode: self.current.blend_mode,
+                isolated: flag("I"),
+                knockout: flag("K"),
+                bounds: bbox_bounds.unwrap_or(self.display_list.page_rect),
+                alpha: self.current.fill_alpha,
+                mask: self.current.soft_mask.take(),
+            });
+            self.current.blend_mode = BlendMode::Normal;
+            self.current.fill_alpha = 1.0;
+            self.current.stroke_alpha = 1.0;
         }
 
         self.form_depth += 1;
@@ -1560,6 +2055,9 @@ impl<'a> ContentInterpreter<'a> {
         if let Some(state) = self.state_stack.pop() {
             self.current = state;
         }
+        if in_group {
+            self.display_list.push(RenderCommand::PopBlendGroup);
+        }
         if bbox_clip {
             self.display_list.push(RenderCommand::PopClip);
         }
@@ -1567,6 +2065,8 @@ impl<'a> ContentInterpreter<'a> {
         self.text_matrix = saved_text_matrix;
         self.text_line_matrix = saved_text_line_matrix;
         self.operand_stack = saved_operand_stack;
+        self.mc_depth = saved_mc_depth;
+        self.oc_hidden_from = saved_oc_hidden;
         self.form_font_overrides.pop();
         if pushed_resources {
             self.form_resources.pop();
@@ -1787,6 +2287,21 @@ impl<'a> ContentInterpreter<'a> {
                 return;
             }
         }
+        if let Some(PatternPaint::Tiling(def)) = self.current.fill_pattern.clone() {
+            if let Some(bounds) = Self::path_bounds(&page_path) {
+                self.display_list.push(RenderCommand::PushClip {
+                    path: page_path.clone(),
+                    rule,
+                });
+                let painted = self.paint_tiling_pattern(&def, bounds);
+                self.display_list.push(RenderCommand::PopClip);
+                if painted {
+                    return;
+                }
+                // Fall through: solid approximation (the clip pair above is
+                // balanced and harmless).
+            }
+        }
         let cmd = RenderCommand::FillPath {
             path: page_path,
             rule,
@@ -1794,6 +2309,186 @@ impl<'a> ContentInterpreter<'a> {
             alpha: self.current.fill_alpha,
         };
         self.emit_painted(cmd);
+    }
+
+    /// Replicate a tiling-pattern cell across the page-space `bounds` of a
+    /// fill. Returns false when the pattern is degenerate or the tile count
+    /// explodes, in which case the caller falls back to a solid fill.
+    fn paint_tiling_pattern(&mut self, def: &TilingPatternDef, bounds: Rect) -> bool {
+        const MAX_FORM_DEPTH: u32 = 16;
+        const MAX_TILES: i64 = 4096;
+        if self.oc_suppressed() {
+            // Hidden layer: skip the tile replication work entirely (the
+            // surrounding clip pair is balanced and paints nothing).
+            return true;
+        }
+        if self.form_depth >= MAX_FORM_DEPTH {
+            tracing::warn!("tiling pattern nesting exceeds {MAX_FORM_DEPTH}; skipping");
+            return false;
+        }
+        // Pattern space is anchored to the page's default user space, not the
+        // CTM at fill time.
+        let to_page = self.base_ctm.concat(&def.matrix);
+        let Some(from_page) = to_page.inverse() else {
+            return false;
+        };
+
+        // Pattern-space bbox of the fill region: map all four page-space
+        // corners (the matrix may rotate/skew).
+        let corners = [
+            Point::new(bounds.x0, bounds.y0),
+            Point::new(bounds.x1, bounds.y0),
+            Point::new(bounds.x0, bounds.y1),
+            Point::new(bounds.x1, bounds.y1),
+        ];
+        let (mut px0, mut py0) = (f64::INFINITY, f64::INFINITY);
+        let (mut px1, mut py1) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+        for c in &corners {
+            let p = c.transform(&from_page);
+            px0 = px0.min(p.x);
+            py0 = py0.min(p.y);
+            px1 = px1.max(p.x);
+            py1 = py1.max(p.y);
+        }
+        if !(px0.is_finite() && py0.is_finite() && px1.is_finite() && py1.is_finite()) {
+            return false;
+        }
+
+        // Tile (i, j) covers bbox translated by (i·XStep, j·YStep). Conservative
+        // index ranges from the two extreme offsets (steps may be negative).
+        let range = |lo: f64, hi: f64, cell_lo: f64, cell_hi: f64, step: f64| {
+            let t0 = (lo - cell_hi) / step;
+            let t1 = (hi - cell_lo) / step;
+            let (a, b) = if t0 <= t1 { (t0, t1) } else { (t1, t0) };
+            (a.floor() as i64, b.ceil() as i64)
+        };
+        let (i0, i1) = range(px0, px1, def.bbox.x0, def.bbox.x1, def.x_step);
+        let (j0, j1) = range(py0, py1, def.bbox.y0, def.bbox.y1, def.y_step);
+        let nx = i1 - i0 + 1;
+        let ny = j1 - j0 + 1;
+        if nx <= 0 || ny <= 0 {
+            return false;
+        }
+        if nx.saturating_mul(ny) > MAX_TILES {
+            tracing::warn!(
+                "tiling pattern: {nx}x{ny} tiles exceeds {MAX_TILES}; using solid approximation"
+            );
+            return false;
+        }
+
+        let file = match self.file {
+            Some(f) => f,
+            None => return false,
+        };
+
+        // Pattern /Resources and fonts shadow the page's for the cell body,
+        // exactly like a form XObject's.
+        self.load_form_fonts(&def.dict, file);
+        let own_resources = def
+            .dict
+            .get("Resources")
+            .and_then(|res_obj| self.resolve_dict_of(res_obj))
+            .and_then(|d| zpdf_document::page::parse_resource_dict(&d, file).ok());
+        let pushed_resources = own_resources.is_some();
+        if let Some(res) = own_resources {
+            self.form_resources.push(res);
+        }
+
+        let saved_text_matrix = self.text_matrix;
+        let saved_text_line_matrix = self.text_line_matrix;
+        let saved_operand_stack = std::mem::take(&mut self.operand_stack);
+        let saved_suppress = self.suppress_color_ops;
+        let uncolored = def.paint_type == 2;
+        // The scn-time color paints an uncolored cell.
+        let pattern_color = self.current.fill_color;
+        let cell_alpha = self.current.fill_alpha;
+
+        self.form_depth += 1;
+        for j in j0..=j1 {
+            for i in i0..=i1 {
+                let tile_offset =
+                    Matrix::translate(i as f64 * def.x_step, j as f64 * def.y_step);
+                let tile_ctm = to_page.concat(&tile_offset);
+
+                // Per-tile state: cells start from a clean color state (and
+                // must not re-enter the active pattern), inherit alpha.
+                let depth_floor = self.state_stack.len();
+                self.state_stack.push(self.current.clone());
+                let saved_floor = self.state_floor;
+                self.state_floor = depth_floor + 1;
+                self.current.ctm = tile_ctm;
+                self.current.clip_depth = 0;
+                self.current.fill_pattern = None;
+                self.current.stroke_pattern = None;
+                self.current.fill_cs = ActiveColorSpace::DeviceGray;
+                self.current.stroke_cs = ActiveColorSpace::DeviceGray;
+                self.current.fill_alpha = cell_alpha;
+                self.current.stroke_alpha = cell_alpha;
+                if uncolored {
+                    self.current.fill_color = pattern_color;
+                    self.current.stroke_color = pattern_color;
+                    self.suppress_color_ops = true;
+                } else {
+                    self.current.fill_color = Color::black();
+                    self.current.stroke_color = Color::black();
+                }
+                self.text_matrix = Matrix::identity();
+                self.text_line_matrix = Matrix::identity();
+
+                // Clip the cell to its /BBox.
+                let mut bbox_path = Path::new();
+                bbox_path.rect(def.bbox);
+                let page_bbox = self.transform_path_to_page_space(&bbox_path);
+                self.display_list.push(RenderCommand::PushClip {
+                    path: page_bbox,
+                    rule: FillRule::NonZero,
+                });
+
+                let tokenizer = ContentTokenizer::new(&def.content);
+                for token in tokenizer {
+                    match token {
+                        ContentToken::Operand(obj) => self.operand_stack.push(obj),
+                        ContentToken::Operator(op) => {
+                            self.execute_operator(&op);
+                            self.operand_stack.clear();
+                        }
+                        ContentToken::InlineImage { dict, data } => {
+                            self.do_inline_image(dict, data);
+                            self.operand_stack.clear();
+                        }
+                    }
+                }
+
+                // Rebalance clips/state left open by the cell body.
+                while self.state_stack.len() > depth_floor + 1 {
+                    for _ in 0..self.current.clip_depth {
+                        self.display_list.push(RenderCommand::PopClip);
+                    }
+                    if let Some(state) = self.state_stack.pop() {
+                        self.current = state;
+                    }
+                }
+                for _ in 0..self.current.clip_depth {
+                    self.display_list.push(RenderCommand::PopClip);
+                }
+                if let Some(state) = self.state_stack.pop() {
+                    self.current = state;
+                }
+                self.display_list.push(RenderCommand::PopClip);
+                self.state_floor = saved_floor;
+                self.suppress_color_ops = saved_suppress;
+            }
+        }
+        self.form_depth -= 1;
+
+        self.text_matrix = saved_text_matrix;
+        self.text_line_matrix = saved_text_line_matrix;
+        self.operand_stack = saved_operand_stack;
+        self.form_font_overrides.pop();
+        if pushed_resources {
+            self.form_resources.pop();
+        }
+        true
     }
 
     fn show_text(&mut self, bytes: &[u8]) {
@@ -1829,28 +2524,77 @@ impl<'a> ContentInterpreter<'a> {
 
         let mut glyphs = Vec::new();
         let mut x_offset = 0.0f32;
+        let mut vertical = false;
 
         if is_two_byte {
-            for chunk in bytes.chunks(2) {
-                // For Identity-H the code is the CID; glyph_outline maps CID→GID.
-                let glyph_id = if chunk.len() == 2 {
-                    ((chunk[0] as u16) << 8) | chunk[1] as u16
-                } else {
-                    chunk[0] as u16
+            // Composite font: segment codes through the /Encoding CMap
+            // (Identity-H semantics when absent) and map code → CID → glyph.
+            let cmap = font_and_id.and_then(|(_, f)| f.cid_cmap.as_ref());
+            vertical = cmap.map(|c| c.wmode == 1).unwrap_or(false);
+            let codes_are_unicode = cmap.map(|c| c.codes_are_unicode).unwrap_or(false);
+            let dw2 = font_and_id.map(|(_, f)| f.dw2).unwrap_or((880.0, -1000.0));
+
+            let mut i = 0usize;
+            while i < bytes.len() {
+                let (code, len) = match cmap {
+                    Some(c) => c.next_code(&bytes[i..]),
+                    None => {
+                        let len = (bytes.len() - i).min(2);
+                        let mut v = 0u32;
+                        for &b in &bytes[i..i + len] {
+                            v = (v << 8) | b as u32;
+                        }
+                        (v, len)
+                    }
                 };
-                let advance = if let Some((_, font)) = font_and_id {
-                    font.glyph_advance(glyph_id) as f32 * scale_factor * h_scale
+                i += len.max(1);
+
+                // Resolve the glyph id and its 1/1000-unit advance.
+                let (glyph_id, adv_units) = if let Some((_, font)) = font_and_id {
+                    if codes_are_unicode {
+                        match font.unicode_glyph(code) {
+                            Some((gid, adv)) => (gid, adv),
+                            None => (0, 500.0),
+                        }
+                    } else {
+                        let cid = cmap
+                            .map(|c| c.code_to_cid(code, len as u8))
+                            .unwrap_or(code)
+                            .min(u16::MAX as u32) as u16;
+                        (cid, font.glyph_advance(cid))
+                    }
                 } else {
-                    font_size * 0.5 * h_scale
+                    (code.min(u16::MAX as u32) as u16, 500.0)
                 };
-                glyphs.push(PositionedGlyph {
-                    glyph_id,
-                    x: x_offset,
-                    y: 0.0,
-                    advance,
-                });
-                // Per PDF 9.4.4, char/word spacing are inside the ·Th product.
-                x_offset += advance + char_spacing * h_scale;
+
+                if vertical {
+                    // Vertical writing (9.7.4.3): the glyph's horizontal origin
+                    // sits at pen − v, v = (w0/2, vy); the pen advances by w1y.
+                    let w0 = adv_units as f32 * scale_factor;
+                    let vy = dw2.0 as f32 * scale_factor;
+                    let advance = dw2.1 as f32 * scale_factor;
+                    glyphs.push(PositionedGlyph {
+                        glyph_id,
+                        x: -w0 / 2.0,
+                        y: x_offset - vy,
+                        advance,
+                    });
+                    x_offset += advance - char_spacing;
+                } else {
+                    let advance = adv_units as f32 * scale_factor * h_scale;
+                    glyphs.push(PositionedGlyph {
+                        glyph_id,
+                        x: x_offset,
+                        y: 0.0,
+                        advance,
+                    });
+                    // Per PDF 9.4.4, char/word spacing are inside the ·Th product.
+                    x_offset += advance + char_spacing * h_scale;
+                    // Word spacing applies to the single-byte code 32 only.
+                    if len == 1 && code == 32 {
+                        x_offset += word_spacing * h_scale;
+                    }
+                }
             }
         } else {
             for &byte in bytes {
@@ -1939,14 +2683,22 @@ impl<'a> ContentInterpreter<'a> {
             }
         }
 
-        if let (Some(span), Some(sink)) = (text_span, self.text_sink.as_mut()) {
-            if !span.text.is_empty() {
-                sink.push(span);
+        // Hidden optional-content layers also extract no text (emit_painted
+        // already drops the glyph run; the matrix advance below still runs).
+        if !self.oc_suppressed() {
+            if let (Some(span), Some(sink)) = (text_span, self.text_sink.as_mut()) {
+                if !span.text.is_empty() {
+                    sink.push(span);
+                }
             }
         }
 
-        // Advance the text matrix along the baseline direction.
-        let advance = Matrix::translate(x_offset as f64, 0.0);
+        // Advance the text matrix along the writing direction.
+        let advance = if vertical {
+            Matrix::translate(0.0, x_offset as f64)
+        } else {
+            Matrix::translate(x_offset as f64, 0.0)
+        };
         self.text_matrix = self.text_matrix.concat(&advance);
     }
 

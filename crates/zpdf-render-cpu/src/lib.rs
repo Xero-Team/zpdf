@@ -21,6 +21,11 @@ pub struct CpuRenderer<'a> {
 struct BlendEntry {
     pixmap: tiny_skia::Pixmap,
     blend_mode: BlendMode,
+    /// Group constant alpha applied at composite time.
+    alpha: f32,
+    /// Rasterized soft-mask coverage (one byte per pixel), multiplied into the
+    /// group before compositing.
+    mask: Option<Vec<u8>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -267,7 +272,10 @@ impl<'a> CpuRenderer<'a> {
         }
     }
 
-    fn push_blend_group(&mut self, blend_mode: BlendMode) {
+    fn push_blend_group(&mut self, blend_mode: BlendMode, alpha: f32, mask: Option<&SoftMask>) {
+        // Rasterize the soft mask before parking the base pixmap (needs dims).
+        let mask_plane = mask.and_then(|m| self.rasterize_soft_mask(m));
+
         let pixmap = match self.pixmap.take() {
             Some(p) => p,
             None => return,
@@ -275,7 +283,12 @@ impl<'a> CpuRenderer<'a> {
         let w = pixmap.width();
         let h = pixmap.height();
 
-        self.blend_stack.push(BlendEntry { pixmap, blend_mode });
+        self.blend_stack.push(BlendEntry {
+            pixmap,
+            blend_mode,
+            alpha,
+            mask: mask_plane,
+        });
 
         self.pixmap = tiny_skia::Pixmap::new(w, h);
     }
@@ -286,7 +299,7 @@ impl<'a> CpuRenderer<'a> {
             None => return,
         };
 
-        let group_pixmap = match self.pixmap.take() {
+        let mut group_pixmap = match self.pixmap.take() {
             Some(p) => p,
             None => {
                 self.pixmap = Some(entry.pixmap);
@@ -294,11 +307,28 @@ impl<'a> CpuRenderer<'a> {
             }
         };
 
+        // Fold the soft mask into the group: premultiplied RGBA scales
+        // uniformly by the per-pixel mask coverage.
+        if let Some(plane) = &entry.mask {
+            let data = group_pixmap.data_mut();
+            for (px, &m) in data.chunks_exact_mut(4).zip(plane.iter()) {
+                if m == 255 {
+                    continue;
+                }
+                let m = m as u16;
+                px[0] = ((px[0] as u16 * m) / 255) as u8;
+                px[1] = ((px[1] as u16 * m) / 255) as u8;
+                px[2] = ((px[2] as u16 * m) / 255) as u8;
+                px[3] = ((px[3] as u16 * m) / 255) as u8;
+            }
+        }
+
         let mut base = entry.pixmap;
         let blend = Self::blend_mode_to_skia(entry.blend_mode);
 
         let paint = tiny_skia::PixmapPaint {
             blend_mode: blend,
+            opacity: entry.alpha.clamp(0.0, 1.0),
             ..Default::default()
         };
 
@@ -312,6 +342,70 @@ impl<'a> CpuRenderer<'a> {
         );
 
         self.pixmap = Some(base);
+    }
+
+    /// Render a soft mask's group commands offscreen (same page geometry as
+    /// the current target) and reduce to a per-pixel coverage plane.
+    fn rasterize_soft_mask(&self, mask: &SoftMask) -> Option<Vec<u8>> {
+        let (w, h) = match self.pixmap.as_ref() {
+            Some(p) => (p.width(), p.height()),
+            None => return None,
+        };
+
+        let mut target = tiny_skia::Pixmap::new(w, h)?;
+        match mask.kind {
+            // Luminosity masks composite the group over the /BC backdrop; the
+            // result stays opaque, so luminance reads are exact.
+            SoftMaskKind::Luminosity => {
+                let l = mask.backdrop_luma.clamp(0.0, 1.0);
+                target.fill(tiny_skia::Color::from_rgba(l, l, l, 1.0)?);
+            }
+            // Alpha masks read group coverage; start fully transparent.
+            SoftMaskKind::Alpha => {}
+        }
+
+        let mut sub = CpuRenderer {
+            pixmap: Some(target),
+            scale: self.scale,
+            rect_x0: self.rect_x0,
+            rect_y0: self.rect_y0,
+            rect_y1: self.rect_y1,
+            font_cache: self.font_cache,
+            image_cache: self.image_cache,
+            clip_stack: Vec::new(),
+            current_clip: None,
+            blend_stack: Vec::new(),
+        };
+        for cmd in &mask.commands.commands {
+            let _ = sub.execute(cmd);
+        }
+        let rendered = sub.pixmap.take()?;
+
+        let mut plane = Vec::with_capacity((w * h) as usize);
+        for px in rendered.pixels() {
+            let v = match mask.kind {
+                SoftMaskKind::Luminosity => {
+                    let a = px.alpha();
+                    if a == 0 {
+                        (mask.backdrop_luma * 255.0).round() as u8
+                    } else {
+                        let d = px.demultiply();
+                        // Rec. 601 luma.
+                        (0.299 * d.red() as f32 + 0.587 * d.green() as f32
+                            + 0.114 * d.blue() as f32)
+                            .round()
+                            .min(255.0) as u8
+                    }
+                }
+                SoftMaskKind::Alpha => px.alpha(),
+            };
+            let v = match &mask.transfer {
+                Some(lut) => lut[v as usize],
+                None => v,
+            };
+            plane.push(v);
+        }
+        Some(plane)
     }
 
     fn blend_mode_to_skia(mode: BlendMode) -> tiny_skia::BlendMode {
@@ -448,8 +542,14 @@ impl<'a> CpuRenderer<'a> {
 
             // Transform each glyph outline point:
             // glyph_coord (font units) → text space → user space → page space → pixel space
-            let skia_path =
-                self.build_outline_transformed_path(&outline, upem, font_size, tm, glyph.x);
+            let skia_path = self.build_outline_transformed_path(
+                &outline,
+                upem,
+                font_size,
+                tm,
+                glyph.x,
+                glyph.y,
+            );
             if let Some(path) = skia_path {
                 if let Some(ref mut pixmap) = self.pixmap {
                     pixmap.fill_path(
@@ -464,6 +564,7 @@ impl<'a> CpuRenderer<'a> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_outline_transformed_path(
         &self,
         outline: &GlyphOutline,
@@ -471,31 +572,30 @@ impl<'a> CpuRenderer<'a> {
         font_size: f32,
         tm: &zpdf_core::Matrix,
         glyph_x_offset: f32,
+        glyph_y_offset: f32,
     ) -> Option<tiny_skia::Path> {
         let mut pb = tiny_skia::PathBuilder::new();
+        let off = (glyph_x_offset, glyph_y_offset);
 
         for cmd in &outline.commands {
             match *cmd {
                 OutlineCommand::MoveTo(x, y) => {
-                    let (px, py) = self.outline_to_pixel(x, y, upem, font_size, tm, glyph_x_offset);
+                    let (px, py) = self.outline_to_pixel(x, y, upem, font_size, tm, off);
                     pb.move_to(px, py);
                 }
                 OutlineCommand::LineTo(x, y) => {
-                    let (px, py) = self.outline_to_pixel(x, y, upem, font_size, tm, glyph_x_offset);
+                    let (px, py) = self.outline_to_pixel(x, y, upem, font_size, tm, off);
                     pb.line_to(px, py);
                 }
                 OutlineCommand::QuadTo(x1, y1, x, y) => {
-                    let (px1, py1) =
-                        self.outline_to_pixel(x1, y1, upem, font_size, tm, glyph_x_offset);
-                    let (px, py) = self.outline_to_pixel(x, y, upem, font_size, tm, glyph_x_offset);
+                    let (px1, py1) = self.outline_to_pixel(x1, y1, upem, font_size, tm, off);
+                    let (px, py) = self.outline_to_pixel(x, y, upem, font_size, tm, off);
                     pb.quad_to(px1, py1, px, py);
                 }
                 OutlineCommand::CurveTo(x1, y1, x2, y2, x, y) => {
-                    let (px1, py1) =
-                        self.outline_to_pixel(x1, y1, upem, font_size, tm, glyph_x_offset);
-                    let (px2, py2) =
-                        self.outline_to_pixel(x2, y2, upem, font_size, tm, glyph_x_offset);
-                    let (px, py) = self.outline_to_pixel(x, y, upem, font_size, tm, glyph_x_offset);
+                    let (px1, py1) = self.outline_to_pixel(x1, y1, upem, font_size, tm, off);
+                    let (px2, py2) = self.outline_to_pixel(x2, y2, upem, font_size, tm, off);
+                    let (px, py) = self.outline_to_pixel(x, y, upem, font_size, tm, off);
                     pb.cubic_to(px1, py1, px2, py2, px, py);
                 }
                 OutlineCommand::Close => pb.close(),
@@ -511,11 +611,11 @@ impl<'a> CpuRenderer<'a> {
         upem: f32,
         font_size: f32,
         tm: &zpdf_core::Matrix,
-        glyph_x_offset: f32,
+        glyph_offset: (f32, f32),
     ) -> (f32, f32) {
         // font units → user space
-        let tx = (gx as f32 / upem * font_size + glyph_x_offset) as f64;
-        let ty = (gy as f32 / upem * font_size) as f64;
+        let tx = (gx as f32 / upem * font_size + glyph_offset.0) as f64;
+        let ty = (gy as f32 / upem * font_size + glyph_offset.1) as f64;
 
         // user space → page space via combined CTM*Tm
         let page_x = tm.a * tx + tm.c * ty + tm.e;
@@ -818,8 +918,13 @@ impl<'a> RenderBackend for CpuRenderer<'a> {
             RenderCommand::PopClip => {
                 self.pop_clip();
             }
-            RenderCommand::PushBlendGroup { blend_mode, .. } => {
-                self.push_blend_group(*blend_mode);
+            RenderCommand::PushBlendGroup {
+                blend_mode,
+                alpha,
+                mask,
+                ..
+            } => {
+                self.push_blend_group(*blend_mode, *alpha, mask.as_ref());
             }
             RenderCommand::PopBlendGroup => {
                 self.pop_blend_group();

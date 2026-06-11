@@ -215,7 +215,17 @@ impl<'a> RenderBackend for WgpuRenderer<'a> {
                     }
                 }
             }
-            RenderCommand::PushBlendGroup { blend_mode, .. } => {
+            RenderCommand::PushBlendGroup {
+                blend_mode,
+                alpha,
+                mask,
+                ..
+            } => {
+                // Soft masks and group alpha are CPU-only for now (Phase 3
+                // parity work); the group still composites with its blend mode.
+                if mask.is_some() || *alpha < 1.0 {
+                    tracing::debug!("wgpu backend: soft mask / group alpha not yet supported");
+                }
                 page.recorder.push_blend(*blend_mode);
             }
             RenderCommand::PopBlendGroup => {

@@ -3,6 +3,13 @@ use std::fs;
 use std::process;
 
 fn main() {
+    // RUST_LOG-controlled diagnostics (e.g. RUST_LOG=zpdf_font=warn). Defaults to
+    // silent so normal CLI output stays clean.
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
+        .init();
+
     let args: Vec<String> = env::args().collect();
 
     if args.len() < 2 {
@@ -323,11 +330,17 @@ fn cmd_render(args: &[String]) -> zpdf::Result<()> {
 
     // Interpret content stream → display list
     let mut image_cache = zpdf::ImageCache::new();
-    let interpreter = zpdf::ContentInterpreter::new(page_box)
+    let annotations = doc.page_annotations(&page);
+    let oc_config = doc.oc_config();
+    let mut interpreter = zpdf::ContentInterpreter::new(page_box)
         .with_page_rotation(page.rotate)
         .with_fonts(&mut font_cache)
         .with_document(doc.file(), &page.resources)
-        .with_images(&mut image_cache);
+        .with_images(&mut image_cache)
+        .with_annotations(&annotations);
+    if let Some(oc) = &oc_config {
+        interpreter = interpreter.with_optional_content(oc);
+    }
     let display_list = interpreter.interpret(&content_bytes);
 
     if font_cache.len() > initial_fonts {

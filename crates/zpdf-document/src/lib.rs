@@ -1,8 +1,12 @@
+pub mod annotation;
 mod catalog;
 pub mod font_loader;
+pub mod optional_content;
 pub mod page;
 
+pub use annotation::Annotation;
 pub use catalog::Catalog;
+pub use optional_content::OcConfig;
 pub use page::{PdfPage, ResourceDict};
 
 use std::sync::Arc;
@@ -64,6 +68,17 @@ impl PdfDocument {
     /// Load all fonts referenced by a page.
     pub fn load_page_fonts(&self, page: &PdfPage) -> FontCache {
         font_loader::load_page_fonts(self.file(), page)
+    }
+
+    /// Parse a page's annotations into renderable form (/Rect, /F, the
+    /// /AS-selected appearance stream, /OC membership).
+    pub fn page_annotations(&self, page: &PdfPage) -> Vec<Annotation> {
+        annotation::parse_annotations(&self.file, page)
+    }
+
+    /// The document's default optional-content configuration, if any.
+    pub fn oc_config(&self) -> Option<OcConfig> {
+        optional_content::parse_oc_config(&self.file)
     }
 }
 

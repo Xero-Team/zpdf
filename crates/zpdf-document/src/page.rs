@@ -35,6 +35,9 @@ pub struct ResourceDict {
     pub patterns: HashMap<String, ObjectId>,
     pub shadings: HashMap<String, ObjectId>,
     pub shadings_inline: HashMap<String, PdfObject>,
+    /// /Properties (marked-content property lists, e.g. BDC /OC lookups).
+    pub properties: HashMap<String, ObjectId>,
+    pub properties_inline: HashMap<String, zpdf_core::PdfDict>,
 }
 
 impl PdfPage {
@@ -238,7 +241,7 @@ impl InheritedAttrs {
 
 /// Read a rectangle value that may be a direct array, an indirect ref to an
 /// array, or an array whose elements are themselves indirect number refs.
-fn resolve_rect(file: &PdfFile, dict: &PdfDict, key: &str) -> Option<Rect> {
+pub(crate) fn resolve_rect(file: &PdfFile, dict: &PdfDict, key: &str) -> Option<Rect> {
     let arr: Cow<'_, [PdfObject]> = match dict.get(key)? {
         PdfObject::Array(a) => Cow::Borrowed(a.as_slice()),
         PdfObject::Ref(r) => match file.resolve(*r) {
@@ -364,6 +367,20 @@ pub fn parse_resource_dict(dict: &zpdf_core::PdfDict, file: &PdfFile) -> Result<
                 }
                 other @ PdfObject::Dict(_) => {
                     res.shadings_inline.insert(name.0.clone(), other.clone());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if let Some(props) = resolve_sub_dict(dict, "Properties", file) {
+        for (name, obj) in &props.0 {
+            match obj {
+                PdfObject::Ref(r) => {
+                    res.properties.insert(name.0.clone(), *r);
+                }
+                PdfObject::Dict(d) => {
+                    res.properties_inline.insert(name.0.clone(), d.clone());
                 }
                 _ => {}
             }
