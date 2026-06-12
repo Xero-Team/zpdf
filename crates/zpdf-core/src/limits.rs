@@ -18,7 +18,10 @@ impl Default for ParseLimits {
             max_stream_bytes: 256 * 1024 * 1024,
             max_image_pixels: 100_000_000,
             max_page_operators: 1_000_000,
-            max_string_length: 65536,
+            // ISO 32000 imposes no string length limit (64 KiB is only the
+            // PDF/A-1 / legacy-Acrobat bound), so real files exceed it. This
+            // is purely an allocation guard against adversarial input.
+            max_string_length: 16 * 1024 * 1024,
             max_objects: 5_000_000,
         }
     }

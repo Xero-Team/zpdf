@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased — veraPDF corpus: 2907/2907
+
+Running the full veraPDF test corpus (`https://labs.pdfa.org/stressful-corpus/`, 2,907 atomic
+PDF/A / PDF/UA / ISO 32000 / Isartor / TWG files) surfaced five failures;
+all are fixed and the corpus now renders 100% (see `tests/corpus-report.md`,
+harness: `tests/corpus_run.sh`).
+
+- **Lenient header version** (`zpdf-parser`): a malformed version after the
+  `%PDF-` magic (e.g. `%PDF-a.4`) warns and assumes 1.7 instead of rejecting
+  the file; `NotAPdf` now only means the magic is missing.
+- **String limit raised** (`zpdf-core`): default
+  `ParseLimits::max_string_length` 64 KiB → 16 MiB. ISO 32000 has no string
+  limit (64 KiB is PDF/A-1's); the cap remains a configurable allocation
+  guard.
+- **Tiling-pattern soft-mask reuse** (`zpdf-content`, `zpdf-display-list`,
+  `zpdf-render-cpu`): a cell applying an ExtGState `/SMask` used to rebuild
+  the mask group per tile (interpret + shading raster), and the CPU backend
+  re-rasterized the mask plane per painted command — ~100 s for a 4 KB
+  corpus file. Tile CTMs differ only by translation, so the mask is now
+  built once per `gs` site (rebased to the loop's middle tile, keyed by
+  per-tile operator index + ExtGState id + CTM linear part) and carried by
+  the new `SoftMask::offset`; the CPU backend caches the rasterized plane
+  per mask identity and derives offset uses by a shift-blit. Pixel-exact on
+  the corpus shape, ~25× faster.
+
 ## 0.4.0 — closing the 0.3.0 gaps
 
 Every item on the 0.3.0 "known limitations" list is now implemented, still
