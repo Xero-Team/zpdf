@@ -11,6 +11,7 @@ struct Page {
 };
 struct ModeU {
     id: u32,
+    alpha: f32,  // group constant alpha (/ca), applied to the source contribution
 };
 
 @group(0) @binding(0) var<uniform> page: Page;
@@ -125,7 +126,9 @@ fn non_separable(cb: vec3<f32>, cs: vec3<f32>, m: u32) -> vec3<f32> {
 @fragment
 fn fs_composite(in: VsOut) -> @location(0) vec4<f32> {
     let coord = vec2<i32>(i32(in.clip_pos.x), i32(in.clip_pos.y));
-    let s = textureLoad(group_tex, coord, 0); // source (premultiplied)
+    // Source (premultiplied) scaled by the group constant alpha: scaling
+    // premultiplied RGBA uniformly is exactly compositing the group at opacity α.
+    let s = textureLoad(group_tex, coord, 0) * mode.alpha;
     let d = textureLoad(base_tex, coord, 0);  // backdrop (premultiplied)
 
     let as_ = s.a;

@@ -15,6 +15,40 @@ use moxcms::{
 };
 use zpdf_core::{Error, ObjectId, Result};
 
+/// PDF colour rendering intent (ISO 32000-1 §8.6.5.8) — the `ri` operator,
+/// ExtGState `/RI`, and image `/Intent`. Defaults to media-relative
+/// colorimetric, the PDF default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum RenderIntent {
+    Perceptual,
+    #[default]
+    RelativeColorimetric,
+    Saturation,
+    AbsoluteColorimetric,
+}
+
+impl RenderIntent {
+    /// Map a PDF intent name to an intent. Unknown names fall back to the
+    /// media-relative colorimetric default (per the spec's recommendation).
+    pub fn from_pdf_name(name: &str) -> Self {
+        match name {
+            "Perceptual" => Self::Perceptual,
+            "Saturation" => Self::Saturation,
+            "AbsoluteColorimetric" => Self::AbsoluteColorimetric,
+            _ => Self::RelativeColorimetric,
+        }
+    }
+
+    fn to_moxcms(self) -> RenderingIntent {
+        match self {
+            Self::Perceptual => RenderingIntent::Perceptual,
+            Self::RelativeColorimetric => RenderingIntent::RelativeColorimetric,
+            Self::Saturation => RenderingIntent::Saturation,
+            Self::AbsoluteColorimetric => RenderingIntent::AbsoluteColorimetric,
+        }
+    }
+}
+
 /// A compiled ICC-profile → sRGB transform for 1/3/4-component input.
 ///
 /// The underlying executor is `Send + Sync`, so a transform can be shared
@@ -38,7 +72,7 @@ impl IccTransform {
     /// Supported data colour spaces: Gray (1 component), RGB and Lab (3),
     /// CMYK (4). Anything else — including malformed or truncated profiles —
     /// is an error so the caller can keep its `/N`-based fallback.
-    pub fn from_profile_bytes(data: &[u8]) -> Result<Self> {
+    pub fn from_profile_bytes(data: &[u8], intent: RenderIntent) -> Result<Self> {
         let profile = ColorProfile::new_from_slice(data)
             .map_err(|e| Error::StreamDecode(format!("ICC profile parse failed: {e:?}")))?;
         let (layout, ncomp) = match profile.color_space {
@@ -55,11 +89,11 @@ impl IccTransform {
             }
         };
         let srgb = ColorProfile::new_srgb();
-        // TODO(/RenderingIntent): plumb the PDF rendering intent through to
-        // here. For now use media-relative colorimetric, retrying perceptual
-        // for LUT profiles that only carry an A2B0 table (the ICC-mandated
-        // fallback order).
+        // Try the requested PDF rendering intent first, then fall back through
+        // media-relative colorimetric and perceptual — the ICC-mandated order
+        // for LUT profiles that only carry a subset of A2B tables.
         let executor = [
+            intent.to_moxcms(),
             RenderingIntent::RelativeColorimetric,
             RenderingIntent::Perceptual,
         ]
@@ -137,11 +171,12 @@ impl IccTransform {
 }
 
 /// Per-document cache of ICCBased profile streams → compiled transforms,
-/// keyed by the profile stream's object id. Failures are cached as `None`
-/// so a malformed profile is parsed (and warned about) only once.
+/// keyed by the profile stream's object id AND the rendering intent (the same
+/// profile may be requested under different intents on one page). Failures are
+/// cached as `None` so a malformed profile is parsed (and warned about) once.
 #[derive(Debug, Default)]
 pub struct IccCache {
-    transforms: HashMap<ObjectId, Option<Arc<IccTransform>>>,
+    transforms: HashMap<(ObjectId, RenderIntent), Option<Arc<IccTransform>>>,
 }
 
 impl IccCache {
@@ -149,19 +184,20 @@ impl IccCache {
         Self::default()
     }
 
-    /// The cached transform for profile stream `id`, building it from the
-    /// bytes returned by `data` on first use. `data` returning `None`
+    /// The cached transform for profile stream `id` under `intent`, building it
+    /// from the bytes returned by `data` on first use. `data` returning `None`
     /// (unresolvable stream) also caches as a failure.
     pub fn get_or_build(
         &mut self,
         id: ObjectId,
+        intent: RenderIntent,
         data: impl FnOnce() -> Option<Vec<u8>>,
     ) -> Option<Arc<IccTransform>> {
         self.transforms
-            .entry(id)
+            .entry((id, intent))
             .or_insert_with(|| {
                 let bytes = data()?;
-                match IccTransform::from_profile_bytes(&bytes) {
+                match IccTransform::from_profile_bytes(&bytes, intent) {
                     Ok(t) => Some(Arc::new(t)),
                     Err(e) => {
                         tracing::warn!(
@@ -184,9 +220,15 @@ mod tests {
     const GRAY_LINEAR: &[u8] = include_bytes!("testdata/gray_linear.icc");
     const CMYK_LUT: &[u8] = include_bytes!("testdata/cmyk_lut.icc");
 
+    /// The default media-relative colorimetric intent, for tests that don't
+    /// exercise intent selection.
+    fn ri() -> RenderIntent {
+        RenderIntent::default()
+    }
+
     #[test]
     fn srgb_profile_is_identity() {
-        let t = IccTransform::from_profile_bytes(SRGB).unwrap();
+        let t = IccTransform::from_profile_bytes(SRGB, ri()).unwrap();
         assert_eq!(t.components(), 3);
         let mut out = [0u8; 6];
         t.slice_to_rgb(&[10, 128, 240, 0, 255, 64], &mut out)
@@ -198,7 +240,7 @@ mod tests {
 
     #[test]
     fn srgb_float_color_roundtrips() {
-        let t = IccTransform::from_profile_bytes(SRGB).unwrap();
+        let t = IccTransform::from_profile_bytes(SRGB, ri()).unwrap();
         let (r, g, b) = t.color_to_rgb(&[1.0, 0.0, 0.0]);
         assert!(r > 0.98 && g < 0.02 && b < 0.02, "got {r} {g} {b}");
     }
@@ -207,7 +249,7 @@ mod tests {
     fn gray_gamma22_tone_curve_applies() {
         // A gamma-2.2 gray curve is close to (but not exactly) sRGB's
         // transfer: 128 → encode(0.502^2.2) ≈ 129.
-        let t = IccTransform::from_profile_bytes(GRAY_GAMMA22).unwrap();
+        let t = IccTransform::from_profile_bytes(GRAY_GAMMA22, ri()).unwrap();
         assert_eq!(t.components(), 1);
         let mut out = [0u8; 9];
         t.slice_to_rgb(&[0, 128, 255], &mut out).unwrap();
@@ -220,7 +262,7 @@ mod tests {
     fn gray_linear_brightens_midtones() {
         // Linear gray re-encoded with the sRGB curve: 128 → ≈188, a visible
         // departure from the old pass-through (which would keep 128).
-        let t = IccTransform::from_profile_bytes(GRAY_LINEAR).unwrap();
+        let t = IccTransform::from_profile_bytes(GRAY_LINEAR, ri()).unwrap();
         let mut out = [0u8; 3];
         t.slice_to_rgb(&[128], &mut out).unwrap();
         assert!((out[0] as i16 - 188).abs() <= 2, "midtone: {out:?}");
@@ -228,7 +270,7 @@ mod tests {
 
     #[test]
     fn cmyk_lut_profile_converts_through_lut() {
-        let t = IccTransform::from_profile_bytes(CMYK_LUT).unwrap();
+        let t = IccTransform::from_profile_bytes(CMYK_LUT, ri()).unwrap();
         assert_eq!(t.components(), 4);
         // white, black (K only), cyan
         let src = [0u8, 0, 0, 0, 0, 0, 0, 255, 255, 0, 0, 0];
@@ -247,7 +289,7 @@ mod tests {
         // A wide-gamut profile must visibly move saturated colours; built
         // with moxcms here so no large fixture is needed.
         let bytes = moxcms::ColorProfile::new_adobe_rgb().encode().unwrap();
-        let t = IccTransform::from_profile_bytes(&bytes).unwrap();
+        let t = IccTransform::from_profile_bytes(&bytes, ri()).unwrap();
         let mut out = [0u8; 3];
         t.slice_to_rgb(&[60, 200, 60], &mut out).unwrap();
         assert!(
@@ -257,10 +299,65 @@ mod tests {
     }
 
     #[test]
+    fn render_intent_name_mapping() {
+        use RenderIntent::*;
+        assert_eq!(RenderIntent::from_pdf_name("Perceptual"), Perceptual);
+        assert_eq!(
+            RenderIntent::from_pdf_name("RelativeColorimetric"),
+            RelativeColorimetric
+        );
+        assert_eq!(RenderIntent::from_pdf_name("Saturation"), Saturation);
+        assert_eq!(
+            RenderIntent::from_pdf_name("AbsoluteColorimetric"),
+            AbsoluteColorimetric
+        );
+        // Unknown / unspecified → media-relative colorimetric default.
+        assert_eq!(RenderIntent::from_pdf_name("Bogus"), RelativeColorimetric);
+        assert_eq!(RenderIntent::default(), RelativeColorimetric);
+    }
+
+    #[test]
+    fn every_intent_compiles_a_working_transform() {
+        use RenderIntent::*;
+        for intent in [
+            Perceptual,
+            RelativeColorimetric,
+            Saturation,
+            AbsoluteColorimetric,
+        ] {
+            let t = IccTransform::from_profile_bytes(SRGB, intent)
+                .unwrap_or_else(|e| panic!("intent {intent:?} failed: {e}"));
+            let mut out = [0u8; 3];
+            t.slice_to_rgb(&[200, 50, 50], &mut out).unwrap();
+            // sRGB→sRGB stays near identity for every intent (no gamut clip).
+            assert!((out[0] as i16 - 200).abs() <= 4, "{intent:?}: {out:?}");
+        }
+    }
+
+    #[test]
+    fn cache_separates_transforms_by_intent() {
+        let mut cache = IccCache::new();
+        let id = ObjectId(11, 0);
+        let mut calls = 0;
+        let _a = cache.get_or_build(id, RenderIntent::Perceptual, || {
+            calls += 1;
+            Some(SRGB.to_vec())
+        });
+        // A different intent must NOT reuse the perceptual entry.
+        let _b = cache.get_or_build(id, RenderIntent::AbsoluteColorimetric, || {
+            calls += 1;
+            Some(SRGB.to_vec())
+        });
+        assert_eq!(calls, 2, "intents must be cached separately");
+        // Same (id, intent) reuses.
+        let _c = cache.get_or_build(id, RenderIntent::Perceptual, || unreachable!());
+    }
+
+    #[test]
     fn malformed_profile_is_rejected() {
-        assert!(IccTransform::from_profile_bytes(&[0u8; 256]).is_err());
-        assert!(IccTransform::from_profile_bytes(&SRGB[..100]).is_err());
-        assert!(IccTransform::from_profile_bytes(b"").is_err());
+        assert!(IccTransform::from_profile_bytes(&[0u8; 256], ri()).is_err());
+        assert!(IccTransform::from_profile_bytes(&SRGB[..100], ri()).is_err());
+        assert!(IccTransform::from_profile_bytes(b"", ri()).is_err());
     }
 
     #[test]
@@ -269,7 +366,7 @@ mod tests {
         let id = ObjectId(7, 0);
         let mut calls = 0;
         for _ in 0..2 {
-            let t = cache.get_or_build(id, || {
+            let t = cache.get_or_build(id, ri(), || {
                 calls += 1;
                 Some(vec![0u8; 64])
             });
@@ -282,14 +379,16 @@ mod tests {
     fn cache_shares_one_transform_per_id() {
         let mut cache = IccCache::new();
         let id = ObjectId(3, 0);
-        let a = cache.get_or_build(id, || Some(SRGB.to_vec())).unwrap();
-        let b = cache.get_or_build(id, || unreachable!()).unwrap();
+        let a = cache
+            .get_or_build(id, ri(), || Some(SRGB.to_vec()))
+            .unwrap();
+        let b = cache.get_or_build(id, ri(), || unreachable!()).unwrap();
         assert!(Arc::ptr_eq(&a, &b));
     }
 
     #[test]
     fn palette_bakes_through_transform() {
-        let t = IccTransform::from_profile_bytes(GRAY_LINEAR).unwrap();
+        let t = IccTransform::from_profile_bytes(GRAY_LINEAR, ri()).unwrap();
         let rgb = t.palette_to_rgb(&[0, 128, 255]);
         assert_eq!(rgb.len(), 9);
         assert_eq!(&rgb[0..3], &[0, 0, 0]);

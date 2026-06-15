@@ -2,8 +2,11 @@
 //! PushBlendGroup ops, so we build DisplayLists programmatically and check the GPU
 //! layered path against (a) explicit blend math and (b) the CPU oracle.
 
+use std::sync::Arc;
 use zpdf_core::Rect;
-use zpdf_display_list::{BlendMode, Color, DisplayList, FillRule, Paint, Path, RenderCommand};
+use zpdf_display_list::{
+    BlendMode, Color, DisplayList, FillRule, Paint, Path, RenderCommand, SoftMask, SoftMaskKind,
+};
 use zpdf_render::RenderBackend;
 use zpdf_render_cpu::CpuRenderer;
 use zpdf_render_wgpu::WgpuRenderer;
@@ -92,6 +95,177 @@ fn normal_group_is_source_over() {
         right[0] > 200 && right[2] < 40,
         "right (normal) should be red, got {right:?}"
     );
+}
+
+/// A transparency group painted at group constant alpha 0.5 must match the CPU
+/// oracle (and read as ~50% red over the blue backdrop).
+#[test]
+fn group_alpha_matches_cpu_oracle() {
+    let mut dl = DisplayList::new(Rect::new(0.0, 0.0, W, H));
+    dl.push(fill(Color::rgb(0.0, 0.0, 1.0), (0.0, 0.0, W, H))); // blue base
+    dl.push(RenderCommand::PushBlendGroup {
+        blend_mode: BlendMode::Normal,
+        isolated: true,
+        knockout: false,
+        bounds: Rect::new(0.0, 0.0, W, H),
+        alpha: 0.5,
+        mask: None,
+    });
+    dl.push(fill(Color::rgb(1.0, 0.0, 0.0), (0.0, 0.0, W, H))); // red fill
+    dl.push(RenderCommand::PopBlendGroup);
+
+    let Some((gw, gh, gpu)) = gpu_render(&dl) else {
+        return;
+    };
+    let cpu = CpuRenderer::new()
+        .render_display_list(&dl, SCALE)
+        .expect("cpu render");
+    assert_eq!((gw, gh), (cpu.width, cpu.height));
+
+    // Center: 50% red over blue ≈ (128, 0, 128).
+    let c = px(&gpu, gw, gw / 2, gh / 2);
+    assert!(
+        c[0] > 100 && c[0] < 160 && c[1] < 40 && c[2] > 100 && c[2] < 160,
+        "group alpha 0.5: expected ~50% red over blue, got {c:?}"
+    );
+
+    let total = (gw * gh) as u64;
+    let mut diff = 0u64;
+    for i in 0..total as usize {
+        let b = i * 4;
+        let dr = (gpu[b] as i32 - cpu.data[b] as i32).unsigned_abs();
+        let dg = (gpu[b + 1] as i32 - cpu.data[b + 1] as i32).unsigned_abs();
+        let db = (gpu[b + 2] as i32 - cpu.data[b + 2] as i32).unsigned_abs();
+        if dr.max(dg).max(db) > 16 {
+            diff += 1;
+        }
+    }
+    let pct = diff as f64 / total as f64 * 100.0;
+    assert!(pct < 1.0, "group alpha: GPU vs CPU {pct:.3}% differing");
+}
+
+/// A luminosity soft mask (white left half over /BC=0) masks a red group: the
+/// red shows on the left (coverage 1) and the blue backdrop shows on the right
+/// (coverage 0). Must match the CPU oracle.
+#[test]
+fn luminosity_soft_mask_matches_cpu_oracle() {
+    let mut mask_dl = DisplayList::new(Rect::new(0.0, 0.0, W, H));
+    mask_dl.push(fill(Color::rgb(1.0, 1.0, 1.0), (0.0, 0.0, W / 2.0, H))); // white left half
+    let mask = SoftMask {
+        kind: SoftMaskKind::Luminosity,
+        commands: Arc::new(mask_dl),
+        offset: (0.0, 0.0),
+        backdrop_luma: 0.0,
+        transfer: None,
+    };
+
+    let mut dl = DisplayList::new(Rect::new(0.0, 0.0, W, H));
+    dl.push(fill(Color::rgb(0.0, 0.0, 1.0), (0.0, 0.0, W, H))); // blue base
+    dl.push(RenderCommand::PushBlendGroup {
+        blend_mode: BlendMode::Normal,
+        isolated: true,
+        knockout: false,
+        bounds: Rect::new(0.0, 0.0, W, H),
+        alpha: 1.0,
+        mask: Some(mask),
+    });
+    dl.push(fill(Color::rgb(1.0, 0.0, 0.0), (0.0, 0.0, W, H))); // red group
+    dl.push(RenderCommand::PopBlendGroup);
+
+    let Some((gw, gh, gpu)) = gpu_render(&dl) else {
+        return;
+    };
+    let cpu = CpuRenderer::new()
+        .render_display_list(&dl, SCALE)
+        .expect("cpu render");
+    assert_eq!((gw, gh), (cpu.width, cpu.height));
+
+    // Left: masked-in red; right: masked-out → blue backdrop.
+    let left = px(&gpu, gw, gw / 4, gh / 2);
+    let right = px(&gpu, gw, gw * 3 / 4, gh / 2);
+    assert!(
+        left[0] > 200 && left[2] < 50,
+        "mask left should be red, got {left:?}"
+    );
+    assert!(
+        right[2] > 200 && right[0] < 50,
+        "mask right should be blue (masked out), got {right:?}"
+    );
+
+    let total = (gw * gh) as u64;
+    let mut diff = 0u64;
+    for i in 0..total as usize {
+        let b = i * 4;
+        let dr = (gpu[b] as i32 - cpu.data[b] as i32).unsigned_abs();
+        let dg = (gpu[b + 1] as i32 - cpu.data[b + 1] as i32).unsigned_abs();
+        let db = (gpu[b + 2] as i32 - cpu.data[b + 2] as i32).unsigned_abs();
+        if dr.max(dg).max(db) > 16 {
+            diff += 1;
+        }
+    }
+    let pct = diff as f64 / total as f64 * 100.0;
+    assert!(pct < 1.0, "luminosity mask: GPU vs CPU {pct:.3}% differing");
+}
+
+/// An alpha soft mask (opaque left half) masks a red group by the mask group's
+/// alpha: red shows on the left, the backdrop on the right. Matches CPU.
+#[test]
+fn alpha_soft_mask_matches_cpu_oracle() {
+    let mut mask_dl = DisplayList::new(Rect::new(0.0, 0.0, W, H));
+    mask_dl.push(fill(Color::rgb(0.0, 1.0, 0.0), (0.0, 0.0, W / 2.0, H))); // opaque left half
+    let mask = SoftMask {
+        kind: SoftMaskKind::Alpha,
+        commands: Arc::new(mask_dl),
+        offset: (0.0, 0.0),
+        backdrop_luma: 0.0,
+        transfer: None,
+    };
+
+    let mut dl = DisplayList::new(Rect::new(0.0, 0.0, W, H));
+    dl.push(fill(Color::rgb(0.0, 0.0, 1.0), (0.0, 0.0, W, H))); // blue base
+    dl.push(RenderCommand::PushBlendGroup {
+        blend_mode: BlendMode::Normal,
+        isolated: true,
+        knockout: false,
+        bounds: Rect::new(0.0, 0.0, W, H),
+        alpha: 1.0,
+        mask: Some(mask),
+    });
+    dl.push(fill(Color::rgb(1.0, 0.0, 0.0), (0.0, 0.0, W, H))); // red group
+    dl.push(RenderCommand::PopBlendGroup);
+
+    let Some((gw, gh, gpu)) = gpu_render(&dl) else {
+        return;
+    };
+    let cpu = CpuRenderer::new()
+        .render_display_list(&dl, SCALE)
+        .expect("cpu render");
+
+    let left = px(&gpu, gw, gw / 4, gh / 2);
+    let right = px(&gpu, gw, gw * 3 / 4, gh / 2);
+    assert!(
+        left[0] > 200 && left[2] < 50,
+        "alpha mask left red: {left:?}"
+    );
+    assert!(
+        right[2] > 200 && right[0] < 50,
+        "alpha mask right blue: {right:?}"
+    );
+
+    let total = (gw * gh) as u64;
+    let mut diff = 0u64;
+    for i in 0..total as usize {
+        let b = i * 4;
+        let d = (gpu[b] as i32 - cpu.data[b] as i32)
+            .unsigned_abs()
+            .max((gpu[b + 1] as i32 - cpu.data[b + 1] as i32).unsigned_abs())
+            .max((gpu[b + 2] as i32 - cpu.data[b + 2] as i32).unsigned_abs());
+        if d > 16 {
+            diff += 1;
+        }
+    }
+    let pct = diff as f64 / total as f64 * 100.0;
+    assert!(pct < 1.0, "alpha mask: GPU vs CPU {pct:.3}% differing");
 }
 
 #[test]

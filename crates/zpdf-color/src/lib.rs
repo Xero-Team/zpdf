@@ -4,7 +4,7 @@ pub mod function;
 pub mod icc;
 
 pub use function::PdfFunction;
-pub use icc::{IccCache, IccTransform};
+pub use icc::{IccCache, IccTransform, RenderIntent};
 
 #[derive(Debug, Clone)]
 pub enum ColorSpace {

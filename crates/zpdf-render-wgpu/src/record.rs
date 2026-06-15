@@ -8,7 +8,17 @@
 
 use crate::path::{fill_mesh, stroke_mesh, Mesh};
 use crate::transform::{PageMap, SolidVertex, TexturedVertex};
-use zpdf_display_list::{BlendMode, FillRule, Path as DlPath, StrokeStyle};
+use zpdf_display_list::{BlendMode, FillRule, Path as DlPath, SoftMaskKind, StrokeStyle};
+
+/// A soft mask's recorded geometry (ops referencing the shared page arena) plus
+/// the reduction parameters needed to turn it into per-pixel coverage.
+pub struct MaskOps {
+    /// Ops replayed into an offscreen mask layer (reference the shared buffers).
+    pub ops: Vec<PageOp>,
+    pub kind: SoftMaskKind,
+    /// /BC backdrop luminosity for areas the mask group leaves unpainted.
+    pub backdrop_luma: f32,
+}
 
 /// A range of indices/vertices in the shared arena.
 #[derive(Clone, Copy)]
@@ -41,9 +51,13 @@ pub enum PageOp {
     },
     /// Begin a transparency group: subsequent ops render to a fresh offscreen layer.
     /// `clips` are the clip paths active at push time, re-stamped into the new layer.
+    /// `alpha` is the group constant alpha applied at composite time; `mask` is an
+    /// optional ExtGState /SMask, pre-multiplied into the group before compositing.
     PushBlend {
         mode: BlendMode,
+        alpha: f32,
         clips: Vec<ClipStamp>,
+        mask: Option<MaskOps>,
     },
     /// End the current group: composite it onto the parent with `mode` (carried by
     /// the matching PushBlend), then re-stamp `clips` into the resulting layer.
@@ -139,6 +153,18 @@ impl PageRecorder {
     /// is the correct "clip to nothing" behavior).
     pub fn push_clip(&mut self, path: &DlPath, rule: FillRule, map: &PageMap) {
         let range = fill_mesh(path, rule, [0.0; 4], map).map(|m| self.append(m));
+        self.push_clip_range(range);
+    }
+
+    /// Push a clip to a *stroked* path's outline (tessellated as a stroke mesh).
+    pub fn push_clip_stroke(&mut self, path: &DlPath, style: &StrokeStyle, map: &PageMap) {
+        let range = stroke_mesh(path, style, [0.0; 4], map).map(|m| self.append(m));
+        self.push_clip_range(range);
+    }
+
+    /// Common tail of the clip-push variants: stamp the (optional) mesh as a clip
+    /// path and advance the clip depth (an empty mesh still occupies a level).
+    fn push_clip_range(&mut self, range: Option<MeshRange>) {
         let ref_value = self.clip_depth;
         if let Some(r) = range {
             self.ops.push(PageOp::StampClip {
@@ -186,9 +212,30 @@ impl PageRecorder {
 
     /// Begin a transparency group. The active clips are captured so the group's
     /// fresh layer (and, on pop, the composited result) reproduce the same clip.
-    pub fn push_blend(&mut self, mode: BlendMode) {
+    pub fn push_blend(&mut self, mode: BlendMode, alpha: f32, mask: Option<MaskOps>) {
         let clips = self.active_clips();
-        self.ops.push(PageOp::PushBlend { mode, clips });
+        self.ops.push(PageOp::PushBlend {
+            mode,
+            alpha,
+            clips,
+            mask,
+        });
+    }
+
+    /// Record a sub-sequence (a soft mask's commands) into the SHARED geometry
+    /// arena, but collect its ops separately instead of appending them to the
+    /// page op list. Clip state is isolated so the mask's clip nesting cannot
+    /// leak into the page. Returns the mask's ops (which reference the shared
+    /// vertex/index buffers, replayed later into a mask layer).
+    pub fn record_subops(&mut self, f: impl FnOnce(&mut Self)) -> Vec<PageOp> {
+        let saved_ops = std::mem::take(&mut self.ops);
+        let saved_stack = std::mem::take(&mut self.clip_stack);
+        let saved_depth = std::mem::replace(&mut self.clip_depth, 0);
+        f(self);
+        let sub = std::mem::replace(&mut self.ops, saved_ops);
+        self.clip_stack = saved_stack;
+        self.clip_depth = saved_depth;
+        sub
     }
 
     pub fn pop_blend(&mut self) {

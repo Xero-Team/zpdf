@@ -65,6 +65,57 @@ harness: `tests/corpus_run.sh`).
   per mask identity and derives offset uses by a shift-blit. Pixel-exact on
   the corpus shape, ~25× faster.
 
+### Closing the 0.4.0 known-limitations list
+
+The 0.4.0 "known limitations" are now implemented (all but legacy predefined
+CMap data tables, intentionally deferred), still with zero C/C++ dependencies.
+
+- **Transparency groups** (`zpdf-render-cpu`): knockout groups (`/K true`) now
+  composite each element against the group's *initial* backdrop instead of the
+  accumulation of preceding elements — a per-element pass captures the element's
+  *shape* (a full-opacity render) so a semi-transparent solid fill still fully
+  knocks out (PDF 11.4.9). Non-isolated groups (`/I false`) with no group-level
+  effect now render their elements straight onto the backdrop (the only correct
+  realization that lets element blend modes inside see it); a non-isolated group
+  carrying a constant alpha / soft mask / non-Normal group blend is still
+  approximated as isolated. A single object carrying a blend mode / soft mask is
+  treated as an isolated one-element group (was incidentally non-isolated).
+- **Pattern paints on strokes and text** (`zpdf-display-list`, `zpdf-content`,
+  `zpdf-render-cpu`, `zpdf-render-wgpu`): a tiling/shading pattern selected for a
+  stroke now clips the pattern to the stroke outline (new `PushClipStroke`
+  command; the CPU backend lifts a stroke-coverage mask, the GPU backend stamps
+  the stroke tessellation into the clip stencil) instead of stroking a solid
+  average colour. Text filled (or "stroked", render modes 1–6) with a pattern
+  clips the pattern to the glyph outlines (built from the font program) instead
+  of painting solid.
+- **`/RenderingIntent`** (`zpdf-color`, `zpdf-content`, `zpdf-image`): the `ri`
+  operator, ExtGState `/RI`, and image `/Intent` are parsed into the graphics
+  state and threaded through `IccTransform`/`IccCache` (now keyed by intent) to
+  the `moxcms` rendering intent — perceptual / relative- & absolute-colorimetric
+  / saturation, with the ICC-mandated fallback order.
+- **Per-CID vertical metrics `/W2`** (`zpdf-font`, `zpdf-document`,
+  `zpdf-content`): the `/W2` array (list and range forms) is parsed into per-CID
+  `(w1y, vx, vy)` triples and used for vertical writing-mode glyph placement,
+  overriding the `/DW2` default per glyph.
+- **JPX embedded ICC** (`zpdf-image`): an ICC profile carried inside a JPEG 2000
+  codestream is now compiled and applied (media-relative colorimetric) instead
+  of falling back to the channel count, when no PDF-level `/ColorSpace` overrides.
+- **JBIG2 advanced segments** (`zpdf-parser`): generic refinement regions
+  (type 22, GRTEMPLATE, TPGRON), symbol/aggregate refinement (`SDREFAGG`) and
+  text-region per-instance refinement (`SBREFINE`), Huffman coding (standard
+  tables B.1–B.15 + custom type-53 tables; Huffman symbol dictionaries and text
+  regions, types 40–43), and pattern dictionaries (16) + halftone regions (20)
+  now decode instead of rendering blank — round-trip-tested with new encoder
+  helpers. (Multi-plane MMR halftones remain lightly tested; arithmetic is the
+  common case.)
+- **wgpu soft masks + group alpha** (`zpdf-render-wgpu`): the GPU backend now
+  applies a group's constant alpha at composite time and rasterizes an ExtGState
+  `/SMask` into an offscreen coverage layer (luminosity over `/BC`, or group
+  alpha), pre-multiplying it into the group before compositing — validated
+  pixel-for-pixel against the CPU oracle. Residual: the `/TR` transfer function,
+  the tiling `offset`, nested groups inside a mask, and the `/RenderingIntent`
+  for codestream-ICC JPX are not yet honored on every path.
+
 ## 0.4.0 — closing the 0.3.0 gaps
 
 Every item on the 0.3.0 "known limitations" list is now implemented, still

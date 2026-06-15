@@ -30,6 +30,10 @@ pub struct Pipelines {
     pub composite_bgl: wgpu::BindGroupLayout,
     /// Blend-group composite pipeline (fullscreen, reads base+group, 16 modes).
     pub composite: wgpu::RenderPipeline,
+    /// Bind group 1 (mask-apply): group texture + mask texture + kind uniform.
+    pub mask_apply_bgl: wgpu::BindGroupLayout,
+    /// Soft-mask apply pipeline (fullscreen, group × mask coverage).
+    pub mask_apply: wgpu::RenderPipeline,
 }
 
 impl Pipelines {
@@ -259,6 +263,87 @@ impl Pipelines {
             cache: None,
         });
 
+        // --- Soft-mask apply pipeline: group 1 = group texture + mask texture +
+        //     kind uniform. Same layout shape as composite. ---
+        let mask_apply_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("zpdf-mask-apply-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let mask_shader =
+            device.create_shader_module(wgpu::include_wgsl!("shaders/mask_apply.wgsl"));
+        let mask_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("zpdf-mask-apply-layout"),
+            bind_group_layouts: &[Some(&page_bgl), Some(&mask_apply_bgl)],
+            immediate_size: 0,
+        });
+        let mask_vbl = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<SolidVertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &attrs,
+        };
+        let mask_apply = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("zpdf-mask-apply"),
+            layout: Some(&mask_layout),
+            vertex: wgpu::VertexState {
+                module: &mask_shader,
+                entry_point: Some("vs_mask"),
+                buffers: &[mask_vbl],
+                compilation_options: Default::default(),
+            },
+            primitive: wgpu::PrimitiveState {
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(composite_stencil_state()),
+            multisample: wgpu::MultisampleState {
+                count: sample_count,
+                ..Default::default()
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &mask_shader,
+                entry_point: Some("fs_mask"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: target_format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+
         Self {
             page_bgl,
             tex_bgl,
@@ -269,6 +354,8 @@ impl Pipelines {
             textured,
             composite_bgl,
             composite,
+            mask_apply_bgl,
+            mask_apply,
         }
     }
 }

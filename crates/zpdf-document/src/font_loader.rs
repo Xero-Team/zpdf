@@ -301,7 +301,8 @@ fn load_type0_font(
     let desc_obj = file.resolve(desc_ref)?;
     let desc_dict = desc_obj.as_dict()?;
 
-    let cid_widths = parse_cid_widths(file, desc_dict);
+    let mut cid_widths = parse_cid_widths(file, desc_dict);
+    parse_cid_w2(file, desc_dict, &mut cid_widths);
     let cmap = parse_type0_encoding(file, dict);
     let dw2 = parse_dw2(file, desc_dict);
 
@@ -672,6 +673,73 @@ fn parse_cid_widths(file: &PdfFile, dict: &zpdf_core::PdfDict) -> CidWidths {
     widths
 }
 
+/// Parse the CID /W2 array (PDF 9.7.4.3) into per-CID vertical metrics.
+/// Two element forms, mirroring /W but with THREE numbers per glyph:
+///   `c [ w1y_1 vx_1 vy_1  w1y_2 vx_2 vy_2 ... ]`   (list form)
+///   `cFirst cLast w1y vx vy`                         (range form)
+/// where `w1y` is the vertical displacement and `(vx, vy)` the position vector.
+fn parse_cid_w2(file: &PdfFile, dict: &zpdf_core::PdfDict, widths: &mut CidWidths) {
+    if let Some(arr) = resolve_array(file, dict, "W2") {
+        apply_w2_array(&arr, widths);
+    }
+}
+
+fn apply_w2_array(w2_array: &[PdfObject], widths: &mut CidWidths) {
+    let mut i = 0;
+    while i < w2_array.len() {
+        let cid_start = match w2_array[i].as_i64() {
+            Ok(v) => v as u16,
+            Err(_) => break,
+        };
+        i += 1;
+        if i >= w2_array.len() {
+            break;
+        }
+
+        match &w2_array[i] {
+            PdfObject::Array(arr) => {
+                // List form: triples (w1y, vx, vy) starting at cid_start.
+                let mut k = 0;
+                while k + 2 < arr.len() {
+                    let (Ok(w1y), Ok(vx), Ok(vy)) =
+                        (arr[k].as_f64(), arr[k + 1].as_f64(), arr[k + 2].as_f64())
+                    else {
+                        break;
+                    };
+                    let Some(cid) = cid_start.checked_add((k / 3) as u16) else {
+                        break;
+                    };
+                    widths.set_v(cid, w1y, vx, vy);
+                    k += 3;
+                }
+                i += 1;
+            }
+            PdfObject::Integer(_) | PdfObject::Real(_) => {
+                // Range form: cFirst cLast w1y vx vy.
+                let cid_end = w2_array[i].as_i64().unwrap_or(cid_start as i64) as u16;
+                if i + 3 < w2_array.len() {
+                    let (Ok(w1y), Ok(vx), Ok(vy)) = (
+                        w2_array[i + 1].as_f64(),
+                        w2_array[i + 2].as_f64(),
+                        w2_array[i + 3].as_f64(),
+                    ) else {
+                        break;
+                    };
+                    for cid in cid_start..=cid_end {
+                        widths.set_v(cid, w1y, vx, vy);
+                    }
+                    i += 4;
+                } else {
+                    break;
+                }
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+}
+
 fn parse_simple_widths(file: &PdfFile, dict: &zpdf_core::PdfDict) -> CidWidths {
     let first_char = dict.get_i64("FirstChar").unwrap_or(0) as u16;
     let mut widths = CidWidths::new(1000.0);
@@ -688,4 +756,59 @@ fn parse_simple_widths(file: &PdfFile, dict: &zpdf_core::PdfDict) -> CidWidths {
     }
 
     widths
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn int(v: i64) -> PdfObject {
+        PdfObject::Integer(v)
+    }
+    fn real(v: f64) -> PdfObject {
+        PdfObject::Real(v)
+    }
+
+    #[test]
+    fn w2_list_form_assigns_consecutive_cids() {
+        // 120 [w1y vx vy  w1y vx vy] → CIDs 120 and 121.
+        let arr = vec![
+            int(120),
+            PdfObject::Array(vec![
+                real(-1000.0),
+                real(500.0),
+                real(880.0),
+                int(-900),
+                int(450),
+                int(820),
+            ]),
+        ];
+        let mut w = CidWidths::new(1000.0);
+        apply_w2_array(&arr, &mut w);
+        assert_eq!(w.get_v(120), Some((-1000.0, 500.0, 880.0)));
+        assert_eq!(w.get_v(121), Some((-900.0, 450.0, 820.0)));
+        assert_eq!(w.get_v(122), None);
+    }
+
+    #[test]
+    fn w2_range_form_assigns_inclusive_range() {
+        // cFirst cLast w1y vx vy
+        let arr = vec![int(10), int(12), int(-1000), int(500), int(880)];
+        let mut w = CidWidths::new(1000.0);
+        apply_w2_array(&arr, &mut w);
+        for cid in 10..=12 {
+            assert_eq!(w.get_v(cid), Some((-1000.0, 500.0, 880.0)));
+        }
+        assert_eq!(w.get_v(9), None);
+        assert_eq!(w.get_v(13), None);
+    }
+
+    #[test]
+    fn w2_truncated_entry_is_ignored_not_panic() {
+        // Range header without the trailing metric numbers must not panic.
+        let arr = vec![int(10), int(12), int(-1000)];
+        let mut w = CidWidths::new(1000.0);
+        apply_w2_array(&arr, &mut w);
+        assert_eq!(w.get_v(10), None);
+    }
 }

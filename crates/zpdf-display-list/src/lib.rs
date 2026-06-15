@@ -39,6 +39,13 @@ pub enum RenderCommand {
         path: Path,
         rule: FillRule,
     },
+    /// Intersect the clip with a *stroked* path's outline (not its fill).
+    /// Used to clip a pattern/shading paint to a stroke, since stroke geometry
+    /// is the backend's job. Released by the matching [`RenderCommand::PopClip`].
+    PushClipStroke {
+        path: Path,
+        style: StrokeStyle,
+    },
     PopClip,
     PushBlendGroup {
         blend_mode: BlendMode,

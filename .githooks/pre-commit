@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# zpdf pre-commit hook — run the same gates as CI (rustfmt + clippy) before a
+# commit is created, so a push never fails on formatting or lints.
+#
+# Skips automatically when a commit touches no buildable sources (docs-only,
+# fixtures, etc.). Bypass in a pinch with `git commit --no-verify`.
+set -euo pipefail
+
+# Only gate commits that actually touch Rust / shader / Cargo sources.
+staged=$(git diff --cached --name-only --diff-filter=ACMR)
+if ! printf '%s\n' "$staged" | grep -qE '\.(rs|wgsl)$|(^|/)Cargo\.(toml|lock)$'; then
+    exit 0
+fi
+
+echo "pre-commit › cargo fmt --all --check"
+if ! cargo fmt --all --check; then
+    echo >&2
+    echo "✗ rustfmt: run 'cargo fmt --all', re-stage the files, and commit again." >&2
+    exit 1
+fi
+
+echo "pre-commit › cargo clippy --workspace --all-targets -- -D warnings"
+if ! cargo clippy --workspace --all-targets -- -D warnings; then
+    echo >&2
+    echo "✗ clippy found issues. Fix them, or bypass with 'git commit --no-verify'." >&2
+    exit 1
+fi
+
+echo "pre-commit ✓ fmt + clippy clean"
