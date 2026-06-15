@@ -548,10 +548,104 @@ fn decode_ascii85(data: &[u8]) -> Result<Vec<u8>> {
 
 fn decode_dct(data: &[u8]) -> Result<Vec<u8>> {
     use zune_jpeg::JpegDecoder;
+
+    // Adobe YCCK JPEGs (APP14 transform == 2, 4 components) are mis-handled by
+    // zune-jpeg's built-in YCCK->RGB: it applies a spurious `255 - x`, producing
+    // a colour-negative image (a white CMYK page reads back as black). zune has
+    // no YCCK->CMYK arm either, so we take the raw YCCK channels and convert them
+    // ourselves. Plain Adobe CMYK (transform 0) decodes correctly via zune's
+    // CMYK->RGB, so it stays on the default path.
+    if jpeg_is_adobe_ycck(data) {
+        use zune_jpeg::zune_core::colorspace::ColorSpace;
+        use zune_jpeg::zune_core::options::DecoderOptions;
+        let opts = DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::YCCK);
+        let mut decoder = JpegDecoder::new_with_options(std::io::Cursor::new(data), opts);
+        match decoder.decode() {
+            Ok(ycck) if decoder.output_colorspace() == Some(ColorSpace::YCCK) => {
+                return Ok(ycck_to_rgb(&ycck));
+            }
+            // Unexpected (e.g. not actually 4-component): fall through to the
+            // default decode rather than mangle the data.
+            _ => {}
+        }
+    }
+
     let mut decoder = JpegDecoder::new(std::io::Cursor::new(data));
     decoder
         .decode()
         .map_err(|e| Error::StreamDecode(format!("DCTDecode: {e}")))
+}
+
+/// Convert raw upsampled Adobe YCCK samples (`Y, Cb, Cr, K` per pixel) to RGB.
+///
+/// In Adobe YCCK the chroma channels encode the *complement* of C/M/Y (so the
+/// JFIF YCbCr->RGB output is already the Adobe-inverted C/M/Y), and the K channel
+/// is likewise inverted (`K_raw == 0` ⇒ no black ink). The ink-weighted result is
+/// `channel * (255 - K_raw) / 255`, matching libjpeg's YCCK decode followed by a
+/// naive CMYK->RGB.
+fn ycck_to_rgb(ycck: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(ycck.len() / 4 * 3);
+    for px in ycck.chunks_exact(4) {
+        let (y, cb, cr) = (px[0] as f32, px[1] as f32, px[2] as f32);
+        let kk = (255 - px[3]) as f32 / 255.0;
+        let r = (y + 1.402 * (cr - 128.0)).clamp(0.0, 255.0);
+        let g = (y - 0.344_136 * (cb - 128.0) - 0.714_136 * (cr - 128.0)).clamp(0.0, 255.0);
+        let b = (y + 1.772 * (cb - 128.0)).clamp(0.0, 255.0);
+        out.push((r * kk) as u8);
+        out.push((g * kk) as u8);
+        out.push((b * kk) as u8);
+    }
+    out
+}
+
+/// Scan a JPEG for an Adobe APP14 marker with transform 2 (YCCK) over a SOF that
+/// declares 4 components. Cheap byte walk over the marker segments only.
+fn jpeg_is_adobe_ycck(data: &[u8]) -> bool {
+    let mut adobe_ycck = false;
+    let mut four_components = false;
+    let mut i = 2; // skip SOI (FFD8)
+    while i + 3 < data.len() {
+        if data[i] != 0xFF {
+            i += 1;
+            continue;
+        }
+        let marker = data[i + 1];
+        // Standalone markers (no length): padding fill, SOI/EOI, RSTn, TEM.
+        if marker == 0xFF || marker == 0x01 || (0xD0..=0xD9).contains(&marker) {
+            i += 2;
+            continue;
+        }
+        let seg_len = ((data[i + 2] as usize) << 8) | data[i + 3] as usize;
+        if seg_len < 2 {
+            break;
+        }
+        let payload_start = i + 4;
+        let payload_end = i + 2 + seg_len;
+        if payload_end > data.len() {
+            break;
+        }
+        let payload = &data[payload_start..payload_end];
+        match marker {
+            // APP14: "Adobe" + version(2) + flags0(2) + flags1(2) + transform(1).
+            0xEE => {
+                if payload.len() >= 12 && &payload[0..5] == b"Adobe" {
+                    adobe_ycck = payload[11] == 2;
+                }
+            }
+            // SOFn (baseline/progressive/etc.), excluding DHT(C4)/JPG(C8)/DAC(CC).
+            0xC0..=0xCF if marker != 0xC4 && marker != 0xC8 && marker != 0xCC => {
+                // precision(1) + height(2) + width(2) + Nf(1).
+                if payload.len() >= 6 {
+                    four_components = payload[5] == 4;
+                }
+            }
+            // Start of scan: header is done.
+            0xDA => break,
+            _ => {}
+        }
+        i = payload_end;
+    }
+    adobe_ycck && four_components
 }
 
 fn decode_run_length(data: &[u8]) -> Result<Vec<u8>> {
@@ -600,6 +694,48 @@ fn decode_run_length(data: &[u8]) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ycck_white_decodes_white_not_black() {
+        // Adobe white (no ink): Y=255, Cb=Cr=128 (neutral), K_raw=0.
+        let rgb = ycck_to_rgb(&[255, 128, 128, 0]);
+        assert_eq!(rgb, vec![255, 255, 255], "Adobe YCCK white must stay white");
+    }
+
+    #[test]
+    fn ycck_full_black_ink_decodes_black() {
+        // K_raw=255 means full black ink regardless of chroma.
+        let rgb = ycck_to_rgb(&[255, 128, 128, 255]);
+        assert_eq!(rgb, vec![0, 0, 0]);
+    }
+
+    #[test]
+    fn ycck_neutral_gray_matches_k_weight() {
+        // No CMY (chroma neutral, luma full) with half black ink ⇒ ~mid gray.
+        let rgb = ycck_to_rgb(&[255, 128, 128, 128]);
+        assert_eq!(rgb, vec![127, 127, 127]);
+    }
+
+    #[test]
+    fn adobe_ycck_detection() {
+        // Minimal marker stream: SOI, APP14(Adobe, transform=2), SOF0(4 comp), SOS.
+        let mut j = vec![0xFF, 0xD8];
+        // APP14, len=16: "Adobe"(5)+ver(2)+f0(2)+f1(2)+transform(1) = 12 payload, +2 len = 14... use 16 with pad.
+        j.extend_from_slice(&[0xFF, 0xEE, 0x00, 0x0E]);
+        j.extend_from_slice(b"Adobe");
+        j.extend_from_slice(&[0x00, 0x64, 0x00, 0x00, 0x00, 0x00, 0x02]); // version, flags, transform=2
+                                                                          // SOF0, len=17 (1 prec + 2 h + 2 w + 1 Nf=4 + 4*3 comp specs) -> payload 6+ needed.
+        j.extend_from_slice(&[0xFF, 0xC0, 0x00, 0x11, 0x08, 0x00, 0x10, 0x00, 0x10, 0x04]);
+        j.extend_from_slice(&[1, 0x11, 0, 2, 0x11, 0, 3, 0x11, 0, 4, 0x11, 0]);
+        j.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x02]); // SOS
+        assert!(jpeg_is_adobe_ycck(&j));
+
+        // transform=0 (plain CMYK) must NOT take the YCCK path.
+        let mut j0 = j.clone();
+        // transform byte is at: 2 (SOI) + 4 (app14 hdr) + 11 = index 17.
+        j0[17] = 0;
+        assert!(!jpeg_is_adobe_ycck(&j0));
+    }
 
     #[test]
     fn flate_roundtrip() {
