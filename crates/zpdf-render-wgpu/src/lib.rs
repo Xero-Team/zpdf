@@ -121,6 +121,7 @@ impl<'a> RenderBackend for WgpuRenderer<'a> {
             self.ctx = Some(GpuContext::new_headless()?);
         }
         let ctx = self.ctx.as_ref().unwrap();
+        ctx.clear_error();
 
         let scale = info.scale;
         // ceil() in f64, exactly like the CPU's `(width() * scale as f64).ceil()`
@@ -383,7 +384,11 @@ impl<'a> RenderBackend for WgpuRenderer<'a> {
         }
         page.target.record_copy(&mut encoder);
         ctx.queue.submit(Some(encoder.finish()));
-        page.target.map_and_strip(device)
+        let result = page.target.map_and_strip(device);
+        if let Some(msg) = ctx.take_error() {
+            return Err(WgpuRenderError::Wgpu(format!("device error: {msg}")));
+        }
+        result
     }
 }
 
@@ -607,7 +612,10 @@ fn init_layer(
 }
 
 /// Multi-pass render for pages with transparency groups: a stack of offscreen
-/// layers, each composited onto its parent on PopBlendGroup.
+/// layers, each composited onto its parent on PopBlendGroup. Layers come from a
+/// recycling [`blend::LayerPool`] so a page with hundreds of groups reuses a
+/// small working set instead of allocating (and never freeing) one full-page
+/// layer per group.
 fn render_layered(
     ctx: &GpuContext,
     target: &PageTarget,
@@ -619,8 +627,9 @@ fn render_layered(
     let device = &ctx.device;
     let (w, h, sc) = (target.width, target.height, target.sample_count);
 
-    let mut layers: Vec<blend::RenderLayer> = vec![blend::RenderLayer::new(device, w, h, sc)];
-    let mut active: Vec<usize> = vec![0];
+    let mut pool = blend::LayerPool::new(w, h, sc);
+    let base = pool.acquire(device);
+    let mut active: Vec<usize> = vec![base];
     let mut blend_info: Vec<(
         zpdf_display_list::BlendMode,
         f32,
@@ -637,13 +646,13 @@ fn render_layered(
 
     // Initialize the base layer (page background, no clips).
     {
-        let base = begin_layer_pass(
+        let pass = begin_layer_pass(
             &mut encoder,
-            &layers[0],
+            pool.get(base),
             wgpu::LoadOp::Clear(page_clear),
             wgpu::LoadOp::Clear(0),
         );
-        drop(base);
+        drop(pass);
     }
 
     let mut i = 0;
@@ -656,7 +665,7 @@ fn render_layered(
             let cur = *active.last().unwrap();
             let mut pass = begin_layer_pass(
                 &mut encoder,
-                &layers[cur],
+                pool.get(cur),
                 wgpu::LoadOp::Load,
                 wgpu::LoadOp::Load,
             );
@@ -673,11 +682,10 @@ fn render_layered(
                 clips,
                 mask,
             } => {
-                let g = layers.len();
-                layers.push(blend::RenderLayer::new(device, w, h, sc));
+                let g = pool.acquire(device);
                 init_layer(
                     &mut encoder,
-                    &layers[g],
+                    pool.get(g),
                     wgpu::Color::TRANSPARENT,
                     clips,
                     res,
@@ -686,27 +694,27 @@ fn render_layered(
                 blend_info.push((*mode, *alpha, mask.as_ref(), clips.clone()));
             }
             PageOp::PopBlend => {
-                let group = active.pop().unwrap_or(0);
+                let group = active.pop().unwrap_or(base);
                 let (mode, alpha, mask, clips) = blend_info.pop().unwrap_or((
                     zpdf_display_list::BlendMode::Normal,
                     1.0,
                     None,
                     Vec::new(),
                 ));
-                let parent = *active.last().unwrap_or(&0);
+                let parent = *active.last().unwrap_or(&base);
 
                 // A soft mask pre-multiplies the group layer by per-pixel
                 // coverage: render the mask into its own layer, then an
                 // apply-mask pass writes (group × coverage) into a fresh layer
-                // that takes the group's place as the composite source.
+                // that takes the group's place as the composite source. The
+                // original group + coverage layers are recycled inside.
                 let group = if let Some(m) = mask {
                     apply_soft_mask(
                         ctx,
                         &mut encoder,
-                        &mut layers,
+                        &mut pool,
                         group,
                         m,
-                        (w, h, sc),
                         res,
                         &mut keep_bgs,
                         &mut keep_bufs,
@@ -715,8 +723,7 @@ fn render_layered(
                     group
                 };
 
-                let scratch = layers.len();
-                layers.push(blend::RenderLayer::new(device, w, h, sc));
+                let scratch = pool.acquire(device);
 
                 // Mode + group-alpha uniform (16-byte aligned) + composite bind group.
                 let mode_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -736,13 +743,13 @@ fn render_layered(
                         wgpu::BindGroupEntry {
                             binding: 0,
                             resource: wgpu::BindingResource::TextureView(
-                                layers[parent].sampleable_view(),
+                                pool.get(parent).sampleable_view(),
                             ),
                         },
                         wgpu::BindGroupEntry {
                             binding: 1,
                             resource: wgpu::BindingResource::TextureView(
-                                layers[group].sampleable_view(),
+                                pool.get(group).sampleable_view(),
                             ),
                         },
                         wgpu::BindGroupEntry {
@@ -756,7 +763,7 @@ fn render_layered(
                 {
                     let mut pass = begin_layer_pass(
                         &mut encoder,
-                        &layers[scratch],
+                        pool.get(scratch),
                         wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                         wgpu::LoadOp::Clear(0),
                     );
@@ -778,8 +785,15 @@ fn render_layered(
 
                 keep_bgs.push(comp_bg);
                 keep_bufs.push(mode_buf);
-                // The scratch becomes the layer at the parent's level.
+
+                // The group and the now-superseded parent are dead: their reads
+                // are recorded, so recycle them for reuse (textures live until
+                // submit). The scratch takes the parent's slot in the stack.
+                pool.recycle(group);
                 active.pop();
+                if parent != base {
+                    pool.recycle(parent);
+                }
                 active.push(scratch);
             }
             _ => unreachable!(),
@@ -787,10 +801,14 @@ fn render_layered(
         i += 1;
     }
 
-    let final_layer = *active.first().unwrap_or(&0);
-    target.record_copy_from(&mut encoder, layers[final_layer].sampleable_texture());
+    let final_layer = *active.first().unwrap_or(&base);
+    target.record_copy_from(&mut encoder, pool.get(final_layer).sampleable_texture());
     ctx.queue.submit(Some(encoder.finish()));
-    target.map_and_strip(device)
+    let result = target.map_and_strip(device);
+    if let Some(msg) = ctx.take_error() {
+        return Err(WgpuRenderError::Wgpu(format!("device error: {msg}")));
+    }
+    result
 }
 
 /// Apply a group's soft mask: render the mask group into its own layer, then a
@@ -803,23 +821,20 @@ fn render_layered(
 fn apply_soft_mask(
     ctx: &GpuContext,
     encoder: &mut wgpu::CommandEncoder,
-    layers: &mut Vec<blend::RenderLayer>,
+    pool: &mut blend::LayerPool,
     group: usize,
     mask: &record::MaskOps,
-    dims: (u32, u32, u32),
     res: &ReplayRes,
     keep_bgs: &mut Vec<wgpu::BindGroup>,
     keep_bufs: &mut Vec<wgpu::Buffer>,
 ) -> usize {
     use wgpu::util::DeviceExt;
     use zpdf_display_list::SoftMaskKind;
-    let (w, h, sc) = dims;
     let device = &ctx.device;
 
     // 1. Render the mask group into a fresh layer. Luminosity masks start from
     //    the /BC backdrop luminosity (opaque); alpha masks from transparent.
-    let mask_layer = layers.len();
-    layers.push(blend::RenderLayer::new(device, w, h, sc));
+    let mask_layer = pool.acquire(device);
     let clear = match mask.kind {
         SoftMaskKind::Luminosity => {
             let l = mask.backdrop_luma.clamp(0.0, 1.0) as f64;
@@ -835,7 +850,7 @@ fn apply_soft_mask(
     {
         let mut pass = begin_layer_pass(
             encoder,
-            &layers[mask_layer],
+            pool.get(mask_layer),
             wgpu::LoadOp::Clear(clear),
             wgpu::LoadOp::Clear(0),
         );
@@ -843,8 +858,7 @@ fn apply_soft_mask(
     }
 
     // 2. Pre-multiply the group layer by the mask coverage into a fresh layer.
-    let masked = layers.len();
-    layers.push(blend::RenderLayer::new(device, w, h, sc));
+    let masked = pool.acquire(device);
     let kind_id: u32 = match mask.kind {
         SoftMaskKind::Luminosity => 1,
         SoftMaskKind::Alpha => 2,
@@ -860,11 +874,13 @@ fn apply_soft_mask(
         entries: &[
             wgpu::BindGroupEntry {
                 binding: 0,
-                resource: wgpu::BindingResource::TextureView(layers[group].sampleable_view()),
+                resource: wgpu::BindingResource::TextureView(pool.get(group).sampleable_view()),
             },
             wgpu::BindGroupEntry {
                 binding: 1,
-                resource: wgpu::BindingResource::TextureView(layers[mask_layer].sampleable_view()),
+                resource: wgpu::BindingResource::TextureView(
+                    pool.get(mask_layer).sampleable_view(),
+                ),
             },
             wgpu::BindGroupEntry {
                 binding: 2,
@@ -875,7 +891,7 @@ fn apply_soft_mask(
     {
         let mut pass = begin_layer_pass(
             encoder,
-            &layers[masked],
+            pool.get(masked),
             wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
             wgpu::LoadOp::Clear(0),
         );
@@ -895,6 +911,11 @@ fn apply_soft_mask(
     }
     keep_bgs.push(mask_bg);
     keep_bufs.push(mask_u);
+
+    // The original group and the coverage layer have been consumed into `masked`
+    // (their reads are recorded); recycle them for reuse.
+    pool.recycle(group);
+    pool.recycle(mask_layer);
     masked
 }
 

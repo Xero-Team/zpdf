@@ -83,6 +83,35 @@ fn type3_pdf() -> Vec<u8> {
     ])
 }
 
+/// A PDF that paints `count` transparency-group Form XObjects in sequence, each
+/// composited with a blend mode. Exercises the wgpu layered path + its recycling
+/// LayerPool (many groups must not allocate one full-page layer apiece).
+fn blend_groups_pdf(count: usize) -> Vec<u8> {
+    let mut content = b"0.9 0.9 0.2 rg 0 0 200 200 re f\n".to_vec();
+    for i in 0..count {
+        // Stagger each group's position so they overlap differently.
+        let x = 10 + (i % 8) * 20;
+        let y = 10 + (i % 6) * 25;
+        content.extend_from_slice(format!("q 1 0 0 1 {x} {y} cm /GS1 gs /Fm1 Do Q\n").as_bytes());
+    }
+    // Group form: two overlapping translucent rects.
+    let form = b"0 0 1 rg 0 0 60 60 re f\n0.2 0.8 0.2 rg 20 20 50 50 re f";
+    assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R \
+          /Resources << /XObject << /Fm1 5 0 R >> /ExtGState << /GS1 6 0 R >> >> >>"
+            .to_vec(),
+        stream_obj("", &content),
+        stream_obj(
+            "/Type /XObject /Subtype /Form /BBox [0 0 60 60] \
+             /Group << /Type /Group /S /Transparency /I true >>",
+            form,
+        ),
+        b"<< /Type /ExtGState /BM /Multiply /ca 0.8 /CA 0.8 >>".to_vec(),
+    ])
+}
+
 fn corpus() -> Vec<(&'static str, Vec<u8>)> {
     let img_a = [255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 0];
     let img_b = [0, 255, 255, 255, 0, 255, 255, 255, 255, 0, 0, 0];
@@ -136,6 +165,10 @@ fn corpus() -> Vec<(&'static str, Vec<u8>)> {
         ("image_rgb", simple_pdf(&image_rgb)),
         ("image_under_clip", simple_pdf(&img_clip)),
         ("text_type3", type3_pdf()),
+        // One blend group, then many — the latter forces the LayerPool to recycle
+        // rather than allocate a layer per group.
+        ("blend_group_single", blend_groups_pdf(1)),
+        ("blend_group_many", blend_groups_pdf(40)),
     ]
 }
 

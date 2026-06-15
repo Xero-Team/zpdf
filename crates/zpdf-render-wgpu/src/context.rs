@@ -4,6 +4,8 @@
 //! device requests are async; we block on them with `pollster` so the public API
 //! stays synchronous and matches the CPU backend's ergonomics.
 
+use std::sync::{Arc, Mutex};
+
 use crate::pipelines::Pipelines;
 use crate::WgpuRenderError;
 
@@ -29,6 +31,10 @@ pub struct GpuContext {
     pub max_texture_dim: u32,
     /// Built-once render pipelines.
     pub pipelines: Pipelines,
+    /// Most recent device-level error (e.g. out-of-memory on a too-large page).
+    /// Set by the uncaptured-error handler instead of wgpu's default panic, so a
+    /// render can fail with a [`WgpuRenderError`] rather than abort the process.
+    device_error: Arc<Mutex<Option<String>>>,
 }
 
 impl GpuContext {
@@ -128,6 +134,21 @@ impl GpuContext {
 
         let pipelines = Pipelines::build(&device, COLOR_FORMAT, sample_count);
 
+        // Capture device errors (notably OOM on oversized pages) instead of
+        // letting wgpu's default handler panic the whole process.
+        let device_error = Arc::new(Mutex::new(None));
+        {
+            let slot = device_error.clone();
+            device.on_uncaptured_error(Arc::new(move |e: wgpu::Error| {
+                let msg = e.to_string();
+                tracing::error!("wgpu device error: {msg}");
+                let mut g = slot.lock().unwrap();
+                if g.is_none() {
+                    *g = Some(msg);
+                }
+            }));
+        }
+
         Ok(Self {
             instance,
             adapter,
@@ -137,6 +158,17 @@ impl GpuContext {
             sample_count,
             max_texture_dim,
             pipelines,
+            device_error,
         })
+    }
+
+    /// Clear any recorded device error (call before starting a page render).
+    pub fn clear_error(&self) {
+        *self.device_error.lock().unwrap() = None;
+    }
+
+    /// Take the most recent recorded device error, if any.
+    pub fn take_error(&self) -> Option<String> {
+        self.device_error.lock().unwrap().take()
     }
 }

@@ -23,6 +23,11 @@ use zpdf_render_wgpu::{GpuContext, WgpuRenderer};
 /// Resolution each page tile is rasterized at. Zoom scales the blit; this is the
 /// crispness ceiling.
 const RENDER_DPI: f32 = 150.0;
+/// Cap on a tile's longest side, in pixels. Large-format pages (posters, plans)
+/// at `RENDER_DPI` can reach 7000+ px, where a single GPU tile (×MSAA ×layers) is
+/// well over a gigabyte and OOMs the device. Above this we lower the per-page
+/// render scale; the blit upscales the smaller tile, which is invisible on screen.
+const MAX_TILE_DIM: f32 = 4096.0;
 /// Vertical gap between pages, in tile pixels.
 const PAGE_GAP: f32 = 14.0;
 /// Max cached page tiles (off-screen ones beyond this are evicted LRU).
@@ -66,7 +71,8 @@ fn render_page(doc: &PdfDocument, idx: usize, slot: &mut Option<GpuContext>) -> 
     let content = doc.page_content_bytes(&page).ok()?;
     let mut images = ImageCache::new();
     let mut colors = IccCache::new();
-    let dl = ContentInterpreter::new(page.effective_box())
+    let eb = page.effective_box();
+    let dl = ContentInterpreter::new(eb)
         .with_page_rotation(page.rotate)
         .with_fonts(&mut fonts)
         .with_document(doc.file(), &page.resources)
@@ -74,11 +80,20 @@ fn render_page(doc: &PdfDocument, idx: usize, slot: &mut Option<GpuContext>) -> 
         .with_colors(&mut colors)
         .interpret(&content);
 
+    // Clamp the render scale so a huge media box doesn't allocate a multi-GB GPU
+    // tile. The blit upscales the result to the page's layout box regardless.
+    let longest = (eb.width().max(eb.height())) as f32;
+    let scale = if longest * (RENDER_DPI / 72.0) > MAX_TILE_DIM {
+        (MAX_TILE_DIM / longest).max(f32::MIN_POSITIVE)
+    } else {
+        RENDER_DPI / 72.0
+    };
+
     let mut renderer = WgpuRenderer::new().with_fonts(&fonts).with_images(&images);
     if let Some(ctx) = slot.take() {
         renderer = renderer.with_context(ctx);
     }
-    let result = renderer.render_display_list(&dl, RENDER_DPI / 72.0);
+    let result = renderer.render_display_list(&dl, scale);
     *slot = renderer.take_context(); // reclaim the context for the next page
     let tex = result.ok()?;
     Some(PageImage {

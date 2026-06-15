@@ -27,6 +27,68 @@ pub fn blend_index(m: BlendMode) -> u32 {
     }
 }
 
+/// Pool of full-page offscreen [`RenderLayer`]s with a free-list.
+///
+/// A page with many transparency groups would otherwise allocate one full-page
+/// layer (MSAA color + resolve + stencil — hundreds of MB on a large media box)
+/// per group and never free them, OOM-ing the device. The pool reuses a small
+/// working set instead: once a group has been composited onto its parent, both
+/// the group layer and the now-superseded parent are recycled. Recycled textures
+/// stay alive in the pool until it is dropped (after `queue.submit`) and are
+/// cleared before reuse, so reusing a just-read layer as a fresh render target
+/// within the same command encoder is safe — wgpu inserts the usage barrier.
+pub struct LayerPool {
+    layers: Vec<RenderLayer>,
+    free: Vec<usize>,
+    width: u32,
+    height: u32,
+    sample_count: u32,
+}
+
+impl LayerPool {
+    pub fn new(width: u32, height: u32, sample_count: u32) -> Self {
+        Self {
+            layers: Vec::new(),
+            free: Vec::new(),
+            width,
+            height,
+            sample_count,
+        }
+    }
+
+    /// Get a layer to render into — a recycled one if available, else a fresh
+    /// allocation. The caller must clear/init it before use.
+    pub fn acquire(&mut self, device: &wgpu::Device) -> usize {
+        if let Some(i) = self.free.pop() {
+            return i;
+        }
+        self.layers.push(RenderLayer::new(
+            device,
+            self.width,
+            self.height,
+            self.sample_count,
+        ));
+        self.layers.len() - 1
+    }
+
+    /// Return a layer to the free-list for reuse. Idempotent (ignores double-free).
+    pub fn recycle(&mut self, idx: usize) {
+        if !self.free.contains(&idx) {
+            self.free.push(idx);
+        }
+    }
+
+    pub fn get(&self, idx: usize) -> &RenderLayer {
+        &self.layers[idx]
+    }
+
+    /// Number of distinct textures actually allocated (peak working set).
+    #[allow(dead_code)]
+    pub fn allocated(&self) -> usize {
+        self.layers.len()
+    }
+}
+
 /// An offscreen render target for a transparency group (or the page base / a
 /// composite scratch). MSAA color is stored (so multiple passes can Load it across
 /// nested-group boundaries) and resolved into a sampleable single-sample texture.
