@@ -26,6 +26,16 @@ pub struct ContentInterpreter<'a> {
     resources: Option<&'a ResourceDict>,
     image_cache: Option<&'a mut ImageCache>,
     icc_cache: Option<&'a mut zpdf_color::IccCache>,
+    /// Maps an image XObject's object id to its already-decoded entry in
+    /// `image_cache`, so an image drawn many times (e.g. a map symbol repeated
+    /// thousands of times) is decoded — colour-converted, soft-mask-folded — only
+    /// once instead of per `Do`. Keyed only for stateless images; `/ImageMask`
+    /// stencils bake in the current fill colour and are never cached here.
+    image_obj_cache: HashMap<ObjectId, zpdf_display_list::ImageId>,
+    /// Built shadings (256-entry LUT + parsed functions) cached by object id, so a
+    /// shading painted many times (`sh` markers repeated across a map) rebuilds its
+    /// LUT only once. Reuse overwrites `to_page` with the current CTM.
+    shading_cache: HashMap<ObjectId, crate::shading::ShadingDef>,
     form_font_overrides: Vec<HashMap<String, String>>,
     /// Owned /Resources of the form XObjects currently being interpreted,
     /// innermost last. Lookups search these before the page resources.
@@ -235,6 +245,10 @@ struct GraphicsState {
     rise: f32,
     render_mode: u8,
     clip_depth: u32,
+    /// Page-space bounding box of the intersection of all active clip paths
+    /// (`None` = unclipped / full page). Used to bound work that would otherwise
+    /// cover the whole page — notably `sh` shading rasterization.
+    clip_bounds: Option<Rect>,
     fill_cs: ActiveColorSpace,
     stroke_cs: ActiveColorSpace,
     fill_pattern: Option<PatternPaint>,
@@ -269,6 +283,7 @@ impl Default for GraphicsState {
             rise: 0.0,
             render_mode: 0,
             clip_depth: 0,
+            clip_bounds: None,
             fill_cs: ActiveColorSpace::DeviceGray,
             stroke_cs: ActiveColorSpace::DeviceGray,
             fill_pattern: None,
@@ -297,6 +312,8 @@ impl<'a> ContentInterpreter<'a> {
             resources: None,
             image_cache: None,
             icc_cache: None,
+            image_obj_cache: HashMap::new(),
+            shading_cache: HashMap::new(),
             form_font_overrides: Vec::new(),
             form_resources: Vec::new(),
             form_depth: 0,
@@ -714,6 +731,7 @@ impl<'a> ContentInterpreter<'a> {
             // -- Clipping --
             "W" => {
                 let path = self.transform_path_to_page_space(&self.current_path.clone());
+                self.intersect_clip_bounds(Self::path_bounds(&path));
                 self.display_list.push(RenderCommand::PushClip {
                     path,
                     rule: FillRule::NonZero,
@@ -722,6 +740,7 @@ impl<'a> ContentInterpreter<'a> {
             }
             "W*" => {
                 let path = self.transform_path_to_page_space(&self.current_path.clone());
+                self.intersect_clip_bounds(Self::path_bounds(&path));
                 self.display_list.push(RenderCommand::PushClip {
                     path,
                     rule: FillRule::EvenOdd,
@@ -1526,26 +1545,82 @@ impl<'a> ContentInterpreter<'a> {
         })
     }
 
-    /// `sh` operator: paint the shading across the page area (the active clip
-    /// crops it), rasterized through the ordinary image pipeline.
-    fn paint_shading_op(&mut self, name: &str) {
-        let sh_obj = match self
-            .lookup_res(|r| r.shadings_inline.get(name).cloned())
-            .or_else(|| {
-                self.lookup_res(|r| r.shadings.get(name).copied())
-                    .map(PdfObject::Ref)
-            }) {
-            Some(o) => o,
-            None => {
-                tracing::debug!("shading {name} not found in resources");
-                return;
-            }
-        };
-        // For `sh`, shading coordinates live in the current user space.
-        let Some(def) = self.build_shading(&sh_obj, self.current.ctm) else {
+    /// Intersect the running clip-bounds with a new clip path's page-space bbox.
+    fn intersect_clip_bounds(&mut self, new: Option<Rect>) {
+        let Some(n) = new.map(|r| r.normalize()) else {
             return;
         };
-        self.emit_shading_image(&def, self.display_list.page_rect);
+        self.current.clip_bounds = Some(match self.current.clip_bounds {
+            Some(c) => {
+                let c = c.normalize();
+                Rect::new(
+                    c.x0.max(n.x0),
+                    c.y0.max(n.y0),
+                    c.x1.min(n.x1),
+                    c.y1.min(n.y1),
+                )
+            }
+            None => n,
+        });
+    }
+
+    /// Page-space region a full-page paint (`sh`) actually needs to cover: the
+    /// active clip bounds intersected with the page rect, or the whole page when
+    /// unclipped. May be empty (caller skips).
+    fn shading_region(&self) -> Rect {
+        let page = self.display_list.page_rect.normalize();
+        match self.current.clip_bounds {
+            Some(c) => {
+                let c = c.normalize();
+                Rect::new(
+                    c.x0.max(page.x0),
+                    c.y0.max(page.y0),
+                    c.x1.min(page.x1),
+                    c.y1.min(page.y1),
+                )
+            }
+            None => page,
+        }
+    }
+
+    /// `sh` operator: paint the shading across the current clip region (not the
+    /// whole page — that rasterizes a full-page gradient per call, which a map
+    /// with hundreds of small `sh` markers makes pathologically slow).
+    fn paint_shading_op(&mut self, name: &str) {
+        let (sh_obj, cache_id) = match self.lookup_res(|r| r.shadings_inline.get(name).cloned()) {
+            Some(o) => (o, None),
+            None => match self.lookup_res(|r| r.shadings.get(name).copied()) {
+                Some(id) => (PdfObject::Ref(id), Some(id)),
+                None => {
+                    tracing::debug!("shading {name} not found in resources");
+                    return;
+                }
+            },
+        };
+
+        // Only rasterize what the clip actually exposes.
+        let region = self.shading_region();
+        if region.width() <= 0.0 || region.height() <= 0.0 {
+            return;
+        }
+
+        // For `sh`, shading coordinates live in the current user space.
+        let def = match cache_id.and_then(|id| self.shading_cache.get(&id).cloned()) {
+            Some(mut d) => {
+                d.to_page = self.current.ctm;
+                d
+            }
+            None => {
+                let Some(d) = self.build_shading(&sh_obj, self.current.ctm) else {
+                    return;
+                };
+                if let Some(id) = cache_id {
+                    self.shading_cache.insert(id, d.clone());
+                }
+                d
+            }
+        };
+        self.emit_shading_image(&def, region);
     }
 
     /// Rasterize `def` over the page-space `region` and emit it as an image.
@@ -2141,6 +2216,18 @@ impl<'a> ContentInterpreter<'a> {
     }
 
     fn do_image_xobject(&mut self, obj_id: zpdf_core::ObjectId, stream: &zpdf_core::PdfStream) {
+        // Fast path: this image object was already decoded — re-emit it under the
+        // current CTM/alpha without re-decoding (huge win for repeated symbols).
+        if let Some(&image_id) = self.image_obj_cache.get(&obj_id) {
+            let cmd = RenderCommand::DrawImage(ImageDraw {
+                image_id,
+                transform: self.current.ctm,
+                alpha: self.current.fill_alpha,
+            });
+            self.emit_painted(cmd);
+            return;
+        }
+
         let file = match self.file {
             Some(f) => f,
             None => return,
@@ -2193,7 +2280,22 @@ impl<'a> ContentInterpreter<'a> {
             fold_stencil_mask(&mut image, mask_ref, file);
         }
 
-        self.emit_draw_image(image);
+        // Insert once and remember the id so repeat draws skip the decode above.
+        // `/ImageMask` stencils bake in the fill colour, so they aren't cached.
+        let is_stencil = matches!(image_dict.get("ImageMask"), Some(PdfObject::Bool(true)));
+        let Some(cache) = self.image_cache.as_mut() else {
+            return;
+        };
+        let image_id = cache.insert(image);
+        if !is_stencil {
+            self.image_obj_cache.insert(obj_id, image_id);
+        }
+        let cmd = RenderCommand::DrawImage(ImageDraw {
+            image_id,
+            transform: self.current.ctm,
+            alpha: self.current.fill_alpha,
+        });
+        self.emit_painted(cmd);
     }
 
     fn do_inline_image(&mut self, dict: zpdf_core::PdfDict, data: Vec<u8>) {
@@ -2367,6 +2469,7 @@ impl<'a> ContentInterpreter<'a> {
                     bbox_path.rect(Rect::new(x0, y0, x1, y1));
                     let page_path = self.transform_path_to_page_space(&bbox_path);
                     bbox_bounds = Self::path_bounds(&page_path);
+                    self.intersect_clip_bounds(bbox_bounds);
                     self.display_list.push(RenderCommand::PushClip {
                         path: page_path,
                         rule: FillRule::NonZero,
