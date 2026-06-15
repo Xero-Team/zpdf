@@ -131,6 +131,8 @@ enum ClipFrame {
 const MAX_CLIP_PIXEL_WORK: u64 = 2_000_000_000;
 
 struct BlendEntry {
+    /// The parked parent raster (the group's backdrop), restored and composited
+    /// onto at `pop`. A 1×1 placeholder for a `passthrough` entry.
     pixmap: tiny_skia::Pixmap,
     blend_mode: BlendMode,
     /// Group constant alpha applied at composite time.
@@ -138,6 +140,16 @@ struct BlendEntry {
     /// Rasterized soft-mask coverage (one byte per pixel), multiplied into the
     /// group before compositing.
     mask: Option<Vec<u8>>,
+    /// Knockout group: each element composites against the group's initial
+    /// backdrop rather than the accumulation of preceding elements.
+    knockout: bool,
+    /// The group's initial backdrop (`b0`) for per-element knockout compositing
+    /// (`Some` only for knockout groups).
+    backdrop: Option<tiny_skia::Pixmap>,
+    /// A non-isolated group with no group-level effect (Normal blend, alpha 1,
+    /// no mask, no knockout): its elements draw straight onto the canvas, so no
+    /// buffer is parked and `pop` is a no-op.
+    passthrough: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -300,7 +312,21 @@ impl<'a> CpuRenderer<'a> {
             Paint::Solid(c) => Self::color_to_paint(c, alpha),
             _ => return,
         };
-        let stroke = tiny_skia::Stroke {
+        let stroke = self.build_skia_stroke(style);
+        if let Some(ref mut pixmap) = self.pixmap {
+            pixmap.stroke_path(
+                &skia_path,
+                &paint,
+                &stroke,
+                tiny_skia::Transform::identity(),
+                self.current_clip.as_ref(),
+            );
+        }
+    }
+
+    /// Device-space tiny-skia stroke parameters for `style`.
+    fn build_skia_stroke(&self, style: &StrokeStyle) -> tiny_skia::Stroke {
+        tiny_skia::Stroke {
             // Hairline boost: never let a stroke fall below one device pixel
             // (matches pdfium; keeps thin diagram strokes legible at low DPI,
             // and renders PDF zero-width strokes as 1px hairlines).
@@ -317,15 +343,6 @@ impl<'a> CpuRenderer<'a> {
             },
             miter_limit: style.miter_limit,
             dash: self.build_stroke_dash(style),
-        };
-        if let Some(ref mut pixmap) = self.pixmap {
-            pixmap.stroke_path(
-                &skia_path,
-                &paint,
-                &stroke,
-                tiny_skia::Transform::identity(),
-                self.current_clip.as_ref(),
-            );
         }
     }
 
@@ -448,9 +465,109 @@ impl<'a> CpuRenderer<'a> {
         }
     }
 
-    fn push_blend_group(&mut self, blend_mode: BlendMode, alpha: f32, mask: Option<&SoftMask>) {
+    /// Intersect the clip with a stroked path's outline. tiny-skia masks cannot
+    /// stroke directly, so the stroke is rasterized into a scratch pixmap and
+    /// its alpha lifted into a coverage mask. Used to clip pattern/shading
+    /// paints to a stroke.
+    fn push_clip_stroke(&mut self, path: &Path, style: &StrokeStyle) {
+        let Some(pixmap) = self.pixmap.as_ref() else {
+            return;
+        };
+        let (pw, ph) = (pixmap.width(), pixmap.height());
+
+        if self.clip_pixel_spent >= MAX_CLIP_PIXEL_WORK {
+            self.clip_stack.push(ClipFrame::Skipped);
+            return;
+        }
+        let Some(skia_path) = self.build_skia_path(path) else {
+            self.clip_stack.push(ClipFrame::Skipped);
+            return;
+        };
+        let Some(mut scratch) = tiny_skia::Pixmap::new(pw, ph) else {
+            self.clip_stack.push(ClipFrame::Skipped);
+            return;
+        };
+        self.clip_pixel_spent += pw as u64 * ph as u64;
+
+        let mut paint = tiny_skia::Paint::default();
+        paint.set_color(tiny_skia::Color::WHITE);
+        paint.anti_alias = true;
+        let stroke = self.build_skia_stroke(style);
+        scratch.stroke_path(
+            &skia_path,
+            &paint,
+            &stroke,
+            tiny_skia::Transform::identity(),
+            None,
+        );
+        let mut mask = tiny_skia::Mask::from_pixmap(scratch.as_ref(), tiny_skia::MaskType::Alpha);
+
+        // Intersect with the active clip over the stroke's device bbox (the
+        // centerline bounds grown by the stroke width). Outside that box the
+        // stroke mask is already 0, so the intersection is 0 there too.
+        if let Some(ref current) = self.current_clip {
+            let b = skia_path.bounds();
+            let grow = stroke.width.max(1.0);
+            let w = pw as usize;
+            let h = ph as usize;
+            let x0 = ((b.left() - grow).floor().max(0.0) as usize).min(w);
+            let x1 = ((b.right() + grow).ceil().max(0.0) as usize).min(w);
+            let y0 = ((b.top() - grow).floor().max(0.0) as usize).min(h);
+            let y1 = ((b.bottom() + grow).ceil().max(0.0) as usize).min(h);
+            let current_data = current.data();
+            let mask_data = mask.data_mut();
+            for y in y0..y1 {
+                let row = y * w;
+                for x in x0..x1 {
+                    let i = row + x;
+                    mask_data[i] = ((mask_data[i] as u16 * current_data[i] as u16) / 255) as u8;
+                }
+            }
+        }
+
+        let frame = match self.current_clip.take() {
+            Some(old) => ClipFrame::Mask(old),
+            None => ClipFrame::Empty,
+        };
+        self.clip_stack.push(frame);
+        self.current_clip = Some(mask);
+    }
+
+    fn push_blend_group(
+        &mut self,
+        blend_mode: BlendMode,
+        isolated: bool,
+        knockout: bool,
+        alpha: f32,
+        mask: Option<&SoftMask>,
+    ) {
         // Rasterize the soft mask before parking the base pixmap (needs dims).
         let mask_plane = mask.and_then(|m| self.soft_mask_plane(m));
+
+        // A non-isolated group with no group-as-a-unit operation (Normal blend,
+        // full alpha, no soft mask, not knockout) is exactly equivalent to
+        // drawing its elements straight onto the backdrop — and that is the only
+        // way element-level blend modes inside it correctly see the backdrop.
+        // Park nothing; a 1×1 sentinel keeps push/pop balanced.
+        let passthrough = !isolated
+            && !knockout
+            && blend_mode == BlendMode::Normal
+            && alpha >= 1.0
+            && mask_plane.is_none();
+        if passthrough {
+            if let Some(sentinel) = tiny_skia::Pixmap::new(1, 1) {
+                self.blend_stack.push(BlendEntry {
+                    pixmap: sentinel,
+                    blend_mode,
+                    alpha,
+                    mask: None,
+                    knockout: false,
+                    backdrop: None,
+                    passthrough: true,
+                });
+            }
+            return;
+        }
 
         let pixmap = match self.pixmap.take() {
             Some(p) => p,
@@ -459,14 +576,27 @@ impl<'a> CpuRenderer<'a> {
         let w = pixmap.width();
         let h = pixmap.height();
 
+        // The group renders into its own transparent buffer (isolated). A
+        // non-isolated group that reached this point carries a group-level
+        // effect (alpha/mask/blend) and is approximated as isolated — element
+        // blends against the backdrop are the rare loss. `None` on allocation
+        // failure degrades to a no-op group, which `pop_blend_group` handles.
+        let group = tiny_skia::Pixmap::new(w, h);
+        // Per-element knockout composites against the (transparent) initial
+        // backdrop preserved here.
+        let backdrop = if knockout { group.clone() } else { None };
+
         self.blend_stack.push(BlendEntry {
             pixmap,
             blend_mode,
             alpha,
             mask: mask_plane,
+            knockout,
+            backdrop,
+            passthrough: false,
         });
 
-        self.pixmap = tiny_skia::Pixmap::new(w, h);
+        self.pixmap = group;
     }
 
     fn pop_blend_group(&mut self) {
@@ -474,6 +604,11 @@ impl<'a> CpuRenderer<'a> {
             Some(e) => e,
             None => return,
         };
+
+        // Passthrough group: elements already drew onto the live canvas.
+        if entry.passthrough {
+            return;
+        }
 
         let mut group_pixmap = match self.pixmap.take() {
             Some(p) => p,
@@ -518,6 +653,101 @@ impl<'a> CpuRenderer<'a> {
         );
 
         self.pixmap = Some(base);
+    }
+
+    /// Dispatch the four painting commands to their renderers (shared by the
+    /// normal path and the knockout path).
+    fn render_paint_cmd(&mut self, cmd: &RenderCommand) {
+        match cmd {
+            RenderCommand::FillPath {
+                path,
+                rule,
+                paint,
+                alpha,
+            } => self.render_fill(path, rule, paint, *alpha),
+            RenderCommand::StrokePath {
+                path,
+                style,
+                paint,
+                alpha,
+            } => self.render_stroke(path, style, paint, *alpha),
+            RenderCommand::DrawGlyphRun(run) => self.render_glyph_run(run),
+            RenderCommand::DrawImage(draw) => self.render_image(draw),
+            _ => {}
+        }
+    }
+
+    /// True while the innermost open transparency group is a knockout group.
+    fn in_knockout(&self) -> bool {
+        self.blend_stack.last().map(|e| e.knockout).unwrap_or(false)
+    }
+
+    /// Render a painting command at full opacity to capture its *shape* (the
+    /// geometric/anti-aliased coverage), independent of its opacity.
+    fn render_shape_cmd(&mut self, cmd: &RenderCommand) {
+        match cmd {
+            RenderCommand::FillPath {
+                path, rule, paint, ..
+            } => self.render_fill(path, rule, paint, 1.0),
+            RenderCommand::StrokePath {
+                path, style, paint, ..
+            } => self.render_stroke(path, style, paint, 1.0),
+            RenderCommand::DrawGlyphRun(run) => {
+                let mut r = run.clone();
+                r.alpha = 1.0;
+                self.render_glyph_run(&r);
+            }
+            RenderCommand::DrawImage(draw) => {
+                let mut d = draw.clone();
+                d.alpha = 1.0;
+                self.render_image(&d);
+            }
+            _ => {}
+        }
+    }
+
+    /// Paint one element inside a knockout group: render it alone, composite it
+    /// over the group's initial backdrop, and replace the group buffer in
+    /// proportion to the element's *shape* (so it knocks out preceding elements
+    /// rather than accumulating over them). The shape — captured by a full-
+    /// opacity pass — is what PDF 11.4.9 uses, so a semi-transparent solid fill
+    /// still fully knocks out (it shows the backdrop through itself, not the
+    /// elements beneath).
+    fn knockout_paint(&mut self, cmd: &RenderCommand) {
+        let (w, h) = match self.pixmap.as_ref() {
+            Some(p) => (p.width(), p.height()),
+            None => return,
+        };
+
+        // Pass 1: the element as painted (real colour and opacity).
+        let group = self.pixmap.take();
+        self.pixmap = tiny_skia::Pixmap::new(w, h);
+        if self.pixmap.is_none() {
+            self.pixmap = group;
+            self.render_paint_cmd(cmd); // OOM: fall back to accumulation
+            return;
+        }
+        self.render_paint_cmd(cmd);
+        let elem = self.pixmap.take();
+
+        // Pass 2: the element at full opacity → its shape (alpha = coverage).
+        self.pixmap = tiny_skia::Pixmap::new(w, h);
+        if self.pixmap.is_none() {
+            self.pixmap = group;
+            return;
+        }
+        self.render_shape_cmd(cmd);
+        let shape = self.pixmap.take();
+
+        self.pixmap = group;
+        let (elem, shape) = match (elem, shape) {
+            (Some(e), Some(s)) => (e, s),
+            _ => return,
+        };
+        if let (Some(g), Some(entry)) = (self.pixmap.as_mut(), self.blend_stack.last()) {
+            let b0 = entry.backdrop.as_ref().map(|p| p.data());
+            knockout_merge(g.data_mut(), elem.data(), shape.data(), b0);
+        }
     }
 
     /// Coverage plane for `mask`, honoring its page-space offset. The base
@@ -1017,6 +1247,46 @@ impl<'a> Default for CpuRenderer<'a> {
     }
 }
 
+/// Knockout merge: `group = lerp(group, elem OVER b0, shape)`, in place,
+/// premultiplied RGBA8. `shape` carries the element's geometric coverage in its
+/// alpha channel (a full-opacity render of the same element), while `elem`
+/// carries its real premultiplied colour/opacity. `b0` is the group's initial
+/// backdrop (`None` == transparent, where `elem OVER transparent == elem`).
+/// Where shape is full, the element fully knocks out preceding elements.
+fn knockout_merge(group: &mut [u8], elem: &[u8], shape: &[u8], b0: Option<&[u8]>) {
+    let n = group.len() / 4;
+    for i in 0..n {
+        let o = i * 4;
+        let f = shape[o + 3]; // geometric coverage of this element
+        if f == 0 {
+            continue;
+        }
+        let ea = elem[o + 3];
+        let inv_e = (255 - ea) as u32; // 1 − elem.alpha
+                                       // X = elem OVER b0 (premultiplied), using the element's real opacity.
+        let x = match b0 {
+            Some(b) => [
+                elem[o] as u32 + (inv_e * b[o] as u32 + 127) / 255,
+                elem[o + 1] as u32 + (inv_e * b[o + 1] as u32 + 127) / 255,
+                elem[o + 2] as u32 + (inv_e * b[o + 2] as u32 + 127) / 255,
+                ea as u32 + (inv_e * b[o + 3] as u32 + 127) / 255,
+            ],
+            None => [
+                elem[o] as u32,
+                elem[o + 1] as u32,
+                elem[o + 2] as u32,
+                ea as u32,
+            ],
+        };
+        // group = group·(1 − shape) + X·shape.
+        let inv_f = (255 - f) as u32;
+        for c in 0..4 {
+            let v = (group[o + c] as u32 * inv_f + x[c] * f as u32 + 127) / 255;
+            group[o + c] = v.min(255) as u8;
+        }
+    }
+}
+
 /// Box-filter (area-average) downscale of a tight RGBA8 buffer. Each target
 /// pixel averages its covering source block, so no source pixel is dropped —
 /// unlike point/bilinear sampling at strong minification. Channels are averaged
@@ -1077,9 +1347,11 @@ impl<'a> RenderBackend for CpuRenderer<'a> {
         self.rect_x0 = info.page_rect.x0 as f32;
         self.rect_y0 = info.page_rect.y0 as f32;
         self.rect_y1 = info.page_rect.y1 as f32;
-        // Fresh clip state + budget for each page (a renderer may be reused).
+        // Fresh clip + blend state + budget for each page (a renderer may be
+        // reused). An unbalanced group from a prior page must not leak through.
         self.clip_stack.clear();
         self.current_clip = None;
+        self.blend_stack.clear();
         self.clip_pixel_spent = 0;
         self.over_budget = false;
         self.deadline = self.render_budget.map(|d| std::time::Instant::now() + d);
@@ -1140,42 +1412,48 @@ impl<'a> RenderBackend for CpuRenderer<'a> {
                 return Ok(());
             }
         }
+
+        // Inside a knockout group each painting element composites against the
+        // group's initial backdrop rather than the accumulation of preceding
+        // elements: route paints through the per-element knockout path.
+        if self.in_knockout()
+            && matches!(
+                cmd,
+                RenderCommand::FillPath { .. }
+                    | RenderCommand::StrokePath { .. }
+                    | RenderCommand::DrawGlyphRun(_)
+                    | RenderCommand::DrawImage(_)
+            )
+        {
+            self.knockout_paint(cmd);
+            return Ok(());
+        }
+
         match cmd {
-            RenderCommand::FillPath {
-                path,
-                rule,
-                paint,
-                alpha,
-            } => {
-                self.render_fill(path, rule, paint, *alpha);
-            }
-            RenderCommand::StrokePath {
-                path,
-                style,
-                paint,
-                alpha,
-            } => {
-                self.render_stroke(path, style, paint, *alpha);
-            }
-            RenderCommand::DrawGlyphRun(glyph_run) => {
-                self.render_glyph_run(glyph_run);
-            }
-            RenderCommand::DrawImage(image_draw) => {
-                self.render_image(image_draw);
+            RenderCommand::FillPath { .. }
+            | RenderCommand::StrokePath { .. }
+            | RenderCommand::DrawGlyphRun(_)
+            | RenderCommand::DrawImage(_) => {
+                self.render_paint_cmd(cmd);
             }
             RenderCommand::PushClip { path, rule } => {
                 self.push_clip(path, rule);
+            }
+            RenderCommand::PushClipStroke { path, style } => {
+                self.push_clip_stroke(path, style);
             }
             RenderCommand::PopClip => {
                 self.pop_clip();
             }
             RenderCommand::PushBlendGroup {
                 blend_mode,
+                isolated,
+                knockout,
                 alpha,
                 mask,
                 ..
             } => {
-                self.push_blend_group(*blend_mode, *alpha, mask.as_ref());
+                self.push_blend_group(*blend_mode, *isolated, *knockout, *alpha, mask.as_ref());
             }
             RenderCommand::PopBlendGroup => {
                 self.pop_blend_group();

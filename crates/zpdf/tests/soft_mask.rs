@@ -147,3 +147,83 @@ fn transparency_group_composites_with_group_alpha() {
     // Outside: untouched white.
     assert_near(px(&page, 180.0, 180.0), [255, 255, 255], 6, "background");
 }
+
+/// Knockout group (/K true): two overlapping 50%-alpha black squares. Each
+/// element composites against the group's (transparent) initial backdrop, so
+/// the overlap shows a single 50% black (≈127 gray), NOT the stacked 75%-black
+/// (≈64) a non-knockout group would accumulate.
+#[test]
+fn knockout_group_elements_do_not_accumulate() {
+    // Inside the group, GS1 sets fill alpha 0.5 for both squares.
+    let form: &[u8] = b"/GS1 gs 0 0 0 rg 20 20 100 100 re f 60 60 100 100 re f";
+    let content: &[u8] = b"/Fm0 Do";
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R \
+          /Resources << /XObject << /Fm0 5 0 R >> >> >>"
+            .to_vec(),
+        stream_obj("", content),
+        stream_obj(
+            "/Type /XObject /Subtype /Form /BBox [0 0 200 200] \
+             /Group << /S /Transparency /CS /DeviceRGB /I true /K true >> \
+             /Resources << /ExtGState << /GS1 6 0 R >> >>",
+            form,
+        ),
+        b"<< /Type /ExtGState /ca 0.5 >>".to_vec(),
+    ]);
+    let page = render(pdf);
+
+    // Square 1 only (40,40): 50% black over white ≈ 127.
+    assert_near(px(&page, 40.0, 40.0), [127, 127, 127], 16, "square 1 only");
+    // Square 2 only (140,140): also ≈ 127.
+    assert_near(
+        px(&page, 140.0, 140.0),
+        [127, 127, 127],
+        16,
+        "square 2 only",
+    );
+    // Overlap (80,80): knockout → still ≈ 127, NOT ≈ 64 (stacked).
+    assert_near(
+        px(&page, 80.0, 80.0),
+        [127, 127, 127],
+        16,
+        "knockout overlap",
+    );
+    // Background untouched.
+    assert_near(px(&page, 185.0, 185.0), [255, 255, 255], 6, "background");
+}
+
+/// Non-isolated group (/I false): a Multiply fill inside the group sees the
+/// page backdrop through the group, so gray × red = dark red. An isolated group
+/// would multiply against transparent and show plain gray instead.
+#[test]
+fn non_isolated_group_blends_with_backdrop() {
+    // Group form: a Multiply (GS0) 50% gray fill over the same area.
+    let form: &[u8] = b"/GS0 gs 0.5 0.5 0.5 rg 40 40 120 120 re f";
+    // Page: red backdrop, then the non-isolated group on top.
+    let content: &[u8] = b"1 0 0 rg 40 40 120 120 re f /Fm0 Do";
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R \
+          /Resources << /XObject << /Fm0 5 0 R >> >> >>"
+            .to_vec(),
+        stream_obj("", content),
+        stream_obj(
+            "/Type /XObject /Subtype /Form /BBox [0 0 200 200] \
+             /Group << /S /Transparency /CS /DeviceRGB /I false >> \
+             /Resources << /ExtGState << /GS0 6 0 R >> >>",
+            form,
+        ),
+        b"<< /Type /ExtGState /BM /Multiply >>".to_vec(),
+    ]);
+    let page = render(pdf);
+
+    // Center: gray × red = dark red (R kept, G/B knocked to ~0).
+    let c = px(&page, 100.0, 100.0);
+    assert!(
+        c[0] > 100 && c[1] < 60 && c[2] < 60,
+        "non-isolated multiply should be dark red, got {c:?}"
+    );
+}

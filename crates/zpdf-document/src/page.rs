@@ -78,7 +78,10 @@ impl PdfPage {
             .media_box
             .filter(is_usable_box)
             .unwrap_or(DEFAULT_MEDIA_BOX);
-        let crop_box = inherited.crop_box.filter(is_usable_box).unwrap_or(media_box);
+        let crop_box = inherited
+            .crop_box
+            .filter(is_usable_box)
+            .unwrap_or(media_box);
         let rotate = inherited.rotate.unwrap_or(0);
         let resources = inherited.resources.unwrap_or_default();
 

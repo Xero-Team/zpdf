@@ -26,11 +26,17 @@ pub enum OutlineCommand {
     Close,
 }
 
-/// Per-glyph width from the PDF /W array.
+/// Per-glyph horizontal width from the PDF /W array, plus per-CID vertical
+/// metrics from /W2 (PDF 9.7.4.3) when present.
 #[derive(Debug, Clone)]
 pub struct CidWidths {
     widths: HashMap<u16, f64>,
     default_width: f64,
+    /// /W2 per-CID vertical metrics: cid → (w1y, vx, vy) in 1/1000 glyph-space
+    /// units. `w1y` is the vertical displacement (advance); `(vx, vy)` is the
+    /// position vector of the glyph's vertical-mode origin relative to its
+    /// horizontal-mode origin. Absent CIDs fall back to /DW2.
+    v_metrics: HashMap<u16, (f64, f64, f64)>,
 }
 
 impl CidWidths {
@@ -38,6 +44,7 @@ impl CidWidths {
         Self {
             widths: HashMap::new(),
             default_width,
+            v_metrics: HashMap::new(),
         }
     }
 
@@ -57,6 +64,16 @@ impl CidWidths {
     /// True when no per-glyph widths were set (every code falls to the default).
     pub fn is_empty(&self) -> bool {
         self.widths.is_empty()
+    }
+
+    /// Record a /W2 vertical metric for `cid`: (w1y, vx, vy).
+    pub fn set_v(&mut self, cid: u16, w1y: f64, vx: f64, vy: f64) {
+        self.v_metrics.insert(cid, (w1y, vx, vy));
+    }
+
+    /// Per-CID /W2 vertical metric (w1y, vx, vy), or `None` to fall back to /DW2.
+    pub fn get_v(&self, cid: u16) -> Option<(f64, f64, f64)> {
+        self.v_metrics.get(&cid).copied()
     }
 }
 
@@ -491,6 +508,12 @@ impl LoadedFont {
             }
         }
         self.cid_widths.get(glyph_id)
+    }
+
+    /// Per-CID vertical metric (w1y, vx, vy) from the font's /W2 array, or
+    /// `None` when this CID has no explicit entry (caller uses /DW2).
+    pub fn cid_v_metric(&self, cid: u16) -> Option<(f64, f64, f64)> {
+        self.cid_widths.get_v(cid)
     }
 
     /// The denominator for converting glyph_advance() to user-space units.

@@ -427,11 +427,13 @@ fn decode_jpx_image(
     // some malformed/unusual JPX codestreams; input pre-validation cannot cover
     // all of its internal invariants. Catch the unwind and surface a clean Err
     // so a single bad image is skipped rather than aborting the whole render.
-    let image = catch_unwind(AssertUnwindSafe(|| Image::new(data, &DecodeSettings::default())))
-        .map_err(|_| {
-            Error::StreamDecode("JPXDecode: decoder panicked parsing codestream header".into())
-        })?
-        .map_err(|e| Error::StreamDecode(format!("JPXDecode: {e}")))?;
+    let image = catch_unwind(AssertUnwindSafe(|| {
+        Image::new(data, &DecodeSettings::default())
+    }))
+    .map_err(|_| {
+        Error::StreamDecode("JPXDecode: decoder panicked parsing codestream header".into())
+    })?
+    .map_err(|e| Error::StreamDecode(format!("JPXDecode: {e}")))?;
 
     // Re-check the pixel limit against the *codestream* header dims, which
     // are authoritative and may differ from the dict's /Width × /Height.
@@ -451,26 +453,33 @@ fn decode_jpx_image(
         );
     }
 
-    // Colour channels per pixel (alpha excluded). Codestream-internal ICC
-    // profiles are not applied (channel-count fallback); a PDF-level
-    // /ColorSpace — including a compiled ICCBased transform or an Indexed
-    // palette — overrides below per spec 7.4.9.
+    // Colour channels per pixel (alpha excluded). An ICC profile embedded in
+    // the JP2 codestream is captured here and compiled below (unless a
+    // PDF-level /ColorSpace overrides it per spec 7.4.9).
+    let supported_ncolor = |n: u8| -> Result<usize> {
+        match n {
+            1 => Ok(1),
+            3 => Ok(3),
+            4 => Ok(4),
+            n => Err(Error::StreamDecode(format!(
+                "JPX image with unsupported channel count {n}"
+            ))),
+        }
+    };
+    let mut codestream_icc: Option<Vec<u8>> = None;
     let ncolor = match image.color_space() {
         JpxColorSpace::Gray => 1usize,
         JpxColorSpace::RGB => 3,
         JpxColorSpace::CMYK => 4,
-        JpxColorSpace::Icc { num_channels, .. } | JpxColorSpace::Unknown { num_channels } => {
-            match num_channels {
-                1 => 1,
-                3 => 3,
-                4 => 4,
-                n => {
-                    return Err(Error::StreamDecode(format!(
-                        "JPX image with unsupported channel count {n}"
-                    )))
-                }
-            }
+        JpxColorSpace::Icc {
+            profile,
+            num_channels,
+        } => {
+            let n = supported_ncolor(*num_channels)?;
+            codestream_icc = Some(profile.clone());
+            n
         }
+        JpxColorSpace::Unknown { num_channels } => supported_ncolor(*num_channels)?,
     };
     let has_alpha = image.has_alpha();
     let channels = ncolor + usize::from(has_alpha);
@@ -510,9 +519,42 @@ fn decode_jpx_image(
         }
     });
 
+    // With no overriding PDF /ColorSpace, honour an ICC profile embedded in the
+    // JP2 codestream by compiling it (media-relative colorimetric — the
+    // graphics-state rendering intent is not threaded into image decoding).
+    let codestream_cs = match (override_cs, &codestream_icc) {
+        (None, Some(profile)) => {
+            match zpdf_color::IccTransform::from_profile_bytes(
+                profile,
+                zpdf_color::RenderIntent::default(),
+            ) {
+                Ok(t) if t.components() == ncolor => Some(ResolvedColorSpace::Icc {
+                    ncomp: ncolor as u8,
+                    transform: std::sync::Arc::new(t),
+                }),
+                Ok(t) => {
+                    tracing::warn!(
+                        "JPX codestream ICC has {} components but {ncolor} colour channels; \
+                         using channel-count fallback",
+                        t.components()
+                    );
+                    None
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "JPX codestream ICC profile rejected: {e}; using channel-count fallback"
+                    );
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+    let effective_cs = override_cs.or(codestream_cs.as_ref());
+
     let mut rgba = Vec::with_capacity(pixel_count as usize * 4);
     for px in samples.chunks_exact(channels).take(pixel_count as usize) {
-        let [mut r, mut g, mut b] = match override_cs {
+        let [mut r, mut g, mut b] = match effective_cs {
             Some(cs) => {
                 let mut comps = [0u8; 4];
                 comps[..ncolor].copy_from_slice(&px[..ncolor]);
@@ -1382,7 +1424,11 @@ mod tests {
     // ---- ICCBased colour spaces (buffer-level CMS transforms) ----
 
     fn icc_cs(profile: &[u8]) -> ResolvedColorSpace {
-        let t = zpdf_color::IccTransform::from_profile_bytes(profile).unwrap();
+        let t = zpdf_color::IccTransform::from_profile_bytes(
+            profile,
+            zpdf_color::RenderIntent::default(),
+        )
+        .unwrap();
         ResolvedColorSpace::Icc {
             ncomp: t.components() as u8,
             transform: std::sync::Arc::new(t),

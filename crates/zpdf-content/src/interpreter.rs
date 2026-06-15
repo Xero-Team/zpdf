@@ -242,6 +242,9 @@ struct GraphicsState {
     blend_mode: BlendMode,
     /// ExtGState /SMask currently in effect (None = no soft mask).
     soft_mask: Option<SoftMask>,
+    /// Colour rendering intent (`ri` operator / ExtGState /RI). Applied when
+    /// compiling ICCBased profiles into transforms.
+    rendering_intent: zpdf_color::RenderIntent,
 }
 
 impl Default for GraphicsState {
@@ -272,6 +275,7 @@ impl Default for GraphicsState {
             stroke_pattern: None,
             blend_mode: BlendMode::Normal,
             soft_mask: None,
+            rendering_intent: zpdf_color::RenderIntent::RelativeColorimetric,
         }
     }
 }
@@ -611,8 +615,13 @@ impl<'a> ContentInterpreter<'a> {
                     }
                 }
             }
-            "i" | "ri" => {
-                // flatness, rendering intent - consume operands
+            "ri" => {
+                // Rendering intent: a name operand selecting the colour intent.
+                let name = self.pop_name();
+                self.current.rendering_intent = zpdf_color::RenderIntent::from_pdf_name(&name);
+            }
+            "i" => {
+                // Flatness tolerance — does not affect raster output.
             }
             "gs" => {
                 let name = self.pop_name();
@@ -1142,15 +1151,16 @@ impl<'a> ContentInterpreter<'a> {
     ) -> Option<std::sync::Arc<zpdf_color::IccTransform>> {
         self.icc_cache.as_ref()?;
         let file = self.file;
+        let intent = self.current.rendering_intent;
         let transform = match obj? {
             PdfObject::Ref(r) => {
                 let file = file?;
                 let cache = self.icc_cache.as_deref_mut()?;
-                cache.get_or_build(*r, || file.resolve_stream_data(*r).ok())
+                cache.get_or_build(*r, intent, || file.resolve_stream_data(*r).ok())
             }
             // Inline profile streams (synthetic content; the spec requires an
             // indirect stream) have no object id to cache under.
-            PdfObject::Stream(s) => build_inline_icc_transform(s),
+            PdfObject::Stream(s) => build_inline_icc_transform(s, intent),
             _ => None,
         }?;
         if transform.components() != n.max(1) as usize {
@@ -1805,7 +1815,11 @@ impl<'a> ContentInterpreter<'a> {
         if self.current.blend_mode != BlendMode::Normal || self.current.soft_mask.is_some() {
             self.display_list.push(RenderCommand::PushBlendGroup {
                 blend_mode: self.current.blend_mode,
-                isolated: false,
+                // A single object carrying a blend mode / soft mask is equivalent
+                // to an isolated group of one element composited with that mode —
+                // it must NOT pull in the backdrop (which would change a
+                // semi-transparent blended fill).
+                isolated: true,
                 knockout: false,
                 bounds: self.display_list.page_rect,
                 alpha: 1.0,
@@ -1874,6 +1888,10 @@ impl<'a> ContentInterpreter<'a> {
         }
         if let Ok(m) = dict.get_f64("ML") {
             self.current.miter_limit = m as f32;
+        }
+        // /RI: rendering intent name.
+        if let Ok(ri) = dict.get_name("RI") {
+            self.current.rendering_intent = zpdf_color::RenderIntent::from_pdf_name(ri);
         }
         // /BM: a name or an array of names (use the first supported one).
         let bm_name = match dict.get("BM") {
@@ -2139,11 +2157,18 @@ impl<'a> ContentInterpreter<'a> {
         // Image metadata keys may be indirect references; resolve them so e.g.
         // an indirect /Decode does not silently invert an /ImageMask stencil.
         let image_dict = resolve_image_metadata(file, &stream.dict);
+        // An image's /Intent overrides the graphics-state rendering intent.
+        let intent = image_dict
+            .get_name("Intent")
+            .ok()
+            .map(zpdf_color::RenderIntent::from_pdf_name)
+            .unwrap_or(self.current.rendering_intent);
         let colorspace = resolve_image_colorspace(
             Some(file),
             self.icc_cache.as_deref_mut(),
             image_dict.get("ColorSpace"),
             0,
+            intent,
         );
         let mut image = match zpdf_image::decode_image_xobject_resolved(
             &decoded_data,
@@ -2202,11 +2227,17 @@ impl<'a> ContentInterpreter<'a> {
                 }
             }
         }
+        let intent = norm
+            .get_name("Intent")
+            .ok()
+            .map(zpdf_color::RenderIntent::from_pdf_name)
+            .unwrap_or(self.current.rendering_intent);
         let colorspace = resolve_image_colorspace(
             self.file,
             self.icc_cache.as_deref_mut(),
             norm.get("ColorSpace"),
             0,
+            intent,
         );
         match zpdf_image::decode_image_xobject_resolved(
             &decoded,
@@ -2590,14 +2621,7 @@ impl<'a> ContentInterpreter<'a> {
             return;
         }
         let page_path = self.transform_path_to_page_space(&path);
-        // Shading-pattern strokes use the precomputed average color.
-        let cmd = RenderCommand::StrokePath {
-            path: page_path,
-            style: self.stroke_style(),
-            paint: Paint::Solid(self.current.stroke_color),
-            alpha: self.current.stroke_alpha,
-        };
-        self.emit_painted(cmd);
+        self.emit_stroke(page_path);
     }
 
     fn paint_fill(&mut self, rule: FillRule) {
@@ -2616,37 +2640,87 @@ impl<'a> ContentInterpreter<'a> {
         }
         let page_path = self.transform_path_to_page_space(&path);
         self.fill_page_path(page_path.clone(), rule);
+        self.emit_stroke(page_path);
+    }
+
+    /// Stroke a page-space path. A stroke pattern (tiling or shading) is clipped
+    /// to the stroke outline via `PushClipStroke`; everything else is a solid
+    /// stroke (shading patterns fall back to the precomputed average colour when
+    /// the region is degenerate).
+    fn emit_stroke(&mut self, page_path: Path) {
+        let style = self.stroke_style();
+        if let Some(pat) = self.current.stroke_pattern.clone() {
+            // The stroke region is the centerline extent grown by the stroke
+            // width. Unlike `path_bounds`, a flat path (a horizontal/vertical
+            // line) is fine here — growing makes the region two-dimensional.
+            if let Some(bounds) = Self::stroke_region_bounds(&page_path, self.current.line_width) {
+                self.display_list.push(RenderCommand::PushClipStroke {
+                    path: page_path.clone(),
+                    style: style.clone(),
+                });
+                let painted = self.paint_pattern_in_region(&pat, bounds);
+                self.display_list.push(RenderCommand::PopClip);
+                if painted {
+                    return;
+                }
+                // Tiling failed to replicate: fall through to a solid stroke
+                // (the clip pair above is balanced and painted nothing).
+            }
+        }
         let cmd = RenderCommand::StrokePath {
             path: page_path,
-            style: self.stroke_style(),
+            style,
             paint: Paint::Solid(self.current.stroke_color),
             alpha: self.current.stroke_alpha,
         };
         self.emit_painted(cmd);
     }
 
-    /// Fill an already page-space path with the active fill paint — a shading
-    /// pattern renders as a gradient image clipped to the path; everything
-    /// else is a solid fill.
-    fn fill_page_path(&mut self, page_path: Path, rule: FillRule) {
-        if let Some(PatternPaint::Shading(def)) = self.current.fill_pattern.clone() {
-            if let Some(bounds) = Self::path_bounds(&page_path) {
-                self.display_list.push(RenderCommand::PushClip {
-                    path: page_path,
-                    rule,
-                });
-                self.emit_shading_image(&def, bounds);
-                self.display_list.push(RenderCommand::PopClip);
-                return;
+    /// Page-space bounding box of a stroke: the path's point extent grown by
+    /// the stroke width on every side (so even a degenerate flat path yields a
+    /// 2-D region for the pattern paint to cover).
+    fn stroke_region_bounds(path: &Path, line_width: f32) -> Option<Rect> {
+        let (mut x0, mut y0, mut x1, mut y1) = (
+            f64::INFINITY,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NEG_INFINITY,
+        );
+        let mut acc = |p: &Point| {
+            x0 = x0.min(p.x);
+            y0 = y0.min(p.y);
+            x1 = x1.max(p.x);
+            y1 = y1.max(p.y);
+        };
+        for elem in &path.elements {
+            match elem {
+                PathElement::MoveTo(p) | PathElement::LineTo(p) => acc(p),
+                PathElement::CurveTo(c1, c2, p) => {
+                    acc(c1);
+                    acc(c2);
+                    acc(p);
+                }
+                PathElement::Close => {}
             }
         }
-        if let Some(PatternPaint::Tiling(def)) = self.current.fill_pattern.clone() {
+        if !(x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite()) {
+            return None;
+        }
+        let grow = (line_width.max(1.0) as f64).max(0.5);
+        Some(Rect::new(x0 - grow, y0 - grow, x1 + grow, y1 + grow))
+    }
+
+    /// Fill an already page-space path with the active fill paint — a pattern
+    /// (tiling or shading) is clipped to the path; everything else is a solid
+    /// fill.
+    fn fill_page_path(&mut self, page_path: Path, rule: FillRule) {
+        if let Some(pat) = self.current.fill_pattern.clone() {
             if let Some(bounds) = Self::path_bounds(&page_path) {
                 self.display_list.push(RenderCommand::PushClip {
                     path: page_path.clone(),
                     rule,
                 });
-                let painted = self.paint_tiling_pattern(&def, bounds);
+                let painted = self.paint_pattern_in_region(&pat, bounds);
                 self.display_list.push(RenderCommand::PopClip);
                 if painted {
                     return;
@@ -2662,6 +2736,20 @@ impl<'a> ContentInterpreter<'a> {
             alpha: self.current.fill_alpha,
         };
         self.emit_painted(cmd);
+    }
+
+    /// Paint a pattern (tiling or shading) across `bounds`. The caller must
+    /// already have installed the clip region (a path/stroke/glyph clip).
+    /// Returns false when a tiling pattern could not be replicated, so the
+    /// caller can fall back to a solid approximation.
+    fn paint_pattern_in_region(&mut self, pattern: &PatternPaint, bounds: Rect) -> bool {
+        match pattern {
+            PatternPaint::Shading(def) => {
+                self.emit_shading_image(def, bounds);
+                true
+            }
+            PatternPaint::Tiling(def) => self.paint_tiling_pattern(def, bounds),
+        }
     }
 
     /// Replicate a tiling-pattern cell across the page-space `bounds` of a
@@ -2883,6 +2971,30 @@ impl<'a> ContentInterpreter<'a> {
         true
     }
 
+    /// Emit a solid-colour glyph run (the non-pattern path, and the fallback
+    /// when a tiling text pattern cannot be replicated).
+    fn emit_solid_glyph_run(
+        &mut self,
+        font_id: FontId,
+        font_size: f32,
+        glyphs: Vec<PositionedGlyph>,
+        transform: Matrix,
+    ) {
+        let paint_color = match self.current.render_mode {
+            1 | 5 => self.current.stroke_color,
+            _ => self.current.fill_color,
+        };
+        let cmd = RenderCommand::DrawGlyphRun(GlyphRun {
+            font_id,
+            font_size,
+            glyphs,
+            paint: Paint::Solid(paint_color),
+            alpha: self.current.fill_alpha,
+            transform,
+        });
+        self.emit_painted(cmd);
+    }
+
     fn show_text(&mut self, bytes: &[u8]) {
         let tm = self.text_matrix;
         let ctm = self.current.ctm;
@@ -2941,35 +3053,46 @@ impl<'a> ContentInterpreter<'a> {
                 };
                 i += len.max(1);
 
-                // Resolve the glyph id and its 1/1000-unit advance.
-                let (glyph_id, adv_units) = if let Some((_, font)) = font_and_id {
+                // Resolve the glyph id, its 1/1000-unit advance, and (for CID
+                // fonts in vertical mode) the per-CID /W2 vertical metric.
+                let (glyph_id, adv_units, v_metric) = if let Some((_, font)) = font_and_id {
                     if codes_are_unicode {
                         match font.unicode_glyph(code) {
-                            Some((gid, adv)) => (gid, adv),
-                            None => (0, 500.0),
+                            Some((gid, adv)) => (gid, adv, None),
+                            None => (0, 500.0, None),
                         }
                     } else {
                         let cid = cmap
                             .map(|c| c.code_to_cid(code, len as u8))
                             .unwrap_or(code)
                             .min(u16::MAX as u32) as u16;
-                        (cid, font.glyph_advance(cid))
+                        let v_metric = if vertical {
+                            font.cid_v_metric(cid)
+                        } else {
+                            None
+                        };
+                        (cid, font.glyph_advance(cid), v_metric)
                     }
                 } else {
-                    (code.min(u16::MAX as u32) as u16, 500.0)
+                    (code.min(u16::MAX as u32) as u16, 500.0, None)
                 };
 
                 if vertical {
                     // Vertical writing (9.7.4.3): the glyph's horizontal origin
-                    // sits at pen − v, v = (w0/2, vy); the pen advances by
-                    // ty = w1·Tfs + Tc (+ Tw for 1-byte code 32) per 9.4.4 —
-                    // no Th factor in vertical mode.
-                    let w0 = adv_units as f32 * scale_factor;
-                    let vy = dw2.0 as f32 * scale_factor;
-                    let advance = dw2.1 as f32 * scale_factor;
+                    // sits at pen − v; the pen advances by ty = w1y·Tfs + Tc
+                    // (+ Tw for 1-byte code 32) per 9.4.4 — no Th factor in
+                    // vertical mode. Per-CID /W2 overrides /DW2 when present;
+                    // the /DW2 default position vector is (w0/2, vy).
+                    let (w1y, vx, vy) = match v_metric {
+                        Some((w1y, vx, vy)) => (w1y, vx, vy),
+                        None => (dw2.1, adv_units / 2.0, dw2.0),
+                    };
+                    let vx = vx as f32 * scale_factor;
+                    let vy = vy as f32 * scale_factor;
+                    let advance = w1y as f32 * scale_factor;
                     glyphs.push(PositionedGlyph {
                         glyph_id,
-                        x: -w0 / 2.0,
+                        x: -vx,
                         y: x_offset - vy,
                         advance,
                     });
@@ -3064,19 +3187,32 @@ impl<'a> ContentInterpreter<'a> {
         let invisible = matches!(self.current.render_mode, 3 | 7);
         if let Some(font_id) = self.current_font_id {
             if !glyphs.is_empty() && !invisible {
-                let paint_color = match self.current.render_mode {
-                    1 | 5 => self.current.stroke_color,
-                    _ => self.current.fill_color,
+                // A Pattern colour space on the active paint (fill for modes
+                // 0/2/4/6, stroke for 1/5) clips the pattern to the glyph
+                // outlines instead of painting a solid run.
+                let text_pattern = match self.current.render_mode {
+                    1 | 5 => self.current.stroke_pattern.clone(),
+                    _ => self.current.fill_pattern.clone(),
                 };
-                let cmd = RenderCommand::DrawGlyphRun(GlyphRun {
-                    font_id,
-                    font_size,
-                    glyphs,
-                    paint: Paint::Solid(paint_color),
-                    alpha: self.current.fill_alpha,
-                    transform: combined,
+                let glyph_clip = text_pattern.as_ref().and_then(|_| {
+                    font_and_id.and_then(|(_, font)| {
+                        build_glyph_clip_path(&glyphs, &combined, font, font_size)
+                    })
                 });
-                self.emit_painted(cmd);
+                match (text_pattern, glyph_clip) {
+                    (Some(pat), Some((clip_path, bounds))) => {
+                        self.display_list.push(RenderCommand::PushClip {
+                            path: clip_path,
+                            rule: FillRule::NonZero,
+                        });
+                        let painted = self.paint_pattern_in_region(&pat, bounds);
+                        self.display_list.push(RenderCommand::PopClip);
+                        if !painted {
+                            self.emit_solid_glyph_run(font_id, font_size, glyphs, combined);
+                        }
+                    }
+                    _ => self.emit_solid_glyph_run(font_id, font_size, glyphs, combined),
+                }
             }
         }
 
@@ -3171,13 +3307,110 @@ fn resolve_image_metadata(file: &PdfFile, dict: &zpdf_core::PdfDict) -> zpdf_cor
     out
 }
 
+/// Build a combined glyph-outline clip path (in PAGE space) for a positioned
+/// glyph run, plus its bounding box. Used to clip a pattern/shading paint to
+/// text. Returns `None` for fonts with no usable outlines (bitmap/Type3) or an
+/// all-blank run. Quadratic segments are promoted to cubics for the display
+/// list `Path` (which carries cubics only).
+fn build_glyph_clip_path(
+    glyphs: &[PositionedGlyph],
+    tm: &Matrix,
+    font: &zpdf_font::LoadedFont,
+    font_size: f32,
+) -> Option<(Path, Rect)> {
+    if !font.has_font_data() || font.is_type3() {
+        return None;
+    }
+    let upem = font.units_per_em as f32;
+    if upem <= 0.0 {
+        return None;
+    }
+
+    // Glyph-space point (font units, + the glyph's text-space offset) → page.
+    let to_page = |gx: f64, gy: f64, ox: f32, oy: f32| -> Point {
+        let tx = (gx as f32 / upem * font_size + ox) as f64;
+        let ty = (gy as f32 / upem * font_size + oy) as f64;
+        Point::new(tm.a * tx + tm.c * ty + tm.e, tm.b * tx + tm.d * ty + tm.f)
+    };
+
+    let mut out = Path::new();
+    let mut bb = (
+        f64::INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NEG_INFINITY,
+    );
+    let track = |p: Point, bb: &mut (f64, f64, f64, f64)| {
+        bb.0 = bb.0.min(p.x);
+        bb.1 = bb.1.min(p.y);
+        bb.2 = bb.2.max(p.x);
+        bb.3 = bb.3.max(p.y);
+    };
+    let mut any = false;
+
+    for glyph in glyphs {
+        let outline = match font.glyph_outline(glyph.glyph_id) {
+            Some(o) => o,
+            None => continue,
+        };
+        let (ox, oy) = (glyph.x, glyph.y);
+        let mut cur = Point::new(0.0, 0.0);
+        for cmd in &outline.commands {
+            match *cmd {
+                zpdf_font::OutlineCommand::MoveTo(x, y) => {
+                    let p = to_page(x, y, ox, oy);
+                    out.move_to(p);
+                    track(p, &mut bb);
+                    cur = p;
+                    any = true;
+                }
+                zpdf_font::OutlineCommand::LineTo(x, y) => {
+                    let p = to_page(x, y, ox, oy);
+                    out.line_to(p);
+                    track(p, &mut bb);
+                    cur = p;
+                }
+                zpdf_font::OutlineCommand::QuadTo(cx, cy, x, y) => {
+                    let c = to_page(cx, cy, ox, oy);
+                    let e = to_page(x, y, ox, oy);
+                    // Quadratic → cubic: control points at 2/3 toward the quad ctrl.
+                    let c1 = Point::new(
+                        cur.x + 2.0 / 3.0 * (c.x - cur.x),
+                        cur.y + 2.0 / 3.0 * (c.y - cur.y),
+                    );
+                    let c2 =
+                        Point::new(e.x + 2.0 / 3.0 * (c.x - e.x), e.y + 2.0 / 3.0 * (c.y - e.y));
+                    out.curve_to(c1, c2, e);
+                    track(e, &mut bb);
+                    cur = e;
+                }
+                zpdf_font::OutlineCommand::CurveTo(x1, y1, x2, y2, x, y) => {
+                    let c1 = to_page(x1, y1, ox, oy);
+                    let c2 = to_page(x2, y2, ox, oy);
+                    let e = to_page(x, y, ox, oy);
+                    out.curve_to(c1, c2, e);
+                    track(e, &mut bb);
+                    cur = e;
+                }
+                zpdf_font::OutlineCommand::Close => out.close(),
+            }
+        }
+    }
+
+    if !(any && bb.0.is_finite() && bb.2 > bb.0 && bb.3 > bb.1) {
+        return None;
+    }
+    Some((out, Rect::new(bb.0, bb.1, bb.2, bb.3)))
+}
+
 /// Build an ICC transform from an inline (synthetic) profile stream,
 /// bypassing the cache — inline streams have no object id to key on.
 fn build_inline_icc_transform(
     s: &zpdf_core::PdfStream,
+    intent: zpdf_color::RenderIntent,
 ) -> Option<std::sync::Arc<zpdf_color::IccTransform>> {
     let data = zpdf_parser::filters::decode_stream(&s.data, &s.dict).ok()?;
-    match zpdf_color::IccTransform::from_profile_bytes(&data) {
+    match zpdf_color::IccTransform::from_profile_bytes(&data, intent) {
         Ok(t) => Some(std::sync::Arc::new(t)),
         Err(e) => {
             tracing::warn!("inline ICC profile rejected: {e}; using /N fallback");
@@ -3197,6 +3430,7 @@ fn resolve_image_colorspace(
     icc: Option<&mut zpdf_color::IccCache>,
     cs: Option<&PdfObject>,
     depth: u8,
+    intent: zpdf_color::RenderIntent,
 ) -> Option<zpdf_image::ResolvedColorSpace> {
     use zpdf_image::ResolvedColorSpace as Rcs;
     if depth > 4 {
@@ -3233,9 +3467,9 @@ fn resolve_image_colorspace(
                     if let Some(cache) = icc {
                         let transform = match (stream_ref, file) {
                             (Some(id), Some(f)) => {
-                                cache.get_or_build(id, || f.resolve_stream_data(id).ok())
+                                cache.get_or_build(id, intent, || f.resolve_stream_data(id).ok())
                             }
-                            (None, _) => build_inline_icc_transform(stream),
+                            (None, _) => build_inline_icc_transform(stream, intent),
                             _ => None,
                         };
                         if let Some(t) = transform {
@@ -3262,7 +3496,7 @@ fn resolve_image_colorspace(
                     }
                 }
                 "Indexed" | "I" => {
-                    let base = resolve_image_colorspace(file, icc, arr.get(1), depth + 1)?;
+                    let base = resolve_image_colorspace(file, icc, arr.get(1), depth + 1, intent)?;
                     let hival = arr.get(2)?.as_f64().ok()?;
                     if !(0.0..=255.0).contains(&hival) {
                         return None;
@@ -3435,6 +3669,54 @@ mod tests {
         assert_eq!(dl.commands.len(), 2);
     }
 
+    /// `build_glyph_clip_path` produces a real outline clip + bbox from a
+    /// loaded font (the geometry behind pattern-filled text). Uses the
+    /// committed Quartz CFF fixture; skips gracefully if it is absent.
+    #[test]
+    fn glyph_clip_path_from_real_font() {
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../zpdf/tests/fixtures/quartz_cff_subset.pdf"
+        );
+        let Ok(data) = std::fs::read(fixture) else {
+            return; // fixture not present in this checkout
+        };
+        let doc = zpdf_document::PdfDocument::open(data).expect("open fixture");
+        // CMBX12 is object 4; GID 26 = 'U', GID 42 = 'n' both have outlines.
+        let font =
+            zpdf_document::font_loader::load_single_font(doc.file(), zpdf_core::ObjectId(4, 0))
+                .expect("load CMBX12");
+        let glyphs = vec![
+            PositionedGlyph {
+                glyph_id: 26,
+                x: 0.0,
+                y: 0.0,
+                advance: 0.0,
+            },
+            PositionedGlyph {
+                glyph_id: 42,
+                x: 50.0,
+                y: 0.0,
+                advance: 0.0,
+            },
+        ];
+        let (path, bounds) = build_glyph_clip_path(&glyphs, &Matrix::identity(), &font, 100.0)
+            .expect("glyph clip path");
+        assert!(
+            !path.elements.is_empty(),
+            "clip path should carry outline elements"
+        );
+        assert!(
+            bounds.x1 > bounds.x0 && bounds.y1 > bounds.y0,
+            "non-empty bbox: {bounds:?}"
+        );
+        // Two ~100pt glyphs starting at x=0 and x=50 stay within a sane span.
+        assert!(
+            bounds.x0 >= -5.0 && bounds.x1 < 250.0,
+            "bbox span: {bounds:?}"
+        );
+    }
+
     /// A FontCache with a single placeholder font registered as `F1`, so that a
     /// `/F1 Tf` selects an active font and text operators emit glyph runs.
     fn cache_with_f1() -> FontCache {
@@ -3502,16 +3784,37 @@ mod tests {
         use zpdf_image::ResolvedColorSpace as Rcs;
         let cs = PdfObject::Name(PdfName::new("DeviceCMYK"));
         assert_eq!(
-            resolve_image_colorspace(None, None, Some(&cs), 0),
+            resolve_image_colorspace(
+                None,
+                None,
+                Some(&cs),
+                0,
+                zpdf_color::RenderIntent::default()
+            ),
             Some(Rcs::Cmyk)
         );
         let cs = PdfObject::Name(PdfName::new("CalGray"));
         assert_eq!(
-            resolve_image_colorspace(None, None, Some(&cs), 0),
+            resolve_image_colorspace(
+                None,
+                None,
+                Some(&cs),
+                0,
+                zpdf_color::RenderIntent::default()
+            ),
             Some(Rcs::Gray)
         );
         let cs = PdfObject::Name(PdfName::new("Pattern"));
-        assert_eq!(resolve_image_colorspace(None, None, Some(&cs), 0), None);
+        assert_eq!(
+            resolve_image_colorspace(
+                None,
+                None,
+                Some(&cs),
+                0,
+                zpdf_color::RenderIntent::default()
+            ),
+            None
+        );
     }
 
     #[test]
@@ -3527,7 +3830,13 @@ mod tests {
             PdfObject::Stream(PdfStream::new(profile_dict, vec![])),
         ]);
         assert_eq!(
-            resolve_image_colorspace(None, None, Some(&cs), 0),
+            resolve_image_colorspace(
+                None,
+                None,
+                Some(&cs),
+                0,
+                zpdf_color::RenderIntent::default()
+            ),
             Some(Rcs::Cmyk)
         );
     }
@@ -3542,7 +3851,13 @@ mod tests {
             PdfObject::Integer(1),
             PdfObject::String(PdfString::new(vec![255, 0, 0, 0, 0, 255])),
         ]);
-        match resolve_image_colorspace(None, None, Some(&cs), 0) {
+        match resolve_image_colorspace(
+            None,
+            None,
+            Some(&cs),
+            0,
+            zpdf_color::RenderIntent::default(),
+        ) {
             Some(Rcs::Indexed {
                 base,
                 hival,
@@ -3567,7 +3882,16 @@ mod tests {
             PdfObject::Integer(1),
             PdfObject::Ref(ObjectId(7, 0)),
         ]);
-        assert_eq!(resolve_image_colorspace(None, None, Some(&cs), 0), None);
+        assert_eq!(
+            resolve_image_colorspace(
+                None,
+                None,
+                Some(&cs),
+                0,
+                zpdf_color::RenderIntent::default()
+            ),
+            None
+        );
     }
 
     // ---- ICCBased with real profile transforms ----
@@ -3634,14 +3958,26 @@ mod tests {
         use zpdf_image::ResolvedColorSpace as Rcs;
         let mut cache = zpdf_color::IccCache::new();
         let cs = iccbased_cs(SRGB_ICC, 3);
-        match resolve_image_colorspace(None, Some(&mut cache), Some(&cs), 0) {
+        match resolve_image_colorspace(
+            None,
+            Some(&mut cache),
+            Some(&cs),
+            0,
+            zpdf_color::RenderIntent::default(),
+        ) {
             Some(Rcs::Icc { ncomp: 3, .. }) => {}
             other => panic!("expected Icc, got {other:?}"),
         }
         // Garbage profile: back to the /N mapping.
         let cs = iccbased_cs(&[0u8; 64], 4);
         assert_eq!(
-            resolve_image_colorspace(None, Some(&mut cache), Some(&cs), 0),
+            resolve_image_colorspace(
+                None,
+                Some(&mut cache),
+                Some(&cs),
+                0,
+                zpdf_color::RenderIntent::default()
+            ),
             Some(Rcs::Cmyk)
         );
     }
@@ -3659,7 +3995,13 @@ mod tests {
             PdfObject::Integer(1),
             PdfObject::String(PdfString::new(vec![255, 0, 0, 0, 0, 255])),
         ]);
-        match resolve_image_colorspace(None, Some(&mut cache), Some(&cs), 0) {
+        match resolve_image_colorspace(
+            None,
+            Some(&mut cache),
+            Some(&cs),
+            0,
+            zpdf_color::RenderIntent::default(),
+        ) {
             Some(Rcs::Indexed { base, lookup, .. }) => {
                 assert_eq!(*base, Rcs::Rgb);
                 assert_eq!(lookup.len(), 6);

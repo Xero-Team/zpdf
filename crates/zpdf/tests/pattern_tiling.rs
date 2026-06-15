@@ -197,6 +197,46 @@ fn tiling_cell_oc_leak_does_not_suppress_page() {
     );
 }
 
+/// A tiling pattern applied to a STROKE paints the pattern clipped to the
+/// stroke outline (not a solid average colour, and not the path interior).
+/// Cell paints red in the left half (cell-x 0..10), white in the right half,
+/// so a position landing in the red sub-cell proves the real pattern is used.
+#[test]
+fn tiling_pattern_strokes_outline() {
+    // Red left half of a 20×20 cell; the right half shows the backdrop.
+    let cell: &[u8] = b"1 0 0 rg 0 0 10 20 re f";
+    let pat = "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+               /BBox [0 0 20 20] /XStep 20 /YStep 20 /Resources << >>";
+    // 20pt-wide horizontal stroke along y=100 from x=20 to x=180. The stroke
+    // colour space/pattern use the uppercase (stroking) operators.
+    let content: &[u8] = b"/Pattern CS /P0 SCN 20 w 20 100 m 180 100 l S";
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R \
+          /Resources << /Pattern << /P0 5 0 R >> >> >>"
+            .to_vec(),
+        stream_obj("", content),
+        stream_obj(pat, cell),
+    ]);
+    let page = render(pdf);
+
+    // On the stroke band (y∈[90,110]) at x=45 → cell-x 5 → red sub-cell.
+    assert_rgbish(
+        px(&page, 45.0, 100.0),
+        [255, 0, 0],
+        "pattern on stroke (red)",
+    );
+    // On the stroke at x=55 → cell-x 15 → white sub-cell (NOT the solid avg).
+    assert_rgbish(
+        px(&page, 55.0, 100.0),
+        [255, 255, 255],
+        "pattern on stroke (white sub-cell)",
+    );
+    // Off the stroke (y=140) the pattern must not paint, even at a red cell-x.
+    assert_rgbish(px(&page, 45.0, 140.0), [255, 255, 255], "off-stroke clip");
+}
+
 /// A pattern /Matrix offsets the tiling grid: shifting the pattern by (10, 10)
 /// moves the red square from cell-space [2,9]² to page [12,19]².
 #[test]

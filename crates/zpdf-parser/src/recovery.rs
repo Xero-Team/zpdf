@@ -190,16 +190,19 @@ fn root_points_at_catalog(
     limits: &ParseLimits,
 ) -> bool {
     let obj = match table.get(root) {
-        Some(XrefEntry::InUse { offset, .. }) => {
-            ObjectParser::new(data, limits).parse_indirect_at(*offset as usize).ok()
-        }
+        Some(XrefEntry::InUse { offset, .. }) => ObjectParser::new(data, limits)
+            .parse_indirect_at(*offset as usize)
+            .ok(),
         Some(XrefEntry::Compressed {
             stream_obj,
             index_in_stream,
         }) => decode_objstm_member(data, table, *stream_obj, *index_in_stream, limits),
         _ => None,
     };
-    obj.as_ref().map(object_dict).map(dict_is_catalog).unwrap_or(false)
+    obj.as_ref()
+        .map(object_dict)
+        .map(dict_is_catalog)
+        .unwrap_or(false)
 }
 
 /// Find the LAST `trailer` keyword in the buffer and lex the following dict.
@@ -246,7 +249,8 @@ fn find_catalog(
             index_in_stream,
         }) = table.get(id)
         {
-            if let Some(obj) = decode_objstm_member(data, table, *stream_obj, *index_in_stream, limits)
+            if let Some(obj) =
+                decode_objstm_member(data, table, *stream_obj, *index_in_stream, limits)
             {
                 if dict_is_catalog(object_dict(&obj)) {
                     best = Some((id, None));
@@ -330,7 +334,9 @@ fn decode_objstm_member(
     if start > end {
         return None;
     }
-    Lexer::new(&decoded[start..end], 0, limits).next_token().ok()
+    Lexer::new(&decoded[start..end], 0, limits)
+        .next_token()
+        .ok()
 }
 
 /// For each recovered /Type /ObjStm object, decode it and add Compressed entries
