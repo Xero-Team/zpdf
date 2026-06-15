@@ -12,6 +12,12 @@ GPU (wgpu) renderers whose output matches within <1% of pixels.
   `/XRefStm`, trailer chains, lazy xref repair, object model, stream filters
   (Flate / LZW / ASCII85 / ASCIIHex / RunLength / DCT / CCITT G3-G4 +
   predictors) with corrupt-stream salvage.
+- **Malformed-input robustness** — opens corrupt, headerless, or garbage-tail
+  files via full-file object-scan recovery (catalog inside an `/ObjStm`,
+  page-tree synthesis from `/Type /Page` scan, byte-flipped `/Type` tolerance,
+  lenient header/dict parsing). Never panics or hangs on adversarial input:
+  path/raster/clip budgets plus interpret/render time backstops degrade to a
+  partial render instead.
 - **Encryption** — RC4 (40/128-bit) and AES-128 / AES-256 (V5 R5/R6) standard
   security handler with crypt filters (empty user password).
 - **Content interpretation** — graphics state, paths, clipping, text (incl.
@@ -120,6 +126,8 @@ zpdf-core            Shared types: ObjectId, PdfObject, Matrix, Rect, Error, Par
 | PDF 1.0–2.0 header | ✅ |
 | Traditional xref + xref/object streams + hybrid `/XRefStm` | ✅ |
 | Incremental update (`/Prev`) chains, lazy xref repair | ✅ |
+| Corrupt/headerless recovery (object scan, catalog-in-`/ObjStm`, page-tree synthesis) | ✅ |
+| Adversarial-input safety (no panics, no hangs; budget-bounded partial render) | ✅ |
 | Flate / LZW / ASCII85 / ASCIIHex / RunLength + predictors | ✅ with corrupt-stream salvage |
 | DCTDecode (JPEG, incl. CMYK) / CCITTFaxDecode (G3/G4) | ✅ |
 | Encryption: RC4 40/128, AES-128, AES-256 (R5/R6), crypt filters | ✅ empty user password |
@@ -130,7 +138,7 @@ zpdf-core            Shared types: ObjectId, PdfObject, Matrix, Rect, Error, Par
 | Indexed / Lab / Separation / DeviceN (tint transforms) | ✅ |
 | PDF functions (sampled / exponential / stitching / PostScript) | ✅ |
 | Axial & radial shadings (`sh` + shading patterns) | ✅ |
-| Tiling patterns | Placeholder (solid mid-gray) |
+| Tiling patterns (PatternType 1, colored/uncolored cell replication) | ✅ |
 | 16 blend modes (`/BM`) | ✅ both backends |
 | Text + text state operators, render modes, rise | ✅ (text-as-clip approximated) |
 | Type3 / TrueType / Type1 / Type1C / CID-Type0 / standard-14 fonts | ✅ |
@@ -140,12 +148,13 @@ zpdf-core            Shared types: ObjectId, PdfObject, Matrix, Rect, Error, Par
 | Form XObjects (full resources, `/BBox` clip, recursion guards) | ✅ |
 | CPU rendering (PNG) | ✅ |
 | GPU rendering (wgpu) | ✅ |
-| ExtGState soft masks (`/SMask`), transparency groups | Planned |
-| ICC color profiles (real color management) | Planned (component-count fallback today) |
-| Annotation appearance streams | Planned (`/Annots` parsed) |
-| Non-embedded CJK font fallback | Planned |
-| JBIG2 / JPX filters | Planned |
-| Optional content groups (layers) | Planned |
+| ExtGState soft masks (`/SMask`), transparency groups | ✅ (isolated/knockout ignored) |
+| ICC color profiles (real color management, `moxcms`) | ✅ |
+| Annotation appearance streams (`/AP`, `/AS`, Hidden/NoView) | ✅ |
+| Non-embedded font fallback (incl. CJK via system fonts) | ✅ |
+| JBIG2 / JPX (JPEG 2000) filters | ✅ |
+| Optional content groups / layers (`/OCG`, `/OCMD`, `/VE`) | ✅ |
+| Predefined + embedded CMaps, vertical writing (`WMode 1`) | ✅ |
 
 ## Dependencies
 
@@ -180,9 +189,13 @@ See [ROADMAP.md](ROADMAP.md).
 - **Phase 1** — PDF parsing — done
 - **Phase 2** — Content interpretation + CPU rendering — done
 - **Phase 3** — wgpu GPU rendering — done
-- **Phase 4** — Advanced features — largely done (encryption incl. AES,
-  shadings, blend modes, spot color, CropBox/rotation); remaining: soft masks,
-  tiling-pattern cells, annotations, ICC profiles, JBIG2/JPX, CJK fallback
+- **Phase 4** — Advanced features — done (encryption incl. AES, shadings,
+  blend modes, spot color, CropBox/rotation, tiling-pattern cells, soft masks &
+  transparency groups, annotation appearance streams, optional content, ICC
+  color management, JBIG2 + JPEG 2000, system-font fallback, composite-font
+  CMaps + vertical writing)
+- **Robustness** — corrupt/adversarial-corpus pass: opens 426/618 of a
+  malformed-PDF corpus (from 166), zero render panics, zero timeouts/hangs
 
 ## License
 

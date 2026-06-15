@@ -61,7 +61,11 @@ impl PdfFile {
 
     pub fn parse_with_limits(data: impl Into<Arc<[u8]>>, limits: ParseLimits) -> Result<Self> {
         let data: Arc<[u8]> = data.into();
-        let header = header::parse_header(&data)?;
+        // A missing `%PDF` marker is not fatal on its own: a sliced/headerless
+        // fragment that begins directly with `N G obj` can still be opened by the
+        // object-scan recovery below. Defer the NotAPdf verdict until recovery
+        // has also come up empty.
+        let header_res = header::parse_header(&data);
 
         // Try the normal xref pipeline first. Fall back to tail-scan recovery if
         // it fails structurally OR yields a trailer whose /Root doesn't resolve.
@@ -82,14 +86,20 @@ impl PdfFile {
                 match recovery::scan_all_objects(&data, &limits) {
                     Ok(recovered) => recovered,
                     // Recovery failed: fall back to the normal parse if it at
-                    // least produced a table, else surface the recovery error.
+                    // least produced a table, else surface the most useful error.
+                    // For a file that never carried a `%PDF` marker, NotAPdf is
+                    // more accurate than the recovery layer's InvalidXref.
                     Err(rec_err) => match other {
                         Ok(parsed) => parsed,
+                        Err(_) if header_res.is_err() => return Err(zpdf_core::Error::NotAPdf),
                         Err(_) => return Err(rec_err),
                     },
                 }
             }
         };
+        // Past this point the document is structurally usable; if the version
+        // header was absent/garbage, assume a modern default rather than failing.
+        let header = header_res.unwrap_or(PdfHeader { major: 1, minor: 4 });
 
         let mut file = Self {
             data,
@@ -168,22 +178,32 @@ impl PdfFile {
 
         // ISO 32000-1, 7.3.10: a reference to an object that is missing from
         // the xref, or marked free, is a reference to the null object — not an
-        // error. Cache the Null so the warning fires once per object.
-        let Some(entry) = self.xref.get(id) else {
-            tracing::warn!("reference to missing object {id}; treating as null");
-            self.object_cache.borrow_mut().insert(id, PdfObject::Null);
-            return Ok(PdfObject::Null);
-        };
-        let obj = match entry {
-            XrefEntry::InUse { offset, .. } => self.parse_at_offset_checked(*offset, id)?,
-            XrefEntry::Compressed {
+        // error. BUT a damaged xref frequently just omits (or wrongly frees)
+        // objects that physically exist in the file, which would silently empty
+        // the page tree. So before treating a missing/free entry as null, give
+        // the lazy repair table (one memoized full-file scan) a chance to locate
+        // the real object. The Null is cached either way so the warning fires
+        // once per object and a genuinely-dangling ref stays cheap.
+        let obj = match self.xref.get(id) {
+            Some(XrefEntry::InUse { offset, .. }) => self.parse_at_offset_checked(*offset, id)?,
+            Some(XrefEntry::Compressed {
                 stream_obj,
                 index_in_stream,
-            } => self.extract_from_object_stream(*stream_obj, *index_in_stream)?,
-            XrefEntry::Free { .. } => {
-                tracing::warn!("reference to free object {id}; treating as null");
-                PdfObject::Null
-            }
+            }) => self.extract_from_object_stream(*stream_obj, *index_in_stream)?,
+            Some(XrefEntry::Free { .. }) => match self.repaired_object(id) {
+                Some(obj) => obj,
+                None => {
+                    tracing::warn!("reference to free object {id}; treating as null");
+                    PdfObject::Null
+                }
+            },
+            None => match self.repaired_object(id) {
+                Some(obj) => obj,
+                None => {
+                    tracing::warn!("reference to missing object {id}; treating as null");
+                    PdfObject::Null
+                }
+            },
         };
 
         // A top-level object body may itself be an indirect reference; follow
@@ -487,6 +507,63 @@ impl PdfFile {
 
     pub fn data(&self) -> &[u8] {
         &self.data
+    }
+
+    /// Force-build (once) and return the full-file repair-scan table, or `None`
+    /// if the scan found nothing. Shares the `OnceCell` the lazy per-object
+    /// repair uses, so the scan runs at most once per `PdfFile`.
+    pub fn force_repair_scan(&self) -> Option<&XrefTable> {
+        self.repair_table
+            .get_or_init(
+                || match recovery::scan_all_objects(&self.data, &self.limits) {
+                    Ok((table, _trailer)) => Some(table),
+                    Err(e) => {
+                        tracing::warn!("repair object scan failed: {e}");
+                        None
+                    }
+                },
+            )
+            .as_ref()
+    }
+
+    /// Every object id known to this file: the live xref unioned with the
+    /// repair-scan table (built on demand). Deduped and sorted by `(num, gen)`.
+    pub fn all_object_ids(&self) -> Vec<ObjectId> {
+        let mut ids: Vec<ObjectId> = self.xref.object_ids().collect();
+        if let Some(table) = self.force_repair_scan() {
+            ids.extend(table.object_ids());
+        }
+        ids.sort_by_key(|id| (id.0, id.1));
+        ids.dedup();
+        ids
+    }
+
+    /// All objects whose dict `/Type` equals `ty`, in `(num, gen)` order.
+    /// Resolves through [`Self::resolve`] (so /ObjStm members are decoded and,
+    /// for encrypted files, decrypted) and falls back to the repair table for
+    /// ids the live xref lacks. Bounded by `limits.max_objects`. The document
+    /// layer uses this to rebuild a page list when the /Pages tree is
+    /// unreachable.
+    pub fn find_objects_by_type(&self, ty: &str) -> Vec<ObjectId> {
+        let mut out = Vec::new();
+        for id in self.all_object_ids() {
+            if out.len() as u32 >= self.limits.max_objects {
+                break;
+            }
+            let obj = match self.resolve(id) {
+                Ok(PdfObject::Null) | Err(_) => self.repaired_object(id),
+                Ok(o) => Some(o),
+            };
+            let is_match = obj
+                .as_ref()
+                .and_then(|o| o.as_dict().ok())
+                .map(|d| d.get_name("Type").map(|t| t == ty).unwrap_or(false))
+                .unwrap_or(false);
+            if is_match {
+                out.push(id);
+            }
+        }
+        out
     }
 }
 

@@ -20,4 +20,5 @@ zpdf-image.workspace = true
 zpdf-render.workspace = true
 tiny-skia.workspace = true
 image.workspace = true
+tracing.workspace = true
 thiserror.workspace = true

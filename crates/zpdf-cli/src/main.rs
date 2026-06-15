@@ -51,7 +51,13 @@ fn cmd_info(args: &[String]) -> zpdf::Result<()> {
     println!("Version: PDF-{major}.{minor}");
     println!("Pages: {}", doc.page_count());
 
-    for i in 0..doc.page_count() {
+    // Cap the per-page listing: a fuzzed/huge document can carry hundreds of
+    // thousands of pages, and resolving + printing each (a fresh inheritance
+    // walk per page) would make `info` appear to hang. The first N is enough to
+    // characterize the file.
+    const MAX_LISTED_PAGES: usize = 1000;
+    let listed = doc.page_count().min(MAX_LISTED_PAGES);
+    for i in 0..listed {
         if let Ok(page) = doc.page(i) {
             println!(
                 "  Page {}: {:.0} x {:.0} pt (rotate: {})",
@@ -61,6 +67,9 @@ fn cmd_info(args: &[String]) -> zpdf::Result<()> {
                 page.rotate,
             );
         }
+    }
+    if doc.page_count() > listed {
+        println!("  ... and {} more pages", doc.page_count() - listed);
     }
 
     Ok(())

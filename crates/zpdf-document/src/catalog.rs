@@ -15,25 +15,35 @@ pub struct Catalog {
 
 impl Catalog {
     pub fn from_trailer(file: &PdfFile) -> Result<Self> {
-        let root_ref = file.trailer.get_ref("Root")?;
-        let root = file.resolve(root_ref)?;
-        // A lenient resolver may report a dangling /Root as Null instead of an
-        // error; either way a document without a catalog is unusable.
-        if root.is_null() {
-            return Err(Error::InvalidObject(
-                0,
-                format!("/Root {root_ref} resolves to null"),
-            ));
-        }
-        let root_dict = root.as_dict()?;
-
-        let pages_ref = root_dict.get_ref("Pages")?;
-
         // /Count is advisory only; the guarded kid walk determines the real
         // page list (broken kids are skipped, cycles and over-deep chains pruned).
+        let pages_ref = Self::resolve_pages_ref(file);
         let mut page_refs = Vec::new();
         let mut visited = HashSet::new();
-        Self::collect_page_refs(file, pages_ref, &mut page_refs, &mut visited, 0)?;
+        if let Some(pages_ref) = pages_ref {
+            Self::collect_page_refs(file, pages_ref, &mut page_refs, &mut visited, 0)?;
+        }
+
+        // Fallback: the /Root or /Pages tree was missing, null, or yielded no
+        // leaves — but the page objects often physically exist in the file (a
+        // broken xref, a catalog stranded in an /ObjStm, a /Root aimed at the
+        // wrong object, or a tree pruned by the cycle/depth guards). Mainstream
+        // readers degrade to a whole-document scan for /Type /Page; do the same.
+        if page_refs.is_empty() {
+            warn!("page tree unreachable via /Pages; scanning all objects for /Type /Page");
+            page_refs = file.find_objects_by_type("Page");
+        }
+
+        // Last resort: fuzzed files often byte-flip or drop the page's /Type
+        // (e.g. it parses as a Stream, or the type name is corrupted). Accept
+        // any "page-shaped" dict — carries /MediaBox or /Contents, is not a
+        // page-tree node (/Kids) or catalog (/Pages). Only reached when the
+        // document is already otherwise unopenable, so the loose heuristic
+        // cannot regress healthy files.
+        if page_refs.is_empty() {
+            warn!("no /Type /Page objects; scanning for page-shaped dicts");
+            page_refs = Self::scan_page_like(file);
+        }
 
         if page_refs.is_empty() {
             return Err(Error::InvalidObject(
@@ -43,10 +53,40 @@ impl Catalog {
         }
 
         Ok(Self {
-            pages_ref,
+            pages_ref: pages_ref.unwrap_or(ObjectId(0, 0)),
             page_count: page_refs.len(),
             page_refs,
         })
+    }
+
+    /// Whole-document scan for "page-shaped" dicts: a leaf carries `/MediaBox`
+    /// or `/Contents`, is not an interior page-tree node (`/Kids`) and not the
+    /// catalog (`/Pages`). Used only when `/Type /Page` matching already came up
+    /// empty, to recover pages whose `/Type` was corrupted or dropped.
+    fn scan_page_like(file: &PdfFile) -> Vec<ObjectId> {
+        file.all_object_ids()
+            .into_iter()
+            .filter(|&id| {
+                let Ok(obj) = file.resolve(id) else {
+                    return false;
+                };
+                let Ok(dict) = obj.as_dict() else {
+                    return false;
+                };
+                dict.get("Kids").is_none()
+                    && dict.get("Pages").is_none()
+                    && (dict.get("MediaBox").is_some() || dict.get("Contents").is_some())
+            })
+            .collect()
+    }
+
+    /// Resolve `/Root` → `/Pages`, tolerating an absent/null/non-dict Root or a
+    /// missing /Pages by returning `None` (the caller then falls back to a
+    /// whole-document page scan instead of failing the open).
+    fn resolve_pages_ref(file: &PdfFile) -> Option<ObjectId> {
+        let root_ref = file.trailer.get_ref("Root").ok()?;
+        let root = file.resolve(root_ref).ok()?;
+        root.as_dict().ok()?.get_ref("Pages").ok()
     }
 
     fn collect_page_refs(
@@ -204,8 +244,10 @@ mod tests {
 
     #[test]
     fn overly_deep_page_tree_is_pruned() {
-        // A single-kid Pages chain deeper than the guard: opening must
-        // terminate, and with the only leaf pruned the tree comes up empty.
+        // A single-kid Pages chain deeper than the guard: the kid walk must
+        // terminate (no hang/stack overflow) with the leaf pruned. The
+        // document-level fallback then recovers the orphaned /Type /Page leaf
+        // via a whole-document scan, so the document still opens with that page.
         let mut objects: Vec<String> = vec!["<< /Type /Catalog /Pages 2 0 R >>".into()];
         let chain = MAX_PAGE_TREE_DEPTH + 10;
         for i in 0..chain {
@@ -213,6 +255,7 @@ mod tests {
         }
         objects.push("<< /Type /Page /MediaBox [0 0 10 10] >>".into());
         let refs: Vec<&str> = objects.iter().map(|s| s.as_str()).collect();
-        assert!(PdfDocument::open(build_pdf(&refs)).is_err());
+        let doc = PdfDocument::open(build_pdf(&refs)).expect("fallback recovers the pruned leaf");
+        assert_eq!(doc.page_count(), 1);
     }
 }

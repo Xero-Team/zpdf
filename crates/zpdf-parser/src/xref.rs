@@ -343,22 +343,25 @@ fn parse_traditional_xref(
 }
 
 fn find_startxref(data: &[u8]) -> Result<usize> {
-    let search_size = 1024.min(data.len());
-    let tail = &data[data.len() - search_size..];
-
+    // Search the WHOLE buffer for the LAST `startxref` rather than only the
+    // final 1 KiB. Real files frequently carry substantial trailing bytes after
+    // the last %%EOF (truncated incremental appends, fuzzer junk, appended
+    // objects); a tail-only window misses the real startxref and forfeits an
+    // otherwise-valid xref. This runs once per open, so the full rposition is
+    // affordable, and a wrong hit still falls through to tail-scan recovery.
     let marker = b"startxref";
-    let marker_pos = tail
+    let marker_pos = data
         .windows(marker.len())
         .rposition(|w| w == marker)
         .ok_or(Error::InvalidXref(0))?;
 
     let after_marker = marker_pos + marker.len();
-    let num_start = tail[after_marker..]
+    let num_start = data[after_marker..]
         .iter()
         .position(|b| b.is_ascii_digit())
         .ok_or(Error::InvalidXref(0))?;
 
-    let num_bytes = &tail[after_marker + num_start..];
+    let num_bytes = &data[after_marker + num_start..];
     let num_end = num_bytes
         .iter()
         .position(|b| !b.is_ascii_digit())

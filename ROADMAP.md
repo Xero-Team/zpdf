@@ -22,7 +22,9 @@
 - [x] `/Prev` 增量更新链追踪
 - [x] Xref stream 解析（PDF 1.5+, `/Type /XRef`）
 - [x] Object stream 解析（`/Type /ObjStm`）
-- [ ] 尾部扫描 fallback（损坏 xref 恢复）
+- [x] 尾部扫描 fallback（损坏 xref 恢复）：全文件 `N G obj` 扫描重建 xref + trailer；
+      catalog 可在 `/ObjStm` 内/被同号对象遮蔽/`/Type` 被翻转时仍定位；无 catalog 也能打开；
+      缺失/free 引用回退至修复表；详见下方"健壮性专项"
 
 ### P1.4 — Stream Filters
 - [x] Filter pipeline 框架（链式解码）
@@ -214,19 +216,33 @@ cargo run -p zpdf-render-wgpu --example viewer -- <file.pdf>   # 交互浏览器
 > 抢救、悬空引用按规范解析为 null、CropBox 渲染、/Rotate //Resources 页面树继承、
 > 虚线、细线 hairline、双线性图像采样、文本渲染模式（OCR 隐藏文本）等。
 > 56 页真实文档对照 pdfium 逐页验证。
+>
+> **损坏/对抗性语料健壮性专项**（见 docs/CHANGELOG.md "Unreleased"）：对 618 个
+> 畸形/对抗性 PDF（tests/failed，来自 PDFBOX/Ghostscript/poppler/MOZILLA/PDFIUM/
+> cairo 等的 bug 与 fuzzer）做了一轮加固。可打开文档 166 → 426；渲染 panic 13 → 0；
+> 渲染超时 110 → 0、打开期挂起 2 → 0。手段：宽松 `%PDF` 头 + 无头碎片对象扫描恢复、
+> 全缓冲 `startxref` 搜索、catalog（含 `/ObjStm` 内/遮蔽/翻转 `/Type`）恢复与无 catalog
+> 仍打开、`resolve` 对缺失/free 项查修复表、文档级 `/Type /Page`/页面形状扫描兜底、
+> 默认 MediaBox、宽松 dict 解析；渲染侧防崩溃/防挂起：路径有限性边界检查（消除 tiny-skia
+> panic）、`hayro-jpeg2000` `catch_unwind`、64 Mpx 栅格上限、按页 clip 像素预算 +
+> bbox 限定裁剪、解释器命令/操作符预算、解释/渲染两阶段挂钟兜底。剩余 192 个无法打开者
+> 为真正不可恢复（口令加密、<400B 截断碎片、非 PDF、页面对象被 fuzzer 删除）。
 
 ### P4.1 — 完整字体支持
 - [x] CIDFont (Type0 composite fonts)：Identity-H、`/W`、`/CIDToGIDMap` 流、
       OpenType 包装的 CID-keyed CFF
-- [ ] CMap 解析（预定义 + 嵌入）— 仅 Identity-H/ToUnicode；非 Identity CMap 未支持
-- [ ] Vertical writing mode
+- [x] CMap 解析（预定义 + 嵌入）：嵌入 CMap 流 + Identity / UniGB/UniCNS/UniJIS/UniKS
+      UCS2/UTF16 系列；legacy 字节编码 CMap 回退 Identity（带告警）
+- [x] Vertical writing mode（WMode 1：按 /DW2 推进 + 字形原点居中）
 - [x] Type3 font (字形由内容流定义)：含间接 /CharProcs //Encoding //Widths，
       FirstChar≠0 修复
-- [ ] Font fallback (缺失字体替代) — 未嵌入 CJK 字体仍渲染空白
+- [x] Font fallback (缺失字体替代)：扫描系统字体目录，按 PostScript 名 / 全名 /
+      家族+样式 + CID 排序默认匹配（`zpdf_font::system`）
 - [ ] Variable fonts
 
 ### P4.2 — 完整颜色管理
-- [~] ICCBased 颜色空间：按 /N 解析为设备空间；moxcms 真正色彩管理未集成
+- [x] ICCBased 颜色空间：经 moxcms 通过嵌入 profile 转换（矢量/shading/调色板/图像
+      路径）；无可用 profile 时按 /N 回退设备空间
 - [x] CalGray / CalRGB / Lab（Lab→XYZ→sRGB 解析转换；CalGray/CalRGB 近似设备空间）
 - [x] Indexed 颜色空间（填充 + 图像调色板，含 Indexed-over-Lab）
 - [x] Separation / DeviceN（经 PDF 函数评估器走 tint transform → alternate）
@@ -237,19 +253,21 @@ cargo run -p zpdf-render-wgpu --example viewer -- <file.pdf>   # 交互浏览器
 ### P4.3 — 透明度与混合
 - [x] 全部 16 种 blend mode（GPU composite.wgsl 实现，W3C 公式）— M8
 - [x] 解释器发出 /BM → PushBlendGroup（双后端生效）
-- [ ] Soft Mask (luminosity/alpha)
+- [x] Soft Mask (luminosity/alpha)：ExtGState /SMask（含 /TR //BC）
 - [~] Transparency Group：离屏合成已实现；isolated/knockout 当前忽略（与 CPU 一致）
 - [x] Offscreen render pass 合成（M8 RenderLayer + scratch swap）
 
 ### P4.4 — Pattern 与 Shading
-- [~] Tiling Pattern (colored/uncolored) — 当前以中性灰占位，未做 cell 平铺
+- [x] Tiling Pattern (colored/uncolored)：真正 cell 平铺（form-XObject 机制，pattern
+      空间锚定 base CTM·/Matrix，平铺数上限保护）
 - [x] Axial Shading (Type 2)：`sh` 算子 + PatternType 2 填充（栅格化为图像）
 - [x] Radial Shading (Type 3)：同上，含 /Extend 与谱系根选择
 - [ ] Free-form Gouraud (Type 4)
 - [ ] Coons/Tensor Patch (Type 6/7)
 
 ### P4.5 — 注释与表单
-- [~] 页面 /Annots 已解析（PdfPage::annots）；appearance stream 渲染未实现
+- [x] 页面 /Annots 解析 + /AP appearance stream 渲染（12.5.5 BBox→Rect 映射，
+      /AS 状态，Hidden/NoView 标志）
 - [ ] Link / Text / Highlight annotation
 - [ ] Widget annotation (form fields)
 - [ ] AcroForm 字段解析
@@ -265,9 +283,9 @@ cargo run -p zpdf-render-wgpu --example viewer -- <file.pdf>   # 交互浏览器
 ### P4.7 — 附加 Filters
 - [x] LZWDecode
 - [x] CCITTFaxDecode (Group 3/4)
-- [ ] JBIG2Decode
-- [ ] JPXDecode (JPEG2000)
-- [ ] Crypt filter
+- [x] JBIG2Decode（手写 T.88 解码器）
+- [x] JPXDecode (JPEG2000)（hayro-jpeg2000；畸形码流 catch_unwind 防崩溃）
+- [x] Crypt filter（/StmF //StrF /Identity）
 
 ### P4.8 — 文本提取增强
 - [x] 结构化文本提取（坐标、大小：TextSpan）

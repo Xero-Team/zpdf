@@ -421,8 +421,16 @@ fn decode_jpx_image(
     colorspace: Option<&ResolvedColorSpace>,
 ) -> Result<DecodedImage> {
     use hayro_jpeg2000::{ColorSpace as JpxColorSpace, DecodeSettings, Image};
+    use std::panic::{catch_unwind, AssertUnwindSafe};
 
-    let image = Image::new(data, &DecodeSettings::default())
+    // hayro-jpeg2000 is a third-party decoder that panics (slice-index OOB) on
+    // some malformed/unusual JPX codestreams; input pre-validation cannot cover
+    // all of its internal invariants. Catch the unwind and surface a clean Err
+    // so a single bad image is skipped rather than aborting the whole render.
+    let image = catch_unwind(AssertUnwindSafe(|| Image::new(data, &DecodeSettings::default())))
+        .map_err(|_| {
+            Error::StreamDecode("JPXDecode: decoder panicked parsing codestream header".into())
+        })?
         .map_err(|e| Error::StreamDecode(format!("JPXDecode: {e}")))?;
 
     // Re-check the pixel limit against the *codestream* header dims, which
@@ -467,8 +475,8 @@ fn decode_jpx_image(
     let has_alpha = image.has_alpha();
     let channels = ncolor + usize::from(has_alpha);
 
-    let samples = image
-        .decode()
+    let samples = catch_unwind(AssertUnwindSafe(|| image.decode()))
+        .map_err(|_| Error::StreamDecode("JPXDecode: decoder panicked decoding codestream".into()))?
         .map_err(|e| Error::StreamDecode(format!("JPXDecode: {e}")))?;
     if samples.len() < pixel_count as usize * channels {
         return Err(Error::StreamDecode(format!(

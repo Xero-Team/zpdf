@@ -23,7 +23,7 @@ pub fn scan_all_objects(data: &[u8], limits: &ParseLimits) -> Result<(XrefTable,
 
     let mut table = XrefTable::new();
     // LATER occurrence wins (incremental update): overwrite earlier offsets.
-    for (id, offset) in headers {
+    for &(id, offset) in &headers {
         table.insert_overwrite(id, XrefEntry::InUse { offset, gen: id.1 });
     }
 
@@ -34,7 +34,20 @@ pub fn scan_all_objects(data: &[u8], limits: &ParseLimits) -> Result<(XrefTable,
     // Optional, recommended: index members of any /ObjStm we found. Never fatal.
     index_objstm_members(data, &mut table, limits);
 
-    let trailer = recover_trailer(data, &table, limits)?;
+    // Locate a catalog among ALL header occurrences (not just the later-wins
+    // survivors) and any /ObjStm members. When the catalog is a direct object
+    // shadowed by a later same-id object, re-point the table entry at its true
+    // offset so resolve(/Root) lands on the catalog rather than the shadow.
+    let catalog = find_catalog(data, &headers, &table, limits);
+    if let Some((id, Some(offset))) = catalog {
+        table.insert_overwrite(id, XrefEntry::InUse { offset, gen: id.1 });
+    }
+
+    // Recovery NEVER fails once objects were found: even with no discoverable
+    // catalog we return a (possibly Root-less) trailer so the file opens, and
+    // the document layer then scans for /Type /Page objects to build the page
+    // list. This is what lets headerless / catalog-less fragments render.
+    let trailer = recover_trailer(data, &table, limits, catalog.map(|(id, _)| id));
     Ok((table, trailer))
 }
 
@@ -133,26 +146,60 @@ fn parse_uint(bytes: &[u8]) -> Option<u32> {
     std::str::from_utf8(bytes).ok()?.parse::<u32>().ok()
 }
 
-/// Recover a trailer: prefer an explicit `trailer << ... >>` in the buffer;
-/// otherwise synthesize `<< /Root <catalog-id> R >>` by finding the /Catalog.
-fn recover_trailer(data: &[u8], table: &XrefTable, limits: &ParseLimits) -> Result<PdfDict> {
-    if let Some(d) = find_trailer_dict(data, limits) {
-        if d.get_ref("Root").is_ok() {
-            return Ok(d);
+/// Recover a trailer. Preference order: an explicit `trailer << ... >>` whose
+/// `/Root` actually resolves to a catalog; otherwise the `recovered_catalog`
+/// found by [`find_catalog`]; otherwise the explicit trailer's (unvalidated)
+/// `/Root` as a last resort; otherwise a Root-less dict so the file still opens
+/// (the document layer scans for `/Type /Page` objects to build the page list).
+fn recover_trailer(
+    data: &[u8],
+    table: &XrefTable,
+    limits: &ParseLimits,
+    recovered_catalog: Option<ObjectId>,
+) -> PdfDict {
+    if let Some(mut d) = find_trailer_dict(data, limits) {
+        // Trust an explicit /Root only if it genuinely points at a catalog —
+        // fuzzed files routinely carry a /Root aimed at a free/wrong object.
+        if let Ok(root) = d.get_ref("Root") {
+            if root_points_at_catalog(data, table, root, limits) {
+                return d;
+            }
         }
-        // Trailer present but no usable /Root — merge a recovered /Root if we can.
-        if let Some(root) = find_catalog(data, table, limits) {
-            let mut d = d;
+        if let Some(root) = recovered_catalog {
             d.insert(PdfName::new("Root"), PdfObject::Ref(root));
-            return Ok(d);
+            return d;
         }
-        return Ok(d); // best effort; downstream get_ref("Root") will error clearly
+        if d.get_ref("Root").is_ok() {
+            return d; // best effort; document layer falls back to a page scan
+        }
     }
 
-    let root = find_catalog(data, table, limits).ok_or(Error::InvalidXref(0))?;
     let mut trailer = PdfDict::new();
-    trailer.insert(PdfName::new("Root"), PdfObject::Ref(root));
-    Ok(trailer)
+    if let Some(root) = recovered_catalog {
+        trailer.insert(PdfName::new("Root"), PdfObject::Ref(root));
+    }
+    trailer
+}
+
+/// True if `root` resolves (via the recovered table, direct or compressed) to a
+/// catalog-shaped dict. Used to vet an explicit `trailer /Root` before trusting it.
+fn root_points_at_catalog(
+    data: &[u8],
+    table: &XrefTable,
+    root: ObjectId,
+    limits: &ParseLimits,
+) -> bool {
+    let obj = match table.get(root) {
+        Some(XrefEntry::InUse { offset, .. }) => {
+            ObjectParser::new(data, limits).parse_indirect_at(*offset as usize).ok()
+        }
+        Some(XrefEntry::Compressed {
+            stream_obj,
+            index_in_stream,
+        }) => decode_objstm_member(data, table, *stream_obj, *index_in_stream, limits),
+        _ => None,
+    };
+    obj.as_ref().map(object_dict).map(dict_is_catalog).unwrap_or(false)
 }
 
 /// Find the LAST `trailer` keyword in the buffer and lex the following dict.
@@ -166,26 +213,124 @@ fn find_trailer_dict(data: &[u8], limits: &ParseLimits) -> Option<PdfDict> {
     }
 }
 
-/// Scan the recovered object table for an object whose /Type is /Catalog.
-/// Prefers the object with the highest offset on ties (most recent in file).
-fn find_catalog(data: &[u8], table: &XrefTable, limits: &ParseLimits) -> Option<ObjectId> {
+/// Locate a document catalog among the recovered objects. Scans EVERY object
+/// header occurrence (in file order; later wins, matching incremental updates)
+/// plus any /ObjStm members, so a catalog shadowed by a later same-id object —
+/// or one living only inside an object stream — is still found. Returns the
+/// catalog's id and, for a direct object, its true byte offset (so the caller
+/// can re-point the xref entry); a `None` offset means a compressed member that
+/// is already addressable via its existing `Compressed` table entry.
+fn find_catalog(
+    data: &[u8],
+    headers: &[(ObjectId, u64)],
+    table: &XrefTable,
+    limits: &ParseLimits,
+) -> Option<(ObjectId, Option<u64>)> {
     let parser = ObjectParser::new(data, limits);
-    let mut best: Option<(u64, ObjectId)> = None;
+    let mut best: Option<(ObjectId, Option<u64>)> = None;
+    // Direct headers in file order: a later occurrence supersedes an earlier one.
+    for &(id, offset) in headers {
+        if let Ok((pid, obj)) = parser.parse_indirect_with_id(offset as usize) {
+            if pid == id && dict_is_catalog(object_dict(&obj)) {
+                best = Some((id, Some(offset)));
+            }
+        }
+    }
+    if best.is_some() {
+        return best;
+    }
+    // None direct: look inside object streams (catalog compressed in an /ObjStm).
     for id in table.object_ids() {
-        if let Some(XrefEntry::InUse { offset, .. }) = table.get(id) {
-            if let Ok(obj) = parser.parse_indirect_at(*offset as usize) {
-                if let Ok(dict) = obj.as_dict() {
-                    if dict.get_name("Type").unwrap_or("") == "Catalog" {
-                        match best {
-                            Some((bo, _)) if bo >= *offset => {}
-                            _ => best = Some((*offset, id)),
-                        }
-                    }
+        if let Some(XrefEntry::Compressed {
+            stream_obj,
+            index_in_stream,
+        }) = table.get(id)
+        {
+            if let Some(obj) = decode_objstm_member(data, table, *stream_obj, *index_in_stream, limits)
+            {
+                if dict_is_catalog(object_dict(&obj)) {
+                    best = Some((id, None));
                 }
             }
         }
     }
-    best.map(|(_, id)| id)
+    best
+}
+
+/// The dictionary backing an object, whether a bare dict or a stream's dict.
+fn object_dict(obj: &PdfObject) -> Option<&PdfDict> {
+    match obj {
+        PdfObject::Dict(d) => Some(d),
+        PdfObject::Stream(s) => Some(&s.dict),
+        _ => None,
+    }
+}
+
+/// Catalog detection tolerant of byte-flipped/absent `/Type`: a dict is a
+/// catalog if `/Type` is `/Catalog`, or — when `/Type` is wrong/absent — it is
+/// "catalog-shaped": carries `/Pages` and is neither a page-tree node (`/Kids`)
+/// nor a page leaf (`/Parent`/`/Contents`/`/MediaBox`).
+fn dict_is_catalog(dict: Option<&PdfDict>) -> bool {
+    let Some(d) = dict else { return false };
+    if d.get_name("Type").ok() == Some("Catalog") {
+        return true;
+    }
+    d.get("Pages").is_some()
+        && d.get("Kids").is_none()
+        && d.get("Parent").is_none()
+        && d.get("Contents").is_none()
+        && d.get("MediaBox").is_none()
+}
+
+/// Decode and extract one member of an `/ObjStm` container during recovery
+/// (pre-decryptor; encrypted object streams are handled later by the
+/// document-level page scan instead). Returns `None` on any malformation rather
+/// than erroring — recovery is best-effort. Mirrors the bounds/ordering guards
+/// of `PdfFile::extract_from_object_stream`.
+fn decode_objstm_member(
+    data: &[u8],
+    table: &XrefTable,
+    stream_obj: u32,
+    index_in_stream: u32,
+    limits: &ParseLimits,
+) -> Option<PdfObject> {
+    use crate::filters;
+    let off = match table.get(ObjectId(stream_obj, 0))? {
+        XrefEntry::InUse { offset, .. } => *offset,
+        _ => return None,
+    };
+    let obj = ObjectParser::new(data, limits)
+        .parse_indirect_at(off as usize)
+        .ok()?;
+    let PdfObject::Stream(stream) = obj else {
+        return None;
+    };
+    if stream.dict.get_name("Type").unwrap_or("") != "ObjStm" {
+        return None;
+    }
+    let n = usize::try_from(stream.dict.get_i64("N").ok()?).ok()?;
+    let first = usize::try_from(stream.dict.get_i64("First").ok()?).ok()?;
+    let decoded = filters::decode_stream(&stream.data, &stream.dict).ok()?;
+
+    let header = &decoded[..first.min(decoded.len())];
+    let mut hlex = Lexer::new(header, 0, limits);
+    let mut offsets = Vec::with_capacity(n.min(header.len()));
+    for _ in 0..n {
+        let _num = hlex.next_token().ok()?.as_i64().ok()?;
+        let m_off = usize::try_from(hlex.next_token().ok()?.as_i64().ok()?).ok()?;
+        offsets.push(m_off);
+    }
+    let idx = index_in_stream as usize;
+    let start = first.checked_add(*offsets.get(idx)?)?;
+    let end = match offsets.get(idx + 1) {
+        Some(next) => first.checked_add(*next)?,
+        None => decoded.len(),
+    }
+    .min(decoded.len());
+    if start > end {
+        return None;
+    }
+    Lexer::new(&decoded[start..end], 0, limits).next_token().ok()
 }
 
 /// For each recovered /Type /ObjStm object, decode it and add Compressed entries

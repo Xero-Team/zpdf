@@ -51,7 +51,48 @@ pub struct ContentInterpreter<'a> {
     /// Depth at which a hidden `BDC /OC` block began; painting is suppressed
     /// until the matching EMC.
     oc_hidden_from: Option<u32>,
+    /// Hard ceiling on emitted display-list commands. Adversarial or pathological
+    /// content (huge form-XObject fanout, massive tiling-pattern replication,
+    /// repeated shadings) can otherwise build a multi-million-command list that
+    /// hangs the renderer. Once exceeded, the interpreter stops emitting and
+    /// returns the partial page rather than hanging.
+    max_commands: usize,
+    /// Total operators executed across the page and all nested forms/patterns.
+    /// A command-count ceiling alone misses *exponential form-XObject fanout*,
+    /// where each call emits almost nothing yet spawns many more calls — the
+    /// command list grows slowly while the call tree explodes. Counting executed
+    /// operators bounds that work directly.
+    ops_executed: u64,
+    /// Ceiling for `ops_executed` (see [`DEFAULT_MAX_OPS`]).
+    max_ops: u64,
+    /// Wall-clock deadline for interpreting this page, the catch-all anti-hang
+    /// backstop. Some heavy work (e.g. rasterizing a shading into an image per
+    /// tiling-pattern cell) costs little in operators or emitted commands yet
+    /// much in time, so the count budgets above cannot bound it. Sampled at the
+    /// loop checkpoints. `None` disables it.
+    deadline: Option<std::time::Instant>,
+    /// Latches once `deadline` passes, so the clock is read only occasionally.
+    timed_out: bool,
+    /// `ops_executed` at the last clock sample (throttles `Instant::now`).
+    last_clock_op: u64,
 }
+
+/// Wall-clock budget for interpreting a single page (see `deadline`). Generous
+/// for any real page (which interpret in well under a second); bounds
+/// adversarial shading/pattern blowups.
+const INTERPRET_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// Default [`ContentInterpreter::max_commands`]. Real pages run to at most low
+/// hundreds of thousands of commands, so this is a generous headroom while still
+/// cutting off runaway form-XObject/tiling/shading emitters before their
+/// emission *time* (not just memory) becomes a hang. Tuned together with the
+/// renderer's wall-clock budget so interpret + render stay comfortably bounded.
+const DEFAULT_MAX_COMMANDS: usize = 500_000;
+
+/// Default [`ContentInterpreter::max_ops`]. Bounds total interpreter work
+/// (operators executed) so exponential form/pattern fanout that emits few
+/// commands per call still terminates promptly.
+const DEFAULT_MAX_OPS: u64 = 4_000_000;
 
 #[derive(Debug, Clone)]
 enum ActiveColorSpace {
@@ -218,7 +259,45 @@ impl<'a> ContentInterpreter<'a> {
             annotations: None,
             mc_depth: 0,
             oc_hidden_from: None,
+            max_commands: DEFAULT_MAX_COMMANDS,
+            ops_executed: 0,
+            max_ops: DEFAULT_MAX_OPS,
+            deadline: None,
+            timed_out: false,
+            last_clock_op: 0,
         }
+    }
+
+    /// Override the emitted-command ceiling (see [`DEFAULT_MAX_COMMANDS`]).
+    pub fn with_command_limit(mut self, max_commands: usize) -> Self {
+        self.max_commands = max_commands;
+        self
+    }
+
+    /// True once the page has hit any anti-hang ceiling: emitted commands,
+    /// executed operators, or the wall-clock deadline. Checked by the top-level
+    /// loop and the recursive form/tiling emitters so a runaway page is
+    /// truncated rather than hanging — whether it explodes in emitted commands,
+    /// raw call fanout, or per-call time (e.g. per-cell shading rasterization).
+    /// The clock is sampled at most once per 256 operators to keep it cheap.
+    fn over_budget(&mut self) -> bool {
+        if self.display_list.commands.len() >= self.max_commands
+            || self.ops_executed >= self.max_ops
+        {
+            return true;
+        }
+        if !self.timed_out {
+            if let Some(deadline) = self.deadline {
+                if self.ops_executed.wrapping_sub(self.last_clock_op) >= 16 {
+                    self.last_clock_op = self.ops_executed;
+                    if std::time::Instant::now() >= deadline {
+                        self.timed_out = true;
+                        tracing::warn!("content interpret exceeded time budget; truncating page");
+                    }
+                }
+            }
+        }
+        self.timed_out
     }
 
     /// Look a value up through the form-resources stack (innermost first),
@@ -313,9 +392,20 @@ impl<'a> ContentInterpreter<'a> {
     }
 
     pub fn interpret(mut self, content: &[u8]) -> DisplayList {
+        // Arm the interpret wall-clock backstop (unless already set by a caller).
+        if self.deadline.is_none() {
+            self.deadline = Some(std::time::Instant::now() + INTERPRET_BUDGET);
+        }
         let tokenizer = ContentTokenizer::new(content);
 
         for token in tokenizer {
+            if self.over_budget() {
+                tracing::warn!(
+                    "content exceeded {} display commands; truncating page",
+                    self.max_commands
+                );
+                break;
+            }
             match token {
                 ContentToken::Operand(obj) => {
                     self.operand_stack.push(obj);
@@ -391,6 +481,10 @@ impl<'a> ContentInterpreter<'a> {
     }
 
     fn execute_operator(&mut self, op: &str) {
+        // Count every operator toward the global work budget so exponential
+        // form/pattern fanout (which emits few commands per call) still stops.
+        self.ops_executed = self.ops_executed.saturating_add(1);
+
         // Uncolored (PaintType 2) pattern cells paint exclusively with the
         // color given at `scn` time; their own color operators are ignored.
         if self.suppress_color_ops
@@ -2016,6 +2110,11 @@ impl<'a> ContentInterpreter<'a> {
             tracing::warn!("form XObject nesting exceeds {MAX_FORM_DEPTH}; skipping");
             return;
         }
+        // Stop descending once the page budget is spent — bounds exponential
+        // form fanout (depth is capped but repetition is not).
+        if self.over_budget() {
+            return;
+        }
 
         // resolve_stream_data handles decryption, indirect /Filter refs and
         // caching; fall back to direct decode for synthetic streams.
@@ -2132,6 +2231,9 @@ impl<'a> ContentInterpreter<'a> {
         self.form_depth += 1;
         let tokenizer = ContentTokenizer::new(&decoded);
         for token in tokenizer {
+            if self.over_budget() {
+                break;
+            }
             match token {
                 ContentToken::Operand(obj) => {
                     self.operand_stack.push(obj);
@@ -2522,8 +2624,14 @@ impl<'a> ContentInterpreter<'a> {
         let cell_alpha = self.current.fill_alpha;
 
         self.form_depth += 1;
-        for j in j0..=j1 {
+        'tiles: for j in j0..=j1 {
             for i in i0..=i1 {
+                // A pathological /XStep,/YStep vs clip can imply millions of
+                // tiles; stop replicating once the page hits the command budget.
+                if self.over_budget() {
+                    tracing::warn!("tiling pattern exceeded command budget; truncating");
+                    break 'tiles;
+                }
                 let tile_offset = Matrix::translate(i as f64 * def.x_step, j as f64 * def.y_step);
                 let tile_ctm = to_page.concat(&tile_offset);
 

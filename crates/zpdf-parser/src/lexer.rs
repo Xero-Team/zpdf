@@ -314,6 +314,10 @@ impl<'a> Lexer<'a> {
         self.enter_container()?;
         self.pos += 2; // skip '<<'
         let mut dict = zpdf_core::PdfDict::new();
+        // Bound on malformed tokens skipped before we give up on this dict, so a
+        // pathological body can't make us churn. Well-formed dicts never trip it.
+        let mut bad = 0u32;
+        const MAX_BAD_TOKENS: u32 = 64;
         loop {
             self.skip_whitespace_and_comments();
             if self.data.get(self.pos..self.pos + 2) == Some(b">>") {
@@ -321,19 +325,47 @@ impl<'a> Lexer<'a> {
                 break;
             }
             if self.is_eof() {
-                return Err(Error::UnexpectedEof(self.pos as u64));
+                // Tolerate a dict whose closing `>>` was truncated or overwritten
+                // (e.g. by the next `N 0 obj` header): return what parsed so far
+                // rather than failing the whole — often critical-path — object.
+                break;
             }
-            let key = match self.next_token()? {
-                PdfObject::Name(n) => n,
-                other => {
-                    return Err(Error::InvalidObject(
-                        self.pos as u64,
-                        format!("dict key must be Name, got {}", other.type_name()),
-                    ));
+            // Read the key leniently: damaged files routinely corrupt one
+            // key/value while the rest of the dict is intact. A non-Name key or
+            // an untokenizable byte is skipped, not fatal — but a resource-limit
+            // error (depth/recursion) must still propagate so the guards hold.
+            let key = match self.next_token() {
+                Ok(PdfObject::Name(n)) => n,
+                Err(e @ Error::RecursionLimit(_)) => return Err(e),
+                Ok(_non_name) => {
+                    // next_token already advanced past the stray token.
+                    bad += 1;
+                    if bad > MAX_BAD_TOKENS {
+                        break;
+                    }
+                    continue;
+                }
+                Err(_) => {
+                    bad += 1;
+                    if bad > MAX_BAD_TOKENS {
+                        break;
+                    }
+                    self.pos += 1; // guarantee forward progress past the bad byte
+                    continue;
                 }
             };
-            let value = self.next_token()?;
-            let value = self.maybe_resolve_ref(value)?;
+            // A missing or garbled value ends the dict (best effort) instead of
+            // aborting the object; a recursion-limit error still propagates.
+            let value = match self.next_token() {
+                Ok(v) => v,
+                Err(e @ Error::RecursionLimit(_)) => return Err(e),
+                Err(_) => break,
+            };
+            let value = match self.maybe_resolve_ref(value) {
+                Ok(v) => v,
+                Err(e @ Error::RecursionLimit(_)) => return Err(e),
+                Err(_) => break,
+            };
             dict.insert(key, value);
         }
         self.leave_container();

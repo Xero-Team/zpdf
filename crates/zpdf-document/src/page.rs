@@ -10,6 +10,26 @@ use zpdf_parser::PdfFile;
 /// concert with the visited-set cycle checks.
 pub(crate) const MAX_PAGE_TREE_DEPTH: usize = 64;
 
+/// US Letter, used when a page has no usable `/MediaBox` (missing, degenerate,
+/// or non-finite). Matches the fallback mainstream PDF readers apply.
+const DEFAULT_MEDIA_BOX: Rect = Rect {
+    x0: 0.0,
+    y0: 0.0,
+    x1: 612.0,
+    y1: 792.0,
+};
+
+/// A box is usable only if all four corners are finite and it encloses a
+/// non-empty area once normalized. Rejects NaN/∞ (which would poison the raster
+/// dimension math downstream) and zero/negative-area rectangles.
+fn is_usable_box(r: &Rect) -> bool {
+    if ![r.x0, r.y0, r.x1, r.y1].iter().all(|v| v.is_finite()) {
+        return false;
+    }
+    let n = r.normalize();
+    n.width() > 0.0 && n.height() > 0.0
+}
+
 #[derive(Debug)]
 pub struct PdfPage {
     pub id: ObjectId,
@@ -50,10 +70,15 @@ impl PdfPage {
         // gathers whichever values the leaf doesn't carry itself.
         let inherited = InheritedAttrs::gather(file, dict);
 
+        // /MediaBox is required and inheritable, but real-world files routinely
+        // omit it or carry a degenerate/non-finite one. Mainstream readers fall
+        // back to US Letter rather than refusing the page; do the same so a
+        // single bad page never sinks the whole document.
         let media_box = inherited
             .media_box
-            .ok_or_else(|| zpdf_core::Error::MissingKey("MediaBox".into()))?;
-        let crop_box = inherited.crop_box.unwrap_or(media_box);
+            .filter(is_usable_box)
+            .unwrap_or(DEFAULT_MEDIA_BOX);
+        let crop_box = inherited.crop_box.filter(is_usable_box).unwrap_or(media_box);
         let rotate = inherited.rotate.unwrap_or(0);
         let resources = inherited.resources.unwrap_or_default();
 

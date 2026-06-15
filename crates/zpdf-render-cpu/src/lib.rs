@@ -13,10 +13,45 @@ pub struct CpuRenderer<'a> {
     rect_y1: f32,
     font_cache: Option<&'a FontCache>,
     image_cache: Option<&'a ImageCache>,
-    clip_stack: Vec<tiny_skia::Mask>,
+    clip_stack: Vec<ClipFrame>,
     current_clip: Option<tiny_skia::Mask>,
+    /// Cumulative full-raster clip-mask work (Σ width·height over built clip
+    /// masks). Bounds the O(clips × raster) cost of the raster-mask clip model:
+    /// pathological pages (100k+ tiny W clips on a large raster) would otherwise
+    /// allocate/zero gigabytes of mask memory and hang. Past the budget, further
+    /// clips are skipped (the page renders complete but slightly over-painted).
+    clip_pixel_spent: u64,
     blend_stack: Vec<BlendEntry>,
+    /// Wall-clock ceiling per page, an anti-hang backstop for adversarial pages
+    /// that emit hundreds of thousands of expensive primitives (strokes, large
+    /// fills, glyphs) — too many to render in bounded time yet individually
+    /// cheap, so neither the command nor clip-pixel budget catches them. `None`
+    /// disables it. Legit pages finish in well under the default and never hit it.
+    render_budget: Option<std::time::Duration>,
+    /// Absolute deadline for the current page (set in `begin_page`).
+    deadline: Option<std::time::Instant>,
+    /// Set once the page deadline passes; further draws are skipped so the
+    /// command loop drains quickly and the page returns partially rendered.
+    over_budget: bool,
 }
+
+/// Default [`CpuRenderer::render_budget`]. Generous enough that no realistic page
+/// approaches it (complex pages render in well under a second) while bounding
+/// pathological inputs to a few seconds.
+const DEFAULT_RENDER_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// A saved clip state for the clip stack. `Skipped` records a budget-dropped
+/// `PushClip` so its matching `PopClip` leaves `current_clip` untouched.
+enum ClipFrame {
+    Empty,
+    Mask(tiny_skia::Mask),
+    Skipped,
+}
+
+/// Ceiling on cumulative clip-mask pixel-work per page (see `clip_pixel_spent`).
+/// ~2 Gpx keeps every realistic clip-heavy page intact while bounding adversarial
+/// ones to roughly a second of mask work.
+const MAX_CLIP_PIXEL_WORK: u64 = 2_000_000_000;
 
 struct BlendEntry {
     pixmap: tiny_skia::Pixmap,
@@ -50,8 +85,18 @@ impl<'a> CpuRenderer<'a> {
             image_cache: None,
             clip_stack: Vec::new(),
             current_clip: None,
+            clip_pixel_spent: 0,
             blend_stack: Vec::new(),
+            render_budget: Some(DEFAULT_RENDER_BUDGET),
+            deadline: None,
+            over_budget: false,
         }
+    }
+
+    /// Override the per-page wall-clock render budget (`None` disables it).
+    pub fn with_render_budget(mut self, budget: Option<std::time::Duration>) -> Self {
+        self.render_budget = budget;
+        self
     }
 
     pub fn with_fonts(mut self, cache: &'a FontCache) -> Self {
@@ -72,6 +117,34 @@ impl<'a> CpuRenderer<'a> {
 
     fn to_pixel_x(&self, x: f32) -> f32 {
         (x - self.rect_x0) * self.scale
+    }
+
+    /// Finish a built path, rejecting it (caller then skips the draw) when its
+    /// bounds are non-finite or astronomically larger than the target pixmap.
+    /// Such geometry — from a degenerate text/CTM matrix or a corrupt coordinate
+    /// — overflows tiny-skia's AA blitter row-offset arithmetic and panics with
+    /// an out-of-range slice index instead of being clipped. A generous overscan
+    /// (64× the longest pixmap side, min 1e6 px) keeps all legitimately
+    /// off-page-but-clipped content while dropping only crash-inducing extents.
+    fn finish_within_limits(&self, pb: tiny_skia::PathBuilder) -> Option<tiny_skia::Path> {
+        let path = pb.finish()?;
+        let b = path.bounds();
+        let vals = [b.left(), b.top(), b.right(), b.bottom()];
+        if vals.iter().any(|v| !v.is_finite()) {
+            tracing::warn!("skipping non-finite path");
+            return None;
+        }
+        let span = self
+            .pixmap
+            .as_ref()
+            .map(|p| p.width().max(p.height()) as f32)
+            .unwrap_or(0.0);
+        let limit = (span * 64.0).max(1_000_000.0);
+        if vals.iter().any(|v| v.abs() > limit) {
+            tracing::warn!("skipping out-of-range path bounds={b:?}");
+            return None;
+        }
+        Some(path)
     }
 
     fn build_skia_path(&self, path: &Path) -> Option<tiny_skia::Path> {
@@ -99,7 +172,7 @@ impl<'a> CpuRenderer<'a> {
                 }
             }
         }
-        pb.finish()
+        self.finish_within_limits(pb)
     }
 
     fn color_to_paint(color: &Color, alpha: f32) -> tiny_skia::Paint<'static> {
@@ -221,17 +294,34 @@ impl<'a> CpuRenderer<'a> {
     }
 
     fn push_clip(&mut self, path: &Path, rule: &FillRule) {
-        let pixmap = match self.pixmap.as_ref() {
-            Some(p) => p,
-            None => return,
+        let Some(pixmap) = self.pixmap.as_ref() else {
+            return;
         };
+        let (pw, ph) = (pixmap.width(), pixmap.height());
+
+        // Budget guard: once the page has spent its clip-mask pixel-work, stop
+        // building new full-raster masks (which would hang on 100k-clip pages).
+        // The matching PopClip pops a `Skipped` frame and the previously-active
+        // clip stays in force — strictly tighter than dropping clipping entirely.
+        if self.clip_pixel_spent >= MAX_CLIP_PIXEL_WORK {
+            self.clip_stack.push(ClipFrame::Skipped);
+            return;
+        }
 
         let Some(skia_path) = self.build_skia_path(path) else {
+            // A non-finite/out-of-range clip path: keep push/pop balanced.
+            self.clip_stack.push(ClipFrame::Skipped);
             return;
         };
 
-        let mut mask = tiny_skia::Mask::new(pixmap.width(), pixmap.height())
-            .unwrap_or_else(|| tiny_skia::Mask::new(1, 1).unwrap());
+        let mut mask = match tiny_skia::Mask::new(pw, ph) {
+            Some(m) => m,
+            None => {
+                self.clip_stack.push(ClipFrame::Skipped);
+                return;
+            }
+        };
+        self.clip_pixel_spent += pw as u64 * ph as u64;
 
         mask.fill_path(
             &skia_path,
@@ -240,35 +330,43 @@ impl<'a> CpuRenderer<'a> {
             tiny_skia::Transform::identity(),
         );
 
-        // Intersect with current clip if any
+        // Intersect with the current clip, but only across the new clip path's
+        // device bbox: outside it the new mask is already 0, so the intersection
+        // there is 0 too and need not be touched. This turns the per-clip
+        // intersection from O(raster) into O(clip bbox).
         if let Some(ref current) = self.current_clip {
+            let b = skia_path.bounds();
+            let w = pw as usize;
+            let h = ph as usize;
+            let x0 = (b.left().floor().max(0.0) as usize).min(w);
+            let x1 = (b.right().ceil().max(0.0) as usize).min(w);
+            let y0 = (b.top().floor().max(0.0) as usize).min(h);
+            let y1 = (b.bottom().ceil().max(0.0) as usize).min(h);
             let current_data = current.data();
             let mask_data = mask.data_mut();
-            for (m, c) in mask_data.iter_mut().zip(current_data.iter()) {
-                *m = ((*m as u16 * *c as u16) / 255) as u8;
+            for y in y0..y1 {
+                let row = y * w;
+                for x in x0..x1 {
+                    let i = row + x;
+                    mask_data[i] = ((mask_data[i] as u16 * current_data[i] as u16) / 255) as u8;
+                }
             }
         }
 
-        // Save current clip and set new one
-        if let Some(old) = self.current_clip.take() {
-            self.clip_stack.push(old);
-        } else {
-            // Push a sentinel empty entry to know we had no clip before
-            let sentinel = tiny_skia::Mask::new(1, 1).unwrap();
-            self.clip_stack.push(sentinel);
-        }
+        let frame = match self.current_clip.take() {
+            Some(old) => ClipFrame::Mask(old),
+            None => ClipFrame::Empty,
+        };
+        self.clip_stack.push(frame);
         self.current_clip = Some(mask);
     }
 
     fn pop_clip(&mut self) {
-        if let Some(prev) = self.clip_stack.pop() {
-            if prev.width() == 1 && prev.height() == 1 {
-                self.current_clip = None;
-            } else {
-                self.current_clip = Some(prev);
-            }
-        } else {
-            self.current_clip = None;
+        match self.clip_stack.pop() {
+            // Budget-skipped push: leave the active clip untouched.
+            Some(ClipFrame::Skipped) => {}
+            Some(ClipFrame::Mask(prev)) => self.current_clip = Some(prev),
+            Some(ClipFrame::Empty) | None => self.current_clip = None,
         }
     }
 
@@ -374,7 +472,13 @@ impl<'a> CpuRenderer<'a> {
             image_cache: self.image_cache,
             clip_stack: Vec::new(),
             current_clip: None,
+            clip_pixel_spent: 0,
             blend_stack: Vec::new(),
+            // Share the parent page's deadline so a soft-mask group cannot hang
+            // past the budget the top-level render already started counting.
+            render_budget: self.render_budget,
+            deadline: self.deadline,
+            over_budget: self.over_budget,
         };
         for cmd in &mask.commands.commands {
             let _ = sub.execute(cmd);
@@ -596,7 +700,7 @@ impl<'a> CpuRenderer<'a> {
                 OutlineCommand::Close => pb.close(),
             }
         }
-        pb.finish()
+        self.finish_within_limits(pb)
     }
 
     fn outline_to_pixel(
@@ -751,7 +855,7 @@ impl<'a> CpuRenderer<'a> {
                 PathElement::Close => pb.close(),
             }
         }
-        pb.finish()
+        self.finish_within_limits(pb)
     }
 
     /// Transform a point from Type3 glyph space all the way to pixel space.
@@ -865,12 +969,36 @@ impl<'a> RenderBackend for CpuRenderer<'a> {
         self.rect_x0 = info.page_rect.x0 as f32;
         self.rect_y0 = info.page_rect.y0 as f32;
         self.rect_y1 = info.page_rect.y1 as f32;
+        // Fresh clip state + budget for each page (a renderer may be reused).
+        self.clip_stack.clear();
+        self.current_clip = None;
+        self.clip_pixel_spent = 0;
+        self.over_budget = false;
+        self.deadline = self.render_budget.map(|d| std::time::Instant::now() + d);
 
         // ceil(), not truncation: a 595x842pt page at 110 DPI is 909.03x1286.6px
         // and must produce a 910x1287 raster (pdfium semantics) so no content is
         // sliced off the right/bottom edges.
-        let w = ((info.page_rect.width() * info.scale as f64).ceil() as u32).max(1);
-        let h = ((info.page_rect.height() * info.scale as f64).ceil() as u32).max(1);
+        let mut w = ((info.page_rect.width() * info.scale as f64).ceil() as u32).max(1);
+        let mut h = ((info.page_rect.height() * info.scale as f64).ceil() as u32).max(1);
+
+        // Clamp the raster to a total-pixel budget. A pathological MediaBox (or
+        // a high DPI on a huge page) otherwise demands a multi-gigabyte Pixmap
+        // that aborts the process on the allocation alone, or makes per-pixel
+        // work (fills, blits, per-clip masks) hang. Scaling BOTH the dimensions
+        // and `self.scale` by the same factor keeps geometry consistent, so the
+        // output is a smaller-but-complete render instead of a crash/timeout.
+        const MAX_PIXELS: u64 = 64 * 1024 * 1024; // 64 Mpx (~8192×8192)
+        let pixels = w as u64 * h as u64;
+        if pixels > MAX_PIXELS {
+            let shrink = (MAX_PIXELS as f64 / pixels as f64).sqrt();
+            self.scale *= shrink as f32;
+            w = ((info.page_rect.width() * self.scale as f64).ceil() as u32).max(1);
+            h = ((info.page_rect.height() * self.scale as f64).ceil() as u32).max(1);
+            tracing::warn!(
+                "raster {pixels} px exceeds budget {MAX_PIXELS}; clamped to {w}x{h} (scale ×{shrink:.4})"
+            );
+        }
 
         let mut pixmap = tiny_skia::Pixmap::new(w, h).ok_or(CpuRenderError::PixmapCreation)?;
 
@@ -884,6 +1012,23 @@ impl<'a> RenderBackend for CpuRenderer<'a> {
     }
 
     fn execute(&mut self, cmd: &RenderCommand) -> Result<(), Self::Error> {
+        // Anti-hang backstop: once the page's wall-clock budget is spent, skip
+        // remaining draws so the command loop drains and the page returns
+        // partially rendered instead of hanging. Checked before EVERY command:
+        // a page may have only a handful of commands that are each individually
+        // very expensive (e.g. dozens of large images scaled across a huge
+        // raster), so a coarse stride would never sample the clock in time.
+        // Instant::now is cheap enough to call per command.
+        if self.over_budget {
+            return Ok(());
+        }
+        if let Some(deadline) = self.deadline {
+            if std::time::Instant::now() >= deadline {
+                self.over_budget = true;
+                tracing::warn!("render exceeded time budget; truncating page");
+                return Ok(());
+            }
+        }
         match cmd {
             RenderCommand::FillPath {
                 path,
