@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use zpdf_display_list::*;
 use zpdf_font::{FontCache, GlyphOutline, OutlineCommand};
 use zpdf_image::ImageCache;
@@ -33,6 +35,81 @@ pub struct CpuRenderer<'a> {
     /// Set once the page deadline passes; further draws are skipped so the
     /// command loop drains quickly and the page returns partially rendered.
     over_budget: bool,
+    /// Soft-mask coverage planes rasterized at build position (offset 0),
+    /// keyed by mask identity. Tiling patterns attach the same mask (modulo
+    /// offset) to every painted command of every tile; without this the full
+    /// page-sized mask would re-rasterize per command. Cleared per page —
+    /// the keys are Arc pointers, only stable while the display list lives.
+    soft_mask_planes: HashMap<SoftMaskPlaneKey, Vec<u8>>,
+}
+
+/// Identity of a [`SoftMask`] up to its offset: command list and transfer
+/// LUT by Arc pointer, plus the scalar parameters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct SoftMaskPlaneKey {
+    commands: usize,
+    kind: SoftMaskKind,
+    backdrop_luma_bits: u32,
+    transfer: usize,
+}
+
+impl SoftMaskPlaneKey {
+    fn new(mask: &SoftMask) -> Self {
+        Self {
+            commands: std::sync::Arc::as_ptr(&mask.commands) as *const () as usize,
+            kind: mask.kind,
+            backdrop_luma_bits: mask.backdrop_luma.to_bits(),
+            transfer: mask
+                .transfer
+                .as_ref()
+                .map(|lut| std::sync::Arc::as_ptr(lut) as *const () as usize)
+                .unwrap_or(0),
+        }
+    }
+}
+
+/// Coverage where the mask group painted nothing — what a fresh raster
+/// produces outside the group, used to fill strips vacated by a plane shift.
+fn unpainted_value(mask: &SoftMask) -> u8 {
+    let v = match mask.kind {
+        SoftMaskKind::Luminosity => (mask.backdrop_luma.clamp(0.0, 1.0) * 255.0).round() as u8,
+        SoftMaskKind::Alpha => 0,
+    };
+    match &mask.transfer {
+        Some(lut) => lut[v as usize],
+        None => v,
+    }
+}
+
+/// Translate a `w`×`h` coverage plane by whole device pixels, filling vacated
+/// areas with `fill`. Offsets at or beyond the plane size yield all-`fill`.
+fn shift_plane(base: &[u8], w: u32, h: u32, dx: i64, dy: i64, fill: u8) -> Vec<u8> {
+    let (w, h) = (w as usize, h as usize);
+    let mut out = vec![fill; w * h];
+    if base.len() != w * h {
+        return out;
+    }
+    if dx.unsigned_abs() as usize >= w || dy.unsigned_abs() as usize >= h {
+        return out;
+    }
+    let copy_w = w - dx.unsigned_abs() as usize;
+    let copy_h = h - dy.unsigned_abs() as usize;
+    let (src_x, dst_x) = if dx >= 0 {
+        (0, dx as usize)
+    } else {
+        ((-dx) as usize, 0)
+    };
+    let (src_y, dst_y) = if dy >= 0 {
+        (0, dy as usize)
+    } else {
+        ((-dy) as usize, 0)
+    };
+    for row in 0..copy_h {
+        let src = (src_y + row) * w + src_x;
+        let dst = (dst_y + row) * w + dst_x;
+        out[dst..dst + copy_w].copy_from_slice(&base[src..src + copy_w]);
+    }
+    out
 }
 
 /// Default [`CpuRenderer::render_budget`]. Generous enough that no realistic page
@@ -90,6 +167,7 @@ impl<'a> CpuRenderer<'a> {
             render_budget: Some(DEFAULT_RENDER_BUDGET),
             deadline: None,
             over_budget: false,
+            soft_mask_planes: HashMap::new(),
         }
     }
 
@@ -372,7 +450,7 @@ impl<'a> CpuRenderer<'a> {
 
     fn push_blend_group(&mut self, blend_mode: BlendMode, alpha: f32, mask: Option<&SoftMask>) {
         // Rasterize the soft mask before parking the base pixmap (needs dims).
-        let mask_plane = mask.and_then(|m| self.rasterize_soft_mask(m));
+        let mask_plane = mask.and_then(|m| self.soft_mask_plane(m));
 
         let pixmap = match self.pixmap.take() {
             Some(p) => p,
@@ -442,8 +520,37 @@ impl<'a> CpuRenderer<'a> {
         self.pixmap = Some(base);
     }
 
+    /// Coverage plane for `mask`, honoring its page-space offset. The base
+    /// raster (at build position) is cached per mask identity; offset uses are
+    /// derived by shifting it — exact wherever the base raster painted, and
+    /// vacated strips take the mask's unpainted value, which is what a fresh
+    /// raster yields outside the group too.
+    fn soft_mask_plane(&mut self, mask: &SoftMask) -> Option<Vec<u8>> {
+        let (w, h) = match self.pixmap.as_ref() {
+            Some(p) => (p.width(), p.height()),
+            None => return None,
+        };
+
+        // Page-space offset → device pixels (device y grows downward).
+        let dx = (mask.offset.0 * self.scale).round() as i64;
+        let dy = (-mask.offset.1 * self.scale).round() as i64;
+
+        let key = SoftMaskPlaneKey::new(mask);
+        if !self.soft_mask_planes.contains_key(&key) {
+            let plane = self.rasterize_soft_mask(mask)?;
+            self.soft_mask_planes.insert(key, plane);
+        }
+        let base = self.soft_mask_planes.get(&key)?;
+
+        if dx == 0 && dy == 0 {
+            return Some(base.clone());
+        }
+        Some(shift_plane(base, w, h, dx, dy, unpainted_value(mask)))
+    }
+
     /// Render a soft mask's group commands offscreen (same page geometry as
-    /// the current target) and reduce to a per-pixel coverage plane.
+    /// the current target) and reduce to a per-pixel coverage plane, ignoring
+    /// the offset (callers shift the result).
     fn rasterize_soft_mask(&self, mask: &SoftMask) -> Option<Vec<u8>> {
         let (w, h) = match self.pixmap.as_ref() {
             Some(p) => (p.width(), p.height()),
@@ -479,6 +586,7 @@ impl<'a> CpuRenderer<'a> {
             render_budget: self.render_budget,
             deadline: self.deadline,
             over_budget: self.over_budget,
+            soft_mask_planes: HashMap::new(),
         };
         for cmd in &mask.commands.commands {
             let _ = sub.execute(cmd);
@@ -1008,6 +1116,9 @@ impl<'a> RenderBackend for CpuRenderer<'a> {
         );
 
         self.pixmap = Some(pixmap);
+        // Mask-plane keys are Arc pointers into the previous display list;
+        // they must not survive into a new page.
+        self.soft_mask_planes.clear();
         Ok(())
     }
 
@@ -1348,5 +1459,60 @@ mod tests {
         assert_eq!(out[0], 128); // round((0+255+0+255)/4)
         assert_eq!(out[4], 150); // (100+200+100+200)/4
         assert_eq!(out[3], 255);
+    }
+
+    #[test]
+    fn shift_plane_right_down() {
+        // 3x3 with a marker at (0,0); shift +1,+1 moves it to (1,1).
+        let mut base = vec![10u8; 9];
+        base[0] = 200;
+        let out = shift_plane(&base, 3, 3, 1, 1, 7);
+        assert_eq!(out[3 + 1], 200);
+        // Vacated top row and left column take the fill value.
+        assert_eq!(&out[0..3], &[7, 7, 7]);
+        assert_eq!(out[3], 7);
+        assert_eq!(out[6], 7);
+        // Copied region keeps base values.
+        assert_eq!(out[5], 10);
+    }
+
+    #[test]
+    fn shift_plane_left_up() {
+        let mut base = vec![10u8; 9];
+        base[2 * 3 + 2] = 200; // marker at (2,2)
+        let out = shift_plane(&base, 3, 3, -1, -1, 7);
+        assert_eq!(out[3 + 1], 200);
+        // Vacated bottom row and right column take the fill value.
+        assert_eq!(&out[6..9], &[7, 7, 7]);
+        assert_eq!(out[2], 7);
+        assert_eq!(out[5], 7);
+    }
+
+    #[test]
+    fn shift_plane_out_of_range_is_all_fill() {
+        let base = vec![10u8; 9];
+        assert_eq!(shift_plane(&base, 3, 3, 3, 0, 7), vec![7u8; 9]);
+        assert_eq!(shift_plane(&base, 3, 3, 0, -3, 7), vec![7u8; 9]);
+    }
+
+    #[test]
+    fn unpainted_value_modes() {
+        let mask = |kind, backdrop_luma, transfer| SoftMask {
+            kind,
+            commands: std::sync::Arc::new(DisplayList::new(Rect::new(0.0, 0.0, 1.0, 1.0))),
+            offset: (0.0, 0.0),
+            backdrop_luma,
+            transfer,
+        };
+        assert_eq!(unpainted_value(&mask(SoftMaskKind::Alpha, 0.5, None)), 0);
+        assert_eq!(
+            unpainted_value(&mask(SoftMaskKind::Luminosity, 0.5, None)),
+            128
+        );
+        let inverting = std::sync::Arc::new(std::array::from_fn(|i| 255 - i as u8));
+        assert_eq!(
+            unpainted_value(&mask(SoftMaskKind::Alpha, 0.0, Some(inverting))),
+            255
+        );
     }
 }

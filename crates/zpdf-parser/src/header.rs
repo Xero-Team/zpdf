@@ -7,13 +7,12 @@ pub struct PdfHeader {
 }
 
 /// Version assumed when a `%PDF` marker is present but the version digits that
-/// should follow it are missing or malformed. 1.4 is a safe lower bound: it
-/// predates object/xref streams, so nothing is silently disabled, yet every
-/// reader treats it as a normal modern document.
-const DEFAULT_VERSION: PdfHeader = PdfHeader { major: 1, minor: 4 };
+/// should follow it are missing or malformed. Matching other robust readers,
+/// a bad version is treated as a modern document (PDF 1.7) rather than rejected.
+const DEFAULT_VERSION: PdfHeader = PdfHeader { major: 1, minor: 7 };
 
 /// Locate and parse the `%PDF` header. Real-world corpora are full of files
-/// whose version field is garbage (`%PDF-1.)`, `%PDF-0000000`, `%PDF-/Si3`),
+/// whose version field is garbage (`%PDF-1.)`, `%PDF-0000000`, `%PDF-a.4`),
 /// missing entirely (`%PDF-\n2 0 obj`), or written without the conventional
 /// hyphen (`%PDF/DA2`). Matching mainstream readers, we accept any file that
 /// contains the literal `%PDF` and fall back to [`DEFAULT_VERSION`] whenever the
@@ -27,10 +26,24 @@ pub fn parse_header(data: &[u8]) -> Result<PdfHeader> {
         .position(|w| w == marker)
         .ok_or(Error::NotAPdf)?;
 
-    // The version conventionally follows as "-M.m"; tolerate a missing hyphen.
+    // The version conventionally follows as "-M.m"; tolerate a missing hyphen
+    // and a malformed/garbage version. A bad version does not make the body
+    // unparseable, so warn and assume a modern default rather than rejecting
+    // the file. (NotAPdf above is reserved for a wholly missing `%PDF` marker.)
     let rest = &data[pos + marker.len()..];
     let rest = rest.strip_prefix(b"-").unwrap_or(rest);
-    Ok(parse_version(rest).unwrap_or(DEFAULT_VERSION))
+    match parse_version(rest) {
+        Some(h) => Ok(h),
+        None => {
+            let shown = String::from_utf8_lossy(&rest[..rest.len().min(8)]);
+            tracing::warn!(
+                "malformed PDF header version {shown:?}; assuming PDF {}.{}",
+                DEFAULT_VERSION.major,
+                DEFAULT_VERSION.minor
+            );
+            Ok(DEFAULT_VERSION)
+        }
+    }
 }
 
 /// Best-effort `M.m` parse from the bytes following the `%PDF[-]` marker.
@@ -80,14 +93,17 @@ mod tests {
 
     #[test]
     fn marker_without_hyphen_defaults_version() {
-        // `%PDF/DA2 ...` — real Ghostscript output; accept it as 1.4.
+        // `%PDF/DA2 ...` — real Ghostscript output; accepted (default version).
         let h = parse_header(b"%PDF/DA2 \x1d\n").unwrap();
-        assert_eq!((h.major, h.minor), (1, 4));
+        assert_eq!((h.major, h.minor), (1, 7));
     }
 
     #[test]
     fn malformed_version_defaults() {
+        // veraPDF corpus 6.1.2 file-header test (`%PDF-a.4`) plus assorted
+        // fuzzed/headerless variants: a bad version must not reject the file.
         for bytes in [
+            &b"%PDF-a.4\n"[..],
             &b"%PDF-1.)"[..],
             &b"%PDF-0000000"[..],
             &b"%PDF-/Si3/De"[..],
@@ -96,8 +112,14 @@ mod tests {
             &b"%PDF-\n2 0 obj"[..],
         ] {
             let h = parse_header(bytes).expect("marker present => header parses");
-            assert_eq!((h.major, h.minor), (1, 4), "input {bytes:?}");
+            assert_eq!((h.major, h.minor), (1, 7), "input {bytes:?}");
         }
+    }
+
+    #[test]
+    fn truncated_version_defaults() {
+        let h = parse_header(b"%PDF-").unwrap();
+        assert_eq!((h.major, h.minor), (1, 7));
     }
 
     #[test]

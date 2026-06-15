@@ -75,6 +75,51 @@ pub struct ContentInterpreter<'a> {
     timed_out: bool,
     /// `ops_executed` at the last clock sample (throttles `Instant::now`).
     last_clock_op: u64,
+    /// Tiling-pattern-scoped soft-mask reuse, installed by
+    /// `paint_tiling_pattern` for the duration of its tile loop (`None`
+    /// elsewhere). Tiles replay identical content under CTMs that differ only
+    /// by translation, so a mask built once at the canonical tile position is
+    /// exact on every tile — see `build_or_reuse_soft_mask`.
+    soft_mask_reuse: Option<TileMaskReuse>,
+    /// Operator counter within the current tile replay, reset at each tile
+    /// start. Part of the reuse key: the same count identifies the same `gs`
+    /// site (hence identical inherited state) across tiles, and two distinct
+    /// sites within one cell can never collide.
+    tile_op_index: u64,
+}
+
+/// State for soft-mask reuse across the tiles of one `paint_tiling_pattern`
+/// loop. Masks are built as if at the *canonical* tile — the middle of the
+/// tile index range, whose cell lies inside the page window — and reused
+/// everywhere else via [`SoftMask::offset`]. Backends shift the rasterized
+/// plane by that page-space offset; samples are only ever taken inside the
+/// painting tile's cell, whose pre-image is the canonical cell, which the
+/// page-rect raster window covers.
+struct TileMaskReuse {
+    masks: HashMap<SoftMaskReuseKey, SoftMaskReuseEntry>,
+    /// Page-space offset of the tile currently being replayed, relative to
+    /// the canonical tile: `to_page_linear · ((i−ic)·XStep, (j−jc)·YStep)`.
+    cur_delta: (f64, f64),
+}
+
+/// Key for tiling-pattern soft-mask reuse: a `gs` site (operator index within
+/// the tile replay + ExtGState object) plus the CTM's linear part. A hit
+/// means the cached mask differs from the needed one only by the CTM
+/// translation delta, which maps 1:1 to a page-space offset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct SoftMaskReuseKey {
+    op_index: u64,
+    gs_id: ObjectId,
+    ctm_linear: [u64; 4],
+}
+
+#[derive(Debug, Clone)]
+struct SoftMaskReuseEntry {
+    mask: SoftMask,
+    /// CTM translation of the canonical-position build; reuse offsets are
+    /// relative to this.
+    build_e: f64,
+    build_f: f64,
 }
 
 /// Wall-clock budget for interpreting a single page (see `deadline`). Generous
@@ -265,6 +310,8 @@ impl<'a> ContentInterpreter<'a> {
             deadline: None,
             timed_out: false,
             last_clock_op: 0,
+            soft_mask_reuse: None,
+            tile_op_index: 0,
         }
     }
 
@@ -485,6 +532,13 @@ impl<'a> ContentInterpreter<'a> {
         // form/pattern fanout (which emits few commands per call) still stops.
         self.ops_executed = self.ops_executed.saturating_add(1);
 
+        // Position counter for tiling-pattern soft-mask reuse: the n-th
+        // operator of tile k is the n-th operator of every other tile, so the
+        // count identifies a `gs` site across tiles (including operators in
+        // nested form XObjects, which replay identically per tile).
+        if self.soft_mask_reuse.is_some() {
+            self.tile_op_index += 1;
+        }
         // Uncolored (PaintType 2) pattern cells paint exclusively with the
         // color given at `scn` time; their own color operators are ignored.
         if self.suppress_color_ops
@@ -1767,7 +1821,7 @@ impl<'a> ContentInterpreter<'a> {
     fn apply_ext_gstate(&mut self, name: &str) {
         // Try inline dict first (common in TikZ/PGF-generated PDFs)
         if let Some(dict) = self.lookup_res(|r| r.ext_g_state_inline.get(name).cloned()) {
-            self.apply_ext_gstate_dict(&dict);
+            self.apply_ext_gstate_dict(&dict, None);
             return;
         }
 
@@ -1788,11 +1842,13 @@ impl<'a> ContentInterpreter<'a> {
 
         if let Ok(dict) = obj.as_dict() {
             let dict = dict.clone();
-            self.apply_ext_gstate_dict(&dict);
+            self.apply_ext_gstate_dict(&dict, Some(gs_id));
         }
     }
 
-    fn apply_ext_gstate_dict(&mut self, dict: &zpdf_core::PdfDict) {
+    /// `gs_id` identifies the indirect ExtGState (None for inline dicts);
+    /// it keys tiling-pattern soft-mask reuse.
+    fn apply_ext_gstate_dict(&mut self, dict: &zpdf_core::PdfDict, gs_id: Option<ObjectId>) {
         if let Ok(a) = dict.get_f64("ca") {
             self.current.fill_alpha = a as f32;
         }
@@ -1854,10 +1910,94 @@ impl<'a> ContentInterpreter<'a> {
                 self.current.soft_mask = None;
             }
             Some(PdfObject::Dict(sm)) => {
-                self.current.soft_mask = self.build_soft_mask(&sm);
+                self.current.soft_mask = self.build_or_reuse_soft_mask(&sm, gs_id);
             }
             _ => {}
         }
+    }
+
+    /// Build a soft mask, going through the tiling-pattern reuse cache when
+    /// one is installed. Within one tile loop, the same `gs` site recurs once
+    /// per tile under CTMs sharing the linear part, and the mask group's
+    /// commands come out identical up to a page-space translation, which the
+    /// backends apply via [`SoftMask::offset`]. The first build is rebased to
+    /// the loop's canonical tile (interior to the page, so the page-rect
+    /// raster window covers its whole cell); every use — the building tile
+    /// included — then samples the mask only inside its own cell, whose
+    /// pre-image under the shift is inside that covered window. Outside tile
+    /// loops (`soft_mask_reuse` is None) every mask is built fresh, as before.
+    fn build_or_reuse_soft_mask(
+        &mut self,
+        sm: &zpdf_core::PdfDict,
+        gs_id: Option<ObjectId>,
+    ) -> Option<SoftMask> {
+        let key = match (gs_id, self.soft_mask_reuse.is_some()) {
+            (Some(id), true) => Some(SoftMaskReuseKey {
+                op_index: self.tile_op_index,
+                gs_id: id,
+                ctm_linear: [
+                    self.current.ctm.a.to_bits(),
+                    self.current.ctm.b.to_bits(),
+                    self.current.ctm.c.to_bits(),
+                    self.current.ctm.d.to_bits(),
+                ],
+            }),
+            _ => None,
+        };
+        let Some(key) = key else {
+            return self.build_soft_mask(sm);
+        };
+
+        if !self
+            .soft_mask_reuse
+            .as_ref()
+            .is_some_and(|r| r.masks.contains_key(&key))
+        {
+            // Miss: build at the canonical tile position. A page-space
+            // translation left-multiplies the CTM, i.e. only shifts (e, f),
+            // so adding the current→canonical delta is exact whatever `cm`s
+            // the cell applied on top of the tile CTM.
+            //
+            // The reuse context is taken out for the duration of the build:
+            // a `gs` inside the mask group itself must build fresh, not
+            // insert group-context entries whose op indices could collide
+            // with later cell sites (this also freezes the tile op counter,
+            // keeping site numbering identical between build- and hit-tiles).
+            let reuse = self.soft_mask_reuse.take()?;
+            let delta = reuse.cur_delta;
+            let saved_ctm_ef = (self.current.ctm.e, self.current.ctm.f);
+            let saved_base_ef = (self.base_ctm.e, self.base_ctm.f);
+            self.current.ctm.e += delta.0;
+            self.current.ctm.f += delta.1;
+            self.base_ctm.e += delta.0;
+            self.base_ctm.f += delta.1;
+            let built = self.build_soft_mask(sm);
+            let (build_e, build_f) = (self.current.ctm.e, self.current.ctm.f);
+            (self.current.ctm.e, self.current.ctm.f) = saved_ctm_ef;
+            (self.base_ctm.e, self.base_ctm.f) = saved_base_ef;
+            self.soft_mask_reuse = Some(reuse);
+            let mask = built?;
+            if let Some(reuse) = self.soft_mask_reuse.as_mut() {
+                reuse.masks.insert(
+                    key,
+                    SoftMaskReuseEntry {
+                        mask,
+                        build_e,
+                        build_f,
+                    },
+                );
+            }
+        }
+
+        let entry = self.soft_mask_reuse.as_ref()?.masks.get(&key)?;
+        let mut mask = entry.mask.clone();
+        // Equal linear parts ⇒ the page-space delta of any point is exactly
+        // the CTM translation delta.
+        mask.offset = (
+            (self.current.ctm.e - entry.build_e) as f32,
+            (self.current.ctm.f - entry.build_f) as f32,
+        );
+        Some(mask)
     }
 
     /// Build a [`SoftMask`] from an ExtGState /SMask dict: interpret the /G
@@ -1927,6 +2067,7 @@ impl<'a> ContentInterpreter<'a> {
         Some(SoftMask {
             kind,
             commands: std::sync::Arc::new(mask_dl),
+            offset: (0.0, 0.0),
             backdrop_luma,
             transfer,
         })
@@ -2622,6 +2763,20 @@ impl<'a> ContentInterpreter<'a> {
         // The scn-time color paints an uncolored cell.
         let pattern_color = self.current.fill_color;
         let cell_alpha = self.current.fill_alpha;
+        // Soft-mask reuse across tiles (see build_or_reuse_soft_mask): masks
+        // are built as if at the middle tile of the range, whose cell sits in
+        // the page interior. Saved and restored so nested pattern loops don't
+        // share each other's keys. (Overflow-safe midpoint: i0/i1 can sit at
+        // the i64 extremes for pathological steps.)
+        let canonical_ctm = to_page.concat(&Matrix::translate(
+            (i0 + (i1 - i0) / 2) as f64 * def.x_step,
+            (j0 + (j1 - j0) / 2) as f64 * def.y_step,
+        ));
+        let saved_mask_reuse = self.soft_mask_reuse.replace(TileMaskReuse {
+            masks: HashMap::new(),
+            cur_delta: (0.0, 0.0),
+        });
+        let saved_tile_op_index = self.tile_op_index;
 
         self.form_depth += 1;
         'tiles: for j in j0..=j1 {
@@ -2634,6 +2789,12 @@ impl<'a> ContentInterpreter<'a> {
                 }
                 let tile_offset = Matrix::translate(i as f64 * def.x_step, j as f64 * def.y_step);
                 let tile_ctm = to_page.concat(&tile_offset);
+                // Restart the per-tile operator count so `gs` sites line up
+                // across tiles, and point mask builds at the canonical tile.
+                self.tile_op_index = 0;
+                if let Some(reuse) = self.soft_mask_reuse.as_mut() {
+                    reuse.cur_delta = (canonical_ctm.e - tile_ctm.e, canonical_ctm.f - tile_ctm.f);
+                }
 
                 // Per-tile state: cells start from a clean color state (and
                 // must not re-enter the active pattern), inherit alpha.
@@ -2709,6 +2870,8 @@ impl<'a> ContentInterpreter<'a> {
             }
         }
         self.form_depth -= 1;
+        self.soft_mask_reuse = saved_mask_reuse;
+        self.tile_op_index = saved_tile_op_index;
 
         self.text_matrix = saved_text_matrix;
         self.text_line_matrix = saved_text_line_matrix;

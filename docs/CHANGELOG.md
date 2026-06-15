@@ -1,71 +1,69 @@
 # Changelog
 
-## Unreleased — corrupt & adversarial PDF robustness
+## Unreleased
+
+Two robustness passes since 0.4.0, both with zero C/C++ dependencies.
+
+### Corrupt & adversarial PDF robustness (618-file failing corpus)
 
 A large-scale run over a 618-file corpus of malformed/adversarial PDFs
 (`tests/failed/`, drawn from the PDFBOX, Ghostscript, poppler, MOZILLA, PDFIUM,
-cairo, … bug trackers and fuzzers) drove a robustness pass. The harness runs
-`zpdf info` (document open) and then `zpdf render` per page (which could
-TIMEOUT or PANIC). Still zero C/C++ dependencies.
+cairo, … bug trackers and fuzzers). The harness runs `zpdf info` (document open)
+and then `zpdf render` per page (which could TIMEOUT or PANIC).
 
-### Highlights
-
-- **Documents that open: 166 → 426** of the 618-file failing corpus.
-- **Render panics: 13 → 0.** No input crashes the renderer.
-- **Render timeouts: 110 → 0**, and the **2 open-time hangs → 0**.
-- The residual 192 unopenable files are genuinely unrecoverable — password
-  -encrypted (need the password), sub-400-byte truncated fragments, non-PDFs,
-  and fuzzer minimizations whose page objects were deleted/corrupted (the
+- **Documents that open: 166 → 426**; **render panics 13 → 0**, **render
+  timeouts 110 → 0**, **open-time hangs 2 → 0**. The residual 192 are genuinely
+  unrecoverable (password-encrypted, sub-400-byte truncated fragments, non-PDFs,
+  and fuzzer minimizations whose page objects were deleted/corrupted — the
   source tools reject them too).
+- **Document-open recovery** (`zpdf-parser`, `zpdf-document`): lenient `%PDF`
+  header (missing hyphen `%PDF/DA2` / garbage version) with object-scan recovery
+  when the marker is absent entirely (headerless `N G obj` fragments);
+  whole-buffer `startxref` search (tolerates trailing garbage after `%%EOF`);
+  stronger tail-scan recovery — `find_catalog` scans every object header +
+  `/ObjStm` members, finds a catalog compressed inside an object stream,
+  re-points a catalog shadowed by a later same-id object, tolerates a
+  byte-flipped/absent `/Type`, validates an explicit trailer `/Root`, and opens
+  the file even with no catalog; `resolve` consults the repair table for
+  missing/free xref entries (new `PdfFile::find_objects_by_type` /
+  `all_object_ids` / `force_repair_scan`); a document-level page fallback that
+  scans for `/Type /Page` then "page-shaped" dicts when the `/Pages` tree is
+  unreachable; default `/MediaBox` (US Letter); and lenient `read_dict` (skips a
+  corrupt key/value, tolerates a lost `>>`, recursion-limit errors still
+  propagate).
+- **Render safety** (`zpdf-render-cpu`, `zpdf-content`, `zpdf-image`): a
+  path-bounds sanitizer (no more tiny-skia coverage-overflow panics), a
+  `catch_unwind` around `hayro-jpeg2000` (no more JPX panics), and layered
+  anti-hang budgets — a 64 Mpx raster clamp, a per-page clip-mask pixel-work
+  budget plus bbox-bounded clip intersection, interpreter command (500k) and
+  operator (4M) ceilings, and per-page wall-clock backstops on both the
+  interpret and render phases (`CpuRenderer::with_render_budget`). `info` page
+  listing capped at 1000 pages.
 
-### Document-open recovery (`zpdf-parser`, `zpdf-document`)
+### veraPDF corpus: 2907/2907
 
-- **Lenient `%PDF` header** — accepts a missing hyphen (`%PDF/DA2`) or garbage
-  version (`%PDF-1.)`, `%PDF-0000000`), defaulting to 1.4; and a **missing
-  marker is no longer fatal** — a headerless fragment that begins directly with
-  `N G obj` falls through to object-scan recovery.
-- **`find_startxref` scans the whole buffer** for the last `startxref` rather
-  than only the final 1 KiB, so files with large trailing garbage after `%%EOF`
-  still find an otherwise-valid xref.
-- **Stronger tail-scan recovery** — `find_catalog` now scans every object-header
-  occurrence (not just the later-wins survivors) and `/ObjStm` members, finds a
-  catalog **compressed inside an object stream**, **re-points a catalog shadowed
-  by a later same-id object**, tolerates a byte-flipped/absent `/Type`, and
-  **validates an explicit trailer `/Root`** before trusting it. Recovery now
-  *opens the file even when no catalog is found* (Root-less trailer) so the
-  document layer can still build a page list.
-- **`resolve` consults the repair table for missing/free xref entries** (not
-  only wrong-object-at-offset), so a subtly broken xref no longer silently
-  empties the page tree. New `PdfFile::find_objects_by_type` / `all_object_ids`
-  / `force_repair_scan`.
-- **Document-level page fallback** — when the `/Pages` tree is unreachable
-  (missing/null `/Root`, missing `/Pages`, all leaves pruned, catalog in an
-  `/ObjStm`, …) the catalog scans every object for `/Type /Page`, then for
-  "page-shaped" dicts (carry `/MediaBox`/`/Contents`, no `/Kids`) to recover
-  pages whose `/Type` was corrupted.
-- **Default `/MediaBox`** to US Letter when missing, degenerate, or non-finite,
-  instead of failing the page.
-- **Lenient dict parsing** — `read_dict` skips a malformed key/value and
-  tolerates a lost `>>` at EOF (bounded, forward-progress-guaranteed), so one
-  corrupt key no longer aborts the whole object; recursion-limit errors still
-  propagate.
+Running the full veraPDF test corpus (`https://labs.pdfa.org/stressful-corpus/`, 2,907 atomic
+PDF/A / PDF/UA / ISO 32000 / Isartor / TWG files) surfaced five failures;
+all are fixed and the corpus now renders 100% (see `tests/corpus-report.md`,
+harness: `tests/corpus_run.sh`).
 
-### Render safety (`zpdf-render-cpu`, `zpdf-content`, `zpdf-image`)
-
-- **No more tiny-skia panics** — paths are rejected before rasterization when
-  their bounds are non-finite or astronomically larger than the pixmap (which
-  overflowed the AA blitter's row-offset math).
-- **No more JPEG 2000 panics** — the third-party `hayro-jpeg2000` decode is
-  wrapped in `catch_unwind` and surfaced as a clean `StreamDecode` error.
-- **Layered anti-hang budgets** (partial render beats a hang on adversarial
-  input): a 64 Mpx output-raster clamp (scales geometry to match); a per-page
-  clip-mask pixel-work budget plus bbox-bounded clip intersection (100k-clip
-  pages no longer allocate gigabytes of masks); interpreter command (500k) and
-  operator (4M) ceilings that bound runaway form-XObject fanout and
-  tiling/shading replication; and per-page **wall-clock backstops** on both the
-  interpret (8 s) and render (8 s) phases (`CpuRenderer::with_render_budget`).
-- **`info` page listing capped** at 1000 pages so a 100k-page document no longer
-  appears to hang while resolving and printing every page.
+- **Lenient header version** (`zpdf-parser`): a malformed version after the
+  `%PDF-` magic (e.g. `%PDF-a.4`) warns and assumes 1.7 instead of rejecting
+  the file; `NotAPdf` now only means the magic is missing.
+- **String limit raised** (`zpdf-core`): default
+  `ParseLimits::max_string_length` 64 KiB → 16 MiB. ISO 32000 has no string
+  limit (64 KiB is PDF/A-1's); the cap remains a configurable allocation
+  guard.
+- **Tiling-pattern soft-mask reuse** (`zpdf-content`, `zpdf-display-list`,
+  `zpdf-render-cpu`): a cell applying an ExtGState `/SMask` used to rebuild
+  the mask group per tile (interpret + shading raster), and the CPU backend
+  re-rasterized the mask plane per painted command — ~100 s for a 4 KB
+  corpus file. Tile CTMs differ only by translation, so the mask is now
+  built once per `gs` site (rebased to the loop's middle tile, keyed by
+  per-tile operator index + ExtGState id + CTM linear part) and carried by
+  the new `SoftMask::offset`; the CPU backend caches the rasterized plane
+  per mask identity and derives offset uses by a shift-blit. Pixel-exact on
+  the corpus shape, ~25× faster.
 
 ## 0.4.0 — closing the 0.3.0 gaps
 

@@ -63,6 +63,11 @@ pub struct SoftMask {
     /// The /G transparency group's interpreted content. Font/image ids refer
     /// to the same caches as the surrounding display list.
     pub commands: std::sync::Arc<DisplayList>,
+    /// Page-space translation to apply to `commands` when rasterizing. Lets a
+    /// mask built once for a tiling-pattern cell be reused at every tile
+    /// position (the tile CTMs differ only by translation), instead of
+    /// re-interpreting the mask group per tile.
+    pub offset: (f32, f32),
     /// /BC backdrop luminosity (0..1) for areas the group leaves unpainted.
     /// Luminosity masks default to 0 (fully masked out).
     pub backdrop_luma: f32,
@@ -70,7 +75,7 @@ pub struct SoftMask {
     pub transfer: Option<std::sync::Arc<[u8; 256]>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SoftMaskKind {
     /// Mask value = group luminosity over the /BC backdrop.
     Luminosity,

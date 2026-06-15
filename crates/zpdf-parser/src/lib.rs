@@ -98,8 +98,9 @@ impl PdfFile {
             }
         };
         // Past this point the document is structurally usable; if the version
-        // header was absent/garbage, assume a modern default rather than failing.
-        let header = header_res.unwrap_or(PdfHeader { major: 1, minor: 4 });
+        // header was absent entirely, assume a modern default (matching
+        // header::parse_header's malformed-version fallback) rather than failing.
+        let header = header_res.unwrap_or(PdfHeader { major: 1, minor: 7 });
 
         let mut file = Self {
             data,
