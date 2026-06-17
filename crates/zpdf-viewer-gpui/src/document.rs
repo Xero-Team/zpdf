@@ -92,10 +92,14 @@ pub fn load_document(path: PathBuf) -> Result<LoadedDocument, DocumentError> {
             page: index + 1,
             source,
         })?;
+        // Report the rendered (effective) page box so the sidebar/footer point
+        // dimensions match what the viewer actually rasterizes; rotation is shown
+        // separately, as page size is conventionally reported pre-rotation.
+        let eb = page.effective_box();
         pages.push(PageSummary {
             index,
-            width: page.width(),
-            height: page.height(),
+            width: eb.width(),
+            height: eb.height(),
             rotate: page.rotate,
         });
     }
@@ -136,7 +140,11 @@ impl LoadedDocument {
         })?;
         let mut images = ImageCache::new();
         let mut colors = IccCache::new();
-        let display_list = ContentInterpreter::new(page.media_box)
+        // Render the effective box (CropBox ∩ MediaBox) with `/Rotate` baked in,
+        // matching the winit viewer and `PdfPage::effective_box()` invariant — the
+        // raw `media_box` would show the untrimmed sheet and ignore page rotation.
+        let display_list = ContentInterpreter::new(page.effective_box())
+            .with_page_rotation(page.rotate)
             .with_fonts(&mut fonts)
             .with_document(self.pdf.file(), &page.resources)
             .with_images(&mut images)
