@@ -1,8 +1,9 @@
 # Changelog
 
-## Unreleased
+## 0.5.0 — robustness & closing the 0.4.0 limitations
 
-Two robustness passes since 0.4.0, both with zero C/C++ dependencies.
+Two robustness passes and a feature-completion pass since 0.4.0, all with zero
+C/C++ dependencies.
 
 ### Corrupt & adversarial PDF robustness (618-file failing corpus)
 

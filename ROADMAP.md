@@ -248,13 +248,16 @@ cargo run -p zpdf-render-wgpu --example viewer -- <file.pdf>   # 交互浏览器
 - [x] Separation / DeviceN（经 PDF 函数评估器走 tint transform → alternate）
 - [x] PDF 函数评估器（type 0/2/3/4，zpdf-color/src/function.rs）
 - [ ] Overprint
-- [ ] Rendering Intent
+- [x] Rendering Intent（`ri` 算子 + ExtGState `/RI` + 图像 `/Intent` → moxcms 渲染意图；
+      `IccCache` 按 (ObjectId, intent) 键控，含 ICC 规定回退序）
 
 ### P4.3 — 透明度与混合
 - [x] 全部 16 种 blend mode（GPU composite.wgsl 实现，W3C 公式）— M8
 - [x] 解释器发出 /BM → PushBlendGroup（双后端生效）
 - [x] Soft Mask (luminosity/alpha)：ExtGState /SMask（含 /TR //BC）
-- [~] Transparency Group：离屏合成已实现；isolated/knockout 当前忽略（与 CPU 一致）
+- [x] Transparency Group：离屏合成已实现；knockout（`/K true`，逐元素 shape pass +
+      `knockout_merge`，PDF 11.4.9）与 non-isolated（`/I false` 透传到 backdrop）已实现；
+      仅"非隔离 + 常量 alpha/软掩码/非 Normal 混合"仍近似为 isolated
 - [x] Offscreen render pass 合成（M8 RenderLayer + scratch swap）
 
 ### P4.4 — Pattern 与 Shading

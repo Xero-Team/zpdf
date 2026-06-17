@@ -20,7 +20,7 @@ Features: `cpu-render` (default, tiny-skia), `gpu-render` (wgpu). Set on the roo
 
 ## Architecture
 
-13-crate workspace. Strict one-direction dependency flow — **render backends never depend on the parser**.
+14-crate workspace. Strict one-direction dependency flow — **render backends never depend on the parser**.
 
 ```
 PDF bytes
@@ -37,7 +37,9 @@ Supporting crates feed into zpdf-content: **zpdf-font** (Type1/TrueType/CID, CMa
 
 **zpdf** is the public facade crate — re-exports all APIs, feature-gates `cpu`/`gpu` modules.
 
-**zpdf-cli** is the binary crate with subcommands: `info`, `dump`, `render`, `debug-stream`.
+**zpdf-cli** is the binary crate with subcommands: `info`, `dump`, `render`, `text`, `compare`, `debug-stream`.
+
+**zpdf-viewer-gpui** is a standalone native desktop reader built on Zed's GPUI (`publish = false`); it depends on the `zpdf` facade with `gpu-render` and renders pages through the wgpu backend. Not part of the parsing/rendering dependency chain. (`zpdf-render-wgpu` also ships a lighter winit-based `viewer` example.)
 
 ## Key Design Constraints
 

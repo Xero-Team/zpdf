@@ -37,8 +37,9 @@ GPU (wgpu) renderers whose output matches within <1% of pixels.
 - **CPU rendering** — tiny-skia backend, PNG output at any DPI.
 - **GPU rendering** — wgpu backend (fills, strokes, clips, text, images, blend
   groups); matches the CPU renderer within <1% pixels.
-- **Tooling** — CLI (`info`/`render`/`text`/`compare`/`dump`/`debug-stream`)
-  and an interactive winit viewer.
+- **Tooling** — CLI (`info`/`render`/`text`/`compare`/`dump`/`debug-stream`),
+  an interactive winit viewer example, and a native GPUI desktop reader
+  (`zpdf-viewer-gpui`).
 
 ## Documentation
 
@@ -65,6 +66,9 @@ cargo run -p zpdf-cli -- compare out.png gpu.png --out diff.png
 
 # Interactive viewer (pan/zoom/page-flip)
 cargo run -p zpdf-render-wgpu --example viewer -- document.pdf
+
+# Native desktop reader (GPUI: page list, zoom, fit-width, keyboard nav)
+cargo run -p zpdf-viewer-gpui -- document.pdf
 ```
 
 ## Library usage
@@ -99,7 +103,7 @@ to render on the GPU — everything upstream is identical. See [docs/library.md]
 
 ## Architecture
 
-13-crate workspace with a strict one-direction dependency flow. **Render backends
+14-crate workspace with a strict one-direction dependency flow. **Render backends
 depend only on `zpdf-display-list`, never on the parser** — parsing and rendering stay
 fully decoupled.
 
@@ -114,8 +118,9 @@ zpdf-core            Shared types: ObjectId, PdfObject, Matrix, Rect, Error, Par
   ├─ zpdf-display-list   Flat RenderCommand sequence (the backend contract)
   ├─ zpdf-render          RenderBackend trait
   │   ├─ zpdf-render-cpu   tiny-skia backend
-  │   └─ zpdf-render-wgpu  wgpu backend (+ viewer example)
+  │   └─ zpdf-render-wgpu  wgpu backend (+ winit viewer example)
   ├─ zpdf-cli        CLI tool
+  ├─ zpdf-viewer-gpui  Native desktop reader (GPUI; depends on the facade)
   └─ zpdf            Facade crate (re-exports; feature-gates cpu / gpu)
 ```
 
