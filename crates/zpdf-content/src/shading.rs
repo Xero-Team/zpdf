@@ -20,7 +20,7 @@ pub struct ShadingDef {
     pub to_page: Matrix,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum ShadingKind {
     Axial {
         x0: f64,
@@ -36,6 +36,28 @@ pub enum ShadingKind {
         y1: f64,
         r1: f64,
     },
+    /// Types 4–7 (free-form/lattice Gouraud meshes, Coons/tensor patches):
+    /// pre-tessellated triangles already transformed into **page space**, each
+    /// vertex carrying its resolved RGB. Rasterized by Gouraud interpolation
+    /// rather than the LUT path (`lut` holds the mean colour for the
+    /// pattern-stroke fallback; `to_page`/`extend_*` are unused).
+    Mesh {
+        triangles: Vec<MeshTriangle>,
+    },
+}
+
+/// A mesh-shading vertex: page-space position with resolved RGB.
+#[derive(Debug, Clone, Copy)]
+pub struct MeshVertex {
+    pub x: f32,
+    pub y: f32,
+    pub rgb: [f32; 3],
+}
+
+/// A mesh-shading triangle (three Gouraud-shaded vertices).
+#[derive(Debug, Clone, Copy)]
+pub struct MeshTriangle {
+    pub v: [MeshVertex; 3],
 }
 
 impl ShadingDef {
@@ -60,8 +82,9 @@ impl ShadingDef {
     /// Parametric position of a shading-space point, or `None` where the
     /// shading paints nothing (outside an unextended ramp or radial cone).
     fn param_at(&self, x: f64, y: f64) -> Option<f64> {
-        match self.kind {
+        match &self.kind {
             ShadingKind::Axial { x0, y0, x1, y1 } => {
+                let (x0, y0, x1, y1) = (*x0, *y0, *x1, *y1);
                 let (dx, dy) = (x1 - x0, y1 - y0);
                 let len2 = dx * dx + dy * dy;
                 if len2 < f64::EPSILON {
@@ -78,6 +101,7 @@ impl ShadingDef {
                 y1,
                 r1,
             } => {
+                let (x0, y0, r0, x1, y1, r1) = (*x0, *y0, *r0, *x1, *y1, *r1);
                 // Solve |p - c(s)| = r(s) with c(s) = c0 + s·(c1-c0),
                 // r(s) = r0 + s·(r1-r0) for the largest valid s (per spec).
                 let (cdx, cdy, dr) = (x1 - x0, y1 - y0, r1 - r0);
@@ -113,6 +137,8 @@ impl ShadingDef {
                 }
                 None
             }
+            // Meshes are not parametric; `rasterize` handles them directly.
+            ShadingKind::Mesh { .. } => None,
         }
     }
 
@@ -139,6 +165,11 @@ impl ShadingDef {
 /// the page-space rect `region` (row 0 = top edge, i.e. `region.y1`).
 /// Returns `None` if the shading-space transform is singular.
 pub fn rasterize(def: &ShadingDef, region: Rect, w: u32, h: u32) -> Option<Vec<u8>> {
+    // Mesh shadings carry their own page-space geometry — Gouraud-rasterize the
+    // triangles directly instead of inverse-mapping a parametric ramp.
+    if let ShadingKind::Mesh { triangles } = &def.kind {
+        return Some(rasterize_mesh(triangles, region, w, h));
+    }
     let inv = def.to_page.inverse()?;
     let mut buf = vec![0u8; (w as usize) * (h as usize) * 4];
     let (rw, rh) = (region.width(), region.height());
@@ -161,6 +192,112 @@ pub fn rasterize(def: &ShadingDef, region: Rect, w: u32, h: u32) -> Option<Vec<u
         }
     }
     Some(buf)
+}
+
+/// Gouraud-rasterize page-space `triangles` into a `w`×`h` premultiplied-RGBA
+/// buffer covering page-space `region` (row 0 = top). Every covered pixel is
+/// opaque, so straight RGB equals premultiplied.
+fn rasterize_mesh(triangles: &[MeshTriangle], region: Rect, w: u32, h: u32) -> Vec<u8> {
+    let mut buf = vec![0u8; (w as usize) * (h as usize) * 4];
+    let (rw, rh) = (region.width(), region.height());
+    if rw <= 0.0 || rh <= 0.0 || w == 0 || h == 0 {
+        return buf;
+    }
+    let to_px = |x: f32, y: f32| -> (f32, f32) {
+        (
+            ((x as f64 - region.x0) / rw * w as f64) as f32,
+            ((region.y1 - y as f64) / rh * h as f64) as f32,
+        )
+    };
+    for tri in triangles {
+        raster_triangle(&mut buf, w, h, tri, &to_px);
+    }
+    buf
+}
+
+/// Scanline-fill one triangle with barycentric RGB interpolation. The top-left
+/// fill rule ensures pixels on a shared edge are painted by exactly one of the
+/// two adjacent triangles (no seams, no double blend).
+fn raster_triangle(
+    buf: &mut [u8],
+    w: u32,
+    h: u32,
+    tri: &MeshTriangle,
+    to_px: &impl Fn(f32, f32) -> (f32, f32),
+) {
+    let p = [
+        to_px(tri.v[0].x, tri.v[0].y),
+        to_px(tri.v[1].x, tri.v[1].y),
+        to_px(tri.v[2].x, tri.v[2].y),
+    ];
+    let c = [tri.v[0].rgb, tri.v[1].rgb, tri.v[2].rgb];
+    let minx = p
+        .iter()
+        .map(|q| q.0)
+        .fold(f32::INFINITY, f32::min)
+        .floor()
+        .max(0.0) as i32;
+    let maxx = p
+        .iter()
+        .map(|q| q.0)
+        .fold(f32::NEG_INFINITY, f32::max)
+        .ceil()
+        .min(w as f32) as i32;
+    let miny = p
+        .iter()
+        .map(|q| q.1)
+        .fold(f32::INFINITY, f32::min)
+        .floor()
+        .max(0.0) as i32;
+    let maxy = p
+        .iter()
+        .map(|q| q.1)
+        .fold(f32::NEG_INFINITY, f32::max)
+        .ceil()
+        .min(h as f32) as i32;
+    let area = edge(p[0], p[1], p[2]);
+    if area.abs() < 1e-7 {
+        return; // degenerate
+    }
+    let inv = 1.0 / area;
+    // An edge a→b is a "top or left" edge (its zero-coverage pixels are filled).
+    let tl = |a: (f32, f32), b: (f32, f32)| -> bool { a.1 > b.1 || (a.1 == b.1 && a.0 < b.0) };
+    let (tl0, tl1, tl2) = (tl(p[1], p[2]), tl(p[2], p[0]), tl(p[0], p[1]));
+    for y in miny..maxy {
+        for x in minx..maxx {
+            let s = (x as f32 + 0.5, y as f32 + 0.5);
+            let w0 = edge(p[1], p[2], s);
+            let w1 = edge(p[2], p[0], s);
+            let w2 = edge(p[0], p[1], s);
+            let inside = if area > 0.0 {
+                (w0 > 0.0 || (w0 == 0.0 && tl0))
+                    && (w1 > 0.0 || (w1 == 0.0 && tl1))
+                    && (w2 > 0.0 || (w2 == 0.0 && tl2))
+            } else {
+                (w0 < 0.0 || (w0 == 0.0 && tl0))
+                    && (w1 < 0.0 || (w1 == 0.0 && tl1))
+                    && (w2 < 0.0 || (w2 == 0.0 && tl2))
+            };
+            if !inside {
+                continue;
+            }
+            let (b0, b1, b2) = (w0 * inv, w1 * inv, w2 * inv);
+            let r = b0 * c[0][0] + b1 * c[1][0] + b2 * c[2][0];
+            let g = b0 * c[0][1] + b1 * c[1][1] + b2 * c[2][1];
+            let bl = b0 * c[0][2] + b1 * c[1][2] + b2 * c[2][2];
+            let o = ((y as usize) * (w as usize) + x as usize) * 4;
+            buf[o] = (r.clamp(0.0, 1.0) * 255.0).round() as u8;
+            buf[o + 1] = (g.clamp(0.0, 1.0) * 255.0).round() as u8;
+            buf[o + 2] = (bl.clamp(0.0, 1.0) * 255.0).round() as u8;
+            buf[o + 3] = 255;
+        }
+    }
+}
+
+/// Signed area (×2) of triangle `a,b,c` — the edge function for `c` against `a→b`.
+#[inline]
+fn edge(a: (f32, f32), b: (f32, f32), c: (f32, f32)) -> f32 {
+    (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0)
 }
 
 #[cfg(test)]
@@ -270,5 +407,48 @@ mod tests {
         let right = ((10 - 1) * 4) as usize;
         assert!(buf[right] > 225, "right {}", buf[right]);
         assert_eq!(buf[3], 255);
+    }
+
+    #[test]
+    fn rasterize_mesh_triangle() {
+        // Page-space triangle (0,0)=red, (1,0)=green, (0,1)=blue over the unit
+        // square, rasterized at 4×4. Gouraud interpolation + coverage.
+        let tri = MeshTriangle {
+            v: [
+                MeshVertex {
+                    x: 0.0,
+                    y: 0.0,
+                    rgb: [1.0, 0.0, 0.0],
+                },
+                MeshVertex {
+                    x: 1.0,
+                    y: 0.0,
+                    rgb: [0.0, 1.0, 0.0],
+                },
+                MeshVertex {
+                    x: 0.0,
+                    y: 1.0,
+                    rgb: [0.0, 0.0, 1.0],
+                },
+            ],
+        };
+        let def = ShadingDef {
+            kind: ShadingKind::Mesh {
+                triangles: vec![tri],
+            },
+            lut: vec![[0.33, 0.33, 0.33]],
+            extend_start: false,
+            extend_end: false,
+            to_page: Matrix::identity(),
+        };
+        let buf = rasterize(&def, Rect::new(0.0, 0.0, 1.0, 1.0), 4, 4).unwrap();
+        // Bottom-left pixel (page near (0,0)) sits by the red corner: opaque & red-dominant.
+        let o = (3 * 4) * 4; // row 3, col 0
+        assert_eq!(buf[o + 3], 255, "covered pixel must be opaque");
+        assert!(
+            buf[o] > buf[o + 2] && buf[o] > buf[o + 1],
+            "near (0,0) should be red-dominant: {:?}",
+            &buf[o..o + 4]
+        );
     }
 }

@@ -265,8 +265,10 @@ cargo run -p zpdf-render-wgpu --example viewer -- <file.pdf>   # 交互浏览器
       空间锚定 base CTM·/Matrix，平铺数上限保护）
 - [x] Axial Shading (Type 2)：`sh` 算子 + PatternType 2 填充（栅格化为图像）
 - [x] Radial Shading (Type 3)：同上，含 /Extend 与谱系根选择
-- [ ] Free-form Gouraud (Type 4)
-- [ ] Coons/Tensor Patch (Type 6/7)
+- [x] Free-form Gouraud (Type 4) + Lattice-form Gouraud (Type 5)（流位流解码，
+      逐顶点字节对齐，边标志条带；Gouraud 重心插值，经图像管线双后端共用）
+- [x] Coons/Tensor Patch (Type 6/7)（12/16 控制点，f=1/2/3 共享边复用表；
+      Coons `S=SC+SD−SB` / 张量双三次曲面；细分三角化 + 逐顶点 RGB 解析后插值）
 
 ### P4.5 — 注释与表单
 - [x] 页面 /Annots 解析 + /AP appearance stream 渲染（12.5.5 BBox→Rect 映射，

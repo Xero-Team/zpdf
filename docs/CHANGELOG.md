@@ -1,5 +1,36 @@
 # Changelog
 
+## Unreleased
+
+### Mesh shadings (types 4–7)
+
+The four mesh shading types now decode and render, completing the shading
+family (`sh` and shading-pattern fills), still with zero C/C++ dependencies.
+
+- **Type 4** (free-form Gouraud triangle mesh) and **Type 5** (lattice-form
+  Gouraud mesh) — the packed vertex bit-stream is decoded MSB-first with
+  per-vertex byte alignment; type 4 follows the edge-flag triangle strip
+  (`f=0` starts a triangle, `f=1`/`f=2` reuse the previous triangle's `vbc`/`vac`
+  side), type 5 triangulates `/VerticesPerRow` rows pairwise.
+- **Type 6** (Coons patch mesh) and **Type 7** (tensor-product patch mesh) —
+  per-patch byte-aligned records with the `f=1/2/3` shared-edge control-point /
+  corner-colour reuse table; the Coons surface is evaluated directly as
+  `S = SC + SD − SB`, the tensor surface as a bicubic over all 16 control
+  points (interior points placed per the ISO §8.7.4.5.8 grid). Patches are
+  tessellated into a triangle grid.
+- Implemented in a new `zpdf-content/src/mesh.rs` (decoder + tessellation) plus
+  a Gouraud triangle rasterizer in `shading.rs`. Meshes rasterize through the
+  existing shading→image path, so **both the CPU and wgpu backends render them
+  with no backend changes**. Decoded with the spec's image-`/Decode` mapping;
+  with a `/Function` the single parametric value per vertex is mapped through
+  the function. Vertex colours are resolved to RGB then interpolated
+  (barycentric per triangle, bilinear per patch) — matching pdf.js/pdfium.
+- Robustness: a 32-bit coordinate divisor computed in `u64` (no overflow), a
+  first-patch-`flag≠0` guard, graceful truncation of incomplete trailing
+  triangles/rows/patches, and a 2M-triangle ceiling — consistent with the
+  existing anti-hang budgets. Verified by unit test vectors (hand-computed
+  decode + interpolation) and CPU end-to-end render tests.
+
 ## 0.5.0 — robustness & closing the 0.4.0 limitations
 
 Two robustness passes and a feature-completion pass since 0.4.0, all with zero

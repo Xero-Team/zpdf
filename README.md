@@ -143,6 +143,7 @@ zpdf-core            Shared types: ObjectId, PdfObject, Matrix, Rect, Error, Par
 | Indexed / Lab / Separation / DeviceN (tint transforms) | ✅ |
 | PDF functions (sampled / exponential / stitching / PostScript) | ✅ |
 | Axial & radial shadings (`sh` + shading patterns) | ✅ |
+| Mesh shadings: free-form/lattice Gouraud (type 4/5), Coons/tensor patches (type 6/7) | ✅ |
 | Tiling patterns (PatternType 1, colored/uncolored cell replication) | ✅ |
 | 16 blend modes (`/BM`) | ✅ both backends |
 | Text + text state operators, render modes, rise | ✅ (text-as-clip approximated) |

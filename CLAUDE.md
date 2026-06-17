@@ -26,7 +26,7 @@ Features: `cpu-render` (default, tiny-skia), `gpu-render` (wgpu). Set on the roo
 PDF bytes
   → zpdf-parser     (lexer, xref incl. /XRefStm + lazy repair, object/stream decoding, filters, RC4/AES decryption)
   → zpdf-document   (catalog, page tree + attribute inheritance, effective_box/CropBox, font loading)
-  → zpdf-content    (content stream tokenizer → operator interpreter; shading.rs evaluates axial/radial gradients)
+  → zpdf-content    (content stream tokenizer → operator interpreter; shading.rs evaluates axial/radial gradients, mesh.rs decodes type 4–7 mesh shadings)
   → zpdf-display-list (flat RenderCommand sequence)
   → zpdf-render-cpu | zpdf-render-wgpu  (implements RenderBackend trait from zpdf-render)
 ```

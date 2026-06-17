@@ -1361,7 +1361,11 @@ impl<'a> ContentInterpreter<'a> {
 
         if ptype == 2 {
             if let Some(sh_obj) = dict.get("Shading") {
-                if let Some(def) = self.build_shading(sh_obj, matrix) {
+                // The pattern /Matrix maps pattern space to the page's *default*
+                // user space, so the shading→page transform is base_ctm · matrix
+                // (mirrors the tiling path). Without base_ctm a shading pattern
+                // ignores page /Rotate and any enclosing form CTM.
+                if let Some(def) = self.build_shading(sh_obj, self.base_ctm.concat(&matrix)) {
                     let avg = def.average_rgb();
                     let approx = Color::rgb(avg[0], avg[1], avg[2]);
                     return (
@@ -1460,6 +1464,12 @@ impl<'a> ContentInterpreter<'a> {
         use crate::shading::{ShadingDef, ShadingKind};
         let dict = self.resolve_dict_of(obj)?;
         let shading_type = dict.get_i64("ShadingType").ok()?;
+        // Mesh shadings (types 4–7) are streams with a packed vertex/patch
+        // bit-stream — a different decode path with no /Coords or required
+        // /Function, so branch before the axial/radial logic below.
+        if matches!(shading_type, 4..=7) {
+            return self.build_mesh_shading(obj, &dict, shading_type, to_page);
+        }
         let coords = dict.get("Coords").map(|o| self.resolve_plain(o))?;
         let coords: Vec<f64> = coords
             .as_array()
@@ -1545,6 +1555,143 @@ impl<'a> ContentInterpreter<'a> {
         })
     }
 
+    /// Build a mesh shading (types 4–7) from its stream. Decodes the packed
+    /// vertex/patch bit-stream, resolves each vertex colour to RGB (applying any
+    /// `/Function` then the colour space), tessellates patches, and transforms
+    /// the triangles into page space. Both backends consume the rasterized
+    /// image, so this needs no backend support.
+    fn build_mesh_shading(
+        &mut self,
+        obj: &PdfObject,
+        dict: &zpdf_core::PdfDict,
+        shading_type: i64,
+        to_page: Matrix,
+    ) -> Option<crate::shading::ShadingDef> {
+        use crate::shading::{MeshTriangle, MeshVertex, ShadingDef, ShadingKind};
+
+        // Mesh shadings are stream objects; get the decoded bytes.
+        let resolved = self.resolve_plain(obj);
+        let PdfObject::Stream(stream) = &resolved else {
+            tracing::debug!("mesh shading type {shading_type} is not a stream");
+            return None;
+        };
+        let data = zpdf_parser::filters::decode_stream(&stream.data, &stream.dict).ok()?;
+
+        let bits_coord = dict.get_i64("BitsPerCoordinate").ok()? as u32;
+        let bits_comp = dict.get_i64("BitsPerComponent").ok()? as u32;
+        let bits_flag = dict.get_i64("BitsPerFlag").unwrap_or(8) as u32;
+        if !(1..=32).contains(&bits_coord) || !(1..=16).contains(&bits_comp) {
+            return None;
+        }
+        let vertices_per_row = dict.get_i64("VerticesPerRow").unwrap_or(0).max(0) as usize;
+
+        // Colour space and optional /Function (all the `&mut self` / `&self`
+        // resolution happens before the resolver closure borrows `self`).
+        let cs = dict
+            .get("ColorSpace")
+            .map(|o| self.resolve_color_space_obj(o, 0))
+            .unwrap_or(ActiveColorSpace::DeviceRGB);
+        let funcs: Vec<zpdf_color::PdfFunction> = match dict.get("Function") {
+            Some(f) => match self.resolve_plain(f) {
+                PdfObject::Array(arr) => {
+                    arr.iter().filter_map(|o| self.parse_function(o)).collect()
+                }
+                _ => self.parse_function(f).into_iter().collect(),
+            },
+            None => Vec::new(),
+        };
+        // One parametric value per vertex with a /Function, else N colour comps.
+        let n_color = if funcs.is_empty() { cs.components() } else { 1 };
+        if n_color == 0 || n_color > 32 {
+            return None;
+        }
+
+        let decode: Vec<f64> = dict
+            .get_array("Decode")
+            .ok()?
+            .iter()
+            .filter_map(|o| o.as_f64().ok())
+            .collect();
+        if decode.len() < 4 + 2 * n_color {
+            return None;
+        }
+
+        let params = crate::mesh::MeshParams {
+            bits_flag,
+            bits_coord,
+            bits_comp,
+            n_color,
+            decode,
+            vertices_per_row,
+        };
+
+        // Resolve raw vertex components → device RGB. `this` is an immutable
+        // reborrow so the closure can call `components_to_rgb` while the decoder
+        // owns the only mutable path.
+        let this: &Self = &*self;
+        let mut resolve = |comps: &[f64]| -> [f32; 3] {
+            let out: Vec<f64> = if funcs.is_empty() {
+                comps.to_vec()
+            } else if funcs.len() == 1 {
+                funcs[0].eval(&[comps[0]]).unwrap_or_default()
+            } else {
+                funcs
+                    .iter()
+                    .map(|f| {
+                        f.eval(&[comps[0]])
+                            .and_then(|v| v.first().copied())
+                            .unwrap_or(0.0)
+                    })
+                    .collect()
+            };
+            let c = this.components_to_rgb(&cs, &out);
+            [c.r, c.g, c.b]
+        };
+
+        let tris = crate::mesh::decode_mesh(shading_type, &data, &params, &mut resolve);
+        if tris.is_empty() {
+            return None;
+        }
+
+        // Transform shading-space triangles to page space; carry the mean colour
+        // in `lut` so `average_rgb()` (pattern-stroke fallback) still works.
+        let mut triangles = Vec::with_capacity(tris.len());
+        let mut acc = [0.0f64; 3];
+        let nverts = (tris.len() * 3).max(1) as f64;
+        for t in &tris {
+            let mut v = [MeshVertex {
+                x: 0.0,
+                y: 0.0,
+                rgb: [0.0; 3],
+            }; 3];
+            for (k, &(sx, sy, rgb)) in t.iter().enumerate() {
+                let p = Point::new(sx, sy).transform(&to_page);
+                v[k] = MeshVertex {
+                    x: p.x as f32,
+                    y: p.y as f32,
+                    rgb,
+                };
+                acc[0] += rgb[0] as f64;
+                acc[1] += rgb[1] as f64;
+                acc[2] += rgb[2] as f64;
+            }
+            triangles.push(MeshTriangle { v });
+        }
+        let mean = [
+            (acc[0] / nverts) as f32,
+            (acc[1] / nverts) as f32,
+            (acc[2] / nverts) as f32,
+        ];
+
+        Some(ShadingDef {
+            kind: ShadingKind::Mesh { triangles },
+            lut: vec![mean],
+            extend_start: false,
+            extend_end: false,
+            to_page,
+        })
+    }
+
     /// Intersect the running clip-bounds with a new clip path's page-space bbox.
     fn intersect_clip_bounds(&mut self, new: Option<Rect>) {
         let Some(n) = new.map(|r| r.normalize()) else {
@@ -1614,8 +1761,12 @@ impl<'a> ContentInterpreter<'a> {
                 let Some(d) = self.build_shading(&sh_obj, self.current.ctm) else {
                     return;
                 };
+                // Mesh defs bake their vertices against the current CTM, so they
+                // must not be reused via the to_page-rewrite cache path below.
                 if let Some(id) = cache_id {
-                    self.shading_cache.insert(id, d.clone());
+                    if !matches!(d.kind, crate::shading::ShadingKind::Mesh { .. }) {
+                        self.shading_cache.insert(id, d.clone());
+                    }
                 }
                 d
             }
