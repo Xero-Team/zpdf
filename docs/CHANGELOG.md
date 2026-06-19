@@ -1,6 +1,12 @@
 # Changelog
 
-## Unreleased
+## 0.6.0 — interactive forms, passwords, mesh shadings & CJK/CMYK fidelity
+
+A feature release, all with zero C/C++ dependencies: interactive AcroForm
+support with generated field appearances, password-protected document
+decryption (user/owner passwords), type 4–7 mesh shadings, the full predefined
+CJK CMap families (Big5 / Shift-JIS / KSC / GBK / EUC-JP), and DeviceCMYK colour
+fidelity.
 
 ### Password-protected documents (non-empty user/owner password)
 
