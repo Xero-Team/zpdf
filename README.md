@@ -1,6 +1,10 @@
 # zpdf
 
 [![CI](https://github.com/Xero-Team/zpdf/actions/workflows/ci.yml/badge.svg)](https://github.com/Xero-Team/zpdf/actions/workflows/ci.yml)
+[![Release](https://github.com/Xero-Team/zpdf/actions/workflows/release.yml/badge.svg)](https://github.com/Xero-Team/zpdf/actions/workflows/release.yml)
+[![Publish (crates.io)](https://github.com/Xero-Team/zpdf/actions/workflows/publish.yml/badge.svg)](https://github.com/Xero-Team/zpdf/actions/workflows/publish.yml)
+[![crates.io](https://img.shields.io/crates/v/zpdf.svg)](https://crates.io/crates/zpdf)
+[![docs.rs](https://img.shields.io/docsrs/zpdf)](https://docs.rs/zpdf)
 
 Pure-Rust PDF parsing and rendering, with interchangeable CPU (tiny-skia) and
 GPU (wgpu) renderers whose output matches within <1% of pixels.
@@ -19,7 +23,8 @@ GPU (wgpu) renderers whose output matches within <1% of pixels.
   path/raster/clip budgets plus interpret/render time backstops degrade to a
   partial render instead.
 - **Encryption** — RC4 (40/128-bit) and AES-128 / AES-256 (V5 R5/R6) standard
-  security handler with crypt filters (empty user password).
+  security handler with crypt filters; opens with the user, owner, or empty
+  password (`open_with_password`, CLI `--password`).
 - **Content interpretation** — graphics state, paths, clipping, text (incl.
   render modes and rise), inline & XObject images, Form XObjects (full
   resources, `/BBox` clip), axial/radial shadings, shading patterns, all 16
@@ -34,6 +39,9 @@ GPU (wgpu) renderers whose output matches within <1% of pixels.
   minification.
 - **Page geometry** — CropBox-aware rendering, page-tree attribute
   inheritance (`/Rotate`, `/Resources`, boxes), page rotation.
+- **Annotations & forms** — `/AP` appearance streams (`/AS` states,
+  Hidden/NoView); an AcroForm field model (`acro_form()`, CLI `forms`) that
+  generates text/choice field appearances when the producer left none.
 - **CPU rendering** — tiny-skia backend, PNG output at any DPI.
 - **GPU rendering** — wgpu backend (fills, strokes, clips, text, images, blend
   groups); matches the CPU renderer within <1% pixels.
@@ -48,7 +56,34 @@ GPU (wgpu) renderers whose output matches within <1% of pixels.
 - **[docs/CHANGELOG.md](docs/CHANGELOG.md)** — release notes.
 - **[ROADMAP.md](ROADMAP.md)** — development plan.
 
+## Install
+
+**Command-line tool** — `cargo install` builds the `zpdf` binary:
+
+```bash
+cargo install zpdf-cli                  # CPU rendering (default)
+cargo install zpdf-cli --features gpu   # + the wgpu GPU backend
+```
+
+```bash
+zpdf info document.pdf
+zpdf render document.pdf -p 1 -o out.png --dpi 150
+```
+
+**Library** — add the `zpdf` facade crate to your project:
+
+```bash
+cargo add zpdf                          # CPU rendering (default)
+cargo add zpdf --features gpu-render    # + the wgpu GPU backend
+```
+
+Published on [crates.io](https://crates.io/crates/zpdf) · API docs on
+[docs.rs](https://docs.rs/zpdf).
+
 ## Quick start
+
+Run from a checkout with `cargo run` (or drop the `cargo run -p zpdf-cli --`
+prefix once the CLI is installed):
 
 ```bash
 # Inspect a document
@@ -135,7 +170,7 @@ zpdf-core            Shared types: ObjectId, PdfObject, Matrix, Rect, Error, Par
 | Adversarial-input safety (no panics, no hangs; budget-bounded partial render) | ✅ |
 | Flate / LZW / ASCII85 / ASCIIHex / RunLength + predictors | ✅ with corrupt-stream salvage |
 | DCTDecode (JPEG, incl. CMYK) / CCITTFaxDecode (G3/G4) | ✅ |
-| Encryption: RC4 40/128, AES-128, AES-256 (R5/R6), crypt filters | ✅ empty user password |
+| Encryption: RC4 40/128, AES-128, AES-256 (R5/R6), crypt filters | ✅ user / owner / empty password |
 | Page tree + attribute inheritance (`/Rotate`, `/Resources`, boxes) | ✅ |
 | CropBox-aware rendering + page rotation | ✅ |
 | Graphics state, paths, painting, clipping, dash patterns | ✅ |
@@ -154,9 +189,10 @@ zpdf-core            Shared types: ObjectId, PdfObject, Matrix, Rect, Error, Par
 | Form XObjects (full resources, `/BBox` clip, recursion guards) | ✅ |
 | CPU rendering (PNG) | ✅ |
 | GPU rendering (wgpu) | ✅ |
-| ExtGState soft masks (`/SMask`), transparency groups | ✅ (isolated/knockout ignored) |
+| ExtGState soft masks (`/SMask`), transparency groups | ✅ (knockout + non-isolated) |
 | ICC color profiles (real color management, `moxcms`) | ✅ |
 | Annotation appearance streams (`/AP`, `/AS`, Hidden/NoView) | ✅ |
+| Interactive forms (AcroForm): field model + generated text/choice appearances | ✅ |
 | Non-embedded font fallback (incl. CJK via system fonts) | ✅ |
 | JBIG2 / JPX (JPEG 2000) filters | ✅ |
 | Optional content groups / layers (`/OCG`, `/OCMD`, `/VE`) | ✅ |
@@ -195,11 +231,12 @@ See [ROADMAP.md](ROADMAP.md).
 - **Phase 1** — PDF parsing — done
 - **Phase 2** — Content interpretation + CPU rendering — done
 - **Phase 3** — wgpu GPU rendering — done
-- **Phase 4** — Advanced features — done (encryption incl. AES, shadings,
-  blend modes, spot color, CropBox/rotation, tiling-pattern cells, soft masks &
-  transparency groups, annotation appearance streams, optional content, ICC
-  color management, JBIG2 + JPEG 2000, system-font fallback, composite-font
-  CMaps + vertical writing)
+- **Phase 4** — Advanced features — done (encryption incl. AES + user/owner
+  passwords, shadings + mesh shadings, blend modes, spot color, CropBox/rotation,
+  tiling-pattern cells, soft masks & transparency groups, annotation appearance
+  streams, interactive forms (AcroForm), optional content, ICC color management,
+  JBIG2 + JPEG 2000, system-font fallback, composite-font CMaps + vertical
+  writing)
 - **Robustness** — corrupt/adversarial-corpus pass: opens 426/618 of a
   malformed-PDF corpus (from 166), zero render panics, zero timeouts/hangs
 

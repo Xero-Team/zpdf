@@ -55,8 +55,51 @@ jobs:
             echo "ASSET=${dist}.tar.gz" >> "$GITHUB_ENV"
           fi
 
+      # Build a rich release body from docs/CHANGELOG.md instead of relying on
+      # GitHub's bare commit/PR list. We extract the section for the tag's
+      # version (e.g. "## 0.6.0 — …"), falling back to the "## Unreleased"
+      # section if the heading hasn't been renamed yet, and keep all its `###`
+      # subsections. `generate_release_notes` still appends the auto PR list
+      # below it. All three matrix jobs produce identical notes, so re-setting
+      # the body per job is idempotent; each job only adds its own asset.
+      - name: Build release notes from the changelog
+        id: notes
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          changelog="docs/CHANGELOG.md"
+          notes="$RUNNER_TEMP/release-notes.md"
+
+          # Print the body of the first "## <heading>" matching the regex up to
+          # the next "## " heading (## only — ### subsections are kept inline).
+          extract() {
+            awk -v want="$1" '
+              /^## / { if (inside) exit; inside = ($0 ~ want) ? 1 : 0; if (inside) next }
+              inside { print }
+            ' "$changelog"
+          }
+          nonblank() { [ -n "$(printf '%s' "$1" | tr -d '[:space:]')" ]; }
+
+          body="$(extract "^## ${version}([^0-9]|\$)")"
+          nonblank "$body" || body="$(extract '^## [Uu]nreleased')"
+
+          {
+            echo "## zpdf ${GITHUB_REF_NAME}"
+            echo
+            if nonblank "$body"; then
+              printf '%s\n' "$body"
+            else
+              echo "See [docs/CHANGELOG.md](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_REF_NAME}/docs/CHANGELOG.md) for details."
+            fi
+          } > "$notes"
+
+          echo "path=$notes" >> "$GITHUB_OUTPUT"
+          echo "----- release notes -----"
+          cat "$notes"
+
       - name: Upload to release
         uses: softprops/action-gh-release@v2
         with:
           files: ${{ env.ASSET }}
+          body_path: ${{ steps.notes.outputs.path }}
           generate_release_notes: true
