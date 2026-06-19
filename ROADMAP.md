@@ -277,9 +277,15 @@ cargo run -p zpdf-render-wgpu --example viewer -- <file.pdf>   # 交互浏览器
 - [x] 页面 /Annots 解析 + /AP appearance stream 渲染（12.5.5 BBox→Rect 映射，
       /AS 状态，Hidden/NoView 标志）
 - [ ] Link / Text / Highlight annotation
-- [ ] Widget annotation (form fields)
-- [ ] AcroForm 字段解析
-- [ ] Appearance regeneration
+- [x] Widget annotation (form fields)：Widget 经字段模型映射回所属字段；checkbox/radio
+      保留 /AP 状态（/AS 缺失时回退 /V）
+- [x] AcroForm 字段解析（`zpdf-document/src/forms.rs`）：递归 /Fields + /Kids，完整
+      限定名（/T 以 `.` 连接），继承 /FT //V //DA //Ff //Q；解析 /Opt //MaxLen；
+      `PdfDocument::acro_form()` + `zpdf forms` CLI 命令
+- [x] Appearance regeneration：文本/选择字段缺 /AP（或 /NeedAppearances）时合成外观流
+      （/DA 字体/字号/颜色，size 0 自适应；/Q 对齐；multiline / comb / list-box 布局；
+      /DR 字体解析，回退合成 Helvetica），经现有 /AP 路径双后端渲染。Button/口令/push
+      不生成；既有 /AP 不被覆盖
 
 ### P4.6 — 加密
 - [x] Standard Security Handler（含直接 /Encrypt 字典、/StmF //StrF /Identity）

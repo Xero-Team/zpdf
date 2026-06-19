@@ -7,6 +7,7 @@
 use zpdf_core::{ObjectId, PdfObject, Rect};
 use zpdf_parser::PdfFile;
 
+use crate::forms::{AcroForm, GeneratedAppearance};
 use crate::page::PdfPage;
 
 /// Annotation flag bits (PDF 32000-1 Table 165).
@@ -23,6 +24,10 @@ pub struct Annotation {
     /// The selected normal appearance stream: `/AP /N`, indexed by `/AS`
     /// when /N is a state dictionary.
     pub appearance: Option<ObjectId>,
+    /// A synthesized appearance for an interactive-form widget whose producer
+    /// left no `/AP` (or set `/NeedAppearances`). Takes precedence over
+    /// `appearance` when present.
+    pub generated: Option<GeneratedAppearance>,
     /// /OC optional-content membership (a Ref to an OCG/OCMD, or a direct
     /// dict), evaluated against the document's OC config at paint time.
     pub oc: Option<PdfObject>,
@@ -35,7 +40,7 @@ impl Annotation {
         self.flags & (ANNOT_FLAG_HIDDEN | ANNOT_FLAG_NOVIEW) == 0
             // Popups only appear when opened interactively.
             && self.subtype != "Popup"
-            && self.appearance.is_some()
+            && (self.appearance.is_some() || self.generated.is_some())
             && self.rect.width() > 0.0
             && self.rect.height() > 0.0
     }
@@ -43,15 +48,24 @@ impl Annotation {
 
 /// Parse a page's annotations into renderable form. Unresolvable or
 /// appearance-less entries are kept (callers may want link rects later) but
-/// fail `is_viewable`.
-pub fn parse_annotations(file: &PdfFile, page: &PdfPage) -> Vec<Annotation> {
+/// fail `is_viewable`. When an `AcroForm` is supplied, widget annotations gain
+/// a generated appearance where the producer left none.
+pub fn parse_annotations(
+    file: &PdfFile,
+    page: &PdfPage,
+    acro_form: Option<&AcroForm>,
+) -> Vec<Annotation> {
     page.annots
         .iter()
-        .filter_map(|&id| parse_annotation(file, id))
+        .filter_map(|&id| parse_annotation(file, id, acro_form))
         .collect()
 }
 
-fn parse_annotation(file: &PdfFile, id: ObjectId) -> Option<Annotation> {
+fn parse_annotation(
+    file: &PdfFile,
+    id: ObjectId,
+    acro_form: Option<&AcroForm>,
+) -> Option<Annotation> {
     let obj = file.resolve(id).ok()?;
     let dict = obj.as_dict().ok()?;
 
@@ -70,11 +84,26 @@ fn parse_annotation(file: &PdfFile, id: ObjectId) -> Option<Annotation> {
     let appearance = select_appearance(file, dict);
     let oc = dict.get("OC").cloned();
 
+    // Generate an appearance for a form widget whose producer left none (or
+    // when /NeedAppearances asks the viewer to regenerate). Buttons keep their
+    // supplied /AP states; the generator returns None for them.
+    let generated = if subtype == "Widget" {
+        acro_form
+            .and_then(|af| af.field_for_widget(id).map(|field| (af, field)))
+            .filter(|(af, _)| af.need_appearances || appearance.is_none())
+            .and_then(|(af, field)| {
+                crate::forms::generate_widget_appearance(field, rect, af.dr_fonts.as_ref())
+            })
+    } else {
+        None
+    };
+
     Some(Annotation {
         subtype,
         rect,
         flags,
         appearance,
+        generated,
         oc,
     })
 }
@@ -109,8 +138,13 @@ fn select_state(
     states: &zpdf_core::PdfDict,
     annot: &zpdf_core::PdfDict,
 ) -> Option<ObjectId> {
-    let as_name = annot.get_name("AS").ok();
-    if let Some(state) = as_name {
+    // Prefer /AS; for a checkbox/radio whose /AS is absent, the on/off state is
+    // named by /V (present on the merged field+widget dict).
+    let state = annot.get_name("AS").ok().or_else(|| match annot.get("V") {
+        Some(PdfObject::Name(n)) => Some(n.as_str()),
+        _ => None,
+    });
+    if let Some(state) = state {
         if let Some(PdfObject::Ref(r)) = states.get(state) {
             return Some(*r);
         }

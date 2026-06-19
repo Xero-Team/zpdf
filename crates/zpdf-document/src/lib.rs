@@ -1,15 +1,17 @@
 pub mod annotation;
 mod catalog;
 pub mod font_loader;
+pub mod forms;
 pub mod optional_content;
 pub mod page;
 
 pub use annotation::Annotation;
 pub use catalog::Catalog;
+pub use forms::{AcroForm, FieldKind, FieldValue, FormField};
 pub use optional_content::OcConfig;
 pub use page::{PdfPage, ResourceDict};
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use zpdf_core::{ParseLimits, Result};
 use zpdf_font::FontCache;
 use zpdf_parser::PdfFile;
@@ -17,6 +19,9 @@ use zpdf_parser::PdfFile;
 pub struct PdfDocument {
     file: PdfFile,
     catalog: Catalog,
+    /// Lazily-parsed interactive form, shared across page-annotation calls so
+    /// the field-tree walk runs at most once per document.
+    acro_form: OnceLock<Option<AcroForm>>,
 }
 
 impl PdfDocument {
@@ -27,7 +32,11 @@ impl PdfDocument {
     pub fn open_with_limits(data: impl Into<Arc<[u8]>>, limits: ParseLimits) -> Result<Self> {
         let file = PdfFile::parse_with_limits(data, limits)?;
         let catalog = Catalog::from_trailer(&file)?;
-        Ok(Self { file, catalog })
+        Ok(Self {
+            file,
+            catalog,
+            acro_form: OnceLock::new(),
+        })
     }
 
     pub fn page_count(&self) -> usize {
@@ -71,9 +80,19 @@ impl PdfDocument {
     }
 
     /// Parse a page's annotations into renderable form (/Rect, /F, the
-    /// /AS-selected appearance stream, /OC membership).
+    /// /AS-selected appearance stream, /OC membership). Widget annotations for
+    /// interactive-form fields gain a generated appearance when the producer
+    /// left none (or set /NeedAppearances).
     pub fn page_annotations(&self, page: &PdfPage) -> Vec<Annotation> {
-        annotation::parse_annotations(&self.file, page)
+        annotation::parse_annotations(&self.file, page, self.acro_form())
+    }
+
+    /// The document's interactive form (`/AcroForm`), if any. Parsed once and
+    /// cached for the lifetime of the document.
+    pub fn acro_form(&self) -> Option<&AcroForm> {
+        self.acro_form
+            .get_or_init(|| AcroForm::parse(&self.file))
+            .as_ref()
     }
 
     /// The document's default optional-content configuration, if any.

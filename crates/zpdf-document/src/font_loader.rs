@@ -26,7 +26,13 @@ pub fn load_page_fonts(file: &PdfFile, page: &PdfPage) -> FontCache {
 pub fn load_single_font(file: &PdfFile, font_ref: ObjectId) -> Result<LoadedFont> {
     let obj = file.resolve(font_ref)?;
     let dict = obj.as_dict()?;
+    load_single_font_dict(file, dict)
+}
 
+/// Load a font from its (already-resolved) font dictionary. Used both by
+/// [`load_single_font`] and for inline font dicts in form resources (e.g. a
+/// synthesized field appearance referencing a standard Helvetica).
+pub fn load_single_font_dict(file: &PdfFile, dict: &zpdf_core::PdfDict) -> Result<LoadedFont> {
     let subtype = dict.get_name("Subtype").unwrap_or("");
     let base_font = dict.get_name("BaseFont").unwrap_or("Unknown").to_string();
 

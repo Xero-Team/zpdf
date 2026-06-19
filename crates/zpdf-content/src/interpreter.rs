@@ -1966,12 +1966,17 @@ impl<'a> ContentInterpreter<'a> {
                     continue;
                 }
             }
-            let Some(ap_id) = a.appearance else { continue };
-            let Ok(obj) = file.resolve(ap_id) else {
-                continue;
-            };
-            let PdfObject::Stream(stream) = obj else {
-                continue;
+            // A generated form-field appearance takes precedence over a stored
+            // /AP stream. A synthetic stream has no object id (`None`), so the
+            // form emitter decodes its bytes directly instead of an xref lookup.
+            let (stream, paint_id) = if let Some(gen) = &a.generated {
+                (synthetic_form_stream(gen), None)
+            } else {
+                let Some(ap_id) = a.appearance else { continue };
+                let Ok(PdfObject::Stream(s)) = file.resolve(ap_id) else {
+                    continue;
+                };
+                (s, Some(ap_id))
             };
 
             // Form /BBox, transformed by the form /Matrix, mapped onto /Rect.
@@ -2020,13 +2025,17 @@ impl<'a> ContentInterpreter<'a> {
                 continue;
             }
 
-            let a_mat = Matrix::translate(a.rect.x0, a.rect.y0)
-                .concat(&Matrix::scale(a.rect.width() / tw, a.rect.height() / th))
+            // Map the form BBox onto the annotation rect. Normalize first so a
+            // legal but inverted /Rect (upper-right corner given first) places
+            // the origin at the lower-left corner, not the wrong one.
+            let rect = a.rect.normalize();
+            let a_mat = Matrix::translate(rect.x0, rect.y0)
+                .concat(&Matrix::scale(rect.width() / tw, rect.height() / th))
                 .concat(&Matrix::translate(-tx0, -ty0));
 
             let saved_ctm = self.current.ctm;
             self.current.ctm = self.base_ctm.concat(&a_mat);
-            self.do_form_xobject(ap_id, &stream, file);
+            self.do_form_xobject(paint_id, &stream, file);
             self.current.ctm = saved_ctm;
         }
     }
@@ -2272,7 +2281,7 @@ impl<'a> ContentInterpreter<'a> {
         self.current.blend_mode = BlendMode::Normal;
         self.current.fill_alpha = 1.0;
         self.current.stroke_alpha = 1.0;
-        self.do_form_xobject(g_ref, &g_stream, file);
+        self.do_form_xobject(Some(g_ref), &g_stream, file);
         self.current = saved_state;
         self.oc_hidden_from = saved_oc_hidden;
         let mask_dl = std::mem::replace(&mut self.display_list, saved_dl);
@@ -2359,7 +2368,7 @@ impl<'a> ContentInterpreter<'a> {
 
         match subtype {
             "Image" => self.do_image_xobject(xobj_id, stream),
-            "Form" => self.do_form_xobject(xobj_id, stream, file),
+            "Form" => self.do_form_xobject(Some(xobj_id), stream, file),
             _ => {
                 tracing::warn!("unknown XObject subtype: {subtype}");
             }
@@ -2524,9 +2533,13 @@ impl<'a> ContentInterpreter<'a> {
         self.emit_painted(cmd);
     }
 
+    /// Replay a form XObject. `xobj_id` is the form's object id for a real
+    /// stream (used for cached, decryption-aware decoding); `None` marks a
+    /// synthetic in-memory stream (e.g. a generated field appearance) whose
+    /// bytes are decoded directly — never looked up in the xref.
     fn do_form_xobject(
         &mut self,
-        xobj_id: ObjectId,
+        xobj_id: Option<ObjectId>,
         stream: &zpdf_core::PdfStream,
         file: &PdfFile,
     ) {
@@ -2541,12 +2554,16 @@ impl<'a> ContentInterpreter<'a> {
             return;
         }
 
-        // resolve_stream_data handles decryption, indirect /Filter refs and
-        // caching; fall back to direct decode for synthetic streams.
-        let decoded = match file
-            .resolve_stream_data(xobj_id)
-            .or_else(|_| zpdf_parser::filters::decode_stream(&stream.data, &stream.dict))
-        {
+        // For a real form, resolve_stream_data handles decryption, indirect
+        // /Filter refs and caching (with a direct-decode fallback). A synthetic
+        // stream has no object id, so its bytes are decoded directly — never
+        // looked up in the xref / repair machinery.
+        let direct = || zpdf_parser::filters::decode_stream(&stream.data, &stream.dict);
+        let decoded = match xobj_id {
+            Some(id) => file.resolve_stream_data(id).or_else(|_| direct()),
+            None => direct(),
+        };
+        let decoded = match decoded {
             Ok(d) => d,
             Err(e) => {
                 tracing::warn!("failed to decode form XObject: {e}");
@@ -2763,25 +2780,38 @@ impl<'a> ContentInterpreter<'a> {
         };
 
         for (name, obj) in &fonts.0 {
-            if let PdfObject::Ref(font_ref) = obj {
-                let page_has_same_name = page_font_ids.contains_key(&name.0);
-                let page_has_same_obj = page_font_ids
-                    .get(&name.0)
-                    .map(|id| *id == *font_ref)
-                    .unwrap_or(false);
+            // A font entry is normally an indirect reference; a synthesized
+            // form-field appearance may instead carry an inline font dict.
+            let load_into = |fc: &mut FontCache, target: &str| -> Result<(), zpdf_core::Error> {
+                let font = match obj {
+                    PdfObject::Ref(font_ref) => {
+                        zpdf_document::font_loader::load_single_font(file, *font_ref)?
+                    }
+                    PdfObject::Dict(font_dict) => {
+                        zpdf_document::font_loader::load_single_font_dict(file, font_dict)?
+                    }
+                    _ => return Ok(()),
+                };
+                fc.insert(target.to_string(), font);
+                Ok(())
+            };
 
-                if page_has_same_name && page_has_same_obj {
-                    continue;
-                }
+            match obj {
+                PdfObject::Ref(font_ref) => {
+                    let page_has_same_name = page_font_ids.contains_key(&name.0);
+                    let page_has_same_obj = page_font_ids
+                        .get(&name.0)
+                        .map(|id| *id == *font_ref)
+                        .unwrap_or(false);
 
-                if page_has_same_name && !page_has_same_obj {
-                    let unique_name = format!("__form{}_{}", form_depth, name.0);
-                    if fc.get_by_name(&unique_name).is_none() {
-                        match zpdf_document::font_loader::load_single_font(file, *font_ref) {
-                            Ok(font) => {
-                                fc.insert(unique_name.clone(), font);
-                            }
-                            Err(e) => {
+                    if page_has_same_name && page_has_same_obj {
+                        continue;
+                    }
+
+                    if page_has_same_name && !page_has_same_obj {
+                        let unique_name = format!("__form{}_{}", form_depth, name.0);
+                        if fc.get_by_name(&unique_name).is_none() {
+                            if let Err(e) = load_into(fc, &unique_name) {
                                 tracing::debug!("form font {}: {e}", name.0);
                                 fc.insert(
                                     unique_name.clone(),
@@ -2789,14 +2819,9 @@ impl<'a> ContentInterpreter<'a> {
                                 );
                             }
                         }
-                    }
-                    overrides.insert(name.0.clone(), unique_name);
-                } else if fc.get_by_name(&name.0).is_none() {
-                    match zpdf_document::font_loader::load_single_font(file, *font_ref) {
-                        Ok(font) => {
-                            fc.insert(name.0.clone(), font);
-                        }
-                        Err(e) => {
+                        overrides.insert(name.0.clone(), unique_name);
+                    } else if fc.get_by_name(&name.0).is_none() {
+                        if let Err(e) = load_into(fc, &name.0) {
                             tracing::debug!("form font {}: {e}", name.0);
                             fc.insert(
                                 name.0.clone(),
@@ -2805,6 +2830,27 @@ impl<'a> ContentInterpreter<'a> {
                         }
                     }
                 }
+                PdfObject::Dict(_) => {
+                    // Inline font dict: rename to avoid clobbering a same-named
+                    // page font in the shared cache.
+                    let target = if page_font_ids.contains_key(&name.0) {
+                        let unique = format!("__form{}_{}", form_depth, name.0);
+                        overrides.insert(name.0.clone(), unique.clone());
+                        unique
+                    } else {
+                        name.0.clone()
+                    };
+                    if fc.get_by_name(&target).is_none() {
+                        if let Err(e) = load_into(fc, &target) {
+                            tracing::debug!("form inline font {}: {e}", name.0);
+                            fc.insert(
+                                target,
+                                zpdf_font::LoadedFont::new_placeholder(name.0.clone()),
+                            );
+                        }
+                    }
+                }
+                _ => {}
             }
         }
 
@@ -3682,6 +3728,50 @@ fn build_glyph_clip_path(
         return None;
     }
     Some((out, Rect::new(bb.0, bb.1, bb.2, bb.3)))
+}
+
+/// Wrap a generated form-field appearance as a form-XObject stream so the
+/// annotation painter can replay it through `do_form_xobject` exactly like a
+/// real `/AP /N`. The stream carries no `/Filter`, so the form emitter's direct
+/// `decode_stream` fallback returns the content bytes verbatim.
+fn synthetic_form_stream(gen: &zpdf_document::forms::GeneratedAppearance) -> zpdf_core::PdfStream {
+    use zpdf_core::{PdfName, PdfObject};
+    let num = |v: f64| PdfObject::Real(v);
+    let mut dict = zpdf_core::PdfDict::new();
+    dict.insert(
+        PdfName::new("Type"),
+        PdfObject::Name(PdfName::new("XObject")),
+    );
+    dict.insert(
+        PdfName::new("Subtype"),
+        PdfObject::Name(PdfName::new("Form")),
+    );
+    dict.insert(
+        PdfName::new("BBox"),
+        PdfObject::Array(vec![
+            num(gen.bbox.x0),
+            num(gen.bbox.y0),
+            num(gen.bbox.x1),
+            num(gen.bbox.y1),
+        ]),
+    );
+    let m = &gen.matrix;
+    dict.insert(
+        PdfName::new("Matrix"),
+        PdfObject::Array(vec![
+            num(m.a),
+            num(m.b),
+            num(m.c),
+            num(m.d),
+            num(m.e),
+            num(m.f),
+        ]),
+    );
+    dict.insert(
+        PdfName::new("Resources"),
+        PdfObject::Dict(gen.resources.clone()),
+    );
+    zpdf_core::PdfStream::new(dict, gen.content.clone())
 }
 
 /// Build an ICC transform from an inline (synthetic) profile stream,

@@ -37,7 +37,7 @@ GPU (wgpu) renderers whose output matches within <1% of pixels.
 - **CPU rendering** — tiny-skia backend, PNG output at any DPI.
 - **GPU rendering** — wgpu backend (fills, strokes, clips, text, images, blend
   groups); matches the CPU renderer within <1% pixels.
-- **Tooling** — CLI (`info`/`render`/`text`/`compare`/`dump`/`debug-stream`),
+- **Tooling** — CLI (`info`/`render`/`text`/`forms`/`compare`/`dump`/`debug-stream`),
   an interactive winit viewer example, and a native GPUI desktop reader
   (`zpdf-viewer-gpui`).
 

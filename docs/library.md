@@ -165,7 +165,7 @@ zpdf-core            Shared types: ObjectId, PdfObject, Matrix, Rect, Error, Par
   ├─ zpdf-render          RenderBackend trait + PageRenderInfo + dash flattening
   │   ├─ zpdf-render-cpu   tiny-skia backend  → RenderedPage
   │   └─ zpdf-render-wgpu  wgpu backend       → GpuTexture
-  ├─ zpdf-cli        Binary: info / dump / render / text / compare / debug-stream
+  ├─ zpdf-cli        Binary: info / dump / render / text / forms / compare / debug-stream
   └─ zpdf            Facade crate (re-exports; feature-gates cpu / gpu)
 ```
 

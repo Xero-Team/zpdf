@@ -14,7 +14,7 @@ fn main() {
 
     if args.len() < 2 {
         eprintln!("Usage: zpdf <command> [args...]");
-        eprintln!("Commands: info, dump, render, text, compare, debug-stream");
+        eprintln!("Commands: info, dump, render, text, forms, compare, debug-stream");
         process::exit(1);
     }
 
@@ -23,6 +23,7 @@ fn main() {
         "dump" => cmd_dump(&args[2..]),
         "render" => cmd_render(&args[2..]),
         "text" => cmd_text(&args[2..]),
+        "forms" => cmd_forms(&args[2..]),
         "compare" => cmd_compare(&args[2..]),
         "debug-stream" => cmd_debug_stream(&args[2..]),
         other => {
@@ -70,6 +71,44 @@ fn cmd_info(args: &[String]) -> zpdf::Result<()> {
     }
     if doc.page_count() > listed {
         println!("  ... and {} more pages", doc.page_count() - listed);
+    }
+
+    Ok(())
+}
+
+/// List the document's interactive-form (AcroForm) fields, types, and values.
+fn cmd_forms(args: &[String]) -> zpdf::Result<()> {
+    if args.is_empty() {
+        eprintln!("Usage: zpdf forms <file.pdf>");
+        process::exit(1);
+    }
+
+    let data = fs::read(&args[0]).map_err(zpdf::Error::Io)?;
+    let doc = zpdf::PdfDocument::open(data)?;
+
+    let Some(form) = doc.acro_form() else {
+        println!("No AcroForm (no interactive form fields).");
+        return Ok(());
+    };
+
+    println!(
+        "AcroForm: {} field(s), NeedAppearances: {}",
+        form.fields.len(),
+        form.need_appearances
+    );
+    for f in &form.fields {
+        let value = match &f.value {
+            Some(zpdf::FieldValue::Text(s)) => format!(" = {s:?}"),
+            Some(zpdf::FieldValue::Name(n)) => format!(" = /{n}"),
+            Some(zpdf::FieldValue::List(v)) => format!(" = {v:?}"),
+            None => String::new(),
+        };
+        let flags = if f.flags != 0 {
+            format!(" (Ff {:#x})", f.flags)
+        } else {
+            String::new()
+        };
+        println!("  [{}] {}{}{}", f.kind.as_str(), f.name, value, flags);
     }
 
     Ok(())

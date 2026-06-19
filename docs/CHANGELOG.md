@@ -2,6 +2,44 @@
 
 ## Unreleased
 
+### Interactive forms (AcroForm)
+
+Interactive form fields now have a field model and, crucially for a renderer,
+**generated appearances** — a text or choice field whose producer left no `/AP`
+stream (or set `/NeedAppearances`) is now drawn with its value, instead of
+rendering blank. Still zero C/C++ dependencies.
+
+- **Field model** (`zpdf-document/src/forms.rs`, new): walks `/Root /AcroForm
+  /Fields` (with `/Kids` recursion, cycle/depth guards), resolving the tree into
+  terminal `FormField`s with **fully-qualified names** (`/T` partials joined by
+  `.`) and **inherited** `/FT` `/V` `/DA` `/Ff` `/Q` (PDF 12.7.3.2). Each field
+  records its widget-annotation ids, its kind (`Tx`/`Btn`/`Ch`/`Sig`), value
+  (string / name / multi-select list, UTF-16BE-aware), flags, `/MaxLen`, and
+  `/Opt`. Exposed as `PdfDocument::acro_form()` and a new `zpdf forms <file>`
+  CLI command that lists fields, types, and values.
+- **Appearance generation** (`forms.rs` + `zpdf-content` annotation painter):
+  for text and choice fields needing one, a form-XObject appearance is
+  synthesized and painted through the existing `/AP` path (a synthetic
+  `PdfStream` replayed by `do_form_xobject`, so **both CPU and wgpu backends
+  render it with no backend changes**). It honors the `/DA` font / size / color
+  (size `0` auto-fits height then width), `/Q` justification (left / center /
+  right), and the **multiline**, **comb** (`/MaxLen` cells), and list-box layout
+  modes. The `/DA` font name resolves through the AcroForm `/DR` font resources,
+  falling back to a synthesized standard Helvetica (`load_form_fonts` now also
+  loads inline font dicts). Content is emitted as WinAnsi single-byte text.
+- **Non-regressing by construction**: generation fires only when the widget has
+  no usable `/AP` *or* `/NeedAppearances` is set; an existing producer
+  appearance is otherwise kept untouched. Buttons (checkbox/radio) keep their
+  supplied `/AP` states — only the `/AS` selection is hardened to fall back to
+  the field `/V` when `/AS` is absent. Password and push-button fields never
+  generate. Bounded against adversarial forms (field-count / depth / value-length
+  caps, visited-set cycle guard), consistent with the existing anti-hang budgets.
+- Verified by unit tests (field-tree FQN + inheritance + widget mapping, DA
+  parsing, UTF-16BE values, comb/escape helpers) and end-to-end CPU render
+  acceptance tests (a text field's value rasterizes to glyphs inside its rect
+  via both the `/DR` font and the Helvetica fallback; an existing `/AP` is not
+  overridden).
+
 ### Mesh shadings (types 4–7)
 
 The four mesh shading types now decode and render, completing the shading

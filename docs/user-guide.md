@@ -30,6 +30,7 @@ The release binary is at `target/release/zpdf`. The examples below use
 | `info` | Print version, page count, and per-page size/rotation. |
 | `render` | Render a page to a PNG (CPU or GPU). |
 | `text` | Extract text from a page (or all pages). |
+| `forms` | List interactive-form (AcroForm) fields, types, and values. |
 | `compare` | Pixel-diff two PNGs and report difference metrics. |
 | `dump` | Print a resolved PDF object. |
 | `debug-stream` | Print a decoded stream object's bytes. |
