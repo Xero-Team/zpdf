@@ -291,8 +291,11 @@ cargo run -p zpdf-render-wgpu --example viewer -- <file.pdf>   # 交互浏览器
 - [x] Standard Security Handler（含直接 /Encrypt 字典、/StmF //StrF /Identity）
 - [x] RC4 / AES-128 / AES-256 解密（V1-V5，R2-R6；空用户口令；pypdf 加密
       fixtures 端到端验证）
-- [ ] 权限检查（/P 仅用于密钥派生）
-- [ ] 口令 API（非空用户口令的文档无法打开）
+- [x] 权限检查（/P 仅用于密钥派生）—— /P 仅参与密钥派生，不做强制限制（符合查看器惯例）
+- [x] 口令 API（非空用户/所有者口令）：`PdfDocument::open_with_password` /
+      `PdfFile::parse_with_password` / `is_encrypted()`；RC4 所有者口令经
+      Algorithm 7 从 /O 恢复用户口令；错误口令返回 `Error::WrongPassword`；
+      CLI `--password`。空口令默认打开仍宽松（不回归损坏语料）
 
 ### P4.7 — 附加 Filters
 - [x] LZWDecode

@@ -35,6 +35,11 @@ The release binary is at `target/release/zpdf`. The examples below use
 | `dump` | Print a resolved PDF object. |
 | `debug-stream` | Print a decoded stream object's bytes. |
 
+> **Encrypted PDFs.** Documents protected with a non-empty password open with
+> `--password <pw>` (accepted by `info`, `dump`, `render`, `text`, and `forms`).
+> The password may be the user or owner password; a wrong one reports an error.
+> Documents encrypted with an empty password open without the flag.
+
 ### `info` — inspect a document
 
 ```bash

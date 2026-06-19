@@ -30,13 +30,33 @@ impl PdfDocument {
     }
 
     pub fn open_with_limits(data: impl Into<Arc<[u8]>>, limits: ParseLimits) -> Result<Self> {
-        let file = PdfFile::parse_with_limits(data, limits)?;
+        Self::open_with_password_and_limits(data, b"", limits)
+    }
+
+    /// Open an encrypted document with a user or owner password. Returns
+    /// [`zpdf_core::Error::WrongPassword`] when the password authenticates as
+    /// neither. (A non-encrypted document opens regardless of the password.)
+    pub fn open_with_password(data: impl Into<Arc<[u8]>>, password: &[u8]) -> Result<Self> {
+        Self::open_with_password_and_limits(data, password, ParseLimits::default())
+    }
+
+    pub fn open_with_password_and_limits(
+        data: impl Into<Arc<[u8]>>,
+        password: &[u8],
+        limits: ParseLimits,
+    ) -> Result<Self> {
+        let file = PdfFile::parse_with_password_and_limits(data, password, limits)?;
         let catalog = Catalog::from_trailer(&file)?;
         Ok(Self {
             file,
             catalog,
             acro_form: OnceLock::new(),
         })
+    }
+
+    /// True when the document is encrypted (carries an `/Encrypt` dictionary).
+    pub fn is_encrypted(&self) -> bool {
+        self.file.is_encrypted()
     }
 
     pub fn page_count(&self) -> usize {

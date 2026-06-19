@@ -60,6 +60,21 @@ impl PdfFile {
     }
 
     pub fn parse_with_limits(data: impl Into<Arc<[u8]>>, limits: ParseLimits) -> Result<Self> {
+        Self::parse_with_password_and_limits(data, b"", limits)
+    }
+
+    /// Open with a user/owner password (for documents the empty password cannot
+    /// decrypt). Returns [`zpdf_core::Error::WrongPassword`] if it authenticates
+    /// as neither.
+    pub fn parse_with_password(data: impl Into<Arc<[u8]>>, password: &[u8]) -> Result<Self> {
+        Self::parse_with_password_and_limits(data, password, ParseLimits::default())
+    }
+
+    pub fn parse_with_password_and_limits(
+        data: impl Into<Arc<[u8]>>,
+        password: &[u8],
+        limits: ParseLimits,
+    ) -> Result<Self> {
         let data: Arc<[u8]> = data.into();
         // A missing `%PDF` marker is not fatal on its own: a sliced/headerless
         // fragment that begins directly with `N G obj` can still be opened by the
@@ -116,24 +131,43 @@ impl PdfFile {
         // Build the decryptor *after* construction so it can use `resolve` to
         // fetch the (never-encrypted) /Encrypt dict; `decryptor` is still `None`
         // at this point, so that resolve does not try to decrypt it.
-        file.decryptor = file.build_decryptor();
+        file.decryptor = file.build_decryptor(password)?;
         Ok(file)
     }
 
+    /// True when the trailer carries an `/Encrypt` dictionary. Note this does not
+    /// imply decryption succeeded — open the document to find out.
+    pub fn is_encrypted(&self) -> bool {
+        self.trailer.get("Encrypt").is_some()
+    }
+
     /// Construct the Standard-security-handler decryptor from the trailer
-    /// `/Encrypt` dictionary and the first element of `/ID`. Returns `None` for
-    /// unencrypted documents or unsupported handlers (AES, non-Standard).
-    fn build_decryptor(&self) -> Option<crypt::Decryptor> {
+    /// `/Encrypt` dictionary, the first element of `/ID`, and the password.
+    /// `Ok(None)` for unencrypted documents or unsupported/degraded handlers;
+    /// `Err(WrongPassword)` when a non-empty password fails to authenticate.
+    fn build_decryptor(&self, password: &[u8]) -> Result<Option<crypt::Decryptor>> {
         // /Encrypt is normally an indirect reference, but a direct dict is
         // legal too (a direct dict has no object id to exempt from decryption).
         // The /Encrypt dict is itself never encrypted; resolve it directly.
-        let (enc_obj, encrypt_ref) = match self.trailer.get("Encrypt")? {
-            PdfObject::Ref(r) => (self.resolve(*r).ok()?, Some(*r)),
+        let Some(enc) = self.trailer.get("Encrypt") else {
+            return Ok(None);
+        };
+        let (enc_obj, encrypt_ref) = match enc {
+            PdfObject::Ref(r) => match self.resolve(*r) {
+                Ok(o) => (o, Some(*r)),
+                Err(_) => return Ok(None),
+            },
             direct => (direct.clone(), None),
         };
-        let enc_dict = enc_obj.as_dict().ok()?;
+        let Ok(enc_dict) = enc_obj.as_dict() else {
+            return Ok(None);
+        };
         let id_first = self.first_id_bytes();
-        crypt::Decryptor::from_encrypt_dict(enc_dict, &id_first, encrypt_ref)
+        match crypt::Decryptor::from_encrypt_dict(enc_dict, &id_first, encrypt_ref, password) {
+            crypt::BuildResult::Decryptor(d) => Ok(Some(d)),
+            crypt::BuildResult::Degrade => Ok(None),
+            crypt::BuildResult::WrongPassword => Err(zpdf_core::Error::WrongPassword),
+        }
     }
 
     /// Raw bytes of the first element of the trailer `/ID` array (used in the

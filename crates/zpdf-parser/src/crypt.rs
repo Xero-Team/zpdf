@@ -1,7 +1,7 @@
 //! PDF **Standard Security Handler** decryption.
 //!
-//! Implements the empty-user-password decryption path for the Standard
-//! security handler:
+//! Authenticates a user or owner password (empty by default) and decrypts the
+//! Standard security handler:
 //! - RC4 (V1/V2, R2–R4) with MD5 key derivation (PDF 1.7 §7.6.3, Algorithms 2 & 1)
 //! - AES-128-CBC (V4/R4, crypt filter `AESV2`) — per-object key = MD5(file key
 //!   ‖ objnum ‖ gen ‖ `sAlT`); the first 16 bytes of each payload are the IV
@@ -46,6 +46,19 @@ enum Algo {
     AesV3,
 }
 
+/// Outcome of attempting to build a [`Decryptor`] for a document.
+pub enum BuildResult {
+    /// A usable decryptor (the password authenticated, or the empty-password
+    /// best-effort path was taken for an unvalidated RC4 document).
+    Decryptor(Decryptor),
+    /// No decryption: an unsupported security handler, or a V5 document whose
+    /// empty password did not validate. The document opens undecrypted.
+    Degrade,
+    /// A non-empty password was supplied but authenticated as neither the user
+    /// nor the owner password.
+    WrongPassword,
+}
+
 /// A built Standard-security-handler decryptor for one file.
 pub struct Decryptor {
     /// File-level encryption key (Algorithm 2 or 2.A output), `n` bytes.
@@ -65,21 +78,26 @@ pub struct Decryptor {
 }
 
 impl Decryptor {
-    /// Build a decryptor from the `/Encrypt` dictionary and the first element of
-    /// the trailer `/ID`. Returns `None` (with a warning) for security handlers
-    /// we don't support (non-`Standard` filter, password-protected documents)
-    /// so the caller degrades gracefully instead of emitting garbage.
+    /// Build a decryptor from the `/Encrypt` dictionary, the first element of the
+    /// trailer `/ID`, and a user/owner password (empty for the default open).
+    ///
+    /// The password is authenticated against `/U` (user) and `/O` (owner). A
+    /// non-empty password that matches neither yields [`BuildResult::WrongPassword`].
+    /// The empty-password default preserves the lenient behavior: an RC4 document
+    /// whose `/U` does not validate still opens (best-effort, with a warning),
+    /// since malformed-but-empty-password files are common.
     pub fn from_encrypt_dict(
         dict: &PdfDict,
         id_first: &[u8],
         encrypt_id: Option<ObjectId>,
-    ) -> Option<Self> {
+        password: &[u8],
+    ) -> BuildResult {
         let filter = dict.get_name("Filter").unwrap_or("");
         if filter != "Standard" {
             tracing::warn!(
                 "unsupported security handler /Filter {filter}; document will not decrypt"
             );
-            return None;
+            return BuildResult::Degrade;
         }
 
         let v = dict.get_i64("V").unwrap_or(0);
@@ -105,9 +123,14 @@ impl Decryptor {
         };
 
         let key = if v >= 5 {
-            // V5 (AESV3): ISO 32000-2 Algorithm 2.A. Validates the (empty)
-            // password and recovers the 32-byte file key from /UE or /OE.
-            compute_key_v5(dict, r)?
+            // V5 (AESV3): ISO 32000-2 Algorithm 2.A. Validates the password and
+            // recovers the 32-byte file key from /UE or /OE. No best-effort path —
+            // the key can only come from a correct password.
+            match compute_key_v5(dict, r, password) {
+                Some(k) => k,
+                None if password.is_empty() => return BuildResult::Degrade,
+                None => return BuildResult::WrongPassword,
+            }
         } else {
             let o = string_bytes(dict, "O");
             let u = string_bytes(dict, "U");
@@ -123,23 +146,44 @@ impl Decryptor {
             } else {
                 key_length_bits(dict, v)
             };
-            let key = compute_key_rc4(&o, p, id_first, r, length_bits, encrypt_metadata);
 
-            // Diagnostic: a correct empty-user-password key reproduces /U
-            // (Algorithm 4/6). A mismatch means a wrong key was derived (e.g. the
-            // document needs a password, or /ID//P were malformed) — surface it
-            // instead of silently rendering garbage. We still proceed, so a quirk in
-            // this check can never break a document that would otherwise decrypt.
-            if !validate_user_password(&key, &u, id_first, r) {
-                tracing::warn!(
-                    "encryption key did not validate against /U (V={v} R={r}); the PDF may require \
-                     a password — decrypted content may be garbage"
-                );
+            match authenticate_rc4(
+                password,
+                &o,
+                &u,
+                p,
+                id_first,
+                r,
+                length_bits,
+                encrypt_metadata,
+            ) {
+                Ok(key) => key,
+                // Authentication failed. Refuse only when a non-empty password
+                // was supplied AND there was a /U to check it against — that is
+                // an unambiguously wrong password. Otherwise open best-effort
+                // with the derived key (the lenient empty-password default, or a
+                // malformed document with no /U), preserving prior behavior.
+                Err(_) if !password.is_empty() && !u.is_empty() => {
+                    return BuildResult::WrongPassword;
+                }
+                Err(best_effort_key) => {
+                    if u.is_empty() && !password.is_empty() {
+                        tracing::warn!(
+                            "encrypted document has no /U to authenticate the password against \
+                             (V={v} R={r}); proceeding with the supplied password unverified"
+                        );
+                    } else {
+                        tracing::warn!(
+                            "encryption key did not validate against /U (V={v} R={r}); the PDF \
+                             may require a password — decrypted content may be garbage"
+                        );
+                    }
+                    best_effort_key
+                }
             }
-            key
         };
 
-        Some(Self {
+        BuildResult::Decryptor(Self {
             key,
             stm_algo,
             str_algo,
@@ -259,13 +303,14 @@ fn key_length_bits(dict: &PdfDict, v: i64) -> i64 {
     dict.get_i64("Length").unwrap_or(40)
 }
 
-/// Validate the derived file key against `/U` for the empty user password.
+/// Validate the derived file key against `/U` (Algorithm 6).
 /// R2: `/U` == RC4(key, PAD) (Algorithm 4). R≥3: the first 16 bytes of `/U`
-/// match the Algorithm 5 computation (Algorithm 6). Returns `true` when `/U` is
-/// absent (nothing to check against).
+/// match the Algorithm 5 computation. Returns `false` when `/U` is absent —
+/// there is nothing to authenticate against, which the caller handles as a
+/// best-effort open rather than a confirmed match.
 fn validate_user_password(key: &[u8], u: &[u8], id_first: &[u8], r: i64) -> bool {
     if u.is_empty() {
-        return true;
+        return false;
     }
     if r == 2 {
         return rc4(key, &PAD) == u;
@@ -306,9 +351,85 @@ fn algo_for_filter(dict: &PdfDict, filter_name: &str) -> Algo {
     }
 }
 
+/// Pad a password to 32 bytes per Algorithm 2 step (a): the first ≤32 password
+/// bytes followed by the standard 32-byte PAD, truncated to 32.
+fn pad_password(password: &[u8]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    let take = password.len().min(32);
+    out[..take].copy_from_slice(&password[..take]);
+    out[take..].copy_from_slice(&PAD[..32 - take]);
+    out
+}
+
+/// The RC4/AES-128 key-derivation byte length `n` for the given revision.
+fn rc4_key_len(r: i64, length_bits: i64) -> usize {
+    if r == 2 {
+        5
+    } else {
+        (length_bits / 8).clamp(5, 16) as usize
+    }
+}
+
+/// Authenticate `password` for an RC4/AES-128 document: try it as the user
+/// password (Algorithm 6), then as the owner password (Algorithm 7, which
+/// recovers the user password from `/O`). `Ok(key)` is a validated key; `Err(key)`
+/// carries the user-password-derived key as a best-effort fallback (for the
+/// lenient empty-password open, or a malformed document with no `/U` to check).
+#[allow(clippy::too_many_arguments)]
+fn authenticate_rc4(
+    password: &[u8],
+    o: &[u8],
+    u: &[u8],
+    p: i32,
+    id_first: &[u8],
+    r: i64,
+    length_bits: i64,
+    encrypt_metadata: bool,
+) -> std::result::Result<Vec<u8>, Vec<u8>> {
+    // User password (Algorithm 6).
+    let key = compute_key_rc4(password, o, p, id_first, r, length_bits, encrypt_metadata);
+    if validate_user_password(&key, u, id_first, r) {
+        return Ok(key);
+    }
+    // Owner password (Algorithm 7): recover the user password from /O, then
+    // run Algorithm 2 with it.
+    let recovered = recover_user_password_rc4(password, o, r, length_bits);
+    let owner_key = compute_key_rc4(&recovered, o, p, id_first, r, length_bits, encrypt_metadata);
+    if validate_user_password(&owner_key, u, id_first, r) {
+        return Ok(owner_key);
+    }
+    Err(key)
+}
+
+/// Algorithm 7: recover the (padded) user password from `/O` using the supplied
+/// owner password. The owner key is derived as in Algorithm 3, then `/O` is
+/// RC4-decrypted (a single pass for R2, 20 reverse-counter passes for R≥3).
+fn recover_user_password_rc4(owner_password: &[u8], o: &[u8], r: i64, length_bits: i64) -> Vec<u8> {
+    let n = rc4_key_len(r, length_bits);
+    let mut hash = md5(&pad_password(owner_password));
+    if r >= 3 {
+        for _ in 0..50 {
+            hash = md5(&hash[..n]);
+        }
+    }
+    let owner_key = &hash[..n];
+
+    let mut user = o.to_vec();
+    if r == 2 {
+        user = rc4(owner_key, &user);
+    } else {
+        for i in (0..=19u8).rev() {
+            let step_key: Vec<u8> = owner_key.iter().map(|b| b ^ i).collect();
+            user = rc4(&step_key, &user);
+        }
+    }
+    user
+}
+
 /// Algorithm 2 (RC4/AES-128 key, revisions 2–4): derive the file encryption key
-/// from the empty user password.
+/// from the (padded) user password.
 fn compute_key_rc4(
+    password: &[u8],
     o: &[u8],
     p: i32,
     id_first: &[u8],
@@ -316,15 +437,11 @@ fn compute_key_rc4(
     length_bits: i64,
     encrypt_metadata: bool,
 ) -> Vec<u8> {
-    let n = if r == 2 {
-        5
-    } else {
-        ((length_bits / 8).clamp(5, 16)) as usize
-    };
+    let n = rc4_key_len(r, length_bits);
 
     let mut input = Vec::with_capacity(32 + 32 + 4 + id_first.len() + 4);
-    // Step (a): padded empty password is exactly the 32-byte pad.
-    input.extend_from_slice(&PAD);
+    // Step (a): the padded user password.
+    input.extend_from_slice(&pad_password(password));
     // Step (b): the /O entry, padded/truncated to 32 bytes.
     let mut o32 = [0u8; 32];
     let take = o.len().min(32);
@@ -353,18 +470,21 @@ fn compute_key_rc4(
 // V5 (AES-256) key derivation — ISO 32000-2 §7.6.4.3.3/4, Algorithms 2.A & 2.B
 // ----------------------------------------------------------------------------
 
-/// Algorithm 2.A: validate the **empty** user password against `/U` and recover
-/// the 32-byte file key from `/UE`; fall back to the empty **owner** password
+/// Algorithm 2.A: validate `password` as the user password against `/U` and
+/// recover the 32-byte file key from `/UE`; fall back to the owner password
 /// (`/O` with the first 48 bytes of `/U` appended to the hash input) and `/OE`.
-/// Returns `None` (with a warning) when neither validates — the document needs
-/// a real password.
-fn compute_key_v5(dict: &PdfDict, r: i64) -> Option<Vec<u8>> {
+/// Returns `None` (with a warning) when neither validates — a wrong/missing
+/// password.
+fn compute_key_v5(dict: &PdfDict, r: i64, password: &[u8]) -> Option<Vec<u8>> {
     let o = string_bytes(dict, "O");
     let u = string_bytes(dict, "U");
     let oe = string_bytes(dict, "OE");
     let ue = string_bytes(dict, "UE");
-    // Only the empty password is supported (no password prompt in this crate).
-    let password: &[u8] = b"";
+    // ISO 32000-2 §7.6.4.3.3: the V5 password is UTF-8, SASLprep-normalized, and
+    // truncated to at most 127 bytes before hashing. We apply the byte cap (the
+    // common interop case); SASLprep normalization of non-ASCII passwords is not
+    // performed (it would need a stringprep table — out of scope for now).
+    let password = &password[..password.len().min(127)];
 
     // Algorithm 11 (user): /U = hash[32] || validation-salt[8] || key-salt[8].
     // On a validation hit but a broken /UE, fall through to the owner path.
@@ -721,7 +841,7 @@ mod tests {
         let p: i32 = -64;
 
         // Algorithm 2 → file encryption key.
-        let key = compute_key_rc4(&o, p, &id0, 2, 40, true);
+        let key = compute_key_rc4(b"", &o, p, &id0, 2, 40, true);
         assert_eq!(hex(&key), "b374aaeaf4", "file key (Algorithm 2)");
 
         // Algorithm 4 (R2): RC4(file_key, PAD) must equal stored /U.
@@ -731,7 +851,7 @@ mod tests {
             "validate_user_password should accept the correct R2 key"
         );
         // A wrong key (empty /ID) must NOT validate.
-        let wrong = compute_key_rc4(&o, p, &[], 2, 40, true);
+        let wrong = compute_key_rc4(b"", &o, p, &[], 2, 40, true);
         assert!(
             !validate_user_password(&wrong, &u, &id0, 2),
             "validate_user_password should reject a wrong key"
@@ -896,7 +1016,7 @@ mod tests {
             dict.insert(PdfName::new("O"), PdfObject::String(PdfString(o.clone())));
             dict.insert(PdfName::new("OE"), PdfObject::String(PdfString(oe.clone())));
             assert_eq!(
-                compute_key_v5(&dict, r).as_deref(),
+                compute_key_v5(&dict, r, b"").as_deref(),
                 Some(&file_key[..]),
                 "user-password path, R{r}"
             );
@@ -910,7 +1030,7 @@ mod tests {
             dict2.insert(PdfName::new("O"), PdfObject::String(PdfString(o)));
             dict2.insert(PdfName::new("OE"), PdfObject::String(PdfString(oe)));
             assert_eq!(
-                compute_key_v5(&dict2, r).as_deref(),
+                compute_key_v5(&dict2, r, b"").as_deref(),
                 Some(&file_key[..]),
                 "owner-password fallback, R{r}"
             );
@@ -939,7 +1059,10 @@ mod tests {
         );
         dict.insert(PdfName::new("StrF"), PdfObject::Name(PdfName::new("StdCF")));
 
-        let dec = Decryptor::from_encrypt_dict(&dict, &[], None).expect("decryptor");
+        let dec = match Decryptor::from_encrypt_dict(&dict, &[], None, b"") {
+            BuildResult::Decryptor(d) => d,
+            _ => panic!("decryptor"),
+        };
         assert_eq!(dec.stm_algo, Algo::Identity);
         assert_eq!(dec.str_algo, Algo::Rc4);
 
@@ -1060,7 +1183,7 @@ mod tests {
         let o = rc4(&okey[..5], &PAD);
         let id0: Vec<u8> = (0u8..16).collect();
         let p: i32 = -1;
-        let key = compute_key_rc4(&o, p, &id0, 2, 40, true);
+        let key = compute_key_rc4(b"", &o, p, &id0, 2, 40, true);
         let u = rc4(&key, &PAD); // Algorithm 4
 
         // RC4 is symmetric: "decrypting" the plaintext produces the ciphertext.
@@ -1119,5 +1242,161 @@ mod tests {
         let pdf = build_rc4_direct_encrypt_pdf(plain);
         let file = crate::PdfFile::parse(pdf).expect("parse hand-built encrypted PDF");
         assert_eq!(content_stream_bytes(&file), plain);
+    }
+
+    // ------------------------------------------------------------------
+    // Non-empty-password (RC4 V2/R3, 128-bit) authentication
+    // ------------------------------------------------------------------
+
+    /// Hand-build a V2/R3 RC4-128 PDF encrypted with distinct user and owner
+    /// passwords (Algorithms 2/3/5 on the encrypt side). `omit_u` drops `/U` to
+    /// model a malformed document with nothing to authenticate against.
+    fn build_rc4_password_pdf(
+        user_pw: &[u8],
+        owner_pw: &[u8],
+        content_plain: &[u8],
+        omit_u: bool,
+    ) -> Vec<u8> {
+        let (r, bits, n) = (3i64, 128i64, 16usize);
+        let id0: Vec<u8> = (0u8..16).collect();
+        let p: i32 = -44;
+
+        // Algorithm 3: /O = encrypt(padded user pwd) under the owner key.
+        let mut okey = md5(&pad_password(owner_pw));
+        for _ in 0..50 {
+            okey = md5(&okey[..n]);
+        }
+        let owner_key = &okey[..n];
+        let mut o = pad_password(user_pw).to_vec();
+        for i in 0..=19u8 {
+            let step_key: Vec<u8> = owner_key.iter().map(|b| b ^ i).collect();
+            o = rc4(&step_key, &o);
+        }
+
+        // Algorithm 2: file key from the user password + /O.
+        let key = compute_key_rc4(user_pw, &o, p, &id0, r, bits, true);
+
+        // Algorithm 5 (R≥3): /U = first 16 bytes of the iterated RC4 of MD5(PAD‖ID),
+        // padded out to 32 bytes.
+        let mut u_input = Vec::new();
+        u_input.extend_from_slice(&PAD);
+        u_input.extend_from_slice(&id0);
+        let mut x = rc4(&key, &md5(&u_input));
+        for i in 1..=19u8 {
+            let step_key: Vec<u8> = key.iter().map(|b| b ^ i).collect();
+            x = rc4(&step_key, &x);
+        }
+        let mut u = x;
+        u.extend_from_slice(&[0u8; 16]);
+
+        let enc = Decryptor {
+            key,
+            stm_algo: Algo::Rc4,
+            str_algo: Algo::Rc4,
+            encrypt_id: None,
+            encrypt_metadata: true,
+        };
+        let content_enc = enc.decrypt_stream_bytes(ObjectId(5, 0), content_plain);
+
+        let mut stream_obj = format!("<< /Length {} >>\nstream\n", content_enc.len()).into_bytes();
+        stream_obj.extend_from_slice(&content_enc);
+        stream_obj.extend_from_slice(b"\nendstream");
+        let bodies: Vec<Vec<u8>> = vec![
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 5 0 R >>".to_vec(),
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+            stream_obj,
+        ];
+
+        let mut out: Vec<u8> = b"%PDF-1.6\n".to_vec();
+        let mut offsets = Vec::new();
+        for (i, body) in bodies.iter().enumerate() {
+            offsets.push(out.len());
+            out.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+            out.extend_from_slice(body);
+            out.extend_from_slice(b"\nendobj\n");
+        }
+        let xref_pos = out.len();
+        out.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+        for off in &offsets {
+            out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        let u_entry = if omit_u {
+            String::new()
+        } else {
+            format!("/U <{}> ", hexstr(&u))
+        };
+        out.extend_from_slice(
+            format!(
+                "trailer\n<< /Size 6 /Root 1 0 R /ID [<{id}> <{id}>] /Encrypt << /Filter \
+                 /Standard /V 2 /R 3 /Length 128 /O <{o}> {u_entry}/P {p} >> >>\nstartxref\n\
+                 {xref_pos}\n%%EOF\n",
+                id = hexstr(&id0),
+                o = hexstr(&o),
+            )
+            .as_bytes(),
+        );
+        out
+    }
+
+    #[test]
+    fn user_password_decrypts() {
+        let plain = b"BT (user password works) Tj ET";
+        let pdf = build_rc4_password_pdf(b"secret", b"master", plain, false);
+        let file =
+            crate::PdfFile::parse_with_password(pdf, b"secret").expect("user password opens");
+        assert_eq!(content_stream_bytes(&file), plain);
+    }
+
+    #[test]
+    fn owner_password_decrypts_via_recovery() {
+        // The owner password authenticates by recovering the user password from
+        // /O (Algorithm 7), then deriving the same file key.
+        let plain = b"BT (owner password works) Tj ET";
+        let pdf = build_rc4_password_pdf(b"secret", b"master", plain, false);
+        let file =
+            crate::PdfFile::parse_with_password(pdf, b"master").expect("owner password opens");
+        assert_eq!(content_stream_bytes(&file), plain);
+    }
+
+    #[test]
+    fn wrong_password_is_rejected() {
+        let pdf = build_rc4_password_pdf(b"secret", b"master", b"BT (x) Tj ET", false);
+        match crate::PdfFile::parse_with_password(pdf, b"nope") {
+            Err(zpdf_core::Error::WrongPassword) => {}
+            Err(e) => panic!("expected WrongPassword, got error {e:?}"),
+            Ok(_) => panic!("expected WrongPassword, but the document opened"),
+        }
+    }
+
+    #[test]
+    fn empty_password_open_degrades_without_erroring() {
+        // The default open (empty password) must NOT error on a password-needing
+        // document — it opens best-effort, but the content does not decrypt to
+        // the plaintext.
+        let plain = b"BT (needs a password) Tj ET";
+        let pdf = build_rc4_password_pdf(b"secret", b"master", plain, false);
+        let file = crate::PdfFile::parse(pdf).expect("default open still succeeds");
+        assert!(file.is_encrypted());
+        assert_ne!(content_stream_bytes(&file), plain);
+    }
+
+    #[test]
+    fn missing_u_opens_best_effort_not_wrong_password() {
+        // A malformed document with no /U cannot be authenticated, so a supplied
+        // password is used unverified (best-effort) rather than reported wrong.
+        // The correct password still yields the right key and decrypts.
+        let plain = b"BT (no /U to check) Tj ET";
+        let pdf = build_rc4_password_pdf(b"secret", b"master", plain, true);
+        let file =
+            crate::PdfFile::parse_with_password(pdf, b"secret").expect("correct password opens");
+        assert_eq!(content_stream_bytes(&file), plain);
+
+        // A wrong password also opens (garbage), but never WrongPassword.
+        let pdf = build_rc4_password_pdf(b"secret", b"master", plain, true);
+        let file = crate::PdfFile::parse_with_password(pdf, b"nope")
+            .expect("wrong password still opens best-effort (no /U to reject against)");
+        assert_ne!(content_stream_bytes(&file), plain);
     }
 }

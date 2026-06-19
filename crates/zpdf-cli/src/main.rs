@@ -38,14 +38,52 @@ fn main() {
     }
 }
 
+/// Pull an optional `--password <pw>` out of an argument list, returning the
+/// remaining args and the password. Lets every document command accept it
+/// uniformly without each flag loop having to know about it.
+fn extract_password(args: &[String]) -> (Vec<String>, Option<String>) {
+    let mut rest = Vec::new();
+    let mut password = None;
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--password" {
+            // Require a value that is not itself a flag, so a forgotten value
+            // (`--password -o out.png`) does not silently swallow the next flag.
+            match args.get(i + 1) {
+                Some(v) if !v.starts_with('-') => {
+                    password = Some(v.clone());
+                    i += 2;
+                }
+                _ => {
+                    eprintln!("--password requires a value (a password not starting with '-')");
+                    process::exit(2);
+                }
+            }
+        } else {
+            rest.push(args[i].clone());
+            i += 1;
+        }
+    }
+    (rest, password)
+}
+
+/// Read and open a PDF, optionally with a decryption password.
+fn open_document(path: &str, password: Option<&str>) -> zpdf::Result<zpdf::PdfDocument> {
+    let data = fs::read(path).map_err(zpdf::Error::Io)?;
+    match password {
+        Some(pw) => zpdf::PdfDocument::open_with_password(data, pw.as_bytes()),
+        None => zpdf::PdfDocument::open(data),
+    }
+}
+
 fn cmd_info(args: &[String]) -> zpdf::Result<()> {
+    let (args, password) = extract_password(args);
     if args.is_empty() {
-        eprintln!("Usage: zpdf info <file.pdf>");
+        eprintln!("Usage: zpdf info <file.pdf> [--password <pw>]");
         process::exit(1);
     }
 
-    let data = fs::read(&args[0]).map_err(zpdf::Error::Io)?;
-    let doc = zpdf::PdfDocument::open(data)?;
+    let doc = open_document(&args[0], password.as_deref())?;
     let (major, minor) = doc.version();
 
     println!("File: {}", args[0]);
@@ -78,13 +116,13 @@ fn cmd_info(args: &[String]) -> zpdf::Result<()> {
 
 /// List the document's interactive-form (AcroForm) fields, types, and values.
 fn cmd_forms(args: &[String]) -> zpdf::Result<()> {
+    let (args, password) = extract_password(args);
     if args.is_empty() {
-        eprintln!("Usage: zpdf forms <file.pdf>");
+        eprintln!("Usage: zpdf forms <file.pdf> [--password <pw>]");
         process::exit(1);
     }
 
-    let data = fs::read(&args[0]).map_err(zpdf::Error::Io)?;
-    let doc = zpdf::PdfDocument::open(data)?;
+    let doc = open_document(&args[0], password.as_deref())?;
 
     let Some(form) = doc.acro_form() else {
         println!("No AcroForm (no interactive form fields).");
@@ -115,13 +153,13 @@ fn cmd_forms(args: &[String]) -> zpdf::Result<()> {
 }
 
 fn cmd_dump(args: &[String]) -> zpdf::Result<()> {
+    let (args, password) = extract_password(args);
     if args.len() < 3 {
-        eprintln!("Usage: zpdf dump <file.pdf> <obj_num> <gen_num>");
+        eprintln!("Usage: zpdf dump <file.pdf> <obj_num> <gen_num> [--password <pw>]");
         process::exit(1);
     }
 
-    let data = fs::read(&args[0]).map_err(zpdf::Error::Io)?;
-    let doc = zpdf::PdfDocument::open(data)?;
+    let doc = open_document(&args[0], password.as_deref())?;
 
     let obj_num: u32 = args[1].parse().unwrap_or(0);
     let gen_num: u16 = args[2].parse().unwrap_or(0);
@@ -236,8 +274,9 @@ fn cmd_compare(args: &[String]) -> zpdf::Result<()> {
 }
 
 fn cmd_text(args: &[String]) -> zpdf::Result<()> {
+    let (args, password) = extract_password(args);
     if args.is_empty() {
-        eprintln!("Usage: zpdf text <file.pdf> [-p <page>] [--all]");
+        eprintln!("Usage: zpdf text <file.pdf> [-p <page>] [--all] [--password <pw>]");
         process::exit(1);
     }
 
@@ -258,8 +297,7 @@ fn cmd_text(args: &[String]) -> zpdf::Result<()> {
         i += 1;
     }
 
-    let data = fs::read(pdf_path).map_err(zpdf::Error::Io)?;
-    let doc = zpdf::PdfDocument::open(data)?;
+    let doc = open_document(pdf_path, password.as_deref())?;
 
     let page_indices: Vec<usize> = if all {
         (0..doc.page_count()).collect()
@@ -298,9 +336,10 @@ fn cmd_text(args: &[String]) -> zpdf::Result<()> {
 }
 
 fn cmd_render(args: &[String]) -> zpdf::Result<()> {
+    let (args, password) = extract_password(args);
     if args.is_empty() {
         eprintln!(
-            "Usage: zpdf render <file.pdf> [-p <page>] [-o <output.png>] [--dpi <dpi>] [--backend cpu|wgpu]"
+            "Usage: zpdf render <file.pdf> [-p <page>] [-o <output.png>] [--dpi <dpi>] [--backend cpu|wgpu] [--password <pw>]"
         );
         process::exit(1);
     }
@@ -343,8 +382,10 @@ fn cmd_render(args: &[String]) -> zpdf::Result<()> {
         i += 1;
     }
 
-    let data = fs::read(pdf_path).map_err(zpdf::Error::Io)?;
-    let doc = zpdf::PdfDocument::open(data)?;
+    let doc = open_document(pdf_path, password.as_deref())?;
+    if doc.is_encrypted() && password.is_none() {
+        eprintln!("  note: document is encrypted; if output looks wrong, pass --password <pw>");
+    }
 
     let page_index = page_num.saturating_sub(1);
     let page = doc.page(page_index)?;

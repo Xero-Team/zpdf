@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+### Password-protected documents (non-empty user/owner password)
+
+Encrypted PDFs that require a password now open with one supplied — previously
+only the empty-password case decrypted. The cryptographic core (RC4/AES-128/256,
+MD5/SHA-2, the R6 hardened hash, key-derivation Algorithms 2 / 2.A / 2.B) was
+already in place and tested; this wires a real password through it. Still zero
+C/C++ dependencies.
+
+- **New API**: `PdfDocument::open_with_password(data, pw)` (and
+  `_and_limits`); `PdfFile::parse_with_password`; `PdfDocument::is_encrypted()`.
+  A wrong password returns the new `Error::WrongPassword`; the password may be
+  the **user** or the **owner** password. The default `open()` is unchanged.
+- **Owner-password recovery** (`zpdf-parser/src/crypt.rs`): RC4 documents now
+  authenticate the owner password too — Algorithm 7 derives the owner key,
+  RC4-decrypts `/O` to recover the user password (single pass for R2, the 20
+  reverse-counter passes for R≥3), then re-derives the file key via Algorithm 2.
+  `authenticate_rc4` tries the password as user (Algorithm 6) then owner. V5
+  (AES-256) already had the owner path; it now uses the supplied password.
+- **Robustness preserved**: the empty-password default open stays lenient — an
+  RC4 document whose `/U` doesn't validate under the empty password still opens
+  best-effort (with a warning), so the malformed/adversarial corpus is
+  unaffected. Only an explicitly-supplied non-empty password that authenticates
+  as neither user nor owner raises `WrongPassword`.
+- **CLI**: a `--password <pw>` flag on `info` / `dump` / `render` / `text` /
+  `forms`; `render` notes when a document is encrypted and no password was given.
+- Verified by new unit tests: a hand-built RC4 V2/R3-128 PDF with distinct user
+  and owner passwords decrypts under **either** (owner via Algorithm 7 recovery),
+  a wrong password returns `WrongPassword`, and the empty-password default open
+  degrades without erroring (no corpus regression).
+
 ### Interactive forms (AcroForm)
 
 Interactive form fields now have a field model and, crucially for a renderer,

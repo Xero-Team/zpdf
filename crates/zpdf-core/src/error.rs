@@ -37,6 +37,9 @@ pub enum Error {
     #[error("unsupported filter: {0}")]
     UnsupportedFilter(String),
 
+    #[error("incorrect password for an encrypted document")]
+    WrongPassword,
+
     #[error("recursion depth exceeded (max {0})")]
     RecursionLimit(u32),
 
