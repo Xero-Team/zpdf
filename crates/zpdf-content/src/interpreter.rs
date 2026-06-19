@@ -4051,7 +4051,11 @@ mod tests {
         match &dl.commands[0] {
             RenderCommand::FillPath { paint, .. } => match paint {
                 Paint::Solid(c) => {
-                    assert!(c.r < 0.01 && c.g < 0.01 && c.b < 0.01);
+                    // DeviceCMYK 100% K resolves through the Adobe polynomial to
+                    // a dark near-black (~0.17, 0.18, 0.21), not pure black.
+                    assert!((c.r - 0.171).abs() < 0.01, "r={}", c.r);
+                    assert!((c.g - 0.182).abs() < 0.01, "g={}", c.g);
+                    assert!((c.b - 0.206).abs() < 0.01, "b={}", c.b);
                 }
                 _ => panic!("expected solid paint"),
             },

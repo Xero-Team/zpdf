@@ -63,6 +63,26 @@ C/C++ dependencies.
   name classification per encoding) and end-to-end `text`/`render` round-trips
   for Big5, GBK, Shift-JIS (incl. half-width kana), EUC-KR, and EUC-JP.
 
+### DeviceCMYK colour fidelity
+
+DeviceCMYK without an ICC profile previously used the crude `(1−c)(1−k)`
+conversion, which renders oversaturated, unlike a reference viewer. It now uses
+the Adobe DeviceCMYK→sRGB polynomial approximation (fitted to US Web Coated
+SWOP — the same one Acrobat and pdf.js use), so colours match a reference
+renderer. Pure cyan goes from `(0, 255, 255)` to `(0, 185, 242)`; pure yellow
+to `(255, 235, 61)`. Most visibly, **100 % K renders as a dark near-black
+`(44, 46, 53)`, not pure black** — ink impurity, matching Acrobat.
+
+- Single source of truth in `zpdf_color::cmyk_to_rgb` (inputs clamped to 0..1);
+  `zpdf-image` delegates to it. Applies to DeviceCMYK fills/strokes, CMYK images
+  (incl. CMYK JPEG and Indexed-over-CMYK), and Separation/DeviceN tint
+  transforms whose alternate space is DeviceCMYK. No new dependency.
+- Unchanged: DeviceCMYK *with* an ICC/Default profile still converts through the
+  moxcms transform (already accurate); and the Adobe-YCCK JPEG path keeps its
+  own YCCK-specific decode (`zpdf-parser`).
+- Verified against the pdf.js coefficients, cross-checked numerically, and with
+  an end-to-end CMYK render whose pixels match the polynomial.
+
 ## 0.5.0 — robustness & closing the 0.4.0 limitations
 
 Two robustness passes and a feature-completion pass since 0.4.0, all with zero

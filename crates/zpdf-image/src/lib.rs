@@ -926,15 +926,20 @@ fn components_to_rgb(cs: &ResolvedColorSpace, comps: &[u8; 4]) -> [u8; 3] {
     }
 }
 
+/// Convert an 8-bit DeviceCMYK pixel to 8-bit sRGB via the shared Adobe
+/// polynomial (the non-ICC path; ICC-tagged CMYK is converted upstream through
+/// the moxcms transform). Single source of truth in [`zpdf_color::cmyk_to_rgb`].
 fn cmyk_to_rgb(comps: &[u8; 4]) -> [u8; 3] {
-    let c = comps[0] as f32 / 255.0;
-    let m = comps[1] as f32 / 255.0;
-    let y = comps[2] as f32 / 255.0;
-    let k = comps[3] as f32 / 255.0;
+    let (r, g, b) = zpdf_color::cmyk_to_rgb(
+        comps[0] as f64 / 255.0,
+        comps[1] as f64 / 255.0,
+        comps[2] as f64 / 255.0,
+        comps[3] as f64 / 255.0,
+    );
     [
-        ((1.0 - c) * (1.0 - k) * 255.0) as u8,
-        ((1.0 - m) * (1.0 - k) * 255.0) as u8,
-        ((1.0 - y) * (1.0 - k) * 255.0) as u8,
+        (r * 255.0).round() as u8,
+        (g * 255.0).round() as u8,
+        (b * 255.0).round() as u8,
     ]
 }
 
@@ -1040,11 +1045,12 @@ mod tests {
 
     #[test]
     fn cmyk8_to_rgba() {
-        // Pure black in CMYK: C=0, M=0, Y=0, K=255
+        // Pure black in CMYK: C=0, M=0, Y=0, K=255. The Adobe DeviceCMYK
+        // polynomial renders 100% K as a dark near-black, not pure (0,0,0).
         let samples = vec![0, 0, 0, 255];
         let dict = image_dict(1, 1, 8, Some("DeviceCMYK"));
         let img = decode_image_xobject(&samples, &dict).unwrap();
-        assert_eq!(pixel(&img, 0), &[0, 0, 0, 255]);
+        assert_eq!(pixel(&img, 0), &[44, 46, 53, 255]);
     }
 
     // ---- JPX signature sniffing (decode itself is tested in tests/jpx.rs) ----
@@ -1168,12 +1174,13 @@ mod tests {
 
     #[test]
     fn decode_array_inverts_cmyk() {
-        // Raw 255,255,255,0 with [1 0 ×4] decodes to C=M=Y=0, K=1 → black.
+        // Raw 255,255,255,0 with [1 0 ×4] decodes to C=M=Y=0, K=1 → near-black
+        // (the Adobe DeviceCMYK polynomial maps 100% K to a dark gray).
         let samples = vec![255, 255, 255, 0];
         let mut dict = image_dict(1, 1, 8, Some("DeviceCMYK"));
         dict.insert(PdfName::new("Decode"), int_array(&[1, 0, 1, 0, 1, 0, 1, 0]));
         let img = decode_image_xobject(&samples, &dict).unwrap();
-        assert_eq!(pixel(&img, 0), &[0, 0, 0, 255]);
+        assert_eq!(pixel(&img, 0), &[44, 46, 53, 255]);
     }
 
     #[test]
@@ -1239,12 +1246,12 @@ mod tests {
         let cs = ResolvedColorSpace::Indexed {
             base: Box::new(ResolvedColorSpace::Cmyk),
             hival: 0,
-            lookup: vec![0, 0, 0, 255], // black
+            lookup: vec![0, 0, 0, 255], // K=1 → near-black via the CMYK polynomial
         };
         let samples = vec![0u8];
         let dict = image_dict(1, 1, 8, None);
         let img = decode_image_xobject_resolved(&samples, &dict, [0, 0, 0], Some(cs)).unwrap();
-        assert_eq!(pixel(&img, 0), &[0, 0, 0, 255]);
+        assert_eq!(pixel(&img, 0), &[44, 46, 53, 255]);
     }
 
     #[test]
@@ -1279,7 +1286,8 @@ mod tests {
             Some(ResolvedColorSpace::Cmyk),
         )
         .unwrap();
-        assert_eq!(pixel(&img, 0), &[0, 0, 0, 255]);
+        // K=1 → dark near-black via the Adobe DeviceCMYK polynomial.
+        assert_eq!(pixel(&img, 0), &[44, 46, 53, 255]);
     }
 
     // ---- item 3: /SMask ----

@@ -82,7 +82,8 @@ cargo run -p zpdf-cli -- dump tests/corpus/minimal.pdf 1 0
 - [x] CS/cs 颜色空间切换
 - [x] SC/SCN/sc/scn 颜色值设置
 - [x] 快捷操作符：G/g/RG/rg/K/k
-- [x] CMYK → RGB 简单转换
+- [x] CMYK → RGB（非 ICC 路径用 Adobe DeviceCMYK→sRGB 多项式近似，US Web Coated
+      SWOP，与 Acrobat/pdf.js 对齐；100% K 为深近黑而非纯黑）
 
 ### P2.4 — 文本渲染
 - [x] BT/ET 文本块
