@@ -248,6 +248,10 @@ pub struct GlyphRun {
     pub paint: Paint,
     pub alpha: f32,
     pub transform: Matrix,
+    /// Horizontal text-scaling factor (Tz/100). Scales the glyph *shape* x only;
+    /// per-glyph advances already include it. Almost always 1.0; negative values
+    /// (e.g. Tz -100) mirror glyphs horizontally — see `outline_to_pixel`.
+    pub h_scale: f32,
 }
 
 #[derive(Debug, Clone, Copy)]

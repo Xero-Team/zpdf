@@ -25,8 +25,8 @@ struct GlyphXform {
     upem: f32,
     font_size: f32,
     map: PageMap,
-    /// `tm.d < 0 || (tm.d == 0 && tm.b != 0)` — the CTM already maps Y downward.
-    ctm_flips_y: bool,
+    /// Horizontal text-scaling factor (Tz/100); scales the glyph shape x only.
+    h_scale: f32,
 }
 
 /// Render one glyph run into the recorder. Dispatch guards mirror the CPU exactly:
@@ -48,10 +48,9 @@ pub fn render_glyph_run(rec: &mut PageRecorder, fonts: &FontCache, map: &PageMap
     }
 
     let tm = &run.transform;
-    let ctm_flips_y = tm.d < 0.0 || (tm.d == 0.0 && tm.b != 0.0);
 
     if font.is_type3() {
-        render_type3(rec, font, run, color, map, ctm_flips_y);
+        render_type3(rec, font, run, color, map, run.h_scale);
         return;
     }
 
@@ -59,7 +58,7 @@ pub fn render_glyph_run(rec: &mut PageRecorder, fonts: &FontCache, map: &PageMap
         upem: font.units_per_em as f32,
         font_size: run.font_size,
         map: *map,
-        ctm_flips_y,
+        h_scale: run.h_scale,
     };
     for g in &run.glyphs {
         let Some(outline) = font.glyph_outline(g.glyph_id) else {
@@ -73,9 +72,9 @@ pub fn render_glyph_run(rec: &mut PageRecorder, fonts: &FontCache, map: &PageMap
     }
 }
 
-/// Reproduce `CpuRenderer::outline_to_pixel`: font units -> user space (f32) ->
-/// page space (f64 via the matrix) -> device pixels (f32), with the conditional
-/// Y flip. The f32->f64->f32 precision order is parity-critical.
+/// Reproduce `CpuRenderer::outline_to_pixel`: font units -> text space (f32) ->
+/// page space (f64 via the matrix) -> device pixels (f32), with the one fixed
+/// page Y-flip. The f32->f64->f32 precision order is parity-critical.
 fn outline_to_pixel(
     gx: f64,
     gy: f64,
@@ -83,16 +82,14 @@ fn outline_to_pixel(
     tm: &Matrix,
     x: &GlyphXform,
 ) -> lyon::math::Point {
-    let tx = (gx as f32 / x.upem * x.font_size + glyph_x) as f64;
+    // Th (h_scale) multiplies the glyph shape x only; the advance in glyph_x
+    // already includes it.
+    let tx = (gx as f32 / x.upem * x.font_size * x.h_scale + glyph_x) as f64;
     let ty = (gy as f32 / x.upem * x.font_size) as f64;
     let page_x = tm.a * tx + tm.c * ty + tm.e;
     let page_y = tm.b * tx + tm.d * ty + tm.f;
     let px = (page_x as f32 - x.map.x0) * x.map.scale;
-    let py = if x.ctm_flips_y {
-        (page_y as f32 - x.map.y0) * x.map.scale
-    } else {
-        (x.map.y1 - page_y as f32) * x.map.scale
-    };
+    let py = (x.map.y1 - page_y as f32) * x.map.scale;
     point(px, py)
 }
 
@@ -163,7 +160,7 @@ fn render_type3(
     run: &GlyphRun,
     color: [f32; 4],
     map: &PageMap,
-    ctm_flips_y: bool,
+    h_scale: f32,
 ) {
     use zpdf_content::interpreter::ContentInterpreter;
 
@@ -181,7 +178,7 @@ fn render_type3(
             match cmd {
                 RenderCommand::FillPath { path, rule, .. } => {
                     if let Some(p) =
-                        build_type3_path(path, &font_matrix, font_size, tm, g.x, map, ctm_flips_y)
+                        build_type3_path(path, &font_matrix, font_size, h_scale, tm, g.x, map)
                     {
                         if let Some(mesh) = fill_lyon_path(&p, *rule, color) {
                             rec.add_mesh(mesh);
@@ -194,7 +191,7 @@ fn render_type3(
                     let width = (style.width * font_matrix[0].abs() as f32 * font_size * map.scale)
                         .max(0.5);
                     if let Some(p) =
-                        build_type3_path(path, &font_matrix, font_size, tm, g.x, map, ctm_flips_y)
+                        build_type3_path(path, &font_matrix, font_size, h_scale, tm, g.x, map)
                     {
                         let opts = StrokeOptions::tolerance(TOLERANCE).with_line_width(width);
                         if let Some(mesh) = stroke_lyon_path(&p, &opts, color) {
@@ -216,23 +213,19 @@ fn type3_to_pixel(
     gy: f64,
     font_matrix: &[f64; 6],
     font_size: f32,
+    h_scale: f32,
     tm: &Matrix,
     glyph_x: f32,
     map: &PageMap,
-    ctm_flips_y: bool,
 ) -> lyon::math::Point {
     let tx = font_matrix[0] * gx + font_matrix[2] * gy + font_matrix[4];
     let ty = font_matrix[1] * gx + font_matrix[3] * gy + font_matrix[5];
-    let tx = tx * font_size as f64 + glyph_x as f64;
+    let tx = tx * font_size as f64 * h_scale as f64 + glyph_x as f64;
     let ty = ty * font_size as f64;
     let page_x = tm.a * tx + tm.c * ty + tm.e;
     let page_y = tm.b * tx + tm.d * ty + tm.f;
     let px = (page_x as f32 - map.x0) * map.scale;
-    let py = if ctm_flips_y {
-        (page_y as f32 - map.y0) * map.scale
-    } else {
-        (map.y1 - page_y as f32) * map.scale
-    };
+    let py = (map.y1 - page_y as f32) * map.scale;
     point(px, py)
 }
 
@@ -241,10 +234,10 @@ fn build_type3_path(
     path: &DlPath,
     font_matrix: &[f64; 6],
     font_size: f32,
+    h_scale: f32,
     tm: &Matrix,
     glyph_x: f32,
     map: &PageMap,
-    ctm_flips_y: bool,
 ) -> Option<LyonPath> {
     if path.elements.is_empty() {
         return None;
@@ -255,10 +248,10 @@ fn build_type3_path(
             pt.y,
             font_matrix,
             font_size,
+            h_scale,
             tm,
             glyph_x,
             map,
-            ctm_flips_y,
         )
     };
     let mut b = LyonPath::builder();
@@ -306,12 +299,7 @@ mod tests {
     use super::*;
 
     fn map(scale: f32, y1: f32) -> PageMap {
-        PageMap {
-            scale,
-            x0: 0.0,
-            y0: 0.0,
-            y1,
-        }
+        PageMap { scale, x0: 0.0, y1 }
     }
 
     #[test]
@@ -321,7 +309,7 @@ mod tests {
             upem: 1000.0,
             font_size: 10.0,
             map: map(2.0, 100.0),
-            ctm_flips_y: false,
+            h_scale: 1.0,
         };
         let tm = Matrix {
             a: 1.0,
@@ -339,14 +327,16 @@ mod tests {
     }
 
     #[test]
-    fn outline_to_pixel_flipped_ctm_skips_page_flip() {
+    fn outline_to_pixel_flipped_ctm_uses_fixed_page_flip() {
+        // The CTM's negative `d` is honored as ordinary geometry; the one fixed
+        // page Y-flip still applies (the old conditional skip was the bug1
+        // upside-down defect).
         let x = GlyphXform {
             upem: 1000.0,
             font_size: 10.0,
             map: map(2.0, 100.0),
-            ctm_flips_y: true,
+            h_scale: 1.0,
         };
-        // d < 0: py uses (page_y - y0)*scale directly (no top-edge flip).
         let tm = Matrix {
             a: 1.0,
             b: 0.0,
@@ -355,9 +345,33 @@ mod tests {
             e: 50.0,
             f: 50.0,
         };
-        // ty = 2; page_y = -1*2 + 50 = 48; py = 48*2 = 96.
+        // ty = 2; page_y = -1*2 + 50 = 48; py = (100-48)*2 = 104.
         let p = outline_to_pixel(500.0, 200.0, 0.0, &tm, &x);
         assert_eq!(p.x, 110.0);
+        assert_eq!(p.y, 104.0);
+    }
+
+    #[test]
+    fn outline_to_pixel_h_scale_mirrors_shape_x_only() {
+        // Th = -1 mirrors the glyph shape x about the pen origin, but never y.
+        let x = GlyphXform {
+            upem: 1000.0,
+            font_size: 10.0,
+            map: map(2.0, 100.0),
+            h_scale: -1.0,
+        };
+        let tm = Matrix {
+            a: 1.0,
+            b: 0.0,
+            c: 0.0,
+            d: 1.0,
+            e: 50.0,
+            f: 50.0,
+        };
+        // tx = 500/1000*10*(-1) + 0 = -5; page_x = 45; px = 90.
+        // ty unaffected: 2; page_y = 52; py = (100-52)*2 = 96.
+        let p = outline_to_pixel(500.0, 200.0, 0.0, &tm, &x);
+        assert_eq!(p.x, 90.0);
         assert_eq!(p.y, 96.0);
     }
 
@@ -370,10 +384,9 @@ mod tests {
             map: PageMap {
                 scale: 2.0,
                 x0: 20.0,
-                y0: 10.0,
                 y1: 110.0,
             },
-            ctm_flips_y: false,
+            h_scale: 1.0,
         };
         let tm = Matrix {
             a: 1.0,

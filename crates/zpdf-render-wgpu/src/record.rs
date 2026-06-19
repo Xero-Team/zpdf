@@ -277,7 +277,6 @@ mod tests {
         PageMap {
             scale: 1.0,
             x0: 0.0,
-            y0: 0.0,
             y1: 100.0,
         }
     }

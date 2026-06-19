@@ -84,6 +84,15 @@ pub fn find_system_font(
         candidates.push(base.to_string());
     };
 
+    // CJK defaults come from the descriptor's CID ordering, or — for Source Han
+    // / Noto CJK / Adobe CJK fonts that declare Adobe-Identity and so carry no
+    // ordering — are inferred from the family name.
+    let cjk_order = if ordering_defaults(ordering).is_empty() {
+        cjk_ordering_for(base_font)
+    } else {
+        ordering
+    };
+
     // The PS name itself (no style suffix games — it already encodes style).
     candidates.push(full_norm.clone());
     push(&mut candidates, &strip_ps_suffixes(&full_norm));
@@ -91,7 +100,7 @@ pub fn find_system_font(
     if let Some(alias) = alias_for(&family_norm) {
         push(&mut candidates, alias);
     }
-    for fam in ordering_defaults(ordering) {
+    for fam in ordering_defaults(cjk_order) {
         push(&mut candidates, fam);
     }
     for fam in generic_defaults(hints) {
@@ -189,6 +198,52 @@ fn alias_for(family_norm: &str) -> Option<&'static str> {
         "batangche" => "batang",
         _ => return None,
     })
+}
+
+/// Infer a CJK CID ordering ("GB1"/"CNS1"/"Japan1"/"Korea1") from a well-known
+/// pan-CJK or Adobe CJK font name. Source Han / Noto CJK fonts declare an
+/// Adobe-Identity ordering, so [`ordering_defaults`] alone yields nothing for
+/// them; this recovers a sensible CJK default from the region-tagged name.
+/// Returns `None` for non-CJK names (so callers don't substitute a CJK face
+/// for a Latin font).
+pub fn cjk_ordering_for(base_font: &str) -> Option<&'static str> {
+    let n = normalize(strip_subset_prefix(base_font));
+    let is_han = n.contains("sourcehan")
+        || n.contains("notosanscjk")
+        || n.contains("notoserifcjk")
+        || n.contains("notocjk");
+    if is_han {
+        // Region tag follows "sans"/"serif"/"cjk": ...tc/hk → Traditional,
+        // ...jp/ja → Japanese, ...kr → Korean, ...sc/cn or untagged → Simplified.
+        if n.contains("tc") || n.contains("hk") {
+            return Some("CNS1");
+        }
+        if n.contains("jp") || n.contains("ja") {
+            return Some("Japan1");
+        }
+        if n.contains("kr") || n.contains("ko") {
+            return Some("Korea1");
+        }
+        return Some("GB1");
+    }
+    // Adobe CJK collection fonts (also commonly non-embedded / Identity).
+    if n.contains("adobeming") || n.contains("adobefanheiti") {
+        return Some("CNS1");
+    }
+    if n.contains("kozmin") || n.contains("kozgo") || n.contains("adobegothic") {
+        return Some("Japan1");
+    }
+    if n.contains("adobemyungjo") || n.contains("adobeg0thic") {
+        return Some("Korea1");
+    }
+    if n.contains("adobesong")
+        || n.contains("adobeheiti")
+        || n.contains("adobefangsong")
+        || n.contains("adobekaiti")
+    {
+        return Some("GB1");
+    }
+    None
 }
 
 /// Default CJK families for a composite font's CID ordering.
@@ -577,6 +632,24 @@ mod tests {
         assert_eq!(alias_for("times"), Some("timesnewroman"));
         assert_eq!(alias_for("courier"), Some("couriernew"));
         assert_eq!(alias_for("verdana"), None);
+    }
+
+    #[test]
+    fn cjk_ordering_inference() {
+        // Source Han / Noto CJK carry Adobe-Identity, so the region-tagged name
+        // is the only ordering signal.
+        assert_eq!(
+            cjk_ordering_for("DISOTQ+SourceHanSansSC-Light"),
+            Some("GB1")
+        );
+        assert_eq!(cjk_ordering_for("SourceHanSerifTC"), Some("CNS1"));
+        assert_eq!(cjk_ordering_for("NotoSansCJKjp-Regular"), Some("Japan1"));
+        assert_eq!(cjk_ordering_for("NotoSansCJKkr"), Some("Korea1"));
+        // Untagged pan-CJK defaults to Simplified.
+        assert_eq!(cjk_ordering_for("SourceHanSans"), Some("GB1"));
+        // Non-CJK names must not be misrouted to a CJK face.
+        assert_eq!(cjk_ordering_for("ArialMT"), None);
+        assert_eq!(cjk_ordering_for("TimesNewRomanPS-BoldMT"), None);
     }
 
     #[test]

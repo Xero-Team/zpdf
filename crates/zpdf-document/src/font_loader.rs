@@ -310,8 +310,12 @@ fn load_type0_font(
 
     let mut font = match font_data {
         Some(data) => {
-            let mut font =
-                LoadedFont::new_with_data(PdfFontType::Type0CidType2, base_font, data, cid_widths);
+            let mut font = LoadedFont::new_with_data(
+                PdfFontType::Type0CidType2,
+                base_font.clone(),
+                data,
+                cid_widths.clone(),
+            );
             // /CIDToGIDMap stream: explicit CID → GID table, authoritative for
             // CIDFontType2 (TrueType-based) descendants. A raw-CFF CIDFontType0
             // descendant keeps its charset-derived map built in new_with_data —
@@ -322,32 +326,27 @@ fn load_type0_font(
                     font.cid_to_gid = Some(map);
                 }
             }
+            // Some embedded CID-keyed CFF subsets are defective and cannot be
+            // outlined (unparseable per-FD Private DICTs strand the local subrs),
+            // so most glyphs render blank. When the font is identifiably CJK and
+            // the embedded program fails to outline most sampled glyphs, fall
+            // back to a system CJK face (glyphs then route CID→Unicode→GID via
+            // /ToUnicode, attached later in load_single_font).
+            let cjk = is_cjk_ordering(desc_ordering(file, desc_dict).as_deref())
+                || zpdf_font::system::cjk_ordering_for(&base_font).is_some();
+            if cjk && font.embedded_outline_failure_rate() > 0.5 {
+                if let Some(sub) = substitute_type0_font(file, desc_dict, &base_font, cid_widths) {
+                    font = sub;
+                }
+            }
             font
         }
         None => {
             // Non-embedded composite font (typically CJK): substitute a system
             // face. CIDs are remapped through /ToUnicode once it is attached
             // (see build_substitute_cid_to_gid in load_single_font).
-            let ordering = resolve_dict(file, desc_dict, "CIDSystemInfo").and_then(|csi| match csi
-                .get("Ordering")
-            {
-                Some(PdfObject::String(s)) => Some(s.to_string_lossy()),
-                Some(PdfObject::Name(n)) => Some(n.as_str().to_string()),
-                _ => None,
-            });
-            let hints = substitute_hints(file, desc_dict);
-            let substituted =
-                zpdf_font::system::find_system_font(&base_font, hints, ordering.as_deref())
-                    .and_then(|m| {
-                        LoadedFont::new_substitute(
-                            PdfFontType::Type0CidType2,
-                            base_font.clone(),
-                            m.data,
-                            m.face_index,
-                            cid_widths,
-                        )
-                    });
-            substituted.unwrap_or_else(|| LoadedFont::new_placeholder(base_font))
+            substitute_type0_font(file, desc_dict, &base_font, cid_widths)
+                .unwrap_or_else(|| LoadedFont::new_placeholder(base_font))
         }
     };
     font.cid_cmap = Some(cmap);
@@ -356,6 +355,42 @@ fn load_type0_font(
     // Unicode; otherwise fall back to Identity (codes pass through as CIDs).
     font.validate_cid_cmap();
     Ok(font)
+}
+
+/// The descendant CIDFont's `/CIDSystemInfo /Ordering` (e.g. "GB1", "Identity").
+fn desc_ordering(file: &PdfFile, desc_dict: &zpdf_core::PdfDict) -> Option<String> {
+    resolve_dict(file, desc_dict, "CIDSystemInfo").and_then(|csi| match csi.get("Ordering") {
+        Some(PdfObject::String(s)) => Some(s.to_string_lossy()),
+        Some(PdfObject::Name(n)) => Some(n.as_str().to_string()),
+        _ => None,
+    })
+}
+
+/// A registered CJK character-collection ordering (not Adobe-Identity).
+fn is_cjk_ordering(ordering: Option<&str>) -> bool {
+    matches!(ordering, Some("GB1" | "CNS1" | "Japan1" | "Korea1" | "KR"))
+}
+
+/// Build a system-font substitute for a composite (Type0) font, carrying over
+/// the PDF's authoritative /W advances. Returns `None` when no installed face
+/// matches (caller keeps the embedded font or a placeholder).
+fn substitute_type0_font(
+    file: &PdfFile,
+    desc_dict: &zpdf_core::PdfDict,
+    base_font: &str,
+    cid_widths: CidWidths,
+) -> Option<LoadedFont> {
+    let ordering = desc_ordering(file, desc_dict);
+    let hints = substitute_hints(file, desc_dict);
+    zpdf_font::system::find_system_font(base_font, hints, ordering.as_deref()).and_then(|m| {
+        LoadedFont::new_substitute(
+            PdfFontType::Type0CidType2,
+            base_font.to_string(),
+            m.data,
+            m.face_index,
+            cid_widths,
+        )
+    })
 }
 
 /// Decode a /CIDToGIDMap stream into a CID → GID table: two bytes per CID,

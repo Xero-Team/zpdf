@@ -1,5 +1,6 @@
 pub mod cmap;
 pub mod encoding;
+pub mod gb2312;
 pub mod glyph_list;
 pub mod standard_fonts;
 pub mod system;
@@ -410,6 +411,14 @@ impl LoadedFont {
             .unwrap_or(false)
     }
 
+    /// A *substituted* font under a legacy GB EUC CMap: `show_text` already
+    /// resolved the incoming `glyph_id` to a real system-face GID (via
+    /// code → Unicode), so `glyph_outline` must pass it straight through rather
+    /// than route it as a CID. Embedded GBpc fonts keep the normal CID path.
+    pub fn gb_decode_substitute(&self) -> bool {
+        self.is_substitute && self.cid_cmap.as_ref().map(|c| c.gb_decode).unwrap_or(false)
+    }
+
     /// Downgrade a Unicode-coded CMap to Identity when the font program has
     /// no Unicode cmap table to resolve against (e.g. an embedded CID-keyed
     /// CFF) — codes then pass through as CIDs, which the charset or
@@ -460,8 +469,9 @@ impl LoadedFont {
         let data = self.font_data.as_ref()?;
         let face = ttf_parser::Face::parse(data, self.face_index).ok()?;
 
-        let actual_gid = if self.unicode_coded() {
-            // Unicode-coded composite fonts already carry real GIDs.
+        let actual_gid = if self.unicode_coded() || self.gb_decode_substitute() {
+            // Unicode-coded (and substituted GB-EUC) composite fonts already
+            // carry real GIDs.
             glyph_id
         } else if let Some(map) = &self.cid_to_gid {
             *map.get(&glyph_id)?
@@ -482,6 +492,50 @@ impl LoadedFont {
             commands: builder.commands,
             advance_width: advance,
         })
+    }
+
+    /// Fraction of sampled, mapped CIDs whose embedded outline fails to resolve.
+    ///
+    /// Some embedded CID-keyed CFF subsets are defective: their per-FD Private
+    /// DICTs are unparseable, stranding the local subroutines, so `ttf-parser`
+    /// (like FreeType) returns no outline for every glyph that calls a local
+    /// subr — often the majority. The font loader uses a high rate to switch to
+    /// a system substitute rather than render mostly-blank text. Returns 0.0 for
+    /// anything that is not an embedded composite font with a CID→GID map.
+    pub fn embedded_outline_failure_rate(&self) -> f32 {
+        if self.is_substitute || !matches!(self.font_type, PdfFontType::Type0CidType2) {
+            return 0.0;
+        }
+        let Some(map) = &self.cid_to_gid else {
+            return 0.0;
+        };
+        let Some(data) = &self.font_data else {
+            return 0.0;
+        };
+        let Ok(face) = ttf_parser::Face::parse(data, self.face_index) else {
+            return 0.0;
+        };
+        let mut cids: Vec<u16> = map.keys().copied().collect();
+        if cids.is_empty() {
+            return 0.0;
+        }
+        // Sample evenly across the (sorted) CID range so several CFF FDs are
+        // exercised, not just one. A glyph with no outline at all (e.g. space)
+        // returns None too, but at the >0.5 trip point a handful cannot matter.
+        cids.sort_unstable();
+        let step = (cids.len() / 64).max(1);
+        let (mut total, mut fail) = (0u32, 0u32);
+        let mut i = 0;
+        while i < cids.len() {
+            let gid = ttf_parser::GlyphId(map[&cids[i]]);
+            let mut builder = OutlineBuilder::new();
+            total += 1;
+            if face.outline_glyph(gid, &mut builder).is_none() {
+                fail += 1;
+            }
+            i += step;
+        }
+        fail as f32 / total as f32
     }
 
     /// Get glyph advance width.
@@ -693,6 +747,13 @@ impl LoadedFont {
                         out.push_str(s);
                     } else if cm.codes_are_unicode {
                         if let Some(c) = char::from_u32(code) {
+                            out.push(c);
+                        }
+                    } else if cm.gb_decode {
+                        if let Some(c) = cm
+                            .decode_to_unicode(code, len as u8)
+                            .and_then(char::from_u32)
+                        {
                             out.push(c);
                         }
                     }

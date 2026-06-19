@@ -975,6 +975,7 @@ impl<'a> CpuRenderer<'a> {
     ) {
         let tm = &run.transform;
         let font_size = run.font_size;
+        let h_scale = run.h_scale;
         let upem = font.units_per_em as f32;
 
         for glyph in &run.glyphs {
@@ -985,8 +986,9 @@ impl<'a> CpuRenderer<'a> {
 
             // Transform each glyph outline point:
             // glyph_coord (font units) → text space → user space → page space → pixel space
-            let skia_path = self
-                .build_outline_transformed_path(&outline, upem, font_size, tm, glyph.x, glyph.y);
+            let skia_path = self.build_outline_transformed_path(
+                &outline, upem, font_size, h_scale, tm, glyph.x, glyph.y,
+            );
             if let Some(path) = skia_path {
                 if let Some(ref mut pixmap) = self.pixmap {
                     pixmap.fill_path(
@@ -1007,6 +1009,7 @@ impl<'a> CpuRenderer<'a> {
         outline: &GlyphOutline,
         upem: f32,
         font_size: f32,
+        h_scale: f32,
         tm: &zpdf_core::Matrix,
         glyph_x_offset: f32,
         glyph_y_offset: f32,
@@ -1017,22 +1020,25 @@ impl<'a> CpuRenderer<'a> {
         for cmd in &outline.commands {
             match *cmd {
                 OutlineCommand::MoveTo(x, y) => {
-                    let (px, py) = self.outline_to_pixel(x, y, upem, font_size, tm, off);
+                    let (px, py) = self.outline_to_pixel(x, y, upem, font_size, h_scale, tm, off);
                     pb.move_to(px, py);
                 }
                 OutlineCommand::LineTo(x, y) => {
-                    let (px, py) = self.outline_to_pixel(x, y, upem, font_size, tm, off);
+                    let (px, py) = self.outline_to_pixel(x, y, upem, font_size, h_scale, tm, off);
                     pb.line_to(px, py);
                 }
                 OutlineCommand::QuadTo(x1, y1, x, y) => {
-                    let (px1, py1) = self.outline_to_pixel(x1, y1, upem, font_size, tm, off);
-                    let (px, py) = self.outline_to_pixel(x, y, upem, font_size, tm, off);
+                    let (px1, py1) =
+                        self.outline_to_pixel(x1, y1, upem, font_size, h_scale, tm, off);
+                    let (px, py) = self.outline_to_pixel(x, y, upem, font_size, h_scale, tm, off);
                     pb.quad_to(px1, py1, px, py);
                 }
                 OutlineCommand::CurveTo(x1, y1, x2, y2, x, y) => {
-                    let (px1, py1) = self.outline_to_pixel(x1, y1, upem, font_size, tm, off);
-                    let (px2, py2) = self.outline_to_pixel(x2, y2, upem, font_size, tm, off);
-                    let (px, py) = self.outline_to_pixel(x, y, upem, font_size, tm, off);
+                    let (px1, py1) =
+                        self.outline_to_pixel(x1, y1, upem, font_size, h_scale, tm, off);
+                    let (px2, py2) =
+                        self.outline_to_pixel(x2, y2, upem, font_size, h_scale, tm, off);
+                    let (px, py) = self.outline_to_pixel(x, y, upem, font_size, h_scale, tm, off);
                     pb.cubic_to(px1, py1, px2, py2, px, py);
                 }
                 OutlineCommand::Close => pb.close(),
@@ -1041,31 +1047,32 @@ impl<'a> CpuRenderer<'a> {
         self.finish_within_limits(pb)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn outline_to_pixel(
         &self,
         gx: f64,
         gy: f64,
         upem: f32,
         font_size: f32,
+        h_scale: f32,
         tm: &zpdf_core::Matrix,
         glyph_offset: (f32, f32),
     ) -> (f32, f32) {
-        // font units → user space
-        let tx = (gx as f32 / upem * font_size + glyph_offset.0) as f64;
+        // font units → text space. The shape x carries the horizontal-scaling
+        // factor (Th = Tz/100); the offset already includes it (accumulated
+        // advance), so Th multiplies only the outline term.
+        let tx = (gx as f32 / upem * font_size * h_scale + glyph_offset.0) as f64;
         let ty = (gy as f32 / upem * font_size + glyph_offset.1) as f64;
 
-        // user space → page space via combined CTM*Tm
+        // text space → page space via combined CTM*Tm*rise
         let page_x = tm.a * tx + tm.c * ty + tm.e;
         let page_y = tm.b * tx + tm.d * ty + tm.f;
 
-        // page space → pixel space
-        let ctm_flips_y = tm.d < 0.0 || (tm.d == 0.0 && tm.b != 0.0);
+        // page space → pixel space. The CTM's own orientation (including a
+        // negative `d`) is honored as ordinary geometry, then the one fixed page
+        // Y-flip is applied — the same affine used for paths and images.
         let px = (page_x as f32 - self.rect_x0) * self.scale;
-        let py = if ctm_flips_y {
-            (page_y as f32 - self.rect_y0) * self.scale
-        } else {
-            (self.rect_y1 - page_y as f32) * self.scale
-        };
+        let py = (self.rect_y1 - page_y as f32) * self.scale;
         (px, py)
     }
 
@@ -1083,6 +1090,7 @@ impl<'a> CpuRenderer<'a> {
         // then Tm * text_coords → CTM-transformed space, then to pixels.
         let tm = &run.transform;
         let font_size = run.font_size;
+        let h_scale = run.h_scale;
 
         for glyph in &run.glyphs {
             let (stream, font_matrix) = match font.type3_glyph_stream(glyph.glyph_id) {
@@ -1105,6 +1113,7 @@ impl<'a> CpuRenderer<'a> {
                             path,
                             &font_matrix,
                             font_size,
+                            h_scale,
                             tm,
                             glyph.x,
                         ) {
@@ -1124,6 +1133,7 @@ impl<'a> CpuRenderer<'a> {
                             path,
                             &font_matrix,
                             font_size,
+                            h_scale,
                             tm,
                             glyph.x,
                         ) {
@@ -1153,11 +1163,13 @@ impl<'a> CpuRenderer<'a> {
     }
 
     /// Transform a Type3 glyph path through: FontMatrix → text position → CTM → pixels.
+    #[allow(clippy::too_many_arguments)]
     fn build_type3_transformed_path(
         &self,
         path: &Path,
         font_matrix: &[f64; 6],
         font_size: f32,
+        h_scale: f32,
         tm: &zpdf_core::Matrix,
         glyph_x_offset: f32,
     ) -> Option<tiny_skia::Path> {
@@ -1166,25 +1178,54 @@ impl<'a> CpuRenderer<'a> {
         for elem in &path.elements {
             match *elem {
                 PathElement::MoveTo(p) => {
-                    let (px, py) =
-                        self.type3_to_pixel(p.x, p.y, font_matrix, font_size, tm, glyph_x_offset);
+                    let (px, py) = self.type3_to_pixel(
+                        p.x,
+                        p.y,
+                        font_matrix,
+                        font_size,
+                        h_scale,
+                        tm,
+                        glyph_x_offset,
+                    );
                     pb.move_to(px, py);
                 }
                 PathElement::LineTo(p) => {
-                    let (px, py) =
-                        self.type3_to_pixel(p.x, p.y, font_matrix, font_size, tm, glyph_x_offset);
+                    let (px, py) = self.type3_to_pixel(
+                        p.x,
+                        p.y,
+                        font_matrix,
+                        font_size,
+                        h_scale,
+                        tm,
+                        glyph_x_offset,
+                    );
                     pb.line_to(px, py);
                 }
                 PathElement::CurveTo(c1, c2, end) => {
-                    let (x1, y1) =
-                        self.type3_to_pixel(c1.x, c1.y, font_matrix, font_size, tm, glyph_x_offset);
-                    let (x2, y2) =
-                        self.type3_to_pixel(c2.x, c2.y, font_matrix, font_size, tm, glyph_x_offset);
+                    let (x1, y1) = self.type3_to_pixel(
+                        c1.x,
+                        c1.y,
+                        font_matrix,
+                        font_size,
+                        h_scale,
+                        tm,
+                        glyph_x_offset,
+                    );
+                    let (x2, y2) = self.type3_to_pixel(
+                        c2.x,
+                        c2.y,
+                        font_matrix,
+                        font_size,
+                        h_scale,
+                        tm,
+                        glyph_x_offset,
+                    );
                     let (x, y) = self.type3_to_pixel(
                         end.x,
                         end.y,
                         font_matrix,
                         font_size,
+                        h_scale,
                         tm,
                         glyph_x_offset,
                     );
@@ -1197,12 +1238,14 @@ impl<'a> CpuRenderer<'a> {
     }
 
     /// Transform a point from Type3 glyph space all the way to pixel space.
+    #[allow(clippy::too_many_arguments)]
     fn type3_to_pixel(
         &self,
         gx: f64,
         gy: f64,
         font_matrix: &[f64; 6],
         font_size: f32,
+        h_scale: f32,
         tm: &zpdf_core::Matrix,
         glyph_x_offset: f32,
     ) -> (f32, f32) {
@@ -1210,32 +1253,21 @@ impl<'a> CpuRenderer<'a> {
         let tx = font_matrix[0] * gx + font_matrix[2] * gy + font_matrix[4];
         let ty = font_matrix[1] * gx + font_matrix[3] * gy + font_matrix[5];
 
-        // Step 2: scale by font_size
-        let tx = tx * font_size as f64;
+        // Step 2: scale by font_size; the shape x also carries Th (Tz/100).
+        let tx = tx * font_size as f64 * h_scale as f64;
         let ty = ty * font_size as f64;
 
-        // Step 3: add glyph horizontal offset (in page space, pre-CTM)
+        // Step 3: add glyph horizontal offset (text space, advance already incl. Th)
         let tx = tx + glyph_x_offset as f64;
 
         // Step 4: apply text matrix (= CTM * Tm) to get page-space coords
         let page_x = tm.a * tx + tm.c * ty + tm.e;
         let page_y = tm.b * tx + tm.d * ty + tm.f;
 
-        // Step 5: page space → pixel space
-        // The CTM already handles Y flipping if needed, so we just need
-        // to map from PDF page coords (origin bottom-left, Y up) to pixels.
-        // But if CTM already flipped Y (like Skia PDFs), page_y is already
-        // in top-down order. We detect this by checking if CTM has negative Y scale.
-        let ctm_flips_y = tm.d < 0.0 || (tm.d == 0.0 && tm.b != 0.0);
-
+        // Step 5: page space → pixel space. The CTM's orientation is ordinary
+        // geometry; the one fixed page Y-flip then maps to device pixels.
         let px = (page_x as f32 - self.rect_x0) * self.scale;
-        let py = if ctm_flips_y {
-            // CTM already flipped Y into screen coordinates
-            (page_y as f32 - self.rect_y0) * self.scale
-        } else {
-            // Standard PDF coords: flip Y
-            (self.rect_y1 - page_y as f32) * self.scale
-        };
+        let py = (self.rect_y1 - page_y as f32) * self.scale;
 
         (px, py)
     }

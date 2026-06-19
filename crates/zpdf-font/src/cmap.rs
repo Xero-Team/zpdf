@@ -288,6 +288,12 @@ pub struct CidCMap {
     pub codes_are_unicode: bool,
     /// CID = code (the Identity family; also the lenient fallback).
     pub identity: bool,
+    /// Legacy GB2312 (EUC-CN) byte encoding (the predefined `GBpc-EUC-H/-V`
+    /// CMaps): 1-byte ASCII + 2-byte EUC-CN. For a *substituted* (non-embedded)
+    /// font the code is decoded to Unicode via [`decode_to_unicode`] and the
+    /// glyph resolves through the system face's Unicode cmap. The 1-byte ASCII →
+    /// Adobe-GB1 CID range is still installed in `cid_ranges` for widths.
+    pub gb_decode: bool,
 }
 
 impl CidCMap {
@@ -319,7 +325,35 @@ impl CidCMap {
                 ..Default::default()
             });
         }
+        // GBpc-EUC-H/-V: 1-byte ASCII + 2-byte GB2312 (EUC-CN), Adobe-GB1.
+        // The 2-byte code is decoded to Unicode at show time (substituted CJK
+        // face); the 1-byte ASCII → Adobe-GB1 CID range (CID = code − 0x1F)
+        // gives correct /W-based advances for the embedded Latin glyphs.
+        if name == "GBpc-EUC-H" || name == "GBpc-EUC-V" {
+            let mut cm = Self {
+                wmode,
+                gb_decode: true,
+                ..Default::default()
+            };
+            cm.codespace.push((1, 0x00, 0x80));
+            cm.codespace.push((2, 0xA1A1, 0xFEFE));
+            cm.cid_ranges.push((1, 0x20, 0x7E, 1)); // 0x20→CID1 … 0x7E→CID95
+            return Some(cm);
+        }
         None
+    }
+
+    /// Decode a code (with its byte length) to a Unicode scalar for the legacy
+    /// GB EUC CMaps: 1-byte codes are ASCII identity, 2-byte codes go through the
+    /// GB2312 table. `None` for non-GB CMaps or undefined codes.
+    pub fn decode_to_unicode(&self, code: u32, len: u8) -> Option<u32> {
+        if !self.gb_decode {
+            return None;
+        }
+        if len == 1 {
+            return (code <= 0x7F).then_some(code);
+        }
+        crate::gb2312::gb2312_to_unicode(code as u16).map(|c| c as u32)
     }
 
     /// Parse an embedded CMap stream: codespacerange, cidrange, cidchar,
@@ -975,6 +1009,25 @@ mod tests {
         // Legacy byte-encoded CMaps are not bundled.
         assert!(CidCMap::predefined("90ms-RKSJ-H").is_none());
         assert!(CidCMap::predefined("ETen-B5-H").is_none());
+    }
+
+    #[test]
+    fn gbpc_euc_decodes_and_splits() {
+        let cm = CidCMap::predefined("GBpc-EUC-H").unwrap();
+        assert!(cm.gb_decode);
+        assert_eq!(cm.wmode, 0);
+        assert_eq!(CidCMap::predefined("GBpc-EUC-V").unwrap().wmode, 1);
+
+        // next_code: 1-byte ASCII, then a 2-byte EUC-CN code.
+        let bytes = b"\x4D\xCF\xC2"; // 'M' then 0xCFC2 (下)
+        assert_eq!(cm.next_code(&bytes[..]), (0x4D, 1));
+        assert_eq!(cm.next_code(&bytes[1..]), (0xCFC2, 2));
+
+        // decode_to_unicode: ASCII identity + GB2312 lookup.
+        assert_eq!(cm.decode_to_unicode(0x4D, 1), Some(0x4D));
+        assert_eq!(cm.decode_to_unicode(0xCFC2, 2), Some(0x4E0B)); // 下
+                                                                   // 1-byte ASCII → Adobe-GB1 CID (CID = code − 0x1F): 'M' → 46.
+        assert_eq!(cm.code_to_cid(0x4D, 1), 46);
     }
 
     #[test]

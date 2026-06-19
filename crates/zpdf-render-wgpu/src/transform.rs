@@ -52,10 +52,10 @@ pub struct TexturedVertex {
 #[derive(Copy, Clone)]
 pub struct PageMap {
     pub scale: f32,
-    /// Page rect bounds (f32, matching the CPU's stored fields): the left edge,
-    /// bottom edge, and top edge of the rendered page rect in page units.
+    /// Page rect bounds (f32, matching the CPU's stored fields): the left edge
+    /// and top edge of the rendered page rect in page units. The fixed Y-flip
+    /// maps page y to `(y1 - y) * scale`, so the bottom edge is not needed.
     pub x0: f32,
-    pub y0: f32,
     pub y1: f32,
 }
 
@@ -64,7 +64,6 @@ impl PageMap {
         Self {
             scale,
             x0: rect.x0 as f32,
-            y0: rect.y0 as f32,
             y1: rect.y1 as f32,
         }
     }
@@ -123,7 +122,6 @@ mod tests {
         let m = PageMap {
             scale: 2.0,
             x0: 0.0,
-            y0: 0.0,
             y1: 100.0,
         };
         // (10, 80) page -> (20, (100-80)*2 = 40) device pixels.

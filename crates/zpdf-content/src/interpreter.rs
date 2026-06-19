@@ -3233,6 +3233,7 @@ impl<'a> ContentInterpreter<'a> {
         font_size: f32,
         glyphs: Vec<PositionedGlyph>,
         transform: Matrix,
+        h_scale: f32,
     ) {
         let paint_color = match self.current.render_mode {
             1 | 5 => self.current.stroke_color,
@@ -3245,6 +3246,7 @@ impl<'a> ContentInterpreter<'a> {
             paint: Paint::Solid(paint_color),
             alpha: self.current.fill_alpha,
             transform,
+            h_scale,
         });
         self.emit_painted(cmd);
     }
@@ -3290,6 +3292,11 @@ impl<'a> ContentInterpreter<'a> {
             let cmap = font_and_id.and_then(|(_, f)| f.cid_cmap.as_ref());
             vertical = cmap.map(|c| c.wmode == 1).unwrap_or(false);
             let codes_are_unicode = cmap.map(|c| c.codes_are_unicode).unwrap_or(false);
+            // Legacy GB EUC CMap on a *substituted* (non-embedded) font: decode
+            // code → Unicode and resolve through the system face. Embedded GBpc
+            // fonts keep the normal code → CID → GID path.
+            let gb_decode = cmap.map(|c| c.gb_decode).unwrap_or(false)
+                && font_and_id.map(|(_, f)| f.is_substitute).unwrap_or(false);
             let dw2 = font_and_id.map(|(_, f)| f.dw2).unwrap_or((880.0, -1000.0));
 
             let mut i = 0usize;
@@ -3315,6 +3322,20 @@ impl<'a> ContentInterpreter<'a> {
                             Some((gid, adv)) => (gid, adv, None),
                             None => (0, 500.0, None),
                         }
+                    } else if gb_decode {
+                        // GID from the system face via code → Unicode; advance
+                        // from the PDF /W keyed by the Adobe-GB1 CID (1-byte
+                        // ASCII → CID 1-95; 2-byte CJK → CID 0 → DW, ~1000).
+                        let cid = cmap
+                            .map(|c| c.code_to_cid(code, len as u8))
+                            .unwrap_or(0)
+                            .min(u16::MAX as u32) as u16;
+                        let gid = cmap
+                            .and_then(|c| c.decode_to_unicode(code, len as u8))
+                            .and_then(|u| font.unicode_glyph(u))
+                            .map(|(g, _)| g)
+                            .unwrap_or(0);
+                        (gid, font.glyph_advance(cid), None)
                     } else {
                         let cid = cmap
                             .map(|c| c.code_to_cid(code, len as u8))
@@ -3450,7 +3471,7 @@ impl<'a> ContentInterpreter<'a> {
                 };
                 let glyph_clip = text_pattern.as_ref().and_then(|_| {
                     font_and_id.and_then(|(_, font)| {
-                        build_glyph_clip_path(&glyphs, &combined, font, font_size)
+                        build_glyph_clip_path(&glyphs, &combined, font, font_size, h_scale)
                     })
                 });
                 match (text_pattern, glyph_clip) {
@@ -3462,10 +3483,12 @@ impl<'a> ContentInterpreter<'a> {
                         let painted = self.paint_pattern_in_region(&pat, bounds);
                         self.display_list.push(RenderCommand::PopClip);
                         if !painted {
-                            self.emit_solid_glyph_run(font_id, font_size, glyphs, combined);
+                            self.emit_solid_glyph_run(
+                                font_id, font_size, glyphs, combined, h_scale,
+                            );
                         }
                     }
-                    _ => self.emit_solid_glyph_run(font_id, font_size, glyphs, combined),
+                    _ => self.emit_solid_glyph_run(font_id, font_size, glyphs, combined, h_scale),
                 }
             }
         }
@@ -3571,6 +3594,7 @@ fn build_glyph_clip_path(
     tm: &Matrix,
     font: &zpdf_font::LoadedFont,
     font_size: f32,
+    h_scale: f32,
 ) -> Option<(Path, Rect)> {
     if !font.has_font_data() || font.is_type3() {
         return None;
@@ -3581,8 +3605,10 @@ fn build_glyph_clip_path(
     }
 
     // Glyph-space point (font units, + the glyph's text-space offset) → page.
+    // The shape x carries the horizontal-scaling factor (Th); the offset already
+    // does (it's an accumulated advance), so Th multiplies only the outline term.
     let to_page = |gx: f64, gy: f64, ox: f32, oy: f32| -> Point {
-        let tx = (gx as f32 / upem * font_size + ox) as f64;
+        let tx = (gx as f32 / upem * font_size * h_scale + ox) as f64;
         let ty = (gy as f32 / upem * font_size + oy) as f64;
         Point::new(tm.a * tx + tm.c * ty + tm.e, tm.b * tx + tm.d * ty + tm.f)
     };
@@ -3954,7 +3980,7 @@ mod tests {
                 advance: 0.0,
             },
         ];
-        let (path, bounds) = build_glyph_clip_path(&glyphs, &Matrix::identity(), &font, 100.0)
+        let (path, bounds) = build_glyph_clip_path(&glyphs, &Matrix::identity(), &font, 100.0, 1.0)
             .expect("glyph clip path");
         assert!(
             !path.elements.is_empty(),
