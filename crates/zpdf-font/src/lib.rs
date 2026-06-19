@@ -1,7 +1,12 @@
+pub mod big5;
 pub mod cmap;
 pub mod encoding;
+pub mod eucjp;
 pub mod gb2312;
+pub mod gbk;
 pub mod glyph_list;
+pub mod ksc;
+pub mod sjis;
 pub mod standard_fonts;
 pub mod system;
 pub mod type1;
@@ -411,12 +416,18 @@ impl LoadedFont {
             .unwrap_or(false)
     }
 
-    /// A *substituted* font under a legacy GB EUC CMap: `show_text` already
-    /// resolved the incoming `glyph_id` to a real system-face GID (via
-    /// code → Unicode), so `glyph_outline` must pass it straight through rather
-    /// than route it as a CID. Embedded GBpc fonts keep the normal CID path.
-    pub fn gb_decode_substitute(&self) -> bool {
-        self.is_substitute && self.cid_cmap.as_ref().map(|c| c.gb_decode).unwrap_or(false)
+    /// A *substituted* font under a legacy byte-encoded CMap (GB / GBK / Big5 /
+    /// Shift-JIS / EUC-JP / KSC): `show_text` already resolved the incoming
+    /// `glyph_id` to a real system-face GID (via code → Unicode), so
+    /// `glyph_outline` must pass it straight through rather than route it as a
+    /// CID. Embedded legacy-CMap fonts keep the normal CID path.
+    pub fn legacy_substitute(&self) -> bool {
+        self.is_substitute
+            && self
+                .cid_cmap
+                .as_ref()
+                .map(|c| c.is_legacy())
+                .unwrap_or(false)
     }
 
     /// Downgrade a Unicode-coded CMap to Identity when the font program has
@@ -469,9 +480,9 @@ impl LoadedFont {
         let data = self.font_data.as_ref()?;
         let face = ttf_parser::Face::parse(data, self.face_index).ok()?;
 
-        let actual_gid = if self.unicode_coded() || self.gb_decode_substitute() {
-            // Unicode-coded (and substituted GB-EUC) composite fonts already
-            // carry real GIDs.
+        let actual_gid = if self.unicode_coded() || self.legacy_substitute() {
+            // Unicode-coded (and substituted legacy-CMap) composite fonts
+            // already carry real GIDs.
             glyph_id
         } else if let Some(map) = &self.cid_to_gid {
             *map.get(&glyph_id)?
@@ -749,7 +760,7 @@ impl LoadedFont {
                         if let Some(c) = char::from_u32(code) {
                             out.push(c);
                         }
-                    } else if cm.gb_decode {
+                    } else if cm.is_legacy() {
                         if let Some(c) = cm
                             .decode_to_unicode(code, len as u8)
                             .and_then(char::from_u32)

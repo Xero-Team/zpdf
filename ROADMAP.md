@@ -232,7 +232,9 @@ cargo run -p zpdf-render-wgpu --example viewer -- <file.pdf>   # 交互浏览器
 - [x] CIDFont (Type0 composite fonts)：Identity-H、`/W`、`/CIDToGIDMap` 流、
       OpenType 包装的 CID-keyed CFF
 - [x] CMap 解析（预定义 + 嵌入）：嵌入 CMap 流 + Identity / UniGB/UniCNS/UniJIS/UniKS
-      UCS2/UTF16 系列；legacy 字节编码 CMap 回退 Identity（带告警）
+      UCS2/UTF16 系列；legacy 字节编码 CMap 全覆盖（GB2312/GBK、Big5、Shift-JIS（含半角
+      片假名）、EUC-KR/UHC、EUC-JP，均含 -H/-V）——非嵌入 CJK 字体经 `LegacyEncoding`
+      解码 code→Unicode 走替代字体；码表由 `tools/gen_cjk_tables.py` 烘焙（Python 编解码器，无新依赖）
 - [x] Vertical writing mode（WMode 1：按 /DW2 推进 + 字形原点居中）
 - [x] Type3 font (字形由内容流定义)：含间接 /CharProcs //Encoding //Widths，
       FirstChar≠0 修复

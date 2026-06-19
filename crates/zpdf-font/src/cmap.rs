@@ -269,10 +269,110 @@ impl ToUnicodeMap {
 // Code → CID CMaps (composite-font /Encoding)
 // ---------------------------------------------------------------------------
 
+/// The national character encoding of a predefined legacy (byte-encoded) CJK
+/// CMap. These map a multi-byte character code, in a national encoding, to a
+/// glyph in an Adobe character collection; for a *substituted* (non-embedded)
+/// font we instead decode the code to Unicode and resolve the glyph through the
+/// system face's Unicode `cmap`. The 2-byte → Unicode tables are baked from the
+/// platform codecs (`tools/gen_cjk_tables.py`); 1-byte codes are ASCII (plus
+/// the Shift-JIS half-width katakana block).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LegacyEncoding {
+    /// GB2312 / EUC-CN — `GBpc-EUC-H/V`, `GB-EUC-H/V` (Adobe-GB1).
+    EucCn,
+    /// GBK — `GBK-EUC-H/V`, `GBKp-EUC-H/V`, `GBK2K-H/V` (Adobe-GB1).
+    Gbk,
+    /// Big5 — `B5pc-H/V`, `ETen-B5-H/V`, `HKscs-B5-H/V` (Adobe-CNS1).
+    Big5,
+    /// Shift-JIS — the `*-RKSJ-H/V` CMaps (Adobe-Japan1).
+    ShiftJis,
+    /// EUC-JP — `EUC-H/V` (Adobe-Japan1).
+    EucJp,
+    /// EUC-KR / UHC — `KSC-EUC-H/V`, `KSCms-UHC-H/V`, `KSCpc-EUC-H` (Adobe-Korea1).
+    EucKr,
+}
+
+impl LegacyEncoding {
+    /// Classify a predefined CMap name; `None` if it is not a supported legacy
+    /// byte-encoded CMap (the caller then falls back to Identity).
+    fn from_cmap_name(name: &str) -> Option<Self> {
+        // Japanese Shift-JIS variants all carry the "RKSJ" tag
+        // (90ms / 90msp / 90pv / 83pv / Add / Ext / 78 …).
+        if name.contains("RKSJ") {
+            return Some(LegacyEncoding::ShiftJis);
+        }
+        if name.starts_with("GBK") {
+            return Some(LegacyEncoding::Gbk);
+        }
+        if name.starts_with("GBpc") || name.starts_with("GB-EUC") {
+            return Some(LegacyEncoding::EucCn);
+        }
+        // B5pc / ETen-B5 / ETenms-B5 / HKscs-B5 / …
+        if name.starts_with("B5pc") || name.contains("-B5") {
+            return Some(LegacyEncoding::Big5);
+        }
+        // KSC-EUC / KSCms-UHC / KSCms-UHC-HW / KSCpc-EUC (EUC-KR / UHC). The
+        // `KSC-Johab-H/V` CMaps use the unrelated Johab encoding, which we do
+        // not bundle a table for — exclude them so they degrade to Identity
+        // rather than decode through the wrong (cp949) table into confidently
+        // wrong Hangul.
+        if name.starts_with("KSC") && !name.contains("Johab") {
+            return Some(LegacyEncoding::EucKr);
+        }
+        if name == "EUC-H" || name == "EUC-V" {
+            return Some(LegacyEncoding::EucJp);
+        }
+        None
+    }
+
+    /// Byte-length codespace ranges `(len, lo, hi)` used to segment a show-text
+    /// byte string into codes for this encoding.
+    fn codespace(self) -> &'static [(u8, u32, u32)] {
+        match self {
+            // EUC: 1-byte ASCII + 2-byte lead/trail in 0xA1..=0xFE.
+            LegacyEncoding::EucCn => &[(1, 0x00, 0x80), (2, 0xA1A1, 0xFEFE)],
+            // EUC-JP additionally has SS2 half-width kana (0x8E 0xA1..=0xDF).
+            LegacyEncoding::EucJp => &[(1, 0x00, 0x80), (2, 0x8EA1, 0x8EDF), (2, 0xA1A1, 0xFEFE)],
+            // GBK / Big5 / UHC: 1-byte ASCII + 2-byte lead 0x81..=0xFE.
+            LegacyEncoding::Gbk | LegacyEncoding::Big5 | LegacyEncoding::EucKr => {
+                &[(1, 0x00, 0x80), (2, 0x8140, 0xFEFE)]
+            }
+            // Shift-JIS: 1-byte ASCII + 1-byte half-width kana (0xA1..=0xDF) +
+            // 2-byte lead 0x81..=0x9F and 0xE0..=0xFC.
+            LegacyEncoding::ShiftJis => &[
+                (1, 0x00, 0x80),
+                (1, 0xA1, 0xDF),
+                (2, 0x8140, 0x9FFC),
+                (2, 0xE040, 0xFCFC),
+            ],
+        }
+    }
+
+    /// Decode a single-byte code: ASCII identity for every encoding, plus the
+    /// Shift-JIS half-width katakana block (0xA1..=0xDF → U+FF61..=U+FF9F).
+    fn decode_single(self, b: u8) -> Option<u32> {
+        if self == LegacyEncoding::ShiftJis && (0xA1..=0xDF).contains(&b) {
+            return Some(0xFF61 + (b - 0xA1) as u32);
+        }
+        (b <= 0x7F).then_some(b as u32)
+    }
+
+    /// Decode a 2-byte code to a Unicode scalar via the baked table.
+    fn decode_double(self, code: u16) -> Option<char> {
+        match self {
+            LegacyEncoding::EucCn => crate::gb2312::gb2312_to_unicode(code),
+            LegacyEncoding::Gbk => crate::gbk::gbk_to_unicode(code),
+            LegacyEncoding::Big5 => crate::big5::big5_to_unicode(code),
+            LegacyEncoding::ShiftJis => crate::sjis::sjis_to_unicode(code),
+            LegacyEncoding::EucJp => crate::eucjp::eucjp_to_unicode(code),
+            LegacyEncoding::EucKr => crate::ksc::ksc_to_unicode(code),
+        }
+    }
+}
+
 /// A code → CID CMap for composite (Type0) fonts: embedded CMap streams plus
-/// the predefined Identity and Unicode (UCS-2/UTF-16) families. Legacy
-/// byte-encoded predefined CMaps (RKSJ, EUC, Big5, GBK…) are not bundled;
-/// callers fall back to Identity with a warning.
+/// the predefined Identity, Unicode (UCS-2/UTF-16), and legacy byte-encoded
+/// (GB / GBK / Big5 / Shift-JIS / EUC-JP / KSC) families.
 #[derive(Debug, Clone, Default)]
 pub struct CidCMap {
     /// Codespace ranges as (byte_len, lo, hi).
@@ -288,12 +388,13 @@ pub struct CidCMap {
     pub codes_are_unicode: bool,
     /// CID = code (the Identity family; also the lenient fallback).
     pub identity: bool,
-    /// Legacy GB2312 (EUC-CN) byte encoding (the predefined `GBpc-EUC-H/-V`
-    /// CMaps): 1-byte ASCII + 2-byte EUC-CN. For a *substituted* (non-embedded)
-    /// font the code is decoded to Unicode via [`decode_to_unicode`] and the
-    /// glyph resolves through the system face's Unicode cmap. The 1-byte ASCII →
-    /// Adobe-GB1 CID range is still installed in `cid_ranges` for widths.
-    pub gb_decode: bool,
+    /// A predefined legacy byte-encoded CMap (`GBpc-EUC`, `GBK-EUC`, `B5pc`,
+    /// `90ms-RKSJ`, `KSC-EUC`, …) and the national encoding it uses. For a
+    /// *substituted* (non-embedded) font the code is decoded to Unicode via
+    /// [`Self::decode_to_unicode`] and the glyph resolves through the system
+    /// face's Unicode cmap; the 1-byte ASCII → CID range stays installed in
+    /// `cid_ranges` for Latin advances. `None` for non-legacy CMaps.
+    pub legacy: Option<LegacyEncoding>,
 }
 
 impl CidCMap {
@@ -305,8 +406,33 @@ impl CidCMap {
         }
     }
 
-    /// Resolve a predefined CMap by name. Identity and the Unicode families
-    /// are supported; `None` means the (legacy byte-encoded) CMap is unknown.
+    /// Build a predefined legacy byte-encoded CMap for `enc`.
+    ///
+    /// The encoding's codespace segments the show-text bytes; the 1-byte ASCII →
+    /// CID range (CID = code − 0x1F, i.e. 0x20 → CID 1 … 0x7E → CID 95) gives
+    /// reasonable /W-based Latin advances — the Adobe CJK collections (GB1 /
+    /// CNS1 / Japan1 / Korea1) all place the proportional ASCII set at low CIDs
+    /// starting near 0x20. CJK codes carry no CID range, so they fall to /DW
+    /// (full width); their glyphs come from the substituted face via Unicode.
+    fn legacy(enc: LegacyEncoding, wmode: u8) -> Self {
+        Self {
+            wmode,
+            legacy: Some(enc),
+            codespace: enc.codespace().to_vec(),
+            cid_ranges: vec![(1, 0x20, 0x7E, 1)],
+            ..Default::default()
+        }
+    }
+
+    /// True for a predefined legacy byte-encoded CMap (GB / GBK / Big5 /
+    /// Shift-JIS / EUC-JP / KSC).
+    pub fn is_legacy(&self) -> bool {
+        self.legacy.is_some()
+    }
+
+    /// Resolve a predefined CMap by name. Identity, the Unicode families, and
+    /// the legacy byte-encoded CJK families are supported; `None` means the
+    /// CMap is unknown (caller falls back to Identity with a warning).
     pub fn predefined(name: &str) -> Option<Self> {
         let wmode = if name.ends_with("-V") { 1 } else { 0 };
         if name == "Identity-H" || name == "Identity-V" {
@@ -325,35 +451,22 @@ impl CidCMap {
                 ..Default::default()
             });
         }
-        // GBpc-EUC-H/-V: 1-byte ASCII + 2-byte GB2312 (EUC-CN), Adobe-GB1.
-        // The 2-byte code is decoded to Unicode at show time (substituted CJK
-        // face); the 1-byte ASCII → Adobe-GB1 CID range (CID = code − 0x1F)
-        // gives correct /W-based advances for the embedded Latin glyphs.
-        if name == "GBpc-EUC-H" || name == "GBpc-EUC-V" {
-            let mut cm = Self {
-                wmode,
-                gb_decode: true,
-                ..Default::default()
-            };
-            cm.codespace.push((1, 0x00, 0x80));
-            cm.codespace.push((2, 0xA1A1, 0xFEFE));
-            cm.cid_ranges.push((1, 0x20, 0x7E, 1)); // 0x20→CID1 … 0x7E→CID95
-            return Some(cm);
+        if let Some(enc) = LegacyEncoding::from_cmap_name(name) {
+            return Some(Self::legacy(enc, wmode));
         }
         None
     }
 
-    /// Decode a code (with its byte length) to a Unicode scalar for the legacy
-    /// GB EUC CMaps: 1-byte codes are ASCII identity, 2-byte codes go through the
-    /// GB2312 table. `None` for non-GB CMaps or undefined codes.
+    /// Decode a code (with its byte length) to a Unicode scalar for a legacy
+    /// byte-encoded CMap: 1-byte codes are ASCII (plus Shift-JIS half-width
+    /// kana), 2-byte codes go through the encoding's baked table. `None` for
+    /// non-legacy CMaps or undefined codes.
     pub fn decode_to_unicode(&self, code: u32, len: u8) -> Option<u32> {
-        if !self.gb_decode {
-            return None;
-        }
+        let enc = self.legacy?;
         if len == 1 {
-            return (code <= 0x7F).then_some(code);
+            return enc.decode_single(code as u8);
         }
-        crate::gb2312::gb2312_to_unicode(code as u16).map(|c| c as u32)
+        enc.decode_double(code as u16).map(|c| c as u32)
     }
 
     /// Parse an embedded CMap stream: codespacerange, cidrange, cidchar,
@@ -1006,15 +1119,66 @@ mod tests {
         assert!(jis_v.codes_are_unicode);
         assert_eq!(jis_v.wmode, 1);
 
-        // Legacy byte-encoded CMaps are not bundled.
-        assert!(CidCMap::predefined("90ms-RKSJ-H").is_none());
-        assert!(CidCMap::predefined("ETen-B5-H").is_none());
+        // Legacy byte-encoded CMaps now classify to their national encoding.
+        assert_eq!(
+            CidCMap::predefined("90ms-RKSJ-H").unwrap().legacy,
+            Some(LegacyEncoding::ShiftJis)
+        );
+        assert_eq!(
+            CidCMap::predefined("ETen-B5-H").unwrap().legacy,
+            Some(LegacyEncoding::Big5)
+        );
+        // An unknown CMap is still unresolved.
+        assert!(CidCMap::predefined("Bogus-CMap-H").is_none());
+    }
+
+    #[test]
+    fn legacy_cmap_name_classification() {
+        use LegacyEncoding::*;
+        let cases = [
+            ("GBpc-EUC-H", EucCn),
+            ("GB-EUC-V", EucCn),
+            ("GBK-EUC-H", Gbk),
+            ("GBKp-EUC-H", Gbk),
+            ("GBK2K-V", Gbk),
+            ("B5pc-H", Big5),
+            ("ETen-B5-V", Big5),
+            ("ETenms-B5-H", Big5),
+            ("HKscs-B5-H", Big5),
+            ("90ms-RKSJ-H", ShiftJis),
+            ("90msp-RKSJ-V", ShiftJis),
+            ("90pv-RKSJ-H", ShiftJis),
+            ("Add-RKSJ-H", ShiftJis),
+            ("Ext-RKSJ-V", ShiftJis),
+            ("EUC-H", EucJp),
+            ("EUC-V", EucJp),
+            ("KSC-EUC-H", EucKr),
+            ("KSCms-UHC-V", EucKr),
+            ("KSCms-UHC-HW-H", EucKr),
+            ("KSCpc-EUC-H", EucKr),
+        ];
+        for (name, want) in cases {
+            assert_eq!(
+                CidCMap::predefined(name).and_then(|c| c.legacy),
+                Some(want),
+                "CMap {name}"
+            );
+        }
+        // Unicode and Identity families are not legacy.
+        assert!(!CidCMap::predefined("UniGB-UCS2-H").unwrap().is_legacy());
+        assert!(!CidCMap::predefined("Identity-H").unwrap().is_legacy());
+
+        // KSC-Johab uses the unrelated Johab encoding (no table); it must not be
+        // mis-routed to the EUC-KR/cp949 table — degrade to Identity instead.
+        assert!(CidCMap::predefined("KSC-Johab-H").is_none());
+        assert!(CidCMap::predefined("KSC-Johab-V").is_none());
     }
 
     #[test]
     fn gbpc_euc_decodes_and_splits() {
         let cm = CidCMap::predefined("GBpc-EUC-H").unwrap();
-        assert!(cm.gb_decode);
+        assert!(cm.is_legacy());
+        assert_eq!(cm.legacy, Some(LegacyEncoding::EucCn));
         assert_eq!(cm.wmode, 0);
         assert_eq!(CidCMap::predefined("GBpc-EUC-V").unwrap().wmode, 1);
 
@@ -1028,6 +1192,46 @@ mod tests {
         assert_eq!(cm.decode_to_unicode(0xCFC2, 2), Some(0x4E0B)); // 下
                                                                    // 1-byte ASCII → Adobe-GB1 CID (CID = code − 0x1F): 'M' → 46.
         assert_eq!(cm.code_to_cid(0x4D, 1), 46);
+    }
+
+    #[test]
+    fn legacy_segmentation_and_decode() {
+        // Big5 (B5pc): 一 = 0xA440; ASCII stays single-byte.
+        let b5 = CidCMap::predefined("B5pc-H").unwrap();
+        assert_eq!(b5.next_code(b"\xA4\x40A"), (0xA440, 2));
+        assert_eq!(b5.next_code(b"A\xA4\x40"), (b'A' as u32, 1));
+        assert_eq!(b5.decode_to_unicode(0xA440, 2), Some(0x4E00));
+
+        // GBK: 一 = 0xD2BB.
+        let gbk = CidCMap::predefined("GBK-EUC-H").unwrap();
+        assert_eq!(gbk.next_code(b"\xD2\xBB"), (0xD2BB, 2));
+        assert_eq!(gbk.decode_to_unicode(0xD2BB, 2), Some(0x4E00));
+
+        // Shift-JIS: 2-byte 亜 = 0x889F; 1-byte half-width katakana ｱ = 0xB1.
+        let sj = CidCMap::predefined("90ms-RKSJ-H").unwrap();
+        assert_eq!(sj.next_code(b"\x88\x9F"), (0x889F, 2));
+        assert_eq!(sj.decode_to_unicode(0x889F, 2), Some(0x4E9C));
+        assert_eq!(sj.next_code(b"\xB1"), (0xB1, 1));
+        assert_eq!(sj.decode_to_unicode(0xB1, 1), Some(0xFF71));
+        assert_eq!(sj.next_code(b"A\x88\x9F"), (b'A' as u32, 1));
+
+        // EUC-KR / UHC: 가 = 0xB0A1.
+        let ksc = CidCMap::predefined("KSC-EUC-H").unwrap();
+        assert_eq!(ksc.next_code(b"\xB0\xA1"), (0xB0A1, 2));
+        assert_eq!(ksc.decode_to_unicode(0xB0A1, 2), Some(0xAC00));
+
+        // EUC-JP: 亜 = 0xB0A1; SS2 half-width kana 0x8EA1 → U+FF61.
+        let euc = CidCMap::predefined("EUC-H").unwrap();
+        assert_eq!(euc.next_code(b"\xB0\xA1"), (0xB0A1, 2));
+        assert_eq!(euc.decode_to_unicode(0xB0A1, 2), Some(0x4E9C));
+        assert_eq!(euc.next_code(b"\x8E\xA1"), (0x8EA1, 2));
+        assert_eq!(euc.decode_to_unicode(0x8EA1, 2), Some(0xFF61));
+
+        // The ASCII → CID range gives Latin advances for every legacy CMap.
+        assert_eq!(b5.code_to_cid(b'M' as u32, 1), 46); // 0x4D − 0x1F
+                                                        // Undefined / unmapped codes never panic.
+        assert_eq!(b5.decode_to_unicode(0x8181, 2), None);
+        assert_eq!(sj.decode_to_unicode(0xFF, 1), None);
     }
 
     #[test]

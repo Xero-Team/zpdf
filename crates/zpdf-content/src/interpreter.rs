@@ -3292,10 +3292,11 @@ impl<'a> ContentInterpreter<'a> {
             let cmap = font_and_id.and_then(|(_, f)| f.cid_cmap.as_ref());
             vertical = cmap.map(|c| c.wmode == 1).unwrap_or(false);
             let codes_are_unicode = cmap.map(|c| c.codes_are_unicode).unwrap_or(false);
-            // Legacy GB EUC CMap on a *substituted* (non-embedded) font: decode
-            // code → Unicode and resolve through the system face. Embedded GBpc
-            // fonts keep the normal code → CID → GID path.
-            let gb_decode = cmap.map(|c| c.gb_decode).unwrap_or(false)
+            // Legacy byte-encoded CMap (GB / GBK / Big5 / Shift-JIS / EUC-JP /
+            // KSC) on a *substituted* (non-embedded) font: decode code → Unicode
+            // and resolve through the system face. Embedded legacy-CMap fonts
+            // keep the normal code → CID → GID path.
+            let legacy = cmap.map(|c| c.is_legacy()).unwrap_or(false)
                 && font_and_id.map(|(_, f)| f.is_substitute).unwrap_or(false);
             let dw2 = font_and_id.map(|(_, f)| f.dw2).unwrap_or((880.0, -1000.0));
 
@@ -3322,10 +3323,10 @@ impl<'a> ContentInterpreter<'a> {
                             Some((gid, adv)) => (gid, adv, None),
                             None => (0, 500.0, None),
                         }
-                    } else if gb_decode {
+                    } else if legacy {
                         // GID from the system face via code → Unicode; advance
-                        // from the PDF /W keyed by the Adobe-GB1 CID (1-byte
-                        // ASCII → CID 1-95; 2-byte CJK → CID 0 → DW, ~1000).
+                        // from the PDF /W keyed by the Adobe CID (1-byte ASCII →
+                        // CID 1-95; 2-byte CJK → CID 0 → DW, ~1000).
                         let cid = cmap
                             .map(|c| c.code_to_cid(code, len as u8))
                             .unwrap_or(0)
