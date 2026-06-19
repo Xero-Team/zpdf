@@ -73,15 +73,20 @@ renderer. Pure cyan goes from `(0, 255, 255)` to `(0, 185, 242)`; pure yellow
 to `(255, 235, 61)`. Most visibly, **100 % K renders as a dark near-black
 `(44, 46, 53)`, not pure black** — ink impurity, matching Acrobat.
 
-- Single source of truth in `zpdf_color::cmyk_to_rgb` (inputs clamped to 0..1);
-  `zpdf-image` delegates to it. Applies to DeviceCMYK fills/strokes, CMYK images
-  (incl. CMYK JPEG and Indexed-over-CMYK), and Separation/DeviceN tint
-  transforms whose alternate space is DeviceCMYK. No new dependency.
-- Unchanged: DeviceCMYK *with* an ICC/Default profile still converts through the
-  moxcms transform (already accurate); and the Adobe-YCCK JPEG path keeps its
-  own YCCK-specific decode (`zpdf-parser`).
-- Verified against the pdf.js coefficients, cross-checked numerically, and with
-  an end-to-end CMYK render whose pixels match the polynomial.
+- Single source of truth in `zpdf_color::cmyk_to_rgb` (inputs clamped to 0..1).
+  Applies to DeviceCMYK fills/strokes, raw CMYK images (Flate/LZW, via
+  `zpdf-image`, which delegates), Indexed-over-CMYK palettes, Separation/DeviceN
+  tint transforms whose alternate space is DeviceCMYK, and — so the filter
+  pipeline stays consistent — the Adobe-**YCCK** JPEG decode arm in `zpdf-parser`
+  (`ycck_to_rgb` now recovers the true CMYK and runs the polynomial instead of
+  the old `(1−c)(1−k)` ink weighting). No new third-party dependency.
+- Unchanged: DeviceCMYK *with* an ICC/Default profile converts through the
+  moxcms transform (already accurate). Plain Adobe-CMYK JPEGs (APP14 transform
+  0/1) are still colour-converted internally by `zune-jpeg`, which has no raw-CMYK
+  output arm we can intercept — a minor residual non-fidelity for that one path.
+- Verified against the pdf.js coefficients, cross-checked numerically, with an
+  end-to-end CMYK render whose pixels match the polynomial, and per-encoding
+  YCCK unit vectors (white/black/gray/colour) against hand-computed references.
 
 ## 0.5.0 — robustness & closing the 0.4.0 limitations
 

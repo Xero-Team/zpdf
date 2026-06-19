@@ -13,6 +13,10 @@ categories.workspace = true
 
 [dependencies]
 zpdf-core.workspace = true
+# DeviceCMYK->sRGB conversion for the Adobe-YCCK JPEG decode arm (the one place
+# the filter pipeline must do colour conversion, since zune-jpeg has no working
+# YCCK arm). zpdf-color depends only on zpdf-core, so this adds no cycle.
+zpdf-color.workspace = true
 winnow.workspace = true
 flate2.workspace = true
 zune-jpeg.workspace = true

@@ -578,22 +578,31 @@ fn decode_dct(data: &[u8]) -> Result<Vec<u8>> {
 
 /// Convert raw upsampled Adobe YCCK samples (`Y, Cb, Cr, K` per pixel) to RGB.
 ///
-/// In Adobe YCCK the chroma channels encode the *complement* of C/M/Y (so the
-/// JFIF YCbCr->RGB output is already the Adobe-inverted C/M/Y), and the K channel
-/// is likewise inverted (`K_raw == 0` ⇒ no black ink). The ink-weighted result is
-/// `channel * (255 - K_raw) / 255`, matching libjpeg's YCCK decode followed by a
-/// naive CMYK->RGB.
+/// In Adobe YCCK the chroma channels encode the *complement* of C/M/Y, so the
+/// JFIF YCbCr->RGB output is the transmitted (inverted) ink: `C = 1 − R'`,
+/// `M = 1 − G'`, `Y = 1 − B'`. The 4th channel is the black-ink amount
+/// (`K_raw = 255` ⇒ full black). The recovered DeviceCMYK is converted through
+/// the shared Adobe polynomial ([`zpdf_color::cmyk_to_rgb`]) so YCCK JPEGs match
+/// every other DeviceCMYK path — e.g. 100 % K is a dark near-black, not pure
+/// black. (The previous `channel * (255 − K_raw)` shortcut was the naïve
+/// `(1−c)(1−k)`, which over-saturated like a non-fidelity viewer.)
 fn ycck_to_rgb(ycck: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(ycck.len() / 4 * 3);
     for px in ycck.chunks_exact(4) {
-        let (y, cb, cr) = (px[0] as f32, px[1] as f32, px[2] as f32);
-        let kk = (255 - px[3]) as f32 / 255.0;
-        let r = (y + 1.402 * (cr - 128.0)).clamp(0.0, 255.0);
-        let g = (y - 0.344_136 * (cb - 128.0) - 0.714_136 * (cr - 128.0)).clamp(0.0, 255.0);
-        let b = (y + 1.772 * (cb - 128.0)).clamp(0.0, 255.0);
-        out.push((r * kk) as u8);
-        out.push((g * kk) as u8);
-        out.push((b * kk) as u8);
+        let (y, cb, cr) = (px[0] as f64, px[1] as f64, px[2] as f64);
+        // JFIF YCbCr -> R'G'B' (transmitted light = complement of C/M/Y ink).
+        let rp = (y + 1.402 * (cr - 128.0)).clamp(0.0, 255.0);
+        let gp = (y - 0.344_136 * (cb - 128.0) - 0.714_136 * (cr - 128.0)).clamp(0.0, 255.0);
+        let bp = (y + 1.772 * (cb - 128.0)).clamp(0.0, 255.0);
+        let (r, g, b) = zpdf_color::cmyk_to_rgb(
+            1.0 - rp / 255.0,
+            1.0 - gp / 255.0,
+            1.0 - bp / 255.0,
+            px[3] as f64 / 255.0,
+        );
+        out.push((r * 255.0).round() as u8);
+        out.push((g * 255.0).round() as u8);
+        out.push((b * 255.0).round() as u8);
     }
     out
 }
@@ -697,23 +706,32 @@ mod tests {
 
     #[test]
     fn ycck_white_decodes_white_not_black() {
-        // Adobe white (no ink): Y=255, Cb=Cr=128 (neutral), K_raw=0.
+        // Adobe white (no ink): Y=255, Cb=Cr=128 (neutral), K_raw=0 → CMYK all 0.
         let rgb = ycck_to_rgb(&[255, 128, 128, 0]);
         assert_eq!(rgb, vec![255, 255, 255], "Adobe YCCK white must stay white");
     }
 
     #[test]
-    fn ycck_full_black_ink_decodes_black() {
-        // K_raw=255 means full black ink regardless of chroma.
+    fn ycck_full_black_ink_decodes_near_black() {
+        // K_raw=255 ⇒ CMYK (0,0,0,1). The Adobe DeviceCMYK polynomial renders
+        // 100% K as a dark near-black, not pure black (matches every other path).
         let rgb = ycck_to_rgb(&[255, 128, 128, 255]);
-        assert_eq!(rgb, vec![0, 0, 0]);
+        assert_eq!(rgb, vec![44, 46, 53]);
     }
 
     #[test]
-    fn ycck_neutral_gray_matches_k_weight() {
-        // No CMY (chroma neutral, luma full) with half black ink ⇒ ~mid gray.
+    fn ycck_neutral_gray_via_polynomial() {
+        // No CMY (chroma neutral, luma full) with half black ink ⇒ CMYK
+        // (0,0,0,0.5); the polynomial maps it lighter than the naïve 127.
         let rgb = ycck_to_rgb(&[255, 128, 128, 128]);
-        assert_eq!(rgb, vec![127, 127, 127]);
+        assert_eq!(rgb, vec![154, 156, 159]);
+    }
+
+    #[test]
+    fn ycck_colored_pixel_via_polynomial() {
+        // Non-neutral chroma exercises the C/M/Y recovery + the full polynomial.
+        let rgb = ycck_to_rgb(&[200, 100, 150, 50]);
+        assert_eq!(rgb, vec![198, 165, 131]);
     }
 
     #[test]
