@@ -1,3 +1,4 @@
+pub mod annot_appearance;
 pub mod annotation;
 mod catalog;
 pub mod font_loader;

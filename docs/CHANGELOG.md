@@ -1,5 +1,49 @@
 # Changelog
 
+## Unreleased
+
+### Markup & geometric annotation appearances (Highlight / Underline / lines / shapes)
+
+Annotations that ship **no `/AP` stream** are now drawn by synthesizing an
+appearance from their geometry, the same way interactive form fields are. A
+producer that left a markup or geometric annotation's appearance implicit (as
+many non-Acrobat tools do) previously rendered nothing; these now paint. Still
+zero C/C++ dependencies, and — because the synthesized appearance is a form
+XObject replayed through the existing `/AP` path — **both the CPU and wgpu
+backends render them with no backend changes** (GPU↔CPU agreement 0.198% on the
+mixed-markup acceptance page).
+
+- **Text markup** (`zpdf-document/src/annot_appearance.rs`, new): `Highlight`,
+  `Underline`, `StrikeOut`, and `Squiggly` are drawn from `/QuadPoints`.
+  Highlights composite with the **Multiply** blend mode (via a generated
+  `/ExtGState`), so the marked text shows through — yellow over white, dark over
+  black — matching Acrobat's generated appearance. Underline/strikeout/squiggly
+  stroke along each quad (default black when `/C` is absent).
+- **Geometric markup**: `Square` and `Circle` (interior `/IC` fill + `/C`
+  border, inset by `/RD` and half the `/BS`/`/Border` width; the circle is four
+  Bézier arcs), `Line` (`/L`), `Polygon`/`PolyLine` (`/Vertices`; polygons fill
+  `/IC`), and `Ink` (`/InkList`, round caps/joins).
+- **Conservative `Link` border**: drawn only when the file gives **both** an
+  explicit `/C` colour **and** an explicit non-zero border width — no width-1
+  default, so ordinary hyperlinks are not boxed (matching mainstream viewers).
+- **Colour & opacity**: `/C` and `/IC` arrays of 1/3/4 components map to device
+  gray / RGB / CMYK. A present-but-empty `/C []` is treated as spec-transparent
+  (nothing drawn) rather than defaulted. The annotation `/CA` becomes an
+  ExtGState constant alpha.
+- **Non-regressing by construction**: generation fires only for these subtypes
+  when the annotation has **no** usable `/AP` (a producer appearance is always
+  kept); `Widget`/`Popup`/`Text`/`FreeText`/`Stamp` and hidden/no-view
+  annotations are untouched. Bounded against adversarial geometry — a 1 MiB
+  per-appearance byte ceiling, a shared Squiggly segment budget (so quad-count ×
+  segment-count cannot blow up), point/quad/ink caps, a ±1e7 coordinate clamp,
+  and an inverted-inset guard. The 618-PDF malformed corpus still renders with
+  **0 panics and 0 timeouts** (426 OK, unchanged).
+- Verified by 15 unit tests (field parsing, colour arities, the Multiply
+  appearance, transparent `/C []`, inverted-inset rejection, link border
+  policy, bounded Squiggly) plus 6 CPU end-to-end render tests (Multiply
+  highlight pixels, underline/square/line/polygon, hidden-annotation
+  suppression) and a GPU↔CPU acceptance comparison.
+
 ## 0.6.0 — interactive forms, passwords, mesh shadings & CJK/CMYK fidelity
 
 A feature release, all with zero C/C++ dependencies: interactive AcroForm

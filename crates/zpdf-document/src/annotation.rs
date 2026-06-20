@@ -84,9 +84,10 @@ fn parse_annotation(
     let appearance = select_appearance(file, dict);
     let oc = dict.get("OC").cloned();
 
-    // Generate an appearance for a form widget whose producer left none (or
-    // when /NeedAppearances asks the viewer to regenerate). Buttons keep their
-    // supplied /AP states; the generator returns None for them.
+    // Generate an appearance when the producer left none. Form widgets defer to
+    // the AcroForm generator (which also honours /NeedAppearances and keeps
+    // button /AP states); markup & geometric annotations synthesize their
+    // appearance from geometry properties (/QuadPoints, /Vertices, /L, …).
     let generated = if subtype == "Widget" {
         acro_form
             .and_then(|af| af.field_for_widget(id).map(|field| (af, field)))
@@ -94,6 +95,8 @@ fn parse_annotation(
             .and_then(|(af, field)| {
                 crate::forms::generate_widget_appearance(field, rect, af.dr_fonts.as_ref())
             })
+    } else if appearance.is_none() {
+        crate::annot_appearance::generate_annotation_appearance(file, dict, &subtype, rect)
     } else {
         None
     };

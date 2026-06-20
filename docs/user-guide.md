@@ -183,15 +183,21 @@ color-key masks, Indexed palettes), **Form XObjects**, **axial/radial gradients*
 (`sh` and shading patterns), all 16 **blend modes**, and
 DeviceGray/RGB/CMYK/ICCBased/Indexed/Lab/Separation/DeviceN color. **Encrypted**
 documents (RC4, AES-128, AES-256; empty user password) decrypt transparently.
-Pages honor CropBox and `/Rotate`. Invisible OCR text layers (text render
-mode 3) are correctly not painted over scanned images.
+**Annotations** render from their appearance streams; markup and geometric
+annotations (highlights, underlines, strike-outs, squiggles, squares, circles,
+lines, polygons, ink) and interactive **form fields** get a synthesized
+appearance when the producer left none. Pages honor CropBox and `/Rotate`.
+Invisible OCR text layers (text render mode 3) are correctly not painted over
+scanned images.
 
 ## Known limitations
 
 - **Tiling patterns** (hatches/textures) paint a neutral gray placeholder.
 - **ExtGState soft masks** (vignettes, gradient-faded groups) are ignored.
 - **Non-embedded CJK fonts** render no glyphs yet (embedded fonts are fine).
-- **Annotations** (form fields, stamps, highlights) are not yet drawn.
+- **Annotation icons** — sticky-note `Text`, `FreeText`, and `Stamp` types — are
+  not synthesized (their appearance streams render if present, but no icon is
+  drawn when absent). Rotated/skewed text-markup uses an axis-aligned approximation.
 - **JBIG2 / JPEG-2000** compressed images are skipped.
 - **Password-protected PDFs** (non-empty user password) won't decrypt — there
   is no password prompt/API yet.

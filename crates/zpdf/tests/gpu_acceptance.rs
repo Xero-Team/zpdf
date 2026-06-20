@@ -227,6 +227,103 @@ fn compare_backends(pdf: Vec<u8>) -> Option<BackendDiff> {
     ))
 }
 
+/// A page exercising generated markup/geometric annotation appearances (no
+/// `/AP`): a Multiply highlight over a black/white split, a filled+stroked
+/// Square, a Line, and a filled Polygon. Drives the synthetic-form-stream
+/// annotation path through both backends.
+fn markup_annots_pdf() -> Vec<u8> {
+    let content: &[u8] = b"1 1 1 rg 0 0 200 200 re f\n0 0 0 rg 0 0 100 200 re f";
+    assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R \
+          /Resources << >> /Annots [5 0 R 6 0 R 7 0 R 8 0 R] >>"
+            .to_vec(),
+        stream_obj("", content),
+        b"<< /Type /Annot /Subtype /Highlight /Rect [20 150 180 175] /F 4 \
+          /QuadPoints [20 175 180 175 20 150 180 150] /C [1 1 0] >>"
+            .to_vec(),
+        b"<< /Type /Annot /Subtype /Square /Rect [30 30 90 90] /F 4 \
+          /IC [0 1 0] /C [1 0 0] /BS << /W 4 >> >>"
+            .to_vec(),
+        b"<< /Type /Annot /Subtype /Line /Rect [110 25 190 95] /F 4 \
+          /L [110 30 190 90] /C [0 0 1] /BS << /W 3 >> >>"
+            .to_vec(),
+        b"<< /Type /Annot /Subtype /Polygon /Rect [110 105 190 145] /F 4 \
+          /Vertices [120 110 180 110 150 140] /IC [1 0 1] >>"
+            .to_vec(),
+    ])
+}
+
+/// Like `compare_backends`, but wires the page's annotations (so generated
+/// markup appearances are painted by both backends).
+fn compare_backends_with_annots(pdf: Vec<u8>) -> Option<BackendDiff> {
+    let doc = PdfDocument::open(pdf).expect("open pdf");
+    let page = doc.page(0).expect("page 0");
+    let mut fonts = doc.load_page_fonts(&page);
+    let content = doc.page_content_bytes(&page).expect("content bytes");
+    let mut images = ImageCache::new();
+    let annots = doc.page_annotations(&page);
+    let dl = ContentInterpreter::new(page.media_box)
+        .with_fonts(&mut fonts)
+        .with_document(doc.file(), &page.resources)
+        .with_images(&mut images)
+        .with_annotations(&annots)
+        .interpret(&content);
+
+    let gpu = match zpdf::gpu::WgpuRenderer::new()
+        .with_fonts(&fonts)
+        .with_images(&images)
+        .render_display_list(&dl, SCALE)
+    {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("skipping GPU markup acceptance (no adapter?): {e}");
+            return None;
+        }
+    };
+    let cpu = zpdf::cpu::CpuRenderer::new()
+        .with_fonts(&fonts)
+        .with_images(&images)
+        .render_display_list(&dl, SCALE)
+        .expect("cpu render");
+
+    if (cpu.width, cpu.height) != (gpu.width, gpu.height) {
+        return Some((100.0, (cpu.width, cpu.height), (gpu.width, gpu.height)));
+    }
+    let total = (cpu.width * cpu.height) as u64;
+    let mut diff = 0u64;
+    for i in 0..total as usize {
+        let b = i * 4;
+        let dr = (gpu.data[b] as i32 - cpu.data[b] as i32).unsigned_abs();
+        let dg = (gpu.data[b + 1] as i32 - cpu.data[b + 1] as i32).unsigned_abs();
+        let db = (gpu.data[b + 2] as i32 - cpu.data[b + 2] as i32).unsigned_abs();
+        if dr.max(dg).max(db) > THRESHOLD as u32 {
+            diff += 1;
+        }
+    }
+    Some((
+        diff as f64 / total as f64 * 100.0,
+        (cpu.width, cpu.height),
+        (gpu.width, gpu.height),
+    ))
+}
+
+#[test]
+fn gpu_matches_cpu_on_markup_annotations() {
+    match compare_backends_with_annots(markup_annots_pdf()) {
+        None => eprintln!("GPU markup acceptance skipped (no adapter)."),
+        Some((pct, cdim, gdim)) => {
+            assert_eq!(cdim, gdim, "dimension mismatch {cdim:?} vs {gdim:?}");
+            println!("  markup_annotations: {pct:.3}% differing");
+            assert!(
+                pct < MAX_DIFF_PCT,
+                "markup GPU vs CPU {pct:.3}% exceeds {MAX_DIFF_PCT}%"
+            );
+        }
+    }
+}
+
 #[test]
 fn gpu_matches_cpu_on_corpus() {
     let mut skipped = false;
