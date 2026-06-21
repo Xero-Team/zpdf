@@ -2,6 +2,43 @@
 
 ## Unreleased
 
+### Text-note icons & Stamp badges
+
+`Text` (sticky-note) and `Stamp` (rubber-stamp) annotations that ship **no `/AP`
+stream** now synthesize an appearance from their `/Name`, the same way markup,
+geometric and form annotations already did. A producer that left a note or stamp
+implicit previously rendered nothing; these now paint. As with the other
+generators the synthesized appearance is a form XObject replayed through the
+existing `/AP` path, so **both the CPU and wgpu backends draw them with no
+backend change**, and it remains zero C/C++ dependencies.
+
+- **`Text` note icons** (`zpdf-document/src/annot_appearance.rs`): `/Name`
+  selects a small vector glyph drawn into a centred square within `/Rect` —
+  `Note` (the spec default — a dog-eared page with text lines), `Comment`,
+  `Help` (a question mark in a circle), `Insert` (an upward caret), `Key`,
+  `Check`/`Checkmark`, and `Cross`; any unknown name falls back to the note. The
+  glyph is tinted by `/C` (default note yellow), with `/CA` constant opacity via
+  a generated `/ExtGState`.
+- **`Stamp` badges** (§12.5.6.12): `/Name` is decoded into a spaced, uppercase
+  label (`NotApproved` → "NOT APPROVED"; the spec default is `Draft`) drawn in
+  centred Helvetica-Bold, sized to fill a rounded-rectangle border. The colour
+  follows a per-name convention — green for affirmative (`Approved`, `Final`, …),
+  blue for neutral (`Experimental`, `ForPublicRelease`, `SignHere`, …), red for
+  cautionary (`NotApproved`, `Confidential`, `TopSecret`, `Draft`, and any
+  unknown name) — overridable by `/C`, with `/CA` opacity. The interior
+  is left unfilled so the page shows through, like a real stamp.
+- **Bounded by construction**: generation fires only for `Text`/`Stamp` with no
+  usable `/AP`; tiny rects are rejected; the decoded label keeps only
+  `[A-Z0-9 ]` (so it is always a safe PDF literal needing no escaping and a name
+  that strips to empty draws nothing); the rounded-rect corner radius is clamped
+  to the badge; and the shared 1 MiB per-appearance content ceiling applies. The
+  618-PDF malformed corpus still renders with **0 panics and 0 timeouts**.
+- Verified by unit tests (icon routing for each `/Name`, the camelCase label
+  decoder, per-name colour, `/C` override, `/CA` on both the shared-wrapper and
+  stamp paths, the empty-`/C`-still-draws-note divergence from markup, tiny-rect
+  and non-decodable-name rejection, and the radius clamp) plus an end-to-end
+  render of a synthetic note/stamp page.
+
 ### Markup, geometric & FreeText annotation appearances
 
 Annotations that ship **no `/AP` stream** are now drawn by synthesizing an

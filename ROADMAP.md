@@ -293,7 +293,12 @@ cargo run -p zpdf-render-wgpu --example viewer -- <file.pdf>   # 交互浏览器
       对齐换行（复用 `forms` 文本排版引擎），可选 /C 背景、可选边框、可选 /CL 标注线
       （带 /LE 箭头）；正文经 `q … cm … BT … ET Q` 平移进框内局部坐标并裁剪；/Contents
       限长 50k 字符防对抗
-- [ ] Text/Stamp 标准图标外观（注记/印章图标矢量；旋转/倾斜文本标记四边形已支持）
+- [x] Text/Stamp 标准图标外观（无 /AP 时合成，`annot_appearance.rs`）：Text 注记按
+      /Name 画矢量图标（Note 折角便签 / Comment / Help 问号圈 / Insert 插入符 / Key 钥匙 /
+      Check 对勾 / Cross 叉，未知名回退便签），/C 着色、居中正方图标框；Stamp 印章按
+      /Name 解码标签（NotApproved→"NOT APPROVED"，默认 Draft）画圆角边框 + Helvetica-Bold
+      居中标签，颜色按名约定（肯定绿/中性蓝/警示红，/C 可覆盖），/CA 透明度。经既有
+      /AP 合成路径双后端渲染，纯 Rust 零新依赖；标签仅 [A-Z0-9 ]（无需转义）+ 1 MiB 上限
 - [x] Widget annotation (form fields)：Widget 经字段模型映射回所属字段；checkbox/radio
       保留 /AP 状态（/AS 缺失时回退 /V）
 - [x] AcroForm 字段解析（`zpdf-document/src/forms.rs`）：递归 /Fields + /Kids，完整

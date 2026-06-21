@@ -866,7 +866,7 @@ fn strip_subset_prefix(name: &str) -> &str {
 pub(crate) fn build_resources(dr_fonts: Option<&PdfDict>, font_res_name: &str) -> PdfDict {
     let font_entry = dr_fonts
         .and_then(|dr| dr.get(font_res_name).cloned())
-        .unwrap_or_else(|| PdfObject::Dict(helvetica_font_dict()));
+        .unwrap_or_else(|| PdfObject::Dict(standard_font_dict("Helvetica")));
 
     let mut fonts = PdfDict::new();
     fonts.insert(PdfName::new(font_res_name), font_entry);
@@ -875,7 +875,10 @@ pub(crate) fn build_resources(dr_fonts: Option<&PdfDict>, font_res_name: &str) -
     res
 }
 
-fn helvetica_font_dict() -> PdfDict {
+/// A synthesized standard-14 Type1 font dict (`/BaseFont base`, WinAnsi). Shared
+/// by the widget generator and the markup/annotation appearance generator so the
+/// font-dict shape lives in one place.
+pub(crate) fn standard_font_dict(base: &str) -> PdfDict {
     let mut d = PdfDict::new();
     d.insert(PdfName::new("Type"), PdfObject::Name(PdfName::new("Font")));
     d.insert(
@@ -884,7 +887,7 @@ fn helvetica_font_dict() -> PdfDict {
     );
     d.insert(
         PdfName::new("BaseFont"),
-        PdfObject::Name(PdfName::new("Helvetica")),
+        PdfObject::Name(PdfName::new(base)),
     );
     d.insert(
         PdfName::new("Encoding"),

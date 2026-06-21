@@ -19,9 +19,11 @@
 //!
 //! Supported subtypes: text markup (`Highlight` / `Underline` / `StrikeOut` /
 //! `Squiggly`, from `/QuadPoints`), geometric markup (`Square` / `Circle` /
-//! `Line` / `Polygon` / `PolyLine` / `Ink`), and a conservative `Link` border.
-//! Everything else (an existing `/AP`, `Widget`, `Popup`, `Text`/`FreeText`/
-//! `Stamp` icons, …) is left to its own appearance or to the widget generator.
+//! `Line` / `Polygon` / `PolyLine` / `Ink`), `FreeText`, a conservative `Link`
+//! border, `Text` note icons (a small vector glyph chosen by `/Name`), and
+//! `Stamp` rubber-stamp badges (a bordered label decoded from `/Name`).
+//! Everything else (an existing `/AP`, `Widget`, `Popup`, …) is left to its own
+//! appearance or to the widget generator.
 
 use zpdf_core::{Matrix, PdfDict, PdfName, PdfObject, Rect};
 use zpdf_parser::PdfFile;
@@ -64,6 +66,13 @@ pub fn generate_annotation_appearance(
         return free_text(file, dict, rect);
     }
 
+    // A Stamp draws a labeled badge and needs a font resource, so (like
+    // FreeText) it builds its own appearance rather than going through the
+    // shared markup/geometry wrapper below.
+    if subtype == "Stamp" {
+        return stamp(file, dict, rect);
+    }
+
     // The whole-annotation constant opacity (/CA) becomes an ExtGState alpha.
     let ca = read_num(file, dict, "CA").map(|v| v.clamp(0.0, 1.0));
 
@@ -87,6 +96,7 @@ pub fn generate_annotation_appearance(
         "PolyLine" => polyline(file, dict, &mut body, false),
         "Ink" => ink(file, dict, &mut body),
         "Link" => link(file, dict, rect, &mut body),
+        "Text" => text_icon(file, dict, rect, &mut body),
         _ => false,
     };
     if !drew || body.is_empty() || body.len() > MAX_APPEARANCE_BYTES {
@@ -612,6 +622,479 @@ fn read_dr_fonts(file: &PdfFile, dict: &PdfDict) -> Option<PdfDict> {
         PdfObject::Ref(r) => file.resolve(*r).ok()?.as_dict().ok().cloned(),
         _ => None,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Text annotation icons (§12.5.6.4) — a small vector glyph chosen by /Name
+// ---------------------------------------------------------------------------
+
+/// Draw a `Text` (note) annotation's icon. The producer's `/Name` selects the
+/// glyph (defaulting to the dog-eared note); `/C` tints it. The icon is a
+/// centred square within `/Rect`, so it stays recognizable for whatever rect
+/// the file gave — a conforming Text annotation's rect is already a small,
+/// roughly square anchor for a fixed-size icon.
+fn text_icon(file: &PdfFile, dict: &PdfDict, rect: Rect, out: &mut Vec<u8>) -> bool {
+    let Some(b) = icon_box(rect) else {
+        return false;
+    };
+    let c = read_color(file, dict, "C");
+    let name = read_name(file, dict, "Name").unwrap_or_else(|| "Note".to_string());
+    match name.as_str() {
+        "Help" => help_icon(out, b, &c),
+        "Insert" => insert_icon(out, b, &c),
+        "Key" => key_icon(out, b, &c),
+        "Check" | "Checkmark" => check_icon(out, b, &c),
+        "Cross" => cross_icon(out, b, &c),
+        // Note (the spec default), Comment, Paragraph, NewParagraph and any
+        // unknown name fall back to the dog-eared note — a universally legible
+        // "there is a comment here" marker.
+        _ => note_icon(out, b, &c),
+    }
+    true
+}
+
+/// The centred square drawing area for a text icon: side = `min(width, height)`
+/// of `/Rect`, inset by a 10% margin. `None` when the rect is too small to
+/// carry a recognizable glyph.
+fn icon_box(rect: Rect) -> Option<Rect> {
+    let side = rect.width().min(rect.height());
+    if side <= 3.0 {
+        return None;
+    }
+    let (cx, cy) = ((rect.x0 + rect.x1) / 2.0, (rect.y0 + rect.y1) / 2.0);
+    let r = side / 2.0 * 0.90;
+    Some(Rect::new(cx - r, cy - r, cx + r, cy + r))
+}
+
+/// A stroke width for an icon of side `s` at fraction `frac`, kept visible but
+/// proportionate.
+fn icon_lw(s: f64, frac: f64) -> f64 {
+    (s * frac).clamp(0.3, 6.0)
+}
+
+/// Map a unit-square coordinate (`u` rightward, `v` upward, both in `[0,1]`)
+/// into the icon's square box.
+fn at(b: Rect, u: f64, v: f64) -> (f64, f64) {
+    (b.x0 + u * b.width(), b.y0 + v * b.height())
+}
+
+/// Emit a polyline through unit-square points (`m` then `l`s, optionally `h`).
+fn poly(out: &mut Vec<u8>, b: Rect, pts: &[(f64, f64)], close: bool) {
+    let Some((&first, rest)) = pts.split_first() else {
+        return;
+    };
+    let (x, y) = at(b, first.0, first.1);
+    push(out, &format!("{} {} m\n", fmt(x), fmt(y)));
+    for &(u, v) in rest {
+        let (x, y) = at(b, u, v);
+        push(out, &format!("{} {} l\n", fmt(x), fmt(y)));
+    }
+    if close {
+        push(out, "h\n");
+    }
+}
+
+/// The dog-eared note: filled paper (`/C`, default note yellow) with a dark
+/// outline, a folded corner, and three lines of "text".
+fn note_icon(out: &mut Vec<u8>, b: Rect, c: &Option<Vec<f64>>) {
+    let s = b.width();
+    let lw = icon_lw(s, 0.035);
+    let paper = c.clone().unwrap_or_else(|| vec![1.0, 0.93, 0.40]);
+    let ink = vec![0.25];
+    // Page body, the top-right corner cut away for the fold.
+    emit_shape_setup(out, &Some(paper), &Some(ink.clone()), lw);
+    poly(
+        out,
+        b,
+        &[
+            (0.15, 0.12),
+            (0.85, 0.12),
+            (0.85, 0.64),
+            (0.64, 0.85),
+            (0.15, 0.85),
+        ],
+        true,
+    );
+    push(out, "B\n");
+    // The folded-over corner, a lighter triangle.
+    emit_shape_setup(out, &Some(vec![0.80]), &Some(ink.clone()), lw);
+    poly(out, b, &[(0.64, 0.85), (0.64, 0.64), (0.85, 0.64)], true);
+    push(out, "B\n");
+    // Three lines of "text" (the last one short).
+    if let Some(op) = color_op(&ink, true) {
+        push(out, &op);
+        push(out, "\n");
+    }
+    push(out, &format!("{} w 1 J\n", fmt(lw)));
+    for (y, x1) in [(0.62, 0.73), (0.50, 0.73), (0.38, 0.55)] {
+        emit_seg(out, at(b, 0.27, y), at(b, x1, y));
+    }
+}
+
+/// A circle enclosing a question mark.
+fn help_icon(out: &mut Vec<u8>, b: Rect, c: &Option<Vec<f64>>) {
+    let s = b.width();
+    let ink = c.clone().unwrap_or_else(|| vec![0.0]);
+    let p = |u: f64, v: f64| {
+        let (x, y) = at(b, u, v);
+        format!("{} {}", fmt(x), fmt(y))
+    };
+    if let Some(op) = color_op(&ink, true) {
+        push(out, &op);
+        push(out, "\n");
+    }
+    push(out, &format!("{} w 1 J 1 j\n", fmt(icon_lw(s, 0.06))));
+    let (c0, c1) = (at(b, 0.10, 0.10), at(b, 0.90, 0.90));
+    push_ellipse(out, Rect::new(c0.0, c0.1, c1.0, c1.1));
+    push(out, "S\n");
+    // The hook + stem of the "?", stroked.
+    push(out, &format!("{} w\n", fmt(icon_lw(s, 0.075))));
+    push(out, &format!("{} m\n", p(0.35, 0.58)));
+    push(
+        out,
+        &format!("{} {} {} c\n", p(0.34, 0.78), p(0.66, 0.78), p(0.63, 0.56)),
+    );
+    push(
+        out,
+        &format!("{} {} {} c\n", p(0.61, 0.47), p(0.50, 0.50), p(0.50, 0.40)),
+    );
+    push(out, "S\n");
+    // The dot beneath it, filled.
+    if let Some(op) = color_op(&ink, false) {
+        push(out, &op);
+        push(out, "\n");
+    }
+    let (d0, d1) = (at(b, 0.455, 0.22), at(b, 0.545, 0.31));
+    push_ellipse(out, Rect::new(d0.0, d0.1, d1.0, d1.1));
+    push(out, "f\n");
+}
+
+/// An upward insertion caret (filled triangle).
+fn insert_icon(out: &mut Vec<u8>, b: Rect, c: &Option<Vec<f64>>) {
+    let ink = c.clone().unwrap_or_else(|| vec![0.0]);
+    if let Some(op) = color_op(&ink, false) {
+        push(out, &op);
+        push(out, "\n");
+    }
+    poly(out, b, &[(0.5, 0.86), (0.80, 0.24), (0.20, 0.24)], true);
+    push(out, "f\n");
+}
+
+/// A key: a stroked ring head, a diagonal stem and two teeth.
+fn key_icon(out: &mut Vec<u8>, b: Rect, c: &Option<Vec<f64>>) {
+    let s = b.width();
+    let ink = c.clone().unwrap_or_else(|| vec![0.0]);
+    if let Some(op) = color_op(&ink, true) {
+        push(out, &op);
+        push(out, "\n");
+    }
+    push(out, &format!("{} w 1 J 1 j\n", fmt(icon_lw(s, 0.085))));
+    let (r0, r1) = (at(b, 0.14, 0.50), at(b, 0.50, 0.86));
+    push_ellipse(out, Rect::new(r0.0, r0.1, r1.0, r1.1));
+    push(out, "S\n");
+    emit_seg(out, at(b, 0.44, 0.58), at(b, 0.84, 0.20)); // stem
+    emit_seg(out, at(b, 0.74, 0.30), at(b, 0.66, 0.22)); // teeth
+    emit_seg(out, at(b, 0.84, 0.20), at(b, 0.76, 0.12));
+}
+
+/// A check mark (two-segment stroke).
+fn check_icon(out: &mut Vec<u8>, b: Rect, c: &Option<Vec<f64>>) {
+    let s = b.width();
+    let ink = c.clone().unwrap_or_else(|| vec![0.0]);
+    if let Some(op) = color_op(&ink, true) {
+        push(out, &op);
+        push(out, "\n");
+    }
+    push(out, &format!("{} w 1 J 1 j\n", fmt(icon_lw(s, 0.11))));
+    let a = at(b, 0.20, 0.50);
+    let m = at(b, 0.42, 0.26);
+    let e = at(b, 0.82, 0.74);
+    push(
+        out,
+        &format!(
+            "{} {} m {} {} l {} {} l S\n",
+            fmt(a.0),
+            fmt(a.1),
+            fmt(m.0),
+            fmt(m.1),
+            fmt(e.0),
+            fmt(e.1)
+        ),
+    );
+}
+
+/// An "X" (two crossed strokes).
+fn cross_icon(out: &mut Vec<u8>, b: Rect, c: &Option<Vec<f64>>) {
+    let s = b.width();
+    let ink = c.clone().unwrap_or_else(|| vec![0.0]);
+    if let Some(op) = color_op(&ink, true) {
+        push(out, &op);
+        push(out, "\n");
+    }
+    push(out, &format!("{} w 1 J\n", fmt(icon_lw(s, 0.11))));
+    emit_seg(out, at(b, 0.24, 0.24), at(b, 0.76, 0.76));
+    emit_seg(out, at(b, 0.24, 0.76), at(b, 0.76, 0.24));
+}
+
+// ---------------------------------------------------------------------------
+// Stamp annotations (§12.5.6.12) — a labeled rubber-stamp badge from /Name
+// ---------------------------------------------------------------------------
+
+/// Build a generated appearance for a `Stamp` annotation with no `/AP`: a
+/// rounded-rectangle border around the label that `/Name` decodes to
+/// (`NotApproved` → "NOT APPROVED"; the spec default is `Draft`). The colour is
+/// `/C`, else a per-name convention (green for affirmative, blue for neutral,
+/// red for cautionary). The label is set in Helvetica-Bold, centred and sized
+/// to fill the badge. Like a real rubber stamp, the interior is left unfilled
+/// so the page shows through.
+fn stamp(file: &PdfFile, dict: &PdfDict, rect: Rect) -> Option<GeneratedAppearance> {
+    let (w, h) = (rect.width(), rect.height());
+    if w <= 6.0 || h <= 6.0 {
+        return None;
+    }
+    let name = read_name(file, dict, "Name").unwrap_or_else(|| "Draft".to_string());
+    let label = stamp_label(&name);
+    if label.is_empty() {
+        return None;
+    }
+    let colour = read_color(file, dict, "C").unwrap_or_else(|| stamp_colour(&name));
+
+    let inset = (w.min(h) * 0.08).clamp(2.0, 10.0);
+    let badge = Rect::new(
+        rect.x0 + inset,
+        rect.y0 + inset,
+        rect.x1 - inset,
+        rect.y1 - inset,
+    );
+    let (bw, bh) = (badge.x1 - badge.x0, badge.y1 - badge.y0);
+    if bw <= 1.0 || bh <= 1.0 {
+        return None;
+    }
+    let border = (w.min(h) * 0.035).clamp(1.0, 4.0);
+    let radius = (w.min(h) * 0.12).clamp(2.0, 12.0);
+
+    // Size the label to fill the badge interior (after the border + padding).
+    // The padding is per-axis: a wide, short stamp (e.g. a banner) must not let
+    // the horizontal inset crush the available height (and vice-versa).
+    let inner_w = (bw - 2.0 * (border + bw * 0.04)).max(1.0);
+    let inner_h = (bh - 2.0 * (border + bh * 0.06)).max(1.0);
+    let unit_w = helv_bold_width(&label, 1.0);
+    let size = if unit_w > 0.0 {
+        (inner_w / unit_w).min(inner_h * 0.72)
+    } else {
+        inner_h * 0.72
+    }
+    .clamp(3.0, 400.0);
+    let label_w = helv_bold_width(&label, size);
+
+    let ca = read_num(file, dict, "CA").map(|v| v.clamp(0.0, 1.0));
+    let gs = build_gs(false, ca);
+
+    let mut content = Vec::new();
+    push(&mut content, "q\n");
+    if gs.is_some() {
+        push(&mut content, "/GS0 gs\n");
+    }
+    // Badge border.
+    if let Some(op) = color_op(&colour, true) {
+        push(&mut content, &op);
+        push(&mut content, "\n");
+    }
+    push(&mut content, &format!("{} w 1 j\n", fmt(border)));
+    push_round_rect(&mut content, badge, radius);
+    push(&mut content, "S\n");
+
+    // Centred label, drawn in a frame translated to the badge's lower-left and
+    // vertically centred by cap height (all-caps text has no descender).
+    if let Some(op) = color_op(&colour, false) {
+        push(&mut content, &op);
+        push(&mut content, "\n");
+    }
+    let tx = ((bw - label_w) / 2.0).max(0.0);
+    let ty = (bh / 2.0 - 0.35 * size).max(0.0);
+    push(&mut content, "q\n");
+    push(
+        &mut content,
+        &format!("1 0 0 1 {} {} cm\n", fmt(badge.x0), fmt(badge.y0)),
+    );
+    push(&mut content, "BT\n");
+    push(&mut content, &format!("/F0 {} Tf\n", fmt(size)));
+    push(
+        &mut content,
+        &format!("1 0 0 1 {} {} Tm\n", fmt(tx), fmt(ty)),
+    );
+    // `label` is `[A-Z0-9 ]` only (see `stamp_label`), so it needs no PDF
+    // literal-string escaping and measures with WinAnsi == ASCII metrics.
+    push(&mut content, "(");
+    push(&mut content, &label);
+    push(&mut content, ") Tj\n");
+    push(&mut content, "ET\n");
+    push(&mut content, "Q\n");
+    push(&mut content, "Q\n");
+
+    if content.len() > MAX_APPEARANCE_BYTES {
+        return None;
+    }
+
+    Some(GeneratedAppearance {
+        bbox: rect,
+        matrix: Matrix::identity(),
+        resources: stamp_resources(gs),
+        content,
+    })
+}
+
+/// Decode a stamp `/Name` into a spaced, uppercase label, splitting camelCase
+/// and digit boundaries and keeping only ASCII letters/digits — so the result
+/// is always a safe PDF literal string and measures with ASCII metrics.
+/// `NotApproved` → "NOT APPROVED", `TopSecret` → "TOP SECRET", `Draft` → "DRAFT".
+fn stamp_label(name: &str) -> String {
+    let mut out = String::new();
+    let mut prev_lower_or_digit = false;
+    for ch in name.chars().take(64) {
+        if matches!(ch, ' ' | '_' | '-') {
+            if !out.is_empty() && !out.ends_with(' ') {
+                out.push(' ');
+            }
+            prev_lower_or_digit = false;
+            continue;
+        }
+        if !ch.is_ascii_alphanumeric() {
+            continue;
+        }
+        if ch.is_ascii_uppercase() && prev_lower_or_digit && !out.ends_with(' ') {
+            out.push(' ');
+        }
+        out.push(ch.to_ascii_uppercase());
+        prev_lower_or_digit = ch.is_ascii_lowercase() || ch.is_ascii_digit();
+    }
+    out.trim().to_string()
+}
+
+/// The conventional colour for a standard stamp `/Name`.
+fn stamp_colour(name: &str) -> Vec<f64> {
+    match name {
+        "Approved" | "Accepted" | "Completed" | "Final" | "Reviewed" => {
+            vec![0.13, 0.55, 0.20] // affirmative — green
+        }
+        "Experimental" | "Sold" | "ForPublicRelease" | "InformationOnly" | "PreliminaryResults"
+        | "Witness" | "InitialHere" | "SignHere" | "Received" => {
+            vec![0.12, 0.22, 0.55] // neutral — blue
+        }
+        // NotApproved, Void, Rejected, Confidential, TopSecret, Expired, AsIs,
+        // NotForPublicRelease, Departmental, ForComment, Draft and any unknown
+        // name → cautionary red.
+        _ => vec![0.72, 0.13, 0.13],
+    }
+}
+
+/// Width of an all-caps label in Helvetica-Bold text-space units at `size`
+/// (standard-14 metrics; a 0.5-em estimate for any non-WinAnsi character).
+fn helv_bold_width(text: &str, size: f64) -> f64 {
+    let metrics = zpdf_font::standard_fonts::lookup("Helvetica-Bold");
+    let mut total = 0.0;
+    for ch in text.chars() {
+        let w1000 = match metrics {
+            Some(m) => {
+                let code = u8::try_from(ch as u32).unwrap_or(b'?') as usize;
+                let w = m.widths[code] as f64;
+                if w == 0.0 {
+                    500.0
+                } else {
+                    w
+                }
+            }
+            None => 500.0,
+        };
+        total += w1000 / 1000.0 * size;
+    }
+    total
+}
+
+/// The stamp appearance `/Resources`: a `/F0` Helvetica-Bold font plus the
+/// optional opacity `GS0`.
+fn stamp_resources(gs: Option<PdfDict>) -> PdfDict {
+    let mut fonts = PdfDict::new();
+    fonts.insert(
+        PdfName::new("F0"),
+        PdfObject::Dict(crate::forms::standard_font_dict("Helvetica-Bold")),
+    );
+    let mut res = PdfDict::new();
+    res.insert(PdfName::new("Font"), PdfObject::Dict(fonts));
+    if let Some(gs) = gs {
+        let mut egs = PdfDict::new();
+        egs.insert(PdfName::new("GS0"), PdfObject::Dict(gs));
+        res.insert(PdfName::new("ExtGState"), PdfObject::Dict(egs));
+    }
+    res
+}
+
+/// Append a rounded rectangle (four straight edges + four Bézier corner arcs),
+/// no paint op. The radius is clamped to half the smaller side.
+fn push_round_rect(out: &mut Vec<u8>, r: Rect, rad: f64) {
+    const K: f64 = 0.552_284_75; // 4/3 * (sqrt(2) - 1)
+    let rad = rad.min(r.width() / 2.0).min(r.height() / 2.0).max(0.0);
+    let k = rad * K;
+    let (x0, y0, x1, y1) = (r.x0, r.y0, r.x1, r.y1);
+    push(out, &format!("{} {} m\n", fmt(x0 + rad), fmt(y0)));
+    push(out, &format!("{} {} l\n", fmt(x1 - rad), fmt(y0)));
+    push(
+        out,
+        &format!(
+            "{} {} {} {} {} {} c\n",
+            fmt(x1 - rad + k),
+            fmt(y0),
+            fmt(x1),
+            fmt(y0 + rad - k),
+            fmt(x1),
+            fmt(y0 + rad)
+        ),
+    );
+    push(out, &format!("{} {} l\n", fmt(x1), fmt(y1 - rad)));
+    push(
+        out,
+        &format!(
+            "{} {} {} {} {} {} c\n",
+            fmt(x1),
+            fmt(y1 - rad + k),
+            fmt(x1 - rad + k),
+            fmt(y1),
+            fmt(x1 - rad),
+            fmt(y1)
+        ),
+    );
+    push(out, &format!("{} {} l\n", fmt(x0 + rad), fmt(y1)));
+    push(
+        out,
+        &format!(
+            "{} {} {} {} {} {} c\n",
+            fmt(x0 + rad - k),
+            fmt(y1),
+            fmt(x0),
+            fmt(y1 - rad + k),
+            fmt(x0),
+            fmt(y1 - rad)
+        ),
+    );
+    push(out, &format!("{} {} l\n", fmt(x0), fmt(y0 + rad)));
+    push(
+        out,
+        &format!(
+            "{} {} {} {} {} {} c\n",
+            fmt(x0),
+            fmt(y0 + rad - k),
+            fmt(x0 + rad - k),
+            fmt(y0),
+            fmt(x0 + rad),
+            fmt(y0)
+        ),
+    );
+    push(out, "h\n");
+}
+
+/// Resolve `/Name` (a possibly-indirect name) to a string.
+fn read_name(file: &PdfFile, dict: &PdfDict, key: &str) -> Option<String> {
+    dict.get(key).and_then(|o| name_of(file, o))
 }
 
 // ---------------------------------------------------------------------------
@@ -1338,10 +1821,276 @@ mod tests {
 
     #[test]
     fn unsupported_subtype_generates_nothing() {
+        // `/Movie` has no geometry-derived appearance (unlike Text/Stamp, which
+        // now draw an icon / badge).
         let a =
-            annot_of("<< /Type /Annot /Subtype /Text /Rect [10 10 30 30] >>").expect("annotation");
+            annot_of("<< /Type /Annot /Subtype /Movie /Rect [10 10 30 30] >>").expect("annotation");
         assert!(a.generated.is_none());
         assert!(!a.is_viewable(), "no appearance, not viewable");
+    }
+
+    #[test]
+    fn text_note_icon_draws_filled_paper() {
+        // A Text annotation with no /Name defaults to the dog-eared note, filled
+        // with /C and outlined / lined in dark gray.
+        let a = annot_of("<< /Type /Annot /Subtype /Text /Rect [10 10 30 30] /C [1 1 0] >>")
+            .expect("annotation");
+        assert!(a.is_viewable(), "generated note icon is viewable");
+        let gen = a.generated.as_ref().expect("generated appearance");
+        let s = String::from_utf8_lossy(&gen.content);
+        assert!(
+            s.contains("1.000 1.000 0.000 rg"),
+            "yellow paper from /C: {s}"
+        );
+        assert!(s.contains("0.250 G"), "dark gray ink: {s}");
+        assert!(s.contains("B\n"), "fills + strokes the page: {s}");
+    }
+
+    #[test]
+    fn text_default_colour_is_note_yellow() {
+        // No /C → the default note yellow, not transparent.
+        let a =
+            annot_of("<< /Type /Annot /Subtype /Text /Rect [10 10 30 30] >>").expect("annotation");
+        let gen = a.generated.as_ref().expect("gen");
+        let s = String::from_utf8_lossy(&gen.content);
+        assert!(
+            s.contains("1.000 0.930 0.400 rg"),
+            "default note yellow: {s}"
+        );
+    }
+
+    #[test]
+    fn text_help_icon_draws_circle() {
+        let a = annot_of("<< /Type /Annot /Subtype /Text /Name /Help /Rect [10 10 34 34] >>")
+            .expect("annotation");
+        let gen = a.generated.as_ref().expect("gen");
+        let s = String::from_utf8_lossy(&gen.content);
+        // The enclosing circle is an ellipse (Bézier arcs); the dot is filled.
+        assert!(s.contains(" c\n"), "curved circle/hook: {s}");
+        assert!(s.contains("f\n"), "filled dot: {s}");
+    }
+
+    #[test]
+    fn text_check_icon_strokes_two_segments() {
+        let a = annot_of(
+            "<< /Type /Annot /Subtype /Text /Name /Check /Rect [10 10 34 34] /C [0 0.5 0] >>",
+        )
+        .expect("annotation");
+        let gen = a.generated.as_ref().expect("gen");
+        let s = String::from_utf8_lossy(&gen.content);
+        assert!(s.contains("0.000 0.500 0.000 RG"), "uses /C ink: {s}");
+        assert!(
+            s.contains(" m ") && s.contains(" l ") && s.contains(" l S"),
+            "check stroke: {s}"
+        );
+    }
+
+    #[test]
+    fn text_icon_too_small_generates_nothing() {
+        let a =
+            annot_of("<< /Type /Annot /Subtype /Text /Rect [10 10 12 12] >>").expect("annotation");
+        assert!(a.generated.is_none(), "a sub-3pt rect has no icon");
+    }
+
+    #[test]
+    fn stamp_label_decodes_camel_case() {
+        assert_eq!(stamp_label("NotApproved"), "NOT APPROVED");
+        assert_eq!(stamp_label("TopSecret"), "TOP SECRET");
+        assert_eq!(stamp_label("ForPublicRelease"), "FOR PUBLIC RELEASE");
+        assert_eq!(stamp_label("AsIs"), "AS IS");
+        assert_eq!(stamp_label("Draft"), "DRAFT");
+        // Already-spaced / punctuated input collapses to single spaces and drops
+        // unsafe characters (so the result is always a safe PDF literal).
+        assert_eq!(stamp_label("For (comment)"), "FOR COMMENT");
+        assert_eq!(stamp_label(""), "");
+    }
+
+    #[test]
+    fn stamp_draws_bordered_label() {
+        let a = annot_of("<< /Type /Annot /Subtype /Stamp /Name /Approved /Rect [20 20 160 70] >>")
+            .expect("annotation");
+        assert!(a.is_viewable(), "generated stamp is viewable");
+        let gen = a.generated.as_ref().expect("gen");
+        let s = String::from_utf8_lossy(&gen.content);
+        assert!(s.contains("(APPROVED) Tj"), "draws the label: {s}");
+        assert!(s.contains("/F0 "), "uses the bold font resource: {s}");
+        // Approved → green border + text.
+        assert!(s.contains("0.130 0.550 0.200 RG"), "green border: {s}");
+        assert!(s.contains("0.130 0.550 0.200 rg"), "green text: {s}");
+        // A rounded-rect border (arcs) stroked, no interior fill.
+        assert!(
+            s.contains(" c\n") && s.contains("h\nS"),
+            "rounded border stroked: {s}"
+        );
+        assert!(gen.resources.get("Font").is_some(), "font resource present");
+    }
+
+    #[test]
+    fn stamp_default_name_is_draft() {
+        let a = annot_of("<< /Type /Annot /Subtype /Stamp /Rect [20 20 160 70] >>")
+            .expect("annotation");
+        let gen = a.generated.as_ref().expect("gen");
+        let s = String::from_utf8_lossy(&gen.content);
+        assert!(s.contains("(DRAFT) Tj"), "default /Name is Draft: {s}");
+        assert!(
+            s.contains("0.720 0.130 0.130 RG"),
+            "Draft is cautionary red: {s}"
+        );
+    }
+
+    #[test]
+    fn stamp_colour_override_from_c() {
+        let a = annot_of(
+            "<< /Type /Annot /Subtype /Stamp /Name /Approved /Rect [20 20 160 70] /C [1 0 0] >>",
+        )
+        .expect("annotation");
+        let gen = a.generated.as_ref().expect("gen");
+        let s = String::from_utf8_lossy(&gen.content);
+        assert!(
+            s.contains("1.000 0.000 0.000 RG"),
+            "/C overrides the green: {s}"
+        );
+        assert!(
+            !s.contains("0.130 0.550 0.200"),
+            "no convention colour when /C given: {s}"
+        );
+    }
+
+    #[test]
+    fn stamp_opacity_uses_extgstate() {
+        let a = annot_of(
+            "<< /Type /Annot /Subtype /Stamp /Name /Confidential /Rect [20 20 200 80] /CA 0.5 >>",
+        )
+        .expect("annotation");
+        let gen = a.generated.as_ref().expect("gen");
+        let s = String::from_utf8_lossy(&gen.content);
+        assert!(s.contains("/GS0 gs"), "applies the opacity ExtGState: {s}");
+        let egs = gen
+            .resources
+            .get("ExtGState")
+            .and_then(|o| o.as_dict().ok())
+            .expect("ExtGState");
+        let g0 = egs.get("GS0").and_then(|o| o.as_dict().ok()).expect("GS0");
+        assert_eq!(g0.get("ca").and_then(|o| o.as_f64().ok()), Some(0.5));
+    }
+
+    #[test]
+    fn text_opacity_uses_extgstate() {
+        // A Text icon routes through the shared q/Q + ExtGState wrapper (a
+        // different path from Stamp); confirm /CA reaches it.
+        let a = annot_of("<< /Type /Annot /Subtype /Text /Rect [10 10 34 34] /CA 0.4 >>")
+            .expect("annotation");
+        let gen = a.generated.as_ref().expect("gen");
+        let s = String::from_utf8_lossy(&gen.content);
+        assert!(s.contains("/GS0 gs"), "applies the opacity ExtGState: {s}");
+        let egs = gen
+            .resources
+            .get("ExtGState")
+            .and_then(|o| o.as_dict().ok())
+            .expect("ExtGState");
+        let g0 = egs.get("GS0").and_then(|o| o.as_dict().ok()).expect("GS0");
+        assert_eq!(g0.get("ca").and_then(|o| o.as_f64().ok()), Some(0.4));
+        assert_eq!(g0.get("CA").and_then(|o| o.as_f64().ok()), Some(0.4));
+    }
+
+    #[test]
+    fn text_empty_colour_still_draws_note() {
+        // Unlike markup (`/C []` is transparent), a Text icon with an empty /C
+        // still draws — falling back to the default note yellow.
+        let a = annot_of("<< /Type /Annot /Subtype /Text /Rect [10 10 34 34] /C [] >>")
+            .expect("annotation");
+        let gen = a
+            .generated
+            .as_ref()
+            .expect("empty /C still draws the note icon");
+        let s = String::from_utf8_lossy(&gen.content);
+        assert!(
+            s.contains("1.000 0.930 0.400 rg"),
+            "default note yellow: {s}"
+        );
+    }
+
+    #[test]
+    fn text_insert_key_cross_route_to_their_glyphs() {
+        let content = |name: &str| {
+            let a = annot_of(&format!(
+                "<< /Type /Annot /Subtype /Text /Name /{name} /Rect [10 10 34 34] >>"
+            ))
+            .expect("annotation");
+            String::from_utf8_lossy(&a.generated.as_ref().expect("gen").content).into_owned()
+        };
+        // Insert: a filled triangle — `f`, and crucially NOT the note's `B`.
+        let ins = content("Insert");
+        assert!(
+            ins.contains("f\n") && !ins.contains("B\n"),
+            "insert triangle: {ins}"
+        );
+        // Key: a stroked ring (Bézier `c`) plus straight segments.
+        let key = content("Key");
+        assert!(
+            key.contains(" c\n") && key.contains(" l S\n"),
+            "key ring + stem: {key}"
+        );
+        // Cross: two stroked segments, no fill at all.
+        let cross = content("Cross");
+        assert!(
+            cross.matches(" l S\n").count() >= 2 && !cross.contains("f\n"),
+            "cross is two strokes: {cross}"
+        );
+    }
+
+    #[test]
+    fn text_checkmark_alias_matches_check() {
+        // `Checkmark` is an alias for `Check`; it must reach the check stroke,
+        // not fall through to the note fill.
+        let a = annot_of("<< /Type /Annot /Subtype /Text /Name /Checkmark /Rect [10 10 34 34] >>")
+            .expect("annotation");
+        let s = String::from_utf8_lossy(&a.generated.as_ref().expect("gen").content);
+        assert!(
+            s.contains(" l S\n") && !s.contains("B\n"),
+            "Checkmark routes to the check icon: {s}"
+        );
+    }
+
+    #[test]
+    fn stamp_too_small_rect_generates_nothing() {
+        let a = annot_of("<< /Type /Annot /Subtype /Stamp /Name /Approved /Rect [10 10 14 14] >>")
+            .expect("annotation");
+        assert!(a.generated.is_none(), "a <=6pt stamp rect has no badge");
+    }
+
+    #[test]
+    fn stamp_non_decodable_name_generates_nothing() {
+        // A /Name with no ASCII alphanumerics strips to an empty label, so no
+        // badge is drawn (rather than an empty `() Tj`).
+        let a = annot_of("<< /Type /Annot /Subtype /Stamp /Name /--- /Rect [20 20 160 70] >>")
+            .expect("annotation");
+        assert!(
+            a.generated.is_none(),
+            "a name that strips to empty draws nothing"
+        );
+    }
+
+    #[test]
+    fn round_rect_clamps_radius_on_a_flat_rect() {
+        // A wide, short rect with an oversized radius: the internal clamp must
+        // keep every emitted coordinate inside the rectangle (no corner-arc
+        // overshoot). Numbers are emitted in x, y, x, y… order.
+        let mut out = Vec::new();
+        push_round_rect(&mut out, Rect::new(0.0, 0.0, 100.0, 4.0), 50.0);
+        let s = String::from_utf8(out).expect("ascii");
+        let nums: Vec<f64> = s
+            .split_whitespace()
+            .filter_map(|t| t.parse::<f64>().ok())
+            .collect();
+        assert!(!nums.is_empty(), "emitted coordinates: {s}");
+        for (i, v) in nums.iter().enumerate() {
+            if i % 2 == 0 {
+                assert!((0.0..=100.0).contains(v), "x within width: {v}");
+            } else {
+                assert!((0.0..=4.0).contains(v), "y clamped to height: {v}");
+            }
+        }
     }
 
     #[test]
