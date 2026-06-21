@@ -124,6 +124,15 @@ pub struct LoadedFont {
     /// /DW2 vertical-writing defaults: (origin-shift vy, advance w1y), in
     /// 1/1000 glyph-space units (PDF defaults [880 −1000]).
     pub dw2: (f64, f64),
+    /// OpenType variation axis settings `(tag, user-value)` derived from the
+    /// FontDescriptor (`/FontWeight`→`wght`, `/FontStretch`→`wdth`,
+    /// `/ItalicAngle`→`slnt`, the Italic flag→`ital`). Applied to a *variable*
+    /// font program before outlining/measuring so it renders at the intended
+    /// instance instead of the default master; a no-op for static fonts
+    /// (`set_variation` ignores axes the font lacks). Set via [`set_variations`].
+    ///
+    /// [`set_variations`]: LoadedFont::set_variations
+    pub variations: Vec<([u8; 4], f32)>,
 }
 
 #[derive(Debug, Clone)]
@@ -212,6 +221,7 @@ impl LoadedFont {
                 type1: None,
                 cid_cmap: None,
                 dw2: (880.0, -1000.0),
+                variations: Vec::new(),
             }
         } else if let Some(t1) = type1::Type1Font::parse(&font_data) {
             // Embedded Type 1 (PostScript) program — ttf-parser cannot parse it.
@@ -235,6 +245,7 @@ impl LoadedFont {
                 type1: Some(t1),
                 cid_cmap: None,
                 dw2: (880.0, -1000.0),
+                variations: Vec::new(),
             }
         } else {
             tracing::debug!(
@@ -259,6 +270,7 @@ impl LoadedFont {
                 type1: None,
                 cid_cmap: None,
                 dw2: (880.0, -1000.0),
+                variations: Vec::new(),
             }
         }
     }
@@ -297,6 +309,7 @@ impl LoadedFont {
             type1: None,
             cid_cmap: None,
             dw2: (880.0, -1000.0),
+            variations: Vec::new(),
         })
     }
 
@@ -381,6 +394,7 @@ impl LoadedFont {
             type1: None,
             cid_cmap: None,
             dw2: (880.0, -1000.0),
+            variations: Vec::new(),
         })
     }
 
@@ -404,6 +418,7 @@ impl LoadedFont {
             type1: None,
             cid_cmap: None,
             dw2: (880.0, -1000.0),
+            variations: Vec::new(),
         }
     }
 
@@ -462,7 +477,8 @@ impl LoadedFont {
     /// (the composite-font convention).
     pub fn unicode_glyph(&self, code: u32) -> Option<(u16, f64)> {
         let data = self.font_data.as_ref()?;
-        let face = ttf_parser::Face::parse(data, self.face_index).ok()?;
+        let mut face = ttf_parser::Face::parse(data, self.face_index).ok()?;
+        self.apply_variations(&mut face);
         let ch = char::from_u32(code)?;
         let gid = face.glyph_index(ch)?;
         let adv = face
@@ -472,13 +488,65 @@ impl LoadedFont {
         Some((gid.0, adv))
     }
 
+    /// Configure OpenType variation axes from FontDescriptor values, so a
+    /// *variable* embedded (or substituted) font program renders at the intended
+    /// instance rather than the default master. Each axis is requested only when
+    /// the corresponding descriptor entry is present and finite; `set_variation`
+    /// then ignores any the font program does not actually carry, so this is a
+    /// no-op for ordinary static fonts. `width_pct` is the `/FontStretch` value
+    /// already mapped to a percentage; `italic_angle` is `/ItalicAngle` (degrees,
+    /// counter-clockwise — the same convention as the `slnt` axis).
+    ///
+    /// Policy: the descriptor selectors drive the instance. When a selector
+    /// equals the font's default axis value — the well-formed case, since
+    /// `/FontWeight` derives from OS/2 `usWeightClass`, which tracks the default
+    /// master — `set_variation` normalizes to the default coordinate and changes
+    /// nothing. A selector that *contradicts* the default master (rare, malformed
+    /// metadata) is honored as written, re-instancing to the requested value.
+    pub fn set_variations(
+        &mut self,
+        weight: Option<f64>,
+        width_pct: Option<f64>,
+        italic_angle: Option<f64>,
+        italic: bool,
+    ) {
+        let mut v: Vec<([u8; 4], f32)> = Vec::new();
+        let mut push = |tag: &[u8; 4], value: f64| {
+            if value.is_finite() {
+                v.push((*tag, value as f32));
+            }
+        };
+        if let Some(w) = weight.filter(|w| *w > 0.0) {
+            push(b"wght", w);
+        }
+        if let Some(wd) = width_pct.filter(|wd| *wd > 0.0) {
+            push(b"wdth", wd);
+        }
+        if let Some(a) = italic_angle.filter(|a| *a != 0.0) {
+            push(b"slnt", a);
+        }
+        if italic {
+            v.push((*b"ital", 1.0));
+        }
+        self.variations = v;
+    }
+
+    /// Apply the descriptor-derived variation axes to a freshly parsed face.
+    /// No-op unless the font is variable and carries the requested axes.
+    fn apply_variations(&self, face: &mut ttf_parser::Face) {
+        for (tag, value) in &self.variations {
+            let _ = face.set_variation(ttf_parser::Tag::from_bytes(tag), *value);
+        }
+    }
+
     /// Get glyph outline for a given glyph ID (or CID for CID fonts).
     pub fn glyph_outline(&self, glyph_id: u16) -> Option<GlyphOutline> {
         if let Some(t1) = &self.type1 {
             return t1.glyph_outline_by_gid(glyph_id);
         }
         let data = self.font_data.as_ref()?;
-        let face = ttf_parser::Face::parse(data, self.face_index).ok()?;
+        let mut face = ttf_parser::Face::parse(data, self.face_index).ok()?;
+        self.apply_variations(&mut face);
 
         let actual_gid = if self.unicode_coded() || self.legacy_substitute() {
             // Unicode-coded (and substituted legacy-CMap) composite fonts
@@ -565,7 +633,8 @@ impl LoadedFont {
         }
         // For simple TrueType, try the font program's hmtx table
         if let Some(data) = &self.font_data {
-            if let Ok(face) = ttf_parser::Face::parse(data, self.face_index) {
+            if let Ok(mut face) = ttf_parser::Face::parse(data, self.face_index) {
+                self.apply_variations(&mut face);
                 let gid = ttf_parser::GlyphId(glyph_id);
                 if let Some(a) = face.glyph_hor_advance(gid) {
                     return a as f64;
@@ -732,7 +801,10 @@ impl LoadedFont {
             return w / 1000.0 * self.units_per_em;
         }
         if let Some(data) = &self.font_data {
-            if let Ok(face) = ttf_parser::Face::parse(data, self.face_index) {
+            if let Ok(mut face) = ttf_parser::Face::parse(data, self.face_index) {
+                // Match the varied outline: a variable font's hmtx advance must
+                // be read at the same instance `glyph_outline` renders.
+                self.apply_variations(&mut face);
                 if let Some(a) = face.glyph_hor_advance(ttf_parser::GlyphId(gid)) {
                     return a as f64;
                 }

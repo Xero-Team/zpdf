@@ -48,6 +48,8 @@ pub fn load_single_font_dict(file: &PdfFile, dict: &zpdf_core::PdfDict) -> Resul
     // A substituted composite font needs /ToUnicode (attached just above) to
     // route CIDs through the system face's Unicode cmap.
     font.build_substitute_cid_to_gid();
+    // FontDescriptor weight/width/slant → variation axes (variable fonts only).
+    apply_descriptor_variations(file, dict, &mut font);
     Ok(font)
 }
 
@@ -175,6 +177,54 @@ fn font_descriptor_symbolic(file: &PdfFile, dict: &zpdf_core::PdfDict) -> bool {
         .ok()
         .and_then(|o| o.as_dict().ok().and_then(|d| d.get_i64("Flags").ok()));
     matches!(flags, Some(f) if (f & 4) != 0 && (f & 32) == 0)
+}
+
+/// Resolve the FontDescriptor dict carrying the embedded program's metadata,
+/// handling the Type0 indirection (the descriptor lives on the descendant
+/// CIDFont, not the top-level Type0 dict).
+fn font_descriptor_dict(file: &PdfFile, dict: &zpdf_core::PdfDict) -> Option<zpdf_core::PdfDict> {
+    let host = if dict.get_name("Subtype").unwrap_or("") == "Type0" {
+        let descendants = resolve_array(file, dict, "DescendantFonts")?;
+        let desc_ref = descendants.first()?.as_ref().ok()?;
+        file.resolve(desc_ref).ok()?.as_dict().ok()?.clone()
+    } else {
+        dict.clone()
+    };
+    let fd_ref = host.get_ref("FontDescriptor").ok()?;
+    file.resolve(fd_ref).ok()?.as_dict().ok().cloned()
+}
+
+/// Map a `/FontStretch` name to its OpenType `wdth`-axis percentage (Table 122).
+fn font_stretch_pct(name: &str) -> Option<f64> {
+    Some(match name {
+        "UltraCondensed" => 50.0,
+        "ExtraCondensed" => 62.5,
+        "Condensed" => 75.0,
+        "SemiCondensed" => 87.5,
+        "Normal" => 100.0,
+        "SemiExpanded" => 112.5,
+        "Expanded" => 125.0,
+        "ExtraExpanded" => 150.0,
+        "UltraExpanded" => 200.0,
+        _ => return None,
+    })
+}
+
+/// Drive a variable font's OpenType axes from the FontDescriptor's selectors
+/// (`/FontWeight`→`wght`, `/FontStretch`→`wdth`, `/ItalicAngle`→`slnt`, Italic
+/// flag→`ital`). A no-op for static fonts (the axes simply do not exist), so it
+/// is applied to every font; the common selector-less font is left untouched.
+fn apply_descriptor_variations(file: &PdfFile, dict: &zpdf_core::PdfDict, font: &mut LoadedFont) {
+    let Some(fd) = font_descriptor_dict(file, dict) else {
+        return;
+    };
+    let weight = fd.get_f64("FontWeight").ok();
+    let width_pct = fd.get_name("FontStretch").ok().and_then(font_stretch_pct);
+    let italic_angle = fd.get_f64("ItalicAngle").ok();
+    let italic = fd.get_i64("Flags").map(|f| f & 64 != 0).unwrap_or(false);
+    if weight.is_some() || width_pct.is_some() || italic_angle.is_some() || italic {
+        font.set_variations(weight, width_pct, italic_angle, italic);
+    }
 }
 
 /// Build the effective simple-font encoding from /Encoding (a name, a dict with
@@ -556,6 +606,7 @@ fn load_type3_font(
         type1: None,
         cid_cmap: None,
         dw2: (880.0, -1000.0),
+        variations: Vec::new(),
     };
 
     Ok(font)

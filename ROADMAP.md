@@ -241,7 +241,10 @@ cargo run -p zpdf-render-wgpu --example viewer -- <file.pdf>   # 交互浏览器
       FirstChar≠0 修复
 - [x] Font fallback (缺失字体替代)：扫描系统字体目录，按 PostScript 名 / 全名 /
       家族+样式 + CID 排序默认匹配（`zpdf_font::system`）
-- [ ] Variable fonts
+- [x] Variable fonts（OpenType `fvar`/`gvar`/CFF2）：FontDescriptor 选择子驱动变体轴
+      （`/FontWeight`→`wght`、`/FontStretch`→`wdth`、`/ItalicAngle`→`slnt`、Italic 标志→`ital`），
+      经 `ttf-parser` `set_variation`（按轴范围钳制 + `avar`）在取轮廓/度量前应用；静态字体为
+      no-op（缺失轴被忽略），`/Widths` 仍主导定位；Type0 经后代 CIDFont 找描述符
 
 ### P4.2 — 完整颜色管理
 - [x] ICCBased 颜色空间：经 moxcms 通过嵌入 profile 转换（矢量/shading/调色板/图像

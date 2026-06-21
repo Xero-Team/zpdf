@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+### Variable fonts (OpenType `fvar`/`gvar`)
+
+An embedded (or substituted) **variable** font program now renders at the instance
+the FontDescriptor asks for, instead of always the default master. The descriptor's
+style selectors drive the OpenType variation axes:
+
+- `/FontWeight` → `wght`,
+- `/FontStretch` (name) → `wdth` (mapped to its percentage, e.g. `Condensed`→75,
+  `Normal`→100, `Expanded`→125),
+- `/ItalicAngle` → `slnt` (same counter-clockwise-degrees convention),
+- the Italic flag → `ital`.
+
+`LoadedFont::set_variations` records the requested axes and they are applied
+(`ttf-parser`'s `set_variation`, which clamps to each axis range and honors `avar`)
+before every outline/advance read. It is a **no-op for static fonts** — axes the
+program does not carry are ignored — so the common, already-instanced font is
+untouched; `/Widths` remain authoritative for positioning. The descriptor is found
+through the Type0 indirection too (the selectors live on the descendant CIDFont).
+
+Pure-Rust, no new dependencies (`ttf-parser`'s `variable-fonts` is a default
+feature). Verified with a minimal `fvar`/`gvar` fixture (`crates/zpdf-font/tests/`):
+the `wght` axis widens a glyph's outline *and* its advance (default/400 → 900), an
+intermediate weight interpolates, absent axes are ignored safely, and an
+end-to-end PDF with `/FontWeight 900` drives the axis through the loader
+(`crates/zpdf/tests/`). An adversarial review confirmed the variation is applied
+on the live simple-font advance fallback (`simple_glyph_advance`), not just the
+outline, so spacing matches the rendered weight.
+
 ### GPU soft-mask fidelity (`/TR`, tiling offset, nested groups)
 
 The wgpu backend now matches the tiny-skia CPU oracle on three ExtGState `/SMask`
