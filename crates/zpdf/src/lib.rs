@@ -1,5 +1,6 @@
 pub use zpdf_color::{IccCache, IccTransform};
 pub use zpdf_content::interpreter::ContentInterpreter;
+pub use zpdf_content::tables::{detect_tables, Table};
 pub use zpdf_content::text::{spans_to_text, TextSpan};
 pub use zpdf_core::*;
 pub use zpdf_display_list as display_list;

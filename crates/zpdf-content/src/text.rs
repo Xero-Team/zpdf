@@ -21,7 +21,7 @@ pub struct TextSpan {
 
 impl TextSpan {
     /// Left/right x-bounds of the span (advance may be negative).
-    fn x_bounds(&self) -> (f64, f64) {
+    pub(crate) fn x_bounds(&self) -> (f64, f64) {
         (
             self.x.min(self.x + self.advance),
             self.x.max(self.x + self.advance),

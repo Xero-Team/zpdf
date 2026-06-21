@@ -329,7 +329,13 @@ cargo run -p zpdf-render-wgpu --example viewer -- <file.pdf>   # 交互浏览器
 ### P4.8 — 文本提取增强
 - [x] 结构化文本提取（坐标、大小：TextSpan）
 - [x] 阅读顺序启发式（递归 XY-cut：列检测 + 整行重组）
-- [ ] 表格检测
+- [x] 表格检测（`zpdf-content/src/tables.rs`，基于对齐的白空隙网格法）：按基线聚行 →
+      按大间距切带 → 带内用扫描线找"白空隙"竖列分隔（列分隔须在带内绝大多数行保持空白，
+      max_cross=floor((1−0.85)·行数)）→ 列分隔中点定列、行基线中点定行 → 按 x 中心分桶建格。
+      标题/说明单列行从首尾裁剪；散文因填满行宽而跨越列隙自动被排除（2 列另设填充率
+      ≤0.80 守卫）。`detect_tables(&[TextSpan]) -> Vec<Table>`（cells/col_x/row_y +
+      to_csv/to_tsv/bbox），CLI `zpdf tables`（`-p`//--all//--csv）。纯文本对齐法，
+      无后端/渲染改动；规则线（绘制的横竖线）感知留作后续增强
 
 ### P4.9 — PDF 2.0
 - [ ] ISO 32000-2 差异项

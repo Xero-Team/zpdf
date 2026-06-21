@@ -2,6 +2,40 @@
 
 ## Unreleased
 
+### Table detection
+
+A new `zpdf-content::tables` module recovers tabular structure from a page's
+extracted text spans — PDF has no table model, so this is heuristic and purely
+**alignment-based** (no rendering or backend changes). It groups spans into
+baseline rows, segments the page into vertical bands at large gaps, and finds
+clean vertical **gutters** — x-ranges that text does not cross down the band —
+as column separators; a band with two or more columns over several rows becomes
+a `Table`. Ordinary prose fills the line width and so crosses any candidate
+gutter, disqualifying itself, which keeps false positives low without needing
+the page's ruled lines.
+
+- **API**: `zpdf::detect_tables(&[TextSpan]) -> Vec<Table>`. A `Table` exposes
+  `cells: Vec<Vec<String>>` (row-major), the `col_x` / `row_y` separator
+  positions, `rows()` / `cols()` / `bbox()`, and `to_csv()` (RFC-4180) /
+  `to_tsv()` / `to_delimited(char)`.
+- **CLI**: `zpdf tables <file.pdf> [-p <page>] [--all] [--csv]` prints each
+  detected grid as TSV (or CSV).
+- **Robustness**: non-finite span coordinates are dropped at entry (a NaN would
+  otherwise make the sort comparators violate a total order — a panic on Rust
+  ≥ 1.81 — or stall the gutter sweepline); span/table counts are bounded. The
+  618-PDF malformed corpus runs with **0 panics**.
+- **Heuristics hardened by an adversarial review**: a spanning group header,
+  caption, or subtotal row no longer collapses columns or drops the table
+  (full-width rows abstain from the gutter vote, and the crossing tolerance
+  rounds up so one over-wide row is forgiven); the prose-fill guard rejects
+  3-or-more-column page layouts too (not just two); and a 3-row table with a
+  single spanning interior row is accepted.
+- **Known limitations** (documented in the module; all improvable with future
+  ruling-line capture): wrapped multi-line cells read as separate rows; a short
+  left-aligned header sitting fully to one side of a right-aligned numeric column
+  can open a spurious gutter; and a table beginning immediately under multi-line
+  prose with no blank line may be missed.
+
 ### Text-note icons & Stamp badges
 
 `Text` (sticky-note) and `Stamp` (rubber-stamp) annotations that ship **no `/AP`

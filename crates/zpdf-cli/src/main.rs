@@ -14,7 +14,7 @@ fn main() {
 
     if args.len() < 2 {
         eprintln!("Usage: zpdf <command> [args...]");
-        eprintln!("Commands: info, dump, render, text, forms, compare, debug-stream");
+        eprintln!("Commands: info, dump, render, text, tables, forms, compare, debug-stream");
         process::exit(1);
     }
 
@@ -23,6 +23,7 @@ fn main() {
         "dump" => cmd_dump(&args[2..]),
         "render" => cmd_render(&args[2..]),
         "text" => cmd_text(&args[2..]),
+        "tables" => cmd_tables(&args[2..]),
         "forms" => cmd_forms(&args[2..]),
         "compare" => cmd_compare(&args[2..]),
         "debug-stream" => cmd_debug_stream(&args[2..]),
@@ -330,6 +331,75 @@ fn cmd_text(args: &[String]) -> zpdf::Result<()> {
         }
         let text = zpdf::spans_to_text(spans, 2.0);
         println!("{text}");
+    }
+
+    Ok(())
+}
+
+fn cmd_tables(args: &[String]) -> zpdf::Result<()> {
+    let (args, password) = extract_password(args);
+    if args.is_empty() {
+        eprintln!("Usage: zpdf tables <file.pdf> [-p <page>] [--all] [--csv] [--password <pw>]");
+        process::exit(1);
+    }
+
+    let pdf_path = &args[0];
+    let mut page_num: usize = 1;
+    let mut all = false;
+    let mut csv = false;
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-p" => {
+                i += 1;
+                page_num = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(1);
+            }
+            "--all" => all = true,
+            "--csv" => csv = true,
+            _ => {}
+        }
+        i += 1;
+    }
+
+    let doc = open_document(pdf_path, password.as_deref())?;
+    let page_indices: Vec<usize> = if all {
+        (0..doc.page_count()).collect()
+    } else {
+        vec![page_num.saturating_sub(1)]
+    };
+
+    // ICC transforms are per-document; share the cache across pages.
+    let mut icc_cache = zpdf::IccCache::new();
+
+    for &pi in &page_indices {
+        let page = doc.page(pi)?;
+        let mut font_cache = doc.load_page_fonts(&page);
+        let content_bytes = doc.page_content_bytes(&page)?;
+        let mut image_cache = zpdf::ImageCache::new();
+
+        let mut spans: Vec<zpdf::TextSpan> = Vec::new();
+        {
+            let interpreter = zpdf::ContentInterpreter::new(page.effective_box())
+                .with_fonts(&mut font_cache)
+                .with_document(doc.file(), &page.resources)
+                .with_images(&mut image_cache)
+                .with_colors(&mut icc_cache)
+                .with_text_sink(&mut spans);
+            let _ = interpreter.interpret(&content_bytes);
+        }
+
+        let tables = zpdf::detect_tables(&spans);
+        if all {
+            println!("===== Page {} ({} table(s)) =====", pi + 1, tables.len());
+        }
+        for (ti, t) in tables.iter().enumerate() {
+            println!("--- Table {} ({}x{}) ---", ti + 1, t.rows(), t.cols());
+            println!("{}", if csv { t.to_csv() } else { t.to_tsv() });
+        }
+        if tables.is_empty() && !all {
+            eprintln!("No tables detected on page {}.", pi + 1);
+        }
     }
 
     Ok(())
