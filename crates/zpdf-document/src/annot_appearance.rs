@@ -56,6 +56,14 @@ pub fn generate_annotation_appearance(
         return None;
     }
 
+    // FreeText draws wrapped text (plus an optional background, border and
+    // callout) and needs font resources, so it builds its own appearance
+    // directly rather than going through the shared markup/geometry wrapper
+    // below. It reuses the AcroForm text-layout engine in [`crate::forms`].
+    if subtype == "FreeText" {
+        return free_text(file, dict, rect);
+    }
+
     // The whole-annotation constant opacity (/CA) becomes an ExtGState alpha.
     let ca = read_num(file, dict, "CA").map(|v| v.clamp(0.0, 1.0));
 
@@ -121,21 +129,20 @@ fn highlight(file: &PdfFile, dict: &PdfDict, out: &mut Vec<u8>) -> bool {
     push(out, &op);
     push(out, "\n");
     let mut any = false;
+    // Fill the actual (possibly rotated/sheared) quadrilateral of each marked
+    // run, not its axis-aligned bounding box — so rotated text highlights along
+    // the baseline. All sub-paths are accumulated into one `f` so overlapping
+    // quads composite once (important under the /Multiply blend, below).
     for q in &quads {
-        let (x0, y0, x1, y1) = quad_bounds(q);
-        if x1 <= x0 || y1 <= y0 {
+        let Some(oq) = oriented_quad(q) else {
             continue;
+        };
+        let c = oq.corners;
+        push(out, &format!("{} {} m\n", fmt(c[0].0), fmt(c[0].1)));
+        for p in &c[1..] {
+            push(out, &format!("{} {} l\n", fmt(p.0), fmt(p.1)));
         }
-        push(
-            out,
-            &format!(
-                "{} {} {} {} re\n",
-                fmt(x0),
-                fmt(y0),
-                fmt(x1 - x0),
-                fmt(y1 - y0)
-            ),
-        );
+        push(out, "h\n");
         any = true;
     }
     if any {
@@ -168,41 +175,50 @@ fn text_markup(file: &PdfFile, dict: &PdfDict, out: &mut Vec<u8>, kind: Markup) 
     // annotation (mirrors `ink`'s shared budget).
     let mut squiggle_budget = MAX_POLY_POINTS;
     for q in &quads {
-        let (x0, y0, x1, y1) = quad_bounds(q);
-        if x1 <= x0 {
+        // Work in the quad's own baseline frame so the mark follows rotated /
+        // skewed text. `up` runs from the baseline (bottom) edge to the top
+        // edge; its length is the run height.
+        let Some(oq) = oriented_quad(q) else {
+            continue;
+        };
+        let h = norm(oq.up);
+        if h <= 0.0 {
             continue;
         }
-        let h = (y1 - y0).max(0.0);
         let lw = (h * 0.06).clamp(0.4, 4.0);
         push(out, &format!("{} w\n", fmt(lw)));
+        // A point on the line at fraction `frac` of the height above the bottom.
+        let along = |p: (f64, f64), frac: f64| (p.0 + oq.up.0 * frac, p.1 + oq.up.1 * frac);
         match kind {
-            Markup::Underline => {
-                let y = y0 + h * 0.12;
-                push(
-                    out,
-                    &format!("{} {} m {} {} l S\n", fmt(x0), fmt(y), fmt(x1), fmt(y)),
-                );
-            }
-            Markup::StrikeOut => {
-                let y = y0 + h * 0.45;
-                push(
-                    out,
-                    &format!("{} {} m {} {} l S\n", fmt(x0), fmt(y), fmt(x1), fmt(y)),
-                );
-            }
+            Markup::Underline => emit_seg(out, along(oq.b0, 0.12), along(oq.b1, 0.12)),
+            Markup::StrikeOut => emit_seg(out, along(oq.b0, 0.45), along(oq.b1, 0.45)),
             Markup::Squiggly => {
                 if squiggle_budget == 0 {
                     break;
                 }
                 let amp = (h * 0.08).clamp(0.6, 2.5);
                 let cap = squiggle_budget.min(MAX_SQUIGGLE_SEGMENTS);
-                let used = squiggle(out, x0, x1, y0 + amp, amp, cap);
+                let used = squiggle(out, &oq, amp, cap);
                 squiggle_budget = squiggle_budget.saturating_sub(used);
             }
         }
         any = true;
     }
     any
+}
+
+/// Emit a single stroked segment `a → b`.
+fn emit_seg(out: &mut Vec<u8>, a: (f64, f64), b: (f64, f64)) {
+    push(
+        out,
+        &format!(
+            "{} {} m {} {} l S\n",
+            fmt(a.0),
+            fmt(a.1),
+            fmt(b.0),
+            fmt(b.1)
+        ),
+    );
 }
 
 fn square(file: &PdfFile, dict: &PdfDict, rect: Rect, out: &mut Vec<u8>) -> bool {
@@ -260,16 +276,23 @@ fn line(file: &PdfFile, dict: &PdfDict, out: &mut Vec<u8>) -> bool {
     push(out, &op);
     push(out, "\n");
     push(out, &format!("{} w 1 J\n", fmt(bw)));
+    let (a, b) = ((l[0], l[1]), (l[2], l[3]));
     push(
         out,
         &format!(
             "{} {} m {} {} l S\n",
-            fmt(l[0]),
-            fmt(l[1]),
-            fmt(l[2]),
-            fmt(l[3])
+            fmt(a.0),
+            fmt(a.1),
+            fmt(b.0),
+            fmt(b.1)
         ),
     );
+    // Line-ending styles (/LE [start end]); a closed head is filled with the
+    // interior colour /IC when present, else left hollow (stroke only).
+    let (le_start, le_end) = read_line_endings(file, dict);
+    let ic = read_color(file, dict, "IC");
+    emit_line_ending(out, a, sub(b, a), le_start, bw, &ic);
+    emit_line_ending(out, b, sub(a, b), le_end, bw, &ic);
     true
 }
 
@@ -300,6 +323,17 @@ fn polyline(file: &PdfFile, dict: &PdfDict, out: &mut Vec<u8>, closed: bool) -> 
     }
     push(out, paint_op(fill.is_some(), stroke.is_some()));
     push(out, "\n");
+    // An open PolyLine carries line-ending styles at its first and last
+    // vertices (a closed Polygon has no free ends).
+    if !closed && n >= 2 {
+        let (le_start, le_end) = read_line_endings(file, dict);
+        let pt = |i: usize| (v[2 * i], v[2 * i + 1]);
+        let (p0, p1) = (pt(0), pt(1));
+        let (pl, pl_prev) = (pt(n - 1), pt(n - 2));
+        let ic = read_color(file, dict, "IC");
+        emit_line_ending(out, p0, sub(p1, p0), le_start, bw, &ic);
+        emit_line_ending(out, pl, sub(pl_prev, pl), le_end, bw, &ic);
+    }
     true
 }
 
@@ -373,6 +407,401 @@ fn link(file: &PdfFile, dict: &PdfDict, rect: Rect, out: &mut Vec<u8>) -> bool {
         ),
     );
     true
+}
+
+// ---------------------------------------------------------------------------
+// FreeText (12.5.6.6) — wrapped text drawn directly on the page
+// ---------------------------------------------------------------------------
+
+/// Build a generated appearance for a `FreeText` annotation with no `/AP`:
+/// `/Contents` laid out per `/DA` (font / size / colour) and `/Q`, an optional
+/// `/C` background, an optional border, and an optional `/CL` callout line with
+/// an `/LE` ending. Text layout reuses the AcroForm engine in [`crate::forms`].
+fn free_text(file: &PdfFile, dict: &PdfDict, rect: Rect) -> Option<GeneratedAppearance> {
+    let (w, h) = (rect.width(), rect.height());
+    if w <= 1.0 || h <= 1.0 {
+        return None;
+    }
+
+    // /RD = [left top right bottom] insets between /Rect and the text region.
+    let (il, it, ir, ib) = match read_nums(file, dict, "RD") {
+        Some(rd) if rd.len() == 4 && rd.iter().all(|v| v.is_finite() && *v >= 0.0) => {
+            (rd[0], rd[1], rd[2], rd[3])
+        }
+        _ => (0.0, 0.0, 0.0, 0.0),
+    };
+
+    let background = read_color(file, dict, "C"); // FreeText /C = background colour
+    let border = explicit_border_width(file, dict).filter(|w| *w > 0.0);
+    // Cap pathological /Contents lengths before they reach the word-wrapper
+    // (shared with the widget generator).
+    let contents = read_text_string(file, dict, "Contents").map(|s| {
+        s.chars()
+            .take(crate::forms::MAX_APPEARANCE_TEXT_CHARS)
+            .collect::<String>()
+    });
+    let has_text = contents
+        .as_deref()
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    let callout = read_nums(file, dict, "CL")
+        .filter(|c| (c.len() == 4 || c.len() == 6) && c.iter().all(|v| v.is_finite()));
+
+    if !has_text && background.is_none() && border.is_none() && callout.is_none() {
+        return None;
+    }
+
+    // Font / DA resolution (reusing the AcroForm text engine).
+    let da = crate::forms::parse_da(&read_text_string(file, dict, "DA").unwrap_or_default());
+    let font_res_name = da
+        .font
+        .as_deref()
+        .filter(|n| crate::forms::is_safe_resource_name(n))
+        .unwrap_or("Helv")
+        .to_string();
+    let dr_fonts = read_dr_fonts(file, dict);
+    let base_font = crate::forms::resolve_base_font(dr_fonts.as_ref(), &font_res_name);
+
+    let ca = read_num(file, dict, "CA").map(|v| v.clamp(0.0, 1.0));
+    let gs = build_gs(false, ca);
+
+    let mut content = Vec::new();
+    push(&mut content, "q\n");
+    if gs.is_some() {
+        push(&mut content, "/GS0 gs\n");
+    }
+
+    // Callout line first, so the text box paints over its tail. Drawn in user
+    // space; for a conforming file /Rect encloses the callout (the painter
+    // clips the form to /Rect either way).
+    if let Some(cl) = &callout {
+        let (le_start, _) = read_line_endings(file, dict);
+        let lw = border.unwrap_or(1.0).max(0.5);
+        push(&mut content, "0 G\n");
+        push(&mut content, &format!("{} w 1 J 1 j\n", fmt(lw)));
+        push(&mut content, &format!("{} {} m\n", fmt(cl[0]), fmt(cl[1])));
+        let mut k = 2;
+        while k + 1 < cl.len() {
+            push(
+                &mut content,
+                &format!("{} {} l\n", fmt(cl[k]), fmt(cl[k + 1])),
+            );
+            k += 2;
+        }
+        push(&mut content, "S\n");
+        let (p0, p1) = ((cl[0], cl[1]), (cl[2], cl[3]));
+        emit_line_ending(&mut content, p0, sub(p1, p0), le_start, lw, &None);
+    }
+
+    // Background fill over the whole rect (user space).
+    if let Some(bg) = &background {
+        if let Some(opc) = color_op(bg, false) {
+            push(&mut content, &opc);
+            push(&mut content, "\n");
+            push(
+                &mut content,
+                &format!(
+                    "{} {} {} {} re f\n",
+                    fmt(rect.x0),
+                    fmt(rect.y0),
+                    fmt(w),
+                    fmt(h)
+                ),
+            );
+        }
+    }
+
+    // Border: a black stroke inset by half its width (no dedicated colour field
+    // exists for FreeText; black matches viewer convention).
+    if let Some(bw) = border {
+        let half = bw / 2.0;
+        let (bx0, by0) = (rect.x0 + half, rect.y0 + half);
+        let (bx1, by1) = (rect.x1 - half, rect.y1 - half);
+        if bx1 - bx0 > 0.0 && by1 - by0 > 0.0 {
+            push(&mut content, "0 G\n");
+            push(&mut content, &format!("{} w\n", fmt(bw)));
+            push(
+                &mut content,
+                &format!(
+                    "{} {} {} {} re S\n",
+                    fmt(bx0),
+                    fmt(by0),
+                    fmt(bx1 - bx0),
+                    fmt(by1 - by0)
+                ),
+            );
+        }
+    }
+
+    // Text, laid out in a local frame translated to the text region's
+    // lower-left corner (so the reused layout works in box-local coordinates),
+    // clipped to that region.
+    if has_text {
+        let text = contents.unwrap_or_default();
+        let q = read_num(file, dict, "Q").map(|v| v as i64).unwrap_or(0);
+        let iw = (w - il - ir).max(1.0);
+        let ih = (h - it - ib).max(1.0);
+        const PAD: f64 = 2.0;
+        push(&mut content, "q\n");
+        push(
+            &mut content,
+            &format!("1 0 0 1 {} {} cm\n", fmt(rect.x0 + il), fmt(rect.y0 + ib)),
+        );
+        push(
+            &mut content,
+            &format!("0 0 {} {} re W n\n", fmt(iw), fmt(ih)),
+        );
+        push(&mut content, "BT\n");
+        crate::forms::multiline_layout(
+            &mut content,
+            &text,
+            &da,
+            &base_font,
+            &font_res_name,
+            iw,
+            ih,
+            PAD,
+            q,
+        );
+        push(&mut content, "ET\n");
+        push(&mut content, "Q\n");
+    }
+    push(&mut content, "Q\n");
+
+    if content.len() > MAX_APPEARANCE_BYTES {
+        return None;
+    }
+
+    // Resources: a /Font dict (when text is drawn) plus the optional GS0.
+    let mut resources = if has_text {
+        crate::forms::build_resources(dr_fonts.as_ref(), &font_res_name)
+    } else {
+        PdfDict::new()
+    };
+    if let Some(gs) = gs {
+        let mut egs = PdfDict::new();
+        egs.insert(PdfName::new("GS0"), PdfObject::Dict(gs));
+        resources.insert(PdfName::new("ExtGState"), PdfObject::Dict(egs));
+    }
+
+    Some(GeneratedAppearance {
+        bbox: rect,
+        matrix: Matrix::identity(),
+        resources,
+        content,
+    })
+}
+
+/// A PDF text string (`/Contents`, `/DA`), resolving one level of indirection.
+fn read_text_string(file: &PdfFile, dict: &PdfDict, key: &str) -> Option<String> {
+    let obj = match dict.get(key)? {
+        PdfObject::Ref(r) => file.resolve(*r).ok()?,
+        other => other.clone(),
+    };
+    match obj {
+        PdfObject::String(s) => Some(crate::forms::pdf_string_to_unicode(s.as_bytes())),
+        _ => None,
+    }
+}
+
+/// The annotation's `/DR /Font` dictionary, if any.
+fn read_dr_fonts(file: &PdfFile, dict: &PdfDict) -> Option<PdfDict> {
+    let dr = read_subdict(file, dict, "DR")?;
+    match dr.get("Font")? {
+        PdfObject::Dict(d) => Some(d.clone()),
+        PdfObject::Ref(r) => file.resolve(*r).ok()?.as_dict().ok().cloned(),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Line endings (Table 176) — shared by Line, PolyLine and FreeText callouts
+// ---------------------------------------------------------------------------
+
+/// A line-ending style. Unrecognized / `None` names map to [`LineEnding::None`].
+#[derive(Clone, Copy, PartialEq)]
+enum LineEnding {
+    None,
+    OpenArrow,
+    ClosedArrow,
+    ROpenArrow,
+    RClosedArrow,
+    Butt,
+    Slash,
+    Square,
+    Circle,
+    Diamond,
+}
+
+fn parse_line_ending(name: &str) -> LineEnding {
+    match name {
+        "OpenArrow" => LineEnding::OpenArrow,
+        "ClosedArrow" => LineEnding::ClosedArrow,
+        "ROpenArrow" => LineEnding::ROpenArrow,
+        "RClosedArrow" => LineEnding::RClosedArrow,
+        "Butt" => LineEnding::Butt,
+        "Slash" => LineEnding::Slash,
+        "Square" => LineEnding::Square,
+        "Circle" => LineEnding::Circle,
+        "Diamond" => LineEnding::Diamond,
+        _ => LineEnding::None, // "None" and any unknown name
+    }
+}
+
+/// Read `/LE` as a `(start, end)` style pair. `/LE` is normally a two-name
+/// array `[start end]` (Line/PolyLine) but may be a bare single name (the
+/// FreeText callout ending); the second slot then defaults to `None`.
+fn read_line_endings(file: &PdfFile, dict: &PdfDict) -> (LineEnding, LineEnding) {
+    if let Some(arr) = read_array(file, dict, "LE") {
+        let style = |o: Option<&PdfObject>| {
+            o.and_then(|o| name_of(file, o))
+                .map_or(LineEnding::None, |s| parse_line_ending(&s))
+        };
+        return (style(arr.first()), style(arr.get(1)));
+    }
+    if let Some(name) = dict.get("LE").and_then(|o| name_of(file, o)) {
+        return (parse_line_ending(&name), LineEnding::None);
+    }
+    (LineEnding::None, LineEnding::None)
+}
+
+/// Resolve an object (possibly indirect) to a name string.
+fn name_of(file: &PdfFile, o: &PdfObject) -> Option<String> {
+    match o {
+        PdfObject::Name(n) => Some(n.0.clone()),
+        PdfObject::Ref(r) => match file.resolve(*r).ok()? {
+            PdfObject::Name(n) => Some(n.0),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Append a line-ending decoration at point `p`. `dir` points from `p` toward
+/// the line's interior; the decoration is sized from the line width `bw`. Closed
+/// heads (`ClosedArrow`, `Square`, `Circle`, `Diamond`) are filled with `fill`
+/// (the `/IC` interior colour) when present, else stroked hollow.
+fn emit_line_ending(
+    out: &mut Vec<u8>,
+    p: (f64, f64),
+    dir: (f64, f64),
+    style: LineEnding,
+    bw: f64,
+    fill: &Option<Vec<f64>>,
+) {
+    if style == LineEnding::None {
+        return;
+    }
+    let len = norm(dir);
+    if len <= 1e-6 {
+        return;
+    }
+    let (ux, uy) = (dir.0 / len, dir.1 / len); // unit, toward the line interior
+    let (wx, wy) = (-uy, ux); // unit, perpendicular
+    let lw = bw.max(0.5);
+    // Sizes scale with the line width but stay within a visible range.
+    let al = (lw * 3.0).clamp(6.0, 30.0); // arrowhead length
+    let aw = al * 0.5; // arrowhead half-width
+    let r = (lw * 1.5).clamp(3.0, 15.0); // block / circle radius
+    let pt = |x: f64, y: f64| format!("{} {}", fmt(x), fmt(y));
+
+    match style {
+        LineEnding::OpenArrow | LineEnding::ROpenArrow => {
+            // Reversed arrow opens away from the line (negative `s`).
+            let s = if style == LineEnding::ROpenArrow {
+                -1.0
+            } else {
+                1.0
+            };
+            let (bx, by) = (p.0 + s * al * ux, p.1 + s * al * uy);
+            push(
+                out,
+                &format!(
+                    "{} m {} l {} l S\n",
+                    pt(bx + aw * wx, by + aw * wy),
+                    pt(p.0, p.1),
+                    pt(bx - aw * wx, by - aw * wy)
+                ),
+            );
+        }
+        LineEnding::ClosedArrow | LineEnding::RClosedArrow => {
+            let s = if style == LineEnding::RClosedArrow {
+                -1.0
+            } else {
+                1.0
+            };
+            let (bx, by) = (p.0 + s * al * ux, p.1 + s * al * uy);
+            let path = format!(
+                "{} m {} l {} l h\n",
+                pt(p.0, p.1),
+                pt(bx + aw * wx, by + aw * wy),
+                pt(bx - aw * wx, by - aw * wy)
+            );
+            paint_closed(out, path.as_bytes(), fill);
+        }
+        LineEnding::Butt => emit_seg(
+            out,
+            (p.0 + r * wx, p.1 + r * wy),
+            (p.0 - r * wx, p.1 - r * wy),
+        ),
+        LineEnding::Slash => {
+            // A short segment at 60° to the line through `p`.
+            const COS60: f64 = 0.5;
+            const SIN60: f64 = 0.866_025_403_784_438_6;
+            let (dx, dy) = (ux * COS60 - uy * SIN60, ux * SIN60 + uy * COS60);
+            emit_seg(
+                out,
+                (p.0 + r * dx, p.1 + r * dy),
+                (p.0 - r * dx, p.1 - r * dy),
+            );
+        }
+        LineEnding::Square => {
+            let path = format!(
+                "{} m {} l {} l {} l h\n",
+                pt(p.0 + r * ux + r * wx, p.1 + r * uy + r * wy),
+                pt(p.0 + r * ux - r * wx, p.1 + r * uy - r * wy),
+                pt(p.0 - r * ux - r * wx, p.1 - r * uy - r * wy),
+                pt(p.0 - r * ux + r * wx, p.1 - r * uy + r * wy)
+            );
+            paint_closed(out, path.as_bytes(), fill);
+        }
+        LineEnding::Diamond => {
+            let path = format!(
+                "{} m {} l {} l {} l h\n",
+                pt(p.0 + r * ux, p.1 + r * uy),
+                pt(p.0 + r * wx, p.1 + r * wy),
+                pt(p.0 - r * ux, p.1 - r * uy),
+                pt(p.0 - r * wx, p.1 - r * wy)
+            );
+            paint_closed(out, path.as_bytes(), fill);
+        }
+        LineEnding::Circle => {
+            // `push_ellipse` writes only ASCII (fmt() numbers + ` m`/` c`/`h`),
+            // so the bytes go straight to `paint_closed` — no UTF-8 round-trip.
+            let mut path = Vec::new();
+            push_ellipse(&mut path, Rect::new(p.0 - r, p.1 - r, p.0 + r, p.1 + r));
+            paint_closed(out, &path, fill);
+        }
+        LineEnding::None => {}
+    }
+}
+
+/// Paint a constructed closed path: fill with `fill` (then stroke the outline)
+/// when an interior colour is given, else stroke only. The fill colour is set
+/// *before* the path so colour operators never sit between path construction
+/// and painting.
+fn paint_closed(out: &mut Vec<u8>, path: &[u8], fill: &Option<Vec<f64>>) {
+    if let Some(c) = fill {
+        if let Some(op) = color_op(c, false) {
+            push(out, &op);
+            push(out, "\n");
+            out.extend_from_slice(path);
+            push(out, "B\n"); // fill + stroke
+            return;
+        }
+    }
+    out.extend_from_slice(path);
+    push(out, "S\n"); // hollow: stroke the outline only
 }
 
 // ---------------------------------------------------------------------------
@@ -455,19 +884,32 @@ fn push_ellipse(out: &mut Vec<u8>, r: Rect) {
     push(out, "h\n");
 }
 
-/// Append a triangle-wave squiggle from `x0` to `x1` oscillating above `y`,
-/// then stroke it. Emits at most `max_seg` segments; returns the count emitted
-/// (the caller decrements a shared budget).
-fn squiggle(out: &mut Vec<u8>, x0: f64, x1: f64, y: f64, amp: f64, max_seg: usize) -> usize {
-    let w = x1 - x0;
+/// Append a triangle-wave squiggle along the quad's baseline, oscillating
+/// toward the top edge by `amp`, then stroke it. Works in the quad's own frame
+/// so it follows rotated/skewed text. Emits at most `max_seg` segments and
+/// returns the count emitted (the caller decrements a shared budget).
+fn squiggle(out: &mut Vec<u8>, oq: &OrientedQuad, amp: f64, max_seg: usize) -> usize {
+    let h = norm(oq.up);
+    if h <= 0.0 {
+        return 0;
+    }
+    // Unit vectors: `u` toward the top edge, `t` along the baseline (b0 → b1).
+    let (ux, uy) = (oq.up.0 / h, oq.up.1 / h);
+    let (tx, ty) = (oq.b1.0 - oq.b0.0, oq.b1.1 - oq.b0.1);
+    let w = (tx * tx + ty * ty).sqrt();
     let period = (amp * 2.0).max(2.0);
     let cap = max_seg.max(1) as i64;
     let n = ((w / period).ceil() as i64).clamp(1, cap);
-    push(out, &format!("{} {} m\n", fmt(x0), fmt(y)));
+    // The wave rides a baseline lifted `amp` above the bottom edge, peaking a
+    // further `amp` toward the top (matching the old axis-aligned amplitude).
+    let base = (oq.b0.0 + ux * amp, oq.b0.1 + uy * amp);
+    push(out, &format!("{} {} m\n", fmt(base.0), fmt(base.1)));
     for i in 1..=n {
-        let x = x0 + (i as f64) * w / (n as f64);
-        let yy = if i % 2 == 1 { y + amp } else { y };
-        push(out, &format!("{} {} l\n", fmt(x), fmt(yy)));
+        let f = i as f64 / n as f64;
+        let peak = if i % 2 == 1 { amp } else { 0.0 };
+        let x = base.0 + tx * f + ux * peak;
+        let y = base.1 + ty * f + uy * peak;
+        push(out, &format!("{} {} l\n", fmt(x), fmt(y)));
     }
     push(out, "S\n");
     n as usize
@@ -625,13 +1067,88 @@ fn read_subdict(file: &PdfFile, dict: &PdfDict, key: &str) -> Option<PdfDict> {
 // Pure helpers
 // ---------------------------------------------------------------------------
 
-/// The axis-aligned bounds of a quad's four corners (robust to point ordering).
-fn quad_bounds(q: &[f64; 8]) -> (f64, f64, f64, f64) {
-    let xs = [q[0], q[2], q[4], q[6]];
-    let ys = [q[1], q[3], q[5], q[7]];
-    let min = |a: &[f64; 4]| a.iter().cloned().fold(f64::INFINITY, f64::min);
-    let max = |a: &[f64; 4]| a.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    (min(&xs), min(&ys), max(&xs), max(&ys))
+/// Euclidean length of a 2-vector.
+fn norm(v: (f64, f64)) -> f64 {
+    (v.0 * v.0 + v.1 * v.1).sqrt()
+}
+
+/// `a - b` as a 2-vector (used as a direction).
+fn sub(a: (f64, f64), b: (f64, f64)) -> (f64, f64) {
+    (a.0 - b.0, a.1 - b.1)
+}
+
+/// A `/QuadPoints` quadrilateral resolved into a baseline-oriented frame,
+/// robust to point order and to page rotation/skew. `corners` are in convex
+/// counter-clockwise order (for filling a `Highlight`); `b0`/`b1` are the
+/// endpoints of the baseline (bottom) edge and `up` is the vector from the
+/// bottom edge to the top edge — its length is the run height — used to place
+/// underline / strike-out / squiggle marks parallel to the baseline.
+#[derive(Debug)]
+struct OrientedQuad {
+    corners: [(f64, f64); 4],
+    b0: (f64, f64),
+    b1: (f64, f64),
+    up: (f64, f64),
+}
+
+/// Resolve one `/QuadPoints` quad (8 numbers) into an [`OrientedQuad`], or
+/// `None` when the four points are non-finite or degenerate (collinear / zero
+/// area).
+fn oriented_quad(q: &[f64; 8]) -> Option<OrientedQuad> {
+    let pts = [(q[0], q[1]), (q[2], q[3]), (q[4], q[5]), (q[6], q[7])];
+    if pts.iter().any(|p| !(p.0.is_finite() && p.1.is_finite())) {
+        return None;
+    }
+    // Convex order: sort the four corners by angle about their centroid. This
+    // turns either common /QuadPoints ordering (Acrobat's TL,TR,BL,BR or the
+    // spec's counter-clockwise order) into a simple, non-self-intersecting
+    // polygon — and the producer's exact ordering no longer matters.
+    let cx = pts.iter().map(|p| p.0).sum::<f64>() / 4.0;
+    let cy = pts.iter().map(|p| p.1).sum::<f64>() / 4.0;
+    let mut c = pts;
+    c.sort_by(|a, b| {
+        (a.1 - cy)
+            .atan2(a.0 - cx)
+            .partial_cmp(&(b.1 - cy).atan2(b.0 - cx))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    // Reject a degenerate quad (shoelace area ≈ 0).
+    let area = 0.5
+        * (c[0].0 * c[1].1 - c[1].0 * c[0].1 + c[1].0 * c[2].1 - c[2].0 * c[1].1 + c[2].0 * c[3].1
+            - c[3].0 * c[2].1
+            + c[3].0 * c[0].1
+            - c[0].0 * c[3].1)
+            .abs();
+    if area < 1e-6 {
+        return None;
+    }
+    // The two baseline-parallel edges are the longer opposing pair: either
+    // (c0-c1, c2-c3) or (c1-c2, c3-c0).
+    let edge = |a: (f64, f64), b: (f64, f64)| norm((a.0 - b.0, a.1 - b.1));
+    let mid = |a: (f64, f64), b: (f64, f64)| ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0);
+    let (long0, long1) =
+        if edge(c[0], c[1]) + edge(c[2], c[3]) >= edge(c[1], c[2]) + edge(c[3], c[0]) {
+            ((c[0], c[1]), (c[2], c[3]))
+        } else {
+            ((c[1], c[2]), (c[3], c[0]))
+        };
+    let (m0, m1) = (mid(long0.0, long0.1), mid(long1.0, long1.1));
+    // Bottom edge = the long edge with the lower midpoint (page y grows upward,
+    // so "lower on the page" = smaller y). Correct for text rotated within
+    // (-90°, 90°); a fully inverted run is vanishingly rare and would only shift
+    // an underline to the opposite long edge (the fill stays correct).
+    let (bottom, top_mid) = if m0.1 <= m1.1 {
+        (long0, m1)
+    } else {
+        (long1, m0)
+    };
+    let bottom_mid = mid(bottom.0, bottom.1);
+    Some(OrientedQuad {
+        corners: c,
+        b0: bottom.0,
+        b1: bottom.1,
+        up: (top_mid.0 - bottom_mid.0, top_mid.1 - bottom_mid.1),
+    })
 }
 
 /// A colour-setting operator: `g`/`rg`/`k` for fill, `G`/`RG`/`K` for stroke.
@@ -669,12 +1186,54 @@ mod tests {
     use crate::PdfDocument;
 
     #[test]
-    fn quad_bounds_ignores_point_order() {
-        // Acrobat order (TL, TR, BL, BR) and a rotated order give the same box.
-        let acrobat = [10.0, 20.0, 30.0, 20.0, 10.0, 12.0, 30.0, 12.0];
-        assert_eq!(quad_bounds(&acrobat), (10.0, 12.0, 30.0, 20.0));
-        let ccw = [10.0, 12.0, 30.0, 12.0, 30.0, 20.0, 10.0, 20.0];
-        assert_eq!(quad_bounds(&ccw), (10.0, 12.0, 30.0, 20.0));
+    fn oriented_quad_finds_baseline_regardless_of_point_order() {
+        // An axis-aligned run, 100 wide × 20 tall, bottom edge at y=12.
+        // Acrobat order (TL, TR, BL, BR) and the spec's CCW order must yield the
+        // same baseline edge and the same upward vector.
+        let approx = |a: f64, b: f64| (a - b).abs() < 1e-6;
+        for q in [
+            [10.0, 32.0, 110.0, 32.0, 10.0, 12.0, 110.0, 12.0], // Acrobat order
+            [10.0, 12.0, 110.0, 12.0, 110.0, 32.0, 10.0, 32.0], // CCW order
+        ] {
+            let oq = oriented_quad(&q).expect("non-degenerate");
+            // Bottom edge endpoints have y = 12 (the lower long edge).
+            assert!(approx(oq.b0.1, 12.0) && approx(oq.b1.1, 12.0), "{oq:?}");
+            // `up` points straight up by the run height (20).
+            assert!(approx(oq.up.0, 0.0) && approx(oq.up.1, 20.0), "{oq:?}");
+        }
+    }
+
+    #[test]
+    fn oriented_quad_rejects_degenerate() {
+        // Four collinear points (zero area).
+        assert!(oriented_quad(&[0.0, 0.0, 1.0, 0.0, 2.0, 0.0, 3.0, 0.0]).is_none());
+        // A non-finite coordinate.
+        assert!(oriented_quad(&[0.0, 0.0, f64::NAN, 0.0, 1.0, 1.0, 0.0, 1.0]).is_none());
+    }
+
+    #[test]
+    fn oriented_quad_tracks_rotation() {
+        // The axis-aligned run rotated 30° CCW about the origin. The baseline
+        // frame must rotate with it: the height stays 20 and the up vector is
+        // the original (0, 20) rotated 30° → (-10, 17.3205…).
+        let base = [10.0, 32.0, 110.0, 32.0, 10.0, 12.0, 110.0, 12.0];
+        let (sin, cos) = 30.0_f64.to_radians().sin_cos();
+        let mut rot = [0.0; 8];
+        for i in 0..4 {
+            let (x, y) = (base[2 * i], base[2 * i + 1]);
+            rot[2 * i] = x * cos - y * sin;
+            rot[2 * i + 1] = x * sin + y * cos;
+        }
+        let oq = oriented_quad(&rot).expect("non-degenerate");
+        assert!(
+            (norm(oq.up) - 20.0).abs() < 1e-6,
+            "height preserved: {oq:?}"
+        );
+        assert!((oq.up.0 - (-10.0)).abs() < 1e-6, "up.x: {oq:?}");
+        assert!(
+            (oq.up.1 - 17.320_508_075_688_775).abs() < 1e-6,
+            "up.y: {oq:?}"
+        );
     }
 
     #[test]
@@ -725,7 +1284,7 @@ mod tests {
         let s = String::from_utf8_lossy(&gen.content);
         assert!(s.contains("/GS0 gs"), "uses the blend ExtGState: {s}");
         assert!(s.contains("1.000 1.000 0.000 rg"), "yellow fill: {s}");
-        assert!(s.contains(" re"), "fills a rectangle: {s}");
+        assert!(s.contains("h\nf"), "closes and fills the quad polygon: {s}");
         // The ExtGState carries Multiply.
         let egs = gen
             .resources
@@ -887,5 +1446,143 @@ mod tests {
                 gen.content.len()
             );
         }
+    }
+
+    #[test]
+    fn rotated_highlight_fills_oriented_polygon() {
+        // A 45°-ish skewed quad: the fill must be a closed polygon through the
+        // four corners, never an axis-aligned `re`.
+        let a = annot_of(
+            "<< /Type /Annot /Subtype /Highlight /Rect [10 10 120 120] \
+             /QuadPoints [20 100 100 60 10 40 90 0] /C [1 1 0] >>",
+        )
+        .expect("annotation");
+        let gen = a.generated.as_ref().expect("gen");
+        let s = String::from_utf8_lossy(&gen.content);
+        assert!(!s.contains(" re"), "no axis-aligned rectangle: {s}");
+        assert!(
+            s.contains(" m\n") && s.contains(" l\n"),
+            "polygon path: {s}"
+        );
+        assert!(s.contains("h\nf"), "closed and filled: {s}");
+    }
+
+    #[test]
+    fn line_open_arrow_strokes_a_head() {
+        let a = annot_of(
+            "<< /Type /Annot /Subtype /Line /Rect [0 0 200 200] /L [20 20 180 180] \
+             /C [0 0 0] /LE [/OpenArrow /None] >>",
+        )
+        .expect("annotation");
+        let gen = a.generated.as_ref().expect("gen");
+        let s = String::from_utf8_lossy(&gen.content);
+        assert!(s.contains("20.000 20.000 m"), "draws the line: {s}");
+        // The arrowhead's tip is the first point, emitted as a line-to in the
+        // open `bl m tip l br l S` path — unique to the ending.
+        assert!(
+            s.contains("20.000 20.000 l"),
+            "open arrowhead at the start: {s}"
+        );
+    }
+
+    #[test]
+    fn line_closed_arrow_fills_with_interior_colour() {
+        let a = annot_of(
+            "<< /Type /Annot /Subtype /Line /Rect [0 0 200 200] /L [20 20 180 180] \
+             /C [0 0 0] /IC [1 0 0] /LE [/None /ClosedArrow] >>",
+        )
+        .expect("annotation");
+        let gen = a.generated.as_ref().expect("gen");
+        let s = String::from_utf8_lossy(&gen.content);
+        // Closed arrow at the end point, filled with /IC then stroked (`B`).
+        assert!(
+            s.contains("180.000 180.000 m"),
+            "closed arrowhead at the end: {s}"
+        );
+        assert!(
+            s.contains("1.000 0.000 0.000 rg"),
+            "interior fill colour: {s}"
+        );
+        assert!(s.contains("B\n"), "fill + stroke: {s}");
+    }
+
+    #[test]
+    fn polyline_carries_line_endings() {
+        let a = annot_of(
+            "<< /Type /Annot /Subtype /PolyLine /Rect [0 0 200 200] \
+             /Vertices [20 20 100 20 100 100] /C [0 0 0] /LE [/Diamond /Butt] >>",
+        )
+        .expect("annotation");
+        let gen = a.generated.as_ref().expect("gen");
+        let s = String::from_utf8_lossy(&gen.content);
+        // The polyline path itself, plus a diamond at the first vertex (closed
+        // path → stroked hollow) and a butt cap at the last.
+        assert!(s.contains("20.000 20.000 m"), "polyline drawn: {s}");
+        assert!(
+            s.contains("20.000 23.000 l"),
+            "diamond at the first vertex: {s}"
+        );
+        assert!(
+            s.contains("103.000 100.000 m 97.000 100.000 l S"),
+            "butt cap at the last vertex: {s}"
+        );
+    }
+
+    #[test]
+    fn freetext_draws_background_and_text() {
+        let a = annot_of(
+            "<< /Type /Annot /Subtype /FreeText /Rect [40 40 190 140] \
+             /Contents (Hello world) /DA (/Helv 12 Tf 0 0 1 rg) /C [1 1 0] >>",
+        )
+        .expect("annotation");
+        assert!(
+            a.is_viewable(),
+            "FreeText with a generated appearance is viewable"
+        );
+        let gen = a.generated.as_ref().expect("gen");
+        let s = String::from_utf8_lossy(&gen.content);
+        assert!(s.contains("1.000 1.000 0.000 rg"), "yellow background: {s}");
+        assert!(s.contains("re f"), "fills the rect: {s}");
+        assert!(
+            s.contains("1 0 0 1 40.000 40.000 cm"),
+            "translates to the rect: {s}"
+        );
+        assert!(s.contains("/Helv 12.00 Tf"), "DA font/size: {s}");
+        assert!(s.contains("0.0000 0.0000 1.0000 rg"), "DA text colour: {s}");
+        assert!(s.contains("(Hello world) Tj"), "draws the text: {s}");
+        assert!(gen.resources.get("Font").is_some(), "font resource present");
+    }
+
+    #[test]
+    fn freetext_callout_draws_polyline_and_arrow() {
+        let a = annot_of(
+            "<< /Type /Annot /Subtype /FreeText /Rect [40 40 190 140] /Contents (note) \
+             /DA (/Helv 10 Tf 0 g) /CL [50 60 120 120] /LE /OpenArrow >>",
+        )
+        .expect("annotation");
+        let gen = a.generated.as_ref().expect("gen");
+        let s = String::from_utf8_lossy(&gen.content);
+        assert!(
+            s.contains("50.000 60.000 m"),
+            "callout starts at /CL[0]: {s}"
+        );
+        assert!(
+            s.contains("120.000 120.000 l"),
+            "callout reaches the box: {s}"
+        );
+        assert!(
+            s.contains("50.000 60.000 l"),
+            "open arrow tip at the callout start: {s}"
+        );
+        assert!(s.contains("(note) Tj"), "draws the text: {s}");
+    }
+
+    #[test]
+    fn freetext_with_nothing_to_draw_generates_nothing() {
+        // No /Contents, /C, border or /CL → nothing to synthesize.
+        let a = annot_of("<< /Type /Annot /Subtype /FreeText /Rect [40 40 190 140] >>")
+            .expect("annotation");
+        assert!(a.generated.is_none(), "empty FreeText draws nothing");
+        assert!(!a.is_viewable());
     }
 }

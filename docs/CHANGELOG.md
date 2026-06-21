@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-### Markup & geometric annotation appearances (Highlight / Underline / lines / shapes)
+### Markup, geometric & FreeText annotation appearances
 
 Annotations that ship **no `/AP` stream** are now drawn by synthesizing an
 appearance from their geometry, the same way interactive form fields are. A
@@ -13,16 +13,35 @@ XObject replayed through the existing `/AP` path — **both the CPU and wgpu
 backends render them with no backend changes** (GPU↔CPU agreement 0.198% on the
 mixed-markup acceptance page).
 
-- **Text markup** (`zpdf-document/src/annot_appearance.rs`, new): `Highlight`,
-  `Underline`, `StrikeOut`, and `Squiggly` are drawn from `/QuadPoints`.
-  Highlights composite with the **Multiply** blend mode (via a generated
-  `/ExtGState`), so the marked text shows through — yellow over white, dark over
-  black — matching Acrobat's generated appearance. Underline/strikeout/squiggly
-  stroke along each quad (default black when `/C` is absent).
+- **Text markup** (`zpdf-document/src/annot_appearance.rs`): `Highlight`,
+  `Underline`, `StrikeOut`, and `Squiggly` are drawn from `/QuadPoints`,
+  following each quad's **true baseline orientation** rather than its
+  axis-aligned bounding box — so **rotated / skewed** text markup lies along the
+  baseline. Each quad is resolved (centroid-angle sort → convex order, longer
+  edge pair → baseline, midpoint comparison → which edge is the bottom) into a
+  baseline frame robust to either common `/QuadPoints` point ordering (Acrobat's
+  `TL TR BL BR` or the spec's counter-clockwise order). Highlights composite
+  with the **Multiply** blend mode (via a generated `/ExtGState`), so the marked
+  text shows through — yellow over white, dark over black — matching Acrobat.
+  Underline/strikeout/squiggly stroke along the oriented quad (default black when
+  `/C` is absent).
 - **Geometric markup**: `Square` and `Circle` (interior `/IC` fill + `/C`
   border, inset by `/RD` and half the `/BS`/`/Border` width; the circle is four
   Bézier arcs), `Line` (`/L`), `Polygon`/`PolyLine` (`/Vertices`; polygons fill
   `/IC`), and `Ink` (`/InkList`, round caps/joins).
+- **Line-ending styles** (`/LE`, PDF Table 176) on `Line` and `PolyLine`:
+  `OpenArrow`, `ClosedArrow`, their reversed `R…` variants, `Butt`, `Slash`,
+  `Square`, `Circle`, `Diamond` (and `None`). Each ending is oriented along the
+  line direction and sized from the border width; a closed head fills with the
+  interior colour `/IC` when present (else stroked hollow). `/LE` is read as a
+  two-name array (the second slot defaults to `None`) or a bare single name.
+- **FreeText** (`/Subtype /FreeText`, §12.5.6.6): `/Contents` is laid out per
+  `/DA` (font / size / colour) and `/Q` quadding — reusing the AcroForm
+  text-layout engine — with an optional `/C` background, an optional border, and
+  an optional `/CL` callout line carrying an `/LE` arrow. The text is wrapped in
+  a `q … cm … BT … ET Q` block that translates into a box-local frame (and clips
+  to the text region inset by `/RD`); `/Contents` is capped at 50 000 chars
+  against adversarial input.
 - **Conservative `Link` border**: drawn only when the file gives **both** an
   explicit `/C` colour **and** an explicit non-zero border width — no width-1
   default, so ordinary hyperlinks are not boxed (matching mainstream viewers).
@@ -32,17 +51,20 @@ mixed-markup acceptance page).
   ExtGState constant alpha.
 - **Non-regressing by construction**: generation fires only for these subtypes
   when the annotation has **no** usable `/AP` (a producer appearance is always
-  kept); `Widget`/`Popup`/`Text`/`FreeText`/`Stamp` and hidden/no-view
-  annotations are untouched. Bounded against adversarial geometry — a 1 MiB
-  per-appearance byte ceiling, a shared Squiggly segment budget (so quad-count ×
-  segment-count cannot blow up), point/quad/ink caps, a ±1e7 coordinate clamp,
-  and an inverted-inset guard. The 618-PDF malformed corpus still renders with
-  **0 panics and 0 timeouts** (426 OK, unchanged).
-- Verified by 15 unit tests (field parsing, colour arities, the Multiply
-  appearance, transparent `/C []`, inverted-inset rejection, link border
-  policy, bounded Squiggly) plus 6 CPU end-to-end render tests (Multiply
-  highlight pixels, underline/square/line/polygon, hidden-annotation
-  suppression) and a GPU↔CPU acceptance comparison.
+  kept); `Widget`/`Popup`/`Text`/`Stamp` and hidden/no-view annotations are
+  untouched. Bounded against adversarial geometry — a 1 MiB per-appearance byte
+  ceiling, a shared Squiggly segment budget (so quad-count × segment-count cannot
+  blow up), point/quad/ink caps, a 50 000-char `/Contents` cap, a ±1e7 coordinate
+  clamp, and an inverted-inset guard. The 618-PDF malformed corpus still renders
+  with **0 panics and 0 timeouts** (426 OK, unchanged).
+- Verified by the appearance generator's unit tests (oriented-quad baseline
+  resolution including rotation and degeneracy rejection, the Multiply
+  appearance, line-ending arrowheads with `/IC` fill, FreeText background/text/
+  callout, transparent `/C []`, inverted-inset rejection, link-border policy,
+  bounded Squiggly) plus **9 CPU end-to-end render tests** (Multiply highlight,
+  oriented diamond highlight whose bbox corners stay clear, underline, square,
+  line, closed arrowhead fill, polygon, FreeText background + glyphs,
+  hidden-annotation suppression) and a GPU↔CPU acceptance comparison.
 
 ## 0.6.0 — interactive forms, passwords, mesh shadings & CJK/CMYK fidelity
 

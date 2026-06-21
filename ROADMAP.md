@@ -278,15 +278,22 @@ cargo run -p zpdf-render-wgpu --example viewer -- <file.pdf>   # 交互浏览器
       /AS 状态，Hidden/NoView 标志）
 - [x] Markup & 几何注释外观合成（无 /AP 时，`zpdf-document/src/annot_appearance.rs`）：
       文本标记 Highlight（/Multiply 混合，over 文字保留深色）/Underline/StrikeOut/Squiggly
-      （按 /QuadPoints 轴对齐包围盒）、几何 Square/Circle（/RD 内缩 + /BS//Border 边框 +
-      /IC 填充）/Line（/L）/Polygon//PolyLine（/Vertices）/Ink（/InkList）、保守 Link
-      边框（仅当显式 /C + 显式非零边框，避免给每个超链接画框）。/C 1/3/4 分量 → 设备
-      灰/RGB/CMYK；空 /C[] 按规范透明（不绘制）；/CA → ExtGState ca//CA。经既有
-      `GeneratedAppearance`→合成 form XObject 路径渲染，**双后端零改动**（GPU↔CPU 0.198%）。
+      （按 /QuadPoints 真实四边形定向：质心角排序取凸序 + 长边定基线 + up 向量，
+      旋转/倾斜文本沿基线绘制而非轴对齐包围盒）、几何 Square/Circle（/RD 内缩 +
+      /BS//Border 边框 + /IC 填充）/Line（/L）/Polygon//PolyLine（/Vertices）/Ink
+      （/InkList）、保守 Link 边框（仅当显式 /C + 显式非零边框，避免给每个超链接画框）。
+      /C 1/3/4 分量 → 设备灰/RGB/CMYK；空 /C[] 按规范透明（不绘制）；/CA → ExtGState ca//CA。
+      经既有 `GeneratedAppearance`→合成 form XObject 路径渲染，**双后端零改动**（GPU↔CPU 0.198%）。
       对抗性几何加固：字节上限（1 MiB）+ Squiggly 跨 quad 段预算 + 坐标钳制 ±1e7 +
       反相 inset 守护（618 失败语料 0 panic/0 timeout，OK 426 不变）
-- [ ] Text/FreeText/Stamp 图标外观；旋转/倾斜文本标记按真实四边形（当前轴对齐近似）；
-      Line /LE 端点（箭头等）
+- [x] Line/PolyLine /LE 端点样式（Table 176：OpenArrow/ClosedArrow/R 反向变体/Butt/
+      Slash/Square/Circle/Diamond/None）：沿线方向定向，按边宽缩放，闭合箭头用 /IC 填充
+      （无则空心描边）；端点几何与定向四边形共用 norm/sub 矢量助手
+- [x] FreeText 外观合成（12.5.6.6，`free_text`）：/Contents 按 /DA 字体/字号/颜色 + /Q
+      对齐换行（复用 `forms` 文本排版引擎），可选 /C 背景、可选边框、可选 /CL 标注线
+      （带 /LE 箭头）；正文经 `q … cm … BT … ET Q` 平移进框内局部坐标并裁剪；/Contents
+      限长 50k 字符防对抗
+- [ ] Text/Stamp 标准图标外观（注记/印章图标矢量；旋转/倾斜文本标记四边形已支持）
 - [x] Widget annotation (form fields)：Widget 经字段模型映射回所属字段；checkbox/radio
       保留 /AP 状态（/AS 缺失时回退 /V）
 - [x] AcroForm 字段解析（`zpdf-document/src/forms.rs`）：递归 /Fields + /Kids，完整

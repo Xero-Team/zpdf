@@ -391,6 +391,13 @@ fn parse_options(file: &PdfFile, dict: &PdfDict) -> Vec<(String, String)> {
 // Appearance generation
 // ---------------------------------------------------------------------------
 
+/// Cap on the number of characters laid out for any synthesized text
+/// appearance — no real field value or `FreeText` note is longer, and it bounds
+/// the word-wrap / measurement work against adversarial input. Shared by the
+/// widget generator here and the `FreeText` generator in
+/// [`crate::annot_appearance`].
+pub(crate) const MAX_APPEARANCE_TEXT_CHARS: usize = 50_000;
+
 /// A synthesized appearance stream for a widget the producer left without one
 /// (or that `/NeedAppearances` asks the viewer to regenerate). Mirrors a form
 /// XObject: a `/BBox`, `/Matrix`, `/Resources` and a content byte stream.
@@ -416,11 +423,10 @@ pub fn generate_widget_appearance(
     }
     // Cap pathological value lengths — no real field shows this much, and it
     // bounds the synthesized content size / measurement work.
-    const MAX_VALUE_CHARS: usize = 50_000;
     let text: String = field
         .display_value()?
         .chars()
-        .take(MAX_VALUE_CHARS)
+        .take(MAX_APPEARANCE_TEXT_CHARS)
         .collect();
     let rect = rect.normalize();
     let (w, h) = (rect.width(), rect.height());
@@ -558,7 +564,7 @@ fn single_line_layout(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn multiline_layout(
+pub(crate) fn multiline_layout(
     body: &mut Vec<u8>,
     text: &str,
     da: &DaInfo,
@@ -672,7 +678,7 @@ fn fmt_num(v: f64) -> String {
 
 /// A font resource name safe to emit as a content-stream `/Name` token and use
 /// as a resource-dict key (no delimiters, whitespace, or `(`/`)`).
-fn is_safe_resource_name(name: &str) -> bool {
+pub(crate) fn is_safe_resource_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
         && name
@@ -732,17 +738,19 @@ fn measure(text: &str, base_font: &str, size: f64) -> f64 {
     total
 }
 
-/// Parsed `/DA` default-appearance pieces we care about.
-struct DaInfo {
-    font: Option<String>,
-    size: f64,
+/// Parsed `/DA` default-appearance pieces we care about. Shared with the
+/// markup-annotation appearance generator ([`crate::annot_appearance`]), which
+/// reuses this whole text-layout engine for `FreeText` annotations.
+pub(crate) struct DaInfo {
+    pub(crate) font: Option<String>,
+    pub(crate) size: f64,
     /// A color-setting fragment (`0 g`, `1 0 0 rg`, …) ready to emit verbatim.
-    color_ops: String,
+    pub(crate) color_ops: String,
 }
 
 /// Extract the font resource name, size, and color operators from a `/DA`
 /// content fragment (e.g. `0 0 1 rg /Helv 12 Tf`).
-fn parse_da(da: &str) -> DaInfo {
+pub(crate) fn parse_da(da: &str) -> DaInfo {
     let mut font = None;
     let mut size: f64 = 0.0;
     let mut color = String::new();
@@ -820,7 +828,7 @@ fn da_color(operands: &[&str], n: usize, op: &str) -> Option<String> {
 /// Resolve a `/DA` font resource name to a base-font name for metrics: prefer
 /// the `/DR` font's `/BaseFont`, else map the conventional Acrobat resource
 /// name (`Helv`, `Cour`, …), else Helvetica.
-fn resolve_base_font(dr_fonts: Option<&PdfDict>, res_name: &str) -> String {
+pub(crate) fn resolve_base_font(dr_fonts: Option<&PdfDict>, res_name: &str) -> String {
     if let Some(dr) = dr_fonts {
         if let Some(PdfObject::Dict(fd)) = dr.get(res_name) {
             if let Ok(bf) = fd.get_name("BaseFont") {
@@ -855,7 +863,7 @@ fn strip_subset_prefix(name: &str) -> &str {
 
 /// Build the appearance `/Resources`: a `/Font` dict mapping the DA font name to
 /// the `/DR` font object (if any) or a synthesized standard Helvetica.
-fn build_resources(dr_fonts: Option<&PdfDict>, font_res_name: &str) -> PdfDict {
+pub(crate) fn build_resources(dr_fonts: Option<&PdfDict>, font_res_name: &str) -> PdfDict {
     let font_entry = dr_fonts
         .and_then(|dr| dr.get(font_res_name).cloned())
         .unwrap_or_else(|| PdfObject::Dict(helvetica_font_dict()));
@@ -1016,7 +1024,7 @@ fn int_value(file: &PdfFile, obj: Option<&PdfObject>) -> Option<i64> {
 
 /// Decode a PDF text string: UTF-16BE when it carries the `FE FF` BOM, else the
 /// bytes as PDFDocEncoding (approximated by Latin-1 for the common range).
-fn pdf_string_to_unicode(bytes: &[u8]) -> String {
+pub(crate) fn pdf_string_to_unicode(bytes: &[u8]) -> String {
     if bytes.len() >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF {
         let units: Vec<u16> = bytes[2..]
             .chunks_exact(2)

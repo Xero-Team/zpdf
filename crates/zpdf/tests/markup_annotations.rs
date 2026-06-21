@@ -191,6 +191,94 @@ fn polygon_fills_interior() {
     );
 }
 
+/// A rotated text-markup quad fills the actual (oriented) quadrilateral, not
+/// its axis-aligned bounding box. A diamond's bbox corners stay clear.
+#[test]
+fn rotated_highlight_fills_only_the_quad() {
+    let content: &[u8] = b"1 1 1 rg 0 0 200 200 re f";
+    // A square rotated 45° (a diamond) centred at (100,100): its corners sit at
+    // the midpoints of the [40,40,160,160] bounding box, so the bbox corners
+    // lie OUTSIDE the quad — the old bbox fill would have painted them yellow.
+    let annot: &[u8] = b"<< /Type /Annot /Subtype /Highlight /Rect [40 40 160 160] /F 4 \
+        /QuadPoints [100 160 160 100 40 100 100 40] /C [1 1 0] >>";
+    let page = render_with_annot(content, annot);
+
+    assert_near(
+        px(&page, 100.0, 100.0),
+        [255, 255, 0],
+        "diamond centre is yellow",
+    );
+    assert_near(
+        px(&page, 130.0, 100.0),
+        [255, 255, 0],
+        "inside the diamond is yellow",
+    );
+    assert_near(
+        px(&page, 48.0, 48.0),
+        [255, 255, 255],
+        "bbox corner outside the quad stays white",
+    );
+}
+
+/// A Line with a closed arrowhead fills the head at the endpoint with the
+/// interior colour (/IC).
+#[test]
+fn line_closed_arrowhead_fills_at_endpoint() {
+    let content: &[u8] = b"1 1 1 rg 0 0 200 200 re f";
+    let annot: &[u8] = b"<< /Type /Annot /Subtype /Line /Rect [20 80 180 120] /F 4 \
+        /L [40 100 160 100] /C [0 0 0] /IC [1 0 0] /LE [/None /ClosedArrow] /BS << /W 3 >> >>";
+    let page = render_with_annot(content, annot);
+
+    assert_near(px(&page, 80.0, 100.0), [0, 0, 0], "black line shaft");
+    assert_near(
+        px(&page, 155.0, 100.0),
+        [255, 0, 0],
+        "red filled arrowhead at the end",
+    );
+    assert_near(
+        px(&page, 80.0, 125.0),
+        [255, 255, 255],
+        "off the line is clear",
+    );
+}
+
+/// A FreeText annotation paints its /C background and renders /Contents as
+/// glyphs through the reused text-layout engine.
+#[test]
+fn freetext_paints_background_and_text() {
+    let content: &[u8] = b"1 1 1 rg 0 0 200 200 re f";
+    let annot: &[u8] = b"<< /Type /Annot /Subtype /FreeText /Rect [20 60 180 140] /F 4 \
+        /Contents (Hello) /DA (/Helv 36 Tf 0 0 0 rg) /C [1 1 0] >>";
+    let page = render_with_annot(content, annot);
+
+    // The yellow background fills the rect…
+    assert_near(
+        px(&page, 30.0, 70.0),
+        [255, 255, 0],
+        "yellow background near a corner",
+    );
+    assert_near(
+        px(&page, 195.0, 195.0),
+        [255, 255, 255],
+        "outside the rect is white",
+    );
+    // …and at least one dark glyph pixel appears in the text band.
+    let mut glyph = false;
+    let mut y = 60;
+    while y < 140 {
+        let mut x = 20;
+        while x < 180 {
+            let c = px(&page, x as f64, y as f64);
+            if c[0] < 128 && c[1] < 128 && c[2] < 128 {
+                glyph = true;
+            }
+            x += 2;
+        }
+        y += 2;
+    }
+    assert!(glyph, "FreeText rendered at least one glyph");
+}
+
 /// A hidden (/F 2) markup annotation with no /AP generates nothing visible.
 #[test]
 fn hidden_markup_is_not_painted() {
