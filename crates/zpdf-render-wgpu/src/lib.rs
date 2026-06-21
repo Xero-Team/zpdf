@@ -232,7 +232,7 @@ impl<'a> RenderBackend for WgpuRenderer<'a> {
                 let map = page.map;
                 let mask_ops = mask
                     .as_ref()
-                    .and_then(|m| build_mask_ops(&mut page.recorder, m, fonts, images, &map));
+                    .map(|m| build_mask_ops(&mut page.recorder, m, fonts, images, &map));
                 page.recorder.push_blend(*blend_mode, *alpha, mask_ops);
             }
             RenderCommand::PopBlendGroup => {
@@ -335,18 +335,19 @@ impl<'a> RenderBackend for WgpuRenderer<'a> {
                         tex_bgs.insert(image_id, image::upload_image_bind_group(ctx, img));
                     }
                 };
-            for op in &rec.ops {
-                match op {
-                    PageOp::Image { image_id, .. } => upload(*image_id, &mut tex_bgs),
-                    // Images inside a soft mask reference the same shared arena.
-                    PageOp::PushBlend { mask: Some(m), .. } => {
-                        for mop in &m.ops {
-                            if let PageOp::Image { image_id, .. } = mop {
-                                upload(*image_id, &mut tex_bgs);
-                            }
-                        }
+            // Walk every op, descending into soft masks at ANY nesting depth: a
+            // mask group may itself contain a masked group whose images are
+            // recorded into a sub-mask's `ops` (not the flat page op list), so a
+            // one-level scan would silently drop them at replay.
+            let mut stack: Vec<&[PageOp]> = vec![rec.ops.as_slice()];
+            while let Some(ops) = stack.pop() {
+                for op in ops {
+                    match op {
+                        PageOp::Image { image_id, .. } => upload(*image_id, &mut tex_bgs),
+                        // Images inside a soft mask reference the same shared arena.
+                        PageOp::PushBlend { mask: Some(m), .. } => stack.push(m.ops.as_slice()),
+                        _ => {}
                     }
-                    _ => {}
                 }
             }
         }
@@ -474,19 +475,21 @@ fn replay_ops(pass: &mut wgpu::RenderPass, ops: &[PageOp], res: &ReplayRes) {
 }
 
 /// Record a soft mask's [`zpdf_display_list::DisplayList`] into `rec` (geometry
-/// into the shared arena, ops collected separately by the caller). Returns
-/// whether everything was recordable: a nested transparency group inside the
-/// mask is unsupported, in which case the caller drops the mask (the group then
-/// renders unmasked rather than incorrectly masked).
+/// into the shared arena, ops collected separately by the caller). A transparency
+/// group nested inside the mask is recorded as a `PushBlend`/`PopBlend` pair (with
+/// its own sub-mask), so the mask group is composited through the same layered
+/// path as the page instead of being dropped. As on the page path, the group's
+/// `isolated`/`knockout` flags are not carried into [`record::PageOp::PushBlend`],
+/// so a nested knockout / non-isolated group is approximated as isolated source-
+/// over — the one residual vs the CPU oracle's full recursive sub-renderer.
 fn record_dl_commands(
     rec: &mut PageRecorder,
     dl: &zpdf_display_list::DisplayList,
     fonts: Option<&zpdf_font::FontCache>,
     images: Option<&zpdf_image::ImageCache>,
     map: &PageMap,
-) -> bool {
+) {
     use zpdf_display_list::Paint;
-    let mut supported = true;
     for cmd in &dl.commands {
         match cmd {
             RenderCommand::FillPath {
@@ -524,36 +527,50 @@ fn record_dl_commands(
             // Pattern fills (non-solid paint) are already expanded to clip+fill
             // by the interpreter, so a non-solid paint here is a rare no-op.
             RenderCommand::FillPath { .. } | RenderCommand::StrokePath { .. } => {}
-            // A nested group inside a mask is not supported on the GPU path.
-            RenderCommand::PushBlendGroup { .. } | RenderCommand::PopBlendGroup => {
-                supported = false;
+            // A transparency group nested inside the mask: build its sub-mask and
+            // record a blend group, recursively (sub-masks compose to any depth).
+            RenderCommand::PushBlendGroup {
+                blend_mode,
+                alpha,
+                mask,
+                ..
+            } => {
+                let sub = mask
+                    .as_ref()
+                    .map(|m| build_mask_ops(rec, m, fonts, images, map));
+                rec.push_blend(*blend_mode, *alpha, sub);
             }
+            RenderCommand::PopBlendGroup => rec.pop_blend(),
         }
     }
-    supported
 }
 
-/// Build the [`record::MaskOps`] for a group's soft mask, or `None` to render the
-/// group unmasked (mask had unsupported content, e.g. a nested group).
+/// Build the [`record::MaskOps`] for a group's soft mask: record its group content
+/// into the shared arena, pre-scale its page-space `offset` to device pixels, and
+/// carry the /TR transfer LUT. Nested groups inside the mask are recorded too, so
+/// the mask is always representable (no fall back to rendering the group unmasked).
 fn build_mask_ops(
     rec: &mut PageRecorder,
     mask: &zpdf_display_list::SoftMask,
     fonts: Option<&zpdf_font::FontCache>,
     images: Option<&zpdf_image::ImageCache>,
     map: &PageMap,
-) -> Option<record::MaskOps> {
-    let mut supported = true;
+) -> record::MaskOps {
     let ops = rec.record_subops(|r| {
-        supported = record_dl_commands(r, &mask.commands, fonts, images, map);
+        record_dl_commands(r, &mask.commands, fonts, images, map);
     });
-    if !supported {
-        return None;
-    }
-    Some(record::MaskOps {
+    // Page-space offset → device pixels; device Y grows downward (mirrors the
+    // CPU `shift_plane` deltas), so the Y component is negated.
+    let dx = (mask.offset.0 * map.scale).round() as i32;
+    let dy = (-mask.offset.1 * map.scale).round() as i32;
+    record::MaskOps {
         ops,
         kind: mask.kind,
         backdrop_luma: mask.backdrop_luma,
-    })
+        dx,
+        dy,
+        transfer: mask.transfer.clone(),
+    }
 }
 
 /// Stamp clip paths into the current pass's stencil (clip_write pipeline).
@@ -611,24 +628,28 @@ fn init_layer(
     stamp_clips(&mut pass, clips, res);
 }
 
-/// Multi-pass render for pages with transparency groups: a stack of offscreen
-/// layers, each composited onto its parent on PopBlendGroup. Layers come from a
-/// recycling [`blend::LayerPool`] so a page with hundreds of groups reuses a
-/// small working set instead of allocating (and never freeing) one full-page
-/// layer per group.
-fn render_layered(
+/// Composite an op list (which may contain `PushBlend`/`PopBlend`) onto `base`,
+/// returning the layer index holding the final result. `base` must already be
+/// acquired and initialized (cleared, clips stamped); it is never recycled here.
+///
+/// Shared by the page render (base = the page background) and a soft mask's group
+/// (base = the /BC backdrop) so a transparency group nested inside a mask is
+/// composited identically to one on the page. Recurses through [`apply_soft_mask`]
+/// for sub-masks; `pool`, `encoder`, and the `keep_*` lifetimes are threaded
+/// through so every layer/bind-group outlives the single submit.
+#[allow(clippy::too_many_arguments)]
+fn composite_into(
     ctx: &GpuContext,
-    target: &PageTarget,
-    page_clear: wgpu::Color,
+    encoder: &mut wgpu::CommandEncoder,
+    pool: &mut blend::LayerPool,
+    base: usize,
     ops: &[PageOp],
     res: &ReplayRes,
-) -> Result<GpuTexture, WgpuRenderError> {
+    keep_bgs: &mut Vec<wgpu::BindGroup>,
+    keep_bufs: &mut Vec<wgpu::Buffer>,
+) -> usize {
     use wgpu::util::DeviceExt;
     let device = &ctx.device;
-    let (w, h, sc) = (target.width, target.height, target.sample_count);
-
-    let mut pool = blend::LayerPool::new(w, h, sc);
-    let base = pool.acquire(device);
     let mut active: Vec<usize> = vec![base];
     let mut blend_info: Vec<(
         zpdf_display_list::BlendMode,
@@ -636,24 +657,6 @@ fn render_layered(
         Option<&record::MaskOps>,
         Vec<record::ClipStamp>,
     )> = Vec::new();
-    // Composite bind groups + mode buffers kept alive until submit.
-    let mut keep_bgs: Vec<wgpu::BindGroup> = Vec::new();
-    let mut keep_bufs: Vec<wgpu::Buffer> = Vec::new();
-
-    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("zpdf-layered"),
-    });
-
-    // Initialize the base layer (page background, no clips).
-    {
-        let pass = begin_layer_pass(
-            &mut encoder,
-            pool.get(base),
-            wgpu::LoadOp::Clear(page_clear),
-            wgpu::LoadOp::Clear(0),
-        );
-        drop(pass);
-    }
 
     let mut i = 0;
     while i < ops.len() {
@@ -664,7 +667,7 @@ fn render_layered(
         if start < i {
             let cur = *active.last().unwrap();
             let mut pass = begin_layer_pass(
-                &mut encoder,
+                encoder,
                 pool.get(cur),
                 wgpu::LoadOp::Load,
                 wgpu::LoadOp::Load,
@@ -683,13 +686,7 @@ fn render_layered(
                 mask,
             } => {
                 let g = pool.acquire(device);
-                init_layer(
-                    &mut encoder,
-                    pool.get(g),
-                    wgpu::Color::TRANSPARENT,
-                    clips,
-                    res,
-                );
+                init_layer(encoder, pool.get(g), wgpu::Color::TRANSPARENT, clips, res);
                 active.push(g);
                 blend_info.push((*mode, *alpha, mask.as_ref(), clips.clone()));
             }
@@ -709,16 +706,7 @@ fn render_layered(
                 // that takes the group's place as the composite source. The
                 // original group + coverage layers are recycled inside.
                 let group = if let Some(m) = mask {
-                    apply_soft_mask(
-                        ctx,
-                        &mut encoder,
-                        &mut pool,
-                        group,
-                        m,
-                        res,
-                        &mut keep_bgs,
-                        &mut keep_bufs,
-                    )
+                    apply_soft_mask(ctx, encoder, pool, group, m, res, keep_bgs, keep_bufs)
                 } else {
                     group
                 };
@@ -762,7 +750,7 @@ fn render_layered(
                 // Composite pass into the scratch layer, then re-stamp the parent clips.
                 {
                     let mut pass = begin_layer_pass(
-                        &mut encoder,
+                        encoder,
                         pool.get(scratch),
                         wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                         wgpu::LoadOp::Clear(0),
@@ -801,7 +789,55 @@ fn render_layered(
         i += 1;
     }
 
-    let final_layer = *active.first().unwrap_or(&base);
+    *active.first().unwrap_or(&base)
+}
+
+/// Multi-pass render for pages with transparency groups: a stack of offscreen
+/// layers, each composited onto its parent on PopBlendGroup. Layers come from a
+/// recycling [`blend::LayerPool`] so a page with hundreds of groups reuses a
+/// small working set instead of allocating (and never freeing) one full-page
+/// layer per group.
+fn render_layered(
+    ctx: &GpuContext,
+    target: &PageTarget,
+    page_clear: wgpu::Color,
+    ops: &[PageOp],
+    res: &ReplayRes,
+) -> Result<GpuTexture, WgpuRenderError> {
+    let device = &ctx.device;
+    let (w, h, sc) = (target.width, target.height, target.sample_count);
+
+    let mut pool = blend::LayerPool::new(w, h, sc);
+    let base = pool.acquire(device);
+    // Composite bind groups + mode buffers kept alive until submit.
+    let mut keep_bgs: Vec<wgpu::BindGroup> = Vec::new();
+    let mut keep_bufs: Vec<wgpu::Buffer> = Vec::new();
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("zpdf-layered"),
+    });
+
+    // Initialize the base layer (page background, no clips).
+    {
+        let pass = begin_layer_pass(
+            &mut encoder,
+            pool.get(base),
+            wgpu::LoadOp::Clear(page_clear),
+            wgpu::LoadOp::Clear(0),
+        );
+        drop(pass);
+    }
+
+    let final_layer = composite_into(
+        ctx,
+        &mut encoder,
+        &mut pool,
+        base,
+        ops,
+        res,
+        &mut keep_bgs,
+        &mut keep_bufs,
+    );
     target.record_copy_from(&mut encoder, pool.get(final_layer).sampleable_texture());
     ctx.queue.submit(Some(encoder.finish()));
     let result = target.map_and_strip(device);
@@ -811,12 +847,45 @@ fn render_layered(
     result
 }
 
-/// Apply a group's soft mask: render the mask group into its own layer, then a
-/// fullscreen pass pre-multiplies the group layer by the mask's per-pixel
-/// coverage (luminosity over the /BC backdrop, or the mask group's alpha).
-/// Returns the index of the masked layer that takes the group's place as the
-/// composite source. New bind groups/buffers are parked in `keep_*` so they
-/// outlive the encoder submission.
+/// Uniform for the mask-apply pass. Mirrors `MaskU` in `mask_apply.wgsl`: the
+/// coverage kind, the device-pixel sampling offset, the /BC backdrop luminosity
+/// (used where the offset reads outside the built mask), and the /TR transfer LUT
+/// packed 4 bytes per `u32` (`array<vec4<u32>, 16>` on the shader side).
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct MaskUniform {
+    kind: u32,
+    dx: i32,
+    dy: i32,
+    _pad0: u32,
+    backdrop_luma: f32,
+    _pad1: [f32; 3],
+    lut: [u32; 64],
+}
+
+/// Pack a /TR transfer LUT (identity when absent) into 256 bytes, 4 per `u32`.
+fn pack_transfer_lut(transfer: Option<&std::sync::Arc<[u8; 256]>>) -> [u32; 64] {
+    let mut lut = [0u32; 64];
+    for (i, slot) in lut.iter_mut().enumerate() {
+        let mut word = 0u32;
+        for byte in 0..4 {
+            let v = match transfer {
+                Some(t) => t[i * 4 + byte],
+                None => (i * 4 + byte) as u8, // identity
+            };
+            word |= (v as u32) << (8 * byte);
+        }
+        *slot = word;
+    }
+    lut
+}
+
+/// Apply a group's soft mask: composite the mask group into its own layer, then a
+/// fullscreen pass pre-multiplies the group layer by the mask's per-pixel coverage
+/// (luminosity over the /BC backdrop, or the mask group's alpha), honoring the
+/// tiling-pattern reuse offset and the /TR transfer function. Returns the index of
+/// the masked layer that takes the group's place as the composite source. New bind
+/// groups/buffers are parked in `keep_*` so they outlive the encoder submission.
 #[allow(clippy::too_many_arguments)]
 fn apply_soft_mask(
     ctx: &GpuContext,
@@ -832,9 +901,11 @@ fn apply_soft_mask(
     use zpdf_display_list::SoftMaskKind;
     let device = &ctx.device;
 
-    // 1. Render the mask group into a fresh layer. Luminosity masks start from
-    //    the /BC backdrop luminosity (opaque); alpha masks from transparent.
-    let mask_layer = pool.acquire(device);
+    // 1. Composite the mask group into its own layer. Luminosity masks start from
+    //    the /BC backdrop luminosity (opaque); alpha masks from transparent. The
+    //    group may itself contain nested transparency groups, so it goes through
+    //    the layered compositor rather than a single replay pass.
+    let mask_base = pool.acquire(device);
     let clear = match mask.kind {
         SoftMaskKind::Luminosity => {
             let l = mask.backdrop_luma.clamp(0.0, 1.0) as f64;
@@ -848,24 +919,38 @@ fn apply_soft_mask(
         SoftMaskKind::Alpha => wgpu::Color::TRANSPARENT,
     };
     {
-        let mut pass = begin_layer_pass(
+        let pass = begin_layer_pass(
             encoder,
-            pool.get(mask_layer),
+            pool.get(mask_base),
             wgpu::LoadOp::Clear(clear),
             wgpu::LoadOp::Clear(0),
         );
-        replay_ops(&mut pass, &mask.ops, res);
+        drop(pass);
     }
+    let mask_layer = composite_into(
+        ctx, encoder, pool, mask_base, &mask.ops, res, keep_bgs, keep_bufs,
+    );
 
     // 2. Pre-multiply the group layer by the mask coverage into a fresh layer.
+    //    The apply pass samples coverage at `coord − (dx, dy)` (tiling-pattern
+    //    reuse offset), reduces to luminosity/alpha, and runs it through the /TR
+    //    transfer LUT before scaling the group.
     let masked = pool.acquire(device);
     let kind_id: u32 = match mask.kind {
         SoftMaskKind::Luminosity => 1,
         SoftMaskKind::Alpha => 2,
     };
     let mask_u = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("zpdf-mask-kind"),
-        contents: bytemuck::cast_slice(&[kind_id, 0u32, 0, 0]),
+        label: Some("zpdf-mask-uniform"),
+        contents: bytemuck::bytes_of(&MaskUniform {
+            kind: kind_id,
+            dx: mask.dx,
+            dy: mask.dy,
+            _pad0: 0,
+            backdrop_luma: mask.backdrop_luma.clamp(0.0, 1.0),
+            _pad1: [0.0; 3],
+            lut: pack_transfer_lut(mask.transfer.as_ref()),
+        }),
         usage: wgpu::BufferUsages::UNIFORM,
     });
     let mask_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -912,10 +997,16 @@ fn apply_soft_mask(
     keep_bgs.push(mask_bg);
     keep_bufs.push(mask_u);
 
-    // The original group and the coverage layer have been consumed into `masked`
-    // (their reads are recorded); recycle them for reuse.
+    // The original group and the mask's layers have been consumed into `masked`
+    // (their reads are recorded); recycle them for reuse. `mask_base` differs from
+    // `mask_layer` only when the mask group itself contained nested groups (the
+    // composite produced a fresh scratch); recycle it too so deep nesting doesn't
+    // leak a layer per level.
     pool.recycle(group);
     pool.recycle(mask_layer);
+    if mask_base != mask_layer {
+        pool.recycle(mask_base);
+    }
     masked
 }
 

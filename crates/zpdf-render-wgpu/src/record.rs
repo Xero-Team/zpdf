@@ -14,10 +14,21 @@ use zpdf_display_list::{BlendMode, FillRule, Path as DlPath, SoftMaskKind, Strok
 /// the reduction parameters needed to turn it into per-pixel coverage.
 pub struct MaskOps {
     /// Ops replayed into an offscreen mask layer (reference the shared buffers).
+    /// May itself contain `PushBlend`/`PopBlend` (a transparency group nested
+    /// inside the mask group), composited through the layered path.
     pub ops: Vec<PageOp>,
     pub kind: SoftMaskKind,
     /// /BC backdrop luminosity for areas the mask group leaves unpainted.
     pub backdrop_luma: f32,
+    /// Device-pixel translation of the coverage plane (a tiling pattern builds
+    /// one mask and reuses it at every cell; the cell CTMs differ only by this
+    /// page-space shift, here pre-scaled to device pixels — `dy` already carries
+    /// the device Y flip). The apply pass samples the mask at `coord − (dx, dy)`.
+    pub dx: i32,
+    pub dy: i32,
+    /// /TR transfer function pre-sampled over [0,1] into 256 steps, applied to
+    /// the reduced coverage before it modulates the group (identity when absent).
+    pub transfer: Option<std::sync::Arc<[u8; 256]>>,
 }
 
 /// A range of indices/vertices in the shared arena.

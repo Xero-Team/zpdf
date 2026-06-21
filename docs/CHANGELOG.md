@@ -2,6 +2,51 @@
 
 ## Unreleased
 
+### GPU soft-mask fidelity (`/TR`, tiling offset, nested groups)
+
+The wgpu backend now matches the tiny-skia CPU oracle on three ExtGState `/SMask`
+cases it previously approximated or dropped. Soft masks were already rendered on
+the GPU (a coverage layer pre-multiplied into the group before compositing); these
+close the remaining gaps, so a soft-masked page renders identically on both
+backends:
+
+- **`/TR` transfer function**: the mask's transfer LUT (pre-sampled to 256 steps by
+  the interpreter) is uploaded with the mask uniform and applied to the reduced
+  coverage in `mask_apply.wgsl`, exactly as the CPU does after reading luminosity/
+  alpha — including the unpainted (`/BC`) value. The GPU previously ignored `/TR`.
+- **Tiling-pattern reuse `offset`**: a mask built once for a pattern cell and reused
+  at every cell (the cell CTMs differ only by a page-space translation) is now
+  sampled at `coord − (dx, dy)` device pixels, with reads outside the built mask
+  taking the unpainted value — mirroring the CPU's `shift_plane`. The GPU
+  previously drew every cell's mask at the build position.
+- **Transparency group nested inside the mask group**: the mask group is now
+  composited through the same layered path as the page (`composite_into`, shared by
+  the page render and recursively by `apply_soft_mask`), so a `gs`/group inside a
+  `/G` mask composites correctly. The GPU previously detected the nested group and
+  **dropped the whole mask**, rendering the group unmasked.
+
+An adversarial review of the change surfaced three further GPU↔CPU parity gaps,
+all now closed:
+
+- the soft-mask luminosity reduction used the W3C blend-mode weights
+  `(0.30, 0.59, 0.11)` rather than the oracle's Rec.601 `(0.299, 0.587, 0.114)`;
+  harmless for the usual gray/white masks but, once `/TR` was applied, a steep
+  transfer over a *colored* luminosity mask amplified the ~1–2/255 coverage error
+  into a ~36% pixel swing. The soft-mask `lum` now matches the oracle (the
+  blend-mode `lum` in `composite.wgsl` is left at the spec-mandated weights);
+- LUT indexing used WGSL `round()` (ties-to-even) where the oracle uses Rust
+  `round` (ties-away); now `floor(x + 0.5)` to agree on exact `.5` ties;
+- the image-upload walk descended only one mask level, so an image inside a
+  *mask nested in a mask* was silently dropped; the walk is now recursive.
+
+Pure-Rust, zero new dependencies; only the wgpu backend changed (the display-list
+`SoftMask` already carried `offset`/`transfer`). Verified by a new GPU↔CPU
+acceptance test (`crates/zpdf/tests/gpu_softmask.rs`: invert-`/TR`, `(+40,+40)`
+offset, nested 0.6-alpha group, alpha-mask + gamma `/TR`, a colored-luminosity +
+step-`/TR` regression guard, and a mask-nested-in-a-mask) — all **0.000%**
+differing — with the existing `gpu_acceptance` corpus and wgpu soft-mask oracle
+tests unchanged.
+
 ### Table detection
 
 A new `zpdf-content::tables` module recovers tabular structure from a page's
