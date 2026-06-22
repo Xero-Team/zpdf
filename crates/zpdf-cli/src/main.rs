@@ -112,6 +112,42 @@ fn cmd_info(args: &[String]) -> zpdf::Result<()> {
         println!("  ... and {} more pages", doc.page_count() - listed);
     }
 
+    let intents = doc.output_intents();
+    if !intents.is_empty() {
+        println!("Output Intents: {}", intents.len());
+        for (i, oi) in intents.iter().enumerate() {
+            let subtype = if oi.subtype.is_empty() {
+                "(none)"
+            } else {
+                &oi.subtype
+            };
+            let condition = oi
+                .output_condition_identifier
+                .as_deref()
+                .unwrap_or("(none)");
+            let profile = match oi.dest_output_profile {
+                Some(id) => {
+                    let n = oi
+                        .dest_profile_components
+                        .map_or_else(|| "?".to_string(), |n| n.to_string());
+                    // `has_cmyk_profile` mirrors the render-time gate: an /N-absent
+                    // embedded profile may still resolve to CMYK and be managed.
+                    let managed = if oi.has_cmyk_profile() {
+                        " (DeviceCMYK colour-managed)"
+                    } else {
+                        ""
+                    };
+                    format!("DestOutputProfile {id} N={n}{managed}")
+                }
+                None => "external profile".to_string(),
+            };
+            println!(
+                "  [{}] /S {subtype} | OutputConditionIdentifier: {condition} | {profile}",
+                i + 1
+            );
+        }
+    }
+
     Ok(())
 }
 
@@ -496,6 +532,16 @@ fn cmd_render(args: &[String]) -> zpdf::Result<()> {
     let annotations = doc.page_annotations(&page);
     let oc_config = doc.oc_config();
     let mut icc_cache = zpdf::IccCache::new();
+    // PDF/X & PDF 2.0 output intents: colour-manage DeviceCMYK through the
+    // page's (or document's) /DestOutputProfile when it is a CMYK ICC profile.
+    // Compiled via `icc_cache` here, before `with_colors` takes its borrow.
+    let doc_intents = doc.output_intents();
+    let oi_cmyk = zpdf::output_intent_cmyk_profile(
+        doc.file(),
+        doc.page_output_intents(&page),
+        &doc_intents,
+        &mut icc_cache,
+    );
     let mut interpreter = zpdf::ContentInterpreter::new(page_box)
         .with_page_rotation(page.rotate)
         .with_fonts(&mut font_cache)
@@ -505,6 +551,10 @@ fn cmd_render(args: &[String]) -> zpdf::Result<()> {
         .with_annotations(&annotations);
     if let Some(oc) = &oc_config {
         interpreter = interpreter.with_optional_content(oc);
+    }
+    if let Some(profile) = oi_cmyk {
+        println!("  Output intent: DeviceCMYK colour-managed via /DestOutputProfile");
+        interpreter = interpreter.with_output_intent_cmyk(profile);
     }
     let display_list = interpreter.interpret(&content_bytes);
 

@@ -66,12 +66,22 @@ fn render_page(doc: &PdfDocument, idx: usize, slot: &mut Option<GpuContext>) -> 
     let content = doc.page_content_bytes(&page).ok()?;
     let mut images = ImageCache::new();
     let mut colors = IccCache::new();
-    let dl = ContentInterpreter::new(page.media_box)
+    let doc_intents = doc.output_intents();
+    let oi_cmyk = zpdf::output_intent_cmyk_profile(
+        doc.file(),
+        doc.page_output_intents(&page),
+        &doc_intents,
+        &mut colors,
+    );
+    let mut interpreter = ContentInterpreter::new(page.media_box)
         .with_fonts(&mut fonts)
         .with_document(doc.file(), &page.resources)
         .with_images(&mut images)
-        .with_colors(&mut colors)
-        .interpret(&content);
+        .with_colors(&mut colors);
+    if let Some(profile) = oi_cmyk {
+        interpreter = interpreter.with_output_intent_cmyk(profile);
+    }
+    let dl = interpreter.interpret(&content);
 
     let mut renderer = WgpuRenderer::new().with_fonts(&fonts).with_images(&images);
     if let Some(ctx) = slot.take() {

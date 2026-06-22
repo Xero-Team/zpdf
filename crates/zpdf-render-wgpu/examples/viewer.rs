@@ -72,13 +72,23 @@ fn render_page(doc: &PdfDocument, idx: usize, slot: &mut Option<GpuContext>) -> 
     let mut images = ImageCache::new();
     let mut colors = IccCache::new();
     let eb = page.effective_box();
-    let dl = ContentInterpreter::new(eb)
+    let doc_intents = doc.output_intents();
+    let oi_cmyk = zpdf::output_intent_cmyk_profile(
+        doc.file(),
+        doc.page_output_intents(&page),
+        &doc_intents,
+        &mut colors,
+    );
+    let mut interpreter = ContentInterpreter::new(eb)
         .with_page_rotation(page.rotate)
         .with_fonts(&mut fonts)
         .with_document(doc.file(), &page.resources)
         .with_images(&mut images)
-        .with_colors(&mut colors)
-        .interpret(&content);
+        .with_colors(&mut colors);
+    if let Some(profile) = oi_cmyk {
+        interpreter = interpreter.with_output_intent_cmyk(profile);
+    }
+    let dl = interpreter.interpret(&content);
 
     // Clamp the render scale so a huge media box doesn't allocate a multi-GB GPU
     // tile. The blit upscales the result to the page's layout box regardless.

@@ -40,6 +40,10 @@ pub struct PdfPage {
     pub contents: Vec<ObjectId>,
     /// Annotation object ids from `/Annots`, parsed but not yet rendered.
     pub annots: Vec<ObjectId>,
+    /// PDF 2.0 page-level `/OutputIntents`. Overrides the document-level intents
+    /// for this page; empty for pre-2.0 / most documents. Not an inheritable
+    /// attribute — read off the leaf page dictionary only.
+    pub output_intents: Vec<crate::output_intents::OutputIntent>,
 }
 
 #[derive(Debug, Default)]
@@ -87,6 +91,8 @@ impl PdfPage {
 
         let contents = Self::collect_content_refs(file, dict.get("Contents"));
         let annots = Self::collect_annot_refs(file, dict.get("Annots"));
+        // PDF 2.0 page-level output intents (off the leaf dict, not inherited).
+        let output_intents = crate::output_intents::parse_page_output_intents(file, dict);
 
         Ok(Self {
             id: page_id,
@@ -96,6 +102,7 @@ impl PdfPage {
             resources,
             contents,
             annots,
+            output_intents,
         })
     }
 
@@ -504,6 +511,7 @@ mod tests {
             resources: ResourceDict::default(),
             contents: vec![],
             annots: vec![],
+            output_intents: vec![],
         }
     }
 

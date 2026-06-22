@@ -2,6 +2,54 @@
 
 ## Unreleased
 
+### Output Intents — DeviceCMYK colour management (PDF/X & PDF 2.0)
+
+Output intents are now parsed, surfaced, and — for CMYK — honoured. An output
+intent declares the *characterized printing condition* a document was prepared
+for; its `/DestOutputProfile` (an embedded ICC profile) is exactly how the
+document's DeviceCMYK is meant to be interpreted. When that profile is 4-channel
+(CMYK), DeviceCMYK now renders **through the profile** (the PDF/X model) instead
+of the generic Adobe SWOP polynomial — so a FOGRA/GRACoL/SWOP-tagged file is
+colour-managed to its own condition rather than a one-size-fits-all approximation.
+
+- **Parsing & exposure** (`zpdf-document/src/output_intents.rs`, zero colour-
+  management deps): document-level `/OutputIntents` off the catalog **and**
+  ISO 32000-2 **page-level** `/OutputIntents` off the page dict (page-level
+  overrides document-level). `OutputIntent` carries `/S`, the condition
+  identifier/condition/info text strings, the `/DestOutputProfile` object id, and
+  the profile's `/N` (read without decoding the stream). Surfaced via
+  `PdfDocument::output_intents()` / `page_output_intents()`, the new
+  `OutputIntent::has_cmyk_profile()` predicate, and the `zpdf info` command.
+
+- **Colour management** (`zpdf-content`): a render-side helper
+  `output_intent_cmyk_profile` picks the effective intent (page over document)
+  and compiles its profile through the existing `IccCache` (failures cached, the
+  media-relative-colorimetric default intent — an output intent characterizes a
+  device, so it is fixed at document scope). The interpreter gained an
+  `output_intent_cmyk` field + `with_output_intent_cmyk` builder. DeviceCMYK
+  routes through it at a single vector/text gate (`cmyk_to_display`, covering
+  `k`/`K` and the `DeviceCMYK | ICCBased(4)` arm of `components_to_rgb` — so
+  `sc`/`scn`, initial colours, and Indexed/Tint-over-CMYK all follow), and for
+  raster images (`Cmyk` → the profile's `Icc{4}` space; an Indexed/DeviceCMYK
+  palette is baked to RGB through the profile).
+
+- **Strict gating, no regressions:** with no usable 4-channel output intent the
+  field is `None` and every conversion keeps the SWOP polynomial **byte-
+  identically**. An explicitly compiled embedded ICCBased(4) colour space always
+  keeps its own profile (it never reaches the gate); the output intent only
+  substitutes for *DeviceCMYK*. RGB / non-4-channel / unparseable intents are
+  ignored. The overprint colorant projection keeps its raw C,M,Y,K tints — only
+  the display colour is rerouted. **Both render backends are unchanged** —
+  conversion happens upstream in the interpreter, so the display list already
+  carries colour-managed sRGB and CPU↔GPU parity holds automatically.
+
+Pure Rust, zero new dependencies. Verified by unit tests (parsing incl.
+page-level + UTF-16BE strings + RGB rejection; the four CMYK conversion sites
+route through a non-SWOP profile and differ from SWOP; no-OI stays exactly SWOP;
+image `Cmyk`→`Icc{4}` and Indexed-base baking) and CPU end-to-end render tests
+(document-level, page-level, page-overrides-document, and RGB-intent-ignored —
+each comparing the rendered pixel against the SWOP baseline).
+
 ### Overprint (PDF 8.6.7)
 
 Overprinting is now honoured on both backends. A painting operation set to

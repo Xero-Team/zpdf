@@ -4,12 +4,14 @@ mod catalog;
 pub mod font_loader;
 pub mod forms;
 pub mod optional_content;
+pub mod output_intents;
 pub mod page;
 
 pub use annotation::Annotation;
 pub use catalog::Catalog;
 pub use forms::{AcroForm, FieldKind, FieldValue, FormField};
 pub use optional_content::OcConfig;
+pub use output_intents::OutputIntent;
 pub use page::{PdfPage, ResourceDict};
 
 use std::sync::{Arc, OnceLock};
@@ -119,6 +121,19 @@ impl PdfDocument {
     /// The document's default optional-content configuration, if any.
     pub fn oc_config(&self) -> Option<OcConfig> {
         optional_content::parse_oc_config(&self.file)
+    }
+
+    /// The document-level output intents (catalog `/OutputIntents`). Empty when
+    /// the document declares none. Page-level intents (PDF 2.0) are carried on
+    /// the page and read via [`PdfDocument::page_output_intents`].
+    pub fn output_intents(&self) -> Vec<OutputIntent> {
+        output_intents::parse_output_intents(&self.file)
+    }
+
+    /// PDF 2.0 page-level `/OutputIntents`, which override the document-level
+    /// intents for that page. Empty for pre-2.0 / most documents.
+    pub fn page_output_intents<'a>(&self, page: &'a PdfPage) -> &'a [OutputIntent] {
+        &page.output_intents
     }
 }
 

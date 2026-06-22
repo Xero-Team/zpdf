@@ -349,8 +349,19 @@ cargo run -p zpdf-render-wgpu --example viewer -- <file.pdf>   # 交互浏览器
       无后端/渲染改动；规则线（绘制的横竖线）感知留作后续增强
 
 ### P4.9 — PDF 2.0
-- [ ] ISO 32000-2 差异项
-- [ ] 新增颜色空间
+- [x] Output Intents（ISO 32000-1 §14.11.5 + ISO 32000-2 页面级）：解析文档级
+      （catalog `/OutputIntents`）与 **PDF 2.0 页面级**（页字典 `/OutputIntents`，
+      页面级覆盖文档级）；`OutputIntent` 元数据经 `PdfDocument::output_intents()` /
+      `page_output_intents()` 暴露，`zpdf info` 列出 `/S`/条件标识/`/DestOutputProfile`
+      通道数。当激活意图的 `/DestOutputProfile` 是 4 通道（CMYK）ICC profile 时，
+      **DeviceCMYK 经该 profile 色彩管理**（PDF/X 特征化印刷条件模型）而非 Adobe SWOP
+      多项式：矢量填充/描边/文本（`k`/`K`/`scn`/`sc` 与 `components_to_rgb` 单一闸口
+      `cmyk_to_display`）与栅格图像（`Cmyk`→`Icc{4}`，Indexed/CMYK 调色板烘焙为 RGB）
+      统一走既有 `IccTransform`/`IccCache`，复用渲染意图机制。严格门控：无可用 4 通道
+      输出意图的文档逐字节不变（仍走 SWOP）；嵌入 ICCBased(4) 自带 profile 优先；
+      RGB(N≠3..)/解析失败的意图被忽略并回退。后端零改动（转换在解释器上游完成，
+      CPU↔GPU 自动一致）。纯 Rust 零新依赖
+- [ ] 新增颜色空间（其余 ISO 32000-2 差异项）
 - [ ] 新增注释类型
 
 ---

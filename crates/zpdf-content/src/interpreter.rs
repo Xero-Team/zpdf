@@ -26,6 +26,14 @@ pub struct ContentInterpreter<'a> {
     resources: Option<&'a ResourceDict>,
     image_cache: Option<&'a mut ImageCache>,
     icc_cache: Option<&'a mut zpdf_color::IccCache>,
+    /// Default DeviceCMYK colour-management transform from the document's active
+    /// output intent (`/OutputIntents` → `/DestOutputProfile`, 4-channel only).
+    /// When present, DeviceCMYK fills/strokes/text/images convert through this
+    /// ICC profile instead of the Adobe SWOP polynomial. Owned `Arc` (not behind
+    /// `&mut icc_cache`) so the read-only colour-conversion paths can consult it.
+    /// `None` ⇒ every conversion keeps the SWOP polynomial (byte-identical to
+    /// pre-output-intent behaviour).
+    output_intent_cmyk: Option<std::sync::Arc<zpdf_color::IccTransform>>,
     /// Maps an image XObject's object id to its already-decoded entry in
     /// `image_cache`, so an image drawn many times (e.g. a map symbol repeated
     /// thousands of times) is decoded — colour-converted, soft-mask-folded — only
@@ -373,6 +381,7 @@ impl<'a> ContentInterpreter<'a> {
             resources: None,
             image_cache: None,
             icc_cache: None,
+            output_intent_cmyk: None,
             image_obj_cache: HashMap::new(),
             shading_cache: HashMap::new(),
             form_font_overrides: Vec::new(),
@@ -517,6 +526,22 @@ impl<'a> ContentInterpreter<'a> {
     /// component-count fallback.
     pub fn with_colors(mut self, cache: &'a mut zpdf_color::IccCache) -> Self {
         self.icc_cache = Some(cache);
+        self
+    }
+
+    /// Inject the document's output-intent default CMYK profile (already
+    /// compiled and validated 4-channel by the caller, e.g. via
+    /// [`output_intent_cmyk_profile`]). DeviceCMYK colours — vector fills,
+    /// strokes, text, and raster images — then render through this ICC transform
+    /// (the PDF/X characterized-printing-condition model) instead of the generic
+    /// Adobe SWOP polynomial. Pass the page-level intent's profile when present,
+    /// else the document-level one. An explicit embedded ICCBased colour space
+    /// always keeps its own profile; this only substitutes for *DeviceCMYK*.
+    pub fn with_output_intent_cmyk(
+        mut self,
+        profile: std::sync::Arc<zpdf_color::IccTransform>,
+    ) -> Self {
+        self.output_intent_cmyk = Some(profile);
         self
     }
 
@@ -847,7 +872,7 @@ impl<'a> ContentInterpreter<'a> {
                 let y_val = self.pop_f64();
                 let m_val = self.pop_f64();
                 let c_val = self.pop_f64();
-                let (r, g, b) = zpdf_color::cmyk_to_rgb(c_val, m_val, y_val, k_val);
+                let (r, g, b) = self.cmyk_to_display(c_val, m_val, y_val, k_val);
                 self.current.fill_color = Color::rgb(r as f32, g as f32, b as f32);
                 self.current.fill_cs = ActiveColorSpace::DeviceCMYK;
                 self.current.fill_pattern = None;
@@ -858,7 +883,7 @@ impl<'a> ContentInterpreter<'a> {
                 let y_val = self.pop_f64();
                 let m_val = self.pop_f64();
                 let c_val = self.pop_f64();
-                let (r, g, b) = zpdf_color::cmyk_to_rgb(c_val, m_val, y_val, k_val);
+                let (r, g, b) = self.cmyk_to_display(c_val, m_val, y_val, k_val);
                 self.current.stroke_color = Color::rgb(r as f32, g as f32, b as f32);
                 self.current.stroke_cs = ActiveColorSpace::DeviceCMYK;
                 self.current.stroke_pattern = None;
@@ -1374,6 +1399,53 @@ impl<'a> ContentInterpreter<'a> {
         )
     }
 
+    /// DeviceCMYK → sRGB for display. Routes through the document's output-intent
+    /// default CMYK profile (the PDF/X characterized printing condition) when one
+    /// is active, otherwise the Adobe SWOP polynomial. This is the single gate
+    /// for the `k`/`K` operators and the `DeviceCMYK | ICCBased(4)` arm of
+    /// [`Self::components_to_rgb`] — an explicitly compiled embedded ICCBased(4)
+    /// profile is the `Icc` variant and never reaches here, so its own profile
+    /// always wins; the output intent only substitutes for raw DeviceCMYK.
+    fn cmyk_to_display(&self, c: f64, m: f64, y: f64, k: f64) -> (f64, f64, f64) {
+        match &self.output_intent_cmyk {
+            Some(t) => t.color_to_rgb(&[c, m, y, k]),
+            None => zpdf_color::cmyk_to_rgb(c, m, y, k),
+        }
+    }
+
+    /// Re-route a DeviceCMYK image colour space through the active output-intent
+    /// profile, mirroring [`Self::cmyk_to_display`] for raster pixels. A bare
+    /// `Cmyk` space becomes the profile's `Icc` space (so the decoder colour-
+    /// manages every pixel); an `Indexed` space with a DeviceCMYK base has its
+    /// palette baked to RGB through the profile (the same one-buffer transform
+    /// `resolve_image_colorspace` applies to embedded-ICC bases). No-op when no
+    /// output intent is active, leaving the existing SWOP path untouched.
+    fn colormanage_cmyk_image(
+        &self,
+        cs: Option<zpdf_image::ResolvedColorSpace>,
+    ) -> Option<zpdf_image::ResolvedColorSpace> {
+        use zpdf_image::ResolvedColorSpace as Rcs;
+        let Some(oi) = &self.output_intent_cmyk else {
+            return cs;
+        };
+        cs.map(|cs| match cs {
+            Rcs::Cmyk => Rcs::Icc {
+                ncomp: 4,
+                transform: oi.clone(),
+            },
+            Rcs::Indexed {
+                base,
+                hival,
+                lookup,
+            } if matches!(*base, Rcs::Cmyk) => Rcs::Indexed {
+                base: Box::new(Rcs::Rgb),
+                hival,
+                lookup: oi.palette_to_rgb(&lookup),
+            },
+            other => other,
+        })
+    }
+
     /// Convert component values in `cs` to an RGB display color.
     fn components_to_rgb(&self, cs: &ActiveColorSpace, vals: &[f64]) -> Color {
         let get = |i: usize| vals.get(i).copied().unwrap_or(0.0);
@@ -1385,7 +1457,7 @@ impl<'a> ContentInterpreter<'a> {
                 Color::rgb(get(0) as f32, get(1) as f32, get(2) as f32)
             }
             ActiveColorSpace::DeviceCMYK | ActiveColorSpace::ICCBased(4) => {
-                let (r, g, b) = zpdf_color::cmyk_to_rgb(get(0), get(1), get(2), get(3));
+                let (r, g, b) = self.cmyk_to_display(get(0), get(1), get(2), get(3));
                 Color::rgb(r as f32, g as f32, b as f32)
             }
             ActiveColorSpace::ICCBased(_) => Color::gray(get(0) as f32),
@@ -2648,6 +2720,7 @@ impl<'a> ContentInterpreter<'a> {
             0,
             intent,
         );
+        let colorspace = self.colormanage_cmyk_image(colorspace);
         let mut image = match zpdf_image::decode_image_xobject_resolved(
             &decoded_data,
             &image_dict,
@@ -2732,6 +2805,7 @@ impl<'a> ContentInterpreter<'a> {
             0,
             intent,
         );
+        let colorspace = self.colormanage_cmyk_image(colorspace);
         match zpdf_image::decode_image_xobject_resolved(
             &decoded,
             &norm,
@@ -4293,6 +4367,244 @@ mod tests {
         let page_rect = Rect::new(0.0, 0.0, 612.0, 792.0);
         let dl = ContentInterpreter::new(page_rect).interpret(content);
         assert_eq!(dl.commands.len(), 2);
+    }
+
+    // ---- Output intents: DeviceCMYK colour-managed through /DestOutputProfile ----
+
+    /// A 4-channel (CMYK) ICC transform from the committed `cmyk_lut.icc`
+    /// fixture, or `None` if the fixture is absent in this checkout (skip).
+    fn cmyk_oi_transform() -> Option<std::sync::Arc<zpdf_color::IccTransform>> {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../zpdf-color/src/testdata/cmyk_lut.icc"
+        );
+        let bytes = std::fs::read(path).ok()?;
+        let t = zpdf_color::IccTransform::from_profile_bytes(
+            &bytes,
+            zpdf_color::RenderIntent::default(),
+        )
+        .ok()?;
+        assert_eq!(t.components(), 4, "fixture must be a CMYK profile");
+        Some(std::sync::Arc::new(t))
+    }
+
+    fn first_fill_color(dl: &DisplayList) -> Color {
+        for cmd in &dl.commands {
+            if let RenderCommand::FillPath {
+                paint: Paint::Solid(c),
+                ..
+            } = cmd
+            {
+                return *c;
+            }
+        }
+        panic!("no solid FillPath in display list");
+    }
+
+    fn approx(a: f32, b: f64) -> bool {
+        (a - b as f32).abs() < 0.01
+    }
+
+    /// The `k` operator routes DeviceCMYK through the output-intent profile, not
+    /// the SWOP polynomial — and the two differ.
+    #[test]
+    fn devicecmyk_k_routes_through_output_intent() {
+        let Some(oi) = cmyk_oi_transform() else {
+            return;
+        };
+        let page = Rect::new(0.0, 0.0, 100.0, 100.0);
+        // K=1 (black via the K colorant): SWOP renders a dark grey, the LUT
+        // profile a deeper near-black — a clear, stable discriminator.
+        let content = b"0 0 0 1 k 0 0 10 10 re f";
+        let dl = ContentInterpreter::new(page)
+            .with_output_intent_cmyk(oi.clone())
+            .interpret(content);
+        let got = first_fill_color(&dl);
+        let (er, eg, eb) = oi.color_to_rgb(&[0.0, 0.0, 0.0, 1.0]);
+        assert!(
+            approx(got.r, er) && approx(got.g, eg) && approx(got.b, eb),
+            "k did not route through the OI profile: got {got:?}, want ({er},{eg},{eb})"
+        );
+        let (sr, sg, sb) = zpdf_color::cmyk_to_rgb(0.0, 0.0, 0.0, 1.0);
+        assert!(
+            (got.r - sr as f32).abs() > 0.02
+                || (got.g - sg as f32).abs() > 0.02
+                || (got.b - sb as f32).abs() > 0.02,
+            "OI render unexpectedly equals the SWOP polynomial: {got:?}"
+        );
+    }
+
+    /// `scn` in an explicitly selected DeviceCMYK space also routes through the
+    /// OI profile (the `components_to_rgb` conversion site).
+    #[test]
+    fn devicecmyk_scn_routes_through_output_intent() {
+        let Some(oi) = cmyk_oi_transform() else {
+            return;
+        };
+        let page = Rect::new(0.0, 0.0, 100.0, 100.0);
+        let content = b"/DeviceCMYK cs 0.1 0.2 0.3 0.4 scn 0 0 10 10 re f";
+        let dl = ContentInterpreter::new(page)
+            .with_output_intent_cmyk(oi.clone())
+            .interpret(content);
+        let got = first_fill_color(&dl);
+        let (er, eg, eb) = oi.color_to_rgb(&[0.1, 0.2, 0.3, 0.4]);
+        assert!(
+            approx(got.r, er) && approx(got.g, eg) && approx(got.b, eb),
+            "scn DeviceCMYK did not route through the OI profile: got {got:?}"
+        );
+    }
+
+    /// Without an output intent, DeviceCMYK keeps the SWOP polynomial exactly —
+    /// the gate that guarantees non-OI documents render byte-identically.
+    #[test]
+    fn devicecmyk_without_output_intent_uses_swop() {
+        let page = Rect::new(0.0, 0.0, 100.0, 100.0);
+        let content = b"0 0 0 1 k 0 0 10 10 re f";
+        let dl = ContentInterpreter::new(page).interpret(content);
+        let got = first_fill_color(&dl);
+        let (sr, sg, sb) = zpdf_color::cmyk_to_rgb(0.0, 0.0, 0.0, 1.0);
+        assert!(
+            (got.r - sr as f32).abs() < 0.001
+                && (got.g - sg as f32).abs() < 0.001
+                && (got.b - sb as f32).abs() < 0.001,
+            "no-OI CMYK must use the SWOP polynomial unchanged: {got:?}"
+        );
+    }
+
+    /// A DeviceCMYK image space is upgraded to the OI profile's `Icc` space, and
+    /// an Indexed/DeviceCMYK palette is baked to RGB through the profile.
+    #[test]
+    fn cmyk_image_colorspace_upgraded_to_output_intent() {
+        use zpdf_image::ResolvedColorSpace as Rcs;
+        let Some(oi) = cmyk_oi_transform() else {
+            return;
+        };
+        let interp = ContentInterpreter::new(Rect::new(0.0, 0.0, 10.0, 10.0))
+            .with_output_intent_cmyk(oi.clone());
+
+        match interp.colormanage_cmyk_image(Some(Rcs::Cmyk)) {
+            Some(Rcs::Icc { ncomp, transform }) => {
+                assert_eq!(ncomp, 4);
+                assert!(std::sync::Arc::ptr_eq(&transform, &oi));
+            }
+            other => panic!("bare DeviceCMYK image must become Icc(4): {other:?}"),
+        }
+
+        let indexed = Rcs::Indexed {
+            base: Box::new(Rcs::Cmyk),
+            hival: 0,
+            lookup: vec![0, 0, 0, 255], // one CMYK palette entry (K=1)
+        };
+        match interp.colormanage_cmyk_image(Some(indexed)) {
+            Some(Rcs::Indexed { base, lookup, .. }) => {
+                assert!(matches!(*base, Rcs::Rgb), "CMYK base must bake to RGB");
+                // Baked through the OI profile, byte-for-byte — not SWOP.
+                assert_eq!(
+                    lookup,
+                    oi.palette_to_rgb(&[0, 0, 0, 255]),
+                    "palette must bake through the OI profile"
+                );
+                let (sr, sg, sb) = zpdf_color::cmyk_to_rgb(0.0, 0.0, 0.0, 1.0);
+                let swop = [
+                    (sr * 255.0).round() as u8,
+                    (sg * 255.0).round() as u8,
+                    (sb * 255.0).round() as u8,
+                ];
+                assert_ne!(
+                    lookup.as_slice(),
+                    swop.as_slice(),
+                    "OI-baked palette must differ from the SWOP polynomial"
+                );
+            }
+            other => panic!("Indexed/CMYK base must bake through the profile: {other:?}"),
+        }
+
+        // A non-CMYK image space is untouched.
+        assert!(matches!(
+            interp.colormanage_cmyk_image(Some(Rcs::Rgb)),
+            Some(Rcs::Rgb)
+        ));
+    }
+
+    /// Without an output intent, image colour spaces pass through unchanged.
+    #[test]
+    fn cmyk_image_unchanged_without_output_intent() {
+        use zpdf_image::ResolvedColorSpace as Rcs;
+        let interp = ContentInterpreter::new(Rect::new(0.0, 0.0, 10.0, 10.0));
+        assert!(matches!(
+            interp.colormanage_cmyk_image(Some(Rcs::Cmyk)),
+            Some(Rcs::Cmyk)
+        ));
+    }
+
+    /// Invariant: an image colour space that already carries a compiled embedded
+    /// ICC profile keeps *that* profile — the output intent substitutes only for
+    /// raw DeviceCMYK, never for an explicit ICCBased space. Proven by pointer
+    /// identity (the two transforms share bytes but are distinct allocations).
+    #[test]
+    fn embedded_icc_image_keeps_its_own_profile_under_output_intent() {
+        use zpdf_image::ResolvedColorSpace as Rcs;
+        let (Some(embedded), Some(oi)) = (cmyk_oi_transform(), cmyk_oi_transform()) else {
+            return;
+        };
+        assert!(!std::sync::Arc::ptr_eq(&embedded, &oi));
+        let interp = ContentInterpreter::new(Rect::new(0.0, 0.0, 10.0, 10.0))
+            .with_output_intent_cmyk(oi.clone());
+        match interp.colormanage_cmyk_image(Some(Rcs::Icc {
+            ncomp: 4,
+            transform: embedded.clone(),
+        })) {
+            Some(Rcs::Icc { transform, .. }) => {
+                assert!(
+                    std::sync::Arc::ptr_eq(&transform, &embedded),
+                    "embedded image ICC profile must be kept, not swapped for the OI"
+                );
+                assert!(!std::sync::Arc::ptr_eq(&transform, &oi));
+            }
+            other => panic!("embedded Icc(4) image space must pass through: {other:?}"),
+        }
+    }
+
+    /// Invariant (vector/text path): a fill in an explicit embedded ICCBased(4)
+    /// colour space renders through that profile, never the output intent. The
+    /// two transforms are the same fixture under *different* rendering intents,
+    /// so when the profile carries distinct A2B tables the OI value is provably
+    /// not used.
+    #[test]
+    fn embedded_icc_vector_keeps_its_own_profile_under_output_intent() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../zpdf-color/src/testdata/cmyk_lut.icc"
+        );
+        let Ok(bytes) = std::fs::read(path) else {
+            return;
+        };
+        let mk = |intent| {
+            std::sync::Arc::new(
+                zpdf_color::IccTransform::from_profile_bytes(&bytes, intent).unwrap(),
+            )
+        };
+        let embedded = mk(zpdf_color::RenderIntent::Perceptual);
+        let oi = mk(zpdf_color::RenderIntent::RelativeColorimetric);
+        let interp = ContentInterpreter::new(Rect::new(0.0, 0.0, 10.0, 10.0))
+            .with_output_intent_cmyk(oi.clone());
+
+        let vals = [0.1, 0.55, 0.3, 0.2];
+        let got = interp.components_to_rgb(&ActiveColorSpace::Icc(embedded.clone()), &vals);
+        let (er, eg, eb) = embedded.color_to_rgb(&vals);
+        assert!(
+            approx(got.r, er) && approx(got.g, eg) && approx(got.b, eb),
+            "embedded ICC vector colour must use its own profile: got {got:?}"
+        );
+        // When the two intents resolve this colour differently, prove the result
+        // is the embedded profile's value, not the output intent's.
+        let (oir, oig, oib) = oi.color_to_rgb(&vals);
+        if (er - oir).abs() > 0.004 || (eg - oig).abs() > 0.004 || (eb - oib).abs() > 0.004 {
+            assert!(
+                !(approx(got.r, oir) && approx(got.g, oig) && approx(got.b, oib)),
+                "embedded ICC must not be rerouted through the output intent"
+            );
+        }
     }
 
     /// `build_glyph_clip_path` produces a real outline clip + bbox from a

@@ -140,16 +140,28 @@ impl LoadedDocument {
         })?;
         let mut images = ImageCache::new();
         let mut colors = IccCache::new();
+        // Output intents (PDF/X & PDF 2.0): colour-manage DeviceCMYK through the
+        // page's/document's CMYK /DestOutputProfile when present, matching the CLI.
+        let doc_intents = self.pdf.output_intents();
+        let oi_cmyk = zpdf::output_intent_cmyk_profile(
+            self.pdf.file(),
+            self.pdf.page_output_intents(&page),
+            &doc_intents,
+            &mut colors,
+        );
         // Render the effective box (CropBox ∩ MediaBox) with `/Rotate` baked in,
         // matching the winit viewer and `PdfPage::effective_box()` invariant — the
         // raw `media_box` would show the untrimmed sheet and ignore page rotation.
-        let display_list = ContentInterpreter::new(page.effective_box())
+        let mut interpreter = ContentInterpreter::new(page.effective_box())
             .with_page_rotation(page.rotate)
             .with_fonts(&mut fonts)
             .with_document(self.pdf.file(), &page.resources)
             .with_images(&mut images)
-            .with_colors(&mut colors)
-            .interpret(&content);
+            .with_colors(&mut colors);
+        if let Some(profile) = oi_cmyk {
+            interpreter = interpreter.with_output_intent_cmyk(profile);
+        }
+        let display_list = interpreter.interpret(&content);
 
         let mut renderer = WgpuRenderer::new().with_fonts(&fonts).with_images(&images);
         if let Some(context) = context_slot.take() {
