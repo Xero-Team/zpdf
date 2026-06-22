@@ -2,6 +2,73 @@
 
 ## Unreleased
 
+### Overprint (PDF 8.6.7)
+
+Overprinting is now honoured on both backends. A painting operation set to
+overprint paints **only the colorants its source colour names** and leaves the
+rest of the backdrop untouched — so K-only black text overprints onto a colour
+without knocking it out, and one process ink laid over another *mixes* (cyan
+over yellow → green) instead of replacing it.
+
+The graphics state grew `/OP` (stroking), `/op` (nonstroking; inherits `/OP`
+when absent), and `/OPM` (overprint mode), parsed in the `gs` ExtGState handler.
+At each colour-set operator the interpreter also records the source colour's
+**CMYK colorant projection**:
+
+- **DeviceCMYK / ICCBased(4)** keep their four tints, and `/OPM` decides the
+  active colorants — mode 0 paints all four (knockout, a no-op on a CMYK-only
+  device), mode 1 paints only the nonzero ones (the classic "nonzero overprint"
+  that lets 0-valued components show the backdrop through);
+- **DeviceGray** maps to the black colorant `(0,0,0,1−g)`;
+- **Separation / DeviceN** run their tint transform and take the resulting
+  process colorants (nonzero rule, independent of `/OPM`);
+- **DeviceRGB, CIE (Lab/CalRGB), ICC non-4-channel, Pattern** are additive or
+  non-colorant spaces where overprint has no visible effect → treated as a
+  normal paint.
+
+The active-colorant mask plus source CMYK travel into the flat display list as a
+new `Overprint { cmyk, active }` on `FillPath` / `StrokePath` / `GlyphRun`
+(images and shadings are out of scope). Because the backdrop is only known at
+paint time, the composite happens in the **backends**, in *naïve subtractive
+CMYK*: the active channels are taken from the source, the rest read from the
+backdrop, recombined, and written back. The conversions
+(`zpdf_core::{rgb_to_cmyk_naive, cmyk_to_rgb_naive}`, a new mutually-inverse
+pair shared by the interpreter and both backends) round-trip exactly, so an
+overprint never disturbs a colorant it does not name. Overprinted content thus
+renders with the textbook ink model (100 % K = pure black) rather than the SWOP
+fidelity polynomial used for normal CMYK painting — a deliberate trade for
+round-trip safety, documented on the conversions.
+
+- **CPU** (the oracle): the element is rendered to a scratch buffer to capture
+  its coverage·opacity, then merged onto the canvas per-pixel (mirrors the
+  existing knockout-merge structure).
+- **wgpu**: an overprinted fill/stroke/glyph is routed through an offscreen
+  layer (forcing the layered path) and composited with a new overprint mode in
+  `composite.wgsl`, which decomposes the backdrop, selects per channel, and
+  recombines — the same machinery as the 16 blend modes plus a colorant mask
+  and source-CMYK uniform.
+
+Pure-Rust, zero new dependencies. Verified by CPU acceptance tests (cyan+yellow
+→ green, magenta+cyan → blue, knockout default, `/OPM 0` no-op, real-valued
+`/OPM 1.0`, a Separation spot colour, white-gray paints-nothing, stroke
+overprint) and a GPU↔CPU parity suite (fills, partial alpha, multi-colorant
+DeviceN, stroke) — all **0.000 %** differing. An adversarial multi-dimension
+review hardened the edge cases: ICC-CMYK initial colour, an `active == 0` paint
+(paints nothing rather than bumping a non-opaque backdrop's alpha), non-finite
+tint-transform output (sanitised to 0), tiling-cell / Pattern-space colorant
+reset, and overprint inside a soft-mask group now honoured on the GPU to match
+the CPU oracle.
+
+Known limitations (documented residuals): image and shading overprint are not
+composited (treated as normal paint); an element that is *both* overprinting and
+carries a non-Normal blend mode or `/SMask` composites against the isolated
+group's backdrop rather than the page (degrades to a knockout for that rare
+combination); overprint inside a knockout group falls back to plain knockout;
+and, as before, the wgpu backend has no per-page time budget, so an overprint —
+which routes each element through the layered path — widens the (pre-existing)
+surface where a pathological page can produce many composite passes (the CPU
+backend's deadline backstop still truncates such pages).
+
 ### Variable fonts (OpenType `fvar`/`gvar`)
 
 An embedded (or substituted) **variable** font program now renders at the instance

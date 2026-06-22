@@ -224,6 +224,46 @@ struct TilingPatternDef {
     paint_type: i64,
 }
 
+/// The CMYK colorant projection of the current fill/stroke colour, kept so the
+/// overprint emitter (PDF 8.6.7) can tell which device colorants a paint writes.
+/// `None` for additive / CIE / Pattern spaces, where overprint is a no-op.
+#[derive(Debug, Clone, Copy)]
+struct Colorant {
+    /// Source colour as process-colorant tints `(C, M, Y, K)`.
+    cmyk: [f32; 4],
+    /// True for DeviceCMYK / ICCBased(4): `/OPM` governs whether a 0 component
+    /// is painted (mode 0, knockout) or left (mode 1, nonzero overprint). For
+    /// DeviceGray and Separation/DeviceN the nonzero rule always applies.
+    cmyk_device: bool,
+}
+
+/// Clamp a colorant tint to `0..=1`, mapping non-finite (NaN/Inf, which a
+/// malformed tint transform can yield) to 0 so overprint descriptors stay
+/// finite and the active-bit test (`!= 0.0`) is well-defined on both backends.
+fn fin(v: f64) -> f32 {
+    if v.is_finite() {
+        v.clamp(0.0, 1.0) as f32
+    } else {
+        0.0
+    }
+}
+
+/// DeviceGray `g` projected onto the black colorant: `(0,0,0,1−g)`.
+fn gray_colorant(gray: f32) -> Colorant {
+    Colorant {
+        cmyk: [0.0, 0.0, 0.0, fin(1.0 - gray as f64)],
+        cmyk_device: false,
+    }
+}
+
+/// DeviceCMYK colorants verbatim (OPM-governed).
+fn cmyk_colorant(c: f64, m: f64, y: f64, k: f64) -> Colorant {
+    Colorant {
+        cmyk: [fin(c), fin(m), fin(y), fin(k)],
+        cmyk_device: true,
+    }
+}
+
 #[derive(Debug, Clone)]
 struct GraphicsState {
     ctm: Matrix,
@@ -259,6 +299,16 @@ struct GraphicsState {
     /// Colour rendering intent (`ri` operator / ExtGState /RI). Applied when
     /// compiling ICCBased profiles into transforms.
     rendering_intent: zpdf_color::RenderIntent,
+    /// ExtGState /op — nonstroking (fill/text-fill/image) overprint (8.6.7).
+    fill_overprint: bool,
+    /// ExtGState /OP — stroking (and text-stroke) overprint (8.6.7).
+    stroke_overprint: bool,
+    /// ExtGState /OPM — overprint mode (0 = knockout zero, 1 = nonzero).
+    overprint_mode: u8,
+    /// CMYK colorant projection of `fill_color` (None = not a colorant space).
+    fill_colorant: Option<Colorant>,
+    /// CMYK colorant projection of `stroke_color`.
+    stroke_colorant: Option<Colorant>,
 }
 
 impl Default for GraphicsState {
@@ -291,6 +341,17 @@ impl Default for GraphicsState {
             blend_mode: BlendMode::Normal,
             soft_mask: None,
             rendering_intent: zpdf_color::RenderIntent::RelativeColorimetric,
+            fill_overprint: false,
+            stroke_overprint: false,
+            overprint_mode: 0,
+            fill_colorant: Some(Colorant {
+                cmyk: [0.0, 0.0, 0.0, 1.0],
+                cmyk_device: false,
+            }),
+            stroke_colorant: Some(Colorant {
+                cmyk: [0.0, 0.0, 0.0, 1.0],
+                cmyk_device: false,
+            }),
         }
     }
 }
@@ -754,12 +815,14 @@ impl<'a> ContentInterpreter<'a> {
                 self.current.fill_color = Color::gray(gray);
                 self.current.fill_cs = ActiveColorSpace::DeviceGray;
                 self.current.fill_pattern = None;
+                self.current.fill_colorant = Some(gray_colorant(gray));
             }
             "G" => {
                 let gray = self.pop_f64() as f32;
                 self.current.stroke_color = Color::gray(gray);
                 self.current.stroke_cs = ActiveColorSpace::DeviceGray;
                 self.current.stroke_pattern = None;
+                self.current.stroke_colorant = Some(gray_colorant(gray));
             }
             "rg" => {
                 let b = self.pop_f64() as f32;
@@ -768,6 +831,7 @@ impl<'a> ContentInterpreter<'a> {
                 self.current.fill_color = Color::rgb(r, g, b);
                 self.current.fill_cs = ActiveColorSpace::DeviceRGB;
                 self.current.fill_pattern = None;
+                self.current.fill_colorant = None;
             }
             "RG" => {
                 let b = self.pop_f64() as f32;
@@ -776,6 +840,7 @@ impl<'a> ContentInterpreter<'a> {
                 self.current.stroke_color = Color::rgb(r, g, b);
                 self.current.stroke_cs = ActiveColorSpace::DeviceRGB;
                 self.current.stroke_pattern = None;
+                self.current.stroke_colorant = None;
             }
             "k" => {
                 let k_val = self.pop_f64();
@@ -786,6 +851,7 @@ impl<'a> ContentInterpreter<'a> {
                 self.current.fill_color = Color::rgb(r as f32, g as f32, b as f32);
                 self.current.fill_cs = ActiveColorSpace::DeviceCMYK;
                 self.current.fill_pattern = None;
+                self.current.fill_colorant = Some(cmyk_colorant(c_val, m_val, y_val, k_val));
             }
             "K" => {
                 let k_val = self.pop_f64();
@@ -796,6 +862,7 @@ impl<'a> ContentInterpreter<'a> {
                 self.current.stroke_color = Color::rgb(r as f32, g as f32, b as f32);
                 self.current.stroke_cs = ActiveColorSpace::DeviceCMYK;
                 self.current.stroke_pattern = None;
+                self.current.stroke_colorant = Some(cmyk_colorant(c_val, m_val, y_val, k_val));
             }
             "cs" => {
                 let name = self.pop_name();
@@ -805,6 +872,12 @@ impl<'a> ContentInterpreter<'a> {
                 // (black / index 0 / tint 1.0 all paint-as-dark; Pattern has none).
                 if !matches!(self.current.fill_cs, ActiveColorSpace::Pattern { .. }) {
                     self.current.fill_color = self.initial_color(&self.current.fill_cs);
+                    let cs = self.current.fill_cs.clone();
+                    self.current.fill_colorant = self.initial_colorant(&cs);
+                } else {
+                    // Pattern is not a colorant space; the colour (and overprint
+                    // colorant) arrive with scn. Clear stale colorant meanwhile.
+                    self.current.fill_colorant = None;
                 }
             }
             "CS" => {
@@ -813,6 +886,10 @@ impl<'a> ContentInterpreter<'a> {
                 self.current.stroke_pattern = None;
                 if !matches!(self.current.stroke_cs, ActiveColorSpace::Pattern { .. }) {
                     self.current.stroke_color = self.initial_color(&self.current.stroke_cs);
+                    let cs = self.current.stroke_cs.clone();
+                    self.current.stroke_colorant = self.initial_colorant(&cs);
+                } else {
+                    self.current.stroke_colorant = None;
                 }
             }
             "sc" | "scn" => {
@@ -826,9 +903,12 @@ impl<'a> ContentInterpreter<'a> {
                     }
                     self.current.fill_pattern = pattern;
                     self.current.fill_color = approx;
+                    self.current.fill_colorant = None;
                 } else {
                     let cs = self.current.fill_cs.clone();
-                    self.current.fill_color = self.pop_color(&cs);
+                    let (color, colorant) = self.pop_color_and_colorant(&cs);
+                    self.current.fill_color = color;
+                    self.current.fill_colorant = colorant;
                 }
             }
             "SC" | "SCN" => {
@@ -840,9 +920,12 @@ impl<'a> ContentInterpreter<'a> {
                     }
                     self.current.stroke_pattern = pattern;
                     self.current.stroke_color = approx;
+                    self.current.stroke_colorant = None;
                 } else {
                     let cs = self.current.stroke_cs.clone();
-                    self.current.stroke_color = self.pop_color(&cs);
+                    let (color, colorant) = self.pop_color_and_colorant(&cs);
+                    self.current.stroke_color = color;
+                    self.current.stroke_colorant = colorant;
                 }
             }
 
@@ -1246,6 +1329,26 @@ impl<'a> ContentInterpreter<'a> {
         }
     }
 
+    /// Colorant projection for a freshly-selected space at its initial value
+    /// (mirrors [`Self::initial_color`]: device/CIE components 0; tint 1.0).
+    fn initial_colorant(&self, cs: &ActiveColorSpace) -> Option<Colorant> {
+        // Mirror `initial_color` (which is black for every device/ICC space): a
+        // CMYK/ICC-4 space starts at K=1, gray/ICC-1 at black. A compiled ICC
+        // profile (`Icc`) is the common ICCBased case — handle it, not just the
+        // profileless `ICCBased(n)` fallback, so the colorant agrees with the
+        // displayed initial colour instead of projecting to all-zeros (white).
+        let vals: &[f64] = match cs {
+            ActiveColorSpace::Indexed { .. } => &[0.0],
+            ActiveColorSpace::Tint { .. } => &[1.0],
+            ActiveColorSpace::DeviceCMYK | ActiveColorSpace::ICCBased(4) => &[0.0, 0.0, 0.0, 1.0],
+            ActiveColorSpace::Icc(t) if t.components() == 4 => &[0.0, 0.0, 0.0, 1.0],
+            ActiveColorSpace::DeviceGray | ActiveColorSpace::ICCBased(1) => &[0.0],
+            ActiveColorSpace::Icc(t) if t.components() == 1 => &[0.0],
+            _ => &[0.0, 0.0, 0.0, 0.0],
+        };
+        self.colorant_projection(cs, vals)
+    }
+
     fn pop_color(&mut self, cs: &ActiveColorSpace) -> Color {
         let n = cs.components();
         let mut vals = Vec::with_capacity(n);
@@ -1254,6 +1357,21 @@ impl<'a> ContentInterpreter<'a> {
         }
         vals.reverse();
         self.components_to_rgb(cs, &vals)
+    }
+
+    /// Pop `cs`'s components once, returning both the display RGB and its CMYK
+    /// colorant projection (for overprint). Avoids popping the operands twice.
+    fn pop_color_and_colorant(&mut self, cs: &ActiveColorSpace) -> (Color, Option<Colorant>) {
+        let n = cs.components();
+        let mut vals = Vec::with_capacity(n);
+        for _ in 0..n {
+            vals.push(self.pop_f64());
+        }
+        vals.reverse();
+        (
+            self.components_to_rgb(cs, &vals),
+            self.colorant_projection(cs, &vals),
+        )
     }
 
     /// Convert component values in `cs` to an RGB display color.
@@ -1327,6 +1445,96 @@ impl<'a> ContentInterpreter<'a> {
                 Color::gray(1.0 - max_tint as f32)
             }
             ActiveColorSpace::Pattern { .. } => Color::black(),
+        }
+    }
+
+    /// CMYK colorant projection of `vals` in `cs` for overprint (PDF 8.6.7),
+    /// or `None` for additive / CIE / indexed / pattern spaces where overprint
+    /// has no visible effect (they paint all process colorants → knockout).
+    fn colorant_projection(&self, cs: &ActiveColorSpace, vals: &[f64]) -> Option<Colorant> {
+        let get = |i: usize| vals.get(i).copied().unwrap_or(0.0);
+        match cs {
+            ActiveColorSpace::DeviceGray | ActiveColorSpace::ICCBased(1) => {
+                Some(gray_colorant(get(0) as f32))
+            }
+            ActiveColorSpace::DeviceCMYK | ActiveColorSpace::ICCBased(4) => {
+                Some(cmyk_colorant(get(0), get(1), get(2), get(3)))
+            }
+            // ICC CMYK: treat the input components as CMYK tints (OPM applies).
+            ActiveColorSpace::Icc(t) if t.components() == 4 => {
+                Some(cmyk_colorant(get(0), get(1), get(2), get(3)))
+            }
+            ActiveColorSpace::Tint {
+                n,
+                transform,
+                alternate,
+            } => {
+                // Project the tint through its transform to the alternate space,
+                // then recover that space's colorants. A spot/DeviceN paints
+                // exactly the colorants it maps to → always the nonzero rule.
+                let alt_vals = match transform.as_ref().and_then(|f| f.eval(vals)) {
+                    Some(out) => out,
+                    None => {
+                        // No usable transform: dark-for-full-tint ≈ K only.
+                        let max_tint = vals
+                            .iter()
+                            .take(*n)
+                            .fold(0.0f64, |acc, &v| acc.max(v.clamp(0.0, 1.0)));
+                        return Some(Colorant {
+                            cmyk: [0.0, 0.0, 0.0, fin(max_tint)],
+                            cmyk_device: false,
+                        });
+                    }
+                };
+                match self.colorant_projection(alternate, &alt_vals) {
+                    Some(c) => Some(Colorant {
+                        cmyk: c.cmyk,
+                        cmyk_device: false,
+                    }),
+                    None => {
+                        // Alternate is additive/CIE: project its RGB to CMYK.
+                        let rgb = self.components_to_rgb(alternate, &alt_vals);
+                        let (c, m, y, k) =
+                            zpdf_color::rgb_to_cmyk_naive(rgb.r as f64, rgb.g as f64, rgb.b as f64);
+                        Some(Colorant {
+                            cmyk: [fin(c), fin(m), fin(y), fin(k)],
+                            cmyk_device: false,
+                        })
+                    }
+                }
+            }
+            // DeviceRGB, ICCBased(3)/odd, Icc(non-4), Lab, Indexed, Pattern:
+            // additive or non-colorant — overprint is a no-op.
+            _ => None,
+        }
+    }
+
+    /// Build the display-list overprint descriptor for a paint, or `None` when
+    /// overprint is off, the colour is not in a device-colorant space, or it
+    /// paints all four process colorants (identical to a normal opaque paint,
+    /// which renders through the fidelity-CMYK path instead of naïve CMYK).
+    fn overprint_descriptor(&self, enabled: bool, colorant: Option<Colorant>) -> Option<Overprint> {
+        if !enabled {
+            return None;
+        }
+        let Colorant { cmyk, cmyk_device } = colorant?;
+        // OPM only distinguishes all-vs-nonzero for a DeviceCMYK source; spot
+        // and gray colorants always paint exactly their nonzero channels.
+        let active: u8 = if cmyk_device && self.current.overprint_mode == 0 {
+            0b1111
+        } else {
+            let mut m = 0u8;
+            for (i, &v) in cmyk.iter().enumerate() {
+                if v != 0.0 {
+                    m |= 1 << i;
+                }
+            }
+            m
+        };
+        if active == 0b1111 {
+            None
+        } else {
+            Some(Overprint { cmyk, active })
         }
     }
 
@@ -2103,6 +2311,29 @@ impl<'a> ContentInterpreter<'a> {
         }
         if let Ok(a) = dict.get_f64("CA") {
             self.current.stroke_alpha = a as f32;
+        }
+        // Overprint (8.6.7): /OP = stroking, /op = nonstroking. Per spec, if
+        // /op is absent, /OP also sets the nonstroking parameter.
+        let op_for_stroke = match dict.get("OP") {
+            Some(PdfObject::Bool(b)) => Some(*b),
+            _ => None,
+        };
+        if let Some(b) = op_for_stroke {
+            self.current.stroke_overprint = b;
+        }
+        match dict.get("op") {
+            Some(PdfObject::Bool(b)) => self.current.fill_overprint = *b,
+            _ => {
+                if let Some(b) = op_for_stroke {
+                    self.current.fill_overprint = b;
+                }
+            }
+        }
+        // /OPM: overprint mode (only 0 and 1 are defined; clamp others to 1).
+        // Read as a number so a real-valued `/OPM 1.0` (some producers emit it)
+        // is honoured, not just an integer.
+        if let Ok(m) = dict.get_f64("OPM") {
+            self.current.overprint_mode = if m.round() == 0.0 { 0 } else { 1 };
         }
         if let Ok(w) = dict.get_f64("LW") {
             self.current.line_width = w as f32;
@@ -2972,6 +3203,8 @@ impl<'a> ContentInterpreter<'a> {
             style,
             paint: Paint::Solid(self.current.stroke_color),
             alpha: self.current.stroke_alpha,
+            overprint: self
+                .overprint_descriptor(self.current.stroke_overprint, self.current.stroke_colorant),
         };
         self.emit_painted(cmd);
     }
@@ -3034,6 +3267,8 @@ impl<'a> ContentInterpreter<'a> {
             rule,
             paint: Paint::Solid(self.current.fill_color),
             alpha: self.current.fill_alpha,
+            overprint: self
+                .overprint_descriptor(self.current.fill_overprint, self.current.fill_colorant),
         };
         self.emit_painted(cmd);
     }
@@ -3201,10 +3436,18 @@ impl<'a> ContentInterpreter<'a> {
                 if uncolored {
                     self.current.fill_color = pattern_color;
                     self.current.stroke_color = pattern_color;
+                    // Uncolored cell colour is the pattern's base-space tint, not
+                    // tracked as a colorant; overprint is off inside the cell.
+                    self.current.fill_colorant = None;
+                    self.current.stroke_colorant = None;
                     self.suppress_color_ops = true;
                 } else {
                     self.current.fill_color = Color::black();
                     self.current.stroke_color = Color::black();
+                    // Match the reset-to-black colour so an overprint before any
+                    // colour op in the cell uses black's colorant, not a stale one.
+                    self.current.fill_colorant = Some(gray_colorant(0.0));
+                    self.current.stroke_colorant = Some(gray_colorant(0.0));
                 }
                 self.text_matrix = Matrix::identity();
                 self.text_line_matrix = Matrix::identity();
@@ -3281,9 +3524,20 @@ impl<'a> ContentInterpreter<'a> {
         transform: Matrix,
         h_scale: f32,
     ) {
-        let paint_color = match self.current.render_mode {
-            1 | 5 => self.current.stroke_color,
-            _ => self.current.fill_color,
+        // Text-fill modes (0/2/4/6) take the nonstroking colour + overprint;
+        // text-stroke modes (1/5) take the stroking colour + overprint.
+        let (paint_color, overprint) = match self.current.render_mode {
+            1 | 5 => (
+                self.current.stroke_color,
+                self.overprint_descriptor(
+                    self.current.stroke_overprint,
+                    self.current.stroke_colorant,
+                ),
+            ),
+            _ => (
+                self.current.fill_color,
+                self.overprint_descriptor(self.current.fill_overprint, self.current.fill_colorant),
+            ),
         };
         let cmd = RenderCommand::DrawGlyphRun(GlyphRun {
             font_id,
@@ -3291,6 +3545,7 @@ impl<'a> ContentInterpreter<'a> {
             glyphs,
             paint: Paint::Solid(paint_color),
             alpha: self.current.fill_alpha,
+            overprint,
             transform,
             h_scale,
         });

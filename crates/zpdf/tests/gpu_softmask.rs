@@ -42,6 +42,7 @@ fn fill(x0: f64, y0: f64, x1: f64, y1: f64, c: Color, alpha: f32) -> RenderComma
         rule: FillRule::NonZero,
         paint: Paint::Solid(c),
         alpha,
+        overprint: None,
     }
 }
 

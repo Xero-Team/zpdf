@@ -180,18 +180,38 @@ impl<'a> RenderBackend for WgpuRenderer<'a> {
                 rule,
                 paint: Paint::Solid(c),
                 alpha,
+                overprint,
             } => {
                 let color = quantize_premul(c, *alpha);
-                page.recorder.add_fill(path, *rule, color, &page.map);
+                match overprint {
+                    // Overprint composites against the backdrop → offscreen layer.
+                    Some(op) if op.active != 0 => {
+                        page.recorder.push_overprint(*op);
+                        page.recorder.add_fill(path, *rule, color, &page.map);
+                        page.recorder.pop_blend();
+                    }
+                    // active == 0 paints no colorants → nothing to draw.
+                    Some(_) => {}
+                    None => page.recorder.add_fill(path, *rule, color, &page.map),
+                }
             }
             RenderCommand::StrokePath {
                 path,
                 style,
                 paint: Paint::Solid(c),
                 alpha,
+                overprint,
             } => {
                 let color = quantize_premul(c, *alpha);
-                page.recorder.add_stroke(path, style, color, &page.map);
+                match overprint {
+                    Some(op) if op.active != 0 => {
+                        page.recorder.push_overprint(*op);
+                        page.recorder.add_stroke(path, style, color, &page.map);
+                        page.recorder.pop_blend();
+                    }
+                    Some(_) => {}
+                    None => page.recorder.add_stroke(path, style, color, &page.map),
+                }
             }
             RenderCommand::PushClip { path, rule } => {
                 page.recorder.push_clip(path, *rule, &page.map);
@@ -204,7 +224,15 @@ impl<'a> RenderBackend for WgpuRenderer<'a> {
             }
             RenderCommand::DrawGlyphRun(run) => {
                 if let Some(fonts) = self.font_cache {
-                    glyph::render_glyph_run(&mut page.recorder, fonts, &page.map, run);
+                    match run.overprint {
+                        Some(op) if op.active != 0 => {
+                            page.recorder.push_overprint(op);
+                            glyph::render_glyph_run(&mut page.recorder, fonts, &page.map, run);
+                            page.recorder.pop_blend();
+                        }
+                        Some(_) => {}
+                        None => glyph::render_glyph_run(&mut page.recorder, fonts, &page.map, run),
+                    }
                 }
             }
             RenderCommand::DrawImage(draw) => {
@@ -497,16 +525,48 @@ fn record_dl_commands(
                 rule,
                 paint: Paint::Solid(c),
                 alpha,
-            } => rec.add_fill(path, *rule, quantize_premul(c, *alpha), map),
+                overprint,
+            } => {
+                let color = quantize_premul(c, *alpha);
+                match overprint {
+                    Some(op) if op.active != 0 => {
+                        rec.push_overprint(*op);
+                        rec.add_fill(path, *rule, color, map);
+                        rec.pop_blend();
+                    }
+                    Some(_) => {}
+                    None => rec.add_fill(path, *rule, color, map),
+                }
+            }
             RenderCommand::StrokePath {
                 path,
                 style,
                 paint: Paint::Solid(c),
                 alpha,
-            } => rec.add_stroke(path, style, quantize_premul(c, *alpha), map),
+                overprint,
+            } => {
+                let color = quantize_premul(c, *alpha);
+                match overprint {
+                    Some(op) if op.active != 0 => {
+                        rec.push_overprint(*op);
+                        rec.add_stroke(path, style, color, map);
+                        rec.pop_blend();
+                    }
+                    Some(_) => {}
+                    None => rec.add_stroke(path, style, color, map),
+                }
+            }
             RenderCommand::DrawGlyphRun(run) => {
                 if let Some(f) = fonts {
-                    glyph::render_glyph_run(rec, f, map, run);
+                    match run.overprint {
+                        Some(op) if op.active != 0 => {
+                            rec.push_overprint(op);
+                            glyph::render_glyph_run(rec, f, map, run);
+                            rec.pop_blend();
+                        }
+                        Some(_) => {}
+                        None => glyph::render_glyph_run(rec, f, map, run),
+                    }
                 }
             }
             RenderCommand::DrawImage(draw) => {
@@ -637,6 +697,17 @@ fn init_layer(
 /// composited identically to one on the page. Recurses through [`apply_soft_mask`]
 /// for sub-masks; `pool`, `encoder`, and the `keep_*` lifetimes are threaded
 /// through so every layer/bind-group outlives the single submit.
+/// One open transparency/overprint group on the composite stack: its blend
+/// mode, group alpha, optional soft mask, inherited clips, and optional
+/// overprint descriptor (mutually exclusive with a real blend/mask in practice).
+type BlendFrame<'a> = (
+    zpdf_display_list::BlendMode,
+    f32,
+    Option<&'a record::MaskOps>,
+    Vec<record::ClipStamp>,
+    Option<zpdf_display_list::Overprint>,
+);
+
 #[allow(clippy::too_many_arguments)]
 fn composite_into(
     ctx: &GpuContext,
@@ -651,12 +722,7 @@ fn composite_into(
     use wgpu::util::DeviceExt;
     let device = &ctx.device;
     let mut active: Vec<usize> = vec![base];
-    let mut blend_info: Vec<(
-        zpdf_display_list::BlendMode,
-        f32,
-        Option<&record::MaskOps>,
-        Vec<record::ClipStamp>,
-    )> = Vec::new();
+    let mut blend_info: Vec<BlendFrame> = Vec::new();
 
     let mut i = 0;
     while i < ops.len() {
@@ -684,19 +750,21 @@ fn composite_into(
                 alpha,
                 clips,
                 mask,
+                overprint,
             } => {
                 let g = pool.acquire(device);
                 init_layer(encoder, pool.get(g), wgpu::Color::TRANSPARENT, clips, res);
                 active.push(g);
-                blend_info.push((*mode, *alpha, mask.as_ref(), clips.clone()));
+                blend_info.push((*mode, *alpha, mask.as_ref(), clips.clone(), *overprint));
             }
             PageOp::PopBlend => {
                 let group = active.pop().unwrap_or(base);
-                let (mode, alpha, mask, clips) = blend_info.pop().unwrap_or((
+                let (mode, alpha, mask, clips, overprint) = blend_info.pop().unwrap_or((
                     zpdf_display_list::BlendMode::Normal,
                     1.0,
                     None,
                     Vec::new(),
+                    None,
                 ));
                 let parent = *active.last().unwrap_or(&base);
 
@@ -713,14 +781,29 @@ fn composite_into(
 
                 let scratch = pool.acquire(device);
 
-                // Mode + group-alpha uniform (16-byte aligned) + composite bind group.
+                // Composite uniform (ModeU, 32 bytes): blend id + group alpha, or
+                // the overprint sentinel + source colorants/mask when overprinting.
+                const OVERPRINT_MODE: u32 = 100;
+                let (id, alpha_bits, op_active, cmyk) = match overprint {
+                    Some(op) => (OVERPRINT_MODE, 1.0f32.to_bits(), op.active as u32, op.cmyk),
+                    None => (
+                        blend::blend_index(mode),
+                        alpha.clamp(0.0, 1.0).to_bits(),
+                        0u32,
+                        [0.0; 4],
+                    ),
+                };
                 let mode_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("zpdf-blend-mode"),
                     contents: bytemuck::cast_slice(&[
-                        blend::blend_index(mode),
-                        alpha.clamp(0.0, 1.0).to_bits(),
-                        0,
-                        0,
+                        id,
+                        alpha_bits,
+                        op_active,
+                        0u32,
+                        cmyk[0].to_bits(),
+                        cmyk[1].to_bits(),
+                        cmyk[2].to_bits(),
+                        cmyk[3].to_bits(),
                     ]),
                     usage: wgpu::BufferUsages::UNIFORM,
                 });

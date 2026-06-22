@@ -10,9 +10,29 @@ struct Page {
     page_height: f32,
 };
 struct ModeU {
-    id: u32,
+    id: u32,     // BlendMode index, or OVERPRINT_MODE for an overprint composite
     alpha: f32,  // group constant alpha (/ca), applied to the source contribution
+    op_active: u32,        // overprint: painted-colorant bitmask (C=1,M=2,Y=4,K=8)
+    _pad: u32,
+    op_cmyk: vec4<f32>,    // overprint: source colour as (C,M,Y,K) tints
 };
+
+// Sentinel `id` selecting the overprint composite instead of a blend mode.
+const OVERPRINT_MODE: u32 = 100u;
+
+// Naïve subtractive CMYK ↔ sRGB, the mutually-inverse pair used for overprint
+// (matches zpdf_core::{rgb_to_cmyk_naive, cmyk_to_rgb_naive} on the CPU oracle).
+fn rgb_to_cmyk_naive(c: vec3<f32>) -> vec4<f32> {
+    let k = 1.0 - max(c.r, max(c.g, c.b));
+    if (k >= 1.0) {
+        return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    }
+    let inv = 1.0 - k;
+    return vec4<f32>((1.0 - c.r - k) / inv, (1.0 - c.g - k) / inv, (1.0 - c.b - k) / inv, k);
+}
+fn cmyk_to_rgb_naive(v: vec4<f32>) -> vec3<f32> {
+    return vec3<f32>((1.0 - v.x) * (1.0 - v.w), (1.0 - v.y) * (1.0 - v.w), (1.0 - v.z) * (1.0 - v.w));
+}
 
 @group(0) @binding(0) var<uniform> page: Page;
 @group(1) @binding(0) var base_tex: texture_2d<f32>;
@@ -137,6 +157,25 @@ fn fs_composite(in: VsOut) -> @location(0) vec4<f32> {
     if (as_ > 0.0) { cs = s.rgb / as_; }
     var cb = vec3<f32>(0.0);
     if (ab > 0.0) { cb = d.rgb / ab; }
+
+    // Overprint (PDF 8.6.7): paint only the `op_active` colorants and keep the
+    // rest of the backdrop, composited in naïve subtractive CMYK. `as_` is the
+    // element's coverage·opacity; the element's own RGB is unused. A transparent
+    // backdrop is white paper (no ink), so retained colorants stay 0.
+    if (mode.id == OVERPRINT_MODE) {
+        var paper = vec3<f32>(1.0);
+        if (ab > 0.0) { paper = cb; }
+        let bd = rgb_to_cmyk_naive(paper);
+        let act = mode.op_active;
+        let tc = select(bd.x, mode.op_cmyk.x, (act & 1u) != 0u);
+        let tm = select(bd.y, mode.op_cmyk.y, (act & 2u) != 0u);
+        let ty = select(bd.z, mode.op_cmyk.z, (act & 4u) != 0u);
+        let tk = select(bd.w, mode.op_cmyk.w, (act & 8u) != 0u);
+        let res = bd + as_ * (vec4<f32>(tc, tm, ty, tk) - bd);
+        let rgb = cmyk_to_rgb_naive(res);
+        let ao = ab + as_ * (1.0 - ab);
+        return vec4<f32>(rgb * ao, ao);
+    }
 
     var blended: vec3<f32>;
     if (mode.id >= 12u) {

@@ -253,7 +253,15 @@ cargo run -p zpdf-render-wgpu --example viewer -- <file.pdf>   # 交互浏览器
 - [x] Indexed 颜色空间（填充 + 图像调色板，含 Indexed-over-Lab）
 - [x] Separation / DeviceN（经 PDF 函数评估器走 tint transform → alternate）
 - [x] PDF 函数评估器（type 0/2/3/4，zpdf-color/src/function.rs）
-- [ ] Overprint
+- [x] Overprint（PDF 8.6.7）：ExtGState `/OP`(描边) `/op`(填充，缺省随 `/OP`) `/OPM`
+      解析进图形状态；按源颜色空间投影出 CMYK 着色剂与"激活通道"掩码（DeviceCMYK
+      受 OPM 控制 0=knockout/1=nonzero；DeviceGray→K；Separation/DeviceN 经 tint
+      变换投影到 CMYK 取非零；DeviceRGB/Lab/ICC 非 4 通道为 no-op）。`Overprint{cmyk,active}`
+      随 FillPath/StrokePath/GlyphRun 进显示列表，**后端按朴素减色 CMYK 合成**：仅激活
+      通道取源值、其余通道保留背景（`zpdf_core::{rgb,cmyk}_to_cmyk/rgb_naive` 互逆 →
+      未触及通道精确往返）。CPU 走 scratch-render + 逐像素合并（oracle），wgpu 经离屏层 +
+      composite.wgsl 新 overprint 模式合成，GPU↔CPU 6 例全 0.000%。仅作用于填充/描边/文本，
+      图像/阴影 overprint 暂未覆盖
 - [x] Rendering Intent（`ri` 算子 + ExtGState `/RI` + 图像 `/Intent` → moxcms 渲染意图；
       `IccCache` 按 (ObjectId, intent) 键控，含 ICC 规定回退序）
 

@@ -26,12 +26,16 @@ pub enum RenderCommand {
         rule: FillRule,
         paint: Paint,
         alpha: f32,
+        /// Overprint (PDF 8.6.7) for this fill, or `None` for a normal paint.
+        overprint: Option<Overprint>,
     },
     StrokePath {
         path: Path,
         style: StrokeStyle,
         paint: Paint,
         alpha: f32,
+        /// Overprint (PDF 8.6.7) for this stroke, or `None` for a normal paint.
+        overprint: Option<Overprint>,
     },
     DrawGlyphRun(GlyphRun),
     DrawImage(ImageDraw),
@@ -235,6 +239,41 @@ pub enum Paint {
     Shading(u32),
 }
 
+/// Overprint descriptor (PDF 8.6.7) for a painted primitive whose source colour
+/// lives in a device-colorant space (DeviceCMYK / DeviceGray / Separation /
+/// DeviceN) and whose ExtGState enables overprint (`/OP`, `/op`, `/OPM`).
+///
+/// Backends composite it in **naïve subtractive CMYK**: the colorants whose bit
+/// is set in `active` are painted from `cmyk`; the rest are read straight from
+/// the backdrop, so the operation never disturbs colorants it does not name
+/// (e.g. K-only black text overprints onto a colour without knocking it out).
+/// The conversion uses `zpdf_color::cmyk_to_rgb_naive` /
+/// `zpdf_color::rgb_to_cmyk_naive` so untouched colorants round-trip exactly.
+///
+/// `active` is never `0b1111` (all colorants painted == a normal opaque paint,
+/// emitted without an `Overprint`), but may be `0` (paints nothing — e.g. white
+/// in DeviceGray under the nonzero rule).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Overprint {
+    /// Source colour as process-colorant tints `(C, M, Y, K)`, each in `0..=1`.
+    pub cmyk: [f32; 4],
+    /// Bitmask of painted colorants: `C=1, M=2, Y=4, K=8`.
+    pub active: u8,
+}
+
+impl Overprint {
+    pub const C: u8 = 1;
+    pub const M: u8 = 2;
+    pub const Y: u8 = 4;
+    pub const K: u8 = 8;
+
+    /// True if colorant `i` (0=C,1=M,2=Y,3=K) is painted by this operation.
+    #[inline]
+    pub fn paints(&self, i: usize) -> bool {
+        self.active & (1 << i) != 0
+    }
+}
+
 // -- Text --
 
 pub type FontId = u32;
@@ -247,6 +286,8 @@ pub struct GlyphRun {
     pub glyphs: Vec<PositionedGlyph>,
     pub paint: Paint,
     pub alpha: f32,
+    /// Overprint (PDF 8.6.7) for this glyph run, or `None` for a normal paint.
+    pub overprint: Option<Overprint>,
     pub transform: Matrix,
     /// Horizontal text-scaling factor (Tz/100). Scales the glyph *shape* x only;
     /// per-glyph advances already include it. Almost always 1.0; negative values

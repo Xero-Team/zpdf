@@ -113,6 +113,12 @@ pub fn cmyk_to_rgb(c: f64, m: f64, y: f64, k: f64) -> (f64, f64, f64) {
     )
 }
 
+// Naïve subtractive CMYK ↔ sRGB (mutually-inverse, used for overprint
+// compositing) live in `zpdf-core` so both render backends — which do not
+// depend on this crate — share one definition. Re-exported here for the
+// content interpreter and colour-path callers.
+pub use zpdf_core::{cmyk_to_rgb_naive, rgb_to_cmyk_naive};
+
 /// Convert a CIE L*a*b* color to sRGB (ISO 32000-1 §8.6.5.4).
 ///
 /// `white_point` is the diffuse white from the Lab dict (default D50,

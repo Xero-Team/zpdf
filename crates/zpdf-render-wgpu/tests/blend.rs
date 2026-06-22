@@ -27,6 +27,7 @@ fn fill(c: Color, r: (f64, f64, f64, f64)) -> RenderCommand {
         rule: FillRule::NonZero,
         paint: Paint::Solid(c),
         alpha: 1.0,
+        overprint: None,
     }
 }
 

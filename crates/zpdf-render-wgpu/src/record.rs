@@ -8,7 +8,9 @@
 
 use crate::path::{fill_mesh, stroke_mesh, Mesh};
 use crate::transform::{PageMap, SolidVertex, TexturedVertex};
-use zpdf_display_list::{BlendMode, FillRule, Path as DlPath, SoftMaskKind, StrokeStyle};
+use zpdf_display_list::{
+    BlendMode, FillRule, Overprint, Path as DlPath, SoftMaskKind, StrokeStyle,
+};
 
 /// A soft mask's recorded geometry (ops referencing the shared page arena) plus
 /// the reduction parameters needed to turn it into per-pixel coverage.
@@ -69,6 +71,11 @@ pub enum PageOp {
         alpha: f32,
         clips: Vec<ClipStamp>,
         mask: Option<MaskOps>,
+        /// When set, the group is composited with the overprint formula (PDF
+        /// 8.6.7) instead of `mode`: a single element rendered into the layer,
+        /// then merged per-colorant against the backdrop. `mode`/`alpha` are
+        /// unused (Normal / 1.0).
+        overprint: Option<Overprint>,
     },
     /// End the current group: composite it onto the parent with `mode` (carried by
     /// the matching PushBlend), then re-stamp `clips` into the resulting layer.
@@ -230,6 +237,21 @@ impl PageRecorder {
             alpha,
             clips,
             mask,
+            overprint: None,
+        });
+    }
+
+    /// Begin an overprint group (PDF 8.6.7): the next recorded draw renders into
+    /// a fresh layer, composited onto the parent with the overprint formula.
+    /// Forces the layered render path (like any blend group).
+    pub fn push_overprint(&mut self, op: Overprint) {
+        let clips = self.active_clips();
+        self.ops.push(PageOp::PushBlend {
+            mode: BlendMode::Normal,
+            alpha: 1.0,
+            clips,
+            mask: None,
+            overprint: Some(op),
         });
     }
 

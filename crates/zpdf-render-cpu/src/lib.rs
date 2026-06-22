@@ -658,18 +658,22 @@ impl<'a> CpuRenderer<'a> {
     /// Dispatch the four painting commands to their renderers (shared by the
     /// normal path and the knockout path).
     fn render_paint_cmd(&mut self, cmd: &RenderCommand) {
+        // Overprint is intercepted in `execute` before this; the plain
+        // renderers below ignore it (so do the scratch passes that reuse them).
         match cmd {
             RenderCommand::FillPath {
                 path,
                 rule,
                 paint,
                 alpha,
+                ..
             } => self.render_fill(path, rule, paint, *alpha),
             RenderCommand::StrokePath {
                 path,
                 style,
                 paint,
                 alpha,
+                ..
             } => self.render_stroke(path, style, paint, *alpha),
             RenderCommand::DrawGlyphRun(run) => self.render_glyph_run(run),
             RenderCommand::DrawImage(draw) => self.render_image(draw),
@@ -747,6 +751,39 @@ impl<'a> CpuRenderer<'a> {
         if let (Some(g), Some(entry)) = (self.pixmap.as_mut(), self.blend_stack.last()) {
             let b0 = entry.backdrop.as_ref().map(|p| p.data());
             knockout_merge(g.data_mut(), elem.data(), shape.data(), b0);
+        }
+    }
+
+    /// Paint an overprinting element (PDF 8.6.7): render it alone to capture
+    /// per-pixel coverage·alpha, then merge it onto the canvas in naïve
+    /// subtractive CMYK — painting only the `active` colorants and reading the
+    /// rest from the backdrop, so it never disturbs colorants it does not name.
+    fn overprint_paint(&mut self, cmd: &RenderCommand, op: &Overprint) {
+        // No colorants painted → the op leaves every channel as the backdrop, a
+        // pure no-op. Skip it (also avoids spuriously raising a non-opaque
+        // backdrop's alpha and the full-page scratch work).
+        if op.active == 0 {
+            return;
+        }
+        let (w, h) = match self.pixmap.as_ref() {
+            Some(p) => (p.width(), p.height()),
+            None => return,
+        };
+        // Render the element (real colour/opacity, current clip) into a scratch
+        // buffer; only its alpha channel — the covered fraction — is consumed.
+        let canvas = self.pixmap.take();
+        self.pixmap = tiny_skia::Pixmap::new(w, h);
+        if self.pixmap.is_none() {
+            // OOM: fall back to a normal paint so content still appears.
+            self.pixmap = canvas;
+            self.render_paint_cmd(cmd);
+            return;
+        }
+        self.render_paint_cmd(cmd);
+        let elem = self.pixmap.take();
+        self.pixmap = canvas;
+        if let (Some(canvas), Some(elem)) = (self.pixmap.as_mut(), elem) {
+            overprint_merge(canvas.data_mut(), elem.data(), op);
         }
     }
 
@@ -1319,6 +1356,64 @@ fn knockout_merge(group: &mut [u8], elem: &[u8], shape: &[u8], b0: Option<&[u8]>
     }
 }
 
+/// The overprint descriptor of a painting command, if any (`None` for images
+/// and non-overprinting paints).
+fn paint_overprint(cmd: &RenderCommand) -> Option<Overprint> {
+    match cmd {
+        RenderCommand::FillPath { overprint, .. } | RenderCommand::StrokePath { overprint, .. } => {
+            *overprint
+        }
+        RenderCommand::DrawGlyphRun(run) => run.overprint,
+        _ => None,
+    }
+}
+
+/// Merge an overprinting element onto the canvas in naïve subtractive CMYK.
+/// `canvas`/`elem` are premultiplied RGBA8; `elem`'s alpha is the element's
+/// coverage·opacity. For each covered pixel the backdrop is decomposed into
+/// colorants, the `active` channels are taken from `op.cmyk` (others kept), the
+/// result recomposed to RGB, and written back premultiplied. A colorant the
+/// element does not paint round-trips exactly (rgb→cmyk→rgb is the identity for
+/// the naïve model), so the backdrop is undisturbed where the element is silent.
+fn overprint_merge(canvas: &mut [u8], elem: &[u8], op: &Overprint) {
+    for (c, e) in canvas.chunks_exact_mut(4).zip(elem.chunks_exact(4)) {
+        let a = e[3] as f64 / 255.0; // coverage · opacity
+        if a <= 0.0 {
+            continue;
+        }
+        let ba = c[3] as f64 / 255.0;
+        // Decompose the backdrop into colorants. A transparent backdrop carries
+        // no ink (white paper), so retained colorants stay 0.
+        let (br, bg, bb) = if ba > 0.0 {
+            (
+                c[0] as f64 / 255.0 / ba,
+                c[1] as f64 / 255.0 / ba,
+                c[2] as f64 / 255.0 / ba,
+            )
+        } else {
+            (1.0, 1.0, 1.0)
+        };
+        let (bc, bm, by, bk) = zpdf_core::rgb_to_cmyk_naive(br, bg, bb);
+        let bd = [bc, bm, by, bk];
+        let mut res = [0f64; 4];
+        for i in 0..4 {
+            let tgt = if op.active & (1 << i) != 0 {
+                op.cmyk[i] as f64
+            } else {
+                bd[i]
+            };
+            res[i] = bd[i] + a * (tgt - bd[i]);
+        }
+        let (rr, rg, rb) = zpdf_core::cmyk_to_rgb_naive(res[0], res[1], res[2], res[3]);
+        let out_a = ba + a * (1.0 - ba);
+        let enc = |v: f64| (v * out_a * 255.0).round().clamp(0.0, 255.0) as u8;
+        c[0] = enc(rr);
+        c[1] = enc(rg);
+        c[2] = enc(rb);
+        c[3] = (out_a * 255.0).round().clamp(0.0, 255.0) as u8;
+    }
+}
+
 /// Box-filter (area-average) downscale of a tight RGBA8 buffer. Each target
 /// pixel averages its covering source block, so no source pixel is dropped —
 /// unlike point/bilinear sampling at strong minification. Channels are averaged
@@ -1461,6 +1556,14 @@ impl<'a> RenderBackend for CpuRenderer<'a> {
             return Ok(());
         }
 
+        // Overprint (PDF 8.6.7): composite the element in subtractive CMYK so it
+        // leaves the colorants it does not paint untouched. (Inside a knockout
+        // group the knockout path above takes precedence — a rare combination.)
+        if let Some(op) = paint_overprint(cmd) {
+            self.overprint_paint(cmd, &op);
+            return Ok(());
+        }
+
         match cmd {
             RenderCommand::FillPath { .. }
             | RenderCommand::StrokePath { .. }
@@ -1533,6 +1636,7 @@ mod tests {
             style,
             paint: Paint::Solid(Color::rgb(0.0, 0.0, 0.0)),
             alpha: 1.0,
+            overprint: None,
         }
     }
 
@@ -1640,6 +1744,7 @@ mod tests {
             rule: FillRule::NonZero,
             paint: Paint::Solid(Color::rgb(1.0, 0.0, 0.0)),
             alpha: 1.0,
+            overprint: None,
         });
         let page = render(&dl, 1.0);
         assert_eq!((page.width, page.height), (20, 20));
@@ -1676,6 +1781,7 @@ mod tests {
             rule: FillRule::NonZero,
             paint: Paint::Solid(Color::rgb(0.0, 0.0, 0.0)),
             alpha: 1.0,
+            overprint: None,
         });
         dl.push(RenderCommand::PopClip);
         let page = render(&dl, 1.0);
