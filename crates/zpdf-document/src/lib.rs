@@ -1,6 +1,7 @@
 pub mod annot_appearance;
 pub mod annotation;
 mod catalog;
+pub mod embedded_files;
 pub mod font_loader;
 pub mod forms;
 pub mod optional_content;
@@ -9,13 +10,14 @@ pub mod page;
 
 pub use annotation::Annotation;
 pub use catalog::Catalog;
+pub use embedded_files::{EmbeddedFile, EmbeddedSource};
 pub use forms::{AcroForm, FieldKind, FieldValue, FormField};
 pub use optional_content::OcConfig;
 pub use output_intents::OutputIntent;
 pub use page::{PdfPage, ResourceDict};
 
 use std::sync::{Arc, OnceLock};
-use zpdf_core::{ParseLimits, Result};
+use zpdf_core::{Error, ParseLimits, Result};
 use zpdf_font::FontCache;
 use zpdf_parser::PdfFile;
 
@@ -134,6 +136,49 @@ impl PdfDocument {
     /// intents for that page. Empty for pre-2.0 / most documents.
     pub fn page_output_intents<'a>(&self, page: &'a PdfPage) -> &'a [OutputIntent] {
         &page.output_intents
+    }
+
+    /// The document's embedded files — file streams registered in the catalog's
+    /// `/Names /EmbeddedFiles` name tree (a viewer's "attachments"). Empty when
+    /// the document carries none. Pull a file's bytes with
+    /// [`PdfDocument::embedded_file_bytes`].
+    pub fn embedded_files(&self) -> Vec<EmbeddedFile> {
+        embedded_files::parse_embedded_files(&self.file)
+    }
+
+    /// Catalog-level associated files (`/Root /AF`, PDF 2.0). Each carries an
+    /// `/AFRelationship`. Per PDF 2.0 these are also listed by
+    /// [`PdfDocument::embedded_files`]; the two lists usually overlap.
+    pub fn associated_files(&self) -> Vec<EmbeddedFile> {
+        embedded_files::parse_associated_files(&self.file)
+    }
+
+    /// Page-level associated files (`/Page /AF`, PDF 2.0) for one page. `/AF` is
+    /// not inheritable, so only the leaf page dictionary is consulted.
+    pub fn page_associated_files(&self, page: &PdfPage) -> Vec<EmbeddedFile> {
+        match self
+            .file
+            .resolve(page.id)
+            .ok()
+            .and_then(|o| o.as_dict().ok().cloned())
+        {
+            Some(dict) => embedded_files::parse_page_associated_files(&self.file, &dict),
+            None => Vec::new(),
+        }
+    }
+
+    /// Decode and return the bytes of an embedded file. Routes through the
+    /// parser's filter pipeline, so it respects `ParseLimits` (max stream size).
+    /// Errors if the file specification carries no embedded stream
+    /// ([`EmbeddedFile::is_embedded`] is `false`).
+    pub fn embedded_file_bytes(&self, file: &EmbeddedFile) -> Result<Vec<u8>> {
+        match file.stream {
+            Some(id) => self.file.resolve_stream_data(id),
+            // An external file specification has nothing to extract; report the
+            // absent /EF as a missing key rather than a fake object-corruption
+            // error, so a caller can distinguish it from a decode failure.
+            None => Err(Error::MissingKey("EF".into())),
+        }
     }
 }
 

@@ -2,6 +2,45 @@
 
 ## Unreleased
 
+### Embedded files & associated files (attachments, PDF 2.0 `/AF`)
+
+The library now surfaces files **stored inside** a PDF: classic embedded files
+from the catalog's `/Names /EmbeddedFiles` name tree (a viewer's "attachments"),
+and ISO 32000-2 **associated files** (`/AF`) attached to the document or a page,
+each carrying an `/AFRelationship`. This is the mechanism PDF/A-3 and
+ZUGFeRD/Factur-X use to embed an invoice's source XML, so the bytes are now
+recoverable.
+
+- **Parsing & exposure** (`zpdf-document/src/embedded_files.rs`, zero new deps):
+  one `EmbeddedFile` model spans both sources — best file name (`/UF` preferred,
+  then `/F`/platform names), `/Desc`, `/AFRelationship`, the embedded stream's
+  `/Subtype` (MIME) and `/Params` (`/Size`, `/CreationDate`, `/ModDate`,
+  `/CheckSum`), and the stream's object id. A guarded name-tree walker (depth,
+  per-reference cycle, and entry-count caps) handles interior `/Kids` and leaf
+  `/Names` nodes; `/AF` arrays are read from the catalog and from page dicts.
+  Metadata is read off stream **dictionaries** — the payload is never decoded
+  during listing.
+
+- **API** (`PdfDocument`): `embedded_files()` (name tree), `associated_files()`
+  (catalog `/AF`), `page_associated_files(page)` (page `/AF`), and
+  `embedded_file_bytes(&EmbeddedFile)` — which decodes on demand through the
+  parser's filter pipeline, so it respects `ParseLimits`. `EmbeddedFile` /
+  `EmbeddedSource` are re-exported from the `zpdf` facade.
+
+- **CLI:** new `zpdf attachments <file.pdf> [--extract <index|name|all>]
+  [--out-dir <dir>]` lists embedded/associated files (deduplicated by embedded
+  stream, merging in the `/AF` relationship) and extracts them by listing index,
+  name, or `all`. Extraction is hardened: file names are **sanitized** (a
+  malicious `/UF` such as `../../etc/passwd` is reduced to its basename; path
+  separators, Windows-reserved characters / device names, and trailing dots and
+  spaces are neutralized) and writes **never overwrite an existing file** (atomic
+  create-new; a collision gets a ` (n)` suffix) — so an attachment can neither
+  escape `--out-dir` nor clobber a file in it. `zpdf info` also lists attachments.
+
+- **Lazy & non-regressing:** these paths run only when explicitly called, never
+  during open or rendering, so the malformed-corpus open/render robustness is
+  untouched.
+
 ### Output Intents — DeviceCMYK colour management (PDF/X & PDF 2.0)
 
 Output intents are now parsed, surfaced, and — for CMYK — honoured. An output

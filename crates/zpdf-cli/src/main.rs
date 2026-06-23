@@ -1,5 +1,8 @@
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
+use std::io::Write;
+use std::path::Path;
 use std::process;
 
 fn main() {
@@ -14,7 +17,9 @@ fn main() {
 
     if args.len() < 2 {
         eprintln!("Usage: zpdf <command> [args...]");
-        eprintln!("Commands: info, dump, render, text, tables, forms, compare, debug-stream");
+        eprintln!(
+            "Commands: info, dump, render, text, tables, forms, attachments, compare, debug-stream"
+        );
         process::exit(1);
     }
 
@@ -25,6 +30,7 @@ fn main() {
         "text" => cmd_text(&args[2..]),
         "tables" => cmd_tables(&args[2..]),
         "forms" => cmd_forms(&args[2..]),
+        "attachments" => cmd_attachments(&args[2..]),
         "compare" => cmd_compare(&args[2..]),
         "debug-stream" => cmd_debug_stream(&args[2..]),
         other => {
@@ -148,7 +154,58 @@ fn cmd_info(args: &[String]) -> zpdf::Result<()> {
         }
     }
 
+    let embedded = doc.embedded_files();
+    let embedded_streams: HashSet<zpdf::ObjectId> =
+        embedded.iter().filter_map(|e| e.stream).collect();
+    if !embedded.is_empty() {
+        println!("Embedded files: {}", embedded.len());
+        for ef in &embedded {
+            println!("  {}", describe_embedded_file(ef));
+        }
+    }
+    let associated = doc.associated_files();
+    if !associated.is_empty() {
+        println!("Associated files (PDF 2.0): {}", associated.len());
+        for af in &associated {
+            // A PDF 2.0 associated file is normally also in the name tree above;
+            // flag the overlap so the two counts are not misread as distinct files.
+            let also = match af.stream {
+                Some(id) if embedded_streams.contains(&id) => "  (also listed above)",
+                _ => "",
+            };
+            println!("  {}{also}", describe_embedded_file(af));
+        }
+    }
+
     Ok(())
+}
+
+/// One-line description of an embedded/associated file for listings: name, then
+/// the metadata that is actually present (relationship, MIME subtype, size).
+fn describe_embedded_file(ef: &zpdf::EmbeddedFile) -> String {
+    let name = if ef.name.is_empty() {
+        "(unnamed)"
+    } else {
+        &ef.name
+    };
+    let mut parts = Vec::new();
+    if let Some(rel) = &ef.relationship {
+        parts.push(format!("rel={rel}"));
+    }
+    if let Some(st) = &ef.subtype {
+        parts.push(st.clone());
+    }
+    if let Some(sz) = ef.size {
+        parts.push(format!("{sz} bytes"));
+    }
+    if !ef.is_embedded() {
+        parts.push("external (no /EF)".to_string());
+    }
+    if parts.is_empty() {
+        name.to_string()
+    } else {
+        format!("{name}  [{}]", parts.join(", "))
+    }
 }
 
 /// List the document's interactive-form (AcroForm) fields, types, and values.
@@ -187,6 +244,269 @@ fn cmd_forms(args: &[String]) -> zpdf::Result<()> {
     }
 
     Ok(())
+}
+
+/// List the document's embedded & associated files, and optionally extract them
+/// to disk. Extraction sanitizes file names (a `/UF` like `../../etc/passwd` is
+/// reduced to its basename) so a malicious attachment cannot escape `--out-dir`,
+/// and never overwrites an existing file — a colliding name gets a ` (n)` suffix.
+fn cmd_attachments(args: &[String]) -> zpdf::Result<()> {
+    let (args, password) = extract_password(args);
+    if args.is_empty() {
+        eprintln!(
+            "Usage: zpdf attachments <file.pdf> [--extract <index|name|all>] [--out-dir <dir>] [--password <pw>]"
+        );
+        process::exit(1);
+    }
+
+    let pdf_path = &args[0];
+    let mut extract: Option<String> = None;
+    let mut out_dir = String::from(".");
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--extract" => {
+                i += 1;
+                extract = Some(args.get(i).cloned().unwrap_or_else(|| {
+                    eprintln!("--extract requires a value (an index, a file name, or 'all')");
+                    process::exit(2);
+                }));
+            }
+            "--out-dir" => {
+                i += 1;
+                if let Some(s) = args.get(i) {
+                    out_dir = s.clone();
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    let doc = open_document(pdf_path, password.as_deref())?;
+    let all = collect_attachments(&doc);
+
+    if all.is_empty() {
+        println!("No embedded or associated files.");
+        return Ok(());
+    }
+
+    println!("{} embedded/associated file(s):", all.len());
+    for (idx, ef) in all.iter().enumerate() {
+        println!("  [{idx}] {}", describe_embedded_file(ef));
+        if let Some(d) = &ef.description {
+            println!("        description: {d}");
+        }
+        if let Some(c) = &ef.creation_date {
+            println!("        created: {c}");
+        }
+        if let Some(m) = &ef.mod_date {
+            println!("        modified: {m}");
+        }
+    }
+
+    let Some(target) = extract else {
+        return Ok(());
+    };
+
+    // `--extract` selects all files (`all`), one listing index, or every file
+    // whose name matches exactly (so unnamed/duplicate files are reachable by
+    // index, names by name).
+    let by_index = target.parse::<usize>().ok().filter(|&n| n < all.len());
+
+    fs::create_dir_all(&out_dir).map_err(zpdf::Error::Io)?;
+    let mut extracted = 0usize;
+    let mut matched = 0usize;
+    for (idx, ef) in all.iter().enumerate() {
+        let selected =
+            target == "all" || by_index == Some(idx) || (by_index.is_none() && ef.name == target);
+        if !selected {
+            continue;
+        }
+        matched += 1;
+        if !ef.is_embedded() {
+            eprintln!(
+                "  skip {:?}: external reference, no embedded bytes",
+                ef.name
+            );
+            continue;
+        }
+        let bytes = match doc.embedded_file_bytes(ef) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("  skip {:?}: {e}", ef.name);
+                continue;
+            }
+        };
+        let base = sanitize_filename(&ef.name).unwrap_or_else(|| format!("attachment_{extracted}"));
+        // create_unique never clobbers an existing file (atomic create_new),
+        // which also folds run-internal uniqueness into the on-disk check.
+        let (path, mut file) = match create_unique(&out_dir, &base) {
+            Ok(pair) => pair,
+            Err(e) => {
+                eprintln!("  skip {:?}: {e}", ef.name);
+                continue;
+            }
+        };
+        if let Err(e) = file.write_all(&bytes) {
+            eprintln!("  skip {:?}: {e}", ef.name);
+            continue;
+        }
+        println!(
+            "  extracted {:?} -> {} ({} bytes)",
+            ef.name,
+            path.display(),
+            bytes.len()
+        );
+        extracted += 1;
+    }
+
+    if matched == 0 && target != "all" {
+        eprintln!("No attachment matched {target:?}. Use --extract all to extract everything.");
+        process::exit(1);
+    }
+
+    Ok(())
+}
+
+/// Pages scanned for page-level `/AF`, and the overall attachment cap — bound the
+/// gather so an adversarial multi-page document cannot explode it.
+const MAX_PAGES_SCANNED: usize = 1000;
+const MAX_ATTACHMENTS: usize = 16_384;
+
+/// Gather every embedded/associated file into one deduplicated list: name-tree
+/// embedded files first, then catalog- and page-level associated files. Entries
+/// are collapsed by embedded-stream object id (merging in the `/AF` relationship
+/// and description from the associated-file copy), so a file present in both the
+/// name tree and an `/AF` array — the PDF 2.0 norm — is reported once. A *named*
+/// external (no-`/EF`) spec collapses with an identically-named one; unnamed
+/// externals never merge. O(n) via hash indices and bounded against hostile input.
+fn collect_attachments(doc: &zpdf::PdfDocument) -> Vec<zpdf::EmbeddedFile> {
+    let mut all = doc.embedded_files();
+    all.truncate(MAX_ATTACHMENTS);
+    let mut stream_index: HashMap<(u32, u16), usize> = all
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| e.stream.map(|id| ((id.0, id.1), i)))
+        .collect();
+    let mut seen_named: HashSet<String> = all
+        .iter()
+        .filter(|e| e.stream.is_none() && !e.name.is_empty())
+        .map(|e| e.name.clone())
+        .collect();
+
+    let mut associated = doc.associated_files();
+    let pages = doc.page_count().min(MAX_PAGES_SCANNED);
+    for pi in 0..pages {
+        if associated.len() >= MAX_ATTACHMENTS {
+            break;
+        }
+        if let Ok(page) = doc.page(pi) {
+            associated.extend(doc.page_associated_files(&page));
+        }
+    }
+
+    for af in associated {
+        if all.len() >= MAX_ATTACHMENTS {
+            break;
+        }
+        if let Some(id) = af.stream {
+            let key = (id.0, id.1);
+            if let Some(&idx) = stream_index.get(&key) {
+                // Same embedded stream already listed: enrich missing metadata.
+                let existing = &mut all[idx];
+                if existing.relationship.is_none() {
+                    existing.relationship = af.relationship.clone();
+                }
+                if existing.description.is_none() {
+                    existing.description = af.description.clone();
+                }
+                continue;
+            }
+            stream_index.insert(key, all.len());
+        } else if !af.name.is_empty() && !seen_named.insert(af.name.clone()) {
+            continue;
+        }
+        all.push(af);
+    }
+    all
+}
+
+/// Reduce a PDF-declared file name to a safe, single-component output file name.
+/// Strips directory components (defeating `../` traversal and absolute paths),
+/// replaces path/Windows-reserved and control characters, strips trailing dots
+/// and spaces (which Windows silently drops, otherwise re-enabling collisions),
+/// and dodges Windows reserved device names. Returns `None` if nothing usable
+/// remains.
+fn sanitize_filename(name: &str) -> Option<String> {
+    // Keep only the final path component — defeats `../` and absolute paths
+    // regardless of which separator the producer used.
+    let base = name.rsplit(['/', '\\']).next().unwrap_or(name).trim();
+    if base.is_empty() || base == "." || base == ".." {
+        return None;
+    }
+    let cleaned: String = base
+        .chars()
+        .map(|c| {
+            if c.is_control() || matches!(c, '/' | '\\' | ':' | '<' | '>' | '"' | '|' | '?' | '*') {
+                '_'
+            } else {
+                c
+            }
+        })
+        .take(200)
+        .collect();
+    // Windows strips trailing dots/spaces at create time, so "x.txt" and "x.txt."
+    // would collide on disk despite being distinct strings; normalize them away.
+    let cleaned = cleaned.trim_end_matches([' ', '.']);
+    // An emptied name, or one of only dots/spaces/underscores, is hidden or
+    // trims to nothing on some platforms; treat it as unusable.
+    if cleaned.is_empty() || cleaned.chars().all(|c| matches!(c, '.' | ' ' | '_')) {
+        return None;
+    }
+    // Windows reserved device names (apply to the stem, any extension).
+    let stem = cleaned.split('.').next().unwrap_or("").to_ascii_uppercase();
+    let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (stem.len() == 4
+            && (stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.as_bytes()[3].is_ascii_digit());
+    Some(if reserved {
+        format!("_{cleaned}")
+    } else {
+        cleaned.to_string()
+    })
+}
+
+/// Create a new file under `dir` named `base`, never overwriting an existing one:
+/// on collision it tries `stem (1).ext`, `stem (2).ext`, … until an unused name
+/// opens. `create_new` makes the existence check and creation one atomic step
+/// (no TOCTOU; a pre-existing file in `dir` is preserved, and same-run name
+/// collisions are disambiguated by the same mechanism).
+fn create_unique(dir: &str, base: &str) -> std::io::Result<(std::path::PathBuf, fs::File)> {
+    use std::io::ErrorKind;
+    let (stem, ext) = match base.rfind('.') {
+        Some(dot) if dot > 0 => (&base[..dot], &base[dot..]),
+        _ => (base, ""),
+    };
+    for n in 0u64.. {
+        let name = if n == 0 {
+            base.to_string()
+        } else {
+            format!("{stem} ({n}){ext}")
+        };
+        let path = Path::new(dir).join(&name);
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => return Ok((path, file)),
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!("a u64 counter always finds a free name")
 }
 
 fn cmd_dump(args: &[String]) -> zpdf::Result<()> {
@@ -663,4 +983,180 @@ fn cmd_debug_stream(args: &[String]) -> zpdf::Result<()> {
     let text = String::from_utf8_lossy(&decoded);
     println!("{text}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{collect_attachments, create_unique, sanitize_filename};
+    use std::io::Write;
+
+    #[test]
+    fn sanitize_strips_traversal_and_absolute_paths() {
+        assert_eq!(
+            sanitize_filename("../../etc/passwd").as_deref(),
+            Some("passwd")
+        );
+        assert_eq!(
+            sanitize_filename("..\\..\\Windows\\system32\\evil.dll").as_deref(),
+            Some("evil.dll")
+        );
+        assert_eq!(
+            sanitize_filename("/abs/path/file.bin").as_deref(),
+            Some("file.bin")
+        );
+        assert_eq!(
+            sanitize_filename("C:\\Users\\me\\x.txt").as_deref(),
+            Some("x.txt")
+        );
+        // A name that traverses then names a file still collapses to the base.
+        assert_eq!(
+            sanitize_filename("a/../../../../root/.bashrc").as_deref(),
+            Some(".bashrc")
+        );
+    }
+
+    #[test]
+    fn sanitize_rejects_dot_segments_and_empties() {
+        assert_eq!(sanitize_filename(""), None);
+        assert_eq!(sanitize_filename("."), None);
+        assert_eq!(sanitize_filename(".."), None);
+        assert_eq!(sanitize_filename("   "), None);
+        assert_eq!(sanitize_filename("foo/"), None); // trailing separator → empty base
+        assert_eq!(sanitize_filename("..."), None); // only dots
+        assert_eq!(sanitize_filename(". . ."), None); // dots + spaces
+    }
+
+    #[test]
+    fn sanitize_replaces_dangerous_chars() {
+        // Windows alternate-data-stream colon, wildcards, control chars → '_'.
+        assert_eq!(
+            sanitize_filename("file:stream").as_deref(),
+            Some("file_stream")
+        );
+        assert_eq!(
+            sanitize_filename("a<b>c|d?e*f").as_deref(),
+            Some("a_b_c_d_e_f")
+        );
+        assert_eq!(sanitize_filename("tab\tname").as_deref(), Some("tab_name"));
+        // No output path separators can survive sanitization.
+        let s = sanitize_filename("x/y\\z").unwrap();
+        assert!(!s.contains('/') && !s.contains('\\'));
+    }
+
+    #[test]
+    fn sanitize_guards_windows_reserved_names() {
+        assert_eq!(sanitize_filename("NUL").as_deref(), Some("_NUL"));
+        assert_eq!(sanitize_filename("con.txt").as_deref(), Some("_con.txt"));
+        assert_eq!(sanitize_filename("COM1").as_deref(), Some("_COM1"));
+        assert_eq!(sanitize_filename("LPT9.dat").as_deref(), Some("_LPT9.dat"));
+        // Not reserved: a longer stem that merely starts with the prefix.
+        assert_eq!(
+            sanitize_filename("complete.txt").as_deref(),
+            Some("complete.txt")
+        );
+        assert_eq!(sanitize_filename("COM10").as_deref(), Some("COM10"));
+    }
+
+    #[test]
+    fn sanitize_strips_trailing_dots_and_spaces() {
+        // Windows silently drops trailing dots/spaces at create time, so two
+        // names differing only there must collapse to one (else they collide on
+        // disk while unique_name thinks they differ).
+        assert_eq!(sanitize_filename("evil.txt.").as_deref(), Some("evil.txt"));
+        assert_eq!(
+            sanitize_filename("report.pdf .").as_deref(),
+            Some("report.pdf")
+        );
+        assert_eq!(sanitize_filename("name   ").as_deref(), Some("name"));
+        assert_eq!(sanitize_filename("config.").as_deref(), Some("config"));
+        // The reserved-name guard still fires after trimming.
+        assert_eq!(sanitize_filename("NUL.").as_deref(), Some("_NUL"));
+    }
+
+    /// Build a PDF from numbered object bodies (object i+1), with a correct xref
+    /// and `/Root` = object 1 — mirrors zpdf-document's test helper.
+    fn build(objs: &[&str]) -> Vec<u8> {
+        let mut buf = Vec::from(&b"%PDF-1.7\n"[..]);
+        let mut offsets = Vec::new();
+        for (i, body) in objs.iter().enumerate() {
+            offsets.push(buf.len());
+            buf.extend_from_slice(format!("{} 0 obj\n{body}\nendobj\n", i + 1).as_bytes());
+        }
+        let xref = buf.len();
+        buf.extend_from_slice(
+            format!("xref\n0 {}\n0000000000 65535 f \n", objs.len() + 1).as_bytes(),
+        );
+        for off in &offsets {
+            buf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        buf.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                objs.len() + 1
+            )
+            .as_bytes(),
+        );
+        buf
+    }
+
+    #[test]
+    fn collect_attachments_dedups_shared_stream_and_merges_relationship() {
+        // A name-tree filespec WITHOUT /AFRelationship and a catalog-/AF filespec
+        // WITH one both point at the same /EF stream (obj4): one merged entry.
+        let doc = zpdf::PdfDocument::open(build(&[
+            "<< /Type /Catalog /Pages 2 0 R /Names << /EmbeddedFiles 5 0 R >> /AF [6 0 R] >>",
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>",
+            "<< /Type /EmbeddedFile /Length 1 >>\nstream\nx\nendstream",
+            "<< /Names [ (a.bin) 7 0 R ] >>",
+            "<< /Type /Filespec /F (a.bin) /AFRelationship /Data /EF << /F 4 0 R >> >>",
+            "<< /Type /Filespec /F (a.bin) /EF << /F 4 0 R >> >>",
+        ]))
+        .expect("open");
+        let all = collect_attachments(&doc);
+        assert_eq!(all.len(), 1, "shared stream collapses to one entry");
+        assert_eq!(all[0].relationship.as_deref(), Some("Data"));
+    }
+
+    #[test]
+    fn collect_attachments_includes_page_level_af() {
+        let doc = zpdf::PdfDocument::open(build(&[
+            "<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /AF [4 0 R] >>",
+            "<< /Type /Filespec /F (p.bin) /AFRelationship /Supplement /EF << /F 5 0 R >> >>",
+            "<< /Type /EmbeddedFile /Length 0 >>\nstream\n\nendstream",
+        ]))
+        .expect("open");
+        let all = collect_attachments(&doc);
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].name, "p.bin");
+        assert_eq!(all[0].relationship.as_deref(), Some("Supplement"));
+    }
+
+    #[test]
+    fn create_unique_never_overwrites_existing() {
+        let dir = std::env::temp_dir().join(format!("zpdf_cu_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ds = dir.to_str().unwrap();
+        std::fs::write(dir.join("a.txt"), b"OLD").unwrap();
+
+        // The pre-existing a.txt is preserved; the new content lands beside it.
+        let (p1, mut f1) = create_unique(ds, "a.txt").unwrap();
+        f1.write_all(b"new1").unwrap();
+        assert_eq!(p1.file_name().unwrap(), "a (1).txt");
+        let (p2, mut f2) = create_unique(ds, "a.txt").unwrap();
+        f2.write_all(b"new2").unwrap();
+        assert_eq!(p2.file_name().unwrap(), "a (2).txt");
+        assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"OLD");
+
+        // Extensionless collisions disambiguate too.
+        let (p3, _f3) = create_unique(ds, "data").unwrap();
+        assert_eq!(p3.file_name().unwrap(), "data");
+        let (p4, _f4) = create_unique(ds, "data").unwrap();
+        assert_eq!(p4.file_name().unwrap(), "data (1)");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

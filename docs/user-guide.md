@@ -31,12 +31,14 @@ The release binary is at `target/release/zpdf`. The examples below use
 | `render` | Render a page to a PNG (CPU or GPU). |
 | `text` | Extract text from a page (or all pages). |
 | `forms` | List interactive-form (AcroForm) fields, types, and values. |
+| `attachments` | List (and optionally extract) embedded & associated files. |
 | `compare` | Pixel-diff two PNGs and report difference metrics. |
 | `dump` | Print a resolved PDF object. |
 | `debug-stream` | Print a decoded stream object's bytes. |
 
 > **Encrypted PDFs.** Documents protected with a non-empty password open with
-> `--password <pw>` (accepted by `info`, `dump`, `render`, `text`, and `forms`).
+> `--password <pw>` (accepted by `info`, `dump`, `render`, `text`, `tables`,
+> `forms`, and `attachments`).
 > The password may be the user or owner password; a wrong one reports an error.
 > Documents encrypted with an empty password open without the flag.
 
@@ -93,6 +95,32 @@ cargo run -p zpdf-cli -- text document.pdf --all    # every page
 
 Text is reconstructed from the page's fonts using `/ToUnicode` (when present) and the
 font encoding, grouped into lines and ordered left-to-right. Output goes to stdout.
+
+### `attachments` — list & extract embedded files
+
+```bash
+cargo run -p zpdf-cli -- attachments document.pdf                       # list
+cargo run -p zpdf-cli -- attachments document.pdf --extract all --out-dir files
+cargo run -p zpdf-cli -- attachments invoice.pdf --extract factur-x.xml # one file
+```
+
+Lists files **embedded inside** the PDF — both classic attachments (the catalog
+`/Names /EmbeddedFiles` name tree) and PDF 2.0 *associated files* (`/AF`, which
+carry an `/AFRelationship` such as `Data` or `Source`; this is how ZUGFeRD /
+Factur-X e-invoices embed their source XML). Each line shows the name and any
+relationship, MIME subtype, and declared size.
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--extract <index\|name\|all>` | — | Extract one file by listing index or name, or `all`. |
+| `--out-dir <dir>` | `.` | Directory to write extracted files into (created if needed). |
+
+Extraction is safe against hostile file names: a `/UF` like `../../etc/passwd`
+is reduced to its basename; path separators, Windows-reserved characters /
+device names, and trailing dots/spaces are neutralized; existing files are never
+overwritten and same-name collisions get a ` (n)` suffix — an attachment can
+neither be written outside `--out-dir` nor clobber a file already in it. Use the
+listing index (e.g. `--extract 0`) to pull out an unnamed or duplicate-named file.
 
 ### `compare` — pixel-diff two PNGs
 

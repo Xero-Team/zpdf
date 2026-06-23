@@ -361,6 +361,22 @@ cargo run -p zpdf-render-wgpu --example viewer -- <file.pdf>   # 交互浏览器
       输出意图的文档逐字节不变（仍走 SWOP）；嵌入 ICCBased(4) 自带 profile 优先；
       RGB(N≠3..)/解析失败的意图被忽略并回退。后端零改动（转换在解释器上游完成，
       CPU↔GPU 自动一致）。纯 Rust 零新依赖
+- [x] 嵌入文件与关联文件（`zpdf-document/src/embedded_files.rs`）：文档级嵌入文件
+      （catalog `/Names /EmbeddedFiles` 名称树，ISO 32000-1 §7.11）与 **PDF 2.0
+      关联文件**（catalog/页面 `/AF` 数组，ISO 32000-2 §7.11.4，携带 `/AFRelationship`）
+      经统一 `EmbeddedFile` 模型暴露：文件名（`/UF` 优先，回退 `/F`/平台名）、`/Desc`、
+      `/AFRelationship`、嵌入流的 `/Subtype`(MIME) 与 `/Params`(`/Size`//CreationDate/
+      `/ModDate`//CheckSum)、嵌入流对象号。名称树游走带深度/逐引用环/条目数上限，处理
+      `/Kids` 内部节点与 `/Names` 叶节点；元数据只读流字典，列举时不解码负载。
+      `PdfDocument::{embedded_files,associated_files,page_associated_files,
+      embedded_file_bytes}`（取字节经过滤管线按需解码，遵守 ParseLimits），facade
+      re-export `EmbeddedFile`//EmbeddedSource。CLI `zpdf attachments`
+      （`--extract <index|name|all>` / `--out-dir`，按嵌入流去重并合并 `/AF` 关系），
+      **抽取时净化文件名**（`../../etc/passwd`→basename，分隔符/Windows 保留字符与设备名/
+      尾随点空格中和，原子 create-new 不覆盖既有文件，冲突加 ` (n)` 后缀）杜绝越出
+      `--out-dir` 或覆盖目录内文件；`zpdf info` 亦列出附件。解析路径仅
+      显式调用时运行（open//render 期间不触发），畸形语料健壮性零回归。纯 Rust 零新运行时依赖
+      （ZUGFeRD/Factur-X 发票 XML 抽取可用）
 - [ ] 新增颜色空间（其余 ISO 32000-2 差异项）
 - [ ] 新增注释类型
 
