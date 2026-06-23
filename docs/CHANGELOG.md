@@ -1,6 +1,13 @@
 # Changelog
 
-## Unreleased
+## 0.7.0 — PDF 2.0 colour & attachments, annotation appearances, overprint & variable fonts
+
+A feature release, all with zero C/C++ dependencies: PDF 2.0 NChannel colour with
+`None`/`All` colorant semantics, output-intent DeviceCMYK colour management, and
+embedded / associated files (`/AF` attachments); synthesized appearances for the
+markup, geometric, FreeText, Text-note, Stamp, Caret and Redact annotation
+families; overprint compositing (`/OP` `/op` `/OPM`); OpenType variable fonts;
+heuristic table detection; and higher-fidelity GPU soft masks.
 
 ### Caret & Redact annotation appearances (PDF 2.0 `Projection` recognized)
 

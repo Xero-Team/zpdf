@@ -218,7 +218,7 @@ cargo run -p zpdf-render-wgpu --example viewer -- <file.pdf>   # 交互浏览器
 > 虚线、细线 hairline、双线性图像采样、文本渲染模式（OCR 隐藏文本）等。
 > 56 页真实文档对照 pdfium 逐页验证。
 >
-> **损坏/对抗性语料健壮性专项**（见 docs/CHANGELOG.md "Unreleased"）：对 618 个
+> **损坏/对抗性语料健壮性专项**（见 docs/CHANGELOG.md 0.5.0）：对 618 个
 > 畸形/对抗性 PDF（tests/failed，来自 PDFBOX/Ghostscript/poppler/MOZILLA/PDFIUM/
 > cairo 等的 bug 与 fuzzer）做了一轮加固。可打开文档 166 → 426；渲染 panic 13 → 0；
 > 渲染超时 110 → 0、打开期挂起 2 → 0。手段：宽松 `%PDF` 头 + 无头碎片对象扫描恢复、

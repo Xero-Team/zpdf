@@ -20,7 +20,7 @@ members = [
 [workspace.package]
 edition = "2021"
 license = "MIT"
-version = "0.6.0"
+version = "0.7.0"
 authors = ["zpdf contributors"]
 repository = "https://github.com/Xero-Team/zpdf"
 homepage = "https://github.com/Xero-Team/zpdf"
@@ -30,18 +30,18 @@ categories = ["rendering", "parser-implementations", "graphics"]
 
 [workspace.dependencies]
 # internal
-zpdf-core = { path = "crates/zpdf-core", version = "0.6.0" }
-zpdf-parser = { path = "crates/zpdf-parser", version = "0.6.0" }
-zpdf-document = { path = "crates/zpdf-document", version = "0.6.0" }
-zpdf-content = { path = "crates/zpdf-content", version = "0.6.0" }
-zpdf-display-list = { path = "crates/zpdf-display-list", version = "0.6.0" }
-zpdf-font = { path = "crates/zpdf-font", version = "0.6.0" }
-zpdf-image = { path = "crates/zpdf-image", version = "0.6.0" }
-zpdf-color = { path = "crates/zpdf-color", version = "0.6.0" }
-zpdf-render = { path = "crates/zpdf-render", version = "0.6.0" }
-zpdf-render-cpu = { path = "crates/zpdf-render-cpu", version = "0.6.0" }
-zpdf-render-wgpu = { path = "crates/zpdf-render-wgpu", version = "0.6.0" }
-zpdf = { path = "crates/zpdf", version = "0.6.0", default-features = false }
+zpdf-core = { path = "crates/zpdf-core", version = "0.7.0" }
+zpdf-parser = { path = "crates/zpdf-parser", version = "0.7.0" }
+zpdf-document = { path = "crates/zpdf-document", version = "0.7.0" }
+zpdf-content = { path = "crates/zpdf-content", version = "0.7.0" }
+zpdf-display-list = { path = "crates/zpdf-display-list", version = "0.7.0" }
+zpdf-font = { path = "crates/zpdf-font", version = "0.7.0" }
+zpdf-image = { path = "crates/zpdf-image", version = "0.7.0" }
+zpdf-color = { path = "crates/zpdf-color", version = "0.7.0" }
+zpdf-render = { path = "crates/zpdf-render", version = "0.7.0" }
+zpdf-render-cpu = { path = "crates/zpdf-render-cpu", version = "0.7.0" }
+zpdf-render-wgpu = { path = "crates/zpdf-render-wgpu", version = "0.7.0" }
+zpdf = { path = "crates/zpdf", version = "0.7.0", default-features = false }
 
 # external
 thiserror = "2"
