@@ -292,3 +292,56 @@ fn hidden_markup_is_not_painted() {
         "hidden annot not painted",
     );
 }
+
+/// A Caret fills a red insertion wedge inside its /Rect; outside stays clear.
+#[test]
+fn caret_paints_red_wedge() {
+    let content: &[u8] = b"1 1 1 rg 0 0 200 200 re f";
+    // /Rect [80 80 120 140] → wedge with apex at (100, 140).
+    let annot: &[u8] = b"<< /Type /Annot /Subtype /Caret /Rect [80 80 120 140] /F 4 /C [1 0 0] >>";
+    let page = render_with_annot(content, annot);
+    assert_near(px(&page, 100.0, 120.0), [255, 0, 0], "red wedge body");
+    assert_near(px(&page, 40.0, 100.0), [255, 255, 255], "clear to the left");
+    assert_near(
+        px(&page, 160.0, 100.0),
+        [255, 255, 255],
+        "clear to the right",
+    );
+}
+
+/// A Redact annotation marks its /QuadPoints region: green /IC fill, red /C
+/// outline — the renderer shows the *marked* state (it does not redact).
+#[test]
+fn redact_marks_region_fill_and_outline() {
+    let content: &[u8] = b"1 1 1 rg 0 0 200 200 re f";
+    // QuadPoints region inset within /Rect so the full 4pt outline is visible
+    // (a quad flush with /Rect would have its outer half clipped away).
+    let annot: &[u8] = b"<< /Type /Annot /Subtype /Redact /Rect [40 40 160 160] /F 4 \
+        /QuadPoints [50 150 150 150 50 50 150 50] /IC [0 1 0] /C [1 0 0] /BS << /W 4 >> >>";
+    let page = render_with_annot(content, annot);
+    assert_near(px(&page, 100.0, 100.0), [0, 255, 0], "green redaction fill");
+    // The 4pt outline is inset by half its width (centre at x≈52) so it stays
+    // inside /Rect rather than being clipped on the boundary.
+    assert_near(px(&page, 52.0, 100.0), [255, 0, 0], "red mark outline");
+    assert_near(
+        px(&page, 45.0, 100.0),
+        [255, 255, 255],
+        "outside the marked region",
+    );
+}
+
+/// A Redact with no /QuadPoints and no /IC outlines the whole /Rect in black,
+/// leaving the interior (and underlying content) visible.
+#[test]
+fn redact_rect_fallback_outline_only() {
+    let content: &[u8] = b"1 1 1 rg 0 0 200 200 re f";
+    let annot: &[u8] = b"<< /Type /Annot /Subtype /Redact /Rect [40 40 160 160] /F 4 \
+        /BS << /W 4 >> >>";
+    let page = render_with_annot(content, annot);
+    assert_near(px(&page, 42.0, 100.0), [0, 0, 0], "black outline");
+    assert_near(
+        px(&page, 100.0, 100.0),
+        [255, 255, 255],
+        "interior not filled",
+    );
+}

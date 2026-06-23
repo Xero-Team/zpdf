@@ -214,7 +214,8 @@ DeviceGray/RGB/CMYK/ICCBased/Indexed/Lab/Separation/DeviceN/**NChannel** color
 documents (RC4, AES-128, AES-256; empty user password) decrypt transparently.
 **Annotations** render from their appearance streams; markup and geometric
 annotations (highlights, underlines, strike-outs, squiggles, squares, circles,
-lines, polygons, ink) and interactive **form fields** get a synthesized
+lines, polygons, ink, free text, sticky-note and stamp icons, caret insertion
+marks, redaction-region marks) and interactive **form fields** get a synthesized
 appearance when the producer left none. Pages honor CropBox and `/Rotate`.
 Invisible OCR text layers (text render mode 3) are correctly not painted over
 scanned images.
@@ -224,9 +225,12 @@ scanned images.
 - **Tiling patterns** (hatches/textures) paint a neutral gray placeholder.
 - **ExtGState soft masks** (vignettes, gradient-faded groups) are ignored.
 - **Non-embedded CJK fonts** render no glyphs yet (embedded fonts are fine).
-- **Annotation icons** — sticky-note `Text`, `FreeText`, and `Stamp` types — are
-  not synthesized (their appearance streams render if present, but no icon is
-  drawn when absent). Rotated/skewed text-markup uses an axis-aligned approximation.
+- **Annotation appearances** are synthesized for most markup/geometric subtypes
+  when absent, but some fidelity trade-offs remain: a `Redact` mark shows the
+  *marked* region (content is never actually removed, and `/OverlayText` is not
+  drawn); a `Caret` does not distinguish the `/Sy` paragraph variant; rotated /
+  skewed text-markup uses an axis-aligned approximation. The PDF 2.0 `Projection`
+  subtype has no synthesized default appearance.
 - **JBIG2 / JPEG-2000** compressed images are skipped.
 - **Password-protected PDFs** (non-empty user password) won't decrypt — there
   is no password prompt/API yet.

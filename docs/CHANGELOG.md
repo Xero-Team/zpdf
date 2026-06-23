@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+### Caret & Redact annotation appearances (PDF 2.0 `Projection` recognized)
+
+Two more annotation subtypes now get a synthesized appearance when their producer
+shipped no `/AP` stream, completing the markup/geometric family in
+`zpdf-document/src/annot_appearance.rs` (an existing `/AP` is still never
+overridden, and both render backends draw the synthesized form XObject with no
+changes):
+
+- **`Caret`** (ISO 32000-1 §12.5.6.11): a filled insertion-mark wedge ("‸") drawn
+  in the `/RD`-inset sub-rectangle of `/Rect`, coloured by `/C` (default black; a
+  present-empty `/C []` is spec-transparent → nothing is drawn). `/Sy` (the
+  paragraph variant) is not distinguished — the wedge serves both.
+- **`Redact`** (§12.5.6.23): the regions slated for redaction are *marked* — the
+  `/QuadPoints` quads (or the whole `/Rect` when absent) filled with the interior
+  colour `/IC` and outlined in `/C` (default black so an un-coloured mark stays
+  visible; a present-empty `/C []` is transparent). The renderer shows the marked
+  state and never removes content, so the post-redaction overlay (`/OverlayText`
+  / `/RO`) is intentionally not drawn. A `/QuadPoints` outline is inset by half
+  the border width (a miter offset at each corner, clamped so it can't invert a
+  small quad) so the stroke stays inside the `/Rect`-equal `/BBox` the painter
+  clips to, matching the `/Rect` fallback.
+
+The PDF 2.0 **`Projection`** subtype is recognized but has no defined default
+appearance, so none is synthesized (it renders from its own `/AP` if present).
+Pure Rust, zero new dependencies. Verified by unit tests (caret wedge geometry,
+`/RD` inset, transparent `/C`; redact `/QuadPoints` + `/Rect` fallback,
+transparent `/C`, the convex-quad inset helper; Projection draws nothing) and
+end-to-end CPU render tests (caret wedge, redact region fill+outline, redact
+rect-fallback outline).
+
 ### NChannel colour space & `None`/`All` colorant semantics (PDF 2.0)
 
 Separation, DeviceN and the PDF 2.0 **NChannel** colour spaces now honour the

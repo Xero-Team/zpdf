@@ -387,7 +387,12 @@ cargo run -p zpdf-render-wgpu --example viewer -- <file.pdf>   # 交互浏览器
       spot 经整体 tint 变换隔离（仍丢弃 `/None`），取并集。显示颜色不变（仍走整体 tint 变换）；
       抑制与掩码均在解释器（显示列表上游）决定，**双后端零改动**、CPU↔GPU 自动一致。无 `/Colorants`
       且无 `/None` 的普通 Separation/DeviceN 逐字节保持原整体变换投影（per-colorant 仅在可能不同时启用）
-- [ ] 新增注释类型
+- [x] 新增注释类型（无 `/AP` 时合成外观，`annot_appearance.rs`）：**Caret**（§12.5.6.11，
+      `/RD` 内缩矩形内的填充插入符 "‸"，`/C` 着色，空 `/C[]` 透明）、**Redact**（§12.5.6.23，
+      标记待密文区域：`/QuadPoints` 四边形或回退 `/Rect`，`/IC` 填充 + `/C` 描边，描边按半边宽
+      斜接内缩使其不被 `/Rect`=`/BBox` 裁剪；仅渲染"标记"态、不移除内容，故 `/OverlayText`//RO
+      后密文叠加不绘制）。PDF 2.0 **Projection** 已识别但无既定默认外观（仅经自带 `/AP` 渲染）。
+      既有 `/AP` 不被覆盖，双后端零改动
 
 ---
 

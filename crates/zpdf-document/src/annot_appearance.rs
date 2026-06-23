@@ -20,10 +20,12 @@
 //! Supported subtypes: text markup (`Highlight` / `Underline` / `StrikeOut` /
 //! `Squiggly`, from `/QuadPoints`), geometric markup (`Square` / `Circle` /
 //! `Line` / `Polygon` / `PolyLine` / `Ink`), `FreeText`, a conservative `Link`
-//! border, `Text` note icons (a small vector glyph chosen by `/Name`), and
-//! `Stamp` rubber-stamp badges (a bordered label decoded from `/Name`).
-//! Everything else (an existing `/AP`, `Widget`, `Popup`, …) is left to its own
-//! appearance or to the widget generator.
+//! border, `Text` note icons (a small vector glyph chosen by `/Name`), `Stamp`
+//! rubber-stamp badges (a bordered label decoded from `/Name`), a `Caret`
+//! insertion mark, and `Redact` redaction-region marks. Everything else (an
+//! existing `/AP`, `Widget`, `Popup`, a PDF 2.0 `Projection` — which has no
+//! defined default appearance — …) is left to its own appearance or the widget
+//! generator.
 
 use zpdf_core::{Matrix, PdfDict, PdfName, PdfObject, Rect};
 use zpdf_parser::PdfFile;
@@ -97,6 +99,8 @@ pub fn generate_annotation_appearance(
         "Ink" => ink(file, dict, &mut body),
         "Link" => link(file, dict, rect, &mut body),
         "Text" => text_icon(file, dict, rect, &mut body),
+        "Caret" => caret(file, dict, rect, &mut body),
+        "Redact" => redact(file, dict, rect, &mut body),
         _ => false,
     };
     if !drew || body.is_empty() || body.len() > MAX_APPEARANCE_BYTES {
@@ -417,6 +421,136 @@ fn link(file: &PdfFile, dict: &PdfDict, rect: Rect, out: &mut Vec<u8>) -> bool {
         ),
     );
     true
+}
+
+/// `Caret` (12.5.6.11): a filled insertion mark drawn in the `/RD`-inset sub-
+/// rectangle of `/Rect`. We draw a notched upward wedge ("‸") in `/C` (default
+/// black; a present-empty `/C []` is transparent → nothing). `/Sy` (None / P
+/// paragraph symbol) is not distinguished — the wedge serves both.
+fn caret(file: &PdfFile, dict: &PdfDict, rect: Rect, out: &mut Vec<u8>) -> bool {
+    // A caret carries no border; inset by `/RD` only (bw = 0).
+    let Some(dr) = drawing_rect(file, dict, rect, 0.0) else {
+        return false;
+    };
+    let Some(color) = markup_color(file, dict, "C", vec![0.0]) else {
+        return false;
+    };
+    let Some(op) = color_op(&color, false) else {
+        return false;
+    };
+    let (x0, y0, w, h) = (dr.x0, dr.y0, dr.width(), dr.height());
+    let cx = x0 + w / 2.0;
+    push(out, &op);
+    push(out, "\n");
+    // bottom-left → apex (top-centre) → bottom-right → notch (centre, 30 % up).
+    push(out, &format!("{} {} m\n", fmt(x0), fmt(y0)));
+    push(out, &format!("{} {} l\n", fmt(cx), fmt(y0 + h)));
+    push(out, &format!("{} {} l\n", fmt(x0 + w), fmt(y0)));
+    push(out, &format!("{} {} l\n", fmt(cx), fmt(y0 + h * 0.30)));
+    push(out, "f\n");
+    true
+}
+
+/// `Redact` (12.5.6.23): mark the regions slated for redaction. We render the
+/// *marked* state (we never remove content): the `/QuadPoints` regions — or the
+/// whole `/Rect` if absent — filled with the interior colour `/IC` when given
+/// and outlined in `/C` (default black so an un-coloured mark stays visible).
+/// `/OverlayText` / `/RO` (the post-redaction overlay) are intentionally not
+/// rendered, since the underlying content has not actually been removed.
+fn redact(file: &PdfFile, dict: &PdfDict, rect: Rect, out: &mut Vec<u8>) -> bool {
+    let bw = border_width(file, dict).max(0.5);
+    let fill = read_color(file, dict, "IC");
+    // Outline `/C`: a present-empty `/C []` is spec-transparent (§12.5.6.2) → no
+    // outline; an absent `/C` falls back to black only when there is no interior
+    // fill, so an un-coloured mark stays visible. (Mirrors `markup_color`, which
+    // Caret uses — keeps the two new generators consistent.)
+    let stroke = match dict.get("C") {
+        Some(_) => read_color(file, dict, "C"),
+        None => fill.is_none().then(|| vec![0.0]),
+    };
+    if fill.is_none() && stroke.is_none() {
+        return false; // explicitly transparent mark — nothing to draw
+    }
+    // The stroke is centred on the path, so inset the region by half the border
+    // when there is an outline — otherwise the outer half straddles the
+    // /Rect-equal /BBox the painter clips to and the outline renders too thin.
+    // (The /Rect fallback gets the same inset from `drawing_rect`.) A fill-only
+    // mark is not inset, so it covers the whole region.
+    let inset = if stroke.is_some() { bw / 2.0 } else { 0.0 };
+
+    // Build the region path(s) first so colour setup is emitted only when there
+    // is something to paint.
+    let mut paths = String::new();
+    if let Some(quads) = read_quadpoints(file, dict) {
+        for q in quads.iter() {
+            let Some(oq) = oriented_quad(q) else {
+                continue;
+            };
+            let c = inset_convex_quad(oq.corners, inset);
+            paths.push_str(&format!("{} {} m\n", fmt(c[0].0), fmt(c[0].1)));
+            for p in &c[1..] {
+                paths.push_str(&format!("{} {} l\n", fmt(p.0), fmt(p.1)));
+            }
+            paths.push_str("h\n");
+        }
+    } else if let Some(dr) = drawing_rect(file, dict, rect, inset * 2.0) {
+        paths.push_str(&format!(
+            "{} {} {} {} re\n",
+            fmt(dr.x0),
+            fmt(dr.y0),
+            fmt(dr.width()),
+            fmt(dr.height())
+        ));
+    }
+    if paths.is_empty() {
+        return false;
+    }
+    emit_shape_setup(out, &fill, &stroke, bw);
+    out.extend_from_slice(paths.as_bytes());
+    push(out, paint_op(fill.is_some(), stroke.is_some()));
+    push(out, "\n");
+    true
+}
+
+/// Inset a convex, counter-clockwise quad toward its interior by `d` (a miter
+/// offset at each vertex), so a stroke of width `2·d` centred on the inset edges
+/// stays within the original quad — used to keep a `Redact` outline inside the
+/// `/Rect`-equal `/BBox` the painter clips to. `d` is clamped to 40 % of the
+/// shortest edge so a wide border cannot invert a small quad; a degenerate
+/// vertex (near-straight edge or reflex angle) keeps its original corner.
+fn inset_convex_quad(c: [(f64, f64); 4], d: f64) -> [(f64, f64); 4] {
+    let min_edge = (0..4)
+        .map(|i| norm(sub(c[(i + 1) % 4], c[i])))
+        .fold(f64::INFINITY, f64::min);
+    let d = d.min(0.4 * min_edge);
+    if d <= 0.0 || !d.is_finite() {
+        return c;
+    }
+    // Interior (left, for CCW) unit normal of the edge a→b.
+    let left_normal = |a: (f64, f64), b: (f64, f64)| {
+        let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+        let len = (dx * dx + dy * dy).sqrt();
+        (len > 0.0).then(|| (-dy / len, dx / len))
+    };
+    let mut out = c;
+    for i in 0..4 {
+        let (prev, cur, next) = (c[(i + 3) % 4], c[i], c[(i + 1) % 4]);
+        let (Some(n1), Some(n2)) = (left_normal(prev, cur), left_normal(cur, next)) else {
+            continue;
+        };
+        let denom = 1.0 + (n1.0 * n2.0 + n1.1 * n2.1);
+        if denom.abs() < 1e-6 {
+            continue; // near-straight / reflex vertex: leave it
+        }
+        let off = (
+            cur.0 + d * (n1.0 + n2.0) / denom,
+            cur.1 + d * (n1.1 + n2.1) / denom,
+        );
+        if off.0.is_finite() && off.1.is_finite() {
+            out[i] = off;
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1741,6 +1875,25 @@ mod tests {
         assert_eq!(paint_op(false, false), "n");
     }
 
+    #[test]
+    fn inset_convex_quad_insets_uniformly() {
+        let approx =
+            |a: (f64, f64), b: (f64, f64)| (a.0 - b.0).abs() < 1e-9 && (a.1 - b.1).abs() < 1e-9;
+        // CCW square [0,0],[10,0],[10,10],[0,10] inset by 2 → corners move 2 in.
+        let c = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)];
+        let r = inset_convex_quad(c, 2.0);
+        assert!(approx(r[0], (2.0, 2.0)), "{r:?}");
+        assert!(approx(r[1], (8.0, 2.0)), "{r:?}");
+        assert!(approx(r[2], (8.0, 8.0)), "{r:?}");
+        assert!(approx(r[3], (2.0, 8.0)), "{r:?}");
+        // A huge inset is clamped to 40 % of the shortest edge (here 4), so the
+        // quad can never invert.
+        let r2 = inset_convex_quad(c, 100.0);
+        assert!(approx(r2[0], (4.0, 4.0)), "clamped corner: {r2:?}");
+        // Zero / negative inset is a no-op.
+        assert_eq!(inset_convex_quad(c, 0.0), c);
+    }
+
     /// Open a one-page doc whose single annotation is object 4, and return its
     /// parsed (generated) appearance via the public annotation path.
     fn annot_of(annot_body: &str) -> Option<crate::Annotation> {
@@ -2332,6 +2485,116 @@ mod tests {
         let a = annot_of("<< /Type /Annot /Subtype /FreeText /Rect [40 40 190 140] >>")
             .expect("annotation");
         assert!(a.generated.is_none(), "empty FreeText draws nothing");
+        assert!(!a.is_viewable());
+    }
+
+    #[test]
+    fn caret_draws_filled_wedge() {
+        // /Rect [10 10 30 40] → x0=10 y0=10 w=20 h=30, apex at (20, 40).
+        let a =
+            annot_of("<< /Type /Annot /Subtype /Caret /Rect [10 10 30 40] >>").expect("annotation");
+        assert!(a.is_viewable(), "generated caret is viewable");
+        let s = String::from_utf8_lossy(&a.generated.as_ref().expect("gen").content);
+        assert!(s.contains("0.000 g"), "black fill by default: {s}");
+        assert!(s.contains("10.000 10.000 m"), "wedge base start: {s}");
+        assert!(s.contains("20.000 40.000 l"), "apex at top-centre: {s}");
+        assert!(s.contains("f\n"), "fills the wedge: {s}");
+    }
+
+    #[test]
+    fn caret_honours_rd_inset_and_colour() {
+        // /RD insets the caret rect; /C [1 0 0] tints it red.
+        let a = annot_of(
+            "<< /Type /Annot /Subtype /Caret /Rect [0 0 40 40] \
+             /RD [10 10 10 10] /C [1 0 0] >>",
+        )
+        .expect("annotation");
+        let s = String::from_utf8_lossy(&a.generated.as_ref().expect("gen").content);
+        assert!(s.contains("1.000 0.000 0.000 rg"), "red fill: {s}");
+        // Inset rect is [10 10 30 30] → apex (20, 30).
+        assert!(
+            s.contains("10.000 10.000 m") && s.contains("20.000 30.000 l"),
+            "{s}"
+        );
+    }
+
+    #[test]
+    fn caret_empty_colour_is_transparent() {
+        // A present-empty /C [] is spec-transparent → nothing drawn.
+        let a = annot_of("<< /Type /Annot /Subtype /Caret /Rect [10 10 30 40] /C [] >>")
+            .expect("annotation");
+        assert!(a.generated.is_none(), "empty /C draws nothing");
+    }
+
+    #[test]
+    fn redact_marks_quadpoints_regions() {
+        // /QuadPoints region, filled /IC + outlined /C → a closed polygon B.
+        let a = annot_of(
+            "<< /Type /Annot /Subtype /Redact /Rect [10 10 110 30] \
+             /QuadPoints [10 30 110 30 10 10 110 10] /IC [0 0 0] /C [1 0 0] >>",
+        )
+        .expect("annotation");
+        assert!(a.is_viewable());
+        let s = String::from_utf8_lossy(&a.generated.as_ref().expect("gen").content);
+        assert!(s.contains("0.000 0.000 0.000 rg"), "IC fill: {s}");
+        assert!(s.contains("1.000 0.000 0.000 RG"), "C outline: {s}");
+        assert!(
+            s.contains("h\nB"),
+            "closes and fills+strokes the region: {s}"
+        );
+    }
+
+    #[test]
+    fn redact_empty_colour_is_transparent_outline() {
+        // A present-empty /C [] is spec-transparent: with an /IC fill, the region
+        // is filled but NOT outlined (no black-outline fallback).
+        let a = annot_of(
+            "<< /Type /Annot /Subtype /Redact /Rect [10 10 110 60] \
+             /QuadPoints [10 60 110 60 10 10 110 10] /IC [0 1 0] /C [] >>",
+        )
+        .expect("annotation");
+        let s = String::from_utf8_lossy(&a.generated.as_ref().expect("gen").content);
+        assert!(s.contains("0.000 1.000 0.000 rg"), "IC fill present: {s}");
+        assert!(
+            !s.contains(" RG"),
+            "no outline colour for transparent /C: {s}"
+        );
+        assert!(s.contains("h\nf"), "fills only (no stroke): {s}");
+    }
+
+    #[test]
+    fn redact_transparent_and_no_fill_draws_nothing() {
+        // Present-empty /C [] and no /IC → nothing to paint at all.
+        let a = annot_of(
+            "<< /Type /Annot /Subtype /Redact /Rect [10 10 110 60] \
+             /QuadPoints [10 60 110 60 10 10 110 10] /C [] >>",
+        )
+        .expect("annotation");
+        assert!(
+            a.generated.is_none(),
+            "fully transparent Redact draws nothing"
+        );
+    }
+
+    #[test]
+    fn redact_falls_back_to_rect_outline() {
+        // No /QuadPoints, no /IC, no /C → outline the whole /Rect in black.
+        let a = annot_of("<< /Type /Annot /Subtype /Redact /Rect [10 10 110 60] >>")
+            .expect("annotation");
+        let s = String::from_utf8_lossy(&a.generated.as_ref().expect("gen").content);
+        assert!(s.contains("0.000 G"), "black outline default: {s}");
+        assert!(s.contains(" re\nS"), "strokes the rect: {s}");
+    }
+
+    #[test]
+    fn projection_generates_no_default_appearance() {
+        // PDF 2.0 Projection has no defined default appearance (only its own /AP).
+        let a = annot_of("<< /Type /Annot /Subtype /Projection /Rect [10 10 30 30] >>")
+            .expect("annotation");
+        assert!(
+            a.generated.is_none(),
+            "no synthesized appearance for Projection"
+        );
         assert!(!a.is_viewable());
     }
 }
