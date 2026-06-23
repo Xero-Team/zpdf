@@ -209,7 +209,8 @@ dash patterns), clipping, embedded **TrueType / Type1 / Type1C / CID-Type0** and
 JPEG/DCT incl. CMYK, CCITT G3/G4, 1–16 bpc, `/Decode`, soft masks, stencil and
 color-key masks, Indexed palettes), **Form XObjects**, **axial/radial gradients**
 (`sh` and shading patterns), all 16 **blend modes**, and
-DeviceGray/RGB/CMYK/ICCBased/Indexed/Lab/Separation/DeviceN color. **Encrypted**
+DeviceGray/RGB/CMYK/ICCBased/Indexed/Lab/Separation/DeviceN/**NChannel** color
+(the `None` colorant correctly produces no marks; `All` knocks out). **Encrypted**
 documents (RC4, AES-128, AES-256; empty user password) decrypt transparently.
 **Annotations** render from their appearance streams; markup and geometric
 annotations (highlights, underlines, strike-outs, squiggles, squares, circles,

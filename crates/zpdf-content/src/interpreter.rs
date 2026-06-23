@@ -176,13 +176,24 @@ enum ActiveColorSpace {
         hival: u8,
         lookup: std::sync::Arc<[u8]>,
     },
-    /// Separation (n = 1) or DeviceN (n = components) with its tint transform
-    /// and alternate space. A missing/unparseable transform falls back to
-    /// `gray(1 - max(tint))`, which has the right polarity for colorants.
+    /// Separation (n = 1) or DeviceN/NChannel (n = components) with its tint
+    /// transform and alternate space. A missing/unparseable transform falls back
+    /// to `gray(1 - max(tint))`, which has the right polarity for colorants.
     Tint {
         n: usize,
         transform: Option<std::sync::Arc<zpdf_color::PdfFunction>>,
         alternate: Box<ActiveColorSpace>,
+        /// Colorant names (Separation: one; DeviceN/NChannel: `n`). Drives the
+        /// special names `None` (no marks, ISO 32000-1 §8.6.6.4/§8.6.6.5) and
+        /// `All` (Separation → every colorant, i.e. overprint knockout).
+        names: std::sync::Arc<[String]>,
+        /// PDF 2.0 NChannel `/Colorants`: per-input-colorant mapping to process
+        /// colorants, parallel to `names`. Present only when **every** colorant
+        /// is classifiable (a `/None`, a named process colorant, or a spot whose
+        /// own Separation space is given in `/Colorants`); enables a precise
+        /// per-colorant overprint mask. `None` → overprint uses the whole-
+        /// transform projection (plain Separation/DeviceN, no regression).
+        colorants: Option<std::sync::Arc<[ColorantMap]>>,
     },
     Pattern {
         /// Underlying space of `[/Pattern base]` — the color operands that
@@ -205,6 +216,54 @@ impl ActiveColorSpace {
             Self::Pattern { .. } => 0,
         }
     }
+}
+
+/// How one input colorant of a DeviceN/NChannel space maps to process colorants
+/// for the overprint active-colorant mask (PDF 8.6.7). Built from `/Colorants`
+/// (and standard process colorant names) so each colorant can be projected
+/// individually — letting a `/None` colorant contribute no ink, which the
+/// whole-transform projection cannot express.
+#[derive(Debug, Clone)]
+enum ColorantMap {
+    /// `/None` — produces no marks; contributes nothing to the mask.
+    None,
+    /// A standard process colorant; index into `(C, M, Y, K)`.
+    Process(usize),
+    /// A spot colorant carrying its own Separation space (from `/Colorants`);
+    /// the tint is projected through it to recover process colorants.
+    Spot(Box<ActiveColorSpace>),
+    /// An unclassifiable spot (no `/Colorants` entry, not a process name) that
+    /// must still be projected because a sibling `/None` has to be dropped: run
+    /// the DeviceN's own tint transform with only this component's tint set (the
+    /// rest zeroed) and recover the alternate space's colorants. Less precise
+    /// than a real per-colorant Separation, but it isolates the colorant so the
+    /// `/None` component contributes no ink (ISO 32000-1 §8.6.6.5).
+    Whole,
+}
+
+/// Index of a standard process colorant name into `(C, M, Y, K)`, or `None` for
+/// a spot/other name. Used to classify DeviceN/NChannel colorants (§8.6.6.5).
+fn process_colorant_index(name: &str) -> Option<usize> {
+    match name {
+        "Cyan" => Some(0),
+        "Magenta" => Some(1),
+        "Yellow" => Some(2),
+        "Black" => Some(3),
+        _ => None,
+    }
+}
+
+/// True when `cs` is a Separation/DeviceN/NChannel space whose colorants are
+/// **all** the special name `None`: such a space produces no marks on the page
+/// (ISO 32000-1 §8.6.6.4 Separation, §8.6.6.5 DeviceN — "marking … in which all
+/// colorant names are None shall produce no marks"), so paints in it are
+/// suppressed entirely while text extraction is unaffected.
+fn cs_produces_no_marks(cs: &ActiveColorSpace) -> bool {
+    matches!(
+        cs,
+        ActiveColorSpace::Tint { names, .. }
+            if !names.is_empty() && names.iter().all(|n| n == "None")
+    )
 }
 
 /// Resolved pattern paint selected via `scn` in a Pattern colorspace.
@@ -1177,23 +1236,53 @@ impl<'a> ContentInterpreter<'a> {
                 }
             }
             "Separation" | "DeviceN" => {
-                let n = if cs_name.as_str() == "Separation" {
-                    1
+                let is_sep = cs_name.as_str() == "Separation";
+                // Colorant names: Separation carries a single Name at [1];
+                // DeviceN/NChannel an array of Names. An unreadable entry becomes
+                // "" (never a process/None/All match → ordinary spot polarity).
+                let names: Vec<String> = if is_sep {
+                    match arr.get(1).map(|o| self.resolve_plain(o)) {
+                        Some(PdfObject::Name(nm)) => vec![nm.0],
+                        _ => vec![String::new()],
+                    }
                 } else {
                     match arr.get(1).map(|o| self.resolve_plain(o)) {
-                        Some(PdfObject::Array(names)) => names.len().max(1),
-                        _ => 1,
+                        Some(PdfObject::Array(items)) => items
+                            .iter()
+                            .map(|o| match self.resolve_plain(o) {
+                                PdfObject::Name(nm) => nm.0,
+                                _ => String::new(),
+                            })
+                            .collect(),
+                        _ => Vec::new(),
                     }
                 };
+                let names = if names.is_empty() {
+                    vec![String::new()]
+                } else {
+                    names
+                };
+                let n = names.len();
                 let alternate = arr
                     .get(2)
                     .map(|o| self.resolve_color_space_obj(o, depth + 1))
                     .unwrap_or(ActiveColorSpace::DeviceGray);
                 let transform = arr.get(3).and_then(|o| self.parse_function(o));
+                // PDF 2.0 NChannel: an attributes dict at [4] may carry
+                // `/Colorants` (each spot colorant's own Separation space),
+                // enabling a precise per-colorant overprint mask. DeviceN only —
+                // a Separation has a single colorant already handled directly.
+                let colorants = if is_sep {
+                    None
+                } else {
+                    self.parse_nchannel_colorants(&names, arr.get(4), depth)
+                };
                 ActiveColorSpace::Tint {
                     n,
                     transform: transform.map(std::sync::Arc::new),
                     alternate: Box::new(alternate),
+                    names: std::sync::Arc::from(names),
+                    colorants,
                 }
             }
             "Indexed" | "I" => {
@@ -1264,6 +1353,65 @@ impl<'a> ContentInterpreter<'a> {
             },
             _ => ActiveColorSpace::DeviceGray,
         }
+    }
+
+    /// Parse a DeviceN/NChannel attributes dict's `/Colorants` into per-input-
+    /// colorant maps parallel to `names`, for the overprint active-colorant mask
+    /// (PDF 8.6.7). Returns `Some` only when **every** colorant is classifiable
+    /// — a `/None`, a standard process colorant, or a spot whose own Separation
+    /// space is present in `/Colorants` — so a partial/absent `/Colorants` leaves
+    /// overprint on the whole-transform projection (plain DeviceN unchanged).
+    fn parse_nchannel_colorants(
+        &mut self,
+        names: &[String],
+        attrs_obj: Option<&PdfObject>,
+        depth: u8,
+    ) -> Option<std::sync::Arc<[ColorantMap]>> {
+        // `/Colorants` (NChannel attributes) maps each spot colorant name to its
+        // own Separation colour space; absent on a plain DeviceN.
+        let colorants_dict = attrs_obj
+            .and_then(|o| self.resolve_dict_of(o))
+            .and_then(|attrs| attrs.get("Colorants").cloned())
+            .map(|o| self.resolve_plain(&o))
+            .and_then(|o| o.as_dict().ok().cloned());
+
+        // Only build a per-colorant mask when it can differ from the whole-
+        // transform projection: an explicit `/Colorants` (NChannel) is present,
+        // or a `/None` colorant must be excluded from the mask. A plain DeviceN
+        // keeps the existing whole-transform overprint path byte-for-byte.
+        let has_none = names.iter().any(|n| n == "None");
+        if colorants_dict.is_none() && !has_none {
+            return None;
+        }
+
+        let mut maps = Vec::with_capacity(names.len());
+        for name in names {
+            if name == "None" {
+                maps.push(ColorantMap::None);
+            } else if let Some(ch) = process_colorant_index(name) {
+                maps.push(ColorantMap::Process(ch));
+            } else {
+                // A spot colorant: classify via its `/Colorants` Separation space
+                // when present.
+                let sep = colorants_dict
+                    .as_ref()
+                    .and_then(|d| d.get(name.as_str()))
+                    .map(|o| self.resolve_color_space_obj(o, depth + 1));
+                match sep {
+                    Some(space @ ActiveColorSpace::Tint { .. }) => {
+                        maps.push(ColorantMap::Spot(Box::new(space)));
+                    }
+                    // Unclassifiable spot. Only keep the per-colorant map when a
+                    // `/None` must be excluded (then isolate this spot through the
+                    // whole tint transform); with no `/None` to drop, fall back
+                    // entirely to the faithful whole-transform projection so a
+                    // plain DeviceN loses no precision.
+                    _ if has_none => maps.push(ColorantMap::Whole),
+                    _ => return None,
+                }
+            }
+        }
+        Some(std::sync::Arc::from(maps))
     }
 
     /// Compile (through the document's `IccCache`) the ICCBased profile
@@ -1503,6 +1651,7 @@ impl<'a> ContentInterpreter<'a> {
                 n,
                 transform,
                 alternate,
+                ..
             } => {
                 if let Some(f) = transform {
                     if let Some(out) = f.eval(vals) {
@@ -1540,44 +1689,116 @@ impl<'a> ContentInterpreter<'a> {
                 n,
                 transform,
                 alternate,
+                names,
+                colorants,
             } => {
-                // Project the tint through its transform to the alternate space,
-                // then recover that space's colorants. A spot/DeviceN paints
-                // exactly the colorants it maps to → always the nonzero rule.
-                let alt_vals = match transform.as_ref().and_then(|f| f.eval(vals)) {
-                    Some(out) => out,
-                    None => {
-                        // No usable transform: dark-for-full-tint ≈ K only.
-                        let max_tint = vals
-                            .iter()
-                            .take(*n)
-                            .fold(0.0f64, |acc, &v| acc.max(v.clamp(0.0, 1.0)));
-                        return Some(Colorant {
-                            cmyk: [0.0, 0.0, 0.0, fin(max_tint)],
-                            cmyk_device: false,
-                        });
-                    }
-                };
-                match self.colorant_projection(alternate, &alt_vals) {
-                    Some(c) => Some(Colorant {
-                        cmyk: c.cmyk,
-                        cmyk_device: false,
-                    }),
-                    None => {
-                        // Alternate is additive/CIE: project its RGB to CMYK.
-                        let rgb = self.components_to_rgb(alternate, &alt_vals);
-                        let (c, m, y, k) =
-                            zpdf_color::rgb_to_cmyk_naive(rgb.r as f64, rgb.g as f64, rgb.b as f64);
-                        Some(Colorant {
-                            cmyk: [fin(c), fin(m), fin(y), fin(k)],
-                            cmyk_device: false,
-                        })
-                    }
+                // The Separation special colorant `All` marks *every* colorant
+                // (registration marks, §8.6.6.4) — not a selective overprint, so
+                // it knocks out: report no colorant projection (→ normal paint).
+                if names.len() == 1 && names[0] == "All" {
+                    return None;
                 }
+                // An all-`None` space produces no marks (the paint is suppressed
+                // upstream); it touches no colorants either.
+                if !names.is_empty() && names.iter().all(|s| s == "None") {
+                    return None;
+                }
+                // NChannel `/Colorants`: project each input colorant on its own —
+                // a `/None` colorant adds no ink, a process colorant sets its
+                // channel, a spot runs its individual Separation transform, an
+                // unclassifiable spot is isolated through the whole transform —
+                // then union the nonzero process colorants. (The *display* colour
+                // still uses the whole tint transform above; this is only the
+                // overprint active-colorant mask, which the whole-transform
+                // projection cannot express because it can't drop a `/None`.)
+                if let Some(maps) = colorants {
+                    let mut cmyk = [0.0f32; 4];
+                    let union = |cmyk: &mut [f32; 4], src: [f32; 4]| {
+                        for (dst, s) in cmyk.iter_mut().zip(src.iter()) {
+                            *dst = dst.max(*s);
+                        }
+                    };
+                    for (i, m) in maps.iter().enumerate() {
+                        let tint = vals.get(i).copied().unwrap_or(0.0);
+                        match m {
+                            ColorantMap::None => {}
+                            ColorantMap::Process(ch) => cmyk[*ch] = cmyk[*ch].max(fin(tint)),
+                            ColorantMap::Spot(sep) => {
+                                if let Some(c) = self.colorant_projection(sep, &[tint]) {
+                                    union(&mut cmyk, c.cmyk);
+                                }
+                            }
+                            ColorantMap::Whole => {
+                                // Isolate this colorant by running the DeviceN's
+                                // own tint transform with only its tint set, so a
+                                // sibling `/None` contributes no ink.
+                                let mut iso = vec![0.0f64; maps.len()];
+                                if let Some(slot) = iso.get_mut(i) {
+                                    *slot = tint;
+                                }
+                                union(
+                                    &mut cmyk,
+                                    self.tint_whole_colorant(
+                                        transform.as_deref(),
+                                        alternate,
+                                        maps.len(),
+                                        &iso,
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                    return Some(Colorant {
+                        cmyk,
+                        cmyk_device: false,
+                    });
+                }
+                // Whole-transform projection: map the tints through the transform
+                // to the alternate space and recover that space's colorants. A
+                // spot/DeviceN paints exactly what it maps to → nonzero rule.
+                Some(Colorant {
+                    cmyk: self.tint_whole_colorant(transform.as_deref(), alternate, *n, vals),
+                    cmyk_device: false,
+                })
             }
             // DeviceRGB, ICCBased(3)/odd, Icc(non-4), Lab, Indexed, Pattern:
             // additive or non-colorant — overprint is a no-op.
             _ => None,
+        }
+    }
+
+    /// Whole-transform overprint projection for a Separation/DeviceN: map `vals`
+    /// through the tint `transform` to `alternate` and recover that space's CMYK
+    /// colorants. With no usable transform, falls back to K-only at the maximum
+    /// tint (the right polarity for a colorant). `n` bounds the fallback's tint
+    /// scan to the declared component count.
+    fn tint_whole_colorant(
+        &self,
+        transform: Option<&zpdf_color::PdfFunction>,
+        alternate: &ActiveColorSpace,
+        n: usize,
+        vals: &[f64],
+    ) -> [f32; 4] {
+        let alt_vals = match transform.and_then(|f| f.eval(vals)) {
+            Some(out) => out,
+            None => {
+                // No usable transform: dark-for-full-tint ≈ K only.
+                let max_tint = vals
+                    .iter()
+                    .take(n)
+                    .fold(0.0f64, |acc, &v| acc.max(v.clamp(0.0, 1.0)));
+                return [0.0, 0.0, 0.0, fin(max_tint)];
+            }
+        };
+        match self.colorant_projection(alternate, &alt_vals) {
+            Some(c) => c.cmyk,
+            None => {
+                // Alternate is additive/CIE: project its RGB to CMYK.
+                let rgb = self.components_to_rgb(alternate, &alt_vals);
+                let (c, m, y, k) =
+                    zpdf_color::rgb_to_cmyk_naive(rgb.r as f64, rgb.g as f64, rgb.b as f64);
+                [fin(c), fin(m), fin(y), fin(k)]
+            }
         }
     }
 
@@ -2707,6 +2928,13 @@ impl<'a> ContentInterpreter<'a> {
         // Image metadata keys may be indirect references; resolve them so e.g.
         // an indirect /Decode does not silently invert an /ImageMask stencil.
         let image_dict = resolve_image_metadata(file, &stream.dict);
+        // An /ImageMask stencil paints in the current fill colour, so a `/None`
+        // (no-marks) fill colour space suppresses it like any other fill paint.
+        if cs_produces_no_marks(&self.current.fill_cs)
+            && matches!(image_dict.get("ImageMask"), Some(PdfObject::Bool(true)))
+        {
+            return;
+        }
         // An image's /Intent overrides the graphics-state rendering intent.
         let intent = image_dict
             .get_name("Intent")
@@ -2767,6 +2995,13 @@ impl<'a> ContentInterpreter<'a> {
             return;
         }
         let mut norm = normalize_inline_image_dict(&dict);
+        // An inline /ImageMask stencil paints in the current fill colour, so a
+        // `/None` (no-marks) fill colour space suppresses it.
+        if cs_produces_no_marks(&self.current.fill_cs)
+            && matches!(norm.get("ImageMask"), Some(PdfObject::Bool(true)))
+        {
+            return;
+        }
         let decoded = match zpdf_parser::filters::decode_stream(&data, &norm) {
             Ok(d) => d,
             Err(e) => {
@@ -3253,6 +3488,10 @@ impl<'a> ContentInterpreter<'a> {
     /// stroke (shading patterns fall back to the precomputed average colour when
     /// the region is degenerate).
     fn emit_stroke(&mut self, page_path: Path) {
+        // A `/None` (or all-`None` DeviceN) stroke colour space produces no marks.
+        if cs_produces_no_marks(&self.current.stroke_cs) {
+            return;
+        }
         let style = self.stroke_style();
         if let Some(pat) = self.current.stroke_pattern.clone() {
             // The stroke region is the centerline extent grown by the stroke
@@ -3321,6 +3560,10 @@ impl<'a> ContentInterpreter<'a> {
     /// (tiling or shading) is clipped to the path; everything else is a solid
     /// fill.
     fn fill_page_path(&mut self, page_path: Path, rule: FillRule) {
+        // A `/None` (or all-`None` DeviceN) fill colour space produces no marks.
+        if cs_produces_no_marks(&self.current.fill_cs) {
+            return;
+        }
         if let Some(pat) = self.current.fill_pattern.clone() {
             if let Some(bounds) = Self::path_bounds(&page_path) {
                 self.display_list.push(RenderCommand::PushClip {
@@ -3835,7 +4078,14 @@ impl<'a> ContentInterpreter<'a> {
         // glyph IDs would be raw, unmappable codes aliased onto font 0.
         // Text render mode 3 (invisible, the OCR-layer case) and 7 (clip only)
         // paint nothing; stroke modes 1/2/5/6 are approximated as fills.
-        let invisible = matches!(self.current.render_mode, 3 | 7);
+        // A `/None` colorant space on the active paint (fill for modes 0/2/4/6,
+        // stroke for 1/5) likewise produces no marks — suppress the visual run,
+        // while the text-extraction sink below still records the glyphs.
+        let no_marks = match self.current.render_mode {
+            1 | 5 => cs_produces_no_marks(&self.current.stroke_cs),
+            _ => cs_produces_no_marks(&self.current.fill_cs),
+        };
+        let invisible = matches!(self.current.render_mode, 3 | 7) || no_marks;
         if let Some(font_id) = self.current_font_id {
             if !glyphs.is_empty() && !invisible {
                 // A Pattern colour space on the active paint (fill for modes
@@ -4957,6 +5207,233 @@ mod tests {
                 );
             }
             other => panic!("expected Indexed, got {other:?}"),
+        }
+    }
+
+    // ---- Separation / DeviceN / NChannel colorant semantics ----
+
+    fn nm(s: &str) -> PdfObject {
+        PdfObject::Name(zpdf_core::PdfName::new(s))
+    }
+
+    /// A FunctionType 2 tint dict (`t → C1`). It parses to `None` without a file
+    /// (the unit tests below exercise colorant *names* and `/Colorants`, never
+    /// the transform itself), which the colour space tolerates.
+    fn tint_fn() -> PdfObject {
+        use zpdf_core::{PdfDict, PdfName};
+        let mut d = PdfDict::new();
+        d.insert(PdfName::new("FunctionType"), PdfObject::Integer(2));
+        d.insert(
+            PdfName::new("Domain"),
+            PdfObject::Array(vec![PdfObject::Real(0.0), PdfObject::Real(1.0)]),
+        );
+        d.insert(PdfName::new("N"), PdfObject::Integer(1));
+        PdfObject::Dict(d)
+    }
+
+    fn separation(name: &str) -> PdfObject {
+        PdfObject::Array(vec![
+            nm("Separation"),
+            nm(name),
+            nm("DeviceCMYK"),
+            tint_fn(),
+        ])
+    }
+
+    fn new_interp() -> ContentInterpreter<'static> {
+        ContentInterpreter::new(Rect::new(0.0, 0.0, 200.0, 200.0))
+    }
+
+    #[test]
+    fn separation_none_produces_no_marks() {
+        let mut interp = new_interp();
+        let acs = interp.resolve_color_space_obj(&separation("None"), 0);
+        match &acs {
+            ActiveColorSpace::Tint { names, .. } => assert_eq!(&names[..], &["None".to_string()]),
+            other => panic!("expected Tint, got {other:?}"),
+        }
+        assert!(
+            cs_produces_no_marks(&acs),
+            "a /None Separation marks nothing"
+        );
+        // A normal spot still marks.
+        let spot = interp.resolve_color_space_obj(&separation("PANTONE 032"), 0);
+        assert!(!cs_produces_no_marks(&spot));
+    }
+
+    #[test]
+    fn separation_all_is_overprint_knockout() {
+        let mut interp = new_interp();
+        let acs = interp.resolve_color_space_obj(&separation("All"), 0);
+        // `All` paints every colorant (registration) → not selective overprint,
+        // so it reports no colorant projection (a normal, knockout paint).
+        assert!(
+            interp.colorant_projection(&acs, &[1.0]).is_none(),
+            "/All must knock out (no overprint mask)"
+        );
+        // A spot, by contrast, projects to its colorant.
+        let spot = interp.resolve_color_space_obj(&separation("Spot"), 0);
+        assert!(interp.colorant_projection(&spot, &[1.0]).is_some());
+    }
+
+    #[test]
+    fn devicen_none_excluded_from_overprint_mask() {
+        // [/DeviceN [/Cyan /None /Black] /DeviceCMYK fn] — Cyan and Black are
+        // process colorants, the middle component is /None. The per-colorant
+        // mask must take Cyan and Black and *drop* the None tint entirely.
+        let cs = PdfObject::Array(vec![
+            nm("DeviceN"),
+            PdfObject::Array(vec![nm("Cyan"), nm("None"), nm("Black")]),
+            nm("DeviceCMYK"),
+            tint_fn(),
+        ]);
+        let mut interp = new_interp();
+        let acs = interp.resolve_color_space_obj(&cs, 0);
+        match &acs {
+            ActiveColorSpace::Tint { colorants, .. } => {
+                assert!(
+                    colorants.is_some(),
+                    "process+None DeviceN gets a per-colorant mask"
+                );
+            }
+            other => panic!("expected Tint, got {other:?}"),
+        }
+        let c = interp
+            .colorant_projection(&acs, &[0.5, 0.9, 0.2])
+            .expect("colorant");
+        // C=0.5, M=0, Y=0, K=0.2 — the None component's 0.9 contributes nothing.
+        assert!((c.cmyk[0] - 0.5).abs() < 1e-6, "C {:?}", c.cmyk);
+        assert_eq!(c.cmyk[1], 0.0, "M {:?}", c.cmyk);
+        assert_eq!(c.cmyk[2], 0.0, "Y (None dropped) {:?}", c.cmyk);
+        assert!((c.cmyk[3] - 0.2).abs() < 1e-6, "K {:?}", c.cmyk);
+        assert!(!c.cmyk_device, "spot/DeviceN colorant is not OPM-governed");
+    }
+
+    #[test]
+    fn plain_devicen_keeps_whole_transform_path() {
+        // A plain DeviceN of two spots, no /Colorants and no /None, must NOT
+        // switch to the per-colorant path — overprint stays byte-identical.
+        let cs = PdfObject::Array(vec![
+            nm("DeviceN"),
+            PdfObject::Array(vec![nm("Spot1"), nm("Spot2")]),
+            nm("DeviceCMYK"),
+            tint_fn(),
+        ]);
+        let mut interp = new_interp();
+        match interp.resolve_color_space_obj(&cs, 0) {
+            ActiveColorSpace::Tint {
+                colorants, names, ..
+            } => {
+                assert!(
+                    colorants.is_none(),
+                    "plain DeviceN keeps whole-transform overprint"
+                );
+                assert_eq!(names.len(), 2);
+            }
+            other => panic!("expected Tint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nchannel_colorants_classifies_spot() {
+        // [/DeviceN [/Cyan /PANTONE] /DeviceCMYK fn << /Subtype /NChannel
+        //   /Colorants << /PANTONE [/Separation /PANTONE /DeviceCMYK fn] >> >>]
+        use zpdf_core::{PdfDict, PdfName};
+        let mut colorants = PdfDict::new();
+        colorants.insert(PdfName::new("PANTONE"), separation("PANTONE"));
+        let mut attrs = PdfDict::new();
+        attrs.insert(PdfName::new("Subtype"), nm("NChannel"));
+        attrs.insert(PdfName::new("Colorants"), PdfObject::Dict(colorants));
+        let cs = PdfObject::Array(vec![
+            nm("DeviceN"),
+            PdfObject::Array(vec![nm("Cyan"), nm("PANTONE")]),
+            nm("DeviceCMYK"),
+            tint_fn(),
+            PdfObject::Dict(attrs),
+        ]);
+        let mut interp = new_interp();
+        match interp.resolve_color_space_obj(&cs, 0) {
+            ActiveColorSpace::Tint {
+                colorants: Some(maps),
+                ..
+            } => {
+                assert!(matches!(maps[0], ColorantMap::Process(0)), "Cyan→C");
+                assert!(matches!(maps[1], ColorantMap::Spot(_)), "PANTONE→spot");
+            }
+            other => panic!("expected NChannel Tint with /Colorants, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn devicen_none_with_unclassifiable_spot_keeps_map() {
+        // [/DeviceN [/Spot1 /None] /DeviceCMYK fn] with NO /Colorants: a /None
+        // must still be dropped from the overprint mask, so the per-colorant map
+        // is kept — the unclassifiable Spot1 isolated through the whole transform
+        // (Whole), the /None dropped — rather than discarded (which would let the
+        // /None tint leak into the whole-transform projection).
+        let cs = PdfObject::Array(vec![
+            nm("DeviceN"),
+            PdfObject::Array(vec![nm("Spot1"), nm("None")]),
+            nm("DeviceCMYK"),
+            tint_fn(),
+        ]);
+        let mut interp = new_interp();
+        match interp.resolve_color_space_obj(&cs, 0) {
+            ActiveColorSpace::Tint {
+                colorants: Some(maps),
+                ..
+            } => {
+                assert!(
+                    matches!(maps[0], ColorantMap::Whole),
+                    "spot → Whole, got {:?}",
+                    maps[0]
+                );
+                assert!(
+                    matches!(maps[1], ColorantMap::None),
+                    "None → None, got {:?}",
+                    maps[1]
+                );
+            }
+            other => panic!("expected per-colorant Tint, got {other:?}"),
+        }
+        // No /None to drop → an unclassifiable spot keeps the faithful whole-
+        // transform path (colorants None), not a Whole-isolated approximation.
+        let cs2 = PdfObject::Array(vec![
+            nm("DeviceN"),
+            PdfObject::Array(vec![nm("Spot1"), nm("Spot2")]),
+            nm("DeviceCMYK"),
+            tint_fn(),
+        ]);
+        match interp.resolve_color_space_obj(&cs2, 0) {
+            ActiveColorSpace::Tint { colorants, .. } => assert!(colorants.is_none()),
+            other => panic!("expected Tint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nchannel_missing_colorant_falls_back() {
+        // A spot with no /Colorants entry cannot be isolated → no per-colorant
+        // mask (whole-transform path), so overprint never regresses.
+        use zpdf_core::{PdfDict, PdfName};
+        let mut attrs = PdfDict::new();
+        attrs.insert(PdfName::new("Subtype"), nm("NChannel"));
+        attrs.insert(PdfName::new("Colorants"), PdfObject::Dict(PdfDict::new()));
+        let cs = PdfObject::Array(vec![
+            nm("DeviceN"),
+            PdfObject::Array(vec![nm("Cyan"), nm("UnknownSpot")]),
+            nm("DeviceCMYK"),
+            tint_fn(),
+            PdfObject::Dict(attrs),
+        ]);
+        let mut interp = new_interp();
+        match interp.resolve_color_space_obj(&cs, 0) {
+            ActiveColorSpace::Tint { colorants, .. } => {
+                assert!(
+                    colorants.is_none(),
+                    "unmapped spot disables the per-colorant mask"
+                );
+            }
+            other => panic!("expected Tint, got {other:?}"),
         }
     }
 }

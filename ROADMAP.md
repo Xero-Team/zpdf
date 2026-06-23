@@ -377,7 +377,16 @@ cargo run -p zpdf-render-wgpu --example viewer -- <file.pdf>   # 交互浏览器
       `--out-dir` 或覆盖目录内文件；`zpdf info` 亦列出附件。解析路径仅
       显式调用时运行（open//render 期间不触发），畸形语料健壮性零回归。纯 Rust 零新运行时依赖
       （ZUGFeRD/Factur-X 发票 XML 抽取可用）
-- [ ] 新增颜色空间（其余 ISO 32000-2 差异项）
+- [x] NChannel 颜色空间与 `None`/`All` 着色剂语义（ISO 32000-1 §8.6.6.4/§8.6.6.5、
+      ISO 32000-2 NChannel）：`ActiveColorSpace::Tint` 携带着色剂名 + NChannel `/Colorants`
+      逐着色剂映射。Separation `/None`（或全 `/None` DeviceN/NChannel）**不产生任何标记**
+      —— 填充/描边/字形 **及 `/ImageMask` 蒙版**（用当前填充色绘制）均被抑制，文本提取不受影响；
+      Separation `/All` 指代全部着色剂（套准标记）→ 非选择性叠印（正常 knockout）；NChannel
+      `/Colorants`（或含 `/None` 需排除时）按**逐输入着色剂**计算叠印激活掩码：`/None` 不贡献
+      墨、过程名 Cyan/Magenta/Yellow/Black 直接置位、spot 经各自 Separation 投影、无法分类的
+      spot 经整体 tint 变换隔离（仍丢弃 `/None`），取并集。显示颜色不变（仍走整体 tint 变换）；
+      抑制与掩码均在解释器（显示列表上游）决定，**双后端零改动**、CPU↔GPU 自动一致。无 `/Colorants`
+      且无 `/None` 的普通 Separation/DeviceN 逐字节保持原整体变换投影（per-colorant 仅在可能不同时启用）
 - [ ] 新增注释类型
 
 ---

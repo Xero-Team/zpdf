@@ -2,6 +2,49 @@
 
 ## Unreleased
 
+### NChannel colour space & `None`/`All` colorant semantics (PDF 2.0)
+
+Separation, DeviceN and the PDF 2.0 **NChannel** colour spaces now honour the
+special colorant names and NChannel's per-colorant attributes. Tint→alternate
+colour conversion already worked through the DeviceN path; this adds the colorant
+*semantics* the spec attaches to the colorant **names** (ISO 32000-1 §8.6.6.4
+Separation, §8.6.6.5 DeviceN; ISO 32000-2 NChannel).
+
+- **`None` produces no marks.** A Separation whose colorant is `/None` — or a
+  DeviceN/NChannel whose colorants are *all* `/None` — marks nothing on the page.
+  Fills, strokes, glyph runs **and `/ImageMask` stencils** (which paint in the
+  current fill colour) in such a space are suppressed; text **extraction** is
+  unaffected (a `/None` text run is still recovered, like invisible render-mode-3
+  text). Previously these painted the tint-transform's (typically dark) colour.
+
+- **`All` knocks out.** The Separation special colorant `/All` refers to every
+  colorant (registration marks), so it is not a selective overprint: it paints
+  normally (no overprint mask) rather than overprinting a single colorant.
+
+- **NChannel `/Colorants` per-colorant overprint.** When a DeviceN/NChannel
+  carries an attributes dict with `/Colorants` (each spot colorant's own
+  Separation space) — or contains a `/None` that must be excluded — the overprint
+  active-colorant mask (PDF 8.6.7) is computed **per input colorant**: a `/None`
+  contributes no ink, a standard process name (`Cyan`/`Magenta`/`Yellow`/`Black`)
+  sets its channel, a spot projects through its individual Separation transform,
+  and an unclassifiable spot beside a `/None` is isolated through the whole tint
+  transform (so the `/None` is still dropped). The union of these is the mask.
+  This is what lets K-only or single-spot overprint mix with the backdrop while a
+  `/None` channel never knocks anything out. A plain Separation/DeviceN with no
+  `/Colorants` and no `/None` keeps the existing whole-transform projection
+  **byte-for-byte** — the per-colorant path only engages when it can differ.
+
+The display colour is unchanged (still the full tint transform). Suppression and
+the colorant mask are decided in the interpreter, upstream of the flat display
+list, so **both render backends are unchanged** and CPU↔GPU parity holds
+automatically (the overprint descriptors are the same shapes the wgpu composite
+already matches at 0.000%). Pure Rust, zero new dependencies. Verified by unit
+tests (name capture, `/Colorants` classification, the `None`/`All` projections,
+the unclassifiable-spot-beside-`None` map) and CPU end-to-end render tests
+(`/None` fill/stroke invisible, all-`None` DeviceN invisible, `/ImageMask`
+stencil suppressed under a `/None` fill, NChannel `/None` adds no ink under
+overprint, `/Colorants` spot overprints, and a normal-spot control).
+
 ### Embedded files & associated files (attachments, PDF 2.0 `/AF`)
 
 The library now surfaces files **stored inside** a PDF: classic embedded files
