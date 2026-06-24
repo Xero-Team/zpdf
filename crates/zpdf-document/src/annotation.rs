@@ -4,11 +4,15 @@
 //! zpdf-content, which replays the appearance stream as a form XObject mapped
 //! onto `/Rect` (PDF 32000-1 §12.5.5).
 
+use std::collections::HashMap;
+
 use zpdf_core::{ObjectId, PdfObject, Rect};
 use zpdf_parser::PdfFile;
 
+use crate::destinations::{resolve_link_target, Destination};
 use crate::forms::{AcroForm, GeneratedAppearance};
 use crate::page::PdfPage;
+use crate::Catalog;
 
 /// Annotation flag bits (PDF 32000-1 Table 165).
 pub const ANNOT_FLAG_HIDDEN: i64 = 1 << 1;
@@ -31,6 +35,15 @@ pub struct Annotation {
     /// /OC optional-content membership (a Ref to an OCG/OCMD, or a direct
     /// dict), evaluated against the document's OC config at paint time.
     pub oc: Option<PdfObject>,
+    /// The in-document navigation target this annotation links to — a resolved
+    /// [`Destination`] from a `/Dest`, a go-to action (`/A /S /GoTo`), or a
+    /// remote go-to whose target page is in range. `None` for non-link
+    /// annotations and for URI / external links (see [`Annotation::uri`]).
+    /// Chiefly populated for `Link` annotations.
+    pub dest: Option<Destination>,
+    /// An external link target: a URI (`/A /S /URI`) or a remote go-to file name
+    /// (`/A /S /GoToR /F`). `None` for in-document and non-link annotations.
+    pub uri: Option<String>,
 }
 
 impl Annotation {
@@ -49,21 +62,28 @@ impl Annotation {
 /// Parse a page's annotations into renderable form. Unresolvable or
 /// appearance-less entries are kept (callers may want link rects later) but
 /// fail `is_viewable`. When an `AcroForm` is supplied, widget annotations gain
-/// a generated appearance where the producer left none.
+/// a generated appearance where the producer left none. Link targets (`/Dest` /
+/// `/A`) are resolved to a [`Destination`] or URI via `catalog` and the
+/// document-wide `named` destination map (flattened once by the caller, so the
+/// name tree is never re-walked per page).
 pub fn parse_annotations(
     file: &PdfFile,
     page: &PdfPage,
+    catalog: &Catalog,
+    named: &HashMap<Vec<u8>, PdfObject>,
     acro_form: Option<&AcroForm>,
 ) -> Vec<Annotation> {
     page.annots
         .iter()
-        .filter_map(|&id| parse_annotation(file, id, acro_form))
+        .filter_map(|&id| parse_annotation(file, id, catalog, named, acro_form))
         .collect()
 }
 
 fn parse_annotation(
     file: &PdfFile,
     id: ObjectId,
+    catalog: &Catalog,
+    named: &HashMap<Vec<u8>, PdfObject>,
     acro_form: Option<&AcroForm>,
 ) -> Option<Annotation> {
     let obj = file.resolve(id).ok()?;
@@ -83,6 +103,9 @@ fn parse_annotation(
 
     let appearance = select_appearance(file, dict);
     let oc = dict.get("OC").cloned();
+    // Resolve the navigation target (cheap (None, None) when the annotation
+    // carries neither /Dest nor /A — the common case for non-link annotations).
+    let (dest, uri) = resolve_link_target(file, catalog, dict, Some(named));
 
     // Generate an appearance when the producer left none. Form widgets defer to
     // the AcroForm generator (which also honours /NeedAppearances and keeps
@@ -108,6 +131,8 @@ fn parse_annotation(
         appearance,
         generated,
         oc,
+        dest,
+        uri,
     })
 }
 
@@ -160,4 +185,110 @@ fn select_state(
     }
     let _ = file;
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::test_util::build_pdf;
+    use crate::PdfDocument;
+
+    /// Two-page document; page 0 (object 3) carries the `/Annots` under test,
+    /// page 1 (object 4) is a destination target. Annotation objects start at 5.
+    fn doc_with_annots(annot_refs: &str, annots: &[&str]) -> PdfDocument {
+        let mut objs: Vec<String> = vec![
+            "<< /Type /Catalog /Pages 2 0 R >>".into(),
+            "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>".into(),
+            format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [{annot_refs}] >>"
+            ),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".into(),
+        ];
+        objs.extend(annots.iter().map(|a| (*a).to_string()));
+        let refs: Vec<&str> = objs.iter().map(|s| s.as_str()).collect();
+        PdfDocument::open(build_pdf(&refs)).expect("open")
+    }
+
+    #[test]
+    fn link_explicit_dest_resolves() {
+        let doc = doc_with_annots(
+            "5 0 R",
+            &["<< /Type /Annot /Subtype /Link /Rect [10 10 100 30] /Dest [4 0 R /Fit] >>"],
+        );
+        let page = doc.page(0).unwrap();
+        let annots = doc.page_annotations(&page);
+        assert_eq!(annots.len(), 1);
+        let d = annots[0].dest.as_ref().expect("dest");
+        assert_eq!(d.page, Some(1));
+        assert!(annots[0].uri.is_none());
+    }
+
+    #[test]
+    fn link_uri_action_captured() {
+        let doc = doc_with_annots(
+            "5 0 R",
+            &["<< /Type /Annot /Subtype /Link /Rect [0 0 100 20] \
+               /A << /S /URI /URI (https://example.com) >> >>"],
+        );
+        let page = doc.page(0).unwrap();
+        let a = &doc.page_annotations(&page)[0];
+        assert_eq!(a.uri.as_deref(), Some("https://example.com"));
+        assert!(a.dest.is_none());
+    }
+
+    #[test]
+    fn link_goto_action_dest_resolves() {
+        let doc = doc_with_annots(
+            "5 0 R",
+            &["<< /Type /Annot /Subtype /Link /Rect [0 0 50 50] \
+               /A << /S /GoTo /D [3 0 R /XYZ null 700 null] >> >>"],
+        );
+        let page = doc.page(0).unwrap();
+        let d = doc.page_annotations(&page)[0].dest.clone().expect("dest");
+        assert_eq!(d.page, Some(0));
+    }
+
+    #[test]
+    fn link_gotor_remote_file_name() {
+        let doc = doc_with_annots(
+            "5 0 R",
+            &["<< /Type /Annot /Subtype /Link /Rect [0 0 50 50] \
+               /A << /S /GoToR /F (other.pdf) >> >>"],
+        );
+        let page = doc.page(0).unwrap();
+        let a = &doc.page_annotations(&page)[0];
+        assert_eq!(a.uri.as_deref(), Some("other.pdf"));
+        assert!(a.dest.is_none());
+    }
+
+    #[test]
+    fn non_link_annotation_has_no_target() {
+        let doc = doc_with_annots(
+            "5 0 R",
+            &["<< /Type /Annot /Subtype /Text /Rect [0 0 20 20] /Contents (note) >>"],
+        );
+        let page = doc.page(0).unwrap();
+        let a = &doc.page_annotations(&page)[0];
+        assert!(a.dest.is_none() && a.uri.is_none());
+    }
+
+    #[test]
+    fn link_named_dest_via_collected_map() {
+        // A link naming a destination registered in the /Names /Dests name tree,
+        // resolved through the once-per-page collected map.
+        let doc = PdfDocument::open(build_pdf(&[
+            "<< /Type /Catalog /Pages 2 0 R /Names << /Dests 6 0 R >> >>",
+            "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [5 0 R] >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+            "<< /Type /Annot /Subtype /Link /Rect [0 0 50 50] /Dest (chap2) >>",
+            "<< /Names [ (chap2) [4 0 R /Fit] ] >>",
+        ]))
+        .expect("open");
+        let page = doc.page(0).unwrap();
+        let d = doc.page_annotations(&page)[0]
+            .dest
+            .clone()
+            .expect("named dest");
+        assert_eq!(d.page, Some(1));
+    }
 }

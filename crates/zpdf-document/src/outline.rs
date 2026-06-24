@@ -13,9 +13,8 @@ use std::collections::{HashMap, HashSet};
 use zpdf_core::{ObjectId, PdfDict, PdfObject};
 use zpdf_parser::PdfFile;
 
-use crate::destinations::{collect_named_dests, resolve_explicit_with, Destination};
-use crate::forms::pdf_string_to_unicode;
-use crate::obj_util::{catalog_dict, resolve_dict, resolve_name, resolve_number, text};
+use crate::destinations::{collect_named_dests, resolve_link_target, Destination};
+use crate::obj_util::{catalog_dict, resolve_dict, resolve_number, text};
 use crate::Catalog;
 
 /// Maximum nesting depth of the outline tree before a subtree is pruned.
@@ -149,87 +148,11 @@ impl OutlineWalk<'_> {
         }
     }
 
-    /// Resolve an outline item's navigation target: `/Dest` directly, or `/A`
-    /// (action). Returns `(destination, uri)`.
+    /// Resolve an outline item's navigation target (`/Dest` or `/A`) through the
+    /// shared resolver, against the pre-collected named-destination map.
     fn resolve_target(&self, dict: &PdfDict) -> (Option<Destination>, Option<String>) {
-        // A direct /Dest takes precedence (a name, string, or explicit array).
-        if let Some(dest_obj) = dict.get("Dest") {
-            if let Some(d) = resolve_explicit_with(self.file, self.catalog, dest_obj, self.named) {
-                return (Some(d), None);
-            }
-        }
-
-        // Otherwise an action /A: go-to (a destination) or URI (a hyperlink).
-        if let Some(action) = resolve_dict(self.file, dict.get("A")) {
-            match resolve_name(self.file, action.get("S")).as_deref() {
-                Some("GoTo") => {
-                    if let Some(d) = action
-                        .get("D")
-                        .and_then(|d| resolve_explicit_with(self.file, self.catalog, d, self.named))
-                    {
-                        return (Some(d), None);
-                    }
-                }
-                Some("URI") => {
-                    if let Some(uri) = uri_string(self.file, &action) {
-                        return (None, Some(uri));
-                    }
-                }
-                Some("GoToR") => {
-                    // Remote go-to: record the destination *file* as the target.
-                    if let Some(name) = remote_file_name(self.file, &action) {
-                        return (None, Some(name));
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        (None, None)
+        resolve_link_target(self.file, self.catalog, dict, Some(self.named))
     }
-}
-
-/// The `/URI` of a URI action — a byte string (often ASCII); decode leniently.
-fn uri_string(file: &PdfFile, action: &PdfDict) -> Option<String> {
-    let value = match action.get("URI")? {
-        PdfObject::String(s) => return Some(decode_ascii(s.as_bytes())),
-        PdfObject::Ref(r) => file.resolve(*r).ok()?,
-        _ => return None,
-    };
-    match value {
-        PdfObject::String(s) => Some(decode_ascii(s.as_bytes())),
-        _ => None,
-    }
-}
-
-/// The target file name of a remote go-to action (`/F` — a string or a file
-/// specification dictionary's `/F`/`/UF`). A bare `/F` string is decoded
-/// BOM-aware (UTF-16BE when it carries the `FE FF` BOM), matching the
-/// filespec-dict path (which goes through [`text`]) and the `embedded_files`
-/// reader — so the same byte string decodes the same way whichever shape it
-/// arrives in.
-fn remote_file_name(file: &PdfFile, action: &PdfDict) -> Option<String> {
-    match action.get("F")? {
-        PdfObject::String(s) => Some(pdf_string_to_unicode(s.as_bytes())),
-        PdfObject::Dict(d) => filespec_name(file, d),
-        PdfObject::Ref(r) => match file.resolve(*r).ok()? {
-            PdfObject::String(s) => Some(pdf_string_to_unicode(s.as_bytes())),
-            PdfObject::Dict(d) => filespec_name(file, &d),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-/// `/UF` (preferred) or `/F` off a file-specification dictionary.
-fn filespec_name(file: &PdfFile, dict: &PdfDict) -> Option<String> {
-    text(file, dict, "UF").or_else(|| text(file, dict, "F"))
-}
-
-/// Decode a (predominantly ASCII) URI/path string, keeping bytes as Latin-1 so
-/// no byte is lost. URIs are 7-bit ASCII per spec; percent-encoding is left raw.
-fn decode_ascii(bytes: &[u8]) -> String {
-    bytes.iter().map(|&b| b as char).collect()
 }
 
 /// An object that is (or resolves to) an indirect reference's id.

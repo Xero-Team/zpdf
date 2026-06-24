@@ -44,12 +44,16 @@ GPU (wgpu) renderers whose output matches within <1% of pixels.
   generates text/choice field appearances when the producer left none.
 - **Navigation & metadata** — the document outline / bookmarks (`outline()`,
   CLI `outline`), named & explicit destinations resolved to a page + view
-  (both `/Names /Dests` and the legacy `/Root /Dests`), and the `/Info`
-  dictionary (`info()`, shown by CLI `info`).
+  (both `/Names /Dests` and the legacy `/Root /Dests`), page labels
+  (`/PageLabels` → `page_labels()`, decimal/roman/letters + prefix/offset), link
+  annotations resolved to their target page or URI (`page_annotations()` →
+  `dest`/`uri`, CLI `links`), XMP `/Metadata` via a hardened, entity-expansion-safe
+  scrape (`xmp_metadata()`), and the `/Info` dictionary (`info()`). `zpdf info`
+  surfaces the `/Info`, XMP, outline, and page-label data.
 - **CPU rendering** — tiny-skia backend, PNG output at any DPI.
 - **GPU rendering** — wgpu backend (fills, strokes, clips, text, images, blend
   groups); matches the CPU renderer within <1% pixels.
-- **Tooling** — CLI (`info`/`render`/`text`/`tables`/`forms`/`outline`/`attachments`/`compare`/`dump`/`debug-stream`),
+- **Tooling** — CLI (`info`/`render`/`text`/`tables`/`forms`/`outline`/`links`/`attachments`/`compare`/`dump`/`debug-stream`),
   an interactive winit viewer example, and a native GPUI desktop reader
   (`zpdf-viewer-gpui`).
 

@@ -21,7 +21,10 @@ use std::collections::{HashMap, HashSet};
 use zpdf_core::{ObjectId, PdfDict, PdfObject};
 use zpdf_parser::PdfFile;
 
-use crate::obj_util::{catalog_dict, resolve_array, resolve_dict, resolve_name, resolve_number};
+use crate::forms::pdf_string_to_unicode;
+use crate::obj_util::{
+    catalog_dict, resolve_array, resolve_dict, resolve_name, resolve_number, text,
+};
 use crate::Catalog;
 
 /// Maximum depth of a `/Names /Dests` name-tree descent.
@@ -104,22 +107,106 @@ pub fn resolve_explicit(file: &PdfFile, catalog: &Catalog, obj: &PdfObject) -> O
     resolve_dest_value(file, catalog, obj, 0, None)
 }
 
-/// Resolve a destination value against a **pre-collected** named-destination map
-/// (see [`collect_named_dests`]). This is what the outline walk uses so that
-/// resolving many bookmarks' named destinations is O(items) rather than
-/// O(items × tree): without the shared map, a file with tens of thousands of
-/// bookmarks each naming a (missing) destination over a budget-sized,
-/// `/Limits`-free name tree would multiply the per-lookup node budget by the
-/// item count into a multi-billion-node walk — a denial of service on
-/// `outline()`. Single-shot callers ([`resolve_named`] / [`resolve_explicit`])
-/// keep the one-off bounded walk; only the per-item path is collapsed.
-pub(crate) fn resolve_explicit_with(
+/// Resolve a navigation target from a dictionary that may carry a `/Dest` and/or
+/// an action `/A` — shared by the outline reader (bookmarks) and link-annotation
+/// extraction. Returns `(destination, uri)`:
+///
+/// * a direct `/Dest`, or a go-to action (`/A /S /GoTo /D …`), yields the
+///   [`Destination`];
+/// * a URI action (`/A /S /URI /URI …`) yields the hyperlink string;
+/// * a remote go-to (`/A /S /GoToR /F …`) yields the target *file name*.
+///
+/// `named`, when supplied, is the pre-collected named-destination map (see
+/// [`collect_named_dests`]); resolving many targets against it is O(targets)
+/// rather than O(targets × tree). Without the shared map a file with tens of
+/// thousands of bookmarks/links each naming a (missing) destination over a
+/// budget-sized, `/Limits`-free name tree would multiply the per-lookup node
+/// budget by the target count into a multi-billion-node walk — a denial of
+/// service. Passing `None` falls back to a single-shot bounded name-tree walk
+/// per call (fine for one-off lookups).
+pub(crate) fn resolve_link_target(
     file: &PdfFile,
     catalog: &Catalog,
-    obj: &PdfObject,
-    named: &HashMap<Vec<u8>, PdfObject>,
-) -> Option<Destination> {
-    resolve_dest_value(file, catalog, obj, 0, Some(named))
+    dict: &PdfDict,
+    named: Option<&HashMap<Vec<u8>, PdfObject>>,
+) -> (Option<Destination>, Option<String>) {
+    // A direct /Dest takes precedence (a name, string, or explicit array).
+    if let Some(dest_obj) = dict.get("Dest") {
+        if let Some(d) = resolve_dest_value(file, catalog, dest_obj, 0, named) {
+            return (Some(d), None);
+        }
+    }
+
+    // Otherwise an action /A: go-to (a destination), URI (a hyperlink), or a
+    // remote go-to (the destination file name).
+    if let Some(action) = resolve_dict(file, dict.get("A")) {
+        match resolve_name(file, action.get("S")).as_deref() {
+            Some("GoTo") => {
+                if let Some(d) = action
+                    .get("D")
+                    .and_then(|d| resolve_dest_value(file, catalog, d, 0, named))
+                {
+                    return (Some(d), None);
+                }
+            }
+            Some("URI") => {
+                if let Some(uri) = uri_string(file, &action) {
+                    return (None, Some(uri));
+                }
+            }
+            Some("GoToR") => {
+                if let Some(name) = remote_file_name(file, &action) {
+                    return (None, Some(name));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    (None, None)
+}
+
+/// The `/URI` of a URI action — a byte string (often ASCII); decoded leniently.
+fn uri_string(file: &PdfFile, action: &PdfDict) -> Option<String> {
+    let value = match action.get("URI")? {
+        PdfObject::String(s) => return Some(decode_ascii(s.as_bytes())),
+        PdfObject::Ref(r) => file.resolve(*r).ok()?,
+        _ => return None,
+    };
+    match value {
+        PdfObject::String(s) => Some(decode_ascii(s.as_bytes())),
+        _ => None,
+    }
+}
+
+/// The target file name of a remote go-to action (`/F` — a string or a file
+/// specification dictionary's `/F`/`/UF`). A bare `/F` string is decoded
+/// BOM-aware (UTF-16BE when it carries the `FE FF` BOM), matching the
+/// filespec-dict path (which goes through [`text`]) and the `embedded_files`
+/// reader — so the same byte string decodes the same way whichever shape it
+/// arrives in.
+fn remote_file_name(file: &PdfFile, action: &PdfDict) -> Option<String> {
+    match action.get("F")? {
+        PdfObject::String(s) => Some(pdf_string_to_unicode(s.as_bytes())),
+        PdfObject::Dict(d) => filespec_name(file, d),
+        PdfObject::Ref(r) => match file.resolve(*r).ok()? {
+            PdfObject::String(s) => Some(pdf_string_to_unicode(s.as_bytes())),
+            PdfObject::Dict(d) => filespec_name(file, &d),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// `/UF` (preferred) or `/F` off a file-specification dictionary.
+fn filespec_name(file: &PdfFile, dict: &PdfDict) -> Option<String> {
+    text(file, dict, "UF").or_else(|| text(file, dict, "F"))
+}
+
+/// Decode a (predominantly ASCII) URI/path string, keeping bytes as Latin-1 so
+/// no byte is lost. URIs are 7-bit ASCII per spec; percent-encoding is left raw.
+fn decode_ascii(bytes: &[u8]) -> String {
+    bytes.iter().map(|&b| b as char).collect()
 }
 
 /// Core resolver: turn any destination-shaped value into a [`Destination`],

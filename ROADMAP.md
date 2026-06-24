@@ -415,6 +415,31 @@ cargo run -p zpdf-render-wgpu --example viewer -- <file.pdf>   # 交互浏览器
       `DocInfo{title,author,subject,keywords,creator,producer,creation_date,mod_date,trapped}`；
       文本串 UTF-16BE/PDFDoc 解码，日期按原始 PDF 日期串报告（不解析）；无 `/Info` 或无任何
       字段时返回 `None`
+- [x] 页面标签（`/PageLabels`，§12.4.2，`page_labels.rs`）：catalog `/PageLabels`
+      **数字树**解析为按起始页索引排序的标注区间。每个标签字典（Table 159）完整支持：`/S`
+      编号样式（`/D` 十进制、`/R`/`/r` 大/小写罗马、`/A`/`/a` 大/小写字母 `A…Z,AA…ZZ,AAA…`）、
+      `/P` 前缀、`/St` 起始值（默认 1，钳制 `≥1`）；无 `/S` 为仅前缀（无数字部分）。
+      `PageLabels::label(page_index)` 取覆盖区间按 `St+(page_index−区间起点)` 计算页码，
+      首区间之前的页无标签（`None`）。数字树一次性扁平化（深度/逐引用 visited/节点+条目预算），
+      前缀长度上限，超大 `/St` 回退十进制（防罗马/字母串膨胀）。`PdfDocument::page_labels()`，
+      facade re-export `PageLabels`/`PageLabelStyle`；`zpdf info` 在各页行附打 `label: <L>`。
+      纯数据模型、零新依赖、无解析/后端改动，仅显式调用时运行（畸形语料健壮性零回归）。
+      经真实 400 页加密文档端到端验证（间接数字树 → 间接标签字典，解密后报告 `1…400`）
+- [x] 链接注释目标提取（§12.5.6.5，`destinations.rs`//annotation.rs`）：`Annotation` 新增
+      `dest:Option<Destination>` 与 `uri:Option<String>`，由 `/Dest` 或 `/A` 动作解析——`/Dest`/
+      go-to(`/GoTo`)→目标地，URI(`/URI`)→超链接，远程 go-to(`/GoToR /F`)→目标文件名。共享
+      `resolve_link_target` 取代 outline 私有副本（书签与链接解析一致）；命名目标注册表按页一次性
+      扁平化（`collect_named_dests`，无命名目标时廉价短路）防 O(links×tree) DoS。CLI `zpdf links`
+      逐页列出链接矩形与目标（`-> p.<N>` / `-> uri:<…>`，页数上限防挂起）
+- [x] XMP 元数据（`/Metadata`，§14.3.2，`xmp.rs`）：catalog `/Metadata` XMP 包（PDF 2.0 优先于
+      `/Info`）经**有界字节抓取**（非 XML 引擎）读出常见 Dublin Core/XMP/PDF 模式属性 →
+      `XmpMetadata{title,creators,description,subjects,keywords,producer,creator_tool,
+      create_date,modify_date}`。**绝不解析任何 DTD 通用实体**（仅 5 个预定义实体 + 数字字符引用，
+      各映射单字符）→ 杜绝"billion laughs"实体膨胀炸弹；扫描线性、字段/数组长度上限、包 BOM 感知
+      （UTF-8/UTF-16）上限 8 MiB、对抗性多字节输入有字符边界守卫。处理简单元素/`rdf:Alt`（取
+      `x-default`）/`rdf:Seq`//rdf:Bag`/RDF 属性简写。`PdfDocument::{xmp_metadata,metadata_bytes}`，
+      facade re-export `XmpMetadata`；`zpdf info` 增打 `XMP Metadata:` 块。权衡：非标准命名空间前缀
+      （非 `dc`//xmp`//pdf`）不识别（实践中通用）
 - [x] API 与 CLI：`PdfDocument::{outline, named_destination, resolve_destination, info}`，
       facade re-export `Destination`//DestView`//OutlineItem`//DocInfo`；CLI `zpdf outline`
       缩进打印书签树（行尾 `-> p.<N>` 页 / `-> uri:<…>` 链接），`zpdf info` 增打 `Metadata:`

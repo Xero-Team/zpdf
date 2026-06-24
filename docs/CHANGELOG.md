@@ -1,12 +1,13 @@
 # Changelog
 
-## 0.8.0 — Document navigation & metadata: outline, destinations, info
+## 0.8.0 — Document navigation & metadata: outline, destinations, page labels, links, XMP, info
 
 A read-only data-model release, pure Rust with zero new dependencies: the
 document's **navigation and metadata** surface — bookmarks, named destinations,
-and the information dictionary — is now exposed through the library and CLI.
-These ride the same catalog-reader + bounded name-tree-walk machinery the
-embedded-files / output-intent / optional-content readers established.
+page labels, link-annotation targets, XMP metadata, and the information
+dictionary — is now exposed through the library and CLI. These ride the same
+catalog-reader + bounded name/number-tree-walk machinery the embedded-files /
+output-intent / optional-content readers established.
 
 ### Outline (bookmarks) & destinations
 
@@ -38,6 +39,69 @@ embedded-files / output-intent / optional-content readers established.
   (`/S /GoTo` → a destination), URI (`/S /URI` → the hyperlink), and remote
   go-to (`/S /GoToR` → the target file name).
 
+### Page labels (`/PageLabels`)
+
+`zpdf-document/src/page_labels.rs` (ISO 32000-1 §12.4.2) reads the catalog's
+`/PageLabels` **number tree** — the printed page "numbers" a viewer shows and a
+user navigates by, which are *not* the physical 0-based page indices. A document
+commonly numbers front matter in lowercase roman (`i, ii, iii …`), the body in
+decimals (`1, 2, 3 …`), and an appendix with a prefix (`A-1, A-2 …`); each is one
+labeling *range* keyed by the 0-based index of its first page.
+
+- Every label dictionary (Table 159) is honoured: `/S` numbering style — `/D`
+  decimal, `/R`/`/r` upper/lower **roman**, `/A`/`/a` upper/lower **letters**
+  (`A…Z, AA…ZZ, AAA…`); `/P` prefix; and `/St` start value (default `1`, clamped
+  to `≥ 1`). An absent `/S` yields a prefix-only label with no numeric portion.
+- `PageLabels::label(page_index)` returns the printed label, computing the
+  numeric value as `St + (page_index − range_start)` for the covering range.
+  Pages *before* the first range carry no label (`None`); ranges extend to the
+  start of the next one (or end of document).
+- **Bounded** like the destination readers: the number tree is flattened once
+  (depth cap, per-reference visited set, node/entry budget), the `/P` prefix is
+  length-capped, and a crafted `/St` beyond a sane bound falls back to a decimal
+  rendering so a roman/letters label can't expand into a multi-megabyte string.
+
+### Link-annotation targets
+
+A `Link` annotation's navigation target is now resolved alongside its rectangle.
+`Annotation` gained `dest: Option<Destination>` and `uri: Option<String>`,
+populated from the annotation's `/Dest` or `/A` action by the **same resolver the
+outline reader uses** — `/Dest` and go-to (`/A /S /GoTo`) → a [`Destination`],
+URI (`/A /S /URI`) → the hyperlink, remote go-to (`/A /S /GoToR /F`) → the target
+file name. The shared `resolve_link_target` (in `destinations.rs`) replaced the
+outline's private copy, so bookmarks and links resolve identically.
+
+- The named-destination registries are flattened **once per page** (the same
+  bounded `collect_named_dests` walk), so a page of many link annotations
+  resolves in O(links), not O(links × tree) — and it short-circuits cheaply when
+  the document declares no named destinations.
+- **CLI**: `zpdf links <file.pdf>` lists each link's rectangle and target
+  (`-> p.<N>` in-document, `-> uri:<…>` external), page by page (the scan is
+  page-capped so a huge document can't hang).
+
+### XMP metadata (`/Metadata`)
+
+`zpdf-document/src/xmp.rs` (ISO 32000-1 §14.3.2) reads the catalog's `/Metadata`
+XMP packet — the RDF/XML metadata that PDF 2.0 prefers over `/Info`. The common
+Dublin Core / XMP / PDF-schema properties are surfaced through `XmpMetadata`:
+`title`, `creators`, `description`, `subjects`, `keywords`, `producer`,
+`creator_tool`, `create_date`, `modify_date`.
+
+- **Bounded scrape, not an XML engine.** This is deliberate: a general XML parser
+  that resolves DTD entities is open to "billion laughs" entity-expansion bombs,
+  and a DOM builder can blow the stack on deeply-nested input. Here **no general
+  entity is ever resolved** (only the five predefined XML entities and numeric
+  character references, each mapping to exactly one character), every scan is
+  linear over the byte string, and each field and array is length-capped. The
+  packet is decoded BOM-aware (UTF-8 / UTF-16), capped to 8 MiB.
+- Handles the standard property shapes — simple element, `rdf:Alt` (preferring
+  the `x-default` language), `rdf:Seq` / `rdf:Bag` arrays, and the RDF attribute
+  shorthand on `rdf:Description`. The trade-off: non-standard namespace prefixes
+  (not `dc`/`xmp`/`pdf`) are not recognized; in practice these are universal.
+- **CLI**: `zpdf info` prints an `XMP Metadata:` block when the document carries
+  a packet. `PdfDocument::metadata_bytes()` returns the raw packet for callers
+  that want to run their own (hardened) XML parser.
+
 ### Document information dictionary (`/Info`)
 
 `zpdf-document/src/doc_info.rs` (§14.3.3) reads the trailer's `/Info` —
@@ -52,13 +116,17 @@ it holds no populated field.
 ### API & CLI
 
 - **`PdfDocument`**: `outline()`, `named_destination(&[u8])`,
-  `resolve_destination(&PdfObject)` (resolves any destination value — useful for
-  link-annotation targets), and `info()`. `Destination`, `DestView`,
-  `OutlineItem`, and `DocInfo` are re-exported from the `zpdf` facade.
+  `resolve_destination(&PdfObject)` (resolves any destination value),
+  `page_labels()`, `xmp_metadata()`, `metadata_bytes()`, and `info()`. A page's
+  annotations (`page_annotations()`) now carry resolved link `dest`/`uri` fields.
+  `Destination`, `DestView`, `OutlineItem`, `PageLabels`, `PageLabelStyle`,
+  `XmpMetadata`, and `DocInfo` are re-exported from the `zpdf` facade.
 - **CLI**: a new `zpdf outline <file.pdf>` prints the bookmark tree indented,
-  each line ending in `-> p.<N>` (in-document page) or `-> uri:<…>` (link).
-  `zpdf info` now also prints a `Metadata:` block from `/Info` and an `Outline:`
-  summary line.
+  each line ending in `-> p.<N>` (in-document page) or `-> uri:<…>` (link); a new
+  `zpdf links <file.pdf>` lists each link annotation's rectangle and target.
+  `zpdf info` now also prints a `Metadata:` block from `/Info`, an `XMP Metadata:`
+  block from `/Metadata`, an `Outline:` summary line, and — when the document
+  defines page labels — each page's printed label (e.g. `label: iv`).
 
 ### Notes
 
@@ -84,8 +152,19 @@ it holds no populated field.
   indirect/real `/Count`, URI/go-to/remote-go-to actions incl. `/UF`-preference
   and UTF-16BE filenames, many-bookmark shared-map resolution, sibling/`/First`/
   root cycles; all `/Info` fields incl. UTF-16BE, direct-trailer-dict, string
-  `/Trapped`, and empty-dict) plus facade integration tests for the outline,
-  named-destination, `resolve_destination`, and `/Info` surfaces.
+  `/Trapped`, and empty-dict; page labels — roman/decimal/letters styles, `/P`
+  prefix, `/St` offset, prefix-only ranges, unlabeled leading pages, `/Kids`
+  interior nodes, cyclic kids, negative keys, and the huge-`/St` decimal fallback;
+  link annotations — explicit-array / named / go-to / URI / remote-go-to targets,
+  non-link annotations carrying no target; XMP — the standard property shapes,
+  `x-default` selection, entity and numeric-character-reference decoding, an
+  unknown-entity left verbatim (no expansion), UTF-16 BOM decode, length caps,
+  and char-boundary panic guards on adversarial multibyte input) plus facade
+  integration tests for the outline, named-destination, `resolve_destination`,
+  page-labels, link-target, XMP, and `/Info` surfaces. Page labels additionally
+  verified end-to-end against a real 400-page encrypted document (indirect number
+  tree → indirect label dict, decrypted) reporting `1 … 400`, and XMP against a
+  real document's packet (creators / dates / producer extracted).
 
 ## 0.7.0 — PDF 2.0 colour & attachments, annotation appearances, overprint & variable fonts
 

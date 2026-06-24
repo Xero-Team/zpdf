@@ -18,7 +18,7 @@ fn main() {
     if args.len() < 2 {
         eprintln!("Usage: zpdf <command> [args...]");
         eprintln!(
-            "Commands: info, dump, render, text, tables, forms, outline, attachments, compare, debug-stream"
+            "Commands: info, dump, render, text, tables, forms, outline, links, attachments, compare, debug-stream"
         );
         process::exit(1);
     }
@@ -31,6 +31,7 @@ fn main() {
         "tables" => cmd_tables(&args[2..]),
         "forms" => cmd_forms(&args[2..]),
         "outline" => cmd_outline(&args[2..]),
+        "links" => cmd_links(&args[2..]),
         "attachments" => cmd_attachments(&args[2..]),
         "compare" => cmd_compare(&args[2..]),
         "debug-stream" => cmd_debug_stream(&args[2..]),
@@ -104,14 +105,26 @@ fn cmd_info(args: &[String]) -> zpdf::Result<()> {
     // characterize the file.
     const MAX_LISTED_PAGES: usize = 1000;
     let listed = doc.page_count().min(MAX_LISTED_PAGES);
+    // Parse the page-label number tree once, then annotate each listed page with
+    // its printed label (e.g. "iv", "A-2") when the document defines labels.
+    let page_labels = doc.page_labels();
     for i in 0..listed {
         if let Ok(page) = doc.page(i) {
+            let label = page_labels
+                .as_ref()
+                .and_then(|pl| pl.label(i))
+                .filter(|l| !l.is_empty());
+            let label_suffix = match label {
+                Some(l) => format!(", label: {l}"),
+                None => String::new(),
+            };
             println!(
-                "  Page {}: {:.0} x {:.0} pt (rotate: {})",
+                "  Page {}: {:.0} x {:.0} pt (rotate: {}{})",
                 i + 1,
                 page.width(),
                 page.height(),
                 page.rotate,
+                label_suffix,
             );
         }
     }
@@ -135,6 +148,29 @@ fn cmd_info(args: &[String]) -> zpdf::Result<()> {
         field("Created", &meta.creation_date);
         field("Modified", &meta.mod_date);
         field("Trapped", &meta.trapped);
+    }
+
+    if let Some(xmp) = doc.xmp_metadata() {
+        println!("XMP Metadata:");
+        let field = |label: &str, value: &Option<String>| {
+            if let Some(v) = value {
+                println!("  {label}: {v}");
+            }
+        };
+        let list = |label: &str, values: &[String]| {
+            if !values.is_empty() {
+                println!("  {label}: {}", values.join(", "));
+            }
+        };
+        field("Title", &xmp.title);
+        list("Creators", &xmp.creators);
+        field("Description", &xmp.description);
+        list("Subjects", &xmp.subjects);
+        field("Keywords", &xmp.keywords);
+        field("Creator Tool", &xmp.creator_tool);
+        field("Producer", &xmp.producer);
+        field("Created", &xmp.create_date);
+        field("Modified", &xmp.modify_date);
     }
 
     let outline = doc.outline();
@@ -319,6 +355,58 @@ fn print_outline(items: &[zpdf::OutlineItem], depth: usize) {
 /// Total number of bookmarks in an outline tree (for the `info` summary).
 fn count_outline(items: &[zpdf::OutlineItem]) -> usize {
     items.iter().map(|i| 1 + count_outline(&i.children)).sum()
+}
+
+/// List link annotations and their resolved targets, page by page. Each line
+/// gives the link rectangle and where it points — an in-document page
+/// (`-> p.<N>`), an external page reference (`-> (external page)`), or an
+/// external URI / remote file (`-> uri:<…>`).
+fn cmd_links(args: &[String]) -> zpdf::Result<()> {
+    let (args, password) = extract_password(args);
+    if args.is_empty() {
+        eprintln!("Usage: zpdf links <file.pdf> [--password <pw>]");
+        process::exit(1);
+    }
+
+    let doc = open_document(&args[0], password.as_deref())?;
+
+    // Cap the page scan so a fuzzed/huge document can't make `links` hang
+    // (each page re-parses its annotations); the first N characterizes the file.
+    const MAX_SCANNED_PAGES: usize = 5000;
+    let scanned = doc.page_count().min(MAX_SCANNED_PAGES);
+    let mut found = 0usize;
+    for i in 0..scanned {
+        let Ok(page) = doc.page(i) else { continue };
+        for a in doc.page_annotations(&page) {
+            let target = match (&a.dest, &a.uri) {
+                (Some(d), _) => match d.page {
+                    Some(p) => format!("-> p.{}", p + 1),
+                    None => "-> (external page)".to_string(),
+                },
+                (None, Some(uri)) => format!("-> uri:{uri}"),
+                (None, None) => continue, // not a link/navigational annotation
+            };
+            found += 1;
+            println!(
+                "Page {}: [{:.0} {:.0} {:.0} {:.0}] {target}",
+                i + 1,
+                a.rect.x0,
+                a.rect.y0,
+                a.rect.x1,
+                a.rect.y1,
+            );
+        }
+    }
+    if found == 0 {
+        println!("No link annotations.");
+    }
+    if doc.page_count() > scanned {
+        println!(
+            "(scanned the first {scanned} of {} pages)",
+            doc.page_count()
+        );
+    }
+    Ok(())
 }
 
 /// List the document's embedded & associated files, and optionally extract them

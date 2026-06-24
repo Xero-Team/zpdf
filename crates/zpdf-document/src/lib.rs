@@ -11,6 +11,8 @@ pub mod optional_content;
 pub mod outline;
 pub mod output_intents;
 pub mod page;
+pub mod page_labels;
+pub mod xmp;
 
 pub use annotation::Annotation;
 pub use catalog::Catalog;
@@ -22,7 +24,10 @@ pub use optional_content::OcConfig;
 pub use outline::OutlineItem;
 pub use output_intents::OutputIntent;
 pub use page::{PdfPage, ResourceDict};
+pub use page_labels::{PageLabelStyle, PageLabels};
+pub use xmp::XmpMetadata;
 
+use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use zpdf_core::{Error, ParseLimits, PdfObject, Result};
 use zpdf_font::FontCache;
@@ -34,6 +39,11 @@ pub struct PdfDocument {
     /// Lazily-parsed interactive form, shared across page-annotation calls so
     /// the field-tree walk runs at most once per document.
     acro_form: OnceLock<Option<AcroForm>>,
+    /// Lazily-flattened named-destination map, shared across page-annotation
+    /// calls so resolving link targets never re-walks the name tree per page —
+    /// a full-document link scan stays O(pages × links + tree), not O(pages ×
+    /// tree).
+    named_dests: OnceLock<HashMap<Vec<u8>, PdfObject>>,
 }
 
 impl PdfDocument {
@@ -63,6 +73,7 @@ impl PdfDocument {
             file,
             catalog,
             acro_form: OnceLock::new(),
+            named_dests: OnceLock::new(),
         })
     }
 
@@ -116,7 +127,21 @@ impl PdfDocument {
     /// interactive-form fields gain a generated appearance when the producer
     /// left none (or set /NeedAppearances).
     pub fn page_annotations(&self, page: &PdfPage) -> Vec<Annotation> {
-        annotation::parse_annotations(&self.file, page, self.acro_form())
+        annotation::parse_annotations(
+            &self.file,
+            page,
+            &self.catalog,
+            self.named_dests(),
+            self.acro_form(),
+        )
+    }
+
+    /// The document's named-destination map, flattened once and cached for the
+    /// document's lifetime. Backs link-target resolution so the name tree is
+    /// walked at most once, never per page.
+    fn named_dests(&self) -> &HashMap<Vec<u8>, PdfObject> {
+        self.named_dests
+            .get_or_init(|| destinations::collect_named_dests(&self.file))
     }
 
     /// The document's interactive form (`/AcroForm`), if any. Parsed once and
@@ -217,6 +242,33 @@ impl PdfDocument {
     /// strings). `None` when the document carries no `/Info` or it is empty.
     pub fn info(&self) -> Option<DocInfo> {
         doc_info::parse_info(&self.file)
+    }
+
+    /// The document's page labels (`/PageLabels`, ISO 32000-1 §12.4.2): the
+    /// number tree mapping page indices to the printed labels a viewer shows and
+    /// a user navigates by — e.g. lowercase-roman front matter (`i, ii, …`) then
+    /// decimal body (`1, 2, …`), or a prefixed appendix (`A-1, A-2, …`). These
+    /// are distinct from the physical 0-based page indices. `None` when the
+    /// document declares no page labels. Query a page with [`PageLabels::label`].
+    pub fn page_labels(&self) -> Option<PageLabels> {
+        page_labels::parse_page_labels(&self.file)
+    }
+
+    /// The document's XMP metadata (`/Metadata`, ISO 32000-1 §14.3.2): the common
+    /// Dublin Core / XMP / PDF-schema properties (title, authors, description,
+    /// keywords, producer, creator tool, dates), read with a bounded scrape (no
+    /// XML engine; entity-expansion-safe). `None` when the document carries no
+    /// `/Metadata` or none of the recognized properties. PDF 2.0 prefers this
+    /// over the `/Info` dictionary ([`PdfDocument::info`]).
+    pub fn xmp_metadata(&self) -> Option<XmpMetadata> {
+        xmp::parse_xmp(&self.file)
+    }
+
+    /// The raw bytes of the catalog's `/Metadata` XMP packet (decoded through the
+    /// filter pipeline, respecting `ParseLimits`), for callers that want to parse
+    /// the RDF/XML themselves. `None` when the document carries no `/Metadata`.
+    pub fn metadata_bytes(&self) -> Option<Vec<u8>> {
+        xmp::metadata_bytes(&self.file)
     }
 }
 
