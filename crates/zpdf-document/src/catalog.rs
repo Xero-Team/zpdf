@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use tracing::warn;
 use zpdf_core::{Error, ObjectId, PdfObject, Result};
@@ -11,6 +11,9 @@ pub struct Catalog {
     pub pages_ref: ObjectId,
     pub page_count: usize,
     page_refs: Vec<ObjectId>,
+    /// Reverse index page-object id → 0-based page index, for resolving a
+    /// destination's target page reference to a page number. Built once at open.
+    page_index: HashMap<ObjectId, usize>,
 }
 
 impl Catalog {
@@ -52,11 +55,26 @@ impl Catalog {
             ));
         }
 
+        // Reverse index for destination resolution. First occurrence wins, so a
+        // page object reused in two slots (malformed) maps to its earliest index.
+        let mut page_index = HashMap::with_capacity(page_refs.len());
+        for (i, &id) in page_refs.iter().enumerate() {
+            page_index.entry(id).or_insert(i);
+        }
+
         Ok(Self {
             pages_ref: pages_ref.unwrap_or(ObjectId(0, 0)),
             page_count: page_refs.len(),
             page_refs,
+            page_index,
         })
+    }
+
+    /// The 0-based page index of a page object, or `None` when the reference is
+    /// not a page in this document's page tree. Used to turn a destination's
+    /// target page reference into a page number.
+    pub fn page_index_of(&self, id: ObjectId) -> Option<usize> {
+        self.page_index.get(&id).copied()
     }
 
     /// Whole-document scan for "page-shaped" dicts: a leaf carries `/MediaBox`

@@ -394,6 +394,33 @@ cargo run -p zpdf-render-wgpu --example viewer -- <file.pdf>   # 交互浏览器
       后密文叠加不绘制）。PDF 2.0 **Projection** 已识别但无既定默认外观（仅经自带 `/AP` 渲染）。
       既有 `/AP` 不被覆盖，双后端零改动
 
+### P4.10 — 文档导航与元数据
+
+- [x] 文档大纲 / 书签（ISO 32000-1 §12.3.3，`zpdf-document/src/outline.rs`）：解析 catalog
+      `/Outlines` 树为嵌套 `OutlineItem`（`title`/已解析 `dest`/`uri`/`open`/`children`）。沿
+      `/First`//Next` 游走，带深度上限 + 逐引用 visited 集（大纲根预置）+ 全局条目上限，畸形/环形
+      树终止不挂起；`/Count` 符号（经解析型数值取值，indirect//Real `/Count` 亦生效）定 `open`
+- [x] 目标地（destinations，§12.3.2，`destinations.rs`）：共享解析器把任意 dest——显式
+      `[page /Fit …]` 数组、命名目标、`<< /D … >>` 字典、或其间接引用——解析为
+      `Destination{page, page_ref, view}`。目标页引用经新增 `Catalog::page_index_of` 映射为
+      0 基页号；裸页号（远程 go-to）按文档页数钳制，`page` 决不越界。八种视图模式
+      （`DestView`：`/XYZ`//Fit`//FitH`//FitV`//FitR`//FitB`//FitBH`//FitBV`）全解析，
+      `null` 坐标与 `/XYZ` 零缩放归一为"保留当前值"
+- [x] 命名目标双注册表解析：现代 `/Names /Dests` 名称树（深度 + visited + 节点预算 + `/Limits`
+      剪枝，且决不漏掉在场键）**与** 旧式 `/Root /Dests` 字典（老旧产出器仍用）；name→name
+      间接按深度限界，自指命名不成环
+- [x] 大纲目标解析：逐项 `/Dest` 或 `/A` 动作——go-to（`/S /GoTo`→目标地）/URI
+      （`/S /URI`→超链接）/远程 go-to（`/S /GoToR`→目标文件名）
+- [x] 文档信息字典（`/Info`，§14.3.3，`doc_info.rs`）：trailer `/Info` →
+      `DocInfo{title,author,subject,keywords,creator,producer,creation_date,mod_date,trapped}`；
+      文本串 UTF-16BE/PDFDoc 解码，日期按原始 PDF 日期串报告（不解析）；无 `/Info` 或无任何
+      字段时返回 `None`
+- [x] API 与 CLI：`PdfDocument::{outline, named_destination, resolve_destination, info}`，
+      facade re-export `Destination`//DestView`//OutlineItem`//DocInfo`；CLI `zpdf outline`
+      缩进打印书签树（行尾 `-> p.<N>` 页 / `-> uri:<…>` 链接），`zpdf info` 增打 `Metadata:`
+      块与 `Outline:` 摘要。纯数据模型、零新依赖、无解析/后端改动；仅显式调用时运行
+      （open/render 期间不触发），畸形语料健壮性零回归
+
 ---
 
 ## 时间估算（参考）

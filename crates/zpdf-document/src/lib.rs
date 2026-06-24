@@ -1,23 +1,30 @@
 pub mod annot_appearance;
 pub mod annotation;
 mod catalog;
+pub mod destinations;
+pub mod doc_info;
 pub mod embedded_files;
 pub mod font_loader;
 pub mod forms;
+mod obj_util;
 pub mod optional_content;
+pub mod outline;
 pub mod output_intents;
 pub mod page;
 
 pub use annotation::Annotation;
 pub use catalog::Catalog;
+pub use destinations::{DestView, Destination};
+pub use doc_info::DocInfo;
 pub use embedded_files::{EmbeddedFile, EmbeddedSource};
 pub use forms::{AcroForm, FieldKind, FieldValue, FormField};
 pub use optional_content::OcConfig;
+pub use outline::OutlineItem;
 pub use output_intents::OutputIntent;
 pub use page::{PdfPage, ResourceDict};
 
 use std::sync::{Arc, OnceLock};
-use zpdf_core::{Error, ParseLimits, Result};
+use zpdf_core::{Error, ParseLimits, PdfObject, Result};
 use zpdf_font::FontCache;
 use zpdf_parser::PdfFile;
 
@@ -179,6 +186,37 @@ impl PdfDocument {
             // error, so a caller can distinguish it from a decode failure.
             None => Err(Error::MissingKey("EF".into())),
         }
+    }
+
+    /// The document outline (bookmarks) from the catalog's `/Outlines`, as a
+    /// nested tree of [`OutlineItem`]. Each item's `/Dest` or go-to `/A` is
+    /// resolved to a [`Destination`]; URI / remote-go-to targets are captured as
+    /// strings. Empty when the document has no outline.
+    pub fn outline(&self) -> Vec<OutlineItem> {
+        outline::parse_outlines(&self.file, &self.catalog)
+    }
+
+    /// Resolve a *named* destination (from a named-destination string/name) to a
+    /// [`Destination`]. Tries the `/Names /Dests` name tree and the legacy
+    /// `/Root /Dests` dictionary. `None` when the name is unknown.
+    pub fn named_destination(&self, name: &[u8]) -> Option<Destination> {
+        destinations::resolve_named(&self.file, &self.catalog, name)
+    }
+
+    /// Resolve any destination *value* — an explicit `[page /Fit …]` array, a
+    /// named-destination name/string, a `<< /D … >>` dictionary, or an indirect
+    /// reference to one — to a [`Destination`]. This is what a `/Dest` entry or
+    /// a go-to action's `/D` carries; useful for resolving link-annotation
+    /// targets. `None` when it does not name a destination.
+    pub fn resolve_destination(&self, dest: &PdfObject) -> Option<Destination> {
+        destinations::resolve_explicit(&self.file, &self.catalog, dest)
+    }
+
+    /// The document information dictionary (`/Info`): title, author, subject,
+    /// keywords, creator/producer, and creation/modification dates (raw PDF date
+    /// strings). `None` when the document carries no `/Info` or it is empty.
+    pub fn info(&self) -> Option<DocInfo> {
+        doc_info::parse_info(&self.file)
     }
 }
 

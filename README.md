@@ -42,10 +42,14 @@ GPU (wgpu) renderers whose output matches within <1% of pixels.
 - **Annotations & forms** — `/AP` appearance streams (`/AS` states,
   Hidden/NoView); an AcroForm field model (`acro_form()`, CLI `forms`) that
   generates text/choice field appearances when the producer left none.
+- **Navigation & metadata** — the document outline / bookmarks (`outline()`,
+  CLI `outline`), named & explicit destinations resolved to a page + view
+  (both `/Names /Dests` and the legacy `/Root /Dests`), and the `/Info`
+  dictionary (`info()`, shown by CLI `info`).
 - **CPU rendering** — tiny-skia backend, PNG output at any DPI.
 - **GPU rendering** — wgpu backend (fills, strokes, clips, text, images, blend
   groups); matches the CPU renderer within <1% pixels.
-- **Tooling** — CLI (`info`/`render`/`text`/`forms`/`compare`/`dump`/`debug-stream`),
+- **Tooling** — CLI (`info`/`render`/`text`/`tables`/`forms`/`outline`/`attachments`/`compare`/`dump`/`debug-stream`),
   an interactive winit viewer example, and a native GPUI desktop reader
   (`zpdf-viewer-gpui`).
 

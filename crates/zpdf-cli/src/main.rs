@@ -18,7 +18,7 @@ fn main() {
     if args.len() < 2 {
         eprintln!("Usage: zpdf <command> [args...]");
         eprintln!(
-            "Commands: info, dump, render, text, tables, forms, attachments, compare, debug-stream"
+            "Commands: info, dump, render, text, tables, forms, outline, attachments, compare, debug-stream"
         );
         process::exit(1);
     }
@@ -30,6 +30,7 @@ fn main() {
         "text" => cmd_text(&args[2..]),
         "tables" => cmd_tables(&args[2..]),
         "forms" => cmd_forms(&args[2..]),
+        "outline" => cmd_outline(&args[2..]),
         "attachments" => cmd_attachments(&args[2..]),
         "compare" => cmd_compare(&args[2..]),
         "debug-stream" => cmd_debug_stream(&args[2..]),
@@ -116,6 +117,33 @@ fn cmd_info(args: &[String]) -> zpdf::Result<()> {
     }
     if doc.page_count() > listed {
         println!("  ... and {} more pages", doc.page_count() - listed);
+    }
+
+    if let Some(meta) = doc.info() {
+        println!("Metadata:");
+        let field = |label: &str, value: &Option<String>| {
+            if let Some(v) = value {
+                println!("  {label}: {v}");
+            }
+        };
+        field("Title", &meta.title);
+        field("Author", &meta.author);
+        field("Subject", &meta.subject);
+        field("Keywords", &meta.keywords);
+        field("Creator", &meta.creator);
+        field("Producer", &meta.producer);
+        field("Created", &meta.creation_date);
+        field("Modified", &meta.mod_date);
+        field("Trapped", &meta.trapped);
+    }
+
+    let outline = doc.outline();
+    if !outline.is_empty() {
+        let total = count_outline(&outline);
+        println!(
+            "Outline: {} top-level bookmark(s), {total} total",
+            outline.len()
+        );
     }
 
     let intents = doc.output_intents();
@@ -244,6 +272,53 @@ fn cmd_forms(args: &[String]) -> zpdf::Result<()> {
     }
 
     Ok(())
+}
+
+/// Print the document outline (bookmarks) as an indented tree, each line ending
+/// in its resolved target (`p.<N>` for an in-document page, `uri:<…>` for a
+/// link). Bookmarks with no resolvable target print just their title.
+fn cmd_outline(args: &[String]) -> zpdf::Result<()> {
+    let (args, password) = extract_password(args);
+    if args.is_empty() {
+        eprintln!("Usage: zpdf outline <file.pdf> [--password <pw>]");
+        process::exit(1);
+    }
+
+    let doc = open_document(&args[0], password.as_deref())?;
+    let outline = doc.outline();
+    if outline.is_empty() {
+        println!("No document outline (bookmarks).");
+        return Ok(());
+    }
+    print_outline(&outline, 0);
+    Ok(())
+}
+
+/// Recursively print outline items with two-space indentation per level.
+fn print_outline(items: &[zpdf::OutlineItem], depth: usize) {
+    for item in items {
+        let indent = "  ".repeat(depth);
+        let title = if item.title.is_empty() {
+            "(untitled)"
+        } else {
+            &item.title
+        };
+        let target = match (&item.dest, &item.uri) {
+            (Some(d), _) => match d.page {
+                Some(p) => format!("  -> p.{}", p + 1),
+                None => "  -> (external page)".to_string(),
+            },
+            (None, Some(uri)) => format!("  -> uri:{uri}"),
+            (None, None) => String::new(),
+        };
+        println!("{indent}{title}{target}");
+        print_outline(&item.children, depth + 1);
+    }
+}
+
+/// Total number of bookmarks in an outline tree (for the `info` summary).
+fn count_outline(items: &[zpdf::OutlineItem]) -> usize {
+    items.iter().map(|i| 1 + count_outline(&i.children)).sum()
 }
 
 /// List the document's embedded & associated files, and optionally extract them

@@ -1,5 +1,92 @@
 # Changelog
 
+## 0.8.0 — Document navigation & metadata: outline, destinations, info
+
+A read-only data-model release, pure Rust with zero new dependencies: the
+document's **navigation and metadata** surface — bookmarks, named destinations,
+and the information dictionary — is now exposed through the library and CLI.
+These ride the same catalog-reader + bounded name-tree-walk machinery the
+embedded-files / output-intent / optional-content readers established.
+
+### Outline (bookmarks) & destinations
+
+- **Document outline** (`zpdf-document/src/outline.rs`, ISO 32000-1 §12.3.3):
+  the catalog's `/Outlines` tree is parsed into a nested `OutlineItem`
+  (`title`, resolved `dest`, `uri`, `open`, `children`). The walk follows
+  `/First`/`/Next` with a depth cap, a per-reference visited set (the outline
+  root is pre-seeded), and a global item cap, so a malformed or cyclic tree
+  terminates without a hang. `/Count`'s sign (read through the resolving numeric
+  accessor, so an indirect or real `/Count` is honoured) drives the `open` flag.
+
+- **Destinations** (`zpdf-document/src/destinations.rs`, §12.3.2): a shared
+  resolver turns any destination — an explicit `[page /Fit …]` array, a *named*
+  destination, a `<< /D … >>` dictionary, or an indirect reference to one — into
+  a `Destination { page, page_ref, view }`. The target page reference is mapped
+  to a 0-based page index via the new `Catalog::page_index_of`; a bare page
+  *number* (remote go-to) is range-checked against the document, so `page` never
+  points past the last page. All eight view modes (`DestView`: `/XYZ` `/Fit`
+  `/FitH` `/FitV` `/FitR` `/FitB` `/FitBH` `/FitBV`) are parsed, with `null`
+  coordinates and a zero `/XYZ` zoom normalized to "retain current value".
+
+- **Named destinations** are resolved from **both** registries: the modern
+  `/Names /Dests` name tree (bounded by depth, a visited set, a node budget,
+  and `/Limits` pruning that never hides a present key) **and** the legacy
+  `/Root /Dests` dictionary still emitted by older producers. Name → name
+  indirection is depth-bounded so a self-referential name cannot loop.
+
+- **Outline targets** resolve each item's `/Dest` or its `/A` action — go-to
+  (`/S /GoTo` → a destination), URI (`/S /URI` → the hyperlink), and remote
+  go-to (`/S /GoToR` → the target file name).
+
+### Document information dictionary (`/Info`)
+
+`zpdf-document/src/doc_info.rs` (§14.3.3) reads the trailer's `/Info` —
+`DocInfo { title, author, subject, keywords, creator, producer, creation_date,
+mod_date, trapped }`. Text strings are UTF-16BE/PDFDoc-decoded; dates are
+reported as their raw PDF date strings (no date parsing). The `/Info` reference
+is read tolerantly: an indirect reference (per spec) **or** a direct dictionary
+inlined in the trailer (lax producers, mirroring the direct-`/Encrypt`
+tolerance) is accepted. Returns `None` when the document carries no `/Info` or
+it holds no populated field.
+
+### API & CLI
+
+- **`PdfDocument`**: `outline()`, `named_destination(&[u8])`,
+  `resolve_destination(&PdfObject)` (resolves any destination value — useful for
+  link-annotation targets), and `info()`. `Destination`, `DestView`,
+  `OutlineItem`, and `DocInfo` are re-exported from the `zpdf` facade.
+- **CLI**: a new `zpdf outline <file.pdf>` prints the bookmark tree indented,
+  each line ending in `-> p.<N>` (in-document page) or `-> uri:<…>` (link).
+  `zpdf info` now also prints a `Metadata:` block from `/Info` and an `Outline:`
+  summary line.
+
+### Notes
+
+- Pure data-model work in `zpdf-document`: no new dependencies, no C/C++, no
+  parser or render-backend changes. The new readers run **only** when explicitly
+  called — never during `open` or rendering — so the malformed-corpus
+  open/render robustness is untouched. A small shared `obj_util` module collects
+  the reference-following accessors (mirroring the proven `embedded_files`
+  helpers); the embedded-files reader itself is unchanged.
+- **Bounded outline resolution.** The named-destination registries are flattened
+  **once per `outline()` call** into a budgeted (`MAX_NAMED_DEST_ENTRIES`) map,
+  and each bookmark resolves against it in O(1). This prevents a crafted file
+  (tens of thousands of bookmarks each naming a missing destination over a
+  budget-sized, `/Limits`-free name tree) from multiplying the per-lookup node
+  budget by the item count into a multi-billion-node walk — i.e. a wall-clock
+  hang on `outline()`/`info`. The one-off `named_destination` / `resolve_destination`
+  APIs keep their per-call bounded walk. A remote-go-to (`/GoToR`) `/F` filename
+  given as a bare string is decoded BOM-aware (UTF-16BE when so tagged),
+  consistent with the filespec-dict / `/UF` and `embedded_files` paths.
+- Verified by unit tests in each module (explicit/named/legacy destinations, all
+  view modes, out-of-range and indirectly-encoded page numbers, name-tree
+  `/Limits` descent and cycles; outline sibling/child traversal, open/closed via
+  indirect/real `/Count`, URI/go-to/remote-go-to actions incl. `/UF`-preference
+  and UTF-16BE filenames, many-bookmark shared-map resolution, sibling/`/First`/
+  root cycles; all `/Info` fields incl. UTF-16BE, direct-trailer-dict, string
+  `/Trapped`, and empty-dict) plus facade integration tests for the outline,
+  named-destination, `resolve_destination`, and `/Info` surfaces.
+
 ## 0.7.0 — PDF 2.0 colour & attachments, annotation appearances, overprint & variable fonts
 
 A feature release, all with zero C/C++ dependencies: PDF 2.0 NChannel colour with

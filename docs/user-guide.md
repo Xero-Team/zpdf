@@ -27,10 +27,12 @@ The release binary is at `target/release/zpdf`. The examples below use
 
 | Command | Purpose |
 | --- | --- |
-| `info` | Print version, page count, and per-page size/rotation. |
+| `info` | Print version, page count, per-page size/rotation, metadata, and outline summary. |
 | `render` | Render a page to a PNG (CPU or GPU). |
 | `text` | Extract text from a page (or all pages). |
+| `tables` | Detect tables on a page (or all pages) and print them as TSV/CSV. |
 | `forms` | List interactive-form (AcroForm) fields, types, and values. |
+| `outline` | Print the document outline (bookmarks) as an indented tree with resolved targets. |
 | `attachments` | List (and optionally extract) embedded & associated files. |
 | `compare` | Pixel-diff two PNGs and report difference metrics. |
 | `dump` | Print a resolved PDF object. |
@@ -38,7 +40,7 @@ The release binary is at `target/release/zpdf`. The examples below use
 
 > **Encrypted PDFs.** Documents protected with a non-empty password open with
 > `--password <pw>` (accepted by `info`, `dump`, `render`, `text`, `tables`,
-> `forms`, and `attachments`).
+> `forms`, `outline`, and `attachments`).
 > The password may be the user or owner password; a wrong one reports an error.
 > Documents encrypted with an empty password open without the flag.
 
@@ -55,7 +57,52 @@ Pages: 16
   Page 1: 612 x 792 pt (rotate: 0)
   Page 2: 612 x 792 pt (rotate: 0)
   ...
+Metadata:
+  Title: Annual Report
+  Author: Jane Doe
+  Producer: LibreOffice 7.6
+  Created: D:20240101120000Z
+Outline: 4 top-level bookmark(s), 27 total
 ```
+
+The `Metadata` block lists the document information dictionary (`/Info`) fields
+that are present (title, author, subject, keywords, creator, producer, creation
+and modification dates). `Output Intents`, `Embedded files`, and
+`Associated files` sections follow when the document carries them.
+
+### `outline` — list bookmarks
+
+```bash
+cargo run -p zpdf-cli -- outline document.pdf
+```
+
+Prints the document outline (`/Outlines` bookmarks) as an indented tree, each
+line ending in its resolved target — `-> p.<N>` for an in-document page (1-based)
+or `-> uri:<url>` for a hyperlink:
+
+```
+Cover  -> p.1
+Introduction  -> p.2
+  Background  -> p.3
+  Goals  -> p.5
+Appendix  -> p.40
+References  -> uri:https://example.org/refs
+```
+
+Each item's `/Dest` (explicit array or named destination, resolved through both
+the `/Names /Dests` name tree and the legacy `/Root /Dests` dictionary) or its
+go-to / URI action (`/A`) is resolved to a page or link. A document with no
+outline prints `No document outline (bookmarks).`
+
+### `tables` — detect tables
+
+```bash
+cargo run -p zpdf-cli -- tables document.pdf -p 1        # one page
+cargo run -p zpdf-cli -- tables document.pdf --all --csv # every page, CSV
+```
+
+Detects tabular layouts from text-span geometry (alignment / whitespace-grid
+heuristics) and prints each as TSV (or CSV with `--csv`).
 
 ### `render` — render a page to PNG
 
