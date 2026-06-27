@@ -446,6 +446,53 @@ cargo run -p zpdf-render-wgpu --example viewer -- <file.pdf>   # 交互浏览器
       块与 `Outline:` 摘要。纯数据模型、零新依赖、无解析/后端改动；仅显式调用时运行
       （open/render 期间不触发），畸形语料健壮性零回归
 
+### P4.11 — 逻辑结构与标记 PDF（Tagged PDF）
+
+- [x] 逻辑结构树（`/StructTreeRoot`，ISO 32000-1 §14.7 + §14.8，`structure.rs`）：把 catalog
+      `/StructTreeRoot` 读为可导航的 `StructTree`——描述文档逻辑组织（标题/段落/列表/表格/插图）
+      的**结构元素**树，独立于页面版式。这是屏幕阅读器所遍历、也是语义化提取（而非"一袋字形"）
+      所依赖的层。结构元素（`/Type /StructElem`）→ 嵌套 `StructElem`，携带角色（`/S`）、原始类型、
+      标题（`/T`）、语言（`/Lang`）、无障碍文本（`/Alt`//ActualText`）、缩写展开（`/E`）、有效页与子项
+- [x] 角色解析与分类：`/S` 经结构树根 `/RoleMap`**传递式**解析（带名字环上限），分类为 `StructRole`
+      枚举的标准结构类型——分组（`Document`//Part`//Sect`//Div`//TOC` …）、块级（`P`//H1`…`H6`、
+      `L`//LI`//Lbl`//LBody`、`Table`//TR`//TH`//TD`//THead`//TBody`//TFoot`）、行内（`Span`//Quote`//Note`//Link`//BibEntry`、
+      `Ruby`//Warichu` …）、插图（`Figure`//Formula`//Form`）。未映射到标准类型者为 `StructRole::Other(name)`，
+      原始 `/S` 始终保留于 `raw_type`
+- [x] 子项（`/K`，单值或数组）归一为 `StructKid`：嵌套元素、**标记内容**序列（裸整数 MCID 或
+      `/Type /MCR` 字典，携带其索引的内容流页号）、或**对象引用**（`/Type /OBJR`，如参与结构的注释）。
+      `/Pg` 继承：元素有效页取自身 `/Pg` 或最近祖先（经 catalog 页反查表映射为 0 基页号），并传递给
+      MCID/OBJR 子项
+- [x] 无障碍辅助：`StructElem::accessible_text()`（`/ActualText` 优先于 `/Alt`）、
+      `StructRole::{as_str, is_standard, is_heading}`、`StructTree::element_count()`；标记态
+      `PdfDocument::is_tagged()`（catalog `/MarkInfo /Marked true`，与是否有 `/StructTreeRoot` 独立）
+- [x] 健壮性：仅触及对象图、仅显式调用时运行（open/render 期间不触发）。全程有界——深度上限、
+      **以结构树根引用预置**的逐引用 visited 集（子项回指根不产生伪元素）、按节点*及*逐 `/K` 数组项
+      examined 扣减的共享预算、`/RoleMap` 解析深度上限 + 名字环守卫、`/RoleMap` 条目数上限、
+      `/Alt`//ActualText`//T`//E`//Lang` 逐串长度上限。畸形语料契约验证（环形子项/根回指/角色映射环/
+      超深链/数 MiB `/Alt` 均干净终止），失败语料零回归
+- [x] API 与 CLI：`PdfDocument::{struct_tree, is_tagged}`，facade re-export `StructTree`/`StructElem`/
+      `StructKid`/`StructRole`；CLI `zpdf struct` 缩进打印结构树（角色 + 可选标题/无障碍文本 + 页，
+      MCID/OBJR 子项作 `·` 叶），`zpdf info` 增打 `Tagged PDF`//Structure tree` 摘要。纯数据模型、
+      零新依赖、无解析/后端改动；真实标记文档端到端验证（16 页标记 PDF 报出完整
+      `Document → H1/P/Figure/…` 树，MCID 与页关联均解析）
+- [x] 标记 PDF 阅读顺序文本提取（MCID → 内容绑定）：内容解释器**为每个抽取文本串捕获其
+      标记内容 id（`/MCID`）**——与既有 `BMC`//BDC`//EMC` 深度并行维护一个 MCID 栈，从每个
+      `BDC` 属性操作数（内联字典或经 `/Properties` 解析的名字）读 `/MCID`，`TextSpan` 新增
+      `mcid:Option<i32>` 取**最内层包围序列**的 id（无 id 的嵌套序列继承外层，§14.6//14.7.4.2），
+      畸形 id（负/非整数）丢为 `None`。MCID 栈在**每个内容流边界保存/恢复**——form XObject 与
+      注释外观流取新作用域（form 标记内容不渗入页面、form 内未闭合 `BDC` 不外泄），平铺图案
+      格逐格重置，页重置清空；Type3 字形过程由后端渲染期解释、抽取期不触及，故无需处理。
+      `zpdf_content::text::struct_ordered_text(spans, page_index, tree)` 按文档序游走结构树：
+      每元素贡献其 `/ActualText`（元素及子项的精确替换）、或其 `/MCID` 子项所引页面内容的文本、
+      或（无内容元素如插图）其 `/Alt`；块级角色（`StructRole::is_block_level`）换行分隔，块内按
+      与 `spans_to_text` 一致的词距/换行启发式拼接；匹配**按页**（MCID 为逐内容流），未标记/无
+      标记内容的页**回退几何 `spans_to_text`**。**结构性双后端安全**：MCID 仅随 `TextSpan`，
+      后端消费的 `DisplayList`//RenderCommand` 逐字节不变（测试断言装/不装文本汇时渲染命令一致），
+      故 CPU↔GPU 像素一致性不可能回归，且捕获仅在装文本汇（抽取）时运行、open/render 期不触发。
+      facade re-export `struct_ordered_text`；CLI `zpdf text --struct`。纯 Rust 零新依赖、无解析/
+      后端改动；真实标记文档端到端验证（页面上离行放置的内联代码段——几何提取会错位——被还原到
+      句子的正确阅读位置）
+
 ---
 
 ## 时间估算（参考）

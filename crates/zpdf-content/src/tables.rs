@@ -566,6 +566,7 @@ mod tests {
             y,
             size,
             advance: text.chars().count() as f64 * size as f64 * 0.5,
+            mcid: None,
         }
     }
 
@@ -651,6 +652,7 @@ mod tests {
                 y,
                 size: 12.0,
                 advance: 195.0,
+                mcid: None,
             });
             spans.push(TextSpan {
                 text: long_r.into(),
@@ -658,6 +660,7 @@ mod tests {
                 y,
                 size: 12.0,
                 advance: 195.0,
+                mcid: None,
             });
         }
         assert!(
@@ -752,6 +755,7 @@ mod tests {
             y,
             size,
             advance,
+            mcid: None,
         }
     }
 

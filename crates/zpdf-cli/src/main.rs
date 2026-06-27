@@ -18,7 +18,7 @@ fn main() {
     if args.len() < 2 {
         eprintln!("Usage: zpdf <command> [args...]");
         eprintln!(
-            "Commands: info, dump, render, text, tables, forms, outline, links, attachments, compare, debug-stream"
+            "Commands: info, dump, render, text, tables, forms, outline, links, struct, attachments, compare, debug-stream"
         );
         process::exit(1);
     }
@@ -32,6 +32,7 @@ fn main() {
         "forms" => cmd_forms(&args[2..]),
         "outline" => cmd_outline(&args[2..]),
         "links" => cmd_links(&args[2..]),
+        "struct" => cmd_struct(&args[2..]),
         "attachments" => cmd_attachments(&args[2..]),
         "compare" => cmd_compare(&args[2..]),
         "debug-stream" => cmd_debug_stream(&args[2..]),
@@ -179,6 +180,19 @@ fn cmd_info(args: &[String]) -> zpdf::Result<()> {
         println!(
             "Outline: {} top-level bookmark(s), {total} total",
             outline.len()
+        );
+    }
+
+    // Logical structure / Tagged PDF. Report tagged-ness, and the structure tree
+    // summary when present (use `zpdf struct` for the full tree).
+    if doc.is_tagged() {
+        println!("Tagged PDF: yes (/MarkInfo /Marked)");
+    }
+    if let Some(tree) = doc.struct_tree() {
+        println!(
+            "Structure tree: {} element(s), {} top-level",
+            tree.element_count(),
+            tree.children.len()
         );
     }
 
@@ -407,6 +421,86 @@ fn cmd_links(args: &[String]) -> zpdf::Result<()> {
         );
     }
     Ok(())
+}
+
+/// Print the document's logical structure tree (Tagged PDF, ISO 32000-1
+/// §14.7–14.8): the nested structure elements with their roles, page
+/// associations, titles, and accessibility text. Marked-content (`mcid`) and
+/// object (`obj`) leaves are shown under their owning element.
+fn cmd_struct(args: &[String]) -> zpdf::Result<()> {
+    let (args, password) = extract_password(args);
+    if args.is_empty() {
+        eprintln!("Usage: zpdf struct <file.pdf> [--password <pw>]");
+        process::exit(1);
+    }
+
+    let doc = open_document(&args[0], password.as_deref())?;
+    println!(
+        "Tagged (/MarkInfo /Marked): {}",
+        if doc.is_tagged() { "yes" } else { "no" }
+    );
+    match doc.struct_tree() {
+        None => println!("No logical structure tree (/StructTreeRoot)."),
+        Some(tree) => {
+            println!(
+                "Structure tree: {} element(s), {} top-level",
+                tree.element_count(),
+                tree.children.len()
+            );
+            for elem in &tree.children {
+                print_struct_elem(elem, 0);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Recursively print a structure element and its kids, two-space indented per
+/// level. An element line shows its role, optional title / accessibility text,
+/// and page; marked-content and object kids are shown as `·` leaves.
+fn print_struct_elem(elem: &zpdf::StructElem, depth: usize) {
+    let indent = "  ".repeat(depth);
+    let mut line = format!("{indent}{}", elem.role.as_str());
+    if let Some(t) = &elem.title {
+        line.push_str(&format!("  \"{}\"", truncate_display(t)));
+    }
+    if let Some(alt) = &elem.alt {
+        line.push_str(&format!("  alt:\"{}\"", truncate_display(alt)));
+    }
+    if let Some(at) = &elem.actual_text {
+        line.push_str(&format!("  text:\"{}\"", truncate_display(at)));
+    }
+    if let Some(p) = elem.page {
+        line.push_str(&format!("  (p.{})", p + 1));
+    }
+    println!("{line}");
+
+    let child_indent = "  ".repeat(depth + 1);
+    for kid in &elem.kids {
+        match kid {
+            zpdf::StructKid::Element(e) => print_struct_elem(e, depth + 1),
+            zpdf::StructKid::MarkedContent { page, mcid } => {
+                let pg = page.map_or_else(String::new, |p| format!(" p.{}", p + 1));
+                println!("{child_indent}· mcid {mcid}{pg}");
+            }
+            zpdf::StructKid::Object { page, obj } => {
+                let pg = page.map_or_else(String::new, |p| format!(" p.{}", p + 1));
+                println!("{child_indent}· obj {} {} R{pg}", obj.0, obj.1);
+            }
+        }
+    }
+}
+
+/// Truncate a string for single-line display, appending `…` when shortened.
+fn truncate_display(s: &str) -> String {
+    const MAX: usize = 60;
+    if s.chars().count() > MAX {
+        let mut out: String = s.chars().take(MAX).collect();
+        out.push('…');
+        out
+    } else {
+        s.to_string()
+    }
 }
 
 /// List the document's embedded & associated files, and optionally extract them
@@ -796,13 +890,16 @@ fn cmd_compare(args: &[String]) -> zpdf::Result<()> {
 fn cmd_text(args: &[String]) -> zpdf::Result<()> {
     let (args, password) = extract_password(args);
     if args.is_empty() {
-        eprintln!("Usage: zpdf text <file.pdf> [-p <page>] [--all] [--password <pw>]");
+        eprintln!("Usage: zpdf text <file.pdf> [-p <page>] [--all] [--struct] [--password <pw>]");
         process::exit(1);
     }
 
     let pdf_path = &args[0];
     let mut page_num: usize = 1;
     let mut all = false;
+    // --struct: emit text in the Tagged-PDF structure tree's reading order
+    // (with /ActualText / /Alt) instead of the geometric XY-cut.
+    let mut use_struct = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -812,12 +909,20 @@ fn cmd_text(args: &[String]) -> zpdf::Result<()> {
                 page_num = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(1);
             }
             "--all" => all = true,
+            "--struct" => use_struct = true,
             _ => {}
         }
         i += 1;
     }
 
     let doc = open_document(pdf_path, password.as_deref())?;
+
+    // The structure tree (whole document) drives `--struct` ordering; each page's
+    // marked content is selected by page index inside `struct_ordered_text`.
+    let struct_tree = if use_struct { doc.struct_tree() } else { None };
+    if use_struct && struct_tree.is_none() {
+        eprintln!("(no structure tree; falling back to geometric reading order)");
+    }
 
     let page_indices: Vec<usize> = if all {
         (0..doc.page_count()).collect()
@@ -848,7 +953,10 @@ fn cmd_text(args: &[String]) -> zpdf::Result<()> {
         if all {
             println!("===== Page {} =====", pi + 1);
         }
-        let text = zpdf::spans_to_text(spans, 2.0);
+        let text = match &struct_tree {
+            Some(tree) => zpdf::struct_ordered_text(&spans, pi, tree),
+            None => zpdf::spans_to_text(spans, 2.0),
+        };
         println!("{text}");
     }
 

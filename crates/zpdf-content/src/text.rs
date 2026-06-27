@@ -4,6 +4,9 @@
 //! the decoded Unicode and the baseline origin in PDF user space (y-up).
 
 use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
+
+use zpdf_document::{StructElem, StructKid, StructTree};
 
 #[derive(Debug, Clone)]
 pub struct TextSpan {
@@ -17,6 +20,10 @@ pub struct TextSpan {
     pub size: f32,
     /// Signed horizontal extent of this span in user-space units (end.x − start.x).
     pub advance: f64,
+    /// The marked-content id (`/MCID`) of the innermost enclosing marked-content
+    /// sequence, or `None` when this run is outside any (or carries none). Binds
+    /// the run to a Tagged-PDF structure element (see [`struct_ordered_text`]).
+    pub mcid: Option<i32>,
 }
 
 impl TextSpan {
@@ -315,6 +322,215 @@ fn block_to_text(block: &[usize], spans: &[TextSpan], line_tol: f64) -> String {
     out
 }
 
+/// Defensive cap on structure-tree recursion while serializing reading-order
+/// text. The tree from the structure reader is already depth-bounded; this
+/// guards a caller-constructed tree.
+const MAX_STRUCT_TEXT_DEPTH: usize = 256;
+
+/// Extract a page's text in the document's **logical reading order**, driven by
+/// the Tagged-PDF structure tree (the order the producer intends, rather than the
+/// geometric XY-cut of [`spans_to_text`]).
+///
+/// Each structure element contributes, in tree order, either its `/ActualText`
+/// (the exact replacement for the element and its children), or the text of the
+/// page content its marked-content (`/MCID`) kids reference, or — for a
+/// content-less element such as a figure — its `/Alt` description. `spans` are
+/// this page's extracted spans (each carrying its [`TextSpan::mcid`], produced by
+/// running the interpreter with a text sink); `page_index` is the 0-based page
+/// they came from. Block-level elements ([`zpdf_document::StructRole::is_block_level`])
+/// are separated by newlines; within a block, runs are joined with the same
+/// word-gap / line-break heuristic as [`spans_to_text`].
+///
+/// Any run the structure tree does not place — a run with no `/MCID` (e.g.
+/// `/Artifact` content: running headers, footers, page numbers) or an `/MCID` no
+/// structure element references — is **appended** in geometric reading order
+/// rather than dropped, so `--struct` never silently loses a page's text. An
+/// entirely untagged page therefore degrades to the geometric [`spans_to_text`].
+pub fn struct_ordered_text(spans: &[TextSpan], page_index: usize, tree: &StructTree) -> String {
+    // Index this page's spans by MCID; a span with no MCID is not reachable
+    // through the structure tree. Insertion order is content (reading) order.
+    let mut by_mcid: HashMap<i64, Vec<&TextSpan>> = HashMap::new();
+    for s in spans {
+        if let Some(m) = s.mcid {
+            by_mcid.entry(m as i64).or_default().push(s);
+        }
+    }
+
+    let mut b = ReadingOrder::default();
+    // MCIDs actually placed by the tree (including those subsumed by an
+    // `/ActualText`), so the leftover pass doesn't re-emit them.
+    let mut consumed: HashSet<i64> = HashSet::new();
+    for elem in &tree.children {
+        emit_struct_elem(elem, page_index, &by_mcid, &mut consumed, 0, &mut b);
+    }
+    let mut result = b.out.trim().to_string();
+
+    // Append any of this page's text the tree left unplaced (no MCID, or an MCID
+    // no element referenced) in geometric order. This also covers a fully
+    // untagged page (every span is leftover → the geometric reading order).
+    let leftover: Vec<TextSpan> = spans
+        .iter()
+        .filter(|s| match s.mcid {
+            Some(m) => !consumed.contains(&(m as i64)),
+            None => true,
+        })
+        .cloned()
+        .collect();
+    if !leftover.is_empty() {
+        let extra = spans_to_text(leftover, 2.0);
+        if !extra.is_empty() {
+            if !result.is_empty() {
+                result.push('\n');
+            }
+            result.push_str(&extra);
+        }
+    }
+    result
+}
+
+/// Accumulates reading-order text, inserting line breaks and word-gap spaces
+/// between successive spans the way [`block_to_text`] does.
+#[derive(Default)]
+struct ReadingOrder {
+    out: String,
+    /// `(end_x, baseline_y, size)` of the last appended span, for gap/line logic.
+    last: Option<(f64, f64, f32)>,
+}
+
+impl ReadingOrder {
+    fn push_span(&mut self, s: &TextSpan) {
+        if let Some((prev_end, prev_y, prev_size)) = self.last {
+            let line_tol = (s.size.max(prev_size)) as f64 * 0.5;
+            if (prev_y - s.y).abs() > line_tol {
+                self.out.push('\n');
+            } else {
+                let gap = s.x_bounds().0 - prev_end;
+                if gap > s.size as f64 * 0.25
+                    && !self.out.ends_with(char::is_whitespace)
+                    && !s.text.starts_with(char::is_whitespace)
+                {
+                    self.out.push(' ');
+                }
+            }
+        }
+        self.out.push_str(&s.text);
+        self.last = Some((s.x_bounds().1, s.y, s.size));
+    }
+
+    /// Append known replacement text (`/ActualText` or `/Alt`), whose geometry is
+    /// unknown — separate it from any preceding run with a single space.
+    fn push_replacement(&mut self, t: &str) {
+        if self.last.is_some()
+            && !self.out.ends_with(char::is_whitespace)
+            && !t.starts_with(char::is_whitespace)
+        {
+            self.out.push(' ');
+        }
+        self.out.push_str(t);
+        self.last = None;
+    }
+
+    /// Start a new block (paragraph/heading/cell) on its own line, collapsing
+    /// consecutive breaks.
+    fn block_break(&mut self) {
+        if !self.out.is_empty() && !self.out.ends_with('\n') {
+            self.out.push('\n');
+        }
+        self.last = None;
+    }
+}
+
+fn emit_struct_elem(
+    elem: &StructElem,
+    page: usize,
+    by_mcid: &HashMap<i64, Vec<&TextSpan>>,
+    consumed: &mut HashSet<i64>,
+    depth: usize,
+    b: &mut ReadingOrder,
+) {
+    if depth > MAX_STRUCT_TEXT_DEPTH {
+        return;
+    }
+    // An element's own text (`/ActualText`, `/Alt`) lives on its effective page;
+    // when that page is known and differs from the one being extracted, the
+    // element contributes none of it here (this is what keeps a figure's `/Alt`
+    // from repeating on every page). A `None` page is unresolved, not excluded.
+    // Child elements are still recursed (a child may carry its own `/Pg`), and a
+    // marked-content kid is page-filtered independently below.
+    let on_this_page = elem.page.is_none_or(|p| p == page);
+
+    let block = elem.role.is_block_level();
+    if block {
+        b.block_break();
+    }
+    // /ActualText is the exact replacement for the element and its children.
+    if let Some(actual) = &elem.actual_text {
+        if on_this_page {
+            b.push_replacement(actual);
+            // The replacement subsumes the subtree's marked content; mark it
+            // consumed so the leftover pass doesn't re-emit the replaced glyphs.
+            mark_consumed(elem, page, 0, consumed);
+        }
+        if block {
+            b.block_break();
+        }
+        return;
+    }
+
+    let before = b.out.len();
+    for kid in &elem.kids {
+        match kid {
+            StructKid::Element(child) => {
+                emit_struct_elem(child, page, by_mcid, consumed, depth + 1, b)
+            }
+            StructKid::MarkedContent {
+                page: kid_page,
+                mcid,
+            } if *kid_page == Some(page) => {
+                if let Some(list) = by_mcid.get(mcid) {
+                    consumed.insert(*mcid);
+                    for s in list {
+                        b.push_span(s);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    // A content-less element (a figure/formula with no extractable glyphs) on
+    // this page falls back to its alternate description.
+    if on_this_page && b.out[before..].trim().is_empty() {
+        if let Some(alt) = &elem.alt {
+            b.push_replacement(alt);
+        }
+    }
+
+    if block {
+        b.block_break();
+    }
+}
+
+/// Mark every marked-content id in `elem`'s subtree (on `page`) as consumed,
+/// without emitting — used when an `/ActualText` replaces the subtree, so the
+/// leftover pass does not re-emit the glyphs it stood in for.
+fn mark_consumed(elem: &StructElem, page: usize, depth: usize, consumed: &mut HashSet<i64>) {
+    if depth > MAX_STRUCT_TEXT_DEPTH {
+        return;
+    }
+    for kid in &elem.kids {
+        match kid {
+            StructKid::Element(child) => mark_consumed(child, page, depth + 1, consumed),
+            StructKid::MarkedContent {
+                page: kid_page,
+                mcid,
+            } if *kid_page == Some(page) => {
+                consumed.insert(*mcid);
+            }
+            _ => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -326,6 +542,7 @@ mod tests {
             y,
             size,
             advance: text.chars().count() as f64 * size as f64 * 0.5,
+            mcid: None,
         }
     }
 
@@ -380,6 +597,7 @@ mod tests {
                 y: 700.0,
                 size: 12.0,
                 advance: 30.0,
+                mcid: None,
             },
         ];
         assert_eq!(spans_to_text(spans, 2.0), "Hello World");
@@ -395,5 +613,221 @@ mod tests {
             span("B", 50.0, 686.0, 12.0),
         ];
         assert_eq!(spans_to_text(spans, 2.0), "AAAAAAAAAA\nB");
+    }
+
+    // ---- struct_ordered_text (Tagged-PDF reading order) ----
+
+    use zpdf_document::StructRole;
+
+    fn span_m(text: &str, x: f64, y: f64, size: f32, mcid: i32) -> TextSpan {
+        let mut s = span(text, x, y, size);
+        s.mcid = Some(mcid);
+        s
+    }
+
+    fn selem(role: StructRole, page: Option<usize>, kids: Vec<StructKid>) -> StructElem {
+        StructElem {
+            role,
+            raw_type: String::new(),
+            title: None,
+            lang: None,
+            alt: None,
+            actual_text: None,
+            expansion: None,
+            page,
+            kids,
+        }
+    }
+
+    /// A marked-content kid binding `mcid` on `page`.
+    fn mc(page: usize, mcid: i64) -> StructKid {
+        StructKid::MarkedContent {
+            page: Some(page),
+            mcid,
+        }
+    }
+
+    #[test]
+    fn struct_order_differs_from_geometry() {
+        // "A" sits higher on the page (y=700), "B" lower (y=686). The structure
+        // tree lists B before A, so the reading order is "B\nA" — the reverse of
+        // the geometric top-to-bottom order.
+        let spans = vec![
+            span_m("A", 50.0, 700.0, 12.0, 0),
+            span_m("B", 50.0, 686.0, 12.0, 1),
+        ];
+        let tree = StructTree {
+            marked: true,
+            children: vec![selem(StructRole::P, Some(0), vec![mc(0, 1), mc(0, 0)])],
+        };
+        assert_eq!(struct_ordered_text(&spans, 0, &tree), "B\nA");
+        // Geometric reading order is the opposite.
+        assert_eq!(spans_to_text(spans, 2.0), "A\nB");
+    }
+
+    #[test]
+    fn actual_text_replaces_marked_content() {
+        // An element's /ActualText is the exact replacement for its content.
+        let spans = vec![span_m("\u{FB01}", 50.0, 700.0, 12.0, 0)]; // "ﬁ" ligature
+        let mut span_el = selem(StructRole::Span, Some(0), vec![mc(0, 0)]);
+        span_el.actual_text = Some("fi".to_string());
+        let tree = StructTree {
+            marked: true,
+            children: vec![span_el],
+        };
+        assert_eq!(struct_ordered_text(&spans, 0, &tree), "fi");
+    }
+
+    #[test]
+    fn alt_text_for_content_less_figure() {
+        // A figure that references no extractable text falls back to /Alt.
+        let mut fig = selem(StructRole::Figure, Some(0), vec![]);
+        fig.alt = Some("A bar chart".to_string());
+        let tree = StructTree {
+            marked: true,
+            children: vec![fig],
+        };
+        assert_eq!(struct_ordered_text(&[], 0, &tree), "A bar chart");
+    }
+
+    #[test]
+    fn empty_tree_falls_back_to_geometry() {
+        let spans = vec![
+            span("Hello", 50.0, 700.0, 12.0),
+            span("World", 50.0, 686.0, 12.0),
+        ];
+        let tree = StructTree {
+            marked: false,
+            children: vec![],
+        };
+        let geo = spans_to_text(spans.clone(), 2.0);
+        assert_eq!(struct_ordered_text(&spans, 0, &tree), geo);
+    }
+
+    #[test]
+    fn marked_content_is_page_scoped() {
+        // MCID values are per content stream. Each page is extracted with its own
+        // spans; a structure element on another page contributes nothing.
+        let tree = StructTree {
+            marked: true,
+            children: vec![
+                selem(StructRole::P, Some(0), vec![mc(0, 0)]),
+                selem(StructRole::P, Some(1), vec![mc(1, 1)]),
+            ],
+        };
+        let page0 = vec![span_m("zero", 50.0, 700.0, 12.0, 0)];
+        let page1 = vec![span_m("one", 50.0, 700.0, 12.0, 1)];
+        assert_eq!(struct_ordered_text(&page0, 0, &tree), "zero");
+        assert_eq!(struct_ordered_text(&page1, 1, &tree), "one");
+    }
+
+    #[test]
+    fn unreferenced_and_artifact_runs_are_appended() {
+        // A tagged run (mcid 0), an artifact run with no MCID, and a run whose
+        // MCID (9) no element references. The tree places the first; the other two
+        // are appended in geometric order rather than silently dropped.
+        let spans = vec![
+            span_m("Tagged", 50.0, 700.0, 12.0, 0),
+            span("Footer", 50.0, 50.0, 10.0), // mcid None (artifact)
+            span_m("Orphan", 50.0, 600.0, 12.0, 9), // referenced by no element
+        ];
+        let tree = StructTree {
+            marked: true,
+            children: vec![selem(StructRole::P, Some(0), vec![mc(0, 0)])],
+        };
+        let out = struct_ordered_text(&spans, 0, &tree);
+        assert!(out.starts_with("Tagged"), "structure text first: {out:?}");
+        assert!(out.contains("Footer"), "artifact run not dropped: {out:?}");
+        assert!(
+            out.contains("Orphan"),
+            "unreferenced run not dropped: {out:?}"
+        );
+    }
+
+    #[test]
+    fn alt_text_does_not_leak_across_pages() {
+        // A figure on page 1 with /Alt: extracting page 0 must not surface it,
+        // page 1 must — so the description isn't repeated on every page.
+        let mut fig = selem(StructRole::Figure, Some(1), vec![]);
+        fig.alt = Some("Chart on page two".to_string());
+        let tree = StructTree {
+            marked: true,
+            children: vec![fig],
+        };
+        assert_eq!(struct_ordered_text(&[], 0, &tree), "");
+        assert_eq!(struct_ordered_text(&[], 1, &tree), "Chart on page two");
+    }
+
+    #[test]
+    fn list_item_label_and_body_read_inline() {
+        // LI { Lbl "1.", LBody "Item text" } reads on one line, not split in two.
+        let spans = vec![
+            span_m("1.", 50.0, 700.0, 12.0, 0),
+            span_m("Item text", 80.0, 700.0, 12.0, 1),
+        ];
+        let li = selem(
+            StructRole::Li,
+            Some(0),
+            vec![
+                StructKid::Element(selem(StructRole::Lbl, Some(0), vec![mc(0, 0)])),
+                StructKid::Element(selem(StructRole::LBody, Some(0), vec![mc(0, 1)])),
+            ],
+        );
+        let tree = StructTree {
+            marked: true,
+            children: vec![li],
+        };
+        assert_eq!(struct_ordered_text(&spans, 0, &tree), "1. Item text");
+    }
+
+    #[test]
+    fn table_row_cells_read_across_the_row() {
+        // TR { TD "a", TD "b" } reads as one row line, not one cell per line.
+        let spans = vec![
+            span_m("a", 50.0, 700.0, 12.0, 0),
+            span_m("b", 120.0, 700.0, 12.0, 1),
+        ];
+        let tr = selem(
+            StructRole::Tr,
+            Some(0),
+            vec![
+                StructKid::Element(selem(StructRole::Td, Some(0), vec![mc(0, 0)])),
+                StructKid::Element(selem(StructRole::Td, Some(0), vec![mc(0, 1)])),
+            ],
+        );
+        let tree = StructTree {
+            marked: true,
+            children: vec![tr],
+        };
+        assert_eq!(struct_ordered_text(&spans, 0, &tree), "a b");
+    }
+
+    #[test]
+    fn block_elements_are_newline_separated() {
+        let spans = vec![
+            span_m("Title", 50.0, 700.0, 16.0, 0),
+            span_m("Body", 50.0, 670.0, 12.0, 1),
+        ];
+        let tree = StructTree {
+            marked: true,
+            children: vec![
+                selem(StructRole::H1, Some(0), vec![mc(0, 0)]),
+                selem(StructRole::P, Some(0), vec![mc(0, 1)]),
+            ],
+        };
+        assert_eq!(struct_ordered_text(&spans, 0, &tree), "Title\nBody");
+    }
+
+    #[test]
+    fn inline_runs_join_with_word_gap() {
+        // Two runs in one paragraph with a clear horizontal gap get one space.
+        let mut world = span_m("World", 130.0, 700.0, 12.0, 1);
+        world.advance = 30.0;
+        let spans = vec![span_m("Hello", 50.0, 700.0, 12.0, 0), world];
+        let tree = StructTree {
+            marked: true,
+            children: vec![selem(StructRole::P, Some(0), vec![mc(0, 0), mc(0, 1)])],
+        };
+        assert_eq!(struct_ordered_text(&spans, 0, &tree), "Hello World");
     }
 }

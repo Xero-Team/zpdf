@@ -1,5 +1,142 @@
 # Changelog
 
+## 0.10.0 — Tagged-PDF reading-order text extraction (MCID → content)
+
+The structure tree shipped in 0.9.0 exposed each element's marked-content ids,
+but nothing bound them to glyphs. This release joins the two halves: the content
+interpreter now **captures the marked-content id (`/MCID`) of every extracted
+text run**, and a new joiner walks the structure tree to produce text in the
+document's **logical reading order**, with `/ActualText` and `/Alt` substitution
+— the order a screen reader follows, rather than the geometric guess.
+
+### Capture
+
+- The interpreter tracks a stack of open marked-content sequences parallel to its
+  existing `BMC`/`BDC`/`EMC` depth, reading the `/MCID` from each `BDC`
+  properties operand (an inline dict, or a name resolved through `/Properties`).
+  `TextSpan` gained an `mcid: Option<i32>` set from the **innermost enclosing
+  `/MCID`** — a nested sequence with no id inherits the enclosing one
+  (ISO 32000-1 §14.6, §14.7.4.2). Malformed ids (negative, non-integer) are
+  dropped to `None`.
+- The marked-content stack is **scoped and restored at every content-stream
+  boundary** — form XObjects and annotation appearance streams get a fresh scope
+  (so a form's marked content cannot bleed into the page's, and an unbalanced
+  `BDC` inside a form cannot leak out), tiling-pattern cells reset per tile, and
+  the page reset clears it. (Type3 glyph procs are interpreted by the render
+  backends, never during extraction, so they need no handling.)
+
+### Join
+
+- `zpdf_content::text::struct_ordered_text(spans, page_index, tree)` walks the
+  structure tree in document order: each element contributes its `/ActualText`
+  (the exact replacement for the element and its children), or the text of the
+  page content its `/MCID` kids reference, or — for a content-less element such
+  as a figure — its `/Alt` description. Block-level roles
+  (`StructRole::is_block_level`) are separated by newlines; within a block, runs
+  are joined with the same word-gap / line-break heuristic as `spans_to_text`.
+  An element's own text (`/ActualText` / `/Alt`) and its `/MCID` matching are
+  both **page-scoped** (MCIDs are per content stream, and an element's text rides
+  on its effective `/Pg`), so a figure's `/Alt` never repeats across pages. List
+  labels/bodies (`Lbl`/`LBody`) and table cells (`TH`/`TD`) read **inline** with
+  their item/row. Any run the tree does not place — a run with no `/MCID` (e.g.
+  `/Artifact` headers, footers, page numbers) or an `/MCID` no element references
+  — is **appended in geometric order**, so `--struct` never silently drops a
+  page's text; an entirely untagged page degrades to the geometric `spans_to_text`.
+
+### Structural cross-backend safety
+
+The `/MCID` rides **only on `TextSpan`** (the text-extraction sink). The
+`DisplayList` / `RenderCommand` stream the CPU and wgpu backends consume is
+unchanged — proven by a test asserting the render commands are byte-for-byte
+identical with and without a text sink installed — so CPU↔GPU pixel parity cannot
+regress, and the capture runs only when a text sink is installed (extraction),
+never during plain `open`/render.
+
+### API & CLI
+
+- Facade re-export `zpdf::struct_ordered_text`; the new `TextSpan::mcid` field.
+- **CLI**: `zpdf text --struct` emits text in the structure tree's reading order
+  (with `/ActualText` / `/Alt`) when the document is tagged, else falls back to
+  the geometric order.
+
+Pure Rust, zero new dependencies, no parser or render-backend changes. Verified
+end-to-end on real tagged documents — inline code spans positioned out-of-line on
+the page (which the geometric extractor mis-orders) are restored to their correct
+place in the sentence flow.
+
+## 0.9.0 — Logical structure & Tagged PDF: structure tree, roles, accessibility
+
+A read-only data-model release, pure Rust with zero new dependencies: the
+document's **logical structure** — the Tagged-PDF tree that makes a PDF
+accessible and semantically extractable — is now exposed through the library and
+CLI. It is the structural companion to the 0.8.0 navigation/metadata surface, and
+rides the same catalog-reader + bounded-tree-walk machinery.
+
+### Logical structure tree (`/StructTreeRoot`)
+
+`zpdf-document/src/structure.rs` (ISO 32000-1 §14.7 Logical Structure + §14.8
+Tagged PDF) reads the catalog's `/StructTreeRoot` into a navigable
+`StructTree`: the tree of **structure elements** describing the document's
+logical organization — its headings, paragraphs, lists, tables, and figures —
+independent of how that content is laid out on the page. This is what a screen
+reader walks, and what lets a consumer recover semantic structure rather than a
+bag of glyphs.
+
+- **Structure elements** (`/Type /StructElem`) become a nested `StructElem`
+  carrying its **role** (`/S`), original raw type, title (`/T`), language
+  (`/Lang`), accessibility text (`/Alt`, `/ActualText`), abbreviation expansion
+  (`/E`), effective page, and kids.
+- **Roles** (`/S`) are resolved through the structure tree root's `/RoleMap`
+  (transitively, with a cycle-bounded walk) and classified into a `StructRole`
+  enum of the standard structure types — grouping (`Document`, `Part`, `Sect`,
+  `Div`, `TOC`, …), block-level (`P`, `H1`…`H6`, `L`/`LI`/`Lbl`/`LBody`,
+  `Table`/`TR`/`TH`/`TD`/`THead`/`TBody`/`TFoot`), inline (`Span`, `Quote`,
+  `Note`, `Link`, `BibEntry`, `Ruby`/`Warichu` …), and illustration (`Figure`,
+  `Formula`, `Form`). A producer type not mapped onto a standard one is
+  `StructRole::Other(name)`; the original `/S` is always kept in `raw_type`.
+- **Kids** (`/K`, a single value or an array) are normalized into `StructKid`:
+  a nested element, a **marked-content** sequence (a bare integer MCID or a
+  `/Type /MCR` dict, carrying the page index whose content stream it indexes), or
+  an **object reference** (`/Type /OBJR`, e.g. an annotation that participates in
+  the structure).
+- **Page inheritance** (`/Pg`): an element's effective page is its own `/Pg` or
+  the nearest ancestor's, resolved to a 0-based page index (via the catalog's
+  page reverse-index), and propagated to its MCID/OBJR kids.
+- **Accessibility helpers**: `StructElem::accessible_text()` returns
+  `/ActualText` (the exact replacement) or `/Alt` (an alternate description);
+  `StructRole::{as_str, is_standard, is_heading}`; `StructTree::element_count()`.
+- **Tagged-ness**: `PdfDocument::is_tagged()` reports the catalog's `/MarkInfo
+  /Marked true` — independent of whether a `/StructTreeRoot` is present (a
+  document may carry one without the other).
+
+### Robustness
+
+Like the other document readers, the whole walk only touches the object graph —
+nothing renders — and runs **only when explicitly called**, never during `open`
+or rendering. Every descent is bounded so a malformed or adversarial tree cannot
+hang, recurse without bound, or exhaust memory: a depth cap, a per-reference
+`visited` set **seeded with the tree-root reference** (so a kid pointing back at
+the root spawns no spurious element), a shared element/kid-entry budget spent per
+node *and* per kid-array entry examined, a `/RoleMap` resolution depth cap with
+its own name-cycle guard, a bounded `/RoleMap` size, and per-string length caps
+on `/Alt`/`/ActualText`/`/T`/`/E`/`/Lang`. Verified against the malformed-corpus
+contract (cyclic kids, root back-edges, role-map cycles, over-deep chains, and
+multi-megabyte `/Alt` all terminate cleanly), with zero regression to the failed
+corpus.
+
+### API & CLI
+
+- `PdfDocument::{struct_tree, is_tagged}`; facade re-exports `StructTree`,
+  `StructElem`, `StructKid`, `StructRole`.
+- **CLI**: `zpdf struct <file.pdf>` prints the indented structure tree — each
+  element's role, optional title / accessibility text, and page, with
+  marked-content (`mcid`) and object (`obj`) leaves shown under their owning
+  element. `zpdf info` gains a `Tagged PDF` / `Structure tree` summary.
+
+Pure data model, zero new dependencies, no parsing/backend changes; verified
+end-to-end on real tagged documents (a 16-page tagged PDF reports its full
+`Document → H1/P/Figure/…` tree with resolved MCIDs and page associations).
+
 ## 0.8.0 — Document navigation & metadata: outline, destinations, page labels, links, XMP, info
 
 A read-only data-model release, pure Rust with zero new dependencies: the

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use zpdf_core::{Matrix, ObjectId, PdfObject, Point, Rect};
+use zpdf_core::{Matrix, ObjectId, PdfDict, PdfObject, Point, Rect};
 use zpdf_display_list::*;
 use zpdf_document::page::ResourceDict;
 use zpdf_font::FontCache;
@@ -66,6 +66,11 @@ pub struct ContentInterpreter<'a> {
     annotations: Option<&'a [zpdf_document::Annotation]>,
     /// Marked-content nesting depth (BMC/BDC vs EMC).
     mc_depth: u32,
+    /// Stack of marked-content `/MCID`s, one entry per open marked-content
+    /// sequence (`None` for a sequence with no `/MCID`), parallel to `mc_depth`.
+    /// Lets the text sink tag each span with the marked-content id that binds it
+    /// to a Tagged-PDF structure element. Only meaningful during text extraction.
+    mc_stack: Vec<Option<i32>>,
     /// Depth at which a hidden `BDC /OC` block began; painting is suppressed
     /// until the matching EMC.
     oc_hidden_from: Option<u32>,
@@ -453,6 +458,7 @@ impl<'a> ContentInterpreter<'a> {
             oc_config: None,
             annotations: None,
             mc_depth: 0,
+            mc_stack: Vec::new(),
             oc_hidden_from: None,
             max_commands: DEFAULT_MAX_COMMANDS,
             ops_executed: 0,
@@ -654,6 +660,7 @@ impl<'a> ContentInterpreter<'a> {
             ..GraphicsState::default()
         };
         self.mc_depth = 0;
+        self.mc_stack.clear();
         self.oc_hidden_from = None;
         self.suppress_color_ops = false;
 
@@ -1139,6 +1146,8 @@ impl<'a> ContentInterpreter<'a> {
             // -- Marked content --
             "BMC" => {
                 self.mc_depth += 1;
+                // A plain marked-content sequence declares no /MCID.
+                self.mc_stack.push(None);
             }
             "BDC" => {
                 // Operands: tag (first) then properties (top of stack).
@@ -1148,9 +1157,14 @@ impl<'a> ContentInterpreter<'a> {
                     _ => String::new(),
                 };
                 self.mc_depth += 1;
+                // Capture this sequence's /MCID (if any) for text extraction; a
+                // sequence with no /MCID inherits the enclosing one via the stack.
+                let mcid = props.as_ref().and_then(|p| self.marked_content_id(p));
+                self.mc_stack.push(mcid);
                 if tag == "OC" && self.oc_hidden_from.is_none() {
                     let visible = props
-                        .map(|p| self.oc_properties_visible(&p))
+                        .as_ref()
+                        .map(|p| self.oc_properties_visible(p))
                         .unwrap_or(true);
                     if !visible {
                         self.oc_hidden_from = Some(self.mc_depth);
@@ -1162,6 +1176,7 @@ impl<'a> ContentInterpreter<'a> {
                     self.oc_hidden_from = None;
                 }
                 self.mc_depth = self.mc_depth.saturating_sub(1);
+                self.mc_stack.pop();
             }
             "MP" | "DP" => {}
 
@@ -2368,6 +2383,44 @@ impl<'a> ContentInterpreter<'a> {
         }
     }
 
+    /// The marked-content id in effect at the current point: the innermost
+    /// enclosing marked-content sequence that declares an `/MCID`. A nested
+    /// sequence with no `/MCID` inherits the enclosing one (ISO 32000-1 §14.6,
+    /// §14.7.4.2). `None` when no enclosing sequence carries one. Used only to
+    /// tag extracted text spans so a Tagged-PDF structure element can bind them.
+    fn current_mcid(&self) -> Option<i32> {
+        self.mc_stack.iter().rev().flatten().next().copied()
+    }
+
+    /// Read the `/MCID` of a `BDC` properties operand (an inline dict, or a name
+    /// resolved through the `/Properties` resource), validated to a non-negative
+    /// `i32`. `None` when the sequence declares no usable marked-content id.
+    fn marked_content_id(&self, props: &PdfObject) -> Option<i32> {
+        let dict = self.resolve_property_dict(props)?;
+        match dict.get("MCID") {
+            Some(PdfObject::Integer(n)) => i32::try_from(*n).ok().filter(|&m| m >= 0),
+            _ => None,
+        }
+    }
+
+    /// Resolve a `BDC` properties operand to its dictionary: an inline dict, a
+    /// name looked up in the `/Properties` resource (inline or by reference), or
+    /// a direct reference. Mirrors [`Self::oc_properties_visible`]'s resolution.
+    fn resolve_property_dict(&self, props: &PdfObject) -> Option<PdfDict> {
+        match props {
+            PdfObject::Dict(d) => Some(d.clone()),
+            PdfObject::Name(n) => {
+                if let Some(d) = self.lookup_res(|r| r.properties_inline.get(n.as_str()).cloned()) {
+                    return Some(d);
+                }
+                let id = self.lookup_res(|r| r.properties.get(n.as_str()).copied())?;
+                self.file?.resolve(id).ok()?.as_dict().ok().cloned()
+            }
+            PdfObject::Ref(r) => self.file?.resolve(*r).ok()?.as_dict().ok().cloned(),
+            _ => None,
+        }
+    }
+
     /// Visibility of an /OC value: an OCG ref, or an OCMD with /OCGs + /P
     /// policy or a /VE visibility expression (which takes precedence).
     fn oc_object_visible(&self, obj: &PdfObject, depth: u8) -> bool {
@@ -3151,8 +3204,11 @@ impl<'a> ContentInterpreter<'a> {
         let saved_text_line_matrix = self.text_line_matrix;
         let saved_operand_stack = std::mem::take(&mut self.operand_stack);
         // An unbalanced EMC inside the form must not unsuppress (or leave
-        // suppressed) page-level marked-content state.
+        // suppressed) page-level marked-content state. The form's content is a
+        // separate marked-content scope, so its /MCIDs start fresh and cannot
+        // bleed into (or be polluted by) the page's enclosing sequence.
         let saved_mc_depth = self.mc_depth;
+        let saved_mc_stack = std::mem::take(&mut self.mc_stack);
         let saved_oc_hidden = self.oc_hidden_from;
 
         self.current.ctm = self.current.ctm.concat(&form_matrix);
@@ -3260,6 +3316,7 @@ impl<'a> ContentInterpreter<'a> {
         self.text_line_matrix = saved_text_line_matrix;
         self.operand_stack = saved_operand_stack;
         self.mc_depth = saved_mc_depth;
+        self.mc_stack = saved_mc_stack;
         self.oc_hidden_from = saved_oc_hidden;
         self.base_ctm = saved_base_ctm;
         self.form_font_overrides.pop();
@@ -3693,9 +3750,11 @@ impl<'a> ContentInterpreter<'a> {
         let saved_text_line_matrix = self.text_line_matrix;
         let saved_operand_stack = std::mem::take(&mut self.operand_stack);
         let saved_suppress = self.suppress_color_ops;
-        // Unbalanced BDC/EMC inside a cell must not leak marked-content
-        // suppression into later tiles or the rest of the page.
+        // Unbalanced BDC/EMC inside a cell must not leak marked-content state
+        // into later tiles or the rest of the page; like `mc_depth`, the cell's
+        // /MCID stack is saved before the tile loop and restored per tile.
         let saved_mc_depth = self.mc_depth;
+        let saved_mc_stack = self.mc_stack.clone();
         let saved_oc_hidden = self.oc_hidden_from;
         // Patterns selected inside the cell anchor to the cell's space.
         let saved_base_ctm = self.base_ctm;
@@ -3813,6 +3872,7 @@ impl<'a> ContentInterpreter<'a> {
                 self.state_floor = saved_floor;
                 self.suppress_color_ops = saved_suppress;
                 self.mc_depth = saved_mc_depth;
+                self.mc_stack.clone_from(&saved_mc_stack);
                 self.oc_hidden_from = saved_oc_hidden;
                 self.base_ctm = saved_base_ctm;
             }
@@ -4069,6 +4129,8 @@ impl<'a> ContentInterpreter<'a> {
                 // Signed horizontal extent of the run (end.x − start.x) so the
                 // extraction gap heuristic stays correct under scaling/rotation.
                 advance: dx,
+                // The marked-content id binding this run to a structure element.
+                mcid: self.current_mcid(),
             })
         } else {
             None

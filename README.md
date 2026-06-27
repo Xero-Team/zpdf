@@ -50,10 +50,20 @@ GPU (wgpu) renderers whose output matches within <1% of pixels.
   `dest`/`uri`, CLI `links`), XMP `/Metadata` via a hardened, entity-expansion-safe
   scrape (`xmp_metadata()`), and the `/Info` dictionary (`info()`). `zpdf info`
   surfaces the `/Info`, XMP, outline, and page-label data.
+- **Logical structure / Tagged PDF** — the `/StructTreeRoot` structure tree
+  (`struct_tree()`, CLI `struct`) read into a navigable model of structure
+  elements with their roles (`/S` resolved through `/RoleMap` to standard types
+  like `H1`/`Table`/`Figure`), accessibility text (`/Alt`/`/ActualText`),
+  language, titles, page associations, and marked-content (MCID) / object
+  (`/OBJR`) kids; plus tagged-ness detection (`is_tagged()`, `/MarkInfo`).
+  Text extraction can follow the structure tree's **logical reading order** with
+  `/ActualText` / `/Alt` substitution (`struct_ordered_text()`, CLI
+  `text --struct`) — the interpreter binds each text run to its `/MCID` — instead
+  of the geometric XY-cut default.
 - **CPU rendering** — tiny-skia backend, PNG output at any DPI.
 - **GPU rendering** — wgpu backend (fills, strokes, clips, text, images, blend
   groups); matches the CPU renderer within <1% pixels.
-- **Tooling** — CLI (`info`/`render`/`text`/`tables`/`forms`/`outline`/`links`/`attachments`/`compare`/`dump`/`debug-stream`),
+- **Tooling** — CLI (`info`/`render`/`text`/`tables`/`forms`/`outline`/`links`/`struct`/`attachments`/`compare`/`dump`/`debug-stream`),
   an interactive winit viewer example, and a native GPUI desktop reader
   (`zpdf-viewer-gpui`).
 

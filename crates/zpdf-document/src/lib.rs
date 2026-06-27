@@ -12,6 +12,7 @@ pub mod outline;
 pub mod output_intents;
 pub mod page;
 pub mod page_labels;
+pub mod structure;
 pub mod xmp;
 
 pub use annotation::Annotation;
@@ -25,6 +26,7 @@ pub use outline::OutlineItem;
 pub use output_intents::OutputIntent;
 pub use page::{PdfPage, ResourceDict};
 pub use page_labels::{PageLabelStyle, PageLabels};
+pub use structure::{StructElem, StructKid, StructRole, StructTree};
 pub use xmp::XmpMetadata;
 
 use std::collections::HashMap;
@@ -269,6 +271,22 @@ impl PdfDocument {
     /// the RDF/XML themselves. `None` when the document carries no `/Metadata`.
     pub fn metadata_bytes(&self) -> Option<Vec<u8>> {
         xmp::metadata_bytes(&self.file)
+    }
+
+    /// The document's logical structure tree (`/StructTreeRoot`, ISO 32000-1
+    /// §14.7–14.8): the Tagged-PDF tree of structure elements (headings,
+    /// paragraphs, lists, tables, figures …) with their roles, accessibility
+    /// text, and marked-content / object associations. `None` when the document
+    /// declares no structure tree. Read-only; runs only when called.
+    pub fn struct_tree(&self) -> Option<StructTree> {
+        structure::parse_struct_tree(&self.file, &self.catalog)
+    }
+
+    /// Whether the document declares Tagged-PDF conformance via the catalog's
+    /// `/MarkInfo` dictionary (`/Marked true`). Independent of whether a
+    /// [`PdfDocument::struct_tree`] is actually present.
+    pub fn is_tagged(&self) -> bool {
+        structure::is_tagged(&self.file)
     }
 }
 
