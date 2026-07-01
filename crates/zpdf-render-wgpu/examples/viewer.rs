@@ -104,6 +104,13 @@ fn render_page(doc: &PdfDocument, idx: usize, slot: &mut Option<GpuContext>) -> 
         renderer = renderer.with_context(ctx);
     }
     let result = renderer.render_display_list(&dl, scale);
+    if let Some(ns) = renderer.last_gpu_time_ns() {
+        tracing::debug!(
+            page = idx,
+            gpu_ms = ns as f64 / 1_000_000.0,
+            "page rendered"
+        );
+    }
     *slot = renderer.take_context(); // reclaim the context for the next page
     let tex = result.ok()?;
     Some(PageImage {

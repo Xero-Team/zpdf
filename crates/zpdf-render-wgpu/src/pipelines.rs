@@ -26,6 +26,10 @@ pub struct Pipelines {
     pub clip_reset: wgpu::RenderPipeline,
     /// Image quad pipeline (samples a texture, premultiplied source-over).
     pub textured: wgpu::RenderPipeline,
+    /// Bind group 1 (glyph atlas): R8 coverage texture + sampler.
+    pub glyph_bgl: wgpu::BindGroupLayout,
+    /// Glyph-atlas quad pipeline (samples coverage, scales the paint color).
+    pub glyph: wgpu::RenderPipeline,
     /// Bind group 1 (composite): base texture + group texture + mode uniform.
     pub composite_bgl: wgpu::BindGroupLayout,
     /// Blend-group composite pipeline (fullscreen, reads base+group, 16 modes).
@@ -168,6 +172,75 @@ impl Pipelines {
             fragment: Some(wgpu::FragmentState {
                 module: &tex_shader,
                 entry_point: Some("fs_image"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: target_format,
+                    blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        // --- Glyph atlas pipeline: group 0 = page uniform, group 1 = R8
+        //     coverage atlas + sampler. Reuses the `TexturedVertex` layout
+        //     (pos/uv/color) — a glyph quad is shaped identically to an image
+        //     quad, only the fragment stage (coverage x color vs RGBA sample)
+        //     and the bound texture's format differ. ---
+        let glyph_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("zpdf-glyph-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let glyph_shader = device.create_shader_module(wgpu::include_wgsl!("shaders/glyph.wgsl"));
+        let glyph_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("zpdf-glyph-layout"),
+            bind_group_layouts: &[Some(&page_bgl), Some(&glyph_bgl)],
+            immediate_size: 0,
+        });
+        let glyph_vbl = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<TexturedVertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &tex_attrs,
+        };
+        let glyph = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("zpdf-glyph"),
+            layout: Some(&glyph_layout),
+            vertex: wgpu::VertexState {
+                module: &glyph_shader,
+                entry_point: Some("vs_glyph"),
+                buffers: &[glyph_vbl],
+                compilation_options: Default::default(),
+            },
+            primitive: wgpu::PrimitiveState {
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(content_stencil_state()),
+            multisample: wgpu::MultisampleState {
+                count: sample_count,
+                ..Default::default()
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &glyph_shader,
+                entry_point: Some("fs_glyph"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: target_format,
                     blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
@@ -352,6 +425,8 @@ impl Pipelines {
             clip_write,
             clip_reset,
             textured,
+            glyph_bgl,
+            glyph,
             composite_bgl,
             composite,
             mask_apply_bgl,

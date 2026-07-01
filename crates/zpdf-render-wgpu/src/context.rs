@@ -31,6 +31,13 @@ pub struct GpuContext {
     pub max_texture_dim: u32,
     /// Built-once render pipelines.
     pub pipelines: Pipelines,
+    /// True when the adapter supports `Features::TIMESTAMP_QUERY` (requested at
+    /// device creation). GPU pass timing is unavailable (silently `None`) when
+    /// this is false, rather than failing the render.
+    pub timestamps_supported: bool,
+    /// Nanoseconds per timestamp tick (`Queue::get_timestamp_period`); only
+    /// meaningful when `timestamps_supported`.
+    pub timestamp_period: f32,
     /// Most recent device-level error (e.g. out-of-memory on a too-large page).
     /// Set by the uncaptured-error handler instead of wgpu's default panic, so a
     /// render can fail with a [`WgpuRenderError`] rather than abort the process.
@@ -71,10 +78,26 @@ impl GpuContext {
         // and measured *worse* for dense CJK text — tiny-skia's AA blends in a
         // different space than the GPU's linear box-filter resolve, so finer
         // sampling exposes more midtone mismatches. 4x is the better operating point.
+        //
+        // TIMESTAMP_QUERY (GPU pass timing, P3.8) is requested only if the adapter
+        // actually supports it — some software/fallback adapters don't, and it's
+        // purely additive telemetry, never load-bearing for rendering.
+        // `write_timestamp` is called directly on the encoder (between passes,
+        // not via a pass descriptor), which wgpu 29 gates behind the more
+        // specific TIMESTAMP_QUERY_INSIDE_ENCODERS bit in addition to the base
+        // TIMESTAMP_QUERY feature — both must be present and requested together.
+        let timing_features =
+            wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
+        let timestamps_supported = adapter.features().contains(timing_features);
+        let requested_features = if timestamps_supported {
+            timing_features
+        } else {
+            wgpu::Features::empty()
+        };
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("zpdf-device"),
-                required_features: wgpu::Features::empty(),
+                required_features: requested_features,
                 required_limits,
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
                 memory_hints: wgpu::MemoryHints::MemoryUsage,
@@ -82,6 +105,11 @@ impl GpuContext {
             })
             .await
             .map_err(|e| WgpuRenderError::Wgpu(format!("request_device: {e}")))?;
+        let timestamp_period = if timestamps_supported {
+            queue.get_timestamp_period()
+        } else {
+            0.0
+        };
 
         // Probe required usages so we error cleanly on exotic adapters rather than
         // silently mis-rendering.
@@ -129,6 +157,7 @@ impl GpuContext {
             adapter = ?adapter.get_info(),
             sample_count,
             max_texture_dim,
+            timestamps_supported,
             "zpdf wgpu context initialized"
         );
 
@@ -158,6 +187,8 @@ impl GpuContext {
             sample_count,
             max_texture_dim,
             pipelines,
+            timestamps_supported,
+            timestamp_period,
             device_error,
         })
     }

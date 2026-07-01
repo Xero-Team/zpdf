@@ -1036,7 +1036,7 @@ fn cmd_render(args: &[String]) -> zpdf::Result<()> {
     let (args, password) = extract_password(args);
     if args.is_empty() {
         eprintln!(
-            "Usage: zpdf render <file.pdf> [-p <page>] [-o <output.png>] [--dpi <dpi>] [--backend cpu|wgpu] [--password <pw>]"
+            "Usage: zpdf render <file.pdf> [-p <page>] [-o <output.png>] [--dpi <dpi>] [--backend cpu|wgpu] [--stats] [--password <pw>]"
         );
         process::exit(1);
     }
@@ -1046,6 +1046,7 @@ fn cmd_render(args: &[String]) -> zpdf::Result<()> {
     let mut output = String::from("output.png");
     let mut dpi: f32 = 150.0;
     let mut backend = String::from("cpu");
+    let mut stats = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -1074,6 +1075,7 @@ fn cmd_render(args: &[String]) -> zpdf::Result<()> {
                     process::exit(2);
                 });
             }
+            "--stats" => stats = true,
             _ => {}
         }
         i += 1;
@@ -1187,13 +1189,18 @@ fn cmd_render(args: &[String]) -> zpdf::Result<()> {
             let mut renderer = zpdf::cpu::CpuRenderer::new()
                 .with_fonts(&font_cache)
                 .with_images(&image_cache);
+            let start = std::time::Instant::now();
             let rendered: zpdf::cpu::RenderedPage = renderer
                 .render_display_list(&display_list, scale)
                 .map_err(|e| zpdf::Error::StreamDecode(e.to_string()))?;
+            let wall = start.elapsed();
             println!(
                 "  Rendered (cpu): {}x{} pixels",
                 rendered.width, rendered.height
             );
+            if stats {
+                println!("  Stats: cpu wall {:.2}ms", wall.as_secs_f64() * 1000.0);
+            }
             save_rgba(&output, rendered.width, rendered.height, &rendered.data)?;
         }
         #[cfg(not(feature = "cpu"))]
@@ -1206,13 +1213,24 @@ fn cmd_render(args: &[String]) -> zpdf::Result<()> {
             let mut renderer = zpdf::gpu::WgpuRenderer::new()
                 .with_fonts(&font_cache)
                 .with_images(&image_cache);
+            let start = std::time::Instant::now();
             let rendered = renderer
                 .render_display_list(&display_list, scale)
                 .map_err(|e| zpdf::Error::StreamDecode(e.to_string()))?;
+            let wall = start.elapsed();
             println!(
                 "  Rendered (wgpu): {}x{} pixels",
                 rendered.width, rendered.height
             );
+            if stats {
+                print!("  Stats: cpu wall {:.2}ms", wall.as_secs_f64() * 1000.0);
+                match renderer.last_gpu_time_ns() {
+                    Some(ns) => println!(", gpu pass {:.2}ms", ns as f64 / 1_000_000.0),
+                    None => {
+                        println!(", gpu pass time unavailable (adapter lacks timestamp queries)")
+                    }
+                }
+            }
             save_rgba(&output, rendered.width, rendered.height, &rendered.data)?;
         }
         #[cfg(not(feature = "gpu"))]

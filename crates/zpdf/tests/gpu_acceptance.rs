@@ -14,6 +14,11 @@ const SCALE: f32 = 2.0;
 const THRESHOLD: u8 = 16;
 const MAX_DIFF_PCT: f64 = 1.0;
 
+/// Real embedded TrueType font (not Type3) — its Unicode cmap maps 'A' (0x41)
+/// to GID 1, a filled-rectangle outline (see `crates/zpdf/tests/variable_font_pdf.rs`,
+/// which exercises the same fixture/GID via `glyph_outline(1)` directly).
+const TEST_TTF: &[u8] = include_bytes!("../../zpdf-font/tests/fixtures/var.ttf");
+
 /// Concatenate 1-based objects with a classic xref table + trailer.
 fn assemble(objs: &[Vec<u8>]) -> Vec<u8> {
     let mut out = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n".to_vec();
@@ -80,6 +85,52 @@ fn type3_pdf() -> Vec<u8> {
         b"<< /sq 8 0 R >>".to_vec(),
         b"<< /Type /Encoding /Differences [65 /sq] >>".to_vec(),
         stream_obj("", glyph),
+    ])
+}
+
+/// A PDF with the SAME real outline glyph ('A' -> GID 1 in `TEST_TTF`) repeated
+/// 12 times across a grid, all under one plain (translation-only) text
+/// transform — axis-aligned, unscaled, unmirrored. Exercises the wgpu glyph
+/// atlas's cache-reuse path (P3.4/M6b): every repeat after the first hits the
+/// same `GlyphKey` and blits a quad instead of re-rasterizing. `text_type3`
+/// above never exercises this — Type3 glyphs always take the content-stream
+/// path, never the outline-glyph atlas.
+///
+/// `font_size` is a parameter rather than a constant: the atlas buckets to
+/// the nearest *integer* device-pixel em-size
+/// (`glyph.rs::axis_aligned_px_per_em`) while the CPU oracle rasterizes at
+/// the exact continuous size, so a size that happens to round cleanly (e.g.
+/// 40pt at 2x = a whole 80px) makes an axis-aligned rectangle glyph agree
+/// bit-for-bit between tiny-skia and lyon's MSAA *regardless of which path is
+/// used* — verified empirically: at 40pt, forcing `ZPDF_GPU_GLYPH_ATLAS=0`
+/// also diffs 0.000% against CPU either way, so it can't discriminate
+/// "did the atlas actually run." The corpus regression case below uses a
+/// round size (comfortable, stable margin vs the 1% gate); the separate
+/// atlas-engagement test uses a fractional size (genuinely exercises the
+/// size-rounding delta) precisely because that test asserts a *relative*
+/// property (atlas output != forced-fallback output) rather than an absolute
+/// diff-% budget, so it doesn't need a safety margin against a fixed gate.
+fn outline_text_pdf(font_size: f32) -> Vec<u8> {
+    let content = format!(
+        "BT /F1 {font_size} Tf 0 0 0 rg\n\
+        20 150 Td (A) Tj 40 0 Td (A) Tj 40 0 Td (A) Tj 40 0 Td (A) Tj\n\
+        -120 -50 Td (A) Tj 40 0 Td (A) Tj 40 0 Td (A) Tj 40 0 Td (A) Tj\n\
+        -120 -50 Td (A) Tj 40 0 Td (A) Tj 40 0 Td (A) Tj 40 0 Td (A) Tj\nET"
+    );
+    assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R \
+          /Resources << /Font << /F1 5 0 R >> >> >>"
+            .to_vec(),
+        stream_obj("", content.as_bytes()),
+        b"<< /Type /Font /Subtype /TrueType /BaseFont /ZpdfSans /FirstChar 65 \
+          /LastChar 65 /Widths [500] /FontDescriptor 6 0 R >>"
+            .to_vec(),
+        b"<< /Type /FontDescriptor /FontName /ZpdfSans /Flags 32 \
+          /FontBBox [0 -200 700 800] /FontFile2 7 0 R >>"
+            .to_vec(),
+        stream_obj(&format!("/Length1 {}", TEST_TTF.len()), TEST_TTF),
     ])
 }
 
@@ -165,6 +216,7 @@ fn corpus() -> Vec<(&'static str, Vec<u8>)> {
         ("image_rgb", simple_pdf(&image_rgb)),
         ("image_under_clip", simple_pdf(&img_clip)),
         ("text_type3", type3_pdf()),
+        ("text_outline_repeated", outline_text_pdf(40.0)),
         // One blend group, then many — the latter forces the LayerPool to recycle
         // rather than allocate a layer per group.
         ("blend_group_single", blend_groups_pdf(1)),
@@ -349,4 +401,81 @@ fn gpu_matches_cpu_on_corpus() {
     if skipped {
         eprintln!("GPU acceptance harness skipped (no adapter).");
     }
+}
+
+/// Guards against `text_outline_repeated` passing `gpu_matches_cpu_on_corpus`
+/// as a false positive (e.g. a blank page trivially diffs at 0%, or the atlas
+/// path silently never engages and the case is really just re-testing
+/// vector-fill): (1) the CPU reference must contain real ink — some pixels
+/// darker than the white background — proving the glyphs actually resolved
+/// and rendered, not a blank page; (2) forcing `ZPDF_GPU_GLYPH_ATLAS=0` (pure
+/// vector-fill, mirroring every other text run before this phase) must
+/// produce *some* pixel difference from the default atlas-enabled render —
+/// proving the atlas code path is genuinely engaged and not a no-op, since
+/// two different rasterizers (tiny-skia analytic AA vs lyon MSAA tessellation)
+/// essentially never agree on every single pixel of a real glyph's AA edge.
+#[test]
+fn glyph_atlas_path_is_genuinely_exercised() {
+    let pdf = outline_text_pdf(37.3); // fractional: see `outline_text_pdf` doc comment
+    let doc = PdfDocument::open(pdf).expect("open pdf");
+    let page = doc.page(0).expect("page 0");
+    let mut fonts = doc.load_page_fonts(&page);
+    let content = doc.page_content_bytes(&page).expect("content bytes");
+    let mut images = ImageCache::new();
+    let dl = ContentInterpreter::new(page.media_box)
+        .with_fonts(&mut fonts)
+        .with_document(doc.file(), &page.resources)
+        .with_images(&mut images)
+        .interpret(&content);
+
+    let cpu = zpdf::cpu::CpuRenderer::new()
+        .with_fonts(&fonts)
+        .with_images(&images)
+        .render_display_list(&dl, SCALE)
+        .expect("cpu render");
+    let ink_pixels = (0..cpu.data.len() / 4)
+        .filter(|&i| cpu.data[i * 4] < 200) // red channel well below white
+        .count();
+    assert!(
+        ink_pixels > 200,
+        "CPU reference has almost no ink ({ink_pixels} px) — glyphs likely \
+         failed to resolve to real outlines; this test's premise is broken"
+    );
+
+    // SAFETY-ISH: std::env::set_var in a test is racy against other tests
+    // touching this var if run in parallel; this is the only test that does,
+    // and it restores the var afterward.
+    let render = || {
+        zpdf::gpu::WgpuRenderer::new()
+            .with_fonts(&fonts)
+            .with_images(&images)
+            .render_display_list(&dl, SCALE)
+    };
+    unsafe {
+        std::env::set_var("ZPDF_GPU_GLYPH_ATLAS", "0");
+    }
+    let fallback = render();
+    unsafe {
+        std::env::remove_var("ZPDF_GPU_GLYPH_ATLAS");
+    }
+    let atlas = render();
+
+    let (Ok(fallback), Ok(atlas)) = (fallback, atlas) else {
+        eprintln!("glyph_atlas_path_is_genuinely_exercised skipped (no adapter).");
+        return;
+    };
+    assert_eq!(
+        (fallback.width, fallback.height),
+        (atlas.width, atlas.height)
+    );
+    let differs = fallback
+        .data
+        .iter()
+        .zip(atlas.data.iter())
+        .any(|(a, b)| a != b);
+    assert!(
+        differs,
+        "atlas-enabled and forced-fallback GPU renders are byte-identical — \
+         the glyph atlas path does not appear to be engaging"
+    );
 }

@@ -6,6 +6,7 @@
 //! active clip paths covering it; content draws test `stencil == clip_depth`
 //! (inside the intersection of all active clips).
 
+use crate::glyph_atlas::GlyphAtlas;
 use crate::path::{fill_mesh, stroke_mesh, Mesh};
 use crate::transform::{PageMap, SolidVertex, TexturedVertex};
 use zpdf_display_list::{
@@ -33,7 +34,10 @@ pub struct MaskOps {
     pub transfer: Option<std::sync::Arc<[u8; 256]>>,
 }
 
-/// A range of indices/vertices in the shared arena.
+/// A range of indices/vertices in the shared arena. Indices are always
+/// absolute (rebased at append time), so `base_vertex` is always `0` — kept as
+/// a field for `draw_indexed`'s call shape rather than removed, to minimize
+/// churn at call sites.
 #[derive(Clone, Copy)]
 pub struct MeshRange {
     pub first_index: u32,
@@ -62,6 +66,10 @@ pub enum PageOp {
         image_id: u32,
         clip_ref: u32,
     },
+    /// Draw a rasterized-glyph quad (from the glyph arena, sampling the
+    /// page's single atlas texture), testing `stencil == clip_ref`. Unlike
+    /// `Image`, no texture id is carried — a page has exactly one atlas.
+    Glyph { range: MeshRange, clip_ref: u32 },
     /// Begin a transparency group: subsequent ops render to a fresh offscreen layer.
     /// `clips` are the clip paths active at push time, re-stamped into the new layer.
     /// `alpha` is the group constant alpha applied at composite time; `mask` is an
@@ -97,6 +105,14 @@ pub struct PageRecorder {
     /// Separate arena for image quads (different vertex format).
     pub tex_vertices: Vec<TexturedVertex>,
     pub tex_indices: Vec<u32>,
+    /// Separate arena for glyph-atlas quads. Indices are absolute (rebased at
+    /// append time, like `vertices`/`indices`), so consecutive same-clip glyph
+    /// quads batch into one draw call (`batch.rs`) — the dominant case for
+    /// text-heavy pages, unlike per-image quads (`tex_indices`), which each
+    /// carry a distinct texture and so never batch with one another.
+    pub glyph_vertices: Vec<TexturedVertex>,
+    pub glyph_indices: Vec<u32>,
+    pub glyph_atlas: GlyphAtlas,
     pub ops: Vec<PageOp>,
     clip_stack: Vec<ClipEntry>,
     clip_depth: u32,
@@ -104,16 +120,22 @@ pub struct PageRecorder {
 
 impl PageRecorder {
     fn append(&mut self, mesh: Mesh) -> MeshRange {
-        let base_vertex = self.vertices.len() as i32;
+        // Indices are rebased to absolute (base_vertex baked in) so every draw
+        // can use base_vertex 0 uniformly. This makes a contiguous run of
+        // same-key ops trivially concatenable into one draw_indexed call
+        // (`batch.rs`): consecutive appends are already contiguous in
+        // `indices`, so merging is just extending index_count — no per-draw
+        // base_vertex bookkeeping needed at replay time.
+        let base_vertex = self.vertices.len() as u32;
         let first_index = self.indices.len() as u32;
         let index_count = mesh.indices.len() as u32;
         self.vertices.extend_from_slice(&mesh.vertices);
-        // Indices stay mesh-local (0-based); draw_indexed applies base_vertex.
-        self.indices.extend_from_slice(&mesh.indices);
+        self.indices
+            .extend(mesh.indices.iter().map(|&i| i + base_vertex));
         MeshRange {
             first_index,
             index_count,
-            base_vertex,
+            base_vertex: 0,
         }
     }
 
@@ -143,6 +165,32 @@ impl PageRecorder {
                 base_vertex,
             },
             image_id,
+            clip_ref: self.clip_depth,
+        });
+    }
+
+    /// Record a glyph-atlas quad (4 textured vertices) at the current clip
+    /// depth. Indices are rebased to absolute (mirroring `append()`, unlike
+    /// `add_image`'s per-quad `base_vertex`) so consecutive glyph quads are
+    /// trivially batchable.
+    pub fn add_glyph_quad(&mut self, quad: [TexturedVertex; 4]) {
+        let base_vertex = self.glyph_vertices.len() as u32;
+        let first_index = self.glyph_indices.len() as u32;
+        self.glyph_vertices.extend_from_slice(&quad);
+        self.glyph_indices.extend_from_slice(&[
+            base_vertex,
+            base_vertex + 1,
+            base_vertex + 2,
+            base_vertex,
+            base_vertex + 2,
+            base_vertex + 3,
+        ]);
+        self.ops.push(PageOp::Glyph {
+            range: MeshRange {
+                first_index,
+                index_count: 6,
+                base_vertex: 0,
+            },
             clip_ref: self.clip_depth,
         });
     }
@@ -376,5 +424,33 @@ mod tests {
         assert_eq!(r.clip_depth, 1, "empty clip still advances depth");
         // No StampClip op emitted for the empty geometry.
         assert!(!r.ops.iter().any(|o| matches!(o, PageOp::StampClip { .. })));
+    }
+
+    /// End-to-end batching check through the real `add_fill`/`append` path
+    /// (not hand-built `PageOp`s): four unclipped fills — the shape of the
+    /// `rect_fills` GPU-acceptance corpus case — collapse into one draw call,
+    /// and the merged range covers every vertex the four fills produced.
+    #[test]
+    fn unclipped_fills_batch_into_one_draw_call() {
+        let mut r = PageRecorder::default();
+        let m = map();
+        let color = [1.0, 0.0, 0.0, 1.0];
+        r.add_fill(&rect(0.0, 0.0, 10.0, 10.0), FillRule::NonZero, color, &m);
+        r.add_fill(&rect(20.0, 0.0, 30.0, 10.0), FillRule::NonZero, color, &m);
+        r.add_fill(&rect(40.0, 0.0, 50.0, 10.0), FillRule::NonZero, color, &m);
+        r.add_fill(&rect(60.0, 0.0, 70.0, 10.0), FillRule::NonZero, color, &m);
+        assert_eq!(r.ops.len(), 4, "recorded as four separate draws");
+
+        let total_indices = r.indices.len() as u32;
+        let batched = crate::batch::batch_ops(r.ops);
+        assert_eq!(batched.len(), 1, "four unclipped fills batch into one draw");
+        match &batched[0] {
+            PageOp::Draw { range, clip_ref } => {
+                assert_eq!(*clip_ref, 0);
+                assert_eq!(range.first_index, 0);
+                assert_eq!(range.index_count, total_indices, "covers every index");
+            }
+            _ => panic!("expected a merged Draw op"),
+        }
     }
 }

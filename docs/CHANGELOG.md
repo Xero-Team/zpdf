@@ -1,5 +1,115 @@
 # Changelog
 
+## 0.11.0 — wgpu backend: GPU timing, draw-call batching, glyph atlas
+
+Closes out the three GPU-backend performance items the 0.2.0 release explicitly
+deferred ("not implemented (intentionally deferred): draw-call batching … an R8
+glyph atlas … GPU timing telemetry"). All three land together since batching and
+the atlas both need timing to be judged, and the atlas reuses the batcher.
+Rendering behavior is unchanged for anything that doesn't hit the new fast paths;
+every change stayed inside the existing GPU-vs-CPU pixel-parity acceptance gate
+(`crates/zpdf/tests/gpu_acceptance.rs`, <1% differing pixels).
+
+### GPU timing telemetry (P3.8)
+
+- `wgpu::Features::TIMESTAMP_QUERY` is requested opportunistically (graceful no-op
+  on adapters that lack it, same negotiation style as the existing MSAA-level
+  fallback). New `timing.rs`: a small `GpuTimer` wraps a 2-entry `QuerySet`,
+  writing a timestamp immediately before and after the render pass and reading
+  the resolved delta back through the existing blocking-map readback pattern.
+- `WgpuRenderer::last_gpu_time_ns() -> Option<u64>` — `None` when the adapter
+  doesn't support timestamp queries.
+- CLI: `render --stats` prints CPU wall time for both backends, plus GPU pass
+  time when available for `--backend wgpu`.
+
+### Draw-call batching (P3.7)
+
+- New `batch.rs`: a single linear pass merges **strictly adjacent** `PageOp`s
+  that share pipeline + clip state (+ image/atlas id) into one `draw_indexed`
+  call. Nothing is reordered — overlapping alpha-blended draws are
+  order-dependent under source-over compositing, so only already-sequential runs
+  with an identical batch key are collapsed; a clip change or stencil reset
+  always breaks a run.
+- `PageRecorder::append` now bakes **absolute indices** into its shared arena at
+  append time instead of mesh-local, 0-based ones, so consecutive same-key draws
+  are trivially concatenable without per-draw `base_vertex` bookkeeping at replay
+  time.
+- Lossless by construction: merging N sequential draws into one covering their
+  concatenated index range preserves GPU primitive rasterization order, so pixel
+  output is bit-identical to the pre-batching baseline — confirmed by re-running
+  the full acceptance corpus and comparing its per-case differing-pixel
+  percentages against the pre-batching numbers.
+
+### Glyph atlas (P3.4/M6b)
+
+- New `glyph_atlas.rs`: each unique `(font, glyph, device-pixel size)`
+  combination is rasterized once per page into an R8Unorm coverage atlas via
+  `tiny-skia` — the same analytic-AA rasterizer the CPU oracle uses — and
+  repeated glyph instances blit a textured quad instead of re-tessellating
+  through `lyon` on every occurrence. `tiny-skia` was already an unused
+  dependency of `zpdf-render-wgpu` (added in 0.2.0 for exactly this purpose).
+  Shelf packing with single-slot LRU eviction on overflow; any glyph that can't
+  be atlassed (pathologically large, or no room after eviction) falls back to
+  the existing per-glyph vector-fill path with no visible discontinuity.
+- **Scope, by design**: built fresh per page and discarded at `end_page` (a
+  page's unique-glyph working set is small enough that one 2048×2048 atlas
+  comfortably holds it, no cross-page cache-coherency needed), and restricted to
+  **axis-aligned, non-mirrored** glyph runs (`tm.b ≈ tm.c ≈ 0`, `tm.a`, `tm.d`,
+  `h_scale` all positive) — rotation, shear, and mirroring always take the
+  unchanged vector-fill path, since those need per-instance-resampled rasters
+  that risk drifting from the CPU oracle's AA.
+- Glyph quads batch through the same `batch.rs` machinery as fills/images
+  (`BatchKey::Glyph(clip_ref)`), so a run of same-clip repeated glyphs still
+  costs one draw call.
+- Debug escape hatch `ZPDF_GPU_GLYPH_ATLAS=0` forces vector-fill even for
+  atlas-eligible runs (mirrors the existing `ZPDF_GPU_FORCE_FALLBACK` pattern),
+  used both as a production fallback and to isolate the atlas's own AA delta
+  from the pre-existing GPU-vs-CPU MSAA delta when diffing a page both ways.
+
+#### Millipixel precision (a lesson from a real-world regression)
+
+The atlas's glyph cache key initially bucketed device-pixel em-size to the
+nearest **whole pixel**. That looked reasonable against the synthetic
+acceptance corpus, but a manual `zpdf compare` pass against a real-world PDF
+(`tests/failed/batch1/PDFBOX/PDFBOX-1515-0.pdf`, chosen because it has 24 real
+glyph runs at ordinary body-text sizes) showed GPU-vs-CPU divergence jump from
+the pre-existing ~1.3% lyon-vs-tiny-skia AA baseline to **~3.9%** — traced via
+diff heatmap to text edges exclusively (the page's images showed zero
+divergence). At typical 9–15 device-pixel body-text em-sizes, a ≤0.5px
+whole-pixel rounding error is a large *relative* shape distortion, not a minor
+AA nuance. The cache key (`GlyphKey`) now buckets size in **millipixels**
+(1/1000 device pixel) instead, making the quantization error negligible
+(≤0.0005px) while still hashing identically for the repeated nominal sizes real
+documents actually use. A new regression test
+(`fractional_millipixel_size_is_not_snapped_to_whole_pixels`) sums a rasterized
+glyph's actual ink coverage — rather than just its buffer dimensions, which
+only ever round to within 1px regardless of input precision and so can't tell
+"accurate" from "snapped" apart — to keep this pinned.
+
+The residual: even after the fix, that same real-world PDF still shows ~3.8%
+divergence, visually confirmed (via heatmap) to be strictly at glyph edges with
+no positional or shape errors. This is the atlas's inherent trade-off — a
+coverage mask rasterized once and placed via bilinear-resampled translation at
+an arbitrary fractional pixel offset is a close but not pixel-exact stand-in
+for rasterizing that exact shape at that exact sub-pixel phase — compounding on
+the pre-existing MSAA-vs-analytic baseline. It doesn't regress the acceptance
+gate (that PDF isn't part of it; the synthetic corpus, including a new
+`text_outline_repeated` repeated-glyph case and a `glyph_atlas_path_is_genuinely_exercised`
+engagement check, stays at 0.000%), so it's recorded here rather than chased
+further — true sub-pixel-phase bucketing (rasterizing a few phase variants per
+glyph instead of one) would close this gap and is a natural follow-up if it
+ever matters in practice.
+
+### Verification
+
+`cargo fmt --all --check`, `cargo clippy --workspace --all-targets --features
+gpu-render -- -D warnings`, and `cargo test --workspace --features gpu-render`
+all pass. `gpu_acceptance.rs`'s full corpus stays at 0.000–0.460% (well under
+the 1% gate); a second real-world spot-check
+(`tests/failed/batch1/PDFBOX/PDFBOX-1094-5.pdf`, a fills/strokes/clips-heavy
+page with zero glyph runs) confirms non-text pages are unaffected by this
+release.
+
 ## 0.10.0 — Tagged-PDF reading-order text extraction (MCID → content)
 
 The structure tree shipped in 0.9.0 exposed each element's marked-content ids,

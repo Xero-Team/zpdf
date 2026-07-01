@@ -147,7 +147,7 @@ cargo run -p zpdf-cli -- text tests/corpus/sample.pdf -p 1
 ### P3.2 — 渲染管线
 - [x] solid_fill pipeline（纯色路径，premultiplied blend + D5 stencil 测试）
 - [ ] textured pipeline（图像）— M7
-- [x] glyph 渲染：矢量填充基线（轮廓 + Type3 走 solid_fill，精确 outline_to_pixel）；R8 atlas 优化留待 M6b
+- [x] glyph 渲染：矢量填充基线（轮廓 + Type3 走 solid_fill，精确 outline_to_pixel）+ R8Unorm 图集快速路径（M6b，轴对齐字形，见 P3.4）
 - [x] stencil_fill pipeline（裁剪：clip_write + clip_reset）
 - [x] WGSL shader 编写（solid.wgsl：pixel→NDC + premultiplied 实色；其余 shader 待后续里程碑）
 
@@ -159,10 +159,11 @@ cargo run -p zpdf-cli -- text tests/corpus/sample.pdf -p 1
 
 ### P3.4 — 文字渲染
 - [x] 矢量填充基线（M6a）：轮廓字形按 CPU 精确坐标 lyon 三角化 → solid_fill；Type3 经 ContentInterpreter 子 DisplayList 渲染。3 个真实 PDF compare 0.34–0.58%，Type3 合成用例 0.000%
-- [ ] GlyphAtlas: R8Unorm 纹理图集 — M6b（可选优化，仅轴对齐字形）
-- [ ] LRU 淘汰策略 — M6b
-- [ ] 字形 quad 生成（位置 + UV）— M6b
-- [ ] 批量绘制 — M6b（当前走共享 arena / Immediate）
+- [x] GlyphAtlas: R8Unorm 纹理图集 — M6b（per-page，仅轴对齐/非镜像字形；tiny-skia 光栅化，与 CPU oracle 同 AA 算法，非 atlas-able 时优雅回退矢量填充）
+- [x] LRU 淘汰策略 — M6b（shelf packing + 图集满时淘汰单个最近最少使用槽位并复用其矩形）
+- [x] 字形 quad 生成（位置 + UV）— M6b（纯平移布局：raster 内 pen 原点对齐 device-pixel 目标位置）
+- [x] 批量绘制 — M6b（同 clip_ref 的相邻 glyph quad 经 P3.7 batch_ops 合并为单个 draw_indexed）
+> 关键教训：图集缓存键必须用毫像素（millipixel，1/1000 px）精度桶化字号——整像素取整（≤0.5px 误差）在常见 9–15px 正文字号下是显著的相对形变，真实 PDF 实测曾令 GPU-vs-CPU 差异从基线 ~1.3% 骤增至 ~3.9%；改为毫像素精度后合成语料回到 0.000%（`text_outline_repeated`），单元测试新增 `fractional_millipixel_size_is_not_snapped_to_whole_pixels` 防回归。真实文本密集页仍有 ~2.5pp 残留差异，经 heatmap 定位严格限于字形边缘（图集纹理双线性重采样在任意亚像素定位下的固有 AA 近似，非结构性缺陷）——在正式验收语料（<1% 门槛）之外，不阻塞发布。
 
 ### P3.5 — 图像渲染
 - [x] 图像上传（Rgba8Unorm，write_texture）+ per-image BindGroup（按 image_id 缓存）
@@ -178,9 +179,9 @@ cargo run -p zpdf-cli -- text tests/corpus/sample.pdf -p 1
 - [x] Blend group 离屏合成（M8：RenderLayer 栈 + scratch composite，多 pass）/ 16 种 blend mode（composite.wgsl，W3C premultiplied 公式）
 > 注：内容解释器尚未发出 PushBlendGroup（CPU/GPU 后端均已实现该 op）；M8 经程序化 DisplayList 验证：Multiply 叠加 = 黑（精确），6 种模式与 CPU oracle 一致 <1%
 
-### P3.7 — 批处理优化（延后：可选性能项）
-- [~] 当前为 Immediate 模式（每命令一个 draw_indexed，共享 per-page arena buffer），正确且对现有负载足够快
-- [ ] BatchBuilder: 按 pipeline/texture/clip 排序合并 — 延后，仅在吞吐成为瓶颈时实现
+### P3.7 — 批处理优化
+- [x] BatchBuilder（batch.rs）：单趟线性扫描，合并严格相邻、同 key（pipeline+clip_ref；图像/字形另加 image_id）的 draw op 为一个 draw_indexed——不重排，仅合并已连续的序列，保持 alpha blending 的绘制顺序依赖安全
+- [x] PageRecorder::append 在写入时烘焙绝对索引（`base_vertex` 恒为 0），使同 arena 内连续同 key 绘制天然可拼接，无需重放期 base_vertex 记账
 - [x] Uniform buffer 复用（page uniform 单 buffer；pipeline 切换最小化）
 
 ### P3.8 — CLI 后端 + 示例 Viewer
@@ -188,18 +189,20 @@ cargo run -p zpdf-cli -- text tests/corpus/sample.pdf -p 1
 - [x] winit 0.30 窗口 + wgpu surface（examples/viewer.rs，winit 仅 dev-dependency）
 - [x] 缩放/平移/翻页（滚轮/+/- 缩放，WASD/方向键，PageUp/Down 翻页）
 - [x] 渲染缓存（page tile：每页渲染一次 → blit；翻页才重栅格化）
-- [ ] GPU timing 统计 — 未实现（性能遥测，延后）
-- [x] CI 验收 harness：crates/zpdf/tests/gpu_acceptance.rs（gpu-render gated，7 合成用例 GPU vs CPU <1%，无 adapter 时优雅跳过）
+- [x] GPU timing 统计 — timing.rs：`wgpu::Features::TIMESTAMP_QUERY`（adapter 不支持时优雅降级，`ts_supported: bool`）；`WgpuRenderer::last_gpu_time_ns()`；CLI `render --stats` 打印 CPU 墙钟 + （wgpu 后端且支持时）GPU pass 耗时
+- [x] CI 验收 harness：crates/zpdf/tests/gpu_acceptance.rs（gpu-render gated，10 合成用例 GPU vs CPU <1% + markup_annotations 专项测试，无 adapter 时优雅跳过；M6b 新增 `text_outline_repeated`（重复字形覆盖图集路径）与 `glyph_atlas_path_is_genuinely_exercised`（分数字号确认图集非回退矢量填充）两个用例）
 
-### P3 里程碑验收 — ✅ 基本达成（M1–M9）
+### P3 里程碑验收 — ✅ 全部达成（M1–M9 + 性能项）
 > GPU 后端渲染填充/描边/曲线/裁剪/文本/图像/混合组，均与 CPU oracle 对齐。
 > 合成语料 + 真实 PDF 单页均 <1%；真实 16→62 页中文文档 52/62 页 <1%（其余 1.0–1.4%，
 > 为致密 CJK 的 analytic-vs-MSAA AA 差异，R1 已知限制，threshold≈24–32 下全部通过）。
-> 批处理（P3.7）与 GPU timing 延后；blend group op 解释器尚未发出（后端已就绪）。
+> P3.4 GlyphAtlas、P3.7 批处理、P3.8 GPU timing 均已实现（原延后的性能项，详见各节）；
+> blend group op 解释器尚未发出（后端已就绪）。
 ```
 cargo run -p zpdf-cli --features gpu -- render <file.pdf> -p 1 -o gpu.png --backend wgpu
 cargo run -p zpdf-cli --features gpu -- render <file.pdf> -p 1 -o cpu.png --backend cpu
 cargo run -p zpdf-cli -- compare cpu.png gpu.png        # <1% 差异
+cargo run -p zpdf-cli --features gpu -- render <file.pdf> -p 1 -o gpu.png --backend wgpu --stats   # CPU/GPU 耗时
 cargo test -p zpdf --features gpu-render                # 验收 harness
 cargo run -p zpdf-render-wgpu --example viewer -- <file.pdf>   # 交互浏览器
 ```

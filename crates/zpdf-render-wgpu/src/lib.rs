@@ -7,14 +7,17 @@
 //! Status: M1/M2 — headless context, per-page render target, and pixel readback
 //! are implemented; `execute` command arms are no-ops until M4 (fills/strokes).
 
+mod batch;
 mod blend;
 mod context;
 mod glyph;
+mod glyph_atlas;
 mod image;
 mod path;
 mod pipelines;
 mod record;
 mod target;
+mod timing;
 mod transform;
 
 pub use context::{GpuContext, COLOR_FORMAT, STENCIL_FORMAT};
@@ -72,6 +75,11 @@ pub struct WgpuRenderer<'a> {
     #[allow(dead_code)] // consumed in M7 (images)
     image_cache: Option<&'a zpdf_image::ImageCache>,
     page: Option<PageState>,
+    /// GPU pass time (nanoseconds) from the most recently completed
+    /// `end_page()`, or `None` if timestamp queries are unsupported on this
+    /// adapter (see `GpuContext::timestamps_supported`) or no page has
+    /// rendered yet. Purely informational (P3.8) — never affects rendering.
+    last_gpu_time_ns: Option<u64>,
 }
 
 impl<'a> WgpuRenderer<'a> {
@@ -81,6 +89,7 @@ impl<'a> WgpuRenderer<'a> {
             font_cache: None,
             image_cache: None,
             page: None,
+            last_gpu_time_ns: None,
         }
     }
 
@@ -103,6 +112,13 @@ impl<'a> WgpuRenderer<'a> {
     /// Reclaim the context for reuse across renders.
     pub fn take_context(&mut self) -> Option<GpuContext> {
         self.ctx.take()
+    }
+
+    /// GPU pass time (nanoseconds) for the most recently completed page, if
+    /// timestamp queries are supported on this adapter (P3.8). `None` before
+    /// any page has rendered, or when the adapter lacks the capability.
+    pub fn last_gpu_time_ns(&self) -> Option<u64> {
+        self.last_gpu_time_ns
     }
 }
 
@@ -280,6 +296,11 @@ impl<'a> RenderBackend for WgpuRenderer<'a> {
 
         // Fullscreen quad: needed for clip rebuild (ResetStencil) and blend composites.
         let needs_fs = page.recorder.uses_reset() || page.recorder.has_blend_groups();
+        // Presence of ResetStencil/PushBlend/PopBlend is unaffected by batching
+        // (it only merges runs of Draw/Image/StampClip; it never removes or adds
+        // an op of a different kind), so this check is valid whether taken
+        // before or after `batch::batch_ops` below.
+        let has_blend_groups = page.recorder.has_blend_groups();
         let fs_range = if needs_fs {
             Some(
                 page.recorder
@@ -288,6 +309,12 @@ impl<'a> RenderBackend for WgpuRenderer<'a> {
         } else {
             None
         };
+
+        // Collapse consecutive same-state ops into single draw_indexed calls
+        // (P3.7). Must happen before `rec` borrows `page.recorder` below (this
+        // takes `page.recorder.ops` by value, leaving an empty Vec in its place
+        // — irrelevant, since every remaining use goes through `batched_ops`).
+        let batched_ops = batch::batch_ops(std::mem::take(&mut page.recorder.ops));
 
         // Page uniform + bind group (pixel->NDC params).
         let uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -339,6 +366,29 @@ impl<'a> RenderBackend for WgpuRenderer<'a> {
             Some((vbuf, ibuf))
         };
 
+        // Glyph-atlas quad buffers (own arena) + the page's single atlas
+        // texture bind group — uploaded once here, shared by every Glyph op.
+        let glyph_buffers = if rec.glyph_indices.is_empty() {
+            None
+        } else {
+            let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("zpdf-glyph-vbuf"),
+                contents: bytemuck::cast_slice(&rec.glyph_vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+            let ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("zpdf-glyph-ibuf"),
+                contents: bytemuck::cast_slice(&rec.glyph_indices),
+                usage: wgpu::BufferUsages::INDEX,
+            });
+            Some((vbuf, ibuf))
+        };
+        let glyph_bg = if rec.glyph_atlas.is_empty() {
+            None
+        } else {
+            Some(glyph_atlas::upload_atlas_bind_group(ctx, &rec.glyph_atlas))
+        };
+
         let mut tex_bgs: std::collections::HashMap<u32, wgpu::BindGroup> =
             std::collections::HashMap::new();
         if let Some(images) = self.image_cache {
@@ -367,7 +417,7 @@ impl<'a> RenderBackend for WgpuRenderer<'a> {
             // mask group may itself contain a masked group whose images are
             // recorded into a sub-mask's `ops` (not the flat page op list), so a
             // one-level scan would silently drop them at replay.
-            let mut stack: Vec<&[PageOp]> = vec![rec.ops.as_slice()];
+            let mut stack: Vec<&[PageOp]> = vec![batched_ops.as_slice()];
             while let Some(ops) = stack.pop() {
                 for op in ops {
                     match op {
@@ -386,18 +436,26 @@ impl<'a> RenderBackend for WgpuRenderer<'a> {
             solid: buffers.as_ref().map(|(v, i)| (v, i)),
             tex: tex_buffers.as_ref().map(|(v, i)| (v, i)),
             tex_bgs: &tex_bgs,
+            glyph: glyph_buffers.as_ref().map(|(v, i)| (v, i)),
+            glyph_bg: glyph_bg.as_ref(),
             fs_range,
         };
 
+        let timer = timing::GpuTimer::new(ctx);
+
         // Pages with transparency groups need the multi-pass offscreen-layer path.
-        if rec.has_blend_groups() {
-            return render_layered(ctx, &page.target, page.clear, &rec.ops, &res);
+        if has_blend_groups {
+            let (texture, gpu_ns) =
+                render_layered(ctx, &page.target, page.clear, &batched_ops, &res, &timer)?;
+            self.last_gpu_time_ns = gpu_ns;
+            return Ok(texture);
         }
 
         // Single-pass path (no blend groups): one render pass into the page target.
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("zpdf-page"),
         });
+        timer.write_begin(&mut encoder);
         {
             let color_att = page.target.color_attachment(page.clear);
             let ds_att = page.target.stencil_attachment();
@@ -409,11 +467,14 @@ impl<'a> RenderBackend for WgpuRenderer<'a> {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            replay_ops(&mut pass, &rec.ops, &res);
+            replay_ops(&mut pass, &batched_ops, &res);
         }
+        timer.write_end(&mut encoder);
+        timer.record_resolve(&mut encoder);
         page.target.record_copy(&mut encoder);
         ctx.queue.submit(Some(encoder.finish()));
         let result = page.target.map_and_strip(device);
+        self.last_gpu_time_ns = timer.resolve_ns(device);
         if let Some(msg) = ctx.take_error() {
             return Err(WgpuRenderError::Wgpu(format!("device error: {msg}")));
         }
@@ -428,6 +489,10 @@ struct ReplayRes<'a> {
     solid: Option<(&'a wgpu::Buffer, &'a wgpu::Buffer)>,
     tex: Option<(&'a wgpu::Buffer, &'a wgpu::Buffer)>,
     tex_bgs: &'a std::collections::HashMap<u32, wgpu::BindGroup>,
+    /// Glyph-atlas quad buffers, present iff any glyph took the atlas path.
+    glyph: Option<(&'a wgpu::Buffer, &'a wgpu::Buffer)>,
+    /// The page's single atlas texture bind group (no per-op id, unlike `tex_bgs`).
+    glyph_bg: Option<&'a wgpu::BindGroup>,
     fs_range: Option<record::MeshRange>,
 }
 
@@ -455,6 +520,27 @@ fn replay_ops(pass: &mut wgpu::RenderPass, ops: &[PageOp], res: &ReplayRes) {
                     pass.set_vertex_buffer(0, tvb.slice(..));
                     pass.set_index_buffer(tib.slice(..), wgpu::IndexFormat::Uint32);
                     bound = BufSet::Tex;
+                }
+                pass.set_bind_group(1, Some(bg1), &[]);
+                pass.set_stencil_reference(*clip_ref);
+                pass.draw_indexed(
+                    range.first_index..range.first_index + range.index_count,
+                    range.base_vertex,
+                    0..1,
+                );
+            }
+            PageOp::Glyph { range, clip_ref } => {
+                let (Some((gvb, gib)), Some(bg1)) = (res.glyph, res.glyph_bg) else {
+                    continue; // no glyph took the atlas path this page
+                };
+                if cur != Pipe::Glyph {
+                    pass.set_pipeline(&res.pipelines.glyph);
+                    cur = Pipe::Glyph;
+                }
+                if bound != BufSet::Glyph {
+                    pass.set_vertex_buffer(0, gvb.slice(..));
+                    pass.set_index_buffer(gib.slice(..), wgpu::IndexFormat::Uint32);
+                    bound = BufSet::Glyph;
                 }
                 pass.set_bind_group(1, Some(bg1), &[]);
                 pass.set_stencil_reference(*clip_ref);
@@ -886,7 +972,8 @@ fn render_layered(
     page_clear: wgpu::Color,
     ops: &[PageOp],
     res: &ReplayRes,
-) -> Result<GpuTexture, WgpuRenderError> {
+    timer: &timing::GpuTimer,
+) -> Result<(GpuTexture, Option<u64>), WgpuRenderError> {
     let device = &ctx.device;
     let (w, h, sc) = (target.width, target.height, target.sample_count);
 
@@ -899,6 +986,7 @@ fn render_layered(
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("zpdf-layered"),
     });
+    timer.write_begin(&mut encoder);
 
     // Initialize the base layer (page background, no clips).
     {
@@ -921,13 +1009,16 @@ fn render_layered(
         &mut keep_bgs,
         &mut keep_bufs,
     );
+    timer.write_end(&mut encoder);
+    timer.record_resolve(&mut encoder);
     target.record_copy_from(&mut encoder, pool.get(final_layer).sampleable_texture());
     ctx.queue.submit(Some(encoder.finish()));
     let result = target.map_and_strip(device);
+    let gpu_ns = timer.resolve_ns(device);
     if let Some(msg) = ctx.take_error() {
         return Err(WgpuRenderError::Wgpu(format!("device error: {msg}")));
     }
-    result
+    result.map(|tex| (tex, gpu_ns))
 }
 
 /// Uniform for the mask-apply pass. Mirrors `MaskU` in `mask_apply.wgsl`: the
@@ -1101,12 +1192,14 @@ enum Pipe {
     ClipWrite,
     ClipReset,
     Textured,
+    Glyph,
 }
 
-/// Tracks which vertex/index buffer pair is bound (solid arena vs textured arena).
+/// Tracks which vertex/index buffer pair is bound (solid arena vs textured vs glyph arena).
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum BufSet {
     None,
     Solid,
     Tex,
+    Glyph,
 }
