@@ -1,0 +1,76 @@
+# cargo-fuzz harness for zpdf. This is a SEPARATE crate, deliberately detached
+# from the parent workspace (its own empty `[workspace]` table below + an
+# `exclude = ["fuzz"]` in the root Cargo.toml) so the nightly-only, sanitizer-
+# instrumented fuzz build never contaminates the normal `cargo build`/`test`.
+#
+# Usage (nightly required — libFuzzer needs `-Z` flags):
+#   cargo +nightly fuzz list
+#   cargo +nightly fuzz build
+#   cargo +nightly fuzz run lexer          -- -max_total_time=60
+#   cargo +nightly fuzz run object_parser  -- -max_total_time=60
+#   cargo +nightly fuzz run filters        -- -max_total_time=60
+#   cargo +nightly fuzz run content_tokenizer -- -max_total_time=60
+#   cargo +nightly fuzz run parse_pdf      -- -max_total_time=60
+#
+# On platforms without a working AddressSanitizer (e.g. some Windows setups),
+# add `-s none` to disable the sanitizer: `cargo +nightly fuzz run -s none lexer`.
+
+[package]
+name = "zpdf-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+zpdf-core = { path = "../crates/zpdf-core" }
+zpdf-parser = { path = "../crates/zpdf-parser" }
+zpdf-content = { path = "../crates/zpdf-content" }
+
+# Detach from the parent workspace: this makes `fuzz/` its own workspace root.
+[workspace]
+
+# Fuzz targets are release-optimized with debug assertions on so overflow
+# checks and `debug_assert!`s fire during fuzzing.
+[profile.release]
+debug = 1
+debug-assertions = true
+overflow-checks = true
+
+[[bin]]
+name = "lexer"
+path = "fuzz_targets/lexer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "object_parser"
+path = "fuzz_targets/object_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "filters"
+path = "fuzz_targets/filters.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "content_tokenizer"
+path = "fuzz_targets/content_tokenizer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_pdf"
+path = "fuzz_targets/parse_pdf.rs"
+test = false
+doc = false
+bench = false

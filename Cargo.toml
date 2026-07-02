@@ -16,6 +16,9 @@ members = [
     "crates/zpdf-viewer-gpui",
     "crates/zpdf-cli",
 ]
+# The cargo-fuzz harness is a detached crate (nightly + sanitizer-only). Keep it
+# out of the normal workspace so `cargo build`/`test`/`clippy` never touch it.
+exclude = ["fuzz"]
 
 [workspace.package]
 edition = "2021"
