@@ -140,13 +140,13 @@ cargo run -p zpdf-cli -- text tests/corpus/sample.pdf -p 1
 
 ### P3.1 — wgpu 上下文
 - [x] WgpuContext: Instance/Adapter/Device/Queue（headless，pollster 阻塞）
-- [ ] Surface 配置（窗口模式）— 留待 viewer (M9)
+- [x] Surface 配置（窗口模式）— examples/viewer.rs（winit 0.30 + surface）与 zpdf-viewer-gpui 已实现
 - [x] Offscreen 渲染（headless）— PageTarget + copy_texture_to_buffer 回读
 - [x] MSAA 支持（4x/1x 协商，含 Stencil8 同采样数）
 
 ### P3.2 — 渲染管线
 - [x] solid_fill pipeline（纯色路径，premultiplied blend + D5 stencil 测试）
-- [ ] textured pipeline（图像）— M7
+- [x] textured pipeline（图像）— M7 已实现（见 P3.5：Rgba8Unorm 上传 + per-image BindGroup）
 - [x] glyph 渲染：矢量填充基线（轮廓 + Type3 走 solid_fill，精确 outline_to_pixel）+ R8Unorm 图集快速路径（M6b，轴对齐字形，见 P3.4）
 - [x] stencil_fill pipeline（裁剪：clip_write + clip_reset）
 - [x] WGSL shader 编写（solid.wgsl：pixel→NDC + premultiplied 实色；其余 shader 待后续里程碑）
@@ -177,7 +177,7 @@ cargo run -p zpdf-cli -- text tests/corpus/sample.pdf -p 1
 - [x] Alpha blending (Normal blend mode)（premultiplied source-over）
 - [x] Premultiplied alpha 管线
 - [x] Blend group 离屏合成（M8：RenderLayer 栈 + scratch composite，多 pass）/ 16 种 blend mode（composite.wgsl，W3C premultiplied 公式）
-> 注：内容解释器尚未发出 PushBlendGroup（CPU/GPU 后端均已实现该 op）；M8 经程序化 DisplayList 验证：Multiply 叠加 = 黑（精确），6 种模式与 CPU oracle 一致 <1%
+> 注：内容解释器已发出 PushBlendGroup（/BM → 双后端生效，见 P4.3）；M8 经程序化 DisplayList 验证：Multiply 叠加 = 黑（精确），6 种模式与 CPU oracle 一致 <1%
 
 ### P3.7 — 批处理优化
 - [x] BatchBuilder（batch.rs）：单趟线性扫描，合并严格相邻、同 key（pipeline+clip_ref；图像/字形另加 image_id）的 draw op 为一个 draw_indexed——不重排，仅合并已连续的序列，保持 alpha blending 的绘制顺序依赖安全
@@ -197,7 +197,7 @@ cargo run -p zpdf-cli -- text tests/corpus/sample.pdf -p 1
 > 合成语料 + 真实 PDF 单页均 <1%；真实 16→62 页中文文档 52/62 页 <1%（其余 1.0–1.4%，
 > 为致密 CJK 的 analytic-vs-MSAA AA 差异，R1 已知限制，threshold≈24–32 下全部通过）。
 > P3.4 GlyphAtlas、P3.7 批处理、P3.8 GPU timing 均已实现（原延后的性能项，详见各节）；
-> blend group op 解释器尚未发出（后端已就绪）。
+> blend group op 已由解释器发出（P4.3，双后端生效）。
 ```
 cargo run -p zpdf-cli --features gpu -- render <file.pdf> -p 1 -o gpu.png --backend wgpu
 cargo run -p zpdf-cli --features gpu -- render <file.pdf> -p 1 -o cpu.png --backend cpu
