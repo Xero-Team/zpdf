@@ -8,6 +8,7 @@ use zpdf_font::FontCache;
 use zpdf_image::ImageCache;
 use zpdf_parser::PdfFile;
 
+use crate::tables::RuleLine;
 use crate::text::TextSpan;
 use crate::tokenizer::{ContentToken, ContentTokenizer};
 
@@ -58,6 +59,10 @@ pub struct ContentInterpreter<'a> {
     /// form cannot corrupt the page-level state.
     state_floor: usize,
     text_sink: Option<&'a mut Vec<TextSpan>>,
+    /// Collect drawn ruled lines (thin axis-aligned strokes/rect fills) for
+    /// table detection. Like `text_sink`, only meaningful during extraction —
+    /// installing it never changes the emitted display list.
+    rule_sink: Option<&'a mut Vec<RuleLine>>,
     /// The CTM at page-content start (identity or the baked page rotation).
     /// Pattern space is anchored to this, not to the CTM at fill time.
     base_ctm: Matrix,
@@ -464,6 +469,7 @@ impl<'a> ContentInterpreter<'a> {
             form_depth: 0,
             state_floor: 0,
             text_sink: None,
+            rule_sink: None,
             base_ctm: Matrix::identity(),
             suppress_color_ops: false,
             oc_config: None,
@@ -571,6 +577,15 @@ impl<'a> ContentInterpreter<'a> {
     /// to building the display list.
     pub fn with_text_sink(mut self, sink: &'a mut Vec<TextSpan>) -> Self {
         self.text_sink = Some(sink);
+        self
+    }
+
+    /// Collect drawn ruled lines — thin axis-aligned strokes and thin filled
+    /// rectangles, in page space — for ruled-line-aware table detection
+    /// ([`crate::tables::detect_tables_with_rules`]). Like the text sink, this
+    /// is extraction-only: it never changes the emitted display list.
+    pub fn with_rule_sink(mut self, sink: &'a mut Vec<RuleLine>) -> Self {
+        self.rule_sink = Some(sink);
         self
     }
 
@@ -3552,6 +3567,185 @@ impl<'a> ContentInterpreter<'a> {
         }
     }
 
+    /// Max page-space thickness (stroke width, or a filled rect's short side)
+    /// for a mark to count as a ruled line, and max rules captured per page.
+    const RULE_MAX_THICKNESS: f64 = 3.0;
+    const RULE_MAX_COUNT: usize = 20_000;
+    /// Min length for a captured rule — shorter marks are dashes/ticks/glyph
+    /// underlines, not table grid lines.
+    const RULE_MIN_LEN: f64 = 8.0;
+
+    /// True when rule capture is active for this drawing op: a sink is
+    /// installed, capacity remains, the mark is visible (not an OC-hidden
+    /// layer), and we are on the page proper (not replicating tiling cells,
+    /// whose ruled art would flood the sink with per-tile duplicates).
+    fn rules_active(&self) -> bool {
+        match &self.rule_sink {
+            Some(sink) => {
+                sink.len() < Self::RULE_MAX_COUNT
+                    && !self.oc_suppressed()
+                    && self.soft_mask_reuse.is_none()
+            }
+            None => false,
+        }
+    }
+
+    /// Capture axis-aligned segments of a stroked page-space path as ruled
+    /// lines, when the stroke is thin enough to be a rule.
+    fn capture_stroke_rules(&mut self, page_path: &Path) {
+        if !self.rules_active() {
+            return;
+        }
+        let width = (self.current.line_width * self.ctm_scale_factor()) as f64;
+        if !(0.0..=Self::RULE_MAX_THICKNESS).contains(&width) {
+            return;
+        }
+        let mut rules: Vec<RuleLine> = Vec::new();
+        let mut cur: Option<Point> = None;
+        let mut start: Option<Point> = None;
+        for elem in &page_path.elements {
+            match *elem {
+                PathElement::MoveTo(p) => {
+                    cur = Some(p);
+                    start = Some(p);
+                }
+                PathElement::LineTo(p) => {
+                    if let Some(from) = cur {
+                        Self::push_segment_rule(&mut rules, from, p);
+                    }
+                    cur = Some(p);
+                }
+                PathElement::CurveTo(_, _, p) => cur = Some(p), // curves are not rules
+                PathElement::Close => {
+                    if let (Some(from), Some(to)) = (cur, start) {
+                        Self::push_segment_rule(&mut rules, from, to);
+                    }
+                    cur = start;
+                }
+            }
+        }
+        if let Some(sink) = self.rule_sink.as_mut() {
+            let room = Self::RULE_MAX_COUNT.saturating_sub(sink.len());
+            sink.extend(rules.into_iter().take(room));
+        }
+    }
+
+    /// Capture a filled page-space path as ruled lines when it consists of
+    /// thin axis-aligned rectangles (rules are often drawn with `re f`, not a
+    /// stroke). Each 4/5-element rect subpath with a short side within the
+    /// thickness cap becomes one rule along its long side's midline.
+    fn capture_fill_rules(&mut self, page_path: &Path) {
+        if !self.rules_active() {
+            return;
+        }
+        let mut rules: Vec<RuleLine> = Vec::new();
+        // Walk subpaths, tracking an axis-aligned bbox and point count; a
+        // subpath containing a curve disqualifies itself.
+        let (mut n, mut curved) = (0usize, false);
+        let (mut bx0, mut by0, mut bx1, mut by1) = (
+            f64::INFINITY,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NEG_INFINITY,
+        );
+        let flush = |n: &mut usize,
+                     curved: &mut bool,
+                     bx0: &mut f64,
+                     by0: &mut f64,
+                     bx1: &mut f64,
+                     by1: &mut f64,
+                     rules: &mut Vec<RuleLine>| {
+            if *n >= 4 && !*curved && bx1 >= bx0 && by1 >= by0 {
+                let w = *bx1 - *bx0;
+                let h = *by1 - *by0;
+                if h <= Self::RULE_MAX_THICKNESS && w >= Self::RULE_MIN_LEN {
+                    rules.push(RuleLine {
+                        vertical: false,
+                        pos: (*by0 + *by1) / 2.0,
+                        start: *bx0,
+                        end: *bx1,
+                    });
+                } else if w <= Self::RULE_MAX_THICKNESS && h >= Self::RULE_MIN_LEN {
+                    rules.push(RuleLine {
+                        vertical: true,
+                        pos: (*bx0 + *bx1) / 2.0,
+                        start: *by0,
+                        end: *by1,
+                    });
+                }
+            }
+            (*n, *curved) = (0, false);
+            (*bx0, *by0, *bx1, *by1) = (
+                f64::INFINITY,
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+                f64::NEG_INFINITY,
+            );
+        };
+        for elem in &page_path.elements {
+            match *elem {
+                PathElement::MoveTo(p) => {
+                    flush(
+                        &mut n,
+                        &mut curved,
+                        &mut bx0,
+                        &mut by0,
+                        &mut bx1,
+                        &mut by1,
+                        &mut rules,
+                    );
+                    n = 1;
+                    (bx0, by0, bx1, by1) = (p.x, p.y, p.x, p.y);
+                }
+                PathElement::LineTo(p) => {
+                    n += 1;
+                    bx0 = bx0.min(p.x);
+                    by0 = by0.min(p.y);
+                    bx1 = bx1.max(p.x);
+                    by1 = by1.max(p.y);
+                }
+                PathElement::CurveTo(..) => curved = true,
+                PathElement::Close => {}
+            }
+        }
+        flush(
+            &mut n,
+            &mut curved,
+            &mut bx0,
+            &mut by0,
+            &mut bx1,
+            &mut by1,
+            &mut rules,
+        );
+        if let Some(sink) = self.rule_sink.as_mut() {
+            let room = Self::RULE_MAX_COUNT.saturating_sub(sink.len());
+            sink.extend(rules.into_iter().take(room));
+        }
+    }
+
+    /// Append `from → to` as a rule if it is axis-aligned (within a hair) and
+    /// long enough to be a grid line rather than a tick.
+    fn push_segment_rule(rules: &mut Vec<RuleLine>, from: Point, to: Point) {
+        const AXIS_TOL: f64 = 0.5; // page-space units of allowed skew
+        let dx = (to.x - from.x).abs();
+        let dy = (to.y - from.y).abs();
+        if dy <= AXIS_TOL && dx >= Self::RULE_MIN_LEN {
+            rules.push(RuleLine {
+                vertical: false,
+                pos: (from.y + to.y) / 2.0,
+                start: from.x.min(to.x),
+                end: from.x.max(to.x),
+            });
+        } else if dx <= AXIS_TOL && dy >= Self::RULE_MIN_LEN {
+            rules.push(RuleLine {
+                vertical: true,
+                pos: (from.x + to.x) / 2.0,
+                start: from.y.min(to.y),
+                end: from.y.max(to.y),
+            });
+        }
+    }
+
     fn paint_stroke(&mut self) {
         let path = std::mem::take(&mut self.current_path);
         if path.is_empty() {
@@ -3585,6 +3779,7 @@ impl<'a> ContentInterpreter<'a> {
     /// stroke (shading patterns fall back to the precomputed average colour when
     /// the region is degenerate).
     fn emit_stroke(&mut self, page_path: Path) {
+        self.capture_stroke_rules(&page_path);
         // A `/None` (or all-`None` DeviceN) stroke colour space produces no marks.
         if cs_produces_no_marks(&self.current.stroke_cs) {
             return;
@@ -3657,6 +3852,7 @@ impl<'a> ContentInterpreter<'a> {
     /// (tiling or shading) is clipped to the path; everything else is a solid
     /// fill.
     fn fill_page_path(&mut self, page_path: Path, rule: FillRule) {
+        self.capture_fill_rules(&page_path);
         // A `/None` (or all-`None` DeviceN) fill colour space produces no marks.
         if cs_produces_no_marks(&self.current.fill_cs) {
             return;
@@ -4719,6 +4915,64 @@ mod tests {
         let page_rect = Rect::new(0.0, 0.0, 612.0, 792.0);
         let dl = ContentInterpreter::new(page_rect).interpret(content);
         assert_eq!(dl.commands.len(), 2);
+    }
+
+    // ---- Ruled-line capture (rule sink for table detection) ----
+
+    #[test]
+    fn rule_sink_captures_thin_strokes_and_rect_fills() {
+        let page_rect = Rect::new(0.0, 0.0, 612.0, 792.0);
+        // A horizontal stroked line, a vertical stroked line, a thin filled
+        // rect (horizontal rule drawn with `re f`), and a fat rect (not a rule).
+        let content = b"0.5 w 50 700 m 400 700 l S \
+                        200 600 m 200 750 l S \
+                        50 649.6 350 0.8 re f \
+                        50 100 200 300 re f";
+        let mut rules: Vec<RuleLine> = Vec::new();
+        let dl = ContentInterpreter::new(page_rect)
+            .with_rule_sink(&mut rules)
+            .interpret(content);
+        assert_eq!(rules.len(), 3, "two strokes + one thin rect: {rules:?}");
+        assert!(!rules[0].vertical && (rules[0].pos - 700.0).abs() < 0.01);
+        assert!(rules[1].vertical && (rules[1].pos - 200.0).abs() < 0.01);
+        assert!(!rules[2].vertical && (rules[2].pos - 650.0).abs() < 0.01);
+        assert!((rules[2].start - 50.0).abs() < 0.01 && (rules[2].end - 400.0).abs() < 0.01);
+        // Rendering output is untouched: 2 strokes + 2 fills.
+        assert_eq!(dl.commands.len(), 4);
+    }
+
+    #[test]
+    fn rule_sink_ignores_thick_strokes_curves_and_short_ticks() {
+        let page_rect = Rect::new(0.0, 0.0, 612.0, 792.0);
+        let content = b"8 w 50 700 m 400 700 l S \
+                        0.5 w 50 600 m 100 650 l S \
+                        50 500 m 60 520 70 540 80 560 c S \
+                        50 400 m 54 400 l S";
+        let mut rules: Vec<RuleLine> = Vec::new();
+        ContentInterpreter::new(page_rect)
+            .with_rule_sink(&mut rules)
+            .interpret(content);
+        assert!(
+            rules.is_empty(),
+            "thick/diagonal/curved/short marks are not rules: {rules:?}"
+        );
+    }
+
+    #[test]
+    fn rule_sink_does_not_change_display_list() {
+        let page_rect = Rect::new(0.0, 0.0, 612.0, 792.0);
+        let content = b"0.5 w 50 700 m 400 700 l S 50 649.6 350 0.8 re f";
+        let without = ContentInterpreter::new(page_rect).interpret(content);
+        let mut rules: Vec<RuleLine> = Vec::new();
+        let with = ContentInterpreter::new(page_rect)
+            .with_rule_sink(&mut rules)
+            .interpret(content);
+        assert_eq!(
+            format!("{:?}", without.commands),
+            format!("{:?}", with.commands),
+            "rule sink must not change render commands"
+        );
+        assert!(!rules.is_empty());
     }
 
     // ---- Output intents: DeviceCMYK colour-managed through /DestOutputProfile ----

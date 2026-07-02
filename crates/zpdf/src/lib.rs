@@ -1,7 +1,7 @@
 pub use zpdf_color::{IccCache, IccTransform};
 pub use zpdf_content::interpreter::ContentInterpreter;
 pub use zpdf_content::output_intent_cmyk_profile;
-pub use zpdf_content::tables::{detect_tables, Table};
+pub use zpdf_content::tables::{detect_tables, detect_tables_with_rules, RuleLine, Table};
 pub use zpdf_content::text::{spans_to_text, struct_ordered_text, TextSpan};
 pub use zpdf_core::*;
 pub use zpdf_display_list as display_list;

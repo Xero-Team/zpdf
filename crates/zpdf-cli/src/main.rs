@@ -1006,17 +1006,19 @@ fn cmd_tables(args: &[String]) -> zpdf::Result<()> {
         let mut image_cache = zpdf::ImageCache::new();
 
         let mut spans: Vec<zpdf::TextSpan> = Vec::new();
+        let mut rules: Vec<zpdf::RuleLine> = Vec::new();
         {
             let interpreter = zpdf::ContentInterpreter::new(page.effective_box())
                 .with_fonts(&mut font_cache)
                 .with_document(doc.file(), &page.resources)
                 .with_images(&mut image_cache)
                 .with_colors(&mut icc_cache)
-                .with_text_sink(&mut spans);
+                .with_text_sink(&mut spans)
+                .with_rule_sink(&mut rules);
             let _ = interpreter.interpret(&content_bytes);
         }
 
-        let tables = zpdf::detect_tables(&spans);
+        let tables = zpdf::detect_tables_with_rules(&spans, &rules);
         if all {
             println!("===== Page {} ({} table(s)) =====", pi + 1, tables.len());
         }

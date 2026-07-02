@@ -2,20 +2,25 @@
 //!
 //! PDF has no table model — a "table" is just text and (sometimes) ruled lines
 //! laid out on a grid — so tabular structure has to be recovered heuristically.
-//! This detector is purely **alignment-based**: it groups spans into baseline
-//! rows, segments the page into vertical bands at large gaps, and within each
-//! band looks for clean vertical **gutters** — x-ranges that (almost) no text
-//! crosses across the band's rows. Gutters that recur down a band are column
-//! separators; a band with two or more columns over several rows is reported as
-//! a [`Table`].
+//! The base detector ([`detect_tables`]) is purely **alignment-based**: it
+//! groups spans into baseline rows, segments the page into vertical bands at
+//! large gaps, and within each band looks for clean vertical **gutters** —
+//! x-ranges that (almost) no text crosses across the band's rows. Gutters that
+//! recur down a band are column separators; a band with two or more columns
+//! over several rows is reported as a [`Table`].
+//!
+//! [`detect_tables_with_rules`] additionally consumes the page's drawn ruled
+//! lines ([`RuleLine`], captured by the interpreter's rule sink): a vertical
+//! rule spanning a band is a **forced column separator**, and a band whose
+//! columns come from drawn rules skips the prose-fill guard — a drawn grid is
+//! direct evidence of tabular intent.
 //!
 //! Because ordinary prose fills the line width, it *crosses* any candidate
 //! gutter and so disqualifies itself — which keeps the false-positive rate low
 //! without needing the page's ruled lines.
 //!
-//! Known limitations (all shared by purely text-based detectors, and all
-//! improvable with ruling-line capture from the interpreter — a natural future
-//! refinement):
+//! Known limitations (all shared by purely text-based detectors; ruled-line
+//! capture mitigates but does not remove them):
 //! - A wrapped multi-line cell is read as separate rows (its continuation line
 //!   becomes a row with the leading columns empty); cells are not re-joined.
 //! - A short, left-aligned header sitting entirely to one side of a
@@ -31,6 +36,37 @@
 use std::cmp::Ordering;
 
 use crate::text::TextSpan;
+
+/// An axis-aligned ruled line captured from page content (a thin stroke or a
+/// thin filled rectangle), in PDF user space (y-up). Produced by running the
+/// interpreter with [`ContentInterpreter::with_rule_sink`]; consumed by
+/// [`detect_tables_with_rules`] as drawn table-grid evidence.
+///
+/// [`ContentInterpreter::with_rule_sink`]: crate::interpreter::ContentInterpreter::with_rule_sink
+#[derive(Debug, Clone, Copy)]
+pub struct RuleLine {
+    /// `true` for a vertical rule (constant x), `false` for horizontal.
+    pub vertical: bool,
+    /// The constant coordinate: x for a vertical rule, y for a horizontal one.
+    pub pos: f64,
+    /// Extent start along the rule's axis (y for vertical, x for horizontal);
+    /// always ≤ `end`.
+    pub start: f64,
+    /// Extent end along the rule's axis.
+    pub end: f64,
+}
+
+impl RuleLine {
+    /// Length of the rule along its axis.
+    pub fn len(&self) -> f64 {
+        self.end - self.start
+    }
+
+    /// True when the rule has no extent.
+    pub fn is_empty(&self) -> bool {
+        self.end <= self.start
+    }
+}
 
 /// A detected table: a grid of cell strings plus the column/row separator
 /// positions in PDF user space (y-up).
@@ -149,10 +185,27 @@ const PROSE_FILL: f64 = 0.80;
 /// full-width spanning row (a title, caption or subtotal drawn as one string);
 /// it abstains from the column-gutter vote so it cannot erase a separator.
 const SPAN_FULL: f64 = 0.9;
+/// Ruled-line inputs beyond this are ignored (anti-adversarial bound).
+const MAX_RULES: usize = 20_000;
+/// A vertical rule must cover at least this fraction of a band's height to be
+/// trusted as a drawn column separator for that band.
+const RULE_COVER: f64 = 0.5;
 
 /// Detect tables among a page's extracted text spans (in PDF user space, y-up).
 /// Returns one [`Table`] per detected grid, in top-to-bottom page order.
 pub fn detect_tables(spans: &[TextSpan]) -> Vec<Table> {
+    detect_tables_with_rules(spans, &[])
+}
+
+/// [`detect_tables`], additionally informed by drawn ruled lines (captured via
+/// [`ContentInterpreter::with_rule_sink`]). Vertical rules that span a band act
+/// as **forced column separators** — they establish columns even where the text
+/// alone leaves no clean whitespace gutter — and a band whose columns come from
+/// drawn rules skips the prose-fill guard (a drawn grid is stronger evidence
+/// than cell-width statistics). With no rules this is exactly [`detect_tables`].
+///
+/// [`ContentInterpreter::with_rule_sink`]: crate::interpreter::ContentInterpreter::with_rule_sink
+pub fn detect_tables_with_rules(spans: &[TextSpan], rules: &[RuleLine]) -> Vec<Table> {
     // Drop empty and non-finite spans up front: a NaN x/y/advance would make the
     // downstream `partial_cmp` sort comparators violate a total order (a panic on
     // Rust ≥ 1.81) and could poison the gutter sweepline — neither is allowed
@@ -173,6 +226,13 @@ pub fn detect_tables(spans: &[TextSpan]) -> Vec<Table> {
     }
     let unit = median_size(&items).max(1.0);
 
+    // Sanitize rules once: finite, non-empty, bounded count.
+    let rules: Vec<&RuleLine> = rules
+        .iter()
+        .filter(|r| r.pos.is_finite() && r.start.is_finite() && r.end.is_finite() && !r.is_empty())
+        .take(MAX_RULES)
+        .collect();
+
     let rows = group_rows(&items, unit);
     if rows.len() < MIN_ROWS {
         return Vec::new();
@@ -183,7 +243,7 @@ pub fn detect_tables(spans: &[TextSpan]) -> Vec<Table> {
         if band.len() < MIN_ROWS {
             continue;
         }
-        if let Some(t) = detect_in_band(&band, &items, unit) {
+        if let Some(t) = detect_in_band(&band, &items, unit, &rules) {
             tables.push(t);
             if tables.len() >= MAX_TABLES {
                 break;
@@ -257,7 +317,12 @@ fn segment_bands(rows: &[Vec<usize>], items: &[&TextSpan], unit: f64) -> Vec<Vec
 }
 
 /// Try to read one band of rows as a table.
-fn detect_in_band(band: &[Vec<usize>], items: &[&TextSpan], unit: f64) -> Option<Table> {
+fn detect_in_band(
+    band: &[Vec<usize>],
+    items: &[&TextSpan],
+    unit: f64,
+    rules: &[&RuleLine],
+) -> Option<Table> {
     // Band content x-extent.
     let mut x0 = f64::INFINITY;
     let mut x1 = f64::NEG_INFINITY;
@@ -272,18 +337,31 @@ fn detect_in_band(band: &[Vec<usize>], items: &[&TextSpan], unit: f64) -> Option
         return None;
     }
 
+    // Drawn vertical rules that span this band are forced column separators —
+    // stronger evidence than whitespace, and available even where cells sit too
+    // close for a clean gutter.
+    let ruled_x = band_rule_columns(band, items, unit, x0, x1, rules);
     let gutters = find_gutters(band, items, unit, x0, x1);
-    if gutters.is_empty() {
+    if gutters.is_empty() && ruled_x.is_empty() {
         return None; // single column → not a table
     }
 
-    // Column boundaries: band edges plus each gutter's midpoint.
-    let mut col_x = Vec::with_capacity(gutters.len() + 2);
+    // Column boundaries: band edges plus each gutter's midpoint plus each
+    // spanning rule's x, deduplicated (a rule usually sits inside the gutter
+    // the text leaves for it — keep one separator, preferring the rule).
+    let mut col_x = Vec::with_capacity(gutters.len() + ruled_x.len() + 2);
     col_x.push(x0);
+    col_x.extend(ruled_x.iter().copied());
     for &(g0, g1) in &gutters {
-        col_x.push((g0 + g1) / 2.0);
+        // Skip a whitespace gutter that a drawn rule already separates.
+        if !ruled_x.iter().any(|&rx| rx >= g0 && rx <= g1) {
+            col_x.push((g0 + g1) / 2.0);
+        }
     }
     col_x.push(x1);
+    col_x.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+    // Merge separators closer than a hair (duplicate rules / rule-on-edge).
+    col_x.dedup_by(|b, a| (*b - *a).abs() < unit * 0.2);
     let ncols = col_x.len() - 1;
     if ncols < MIN_COLS {
         return None;
@@ -355,7 +433,10 @@ fn detect_in_band(band: &[Vec<usize>], items: &[&TextSpan], unit: f64) -> Option
     }
 
     // Prose guard: real table cells leave whitespace; prose columns fill width.
-    if ncols >= 2 && median_fill(&cells, items, body, &col_x) > PROSE_FILL {
+    // A band whose columns are established by drawn rules is exempt — a drawn
+    // grid is direct evidence of tabular intent, and its cells may legitimately
+    // fill their columns (e.g. wrapped text inside ruled cells).
+    if ruled_x.is_empty() && ncols >= 2 && median_fill(&cells, items, body, &col_x) > PROSE_FILL {
         return None;
     }
 
@@ -364,6 +445,48 @@ fn detect_in_band(band: &[Vec<usize>], items: &[&TextSpan], unit: f64) -> Option
         col_x,
         row_y: row_separators(body, items),
     })
+}
+
+/// Interior x-positions of drawn vertical rules that cover enough of this
+/// band's y-extent to be trusted as column separators, ascending and deduped.
+fn band_rule_columns(
+    band: &[Vec<usize>],
+    items: &[&TextSpan],
+    unit: f64,
+    x0: f64,
+    x1: f64,
+    rules: &[&RuleLine],
+) -> Vec<f64> {
+    // Band y-extent from row baselines, padded by a line so a rule that stops
+    // at the text's cap height still counts.
+    let mut y_top = f64::NEG_INFINITY;
+    let mut y_bot = f64::INFINITY;
+    for row in band {
+        let y = row_baseline(row, items);
+        y_top = y_top.max(y);
+        y_bot = y_bot.min(y);
+    }
+    if !(y_top.is_finite() && y_bot.is_finite()) {
+        return Vec::new();
+    }
+    let band_h = (y_top - y_bot).max(unit);
+
+    let mut xs: Vec<f64> = rules
+        .iter()
+        .filter(|r| r.vertical)
+        // Interior to the band's text extent (a hair of tolerance so a rule
+        // exactly on the text edge is not counted as a phantom outer column).
+        .filter(|r| r.pos > x0 + unit * 0.2 && r.pos < x1 - unit * 0.2)
+        // Must overlap the band's y-range substantially.
+        .filter(|r| {
+            let overlap = r.end.min(y_top + unit) - r.start.max(y_bot - unit);
+            overlap >= band_h * RULE_COVER
+        })
+        .map(|r| r.pos)
+        .collect();
+    xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+    xs.dedup_by(|b, a| (*b - *a).abs() < unit * 0.2);
+    xs
 }
 
 /// Find column gutters: maximal interior x-ranges that stay clear of text in
@@ -911,5 +1034,186 @@ mod tests {
         assert_eq!(tables.len(), 1);
         assert_eq!(tables[0].cols(), 4);
         assert_eq!(tables[0].cells[1], vec!["B", "2", "y", "8"]);
+    }
+
+    // ---- Ruled-line-aware detection ----
+
+    fn vrule(x: f64, y0: f64, y1: f64) -> RuleLine {
+        RuleLine {
+            vertical: true,
+            pos: x,
+            start: y0,
+            end: y1,
+        }
+    }
+
+    #[test]
+    fn no_rules_is_identical_to_plain_detection() {
+        let spans = grid(
+            &[
+                &["Name", "Qty", "Price"],
+                &["Apple", "3", "1.20"],
+                &["Pear", "12", "0.80"],
+            ],
+            &[50.0, 200.0, 320.0],
+            700.0,
+            14.0,
+            10.0,
+        );
+        let plain = detect_tables(&spans);
+        let with = detect_tables_with_rules(&spans, &[]);
+        assert_eq!(plain.len(), with.len());
+        assert_eq!(plain[0].cells, with[0].cells);
+    }
+
+    #[test]
+    fn vertical_rule_forces_column_where_gutter_is_too_narrow() {
+        // Cells sit close enough that the whitespace gutter (< MIN_GUTTER·unit
+        // = 4pt at size 10) is rejected — text alone finds no columns. A drawn
+        // vertical rule between them must establish the separator.
+        let cells: &[&[&str]] = &[
+            &["alpha", "100"],
+            &["beta", "200"],
+            &["gamma", "300"],
+            &["delta", "400"],
+        ];
+        // Left cells ~x[50..50+5*5=75]; right cells start at 78 → 3pt gutter.
+        let spans = grid(cells, &[50.0, 78.0], 700.0, 14.0, 10.0);
+        assert!(
+            detect_tables(&spans).is_empty(),
+            "narrow gutter alone must not form a table"
+        );
+        let rules = [vrule(76.5, 640.0, 710.0)];
+        let tables = detect_tables_with_rules(&spans, &rules);
+        assert_eq!(tables.len(), 1, "rule forces the column split");
+        assert_eq!(tables[0].cols(), 2);
+        assert_eq!(tables[0].cells[1], vec!["beta", "200"]);
+    }
+
+    #[test]
+    fn ruled_band_skips_prose_fill_guard() {
+        // Two columns of width-filling text: rejected as prose without rules,
+        // accepted as a table when a spanning vertical rule divides them.
+        let long_l = "left column text filling the whole width here";
+        let long_r = "right column text also filling its column";
+        let mut spans = Vec::new();
+        for r in 0..5 {
+            let y = 700.0 - r as f64 * 14.0;
+            spans.push(TextSpan {
+                text: long_l.into(),
+                x: 50.0,
+                y,
+                size: 12.0,
+                advance: 195.0,
+                mcid: None,
+            });
+            spans.push(TextSpan {
+                text: long_r.into(),
+                x: 270.0,
+                y,
+                size: 12.0,
+                advance: 195.0,
+                mcid: None,
+            });
+        }
+        assert!(detect_tables(&spans).is_empty(), "prose without rules");
+        let rules = [vrule(258.0, 630.0, 710.0)];
+        let tables = detect_tables_with_rules(&spans, &rules);
+        assert_eq!(tables.len(), 1, "drawn rule overrides the prose guard");
+        assert_eq!(tables[0].cols(), 2);
+    }
+
+    #[test]
+    fn short_rule_does_not_force_a_column() {
+        // A vertical tick covering well under RULE_COVER of the band height
+        // must not split a prose paragraph into a fake table.
+        let spans = vec![
+            sp(
+                "This is a paragraph of running text",
+                50.0,
+                700.0,
+                12.0,
+                220.0,
+            ),
+            sp(
+                "that continues onto a second line an",
+                50.0,
+                686.0,
+                12.0,
+                220.0,
+            ),
+            sp(
+                "a third line with no column structur",
+                50.0,
+                672.0,
+                12.0,
+                220.0,
+            ),
+            sp(
+                "and finally a fourth closing line he",
+                50.0,
+                658.0,
+                12.0,
+                220.0,
+            ),
+        ];
+        let rules = [vrule(150.0, 695.0, 705.0)]; // 10pt of a ~42pt band
+        assert!(
+            detect_tables_with_rules(&spans, &rules).is_empty(),
+            "short tick must not create a table"
+        );
+    }
+
+    #[test]
+    fn rule_inside_gutter_is_deduped_with_it() {
+        // A rule drawn inside the whitespace gutter must yield ONE separator,
+        // not a rule-column plus a gutter-column (which would make 3 columns).
+        let spans = grid(
+            &[&["a", "1"], &["b", "2"], &["c", "3"]],
+            &[50.0, 260.0],
+            700.0,
+            14.0,
+            10.0,
+        );
+        let rules = [vrule(150.0, 640.0, 710.0)];
+        let tables = detect_tables_with_rules(&spans, &rules);
+        assert_eq!(tables.len(), 1);
+        assert_eq!(
+            tables[0].cols(),
+            2,
+            "rule and gutter merge to one separator"
+        );
+    }
+
+    #[test]
+    fn adversarial_rules_are_bounded_and_finite_filtered() {
+        // NaN/empty/duplicate rules must not panic or distort detection.
+        let spans = grid(
+            &[&["a", "1"], &["b", "2"], &["c", "3"]],
+            &[50.0, 260.0],
+            700.0,
+            14.0,
+            10.0,
+        );
+        let mut rules = vec![
+            RuleLine {
+                vertical: true,
+                pos: f64::NAN,
+                start: 0.0,
+                end: 100.0,
+            },
+            RuleLine {
+                vertical: true,
+                pos: 150.0,
+                start: 700.0,
+                end: 700.0, // empty
+            },
+        ];
+        for _ in 0..100 {
+            rules.push(vrule(150.0, 640.0, 710.0)); // duplicates dedupe
+        }
+        let tables = detect_tables_with_rules(&spans, &rules);
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0].cols(), 2);
     }
 }

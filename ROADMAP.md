@@ -348,8 +348,19 @@ cargo run -p zpdf-render-wgpu --example viewer -- <file.pdf>   # 交互浏览器
       max_cross=floor((1−0.85)·行数)）→ 列分隔中点定列、行基线中点定行 → 按 x 中心分桶建格。
       标题/说明单列行从首尾裁剪；散文因填满行宽而跨越列隙自动被排除（2 列另设填充率
       ≤0.80 守卫）。`detect_tables(&[TextSpan]) -> Vec<Table>`（cells/col_x/row_y +
-      to_csv/to_tsv/bbox），CLI `zpdf tables`（`-p`//--all//--csv）。纯文本对齐法，
-      无后端/渲染改动；规则线（绘制的横竖线）感知留作后续增强
+      to_csv/to_tsv/bbox），CLI `zpdf tables`（`-p`//--all//--csv`）。纯文本对齐法，
+      无后端/渲染改动
+- [x] 规则线感知表格检测（`RuleLine` + `detect_tables_with_rules`）：解释器新增
+      `with_rule_sink`（与 text sink 同型，仅提取期运行、不改显示列表——有测试断言
+      渲染命令逐字节不变），捕获页面空间中的细横竖线：细描边线段（轴对齐 ±0.5、
+      线宽 ≤3、长度 ≥8）与细填充矩形（`re f` 画线的常见形态，短边 ≤3）；OC 隐藏层
+      与平铺 pattern 格内不采集，条数上限 20k。检测端：竖直规则线覆盖带高 ≥50% 即为
+      **强制列分隔**（文本无干净空隙也能立列），与白空隙分隔去重合并（规则线优先）；
+      由规则线立列的带**豁免散文填充率守卫**（画出的网格即表格意图的直接证据，
+      格内换行填满单元格属正常）。CLI `zpdf tables` 已接线；facade re-export
+      `RuleLine`//detect_tables_with_rules`。真实 PDF 验证：test1 第 8 页一个
+      紧凑网格表（旧法漏检）被新法检出，其余文档计数逐一不变；618 失败语料
+      0 panic/0 timeout/426 OK 不变
 
 ### P4.9 — PDF 2.0
 - [x] Output Intents（ISO 32000-1 §14.11.5 + ISO 32000-2 页面级）：解析文档级
