@@ -1795,19 +1795,31 @@ fn wrap_cff_in_otf(cff_data: &[u8]) -> Vec<u8> {
     buf
 }
 
-/// Cache of loaded fonts, keyed by FontId.
+/// Cache of loaded fonts, keyed by FontId, with LRU eviction.
 pub struct FontCache {
     fonts: HashMap<FontId, LoadedFont>,
     name_to_id: HashMap<String, FontId>,
     next_id: FontId,
+    /// LRU access order: most recently used at the end
+    access_order: Vec<FontId>,
+    /// Maximum number of fonts to cache (default 256)
+    max_capacity: usize,
 }
 
 impl FontCache {
+    /// Create a new font cache with the default capacity (256 fonts).
     pub fn new() -> Self {
+        Self::with_capacity(256)
+    }
+
+    /// Create a new font cache with a specific capacity limit.
+    pub fn with_capacity(max_capacity: usize) -> Self {
         Self {
             fonts: HashMap::new(),
             name_to_id: HashMap::new(),
             next_id: 0,
+            access_order: Vec::new(),
+            max_capacity,
         }
     }
 
@@ -1823,12 +1835,29 @@ impl FontCache {
 
     pub fn insert(&mut self, name: String, font: LoadedFont) -> FontId {
         if let Some(&existing_id) = self.name_to_id.get(&name) {
+            // Move to end (most recently used)
+            if let Some(pos) = self.access_order.iter().position(|&id| id == existing_id) {
+                self.access_order.remove(pos);
+                self.access_order.push(existing_id);
+            }
             return existing_id;
         }
+
+        // Evict LRU if at capacity
+        if self.fonts.len() >= self.max_capacity && !self.access_order.is_empty() {
+            if let Some(lru_id) = self.access_order.first().copied() {
+                self.fonts.remove(&lru_id);
+                // Remove from name_to_id (need to find the name with this id)
+                self.name_to_id.retain(|_, &mut id| id != lru_id);
+                self.access_order.remove(0);
+            }
+        }
+
         let id = self.next_id;
         self.next_id += 1;
         self.name_to_id.insert(name, id);
         self.fonts.insert(id, font);
+        self.access_order.push(id);
         id
     }
 

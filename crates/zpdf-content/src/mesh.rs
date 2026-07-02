@@ -176,6 +176,11 @@ pub(crate) fn decode_mesh(
     if p.decode.len() < 4 + 2 * p.n_color || p.bits_coord == 0 || p.bits_comp == 0 {
         return Vec::new();
     }
+    // Validate decode values are finite (reject NaN/Infinity from malformed PDFs)
+    if !p.decode.iter().all(|v| v.is_finite()) {
+        tracing::warn!("Mesh shading decode contains non-finite values, skipping");
+        return Vec::new();
+    }
     let mut mr = MeshReader {
         r: BitReader::new(data),
         p,

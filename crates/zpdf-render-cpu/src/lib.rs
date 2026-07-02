@@ -357,13 +357,18 @@ impl<'a> CpuRenderer<'a> {
         }
         let mut array: Vec<f32> = dash.array.iter().map(|v| v * self.scale).collect();
         if array.len() % 2 == 1 {
-            let doubled = array.clone();
-            array.extend(doubled);
+            // Avoid clone: reserve and extend from within the same vec
+            array.reserve(array.len());
+            let len = array.len();
+            for i in 0..len {
+                array.push(array[i]);
+            }
         }
         tiny_skia::StrokeDash::new(array, dash.phase * self.scale)
     }
 
-    fn render_glyph_run(&mut self, run: &GlyphRun) {
+    /// Render a glyph run with a specific alpha override (used by knockout groups).
+    fn render_glyph_run_with_alpha(&mut self, run: &GlyphRun, alpha_override: f32) {
         let font_cache = match self.font_cache {
             Some(fc) => fc,
             None => return,
@@ -377,7 +382,7 @@ impl<'a> CpuRenderer<'a> {
         }
 
         let paint = match &run.paint {
-            Paint::Solid(c) => Self::color_to_paint(c, run.alpha),
+            Paint::Solid(c) => Self::color_to_paint(c, alpha_override),
             _ => return,
         };
 
@@ -386,6 +391,10 @@ impl<'a> CpuRenderer<'a> {
         } else {
             self.render_outline_glyphs(run, font, &paint);
         }
+    }
+
+    fn render_glyph_run(&mut self, run: &GlyphRun) {
+        self.render_glyph_run_with_alpha(run, run.alpha)
     }
 
     fn push_clip(&mut self, path: &Path, rule: &FillRule) {
@@ -696,16 +705,8 @@ impl<'a> CpuRenderer<'a> {
             RenderCommand::StrokePath {
                 path, style, paint, ..
             } => self.render_stroke(path, style, paint, 1.0),
-            RenderCommand::DrawGlyphRun(run) => {
-                let mut r = run.clone();
-                r.alpha = 1.0;
-                self.render_glyph_run(&r);
-            }
-            RenderCommand::DrawImage(draw) => {
-                let mut d = draw.clone();
-                d.alpha = 1.0;
-                self.render_image(&d);
-            }
+            RenderCommand::DrawGlyphRun(run) => self.render_glyph_run_with_alpha(run, 1.0),
+            RenderCommand::DrawImage(draw) => self.render_image_with_alpha(draw, 1.0),
             _ => {}
         }
     }
@@ -909,7 +910,7 @@ impl<'a> CpuRenderer<'a> {
         }
     }
 
-    fn render_image(&mut self, draw: &ImageDraw) {
+    fn render_image_with_alpha(&mut self, draw: &ImageDraw, alpha_override: f32) {
         let image_cache = match self.image_cache {
             Some(c) => c,
             None => return,
@@ -994,7 +995,7 @@ impl<'a> CpuRenderer<'a> {
         );
 
         let paint = tiny_skia::PixmapPaint {
-            opacity: draw.alpha,
+            opacity: alpha_override,
             // Bilinear sampling (matches pdfium); nearest leaves blocky upscales
             // and aliased downscales.
             quality: tiny_skia::FilterQuality::Bilinear,
@@ -1002,6 +1003,10 @@ impl<'a> CpuRenderer<'a> {
         };
 
         pixmap.draw_pixmap(0, 0, src, &paint, transform, self.current_clip.as_ref());
+    }
+
+    fn render_image(&mut self, draw: &ImageDraw) {
+        self.render_image_with_alpha(draw, draw.alpha)
     }
 
     fn render_outline_glyphs(
@@ -1457,8 +1462,10 @@ pub struct RenderedPage {
 }
 
 impl RenderedPage {
-    pub fn save_png(&self, path: &str) -> Result<(), CpuRenderError> {
-        let img = image::RgbaImage::from_raw(self.width, self.height, self.data.clone())
+    /// Save the rendered page to a PNG file. Consumes the page to avoid cloning
+    /// the pixel buffer (eliminates 512MB copy on 64Mpx pages).
+    pub fn save_png(self, path: &str) -> Result<(), CpuRenderError> {
+        let img = image::RgbaImage::from_raw(self.width, self.height, self.data)
             .ok_or(CpuRenderError::PixmapCreation)?;
         img.save(path)
             .map_err(|e| CpuRenderError::PngEncode(e.to_string()))

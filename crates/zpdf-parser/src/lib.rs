@@ -524,8 +524,12 @@ impl PdfFile {
         for _ in 0..n {
             let obj_num_tok = header_lexer.next_token()?;
             let offset_tok = header_lexer.next_token()?;
-            let obj_num = obj_num_tok.as_i64()? as u32;
-            let offset = usize::try_from(offset_tok.as_i64()?).map_err(|_| neg("member offset"))?;
+            let obj_num = u32::try_from(obj_num_tok.as_i64()?).map_err(|_| {
+                zpdf_core::Error::StreamDecode("ObjStm: object number out of range".into())
+            })?;
+            let offset = usize::try_from(offset_tok.as_i64()?).map_err(|_| {
+                zpdf_core::Error::StreamDecode("ObjStm: member offset out of range".into())
+            })?;
             entries.push((obj_num, offset));
         }
 
