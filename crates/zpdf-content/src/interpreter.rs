@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 use zpdf_core::{Matrix, ObjectId, PdfDict, PdfObject, Point, Rect};
@@ -9,6 +10,9 @@ use zpdf_parser::PdfFile;
 
 use crate::text::TextSpan;
 use crate::tokenizer::{ContentToken, ContentTokenizer};
+
+/// Cached CMYK→RGB conversion entry
+type CmykCacheEntry = ([f64; 4], (f64, f64, f64));
 
 /// Interprets a PDF content stream and produces a DisplayList.
 pub struct ContentInterpreter<'a> {
@@ -109,6 +113,13 @@ pub struct ContentInterpreter<'a> {
     /// site (hence identical inherited state) across tiles, and two distinct
     /// sites within one cell can never collide.
     tile_op_index: u64,
+    /// Cache last CMYK→RGB conversion to avoid redundant transforms.
+    /// Technical drawings often paint hundreds of shapes in the same black/cyan color.
+    /// Uses RefCell for interior mutability since cmyk_to_display is called from &self methods.
+    cmyk_cache: RefCell<Option<CmykCacheEntry>>,
+    /// Cache resolved color spaces per page (indirect refs can repeat).
+    /// Cleared per-page to avoid stale references across documents.
+    cs_cache: RefCell<HashMap<ObjectId, ActiveColorSpace>>,
 }
 
 /// State for soft-mask reuse across the tiles of one `paint_tiling_pattern`
@@ -468,6 +479,8 @@ impl<'a> ContentInterpreter<'a> {
             last_clock_op: 0,
             soft_mask_reuse: None,
             tile_op_index: 0,
+            cmyk_cache: RefCell::new(None),
+            cs_cache: RefCell::new(HashMap::new()),
         }
     }
 
@@ -1213,6 +1226,17 @@ impl<'a> ContentInterpreter<'a> {
         if depth > 4 {
             return ActiveColorSpace::DeviceGray;
         }
+
+        // Check cache for indirect refs (common: same ColorSpace object reused)
+        let cache_key = if let PdfObject::Ref(r) = obj {
+            if let Some(cached) = self.cs_cache.borrow().get(r) {
+                return cached.clone();
+            }
+            Some(*r)
+        } else {
+            None
+        };
+
         let resolved;
         let obj = if let PdfObject::Ref(r) = obj {
             match self.file.map(|f| f.resolve(*r)) {
@@ -1233,7 +1257,7 @@ impl<'a> ContentInterpreter<'a> {
         let Some(PdfObject::Name(cs_name)) = arr.first() else {
             return ActiveColorSpace::DeviceGray;
         };
-        match cs_name.as_str() {
+        let result = match cs_name.as_str() {
             "ICCBased" => {
                 let n = arr
                     .get(1)
@@ -1367,7 +1391,13 @@ impl<'a> ContentInterpreter<'a> {
                     .map(|o| Box::new(self.resolve_color_space_obj(o, depth + 1))),
             },
             _ => ActiveColorSpace::DeviceGray,
+        };
+
+        // Cache the result if it came from an indirect reference
+        if let Some(key) = cache_key {
+            self.cs_cache.borrow_mut().insert(key, result.clone());
         }
+        result
     }
 
     /// Parse a DeviceN/NChannel attributes dict's `/Colorants` into per-input-
@@ -1570,10 +1600,20 @@ impl<'a> ContentInterpreter<'a> {
     /// profile is the `Icc` variant and never reaches here, so its own profile
     /// always wins; the output intent only substitutes for raw DeviceCMYK.
     fn cmyk_to_display(&self, c: f64, m: f64, y: f64, k: f64) -> (f64, f64, f64) {
-        match &self.output_intent_cmyk {
-            Some(t) => t.color_to_rgb(&[c, m, y, k]),
-            None => zpdf_color::cmyk_to_rgb(c, m, y, k),
+        let cmyk = [c, m, y, k];
+        // Check cache for repeated identical CMYK values (common in technical drawings)
+        if let Some((cached_cmyk, cached_rgb)) = *self.cmyk_cache.borrow() {
+            if cached_cmyk == cmyk {
+                return cached_rgb;
+            }
         }
+        // Compute and cache the result
+        let rgb = match &self.output_intent_cmyk {
+            Some(t) => t.color_to_rgb(&cmyk),
+            None => zpdf_color::cmyk_to_rgb(c, m, y, k),
+        };
+        *self.cmyk_cache.borrow_mut() = Some((cmyk, rgb));
+        rgb
     }
 
     /// Re-route a DeviceCMYK image colour space through the active output-intent

@@ -68,9 +68,24 @@ fn apply_predictor(data: &[u8], params: &PdfDict) -> Result<Vec<u8>> {
         return Ok(data.to_vec());
     }
 
-    let colors = params.get_i64("Colors").unwrap_or(1).max(1) as usize;
-    let bpc = params.get_i64("BitsPerComponent").unwrap_or(8).max(1) as usize;
-    let columns = params.get_i64("Columns").unwrap_or(1).max(1) as usize;
+    // Validate parameters with reasonable PDF limits to prevent overflow attacks.
+    // PDF spec typically uses modest values, but we allow generous bounds.
+    const MAX_COLORS: usize = 256; // PDF spec typically ≤32
+    const MAX_BPC: usize = 32; // PDF spec: 1,2,4,8,12,16,24,32
+    const MAX_COLUMNS: usize = 1 << 16; // 64K columns is generous
+
+    let colors = params
+        .get_i64("Colors")
+        .unwrap_or(1)
+        .clamp(1, MAX_COLORS as i64) as usize;
+    let bpc = params
+        .get_i64("BitsPerComponent")
+        .unwrap_or(8)
+        .clamp(1, MAX_BPC as i64) as usize;
+    let columns = params
+        .get_i64("Columns")
+        .unwrap_or(1)
+        .clamp(1, MAX_COLUMNS as i64) as usize;
 
     if predictor == 2 {
         decode_tiff_predictor(data, colors, bpc, columns)
@@ -90,7 +105,13 @@ fn decode_tiff_predictor(
     if bpc != 8 {
         return Ok(data.to_vec());
     }
-    let row_bytes = columns * colors;
+    // Check for overflow in row_bytes calculation
+    let row_bytes = columns
+        .checked_mul(colors)
+        .ok_or_else(|| Error::StreamDecode("TIFF predictor: columns * colors overflow".into()))?;
+    if row_bytes == 0 {
+        return Ok(data.to_vec());
+    }
     let mut output = data.to_vec();
     for row_start in (0..output.len()).step_by(row_bytes) {
         let row_end = (row_start + row_bytes).min(output.len());
@@ -102,9 +123,21 @@ fn decode_tiff_predictor(
 }
 
 fn decode_png_predictor(data: &[u8], colors: usize, bpc: usize, columns: usize) -> Result<Vec<u8>> {
-    let row_bytes = (colors * bpc * columns).div_ceil(8);
-    let bpp = (colors * bpc).div_ceil(8); // bytes per pixel for Sub/Paeth
-    let stride = 1 + row_bytes; // filter byte + row data
+    // Check all multiplications for overflow to prevent allocation bombs
+    let bits_per_row = colors
+        .checked_mul(bpc)
+        .and_then(|v| v.checked_mul(columns))
+        .ok_or_else(|| Error::StreamDecode("PNG predictor: row computation overflow".into()))?;
+    let row_bytes = bits_per_row.div_ceil(8);
+
+    let bits_per_pixel = colors
+        .checked_mul(bpc)
+        .ok_or_else(|| Error::StreamDecode("PNG predictor: pixel computation overflow".into()))?;
+    let bpp = bits_per_pixel.div_ceil(8); // bytes per pixel for Sub/Paeth
+
+    let stride = row_bytes
+        .checked_add(1)
+        .ok_or_else(|| Error::StreamDecode("PNG predictor: stride overflow".into()))?; // filter byte + row data
 
     if !data.len().is_multiple_of(stride) && !data.is_empty() {
         // Try to process what we can
@@ -115,14 +148,14 @@ fn decode_png_predictor(data: &[u8], colors: usize, bpc: usize, columns: usize) 
     }
 
     let num_rows = data.len().div_ceil(stride);
-    let mut output = Vec::with_capacity(num_rows * row_bytes);
+    let output_size = num_rows
+        .checked_mul(row_bytes)
+        .ok_or_else(|| Error::StreamDecode("PNG predictor: output size overflow".into()))?;
+    let mut output = Vec::with_capacity(output_size);
     let mut prev_row = vec![0u8; row_bytes];
 
     let mut pos = 0;
     while pos < data.len() {
-        if pos >= data.len() {
-            break;
-        }
         let filter_type = data[pos];
         pos += 1;
 

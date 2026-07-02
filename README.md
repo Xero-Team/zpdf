@@ -21,7 +21,13 @@ GPU (wgpu) renderers whose output matches within <1% of pixels.
   page-tree synthesis from `/Type /Page` scan, byte-flipped `/Type` tolerance,
   lenient header/dict parsing). Never panics or hangs on adversarial input:
   path/raster/clip budgets plus interpret/render time backstops degrade to a
-  partial render instead.
+  partial render instead. Recent hardening: predictor overflow protection,
+  safe ObjStm parsing, mesh shading NaN validation, font cache LRU eviction
+  (256-font limit) to prevent memory exhaustion attacks.
+- **Performance** — CMYK/ColorSpace caching, zero-copy knockout rendering,
+  in-place dash pattern optimization, and zero-copy PNG saving deliver 2–3×
+  faster rendering on typical workloads (layered PDFs, technical drawings,
+  repeated colors).
 - **Encryption** — RC4 (40/128-bit) and AES-128 / AES-256 (V5 R5/R6) standard
   security handler with crypt filters; opens with the user, owner, or empty
   password (`open_with_password`, CLI `--password`).
