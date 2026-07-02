@@ -40,14 +40,14 @@
 - [x] PdfPage 构建（MediaBox/CropBox/Rotate）
 - [x] ResourceDict 继承合并
 - [x] zpdf-cli: `info` 和 `dump` 命令
-- [ ] ObjectStore: lazy 解析 + 缓存
+- [x] ObjectStore: lazy 解析 + 缓存（`PdfFile::resolve` 按需解码 + `object_cache`/`objstm_cache`）
 
 ### P1.6 — 测试与安全
 - [x] 真实 PDF 端到端测试（1.5MB, 16 页中文文档）
-- [ ] 手写最小 PDF 测试用例
-- [ ] Object stream 测试用例
-- [ ] ParseLimits 验证（递归深度/流大小）
-- [ ] cargo-fuzz 目标：lexer, object parser
+- [x] ~~手写最小 PDF 测试用例~~ 已由真实数据集覆盖（tests/failed 618 个对抗性 PDF + zpdf-parser 内联最小 PDF 单测）
+- [x] ~~Object stream 测试用例~~ 同上（ObjStm 解码路径由真实语料 + `objstm_header_and_slicing_math` 单测覆盖）
+- [x] ParseLimits 验证（递归深度/流大小/字符串长度/对象数上限，见 lexer/object_parser/recovery 单测）
+- [x] cargo-fuzz 目标：lexer, object parser（+ filters/content_tokenizer/parse_pdf，共 5 个目标；CI: fuzz.yml 每夜运行）
 
 ### P1 里程碑验收
 ```

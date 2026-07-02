@@ -68,13 +68,21 @@ End-to-end whole-file parse: `PdfFile::parse_with_limits` on arbitrary bytes, th
 
 ## Corpora
 
-Seed inputs live in `corpus/<target>/`. These are hand-written minimal PDFs, token streams, and filter payloads that give the fuzzer meaningful starting points. Over time, the fuzzer expands coverage by mutating and recombining these seeds.
+Seed inputs are committed under `seeds/<target>/` and copied into the working `corpus/<target>/` (git-ignored — the fuzzer grows it) by CI, or by hand on a fresh checkout:
 
-- `corpus/parse_pdf/` — real small PDFs from `tests/corpus/`
-- `corpus/object_parser/` — minimal indirect objects (catalog, stream, ref body)
-- `corpus/lexer/` — token-shaped snippets (dict, string, numbers)
-- `corpus/content_tokenizer/` — content-stream operators + inline image
-- `corpus/filters/` — config-header + payload for ASCIIHex / ASCII85 / RunLength / Flate-with-predictor
+```bash
+for t in lexer object_parser filters content_tokenizer parse_pdf; do
+  mkdir -p corpus/$t && cp -n seeds/$t/* corpus/$t/
+done
+```
+
+These are hand-written minimal PDFs, token streams, and filter payloads that give the fuzzer meaningful starting points. Over time, the fuzzer expands coverage by mutating and recombining these seeds.
+
+- `seeds/parse_pdf/` — real small PDFs from `tests/corpus/`
+- `seeds/object_parser/` — minimal indirect objects (catalog, stream, ref body)
+- `seeds/lexer/` — token-shaped snippets (dict, string, numbers)
+- `seeds/content_tokenizer/` — content-stream operators + inline image
+- `seeds/filters/` — config-header + payload for ASCIIHex / ASCII85 / RunLength / Flate-with-predictor
 
 ## Windows (MSVC) limitation
 
@@ -86,22 +94,15 @@ cargo-fuzz relies on **libFuzzer's coverage instrumentation**, which on Linux em
 
 The targets **type-check and compile** on Windows in dev mode (`cargo +nightly check` succeeds), so the code itself is portable — only the instrumented fuzzing binary requires Linux or macOS.
 
-## CI integration (future work)
+## CI integration
 
-To run fuzz targets in CI (e.g. GitHub Actions on `ubuntu-latest`):
+`.github/workflows/fuzz.yml` runs all five targets on `ubuntu-latest`, one matrix job per target:
 
-```yaml
-- name: Fuzz smoke test
-  run: |
-    rustup toolchain install nightly
-    cargo install cargo-fuzz
-    cargo +nightly fuzz build
-    for target in lexer object_parser filters content_tokenizer parse_pdf; do
-      timeout 120 cargo +nightly fuzz run "$target" -- -max_total_time=60 || true
-    done
-```
+- **Nightly** (scheduled): 15 minutes per target.
+- **Push to main** touching `fuzz/` or a parser-adjacent crate (`zpdf-core`, `zpdf-parser`, `zpdf-content`): 90-second smoke test.
+- **Manual dispatch**: configurable seconds per target (default 300).
 
-Set a short timeout (e.g. 60s per target) for smoke-testing that nothing immediately crashes; longer runs (hours) can live in a dedicated nightly/weekly job.
+The working corpus is persisted between runs with `actions/cache` (keyed per target), so each night builds on the coverage the last one grew. A crash or hang fails the job and uploads `fuzz/artifacts/<target>/` as a `fuzz-artifacts-<target>` artifact; download it and reproduce locally with `cargo +nightly fuzz run <target> artifacts/<target>/<file>`.
 
 ## Design notes
 
@@ -141,7 +142,7 @@ libFuzzer's coverage guidance is still valuable even without ASAN: it explores b
 
 - **Add new targets** when new parser surfaces ship (e.g. a future `/Sig` signature validator).
 - **Triage crashes**: if a crash is found, reproduce it (`cargo +nightly fuzz run <target> artifacts/<target>/crash-<hash>`), fix the bug, and add a regression test to `crates/zpdf-parser/tests/`.
-- **Refresh seeds** after major refactors: if the filter pipeline changes, update `corpus/filters/` with new config patterns.
+- **Refresh seeds** after major refactors: if the filter pipeline changes, update `seeds/filters/` with new config patterns.
 
 ## Further reading
 

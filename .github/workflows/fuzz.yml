@@ -1,0 +1,87 @@
+name: Fuzz
+
+# Coverage-guided fuzzing of the parser surfaces (see fuzz/README.md).
+# Not on the PR critical path: runs nightly, on demand, and when the fuzz
+# harness or a parser-adjacent crate changes on main.
+on:
+  schedule:
+    - cron: "23 3 * * *" # nightly, off the :00 rush
+  workflow_dispatch:
+    inputs:
+      seconds_per_target:
+        description: "Seconds to fuzz each target"
+        default: "300"
+  push:
+    branches: [main]
+    paths:
+      - "fuzz/**"
+      - "crates/zpdf-core/**"
+      - "crates/zpdf-parser/**"
+      - "crates/zpdf-content/**"
+      - ".github/workflows/fuzz.yml"
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    name: fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [lexer, object_parser, filters, content_tokenizer, parse_pdf]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@nightly
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+
+      # Persist the coverage-grown corpus across runs so each night builds on
+      # the last. Keyed per target; restore-keys lets a new save supersede old.
+      - name: Restore corpus
+        uses: actions/cache@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+
+      - name: Seed corpus
+        run: |
+          mkdir -p "fuzz/corpus/${{ matrix.target }}"
+          cp -n fuzz/seeds/${{ matrix.target }}/* "fuzz/corpus/${{ matrix.target }}/" || true
+
+      - name: Fuzz
+        working-directory: fuzz
+        run: |
+          # Push events are a smoke test; nightly runs go longer; manual
+          # dispatch takes whatever was asked for.
+          case "${{ github.event_name }}" in
+            push)     SECS=90 ;;
+            schedule) SECS=900 ;;
+            *)        SECS="${{ github.event.inputs.seconds_per_target || '300' }}" ;;
+          esac
+          cargo +nightly fuzz run ${{ matrix.target }} -- \
+            -max_total_time="$SECS" \
+            -timeout=30 \
+            -rss_limit_mb=4096
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore
