@@ -73,7 +73,9 @@ jobs:
             schedule) SECS=900 ;;
             *)        SECS="${{ github.event.inputs.seconds_per_target || '300' }}" ;;
           esac
-          cargo +nightly fuzz run ${{ matrix.target }} -- \
+          cargo +nightly fuzz run ${{ matrix.target }} \
+            --target x86_64-unknown-linux-gnu \
+            -- \
             -max_total_time="$SECS" \
             -timeout=30 \
             -rss_limit_mb=4096
