@@ -2040,6 +2040,17 @@ impl Decoder {
         let total_input_plus_new = input.len() + num_new;
         let sym_code_len = ceil_log2(total_input_plus_new.max(1)).max(1);
 
+        // Plausibility check for arithmetic symbol dictionaries: similar to pattern
+        // dicts, reject when declared symbol count vastly exceeds the payload size.
+        // Each symbol needs at least a few bytes (height-class delta, width delta,
+        // bitmap or refinement data). 1K:1 is generous; real encoders are denser.
+        if !sd_huff && num_new > r.remaining().saturating_mul(1024) {
+            return Err(err(format!(
+                "symbol dictionary: {num_new} new symbols declared, only {} bytes payload",
+                r.remaining()
+            )));
+        }
+
         // Decode the new symbols, then the export flags, off one live stream.
         let new_syms = if sd_huff {
             self.decode_symbol_dict_huff(
@@ -4488,6 +4499,26 @@ mod tests {
         assert!(
             result.is_ok(),
             "decode should succeed with failed pattern dict"
+        );
+    }
+
+    #[test]
+    fn huge_symbol_dict_rejects() {
+        // Regression test for second fuzzer hang: symbol dictionary declaring
+        // 16,712 new symbols with only 12 bytes of payload. The plausibility check
+        // rejects it instantly; page decodes with the symbol dict failed (warning).
+        let mut stream = segment(0, 48, &[], 1, &page_info_payload(100, 100, 0));
+        // Segment 1: symbol dict (type 0) with pathological params.
+        // flags=0x3600 (arithmetic, template 1), num_ex=0, num_new=16712.
+        let sd_payload = [
+            0x36, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x41, 0x48, 0x78, 0x24, 0x46,
+            0x5e, 0x45, 0x24, 0x46, 0x5e, 0x45, 0x00, 0x00, 0x00,
+        ];
+        stream.extend_from_slice(&segment(1, 0, &[], 1, &sd_payload));
+        let result = decode(&stream, &Jbig2Params { globals: None });
+        assert!(
+            result.is_ok(),
+            "decode should succeed with failed symbol dict"
         );
     }
 }
