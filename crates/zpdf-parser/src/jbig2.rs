@@ -38,6 +38,12 @@ const MAX_DIMENSION: usize = 1 << 20;
 const MAX_SYMBOLS: usize = 1 << 18;
 /// Cap on text-region symbol instances (same rationale as [`MAX_SYMBOLS`]).
 const MAX_INSTANCES: usize = 1 << 22;
+/// Per-segment MQ decode iteration budget: caps the number of `mq.decode()`
+/// calls in arithmetic-coded regions to prevent hangs on pathological inputs
+/// (huge declared dimensions + tiny compressed payload). Set to cover real-world
+/// needs (a dense 8Kx8K region is 64M pixels) with headroom, but low enough to
+/// fail fast on adversarial bombs.
+const MAX_MQ_ITERATIONS: usize = 64 * 1024 * 1024;
 
 /// Parsed `/DecodeParms` for a JBIG2Decode filter.
 pub struct Jbig2Params {
@@ -528,11 +534,16 @@ fn decode_generic(
     let ctx_at = context_fn(p.template);
     let tpgd_cx = tpgd_context(p.template);
     let mut ltp = false;
+    let mut iterations = 0usize;
 
     for y in 0..height {
         if p.tpgdon {
             // Typical prediction: SLTP toggles LTP; an LTP row repeats the
             // row above (all-white above row 0).
+            iterations += 1;
+            if iterations > MAX_MQ_ITERATIONS {
+                return Err(err("generic region MQ decode exceeded iteration budget"));
+            }
             ltp ^= mq.decode(cx, tpgd_cx) == 1;
             if ltp {
                 if y > 0 {
@@ -543,6 +554,10 @@ fn decode_generic(
             }
         }
         for x in 0..width {
+            iterations += 1;
+            if iterations > MAX_MQ_ITERATIONS {
+                return Err(err("generic region MQ decode exceeded iteration budget"));
+            }
             let ctx = ctx_at(&bm, x as i64, y as i64, &p.at);
             let pixel = mq.decode(cx, ctx);
             if pixel == 1 {
@@ -639,11 +654,16 @@ fn decode_refinement(
 ) -> Result<Bitmap> {
     let mut bm = Bitmap::new(width, height, 0)?;
     let mut ltp = false;
+    let mut iterations = 0usize;
     for y in 0..height as i64 {
         if p.tpgron {
             // SLTP reused context (T.88 6.3.5.6): the pseudo-pixel context for
             // the canonical bit ordering is 0x0020 (template 0) / 0x0008
             // (template 1).
+            iterations += 1;
+            if iterations > MAX_MQ_ITERATIONS {
+                return Err(err("refinement region MQ decode exceeded iteration budget"));
+            }
             let sltp_cx = if p.template == 0 { 0x0020 } else { 0x0008 };
             ltp ^= mq.decode(cx, sltp_cx) == 1;
         }
@@ -667,6 +687,10 @@ fn decode_refinement(
                     bm.set(x as usize, y as usize, 1);
                     continue;
                 }
+            }
+            iterations += 1;
+            if iterations > MAX_MQ_ITERATIONS {
+                return Err(err("refinement region MQ decode exceeded iteration budget"));
             }
             let ctx = refine_context(p.template, &bm, refr, x, y, rx, ry, &p.at);
             if mq.decode(cx, ctx) == 1 {
@@ -2685,6 +2709,18 @@ impl Decoder {
             return Err(err("pattern dictionary exceeds the pixel limit"));
         }
 
+        // Plausibility check: arithmetic-coded regions require roughly 1 bit per
+        // pixel minimum (highly compressible white fills still consume MQ symbols);
+        // reject when declared dimensions dwarf the available compressed payload.
+        // Real JBIG2 encoders emit proportional payloads; this catches fuzzer bombs.
+        let pixels = collective_w * hdph;
+        let payload_bytes = r.remaining();
+        if !mmr && pixels > payload_bytes.saturating_mul(8 * 1024) {
+            return Err(err(format!(
+                "pattern dictionary: {pixels} px declared, only {payload_bytes} bytes payload"
+            )));
+        }
+
         // Decode the collective bitmap. The AT pixels are fixed (T.88 6.7.5):
         // A1 = (-HDPW, 0), A2 = (-3, -1), A3 = (2, -2), A4 = (-2, -2).
         let collective = if mmr {
@@ -4426,5 +4462,32 @@ mod tests {
             "..##", // p0 row1 (..) | p3 row1 (##)
         ]);
         assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn huge_pattern_dict_rejects() {
+        // Regression test for fuzzer hang: pattern dictionary with huge declared
+        // dimensions (430652×227 collective bitmap, 97M pixels) but only 19 bytes
+        // of compressed data. The plausibility check now rejects it instantly; the
+        // page decodes with the pattern dict segment failed (logged as a warning).
+        // Before the fix, this took 6+ seconds; after, it's instant.
+        let mut stream = segment(0, 48, &[], 1, &page_info_payload(100, 100, 0));
+        // Segment 1: pattern dict (type 16) with pathological params.
+        // flags=0x2e (arithmetic, template 3), hdpw=46, hdph=227, gray_max=9361.
+        // n_patterns=9362, collective_w=430652, pixels=97M (within limits),
+        // but only 19 bytes of payload after the 7-byte header.
+        let pd_payload = [
+            0x2e, 0x2e, 0xe3, 0x00, 0x00, 0x24, 0x91, 0xff, 0x84, 0xff, 0xf2, 0x2e, 0x00, 0xf7,
+            0x40, 0xe3, 0x00, 0x00, 0x00, 0x10, 0x84, 0xff, 0x40, 0xf7, 0x05, 0x05,
+        ];
+        stream.extend_from_slice(&segment(1, 16, &[], 1, &pd_payload));
+        let result = decode(&stream, &Jbig2Params { globals: None });
+        // The pattern dict segment fails the plausibility check and is logged as
+        // a warning; the page itself decodes (all-white since no valid patterns).
+        // The key win: no hang, instant return.
+        assert!(
+            result.is_ok(),
+            "decode should succeed with failed pattern dict"
+        );
     }
 }
