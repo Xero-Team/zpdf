@@ -11,6 +11,7 @@ use zpdf_parser::PdfFile;
 
 use crate::destinations::{resolve_link_target, Destination};
 use crate::forms::{AcroForm, GeneratedAppearance};
+use crate::measure::{parse_measure, Measure};
 use crate::page::PdfPage;
 use crate::Catalog;
 
@@ -44,6 +45,10 @@ pub struct Annotation {
     /// An external link target: a URI (`/A /S /URI`) or a remote go-to file name
     /// (`/A /S /GoToR /F`). `None` for in-document and non-link annotations.
     pub uri: Option<String>,
+    /// Geospatial measure dictionary (`/Measure`) defining coordinate systems
+    /// and units for map annotations (ISO 32000-1 §13.2). Primarily used with
+    /// PDF 2.0 Projection annotations.
+    pub measure: Option<Measure>,
 }
 
 impl Annotation {
@@ -107,6 +112,9 @@ fn parse_annotation(
     // carries neither /Dest nor /A — the common case for non-link annotations).
     let (dest, uri) = resolve_link_target(file, catalog, dict, Some(named));
 
+    // Parse geospatial measure dictionary if present.
+    let measure = parse_measure(file, dict);
+
     // Generate an appearance when the producer left none. Form widgets defer to
     // the AcroForm generator (which also honours /NeedAppearances and keeps
     // button /AP states); markup & geometric annotations synthesize their
@@ -133,6 +141,7 @@ fn parse_annotation(
         oc,
         dest,
         uri,
+        measure,
     })
 }
 

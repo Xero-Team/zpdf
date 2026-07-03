@@ -398,7 +398,26 @@ fn cmd_links(args: &[String]) -> zpdf::Result<()> {
                     None => "-> (external page)".to_string(),
                 },
                 (None, Some(uri)) => format!("-> uri:{uri}"),
-                (None, None) => continue, // not a link/navigational annotation
+                (None, None) => {
+                    // Not a link/navigational annotation - but if it has measure info, show it
+                    if let Some(measure) = &a.measure {
+                        let mut info = format!("[Measure: {}]", measure.subtype);
+                        if let Some(epsg) = measure.gcs.as_ref().and_then(|g| g.epsg) {
+                            info.push_str(&format!(" EPSG:{}", epsg));
+                        }
+                        found += 1;
+                        println!(
+                            "Page {}: [{:.0} {:.0} {:.0} {:.0}] {}",
+                            i + 1,
+                            a.rect.x0,
+                            a.rect.y0,
+                            a.rect.x1,
+                            a.rect.y1,
+                            info
+                        );
+                    }
+                    continue;
+                }
             };
             found += 1;
             println!(

@@ -8,8 +8,9 @@ pub use zpdf_display_list as display_list;
 pub use zpdf_display_list::DisplayList;
 pub use zpdf_document::{
     AcroForm, Annotation, DestView, Destination, DocInfo, EmbeddedFile, EmbeddedSource, FieldKind,
-    FieldValue, FormField, OcConfig, OutlineItem, OutputIntent, PageLabelStyle, PageLabels,
-    PdfDocument, PdfPage, ResourceDict, StructElem, StructKid, StructRole, StructTree, XmpMetadata,
+    FieldValue, FormField, GeographicCoordinateSystem, Measure, OcConfig, OutlineItem,
+    OutputIntent, PageLabelStyle, PageLabels, PdfDocument, PdfPage, ResourceDict, StructElem,
+    StructKid, StructRole, StructTree, XmpMetadata,
 };
 pub use zpdf_font::FontCache;
 pub use zpdf_image::{DecodedImage, ImageCache};

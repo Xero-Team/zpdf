@@ -407,6 +407,13 @@ cargo run -p zpdf-render-wgpu --example viewer -- <file.pdf>   # 交互浏览器
       斜接内缩使其不被 `/Rect`=`/BBox` 裁剪；仅渲染"标记"态、不移除内容，故 `/OverlayText`//RO
       后密文叠加不绘制）。PDF 2.0 **Projection** 已识别但无既定默认外观（仅经自带 `/AP` 渲染）。
       既有 `/AP` 不被覆盖，双后端零改动
+- [x] 地理空间测量字典（`/Measure`，ISO 32000-1 §13.2，`measure.rs`）：解析注释的 `/Measure`
+      字典为 `Measure` 数据模型——子类型（通常 `GEO`）、地理坐标系（`/GCS`，含 EPSG 代码与 WKT
+      定义）、地理空间点数组（`/GPTS`，纬度/经度对）、边界矩形（`/Bounds`）、测量单位（`/PDU`
+      点距离单位、`/DU` 显示单位、`/A` 面积单位）。用于 PDF 2.0 Projection 注释的 GIS/地图应用。
+      纯数据模型、不执行坐标变换；facade re-export `Measure`//GeographicCoordinateSystem`；
+      `Annotation::measure` 字段暴露；CLI `zpdf links` 在有 `/Measure` 的注释旁显示子类型与 EPSG。
+      带安全限制（GPTS 数组上限 1024 值、WKT 字符串上限 32 KiB），纯 Rust 零新依赖
 
 ### P4.10 — 文档导航与元数据
 
