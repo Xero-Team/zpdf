@@ -16,3 +16,6 @@ zpdf-core.workspace = true
 zpdf-parser.workspace = true
 zpdf-font.workspace = true
 tracing.workspace = true
+# Pure-Rust digests (RustCrypto) for signature byte-range integrity checks.
+sha1.workspace = true
+sha2.workspace = true
