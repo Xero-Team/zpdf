@@ -2122,14 +2122,26 @@ impl Decoder {
         let mut new_syms: Vec<Rc<Bitmap>> = Vec::with_capacity(num_new.min(1024));
         let mut hc_height: i64 = 0;
         let mut total_area: usize = 0;
+        let mut iterations = 0usize;
         while new_syms.len() < num_new {
+            iterations += 1;
+            if iterations > num_new.saturating_mul(2) {
+                return Err(err("symbol dictionary decode exceeded iteration budget"));
+            }
             let dh = decode_int(&mut mq, &mut iadh).ok_or_else(|| err("unexpected OOB in IADH"))?;
             hc_height += dh;
             if hc_height <= 0 || hc_height > MAX_DIMENSION as i64 {
                 return Err(err(format!("implausible symbol height {hc_height}")));
             }
             let mut sym_width: i64 = 0;
+            let mut width_iterations = 0usize;
             while let Some(dw) = decode_int(&mut mq, &mut iadw) {
+                width_iterations += 1;
+                if width_iterations > num_new.saturating_add(1) {
+                    return Err(err(
+                        "symbol dictionary width loop exceeded iteration budget",
+                    ));
+                }
                 sym_width += dw;
                 if sym_width <= 0 || sym_width > MAX_DIMENSION as i64 {
                     return Err(err(format!("implausible symbol width {sym_width}")));
@@ -2218,7 +2230,14 @@ impl Decoder {
         let mut exported: Vec<Rc<Bitmap>> = Vec::with_capacity(num_ex.min(1024));
         let mut idx = 0usize;
         let mut exporting = false;
+        let mut export_iterations = 0usize;
         while idx < total {
+            export_iterations += 1;
+            if export_iterations > total.saturating_mul(2) {
+                return Err(err(
+                    "symbol dictionary export loop exceeded iteration budget",
+                ));
+            }
             let run =
                 decode_int(&mut mq, &mut iaex).ok_or_else(|| err("unexpected OOB in IAEX"))?;
             if run < 0 || idx as i64 + run > total as i64 {
@@ -2263,7 +2282,12 @@ impl Decoder {
         let mut new_syms: Vec<Rc<Bitmap>> = Vec::with_capacity(num_new.min(1024));
         let mut hc_height: i64 = 0;
         let mut total_area: usize = 0;
+        let mut iterations = 0usize;
         while new_syms.len() < num_new {
+            iterations += 1;
+            if iterations > num_new.saturating_mul(2) {
+                return Err(err("symbol dictionary decode exceeded iteration budget"));
+            }
             let dh = dh_tab
                 .table()
                 .decode(&mut br)
@@ -2276,8 +2300,15 @@ impl Decoder {
             let mut widths: Vec<usize> = Vec::new();
             let mut sym_width: i64 = 0;
             let mut totwidth: i64 = 0;
+            let mut width_iterations = 0usize;
             // OOB from DW ends the height class.
             while let Some(dw) = dw_tab.table().decode(&mut br) {
+                width_iterations += 1;
+                if width_iterations > num_new.saturating_add(1) {
+                    return Err(err(
+                        "symbol dictionary width loop exceeded iteration budget",
+                    ));
+                }
                 sym_width += dw;
                 if sym_width <= 0 || sym_width > MAX_DIMENSION as i64 {
                     return Err(err(format!("implausible symbol width {sym_width}")));
@@ -2347,7 +2378,14 @@ impl Decoder {
         let mut exported: Vec<Rc<Bitmap>> = Vec::with_capacity(num_ex.min(1024));
         let mut idx = 0usize;
         let mut exporting = false;
+        let mut export_iterations = 0usize;
         while idx < total {
+            export_iterations += 1;
+            if export_iterations > total.saturating_mul(2) {
+                return Err(err(
+                    "symbol dictionary export loop exceeded iteration budget",
+                ));
+            }
             let run = ex_tab
                 .decode(&mut br)
                 .ok_or_else(|| err("unexpected OOB in Huffman EXFLAGS"))?;
@@ -4519,6 +4557,34 @@ mod tests {
         assert!(
             result.is_ok(),
             "decode should succeed with failed symbol dict"
+        );
+    }
+
+    #[test]
+    fn symbol_dict_iteration_budget_prevents_hang() {
+        // Fuzzer-found hang: symbol dictionary with huge num_new and MQ data
+        // that never produces symbols (keeps decoding height deltas without OOB).
+        let mut stream = segment(0, 48, &[], 1, &page_info_payload(10, 10, 0));
+        // Symbol dict with num_new = 1000, but MQ stream that loops on height deltas.
+        let mut sd_payload = Vec::new();
+        sd_payload.extend_from_slice(&0u16.to_be_bytes()); // flags: arithmetic, template 0
+        for &(ax, ay) in nominal_at(0).iter() {
+            sd_payload.push(ax as u8);
+            sd_payload.push(ay as u8);
+        }
+        sd_payload.extend_from_slice(&0u32.to_be_bytes()); // SDNUMEXSYMS
+        sd_payload.extend_from_slice(&1000u32.to_be_bytes()); // SDNUMNEWSYMS
+                                                              // Append MQ data that decodes small positive deltas forever (never OOB).
+                                                              // This is a pathological stream crafted to trigger the iteration budget.
+        for _ in 0..20 {
+            sd_payload.extend_from_slice(&[0x84, 0xC7, 0x3B, 0xFC]);
+        }
+        stream.extend_from_slice(&segment(1, 0, &[], 1, &sd_payload));
+        let result = decode(&stream, &Jbig2Params { globals: None });
+        // The symbol dict should fail with iteration budget exceeded.
+        assert!(
+            result.is_ok(),
+            "page decodes with failed symbol dict (warns, not fatal)"
         );
     }
 }
