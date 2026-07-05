@@ -33,3 +33,6 @@ zpdf-render-wgpu = { workspace = true, optional = true }
 # Pure-Rust zlib (rust_backend, no C deps) for building FlateDecode-compressed
 # embedded-file fixtures in the attachments end-to-end tests.
 flate2.workspace = true
+# Pure-Rust SHA-256 for computing the signed byte-range digest in the digital
+# signature end-to-end tests.
+sha2.workspace = true
