@@ -13,6 +13,7 @@ pub mod outline;
 pub mod output_intents;
 pub mod page;
 pub mod page_labels;
+pub mod signature;
 pub mod structure;
 pub mod xmp;
 
@@ -28,6 +29,7 @@ pub use outline::OutlineItem;
 pub use output_intents::OutputIntent;
 pub use page::{PdfPage, ResourceDict};
 pub use page_labels::{PageLabelStyle, PageLabels};
+pub use signature::{ByteRangeCoverage, DigestStatus, Signature};
 pub use structure::{StructElem, StructKid, StructRole, StructTree};
 pub use xmp::XmpMetadata;
 
@@ -289,6 +291,18 @@ impl PdfDocument {
     /// [`PdfDocument::struct_tree`] is actually present.
     pub fn is_tagged(&self) -> bool {
         structure::is_tagged(&self.file)
+    }
+
+    /// The document's digital signatures (`/Sig` form fields, ISO 32000-1
+    /// §12.8). Each [`Signature`] carries the signature dictionary's metadata,
+    /// its `/ByteRange` coverage, and a byte-range **integrity** verdict
+    /// ([`DigestStatus`]) obtained by recomputing the covered-bytes digest and
+    /// comparing it to the digest embedded in the CMS blob. This does *not*
+    /// verify the signer's public-key signature or certificate trust — see the
+    /// [`signature`] module docs. Empty when the document carries no signatures.
+    /// Read-only; runs only when called.
+    pub fn signatures(&self) -> Vec<Signature> {
+        signature::parse_signatures(&self.file)
     }
 }
 
