@@ -18,7 +18,7 @@ fn main() {
     if args.len() < 2 {
         eprintln!("Usage: zpdf <command> [args...]");
         eprintln!(
-            "Commands: info, dump, render, text, tables, forms, outline, links, struct, attachments, compare, debug-stream"
+            "Commands: info, dump, render, text, tables, forms, outline, links, struct, signatures, attachments, compare, debug-stream"
         );
         process::exit(1);
     }
@@ -33,6 +33,7 @@ fn main() {
         "outline" => cmd_outline(&args[2..]),
         "links" => cmd_links(&args[2..]),
         "struct" => cmd_struct(&args[2..]),
+        "signatures" => cmd_signatures(&args[2..]),
         "attachments" => cmd_attachments(&args[2..]),
         "compare" => cmd_compare(&args[2..]),
         "debug-stream" => cmd_debug_stream(&args[2..]),
@@ -508,6 +509,78 @@ fn print_struct_elem(elem: &zpdf::StructElem, depth: usize) {
             }
         }
     }
+}
+
+/// List the document's digital signatures, with each signature's declared
+/// metadata, its `/ByteRange` coverage, and the byte-range integrity verdict.
+///
+/// The verdict reports whether the *signed bytes are intact* (their digest
+/// matches the one embedded in the CMS blob); it does NOT verify the signer's
+/// cryptographic signature or certificate trust. The output labels this
+/// explicitly so it is never read as full validation.
+fn cmd_signatures(args: &[String]) -> zpdf::Result<()> {
+    let (args, password) = extract_password(args);
+    if args.is_empty() {
+        eprintln!("Usage: zpdf signatures <file.pdf> [--password <pw>]");
+        process::exit(1);
+    }
+
+    let doc = open_document(&args[0], password.as_deref())?;
+    let sigs = doc.signatures();
+    if sigs.is_empty() {
+        println!("No digital signatures (/Sig fields).");
+        return Ok(());
+    }
+
+    println!("Digital signatures: {}", sigs.len());
+    println!("(integrity = signed bytes match the CMS digest; NOT public-key/cert validation)");
+    for (i, s) in sigs.iter().enumerate() {
+        println!("\n[{}] field: {}", i + 1, s.field_name);
+        let field = |label: &str, value: &Option<String>| {
+            if let Some(v) = value {
+                println!("    {label}: {}", truncate_display(v));
+            }
+        };
+        field("Signer (/Name)", &s.name);
+        field("Signer CN (cert)", &s.signer_common_name);
+        field("Reason", &s.reason);
+        field("Location", &s.location);
+        field("Contact", &s.contact_info);
+        field("Signing time", &s.signing_time);
+        field("Filter", &s.filter);
+        field("SubFilter", &s.sub_filter);
+        if let Some(alg) = &s.digest_algorithm {
+            println!("    Digest algorithm: {alg}");
+        }
+
+        let cov = &s.coverage;
+        println!(
+            "    Coverage: {} span(s), whole document: {}{}",
+            cov.ranges.len(),
+            if cov.covers_whole_document {
+                "yes"
+            } else {
+                "no"
+            },
+            if cov.bytes_after_signature > 0 {
+                format!(
+                    " ({} byte(s) added after signing — later incremental update)",
+                    cov.bytes_after_signature
+                )
+            } else {
+                String::new()
+            }
+        );
+
+        let verdict = match s.digest {
+            zpdf::DigestStatus::Verified => "VERIFIED — signed bytes are intact",
+            zpdf::DigestStatus::Mismatch => "MISMATCH — signed bytes were altered",
+            zpdf::DigestStatus::Unsupported => "unsupported — no comparable digest",
+        };
+        println!("    Integrity: {verdict}");
+    }
+
+    Ok(())
 }
 
 /// Truncate a string for single-line display, appending `…` when shortened.
