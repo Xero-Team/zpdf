@@ -514,6 +514,36 @@ cargo run -p zpdf-render-wgpu --example viewer -- <file.pdf>   # 交互浏览器
       后端改动；真实标记文档端到端验证（页面上离行放置的内联代码段——几何提取会错位——被还原到
       句子的正确阅读位置）
 
+### P4.12 — 数字签名（Digital Signatures）
+
+- [x] `/Sig` 字段解析（ISO 32000-1 §12.8，`zpdf-document/src/signature.rs`）：遍历 AcroForm
+      字段树（带深度/visited/字段数上限），提取每个 `/Sig` 字段的签名字典（`/Filter`/`/SubFilter`/
+      `/Name`/`/M`/`/Location`/`/Reason`/`/ContactInfo`）、`/ByteRange`、`/Contents` CMS 负载
+- [x] 字节范围完整性验证（`DigestStatus`）：重算 `/ByteRange` 覆盖跨度的 SHA-1/256/384/512 摘要，
+      与 CMS `SignedData` 中 `messageDigest` 签名属性比对；一致为 `Verified`（覆盖字节完整），
+      不一致为 `Mismatch`（篡改）；不支持的 `/SubFilter`（非 `adbe.pkcs7.detached`/`ETSI.CAdES.detached`）
+      或 CMS 结构错误为 `Unsupported`。对抗性安全：最大 CMS 4 MiB、越界 `/ByteRange` 拒绝、
+      DER 解析器拒绝不定长/截断 TLV、无递归无索引越界
+- [x] 公钥签名验证（`CryptoStatus`，RustCrypto）：从 CMS `SignerInfo` 提取签名算法
+      （RSA PKCS#1 v1.5 / ECDSA P-256 / P-384）、签名属性 DER（`[0]` 标签改写为 `SET`）、
+      签名值（`signature` OCTET STRING）；从首个嵌入证书 `SubjectPublicKeyInfo` 提取公钥
+      （RSA `RSAPublicKey` / EC SEC1 点）；用摘要算法哈希签名属性，RSA/ECDSA 验签。验证通过为
+      `Valid`，失败为 `Invalid`（伪造/损坏），不支持的算法（RSA-PSS/DSA/非 P-256/384 曲线）或
+      无法解析的证书/公钥为 `Unsupported`。`Signature::is_cryptographically_valid()` 为
+      **完整性与签名双通过** — **不校验证书链信任锚、撤销、签名时效**（无信任库，范围外）
+- [x] CMS / X.509 最小化解析器（`cms` 模块）：手写 DER TLV 游走器（RFC 5652 CMS `SignedData`
+      + X.509 `Certificate`），提取摘要算法 OID、`messageDigest` 属性、首个证书的 CN 与 SPKI、
+      签名算法 OID、签名值。按 OID 分类跳过 `sid`（`issuerAndSerialNumber` 也是 `SEQUENCE`），
+      拒绝不定长，深度/节点数有界，返回 `Option`（结构异常不 panic）
+- [x] API：`PdfDocument::signatures() -> Vec<Signature>` (字段名/元数据/覆盖范围/摘要状态/
+      签名状态/算法名/签名者 CN)；facade re-export `Signature`/`DigestStatus`/`CryptoStatus`；
+      CLI `zpdf signatures` 逐签名打印双状态 + 综合"密码学健全"判据（带信任警告）
+- [x] 端到端测试：固定 `/Contents` 窗口（8192 字节十六进制）拼装带真实签名的 PDF（ECDSA P-256
+      确定性密钥 + RSA-2048 随机密钥），断言 `Verified`+`Valid`；损坏签名值断言 `Invalid`；
+      篡改已签字节断言 `Mismatch`；4 个既有字节范围摘要测试不变（无 `CryptoStatus` 字段的回归）
+- [x] 依赖：RustCrypto `rsa` 0.9（PKCS#1 v1.5）、`p256`/`p384` 0.13（ECDSA + SEC1 点 +
+      DER 签名）、`sha1`/`sha2` 0.10（`oid` feature 供 RSA `DigestInfo`）；全部纯 Rust 零 C
+
 ---
 
 ## 时间估算（参考）

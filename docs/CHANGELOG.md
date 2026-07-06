@@ -1,5 +1,90 @@
 # Changelog
 
+## 0.10.0 — Digital signature cryptographic verification (ISO 32000-1 §12.8)
+
+Complete public-key signature verification for PDF digital signatures, extending
+the existing byte-range integrity check with full RSA PKCS#1 v1.5 and ECDSA
+(P-256/P-384) cryptographic verification against embedded certificates.
+
+### Digital signature verification
+
+- **Byte-range integrity** (`DigestStatus`): the existing check recomputes the
+  SHA-1/256/384/512 digest of the `/ByteRange` spans and compares it to the
+  `messageDigest` signed attribute in the CMS blob. `Verified` = covered bytes
+  intact; `Mismatch` = tampered; `Unsupported` = unverifiable (unsupported
+  `/SubFilter`, out-of-range `/ByteRange`, corrupt CMS, etc.).
+
+- **Cryptographic signature verification** (`CryptoStatus`): **new**. Verifies
+  the signer's RSA (PKCS#1 v1.5, SHA-1/256/384/512) or ECDSA (P-256/P-384,
+  SHA-256) signature over the CMS signed attributes using the public key from the
+  first embedded certificate. `Valid` = signature verifies; `Invalid` = forged or
+  corrupt; `Unsupported` = unsupported algorithm (RSA-PSS, DSA, other curves) or
+  unparseable certificate/key. **Does NOT validate certificate trust chains,
+  revocation (CRL/OCSP), or signing-time validity** — those require a trust store
+  and network access, which are out of scope for this pure-Rust library.
+
+- **`Signature::is_cryptographically_valid()`**: convenience method returning
+  `true` only when **both** checks pass (digest `Verified` + crypto `Valid`).
+  This means "the signed bytes are intact and were signed by the private key
+  matching the embedded certificate" — still **not** "the signer is a trusted,
+  non-revoked identity." Callers must not overstate the verdict.
+
+- **CMS / X.509 parser** (`signature.rs` `cms` module): a minimal, bounded
+  hand-written DER TLV walker for RFC 5652 CMS `SignedData` and X.509
+  `Certificate`. Extracts the digest algorithm, `messageDigest` attribute, signer
+  certificate CN, `SubjectPublicKeyInfo` (algorithm + key bytes), signature
+  algorithm OID, signature value, and signed-attributes DER (with the `[0]`
+  IMPLICIT tag rewritten to `SET` per RFC 5652 §5.4 for hashing). Rejects
+  indefinite-length encoding, depth- and count-bounded, returns `Option` on
+  structural anomalies (never panics). OID-based classification skips `sid`
+  `issuerAndSerialNumber` SEQUENCEs robustly.
+
+- **Public-key verification** (`signature.rs` `pk` module): RustCrypto `rsa`
+  0.9 (PKCS#1 v1.5 verify), `p256`/`p384` 0.13 (ECDSA prehash verify). The
+  signature is verified over the digest of the SET-encoded signed attributes.
+
+### API
+
+- **New fields** on `Signature`: `crypto: CryptoStatus`, `signature_algorithm:
+  Option<String>` (e.g., `"RSA"`, `"ECDSA (P-256)"`), and
+  `is_cryptographically_valid()` method.
+- **Re-exports**: facade `zpdf` now re-exports `CryptoStatus`.
+- **CLI**: `zpdf signatures` prints both the integrity and cryptographic verdicts,
+  with a summary line when both pass (and an explicit "trust anchor NOT validated"
+  caveat).
+
+### Dependencies (pure Rust, no C)
+
+- **Runtime** (in `zpdf-document`): `rsa` 0.9, `p256` 0.13, `p384` 0.13,
+  `sha1`/`sha2` 0.10 with `oid` feature (supplies RSA `DigestInfo` prefixes).
+- **Dev** (test-only): `rand_chacha` 0.3 for deterministic RSA-2048 key
+  generation in acceptance tests.
+
+All dependencies are pure Rust with zero C/C++ toolchain requirements, preserving
+zpdf's no-C design.
+
+### Testing
+
+- **8 end-to-end tests** (4 existing byte-range tests + 4 new crypto tests):
+  - `ecdsa_p256_signature_verifies` — real deterministic ECDSA P-256 signer,
+    asserts `Verified` + `Valid`.
+  - `rsa_signature_verifies` — real RSA-2048 signer (deterministic via
+    `ChaCha20Rng`), asserts `Verified` + `Valid`.
+  - `corrupted_signature_is_detected_as_invalid` — flip the signature value (which
+    lives in the unsigned `/Contents` gap), asserts digest stays `Verified` but
+    crypto becomes `Invalid`.
+  - `tampered_body_fails_both_checks` — alter a signed byte in the document body,
+    asserts digest `Mismatch` (and thus not cryptographically valid overall).
+- The test signer builds real X.509 certificates with correct SPKIs, embeds them
+  in fully-formed CMS `SignedData` blobs, and signs the actual SET-encoded signed
+  attributes — a genuine end-to-end path.
+
+### Verification
+
+All workspace tests pass (49 tests), including the signature acceptance suite.
+`cargo clippy --workspace -- -D warnings` clean. Functional smoke-testing on
+synthetic signed PDFs confirms both RSA and ECDSA paths.
+
 ## 0.9.0 — Performance & robustness improvements
 
 Comprehensive audit and optimization pass targeting rendering speed, memory usage, and security.
