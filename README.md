@@ -56,6 +56,13 @@ GPU (wgpu) renderers whose output matches within <1% of pixels.
   `dest`/`uri`, CLI `links`), XMP `/Metadata` via a hardened, entity-expansion-safe
   scrape (`xmp_metadata()`), and the `/Info` dictionary (`info()`). `zpdf info`
   surfaces the `/Info`, XMP, outline, and page-label data.
+- **Digital signatures** — parses `/Sig` signature fields from AcroForm,
+  verifies **byte-range integrity** (recomputes SHA-1/256/384/512 digest of
+  `/ByteRange` spans vs. CMS `messageDigest`) and **cryptographic signatures**
+  (RSA PKCS#1 v1.5 / ECDSA P-256/P-384 over signed attributes using embedded
+  certificate public keys). `signatures()` API + CLI `zpdf signatures`.
+  **Note**: does NOT validate certificate trust chains or revocation — reports
+  "cryptographically sound" (bytes intact + signature valid), not "trusted signer."
 - **Logical structure / Tagged PDF** — the `/StructTreeRoot` structure tree
   (`struct_tree()`, CLI `struct`) read into a navigable model of structure
   elements with their roles (`/S` resolved through `/RoleMap` to standard types
@@ -69,7 +76,7 @@ GPU (wgpu) renderers whose output matches within <1% of pixels.
 - **CPU rendering** — tiny-skia backend, PNG output at any DPI.
 - **GPU rendering** — wgpu backend (fills, strokes, clips, text, images, blend
   groups); matches the CPU renderer within <1% pixels.
-- **Tooling** — CLI (`info`/`render`/`text`/`tables`/`forms`/`outline`/`links`/`struct`/`attachments`/`compare`/`dump`/`debug-stream`),
+- **Tooling** — CLI (`info`/`render`/`text`/`tables`/`forms`/`outline`/`links`/`struct`/`attachments`/`signatures`/`compare`/`dump`/`debug-stream`),
   an interactive winit viewer example, and a native GPUI desktop reader
   (`zpdf-viewer-gpui`).
 
@@ -162,7 +169,7 @@ to render on the GPU — everything upstream is identical. See [docs/library.md]
 
 ## Architecture
 
-14-crate workspace with a strict one-direction dependency flow. **Render backends
+15-crate workspace with a strict one-direction dependency flow. **Render backends
 depend only on `zpdf-display-list`, never on the parser** — parsing and rendering stay
 fully decoupled.
 
@@ -178,6 +185,7 @@ zpdf-core            Shared types: ObjectId, PdfObject, Matrix, Rect, Error, Par
   ├─ zpdf-render          RenderBackend trait
   │   ├─ zpdf-render-cpu   tiny-skia backend
   │   └─ zpdf-render-wgpu  wgpu backend (+ winit viewer example)
+  ├─ zpdf-writer     Incremental PDF writer (annotations, modifications)
   ├─ zpdf-cli        CLI tool
   ├─ zpdf-viewer-gpui  Native desktop reader (GPUI; depends on the facade)
   └─ zpdf            Facade crate (re-exports; feature-gates cpu / gpu)
@@ -221,6 +229,7 @@ zpdf-core            Shared types: ObjectId, PdfObject, Matrix, Rect, Error, Par
 | JBIG2 / JPX (JPEG 2000) filters | ✅ |
 | Optional content groups / layers (`/OCG`, `/OCMD`, `/VE`) | ✅ |
 | Predefined + embedded CMaps, vertical writing (`WMode 1`) | ✅ |
+| Digital signatures: byte-range integrity + RSA/ECDSA cryptographic verification | ✅ (no cert chain / revocation) |
 
 ## Dependencies
 
@@ -233,6 +242,7 @@ All pure Rust:
 | `flate2` (`rust_backend`) | FlateDecode |
 | `zune-jpeg` | JPEG (DCTDecode) |
 | `aes` + `cbc` + `sha2` | AES decryption (RustCrypto) |
+| `rsa` + `p256` + `p384` | RSA/ECDSA signature verification (RustCrypto) |
 | `image` | PNG I/O |
 | `winnow` | Parsing helpers |
 | `wgpu` + `lyon` + `pollster` | GPU rendering (`gpu-render` feature) |
