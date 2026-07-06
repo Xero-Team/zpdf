@@ -1,0 +1,18 @@
+[package]
+name = "zpdf-writer"
+description = "Incremental PDF writer for appending annotations and modifications"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+zpdf-core.workspace = true
+zpdf-parser.workspace = true
+zpdf-document.workspace = true
+thiserror.workspace = true
