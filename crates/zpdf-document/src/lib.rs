@@ -6,6 +6,7 @@ pub mod doc_info;
 pub mod embedded_files;
 pub mod font_loader;
 pub mod forms;
+pub mod ink;
 pub mod measure;
 mod obj_util;
 pub mod optional_content;
@@ -23,13 +24,14 @@ pub use destinations::{DestView, Destination};
 pub use doc_info::DocInfo;
 pub use embedded_files::{EmbeddedFile, EmbeddedSource};
 pub use forms::{AcroForm, FieldKind, FieldValue, FormField};
+pub use ink::{InkAnnotDict, InkAnnotationBuilder};
 pub use measure::{GeographicCoordinateSystem, Measure};
 pub use optional_content::OcConfig;
 pub use outline::OutlineItem;
 pub use output_intents::OutputIntent;
 pub use page::{PdfPage, ResourceDict};
 pub use page_labels::{PageLabelStyle, PageLabels};
-pub use signature::{ByteRangeCoverage, DigestStatus, Signature};
+pub use signature::{ByteRangeCoverage, CryptoStatus, DigestStatus, Signature};
 pub use structure::{StructElem, StructKid, StructRole, StructTree};
 pub use xmp::XmpMetadata;
 
@@ -295,12 +297,15 @@ impl PdfDocument {
 
     /// The document's digital signatures (`/Sig` form fields, ISO 32000-1
     /// §12.8). Each [`Signature`] carries the signature dictionary's metadata,
-    /// its `/ByteRange` coverage, and a byte-range **integrity** verdict
+    /// its `/ByteRange` coverage, a byte-range **integrity** verdict
     /// ([`DigestStatus`]) obtained by recomputing the covered-bytes digest and
-    /// comparing it to the digest embedded in the CMS blob. This does *not*
-    /// verify the signer's public-key signature or certificate trust — see the
-    /// [`signature`] module docs. Empty when the document carries no signatures.
-    /// Read-only; runs only when called.
+    /// comparing it to the digest embedded in the CMS blob, and a
+    /// **cryptographic** verdict ([`CryptoStatus`]) from verifying the signer's
+    /// RSA/ECDSA signature over the signed attributes against the embedded
+    /// certificate's public key. This does *not* validate certificate trust,
+    /// revocation, or signing-time validity — see the [`signature`] module docs
+    /// and [`Signature::is_cryptographically_valid`]. Empty when the document
+    /// carries no signatures. Read-only; runs only when called.
     pub fn signatures(&self) -> Vec<Signature> {
         signature::parse_signatures(&self.file)
     }
