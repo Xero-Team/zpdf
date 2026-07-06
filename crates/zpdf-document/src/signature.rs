@@ -7,23 +7,36 @@
 //! the signature verifiable — a `/ByteRange` naming which spans of the file are
 //! signed and a `/Contents` string holding the CMS (PKCS #7) signature blob.
 //!
-//! This module reads that dictionary into a data model and performs the one
-//! check that is possible with only a hash function: it recomputes the digest of
-//! the signed byte range and compares it against the `messageDigest` attribute
-//! embedded in the CMS structure. A match proves the covered bytes are exactly
-//! what the signature committed to — i.e. the document was **not altered inside
-//! the signed range** after signing.
+//! This module reads that dictionary into a data model and performs two
+//! independent checks:
 //!
-//! What this module deliberately does **not** do: verify the signer's RSA/ECDSA
-//! signature over those attributes, or validate the certificate chain to a trust
-//! anchor. Those require public-key cryptography and a trust store, neither of
-//! which lives in this pure-Rust, dependency-light crate. So a [`DigestStatus::Verified`]
-//! result means "the signed bytes are intact," not "the signer is authentic and
-//! trusted." Callers presenting this to users must not overstate it.
+//! 1. **Byte-range integrity** ([`DigestStatus`]): it recomputes the digest of
+//!    the signed byte range and compares it against the `messageDigest`
+//!    attribute embedded in the CMS structure. A match proves the covered bytes
+//!    are exactly what the signature committed to — the document was **not
+//!    altered inside the signed range** after signing.
+//!
+//! 2. **Cryptographic signature** ([`CryptoStatus`]): it verifies the signer's
+//!    RSA (PKCS #1 v1.5) or ECDSA (NIST P-256 / P-384) signature over the
+//!    signed attributes, using the public key of the first certificate carried
+//!    in the CMS blob. A [`CryptoStatus::Valid`] verdict proves the signed
+//!    attributes (which bind the `messageDigest`) were produced by the holder of
+//!    that certificate's private key.
+//!
+//! What this module deliberately does **not** do: validate the certificate
+//! chain to a trust anchor, check revocation (CRL/OCSP), or honour signing-time
+//! validity. Those require a trust store and network access, neither of which
+//! lives in this pure-Rust, dependency-light crate. So even a fully
+//! [`DigestStatus::Verified`] + [`CryptoStatus::Valid`] signature means "the
+//! signed bytes are intact and were signed by the private key matching the
+//! embedded certificate" — **not** "the signer is a trusted, non-revoked
+//! identity." Callers presenting this to users must not overstate it. See
+//! [`Signature::is_cryptographically_valid`].
 //!
 //! Everything here is bounded and best-effort: a malformed field tree, an
-//! out-of-range `/ByteRange`, or a corrupt CMS blob yields `None` / an
-//! [`DigestStatus::Unsupported`] verdict, never a panic.
+//! out-of-range `/ByteRange`, an unsupported algorithm, or a corrupt CMS blob
+//! yields `None` / an [`DigestStatus::Unsupported`] / [`CryptoStatus::Unsupported`]
+//! verdict, never a panic.
 
 use std::collections::HashSet;
 
@@ -70,13 +83,36 @@ pub struct Signature {
     /// Result of comparing the recomputed digest of the covered bytes to the
     /// digest embedded in the CMS blob.
     pub digest: DigestStatus,
+    /// Result of verifying the signer's public-key signature over the CMS signed
+    /// attributes, using the first embedded certificate's public key.
+    pub crypto: CryptoStatus,
     /// Human name of the digest algorithm named by the CMS `SignerInfo`
     /// (`SHA-1`, `SHA-256`, …), when it could be identified.
     pub digest_algorithm: Option<String>,
+    /// Human name of the signature (public-key) algorithm identified from the
+    /// CMS `SignerInfo` and the signer certificate (`RSA`, `ECDSA (P-256)`, …),
+    /// when it could be identified.
+    pub signature_algorithm: Option<String>,
     /// The Common Name (`CN`) of the first certificate in the CMS blob —
     /// typically, but not guaranteed to be, the signer's leaf certificate.
     /// Best-effort; `None` when no certificate / CN could be extracted.
     pub signer_common_name: Option<String>,
+}
+
+impl Signature {
+    /// True only when **both** checks pass: the signed bytes are intact
+    /// ([`DigestStatus::Verified`]) **and** the signer's signature over the
+    /// signed attributes verifies against the embedded certificate's public key
+    /// ([`CryptoStatus::Valid`]).
+    ///
+    /// This still does **not** establish trust: the certificate is not validated
+    /// against any anchor, nor checked for revocation. A `true` here means
+    /// "cryptographically sound, from the private key matching the embedded
+    /// certificate" — the certificate's *trustworthiness* is a separate,
+    /// out-of-scope question.
+    pub fn is_cryptographically_valid(&self) -> bool {
+        self.digest == DigestStatus::Verified && self.crypto == CryptoStatus::Valid
+    }
 }
 
 /// How a signature's `/ByteRange` covers the file.
@@ -115,6 +151,32 @@ impl DigestStatus {
             DigestStatus::Verified => "verified",
             DigestStatus::Mismatch => "mismatch",
             DigestStatus::Unsupported => "unsupported",
+        }
+    }
+}
+
+/// Verdict of the public-key signature check over the CMS signed attributes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CryptoStatus {
+    /// The signer's signature over the signed attributes verifies against the
+    /// public key of the embedded (first) certificate.
+    Valid,
+    /// A signature and key were present and of a supported algorithm, but the
+    /// signature does **not** verify — a forged, corrupt, or wrong-key blob.
+    Invalid,
+    /// The signature could not be checked: an unsupported `/SubFilter`, no
+    /// signed attributes, an unsupported signature/key algorithm (e.g. RSA-PSS,
+    /// DSA, or a curve other than P-256/P-384), or an unparseable certificate /
+    /// public key. The [`DigestStatus`] check may still be meaningful.
+    Unsupported,
+}
+
+impl CryptoStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CryptoStatus::Valid => "valid",
+            CryptoStatus::Invalid => "invalid",
+            CryptoStatus::Unsupported => "unsupported",
         }
     }
 }
@@ -231,8 +293,7 @@ fn build_signature(file: &PdfFile, field_name: String, sig: &PdfDict) -> Signatu
     };
 
     let coverage = parse_byte_range(file, sig, file.data().len());
-    let (digest, digest_algorithm, signer_common_name) =
-        verify(file, &coverage, contents.as_deref(), sub_filter.as_deref());
+    let outcome = verify(file, &coverage, contents.as_deref(), sub_filter.as_deref());
 
     Signature {
         field_name,
@@ -244,10 +305,21 @@ fn build_signature(file: &PdfFile, field_name: String, sig: &PdfDict) -> Signatu
         reason: sig.get("Reason").and_then(|o| text_string(file, o)),
         contact_info: sig.get("ContactInfo").and_then(|o| text_string(file, o)),
         coverage,
-        digest,
-        digest_algorithm,
-        signer_common_name,
+        digest: outcome.digest,
+        crypto: outcome.crypto,
+        digest_algorithm: outcome.digest_algorithm,
+        signature_algorithm: outcome.signature_algorithm,
+        signer_common_name: outcome.signer_common_name,
     }
+}
+
+/// The full result of verifying one signature's CMS blob.
+struct VerifyOutcome {
+    digest: DigestStatus,
+    crypto: CryptoStatus,
+    digest_algorithm: Option<String>,
+    signature_algorithm: Option<String>,
+    signer_common_name: Option<String>,
 }
 
 /// Parse `/ByteRange` into `(offset, length)` spans and classify coverage.
@@ -288,50 +360,124 @@ fn parse_byte_range(file: &PdfFile, sig: &PdfDict, file_len: usize) -> ByteRange
     }
 }
 
-/// Recompute the covered-bytes digest and compare it to the CMS `messageDigest`.
-/// Returns the verdict plus the identified digest-algorithm name and signer CN.
+/// Recompute the covered-bytes digest, compare it to the CMS `messageDigest`,
+/// and verify the signer's public-key signature over the signed attributes.
 fn verify(
     file: &PdfFile,
     coverage: &ByteRangeCoverage,
     contents: Option<&[u8]>,
     sub_filter: Option<&str>,
-) -> (DigestStatus, Option<String>, Option<String>) {
-    let Some(cms) = contents.filter(|c| !c.is_empty() && c.len() <= MAX_CMS_BYTES) else {
-        return (DigestStatus::Unsupported, None, None);
+) -> VerifyOutcome {
+    let unsupported = VerifyOutcome {
+        digest: DigestStatus::Unsupported,
+        crypto: CryptoStatus::Unsupported,
+        digest_algorithm: None,
+        signature_algorithm: None,
+        signer_common_name: None,
     };
 
-    let parsed = cms::parse(cms);
-    let alg = parsed.as_ref().and_then(|p| p.digest_alg);
-    let alg_name = alg.map(|a| a.name().to_string());
-    let cn = parsed.as_ref().and_then(|p| p.signer_cn.clone());
+    let Some(cms) = contents.filter(|c| !c.is_empty() && c.len() <= MAX_CMS_BYTES) else {
+        return unsupported;
+    };
 
-    // The digest check applies to the detached CMS SubFilters (PKCS#7 / CAdES),
-    // where the digest is taken over the byte range and stored as the
-    // messageDigest signed attribute. Other encodings (e.g. adbe.x509.rsa_sha1,
-    // adbe.pkcs7.sha1) are reported without a digest verdict.
+    let Some(parsed) = cms::parse(cms) else {
+        return unsupported;
+    };
+    let digest_algorithm = parsed.digest_alg.map(|a| a.name().to_string());
+    let signature_algorithm = signature_alg_name(&parsed);
+    let signer_common_name = parsed.signer_cn.clone();
+
+    // The checks apply to the detached CMS SubFilters (PKCS#7 / CAdES), where the
+    // digest is taken over the byte range and stored as the messageDigest signed
+    // attribute. Other encodings (e.g. adbe.x509.rsa_sha1) are reported without a
+    // verdict.
     let is_detached = matches!(
         sub_filter,
         Some("adbe.pkcs7.detached") | Some("ETSI.CAdES.detached")
     );
+    if !is_detached {
+        return VerifyOutcome {
+            digest: DigestStatus::Unsupported,
+            crypto: CryptoStatus::Unsupported,
+            digest_algorithm,
+            signature_algorithm,
+            signer_common_name,
+        };
+    }
 
-    let status = match (is_detached, parsed.as_ref(), alg) {
-        (true, Some(p), Some(alg)) if p.message_digest.is_some() => {
-            match gather_ranges(file.data(), &coverage.ranges) {
-                Some(spans) => {
-                    let computed = alg.hash(&spans);
-                    if computed.as_slice() == p.message_digest.as_deref().unwrap() {
-                        DigestStatus::Verified
-                    } else {
-                        DigestStatus::Mismatch
-                    }
+    // (1) Byte-range digest vs the messageDigest signed attribute.
+    let digest = match (parsed.digest_alg, parsed.message_digest.as_deref()) {
+        (Some(alg), Some(embedded)) => match gather_ranges(file.data(), &coverage.ranges) {
+            Some(spans) => {
+                if alg.hash(&spans) == embedded {
+                    DigestStatus::Verified
+                } else {
+                    DigestStatus::Mismatch
                 }
-                None => DigestStatus::Unsupported, // /ByteRange out of file bounds
             }
-        }
+            None => DigestStatus::Unsupported, // /ByteRange out of file bounds
+        },
         _ => DigestStatus::Unsupported,
     };
 
-    (status, alg_name, cn)
+    // (2) Public-key signature over the signed attributes.
+    let crypto = verify_crypto(&parsed);
+
+    VerifyOutcome {
+        digest,
+        crypto,
+        digest_algorithm,
+        signature_algorithm,
+        signer_common_name,
+    }
+}
+
+/// Verify the signer's RSA/ECDSA signature over the CMS signed attributes using
+/// the embedded certificate's public key. Returns [`CryptoStatus::Unsupported`]
+/// whenever a required piece is missing or the algorithm is not one we handle.
+fn verify_crypto(p: &cms::Cms) -> CryptoStatus {
+    let (Some(attrs), Some(sig), Some(key), Some(dalg), Some(salg)) = (
+        p.signed_attrs_der.as_deref(),
+        p.signature.as_deref(),
+        p.signer_key.as_ref(),
+        p.digest_alg,
+        p.sig_alg,
+    ) else {
+        return CryptoStatus::Unsupported;
+    };
+
+    // The signature is computed over the DER encoding of the signed attributes,
+    // hashed with the SignerInfo digest algorithm.
+    let hashed = dalg.hash(attrs);
+
+    let verified = match (salg, key.alg) {
+        (cms::SigAlg::Rsa, cms::KeyAlg::Rsa) => pk::rsa_verify(dalg, &key.key, &hashed, sig),
+        (cms::SigAlg::Ecdsa, cms::KeyAlg::EcP256) => pk::ecdsa_p256_verify(&key.key, &hashed, sig),
+        (cms::SigAlg::Ecdsa, cms::KeyAlg::EcP384) => pk::ecdsa_p384_verify(&key.key, &hashed, sig),
+        // RSA-PSS, DSA, mismatched sig/key algorithms, or unsupported curves.
+        _ => return CryptoStatus::Unsupported,
+    };
+
+    match verified {
+        Some(true) => CryptoStatus::Valid,
+        Some(false) => CryptoStatus::Invalid,
+        None => CryptoStatus::Unsupported, // key/signature failed to parse
+    }
+}
+
+/// A display name combining the signer's public-key algorithm with the curve,
+/// e.g. `RSA`, `ECDSA (P-256)`, `RSA-PSS`.
+fn signature_alg_name(p: &cms::Cms) -> Option<String> {
+    let salg = p.sig_alg?;
+    Some(match salg {
+        cms::SigAlg::Rsa => "RSA".to_string(),
+        cms::SigAlg::RsaPss => "RSA-PSS".to_string(),
+        cms::SigAlg::Ecdsa => match p.signer_key.as_ref().map(|k| k.alg) {
+            Some(cms::KeyAlg::EcP256) => "ECDSA (P-256)".to_string(),
+            Some(cms::KeyAlg::EcP384) => "ECDSA (P-384)".to_string(),
+            _ => "ECDSA".to_string(),
+        },
+    })
 }
 
 /// Collect the covered byte spans into a single buffer, or `None` if any span
@@ -409,6 +555,44 @@ mod cms {
         pub(super) digest_alg: Option<DigestAlg>,
         pub(super) message_digest: Option<Vec<u8>>,
         pub(super) signer_cn: Option<String>,
+        /// The signed attributes, DER-encoded with the outer `[0] IMPLICIT` tag
+        /// rewritten to `SET OF` (0x31) — exactly the bytes the signature is
+        /// computed over (RFC 5652 §5.4). `None` when the SignerInfo carries no
+        /// signed attributes.
+        pub(super) signed_attrs_der: Option<Vec<u8>>,
+        /// The `SignerInfo` signature value (the `signature` OCTET STRING).
+        pub(super) signature: Option<Vec<u8>>,
+        /// The signature (public-key) algorithm from the `SignerInfo`.
+        pub(super) sig_alg: Option<SigAlg>,
+        /// The public key of the first embedded certificate.
+        pub(super) signer_key: Option<PublicKeyInfo>,
+    }
+
+    /// The public-key algorithm named by the `SignerInfo` `signatureAlgorithm`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum SigAlg {
+        /// RSA PKCS #1 v1.5 (`rsaEncryption` or `sha*WithRSAEncryption`).
+        Rsa,
+        /// RSA-PSS (`id-RSASSA-PSS`) — recognised but not verified.
+        RsaPss,
+        /// ECDSA (`ecdsa-with-SHA*`).
+        Ecdsa,
+    }
+
+    /// A signer certificate's public key: its algorithm and raw key material.
+    pub(super) struct PublicKeyInfo {
+        pub(super) alg: KeyAlg,
+        /// For RSA: the `RSAPublicKey` DER (`SEQUENCE { modulus, exponent }`).
+        /// For ECDSA: the SEC1-encoded public point.
+        pub(super) key: Vec<u8>,
+    }
+
+    /// The public-key algorithm of a certificate's `SubjectPublicKeyInfo`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum KeyAlg {
+        Rsa,
+        EcP256,
+        EcP384,
     }
 
     // DER tags we care about.
@@ -416,12 +600,26 @@ mod cms {
     const SET: u8 = 0x31;
     const OID: u8 = 0x06;
     const OCTET_STRING: u8 = 0x04;
+    const BIT_STRING: u8 = 0x03;
     const CONTEXT_0: u8 = 0xA0; // [0] constructed / EXPLICIT
 
     // OIDs (raw content bytes).
     const OID_SIGNED_DATA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x02];
     const OID_MESSAGE_DIGEST: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x04];
     const OID_CN: &[u8] = &[0x55, 0x04, 0x03];
+
+    // Public-key / signature algorithm OIDs.
+    // RSA family: 1.2.840.113549.1.1.{1=rsaEncryption, 10=PSS, 4/5/11/12/13=sha*WithRSA}.
+    const OID_RSA_PREFIX: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01];
+    const OID_RSA_PSS: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0a];
+    // rsaEncryption 1.2.840.113549.1.1.1 (SPKI key algorithm).
+    const OID_RSA_PUBLIC_KEY: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01];
+    // EC: id-ecPublicKey 1.2.840.10045.2.1; ecdsa-with-* 1.2.840.10045.4.*.
+    const OID_EC_PUBLIC_KEY: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01];
+    const OID_ECDSA_PREFIX: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04];
+    // Named curves.
+    const OID_CURVE_P256: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07];
+    const OID_CURVE_P384: &[u8] = &[0x2b, 0x81, 0x04, 0x00, 0x22];
 
     /// Read one DER TLV from the front of `buf`: returns `(tag, content, rest)`.
     /// Rejects the indefinite-length form and lengths that run past `buf`.
@@ -465,6 +663,25 @@ mod cms {
         out
     }
 
+    /// Like [`children`], but each entry also carries the element's **full** raw
+    /// bytes (tag + length + content) — needed to re-encode the signed
+    /// attributes for hashing. Returns `(tag, content, full_tlv)`.
+    #[allow(clippy::type_complexity)]
+    fn children_raw(content: &[u8], max: usize) -> Vec<(u8, &[u8], &[u8])> {
+        let mut out = Vec::new();
+        let mut rest = content;
+        while !rest.is_empty() && out.len() < max {
+            let before = rest;
+            let Some((tag, body, next)) = tlv(rest) else {
+                break;
+            };
+            let consumed = before.len() - next.len();
+            out.push((tag, body, &before[..consumed]));
+            rest = next;
+        }
+        out
+    }
+
     pub(super) fn parse(blob: &[u8]) -> Option<Cms> {
         // ContentInfo ::= SEQUENCE { contentType OID, content [0] SignedData }
         let (tag, ci, _) = tlv(blob)?;
@@ -495,36 +712,72 @@ mod cms {
         if tag != SEQUENCE {
             return None;
         }
-        let si = children(signer_info, 16);
+        let si = children_raw(signer_info, 16);
 
         // SignerInfo: version INT, sid, digestAlgorithm SEQ, signedAttrs [0]?,
         // signatureAlgorithm SEQ, signature OCTET, unsignedAttrs [1]?.
-        // The digestAlgorithm is the first SEQUENCE after version + sid.
+        // `sid` (issuerAndSerialNumber) is *also* a SEQUENCE, so we can't pick the
+        // algorithm SEQUENCEs positionally. Instead classify each SEQUENCE's OID:
+        // sid's OIDs are X.509 attribute types (2.5.4.x) — never digest or
+        // signature OIDs — so the first SEQUENCE yielding each is unambiguous.
+        let seq_oid = |seq: &[u8]| -> Option<Vec<u8>> {
+            children(seq, 2)
+                .iter()
+                .find(|(t, _)| *t == OID)
+                .map(|(_, oid)| oid.to_vec())
+        };
         let digest_alg = si
             .iter()
-            .filter(|(t, _)| *t == SEQUENCE)
-            .find_map(|(_, seq)| {
-                let inner = children(seq, 2);
-                inner
-                    .iter()
-                    .find(|(t, _)| *t == OID)
-                    .and_then(|(_, oid)| DigestAlg::from_oid(oid))
-            });
+            .filter(|(t, _, _)| *t == SEQUENCE)
+            .find_map(|(_, seq, _)| seq_oid(seq).and_then(|oid| DigestAlg::from_oid(&oid)));
+        let sig_alg = si
+            .iter()
+            .filter(|(t, _, _)| *t == SEQUENCE)
+            .find_map(|(_, seq, _)| seq_oid(seq).and_then(|oid| sig_alg_from_oid(&oid)));
 
         // signedAttrs is the [0] IMPLICIT tag; its content is the concatenated
         // Attribute SEQUENCEs. Find the messageDigest attribute.
-        let message_digest = si
+        let signed_attrs = si.iter().find(|(t, _, _)| *t == CONTEXT_0);
+        let message_digest = signed_attrs.and_then(|(_, attrs, _)| find_message_digest(attrs));
+        // For hashing, the [0] IMPLICIT tag is replaced by SET OF (RFC 5652 §5.4).
+        let signed_attrs_der = signed_attrs.map(|(_, _, full)| {
+            let mut der = full.to_vec();
+            der[0] = SET;
+            der
+        });
+
+        // The signature value is the OCTET STRING after the two algorithm SEQs.
+        let signature = si
             .iter()
-            .find(|(t, _)| *t == CONTEXT_0)
-            .and_then(|(_, attrs)| find_message_digest(attrs));
+            .find(|(t, _, _)| *t == OCTET_STRING)
+            .map(|(_, body, _)| body.to_vec());
 
         let signer_cn = certs.and_then(first_cert_cn);
+        let signer_key = certs.and_then(first_cert_public_key);
 
         Some(Cms {
             digest_alg,
             message_digest,
             signer_cn,
+            signed_attrs_der,
+            signature,
+            sig_alg,
+            signer_key,
         })
+    }
+
+    /// Classify a `SignerInfo` `signatureAlgorithm` OID into an [`SigAlg`].
+    fn sig_alg_from_oid(oid: &[u8]) -> Option<SigAlg> {
+        if oid == OID_RSA_PSS {
+            Some(SigAlg::RsaPss)
+        } else if oid.starts_with(OID_RSA_PREFIX) {
+            // rsaEncryption or any sha*WithRSAEncryption → PKCS#1 v1.5.
+            Some(SigAlg::Rsa)
+        } else if oid.starts_with(OID_ECDSA_PREFIX) {
+            Some(SigAlg::Ecdsa)
+        } else {
+            None
+        }
     }
 
     /// Within a signed-attributes body (concatenated `Attribute` SEQUENCEs),
@@ -594,6 +847,70 @@ mod cms {
         None
     }
 
+    /// Extract the [`PublicKeyInfo`] from the first X.509 certificate's
+    /// `SubjectPublicKeyInfo`. Best-effort; `None` on any structural surprise or
+    /// an unsupported key algorithm / curve.
+    fn first_cert_public_key(certs: &[u8]) -> Option<PublicKeyInfo> {
+        // Certificate ::= SEQUENCE { tbsCertificate, sigAlg, sig }.
+        let (tag, cert, _) = tlv(certs)?;
+        if tag != SEQUENCE {
+            return None;
+        }
+        let (tag, tbs, _) = tlv(cert)?;
+        if tag != SEQUENCE {
+            return None;
+        }
+        // TBSCertificate SEQUENCEs, in order: signatureAlg, issuer, validity,
+        // subject, subjectPublicKeyInfo. The SPKI is the 5th SEQUENCE.
+        let spki = children(tbs, 16)
+            .into_iter()
+            .filter(|(t, _)| *t == SEQUENCE)
+            .nth(4)?;
+
+        // SubjectPublicKeyInfo ::= SEQUENCE { algorithm AlgorithmIdentifier,
+        //   subjectPublicKey BIT STRING }.
+        let spki_parts = children(spki.1, 2);
+        let alg_id = spki_parts.iter().find(|(t, _)| *t == SEQUENCE)?.1;
+        let bit_string = spki_parts.iter().find(|(t, _)| *t == BIT_STRING)?.1;
+        // A BIT STRING's first content byte is the count of unused trailing bits
+        // (0 for keys); the key itself follows.
+        let key_bytes = bit_string
+            .split_first()
+            .and_then(|(unused, rest)| (*unused == 0).then(|| rest.to_vec()))?;
+
+        // AlgorithmIdentifier ::= SEQUENCE { algorithm OID, parameters ANY? }.
+        let alg_parts = children(alg_id, 2);
+        let alg_oid = alg_parts.iter().find(|(t, _)| *t == OID)?.1;
+
+        if alg_oid == OID_RSA_PUBLIC_KEY {
+            Some(PublicKeyInfo {
+                alg: KeyAlg::Rsa,
+                key: key_bytes,
+            })
+        } else if alg_oid == OID_EC_PUBLIC_KEY {
+            // The named curve is the *second* OID (the AlgorithmIdentifier
+            // parameter) after id-ecPublicKey.
+            let curve = alg_parts
+                .iter()
+                .filter(|(t, _)| *t == OID)
+                .nth(1)
+                .map(|(_, oid)| *oid)?;
+            let alg = if curve == OID_CURVE_P256 {
+                KeyAlg::EcP256
+            } else if curve == OID_CURVE_P384 {
+                KeyAlg::EcP384
+            } else {
+                return None;
+            };
+            Some(PublicKeyInfo {
+                alg,
+                key: key_bytes,
+            })
+        } else {
+            None
+        }
+    }
+
     /// Decode an X.520 DirectoryString value by tag: BMPString is UTF-16BE, the
     /// rest (UTF8String / PrintableString / IA5String / …) are treated as UTF-8.
     fn decode_directory_string(tag: u8, value: &[u8]) -> String {
@@ -607,6 +924,61 @@ mod cms {
         } else {
             String::from_utf8_lossy(value).into_owned()
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Public-key signature verification (RustCrypto)
+// ---------------------------------------------------------------------------
+//
+// Each verifier takes the already-computed digest of the signed attributes and
+// the raw signature/key bytes, and returns `Some(true)` on a valid signature,
+// `Some(false)` on a well-formed-but-failing one, or `None` when the key or
+// signature could not be parsed at all.
+
+mod pk {
+    use super::DigestAlg;
+    use rsa::pkcs1::DecodeRsaPublicKey;
+    use rsa::{Pkcs1v15Sign, RsaPublicKey};
+    use sha1::Sha1;
+    use sha2::{Sha256, Sha384, Sha512};
+
+    /// Verify an RSA PKCS #1 v1.5 signature. `key_der` is the `RSAPublicKey`
+    /// DER (`SEQUENCE { modulus, publicExponent }`); `hashed` is the digest of
+    /// the signed attributes under `alg`.
+    pub(super) fn rsa_verify(
+        alg: DigestAlg,
+        key_der: &[u8],
+        hashed: &[u8],
+        sig: &[u8],
+    ) -> Option<bool> {
+        let key = RsaPublicKey::from_pkcs1_der(key_der).ok()?;
+        let scheme = match alg {
+            DigestAlg::Sha1 => Pkcs1v15Sign::new::<Sha1>(),
+            DigestAlg::Sha256 => Pkcs1v15Sign::new::<Sha256>(),
+            DigestAlg::Sha384 => Pkcs1v15Sign::new::<Sha384>(),
+            DigestAlg::Sha512 => Pkcs1v15Sign::new::<Sha512>(),
+        };
+        Some(key.verify(scheme, hashed, sig).is_ok())
+    }
+
+    /// Verify an ECDSA signature over the NIST P-256 curve. `point` is the
+    /// SEC1-encoded public point; `sig` is the DER-encoded `(r, s)`.
+    pub(super) fn ecdsa_p256_verify(point: &[u8], hashed: &[u8], sig: &[u8]) -> Option<bool> {
+        use p256::ecdsa::signature::hazmat::PrehashVerifier;
+        use p256::ecdsa::{Signature, VerifyingKey};
+        let key = VerifyingKey::from_sec1_bytes(point).ok()?;
+        let sig = Signature::from_der(sig).ok()?;
+        Some(key.verify_prehash(hashed, &sig).is_ok())
+    }
+
+    /// Verify an ECDSA signature over the NIST P-384 curve.
+    pub(super) fn ecdsa_p384_verify(point: &[u8], hashed: &[u8], sig: &[u8]) -> Option<bool> {
+        use p384::ecdsa::signature::hazmat::PrehashVerifier;
+        use p384::ecdsa::{Signature, VerifyingKey};
+        let key = VerifyingKey::from_sec1_bytes(point).ok()?;
+        let sig = Signature::from_der(sig).ok()?;
+        Some(key.verify_prehash(hashed, &sig).is_ok())
     }
 }
 

@@ -36,3 +36,8 @@ flate2.workspace = true
 # Pure-Rust SHA-256 for computing the signed byte-range digest in the digital
 # signature end-to-end tests.
 sha2.workspace = true
+# Pure-Rust public-key crypto for *producing* real signed CMS blobs in the
+# digital-signature crypto-verification tests (mirrors the verify-side deps).
+rsa.workspace = true
+p256.workspace = true
+rand_chacha = "0.3"

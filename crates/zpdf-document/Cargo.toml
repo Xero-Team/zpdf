@@ -17,5 +17,10 @@ zpdf-parser.workspace = true
 zpdf-font.workspace = true
 tracing.workspace = true
 # Pure-Rust digests (RustCrypto) for signature byte-range integrity checks.
-sha1.workspace = true
-sha2.workspace = true
+# The `oid` feature lets these serve as the RSA PKCS#1 v1.5 DigestInfo hash.
+sha1 = { workspace = true, features = ["oid"] }
+sha2 = { workspace = true, features = ["oid"] }
+# Pure-Rust public-key verification for CMS signer signatures.
+rsa.workspace = true
+p256.workspace = true
+p384.workspace = true

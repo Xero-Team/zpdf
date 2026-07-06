@@ -15,6 +15,7 @@ members = [
     "crates/zpdf-render-wgpu",
     "crates/zpdf-viewer-gpui",
     "crates/zpdf-cli",
+    "crates/zpdf-writer",
 ]
 # The cargo-fuzz harness is a detached crate (nightly + sanitizer-only). Keep it
 # out of the normal workspace so `cargo build`/`test`/`clippy` never touch it.
@@ -44,6 +45,7 @@ zpdf-color = { path = "crates/zpdf-color", version = "0.9.0" }
 zpdf-render = { path = "crates/zpdf-render", version = "0.9.0" }
 zpdf-render-cpu = { path = "crates/zpdf-render-cpu", version = "0.9.0" }
 zpdf-render-wgpu = { path = "crates/zpdf-render-wgpu", version = "0.9.0" }
+zpdf-writer = { path = "crates/zpdf-writer", version = "0.9.0" }
 zpdf = { path = "crates/zpdf", version = "0.9.0", default-features = false }
 
 # external
@@ -61,6 +63,12 @@ aes = "0.8"
 cbc = "0.1"
 sha1 = "0.10"
 sha2 = "0.10"
+# Pure-Rust public-key verification (RustCrypto) for CMS/PKCS#7 digital
+# signatures: RSA PKCS#1 v1.5 and ECDSA over the NIST P-256/P-384 curves.
+# The `oid` feature on the digests supplies the DigestInfo prefixes RSA needs.
+rsa = "0.9"
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+p384 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
 zune-jpeg = "0.5"
 # Pure-Rust JPEG 2000 decoder (JPXDecode) from the hayro PDF renderer family.
 # Hand-written, #![forbid(unsafe_code)] at the crate level; the optional `simd`
