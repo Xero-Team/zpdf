@@ -1,15 +1,19 @@
 use std::collections::HashMap;
+use std::fs::File;
 use std::sync::Arc;
 
 use gpui::{
     div, img, prelude::*, px, rgb, App, Context, FocusHandle, Focusable, FontWeight,
-    InteractiveElement, MouseButton, ParentElement, RenderImage, StatefulInteractiveElement,
-    Styled, StyledImage, Window,
+    InteractiveElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement,
+    RenderImage, StatefulInteractiveElement, Styled, StyledImage, Window,
 };
 use zpdf::gpu::GpuContext;
+use zpdf_document::{InkAnnotDict, InkAnnotationBuilder};
+use zpdf_writer::IncrementalWriter;
 
 use crate::actions::{
-    ActualSize, FirstPage, FitWidth, LastPage, NextPage, PreviousPage, ZoomIn, ZoomOut,
+    ActualSize, CancelAnnotation, FirstPage, FitWidth, LastPage, NextPage, PreviousPage,
+    SaveAnnotation, ToggleInkMode, ZoomIn, ZoomOut,
 };
 use crate::document::{LoadedDocument, PagePreview, PageSummary};
 
@@ -21,6 +25,12 @@ const SIDEBAR_WIDTH: f32 = 264.0;
 const PAGE_VIEWPORT_CHROME: f32 = 220.0;
 type ButtonPalette = (u32, u32, u32);
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum AnnotationMode {
+    None,
+    Ink,
+}
+
 pub struct Viewer {
     document: LoadedDocument,
     focus_handle: FocusHandle,
@@ -30,6 +40,18 @@ pub struct Viewer {
     page_cache: HashMap<usize, PagePreview>,
     gpu_context: Option<GpuContext>,
     last_error: Option<String>,
+
+    // Ink annotation state
+    annotation_mode: AnnotationMode,
+    current_stroke: Vec<(f32, f32)>,
+    ink_strokes: Vec<Vec<(f32, f32)>>,
+    ink_color: (f64, f64, f64),
+    ink_width: f64,
+    is_drawing: bool,
+
+    // Current rendered image bounds (for coordinate conversion)
+    current_image_width: f32,
+    current_image_height: f32,
 }
 
 impl Viewer {
@@ -43,6 +65,14 @@ impl Viewer {
             page_cache: HashMap::new(),
             gpu_context: None,
             last_error: None,
+            annotation_mode: AnnotationMode::None,
+            current_stroke: Vec::new(),
+            ink_strokes: Vec::new(),
+            ink_color: (0.0, 0.0, 0.0), // black
+            ink_width: 2.0,
+            is_drawing: false,
+            current_image_width: 0.0,
+            current_image_height: 0.0,
         }
     }
 
@@ -118,6 +148,221 @@ impl Viewer {
 
     fn fit_width(&mut self, _: &FitWidth, _: &mut Window, cx: &mut Context<Self>) {
         self.fit_width = true;
+        cx.notify();
+    }
+
+    fn toggle_ink_mode(&mut self, _: &ToggleInkMode, _: &mut Window, cx: &mut Context<Self>) {
+        match self.annotation_mode {
+            AnnotationMode::None => {
+                self.annotation_mode = AnnotationMode::Ink;
+                self.current_stroke.clear();
+                self.ink_strokes.clear();
+            }
+            AnnotationMode::Ink => {
+                self.annotation_mode = AnnotationMode::None;
+                self.current_stroke.clear();
+                self.ink_strokes.clear();
+            }
+        }
+        cx.notify();
+    }
+
+    fn cancel_annotation(&mut self, _: &CancelAnnotation, _: &mut Window, cx: &mut Context<Self>) {
+        self.annotation_mode = AnnotationMode::None;
+        self.current_stroke.clear();
+        self.ink_strokes.clear();
+        cx.notify();
+    }
+
+    fn save_annotation(&mut self, _: &SaveAnnotation, window: &mut Window, cx: &mut Context<Self>) {
+        tracing::warn!("=== SAVE ANNOTATION CALLED ===");
+        tracing::warn!("Number of strokes: {}", self.ink_strokes.len());
+
+        if self.ink_strokes.is_empty() {
+            tracing::warn!("No strokes to save!");
+            self.last_error = Some("No strokes to save".to_string());
+            cx.notify();
+            return;
+        }
+
+        // Get the current page info
+        let page = &self.document.summary.pages[self.current_page];
+        let zoom = self.effective_zoom(window);
+
+        tracing::warn!("Page dimensions: {}x{}", page.width, page.height);
+        tracing::warn!("Zoom: {}", zoom);
+
+        // Convert screen coordinates to PDF coordinates
+        let mut builder = InkAnnotationBuilder::new();
+        builder.set_color(self.ink_color.0, self.ink_color.1, self.ink_color.2);
+        builder.set_width(self.ink_width);
+
+        for (stroke_idx, stroke) in self.ink_strokes.iter().enumerate() {
+            tracing::warn!("Stroke {}: {} points", stroke_idx, stroke.len());
+            if let Some(first) = stroke.first() {
+                tracing::warn!("  Screen coords - first: ({}, {})", first.0, first.1);
+            }
+
+            let pdf_stroke: Vec<(f64, f64)> = stroke
+                .iter()
+                .map(|&(screen_x, screen_y)| self.screen_to_pdf(screen_x, screen_y, page, zoom))
+                .collect();
+
+            if let Some(first) = pdf_stroke.first() {
+                tracing::warn!("  PDF coords - first: ({}, {})", first.0, first.1);
+            }
+
+            if !pdf_stroke.is_empty() {
+                builder.add_stroke(pdf_stroke);
+            }
+        }
+
+        match builder.build() {
+            Some((annot_dict, appearance)) => {
+                tracing::warn!(
+                    "Built annotation, appearance size: {} bytes",
+                    appearance.len()
+                );
+                // Save to file
+                if let Err(e) = self.save_to_file(&annot_dict, &appearance) {
+                    tracing::error!("Save failed: {}", e);
+                    self.last_error = Some(format!("Failed to save: {}", e));
+                } else {
+                    tracing::warn!("Save successful!");
+                    // Success - exit ink mode and reload
+                    self.annotation_mode = AnnotationMode::None;
+                    self.current_stroke.clear();
+                    self.ink_strokes.clear();
+                    self.page_cache.clear();
+                    self.last_error = None;
+                }
+            }
+            None => {
+                tracing::error!("Failed to build annotation");
+                self.last_error = Some("Failed to build annotation".to_string());
+            }
+        }
+        cx.notify();
+    }
+
+    fn screen_to_pdf(
+        &self,
+        screen_x: f32,
+        screen_y: f32,
+        page: &crate::document::PageSummary,
+        zoom: f32,
+    ) -> (f64, f64) {
+        // Screen coordinates should be relative to the page_container div
+        // The image fills the container, so coords should map directly
+        // Scale factor: DPI / 72.0 * zoom
+        let scale = PREVIEW_DPI / 72.0 * zoom;
+
+        tracing::warn!(
+            "  screen_to_pdf: screen=({}, {}), scale={}, page_size=({}, {})",
+            screen_x,
+            screen_y,
+            scale,
+            page.width,
+            page.height
+        );
+        tracing::warn!(
+            "  image_size=({}, {})",
+            self.current_image_width,
+            self.current_image_height
+        );
+
+        // Check if click is within image bounds
+        if screen_x < 0.0
+            || screen_x > self.current_image_width
+            || screen_y < 0.0
+            || screen_y > self.current_image_height
+        {
+            tracing::warn!("  WARNING: Click outside image bounds!");
+        }
+
+        // Convert to PDF coordinates
+        // PDF origin is bottom-left, screen origin is top-left
+        let pdf_x = (screen_x / scale) as f64;
+        let pdf_y = ((page.height as f32) - (screen_y / scale)) as f64;
+
+        tracing::warn!("  -> pdf=({}, {})", pdf_x, pdf_y);
+
+        (pdf_x, pdf_y)
+    }
+
+    fn save_to_file(
+        &self,
+        annot_dict: &InkAnnotDict,
+        appearance: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // Read the original PDF
+        let original_bytes = std::fs::read(&self.document.summary.path)?;
+
+        // Create incremental writer
+        let mut writer = IncrementalWriter::new(original_bytes)?;
+
+        // Add the annotation
+        writer.add_ink_annotation_to_page(self.current_page, annot_dict, appearance)?;
+
+        // Write to temporary file
+        let temp_path = self.document.summary.path.with_extension("pdf.tmp");
+        let mut temp_file = File::create(&temp_path)?;
+        writer.write(&mut temp_file)?;
+        temp_file.sync_all()?;
+        drop(temp_file);
+
+        // Atomic rename
+        std::fs::rename(&temp_path, &self.document.summary.path)?;
+
+        Ok(())
+    }
+
+    fn handle_ink_mouse_down(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
+        if self.annotation_mode != AnnotationMode::Ink {
+            return;
+        }
+        tracing::warn!(
+            "=== Mouse DOWN at position: ({}, {}) ===",
+            event.position.x,
+            event.position.y
+        );
+        tracing::warn!(
+            "    Current image size: {} x {}",
+            self.current_image_width,
+            self.current_image_height
+        );
+
+        self.is_drawing = true;
+        self.current_stroke.clear();
+        self.current_stroke
+            .push((event.position.x.into(), event.position.y.into()));
+        cx.notify();
+    }
+
+    fn handle_ink_mouse_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if self.annotation_mode != AnnotationMode::Ink || !self.is_drawing {
+            return;
+        }
+        // Only log every 10th point to avoid spam
+        if self.current_stroke.len().is_multiple_of(10) {
+            tracing::warn!("    Move to: ({}, {})", event.position.x, event.position.y);
+        }
+        self.current_stroke
+            .push((event.position.x.into(), event.position.y.into()));
+        cx.notify();
+    }
+
+    fn handle_ink_mouse_up(&mut self, _event: &MouseUpEvent, cx: &mut Context<Self>) {
+        if self.annotation_mode != AnnotationMode::Ink || !self.is_drawing {
+            return;
+        }
+        tracing::warn!("Mouse UP - stroke has {} points", self.current_stroke.len());
+        self.is_drawing = false;
+        if !self.current_stroke.is_empty() {
+            self.ink_strokes.push(self.current_stroke.clone());
+            tracing::warn!("Total strokes: {}", self.ink_strokes.len());
+            self.current_stroke.clear();
+        }
         cx.notify();
     }
 
@@ -322,6 +567,107 @@ impl Render for Viewer {
                 let width = preview.pixel_width * zoom;
                 let height = preview.pixel_height * zoom;
 
+                // Track current image dimensions for coordinate conversion
+                self.current_image_width = width;
+                self.current_image_height = height;
+
+                let page_container = div()
+                    .bg(rgb(0xffffff))
+                    .border_1()
+                    .border_color(rgb(0xd8d0c2))
+                    .shadow_lg()
+                    .relative() // Make container positioned for absolute children
+                    .child(
+                        img(self.current_render_image().expect("preview image"))
+                            .w(px(width))
+                            .h(px(height))
+                            .object_fit(gpui::ObjectFit::Fill),
+                    );
+
+                // Add stroke overlay when in ink mode
+                let page_container = if self.annotation_mode == AnnotationMode::Ink {
+                    let mut container = page_container;
+
+                    // Render completed strokes
+                    for stroke in &self.ink_strokes {
+                        for point in stroke {
+                            container = container.child(
+                                div()
+                                    .absolute()
+                                    .left(px(point.0 - 2.0))
+                                    .top(px(point.1 - 2.0))
+                                    .w(px(4.0))
+                                    .h(px(4.0))
+                                    .rounded(px(2.0))
+                                    .bg(rgb(0xff0000)), // Red
+                            );
+                        }
+                    }
+
+                    // Render current stroke being drawn
+                    for point in &self.current_stroke {
+                        container = container.child(
+                            div()
+                                .absolute()
+                                .left(px(point.0 - 2.0))
+                                .top(px(point.1 - 2.0))
+                                .w(px(4.0))
+                                .h(px(4.0))
+                                .rounded(px(2.0))
+                                .bg(rgb(0xff0000)), // Red
+                        );
+                    }
+
+                    // Add a crosshair at the last point for debugging
+                    if let Some(last_point) = self.current_stroke.last() {
+                        container = container
+                            .child(
+                                div()
+                                    .absolute()
+                                    .left(px(last_point.0 - 10.0))
+                                    .top(px(last_point.1 - 1.0))
+                                    .w(px(20.0))
+                                    .h(px(2.0))
+                                    .bg(rgb(0x00ff00)), // Green horizontal line
+                            )
+                            .child(
+                                div()
+                                    .absolute()
+                                    .left(px(last_point.0 - 1.0))
+                                    .top(px(last_point.1 - 10.0))
+                                    .w(px(2.0))
+                                    .h(px(20.0))
+                                    .bg(rgb(0x00ff00)), // Green vertical line
+                            );
+                    }
+
+                    container
+                } else {
+                    page_container
+                };
+
+                // Add mouse handlers when in ink mode
+                let page_container = if self.annotation_mode == AnnotationMode::Ink {
+                    page_container
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, event, _, cx| {
+                                this.handle_ink_mouse_down(event, cx);
+                            }),
+                        )
+                        .on_mouse_move(cx.listener(|this, event, _, cx| {
+                            this.handle_ink_mouse_move(event, cx);
+                        }))
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, event, _, cx| {
+                                this.handle_ink_mouse_up(event, cx);
+                            }),
+                        )
+                } else {
+                    page_container
+                };
+
                 div()
                     .flex()
                     .justify_center()
@@ -334,19 +680,7 @@ impl Render for Viewer {
                             .border_1()
                             .border_color(rgb(0xbeb29d))
                             .shadow_lg()
-                            .child(
-                                div()
-                                    .bg(rgb(0xffffff))
-                                    .border_1()
-                                    .border_color(rgb(0xd8d0c2))
-                                    .shadow_lg()
-                                    .child(
-                                        img(self.current_render_image().expect("preview image"))
-                                            .w(px(width))
-                                            .h(px(height))
-                                            .object_fit(gpui::ObjectFit::Fill),
-                                    ),
-                            ),
+                            .child(page_container),
                     )
                     .into_any_element()
             }
@@ -391,6 +725,9 @@ impl Render for Viewer {
             .on_action(cx.listener(Self::zoom_out))
             .on_action(cx.listener(Self::actual_size))
             .on_action(cx.listener(Self::fit_width))
+            .on_action(cx.listener(Self::toggle_ink_mode))
+            .on_action(cx.listener(Self::save_annotation))
+            .on_action(cx.listener(Self::cancel_annotation))
             .size_full()
             .flex()
             .bg(rgb(0x0d1210))
@@ -692,6 +1029,68 @@ impl Render for Viewer {
                                             .on_click(cx.listener(|this, _, window, cx| {
                                                 this.fit_width(&FitWidth, window, cx)
                                             })),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        self.tool_button(
+                                            "ink-mode",
+                                            "✏ Ink",
+                                            self.annotation_mode == AnnotationMode::Ink,
+                                        )
+                                        .on_click(
+                                            cx.listener(|this, _, window, cx| {
+                                                this.toggle_ink_mode(&ToggleInkMode, window, cx)
+                                            }),
+                                        ),
+                                    )
+                                    .when(
+                                        self.annotation_mode == AnnotationMode::Ink,
+                                        |container| {
+                                            container
+                                                .child(
+                                                    div()
+                                                        .px_3()
+                                                        .text_sm()
+                                                        .text_color(rgb(0xbfb5a5))
+                                                        .child(format!(
+                                                            "{} stroke(s)",
+                                                            self.ink_strokes.len()
+                                                        )),
+                                                )
+                                                .child(
+                                                    self.tool_button(
+                                                        "save-annotation",
+                                                        "Save",
+                                                        false,
+                                                    )
+                                                    .on_click(cx.listener(|this, _, window, cx| {
+                                                        this.save_annotation(
+                                                            &SaveAnnotation,
+                                                            window,
+                                                            cx,
+                                                        )
+                                                    })),
+                                                )
+                                                .child(
+                                                    self.tool_button(
+                                                        "cancel-annotation",
+                                                        "Cancel",
+                                                        false,
+                                                    )
+                                                    .on_click(cx.listener(|this, _, window, cx| {
+                                                        this.cancel_annotation(
+                                                            &CancelAnnotation,
+                                                            window,
+                                                            cx,
+                                                        )
+                                                    })),
+                                                )
+                                        },
                                     ),
                             ),
                     )

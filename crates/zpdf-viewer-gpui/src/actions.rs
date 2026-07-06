@@ -11,6 +11,9 @@ actions!(
         ZoomIn,
         ZoomOut,
         ActualSize,
-        FitWidth
+        FitWidth,
+        ToggleInkMode,
+        SaveAnnotation,
+        CancelAnnotation
     ]
 );

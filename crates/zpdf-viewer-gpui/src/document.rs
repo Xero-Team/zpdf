@@ -158,10 +158,50 @@ impl LoadedDocument {
             .with_document(self.pdf.file(), &page.resources)
             .with_images(&mut images)
             .with_colors(&mut colors);
-        if let Some(profile) = oi_cmyk {
-            interpreter = interpreter.with_output_intent_cmyk(profile);
+        if let Some(ref profile) = oi_cmyk {
+            interpreter = interpreter.with_output_intent_cmyk(profile.clone());
         }
-        let display_list = interpreter.interpret(&content);
+        let mut display_list = interpreter.interpret(&content);
+
+        // Render annotations on top of page content
+        let annotations = self.pdf.page_annotations(&page);
+        for annot in annotations {
+            // Skip hidden or no-view annotations
+            if (annot.flags & 0x02) != 0 || (annot.flags & 0x20) != 0 {
+                continue;
+            }
+
+            // Render the annotation's appearance stream
+            if let Some(appearance_id) = annot.appearance {
+                // Try to decode the appearance stream
+                match self.pdf.file().resolve_stream_data(appearance_id) {
+                    Ok(appearance_content) => {
+                        // Create an interpreter for the annotation appearance
+                        let mut annot_interp = ContentInterpreter::new(annot.rect)
+                            .with_fonts(&mut fonts)
+                            .with_document(self.pdf.file(), &page.resources)
+                            .with_images(&mut images)
+                            .with_colors(&mut colors);
+                        if let Some(ref profile) = oi_cmyk {
+                            annot_interp = annot_interp.with_output_intent_cmyk(profile.clone());
+                        }
+
+                        let annot_display_list = annot_interp.interpret(&appearance_content);
+
+                        // Merge annotation display list commands into main display list
+                        display_list.commands.extend(annot_display_list.commands);
+                    }
+                    Err(e) => {
+                        // Skip annotations with invalid appearance streams
+                        tracing::warn!(
+                            "Failed to decode annotation appearance {}: {}",
+                            appearance_id,
+                            e
+                        );
+                    }
+                }
+            }
+        }
 
         let mut renderer = WgpuRenderer::new().with_fonts(&fonts).with_images(&images);
         if let Some(context) = context_slot.take() {
