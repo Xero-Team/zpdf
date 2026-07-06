@@ -533,7 +533,10 @@ fn cmd_signatures(args: &[String]) -> zpdf::Result<()> {
     }
 
     println!("Digital signatures: {}", sigs.len());
-    println!("(integrity = signed bytes match the CMS digest; NOT public-key/cert validation)");
+    println!(
+        "(integrity = signed bytes match the CMS digest; signature = signer's public-key \
+         signature verifies; neither validates certificate trust or revocation)"
+    );
     for (i, s) in sigs.iter().enumerate() {
         println!("\n[{}] field: {}", i + 1, s.field_name);
         let field = |label: &str, value: &Option<String>| {
@@ -551,6 +554,9 @@ fn cmd_signatures(args: &[String]) -> zpdf::Result<()> {
         field("SubFilter", &s.sub_filter);
         if let Some(alg) = &s.digest_algorithm {
             println!("    Digest algorithm: {alg}");
+        }
+        if let Some(alg) = &s.signature_algorithm {
+            println!("    Signature algorithm: {alg}");
         }
 
         let cov = &s.coverage;
@@ -572,12 +578,25 @@ fn cmd_signatures(args: &[String]) -> zpdf::Result<()> {
             }
         );
 
-        let verdict = match s.digest {
+        let integrity = match s.digest {
             zpdf::DigestStatus::Verified => "VERIFIED — signed bytes are intact",
             zpdf::DigestStatus::Mismatch => "MISMATCH — signed bytes were altered",
             zpdf::DigestStatus::Unsupported => "unsupported — no comparable digest",
         };
-        println!("    Integrity: {verdict}");
+        println!("    Integrity: {integrity}");
+
+        let signature = match s.crypto {
+            zpdf::CryptoStatus::Valid => {
+                "VALID — signature verifies (certificate trust NOT checked)"
+            }
+            zpdf::CryptoStatus::Invalid => "INVALID — signature does not verify",
+            zpdf::CryptoStatus::Unsupported => "unsupported — algorithm/key not verifiable",
+        };
+        println!("    Signature: {signature}");
+
+        if s.is_cryptographically_valid() {
+            println!("    => Cryptographically sound (bytes intact + signature valid); trust anchor NOT validated");
+        }
     }
 
     Ok(())
