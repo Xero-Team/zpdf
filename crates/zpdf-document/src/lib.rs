@@ -23,7 +23,11 @@ pub use catalog::Catalog;
 pub use destinations::{DestView, Destination};
 pub use doc_info::DocInfo;
 pub use embedded_files::{EmbeddedFile, EmbeddedSource};
-pub use forms::{AcroForm, FieldKind, FieldValue, FormField};
+pub use forms::{
+    build_resources, escape_text, generate_widget_appearance, standard_font_dict,
+    unicode_to_winansi, AcroForm, FieldKind, FieldValue, FormField, GeneratedAppearance,
+    FF_READONLY,
+};
 pub use ink::{InkAnnotDict, InkAnnotationBuilder};
 pub use measure::{GeographicCoordinateSystem, Measure};
 pub use optional_content::OcConfig;

@@ -82,6 +82,9 @@ pub enum FieldValue {
 /// A terminal interactive-form field.
 #[derive(Debug, Clone)]
 pub struct FormField {
+    /// The field dictionary's own object id — where `/V` lives (distinct from
+    /// the widget ids when the field has separate widget kids).
+    pub field_id: ObjectId,
     /// Fully-qualified name: the `/T` partial names of this field and its
     /// ancestors joined by `.` (PDF 12.7.3.2).
     pub name: String,
@@ -338,6 +341,7 @@ fn walk_field(
         state.widget_owner.entry(w).or_insert(index);
     }
     state.fields.push(FormField {
+        field_id: id,
         name,
         kind,
         flags: merged.flags,
@@ -863,7 +867,7 @@ fn strip_subset_prefix(name: &str) -> &str {
 
 /// Build the appearance `/Resources`: a `/Font` dict mapping the DA font name to
 /// the `/DR` font object (if any) or a synthesized standard Helvetica.
-pub(crate) fn build_resources(dr_fonts: Option<&PdfDict>, font_res_name: &str) -> PdfDict {
+pub fn build_resources(dr_fonts: Option<&PdfDict>, font_res_name: &str) -> PdfDict {
     let font_entry = dr_fonts
         .and_then(|dr| dr.get(font_res_name).cloned())
         .unwrap_or_else(|| PdfObject::Dict(standard_font_dict("Helvetica")));
@@ -878,7 +882,7 @@ pub(crate) fn build_resources(dr_fonts: Option<&PdfDict>, font_res_name: &str) -
 /// A synthesized standard-14 Type1 font dict (`/BaseFont base`, WinAnsi). Shared
 /// by the widget generator and the markup/annotation appearance generator so the
 /// font-dict shape lives in one place.
-pub(crate) fn standard_font_dict(base: &str) -> PdfDict {
+pub fn standard_font_dict(base: &str) -> PdfDict {
     let mut d = PdfDict::new();
     d.insert(PdfName::new("Type"), PdfObject::Name(PdfName::new("Font")));
     d.insert(
@@ -899,7 +903,7 @@ pub(crate) fn standard_font_dict(base: &str) -> PdfDict {
 /// Escape a string into a PDF literal-string body (`(`/`)`/`\` and CR), encoding
 /// each character as its WinAnsiEncoding byte (the declared appearance-font
 /// encoding); characters with no WinAnsi byte fall back to `?`.
-fn escape_text(s: &str, out: &mut Vec<u8>) {
+pub fn escape_text(s: &str, out: &mut Vec<u8>) {
     for ch in s.chars() {
         let b = unicode_to_winansi(ch).unwrap_or(b'?');
         match b {
@@ -916,7 +920,7 @@ fn escape_text(s: &str, out: &mut Vec<u8>) {
 /// Latin-1 (0xA0–0xFF) are identity; the WinAnsi C1 block (0x80–0x9F) holds
 /// typographic punctuation / currency whose Unicode code points are ≥ 0x100.
 /// Returns `None` for code points with no WinAnsi representation.
-fn unicode_to_winansi(ch: char) -> Option<u8> {
+pub fn unicode_to_winansi(ch: char) -> Option<u8> {
     let cp = ch as u32;
     match cp {
         0x20..=0x7E | 0xA0..=0xFF => Some(cp as u8),
@@ -1184,6 +1188,7 @@ mod tests {
     #[test]
     fn choice_value_maps_export_to_display_label() {
         let f = FormField {
+            field_id: ObjectId(0, 0),
             name: "month".into(),
             kind: FieldKind::Choice,
             flags: 0,
@@ -1210,6 +1215,7 @@ mod tests {
     #[test]
     fn comb_is_suppressed_when_multiline() {
         let base = FormField {
+            field_id: ObjectId(0, 0),
             name: "x".into(),
             kind: FieldKind::Text,
             flags: FF_COMB | FF_MULTILINE,
@@ -1228,6 +1234,7 @@ mod tests {
     #[test]
     fn comb_field_detection() {
         let f = FormField {
+            field_id: ObjectId(0, 0),
             name: "x".into(),
             kind: FieldKind::Text,
             flags: FF_COMB,
@@ -1250,6 +1257,7 @@ mod tests {
     #[test]
     fn generated_appearance_draws_value() {
         let f = FormField {
+            field_id: ObjectId(0, 0),
             name: "name".into(),
             kind: FieldKind::Text,
             flags: 0,
@@ -1274,6 +1282,7 @@ mod tests {
     #[test]
     fn empty_and_button_values_generate_nothing() {
         let base = FormField {
+            field_id: ObjectId(0, 0),
             name: "x".into(),
             kind: FieldKind::Text,
             flags: 0,
