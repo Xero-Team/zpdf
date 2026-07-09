@@ -17,6 +17,7 @@ pub use zpdf_font::FontCache;
 pub use zpdf_image::{DecodedImage, ImageCache};
 pub use zpdf_parser::PdfFile;
 pub use zpdf_render::RenderBackend;
+pub use zpdf_writer::{FormFiller, IncrementalWriter, InfoUpdate, StampImage, StampItem};
 
 #[cfg(feature = "cpu-render")]
 pub mod cpu {

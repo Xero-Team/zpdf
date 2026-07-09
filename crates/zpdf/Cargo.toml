@@ -28,6 +28,7 @@ zpdf-color.workspace = true
 zpdf-render.workspace = true
 zpdf-render-cpu = { workspace = true, optional = true }
 zpdf-render-wgpu = { workspace = true, optional = true }
+zpdf-writer.workspace = true
 
 [dev-dependencies]
 # Pure-Rust zlib (rust_backend, no C deps) for building FlateDecode-compressed
