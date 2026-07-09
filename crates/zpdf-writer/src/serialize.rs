@@ -61,17 +61,7 @@ fn serialize_direct_object(buf: &mut Vec<u8>, obj: &PdfObject) {
             }
             buf.push(b')');
         }
-        PdfObject::Name(n) => {
-            buf.push(b'/');
-            // Names must escape special characters as #XX.
-            for &b in n.as_str().as_bytes() {
-                if b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.' {
-                    buf.push(b);
-                } else {
-                    buf.extend_from_slice(format!("#{:02X}", b).as_bytes());
-                }
-            }
-        }
+        PdfObject::Name(n) => serialize_name(buf, n.as_str()),
         PdfObject::Array(arr) => {
             buf.push(b'[');
             for (i, elem) in arr.iter().enumerate() {
@@ -95,12 +85,23 @@ fn serialize_direct_object(buf: &mut Vec<u8>, obj: &PdfObject) {
     }
 }
 
+/// Serialize a name token (`/Name`), escaping special characters as `#XX`.
+fn serialize_name(buf: &mut Vec<u8>, name: &str) {
+    buf.push(b'/');
+    for &b in name.as_bytes() {
+        if b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.' {
+            buf.push(b);
+        } else {
+            buf.extend_from_slice(format!("#{:02X}", b).as_bytes());
+        }
+    }
+}
+
 /// Serialize a dictionary.
 pub fn serialize_dict(buf: &mut Vec<u8>, dict: &PdfDict) {
     buf.extend_from_slice(b"<< ");
     for (key, value) in &dict.0 {
-        buf.push(b'/');
-        buf.extend_from_slice(key.as_str().as_bytes());
+        serialize_name(buf, key.as_str());
         buf.push(b' ');
         serialize_direct_object(buf, value);
         buf.push(b' ');

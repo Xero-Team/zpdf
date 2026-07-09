@@ -40,10 +40,19 @@ const MAX_SYMBOLS: usize = 1 << 18;
 const MAX_INSTANCES: usize = 1 << 22;
 /// Per-segment MQ decode iteration budget: caps the number of `mq.decode()`
 /// calls in arithmetic-coded regions to prevent hangs on pathological inputs
-/// (huge declared dimensions + tiny compressed payload). Set to cover real-world
-/// needs (a dense 8Kx8K region is 64M pixels) with headroom, but low enough to
-/// fail fast on adversarial bombs.
-const MAX_MQ_ITERATIONS: usize = 64 * 1024 * 1024;
+/// (huge declared dimensions + tiny compressed payload). Computed per segment
+/// based on payload size: even highly compressible data requires roughly 1 bit
+/// per 16 output pixels (MQ symbols are cheap but not free), so a reasonable
+/// upper bound is `payload_bytes * 8 * 1024`. This covers real PDFs while
+/// failing fast on fuzzer bombs (e.g., 38-byte payloads declaring 1M pixels).
+fn mq_iteration_budget(payload_bytes: usize) -> usize {
+    // Base budget: 8K iterations per payload byte (covers 1 bit per 16 pixels).
+    // Clamp to [1K, 64M] so tiny payloads don't loop forever and huge payloads
+    // don't wrap. Real encoders stay well below this; adversarial ones abort fast.
+    payload_bytes
+        .saturating_mul(8 * 1024)
+        .clamp(1024, 64 * 1024 * 1024)
+}
 
 /// Parsed `/DecodeParms` for a JBIG2Decode filter.
 pub struct Jbig2Params {
@@ -227,7 +236,7 @@ const QE_TABLE: [(u16, u8, u8, u8); 47] = [
 /// MQ decoder. Exhausted input feeds 0xFF bytes per the spec, so decoding
 /// never fails mid-stream; the loops above are bounded by declared counts.
 /// Per-context adaptive state is packed one byte per context: `index << 1 |
-/// mps` (index < 47).
+/// mps` (index < 47). A decode budget caps total operations to prevent hangs.
 struct MqDecoder<'a> {
     data: &'a [u8],
     bp: usize,
@@ -235,10 +244,14 @@ struct MqDecoder<'a> {
     clow: u32,
     ct: i32,
     a: u32,
+    /// Total decode operations performed (incremented on each decode() call).
+    /// Checked against a budget to prevent infinite loops on malformed streams.
+    decode_count: usize,
+    decode_budget: usize,
 }
 
 impl<'a> MqDecoder<'a> {
-    fn new(data: &'a [u8]) -> Self {
+    fn new(data: &'a [u8], budget: usize) -> Self {
         // INITDEC (T.88 E.3.5).
         let mut d = MqDecoder {
             data,
@@ -247,6 +260,8 @@ impl<'a> MqDecoder<'a> {
             clow: 0,
             ct: 0,
             a: 0,
+            decode_count: 0,
+            decode_budget: budget,
         };
         d.chigh = d.byte_at(0) as u32;
         d.byte_in();
@@ -286,7 +301,12 @@ impl<'a> MqDecoder<'a> {
     }
 
     /// DECODE (T.88 E.3.2): one bit under the adaptive context `cx[idx]`.
-    fn decode(&mut self, cx: &mut [u8], idx: usize) -> u8 {
+    fn decode(&mut self, cx: &mut [u8], idx: usize) -> Result<u8> {
+        self.decode_count += 1;
+        if self.decode_count > self.decode_budget {
+            return Err(err("MQ decoder exceeded operation budget"));
+        }
+
         let state = cx[idx];
         let mut i = (state >> 1) as usize;
         let mut mps = state & 1;
@@ -314,7 +334,7 @@ impl<'a> MqDecoder<'a> {
             self.chigh -= qe;
             if a & 0x8000 != 0 {
                 self.a = a;
-                return mps;
+                return Ok(mps);
             }
             if a < qe {
                 // Conditional exchange: actually the LPS.
@@ -344,7 +364,7 @@ impl<'a> MqDecoder<'a> {
         }
         self.a = a;
         cx[idx] = ((i as u8) << 1) | mps;
-        d
+        Ok(d)
     }
 }
 
@@ -356,10 +376,10 @@ impl<'a> MqDecoder<'a> {
 const INT_CTX_SIZE: usize = 512;
 
 /// Read `n` bits under the running PREV context (A.2 step 2).
-fn read_int_bits(mq: &mut MqDecoder, cx: &mut [u8], prev: &mut usize, n: u32) -> u32 {
+fn read_int_bits(mq: &mut MqDecoder, cx: &mut [u8], prev: &mut usize, n: u32) -> Result<u32> {
     let mut v = 0u32;
     for _ in 0..n {
-        let bit = mq.decode(cx, *prev) as u32;
+        let bit = mq.decode(cx, *prev)? as u32;
         *prev = if *prev < 256 {
             (*prev << 1) | bit as usize
         } else {
@@ -367,44 +387,44 @@ fn read_int_bits(mq: &mut MqDecoder, cx: &mut [u8], prev: &mut usize, n: u32) ->
         };
         v = (v << 1) | bit;
     }
-    v
+    Ok(v)
 }
 
 /// IAx integer decoding procedure (T.88 A.2). Returns `None` for OOB.
-fn decode_int(mq: &mut MqDecoder, cx: &mut [u8]) -> Option<i64> {
+fn decode_int(mq: &mut MqDecoder, cx: &mut [u8]) -> Result<Option<i64>> {
     let mut prev = 1usize;
-    let sign = read_int_bits(mq, cx, &mut prev, 1);
-    let value = if read_int_bits(mq, cx, &mut prev, 1) == 0 {
-        read_int_bits(mq, cx, &mut prev, 2) as i64
-    } else if read_int_bits(mq, cx, &mut prev, 1) == 0 {
-        read_int_bits(mq, cx, &mut prev, 4) as i64 + 4
-    } else if read_int_bits(mq, cx, &mut prev, 1) == 0 {
-        read_int_bits(mq, cx, &mut prev, 6) as i64 + 20
-    } else if read_int_bits(mq, cx, &mut prev, 1) == 0 {
-        read_int_bits(mq, cx, &mut prev, 8) as i64 + 84
-    } else if read_int_bits(mq, cx, &mut prev, 1) == 0 {
-        read_int_bits(mq, cx, &mut prev, 12) as i64 + 340
+    let sign = read_int_bits(mq, cx, &mut prev, 1)?;
+    let value = if read_int_bits(mq, cx, &mut prev, 1)? == 0 {
+        read_int_bits(mq, cx, &mut prev, 2)? as i64
+    } else if read_int_bits(mq, cx, &mut prev, 1)? == 0 {
+        read_int_bits(mq, cx, &mut prev, 4)? as i64 + 4
+    } else if read_int_bits(mq, cx, &mut prev, 1)? == 0 {
+        read_int_bits(mq, cx, &mut prev, 6)? as i64 + 20
+    } else if read_int_bits(mq, cx, &mut prev, 1)? == 0 {
+        read_int_bits(mq, cx, &mut prev, 8)? as i64 + 84
+    } else if read_int_bits(mq, cx, &mut prev, 1)? == 0 {
+        read_int_bits(mq, cx, &mut prev, 12)? as i64 + 340
     } else {
-        read_int_bits(mq, cx, &mut prev, 32) as i64 + 4436
+        read_int_bits(mq, cx, &mut prev, 32)? as i64 + 4436
     };
     if sign == 1 {
         if value == 0 {
-            return None; // OOB
+            return Ok(None); // OOB
         }
-        return Some(-value);
+        return Ok(Some(-value));
     }
-    Some(value)
+    Ok(Some(value))
 }
 
 /// IAID decoding procedure (T.88 A.3): a `code_len`-bit symbol ID. The
 /// context array must hold `1 << (code_len + 1)` entries.
-fn decode_iaid(mq: &mut MqDecoder, cx: &mut [u8], code_len: u32) -> usize {
+fn decode_iaid(mq: &mut MqDecoder, cx: &mut [u8], code_len: u32) -> Result<usize> {
     let mut prev = 1usize;
     for _ in 0..code_len {
-        let bit = mq.decode(cx, prev) as usize;
+        let bit = mq.decode(cx, prev)? as usize;
         prev = (prev << 1) | bit;
     }
-    prev - (1usize << code_len)
+    Ok(prev - (1usize << code_len))
 }
 
 /// `ceil(log2(n))` for n ≥ 1.
@@ -529,6 +549,7 @@ fn decode_generic(
     width: usize,
     height: usize,
     p: &GenericParams,
+    budget: usize,
 ) -> Result<Bitmap> {
     let mut bm = Bitmap::new(width, height, 0)?;
     let ctx_at = context_fn(p.template);
@@ -541,10 +562,10 @@ fn decode_generic(
             // Typical prediction: SLTP toggles LTP; an LTP row repeats the
             // row above (all-white above row 0).
             iterations += 1;
-            if iterations > MAX_MQ_ITERATIONS {
+            if iterations > budget {
                 return Err(err("generic region MQ decode exceeded iteration budget"));
             }
-            ltp ^= mq.decode(cx, tpgd_cx) == 1;
+            ltp ^= mq.decode(cx, tpgd_cx)? == 1;
             if ltp {
                 if y > 0 {
                     let w = bm.width;
@@ -555,11 +576,11 @@ fn decode_generic(
         }
         for x in 0..width {
             iterations += 1;
-            if iterations > MAX_MQ_ITERATIONS {
+            if iterations > budget {
                 return Err(err("generic region MQ decode exceeded iteration budget"));
             }
             let ctx = ctx_at(&bm, x as i64, y as i64, &p.at);
-            let pixel = mq.decode(cx, ctx);
+            let pixel = mq.decode(cx, ctx)?;
             if pixel == 1 {
                 bm.set(x, y, 1);
             }
@@ -651,6 +672,7 @@ fn decode_refinement(
     height: usize,
     refr: &Bitmap,
     p: &RefinementParams,
+    budget: usize,
 ) -> Result<Bitmap> {
     let mut bm = Bitmap::new(width, height, 0)?;
     let mut ltp = false;
@@ -661,11 +683,11 @@ fn decode_refinement(
             // the canonical bit ordering is 0x0020 (template 0) / 0x0008
             // (template 1).
             iterations += 1;
-            if iterations > MAX_MQ_ITERATIONS {
+            if iterations > budget {
                 return Err(err("refinement region MQ decode exceeded iteration budget"));
             }
             let sltp_cx = if p.template == 0 { 0x0020 } else { 0x0008 };
-            ltp ^= mq.decode(cx, sltp_cx) == 1;
+            ltp ^= mq.decode(cx, sltp_cx)? == 1;
         }
         for x in 0..width as i64 {
             let rx = x - p.dx as i64;
@@ -689,11 +711,11 @@ fn decode_refinement(
                 }
             }
             iterations += 1;
-            if iterations > MAX_MQ_ITERATIONS {
+            if iterations > budget {
                 return Err(err("refinement region MQ decode exceeded iteration budget"));
             }
             let ctx = refine_context(p.template, &bm, refr, x, y, rx, ry, &p.at);
-            if mq.decode(cx, ctx) == 1 {
+            if mq.decode(cx, ctx)? == 1 {
                 bm.set(x as usize, y as usize, 1);
             }
         }
@@ -796,25 +818,26 @@ fn decode_text_region_arith(
     sym_code_len: u32,
     geom: &TextRegionGeom,
     ctx: &mut TextArithCtx,
+    budget: usize,
 ) -> Result<Bitmap> {
     let mut bm = Bitmap::new(width, height, geom.def_pixel)?;
     let strips = geom.strips;
 
     let mut stript =
-        -decode_int(mq, ctx.iadt).ok_or_else(|| err("unexpected OOB in IADT"))? * strips;
+        -decode_int(mq, ctx.iadt)?.ok_or_else(|| err("unexpected OOB in IADT"))? * strips;
     let mut firsts: i64 = 0;
     let mut inst = 0usize;
 
     'instances: while inst < num_instances {
-        let dt = decode_int(mq, ctx.iadt).ok_or_else(|| err("unexpected OOB in IADT"))?;
+        let dt = decode_int(mq, ctx.iadt)?.ok_or_else(|| err("unexpected OOB in IADT"))?;
         stript += dt * strips;
-        let dfs = decode_int(mq, ctx.iafs).ok_or_else(|| err("unexpected OOB in IAFS"))?;
+        let dfs = decode_int(mq, ctx.iafs)?.ok_or_else(|| err("unexpected OOB in IAFS"))?;
         firsts += dfs;
         let mut curs = firsts;
         let mut first = true;
         loop {
             if !first {
-                let Some(ids) = decode_int(mq, ctx.iads) else {
+                let Some(ids) = decode_int(mq, ctx.iads)? else {
                     break; // OOB ends the strip
                 };
                 curs += ids + geom.ds_offset;
@@ -827,10 +850,10 @@ fn decode_text_region_arith(
             let curt = if strips == 1 {
                 0
             } else {
-                decode_int(mq, ctx.iait).ok_or_else(|| err("unexpected OOB in IAIT"))?
+                decode_int(mq, ctx.iait)?.ok_or_else(|| err("unexpected OOB in IAIT"))?
             };
             let t = stript + curt;
-            let id = decode_iaid(mq, ctx.iaid, sym_code_len);
+            let id = decode_iaid(mq, ctx.iaid, sym_code_len)?;
             let sym = symbols
                 .get(id)
                 .ok_or_else(|| err(format!("symbol id {id} out of range")))?
@@ -838,16 +861,16 @@ fn decode_text_region_arith(
 
             // Per-instance refinement (T.88 6.4.11).
             let refined = if geom.sb_refine {
-                let ri = decode_int(mq, ctx.iari).ok_or_else(|| err("unexpected OOB in IARI"))?;
+                let ri = decode_int(mq, ctx.iari)?.ok_or_else(|| err("unexpected OOB in IARI"))?;
                 if ri != 0 {
                     let rdw =
-                        decode_int(mq, ctx.iardw).ok_or_else(|| err("unexpected OOB in IARDW"))?;
+                        decode_int(mq, ctx.iardw)?.ok_or_else(|| err("unexpected OOB in IARDW"))?;
                     let rdh =
-                        decode_int(mq, ctx.iardh).ok_or_else(|| err("unexpected OOB in IARDH"))?;
+                        decode_int(mq, ctx.iardh)?.ok_or_else(|| err("unexpected OOB in IARDH"))?;
                     let rdx =
-                        decode_int(mq, ctx.iardx).ok_or_else(|| err("unexpected OOB in IARDX"))?;
+                        decode_int(mq, ctx.iardx)?.ok_or_else(|| err("unexpected OOB in IARDX"))?;
                     let rdy =
-                        decode_int(mq, ctx.iardy).ok_or_else(|| err("unexpected OOB in IARDY"))?;
+                        decode_int(mq, ctx.iardy)?.ok_or_else(|| err("unexpected OOB in IARDY"))?;
                     let nw = sym.width as i64 + rdw;
                     let nh = sym.height as i64 + rdh;
                     if nw <= 0 || nh <= 0 || nw > MAX_DIMENSION as i64 || nh > MAX_DIMENSION as i64
@@ -871,6 +894,7 @@ fn decode_text_region_arith(
                             dx: dx as i32,
                             dy: dy as i32,
                         },
+                        budget,
                     )?)
                 } else {
                     None
@@ -1610,8 +1634,20 @@ impl Decoder {
     /// Parse and process every segment in `data` (globals or page stream).
     fn process_segments(&mut self, data: &[u8]) -> Result<()> {
         let mut r = Reader::new(data);
+        let mut segments_processed = 0usize;
+        // Bound the number of segments: even tiny headers are 11 bytes, so this
+        // is generous. Malformed streams that loop forever on bogus headers abort.
+        let max_segments = data
+            .len()
+            .saturating_div(5)
+            .saturating_add(100)
+            .min(100_000);
         // A header is at least 11 bytes; shorter trailers are padding.
         while r.remaining() >= 11 {
+            segments_processed += 1;
+            if segments_processed > max_segments {
+                return Err(err("segment processing exceeded iteration budget"));
+            }
             let h = parse_segment_header(&mut r)?;
             if h.data_length == 0xFFFF_FFFF {
                 return Err(err(format!(
@@ -1851,7 +1887,9 @@ impl Decoder {
         for slot in at.iter_mut().take(n_at) {
             *slot = (r.i8()?, r.i8()?);
         }
-        let mut mq = MqDecoder::new(r.rest());
+        let payload = r.rest();
+        let budget = mq_iteration_budget(payload.len());
+        let mut mq = MqDecoder::new(payload, budget);
         let mut cx = vec![0u8; 1 << 16];
         let bm = decode_generic(
             &mut mq,
@@ -1863,6 +1901,7 @@ impl Decoder {
                 tpgdon,
                 at,
             },
+            budget,
         )?;
         Ok((info, bm))
     }
@@ -1909,7 +1948,9 @@ impl Decoder {
                 refr
             };
 
-        let mut mq = MqDecoder::new(r.rest());
+        let payload = r.rest();
+        let budget = mq_iteration_budget(payload.len());
+        let mut mq = MqDecoder::new(payload, budget);
         let mut cx = vec![0u8; 1 << 13];
         let bm = decode_refinement(
             &mut mq,
@@ -1924,6 +1965,7 @@ impl Decoder {
                 dx: 0,
                 dy: 0,
             },
+            budget,
         )?;
         // When refining the page in place, the result REPLACES the page area
         // (operator REPLACE), since the reference already held those pixels.
@@ -2096,7 +2138,8 @@ impl Decoder {
         r_at: [(i8, i8); 2],
         sym_code_len: u32,
     ) -> Result<Vec<Rc<Bitmap>>> {
-        let mut mq = MqDecoder::new(payload);
+        let budget = mq_iteration_budget(payload.len());
+        let mut mq = MqDecoder::new(payload, budget);
         let mut cx_gb = vec![0u8; 1 << 16];
         let mut cx_gr = vec![0u8; 1 << 13];
         let mut iadh = vec![0u8; INT_CTX_SIZE];
@@ -2123,21 +2166,26 @@ impl Decoder {
         let mut hc_height: i64 = 0;
         let mut total_area: usize = 0;
         let mut iterations = 0usize;
+        // Total decode_int budget: each symbol needs ~2 decode_int calls (DH, DW),
+        // plus some for export flags. Cap at 10K total IAx calls for tiny payloads.
+        let max_iterations = num_new.saturating_mul(2).saturating_add(num_ex).min(10_000);
         while new_syms.len() < num_new {
             iterations += 1;
-            if iterations > num_new.saturating_mul(2) {
+            if iterations > max_iterations {
                 return Err(err("symbol dictionary decode exceeded iteration budget"));
             }
-            let dh = decode_int(&mut mq, &mut iadh).ok_or_else(|| err("unexpected OOB in IADH"))?;
+            let dh =
+                decode_int(&mut mq, &mut iadh)?.ok_or_else(|| err("unexpected OOB in IADH"))?;
             hc_height += dh;
             if hc_height <= 0 || hc_height > MAX_DIMENSION as i64 {
                 return Err(err(format!("implausible symbol height {hc_height}")));
             }
             let mut sym_width: i64 = 0;
             let mut width_iterations = 0usize;
-            while let Some(dw) = decode_int(&mut mq, &mut iadw) {
+            let max_width_iterations = num_new.saturating_add(1).min(10_000);
+            while let Some(dw) = decode_int(&mut mq, &mut iadw)? {
                 width_iterations += 1;
-                if width_iterations > num_new.saturating_add(1) {
+                if width_iterations > max_width_iterations {
                     return Err(err(
                         "symbol dictionary width loop exceeded iteration budget",
                     ));
@@ -2155,16 +2203,16 @@ impl Decoder {
                 }
                 let bm = if sd_refagg {
                     // REFAGG: IAAI counts the aggregate instances (T.88 6.5.8.2).
-                    let n_inst = decode_int(&mut mq, &mut iaai)
+                    let n_inst = decode_int(&mut mq, &mut iaai)?
                         .ok_or_else(|| err("unexpected OOB in IAAI"))?;
                     let all: Vec<Rc<Bitmap>> =
                         input.iter().chain(new_syms.iter()).cloned().collect();
                     if n_inst == 1 {
                         // Single-instance refinement of an existing symbol.
-                        let id = decode_iaid(&mut mq, &mut iaid, sym_code_len);
-                        let rdx = decode_int(&mut mq, &mut iardx)
+                        let id = decode_iaid(&mut mq, &mut iaid, sym_code_len)?;
+                        let rdx = decode_int(&mut mq, &mut iardx)?
                             .ok_or_else(|| err("unexpected OOB in IARDX"))?;
-                        let rdy = decode_int(&mut mq, &mut iardy)
+                        let rdy = decode_int(&mut mq, &mut iardy)?
                             .ok_or_else(|| err("unexpected OOB in IARDY"))?;
                         let refr = all.get(id).ok_or_else(|| {
                             err(format!("refinement symbol id {id} out of range"))
@@ -2182,6 +2230,7 @@ impl Decoder {
                                 dx: rdx as i32,
                                 dy: rdy as i32,
                             },
+                            budget,
                         )?
                     } else {
                         // Aggregate: a text region placing n_inst instances.
@@ -2210,6 +2259,7 @@ impl Decoder {
                             sym_code_len,
                             &TextRegionGeom::aggregate(r_template, r_at),
                             &mut ctx,
+                            budget,
                         )?
                     }
                 } else {
@@ -2219,6 +2269,7 @@ impl Decoder {
                         sym_width as usize,
                         hc_height as usize,
                         &gp,
+                        budget,
                     )?
                 };
                 new_syms.push(Rc::new(bm));
@@ -2239,7 +2290,7 @@ impl Decoder {
                 ));
             }
             let run =
-                decode_int(&mut mq, &mut iaex).ok_or_else(|| err("unexpected OOB in IAEX"))?;
+                decode_int(&mut mq, &mut iaex)?.ok_or_else(|| err("unexpected OOB in IAEX"))?;
             if run < 0 || idx as i64 + run > total as i64 {
                 return Err(err("invalid symbol export run length"));
             }
@@ -2492,7 +2543,9 @@ impl Decoder {
             );
         }
 
-        let mut mq = MqDecoder::new(r.rest());
+        let payload = r.rest();
+        let budget = mq_iteration_budget(payload.len());
+        let mut mq = MqDecoder::new(payload, budget);
         let mut iadt = vec![0u8; INT_CTX_SIZE];
         let mut iafs = vec![0u8; INT_CTX_SIZE];
         let mut iads = vec![0u8; INT_CTX_SIZE];
@@ -2526,6 +2579,7 @@ impl Decoder {
             sym_code_len,
             &geom,
             &mut ctx,
+            budget,
         )?;
         Ok((info, bm))
     }
@@ -2695,7 +2749,9 @@ impl Decoder {
                         }
                         let dx = (rdw >> 1) + rdx;
                         let dy = (rdh >> 1) + rdy;
-                        let mut mq = MqDecoder::new(&payload[br.byte_pos().min(payload.len())..]);
+                        let refine_payload = &payload[br.byte_pos().min(payload.len())..];
+                        let refine_budget = mq_iteration_budget(refine_payload.len());
+                        let mut mq = MqDecoder::new(refine_payload, refine_budget);
                         let mut cx = vec![0u8; 1 << 13];
                         let refined = decode_refinement(
                             &mut mq,
@@ -2710,6 +2766,7 @@ impl Decoder {
                                 dx: dx as i32,
                                 dy: dy as i32,
                             },
+                            refine_budget,
                         )?;
                         // Advance past the refinement MQ data using RSIZE.
                         br.pos = (br.byte_pos() + _rsize.max(0) as usize) * 8;
@@ -2789,7 +2846,9 @@ impl Decoder {
                 (2, -2),
                 (-2, -2),
             ];
-            let mut mq = MqDecoder::new(r.rest());
+            let payload = r.rest();
+            let budget = mq_iteration_budget(payload.len());
+            let mut mq = MqDecoder::new(payload, budget);
             let mut cx = vec![0u8; 1 << 16];
             decode_generic(
                 &mut mq,
@@ -2801,6 +2860,7 @@ impl Decoder {
                     tpgdon: false,
                     at,
                 },
+                budget,
             )?
         };
 
@@ -2906,16 +2966,18 @@ impl Decoder {
             (2, -2),
             (-2, -2),
         ];
+        let payload = r.rest();
+        let budget = mq_iteration_budget(payload.len());
         let mut mq = if mmr {
             None
         } else {
-            Some(MqDecoder::new(r.rest()))
+            Some(MqDecoder::new(payload, budget))
         };
         let mut cx = if mmr { Vec::new() } else { vec![0u8; 1 << 16] };
         // MMR planes are concatenated; the CCITT decoder consumes one full
         // image per call but does not report bytes consumed, so multi-plane
         // MMR halftones can only be tracked for the common single-plane case.
-        let mmr_data = r.rest();
+        let mmr_data = payload;
         // `bit[j+1]` accumulator for the Gray decode, per cell.
         let mut prev_bit = vec![0u8; grid_cells];
         for j in (0..hbpp).rev() {
@@ -2930,6 +2992,7 @@ impl Decoder {
                         tpgdon: false,
                         at,
                     },
+                    budget,
                 )?
             } else {
                 let params = crate::ccitt::CcittParams {
@@ -3558,11 +3621,11 @@ mod tests {
 
     #[test]
     fn mq_decoder_t88_h2_vector() {
-        let mut dec = MqDecoder::new(&H2_ENCODED);
+        let mut dec = MqDecoder::new(&H2_ENCODED, 1_000_000);
         let mut cx = vec![0u8; 1];
         let mut out = vec![0u8; 32];
         for i in 0..256 {
-            let bit = dec.decode(&mut cx, 0);
+            let bit = dec.decode(&mut cx, 0).unwrap();
             out[i / 8] |= bit << (7 - i % 8);
         }
         assert_eq!(out, H2_INPUT);
@@ -3599,10 +3662,10 @@ mod tests {
             enc.encode(&mut cx, i % 5, b);
         }
         let data = enc.finish();
-        let mut dec = MqDecoder::new(&data);
+        let mut dec = MqDecoder::new(&data, 1_000_000);
         let mut cx = vec![0u8; 5];
         for (i, &b) in bits.iter().enumerate() {
-            assert_eq!(dec.decode(&mut cx, i % 5), b, "bit {i}");
+            assert_eq!(dec.decode(&mut cx, i % 5).unwrap(), b, "bit {i}");
         }
     }
 
@@ -3641,10 +3704,10 @@ mod tests {
             encode_int(&mut enc, &mut cx, *v);
         }
         let data = enc.finish();
-        let mut dec = MqDecoder::new(&data);
+        let mut dec = MqDecoder::new(&data, 1_000_000);
         let mut cx = vec![0u8; INT_CTX_SIZE];
         for v in &values {
-            assert_eq!(decode_int(&mut dec, &mut cx), *v);
+            assert_eq!(decode_int(&mut dec, &mut cx).unwrap(), *v);
         }
     }
 
@@ -3658,10 +3721,10 @@ mod tests {
             encode_iaid(&mut enc, &mut cx, code_len as u32, id);
         }
         let data = enc.finish();
-        let mut dec = MqDecoder::new(&data);
+        let mut dec = MqDecoder::new(&data, 1_000_000);
         let mut cx = vec![0u8; 1 << (code_len + 1)];
         for &id in &ids {
-            assert_eq!(decode_iaid(&mut dec, &mut cx, code_len as u32), id);
+            assert_eq!(decode_iaid(&mut dec, &mut cx, code_len as u32).unwrap(), id);
         }
     }
 
@@ -3695,9 +3758,10 @@ mod tests {
             let mut cx = vec![0u8; 1 << 16];
             encode_generic(&mut enc, &mut cx, &bm, &p);
             let data = enc.finish();
-            let mut dec = MqDecoder::new(&data);
+            let mut dec = MqDecoder::new(&data, 1_000_000);
             let mut cx = vec![0u8; 1 << 16];
-            let out = decode_generic(&mut dec, &mut cx, bm.width, bm.height, &p).unwrap();
+            let out =
+                decode_generic(&mut dec, &mut cx, bm.width, bm.height, &p, usize::MAX).unwrap();
             assert_eq!(out.data, bm.data, "template {template}");
         }
     }
@@ -3718,9 +3782,10 @@ mod tests {
             let mut cx = vec![0u8; 1 << 16];
             encode_generic(&mut enc, &mut cx, &bm, &p);
             let data = enc.finish();
-            let mut dec = MqDecoder::new(&data);
+            let mut dec = MqDecoder::new(&data, 1_000_000);
             let mut cx = vec![0u8; 1 << 16];
-            let out = decode_generic(&mut dec, &mut cx, bm.width, bm.height, &p).unwrap();
+            let out =
+                decode_generic(&mut dec, &mut cx, bm.width, bm.height, &p, usize::MAX).unwrap();
             assert_eq!(out.data, bm.data, "template {template}");
         }
     }
@@ -3738,9 +3803,9 @@ mod tests {
         let mut cx = vec![0u8; 1 << 16];
         encode_generic(&mut enc, &mut cx, &bm, &p);
         let data = enc.finish();
-        let mut dec = MqDecoder::new(&data);
+        let mut dec = MqDecoder::new(&data, 1_000_000);
         let mut cx = vec![0u8; 1 << 16];
-        let out = decode_generic(&mut dec, &mut cx, bm.width, bm.height, &p).unwrap();
+        let out = decode_generic(&mut dec, &mut cx, bm.width, bm.height, &p, 1_000_000).unwrap();
         assert_eq!(out.data, bm.data);
     }
 
@@ -4027,10 +4092,18 @@ mod tests {
             let mut cx = vec![0u8; 1 << 13];
             encode_refinement(&mut enc, &mut cx, &target, &refr, &p);
             let data = enc.finish();
-            let mut dec = MqDecoder::new(&data);
+            let mut dec = MqDecoder::new(&data, 1_000_000);
             let mut cx = vec![0u8; 1 << 13];
-            let out = decode_refinement(&mut dec, &mut cx, target.width, target.height, &refr, &p)
-                .unwrap();
+            let out = decode_refinement(
+                &mut dec,
+                &mut cx,
+                target.width,
+                target.height,
+                &refr,
+                &p,
+                usize::MAX,
+            )
+            .unwrap();
             assert_eq!(out.data, target.data, "template {template}");
         }
     }
@@ -4058,11 +4131,18 @@ mod tests {
                 let mut cx = vec![0u8; 1 << 13];
                 encode_refinement(&mut enc, &mut cx, &target, &refr, &p);
                 let data = enc.finish();
-                let mut dec = MqDecoder::new(&data);
+                let mut dec = MqDecoder::new(&data, 1_000_000);
                 let mut cx = vec![0u8; 1 << 13];
-                let out =
-                    decode_refinement(&mut dec, &mut cx, target.width, target.height, &refr, &p)
-                        .unwrap();
+                let out = decode_refinement(
+                    &mut dec,
+                    &mut cx,
+                    target.width,
+                    target.height,
+                    &refr,
+                    &p,
+                    1_000_000,
+                )
+                .unwrap();
                 assert_eq!(
                     out.data, target.data,
                     "template {template} offset ({dx},{dy})"
@@ -4086,9 +4166,18 @@ mod tests {
         let mut cx = vec![0u8; 1 << 13];
         encode_refinement(&mut enc, &mut cx, &refr, &refr, &p);
         let data = enc.finish();
-        let mut dec = MqDecoder::new(&data);
+        let mut dec = MqDecoder::new(&data, 1_000_000);
         let mut cx = vec![0u8; 1 << 13];
-        let out = decode_refinement(&mut dec, &mut cx, refr.width, refr.height, &refr, &p).unwrap();
+        let out = decode_refinement(
+            &mut dec,
+            &mut cx,
+            refr.width,
+            refr.height,
+            &refr,
+            &p,
+            usize::MAX,
+        )
+        .unwrap();
         assert_eq!(out.data, refr.data);
     }
 

@@ -16,3 +16,5 @@ zpdf-core.workspace = true
 zpdf-parser.workspace = true
 zpdf-document.workspace = true
 thiserror.workspace = true
+flate2.workspace = true
+tracing.workspace = true
