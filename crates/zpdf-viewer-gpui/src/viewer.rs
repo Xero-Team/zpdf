@@ -8,12 +8,14 @@ use gpui::{
     RenderImage, StatefulInteractiveElement, Styled, StyledImage, Window,
 };
 use zpdf::gpu::GpuContext;
+use zpdf::{ObjectId, PdfObject, Rect};
 use zpdf_document::{InkAnnotDict, InkAnnotationBuilder};
 use zpdf_writer::IncrementalWriter;
 
 use crate::actions::{
-    ActualSize, CancelAnnotation, FirstPage, FitWidth, LastPage, NextPage, PreviousPage,
-    SaveAnnotation, ToggleInkMode, ZoomIn, ZoomOut,
+    ActualSize, AddConfidentialStamp, AddDraftStamp, AddWatermark, CancelAnnotation,
+    DeleteSelected, FirstPage, FitWidth, LastPage, NextPage, PreviousPage, SaveAnnotation,
+    SaveEdits, ToggleInkMode, ToggleSelectMode, ZoomIn, ZoomOut,
 };
 use crate::document::{LoadedDocument, PagePreview, PageSummary};
 
@@ -29,6 +31,83 @@ type ButtonPalette = (u32, u32, u32);
 enum AnnotationMode {
     None,
     Ink,
+    Select,
+}
+
+#[derive(Debug, Clone)]
+struct EditableAnnotation {
+    object_id: ObjectId,
+    #[allow(dead_code)]
+    page_index: usize,
+    #[allow(dead_code)]
+    subtype: String,
+    #[allow(dead_code)]
+    original_rect: Rect,
+    current_rect: Rect,
+}
+
+#[derive(Debug, Clone)]
+enum EditOperation {
+    Move {
+        object_id: ObjectId,
+        #[allow(dead_code)]
+        page_index: usize,
+        new_rect: Rect,
+    },
+    Delete {
+        object_id: ObjectId,
+        page_index: usize,
+    },
+}
+
+#[derive(Debug, Default)]
+struct EditBuffer {
+    operations: HashMap<ObjectId, EditOperation>,
+}
+
+impl EditBuffer {
+    fn add(&mut self, op: EditOperation) {
+        let id = match &op {
+            EditOperation::Move { object_id, .. } => *object_id,
+            EditOperation::Delete { object_id, .. } => *object_id,
+        };
+        self.operations.insert(id, op);
+    }
+
+    fn clear(&mut self) {
+        self.operations.clear();
+    }
+
+    fn is_empty(&self) -> bool {
+        self.operations.is_empty()
+    }
+}
+
+#[derive(Debug, Clone)]
+enum DragState {
+    MovingAnnotation {
+        annotation_id: ObjectId,
+        start_screen_pos: (f32, f32),
+        start_pdf_rect: Rect,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(dead_code)]
+enum ResizeHandle {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+    Top,
+    Bottom,
+    Left,
+    Right,
+}
+
+enum HitTestResult {
+    None,
+    AnnotationBody { annotation_id: ObjectId },
 }
 
 pub struct Viewer {
@@ -48,6 +127,12 @@ pub struct Viewer {
     ink_color: (f64, f64, f64),
     ink_width: f64,
     is_drawing: bool,
+
+    // Selection mode state
+    page_annotations: Vec<EditableAnnotation>,
+    selected_annotation: Option<ObjectId>,
+    edit_buffer: EditBuffer,
+    drag_state: Option<DragState>,
 
     // Current rendered image bounds (for coordinate conversion)
     current_image_width: f32,
@@ -71,6 +156,10 @@ impl Viewer {
             ink_color: (0.0, 0.0, 0.0), // black
             ink_width: 2.0,
             is_drawing: false,
+            page_annotations: Vec::new(),
+            selected_annotation: None,
+            edit_buffer: EditBuffer::default(),
+            drag_state: None,
             current_image_width: 0.0,
             current_image_height: 0.0,
         }
@@ -160,6 +249,13 @@ impl Viewer {
             }
             AnnotationMode::Ink => {
                 self.annotation_mode = AnnotationMode::None;
+                self.current_stroke.clear();
+                self.ink_strokes.clear();
+            }
+            AnnotationMode::Select => {
+                self.annotation_mode = AnnotationMode::Ink;
+                self.selected_annotation = None;
+                self.page_annotations.clear();
                 self.current_stroke.clear();
                 self.ink_strokes.clear();
             }
@@ -317,6 +413,113 @@ impl Viewer {
         Ok(())
     }
 
+    fn add_watermark(&mut self, _: &AddWatermark, _: &mut Window, cx: &mut Context<Self>) {
+        self.add_stamp("WATERMARK", 48.0, (0.7, 0.7, 0.7), cx);
+    }
+
+    fn add_draft_stamp(&mut self, _: &AddDraftStamp, _: &mut Window, cx: &mut Context<Self>) {
+        self.add_stamp("DRAFT", 72.0, (1.0, 0.0, 0.0), cx);
+    }
+
+    fn add_confidential_stamp(
+        &mut self,
+        _: &AddConfidentialStamp,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.add_stamp("CONFIDENTIAL", 48.0, (1.0, 0.0, 0.0), cx);
+    }
+
+    fn add_stamp(&mut self, text: &str, size: f64, color: (f64, f64, f64), cx: &mut Context<Self>) {
+        tracing::info!("Adding stamp '{}' to page {}", text, self.current_page);
+
+        // Read the original PDF
+        let original_bytes = match std::fs::read(&self.document.summary.path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                self.last_error = Some(format!("Failed to read PDF: {}", e));
+                cx.notify();
+                return;
+            }
+        };
+
+        // Create incremental writer
+        let mut writer = match IncrementalWriter::new(original_bytes) {
+            Ok(w) => w,
+            Err(e) => {
+                self.last_error = Some(format!("Failed to create writer: {}", e));
+                cx.notify();
+                return;
+            }
+        };
+
+        // Get page dimensions
+        let page = &self.document.summary.pages[self.current_page];
+
+        // Position stamp in center of page
+        let x = (page.width / 2.0) - 100.0; // Rough centering
+        let y = page.height / 2.0;
+
+        // Create stamp item
+        let stamp = zpdf::StampItem::Text {
+            text: text.to_string(),
+            x,
+            y,
+            font: "Helvetica-Bold".to_string(),
+            size,
+            color,
+        };
+
+        // Apply stamp
+        if let Err(e) = writer.stamp_page(self.current_page, &[stamp]) {
+            self.last_error = Some(format!("Failed to stamp: {}", e));
+            cx.notify();
+            return;
+        }
+
+        // Write to temporary file
+        let temp_path = self.document.summary.path.with_extension("pdf.tmp");
+        let mut temp_file = match File::create(&temp_path) {
+            Ok(f) => f,
+            Err(e) => {
+                self.last_error = Some(format!("Failed to create temp file: {}", e));
+                cx.notify();
+                return;
+            }
+        };
+
+        if let Err(e) = writer.write(&mut temp_file) {
+            self.last_error = Some(format!("Failed to write: {}", e));
+            cx.notify();
+            return;
+        }
+
+        if let Err(e) = temp_file.sync_all() {
+            self.last_error = Some(format!("Failed to sync: {}", e));
+            cx.notify();
+            return;
+        }
+        drop(temp_file);
+
+        // Atomic rename
+        if let Err(e) = std::fs::rename(&temp_path, &self.document.summary.path) {
+            self.last_error = Some(format!("Failed to rename: {}", e));
+            cx.notify();
+            return;
+        }
+
+        tracing::info!("Stamp applied successfully!");
+
+        // Clear cache to force reload
+        self.page_cache.clear();
+        self.last_error = Some(format!(
+            "✓ Added '{}' stamp to page {}",
+            text,
+            self.current_page + 1
+        ));
+        cx.notify();
+    }
+
     fn handle_ink_mouse_down(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
         if self.annotation_mode != AnnotationMode::Ink {
             return;
@@ -363,6 +566,329 @@ impl Viewer {
             tracing::warn!("Total strokes: {}", self.ink_strokes.len());
             self.current_stroke.clear();
         }
+        cx.notify();
+    }
+
+    // ========== Selection Mode Methods ==========
+
+    fn toggle_select_mode(&mut self, cx: &mut Context<Self>) {
+        match self.annotation_mode {
+            AnnotationMode::Select => {
+                self.annotation_mode = AnnotationMode::None;
+                self.selected_annotation = None;
+                self.page_annotations.clear();
+            }
+            _ => {
+                self.annotation_mode = AnnotationMode::Select;
+                self.load_page_annotations(cx);
+            }
+        }
+        cx.notify();
+    }
+
+    fn load_page_annotations(&mut self, _cx: &mut Context<Self>) {
+        self.page_annotations.clear();
+
+        // Parse annotations from current page
+        let page_result = self.document.document().page(self.current_page);
+        if let Ok(page) = page_result {
+            let file = self.document.document().file();
+
+            // Get annotations for this page
+            for &annot_id in &page.annots {
+                if let Ok(annot_obj) = file.resolve(annot_id) {
+                    if let Ok(annot_dict) = annot_obj.as_dict() {
+                        // Parse subtype
+                        let subtype = annot_dict
+                            .get_name("Subtype")
+                            .unwrap_or("Unknown")
+                            .to_string();
+
+                        // Parse rect
+                        if let Some(PdfObject::Array(rect_arr)) = annot_dict.get("Rect") {
+                            if rect_arr.len() == 4 {
+                                let x0 = match &rect_arr[0] {
+                                    PdfObject::Real(x) => *x,
+                                    PdfObject::Integer(x) => *x as f64,
+                                    _ => continue,
+                                };
+                                let y0 = match &rect_arr[1] {
+                                    PdfObject::Real(y) => *y,
+                                    PdfObject::Integer(y) => *y as f64,
+                                    _ => continue,
+                                };
+                                let x1 = match &rect_arr[2] {
+                                    PdfObject::Real(x) => *x,
+                                    PdfObject::Integer(x) => *x as f64,
+                                    _ => continue,
+                                };
+                                let y1 = match &rect_arr[3] {
+                                    PdfObject::Real(y) => *y,
+                                    PdfObject::Integer(y) => *y as f64,
+                                    _ => continue,
+                                };
+
+                                let rect = Rect { x0, y0, x1, y1 };
+
+                                self.page_annotations.push(EditableAnnotation {
+                                    object_id: annot_id,
+                                    page_index: self.current_page,
+                                    subtype,
+                                    original_rect: rect,
+                                    current_rect: rect,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        tracing::info!(
+            "Loaded {} annotations for page {}",
+            self.page_annotations.len(),
+            self.current_page
+        );
+    }
+
+    fn hit_test(
+        &self,
+        screen_x: f32,
+        screen_y: f32,
+        page: &PageSummary,
+        zoom: f32,
+    ) -> HitTestResult {
+        // Convert screen to PDF coordinates
+        let (pdf_x, pdf_y) = self.screen_to_pdf(screen_x, screen_y, page, zoom);
+
+        // Test annotation bodies (rect contains point)
+        for annot in &self.page_annotations {
+            let rect = &annot.current_rect;
+            if pdf_x >= rect.x0 && pdf_x <= rect.x1 && pdf_y >= rect.y0 && pdf_y <= rect.y1 {
+                return HitTestResult::AnnotationBody {
+                    annotation_id: annot.object_id,
+                };
+            }
+        }
+
+        HitTestResult::None
+    }
+
+    fn handle_select_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.annotation_mode != AnnotationMode::Select {
+            return;
+        }
+
+        let page = &self.document.summary.pages[self.current_page];
+        let zoom = self.effective_zoom(window);
+
+        match self.hit_test(event.position.x.into(), event.position.y.into(), page, zoom) {
+            HitTestResult::AnnotationBody { annotation_id } => {
+                self.selected_annotation = Some(annotation_id);
+
+                // Find the annotation to get its rect
+                if let Some(annot) = self
+                    .page_annotations
+                    .iter()
+                    .find(|a| a.object_id == annotation_id)
+                {
+                    self.drag_state = Some(DragState::MovingAnnotation {
+                        annotation_id,
+                        start_screen_pos: (event.position.x.into(), event.position.y.into()),
+                        start_pdf_rect: annot.current_rect,
+                    });
+                }
+            }
+            HitTestResult::None => {
+                self.selected_annotation = None;
+                self.drag_state = None;
+            }
+        }
+
+        cx.notify();
+    }
+
+    fn handle_select_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.annotation_mode != AnnotationMode::Select {
+            return;
+        }
+
+        if let Some(DragState::MovingAnnotation {
+            annotation_id,
+            start_screen_pos,
+            start_pdf_rect,
+        }) = &self.drag_state
+        {
+            let _page = &self.document.summary.pages[self.current_page];
+            let zoom = self.effective_zoom(window);
+            let scale = (PREVIEW_DPI / 72.0) * zoom;
+
+            // Calculate screen delta (Pixels to f32)
+            let screen_dx: f32 = (event.position.x - px(start_screen_pos.0)).into();
+            let screen_dy: f32 = (event.position.y - px(start_screen_pos.1)).into();
+
+            // Convert to PDF delta
+            let pdf_dx = (screen_dx / scale) as f64;
+            let pdf_dy = -((screen_dy / scale) as f64); // Negative because PDF Y increases upward
+
+            // Update annotation's current rect
+            if let Some(annot) = self
+                .page_annotations
+                .iter_mut()
+                .find(|a| a.object_id == *annotation_id)
+            {
+                annot.current_rect = Rect {
+                    x0: start_pdf_rect.x0 + pdf_dx,
+                    y0: start_pdf_rect.y0 + pdf_dy,
+                    x1: start_pdf_rect.x1 + pdf_dx,
+                    y1: start_pdf_rect.y1 + pdf_dy,
+                };
+            }
+
+            cx.notify();
+        }
+    }
+
+    fn handle_select_mouse_up(&mut self, _event: &MouseUpEvent, cx: &mut Context<Self>) {
+        if self.annotation_mode != AnnotationMode::Select {
+            return;
+        }
+
+        if let Some(DragState::MovingAnnotation { annotation_id, .. }) = self.drag_state.take() {
+            // Find the annotation's final rect
+            if let Some(annot) = self
+                .page_annotations
+                .iter()
+                .find(|a| a.object_id == annotation_id)
+            {
+                // Add to edit buffer
+                self.edit_buffer.add(EditOperation::Move {
+                    object_id: annotation_id,
+                    page_index: self.current_page,
+                    new_rect: annot.current_rect,
+                });
+
+                self.last_error = Some("Moved annotation (press Ctrl+S to save)".to_string());
+            }
+        }
+
+        cx.notify();
+    }
+
+    fn delete_selected_annotation(&mut self, cx: &mut Context<Self>) {
+        if let Some(selected_id) = self.selected_annotation {
+            // Add delete operation to buffer
+            self.edit_buffer.add(EditOperation::Delete {
+                object_id: selected_id,
+                page_index: self.current_page,
+            });
+
+            // Remove from display
+            self.page_annotations.retain(|a| a.object_id != selected_id);
+            self.selected_annotation = None;
+
+            self.last_error = Some("Deleted annotation (press Ctrl+S to save)".to_string());
+            cx.notify();
+        }
+    }
+
+    fn save_edits(&mut self, cx: &mut Context<Self>) {
+        if self.edit_buffer.is_empty() {
+            self.last_error = Some("No edits to save".to_string());
+            cx.notify();
+            return;
+        }
+
+        // Read original PDF bytes
+        let original_bytes = match std::fs::read(&self.document.summary.path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                self.last_error = Some(format!("Failed to read PDF: {}", e));
+                cx.notify();
+                return;
+            }
+        };
+
+        // Create writer
+        let mut writer = match IncrementalWriter::new(original_bytes) {
+            Ok(w) => w,
+            Err(e) => {
+                self.last_error = Some(format!("Failed to create writer: {}", e));
+                cx.notify();
+                return;
+            }
+        };
+
+        // Apply all buffered operations
+        for op in self.edit_buffer.operations.values() {
+            let result = match op {
+                EditOperation::Move {
+                    object_id,
+                    new_rect,
+                    ..
+                } => writer.update_annotation_rect(*object_id, *new_rect),
+                EditOperation::Delete {
+                    object_id,
+                    page_index,
+                } => writer.delete_annotation(*page_index, *object_id),
+            };
+
+            if let Err(e) = result {
+                self.last_error = Some(format!("Failed to apply edit: {}", e));
+                cx.notify();
+                return;
+            }
+        }
+
+        // Write to temp file
+        let temp_path = self.document.summary.path.with_extension("pdf.tmp");
+        let mut temp_file = match File::create(&temp_path) {
+            Ok(f) => f,
+            Err(e) => {
+                self.last_error = Some(format!("Failed to create temp file: {}", e));
+                cx.notify();
+                return;
+            }
+        };
+
+        if let Err(e) = writer.write(&mut temp_file) {
+            self.last_error = Some(format!("Failed to write: {}", e));
+            cx.notify();
+            return;
+        }
+
+        if let Err(e) = temp_file.sync_all() {
+            self.last_error = Some(format!("Failed to sync: {}", e));
+            cx.notify();
+            return;
+        }
+        drop(temp_file);
+
+        // Atomic rename
+        if let Err(e) = std::fs::rename(&temp_path, &self.document.summary.path) {
+            self.last_error = Some(format!("Failed to rename: {}", e));
+            cx.notify();
+            return;
+        }
+
+        let num_edits = self.edit_buffer.operations.len();
+        self.edit_buffer.clear();
+        self.page_cache.clear();
+
+        self.last_error = Some(format!("✓ Saved {} edit(s)", num_edits));
+
+        // Reload annotations
+        self.load_page_annotations(cx);
         cx.notify();
     }
 
@@ -642,6 +1168,42 @@ impl Render for Viewer {
                     }
 
                     container
+                } else if self.annotation_mode == AnnotationMode::Select {
+                    let mut container = page_container;
+
+                    // Render selection highlight for selected annotation
+                    if let Some(selected_id) = self.selected_annotation {
+                        if let Some(annot) = self
+                            .page_annotations
+                            .iter()
+                            .find(|a| a.object_id == selected_id)
+                        {
+                            let scale = (PREVIEW_DPI / 72.0) * zoom;
+                            let screen_x0 = (annot.current_rect.x0 * scale as f64) as f32;
+                            let screen_y0 =
+                                ((page.height - annot.current_rect.y1) * scale as f64) as f32;
+                            let screen_width = ((annot.current_rect.x1 - annot.current_rect.x0)
+                                * scale as f64)
+                                as f32;
+                            let screen_height = ((annot.current_rect.y1 - annot.current_rect.y0)
+                                * scale as f64)
+                                as f32;
+
+                            // Blue selection border
+                            container = container.child(
+                                div()
+                                    .absolute()
+                                    .left(px(screen_x0))
+                                    .top(px(screen_y0))
+                                    .w(px(screen_width))
+                                    .h(px(screen_height))
+                                    .border_2()
+                                    .border_color(rgb(0x4A90E2)),
+                            );
+                        }
+                    }
+
+                    container
                 } else {
                     page_container
                 };
@@ -662,6 +1224,23 @@ impl Render for Viewer {
                             MouseButton::Left,
                             cx.listener(|this, event, _, cx| {
                                 this.handle_ink_mouse_up(event, cx);
+                            }),
+                        )
+                } else if self.annotation_mode == AnnotationMode::Select {
+                    page_container
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, event, window, cx| {
+                                this.handle_select_mouse_down(event, window, cx);
+                            }),
+                        )
+                        .on_mouse_move(cx.listener(|this, event, window, cx| {
+                            this.handle_select_mouse_move(event, window, cx);
+                        }))
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, event, _, cx| {
+                                this.handle_select_mouse_up(event, cx);
                             }),
                         )
                 } else {
@@ -728,6 +1307,18 @@ impl Render for Viewer {
             .on_action(cx.listener(Self::toggle_ink_mode))
             .on_action(cx.listener(Self::save_annotation))
             .on_action(cx.listener(Self::cancel_annotation))
+            .on_action(cx.listener(Self::add_watermark))
+            .on_action(cx.listener(Self::add_draft_stamp))
+            .on_action(cx.listener(Self::add_confidential_stamp))
+            .on_action(cx.listener(|this, _: &ToggleSelectMode, _, cx| {
+                this.toggle_select_mode(cx);
+            }))
+            .on_action(cx.listener(|this, _: &SaveEdits, _, cx| {
+                this.save_edits(cx);
+            }))
+            .on_action(cx.listener(|this, _: &DeleteSelected, _, cx| {
+                this.delete_selected_annotation(cx);
+            }))
             .size_full()
             .flex()
             .bg(rgb(0x0d1210))
@@ -1048,6 +1639,18 @@ impl Render for Viewer {
                                             }),
                                         ),
                                     )
+                                    .child(
+                                        self.tool_button(
+                                            "select-mode",
+                                            "🖱 Select",
+                                            self.annotation_mode == AnnotationMode::Select,
+                                        )
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| {
+                                                this.toggle_select_mode(cx)
+                                            }),
+                                        ),
+                                    )
                                     .when(
                                         self.annotation_mode == AnnotationMode::Ink,
                                         |container| {
@@ -1091,6 +1694,69 @@ impl Render for Viewer {
                                                     })),
                                                 )
                                         },
+                                    )
+                                    .when(
+                                        self.annotation_mode == AnnotationMode::Select,
+                                        |container| {
+                                            container
+                                                .child(
+                                                    div()
+                                                        .px_3()
+                                                        .text_sm()
+                                                        .text_color(rgb(0xbfb5a5))
+                                                        .child(format!(
+                                                            "{} annotation(s)",
+                                                            self.page_annotations.len()
+                                                        )),
+                                                )
+                                                .when(!self.edit_buffer.is_empty(), |c| {
+                                                    c.child(
+                                                        div()
+                                                            .px_3()
+                                                            .text_sm()
+                                                            .text_color(rgb(0xff6b35))
+                                                            .child(format!(
+                                                                "{} edit(s) pending",
+                                                                self.edit_buffer.operations.len()
+                                                            )),
+                                                    )
+                                                })
+                                        },
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .px_3()
+                                            .text_sm()
+                                            .text_color(rgb(0xbfb5a5))
+                                            .child("Stamps:"),
+                                    )
+                                    .child(
+                                        self.tool_button("watermark", "💧 Water", false).on_click(
+                                            cx.listener(|this, _, window, cx| {
+                                                this.add_watermark(&AddWatermark, window, cx)
+                                            }),
+                                        ),
+                                    )
+                                    .child(self.tool_button("draft", "📝 Draft", false).on_click(
+                                        cx.listener(|this, _, window, cx| {
+                                            this.add_draft_stamp(&AddDraftStamp, window, cx)
+                                        }),
+                                    ))
+                                    .child(
+                                        self.tool_button("confidential", "🔒 Conf", false)
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.add_confidential_stamp(
+                                                    &AddConfidentialStamp,
+                                                    window,
+                                                    cx,
+                                                )
+                                            })),
                                     ),
                             ),
                     )

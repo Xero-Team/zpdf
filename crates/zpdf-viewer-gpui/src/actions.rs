@@ -14,6 +14,12 @@ actions!(
         FitWidth,
         ToggleInkMode,
         SaveAnnotation,
-        CancelAnnotation
+        CancelAnnotation,
+        AddWatermark,
+        AddConfidentialStamp,
+        AddDraftStamp,
+        ToggleSelectMode,
+        SaveEdits,
+        DeleteSelected
     ]
 );

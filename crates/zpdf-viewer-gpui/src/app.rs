@@ -8,7 +8,8 @@ use gpui_platform::application;
 use thiserror::Error;
 
 use crate::actions::{
-    ActualSize, FirstPage, FitWidth, LastPage, NextPage, PreviousPage, Quit, ZoomIn, ZoomOut,
+    ActualSize, AddConfidentialStamp, AddDraftStamp, AddWatermark, DeleteSelected, FirstPage,
+    FitWidth, LastPage, NextPage, PreviousPage, Quit, SaveEdits, ToggleSelectMode, ZoomIn, ZoomOut,
 };
 use crate::document::{load_document, DocumentError};
 use crate::viewer::Viewer;
@@ -52,6 +53,14 @@ pub fn run(path: PathBuf) -> Result<(), AppError> {
             KeyBinding::new("-", ZoomOut, Some("PdfViewer")),
             KeyBinding::new("0", ActualSize, Some("PdfViewer")),
             KeyBinding::new("f", FitWidth, Some("PdfViewer")),
+            KeyBinding::new("w", AddWatermark, Some("PdfViewer")),
+            KeyBinding::new("d", AddDraftStamp, Some("PdfViewer")),
+            KeyBinding::new("c", AddConfidentialStamp, Some("PdfViewer")),
+            KeyBinding::new("s", ToggleSelectMode, Some("PdfViewer")),
+            KeyBinding::new("cmd-s", SaveEdits, Some("PdfViewer")),
+            KeyBinding::new("ctrl-s", SaveEdits, Some("PdfViewer")),
+            KeyBinding::new("delete", DeleteSelected, Some("PdfViewer")),
+            KeyBinding::new("backspace", DeleteSelected, Some("PdfViewer")),
         ]);
 
         cx.open_window(

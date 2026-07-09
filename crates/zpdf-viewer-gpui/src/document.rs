@@ -116,6 +116,10 @@ pub fn load_document(path: PathBuf) -> Result<LoadedDocument, DocumentError> {
 }
 
 impl LoadedDocument {
+    pub fn document(&self) -> &PdfDocument {
+        &self.pdf
+    }
+
     pub fn render_page_preview(
         &self,
         index: usize,
