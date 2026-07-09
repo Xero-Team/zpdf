@@ -505,7 +505,7 @@ impl IncrementalWriter {
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let pdf_bytes = std::fs::read("input.pdf")?;
     /// let mut writer = IncrementalWriter::new(pdf_bytes)?;
-    /// writer.delete_annotation(0, ObjectId::new(5, 0))?;
+    /// writer.delete_annotation(0, ObjectId(5, 0))?;
     /// writer.write(&mut std::fs::File::create("output.pdf")?)?;
     /// # Ok(())
     /// # }
@@ -560,7 +560,7 @@ impl IncrementalWriter {
     /// let pdf_bytes = std::fs::read("input.pdf")?;
     /// let mut writer = IncrementalWriter::new(pdf_bytes)?;
     /// let new_rect = Rect { x0: 100.0, y0: 200.0, x1: 300.0, y1: 400.0 };
-    /// writer.update_annotation_rect(ObjectId::new(5, 0), new_rect)?;
+    /// writer.update_annotation_rect(ObjectId(5, 0), new_rect)?;
     /// writer.write(&mut std::fs::File::create("output.pdf")?)?;
     /// # Ok(())
     /// # }
@@ -605,7 +605,7 @@ impl IncrementalWriter {
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let pdf_bytes = std::fs::read("input.pdf")?;
     /// let mut writer = IncrementalWriter::new(pdf_bytes)?;
-    /// writer.update_annotation_color(ObjectId::new(5, 0), (1.0, 0.0, 0.0))?; // Red
+    /// writer.update_annotation_color(ObjectId(5, 0), (1.0, 0.0, 0.0))?; // Red
     /// writer.write(&mut std::fs::File::create("output.pdf")?)?;
     /// # Ok(())
     /// # }
@@ -644,7 +644,7 @@ impl IncrementalWriter {
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let pdf_bytes = std::fs::read("input.pdf")?;
     /// let mut writer = IncrementalWriter::new(pdf_bytes)?;
-    /// writer.update_annotation_contents(ObjectId::new(5, 0), "Updated comment")?;
+    /// writer.update_annotation_contents(ObjectId(5, 0), "Updated comment")?;
     /// writer.write(&mut std::fs::File::create("output.pdf")?)?;
     /// # Ok(())
     /// # }
@@ -687,7 +687,7 @@ impl IncrementalWriter {
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let pdf_bytes = std::fs::read("input.pdf")?;
     /// let mut writer = IncrementalWriter::new(pdf_bytes)?;
-    /// writer.update_annotation_border_width(ObjectId::new(5, 0), 3.0)?;
+    /// writer.update_annotation_border_width(ObjectId(5, 0), 3.0)?;
     /// writer.write(&mut std::fs::File::create("output.pdf")?)?;
     /// # Ok(())
     /// # }
