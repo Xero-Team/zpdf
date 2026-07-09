@@ -18,7 +18,7 @@ fn main() {
     if args.len() < 2 {
         eprintln!("Usage: zpdf <command> [args...]");
         eprintln!(
-            "Commands: info, dump, render, text, tables, forms, outline, links, struct, signatures, attachments, compare, debug-stream"
+            "Commands: info, dump, render, text, tables, forms, outline, links, struct, signatures, attachments, compare, debug-stream, fill, pages, set-meta, stamp"
         );
         process::exit(1);
     }
@@ -37,6 +37,10 @@ fn main() {
         "attachments" => cmd_attachments(&args[2..]),
         "compare" => cmd_compare(&args[2..]),
         "debug-stream" => cmd_debug_stream(&args[2..]),
+        "fill" => cmd_fill(&args[2..]),
+        "pages" => cmd_pages(&args[2..]),
+        "set-meta" => cmd_set_meta(&args[2..]),
+        "stamp" => cmd_stamp(&args[2..]),
         other => {
             eprintln!("Unknown command: {other}");
             process::exit(1);
@@ -1387,6 +1391,452 @@ fn cmd_debug_stream(args: &[String]) -> zpdf::Result<()> {
     Ok(())
 }
 
+/// Shared: build an IncrementalWriter from a file path, erroring on encrypted docs.
+fn build_writer(
+    path: &str,
+    _password: Option<&str>,
+) -> zpdf::Result<zpdf_writer::IncrementalWriter> {
+    let data = fs::read(path).map_err(zpdf::Error::Io)?;
+    zpdf_writer::IncrementalWriter::new(data)
+}
+
+/// Shared: write the incremental update to disk, refusing when output == input.
+fn write_output(writer: &zpdf_writer::IncrementalWriter, out_path: &str) -> zpdf::Result<()> {
+    let mut file = fs::File::create(out_path).map_err(zpdf::Error::Io)?;
+    writer.write(&mut file).map_err(zpdf::Error::Io)?;
+    Ok(())
+}
+
+/// Warn when the document has signatures (edits may invalidate them).
+fn warn_signatures(doc: &zpdf::PdfDocument) {
+    if !doc.signatures().is_empty() {
+        eprintln!("Warning: document is digitally signed; this edit may invalidate signatures.");
+    }
+}
+
+fn cmd_fill(args: &[String]) -> zpdf::Result<()> {
+    let (args, password) = extract_password(args);
+    let mut input = None;
+    let mut output = None;
+    let mut sets: Vec<(String, String)> = Vec::new();
+    let mut list = false;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--set" => {
+                if let Some(val) = args.get(i + 1) {
+                    if let Some(pos) = val.find('=') {
+                        let (name, value) = val.split_at(pos);
+                        sets.push((name.to_string(), value[1..].to_string()));
+                        i += 2;
+                    } else {
+                        eprintln!("--set requires NAME=VALUE");
+                        process::exit(1);
+                    }
+                } else {
+                    eprintln!("--set requires a value");
+                    process::exit(1);
+                }
+            }
+            "-o" => {
+                output = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "--list" => {
+                list = true;
+                i += 1;
+            }
+            other if !other.starts_with('-') => {
+                if input.is_none() {
+                    input = Some(other.to_string());
+                }
+                i += 1;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+
+    let Some(input_path) = input else {
+        eprintln!("Usage: zpdf fill <file.pdf> --set NAME=VALUE [--set ...] [--list] -o <out.pdf>");
+        process::exit(1);
+    };
+
+    if list {
+        let doc = open_document(&input_path, password.as_deref())?;
+        if let Some(form) = doc.acro_form() {
+            println!("Fields:");
+            for field in &form.fields {
+                let val = field
+                    .value
+                    .as_ref()
+                    .map(|v| format!("{:?}", v))
+                    .unwrap_or_else(|| "None".to_string());
+                println!("  {} ({:?}): {}", field.name, field.kind, val);
+            }
+        } else {
+            println!("No AcroForm.");
+        }
+        return Ok(());
+    }
+
+    let Some(out_path) = output else {
+        eprintln!("-o <out.pdf> required");
+        process::exit(1);
+    };
+    if out_path == input_path {
+        eprintln!("Output path must differ from input");
+        process::exit(1);
+    }
+
+    let doc = open_document(&input_path, password.as_deref())?;
+    warn_signatures(&doc);
+    let mut writer = build_writer(&input_path, password.as_deref())?;
+    let mut filler = zpdf_writer::FormFiller::new(&mut writer)?;
+    for (name, value) in &sets {
+        filler.set(name, value)?;
+    }
+    filler.finish()?;
+    write_output(&writer, &out_path)?;
+    println!("Filled {} fields → {}", sets.len(), out_path);
+    Ok(())
+}
+
+fn cmd_pages(args: &[String]) -> zpdf::Result<()> {
+    let (args, password) = extract_password(args);
+    let mut input = None;
+    let mut output = None;
+    let mut rotates: Vec<(Vec<usize>, i32)> = Vec::new();
+    let mut deletes: Vec<usize> = Vec::new();
+    let mut order: Option<Vec<usize>> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--rotate" => {
+                if let Some(spec) = args.get(i + 1) {
+                    let parts: Vec<&str> = spec.split(':').collect();
+                    if parts.len() == 2 {
+                        let pages = parse_page_list(parts[0]);
+                        let deg: i32 = parts[1].parse().unwrap_or(0);
+                        rotates.push((pages, deg));
+                    }
+                    i += 2;
+                } else {
+                    eprintln!("--rotate requires PAGES:DEG");
+                    process::exit(1);
+                }
+            }
+            "--delete" => {
+                if let Some(list) = args.get(i + 1) {
+                    deletes.extend(parse_page_list(list));
+                    i += 2;
+                } else {
+                    eprintln!("--delete requires a page list");
+                    process::exit(1);
+                }
+            }
+            "--order" => {
+                if let Some(list) = args.get(i + 1) {
+                    order = Some(parse_page_list(list));
+                    i += 2;
+                } else {
+                    eprintln!("--order requires a page list");
+                    process::exit(1);
+                }
+            }
+            "-o" => {
+                output = args.get(i + 1).cloned();
+                i += 2;
+            }
+            other if !other.starts_with('-') => {
+                if input.is_none() {
+                    input = Some(other.to_string());
+                }
+                i += 1;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+
+    let Some(input_path) = input else {
+        eprintln!("Usage: zpdf pages <file.pdf> [--rotate PAGES:DEG] [--delete LIST] [--order LIST] -o <out.pdf>");
+        process::exit(1);
+    };
+    let Some(out_path) = output else {
+        eprintln!("-o <out.pdf> required");
+        process::exit(1);
+    };
+    if out_path == input_path {
+        eprintln!("Output path must differ from input");
+        process::exit(1);
+    }
+    if order.is_some() && !deletes.is_empty() {
+        eprintln!("--order and --delete are mutually exclusive in this version");
+        process::exit(1);
+    }
+
+    let doc = open_document(&input_path, password.as_deref())?;
+    warn_signatures(&doc);
+    let mut writer = build_writer(&input_path, password.as_deref())?;
+    for (pages, deg) in &rotates {
+        for &idx in pages {
+            writer.rotate_page(idx, *deg)?;
+        }
+    }
+    if let Some(ord) = order {
+        writer.reorder_pages(&ord)?;
+    } else if !deletes.is_empty() {
+        writer.delete_pages(&deletes)?;
+    }
+    write_output(&writer, &out_path)?;
+    println!("Page ops applied → {}", out_path);
+    Ok(())
+}
+
+fn cmd_set_meta(args: &[String]) -> zpdf::Result<()> {
+    let (args, password) = extract_password(args);
+    let mut input = None;
+    let mut output = None;
+    let mut update = zpdf_writer::InfoUpdate::default();
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--title" => {
+                update.title = args.get(i + 1).map(|s| Some(s.clone()));
+                i += 2;
+            }
+            "--author" => {
+                update.author = args.get(i + 1).map(|s| Some(s.clone()));
+                i += 2;
+            }
+            "--subject" => {
+                update.subject = args.get(i + 1).map(|s| Some(s.clone()));
+                i += 2;
+            }
+            "--keywords" => {
+                update.keywords = args.get(i + 1).map(|s| Some(s.clone()));
+                i += 2;
+            }
+            "--creator" => {
+                update.creator = args.get(i + 1).map(|s| Some(s.clone()));
+                i += 2;
+            }
+            "--producer" => {
+                update.producer = args.get(i + 1).map(|s| Some(s.clone()));
+                i += 2;
+            }
+            "-o" => {
+                output = args.get(i + 1).cloned();
+                i += 2;
+            }
+            other if !other.starts_with('-') => {
+                if input.is_none() {
+                    input = Some(other.to_string());
+                }
+                i += 1;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+
+    let Some(input_path) = input else {
+        eprintln!("Usage: zpdf set-meta <file.pdf> [--title S] [--author S] ... -o <out.pdf>");
+        process::exit(1);
+    };
+    let Some(out_path) = output else {
+        eprintln!("-o <out.pdf> required");
+        process::exit(1);
+    };
+    if out_path == input_path {
+        eprintln!("Output path must differ from input");
+        process::exit(1);
+    }
+    if update.is_empty() {
+        eprintln!("No metadata fields specified");
+        process::exit(1);
+    }
+
+    let doc = open_document(&input_path, password.as_deref())?;
+    warn_signatures(&doc);
+    let mut writer = build_writer(&input_path, password.as_deref())?;
+    writer.set_info(&update)?;
+    write_output(&writer, &out_path)?;
+    println!("Metadata updated → {}", out_path);
+    Ok(())
+}
+
+fn cmd_stamp(args: &[String]) -> zpdf::Result<()> {
+    let (args, password) = extract_password(args);
+    let mut input = None;
+    let mut output = None;
+    let mut page: Option<usize> = None;
+    let mut items: Vec<zpdf::StampItem> = Vec::new();
+    let mut current_text: Option<(String, f64, f64)> = None;
+    let mut current_font = "Helvetica".to_string();
+    let mut current_size = 12.0;
+    let mut current_color = (0.0, 0.0, 0.0);
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-p" => {
+                if let Some(val) = args.get(i + 1).and_then(|s| s.parse::<usize>().ok()) {
+                    page = Some(val - 1); // 1-based → 0-based
+                    i += 2;
+                } else {
+                    eprintln!("-p requires a page number");
+                    process::exit(1);
+                }
+            }
+            "--text" => {
+                if let Some(current) = current_text.take() {
+                    items.push(zpdf::StampItem::Text {
+                        text: current.0,
+                        x: current.1,
+                        y: current.2,
+                        font: current_font.clone(),
+                        size: current_size,
+                        color: current_color,
+                    });
+                }
+                if let Some(val) = args.get(i + 1) {
+                    current_text = Some((val.clone(), 0.0, 0.0));
+                    i += 2;
+                } else {
+                    eprintln!("--text requires a string");
+                    process::exit(1);
+                }
+            }
+            "--at" if current_text.is_some() => {
+                if let Some(val) = args.get(i + 1) {
+                    let parts: Vec<&str> = val.split(',').collect();
+                    if parts.len() == 2 {
+                        let x = parts[0].parse().unwrap_or(0.0);
+                        let y = parts[1].parse().unwrap_or(0.0);
+                        if let Some(ref mut t) = current_text {
+                            t.1 = x;
+                            t.2 = y;
+                        }
+                    }
+                    i += 2;
+                } else {
+                    eprintln!("--at requires X,Y");
+                    process::exit(1);
+                }
+            }
+            "--font" => {
+                if let Some(val) = args.get(i + 1) {
+                    current_font = val.clone();
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            "--size" => {
+                if let Some(val) = args.get(i + 1).and_then(|s| s.parse().ok()) {
+                    current_size = val;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            "--color" => {
+                if let Some(val) = args.get(i + 1) {
+                    let parts: Vec<&str> = val.split(',').collect();
+                    if parts.len() == 3 {
+                        current_color = (
+                            parts[0].parse().unwrap_or(0.0),
+                            parts[1].parse().unwrap_or(0.0),
+                            parts[2].parse().unwrap_or(0.0),
+                        );
+                    }
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            "-o" => {
+                output = args.get(i + 1).cloned();
+                i += 2;
+            }
+            other if !other.starts_with('-') => {
+                if input.is_none() {
+                    input = Some(other.to_string());
+                }
+                i += 1;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+    if let Some(current) = current_text {
+        items.push(zpdf::StampItem::Text {
+            text: current.0,
+            x: current.1,
+            y: current.2,
+            font: current_font,
+            size: current_size,
+            color: current_color,
+        });
+    }
+
+    let Some(input_path) = input else {
+        eprintln!("Usage: zpdf stamp <file.pdf> -p N --text STR --at X,Y [--font F] [--size N] [--color R,G,B] -o <out.pdf>");
+        process::exit(1);
+    };
+    let Some(out_path) = output else {
+        eprintln!("-o <out.pdf> required");
+        process::exit(1);
+    };
+    if out_path == input_path {
+        eprintln!("Output path must differ from input");
+        process::exit(1);
+    }
+    let Some(page_idx) = page else {
+        eprintln!("-p <page> required");
+        process::exit(1);
+    };
+
+    let doc = open_document(&input_path, password.as_deref())?;
+    warn_signatures(&doc);
+    let mut writer = build_writer(&input_path, password.as_deref())?;
+    writer.stamp_page(page_idx, &items)?;
+    write_output(&writer, &out_path)?;
+    println!(
+        "Stamped {} items on page {} → {}",
+        items.len(),
+        page_idx + 1,
+        out_path
+    );
+    Ok(())
+}
+
+/// Parse "1,3-5,8" into 0-based indices [0,2,3,4,7]. "all" is not supported.
+fn parse_page_list(s: &str) -> Vec<usize> {
+    let mut result = Vec::new();
+    for part in s.split(',') {
+        if let Some(pos) = part.find('-') {
+            let (start, end) = part.split_at(pos);
+            let a: usize = start.parse::<usize>().unwrap_or(1).saturating_sub(1);
+            let b: usize = end[1..].parse::<usize>().unwrap_or(1).saturating_sub(1);
+            for i in a..=b {
+                result.push(i);
+            }
+        } else if let Ok(n) = part.parse::<usize>() {
+            result.push(n.saturating_sub(1));
+        }
+    }
+    result
+}
 #[cfg(test)]
 mod tests {
     use super::{collect_attachments, create_unique, sanitize_filename};
