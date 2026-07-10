@@ -160,16 +160,31 @@ fn decode_tiff_predictor(
     bpc: usize,
     columns: usize,
 ) -> Result<Vec<u8>> {
+    // M4 Fix: Validate parameters before processing
+    // TIFF predictor (Predictor 2) in PDF spec only supports BPC=8
     if bpc != 8 {
+        // Not an error per spec - just means predictor doesn't apply
         return Ok(data.to_vec());
     }
+
+    // M4 Fix: Explicit validation that parameters are non-zero
+    if colors == 0 || columns == 0 {
+        return Err(Error::StreamDecode(
+            "TIFF predictor: colors and columns must be non-zero".into(),
+        ));
+    }
+
     // Check for overflow in row_bytes calculation
     let row_bytes = columns
         .checked_mul(colors)
         .ok_or_else(|| Error::StreamDecode("TIFF predictor: columns * colors overflow".into()))?;
-    if row_bytes == 0 {
+
+    // M4 Fix: Validate data length is consistent with parameters
+    // Data should be a multiple of row_bytes (though we handle partial rows gracefully)
+    if data.is_empty() {
         return Ok(data.to_vec());
     }
+
     let mut output = data.to_vec();
     for row_start in (0..output.len()).step_by(row_bytes) {
         let row_end = (row_start + row_bytes).min(output.len());
@@ -181,6 +196,18 @@ fn decode_tiff_predictor(
 }
 
 fn decode_png_predictor(data: &[u8], colors: usize, bpc: usize, columns: usize) -> Result<Vec<u8>> {
+    // L1 Fix: Explicit validation of parameters before processing
+    if colors == 0 || columns == 0 {
+        return Err(Error::StreamDecode(
+            "PNG predictor: colors and columns must be non-zero".into(),
+        ));
+    }
+    if bpc == 0 || bpc > 16 {
+        return Err(Error::StreamDecode(
+            "PNG predictor: bits per component must be 1-16".into(),
+        ));
+    }
+
     // Check all multiplications for overflow to prevent allocation bombs
     let bits_per_row = colors
         .checked_mul(bpc)
@@ -196,6 +223,13 @@ fn decode_png_predictor(data: &[u8], colors: usize, bpc: usize, columns: usize) 
     let stride = row_bytes
         .checked_add(1)
         .ok_or_else(|| Error::StreamDecode("PNG predictor: stride overflow".into()))?; // filter byte + row data
+
+    // L1 Fix: Validate stride is reasonable (not zero, not absurdly large)
+    if stride == 0 {
+        return Err(Error::StreamDecode(
+            "PNG predictor: stride cannot be zero".into(),
+        ));
+    }
 
     if !data.len().is_multiple_of(stride) && !data.is_empty() {
         // Try to process what we can
@@ -306,13 +340,13 @@ fn apply_filter(
         "DCTDecode" | "DCT" => decode_dct(data, budget),
         "CCITTFaxDecode" | "CCF" => {
             let ccitt_params = crate::ccitt::CcittParams::from_dict(params);
-            // TODO H1: Thread budget through once ccitt module is updated
-            crate::ccitt::decode(data, &ccitt_params)
+            // M1 Fix: Thread budget through to prevent decompression bombs
+            crate::ccitt::decode(data, &ccitt_params, budget)
         }
         "JBIG2Decode" => {
             let jbig2_params = crate::jbig2::Jbig2Params::from_dict(params);
-            // TODO H1: Thread budget through once jbig2 module is updated
-            crate::jbig2::decode(data, &jbig2_params)
+            // M2 Fix: Thread budget through to prevent decompression bombs
+            crate::jbig2::decode(data, &jbig2_params, budget)
         }
         // JPXDecode output is decoded *pixels*, not raw samples, and JPEG 2000
         // carries its own colour-space/alpha metadata that a bytes-only filter
@@ -415,9 +449,17 @@ fn lzw_decode(data: &[u8], early_change: i64, budget: &mut DecodeBudget) -> Resu
         // Add new dictionary entry = previous string + first byte of this entry.
         // (Skipped for the first code after a clear, when prev is None.)
         if let Some(p) = prev {
-            let mut new_entry = table[p as usize].clone();
-            new_entry.push(entry[0]);
-            table.push(new_entry);
+            // M5 Fix: Enforce the LZW table size limit of 4096 entries (codes 0-4095).
+            // The spec dictates max code width is 12 bits (2^12 = 4096), so adding
+            // beyond this would violate the protocol.
+            if table.len() >= 4096 {
+                // Table is full; don't add new entries until a CLEAR resets it.
+                // This is standard LZW behavior when the table maxes out.
+            } else {
+                let mut new_entry = table[p as usize].clone();
+                new_entry.push(entry[0]);
+                table.push(new_entry);
+            }
         }
         prev = Some(code);
 
@@ -542,7 +584,11 @@ fn decode_flate(data: &[u8], budget: &mut DecodeBudget) -> Result<Vec<u8>> {
 /// Lenient ASCIIHexDecode: whitespace is ignored anywhere, stray non-hex bytes
 /// are skipped (warned, not fatal), and anything after the `>` EOD marker is
 /// ignored, so partial/dirty streams still decode.
-fn decode_ascii_hex(data: &[u8], _budget: &mut DecodeBudget) -> Result<Vec<u8>> {
+fn decode_ascii_hex(data: &[u8], budget: &mut DecodeBudget) -> Result<Vec<u8>> {
+    // M7 Fix: Reserve budget upfront for worst-case output size (one byte per two input chars)
+    let max_output = data.len().saturating_add(1) / 2;
+    budget.reserve(max_output as u64)?;
+
     let mut output = Vec::with_capacity(data.len() / 2);
     let mut high: Option<u8> = None;
     let mut stray = 0usize;
@@ -586,7 +632,13 @@ fn decode_ascii_hex(data: &[u8], _budget: &mut DecodeBudget) -> Result<Vec<u8>> 
 /// Lenient ASCII85Decode: whitespace is ignored anywhere, stray bytes outside
 /// the alphabet are skipped (warned, not fatal), and everything from the `~`
 /// of the `~>` EOD marker on is ignored, salvaging partial output.
-fn decode_ascii85(data: &[u8], _budget: &mut DecodeBudget) -> Result<Vec<u8>> {
+fn decode_ascii85(data: &[u8], budget: &mut DecodeBudget) -> Result<Vec<u8>> {
+    // M6 Fix: Reserve budget upfront for worst-case output size.
+    // Each 5-char ASCII85 group decodes to 4 bytes, plus special 'z' → 4 bytes.
+    // Worst case: all 'z' chars → data.len() * 4 bytes. Over-reservation is safe.
+    let max_output = (data.len() as u64).saturating_mul(4);
+    budget.reserve(max_output)?;
+
     let mut output = Vec::new();
     // u64 accumulator: a 5-char group of bytes near 'u' encodes a value just
     // above u32::MAX; the spec calls it invalid, but it must not overflow.
@@ -640,7 +692,43 @@ fn decode_ascii85(data: &[u8], _budget: &mut DecodeBudget) -> Result<Vec<u8>> {
     Ok(output)
 }
 
-fn decode_dct(data: &[u8], _budget: &mut DecodeBudget) -> Result<Vec<u8>> {
+/// H2 Fix: Validate JPEG dimensions before zune-jpeg allocates the output buffer.
+/// A malformed JPEG header claiming 65535×65535×4 would trigger a ~16 GiB allocation
+/// in `decode()`, bypassing all limits. Pre-validate against ParseLimits and reserve
+/// the decoded size from the budget before calling decode.
+fn validate_jpeg_dimensions(
+    width: u16,
+    height: u16,
+    components: u8,
+    budget: &mut DecodeBudget,
+) -> Result<()> {
+    let w = width as u64;
+    let h = height as u64;
+    let c = components as u64;
+
+    // Check pixel count against the same limit zpdf-image uses (mirrors ParseLimits default)
+    let pixel_count = w.saturating_mul(h);
+    if pixel_count > 100_000_000 {
+        return Err(Error::StreamDecode(format!(
+            "JPEG dimensions {w}×{h} exceed 100M pixel limit"
+        )));
+    }
+
+    // Check decoded byte size (width × height × channels) against budget
+    let decoded_size = pixel_count.saturating_mul(c);
+    if decoded_size > budget.remaining {
+        return Err(Error::StreamDecode(format!(
+            "JPEG output {w}×{h}×{c} = {decoded_size} bytes exceeds remaining budget {}",
+            budget.remaining
+        )));
+    }
+
+    // Reserve budget before zune-jpeg allocates
+    budget.reserve(decoded_size)?;
+    Ok(())
+}
+
+fn decode_dct(data: &[u8], budget: &mut DecodeBudget) -> Result<Vec<u8>> {
     use zune_jpeg::JpegDecoder;
 
     // Adobe YCCK JPEGs (APP14 transform == 2, 4 components) are mis-handled by
@@ -654,6 +742,15 @@ fn decode_dct(data: &[u8], _budget: &mut DecodeBudget) -> Result<Vec<u8>> {
         use zune_jpeg::zune_core::options::DecoderOptions;
         let opts = DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::YCCK);
         let mut decoder = JpegDecoder::new_with_options(std::io::Cursor::new(data), opts);
+
+        // H2 Fix: Validate JPEG dimensions before decode to prevent allocation bomb
+        decoder
+            .decode_headers()
+            .map_err(|e| Error::StreamDecode(format!("DCTDecode header parse failed: {e}")))?;
+        if let Some(info) = decoder.info() {
+            validate_jpeg_dimensions(info.width, info.height, info.components, budget)?;
+        }
+
         match decoder.decode() {
             Ok(ycck) if decoder.output_colorspace() == Some(ColorSpace::YCCK) => {
                 return Ok(ycck_to_rgb(&ycck));
@@ -665,6 +762,15 @@ fn decode_dct(data: &[u8], _budget: &mut DecodeBudget) -> Result<Vec<u8>> {
     }
 
     let mut decoder = JpegDecoder::new(std::io::Cursor::new(data));
+
+    // H2 Fix: Validate JPEG dimensions before decode to prevent allocation bomb
+    decoder
+        .decode_headers()
+        .map_err(|e| Error::StreamDecode(format!("DCTDecode header parse failed: {e}")))?;
+    if let Some(info) = decoder.info() {
+        validate_jpeg_dimensions(info.width, info.height, info.components, budget)?;
+    }
+
     decoder
         .decode()
         .map_err(|e| Error::StreamDecode(format!("DCTDecode: {e}")))

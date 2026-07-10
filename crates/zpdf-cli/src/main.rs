@@ -1061,7 +1061,8 @@ fn cmd_text(args: &[String]) -> zpdf::Result<()> {
                 .with_document(doc.file(), &page.resources)
                 .with_images(&mut image_cache)
                 .with_colors(&mut icc_cache)
-                .with_text_sink(&mut spans);
+                .with_text_sink(&mut spans)
+                .with_operand_stack_limit(doc.file().limits().max_operand_stack_depth as usize);
             let _ = interpreter.interpret(&content_bytes);
         }
 
@@ -1129,7 +1130,8 @@ fn cmd_tables(args: &[String]) -> zpdf::Result<()> {
                 .with_images(&mut image_cache)
                 .with_colors(&mut icc_cache)
                 .with_text_sink(&mut spans)
-                .with_rule_sink(&mut rules);
+                .with_rule_sink(&mut rules)
+                .with_operand_stack_limit(doc.file().limits().max_operand_stack_depth as usize);
             let _ = interpreter.interpret(&content_bytes);
         }
 
@@ -1258,7 +1260,8 @@ fn cmd_render(args: &[String]) -> zpdf::Result<()> {
         .with_document(doc.file(), &page.resources)
         .with_images(&mut image_cache)
         .with_colors(&mut icc_cache)
-        .with_annotations(&annotations);
+        .with_annotations(&annotations)
+        .with_operand_stack_limit(doc.file().limits().max_operand_stack_depth as usize);
     if let Some(oc) = &oc_config {
         interpreter = interpreter.with_optional_content(oc);
     }

@@ -161,7 +161,8 @@ impl LoadedDocument {
             .with_fonts(&mut fonts)
             .with_document(self.pdf.file(), &page.resources)
             .with_images(&mut images)
-            .with_colors(&mut colors);
+            .with_colors(&mut colors)
+            .with_operand_stack_limit(self.pdf.file().limits().max_operand_stack_depth as usize);
         if let Some(ref profile) = oi_cmyk {
             interpreter = interpreter.with_output_intent_cmyk(profile.clone());
         }
@@ -185,7 +186,10 @@ impl LoadedDocument {
                             .with_fonts(&mut fonts)
                             .with_document(self.pdf.file(), &page.resources)
                             .with_images(&mut images)
-                            .with_colors(&mut colors);
+                            .with_colors(&mut colors)
+                            .with_operand_stack_limit(
+                                self.pdf.file().limits().max_operand_stack_depth as usize,
+                            );
                         if let Some(ref profile) = oi_cmyk {
                             annot_interp = annot_interp.with_output_intent_cmyk(profile.clone());
                         }

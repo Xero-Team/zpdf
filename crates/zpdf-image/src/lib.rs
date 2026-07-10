@@ -293,8 +293,16 @@ fn decode_image_mask(
     fill: [u8; 3],
     invert: bool,
 ) -> Result<DecodedImage> {
+    // L2 Fix: Use checked arithmetic to prevent overflow in capacity calculation
+    let pixel_count = (width as usize)
+        .checked_mul(height as usize)
+        .ok_or_else(|| Error::StreamDecode("image mask pixel count overflow".into()))?;
+    let rgba_size = pixel_count
+        .checked_mul(4)
+        .ok_or_else(|| Error::StreamDecode("image mask RGBA buffer size overflow".into()))?;
+
     let row_bytes = (width as usize).div_ceil(8);
-    let mut rgba = Vec::with_capacity((width as usize) * (height as usize) * 4);
+    let mut rgba = Vec::with_capacity(rgba_size);
     for row in 0..height as usize {
         for col in 0..width as usize {
             let byte_idx = row * row_bytes + col / 8;
@@ -435,6 +443,10 @@ fn decode_jpx_image(
     })?
     .map_err(|e| Error::StreamDecode(format!("JPXDecode: {e}")))?;
 
+    // L3 Fix: Validate dimensions immediately after parsing header, before decode.
+    // JPX/JPEG2000 dimensions are embedded in the codestream (not just the dict),
+    // so we must parse the header first. We validate as early as possible: after
+    // Image::new (header parse) but before image.decode() (full decompression).
     // Re-check the pixel limit against the *codestream* header dims, which
     // are authoritative and may differ from the dict's /Width × /Height.
     let (width, height) = (image.width(), image.height());
@@ -615,6 +627,27 @@ fn decode_dct_image(
     // space whose component count matches the sniffed one is kept, so its
     // transform applies to the JPEG's output samples.
     let pixel_count = (width as usize) * (height as usize);
+
+    // L4 Fix: Explicit validation of component count from data length
+    // JPEG can only produce 1 (grayscale), 3 (RGB/YCbCr), or 4 (CMYK/YCCK) components
+    let bytes_per_pixel = if decoded_data.len() > pixel_count {
+        decoded_data.len() / pixel_count
+    } else {
+        return Err(Error::StreamDecode(format!(
+            "DCT decoded data too short: {} bytes for {}x{} image",
+            decoded_data.len(),
+            width,
+            height
+        )));
+    };
+
+    if !matches!(bytes_per_pixel, 1 | 3 | 4) {
+        return Err(Error::StreamDecode(format!(
+            "DCT image has invalid component count: {} bytes/pixel (expected 1, 3, or 4)",
+            bytes_per_pixel
+        )));
+    }
+
     let cs_is_cmyk =
         *cs == ResolvedColorSpace::Cmyk || matches!(cs, ResolvedColorSpace::Icc { ncomp: 4, .. });
     let (sniffed, ncomp) = if decoded_data.len() >= pixel_count * 4 && cs_is_cmyk {
@@ -716,11 +749,24 @@ fn decode_raw_samples(
     }
 
     let ncomp = cs.components();
-    let pixel_count = (width as usize) * (height as usize);
+    let pixel_count = (width as usize)
+        .checked_mul(height as usize)
+        .ok_or_else(|| Error::StreamDecode("raw samples: pixel count overflow".into()))?;
+
+    // L5 Fix: Check row_bytes computation for overflow before allocation
+    let row_bytes = (width as usize)
+        .checked_mul(ncomp)
+        .and_then(|v| v.checked_mul(bpc as usize))
+        .ok_or_else(|| Error::StreamDecode("raw samples: row bytes overflow".into()))?
+        .div_ceil(8);
+
+    let rgba_size = pixel_count
+        .checked_mul(4)
+        .ok_or_else(|| Error::StreamDecode("raw samples: RGBA buffer size overflow".into()))?;
+
     let luts = build_component_luts(bpc, cs, decode);
 
-    let row_bytes = (width as usize * ncomp * bpc as usize).div_ceil(8);
-    let mut rgba = Vec::with_capacity(pixel_count * 4);
+    let mut rgba = Vec::with_capacity(rgba_size);
     let mut any_masked = false;
 
     for row in 0..height as usize {
@@ -976,10 +1022,15 @@ fn mul255(v: u8, a: u8) -> u8 {
 /// Bilinear resample of a single-channel plane (fits mask planes onto the
 /// image they soften). Missing source data reads as opaque (255).
 fn resample_bilinear(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
+    // L6 Fix: Check output buffer size for overflow before allocation
+    let out_size = (dw as usize)
+        .checked_mul(dh as usize)
+        .expect("bilinear resample: output size overflow");
+
     let (sw_u, sh_u) = (sw as usize, sh as usize);
     let sample =
         |x: usize, y: usize| -> f32 { src.get(y * sw_u + x).copied().unwrap_or(255) as f32 };
-    let mut out = Vec::with_capacity(dw as usize * dh as usize);
+    let mut out = Vec::with_capacity(out_size);
     for dy in 0..dh {
         let fy = ((dy as f32 + 0.5) * sh as f32 / dh as f32 - 0.5).clamp(0.0, (sh - 1) as f32);
         let y0 = fy.floor() as usize;

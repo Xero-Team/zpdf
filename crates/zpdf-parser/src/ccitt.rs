@@ -11,6 +11,8 @@
 
 use zpdf_core::{Error, PdfDict, Result};
 
+use crate::filters::DecodeBudget;
+
 /// Parsed `/DecodeParms` for a CCITTFaxDecode filter.
 pub struct CcittParams {
     pub k: i64,
@@ -43,7 +45,11 @@ impl CcittParams {
 }
 
 /// Decode a CCITTFax stream into packed 1-bpp rows.
-pub fn decode(data: &[u8], params: &CcittParams) -> Result<Vec<u8>> {
+///
+/// M1 Fix: Now tracks cumulative budget to prevent decompression bombs where
+/// a tiny CCITT stream expands to hundreds of MiB. The existing MAX_OUTPUT
+/// heuristic (256 MiB) is replaced by explicit budget reservation.
+pub fn decode(data: &[u8], params: &CcittParams, budget: &mut DecodeBudget) -> Result<Vec<u8>> {
     let columns = params.columns;
     if columns == 0 || columns > 1 << 20 {
         return Err(Error::StreamDecode(format!(
@@ -52,20 +58,14 @@ pub fn decode(data: &[u8], params: &CcittParams) -> Result<Vec<u8>> {
     }
     let row_bytes = columns.div_ceil(8);
 
-    // Output-size safety cap (matches ParseLimits::max_stream_bytes default and
-    // the sibling LZW decoder). A single 1-bit vertical-mode code can emit a
-    // full row, so a tiny crafted stream with huge /Columns or /Rows would
-    // otherwise expand to gigabytes — bound both the row count and the buffer.
-    const MAX_OUTPUT: usize = 256 * 1024 * 1024;
-    let row_cap = (MAX_OUTPUT / row_bytes.max(1)).max(1);
-    // Honour an explicit /Rows; otherwise bound by the input size (each decoded
-    // row consumes at least one bit). Either way, clamp to the output cap.
-    let declared = if params.rows > 0 {
+    // M1 Fix: Use budget system instead of hardcoded MAX_OUTPUT. Honour an
+    // explicit /Rows; otherwise bound by the input size (each decoded row
+    // consumes at least one bit).
+    let max_rows = if params.rows > 0 {
         params.rows
     } else {
         data.len().saturating_mul(8).max(1)
     };
-    let max_rows = declared.min(row_cap);
 
     let mut reader = BitReader::new(data);
     let mut out: Vec<u8> = Vec::new();
@@ -109,11 +109,8 @@ pub fn decode(data: &[u8], params: &CcittParams) -> Result<Vec<u8>> {
             None => break, // ran out of bits mid-row
         };
 
-        // Defence in depth against a decompression bomb (max_rows already
-        // bounds this, but guard the buffer explicitly).
-        if out.len().saturating_add(row_bytes) > MAX_OUTPUT {
-            break;
-        }
+        // M1 Fix: Reserve budget for this row before allocating
+        budget.reserve(row_bytes as u64)?;
 
         // Pack the row: starts white, flips colour at each changing element.
         let mut row = vec![0u8; row_bytes];
@@ -470,6 +467,12 @@ const BLACK_CODES: [(u8, u16, u16); 64 + 27 + 13] = [
 mod tests {
     use super::*;
 
+    /// Helper for tests: decode with unlimited budget
+    fn decode_test(data: &[u8], params: &CcittParams) -> Result<Vec<u8>> {
+        let mut budget = crate::filters::DecodeBudget::new(u64::MAX);
+        decode(data, params, &mut budget)
+    }
+
     /// A single all-white 8-pixel row, 1-D coded: white run 8 (10011) then black
     /// run 0 (0000110111).
     #[test]
@@ -483,7 +486,7 @@ mod tests {
             black_is_1: false,
             byte_align: false,
         };
-        let out = decode(&data, &p).unwrap();
+        let out = decode_test(&data, &p).unwrap();
         // 8 white pixels, BlackIs1 false → white = sample 1 → 0xFF
         assert_eq!(out, vec![0xFF]);
     }
@@ -501,7 +504,7 @@ mod tests {
             black_is_1: false,
             byte_align: false,
         };
-        let out = decode(&data, &p).unwrap();
+        let out = decode_test(&data, &p).unwrap();
         // pixels WWWBBWWW, white=1 black=0 → 1110 0111 = 0xE7
         assert_eq!(out, vec![0b11100111]);
     }
@@ -518,7 +521,7 @@ mod tests {
             black_is_1: true,
             byte_align: false,
         };
-        let out = decode(&data, &p).unwrap();
+        let out = decode_test(&data, &p).unwrap();
         // WWWBBWWW, white=0 black=1 → 0001 1000 = 0x18
         assert_eq!(out, vec![0b00011000]);
     }
@@ -537,7 +540,7 @@ mod tests {
             black_is_1: false,
             byte_align: false,
         };
-        let out = decode(&data, &p).unwrap();
+        let out = decode_test(&data, &p).unwrap();
         assert!(
             out.len() <= 32,
             "output must stay bounded by input bits, got {}",

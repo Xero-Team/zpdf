@@ -77,7 +77,8 @@ fn render_page(doc: &PdfDocument, idx: usize, slot: &mut Option<GpuContext>) -> 
         .with_fonts(&mut fonts)
         .with_document(doc.file(), &page.resources)
         .with_images(&mut images)
-        .with_colors(&mut colors);
+        .with_colors(&mut colors)
+        .with_operand_stack_limit(doc.file().limits().max_operand_stack_depth as usize);
     if let Some(profile) = oi_cmyk {
         interpreter = interpreter.with_output_intent_cmyk(profile);
     }

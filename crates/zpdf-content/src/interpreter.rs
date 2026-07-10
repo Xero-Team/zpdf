@@ -125,6 +125,8 @@ pub struct ContentInterpreter<'a> {
     /// Cache resolved color spaces per page (indirect refs can repeat).
     /// Cleared per-page to avoid stale references across documents.
     cs_cache: RefCell<HashMap<ObjectId, ActiveColorSpace>>,
+    /// Maximum operand stack depth (M3 security fix).
+    max_operand_stack_depth: usize,
 }
 
 /// State for soft-mask reuse across the tiles of one `paint_tiling_pattern`
@@ -487,12 +489,19 @@ impl<'a> ContentInterpreter<'a> {
             tile_op_index: 0,
             cmyk_cache: RefCell::new(None),
             cs_cache: RefCell::new(HashMap::new()),
+            max_operand_stack_depth: 10_000, // M3: Match ParseLimits::default()
         }
     }
 
     /// Override the emitted-command ceiling (see [`DEFAULT_MAX_COMMANDS`]).
     pub fn with_command_limit(mut self, max_commands: usize) -> Self {
         self.max_commands = max_commands;
+        self
+    }
+
+    /// Override the operand stack depth limit (M3 security fix).
+    pub fn with_operand_stack_limit(mut self, max_depth: usize) -> Self {
+        self.max_operand_stack_depth = max_depth;
         self
     }
 
@@ -520,6 +529,12 @@ impl<'a> ContentInterpreter<'a> {
             }
         }
         self.timed_out
+    }
+
+    /// M3 Fix: Check operand stack depth before pushing. Returns true if the
+    /// push would exceed the limit.
+    fn operand_stack_full(&self) -> bool {
+        self.operand_stack.len() >= self.max_operand_stack_depth
     }
 
     /// Look a value up through the form-resources stack (innermost first),
@@ -655,6 +670,14 @@ impl<'a> ContentInterpreter<'a> {
             }
             match token {
                 ContentToken::Operand(obj) => {
+                    // M3 Fix: Enforce operand stack depth limit
+                    if self.operand_stack_full() {
+                        tracing::warn!(
+                            "operand stack exceeded {} entries; truncating page",
+                            self.max_operand_stack_depth
+                        );
+                        break;
+                    }
                     self.operand_stack.push(obj);
                 }
                 ContentToken::Operator(op) => {
@@ -3330,6 +3353,14 @@ impl<'a> ContentInterpreter<'a> {
             }
             match token {
                 ContentToken::Operand(obj) => {
+                    // M3 Fix: Enforce operand stack depth limit
+                    if self.operand_stack_full() {
+                        tracing::warn!(
+                            "operand stack exceeded {} entries in form XObject; truncating",
+                            self.max_operand_stack_depth
+                        );
+                        break;
+                    }
                     self.operand_stack.push(obj);
                 }
                 ContentToken::Operator(op) => {
@@ -4077,7 +4108,17 @@ impl<'a> ContentInterpreter<'a> {
                 let tokenizer = ContentTokenizer::new(&def.content);
                 for token in tokenizer {
                     match token {
-                        ContentToken::Operand(obj) => self.operand_stack.push(obj),
+                        ContentToken::Operand(obj) => {
+                            // M3 Fix: Enforce operand stack depth limit
+                            if self.operand_stack_full() {
+                                tracing::warn!(
+                                    "operand stack exceeded {} entries in tiling pattern; truncating",
+                                    self.max_operand_stack_depth
+                                );
+                                break;
+                            }
+                            self.operand_stack.push(obj);
+                        }
                         ContentToken::Operator(op) => {
                             self.execute_operator(&op);
                             self.operand_stack.clear();
