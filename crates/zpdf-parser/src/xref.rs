@@ -182,8 +182,8 @@ fn parse_xref_stream(
         return Err(Error::InvalidXref(offset as u64));
     }
 
-    // Decode stream data
-    let decoded = filters::decode_stream(&stream.data, dict)?;
+    // Decode stream data using explicit limits for H1 security fix
+    let decoded = filters::decode_stream_with_limits(&stream.data, dict, limits)?;
 
     // /Index [start count start count ...] — subsection ranges (optional)
     let index_ranges: Vec<(u32, u32)> = if let Ok(idx_arr) = dict.get_array("Index") {
