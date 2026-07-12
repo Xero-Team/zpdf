@@ -548,6 +548,11 @@ impl PdfFile {
         &self.data
     }
 
+    /// Return the active parse limits (M3 security fix).
+    pub fn limits(&self) -> &ParseLimits {
+        &self.limits
+    }
+
     /// Force-build (once) and return the full-file repair-scan table, or `None`
     /// if the scan found nothing. Shares the `OnceCell` the lazy per-object
     /// repair uses, so the scan runs at most once per `PdfFile`.
