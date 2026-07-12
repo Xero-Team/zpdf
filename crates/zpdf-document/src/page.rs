@@ -10,6 +10,11 @@ use zpdf_parser::PdfFile;
 /// concert with the visited-set cycle checks.
 pub(crate) const MAX_PAGE_TREE_DEPTH: usize = 64;
 
+/// L8 Fix: Maximum number of pages to collect from the page tree. Protects
+/// against adversarial PDFs with massive /Kids arrays or deeply nested trees
+/// that could exhaust memory. Real-world PDFs rarely exceed 100k pages.
+pub(crate) const MAX_PAGE_COUNT: usize = 1_000_000;
+
 /// US Letter, used when a page has no usable `/MediaBox` (missing, degenerate,
 /// or non-finite). Matches the fallback mainstream PDF readers apply.
 const DEFAULT_MEDIA_BOX: Rect = Rect {

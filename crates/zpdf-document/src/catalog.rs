@@ -5,7 +5,7 @@ use tracing::warn;
 use zpdf_core::{Error, ObjectId, PdfObject, Result};
 use zpdf_parser::PdfFile;
 
-use crate::page::{PdfPage, MAX_PAGE_TREE_DEPTH};
+use crate::page::{PdfPage, MAX_PAGE_COUNT, MAX_PAGE_TREE_DEPTH};
 
 pub struct Catalog {
     pub pages_ref: ObjectId,
@@ -183,6 +183,11 @@ impl Catalog {
                 }
             }
         } else {
+            // L8 Fix: Check page count limit before adding new page
+            if refs.len() >= MAX_PAGE_COUNT {
+                warn!("page tree exceeds {MAX_PAGE_COUNT} pages; stopping collection");
+                return Ok(());
+            }
             refs.push(node_id);
         }
         Ok(())
