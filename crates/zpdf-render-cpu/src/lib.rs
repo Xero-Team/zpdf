@@ -794,9 +794,9 @@ impl<'a> CpuRenderer<'a> {
     /// vacated strips take the mask's unpainted value, which is what a fresh
     /// raster yields outside the group too.
     fn soft_mask_plane(&mut self, mask: &SoftMask) -> Option<Vec<u8>> {
-        let (w, h) = match self.pixmap.as_ref() {
-            Some(p) => (p.width(), p.height()),
-            None => return None,
+        let (w, h) = {
+            let p = self.pixmap.as_ref()?;
+            (p.width(), p.height())
         };
 
         // Page-space offset → device pixels (device y grows downward).
@@ -820,9 +820,9 @@ impl<'a> CpuRenderer<'a> {
     /// the current target) and reduce to a per-pixel coverage plane, ignoring
     /// the offset (callers shift the result).
     fn rasterize_soft_mask(&self, mask: &SoftMask) -> Option<Vec<u8>> {
-        let (w, h) = match self.pixmap.as_ref() {
-            Some(p) => (p.width(), p.height()),
-            None => return None,
+        let (w, h) = {
+            let p = self.pixmap.as_ref()?;
+            (p.width(), p.height())
         };
 
         let mut target = tiny_skia::Pixmap::new(w, h)?;
