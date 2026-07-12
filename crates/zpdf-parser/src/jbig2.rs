@@ -23,6 +23,8 @@ use std::rc::Rc;
 use tracing::{debug, warn};
 use zpdf_core::{Error, PdfDict, PdfObject, Result};
 
+use crate::filters::DecodeBudget;
+
 /// Output-size safety cap for the packed page bitmap (matches the sibling
 /// CCITT decoder and the ParseLimits::max_stream_bytes default).
 const MAX_OUTPUT: usize = 256 * 1024 * 1024;
@@ -81,8 +83,11 @@ impl Jbig2Params {
 }
 
 /// Decode an embedded JBIG2 stream into packed 1-bpp rows (PDF polarity).
-pub fn decode(data: &[u8], params: &Jbig2Params) -> Result<Vec<u8>> {
-    let mut dec = Decoder::default();
+///
+/// M2 Fix: Now tracks cumulative budget to prevent decompression bombs. The
+/// budget is threaded through to nested CCITT MMR decoding within JBIG2.
+pub fn decode(data: &[u8], params: &Jbig2Params, budget: &mut DecodeBudget) -> Result<Vec<u8>> {
+    let mut dec = Decoder::new(budget);
     if let Some(globals) = &params.globals {
         dec.process_segments(globals)?;
     }
@@ -1008,6 +1013,7 @@ impl HuffLine {
 }
 
 /// A built Huffman table: lines paired with assigned prefix codes (T.88 B.3).
+#[derive(Clone)]
 struct HuffTable {
     lines: Vec<HuffLine>,
     /// Assigned prefix code per line, parallel to `lines`. Lines with
@@ -1611,8 +1617,7 @@ struct PatternDict {
     patterns: Vec<Rc<Bitmap>>,
 }
 
-#[derive(Default)]
-struct Decoder {
+struct Decoder<'a> {
     page: Option<Bitmap>,
     /// Page height was declared 0xFFFFFFFF (striped): grow rows on demand.
     page_auto_height: bool,
@@ -1628,9 +1633,23 @@ struct Decoder {
     pattern_dicts: HashMap<u32, Option<PatternDict>>,
     /// Custom Huffman tables keyed by type-53 segment number.
     huff_tables: HashMap<u32, HuffTable>,
+    /// M2 Fix: DecodeBudget for tracking cumulative output across filter chain
+    budget: &'a mut DecodeBudget,
 }
 
-impl Decoder {
+impl<'a> Decoder<'a> {
+    fn new(budget: &'a mut DecodeBudget) -> Self {
+        Self {
+            page: None,
+            page_auto_height: false,
+            page_default_pixel: 0,
+            symbol_dicts: HashMap::new(),
+            regions: HashMap::new(),
+            pattern_dicts: HashMap::new(),
+            huff_tables: HashMap::new(),
+            budget,
+        }
+    }
     /// Parse and process every segment in `data` (globals or page stream).
     fn process_segments(&mut self, data: &[u8]) -> Result<()> {
         let mut r = Reader::new(data);
@@ -1859,7 +1878,7 @@ impl Decoder {
     }
 
     /// Generic region segment (T.88 7.4.6): MMR or arithmetic coding.
-    fn decode_generic_region_segment(&self, data: &[u8]) -> Result<(RegionInfo, Bitmap)> {
+    fn decode_generic_region_segment(&mut self, data: &[u8]) -> Result<(RegionInfo, Bitmap)> {
         let mut r = Reader::new(data);
         let info = parse_region_info(&mut r)?;
         let flags = r.u8()?;
@@ -1877,7 +1896,7 @@ impl Decoder {
                 black_is_1: true,
                 byte_align: false,
             };
-            let packed = crate::ccitt::decode(r.rest(), &params)?;
+            let packed = crate::ccitt::decode(r.rest(), &params, self.budget)?;
             let bm = unpack_rows(&packed, info.width, info.height)?;
             return Ok((info, bm));
         }
@@ -1978,16 +1997,17 @@ impl Decoder {
 
     /// Collect referred custom Huffman tables (type-53 segments) in referral
     /// order, for runtime table selection in regions/dictionaries.
-    fn referred_huff_tables(&self, h: &SegmentHeader) -> Vec<&HuffTable> {
+    /// M2 Fix: Clone the tables to avoid borrow conflicts when budget is threaded.
+    fn referred_huff_tables(&self, h: &SegmentHeader) -> Vec<HuffTable> {
         h.referred
             .iter()
-            .filter_map(|n| self.huff_tables.get(n))
+            .filter_map(|n| self.huff_tables.get(n).cloned())
             .collect()
     }
 
     /// Symbol dictionary segment (T.88 6.5 / 7.4.3). Supports arithmetic and
     /// Huffman entropy coding, and refinement/aggregate (SDREFAGG) symbols.
-    fn decode_symbol_dict(&self, h: &SegmentHeader, data: &[u8]) -> Result<Vec<Rc<Bitmap>>> {
+    fn decode_symbol_dict(&mut self, h: &SegmentHeader, data: &[u8]) -> Result<Vec<Rc<Bitmap>>> {
         let mut r = Reader::new(data);
         let flags = r.u16()?;
         let sd_huff = flags & 1 != 0;
@@ -2047,7 +2067,6 @@ impl Decoder {
         let mut next_custom = || -> Result<&HuffTable> {
             custom_iter
                 .next()
-                .copied()
                 .ok_or_else(|| err("SDHUFF references missing custom table"))
         };
 
@@ -2320,7 +2339,7 @@ impl Decoder {
     /// sliced per symbol width. Export flags use the table-B.1 run lengths.
     #[allow(clippy::too_many_arguments)]
     fn decode_symbol_dict_huff(
-        &self,
+        &mut self,
         payload: &[u8],
         num_new: usize,
         num_ex: usize,
@@ -2400,7 +2419,7 @@ impl Decoder {
                 black_is_1: true,
                 byte_align: false,
             };
-            let packed = crate::ccitt::decode(mmr_data, &params)?;
+            let packed = crate::ccitt::decode(mmr_data, &params, self.budget)?;
             let collective = unpack_rows(&packed, cw, ch)?;
             let consumed = if bmsize == 0 {
                 payload.len().saturating_sub(start)
@@ -2603,7 +2622,6 @@ impl Decoder {
         let mut next_custom = || -> Result<&HuffTable> {
             custom_iter
                 .next()
-                .copied()
                 .ok_or_else(|| err("SBHUFF references missing custom table"))
         };
 
@@ -2788,7 +2806,7 @@ impl Decoder {
     /// Pattern dictionary segment (T.88 6.7 / 7.4.4). Decodes one wide generic
     /// region holding HDMAX+1 patterns side by side and slices it into the
     /// individual pattern bitmaps.
-    fn decode_pattern_dict(&self, data: &[u8]) -> Result<PatternDict> {
+    fn decode_pattern_dict(&mut self, data: &[u8]) -> Result<PatternDict> {
         let mut r = Reader::new(data);
         let flags = r.u8()?;
         let mmr = flags & 1 != 0;
@@ -2837,7 +2855,7 @@ impl Decoder {
                 black_is_1: true,
                 byte_align: false,
             };
-            let packed = crate::ccitt::decode(r.rest(), &params)?;
+            let packed = crate::ccitt::decode(r.rest(), &params, self.budget)?;
             unpack_rows(&packed, collective_w, hdph)?
         } else {
             let at = [
@@ -2885,7 +2903,7 @@ impl Decoder {
     /// (HBPP Gray-coded bitplanes) and tiles the referred pattern dictionary
     /// across the HGW×HGH grid.
     fn decode_halftone_region(
-        &self,
+        &mut self,
         h: &SegmentHeader,
         data: &[u8],
     ) -> Result<(RegionInfo, Bitmap)> {
@@ -3002,7 +3020,7 @@ impl Decoder {
                     black_is_1: true,
                     byte_align: false,
                 };
-                let packed = crate::ccitt::decode(mmr_data, &params)?;
+                let packed = crate::ccitt::decode(mmr_data, &params, self.budget)?;
                 unpack_rows(&packed, hgw, hgh)?
             };
             // Gray-code combine: the j-th gray bit is plane XOR the (j+1)-th bit.
@@ -3037,15 +3055,19 @@ impl Decoder {
 
     /// Final page bitmap → packed MSB-first rows, inverted to PDF polarity
     /// (JBIG2 1 = black becomes the PDF 1-bpc convention black = 0).
-    fn into_packed_output(self) -> Result<Vec<u8>> {
-        let Some(bm) = self.page else {
+    #[allow(clippy::wrong_self_convention)]
+    fn into_packed_output(&mut self) -> Result<Vec<u8>> {
+        let Some(bm) = self.page.take() else {
             return Err(err("stream contains no page"));
         };
         let row_bytes = bm.width.div_ceil(8);
         let size = row_bytes
             .checked_mul(bm.height)
-            .filter(|&s| s <= MAX_OUTPUT)
-            .ok_or_else(|| err("page exceeds the output size limit"))?;
+            .ok_or_else(|| err("page size computation overflow"))?;
+
+        // M2 Fix: Reserve budget for the packed output
+        self.budget.reserve(size as u64)?;
+
         let mut out = vec![0u8; size];
         for y in 0..bm.height {
             let row = &bm.data[y * bm.width..(y + 1) * bm.width];
@@ -3082,6 +3104,12 @@ fn unpack_rows(packed: &[u8], width: usize, height: usize) -> Result<Bitmap> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Helper for tests: decode with unlimited budget
+    fn decode_test(data: &[u8], params: &Jbig2Params) -> Result<Vec<u8>> {
+        let mut budget = crate::filters::DecodeBudget::new(u64::MAX);
+        decode(data, params, &mut budget)
+    }
 
     // -----------------------------------------------------------------------
     // Test-only MQ *encoder* (T.88 E.3.2–E.3.8, software conventions). Used to
@@ -3860,7 +3888,7 @@ mod tests {
         // And via the full decode path (header shorter than the 11-byte
         // minimum is treated as trailing padding → "no page" error).
         let params = Jbig2Params { globals: None };
-        assert!(decode(&bytes, &params).is_err());
+        assert!(decode_test(&bytes, &params).is_err());
     }
 
     #[test]
@@ -3900,7 +3928,7 @@ mod tests {
                 1,
                 &generic_region_payload(&bm, template, tpgdon),
             ));
-            let out = decode(&stream, &Jbig2Params { globals: None }).unwrap();
+            let out = decode_test(&stream, &Jbig2Params { globals: None }).unwrap();
             assert_eq!(
                 out,
                 packed_from(&art),
@@ -3918,7 +3946,7 @@ mod tests {
         payload.extend_from_slice(&[0x31, 0xF8]);
         let mut stream = segment(0, 48, &[], 1, &page_info_payload(8, 2, 0));
         stream.extend_from_slice(&segment(1, 38, &[], 1, &payload));
-        let out = decode(&stream, &Jbig2Params { globals: None }).unwrap();
+        let out = decode_test(&stream, &Jbig2Params { globals: None }).unwrap();
         assert_eq!(out, vec![0xE7, 0xE7]); // WWWBBWWW, white = 1
     }
 
@@ -3943,7 +3971,7 @@ mod tests {
             1,
             &text_region_payload(10, 4, 2, &[(0, 0), (1, 2)]),
         ));
-        let out = decode(&stream, &Jbig2Params { globals: None }).unwrap();
+        let out = decode_test(&stream, &Jbig2Params { globals: None }).unwrap();
         let expected = packed_from(&["#.#...#...", ".#...#....", "#.#.#.....", ".........."]);
         assert_eq!(out, expected);
     }
@@ -3956,7 +3984,7 @@ mod tests {
         let mut globals = segment(0, 48, &[], 1, &page_info_payload(4, 2, 0));
         globals.extend_from_slice(&segment(1, 0, &[], 1, &symbol_dict_payload(&[&sym])));
         let stream = segment(2, 6, &[1], 1, &text_region_payload(4, 2, 1, &[(0, 1)]));
-        let out = decode(
+        let out = decode_test(
             &stream,
             &Jbig2Params {
                 globals: Some(globals),
@@ -3970,12 +3998,12 @@ mod tests {
     fn page_default_pixel_and_packing_polarity() {
         // A page with no regions: default pixel 0 = white = PDF sample 1.
         let stream = segment(0, 48, &[], 1, &page_info_payload(10, 3, 0));
-        let out = decode(&stream, &Jbig2Params { globals: None }).unwrap();
+        let out = decode_test(&stream, &Jbig2Params { globals: None }).unwrap();
         assert_eq!(out, vec![0xFF, 0xC0, 0xFF, 0xC0, 0xFF, 0xC0]);
 
         // Default pixel 1 (page flags bit 2) = black = PDF sample 0.
         let stream = segment(0, 48, &[], 1, &page_info_payload(10, 3, 0x04));
-        let out = decode(&stream, &Jbig2Params { globals: None }).unwrap();
+        let out = decode_test(&stream, &Jbig2Params { globals: None }).unwrap();
         assert_eq!(out, vec![0u8; 6]);
     }
 
@@ -3996,27 +4024,27 @@ mod tests {
         ));
         // A halftone region segment is skipped wholesale.
         stream.extend_from_slice(&segment(3, 22, &[], 1, &[0u8; 20]));
-        let out = decode(&stream, &Jbig2Params { globals: None }).unwrap();
+        let out = decode_test(&stream, &Jbig2Params { globals: None }).unwrap();
         assert_eq!(out, vec![0xFF, 0xFF]); // page stays white
     }
 
     #[test]
     fn missing_page_info_is_error_but_unknown_length_too() {
         // Empty stream: nothing decoded → no page.
-        assert!(decode(&[], &Jbig2Params { globals: None }).is_err());
+        assert!(decode_test(&[], &Jbig2Params { globals: None }).is_err());
         // Unknown segment data length (0xFFFFFFFF) is unsupported.
         let mut stream = segment(0, 48, &[], 1, &page_info_payload(8, 2, 0));
         let mut bad = segment(1, 38, &[], 1, &[]);
         let n = bad.len();
         bad[n - 4..].copy_from_slice(&[0xFF; 4]);
         stream.extend_from_slice(&bad);
-        assert!(decode(&stream, &Jbig2Params { globals: None }).is_err());
+        assert!(decode_test(&stream, &Jbig2Params { globals: None }).is_err());
     }
 
     #[test]
     fn implausible_page_size_is_error() {
         let stream = segment(0, 48, &[], 1, &page_info_payload(u32::MAX - 1, 2, 0));
-        assert!(decode(&stream, &Jbig2Params { globals: None }).is_err());
+        assert!(decode_test(&stream, &Jbig2Params { globals: None }).is_err());
     }
 
     #[test]
@@ -4027,7 +4055,7 @@ mod tests {
         payload.extend_from_slice(&[3, 0xFF, 0xFD, 0xFF, 2, 0xFE, 0xFE, 0xFE]); // AT
         let mut stream = segment(0, 48, &[], 1, &page_info_payload(8, 1, 0));
         stream.extend_from_slice(&segment(1, 38, &[], 1, &payload));
-        let out = decode(&stream, &Jbig2Params { globals: None }).unwrap();
+        let out = decode_test(&stream, &Jbig2Params { globals: None }).unwrap();
         assert_eq!(out, vec![0xFF]);
     }
 
@@ -4057,7 +4085,7 @@ mod tests {
         payload.extend_from_slice(&enc.finish());
         let mut stream = segment(0, 48, &[], 1, &page_info_payload(8, 3, 0));
         stream.extend_from_slice(&segment(1, 38, &[], 1, &payload));
-        let out = decode(&stream, &Jbig2Params { globals: None }).unwrap();
+        let out = decode_test(&stream, &Jbig2Params { globals: None }).unwrap();
         assert_eq!(out, packed_from(&["........", "......##", "........"]));
     }
 
@@ -4215,7 +4243,7 @@ mod tests {
         encode_refinement(&mut enc, &mut cx, &refined, &initial, &p);
         payload.extend_from_slice(&enc.finish());
         stream.extend_from_slice(&segment(2, 42, &[], 1, &payload));
-        let out = decode(&stream, &Jbig2Params { globals: None }).unwrap();
+        let out = decode_test(&stream, &Jbig2Params { globals: None }).unwrap();
         // The refinement region REPLACEs the page area with the refined art.
         assert_eq!(
             out,
@@ -4294,7 +4322,7 @@ mod tests {
             1,
             &text_region_payload(8, 4, 1, &[(0, 0)]),
         ));
-        let out = decode(&stream, &Jbig2Params { globals: None }).unwrap();
+        let out = decode_test(&stream, &Jbig2Params { globals: None }).unwrap();
         assert_eq!(
             out,
             packed_from(&["####....", "#..#....", "#.##....", "####...."])
@@ -4362,7 +4390,7 @@ mod tests {
         let mut stream = segment(0, 48, &[], 1, &page_info_payload(4, 4, 0));
         stream.extend_from_slice(&segment(1, 0, &[], 1, &dict));
         stream.extend_from_slice(&segment(2, 6, &[1], 1, &p));
-        let out = decode(&stream, &Jbig2Params { globals: None }).unwrap();
+        let out = decode_test(&stream, &Jbig2Params { globals: None }).unwrap();
         assert_eq!(out, packed_from(&["####", "##.#", "#..#", "####"]));
     }
 
@@ -4495,7 +4523,7 @@ mod tests {
             1,
             &text_region_payload(8, 2, 1, &[(0, 0)]),
         ));
-        let out = decode(&stream, &Jbig2Params { globals: None }).unwrap();
+        let out = decode_test(&stream, &Jbig2Params { globals: None }).unwrap();
         // The symbol is WWWBBWWW on both rows (black at cols 3-4).
         assert_eq!(out, packed_from(&["...##...", "...##..."]));
     }
@@ -4590,7 +4618,7 @@ mod tests {
         let mut stream = segment(0, 48, &[], 1, &page_info_payload(4, 4, 0));
         stream.extend_from_slice(&segment(1, 16, &[], 1, &pd)); // pattern dict
         stream.extend_from_slice(&segment(2, 22, &[1], 1, &ht)); // halftone region
-        let out = decode(&stream, &Jbig2Params { globals: None }).unwrap();
+        let out = decode_test(&stream, &Jbig2Params { globals: None }).unwrap();
         // Expected page: cell (m,n) draws pattern[gray[m][n]] at (n*2, m*2).
         // gray = [[1,2],[0,3]] → patterns p1,p2 (top), p0,p3 (bottom).
         let expected = packed_from(&[
@@ -4619,7 +4647,7 @@ mod tests {
             0x40, 0xe3, 0x00, 0x00, 0x00, 0x10, 0x84, 0xff, 0x40, 0xf7, 0x05, 0x05,
         ];
         stream.extend_from_slice(&segment(1, 16, &[], 1, &pd_payload));
-        let result = decode(&stream, &Jbig2Params { globals: None });
+        let result = decode_test(&stream, &Jbig2Params { globals: None });
         // The pattern dict segment fails the plausibility check and is logged as
         // a warning; the page itself decodes (all-white since no valid patterns).
         // The key win: no hang, instant return.
@@ -4642,7 +4670,7 @@ mod tests {
             0x5e, 0x45, 0x24, 0x46, 0x5e, 0x45, 0x00, 0x00, 0x00,
         ];
         stream.extend_from_slice(&segment(1, 0, &[], 1, &sd_payload));
-        let result = decode(&stream, &Jbig2Params { globals: None });
+        let result = decode_test(&stream, &Jbig2Params { globals: None });
         assert!(
             result.is_ok(),
             "decode should succeed with failed symbol dict"
@@ -4669,7 +4697,7 @@ mod tests {
             sd_payload.extend_from_slice(&[0x84, 0xC7, 0x3B, 0xFC]);
         }
         stream.extend_from_slice(&segment(1, 0, &[], 1, &sd_payload));
-        let result = decode(&stream, &Jbig2Params { globals: None });
+        let result = decode_test(&stream, &Jbig2Params { globals: None });
         // The symbol dict should fail with iteration budget exceeded.
         assert!(
             result.is_ok(),

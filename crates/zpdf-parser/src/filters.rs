@@ -1,11 +1,43 @@
-use zpdf_core::{Error, PdfDict, PdfName, PdfObject, Result};
+use zpdf_core::{Error, ParseLimits, PdfDict, PdfName, PdfObject, Result};
 
-/// Hard cap on the bytes produced by any single decompression filter (Flate,
-/// LZW, RunLength). Stops decompression bombs even though `ParseLimits` is not
-/// threaded into this layer (filter functions see only bytes + dict).
-const MAX_DECODED_OUTPUT: usize = 1 << 30; // 1 GiB
+/// Tracks cumulative decoded bytes across a filter chain to prevent decompression bombs.
+/// Each filter in the chain consumes budget; once exhausted, decoding fails.
+pub(crate) struct DecodeBudget {
+    remaining: u64,
+    total_consumed: u64,
+}
 
-pub fn decode_stream(data: &[u8], dict: &PdfDict) -> Result<Vec<u8>> {
+impl DecodeBudget {
+    pub(crate) fn new(limit: u64) -> Self {
+        Self {
+            remaining: limit,
+            total_consumed: 0,
+        }
+    }
+
+    /// Reserve bytes for output. Returns error if budget exhausted.
+    pub(crate) fn reserve(&mut self, bytes: u64) -> Result<()> {
+        if bytes > self.remaining {
+            return Err(Error::StreamDecode(format!(
+                "decoded stream exceeds budget: {} bytes already consumed, {} more requested, {} limit",
+                self.total_consumed, bytes, self.total_consumed.saturating_add(self.remaining)
+            )));
+        }
+        self.remaining = self.remaining.saturating_sub(bytes);
+        self.total_consumed = self.total_consumed.saturating_add(bytes);
+        Ok(())
+    }
+}
+
+/// Decode a PDF stream through its filter chain with explicit limits.
+///
+/// This is the primary implementation that enforces cumulative budget tracking
+/// to prevent decompression bombs (H1 security fix).
+pub fn decode_stream_with_limits(
+    data: &[u8],
+    dict: &PdfDict,
+    limits: &ParseLimits,
+) -> Result<Vec<u8>> {
     let filters = match dict.get("Filter") {
         Some(PdfObject::Name(n)) => vec![n.clone()],
         Some(PdfObject::Array(arr)) => arr
@@ -29,15 +61,38 @@ pub fn decode_stream(data: &[u8], dict: &PdfDict) -> Result<Vec<u8>> {
 
     let decode_parms = extract_decode_parms(dict, filters.len());
 
-    let mut result = data.to_vec();
+    // H1 Fix: Use cumulative budget from ParseLimits instead of per-filter 1 GiB cap
+    let mut budget = DecodeBudget::new(limits.max_decoded_stream_bytes);
+
+    // H1 Fix: Process filter chain properly, using previous output as next input
+    let mut current = data.to_vec();
     for (i, filter) in filters.iter().enumerate() {
         let params = decode_parms[i].as_ref();
-        result = apply_filter(filter, &result, params)?;
-        if let Some(p) = params {
-            result = apply_predictor(&result, p)?;
-        }
+
+        // Apply filter to current data
+        let decoded = apply_filter(filter, &current, params, &mut budget)?;
+
+        // Apply predictor if specified
+        current = if let Some(p) = params {
+            apply_predictor(&decoded, p, &mut budget)?
+        } else {
+            decoded
+        };
     }
-    Ok(result)
+
+    Ok(current)
+}
+
+/// Decode a PDF stream through its filter chain using default limits.
+///
+/// **Temporary backward compatibility wrapper** - allows existing code to compile
+/// while we migrate call sites to pass explicit ParseLimits. This uses default
+/// limits (2 GiB decoded budget), which provides DoS protection but isn't customizable.
+///
+/// New code should use `decode_stream_with_limits` and pass the active ParseLimits.
+/// This wrapper will be removed once all call sites are migrated.
+pub fn decode_stream(data: &[u8], dict: &PdfDict) -> Result<Vec<u8>> {
+    decode_stream_with_limits(data, dict, &ParseLimits::default())
 }
 
 fn extract_decode_parms(dict: &PdfDict, filter_count: usize) -> Vec<Option<PdfDict>> {
@@ -62,11 +117,14 @@ fn extract_decode_parms(dict: &PdfDict, filter_count: usize) -> Vec<Option<PdfDi
     }
 }
 
-fn apply_predictor(data: &[u8], params: &PdfDict) -> Result<Vec<u8>> {
+fn apply_predictor(data: &[u8], params: &PdfDict, budget: &mut DecodeBudget) -> Result<Vec<u8>> {
     let predictor = params.get_i64("Predictor").unwrap_or(1) as u32;
     if predictor == 1 {
         return Ok(data.to_vec());
     }
+
+    // H1 Fix: Reserve budget for predictor output before allocation
+    budget.reserve(data.len() as u64)?;
 
     // Validate parameters with reasonable PDF limits to prevent overflow attacks.
     // PDF spec typically uses modest values, but we allow generous bounds.
@@ -102,16 +160,31 @@ fn decode_tiff_predictor(
     bpc: usize,
     columns: usize,
 ) -> Result<Vec<u8>> {
+    // M4 Fix: Validate parameters before processing
+    // TIFF predictor (Predictor 2) in PDF spec only supports BPC=8
     if bpc != 8 {
+        // Not an error per spec - just means predictor doesn't apply
         return Ok(data.to_vec());
     }
+
+    // M4 Fix: Explicit validation that parameters are non-zero
+    if colors == 0 || columns == 0 {
+        return Err(Error::StreamDecode(
+            "TIFF predictor: colors and columns must be non-zero".into(),
+        ));
+    }
+
     // Check for overflow in row_bytes calculation
     let row_bytes = columns
         .checked_mul(colors)
         .ok_or_else(|| Error::StreamDecode("TIFF predictor: columns * colors overflow".into()))?;
-    if row_bytes == 0 {
+
+    // M4 Fix: Validate data length is consistent with parameters
+    // Data should be a multiple of row_bytes (though we handle partial rows gracefully)
+    if data.is_empty() {
         return Ok(data.to_vec());
     }
+
     let mut output = data.to_vec();
     for row_start in (0..output.len()).step_by(row_bytes) {
         let row_end = (row_start + row_bytes).min(output.len());
@@ -123,6 +196,18 @@ fn decode_tiff_predictor(
 }
 
 fn decode_png_predictor(data: &[u8], colors: usize, bpc: usize, columns: usize) -> Result<Vec<u8>> {
+    // L1 Fix: Explicit validation of parameters before processing
+    if colors == 0 || columns == 0 {
+        return Err(Error::StreamDecode(
+            "PNG predictor: colors and columns must be non-zero".into(),
+        ));
+    }
+    if bpc == 0 || bpc > 16 {
+        return Err(Error::StreamDecode(
+            "PNG predictor: bits per component must be 1-16".into(),
+        ));
+    }
+
     // Check all multiplications for overflow to prevent allocation bombs
     let bits_per_row = colors
         .checked_mul(bpc)
@@ -138,6 +223,13 @@ fn decode_png_predictor(data: &[u8], colors: usize, bpc: usize, columns: usize) 
     let stride = row_bytes
         .checked_add(1)
         .ok_or_else(|| Error::StreamDecode("PNG predictor: stride overflow".into()))?; // filter byte + row data
+
+    // L1 Fix: Validate stride is reasonable (not zero, not absurdly large)
+    if stride == 0 {
+        return Err(Error::StreamDecode(
+            "PNG predictor: stride cannot be zero".into(),
+        ));
+    }
 
     if !data.len().is_multiple_of(stride) && !data.is_empty() {
         // Try to process what we can
@@ -227,27 +319,34 @@ fn paeth(a: i32, b: i32, c: i32) -> u8 {
     }
 }
 
-fn apply_filter(filter: &PdfName, data: &[u8], params: Option<&PdfDict>) -> Result<Vec<u8>> {
+fn apply_filter(
+    filter: &PdfName,
+    data: &[u8],
+    params: Option<&PdfDict>,
+    budget: &mut DecodeBudget,
+) -> Result<Vec<u8>> {
     match filter.as_str() {
-        "FlateDecode" | "Fl" => decode_flate(data),
+        "FlateDecode" | "Fl" => decode_flate(data, budget),
         "LZWDecode" | "LZW" => {
             // EarlyChange lives in DecodeParms; default 1 per ISO 32000.
             let early_change = params
                 .and_then(|p| p.get_i64("EarlyChange").ok())
                 .unwrap_or(1);
-            lzw_decode(data, early_change)
+            lzw_decode(data, early_change, budget)
         }
-        "ASCIIHexDecode" | "AHx" => decode_ascii_hex(data),
-        "ASCII85Decode" | "A85" => decode_ascii85(data),
-        "RunLengthDecode" | "RL" => decode_run_length(data),
-        "DCTDecode" | "DCT" => decode_dct(data),
+        "ASCIIHexDecode" | "AHx" => decode_ascii_hex(data, budget),
+        "ASCII85Decode" | "A85" => decode_ascii85(data, budget),
+        "RunLengthDecode" | "RL" => decode_run_length(data, budget),
+        "DCTDecode" | "DCT" => decode_dct(data, budget),
         "CCITTFaxDecode" | "CCF" => {
             let ccitt_params = crate::ccitt::CcittParams::from_dict(params);
-            crate::ccitt::decode(data, &ccitt_params)
+            // M1 Fix: Thread budget through to prevent decompression bombs
+            crate::ccitt::decode(data, &ccitt_params, budget)
         }
         "JBIG2Decode" => {
             let jbig2_params = crate::jbig2::Jbig2Params::from_dict(params);
-            crate::jbig2::decode(data, &jbig2_params)
+            // M2 Fix: Thread budget through to prevent decompression bombs
+            crate::jbig2::decode(data, &jbig2_params, budget)
         }
         // JPXDecode output is decoded *pixels*, not raw samples, and JPEG 2000
         // carries its own colour-space/alpha metadata that a bytes-only filter
@@ -265,7 +364,7 @@ fn apply_filter(filter: &PdfName, data: &[u8], params: Option<&PdfDict>) -> Resu
 /// code 257 = EOD. Codes 258+ are dictionary strings. `early_change` is the
 /// DecodeParms EarlyChange value (default 1); when 1 the code width is increased
 /// one code earlier than the natural boundary.
-fn lzw_decode(data: &[u8], early_change: i64) -> Result<Vec<u8>> {
+fn lzw_decode(data: &[u8], early_change: i64, budget: &mut DecodeBudget) -> Result<Vec<u8>> {
     const CLEAR: u32 = 256;
     const EOD: u32 = 257;
 
@@ -343,19 +442,24 @@ fn lzw_decode(data: &[u8], early_change: i64) -> Result<Vec<u8>> {
             )));
         };
 
+        // H1 Fix: Reserve budget before extending output
+        budget.reserve(entry.len() as u64)?;
         out.extend_from_slice(&entry);
-        if out.len() > MAX_DECODED_OUTPUT {
-            return Err(Error::StreamDecode(
-                "LZWDecode: output exceeds decompression limit".into(),
-            ));
-        }
 
         // Add new dictionary entry = previous string + first byte of this entry.
         // (Skipped for the first code after a clear, when prev is None.)
         if let Some(p) = prev {
-            let mut new_entry = table[p as usize].clone();
-            new_entry.push(entry[0]);
-            table.push(new_entry);
+            // M5 Fix: Enforce the LZW table size limit of 4096 entries (codes 0-4095).
+            // The spec dictates max code width is 12 bits (2^12 = 4096), so adding
+            // beyond this would violate the protocol.
+            if table.len() >= 4096 {
+                // Table is full; don't add new entries until a CLEAR resets it.
+                // This is standard LZW behavior when the table maxes out.
+            } else {
+                let mut new_entry = table[p as usize].clone();
+                new_entry.push(entry[0]);
+                table.push(new_entry);
+            }
         }
         prev = Some(code);
 
@@ -382,21 +486,20 @@ enum InflateOutcome {
 }
 
 /// Drive `reader` to completion in fixed-size chunks so that a mid-stream
-/// error still yields the bytes decoded before it. Output is capped at
-/// [`MAX_DECODED_OUTPUT`]; hitting the cap is a hard error (a decompression
-/// bomb is not salvageable data).
-fn inflate_chunked(mut reader: impl std::io::Read) -> Result<InflateOutcome> {
+/// error still yields the bytes decoded before it. Output is capped by the
+/// budget; hitting the cap is a hard error (a decompression bomb is not salvageable data).
+fn inflate_chunked(
+    mut reader: impl std::io::Read,
+    budget: &mut DecodeBudget,
+) -> Result<InflateOutcome> {
     let mut out = Vec::new();
     let mut buf = [0u8; 16 * 1024];
     loop {
         match reader.read(&mut buf) {
             Ok(0) => return Ok(InflateOutcome::Complete(out)),
             Ok(n) => {
-                if out.len() + n > MAX_DECODED_OUTPUT {
-                    return Err(Error::StreamDecode(
-                        "FlateDecode: output exceeds decompression limit".into(),
-                    ));
-                }
+                // H1 Fix: Reserve budget before extending output
+                budget.reserve(n as u64)?;
                 out.extend_from_slice(&buf[..n]);
             }
             Err(e) => return Ok(InflateOutcome::Failed(out, e.to_string())),
@@ -407,7 +510,7 @@ fn inflate_chunked(mut reader: impl std::io::Read) -> Result<InflateOutcome> {
 /// FlateDecode with real-world tolerance: salvages partial output from
 /// truncated/corrupt zlib streams, retries headerless data as raw deflate,
 /// and skips a bounded run of leading garbage before a plausible zlib header.
-fn decode_flate(data: &[u8]) -> Result<Vec<u8>> {
+fn decode_flate(data: &[u8], budget: &mut DecodeBudget) -> Result<Vec<u8>> {
     use flate2::read::{DeflateDecoder, ZlibDecoder};
 
     // Lenient: an empty stream decodes to nothing.
@@ -425,7 +528,7 @@ fn decode_flate(data: &[u8]) -> Result<Vec<u8>> {
 
     let mut zlib_err: Option<String> = None;
     if plausible_zlib(0) {
-        match inflate_chunked(ZlibDecoder::new(data))? {
+        match inflate_chunked(ZlibDecoder::new(data), budget)? {
             InflateOutcome::Complete(out) => return Ok(out),
             InflateOutcome::Failed(partial, err) if !partial.is_empty() => {
                 tracing::warn!(
@@ -442,7 +545,7 @@ fn decode_flate(data: &[u8]) -> Result<Vec<u8>> {
     // CMF/FLG pair after a bounded garbage/whitespace prefix.
     const MAX_HEADER_SCAN: usize = 64;
     if let Some(k) = (1..data.len().min(MAX_HEADER_SCAN)).find(|&k| plausible_zlib(k)) {
-        match inflate_chunked(ZlibDecoder::new(&data[k..]))? {
+        match inflate_chunked(ZlibDecoder::new(&data[k..]), budget)? {
             InflateOutcome::Complete(out) => {
                 tracing::warn!("FlateDecode: skipped {k} bytes of leading garbage");
                 return Ok(out);
@@ -459,7 +562,7 @@ fn decode_flate(data: &[u8]) -> Result<Vec<u8>> {
     }
 
     // Last resort: some writers emit raw deflate with no zlib wrapper.
-    match inflate_chunked(DeflateDecoder::new(data))? {
+    match inflate_chunked(DeflateDecoder::new(data), budget)? {
         InflateOutcome::Complete(out) => {
             tracing::warn!("FlateDecode: decoded as raw deflate (missing zlib header)");
             Ok(out)
@@ -481,7 +584,11 @@ fn decode_flate(data: &[u8]) -> Result<Vec<u8>> {
 /// Lenient ASCIIHexDecode: whitespace is ignored anywhere, stray non-hex bytes
 /// are skipped (warned, not fatal), and anything after the `>` EOD marker is
 /// ignored, so partial/dirty streams still decode.
-fn decode_ascii_hex(data: &[u8]) -> Result<Vec<u8>> {
+fn decode_ascii_hex(data: &[u8], budget: &mut DecodeBudget) -> Result<Vec<u8>> {
+    // M7 Fix: Reserve budget upfront for worst-case output size (one byte per two input chars)
+    let max_output = data.len().saturating_add(1) / 2;
+    budget.reserve(max_output as u64)?;
+
     let mut output = Vec::with_capacity(data.len() / 2);
     let mut high: Option<u8> = None;
     let mut stray = 0usize;
@@ -525,7 +632,13 @@ fn decode_ascii_hex(data: &[u8]) -> Result<Vec<u8>> {
 /// Lenient ASCII85Decode: whitespace is ignored anywhere, stray bytes outside
 /// the alphabet are skipped (warned, not fatal), and everything from the `~`
 /// of the `~>` EOD marker on is ignored, salvaging partial output.
-fn decode_ascii85(data: &[u8]) -> Result<Vec<u8>> {
+fn decode_ascii85(data: &[u8], budget: &mut DecodeBudget) -> Result<Vec<u8>> {
+    // M6 Fix: Reserve budget upfront for worst-case output size.
+    // Each 5-char ASCII85 group decodes to 4 bytes, plus special 'z' → 4 bytes.
+    // Worst case: all 'z' chars → data.len() * 4 bytes. Over-reservation is safe.
+    let max_output = (data.len() as u64).saturating_mul(4);
+    budget.reserve(max_output)?;
+
     let mut output = Vec::new();
     // u64 accumulator: a 5-char group of bytes near 'u' encodes a value just
     // above u32::MAX; the spec calls it invalid, but it must not overflow.
@@ -579,7 +692,43 @@ fn decode_ascii85(data: &[u8]) -> Result<Vec<u8>> {
     Ok(output)
 }
 
-fn decode_dct(data: &[u8]) -> Result<Vec<u8>> {
+/// H2 Fix: Validate JPEG dimensions before zune-jpeg allocates the output buffer.
+/// A malformed JPEG header claiming 65535×65535×4 would trigger a ~16 GiB allocation
+/// in `decode()`, bypassing all limits. Pre-validate against ParseLimits and reserve
+/// the decoded size from the budget before calling decode.
+fn validate_jpeg_dimensions(
+    width: u16,
+    height: u16,
+    components: u8,
+    budget: &mut DecodeBudget,
+) -> Result<()> {
+    let w = width as u64;
+    let h = height as u64;
+    let c = components as u64;
+
+    // Check pixel count against the same limit zpdf-image uses (mirrors ParseLimits default)
+    let pixel_count = w.saturating_mul(h);
+    if pixel_count > 100_000_000 {
+        return Err(Error::StreamDecode(format!(
+            "JPEG dimensions {w}×{h} exceed 100M pixel limit"
+        )));
+    }
+
+    // Check decoded byte size (width × height × channels) against budget
+    let decoded_size = pixel_count.saturating_mul(c);
+    if decoded_size > budget.remaining {
+        return Err(Error::StreamDecode(format!(
+            "JPEG output {w}×{h}×{c} = {decoded_size} bytes exceeds remaining budget {}",
+            budget.remaining
+        )));
+    }
+
+    // Reserve budget before zune-jpeg allocates
+    budget.reserve(decoded_size)?;
+    Ok(())
+}
+
+fn decode_dct(data: &[u8], budget: &mut DecodeBudget) -> Result<Vec<u8>> {
     use zune_jpeg::JpegDecoder;
 
     // Adobe YCCK JPEGs (APP14 transform == 2, 4 components) are mis-handled by
@@ -593,6 +742,15 @@ fn decode_dct(data: &[u8]) -> Result<Vec<u8>> {
         use zune_jpeg::zune_core::options::DecoderOptions;
         let opts = DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::YCCK);
         let mut decoder = JpegDecoder::new_with_options(std::io::Cursor::new(data), opts);
+
+        // H2 Fix: Validate JPEG dimensions before decode to prevent allocation bomb
+        decoder
+            .decode_headers()
+            .map_err(|e| Error::StreamDecode(format!("DCTDecode header parse failed: {e}")))?;
+        if let Some(info) = decoder.info() {
+            validate_jpeg_dimensions(info.width, info.height, info.components, budget)?;
+        }
+
         match decoder.decode() {
             Ok(ycck) if decoder.output_colorspace() == Some(ColorSpace::YCCK) => {
                 return Ok(ycck_to_rgb(&ycck));
@@ -604,6 +762,15 @@ fn decode_dct(data: &[u8]) -> Result<Vec<u8>> {
     }
 
     let mut decoder = JpegDecoder::new(std::io::Cursor::new(data));
+
+    // H2 Fix: Validate JPEG dimensions before decode to prevent allocation bomb
+    decoder
+        .decode_headers()
+        .map_err(|e| Error::StreamDecode(format!("DCTDecode header parse failed: {e}")))?;
+    if let Some(info) = decoder.info() {
+        validate_jpeg_dimensions(info.width, info.height, info.components, budget)?;
+    }
+
     decoder
         .decode()
         .map_err(|e| Error::StreamDecode(format!("DCTDecode: {e}")))
@@ -690,7 +857,7 @@ fn jpeg_is_adobe_ycck(data: &[u8]) -> bool {
     adobe_ycck && four_components
 }
 
-fn decode_run_length(data: &[u8]) -> Result<Vec<u8>> {
+fn decode_run_length(data: &[u8], budget: &mut DecodeBudget) -> Result<Vec<u8>> {
     let mut output = Vec::new();
     let mut i = 0;
 
@@ -706,11 +873,8 @@ fn decode_run_length(data: &[u8]) -> Result<Vec<u8>> {
             if i + count > data.len() {
                 return Err(Error::StreamDecode("RunLengthDecode: truncated".into()));
             }
-            if output.len() + count > MAX_DECODED_OUTPUT {
-                return Err(Error::StreamDecode(
-                    "RunLengthDecode: output exceeds decompression limit".into(),
-                ));
-            }
+            // H1 Fix: Reserve budget before extending
+            budget.reserve(count as u64)?;
             output.extend_from_slice(&data[i..i + count]);
             i += count;
         } else {
@@ -719,11 +883,8 @@ fn decode_run_length(data: &[u8]) -> Result<Vec<u8>> {
             if i >= data.len() {
                 return Err(Error::StreamDecode("RunLengthDecode: truncated".into()));
             }
-            if output.len() + count > MAX_DECODED_OUTPUT {
-                return Err(Error::StreamDecode(
-                    "RunLengthDecode: output exceeds decompression limit".into(),
-                ));
-            }
+            // H1 Fix: Reserve budget before resizing
+            budget.reserve(count as u64)?;
             let byte = data[i];
             i += 1;
             output.resize(output.len() + count, byte);
@@ -799,7 +960,10 @@ mod tests {
         encoder.write_all(original).unwrap();
         let compressed = encoder.finish().unwrap();
 
-        let decoded = decode_flate(&compressed).unwrap();
+        let decoded = {
+            let mut budget = DecodeBudget::new(ParseLimits::default().max_decoded_stream_bytes);
+            decode_flate(&compressed, &mut budget).unwrap()
+        };
         assert_eq!(decoded, original);
     }
 
@@ -825,7 +989,10 @@ mod tests {
         let compressed = encoder.finish().unwrap();
 
         let truncated = &compressed[..compressed.len() / 2];
-        let decoded = decode_flate(truncated).unwrap();
+        let decoded = {
+            let mut budget = DecodeBudget::new(ParseLimits::default().max_decoded_stream_bytes);
+            decode_flate(truncated, &mut budget).unwrap()
+        };
         assert!(!decoded.is_empty(), "partial output must be salvaged");
         assert!(decoded.len() < original.len());
         assert_eq!(
@@ -846,7 +1013,10 @@ mod tests {
         encoder.write_all(&original).unwrap();
         let compressed = encoder.finish().unwrap();
 
-        let decoded = decode_flate(&compressed).unwrap();
+        let decoded = {
+            let mut budget = DecodeBudget::new(ParseLimits::default().max_decoded_stream_bytes);
+            decode_flate(&compressed, &mut budget).unwrap()
+        };
         assert_eq!(decoded, original);
     }
 
@@ -864,44 +1034,68 @@ mod tests {
         // \r\n\xff: no byte pair in the prefix forms a plausible zlib header.
         let mut data = b"\r\n\xff".to_vec();
         data.extend_from_slice(&compressed);
-        let decoded = decode_flate(&data).unwrap();
+        let decoded = {
+            let mut budget = DecodeBudget::new(ParseLimits::default().max_decoded_stream_bytes);
+            decode_flate(&data, &mut budget).unwrap()
+        };
         assert_eq!(decoded, original);
     }
 
     #[test]
     fn flate_empty_input_is_empty_output() {
-        assert_eq!(decode_flate(&[]).unwrap(), Vec::<u8>::new());
+        assert_eq!(
+            {
+                let mut budget = DecodeBudget::new(ParseLimits::default().max_decoded_stream_bytes);
+                decode_flate(&[], &mut budget).unwrap()
+            },
+            Vec::<u8>::new()
+        );
     }
 
     #[test]
     fn flate_garbage_still_errors() {
         // Pure ASCII text: implausible zlib header, invalid deflate.
-        assert!(decode_flate(b"this is not compressed data at all....").is_err());
+        assert!({
+            let mut budget = DecodeBudget::new(ParseLimits::default().max_decoded_stream_bytes);
+            decode_flate(b"this is not compressed data at all....", &mut budget).is_err()
+        });
     }
 
     #[test]
     fn ascii_hex() {
-        let decoded = decode_ascii_hex(b"48 65 6C 6C 6F>").unwrap();
+        let decoded = {
+            let mut budget = DecodeBudget::new(ParseLimits::default().max_decoded_stream_bytes);
+            decode_ascii_hex(b"48 65 6C 6C 6F>", &mut budget).unwrap()
+        };
         assert_eq!(decoded, b"Hello");
     }
 
     #[test]
     fn ascii_hex_tolerates_stray_bytes_and_data_after_eod() {
         // 'x'/'!' are not hex digits (skipped); '>' is EOD (rest ignored).
-        let decoded = decode_ascii_hex(b"48 65 x6C!6C 6F> trailing garbage \xff").unwrap();
+        let decoded = {
+            let mut budget = DecodeBudget::new(ParseLimits::default().max_decoded_stream_bytes);
+            decode_ascii_hex(b"48 65 x6C!6C 6F> trailing garbage \xff", &mut budget).unwrap()
+        };
         assert_eq!(decoded, b"Hello");
     }
 
     #[test]
     fn ascii85_basic() {
         // "Man " encodes to "9jqo^" in ASCII85
-        let decoded = decode_ascii85(b"9jqo^~>").unwrap();
+        let decoded = {
+            let mut budget = DecodeBudget::new(ParseLimits::default().max_decoded_stream_bytes);
+            decode_ascii85(b"9jqo^~>", &mut budget).unwrap()
+        };
         assert_eq!(decoded, b"Man ");
     }
 
     #[test]
     fn ascii85_ignores_bytes_after_eod() {
-        let decoded = decode_ascii85(b"9jqo^~> stray bytes \xff\xfe after EOD").unwrap();
+        let decoded = {
+            let mut budget = DecodeBudget::new(ParseLimits::default().max_decoded_stream_bytes);
+            decode_ascii85(b"9jqo^~> stray bytes \xff\xfe after EOD", &mut budget).unwrap()
+        };
         assert_eq!(decoded, b"Man ");
     }
 
@@ -909,7 +1103,10 @@ mod tests {
     fn ascii85_skips_stray_bytes_and_whitespace() {
         // NUL and 0xFF are outside the alphabet: skipped, not fatal.
         // Whitespace inside a group is ignored.
-        let decoded = decode_ascii85(b"9j\x00qo\xff ^~>").unwrap();
+        let decoded = {
+            let mut budget = DecodeBudget::new(ParseLimits::default().max_decoded_stream_bytes);
+            decode_ascii85(b"9j\x00qo\xff ^~>", &mut budget).unwrap()
+        };
         assert_eq!(decoded, b"Man ");
     }
 
@@ -917,14 +1114,20 @@ mod tests {
     fn ascii85_overflowing_group_does_not_panic() {
         // "uuuuu" encodes a value above u32::MAX — invalid per spec, but must
         // decode leniently (truncated) instead of overflowing.
-        assert!(decode_ascii85(b"uuuuu~>").is_ok());
+        assert!({
+            let mut budget = DecodeBudget::new(ParseLimits::default().max_decoded_stream_bytes);
+            decode_ascii85(b"uuuuu~>", &mut budget).is_ok()
+        });
     }
 
     #[test]
     fn run_length_literal_and_repeat() {
         // 2 literal bytes [0x41, 0x42], then repeat 0x43 three times, then EOD
         let data = [1, 0x41, 0x42, 254, 0x43, 128];
-        let decoded = decode_run_length(&data).unwrap();
+        let decoded = {
+            let mut budget = DecodeBudget::new(ParseLimits::default().max_decoded_stream_bytes);
+            decode_run_length(&data, &mut budget).unwrap()
+        };
         assert_eq!(decoded, vec![0x41, 0x42, 0x43, 0x43, 0x43]);
     }
 
@@ -986,7 +1189,8 @@ mod tests {
         //   256 (Clear), 45 ('-'), 258 (KwKwK -> "--"), 259 ("---"),
         //   65 ('A'), 259 ("---"), 66 ('B'), 257 (EOD)
         let data = [0x80, 0x0B, 0x60, 0x50, 0x22, 0x0C, 0x0C, 0x85, 0x01];
-        let decoded = lzw_decode(&data, 1).unwrap();
+        let mut budget = DecodeBudget::new(ParseLimits::default().max_decoded_stream_bytes);
+        let decoded = lzw_decode(&data, 1, &mut budget).unwrap();
         assert_eq!(decoded, b"-----A---B");
     }
 
@@ -994,7 +1198,8 @@ mod tests {
     fn lzw_via_apply_filter_default_early_change() {
         let data = [0x80, 0x0B, 0x60, 0x50, 0x22, 0x0C, 0x0C, 0x85, 0x01];
         let name = PdfName::new("LZWDecode");
-        let out = apply_filter(&name, &data, None).unwrap();
+        let mut budget = DecodeBudget::new(ParseLimits::default().max_decoded_stream_bytes);
+        let out = apply_filter(&name, &data, None, &mut budget).unwrap();
         assert_eq!(out, b"-----A---B");
     }
 
@@ -1002,13 +1207,15 @@ mod tests {
     fn lzw_stops_at_end_without_eod() {
         // Truncated before EOD; should decode the leading symbols and stop cleanly.
         let data = [0x80, 0x0B, 0x60, 0x50];
-        let out = lzw_decode(&data, 1).unwrap();
+        let mut budget = DecodeBudget::new(ParseLimits::default().max_decoded_stream_bytes);
+        let out = lzw_decode(&data, 1, &mut budget).unwrap();
         assert!(out.starts_with(b"-"));
     }
 
     #[test]
     fn lzw_empty_input() {
-        assert_eq!(lzw_decode(&[], 1).unwrap(), Vec::<u8>::new());
+        let mut budget = DecodeBudget::new(ParseLimits::default().max_decoded_stream_bytes);
+        assert_eq!(lzw_decode(&[], 1, &mut budget).unwrap(), Vec::<u8>::new());
     }
 
     /// Encode with weezl (an independent, spec-conformant LZW producer) so the
@@ -1030,12 +1237,13 @@ mod tests {
     fn lzw_roundtrip_against_weezl() {
         // Cross every width boundary (9->10->11->12) and the 4096 auto-clear,
         // for both EarlyChange settings, against an external reference encoder.
+        let mut budget = DecodeBudget::new(ParseLimits::default().max_decoded_stream_bytes);
         for ec in [1i64, 0] {
             for &len in &[0usize, 1, 300, 600, 1200, 3000, 5000, 9000] {
                 // Mix of low- and high-entropy bytes to grow the dictionary.
                 let input: Vec<u8> = (0..len).map(|i| ((i * 7 + i / 11) % 251) as u8).collect();
                 let encoded = weezl_encode(&input, ec);
-                let decoded = lzw_decode(&encoded, ec).unwrap();
+                let decoded = lzw_decode(&encoded, ec, &mut budget).unwrap();
                 assert_eq!(decoded, input, "ec={ec} len={len}");
             }
         }
@@ -1045,9 +1253,14 @@ mod tests {
     fn lzw_single_byte_run_roundtrip_against_weezl() {
         // A long single-symbol run exercises the KwKwK path heavily.
         let input = vec![b'A'; 5000];
+        let mut budget = DecodeBudget::new(ParseLimits::default().max_decoded_stream_bytes);
         for ec in [1i64, 0] {
             let encoded = weezl_encode(&input, ec);
-            assert_eq!(lzw_decode(&encoded, ec).unwrap(), input, "ec={ec}");
+            assert_eq!(
+                lzw_decode(&encoded, ec, &mut budget).unwrap(),
+                input,
+                "ec={ec}"
+            );
         }
     }
 }
