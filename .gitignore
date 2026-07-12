@@ -1,6 +1,7 @@
 /target
 /wgpu
 /tests
+/review
 /.claude
 Cargo.lock
 *.swp
