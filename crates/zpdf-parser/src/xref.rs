@@ -182,8 +182,8 @@ fn parse_xref_stream(
         return Err(Error::InvalidXref(offset as u64));
     }
 
-    // Decode stream data
-    let decoded = filters::decode_stream(&stream.data, dict)?;
+    // Decode stream data using explicit limits for H1 security fix
+    let decoded = filters::decode_stream_with_limits(&stream.data, dict, limits)?;
 
     // /Index [start count start count ...] — subsection ranges (optional)
     let index_ranges: Vec<(u32, u32)> = if let Ok(idx_arr) = dict.get_array("Index") {
@@ -203,6 +203,20 @@ fn parse_xref_stream(
 
     let mut pos = 0usize;
     for &(start, count) in &index_ranges {
+        // H3 Fix: Validate range end doesn't overflow u32 before processing
+        let _range_end = start
+            .checked_add(count)
+            .ok_or(Error::InvalidXref(offset as u64))?;
+
+        // H3 Fix: Check total entry count against max_objects before processing range
+        let new_total = table
+            .len()
+            .checked_add(count as usize)
+            .ok_or(Error::InvalidXref(offset as u64))?;
+        if new_total > limits.max_objects as usize {
+            return Err(Error::InvalidXref(offset as u64));
+        }
+
         for i in 0..count {
             if pos + entry_size > decoded.len() {
                 break;
@@ -295,6 +309,23 @@ fn parse_traditional_xref(
 
         // Read: <first_obj_num> <count>
         let (first_obj, count) = parse_subsection_header(data, &mut pos)?;
+
+        // L7 Fix: Validate subsection range doesn't overflow object ID space
+        let range_end = first_obj
+            .checked_add(count)
+            .ok_or(Error::InvalidXref(pos as u64))?;
+        if range_end > limits.max_objects {
+            return Err(Error::InvalidXref(pos as u64));
+        }
+
+        // L7 Fix: Check total entry count against limits before processing
+        let new_total = table
+            .len()
+            .checked_add(count as usize)
+            .ok_or(Error::InvalidXref(pos as u64))?;
+        if new_total > limits.max_objects as usize {
+            return Err(Error::InvalidXref(pos as u64));
+        }
 
         for i in 0..count {
             skip_whitespace(data, &mut pos);
