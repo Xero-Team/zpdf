@@ -18,7 +18,7 @@ use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
 
 use zpdf::{ContentInterpreter, IccCache, ImageCache, PdfDocument, RenderBackend};
-use zpdf_render_wgpu::{GpuContext, WgpuRenderer};
+use zpdf_render_wgpu::{GpuContext, WgpuRenderError, WgpuRenderer};
 
 /// Resolution each page tile is rasterized at. Zoom scales the blit; this is the
 /// crispness ceiling.
@@ -32,6 +32,8 @@ const MAX_TILE_DIM: f32 = 4096.0;
 const PAGE_GAP: f32 = 14.0;
 /// Max cached page tiles (off-screen ones beyond this are evicted LRU).
 const MAX_TILES: usize = 16;
+/// Count alone is not enough for mixed/large page sizes; cap retained texels too.
+const MAX_TILE_BYTES: u64 = 512 * 1024 * 1024;
 /// Max new tiles rasterized per frame (spreads the cost while scrolling fast).
 const MAX_RENDER_PER_FRAME: usize = 3;
 /// Vertex-buffer capacity in quads (visible tiles per frame).
@@ -55,6 +57,7 @@ struct PageLayout {
 struct Tile {
     bind_group: wgpu::BindGroup,
     last_used: u64,
+    bytes: u64,
 }
 
 struct PageImage {
@@ -100,7 +103,10 @@ fn render_page(doc: &PdfDocument, idx: usize, slot: &mut Option<GpuContext>) -> 
         RENDER_DPI / 72.0
     };
 
-    let mut renderer = WgpuRenderer::new().with_fonts(&fonts).with_images(&images);
+    let mut renderer = WgpuRenderer::new()
+        .with_limits(doc.file().limits())
+        .with_fonts(&fonts)
+        .with_images(&images);
     if let Some(ctx) = slot.take() {
         renderer = renderer.with_context(ctx);
     }
@@ -112,8 +118,26 @@ fn render_page(doc: &PdfDocument, idx: usize, slot: &mut Option<GpuContext>) -> 
             "page rendered"
         );
     }
-    *slot = renderer.take_context(); // reclaim the context for the next page
-    let tex = result.ok()?;
+    let context = renderer.take_context();
+    let tex = match result {
+        Ok(tex) => {
+            *slot = context;
+            tex
+        }
+        Err(err) => {
+            *slot = if matches!(
+                err,
+                WgpuRenderError::Unsupported(_)
+                    | WgpuRenderError::InvalidPage(_)
+                    | WgpuRenderError::NoActivePage
+            ) {
+                context
+            } else {
+                None
+            };
+            return None;
+        }
+    };
     Some(PageImage {
         width: tex.width,
         height: tex.height,
@@ -464,12 +488,32 @@ impl App {
             }
             rendered += 1;
             if let Some(img) = render_page(&self.doc, i, &mut self.ctx) {
+                let bytes = img.width as u64 * img.height as u64 * 4;
+                while self.tiles.len() >= MAX_TILES
+                    || self
+                        .tiles
+                        .values()
+                        .map(|tile| tile.bytes)
+                        .sum::<u64>()
+                        .saturating_add(bytes)
+                        > MAX_TILE_BYTES
+                {
+                    let victim = self
+                        .tiles
+                        .iter()
+                        .filter(|(key, _)| !visible.contains(key))
+                        .min_by_key(|(_, tile)| tile.last_used)
+                        .map(|(key, _)| *key);
+                    let Some(victim) = victim else { break };
+                    self.tiles.remove(&victim);
+                }
                 let bind_group = gfx.upload(&img);
                 self.tiles.insert(
                     i,
                     Tile {
                         bind_group,
                         last_used: self.frame,
+                        bytes,
                     },
                 );
             }
@@ -481,7 +525,9 @@ impl App {
                 t.last_used = self.frame;
             }
         }
-        while self.tiles.len() > MAX_TILES {
+        while self.tiles.len() > MAX_TILES
+            || self.tiles.values().map(|tile| tile.bytes).sum::<u64>() > MAX_TILE_BYTES
+        {
             let victim = self
                 .tiles
                 .iter()
@@ -498,8 +544,8 @@ impl App {
 
         // Build quads (NDC) for visible tiles that are ready.
         let ndc = |x: f32, y: f32| [2.0 * x / ww - 1.0, 1.0 - 2.0 * y / wh];
-        let mut verts: Vec<Vertex> = Vec::new();
-        let mut draws: Vec<&wgpu::BindGroup> = Vec::new();
+        let mut verts: Vec<Vertex> = Vec::with_capacity(MAX_QUADS * 4);
+        let mut draws: Vec<&wgpu::BindGroup> = Vec::with_capacity(MAX_QUADS);
         for &i in &visible {
             if draws.len() >= MAX_QUADS {
                 break;

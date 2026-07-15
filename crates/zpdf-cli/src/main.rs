@@ -722,6 +722,13 @@ fn cmd_attachments(args: &[String]) -> zpdf::Result<()> {
             }
         };
         if let Err(e) = file.write_all(&bytes) {
+            drop(file);
+            if let Err(cleanup) = fs::remove_file(&path) {
+                eprintln!(
+                    "  warning: could not remove partial extraction {}: {cleanup}",
+                    path.display()
+                );
+            }
             eprintln!("  skip {:?}: {e}", ef.name);
             continue;
         }
@@ -769,13 +776,15 @@ fn collect_attachments(doc: &zpdf::PdfDocument) -> Vec<zpdf::EmbeddedFile> {
         .collect();
 
     let mut associated = doc.associated_files();
+    associated.truncate(MAX_ATTACHMENTS);
     let pages = doc.page_count().min(MAX_PAGES_SCANNED);
     for pi in 0..pages {
         if associated.len() >= MAX_ATTACHMENTS {
             break;
         }
         if let Ok(page) = doc.page(pi) {
-            associated.extend(doc.page_associated_files(&page));
+            let remaining = MAX_ATTACHMENTS - associated.len();
+            associated.extend(doc.page_associated_files(&page).into_iter().take(remaining));
         }
     }
 
@@ -983,10 +992,16 @@ fn cmd_compare(args: &[String]) -> zpdf::Result<()> {
         }
     }
 
-    let channels = (total * 3) as f64;
-    let mae = sum_abs as f64 / channels;
-    let rmse = (sum_sq as f64 / channels).sqrt();
-    let pct = diff_pixels as f64 / total as f64 * 100.0;
+    let (mae, rmse, pct) = if total == 0 {
+        (0.0, 0.0, 0.0)
+    } else {
+        let channels = total as f64 * 3.0;
+        (
+            sum_abs as f64 / channels,
+            (sum_sq as f64 / channels).sqrt(),
+            diff_pixels as f64 / total as f64 * 100.0,
+        )
+    };
 
     println!("Compare: {a_path}  vs  {b_path}");
     println!("  Size: {w}x{h} ({total} px)");
@@ -1021,7 +1036,14 @@ fn cmd_text(args: &[String]) -> zpdf::Result<()> {
         match args[i].as_str() {
             "-p" => {
                 i += 1;
-                page_num = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(1);
+                page_num = args
+                    .get(i)
+                    .and_then(|s| s.parse().ok())
+                    .filter(|&page| page > 0)
+                    .unwrap_or_else(|| {
+                        eprintln!("-p requires a positive page number");
+                        process::exit(2);
+                    });
             }
             "--all" => all = true,
             "--struct" => use_struct = true,
@@ -1039,27 +1061,28 @@ fn cmd_text(args: &[String]) -> zpdf::Result<()> {
         eprintln!("(no structure tree; falling back to geometric reading order)");
     }
 
-    let page_indices: Vec<usize> = if all {
-        (0..doc.page_count()).collect()
+    let (first_page, end_page) = if all {
+        (0, doc.page_count())
     } else {
-        vec![page_num.saturating_sub(1)]
+        let page_index = page_num - 1;
+        // Validate once before constructing the one-page range.
+        let _ = doc.page(page_index)?;
+        (page_index, page_index + 1)
     };
 
     // ICC transforms are per-document; share the cache across pages.
     let mut icc_cache = zpdf::IccCache::new();
 
-    for &pi in &page_indices {
+    for pi in first_page..end_page {
         let page = doc.page(pi)?;
         let mut font_cache = doc.load_page_fonts(&page);
         let content_bytes = doc.page_content_bytes(&page)?;
-        let mut image_cache = zpdf::ImageCache::new();
 
         let mut spans: Vec<zpdf::TextSpan> = Vec::new();
         {
             let interpreter = zpdf::ContentInterpreter::new(page.effective_box())
                 .with_fonts(&mut font_cache)
                 .with_document(doc.file(), &page.resources)
-                .with_images(&mut image_cache)
                 .with_colors(&mut icc_cache)
                 .with_text_sink(&mut spans)
                 .with_operand_stack_limit(doc.file().limits().max_operand_stack_depth as usize);
@@ -1096,7 +1119,14 @@ fn cmd_tables(args: &[String]) -> zpdf::Result<()> {
         match args[i].as_str() {
             "-p" => {
                 i += 1;
-                page_num = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(1);
+                page_num = args
+                    .get(i)
+                    .and_then(|s| s.parse().ok())
+                    .filter(|&page| page > 0)
+                    .unwrap_or_else(|| {
+                        eprintln!("-p requires a positive page number");
+                        process::exit(2);
+                    });
             }
             "--all" => all = true,
             "--csv" => csv = true,
@@ -1106,20 +1136,21 @@ fn cmd_tables(args: &[String]) -> zpdf::Result<()> {
     }
 
     let doc = open_document(pdf_path, password.as_deref())?;
-    let page_indices: Vec<usize> = if all {
-        (0..doc.page_count()).collect()
+    let (first_page, end_page) = if all {
+        (0, doc.page_count())
     } else {
-        vec![page_num.saturating_sub(1)]
+        let page_index = page_num - 1;
+        let _ = doc.page(page_index)?;
+        (page_index, page_index + 1)
     };
 
     // ICC transforms are per-document; share the cache across pages.
     let mut icc_cache = zpdf::IccCache::new();
 
-    for &pi in &page_indices {
+    for pi in first_page..end_page {
         let page = doc.page(pi)?;
         let mut font_cache = doc.load_page_fonts(&page);
         let content_bytes = doc.page_content_bytes(&page)?;
-        let mut image_cache = zpdf::ImageCache::new();
 
         let mut spans: Vec<zpdf::TextSpan> = Vec::new();
         let mut rules: Vec<zpdf::RuleLine> = Vec::new();
@@ -1127,7 +1158,6 @@ fn cmd_tables(args: &[String]) -> zpdf::Result<()> {
             let interpreter = zpdf::ContentInterpreter::new(page.effective_box())
                 .with_fonts(&mut font_cache)
                 .with_document(doc.file(), &page.resources)
-                .with_images(&mut image_cache)
                 .with_colors(&mut icc_cache)
                 .with_text_sink(&mut spans)
                 .with_rule_sink(&mut rules)
@@ -1172,7 +1202,14 @@ fn cmd_render(args: &[String]) -> zpdf::Result<()> {
         match args[i].as_str() {
             "-p" => {
                 i += 1;
-                page_num = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(1);
+                page_num = args
+                    .get(i)
+                    .and_then(|s| s.parse().ok())
+                    .filter(|&page| page > 0)
+                    .unwrap_or_else(|| {
+                        eprintln!("-p requires a positive page number");
+                        process::exit(2);
+                    });
             }
             "-o" => {
                 i += 1;
@@ -1182,7 +1219,10 @@ fn cmd_render(args: &[String]) -> zpdf::Result<()> {
             }
             "--dpi" => {
                 i += 1;
-                dpi = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(150.0);
+                dpi = args.get(i).and_then(|s| s.parse().ok()).unwrap_or_else(|| {
+                    eprintln!("--dpi requires a number");
+                    process::exit(2);
+                });
             }
             "--backend" => {
                 i += 1;
@@ -1198,6 +1238,11 @@ fn cmd_render(args: &[String]) -> zpdf::Result<()> {
             _ => {}
         }
         i += 1;
+    }
+
+    if !dpi.is_finite() || dpi <= 0.0 {
+        eprintln!("--dpi must be a finite number greater than zero");
+        process::exit(2);
     }
 
     let doc = open_document(pdf_path, password.as_deref())?;
@@ -1307,6 +1352,7 @@ fn cmd_render(args: &[String]) -> zpdf::Result<()> {
         #[cfg(feature = "cpu")]
         "cpu" => {
             let mut renderer = zpdf::cpu::CpuRenderer::new()
+                .with_limits(doc.file().limits())
                 .with_fonts(&font_cache)
                 .with_images(&image_cache);
             let start = std::time::Instant::now();
@@ -1331,8 +1377,10 @@ fn cmd_render(args: &[String]) -> zpdf::Result<()> {
         #[cfg(feature = "gpu")]
         "wgpu" => {
             let mut renderer = zpdf::gpu::WgpuRenderer::new()
+                .with_limits(doc.file().limits())
                 .with_fonts(&font_cache)
-                .with_images(&image_cache);
+                .with_images(&image_cache)
+                .with_gpu_timing(stats);
             let start = std::time::Instant::now();
             let rendered = renderer
                 .render_display_list(&display_list, scale)
@@ -1343,7 +1391,7 @@ fn cmd_render(args: &[String]) -> zpdf::Result<()> {
                 rendered.width, rendered.height
             );
             if stats {
-                print!("  Stats: cpu wall {:.2}ms", wall.as_secs_f64() * 1000.0);
+                print!("  Stats: wall {:.2}ms", wall.as_secs_f64() * 1000.0);
                 match renderer.last_gpu_time_ns() {
                     Some(ns) => println!(", gpu pass {:.2}ms", ns as f64 / 1_000_000.0),
                     None => {
@@ -1372,9 +1420,16 @@ fn cmd_render(args: &[String]) -> zpdf::Result<()> {
 /// Save a tight RGBA8 buffer (top-left origin, `len == w*h*4`) as a PNG. Shared by
 /// both render backends so output goes through a single encoder path.
 fn save_rgba(path: &str, w: u32, h: u32, data: &[u8]) -> zpdf::Result<()> {
-    let img = image::RgbaImage::from_raw(w, h, data.to_vec())
-        .ok_or_else(|| zpdf::Error::StreamDecode("rgba buffer size mismatch".into()))?;
-    img.save(path)
+    let expected = (w as usize)
+        .checked_mul(h as usize)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| zpdf::Error::StreamDecode("rgba dimensions overflow".into()))?;
+    if data.len() != expected {
+        return Err(zpdf::Error::StreamDecode(
+            "rgba buffer size mismatch".into(),
+        ));
+    }
+    image::save_buffer(path, data, w, h, image::ColorType::Rgba8)
         .map_err(|e| zpdf::Error::StreamDecode(format!("save {path}: {e}")))
 }
 
@@ -1494,9 +1549,8 @@ fn cmd_fill(args: &[String]) -> zpdf::Result<()> {
         process::exit(1);
     }
 
-    let doc = open_document(&input_path, password.as_deref())?;
-    warn_signatures(&doc);
     let mut writer = build_writer(&input_path, password.as_deref())?;
+    warn_signatures(writer.document());
     let mut filler = zpdf_writer::FormFiller::new(&mut writer)?;
     for (name, value) in &sets {
         filler.set(name, value)?;
@@ -1520,12 +1574,19 @@ fn cmd_pages(args: &[String]) -> zpdf::Result<()> {
         match args[i].as_str() {
             "--rotate" => {
                 if let Some(spec) = args.get(i + 1) {
-                    let parts: Vec<&str> = spec.split(':').collect();
-                    if parts.len() == 2 {
-                        let pages = parse_page_list(parts[0]);
-                        let deg: i32 = parts[1].parse().unwrap_or(0);
-                        rotates.push((pages, deg));
-                    }
+                    let (page_spec, degree_spec) = spec.split_once(':').unwrap_or_else(|| {
+                        eprintln!("--rotate requires PAGES:DEG");
+                        process::exit(1);
+                    });
+                    let pages = parse_page_list(page_spec).unwrap_or_else(|error| {
+                        eprintln!("invalid page list: {error}");
+                        process::exit(1);
+                    });
+                    let deg: i32 = degree_spec.parse().unwrap_or_else(|_| {
+                        eprintln!("invalid rotation: {degree_spec}");
+                        process::exit(1);
+                    });
+                    rotates.push((pages, deg));
                     i += 2;
                 } else {
                     eprintln!("--rotate requires PAGES:DEG");
@@ -1534,7 +1595,10 @@ fn cmd_pages(args: &[String]) -> zpdf::Result<()> {
             }
             "--delete" => {
                 if let Some(list) = args.get(i + 1) {
-                    deletes.extend(parse_page_list(list));
+                    deletes.extend(parse_page_list(list).unwrap_or_else(|error| {
+                        eprintln!("invalid page list: {error}");
+                        process::exit(1);
+                    }));
                     i += 2;
                 } else {
                     eprintln!("--delete requires a page list");
@@ -1543,7 +1607,10 @@ fn cmd_pages(args: &[String]) -> zpdf::Result<()> {
             }
             "--order" => {
                 if let Some(list) = args.get(i + 1) {
-                    order = Some(parse_page_list(list));
+                    order = Some(parse_page_list(list).unwrap_or_else(|error| {
+                        eprintln!("invalid page list: {error}");
+                        process::exit(1);
+                    }));
                     i += 2;
                 } else {
                     eprintln!("--order requires a page list");
@@ -1583,9 +1650,8 @@ fn cmd_pages(args: &[String]) -> zpdf::Result<()> {
         process::exit(1);
     }
 
-    let doc = open_document(&input_path, password.as_deref())?;
-    warn_signatures(&doc);
     let mut writer = build_writer(&input_path, password.as_deref())?;
+    warn_signatures(writer.document());
     for (pages, deg) in &rotates {
         for &idx in pages {
             writer.rotate_page(idx, *deg)?;
@@ -1667,9 +1733,8 @@ fn cmd_set_meta(args: &[String]) -> zpdf::Result<()> {
         process::exit(1);
     }
 
-    let doc = open_document(&input_path, password.as_deref())?;
-    warn_signatures(&doc);
     let mut writer = build_writer(&input_path, password.as_deref())?;
+    warn_signatures(writer.document());
     writer.set_info(&update)?;
     write_output(&writer, &out_path)?;
     println!("Metadata updated → {}", out_path);
@@ -1691,8 +1756,12 @@ fn cmd_stamp(args: &[String]) -> zpdf::Result<()> {
     while i < args.len() {
         match args[i].as_str() {
             "-p" => {
-                if let Some(val) = args.get(i + 1).and_then(|s| s.parse::<usize>().ok()) {
-                    page = Some(val - 1); // 1-based → 0-based
+                if let Some(val) = args
+                    .get(i + 1)
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .and_then(|value| value.checked_sub(1))
+                {
+                    page = Some(val); // 1-based → 0-based
                     i += 2;
                 } else {
                     eprintln!("-p requires a page number");
@@ -1809,9 +1878,8 @@ fn cmd_stamp(args: &[String]) -> zpdf::Result<()> {
         process::exit(1);
     };
 
-    let doc = open_document(&input_path, password.as_deref())?;
-    warn_signatures(&doc);
     let mut writer = build_writer(&input_path, password.as_deref())?;
+    warn_signatures(writer.document());
     writer.stamp_page(page_idx, &items)?;
     write_output(&writer, &out_path)?;
     println!(
@@ -1824,26 +1892,67 @@ fn cmd_stamp(args: &[String]) -> zpdf::Result<()> {
 }
 
 /// Parse "1,3-5,8" into 0-based indices [0,2,3,4,7]. "all" is not supported.
-fn parse_page_list(s: &str) -> Vec<usize> {
+fn parse_page_list(s: &str) -> std::result::Result<Vec<usize>, String> {
+    const MAX_SELECTED_PAGES: usize = 1_000_000;
     let mut result = Vec::new();
-    for part in s.split(',') {
-        if let Some(pos) = part.find('-') {
-            let (start, end) = part.split_at(pos);
-            let a: usize = start.parse::<usize>().unwrap_or(1).saturating_sub(1);
-            let b: usize = end[1..].parse::<usize>().unwrap_or(1).saturating_sub(1);
-            for i in a..=b {
-                result.push(i);
+    for raw_part in s.split(',') {
+        let part = raw_part.trim();
+        if part.is_empty() {
+            return Err("empty page number".to_string());
+        }
+        if let Some((start, end)) = part.split_once('-') {
+            let start = start
+                .parse::<usize>()
+                .map_err(|_| format!("invalid page number: {start}"))?;
+            let end = end
+                .parse::<usize>()
+                .map_err(|_| format!("invalid page number: {end}"))?;
+            if start == 0 || end == 0 {
+                return Err("page numbers are 1-based".to_string());
             }
-        } else if let Ok(n) = part.parse::<usize>() {
-            result.push(n.saturating_sub(1));
+            if end < start {
+                return Err(format!("reversed page range: {part}"));
+            }
+            let count = end
+                .checked_sub(start)
+                .and_then(|span| span.checked_add(1))
+                .ok_or_else(|| format!("page range is too large: {part}"))?;
+            if count > MAX_SELECTED_PAGES.saturating_sub(result.len()) {
+                return Err(format!(
+                    "page list exceeds the {MAX_SELECTED_PAGES}-page limit"
+                ));
+            }
+            result.extend((start - 1)..=(end - 1));
+        } else {
+            let page = part
+                .parse::<usize>()
+                .map_err(|_| format!("invalid page number: {part}"))?;
+            if page == 0 {
+                return Err("page numbers are 1-based".to_string());
+            }
+            if result.len() == MAX_SELECTED_PAGES {
+                return Err(format!(
+                    "page list exceeds the {MAX_SELECTED_PAGES}-page limit"
+                ));
+            }
+            result.push(page - 1);
         }
     }
-    result
+    Ok(result)
 }
 #[cfg(test)]
 mod tests {
-    use super::{collect_attachments, create_unique, sanitize_filename};
+    use super::{collect_attachments, create_unique, parse_page_list, sanitize_filename};
     use std::io::Write;
+
+    #[test]
+    fn page_list_parsing_is_checked_and_bounded() {
+        assert_eq!(parse_page_list("1,3-5,8").unwrap(), vec![0, 2, 3, 4, 7]);
+        assert!(parse_page_list("0").is_err());
+        assert!(parse_page_list("5-3").is_err());
+        assert!(parse_page_list("1-1000001").is_err());
+        assert!(parse_page_list("x").is_err());
+    }
 
     #[test]
     fn sanitize_strips_traversal_and_absolute_paths() {
