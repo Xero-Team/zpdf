@@ -95,6 +95,7 @@ impl Catalog {
                     && dict.get("Pages").is_none()
                     && (dict.get("MediaBox").is_some() || dict.get("Contents").is_some())
             })
+            .take(MAX_PAGE_COUNT)
             .collect()
     }
 
@@ -114,6 +115,9 @@ impl Catalog {
         visited: &mut HashSet<ObjectId>,
         depth: usize,
     ) -> Result<()> {
+        if refs.len() >= MAX_PAGE_COUNT {
+            return Ok(());
+        }
         if depth > MAX_PAGE_TREE_DEPTH {
             warn!("page tree deeper than {MAX_PAGE_TREE_DEPTH} at {node_id}; pruning subtree");
             return Ok(());
@@ -167,6 +171,9 @@ impl Catalog {
                 }
             };
             for kid in kids.iter() {
+                if refs.len() >= MAX_PAGE_COUNT {
+                    break;
+                }
                 match kid {
                     PdfObject::Ref(r) => {
                         Self::collect_page_refs(file, *r, refs, visited, depth + 1)?;

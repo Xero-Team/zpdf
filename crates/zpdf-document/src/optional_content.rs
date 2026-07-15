@@ -9,6 +9,8 @@ use std::collections::HashSet;
 use zpdf_core::{ObjectId, PdfObject};
 use zpdf_parser::PdfFile;
 
+const MAX_OC_GROUPS_PER_LIST: usize = 65_536;
+
 /// The document's default optional-content configuration (`/OCProperties /D`).
 #[derive(Debug, Clone, Default)]
 pub struct OcConfig {
@@ -75,10 +77,10 @@ fn resolve_dict(file: &PdfFile, obj: &PdfObject) -> Option<zpdf_core::PdfDict> {
 }
 
 fn ref_array(file: &PdfFile, obj: Option<&PdfObject>) -> Vec<ObjectId> {
-    let arr = match obj {
-        Some(PdfObject::Array(a)) => a.clone(),
+    let arr: std::borrow::Cow<'_, [PdfObject]> = match obj {
+        Some(PdfObject::Array(a)) => std::borrow::Cow::Borrowed(a),
         Some(PdfObject::Ref(r)) => match file.resolve(*r) {
-            Ok(PdfObject::Array(a)) => a,
+            Ok(PdfObject::Array(a)) => std::borrow::Cow::Owned(a),
             _ => return Vec::new(),
         },
         _ => return Vec::new(),
@@ -88,5 +90,6 @@ fn ref_array(file: &PdfFile, obj: Option<&PdfObject>) -> Vec<ObjectId> {
             PdfObject::Ref(r) => Some(*r),
             _ => None,
         })
+        .take(MAX_OC_GROUPS_PER_LIST)
         .collect()
 }
