@@ -885,43 +885,13 @@ fn decode_dct_image(
     // count from the data length to stay robust if that ever changes. An ICC
     // space whose component count matches the sniffed one is kept, so its
     // transform applies to the JPEG's output samples.
-    let pixel_count = (width as usize) * (height as usize);
+    let pixel_count = (width as usize)
+        .checked_mul(height as usize)
+        .ok_or_else(|| Error::StreamDecode("DCT image pixel count overflow".into()))?;
 
     // L4 Fix: Explicit validation of component count from data length
     // JPEG can only produce 1 (grayscale), 3 (RGB/YCbCr), or 4 (CMYK/YCCK) components
-    let bytes_per_pixel = if decoded_data.len() > pixel_count {
-        decoded_data.len() / pixel_count
-    } else {
-        return Err(Error::StreamDecode(format!(
-            "DCT decoded data too short: {} bytes for {}x{} image",
-            decoded_data.len(),
-            width,
-            height
-        )));
-    };
-
-    if !matches!(bytes_per_pixel, 1 | 3 | 4) {
-        return Err(Error::StreamDecode(format!(
-            "DCT image has invalid component count: {} bytes/pixel (expected 1, 3, or 4)",
-            bytes_per_pixel
-        )));
-    }
-
-    let cs_is_cmyk =
-        *cs == ResolvedColorSpace::Cmyk || matches!(cs, ResolvedColorSpace::Icc { ncomp: 4, .. });
-    let (sniffed, ncomp) = if decoded_data.len() >= pixel_count * 4 && cs_is_cmyk {
-        (cs.clone(), 4)
-    } else if decoded_data.len() >= pixel_count * 3 {
-        match cs {
-            ResolvedColorSpace::Icc { ncomp: 3, .. } => (cs.clone(), 3),
-            _ => (ResolvedColorSpace::Rgb, 3),
-        }
-    } else if decoded_data.len() >= pixel_count {
-        match cs {
-            ResolvedColorSpace::Icc { ncomp: 1, .. } => (cs.clone(), 1),
-            _ => (ResolvedColorSpace::Gray, 1),
-        }
-    } else {
+    if decoded_data.len() < pixel_count {
         return Err(Error::StreamDecode(format!(
             "DCT decoded data too short: {} bytes for {}x{} image",
             decoded_data.len(),
@@ -1064,12 +1034,31 @@ fn decode_raw_samples(
         .and_then(|v| v.checked_mul(bpc as usize))
         .ok_or_else(|| Error::StreamDecode("raw samples: row bytes overflow".into()))?
         .div_ceil(8);
+    let required_data = row_bytes
+        .checked_mul(height as usize)
+        .ok_or_else(|| Error::StreamDecode("raw samples: data size overflow".into()))?;
+    if data.len() < required_data {
+        return Err(Error::StreamDecode(format!(
+            "raw image data too short: {} bytes, expected {required_data}",
+            data.len()
+        )));
+    }
 
     let rgba_size = pixel_count
         .checked_mul(4)
         .ok_or_else(|| Error::StreamDecode("raw samples: RGBA buffer size overflow".into()))?;
 
     let luts = build_component_luts(bpc, cs, decode);
+    // Resolve Indexed entries once. In particular this avoids invoking an ICC
+    // transform separately for every pixel when the palette has an ICC base.
+    let indexed_palette = match cs {
+        ResolvedColorSpace::Indexed {
+            base,
+            hival,
+            lookup,
+        } => Some(build_indexed_rgb_palette(base, *hival, lookup)),
+        _ => None,
+    };
 
     let mut rgba = Vec::with_capacity(rgba_size);
     let mut any_masked = false;
@@ -1423,15 +1412,22 @@ fn mul255(v: u8, a: u8) -> u8 {
 /// Bilinear resample of a single-channel plane (fits mask planes onto the
 /// image they soften). Missing source data reads as opaque (255).
 fn resample_bilinear(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
-    // L6 Fix: Check output buffer size for overflow before allocation
-    let out_size = (dw as usize)
-        .checked_mul(dh as usize)
-        .expect("bilinear resample: output size overflow");
+    let Some(out_size) = (dw as usize).checked_mul(dh as usize) else {
+        tracing::warn!("bilinear mask resample output size overflow");
+        return Vec::new();
+    };
 
     let (sw_u, sh_u) = (sw as usize, sh as usize);
-    let sample =
-        |x: usize, y: usize| -> f32 { src.get(y * sw_u + x).copied().unwrap_or(255) as f32 };
+    let sample = |x: usize, y: usize| -> f64 {
+        y.checked_mul(sw_u)
+            .and_then(|offset| offset.checked_add(x))
+            .and_then(|offset| src.get(offset))
+            .copied()
+            .unwrap_or(255) as f64
+    };
     let mut out = Vec::with_capacity(out_size);
+    let x_scale = sw as f64 / dw as f64;
+    let y_scale = sh as f64 / dh as f64;
     for dy in 0..dh {
         let fy = ((dy as f64 + 0.5) * y_scale - 0.5).clamp(0.0, (sh - 1) as f64);
         let y0 = fy.floor() as usize;

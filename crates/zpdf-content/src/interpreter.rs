@@ -133,6 +133,13 @@ pub struct ContentInterpreter<'a> {
     cs_cache: RefCell<HashMap<ObjectId, ActiveColorSpace>>,
     /// Maximum operand stack depth (M3 security fix).
     max_operand_stack_depth: usize,
+    /// Maximum retained `q` graphics-state depth.
+    max_graphics_state_depth: usize,
+    /// Maximum BMC/BDC nesting depth.
+    max_marked_content_depth: usize,
+    /// Latches when a structural memory limit is exceeded so every enclosing
+    /// form/pattern loop stops after restoring its local state.
+    resource_limit_hit: bool,
 }
 
 /// State for soft-mask reuse across the tiles of one `paint_tiling_pattern`
@@ -501,6 +508,9 @@ impl<'a> ContentInterpreter<'a> {
             cmyk_cache: RefCell::new(None),
             cs_cache: RefCell::new(HashMap::new()),
             max_operand_stack_depth: 10_000, // M3: Match ParseLimits::default()
+            max_graphics_state_depth: 256,
+            max_marked_content_depth: 128,
+            resource_limit_hit: false,
         }
     }
 
@@ -514,6 +524,38 @@ impl<'a> ContentInterpreter<'a> {
     pub fn with_operand_stack_limit(mut self, max_depth: usize) -> Self {
         self.max_operand_stack_depth = max_depth;
         self
+    }
+
+    /// Override the retained graphics-state (`q`) depth limit.
+    pub fn with_graphics_state_limit(mut self, max_depth: usize) -> Self {
+        self.max_graphics_state_depth = max_depth;
+        self
+    }
+
+    /// Override the marked-content (BMC/BDC) nesting limit.
+    pub fn with_marked_content_limit(mut self, max_depth: usize) -> Self {
+        self.max_marked_content_depth = max_depth;
+        self
+    }
+
+    /// Apply the content-related limits from a document's [`ParseLimits`].
+    ///
+    /// [`Self::with_document`] calls this automatically. It remains public for
+    /// callers that interpret standalone streams while enforcing the same
+    /// policy as a parsed document.
+    pub fn with_limits(mut self, limits: &ParseLimits) -> Self {
+        self.apply_limits(limits);
+        self
+    }
+
+    fn apply_limits(&mut self, limits: &ParseLimits) {
+        self.max_ops = limits.max_page_operators;
+        self.max_operand_stack_depth = limits.max_operand_stack_depth as usize;
+        self.max_graphics_state_depth = limits.max_graphics_state_depth as usize;
+        self.max_marked_content_depth = limits.max_marked_content_depth as usize;
+        self.max_image_cache_bytes = limits.max_image_cache_bytes;
+        self.max_font_cache_bytes = limits.max_font_cache_bytes;
+        self.parse_limits = limits.clone();
     }
 
     /// True once the page has hit any anti-hang ceiling: emitted commands,
@@ -547,6 +589,19 @@ impl<'a> ContentInterpreter<'a> {
     /// push would exceed the limit.
     fn operand_stack_full(&self) -> bool {
         self.operand_stack.len() >= self.max_operand_stack_depth
+    }
+
+    fn push_operand(&mut self, obj: PdfObject) -> bool {
+        if self.operand_stack_full() {
+            tracing::warn!(
+                "operand stack exceeded {} entries; truncating page",
+                self.max_operand_stack_depth
+            );
+            self.resource_limit_hit = true;
+            return false;
+        }
+        self.operand_stack.push(obj);
+        true
     }
 
     /// Look a value up through the form-resources stack (innermost first),
@@ -689,15 +744,9 @@ impl<'a> ContentInterpreter<'a> {
             }
             match token {
                 ContentToken::Operand(obj) => {
-                    // M3 Fix: Enforce operand stack depth limit
-                    if self.operand_stack_full() {
-                        tracing::warn!(
-                            "operand stack exceeded {} entries; truncating page",
-                            self.max_operand_stack_depth
-                        );
+                    if !self.push_operand(obj) {
                         break;
                     }
-                    self.operand_stack.push(obj);
                 }
                 ContentToken::Operator(op) => {
                     self.execute_operator(&op);
@@ -3438,15 +3487,9 @@ impl<'a> ContentInterpreter<'a> {
             }
             match token {
                 ContentToken::Operand(obj) => {
-                    // M3 Fix: Enforce operand stack depth limit
-                    if self.operand_stack_full() {
-                        tracing::warn!(
-                            "operand stack exceeded {} entries in form XObject; truncating",
-                            self.max_operand_stack_depth
-                        );
+                    if !self.push_operand(obj) {
                         break;
                     }
-                    self.operand_stack.push(obj);
                 }
                 ContentToken::Operator(op) => {
                     self.execute_operator(&op);
@@ -4206,15 +4249,9 @@ impl<'a> ContentInterpreter<'a> {
                     }
                     match token {
                         ContentToken::Operand(obj) => {
-                            // M3 Fix: Enforce operand stack depth limit
-                            if self.operand_stack_full() {
-                                tracing::warn!(
-                                    "operand stack exceeded {} entries in tiling pattern; truncating",
-                                    self.max_operand_stack_depth
-                                );
+                            if !self.push_operand(obj) {
                                 break;
                             }
-                            self.operand_stack.push(obj);
                         }
                         ContentToken::Operator(op) => {
                             self.execute_operator(&op);

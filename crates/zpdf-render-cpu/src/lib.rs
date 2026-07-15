@@ -966,7 +966,14 @@ impl<'a> CpuRenderer<'a> {
     /// derived by shifting it — exact wherever the base raster painted, and
     /// vacated strips take the mask's unpainted value, which is what a fresh
     /// raster yields outside the group too.
-    fn soft_mask_plane(&mut self, mask: &SoftMask) -> Option<Vec<u8>> {
+    fn soft_mask_plane(&mut self, mask: &SoftMask) -> Option<Arc<[u8]>> {
+        if self.soft_mask_depth >= self.max_blend_group_depth {
+            tracing::warn!(
+                limit = self.max_blend_group_depth,
+                "soft-mask nesting exceeds configured blend-group limit; skipping mask"
+            );
+            return None;
+        }
         let (w, h) = {
             let p = self.pixmap.as_ref()?;
             (p.width(), p.height())

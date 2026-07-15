@@ -15,6 +15,10 @@ pub(crate) const MAX_PAGE_TREE_DEPTH: usize = 64;
 /// that could exhaust memory. Real-world PDFs rarely exceed 100k pages.
 pub(crate) const MAX_PAGE_COUNT: usize = 1_000_000;
 
+const MAX_PAGE_CONTENT_STREAMS: usize = 65_536;
+const MAX_PAGE_ANNOTATIONS: usize = 65_536;
+const MAX_RESOURCE_ENTRIES: usize = 65_536;
+
 /// US Letter, used when a page has no usable `/MediaBox` (missing, degenerate,
 /// or non-finite). Matches the fallback mainstream PDF readers apply.
 const DEFAULT_MEDIA_BOX: Rect = Rect {
