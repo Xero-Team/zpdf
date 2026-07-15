@@ -171,7 +171,7 @@ impl GpuContext {
             device.on_uncaptured_error(Arc::new(move |e: wgpu::Error| {
                 let msg = e.to_string();
                 tracing::error!("wgpu device error: {msg}");
-                let mut g = slot.lock().unwrap();
+                let mut g = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                 if g.is_none() {
                     *g = Some(msg);
                 }
@@ -195,11 +195,17 @@ impl GpuContext {
 
     /// Clear any recorded device error (call before starting a page render).
     pub fn clear_error(&self) {
-        *self.device_error.lock().unwrap() = None;
+        *self
+            .device_error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }
 
     /// Take the most recent recorded device error, if any.
     pub fn take_error(&self) -> Option<String> {
-        self.device_error.lock().unwrap().take()
+        self.device_error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
     }
 }

@@ -25,6 +25,7 @@ pub use context::{GpuContext, COLOR_FORMAT, STENCIL_FORMAT};
 use record::{PageOp, PageRecorder};
 use target::PageTarget;
 use transform::{quantize_premul, PageMap, PageUniform};
+use zpdf_core::ParseLimits;
 use zpdf_display_list::{Paint, RenderCommand};
 use zpdf_render::{PageRenderInfo, RenderBackend};
 
@@ -47,6 +48,8 @@ pub enum WgpuRenderError {
     NoAdapter,
     #[error("required GPU capability unavailable: {0}")]
     Unsupported(String),
+    #[error("invalid page render info: {0}")]
+    InvalidPage(#[from] zpdf_render::PageGeometryError),
     #[error("buffer readback failed: {0}")]
     Readback(String),
     #[error("device poll failed: {0}")]
@@ -57,7 +60,8 @@ pub enum WgpuRenderError {
 
 /// Per-page state, alive between `begin_page` and `end_page`.
 struct PageState {
-    target: PageTarget,
+    width: u32,
+    height: u32,
     clear: wgpu::Color,
     /// Page-units -> device-pixel mapping for tessellation.
     map: PageMap,
@@ -67,6 +71,58 @@ struct PageState {
     recorder: PageRecorder,
 }
 
+fn estimate_readback_bytes(width: u32, height: u32) -> u64 {
+    let row = width as u64 * 4;
+    let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as u64;
+    let padded_row = row.div_ceil(align) * align;
+    padded_row.saturating_mul(height as u64)
+}
+
+fn estimate_page_target_bytes(width: u32, height: u32, sample_count: u32) -> u64 {
+    let pixels = width as u64 * height as u64;
+    let color = pixels.saturating_mul(4).saturating_mul(sample_count as u64);
+    let resolve = if sample_count > 1 {
+        pixels.saturating_mul(4)
+    } else {
+        0
+    };
+    // Use four bytes/sample as a conservative allocation estimate for Stencil8.
+    let stencil = pixels.saturating_mul(4).saturating_mul(sample_count as u64);
+    let readback = estimate_readback_bytes(width, height);
+    color
+        .saturating_add(resolve)
+        .saturating_add(stencil)
+        .saturating_add(readback)
+}
+
+/// Unique image textures referenced by a page, including images nested in any
+/// soft-mask op list. Preserve first-use order for deterministic upload traces.
+fn referenced_image_ids(ops: &[PageOp]) -> Vec<u32> {
+    let mut ids = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut stack = vec![ops];
+    while let Some(ops) = stack.pop() {
+        for op in ops {
+            match op {
+                PageOp::Image { image_id, .. } if seen.insert(*image_id) => ids.push(*image_id),
+                PageOp::PushBlend {
+                    mask: Some(mask), ..
+                } => stack.push(mask.ops.as_slice()),
+                _ => {}
+            }
+        }
+    }
+    ids
+}
+
+fn unit(v: f32) -> f32 {
+    if v.is_finite() {
+        v.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
 /// GPU renderer. Borrows font/image caches like `CpuRenderer<'a>`.
 pub struct WgpuRenderer<'a> {
     ctx: Option<GpuContext>,
@@ -74,22 +130,33 @@ pub struct WgpuRenderer<'a> {
     font_cache: Option<&'a zpdf_font::FontCache>,
     #[allow(dead_code)] // consumed in M7 (images)
     image_cache: Option<&'a zpdf_image::ImageCache>,
+    max_page_pixels: u64,
+    max_gpu_texture_bytes: u64,
+    max_blend_group_depth: usize,
     page: Option<PageState>,
     /// GPU pass time (nanoseconds) from the most recently completed
     /// `end_page()`, or `None` if timestamp queries are unsupported on this
     /// adapter (see `GpuContext::timestamps_supported`) or no page has
     /// rendered yet. Purely informational (P3.8) — never affects rendering.
     last_gpu_time_ns: Option<u64>,
+    /// Timestamp readback adds buffers, a map, and a second blocking poll. Keep
+    /// it opt-in so normal rendering pays no telemetry cost.
+    gpu_timing_enabled: bool,
 }
 
 impl<'a> WgpuRenderer<'a> {
     pub fn new() -> Self {
+        let limits = ParseLimits::default();
         Self {
             ctx: None,
             font_cache: None,
             image_cache: None,
+            max_page_pixels: limits.max_page_pixels,
+            max_gpu_texture_bytes: limits.max_gpu_texture_bytes,
+            max_blend_group_depth: limits.max_blend_group_depth as usize,
             page: None,
             last_gpu_time_ns: None,
+            gpu_timing_enabled: false,
         }
     }
 
@@ -103,6 +170,15 @@ impl<'a> WgpuRenderer<'a> {
         self
     }
 
+    /// Apply render-time security budgets from the source document. Values are
+    /// copied, so this does not extend the renderer's borrow lifetime.
+    pub fn with_limits(mut self, limits: &ParseLimits) -> Self {
+        self.max_page_pixels = limits.max_page_pixels;
+        self.max_gpu_texture_bytes = limits.max_gpu_texture_bytes;
+        self.max_blend_group_depth = limits.max_blend_group_depth as usize;
+        self
+    }
+
     /// Reuse an existing context (e.g. the viewer's surface-bound device).
     pub fn with_context(mut self, ctx: GpuContext) -> Self {
         self.ctx = Some(ctx);
@@ -111,6 +187,9 @@ impl<'a> WgpuRenderer<'a> {
 
     /// Reclaim the context for reuse across renders.
     pub fn take_context(&mut self) -> Option<GpuContext> {
+        if self.page.is_some() {
+            return None;
+        }
         self.ctx.take()
     }
 
@@ -119,6 +198,13 @@ impl<'a> WgpuRenderer<'a> {
     /// any page has rendered, or when the adapter lacks the capability.
     pub fn last_gpu_time_ns(&self) -> Option<u64> {
         self.last_gpu_time_ns
+    }
+
+    /// Enable per-page GPU timestamp telemetry. Disabled by default because its
+    /// readback introduces an additional synchronization point.
+    pub fn with_gpu_timing(mut self, enabled: bool) -> Self {
+        self.gpu_timing_enabled = enabled;
+        self
     }
 }
 
@@ -133,6 +219,24 @@ impl<'a> RenderBackend for WgpuRenderer<'a> {
     type Error = WgpuRenderError;
 
     fn begin_page(&mut self, info: &PageRenderInfo) -> Result<(), Self::Error> {
+        // A failed replacement must not leave an older page available to end.
+        self.page = None;
+        self.last_gpu_time_ns = None;
+        let (width, height) = info.raster_dimensions()?;
+        let pixels = width as u64 * height as u64;
+        if pixels > self.max_page_pixels {
+            return Err(WgpuRenderError::Unsupported(format!(
+                "page {width}x{height} has {pixels} pixels (max_page_pixels={})",
+                self.max_page_pixels
+            )));
+        }
+        let readback_bytes = estimate_readback_bytes(width, height);
+        if readback_bytes > self.max_gpu_texture_bytes {
+            return Err(WgpuRenderError::Unsupported(format!(
+                "page {width}x{height} readback alone needs {readback_bytes} bytes (max_gpu_texture_bytes={})",
+                self.max_gpu_texture_bytes
+            )));
+        }
         if self.ctx.is_none() {
             self.ctx = Some(GpuContext::new_headless()?);
         }
@@ -140,12 +244,6 @@ impl<'a> RenderBackend for WgpuRenderer<'a> {
         ctx.clear_error();
 
         let scale = info.scale;
-        // ceil() in f64, exactly like the CPU's `(width() * scale as f64).ceil()`
-        // (pdfium semantics: a 595x842pt page at 110 DPI is a 910x1287 raster, so
-        // no content is sliced off the right/bottom edges; f32 math would round
-        // differently at integer boundaries).
-        let width = ((info.page_rect.width() * scale as f64).ceil() as u32).max(1);
-        let height = ((info.page_rect.height() * scale as f64).ceil() as u32).max(1);
         if width > ctx.max_texture_dim || height > ctx.max_texture_dim {
             return Err(WgpuRenderError::Unsupported(format!(
                 "page {width}x{height} exceeds adapter max texture dim {}",
@@ -153,12 +251,19 @@ impl<'a> RenderBackend for WgpuRenderer<'a> {
             )));
         }
 
-        let target = PageTarget::new(&ctx.device, width, height, ctx.sample_count);
+        let estimated = estimate_page_target_bytes(width, height, ctx.sample_count);
+        if estimated > self.max_gpu_texture_bytes {
+            return Err(WgpuRenderError::Unsupported(format!(
+                "page {width}x{height} needs about {} MiB of GPU target/readback memory (limit {} MiB)",
+                estimated.div_ceil(1024 * 1024),
+                self.max_gpu_texture_bytes / (1024 * 1024)
+            )));
+        }
 
         // Pre-quantize the background channel-wise so the cleared bytes equal the
         // CPU's `(c * 255) as u8` background fill byte-for-byte.
         let bg = &info.background;
-        let q = |v: f32| (((v * 255.0) as u8) as f64) / 255.0;
+        let q = |v: f32| (((v.clamp(0.0, 1.0) * 255.0) as u8) as f64) / 255.0;
         let clear = wgpu::Color {
             r: q(bg.r),
             g: q(bg.g),
@@ -175,11 +280,12 @@ impl<'a> RenderBackend for WgpuRenderer<'a> {
         };
 
         self.page = Some(PageState {
-            target,
+            width,
+            height,
             clear,
             map,
             uniform,
-            recorder: PageRecorder::default(),
+            recorder: PageRecorder::default().with_max_blend_depth(self.max_blend_group_depth),
         });
         Ok(())
     }
@@ -188,7 +294,7 @@ impl<'a> RenderBackend for WgpuRenderer<'a> {
         let fonts = self.font_cache;
         let images = self.image_cache;
         let Some(page) = self.page.as_mut() else {
-            return Ok(());
+            return Err(WgpuRenderError::NoActivePage);
         };
         match cmd {
             RenderCommand::FillPath {
@@ -254,6 +360,16 @@ impl<'a> RenderBackend for WgpuRenderer<'a> {
             RenderCommand::DrawImage(draw) => {
                 if let Some(images) = self.image_cache {
                     if let Some(img) = images.get(draw.image_id) {
+                        if !image::is_valid_decoded_image(img) {
+                            tracing::warn!(
+                                image_id = draw.image_id,
+                                width = img.width,
+                                height = img.height,
+                                bytes = img.data.len(),
+                                "skipping malformed decoded image"
+                            );
+                            return Ok(());
+                        }
                         let quad = image::image_quad(
                             img.width as f32,
                             img.height as f32,
@@ -261,7 +377,14 @@ impl<'a> RenderBackend for WgpuRenderer<'a> {
                             &page.map,
                             draw.alpha,
                         );
-                        page.recorder.add_image(quad, draw.image_id);
+                        if image::is_safe_quad(&quad) {
+                            page.recorder.add_image(quad, draw.image_id);
+                        } else {
+                            tracing::warn!(
+                                image_id = draw.image_id,
+                                "skipping out-of-range image transform"
+                            );
+                        }
                     }
                 }
             }
@@ -274,9 +397,12 @@ impl<'a> RenderBackend for WgpuRenderer<'a> {
                 // Record the soft mask's geometry into the shared arena (its ops
                 // are replayed into an offscreen coverage layer at composite).
                 let map = page.map;
-                let mask_ops = mask
-                    .as_ref()
-                    .map(|m| build_mask_ops(&mut page.recorder, m, fonts, images, &map));
+                let mask_ops = if page.recorder.can_push_blend() {
+                    mask.as_ref()
+                        .map(|m| build_mask_ops(&mut page.recorder, m, fonts, images, &map))
+                } else {
+                    None
+                };
                 page.recorder.push_blend(*blend_mode, *alpha, mask_ops);
             }
             RenderCommand::PopBlendGroup => {
@@ -293,6 +419,7 @@ impl<'a> RenderBackend for WgpuRenderer<'a> {
         let ctx = self.ctx.as_ref().ok_or(WgpuRenderError::NotInitialized)?;
         let mut page = self.page.take().ok_or(WgpuRenderError::NoActivePage)?;
         let device = &ctx.device;
+        page.recorder.close_open_blends();
 
         // Fullscreen quad: needed for clip rebuild (ResetStencil) and blend composites.
         let needs_fs = page.recorder.uses_reset() || page.recorder.has_blend_groups();
@@ -316,6 +443,71 @@ impl<'a> RenderBackend for WgpuRenderer<'a> {
         // — irrelevant, since every remaining use goes through `batched_ops`).
         let batched_ops = batch::batch_ops(std::mem::take(&mut page.recorder.ops));
 
+        // Validate the complete per-page GPU texture/readback working set before
+        // allocating any large resource. Single-pass pages own page attachments;
+        // layered pages own only readback here and receive the remainder as their
+        // dynamically enforced transparency-layer pool budget.
+        let rec = &page.recorder;
+        let referenced_images = referenced_image_ids(&batched_ops);
+        let mut uploadable_images = Vec::new();
+        let mut image_texture_bytes = 0u64;
+        if let Some(images) = self.image_cache {
+            for image_id in referenced_images {
+                let Some(img) = images.get(image_id) else {
+                    continue;
+                };
+                if !image::is_valid_decoded_image(img)
+                    || img.width > ctx.max_texture_dim
+                    || img.height > ctx.max_texture_dim
+                {
+                    tracing::warn!(
+                        "image {image_id} {}x{} skipped (exceeds limits)",
+                        img.width,
+                        img.height
+                    );
+                    continue;
+                }
+                image_texture_bytes =
+                    image_texture_bytes.saturating_add(img.width as u64 * img.height as u64 * 4);
+                uploadable_images.push(image_id);
+            }
+        }
+        let glyph_texture_bytes = rec.glyph_atlas.gpu_texture_bytes();
+        let target_bytes = if has_blend_groups {
+            estimate_readback_bytes(page.width, page.height)
+        } else {
+            estimate_page_target_bytes(page.width, page.height, ctx.sample_count)
+        };
+        let fixed_gpu_bytes = target_bytes
+            .saturating_add(image_texture_bytes)
+            .saturating_add(glyph_texture_bytes);
+        if fixed_gpu_bytes > self.max_gpu_texture_bytes {
+            return Err(WgpuRenderError::Unsupported(format!(
+                "page GPU target/readback ({target_bytes} bytes), images ({image_texture_bytes} bytes), and glyph atlas ({glyph_texture_bytes} bytes) exceed max_gpu_texture_bytes={}",
+                self.max_gpu_texture_bytes
+            )));
+        }
+        let layer_budget = self.max_gpu_texture_bytes - fixed_gpu_bytes;
+        if has_blend_groups
+            && blend::estimated_layer_bytes(page.width, page.height, ctx.sample_count)
+                > layer_budget
+        {
+            return Err(WgpuRenderError::Unsupported(format!(
+                "page leaves {layer_budget} bytes for transparency layers, less than one layer requires"
+            )));
+        }
+
+        // Layered rendering supplies its own color/stencil textures and needs
+        // only this target's readback buffer. Allocate attachments lazily after
+        // the complete budget validation above.
+        let target = PageTarget::new(
+            device,
+            page.width,
+            page.height,
+            ctx.sample_count,
+            !has_blend_groups,
+        );
+
         // Page uniform + bind group (pixel->NDC params).
         let uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("zpdf-page-uniform"),
@@ -332,7 +524,6 @@ impl<'a> RenderBackend for WgpuRenderer<'a> {
         });
 
         // One shared arena buffer pair (empty for a blank page).
-        let rec = &page.recorder;
         let buffers = if rec.indices.is_empty() {
             None
         } else {
@@ -392,40 +583,9 @@ impl<'a> RenderBackend for WgpuRenderer<'a> {
         let mut tex_bgs: std::collections::HashMap<u32, wgpu::BindGroup> =
             std::collections::HashMap::new();
         if let Some(images) = self.image_cache {
-            let upload =
-                |image_id: u32, tex_bgs: &mut std::collections::HashMap<u32, wgpu::BindGroup>| {
-                    if tex_bgs.contains_key(&image_id) {
-                        return;
-                    }
-                    if let Some(img) = images.get(image_id) {
-                        if img.width == 0
-                            || img.height == 0
-                            || img.width > ctx.max_texture_dim
-                            || img.height > ctx.max_texture_dim
-                        {
-                            tracing::warn!(
-                                "image {image_id} {}x{} skipped (exceeds limits)",
-                                img.width,
-                                img.height
-                            );
-                            return;
-                        }
-                        tex_bgs.insert(image_id, image::upload_image_bind_group(ctx, img));
-                    }
-                };
-            // Walk every op, descending into soft masks at ANY nesting depth: a
-            // mask group may itself contain a masked group whose images are
-            // recorded into a sub-mask's `ops` (not the flat page op list), so a
-            // one-level scan would silently drop them at replay.
-            let mut stack: Vec<&[PageOp]> = vec![batched_ops.as_slice()];
-            while let Some(ops) = stack.pop() {
-                for op in ops {
-                    match op {
-                        PageOp::Image { image_id, .. } => upload(*image_id, &mut tex_bgs),
-                        // Images inside a soft mask reference the same shared arena.
-                        PageOp::PushBlend { mask: Some(m), .. } => stack.push(m.ops.as_slice()),
-                        _ => {}
-                    }
+            for image_id in uploadable_images {
+                if let Some(img) = images.get(image_id) {
+                    tex_bgs.insert(image_id, image::upload_image_bind_group(ctx, img));
                 }
             }
         }
@@ -441,12 +601,19 @@ impl<'a> RenderBackend for WgpuRenderer<'a> {
             fs_range,
         };
 
-        let timer = timing::GpuTimer::new(ctx);
+        let timer = timing::GpuTimer::new(ctx, self.gpu_timing_enabled);
 
         // Pages with transparency groups need the multi-pass offscreen-layer path.
         if has_blend_groups {
-            let (texture, gpu_ns) =
-                render_layered(ctx, &page.target, page.clear, &batched_ops, &res, &timer)?;
+            let (texture, gpu_ns) = render_layered(
+                ctx,
+                &target,
+                page.clear,
+                &batched_ops,
+                &res,
+                &timer,
+                layer_budget,
+            )?;
             self.last_gpu_time_ns = gpu_ns;
             return Ok(texture);
         }
@@ -457,8 +624,8 @@ impl<'a> RenderBackend for WgpuRenderer<'a> {
         });
         timer.write_begin(&mut encoder);
         {
-            let color_att = page.target.color_attachment(page.clear);
-            let ds_att = page.target.stencil_attachment();
+            let color_att = target.color_attachment(page.clear);
+            let ds_att = target.stencil_attachment();
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("zpdf-page-pass"),
                 color_attachments: &[Some(color_att)],
@@ -471,9 +638,9 @@ impl<'a> RenderBackend for WgpuRenderer<'a> {
         }
         timer.write_end(&mut encoder);
         timer.record_resolve(&mut encoder);
-        page.target.record_copy(&mut encoder);
+        target.record_copy(&mut encoder);
         ctx.queue.submit(Some(encoder.finish()));
-        let result = page.target.map_and_strip(device);
+        let result = target.map_and_strip(device);
         self.last_gpu_time_ns = timer.resolve_ns(device);
         if let Some(msg) = ctx.take_error() {
             return Err(WgpuRenderError::Wgpu(format!("device error: {msg}")));
@@ -656,7 +823,10 @@ fn record_dl_commands(
                 }
             }
             RenderCommand::DrawImage(draw) => {
-                if let Some(img) = images.and_then(|c| c.get(draw.image_id)) {
+                if let Some(img) = images
+                    .and_then(|c| c.get(draw.image_id))
+                    .filter(|img| image::is_valid_decoded_image(img))
+                {
                     let quad = image::image_quad(
                         img.width as f32,
                         img.height as f32,
@@ -664,7 +834,9 @@ fn record_dl_commands(
                         map,
                         draw.alpha,
                     );
-                    rec.add_image(quad, draw.image_id);
+                    if image::is_safe_quad(&quad) {
+                        rec.add_image(quad, draw.image_id);
+                    }
                 }
             }
             RenderCommand::PushClip { path, rule } => rec.push_clip(path, *rule, map),
@@ -681,9 +853,12 @@ fn record_dl_commands(
                 mask,
                 ..
             } => {
-                let sub = mask
-                    .as_ref()
-                    .map(|m| build_mask_ops(rec, m, fonts, images, map));
+                let sub = if rec.can_push_blend() {
+                    mask.as_ref()
+                        .map(|m| build_mask_ops(rec, m, fonts, images, map))
+                } else {
+                    None
+                };
                 rec.push_blend(*blend_mode, *alpha, sub);
             }
             RenderCommand::PopBlendGroup => rec.pop_blend(),
@@ -804,7 +979,7 @@ fn composite_into(
     res: &ReplayRes,
     keep_bgs: &mut Vec<wgpu::BindGroup>,
     keep_bufs: &mut Vec<wgpu::Buffer>,
-) -> usize {
+) -> Result<usize, WgpuRenderError> {
     use wgpu::util::DeviceExt;
     let device = &ctx.device;
     let mut active: Vec<usize> = vec![base];
@@ -838,7 +1013,7 @@ fn composite_into(
                 mask,
                 overprint,
             } => {
-                let g = pool.acquire(device);
+                let g = pool.acquire(device)?;
                 init_layer(encoder, pool.get(g), wgpu::Color::TRANSPARENT, clips, res);
                 active.push(g);
                 blend_info.push((*mode, *alpha, mask.as_ref(), clips.clone(), *overprint));
@@ -860,21 +1035,26 @@ fn composite_into(
                 // that takes the group's place as the composite source. The
                 // original group + coverage layers are recycled inside.
                 let group = if let Some(m) = mask {
-                    apply_soft_mask(ctx, encoder, pool, group, m, res, keep_bgs, keep_bufs)
+                    apply_soft_mask(ctx, encoder, pool, group, m, res, keep_bgs, keep_bufs)?
                 } else {
                     group
                 };
 
-                let scratch = pool.acquire(device);
+                let scratch = pool.acquire(device)?;
 
                 // Composite uniform (ModeU, 32 bytes): blend id + group alpha, or
                 // the overprint sentinel + source colorants/mask when overprinting.
                 const OVERPRINT_MODE: u32 = 100;
                 let (id, alpha_bits, op_active, cmyk) = match overprint {
-                    Some(op) => (OVERPRINT_MODE, 1.0f32.to_bits(), op.active as u32, op.cmyk),
+                    Some(op) => (
+                        OVERPRINT_MODE,
+                        1.0f32.to_bits(),
+                        op.active as u32,
+                        op.cmyk.map(unit),
+                    ),
                     None => (
                         blend::blend_index(mode),
-                        alpha.clamp(0.0, 1.0).to_bits(),
+                        unit(alpha).to_bits(),
                         0u32,
                         [0.0; 4],
                     ),
@@ -958,7 +1138,7 @@ fn composite_into(
         i += 1;
     }
 
-    *active.first().unwrap_or(&base)
+    Ok(*active.first().unwrap_or(&base))
 }
 
 /// Multi-pass render for pages with transparency groups: a stack of offscreen
@@ -973,12 +1153,13 @@ fn render_layered(
     ops: &[PageOp],
     res: &ReplayRes,
     timer: &timing::GpuTimer,
+    layer_budget: u64,
 ) -> Result<(GpuTexture, Option<u64>), WgpuRenderError> {
     let device = &ctx.device;
     let (w, h, sc) = (target.width, target.height, target.sample_count);
 
-    let mut pool = blend::LayerPool::new(w, h, sc);
-    let base = pool.acquire(device);
+    let mut pool = blend::LayerPool::new(w, h, sc, layer_budget);
+    let base = pool.acquire(device)?;
     // Composite bind groups + mode buffers kept alive until submit.
     let mut keep_bgs: Vec<wgpu::BindGroup> = Vec::new();
     let mut keep_bufs: Vec<wgpu::Buffer> = Vec::new();
@@ -1008,7 +1189,7 @@ fn render_layered(
         res,
         &mut keep_bgs,
         &mut keep_bufs,
-    );
+    )?;
     timer.write_end(&mut encoder);
     timer.record_resolve(&mut encoder);
     target.record_copy_from(&mut encoder, pool.get(final_layer).sampleable_texture());
@@ -1070,7 +1251,7 @@ fn apply_soft_mask(
     res: &ReplayRes,
     keep_bgs: &mut Vec<wgpu::BindGroup>,
     keep_bufs: &mut Vec<wgpu::Buffer>,
-) -> usize {
+) -> Result<usize, WgpuRenderError> {
     use wgpu::util::DeviceExt;
     use zpdf_display_list::SoftMaskKind;
     let device = &ctx.device;
@@ -1079,10 +1260,10 @@ fn apply_soft_mask(
     //    the /BC backdrop luminosity (opaque); alpha masks from transparent. The
     //    group may itself contain nested transparency groups, so it goes through
     //    the layered compositor rather than a single replay pass.
-    let mask_base = pool.acquire(device);
+    let mask_base = pool.acquire(device)?;
     let clear = match mask.kind {
         SoftMaskKind::Luminosity => {
-            let l = mask.backdrop_luma.clamp(0.0, 1.0) as f64;
+            let l = unit(mask.backdrop_luma) as f64;
             wgpu::Color {
                 r: l,
                 g: l,
@@ -1103,13 +1284,13 @@ fn apply_soft_mask(
     }
     let mask_layer = composite_into(
         ctx, encoder, pool, mask_base, &mask.ops, res, keep_bgs, keep_bufs,
-    );
+    )?;
 
     // 2. Pre-multiply the group layer by the mask coverage into a fresh layer.
     //    The apply pass samples coverage at `coord − (dx, dy)` (tiling-pattern
     //    reuse offset), reduces to luminosity/alpha, and runs it through the /TR
     //    transfer LUT before scaling the group.
-    let masked = pool.acquire(device);
+    let masked = pool.acquire(device)?;
     let kind_id: u32 = match mask.kind {
         SoftMaskKind::Luminosity => 1,
         SoftMaskKind::Alpha => 2,
@@ -1121,7 +1302,7 @@ fn apply_soft_mask(
             dx: mask.dx,
             dy: mask.dy,
             _pad0: 0,
-            backdrop_luma: mask.backdrop_luma.clamp(0.0, 1.0),
+            backdrop_luma: unit(mask.backdrop_luma),
             _pad1: [0.0; 3],
             lut: pack_transfer_lut(mask.transfer.as_ref()),
         }),
@@ -1181,7 +1362,77 @@ fn apply_soft_mask(
     if mask_base != mask_layer {
         pool.recycle(mask_base);
     }
-    masked
+    Ok(masked)
+}
+
+#[cfg(test)]
+mod resource_tests {
+    use super::*;
+    use zpdf_core::Rect;
+    use zpdf_display_list::Color;
+
+    #[test]
+    fn default_gpu_budget_rejects_multi_gigabyte_targets() {
+        let limit = ParseLimits::default().max_gpu_texture_bytes;
+        assert!(estimate_page_target_bytes(2_000, 2_000, 4) < limit);
+        assert!(estimate_page_target_bytes(16_384, 16_384, 4) > limit);
+        assert_eq!(
+            estimate_page_target_bytes(u32::MAX, u32::MAX, u32::MAX),
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn with_limits_copies_renderer_budgets() {
+        let limits = ParseLimits {
+            max_page_pixels: 123,
+            max_gpu_texture_bytes: 456,
+            max_blend_group_depth: 7,
+            ..ParseLimits::default()
+        };
+        let renderer = WgpuRenderer::new().with_limits(&limits);
+        assert_eq!(renderer.max_page_pixels, 123);
+        assert_eq!(renderer.max_gpu_texture_bytes, 456);
+        assert_eq!(renderer.max_blend_group_depth, 7);
+    }
+
+    #[test]
+    fn page_pixel_limit_rejects_before_creating_a_gpu_context() {
+        let limits = ParseLimits {
+            max_page_pixels: 3,
+            ..ParseLimits::default()
+        };
+        let mut renderer = WgpuRenderer::new().with_limits(&limits);
+        let err = renderer
+            .begin_page(&PageRenderInfo {
+                page_rect: Rect::new(0.0, 0.0, 2.0, 2.0),
+                scale: 1.0,
+                background: Color::white(),
+            })
+            .unwrap_err();
+        assert!(matches!(err, WgpuRenderError::Unsupported(_)));
+        assert!(renderer.ctx.is_none());
+        assert!(renderer.page.is_none());
+    }
+
+    #[test]
+    fn gpu_byte_limit_rejects_before_creating_a_gpu_context() {
+        let limits = ParseLimits {
+            max_gpu_texture_bytes: 0,
+            ..ParseLimits::default()
+        };
+        let mut renderer = WgpuRenderer::new().with_limits(&limits);
+        let err = renderer
+            .begin_page(&PageRenderInfo {
+                page_rect: Rect::new(0.0, 0.0, 1.0, 1.0),
+                scale: 1.0,
+                background: Color::white(),
+            })
+            .unwrap_err();
+        assert!(matches!(err, WgpuRenderError::Unsupported(_)));
+        assert!(renderer.ctx.is_none());
+        assert!(renderer.page.is_none());
+    }
 }
 
 /// Tracks the currently-bound pipeline to skip redundant `set_pipeline` calls.

@@ -11,8 +11,8 @@ pub struct PageTarget {
     pub sample_count: u32,
 
     /// Multisampled (or single-sample, when `sample_count == 1`) color attachment.
-    pub color_msaa: wgpu::Texture,
-    pub color_msaa_view: wgpu::TextureView,
+    pub color_msaa: Option<wgpu::Texture>,
+    pub color_msaa_view: Option<wgpu::TextureView>,
 
     /// Single-sample resolve target; `Some` only under MSAA. Readback source when present.
     pub resolve: Option<wgpu::Texture>,
@@ -21,8 +21,8 @@ pub struct PageTarget {
     /// Stencil attachment for clip masks (same sample count as color).
     /// The texture is held to keep it alive and for clip-rebuild in M5.
     #[allow(dead_code)]
-    pub stencil: wgpu::Texture,
-    pub stencil_view: wgpu::TextureView,
+    pub stencil: Option<wgpu::Texture>,
+    pub stencil_view: Option<wgpu::TextureView>,
 
     /// Staging buffer for texture->CPU readback (rows padded to 256 bytes).
     pub readback: wgpu::Buffer,
@@ -31,60 +31,79 @@ pub struct PageTarget {
 }
 
 impl PageTarget {
-    pub fn new(device: &wgpu::Device, width: u32, height: u32, sample_count: u32) -> Self {
+    pub fn new(
+        device: &wgpu::Device,
+        width: u32,
+        height: u32,
+        sample_count: u32,
+        render_attachments: bool,
+    ) -> Self {
         let size = wgpu::Extent3d {
             width,
             height,
             depth_or_array_layers: 1,
         };
 
-        // When single-sampled, the color texture is itself the readback source and
-        // needs COPY_SRC. Under MSAA it is render-only; the resolve carries COPY_SRC.
-        let color_usage = if sample_count > 1 {
-            wgpu::TextureUsages::RENDER_ATTACHMENT
-        } else {
-            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC
-        };
-        let color_msaa = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("zpdf-color"),
-            size,
-            mip_level_count: 1,
-            sample_count,
-            dimension: wgpu::TextureDimension::D2,
-            format: COLOR_FORMAT,
-            usage: color_usage,
-            view_formats: &[],
-        });
-        let color_msaa_view = color_msaa.create_view(&wgpu::TextureViewDescriptor::default());
+        let (color_msaa, color_msaa_view, resolve, resolve_view, stencil, stencil_view) =
+            if render_attachments {
+                // When single-sampled, the color texture is itself the readback source and
+                // needs COPY_SRC. Under MSAA it is render-only; the resolve carries COPY_SRC.
+                let color_usage = if sample_count > 1 {
+                    wgpu::TextureUsages::RENDER_ATTACHMENT
+                } else {
+                    wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC
+                };
+                let color = device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("zpdf-color"),
+                    size,
+                    mip_level_count: 1,
+                    sample_count,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: COLOR_FORMAT,
+                    usage: color_usage,
+                    view_formats: &[],
+                });
+                let color_view = color.create_view(&wgpu::TextureViewDescriptor::default());
 
-        let (resolve, resolve_view) = if sample_count > 1 {
-            let resolve = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("zpdf-resolve"),
-                size,
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: COLOR_FORMAT,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-                view_formats: &[],
-            });
-            let view = resolve.create_view(&wgpu::TextureViewDescriptor::default());
-            (Some(resolve), Some(view))
-        } else {
-            (None, None)
-        };
-
-        let stencil = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("zpdf-stencil"),
-            size,
-            mip_level_count: 1,
-            sample_count,
-            dimension: wgpu::TextureDimension::D2,
-            format: STENCIL_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            view_formats: &[],
-        });
-        let stencil_view = stencil.create_view(&wgpu::TextureViewDescriptor::default());
+                let (resolve, resolve_view) = if sample_count > 1 {
+                    let resolve = device.create_texture(&wgpu::TextureDescriptor {
+                        label: Some("zpdf-resolve"),
+                        size,
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: COLOR_FORMAT,
+                        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                            | wgpu::TextureUsages::COPY_SRC,
+                        view_formats: &[],
+                    });
+                    let view = resolve.create_view(&wgpu::TextureViewDescriptor::default());
+                    (Some(resolve), Some(view))
+                } else {
+                    (None, None)
+                };
+                let stencil = device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("zpdf-stencil"),
+                    size,
+                    mip_level_count: 1,
+                    sample_count,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: STENCIL_FORMAT,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    view_formats: &[],
+                });
+                let stencil_view = stencil.create_view(&wgpu::TextureViewDescriptor::default());
+                (
+                    Some(color),
+                    Some(color_view),
+                    resolve,
+                    resolve_view,
+                    Some(stencil),
+                    Some(stencil_view),
+                )
+            } else {
+                (None, None, None, None, None, None)
+            };
 
         let unpadded_bytes_per_row = width * 4;
         let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
@@ -115,13 +134,19 @@ impl PageTarget {
     /// The texture that holds the final single-sample image (resolve under MSAA,
     /// else the color texture itself).
     fn readback_source(&self) -> &wgpu::Texture {
-        self.resolve.as_ref().unwrap_or(&self.color_msaa)
+        self.resolve
+            .as_ref()
+            .or(self.color_msaa.as_ref())
+            .expect("render target attachments are present")
     }
 
     /// Color attachment for the page pass: clears to `clear`, resolves under MSAA.
     pub fn color_attachment(&self, clear: wgpu::Color) -> wgpu::RenderPassColorAttachment<'_> {
         wgpu::RenderPassColorAttachment {
-            view: &self.color_msaa_view,
+            view: self
+                .color_msaa_view
+                .as_ref()
+                .expect("render target attachments are present"),
             depth_slice: None,
             resolve_target: self.resolve_view.as_ref(),
             ops: wgpu::Operations {
@@ -139,7 +164,10 @@ impl PageTarget {
     /// Depth-stencil attachment: Stencil8 only (no depth aspect), cleared to 0.
     pub fn stencil_attachment(&self) -> wgpu::RenderPassDepthStencilAttachment<'_> {
         wgpu::RenderPassDepthStencilAttachment {
-            view: &self.stencil_view,
+            view: self
+                .stencil_view
+                .as_ref()
+                .expect("render target attachments are present"),
             depth_ops: None,
             stencil_ops: Some(wgpu::Operations {
                 load: wgpu::LoadOp::Clear(0),
@@ -210,9 +238,13 @@ impl PageTarget {
         let row = self.unpadded_bytes_per_row as usize;
         let padded = self.padded_bytes_per_row as usize;
         let mut data = Vec::with_capacity(row * self.height as usize);
-        for r in 0..self.height as usize {
-            let start = r * padded;
-            data.extend_from_slice(&view[start..start + row]);
+        if row == padded {
+            data.extend_from_slice(&view[..row * self.height as usize]);
+        } else {
+            for r in 0..self.height as usize {
+                let start = r * padded;
+                data.extend_from_slice(&view[start..start + row]);
+            }
         }
         drop(view);
         self.readback.unmap();

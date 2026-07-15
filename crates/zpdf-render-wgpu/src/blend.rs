@@ -3,6 +3,7 @@
 //! containing PushBlendGroup); the common single-pass path never allocates these.
 
 use crate::context::{COLOR_FORMAT, STENCIL_FORMAT};
+use crate::WgpuRenderError;
 use zpdf_display_list::BlendMode;
 
 /// Index matching the `switch` in composite.wgsl and `BlendMode`'s declaration order.
@@ -43,24 +44,48 @@ pub struct LayerPool {
     width: u32,
     height: u32,
     sample_count: u32,
+    max_layers: usize,
+    max_bytes: u64,
+}
+
+pub(crate) fn estimated_layer_bytes(width: u32, height: u32, sample_count: u32) -> u64 {
+    let pixels = width as u64 * height as u64;
+    let color = pixels.saturating_mul(4).saturating_mul(sample_count as u64);
+    let resolve = if sample_count > 1 {
+        pixels.saturating_mul(4)
+    } else {
+        0
+    };
+    // Conservative: Stencil8 may be allocated at a wider hardware granularity.
+    let stencil = pixels.saturating_mul(4).saturating_mul(sample_count as u64);
+    color.saturating_add(resolve).saturating_add(stencil)
 }
 
 impl LayerPool {
-    pub fn new(width: u32, height: u32, sample_count: u32) -> Self {
+    pub fn new(width: u32, height: u32, sample_count: u32, max_bytes: u64) -> Self {
+        let per_layer = estimated_layer_bytes(width, height, sample_count).max(1);
         Self {
             layers: Vec::new(),
             free: Vec::new(),
             width,
             height,
             sample_count,
+            max_layers: usize::try_from(max_bytes / per_layer).unwrap_or(usize::MAX),
+            max_bytes,
         }
     }
 
     /// Get a layer to render into — a recycled one if available, else a fresh
     /// allocation. The caller must clear/init it before use.
-    pub fn acquire(&mut self, device: &wgpu::Device) -> usize {
+    pub fn acquire(&mut self, device: &wgpu::Device) -> Result<usize, WgpuRenderError> {
         if let Some(i) = self.free.pop() {
-            return i;
+            return Ok(i);
+        }
+        if self.layers.len() >= self.max_layers {
+            return Err(WgpuRenderError::Unsupported(format!(
+                "transparency layers exceed the {} MiB GPU working-set limit",
+                self.max_bytes / (1024 * 1024)
+            )));
         }
         self.layers.push(RenderLayer::new(
             device,
@@ -68,7 +93,7 @@ impl LayerPool {
             self.height,
             self.sample_count,
         ));
-        self.layers.len() - 1
+        Ok(self.layers.len() - 1)
     }
 
     /// Return a layer to the free-list for reuse. Idempotent (ignores double-free).
@@ -205,5 +230,25 @@ impl RenderLayer {
                 store: wgpu::StoreOp::Store,
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn layer_budget_scales_with_msaa_and_page_area() {
+        assert_eq!(estimated_layer_bytes(100, 100, 1), 80_000);
+        assert!(estimated_layer_bytes(100, 100, 4) > estimated_layer_bytes(100, 100, 1));
+        assert!(estimated_layer_bytes(16_384, 16_384, 4) > 512 * 1024 * 1024);
+    }
+
+    #[test]
+    fn layer_pool_uses_the_supplied_byte_budget() {
+        let per_layer = estimated_layer_bytes(100, 100, 1);
+        let pool = LayerPool::new(100, 100, 1, per_layer * 2 + per_layer / 2);
+        assert_eq!(pool.max_layers, 2);
+        assert_eq!(pool.max_bytes, per_layer * 2 + per_layer / 2);
     }
 }

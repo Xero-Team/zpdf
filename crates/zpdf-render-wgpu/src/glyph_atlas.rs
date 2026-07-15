@@ -12,10 +12,9 @@
 //! anything else (rotation, shear, mirroring, non-1.0 Tz) never reaches this
 //! module and keeps using the existing, unchanged vector-fill path.
 //!
-//! **Eviction**: on atlas-full, the single least-recently-used slot is
-//! evicted and its exact rect reused, but only if the new glyph fits in it;
-//! otherwise `get_or_rasterize` returns `None` and the caller falls back to
-//! vector-fill for that one glyph. The atlas is a pure optimization, never a
+//! **No in-page eviction**: recorded quads keep referring to their slots until
+//! submission, so overwriting any slot would corrupt earlier draws. Atlas-full
+//! falls back to vector fill for new glyphs. The atlas is a pure optimization,
 //! correctness requirement — every failure mode here degrades gracefully.
 
 use std::collections::HashMap;
@@ -81,21 +80,19 @@ pub struct AtlasEntry {
     pub pen_y: f32,
 }
 
-struct Slot {
-    entry: AtlasEntry,
-    last_used: u64,
-}
-
 /// A page-scoped coverage atlas. `pixels` is uploaded to an R8Unorm texture
 /// once in `end_page`; nothing in this module touches the GPU.
 pub struct GlyphAtlas {
     size: u32,
+    /// Allocated lazily on the first glyph so blank/vector-only pages pay no
+    /// fixed 4 MiB host allocation.
     pixels: Vec<u8>,
-    slots: HashMap<GlyphKey, Slot>,
-    clock: u64,
+    slots: HashMap<GlyphKey, AtlasEntry>,
     shelf_x: u32,
     shelf_y: u32,
     shelf_h: u32,
+    used_width: u32,
+    used_height: u32,
 }
 
 impl Default for GlyphAtlas {
@@ -108,12 +105,13 @@ impl GlyphAtlas {
     pub fn new(size: u32) -> Self {
         Self {
             size,
-            pixels: vec![0u8; (size as usize) * (size as usize)],
+            pixels: Vec::new(),
             slots: HashMap::new(),
-            clock: 0,
             shelf_x: 0,
             shelf_y: 0,
             shelf_h: 0,
+            used_width: 0,
+            used_height: 0,
         }
     }
 
@@ -129,23 +127,35 @@ impl GlyphAtlas {
         self.size
     }
 
+    fn used_extent(&self) -> (u32, u32) {
+        (self.used_width, self.used_height)
+    }
+
+    /// Bytes allocated by the tightly cropped R8 GPU texture uploaded at page
+    /// end (zero while no glyph has entered the atlas).
+    pub fn gpu_texture_bytes(&self) -> u64 {
+        self.used_width as u64 * self.used_height as u64
+    }
+
     /// Look up (or rasterize and cache) the coverage mask for `key`. `outline`
     /// is the glyph's font-unit (Y-up) outline; `upem` its units-per-em.
     /// Returns `None` for a degenerate outline, a glyph too large for this
-    /// atlas even when empty, or one that doesn't fit after evicting the
-    /// single least-recently-used slot — the caller falls back to vector-fill.
+    /// atlas even when empty, or one that doesn't fit in the remaining shelves;
+    /// the caller falls back to vector-fill.
     pub fn get_or_rasterize(
         &mut self,
         key: GlyphKey,
         outline: &GlyphOutline,
         upem: f32,
     ) -> Option<AtlasEntry> {
-        self.clock += 1;
-        if let Some(slot) = self.slots.get_mut(&key) {
-            slot.last_used = self.clock;
-            return Some(slot.entry);
+        if let Some(entry) = self.slots.get(&key) {
+            return Some(*entry);
         }
-        if key.x_millipx_per_em <= 0 || key.y_millipx_per_em <= 0 {
+        if key.x_millipx_per_em <= 0
+            || key.y_millipx_per_em <= 0
+            || !upem.is_finite()
+            || upem <= 0.0
+        {
             return None;
         }
 
@@ -162,7 +172,13 @@ impl GlyphAtlas {
         mask.fill_path(&path, SkFillRule::Winding, true, Transform::identity());
 
         let (x, y) = self.allocate(w, h)?;
+        if self.pixels.is_empty() {
+            let len = (self.size as usize).checked_mul(self.size as usize)?;
+            self.pixels.resize(len, 0);
+        }
         blit_mask(&mut self.pixels, self.size, x, y, w, h, mask.data());
+        self.used_width = self.used_width.max(x + w);
+        self.used_height = self.used_height.max(y + h);
 
         let entry = AtlasEntry {
             x,
@@ -172,35 +188,14 @@ impl GlyphAtlas {
             pen_x: (-min_x * scale_x) as f32 + PAD as f32,
             pen_y: (max_y * scale_y) as f32 + PAD as f32,
         };
-        self.slots.insert(
-            key,
-            Slot {
-                entry,
-                last_used: self.clock,
-            },
-        );
+        self.slots.insert(key, entry);
         Some(entry)
     }
 
-    /// Shelf-pack a `w x h` rect. On overflow, evict the single
-    /// least-recently-used slot and reuse its exact rect if large enough for
-    /// `w x h`; otherwise fail. This is a minimal "free list of size 1", not a
-    /// general allocator — the shelf cursor itself never moves backward, so
-    /// already-placed glyphs are never invalidated.
+    /// Shelf-pack a `w x h` rect. Existing slots cannot be reused because
+    /// already-recorded quads keep referencing them until page submission.
     fn allocate(&mut self, w: u32, h: u32) -> Option<(u32, u32)> {
-        if let Some(pos) = self.try_shelf_alloc(w, h) {
-            return Some(pos);
-        }
-        let victim = self
-            .slots
-            .iter()
-            .min_by_key(|(_, s)| s.last_used)
-            .map(|(k, s)| (*k, s.entry))?;
-        if victim.1.w >= w && victim.1.h >= h {
-            self.slots.remove(&victim.0);
-            return Some((victim.1.x, victim.1.y));
-        }
-        None
+        self.try_shelf_alloc(w, h)
     }
 
     fn try_shelf_alloc(&mut self, w: u32, h: u32) -> Option<(u32, u32)> {
@@ -351,6 +346,8 @@ pub fn glyph_quad(
 /// bind group (group 1: texture + the shared bilinear sampler). Called once
 /// per page in `end_page`, only when the atlas is non-empty.
 pub fn upload_atlas_bind_group(ctx: &GpuContext, atlas: &GlyphAtlas) -> wgpu::BindGroup {
+    let (used_width, used_height) = atlas.used_extent();
+    debug_assert!(used_width > 0 && used_height > 0);
     let size = wgpu::Extent3d {
         width: atlas.size(),
         height: atlas.size(),
@@ -377,9 +374,13 @@ pub fn upload_atlas_bind_group(ctx: &GpuContext, atlas: &GlyphAtlas) -> wgpu::Bi
         wgpu::TexelCopyBufferLayout {
             offset: 0,
             bytes_per_row: Some(atlas.size()),
-            rows_per_image: Some(atlas.size()),
+            rows_per_image: Some(used_height),
         },
-        size,
+        wgpu::Extent3d {
+            width: used_width,
+            height: used_height,
+            depth_or_array_layers: 1,
+        },
     );
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
     ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -534,14 +535,14 @@ mod tests {
     }
 
     #[test]
-    fn overflow_evicts_lru_slot_and_reuses_its_rect() {
-        // A small atlas that fits exactly two 30x30-ish glyphs per shelf pass.
+    fn overflow_falls_back_without_panicking() {
+        // Exercise a small atlas without relying on eviction or exact packing.
         let mut atlas = GlyphAtlas::new(64);
         let outline = square_outline();
         let a = atlas
             .get_or_rasterize(key(28, 28), &outline, 1000.0)
             .unwrap();
-        // Touch `a` again so it's more recently used than the next insert.
+        // A repeated key remains a cache hit.
         atlas
             .get_or_rasterize(key(28, 28), &outline, 1000.0)
             .unwrap();
@@ -557,9 +558,7 @@ mod tests {
                 1000.0,
             )
             .unwrap();
-        // A third distinct glyph of the same size should force an eviction
-        // (shelf packing at 64x64 with 30x30 slots has room for very few) —
-        // exercise the path without asserting exactly which slot is evicted.
+        // A further distinct glyph either fits or falls back without panicking.
         let c_key = GlyphKey {
             font_id: 0,
             glyph_id: 3,
@@ -567,10 +566,56 @@ mod tests {
             y_millipx_per_em: 28_000,
         };
         let result = atlas.get_or_rasterize(c_key, &outline, 1000.0);
-        // Either it fit directly or eviction made room — both are acceptable;
-        // the important contract is it never panics and `a`'s original slot
-        // remains valid until actually evicted.
+        // The exact shelf result is intentionally not part of the contract.
         let _ = result;
         let _ = a;
+    }
+
+    #[test]
+    fn full_atlas_never_overwrites_a_recorded_slot() {
+        // 30px square + 2px padding occupies exactly 32x32: four fill 64x64.
+        let mut atlas = GlyphAtlas::new(64);
+        let outline = square_outline();
+        let mut first = None;
+        for glyph_id in 1..=4 {
+            let entry = atlas
+                .get_or_rasterize(
+                    GlyphKey {
+                        font_id: 0,
+                        glyph_id,
+                        x_millipx_per_em: 30_000,
+                        y_millipx_per_em: 30_000,
+                    },
+                    &outline,
+                    1000.0,
+                )
+                .unwrap();
+            first.get_or_insert(entry);
+        }
+        let first = first.unwrap();
+        let row = first.y as usize * atlas.size() as usize;
+        let before =
+            atlas.pixels()[row + first.x as usize..row + (first.x + first.w) as usize].to_vec();
+        assert!(atlas
+            .get_or_rasterize(
+                GlyphKey {
+                    font_id: 0,
+                    glyph_id: 5,
+                    x_millipx_per_em: 30_000,
+                    y_millipx_per_em: 30_000,
+                },
+                &outline,
+                1000.0,
+            )
+            .is_none());
+        assert_eq!(
+            &atlas.pixels()[row + first.x as usize..row + (first.x + first.w) as usize],
+            before.as_slice()
+        );
+    }
+
+    #[test]
+    fn blank_atlas_has_no_fixed_pixel_allocation() {
+        assert!(GlyphAtlas::new(2048).pixels().is_empty());
     }
 }
