@@ -82,7 +82,7 @@ impl IncrementalWriter {
         match existing_id {
             Some(id) => self.overwrite_object(id, PdfObject::Dict(dict)),
             None => {
-                let (num, gen) = self.add_object(&PdfObject::Dict(dict));
+                let (num, gen) = self.try_add_object(&PdfObject::Dict(dict))?;
                 self.set_info_ref(ObjectId(num, gen as u16));
             }
         }
