@@ -323,14 +323,14 @@ fn parse_traditional_xref(
         let (first_obj, count) = parse_subsection_header(data, &mut pos)?;
 
         // L7 Fix: Validate subsection range doesn't overflow object ID space
-        let range_end = first_obj
+        let _range_end = first_obj
             .checked_add(count)
             .ok_or(Error::InvalidXref(pos as u64))?;
-        if range_end > limits.max_objects {
-            return Err(Error::InvalidXref(pos as u64));
-        }
 
         // L7 Fix: Check total entry count against limits before processing
+        // Note: max_objects limits the number of entries we parse, not the
+        // magnitude of object numbers (a sparse xref with one high-numbered
+        // entry should be allowed)
         let new_total = table
             .len()
             .checked_add(count as usize)
