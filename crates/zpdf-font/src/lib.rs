@@ -11,7 +11,7 @@ pub mod standard_fonts;
 pub mod system;
 pub mod type1;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 pub type FontId = u32;
@@ -49,13 +49,19 @@ impl CidWidths {
     pub fn new(default_width: f64) -> Self {
         Self {
             widths: HashMap::new(),
-            default_width,
+            default_width: if default_width.is_finite() {
+                default_width
+            } else {
+                1000.0
+            },
             v_metrics: HashMap::new(),
         }
     }
 
     pub fn set(&mut self, cid: u16, width: f64) {
-        self.widths.insert(cid, width);
+        if width.is_finite() {
+            self.widths.insert(cid, width);
+        }
     }
 
     pub fn get(&self, cid: u16) -> f64 {
@@ -74,7 +80,9 @@ impl CidWidths {
 
     /// Record a /W2 vertical metric for `cid`: (w1y, vx, vy).
     pub fn set_v(&mut self, cid: u16, w1y: f64, vx: f64, vy: f64) {
-        self.v_metrics.insert(cid, (w1y, vx, vy));
+        if w1y.is_finite() && vx.is_finite() && vy.is_finite() {
+            self.v_metrics.insert(cid, (w1y, vx, vy));
+        }
     }
 
     /// Per-CID /W2 vertical metric (w1y, vx, vy), or `None` to fall back to /DW2.
@@ -152,6 +160,26 @@ pub enum PdfFontType {
 }
 
 impl LoadedFont {
+    /// Retained font-program bytes used for cache admission accounting.
+    pub fn estimated_cache_bytes(&self) -> u64 {
+        if let Some(data) = &self.font_data {
+            return data.len() as u64;
+        }
+        if let Some(font) = &self.type1 {
+            return font.estimated_program_bytes();
+        }
+        match &self.font_type {
+            PdfFontType::Type3 { char_procs, .. } => {
+                char_procs.values().map(|stream| stream.len() as u64).sum()
+            }
+            _ => 0,
+        }
+    }
+
+    fn shared_program_key(&self) -> Option<usize> {
+        self.font_data.as_ref().map(|data| data.as_ptr() as usize)
+    }
+
     pub fn new_with_data(
         font_type: PdfFontType,
         base_font: String,
@@ -512,8 +540,9 @@ impl LoadedFont {
     ) {
         let mut v: Vec<([u8; 4], f32)> = Vec::new();
         let mut push = |tag: &[u8; 4], value: f64| {
+            let value = value as f32;
             if value.is_finite() {
-                v.push((*tag, value as f32));
+                v.push((*tag, value));
             }
         };
         if let Some(w) = weight.filter(|w| *w > 0.0) {
@@ -824,9 +853,17 @@ impl LoadedFont {
             if let Some(cm) = &self.cid_cmap {
                 let mut i = 0usize;
                 while i < bytes.len() {
+                    let start = i;
                     let (code, len) = cm.next_code(&bytes[i..]);
                     i += len.max(1);
-                    if let Some(s) = self.to_unicode.as_ref().and_then(|tu| tu.lookup(code)) {
+                    let raw_code = bytes[start..i.min(bytes.len())]
+                        .iter()
+                        .fold(0u32, |value, &byte| (value << 8) | byte as u32);
+                    if let Some(s) = self
+                        .to_unicode
+                        .as_ref()
+                        .and_then(|tu| tu.lookup(raw_code).or_else(|| tu.lookup(code)))
+                    {
                         out.push_str(s);
                     } else if cm.codes_are_unicode {
                         if let Some(c) = char::from_u32(code) {
@@ -999,24 +1036,8 @@ fn cff_top_dict(cff: &[u8]) -> Option<&[u8]> {
     }
     let header_size = cff[2] as usize;
     // Skip the Name INDEX, then read the first Top DICT INDEX entry.
-    let mut pos = skip_cff_index(cff, header_size)?;
-    if pos + 2 > cff.len() {
-        return None;
-    }
-    let count = u16::from_be_bytes([cff[pos], cff[pos + 1]]) as usize;
-    if count == 0 {
-        return None;
-    }
-    pos += 2;
-    let off_size = cff[pos] as usize;
-    pos += 1;
-    let start = read_cff_offset(cff, pos, off_size)?;
-    let end = read_cff_offset(cff, pos + off_size, off_size)?;
-    let data_start = pos + (count + 1) * off_size;
-    if start < 1 || end < start || data_start + end - 1 > cff.len() {
-        return None;
-    }
-    Some(&cff[data_start + start - 1..data_start + end - 1])
+    let pos = skip_cff_index(cff, header_size)?;
+    cff_index_entry(cff, pos, 0)
 }
 
 fn build_cff_encoding_map(otf_data: &[u8]) -> Option<HashMap<u16, u16>> {
@@ -1036,25 +1057,7 @@ fn parse_cff_encoding(cff: &[u8]) -> Option<HashMap<u16, u16>> {
 
     // Top DICT INDEX
     let top_dict_index_start = pos;
-    if pos + 2 > cff.len() {
-        return None;
-    }
-    let count = u16::from_be_bytes([cff[pos], cff[pos + 1]]) as usize;
-    if count == 0 {
-        return None;
-    }
-    pos += 2;
-    let off_size = cff[pos] as usize;
-    pos += 1;
-
-    let mut offsets = Vec::with_capacity(count + 1);
-    for _ in 0..=count {
-        let off = read_cff_offset(cff, pos, off_size)?;
-        offsets.push(off);
-        pos += off_size;
-    }
-    let data_start = pos;
-    let dict_data = &cff[data_start + offsets[0] - 1..data_start + offsets[1] - 1];
+    let dict_data = cff_index_entry(cff, top_dict_index_start, 0)?;
 
     // Get encoding offset from Top DICT (key 16)
     let encoding_offset = parse_top_dict_int(dict_data, 16).unwrap_or(0);
@@ -1165,26 +1168,8 @@ fn parse_cff_orphan_gids(cff: &[u8]) -> Option<Vec<u16>> {
     let header_size = cff[2] as usize;
 
     // Skip Name INDEX, then read the first Top DICT.
-    let mut pos = skip_cff_index(cff, header_size)?;
-    if pos + 2 > cff.len() {
-        return None;
-    }
-    let count = u16::from_be_bytes([cff[pos], cff[pos + 1]]) as usize;
-    if count == 0 {
-        return None;
-    }
-    pos += 2;
-    let off_size = cff[pos] as usize;
-    pos += 1;
-    let mut offsets = Vec::with_capacity(count + 1);
-    for _ in 0..=count {
-        offsets.push(read_cff_offset(cff, pos, off_size)?);
-        pos += off_size;
-    }
-    if offsets[0] < 1 || pos + offsets[1] - 1 > cff.len() || offsets[1] < offsets[0] {
-        return None;
-    }
-    let dict_data = &cff[pos + offsets[0] - 1..pos + offsets[1] - 1];
+    let pos = skip_cff_index(cff, header_size)?;
+    let dict_data = cff_index_entry(cff, pos, 0)?;
 
     let charset_offset = parse_top_dict_int(dict_data, 15).unwrap_or(0);
     // 0/1/2 are predefined charsets (ISOAdobe/Expert/ExpertSubset), not
@@ -1403,8 +1388,11 @@ fn find_cff_table(data: &[u8]) -> Option<&[u8]> {
                 data[rec + 14],
                 data[rec + 15],
             ]) as usize;
-            if offset + length <= data.len() {
-                return Some(&data[offset..offset + length]);
+            if let Some(table) = offset
+                .checked_add(length)
+                .and_then(|end| data.get(offset..end))
+            {
+                return Some(table);
             }
         }
     }
@@ -1424,28 +1412,8 @@ fn parse_cff_charset(cff: &[u8]) -> Option<HashMap<u16, u16>> {
     // Top DICT INDEX — we need to read it to find charset offset
     let top_dict_index_end = skip_cff_index(cff, pos)?;
 
-    // Parse Top DICT INDEX to get the data
-    if pos + 2 > cff.len() {
-        return None;
-    }
-    let count = u16::from_be_bytes([cff[pos], cff[pos + 1]]) as usize;
-    if count == 0 {
-        return None;
-    }
-    pos += 2;
-    let off_size = cff[pos] as usize;
-    pos += 1;
-
-    // Read offsets
-    let mut offsets = Vec::with_capacity(count + 1);
-    for _ in 0..=count {
-        let off = read_cff_offset(cff, pos, off_size)?;
-        offsets.push(off);
-        pos += off_size;
-    }
-
-    let data_start = pos;
-    let dict_data = &cff[data_start + offsets[0] - 1..data_start + offsets[1] - 1];
+    // Parse the first Top DICT entry through the bounds-checked INDEX helper.
+    let dict_data = cff_index_entry(cff, pos, 0)?;
 
     // Parse Top DICT to find charset offset (key 15)
     let charset_offset = parse_top_dict_charset(dict_data)?;
@@ -1549,40 +1517,63 @@ fn parse_cff_charset(cff: &[u8]) -> Option<HashMap<u16, u16>> {
 }
 
 fn skip_cff_index(cff: &[u8], pos: usize) -> Option<usize> {
-    if pos + 2 > cff.len() {
-        return None;
-    }
-    let count = u16::from_be_bytes([cff[pos], cff[pos + 1]]) as usize;
+    let count_bytes = cff.get(pos..pos.checked_add(2)?)?;
+    let count = u16::from_be_bytes([count_bytes[0], count_bytes[1]]) as usize;
     if count == 0 {
-        return Some(pos + 2);
+        return pos.checked_add(2);
     }
-    let off_size = cff[pos + 2] as usize;
-    let offsets_start = pos + 3;
-    let last_offset_pos = offsets_start + count * off_size;
-    if last_offset_pos + off_size > cff.len() {
+    let off_size = *cff.get(pos.checked_add(2)?)? as usize;
+    if !(1..=4).contains(&off_size) {
         return None;
     }
+    let offsets_start = pos.checked_add(3)?;
+    let last_offset_pos = offsets_start.checked_add(count.checked_mul(off_size)?)?;
     let last_offset = read_cff_offset(cff, last_offset_pos, off_size)?;
-    let data_start = offsets_start + (count + 1) * off_size;
-    Some(data_start + last_offset - 1)
+    let last_offset = last_offset.checked_sub(1)?;
+    let data_start = offsets_start.checked_add((count + 1).checked_mul(off_size)?)?;
+    let end = data_start.checked_add(last_offset)?;
+    (end <= cff.len()).then_some(end)
 }
 
 fn read_cff_offset(cff: &[u8], pos: usize, size: usize) -> Option<usize> {
-    if pos + size > cff.len() {
+    if !(1..=4).contains(&size) {
         return None;
     }
+    let bytes = cff.get(pos..pos.checked_add(size)?)?;
     let mut val = 0usize;
-    for i in 0..size {
-        val = (val << 8) | cff[pos + i] as usize;
+    for &byte in bytes {
+        val = (val << 8) | byte as usize;
     }
     Some(val)
 }
 
-fn count_cff_index_entries(cff: &[u8], pos: usize) -> Option<usize> {
-    if pos + 2 > cff.len() {
+fn cff_index_entry(cff: &[u8], pos: usize, entry: usize) -> Option<&[u8]> {
+    let count_bytes = cff.get(pos..pos.checked_add(2)?)?;
+    let count = u16::from_be_bytes([count_bytes[0], count_bytes[1]]) as usize;
+    if entry >= count {
         return None;
     }
-    Some(u16::from_be_bytes([cff[pos], cff[pos + 1]]) as usize)
+    let off_size = *cff.get(pos.checked_add(2)?)? as usize;
+    if !(1..=4).contains(&off_size) {
+        return None;
+    }
+    let offsets_start = pos.checked_add(3)?;
+    let start_pos = offsets_start.checked_add(entry.checked_mul(off_size)?)?;
+    let end_pos = start_pos.checked_add(off_size)?;
+    let start = read_cff_offset(cff, start_pos, off_size)?.checked_sub(1)?;
+    let end = read_cff_offset(cff, end_pos, off_size)?.checked_sub(1)?;
+    if end < start {
+        return None;
+    }
+    let data_start = offsets_start.checked_add((count + 1).checked_mul(off_size)?)?;
+    let range_start = data_start.checked_add(start)?;
+    let range_end = data_start.checked_add(end)?;
+    cff.get(range_start..range_end)
+}
+
+fn count_cff_index_entries(cff: &[u8], pos: usize) -> Option<usize> {
+    let bytes = cff.get(pos..pos.checked_add(2)?)?;
+    Some(u16::from_be_bytes([bytes[0], bytes[1]]) as usize)
 }
 
 fn parse_top_dict_charset(dict_data: &[u8]) -> Option<usize> {
@@ -1614,7 +1605,9 @@ fn parse_top_dict_int(dict_data: &[u8], target_key: u16) -> Option<usize> {
                     b0 as u16
                 };
                 if key == target_key {
-                    return operand_stack.last().map(|&v| v as usize);
+                    return operand_stack
+                        .last()
+                        .and_then(|&value| usize::try_from(value).ok());
                 }
                 operand_stack.clear();
                 pos += 1;
@@ -1677,6 +1670,9 @@ fn parse_top_dict_int(dict_data: &[u8], target_key: u16) -> Option<usize> {
                 pos += 1;
             }
         }
+        if operand_stack.len() > 48 {
+            return None;
+        }
     }
     None
 }
@@ -1693,8 +1689,8 @@ fn wrap_cff_in_otf(cff_data: &[u8]) -> Vec<u8> {
 
     let header_size = 12 + num_tables as usize * 16;
 
-    fn pad4(n: u32) -> u32 {
-        (n + 3) & !3
+    fn pad4(n: u32) -> Option<u32> {
+        Some(n.checked_add(3)? & !3)
     }
     fn compute_checksum(data: &[u8]) -> u32 {
         let mut sum: u32 = 0;
@@ -1718,22 +1714,50 @@ fn wrap_cff_in_otf(cff_data: &[u8]) -> Vec<u8> {
     }
 
     let cff_offset = header_size as u32;
-    let cff_len = cff_data.len() as u32;
+    let Ok(cff_len) = u32::try_from(cff_data.len()) else {
+        return Vec::new();
+    };
 
-    let head_offset = cff_offset + pad4(cff_len);
+    let Some(cff_padded) = pad4(cff_len) else {
+        return Vec::new();
+    };
+    let Some(head_offset) = cff_offset.checked_add(cff_padded) else {
+        return Vec::new();
+    };
     let head_len: u32 = 54;
 
-    let hhea_offset = head_offset + pad4(head_len);
+    let Some(head_padded) = pad4(head_len) else {
+        return Vec::new();
+    };
+    let Some(hhea_offset) = head_offset.checked_add(head_padded) else {
+        return Vec::new();
+    };
     let hhea_len: u32 = 36;
 
-    let maxp_offset = hhea_offset + pad4(hhea_len);
+    let Some(hhea_padded) = pad4(hhea_len) else {
+        return Vec::new();
+    };
+    let Some(maxp_offset) = hhea_offset.checked_add(hhea_padded) else {
+        return Vec::new();
+    };
     let maxp_len: u32 = 6;
 
-    let post_offset = maxp_offset + pad4(maxp_len);
+    let Some(maxp_padded) = pad4(maxp_len) else {
+        return Vec::new();
+    };
+    let Some(post_offset) = maxp_offset.checked_add(maxp_padded) else {
+        return Vec::new();
+    };
     let post_len: u32 = 32;
 
-    let total_size = post_offset as usize + post_len as usize;
-    let mut buf = vec![0u8; total_size];
+    let Some(total_size) = (post_offset as usize).checked_add(post_len as usize) else {
+        return Vec::new();
+    };
+    let mut buf = Vec::new();
+    if buf.try_reserve_exact(total_size).is_err() {
+        return Vec::new();
+    }
+    buf.resize(total_size, 0);
 
     // OTF header
     buf[0..4].copy_from_slice(b"OTTO");
@@ -1795,32 +1819,46 @@ fn wrap_cff_in_otf(cff_data: &[u8]) -> Vec<u8> {
     buf
 }
 
-/// Cache of loaded fonts, keyed by FontId, with LRU eviction.
+/// Page/display-list font store keyed by [`FontId`].
+///
+/// Entries are intentionally stable for the lifetime of the store: display
+/// lists retain only a `FontId`, so evicting a font would invalidate commands
+/// that have already been emitted. The capacity argument is therefore an
+/// allocation hint, not an eviction limit.
 pub struct FontCache {
     fonts: HashMap<FontId, LoadedFont>,
     name_to_id: HashMap<String, FontId>,
     next_id: FontId,
-    /// LRU access order: most recently used at the end
-    access_order: Vec<FontId>,
-    /// Maximum number of fonts to cache (default 256)
-    max_capacity: usize,
+    bytes_used: u64,
+    shared_programs: HashSet<usize>,
 }
 
 impl FontCache {
-    /// Create a new font cache with the default capacity (256 fonts).
+    /// Create a new font store preallocated for 256 fonts.
     pub fn new() -> Self {
-        Self::with_capacity(256)
+        Self::with_preallocated_capacity(256)
     }
 
-    /// Create a new font cache with a specific capacity limit.
-    pub fn with_capacity(max_capacity: usize) -> Self {
+    /// Create a new font store with a specific allocation hint.
+    pub fn with_preallocated_capacity(capacity: usize) -> Self {
         Self {
-            fonts: HashMap::new(),
-            name_to_id: HashMap::new(),
+            fonts: HashMap::with_capacity(capacity),
+            name_to_id: HashMap::with_capacity(capacity),
             next_id: 0,
-            access_order: Vec::new(),
-            max_capacity,
+            bytes_used: 0,
+            shared_programs: HashSet::with_capacity(capacity),
         }
+    }
+
+    /// Compatibility shim for the former capacity-limited cache constructor.
+    ///
+    /// Evicting entries at this threshold would invalidate display-list font
+    /// IDs, so `capacity` is now only a preallocation hint.
+    #[deprecated(
+        note = "old hard-limit semantics could not safely be preserved; use FontCache::with_preallocated_capacity"
+    )]
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self::with_preallocated_capacity(capacity)
     }
 
     pub fn get(&self, id: FontId) -> Option<&LoadedFont> {
@@ -1834,31 +1872,56 @@ impl FontCache {
     }
 
     pub fn insert(&mut self, name: String, font: LoadedFont) -> FontId {
+        self.try_insert_with_limit(name, font, u64::MAX)
+            .expect("font id space exhausted")
+    }
+
+    /// Admit a font without evicting any existing ID. Shared `Arc` font files
+    /// (notably multiple TTC faces) are charged once. Returns `None` when the
+    /// retained-program byte limit would be exceeded or no ID remains.
+    pub fn try_insert_with_limit(
+        &mut self,
+        name: String,
+        font: LoadedFont,
+        max_bytes: u64,
+    ) -> Option<FontId> {
         if let Some(&existing_id) = self.name_to_id.get(&name) {
-            // Move to end (most recently used)
-            if let Some(pos) = self.access_order.iter().position(|&id| id == existing_id) {
-                self.access_order.remove(pos);
-                self.access_order.push(existing_id);
-            }
-            return existing_id;
+            return Some(existing_id);
         }
 
-        // Evict LRU if at capacity
-        if self.fonts.len() >= self.max_capacity && !self.access_order.is_empty() {
-            if let Some(lru_id) = self.access_order.first().copied() {
-                self.fonts.remove(&lru_id);
-                // Remove from name_to_id (need to find the name with this id)
-                self.name_to_id.retain(|_, &mut id| id != lru_id);
-                self.access_order.remove(0);
-            }
+        let program_key = font.shared_program_key();
+        let added_bytes = if program_key.is_some_and(|key| self.shared_programs.contains(&key)) {
+            0
+        } else {
+            font.estimated_cache_bytes()
+        };
+        let new_total = self.bytes_used.checked_add(added_bytes)?;
+        if new_total > max_bytes {
+            return None;
         }
 
-        let id = self.next_id;
-        self.next_id += 1;
+        let id = self.next_free_id()?;
+        if let Some(key) = program_key {
+            self.shared_programs.insert(key);
+        }
+        self.bytes_used = new_total;
         self.name_to_id.insert(name, id);
         self.fonts.insert(id, font);
-        self.access_order.push(id);
-        id
+        Some(id)
+    }
+
+    fn next_free_id(&mut self) -> Option<FontId> {
+        let start = self.next_id;
+        loop {
+            let candidate = self.next_id;
+            self.next_id = self.next_id.wrapping_add(1);
+            if !self.fonts.contains_key(&candidate) {
+                return Some(candidate);
+            }
+            if self.next_id == start {
+                return None;
+            }
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -1867,6 +1930,11 @@ impl FontCache {
 
     pub fn is_empty(&self) -> bool {
         self.fonts.is_empty()
+    }
+
+    /// Total unique font-program bytes retained by this store.
+    pub fn bytes_used(&self) -> u64 {
+        self.bytes_used
     }
 }
 
@@ -2035,6 +2103,17 @@ mod tests {
         assert_eq!(mac_roman_code_for_name("nosuchglyphname"), None);
     }
 
+    #[test]
+    fn utf16_cmap_keeps_raw_code_for_to_unicode_lookup() {
+        let mut font = LoadedFont::new_placeholder("Test".into());
+        font.font_type = PdfFontType::Type0CidType2;
+        font.cid_cmap = cmap::CidCMap::predefined("UniJIS-UTF16-H");
+        font.to_unicode = Some(cmap::ToUnicodeMap::parse(
+            b"beginbfchar <D840DC00> <0041> endbfchar",
+        ));
+        assert_eq!(font.decode_to_string(&[0xD8, 0x40, 0xDC, 0x00]), "A");
+    }
+
     // ----- OTF-wrapped CID-keyed CFF -----
 
     /// Minimal CFF table: Name INDEX ("T"), Top DICT (optionally with /ROS),
@@ -2103,5 +2182,67 @@ mod tests {
             CidWidths::new(1000.0),
         );
         assert!(font.cid_to_gid.is_none());
+    }
+
+    #[test]
+    fn malformed_cff_indexes_never_panic() {
+        for len in 0..48 {
+            for fill in [0u8, 1, 4, 0xFF] {
+                let data = vec![fill; len];
+                let result = std::panic::catch_unwind(|| {
+                    let _ = cff_top_dict(&data);
+                    let _ = parse_cff_encoding(&data);
+                    let _ = parse_cff_orphan_gids(&data);
+                    let _ = parse_cff_charset(&data);
+                    for pos in 0..=data.len() {
+                        let _ = skip_cff_index(&data, pos);
+                    }
+                });
+                assert!(result.is_ok(), "panicked for len={len}, fill={fill:#x}");
+            }
+        }
+    }
+
+    #[test]
+    fn font_ids_remain_valid_beyond_capacity_hint() {
+        let mut cache = FontCache::with_preallocated_capacity(1);
+        let first = cache.insert("A".into(), LoadedFont::new_placeholder("A".into()));
+        let second = cache.insert("B".into(), LoadedFont::new_placeholder("B".into()));
+        assert!(cache.get(first).is_some());
+        assert!(cache.get(second).is_some());
+        assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn font_ids_wrap_without_overwriting_live_entries() {
+        let mut cache = FontCache::new();
+        cache.next_id = u32::MAX;
+        let last = cache.insert("A".into(), LoadedFont::new_placeholder("A".into()));
+        let zero = cache.insert("B".into(), LoadedFont::new_placeholder("B".into()));
+        assert_eq!(last, u32::MAX);
+        assert_eq!(zero, 0);
+        assert!(cache.get(last).is_some() && cache.get(zero).is_some());
+    }
+
+    #[test]
+    fn font_cache_budget_is_non_evicting_and_deduplicates_shared_programs() {
+        let data: Arc<[u8]> = Arc::from(vec![0u8; 8]);
+        let mut first = LoadedFont::new_placeholder("A".into());
+        first.font_data = Some(data.clone());
+        let mut second = LoadedFont::new_placeholder("B".into());
+        second.font_data = Some(data);
+        let mut third = LoadedFont::new_placeholder("C".into());
+        third.font_data = Some(Arc::from(vec![0u8; 1]));
+
+        let mut cache = FontCache::new();
+        assert_eq!(cache.try_insert_with_limit("A".into(), first, 8), Some(0));
+        assert_eq!(cache.try_insert_with_limit("B".into(), second, 8), Some(1));
+        assert_eq!(cache.try_insert_with_limit("C".into(), third, 8), None);
+        assert_eq!(cache.bytes_used(), 8);
+        assert!(cache.get(0).is_some() && cache.get(1).is_some());
+        assert_eq!(
+            cache.try_insert_with_limit("D".into(), LoadedFont::new_placeholder("D".into()), 8),
+            Some(2)
+        );
     }
 }
