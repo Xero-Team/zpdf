@@ -2,8 +2,8 @@
 //! `fixtures/gen_jpx_fixtures.py` (lossless fixtures ship byte-exact `.raw`
 //! references dumped at generation time).
 
-use zpdf_core::{PdfDict, PdfName, PdfObject};
-use zpdf_image::{decode_image_xobject, DecodedImage};
+use zpdf_core::{ParseLimits, PdfDict, PdfName, PdfObject};
+use zpdf_image::{decode_image_xobject, decode_image_xobject_with_limits, DecodedImage};
 
 const W: u32 = 32;
 const H: u32 = 24;
@@ -127,6 +127,20 @@ fn codestream_dimensions_override_dict() {
     // The codestream is authoritative when the dict disagrees.
     let img = decode_image_xobject(RGB_JP2, &jpx_dict(1, 1)).unwrap();
     assert_eq!((img.width, img.height), (W, H));
+}
+
+#[test]
+fn codestream_dimensions_honor_custom_pixel_limit() {
+    // The dictionary is deliberately below the limit. The authoritative JPX
+    // header dimensions must still be checked before pixel decompression.
+    let limits = ParseLimits {
+        max_image_pixels: 3,
+        ..ParseLimits::default()
+    };
+    let err = decode_image_xobject_with_limits(RGB_JP2, &jpx_dict(1, 1), &limits).unwrap_err();
+    let message = err.to_string();
+    assert!(message.contains("JPX codestream"), "{message}");
+    assert!(message.contains("3-pixel limit"), "{message}");
 }
 
 #[test]
