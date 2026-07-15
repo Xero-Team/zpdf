@@ -14,6 +14,13 @@ use zpdf_core::{ObjectId, PdfDict, PdfObject};
 
 /// Maximum nesting for stitching sub-functions (guards cyclic references).
 const MAX_FUNCTION_DEPTH: u32 = 8;
+/// Sampled functions require `2^n` interpolation corners. Above this limit
+/// evaluation would be prohibitively expensive; older code also silently
+/// ignored dimensions above 16.
+const MAX_SAMPLED_INPUTS: usize = 16;
+const MAX_SAMPLED_INTERPOLATIONS: u64 = 65_536;
+/// Bound arrays copied out of a PDF object and per-evaluation output buffers.
+const MAX_FUNCTION_COMPONENTS: usize = 256;
 /// Execution-step budget for the Type 4 calculator (guards runaway loops —
 /// the language has no loops, but nested procedures can blow up).
 const MAX_PS_STEPS: u32 = 10_000;
@@ -80,8 +87,8 @@ impl PdfFunction {
         match obj {
             PdfObject::Ref(id) => {
                 let (resolved, data) = resolve(*id)?;
-                let dict = resolved.as_dict().ok()?.clone();
-                Self::parse_depth(&dict, data.as_deref(), resolve, depth)
+                let dict = resolved.as_dict().ok()?;
+                Self::parse_depth(dict, data.as_deref(), resolve, depth)
             }
             PdfObject::Dict(d) => Self::parse_depth(d, None, resolve, depth),
             _ => None,
@@ -99,19 +106,33 @@ impl PdfFunction {
         }
         let ftype = dict.get_i64("FunctionType").ok()?;
         let domain = number_pairs(dict.get("Domain")?)?;
-        if domain.is_empty() {
+        if domain.is_empty() || domain.len() > MAX_FUNCTION_COMPONENTS || !ordered_pairs(&domain) {
             return None;
         }
-        let range = dict.get("Range").and_then(number_pairs);
+        let range = match dict.get("Range") {
+            Some(obj) => {
+                let pairs = number_pairs(obj)?;
+                if pairs.is_empty()
+                    || pairs.len() > MAX_FUNCTION_COMPONENTS
+                    || !ordered_pairs(&pairs)
+                {
+                    return None;
+                }
+                Some(pairs)
+            }
+            None => None,
+        };
 
         let kind = match ftype {
             0 => {
                 let data = stream_data?;
                 let size: Vec<u32> = numbers(dict.get("Size")?)?
                     .into_iter()
-                    .map(|v| v.max(1.0) as u32)
-                    .collect();
-                if size.len() != domain.len() {
+                    .map(|v| {
+                        (v >= 1.0 && v <= u32::MAX as f64 && v.fract() == 0.0).then_some(v as u32)
+                    })
+                    .collect::<Option<_>>()?;
+                if size.len() != domain.len() || size.len() > MAX_SAMPLED_INPUTS {
                     return None;
                 }
                 let bps = dict.get_i64("BitsPerSample").ok()?;
@@ -120,18 +141,31 @@ impl PdfFunction {
                 }
                 let range = range.as_ref()?;
                 let n_outputs = range.len();
-                let encode = dict
-                    .get("Encode")
-                    .and_then(number_pairs)
-                    .unwrap_or_else(|| size.iter().map(|&s| [0.0, (s - 1) as f64]).collect());
-                let decode = dict
-                    .get("Decode")
-                    .and_then(number_pairs)
-                    .unwrap_or_else(|| range.clone());
+                let corners = 1u64.checked_shl(u32::try_from(size.len()).ok()?)?;
+                if corners.checked_mul(u64::try_from(n_outputs).ok()?)? > MAX_SAMPLED_INTERPOLATIONS
+                {
+                    return None;
+                }
+                let encode = match dict.get("Encode") {
+                    Some(obj) => number_pairs(obj)?,
+                    None => size.iter().map(|&s| [0.0, (s - 1) as f64]).collect(),
+                };
+                let decode = match dict.get("Decode") {
+                    Some(obj) => number_pairs(obj)?,
+                    None => range.clone(),
+                };
+                if encode.len() != size.len() || decode.len() != n_outputs {
+                    return None;
+                }
                 // Sanity: enough sample bits for the full grid.
-                let total: u64 =
-                    size.iter().map(|&s| s as u64).product::<u64>() * n_outputs as u64 * bps as u64;
-                if total > (data.len() as u64) * 8 {
+                let sample_count = size
+                    .iter()
+                    .try_fold(1u64, |total, &s| total.checked_mul(s as u64))?;
+                let total_bits = sample_count
+                    .checked_mul(u64::try_from(n_outputs).ok()?)?
+                    .checked_mul(bps as u64)?;
+                let required_bytes = usize::try_from(total_bits.checked_add(7)? / 8).ok()?;
+                if required_bytes > data.len() {
                     return None;
                 }
                 FunctionKind::Sampled {
@@ -140,10 +174,15 @@ impl PdfFunction {
                     encode,
                     decode,
                     n_outputs,
-                    samples: data.to_vec(),
+                    // Do not retain arbitrary trailing stream garbage for the
+                    // lifetime of the function/document.
+                    samples: data[..required_bytes].to_vec(),
                 }
             }
             2 => {
+                if domain.len() != 1 {
+                    return None;
+                }
                 let c0 = dict
                     .get("C0")
                     .and_then(numbers)
@@ -152,35 +191,65 @@ impl PdfFunction {
                     .get("C1")
                     .and_then(numbers)
                     .unwrap_or_else(|| vec![1.0]);
-                if c0.len() != c1.len() || c0.is_empty() {
+                if c0.len() != c1.len()
+                    || c0.is_empty()
+                    || c0.len() > MAX_FUNCTION_COMPONENTS
+                    || range.as_ref().is_some_and(|r| r.len() != c0.len())
+                {
                     return None;
                 }
                 let n = dict.get_f64("N").unwrap_or(1.0);
+                if !n.is_finite() {
+                    return None;
+                }
                 FunctionKind::Exponential { c0, c1, n }
             }
             3 => {
+                if domain.len() != 1 {
+                    return None;
+                }
                 let funcs_obj = dict.get("Functions")?;
-                let funcs_arr = match funcs_obj {
-                    PdfObject::Array(a) => a.clone(),
+                let resolved_funcs;
+                let funcs_arr: &[PdfObject] = match funcs_obj {
+                    PdfObject::Array(a) => a,
                     PdfObject::Ref(id) => {
-                        let (resolved, _) = resolve(*id)?;
-                        resolved.as_array().ok()?.to_vec()
+                        (resolved_funcs, _) = resolve(*id)?;
+                        resolved_funcs.as_array().ok()?
                     }
                     _ => return None,
                 };
-                let mut functions = Vec::with_capacity(funcs_arr.len());
-                for f in &funcs_arr {
-                    functions.push(Self::parse_object_depth(f, resolve, depth + 1)?);
-                }
-                if functions.is_empty() {
+                if funcs_arr.is_empty() || funcs_arr.len() > MAX_FUNCTION_COMPONENTS {
                     return None;
                 }
-                let bounds = dict.get("Bounds").and_then(numbers).unwrap_or_default();
+                let mut functions = Vec::with_capacity(funcs_arr.len());
+                for f in funcs_arr {
+                    functions.push(Self::parse_object_depth(f, resolve, depth + 1)?);
+                }
+                let bounds = match dict.get("Bounds") {
+                    Some(obj) => numbers(obj)?,
+                    None => Vec::new(),
+                };
                 if bounds.len() + 1 != functions.len() {
+                    return None;
+                }
+                let [domain_min, domain_max] = domain[0];
+                if !bounds.windows(2).all(|w| w[0] < w[1])
+                    || !bounds
+                        .iter()
+                        .all(|&bound| domain_min <= bound && bound <= domain_max)
+                {
                     return None;
                 }
                 let encode = number_pairs(dict.get("Encode")?)?;
                 if encode.len() != functions.len() {
+                    return None;
+                }
+                let outputs = functions[0].n_outputs()?;
+                if functions
+                    .iter()
+                    .any(|f| f.n_inputs() != 1 || f.n_outputs() != Some(outputs))
+                    || range.as_ref().is_some_and(|r| r.len() != outputs)
+                {
                     return None;
                 }
                 FunctionKind::Stitching {
@@ -288,6 +357,14 @@ impl PdfFunction {
             FunctionKind::PostScript { program } => eval_postscript(program, &clamped)?,
         };
 
+        // `/Range` is optional for Type 2/3 functions, but their arithmetic can
+        // still produce NaN or infinity (for example 0^-1 or a fractional power
+        // of a negative domain value). Never let non-finite color components
+        // escape merely because there is no range to clamp them against.
+        if out.iter().any(|value| !value.is_finite()) {
+            return None;
+        }
+
         if let Some(range) = &self.range {
             if out.len() > range.len() {
                 if matches!(self.kind, FunctionKind::PostScript { .. }) {
@@ -297,6 +374,9 @@ impl PdfFunction {
                 } else {
                     out.truncate(range.len());
                 }
+            }
+            if out.len() < range.len() {
+                return None;
             }
             for (v, r) in out.iter_mut().zip(range) {
                 *v = v.clamp(r[0].min(r[1]), r[0].max(r[1]));
@@ -312,8 +392,26 @@ impl PdfFunction {
 
 /// Read sample index `idx` (in samples, not bytes) of width `bps` bits.
 fn read_sample(samples: &[u8], idx: u64, bps: u8) -> f64 {
-    let bit = idx * bps as u64;
-    let max = (1u64 << bps.min(63)) - 1;
+    let Some(bit) = idx.checked_mul(bps as u64) else {
+        return 0.0;
+    };
+    let max = (1u64 << bps) - 1;
+    if bps.is_multiple_of(8) {
+        let Ok(byte) = usize::try_from(bit / 8) else {
+            return 0.0;
+        };
+        let width = (bps / 8) as usize;
+        let Some(chunk) = byte
+            .checked_add(width)
+            .and_then(|end| samples.get(byte..end))
+        else {
+            return 0.0;
+        };
+        let acc = chunk
+            .iter()
+            .fold(0u64, |value, &next| (value << 8) | next as u64);
+        return acc as f64 / max as f64;
+    }
     let mut acc: u64 = 0;
     for i in 0..bps as u64 {
         let b = bit + i;
@@ -358,7 +456,7 @@ fn eval_sampled(
 
     // Multilinear interpolation over the 2^m surrounding grid points.
     let mut out = vec![0.0f64; n_outputs];
-    let corners = 1usize << m.min(16);
+    let corners = 1usize.checked_shl(u32::try_from(m).ok()?)?;
     for corner in 0..corners {
         let mut weight = 1.0f64;
         let mut index: u64 = 0;
@@ -373,14 +471,17 @@ fn eval_sampled(
                 base as u64
             };
             weight *= if hi { frac } else { 1.0 - frac };
-            index += gi * stride;
-            stride *= size[i] as u64;
+            index = index.checked_add(gi.checked_mul(stride)?)?;
+            stride = stride.checked_mul(size[i] as u64)?;
         }
         if weight == 0.0 {
             continue;
         }
         for (j, o) in out.iter_mut().enumerate() {
-            let s = read_sample(samples, index * n_outputs as u64 + j as u64, bps);
+            let sample_index = index
+                .checked_mul(u64::try_from(n_outputs).ok()?)?
+                .checked_add(u64::try_from(j).ok()?)?;
+            let s = read_sample(samples, sample_index, bps);
             *o += weight * s;
         }
     }
@@ -457,7 +558,10 @@ fn parse_postscript(src: &[u8]) -> Option<Vec<PsOp>> {
         PsTok::LBrace => {}
         _ => return None,
     }
-    parse_ps_block(&mut toks, 0)
+    let mut budget = MAX_PS_STEPS;
+    let program = parse_ps_block(&mut toks, 0, &mut budget)?;
+    // Only whitespace/comments may follow the outer procedure.
+    toks.next_token().is_none().then_some(program)
 }
 
 struct PsTokens<'a> {
@@ -512,7 +616,7 @@ impl<'a> PsTokens<'a> {
     }
 }
 
-fn parse_ps_block(toks: &mut PsTokens<'_>, depth: u32) -> Option<Vec<PsOp>> {
+fn parse_ps_block(toks: &mut PsTokens<'_>, depth: u32, budget: &mut u32) -> Option<Vec<PsOp>> {
     if depth > 32 {
         return None;
     }
@@ -527,7 +631,7 @@ fn parse_ps_block(toks: &mut PsTokens<'_>, depth: u32) -> Option<Vec<PsOp>> {
                 return if pending.is_empty() { Some(ops) } else { None };
             }
             PsTok::LBrace => {
-                pending.push(parse_ps_block(toks, depth + 1)?);
+                pending.push(parse_ps_block(toks, depth + 1, budget)?);
                 if pending.len() > 2 {
                     return None;
                 }
@@ -539,6 +643,7 @@ fn parse_ps_block(toks: &mut PsTokens<'_>, depth: u32) -> Option<Vec<PsOp>> {
                     if !pending.is_empty() {
                         return None;
                     }
+                    take_ps_budget(budget)?;
                     ops.push(PsOp::If(body));
                 } else if word == "ifelse" {
                     let else_b = pending.pop()?;
@@ -546,11 +651,13 @@ fn parse_ps_block(toks: &mut PsTokens<'_>, depth: u32) -> Option<Vec<PsOp>> {
                     if !pending.is_empty() {
                         return None;
                     }
+                    take_ps_budget(budget)?;
                     ops.push(PsOp::IfElse(then_b, else_b));
                 } else {
                     if !pending.is_empty() {
                         return None;
                     }
+                    take_ps_budget(budget)?;
                     ops.push(parse_ps_word(word)?);
                 }
             }
@@ -558,9 +665,14 @@ fn parse_ps_block(toks: &mut PsTokens<'_>, depth: u32) -> Option<Vec<PsOp>> {
     }
 }
 
+fn take_ps_budget(budget: &mut u32) -> Option<()> {
+    *budget = budget.checked_sub(1)?;
+    Some(())
+}
+
 fn parse_ps_word(w: &str) -> Option<PsOp> {
     if let Ok(n) = w.parse::<f64>() {
-        return Some(PsOp::Num(n));
+        return n.is_finite().then_some(PsOp::Num(n));
     }
     Some(match w {
         "abs" => PsOp::Abs,
@@ -608,6 +720,9 @@ fn parse_ps_word(w: &str) -> Option<PsOp> {
 }
 
 fn eval_postscript(program: &[PsOp], inputs: &[f64]) -> Option<Vec<f64>> {
+    if inputs.len() > 256 || inputs.iter().any(|v| !v.is_finite()) {
+        return None;
+    }
     let mut stack: Vec<f64> = inputs.to_vec();
     let mut steps = 0u32;
     exec_ps(program, &mut stack, &mut steps)?;
@@ -654,17 +769,23 @@ fn exec_ps(ops: &[PsOp], stack: &mut Vec<f64>, steps: &mut u32) -> Option<()> {
             Div => bin!(|a, b| if b == 0.0 { 0.0 } else { a / b }),
             Exp => bin!(|a, b| a.powf(b)),
             Floor => un!(|a| a.floor()),
-            Idiv => bin!(|a, b| if b as i64 == 0 {
-                0.0
-            } else {
-                ((a as i64) / (b as i64)) as f64
+            Idiv => bin!(|a, b| {
+                let (a, b) = (ps_i64(a)?, ps_i64(b)?);
+                if b == 0 {
+                    0.0
+                } else {
+                    a.checked_div(b)? as f64
+                }
             }),
             Ln => un!(|a| if a > 0.0 { a.ln() } else { 0.0 }),
             Log => un!(|a| if a > 0.0 { a.log10() } else { 0.0 }),
-            Mod => bin!(|a, b| if b as i64 == 0 {
-                0.0
-            } else {
-                ((a as i64) % (b as i64)) as f64
+            Mod => bin!(|a, b| {
+                let (a, b) = (ps_i64(a)?, ps_i64(b)?);
+                if b == 0 {
+                    0.0
+                } else {
+                    a.checked_rem(b)? as f64
+                }
             }),
             Mul => bin!(|a, b| a * b),
             Neg => un!(|a| -a),
@@ -673,13 +794,13 @@ fn exec_ps(ops: &[PsOp], stack: &mut Vec<f64>, steps: &mut u32) -> Option<()> {
             Sqrt => un!(|a| if a >= 0.0 { a.sqrt() } else { 0.0 }),
             Sub => bin!(|a, b| a - b),
             Truncate => un!(|a| a.trunc()),
-            And => bin!(|a, b| ((a as i64) & (b as i64)) as f64),
+            And => bin!(|a, b| (ps_i64(a)? & ps_i64(b)?) as f64),
             Bitshift => bin!(|a, b| {
-                let (ai, bi) = (a as i64, b as i64);
+                let (ai, bi) = (ps_i64(a)?, ps_i64(b)?);
                 (if bi >= 0 {
                     ai.wrapping_shl(bi.min(63) as u32)
                 } else {
-                    ai >> ((-bi).min(63))
+                    ai >> bi.unsigned_abs().min(63)
                 }) as f64
             }),
             Eq => bin!(|a, b| (a == b) as i64 as f64),
@@ -692,20 +813,19 @@ fn exec_ps(ops: &[PsOp], stack: &mut Vec<f64>, steps: &mut u32) -> Option<()> {
             Not => un!(|a| if a == 0.0 || a == 1.0 {
                 (a == 0.0) as i64 as f64
             } else {
-                !(a as i64) as f64
+                !ps_i64(a)? as f64
             }),
-            Or => bin!(|a, b| ((a as i64) | (b as i64)) as f64),
+            Or => bin!(|a, b| (ps_i64(a)? | ps_i64(b)?) as f64),
             True => stack.push(1.0),
-            Xor => bin!(|a, b| ((a as i64) ^ (b as i64)) as f64),
+            Xor => bin!(|a, b| (ps_i64(a)? ^ ps_i64(b)?) as f64),
             Copy => {
-                let n = stack.pop()? as usize;
+                let n = ps_count(stack.pop()?)?;
                 if n > 0 {
                     let len = stack.len();
-                    if n > len || len + n > 256 {
+                    if n > len || len.checked_add(n)? > 256 {
                         return None;
                     }
-                    let tail: Vec<f64> = stack[len - n..].to_vec();
-                    stack.extend(tail);
+                    stack.extend_from_within(len - n..);
                 }
             }
             Dup => {
@@ -719,7 +839,7 @@ fn exec_ps(ops: &[PsOp], stack: &mut Vec<f64>, steps: &mut u32) -> Option<()> {
                 stack.push(a);
             }
             Index => {
-                let n = stack.pop()? as usize;
+                let n = ps_count(stack.pop()?)?;
                 if n >= stack.len() {
                     return None;
                 }
@@ -730,8 +850,8 @@ fn exec_ps(ops: &[PsOp], stack: &mut Vec<f64>, steps: &mut u32) -> Option<()> {
                 stack.pop()?;
             }
             Roll => {
-                let j = stack.pop()? as i64;
-                let n = stack.pop()? as usize;
+                let j = ps_i64(stack.pop()?)?;
+                let n = ps_count(stack.pop()?)?;
                 if n > stack.len() || n == 0 {
                     if n == 0 {
                         continue;
@@ -758,8 +878,22 @@ fn exec_ps(ops: &[PsOp], stack: &mut Vec<f64>, steps: &mut u32) -> Option<()> {
                 }
             }
         }
+        if stack.len() > 256 || stack.iter().any(|v| !v.is_finite()) {
+            return None;
+        }
     }
     Some(())
+}
+
+fn ps_i64(value: f64) -> Option<i64> {
+    // `i64::MAX as f64` rounds to 2^63, so use an exclusive upper bound.
+    const I64_UPPER_EXCLUSIVE: f64 = 9_223_372_036_854_775_808.0;
+    (value.is_finite() && value >= i64::MIN as f64 && value < I64_UPPER_EXCLUSIVE)
+        .then_some(value.trunc() as i64)
+}
+
+fn ps_count(value: f64) -> Option<usize> {
+    usize::try_from(ps_i64(value)?).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -768,9 +902,16 @@ fn exec_ps(ops: &[PsOp], stack: &mut Vec<f64>, steps: &mut u32) -> Option<()> {
 
 fn numbers(obj: &PdfObject) -> Option<Vec<f64>> {
     let arr = obj.as_array().ok()?;
+    if arr.len() > MAX_FUNCTION_COMPONENTS * 2 {
+        return None;
+    }
     let mut out = Vec::with_capacity(arr.len());
     for v in arr {
-        out.push(v.as_f64().ok()?);
+        let value = v.as_f64().ok()?;
+        if !value.is_finite() {
+            return None;
+        }
+        out.push(value);
     }
     Some(out)
 }
@@ -781,6 +922,10 @@ fn number_pairs(obj: &PdfObject) -> Option<Vec<[f64; 2]>> {
         return None;
     }
     Some(nums.chunks(2).map(|c| [c[0], c[1]]).collect())
+}
+
+fn ordered_pairs(pairs: &[[f64; 2]]) -> bool {
+    pairs.iter().all(|[min, max]| min <= max)
 }
 
 #[cfg(test)]
@@ -821,6 +966,27 @@ mod tests {
         assert!((mid[0] - 0.5).abs() < 1e-9 && (mid[1] - 0.25).abs() < 1e-9);
         // domain clamp
         assert_eq!(f.eval(&[2.0]).unwrap(), vec![1.0, 0.5, 0.25]);
+    }
+
+    #[test]
+    fn range_less_exponential_rejects_non_finite_results() {
+        let make = |domain: [f64; 2], exponent: f64| {
+            dict(vec![
+                ("FunctionType", PdfObject::Integer(2)),
+                ("Domain", arr(&domain)),
+                ("C0", arr(&[0.0])),
+                ("C1", arr(&[1.0])),
+                ("N", PdfObject::Real(exponent)),
+            ])
+        };
+
+        let mut r = no_resolve();
+        let reciprocal = PdfFunction::parse(&make([0.0, 1.0], -1.0), None, &mut r).unwrap();
+        assert!(reciprocal.eval(&[0.0]).is_none());
+
+        let mut r = no_resolve();
+        let fractional = PdfFunction::parse(&make([-1.0, 1.0], 0.5), None, &mut r).unwrap();
+        assert!(fractional.eval(&[-1.0]).is_none());
     }
 
     #[test]
@@ -972,5 +1138,55 @@ mod tests {
         assert!(PdfFunction::parse(&d0, None, &mut r).is_none());
         // type 0 with too few samples for the grid
         assert!(PdfFunction::parse(&d0, Some(&[1]), &mut r).is_none());
+
+        // Grid-size arithmetic is checked instead of overflowing on hostile
+        // dimensions, and dimensions above the supported interpolation limit
+        // are rejected rather than silently ignored.
+        let huge = dict(vec![
+            ("FunctionType", PdfObject::Integer(0)),
+            ("Domain", arr(&[0.0, 1.0, 0.0, 1.0])),
+            ("Range", arr(&[0.0, 1.0])),
+            ("Size", arr(&[u32::MAX as f64, u32::MAX as f64])),
+            ("BitsPerSample", PdfObject::Integer(32)),
+        ]);
+        assert!(PdfFunction::parse(&huge, Some(&[]), &mut r).is_none());
+
+        let too_many_dims = dict(vec![
+            ("FunctionType", PdfObject::Integer(0)),
+            ("Domain", arr(&[0.0, 1.0].repeat(17))),
+            ("Range", arr(&[0.0, 1.0])),
+            ("Size", arr(&[1.0; 17])),
+            ("BitsPerSample", PdfObject::Integer(8)),
+        ]);
+        assert!(PdfFunction::parse(&too_many_dims, Some(&[0]), &mut r).is_none());
+    }
+
+    #[test]
+    fn sampled_function_does_not_retain_trailing_stream_bytes() {
+        let d = dict(vec![
+            ("FunctionType", PdfObject::Integer(0)),
+            ("Domain", arr(&[0.0, 1.0])),
+            ("Range", arr(&[0.0, 1.0])),
+            ("Size", arr(&[2.0])),
+            ("BitsPerSample", PdfObject::Integer(8)),
+        ]);
+        let mut r = no_resolve();
+        let f = PdfFunction::parse(&d, Some(&[0, 255, 1, 2, 3, 4]), &mut r).unwrap();
+        let FunctionKind::Sampled { samples, .. } = &f.kind else {
+            panic!("expected sampled function");
+        };
+        assert_eq!(samples, &[0, 255]);
+    }
+
+    #[test]
+    fn postscript_integer_overflow_is_an_eval_error() {
+        let d = dict(vec![
+            ("FunctionType", PdfObject::Integer(4)),
+            ("Domain", arr(&[0.0, 1.0])),
+            ("Range", arr(&[0.0, 1.0])),
+        ]);
+        let mut r = no_resolve();
+        let f = PdfFunction::parse(&d, Some(b"{ -9223372036854775808 -1 idiv }"), &mut r).unwrap();
+        assert!(f.eval(&[0.5]).is_none());
     }
 }

@@ -67,10 +67,17 @@ pub struct LabParams {
 /// Coefficients: Mozilla pdf.js `DeviceCmykCS` (Apache-2.0), in turn the Adobe
 /// approximation.
 pub fn cmyk_to_rgb(c: f64, m: f64, y: f64, k: f64) -> (f64, f64, f64) {
-    let c = c.clamp(0.0, 1.0);
-    let m = m.clamp(0.0, 1.0);
-    let y = y.clamp(0.0, 1.0);
-    let k = k.clamp(0.0, 1.0);
+    let unit = |value: f64| {
+        if value.is_finite() {
+            value.clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    };
+    let c = unit(c);
+    let m = unit(m);
+    let y = unit(y);
+    let k = unit(k);
 
     // Each channel is a quadratic form over (c, m, y, k), evaluated in 0..255.
     let r = 255.0
@@ -140,18 +147,22 @@ pub fn lab_to_rgb(l: f64, a: f64, b: f64, white_point: [f64; 3]) -> (f64, f64, f
     let x = white_point[0] * g(fx);
     let y = white_point[1] * g(fy);
     let z = white_point[2] * g(fz);
+    let (x, y, z) = adapt_xyz_to_d65(x, y, z, white_point);
     xyz_to_srgb(x, y, z)
 }
 
-/// Convert CIE XYZ (D50-ish white) to gamma-encoded sRGB, clamped to 0..1.
+/// Convert CIE XYZ with a D65 white point to gamma-encoded sRGB, clamped to 0..1.
 pub fn xyz_to_srgb(x: f64, y: f64, z: f64) -> (f64, f64, f64) {
-    // sRGB D65 matrix; the small white-point mismatch vs D50 sources is
-    // acceptable without full chromatic adaptation.
+    // IEC 61966-2-1 sRGB D65 matrix.
     let r = 3.2406 * x - 1.5372 * y - 0.4986 * z;
     let g = -0.9689 * x + 1.8758 * y + 0.0415 * z;
     let b = 0.0557 * x - 0.2040 * y + 1.0570 * z;
     let enc = |c: f64| {
-        let c = c.clamp(0.0, 1.0);
+        let c = if c.is_finite() {
+            c.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
         if c <= 0.0031308 {
             12.92 * c
         } else {
@@ -159,6 +170,31 @@ pub fn xyz_to_srgb(x: f64, y: f64, z: f64) -> (f64, f64, f64) {
         }
     };
     (enc(r), enc(g), enc(b))
+}
+
+/// Bradford-adapt source-white XYZ to the D65 white used by sRGB.
+fn adapt_xyz_to_d65(x: f64, y: f64, z: f64, source_white: [f64; 3]) -> (f64, f64, f64) {
+    const D65: [f64; 3] = [0.95047, 1.0, 1.08883];
+    let cone = |[x, y, z]: [f64; 3]| {
+        [
+            0.8951 * x + 0.2664 * y - 0.1614 * z,
+            -0.7502 * x + 1.7135 * y + 0.0367 * z,
+            0.0389 * x - 0.0685 * y + 1.0296 * z,
+        ]
+    };
+    let src = cone(source_white);
+    if src.iter().any(|v| !v.is_finite() || v.abs() < f64::EPSILON) {
+        return (x, y, z);
+    }
+    let dst = cone(D65);
+    let l = (0.8951 * x + 0.2664 * y - 0.1614 * z) * dst[0] / src[0];
+    let m = (-0.7502 * x + 1.7135 * y + 0.0367 * z) * dst[1] / src[1];
+    let s = (0.0389 * x - 0.0685 * y + 1.0296 * z) * dst[2] / src[2];
+    (
+        0.986_992_9 * l - 0.147_054_3 * m + 0.159_962_7 * s,
+        0.432_305_3 * l + 0.518_360_3 * m + 0.049_291_2 * s,
+        -0.008_528_7 * l + 0.040_042_8 * m + 0.968_486_7 * s,
+    )
 }
 
 #[cfg(test)]
@@ -206,5 +242,15 @@ mod tests {
             cmyk_to_rgb(2.0, -1.0, 0.5, 5.0),
             cmyk_to_rgb(1.0, 0.0, 0.5, 1.0)
         );
+        assert_eq!(
+            cmyk_to_rgb(f64::NAN, 0.0, 0.0, 0.0),
+            cmyk_to_rgb(0.0, 0.0, 0.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn lab_d50_neutral_white_adapts_to_srgb_white() {
+        let (r, g, b) = lab_to_rgb(100.0, 0.0, 0.0, [0.9642, 1.0, 0.8249]);
+        assert!(r > 0.999 && g > 0.999 && b > 0.999, "got {r}, {g}, {b}");
     }
 }

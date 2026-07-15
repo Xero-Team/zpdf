@@ -15,6 +15,9 @@ use moxcms::{
 };
 use zpdf_core::{Error, ObjectId, Result};
 
+const MAX_ICC_PROFILE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_ICC_CACHE_ENTRIES: usize = 1024;
+
 /// PDF colour rendering intent (ISO 32000-1 §8.6.5.8) — the `ri` operator,
 /// ExtGState `/RI`, and image `/Intent`. Defaults to media-relative
 /// colorimetric, the PDF default.
@@ -73,6 +76,12 @@ impl IccTransform {
     /// CMYK (4). Anything else — including malformed or truncated profiles —
     /// is an error so the caller can keep its `/N`-based fallback.
     pub fn from_profile_bytes(data: &[u8], intent: RenderIntent) -> Result<Self> {
+        if data.len() < 128 || data.len() > MAX_ICC_PROFILE_BYTES {
+            return Err(Error::StreamDecode(format!(
+                "ICC profile size {} is outside 128..={MAX_ICC_PROFILE_BYTES}",
+                data.len()
+            )));
+        }
         let profile = ColorProfile::new_from_slice(data)
             .map_err(|e| Error::StreamDecode(format!("ICC profile parse failed: {e:?}")))?;
         let (layout, ncomp) = match profile.color_space {
@@ -92,28 +101,31 @@ impl IccTransform {
         // Try the requested PDF rendering intent first, then fall back through
         // media-relative colorimetric and perceptual — the ICC-mandated order
         // for LUT profiles that only carry a subset of A2B tables.
-        let executor = [
+        let intents = [
             intent.to_moxcms(),
             RenderingIntent::RelativeColorimetric,
             RenderingIntent::Perceptual,
-        ]
-        .into_iter()
-        .find_map(|intent| {
-            profile
-                .create_transform_8bit(
-                    layout,
-                    &srgb,
-                    Layout::Rgb,
-                    TransformOptions {
-                        rendering_intent: intent,
-                        ..TransformOptions::default()
-                    },
-                )
-                .ok()
-        })
-        .ok_or_else(|| {
-            Error::StreamDecode("ICC profile cannot be connected to sRGB".to_string())
-        })?;
+        ];
+        let executor = intents
+            .into_iter()
+            .enumerate()
+            .filter(|(index, candidate)| !intents[..*index].contains(candidate))
+            .find_map(|(_, intent)| {
+                profile
+                    .create_transform_8bit(
+                        layout,
+                        &srgb,
+                        Layout::Rgb,
+                        TransformOptions {
+                            rendering_intent: intent,
+                            ..TransformOptions::default()
+                        },
+                    )
+                    .ok()
+            })
+            .ok_or_else(|| {
+                Error::StreamDecode("ICC profile cannot be connected to sRGB".to_string())
+            })?;
         Ok(Self { ncomp, executor })
     }
 
@@ -162,7 +174,10 @@ impl IccTransform {
     pub fn palette_to_rgb(&self, palette: &[u8]) -> Vec<u8> {
         let n = self.components();
         let entries = palette.len() / n;
-        let mut out = vec![0u8; entries * 3];
+        let Some(output_len) = entries.checked_mul(3) else {
+            return Vec::new();
+        };
+        let mut out = vec![0u8; output_len];
         if let Err(e) = self.slice_to_rgb(&palette[..entries * n], &mut out) {
             tracing::warn!("ICC palette conversion failed: {e}");
         }
@@ -193,6 +208,15 @@ impl IccCache {
         intent: RenderIntent,
         data: impl FnOnce() -> Option<Vec<u8>>,
     ) -> Option<Arc<IccTransform>> {
+        if let Some(cached) = self.transforms.get(&(id, intent)) {
+            return cached.clone();
+        }
+        if self.transforms.len() >= MAX_ICC_CACHE_ENTRIES {
+            tracing::warn!(
+                "ICC transform cache reached {MAX_ICC_CACHE_ENTRIES} entries; ignoring profile {id}"
+            );
+            return None;
+        }
         self.transforms
             .entry((id, intent))
             .or_insert_with(|| {
@@ -384,6 +408,25 @@ mod tests {
             .unwrap();
         let b = cache.get_or_build(id, ri(), || unreachable!()).unwrap();
         assert!(Arc::ptr_eq(&a, &b));
+    }
+
+    #[test]
+    fn cache_entry_count_is_bounded() {
+        let mut cache = IccCache::new();
+        for number in 0..MAX_ICC_CACHE_ENTRIES {
+            assert!(cache
+                .get_or_build(ObjectId(number as u32, 0), ri(), || None)
+                .is_none());
+        }
+        let mut called = false;
+        assert!(cache
+            .get_or_build(ObjectId(u32::MAX, 0), ri(), || {
+                called = true;
+                Some(SRGB.to_vec())
+            })
+            .is_none());
+        assert!(!called);
+        assert_eq!(cache.transforms.len(), MAX_ICC_CACHE_ENTRIES);
     }
 
     #[test]
