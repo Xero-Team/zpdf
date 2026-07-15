@@ -17,6 +17,15 @@ pub enum ContentToken {
 /// this only exists to bound recursion so adversarial deeply-nested input cannot
 /// overflow the native stack.
 const MAX_CONTENT_DEPTH: u32 = 200;
+/// Aggregate number of objects retained inside array/dictionary operands. This
+/// closes the gap left by an operand-count limit: one operand can otherwise be
+/// an array containing millions of heap-allocated objects.
+const MAX_RETAINED_OBJECTS: usize = 100_000;
+/// Names and operators are identifiers, not bulk data. Bound their owned copy
+/// while still scanning the full token so malformed input always advances.
+const MAX_CONTENT_NAME_BYTES: usize = 64 * 1024;
+const MAX_CONTENT_OPERATOR_BYTES: usize = 256;
+const MAX_CONTENT_STRING_BYTES: usize = 16 * 1024 * 1024;
 
 /// Tokenizer for PDF content streams.
 /// Content streams contain sequences of: operand* operator
@@ -25,6 +34,8 @@ pub struct ContentTokenizer<'a> {
     pos: usize,
     /// Current array/dict nesting depth (see `MAX_CONTENT_DEPTH`).
     depth: u32,
+    /// Objects retained by nested arrays/dicts over this tokenizer's lifetime.
+    retained_objects: usize,
 }
 
 impl<'a> ContentTokenizer<'a> {
@@ -33,6 +44,7 @@ impl<'a> ContentTokenizer<'a> {
             data,
             pos: 0,
             depth: 0,
+            retained_objects: 0,
         }
     }
 
@@ -42,6 +54,24 @@ impl<'a> ContentTokenizer<'a> {
 
     fn is_eof(&self) -> bool {
         self.pos >= self.data.len()
+    }
+
+    fn starts_keyword(&self, keyword: &[u8]) -> bool {
+        let Some(rest) = self.data.get(self.pos..) else {
+            return false;
+        };
+        rest.starts_with(keyword)
+            && rest
+                .get(keyword.len())
+                .is_none_or(|&b| is_whitespace(b) || is_delimiter(b))
+    }
+
+    fn retain_slot(&mut self) -> bool {
+        if self.retained_objects >= MAX_RETAINED_OBJECTS {
+            return false;
+        }
+        self.retained_objects += 1;
+        true
     }
 
     fn skip_whitespace(&mut self) {
@@ -96,15 +126,15 @@ impl<'a> ContentTokenizer<'a> {
                 let arr = self.read_array();
                 Some(ContentToken::Operand(PdfObject::Array(arr)))
             }
-            b't' if self.data[self.pos..].starts_with(b"true") => {
+            b't' if self.starts_keyword(b"true") => {
                 self.pos += 4;
                 Some(ContentToken::Operand(PdfObject::Bool(true)))
             }
-            b'f' if self.data[self.pos..].starts_with(b"false") => {
+            b'f' if self.starts_keyword(b"false") => {
                 self.pos += 5;
                 Some(ContentToken::Operand(PdfObject::Bool(false)))
             }
-            b'n' if self.data[self.pos..].starts_with(b"null") => {
+            b'n' if self.starts_keyword(b"null") => {
                 self.pos += 4;
                 Some(ContentToken::Operand(PdfObject::Null))
             }
@@ -140,7 +170,12 @@ impl<'a> ContentTokenizer<'a> {
         }
         let s = std::str::from_utf8(&self.data[start..self.pos]).unwrap_or("0");
         if has_dot {
-            PdfObject::Real(s.parse().unwrap_or(0.0))
+            PdfObject::Real(
+                s.parse::<f64>()
+                    .ok()
+                    .filter(|n| n.is_finite())
+                    .unwrap_or(0.0),
+            )
         } else {
             PdfObject::Integer(s.parse().unwrap_or(0))
         }
@@ -156,7 +191,7 @@ impl<'a> ContentTokenizer<'a> {
             self.pos += 1;
         }
         let raw = &self.data[start..self.pos];
-        PdfName::new(String::from_utf8_lossy(raw).into_owned())
+        PdfName::new(decode_name(&raw[..raw.len().min(MAX_CONTENT_NAME_BYTES)]))
     }
 
     fn read_literal_string(&mut self) -> PdfString {
@@ -168,27 +203,27 @@ impl<'a> ContentTokenizer<'a> {
             match b {
                 b'(' => {
                     depth += 1;
-                    buf.push(b'(');
+                    push_string_byte(&mut buf, b'(');
                 }
                 b')' => {
                     depth -= 1;
                     if depth == 0 {
                         break;
                     }
-                    buf.push(b')');
+                    push_string_byte(&mut buf, b')');
                 }
                 b'\\' => {
                     if let Some(&esc) = self.data.get(self.pos) {
                         self.pos += 1;
                         match esc {
-                            b'n' => buf.push(b'\n'),
-                            b'r' => buf.push(b'\r'),
-                            b't' => buf.push(b'\t'),
-                            b'b' => buf.push(0x08),
-                            b'f' => buf.push(0x0c),
-                            b'(' => buf.push(b'('),
-                            b')' => buf.push(b')'),
-                            b'\\' => buf.push(b'\\'),
+                            b'n' => push_string_byte(&mut buf, b'\n'),
+                            b'r' => push_string_byte(&mut buf, b'\r'),
+                            b't' => push_string_byte(&mut buf, b'\t'),
+                            b'b' => push_string_byte(&mut buf, 0x08),
+                            b'f' => push_string_byte(&mut buf, 0x0c),
+                            b'(' => push_string_byte(&mut buf, b'('),
+                            b')' => push_string_byte(&mut buf, b')'),
+                            b'\\' => push_string_byte(&mut buf, b'\\'),
                             // Line continuation: a backslash before an EOL is elided.
                             b'\n' => {}
                             b'\r' => {
@@ -208,13 +243,13 @@ impl<'a> ContentTokenizer<'a> {
                                         _ => break,
                                     }
                                 }
-                                buf.push(val as u8);
+                                push_string_byte(&mut buf, val as u8);
                             }
-                            _ => buf.push(esc),
+                            _ => push_string_byte(&mut buf, esc),
                         }
                     }
                 }
-                _ => buf.push(b),
+                _ => push_string_byte(&mut buf, b),
             }
         }
         PdfString::new(buf)
@@ -241,13 +276,13 @@ impl<'a> ContentTokenizer<'a> {
             match high {
                 None => high = Some(nibble),
                 Some(h) => {
-                    buf.push((h << 4) | nibble);
+                    push_string_byte(&mut buf, (h << 4) | nibble);
                     high = None;
                 }
             }
         }
         if let Some(h) = high {
-            buf.push(h << 4);
+            push_string_byte(&mut buf, h << 4);
         }
         PdfString::new(buf)
     }
@@ -272,7 +307,9 @@ impl<'a> ContentTokenizer<'a> {
                 break;
             }
             if let Some(ContentToken::Operand(obj)) = self.next_token() {
-                items.push(obj);
+                if self.retain_slot() {
+                    items.push(obj);
+                }
             }
         }
         self.depth -= 1;
@@ -296,9 +333,21 @@ impl<'a> ContentTokenizer<'a> {
             if self.is_eof() {
                 break;
             }
+            if self.peek() != Some(b'/') {
+                // A dictionary key must be a name. Consume one malformed token
+                // and keep looking instead of manufacturing a key from it.
+                let before = self.pos;
+                let _ = self.next_token();
+                if self.pos == before {
+                    self.pos += 1;
+                }
+                continue;
+            }
             let key = self.read_name();
             if let Some(ContentToken::Operand(val)) = self.next_token() {
-                dict.insert(key, val);
+                if self.retain_slot() {
+                    dict.insert(key, val);
+                }
             }
         }
         self.depth -= 1;
@@ -313,7 +362,10 @@ impl<'a> ContentTokenizer<'a> {
             }
             self.pos += 1;
         }
-        String::from_utf8_lossy(&self.data[start..self.pos]).into_owned()
+        let end = start
+            .saturating_add(MAX_CONTENT_OPERATOR_BYTES)
+            .min(self.pos);
+        String::from_utf8_lossy(&self.data[start..end]).into_owned()
     }
 
     /// Parse the body of an inline image after the `BI` operator: the parameter
@@ -334,7 +386,9 @@ impl<'a> ContentTokenizer<'a> {
                 let key = self.read_name();
                 self.skip_whitespace();
                 if let Some(ContentToken::Operand(val)) = self.next_token() {
-                    dict.insert(key, val);
+                    if self.retain_slot() {
+                        dict.insert(key, val);
+                    }
                 }
             } else {
                 let op = self.read_operator();
@@ -473,7 +527,50 @@ impl<'a> Iterator for ContentTokenizer<'a> {
     type Item = ContentToken;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.next_token()
+        loop {
+            let before = self.pos;
+            if let Some(token) = self.next_token() {
+                return Some(token);
+            }
+            if self.is_eof() {
+                return None;
+            }
+            if self.pos == before {
+                self.pos += 1;
+            }
+        }
+    }
+}
+
+fn decode_name(raw: &[u8]) -> String {
+    let mut decoded = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        if raw[i] == b'#' && i + 2 < raw.len() {
+            if let (Some(high), Some(low)) = (hex_digit(raw[i + 1]), hex_digit(raw[i + 2])) {
+                decoded.push((high << 4) | low);
+                i += 3;
+                continue;
+            }
+        }
+        decoded.push(raw[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
+fn push_string_byte(buffer: &mut Vec<u8>, byte: u8) {
+    if buffer.len() < MAX_CONTENT_STRING_BYTES {
+        buffer.push(byte);
+    }
+}
+
+fn hex_digit(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -593,5 +690,52 @@ mod tests {
         let tokens: Vec<_> = ContentTokenizer::new(data).collect();
         // 100, 200, m, 300, 400, l, S = 7 tokens
         assert_eq!(tokens.len(), 7);
+    }
+
+    #[test]
+    fn iterator_recovers_after_stray_bytes() {
+        let tokens: Vec<_> = ContentTokenizer::new(b"q @ Q").collect();
+        assert_eq!(tokens.len(), 2);
+        assert!(matches!(&tokens[0], ContentToken::Operator(op) if op == "q"));
+        assert!(matches!(&tokens[1], ContentToken::Operator(op) if op == "Q"));
+    }
+
+    #[test]
+    fn keywords_require_token_boundaries() {
+        let tokens: Vec<_> = ContentTokenizer::new(b"truecolor falsehood nullify").collect();
+        assert!(tokens
+            .iter()
+            .all(|t| matches!(t, ContentToken::Operator(_))));
+    }
+
+    #[test]
+    fn name_hex_escapes_are_decoded() {
+        let tokens: Vec<_> = ContentTokenizer::new(b"/F#31 12 Tf").collect();
+        assert!(matches!(
+            &tokens[0],
+            ContentToken::Operand(PdfObject::Name(name)) if name.as_str() == "F1"
+        ));
+    }
+
+    #[test]
+    fn overflowing_real_degrades_to_zero() {
+        let data = format!("{}.0", "9".repeat(400));
+        let token = ContentTokenizer::new(data.as_bytes()).next().unwrap();
+        assert!(matches!(token, ContentToken::Operand(PdfObject::Real(0.0))));
+    }
+
+    #[test]
+    fn nested_operand_retention_is_bounded() {
+        let mut data = Vec::with_capacity((MAX_RETAINED_OBJECTS + 10) * 2 + 2);
+        data.push(b'[');
+        for _ in 0..MAX_RETAINED_OBJECTS + 10 {
+            data.extend_from_slice(b"0 ");
+        }
+        data.push(b']');
+        let token = ContentTokenizer::new(&data).next().unwrap();
+        let ContentToken::Operand(PdfObject::Array(items)) = token else {
+            panic!("expected array operand");
+        };
+        assert_eq!(items.len(), MAX_RETAINED_OBJECTS);
     }
 }

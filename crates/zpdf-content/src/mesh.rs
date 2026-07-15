@@ -173,7 +173,15 @@ pub(crate) fn decode_mesh(
     p: &MeshParams,
     resolve: &mut dyn FnMut(&[f64]) -> [f32; 3],
 ) -> Vec<STri> {
-    if p.decode.len() < 4 + 2 * p.n_color || p.bits_coord == 0 || p.bits_comp == 0 {
+    let Some(required_decode) = p.n_color.checked_mul(2).and_then(|n| n.checked_add(4)) else {
+        return Vec::new();
+    };
+    if p.n_color == 0
+        || p.n_color > 32
+        || p.decode.len() < required_decode
+        || !(1..=32).contains(&p.bits_coord)
+        || !(1..=32).contains(&p.bits_comp)
+    {
         return Vec::new();
     }
     // Validate decode values are finite (reject NaN/Infinity from malformed PDFs)
