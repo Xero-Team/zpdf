@@ -95,6 +95,8 @@ struct ClipEntry {
     /// `None` for an empty/degenerate clip path (still occupies a depth level).
     range: Option<MeshRange>,
     ref_value: u32,
+    /// False once the Stencil8 representable depth (255) is saturated.
+    advanced: bool,
 }
 
 /// Accumulates geometry + ops for one page.
@@ -116,9 +118,29 @@ pub struct PageRecorder {
     pub ops: Vec<PageOp>,
     clip_stack: Vec<ClipEntry>,
     clip_depth: u32,
+    /// `None` keeps the standalone recorder utility unlimited; renderers set a
+    /// concrete document-derived limit at page creation.
+    max_blend_depth: Option<usize>,
+    /// Logical outer depth while recording a soft-mask sub-list.
+    blend_depth_offset: usize,
+    blend_depth: usize,
+    /// Groups omitted after reaching the depth cap. Matching pops consume this
+    /// counter instead of closing a real outer group.
+    skipped_blend_depth: usize,
 }
 
 impl PageRecorder {
+    pub fn with_max_blend_depth(mut self, max_depth: usize) -> Self {
+        self.max_blend_depth = Some(max_depth);
+        self
+    }
+
+    pub fn can_push_blend(&self) -> bool {
+        self.skipped_blend_depth == 0
+            && self.blend_depth_offset.saturating_add(self.blend_depth)
+                < self.max_blend_depth.unwrap_or(usize::MAX)
+    }
+
     fn append(&mut self, mesh: Mesh) -> MeshRange {
         // Indices are rebased to absolute (base_vertex baked in) so every draw
         // can use base_vertex 0 uniformly. This makes a contiguous run of
@@ -154,15 +176,22 @@ impl PageRecorder {
 
     /// Record an image quad (4 textured vertices) at the current clip depth.
     pub fn add_image(&mut self, quad: [TexturedVertex; 4], image_id: u32) {
-        let base_vertex = self.tex_vertices.len() as i32;
+        let base_vertex = self.tex_vertices.len() as u32;
         let first_index = self.tex_indices.len() as u32;
         self.tex_vertices.extend_from_slice(&quad);
-        self.tex_indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+        self.tex_indices.extend_from_slice(&[
+            base_vertex,
+            base_vertex + 1,
+            base_vertex + 2,
+            base_vertex,
+            base_vertex + 2,
+            base_vertex + 3,
+        ]);
         self.ops.push(PageOp::Image {
             range: MeshRange {
                 first_index,
                 index_count: 6,
-                base_vertex,
+                base_vertex: 0,
             },
             image_id,
             clip_ref: self.clip_depth,
@@ -231,6 +260,17 @@ impl PageRecorder {
     /// Common tail of the clip-push variants: stamp the (optional) mesh as a clip
     /// path and advance the clip depth (an empty mesh still occupies a level).
     fn push_clip_range(&mut self, range: Option<MeshRange>) {
+        // Stencil8 can encode references 0..=255. Saturate deeper malformed
+        // nesting instead of wrapping the reference to zero and leaking draws.
+        if self.clip_depth == u8::MAX as u32 {
+            self.clip_stack.push(ClipEntry {
+                range: None,
+                ref_value: self.clip_depth,
+                advanced: false,
+            });
+            tracing::warn!("GPU clip nesting exceeds Stencil8 capacity; ignoring deeper clip");
+            return;
+        }
         let ref_value = self.clip_depth;
         if let Some(r) = range {
             self.ops.push(PageOp::StampClip {
@@ -238,7 +278,11 @@ impl PageRecorder {
                 ref_value,
             });
         }
-        self.clip_stack.push(ClipEntry { range, ref_value });
+        self.clip_stack.push(ClipEntry {
+            range,
+            ref_value,
+            advanced: true,
+        });
         self.clip_depth += 1;
     }
 
@@ -247,7 +291,10 @@ impl PageRecorder {
     /// MSAA boundaries; PDFs nest shallowly so rebuild is cheap. Unbalanced pop
     /// is a no-op (mirrors the CPU).
     pub fn pop_clip(&mut self) {
-        if self.clip_stack.pop().is_none() {
+        let Some(popped) = self.clip_stack.pop() else {
+            return;
+        };
+        if !popped.advanced {
             return;
         }
         self.clip_depth -= 1;
@@ -279,6 +326,16 @@ impl PageRecorder {
     /// Begin a transparency group. The active clips are captured so the group's
     /// fresh layer (and, on pop, the composited result) reproduce the same clip.
     pub fn push_blend(&mut self, mode: BlendMode, alpha: f32, mask: Option<MaskOps>) {
+        if !self.can_push_blend() {
+            if self.skipped_blend_depth == 0 {
+                tracing::warn!(
+                    limit = self.max_blend_depth.unwrap_or(usize::MAX),
+                    "GPU blend-group nesting exceeds configured limit; using passthrough"
+                );
+            }
+            self.skipped_blend_depth = self.skipped_blend_depth.saturating_add(1);
+            return;
+        }
         let clips = self.active_clips();
         self.ops.push(PageOp::PushBlend {
             mode,
@@ -287,12 +344,23 @@ impl PageRecorder {
             mask,
             overprint: None,
         });
+        self.blend_depth += 1;
     }
 
     /// Begin an overprint group (PDF 8.6.7): the next recorded draw renders into
     /// a fresh layer, composited onto the parent with the overprint formula.
     /// Forces the layered render path (like any blend group).
     pub fn push_overprint(&mut self, op: Overprint) {
+        if !self.can_push_blend() {
+            if self.skipped_blend_depth == 0 {
+                tracing::warn!(
+                    limit = self.max_blend_depth.unwrap_or(usize::MAX),
+                    "GPU blend-group nesting exceeds configured limit; using source-over"
+                );
+            }
+            self.skipped_blend_depth = self.skipped_blend_depth.saturating_add(1);
+            return;
+        }
         let clips = self.active_clips();
         self.ops.push(PageOp::PushBlend {
             mode: BlendMode::Normal,
@@ -301,6 +369,7 @@ impl PageRecorder {
             mask: None,
             overprint: Some(op),
         });
+        self.blend_depth += 1;
     }
 
     /// Record a sub-sequence (a soft mask's commands) into the SHARED geometry
@@ -309,18 +378,43 @@ impl PageRecorder {
     /// leak into the page. Returns the mask's ops (which reference the shared
     /// vertex/index buffers, replayed later into a mask layer).
     pub fn record_subops(&mut self, f: impl FnOnce(&mut Self)) -> Vec<PageOp> {
+        let nested_offset = self
+            .blend_depth_offset
+            .saturating_add(self.blend_depth)
+            .saturating_add(1);
         let saved_ops = std::mem::take(&mut self.ops);
         let saved_stack = std::mem::take(&mut self.clip_stack);
         let saved_depth = std::mem::replace(&mut self.clip_depth, 0);
+        let saved_blend_depth = std::mem::replace(&mut self.blend_depth, 0);
+        let saved_blend_offset = std::mem::replace(&mut self.blend_depth_offset, nested_offset);
+        let saved_skipped_blend_depth = std::mem::replace(&mut self.skipped_blend_depth, 0);
         f(self);
+        self.close_open_blends();
         let sub = std::mem::replace(&mut self.ops, saved_ops);
         self.clip_stack = saved_stack;
         self.clip_depth = saved_depth;
+        self.blend_depth = saved_blend_depth;
+        self.blend_depth_offset = saved_blend_offset;
+        self.skipped_blend_depth = saved_skipped_blend_depth;
         sub
     }
 
     pub fn pop_blend(&mut self) {
+        if self.skipped_blend_depth > 0 {
+            self.skipped_blend_depth -= 1;
+            return;
+        }
+        if self.blend_depth == 0 {
+            return;
+        }
         self.ops.push(PageOp::PopBlend);
+        self.blend_depth -= 1;
+    }
+
+    pub fn close_open_blends(&mut self) {
+        while self.blend_depth > 0 || self.skipped_blend_depth > 0 {
+            self.pop_blend();
+        }
     }
 
     pub fn has_blend_groups(&self) -> bool {
@@ -418,6 +512,54 @@ mod tests {
     }
 
     #[test]
+    fn blend_stack_ignores_extra_pops_and_closes_open_groups() {
+        let mut r = PageRecorder::default();
+        r.pop_blend();
+        assert!(r.ops.is_empty());
+        r.push_blend(BlendMode::Normal, 1.0, None);
+        r.close_open_blends();
+        assert_eq!(r.blend_depth, 0);
+        assert!(matches!(
+            r.ops.as_slice(),
+            [PageOp::PushBlend { .. }, PageOp::PopBlend]
+        ));
+    }
+
+    #[test]
+    fn blend_depth_limit_skips_nested_groups_without_popping_outer_group() {
+        let mut r = PageRecorder::default().with_max_blend_depth(1);
+        r.push_blend(BlendMode::Normal, 1.0, None);
+        r.push_blend(BlendMode::Multiply, 1.0, None);
+        assert_eq!(r.blend_depth, 1);
+        assert_eq!(r.skipped_blend_depth, 1);
+        assert_eq!(
+            r.ops
+                .iter()
+                .filter(|op| matches!(op, PageOp::PushBlend { .. }))
+                .count(),
+            1
+        );
+        r.pop_blend();
+        assert_eq!(r.blend_depth, 1);
+        assert_eq!(r.skipped_blend_depth, 0);
+        r.pop_blend();
+        assert_eq!(r.blend_depth, 0);
+        assert!(matches!(r.ops.last(), Some(PageOp::PopBlend)));
+    }
+
+    #[test]
+    fn soft_mask_subops_count_toward_the_blend_depth_limit() {
+        let mut r = PageRecorder::default().with_max_blend_depth(1);
+        assert!(r.can_push_blend());
+        let sub = r.record_subops(|nested| {
+            assert!(!nested.can_push_blend());
+            nested.push_blend(BlendMode::Normal, 1.0, None);
+        });
+        assert!(sub.is_empty());
+        assert!(r.can_push_blend());
+    }
+
+    #[test]
     fn empty_clip_path_still_occupies_depth() {
         let mut r = PageRecorder::default();
         r.push_clip(&DlPath::new(), FillRule::NonZero, &map());
@@ -452,5 +594,40 @@ mod tests {
             }
             _ => panic!("expected a merged Draw op"),
         }
+    }
+
+    #[test]
+    fn repeated_image_quads_use_absolute_indices_and_batch() {
+        let v = TexturedVertex {
+            pos: [0.0, 0.0],
+            uv: [0.0, 0.0],
+            color: [1.0; 4],
+        };
+        let mut r = PageRecorder::default();
+        r.add_image([v; 4], 7);
+        r.add_image([v; 4], 7);
+        assert_eq!(r.tex_indices, vec![0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7]);
+        let batched = crate::batch::batch_ops(r.ops);
+        assert_eq!(batched.len(), 1);
+        match &batched[0] {
+            PageOp::Image { range, .. } => {
+                assert_eq!(range.base_vertex, 0);
+                assert_eq!(range.index_count, 12);
+            }
+            _ => panic!("expected a batched image draw"),
+        }
+    }
+
+    #[test]
+    fn clip_depth_saturates_at_stencil8_capacity() {
+        let mut r = PageRecorder::default();
+        for _ in 0..300 {
+            r.push_clip(&DlPath::new(), FillRule::NonZero, &map());
+        }
+        assert_eq!(r.clip_depth, u8::MAX as u32);
+        for _ in 0..300 {
+            r.pop_clip();
+        }
+        assert_eq!(r.clip_depth, 0);
     }
 }

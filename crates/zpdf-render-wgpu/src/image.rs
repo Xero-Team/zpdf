@@ -37,6 +37,11 @@ pub fn image_quad(iw: f32, ih: f32, tm: &Matrix, map: &PageMap, alpha: f32) -> [
     );
 
     let pt = |ix: f32, iy: f32| [t_sx * ix + t_kx * iy + t_tx, t_ky * ix + t_sy * iy + t_ty];
+    let alpha = if alpha.is_finite() {
+        alpha.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
     let color = [1.0, 1.0, 1.0, alpha];
     [
         TexturedVertex {
@@ -60,6 +65,24 @@ pub fn image_quad(iw: f32, ih: f32, tm: &Matrix, map: &PageMap, alpha: f32) -> [
             color,
         },
     ]
+}
+
+pub fn is_valid_decoded_image(img: &DecodedImage) -> bool {
+    img.width > 0
+        && img.height > 0
+        && (img.width as usize)
+            .checked_mul(img.height as usize)
+            .and_then(|n| n.checked_mul(4))
+            == Some(img.data.len())
+}
+
+pub fn is_safe_quad(quad: &[TexturedVertex; 4]) -> bool {
+    quad.iter().all(|v| {
+        v.pos[0].is_finite()
+            && v.pos[1].is_finite()
+            && v.pos[0].abs() <= 1_000_000.0
+            && v.pos[1].abs() <= 1_000_000.0
+    })
 }
 
 /// Upload a decoded image to an `Rgba8Unorm` texture and build its bind group

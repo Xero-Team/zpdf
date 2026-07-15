@@ -51,7 +51,10 @@ impl IncrementalWriter {
         if unique.is_empty() {
             return Ok(());
         }
-        if unique.len() >= total {
+        if unique.iter().any(|&index| index >= total) {
+            return Err(invalid_data("page index out of range").into());
+        }
+        if unique.len() == total {
             return Err(invalid_data("cannot delete every page of the document").into());
         }
 
@@ -87,7 +90,7 @@ impl IncrementalWriter {
                 PdfObject::Integer(n) => n,
                 _ => 0,
             };
-            let new_count = (old_count - count_dec[&node]).max(0);
+            let new_count = old_count.saturating_sub(count_dec[&node]).max(0);
             dict.insert(PdfName::new("Count"), PdfObject::Integer(new_count));
             self.overwrite_object(node, PdfObject::Dict(dict));
         }
@@ -197,7 +200,7 @@ impl IncrementalWriter {
         let mut visited = HashSet::new();
         let mut node = start;
         loop {
-            if chain.len() > MAX_TREE_DEPTH {
+            if chain.len() >= MAX_TREE_DEPTH {
                 return Err(invalid_data("page tree too deep").into());
             }
             if !visited.insert(node) {
@@ -236,7 +239,7 @@ impl IncrementalWriter {
         };
         for _ in 0..MAX_TREE_DEPTH {
             if !visited.insert(node) {
-                return Ok(None); // cycle
+                return Err(invalid_data("page tree contains a /Parent cycle").into());
             }
             let dict = self.resolve_current(node)?.as_dict()?.clone();
             if let Some(v) = dict.get(attr) {
@@ -247,6 +250,6 @@ impl IncrementalWriter {
                 _ => return Ok(None),
             }
         }
-        Ok(None)
+        Err(invalid_data("page tree too deep").into())
     }
 }

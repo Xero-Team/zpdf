@@ -19,6 +19,11 @@
 
 use std::collections::HashMap;
 
+const MAX_CMAP_ENTRIES: usize = 65_536;
+const MAX_CMAP_TOKENS: usize = MAX_CMAP_ENTRIES * 4 + 1024;
+const MAX_CMAP_HEX_BYTES: usize = 512;
+const MAX_CMAP_WORD_BYTES: usize = 256;
+
 /// A parsed `/ToUnicode` CMap: maps a character code to its Unicode string.
 #[derive(Debug, Clone, Default)]
 pub struct ToUnicodeMap {
@@ -89,8 +94,17 @@ impl ToUnicodeMap {
     }
 
     fn record_code_length(&mut self, len: u8) {
-        if len > 0 && !self.code_lengths.contains(&len) {
+        if (1..=4).contains(&len) && !self.code_lengths.contains(&len) {
             self.code_lengths.push(len);
+        }
+    }
+
+    fn insert_mapping(&mut self, code: u32, value: String) -> bool {
+        if self.map.len() < MAX_CMAP_ENTRIES || self.map.contains_key(&code) {
+            self.map.insert(code, value);
+            true
+        } else {
+            false
         }
     }
 
@@ -104,11 +118,12 @@ impl ToUnicodeMap {
                     return i + 1;
                 }
                 Token::HexString(lo) => {
-                    // Expect a matching <hi>; record the byte length of <lo>.
-                    self.record_code_length(lo.len() as u8);
                     i += 1;
-                    // Skip the high bound (also a hex string) if present.
-                    if let Some(Token::HexString(_)) = tokens.get(i) {
+                    // Record only a valid, matching one-to-four-byte range.
+                    if let Some(Token::HexString(hi)) = tokens.get(i) {
+                        if lo.len() == hi.len() && (1..=4).contains(&lo.len()) {
+                            self.record_code_length(lo.len() as u8);
+                        }
                         i += 1;
                     }
                 }
@@ -133,6 +148,13 @@ impl ToUnicodeMap {
                     return i + 1;
                 }
                 Token::HexString(src) => {
+                    if !(1..=4).contains(&src.len()) {
+                        i += 1;
+                        if matches!(tokens.get(i), Some(Token::HexString(_) | Token::Name(_))) {
+                            i += 1;
+                        }
+                        continue;
+                    }
                     let code = bytes_to_code(src);
                     i += 1;
                     // The destination follows; it is usually a hex string, but
@@ -140,7 +162,7 @@ impl ToUnicodeMap {
                     match tokens.get(i) {
                         Some(Token::HexString(dst)) => {
                             if let Some(s) = utf16be_to_string(dst) {
-                                self.map.insert(code, s);
+                                self.insert_mapping(code, s);
                             }
                             i += 1;
                         }
@@ -170,11 +192,17 @@ impl ToUnicodeMap {
                     return i + 1;
                 }
                 Token::HexString(lo) => {
+                    if !(1..=4).contains(&lo.len()) {
+                        return i + 1;
+                    }
                     let lo_code = bytes_to_code(lo);
                     i += 1;
                     // Expect <hi>.
                     let hi_code = match tokens.get(i) {
                         Some(Token::HexString(hi)) => {
+                            if hi.len() != lo.len() {
+                                return i + 1;
+                            }
                             let v = bytes_to_code(hi);
                             i += 1;
                             v
@@ -203,7 +231,7 @@ impl ToUnicodeMap {
                                     Token::HexString(dst) => {
                                         if code <= hi_code {
                                             if let Some(s) = utf16be_to_string(dst) {
-                                                self.map.insert(code, s);
+                                                self.insert_mapping(code, s);
                                             }
                                         }
                                         code = code.wrapping_add(1);
@@ -242,6 +270,9 @@ impl ToUnicodeMap {
     /// destination to `lo`, then increment the *last UTF-16 code unit* by one for
     /// each subsequent code (PDF 32000-1:2008 §9.10.3).
     fn assign_bfrange_incrementing(&mut self, lo: u32, hi: u32, dst: &[u8]) {
+        if dst.len() > MAX_CMAP_HEX_BYTES {
+            return;
+        }
         // Work on the destination as UTF-16BE code units.
         let mut units = bytes_to_u16be(dst);
         if units.is_empty() {
@@ -257,7 +288,9 @@ impl ToUnicodeMap {
         for n in 0..limit {
             let code = lo + n;
             if let Some(s) = units_to_string(&units) {
-                self.map.insert(code, s);
+                if !self.insert_mapping(code, s) {
+                    break;
+                }
             }
             // Increment the last code unit, carrying upward if it overflows.
             increment_last_unit(&mut units);
@@ -388,6 +421,9 @@ pub struct CidCMap {
     pub codes_are_unicode: bool,
     /// CID = code (the Identity family; also the lenient fallback).
     pub identity: bool,
+    /// The Unicode CMap uses UTF-16 rather than UCS-2, so a valid surrogate
+    /// pair is one four-byte character code.
+    utf16: bool,
     /// A predefined legacy byte-encoded CMap (`GBpc-EUC`, `GBK-EUC`, `B5pc`,
     /// `90ms-RKSJ`, `KSC-EUC`, …) and the national encoding it uses. For a
     /// *substituted* (non-embedded) font the code is decoded to Unicode via
@@ -448,6 +484,7 @@ impl CidCMap {
             return Some(Self {
                 wmode,
                 codes_are_unicode: true,
+                utf16: name.contains("UTF16"),
                 ..Default::default()
             });
         }
@@ -483,9 +520,16 @@ impl CidCMap {
                     while i + 1 < tokens.len() {
                         match (&tokens[i], &tokens[i + 1]) {
                             (Token::HexString(lo), Token::HexString(hi)) => {
-                                let len = lo.len().clamp(1, 4) as u8;
-                                cmap.codespace
-                                    .push((len, bytes_to_code(lo), bytes_to_code(hi)));
+                                if cmap.codespace.len() < MAX_CMAP_ENTRIES
+                                    && lo.len() == hi.len()
+                                    && (1..=4).contains(&lo.len())
+                                {
+                                    let low = bytes_to_code(lo);
+                                    let high = bytes_to_code(hi);
+                                    if low <= high {
+                                        cmap.codespace.push((lo.len() as u8, low, high));
+                                    }
+                                }
                                 i += 2;
                             }
                             _ => break,
@@ -497,14 +541,21 @@ impl CidCMap {
                     while i + 2 < tokens.len() {
                         match (&tokens[i], &tokens[i + 1], &tokens[i + 2]) {
                             (Token::HexString(lo), Token::HexString(hi), Token::Number(cid)) => {
-                                let len = lo.len().clamp(1, 4) as u8;
-                                let first = ascii_to_u32(cid);
-                                cmap.cid_ranges.push((
-                                    len,
-                                    bytes_to_code(lo),
-                                    bytes_to_code(hi),
-                                    first,
-                                ));
+                                if cmap.cid_ranges.len() < MAX_CMAP_ENTRIES
+                                    && lo.len() == hi.len()
+                                    && (1..=4).contains(&lo.len())
+                                {
+                                    let low = bytes_to_code(lo);
+                                    let high = bytes_to_code(hi);
+                                    if low <= high {
+                                        cmap.cid_ranges.push((
+                                            lo.len() as u8,
+                                            low,
+                                            high,
+                                            ascii_to_u32(cid),
+                                        ));
+                                    }
+                                }
                                 i += 3;
                             }
                             _ => break,
@@ -516,8 +567,13 @@ impl CidCMap {
                     while i + 1 < tokens.len() {
                         match (&tokens[i], &tokens[i + 1]) {
                             (Token::HexString(code), Token::Number(cid)) => {
-                                cmap.cid_chars
-                                    .insert(bytes_to_code(code), ascii_to_u32(cid));
+                                if code.len() <= 4
+                                    && (cmap.cid_chars.len() < MAX_CMAP_ENTRIES
+                                        || cmap.cid_chars.contains_key(&bytes_to_code(code)))
+                                {
+                                    cmap.cid_chars
+                                        .insert(bytes_to_code(code), ascii_to_u32(cid));
+                                }
                                 i += 2;
                             }
                             _ => break,
@@ -534,6 +590,7 @@ impl CidCMap {
                     if let Some(base) = base {
                         cmap.identity |= base.identity;
                         cmap.codes_are_unicode |= base.codes_are_unicode;
+                        cmap.utf16 |= base.utf16;
                     }
                     i += 1;
                 }
@@ -563,6 +620,18 @@ impl CidCMap {
     pub fn next_code(&self, bytes: &[u8]) -> (u32, usize) {
         if bytes.is_empty() {
             return (0, 1);
+        }
+        if self.codes_are_unicode && self.utf16 {
+            let high = u16::from_be_bytes([bytes[0], *bytes.get(1).unwrap_or(&0)]);
+            if (0xD800..=0xDBFF).contains(&high) && bytes.len() >= 4 {
+                let low = u16::from_be_bytes([bytes[2], bytes[3]]);
+                if (0xDC00..=0xDFFF).contains(&low) {
+                    let scalar = 0x1_0000 + ((high as u32 - 0xD800) << 10) + (low as u32 - 0xDC00);
+                    return (scalar, 4);
+                }
+            }
+            let len = bytes.len().min(2);
+            return (bytes_to_code(&bytes[..len]), len);
         }
         if self.codespace.is_empty() {
             let len = bytes.len().min(2);
@@ -598,7 +667,7 @@ impl CidCMap {
         }
         for &(rlen, lo, hi, first) in &self.cid_ranges {
             if rlen == len && code >= lo && code <= hi {
-                return first + (code - lo);
+                return first.checked_add(code - lo).unwrap_or(0);
             }
         }
         if self.identity {
@@ -613,8 +682,7 @@ impl CidCMap {
 fn ascii_to_u32(bytes: &[u8]) -> u32 {
     std::str::from_utf8(bytes)
         .ok()
-        .and_then(|s| s.trim().parse::<f64>().ok())
-        .map(|v| v.max(0.0) as u32)
+        .and_then(|s| s.trim().parse::<u32>().ok())
         .unwrap_or(0)
 }
 
@@ -680,6 +748,9 @@ fn tokenize(data: &[u8]) -> Vec<Token> {
     let n = data.len();
 
     while i < n {
+        if tokens.len() >= MAX_CMAP_TOKENS {
+            break;
+        }
         let b = data[i];
 
         if is_pdf_whitespace(b) {
@@ -746,6 +817,8 @@ fn tokenize(data: &[u8]) -> Vec<Token> {
                 let word = &data[start..i];
                 if word.is_empty() {
                     i += 1; // defensive: never get stuck
+                } else if word.len() > MAX_CMAP_WORD_BYTES {
+                    continue;
                 } else if is_number(word) {
                     tokens.push(Token::Number(word.to_vec()));
                 } else {
@@ -763,7 +836,9 @@ fn tokenize(data: &[u8]) -> Vec<Token> {
 fn read_hex_string(data: &[u8], start: usize) -> (Vec<u8>, usize) {
     let n = data.len();
     let mut i = start;
-    let mut nibbles: Vec<u8> = Vec::new();
+    let mut bytes = Vec::new();
+    let mut high_nibble = None;
+    let mut too_long = false;
 
     while i < n {
         let b = data[i];
@@ -776,24 +851,28 @@ fn read_hex_string(data: &[u8], start: usize) -> (Vec<u8>, usize) {
             continue;
         }
         if let Some(v) = hex_val(b) {
-            nibbles.push(v);
+            if let Some(high) = high_nibble.take() {
+                if bytes.len() < MAX_CMAP_HEX_BYTES {
+                    bytes.push((high << 4) | v);
+                } else {
+                    too_long = true;
+                }
+            } else {
+                high_nibble = Some(v);
+            }
         }
         // Non-hex, non-ws chars inside `<...>` are ignored defensively.
         i += 1;
     }
 
     // Per PDF spec, an odd final nibble is padded with a trailing 0.
-    if nibbles.len() % 2 == 1 {
-        nibbles.push(0);
+    if let Some(high) = high_nibble.filter(|_| !too_long) {
+        bytes.push(high << 4);
     }
 
-    let mut bytes = Vec::with_capacity(nibbles.len() / 2);
-    let mut k = 0;
-    while k + 1 < nibbles.len() {
-        bytes.push((nibbles[k] << 4) | nibbles[k + 1]);
-        k += 2;
+    if too_long {
+        bytes.clear();
     }
-    // (k == nibbles.len() exactly because length is even.)
 
     (bytes, i)
 }
@@ -837,6 +916,7 @@ fn read_name(data: &[u8], start: usize) -> (Vec<u8>, usize) {
     let n = data.len();
     let mut i = start;
     let mut out = Vec::new();
+    let mut too_long = false;
 
     while i < n {
         let b = data[i];
@@ -845,13 +925,25 @@ fn read_name(data: &[u8], start: usize) -> (Vec<u8>, usize) {
         }
         if b == b'#' && i + 2 < n {
             if let (Some(h), Some(l)) = (hex_val(data[i + 1]), hex_val(data[i + 2])) {
-                out.push((h << 4) | l);
+                if out.len() < MAX_CMAP_WORD_BYTES {
+                    out.push((h << 4) | l);
+                } else {
+                    too_long = true;
+                }
                 i += 3;
                 continue;
             }
         }
-        out.push(b);
+        if out.len() < MAX_CMAP_WORD_BYTES {
+            out.push(b);
+        } else {
+            too_long = true;
+        }
         i += 1;
+    }
+
+    if too_long {
+        out.clear();
     }
 
     (out, i)
@@ -890,7 +982,7 @@ fn bytes_to_code(bytes: &[u8]) -> u32 {
 /// Reinterpret a byte buffer as a sequence of big-endian u16 code units.
 /// A trailing odd byte is treated as the high byte of a final unit.
 fn bytes_to_u16be(bytes: &[u8]) -> Vec<u16> {
-    let mut units = Vec::with_capacity(bytes.len() / 2 + 1);
+    let mut units = Vec::with_capacity(bytes.len().div_ceil(2));
     let mut i = 0;
     while i + 1 < bytes.len() {
         units.push(((bytes[i] as u16) << 8) | bytes[i + 1] as u16);
@@ -1085,6 +1177,25 @@ mod tests {
     }
 
     #[test]
+    fn mapping_count_is_bounded() {
+        let mut map = ToUnicodeMap::default();
+        for code in 0..(MAX_CMAP_ENTRIES as u32 + 10) {
+            map.insert_mapping(code, "A".to_string());
+        }
+        assert_eq!(map.map.len(), MAX_CMAP_ENTRIES);
+        assert!(map.lookup(MAX_CMAP_ENTRIES as u32).is_none());
+    }
+
+    #[test]
+    fn overflowing_cid_range_is_invalid_not_a_panic() {
+        let cmap = CidCMap {
+            cid_ranges: vec![(1, 0, 1, u32::MAX)],
+            ..CidCMap::default()
+        };
+        assert_eq!(cmap.code_to_cid(1, 1), 0);
+    }
+
+    #[test]
     fn named_destination_in_bfchar_ignored() {
         let data = b"\
             beginbfchar\n\
@@ -1118,6 +1229,10 @@ mod tests {
         let jis_v = CidCMap::predefined("UniJIS-UTF16-V").unwrap();
         assert!(jis_v.codes_are_unicode);
         assert_eq!(jis_v.wmode, 1);
+        // U+20000 encoded as UTF-16BE D840 DC00 is one scalar/code, not two
+        // unpaired surrogate glyphs.
+        assert_eq!(jis_v.next_code(&[0xD8, 0x40, 0xDC, 0x00]), (0x20000, 4));
+        assert_eq!(gb.next_code(&[0xD8, 0x40, 0xDC, 0x00]), (0xD840, 2));
 
         // Legacy byte-encoded CMaps now classify to their national encoding.
         assert_eq!(

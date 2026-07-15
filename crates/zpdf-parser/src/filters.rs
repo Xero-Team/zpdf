@@ -56,7 +56,12 @@ pub fn decode_stream_with_limits(
                 actual: "other",
             })
         }
-        None => return Ok(data.to_vec()),
+        None => {
+            if data.len() as u64 > limits.max_decoded_stream_bytes {
+                return Err(Error::StreamSizeLimit(limits.max_decoded_stream_bytes));
+            }
+            return Ok(data.to_vec());
+        }
     };
 
     let decode_parms = extract_decode_parms(dict, filters.len());
@@ -352,7 +357,10 @@ fn apply_filter(
         // carries its own colour-space/alpha metadata that a bytes-only filter
         // cannot return. Pass the codestream through unchanged; zpdf-image
         // sniffs it (filter name + JP2/SOC magic) and runs the real decode.
-        "JPXDecode" => Ok(data.to_vec()),
+        "JPXDecode" => {
+            budget.reserve(data.len() as u64)?;
+            Ok(data.to_vec())
+        }
         other => Err(Error::UnsupportedFilter(other.to_string())),
     }
 }
@@ -1262,5 +1270,39 @@ mod tests {
                 "ec={ec}"
             );
         }
+    }
+
+    #[test]
+    fn decoded_limit_applies_without_filters() {
+        let limits = ParseLimits {
+            max_decoded_stream_bytes: 3,
+            ..ParseLimits::default()
+        };
+        let err = decode_stream_with_limits(b"four", &PdfDict::new(), &limits).unwrap_err();
+        assert!(matches!(err, Error::StreamSizeLimit(3)));
+    }
+
+    #[test]
+    fn jpeg_dimensions_honor_custom_pixel_limit() {
+        let mut budget = DecodeBudget::new(1024);
+        let err = validate_jpeg_dimensions(2, 2, 3, 3, &mut budget).unwrap_err();
+        assert!(err.to_string().contains("3-pixel limit"));
+
+        let mut budget = DecodeBudget::new(1024);
+        validate_jpeg_dimensions(2, 2, 3, 4, &mut budget).unwrap();
+    }
+
+    #[test]
+    fn jpx_passthrough_consumes_decode_budget() {
+        let mut dict = PdfDict::new();
+        dict.insert(
+            PdfName::new("Filter"),
+            PdfObject::Name(PdfName::new("JPXDecode")),
+        );
+        let limits = ParseLimits {
+            max_decoded_stream_bytes: 3,
+            ..ParseLimits::default()
+        };
+        assert!(decode_stream_with_limits(b"four", &dict, &limits).is_err());
     }
 }

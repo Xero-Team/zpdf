@@ -8,7 +8,7 @@ authors.workspace = true
 
 [dependencies]
 gpui.workspace = true
-zpdf = { workspace = true, features = ["gpu-render"] }
+zpdf = { workspace = true, features = ["gpu-render", "cpu-render"] }
 zpdf-document.workspace = true
 zpdf-writer.workspace = true
 tracing.workspace = true

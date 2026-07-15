@@ -18,7 +18,9 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
+
+const MAX_SYSTEM_FONT_BYTES: u64 = 256 * 1024 * 1024;
 
 /// A face matched in the system-font index, ready to hand to
 /// [`LoadedFont::new_substitute`](crate::LoadedFont::new_substitute).
@@ -302,17 +304,26 @@ fn font_index() -> &'static FontIndex {
     INDEX.get_or_init(build_font_index)
 }
 
-/// Per-path cache of loaded font files, so a TTC shared by several PDF fonts
-/// is read once.
+/// Per-path cache of loaded font files, so a TTC shared by several live PDF
+/// fonts is read once. Weak entries avoid retaining every substituted font for
+/// the remainder of the process after its document/page has been dropped.
 fn load_font_bytes(path: &Path) -> Option<Arc<[u8]>> {
-    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Arc<[u8]>>>> = OnceLock::new();
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Weak<[u8]>>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut cache = cache.lock().ok()?;
-    if let Some(data) = cache.get(path) {
-        return Some(data.clone());
+    if let Some(data) = cache.lock().ok()?.get(path).and_then(Weak::upgrade) {
+        return Some(data);
+    }
+    if fs::metadata(path).ok()?.len() > MAX_SYSTEM_FONT_BYTES {
+        tracing::warn!("system font {} exceeds the size limit", path.display());
+        return None;
     }
     let data: Arc<[u8]> = Arc::from(fs::read(path).ok()?);
-    cache.insert(path.to_path_buf(), data.clone());
+    // Another thread may have populated the entry while this file was read.
+    let mut cache = cache.lock().ok()?;
+    if let Some(existing) = cache.get(path).and_then(Weak::upgrade) {
+        return Some(existing);
+    }
+    cache.insert(path.to_path_buf(), Arc::downgrade(&data));
     Some(data)
 }
 

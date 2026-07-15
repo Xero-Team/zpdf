@@ -7,15 +7,32 @@ use crate::page::PdfPage;
 /// Load all fonts referenced by a page into a FontCache.
 pub fn load_page_fonts(file: &PdfFile, page: &PdfPage) -> FontCache {
     let mut cache = FontCache::new();
+    let max_bytes = file.limits().max_font_cache_bytes;
 
     for (name, &font_ref) in &page.resources.fonts {
         match load_single_font(file, font_ref) {
             Ok(font) => {
-                cache.insert(name.clone(), font);
+                if cache
+                    .try_insert_with_limit(name.clone(), font, max_bytes)
+                    .is_none()
+                {
+                    tracing::warn!(
+                        "font cache byte limit ({max_bytes}) or ID capacity reached; using placeholder for {name}"
+                    );
+                    let _ = cache.try_insert_with_limit(
+                        name.clone(),
+                        LoadedFont::new_placeholder(name.clone()),
+                        max_bytes,
+                    );
+                }
             }
             Err(e) => {
                 tracing::debug!("font {name} ({font_ref}): fallback - {e}");
-                cache.insert(name.clone(), LoadedFont::new_placeholder(name.clone()));
+                let _ = cache.try_insert_with_limit(
+                    name.clone(),
+                    LoadedFont::new_placeholder(name.clone()),
+                    max_bytes,
+                );
             }
         }
     }
@@ -269,15 +286,15 @@ fn default_simple_base(subtype: &str) -> &'static zpdf_font::encoding::EncodingT
 
 fn apply_differences(enc_dict: &zpdf_core::PdfDict, encoding: &mut zpdf_font::encoding::Encoding) {
     if let Ok(diffs) = enc_dict.get_array("Differences") {
-        let mut code = 0u32;
+        let mut code = Some(0u16);
         for obj in diffs {
             match obj {
-                PdfObject::Integer(n) => code = (*n).max(0) as u32,
+                PdfObject::Integer(n) => code = u8::try_from(*n).ok().map(u16::from),
                 PdfObject::Name(name) => {
-                    if code <= 255 {
-                        encoding.apply_difference(code as u8, name.as_str());
+                    if let Some(current) = code {
+                        encoding.apply_difference(current as u8, name.as_str());
+                        code = current.checked_add(1).filter(|&next| next <= 255);
                     }
-                    code += 1;
                 }
                 _ => {}
             }
@@ -309,9 +326,9 @@ fn parse_type0_encoding(file: &PdfFile, dict: &zpdf_core::PdfDict) -> zpdf_font:
                 CidCMap::predefined(n.as_str()).unwrap_or_else(|| identity_fallback(n.as_str()))
             }
             Ok(PdfObject::Stream(s)) => {
-                let data = file
-                    .resolve_stream_data(*r)
-                    .or_else(|_| zpdf_parser::filters::decode_stream(&s.data, &s.dict));
+                let data = file.resolve_stream_data(*r).or_else(|_| {
+                    zpdf_parser::filters::decode_stream_with_limits(&s.data, &s.dict, file.limits())
+                });
                 let mut cmap = match data {
                     Ok(d) => CidCMap::parse(&d),
                     Err(e) => {
@@ -512,6 +529,26 @@ fn load_truetype_font(
     }
 }
 
+fn type3_differences(diffs: &[PdfObject]) -> Vec<String> {
+    let mut encoding = Vec::new();
+    let mut current = Some(0usize);
+    for obj in diffs {
+        match obj {
+            PdfObject::Integer(n) => {
+                current = usize::try_from(*n).ok().filter(|&code| code <= 255);
+            }
+            PdfObject::Name(name) => {
+                let Some(code) = current else { continue };
+                encoding.resize(code + 1, String::new());
+                encoding[code] = name.0.clone();
+                current = code.checked_add(1).filter(|&next| next <= 255);
+            }
+            _ => {}
+        }
+    }
+    encoding
+}
+
 fn load_type3_font(
     file: &PdfFile,
     dict: &zpdf_core::PdfDict,
@@ -539,32 +576,25 @@ fn load_type3_font(
     let mut encoding = Vec::new();
     if let Some(enc_dict) = resolve_dict(file, dict, "Encoding") {
         if let Some(diffs) = resolve_array(file, &enc_dict, "Differences") {
-            let mut current_code = 0usize;
-            for obj in &diffs {
-                match obj {
-                    PdfObject::Integer(n) => {
-                        current_code = *n as usize;
-                        while encoding.len() < current_code {
-                            encoding.push(String::new());
-                        }
-                    }
-                    PdfObject::Name(n) => {
-                        while encoding.len() <= current_code {
-                            encoding.push(String::new());
-                        }
-                        encoding[current_code] = n.0.clone();
-                        current_code += 1;
-                    }
-                    _ => {}
-                }
-            }
+            encoding = type3_differences(&diffs);
         }
     }
 
     // CharProcs: name → stream ref
     let mut char_procs = std::collections::HashMap::new();
+    let encoded_names: std::collections::HashSet<&str> = encoding
+        .iter()
+        .map(String::as_str)
+        .filter(|name| !name.is_empty())
+        .collect();
     if let Some(cp_dict) = resolve_dict(file, dict, "CharProcs") {
         for (name, obj) in &cp_dict.0 {
+            if char_procs.len() >= encoded_names.len() {
+                break;
+            }
+            if !encoded_names.contains(name.as_str()) {
+                continue;
+            }
             if let PdfObject::Ref(r) = obj {
                 if let Ok(data) = file.resolve_stream_data(*r) {
                     char_procs.insert(name.0.clone(), Arc::from(data));
@@ -574,10 +604,16 @@ fn load_type3_font(
     }
 
     // Widths
-    let first_char = dict.get_i64("FirstChar").unwrap_or(0) as u16;
+    let first_char = dict
+        .get_i64("FirstChar")
+        .ok()
+        .and_then(|n| u8::try_from(n).ok())
+        .map(u16::from)
+        .unwrap_or(0);
     let widths: Vec<f64> = resolve_array(file, dict, "Widths")
         .unwrap_or_default()
         .iter()
+        .take(256)
         .map(|o| o.as_f64().unwrap_or(0.0))
         .collect();
 
@@ -722,9 +758,9 @@ fn parse_cid_widths(file: &PdfFile, dict: &zpdf_core::PdfDict) -> CidWidths {
 
     let mut i = 0;
     while i < w_array.len() {
-        let cid_start = match w_array[i].as_i64() {
-            Ok(v) => v as u16,
-            Err(_) => break,
+        let cid_start = match w_array[i].as_i64().ok().and_then(|v| u16::try_from(v).ok()) {
+            Some(v) => v,
+            None => break,
         };
         i += 1;
         if i >= w_array.len() {
@@ -735,7 +771,10 @@ fn parse_cid_widths(file: &PdfFile, dict: &zpdf_core::PdfDict) -> CidWidths {
             PdfObject::Array(arr) => {
                 // [cid_start [w1 w2 w3 ...]]
                 for (j, obj) in arr.iter().enumerate() {
-                    let Some(cid) = cid_start.checked_add(j as u16) else {
+                    let Some(cid) = u16::try_from(j)
+                        .ok()
+                        .and_then(|delta| cid_start.checked_add(delta))
+                    else {
                         break;
                     };
                     if let Ok(w) = obj.as_f64() {
@@ -746,7 +785,11 @@ fn parse_cid_widths(file: &PdfFile, dict: &zpdf_core::PdfDict) -> CidWidths {
             }
             PdfObject::Integer(_) | PdfObject::Real(_) => {
                 // [cid_start cid_end width]
-                let cid_end = w_array[i].as_i64().unwrap_or(cid_start as i64) as u16;
+                let cid_end = w_array[i]
+                    .as_i64()
+                    .ok()
+                    .and_then(|v| u16::try_from(v).ok())
+                    .unwrap_or(cid_start);
                 i += 1;
                 if i < w_array.len() {
                     let w = w_array[i].as_f64().unwrap_or(dw);
@@ -779,9 +822,13 @@ fn parse_cid_w2(file: &PdfFile, dict: &zpdf_core::PdfDict, widths: &mut CidWidth
 fn apply_w2_array(w2_array: &[PdfObject], widths: &mut CidWidths) {
     let mut i = 0;
     while i < w2_array.len() {
-        let cid_start = match w2_array[i].as_i64() {
-            Ok(v) => v as u16,
-            Err(_) => break,
+        let cid_start = match w2_array[i]
+            .as_i64()
+            .ok()
+            .and_then(|v| u16::try_from(v).ok())
+        {
+            Some(v) => v,
+            None => break,
         };
         i += 1;
         if i >= w2_array.len() {
@@ -798,7 +845,10 @@ fn apply_w2_array(w2_array: &[PdfObject], widths: &mut CidWidths) {
                     else {
                         break;
                     };
-                    let Some(cid) = cid_start.checked_add((k / 3) as u16) else {
+                    let Some(cid) = u16::try_from(k / 3)
+                        .ok()
+                        .and_then(|delta| cid_start.checked_add(delta))
+                    else {
                         break;
                     };
                     widths.set_v(cid, w1y, vx, vy);
@@ -808,7 +858,11 @@ fn apply_w2_array(w2_array: &[PdfObject], widths: &mut CidWidths) {
             }
             PdfObject::Integer(_) | PdfObject::Real(_) => {
                 // Range form: cFirst cLast w1y vx vy.
-                let cid_end = w2_array[i].as_i64().unwrap_or(cid_start as i64) as u16;
+                let cid_end = w2_array[i]
+                    .as_i64()
+                    .ok()
+                    .and_then(|v| u16::try_from(v).ok())
+                    .unwrap_or(cid_start);
                 if i + 3 < w2_array.len() {
                     let (Ok(w1y), Ok(vx), Ok(vy)) = (
                         w2_array[i + 1].as_f64(),
@@ -833,12 +887,21 @@ fn apply_w2_array(w2_array: &[PdfObject], widths: &mut CidWidths) {
 }
 
 fn parse_simple_widths(file: &PdfFile, dict: &zpdf_core::PdfDict) -> CidWidths {
-    let first_char = dict.get_i64("FirstChar").unwrap_or(0) as u16;
+    let first_char = dict
+        .get_i64("FirstChar")
+        .ok()
+        .and_then(|v| u8::try_from(v).ok())
+        .map(u16::from)
+        .unwrap_or(0);
     let mut widths = CidWidths::new(1000.0);
 
     if let Some(arr) = resolve_array(file, dict, "Widths") {
-        for (j, obj) in arr.iter().enumerate() {
-            let Some(code) = first_char.checked_add(j as u16) else {
+        for (j, obj) in arr.iter().take(256).enumerate() {
+            let Some(code) = u16::try_from(j)
+                .ok()
+                .and_then(|delta| first_char.checked_add(delta))
+                .filter(|&code| code <= 255)
+            else {
                 break;
             };
             if let Ok(w) = obj.as_f64() {
@@ -902,5 +965,37 @@ mod tests {
         let mut w = CidWidths::new(1000.0);
         apply_w2_array(&arr, &mut w);
         assert_eq!(w.get_v(10), None);
+    }
+
+    #[test]
+    fn type3_differences_reject_out_of_range_codes_without_growth() {
+        let name = |s: &str| PdfObject::Name(zpdf_core::PdfName::new(s));
+        let diffs = vec![
+            int(-1),
+            name("ignored-negative"),
+            int(i64::MAX),
+            name("ignored-huge"),
+            int(255),
+            name("last"),
+            name("past-end"),
+        ];
+        let encoding = type3_differences(&diffs);
+        assert_eq!(encoding.len(), 256);
+        assert_eq!(encoding[255], "last");
+    }
+
+    #[test]
+    fn simple_differences_do_not_overflow_after_huge_code() {
+        let mut dict = zpdf_core::PdfDict::new();
+        dict.insert(
+            zpdf_core::PdfName::new("Differences"),
+            PdfObject::Array(vec![
+                int(i64::MAX),
+                PdfObject::Name(zpdf_core::PdfName::new("ignored")),
+            ]),
+        );
+        let mut encoding =
+            zpdf_font::encoding::Encoding::from_base(&zpdf_font::encoding::STANDARD_ENCODING);
+        apply_differences(&dict, &mut encoding);
     }
 }

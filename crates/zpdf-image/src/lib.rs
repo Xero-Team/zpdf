@@ -1,13 +1,16 @@
 use std::collections::HashMap;
 
-use zpdf_core::{Error, PdfDict, PdfObject, Result};
+use zpdf_core::{Error, ParseLimits, PdfDict, PdfObject, Result};
 
 pub type ImageId = u32;
 
+/// Display-list image store. Entries remain stable because render commands keep
+/// only an [`ImageId`]; callers bound memory by the store/document lifetime.
 #[derive(Debug)]
 pub struct ImageCache {
     images: HashMap<ImageId, DecodedImage>,
     next_id: ImageId,
+    bytes_used: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -24,6 +27,7 @@ impl ImageCache {
         Self {
             images: HashMap::new(),
             next_id: 0,
+            bytes_used: 0,
         }
     }
 
@@ -32,10 +36,55 @@ impl ImageCache {
     }
 
     pub fn insert(&mut self, image: DecodedImage) -> ImageId {
-        let id = self.next_id;
-        self.next_id += 1;
+        self.try_insert_with_limit(image, u64::MAX)
+            .expect("image id space exhausted")
+    }
+
+    /// Admit an image without evicting any existing ID. Returns `None` when
+    /// the aggregate decoded-byte limit would be exceeded or no ID remains.
+    pub fn try_insert_with_limit(
+        &mut self,
+        image: DecodedImage,
+        max_bytes: u64,
+    ) -> Option<ImageId> {
+        // Charge the retained allocation, not merely its initialized length:
+        // decoded buffers commonly reserve their final RGBA size up front.
+        let image_bytes = u64::try_from(image.data.capacity()).ok()?;
+        let new_total = self.bytes_used.checked_add(image_bytes)?;
+        if new_total > max_bytes {
+            return None;
+        }
+        let id = self.next_free_id()?;
         self.images.insert(id, image);
-        id
+        self.bytes_used = new_total;
+        Some(id)
+    }
+
+    fn next_free_id(&mut self) -> Option<ImageId> {
+        let start = self.next_id;
+        loop {
+            let candidate = self.next_id;
+            self.next_id = self.next_id.wrapping_add(1);
+            if !self.images.contains_key(&candidate) {
+                return Some(candidate);
+            }
+            if self.next_id == start {
+                return None;
+            }
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.images.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.images.is_empty()
+    }
+
+    /// Total decoded image bytes currently retained by this store.
+    pub fn bytes_used(&self) -> u64 {
+        self.bytes_used
     }
 }
 
@@ -55,6 +104,11 @@ pub enum ResolvedColorSpace {
     Gray,
     Rgb,
     Cmyk,
+    /// CIE L*a*b* with the parameters from its PDF colour-space dictionary.
+    Lab {
+        white_point: [f64; 3],
+        range: [f64; 4],
+    },
     /// ICCBased with a compiled profile→sRGB transform built by the caller.
     /// `ncomp` mirrors `transform.components()` for cheap access.
     Icc {
@@ -77,6 +131,16 @@ impl PartialEq for ResolvedColorSpace {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Gray, Self::Gray) | (Self::Rgb, Self::Rgb) | (Self::Cmyk, Self::Cmyk) => true,
+            (
+                Self::Lab {
+                    white_point: w1,
+                    range: r1,
+                },
+                Self::Lab {
+                    white_point: w2,
+                    range: r2,
+                },
+            ) => w1 == w2 && r1 == r2,
             (
                 Self::Icc {
                     ncomp: n1,
@@ -110,10 +174,51 @@ impl ResolvedColorSpace {
     fn components(&self) -> usize {
         match self {
             Self::Gray | Self::Indexed { .. } => 1,
-            Self::Rgb => 3,
+            Self::Rgb | Self::Lab { .. } => 3,
             Self::Cmyk => 4,
-            Self::Icc { ncomp, .. } => (*ncomp).max(1) as usize,
+            // The compiled transform is authoritative. Trusting the public
+            // `ncomp` hint here could make malformed caller input index past
+            // the fixed four-component scratch arrays below.
+            Self::Icc { transform, .. } => transform.components(),
         }
+    }
+
+    fn validate(&self, depth: u8) -> Result<()> {
+        if depth > 8 {
+            return Err(Error::StreamDecode(
+                "image colour space nesting exceeds the limit".into(),
+            ));
+        }
+        match self {
+            Self::Icc { ncomp, transform } => {
+                let actual = transform.components();
+                if !matches!(actual, 1 | 3 | 4) || *ncomp as usize != actual {
+                    return Err(Error::StreamDecode(format!(
+                        "ICCBased component hint {ncomp} does not match transform ({actual})"
+                    )));
+                }
+            }
+            Self::Indexed { base, .. } => {
+                if matches!(base.as_ref(), Self::Indexed { .. }) {
+                    return Err(Error::StreamDecode(
+                        "Indexed colour space cannot have an Indexed base".into(),
+                    ));
+                }
+                base.validate(depth + 1)?;
+            }
+            Self::Lab { white_point, range }
+                if white_point.iter().any(|v| !v.is_finite() || *v <= 0.0)
+                    || range.iter().any(|v| !v.is_finite())
+                    || range[0] > range[1]
+                    || range[2] > range[3] =>
+            {
+                return Err(Error::StreamDecode(
+                    "invalid Lab colour-space parameters".into(),
+                ));
+            }
+            _ => {}
+        }
+        Ok(())
     }
 }
 
@@ -129,7 +234,16 @@ pub fn colorspace_from_name(name: &str) -> Option<ResolvedColorSpace> {
 }
 
 pub fn decode_image_xobject(decoded_data: &[u8], dict: &PdfDict) -> Result<DecodedImage> {
-    decode_image_xobject_resolved(decoded_data, dict, [0, 0, 0], None)
+    decode_image_xobject_with_limits(decoded_data, dict, &ParseLimits::default())
+}
+
+/// Decode an image XObject using explicit security limits.
+pub fn decode_image_xobject_with_limits(
+    decoded_data: &[u8],
+    dict: &PdfDict,
+    limits: &ParseLimits,
+) -> Result<DecodedImage> {
+    decode_image_xobject_resolved_with_limits(decoded_data, dict, [0, 0, 0], None, limits)
 }
 
 /// Decode an image XObject, painting `/ImageMask true` stencils in `fill_rgb`
@@ -139,7 +253,17 @@ pub fn decode_image_xobject_with_fill(
     dict: &PdfDict,
     fill_rgb: [u8; 3],
 ) -> Result<DecodedImage> {
-    decode_image_xobject_resolved(decoded_data, dict, fill_rgb, None)
+    decode_image_xobject_with_fill_and_limits(decoded_data, dict, fill_rgb, &ParseLimits::default())
+}
+
+/// Decode an image XObject with a stencil fill and explicit security limits.
+pub fn decode_image_xobject_with_fill_and_limits(
+    decoded_data: &[u8],
+    dict: &PdfDict,
+    fill_rgb: [u8; 3],
+    limits: &ParseLimits,
+) -> Result<DecodedImage> {
+    decode_image_xobject_resolved_with_limits(decoded_data, dict, fill_rgb, None, limits)
 }
 
 /// Decode an image XObject into RGBA.
@@ -159,16 +283,41 @@ pub fn decode_image_xobject_resolved(
     fill_rgb: [u8; 3],
     colorspace: Option<ResolvedColorSpace>,
 ) -> Result<DecodedImage> {
-    let width = dict.get_i64("Width")? as u32;
-    let height = dict.get_i64("Height")? as u32;
-    let bpc = dict.get_i64("BitsPerComponent").unwrap_or(8) as u8;
+    decode_image_xobject_resolved_with_limits(
+        decoded_data,
+        dict,
+        fill_rgb,
+        colorspace,
+        &ParseLimits::default(),
+    )
+}
 
-    // Bound the RGBA allocation (4 bytes/pixel) against the ParseLimits default
-    // so a crafted /Width × /Height cannot OOM — applies to every image path,
-    // including the 1-bpp stencil below.
-    if (width as u64).saturating_mul(height as u64) > MAX_IMAGE_PIXELS {
+/// Decode an image XObject with a pre-resolved colour space and explicit
+/// security limits.
+pub fn decode_image_xobject_resolved_with_limits(
+    decoded_data: &[u8],
+    dict: &PdfDict,
+    fill_rgb: [u8; 3],
+    colorspace: Option<ResolvedColorSpace>,
+    limits: &ParseLimits,
+) -> Result<DecodedImage> {
+    let width_value = dict.get_i64("Width")?;
+    let height_value = dict.get_i64("Height")?;
+    let width = u32::try_from(width_value)
+        .ok()
+        .filter(|&v| v != 0)
+        .ok_or_else(|| Error::StreamDecode(format!("invalid image Width {width_value}")))?;
+    let height = u32::try_from(height_value)
+        .ok()
+        .filter(|&v| v != 0)
+        .ok_or_else(|| Error::StreamDecode(format!("invalid image Height {height_value}")))?;
+
+    // Bound the RGBA allocation (4 bytes/pixel) before dispatching to any image
+    // path, including the 1-bpp stencil below.
+    if (width as u64).saturating_mul(height as u64) > limits.max_image_pixels {
         return Err(Error::StreamDecode(format!(
-            "image {width}x{height} exceeds the {MAX_IMAGE_PIXELS}-pixel limit"
+            "image {width}x{height} exceeds the {}-pixel limit",
+            limits.max_image_pixels
         )));
     }
 
@@ -179,23 +328,35 @@ pub fn decode_image_xobject_resolved(
         return decode_image_mask(decoded_data, width, height, fill_rgb, invert);
     }
 
+    if let Some(cs) = &colorspace {
+        cs.validate(0)?;
+    }
+
     // JPEG 2000 first: the codestream carries its own dimensions, colour
     // space, bit depth and alpha, and /ColorSpace + /BitsPerComponent may
     // legally be absent from the dict (spec 7.4.9). A present /ColorSpace
     // overrides the codestream's colour declaration.
     if is_jpx_encoded(dict, decoded_data) {
-        return decode_jpx_image(decoded_data, dict, colorspace.as_ref());
+        return decode_jpx_image(
+            decoded_data,
+            dict,
+            colorspace.as_ref(),
+            limits.max_image_pixels,
+        );
     }
 
     let cs = colorspace.unwrap_or_else(|| infer_colorspace(dict));
+    cs.validate(0)?;
 
     if is_dct_encoded(dict) {
         return decode_dct_image(decoded_data, width, height, &cs, dict);
     }
 
+    let bpc_value = dict.get_i64("BitsPerComponent").unwrap_or(8);
+    let bpc = u8::try_from(bpc_value).unwrap_or(0);
     if !matches!(bpc, 1 | 2 | 4 | 8 | 16) {
         return Err(Error::StreamDecode(format!(
-            "invalid BitsPerComponent {bpc}"
+            "invalid BitsPerComponent {bpc_value}"
         )));
     }
 
@@ -213,10 +374,6 @@ pub fn decode_image_xobject_resolved(
     )
 }
 
-/// Mirrors `ParseLimits::default().max_image_pixels` without depending on it
-/// at this layer.
-const MAX_IMAGE_PIXELS: u64 = 100_000_000;
-
 /// Fold a decoded `/SMask` (luminosity soft mask) into `image` as alpha. The
 /// mask must come through the same full image-decode path as any image (so
 /// filters, predictors, sub-byte bpc and /Decode all apply); the decoded gray
@@ -225,6 +382,21 @@ const MAX_IMAGE_PIXELS: u64 = 100_000_000;
 /// folds in, because both backends (tiny-skia `PixmapRef::from_bytes` and the
 /// wgpu `Rgba8Unorm` upload) treat the bytes as premultiplied RGBA.
 pub fn apply_smask_image(image: &mut DecodedImage, mask: &DecodedImage) {
+    if (mask.width, mask.height) == (image.width, image.height)
+        && image.width != 0
+        && image.height != 0
+    {
+        for (px, mask_px) in image
+            .data
+            .chunks_exact_mut(4)
+            .zip(mask.data.chunks_exact(4))
+        {
+            multiply_pixel_alpha(px, mask_px[0]);
+        }
+        image.has_alpha = true;
+        image.premultiplied = true;
+        return;
+    }
     // The mask is DeviceGray, so its decoded R channel is the gray level.
     let alpha: Vec<u8> = mask.data.chunks_exact(4).map(|px| px[0]).collect();
     fold_alpha_plane(image, &alpha, mask.width, mask.height);
@@ -241,12 +413,60 @@ pub fn apply_stencil_mask(
     mask_height: u32,
     invert: bool,
 ) {
-    if (mask_width as u64).saturating_mul(mask_height as u64) > MAX_IMAGE_PIXELS {
-        tracing::warn!("/Mask stencil {mask_width}x{mask_height} exceeds the pixel limit, ignored");
+    apply_stencil_mask_with_limits(
+        image,
+        mask_data,
+        mask_width,
+        mask_height,
+        invert,
+        &ParseLimits::default(),
+    );
+}
+
+/// Fold a `/Mask` stencil stream into an image using explicit security limits.
+pub fn apply_stencil_mask_with_limits(
+    image: &mut DecodedImage,
+    mask_data: &[u8],
+    mask_width: u32,
+    mask_height: u32,
+    invert: bool,
+    limits: &ParseLimits,
+) {
+    if (mask_width as u64).saturating_mul(mask_height as u64) > limits.max_image_pixels {
+        tracing::warn!(
+            "/Mask stencil {mask_width}x{mask_height} exceeds the {}-pixel limit, ignored",
+            limits.max_image_pixels
+        );
         return;
     }
     let row_bytes = (mask_width as usize).div_ceil(8);
-    let mut alpha = Vec::with_capacity(mask_width as usize * mask_height as usize);
+    if (mask_width, mask_height) == (image.width, image.height)
+        && mask_width != 0
+        && mask_height != 0
+    {
+        for (index, px) in image.data.chunks_exact_mut(4).enumerate() {
+            let row = index / mask_width as usize;
+            if row >= mask_height as usize {
+                break;
+            }
+            let col = index % mask_width as usize;
+            let byte = mask_data
+                .get(row * row_bytes + col / 8)
+                .copied()
+                .unwrap_or(0xFF);
+            let sample = (byte >> (7 - (col % 8))) & 1;
+            let masked = (sample == 1) != invert;
+            multiply_pixel_alpha(px, if masked { 0 } else { 255 });
+        }
+        image.has_alpha = true;
+        image.premultiplied = true;
+        return;
+    }
+    let Some(alpha_len) = (mask_width as usize).checked_mul(mask_height as usize) else {
+        tracing::warn!("/Mask stencil dimensions exceed addressable memory, ignored");
+        return;
+    };
+    let mut alpha = Vec::with_capacity(alpha_len);
     for row in 0..mask_height as usize {
         for col in 0..mask_width as usize {
             // Out-of-range (short data) reads as sample 1 → masked out.
@@ -266,14 +486,7 @@ pub fn apply_stencil_mask(
 /// value paints. Default `[0 1]` means sample 0 paints (marks the page).
 pub fn mask_decode_inverts(dict: &PdfDict) -> bool {
     match dict.get("Decode") {
-        Some(PdfObject::Array(a)) => {
-            let first = a.first().and_then(|o| match o {
-                PdfObject::Integer(n) => Some(*n),
-                PdfObject::Real(r) => Some(*r as i64),
-                _ => None,
-            });
-            first == Some(1)
-        }
+        Some(PdfObject::Array(a)) => a.first().and_then(|o| o.as_f64().ok()) == Some(1.0),
         _ => false,
     }
 }
@@ -368,6 +581,7 @@ fn infer_colorspace_array(arr: &[PdfObject]) -> ResolvedColorSpace {
         "Indexed" | "I" => {
             let base = arr.get(1).and_then(|o| match o {
                 PdfObject::Name(n) => colorspace_from_name(n.as_str()),
+                PdfObject::Array(base) => Some(infer_colorspace_array(base)),
                 _ => None,
             });
             let hival = arr.get(2).and_then(|o| o.as_f64().ok());
@@ -376,7 +590,9 @@ fn infer_colorspace_array(arr: &[PdfObject]) -> ResolvedColorSpace {
                 _ => None,
             });
             match (base, hival, lookup) {
-                (Some(base), Some(h), Some(lookup)) if (0.0..=255.0).contains(&h) => {
+                (Some(base), Some(h), Some(lookup))
+                    if (0.0..=255.0).contains(&h) && h.fract() == 0.0 =>
+                {
                     ResolvedColorSpace::Indexed {
                         base: Box::new(base),
                         hival: h as u8,
@@ -389,11 +605,39 @@ fn infer_colorspace_array(arr: &[PdfObject]) -> ResolvedColorSpace {
                 }
             }
         }
+        "Lab" => {
+            let params = match arr.get(1) {
+                Some(PdfObject::Dict(dict)) => dict,
+                _ => {
+                    tracing::warn!("Lab image colour space has no parameter dictionary");
+                    return ResolvedColorSpace::Gray;
+                }
+            };
+            let white_point = numeric_array::<3>(params.get("WhitePoint"))
+                .filter(|v| v.iter().all(|n| n.is_finite() && *n > 0.0))
+                .unwrap_or([0.9642, 1.0, 0.8249]);
+            let range = numeric_array::<4>(params.get("Range"))
+                .filter(|v| v.iter().all(|n| n.is_finite()) && v[0] <= v[1] && v[2] <= v[3])
+                .unwrap_or([-100.0, 100.0, -100.0, 100.0]);
+            ResolvedColorSpace::Lab { white_point, range }
+        }
         other => {
             tracing::warn!("unsupported colour space {other}, treating as gray");
             ResolvedColorSpace::Gray
         }
     }
+}
+
+fn numeric_array<const N: usize>(obj: Option<&PdfObject>) -> Option<[f64; N]> {
+    let values = obj?.as_array().ok()?;
+    if values.len() != N {
+        return None;
+    }
+    let mut out = [0.0; N];
+    for (slot, value) in out.iter_mut().zip(values) {
+        *slot = value.as_f64().ok()?;
+    }
+    Some(out)
 }
 
 /// JP2 signature box — the first 12 bytes of a `.jp2` container file.
@@ -427,6 +671,7 @@ fn decode_jpx_image(
     data: &[u8],
     dict: &PdfDict,
     colorspace: Option<&ResolvedColorSpace>,
+    max_image_pixels: u64,
 ) -> Result<DecodedImage> {
     use hayro_jpeg2000::{ColorSpace as JpxColorSpace, DecodeSettings, Image};
     use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -451,9 +696,9 @@ fn decode_jpx_image(
     // are authoritative and may differ from the dict's /Width × /Height.
     let (width, height) = (image.width(), image.height());
     let pixel_count = (width as u64).saturating_mul(height as u64);
-    if pixel_count == 0 || pixel_count > MAX_IMAGE_PIXELS {
+    if pixel_count == 0 || pixel_count > max_image_pixels {
         return Err(Error::StreamDecode(format!(
-            "JPX codestream {width}x{height} exceeds the {MAX_IMAGE_PIXELS}-pixel limit"
+            "JPX codestream {width}x{height} exceeds the {max_image_pixels}-pixel limit"
         )));
     }
     let dict_w = dict.get_i64("Width").unwrap_or(width as i64);
@@ -478,7 +723,7 @@ fn decode_jpx_image(
             ))),
         }
     };
-    let mut codestream_icc: Option<Vec<u8>> = None;
+    let mut codestream_icc: Option<&[u8]> = None;
     let ncolor = match image.color_space() {
         JpxColorSpace::Gray => 1usize,
         JpxColorSpace::RGB => 3,
@@ -488,7 +733,7 @@ fn decode_jpx_image(
             num_channels,
         } => {
             let n = supported_ncolor(*num_channels)?;
-            codestream_icc = Some(profile.clone());
+            codestream_icc = Some(profile.as_slice());
             n
         }
         JpxColorSpace::Unknown { num_channels } => supported_ncolor(*num_channels)?,
@@ -499,14 +744,25 @@ fn decode_jpx_image(
     let samples = catch_unwind(AssertUnwindSafe(|| image.decode()))
         .map_err(|_| Error::StreamDecode("JPXDecode: decoder panicked decoding codestream".into()))?
         .map_err(|e| Error::StreamDecode(format!("JPXDecode: {e}")))?;
-    if samples.len() < pixel_count as usize * channels {
+    let pixel_count = usize::try_from(pixel_count)
+        .map_err(|_| Error::StreamDecode("JPX pixel count does not fit memory size".into()))?;
+    let expected_samples = pixel_count
+        .checked_mul(channels)
+        .ok_or_else(|| Error::StreamDecode("JPX decoded sample count overflow".into()))?;
+    if samples.len() < expected_samples {
         return Err(Error::StreamDecode(format!(
             "JPX decoded data too short: {} bytes for {width}x{height}x{channels}",
             samples.len()
         )));
     }
 
-    let smask_in_data = dict.get_i64("SMaskInData").unwrap_or(0);
+    let smask_in_data = match dict.get_i64("SMaskInData").unwrap_or(0) {
+        value @ 0..=2 => value,
+        other => {
+            tracing::warn!("invalid /SMaskInData {other}; ignoring codestream alpha");
+            0
+        }
+    };
     let use_alpha = has_alpha && smask_in_data != 0;
     if has_alpha && !use_alpha {
         tracing::warn!("JPX codestream has an alpha channel but /SMaskInData is 0/absent; ignoring it per spec");
@@ -564,8 +820,11 @@ fn decode_jpx_image(
     };
     let effective_cs = override_cs.or(codestream_cs.as_ref());
 
-    let mut rgba = Vec::with_capacity(pixel_count as usize * 4);
-    for px in samples.chunks_exact(channels).take(pixel_count as usize) {
+    let rgba_size = pixel_count
+        .checked_mul(4)
+        .ok_or_else(|| Error::StreamDecode("JPX RGBA buffer size overflow".into()))?;
+    let mut rgba = Vec::with_capacity(rgba_size);
+    for px in samples.chunks_exact(channels).take(pixel_count) {
         let [mut r, mut g, mut b] = match effective_cs {
             Some(cs) => {
                 let mut comps = [0u8; 4];
@@ -669,6 +928,39 @@ fn decode_dct_image(
             width,
             height
         )));
+    }
+    if !decoded_data.len().is_multiple_of(pixel_count) {
+        return Err(Error::StreamDecode(format!(
+            "DCT decoded data length {} is not a whole number of pixels for {}x{} image",
+            decoded_data.len(),
+            width,
+            height
+        )));
+    }
+    let bytes_per_pixel = decoded_data.len() / pixel_count;
+
+    if !matches!(bytes_per_pixel, 1 | 3 | 4) {
+        return Err(Error::StreamDecode(format!(
+            "DCT image has invalid component count: {} bytes/pixel (expected 1, 3, or 4)",
+            bytes_per_pixel
+        )));
+    }
+
+    let (sniffed, ncomp) = match bytes_per_pixel {
+        4 => match cs {
+            ResolvedColorSpace::Icc { .. } if cs.components() == 4 => (cs.clone(), 4),
+            _ => (ResolvedColorSpace::Cmyk, 4),
+        },
+        3 => match cs {
+            ResolvedColorSpace::Icc { .. } if cs.components() == 3 => (cs.clone(), 3),
+            ResolvedColorSpace::Lab { .. } => (cs.clone(), 3),
+            _ => (ResolvedColorSpace::Rgb, 3),
+        },
+        1 => match cs {
+            ResolvedColorSpace::Icc { .. } if cs.components() == 1 => (cs.clone(), 1),
+            _ => (ResolvedColorSpace::Gray, 1),
+        },
+        _ => unreachable!("component count was validated above"),
     };
 
     // /Decode and colour-key /Mask entries apply to the JPEG's output
@@ -695,19 +987,22 @@ fn decode_array(dict: &PdfDict, ncomp: usize) -> Option<Vec<f32>> {
         Some(PdfObject::Array(a)) => a,
         _ => return None,
     };
-    let vals: Vec<f32> = arr
-        .iter()
-        .filter_map(|o| o.as_f64().ok().map(|v| v as f32))
-        .collect();
-    if vals.len() != ncomp * 2 {
+    let expected = ncomp.checked_mul(2)?;
+    if arr.len() != expected {
         tracing::warn!(
             "/Decode has {} numbers, expected {} — ignoring",
-            vals.len(),
-            ncomp * 2
+            arr.len(),
+            expected
         );
         return None;
     }
-    Some(vals)
+    arr.iter()
+        .map(|o| {
+            let value = o.as_f64().ok()?;
+            let value = value as f32;
+            value.is_finite().then_some(value)
+        })
+        .collect()
 }
 
 /// `/Mask [min₁ max₁ …]` colour-key ranges, compared against RAW sample values
@@ -717,19 +1012,29 @@ fn color_key_ranges(dict: &PdfDict, ncomp: usize) -> Option<Vec<(u16, u16)>> {
         Some(PdfObject::Array(a)) => a,
         _ => return None,
     };
-    let vals: Vec<u16> = arr
-        .iter()
-        .filter_map(|o| o.as_f64().ok().map(|v| v.clamp(0.0, 65535.0) as u16))
-        .collect();
-    if vals.len() != ncomp * 2 {
+    let expected = ncomp.checked_mul(2)?;
+    if arr.len() != expected {
         tracing::warn!(
             "colour-key /Mask has {} numbers, expected {} — ignoring",
-            vals.len(),
-            ncomp * 2
+            arr.len(),
+            expected
         );
         return None;
     }
-    Some(vals.chunks_exact(2).map(|p| (p[0], p[1])).collect())
+    let vals: Vec<u16> = arr
+        .iter()
+        .map(|o| {
+            let value = o.as_f64().ok()?;
+            value
+                .is_finite()
+                .then_some(value.clamp(0.0, 65535.0) as u16)
+        })
+        .collect::<Option<_>>()?;
+    Some(
+        vals.chunks_exact(2)
+            .map(|p| (p[0].min(p[1]), p[0].max(p[1])))
+            .collect(),
+    )
 }
 
 /// Decode packed raw samples (post-filter) into RGBA: unpack 1/2/4/8/16-bpc
@@ -797,7 +1102,10 @@ fn decode_raw_samples(
                 };
                 comps[c] = luts[c][idx];
             }
-            let [r, g, b] = components_to_rgb(cs, &comps);
+            let [r, g, b] = indexed_palette
+                .as_ref()
+                .map(|palette| palette[comps[0] as usize])
+                .unwrap_or_else(|| components_to_rgb(cs, &comps));
             rgba.extend_from_slice(&[r, g, b, 255]);
         }
     }
@@ -830,32 +1138,54 @@ fn decode_raw_samples_icc(
     color_key: Option<&[(u16, u16)]>,
 ) -> Result<DecodedImage> {
     let ncomp = cs.components();
-    let pixel_count = (width as usize) * (height as usize);
+    let pixel_count = (width as usize)
+        .checked_mul(height as usize)
+        .ok_or_else(|| Error::StreamDecode("ICC image pixel count overflow".into()))?;
     let luts = build_component_luts(bpc, cs, decode);
-    let row_bytes = (width as usize * ncomp * bpc as usize).div_ceil(8);
+    let row_bytes = (width as usize)
+        .checked_mul(ncomp)
+        .and_then(|v| v.checked_mul(bpc as usize))
+        .ok_or_else(|| Error::StreamDecode("ICC image row size overflow".into()))?
+        .div_ceil(8);
+    let required_data = row_bytes
+        .checked_mul(height as usize)
+        .ok_or_else(|| Error::StreamDecode("ICC image data size overflow".into()))?;
+    if data.len() < required_data {
+        return Err(Error::StreamDecode(format!(
+            "ICC image data too short: {} bytes, expected {required_data}",
+            data.len()
+        )));
+    }
+    let rgba_size = pixel_count
+        .checked_mul(4)
+        .ok_or_else(|| Error::StreamDecode("ICC image RGBA size overflow".into()))?;
 
-    let mut comps = Vec::with_capacity(pixel_count * ncomp);
-    let mut masked = vec![false; if color_key.is_some() { pixel_count } else { 0 }];
+    // Transform bounded batches instead of retaining full component, mask and
+    // RGB planes (up to another 7 bytes/pixel) alongside the final RGBA image.
+    const CHUNK_PIXELS: usize = 16 * 1024;
+    let chunk_pixels = pixel_count.min(CHUNK_PIXELS);
+    let mut comps = Vec::with_capacity(chunk_pixels.saturating_mul(ncomp));
+    let mut masked = Vec::with_capacity(chunk_pixels);
+    let mut rgb = Vec::with_capacity(chunk_pixels.saturating_mul(3));
+    let mut rgba = Vec::with_capacity(rgba_size);
     let mut any_masked = false;
 
     for row in 0..height as usize {
         let row_start = row * row_bytes;
         let mut bit = 0usize;
-        for col in 0..width as usize {
+        for _col in 0..width as usize {
             let mut raw = [0u16; 4];
             for r in raw.iter_mut().take(ncomp) {
                 *r = read_sample(data, row_start, &mut bit, bpc);
             }
-            if let Some(ranges) = color_key {
-                if ranges
+            let is_masked = color_key.is_some_and(|ranges| {
+                ranges
                     .iter()
                     .zip(&raw)
                     .all(|(&(lo, hi), &v)| lo <= v && v <= hi)
-                {
-                    masked[row * width as usize + col] = true;
-                    any_masked = true;
-                }
-            }
+            });
+            masked.push(is_masked);
+            any_masked |= is_masked;
             for c in 0..ncomp {
                 let idx = if bpc == 16 {
                     (raw[c] >> 8) as usize
@@ -864,20 +1194,12 @@ fn decode_raw_samples_icc(
                 };
                 comps.push(luts[c][idx]);
             }
+            if masked.len() == CHUNK_PIXELS {
+                append_icc_chunk(transform, &mut comps, &mut masked, &mut rgb, &mut rgba)?;
+            }
         }
     }
-
-    let mut rgb = vec![0u8; pixel_count * 3];
-    transform.slice_to_rgb(&comps, &mut rgb)?;
-
-    let mut rgba = Vec::with_capacity(pixel_count * 4);
-    for (i, px) in rgb.chunks_exact(3).enumerate() {
-        if any_masked && masked[i] {
-            rgba.extend_from_slice(&[0, 0, 0, 0]);
-        } else {
-            rgba.extend_from_slice(&[px[0], px[1], px[2], 255]);
-        }
-    }
+    append_icc_chunk(transform, &mut comps, &mut masked, &mut rgb, &mut rgba)?;
 
     Ok(DecodedImage {
         width,
@@ -888,6 +1210,34 @@ fn decode_raw_samples_icc(
         // RGBA — the backends treat the bytes as premultiplied.
         premultiplied: any_masked,
     })
+}
+
+fn append_icc_chunk(
+    transform: &zpdf_color::IccTransform,
+    comps: &mut Vec<u8>,
+    masked: &mut Vec<bool>,
+    rgb: &mut Vec<u8>,
+    rgba: &mut Vec<u8>,
+) -> Result<()> {
+    if masked.is_empty() {
+        return Ok(());
+    }
+    let rgb_len = masked
+        .len()
+        .checked_mul(3)
+        .ok_or_else(|| Error::StreamDecode("ICC chunk size overflow".into()))?;
+    rgb.resize(rgb_len, 0);
+    transform.slice_to_rgb(comps, rgb)?;
+    for (px, &is_masked) in rgb.chunks_exact(3).zip(masked.iter()) {
+        if is_masked {
+            rgba.extend_from_slice(&[0, 0, 0, 0]);
+        } else {
+            rgba.extend_from_slice(&[px[0], px[1], px[2], 255]);
+        }
+    }
+    comps.clear();
+    masked.clear();
+    Ok(())
 }
 
 /// Per-component lookup tables mapping a raw sample (or its high byte for
@@ -907,6 +1257,14 @@ fn build_component_luts(bpc: u8, cs: &ResolvedColorSpace, decode: Option<&[f32]>
                     let full = if bpc == 16 { 65535.0 } else { maxf };
                     decode.map_or((0.0, full), |d| (d[c * 2], d[c * 2 + 1]))
                 }
+                ResolvedColorSpace::Lab { range, .. } => {
+                    let default = match c {
+                        0 => (0.0, 100.0),
+                        1 => (range[0] as f32, range[1] as f32),
+                        _ => (range[2] as f32, range[3] as f32),
+                    };
+                    decode.map_or(default, |d| (d[c * 2], d[c * 2 + 1]))
+                }
                 _ => decode.map_or((0.0, 1.0), |d| (d[c * 2], d[c * 2 + 1])),
             };
             (0..=lut_max)
@@ -915,6 +1273,19 @@ fn build_component_luts(bpc: u8, cs: &ResolvedColorSpace, decode: Option<&[f32]>
                     match cs {
                         ResolvedColorSpace::Indexed { hival, .. } => {
                             v.round().clamp(0.0, *hival as f32) as u8
+                        }
+                        ResolvedColorSpace::Lab { range, .. } => {
+                            let (min, max) = match c {
+                                0 => (0.0, 100.0),
+                                1 => (range[0] as f32, range[1] as f32),
+                                _ => (range[2] as f32, range[3] as f32),
+                            };
+                            let normalized = if (max - min).abs() <= f32::EPSILON {
+                                0.0
+                            } else {
+                                (v - min) / (max - min)
+                            };
+                            (normalized.clamp(0.0, 1.0) * 255.0).round() as u8
                         }
                         _ => (v.clamp(0.0, 1.0) * 255.0).round() as u8,
                     }
@@ -953,6 +1324,17 @@ fn components_to_rgb(cs: &ResolvedColorSpace, comps: &[u8; 4]) -> [u8; 3] {
         ResolvedColorSpace::Gray => [comps[0]; 3],
         ResolvedColorSpace::Rgb => [comps[0], comps[1], comps[2]],
         ResolvedColorSpace::Cmyk => cmyk_to_rgb(comps),
+        ResolvedColorSpace::Lab { white_point, range } => {
+            let l = comps[0] as f64 / 255.0 * 100.0;
+            let a = range[0] + comps[1] as f64 / 255.0 * (range[1] - range[0]);
+            let b = range[2] + comps[2] as f64 / 255.0 * (range[3] - range[2]);
+            let (r, g, b) = zpdf_color::lab_to_rgb(l, a, b, *white_point);
+            [
+                (r * 255.0).round() as u8,
+                (g * 255.0).round() as u8,
+                (b * 255.0).round() as u8,
+            ]
+        }
         // Whole images take the buffer-level path in decode_raw_samples_icc;
         // this per-pixel call serves Indexed bases built without the
         // interpreter's palette pre-baking.
@@ -970,6 +1352,20 @@ fn components_to_rgb(cs: &ResolvedColorSpace, comps: &[u8; 4]) -> [u8; 3] {
             components_to_rgb(base, &bc)
         }
     }
+}
+
+fn build_indexed_rgb_palette(base: &ResolvedColorSpace, hival: u8, lookup: &[u8]) -> Vec<[u8; 3]> {
+    let n = base.components();
+    (0..=hival)
+        .map(|index| {
+            let offset = index as usize * n;
+            let mut comps = [0u8; 4];
+            for (component, value) in comps.iter_mut().take(n).enumerate() {
+                *value = lookup.get(offset + component).copied().unwrap_or(0);
+            }
+            components_to_rgb(base, &comps)
+        })
+        .collect()
 }
 
 /// Convert an 8-bit DeviceCMYK pixel to 8-bit sRGB via the shared Adobe
@@ -1005,12 +1401,17 @@ fn fold_alpha_plane(image: &mut DecodedImage, alpha: &[u8], aw: u32, ah: u32) {
         &resampled
     };
     for (px, &a) in image.data.chunks_exact_mut(4).zip(plane) {
-        for ch in px.iter_mut() {
-            *ch = mul255(*ch, a);
-        }
+        multiply_pixel_alpha(px, a);
     }
     image.has_alpha = true;
     image.premultiplied = true;
+}
+
+#[inline]
+fn multiply_pixel_alpha(pixel: &mut [u8], alpha: u8) {
+    for channel in pixel {
+        *channel = mul255(*channel, alpha);
+    }
 }
 
 /// `round(v * a / 255)` without going through floats.
@@ -1032,15 +1433,15 @@ fn resample_bilinear(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> 
         |x: usize, y: usize| -> f32 { src.get(y * sw_u + x).copied().unwrap_or(255) as f32 };
     let mut out = Vec::with_capacity(out_size);
     for dy in 0..dh {
-        let fy = ((dy as f32 + 0.5) * sh as f32 / dh as f32 - 0.5).clamp(0.0, (sh - 1) as f32);
+        let fy = ((dy as f64 + 0.5) * y_scale - 0.5).clamp(0.0, (sh - 1) as f64);
         let y0 = fy.floor() as usize;
         let y1 = (y0 + 1).min(sh_u - 1);
-        let ty = fy - y0 as f32;
+        let ty = fy - y0 as f64;
         for dx in 0..dw {
-            let fx = ((dx as f32 + 0.5) * sw as f32 / dw as f32 - 0.5).clamp(0.0, (sw - 1) as f32);
+            let fx = ((dx as f64 + 0.5) * x_scale - 0.5).clamp(0.0, (sw - 1) as f64);
             let x0 = fx.floor() as usize;
             let x1 = (x0 + 1).min(sw_u - 1);
-            let tx = fx - x0 as f32;
+            let tx = fx - x0 as f64;
             let top = sample(x0, y0) * (1.0 - tx) + sample(x1, y0) * tx;
             let bot = sample(x0, y1) * (1.0 - tx) + sample(x1, y1) * tx;
             out.push((top * (1.0 - ty) + bot * ty).round() as u8);
@@ -1074,6 +1475,72 @@ mod tests {
     }
 
     #[test]
+    fn image_ids_wrap_without_overwriting_live_entries() {
+        let image = DecodedImage {
+            width: 1,
+            height: 1,
+            data: vec![0, 0, 0, 255],
+            has_alpha: false,
+            premultiplied: false,
+        };
+        let mut cache = ImageCache::new();
+        cache.next_id = u32::MAX;
+        assert_eq!(cache.insert(image.clone()), u32::MAX);
+        assert_eq!(cache.insert(image), 0);
+        assert_eq!(cache.images.len(), 2);
+    }
+
+    #[test]
+    fn image_cache_budget_rejects_without_evicting_or_advancing_id() {
+        let image = DecodedImage {
+            width: 1,
+            height: 1,
+            data: vec![0, 0, 0, 255],
+            has_alpha: false,
+            premultiplied: false,
+        };
+        let mut cache = ImageCache::new();
+        assert_eq!(cache.try_insert_with_limit(image.clone(), 4), Some(0));
+        assert_eq!(cache.try_insert_with_limit(image.clone(), 7), None);
+        assert_eq!(cache.bytes_used(), 4);
+        assert!(cache.get(0).is_some());
+        assert_eq!(cache.try_insert_with_limit(image, 8), Some(1));
+    }
+
+    #[test]
+    fn image_cache_charges_retained_vector_capacity() {
+        let mut data = Vec::with_capacity(16);
+        data.extend_from_slice(&[0, 0, 0, 255]);
+        assert!(data.capacity() > data.len());
+        let retained_bytes = data.capacity() as u64;
+        let image = DecodedImage {
+            width: 1,
+            height: 1,
+            data,
+            has_alpha: false,
+            premultiplied: false,
+        };
+
+        let mut cache = ImageCache::new();
+        assert_eq!(cache.try_insert_with_limit(image, 4), None);
+        assert_eq!(cache.bytes_used(), 0);
+        assert!(cache.images.is_empty());
+
+        let mut data = Vec::with_capacity(retained_bytes as usize);
+        data.extend_from_slice(&[0, 0, 0, 255]);
+        let admitted_bytes = data.capacity() as u64;
+        let image = DecodedImage {
+            width: 1,
+            height: 1,
+            data,
+            has_alpha: false,
+            premultiplied: false,
+        };
+        assert_eq!(cache.try_insert_with_limit(image, admitted_bytes), Some(0));
+        assert_eq!(cache.bytes_used(), admitted_bytes);
+    }
+
+    #[test]
     fn rgb8_to_rgba() {
         let samples = vec![255, 0, 0, 0, 255, 0, 0, 0, 255, 128, 128, 128];
         let dict = image_dict(2, 2, 8, Some("DeviceRGB"));
@@ -1092,6 +1559,67 @@ mod tests {
         let img = decode_image_xobject(&samples, &dict).unwrap();
         assert_eq!(pixel(&img, 0), &[0, 0, 0, 255]);
         assert_eq!(pixel(&img, 1), &[128, 128, 128, 255]);
+    }
+
+    #[test]
+    fn raw_and_dct_images_honor_custom_pixel_limit() {
+        let limits = ParseLimits {
+            max_image_pixels: 3,
+            ..ParseLimits::default()
+        };
+        let raw = image_dict(2, 2, 8, Some("DeviceGray"));
+        assert!(decode_image_xobject_with_limits(&[0; 4], &raw, &limits).is_err());
+
+        let mut dct = raw;
+        dct.insert(
+            PdfName::new("Filter"),
+            PdfObject::Name(PdfName::new("DCTDecode")),
+        );
+        assert!(decode_image_xobject_with_limits(&[0; 4], &dct, &limits).is_err());
+    }
+
+    #[test]
+    fn image_and_stencil_masks_honor_custom_pixel_limit() {
+        let limits = ParseLimits {
+            max_image_pixels: 3,
+            ..ParseLimits::default()
+        };
+        let mut mask = image_dict(2, 2, 1, None);
+        mask.insert(PdfName::new("ImageMask"), PdfObject::Bool(true));
+        assert!(decode_image_xobject_with_limits(&[0], &mask, &limits).is_err());
+
+        let mut image = DecodedImage {
+            width: 1,
+            height: 1,
+            data: vec![10, 20, 30, 255],
+            has_alpha: false,
+            premultiplied: false,
+        };
+        apply_stencil_mask_with_limits(&mut image, &[0], 2, 2, false, &limits);
+        assert_eq!(image.data, [10, 20, 30, 255]);
+        assert!(!image.has_alpha);
+    }
+
+    #[test]
+    fn dct_grayscale_accepts_exact_one_byte_per_pixel() {
+        let mut dict = image_dict(2, 1, 8, Some("DeviceGray"));
+        dict.insert(
+            PdfName::new("Filter"),
+            PdfObject::Name(PdfName::new("DCTDecode")),
+        );
+        let img = decode_image_xobject(&[10, 200], &dict).unwrap();
+        assert_eq!(img.data, [10, 10, 10, 255, 200, 200, 200, 255]);
+    }
+
+    #[test]
+    fn wrapped_dimensions_and_bpc_are_rejected() {
+        assert!(decode_image_xobject(&[], &image_dict(-1, 1, 8, Some("DeviceGray"))).is_err());
+        assert!(decode_image_xobject(
+            &[],
+            &image_dict(i64::from(u32::MAX) + 1, 1, 8, Some("DeviceGray"))
+        )
+        .is_err());
+        assert!(decode_image_xobject(&[0], &image_dict(1, 1, 257, Some("DeviceGray"))).is_err());
     }
 
     #[test]
@@ -1322,6 +1850,31 @@ mod tests {
         let img = decode_image_xobject(&samples, &dict).unwrap();
         assert_eq!(pixel(&img, 0), &[255, 0, 0, 255]);
         assert_eq!(pixel(&img, 1), &[0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn lab_image_uses_its_white_point_and_range() {
+        let mut params = PdfDict::new();
+        params.insert(
+            PdfName::new("WhitePoint"),
+            PdfObject::Array(vec![
+                PdfObject::Real(0.9642),
+                PdfObject::Real(1.0),
+                PdfObject::Real(0.8249),
+            ]),
+        );
+        let mut dict = image_dict(1, 1, 8, None);
+        dict.insert(
+            PdfName::new("ColorSpace"),
+            PdfObject::Array(vec![
+                PdfObject::Name(PdfName::new("Lab")),
+                PdfObject::Dict(params),
+            ]),
+        );
+        // L*=100, a*/b* nearest representable neutral under default Range.
+        let img = decode_image_xobject(&[255, 128, 128], &dict).unwrap();
+        let px = pixel(&img, 0);
+        assert!(px[0] > 248 && px[1] > 248 && px[2] > 248, "{px:?}");
     }
 
     #[test]

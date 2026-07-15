@@ -8,6 +8,11 @@
 
 use zpdf_core::{Matrix, Rect};
 
+/// Public `rasterize` callers may supply dimensions directly. Keep a single
+/// shading allocation within the core page-pixel budget and reject arithmetic
+/// overflow before constructing the RGBA buffer.
+const MAX_RASTER_PIXELS: u64 = 64_000_000;
+
 #[derive(Debug, Clone)]
 pub struct ShadingDef {
     pub kind: ShadingKind,
@@ -75,6 +80,9 @@ impl ShadingDef {
     }
 
     fn sample(&self, s: f64) -> [f32; 3] {
+        if self.lut.is_empty() {
+            return [0.0; 3];
+        }
         let idx = (s.clamp(0.0, 1.0) * 255.0).round() as usize;
         self.lut[idx.min(self.lut.len() - 1)]
     }
@@ -168,10 +176,10 @@ pub fn rasterize(def: &ShadingDef, region: Rect, w: u32, h: u32) -> Option<Vec<u
     // Mesh shadings carry their own page-space geometry — Gouraud-rasterize the
     // triangles directly instead of inverse-mapping a parametric ramp.
     if let ShadingKind::Mesh { triangles } = &def.kind {
-        return Some(rasterize_mesh(triangles, region, w, h));
+        return rasterize_mesh(triangles, region, w, h);
     }
     let inv = def.to_page.inverse()?;
-    let mut buf = vec![0u8; (w as usize) * (h as usize) * 4];
+    let mut buf = vec![0u8; rgba_len(w, h)?];
     let (rw, rh) = (region.width(), region.height());
     for j in 0..h {
         // Pixel-center page-space y, row 0 at the top.
@@ -197,11 +205,11 @@ pub fn rasterize(def: &ShadingDef, region: Rect, w: u32, h: u32) -> Option<Vec<u
 /// Gouraud-rasterize page-space `triangles` into a `w`×`h` premultiplied-RGBA
 /// buffer covering page-space `region` (row 0 = top). Every covered pixel is
 /// opaque, so straight RGB equals premultiplied.
-fn rasterize_mesh(triangles: &[MeshTriangle], region: Rect, w: u32, h: u32) -> Vec<u8> {
-    let mut buf = vec![0u8; (w as usize) * (h as usize) * 4];
+fn rasterize_mesh(triangles: &[MeshTriangle], region: Rect, w: u32, h: u32) -> Option<Vec<u8>> {
+    let mut buf = vec![0u8; rgba_len(w, h)?];
     let (rw, rh) = (region.width(), region.height());
     if rw <= 0.0 || rh <= 0.0 || w == 0 || h == 0 {
-        return buf;
+        return Some(buf);
     }
     let to_px = |x: f32, y: f32| -> (f32, f32) {
         (
@@ -212,7 +220,15 @@ fn rasterize_mesh(triangles: &[MeshTriangle], region: Rect, w: u32, h: u32) -> V
     for tri in triangles {
         raster_triangle(&mut buf, w, h, tri, &to_px);
     }
-    buf
+    Some(buf)
+}
+
+fn rgba_len(w: u32, h: u32) -> Option<usize> {
+    let pixels = u64::from(w).checked_mul(u64::from(h))?;
+    if pixels > MAX_RASTER_PIXELS {
+        return None;
+    }
+    usize::try_from(pixels.checked_mul(4)?).ok()
 }
 
 /// Scanline-fill one triangle with barycentric RGB interpolation. The top-left
@@ -450,5 +466,35 @@ mod tests {
             "near (0,0) should be red-dominant: {:?}",
             &buf[o..o + 4]
         );
+    }
+
+    #[test]
+    fn raster_dimensions_are_bounded_before_allocation() {
+        let d = ramp_def(
+            ShadingKind::Axial {
+                x0: 0.0,
+                y0: 0.0,
+                x1: 1.0,
+                y1: 0.0,
+            },
+            (false, false),
+        );
+        assert!(rasterize(&d, Rect::new(0.0, 0.0, 1.0, 1.0), u32::MAX, 2).is_none());
+    }
+
+    #[test]
+    fn empty_lut_degrades_to_black() {
+        let mut d = ramp_def(
+            ShadingKind::Axial {
+                x0: 0.0,
+                y0: 0.0,
+                x1: 1.0,
+                y1: 0.0,
+            },
+            (true, true),
+        );
+        d.lut.clear();
+        let buf = rasterize(&d, Rect::new(0.0, 0.0, 1.0, 1.0), 1, 1).unwrap();
+        assert_eq!(buf, [0, 0, 0, 255]);
     }
 }

@@ -190,9 +190,11 @@ fn root_points_at_catalog(
     limits: &ParseLimits,
 ) -> bool {
     let obj = match table.get(root) {
-        Some(XrefEntry::InUse { offset, .. }) => ObjectParser::new(data, limits)
-            .parse_indirect_at(*offset as usize)
-            .ok(),
+        Some(XrefEntry::InUse { offset, .. }) => usize::try_from(*offset).ok().and_then(|offset| {
+            ObjectParser::new(data, limits)
+                .parse_indirect_at(offset)
+                .ok()
+        }),
         Some(XrefEntry::Compressed {
             stream_obj,
             index_in_stream,
@@ -233,7 +235,10 @@ fn find_catalog(
     let mut best: Option<(ObjectId, Option<u64>)> = None;
     // Direct headers in file order: a later occurrence supersedes an earlier one.
     for &(id, offset) in headers {
-        if let Ok((pid, obj)) = parser.parse_indirect_with_id(offset as usize) {
+        let Ok(file_offset) = usize::try_from(offset) else {
+            continue;
+        };
+        if let Ok((pid, obj)) = parser.parse_indirect_with_id(file_offset) {
             if pid == id && dict_is_catalog(object_dict(&obj)) {
                 best = Some((id, Some(offset)));
             }
@@ -304,7 +309,7 @@ fn decode_objstm_member(
         _ => return None,
     };
     let obj = ObjectParser::new(data, limits)
-        .parse_indirect_at(off as usize)
+        .parse_indirect_at(usize::try_from(off).ok()?)
         .ok()?;
     let PdfObject::Stream(stream) = obj else {
         return None;
@@ -314,7 +319,10 @@ fn decode_objstm_member(
     }
     let n = usize::try_from(stream.dict.get_i64("N").ok()?).ok()?;
     let first = usize::try_from(stream.dict.get_i64("First").ok()?).ok()?;
-    let decoded = filters::decode_stream(&stream.data, &stream.dict).ok()?;
+    if n > limits.max_objects as usize {
+        return None;
+    }
+    let decoded = filters::decode_stream_with_limits(&stream.data, &stream.dict, limits).ok()?;
 
     let header = &decoded[..first.min(decoded.len())];
     let mut hlex = Lexer::new(header, 0, limits);
@@ -354,7 +362,10 @@ fn index_objstm_members(data: &[u8], table: &mut XrefTable, limits: &ParseLimits
         .collect();
 
     for (sid, offset) in stream_ids {
-        let Ok(obj) = parser.parse_indirect_at(offset as usize) else {
+        let Ok(file_offset) = usize::try_from(offset) else {
+            continue;
+        };
+        let Ok(obj) = parser.parse_indirect_at(file_offset) else {
             continue;
         };
         let PdfObject::Stream(stream) = obj else {
@@ -363,26 +374,39 @@ fn index_objstm_members(data: &[u8], table: &mut XrefTable, limits: &ParseLimits
         if stream.dict.get_name("Type").unwrap_or("") != "ObjStm" {
             continue;
         }
-        let (Ok(n), Ok(first)) = (stream.dict.get_i64("N"), stream.dict.get_i64("First")) else {
+        let (Ok(n_raw), Ok(first_raw)) = (stream.dict.get_i64("N"), stream.dict.get_i64("First"))
+        else {
             continue;
         };
-        let Ok(decoded) = filters::decode_stream(&stream.data, &stream.dict) else {
+        let (Ok(n), Ok(first)) = (u32::try_from(n_raw), usize::try_from(first_raw)) else {
+            tracing::debug!("recovery: invalid ObjStm /N or /First for {sid}");
+            continue;
+        };
+        if n > limits.max_objects {
+            continue;
+        }
+        let Ok(decoded) = filters::decode_stream_with_limits(&stream.data, &stream.dict, limits)
+        else {
             tracing::debug!("recovery: failed to decode ObjStm {sid}");
             continue;
         };
-        let header = &decoded[..(first as usize).min(decoded.len())];
+        let header = &decoded[..first.min(decoded.len())];
         let mut hlex = Lexer::new(header, 0, limits);
-        for idx in 0..n as u32 {
+        for idx in 0..n {
             let Ok(num_tok) = hlex.next_token() else {
                 break;
             };
             let Ok(_off_tok) = hlex.next_token() else {
                 break;
             };
-            let Ok(member_num) = num_tok.as_i64() else {
+            let Ok(member_num) = num_tok.as_i64().and_then(|n| {
+                u32::try_from(n).map_err(|_| {
+                    Error::InvalidObject(0, "ObjStm member number out of range".into())
+                })
+            }) else {
                 break;
             };
-            let member_id = ObjectId(member_num as u32, 0);
+            let member_id = ObjectId(member_num, 0);
             // Direct objects already found by tail-scan take precedence.
             if table.get(member_id).is_none() {
                 table.insert_overwrite(

@@ -25,7 +25,7 @@ fn simple_dl() -> DisplayList {
 
 #[test]
 fn gpu_pass_time_is_reported_when_supported() {
-    let mut r = WgpuRenderer::new();
+    let mut r = WgpuRenderer::new().with_gpu_timing(true);
     let dl = simple_dl();
     match r.render_display_list(&dl, SCALE) {
         Ok(_) => {

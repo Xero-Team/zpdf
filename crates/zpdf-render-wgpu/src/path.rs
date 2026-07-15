@@ -16,6 +16,10 @@ use crate::transform::{PageMap, SolidVertex};
 /// Flattening tolerance in device pixels. Sub-pixel; keeps curve facets invisible.
 pub const TOLERANCE: f32 = 0.1;
 
+/// Matches the CPU backend's guard for coordinates that can overflow rasterizer
+/// edge arithmetic. Real off-page/clipped content remains far inside this bound.
+const MAX_DEVICE_COORD: f32 = 1_000_000.0;
+
 /// A tessellated triangle mesh (device-pixel positions, u32 indices).
 pub type Mesh = VertexBuffers<SolidVertex, u32>;
 
@@ -113,6 +117,10 @@ fn dash_lyon_path(path: &LyonPath, array: &[f32], phase: f32, scale: f32) -> Opt
 /// Tessellate an already-built lyon path as a fill. Shared by display-list fills,
 /// glyph outlines, and Type3 glyph paths (which build their own device-pixel paths).
 pub fn fill_lyon_path(path: &LyonPath, rule: FillRule, color: [f32; 4]) -> Option<Mesh> {
+    if !path_is_safe(path) {
+        tracing::warn!("skipping non-finite or out-of-range GPU path");
+        return None;
+    }
     let opts = FillOptions::tolerance(TOLERANCE).with_fill_rule(match rule {
         FillRule::NonZero => LyonFillRule::NonZero,
         FillRule::EvenOdd => LyonFillRule::EvenOdd,
@@ -132,6 +140,10 @@ pub fn fill_lyon_path(path: &LyonPath, rule: FillRule, color: [f32; 4]) -> Optio
 
 /// Tessellate an already-built lyon path as a stroke with the given options.
 pub fn stroke_lyon_path(path: &LyonPath, opts: &StrokeOptions, color: [f32; 4]) -> Option<Mesh> {
+    if !path_is_safe(path) {
+        tracing::warn!("skipping non-finite or out-of-range GPU path");
+        return None;
+    }
     let mut mesh = Mesh::new();
     let mut tess = StrokeTessellator::new();
     if let Err(e) = tess.tessellate_path(
@@ -153,29 +165,33 @@ fn build_lyon_path(path: &DlPath, map: &PageMap) -> Option<LyonPath> {
     }
     let mut b = LyonPath::builder();
     let mut open = false;
+    let map_point = |p| {
+        let p = map.pt(p);
+        safe_point(p).then_some(p)
+    };
     for el in &path.elements {
         match *el {
             PathElement::MoveTo(p) => {
                 if open {
                     b.end(false);
                 }
-                b.begin(map.pt(p));
+                b.begin(map_point(p)?);
                 open = true;
             }
             PathElement::LineTo(p) => {
                 if !open {
-                    b.begin(map.pt(p));
+                    b.begin(map_point(p)?);
                     open = true;
                 } else {
-                    b.line_to(map.pt(p));
+                    b.line_to(map_point(p)?);
                 }
             }
             PathElement::CurveTo(c1, c2, e) => {
                 if !open {
-                    b.begin(map.pt(c1));
+                    b.begin(map_point(c1)?);
                     open = true;
                 }
-                b.cubic_bezier_to(map.pt(c1), map.pt(c2), map.pt(e));
+                b.cubic_bezier_to(map_point(c1)?, map_point(c2)?, map_point(e)?);
             }
             PathElement::Close => {
                 if open {
@@ -189,6 +205,31 @@ fn build_lyon_path(path: &DlPath, map: &PageMap) -> Option<LyonPath> {
         b.end(false);
     }
     Some(b.build())
+}
+
+fn safe_point(p: lyon::math::Point) -> bool {
+    p.x.is_finite()
+        && p.y.is_finite()
+        && p.x.abs() <= MAX_DEVICE_COORD
+        && p.y.abs() <= MAX_DEVICE_COORD
+}
+
+fn path_is_safe(path: &LyonPath) -> bool {
+    use lyon::path::PathEvent;
+    path.iter().all(|event| match event {
+        PathEvent::Begin { at } => safe_point(at),
+        PathEvent::Line { from, to } => safe_point(from) && safe_point(to),
+        PathEvent::Quadratic { from, ctrl, to } => {
+            safe_point(from) && safe_point(ctrl) && safe_point(to)
+        }
+        PathEvent::Cubic {
+            from,
+            ctrl1,
+            ctrl2,
+            to,
+        } => safe_point(from) && safe_point(ctrl1) && safe_point(ctrl2) && safe_point(to),
+        PathEvent::End { last, first, .. } => safe_point(last) && safe_point(first),
+    })
 }
 
 fn map_cap(c: LineCap) -> LyonCap {
@@ -360,5 +401,18 @@ mod tests {
         let mesh = fill_mesh(&p, FillRule::NonZero, [1.0, 0.0, 0.0, 1.0], &map());
         assert!(mesh.is_some());
         assert!(!mesh.unwrap().vertices.is_empty());
+    }
+
+    #[test]
+    fn rejects_non_finite_and_extreme_coordinates() {
+        let mut p = DlPath::new();
+        p.move_to(Point::new(f64::NAN, 0.0));
+        p.line_to(Point::new(1.0, 1.0));
+        assert!(fill_mesh(&p, FillRule::NonZero, [1.0; 4], &map()).is_none());
+
+        let mut p = DlPath::new();
+        p.move_to(Point::new(0.0, 0.0));
+        p.line_to(Point::new(2_000_000.0, 1.0));
+        assert!(fill_mesh(&p, FillRule::NonZero, [1.0; 4], &map()).is_none());
     }
 }

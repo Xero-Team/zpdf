@@ -17,6 +17,12 @@ const CHARSTRING_R: u16 = 4330;
 const C1: u16 = 52845;
 const C2: u16 = 22719;
 const MAX_SUBR_DEPTH: u32 = 60;
+const MAX_SEAC_DEPTH: u32 = 16;
+const MAX_CHARSTRING_STEPS: usize = 100_000;
+const MAX_CHARSTRING_STACK: usize = 96;
+const MAX_TYPE1_SUBRS: usize = 65_536;
+const MAX_TYPE1_GLYPHS: usize = 65_536;
+const MAX_GLYPH_NAME_LEN: usize = 127;
 
 /// A parsed Type 1 font program.
 pub struct Type1Font {
@@ -38,10 +44,24 @@ pub struct Type1Font {
 }
 
 impl Type1Font {
+    pub(crate) fn estimated_program_bytes(&self) -> u64 {
+        let charstrings: u64 = self
+            .char_strings
+            .iter()
+            .map(|(name, data)| (name.len() + data.len()) as u64)
+            .sum();
+        let subrs: u64 = self.subrs.iter().map(|data| data.len() as u64).sum();
+        charstrings.saturating_add(subrs)
+    }
+
     /// Parse a Type 1 font program. Returns `None` if it does not look like one.
     pub fn parse(data: &[u8]) -> Option<Type1Font> {
-        let data = depfb(data);
-        let eexec_pos = find(&data, b"eexec")?;
+        // Plain PFA data can be parsed in place. Only PFB input needs a
+        // reassembled copy, avoiding one full-font allocation in the common
+        // path.
+        let flattened = (data.first() == Some(&0x80)).then(|| depfb(data));
+        let data = flattened.as_deref().unwrap_or(data);
+        let eexec_pos = find(data, b"eexec")?;
         let clear = &data[..eexec_pos];
 
         // Binary (or hex) eexec section begins after `eexec` + whitespace.
@@ -50,16 +70,16 @@ impl Type1Font {
             p += 1;
         }
         let enc = &data[p..];
-        let binary = if looks_hex(enc) {
-            hex_decode(enc)
+        let private = if looks_hex(enc) {
+            let binary = hex_decode(enc);
+            decrypt(&binary, EEXEC_R, 4)
         } else {
-            enc.to_vec()
+            decrypt(enc, EEXEC_R, 4)
         };
-        let private = decrypt(&binary, EEXEC_R, 4);
 
         let font_matrix = parse_font_matrix(clear).unwrap_or([0.001, 0.0, 0.0, 0.001, 0.0, 0.0]);
-        let units_per_em = if font_matrix[0].abs() > 1e-12 {
-            1.0 / font_matrix[0]
+        let units_per_em = if font_matrix[0].is_finite() && font_matrix[0].abs() > 1e-12 {
+            1.0 / font_matrix[0].abs()
         } else {
             1000.0
         };
@@ -78,10 +98,10 @@ impl Type1Font {
         if let Some(pos) = names.iter().position(|n| n == ".notdef") {
             names.swap(0, pos);
         }
+        names.truncate(MAX_TYPE1_GLYPHS);
         let name_to_gid: HashMap<String, u16> = names
             .iter()
             .enumerate()
-            .take(u16::MAX as usize)
             .map(|(i, n)| (n.clone(), i as u16))
             .collect();
 
@@ -126,12 +146,23 @@ impl Type1Font {
     /// composites offset base/accent in this space, so the matrix must only
     /// be applied once, at the public boundary.
     fn raw_outline_by_name(&self, name: &str) -> Option<GlyphOutline> {
+        self.raw_outline_by_name_depth(name, 0)
+    }
+
+    fn raw_outline_by_name_depth(&self, name: &str, depth: u32) -> Option<GlyphOutline> {
+        if depth > MAX_SEAC_DEPTH {
+            return None;
+        }
         let cs = self.char_strings.get(name)?;
-        let mut interp = Interp::new(&self.subrs);
-        interp.run(cs, 0);
+        let mut interp = Interp::new();
+        interp.run(cs, &self.subrs, 0);
+
+        if interp.failed {
+            return None;
+        }
 
         if let Some(seac) = interp.seac {
-            return self.compose_seac(&interp, seac);
+            return self.compose_seac(&interp, seac, depth + 1);
         }
         if interp.cmds.is_empty() {
             return None;
@@ -150,7 +181,7 @@ impl Type1Font {
     /// component under M is `a*w`, and `a * units_per_em == 1`.
     fn apply_font_matrix(&self, mut outline: GlyphOutline) -> GlyphOutline {
         let [a, b, c, d, e, f] = self.font_matrix;
-        if b == 0.0 && c == 0.0 && e == 0.0 && f == 0.0 && a == d {
+        if b == 0.0 && c == 0.0 && e == 0.0 && f == 0.0 && a == d && a > 0.0 {
             return outline;
         }
         let s = self.units_per_em;
@@ -183,7 +214,7 @@ impl Type1Font {
     }
 
     /// Build a `seac` accented composite (base glyph + offset accent glyph).
-    fn compose_seac(&self, interp: &Interp, seac: Seac) -> Option<GlyphOutline> {
+    fn compose_seac(&self, interp: &Interp, seac: Seac, depth: u32) -> Option<GlyphOutline> {
         let bname = STANDARD_ENCODING
             .get(seac.bchar as usize)
             .copied()
@@ -192,8 +223,8 @@ impl Type1Font {
             .get(seac.achar as usize)
             .copied()
             .flatten()?;
-        let base = self.raw_outline_by_name(bname)?;
-        let accent = self.raw_outline_by_name(aname)?;
+        let base = self.raw_outline_by_name_depth(bname, depth)?;
+        let accent = self.raw_outline_by_name_depth(aname, depth)?;
 
         let dx = interp.sbx + seac.adx - seac.asb;
         let dy = seac.ady;
@@ -235,8 +266,7 @@ struct Seac {
 }
 
 /// Type 1 charstring interpreter state.
-struct Interp<'a> {
-    subrs: &'a [Vec<u8>],
+struct Interp {
     cmds: Vec<OutlineCommand>,
     stack: Vec<f64>,
     ps_stack: Vec<f64>,
@@ -249,12 +279,13 @@ struct Interp<'a> {
     flex_pts: Vec<(f64, f64)>,
     seac: Option<Seac>,
     done: bool,
+    failed: bool,
+    steps: usize,
 }
 
-impl<'a> Interp<'a> {
-    fn new(subrs: &'a [Vec<u8>]) -> Self {
+impl Interp {
+    fn new() -> Self {
         Interp {
-            subrs,
             cmds: Vec::new(),
             stack: Vec::new(),
             ps_stack: Vec::new(),
@@ -267,6 +298,8 @@ impl<'a> Interp<'a> {
             flex_pts: Vec::new(),
             seac: None,
             done: false,
+            failed: false,
+            steps: 0,
         }
     }
 
@@ -274,7 +307,9 @@ impl<'a> Interp<'a> {
         self.x += dx;
         self.y += dy;
         if self.in_flex {
-            self.flex_pts.push((self.x, self.y));
+            if self.flex_pts.len() < 7 {
+                self.flex_pts.push((self.x, self.y));
+            }
             return;
         }
         if self.contour_open {
@@ -308,13 +343,22 @@ impl<'a> Interp<'a> {
         }
     }
 
-    fn run(&mut self, cs: &[u8], depth: u32) {
-        if depth > MAX_SUBR_DEPTH || self.done {
+    fn run(&mut self, cs: &[u8], subrs: &[Vec<u8>], depth: u32) {
+        if depth > MAX_SUBR_DEPTH {
+            self.failed = true;
+            return;
+        }
+        if self.done || self.failed {
             return;
         }
         let mut i = 0;
         while i < cs.len() {
-            if self.done {
+            if self.done || self.failed {
+                return;
+            }
+            self.steps += 1;
+            if self.steps > MAX_CHARSTRING_STEPS {
+                self.failed = true;
                 return;
             }
             let b = cs[i];
@@ -441,9 +485,8 @@ impl<'a> Interp<'a> {
                     // callsubr
                     if let Some(idx) = self.stack.pop() {
                         let idx = idx as i64;
-                        if idx >= 0 && (idx as usize) < self.subrs.len() {
-                            let sub = self.subrs[idx as usize].clone();
-                            self.run(&sub, depth + 1);
+                        if idx >= 0 && (idx as usize) < subrs.len() {
+                            self.run(&subrs[idx as usize], subrs, depth + 1);
                         }
                     }
                 }
@@ -466,6 +509,13 @@ impl<'a> Interp<'a> {
                     // Unknown operator: drop operands and continue.
                     self.stack.clear();
                 }
+            }
+            if self.stack.len() > MAX_CHARSTRING_STACK
+                || self.ps_stack.len() > MAX_CHARSTRING_STACK
+                || self.cmds.len() > MAX_CHARSTRING_STEPS
+            {
+                self.failed = true;
+                return;
             }
         }
     }
@@ -532,12 +582,16 @@ impl<'a> Interp<'a> {
         // Operand layout: arg1 .. argN  N  othersubr#
         let othersubr = self.stack.pop().unwrap_or(0.0) as i64;
         let n = self.stack.pop().unwrap_or(0.0) as i64;
-        let n = n.max(0) as usize;
-        let mut args = Vec::with_capacity(n);
-        for _ in 0..n {
-            args.push(self.stack.pop().unwrap_or(0.0));
+        if n < 0 {
+            self.failed = true;
+            return;
         }
-        args.reverse(); // now in original order
+        let n = n as usize;
+        if n > self.stack.len() || n > MAX_CHARSTRING_STACK {
+            self.failed = true;
+            return;
+        }
+        let args = self.stack.split_off(self.stack.len() - n);
 
         match othersubr {
             1 => {
@@ -587,16 +641,13 @@ impl<'a> Interp<'a> {
 // ----- charstring / eexec decryption -----
 
 fn decrypt(data: &[u8], mut r: u16, skip: usize) -> Vec<u8> {
-    let mut out = Vec::with_capacity(data.len());
-    for &c in data {
+    let mut out = Vec::with_capacity(data.len().saturating_sub(skip));
+    for (index, &c) in data.iter().enumerate() {
         let p = c ^ (r >> 8) as u8;
         r = (c as u16).wrapping_add(r).wrapping_mul(C1).wrapping_add(C2);
-        out.push(p);
-    }
-    if out.len() >= skip {
-        out.drain(0..skip);
-    } else {
-        out.clear();
+        if index >= skip {
+            out.push(p);
+        }
     }
     out
 }
@@ -620,11 +671,14 @@ fn depfb(data: &[u8]) -> Vec<u8> {
         }
         let len = u32::from_le_bytes([data[p + 2], data[p + 3], data[p + 4], data[p + 5]]) as usize;
         p += 6;
-        if p + len > data.len() {
+        let Some(end) = p.checked_add(len) else {
+            break;
+        };
+        if end > data.len() {
             break;
         }
-        out.extend_from_slice(&data[p..p + len]);
-        p += len;
+        out.extend_from_slice(&data[p..end]);
+        p = end;
     }
     out
 }
@@ -665,15 +719,16 @@ fn parse_font_matrix(clear: &[u8]) -> Option<[f64; 6]> {
     let open = pos + clear[pos..].iter().position(|&b| b == b'[')?;
     let close = open + clear[open..].iter().position(|&b| b == b']')?;
     let body = std::str::from_utf8(&clear[open + 1..close]).ok()?;
-    let nums: Vec<f64> = body
-        .split_whitespace()
-        .filter_map(|t| t.parse::<f64>().ok())
-        .collect();
-    if nums.len() >= 6 {
-        Some([nums[0], nums[1], nums[2], nums[3], nums[4], nums[5]])
-    } else {
-        None
+    let mut values = [0.0; 6];
+    let mut tokens = body.split_whitespace();
+    for value in &mut values {
+        let parsed = tokens.next()?.parse::<f64>().ok()?;
+        if !parsed.is_finite() {
+            return None;
+        }
+        *value = parsed;
     }
+    Some(values)
 }
 
 fn parse_builtin_encoding(clear: &[u8]) -> Vec<Option<String>> {
@@ -707,8 +762,8 @@ fn parse_builtin_encoding(clear: &[u8]) -> Vec<Option<String>> {
                 while p < region.len() && !is_ws(region[p]) && !is_delim(region[p]) {
                     p += 1;
                 }
-                let name = String::from_utf8_lossy(&region[start..p]).into_owned();
-                if code < 256 {
+                if code < 256 && p - start <= MAX_GLYPH_NAME_LEN {
+                    let name = String::from_utf8_lossy(&region[start..p]).into_owned();
                     enc[code] = Some(name);
                 }
             }
@@ -723,7 +778,7 @@ fn parse_builtin_encoding(clear: &[u8]) -> Vec<Option<String>> {
 fn parse_len_iv(private: &[u8]) -> Option<i32> {
     let pos = find(private, b"/lenIV")?;
     let (v, _) = read_int(private, pos + 6)?;
-    Some(v as i32)
+    i32::try_from(v).ok()
 }
 
 fn parse_subrs(private: &[u8], len_iv: i32) -> Vec<Vec<u8>> {
@@ -734,7 +789,7 @@ fn parse_subrs(private: &[u8], len_iv: i32) -> Vec<Vec<u8>> {
     };
     // Optional count to pre-size.
     if let Some((count, _)) = read_int(private, start + 6) {
-        if (0..100_000).contains(&count) {
+        if (0..MAX_TYPE1_SUBRS as i64).contains(&count) {
             subrs.resize(count as usize, Vec::new());
         }
     }
@@ -770,24 +825,37 @@ fn parse_subrs(private: &[u8], len_iv: i32) -> Vec<Vec<u8>> {
         // Binary token: RD or -|
         let (tok, np) = read_token(private, p);
         p = np;
-        if tok != "RD" && tok != "-|" {
+        if tok != b"RD" && tok != b"-|" {
             i = p;
             continue;
         }
-        p += 1; // single separator space
+        let Some(data_start) = p.checked_add(1) else {
+            break;
+        }; // single separator space
         let len = len.max(0) as usize;
-        if len > private.len() || p + len > private.len() {
+        let Some(end) = data_start.checked_add(len) else {
+            break;
+        };
+        if len > private.len() || end > private.len() {
             break;
         }
-        let cs = decrypt(&private[p..p + len], CHARSTRING_R, len_iv.max(0) as usize);
+        let cs = decrypt(
+            &private[data_start..end],
+            CHARSTRING_R,
+            len_iv.max(0) as usize,
+        );
         if idx >= 0 {
             let idx = idx as usize;
+            if idx >= MAX_TYPE1_SUBRS {
+                i = end;
+                continue;
+            }
             if idx >= subrs.len() {
                 subrs.resize(idx + 1, Vec::new());
             }
             subrs[idx] = cs;
         }
-        i = p + len;
+        i = end;
     }
     subrs
 }
@@ -804,6 +872,9 @@ fn parse_charstrings(private: &[u8], len_iv: i32) -> HashMap<String, Vec<u8>> {
         None => start + 12,
     };
     while i < private.len() {
+        if out.len() >= MAX_TYPE1_GLYPHS {
+            break;
+        }
         // Next glyph entry starts with '/'.
         let rel = match private[i..].iter().position(|&b| b == b'/') {
             Some(r) => r,
@@ -813,6 +884,10 @@ fn parse_charstrings(private: &[u8], len_iv: i32) -> HashMap<String, Vec<u8>> {
         let name_start = p;
         while p < private.len() && !is_ws(private[p]) && !is_delim(private[p]) {
             p += 1;
+        }
+        if p - name_start > MAX_GLYPH_NAME_LEN {
+            i = p;
+            continue;
         }
         let name = String::from_utf8_lossy(&private[name_start..p]).into_owned();
 
@@ -828,18 +903,27 @@ fn parse_charstrings(private: &[u8], len_iv: i32) -> HashMap<String, Vec<u8>> {
         };
         let (tok, np) = read_token(private, p);
         p = np;
-        if tok != "RD" && tok != "-|" {
+        if tok != b"RD" && tok != b"-|" {
             // Not a charstring entry (e.g. reached "end"); stop.
             break;
         }
-        p += 1; // single separator space
+        let Some(data_start) = p.checked_add(1) else {
+            break;
+        }; // single separator space
         let len = len.max(0) as usize;
-        if p + len > private.len() {
+        let Some(end) = data_start.checked_add(len) else {
+            break;
+        };
+        if end > private.len() {
             break;
         }
-        let cs = decrypt(&private[p..p + len], CHARSTRING_R, len_iv.max(0) as usize);
+        let cs = decrypt(
+            &private[data_start..end],
+            CHARSTRING_R,
+            len_iv.max(0) as usize,
+        );
         out.insert(name, cs);
-        i = p + len;
+        i = end;
     }
     out
 }
@@ -911,7 +995,7 @@ fn read_uint(data: &[u8], pos: usize) -> Option<(usize, usize)> {
 }
 
 /// Read a whitespace-delimited token (skipping leading whitespace).
-fn read_token(data: &[u8], mut pos: usize) -> (String, usize) {
+fn read_token(data: &[u8], mut pos: usize) -> (&[u8], usize) {
     while pos < data.len() && is_ws(data[pos]) {
         pos += 1;
     }
@@ -919,7 +1003,7 @@ fn read_token(data: &[u8], mut pos: usize) -> (String, usize) {
     while pos < data.len() && !is_ws(data[pos]) {
         pos += 1;
     }
-    (String::from_utf8_lossy(&data[start..pos]).into_owned(), pos)
+    (&data[start..pos], pos)
 }
 
 #[cfg(test)]
@@ -946,8 +1030,8 @@ mod tests {
         // 139 -> 0, 'b'=255 then 4 bytes -> i32. Use a tiny synthetic charstring:
         // 0x8B (=139 -> 0), then 0xFF 00 00 01 00 (-> 256), then endchar.
         let cs = [0x8B, 0xFF, 0x00, 0x00, 0x01, 0x00, 14];
-        let mut interp = Interp::new(&[]);
-        interp.run(&cs, 0);
+        let mut interp = Interp::new();
+        interp.run(&cs, &[], 0);
         // Stack consumed by endchar path; just assert it doesn't panic and closes.
         assert!(interp.done);
     }
@@ -1049,5 +1133,31 @@ mod tests {
             }
             ref c => panic!("expected LineTo, got {c:?}"),
         }
+    }
+
+    #[test]
+    fn cyclic_seac_composites_are_bounded() {
+        let mut font = font_with_matrix([0.001, 0.0, 0.0, 0.001, 0.0, 0.0]);
+        // seac 0 0 0 /A /A: both StandardEncoding character codes are 65.
+        font.char_strings
+            .insert("A".to_string(), vec![139, 139, 139, 204, 204, 12, 6]);
+        assert!(font.glyph_outline_by_name("A").is_none());
+    }
+
+    #[test]
+    fn oversized_othersubr_argument_count_is_rejected_without_allocating() {
+        let mut cs = vec![255];
+        cs.extend_from_slice(&i32::MAX.to_be_bytes()); // argument count
+        cs.push(139); // OtherSubr 0
+        cs.extend_from_slice(&[12, 16]); // callothersubr
+        let mut interp = Interp::new();
+        interp.run(&cs, &[], 0);
+        assert!(interp.failed);
+    }
+
+    #[test]
+    fn sparse_huge_subr_index_does_not_resize_the_table() {
+        let private = b"/Subrs 0 array dup 999999 1 RD x /CharStrings";
+        assert!(parse_subrs(private, 0).is_empty());
     }
 }

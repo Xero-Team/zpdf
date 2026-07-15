@@ -1,11 +1,10 @@
 use std::collections::HashMap;
 use std::fs::File;
-use std::sync::Arc;
 
 use gpui::{
     div, img, prelude::*, px, rgb, App, Context, FocusHandle, Focusable, FontWeight,
     InteractiveElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement,
-    RenderImage, StatefulInteractiveElement, Styled, StyledImage, Window,
+    StatefulInteractiveElement, Styled, StyledImage, Window,
 };
 use zpdf::gpu::GpuContext;
 use zpdf::{ObjectId, PdfObject, Rect};
@@ -17,7 +16,7 @@ use crate::actions::{
     DeleteSelected, FirstPage, FitWidth, LastPage, NextPage, PreviousPage, SaveAnnotation,
     SaveEdits, ToggleInkMode, ToggleSelectMode, ZoomIn, ZoomOut,
 };
-use crate::document::{LoadedDocument, PagePreview, PageSummary};
+use crate::document::{load_document, DocumentError, LoadedDocument, PagePreview, PageSummary};
 
 const PREVIEW_DPI: f32 = 144.0;
 const MIN_ZOOM: f32 = 0.35;
@@ -25,6 +24,8 @@ const MAX_ZOOM: f32 = 3.5;
 const ZOOM_STEP: f32 = 1.2;
 const SIDEBAR_WIDTH: f32 = 264.0;
 const PAGE_VIEWPORT_CHROME: f32 = 220.0;
+const MAX_INK_POINTS_PER_STROKE: usize = 100_000;
+const MAX_PREVIEW_CACHE_BYTES: u64 = 384 * 1024 * 1024;
 type ButtonPalette = (u32, u32, u32);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -190,11 +191,34 @@ impl Viewer {
         )
     }
 
+    fn reload_document(&mut self) -> Result<(), DocumentError> {
+        let path = self.document.summary.path.clone();
+        self.document = load_document(path)?;
+        self.current_page = self
+            .current_page
+            .min(self.document.summary.page_count.saturating_sub(1));
+        self.page_cache.clear();
+        self.selected_annotation = None;
+        self.drag_state = None;
+        self.page_annotations.clear();
+        Ok(())
+    }
+
     fn set_page(&mut self, page: usize, cx: &mut Context<Self>) {
         let clamped = page.min(self.document.summary.page_count.saturating_sub(1));
         if clamped != self.current_page {
             self.current_page = clamped;
             self.last_error = None;
+            self.is_drawing = false;
+            self.current_stroke.clear();
+            self.ink_strokes.clear();
+            self.selected_annotation = None;
+            self.drag_state = None;
+            if self.annotation_mode == AnnotationMode::Select {
+                self.load_page_annotations(cx);
+            } else {
+                self.page_annotations.clear();
+            }
             cx.notify();
         }
     }
@@ -329,8 +353,10 @@ impl Viewer {
                     self.annotation_mode = AnnotationMode::None;
                     self.current_stroke.clear();
                     self.ink_strokes.clear();
-                    self.page_cache.clear();
-                    self.last_error = None;
+                    self.last_error = self
+                        .reload_document()
+                        .err()
+                        .map(|e| format!("Saved, but failed to reload PDF: {e}"));
                 }
             }
             None => {
@@ -510,13 +536,15 @@ impl Viewer {
 
         tracing::info!("Stamp applied successfully!");
 
-        // Clear cache to force reload
-        self.page_cache.clear();
+        let reload_error = self.reload_document().err();
         self.last_error = Some(format!(
             "✓ Added '{}' stamp to page {}",
             text,
             self.current_page + 1
         ));
+        if let Some(e) = reload_error {
+            self.last_error = Some(format!("Stamp saved, but failed to reload PDF: {e}"));
+        }
         cx.notify();
     }
 
@@ -546,12 +574,18 @@ impl Viewer {
         if self.annotation_mode != AnnotationMode::Ink || !self.is_drawing {
             return;
         }
-        // Only log every 10th point to avoid spam
-        if self.current_stroke.len().is_multiple_of(10) {
-            tracing::warn!("    Move to: ({}, {})", event.position.x, event.position.y);
+        if self.current_stroke.len() >= MAX_INK_POINTS_PER_STROKE {
+            return;
         }
-        self.current_stroke
-            .push((event.position.x.into(), event.position.y.into()));
+        let point = (event.position.x.into(), event.position.y.into());
+        if self.current_stroke.last().is_some_and(|last| {
+            let dx = last.0 - point.0;
+            let dy = last.1 - point.1;
+            dx * dx + dy * dy < 0.25
+        }) {
+            return;
+        }
+        self.current_stroke.push(point);
         cx.notify();
     }
 
@@ -562,9 +596,9 @@ impl Viewer {
         tracing::warn!("Mouse UP - stroke has {} points", self.current_stroke.len());
         self.is_drawing = false;
         if !self.current_stroke.is_empty() {
-            self.ink_strokes.push(self.current_stroke.clone());
+            self.ink_strokes
+                .push(std::mem::take(&mut self.current_stroke));
             tracing::warn!("Total strokes: {}", self.ink_strokes.len());
-            self.current_stroke.clear();
         }
         cx.notify();
     }
@@ -883,12 +917,15 @@ impl Viewer {
 
         let num_edits = self.edit_buffer.operations.len();
         self.edit_buffer.clear();
-        self.page_cache.clear();
+        let reload_error = self.reload_document().err();
 
         self.last_error = Some(format!("✓ Saved {} edit(s)", num_edits));
 
-        // Reload annotations
-        self.load_page_annotations(cx);
+        if let Some(e) = reload_error {
+            self.last_error = Some(format!("Edits saved, but failed to reload PDF: {e}"));
+        } else {
+            self.load_page_annotations(cx);
+        }
         cx.notify();
     }
 
@@ -911,7 +948,7 @@ impl Viewer {
     }
 
     fn ensure_page_rendered(&mut self, index: usize) {
-        if self.page_cache.contains_key(&index) {
+        if index >= self.document.summary.page_count || self.page_cache.contains_key(&index) {
             return;
         }
 
@@ -929,6 +966,21 @@ impl Viewer {
         }
     }
 
+    fn cached_preview_bytes(&self) -> u64 {
+        self.page_cache
+            .values()
+            .map(|preview| preview.pixel_width as u64 * preview.pixel_height as u64 * 4)
+            .sum()
+    }
+
+    fn estimated_preview_bytes(&self, index: usize) -> u64 {
+        let page = &self.document.summary.pages[index];
+        let scale = PREVIEW_DPI as f64 / 72.0;
+        let width = (page.width * scale).ceil().max(1.0) as u64;
+        let height = (page.height * scale).ceil().max(1.0) as u64;
+        width.saturating_mul(height).saturating_mul(4)
+    }
+
     fn prefetch_nearby_pages(&mut self) {
         let page_count = self.document.summary.page_count;
         if page_count == 0 {
@@ -938,8 +990,34 @@ impl Viewer {
         let previous = self.current_page.saturating_sub(1);
         let next = (self.current_page + 1).min(page_count - 1);
 
-        for index in [self.current_page, previous, next] {
-            self.ensure_page_rendered(index);
+        // RenderImage owns the full CPU/GPU-ready page pixels. Retaining every
+        // page ever visited made memory grow with document length; keep only the
+        // navigation working set.
+        self.page_cache
+            .retain(|&index, _| index == self.current_page || index == previous || index == next);
+
+        self.ensure_page_rendered(self.current_page);
+        while self.cached_preview_bytes() > MAX_PREVIEW_CACHE_BYTES && self.page_cache.len() > 1 {
+            let victim = self
+                .page_cache
+                .keys()
+                .copied()
+                .filter(|&index| index != self.current_page)
+                .max_by_key(|&index| index.abs_diff(self.current_page));
+            let Some(victim) = victim else { break };
+            self.page_cache.remove(&victim);
+        }
+        for index in [previous, next] {
+            if index == self.current_page || self.page_cache.contains_key(&index) {
+                continue;
+            }
+            if self
+                .cached_preview_bytes()
+                .saturating_add(self.estimated_preview_bytes(index))
+                <= MAX_PREVIEW_CACHE_BYTES
+            {
+                self.ensure_page_rendered(index);
+            }
         }
     }
 
@@ -1043,12 +1121,6 @@ impl Viewer {
                     .child(format!("rotation {}", page.rotate)),
             )
     }
-
-    fn current_render_image(&self) -> Option<Arc<RenderImage>> {
-        self.page_cache
-            .get(&self.current_page)
-            .map(|preview| preview.image.clone())
-    }
 }
 
 impl Focusable for Viewer {
@@ -1104,7 +1176,7 @@ impl Render for Viewer {
                     .shadow_lg()
                     .relative() // Make container positioned for absolute children
                     .child(
-                        img(self.current_render_image().expect("preview image"))
+                        img(preview.image.clone())
                             .w(px(width))
                             .h(px(height))
                             .object_fit(gpui::ObjectFit::Fill),

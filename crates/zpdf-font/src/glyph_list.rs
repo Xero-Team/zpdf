@@ -48,7 +48,9 @@ pub fn glyph_name_to_string(name: &str) -> Option<String> {
             let mut i = 0;
             while i < bytes.len() {
                 let group = &rest[i..i + 4];
-                let cp = u32::from_str_radix(group, 16).expect("validated hex");
+                let Ok(cp) = u32::from_str_radix(group, 16) else {
+                    return None;
+                };
                 // Skip surrogate halves per the AGL algorithm.
                 if (0xD800..=0xDFFF).contains(&cp) {
                     i += 4;
@@ -96,7 +98,36 @@ pub fn glyph_name_to_string(name: &str) -> Option<String> {
 
 /// Glyph name -> first Unicode scalar (for cmap lookup convenience).
 pub fn glyph_name_to_char(name: &str) -> Option<char> {
-    glyph_name_to_string(name).and_then(|s| s.chars().next())
+    // This helper sits on the glyph-resolution hot path. Resolve the first
+    // scalar directly instead of allocating a temporary `String` per glyph.
+    let base = name.split('.').next()?;
+    if base.is_empty() {
+        return None;
+    }
+    if let Some(value) = lookup_agl(base) {
+        return value.chars().next();
+    }
+    if let Some(rest) = base.strip_prefix("uni") {
+        if !rest.is_empty() && rest.len() % 4 == 0 && is_all_upper_hex(rest) {
+            for group in rest.as_bytes().chunks_exact(4) {
+                let group = std::str::from_utf8(group).ok()?;
+                let cp = u32::from_str_radix(group, 16).ok()?;
+                if !(0xD800..=0xDFFF).contains(&cp) {
+                    return char::from_u32(cp);
+                }
+            }
+            return None;
+        }
+    }
+    if let Some(rest) = base.strip_prefix('u') {
+        if (4..=6).contains(&rest.len()) && is_all_upper_hex(rest) {
+            let cp = u32::from_str_radix(rest, 16).ok()?;
+            if !(0xD800..=0xDFFF).contains(&cp) {
+                return char::from_u32(cp);
+            }
+        }
+    }
+    None
 }
 
 /// Returns true iff every byte is a digit 0-9 or an uppercase hex letter A-F.

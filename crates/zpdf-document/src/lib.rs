@@ -113,10 +113,26 @@ impl PdfDocument {
     /// Get decoded content stream bytes for a page.
     pub fn page_content_bytes(&self, page: &PdfPage) -> Result<Vec<u8>> {
         let mut all_bytes = Vec::new();
+        let limit = self.file.limits().max_decoded_stream_bytes;
         for &content_id in &page.contents {
             match self.file.resolve_stream_data(content_id) {
                 Ok(bytes) => {
-                    if !all_bytes.is_empty() {
+                    let separator = usize::from(!all_bytes.is_empty());
+                    let Some(combined_len) = (all_bytes.len() as u64)
+                        .checked_add(separator as u64)
+                        .and_then(|n| n.checked_add(bytes.len() as u64))
+                    else {
+                        return Err(Error::StreamSizeLimit(limit));
+                    };
+                    if combined_len > limit {
+                        return Err(Error::StreamSizeLimit(limit));
+                    }
+                    all_bytes
+                        .try_reserve(separator.saturating_add(bytes.len()))
+                        .map_err(|e| {
+                            Error::StreamDecode(format!("page content allocation failed: {e}"))
+                        })?;
+                    if separator != 0 {
                         all_bytes.push(b'\n');
                     }
                     all_bytes.extend_from_slice(&bytes);
@@ -312,6 +328,32 @@ impl PdfDocument {
     /// carries no signatures. Read-only; runs only when called.
     pub fn signatures(&self) -> Vec<Signature> {
         signature::parse_signatures(&self.file)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn combined_page_content_respects_decode_limit() {
+        let pdf = test_util::build_pdf(&[
+            "<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Contents [4 0 R 5 0 R] >>",
+            "<< /Length 3 >>\nstream\nABC\nendstream",
+            "<< /Length 3 >>\nstream\nDEF\nendstream",
+        ]);
+        let limits = ParseLimits {
+            max_decoded_stream_bytes: 6,
+            ..ParseLimits::default()
+        };
+        let doc = PdfDocument::open_with_limits(pdf, limits).unwrap();
+        let page = doc.page(0).unwrap();
+        assert!(matches!(
+            doc.page_content_bytes(&page),
+            Err(Error::StreamSizeLimit(6))
+        ));
     }
 }
 

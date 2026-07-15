@@ -1,0 +1,21 @@
+--- Summary of changes needed for H1 fix ---
+
+1. Change Error::Parse to Error::StreamDecode (lines 21-24)
+2. Add budget parameter to decode_flate (line 448)
+3. Add budget parameter to lzw_decode (line 306)
+4. Add budget parameter to decode_ascii_hex (line 522)
+5. Add budget parameter to decode_ascii85 (line 566)
+6. Add budget parameter to decode_run_length (~line 610)
+7. Add budget parameter to decode_dct (~line 220)
+8. Update inflate_chunked to use budget (line 426)
+9. Replace MAX_DECODED_OUTPUT checks with budget.reserve() calls at:
+   - Line 385 (lzw_decode)
+   - Line 433 (inflate_chunked)
+   - Line 747 (decode_run_length)
+   - Line 760 (decode_run_length)
+
+Also need to update call sites in:
+- crates/zpdf-parser/src/object_parser.rs
+- crates/zpdf-parser/src/lib.rs
+- crates/zpdf-parser/src/ccitt.rs
+- crates/zpdf-parser/src/jbig2.rs

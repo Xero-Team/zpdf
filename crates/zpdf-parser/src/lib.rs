@@ -13,7 +13,7 @@ pub use lexer::Lexer;
 pub use object_parser::ObjectParser;
 pub use xref::{XrefEntry, XrefTable};
 
-use std::cell::{OnceCell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::HashMap;
 use std::sync::Arc;
 use zpdf_core::{ObjectId, ParseLimits, PdfDict, PdfName, PdfObject, PdfStream, Result};
@@ -44,9 +44,14 @@ pub struct PdfFile {
     /// `RefCell` suffices: `PdfFile` is never shared across threads in this
     /// workspace (swap to `Mutex` if that ever changes).
     object_cache: RefCell<HashMap<ObjectId, PdfObject>>,
+    /// Estimated retained bytes in `object_cache`. Cache admission stops at the
+    /// caller's limit; resolution still succeeds without retaining the object.
+    object_cache_bytes: Cell<u64>,
     /// Cache of decoded object streams, keyed by the ObjStm object number.
     /// Avoids re-decoding the whole stream for every compressed object it holds.
     objstm_cache: RefCell<HashMap<u32, Arc<DecodedObjStm>>>,
+    /// Retained decoded-object-stream bytes, including parsed header entries.
+    objstm_cache_bytes: Cell<u64>,
     /// Lazily-built repair table: populated at most once by a full-file object
     /// scan, the first time an xref offset turns out to hold the wrong object
     /// (or no parseable object at all). The inner `None` means the scan itself
@@ -125,7 +130,9 @@ impl PdfFile {
             limits,
             decryptor: None,
             object_cache: RefCell::new(HashMap::new()),
+            object_cache_bytes: Cell::new(0),
             objstm_cache: RefCell::new(HashMap::new()),
+            objstm_cache_bytes: Cell::new(0),
             repair_table: OnceCell::new(),
         };
         // Build the decryptor *after* construction so it can use `resolve` to
@@ -248,8 +255,24 @@ impl PdfFile {
             other => other,
         };
 
-        self.object_cache.borrow_mut().insert(id, obj.clone());
+        self.cache_object(id, &obj);
         Ok(obj)
+    }
+
+    /// Admit a resolved object only while the configured retained-memory budget
+    /// has room. A full cache degrades to reparsing instead of retaining an
+    /// attacker-controlled number of objects for the document's lifetime.
+    fn cache_object(&self, id: ObjectId, obj: &PdfObject) {
+        if self.object_cache.borrow().contains_key(&id) {
+            return;
+        }
+        let cost = estimate_cached_object_bytes(obj);
+        let used = self.object_cache_bytes.get();
+        if cost > self.limits.max_object_cache_bytes.saturating_sub(used) {
+            return;
+        }
+        self.object_cache.borrow_mut().insert(id, obj.clone());
+        self.object_cache_bytes.set(used.saturating_add(cost));
     }
 
     /// Parse the indirect object at `offset`, validating that the header's
@@ -258,7 +281,10 @@ impl PdfFile {
     /// scan, run at most once) before giving up.
     fn parse_at_offset_checked(&self, offset: u64, id: ObjectId) -> Result<PdfObject> {
         let parser = ObjectParser::new(&self.data, &self.limits);
-        match parser.parse_indirect_with_id(offset as usize) {
+        let file_offset = usize::try_from(offset).map_err(|_| {
+            zpdf_core::Error::InvalidObject(offset, "xref offset exceeds address space".into())
+        })?;
+        match parser.parse_indirect_with_id(file_offset) {
             Ok((pid, mut obj)) if pid == id => {
                 // Top-level objects parsed straight from the file are encrypted;
                 // RC4-decrypt their strings and stream bytes in place (the
@@ -309,7 +335,8 @@ impl PdfFile {
         match table.get(id)? {
             XrefEntry::InUse { offset, .. } => {
                 let parser = ObjectParser::new(&self.data, &self.limits);
-                let (pid, mut obj) = parser.parse_indirect_with_id(*offset as usize).ok()?;
+                let file_offset = usize::try_from(*offset).ok()?;
+                let (pid, mut obj) = parser.parse_indirect_with_id(file_offset).ok()?;
                 if pid != id {
                     return None;
                 }
@@ -344,8 +371,10 @@ impl PdfFile {
         let obj = self.resolve(id)?;
         let stream = obj.as_stream()?;
         match self.dict_with_resolved_filters(&stream.dict, inline_globals) {
-            Some(resolved) => filters::decode_stream(&stream.data, &resolved),
-            None => filters::decode_stream(&stream.data, &stream.dict),
+            Some(resolved) => {
+                filters::decode_stream_with_limits(&stream.data, &resolved, &self.limits)
+            }
+            None => filters::decode_stream_with_limits(&stream.data, &stream.dict, &self.limits),
         }
     }
 
@@ -491,7 +520,13 @@ impl PdfFile {
         let stream_obj = match stream_entry {
             XrefEntry::InUse { offset, .. } => {
                 let parser = ObjectParser::new(&self.data, &self.limits);
-                parser.parse_indirect_at(*offset as usize)?
+                let file_offset = usize::try_from(*offset).map_err(|_| {
+                    zpdf_core::Error::InvalidObject(
+                        *offset,
+                        "object-stream offset exceeds address space".into(),
+                    )
+                })?;
+                parser.parse_indirect_at(file_offset)?
             }
             _ => return Err(zpdf_core::Error::ObjectNotFound(stream_id)),
         };
@@ -504,6 +539,12 @@ impl PdfFile {
             |what: &str| zpdf_core::Error::InvalidObject(0, format!("ObjStm {what} is negative"));
         let n = usize::try_from(stream.dict.get_i64("N")?).map_err(|_| neg("/N"))?;
         let first = usize::try_from(stream.dict.get_i64("First")?).map_err(|_| neg("/First"))?;
+        if n > self.limits.max_objects as usize {
+            return Err(zpdf_core::Error::StreamDecode(format!(
+                "ObjStm /N {n} exceeds object limit {}",
+                self.limits.max_objects
+            )));
+        }
 
         // An encrypted document encrypts the ObjStm *container* once (keyed by
         // the container's own object id); its member objects are not separately
@@ -514,7 +555,7 @@ impl PdfFile {
             ),
             None => std::borrow::Cow::Borrowed(&stream.data),
         };
-        let decoded = filters::decode_stream(&raw, &stream.dict)?;
+        let decoded = filters::decode_stream_with_limits(&raw, &stream.dict, &self.limits)?;
 
         // Parse the header: N pairs of (obj_num, offset_within_data). Capacity is
         // bounded by the header length to avoid a huge allocation on a bogus /N.
@@ -538,9 +579,14 @@ impl PdfFile {
             first,
             entries,
         });
-        self.objstm_cache
-            .borrow_mut()
-            .insert(stream_obj_num, Arc::clone(&decoded_arc));
+        let cost = estimate_objstm_bytes(&decoded_arc);
+        let used = self.objstm_cache_bytes.get();
+        if cost <= self.limits.max_objstm_cache_bytes.saturating_sub(used) {
+            self.objstm_cache
+                .borrow_mut()
+                .insert(stream_obj_num, Arc::clone(&decoded_arc));
+            self.objstm_cache_bytes.set(used.saturating_add(cost));
+        }
         Ok(decoded_arc)
     }
 
@@ -611,6 +657,54 @@ impl PdfFile {
     }
 }
 
+/// Conservative heap-size estimate for one cached object and its hash-table
+/// entry. It intentionally counts inline child enum storage as well as nested
+/// payloads; overestimating only reduces cache hit rate, while underestimating
+/// would defeat the retention limit.
+fn estimate_cached_object_bytes(obj: &PdfObject) -> u64 {
+    const ENTRY_OVERHEAD: u64 = 64;
+
+    fn dict_bytes(dict: &PdfDict) -> u64 {
+        dict.0.iter().fold(0u64, |sum, (key, value)| {
+            sum.saturating_add(key.0.len() as u64)
+                .saturating_add(48) // conservative BTree node/link overhead
+                .saturating_add(object_bytes(value))
+        })
+    }
+
+    fn object_bytes(obj: &PdfObject) -> u64 {
+        let base = std::mem::size_of::<PdfObject>() as u64;
+        let payload = match obj {
+            PdfObject::String(s) => s.0.len() as u64,
+            PdfObject::Name(n) => n.0.len() as u64,
+            PdfObject::Array(items) => items.iter().fold(
+                (items.len() * std::mem::size_of::<PdfObject>()) as u64,
+                |sum, item| sum.saturating_add(object_bytes(item)),
+            ),
+            PdfObject::Dict(dict) => dict_bytes(dict),
+            PdfObject::Stream(stream) => {
+                (stream.data.len() as u64).saturating_add(dict_bytes(&stream.dict))
+            }
+            PdfObject::Null
+            | PdfObject::Bool(_)
+            | PdfObject::Integer(_)
+            | PdfObject::Real(_)
+            | PdfObject::Ref(_) => 0,
+        };
+        base.saturating_add(payload)
+    }
+
+    ENTRY_OVERHEAD.saturating_add(object_bytes(obj))
+}
+
+fn estimate_objstm_bytes(stream: &DecodedObjStm) -> u64 {
+    const ENTRY_OVERHEAD: u64 = 64;
+    ENTRY_OVERHEAD
+        .saturating_add(std::mem::size_of::<DecodedObjStm>() as u64)
+        .saturating_add(stream.data.len() as u64)
+        .saturating_add((stream.entries.len() * std::mem::size_of::<(u32, usize)>()) as u64)
+}
+
 /// Best-effort check that the trailer's /Root points at a usable Catalog. Runs
 /// once at open time (before `PdfFile` exists), so it is a free function that
 /// parses the Root directly rather than going through `PdfFile::resolve`.
@@ -630,9 +724,12 @@ fn root_resolves(
     match xref.get(root_ref) {
         Some(XrefEntry::InUse { offset, .. }) => {
             let parser = ObjectParser::new(data, limits);
+            let Some(file_offset) = usize::try_from(*offset).ok() else {
+                return false;
+            };
             matches!(
                 parser
-                    .parse_indirect_at(*offset as usize)
+                    .parse_indirect_at(file_offset)
                     .ok()
                     .and_then(|o| o
                         .as_dict()
@@ -847,6 +944,79 @@ mod tests {
         let file = PdfFile::parse(d).unwrap();
         let data = file.resolve_stream_data(ObjectId(3, 0)).unwrap();
         assert_eq!(data, payload);
+    }
+
+    #[test]
+    fn resolve_stream_uses_file_decode_limits() {
+        let pdf = build_pdf(
+            &[
+                (1, "<< /Type /Catalog >>"),
+                (3, "<< /Length 4 >>\nstream\nfour\nendstream"),
+            ],
+            1,
+        );
+        let limits = ParseLimits {
+            max_decoded_stream_bytes: 3,
+            ..ParseLimits::default()
+        };
+        let file = PdfFile::parse_with_limits(pdf, limits).unwrap();
+        assert!(matches!(
+            file.resolve_stream_data(ObjectId(3, 0)),
+            Err(zpdf_core::Error::StreamSizeLimit(3))
+        ));
+    }
+
+    #[test]
+    fn zero_object_cache_budget_retains_nothing() {
+        let pdf = build_pdf(&[(1, "<< /Type /Catalog /Marker (large) >>")], 1);
+        let limits = ParseLimits {
+            max_object_cache_bytes: 0,
+            ..ParseLimits::default()
+        };
+        let file = PdfFile::parse_with_limits(pdf, limits).unwrap();
+        assert_eq!(
+            file.resolve(ObjectId(1, 0))
+                .unwrap()
+                .as_dict()
+                .unwrap()
+                .get_name("Type")
+                .unwrap(),
+            "Catalog"
+        );
+        assert!(file.object_cache.borrow().is_empty());
+        assert_eq!(file.object_cache_bytes.get(), 0);
+    }
+
+    #[test]
+    fn zero_objstm_cache_budget_decodes_without_retention() {
+        let pdf = build_pdf(
+            &[
+                (1, "<< /Type /Catalog >>"),
+                (
+                    5,
+                    "<< /Type /ObjStm /N 1 /First 4 /Length 6 >>\nstream\n6 0 42\nendstream",
+                ),
+            ],
+            1,
+        );
+        let limits = ParseLimits {
+            max_objstm_cache_bytes: 0,
+            ..ParseLimits::default()
+        };
+        let mut file = PdfFile::parse_with_limits(pdf, limits).unwrap();
+        file.xref.insert_overwrite(
+            ObjectId(6, 0),
+            XrefEntry::Compressed {
+                stream_obj: 5,
+                index_in_stream: 0,
+            },
+        );
+        assert_eq!(
+            file.resolve(ObjectId(6, 0)).unwrap(),
+            PdfObject::Integer(42)
+        );
+        assert!(file.objstm_cache.borrow().is_empty());
+        assert_eq!(file.objstm_cache_bytes.get(), 0);
     }
 
     /// An image stream with /Filter /JBIG2Decode whose /DecodeParms holds an

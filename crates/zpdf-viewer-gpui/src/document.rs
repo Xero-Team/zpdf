@@ -50,6 +50,8 @@ pub enum DocumentError {
         #[source]
         source: zpdf::Error,
     },
+    #[error("PDF {path} contains no pages")]
+    EmptyDocument { path: PathBuf },
     #[error("failed to read page {page} from {path}: {source}")]
     ReadPage {
         path: PathBuf,
@@ -71,6 +73,13 @@ pub enum DocumentError {
         #[source]
         source: WgpuRenderError,
     },
+    #[error("GPU rendering failed and CPU fallback failed for page {page} from {path}: {source}")]
+    RenderPageCpu {
+        path: PathBuf,
+        page: usize,
+        #[source]
+        source: zpdf::cpu::CpuRenderError,
+    },
     #[error("failed to build page image for page {page} from {path}")]
     BuildPageImage { path: PathBuf, page: usize },
 }
@@ -84,6 +93,9 @@ pub fn load_document(path: PathBuf) -> Result<LoadedDocument, DocumentError> {
         path: path.clone(),
         source,
     })?;
+    if pdf.page_count() == 0 {
+        return Err(DocumentError::EmptyDocument { path });
+    }
 
     let mut pages = Vec::with_capacity(pdf.page_count());
     for index in 0..pdf.page_count() {
@@ -211,31 +223,60 @@ impl LoadedDocument {
             }
         }
 
-        let mut renderer = WgpuRenderer::new().with_fonts(&fonts).with_images(&images);
+        let mut renderer = WgpuRenderer::new()
+            .with_limits(self.pdf.file().limits())
+            .with_fonts(&fonts)
+            .with_images(&images);
         if let Some(context) = context_slot.take() {
             renderer = renderer.with_context(context);
         }
 
         let render_result = renderer.render_display_list(&display_list, dpi / 72.0);
-        *context_slot = renderer.take_context();
+        let context = renderer.take_context();
+        let (width, height, data) = match render_result {
+            Ok(texture) => {
+                *context_slot = context;
+                (texture.width, texture.height, texture.data)
+            }
+            Err(source) => {
+                // Validation/size failures leave the device healthy. Poll,
+                // readback, or uncaptured device errors may indicate loss, so
+                // discard that context and recreate it on the next attempt.
+                *context_slot = if matches!(
+                    source,
+                    WgpuRenderError::Unsupported(_)
+                        | WgpuRenderError::InvalidPage(_)
+                        | WgpuRenderError::NoActivePage
+                ) {
+                    context
+                } else {
+                    None
+                };
+                tracing::warn!(page = index + 1, error = %source, "GPU render failed; using CPU fallback");
+                let page = zpdf::cpu::CpuRenderer::new()
+                    .with_limits(self.pdf.file().limits())
+                    .with_fonts(&fonts)
+                    .with_images(&images)
+                    .render_display_list(&display_list, dpi / 72.0)
+                    .map_err(|source| DocumentError::RenderPageCpu {
+                        path: self.summary.path.clone(),
+                        page: index + 1,
+                        source,
+                    })?;
+                (page.width, page.height, page.data)
+            }
+        };
 
-        let texture = render_result.map_err(|source| DocumentError::RenderPage {
-            path: self.summary.path.clone(),
-            page: index + 1,
-            source,
-        })?;
-
-        let image = render_image_from_rgba(texture.width, texture.height, texture.data).ok_or(
-            DocumentError::BuildPageImage {
+        let image =
+            render_image_from_rgba(width, height, data).ok_or(DocumentError::BuildPageImage {
                 path: self.summary.path.clone(),
                 page: index + 1,
-            },
-        )?;
+            })?;
 
         Ok(PagePreview {
             image,
-            pixel_width: texture.width as f32,
-            pixel_height: texture.height as f32,
+            pixel_width: width as f32,
+            pixel_height: height as f32,
         })
     }
 }

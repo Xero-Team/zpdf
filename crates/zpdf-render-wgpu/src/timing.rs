@@ -19,8 +19,8 @@ pub struct GpuTimer {
 impl GpuTimer {
     /// Create a timer. All internals are `None` when the context doesn't
     /// support timestamp queries, making every other method a no-op.
-    pub fn new(ctx: &GpuContext) -> Self {
-        if !ctx.timestamps_supported {
+    pub fn new(ctx: &GpuContext, enabled: bool) -> Self {
+        if !enabled || !ctx.timestamps_supported {
             return Self {
                 query_set: None,
                 resolve_buf: None,

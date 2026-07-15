@@ -1,5 +1,7 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
+use zpdf_core::ParseLimits;
 use zpdf_display_list::*;
 use zpdf_font::{FontCache, GlyphOutline, OutlineCommand};
 use zpdf_image::ImageCache;
@@ -15,6 +17,13 @@ pub struct CpuRenderer<'a> {
     rect_y1: f32,
     font_cache: Option<&'a FontCache>,
     image_cache: Option<&'a ImageCache>,
+    /// Maximum pixels in one output raster. Oversized pages are uniformly
+    /// downscaled before allocation so the complete page still renders.
+    max_page_pixels: u64,
+    /// Maximum live transparency-group nesting, including groups inside masks.
+    max_blend_group_depth: usize,
+    /// Maximum retained one-byte soft-mask coverage planes per page.
+    max_soft_mask_cache_bytes: u64,
     clip_stack: Vec<ClipFrame>,
     current_clip: Option<tiny_skia::Mask>,
     /// Cumulative full-raster clip-mask work (Σ width·height over built clip
@@ -23,7 +32,15 @@ pub struct CpuRenderer<'a> {
     /// allocate/zero gigabytes of mask memory and hang. Past the budget, further
     /// clips are skipped (the page renders complete but slightly over-painted).
     clip_pixel_spent: u64,
+    /// Bytes retained by the active clip plus saved masks on the clip stack.
+    clip_mask_bytes: u64,
     blend_stack: Vec<BlendEntry>,
+    /// Bytes retained by the live page/group pixmap plus parked blend parents.
+    blend_surface_bytes: u64,
+    /// Blend pushes skipped after reaching a configured depth limit or the
+    /// render deadline. Keeping a separate depth lets matching pops unwind
+    /// without accidentally popping a real outer group.
+    skipped_blend_depth: usize,
     /// Wall-clock ceiling per page, an anti-hang backstop for adversarial pages
     /// that emit hundreds of thousands of expensive primitives (strokes, large
     /// fills, glyphs) — too many to render in bounded time yet individually
@@ -40,7 +57,13 @@ pub struct CpuRenderer<'a> {
     /// offset) to every painted command of every tile; without this the full
     /// page-sized mask would re-rasterize per command. Cleared per page —
     /// the keys are Arc pointers, only stable while the display list lives.
-    soft_mask_planes: HashMap<SoftMaskPlaneKey, Vec<u8>>,
+    soft_mask_planes: HashMap<SoftMaskPlaneKey, Arc<[u8]>>,
+    soft_mask_cache_bytes: u64,
+    /// Current recursive soft-mask depth (guards malicious/cyclic mask graphs).
+    soft_mask_depth: usize,
+    /// Box-filtered image variants reused by repeated draws at the same device
+    /// footprint (common for patterns and repeated XObjects).
+    downscaled_images: HashMap<(ImageId, u32, u32), Arc<[u8]>>,
 }
 
 /// Identity of a [`SoftMask`] up to its offset: command list and transfer
@@ -68,11 +91,19 @@ impl SoftMaskPlaneKey {
     }
 }
 
+fn unit(v: f32) -> f32 {
+    if v.is_finite() {
+        v.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
 /// Coverage where the mask group painted nothing — what a fresh raster
 /// produces outside the group, used to fill strips vacated by a plane shift.
 fn unpainted_value(mask: &SoftMask) -> u8 {
     let v = match mask.kind {
-        SoftMaskKind::Luminosity => (mask.backdrop_luma.clamp(0.0, 1.0) * 255.0).round() as u8,
+        SoftMaskKind::Luminosity => (unit(mask.backdrop_luma) * 255.0).round() as u8,
         SoftMaskKind::Alpha => 0,
     };
     match &mask.transfer {
@@ -129,6 +160,48 @@ enum ClipFrame {
 /// ~2 Gpx keeps every realistic clip-heavy page intact while bounding adversarial
 /// ones to roughly a second of mask work.
 const MAX_CLIP_PIXEL_WORK: u64 = 2_000_000_000;
+const MAX_CLIP_MASK_BYTES: u64 = 128 * 1024 * 1024;
+
+const MAX_DOWNSCALED_IMAGE_CACHE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_BLEND_SURFACE_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Uniformly reduce `scale` until ceil-rounded dimensions fit an exact pixel
+/// budget. Recomputing after every reduction matters for very thin pages: one
+/// dimension bottoms out at one pixel, so a single square-root estimate can
+/// otherwise remain well above the requested total.
+fn fit_raster_to_pixel_limit(
+    width_points: f64,
+    height_points: f64,
+    requested_scale: f32,
+    max_pixels: u64,
+) -> Option<(f32, u32, u32)> {
+    if max_pixels == 0 {
+        return None;
+    }
+    let dimensions = |scale: f32| {
+        let width = (width_points * scale as f64).ceil().max(1.0) as u32;
+        let height = (height_points * scale as f64).ceil().max(1.0) as u32;
+        (width, height, width as u64 * height as u64)
+    };
+
+    let mut scale = requested_scale;
+    for _ in 0..96 {
+        let (width, height, pixels) = dimensions(scale);
+        if pixels <= max_pixels {
+            return Some((scale, width, height));
+        }
+        let shrink = (max_pixels as f64 / pixels as f64).sqrt() * (1.0 - f64::EPSILON);
+        let candidate = (scale as f64 * shrink) as f32;
+        scale = if candidate > 0.0 && candidate < scale {
+            candidate
+        } else if scale.to_bits() > 1 {
+            f32::from_bits(scale.to_bits() - 1)
+        } else {
+            return None;
+        };
+    }
+    None
+}
 
 struct BlendEntry {
     /// The parked parent raster (the group's backdrop), restored and composited
@@ -139,7 +212,7 @@ struct BlendEntry {
     alpha: f32,
     /// Rasterized soft-mask coverage (one byte per pixel), multiplied into the
     /// group before compositing.
-    mask: Option<Vec<u8>>,
+    mask: Option<Arc<[u8]>>,
     /// Knockout group: each element composites against the group's initial
     /// backdrop rather than the accumulation of preceding elements.
     knockout: bool,
@@ -158,12 +231,17 @@ pub enum CpuRenderError {
     NotInitialized,
     #[error("failed to create pixmap")]
     PixmapCreation,
+    #[error("invalid page render info: {0}")]
+    InvalidPage(#[from] zpdf_render::PageGeometryError),
+    #[error("render limit exceeded: {0}")]
+    LimitExceeded(String),
     #[error("png encode error: {0}")]
     PngEncode(String),
 }
 
 impl<'a> CpuRenderer<'a> {
     pub fn new() -> Self {
+        let limits = ParseLimits::default();
         Self {
             pixmap: None,
             scale: 1.0,
@@ -172,20 +250,38 @@ impl<'a> CpuRenderer<'a> {
             rect_y1: 0.0,
             font_cache: None,
             image_cache: None,
+            max_page_pixels: limits.max_page_pixels,
+            max_blend_group_depth: limits.max_blend_group_depth as usize,
+            max_soft_mask_cache_bytes: limits.max_softmask_cache_bytes,
             clip_stack: Vec::new(),
             current_clip: None,
             clip_pixel_spent: 0,
+            clip_mask_bytes: 0,
             blend_stack: Vec::new(),
+            blend_surface_bytes: 0,
+            skipped_blend_depth: 0,
             render_budget: Some(DEFAULT_RENDER_BUDGET),
             deadline: None,
             over_budget: false,
             soft_mask_planes: HashMap::new(),
+            soft_mask_cache_bytes: 0,
+            soft_mask_depth: 0,
+            downscaled_images: HashMap::new(),
         }
     }
 
     /// Override the per-page wall-clock render budget (`None` disables it).
     pub fn with_render_budget(mut self, budget: Option<std::time::Duration>) -> Self {
         self.render_budget = budget;
+        self
+    }
+
+    /// Apply the render-time security budgets from the document being rendered.
+    /// The values are copied, so the renderer does not borrow the limits object.
+    pub fn with_limits(mut self, limits: &ParseLimits) -> Self {
+        self.max_page_pixels = limits.max_page_pixels;
+        self.max_blend_group_depth = limits.max_blend_group_depth as usize;
+        self.max_soft_mask_cache_bytes = limits.max_softmask_cache_bytes;
         self
     }
 
@@ -402,12 +498,15 @@ impl<'a> CpuRenderer<'a> {
             return;
         };
         let (pw, ph) = (pixmap.width(), pixmap.height());
+        let mask_bytes = pw as u64 * ph as u64;
 
         // Budget guard: once the page has spent its clip-mask pixel-work, stop
         // building new full-raster masks (which would hang on 100k-clip pages).
         // The matching PopClip pops a `Skipped` frame and the previously-active
         // clip stays in force — strictly tighter than dropping clipping entirely.
-        if self.clip_pixel_spent >= MAX_CLIP_PIXEL_WORK {
+        if self.clip_pixel_spent >= MAX_CLIP_PIXEL_WORK
+            || self.clip_mask_bytes.saturating_add(mask_bytes) > MAX_CLIP_MASK_BYTES
+        {
             self.clip_stack.push(ClipFrame::Skipped);
             return;
         }
@@ -426,6 +525,7 @@ impl<'a> CpuRenderer<'a> {
             }
         };
         self.clip_pixel_spent += pw as u64 * ph as u64;
+        self.clip_mask_bytes += mask_bytes;
 
         mask.fill_path(
             &skia_path,
@@ -469,8 +569,21 @@ impl<'a> CpuRenderer<'a> {
         match self.clip_stack.pop() {
             // Budget-skipped push: leave the active clip untouched.
             Some(ClipFrame::Skipped) => {}
-            Some(ClipFrame::Mask(prev)) => self.current_clip = Some(prev),
-            Some(ClipFrame::Empty) | None => self.current_clip = None,
+            Some(ClipFrame::Mask(prev)) => {
+                if let Some(removed) = self.current_clip.replace(prev) {
+                    self.clip_mask_bytes = self
+                        .clip_mask_bytes
+                        .saturating_sub(removed.width() as u64 * removed.height() as u64);
+                }
+            }
+            Some(ClipFrame::Empty) => {
+                if let Some(mask) = self.current_clip.take() {
+                    self.clip_mask_bytes = self
+                        .clip_mask_bytes
+                        .saturating_sub(mask.width() as u64 * mask.height() as u64);
+                }
+            }
+            None => {}
         }
     }
 
@@ -483,8 +596,11 @@ impl<'a> CpuRenderer<'a> {
             return;
         };
         let (pw, ph) = (pixmap.width(), pixmap.height());
+        let mask_bytes = pw as u64 * ph as u64;
 
-        if self.clip_pixel_spent >= MAX_CLIP_PIXEL_WORK {
+        if self.clip_pixel_spent >= MAX_CLIP_PIXEL_WORK
+            || self.clip_mask_bytes.saturating_add(mask_bytes) > MAX_CLIP_MASK_BYTES
+        {
             self.clip_stack.push(ClipFrame::Skipped);
             return;
         }
@@ -497,6 +613,7 @@ impl<'a> CpuRenderer<'a> {
             return;
         };
         self.clip_pixel_spent += pw as u64 * ph as u64;
+        self.clip_mask_bytes += mask_bytes;
 
         let mut paint = tiny_skia::Paint::default();
         paint.set_color(tiny_skia::Color::WHITE);
@@ -550,6 +667,23 @@ impl<'a> CpuRenderer<'a> {
         alpha: f32,
         mask: Option<&SoftMask>,
     ) {
+        // Once a group is skipped, all of its nested groups must also be
+        // structural no-ops until the matching pops drain the skipped depth.
+        // Otherwise a nested pop could accidentally close the real outer group.
+        if self.skipped_blend_depth > 0 {
+            self.skipped_blend_depth = self.skipped_blend_depth.saturating_add(1);
+            return;
+        }
+        let depth = self.soft_mask_depth.saturating_add(self.blend_stack.len());
+        if depth >= self.max_blend_group_depth {
+            self.skipped_blend_depth = 1;
+            tracing::warn!(
+                limit = self.max_blend_group_depth,
+                "blend-group nesting exceeds configured limit; using passthrough"
+            );
+            return;
+        }
+
         // Rasterize the soft mask before parking the base pixmap (needs dims).
         let mask_plane = mask.and_then(|m| self.soft_mask_plane(m));
 
@@ -584,6 +718,24 @@ impl<'a> CpuRenderer<'a> {
         };
         let w = pixmap.width();
         let h = pixmap.height();
+        let surface_bytes = w as u64 * h as u64 * 4;
+
+        if self.blend_surface_bytes.saturating_add(surface_bytes) > MAX_BLEND_SURFACE_BYTES {
+            self.pixmap = Some(pixmap);
+            tracing::warn!("blend-group surfaces exceed memory budget; using passthrough");
+            if let Some(sentinel) = tiny_skia::Pixmap::new(1, 1) {
+                self.blend_stack.push(BlendEntry {
+                    pixmap: sentinel,
+                    blend_mode,
+                    alpha,
+                    mask: None,
+                    knockout: false,
+                    backdrop: None,
+                    passthrough: true,
+                });
+            }
+            return;
+        }
 
         // The group renders into its own transparent buffer (isolated). A
         // non-isolated group that reached this point carries a group-level
@@ -593,7 +745,10 @@ impl<'a> CpuRenderer<'a> {
         let group = tiny_skia::Pixmap::new(w, h);
         // Per-element knockout composites against the (transparent) initial
         // backdrop preserved here.
-        let backdrop = if knockout { group.clone() } else { None };
+        // This backend currently approximates every non-passthrough group as
+        // isolated, so its initial backdrop is transparent. Do not clone the
+        // full-page transparent pixmap merely to represent that fact.
+        let backdrop = None;
 
         self.blend_stack.push(BlendEntry {
             pixmap,
@@ -606,6 +761,9 @@ impl<'a> CpuRenderer<'a> {
         });
 
         self.pixmap = group;
+        if self.pixmap.is_some() {
+            self.blend_surface_bytes += surface_bytes;
+        }
     }
 
     fn pop_blend_group(&mut self) {
@@ -648,7 +806,7 @@ impl<'a> CpuRenderer<'a> {
 
         let paint = tiny_skia::PixmapPaint {
             blend_mode: blend,
-            opacity: entry.alpha.clamp(0.0, 1.0),
+            opacity: unit(entry.alpha),
             ..Default::default()
         };
 
@@ -662,6 +820,9 @@ impl<'a> CpuRenderer<'a> {
         );
 
         self.pixmap = Some(base);
+        self.blend_surface_bytes = self
+            .blend_surface_bytes
+            .saturating_sub(group_pixmap.width() as u64 * group_pixmap.height() as u64 * 4);
     }
 
     /// Dispatch the four painting commands to their renderers (shared by the
@@ -723,6 +884,12 @@ impl<'a> CpuRenderer<'a> {
             Some(p) => (p.width(), p.height()),
             None => return,
         };
+        let scratch_bytes = w as u64 * h as u64 * 4 * 2;
+        if self.blend_surface_bytes.saturating_add(scratch_bytes) > MAX_BLEND_SURFACE_BYTES {
+            tracing::warn!("knockout scratch surfaces exceed memory budget; using accumulation");
+            self.render_paint_cmd(cmd);
+            return;
+        }
 
         // Pass 1: the element as painted (real colour and opacity).
         let group = self.pixmap.take();
@@ -770,6 +937,12 @@ impl<'a> CpuRenderer<'a> {
             Some(p) => (p.width(), p.height()),
             None => return,
         };
+        let scratch_bytes = w as u64 * h as u64 * 4;
+        if self.blend_surface_bytes.saturating_add(scratch_bytes) > MAX_BLEND_SURFACE_BYTES {
+            tracing::warn!("overprint scratch surface exceeds memory budget; using source-over");
+            self.render_paint_cmd(cmd);
+            return;
+        }
         // Render the element (real colour/opacity, current clip) into a scratch
         // buffer; only its alpha channel — the covered fraction — is consumed.
         let canvas = self.pixmap.take();
@@ -798,22 +971,55 @@ impl<'a> CpuRenderer<'a> {
             let p = self.pixmap.as_ref()?;
             (p.width(), p.height())
         };
+        let mask_work_bytes = w as u64 * h as u64 * 5; // RGBA scratch + 1-byte plane
+        if self.blend_surface_bytes.saturating_add(mask_work_bytes) > MAX_BLEND_SURFACE_BYTES {
+            tracing::warn!("soft-mask scratch exceeds memory budget; skipping mask");
+            return None;
+        }
 
         // Page-space offset → device pixels (device y grows downward).
         let dx = (mask.offset.0 * self.scale).round() as i64;
         let dy = (-mask.offset.1 * self.scale).round() as i64;
 
         let key = SoftMaskPlaneKey::new(mask);
-        if !self.soft_mask_planes.contains_key(&key) {
-            let plane = self.rasterize_soft_mask(mask)?;
-            self.soft_mask_planes.insert(key, plane);
+        if let Some(base) = self.soft_mask_planes.get(&key) {
+            if dx == 0 && dy == 0 {
+                return Some(Arc::clone(base));
+            }
+            return Some(Arc::from(shift_plane(
+                base,
+                w,
+                h,
+                dx,
+                dy,
+                unpainted_value(mask),
+            )));
         }
-        let base = self.soft_mask_planes.get(&key)?;
 
-        if dx == 0 && dy == 0 {
-            return Some(base.clone());
+        let base: Arc<[u8]> = Arc::from(self.rasterize_soft_mask(mask)?);
+        let base_bytes = base.len() as u64;
+        if base_bytes <= self.max_soft_mask_cache_bytes {
+            if self.soft_mask_cache_bytes.saturating_add(base_bytes)
+                > self.max_soft_mask_cache_bytes
+            {
+                self.soft_mask_planes.clear();
+                self.soft_mask_cache_bytes = 0;
+            }
+            self.soft_mask_planes.insert(key, Arc::clone(&base));
+            self.soft_mask_cache_bytes = self.soft_mask_cache_bytes.saturating_add(base_bytes);
         }
-        Some(shift_plane(base, w, h, dx, dy, unpainted_value(mask)))
+        if dx == 0 && dy == 0 {
+            Some(base)
+        } else {
+            Some(Arc::from(shift_plane(
+                &base,
+                w,
+                h,
+                dx,
+                dy,
+                unpainted_value(mask),
+            )))
+        }
     }
 
     /// Render a soft mask's group commands offscreen (same page geometry as
@@ -830,7 +1036,7 @@ impl<'a> CpuRenderer<'a> {
             // Luminosity masks composite the group over the /BC backdrop; the
             // result stays opaque, so luminance reads are exact.
             SoftMaskKind::Luminosity => {
-                let l = mask.backdrop_luma.clamp(0.0, 1.0);
+                let l = unit(mask.backdrop_luma);
                 target.fill(tiny_skia::Color::from_rgba(l, l, l, 1.0)?);
             }
             // Alpha masks read group coverage; start fully transparent.
@@ -845,19 +1051,38 @@ impl<'a> CpuRenderer<'a> {
             rect_y1: self.rect_y1,
             font_cache: self.font_cache,
             image_cache: self.image_cache,
+            max_page_pixels: self.max_page_pixels,
+            max_blend_group_depth: self.max_blend_group_depth,
+            max_soft_mask_cache_bytes: self.max_soft_mask_cache_bytes,
             clip_stack: Vec::new(),
             current_clip: None,
             clip_pixel_spent: 0,
+            clip_mask_bytes: 0,
             blend_stack: Vec::new(),
+            blend_surface_bytes: w as u64 * h as u64 * 4,
+            skipped_blend_depth: 0,
             // Share the parent page's deadline so a soft-mask group cannot hang
             // past the budget the top-level render already started counting.
             render_budget: self.render_budget,
             deadline: self.deadline,
             over_budget: self.over_budget,
             soft_mask_planes: HashMap::new(),
+            soft_mask_cache_bytes: 0,
+            // The mask belongs to the group currently being pushed, so carry
+            // both enclosing mask depth and live page-group depth into the
+            // sub-renderer. Nested groups inside the mask then share one exact
+            // max_blend_group_depth budget with the outer page.
+            soft_mask_depth: self
+                .soft_mask_depth
+                .saturating_add(self.blend_stack.len())
+                .saturating_add(1),
+            downscaled_images: HashMap::new(),
         };
         for cmd in &mask.commands.commands {
             let _ = sub.execute(cmd);
+        }
+        while !sub.blend_stack.is_empty() {
+            sub.pop_blend_group();
         }
         let rendered = sub.pixmap.take()?;
 
@@ -867,7 +1092,7 @@ impl<'a> CpuRenderer<'a> {
                 SoftMaskKind::Luminosity => {
                     let a = px.alpha();
                     if a == 0 {
-                        (mask.backdrop_luma * 255.0).round() as u8
+                        (unit(mask.backdrop_luma) * 255.0).round() as u8
                     } else {
                         let d = px.demultiply();
                         // Rec. 601 luma.
@@ -919,11 +1144,26 @@ impl<'a> CpuRenderer<'a> {
             Some(img) => img,
             None => return,
         };
-        let pixmap = match self.pixmap.as_mut() {
-            Some(p) => p,
-            None => return,
+        let Some(expected_len) = (image.width as usize)
+            .checked_mul(image.height as usize)
+            .and_then(|n| n.checked_mul(4))
+        else {
+            tracing::warn!(
+                image_id = draw.image_id,
+                "skipping overflowing image dimensions"
+            );
+            return;
         };
-
+        if image.width == 0 || image.height == 0 || image.data.len() != expected_len {
+            tracing::warn!(
+                image_id = draw.image_id,
+                width = image.width,
+                height = image.height,
+                bytes = image.data.len(),
+                "skipping malformed decoded image"
+            );
+            return;
+        }
         // PDF images occupy the unit square [0,1]×[0,1] in user space, mapped by
         // the CTM. Image sample space has its origin at the TOP-left with y
         // pointing DOWN (PDF spec §8.9.5.2), so sample row 0 maps to the top
@@ -963,17 +1203,36 @@ impl<'a> CpuRenderer<'a> {
         // Below ~0.5x per axis, bilinear sampling starts skipping source pixels
         // entirely (thin strokes in downscaled scans break up). Pre-downscale
         // with a box filter (plain average) to the target device scale first.
-        let mut downscaled: Option<(Vec<u8>, u32, u32)> = None;
+        let mut downscaled: Option<(Arc<[u8]>, u32, u32)> = None;
         if fx < 0.5 || fy < 0.5 {
             let tw = ((image.width as f32 * fx.min(1.0)).ceil() as u32).clamp(1, image.width);
             let th = ((image.height as f32 * fy.min(1.0)).ceil() as u32).clamp(1, image.height);
             if tw < image.width || th < image.height {
-                let data = box_downscale_rgba(&image.data, image.width, image.height, tw, th);
+                let key = (draw.image_id, tw, th);
+                let data = if let Some(data) = self.downscaled_images.get(&key) {
+                    Arc::clone(data)
+                } else {
+                    let data: Arc<[u8]> = Arc::from(box_downscale_rgba(
+                        &image.data,
+                        image.width,
+                        image.height,
+                        tw,
+                        th,
+                    ));
+                    let retained: usize = self.downscaled_images.values().map(|d| d.len()).sum();
+                    if data.len() <= MAX_DOWNSCALED_IMAGE_CACHE_BYTES {
+                        if retained.saturating_add(data.len()) > MAX_DOWNSCALED_IMAGE_CACHE_BYTES {
+                            self.downscaled_images.clear();
+                        }
+                        self.downscaled_images.insert(key, Arc::clone(&data));
+                    }
+                    data
+                };
                 downscaled = Some((data, tw, th));
             }
         }
         let (data, w, h) = match &downscaled {
-            Some((data, w, h)) => (data.as_slice(), *w, *h),
+            Some((data, w, h)) => (data.as_ref(), *w, *h),
             None => (image.data.as_slice(), image.width, image.height),
         };
         let src = match tiny_skia::PixmapRef::from_bytes(data, w, h) {
@@ -995,13 +1254,21 @@ impl<'a> CpuRenderer<'a> {
         );
 
         let paint = tiny_skia::PixmapPaint {
-            opacity: alpha_override,
+            opacity: if alpha_override.is_finite() {
+                alpha_override.clamp(0.0, 1.0)
+            } else {
+                0.0
+            },
             // Bilinear sampling (matches pdfium); nearest leaves blocky upscales
             // and aliased downscales.
             quality: tiny_skia::FilterQuality::Bilinear,
             ..Default::default()
         };
 
+        let pixmap = match self.pixmap.as_mut() {
+            Some(p) => p,
+            None => return,
+        };
         pixmap.draw_pixmap(0, 0, src, &paint, transform, self.current_clip.as_ref());
     }
 
@@ -1403,7 +1670,7 @@ fn overprint_merge(canvas: &mut [u8], elem: &[u8], op: &Overprint) {
         let mut res = [0f64; 4];
         for i in 0..4 {
             let tgt = if op.active & (1 << i) != 0 {
-                op.cmyk[i] as f64
+                unit(op.cmyk[i]) as f64
             } else {
                 bd[i]
             };
@@ -1477,6 +1744,9 @@ impl<'a> RenderBackend for CpuRenderer<'a> {
     type Error = CpuRenderError;
 
     fn begin_page(&mut self, info: &PageRenderInfo) -> Result<(), Self::Error> {
+        // A failed replacement must not leave the previous page available to a
+        // later `end_page` call.
+        self.pixmap = None;
         self.scale = info.scale;
         self.rect_x0 = info.page_rect.x0 as f32;
         self.rect_y0 = info.page_rect.y0 as f32;
@@ -1486,15 +1756,21 @@ impl<'a> RenderBackend for CpuRenderer<'a> {
         self.clip_stack.clear();
         self.current_clip = None;
         self.blend_stack.clear();
+        self.blend_surface_bytes = 0;
+        self.skipped_blend_depth = 0;
         self.clip_pixel_spent = 0;
+        self.clip_mask_bytes = 0;
         self.over_budget = false;
+        self.soft_mask_depth = 0;
+        self.soft_mask_planes.clear();
+        self.soft_mask_cache_bytes = 0;
+        self.downscaled_images.clear();
         self.deadline = self.render_budget.map(|d| std::time::Instant::now() + d);
 
         // ceil(), not truncation: a 595x842pt page at 110 DPI is 909.03x1286.6px
         // and must produce a 910x1287 raster (pdfium semantics) so no content is
         // sliced off the right/bottom edges.
-        let mut w = ((info.page_rect.width() * info.scale as f64).ceil() as u32).max(1);
-        let mut h = ((info.page_rect.height() * info.scale as f64).ceil() as u32).max(1);
+        let (mut w, mut h) = info.raster_dimensions()?;
 
         // Clamp the raster to a total-pixel budget. A pathological MediaBox (or
         // a high DPI on a huge page) otherwise demands a multi-gigabyte Pixmap
@@ -1502,15 +1778,29 @@ impl<'a> RenderBackend for CpuRenderer<'a> {
         // work (fills, blits, per-clip masks) hang. Scaling BOTH the dimensions
         // and `self.scale` by the same factor keeps geometry consistent, so the
         // output is a smaller-but-complete render instead of a crash/timeout.
-        const MAX_PIXELS: u64 = 64 * 1024 * 1024; // 64 Mpx (~8192×8192)
         let pixels = w as u64 * h as u64;
-        if pixels > MAX_PIXELS {
-            let shrink = (MAX_PIXELS as f64 / pixels as f64).sqrt();
-            self.scale *= shrink as f32;
-            w = ((info.page_rect.width() * self.scale as f64).ceil() as u32).max(1);
-            h = ((info.page_rect.height() * self.scale as f64).ceil() as u32).max(1);
+        if pixels > self.max_page_pixels {
+            let requested_scale = self.scale;
+            let (limited_scale, limited_width, limited_height) = fit_raster_to_pixel_limit(
+                info.page_rect.width(),
+                info.page_rect.height(),
+                requested_scale,
+                self.max_page_pixels,
+            )
+            .ok_or_else(|| {
+                CpuRenderError::LimitExceeded(format!(
+                    "page raster {w}x{h} cannot fit max_page_pixels={}",
+                    self.max_page_pixels
+                ))
+            })?;
+            self.scale = limited_scale;
+            w = limited_width;
+            h = limited_height;
             tracing::warn!(
-                "raster {pixels} px exceeds budget {MAX_PIXELS}; clamped to {w}x{h} (scale ×{shrink:.4})"
+                limit = self.max_page_pixels,
+                "raster {pixels} px exceeds configured budget; clamped to {w}x{h} (scale {:.4} -> {:.4})",
+                requested_scale,
+                self.scale
             );
         }
 
@@ -1518,17 +1808,24 @@ impl<'a> RenderBackend for CpuRenderer<'a> {
 
         let bg = &info.background;
         pixmap.fill(
-            tiny_skia::Color::from_rgba(bg.r, bg.g, bg.b, bg.a).unwrap_or(tiny_skia::Color::WHITE),
+            tiny_skia::Color::from_rgba(
+                bg.r.clamp(0.0, 1.0),
+                bg.g.clamp(0.0, 1.0),
+                bg.b.clamp(0.0, 1.0),
+                bg.a.clamp(0.0, 1.0),
+            )
+            .unwrap_or(tiny_skia::Color::WHITE),
         );
 
         self.pixmap = Some(pixmap);
-        // Mask-plane keys are Arc pointers into the previous display list;
-        // they must not survive into a new page.
-        self.soft_mask_planes.clear();
+        self.blend_surface_bytes = w as u64 * h as u64 * 4;
         Ok(())
     }
 
     fn execute(&mut self, cmd: &RenderCommand) -> Result<(), Self::Error> {
+        if self.pixmap.is_none() {
+            return Err(CpuRenderError::NotInitialized);
+        }
         // Anti-hang backstop: once the page's wall-clock budget is spent, skip
         // remaining draws so the command loop drains and the page returns
         // partially rendered instead of hanging. Checked before EVERY command:
@@ -1536,15 +1833,30 @@ impl<'a> RenderBackend for CpuRenderer<'a> {
         // very expensive (e.g. dozens of large images scaled across a huge
         // raster), so a coarse stride would never sample the clock in time.
         // Instant::now is cheap enough to call per command.
-        if self.over_budget {
-            return Ok(());
-        }
         if let Some(deadline) = self.deadline {
             if std::time::Instant::now() >= deadline {
                 self.over_budget = true;
                 tracing::warn!("render exceeded time budget; truncating page");
-                return Ok(());
             }
+        }
+
+        if self.over_budget {
+            // Continue only structural commands so a deadline reached inside a
+            // clip/blend group cannot leak that group's offscreen target into
+            // `end_page` or accidentally pop an outer group.
+            match cmd {
+                RenderCommand::PushClip { .. } | RenderCommand::PushClipStroke { .. } => {
+                    self.clip_stack.push(ClipFrame::Skipped);
+                }
+                RenderCommand::PopClip => self.pop_clip(),
+                RenderCommand::PushBlendGroup { .. } => self.skipped_blend_depth += 1,
+                RenderCommand::PopBlendGroup if self.skipped_blend_depth > 0 => {
+                    self.skipped_blend_depth -= 1;
+                }
+                RenderCommand::PopBlendGroup => self.pop_blend_group(),
+                _ => {}
+            }
+            return Ok(());
         }
 
         // Inside a knockout group each painting element composites against the
@@ -1597,19 +1909,37 @@ impl<'a> RenderBackend for CpuRenderer<'a> {
             } => {
                 self.push_blend_group(*blend_mode, *isolated, *knockout, *alpha, mask.as_ref());
             }
-            RenderCommand::PopBlendGroup => {
-                self.pop_blend_group();
+            RenderCommand::PopBlendGroup if self.skipped_blend_depth > 0 => {
+                self.skipped_blend_depth -= 1;
             }
+            RenderCommand::PopBlendGroup => self.pop_blend_group(),
         }
         Ok(())
     }
 
     fn end_page(&mut self) -> Result<Self::Target, Self::Error> {
+        // Gracefully close a malformed/truncated display list. This also restores
+        // the real page target if the deadline fired inside an open blend group.
+        while !self.blend_stack.is_empty() {
+            self.pop_blend_group();
+        }
         let pixmap = self.pixmap.take().ok_or(CpuRenderError::NotInitialized)?;
+        let width = pixmap.width();
+        let height = pixmap.height();
+        let data = pixmap.take();
+        self.clip_stack.clear();
+        self.current_clip = None;
+        self.clip_mask_bytes = 0;
+        self.soft_mask_planes.clear();
+        self.soft_mask_cache_bytes = 0;
+        self.downscaled_images.clear();
+        self.deadline = None;
+        self.skipped_blend_depth = 0;
+        self.blend_surface_bytes = 0;
         Ok(RenderedPage {
-            width: pixmap.width(),
-            height: pixmap.height(),
-            data: pixmap.data().to_vec(),
+            width,
+            height,
+            data,
         })
     }
 }
@@ -1635,6 +1965,265 @@ mod tests {
         p.move_to(Point::new(x0, y0));
         p.line_to(Point::new(x1, y1));
         p
+    }
+
+    #[test]
+    fn execute_requires_an_active_page() {
+        let mut renderer = CpuRenderer::new();
+        assert!(matches!(
+            renderer.execute(&RenderCommand::PopClip),
+            Err(CpuRenderError::NotInitialized)
+        ));
+    }
+
+    #[test]
+    fn invalid_begin_drops_the_previous_page() {
+        let mut renderer = CpuRenderer::new();
+        renderer
+            .begin_page(&PageRenderInfo {
+                page_rect: Rect::new(0.0, 0.0, 2.0, 2.0),
+                scale: 1.0,
+                background: Color::white(),
+            })
+            .unwrap();
+        assert!(matches!(
+            renderer.begin_page(&PageRenderInfo {
+                page_rect: Rect::new(0.0, 0.0, f64::INFINITY, 2.0),
+                scale: 1.0,
+                background: Color::white(),
+            }),
+            Err(CpuRenderError::InvalidPage(_))
+        ));
+        assert!(matches!(
+            renderer.end_page(),
+            Err(CpuRenderError::NotInitialized)
+        ));
+    }
+
+    #[test]
+    fn document_page_pixel_limit_uniformly_downscales_before_allocation() {
+        let limits = ParseLimits {
+            max_page_pixels: 25,
+            ..ParseLimits::default()
+        };
+        let mut renderer = CpuRenderer::new().with_limits(&limits);
+        renderer
+            .begin_page(&PageRenderInfo {
+                page_rect: Rect::new(0.0, 0.0, 10.0, 10.0),
+                scale: 1.0,
+                background: Color::white(),
+            })
+            .unwrap();
+        let page = renderer.end_page().unwrap();
+        assert_eq!((page.width, page.height), (5, 5));
+        assert!(page.width as u64 * page.height as u64 <= limits.max_page_pixels);
+    }
+
+    #[test]
+    fn page_pixel_limit_is_exact_for_extreme_aspect_ratios() {
+        let (scale, width, height) = fit_raster_to_pixel_limit(1.0, 1000.0, 1.0, 100).unwrap();
+        assert!(scale > 0.0);
+        assert_eq!(width, 1);
+        assert!(width as u64 * height as u64 <= 100);
+    }
+
+    #[test]
+    fn zero_page_pixel_limit_rejects_before_allocation() {
+        let limits = ParseLimits {
+            max_page_pixels: 0,
+            ..ParseLimits::default()
+        };
+        let mut renderer = CpuRenderer::new().with_limits(&limits);
+        let err = renderer
+            .begin_page(&PageRenderInfo {
+                page_rect: Rect::new(0.0, 0.0, 1.0, 1.0),
+                scale: 1.0,
+                background: Color::white(),
+            })
+            .unwrap_err();
+        assert!(matches!(err, CpuRenderError::LimitExceeded(_)));
+        assert!(renderer.pixmap.is_none());
+    }
+
+    #[test]
+    fn document_blend_depth_limit_keeps_structural_pops_balanced() {
+        let limits = ParseLimits {
+            max_blend_group_depth: 1,
+            ..ParseLimits::default()
+        };
+        let mut renderer = CpuRenderer::new().with_limits(&limits);
+        renderer
+            .begin_page(&PageRenderInfo {
+                page_rect: Rect::new(0.0, 0.0, 4.0, 4.0),
+                scale: 1.0,
+                background: Color::white(),
+            })
+            .unwrap();
+        let push = RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Normal,
+            isolated: true,
+            knockout: false,
+            bounds: Rect::new(0.0, 0.0, 4.0, 4.0),
+            alpha: 1.0,
+            mask: None,
+        };
+        renderer.execute(&push).unwrap();
+        renderer.execute(&push).unwrap();
+        assert_eq!(renderer.blend_stack.len(), 1);
+        assert_eq!(renderer.skipped_blend_depth, 1);
+        renderer.execute(&RenderCommand::PopBlendGroup).unwrap();
+        assert_eq!(renderer.blend_stack.len(), 1);
+        assert_eq!(renderer.skipped_blend_depth, 0);
+        renderer.execute(&RenderCommand::PopBlendGroup).unwrap();
+        assert!(renderer.blend_stack.is_empty());
+    }
+
+    #[test]
+    fn document_soft_mask_cache_limit_is_enforced() {
+        let limits = ParseLimits {
+            max_softmask_cache_bytes: 3,
+            ..ParseLimits::default()
+        };
+        let mut renderer = CpuRenderer::new().with_limits(&limits);
+        renderer
+            .begin_page(&PageRenderInfo {
+                page_rect: Rect::new(0.0, 0.0, 2.0, 2.0),
+                scale: 1.0,
+                background: Color::white(),
+            })
+            .unwrap();
+        let mask = SoftMask {
+            kind: SoftMaskKind::Alpha,
+            commands: Arc::new(DisplayList::new(Rect::new(0.0, 0.0, 2.0, 2.0))),
+            offset: (0.0, 0.0),
+            backdrop_luma: 0.0,
+            transfer: None,
+        };
+        assert_eq!(renderer.soft_mask_plane(&mask).unwrap().len(), 4);
+        assert!(renderer.soft_mask_planes.is_empty());
+        assert_eq!(renderer.soft_mask_cache_bytes, 0);
+    }
+
+    #[test]
+    fn end_page_transfers_pixels_without_a_full_raster_copy() {
+        let mut renderer = CpuRenderer::new();
+        renderer
+            .begin_page(&PageRenderInfo {
+                page_rect: Rect::new(0.0, 0.0, 8.0, 8.0),
+                scale: 1.0,
+                background: Color::white(),
+            })
+            .unwrap();
+        let before = renderer.pixmap.as_ref().unwrap().data().as_ptr();
+        let page = renderer.end_page().unwrap();
+        assert_eq!(
+            before,
+            page.data.as_ptr(),
+            "Pixmap allocation should be moved"
+        );
+    }
+
+    #[test]
+    fn malformed_image_is_ignored_without_panicking() {
+        let mut images = ImageCache::new();
+        let image_id = images.insert(DecodedImage {
+            width: 10,
+            height: 10,
+            data: vec![0; 3],
+            has_alpha: false,
+            premultiplied: false,
+        });
+        let mut renderer = CpuRenderer::new().with_images(&images);
+        renderer
+            .begin_page(&PageRenderInfo {
+                page_rect: Rect::new(0.0, 0.0, 10.0, 10.0),
+                scale: 1.0,
+                background: Color::white(),
+            })
+            .unwrap();
+        renderer
+            .execute(&RenderCommand::DrawImage(ImageDraw {
+                image_id,
+                transform: Matrix::identity(),
+                alpha: 1.0,
+            }))
+            .unwrap();
+        let page = renderer.end_page().unwrap();
+        assert_eq!(px(&page, 5, 5), [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn repeated_image_minification_reuses_box_filter_result() {
+        let mut images = ImageCache::new();
+        let image_id = images.insert(DecodedImage {
+            width: 100,
+            height: 100,
+            data: vec![255; 100 * 100 * 4],
+            has_alpha: false,
+            premultiplied: false,
+        });
+        let mut renderer = CpuRenderer::new().with_images(&images);
+        renderer
+            .begin_page(&PageRenderInfo {
+                page_rect: Rect::new(0.0, 0.0, 10.0, 10.0),
+                scale: 1.0,
+                background: Color::white(),
+            })
+            .unwrap();
+        let draw = RenderCommand::DrawImage(ImageDraw {
+            image_id,
+            transform: Matrix::identity(),
+            alpha: 1.0,
+        });
+        renderer.execute(&draw).unwrap();
+        renderer.execute(&draw).unwrap();
+        assert_eq!(renderer.downscaled_images.len(), 1);
+    }
+
+    #[test]
+    fn clip_memory_budget_degrades_to_a_skipped_frame() {
+        let mut renderer = CpuRenderer::new();
+        renderer
+            .begin_page(&PageRenderInfo {
+                page_rect: Rect::new(0.0, 0.0, 10.0, 10.0),
+                scale: 1.0,
+                background: Color::white(),
+            })
+            .unwrap();
+        renderer.clip_mask_bytes = MAX_CLIP_MASK_BYTES;
+        let mut path = Path::new();
+        path.rect(Rect::new(0.0, 0.0, 5.0, 5.0));
+        renderer.push_clip(&path, &FillRule::NonZero);
+        assert!(matches!(
+            renderer.clip_stack.last(),
+            Some(ClipFrame::Skipped)
+        ));
+    }
+
+    #[test]
+    fn budgeted_renderer_still_unwinds_an_open_blend_group() {
+        let mut renderer = CpuRenderer::new();
+        renderer
+            .begin_page(&PageRenderInfo {
+                page_rect: Rect::new(0.0, 0.0, 10.0, 10.0),
+                scale: 1.0,
+                background: Color::white(),
+            })
+            .unwrap();
+        renderer
+            .execute(&RenderCommand::PushBlendGroup {
+                blend_mode: BlendMode::Normal,
+                isolated: true,
+                knockout: false,
+                bounds: Rect::new(0.0, 0.0, 10.0, 10.0),
+                alpha: 1.0,
+                mask: None,
+            })
+            .unwrap();
+        renderer.over_budget = true;
+        renderer.execute(&RenderCommand::PopBlendGroup).unwrap();
+        assert!(renderer.blend_stack.is_empty());
+        assert!(renderer.end_page().is_ok());
     }
 
     fn stroke_cmd(path: Path, style: StrokeStyle) -> RenderCommand {

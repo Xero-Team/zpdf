@@ -119,6 +119,7 @@ impl PdfPage {
     fn collect_content_refs(file: &PdfFile, contents: Option<&PdfObject>) -> Vec<ObjectId> {
         fn refs_from_array(arr: &[PdfObject]) -> Vec<ObjectId> {
             arr.iter()
+                .take(MAX_PAGE_CONTENT_STREAMS)
                 .filter_map(|o| match o {
                     PdfObject::Ref(r) => Some(*r),
                     _ => None,
@@ -145,6 +146,7 @@ impl PdfPage {
     fn collect_annot_refs(file: &PdfFile, annots: Option<&PdfObject>) -> Vec<ObjectId> {
         fn refs_from_array(arr: &[PdfObject]) -> Vec<ObjectId> {
             arr.iter()
+                .take(MAX_PAGE_ANNOTATIONS)
                 .filter_map(|o| match o {
                     PdfObject::Ref(r) => Some(*r),
                     _ => None,
@@ -345,31 +347,45 @@ fn resolve_sub_dict<'a>(
 
 pub fn parse_resource_dict(dict: &zpdf_core::PdfDict, file: &PdfFile) -> Result<ResourceDict> {
     let mut res = ResourceDict::default();
+    let mut remaining = MAX_RESOURCE_ENTRIES;
 
     if let Some(fonts) = resolve_sub_dict(dict, "Font", file) {
         for (name, obj) in &fonts.0 {
+            if remaining == 0 {
+                break;
+            }
             if let PdfObject::Ref(r) = obj {
                 res.fonts.insert(name.0.clone(), *r);
+                remaining -= 1;
             }
         }
     }
 
     if let Some(xobjects) = resolve_sub_dict(dict, "XObject", file) {
         for (name, obj) in &xobjects.0 {
+            if remaining == 0 {
+                break;
+            }
             if let PdfObject::Ref(r) = obj {
                 res.xobjects.insert(name.0.clone(), *r);
+                remaining -= 1;
             }
         }
     }
 
     if let Some(gs) = resolve_sub_dict(dict, "ExtGState", file) {
         for (name, obj) in &gs.0 {
+            if remaining == 0 {
+                break;
+            }
             match obj {
                 PdfObject::Ref(r) => {
                     res.ext_g_state.insert(name.0.clone(), *r);
+                    remaining -= 1;
                 }
                 PdfObject::Dict(d) => {
                     res.ext_g_state_inline.insert(name.0.clone(), d.clone());
+                    remaining -= 1;
                 }
                 _ => {}
             }
@@ -378,13 +394,18 @@ pub fn parse_resource_dict(dict: &zpdf_core::PdfDict, file: &PdfFile) -> Result<
 
     if let Some(cs) = resolve_sub_dict(dict, "ColorSpace", file) {
         for (name, obj) in &cs.0 {
+            if remaining == 0 {
+                break;
+            }
             match obj {
                 PdfObject::Ref(r) => {
                     res.color_spaces.insert(name.0.clone(), *r);
+                    remaining -= 1;
                 }
                 other @ (PdfObject::Array(_) | PdfObject::Name(_)) => {
                     res.color_spaces_inline
                         .insert(name.0.clone(), other.clone());
+                    remaining -= 1;
                 }
                 _ => {}
             }
@@ -393,20 +414,29 @@ pub fn parse_resource_dict(dict: &zpdf_core::PdfDict, file: &PdfFile) -> Result<
 
     if let Some(pat) = resolve_sub_dict(dict, "Pattern", file) {
         for (name, obj) in &pat.0 {
+            if remaining == 0 {
+                break;
+            }
             if let PdfObject::Ref(r) = obj {
                 res.patterns.insert(name.0.clone(), *r);
+                remaining -= 1;
             }
         }
     }
 
     if let Some(sh) = resolve_sub_dict(dict, "Shading", file) {
         for (name, obj) in &sh.0 {
+            if remaining == 0 {
+                break;
+            }
             match obj {
                 PdfObject::Ref(r) => {
                     res.shadings.insert(name.0.clone(), *r);
+                    remaining -= 1;
                 }
                 other @ PdfObject::Dict(_) => {
                     res.shadings_inline.insert(name.0.clone(), other.clone());
+                    remaining -= 1;
                 }
                 _ => {}
             }
@@ -415,12 +445,17 @@ pub fn parse_resource_dict(dict: &zpdf_core::PdfDict, file: &PdfFile) -> Result<
 
     if let Some(props) = resolve_sub_dict(dict, "Properties", file) {
         for (name, obj) in &props.0 {
+            if remaining == 0 {
+                break;
+            }
             match obj {
                 PdfObject::Ref(r) => {
                     res.properties.insert(name.0.clone(), *r);
+                    remaining -= 1;
                 }
                 PdfObject::Dict(d) => {
                     res.properties_inline.insert(name.0.clone(), d.clone());
+                    remaining -= 1;
                 }
                 _ => {}
             }
@@ -505,6 +540,23 @@ mod tests {
             "<< /Type /Annot /Subtype /Square >>",
         ]);
         assert_eq!(page.annots, vec![ObjectId(4, 0), ObjectId(5, 0)]);
+    }
+
+    #[test]
+    fn page_reference_arrays_are_bounded() {
+        let doc = PdfDocument::open(build_pdf(&[
+            "<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] >>",
+        ]))
+        .unwrap();
+        let refs: Vec<PdfObject> = (0..MAX_PAGE_CONTENT_STREAMS + 10)
+            .map(|n| PdfObject::Ref(ObjectId(n as u32 + 10, 0)))
+            .collect();
+        assert_eq!(
+            PdfPage::collect_content_refs(doc.file(), Some(&PdfObject::Array(refs))).len(),
+            MAX_PAGE_CONTENT_STREAMS
+        );
     }
 
     fn page_with_boxes(media: Rect, crop: Rect) -> PdfPage {

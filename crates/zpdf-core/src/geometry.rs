@@ -126,9 +126,18 @@ impl Matrix {
         self.a * self.d - self.b * self.c
     }
 
+    pub fn is_finite(&self) -> bool {
+        [self.a, self.b, self.c, self.d, self.e, self.f]
+            .iter()
+            .all(|v| v.is_finite())
+    }
+
     pub fn inverse(&self) -> Option<Self> {
+        if !self.is_finite() {
+            return None;
+        }
         let det = self.determinant();
-        if det.abs() < 1e-12 {
+        if !det.is_finite() || det.abs() < 1e-12 {
             return None;
         }
         let inv_det = 1.0 / det;
@@ -170,6 +179,13 @@ mod tests {
         assert!((result.a - id.a).abs() < 1e-10);
         assert!((result.d - id.d).abs() < 1e-10);
         assert!((result.e - id.e).abs() < 1e-10);
+    }
+
+    #[test]
+    fn non_finite_matrix_has_no_inverse() {
+        let m = Matrix::new(f64::INFINITY, 0.0, 0.0, 1.0, 0.0, 0.0);
+        assert!(!m.is_finite());
+        assert!(m.inverse().is_none());
     }
 
     #[test]

@@ -1,112 +1,143 @@
 //! PDF object serialization to text format (ISO 32000-1 §7.3).
 
+use std::io::{self, Write};
+
 use zpdf_core::{PdfDict, PdfName, PdfObject};
 
 /// Serialize an indirect object in PDF syntax.
 /// Format: `<num> <gen> obj\n<content>\nendobj\n`
-pub fn serialize_object(num: u32, gen: u32, obj: &PdfObject) -> Vec<u8> {
+#[cfg(test)]
+pub fn serialize_object(num: u32, gen: u32, obj: &PdfObject) -> io::Result<Vec<u8>> {
     let mut buf = Vec::new();
-    buf.extend_from_slice(format!("{} {} obj\n", num, gen).as_bytes());
-    serialize_direct_object(&mut buf, obj);
-    buf.extend_from_slice(b"\nendobj\n");
-    buf
+    write_object(&mut buf, num, gen, obj)?;
+    Ok(buf)
+}
+
+/// Write an indirect object directly to an output without staging a second
+/// full-sized buffer.
+pub fn write_object<W: Write>(out: &mut W, num: u32, gen: u32, obj: &PdfObject) -> io::Result<()> {
+    writeln!(out, "{num} {gen} obj")?;
+    serialize_direct_object(out, obj)?;
+    out.write_all(b"\nendobj\n")
 }
 
 /// Serialize a stream object (dict + binary data).
 /// Format: `<num> <gen> obj\n<< /Length <n> ... >> stream\n<data>\nendstream\nendobj\n`
-pub fn serialize_stream(num: u32, gen: u32, dict: &PdfDict, data: &[u8]) -> Vec<u8> {
+#[cfg(test)]
+pub fn serialize_stream(num: u32, gen: u32, dict: &PdfDict, data: &[u8]) -> io::Result<Vec<u8>> {
     let mut buf = Vec::new();
-    buf.extend_from_slice(format!("{} {} obj\n", num, gen).as_bytes());
+    write_stream(&mut buf, num, gen, dict, data)?;
+    Ok(buf)
+}
+
+/// Write a stream directly to an output, keeping the potentially large stream
+/// payload zero-copy.
+pub fn write_stream<W: Write>(
+    out: &mut W,
+    num: u32,
+    gen: u32,
+    dict: &PdfDict,
+    data: &[u8],
+) -> io::Result<()> {
+    writeln!(out, "{num} {gen} obj")?;
 
     // Add /Length to the dict.
     let mut dict = dict.clone();
-    dict.insert(
-        PdfName("Length".to_string()),
-        PdfObject::Integer(data.len() as i64),
-    );
+    let length = i64::try_from(data.len())
+        .map_err(|_| invalid_input("stream length exceeds PDF integer range"))?;
+    dict.insert(PdfName("Length".to_string()), PdfObject::Integer(length));
 
-    serialize_dict(&mut buf, &dict);
-    buf.extend_from_slice(b"\nstream\n");
-    buf.extend_from_slice(data);
-    buf.extend_from_slice(b"\nendstream\nendobj\n");
-    buf
+    serialize_dict(out, &dict)?;
+    out.write_all(b"\nstream\n")?;
+    out.write_all(data)?;
+    out.write_all(b"\nendstream\nendobj\n")
 }
 
 /// Serialize a direct PDF object (not wrapped in `obj`/`endobj`).
-fn serialize_direct_object(buf: &mut Vec<u8>, obj: &PdfObject) {
+fn serialize_direct_object<W: Write>(buf: &mut W, obj: &PdfObject) -> io::Result<()> {
     match obj {
-        PdfObject::Null => buf.extend_from_slice(b"null"),
-        PdfObject::Bool(b) => buf.extend_from_slice(if *b { b"true" } else { b"false" }),
-        PdfObject::Integer(n) => buf.extend_from_slice(format!("{}", n).as_bytes()),
+        PdfObject::Null => buf.write_all(b"null")?,
+        PdfObject::Bool(b) => buf.write_all(if *b { b"true" } else { b"false" })?,
+        PdfObject::Integer(n) => write!(buf, "{n}")?,
         PdfObject::Real(f) => {
+            if !f.is_finite() {
+                return Err(invalid_input("PDF real numbers must be finite"));
+            }
             // Format floats with up to 6 decimal places, stripping trailing zeros.
             let s = format!("{:.6}", f);
             let trimmed = s.trim_end_matches('0').trim_end_matches('.');
-            buf.extend_from_slice(trimmed.as_bytes());
+            buf.write_all(trimmed.as_bytes())?;
         }
         PdfObject::String(s) => {
             // Literal string: (escaped)
-            buf.push(b'(');
+            buf.write_all(b"(")?;
             for &b in s.as_bytes() {
                 match b {
                     b'(' | b')' | b'\\' => {
-                        buf.push(b'\\');
-                        buf.push(b);
+                        buf.write_all(&[b'\\', b])?;
                     }
-                    b'\n' => buf.extend_from_slice(b"\\n"),
-                    b'\r' => buf.extend_from_slice(b"\\r"),
-                    b'\t' => buf.extend_from_slice(b"\\t"),
-                    _ => buf.push(b),
+                    b'\n' => buf.write_all(b"\\n")?,
+                    b'\r' => buf.write_all(b"\\r")?,
+                    b'\t' => buf.write_all(b"\\t")?,
+                    _ => buf.write_all(&[b])?,
                 }
             }
-            buf.push(b')');
+            buf.write_all(b")")?;
         }
-        PdfObject::Name(n) => serialize_name(buf, n.as_str()),
+        PdfObject::Name(n) => serialize_name(buf, n.as_str())?,
         PdfObject::Array(arr) => {
-            buf.push(b'[');
+            buf.write_all(b"[")?;
             for (i, elem) in arr.iter().enumerate() {
                 if i > 0 {
-                    buf.push(b' ');
+                    buf.write_all(b" ")?;
                 }
-                serialize_direct_object(buf, elem);
+                serialize_direct_object(buf, elem)?;
             }
-            buf.push(b']');
+            buf.write_all(b"]")?;
         }
         PdfObject::Dict(dict) => {
-            serialize_dict(buf, dict);
+            serialize_dict(buf, dict)?;
         }
         PdfObject::Ref(r) => {
-            buf.extend_from_slice(format!("{} {} R", r.0, r.1).as_bytes());
+            write!(buf, "{} {} R", r.0, r.1)?;
         }
         PdfObject::Stream(_) => {
             // Streams must be serialized with serialize_stream, not as direct objects.
-            panic!("cannot serialize stream as direct object");
+            return Err(invalid_input(
+                "cannot serialize a stream as a direct object",
+            ));
         }
     }
+    Ok(())
 }
 
 /// Serialize a name token (`/Name`), escaping special characters as `#XX`.
-fn serialize_name(buf: &mut Vec<u8>, name: &str) {
-    buf.push(b'/');
+fn serialize_name<W: Write>(buf: &mut W, name: &str) -> io::Result<()> {
+    buf.write_all(b"/")?;
     for &b in name.as_bytes() {
         if b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.' {
-            buf.push(b);
+            buf.write_all(&[b])?;
         } else {
-            buf.extend_from_slice(format!("#{:02X}", b).as_bytes());
+            write!(buf, "#{b:02X}")?;
         }
     }
+    Ok(())
 }
 
 /// Serialize a dictionary.
-pub fn serialize_dict(buf: &mut Vec<u8>, dict: &PdfDict) {
-    buf.extend_from_slice(b"<< ");
+pub fn serialize_dict<W: Write>(buf: &mut W, dict: &PdfDict) -> io::Result<()> {
+    buf.write_all(b"<< ")?;
     for (key, value) in &dict.0 {
-        serialize_name(buf, key.as_str());
-        buf.push(b' ');
-        serialize_direct_object(buf, value);
-        buf.push(b' ');
+        serialize_name(buf, key.as_str())?;
+        buf.write_all(b" ")?;
+        serialize_direct_object(buf, value)?;
+        buf.write_all(b" ")?;
     }
-    buf.extend_from_slice(b">>");
+    buf.write_all(b">>")
+}
+
+fn invalid_input(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, message)
 }
 
 #[cfg(test)]
@@ -117,7 +148,7 @@ mod tests {
     #[test]
     fn serialize_simple_object() {
         let obj = PdfObject::Integer(42);
-        let bytes = serialize_object(5, 0, &obj);
+        let bytes = serialize_object(5, 0, &obj).unwrap();
         assert_eq!(String::from_utf8_lossy(&bytes), "5 0 obj\n42\nendobj\n");
     }
 
@@ -132,7 +163,7 @@ mod tests {
             PdfName("Parent".to_string()),
             PdfObject::Ref(ObjectId(3, 0)),
         );
-        let bytes = serialize_object(10, 0, &PdfObject::Dict(dict));
+        let bytes = serialize_object(10, 0, &PdfObject::Dict(dict)).unwrap();
         let s = String::from_utf8_lossy(&bytes);
         assert!(s.contains("10 0 obj"));
         assert!(s.contains("/Type /Page"));
@@ -147,7 +178,7 @@ mod tests {
             PdfObject::Real(2.5),
             PdfObject::Name(PdfName("Foo".to_string())),
         ];
-        let bytes = serialize_object(7, 0, &PdfObject::Array(arr));
+        let bytes = serialize_object(7, 0, &PdfObject::Array(arr)).unwrap();
         let s = String::from_utf8_lossy(&bytes);
         assert!(s.contains("[1 2.5 /Foo]"));
     }
@@ -155,7 +186,7 @@ mod tests {
     #[test]
     fn serialize_string_escapes() {
         let obj = PdfObject::String(zpdf_core::PdfString(b"Hello (world)\n".to_vec()));
-        let bytes = serialize_object(2, 0, &obj);
+        let bytes = serialize_object(2, 0, &obj).unwrap();
         let s = String::from_utf8_lossy(&bytes);
         assert!(s.contains(r"(Hello \(world\)\n)"));
     }
@@ -163,7 +194,7 @@ mod tests {
     #[test]
     fn serialize_name_escapes() {
         let obj = PdfObject::Name(PdfName("Foo#Bar Baz".to_string()));
-        let bytes = serialize_object(3, 0, &obj);
+        let bytes = serialize_object(3, 0, &obj).unwrap();
         let s = String::from_utf8_lossy(&bytes);
         // '#' -> #23, space -> #20
         assert!(s.contains("/Foo#23Bar#20Baz"));
@@ -177,7 +208,7 @@ mod tests {
             PdfObject::Name(PdfName("XObject".to_string())),
         );
         let data = b"q 1 0 0 1 0 0 cm Q";
-        let bytes = serialize_stream(15, 0, &dict, data);
+        let bytes = serialize_stream(15, 0, &dict, data).unwrap();
         let s = String::from_utf8_lossy(&bytes);
         assert!(s.contains("15 0 obj"));
         assert!(s.contains("/Length 18"));
@@ -188,7 +219,21 @@ mod tests {
     fn real_strips_trailing_zeros() {
         let obj = PdfObject::Real(1.500000);
         let mut buf = Vec::new();
-        serialize_direct_object(&mut buf, &obj);
+        serialize_direct_object(&mut buf, &obj).unwrap();
         assert_eq!(String::from_utf8_lossy(&buf), "1.5");
+    }
+
+    #[test]
+    fn nested_stream_is_an_error_instead_of_a_panic() {
+        let stream = zpdf_core::PdfStream::new(PdfDict::new(), b"data".to_vec());
+        let obj = PdfObject::Array(vec![PdfObject::Stream(stream)]);
+        let err = serialize_object(1, 0, &obj).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn non_finite_real_is_rejected() {
+        let err = serialize_object(1, 0, &PdfObject::Real(f64::NAN)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 }

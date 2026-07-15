@@ -1,3 +1,4 @@
+use std::borrow::Borrow;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
@@ -25,6 +26,12 @@ impl PdfName {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl Borrow<str> for PdfName {
+    fn borrow(&self) -> &str {
+        self.as_str()
     }
 }
 
@@ -62,7 +69,7 @@ impl PdfDict {
     }
 
     pub fn get(&self, key: &str) -> Option<&PdfObject> {
-        self.0.get(&PdfName(key.to_string()))
+        self.0.get(key)
     }
 
     pub fn insert(&mut self, key: PdfName, value: PdfObject) {

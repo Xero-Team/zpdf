@@ -34,7 +34,7 @@ use zpdf_core::{ObjectId, PdfDict, PdfName, PdfObject, Result};
 use zpdf_document::{InkAnnotDict, PdfDocument};
 
 mod serialize;
-use serialize::{serialize_dict, serialize_object, serialize_stream};
+use serialize::{serialize_dict, write_object, write_stream};
 
 pub mod forms;
 pub mod metadata;
@@ -50,7 +50,7 @@ pub use stamp::{jpeg_dimensions, StampImage, StampItem};
 enum PendingObject {
     Object(PdfObject),
     /// Stream dict + (possibly already compressed) data.
-    Stream(PdfDict, Vec<u8>),
+    Stream(PdfDict, Arc<[u8]>),
 }
 
 /// The cross-reference flavor of the original file, which the update must
@@ -95,18 +95,24 @@ impl IncrementalWriter {
             return Err(unsupported("cannot incrementally update an encrypted document").into());
         }
         let file = doc.file();
-        let size = file
-            .trailer
-            .get("Size")
-            .and_then(|o| match o {
-                PdfObject::Integer(n) => Some(*n as u32),
-                _ => None,
+        let trailer_size = file.trailer.get("Size").and_then(|o| match o {
+            PdfObject::Integer(n) => u32::try_from(*n).ok(),
+            _ => None,
+        });
+        // A malformed or stale /Size must not make newly-added objects collide
+        // with existing ones. Derive the authoritative lower bound from the
+        // parsed xref and take the larger value.
+        let known_next = file
+            .all_object_ids()
+            .into_iter()
+            .try_fold(0u32, |next, id| {
+                id.0.checked_add(1).map(|candidate| next.max(candidate))
             })
-            .or_else(|| {
-                // Malformed trailer: fall back to the highest known object number.
-                file.all_object_ids().iter().map(|id| id.0 + 1).max()
-            })
-            .ok_or_else(|| invalid_data("trailer missing /Size"))?;
+            .ok_or_else(|| invalid_data("object number space is exhausted"))?;
+        let size = trailer_size.unwrap_or(known_next).max(known_next).max(1);
+        if size == u32::MAX {
+            return Err(invalid_data("object number space is exhausted").into());
+        }
 
         let root = file
             .trailer
@@ -140,31 +146,77 @@ impl IncrementalWriter {
     /// Add a new indirect object. Returns its `(obj_num, gen_num)`. Generation
     /// is always 0 for newly created objects.
     pub fn add_object(&mut self, obj: &PdfObject) -> (u32, u32) {
+        self.try_add_object(obj)
+            .expect("object number space is exhausted")
+    }
+
+    /// Fallible form of [`Self::add_object`] for callers processing untrusted
+    /// or extremely large update batches.
+    pub fn try_add_object(&mut self, obj: &PdfObject) -> Result<(u32, u32)> {
+        self.ensure_object_capacity(1)?;
+        let pending = match obj {
+            PdfObject::Stream(stream) => {
+                PendingObject::Stream(stream.dict.clone(), Arc::clone(&stream.data))
+            }
+            _ => PendingObject::Object(obj.clone()),
+        };
         let num = self.next_obj_num;
         self.next_obj_num += 1;
-        self.pending
-            .insert(num, (0, PendingObject::Object(obj.clone())));
-        (num, 0)
+        self.pending.insert(num, (0, pending));
+        Ok((num, 0))
     }
 
     /// Add a stream object (a dictionary plus binary data). Returns its object reference.
     pub fn add_stream(&mut self, dict: &PdfDict, data: &[u8]) -> (u32, u32) {
+        self.try_add_stream(dict, data)
+            .expect("object number space is exhausted")
+    }
+
+    /// Fallible form of [`Self::add_stream`].
+    pub fn try_add_stream(&mut self, dict: &PdfDict, data: &[u8]) -> Result<(u32, u32)> {
+        // Check before copying a potentially large stream into the pending store.
+        self.ensure_object_capacity(1)?;
+        self.try_add_stream_arc(dict.clone(), Arc::from(data))
+    }
+
+    fn try_add_stream_arc(&mut self, dict: PdfDict, data: Arc<[u8]>) -> Result<(u32, u32)> {
+        self.ensure_object_capacity(1)?;
         let num = self.next_obj_num;
         self.next_obj_num += 1;
         self.pending
-            .insert(num, (0, PendingObject::Stream(dict.clone(), data.to_vec())));
-        (num, 0)
+            .insert(num, (0, PendingObject::Stream(dict, data)));
+        Ok((num, 0))
     }
 
     /// Add a stream object with the raw data FlateDecode-compressed (the dict
     /// gains `/Filter /FlateDecode`). Returns its object reference.
     pub fn add_flate_stream(&mut self, dict: &PdfDict, raw: &[u8]) -> (u32, u32) {
+        self.try_add_flate_stream(dict, raw)
+            .expect("object number space is exhausted")
+    }
+
+    /// Fallible form of [`Self::add_flate_stream`]. Capacity is checked before
+    /// compression so exhausted writers do not allocate a temporary buffer.
+    pub fn try_add_flate_stream(&mut self, dict: &PdfDict, raw: &[u8]) -> Result<(u32, u32)> {
+        self.ensure_object_capacity(1)?;
         let mut dict = dict.clone();
         dict.insert(
             PdfName::new("Filter"),
             PdfObject::Name(PdfName::new("FlateDecode")),
         );
-        self.add_stream(&dict, &flate_compress(raw))
+        self.try_add_stream_arc(dict, flate_compress(raw).into())
+    }
+
+    /// Verify that `count` new indirect objects can be assigned without
+    /// changing writer state. High-level multi-object edits use this as a
+    /// transaction preflight so exhaustion cannot leave half an edit pending.
+    pub(crate) fn ensure_object_capacity(&self, count: usize) -> Result<()> {
+        let count =
+            u32::try_from(count).map_err(|_| invalid_data("object number space is exhausted"))?;
+        self.next_obj_num
+            .checked_add(count)
+            .ok_or_else(|| invalid_data("object number space is exhausted"))?;
+        Ok(())
     }
 
     /// Queue a replacement for an existing object. The replacement is written
@@ -180,9 +232,12 @@ impl IncrementalWriter {
     pub fn resolve_current(&self, id: ObjectId) -> Result<PdfObject> {
         match self.pending.get(&id.0) {
             Some((_, PendingObject::Object(obj))) => Ok(obj.clone()),
-            Some((_, PendingObject::Stream(dict, data))) => Ok(PdfObject::Stream(
-                zpdf_core::PdfStream::new(dict.clone(), data.clone()),
-            )),
+            Some((_, PendingObject::Stream(dict, data))) => {
+                Ok(PdfObject::Stream(zpdf_core::PdfStream {
+                    dict: dict.clone(),
+                    data: Arc::clone(data),
+                }))
+            }
             None => self.doc.file().resolve(id),
         }
     }
@@ -215,17 +270,22 @@ impl IncrementalWriter {
         appearance_stream: &[u8],
     ) -> Result<()> {
         let page_id = self.page_id(page_index)?;
+        self.ensure_object_capacity(2)?;
+        let annot_number = self.next_obj_num + 1;
+        let updated_page = self.page_with_appended_annot(page_id, ObjectId(annot_number, 0))?;
 
         // 1. Add the appearance stream (a Form XObject).
         let appearance_dict = self.build_appearance_dict(annot_dict);
-        let ap_ref = self.add_stream(&appearance_dict, appearance_stream);
+        let ap_ref = self.try_add_stream(&appearance_dict, appearance_stream)?;
 
         // 2. Add the annotation dict.
         let annot_pdf_dict = self.build_annot_dict(annot_dict, ap_ref);
-        let annot_ref = self.add_object(&PdfObject::Dict(annot_pdf_dict));
+        let annot_ref = self.try_add_object(&PdfObject::Dict(annot_pdf_dict))?;
+        debug_assert_eq!(annot_ref, (annot_number, 0));
 
         // 3. Rewrite the page dict with the annotation appended to /Annots.
-        self.append_page_annot(page_id, ObjectId(annot_ref.0, annot_ref.1 as u16))
+        self.overwrite_object(page_id, PdfObject::Dict(updated_page));
+        Ok(())
     }
 
     /// The object id of a 0-based page index (pending edits do not change page
@@ -238,8 +298,8 @@ impl IncrementalWriter {
             .id)
     }
 
-    /// Rewrite a page dict with one more `/Annots` entry.
-    fn append_page_annot(&mut self, page_id: ObjectId, annot_ref: ObjectId) -> Result<()> {
+    /// Build a page dict with one more `/Annots` entry.
+    fn page_with_appended_annot(&self, page_id: ObjectId, annot_ref: ObjectId) -> Result<PdfDict> {
         let page_obj = self.resolve_current(page_id)?;
         let mut page_dict = page_obj.as_dict()?.clone();
 
@@ -255,9 +315,7 @@ impl IncrementalWriter {
         };
         annots.push(PdfObject::Ref(annot_ref));
         page_dict.insert(PdfName::new("Annots"), PdfObject::Array(annots));
-
-        self.overwrite_object(page_id, PdfObject::Dict(page_dict));
-        Ok(())
+        Ok(page_dict)
     }
 
     /// Build the appearance stream dictionary (Form XObject).
@@ -313,7 +371,7 @@ impl IncrementalWriter {
             .map(|stroke| {
                 let coords: Vec<PdfObject> = stroke
                     .iter()
-                    .flat_map(|&(x, y)| vec![PdfObject::Real(x), PdfObject::Real(y)])
+                    .flat_map(|&(x, y)| [PdfObject::Real(x), PdfObject::Real(y)])
                     .collect();
                 PdfObject::Array(coords)
             })
@@ -363,11 +421,12 @@ impl IncrementalWriter {
         for (&num, (gen, pending)) in &self.pending {
             let offset = out.stream_position()?;
             xref_entries.push((num, *gen, offset));
-            let bytes = match pending {
-                PendingObject::Object(obj) => serialize_object(num, *gen as u32, obj),
-                PendingObject::Stream(dict, data) => serialize_stream(num, *gen as u32, dict, data),
-            };
-            out.write_all(&bytes)?;
+            match pending {
+                PendingObject::Object(obj) => write_object(&mut out, num, *gen as u32, obj)?,
+                PendingObject::Stream(dict, data) => {
+                    write_stream(&mut out, num, *gen as u32, dict, data)?
+                }
+            }
         }
 
         // 3. Append the new cross-reference section + trailer, matching the
@@ -425,6 +484,11 @@ impl IncrementalWriter {
         for run in contiguous_runs(entries) {
             writeln!(out, "{} {}", run[0].0, run.len())?;
             for (_, gen, offset) in run {
+                if *offset > 9_999_999_999 {
+                    return Err(invalid_data(
+                        "classic xref offsets cannot exceed ten decimal digits",
+                    ));
+                }
                 writeln!(out, "{:010} {:05} n ", offset, gen)?;
             }
         }
@@ -434,9 +498,7 @@ impl IncrementalWriter {
     /// Write the new trailer (classic-table flavor).
     fn write_trailer<W: Write>(&self, out: &mut W) -> io::Result<()> {
         writeln!(out, "trailer")?;
-        let mut buf = Vec::new();
-        serialize_dict(&mut buf, &self.trailer_dict(self.next_obj_num));
-        out.write_all(&buf)?;
+        serialize_dict(out, &self.trailer_dict(self.next_obj_num))?;
         writeln!(out)?;
         Ok(())
     }
@@ -457,26 +519,35 @@ impl IncrementalWriter {
         let mut all: Vec<(u32, u16, u64)> = entries.to_vec();
         all.push((stream_num, 0, xref_pos));
 
-        // /W [1 4 2]: 1-byte type, 4-byte offset, 2-byte generation.
-        let mut data = Vec::with_capacity(all.len() * 7);
-        let mut index = Vec::new();
+        // Use an 8-byte offset field. Four bytes silently corrupt xref streams
+        // once an incremental update crosses 4 GiB, while /W permits 64-bit
+        // fields and the parser already supports them.
+        let data_capacity = all
+            .len()
+            .checked_mul(11)
+            .ok_or_else(|| invalid_data("xref stream is too large"))?;
+        let mut data = Vec::with_capacity(data_capacity);
+        let mut index = Vec::with_capacity(all.len().saturating_mul(2));
         for run in contiguous_runs(&all) {
             index.push(PdfObject::Integer(run[0].0 as i64));
             index.push(PdfObject::Integer(run.len() as i64));
             for (_, gen, offset) in run {
                 data.push(1u8); // type 1: in-use, uncompressed
-                data.extend_from_slice(&(*offset as u32).to_be_bytes());
+                data.extend_from_slice(&offset.to_be_bytes());
                 data.extend_from_slice(&gen.to_be_bytes());
             }
         }
 
-        let mut dict = self.trailer_dict(stream_num + 1);
+        let size = stream_num
+            .checked_add(1)
+            .ok_or_else(|| invalid_data("object number space is exhausted"))?;
+        let mut dict = self.trailer_dict(size);
         dict.insert(PdfName::new("Type"), PdfObject::Name(PdfName::new("XRef")));
         dict.insert(
             PdfName::new("W"),
             PdfObject::Array(vec![
                 PdfObject::Integer(1),
-                PdfObject::Integer(4),
+                PdfObject::Integer(8),
                 PdfObject::Integer(2),
             ]),
         );
@@ -486,9 +557,7 @@ impl IncrementalWriter {
             PdfObject::Name(PdfName::new("FlateDecode")),
         );
 
-        let bytes = serialize_stream(stream_num, 0, &dict, &flate_compress(&data));
-        out.write_all(&bytes)?;
-        Ok(())
+        write_stream(out, stream_num, 0, &dict, &flate_compress(&data))
     }
 
     /// Delete an annotation from a page's `/Annots` array. The annotation object
@@ -717,7 +786,7 @@ fn contiguous_runs(entries: &[(u32, u16, u64)]) -> Vec<&[(u32, u16, u64)]> {
     let mut runs = Vec::new();
     let mut start = 0;
     for i in 1..=entries.len() {
-        if i == entries.len() || entries[i].0 != entries[i - 1].0 + 1 {
+        if i == entries.len() || entries[i - 1].0.checked_add(1) != Some(entries[i].0) {
             runs.push(&entries[start..i]);
             start = i;
         }
@@ -730,9 +799,12 @@ fn flate_compress(raw: &[u8]) -> Vec<u8> {
     use flate2::write::ZlibEncoder;
     use flate2::Compression;
     let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
-    // Writing to a Vec cannot fail.
-    let _ = enc.write_all(raw);
-    enc.finish().unwrap_or_default()
+    // Vec-backed writes have no I/O failure mode; surfacing an impossible
+    // encoder failure is preferable to silently emitting an empty stream.
+    enc.write_all(raw)
+        .expect("Vec-backed zlib compression cannot fail");
+    enc.finish()
+        .expect("Vec-backed zlib finalization cannot fail")
 }
 
 pub(crate) fn invalid_data(msg: &str) -> io::Error {
@@ -745,23 +817,35 @@ pub(crate) fn unsupported(msg: &str) -> io::Error {
 
 /// Find the `startxref` offset in a PDF file by scanning backward from the end.
 fn find_startxref(data: &[u8]) -> Option<u64> {
-    let tail = &data[data.len().saturating_sub(512)..];
-    let s = String::from_utf8_lossy(tail);
-    s.rfind("startxref").and_then(|pos| {
-        let after = &s[pos + "startxref".len()..];
-        // The number is on the next non-empty line after "startxref"
-        after
-            .lines()
-            .nth(1) // Skip the empty line immediately after "startxref"
-            .and_then(|line| line.trim().parse::<u64>().ok())
-    })
+    const MARKER: &[u8] = b"startxref";
+    // Search the whole file, matching the parser. Although conforming writers
+    // put `startxref` near EOF, real files can carry long trailing appends or
+    // junk and are still accepted by `PdfFile`; the incremental writer must not
+    // reject that same input. Work on raw bytes so malformed UTF-8 is harmless.
+    let marker_pos = data
+        .windows(MARKER.len())
+        .rposition(|window| window == MARKER)?;
+    let after = &data[marker_pos + MARKER.len()..];
+    let number_start = after.iter().position(|byte| !byte.is_ascii_whitespace())?;
+    let digits = &after[number_start..];
+    let number_len = digits
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    if number_len == 0 {
+        return None;
+    }
+    std::str::from_utf8(&digits[..number_len])
+        .ok()?
+        .parse::<u64>()
+        .ok()
 }
 
 /// Classic `xref` table vs. cross-reference stream, sniffed at the original
 /// startxref target. Anything that does not begin with the `xref` keyword is
 /// an indirect object holding an xref stream.
 fn detect_xref_kind(data: &[u8], pos: u64) -> XrefKind {
-    let start = (pos as usize).min(data.len());
+    let start = usize::try_from(pos).unwrap_or(data.len()).min(data.len());
     let slice = &data[start..];
     let trimmed = slice
         .iter()
@@ -896,5 +980,105 @@ startxref
         // Verify the output is valid PDF
         let result = PdfDocument::open(output.into_inner());
         assert!(result.is_ok(), "Updated PDF should be valid");
+    }
+
+    #[test]
+    fn stale_trailer_size_does_not_reuse_an_existing_object_number() {
+        let pdf = create_test_pdf_with_annotation();
+        let pdf = String::from_utf8(pdf)
+            .unwrap()
+            .replace("<< /Size 5 /Root", "<< /Size 2 /Root")
+            .into_bytes();
+        let mut writer = IncrementalWriter::new(pdf).unwrap();
+        let (number, generation) = writer.add_object(&PdfObject::Integer(42));
+        assert_eq!((number, generation), (5, 0));
+    }
+
+    #[test]
+    fn generic_add_object_accepts_streams_without_panicking() {
+        let pdf = create_test_pdf_with_annotation();
+        let mut writer = IncrementalWriter::new(pdf).unwrap();
+        let stream = zpdf_core::PdfStream::new(PdfDict::new(), b"hello".to_vec());
+        let (number, generation) = writer.add_object(&PdfObject::Stream(stream));
+
+        let mut output = Cursor::new(Vec::new());
+        writer.write(&mut output).unwrap();
+        let doc = PdfDocument::open(output.into_inner()).unwrap();
+        let object = doc
+            .file()
+            .resolve(ObjectId(number, generation as u16))
+            .unwrap();
+        assert_eq!(object.as_stream().unwrap().data.as_ref(), b"hello");
+    }
+
+    #[test]
+    fn fallible_add_rejects_object_number_exhaustion_without_mutating() {
+        let pdf = create_test_pdf_with_annotation();
+        let mut writer = IncrementalWriter::new(pdf).unwrap();
+        writer.next_obj_num = u32::MAX;
+        assert!(writer.try_add_object(&PdfObject::Integer(42)).is_err());
+        assert!(writer.pending.is_empty());
+        assert_eq!(writer.next_obj_num, u32::MAX);
+    }
+
+    #[test]
+    fn fallible_stream_adds_reject_exhaustion_without_mutating() {
+        let pdf = create_test_pdf_with_annotation();
+        let mut writer = IncrementalWriter::new(pdf).unwrap();
+        writer.next_obj_num = u32::MAX;
+
+        assert!(writer
+            .try_add_stream(&PdfDict::new(), b"uncompressed")
+            .is_err());
+        assert!(writer
+            .try_add_flate_stream(&PdfDict::new(), b"compressed")
+            .is_err());
+        assert!(writer.pending.is_empty());
+        assert_eq!(writer.next_obj_num, u32::MAX);
+    }
+
+    #[test]
+    fn annotation_preflights_all_object_numbers() {
+        let pdf = create_test_pdf_with_annotation();
+        let mut writer = IncrementalWriter::new(pdf).unwrap();
+        writer.next_obj_num = u32::MAX - 1;
+        let annot = InkAnnotDict {
+            rect: Rect::new(10.0, 10.0, 20.0, 20.0),
+            ink_list: vec![vec![(10.0, 10.0), (20.0, 20.0)]],
+            color: (0.0, 0.0, 0.0),
+            width: 1.0,
+        };
+
+        assert!(writer
+            .add_ink_annotation_to_page(0, &annot, b"q Q")
+            .is_err());
+        assert!(writer.pending.is_empty());
+        assert_eq!(writer.next_obj_num, u32::MAX - 1);
+    }
+
+    #[test]
+    fn new_info_object_reports_exhaustion_without_mutating() {
+        let pdf = create_test_pdf_with_annotation();
+        let mut writer = IncrementalWriter::new(pdf).unwrap();
+        writer.next_obj_num = u32::MAX;
+
+        assert!(writer.set_info(&InfoUpdate::default()).is_err());
+        assert!(writer.pending.is_empty());
+        assert!(writer.info_ref_override.is_none());
+        assert_eq!(writer.next_obj_num, u32::MAX);
+    }
+
+    #[test]
+    fn startxref_scan_accepts_whitespace_and_non_utf8_tail_bytes() {
+        let mut data = vec![0xff; 32];
+        data.extend_from_slice(b"startxref \r\n\t 12345\n%%EOF");
+        assert_eq!(find_startxref(&data), Some(12_345));
+    }
+
+    #[test]
+    fn startxref_scan_accepts_long_trailing_data() {
+        let mut data = b"startxref\n12345\n%%EOF\n".to_vec();
+        data.extend(std::iter::repeat_n(0xff, 2_048));
+        assert_eq!(find_startxref(&data), Some(12_345));
     }
 }

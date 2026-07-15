@@ -6,6 +6,8 @@
 //! expected in a single consistent space (the wgpu backend passes device
 //! pixels: dash array and phase pre-multiplied by the page scale).
 
+const MAX_DASH_TRANSITIONS: usize = 100_000;
+
 /// True when a dash array cannot produce a meaningful on/off pattern and the
 /// stroke should be drawn solid instead: empty array, any negative or
 /// non-finite entry (invalid per PDF 8.4.3.6), or all entries zero.
@@ -25,7 +27,11 @@ pub fn is_degenerate(array: &[f32]) -> bool {
 /// identical endpoints (dots under round caps); callers that cannot render
 /// those may skip zero-length runs.
 pub fn dash_polyline(points: &[[f32; 2]], array: &[f32], phase: f32) -> Vec<Vec<[f32; 2]>> {
-    if points.len() < 2 || is_degenerate(array) {
+    if points.len() < 2
+        || is_degenerate(array)
+        || !phase.is_finite()
+        || points.iter().flatten().any(|v| !v.is_finite())
+    {
         return vec![points.to_vec()];
     }
 
@@ -34,6 +40,21 @@ pub fn dash_polyline(points: &[[f32; 2]], array: &[f32], phase: f32) -> Vec<Vec<
         pattern.extend_from_slice(array);
     }
     let period: f32 = pattern.iter().sum();
+    let total_len: f32 = points
+        .windows(2)
+        .map(|w| (w[1][0] - w[0][0]).hypot(w[1][1] - w[0][1]))
+        .sum();
+    let min_step = pattern
+        .iter()
+        .copied()
+        .filter(|v| *v > 0.0)
+        .fold(f32::INFINITY, f32::min);
+    if !period.is_finite()
+        || !total_len.is_finite()
+        || total_len / min_step > MAX_DASH_TRANSITIONS as f32
+    {
+        return vec![points.to_vec()];
+    }
 
     // Advance to the pattern position selected by the phase. `is_degenerate`
     // guarantees `period > 0`, so both loops terminate. The `pos > 0` guard keeps
@@ -50,6 +71,7 @@ pub fn dash_polyline(points: &[[f32; 2]], array: &[f32], phase: f32) -> Vec<Vec<
 
     let mut runs: Vec<Vec<[f32; 2]>> = Vec::new();
     let mut current: Vec<[f32; 2]> = Vec::new();
+    let mut transitions = 0usize;
     if on {
         current.push(points[0]);
     }
@@ -64,7 +86,34 @@ pub fn dash_polyline(points: &[[f32; 2]], array: &[f32], phase: f32) -> Vec<Vec<
         }
         let mut consumed = 0.0f32;
         while len - consumed > remaining {
-            consumed += remaining;
+            transitions += 1;
+            if transitions > MAX_DASH_TRANSITIONS {
+                // A microscopic pattern over a long path can otherwise request
+                // billions of output segments or fail to make f32 progress.
+                return vec![points.to_vec()];
+            }
+            let next = consumed + remaining;
+            if remaining == 0.0 && on {
+                // A zero-length painted interval is a dot when round caps are
+                // in use. Preserve it as a two-point run while still advancing
+                // the pattern below, otherwise `[0, gap]` silently loses every
+                // painted interval.
+                let k = consumed / len;
+                let split = [p0[0] + dx * k, p0[1] + dy * k];
+                current.push(split);
+                runs.push(std::mem::take(&mut current));
+                on = false;
+                idx = (idx + 1) % pattern.len();
+                remaining = pattern[idx];
+                continue;
+            }
+            if next <= consumed && remaining > 0.0 {
+                on = !on;
+                idx = (idx + 1) % pattern.len();
+                remaining = pattern[idx];
+                continue;
+            }
+            consumed = next;
             let k = consumed / len;
             let split = [p0[0] + dx * k, p0[1] + dy * k];
             if on {
@@ -148,6 +197,12 @@ mod tests {
     }
 
     #[test]
+    fn non_finite_phase_returns_solid_run() {
+        let pts = line(0.0, 20.0);
+        assert_eq!(dash_polyline(&pts, &[4.0, 4.0], f32::NAN), vec![pts]);
+    }
+
+    #[test]
     fn zero_on_interval_terminates_with_dot_runs() {
         // [0, 4]: zero-length "on" dots every 4 units — must not loop forever.
         // A dot landing exactly on the path end (at 12) is dropped.
@@ -159,5 +214,12 @@ mod tests {
         assert_eq!(runs[0][0], [0.0, 0.0]);
         assert_eq!(runs[1][0], [4.0, 0.0]);
         assert_eq!(runs[2][0], [8.0, 0.0]);
+    }
+
+    #[test]
+    fn microscopic_pattern_is_bounded() {
+        let pts = line(0.0, 1.0);
+        let runs = dash_polyline(&pts, &[f32::MIN_POSITIVE, f32::MIN_POSITIVE], 0.0);
+        assert_eq!(runs, vec![pts]);
     }
 }

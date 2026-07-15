@@ -1,7 +1,7 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use zpdf_core::{Matrix, ObjectId, PdfDict, PdfObject, Point, Rect};
+use zpdf_core::{Matrix, ObjectId, ParseLimits, PdfDict, PdfObject, Point, Rect};
 use zpdf_display_list::*;
 use zpdf_document::page::ResourceDict;
 use zpdf_font::FontCache;
@@ -30,6 +30,11 @@ pub struct ContentInterpreter<'a> {
     file: Option<&'a PdfFile>,
     resources: Option<&'a ResourceDict>,
     image_cache: Option<&'a mut ImageCache>,
+    max_image_cache_bytes: u64,
+    max_font_cache_bytes: u64,
+    /// Active document/standalone parsing policy used by inline image filters
+    /// and all image pixel allocations.
+    parse_limits: ParseLimits,
     icc_cache: Option<&'a mut zpdf_color::IccCache>,
     /// Default DeviceCMYK colour-management transform from the document's active
     /// output intent (`/OutputIntents` → `/DestOutputProfile`, 4-channel only).
@@ -45,6 +50,7 @@ pub struct ContentInterpreter<'a> {
     /// once instead of per `Do`. Keyed only for stateless images; `/ImageMask`
     /// stencils bake in the current fill colour and are never cached here.
     image_obj_cache: HashMap<ObjectId, zpdf_display_list::ImageId>,
+    rejected_image_objects: HashSet<ObjectId>,
     /// Built shadings (256-entry LUT + parsed functions) cached by object id, so a
     /// shading painted many times (`sh` markers repeated across a map) rebuilds its
     /// LUT only once. Reuse overwrites `to_page` with the current CTM.
@@ -448,6 +454,7 @@ impl Default for GraphicsState {
 
 impl<'a> ContentInterpreter<'a> {
     pub fn new(page_rect: Rect) -> Self {
+        let limits = ParseLimits::default();
         Self {
             state_stack: Vec::new(),
             current: GraphicsState::default(),
@@ -462,9 +469,13 @@ impl<'a> ContentInterpreter<'a> {
             file: None,
             resources: None,
             image_cache: None,
+            max_image_cache_bytes: limits.max_image_cache_bytes,
+            max_font_cache_bytes: limits.max_font_cache_bytes,
+            parse_limits: limits,
             icc_cache: None,
             output_intent_cmyk: None,
             image_obj_cache: HashMap::new(),
+            rejected_image_objects: HashSet::new(),
             shading_cache: HashMap::new(),
             form_font_overrides: Vec::new(),
             form_resources: Vec::new(),
@@ -512,7 +523,8 @@ impl<'a> ContentInterpreter<'a> {
     /// raw call fanout, or per-call time (e.g. per-cell shading rasterization).
     /// The clock is sampled at most once per 256 operators to keep it cheap.
     fn over_budget(&mut self) -> bool {
-        if self.display_list.commands.len() >= self.max_commands
+        if self.resource_limit_hit
+            || self.display_list.commands.len() >= self.max_commands
             || self.ops_executed >= self.max_ops
         {
             return true;
@@ -605,6 +617,7 @@ impl<'a> ContentInterpreter<'a> {
     }
 
     pub fn with_document(mut self, file: &'a PdfFile, resources: &'a ResourceDict) -> Self {
+        self.apply_limits(file.limits());
         self.file = Some(file);
         self.resources = Some(resources);
         self
@@ -612,6 +625,12 @@ impl<'a> ContentInterpreter<'a> {
 
     pub fn with_images(mut self, cache: &'a mut ImageCache) -> Self {
         self.image_cache = Some(cache);
+        self
+    }
+
+    /// Override aggregate decoded-image cache admission for standalone use.
+    pub fn with_image_cache_limit(mut self, max_bytes: u64) -> Self {
+        self.max_image_cache_bytes = max_bytes;
         self
     }
 
@@ -728,6 +747,7 @@ impl<'a> ContentInterpreter<'a> {
         self.operand_stack
             .pop()
             .and_then(|o| o.as_f64().ok())
+            .filter(|n| n.is_finite())
             .unwrap_or(0.0)
     }
 
@@ -776,6 +796,14 @@ impl<'a> ContentInterpreter<'a> {
         match op {
             // -- Graphics state --
             "q" => {
+                if self.state_stack.len() >= self.max_graphics_state_depth {
+                    tracing::warn!(
+                        "graphics-state stack exceeded {} entries; truncating page",
+                        self.max_graphics_state_depth
+                    );
+                    self.resource_limit_hit = true;
+                    return;
+                }
                 self.state_stack.push(self.current.clone());
                 self.current.clip_depth = 0;
             }
@@ -803,7 +831,12 @@ impl<'a> ContentInterpreter<'a> {
                 let b = self.pop_f64();
                 let a = self.pop_f64();
                 let m = Matrix::new(a, b, c, d, e, f);
-                self.current.ctm = self.current.ctm.concat(&m);
+                let next = self.current.ctm.concat(&m);
+                if next.is_finite() {
+                    self.current.ctm = next;
+                } else {
+                    tracing::warn!("content transform overflowed; ignoring cm operator");
+                }
             }
             "w" => self.current.line_width = self.pop_f64() as f32,
             "J" => {
@@ -1196,11 +1229,27 @@ impl<'a> ContentInterpreter<'a> {
 
             // -- Marked content --
             "BMC" => {
+                if self.mc_stack.len() >= self.max_marked_content_depth {
+                    tracing::warn!(
+                        "marked-content stack exceeded {} entries; truncating page",
+                        self.max_marked_content_depth
+                    );
+                    self.resource_limit_hit = true;
+                    return;
+                }
                 self.mc_depth += 1;
                 // A plain marked-content sequence declares no /MCID.
                 self.mc_stack.push(None);
             }
             "BDC" => {
+                if self.mc_stack.len() >= self.max_marked_content_depth {
+                    tracing::warn!(
+                        "marked-content stack exceeded {} entries; truncating page",
+                        self.max_marked_content_depth
+                    );
+                    self.resource_limit_hit = true;
+                    return;
+                }
                 // Operands: tag (first) then properties (top of stack).
                 let props = self.operand_stack.pop();
                 let tag = match self.operand_stack.pop() {
@@ -1518,7 +1567,7 @@ impl<'a> ContentInterpreter<'a> {
             }
             // Inline profile streams (synthetic content; the spec requires an
             // indirect stream) have no object id to cache under.
-            PdfObject::Stream(s) => build_inline_icc_transform(s, intent),
+            PdfObject::Stream(s) => build_inline_icc_transform(file, s, intent),
             _ => None,
         }?;
         if transform.components() != n.max(1) as usize {
@@ -1979,7 +2028,7 @@ impl<'a> ContentInterpreter<'a> {
         };
         let content = match file
             .resolve_stream_data(pat_id)
-            .or_else(|_| zpdf_parser::filters::decode_stream(&stream.data, &stream.dict))
+            .or_else(|_| decode_stream_for_file(Some(file), &stream.data, &stream.dict))
         {
             Ok(d) => d,
             Err(e) => {
@@ -2169,7 +2218,13 @@ impl<'a> ContentInterpreter<'a> {
             tracing::debug!("mesh shading type {shading_type} is not a stream");
             return None;
         };
-        let data = zpdf_parser::filters::decode_stream(&stream.data, &stream.dict).ok()?;
+        let data = match (obj, self.file) {
+            (PdfObject::Ref(id), Some(file)) => file
+                .resolve_stream_data(*id)
+                .or_else(|_| decode_stream_for_file(Some(file), &stream.data, &stream.dict))
+                .ok()?,
+            _ => decode_stream_for_file(self.file, &stream.data, &stream.dict).ok()?,
+        };
 
         let bits_coord = dict.get_i64("BitsPerCoordinate").ok()? as u32;
         let bits_comp = dict.get_i64("BitsPerComponent").ok()? as u32;
@@ -2328,6 +2383,13 @@ impl<'a> ContentInterpreter<'a> {
     /// whole page — that rasterizes a full-page gradient per call, which a map
     /// with hundreds of small `sh` markers makes pathologically slow).
     fn paint_shading_op(&mut self, name: &str) {
+        // Shadings are represented by decoded images in the display list. Text
+        // and table extraction intentionally omit an image cache, so avoid all
+        // function parsing, mesh construction, and raster work when there is no
+        // store in which the resulting pixels could be retained.
+        if self.image_cache.is_none() {
+            return;
+        }
         let (sh_obj, cache_id) = match self.lookup_res(|r| r.shadings_inline.get(name).cloned()) {
             Some(o) => (o, None),
             None => match self.lookup_res(|r| r.shadings.get(name).copied()) {
@@ -2388,11 +2450,9 @@ impl<'a> ContentInterpreter<'a> {
             has_alpha: true,
             premultiplied: true,
         };
-        let image_cache = match self.image_cache.as_mut() {
-            Some(c) => c,
-            None => return,
+        let Some(image_id) = self.admit_image(image) else {
+            return;
         };
-        let image_id = image_cache.insert(image);
         // Unit-square image -> page-space region.
         let transform = Matrix::new(
             region.width(),
@@ -3031,6 +3091,16 @@ impl<'a> ContentInterpreter<'a> {
     }
 
     fn do_image_xobject(&mut self, obj_id: zpdf_core::ObjectId, stream: &zpdf_core::PdfStream) {
+        // Without an image cache there is nowhere to retain the decoded pixels
+        // referenced by a DrawImage command, so avoid paying the stream/image
+        // decode cost only to discard the result below.
+        if self.image_cache.is_none() {
+            return;
+        }
+        if self.rejected_image_objects.contains(&obj_id) {
+            return;
+        }
+
         // Fast path: this image object was already decoded — re-emit it under the
         // current CTM/alpha without re-decoding (huge win for repeated symbols).
         if let Some(&image_id) = self.image_obj_cache.get(&obj_id) {
@@ -3080,11 +3150,12 @@ impl<'a> ContentInterpreter<'a> {
             intent,
         );
         let colorspace = self.colormanage_cmyk_image(colorspace);
-        let mut image = match zpdf_image::decode_image_xobject_resolved(
+        let mut image = match zpdf_image::decode_image_xobject_resolved_with_limits(
             &decoded_data,
             &image_dict,
             self.fill_rgb_u8(),
             colorspace,
+            &self.parse_limits,
         ) {
             Ok(img) => img,
             Err(e) => {
@@ -3098,18 +3169,18 @@ impl<'a> ContentInterpreter<'a> {
         // /Mask as a stream ref is a 1-bpc stencil; /Mask colour-key arrays
         // were already handled inside decode_image_xobject_resolved.
         if let Ok(smask_ref) = stream.dict.get_ref("SMask") {
-            fold_soft_mask(&mut image, smask_ref, file);
+            fold_soft_mask(&mut image, smask_ref, file, &self.parse_limits);
         } else if let Ok(mask_ref) = stream.dict.get_ref("Mask") {
-            fold_stencil_mask(&mut image, mask_ref, file);
+            fold_stencil_mask(&mut image, mask_ref, file, &self.parse_limits);
         }
 
         // Insert once and remember the id so repeat draws skip the decode above.
         // `/ImageMask` stencils bake in the fill colour, so they aren't cached.
         let is_stencil = matches!(image_dict.get("ImageMask"), Some(PdfObject::Bool(true)));
-        let Some(cache) = self.image_cache.as_mut() else {
+        let Some(image_id) = self.admit_image(image) else {
+            self.rejected_image_objects.insert(obj_id);
             return;
         };
-        let image_id = cache.insert(image);
         if !is_stencil {
             self.image_obj_cache.insert(obj_id, image_id);
         }
@@ -3133,13 +3204,15 @@ impl<'a> ContentInterpreter<'a> {
         {
             return;
         }
-        let decoded = match zpdf_parser::filters::decode_stream(&data, &norm) {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::warn!("inline image: filter decode failed: {e}");
-                return;
-            }
-        };
+        let decoded =
+            match zpdf_parser::filters::decode_stream_with_limits(&data, &norm, &self.parse_limits)
+            {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::warn!("inline image: filter decode failed: {e}");
+                    return;
+                }
+            };
         // An inline-image /CS naming a non-device space refers to a
         // /ColorSpace resource; substitute the resolved object.
         if let Some(PdfObject::Name(n)) = norm.get("ColorSpace") {
@@ -3172,11 +3245,12 @@ impl<'a> ContentInterpreter<'a> {
             intent,
         );
         let colorspace = self.colormanage_cmyk_image(colorspace);
-        match zpdf_image::decode_image_xobject_resolved(
+        match zpdf_image::decode_image_xobject_resolved_with_limits(
             &decoded,
             &norm,
             self.fill_rgb_u8(),
             colorspace,
+            &self.parse_limits,
         ) {
             Ok(img) => self.emit_draw_image(img),
             Err(e) => tracing::warn!("inline image: {e}"),
@@ -3191,17 +3265,28 @@ impl<'a> ContentInterpreter<'a> {
     }
 
     fn emit_draw_image(&mut self, image: zpdf_image::DecodedImage) {
-        let image_cache = match self.image_cache.as_mut() {
-            Some(c) => c,
-            None => return,
+        let Some(image_id) = self.admit_image(image) else {
+            return;
         };
-        let image_id = image_cache.insert(image);
         let cmd = RenderCommand::DrawImage(ImageDraw {
             image_id,
             transform: self.current.ctm,
             alpha: self.current.fill_alpha,
         });
         self.emit_painted(cmd);
+    }
+
+    fn admit_image(&mut self, image: zpdf_image::DecodedImage) -> Option<zpdf_image::ImageId> {
+        let bytes = image.data.capacity();
+        let cache = self.image_cache.as_mut()?;
+        let id = cache.try_insert_with_limit(image, self.max_image_cache_bytes);
+        if id.is_none() {
+            tracing::warn!(
+                "image cache byte limit ({}) or ID capacity reached; dropping {bytes}-byte image",
+                self.max_image_cache_bytes
+            );
+        }
+        id
     }
 
     /// Replay a form XObject. `xobj_id` is the form's object id for a real
@@ -3229,7 +3314,7 @@ impl<'a> ContentInterpreter<'a> {
         // /Filter refs and caching (with a direct-decode fallback). A synthetic
         // stream has no object id, so its bytes are decoded directly — never
         // looked up in the xref / repair machinery.
-        let direct = || zpdf_parser::filters::decode_stream(&stream.data, &stream.dict);
+        let direct = || decode_stream_for_file(Some(file), &stream.data, &stream.dict);
         let decoded = match xobj_id {
             Some(id) => file.resolve_stream_data(id).or_else(|_| direct()),
             None => direct(),
@@ -3453,6 +3538,7 @@ impl<'a> ContentInterpreter<'a> {
 
         let mut overrides = HashMap::new();
         let form_depth = self.form_font_overrides.len();
+        let max_font_bytes = self.max_font_cache_bytes;
 
         let fc = match self.font_cache.as_mut() {
             Some(fc) => fc,
@@ -3475,8 +3561,13 @@ impl<'a> ContentInterpreter<'a> {
                     }
                     _ => return Ok(()),
                 };
-                fc.insert(target.to_string(), font);
-                Ok(())
+                fc.try_insert_with_limit(target.to_string(), font, max_font_bytes)
+                    .map(|_| ())
+                    .ok_or_else(|| {
+                        zpdf_core::Error::StreamDecode(format!(
+                            "font cache byte limit ({max_font_bytes}) or ID capacity reached"
+                        ))
+                    })
             };
 
             match obj {
@@ -3496,9 +3587,10 @@ impl<'a> ContentInterpreter<'a> {
                         if fc.get_by_name(&unique_name).is_none() {
                             if let Err(e) = load_into(fc, &unique_name) {
                                 tracing::debug!("form font {}: {e}", name.0);
-                                fc.insert(
+                                let _ = fc.try_insert_with_limit(
                                     unique_name.clone(),
                                     zpdf_font::LoadedFont::new_placeholder(name.0.clone()),
+                                    max_font_bytes,
                                 );
                             }
                         }
@@ -3506,9 +3598,10 @@ impl<'a> ContentInterpreter<'a> {
                     } else if fc.get_by_name(&name.0).is_none() {
                         if let Err(e) = load_into(fc, &name.0) {
                             tracing::debug!("form font {}: {e}", name.0);
-                            fc.insert(
+                            let _ = fc.try_insert_with_limit(
                                 name.0.clone(),
                                 zpdf_font::LoadedFont::new_placeholder(name.0.clone()),
+                                max_font_bytes,
                             );
                         }
                     }
@@ -3526,9 +3619,10 @@ impl<'a> ContentInterpreter<'a> {
                     if fc.get_by_name(&target).is_none() {
                         if let Err(e) = load_into(fc, &target) {
                             tracing::debug!("form inline font {}: {e}", name.0);
-                            fc.insert(
+                            let _ = fc.try_insert_with_limit(
                                 target,
                                 zpdf_font::LoadedFont::new_placeholder(name.0.clone()),
+                                max_font_bytes,
                             );
                         }
                     }
@@ -4107,6 +4201,9 @@ impl<'a> ContentInterpreter<'a> {
 
                 let tokenizer = ContentTokenizer::new(&def.content);
                 for token in tokenizer {
+                    if self.over_budget() {
+                        break;
+                    }
                     match token {
                         ContentToken::Operand(obj) => {
                             // M3 Fix: Enforce operand stack depth limit
@@ -4692,13 +4789,26 @@ fn synthetic_form_stream(gen: &zpdf_document::forms::GeneratedAppearance) -> zpd
     zpdf_core::PdfStream::new(dict, gen.content.clone())
 }
 
-/// Build an ICC transform from an inline (synthetic) profile stream,
-/// bypassing the cache — inline streams have no object id to key on.
+/// Decode an in-memory stream with the owning file's active limits.
+/// The owning file is optional for synthetic standalone content.
+fn decode_stream_for_file(
+    file: Option<&PdfFile>,
+    data: &[u8],
+    dict: &PdfDict,
+) -> zpdf_core::Result<Vec<u8>> {
+    match file {
+        Some(file) => zpdf_parser::filters::decode_stream_with_limits(data, dict, file.limits()),
+        None => zpdf_parser::filters::decode_stream(data, dict),
+    }
+}
+
+/// Build an ICC transform from an inline (synthetic) profile stream.
 fn build_inline_icc_transform(
+    file: Option<&PdfFile>,
     s: &zpdf_core::PdfStream,
     intent: zpdf_color::RenderIntent,
 ) -> Option<std::sync::Arc<zpdf_color::IccTransform>> {
-    let data = zpdf_parser::filters::decode_stream(&s.data, &s.dict).ok()?;
+    let data = decode_stream_for_file(file, &s.data, &s.dict).ok()?;
     match zpdf_color::IccTransform::from_profile_bytes(&data, intent) {
         Ok(t) => Some(std::sync::Arc::new(t)),
         Err(e) => {
@@ -4758,7 +4868,7 @@ fn resolve_image_colorspace(
                             (Some(id), Some(f)) => {
                                 cache.get_or_build(id, intent, || f.resolve_stream_data(id).ok())
                             }
-                            (None, _) => build_inline_icc_transform(stream, intent),
+                            (None, _) => build_inline_icc_transform(file, stream, intent),
                             _ => None,
                         };
                         if let Some(t) = transform {
@@ -4794,7 +4904,7 @@ fn resolve_image_colorspace(
                         PdfObject::String(s) => s.as_bytes().to_vec(),
                         PdfObject::Ref(r) => file?.resolve_stream_data(*r).ok()?,
                         PdfObject::Stream(s) => {
-                            zpdf_parser::filters::decode_stream(&s.data, &s.dict).ok()?
+                            decode_stream_for_file(file, &s.data, &s.dict).ok()?
                         }
                         _ => return None,
                     };
@@ -4824,6 +4934,7 @@ fn fold_soft_mask(
     image: &mut zpdf_image::DecodedImage,
     smask_ref: zpdf_core::ObjectId,
     file: &PdfFile,
+    limits: &ParseLimits,
 ) {
     let obj = match file.resolve(smask_ref) {
         Ok(o) => o,
@@ -4842,11 +4953,12 @@ fn fold_soft_mask(
     };
     let dict = resolve_image_metadata(file, &stream.dict);
     // SMasks are DeviceGray by definition (spec table 144).
-    match zpdf_image::decode_image_xobject_resolved(
+    match zpdf_image::decode_image_xobject_resolved_with_limits(
         &data,
         &dict,
         [0, 0, 0],
         Some(zpdf_image::ResolvedColorSpace::Gray),
+        limits,
     ) {
         Ok(mask) => zpdf_image::apply_smask_image(image, &mask),
         Err(e) => tracing::warn!("failed to decode /SMask image: {e}"),
@@ -4859,6 +4971,7 @@ fn fold_stencil_mask(
     image: &mut zpdf_image::DecodedImage,
     mask_ref: zpdf_core::ObjectId,
     file: &PdfFile,
+    limits: &ParseLimits,
 ) {
     let obj = match file.resolve(mask_ref) {
         Ok(o) => o,
@@ -4881,7 +4994,7 @@ fn fold_stencil_mask(
     let width = dict.get_i64("Width").unwrap_or(0) as u32;
     let height = dict.get_i64("Height").unwrap_or(0) as u32;
     let invert = zpdf_image::mask_decode_inverts(&dict);
-    zpdf_image::apply_stencil_mask(image, &data, width, height, invert);
+    zpdf_image::apply_stencil_mask_with_limits(image, &data, width, height, invert, limits);
 }
 
 /// Expand the abbreviated keys/values of an inline-image parameter dict to their
@@ -5832,5 +5945,135 @@ mod tests {
             }
             other => panic!("expected Tint, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn graphics_state_limit_truncates_before_unbounded_clones() {
+        let page = Rect::new(0.0, 0.0, 10.0, 10.0);
+        let dl = ContentInterpreter::new(page)
+            .with_graphics_state_limit(2)
+            .interpret(b"q q q 0 0 1 1 re f");
+        assert!(!dl
+            .commands
+            .iter()
+            .any(|c| matches!(c, RenderCommand::FillPath { .. })));
+
+        let dl = ContentInterpreter::new(page)
+            .with_graphics_state_limit(2)
+            .interpret(b"q q 0 0 1 1 re f Q Q");
+        assert!(dl
+            .commands
+            .iter()
+            .any(|c| matches!(c, RenderCommand::FillPath { .. })));
+    }
+
+    #[test]
+    fn marked_content_limit_truncates_before_unbounded_stack_growth() {
+        let dl = ContentInterpreter::new(Rect::new(0.0, 0.0, 10.0, 10.0))
+            .with_marked_content_limit(2)
+            .interpret(b"/Span BMC /Span BMC /Span BMC 0 0 1 1 re f");
+        assert!(!dl
+            .commands
+            .iter()
+            .any(|c| matches!(c, RenderCommand::FillPath { .. })));
+    }
+
+    #[test]
+    fn parse_limits_configure_all_content_budgets() {
+        let limits = ParseLimits {
+            max_page_operators: 7,
+            max_operand_stack_depth: 8,
+            max_graphics_state_depth: 9,
+            max_marked_content_depth: 10,
+            max_image_cache_bytes: 11,
+            max_font_cache_bytes: 12,
+            max_image_pixels: 13,
+            ..ParseLimits::default()
+        };
+        let interp = ContentInterpreter::new(Rect::new(0.0, 0.0, 10.0, 10.0)).with_limits(&limits);
+        assert_eq!(interp.max_ops, 7);
+        assert_eq!(interp.max_operand_stack_depth, 8);
+        assert_eq!(interp.max_graphics_state_depth, 9);
+        assert_eq!(interp.max_marked_content_depth, 10);
+        assert_eq!(interp.max_image_cache_bytes, 11);
+        assert_eq!(interp.max_font_cache_bytes, 12);
+        assert_eq!(interp.parse_limits.max_image_pixels, 13);
+    }
+
+    #[test]
+    fn inline_images_honor_custom_pixel_limit() {
+        let limits = ParseLimits {
+            max_image_pixels: 3,
+            ..ParseLimits::default()
+        };
+        let mut dict = PdfDict::new();
+        dict.insert(zpdf_core::PdfName::new("W"), PdfObject::Integer(2));
+        dict.insert(zpdf_core::PdfName::new("H"), PdfObject::Integer(2));
+        dict.insert(zpdf_core::PdfName::new("BPC"), PdfObject::Integer(8));
+        dict.insert(
+            zpdf_core::PdfName::new("CS"),
+            PdfObject::Name(zpdf_core::PdfName::new("G")),
+        );
+
+        let mut cache = ImageCache::new();
+        {
+            let mut interp = ContentInterpreter::new(Rect::new(0.0, 0.0, 10.0, 10.0))
+                .with_images(&mut cache)
+                .with_limits(&limits);
+            interp.do_inline_image(dict, vec![0; 4]);
+            assert!(!interp
+                .display_list
+                .commands
+                .iter()
+                .any(|command| matches!(command, RenderCommand::DrawImage(_))));
+        }
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn image_cache_limit_drops_draw_without_retaining_pixels() {
+        let mut cache = ImageCache::new();
+        {
+            let mut interp = ContentInterpreter::new(Rect::new(0.0, 0.0, 10.0, 10.0))
+                .with_images(&mut cache)
+                .with_image_cache_limit(3);
+            interp.emit_draw_image(zpdf_image::DecodedImage {
+                width: 1,
+                height: 1,
+                data: vec![0, 0, 0, 255],
+                has_alpha: false,
+                premultiplied: false,
+            });
+            assert!(!interp
+                .display_list
+                .commands
+                .iter()
+                .any(|command| matches!(command, RenderCommand::DrawImage(_))));
+        }
+        assert!(cache.is_empty());
+        assert_eq!(cache.bytes_used(), 0);
+    }
+
+    #[test]
+    fn non_finite_and_overflowing_transforms_are_ignored() {
+        let mut interp = ContentInterpreter::new(Rect::new(0.0, 0.0, 10.0, 10.0));
+        interp.operand_stack.push(PdfObject::Real(f64::INFINITY));
+        assert_eq!(interp.pop_f64(), 0.0);
+
+        let scale = |interp: &mut ContentInterpreter<'_>| {
+            interp.operand_stack.extend([
+                PdfObject::Real(1.0e308),
+                PdfObject::Real(0.0),
+                PdfObject::Real(0.0),
+                PdfObject::Real(1.0e308),
+                PdfObject::Real(0.0),
+                PdfObject::Real(0.0),
+            ]);
+            interp.execute_operator("cm");
+            interp.operand_stack.clear();
+        };
+        scale(&mut interp);
+        scale(&mut interp); // would overflow without the post-concat guard
+        assert!(interp.current.ctm.is_finite());
     }
 }
