@@ -270,7 +270,24 @@ impl Overprint {
     /// True if colorant `i` (0=C,1=M,2=Y,3=K) is painted by this operation.
     #[inline]
     pub fn paints(&self, i: usize) -> bool {
-        self.active & (1 << i) != 0
+        i < 4 && self.active & (1u8 << i) != 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn overprint_channel_query_is_total() {
+        let op = Overprint {
+            cmyk: [0.0; 4],
+            active: Overprint::C | Overprint::K,
+        };
+        assert!(op.paints(0));
+        assert!(op.paints(3));
+        assert!(!op.paints(4));
+        assert!(!op.paints(usize::MAX));
     }
 }
 
