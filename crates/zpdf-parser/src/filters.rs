@@ -56,7 +56,12 @@ pub fn decode_stream_with_limits(
                 actual: "other",
             })
         }
-        None => return Ok(data.to_vec()),
+        None => {
+            if data.len() as u64 > limits.max_decoded_stream_bytes {
+                return Err(Error::StreamSizeLimit(limits.max_decoded_stream_bytes));
+            }
+            return Ok(data.to_vec());
+        }
     };
 
     let decode_parms = extract_decode_parms(dict, filters.len());
@@ -70,11 +75,18 @@ pub fn decode_stream_with_limits(
         let params = decode_parms[i].as_ref();
 
         // Apply filter to current data
-        let decoded = apply_filter(filter, &current, params, &mut budget)?;
+        let decoded = apply_filter(filter, &current, params, limits, &mut budget)?;
 
         // Apply predictor if specified
         current = if let Some(p) = params {
-            apply_predictor(&decoded, p, &mut budget)?
+            let predictor = p.get_i64("Predictor").unwrap_or(1);
+            if predictor == 2 || predictor >= 10 {
+                apply_predictor(&decoded, p, &mut budget)?
+            } else {
+                // Predictor 1 (and unknown values) is a no-op. Keep ownership of
+                // the filter output instead of cloning the entire stream.
+                decoded
+            }
         } else {
             decoded
         };
@@ -323,6 +335,7 @@ fn apply_filter(
     filter: &PdfName,
     data: &[u8],
     params: Option<&PdfDict>,
+    limits: &ParseLimits,
     budget: &mut DecodeBudget,
 ) -> Result<Vec<u8>> {
     match filter.as_str() {
@@ -337,7 +350,7 @@ fn apply_filter(
         "ASCIIHexDecode" | "AHx" => decode_ascii_hex(data, budget),
         "ASCII85Decode" | "A85" => decode_ascii85(data, budget),
         "RunLengthDecode" | "RL" => decode_run_length(data, budget),
-        "DCTDecode" | "DCT" => decode_dct(data, budget),
+        "DCTDecode" | "DCT" => decode_dct(data, limits.max_image_pixels, budget),
         "CCITTFaxDecode" | "CCF" => {
             let ccitt_params = crate::ccitt::CcittParams::from_dict(params);
             // M1 Fix: Thread budget through to prevent decompression bombs
@@ -352,7 +365,10 @@ fn apply_filter(
         // carries its own colour-space/alpha metadata that a bytes-only filter
         // cannot return. Pass the codestream through unchanged; zpdf-image
         // sniffs it (filter name + JP2/SOC magic) and runs the real decode.
-        "JPXDecode" => Ok(data.to_vec()),
+        "JPXDecode" => {
+            budget.reserve(data.len() as u64)?;
+            Ok(data.to_vec())
+        }
         other => Err(Error::UnsupportedFilter(other.to_string())),
     }
 }
@@ -694,23 +710,25 @@ fn decode_ascii85(data: &[u8], budget: &mut DecodeBudget) -> Result<Vec<u8>> {
 
 /// H2 Fix: Validate JPEG dimensions before zune-jpeg allocates the output buffer.
 /// A malformed JPEG header claiming 65535×65535×4 would trigger a ~16 GiB allocation
-/// in `decode()`, bypassing all limits. Pre-validate against ParseLimits and reserve
-/// the decoded size from the budget before calling decode.
+/// in `decode()`, bypassing all limits. Pre-validate against the active
+/// `ParseLimits` pixel limit and reserve the decoded size from the budget before
+/// calling decode.
 fn validate_jpeg_dimensions(
     width: u16,
     height: u16,
     components: u8,
+    max_image_pixels: u64,
     budget: &mut DecodeBudget,
 ) -> Result<()> {
     let w = width as u64;
     let h = height as u64;
     let c = components as u64;
 
-    // Check pixel count against the same limit zpdf-image uses (mirrors ParseLimits default)
+    // The JPEG header is authoritative; the PDF image dictionary may disagree.
     let pixel_count = w.saturating_mul(h);
-    if pixel_count > 100_000_000 {
+    if pixel_count > max_image_pixels {
         return Err(Error::StreamDecode(format!(
-            "JPEG dimensions {w}×{h} exceed 100M pixel limit"
+            "JPEG dimensions {w}×{h} exceed the {max_image_pixels}-pixel limit"
         )));
     }
 
@@ -728,7 +746,7 @@ fn validate_jpeg_dimensions(
     Ok(())
 }
 
-fn decode_dct(data: &[u8], budget: &mut DecodeBudget) -> Result<Vec<u8>> {
+fn decode_dct(data: &[u8], max_image_pixels: u64, budget: &mut DecodeBudget) -> Result<Vec<u8>> {
     use zune_jpeg::JpegDecoder;
 
     // Adobe YCCK JPEGs (APP14 transform == 2, 4 components) are mis-handled by
@@ -748,7 +766,13 @@ fn decode_dct(data: &[u8], budget: &mut DecodeBudget) -> Result<Vec<u8>> {
             .decode_headers()
             .map_err(|e| Error::StreamDecode(format!("DCTDecode header parse failed: {e}")))?;
         if let Some(info) = decoder.info() {
-            validate_jpeg_dimensions(info.width, info.height, info.components, budget)?;
+            validate_jpeg_dimensions(
+                info.width,
+                info.height,
+                info.components,
+                max_image_pixels,
+                budget,
+            )?;
         }
 
         match decoder.decode() {
@@ -768,7 +792,13 @@ fn decode_dct(data: &[u8], budget: &mut DecodeBudget) -> Result<Vec<u8>> {
         .decode_headers()
         .map_err(|e| Error::StreamDecode(format!("DCTDecode header parse failed: {e}")))?;
     if let Some(info) = decoder.info() {
-        validate_jpeg_dimensions(info.width, info.height, info.components, budget)?;
+        validate_jpeg_dimensions(
+            info.width,
+            info.height,
+            info.components,
+            max_image_pixels,
+            budget,
+        )?;
     }
 
     decoder
@@ -1199,7 +1229,7 @@ mod tests {
         let data = [0x80, 0x0B, 0x60, 0x50, 0x22, 0x0C, 0x0C, 0x85, 0x01];
         let name = PdfName::new("LZWDecode");
         let mut budget = DecodeBudget::new(ParseLimits::default().max_decoded_stream_bytes);
-        let out = apply_filter(&name, &data, None, &mut budget).unwrap();
+        let out = apply_filter(&name, &data, None, &ParseLimits::default(), &mut budget).unwrap();
         assert_eq!(out, b"-----A---B");
     }
 
@@ -1262,5 +1292,39 @@ mod tests {
                 "ec={ec}"
             );
         }
+    }
+
+    #[test]
+    fn decoded_limit_applies_without_filters() {
+        let limits = ParseLimits {
+            max_decoded_stream_bytes: 3,
+            ..ParseLimits::default()
+        };
+        let err = decode_stream_with_limits(b"four", &PdfDict::new(), &limits).unwrap_err();
+        assert!(matches!(err, Error::StreamSizeLimit(3)));
+    }
+
+    #[test]
+    fn jpeg_dimensions_honor_custom_pixel_limit() {
+        let mut budget = DecodeBudget::new(1024);
+        let err = validate_jpeg_dimensions(2, 2, 3, 3, &mut budget).unwrap_err();
+        assert!(err.to_string().contains("3-pixel limit"));
+
+        let mut budget = DecodeBudget::new(1024);
+        validate_jpeg_dimensions(2, 2, 3, 4, &mut budget).unwrap();
+    }
+
+    #[test]
+    fn jpx_passthrough_consumes_decode_budget() {
+        let mut dict = PdfDict::new();
+        dict.insert(
+            PdfName::new("Filter"),
+            PdfObject::Name(PdfName::new("JPXDecode")),
+        );
+        let limits = ParseLimits {
+            max_decoded_stream_bytes: 3,
+            ..ParseLimits::default()
+        };
+        assert!(decode_stream_with_limits(b"four", &dict, &limits).is_err());
     }
 }

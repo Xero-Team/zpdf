@@ -112,7 +112,7 @@ impl<'a> ObjectParser<'a> {
         // indirect /Length, so without this fallback such streams (very common,
         // e.g. Acrobat output) would decode to empty/garbage data.
         let declared = match dict.get("Length") {
-            Some(PdfObject::Integer(n)) if *n >= 0 => Some(*n as usize),
+            Some(PdfObject::Integer(n)) if *n >= 0 => usize::try_from(*n).ok(),
             _ => None,
         };
 
@@ -160,7 +160,9 @@ impl<'a> ObjectParser<'a> {
     /// data). The search is bounded by `max_stream_bytes` so a stream missing
     /// its `endstream` cannot force an unbounded scan.
     fn scan_for_endstream(&self, pos: usize) -> Result<usize> {
-        let cap = (self.limits.max_stream_bytes as usize).saturating_add(b"endstream".len() + 2);
+        let cap = usize::try_from(self.limits.max_stream_bytes)
+            .unwrap_or(usize::MAX)
+            .saturating_add(b"endstream".len() + 2);
         let search_end = pos.saturating_add(cap).min(self.data.len());
         let hay = self
             .data

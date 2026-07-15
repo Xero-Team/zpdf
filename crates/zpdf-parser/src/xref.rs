@@ -76,11 +76,13 @@ pub fn parse_xref_and_trailer(data: &[u8], limits: &ParseLimits) -> Result<(Xref
     parse_hybrid_xrefstm(data, &trailer, &mut table, limits, &mut visited);
     let mut prev = next_prev;
     while let Some(prev_offset) = prev {
-        if !visited.insert(prev_offset as usize) {
+        let prev_offset_usize =
+            usize::try_from(prev_offset).map_err(|_| Error::InvalidXref(prev_offset))?;
+        if !visited.insert(prev_offset_usize) {
             break;
         }
         let (section_trailer, next) =
-            parse_xref_section(data, prev_offset as usize, &mut table, limits)?;
+            parse_xref_section(data, prev_offset_usize, &mut table, limits)?;
         parse_hybrid_xrefstm(data, &section_trailer, &mut table, limits, &mut visited);
         prev = next;
     }
@@ -158,7 +160,8 @@ fn parse_xref_stream(
         return Err(Error::InvalidXref(offset as u64));
     }
 
-    let size = dict.get_i64("Size")? as u32;
+    let size =
+        u32::try_from(dict.get_i64("Size")?).map_err(|_| Error::InvalidXref(offset as u64))?;
 
     // /W [w1 w2 w3] — field widths. Attacker-controlled: a negative width cast
     // to usize would explode entry_size, and widths above 8 cannot fit the u64
@@ -187,16 +190,18 @@ fn parse_xref_stream(
 
     // /Index [start count start count ...] — subsection ranges (optional)
     let index_ranges: Vec<(u32, u32)> = if let Ok(idx_arr) = dict.get_array("Index") {
-        idx_arr
-            .chunks(2)
-            .filter_map(|pair| {
-                if pair.len() == 2 {
-                    Some((pair[0].as_i64().ok()? as u32, pair[1].as_i64().ok()? as u32))
-                } else {
-                    None
-                }
-            })
-            .collect()
+        if !idx_arr.len().is_multiple_of(2) {
+            return Err(Error::InvalidXref(offset as u64));
+        }
+        let mut ranges = Vec::with_capacity(idx_arr.len() / 2);
+        for pair in idx_arr.chunks_exact(2) {
+            let start =
+                u32::try_from(pair[0].as_i64()?).map_err(|_| Error::InvalidXref(offset as u64))?;
+            let count =
+                u32::try_from(pair[1].as_i64()?).map_err(|_| Error::InvalidXref(offset as u64))?;
+            ranges.push((start, count));
+        }
+        ranges
     } else {
         vec![(0, size)]
     };
@@ -204,9 +209,12 @@ fn parse_xref_stream(
     let mut pos = 0usize;
     for &(start, count) in &index_ranges {
         // H3 Fix: Validate range end doesn't overflow u32 before processing
-        let _range_end = start
+        let range_end = start
             .checked_add(count)
             .ok_or(Error::InvalidXref(offset as u64))?;
+        if range_end > size {
+            return Err(Error::InvalidXref(offset as u64));
+        }
 
         // H3 Fix: Check total entry count against max_objects before processing range
         let new_total = table
@@ -228,34 +236,41 @@ fn parse_xref_stream(
             let field3 = read_field(&decoded[pos + w1 + w2..], w3);
             pos += entry_size;
 
-            let entry_type = if w1 == 0 { 1 } else { field1 as u8 };
-            let id = ObjectId(obj_num, field3 as u16);
+            let entry_type = if w1 == 0 {
+                1
+            } else {
+                u8::try_from(field1).map_err(|_| Error::InvalidXref(offset as u64))?
+            };
 
             match entry_type {
                 0 => {
-                    table.insert(
-                        id,
-                        XrefEntry::Free {
-                            next: field2 as u32,
-                            gen: field3 as u16,
-                        },
-                    );
+                    let next =
+                        u32::try_from(field2).map_err(|_| Error::InvalidXref(offset as u64))?;
+                    let gen =
+                        u16::try_from(field3).map_err(|_| Error::InvalidXref(offset as u64))?;
+                    table.insert(ObjectId(obj_num, gen), XrefEntry::Free { next, gen });
                 }
                 1 => {
+                    let gen =
+                        u16::try_from(field3).map_err(|_| Error::InvalidXref(offset as u64))?;
                     table.insert(
-                        id,
+                        ObjectId(obj_num, gen),
                         XrefEntry::InUse {
                             offset: field2,
-                            gen: field3 as u16,
+                            gen,
                         },
                     );
                 }
                 2 => {
+                    let stream_obj =
+                        u32::try_from(field2).map_err(|_| Error::InvalidXref(offset as u64))?;
+                    let index_in_stream =
+                        u32::try_from(field3).map_err(|_| Error::InvalidXref(offset as u64))?;
                     table.insert(
                         ObjectId(obj_num, 0),
                         XrefEntry::Compressed {
-                            stream_obj: field2 as u32,
-                            index_in_stream: field3 as u32,
+                            stream_obj,
+                            index_in_stream,
                         },
                     );
                 }
@@ -267,7 +282,7 @@ fn parse_xref_stream(
     // The xref stream dict itself serves as the trailer
     let trailer = dict.clone();
     let prev = trailer.get("Prev").and_then(|obj| match obj {
-        PdfObject::Integer(n) => Some(*n as u64),
+        PdfObject::Integer(n) => u64::try_from(*n).ok(),
         _ => None,
     });
 
@@ -311,12 +326,9 @@ fn parse_traditional_xref(
         let (first_obj, count) = parse_subsection_header(data, &mut pos)?;
 
         // L7 Fix: Validate subsection range doesn't overflow object ID space
-        let range_end = first_obj
+        let _range_end = first_obj
             .checked_add(count)
             .ok_or(Error::InvalidXref(pos as u64))?;
-        if range_end > limits.max_objects {
-            return Err(Error::InvalidXref(pos as u64));
-        }
 
         // L7 Fix: Check total entry count against limits before processing
         let new_total = table
@@ -349,7 +361,8 @@ fn parse_traditional_xref(
                 table.insert(
                     id,
                     XrefEntry::Free {
-                        next: entry_offset as u32,
+                        next: u32::try_from(entry_offset)
+                            .map_err(|_| Error::InvalidXref(pos as u64))?,
                         gen,
                     },
                 );
@@ -366,7 +379,7 @@ fn parse_traditional_xref(
     };
 
     let prev = trailer.get("Prev").and_then(|obj| match obj {
-        PdfObject::Integer(n) => Some(*n as u64),
+        PdfObject::Integer(n) => u64::try_from(*n).ok(),
         _ => None,
     });
 
@@ -577,6 +590,56 @@ mod tests {
         let d = xref_stream_bytes("[0 0 0]", 1, "", &[]);
         let mut table = XrefTable::new();
         assert!(parse_xref_stream(&d, 0, &mut table, &ParseLimits::default()).is_err());
+    }
+
+    #[test]
+    fn xref_stream_rejects_negative_index_values() {
+        let d = xref_stream_bytes("[1 1 1]", 1, "/Index [-1 1]", &[1, 0, 0]);
+        let mut table = XrefTable::new();
+        assert!(parse_xref_stream(&d, 0, &mut table, &ParseLimits::default()).is_err());
+    }
+
+    #[test]
+    fn xref_stream_rejects_truncating_entry_fields() {
+        // A two-byte type value of 257 must not wrap to type 1.
+        let d = xref_stream_bytes("[2 0 0]", 1, "/Index [0 1]", &[1, 1]);
+        let mut table = XrefTable::new();
+        assert!(parse_xref_stream(&d, 0, &mut table, &ParseLimits::default()).is_err());
+
+        // Generation 65536 must not wrap to generation zero.
+        let d = xref_stream_bytes("[1 1 3]", 1, "/Index [0 1]", &[1, 0, 1, 0, 0]);
+        let mut table = XrefTable::new();
+        assert!(parse_xref_stream(&d, 0, &mut table, &ParseLimits::default()).is_err());
+    }
+
+    #[test]
+    fn sparse_xref_stream_limits_entry_count_not_object_number() {
+        let d = xref_stream_bytes("[1 1 1]", 1_000_001, "/Index [1000000 1]", &[1, 0, 0]);
+        let limits = ParseLimits {
+            max_objects: 1,
+            ..ParseLimits::default()
+        };
+        let mut table = XrefTable::new();
+        parse_xref_stream(&d, 0, &mut table, &limits).unwrap();
+        assert!(matches!(
+            table.get(ObjectId(1_000_000, 0)),
+            Some(XrefEntry::InUse { .. })
+        ));
+    }
+
+    #[test]
+    fn sparse_traditional_xref_limits_entry_count_not_object_number() {
+        let d = b"xref\n1000000 1\n0000000000 00000 n \ntrailer\n<< /Size 1000001 >>\n";
+        let limits = ParseLimits {
+            max_objects: 1,
+            ..ParseLimits::default()
+        };
+        let mut table = XrefTable::new();
+        parse_traditional_xref(d, 0, &mut table, &limits).unwrap();
+        assert!(matches!(
+            table.get(ObjectId(1_000_000, 0)),
+            Some(XrefEntry::InUse { .. })
+        ));
     }
 
     #[test]

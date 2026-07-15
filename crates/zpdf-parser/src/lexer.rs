@@ -111,6 +111,9 @@ impl<'a> Lexer<'a> {
             self.pos += 1;
         }
         let raw = &self.data[start..self.pos];
+        if raw.len() > self.limits.max_string_length as usize {
+            return Err(Error::StringLengthLimit(self.limits.max_string_length));
+        }
         let name = decode_name(raw);
         Ok(PdfObject::Name(PdfName::new(name)))
     }
@@ -244,6 +247,12 @@ impl<'a> Lexer<'a> {
             let n: f64 = s
                 .parse()
                 .map_err(|_| Error::InvalidObject(start as u64, format!("bad real: {s}")))?;
+            if !n.is_finite() {
+                return Err(Error::InvalidObject(
+                    start as u64,
+                    "non-finite real number".into(),
+                ));
+            }
             Ok(PdfObject::Real(n))
         } else {
             let n: i64 = s
@@ -380,7 +389,10 @@ impl<'a> Lexer<'a> {
                 self.skip_whitespace_and_comments();
                 if self.peek() == Some(b'R') {
                     self.pos += 1;
-                    return Ok(PdfObject::Ref(ObjectId(num as u32, gen as u16)));
+                    if let (Ok(num), Ok(gen)) = (u32::try_from(num), u16::try_from(gen)) {
+                        return Ok(PdfObject::Ref(ObjectId(num, gen)));
+                    }
+                    return Ok(PdfObject::Null);
                 }
             }
             self.pos = saved;
@@ -475,6 +487,14 @@ mod tests {
             PdfObject::Real(n) => assert!((n - (-3.5)).abs() < 1e-10),
             other => panic!("expected Real, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn reject_real_that_overflows_to_infinity() {
+        let l = lim();
+        let data = format!("{}.0", "9".repeat(400));
+        let mut lex = Lexer::new(data.as_bytes(), 0, &l);
+        assert!(matches!(lex.next_token(), Err(Error::InvalidObject(_, _))));
     }
 
     #[test]
@@ -623,6 +643,23 @@ mod tests {
         let mut lex = Lexer::new(&data, 0, &l);
         let err = lex.next_token().unwrap_err();
         assert!(matches!(err, Error::StringLengthLimit(4)), "got {err:?}");
+    }
+
+    #[test]
+    fn reject_oversized_name() {
+        let mut l = lim();
+        l.max_string_length = 4;
+        let mut lex = Lexer::new(b"/abcde", 0, &l);
+        assert!(matches!(lex.next_token(), Err(Error::StringLengthLimit(4))));
+    }
+
+    #[test]
+    fn out_of_range_reference_does_not_wrap() {
+        let l = lim();
+        let mut lex = Lexer::new(b"[4294967296 0 R -1 0 R 1 65536 R]", 0, &l);
+        let obj = lex.next_token().unwrap();
+        let arr = obj.as_array().unwrap();
+        assert!(arr.iter().all(|o| !matches!(o, PdfObject::Ref(_))));
     }
 
     #[test]
