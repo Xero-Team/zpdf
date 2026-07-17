@@ -35,6 +35,20 @@ impl ImageCache {
         self.images.get(&id)
     }
 
+    /// Remove and return an image from the cache.
+    ///
+    /// This is intended for consumers such as document converters that need to
+    /// take ownership of decoded pixels after they have finished inspecting the
+    /// display list. Any display-list command that still refers to `id` becomes
+    /// unusable after this call.
+    pub fn remove(&mut self, id: ImageId) -> Option<DecodedImage> {
+        let image = self.images.remove(&id)?;
+        self.bytes_used = self
+            .bytes_used
+            .saturating_sub(u64::try_from(image.data.capacity()).unwrap_or(u64::MAX));
+        Some(image)
+    }
+
     pub fn insert(&mut self, image: DecodedImage) -> ImageId {
         self.try_insert_with_limit(image, u64::MAX)
             .expect("image id space exhausted")
@@ -1501,6 +1515,24 @@ mod tests {
         assert_eq!(cache.bytes_used(), 4);
         assert!(cache.get(0).is_some());
         assert_eq!(cache.try_insert_with_limit(image, 8), Some(1));
+    }
+
+    #[test]
+    fn removing_an_image_releases_its_byte_accounting() {
+        let image = DecodedImage {
+            width: 1,
+            height: 1,
+            data: vec![0, 0, 0, 255],
+            has_alpha: false,
+            premultiplied: false,
+        };
+        let mut cache = ImageCache::new();
+        let id = cache.insert(image);
+        assert_eq!(cache.bytes_used(), 4);
+        assert!(cache.remove(id).is_some());
+        assert_eq!(cache.bytes_used(), 0);
+        assert!(cache.is_empty());
+        assert!(cache.remove(id).is_none());
     }
 
     #[test]
