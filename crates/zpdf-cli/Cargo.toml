@@ -1,6 +1,6 @@
 [package]
 name = "zpdf-cli"
-description = "Command-line tool for zpdf: info, dump, render, text, forms, compare"
+description = "Command-line tool for zpdf: inspect, render, convert, extract, and edit PDFs"
 edition.workspace = true
 license.workspace = true
 version.workspace = true

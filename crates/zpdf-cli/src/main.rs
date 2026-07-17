@@ -5,6 +5,8 @@ use std::io::Write;
 use std::path::Path;
 use std::process;
 
+mod convert;
+
 fn main() {
     // RUST_LOG-controlled diagnostics (e.g. RUST_LOG=zpdf_font=warn). Defaults to
     // silent so normal CLI output stays clean.
@@ -18,7 +20,7 @@ fn main() {
     if args.len() < 2 {
         eprintln!("Usage: zpdf <command> [args...]");
         eprintln!(
-            "Commands: info, dump, render, text, tables, forms, outline, links, struct, signatures, attachments, compare, debug-stream, fill, pages, set-meta, stamp"
+            "Commands: info, dump, render, text, convert, tables, forms, outline, links, struct, signatures, attachments, compare, debug-stream, fill, pages, set-meta, stamp"
         );
         process::exit(1);
     }
@@ -28,6 +30,7 @@ fn main() {
         "dump" => cmd_dump(&args[2..]),
         "render" => cmd_render(&args[2..]),
         "text" => cmd_text(&args[2..]),
+        "convert" => convert::run(&args[2..]),
         "tables" => cmd_tables(&args[2..]),
         "forms" => cmd_forms(&args[2..]),
         "outline" => cmd_outline(&args[2..]),
@@ -56,7 +59,7 @@ fn main() {
 /// Pull an optional `--password <pw>` out of an argument list, returning the
 /// remaining args and the password. Lets every document command accept it
 /// uniformly without each flag loop having to know about it.
-fn extract_password(args: &[String]) -> (Vec<String>, Option<String>) {
+pub(crate) fn extract_password(args: &[String]) -> (Vec<String>, Option<String>) {
     let mut rest = Vec::new();
     let mut password = None;
     let mut i = 0;
@@ -83,7 +86,7 @@ fn extract_password(args: &[String]) -> (Vec<String>, Option<String>) {
 }
 
 /// Read and open a PDF, optionally with a decryption password.
-fn open_document(path: &str, password: Option<&str>) -> zpdf::Result<zpdf::PdfDocument> {
+pub(crate) fn open_document(path: &str, password: Option<&str>) -> zpdf::Result<zpdf::PdfDocument> {
     let data = fs::read(path).map_err(zpdf::Error::Io)?;
     match password {
         Some(pw) => zpdf::PdfDocument::open_with_password(data, pw.as_bytes()),
@@ -1892,7 +1895,7 @@ fn cmd_stamp(args: &[String]) -> zpdf::Result<()> {
 }
 
 /// Parse "1,3-5,8" into 0-based indices [0,2,3,4,7]. "all" is not supported.
-fn parse_page_list(s: &str) -> std::result::Result<Vec<usize>, String> {
+pub(crate) fn parse_page_list(s: &str) -> std::result::Result<Vec<usize>, String> {
     const MAX_SELECTED_PAGES: usize = 1_000_000;
     let mut result = Vec::new();
     for raw_part in s.split(',') {
