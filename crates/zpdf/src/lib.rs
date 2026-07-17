@@ -1,3 +1,9 @@
+mod conversion;
+
+pub use conversion::{
+    convert_pdf, ConversionMode, ConversionOptions, ConvertedDocument, ConvertedImage,
+    ConvertedPage, ImagePlacement,
+};
 pub use zpdf_color::{IccCache, IccTransform};
 pub use zpdf_content::interpreter::ContentInterpreter;
 pub use zpdf_content::output_intent_cmyk_profile;
