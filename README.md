@@ -40,6 +40,10 @@ GPU (wgpu) renderers whose output matches within <1% of pixels.
 - **Fonts** — embedded TrueType, Type1, Type1C/CFF, CID/Type0 (Identity-H,
   `/W`, `/CIDToGIDMap` streams), Type3, the standard-14 fonts; encodings +
   `/Differences`; Quartz-subset recovery; `/ToUnicode` text extraction.
+- **TXT, Markdown & HTML conversion** — text-only conversion skips image
+  decoding entirely; rich Markdown/HTML exports decoded images as PNG assets and
+  includes document/page metadata. Unsupported or malformed images are discarded
+  without interrupting text extraction (`convert_pdf`, CLI `convert`).
 - **Images** — 1/2/4/8/16-bpc, `/Decode`, soft masks, stencil & color-key
   masks, Indexed palettes, CMYK JPEG; bilinear sampling with box-filter
   minification.
@@ -76,7 +80,7 @@ GPU (wgpu) renderers whose output matches within <1% of pixels.
 - **CPU rendering** — tiny-skia backend, PNG output at any DPI.
 - **GPU rendering** — wgpu backend (fills, strokes, clips, text, images, blend
   groups); matches the CPU renderer within <1% pixels.
-- **Tooling** — CLI (`info`/`render`/`text`/`tables`/`forms`/`outline`/`links`/`struct`/`attachments`/`signatures`/`compare`/`dump`/`debug-stream`),
+- **Tooling** — CLI (`info`/`render`/`text`/`convert`/`tables`/`forms`/`outline`/`links`/`struct`/`attachments`/`signatures`/`compare`/`dump`/`debug-stream`),
   an interactive winit viewer example, and a native GPUI desktop reader
   (`zpdf-viewer-gpui`).
 
@@ -129,6 +133,11 @@ cargo run -p zpdf-cli --features gpu -- render document.pdf -p 1 -o gpu.png --ba
 # Extract text, and compare two renders
 cargo run -p zpdf-cli -- text document.pdf -p 1
 cargo run -p zpdf-cli -- compare out.png gpu.png --out diff.png
+
+# Convert the whole document to TXT, rich Markdown, or rich HTML + PNG assets
+cargo run -p zpdf-cli -- convert document.pdf -o document.txt --mode text
+cargo run -p zpdf-cli -- convert document.pdf -o document.md --mode rich
+cargo run -p zpdf-cli -- convert document.pdf -o document.html --mode rich
 
 # Interactive viewer (pan/zoom/page-flip)
 cargo run -p zpdf-render-wgpu --example viewer -- document.pdf

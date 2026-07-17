@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+### TXT, Markdown, and HTML conversion
+
+- Added the public `convert_pdf` facade API with `ConversionMode::TextOnly` and
+  `ConversionMode::Rich`. Text-only mode omits the image cache entirely; rich
+  mode returns extracted text, document/page metadata, decoded raster images,
+  and every placement of each unique page image.
+- Added `zpdf convert` with `--format txt|md|html`, `--mode text|rich`,
+  single/list/all page selection, `--struct`, password support, inferred output
+  names, and configurable Markdown/HTML image-assets directories.
+- HTML output is a complete UTF-8 document with safely escaped content,
+  responsive light/dark styling, semantic page sections, preserved text layout,
+  metadata tables, and lazy-loaded rich-mode images.
+- Rich conversion writes straight-alpha PNG assets, deduplicates repeated image
+  draws, and continues with text when image decode or export fails.
+- Added end-to-end coverage proving that malformed images do not interrupt text
+  extraction, plus CLI parsing, path escaping, and alpha-conversion tests.
+
 ## 0.10.0 — Digital signature cryptographic verification (ISO 32000-1 §12.8)
 
 Complete public-key signature verification for PDF digital signatures, extending

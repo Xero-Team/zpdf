@@ -392,6 +392,11 @@ cargo run -p zpdf-render-wgpu --example viewer -- <file.pdf>   # 交互浏览器
 
 - [X] 结构化文本提取（坐标、大小：TextSpan）
 - [X] 阅读顺序启发式（递归 XY-cut：列检测 + 整行重组）
+- [X] PDF 转 TXT/Markdown/HTML：facade `convert_pdf` 提供 `TextOnly`（不创建图像缓存，
+  静默丢弃非文本内容）与 `Rich`（文本 + 文档/页面元数据 + 去重 RGBA 图像及放置位置）
+  两种模式；CLI `zpdf convert` 支持 `--format txt|md|html`、页码列表、`--struct`、
+  密码和 Markdown/HTML PNG assets 目录。HTML 输出包含 UTF-8 转义、响应式样式、页面
+  区块和元数据表；图像解码/写入失败仅丢弃该图，不中断文本输出
 - [X] 表格检测（`zpdf-content/src/tables.rs`，基于对齐的白空隙网格法）：按基线聚行 →
   按大间距切带 → 带内用扫描线找"白空隙"竖列分隔（列分隔须在带内绝大多数行保持空白，
   max_cross=floor((1−0.85)·行数)）→ 列分隔中点定列、行基线中点定行 → 按 x 中心分桶建格。

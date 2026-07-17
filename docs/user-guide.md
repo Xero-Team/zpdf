@@ -1,7 +1,8 @@
 # zpdf User Guide
 
 `zpdf` is a pure-Rust PDF parser and renderer. This guide covers the `zpdf`
-command-line tool: rendering pages to PNG (on CPU or GPU), extracting text,
+command-line tool: rendering pages to PNG (on CPU or GPU), converting to TXT,
+Markdown, or HTML, extracting text,
 inspecting PDF internals, and comparing renders.
 
 For using zpdf as a Rust library, see [library.md](library.md).
@@ -30,6 +31,7 @@ The release binary is at `target/release/zpdf`. The examples below use
 | `info` | Print version, page count, per-page size/rotation, metadata, and outline summary. |
 | `render` | Render a page to a PNG (CPU or GPU). |
 | `text` | Extract text from a page (or all pages). |
+| `convert` | Convert selected pages to TXT, Markdown, or HTML with optional PNG assets. |
 | `tables` | Detect tables on a page (or all pages) and print them as TSV/CSV. |
 | `forms` | List interactive-form (AcroForm) fields, types, and values. |
 | `outline` | Print the document outline (bookmarks) as an indented tree with resolved targets. |
@@ -39,7 +41,7 @@ The release binary is at `target/release/zpdf`. The examples below use
 | `debug-stream` | Print a decoded stream object's bytes. |
 
 > **Encrypted PDFs.** Documents protected with a non-empty password open with
-> `--password <pw>` (accepted by `info`, `dump`, `render`, `text`, `tables`,
+> `--password <pw>` (accepted by `info`, `dump`, `render`, `text`, `convert`, `tables`,
 > `forms`, `outline`, and `attachments`).
 > The password may be the user or owner password; a wrong one reports an error.
 > Documents encrypted with an empty password open without the flag.
@@ -142,6 +144,50 @@ cargo run -p zpdf-cli -- text document.pdf --all    # every page
 
 Text is reconstructed from the page's fonts using `/ToUnicode` (when present) and the
 font encoding, grouped into lines and ordered left-to-right. Output goes to stdout.
+
+### `convert` — write TXT, Markdown, or HTML
+
+```bash
+# Whole-document plain text. Images and all other graphics are not decoded.
+cargo run -p zpdf-cli -- convert document.pdf -o document.txt --mode text
+
+# Rich Markdown plus document_assets/page-NNNN-image-NNN.png files.
+cargo run -p zpdf-cli -- convert document.pdf -o document.md --mode rich
+
+# Rich, styled HTML using the same extracted text, metadata, and PNG assets.
+cargo run -p zpdf-cli -- convert document.pdf -o document.html --mode rich
+
+# Selected pages in Tagged-PDF logical reading order when available.
+cargo run -p zpdf-cli -- convert document.pdf --mode rich --pages 1,3-5 \
+  --struct --images-dir assets -o excerpt.md
+```
+
+`--mode text` is the default. It constructs the content interpreter without an
+image cache, so image streams, shadings, and other graphics are silently skipped
+and cannot interfere with text extraction. TXT contains only extracted page text,
+with pages separated by blank lines. `--format txt|md|html` overrides format
+inference from `-o`; without `-o`, output defaults to the input name with `.txt`,
+`.md`, or `.html`.
+
+`--mode rich` requires Markdown or HTML. It adds `/Info` and XMP metadata, page
+size, rotation, printed page labels, and every successfully decoded raster image.
+Images are written as PNG files under `<output-stem>_assets` by default. An
+unsupported, malformed, over-budget, or unwritable image is omitted while
+conversion continues with the page text. Repeated draws of the same image export
+one asset and retain a placement count. HTML output is a complete UTF-8 document
+with responsive light/dark CSS, semantic page sections, escaped metadata/text,
+and preformatted text that preserves extracted line breaks and spacing.
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--mode text\|rich` | `text` | Text only, or metadata and images where supported. |
+| `--format txt\|md\|html` | output extension | Output serialization; rich mode requires `md` or `html`. |
+| `-o, --output <file>` | input stem | Destination `.txt`, `.md`, or `.html` file. |
+| `-p, --page <n>` | all pages | Convert one 1-based page. |
+| `--pages <list>` | all pages | Convert a list such as `1,3-5`; duplicates are removed. |
+| `--all` | all pages | Explicitly convert the complete document. |
+| `--struct` | off | Prefer Tagged-PDF logical order, falling back to geometric order. |
+| `--images-dir <dir>` | `<output-stem>_assets` | Rich-mode PNG destination, relative to the Markdown/HTML file. |
 
 ### `attachments` — list & extract embedded files
 

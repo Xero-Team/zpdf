@@ -126,6 +126,49 @@ println!("{text}");
 Each `TextSpan` carries the decoded text plus its position and size, so you can build
 your own layout/extraction logic instead of using `spans_to_text`.
 
+## Converting a document
+
+The facade also provides a high-level conversion API. Text-only mode deliberately
+omits image decoding; rich mode returns document/page metadata and owned RGBA image
+buffers for the caller to serialize as PNG, Markdown, HTML, or another format.
+
+```rust
+use zpdf::{convert_pdf, ConversionMode, ConversionOptions, PdfDocument};
+
+let bytes = std::fs::read("document.pdf").map_err(zpdf::Error::Io)?;
+let doc = PdfDocument::open(bytes)?;
+let pages: Vec<usize> = (0..doc.page_count()).collect();
+let converted = convert_pdf(
+    &doc,
+    &pages,
+    ConversionOptions {
+        mode: ConversionMode::Rich,
+        use_structure: true,
+    },
+)?;
+
+for page in converted.pages {
+    println!("page {}: {}", page.index + 1, page.text);
+    for image in page.images {
+        println!(
+            "  image {}x{}, drawn {} time(s)",
+            image.image.width,
+            image.image.height,
+            image.placements.len()
+        );
+        // image.image.data is tight RGBA8. When `premultiplied` is true,
+        // unpremultiply RGB before encoding it with a straight-alpha PNG API.
+    }
+}
+```
+
+Malformed, unsupported, hidden, or resource-limit-rejected images are absent from
+`page.images`; they do not turn a successful text extraction into an error. The CLI
+implements ready-made TXT, Markdown, and HTML serializers on top of this API.
+Across all selected pages, retained images share `max_image_cache_bytes` and
+extracted text is bounded by `max_decoded_stream_bytes` from the document's active
+`ParseLimits`.
+
 ## Inspecting documents
 
 ```rust
