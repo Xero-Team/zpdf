@@ -20,7 +20,7 @@ fn main() {
     if args.len() < 2 {
         eprintln!("Usage: zpdf <command> [args...]");
         eprintln!(
-            "Commands: info, dump, render, text, search, convert, tables, forms, outline, links, struct, signatures, attachments, compare, debug-stream, fill, merge, split, pages, set-meta, stamp"
+            "Commands: info, dump, render, text, search, convert, tables, forms, outline, links, struct, signatures, attachments, compare, debug-stream, fill, merge, split, optimize, pages, set-meta, stamp"
         );
         process::exit(1);
     }
@@ -44,6 +44,7 @@ fn main() {
         "fill" => cmd_fill(&args[2..]),
         "merge" => cmd_merge(&args[2..]),
         "split" => cmd_split(&args[2..]),
+        "optimize" => cmd_optimize(&args[2..]),
         "pages" => cmd_pages(&args[2..]),
         "set-meta" => cmd_set_meta(&args[2..]),
         "stamp" => cmd_stamp(&args[2..]),
@@ -1787,6 +1788,65 @@ fn cmd_split(args: &[String]) -> zpdf::Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+/// Rewrite a PDF from its object graph: garbage-collect unreachable objects,
+/// renumber densely, decrypt (when opened with a password) and optionally
+/// compress bare streams.
+fn cmd_optimize(args: &[String]) -> zpdf::Result<()> {
+    let (args, password) = extract_password(args);
+    let mut input = None;
+    let mut output = None;
+    let mut no_compress = false;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-o" => {
+                output = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "--no-compress" => {
+                no_compress = true;
+                i += 1;
+            }
+            other if !other.starts_with('-') => {
+                if input.is_none() {
+                    input = Some(other.to_string());
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+
+    let (Some(input_path), Some(out_path)) = (input, output) else {
+        eprintln!("Usage: zpdf optimize <file.pdf> -o <out.pdf> [--no-compress] [--password <pw>]");
+        process::exit(1);
+    };
+    if out_path == input_path {
+        eprintln!("Output path must differ from input");
+        process::exit(1);
+    }
+
+    let doc = open_document(&input_path, password.as_deref())?;
+    warn_signatures(&doc);
+    if doc.is_encrypted() {
+        eprintln!("Note: output will be decrypted (rewrite drops /Encrypt).");
+    }
+    let options = zpdf_writer::RewriteOptions {
+        compress_uncompressed: !no_compress,
+    };
+    let bytes = zpdf_writer::rewrite_pdf(doc.file(), &options)?;
+
+    let in_size = fs::metadata(&input_path).map_err(zpdf::Error::Io)?.len();
+    let out_size = bytes.len() as u64;
+    fs::write(&out_path, bytes).map_err(zpdf::Error::Io)?;
+    println!(
+        "{input_path} ({in_size} B) → {out_path} ({out_size} B, {:+.1}%)",
+        (out_size as f64 - in_size as f64) / in_size as f64 * 100.0
+    );
     Ok(())
 }
 

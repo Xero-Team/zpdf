@@ -41,12 +41,14 @@ pub mod forms;
 pub mod merge;
 pub mod metadata;
 pub mod pages;
+pub mod rewrite;
 pub mod stamp;
 
 pub use copier::{copy_object_graph, ObjectIdMap};
 pub use forms::FormFiller;
 pub use merge::extract_pages;
 pub use metadata::InfoUpdate;
+pub use rewrite::{rewrite_pdf, RewriteOptions};
 pub use stamp::{jpeg_dimensions, StampImage, StampItem};
 
 /// An object queued for the incremental update, kept unserialized so later
