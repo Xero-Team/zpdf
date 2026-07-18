@@ -36,6 +36,7 @@ use zpdf_document::{InkAnnotDict, PdfDocument};
 mod serialize;
 use serialize::{serialize_dict, write_object, write_stream};
 
+pub mod annotate;
 pub mod copier;
 pub mod forms;
 pub mod merge;
@@ -44,6 +45,7 @@ pub mod pages;
 pub mod rewrite;
 pub mod stamp;
 
+pub use annotate::{AnnotationSpec, MarkupKind};
 pub use copier::{copy_object_graph, ObjectIdMap};
 pub use forms::FormFiller;
 pub use merge::extract_pages;

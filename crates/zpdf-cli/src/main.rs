@@ -20,7 +20,7 @@ fn main() {
     if args.len() < 2 {
         eprintln!("Usage: zpdf <command> [args...]");
         eprintln!(
-            "Commands: info, dump, render, text, search, convert, tables, forms, outline, links, struct, signatures, attachments, compare, debug-stream, fill, merge, split, optimize, pages, set-meta, stamp"
+            "Commands: info, dump, render, text, search, convert, tables, forms, outline, links, struct, signatures, attachments, compare, debug-stream, fill, merge, split, optimize, annotate, pages, set-meta, stamp"
         );
         process::exit(1);
     }
@@ -45,6 +45,7 @@ fn main() {
         "merge" => cmd_merge(&args[2..]),
         "split" => cmd_split(&args[2..]),
         "optimize" => cmd_optimize(&args[2..]),
+        "annotate" => cmd_annotate(&args[2..]),
         "pages" => cmd_pages(&args[2..]),
         "set-meta" => cmd_set_meta(&args[2..]),
         "stamp" => cmd_stamp(&args[2..]),
@@ -1847,6 +1848,227 @@ fn cmd_optimize(args: &[String]) -> zpdf::Result<()> {
         "{input_path} ({in_size} B) → {out_path} ({out_size} B, {:+.1}%)",
         (out_size as f64 - in_size as f64) / in_size as f64 * 100.0
     );
+    Ok(())
+}
+
+/// Author an annotation onto a page: highlight/underline/strikeout/squiggly
+/// (from a rect), note, free text, square, circle or line.
+fn cmd_annotate(args: &[String]) -> zpdf::Result<()> {
+    let (args, password) = extract_password(args);
+    let mut input = None;
+    let mut output = None;
+    let mut page_num: usize = 1;
+    let mut kind: Option<String> = None;
+    let mut rect: Option<zpdf::Rect> = None;
+    let mut at: Option<(f64, f64)> = None;
+    let mut to: Option<(f64, f64)> = None;
+    let mut text: Option<String> = None;
+    let mut color: Option<(f64, f64, f64)> = None;
+    let mut interior: Option<(f64, f64, f64)> = None;
+    let mut width: f64 = 1.0;
+    let mut size: Option<f64> = None;
+    let mut icon: Option<String> = None;
+
+    let usage = || {
+        eprintln!(
+            "Usage: zpdf annotate <file.pdf> -p <page> --kind <highlight|underline|strikeout|squiggly|note|freetext|square|circle|line>\n       [--rect X0,Y0,X1,Y1] [--at X,Y] [--to X,Y] [--text STR] [--color R,G,B] [--interior R,G,B]\n       [--width W] [--size S] [--icon NAME] -o <out.pdf>"
+        );
+        process::exit(1);
+    };
+
+    let parse_nums = |s: &str, n: usize, what: &str| -> Vec<f64> {
+        let vals: Vec<f64> = s.split(',').filter_map(|p| p.trim().parse().ok()).collect();
+        if vals.len() != n {
+            eprintln!("{what} requires {n} comma-separated numbers");
+            process::exit(1);
+        }
+        vals
+    };
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-p" => {
+                page_num = args
+                    .get(i + 1)
+                    .and_then(|s| s.parse().ok())
+                    .filter(|&p: &usize| p > 0)
+                    .unwrap_or_else(|| {
+                        eprintln!("-p requires a positive page number");
+                        process::exit(2);
+                    });
+                i += 2;
+            }
+            "--kind" => {
+                kind = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "--rect" => {
+                let v = parse_nums(
+                    args.get(i + 1).map(String::as_str).unwrap_or(""),
+                    4,
+                    "--rect",
+                );
+                rect = Some(zpdf::Rect::new(v[0], v[1], v[2], v[3]));
+                i += 2;
+            }
+            "--at" => {
+                let v = parse_nums(args.get(i + 1).map(String::as_str).unwrap_or(""), 2, "--at");
+                at = Some((v[0], v[1]));
+                i += 2;
+            }
+            "--to" => {
+                let v = parse_nums(args.get(i + 1).map(String::as_str).unwrap_or(""), 2, "--to");
+                to = Some((v[0], v[1]));
+                i += 2;
+            }
+            "--text" => {
+                text = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "--color" => {
+                let v = parse_nums(
+                    args.get(i + 1).map(String::as_str).unwrap_or(""),
+                    3,
+                    "--color",
+                );
+                color = Some((v[0], v[1], v[2]));
+                i += 2;
+            }
+            "--interior" => {
+                let v = parse_nums(
+                    args.get(i + 1).map(String::as_str).unwrap_or(""),
+                    3,
+                    "--interior",
+                );
+                interior = Some((v[0], v[1], v[2]));
+                i += 2;
+            }
+            "--width" => {
+                width = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(1.0);
+                i += 2;
+            }
+            "--size" => {
+                size = args.get(i + 1).and_then(|s| s.parse().ok());
+                i += 2;
+            }
+            "--icon" => {
+                icon = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "-o" => {
+                output = args.get(i + 1).cloned();
+                i += 2;
+            }
+            other if !other.starts_with('-') => {
+                if input.is_none() {
+                    input = Some(other.to_string());
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+
+    let (Some(input_path), Some(out_path), Some(kind)) = (input, output, kind) else {
+        usage();
+        unreachable!()
+    };
+    if out_path == input_path {
+        eprintln!("Output path must differ from input");
+        process::exit(1);
+    }
+
+    let markup = |mk: zpdf::MarkupKind| -> zpdf::AnnotationSpec {
+        let Some(r) = rect else {
+            eprintln!("--rect X0,Y0,X1,Y1 required for text markup");
+            process::exit(1);
+        };
+        zpdf::AnnotationSpec::markup_from_rects(
+            mk,
+            &[r],
+            color.unwrap_or((1.0, 1.0, 0.0)),
+            text.clone(),
+        )
+    };
+
+    let spec = match kind.as_str() {
+        "highlight" => markup(zpdf::MarkupKind::Highlight),
+        "underline" => markup(zpdf::MarkupKind::Underline),
+        "strikeout" => markup(zpdf::MarkupKind::StrikeOut),
+        "squiggly" => markup(zpdf::MarkupKind::Squiggly),
+        "note" => {
+            let Some((x, y)) = at else {
+                eprintln!("--at X,Y required for note");
+                process::exit(1);
+            };
+            zpdf::AnnotationSpec::Note {
+                x,
+                y,
+                contents: text.clone().unwrap_or_default(),
+                color,
+                icon: icon.clone(),
+            }
+        }
+        "freetext" => {
+            let Some(r) = rect else {
+                eprintln!("--rect X0,Y0,X1,Y1 required for freetext");
+                process::exit(1);
+            };
+            zpdf::AnnotationSpec::FreeText {
+                rect: r,
+                contents: text.clone().unwrap_or_default(),
+                size,
+                color,
+            }
+        }
+        "square" | "circle" => {
+            let Some(r) = rect else {
+                eprintln!("--rect X0,Y0,X1,Y1 required for square/circle");
+                process::exit(1);
+            };
+            let c = color.unwrap_or((1.0, 0.0, 0.0));
+            if kind == "square" {
+                zpdf::AnnotationSpec::Square {
+                    rect: r,
+                    color: c,
+                    interior,
+                    width,
+                }
+            } else {
+                zpdf::AnnotationSpec::Circle {
+                    rect: r,
+                    color: c,
+                    interior,
+                    width,
+                }
+            }
+        }
+        "line" => {
+            let (Some((x1, y1)), Some((x2, y2))) = (at, to) else {
+                eprintln!("--at X,Y and --to X,Y required for line");
+                process::exit(1);
+            };
+            zpdf::AnnotationSpec::Line {
+                x1,
+                y1,
+                x2,
+                y2,
+                color: color.unwrap_or((1.0, 0.0, 0.0)),
+                width,
+            }
+        }
+        other => {
+            eprintln!("Unknown annotation kind: {other}");
+            process::exit(1);
+        }
+    };
+
+    let mut writer = build_writer(&input_path, password.as_deref())?;
+    warn_signatures(writer.document());
+    writer.add_annotation(page_num - 1, &spec)?;
+    write_output(&writer, &out_path)?;
+    println!("{kind} annotation on page {page_num} → {out_path}");
     Ok(())
 }
 
