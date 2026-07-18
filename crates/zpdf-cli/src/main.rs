@@ -20,7 +20,7 @@ fn main() {
     if args.len() < 2 {
         eprintln!("Usage: zpdf <command> [args...]");
         eprintln!(
-            "Commands: info, dump, render, text, search, convert, tables, forms, outline, links, struct, signatures, attachments, compare, debug-stream, fill, pages, set-meta, stamp"
+            "Commands: info, dump, render, text, search, convert, tables, forms, outline, links, struct, signatures, attachments, compare, debug-stream, fill, merge, split, pages, set-meta, stamp"
         );
         process::exit(1);
     }
@@ -42,6 +42,8 @@ fn main() {
         "compare" => cmd_compare(&args[2..]),
         "debug-stream" => cmd_debug_stream(&args[2..]),
         "fill" => cmd_fill(&args[2..]),
+        "merge" => cmd_merge(&args[2..]),
+        "split" => cmd_split(&args[2..]),
         "pages" => cmd_pages(&args[2..]),
         "set-meta" => cmd_set_meta(&args[2..]),
         "stamp" => cmd_stamp(&args[2..]),
@@ -1653,6 +1655,157 @@ fn cmd_fill(args: &[String]) -> zpdf::Result<()> {
     write_output(&writer, &out_path)?;
     println!("Filled {} fields → {}", sets.len(), out_path);
     Ok(())
+}
+
+/// Concatenate two or more PDFs: the first file is the base, the pages of
+/// every following file are appended (deep-copied with renumbering).
+fn cmd_merge(args: &[String]) -> zpdf::Result<()> {
+    let mut inputs: Vec<String> = Vec::new();
+    let mut output = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-o" => {
+                output = args.get(i + 1).cloned();
+                i += 2;
+            }
+            other if !other.starts_with('-') => {
+                inputs.push(other.to_string());
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+
+    if inputs.len() < 2 {
+        eprintln!("Usage: zpdf merge <a.pdf> <b.pdf> [more.pdf ...] -o <out.pdf>");
+        process::exit(1);
+    }
+    let Some(out_path) = output else {
+        eprintln!("-o <out.pdf> required");
+        process::exit(1);
+    };
+    if inputs.contains(&out_path) {
+        eprintln!("Output path must differ from every input");
+        process::exit(1);
+    }
+
+    let mut writer = build_writer(&inputs[0], None)?;
+    warn_signatures(writer.document());
+    let mut total = writer.document().page_count();
+    for path in &inputs[1..] {
+        let data = fs::read(path).map_err(zpdf::Error::Io)?;
+        let file = zpdf::PdfFile::parse(data)?;
+        let appended = writer.append_document_pages(&file)?;
+        total += appended;
+        println!("{path}: {appended} page(s) appended");
+    }
+    write_output(&writer, &out_path)?;
+    println!(
+        "Merged {} file(s), {total} page(s) → {out_path}",
+        inputs.len()
+    );
+    Ok(())
+}
+
+/// Split a PDF into per-range files. With no --pages, writes one file per
+/// page (`<stem>-N.pdf`); with `--pages`, extracts one file with those pages.
+fn cmd_split(args: &[String]) -> zpdf::Result<()> {
+    let (args, password) = extract_password(args);
+    let mut input = None;
+    let mut output: Option<String> = None;
+    let mut pages_spec: Option<String> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-o" => {
+                output = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "--pages" => {
+                pages_spec = args.get(i + 1).cloned();
+                i += 2;
+            }
+            other if !other.starts_with('-') => {
+                if input.is_none() {
+                    input = Some(other.to_string());
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+
+    let Some(input_path) = input else {
+        eprintln!(
+            "Usage: zpdf split <file.pdf> [--pages 1,3-5] [-o <out.pdf|out-dir>] [--password <pw>]"
+        );
+        process::exit(1);
+    };
+
+    let doc = open_document(&input_path, password.as_deref())?;
+    let total = doc.page_count();
+
+    match pages_spec {
+        // One output containing the selected pages.
+        Some(spec) => {
+            let pages = parse_page_list(&spec).unwrap_or_else(|error| {
+                eprintln!("invalid page list: {error}");
+                process::exit(1);
+            });
+            if pages.iter().any(|&p| p >= total) {
+                eprintln!("page out of range (document has {total} pages)");
+                process::exit(1);
+            }
+            let out_path = output.unwrap_or_else(|| derive_split_name(&input_path, None));
+            if out_path == input_path {
+                eprintln!("Output path must differ from input");
+                process::exit(1);
+            }
+            let bytes = zpdf_writer::extract_pages(doc.file(), &pages)?;
+            fs::write(&out_path, bytes).map_err(zpdf::Error::Io)?;
+            println!("{} page(s) → {out_path}", pages.len());
+        }
+        // One output per page: <stem>-<N>.pdf next to the input (or in -o dir).
+        None => {
+            for p in 0..total {
+                let out_path = match &output {
+                    Some(dir) => {
+                        let stem = Path::new(&input_path)
+                            .file_stem()
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or_else(|| "page".to_string());
+                        format!("{}/{stem}-{}.pdf", dir.trim_end_matches(['/', '\\']), p + 1)
+                    }
+                    None => derive_split_name(&input_path, Some(p + 1)),
+                };
+                let bytes = zpdf_writer::extract_pages(doc.file(), &[p])?;
+                fs::write(&out_path, bytes).map_err(zpdf::Error::Io)?;
+                println!("page {} → {out_path}", p + 1);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `input.pdf` → `input-split.pdf` or `input-3.pdf` for a page number.
+fn derive_split_name(input: &str, page: Option<usize>) -> String {
+    let path = Path::new(input);
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "out".to_string());
+    let dir = path.parent().map(|p| p.to_string_lossy().to_string());
+    let name = match page {
+        Some(n) => format!("{stem}-{n}.pdf"),
+        None => format!("{stem}-split.pdf"),
+    };
+    match dir.as_deref() {
+        Some("") | None => name,
+        Some(d) => format!("{d}/{name}"),
+    }
 }
 
 fn cmd_pages(args: &[String]) -> zpdf::Result<()> {

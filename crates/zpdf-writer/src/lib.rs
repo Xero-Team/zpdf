@@ -36,12 +36,16 @@ use zpdf_document::{InkAnnotDict, PdfDocument};
 mod serialize;
 use serialize::{serialize_dict, write_object, write_stream};
 
+pub mod copier;
 pub mod forms;
+pub mod merge;
 pub mod metadata;
 pub mod pages;
 pub mod stamp;
 
+pub use copier::{copy_object_graph, ObjectIdMap};
 pub use forms::FormFiller;
+pub use merge::extract_pages;
 pub use metadata::InfoUpdate;
 pub use stamp::{jpeg_dimensions, StampImage, StampItem};
 
@@ -143,6 +147,11 @@ impl IncrementalWriter {
         &self.doc
     }
 
+    /// The catalog (trailer `/Root`) reference of the base document.
+    pub(crate) fn catalog_ref(&self) -> ObjectId {
+        self.catalog_ref
+    }
+
     /// Add a new indirect object. Returns its `(obj_num, gen_num)`. Generation
     /// is always 0 for newly created objects.
     pub fn add_object(&mut self, obj: &PdfObject) -> (u32, u32) {
@@ -217,6 +226,29 @@ impl IncrementalWriter {
             .checked_add(count)
             .ok_or_else(|| invalid_data("object number space is exhausted"))?;
         Ok(())
+    }
+
+    /// Reserve a fresh object number without providing its content yet. The
+    /// object graph copier uses this to break reference cycles: numbers are
+    /// handed out on first sight, bodies filled in via
+    /// [`Self::set_reserved_object`] as the work-list drains. A reserved
+    /// number that is never set serializes as `null` (harmless placeholder).
+    pub(crate) fn reserve_object_number(&mut self) -> Result<ObjectId> {
+        self.ensure_object_capacity(1)?;
+        let num = self.next_obj_num;
+        self.next_obj_num += 1;
+        self.pending
+            .insert(num, (0, PendingObject::Object(PdfObject::Null)));
+        Ok(ObjectId(num, 0))
+    }
+
+    /// Provide the body for a previously reserved object number.
+    pub(crate) fn set_reserved_object(&mut self, id: ObjectId, obj: PdfObject) {
+        let pending = match obj {
+            PdfObject::Stream(stream) => PendingObject::Stream(stream.dict, stream.data),
+            other => PendingObject::Object(other),
+        };
+        self.pending.insert(id.0, (id.1, pending));
     }
 
     /// Queue a replacement for an existing object. The replacement is written
