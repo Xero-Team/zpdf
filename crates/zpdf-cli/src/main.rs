@@ -20,7 +20,7 @@ fn main() {
     if args.len() < 2 {
         eprintln!("Usage: zpdf <command> [args...]");
         eprintln!(
-            "Commands: info, dump, render, text, search, convert, tables, forms, outline, links, struct, signatures, attachments, compare, debug-stream, fill, merge, split, optimize, annotate, pages, set-meta, stamp"
+            "Commands: info, dump, render, text, search, convert, tables, forms, outline, links, struct, signatures, attachments, compare, debug-stream, fill, merge, split, optimize, annotate, sign, pages, set-meta, stamp"
         );
         process::exit(1);
     }
@@ -46,6 +46,7 @@ fn main() {
         "split" => cmd_split(&args[2..]),
         "optimize" => cmd_optimize(&args[2..]),
         "annotate" => cmd_annotate(&args[2..]),
+        "sign" => cmd_sign(&args[2..]),
         "pages" => cmd_pages(&args[2..]),
         "set-meta" => cmd_set_meta(&args[2..]),
         "stamp" => cmd_stamp(&args[2..]),
@@ -2069,6 +2070,90 @@ fn cmd_annotate(args: &[String]) -> zpdf::Result<()> {
     writer.add_annotation(page_num - 1, &spec)?;
     write_output(&writer, &out_path)?;
     println!("{kind} annotation on page {page_num} → {out_path}");
+    Ok(())
+}
+
+/// Digitally sign a PDF with a PKCS#8 private key (RSA or ECDSA P-256) and
+/// its DER certificate, producing an incremental signed revision.
+fn cmd_sign(args: &[String]) -> zpdf::Result<()> {
+    let (args, password) = extract_password(args);
+    let mut input = None;
+    let mut output = None;
+    let mut key_path: Option<String> = None;
+    let mut cert_path: Option<String> = None;
+    let mut name: Option<String> = None;
+    let mut reason: Option<String> = None;
+    let mut location: Option<String> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--key" => {
+                key_path = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "--cert" => {
+                cert_path = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "--name" => {
+                name = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "--reason" => {
+                reason = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "--location" => {
+                location = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "-o" => {
+                output = args.get(i + 1).cloned();
+                i += 2;
+            }
+            other if !other.starts_with('-') => {
+                if input.is_none() {
+                    input = Some(other.to_string());
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+
+    let (Some(input_path), Some(out_path), Some(key_path), Some(cert_path)) =
+        (input, output, key_path, cert_path)
+    else {
+        eprintln!(
+            "Usage: zpdf sign <file.pdf> --key <key.p8.der> --cert <cert.der> [--name S] [--reason S] [--location S] -o <out.pdf>\n  key: PKCS#8 DER (RSA or ECDSA P-256); cert: X.509 DER with the matching public key"
+        );
+        process::exit(1);
+    };
+    if out_path == input_path {
+        eprintln!("Output path must differ from input");
+        process::exit(1);
+    }
+
+    let key_der = fs::read(&key_path).map_err(zpdf::Error::Io)?;
+    let cert_der = fs::read(&cert_path).map_err(zpdf::Error::Io)?;
+    let key = zpdf_writer::SigningKey::from_pkcs8_der(&key_der)
+        .or_else(|_| zpdf_writer::SigningKey::rsa_from_pkcs1_der(&key_der))?;
+
+    let writer = build_writer(&input_path, password.as_deref())?;
+    let signed = writer.sign(
+        &cert_der,
+        &key,
+        &zpdf_writer::SignatureOptions {
+            name,
+            reason,
+            location,
+            ..Default::default()
+        },
+    )?;
+    fs::write(&out_path, signed).map_err(zpdf::Error::Io)?;
+    println!("Signed → {out_path}");
+    println!("Note: certificate chain trust is not established by zpdf; viewers will show the signer as untrusted unless the certificate is in their trust store.");
     Ok(())
 }
 

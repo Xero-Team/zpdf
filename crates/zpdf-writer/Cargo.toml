@@ -18,3 +18,12 @@ zpdf-document.workspace = true
 thiserror.workspace = true
 flate2.workspace = true
 tracing.workspace = true
+# Pure-Rust signing (RustCrypto) for CMS/PKCS#7 signature creation:
+# RSA PKCS#1 v1.5 and ECDSA P-256, SHA-256 digests.
+sha2.workspace = true
+rsa.workspace = true
+p256 = { workspace = true, features = ["pkcs8"] }
+
+[dev-dependencies]
+# Deterministic RSA keygen for the signing round-trip tests.
+rand_chacha = "0.3"

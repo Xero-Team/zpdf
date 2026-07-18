@@ -106,6 +106,12 @@ pub(crate) fn encode_text_string(s: &str) -> PdfString {
 
 /// The current UTC time as a PDF date string (`D:YYYYMMDDHHMMSSZ`).
 fn pdf_date_now() -> String {
+    format!("D:{}Z", pdf_date_now_raw())
+}
+
+/// The current UTC time as bare `YYYYMMDDHHMMSS` (no `D:` prefix/zone),
+/// shared with the signature `/M` date.
+pub(crate) fn pdf_date_now_raw() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -114,7 +120,7 @@ fn pdf_date_now() -> String {
     let rem = secs % 86_400;
     let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
     let (year, month, day) = civil_from_days(days);
-    format!("D:{year:04}{month:02}{day:02}{h:02}{m:02}{s:02}Z")
+    format!("{year:04}{month:02}{day:02}{h:02}{m:02}{s:02}")
 }
 
 /// Days-since-epoch → (year, month, day), Howard Hinnant's `civil_from_days`.

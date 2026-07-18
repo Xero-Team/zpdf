@@ -53,6 +53,13 @@ pub fn write_stream<W: Write>(
     out.write_all(b"\nendstream\nendobj\n")
 }
 
+/// Serialize a direct object body (no `obj`/`endobj` wrapper) to a writer.
+/// Crate-public for the signer, which assembles a raw dictionary body with
+/// byte-exact placeholder offsets.
+pub(crate) fn serialize_object_body<W: Write>(out: &mut W, obj: &PdfObject) -> io::Result<()> {
+    serialize_direct_object(out, obj)
+}
+
 /// Serialize a direct PDF object (not wrapped in `obj`/`endobj`).
 fn serialize_direct_object<W: Write>(buf: &mut W, obj: &PdfObject) -> io::Result<()> {
     match obj {

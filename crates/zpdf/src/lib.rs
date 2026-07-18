@@ -26,7 +26,8 @@ pub use zpdf_parser::PdfFile;
 pub use zpdf_render::RenderBackend;
 pub use zpdf_writer::{
     copy_object_graph, extract_pages, rewrite_pdf, AnnotationSpec, FormFiller, IncrementalWriter,
-    InfoUpdate, MarkupKind, ObjectIdMap, RewriteOptions, StampImage, StampItem,
+    InfoUpdate, MarkupKind, ObjectIdMap, RewriteOptions, SignatureOptions, SigningKey, StampImage,
+    StampItem,
 };
 
 #[cfg(feature = "cpu-render")]

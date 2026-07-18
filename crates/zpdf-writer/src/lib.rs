@@ -43,6 +43,7 @@ pub mod merge;
 pub mod metadata;
 pub mod pages;
 pub mod rewrite;
+pub mod sign;
 pub mod stamp;
 
 pub use annotate::{AnnotationSpec, MarkupKind};
@@ -51,6 +52,7 @@ pub use forms::FormFiller;
 pub use merge::extract_pages;
 pub use metadata::InfoUpdate;
 pub use rewrite::{rewrite_pdf, RewriteOptions};
+pub use sign::{SignatureOptions, SigningKey};
 pub use stamp::{jpeg_dimensions, StampImage, StampItem};
 
 /// An object queued for the incremental update, kept unserialized so later
@@ -59,6 +61,10 @@ enum PendingObject {
     Object(PdfObject),
     /// Stream dict + (possibly already compressed) data.
     Stream(PdfDict, Arc<[u8]>),
+    /// A pre-serialized object body, emitted verbatim between `N G obj` and
+    /// `endobj`. Used by the signer, whose `/ByteRange` and `/Contents`
+    /// placeholders must land in the file at exactly known widths.
+    Raw(Arc<[u8]>),
 }
 
 /// The cross-reference flavor of the original file, which the update must
@@ -201,6 +207,18 @@ impl IncrementalWriter {
         Ok((num, 0))
     }
 
+    /// Add an object whose body is already serialized (emitted verbatim
+    /// between `obj`/`endobj`). The signer uses this for the signature dict,
+    /// whose placeholder byte offsets must be exactly predictable.
+    pub(crate) fn try_add_raw_object(&mut self, body: &[u8]) -> Result<(u32, u32)> {
+        self.ensure_object_capacity(1)?;
+        let num = self.next_obj_num;
+        self.next_obj_num += 1;
+        self.pending
+            .insert(num, (0, PendingObject::Raw(Arc::from(body))));
+        Ok((num, 0))
+    }
+
     /// Add a stream object with the raw data FlateDecode-compressed (the dict
     /// gains `/Filter /FlateDecode`). Returns its object reference.
     pub fn add_flate_stream(&mut self, dict: &PdfDict, raw: &[u8]) -> (u32, u32) {
@@ -274,6 +292,9 @@ impl IncrementalWriter {
                     data: Arc::clone(data),
                 }))
             }
+            // Raw bodies are write-only (they exist for byte-exact offsets);
+            // resolving one falls back to the original object, if any.
+            Some((_, PendingObject::Raw(_))) => self.doc.file().resolve(id),
             None => self.doc.file().resolve(id),
         }
     }
@@ -461,6 +482,11 @@ impl IncrementalWriter {
                 PendingObject::Object(obj) => write_object(&mut out, num, *gen as u32, obj)?,
                 PendingObject::Stream(dict, data) => {
                     write_stream(&mut out, num, *gen as u32, dict, data)?
+                }
+                PendingObject::Raw(body) => {
+                    writeln!(out, "{num} {gen} obj")?;
+                    out.write_all(body)?;
+                    out.write_all(b"\nendobj\n")?;
                 }
             }
         }
