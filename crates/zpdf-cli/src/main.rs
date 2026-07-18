@@ -20,7 +20,7 @@ fn main() {
     if args.len() < 2 {
         eprintln!("Usage: zpdf <command> [args...]");
         eprintln!(
-            "Commands: info, dump, render, text, convert, tables, forms, outline, links, struct, signatures, attachments, compare, debug-stream, fill, pages, set-meta, stamp"
+            "Commands: info, dump, render, text, search, convert, tables, forms, outline, links, struct, signatures, attachments, compare, debug-stream, fill, pages, set-meta, stamp"
         );
         process::exit(1);
     }
@@ -30,6 +30,7 @@ fn main() {
         "dump" => cmd_dump(&args[2..]),
         "render" => cmd_render(&args[2..]),
         "text" => cmd_text(&args[2..]),
+        "search" => cmd_search(&args[2..]),
         "convert" => convert::run(&args[2..]),
         "tables" => cmd_tables(&args[2..]),
         "forms" => cmd_forms(&args[2..]),
@@ -1102,6 +1103,96 @@ fn cmd_text(args: &[String]) -> zpdf::Result<()> {
         println!("{text}");
     }
 
+    Ok(())
+}
+
+/// Search for a text string across pages, printing page number, match
+/// rectangle (PDF user space, y-up) and the matched line as context.
+fn cmd_search(args: &[String]) -> zpdf::Result<()> {
+    let (args, password) = extract_password(args);
+    if args.len() < 2 {
+        eprintln!(
+            "Usage: zpdf search <file.pdf> <query> [-p <page>] [--case-sensitive] [--password <pw>]"
+        );
+        process::exit(1);
+    }
+
+    let pdf_path = &args[0];
+    let query = &args[1];
+    let mut page_num: Option<usize> = None;
+    let mut case_sensitive = false;
+
+    let mut i = 2;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-p" => {
+                i += 1;
+                page_num = Some(
+                    args.get(i)
+                        .and_then(|s| s.parse().ok())
+                        .filter(|&page: &usize| page > 0)
+                        .unwrap_or_else(|| {
+                            eprintln!("-p requires a positive page number");
+                            process::exit(2);
+                        }),
+                );
+            }
+            "--case-sensitive" => case_sensitive = true,
+            _ => {}
+        }
+        i += 1;
+    }
+
+    let doc = open_document(pdf_path, password.as_deref())?;
+    let (first_page, end_page) = match page_num {
+        Some(p) => {
+            let page_index = p - 1;
+            let _ = doc.page(page_index)?;
+            (page_index, page_index + 1)
+        }
+        None => (0, doc.page_count()),
+    };
+
+    // ICC transforms are per-document; share the cache across pages.
+    let mut icc_cache = zpdf::IccCache::new();
+    let mut total = 0usize;
+
+    for pi in first_page..end_page {
+        let page = doc.page(pi)?;
+        let mut font_cache = doc.load_page_fonts(&page);
+        let content_bytes = doc.page_content_bytes(&page)?;
+
+        let mut spans: Vec<zpdf::TextSpan> = Vec::new();
+        {
+            let interpreter = zpdf::ContentInterpreter::new(page.effective_box())
+                .with_fonts(&mut font_cache)
+                .with_document(doc.file(), &page.resources)
+                .with_colors(&mut icc_cache)
+                .with_text_sink(&mut spans)
+                .with_operand_stack_limit(doc.file().limits().max_operand_stack_depth as usize);
+            let _ = interpreter.interpret(&content_bytes);
+        }
+
+        for hit in zpdf::search_spans(&spans, query, case_sensitive) {
+            let r = hit.bounds();
+            println!(
+                "p.{} [{:.1},{:.1} {:.1},{:.1}]  {}",
+                pi + 1,
+                r.x0,
+                r.y0,
+                r.x1,
+                r.y1,
+                hit.line.trim()
+            );
+            total += 1;
+        }
+    }
+
+    if total == 0 {
+        eprintln!("No matches for {query:?}.");
+    } else {
+        eprintln!("{total} match(es).");
+    }
     Ok(())
 }
 

@@ -1,6 +1,7 @@
 pub mod interpreter;
 mod mesh;
 pub mod output_intent;
+pub mod search;
 pub mod shading;
 pub mod tables;
 pub mod text;
