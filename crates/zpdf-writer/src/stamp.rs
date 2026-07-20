@@ -477,7 +477,7 @@ fn stamp_image_object_count(image: &StampImage) -> Result<usize> {
     }
 }
 
-fn validate_jpeg_stamp(
+pub(crate) fn validate_jpeg_stamp(
     data: &[u8],
     width: u32,
     height: u32,
@@ -501,7 +501,7 @@ fn validate_jpeg_stamp(
     Ok(color_space)
 }
 
-fn checked_image_len(width: u32, height: u32, channels: usize) -> Result<usize> {
+pub(crate) fn checked_image_len(width: u32, height: u32, channels: usize) -> Result<usize> {
     if width == 0 || height == 0 {
         return Err(invalid_data("stamp image dimensions must be non-zero").into());
     }

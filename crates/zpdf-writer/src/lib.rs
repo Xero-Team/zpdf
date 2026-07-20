@@ -37,20 +37,31 @@ mod serialize;
 use serialize::{serialize_dict, write_object, write_stream};
 
 pub mod annotate;
+pub mod builder;
 pub mod copier;
+pub mod encrypt;
 pub mod forms;
+pub mod linearize;
 pub mod merge;
 pub mod metadata;
 pub mod pages;
+pub mod redact;
 pub mod rewrite;
 pub mod sign;
 pub mod stamp;
+pub mod subset;
 
 pub use annotate::{AnnotationSpec, MarkupKind};
+pub use builder::{
+    DocumentBuilder, EmbeddedFontHandle, ImageData, PageHandle, PathSegment, PathStyle,
+};
 pub use copier::{copy_object_graph, ObjectIdMap};
+pub use encrypt::{EncryptionAlgorithm, EncryptionConfig, Permissions};
 pub use forms::FormFiller;
+pub use linearize::linearize_pdf;
 pub use merge::extract_pages;
 pub use metadata::InfoUpdate;
+pub use redact::RedactOptions;
 pub use rewrite::{rewrite_pdf, RewriteOptions};
 pub use sign::{SignatureOptions, SigningKey};
 pub use stamp::{jpeg_dimensions, StampImage, StampItem};
@@ -100,13 +111,25 @@ impl IncrementalWriter {
     /// Create a new incremental writer from the original PDF bytes. Parses the
     /// document once; all subsequent edits resolve objects through it.
     ///
-    /// Errors when the document is encrypted (updating an encrypted file would
-    /// require encrypting every new string/stream, which is not supported yet).
+    /// Errors when the document is encrypted — use
+    /// [`Self::new_with_password`] for those (new objects are then encrypted
+    /// with the document's existing key).
     pub fn new(original: Vec<u8>) -> Result<Self> {
+        Self::new_with_password(original, b"")
+    }
+
+    /// Like [`Self::new`], but opens an encrypted document with its password.
+    /// New and modified objects written by the update are encrypted with the
+    /// document's existing encryption key, as §7.5.6 requires.
+    pub fn new_with_password(original: Vec<u8>, password: &[u8]) -> Result<Self> {
         let original_arc: Arc<[u8]> = original.into();
-        let doc = PdfDocument::open(original_arc)?;
-        if doc.is_encrypted() {
-            return Err(unsupported("cannot incrementally update an encrypted document").into());
+        let doc = PdfDocument::open_with_password(original_arc, password)?;
+        if doc.is_encrypted() && doc.file().decryptor().is_none() {
+            return Err(unsupported(
+                "cannot update an encrypted document whose key was not recovered \
+                 (unsupported handler or missing password)",
+            )
+            .into());
         }
         let file = doc.file();
         let trailer_size = file.trailer.get("Size").and_then(|o| match o {
@@ -474,15 +497,41 @@ impl IncrementalWriter {
         }
 
         // 2. Append pending objects in object-number order, recording offsets.
+        //    For an encrypted document, every new/modified object is encrypted
+        //    with the document key (resolve_current returned plaintext, since
+        //    the parser decrypts on resolve). Raw bodies (the signer's
+        //    byte-exact dict) are emitted verbatim — signature dicts store
+        //    /Contents unencrypted by design (§7.6.2 note: signature
+        //    dictionaries' Contents are excluded from encryption).
+        let decryptor = self.doc.file().decryptor();
         let mut xref_entries: Vec<(u32, u16, u64)> = Vec::new();
         for (&num, (gen, pending)) in &self.pending {
             let offset = out.stream_position()?;
             xref_entries.push((num, *gen, offset));
+            let id = ObjectId(num, *gen);
             match pending {
-                PendingObject::Object(obj) => write_object(&mut out, num, *gen as u32, obj)?,
-                PendingObject::Stream(dict, data) => {
-                    write_stream(&mut out, num, *gen as u32, dict, data)?
-                }
+                PendingObject::Object(obj) => match decryptor {
+                    Some(dec) => {
+                        let mut obj = obj.clone();
+                        dec.encrypt_object_strings(&mut obj, id);
+                        write_object(&mut out, num, *gen as u32, &obj)?
+                    }
+                    None => write_object(&mut out, num, *gen as u32, obj)?,
+                },
+                PendingObject::Stream(dict, data) => match decryptor {
+                    Some(dec) => {
+                        let mut dict = dict.clone();
+                        let mut dict_obj = PdfObject::Dict(dict);
+                        dec.encrypt_object_strings(&mut dict_obj, id);
+                        dict = match dict_obj {
+                            PdfObject::Dict(d) => d,
+                            _ => unreachable!(),
+                        };
+                        let encrypted = dec.encrypt_stream_bytes(id, data);
+                        write_stream(&mut out, num, *gen as u32, &dict, &encrypted)?
+                    }
+                    None => write_stream(&mut out, num, *gen as u32, dict, data)?,
+                },
                 PendingObject::Raw(body) => {
                     writeln!(out, "{num} {gen} obj")?;
                     out.write_all(body)?;
@@ -532,6 +581,10 @@ impl IncrementalWriter {
         }
         if let Some(id) = orig.get("ID") {
             trailer.insert(PdfName::new("ID"), id.clone());
+        }
+        // An update to an encrypted document keeps the same /Encrypt.
+        if let Some(enc) = orig.get("Encrypt") {
+            trailer.insert(PdfName::new("Encrypt"), enc.clone());
         }
         trailer
     }

@@ -22,7 +22,7 @@ use crate::IncrementalWriter;
 /// built up while copying. Reusable across multiple [`copy_object_graph`]
 /// calls against the same (source, destination) pair so shared resources
 /// (fonts, images) are copied once.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ObjectIdMap {
     mapping: HashMap<ObjectId, ObjectId>,
 }

@@ -209,6 +209,57 @@ impl Decryptor {
         self.decrypt(id, data, self.stm_algo)
     }
 
+    /// **Encrypt** a stream payload for object `id` (the write-side inverse of
+    /// [`Self::decrypt_stream_bytes`]). Used by the incremental writer to add
+    /// objects to an already-encrypted document with its existing key.
+    pub fn encrypt_stream_bytes(&self, id: ObjectId, data: &[u8]) -> Vec<u8> {
+        self.encrypt(id, data, self.stm_algo)
+    }
+
+    /// **Encrypt** a string payload for object `id`.
+    pub fn encrypt_string_bytes(&self, id: ObjectId, data: &[u8]) -> Vec<u8> {
+        self.encrypt(id, data, self.str_algo)
+    }
+
+    /// Recursively encrypt every string in `obj` in place with the per-object
+    /// key for `id`. Stream payloads are NOT touched (they are encrypted
+    /// separately via [`Self::encrypt_stream_bytes`], since writers carry the
+    /// payload out-of-band).
+    pub fn encrypt_object_strings(&self, obj: &mut PdfObject, id: ObjectId) {
+        match obj {
+            PdfObject::String(s) if self.str_algo != Algo::Identity => {
+                *s = PdfString(self.encrypt(id, &s.0, self.str_algo));
+            }
+            PdfObject::String(_) => {}
+            PdfObject::Array(a) => {
+                for o in a.iter_mut() {
+                    self.encrypt_object_strings(o, id);
+                }
+            }
+            PdfObject::Dict(d) => {
+                for v in d.0.values_mut() {
+                    self.encrypt_object_strings(v, id);
+                }
+            }
+            PdfObject::Stream(s) => {
+                for v in s.dict.0.values_mut() {
+                    self.encrypt_object_strings(v, id);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Per-object key derivation + cipher application, encrypt direction.
+    fn encrypt(&self, id: ObjectId, data: &[u8], algo: Algo) -> Vec<u8> {
+        match algo {
+            Algo::Identity => data.to_vec(),
+            // RC4 is symmetric.
+            Algo::Rc4 => rc4(&self.object_key(id, algo), data),
+            Algo::AesV2 | Algo::AesV3 => aes_cbc_encrypt(&self.object_key(id, algo), data),
+        }
+    }
+
     fn walk(&self, obj: &mut PdfObject, id: ObjectId) {
         match obj {
             PdfObject::String(s) if self.str_algo != Algo::Identity => {
@@ -673,6 +724,67 @@ fn aes128_cbc_encrypt_nopad(key: &[u8], iv: &[u8], data: &[u8]) -> Vec<u8> {
         enc.encrypt_block_mut(GenericArray::from_mut_slice(block));
     }
     buf
+}
+
+/// AES-CBC **encrypt** in the PDF payload format: random IV || ciphertext with
+/// PKCS#5 padding. Key length selects AES-128 (AESV2) vs AES-256 (AESV3). The
+/// write-side inverse of [`aes_cbc_decrypt`]; used when adding objects to an
+/// encrypted document.
+fn aes_cbc_encrypt(key: &[u8], data: &[u8]) -> Vec<u8> {
+    let mut iv = [0u8; 16];
+    // The IV must be unpredictable but need not be secret. getrandom is not a
+    // parser dependency, so derive it from entropy we have: MD5 over the data
+    // plus a process-unique counter. (Writers with stronger requirements
+    // encrypt via zpdf-writer's Encryptor, which uses the system RNG.)
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nonce = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut seed = Vec::with_capacity(data.len().min(256) + 16);
+    seed.extend_from_slice(&nonce.to_le_bytes());
+    seed.extend_from_slice(&(data.len() as u64).to_le_bytes());
+    seed.extend_from_slice(&data[..data.len().min(240)]);
+    iv.copy_from_slice(&md5(&seed));
+
+    let pad = 16 - (data.len() % 16);
+    let mut buf = Vec::with_capacity(data.len() + pad);
+    buf.extend_from_slice(data);
+    buf.extend(std::iter::repeat_n(pad as u8, pad));
+
+    let ok = match key.len() {
+        16 => {
+            if let Ok(mut enc) = cbc::Encryptor::<aes::Aes128>::new_from_slices(key, &iv) {
+                for block in buf.chunks_exact_mut(16) {
+                    enc.encrypt_block_mut(GenericArray::from_mut_slice(block));
+                }
+                true
+            } else {
+                false
+            }
+        }
+        32 => {
+            if let Ok(mut enc) = cbc::Encryptor::<aes::Aes256>::new_from_slices(key, &iv) {
+                for block in buf.chunks_exact_mut(16) {
+                    enc.encrypt_block_mut(GenericArray::from_mut_slice(block));
+                }
+                true
+            } else {
+                false
+            }
+        }
+        _ => false,
+    };
+    if !ok {
+        tracing::warn!(
+            "invalid AES key length {}; data left unencrypted",
+            key.len()
+        );
+        return data.to_vec();
+    }
+
+    let mut out = Vec::with_capacity(16 + buf.len());
+    out.extend_from_slice(&iv);
+    out.extend_from_slice(&buf);
+    out
 }
 
 // ----------------------------------------------------------------------------

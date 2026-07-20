@@ -26,19 +26,41 @@ The release binary is at `target/release/zpdf`. The examples below use
 
 ## Commands
 
+**Reading & analysis**
+
 | Command | Purpose |
 | --- | --- |
 | `info` | Print version, page count, per-page size/rotation, metadata, and outline summary. |
 | `render` | Render a page to a PNG (CPU or GPU). |
-| `text` | Extract text from a page (or all pages). |
+| `text` | Extract text from a page (or all pages); `--struct` follows the Tagged-PDF reading order. |
+| `search` | Search for text across pages, with per-hit highlight rectangles. |
 | `convert` | Convert selected pages to TXT, Markdown, or HTML with optional PNG assets. |
 | `tables` | Detect tables on a page (or all pages) and print them as TSV/CSV. |
 | `forms` | List interactive-form (AcroForm) fields, types, and values. |
 | `outline` | Print the document outline (bookmarks) as an indented tree with resolved targets. |
+| `links` | List link annotations with their resolved page targets or URIs. |
+| `struct` | Print the Tagged-PDF structure tree. |
+| `signatures` | List digital signatures with integrity/crypto status; `--trust` verifies certificate chains. |
 | `attachments` | List (and optionally extract) embedded & associated files. |
+| `validate` | Validate against a PDF/A profile (`pdfa-1b` / `pdfa-2b`). |
 | `compare` | Pixel-diff two PNGs and report difference metrics. |
 | `dump` | Print a resolved PDF object. |
 | `debug-stream` | Print a decoded stream object's bytes. |
+
+**Writing & editing**
+
+| Command | Purpose |
+| --- | --- |
+| `fill` | Fill AcroForm fields and save (incremental update). |
+| `merge` | Concatenate PDFs — pages plus outlines, form fields, and layer configs. |
+| `split` | Split into per-page or page-range files. |
+| `optimize` | Garbage-collect & recompress; `--encrypt` (AES-256/RC4), `--max-image-dim`, `--linearize`. |
+| `annotate` | Add annotations (highlight, note, freetext, square, circle, line) with baked appearances. |
+| `redact` | Remove content under regions from the content stream (true redaction). |
+| `sign` | Digitally sign (`adbe.pkcs7.detached`, RSA / ECDSA P-256). |
+| `pages` | Rotate, delete, or reorder pages. |
+| `set-meta` | Update `/Info` metadata fields. |
+| `stamp` | Overlay text or images on a page. |
 
 > **Encrypted PDFs.** Documents protected with a non-empty password open with
 > `--password <pw>` (accepted by `info`, `dump`, `render`, `text`, `convert`, `tables`,
@@ -248,6 +270,76 @@ cargo run -p zpdf-cli -- dump document.pdf 4 0
 # Print a stream object's decoded bytes (after filter decoding)
 cargo run -p zpdf-cli -- debug-stream document.pdf 7 0
 ```
+
+### `validate` — PDF/A conformance
+
+Best-effort rule engine over the structural, machine-checkable clauses of
+PDF/A-1b and PDF/A-2b (encryption, trailer `/ID`, header version, XMP
+`pdfaid` identification, `GTS_PDFA1` output intent + ICC profile, font
+embedding, forbidden features). Exit code 3 on FAIL.
+
+```bash
+cargo run -p zpdf-cli -- validate document.pdf --profile pdfa-2b
+```
+
+```
+Profile: PDF/A-2b
+Claimed: (no PDF/A identification in XMP)
+Result: FAIL — 2 violation(s)
+  [xmp-pdfaid] XMP metadata carries no PDF/A identification (pdfaid:part)
+  [output-intent] no GTS_PDFA1 output intent; PDF/A requires one for device-dependent color
+```
+
+### `redact` — remove content under a region
+
+Unlike drawing a black box, `redact` **removes** the matching operators from
+the content stream: text shows whose extent intersects the region, image
+draws, and path paints; annotations overlapping the region are dropped from
+the page. A fill box is painted over the region unless `--no-fill`.
+
+```bash
+cargo run -p zpdf-cli -- redact document.pdf -p 1 --rect 60,690,400,730 -o redacted.pdf
+cargo run -p zpdf-cli -- redact document.pdf -p 1 --rect 60,690,400,730 --fill 1,1,1 -o redacted.pdf
+```
+
+Verify with `zpdf text redacted.pdf` — the covered text is gone from
+extraction, not merely hidden.
+
+### `optimize` — compress, encrypt, downsample, linearize
+
+```bash
+# Garbage-collect and Flate-compress (also decrypts when opened with --password)
+cargo run -p zpdf-cli -- optimize document.pdf -o smaller.pdf
+
+# Downsample large raster images to a maximum dimension
+cargo run -p zpdf-cli -- optimize document.pdf -o smaller.pdf --max-image-dim 1500
+
+# Encrypt on save: AES-256 (R6) or RC4-128
+cargo run -p zpdf-cli -- optimize document.pdf -o locked.pdf \
+    --encrypt aes256 --user-password s3cret --owner-password 0wner
+
+# Linearize for "fast web view" (not combinable with --encrypt)
+cargo run -p zpdf-cli -- optimize document.pdf -o linear.pdf --linearize
+```
+
+### `signatures --trust` — certificate-chain verification
+
+By default `signatures` reports integrity + cryptographic validity only.
+With `--trust <roots.pem>` (PEM bundle or single DER certificate) it also
+builds and verifies the certificate chain to your anchors, including
+validity periods:
+
+```bash
+cargo run -p zpdf-cli -- signatures signed.pdf --trust corporate-roots.pem
+```
+
+```
+    Integrity: VERIFIED — signed bytes are intact
+    Signature: VALID — signature verifies (certificate trust NOT checked)
+    Trust chain: TRUSTED (ZPDF Test Signer)
+```
+
+Revocation (CRL/OCSP) is not checked — that requires network access.
 
 ## Window viewers
 

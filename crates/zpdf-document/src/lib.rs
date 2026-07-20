@@ -14,8 +14,10 @@ pub mod outline;
 pub mod output_intents;
 pub mod page;
 pub mod page_labels;
+pub mod pdfa;
 pub mod signature;
 pub mod structure;
+pub mod trust;
 pub mod xmp;
 
 pub use annotation::Annotation;

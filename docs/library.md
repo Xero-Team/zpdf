@@ -188,6 +188,56 @@ Encrypted documents (RC4 and AES-128/256, empty user password) open and decrypt
 transparently in `PdfDocument::open`; password-protected files degrade to a
 warning and render blank.
 
+## Writing PDFs
+
+The `zpdf-writer` crate (re-exported through the facade) covers three writing
+models:
+
+**Creation from scratch** — `DocumentBuilder`:
+
+```rust
+use zpdf::DocumentBuilder;
+
+let mut b = DocumentBuilder::new();
+let page = b.add_page(612.0, 792.0);
+b.add_text(page, "Hello", 72.0, 700.0, "Helvetica", 24.0, (0.0, 0.0, 0.0))?;
+let font = b.embed_font(std::fs::read("font.ttf")?)?;   // subset automatically
+b.add_text_embedded(page, "Embedded", 72.0, 650.0, font, 14.0, (0.0, 0.0, 0.0))?;
+std::fs::write("out.pdf", b.build()?)?;
+```
+
+**Incremental updates** — `IncrementalWriter` appends a §7.5.6 update to the
+original bytes (annotations with baked `/AP`, form filling via `FormFiller`,
+`stamp_page`, `redact_page`, page operations, `set_info`, `sign`, and
+`append_document` for full merges). `IncrementalWriter::new_with_password`
+updates **encrypted** documents — new objects are encrypted with the
+document's existing key.
+
+**Full rewrite** — `rewrite_pdf(&file, &RewriteOptions)` garbage-collects and
+re-serializes; options: `compress_uncompressed`, `max_image_dimension`
+(box-filter downsampling), and `encrypt` (`EncryptionConfig::aes256` /
+`::rc4_128` with `Permissions`). `linearize_pdf(&file)` produces Annex F
+"fast web view" output instead.
+
+## Validating and trusting
+
+```rust
+// PDF/A conformance (best-effort rule engine)
+let report = zpdf::pdfa::validate(doc.file(), zpdf::pdfa::Profile::A2b);
+if !report.conforms() {
+    for v in &report.violations { println!("[{}] {}", v.rule, v.message); }
+}
+
+// Signature certificate chains against your own trust anchors
+let anchors = zpdf::trust::parse_trust_anchors(&std::fs::read("roots.pem")?);
+for sig in doc.signatures() {
+    if let Some(blob) = &sig.cms_blob {
+        let status = zpdf::trust::verify_certificate_chain(blob, &anchors, now_unix_secs);
+        println!("{}: {}", sig.field_name, status.as_str());
+    }
+}
+```
+
 ## Architecture
 
 A 13-crate workspace with a strict one-direction dependency flow. **Render backends

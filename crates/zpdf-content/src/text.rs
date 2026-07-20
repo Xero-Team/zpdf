@@ -68,6 +68,101 @@ pub fn spans_to_text(spans: Vec<TextSpan>, line_tol: f64) -> String {
         }
         out.push_str(&text);
     }
+    let out = fix_rtl_visual_order(&out);
+    dehyphenate(&out)
+}
+
+/// Merge words hyphenated across line breaks: a line ending in `-` (or a soft
+/// hyphen) directly after a letter is joined with the next line when that line
+/// starts with a lowercase letter — the typographic signature of a broken
+/// word. `co-\noperation` → `cooperation`; `UTF-\n8`, list dashes and lines
+/// followed by capitalized words are left alone.
+pub fn dehyphenate(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut lines = text.split('\n').peekable();
+    while let Some(line) = lines.next() {
+        let trimmed = line.trim_end();
+        let joins = trimmed
+            .strip_suffix(['-', '\u{00AD}'])
+            .filter(|stem| stem.chars().next_back().is_some_and(|c| c.is_alphabetic()))
+            .filter(|_| {
+                lines
+                    .peek()
+                    .and_then(|next| next.trim_start().chars().next())
+                    .is_some_and(|c| c.is_alphabetic() && c.is_lowercase())
+            });
+        match joins {
+            Some(stem) => {
+                out.push_str(stem);
+                // The next line continues the word: no newline, no hyphen.
+            }
+            None => {
+                out.push_str(line);
+                if lines.peek().is_some() {
+                    out.push('\n');
+                }
+            }
+        }
+    }
+    out
+}
+
+/// True for characters of inherently right-to-left scripts (Hebrew, Arabic,
+/// Syriac, Thaana, plus the Arabic/Hebrew presentation forms).
+fn is_rtl_char(c: char) -> bool {
+    matches!(c,
+        '\u{0590}'..='\u{08FF}'      // Hebrew, Arabic, Syriac, Thaana, ext.
+        | '\u{FB1D}'..='\u{FDFF}'    // presentation forms A
+        | '\u{FE70}'..='\u{FEFF}'    // presentation forms B
+    )
+}
+
+/// PDF content streams paint glyphs in **visual** order (left to right on the
+/// page). For RTL scripts the logical (reading) order is the reverse of each
+/// RTL segment. Lines with no RTL characters pass through untouched; in mixed
+/// lines each maximal RTL run (including interior neutral characters like
+/// spaces and punctuation between two RTL runs) is reversed in place.
+fn fix_rtl_visual_order(text: &str) -> String {
+    if !text.chars().any(is_rtl_char) {
+        return text.to_string();
+    }
+    text.split('\n')
+        .map(fix_rtl_line)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn fix_rtl_line(line: &str) -> String {
+    if !line.chars().any(is_rtl_char) {
+        return line.to_string();
+    }
+    let chars: Vec<char> = line.chars().collect();
+    let mut out = String::with_capacity(line.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if is_rtl_char(chars[i]) {
+            // Extend the run to the last RTL character, absorbing neutral
+            // characters (spaces, digits, punctuation) that sit *between* RTL
+            // characters — they belong to the RTL segment.
+            let mut end = i;
+            let mut j = i + 1;
+            while j < chars.len() {
+                if is_rtl_char(chars[j]) {
+                    end = j;
+                } else if chars[j].is_alphabetic() {
+                    break; // a strong LTR character terminates the segment
+                }
+                j += 1;
+            }
+            for &c in chars[i..=end].iter().rev() {
+                out.push(c);
+            }
+            i = end + 1;
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
     out
 }
 
@@ -829,5 +924,71 @@ mod tests {
             children: vec![selem(StructRole::P, Some(0), vec![mc(0, 0), mc(0, 1)])],
         };
         assert_eq!(struct_ordered_text(&spans, 0, &tree), "Hello World");
+    }
+}
+
+#[cfg(test)]
+mod dehyphen_tests {
+    use super::{dehyphenate, fix_rtl_visual_order};
+
+    #[test]
+    fn joins_hyphenated_word_across_lines() {
+        assert_eq!(dehyphenate("coopera-\ntion works"), "cooperation works");
+    }
+
+    #[test]
+    fn soft_hyphen_also_joins() {
+        assert_eq!(dehyphenate("con\u{00AD}\ntinued"), "continued");
+    }
+
+    #[test]
+    fn capitalized_next_line_is_not_joined() {
+        // Likely a compound name or new sentence, not a broken word.
+        assert_eq!(dehyphenate("Smith-\nJones"), "Smith-\nJones");
+    }
+
+    #[test]
+    fn digit_before_hyphen_is_not_joined() {
+        assert_eq!(dehyphenate("UTF-\n8 encoding"), "UTF-\n8 encoding");
+    }
+
+    #[test]
+    fn hyphen_mid_line_untouched() {
+        assert_eq!(dehyphenate("well-known fact"), "well-known fact");
+    }
+
+    #[test]
+    fn no_hyphens_passthrough() {
+        let text = "plain\nlines\nhere";
+        assert_eq!(dehyphenate(text), text);
+    }
+
+    #[test]
+    fn rtl_line_is_reversed_to_logical_order() {
+        // Visual order (as painted): "םולש" — logical: "שלום".
+        let visual = "\u{05DD}\u{05D5}\u{05DC}\u{05E9}";
+        let logical = "\u{05E9}\u{05DC}\u{05D5}\u{05DD}";
+        assert_eq!(fix_rtl_visual_order(visual), logical);
+    }
+
+    #[test]
+    fn mixed_line_reverses_only_rtl_segment() {
+        // "abc " + visual-RTL + " xyz"
+        let visual = format!("abc {} xyz", "\u{05D2}\u{05D1}\u{05D0}");
+        let expected = format!("abc {} xyz", "\u{05D0}\u{05D1}\u{05D2}");
+        assert_eq!(fix_rtl_visual_order(&visual), expected);
+    }
+
+    #[test]
+    fn ltr_text_passthrough() {
+        assert_eq!(fix_rtl_visual_order("hello world"), "hello world");
+    }
+
+    #[test]
+    fn rtl_segment_with_interior_space() {
+        // Two RTL words separated by a space: whole segment reverses.
+        let visual = "\u{05D1} \u{05D0}"; // visual "ב א"
+        let logical = "\u{05D0} \u{05D1}"; // logical "א ב"
+        assert_eq!(fix_rtl_visual_order(visual), logical);
     }
 }

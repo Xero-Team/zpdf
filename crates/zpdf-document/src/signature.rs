@@ -97,6 +97,10 @@ pub struct Signature {
     /// typically, but not guaranteed to be, the signer's leaf certificate.
     /// Best-effort; `None` when no certificate / CN could be extracted.
     pub signer_common_name: Option<String>,
+    /// The raw CMS `SignedData` blob (`/Contents`), for follow-up checks such
+    /// as certificate-chain verification ([`crate::trust`]). `None` when the
+    /// dictionary carried no string /Contents.
+    pub cms_blob: Option<Vec<u8>>,
 }
 
 impl Signature {
@@ -310,6 +314,7 @@ fn build_signature(file: &PdfFile, field_name: String, sig: &PdfDict) -> Signatu
         digest_algorithm: outcome.digest_algorithm,
         signature_algorithm: outcome.signature_algorithm,
         signer_common_name: outcome.signer_common_name,
+        cms_blob: contents,
     }
 }
 

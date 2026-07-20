@@ -65,8 +65,37 @@ GPU (wgpu) renderers whose output matches within <1% of pixels.
   `/ByteRange` spans vs. CMS `messageDigest`) and **cryptographic signatures**
   (RSA PKCS#1 v1.5 / ECDSA P-256/P-384 over signed attributes using embedded
   certificate public keys). `signatures()` API + CLI `zpdf signatures`.
-  **Note**: does NOT validate certificate trust chains or revocation — reports
-  "cryptographically sound" (bytes intact + signature valid), not "trusted signer."
+  Optional **certificate-chain verification** against caller-provided trust
+  anchors (`trust::verify_certificate_chain`, CLI `--trust roots.pem`) with
+  validity-period checks; revocation (CRL/OCSP) remains out of scope.
+- **Writing & editing** — a full authoring/editing toolkit (`zpdf-writer`):
+  - **Document creation from scratch** (`DocumentBuilder`): pages, text
+    (standard-14 or embedded TrueType with automatic **font subsetting**),
+    JPEG/RGB/RGBA images (alpha → SMask), and vector paths.
+  - **Incremental updates** (ISO 32000-1 §7.5.6): annotations (with baked
+    `/AP` appearance streams), form filling, page rotate/delete/reorder,
+    metadata, text & image stamps, digital signature creation
+    (`adbe.pkcs7.detached`, RSA / ECDSA P-256) — including updates to
+    **encrypted** documents (new objects encrypted with the document key).
+  - **Document merge** (`append_document`): pages plus outlines, AcroForm
+    fields (collision renaming), and optional-content (layer) configuration;
+    page extraction / split.
+  - **Full rewrite** (`rewrite_pdf`): garbage-collect, renumber, decrypt,
+    Flate-compress, optional **image downsampling** — and **encrypt on save**
+    (AES-256 R6 or RC4-128 with user/owner passwords and permissions).
+  - **True redaction** (`redact_page`): removes text/image/path operators
+    intersecting a region from the content stream itself (not a cosmetic box)
+    and drops overlapping annotations.
+  - **Linearization** (`linearize_pdf`): "fast web view" output per
+    ISO 32000-1 Annex F.
+- **PDF/A validation** — a best-effort conformance rule engine for
+  **PDF/A-1b** and **PDF/A-2b** (`pdfa::validate`, CLI `zpdf validate`):
+  encryption/ID/header checks, XMP `pdfaid` identification, `GTS_PDFA1`
+  output intent, font embedding, forbidden features (JavaScript, embedded
+  files, transparency for A-1).
+- **Text extraction quality** — geometric XY-cut reading order with
+  **dehyphenation** (line-break hyphen joining) and **RTL repair** (Hebrew /
+  Arabic visual→logical reordering).
 - **Logical structure / Tagged PDF** — the `/StructTreeRoot` structure tree
   (`struct_tree()`, CLI `struct`) read into a navigable model of structure
   elements with their roles (`/S` resolved through `/RoleMap` to standard types
@@ -80,7 +109,10 @@ GPU (wgpu) renderers whose output matches within <1% of pixels.
 - **CPU rendering** — tiny-skia backend, PNG output at any DPI.
 - **GPU rendering** — wgpu backend (fills, strokes, clips, text, images, blend
   groups); matches the CPU renderer within <1% pixels.
-- **Tooling** — CLI (`info`/`render`/`text`/`convert`/`tables`/`forms`/`outline`/`links`/`struct`/`attachments`/`signatures`/`compare`/`dump`/`debug-stream`),
+- **Tooling** — CLI with read commands
+  (`info`/`render`/`text`/`search`/`convert`/`tables`/`forms`/`outline`/`links`/`struct`/`attachments`/`signatures`/`validate`/`compare`/`dump`/`debug-stream`)
+  and write commands
+  (`fill`/`merge`/`split`/`optimize`/`annotate`/`redact`/`sign`/`pages`/`set-meta`/`stamp`),
   an interactive winit viewer example, and a native GPUI desktop reader
   (`zpdf-viewer-gpui`).
 
@@ -139,6 +171,17 @@ cargo run -p zpdf-cli -- convert document.pdf -o document.txt --mode text
 cargo run -p zpdf-cli -- convert document.pdf -o document.md --mode rich
 cargo run -p zpdf-cli -- convert document.pdf -o document.html --mode rich
 
+# Create, edit, and secure PDFs
+cargo run -p zpdf-cli -- merge a.pdf b.pdf -o merged.pdf        # pages + outlines + forms + layers
+cargo run -p zpdf-cli -- annotate document.pdf -p 1 --kind highlight --rect 70,690,340,725 -o annotated.pdf
+cargo run -p zpdf-cli -- redact document.pdf -p 1 --rect 60,690,400,730 -o redacted.pdf
+cargo run -p zpdf-cli -- optimize document.pdf -o smaller.pdf --max-image-dim 1500
+cargo run -p zpdf-cli -- optimize document.pdf -o encrypted.pdf --encrypt aes256 --user-password s3cret
+cargo run -p zpdf-cli -- optimize document.pdf -o linear.pdf --linearize
+cargo run -p zpdf-cli -- sign document.pdf --key key.p8.der --cert cert.der -o signed.pdf
+cargo run -p zpdf-cli -- signatures signed.pdf --trust roots.pem
+cargo run -p zpdf-cli -- validate document.pdf --profile pdfa-2b
+
 # Interactive viewer (pan/zoom/page-flip)
 cargo run -p zpdf-render-wgpu --example viewer -- document.pdf
 
@@ -176,6 +219,22 @@ page_img.save_png("out.png")?;
 Switch `zpdf::cpu::CpuRenderer` for `zpdf::gpu::WgpuRenderer` (with `features = ["gpu-render"]`)
 to render on the GPU — everything upstream is identical. See [docs/library.md](docs/library.md).
 
+### Creating a PDF from scratch
+
+```rust
+use zpdf::DocumentBuilder;
+
+let mut builder = DocumentBuilder::new();
+let page = builder.add_page(612.0, 792.0);                       // US Letter, points
+builder.add_text(page, "Hello, PDF!", 72.0, 700.0, "Helvetica", 24.0, (0.0, 0.0, 0.0))?;
+
+// Embedded fonts are automatically subset to the glyphs actually used.
+let font = builder.embed_font(std::fs::read("DejaVuSans.ttf")?)?;
+builder.add_text_embedded(page, "Embedded text", 72.0, 650.0, font, 14.0, (0.0, 0.3, 0.7))?;
+
+std::fs::write("hello.pdf", builder.build()?)?;
+```
+
 ## Architecture
 
 15-crate workspace with a strict one-direction dependency flow. **Render backends
@@ -194,7 +253,8 @@ zpdf-core            Shared types: ObjectId, PdfObject, Matrix, Rect, Error, Par
   ├─ zpdf-render          RenderBackend trait
   │   ├─ zpdf-render-cpu   tiny-skia backend
   │   └─ zpdf-render-wgpu  wgpu backend (+ winit viewer example)
-  ├─ zpdf-writer     Incremental PDF writer (annotations, modifications)
+  ├─ zpdf-writer     PDF authoring & editing: DocumentBuilder, incremental updates,
+  │                  merge, redaction, encryption, subsetting, linearization
   ├─ zpdf-cli        CLI tool
   ├─ zpdf-viewer-gpui  Native desktop reader (GPUI; depends on the facade)
   └─ zpdf            Facade crate (re-exports; feature-gates cpu / gpu)
@@ -238,7 +298,14 @@ zpdf-core            Shared types: ObjectId, PdfObject, Matrix, Rect, Error, Par
 | JBIG2 / JPX (JPEG 2000) filters | ✅ |
 | Optional content groups / layers (`/OCG`, `/OCMD`, `/VE`) | ✅ |
 | Predefined + embedded CMaps, vertical writing (`WMode 1`) | ✅ |
-| Digital signatures: byte-range integrity + RSA/ECDSA cryptographic verification | ✅ (no cert chain / revocation) |
+| Digital signatures: byte-range integrity + RSA/ECDSA cryptographic verification | ✅ (+ opt-in cert-chain trust; no revocation) |
+| PDF creation from scratch (pages, text, images, paths, font embedding + subsetting) | ✅ |
+| Incremental update writing (annotations, forms, stamps, signing; encrypted docs too) | ✅ |
+| Encryption on save (AES-256 R6, RC4-128; permissions) | ✅ |
+| True redaction (content-stream excision + annotation removal) | ✅ |
+| Document merge incl. outlines, AcroForm fields, OCG configs | ✅ |
+| Linearization ("fast web view", Annex F) | ✅ |
+| PDF/A-1b / PDF/A-2b validation (best-effort rule engine) | ✅ |
 
 ## Dependencies
 
@@ -250,8 +317,9 @@ All pure Rust:
 | `tiny-skia` | CPU 2D rasterization |
 | `flate2` (`rust_backend`) | FlateDecode |
 | `zune-jpeg` | JPEG (DCTDecode) |
-| `aes` + `cbc` + `sha2` | AES decryption (RustCrypto) |
-| `rsa` + `p256` + `p384` | RSA/ECDSA signature verification (RustCrypto) |
+| `aes` + `cbc` + `sha2` | AES encryption/decryption (RustCrypto) |
+| `rsa` + `p256` + `p384` | RSA/ECDSA signing & verification (RustCrypto) |
+| `getrandom` | Key/salt/IV generation for encryption on save |
 | `image` | PNG I/O |
 | `winnow` | Parsing helpers |
 | `wgpu` + `lyon` + `pollster` | GPU rendering (`gpu-render` feature) |
@@ -280,6 +348,10 @@ See [ROADMAP.md](ROADMAP.md).
   streams, interactive forms (AcroForm), optional content, ICC color management,
   JBIG2 + JPEG 2000, system-font fallback, composite-font CMaps + vertical
   writing)
+- **Writer toolkit** — done (document creation from scratch, incremental
+  updates incl. encrypted documents, encryption on save, true redaction,
+  full document merge, font subsetting + image downsampling, signature
+  creation + trust-chain verification, linearization, PDF/A validation)
 - **Robustness** — corrupt/adversarial-corpus pass: opens 426/618 of a
   malformed-PDF corpus (from 166), zero render panics, zero timeouts/hangs
 

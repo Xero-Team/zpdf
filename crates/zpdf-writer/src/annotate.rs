@@ -121,10 +121,76 @@ impl AnnotationSpec {
 impl IncrementalWriter {
     /// Append an authored annotation to a page (0-based index). Returns the
     /// new annotation's object id.
+    ///
+    /// A `/AP /N` appearance stream is baked in (synthesized from the
+    /// annotation geometry via the same generator both render backends use),
+    /// so the annotation is visible even in viewers that never synthesize
+    /// appearances from geometry.
     pub fn add_annotation(&mut self, page_index: usize, spec: &AnnotationSpec) -> Result<ObjectId> {
-        let dict = build_annotation_dict(spec)?;
+        let mut dict = build_annotation_dict(spec)?;
         let page_id = self.page_id(page_index)?;
-        self.ensure_object_capacity(1)?;
+        self.ensure_object_capacity(2)?;
+
+        // Synthesize the appearance from the finished dict. `None` (e.g. a
+        // degenerate rect) simply leaves the annotation without /AP.
+        let appearance = subtype_name(&dict).and_then(|subtype| {
+            let rect = rect_from_dict(&dict)?;
+            zpdf_document::annot_appearance::generate_annotation_appearance(
+                self.document().file(),
+                &dict,
+                &subtype,
+                rect,
+            )
+        });
+
+        if let Some(ap) = appearance {
+            let mut form = PdfDict::new();
+            form.insert(
+                PdfName::new("Type"),
+                PdfObject::Name(PdfName::new("XObject")),
+            );
+            form.insert(
+                PdfName::new("Subtype"),
+                PdfObject::Name(PdfName::new("Form")),
+            );
+            form.insert(PdfName::new("FormType"), PdfObject::Integer(1));
+            form.insert(
+                PdfName::new("BBox"),
+                PdfObject::Array(vec![
+                    PdfObject::Real(ap.bbox.x0),
+                    PdfObject::Real(ap.bbox.y0),
+                    PdfObject::Real(ap.bbox.x1),
+                    PdfObject::Real(ap.bbox.y1),
+                ]),
+            );
+            let m = ap.matrix;
+            if m != zpdf_core::Matrix::identity() {
+                form.insert(
+                    PdfName::new("Matrix"),
+                    PdfObject::Array(vec![
+                        PdfObject::Real(m.a),
+                        PdfObject::Real(m.b),
+                        PdfObject::Real(m.c),
+                        PdfObject::Real(m.d),
+                        PdfObject::Real(m.e),
+                        PdfObject::Real(m.f),
+                    ]),
+                );
+            }
+            if !ap.resources.0.is_empty() {
+                form.insert(
+                    PdfName::new("Resources"),
+                    PdfObject::Dict(ap.resources.clone()),
+                );
+            }
+            let (ap_num, ap_gen) = self.try_add_stream(&form, &ap.content)?;
+            let mut ap_dict = PdfDict::new();
+            ap_dict.insert(
+                PdfName::new("N"),
+                PdfObject::Ref(ObjectId(ap_num, ap_gen as u16)),
+            );
+            dict.insert(PdfName::new("AP"), PdfObject::Dict(ap_dict));
+        }
 
         let (num, gen) = self.try_add_object(&PdfObject::Dict(dict))?;
         let annot_id = ObjectId(num, gen as u16);
@@ -144,6 +210,32 @@ impl IncrementalWriter {
         page_dict.insert(PdfName::new("Annots"), PdfObject::Array(annots));
         self.overwrite_object(page_id, PdfObject::Dict(page_dict));
         Ok(annot_id)
+    }
+}
+
+/// The `/Subtype` name of a finished annotation dict.
+fn subtype_name(dict: &PdfDict) -> Option<String> {
+    match dict.get("Subtype") {
+        Some(PdfObject::Name(n)) => Some(n.as_str().to_string()),
+        _ => None,
+    }
+}
+
+/// The `/Rect` of a finished annotation dict.
+fn rect_from_dict(dict: &PdfDict) -> Option<Rect> {
+    match dict.get("Rect") {
+        Some(PdfObject::Array(a)) if a.len() == 4 => {
+            let mut v = [0.0f64; 4];
+            for (i, obj) in a.iter().enumerate() {
+                v[i] = match obj {
+                    PdfObject::Integer(n) => *n as f64,
+                    PdfObject::Real(f) => *f,
+                    _ => return None,
+                };
+            }
+            Some(Rect::new(v[0], v[1], v[2], v[3]))
+        }
+        _ => None,
     }
 }
 

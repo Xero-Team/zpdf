@@ -15,14 +15,22 @@ categories.workspace = true
 zpdf-core.workspace = true
 zpdf-parser.workspace = true
 zpdf-document.workspace = true
+# Content-stream tokenizer for redaction.
+zpdf-content.workspace = true
 thiserror.workspace = true
 flate2.workspace = true
 tracing.workspace = true
+# TrueType/CFF parsing for font embedding in DocumentBuilder.
+ttf-parser.workspace = true
 # Pure-Rust signing (RustCrypto) for CMS/PKCS#7 signature creation:
 # RSA PKCS#1 v1.5 and ECDSA P-256, SHA-256 digests.
 sha2.workspace = true
 rsa.workspace = true
 p256 = { workspace = true, features = ["pkcs8"] }
+# Encryption on save (Standard security handler, RC4 + AES-CBC).
+aes.workspace = true
+cbc = { workspace = true, features = ["alloc"] }
+getrandom = "0.2"
 
 [dev-dependencies]
 # Deterministic RSA keygen for the signing round-trip tests.

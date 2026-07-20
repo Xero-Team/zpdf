@@ -1,5 +1,6 @@
 mod ccitt;
 mod crypt;
+pub use crypt::Decryptor;
 pub mod filters;
 mod header;
 mod jbig2;
@@ -146,6 +147,12 @@ impl PdfFile {
     /// imply decryption succeeded — open the document to find out.
     pub fn is_encrypted(&self) -> bool {
         self.trailer.get("Encrypt").is_some()
+    }
+
+    /// The document's decryptor, when one was built at open time. Writers use
+    /// it to encrypt objects added to an encrypted document with its key.
+    pub fn decryptor(&self) -> Option<&crypt::Decryptor> {
+        self.decryptor.as_ref()
     }
 
     /// Construct the Standard-security-handler decryptor from the trailer

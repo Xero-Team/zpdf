@@ -201,3 +201,89 @@ fn non_finite_quads_rejected() {
     );
     assert!(err.is_err());
 }
+
+/// Authored annotations must carry a baked /AP /N appearance stream so they
+/// render in viewers that never synthesize appearances.
+#[test]
+fn authored_annotations_carry_appearance_streams() {
+    use zpdf_core::PdfObject;
+
+    let specs = vec![
+        AnnotationSpec::markup_from_rects(
+            MarkupKind::Highlight,
+            &[Rect::new(50.0, 700.0, 200.0, 715.0)],
+            (1.0, 1.0, 0.0),
+            None,
+        ),
+        AnnotationSpec::Square {
+            rect: Rect::new(100.0, 500.0, 250.0, 600.0),
+            color: (1.0, 0.0, 0.0),
+            interior: Some((1.0, 0.9, 0.9)),
+            width: 2.0,
+        },
+        AnnotationSpec::Line {
+            x1: 50.0,
+            y1: 400.0,
+            x2: 300.0,
+            y2: 450.0,
+            color: (0.0, 0.0, 1.0),
+            width: 1.5,
+        },
+        AnnotationSpec::Note {
+            x: 400.0,
+            y: 700.0,
+            contents: "sticky".into(),
+            color: None,
+            icon: None,
+        },
+        AnnotationSpec::FreeText {
+            rect: Rect::new(50.0, 300.0, 300.0, 350.0),
+            contents: "free text body".into(),
+            size: Some(12.0),
+            color: Some((0.0, 0.0, 0.0)),
+        },
+    ];
+
+    for spec in specs {
+        let doc = add_and_reopen(spec.clone());
+        let page = doc.page(0).expect("page");
+        let annot_ref = *page.annots.first().expect("annot present");
+        let dict = doc
+            .file()
+            .resolve(annot_ref)
+            .expect("resolve annot")
+            .as_dict()
+            .expect("dict")
+            .clone();
+        let subtype = match dict.get("Subtype") {
+            Some(PdfObject::Name(n)) => n.as_str().to_string(),
+            _ => String::new(),
+        };
+        let ap = dict
+            .get("AP")
+            .unwrap_or_else(|| panic!("{subtype}: /AP missing"));
+        let ap_dict = match ap {
+            PdfObject::Dict(d) => d.clone(),
+            PdfObject::Ref(r) => doc
+                .file()
+                .resolve(*r)
+                .expect("resolve AP")
+                .as_dict()
+                .expect("AP dict")
+                .clone(),
+            other => panic!("{subtype}: /AP has wrong type: {other:?}"),
+        };
+        let n_ref = match ap_dict.get("N") {
+            Some(PdfObject::Ref(r)) => *r,
+            other => panic!("{subtype}: /AP /N must be a stream ref, got {other:?}"),
+        };
+        let content = doc
+            .file()
+            .resolve_stream_data(n_ref)
+            .unwrap_or_else(|e| panic!("{subtype}: /N stream unreadable: {e}"));
+        assert!(
+            !content.is_empty(),
+            "{subtype}: appearance stream must not be empty"
+        );
+    }
+}

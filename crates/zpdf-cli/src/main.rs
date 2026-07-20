@@ -46,6 +46,8 @@ fn main() {
         "split" => cmd_split(&args[2..]),
         "optimize" => cmd_optimize(&args[2..]),
         "annotate" => cmd_annotate(&args[2..]),
+        "redact" => cmd_redact(&args[2..]),
+        "validate" => cmd_validate(&args[2..]),
         "sign" => cmd_sign(&args[2..]),
         "pages" => cmd_pages(&args[2..]),
         "set-meta" => cmd_set_meta(&args[2..]),
@@ -533,12 +535,49 @@ fn print_struct_elem(elem: &zpdf::StructElem, depth: usize) {
 /// explicitly so it is never read as full validation.
 fn cmd_signatures(args: &[String]) -> zpdf::Result<()> {
     let (args, password) = extract_password(args);
-    if args.is_empty() {
-        eprintln!("Usage: zpdf signatures <file.pdf> [--password <pw>]");
-        process::exit(1);
-    }
 
-    let doc = open_document(&args[0], password.as_deref())?;
+    // Optional --trust <roots.pem>: also verify each signature's certificate
+    // chain against the provided anchors.
+    let mut input: Option<&str> = None;
+    let mut trust_path: Option<&str> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--trust" => {
+                trust_path = args.get(i + 1).map(String::as_str);
+                i += 2;
+            }
+            other if !other.starts_with('-') => {
+                if input.is_none() {
+                    input = Some(other);
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    let Some(input) = input else {
+        eprintln!("Usage: zpdf signatures <file.pdf> [--password <pw>] [--trust <roots.pem>]");
+        process::exit(1);
+    };
+    let anchors = match trust_path {
+        Some(path) => {
+            let data = fs::read(path).map_err(zpdf::Error::Io)?;
+            let anchors = zpdf::trust::parse_trust_anchors(&data);
+            if anchors.is_empty() {
+                eprintln!("No certificates found in {path}");
+                process::exit(1);
+            }
+            Some(anchors)
+        }
+        None => None,
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .ok();
+
+    let doc = open_document(input, password.as_deref())?;
     let sigs = doc.signatures();
     if sigs.is_empty() {
         println!("No digital signatures (/Sig fields).");
@@ -609,6 +648,25 @@ fn cmd_signatures(args: &[String]) -> zpdf::Result<()> {
 
         if s.is_cryptographically_valid() {
             println!("    => Cryptographically sound (bytes intact + signature valid); trust anchor NOT validated");
+        }
+
+        // Certificate-chain verification against the provided anchors.
+        if let Some(anchors) = &anchors {
+            let verdict = match &s.cms_blob {
+                Some(blob) => zpdf::trust::verify_certificate_chain(blob, anchors, now),
+                None => zpdf::trust::ChainStatus::Unsupported("no CMS blob in signature".into()),
+            };
+            match verdict {
+                zpdf::trust::ChainStatus::Trusted(names) => {
+                    println!("    Trust chain: TRUSTED ({})", names.join(" → "));
+                }
+                zpdf::trust::ChainStatus::Untrusted(why) => {
+                    println!("    Trust chain: UNTRUSTED — {why}");
+                }
+                zpdf::trust::ChainStatus::Unsupported(why) => {
+                    println!("    Trust chain: unsupported — {why}");
+                }
+            }
         }
     }
 
@@ -1700,7 +1758,7 @@ fn cmd_merge(args: &[String]) -> zpdf::Result<()> {
     for path in &inputs[1..] {
         let data = fs::read(path).map_err(zpdf::Error::Io)?;
         let file = zpdf::PdfFile::parse(data)?;
-        let appended = writer.append_document_pages(&file)?;
+        let appended = writer.append_document(&file)?;
         total += appended;
         println!("{path}: {appended} page(s) appended");
     }
@@ -1801,6 +1859,11 @@ fn cmd_optimize(args: &[String]) -> zpdf::Result<()> {
     let mut input = None;
     let mut output = None;
     let mut no_compress = false;
+    let mut encrypt_algo: Option<String> = None;
+    let mut user_pw = String::new();
+    let mut owner_pw = String::new();
+    let mut max_image_dim: Option<u32> = None;
+    let mut linearize = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -1811,6 +1874,30 @@ fn cmd_optimize(args: &[String]) -> zpdf::Result<()> {
             }
             "--no-compress" => {
                 no_compress = true;
+                i += 1;
+            }
+            "--encrypt" => {
+                encrypt_algo = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "--user-password" => {
+                user_pw = args.get(i + 1).cloned().unwrap_or_default();
+                i += 2;
+            }
+            "--owner-password" => {
+                owner_pw = args.get(i + 1).cloned().unwrap_or_default();
+                i += 2;
+            }
+            "--max-image-dim" => {
+                max_image_dim = args.get(i + 1).and_then(|s| s.parse().ok());
+                if max_image_dim.is_none() {
+                    eprintln!("--max-image-dim requires a positive pixel count");
+                    process::exit(1);
+                }
+                i += 2;
+            }
+            "--linearize" => {
+                linearize = true;
                 i += 1;
             }
             other if !other.starts_with('-') => {
@@ -1824,7 +1911,10 @@ fn cmd_optimize(args: &[String]) -> zpdf::Result<()> {
     }
 
     let (Some(input_path), Some(out_path)) = (input, output) else {
-        eprintln!("Usage: zpdf optimize <file.pdf> -o <out.pdf> [--no-compress] [--password <pw>]");
+        eprintln!(
+            "Usage: zpdf optimize <file.pdf> -o <out.pdf> [--no-compress] [--password <pw>]\n       \
+             [--max-image-dim N] [--encrypt aes256|rc4 --user-password <pw> --owner-password <pw>]"
+        );
         process::exit(1);
     };
     if out_path == input_path {
@@ -1832,15 +1922,35 @@ fn cmd_optimize(args: &[String]) -> zpdf::Result<()> {
         process::exit(1);
     }
 
+    let encrypt = match encrypt_algo.as_deref() {
+        None => None,
+        Some("aes256") => Some(zpdf_writer::EncryptionConfig::aes256(&user_pw, &owner_pw)),
+        Some("rc4") => Some(zpdf_writer::EncryptionConfig::rc4_128(&user_pw, &owner_pw)),
+        Some(other) => {
+            eprintln!("Unknown --encrypt algorithm: {other} (use aes256 or rc4)");
+            process::exit(1);
+        }
+    };
+
     let doc = open_document(&input_path, password.as_deref())?;
     warn_signatures(&doc);
-    if doc.is_encrypted() {
+    if doc.is_encrypted() && encrypt.is_none() {
         eprintln!("Note: output will be decrypted (rewrite drops /Encrypt).");
     }
     let options = zpdf_writer::RewriteOptions {
         compress_uncompressed: !no_compress,
+        encrypt,
+        max_image_dimension: max_image_dim,
     };
-    let bytes = zpdf_writer::rewrite_pdf(doc.file(), &options)?;
+    let bytes = if linearize {
+        if encrypt_algo.is_some() {
+            eprintln!("--linearize cannot be combined with --encrypt");
+            process::exit(1);
+        }
+        zpdf_writer::linearize_pdf(doc.file())?
+    } else {
+        zpdf_writer::rewrite_pdf(doc.file(), &options)?
+    };
 
     let in_size = fs::metadata(&input_path).map_err(zpdf::Error::Io)?.len();
     let out_size = bytes.len() as u64;
@@ -2352,6 +2462,162 @@ fn cmd_set_meta(args: &[String]) -> zpdf::Result<()> {
     writer.set_info(&update)?;
     write_output(&writer, &out_path)?;
     println!("Metadata updated → {}", out_path);
+    Ok(())
+}
+
+/// Redact one or more regions of a page: remove intersecting text/image/path
+/// content from the content stream, drop overlapping annotations, and draw an
+/// opaque box (unless --no-fill).
+fn cmd_redact(args: &[String]) -> zpdf::Result<()> {
+    let (args, password) = extract_password(args);
+    let mut input = None;
+    let mut output = None;
+    let mut page_num: usize = 1;
+    let mut rects: Vec<zpdf::Rect> = Vec::new();
+    let mut fill: Option<(f64, f64, f64)> = Some((0.0, 0.0, 0.0));
+
+    let parse_nums = |s: &str, n: usize, what: &str| -> Vec<f64> {
+        let vals: Vec<f64> = s.split(',').filter_map(|p| p.trim().parse().ok()).collect();
+        if vals.len() != n {
+            eprintln!("{what} requires {n} comma-separated numbers");
+            process::exit(1);
+        }
+        vals
+    };
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-o" => {
+                output = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "-p" => {
+                page_num = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(1);
+                i += 2;
+            }
+            "--rect" => {
+                let v = parse_nums(
+                    args.get(i + 1).map(String::as_str).unwrap_or(""),
+                    4,
+                    "--rect",
+                );
+                rects.push(zpdf::Rect::new(v[0], v[1], v[2], v[3]));
+                i += 2;
+            }
+            "--fill" => {
+                let v = parse_nums(
+                    args.get(i + 1).map(String::as_str).unwrap_or(""),
+                    3,
+                    "--fill",
+                );
+                fill = Some((v[0], v[1], v[2]));
+                i += 2;
+            }
+            "--no-fill" => {
+                fill = None;
+                i += 1;
+            }
+            other if !other.starts_with('-') => {
+                if input.is_none() {
+                    input = Some(other.to_string());
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+
+    let (Some(input_path), Some(out_path)) = (input, output) else {
+        eprintln!(
+            "Usage: zpdf redact <file.pdf> -p <page> --rect X0,Y0,X1,Y1 [--rect ...]\n       \
+             [--fill R,G,B | --no-fill] [--password <pw>] -o <out.pdf>"
+        );
+        process::exit(1);
+    };
+    if rects.is_empty() {
+        eprintln!("At least one --rect X0,Y0,X1,Y1 is required");
+        process::exit(1);
+    }
+    if out_path == input_path {
+        eprintln!("Output path must differ from input");
+        process::exit(1);
+    }
+
+    let bytes = fs::read(&input_path).map_err(zpdf::Error::Io)?;
+    let mut writer = match password.as_deref() {
+        Some(pw) => zpdf_writer::IncrementalWriter::new_with_password(bytes, pw.as_bytes())?,
+        None => zpdf_writer::IncrementalWriter::new(bytes)?,
+    };
+    writer.redact_page(
+        page_num.saturating_sub(1),
+        &rects,
+        &zpdf_writer::RedactOptions { fill },
+    )?;
+    let mut out = std::io::Cursor::new(Vec::new());
+    writer.write(&mut out).map_err(zpdf::Error::Io)?;
+    fs::write(&out_path, out.into_inner()).map_err(zpdf::Error::Io)?;
+    println!(
+        "{} region(s) redacted on page {page_num} → {out_path}",
+        rects.len()
+    );
+    Ok(())
+}
+
+/// Validate a document against a PDF/A profile (best-effort rule engine).
+fn cmd_validate(args: &[String]) -> zpdf::Result<()> {
+    let (args, password) = extract_password(args);
+    let mut input: Option<&str> = None;
+    let mut profile = zpdf::pdfa::Profile::A2b;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--profile" => {
+                profile = match args.get(i + 1).map(String::as_str) {
+                    Some("pdfa-1b") | Some("a-1b") | Some("1b") => zpdf::pdfa::Profile::A1b,
+                    Some("pdfa-2b") | Some("a-2b") | Some("2b") => zpdf::pdfa::Profile::A2b,
+                    other => {
+                        eprintln!(
+                            "Unknown profile {:?} (use pdfa-1b or pdfa-2b)",
+                            other.unwrap_or("")
+                        );
+                        process::exit(1);
+                    }
+                };
+                i += 2;
+            }
+            other if !other.starts_with('-') => {
+                if input.is_none() {
+                    input = Some(other);
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    let Some(input) = input else {
+        eprintln!("Usage: zpdf validate <file.pdf> [--profile pdfa-1b|pdfa-2b] [--password <pw>]");
+        process::exit(1);
+    };
+
+    let doc = open_document(input, password.as_deref())?;
+    let report = zpdf::pdfa::validate(doc.file(), profile);
+
+    println!("Profile: {}", report.profile.as_str());
+    match &report.claimed {
+        Some((part, conf)) => println!("Claimed: PDF/A-{part}{}", conf.to_lowercase()),
+        None => println!("Claimed: (no PDF/A identification in XMP)"),
+    }
+    if report.conforms() {
+        println!("Result: PASS — no violations found");
+    } else {
+        println!("Result: FAIL — {} violation(s)", report.violations.len());
+        for v in &report.violations {
+            println!("  [{}] {}", v.rule, v.message);
+        }
+        process::exit(3);
+    }
     Ok(())
 }
 

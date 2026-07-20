@@ -186,3 +186,101 @@ fn inherited_attributes_are_materialized() {
     assert_eq!(page.width(), 555.0, "inherited MediaBox materialized");
     assert_eq!(page.rotate, 90, "inherited Rotate materialized");
 }
+
+// ---------------------------------------------------------------------------
+// append_document (full merge: outlines, AcroForm, OCGs)
+// ---------------------------------------------------------------------------
+
+/// A PDF with one page, a two-item outline, one text field, and one OCG.
+fn rich_pdf(field_name: &str, title_prefix: &str) -> Vec<u8> {
+    let objects = [
+        // 1: catalog
+        "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R /AcroForm << /Fields [7 0 R] >> \
+           /OCProperties << /OCGs [8 0 R] /D << /ON [8 0 R] /OFF [] >> >> >>"
+            .to_string(),
+        // 2: pages root
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+        // 3: page (also the widget's /P target)
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [7 0 R] >>".to_string(),
+        // 4: outlines root
+        "<< /Type /Outlines /First 5 0 R /Last 6 0 R /Count 2 >>".to_string(),
+        // 5: outline item 1
+        format!("<< /Title ({title_prefix} One) /Parent 4 0 R /Next 6 0 R /Dest [3 0 R /Fit] >>"),
+        // 6: outline item 2
+        format!("<< /Title ({title_prefix} Two) /Parent 4 0 R /Prev 5 0 R /Dest [3 0 R /Fit] >>"),
+        // 7: text field doubling as its own widget
+        format!(
+            "<< /FT /Tx /T ({field_name}) /V (hello) /Type /Annot /Subtype /Widget \
+               /Rect [100 700 300 720] /P 3 0 R >>"
+        ),
+        // 8: an OCG
+        "<< /Type /OCG /Name (Layer A) >>".to_string(),
+    ];
+    let mut pdf = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::new();
+    for (i, obj) in objects.iter().enumerate() {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{} 0 obj\n{}\nendobj\n", i + 1, obj).as_bytes());
+    }
+    let xref = pdf.len();
+    pdf.extend_from_slice(format!("xref\n0 {}\n", objects.len() + 1).as_bytes());
+    pdf.extend_from_slice(b"0000000000 65535 f \n");
+    for ofs in offsets {
+        pdf.extend_from_slice(format!("{ofs:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+            objects.len() + 1
+        )
+        .as_bytes(),
+    );
+    pdf
+}
+
+#[test]
+fn append_document_merges_outlines_fields_and_ocgs() {
+    let base = rich_pdf("name", "Base");
+    let other = rich_pdf("name", "Other"); // deliberately colliding field name
+
+    let mut writer = IncrementalWriter::new(base).expect("writer");
+    let src = PdfFile::parse(other).expect("parse source");
+    let appended = writer.append_document(&src).expect("append_document");
+    assert_eq!(appended, 1);
+
+    let mut out = Cursor::new(Vec::new());
+    writer.write(&mut out).expect("write");
+    let bytes = out.into_inner();
+    let doc = PdfDocument::open(bytes).expect("open merged");
+    assert_eq!(doc.page_count(), 2);
+
+    // Outline: four top-level items in order Base One, Base Two, Other One, Other Two.
+    let outline = doc.outline();
+    let titles: Vec<String> = outline.iter().map(|i| i.title.clone()).collect();
+    assert_eq!(
+        titles,
+        vec!["Base One", "Base Two", "Other One", "Other Two"],
+        "merged outline order"
+    );
+
+    // AcroForm: two fields, the second renamed on collision.
+    let form = zpdf_document::AcroForm::parse(doc.file()).expect("acroform");
+    let mut names: Vec<String> = form.fields.iter().map(|f| f.name.clone()).collect();
+    names.sort();
+    assert_eq!(names, vec!["name", "name_2"], "collision renaming");
+}
+
+#[test]
+fn append_document_without_extras_still_works() {
+    // Sources without outlines/forms/OCGs go through the same path.
+    let base = pdf_with_pages(1, 600);
+    let mut writer = IncrementalWriter::new(base).expect("writer");
+    let src_bytes = pdf_with_pages(1, 700);
+    let src = PdfFile::parse(src_bytes).expect("parse");
+    let n = writer.append_document(&src).expect("append");
+    assert_eq!(n, 1);
+    let mut out = Cursor::new(Vec::new());
+    writer.write(&mut out).expect("write");
+    let doc = PdfDocument::open(out.into_inner()).expect("open");
+    assert_eq!(doc.page_count(), 2);
+}

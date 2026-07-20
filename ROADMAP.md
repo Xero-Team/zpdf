@@ -660,6 +660,58 @@ cargo run -p zpdf-render-wgpu --example viewer -- <file.pdf>   # 交互浏览器
 
 ---
 
+## P5 — 写入工具链（2026-07 完成）
+
+### P5.1 — 从零创建 PDF（`DocumentBuilder`，`builder.rs`）
+- [X] 任意尺寸页面、标准 14 字体文本、内嵌 TrueType 文本（WinAnsi 编码，
+  `embed_font`/`add_text_embedded`）、JPEG/RGB/RGBA 图像（alpha → `/SMask`）、
+  矢量路径（`PathSegment`/`PathStyle`）
+- [X] 构建时自动**字体子集化**（`subset.rs` sparse-glyf：清空未用轮廓、保留
+  度量与 cmap，复合字形闭包，强制 long loca；Arial 演示 549KB → 135KB）
+
+### P5.2 — 保存时加密 + 加密文档编辑（`encrypt.rs`）
+- [X] `RewriteOptions::encrypt`：AES-256 R6（算法 8/9 + 2.B 强化哈希、`/Perms`）
+  与 RC4-128 R3，`Permissions` 权限位；CLI `optimize --encrypt aes256|rc4`
+- [X] `IncrementalWriter::new_with_password` 增量更新加密文档（新对象用文档
+  密钥加密，trailer 延续 `/Encrypt`）；parser `Decryptor` 增加加密方向
+
+### P5.3 — 真实脱敏（`redact.rs`）
+- [X] 令牌级内容流过滤：按范围删除文本显示、图像绘制（`Do`/内联），路径绘制
+  降级为 `n`；删除重叠注释；可选填充遮盖框；CLI `zpdf redact`
+
+### P5.4 — 注释外观烘焙
+- [X] `add_annotation` 生成 `/AP /N` Form XObject（复用双后端共享的
+  `annot_appearance` 合成器），严格查看器可见
+
+### P5.5 — 完整文档合并（`append_document`）
+- [X] 书签（大纲兄弟链拼接 + 重新挂父）、AcroForm 字段（`/T` 冲突改名 `_2`）、
+  `/OCProperties`（OCG + 默认 ON/OFF 状态）；CLI `merge` 已启用
+
+### P5.6 — 文本提取质量
+- [X] 断字合并（连字符行尾 + 下行小写才合并）与 RTL 视觉→逻辑序修复
+  （希伯来/阿拉伯文最大连续段反转），内建于 `spans_to_text`
+
+### P5.7 — 优化增强
+- [X] `RewriteOptions::max_image_dimension` 盒式滤波降采样（8-bit Flate/raw
+  Gray/RGB，跳过 predictor/掩膜/DCT）；CLI `--max-image-dim`
+
+### P5.8 — 签名信任链（`zpdf-document/src/trust.rs`）
+- [X] 基于调用方提供锚点（PEM/DER）的 X.509 链构建与验证：逐级 RSA/ECDSA
+  P-256/P-384 签名校验、有效期检查；`Signature.cms_blob` 保留原始 CMS；
+  CLI `signatures --trust roots.pem`；吊销（CRL/OCSP）不在范围内
+
+### P5.9 — 线性化（`linearize.rs`）
+- [X] ISO 32000-1 附录 F "fast web view"：线性化参数字典居首、首页对象前置、
+  两趟定宽偏移回填；CLI `optimize --linearize`
+
+### P5.10 — PDF/A 校验（`zpdf-document/src/pdfa.rs`）
+- [X] PDF/A-1b / 2b 规则引擎：加密、trailer `/ID`、版本上限（A-1）、XMP
+  `pdfaid` 声明、`GTS_PDFA1` 输出意图 + ICC、字体内嵌（含 Type0 后代）、
+  禁用特性（JavaScript/Launch、内嵌文件与透明组 A-1）；
+  CLI `zpdf validate --profile pdfa-1b|pdfa-2b`（FAIL 退出码 3）
+
+---
+
 ## 时间估算（参考）
 
 | Phase | 预计工作量 | 累计     |

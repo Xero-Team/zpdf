@@ -2,6 +2,95 @@
 
 ## Unreleased
 
+### PDF creation from scratch (`DocumentBuilder`)
+
+- New `zpdf_writer::DocumentBuilder`: author complete PDFs without an existing
+  file — pages of any size, text in standard-14 fonts, embedded TrueType fonts
+  (`embed_font` / `add_text_embedded`, WinAnsi encoding), JPEG/RGB/RGBA images
+  (RGBA alpha becomes an `/SMask`), and vector paths
+  (`PathSegment`/`PathStyle`: move/line/curve/rect, stroke/fill/both).
+- Embedded fonts are **subset automatically** at `build()` time (sparse-glyf:
+  unused outlines emptied, metrics and cmap preserved — text extraction is
+  unaffected). A demo embedding Arial shrank from 549 KB to 135 KB.
+
+### Encryption on save + encrypted-document editing
+
+- `RewriteOptions::encrypt` with `EncryptionConfig::aes256(user, owner)`
+  (V5/R6, Algorithm 2.B hardened hash, `/Perms`) or `::rc4_128(user, owner)`
+  (V2/R3), plus a `Permissions` bit-field. CLI:
+  `zpdf optimize --encrypt aes256|rc4 --user-password … --owner-password …`.
+- `IncrementalWriter::new_with_password` now updates **encrypted** documents:
+  new/modified objects are encrypted with the document's existing key and the
+  update trailer carries `/Encrypt` forward (previously refused).
+- The parser's `Decryptor` gained the encrypt direction
+  (`encrypt_stream_bytes`, `encrypt_object_strings`) and is exposed via
+  `PdfFile::decryptor()`.
+
+### True redaction
+
+- `IncrementalWriter::redact_page(page, rects, options)`: walks the content
+  stream with the tokenizer and **removes** text shows whose extent intersects
+  a redaction rect, XObject/inline-image draws whose placement intersects, and
+  downgrades intersecting path paints to no-ops — then drops overlapping
+  annotations and (optionally) paints an opaque box. CLI `zpdf redact`.
+
+### Annotation appearance streams
+
+- `IncrementalWriter::add_annotation` now bakes an `/AP /N` Form-XObject
+  appearance (via the same synthesizer both render backends use), so authored
+  highlights/notes/shapes/free-text render in viewers that never synthesize
+  appearances from geometry.
+
+### Full document merge
+
+- New `IncrementalWriter::append_document`: appends pages **and** merges
+  document-level structures — outlines (source items spliced after the
+  destination's, destinations remapped), AcroForm fields (fully-qualified name
+  collisions renamed `name_2`, `name_3`, …; `/DR`/`/DA` carried when absent),
+  and `/OCProperties` (OCGs + default ON/OFF visibility). `zpdf merge` uses it.
+
+### Text extraction quality
+
+- **Dehyphenation**: a line ending in a hyphen after a letter joins the next
+  line when it starts lowercase (`coopera-\ntion` → `cooperation`; `UTF-\n8`
+  and `Smith-\nJones` are left alone).
+- **RTL repair**: PDF paints glyphs in visual order; maximal Hebrew/Arabic
+  runs are now reversed to logical order in `spans_to_text`.
+
+### Optimize: image downsampling
+
+- `RewriteOptions::max_image_dimension`: box-filter halving of 8-bit
+  Flate/raw DeviceRGB/DeviceGray images above the cap (predictors, palettes,
+  masks, and DCT/JPX are left untouched). CLI `--max-image-dim N`.
+
+### Signature trust chains
+
+- New `zpdf_document::trust` module: X.509 certificate-chain verification for
+  PDF signatures against **caller-provided trust anchors** (PEM bundle or DER)
+  — chain building over the CMS certificate set, per-link RSA / ECDSA
+  P-256/P-384 signature verification (SHA-1/256/384/512), validity-period
+  checks. `Signature` now retains `cms_blob` for this. CLI:
+  `zpdf signatures --trust roots.pem` → `TRUSTED (leaf → … → anchor)` /
+  `UNTRUSTED` / `unsupported`. Revocation (CRL/OCSP) remains out of scope.
+
+### Linearization
+
+- New `zpdf_writer::linearize_pdf`: "fast web view" output per ISO 32000-1
+  Annex F — linearization parameter dictionary first, first-page objects and
+  xref up front, minimal hint stream, two-pass fixed-width offset patching.
+  CLI `zpdf optimize --linearize`.
+
+### PDF/A validation
+
+- New `zpdf_document::pdfa` module: best-effort conformance rule engine for
+  **PDF/A-1b** and **PDF/A-2b** — encryption, trailer `/ID`, header version
+  (A-1), XMP presence + `pdfaid` identification (and the claimed
+  part/conformance), `GTS_PDFA1` output intent with embedded ICC profile, font
+  embedding across all page resources (Type0 descendants included), and
+  forbidden features (JavaScript/Launch actions, embedded files and
+  transparency groups for A-1). CLI `zpdf validate --profile pdfa-1b|pdfa-2b`
+  (exit code 3 on FAIL).
+
 ### TXT, Markdown, and HTML conversion
 
 - Added the public `convert_pdf` facade API with `ConversionMode::TextOnly` and

@@ -13,6 +13,8 @@ pub use zpdf_content::text::{spans_to_text, struct_ordered_text, TextSpan};
 pub use zpdf_core::*;
 pub use zpdf_display_list as display_list;
 pub use zpdf_display_list::DisplayList;
+pub use zpdf_document::pdfa;
+pub use zpdf_document::trust;
 pub use zpdf_document::{
     AcroForm, Annotation, ByteRangeCoverage, CryptoStatus, DestView, Destination, DigestStatus,
     DocInfo, EmbeddedFile, EmbeddedSource, FieldKind, FieldValue, FormField,

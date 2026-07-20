@@ -91,6 +91,7 @@ fn rewrite_without_compression_keeps_stream_raw() {
         &file,
         &RewriteOptions {
             compress_uncompressed: false,
+            ..Default::default()
         },
     )
     .expect("rewrite");
