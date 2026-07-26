@@ -16,6 +16,7 @@ members = [
     "crates/zpdf-viewer-gpui",
     "crates/zpdf-cli",
     "crates/zpdf-writer",
+    "crates/zpdf-pptx-export",
 ]
 # The cargo-fuzz harness is a detached crate (nightly + sanitizer-only). Keep it
 # out of the normal workspace so `cargo build`/`test`/`clippy` never touch it.
@@ -46,6 +47,7 @@ zpdf-render = { path = "crates/zpdf-render", version = "0.10.0" }
 zpdf-render-cpu = { path = "crates/zpdf-render-cpu", version = "0.10.0" }
 zpdf-render-wgpu = { path = "crates/zpdf-render-wgpu", version = "0.10.0" }
 zpdf-writer = { path = "crates/zpdf-writer", version = "0.10.0" }
+zpdf-pptx-export = { path = "crates/zpdf-pptx-export", version = "0.10.0" }
 zpdf = { path = "crates/zpdf", version = "0.10.0", default-features = false }
 
 # external

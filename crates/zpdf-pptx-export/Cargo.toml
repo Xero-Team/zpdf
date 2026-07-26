@@ -1,0 +1,35 @@
+[package]
+name = "zpdf-pptx-export"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+zpdf-core.workspace = true
+zpdf-parser.workspace = true
+zpdf-document.workspace = true
+zpdf-content.workspace = true
+zpdf-display-list.workspace = true
+zpdf-font.workspace = true
+zpdf-image.workspace = true
+zpdf-color.workspace = true
+
+thiserror.workspace = true
+tracing.workspace = true
+
+# Image encoding for embedded images
+image.workspace = true
+
+# ZIP handling for .pptx (which is a ZIP archive)
+zip = "2.2"
+
+# XML generation for OOXML
+quick-xml = { version = "0.37", features = ["serialize"] }
+
+[dev-dependencies]
