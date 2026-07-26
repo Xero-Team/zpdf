@@ -44,6 +44,11 @@ GPU (wgpu) renderers whose output matches within <1% of pixels.
   decoding entirely; rich Markdown/HTML exports decoded images as PNG assets and
   includes document/page metadata. Unsupported or malformed images are discarded
   without interrupting text extraction (`convert_pdf`, CLI `convert`).
+- **PowerPoint (PPTX) export** — converts PDF pages to editable PowerPoint
+  presentations preserving text (with font/size/color/style), shapes
+  (rectangles, ellipses, lines with fill/stroke), and embedded images as native
+  PowerPoint elements rather than rasterizing to images (`zpdf-pptx-export`,
+  CLI `export-pptx`).
 - **Images** — 1/2/4/8/16-bpc, `/Decode`, soft masks, stencil & color-key
   masks, Indexed palettes, CMYK JPEG; bilinear sampling with box-filter
   minification.
@@ -110,7 +115,7 @@ GPU (wgpu) renderers whose output matches within <1% of pixels.
 - **GPU rendering** — wgpu backend (fills, strokes, clips, text, images, blend
   groups); matches the CPU renderer within <1% pixels.
 - **Tooling** — CLI with read commands
-  (`info`/`render`/`text`/`search`/`convert`/`tables`/`forms`/`outline`/`links`/`struct`/`attachments`/`signatures`/`validate`/`compare`/`dump`/`debug-stream`)
+  (`info`/`render`/`text`/`search`/`convert`/`export-pptx`/`tables`/`forms`/`outline`/`links`/`struct`/`attachments`/`signatures`/`validate`/`compare`/`dump`/`debug-stream`)
   and write commands
   (`fill`/`merge`/`split`/`optimize`/`annotate`/`redact`/`sign`/`pages`/`set-meta`/`stamp`),
   an interactive winit viewer example, and a native GPUI desktop reader

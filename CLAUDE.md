@@ -39,7 +39,7 @@ Supporting crates feed into zpdf-content: **zpdf-font** (Type1/TrueType/CID, CMa
 
 **zpdf** is the public facade crate — re-exports all APIs, feature-gates `cpu`/`gpu` modules.
 
-**zpdf-cli** is the binary crate with subcommands: read — `info`, `dump`, `render`, `text`, `search`, `convert`, `tables`, `forms`, `outline`, `links`, `struct`, `signatures` (`--trust` for cert chains), `attachments`, `validate` (PDF/A), `compare`, `debug-stream`; write — `fill`, `merge`, `split`, `optimize` (`--encrypt`, `--max-image-dim`, `--linearize`), `annotate`, `redact`, `sign`, `pages`, `set-meta`, `stamp`.
+**zpdf-cli** is the binary crate with subcommands: read — `info`, `dump`, `render`, `text`, `search`, `convert`, `export-pptx`, `tables`, `forms`, `outline`, `links`, `struct`, `signatures` (`--trust` for cert chains), `attachments`, `validate` (PDF/A), `compare`, `debug-stream`; write — `fill`, `merge`, `split`, `optimize` (`--encrypt`, `--max-image-dim`, `--linearize`), `annotate`, `redact`, `sign`, `pages`, `set-meta`, `stamp`.
 
 **zpdf-viewer-gpui** is a standalone native desktop reader built on Zed's GPUI (`publish = false`); it depends on the `zpdf` facade with `gpu-render` and renders pages through the wgpu backend. Not part of the parsing/rendering dependency chain. (`zpdf-render-wgpu` also ships a lighter winit-based `viewer` example.)
 
