@@ -20,7 +20,7 @@ fn main() {
     if args.len() < 2 {
         eprintln!("Usage: zpdf <command> [args...]");
         eprintln!(
-            "Commands: info, dump, render, text, search, convert, tables, forms, outline, links, struct, signatures, attachments, compare, debug-stream, fill, merge, split, optimize, annotate, sign, pages, set-meta, stamp"
+            "Commands: info, dump, render, text, search, convert, tables, forms, outline, links, struct, signatures, attachments, compare, debug-stream, fill, merge, split, optimize, annotate, sign, pages, set-meta, stamp, export-pptx"
         );
         process::exit(1);
     }
@@ -52,6 +52,7 @@ fn main() {
         "pages" => cmd_pages(&args[2..]),
         "set-meta" => cmd_set_meta(&args[2..]),
         "stamp" => cmd_stamp(&args[2..]),
+        "export-pptx" => cmd_export_pptx(&args[2..]),
         other => {
             eprintln!("Unknown command: {other}");
             process::exit(1);
@@ -2820,6 +2821,155 @@ pub(crate) fn parse_page_list(s: &str) -> std::result::Result<Vec<usize>, String
     }
     Ok(result)
 }
+
+/// Export PDF pages to PowerPoint (.pptx) with editable content.
+fn cmd_export_pptx(args: &[String]) -> zpdf::Result<()> {
+    let (args, password) = extract_password(args);
+    if args.is_empty() {
+        eprintln!("Usage: zpdf export-pptx <file.pdf> [-o <output.pptx>] [-p <page>|--pages <list>|--all] [--password <pw>]");
+        process::exit(1);
+    }
+
+    let pdf_path = &args[0];
+    let mut output: Option<String> = None;
+    let mut pages_spec: Option<String> = None;
+    let mut all = false;
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-o" => {
+                output = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "-p" => {
+                pages_spec = args.get(i + 1).map(|s| s.to_string());
+                i += 2;
+            }
+            "--pages" => {
+                pages_spec = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "--all" => {
+                all = true;
+                i += 1;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+
+    let out_path = output.unwrap_or_else(|| {
+        let base = std::path::Path::new(pdf_path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("output");
+        format!("{}.pptx", base)
+    });
+
+    if out_path == *pdf_path {
+        eprintln!("Output path must differ from input");
+        process::exit(1);
+    }
+
+    let doc = open_document(pdf_path, password.as_deref())?;
+    let total_pages = doc.page_count();
+
+    // Determine which pages to export
+    let page_indices: Vec<usize> = if let Some(spec) = pages_spec {
+        parse_page_list(&spec).unwrap_or_else(|error| {
+            eprintln!("invalid page list: {error}");
+            process::exit(1);
+        })
+    } else if all {
+        (0..total_pages).collect()
+    } else {
+        vec![0] // Default: first page
+    };
+
+    // Validate page indices
+    for &idx in &page_indices {
+        if idx >= total_pages {
+            eprintln!(
+                "page {} is out of range; document has {total_pages} pages",
+                idx + 1
+            );
+            process::exit(1);
+        }
+    }
+
+    println!("Exporting {} page(s) to PowerPoint...", page_indices.len());
+
+    // Process each page
+    let mut icc_cache = zpdf::IccCache::new();
+    let mut pptx_slides = Vec::new();
+
+    // Determine slide size from first page
+    let first_page = doc.page(page_indices[0])?;
+    let page_box = first_page.effective_box();
+    let width_pt = page_box.width();
+    let height_pt = page_box.height();
+    let width_emu = ((width_pt / 72.0) * 914400.0) as i64;
+    let height_emu = ((height_pt / 72.0) * 914400.0) as i64;
+
+    for &page_index in &page_indices {
+        let page = doc.page(page_index)?;
+        let page_box = page.effective_box();
+
+        // Load fonts and images for this page
+        let mut font_cache = doc.load_page_fonts(&page);
+        let mut image_cache = zpdf::ImageCache::new();
+
+        // Interpret content stream to display list
+        let content_bytes = doc.page_content_bytes(&page)?;
+        let interpreter = zpdf::ContentInterpreter::new(page_box)
+            .with_page_rotation(page.rotate)
+            .with_fonts(&mut font_cache)
+            .with_document(doc.file(), &page.resources)
+            .with_images(&mut image_cache)
+            .with_colors(&mut icc_cache)
+            .with_operand_stack_limit(doc.file().limits().max_operand_stack_depth as usize);
+
+        let display_list = interpreter.interpret(&content_bytes);
+
+        // Convert display list to PowerPoint slide
+        let options = zpdf_pptx_export::ConversionOptions::default();
+        let slide = zpdf_pptx_export::display_list_to_slide(
+            &display_list,
+            page_index,
+            &font_cache,
+            &image_cache,
+            &options,
+        )?;
+
+        println!(
+            "  Converted page {} ({} elements)",
+            page_index + 1,
+            slide.elements.len()
+        );
+        pptx_slides.push(slide);
+    }
+
+    // Create PowerPoint presentation
+    let presentation = zpdf_pptx_export::PptxPresentation {
+        slides: pptx_slides,
+        width_emu,
+        height_emu,
+    };
+
+    // Write to file
+    let writer = zpdf_pptx_export::PptxWriter::new(presentation);
+    let pptx_bytes = writer.write_to_bytes()?;
+    fs::write(&out_path, pptx_bytes).map_err(zpdf::Error::Io)?;
+
+    println!("Exported {} page(s) → {}", page_indices.len(), out_path);
+    println!(
+        "Note: Complex paths, patterns, and advanced PDF features may not be fully preserved."
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{collect_attachments, create_unique, parse_page_list, sanitize_filename};
