@@ -1,0 +1,31 @@
+[package]
+name = "zpdf-svg-export"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+description = "Vector-faithful PDF page to SVG export for zpdf"
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+zpdf-core.workspace = true
+zpdf-display-list.workspace = true
+zpdf-content.workspace = true
+zpdf-font.workspace = true
+zpdf-image.workspace = true
+zpdf-render.workspace = true
+
+tracing.workspace = true
+
+# PNG encoding for embedded raster images (data: URIs)
+image.workspace = true
+
+[dev-dependencies]
+# Fidelity harness: full pipeline + CPU oracle, and an independent SVG
+# rasterizer (resvg, pure Rust) to verify the exported SVG pixel-matches.
+zpdf = { workspace = true, features = ["cpu-render"] }
+resvg = "0.45"
