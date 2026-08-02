@@ -81,7 +81,7 @@ zune-jpeg = "0.5"
 hayro-jpeg2000 = { version = "0.3.5", default-features = false, features = ["std", "simd"] }
 # Pure-Rust ICC color management (profile parsing + device→sRGB transforms);
 # its only deps (num-traits, pxfm) are pure Rust as well.
-moxcms = "0.8"
+moxcms = "0.9"
 image = { version = "0.25", default-features = false, features = ["png"] }
 wgpu = "29"
 lyon = "1"
