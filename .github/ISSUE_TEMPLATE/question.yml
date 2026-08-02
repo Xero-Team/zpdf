@@ -1,0 +1,50 @@
+name: Usage question
+description: Ask a focused question about using or integrating zpdf.
+title: "[Question]: "
+labels:
+  - question
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Issues are best for focused questions that may improve the project documentation. For defects, use the bug report form instead.
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Preflight checks
+      options:
+        - label: I searched the README, API documentation, and open and closed issues.
+          required: true
+        - label: This question does not include credentials or confidential documents.
+          required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: zpdf version
+      placeholder: "0.11.0"
+    validations:
+      required: true
+
+  - type: textarea
+    id: goal
+    attributes:
+      label: What are you trying to do?
+      description: Describe the desired outcome and relevant constraints.
+    validations:
+      required: true
+
+  - type: textarea
+    id: attempts
+    attributes:
+      label: What have you tried?
+      description: Include a minimal code sample or command and any result or error.
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment and additional context
+      description: Include OS, target, feature flags, and any other details needed to answer.

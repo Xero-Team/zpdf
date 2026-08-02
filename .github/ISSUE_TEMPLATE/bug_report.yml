@@ -1,0 +1,121 @@
+name: Bug report
+description: Report a reproducible defect, regression, crash, or incorrect result.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve zpdf. Please file one problem per issue and provide the smallest reproducible example you can.
+
+        **Security vulnerabilities must be reported through [GitHub's private vulnerability reporting](https://github.com/Xero-Team/zpdf/security/advisories/new), not here.**
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Preflight checks
+      options:
+        - label: I searched open and closed issues and did not find an existing report.
+          required: true
+        - label: I tested the latest released version or the current `main` branch.
+          required: true
+        - label: This report does not contain passwords, keys, confidential PDFs, or other sensitive data.
+          required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected area
+      description: Select the closest component. Maintainers can refine this during triage.
+      options:
+        - PDF parsing and filters
+        - Document model and navigation
+        - Content interpretation and text extraction
+        - CPU rendering
+        - GPU / wgpu rendering
+        - Fonts, images, and color
+        - Writer, editing, encryption, or signatures
+        - CLI
+        - Desktop viewer
+        - SVG, PPTX, TXT, Markdown, or HTML export
+        - WebAssembly
+        - Other or unknown
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: zpdf version or commit
+      description: Include the crate version, release tag, or commit SHA.
+      placeholder: "0.11.0 or 6bda637"
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Include OS, architecture, Rust version, and relevant feature flags.
+      placeholder: "Windows 11 x86_64, rustc 1.xx, features: gpu-render"
+    validations:
+      required: true
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Problem summary
+      description: Describe the observed problem and its impact in a few sentences.
+      placeholder: Rendering page 3 produces a blank image when the page uses ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Provide exact commands or a small Rust snippet and the shortest deterministic steps.
+      placeholder: |
+        1. Run `zpdf render sample.pdf --page 3 --output page.png`.
+        2. Open `page.png`.
+        3. Observe that ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: State the expected result and, where useful, the PDF specification section or a known-good renderer/version.
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: State exactly what happened, including panic messages or incorrect output.
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Logs, backtrace, or sample PDF
+      description: |
+        Paste redacted logs/backtraces or attach a minimal PDF that you have permission to share. Set `RUST_BACKTRACE=1` for panics. Do not upload confidential documents; reduce or synthesize a fixture instead.
+      render: shell
+
+  - type: input
+    id: regression
+    attributes:
+      label: Regression range
+      description: If this worked before, provide the last known good and first known bad version or commit.
+      placeholder: "Works in 0.10.0; fails in 0.11.0"
+
+  - type: textarea
+    id: additional_context
+    attributes:
+      label: Additional context
+      description: Add related issues, screenshots, workarounds, or constraints not covered above.

@@ -1,0 +1,87 @@
+name: Feature request
+description: Propose a new capability or a focused improvement.
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the user problem before the implementation. Large API or architecture changes should be agreed on before a pull request is opened.
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Preflight checks
+      options:
+        - label: I searched open and closed issues for an existing request.
+          required: true
+        - label: I reviewed the [roadmap](https://github.com/Xero-Team/zpdf/blob/main/ROADMAP.md) and current documentation.
+          required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected area
+      options:
+        - PDF parsing and filters
+        - Document model and navigation
+        - Content interpretation and text extraction
+        - CPU rendering
+        - GPU / wgpu rendering
+        - Fonts, images, and color
+        - Writer, editing, encryption, or signatures
+        - CLI
+        - Desktop viewer
+        - Export formats
+        - WebAssembly
+        - Public API or cross-cutting architecture
+        - Other or unknown
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: Explain who needs this, what they are trying to do, and why the current behavior is insufficient.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the desired user-facing behavior or API. Include examples where possible.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Describe workarounds, prior art, or other designs and their tradeoffs.
+
+  - type: textarea
+    id: compatibility
+    attributes:
+      label: Compatibility and specification impact
+      description: Note public API changes, feature flags, file-format implications, and relevant PDF specification sections.
+
+  - type: dropdown
+    id: implementation
+    attributes:
+      label: Implementation intent
+      description: This helps maintainers plan and route the request; it is not a commitment.
+      options:
+        - I plan to implement this
+        - I may implement this with guidance
+        - I am proposing the idea only
+    validations:
+      required: true
+
+  - type: textarea
+    id: additional_context
+    attributes:
+      label: Additional context
+      description: Add mockups, sample files, links, benchmarks, or related work.

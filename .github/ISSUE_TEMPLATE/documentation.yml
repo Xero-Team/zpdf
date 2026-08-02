@@ -1,0 +1,42 @@
+name: Documentation issue
+description: Report inaccurate, missing, unclear, or outdated documentation.
+title: "[Docs]: "
+labels:
+  - documentation
+body:
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Preflight checks
+      options:
+        - label: I searched open and closed issues for an existing report.
+          required: true
+
+  - type: input
+    id: location
+    attributes:
+      label: Documentation location
+      description: Provide a repository path, heading, API item, or published URL.
+      placeholder: "README.md#library-usage or rustdoc path"
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What is wrong or missing?
+      description: Quote the relevant text when useful and explain the practical impact.
+    validations:
+      required: true
+
+  - type: textarea
+    id: correction
+    attributes:
+      label: Suggested correction
+      description: Describe what the documentation should say or demonstrate instead.
+
+  - type: textarea
+    id: additional_context
+    attributes:
+      label: Additional context
+      description: Add version information, screenshots, references, or related links.

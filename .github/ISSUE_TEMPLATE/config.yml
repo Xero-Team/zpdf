@@ -1,0 +1,9 @@
+blank_issues_enabled: false
+
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/Xero-Team/zpdf/security/advisories/new
+    about: Please report vulnerabilities privately. Do not open a public issue.
+  - name: Read the documentation
+    url: https://github.com/Xero-Team/zpdf#documentation
+    about: Check the README, API docs, changelog, and roadmap before filing an issue.

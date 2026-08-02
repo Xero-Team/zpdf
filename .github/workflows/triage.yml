@@ -1,0 +1,219 @@
+name: Triage
+
+on:
+  issues:
+    types: [opened, reopened]
+  pull_request_target:
+    # This workflow reads metadata and the base-branch label configuration. It
+    # never checks out or executes code from an untrusted pull request.
+    types: [opened, synchronize, reopened, edited]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: triage-${{ github.event.pull_request.number || github.event.issue.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  label:
+    name: Apply routing labels
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Ensure managed labels exist
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        with:
+          script: |
+            const labels = [
+              ["area: core", "5319e7", "Public API and shared foundations"],
+              ["area: parser", "1d76db", "PDF parsing, filters, and object decoding"],
+              ["area: document", "0e8a16", "Document model, navigation, and metadata"],
+              ["area: content", "006b75", "Content, display lists, fonts, images, and color"],
+              ["area: rendering", "d4c5f9", "CPU and shared rendering code"],
+              ["area: gpu", "7057ff", "wgpu rendering backend"],
+              ["area: writer", "c2e0c6", "PDF creation, editing, security, and signatures"],
+              ["area: export", "bfdadc", "SVG, PPTX, and other export formats"],
+              ["area: cli", "fbca04", "Command-line interface"],
+              ["area: viewer", "f9d0c4", "Desktop and interactive viewers"],
+              ["area: wasm", "c5def5", "WebAssembly bindings"],
+              ["area: ci", "000000", "Automation, workflows, and repository tooling"],
+              ["area: fuzzing", "b60205", "Fuzz targets, corpora, and parser hardening"],
+              ["tests", "d4c5f9", "Tests and test infrastructure"],
+              ["dependencies", "0366d6", "Dependency updates"],
+              ["performance", "f9d0c4", "Performance or resource-usage work"],
+              ["security", "b60205", "Security-sensitive work; do not disclose vulnerabilities publicly"],
+              ["breaking change", "d93f0b", "Requires migration or intentionally changes compatibility"],
+              ["needs: triage", "fbca04", "Needs maintainer classification and prioritization"],
+              ["stale", "ededed", "Inactive and awaiting updated information"],
+              ["no-stale", "1d76db", "Exempt from stale automation"],
+              ["size: XS", "c2e0c6", "Fewer than 50 changed lines, excluding Cargo.lock"],
+              ["size: S", "7fdbca", "50-199 changed lines, excluding Cargo.lock"],
+              ["size: M", "fbca04", "200-499 changed lines, excluding Cargo.lock"],
+              ["size: L", "f9a825", "500-999 changed lines, excluding Cargo.lock"],
+              ["size: XL", "d93f0b", "At least 1000 changed lines, excluding Cargo.lock"],
+            ];
+
+            for (const [name, color, description] of labels) {
+              try {
+                const current = await github.rest.issues.getLabel({
+                  ...context.repo,
+                  name,
+                });
+                if (current.data.color !== color || current.data.description !== description) {
+                  await github.rest.issues.updateLabel({
+                    ...context.repo,
+                    name,
+                    color,
+                    description,
+                  });
+                }
+              } catch (error) {
+                if (error.status !== 404) throw error;
+                await github.rest.issues.createLabel({
+                  ...context.repo,
+                  name,
+                  color,
+                  description,
+                });
+              }
+            }
+
+      - name: Label pull request by changed paths
+        if: github.event_name == 'pull_request_target'
+        uses: actions/labeler@b8dd2d9be0f68b860e7dae5dae7d772984eacd6d # v6
+        with:
+          repo-token: ${{ github.token }}
+          sync-labels: true
+
+      - name: Apply pull request size label
+        if: github.event_name == 'pull_request_target'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        with:
+          script: |
+            const sizeLabels = ["size: XS", "size: S", "size: M", "size: L", "size: XL"];
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              ...context.repo,
+              pull_number: context.payload.pull_request.number,
+              per_page: 100,
+            });
+
+            const changedLines = files.reduce((total, file) => {
+              if (file.filename === "Cargo.lock") return total;
+              return total + file.additions + file.deletions;
+            }, 0);
+
+            let target = "size: XL";
+            if (changedLines < 50) target = "size: XS";
+            else if (changedLines < 200) target = "size: S";
+            else if (changedLines < 500) target = "size: M";
+            else if (changedLines < 1000) target = "size: L";
+
+            const current = await github.paginate(github.rest.issues.listLabelsOnIssue, {
+              ...context.repo,
+              issue_number: context.payload.pull_request.number,
+              per_page: 100,
+            });
+            for (const label of current) {
+              if (sizeLabels.includes(label.name) && label.name !== target) {
+                await github.rest.issues.removeLabel({
+                  ...context.repo,
+                  issue_number: context.payload.pull_request.number,
+                  name: label.name,
+                });
+              }
+            }
+            if (!current.some((label) => label.name === target)) {
+              await github.rest.issues.addLabels({
+                ...context.repo,
+                issue_number: context.payload.pull_request.number,
+                labels: [target],
+              });
+            }
+            core.info(`Applied ${target} for ${changedLines} changed lines.`);
+
+      - name: Apply pull request type labels
+        if: github.event_name == 'pull_request_target'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        with:
+          script: |
+            const title = context.payload.pull_request.title || "";
+            const match = title.match(/^(feat|fix|perf|docs|test|ci)(?:\([^)]+\))?(!)?:\s+/i);
+            const typeLabels = {
+              feat: "enhancement",
+              fix: "bug",
+              perf: "performance",
+              docs: "documentation",
+              test: "tests",
+              ci: "area: ci",
+            };
+            const current = await github.paginate(github.rest.issues.listLabelsOnIssue, {
+              ...context.repo,
+              issue_number: context.payload.pull_request.number,
+              per_page: 100,
+            });
+            const isBreaking = match?.[2] === "!" ||
+              /\bBREAKING[ -]CHANGE\b/i.test(context.payload.pull_request.body || "");
+
+            const hasBreakingLabel = current.some((label) => label.name === "breaking change");
+            if (isBreaking && !hasBreakingLabel) {
+              await github.rest.issues.addLabels({
+                ...context.repo,
+                issue_number: context.payload.pull_request.number,
+                labels: ["breaking change"],
+              });
+            } else if (!isBreaking && hasBreakingLabel) {
+              await github.rest.issues.removeLabel({
+                ...context.repo,
+                issue_number: context.payload.pull_request.number,
+                name: "breaking change",
+              });
+            }
+
+            if (!match) {
+              core.info("No managed conventional title type found; leaving type labels unchanged.");
+              return;
+            }
+
+            const target = typeLabels[match[1].toLowerCase()];
+            if (!current.some((label) => label.name === target)) {
+              await github.rest.issues.addLabels({
+                ...context.repo,
+                issue_number: context.payload.pull_request.number,
+                labels: [target],
+              });
+            }
+
+      - name: Route new issue
+        if: github.event_name == 'issues'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        with:
+          script: |
+            const body = context.payload.issue.body || "";
+            const area = body.match(/^### Affected area\r?\n+\s*(.+)$/m)?.[1]?.trim();
+            const areaLabels = {
+              "PDF parsing and filters": "area: parser",
+              "Document model and navigation": "area: document",
+              "Content interpretation and text extraction": "area: content",
+              "CPU rendering": "area: rendering",
+              "GPU / wgpu rendering": "area: gpu",
+              "Fonts, images, and color": "area: content",
+              "Writer, editing, encryption, or signatures": "area: writer",
+              "CLI": "area: cli",
+              "Desktop viewer": "area: viewer",
+              "SVG, PPTX, TXT, Markdown, or HTML export": "area: export",
+              "Export formats": "area: export",
+              "WebAssembly": "area: wasm",
+              "Public API or cross-cutting architecture": "area: core",
+            };
+            const labels = ["needs: triage"];
+            if (areaLabels[area]) labels.push(areaLabels[area]);
+            await github.rest.issues.addLabels({
+              ...context.repo,
+              issue_number: context.payload.issue.number,
+              labels,
+            });

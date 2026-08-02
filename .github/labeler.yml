@@ -1,0 +1,96 @@
+# Path-based pull request labels. Keep these labels focused on review routing;
+# issue type and status labels are applied separately by the triage workflow.
+
+"area: core":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "crates/zpdf/**"
+          - "crates/zpdf-core/**"
+
+"area: parser":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "crates/zpdf-parser/**"
+
+"area: document":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "crates/zpdf-document/**"
+
+"area: content":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "crates/zpdf-content/**"
+          - "crates/zpdf-display-list/**"
+          - "crates/zpdf-font/**"
+          - "crates/zpdf-image/**"
+          - "crates/zpdf-color/**"
+
+"area: rendering":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "crates/zpdf-render/**"
+          - "crates/zpdf-render-cpu/**"
+
+"area: gpu":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "crates/zpdf-render-wgpu/**"
+          - "wgpu/**"
+
+"area: writer":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "crates/zpdf-writer/**"
+
+"area: export":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "crates/zpdf-pptx-export/**"
+          - "crates/zpdf-svg-export/**"
+
+"area: cli":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "crates/zpdf-cli/**"
+
+"area: viewer":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "crates/zpdf-viewer-gpui/**"
+
+"area: wasm":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "crates/zpdf-wasm/**"
+
+documentation:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "**/*.md"
+          - "docs/**"
+
+"area: ci":
+  - changed-files:
+      - any-glob-to-any-file:
+          - ".github/**"
+          - ".githooks/**"
+
+"area: fuzzing":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "fuzz/**"
+
+tests:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "tests/**"
+          - "**/tests/**"
+
+dependencies:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "Cargo.toml"
+          - "Cargo.lock"
+          - "**/Cargo.toml"
+          - ".github/dependabot.yml"

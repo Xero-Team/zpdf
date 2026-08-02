@@ -380,6 +380,11 @@ All pure Rust:
 
 ## Development
 
+Contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) for project
+scope, development setup, test expectations, and the pull request process. For
+usage help, see [SUPPORT.md](SUPPORT.md). Report vulnerabilities privately as
+described in [SECURITY.md](SECURITY.md).
+
 ```bash
 cargo build                                   # CPU-only (default)
 cargo build --features gpu-render             # include the wgpu backend

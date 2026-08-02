@@ -1,0 +1,14 @@
+# CODEOWNERS requests focused review for repository automation, dependency
+# policy, releases, and security-sensitive parser/writer foundations. A branch
+# ruleset must enable "Require review from Code Owners" to enforce approval.
+# GitHub uses last-match-wins semantics when this file is extended.
+
+/.github/ @YUZHEthefool
+/.githooks/ @YUZHEthefool
+/SECURITY.md @YUZHEthefool
+/Cargo.toml @YUZHEthefool
+/Cargo.lock @YUZHEthefool
+/crates/zpdf-core/ @YUZHEthefool
+/crates/zpdf-parser/ @YUZHEthefool
+/crates/zpdf-content/ @YUZHEthefool
+/crates/zpdf-writer/ @YUZHEthefool

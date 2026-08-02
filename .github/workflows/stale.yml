@@ -1,0 +1,39 @@
+name: Stale issues
+
+on:
+  schedule:
+    - cron: "37 2 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: stale-issues
+  cancel-in-progress: false
+
+jobs:
+  stale:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/stale@1e223db275d687790206a7acac4d1a11bd6fe629 # v10
+        with:
+          days-before-issue-stale: 90
+          days-before-issue-close: 30
+          stale-issue-label: stale
+          stale-issue-message: |
+            This issue has had no activity for 90 days and is now marked `stale`.
+
+            If it is still relevant, please add current-version reproduction details or other new information. It will close automatically in 30 days without an update.
+          close-issue-message: |
+            Closing after an additional 30 days without activity. If the problem still occurs on the latest zpdf release, please open a fresh issue with an updated reproduction and link back to this one.
+          close-issue-reason: not_planned
+          exempt-issue-labels: security,no-stale,good first issue,help wanted
+          exempt-all-assignees: true
+          remove-stale-when-updated: true
+          operations-per-run: 100
+          days-before-pr-stale: -1
+          days-before-pr-close: -1
+          enable-statistics: true
