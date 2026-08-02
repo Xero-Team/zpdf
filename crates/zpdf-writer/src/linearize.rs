@@ -178,15 +178,35 @@ pub fn linearize_pdf(source: &PdfFile) -> Result<Vec<u8>> {
         emit(&mut out, num, obj)?;
     }
 
-    // (6) Main xref: object 0 free + objects 1 (lin dict) and 2 (hint stream).
+    // (6) Main xref: object 0 (free) plus every object the first-page table
+    // does *not* cover.
+    //
+    // Annex F splits the cross-reference in two: the table at the top covers
+    // the first-page section (objects 1, 2 and the first-page set), and this
+    // one covers the remainder. Emitting objects 1 and 2 again here left
+    // every object after the first-page set — 11..25 on a four-page file —
+    // present in the body and absent from *both* tables, so `/Size` was 3
+    // while 25 objects existed. Readers that trust the table then fail:
+    // `MuPDF: object out of range (11 0 R); xref size 11`, three of four
+    // pages dangling, `qpdf --check-linearization` reporting `/N does not
+    // match number of pages`.
     let main_xref_ofs = out.len() as u64;
+    let first_rest_num = 3 + first_objs.len() as u32;
     let mut main_xref = String::new();
-    main_xref.push_str("xref\n0 3\n");
-    main_xref.push_str("0000000000 65535 f \n");
-    main_xref.push_str(&format!("{lin_ofs:010} 00000 n \n"));
-    main_xref.push_str(&format!("{hint_ofs:010} 00000 n \n"));
+    main_xref.push_str("xref\n0 1\n0000000000 65535 f \n");
+    if !rest_objs.is_empty() {
+        main_xref.push_str(&format!("{} {}\n", first_rest_num, rest_objs.len()));
+        for id in &rest_objs {
+            let num = number[id];
+            main_xref.push_str(&format!("{:010} 00000 n \n", offsets[&num]));
+        }
+    }
+    // /Size is the total object count, and /Root belongs here too: a reader
+    // that starts from the main xref (rather than following /Prev from the
+    // first) has no other way to find the catalog.
     main_xref.push_str(&format!(
-        "trailer\n<< /Size 3 >>\nstartxref\n{first_xref_ofs}\n%%EOF\n"
+        "trailer\n<< /Size {} /Root {} 0 R >>\nstartxref\n{first_xref_ofs}\n%%EOF\n",
+        total_objects, number[&root]
     ));
     out.extend_from_slice(main_xref.as_bytes());
     let total_len = out.len() as u64; // /L
