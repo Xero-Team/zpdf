@@ -48,7 +48,7 @@ pub struct CpuRenderer<'a> {
     /// disables it. Legit pages finish in well under the default and never hit it.
     render_budget: Option<std::time::Duration>,
     /// Absolute deadline for the current page (set in `begin_page`).
-    deadline: Option<std::time::Instant>,
+    deadline: Option<zpdf_core::time::Instant>,
     /// Set once the page deadline passes; further draws are skipped so the
     /// command loop drains quickly and the page returns partially rendered.
     over_budget: bool,
@@ -1772,7 +1772,9 @@ impl<'a> RenderBackend for CpuRenderer<'a> {
         self.soft_mask_planes.clear();
         self.soft_mask_cache_bytes = 0;
         self.downscaled_images.clear();
-        self.deadline = self.render_budget.map(|d| std::time::Instant::now() + d);
+        self.deadline = self
+            .render_budget
+            .map(|d| zpdf_core::time::Instant::now() + d);
 
         // ceil(), not truncation: a 595x842pt page at 110 DPI is 909.03x1286.6px
         // and must produce a 910x1287 raster (pdfium semantics) so no content is
@@ -1841,7 +1843,7 @@ impl<'a> RenderBackend for CpuRenderer<'a> {
         // raster), so a coarse stride would never sample the clock in time.
         // Instant::now is cheap enough to call per command.
         if let Some(deadline) = self.deadline {
-            if std::time::Instant::now() >= deadline {
+            if zpdf_core::time::Instant::now() >= deadline {
                 self.over_budget = true;
                 tracing::warn!("render exceeded time budget; truncating page");
             }

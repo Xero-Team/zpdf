@@ -264,7 +264,9 @@ impl IncrementalWriter {
         ];
         let br_open = br_at + b"/ByteRange ".len(); // offset of `[`
         for (i, &v) in ranges.iter().enumerate() {
-            if v > 9_999_999_999 {
+            // Compare in u64: usize is 32-bit on wasm32, where the ten-digit
+            // literal would not even fit the type.
+            if v as u64 > 9_999_999_999 {
                 return Err(invalid_data("file too large for ByteRange slots").into());
             }
             let slot = br_open + 1 + i * 11;

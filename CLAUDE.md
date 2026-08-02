@@ -20,7 +20,7 @@ Features: `cpu-render` (default, tiny-skia), `gpu-render` (wgpu). Set on the roo
 
 ## Architecture
 
-14-crate workspace. Strict one-direction dependency flow — **render backends never depend on the parser**.
+18-crate workspace. Strict one-direction dependency flow — **render backends never depend on the parser**.
 
 ```
 PDF bytes
@@ -37,9 +37,15 @@ Supporting crates feed into zpdf-content: **zpdf-font** (Type1/TrueType/CID, CMa
 
 **zpdf-writer** is the authoring/editing crate (depends on parser + document + content, never on renderers): `DocumentBuilder` (creation from scratch, TrueType embedding + sparse-glyf subsetting), `IncrementalWriter` (ISO §7.5.6 updates — annotations with baked /AP, forms, stamps, redaction, page ops, signing; encrypted docs via `new_with_password`), `rewrite_pdf` (GC/decrypt/compress/downsample/encrypt-on-save), `linearize_pdf` (Annex F), `append_document` (merge incl. outlines/AcroForm/OCGs).
 
+**zpdf-pptx-export** converts DisplayList to editable PowerPoint (.pptx) — text stays editable with font/size/color/style preserved, shapes (rectangles/ellipses/lines with fill/stroke) and images render as native PowerPoint elements rather than flattening to raster. Separate crate from rendering; depends only on display-list.
+
 **zpdf** is the public facade crate — re-exports all APIs, feature-gates `cpu`/`gpu` modules.
 
-**zpdf-cli** is the binary crate with subcommands: read — `info`, `dump`, `render`, `text`, `search`, `convert`, `export-pptx`, `tables`, `forms`, `outline`, `links`, `struct`, `signatures` (`--trust` for cert chains), `attachments`, `validate` (PDF/A), `compare`, `debug-stream`; write — `fill`, `merge`, `split`, `optimize` (`--encrypt`, `--max-image-dim`, `--linearize`), `annotate`, `redact`, `sign`, `pages`, `set-meta`, `stamp`.
+**zpdf-svg-export** converts a page's DisplayList to vector-faithful standalone SVG (paths/glyph outlines stay vectors, images embed as base64 PNG, clips/soft masks/blend modes map to SVG equivalents). Mirrors CPU-backend semantics; verified against the CPU oracle via resvg rasterization (`tests/fidelity.rs`). NB: never wrap content in `<g clip-path>` — in SVG that isolates blending; clips are attribute chains on painted elements.
+
+**zpdf-wasm** is the WebAssembly crate (`wasm32-unknown-unknown` target + `wasm-bindgen`). Exposes `Pdf.open` / `render_page` / `page_text` / `page_svg` to JS (browser or Node). Pure Rust with zero C deps is what makes this build possible where native PDF libraries struggle. Wall-clock budgets disabled (bare wasm32 has no `Instant::now`); deterministic `ParseLimits` still bound adversarial inputs. `www/` contains a drop-in browser demo; `build-web.sh` compiles + generates ES-module bindings.
+
+**zpdf-cli** is the binary crate with subcommands: read — `info`, `dump`, `render`, `text`, `search`, `convert`, `export-pptx`, `export-svg`, `tables`, `forms`, `outline`, `links`, `struct`, `signatures` (`--trust` for cert chains), `attachments`, `validate` (PDF/A), `compare`, `debug-stream`; write — `fill`, `merge`, `split`, `optimize` (`--encrypt`, `--max-image-dim`, `--linearize`), `annotate`, `redact`, `sign`, `pages`, `set-meta`, `stamp`.
 
 **zpdf-viewer-gpui** is a standalone native desktop reader built on Zed's GPUI (`publish = false`); it depends on the `zpdf` facade with `gpu-render` and renders pages through the wgpu backend. Not part of the parsing/rendering dependency chain. (`zpdf-render-wgpu` also ships a lighter winit-based `viewer` example.)
 

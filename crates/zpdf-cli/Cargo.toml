@@ -24,6 +24,7 @@ gpu = ["zpdf/gpu-render"]
 zpdf = { workspace = true, default-features = false }
 zpdf-writer.workspace = true
 zpdf-pptx-export.workspace = true
+zpdf-svg-export.workspace = true
 # Direct CLI dep (NOT feature-gated): compare/text/render use image::open/RgbaImage.
 image.workspace = true
 tracing-subscriber.workspace = true

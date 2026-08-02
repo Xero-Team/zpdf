@@ -20,7 +20,7 @@ fn main() {
     if args.len() < 2 {
         eprintln!("Usage: zpdf <command> [args...]");
         eprintln!(
-            "Commands: info, dump, render, text, search, convert, tables, forms, outline, links, struct, signatures, attachments, compare, debug-stream, fill, merge, split, optimize, annotate, sign, pages, set-meta, stamp, export-pptx"
+            "Commands: info, dump, render, text, search, convert, tables, forms, outline, links, struct, signatures, attachments, compare, debug-stream, fill, merge, split, optimize, annotate, sign, pages, set-meta, stamp, export-pptx, export-svg"
         );
         process::exit(1);
     }
@@ -53,6 +53,7 @@ fn main() {
         "set-meta" => cmd_set_meta(&args[2..]),
         "stamp" => cmd_stamp(&args[2..]),
         "export-pptx" => cmd_export_pptx(&args[2..]),
+        "export-svg" => cmd_export_svg(&args[2..]),
         other => {
             eprintln!("Unknown command: {other}");
             process::exit(1);
@@ -2967,6 +2968,135 @@ fn cmd_export_pptx(args: &[String]) -> zpdf::Result<()> {
     println!(
         "Note: Complex paths, patterns, and advanced PDF features may not be fully preserved."
     );
+    Ok(())
+}
+
+fn cmd_export_svg(args: &[String]) -> zpdf::Result<()> {
+    let (args, password) = extract_password(args);
+    if args.is_empty() {
+        eprintln!("Usage: zpdf export-svg <file.pdf> [-o <output.svg>] [-p <page>|--pages <list>|--all] [--no-background] [--password <pw>]");
+        eprintln!("  Exports each selected page as a standalone SVG. With multiple pages,");
+        eprintln!("  output files are numbered <name>-p<N>.svg.");
+        process::exit(1);
+    }
+
+    let pdf_path = &args[0];
+    let mut output: Option<String> = None;
+    let mut pages_spec: Option<String> = None;
+    let mut all = false;
+    let mut background = true;
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-o" => {
+                output = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "-p" | "--pages" => {
+                pages_spec = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "--all" => {
+                all = true;
+                i += 1;
+            }
+            "--no-background" => {
+                background = false;
+                i += 1;
+            }
+            other => {
+                eprintln!("Unknown flag: {other}");
+                process::exit(1);
+            }
+        }
+    }
+
+    let doc = open_document(pdf_path, password.as_deref())?;
+    let total_pages = doc.page_count();
+
+    let page_indices: Vec<usize> = if let Some(spec) = pages_spec {
+        parse_page_list(&spec).unwrap_or_else(|error| {
+            eprintln!("invalid page list: {error}");
+            process::exit(1);
+        })
+    } else if all {
+        (0..total_pages).collect()
+    } else {
+        vec![0]
+    };
+    for &idx in &page_indices {
+        if idx >= total_pages {
+            eprintln!(
+                "page {} is out of range; document has {total_pages} pages",
+                idx + 1
+            );
+            process::exit(1);
+        }
+    }
+
+    // Single page → one file (default `<stem>.svg`); multiple pages → numbered
+    // `<base>-p<N>.svg`, where `<base>` is `-o` minus its `.svg` extension.
+    let stem = Path::new(pdf_path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("output")
+        .to_string();
+    let single_out = output.clone().unwrap_or_else(|| format!("{stem}.svg"));
+    let multi_base = output
+        .as_deref()
+        .map(|o| o.strip_suffix(".svg").unwrap_or(o).to_string())
+        .unwrap_or(stem);
+
+    let options = zpdf_svg_export::SvgOptions {
+        background: background.then(zpdf::display_list::Color::white),
+        ..Default::default()
+    };
+
+    let mut icc_cache = zpdf::IccCache::new();
+    for &page_index in &page_indices {
+        let page = doc.page(page_index)?;
+        let page_box = page.effective_box();
+
+        let mut font_cache = doc.load_page_fonts(&page);
+        let mut image_cache = zpdf::ImageCache::new();
+
+        let content_bytes = doc.page_content_bytes(&page)?;
+        let interpreter = zpdf::ContentInterpreter::new(page_box)
+            .with_page_rotation(page.rotate)
+            .with_fonts(&mut font_cache)
+            .with_document(doc.file(), &page.resources)
+            .with_images(&mut image_cache)
+            .with_colors(&mut icc_cache)
+            .with_operand_stack_limit(doc.file().limits().max_operand_stack_depth as usize);
+        let display_list = interpreter.interpret(&content_bytes);
+
+        let svg = zpdf_svg_export::display_list_to_svg(
+            &display_list,
+            &font_cache,
+            &image_cache,
+            &options,
+        );
+
+        let out_path = if page_indices.len() == 1 {
+            single_out.clone()
+        } else {
+            format!("{multi_base}-p{}.svg", page_index + 1)
+        };
+        if out_path == *pdf_path {
+            eprintln!("Output path must differ from input");
+            process::exit(1);
+        }
+        fs::write(&out_path, &svg).map_err(zpdf::Error::Io)?;
+        println!(
+            "  Page {} → {} ({} bytes)",
+            page_index + 1,
+            out_path,
+            svg.len()
+        );
+    }
+
+    println!("Exported {} page(s) as SVG", page_indices.len());
     Ok(())
 }
 

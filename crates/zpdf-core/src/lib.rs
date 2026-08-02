@@ -3,6 +3,7 @@ mod error;
 mod geometry;
 mod limits;
 mod object;
+pub mod time;
 
 pub use color::{cmyk_to_rgb_naive, rgb_to_cmyk_naive};
 pub use error::{Error, Result};

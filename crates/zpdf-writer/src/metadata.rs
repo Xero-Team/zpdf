@@ -5,8 +5,6 @@
 //! (the trailer keeps pointing at it); a direct or absent `/Info` is replaced
 //! by a fresh object the new trailer points at.
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use zpdf_core::{ObjectId, PdfDict, PdfName, PdfObject, PdfString, Result};
 
 use crate::IncrementalWriter;
@@ -112,10 +110,9 @@ fn pdf_date_now() -> String {
 /// The current UTC time as bare `YYYYMMDDHHMMSS` (no `D:` prefix/zone),
 /// shared with the signature `/M` date.
 pub(crate) fn pdf_date_now_raw() -> String {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    // zpdf_core::time::unix_seconds is wasm-safe (epoch 0 on bare wasm32,
+    // where SystemTime::now() would panic).
+    let secs = zpdf_core::time::unix_seconds();
     let days = (secs / 86_400) as i64;
     let rem = secs % 86_400;
     let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);

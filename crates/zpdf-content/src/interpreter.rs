@@ -108,7 +108,7 @@ pub struct ContentInterpreter<'a> {
     /// tiling-pattern cell) costs little in operators or emitted commands yet
     /// much in time, so the count budgets above cannot bound it. Sampled at the
     /// loop checkpoints. `None` disables it.
-    deadline: Option<std::time::Instant>,
+    deadline: Option<zpdf_core::time::Instant>,
     /// Latches once `deadline` passes, so the clock is read only occasionally.
     timed_out: bool,
     /// `ops_executed` at the last clock sample (throttles `Instant::now`).
@@ -575,7 +575,7 @@ impl<'a> ContentInterpreter<'a> {
             if let Some(deadline) = self.deadline {
                 if self.ops_executed.wrapping_sub(self.last_clock_op) >= 16 {
                     self.last_clock_op = self.ops_executed;
-                    if std::time::Instant::now() >= deadline {
+                    if zpdf_core::time::Instant::now() >= deadline {
                         self.timed_out = true;
                         tracing::warn!("content interpret exceeded time budget; truncating page");
                     }
@@ -730,7 +730,7 @@ impl<'a> ContentInterpreter<'a> {
     pub fn interpret(mut self, content: &[u8]) -> DisplayList {
         // Arm the interpret wall-clock backstop (unless already set by a caller).
         if self.deadline.is_none() {
-            self.deadline = Some(std::time::Instant::now() + INTERPRET_BUDGET);
+            self.deadline = Some(zpdf_core::time::Instant::now() + INTERPRET_BUDGET);
         }
         let tokenizer = ContentTokenizer::new(content);
 

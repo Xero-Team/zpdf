@@ -49,6 +49,15 @@ GPU (wgpu) renderers whose output matches within <1% of pixels.
   (rectangles, ellipses, lines with fill/stroke), and embedded images as native
   PowerPoint elements rather than rasterizing to images (`zpdf-pptx-export`,
   CLI `export-pptx`).
+- **SVG export** — vector-faithful page → SVG conversion (`zpdf-svg-export`,
+  CLI `export-svg`). Paths, glyphs, and strokes stay vectors; images embed as
+  base64 PNG; clips/soft masks/blend modes map to SVG equivalents. Verified
+  against the CPU backend via resvg rasterization (zero systematic drift).
+- **WebAssembly** — the full read pipeline (parse + CPU render + text + SVG)
+  compiles to `wasm32-unknown-unknown` (`zpdf-wasm`). Pure Rust with zero C
+  dependencies makes this feasible where native PDF libraries fail. Includes a
+  fully client-side browser demo (`www/`) with drag-drop, page navigation, text
+  extraction, and SVG export — nothing uploads.
 - **Images** — 1/2/4/8/16-bpc, `/Decode`, soft masks, stencil & color-key
   masks, Indexed palettes, CMYK JPEG; bilinear sampling with box-filter
   minification.
@@ -115,7 +124,7 @@ GPU (wgpu) renderers whose output matches within <1% of pixels.
 - **GPU rendering** — wgpu backend (fills, strokes, clips, text, images, blend
   groups); matches the CPU renderer within <1% pixels.
 - **Tooling** — CLI with read commands
-  (`info`/`render`/`text`/`search`/`convert`/`export-pptx`/`tables`/`forms`/`outline`/`links`/`struct`/`attachments`/`signatures`/`validate`/`compare`/`dump`/`debug-stream`)
+  (`info`/`render`/`text`/`search`/`convert`/`export-pptx`/`export-svg`/`tables`/`forms`/`outline`/`links`/`struct`/`attachments`/`signatures`/`validate`/`compare`/`dump`/`debug-stream`)
   and write commands
   (`fill`/`merge`/`split`/`optimize`/`annotate`/`redact`/`sign`/`pages`/`set-meta`/`stamp`),
   an interactive winit viewer example, and a native GPUI desktop reader
@@ -176,6 +185,10 @@ cargo run -p zpdf-cli -- convert document.pdf -o document.txt --mode text
 cargo run -p zpdf-cli -- convert document.pdf -o document.md --mode rich
 cargo run -p zpdf-cli -- convert document.pdf -o document.html --mode rich
 
+# Export pages as editable PowerPoint or vector SVG
+cargo run -p zpdf-cli -- export-pptx document.pdf -o presentation.pptx
+cargo run -p zpdf-cli -- export-svg document.pdf -p 1-5 -o page-%d.svg
+
 # Create, edit, and secure PDFs
 cargo run -p zpdf-cli -- merge a.pdf b.pdf -o merged.pdf        # pages + outlines + forms + layers
 cargo run -p zpdf-cli -- annotate document.pdf -p 1 --kind highlight --rect 70,690,340,725 -o annotated.pdf
@@ -224,6 +237,33 @@ page_img.save_png("out.png")?;
 Switch `zpdf::cpu::CpuRenderer` for `zpdf::gpu::WgpuRenderer` (with `features = ["gpu-render"]`)
 to render on the GPU — everything upstream is identical. See [docs/library.md](docs/library.md).
 
+### Exporting to SVG
+
+```rust
+use zpdf::svg::display_list_to_svg;
+
+let svg = display_list_to_svg(&display_list, &fonts, &images, &Default::default());
+std::fs::write("page.svg", svg)?;
+```
+
+### WebAssembly
+
+```bash
+cd crates/zpdf-wasm
+bash build-web.sh
+python -m http.server -d www 8080
+```
+
+```javascript
+import init, { Pdf } from "./pkg/zpdf_wasm.js";
+await init();
+
+const pdf = Pdf.open(pdfBytes);
+const bitmap = pdf.render_page(0, 150.0 / 72.0);  // page 0, 150 DPI
+const text = pdf.page_text(0);
+const svg = pdf.page_svg(0);
+```
+
 ### Creating a PDF from scratch
 
 ```rust
@@ -242,7 +282,7 @@ std::fs::write("hello.pdf", builder.build()?)?;
 
 ## Architecture
 
-15-crate workspace with a strict one-direction dependency flow. **Render backends
+18-crate workspace with a strict one-direction dependency flow. **Render backends
 depend only on `zpdf-display-list`, never on the parser** — parsing and rendering stay
 fully decoupled.
 
@@ -260,6 +300,9 @@ zpdf-core            Shared types: ObjectId, PdfObject, Matrix, Rect, Error, Par
   │   └─ zpdf-render-wgpu  wgpu backend (+ winit viewer example)
   ├─ zpdf-writer     PDF authoring & editing: DocumentBuilder, incremental updates,
   │                  merge, redaction, encryption, subsetting, linearization
+  ├─ zpdf-pptx-export  DisplayList → editable PowerPoint
+  ├─ zpdf-svg-export   DisplayList → vector-faithful SVG
+  ├─ zpdf-wasm       WebAssembly bindings (parse + render + text + SVG in browser/Node)
   ├─ zpdf-cli        CLI tool
   ├─ zpdf-viewer-gpui  Native desktop reader (GPUI; depends on the facade)
   └─ zpdf            Facade crate (re-exports; feature-gates cpu / gpu)
@@ -311,6 +354,9 @@ zpdf-core            Shared types: ObjectId, PdfObject, Matrix, Rect, Error, Par
 | Document merge incl. outlines, AcroForm fields, OCG configs | ✅ |
 | Linearization ("fast web view", Annex F) | ✅ |
 | PDF/A-1b / PDF/A-2b validation (best-effort rule engine) | ✅ |
+| PowerPoint (PPTX) export (editable text/shapes/images) | ✅ |
+| SVG export (vector-faithful paths/glyphs/clips/masks) | ✅ |
+| WebAssembly (parse + render + text + SVG in browser/Node) | ✅ |
 
 ## Dependencies
 
@@ -328,6 +374,8 @@ All pure Rust:
 | `image` | PNG I/O |
 | `winnow` | Parsing helpers |
 | `wgpu` + `lyon` + `pollster` | GPU rendering (`gpu-render` feature) |
+| `wasm-bindgen` | WebAssembly bindings (`zpdf-wasm`) |
+| `resvg` | SVG rasterizer (test dependency for SVG export fidelity) |
 | `winit` | Viewer example only (dev-dependency) |
 
 ## Development
