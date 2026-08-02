@@ -23,4 +23,4 @@ console_error_panic_hook = "0.1"
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # p256/p384 (signature verification) pull rand_core → getrandom, which refuses
 # to compile on wasm32-unknown-unknown unless the JS entropy backend is enabled.
-getrandom = { version = "0.2", features = ["js"] }
+getrandom = { version = "0.4", features = ["js"] }

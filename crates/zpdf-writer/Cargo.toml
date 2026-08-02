@@ -30,7 +30,7 @@ p256 = { workspace = true, features = ["pkcs8"] }
 # Encryption on save (Standard security handler, RC4 + AES-CBC).
 aes.workspace = true
 cbc = { workspace = true, features = ["alloc"] }
-getrandom = "0.2"
+getrandom = "0.4"
 
 [dev-dependencies]
 # Deterministic RSA keygen for the signing round-trip tests.
