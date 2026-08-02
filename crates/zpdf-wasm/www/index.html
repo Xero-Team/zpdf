@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>zpdf — PDF rendering in the browser (pure Rust → WebAssembly)</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+    display: flex; flex-direction: column; height: 100vh;
+  }
+  header {
+    padding: 10px 16px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap;
+    border-bottom: 1px solid color-mix(in srgb, currentColor 20%, transparent);
+  }
+  header h1 { font-size: 16px; margin: 0 8px 0 0; }
+  header .muted { opacity: .65; font-size: 12px; }
+  main { flex: 1; display: flex; min-height: 0; }
+  #viewer {
+    flex: 1; overflow: auto; display: flex; align-items: flex-start; justify-content: center;
+    padding: 16px; background: color-mix(in srgb, currentColor 6%, transparent);
+  }
+  #page-canvas { box-shadow: 0 2px 12px rgba(0,0,0,.35); background: white; }
+  #sidebar {
+    width: 34%; min-width: 260px; max-width: 560px; border-left: 1px solid
+    color-mix(in srgb, currentColor 20%, transparent); display: none; flex-direction: column;
+  }
+  #sidebar.open { display: flex; }
+  #sidebar h2 { font-size: 13px; margin: 0; padding: 10px 12px 0; }
+  #text-out {
+    flex: 1; margin: 8px 12px 12px; white-space: pre-wrap; overflow: auto; font: 12px/1.45
+    ui-monospace, Consolas, monospace; border: 1px solid
+    color-mix(in srgb, currentColor 20%, transparent); border-radius: 6px; padding: 8px;
+  }
+  button, input[type="number"] {
+    font: inherit; padding: 4px 10px; border-radius: 6px; cursor: pointer;
+    border: 1px solid color-mix(in srgb, currentColor 30%, transparent); background: transparent;
+  }
+  button:disabled { opacity: .4; cursor: default; }
+  #drop-hint {
+    margin: auto; text-align: center; opacity: .6; padding: 40px;
+    border: 2px dashed color-mix(in srgb, currentColor 30%, transparent); border-radius: 12px;
+  }
+  #status { font-size: 12px; opacity: .75; margin-left: auto; }
+  .drag-over #drop-hint { border-color: #4a9eff; color: #4a9eff; }
+</style>
+</head>
+<body>
+<header>
+  <h1>zpdf<span class="muted"> · wasm demo</span></h1>
+  <input type="file" id="file-input" accept="application/pdf">
+  <button id="prev" disabled>◀</button>
+  <span id="page-label" class="muted">–</span>
+  <button id="next" disabled>▶</button>
+  <button id="zoom-out" disabled>−</button>
+  <span id="zoom-label" class="muted">100%</span>
+  <button id="zoom-in" disabled>+</button>
+  <button id="btn-text" disabled>Extract text</button>
+  <button id="btn-svg" disabled>Download SVG</button>
+  <span id="status">loading wasm…</span>
+</header>
+<main>
+  <div id="viewer">
+    <div id="drop-hint">Drop a PDF here<br><span class="muted">parsed &amp; rendered entirely in your browser — nothing is uploaded</span></div>
+    <canvas id="page-canvas" hidden></canvas>
+  </div>
+  <div id="sidebar">
+    <h2>Extracted text (reading order)</h2>
+    <div id="text-out"></div>
+  </div>
+</main>
+<script type="module">
+import init, { Pdf } from "./pkg/zpdf_wasm.js";
+
+const $ = (id) => document.getElementById(id);
+const status = (msg) => { $("status").textContent = msg; };
+
+let pdf = null;
+let pageIndex = 0;
+let zoom = 1.0;
+
+await init();
+status("ready — open a PDF");
+
+async function openFile(file) {
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  if (pdf) { pdf.free(); pdf = null; }
+  try {
+    pdf = Pdf.open(bytes);
+  } catch (e) {
+    const msg = String(e);
+    if (/password/i.test(msg)) {
+      const pw = prompt("This PDF is encrypted. Password:");
+      if (pw === null) { status("open cancelled"); return; }
+      try { pdf = Pdf.open_with_password(bytes, pw); }
+      catch (e2) { status("open failed: " + e2); return; }
+    } else {
+      status("open failed: " + msg);
+      return;
+    }
+  }
+  pageIndex = 0;
+  const title = pdf.title;
+  document.title = (title ? title + " — " : "") + "zpdf wasm demo";
+  for (const id of ["prev", "next", "zoom-in", "zoom-out", "btn-text", "btn-svg"]) $(id).disabled = false;
+  $("drop-hint").hidden = true;
+  renderPage();
+}
+
+function renderPage() {
+  if (!pdf) return;
+  const t0 = performance.now();
+  // scale: CSS zoom × devicePixelRatio, relative to the PDF's 72 dpi space.
+  const dpr = window.devicePixelRatio || 1;
+  const bitmap = pdf.render_page(pageIndex, zoom * dpr);
+  const w = bitmap.width, h = bitmap.height;
+  const canvas = $("page-canvas");
+  canvas.width = w;
+  canvas.height = h;
+  canvas.style.width = (w / dpr) + "px";
+  canvas.style.height = (h / dpr) + "px";
+  canvas.hidden = false;
+  const image = new ImageData(new Uint8ClampedArray(bitmap.rgba().buffer), w, h);
+  canvas.getContext("2d").putImageData(image, 0, 0);
+  bitmap.free();
+  const ms = (performance.now() - t0).toFixed(0);
+  $("page-label").textContent = `${pageIndex + 1} / ${pdf.page_count}`;
+  $("zoom-label").textContent = Math.round(zoom * 100) + "%";
+  status(`rendered ${w}×${h}px in ${ms} ms`);
+}
+
+$("file-input").addEventListener("change", (e) => {
+  if (e.target.files[0]) openFile(e.target.files[0]);
+});
+document.body.addEventListener("dragover", (e) => { e.preventDefault(); document.body.classList.add("drag-over"); });
+document.body.addEventListener("dragleave", () => document.body.classList.remove("drag-over"));
+document.body.addEventListener("drop", (e) => {
+  e.preventDefault();
+  document.body.classList.remove("drag-over");
+  const f = e.dataTransfer.files[0];
+  if (f) openFile(f);
+});
+$("prev").addEventListener("click", () => { if (pdf && pageIndex > 0) { pageIndex--; renderPage(); } });
+$("next").addEventListener("click", () => { if (pdf && pageIndex + 1 < pdf.page_count) { pageIndex++; renderPage(); } });
+$("zoom-in").addEventListener("click", () => { zoom = Math.min(zoom * 1.25, 6); renderPage(); });
+$("zoom-out").addEventListener("click", () => { zoom = Math.max(zoom / 1.25, 0.25); renderPage(); });
+
+$("btn-text").addEventListener("click", () => {
+  if (!pdf) return;
+  const t0 = performance.now();
+  const text = pdf.page_text(pageIndex);
+  $("sidebar").classList.add("open");
+  $("text-out").textContent = text || "(no text on this page)";
+  status(`extracted ${text.length} chars in ${(performance.now() - t0).toFixed(0)} ms`);
+});
+
+$("btn-svg").addEventListener("click", () => {
+  if (!pdf) return;
+  const t0 = performance.now();
+  const svg = pdf.page_svg(pageIndex);
+  const blob = new Blob([svg], { type: "image/svg+xml" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `page-${pageIndex + 1}.svg`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+  status(`exported SVG (${(svg.length / 1024).toFixed(1)} KiB) in ${(performance.now() - t0).toFixed(0)} ms`);
+});
+
+document.addEventListener("keydown", (e) => {
+  if (e.key === "ArrowLeft") $("prev").click();
+  if (e.key === "ArrowRight") $("next").click();
+});
+</script>
+</body>
+</html>
