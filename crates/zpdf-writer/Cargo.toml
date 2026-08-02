@@ -34,4 +34,4 @@ getrandom = "0.2"
 
 [dev-dependencies]
 # Deterministic RSA keygen for the signing round-trip tests.
-rand_chacha = "0.3"
+rand_chacha = "0.10"

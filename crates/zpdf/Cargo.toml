@@ -41,4 +41,4 @@ sha2.workspace = true
 # digital-signature crypto-verification tests (mirrors the verify-side deps).
 rsa.workspace = true
 p256.workspace = true
-rand_chacha = "0.3"
+rand_chacha = "0.10"
