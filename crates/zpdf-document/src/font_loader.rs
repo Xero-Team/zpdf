@@ -76,19 +76,17 @@ fn substitute_hints(
     dict: &zpdf_core::PdfDict,
 ) -> zpdf_font::system::SubstituteHints {
     let mut hints = zpdf_font::system::SubstituteHints::default();
-    if let Ok(fd_ref) = dict.get_ref("FontDescriptor") {
-        if let Ok(fd) = file.resolve(fd_ref) {
-            if let Ok(fd) = fd.as_dict() {
-                if let Ok(flags) = fd.get_i64("Flags") {
-                    hints.fixed_pitch = flags & 1 != 0;
-                    hints.serif = flags & 2 != 0;
-                    hints.italic = flags & 64 != 0;
-                    hints.bold = flags & (1 << 18) != 0; // ForceBold
-                }
-                if let Ok(w) = fd.get_f64("StemV") {
-                    hints.bold |= w >= 160.0;
-                }
-            }
+    // /FontDescriptor must be indirect per spec, but AutoCAD and other producers
+    // inline it; resolve_dict accepts both forms.
+    if let Some(fd) = resolve_dict(file, dict, "FontDescriptor") {
+        if let Ok(flags) = fd.get_i64("Flags") {
+            hints.fixed_pitch = flags & 1 != 0;
+            hints.serif = flags & 2 != 0;
+            hints.italic = flags & 64 != 0;
+            hints.bold = flags & (1 << 18) != 0; // ForceBold
+        }
+        if let Ok(w) = fd.get_f64("StemV") {
+            hints.bold |= w >= 160.0;
         }
     }
     hints
@@ -185,14 +183,8 @@ fn builtin_symbol_encoding(base_font: &str) -> Option<zpdf_font::encoding::Encod
 /// Read the FontDescriptor /Flags and decide whether the font is symbolic
 /// (bit 3 set, bit 6 clear).
 fn font_descriptor_symbolic(file: &PdfFile, dict: &zpdf_core::PdfDict) -> bool {
-    let fd_ref = match dict.get_ref("FontDescriptor") {
-        Ok(r) => r,
-        Err(_) => return false,
-    };
-    let flags = file
-        .resolve(fd_ref)
-        .ok()
-        .and_then(|o| o.as_dict().ok().and_then(|d| d.get_i64("Flags").ok()));
+    let flags =
+        resolve_dict(file, dict, "FontDescriptor").and_then(|d| d.get_i64("Flags").ok());
     matches!(flags, Some(f) if (f & 4) != 0 && (f & 32) == 0)
 }
 
@@ -202,13 +194,22 @@ fn font_descriptor_symbolic(file: &PdfFile, dict: &zpdf_core::PdfDict) -> bool {
 fn font_descriptor_dict(file: &PdfFile, dict: &zpdf_core::PdfDict) -> Option<zpdf_core::PdfDict> {
     let host = if dict.get_name("Subtype").unwrap_or("") == "Type0" {
         let descendants = resolve_array(file, dict, "DescendantFonts")?;
-        let desc_ref = descendants.first()?.as_ref().ok()?;
-        file.resolve(desc_ref).ok()?.as_dict().ok()?.clone()
+        descendant_cid_dict(file, &descendants)?
     } else {
         dict.clone()
     };
-    let fd_ref = host.get_ref("FontDescriptor").ok()?;
-    file.resolve(fd_ref).ok()?.as_dict().ok().cloned()
+    resolve_dict(file, &host, "FontDescriptor")
+}
+
+/// The first /DescendantFonts entry as a dict. The spec requires an indirect
+/// reference, but AutoCAD and other producers inline the CIDFont dict directly
+/// in the array; accept both forms.
+fn descendant_cid_dict(file: &PdfFile, descendants: &[PdfObject]) -> Option<zpdf_core::PdfDict> {
+    match descendants.first()? {
+        PdfObject::Dict(d) => Some(d.clone()),
+        PdfObject::Ref(r) => file.resolve(*r).ok()?.as_dict().ok().cloned(),
+        _ => None,
+    }
 }
 
 /// Map a `/FontStretch` name to its OpenType `wdth`-axis percentage (Table 122).
@@ -366,13 +367,11 @@ fn load_type0_font(
     // /DescendantFonts is commonly an indirect reference to the array.
     let descendants = resolve_array(file, dict, "DescendantFonts")
         .ok_or_else(|| zpdf_core::Error::MissingKey("DescendantFonts".into()))?;
-    let desc_ref = descendants
-        .first()
-        .ok_or_else(|| zpdf_core::Error::MissingKey("DescendantFonts[0]".into()))?
-        .as_ref()?;
-
-    let desc_obj = file.resolve(desc_ref)?;
-    let desc_dict = desc_obj.as_dict()?;
+    // /DescendantFonts is commonly an indirect reference to the array; the
+    // CIDFont entry itself may also be inlined (AutoCAD) instead of a ref.
+    let desc_dict = descendant_cid_dict(file, &descendants)
+        .ok_or_else(|| zpdf_core::Error::MissingKey("DescendantFonts[0]".into()))?;
+    let desc_dict = &desc_dict;
 
     let mut cid_widths = parse_cid_widths(file, desc_dict);
     parse_cid_w2(file, desc_dict, &mut cid_widths);
@@ -677,9 +676,7 @@ fn load_type1_font(
 
 /// Extract embedded font binary from FontDescriptor → FontFile2 (TrueType).
 fn extract_font_file(file: &PdfFile, cid_dict: &zpdf_core::PdfDict) -> Option<Vec<u8>> {
-    let fd_ref = cid_dict.get_ref("FontDescriptor").ok()?;
-    let fd_obj = file.resolve(fd_ref).ok()?;
-    let fd_dict = fd_obj.as_dict().ok()?;
+    let fd_dict = resolve_dict(file, cid_dict, "FontDescriptor")?;
 
     // Try FontFile2 (TrueType), then FontFile3 (OpenType/CFF), then FontFile (Type1)
     for key in &["FontFile2", "FontFile3", "FontFile"] {
@@ -698,9 +695,7 @@ fn extract_font_file_from_descriptor(
     file: &PdfFile,
     font_dict: &zpdf_core::PdfDict,
 ) -> Option<Vec<u8>> {
-    let fd_ref = font_dict.get_ref("FontDescriptor").ok()?;
-    let fd_obj = file.resolve(fd_ref).ok()?;
-    let fd_dict = fd_obj.as_dict().ok()?;
+    let fd_dict = resolve_dict(file, font_dict, "FontDescriptor")?;
 
     for key in &["FontFile2", "FontFile3", "FontFile"] {
         if let Ok(ff_ref) = fd_dict.get_ref(key) {
