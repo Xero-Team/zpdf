@@ -56,6 +56,19 @@ pub struct ContentInterpreter<'a> {
     /// LUT only once. Reuse overwrites `to_page` with the current CTM.
     shading_cache: HashMap<ObjectId, crate::shading::ShadingDef>,
     form_font_overrides: Vec<HashMap<String, String>>,
+    /// Per-Type0-font sets of CIDs legitimately shown on this page, armed by
+    /// [`Self::arm_leaked_cid_fix`] only when the page contains text shows that
+    /// inherited ("leaked") a simple font while carrying 2-byte CID codes —
+    /// the AutoCAD show-before-Tf defect. `None` ⇒ no repair on this page.
+    leaked_cid_sets: Option<HashMap<zpdf_font::FontId, HashSet<u16>>>,
+    /// Memoized "does font `fid` outline CID `c`" answers for the corrupted-
+    /// subset repair ([`Self::arm_broken_subset_fix`]); `glyph_outline` re-parses
+    /// the face per call, so caching keeps the check cheap.
+    outline_present: HashMap<zpdf_font::FontId, HashMap<u16, bool>>,
+    /// Per-page map from a corrupted Type0 subset font to the sibling Type0 font
+    /// that carries the glyphs it is missing. Armed by [`Self::arm_broken_subset_fix`];
+    /// every show under a keyed font is rerouted to its value. `None` ⇒ no repair.
+    broken_redirect: Option<HashMap<zpdf_font::FontId, zpdf_font::FontId>>,
     /// Owned /Resources of the form XObjects currently being interpreted,
     /// innermost last. Lookups search these before the page resources.
     form_resources: Vec<ResourceDict>,
@@ -485,6 +498,9 @@ impl<'a> ContentInterpreter<'a> {
             rejected_image_objects: HashSet::new(),
             shading_cache: HashMap::new(),
             form_font_overrides: Vec::new(),
+            leaked_cid_sets: None,
+            outline_present: HashMap::new(),
+            broken_redirect: None,
             form_resources: Vec::new(),
             form_depth: 0,
             state_floor: 0,
@@ -732,6 +748,10 @@ impl<'a> ContentInterpreter<'a> {
         if self.deadline.is_none() {
             self.deadline = Some(zpdf_core::time::Instant::now() + INTERPRET_BUDGET);
         }
+        // Pre-scan the page once to arm the malformed-CID-font repairs (both are
+        // no-ops unless the page actually exhibits the defect). See the methods.
+        self.arm_leaked_cid_fix(content);
+        self.arm_broken_subset_fix(content);
         let tokenizer = ContentTokenizer::new(content);
 
         for token in tokenizer {
@@ -1222,10 +1242,31 @@ impl<'a> ContentInterpreter<'a> {
             "Tr" => self.current.render_mode = self.pop_f64() as u8,
             "Tj" => {
                 let bytes = self.pop_string_bytes();
+                self.apply_leaked_cid_fix(&[&bytes]);
+                let restore = self
+                    .forward_leak_override(&[&bytes])
+                    .or_else(|| self.broken_subset_override(&[&bytes]));
                 self.show_text(&bytes);
+                if let Some(prev) = restore {
+                    self.current_font_id = prev;
+                }
             }
             "TJ" => {
                 if let Some(PdfObject::Array(arr)) = self.operand_stack.pop() {
+                    // The leak check judges the whole operator (all string
+                    // elements together) before any element is shown, so a
+                    // CID-looking element repairs the ones preceding it too.
+                    let strings: Vec<&[u8]> = arr
+                        .iter()
+                        .filter_map(|o| match o {
+                            PdfObject::String(s) => Some(s.0.as_slice()),
+                            _ => None,
+                        })
+                        .collect();
+                    self.apply_leaked_cid_fix(&strings);
+                    let restore = self
+                        .forward_leak_override(&strings)
+                        .or_else(|| self.broken_subset_override(&strings));
                     for item in arr {
                         match item {
                             PdfObject::String(s) => self.show_text(&s.0),
@@ -1238,6 +1279,9 @@ impl<'a> ContentInterpreter<'a> {
                             _ => {}
                         }
                     }
+                    if let Some(prev) = restore {
+                        self.current_font_id = prev;
+                    }
                 }
             }
             "'" => {
@@ -1247,7 +1291,14 @@ impl<'a> ContentInterpreter<'a> {
                 self.text_line_matrix = self.text_line_matrix.concat(&translate);
                 self.text_matrix = self.text_line_matrix;
                 let bytes = self.pop_string_bytes();
+                self.apply_leaked_cid_fix(&[&bytes]);
+                let restore = self
+                    .forward_leak_override(&[&bytes])
+                    .or_else(|| self.broken_subset_override(&[&bytes]));
                 self.show_text(&bytes);
+                if let Some(prev) = restore {
+                    self.current_font_id = prev;
+                }
             }
             "\"" => {
                 let bytes = self.pop_string_bytes();
@@ -1259,7 +1310,14 @@ impl<'a> ContentInterpreter<'a> {
                 let translate = Matrix::translate(0.0, -leading);
                 self.text_line_matrix = self.text_line_matrix.concat(&translate);
                 self.text_matrix = self.text_line_matrix;
+                self.apply_leaked_cid_fix(&[&bytes]);
+                let restore = self
+                    .forward_leak_override(&[&bytes])
+                    .or_else(|| self.broken_subset_override(&[&bytes]));
                 self.show_text(&bytes);
+                if let Some(prev) = restore {
+                    self.current_font_id = prev;
+                }
             }
 
             // -- XObject --
@@ -4340,6 +4398,366 @@ impl<'a> ContentInterpreter<'a> {
         self.emit_painted(cmd);
     }
 
+    /// AutoCAD drawings sometimes emit a text show *before* the block's `Tf`,
+    /// so the show inherits ("leaks") the font from the previous text block.
+    /// The bytes are 2-byte CIDs typeset for a composite Type0 font, but the
+    /// leaked font can be a simple 1-byte font: it decodes `00 13` as two
+    /// codes, the `0x00` high byte lands on .notdef and the digit renders as
+    /// tofu. This pre-scan walks the page token stream once — cheaply, no
+    /// display commands — collecting the CIDs legitimately shown under each
+    /// explicitly-selected Type0 font, and arms the repair only when a show
+    /// under a simple (or unset) font carries CID-looking bytes. The repair
+    /// itself happens per show in [`Self::leaked_cid_target`].
+    fn arm_leaked_cid_fix(&mut self, content: &[u8]) {
+        let Some(fc) = self.font_cache.as_deref() else {
+            return;
+        };
+        let Some(res) = self.resources else {
+            return;
+        };
+
+        // Names of the page's composite (Type0) fonts. Every page font resolves
+        // in the cache (load_page_fonts inserts a placeholder on failure).
+        let type0: HashSet<&str> = res
+            .fonts
+            .keys()
+            .filter(|name| {
+                fc.get_by_name(name).is_some_and(|(_, f)| {
+                    matches!(f.font_type, zpdf_font::PdfFontType::Type0CidType2)
+                })
+            })
+            .map(String::as_str)
+            .collect();
+        if type0.is_empty() {
+            return;
+        }
+
+        let mut cid_sets: HashMap<zpdf_font::FontId, HashSet<u16>> = HashMap::new();
+        let mut has_candidate = false;
+        // The active font carries across operators (including BT/ET) — that is
+        // exactly the graphics-state behavior the leak rides on. `cur_type0` =
+        // an explicitly-selected Type0 font; `cur_simple` = an explicitly-
+        // selected non-composite font; both `None` = nothing selected yet.
+        let mut cur_type0: Option<zpdf_font::FontId> = None;
+        let mut cur_simple: Option<zpdf_font::FontId> = None;
+        let mut pending: Vec<PdfObject> = Vec::new();
+
+        for token in ContentTokenizer::new(content) {
+            match token {
+                ContentToken::Operand(obj) => pending.push(obj),
+                ContentToken::InlineImage { .. } => pending.clear(),
+                ContentToken::Operator(op) => {
+                    match op.as_str() {
+                        "Tf" => {
+                            cur_type0 = None;
+                            cur_simple = None;
+                            if let Some(PdfObject::Name(n)) = pending.first() {
+                                let fid = fc.get_by_name(&n.0).map(|(fid, _)| fid);
+                                if type0.contains(n.0.as_str()) {
+                                    cur_type0 = fid;
+                                } else {
+                                    cur_simple = fid;
+                                }
+                            }
+                        }
+                        "Tj" | "TJ" | "'" | "\"" => match cur_type0 {
+                            Some(fid) => {
+                                let set = cid_sets.entry(fid).or_default();
+                                for_each_show_string(&pending, |b| {
+                                    for pair in b.chunks_exact(2) {
+                                        set.insert(((pair[0] as u16) << 8) | pair[1] as u16);
+                                    }
+                                });
+                            }
+                            None => {
+                                if !has_candidate {
+                                    let simple = cur_simple.and_then(|fid| fc.get(fid));
+                                    for_each_show_string(&pending, |b| {
+                                        has_candidate |= bytes_look_cid_for(b, simple);
+                                    });
+                                }
+                            }
+                        },
+                        _ => {}
+                    }
+                    pending.clear();
+                }
+            }
+        }
+
+        if has_candidate && !cid_sets.is_empty() {
+            self.leaked_cid_sets = Some(cid_sets);
+        }
+    }
+
+    /// The Type0 font a leaked show should be rerouted to, or `None` when the
+    /// show needs no repair: the fix is not armed, the show sits inside a form
+    /// XObject (own resources, not covered by the page pre-scan), a composite
+    /// font is already active, or no string looks like 2-byte CIDs.
+    ///
+    /// Judged per show *operator* (all string operands together, `strings`):
+    /// one CID-looking element flags the whole show, so the elements of a
+    /// kerned `TJ` array that precede the flagging one are repaired too.
+    /// Picks the font whose legitimately-shown CID set covers the most of the
+    /// show's codes; at zero coverage everywhere the dominant font (largest
+    /// set) still wins, because keeping the simple font is guaranteed tofu.
+    fn leaked_cid_target_op(&self, strings: &[&[u8]]) -> Option<zpdf_font::FontId> {
+        let sets = self.leaked_cid_sets.as_ref()?;
+        if !self.form_font_overrides.is_empty() {
+            return None;
+        }
+        let current = self.current_font_id.and_then(|fid| {
+            self.font_cache
+                .as_ref()
+                .and_then(|fc| fc.get(fid).map(|f| (fid, f)))
+        });
+        if current.is_some_and(|(_, f)| {
+            matches!(f.font_type, zpdf_font::PdfFontType::Type0CidType2)
+        }) {
+            return None;
+        }
+        let cur_font = current.map(|(_, f)| f);
+        if !strings.iter().any(|b| bytes_look_cid_for(b, cur_font)) {
+            return None;
+        }
+
+        let codes: Vec<u16> = strings
+            .iter()
+            .flat_map(|b| b.chunks_exact(2))
+            .map(|pair| ((pair[0] as u16) << 8) | pair[1] as u16)
+            .collect();
+        // (fid, coverage, set size); tie-break by FontId keeps the choice
+        // deterministic under HashMap iteration order.
+        let mut best: Option<(zpdf_font::FontId, usize, usize)> = None;
+        for (&fid, set) in sets {
+            let coverage = codes.iter().filter(|c| set.contains(c)).count();
+            let better = match best {
+                None => true,
+                Some((bfid, bc, bs)) => (coverage, set.len(), fid) > (bc, bs, bfid),
+            };
+            if better {
+                best = Some((fid, coverage, set.len()));
+            }
+        }
+        best.map(|(fid, _, _)| fid)
+    }
+
+    /// Apply the leaked-CID repair for a show operator: persist the rerouted
+    /// font in the graphics state, exactly as an explicit `Tf` inserted before
+    /// the show would. Following shows of the same leaked run — including ones
+    /// whose bytes carry no NUL to flag them as CIDs — then render under the
+    /// same Type0 font until the next explicit `Tf`.
+    fn apply_leaked_cid_fix(&mut self, strings: &[&[u8]]) {
+        if let Some(fid) = self.leaked_cid_target_op(strings) {
+            self.current_font_id = Some(fid);
+        }
+    }
+
+    /// AutoCAD also leaks fonts in the *forward* direction: after a `/C2_x Tf`
+    /// selecting a composite (Type0/Identity-H) font, later BT blocks show
+    /// 1-byte simple-font codes *without* re-issuing `Tf`, so they inherit the
+    /// composite font. Read as 2-byte Identity CIDs those bytes render as tofu
+    /// (e.g. `<31>` → CID 0x31 → an unrelated glyph in the leaked full font).
+    /// A genuine Identity-H show is always even-length, so an odd-length string
+    /// element proves the run is really simple 1-byte text. When that happens,
+    /// reroute the whole operator to the sibling simple font of the same
+    /// BaseFont — the non-composite face AutoCAD emits alongside every composite
+    /// font (e.g. `/TT1` next to `/C2_2`, both `ArialNarrow`).
+    ///
+    /// The override is per-operator (see the show handlers), so it never
+    /// corrupts the persistent graphics-state font: the next genuine composite
+    /// show is preceded by its own `/C2_x Tf`.
+    fn forward_leak_simple_target(&self, strings: &[&[u8]]) -> Option<zpdf_font::FontId> {
+        let fc = self.font_cache.as_ref()?;
+        let cur = self.current_font_id.and_then(|fid| fc.get(fid))?;
+        if !matches!(cur.font_type, zpdf_font::PdfFontType::Type0CidType2) {
+            return None;
+        }
+        // Only fire when at least one element cannot be valid 2-byte CID data.
+        if !strings.iter().any(|s| !s.is_empty() && s.len() % 2 == 1) {
+            return None;
+        }
+        let base = cur.base_font.as_str();
+        let res = self.resources?;
+        for name in res.fonts.keys() {
+            if let Some((fid, f)) = fc.get_by_name(name) {
+                if !matches!(f.font_type, zpdf_font::PdfFontType::Type0CidType2)
+                    && f.base_font == base
+                {
+                    return Some(fid);
+                }
+            }
+        }
+        None
+    }
+
+    /// Apply the forward-leak repair for one show operator: if the active
+    /// composite font is masking leaked simple 1-byte text, temporarily switch
+    /// to the sibling simple font. Returns the previous `current_font_id` to be
+    /// restored after the operator's shows (or `None` when nothing was changed).
+    fn forward_leak_override(&mut self, strings: &[&[u8]]) -> Option<Option<zpdf_font::FontId>> {
+        let target = self.forward_leak_simple_target(strings)?;
+        let prev = self.current_font_id;
+        self.current_font_id = Some(target);
+        Some(prev)
+    }
+
+    /// Whether font `fid`'s embedded program outlines the glyph for `cid`,
+    /// memoized per (font, CID). `glyph_outline` re-parses the face on every
+    /// call, so the cache keeps the broken-font fallback check cheap on
+    /// glyph-by-glyph AutoCAD text.
+    fn cid_has_outline(&mut self, fid: zpdf_font::FontId, cid: u16) -> bool {
+        if let Some(known) = self.outline_present.get(&fid).and_then(|m| m.get(&cid)) {
+            return *known;
+        }
+        let present = self
+            .font_cache
+            .as_ref()
+            .and_then(|fc| fc.get(fid))
+            .map(|f| f.glyph_outline(cid).is_some())
+            .unwrap_or(false);
+        self.outline_present.entry(fid).or_default().insert(cid, present);
+        present
+    }
+
+    /// Corrupted-subset repair. Some AutoCAD PDFs embed a Type0 (Identity-H)
+    /// subset whose glyph program is missing the very glyphs the content shows
+    /// (their `loca` entries are empty) — and, worse, whose *present* glyphs sit
+    /// at CIDs meaning a different character than the content intends. Alongside
+    /// it the producer emits a second Type0 font that carries the full glyph set
+    /// under the identical CID→glyph scheme the content was authored for (e.g. an
+    /// ISOCPEUR subset drawn next to a GOST-Common one, both keyed by the same
+    /// CIDs). Rendered as-is the first font drops or mis-draws those symbols.
+    ///
+    /// This pre-scan walks the page once, collects the CIDs shown under each
+    /// embedded Identity-H Type0 font, and — when a font cannot outline a large
+    /// fraction of its own shown CIDs while a sibling Type0 font outlines a
+    /// majority of them — records a whole-font reroute to that sibling. Because
+    /// the embedded program is unreliable for the *whole* font (its non-missing
+    /// glyphs are scheme-mismatched too), the reroute applies to every show under
+    /// it, not just the ones that fail — the sibling then supplies both outlines
+    /// and matching advances, keeping the text consistent.
+    ///
+    /// Guarded so it never touches a healthy font: a font that outlines all (or
+    /// nearly all) of its shown CIDs is left alone, and a sibling that does not
+    /// recover a majority of the missing glyphs is rejected, so an unrelated
+    /// font cannot hijack the run.
+    fn arm_broken_subset_fix(&mut self, content: &[u8]) {
+        let Some(fc) = self.font_cache.as_deref() else {
+            return;
+        };
+        let Some(res) = self.resources else {
+            return;
+        };
+
+        // Embedded, Identity-H composite fonts on the page (CID == GID, so a
+        // sibling's same-CID glyph renders the same character).
+        let embedded_type0: Vec<zpdf_font::FontId> = res
+            .fonts
+            .keys()
+            .filter_map(|name| fc.get_by_name(name))
+            .filter(|(_, f)| {
+                matches!(f.font_type, zpdf_font::PdfFontType::Type0CidType2)
+                    && f.has_font_data()
+                    && !f.is_substitute
+                    && f.cid_cmap.as_ref().map(|c| c.identity).unwrap_or(false)
+            })
+            .map(|(fid, _)| fid)
+            .collect();
+        if embedded_type0.len() < 2 {
+            return; // No sibling to recover from.
+        }
+        let type0_set: HashSet<zpdf_font::FontId> = embedded_type0.iter().copied().collect();
+
+        // Collect the CIDs each font legitimately shows.
+        let mut cid_sets: HashMap<zpdf_font::FontId, HashSet<u16>> = HashMap::new();
+        let mut cur: Option<zpdf_font::FontId> = None;
+        let mut pending: Vec<PdfObject> = Vec::new();
+        for token in ContentTokenizer::new(content) {
+            match token {
+                ContentToken::Operand(obj) => pending.push(obj),
+                ContentToken::InlineImage { .. } => pending.clear(),
+                ContentToken::Operator(op) => {
+                    match op.as_str() {
+                        "Tf" => {
+                            cur = match pending.first() {
+                                Some(PdfObject::Name(n)) => fc
+                                    .get_by_name(&n.0)
+                                    .map(|(fid, _)| fid)
+                                    .filter(|fid| type0_set.contains(fid)),
+                                _ => None,
+                            };
+                        }
+                        "Tj" | "TJ" | "'" | "\"" => {
+                            if let Some(fid) = cur {
+                                let set = cid_sets.entry(fid).or_default();
+                                for_each_show_string(&pending, |b| {
+                                    for pair in b.chunks_exact(2) {
+                                        set.insert(((pair[0] as u16) << 8) | pair[1] as u16);
+                                    }
+                                });
+                            }
+                        }
+                        _ => {}
+                    }
+                    pending.clear();
+                }
+            }
+        }
+
+        // Decide a reroute per font from its shown CIDs.
+        let mut redirect: HashMap<zpdf_font::FontId, zpdf_font::FontId> = HashMap::new();
+        for (&fid, cids) in &cid_sets {
+            let total = cids.len();
+            if total < 4 {
+                continue; // Too little evidence.
+            }
+            let missing: Vec<u16> = cids
+                .iter()
+                .copied()
+                .filter(|&c| !self.cid_has_outline(fid, c))
+                .collect();
+            // Healthy fonts render essentially everything they show.
+            if missing.len() * 3 < total {
+                continue;
+            }
+            let mut best: Option<(zpdf_font::FontId, usize)> = None;
+            for &sid in &embedded_type0 {
+                if sid == fid {
+                    continue;
+                }
+                let recovered =
+                    missing.iter().filter(|&&c| self.cid_has_outline(sid, c)).count();
+                if best.map(|(_, r)| recovered > r).unwrap_or(true) {
+                    best = Some((sid, recovered));
+                }
+            }
+            if let Some((sid, recovered)) = best {
+                if recovered * 2 > missing.len() {
+                    redirect.insert(fid, sid);
+                }
+            }
+        }
+
+        if !redirect.is_empty() {
+            self.broken_redirect = Some(redirect);
+        }
+    }
+
+    /// Apply the corrupted-subset repair for one show operator, mirroring
+    /// [`Self::forward_leak_override`]: if the active font was armed for reroute,
+    /// temporarily switch to its sibling and return the previous
+    /// `current_font_id` to restore afterwards.
+    fn broken_subset_override(&mut self, _strings: &[&[u8]]) -> Option<Option<zpdf_font::FontId>> {
+        let target = *self
+            .broken_redirect
+            .as_ref()?
+            .get(&self.current_font_id?)?;
+        let prev = self.current_font_id;
+        self.current_font_id = Some(target);
+        Some(prev)
+    }
+
     fn show_text(&mut self, bytes: &[u8]) {
         let tm = self.text_matrix;
         let ctm = self.current.ctm;
@@ -4639,6 +5057,56 @@ impl<'a> ContentInterpreter<'a> {
 /// `/Decode` must be resolved or an `/ImageMask` stencil would paint with the
 /// wrong polarity. `/SMask` and `/Mask` are intentionally left as references
 /// (handled separately, and they are streams we don't want to inline here).
+/// Whether show bytes look like 2-byte Identity CIDs rather than simple-font
+/// text: non-empty, even length, containing a NUL byte. Low CIDs of a composite
+/// font always produce a `0x00` high byte, while correct simple-font strings
+/// (WinAnsi/MacRoman/Standard) practically never contain NUL.
+fn bytes_look_cid(b: &[u8]) -> bool {
+    !b.is_empty() && b.len() % 2 == 0 && b.contains(&0x00)
+}
+
+/// Extended CID-likeness for a show under `simple`, the active simple font (if
+/// any). Besides the NUL heuristic, a leaked run whose CIDs are all ≥ 0x0100
+/// carries no NUL at all (e.g. `<0116>` "Ж"); such bytes still betray
+/// themselves by tiny high bytes (subset fonts rarely exceed a few thousand
+/// CIDs, so byte 0, 2, 4… stay < 0x08 — real text never does). To avoid
+/// hijacking legit low-code text (TeX-style subsets map codes 1–31 through
+/// /Differences), the extended form only fires when the active simple font
+/// cannot map a single one of the byte codes to a glyph.
+fn bytes_look_cid_for(b: &[u8], simple: Option<&zpdf_font::LoadedFont>) -> bool {
+    if bytes_look_cid(b) {
+        return true;
+    }
+    if b.is_empty() || b.len() % 2 != 0 {
+        return false;
+    }
+    if !b.iter().step_by(2).all(|&hi| hi < 0x08) {
+        return false;
+    }
+    match simple {
+        Some(f) => b.iter().all(|&code| f.code_to_gid(code as u16).is_none()),
+        None => true,
+    }
+}
+
+/// Feed every string operand of a show operator (`Tj`/`'`/`"` strings and the
+/// strings inside a `TJ` array) to `f`.
+fn for_each_show_string(operands: &[PdfObject], mut f: impl FnMut(&[u8])) {
+    for op in operands {
+        match op {
+            PdfObject::String(s) => f(&s.0),
+            PdfObject::Array(arr) => {
+                for el in arr {
+                    if let PdfObject::String(s) = el {
+                        f(&s.0);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 fn resolve_image_metadata(file: &PdfFile, dict: &zpdf_core::PdfDict) -> zpdf_core::PdfDict {
     use zpdf_core::{PdfName, PdfObject};
     let mut out = dict.clone();
@@ -5106,6 +5574,329 @@ mod tests {
         let page_rect = Rect::new(0.0, 0.0, 612.0, 792.0);
         let dl = ContentInterpreter::new(page_rect).interpret(content);
         assert_eq!(dl.commands.len(), 2);
+    }
+
+    // ---- Malformed AutoCAD CID-font recovery ----
+
+    /// Assemble a minimal one-object PDF so `with_document` has a real PdfFile.
+    fn tiny_pdf_file() -> PdfFile {
+        let mut p = Vec::from(&b"%PDF-1.7\n"[..]);
+        let off = p.len();
+        p.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+        let xref = p.len();
+        p.extend_from_slice(
+            format!(
+                "xref\n0 2\n0000000000 65535 f \n{off:010} 00000 n \n\
+                 trailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        PdfFile::parse(p).expect("tiny pdf")
+    }
+
+    #[test]
+    fn leaked_cid_show_rerouted_to_type0_font() {
+        // The AutoCAD defect: a show under a (leaked) simple font carrying
+        // 2-byte CID codes must be emitted under the page's Type0 font — the
+        // font its codes were typeset for. Under the simple font the 0x00
+        // high bytes would land on .notdef and render as tofu.
+        let file = tiny_pdf_file();
+        let mut resources = ResourceDict::default();
+        resources.fonts.insert("T0".to_string(), ObjectId(1, 0));
+        resources.fonts.insert("S0".to_string(), ObjectId(1, 0));
+
+        let mut fonts = FontCache::new();
+        // Unparseable data still yields a Type0-typed cache entry, which is
+        // all the routing under test needs (no outlines are rasterized).
+        let t0 = zpdf_font::LoadedFont::new_with_data(
+            zpdf_font::PdfFontType::Type0CidType2,
+            "T0".into(),
+            b"JUNK".to_vec(),
+            zpdf_font::CidWidths::new(1000.0),
+        );
+        let t0_id = fonts.insert("T0".to_string(), t0);
+        let s0_id = fonts.insert(
+            "S0".to_string(),
+            zpdf_font::LoadedFont::new_placeholder("S0".into()),
+        );
+        assert_ne!(t0_id, s0_id);
+
+        // Block 1 legitimately shows CID 0x13 under the Type0 font; block 2
+        // shows the same CID bytes with the simple font active (the leak).
+        let content = b"BT /T0 10 Tf <0013> Tj ET BT /S0 10 Tf <0013> Tj ET";
+        let page_rect = Rect::new(0.0, 0.0, 612.0, 792.0);
+        let dl = ContentInterpreter::new(page_rect)
+            .with_fonts(&mut fonts)
+            .with_document(&file, &resources)
+            .interpret(content);
+
+        let run_fonts: Vec<_> = dl
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                RenderCommand::DrawGlyphRun(run) => Some(run.font_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            run_fonts,
+            vec![t0_id, t0_id],
+            "leaked show rerouted to the Type0 font"
+        );
+    }
+
+    #[test]
+    fn leaked_cid_fix_covers_whole_tj_and_persists() {
+        // The leak check judges the whole TJ operator: a NUL-free element
+        // (<0116>, CID ≥ 0x0100) preceding the flagging one (<0013>) must be
+        // repaired too. The reroute then persists like an inserted `Tf`, so a
+        // following NUL-free Tj without any Tf also renders under the Type0.
+        let file = tiny_pdf_file();
+        let mut resources = ResourceDict::default();
+        resources.fonts.insert("T0".to_string(), ObjectId(1, 0));
+        resources.fonts.insert("S0".to_string(), ObjectId(1, 0));
+
+        let mut fonts = FontCache::new();
+        let t0 = zpdf_font::LoadedFont::new_with_data(
+            zpdf_font::PdfFontType::Type0CidType2,
+            "T0".into(),
+            b"JUNK".to_vec(),
+            zpdf_font::CidWidths::new(1000.0),
+        );
+        let t0_id = fonts.insert("T0".to_string(), t0);
+        let s0_id = fonts.insert(
+            "S0".to_string(),
+            zpdf_font::LoadedFont::new_placeholder("S0".into()),
+        );
+
+        // Block 1: legit Type0 show, then legit simple text (no CID look).
+        // Block 2: TJ leaked under the simple font. Block 3: NUL-free Tj with
+        // no Tf at all — must inherit the persisted Type0 reroute.
+        let content = b"BT /T0 10 Tf <0013> Tj /S0 10 Tf (AB) Tj ET \
+                        BT [<0116> -20 <0013>] TJ ET \
+                        BT <0116> Tj ET";
+        let page_rect = Rect::new(0.0, 0.0, 612.0, 792.0);
+        let dl = ContentInterpreter::new(page_rect)
+            .with_fonts(&mut fonts)
+            .with_document(&file, &resources)
+            .interpret(content);
+
+        let run_fonts: Vec<_> = dl
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                RenderCommand::DrawGlyphRun(run) => Some(run.font_id),
+                _ => None,
+            })
+            .collect();
+        // Legit Type0 show; legit simple show untouched; both TJ elements
+        // repaired; trailing Tj inherits the persisted reroute.
+        assert_eq!(run_fonts, vec![t0_id, s0_id, t0_id, t0_id, t0_id]);
+    }
+
+    #[test]
+    fn forward_leaked_simple_text_rerouted_to_sibling_simple_font() {
+        // The reverse AutoCAD defect: after `/C2_x Tf` selects a composite
+        // (Type0/Identity-H) font, a later BT block shows 1-byte simple-font
+        // codes without re-issuing `Tf`, so they inherit the composite font.
+        // Read as 2-byte Identity CIDs they render as tofu. An odd-length show
+        // proves the run is really simple text and must be rerouted to the
+        // sibling simple font of the same BaseFont. The override is per-operator:
+        // a following genuine (even-length) CID show still renders under Type0.
+        let file = tiny_pdf_file();
+        let mut resources = ResourceDict::default();
+        resources.fonts.insert("C2".to_string(), ObjectId(1, 0));
+        resources.fonts.insert("TT".to_string(), ObjectId(1, 0));
+
+        let mut fonts = FontCache::new();
+        // Both faces share the BaseFont "Arial": the composite (Type0) and the
+        // simple (TrueType) sibling AutoCAD emits alongside it.
+        let t0 = zpdf_font::LoadedFont::new_with_data(
+            zpdf_font::PdfFontType::Type0CidType2,
+            "Arial".into(),
+            b"JUNK".to_vec(),
+            zpdf_font::CidWidths::new(1000.0),
+        );
+        let simple = zpdf_font::LoadedFont::new_with_data(
+            zpdf_font::PdfFontType::TrueType,
+            "Arial".into(),
+            b"JUNK".to_vec(),
+            zpdf_font::CidWidths::new(1000.0),
+        );
+        let t0_id = fonts.insert("C2".to_string(), t0);
+        let tt_id = fonts.insert("TT".to_string(), simple);
+        assert_ne!(t0_id, tt_id);
+
+        // Block 1: genuine even-length CID show under the composite font.
+        // Block 2: leaked 1-byte ASCII "12" with no Tf → reroute to the simple
+        // sibling. Block 3: genuine even-length CID show, still under Type0
+        // (the per-operator override did not persist).
+        let content = b"BT /C2 10 Tf <0013> Tj ET \
+                        BT <31> Tj <32> Tj ET \
+                        BT <0013> Tj ET";
+        let page_rect = Rect::new(0.0, 0.0, 612.0, 792.0);
+        let dl = ContentInterpreter::new(page_rect)
+            .with_fonts(&mut fonts)
+            .with_document(&file, &resources)
+            .interpret(content);
+
+        let run_fonts: Vec<_> = dl
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                RenderCommand::DrawGlyphRun(run) => Some(run.font_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            run_fonts,
+            vec![t0_id, tt_id, tt_id, t0_id],
+            "leaked 1-byte shows route to the simple sibling; genuine CID stays Type0"
+        );
+    }
+
+    #[test]
+    fn broken_subset_not_rerouted_without_a_recovering_sibling() {
+        // Guard for the corrupted-subset repair: when the active font's glyphs
+        // cannot be outlined (unparseable data here) *and* no sibling can recover
+        // them either, the show must stay on its own font — the repair only fires
+        // when a sibling genuinely carries the missing glyphs, so an unrenderable
+        // page is never silently rerouted.
+        let file = tiny_pdf_file();
+        let mut resources = ResourceDict::default();
+        resources.fonts.insert("F0".to_string(), ObjectId(1, 0));
+        resources.fonts.insert("F1".to_string(), ObjectId(1, 0));
+
+        let mut fonts = FontCache::new();
+        let mut mk = || {
+            let mut f = zpdf_font::LoadedFont::new_with_data(
+                zpdf_font::PdfFontType::Type0CidType2,
+                "Broken".into(),
+                b"JUNK".to_vec(),
+                zpdf_font::CidWidths::new(1000.0),
+            );
+            // Identity-H so the pre-scan treats the bytes as 2-byte CIDs.
+            f.cid_cmap = Some(zpdf_font::cmap::CidCMap::identity(0));
+            f
+        };
+        let f0 = fonts.insert("F0".to_string(), mk());
+        let f1 = fonts.insert("F1".to_string(), mk());
+
+        // Four CIDs under F0 (enough to clear the evidence threshold) and one
+        // under F1; neither font can outline anything, so no reroute is armed.
+        let content = b"BT /F0 10 Tf <0001000200030004> Tj ET BT /F1 10 Tf <0005> Tj ET";
+        let page_rect = Rect::new(0.0, 0.0, 612.0, 792.0);
+        let dl = ContentInterpreter::new(page_rect)
+            .with_fonts(&mut fonts)
+            .with_document(&file, &resources)
+            .interpret(content);
+
+        let run_fonts: Vec<_> = dl
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                RenderCommand::DrawGlyphRun(run) => Some(run.font_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(run_fonts, vec![f0, f1], "no sibling recovers → no reroute");
+    }
+
+    fn hex_bytes(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    // Minimal 8-glyph TrueType fonts built for the corrupted-subset test. Both
+    // share the identical glyph order and CID scheme; `PRESENT` carries real
+    // contours for glyphs 3..=6 while `EMPTY` leaves every glyph blank (zero-
+    // length `loca` entries) — the exact shape of the AutoCAD corruption.
+    // FONT_PRESENT_HEX: 720 bytes
+    const FONT_PRESENT_HEX: &str = concat!(
+        "00010000000a0080000300204f532f32412841d30000012800000060636d6170000c008a0000019c00000034676c7966",
+        "9c789c74000001e400000068686561642e66b048000000ac000000366868656104b2025a000000e400000024686d7478",
+        "0258000000000188000000126c6f636100680071000001d0000000126d617870000a000600000108000000206e616d65",
+        "00995cc80000024c0000003c706f7374d625404700000288000000470001000000010000d0fc3df65f0f3cf5000103e8",
+        "00000000e67d365600000000e67d36560064000001f402bc000000030002000000000000000100000320ff3800000258",
+        "000000c80190000100000000000000000000000000000001000100000008000400010000000000020000000000000000",
+        "000000000000000000030258019000050004000000000000000000000000000000000000000000000000000000000000",
+        "0000000000010000000000000000000000003f3f3f3f0000003100370000000000000000000000000000000000000000",
+        "000000000020000002580000000000000000000000000000000000000000000200000003000000140003000100000014",
+        "00040020000000040004000100000037ffff00000031ffffffd00001000000000000000000000000000d001a00270034",
+        "0034000000010064000001f402bc000300003311211164019002bcfd440000010064000001f402bc0003000033112111",
+        "64019002bcfd440000010064000001f402bc000300003311211164019002bcfd440000010064000001f402bc00030000",
+        "3311211164019002bcfd4400000000040036000100000000000100010000000100000000000200010001000300010409",
+        "000100020002000300010409000200020004545200540052000200000000000000000000000000000000000000000000",
+        "000000000000000000080000010201030104010501060107010802673102673202673302673402673502673602673700",
+    );
+    // FONT_EMPTY_HEX: 620 bytes
+    const FONT_EMPTY_HEX: &str = concat!(
+        "00010000000a0080000300204f532f32412841d30000012800000060636d6170000c008a0000019c00000034676c7966",
+        "00000000000001e400000001686561642c10ad8c000000ac000000366868656103220192000000e400000024686d7478",
+        "0258000000000188000000126c6f636100000000000001d0000000126d6178700009000200000108000000206e616d65",
+        "00995cc8000001e80000003c706f7374d625404700000224000000470001000000010000128b7fb95f0f3cf5000303e8",
+        "00000000e67d365600000000e67d36560000000000000000000000030002000000000000000100000320ff3800000258",
+        "000000000000000100000000000000000000000000000001000100000008000000000000000000020000000000000000",
+        "000000000000000000030258019000050004000000000000000000000000000000000000000000000000000000000000",
+        "0000000000010000000000000000000000003f3f3f3f0000003100370000000000000000000000000000000000000000",
+        "000000000020000002580000000000000000000000000000000000000000000200000003000000140003000100000014",
+        "00040020000000040004000100000037ffff00000031ffffffd000010000000000000000000000000000000000000000",
+        "000000000000000000000004003600010000000000010001000000010000000000020001000100030001040900010002",
+        "000200030001040900020002000454520054005200020000000000000000000000000000000000000000000000000000",
+        "0000000000080000010201030104010501060107010802673102673202673302673402673502673602673700",
+    );
+
+    #[test]
+    fn broken_subset_rerouted_to_recovering_sibling() {
+        // The corrupted-subset repair: a Type0 subset that cannot outline the
+        // glyphs it shows is rerouted, whole, to a sibling Type0 font that
+        // carries them at the same CIDs — while the sibling's own shows are
+        // untouched.
+        let file = tiny_pdf_file();
+        let mut resources = ResourceDict::default();
+        resources.fonts.insert("Broken".to_string(), ObjectId(1, 0));
+        resources.fonts.insert("Good".to_string(), ObjectId(1, 0));
+
+        let mut fonts = FontCache::new();
+        let mk = |hex: &str| {
+            let mut f = zpdf_font::LoadedFont::new_with_data(
+                zpdf_font::PdfFontType::Type0CidType2,
+                "Sub".into(),
+                hex_bytes(hex),
+                zpdf_font::CidWidths::new(1000.0),
+            );
+            f.cid_cmap = Some(zpdf_font::cmap::CidCMap::identity(0));
+            f
+        };
+        let broken_id = fonts.insert("Broken".to_string(), mk(FONT_EMPTY_HEX));
+        let good_id = fonts.insert("Good".to_string(), mk(FONT_PRESENT_HEX));
+        assert_ne!(broken_id, good_id);
+
+        // CIDs 3..=6 shown under the broken font are all blank there but present
+        // in the sibling; a genuine CID under the good font must stay put.
+        let content = b"BT /Broken 10 Tf <0003000400050006> Tj ET \
+                        BT /Good 10 Tf <0003> Tj ET";
+        let page_rect = Rect::new(0.0, 0.0, 612.0, 792.0);
+        let dl = ContentInterpreter::new(page_rect)
+            .with_fonts(&mut fonts)
+            .with_document(&file, &resources)
+            .interpret(content);
+
+        let run_fonts: Vec<_> = dl
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                RenderCommand::DrawGlyphRun(run) => Some(run.font_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            run_fonts,
+            vec![good_id, good_id],
+            "broken subset rerouted to the recovering sibling; good font untouched"
+        );
     }
 
     // ---- Ruled-line capture (rule sink for table detection) ----
