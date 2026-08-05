@@ -3615,39 +3615,37 @@ impl<'a> ContentInterpreter<'a> {
 
             match obj {
                 PdfObject::Ref(font_ref) => {
-                    let page_has_same_name = page_font_ids.contains_key(&name.0);
-                    let page_has_same_obj = page_font_ids
+                    // If the page already caches this exact font under this same
+                    // name, the plain name already resolves to it — no override.
+                    let page_same_obj = page_font_ids
                         .get(&name.0)
                         .map(|id| *id == *font_ref)
                         .unwrap_or(false);
-
-                    if page_has_same_name && page_has_same_obj {
+                    if page_same_obj {
                         continue;
                     }
 
-                    if page_has_same_name && !page_has_same_obj {
-                        let unique_name = format!("__form{}_{}", form_depth, name.0);
-                        if fc.get_by_name(&unique_name).is_none() {
-                            if let Err(e) = load_into(fc, &unique_name) {
-                                tracing::debug!("form font {}: {e}", name.0);
-                                let _ = fc.try_insert_with_limit(
-                                    unique_name.clone(),
-                                    zpdf_font::LoadedFont::new_placeholder(name.0.clone()),
-                                    max_font_bytes,
-                                );
-                            }
-                        }
-                        overrides.insert(name.0.clone(), unique_name);
-                    } else if fc.get_by_name(&name.0).is_none() {
-                        if let Err(e) = load_into(fc, &name.0) {
+                    // Otherwise scope the cache slot by the font's object id.
+                    // Sibling form XObjects routinely reuse the same resource
+                    // name for *different* fonts (ArchiCAD/GraphiSoft emit /R7,
+                    // /R9 in every form). Keying the shared cache by name — even
+                    // by (form-depth, name) — collides for two siblings at the
+                    // same depth: the first-loaded font won and every later
+                    // form's text rendered with the wrong subset. An object-id
+                    // key also dedupes a font shared across forms (loaded once,
+                    // reused).
+                    let unique_name = format!("__font_{}_{}", font_ref.0, font_ref.1);
+                    if fc.get_by_name(&unique_name).is_none() {
+                        if let Err(e) = load_into(fc, &unique_name) {
                             tracing::debug!("form font {}: {e}", name.0);
                             let _ = fc.try_insert_with_limit(
-                                name.0.clone(),
+                                unique_name.clone(),
                                 zpdf_font::LoadedFont::new_placeholder(name.0.clone()),
                                 max_font_bytes,
                             );
                         }
                     }
+                    overrides.insert(name.0.clone(), unique_name);
                 }
                 PdfObject::Dict(_) => {
                     // Inline font dict: rename to avoid clobbering a same-named
