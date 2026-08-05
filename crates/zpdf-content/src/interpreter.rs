@@ -50,6 +50,15 @@ pub struct ContentInterpreter<'a> {
     /// once instead of per `Do`. Keyed only for stateless images; `/ImageMask`
     /// stencils bake in the current fill colour and are never cached here.
     image_obj_cache: HashMap<ObjectId, zpdf_display_list::ImageId>,
+    /// Render scale at which decoded images are pre-downscaled to their on-page
+    /// device footprint before caching, so an oversized raster (a scan far larger
+    /// than the area it fills) does not sit in the image cache at full source
+    /// resolution. `0.0` disables it (images cached as decoded). Set to the same
+    /// scale later used by the renderer (see [`Self::with_image_downscale`]); the
+    /// backend already box-downscales minified images per draw, so pre-shrinking
+    /// to that exact target keeps the rasterized output identical while cutting
+    /// both cache memory and repeated per-draw downscaling.
+    image_downscale_scale: f32,
     rejected_image_objects: HashSet<ObjectId>,
     /// Built shadings (256-entry LUT + parsed functions) cached by object id, so a
     /// shading painted many times (`sh` markers repeated across a map) rebuilds its
@@ -482,6 +491,7 @@ impl<'a> ContentInterpreter<'a> {
             icc_cache: None,
             output_intent_cmyk: None,
             image_obj_cache: HashMap::new(),
+            image_downscale_scale: 0.0,
             rejected_image_objects: HashSet::new(),
             shading_cache: HashMap::new(),
             form_font_overrides: Vec::new(),
@@ -652,6 +662,19 @@ impl<'a> ContentInterpreter<'a> {
 
     pub fn with_fonts(mut self, cache: &'a mut FontCache) -> Self {
         self.font_cache = Some(cache);
+        self
+    }
+
+    /// Pre-downscale decoded images to their on-page device footprint at this
+    /// render scale before caching (see [`image_downscale_scale`]). Pass the same
+    /// scale later handed to the renderer; `0.0` (default) disables it. The
+    /// pre-shrink uses the same box filter and target size the backend would use
+    /// on draw, so the rasterized output is unchanged — it only keeps the image
+    /// cache from holding a scan far larger than the area it fills.
+    ///
+    /// [`image_downscale_scale`]: Self::image_downscale_scale
+    pub fn with_image_downscale(mut self, render_scale: f32) -> Self {
+        self.image_downscale_scale = render_scale.max(0.0);
         self
     }
 
@@ -3223,6 +3246,12 @@ impl<'a> ContentInterpreter<'a> {
             fold_stencil_mask(&mut image, mask_ref, file, &self.parse_limits);
         }
 
+        // Shrink an oversized raster to the device footprint it actually covers
+        // under the current CTM, so the cache never holds a scan larger than the
+        // area it fills. Mirrors the renderer's per-draw box-downscale exactly
+        // (same target size, same filter) so the rasterized page is unchanged.
+        maybe_downscale_to_footprint(&mut image, &self.current.ctm, self.image_downscale_scale);
+
         // Insert once and remember the id so repeat draws skip the decode above.
         // `/ImageMask` stencils bake in the fill colour, so they aren't cached.
         let is_stencil = matches!(image_dict.get("ImageMask"), Some(PdfObject::Bool(true)));
@@ -4639,6 +4668,73 @@ impl<'a> ContentInterpreter<'a> {
 /// `/Decode` must be resolved or an `/ImageMask` stencil would paint with the
 /// wrong polarity. `/SMask` and `/Mask` are intentionally left as references
 /// (handled separately, and they are streams we don't want to inline here).
+fn maybe_downscale_to_footprint(
+    image: &mut zpdf_image::DecodedImage,
+    ctm: &Matrix,
+    scale: f32,
+) {
+    if scale <= 0.0 || image.width == 0 || image.height == 0 {
+        return;
+    }
+    // Device-space length of each unit-square axis (columns of the scaled CTM),
+    // i.e. how many output pixels one image axis spans. Computed exactly as the
+    // renderer does (CTM cast to f32 first) so the target size matches to the bit
+    // and the backend's own downscale becomes a no-op.
+    let (a, b, c, d) = (ctm.a as f32, ctm.b as f32, ctm.c as f32, ctm.d as f32);
+    let dev_w = (a * a + b * b).sqrt() * scale;
+    let dev_h = (c * c + d * d).sqrt() * scale;
+    let fx = dev_w / image.width as f32;
+    let fy = dev_h / image.height as f32;
+    // Only when the image is minified past the point where the backend would box-
+    // downscale anyway (below 0.5x on an axis). Above that it samples the source
+    // directly, so shrinking here would change the output.
+    if !(fx < 0.5 || fy < 0.5) {
+        return;
+    }
+    let tw = ((image.width as f32 * fx.min(1.0)).ceil() as u32).clamp(1, image.width);
+    let th = ((image.height as f32 * fy.min(1.0)).ceil() as u32).clamp(1, image.height);
+    if tw >= image.width && th >= image.height {
+        return;
+    }
+    image.data = box_downscale_rgba(&image.data, image.width, image.height, tw, th);
+    image.width = tw;
+    image.height = th;
+}
+
+/// Box-filter (area-average) downscale of a tight RGBA8 buffer — a verbatim copy
+/// of the CPU renderer's `box_downscale_rgba`, so pre-shrinking at decode time
+/// produces byte-identical pixels to the backend's on-draw downscale.
+fn box_downscale_rgba(data: &[u8], sw: u32, sh: u32, tw: u32, th: u32) -> Vec<u8> {
+    debug_assert!(tw >= 1 && th >= 1 && tw <= sw && th <= sh);
+    let mut out = vec![0u8; tw as usize * th as usize * 4];
+    let (sw64, sh64, tw64, th64) = (sw as u64, sh as u64, tw as u64, th as u64);
+    for ty in 0..th as u64 {
+        let y0 = (ty * sh64 / th64) as u32;
+        let y1 = (((ty + 1) * sh64).div_ceil(th64) as u32).clamp(y0 + 1, sh);
+        for tx in 0..tw as u64 {
+            let x0 = (tx * sw64 / tw64) as u32;
+            let x1 = (((tx + 1) * sw64).div_ceil(tw64) as u32).clamp(x0 + 1, sw);
+            let mut acc = [0u64; 4];
+            for sy in y0..y1 {
+                let row = (sy as usize * sw as usize + x0 as usize) * 4;
+                for sx in 0..(x1 - x0) as usize {
+                    let px = row + sx * 4;
+                    acc[0] += data[px] as u64;
+                    acc[1] += data[px + 1] as u64;
+                    acc[2] += data[px + 2] as u64;
+                    acc[3] += data[px + 3] as u64;
+                }
+            }
+            let n = ((x1 - x0) as u64) * ((y1 - y0) as u64);
+            let o = (ty as usize * tw as usize + tx as usize) * 4;
+            for ch in 0..4 {
+                out[o + ch] = ((acc[ch] + n / 2) / n) as u8;
+            }
+        }
+    }
+    out
+}
+
 fn resolve_image_metadata(file: &PdfFile, dict: &zpdf_core::PdfDict) -> zpdf_core::PdfDict {
     use zpdf_core::{PdfName, PdfObject};
     let mut out = dict.clone();
@@ -5106,6 +5202,40 @@ mod tests {
         let page_rect = Rect::new(0.0, 0.0, 612.0, 792.0);
         let dl = ContentInterpreter::new(page_rect).interpret(content);
         assert_eq!(dl.commands.len(), 2);
+    }
+
+    // ---- Image footprint pre-downscale ----
+
+    #[test]
+    fn image_downscale_to_footprint_shrinks_oversized_and_is_a_noop_otherwise() {
+        let make = |w: u32, h: u32| zpdf_image::DecodedImage {
+            width: w,
+            height: h,
+            data: vec![0u8; (w as usize) * (h as usize) * 4],
+            has_alpha: false,
+            premultiplied: false,
+        };
+        // A unit-square image placed at 100x100 user units, rendered at scale 2,
+        // covers a 200px device footprint. A 1000px source is 0.2x minified —
+        // well below the 0.5x threshold where the backend box-downscales anyway —
+        // so it is pre-shrunk to the 200x200 target (same size/filter the backend
+        // would use on draw, so the rasterized output is unchanged).
+        let ctm = Matrix::new(100.0, 0.0, 0.0, 100.0, 0.0, 0.0);
+        let mut img = make(1000, 1000);
+        maybe_downscale_to_footprint(&mut img, &ctm, 2.0);
+        assert_eq!((img.width, img.height), (200, 200));
+        assert_eq!(img.data.len(), 200 * 200 * 4);
+
+        // Same footprint, but the source (250px, 0.8x) is above the 0.5x
+        // threshold: the backend samples it directly, so no pre-shrink.
+        let mut img2 = make(250, 250);
+        maybe_downscale_to_footprint(&mut img2, &ctm, 2.0);
+        assert_eq!((img2.width, img2.height), (250, 250));
+
+        // scale 0.0 disables the pass entirely.
+        let mut img3 = make(1000, 1000);
+        maybe_downscale_to_footprint(&mut img3, &ctm, 0.0);
+        assert_eq!((img3.width, img3.height), (1000, 1000));
     }
 
     // ---- Ruled-line capture (rule sink for table detection) ----
