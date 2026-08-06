@@ -223,3 +223,55 @@ fn cid_w_indirect_width_subarray_resolves() {
         "CIDs outside /W keep /DW (not set)"
     );
 }
+
+#[test]
+fn inline_font_descriptor_resolves() {
+    // AutoCAD (and other producers) emit the CIDFont's /FontDescriptor as an
+    // INLINE dict, though ISO 32000 requires an indirect reference. A
+    // spec-strict, `get_ref`-only read finds no descriptor, so the embedded
+    // /FontFile is never extracted and the font falls back to a substitute.
+    // `resolve_dict` accepts both forms; the embedded program must attach.
+    let pdf = build_pdf(&[
+        dict_obj("<< /Type /Catalog >>"),
+        dict_obj(
+            "<< /Type /Font /Subtype /Type0 /BaseFont /T /Encoding /Identity-H \
+             /DescendantFonts [3 0 R] >>",
+        ),
+        dict_obj(
+            "<< /Type /Font /Subtype /CIDFontType0 /BaseFont /T /CIDToGIDMap /Identity /DW 1000 \
+             /FontDescriptor << /Type /FontDescriptor /FontName /T /Flags 4 /FontFile3 4 0 R >> >>",
+        ),
+        stream_obj(&cid_keyed_cff()),
+    ]);
+
+    let file = PdfFile::parse(pdf).expect("parse synthetic pdf");
+    let font = load_single_font(&file, ObjectId(2, 0)).expect("load font");
+    assert!(
+        font.has_font_data(),
+        "inline /FontDescriptor resolved and /FontFile3 program parsed"
+    );
+}
+
+#[test]
+fn inline_descendant_cidfont_resolves() {
+    // The /DescendantFonts entry itself may be an inline CIDFont dict rather
+    // than an indirect reference (AutoCAD). The descendant's embedded font
+    // program must still load.
+    let pdf = build_pdf(&[
+        dict_obj("<< /Type /Catalog >>"),
+        dict_obj(
+            "<< /Type /Font /Subtype /Type0 /BaseFont /T /Encoding /Identity-H \
+             /DescendantFonts [ << /Type /Font /Subtype /CIDFontType0 /BaseFont /T \
+             /CIDToGIDMap /Identity /DW 1000 /FontDescriptor 3 0 R >> ] >>",
+        ),
+        dict_obj("<< /Type /FontDescriptor /FontName /T /Flags 4 /FontFile3 4 0 R >>"),
+        stream_obj(&cid_keyed_cff()),
+    ]);
+
+    let file = PdfFile::parse(pdf).expect("parse synthetic pdf");
+    let font = load_single_font(&file, ObjectId(2, 0)).expect("load font");
+    assert!(
+        font.has_font_data(),
+        "inline /DescendantFonts CIDFont dict resolved and program loaded"
+    );
+}
