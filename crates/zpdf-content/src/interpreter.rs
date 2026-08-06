@@ -659,6 +659,18 @@ impl<'a> ContentInterpreter<'a> {
         self
     }
 
+    /// Translate the initial CTM by `(dx, dy)`, exactly as a leading
+    /// `1 0 0 1 dx dy cm` operator would (concatenated onto the current CTM,
+    /// leaving `base_ctm` untouched). This lets a caller apply a CropBox-origin
+    /// shift — e.g. AutoCAD pages whose content lives at a non-zero MediaBox/
+    /// CropBox origin — without prepending that operator to a *copy* of the whole
+    /// content stream (on a 20+ MB stream that duplicate is pure waste). Call
+    /// after [`with_page_rotation`](Self::with_page_rotation).
+    pub fn with_content_translation(mut self, dx: f64, dy: f64) -> Self {
+        self.current.ctm = self.current.ctm.concat(&Matrix::translate(dx, dy));
+        self
+    }
+
     pub fn with_fonts(mut self, cache: &'a mut FontCache) -> Self {
         self.font_cache = Some(cache);
         self
@@ -5230,11 +5242,9 @@ mod tests {
                 .collect()
         };
 
-        let clip_kinds =
-            kinds(b"q BT /F 40 Tf 7 Tr <0003000400050006> Tj ET 0 0 1000 1000 re f Q");
+        let clip_kinds = kinds(b"q BT /F 40 Tf 7 Tr <0003000400050006> Tj ET 0 0 1000 1000 re f Q");
         // Baseline: identical but ordinary fill text (mode 0) — no text clip.
-        let base_kinds =
-            kinds(b"q BT /F 40 Tf 0 Tr <0003000400050006> Tj ET 0 0 1000 1000 re f Q");
+        let base_kinds = kinds(b"q BT /F 40 Tf 0 Tr <0003000400050006> Tj ET 0 0 1000 1000 re f Q");
 
         assert!(
             !clip_kinds.contains(&"glyph"),
@@ -5260,6 +5270,37 @@ mod tests {
             clip_kinds.iter().filter(|k| **k == "push").count(),
             clip_kinds.iter().filter(|k| **k == "pop").count(),
             "clips balanced: {clip_kinds:?}"
+        );
+    }
+
+    #[test]
+    fn with_content_translation_shifts_emitted_geometry() {
+        // with_content_translation applies a (dx, dy) shift as the initial CTM,
+        // exactly like a leading `1 0 0 1 dx dy cm`, without prepending that
+        // operator to a copy of the whole content stream. Emitted geometry must
+        // move by exactly (dx, dy) versus an untranslated interpret.
+        let content = b"10 20 5 5 re f";
+        let page = Rect::new(0.0, 0.0, 100.0, 100.0);
+        let first_move = |dl: &DisplayList| -> (f64, f64) {
+            for c in &dl.commands {
+                if let RenderCommand::FillPath { path, .. } = c {
+                    if let Some(PathElement::MoveTo(p)) = path.elements.first() {
+                        return (p.x, p.y);
+                    }
+                }
+            }
+            panic!("no fill emitted");
+        };
+        let base = first_move(&ContentInterpreter::new(page).interpret(content));
+        let shifted = first_move(
+            &ContentInterpreter::new(page)
+                .with_content_translation(100.0, 200.0)
+                .interpret(content),
+        );
+        assert!(
+            (shifted.0 - (base.0 + 100.0)).abs() < 1e-6
+                && (shifted.1 - (base.1 + 200.0)).abs() < 1e-6,
+            "content shifted by exactly (100, 200): base={base:?} shifted={shifted:?}"
         );
     }
 
