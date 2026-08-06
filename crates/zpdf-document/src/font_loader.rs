@@ -767,7 +767,20 @@ fn parse_cid_widths(file: &PdfFile, dict: &zpdf_core::PdfDict) -> CidWidths {
             break;
         }
 
-        match &w_array[i] {
+        // In the `[cid [w1 w2 ...]]` form the width sub-array is frequently an
+        // *indirect* reference (AutoCAD/nanoCAD export /W this way). Resolve one
+        // level so the `PdfObject::Array` arm below sees it; otherwise the entry
+        // fell through to `_ => i += 1`, the sub-array was skipped, and every CID
+        // in the range silently defaulted to /DW — breaking advances (and thus
+        // inter-glyph spacing), so the text drifts.
+        let resolved = if let PdfObject::Ref(id) = &w_array[i] {
+            file.resolve(*id).ok()
+        } else {
+            None
+        };
+        let entry = resolved.as_ref().unwrap_or(&w_array[i]);
+
+        match entry {
             PdfObject::Array(arr) => {
                 // [cid_start [w1 w2 w3 ...]]
                 for (j, obj) in arr.iter().enumerate() {
@@ -785,7 +798,7 @@ fn parse_cid_widths(file: &PdfFile, dict: &zpdf_core::PdfDict) -> CidWidths {
             }
             PdfObject::Integer(_) | PdfObject::Real(_) => {
                 // [cid_start cid_end width]
-                let cid_end = w_array[i]
+                let cid_end = entry
                     .as_i64()
                     .ok()
                     .and_then(|v| u16::try_from(v).ok())
