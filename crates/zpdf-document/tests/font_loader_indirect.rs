@@ -191,3 +191,87 @@ fn type3_indirect_refs_resolve() {
     assert_eq!(font.type3_glyph_width(65), 500.0);
     assert_eq!(font.type3_glyph_width(66), 600.0);
 }
+
+#[test]
+fn cid_w_indirect_width_subarray_resolves() {
+    // A /W entry's width sub-array `[w1 w2 ...]` is often an INDIRECT reference
+    // (AutoCAD/nanoCAD export). Without resolving it the entry is skipped and
+    // every CID falls back to /DW — advances (and inter-glyph spacing) break, so
+    // text drifts. Here CIDs 10,11,12 must pick up 111,222,333, not /DW 1000.
+    let pdf = build_pdf(&[
+        dict_obj("<< /Type /Catalog >>"),
+        dict_obj(
+            "<< /Type /Font /Subtype /Type0 /BaseFont /T /Encoding /Identity-H \
+             /DescendantFonts [3 0 R] >>",
+        ),
+        dict_obj(
+            "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /T /FontDescriptor 4 0 R \
+             /CIDToGIDMap /Identity /DW 1000 /W [ 10 5 0 R ] >>",
+        ),
+        dict_obj("<< /Type /FontDescriptor /FontName /T /Flags 4 >>"),
+        dict_obj("[ 111 222 333 ]"),
+    ]);
+
+    let file = PdfFile::parse(pdf).expect("parse synthetic pdf");
+    let font = load_single_font(&file, ObjectId(2, 0)).expect("load font");
+    assert_eq!(font.cid_widths.get(10), 111.0);
+    assert_eq!(font.cid_widths.get(11), 222.0);
+    assert_eq!(font.cid_widths.get(12), 333.0);
+    assert_eq!(
+        font.cid_widths.get_opt(9),
+        None,
+        "CIDs outside /W keep /DW (not set)"
+    );
+}
+
+#[test]
+fn inline_font_descriptor_resolves() {
+    // AutoCAD (and other producers) emit the CIDFont's /FontDescriptor as an
+    // INLINE dict, though ISO 32000 requires an indirect reference. A
+    // spec-strict, `get_ref`-only read finds no descriptor, so the embedded
+    // /FontFile is never extracted and the font falls back to a substitute.
+    // `resolve_dict` accepts both forms; the embedded program must attach.
+    let pdf = build_pdf(&[
+        dict_obj("<< /Type /Catalog >>"),
+        dict_obj(
+            "<< /Type /Font /Subtype /Type0 /BaseFont /T /Encoding /Identity-H \
+             /DescendantFonts [3 0 R] >>",
+        ),
+        dict_obj(
+            "<< /Type /Font /Subtype /CIDFontType0 /BaseFont /T /CIDToGIDMap /Identity /DW 1000 \
+             /FontDescriptor << /Type /FontDescriptor /FontName /T /Flags 4 /FontFile3 4 0 R >> >>",
+        ),
+        stream_obj(&cid_keyed_cff()),
+    ]);
+
+    let file = PdfFile::parse(pdf).expect("parse synthetic pdf");
+    let font = load_single_font(&file, ObjectId(2, 0)).expect("load font");
+    assert!(
+        font.has_font_data(),
+        "inline /FontDescriptor resolved and /FontFile3 program parsed"
+    );
+}
+
+#[test]
+fn inline_descendant_cidfont_resolves() {
+    // The /DescendantFonts entry itself may be an inline CIDFont dict rather
+    // than an indirect reference (AutoCAD). The descendant's embedded font
+    // program must still load.
+    let pdf = build_pdf(&[
+        dict_obj("<< /Type /Catalog >>"),
+        dict_obj(
+            "<< /Type /Font /Subtype /Type0 /BaseFont /T /Encoding /Identity-H \
+             /DescendantFonts [ << /Type /Font /Subtype /CIDFontType0 /BaseFont /T \
+             /CIDToGIDMap /Identity /DW 1000 /FontDescriptor 3 0 R >> ] >>",
+        ),
+        dict_obj("<< /Type /FontDescriptor /FontName /T /Flags 4 /FontFile3 4 0 R >>"),
+        stream_obj(&cid_keyed_cff()),
+    ]);
+
+    let file = PdfFile::parse(pdf).expect("parse synthetic pdf");
+    let font = load_single_font(&file, ObjectId(2, 0)).expect("load font");
+    assert!(
+        font.has_font_data(),
+        "inline /DescendantFonts CIDFont dict resolved and program loaded"
+    );
+}

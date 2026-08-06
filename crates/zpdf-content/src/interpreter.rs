@@ -25,6 +25,13 @@ pub struct ContentInterpreter<'a> {
     text_active: bool,
     text_matrix: Matrix,
     text_line_matrix: Matrix,
+    /// Page-space accumulator for text clipping (render modes 4–7): every glyph
+    /// shown in the current BT…ET block appends its outline here, and `ET`
+    /// intersects the union into the clip stack (see `apply_text_clip`). `None` =
+    /// no glyph outlines accumulated yet. `text_clip_requested` records that a
+    /// clip render mode was seen at all, even if no drawable glyph produced one.
+    text_clip_accum: Option<Path>,
+    text_clip_requested: bool,
     font_cache: Option<&'a mut FontCache>,
     current_font_id: Option<zpdf_font::FontId>,
     file: Option<&'a PdfFile>,
@@ -471,6 +478,8 @@ impl<'a> ContentInterpreter<'a> {
             text_active: false,
             text_matrix: Matrix::identity(),
             text_line_matrix: Matrix::identity(),
+            text_clip_accum: None,
+            text_clip_requested: false,
             font_cache: None,
             current_font_id: None,
             file: None,
@@ -647,6 +656,18 @@ impl<'a> ContentInterpreter<'a> {
         self.current.ctm = base;
         self.base_ctm = base;
         self.display_list.page_rect = rotated;
+        self
+    }
+
+    /// Translate the initial CTM by `(dx, dy)`, exactly as a leading
+    /// `1 0 0 1 dx dy cm` operator would (concatenated onto the current CTM,
+    /// leaving `base_ctm` untouched). This lets a caller apply a CropBox-origin
+    /// shift — e.g. AutoCAD pages whose content lives at a non-zero MediaBox/
+    /// CropBox origin — without prepending that operator to a *copy* of the whole
+    /// content stream (on a 20+ MB stream that duplicate is pure waste). Call
+    /// after [`with_page_rotation`](Self::with_page_rotation).
+    pub fn with_content_translation(mut self, dx: f64, dy: f64) -> Self {
+        self.current.ctm = self.current.ctm.concat(&Matrix::translate(dx, dy));
         self
     }
 
@@ -1164,9 +1185,12 @@ impl<'a> ContentInterpreter<'a> {
                 self.text_active = true;
                 self.text_matrix = Matrix::identity();
                 self.text_line_matrix = Matrix::identity();
+                self.text_clip_accum = None;
+                self.text_clip_requested = false;
             }
             "ET" => {
                 self.text_active = false;
+                self.apply_text_clip();
             }
             "Tf" => {
                 let size = self.pop_f64() as f32;
@@ -3615,39 +3639,37 @@ impl<'a> ContentInterpreter<'a> {
 
             match obj {
                 PdfObject::Ref(font_ref) => {
-                    let page_has_same_name = page_font_ids.contains_key(&name.0);
-                    let page_has_same_obj = page_font_ids
+                    // If the page already caches this exact font under this same
+                    // name, the plain name already resolves to it — no override.
+                    let page_same_obj = page_font_ids
                         .get(&name.0)
                         .map(|id| *id == *font_ref)
                         .unwrap_or(false);
-
-                    if page_has_same_name && page_has_same_obj {
+                    if page_same_obj {
                         continue;
                     }
 
-                    if page_has_same_name && !page_has_same_obj {
-                        let unique_name = format!("__form{}_{}", form_depth, name.0);
-                        if fc.get_by_name(&unique_name).is_none() {
-                            if let Err(e) = load_into(fc, &unique_name) {
-                                tracing::debug!("form font {}: {e}", name.0);
-                                let _ = fc.try_insert_with_limit(
-                                    unique_name.clone(),
-                                    zpdf_font::LoadedFont::new_placeholder(name.0.clone()),
-                                    max_font_bytes,
-                                );
-                            }
-                        }
-                        overrides.insert(name.0.clone(), unique_name);
-                    } else if fc.get_by_name(&name.0).is_none() {
-                        if let Err(e) = load_into(fc, &name.0) {
+                    // Otherwise scope the cache slot by the font's object id.
+                    // Sibling form XObjects routinely reuse the same resource
+                    // name for *different* fonts (ArchiCAD/GraphiSoft emit /R7,
+                    // /R9 in every form). Keying the shared cache by name — even
+                    // by (form-depth, name) — collides for two siblings at the
+                    // same depth: the first-loaded font won and every later
+                    // form's text rendered with the wrong subset. An object-id
+                    // key also dedupes a font shared across forms (loaded once,
+                    // reused).
+                    let unique_name = format!("__font_{}_{}", font_ref.0, font_ref.1);
+                    if fc.get_by_name(&unique_name).is_none() {
+                        if let Err(e) = load_into(fc, &unique_name) {
                             tracing::debug!("form font {}: {e}", name.0);
                             let _ = fc.try_insert_with_limit(
-                                name.0.clone(),
+                                unique_name.clone(),
                                 zpdf_font::LoadedFont::new_placeholder(name.0.clone()),
                                 max_font_bytes,
                             );
                         }
                     }
+                    overrides.insert(name.0.clone(), unique_name);
                 }
                 PdfObject::Dict(_) => {
                     // Inline font dict: rename to avoid clobbering a same-named
@@ -4559,6 +4581,26 @@ impl<'a> ContentInterpreter<'a> {
             _ => cs_produces_no_marks(&self.current.fill_cs),
         };
         let invisible = matches!(self.current.render_mode, 3 | 7) || no_marks;
+        // Text render modes 4–7 also *add the glyph outlines to the clipping
+        // path* (applied at ET). Accumulate them in page space now — regardless
+        // of whether the run is also painted (4=fill+clip, 5=stroke+clip,
+        // 6=fill+stroke+clip, 7=clip only). Without this, a following opaque fill
+        // or image meant to show only through the glyphs paints over everything.
+        if matches!(self.current.render_mode, 4..=7) {
+            self.text_clip_requested = true;
+            if let Some((_, font)) = font_and_id {
+                if !glyphs.is_empty() {
+                    if let Some((clip_path, _)) =
+                        build_glyph_clip_path(&glyphs, &combined, font, font_size, h_scale)
+                    {
+                        match self.text_clip_accum.as_mut() {
+                            Some(accum) => accum.elements.extend(clip_path.elements),
+                            None => self.text_clip_accum = Some(clip_path),
+                        }
+                    }
+                }
+            }
+        }
         if let Some(font_id) = self.current_font_id {
             if !glyphs.is_empty() && !invisible {
                 // A Pattern colour space on the active paint (fill for modes
@@ -4609,6 +4651,33 @@ impl<'a> ContentInterpreter<'a> {
             Matrix::translate(x_offset as f64, 0.0)
         };
         self.text_matrix = self.text_matrix.concat(&advance);
+    }
+
+    /// At `ET`, fold any text-clip accumulated during the block (render modes
+    /// 4–7) into the clip stack. The glyph outlines are already in page space,
+    /// so this mirrors a `W n` clip: push a NonZero `PushClip` and bump
+    /// `clip_depth` so the enclosing `Q` pops it. Without this, a subsequent
+    /// opaque fill or image meant to show only through the glyph shapes paints
+    /// over the whole surrounding clip region.
+    ///
+    /// A clip mode that produced no drawable glyphs (bare font, Type3, empty
+    /// run) leaves nothing to clip to; we skip pushing rather than emit an empty
+    /// path (which the renderer treats as "no clip", not "clip everything out"),
+    /// preserving the prior behaviour for that rare case.
+    fn apply_text_clip(&mut self) {
+        if !self.text_clip_requested {
+            return;
+        }
+        self.text_clip_requested = false;
+        let Some(path) = self.text_clip_accum.take().filter(|p| !p.is_empty()) else {
+            return;
+        };
+        self.intersect_clip_bounds(Self::path_bounds(&path));
+        self.display_list.push(RenderCommand::PushClip {
+            path,
+            rule: FillRule::NonZero,
+        });
+        self.current.clip_depth += 1;
     }
 
     fn adjust_text_position(&mut self, amount: f64) {
@@ -5106,6 +5175,131 @@ mod tests {
         let page_rect = Rect::new(0.0, 0.0, 612.0, 792.0);
         let dl = ContentInterpreter::new(page_rect).interpret(content);
         assert_eq!(dl.commands.len(), 2);
+    }
+
+    // ---- Text clipping (render modes 4–7) ----
+
+    fn hex_bytes(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    // A minimal 8-glyph TrueType font carrying real contours for glyphs 3..=6,
+    // used as an Identity-CID composite so `<0003>` etc. resolve to those GIDs.
+    const FONT_PRESENT_HEX: &str = concat!(
+        "00010000000a0080000300204f532f32412841d30000012800000060636d6170000c008a0000019c00000034676c7966",
+        "9c789c74000001e400000068686561642e66b048000000ac000000366868656104b2025a000000e400000024686d7478",
+        "0258000000000188000000126c6f636100680071000001d0000000126d617870000a000600000108000000206e616d65",
+        "00995cc80000024c0000003c706f7374d625404700000288000000470001000000010000d0fc3df65f0f3cf5000103e8",
+        "00000000e67d365600000000e67d36560064000001f402bc000000030002000000000000000100000320ff3800000258",
+        "000000c80190000100000000000000000000000000000001000100000008000400010000000000020000000000000000",
+        "000000000000000000030258019000050004000000000000000000000000000000000000000000000000000000000000",
+        "0000000000010000000000000000000000003f3f3f3f0000003100370000000000000000000000000000000000000000",
+        "000000000020000002580000000000000000000000000000000000000000000200000003000000140003000100000014",
+        "00040020000000040004000100000037ffff00000031ffffffd00001000000000000000000000000000d001a00270034",
+        "0034000000010064000001f402bc000300003311211164019002bcfd440000010064000001f402bc0003000033112111",
+        "64019002bcfd440000010064000001f402bc000300003311211164019002bcfd440000010064000001f402bc00030000",
+        "3311211164019002bcfd4400000000040036000100000000000100010000000100000000000200010001000300010409",
+        "000100020002000300010409000200020004545200540052000200000000000000000000000000000000000000000000",
+        "000000000000000000080000010201030104010501060107010802673102673202673302673402673502673602673700",
+    );
+
+    #[test]
+    fn text_clip_mode_confines_following_fill_to_glyphs() {
+        // PDF text render modes 4–7 add the shown glyph outlines to the clipping
+        // path, applied at ET. Without this a following opaque fill/image that
+        // was meant to appear only through the glyph shapes paints over the whole
+        // surrounding region. A `7 Tr` (clip-only) show followed by a
+        // page-covering fill inside one q…Q must therefore emit a text-clip
+        // PushClip before the fill (popped by the enclosing Q), while the
+        // clip-only text itself paints no visible glyph run.
+        let kinds = |content: &[u8]| -> Vec<&'static str> {
+            let mut fonts = FontCache::new();
+            let mut f = zpdf_font::LoadedFont::new_with_data(
+                zpdf_font::PdfFontType::Type0CidType2,
+                "Sub".into(),
+                hex_bytes(FONT_PRESENT_HEX),
+                zpdf_font::CidWidths::new(1000.0),
+            );
+            f.cid_cmap = Some(zpdf_font::cmap::CidCMap::identity(0));
+            fonts.insert("F".to_string(), f);
+            let dl = ContentInterpreter::new(Rect::new(0.0, 0.0, 612.0, 792.0))
+                .with_fonts(&mut fonts)
+                .interpret(content);
+            dl.commands
+                .iter()
+                .map(|c| match c {
+                    RenderCommand::PushClip { .. } => "push",
+                    RenderCommand::PopClip => "pop",
+                    RenderCommand::FillPath { .. } => "fill",
+                    RenderCommand::DrawGlyphRun(_) => "glyph",
+                    _ => "other",
+                })
+                .collect()
+        };
+
+        let clip_kinds = kinds(b"q BT /F 40 Tf 7 Tr <0003000400050006> Tj ET 0 0 1000 1000 re f Q");
+        // Baseline: identical but ordinary fill text (mode 0) — no text clip.
+        let base_kinds = kinds(b"q BT /F 40 Tf 0 Tr <0003000400050006> Tj ET 0 0 1000 1000 re f Q");
+
+        assert!(
+            !clip_kinds.contains(&"glyph"),
+            "mode-7 text paints nothing: {clip_kinds:?}"
+        );
+        assert!(
+            base_kinds.contains(&"glyph"),
+            "mode-0 text paints a glyph run: {base_kinds:?}"
+        );
+
+        let fi = clip_kinds.iter().position(|k| *k == "fill").expect("fill");
+        assert!(
+            clip_kinds[..fi].contains(&"push"),
+            "text clip pushed before the fill: {clip_kinds:?}"
+        );
+        let bfi = base_kinds.iter().position(|k| *k == "fill").expect("fill");
+        assert!(
+            !base_kinds[..bfi].contains(&"push"),
+            "no clip without a clip render mode: {base_kinds:?}"
+        );
+
+        assert_eq!(
+            clip_kinds.iter().filter(|k| **k == "push").count(),
+            clip_kinds.iter().filter(|k| **k == "pop").count(),
+            "clips balanced: {clip_kinds:?}"
+        );
+    }
+
+    #[test]
+    fn with_content_translation_shifts_emitted_geometry() {
+        // with_content_translation applies a (dx, dy) shift as the initial CTM,
+        // exactly like a leading `1 0 0 1 dx dy cm`, without prepending that
+        // operator to a copy of the whole content stream. Emitted geometry must
+        // move by exactly (dx, dy) versus an untranslated interpret.
+        let content = b"10 20 5 5 re f";
+        let page = Rect::new(0.0, 0.0, 100.0, 100.0);
+        let first_move = |dl: &DisplayList| -> (f64, f64) {
+            for c in &dl.commands {
+                if let RenderCommand::FillPath { path, .. } = c {
+                    if let Some(PathElement::MoveTo(p)) = path.elements.first() {
+                        return (p.x, p.y);
+                    }
+                }
+            }
+            panic!("no fill emitted");
+        };
+        let base = first_move(&ContentInterpreter::new(page).interpret(content));
+        let shifted = first_move(
+            &ContentInterpreter::new(page)
+                .with_content_translation(100.0, 200.0)
+                .interpret(content),
+        );
+        assert!(
+            (shifted.0 - (base.0 + 100.0)).abs() < 1e-6
+                && (shifted.1 - (base.1 + 200.0)).abs() < 1e-6,
+            "content shifted by exactly (100, 200): base={base:?} shifted={shifted:?}"
+        );
     }
 
     // ---- Ruled-line capture (rule sink for table detection) ----
