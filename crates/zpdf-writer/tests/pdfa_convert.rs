@@ -2,6 +2,7 @@
 //! `rewrite_pdf` with `RewriteOptions::pdfa` and confirm the output passes
 //! `zpdf_document::pdfa::validate` for the target profile.
 
+use zpdf_core::PdfObject;
 use zpdf_document::pdfa::{validate, Profile};
 use zpdf_parser::PdfFile;
 use zpdf_writer::{DocumentBuilder, PdfaConvertConfig, PdfaProfile, RewriteOptions};
@@ -168,4 +169,231 @@ fn build_pdf(objects: &[&str]) -> Vec<u8> {
         .as_bytes(),
     );
     data
+}
+
+// ---- Type0/CID fallback embedding ----------------------------------------
+
+/// A non-embedded Type0 font (a Type0 with a descendant CIDFont whose
+/// FontDescriptor has no FontFile). Converting with a `fallback_font` embeds
+/// it on the descendant as `/FontFile2` with `/CIDToGIDMap /Identity`, so the
+/// font-embedding rule of PDF/A passes.
+#[test]
+fn fallback_font_embeds_nonembedded_type0_font() {
+    let objects: &[&str] = &[
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+         /Resources << /Font << /F1 4 0 R >> >> >>",
+        // Type0 font → descendant CIDFont → FontDescriptor (no FontFile).
+        "<< /Type /Font /Subtype /Type0 /BaseFont /TestType0 \
+         /Encoding /Identity-H /DescendantFonts [5 0 R] >>",
+        "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /TestType0 \
+         /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> \
+         /FontDescriptor 6 0 R /DW 1000 >>",
+        "<< /Type /FontDescriptor /FontName /TestType0 /Flags 4 \
+         /FontBBox [0 0 1000 1000] /ItalicAngle 0 /Ascent 800 /Descent -200 \
+         /CapHeight 700 /StemV 80 >>",
+    ];
+    let pdf = build_pdf(objects);
+    // Pre-conversion: fails (non-embedded font, no XMP/intent/ID, 1.7 header).
+    assert!(conforms(&pdf, Profile::A1b).is_err());
+
+    let file = PdfFile::parse(pdf.to_vec()).expect("parse");
+    let fallback = std::fs::read(VAR_TTF).expect("read var.ttf");
+    let converted = zpdf_writer::rewrite_pdf(
+        &file,
+        &RewriteOptions {
+            pdfa: Some(PdfaConvertConfig {
+                profile: PdfaProfile::A1b,
+                icc: None,
+                fallback_font: Some(fallback),
+            }),
+            ..Default::default()
+        },
+    )
+    .expect("convert");
+
+    // The converted output embeds a FontFile2 and uses /CIDToGIDMap /Identity
+    // on the descendant, and conforms to PDF/A-1b (font embedding satisfied).
+    let body = String::from_utf8_lossy(&converted);
+    assert!(
+        body.contains("/FontFile2"),
+        "Type0 fallback must embed /FontFile2"
+    );
+    assert!(
+        body.contains("/CIDToGIDMap /Identity"),
+        "Type0 fallback must set /CIDToGIDMap /Identity: {body}"
+    );
+    assert!(
+        conforms(&converted, Profile::A1b).is_ok(),
+        "Type0 fallback-embedded PDF should conform to PDF/A-1b: {}",
+        conforms(&converted, Profile::A1b).unwrap_err()
+    );
+}
+
+// ---- Forbidden-annotation removal ----------------------------------------
+
+/// A page carrying a PDF/A-forbidden annotation subtype (Sound) is cleaned
+/// during conversion: the annotation is dropped from the page's `/Annots`,
+/// and the converted output conforms. Also exercises a JavaScript annotation
+/// action (forbidden too). The annotation object may linger in the file
+/// (unreferenced), so we check the page's reachable `/Annots`, not the bytes.
+#[test]
+fn conversion_strips_forbidden_annotations() {
+    let objects: &[&str] = &[
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+         /Resources << /Font << /F1 4 0 R >> >> \
+         /Annots [6 0 R 7 0 R 8 0 R] >>",
+        // A non-embedded TrueType with a FontDescriptor, so the fallback_font
+        // path can embed it and the font rule passes (isolating the annot test).
+        "<< /Type /Font /Subtype /TrueType /BaseFont /TestFont /FontDescriptor 5 0 R >>",
+        "<< /Type /FontDescriptor /FontName /TestFont /Flags 32 \
+         /FontBBox [0 0 1000 1000] /ItalicAngle 0 /Ascent 800 /Descent -200 \
+         /CapHeight 700 /StemV 80 >>",
+        // Forbidden: /Subtype /Sound.
+        "<< /Type /Annot /Subtype /Sound /Rect [0 0 50 50] /Contents (beep) >>",
+        // Permitted: /Subtype /Text (a note) — must be kept.
+        "<< /Type /Annot /Subtype /Text /Rect [60 60 80 80] /Contents (note) >>",
+        // Forbidden via its action: a Launch action annotation.
+        "<< /Type /Annot /Subtype /Link /Rect [100 100 120 120] \
+         /A << /S /Launch /F (calc.exe) >> >>",
+    ];
+    let pdf = build_pdf(objects);
+    let file = PdfFile::parse(pdf.to_vec()).expect("parse");
+    let fallback = std::fs::read(VAR_TTF).expect("read var.ttf");
+    let converted = zpdf_writer::rewrite_pdf(
+        &file,
+        &RewriteOptions {
+            pdfa: Some(PdfaConvertConfig {
+                profile: PdfaProfile::A1b,
+                icc: None,
+                fallback_font: Some(fallback),
+            }),
+            ..Default::default()
+        },
+    )
+    .expect("convert");
+
+    // Parse the converted PDF and inspect the page's reachable /Annots.
+    let cfile = PdfFile::parse(converted.to_vec()).expect("parse converted");
+    let subtypes = page_annot_subtypes(&cfile);
+    assert!(
+        !subtypes.iter().any(|s| s == "Sound"),
+        "Sound annotation must be removed from /Annots, got: {subtypes:?}"
+    );
+    assert!(
+        !subtypes.iter().any(|s| s == "Link"),
+        "Launch-action Link must be removed from /Annots, got: {subtypes:?}"
+    );
+    assert!(
+        subtypes.iter().any(|s| s == "Text"),
+        "permitted Text annotation must be kept, got: {subtypes:?}"
+    );
+    assert!(
+        conforms(&converted, Profile::A1b).is_ok(),
+        "annotation-cleaned PDF should conform to PDF/A-1b: {}",
+        conforms(&converted, Profile::A1b).unwrap_err()
+    );
+}
+
+/// A FileAttachment annotation is forbidden under PDF/A-1b (carries an
+/// embedded file) but permitted under PDF/A-2b.
+#[test]
+fn fileattachment_stripped_under_a1b_kept_under_a2b() {
+    let objects: &[&str] = &[
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+         /Resources << /Font << /F1 4 0 R >> >> /Annots [5 0 R] >>",
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        "<< /Type /Annot /Subtype /FileAttachment /Rect [0 0 50 50] \
+         /Contents (attach) /FS << /Type /EmbeddedFile /F (x.txt) >> >>",
+    ];
+    let pdf = build_pdf(objects);
+    let file = PdfFile::parse(pdf.to_vec()).expect("parse");
+
+    // A-1b strips the FileAttachment from the page's /Annots.
+    let a1b = zpdf_writer::rewrite_pdf(
+        &file,
+        &RewriteOptions {
+            pdfa: Some(PdfaConvertConfig {
+                profile: PdfaProfile::A1b,
+                icc: None,
+                fallback_font: None,
+            }),
+            ..Default::default()
+        },
+    )
+    .expect("convert a1b");
+    let a1b_file = PdfFile::parse(a1b.to_vec()).expect("parse a1b");
+    let a1b_subs = page_annot_subtypes(&a1b_file);
+    assert!(
+        !a1b_subs.iter().any(|s| s == "FileAttachment"),
+        "A-1b must strip FileAttachment, got: {a1b_subs:?}"
+    );
+
+    // A-2b keeps it (embedded files are permitted in A-2).
+    let a2b = zpdf_writer::rewrite_pdf(
+        &file,
+        &RewriteOptions {
+            pdfa: Some(PdfaConvertConfig {
+                profile: PdfaProfile::A2b,
+                icc: None,
+                fallback_font: None,
+            }),
+            ..Default::default()
+        },
+    )
+    .expect("convert a2b");
+    let a2b_file = PdfFile::parse(a2b.to_vec()).expect("parse a2b");
+    let a2b_subs = page_annot_subtypes(&a2b_file);
+    assert!(
+        a2b_subs.iter().any(|s| s == "FileAttachment"),
+        "A-2b should keep FileAttachment, got: {a2b_subs:?}"
+    );
+}
+
+/// Resolve the first page's `/Annots` and return the `/Subtype` of each
+/// reachable annotation. Used to verify forbidden annotations were dropped
+/// from the page (rather than lingering unreferenced in the file body).
+fn page_annot_subtypes(file: &PdfFile) -> Vec<String> {
+    let root = file.trailer.get_ref("Root").expect("Root");
+    let catalog = file
+        .resolve(root)
+        .and_then(|o| o.as_dict().cloned())
+        .expect("catalog");
+    let pages = catalog.get_ref("Pages").expect("Pages");
+    let pages_dict = file
+        .resolve(pages)
+        .and_then(|o| o.as_dict().cloned())
+        .expect("pages");
+    let page_ref = match pages_dict.get("Kids").and_then(|o| match o {
+        PdfObject::Array(a) => a.first().cloned(),
+        _ => None,
+    }) {
+        Some(PdfObject::Ref(r)) => r,
+        _ => panic!("no page kid"),
+    };
+    let page = file
+        .resolve(page_ref)
+        .and_then(|o| o.as_dict().cloned())
+        .expect("page");
+    let Some(PdfObject::Array(annots)) = page.get("Annots") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for a in annots {
+        let resolved = match a {
+            PdfObject::Ref(r) => file.resolve(*r).unwrap_or(zpdf_core::PdfObject::Null),
+            other => other.clone(),
+        };
+        if let Ok(d) = resolved.as_dict() {
+            if let Ok(s) = d.get_name("Subtype") {
+                out.push(s.to_string());
+            }
+        }
+    }
+    out
 }

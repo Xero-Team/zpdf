@@ -709,6 +709,20 @@ cargo run -p zpdf-render-wgpu --example viewer -- <file.pdf>   # 交互浏览器
   `pdfaid` 声明、`GTS_PDFA1` 输出意图 + ICC、字体内嵌（含 Type0 后代）、
   禁用特性（JavaScript/Launch、内嵌文件与透明组 A-1）；
   CLI `zpdf validate --profile pdfa-1b|pdfa-2b`（FAIL 退出码 3）
+- [X] **Type0/CID 字体回退嵌入 + 注解类型剔除**（`zpdf-writer/src/pdfa_convert.rs`）：
+  - `embed_fallback_fonts` 现在处理 Type0：后代 CIDFont 的 `/FontDescriptor` 嵌入
+    `fallback` 为 `/FontFile2`，并设置 `/CIDToGIDMap /Identity` + 默认 `/DW`，
+    满足 PDF/A 内嵌要求（字形可能不匹配，与简单字体回退同语义）；Type0 回退
+    此前被跳过（"需复合字体写入"），现已被合并的 CJK 复合字体能力解锁
+  - `strip_forbidden_annotations`：转换期遍历页树 `/Annots`，剔除禁用注解子类型
+    （3D/Sound/Movie 全部 profile；FileAttachment 仅 A-1b，A-2b 保留内嵌文件）
+    与 `/A` 动作为 JavaScript/Launch 的注解；Widget（表单字段）保留
+  - 校验器加宽：`pdfa.rs` 新增 `annotation-subtype`/`annotation-action` 规则，
+    标记禁用注解子类型与 JS/Launch 注解动作（A-1b 额外标记 FileAttachment），
+    使未转换的不合规 PDF 也能被检出
+  - 测试：`pdfa_convert.rs` 新增 3 例（Type0 回退嵌入后 A-1b 通过、禁用注解
+    剔除并 A-1b 通过、FileAttachment 在 A-1b 剔除/A-2b 保留）；`pdfa.rs` 新增
+    3 例校验器规则单测。转换→校验 roundtrip 全过
 
 ---
 

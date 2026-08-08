@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+### PDF/A: Type0 font fallback + forbidden-annotation removal
+
+- `rewrite_pdf --pdfa` now embeds a fallback font program on **non-embedded
+  Type0/CID fonts** (previously skipped): the descendant CIDFont's
+  `/FontDescriptor` gains `/FontFile2`, and the CIDFont dict gets
+  `/CIDToGIDMap /Identity` + a default `/DW`. Best-effort — the program's glyphs
+  need not match the original (same semantics as the simple-font fallback).
+- PDF/A conversion now **strips forbidden annotations** from each page's
+  `/Annots`: `3D`/`Sound`/`Movie` (all profiles), `FileAttachment` (A-1b only;
+  A-2b permits embedded files), and any annotation whose `/A` action is
+  JavaScript or Launch. Widget annotations (form fields) are preserved.
+- The PDF/A validator gained matching rules: `annotation-subtype` and
+  `annotation-action` flag forbidden subtypes and JS/Launch annotation actions,
+  so a non-conforming source PDF is now correctly reported (not just fixed by
+  conversion).
+
 ### PDF creation from scratch (`DocumentBuilder`)
 
 - New `zpdf_writer::DocumentBuilder`: author complete PDFs without an existing
