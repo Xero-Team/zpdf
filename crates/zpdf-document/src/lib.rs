@@ -15,6 +15,7 @@ pub mod output_intents;
 pub mod page;
 pub mod page_labels;
 pub mod pdfa;
+pub mod pdfua;
 pub mod signature;
 pub mod structure;
 pub mod trust;

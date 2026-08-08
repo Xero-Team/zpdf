@@ -20,6 +20,8 @@ use std::collections::{HashMap, HashSet};
 use zpdf_core::{ObjectId, PdfDict, PdfName, PdfObject, Result};
 use zpdf_document::escape_text;
 
+use crate::metadata::encode_text_string;
+
 /// A handle to a page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PageHandle(u32);
@@ -48,6 +50,21 @@ pub enum ImageData {
     },
 }
 
+/// A structure-element tag for a page item: the role (`/S`) and optional
+/// accessibility text (`/Alt`, `/ActualText`). When present, the item's
+/// painting operators are wrapped in a marked-content sequence
+/// (`/Role << /MCID N >> BDC … EMC`) and a matching `/StructElem` is emitted
+/// in the document's `/StructTreeRoot` — producing a Tagged PDF.
+#[derive(Debug, Clone)]
+pub struct TagSpec {
+    /// The structure role (`/S`), e.g. `P`, `H1`, `Figure`.
+    pub role: zpdf_document::StructRole,
+    /// `/Alt` — an alternate textual description (required for `Figure`).
+    pub alt: Option<String>,
+    /// `/ActualText` — the exact replacement text for the item.
+    pub actual_text: Option<String>,
+}
+
 /// Item to place on a page.
 enum PageItem {
     Text {
@@ -57,6 +74,7 @@ enum PageItem {
         font_name: String,
         size: f64,
         color: (f64, f64, f64),
+        tag: Option<TagSpec>,
     },
     Image {
         image: ImageData,
@@ -64,10 +82,12 @@ enum PageItem {
         y: f64,
         width: f64,
         height: f64,
+        tag: Option<TagSpec>,
     },
     Path {
         segments: Vec<PathSegment>,
         style: PathStyle,
+        tag: Option<TagSpec>,
     },
 }
 
@@ -171,6 +191,8 @@ pub struct EmbeddedFontHandle(u32);
 pub struct DocumentBuilder {
     pages: Vec<PageState>,
     embedded_fonts: Vec<EmbeddedFont>,
+    /// Catalog `/Lang` (BCP 47), written when the document is tagged.
+    lang: Option<String>,
 }
 
 impl DocumentBuilder {
@@ -179,7 +201,15 @@ impl DocumentBuilder {
         Self {
             pages: Vec::new(),
             embedded_fonts: Vec::new(),
+            lang: None,
         }
+    }
+
+    /// Set the catalog `/Lang` (a BCP 47 language tag), emitted when the
+    /// document is built. Required for PDF/UA and good practice for Tagged
+    /// PDFs (it scopes the document's natural language for screen readers).
+    pub fn set_lang(&mut self, lang: impl Into<String>) {
+        self.lang = Some(lang.into());
     }
 
     /// Embed a TrueType font. The returned handle is used with
@@ -379,6 +409,7 @@ impl DocumentBuilder {
                 font_name: marker,
                 size,
                 color,
+                tag: None,
             });
             Ok(())
         } else {
@@ -449,6 +480,7 @@ impl DocumentBuilder {
                 font_name: normalized,
                 size,
                 color,
+                tag: None,
             });
             Ok(())
         } else {
@@ -476,6 +508,7 @@ impl DocumentBuilder {
                 y,
                 width,
                 height,
+                tag: None,
             });
             Ok(())
         } else {
@@ -520,7 +553,11 @@ impl DocumentBuilder {
             )));
         }
         if let Some(page_state) = self.pages.get_mut(page.0 as usize) {
-            page_state.items.push(PageItem::Path { segments, style });
+            page_state.items.push(PageItem::Path {
+                segments,
+                style,
+                tag: None,
+            });
             Ok(())
         } else {
             Err(zpdf_core::Error::Io(std::io::Error::new(
@@ -528,6 +565,111 @@ impl DocumentBuilder {
                 "page handle not found",
             )))
         }
+    }
+
+    /// Add tagged text using a previously embedded font. The text is wrapped
+    /// in a marked-content sequence carrying `tag.role` and an MCID, and a
+    /// matching `/StructElem` is emitted in the `/StructTreeRoot` at build
+    /// time — producing Tagged PDF content.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_tagged_text_embedded(
+        &mut self,
+        page: PageHandle,
+        text: &str,
+        x: f64,
+        y: f64,
+        font: EmbeddedFontHandle,
+        size: f64,
+        color: (f64, f64, f64),
+        tag: TagSpec,
+    ) -> Result<()> {
+        if font.0 as usize >= self.embedded_fonts.len() {
+            return Err(zpdf_core::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "embedded font handle not found",
+            )));
+        }
+        let marker = format!("\u{0}EMB{}", font.0);
+        if let Some(page_state) = self.pages.get_mut(page.0 as usize) {
+            page_state.items.push(PageItem::Text {
+                text: text.to_string(),
+                x,
+                y,
+                font_name: marker,
+                size,
+                color,
+                tag: Some(tag),
+            });
+            Ok(())
+        } else {
+            Err(zpdf_core::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "page handle not found",
+            )))
+        }
+    }
+
+    /// Add tagged text using a standard-14 font. See
+    /// [`Self::add_tagged_text_embedded`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_tagged_text(
+        &mut self,
+        page: PageHandle,
+        text: &str,
+        x: f64,
+        y: f64,
+        font_name: &str,
+        size: f64,
+        color: (f64, f64, f64),
+        tag: TagSpec,
+    ) -> Result<()> {
+        // Reuse the standard-14 validation in add_text by calling it, then
+        // patch in the tag.
+        self.add_text(page, text, x, y, font_name, size, color)?;
+        if let Some(page_state) = self.pages.get_mut(page.0 as usize) {
+            if let Some(PageItem::Text { tag: slot, .. }) = page_state.items.last_mut() {
+                *slot = Some(tag);
+            }
+        }
+        Ok(())
+    }
+
+    /// Add a tagged image. See [`Self::add_tagged_text_embedded`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_tagged_image(
+        &mut self,
+        page: PageHandle,
+        image: ImageData,
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+        tag: TagSpec,
+    ) -> Result<()> {
+        self.add_image(page, image, x, y, width, height)?;
+        if let Some(page_state) = self.pages.get_mut(page.0 as usize) {
+            if let Some(PageItem::Image { tag: slot, .. }) = page_state.items.last_mut() {
+                *slot = Some(tag);
+            }
+        }
+        Ok(())
+    }
+
+    /// Add a tagged vector path. See [`Self::add_tagged_text_embedded`].
+    pub fn add_tagged_path(
+        &mut self,
+        page: PageHandle,
+        segments: Vec<PathSegment>,
+        style: PathStyle,
+        tag: TagSpec,
+    ) -> Result<()> {
+        self.add_path(page, segments, style)?;
+        if let Some(page_state) = self.pages.get_mut(page.0 as usize) {
+            if let Some(PageItem::Path { tag: slot, .. }) = page_state.items.last_mut() {
+                *slot = Some(tag);
+            }
+        }
+        Ok(())
     }
 
     /// Build the PDF and return its bytes.
@@ -562,7 +704,7 @@ impl DocumentBuilder {
         let composite_glyph_maps = self.build_composite_glyph_maps();
 
         for (page_idx, page_state) in self.pages.iter().enumerate() {
-            let (content_bytes, font_names, image_refs) = self.build_page_content(
+            let (content_bytes, font_names, image_refs, tagged) = self.build_page_content(
                 page_state,
                 &mut image_counter,
                 &mut obj_num,
@@ -588,6 +730,7 @@ impl DocumentBuilder {
                 content_bytes,
                 font_names,
                 image_refs,
+                tagged,
             ));
         }
 
@@ -595,7 +738,7 @@ impl DocumentBuilder {
         // zpdf's own resource loader, only follow /Font entries that are
         // references). Dedup per document by BaseFont name.
         let mut font_obj_by_name: HashMap<String, u32> = HashMap::new();
-        for (_, _, _, font_names, _) in &page_contents {
+        for (_, _, _, font_names, _, _) in &page_contents {
             for name in font_names {
                 if !font_obj_by_name.contains_key(name) {
                     font_obj_by_name.insert(name.clone(), obj_num);
@@ -920,6 +1063,98 @@ impl DocumentBuilder {
             }
         }
 
+        // --- Tagged PDF: when any page carries tagged items, emit a
+        // /StructTreeRoot + /MarkInfo (and /Lang when set). Each tagged item
+        // becomes a /StructElem with /K = its MCID; the root /ParentTree maps
+        // each page's /StructParents key to that page's elem-ref array (in
+        // MCID order), so the read side can resolve MCID → element.
+        let any_tagged = page_contents
+            .iter()
+            .any(|(_, _, _, _, _, tagged)| !tagged.is_empty());
+        let tree_root_num: Option<u32> = if any_tagged {
+            // Reserve the StructTreeRoot number first so every /StructElem's
+            // /P can point back at it.
+            let tree_root_num = obj_num;
+            obj_num += 1;
+
+            let mut top_level_elems: Vec<PdfObject> = Vec::new();
+            let mut parent_nums: Vec<PdfObject> = Vec::new();
+            for (page_idx, (page_num, _, _, _, _, tagged)) in page_contents.iter().enumerate() {
+                if tagged.is_empty() {
+                    continue;
+                }
+                let mut elem_refs: Vec<PdfObject> = Vec::with_capacity(tagged.len());
+                for (mcid, spec) in tagged {
+                    let elem_num = obj_num;
+                    obj_num += 1;
+                    elem_refs.push(PdfObject::Ref(ObjectId(elem_num, 0)));
+                    let mut elem = PdfDict::new();
+                    elem.insert(
+                        PdfName::new("Type"),
+                        PdfObject::Name(PdfName::new("StructElem")),
+                    );
+                    elem.insert(
+                        PdfName::new("S"),
+                        PdfObject::Name(PdfName::new(spec.role.as_str())),
+                    );
+                    elem.insert(
+                        PdfName::new("P"),
+                        PdfObject::Ref(ObjectId(tree_root_num, 0)),
+                    );
+                    elem.insert(PdfName::new("Pg"), PdfObject::Ref(ObjectId(*page_num, 0)));
+                    elem.insert(PdfName::new("K"), PdfObject::Integer(*mcid as i64));
+                    if let Some(alt) = &spec.alt {
+                        elem.insert(
+                            PdfName::new("Alt"),
+                            PdfObject::String(encode_text_string(alt)),
+                        );
+                    }
+                    if let Some(actual) = &spec.actual_text {
+                        elem.insert(
+                            PdfName::new("ActualText"),
+                            PdfObject::String(encode_text_string(actual)),
+                        );
+                    }
+                    objects.push((elem_num, PdfObject::Dict(elem)));
+                }
+                top_level_elems.extend(elem_refs.iter().cloned());
+
+                // The parent-tree array for this page (elem refs in MCID order).
+                let arr_num = obj_num;
+                obj_num += 1;
+                objects.push((arr_num, PdfObject::Array(elem_refs)));
+                parent_nums.push(PdfObject::Integer(page_idx as i64));
+                parent_nums.push(PdfObject::Ref(ObjectId(arr_num, 0)));
+            }
+
+            // /ParentTree number tree: /Nums [ key0 arr0 key1 arr1 … ].
+            let parent_tree_num = obj_num;
+            obj_num += 1;
+            let mut parent_tree = PdfDict::new();
+            parent_tree.insert(PdfName::new("Nums"), PdfObject::Array(parent_nums));
+            objects.push((parent_tree_num, PdfObject::Dict(parent_tree)));
+
+            // StructTreeRoot.
+            let mut root = PdfDict::new();
+            root.insert(
+                PdfName::new("Type"),
+                PdfObject::Name(PdfName::new("StructTreeRoot")),
+            );
+            root.insert(PdfName::new("K"), PdfObject::Array(top_level_elems));
+            root.insert(
+                PdfName::new("ParentTree"),
+                PdfObject::Ref(ObjectId(parent_tree_num, 0)),
+            );
+            root.insert(
+                PdfName::new("ParentTreeNextKey"),
+                PdfObject::Integer(num_pages as i64),
+            );
+            objects.push((tree_root_num, PdfObject::Dict(root)));
+            Some(tree_root_num)
+        } else {
+            None
+        };
+
         // Object 1: Catalog
         let mut catalog = PdfDict::new();
         catalog.insert(
@@ -927,6 +1162,21 @@ impl DocumentBuilder {
             PdfObject::Name(PdfName::new("Catalog")),
         );
         catalog.insert(PdfName::new("Pages"), PdfObject::Ref(ObjectId(2, 0)));
+        if let Some(tree_num) = tree_root_num {
+            catalog.insert(
+                PdfName::new("StructTreeRoot"),
+                PdfObject::Ref(ObjectId(tree_num, 0)),
+            );
+            let mut mark_info = PdfDict::new();
+            mark_info.insert(PdfName::new("Marked"), PdfObject::Bool(true));
+            catalog.insert(PdfName::new("MarkInfo"), PdfObject::Dict(mark_info));
+        }
+        if let Some(lang) = &self.lang {
+            catalog.insert(
+                PdfName::new("Lang"),
+                PdfObject::String(encode_text_string(lang)),
+            );
+        }
         objects.push((1u32, PdfObject::Dict(catalog)));
 
         // Object 2: Pages tree
@@ -941,7 +1191,10 @@ impl DocumentBuilder {
         objects.push((2u32, PdfObject::Dict(pages_tree)));
 
         // Pages and their content streams
-        for (page_num, content_num, content_bytes, font_names, image_refs) in page_contents {
+        for (page_num, content_num, content_bytes, font_names, image_refs, tagged) in &page_contents
+        {
+            let page_num = *page_num;
+            let content_num = *content_num;
             let page_state = &self.pages[(page_num - 3) as usize];
 
             // Page dict
@@ -961,6 +1214,13 @@ impl DocumentBuilder {
                 PdfName::new("Contents"),
                 PdfObject::Ref(ObjectId(content_num, 0)),
             );
+            if !tagged.is_empty() {
+                // The page's key into the /ParentTree /Nums is its 0-based index.
+                page.insert(
+                    PdfName::new("StructParents"),
+                    PdfObject::Integer((page_num - 3) as i64),
+                );
+            }
 
             // Resources dict
             if !font_names.is_empty() || !image_refs.is_empty() {
@@ -1000,7 +1260,7 @@ impl DocumentBuilder {
                 PdfName::new("Filter"),
                 PdfObject::Name(PdfName::new("FlateDecode")),
             );
-            let compressed = flate_compress(&content_bytes)?;
+            let compressed = flate_compress(content_bytes)?;
             streams.push((content_num, content_dict, compressed));
         }
 
@@ -1182,18 +1442,26 @@ impl DocumentBuilder {
         out
     }
 
+    #[allow(clippy::type_complexity)] // flat build tuple; factoring a type alias would obscure it
     fn build_page_content(
         &self,
         page_state: &PageState,
         image_counter: &mut usize,
         next_obj: &mut u32,
         composite_glyph_maps: &HashMap<u32, HashMap<char, u16>>,
-    ) -> Result<(Vec<u8>, Vec<String>, Vec<u32>)> {
+    ) -> Result<(Vec<u8>, Vec<String>, Vec<u32>, Vec<(i32, TagSpec)>)> {
         let mut ops = Vec::new();
         let mut font_names = Vec::new();
         let mut image_refs = Vec::new();
         let mut used_fonts = HashMap::new();
         let mut used_images = HashMap::new();
+        // Per-page marked-content identifiers for tagged items, assigned in
+        // item order (0, 1, 2, …). The /StructTreeRoot's /ParentTree maps each
+        // page's /StructParents key to an array of /StructElem refs indexed by
+        // MCID, so the order here must match the order the struct elements are
+        // emitted in build().
+        let mut next_mcid: i32 = 0;
+        let mut tagged: Vec<(i32, TagSpec)> = Vec::new();
 
         ops.extend_from_slice(b"BT\n");
 
@@ -1206,6 +1474,7 @@ impl DocumentBuilder {
                     font_name,
                     size,
                     color,
+                    tag,
                 } => {
                     // Ensure font is in the resources
                     let font_idx = if let Some(&idx) = used_fonts.get(font_name) {
@@ -1216,6 +1485,15 @@ impl DocumentBuilder {
                         font_names.push(font_name.clone());
                         idx
                     };
+
+                    if let Some(spec) = tag {
+                        let mcid = next_mcid;
+                        next_mcid += 1;
+                        tagged.push((mcid, spec.clone()));
+                        ops.extend_from_slice(
+                            format!("/{} <</MCID {}>> BDC\n", spec.role.as_str(), mcid).as_bytes(),
+                        );
+                    }
 
                     // Emit text ops
                     let r = color.0.clamp(0.0, 1.0);
@@ -1243,6 +1521,10 @@ impl DocumentBuilder {
                         escape_text(text, &mut ops);
                         ops.extend_from_slice(b") Tj\n");
                     }
+
+                    if tag.is_some() {
+                        ops.extend_from_slice(b"EMC\n");
+                    }
                 }
                 PageItem::Image {
                     image: _,
@@ -1250,6 +1532,7 @@ impl DocumentBuilder {
                     y,
                     width,
                     height,
+                    tag,
                 } => {
                     // End text mode
                     ops.extend_from_slice(b"ET\n");
@@ -1265,18 +1548,41 @@ impl DocumentBuilder {
 
                     // Emit image ops (use placeholder; actual image objects added externally)
                     ops.extend_from_slice(b"q\n");
+                    if let Some(spec) = tag {
+                        let mcid = next_mcid;
+                        next_mcid += 1;
+                        tagged.push((mcid, spec.clone()));
+                        ops.extend_from_slice(
+                            format!("/{} <</MCID {}>> BDC\n", spec.role.as_str(), mcid).as_bytes(),
+                        );
+                    }
                     ops.extend_from_slice(
                         format!("{} 0 0 {} {} {} cm\n", width, height, x, y).as_bytes(),
                     );
                     ops.extend_from_slice(format!("/Im{} Do\n", used_images.len()).as_bytes());
+                    if tag.is_some() {
+                        ops.extend_from_slice(b"EMC\n");
+                    }
                     ops.extend_from_slice(b"Q\n");
 
                     // Restart text mode
                     ops.extend_from_slice(b"BT\n");
                 }
-                PageItem::Path { segments, style } => {
+                PageItem::Path {
+                    segments,
+                    style,
+                    tag,
+                } => {
                     // Paths are painted outside the text block.
                     ops.extend_from_slice(b"ET\nq\n");
+                    if let Some(spec) = tag {
+                        let mcid = next_mcid;
+                        next_mcid += 1;
+                        tagged.push((mcid, spec.clone()));
+                        ops.extend_from_slice(
+                            format!("/{} <</MCID {}>> BDC\n", spec.role.as_str(), mcid).as_bytes(),
+                        );
+                    }
                     if let Some((r, g, b)) = style.stroke {
                         ops.extend_from_slice(format!("{} {} {} RG\n", r, g, b).as_bytes());
                         ops.extend_from_slice(format!("{} w\n", style.line_width).as_bytes());
@@ -1325,6 +1631,9 @@ impl DocumentBuilder {
                         (false, false) => b"n\n",
                     };
                     ops.extend_from_slice(paint_op);
+                    if tag.is_some() {
+                        ops.extend_from_slice(b"EMC\n");
+                    }
                     ops.extend_from_slice(b"Q\nBT\n");
                 }
             }
@@ -1332,7 +1641,7 @@ impl DocumentBuilder {
 
         ops.extend_from_slice(b"ET\n");
 
-        Ok((ops, font_names, image_refs))
+        Ok((ops, font_names, image_refs, tagged))
     }
 }
 

@@ -2570,18 +2570,27 @@ fn cmd_redact(args: &[String]) -> zpdf::Result<()> {
 fn cmd_validate(args: &[String]) -> zpdf::Result<()> {
     let (args, password) = extract_password(args);
     let mut input: Option<&str> = None;
-    let mut profile = zpdf::pdfa::Profile::A2b;
+    enum Profile {
+        Pdfa(zpdf::pdfa::Profile),
+        Pdfua(zpdf::pdfua::Profile),
+    }
+    let mut profile = Profile::Pdfa(zpdf::pdfa::Profile::A2b);
 
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--profile" => {
                 profile = match args.get(i + 1).map(String::as_str) {
-                    Some("pdfa-1b") | Some("a-1b") | Some("1b") => zpdf::pdfa::Profile::A1b,
-                    Some("pdfa-2b") | Some("a-2b") | Some("2b") => zpdf::pdfa::Profile::A2b,
+                    Some("pdfa-1b") | Some("a-1b") | Some("1b") => {
+                        Profile::Pdfa(zpdf::pdfa::Profile::A1b)
+                    }
+                    Some("pdfa-2b") | Some("a-2b") | Some("2b") => {
+                        Profile::Pdfa(zpdf::pdfa::Profile::A2b)
+                    }
+                    Some("pdfua-1") | Some("ua-1") => Profile::Pdfua(zpdf::pdfua::Profile::Ua1),
                     other => {
                         eprintln!(
-                            "Unknown profile {:?} (use pdfa-1b or pdfa-2b)",
+                            "Unknown profile {:?} (use pdfa-1b, pdfa-2b, or pdfua-1)",
                             other.unwrap_or("")
                         );
                         process::exit(1);
@@ -2599,26 +2608,44 @@ fn cmd_validate(args: &[String]) -> zpdf::Result<()> {
         }
     }
     let Some(input) = input else {
-        eprintln!("Usage: zpdf validate <file.pdf> [--profile pdfa-1b|pdfa-2b] [--password <pw>]");
+        eprintln!(
+            "Usage: zpdf validate <file.pdf> [--profile pdfa-1b|pdfa-2b|pdfua-1] [--password <pw>]"
+        );
         process::exit(1);
     };
 
     let doc = open_document(input, password.as_deref())?;
-    let report = zpdf::pdfa::validate(doc.file(), profile);
-
-    println!("Profile: {}", report.profile.as_str());
-    match &report.claimed {
-        Some((part, conf)) => println!("Claimed: PDF/A-{part}{}", conf.to_lowercase()),
-        None => println!("Claimed: (no PDF/A identification in XMP)"),
-    }
-    if report.conforms() {
-        println!("Result: PASS — no violations found");
-    } else {
-        println!("Result: FAIL — {} violation(s)", report.violations.len());
-        for v in &report.violations {
-            println!("  [{}] {}", v.rule, v.message);
+    match profile {
+        Profile::Pdfa(p) => {
+            let report = zpdf::pdfa::validate(doc.file(), p);
+            println!("Profile: {}", report.profile.as_str());
+            match &report.claimed {
+                Some((part, conf)) => println!("Claimed: PDF/A-{part}{}", conf.to_lowercase()),
+                None => println!("Claimed: (no PDF/A identification in XMP)"),
+            }
+            if report.conforms() {
+                println!("Result: PASS — no violations found");
+            } else {
+                println!("Result: FAIL — {} violation(s)", report.violations.len());
+                for v in &report.violations {
+                    println!("  [{}] {}", v.rule, v.message);
+                }
+                process::exit(3);
+            }
         }
-        process::exit(3);
+        Profile::Pdfua(p) => {
+            let report = zpdf::pdfua::validate(doc.file(), p);
+            println!("Profile: {}", report.profile.as_str());
+            if report.conforms() {
+                println!("Result: PASS — no violations found");
+            } else {
+                println!("Result: FAIL — {} violation(s)", report.violations.len());
+                for v in &report.violations {
+                    println!("  [{}] {}", v.rule, v.message);
+                }
+                process::exit(3);
+            }
+        }
     }
     Ok(())
 }
