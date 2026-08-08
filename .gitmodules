@@ -1,0 +1,3 @@
+[submodule "zpdf-skill"]
+	path = zpdf-skill
+	url = https://github.com/Xero-Team/zpdf-skill
