@@ -560,12 +560,16 @@ cargo run -p zpdf-render-wgpu --example viewer -- <file.pdf>   # 交互浏览器
   或 CMS 结构错误为 `Unsupported`。对抗性安全：最大 CMS 4 MiB、越界 `/ByteRange` 拒绝、
   DER 解析器拒绝不定长/截断 TLV、无递归无索引越界
 - [X] 公钥签名验证（`CryptoStatus`，RustCrypto）：从 CMS `SignerInfo` 提取签名算法
-  （RSA PKCS#1 v1.5 / ECDSA P-256 / P-384）、签名属性 DER（`[0]` 标签改写为 `SET`）、
+  （RSA PKCS#1 v1.5 / **RSASSA-PSS (RFC 4055)** / ECDSA P-256 / P-384）、签名属性 DER（`[0]` 标签改写为 `SET`）、
   签名值（`signature` OCTET STRING）；从首个嵌入证书 `SubjectPublicKeyInfo` 提取公钥
   （RSA `RSAPublicKey` / EC SEC1 点）；用摘要算法哈希签名属性，RSA/ECDSA 验签。验证通过为
-  `Valid`，失败为 `Invalid`（伪造/损坏），不支持的算法（RSA-PSS/DSA/非 P-256/384 曲线）或
-  无法解析的证书/公钥为 `Unsupported`。`Signature::is_cryptographically_valid()` 为
-  **完整性与签名双通过** — **不校验证书链信任锚、撤销、签名时效**（无信任库，范围外）
+  `Valid`，失败为 `Invalid`（伪造/损坏），不支持的算法（DSA/非 P-256/384 曲线，或 PSS 的
+  `RSASSA-PSS-params` 无法解析）或无法解析的证书/公钥为 `Unsupported`。`Signature::is_cryptographically_valid()` 为
+  **完整性与签名双通过** — **不校验证书链信任锚、撤销、签名时效**（无信任库，范围外）。
+  **RSASSA-PSS**：解析 `signatureAlgorithm` 中的 `RSASSA-PSS-params`（hash/MGF1-hash/saltLength，
+  兼容 EXPLICIT 与 IMPLICIT 上下文标记，缺失字段取 SHA-1/MGF1-SHA-1/20 默认值），经 rsa 0.9
+  `Pss::new_with_salt::<D>(salt_len)` 验签；声明的 hash 须与 SignerInfo 摘要一致、salt_len 须与
+  签名所用一致，否则 `Unsupported`/`Invalid`（不静默纠正参数）
 - [X] CMS / X.509 最小化解析器（`cms` 模块）：手写 DER TLV 游走器（RFC 5652 CMS `SignedData`
   + X.509 `Certificate`），提取摘要算法 OID、`messageDigest` 属性、首个证书的 CN 与 SPKI、
   签名算法 OID、签名值。按 OID 分类跳过 `sid`（`issuerAndSerialNumber` 也是 `SEQUENCE`），
