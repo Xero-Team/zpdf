@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+## 0.12.1 — Prebuilt binaries via `cargo-binstall`
+
+### Prebuilt CLI binaries
+
+- `zpdf-cli` now carries `[package.metadata.binstall]` so `cargo binstall
+  zpdf-cli` downloads a **prebuilt binary** from the GitHub Release instead of
+  compiling from source (`cargo install zpdf-cli` still compiles — crates.io
+  is source-only; binstall is the binary channel).
+- The `release.yml` workflow now builds for **six targets**: Windows
+  x86_64-msvc, Linux x86_64-gnu + x86_64-musl + aarch64-gnu, macOS aarch64
+  (Apple Silicon) + x86_64 (Intel). Linux musl is a static build (portable to
+  any distro); macOS Intel cross-builds on the ARM runner via the macOS SDK.
+- Archive layout matches the binstall manifest exactly: each target ships
+  `zpdf-v<version>-<target>/zpdf[.exe]` inside a `.zip` (Windows) or `.tar.gz`
+  (unix), attached to the Release for the tag.
+
 ## 0.12.0 — Writer-toolkit Deferred sweep + first publishable release
 
 This is the first release whose full crate chain is publishable to crates.io

@@ -1,7 +1,10 @@
 name: Release
 
-# Build the `zpdf` CLI for each platform and attach the archives to the GitHub
-# Release for the pushed tag (e.g. `git tag v0.1.0 && git push origin v0.1.0`).
+# Build the `zpdf` CLI for each target platform and attach the archives to
+# the GitHub Release for the pushed tag (e.g. `git tag v0.1.0 && git push origin
+# v0.1.0`). The archives are also what `cargo-binstall` downloads: the
+# `[package.metadata.binstall]` block in zpdf-cli's Cargo.toml points at this
+# Release's `zpdf-v<version>-<target>.{zip,tar.gz}` assets.
 on:
   push:
     tags: ["v*"]
@@ -20,20 +23,46 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Linux: glibc (dynamic) + musl (static, portable to any distro).
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            musl: true
+          # Linux ARM64 (native on the ARM runner — no cross-compile).
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          # Windows x86_64 (MSVC).
           - os: windows-latest
             target: x86_64-pc-windows-msvc
+          # macOS: Apple Silicon (native) + Intel (cross via the macOS SDK,
+          # which supports x86_64 targets on an ARM host out of the box).
           - os: macos-latest
             target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      # musl needs the musl target + the C linker (musl-tools). zpdf-cli is
+      # pure Rust, but its build deps (e.g. ring via ureq behind `timestamp`)
+      # may want a C toolchain; install musl-gcc to be safe.
+      - name: Install musl toolchain (Linux musl only)
+        if: matrix.musl == true
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
 
       - name: Build release binary
+        # `--locked` is intentionally omitted: the workspace gitignores
+        # Cargo.lock (it ships library crates to crates.io, where a lockfile
+        # would over-constrain downstream). A fresh lock is generated per build.
         run: cargo build --release -p zpdf-cli --target ${{ matrix.target }}
 
       - name: Package

@@ -31,3 +31,24 @@ zpdf-svg-export.workspace = true
 # Direct CLI dep (NOT feature-gated): compare/text/render use image::open/RgbaImage.
 image.workspace = true
 tracing-subscriber.workspace = true
+
+# Prebuilt-binary discovery for `cargo-binstall`. `cargo install zpdf-cli`
+# always compiles from source (crates.io is source-only); `cargo binstall
+# zpdf-cli` instead downloads the prebuilt binary the `release.yml` workflow
+# attaches to the matching GitHub Release. The archive layout produced by
+# `release.yml` is `zpdf-v<version>-<target>/zpdf[.exe]` inside a
+# `zpdf-v<version>-<target>.zip` (Windows) or `.tar.gz` (unix) — the patterns
+# below mirror that exactly so binstall can locate and extract the binary.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/zpdf-v{ version }-{ target }.{ archive-format }"
+bin-dir = "zpdf-v{ version }-{ target }/{ bin }{ binary-ext }"
+# The release workflow builds these targets; binstall picks the one matching
+# the host. musl is preferred over gnu on Linux for portability (static link).
+supported-targets = [
+    "x86_64-pc-windows-msvc",
+    "x86_64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+]
