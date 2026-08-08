@@ -25,8 +25,12 @@ use crate::rewrite::{renumber, PdfaConvertConfig, PdfaProfile};
 use crate::{flate_compress, invalid_data};
 
 /// The default sRGB v2 ICC profile, embedded as the `/DestOutputProfile` for
-/// the `GTS_PDFA1` output intent when the caller supplies no profile.
-const SRGB_ICC: &[u8] = include_bytes!("../../zpdf-color/src/testdata/srgb.icc");
+/// the `GTS_PDFA1` output intent when the caller supplies no profile. Kept
+/// inside this crate (not borrowed from `zpdf-color`'s test data) so the
+/// published `zpdf-writer` package is self-contained — `cargo publish` only
+/// ships files within the crate, and `include_bytes!` of a sibling crate's
+/// path would break the published build.
+const SRGB_ICC: &[u8] = include_bytes!("srgb.icc");
 
 /// A new object injected by the PDF/A pass: a direct object or a stream.
 pub(crate) enum ExtraObj {
