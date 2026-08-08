@@ -319,12 +319,13 @@ fn rsa_spki(pkcs1_pub_der: &[u8]) -> Vec<u8> {
 
 /// Build a full CMS `SignedData` carrying `digest` as the messageDigest signed
 /// attribute, the certificate `cert`, and a real `signature` over the SET-encoded
-/// signed attributes produced by `sign`. `sig_alg_oid` names the signature
-/// algorithm in the `SignerInfo`.
+/// signed attributes produced by `sign`. `sig_alg` is the full
+/// `signatureAlgorithm` SEQUENCE bytes (OID plus any parameters, e.g. the
+/// RSASSA-PSS-params for PSS).
 fn build_real_cms(
     digest: &[u8],
     cert: &[u8],
-    sig_alg_oid: &[u8],
+    sig_alg: &[u8],
     sign: impl Fn(&[u8]) -> Vec<u8>,
 ) -> Vec<u8> {
     let sha256_oid = [0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01];
@@ -348,7 +349,7 @@ fn build_real_cms(
             der(SEQ, &[]), // sid placeholder (empty SEQUENCE, skipped by OID scan)
             digest_alg.clone(),
             der(CTX0_TAG, &md_attr), // signedAttrs [0] IMPLICIT
-            der(SEQ, &der(OID, sig_alg_oid)),
+            sig_alg.to_vec(),        // signatureAlgorithm SEQUENCE
             der(OCTET, &signature),
         ]
         .concat(),
@@ -492,7 +493,8 @@ fn ecdsa_p256_signature_verifies() {
     let (cert, sign) = ecdsa_p256_signer();
     // ecdsa-with-SHA256: 1.2.840.10045.4.3.2
     let sig_oid = [0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02];
-    let pdf = assemble_signed_pdf(|d| build_real_cms(d, &cert, &sig_oid, &sign));
+    let sig_alg = der(SEQ, &der(OID, &sig_oid));
+    let pdf = assemble_signed_pdf(|d| build_real_cms(d, &cert, &sig_alg, &sign));
 
     let doc = PdfDocument::open(pdf).expect("open");
     let s = &doc.signatures()[0];
@@ -508,7 +510,8 @@ fn rsa_signature_verifies() {
     let (cert, sign) = rsa_signer();
     // sha256WithRSAEncryption: 1.2.840.113549.1.1.11
     let sig_oid = [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b];
-    let pdf = assemble_signed_pdf(|d| build_real_cms(d, &cert, &sig_oid, &sign));
+    let sig_alg = der(SEQ, &der(OID, &sig_oid));
+    let pdf = assemble_signed_pdf(|d| build_real_cms(d, &cert, &sig_alg, &sign));
 
     let doc = PdfDocument::open(pdf).expect("open");
     let s = &doc.signatures()[0];
@@ -523,11 +526,12 @@ fn rsa_signature_verifies() {
 fn corrupted_signature_is_detected_as_invalid() {
     let (cert, sign) = ecdsa_p256_signer();
     let sig_oid = [0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02];
+    let sig_alg = der(SEQ, &der(OID, &sig_oid));
     // Flip the last byte of the CMS — inside the signature value, which lives in
     // the (unsigned) /Contents gap, so the byte-range digest stays intact but the
     // public-key signature no longer verifies.
     let pdf = assemble_signed_pdf(|d| {
-        let mut cms = build_real_cms(d, &cert, &sig_oid, &sign);
+        let mut cms = build_real_cms(d, &cert, &sig_alg, &sign);
         let last = cms.len() - 1;
         cms[last] ^= 0xff;
         cms
@@ -548,7 +552,8 @@ fn corrupted_signature_is_detected_as_invalid() {
 fn tampered_body_fails_both_checks() {
     let (cert, sign) = ecdsa_p256_signer();
     let sig_oid = [0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02];
-    let mut pdf = assemble_signed_pdf(|d| build_real_cms(d, &cert, &sig_oid, &sign));
+    let sig_alg = der(SEQ, &der(OID, &sig_oid));
+    let mut pdf = assemble_signed_pdf(|d| build_real_cms(d, &cert, &sig_alg, &sign));
     // Alter a signed byte: the digest breaks (Mismatch); the crypto signature
     // over the attributes is still internally consistent, but the overall
     // signature is not valid because the document no longer matches.
@@ -561,6 +566,148 @@ fn tampered_body_fails_both_checks() {
     assert!(
         !s.is_cryptographically_valid(),
         "a tampered document is never cryptographically valid"
+    );
+}
+
+/// A deterministic RSA-2048 signer using **RSASSA-PSS with SHA-256 and a
+/// 32-byte salt** (MGF1-SHA256), plus its certificate. Returns the certificate
+/// bytes, a signer closure, and the full `signatureAlgorithm` SEQUENCE bytes
+/// (carrying the `RSASSA-PSS-params`) for embedding in the CMS.
+#[allow(clippy::type_complexity)]
+fn rsa_pss_signer() -> (Vec<u8>, impl Fn(&[u8]) -> Vec<u8>, Vec<u8>) {
+    use rand_chacha::rand_core::SeedableRng;
+    use rand_chacha::ChaCha20Rng;
+    use rsa::pkcs1::EncodeRsaPublicKey;
+    use rsa::pss::SigningKey;
+    use rsa::signature::{RandomizedSigner, SignatureEncoding};
+    use rsa::RsaPrivateKey;
+    use sha2::Sha256;
+
+    let mut rng = ChaCha20Rng::from_seed([9u8; 32]);
+    let priv_key = RsaPrivateKey::new(&mut rng, 2048).expect("rsa keygen");
+    let pub_der = priv_key
+        .to_public_key()
+        .to_pkcs1_der()
+        .expect("pkcs1 der")
+        .as_bytes()
+        .to_vec();
+    let cert = build_cert(&rsa_spki(&pub_der), "zpdf RSA-PSS Test");
+
+    // PSS signing key: SHA-256 digest, salt length = 32 (the digest size, the
+    // common `Pss::new::<Sha256>()` default). PSS is randomised, so the signer
+    // closure re-seeds a fresh deterministic RNG per call — the salt is
+    // pseudo-random but reproducible, and the signature still verifies.
+    let signing_key = SigningKey::<Sha256>::new(priv_key);
+    let sign = move |msg: &[u8]| {
+        let mut r = ChaCha20Rng::from_seed([9u8; 32]);
+        signing_key
+            .try_sign_with_rng(&mut r, msg)
+            .expect("pss sign")
+            .to_vec()
+    };
+
+    // signatureAlgorithm ::= SEQUENCE { OID id-RSASSA-PSS, params RSASSA-PSS-params }
+    // RSASSA-PSS-params ::= SEQUENCE {
+    //   hashAlgorithm    [0] EXPLICIT AlgorithmIdentifier,  -- RFC 4055 uses EXPLICIT
+    //   maskGenAlgorithm  [1] EXPLICIT AlgorithmIdentifier,
+    //   saltLength       [2] INTEGER,
+    //   trailerField     [3] INTEGER  -- omitted (default 1)
+    // }
+    let pss_oid = [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0a]; // id-RSASSA-PSS
+    let sha256_oid = [0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01];
+    let mgf1_oid = [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x08]; // id-mgf1
+    const NULL: u8 = 0x05;
+
+    let hash_alg = der(SEQ, &[der(OID, &sha256_oid), der(NULL, &[])].concat());
+    // MGF1 AlgorithmIdentifier: OID id-mgf1 + parameter = hash AlgorithmIdentifier.
+    let mgf1_alg = der(SEQ, &[der(OID, &mgf1_oid), hash_alg.clone()].concat());
+    let params = der(
+        SEQ,
+        &[
+            der(0xA0, &hash_alg), // [0] EXPLICIT
+            der(0xA1, &mgf1_alg), // [1] EXPLICIT
+            der(0x82, &[32u8]),   // [2] IMPLICIT INTEGER saltLength = 32
+        ]
+        .concat(),
+    );
+    let sig_alg = der(SEQ, &[der(OID, &pss_oid), params].concat());
+    (cert, sign, sig_alg)
+}
+
+#[test]
+fn rsa_pss_signature_verifies() {
+    let (cert, sign, sig_alg) = rsa_pss_signer();
+    let pdf = assemble_signed_pdf(|d| build_real_cms(d, &cert, &sig_alg, &sign));
+
+    let doc = PdfDocument::open(pdf).expect("open");
+    let s = &doc.signatures()[0];
+    assert_eq!(s.digest, DigestStatus::Verified);
+    assert_eq!(
+        s.crypto,
+        CryptoStatus::Valid,
+        "RSA-PSS signature must verify"
+    );
+    assert_eq!(s.signature_algorithm.as_deref(), Some("RSA-PSS"));
+    assert_eq!(s.signer_common_name.as_deref(), Some("zpdf RSA-PSS Test"));
+    assert!(s.is_cryptographically_valid());
+}
+
+#[test]
+fn corrupted_rsa_pss_signature_is_invalid() {
+    let (cert, sign, sig_alg) = rsa_pss_signer();
+    // Flip the last byte of the CMS signature value (inside the unsigned
+    // /Contents gap): byte-range digest stays Verified, PSS crypto fails.
+    let pdf = assemble_signed_pdf(|d| {
+        let mut cms = build_real_cms(d, &cert, &sig_alg, &sign);
+        let last = cms.len() - 1;
+        cms[last] ^= 0xff;
+        cms
+    });
+
+    let doc = PdfDocument::open(pdf).expect("open");
+    let s = &doc.signatures()[0];
+    assert_eq!(s.digest, DigestStatus::Verified, "signed bytes untouched");
+    assert_eq!(
+        s.crypto,
+        CryptoStatus::Invalid,
+        "a corrupted PSS signature must not verify"
+    );
+    assert!(!s.is_cryptographically_valid());
+}
+
+/// A PSS signature whose `signatureAlgorithm` carries the wrong salt length
+/// (claims 48 but the signer used 32) must NOT verify — the params mismatch is
+/// honoured, not silently coerced.
+#[test]
+fn rsa_pss_wrong_salt_length_is_invalid() {
+    let (cert, sign, sig_alg) = rsa_pss_signer();
+    // Re-encode the PSS params with saltLength = 48 (wrong) and rebuild sig_alg.
+    let pss_oid = [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0a];
+    let sha256_oid = [0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01];
+    let mgf1_oid = [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x08];
+    let null = der(0x05, &[]);
+    let hash_alg = der(SEQ, &[der(OID, &sha256_oid), null].concat());
+    let mgf1_alg = der(SEQ, &[der(OID, &mgf1_oid), hash_alg.clone()].concat());
+    let params = der(
+        SEQ,
+        &[
+            der(0xA0, &hash_alg),
+            der(0xA1, &mgf1_alg),
+            der(0x82, &[48u8]), // wrong salt length
+        ]
+        .concat(),
+    );
+    let wrong_sig_alg = der(SEQ, &[der(OID, &pss_oid), params].concat());
+    let _ = sig_alg; // the correct one is unused in this test
+
+    let pdf = assemble_signed_pdf(|d| build_real_cms(d, &cert, &wrong_sig_alg, &sign));
+    let doc = PdfDocument::open(pdf).expect("open");
+    let s = &doc.signatures()[0];
+    assert_eq!(s.digest, DigestStatus::Verified);
+    assert_eq!(
+        s.crypto,
+        CryptoStatus::Invalid,
+        "a PSS signature with the wrong declared salt length must not verify"
     );
 }
 

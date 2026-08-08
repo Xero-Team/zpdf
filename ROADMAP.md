@@ -548,6 +548,18 @@ cargo run -p zpdf-render-wgpu --example viewer -- <file.pdf>   # 交互浏览器
   后端消费的 `DisplayList`//RenderCommand`逐字节不变（测试断言装/不装文本汇时渲染命令一致）， 故 CPU↔GPU 像素一致性不可能回归，且捕获仅在装文本汇（抽取）时运行、open/render 期不触发。 facade re-export`struct_ordered_text`；CLI `zpdf text --struct`。纯 Rust 零新依赖、无解析/
   后端改动；真实标记文档端到端验证（页面上离行放置的内联代码段——几何提取会错位——被还原到
   句子的正确阅读位置）
+- [X] **既有 PDF 粗粒度补标签 + PDF/UA 表格/OBJR 校验**（`zpdf-writer/src/tag.rs` + `zpdf-document/src/pdfua.rs`）：
+  - `IncrementalWriter::tag_pdf`：给未标记既有 PDF 加粗粒度标签——每页 `/Contents` 包进单个
+    `/Part <</MCID 0>> BDC … EMC`，发 `/StructTreeRoot` + `/ParentTree` 数字树 + `/MarkInfo /Marked true`，
+    每页一个 `/Part` 元素（`/Alt` 取该页提取文本，≤4 KiB 截断），页加 `/StructParents`。**粒度限制**：
+    无法把既有内容细分为段落/标题/表格语义（需理解已绘制字形版式，范围外），每页一个 `/Part`；
+    已标记文档为 no-op（不重包不重复）；CLI `zpdf tag <in> -o <out>`（`--password` 经加密文档路径）
+  - PDF/UA-1 校验器加宽：`table-structure`（Table 子须为 TR、TR 子须为 TH/TD）、`annotation-objr`
+    （文档有 Widget/Link/标注 markup 但结构树无 `/OBJR` → flag，best-effort 全树计数）。原 4 规则不变
+  - 测试：`zpdf-writer/tests/tagged.rs` 新增 2 例（两页 PDF 补标签后每页 `/Part`+MCID 0；已标记 no-op
+    不重复）；`zpdf-document/src/pdfua.rs` 新增 4 例（非-TR Table 子、非-cell TR 子、合规 Table、
+    有 Link 无 OBJR）。全 writer+document 测试与 clippy 干净；`zpdf tag` 真实 PDF 端到端验证（`zpdf info`
+    报 `Tagged PDF: yes`/`Structure tree: 1 element`）
 
 ### P4.12 — 数字签名（Digital Signatures）
 
@@ -560,12 +572,16 @@ cargo run -p zpdf-render-wgpu --example viewer -- <file.pdf>   # 交互浏览器
   或 CMS 结构错误为 `Unsupported`。对抗性安全：最大 CMS 4 MiB、越界 `/ByteRange` 拒绝、
   DER 解析器拒绝不定长/截断 TLV、无递归无索引越界
 - [X] 公钥签名验证（`CryptoStatus`，RustCrypto）：从 CMS `SignerInfo` 提取签名算法
-  （RSA PKCS#1 v1.5 / ECDSA P-256 / P-384）、签名属性 DER（`[0]` 标签改写为 `SET`）、
+  （RSA PKCS#1 v1.5 / **RSASSA-PSS (RFC 4055)** / ECDSA P-256 / P-384）、签名属性 DER（`[0]` 标签改写为 `SET`）、
   签名值（`signature` OCTET STRING）；从首个嵌入证书 `SubjectPublicKeyInfo` 提取公钥
   （RSA `RSAPublicKey` / EC SEC1 点）；用摘要算法哈希签名属性，RSA/ECDSA 验签。验证通过为
-  `Valid`，失败为 `Invalid`（伪造/损坏），不支持的算法（RSA-PSS/DSA/非 P-256/384 曲线）或
-  无法解析的证书/公钥为 `Unsupported`。`Signature::is_cryptographically_valid()` 为
-  **完整性与签名双通过** — **不校验证书链信任锚、撤销、签名时效**（无信任库，范围外）
+  `Valid`，失败为 `Invalid`（伪造/损坏），不支持的算法（DSA/非 P-256/384 曲线，或 PSS 的
+  `RSASSA-PSS-params` 无法解析）或无法解析的证书/公钥为 `Unsupported`。`Signature::is_cryptographically_valid()` 为
+  **完整性与签名双通过** — **不校验证书链信任锚、撤销、签名时效**（无信任库，范围外）。
+  **RSASSA-PSS**：解析 `signatureAlgorithm` 中的 `RSASSA-PSS-params`（hash/MGF1-hash/saltLength，
+  兼容 EXPLICIT 与 IMPLICIT 上下文标记，缺失字段取 SHA-1/MGF1-SHA-1/20 默认值），经 rsa 0.9
+  `Pss::new_with_salt::<D>(salt_len)` 验签；声明的 hash 须与 SignerInfo 摘要一致、salt_len 须与
+  签名所用一致，否则 `Unsupported`/`Invalid`（不静默纠正参数）
 - [X] CMS / X.509 最小化解析器（`cms` 模块）：手写 DER TLV 游走器（RFC 5652 CMS `SignedData`
   + X.509 `Certificate`），提取摘要算法 OID、`messageDigest` 属性、首个证书的 CN 与 SPKI、
   签名算法 OID、签名值。按 OID 分类跳过 `sid`（`issuerAndSerialNumber` 也是 `SEQUENCE`），
@@ -668,6 +684,22 @@ cargo run -p zpdf-render-wgpu --example viewer -- <file.pdf>   # 交互浏览器
   矢量路径（`PathSegment`/`PathStyle`）
 - [X] 构建时自动**字体子集化**（`subset.rs` sparse-glyf：清空未用轮廓、保留
   度量与 cmap，复合字形闭包，强制 long loca；Arial 演示 549KB → 135KB）
+- [X] **CJK 竖排 + 预定义 CMap 写入**（`CidEncoding`/`PredefinedOrdering`）：
+  - `embed_composite_font_vertical`：Type0 `/Encoding /Identity-V`，后代 CIDFont
+    `/DW2`（从字体 `vhea` 取竖排度量，缺省 `[880 −1000]`）+ 稀疏 `/W2`，内容流
+    竖排文本矩阵 `0 1 -1 0 x y`（90° 旋转，自上而下推进）；2 字节码仍为 GID
+  - `embed_composite_font_predefined(bytes, ordering, vertical)`：用预定义 Adobe
+    Unicode CMap（`UniGB-UCS2`/`UniJIS-UCS2`/`UniKS-UCS2`/`UniCNS-UCS2` 的
+    `-H`/`-V` 变体）替代 Identity-H——2 字节码 = Unicode 标量，`/CIDToGIDMap` 为
+    显式表（按 CID 索引的 2 字节大端 GID，非 `/Identity`），`/CIDSystemInfo`
+    取集合的 Registry/Ordering/Supplement（GB1/Japan1/Korea1/CNS1）
+  - 子项相互正交：Identity-H（默认）/ Identity-V（竖排）/ 预定义 `-H`/`-V`
+  - 限制：预定义 CMap 仅编码 BMP 字符（UCS2 命名暗示），辅助平面字符回退
+    `.notdef`（全平面覆盖用 Identity-H/V）；`ttf-parser` 0.25 未暴露逐字形
+    `vmtx` 竖排推进，故 `/W2` 按字体级 `vhea` 度量近似（CJK 常见均匀全 em 推进）
+  - 测试：`zpdf-writer/tests/cjk.rs` 新增 5 例（Identity-V 结构 + 真实语料
+    round-trip、预定义 `-H`/`-V` 结构 + 真实语料 round-trip），文本经读取侧
+    `page0_text` round-trip 验证
 
 ### P5.2 — 保存时加密 + 加密文档编辑（`encrypt.rs`）
 - [X] `RewriteOptions::encrypt`：AES-256 R6（算法 8/9 + 2.B 强化哈希、`/Perms`）
@@ -709,6 +741,20 @@ cargo run -p zpdf-render-wgpu --example viewer -- <file.pdf>   # 交互浏览器
   `pdfaid` 声明、`GTS_PDFA1` 输出意图 + ICC、字体内嵌（含 Type0 后代）、
   禁用特性（JavaScript/Launch、内嵌文件与透明组 A-1）；
   CLI `zpdf validate --profile pdfa-1b|pdfa-2b`（FAIL 退出码 3）
+- [X] **Type0/CID 字体回退嵌入 + 注解类型剔除**（`zpdf-writer/src/pdfa_convert.rs`）：
+  - `embed_fallback_fonts` 现在处理 Type0：后代 CIDFont 的 `/FontDescriptor` 嵌入
+    `fallback` 为 `/FontFile2`，并设置 `/CIDToGIDMap /Identity` + 默认 `/DW`，
+    满足 PDF/A 内嵌要求（字形可能不匹配，与简单字体回退同语义）；Type0 回退
+    此前被跳过（"需复合字体写入"），现已被合并的 CJK 复合字体能力解锁
+  - `strip_forbidden_annotations`：转换期遍历页树 `/Annots`，剔除禁用注解子类型
+    （3D/Sound/Movie 全部 profile；FileAttachment 仅 A-1b，A-2b 保留内嵌文件）
+    与 `/A` 动作为 JavaScript/Launch 的注解；Widget（表单字段）保留
+  - 校验器加宽：`pdfa.rs` 新增 `annotation-subtype`/`annotation-action` 规则，
+    标记禁用注解子类型与 JS/Launch 注解动作（A-1b 额外标记 FileAttachment），
+    使未转换的不合规 PDF 也能被检出
+  - 测试：`pdfa_convert.rs` 新增 3 例（Type0 回退嵌入后 A-1b 通过、禁用注解
+    剔除并 A-1b 通过、FileAttachment 在 A-1b 剔除/A-2b 保留）；`pdfa.rs` 新增
+    3 例校验器规则单测。转换→校验 roundtrip 全过
 
 ---
 

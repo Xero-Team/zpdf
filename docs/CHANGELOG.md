@@ -2,6 +2,64 @@
 
 ## Unreleased
 
+### Tagged PDF: coarse retagging + PDF/UA table/OBJR checks
+
+- `IncrementalWriter::tag_pdf` adds a coarse-grained tag structure to an
+  existing **untagged** PDF: each page's `/Contents` is wrapped in a single
+  `/Part <</MCID 0>> BDC … EMC` sequence, with a `/StructTreeRoot` + `/ParentTree`
+  + `/MarkInfo /Marked true`, and one `/Part` element per page carrying the
+  page's extracted text as `/Alt`. No-op when the document is already tagged.
+  The tags are page-level only — this cannot infer paragraph/heading/table
+  semantics from existing layout; use `DocumentBuilder`'s tagged APIs for
+  fine-grained tags. CLI `zpdf tag <in> -o <out>`.
+- The PDF/UA-1 validator gained two rules: `table-structure` (a `Table`'s
+  element children must be `TR`; a `TR`'s must be `TH`/`TD`) and `annotation-objr`
+  (content-bearing annotations — Widget/Link/marked-up — should be
+  structure-reachable via `/OBJR`; flagged when the tree has none).
+
+### CJK vertical writing + predefined CMap authoring
+
+- `DocumentBuilder::embed_composite_font_vertical`: composite (Type0) fonts in
+  **vertical writing mode** — `/Encoding /Identity-V`, descendant CIDFont
+  `/DW2` vertical metrics (read from the font's `vhea`, default `[880 −1000]`)
+  plus sparse `/W2`, and a vertical text matrix (`0 1 -1 0 x y`) in the content
+  stream so glyphs advance top-to-bottom (tategaki).
+- `DocumentBuilder::embed_composite_font_predefined(bytes, ordering, vertical)`:
+  composite fonts using a **predefined Adobe Unicode CMap**
+  (`UniGB-UCS2`/`UniJIS-UCS2`/`UniKS-UCS2`/`UniCNS-UCS2`, `-H`/`-V` variants)
+  instead of Identity-H. The 2-byte content-stream code is the Unicode scalar,
+  `/CIDToGIDMap` is an explicit table (not `/Identity`), and `/CIDSystemInfo`
+  carries the collection's registry/ordering/supplement.
+- New public types `CidEncoding` and `PredefinedOrdering` (re-exported from
+  `zpdf_writer`). Identity-H authoring is unchanged. Predefined CMaps encode
+  the BMP only; supplementary-plane characters fall back to `.notdef` (use
+  Identity-H/V for full-plane coverage).
+
+### PDF/A: Type0 font fallback + forbidden-annotation removal
+
+- `rewrite_pdf --pdfa` now embeds a fallback font program on **non-embedded
+  Type0/CID fonts** (previously skipped): the descendant CIDFont's
+  `/FontDescriptor` gains `/FontFile2`, and the CIDFont dict gets
+  `/CIDToGIDMap /Identity` + a default `/DW`. Best-effort — the program's glyphs
+  need not match the original (same semantics as the simple-font fallback).
+- PDF/A conversion now **strips forbidden annotations** from each page's
+  `/Annots`: `3D`/`Sound`/`Movie` (all profiles), `FileAttachment` (A-1b only;
+  A-2b permits embedded files), and any annotation whose `/A` action is
+  JavaScript or Launch. Widget annotations (form fields) are preserved.
+- The PDF/A validator gained matching rules: `annotation-subtype` and
+  `annotation-action` flag forbidden subtypes and JS/Launch annotation actions,
+  so a non-conforming source PDF is now correctly reported (not just fixed by
+  conversion).
+
+### RSA-PSS signature verification (RFC 4055)
+
+- RSASSA-PSS signatures are now cryptographically verified (previously
+  recognised but reported `Unsupported`). The `RSASSA-PSS-params` in the CMS
+  `signatureAlgorithm` (hash / MGF1 hash / salt length) are parsed with both
+  EXPLICIT and IMPLICIT context tags, then verified with `rsa`'s PSS scheme.
+  Mismatched declared hash or salt length yields `Unsupported`/`Invalid` rather
+  than silent coercion.
+
 ### PDF creation from scratch (`DocumentBuilder`)
 
 - New `zpdf_writer::DocumentBuilder`: author complete PDFs without an existing

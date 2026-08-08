@@ -24,7 +24,9 @@ use zpdf_core::{ObjectId, PdfObject};
 use zpdf_parser::PdfFile;
 
 use crate::catalog::Catalog;
-use crate::structure::{is_tagged, parse_struct_tree, StructElem, StructRole, StructTree};
+use crate::structure::{
+    is_tagged, parse_struct_tree, StructElem, StructKid, StructRole, StructTree,
+};
 
 /// The validation profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,8 +75,10 @@ pub fn validate(file: &PdfFile, profile: Profile) -> ValidationReport {
         check_figures_have_alt(tree, &mut v);
         check_has_heading(tree, &mut v);
         check_roles_standard(tree, &mut v);
+        check_table_structure(tree, &mut v);
     }
     check_page_struct_parents(file, &mut v);
+    check_annotation_objr(file, tree.as_ref(), &mut v);
     ValidationReport {
         profile,
         violations: v,
@@ -186,6 +190,136 @@ fn check_roles_standard(tree: &StructTree, out: &mut Vec<Violation>) {
     }
 }
 
+/// Table-structure consistency (ISO 14289-1 §7.6): a `Table` element's
+/// element children should be `TR` rows, and a `TR`'s element children should
+/// be `TH`/`TD` cells. A `Table` with non-row element children, or a `TR` with
+/// non-cell element children, is flagged. Best-effort: only checks element
+/// kids (marked-content/OBJR kids inside a table are non-conformant but rare;
+/// nesting depth is bounded by the tree's parse-time guards).
+fn check_table_structure(tree: &StructTree, out: &mut Vec<Violation>) {
+    let mut table_bad = 0usize;
+    let mut row_bad = 0usize;
+    visit(tree.children.iter(), &mut |elem| {
+        if elem.role == StructRole::Table {
+            for kid in elem.child_elements() {
+                if kid.role != StructRole::Tr {
+                    table_bad += 1;
+                    break;
+                }
+            }
+        }
+        if elem.role == StructRole::Tr {
+            for kid in elem.child_elements() {
+                if !matches!(kid.role, StructRole::Th | StructRole::Td) {
+                    row_bad += 1;
+                    break;
+                }
+            }
+        }
+    });
+    if table_bad > 0 {
+        out.push(Violation {
+            rule: "table-structure",
+            message: format!(
+                "{table_bad} Table element(s) have non-TR element children; PDF/UA requires table rows"
+            ),
+        });
+    }
+    if row_bad > 0 {
+        out.push(Violation {
+            rule: "table-structure",
+            message: format!(
+                "{row_bad} TR element(s) have non-TH/TD element children; PDF/UA requires table cells"
+            ),
+        });
+    }
+}
+
+/// Annotation structure coverage (ISO 14289-1 §7.18): annotations that convey
+/// content (Widget form fields, Link, and content-bearing markup annotations)
+/// should participate in the structure tree via `/OBJR` references. This is a
+/// best-effort check: if the document has any such annotations but the
+/// structure tree contains no `OBJR` kids at all, flag it. A full per-annotation
+/// audit is out of scope (it needs annotation↔page↔OBJR cross-referencing).
+fn check_annotation_objr(file: &PdfFile, tree: Option<&StructTree>, out: &mut Vec<Violation>) {
+    let Some(tree) = tree else {
+        return;
+    };
+    let Ok(root) = file.trailer.get_ref("Root") else {
+        return;
+    };
+    let Ok(catalog) = file.resolve(root).and_then(|o| o.as_dict().cloned()) else {
+        return;
+    };
+    let Ok(pages_root) = catalog.get_ref("Pages") else {
+        return;
+    };
+    // Count content-bearing annotations across all pages.
+    let mut content_annots = 0usize;
+    let mut stack = vec![(pages_root, 0usize)];
+    let mut visited: HashSet<ObjectId> = HashSet::new();
+    while let Some((node, depth)) = stack.pop() {
+        if depth > 64 || !visited.insert(node) {
+            continue;
+        }
+        let Ok(dict) = file.resolve(node).and_then(|o| o.as_dict().cloned()) else {
+            continue;
+        };
+        if let Some(PdfObject::Array(kids)) = dict.get("Kids").map(|o| deref(file, o)).as_ref() {
+            for kid in kids {
+                if let PdfObject::Ref(r) = kid {
+                    stack.push((*r, depth + 1));
+                }
+            }
+        }
+        let annots_obj = dict.get("Annots").map(|o| deref(file, o));
+        let Some(PdfObject::Array(annots)) = annots_obj.as_ref() else {
+            continue;
+        };
+        for a in annots {
+            let Ok(ad) = deref(file, a).as_dict().cloned() else {
+                continue;
+            };
+            let subtype = ad.get_name("Subtype").unwrap_or("");
+            // Widget (form fields), Link, and the markup/content annotations
+            // are the ones PDF/UA requires to be structure-reachable.
+            if matches!(
+                subtype,
+                "Widget"
+                    | "Link"
+                    | "FreeText"
+                    | "Text"
+                    | "Highlight"
+                    | "Underline"
+                    | "StrikeOut"
+                    | "Squiggly"
+            ) {
+                content_annots += 1;
+            }
+        }
+    }
+    if content_annots == 0 {
+        return;
+    }
+    // Count OBJR kids across the whole structure tree.
+    let mut objr_count = 0usize;
+    visit_kids(tree.children.iter(), &mut |elem| {
+        for kid in &elem.kids {
+            if matches!(kid, StructKid::Object { .. }) {
+                objr_count += 1;
+            }
+        }
+    });
+    if objr_count == 0 {
+        out.push(Violation {
+            rule: "annotation-objr",
+            message: format!(
+                "document has {content_annots} content-bearing annotation(s) but the structure tree has no /OBJR references; PDF/UA requires annotations to be structure-reachable"
+            ),
+        });
+    }
+}
+
 /// Every page dict must carry `/StructParents`.
 fn check_page_struct_parents(file: &PdfFile, out: &mut Vec<Violation>) {
     let Ok(root) = file.trailer.get_ref("Root") else {
@@ -232,6 +366,20 @@ fn check_page_struct_parents(file: &PdfFile, out: &mut Vec<Violation>) {
 /// element (including nested ones). Bounded by the tree's own guards at parse
 /// time, so this walk cannot recurse without bound.
 fn visit<'a>(elems: impl Iterator<Item = &'a StructElem>, f: &mut dyn FnMut(&StructElem)) {
+    fn walk<'a>(elem: &'a StructElem, f: &mut dyn FnMut(&StructElem)) {
+        f(elem);
+        for child in elem.child_elements() {
+            walk(child, f);
+        }
+    }
+    for elem in elems {
+        walk(elem, f);
+    }
+}
+
+/// Like [`visit`], but the callback can inspect each element's `kids` (the
+/// `/K` entries, including non-element kids such as `OBJR` references).
+fn visit_kids<'a>(elems: impl Iterator<Item = &'a StructElem>, f: &mut dyn FnMut(&StructElem)) {
     fn walk<'a>(elem: &'a StructElem, f: &mut dyn FnMut(&StructElem)) {
         f(elem);
         for child in elem.child_elements() {
@@ -352,6 +500,132 @@ mod tests {
         assert!(
             rules.contains(&"headings"),
             "headings should fire: {rules:?}"
+        );
+    }
+
+    #[test]
+    fn table_with_non_tr_children_is_flagged() {
+        // Table whose child is a P (not a TR) — must flag table-structure.
+        let file = ua_pdf(
+            "<< /Type /Catalog /Pages 2 0 R /Lang (en) /MarkInfo << /Marked true >> \
+             /StructTreeRoot 4 0 R >>",
+            &[
+                // 4: StructTreeRoot → [H1, Table]
+                "<< /Type /StructTreeRoot /K [5 0 R 6 0 R] /ParentTree 7 0 R /ParentTreeNextKey 2 >>",
+                // 5: H1
+                "<< /Type /StructElem /S /H1 /P 4 0 R /Pg 3 0 R /K 0 >>",
+                // 6: Table with a P child (non-TR) — non-conformant
+                "<< /Type /StructElem /S /Table /P 4 0 R /K [8 0 R] >>",
+                // 7: ParentTree
+                "<< /Nums [0 9 0 R] >>",
+                // 8: P inside the table
+                "<< /Type /StructElem /S /P /P 6 0 R /Pg 3 0 R /K 1 >>",
+                // 9: array
+                "<< 5 0 R 8 0 R >>",
+            ],
+        );
+        let r = validate(&file, Profile::Ua1);
+        let rules: Vec<&str> = r.violations.iter().map(|v| v.rule).collect();
+        assert!(
+            rules.contains(&"table-structure"),
+            "table-structure should fire for non-TR table child: {rules:?}"
+        );
+    }
+
+    #[test]
+    fn tr_with_non_cell_children_is_flagged() {
+        // Table → TR → P (non-cell) — flags the TR row check.
+        let file = ua_pdf(
+            "<< /Type /Catalog /Pages 2 0 R /Lang (en) /MarkInfo << /Marked true >> \
+             /StructTreeRoot 4 0 R >>",
+            &[
+                "<< /Type /StructTreeRoot /K [5 0 R 6 0 R] /ParentTree 7 0 R /ParentTreeNextKey 2 >>",
+                // 5: H1
+                "<< /Type /StructElem /S /H1 /P 4 0 R /Pg 3 0 R /K 0 >>",
+                // 6: Table → TR → P
+                "<< /Type /StructElem /S /Table /P 4 0 R /K [8 0 R] >>",
+                // 7: ParentTree
+                "<< /Nums [0 9 0 R] >>",
+                // 8: TR with a P child (non-cell)
+                "<< /Type /StructElem /S /TR /P 6 0 R /K [10 0 R] >>",
+                // 9: array
+                "<< 5 0 R >>",
+                // 10: P inside the TR
+                "<< /Type /StructElem /S /P /P 8 0 R /Pg 3 0 R /K 1 >>",
+            ],
+        );
+        let r = validate(&file, Profile::Ua1);
+        let rules: Vec<&str> = r.violations.iter().map(|v| v.rule).collect();
+        assert!(
+            rules.contains(&"table-structure"),
+            "table-structure should fire for non-cell TR child: {rules:?}"
+        );
+    }
+
+    #[test]
+    fn well_formed_table_passes() {
+        // Table → TR → [TH, TD] — conformant table structure.
+        let file = ua_pdf(
+            "<< /Type /Catalog /Pages 2 0 R /Lang (en) /MarkInfo << /Marked true >> \
+             /StructTreeRoot 4 0 R >>",
+            &[
+                "<< /Type /StructTreeRoot /K [5 0 R 6 0 R] /ParentTree 7 0 R /ParentTreeNextKey 3 >>",
+                // 5: H1
+                "<< /Type /StructElem /S /H1 /P 4 0 R /Pg 3 0 R /K 0 >>",
+                // 6: Table → TR → [TH, TD]
+                "<< /Type /StructElem /S /Table /P 4 0 R /K [8 0 R] >>",
+                // 7: ParentTree
+                "<< /Nums [0 9 0 R] >>",
+                // 8: TR → [TH, TD]
+                "<< /Type /StructElem /S /TR /P 6 0 R /K [10 0 R 11 0 R] >>",
+                // 9: array
+                "<< 5 0 R >>",
+                // 10: TH
+                "<< /Type /StructElem /S /TH /P 8 0 R /Pg 3 0 R /K 1 >>",
+                // 11: TD
+                "<< /Type /StructElem /S /TD /P 8 0 R /Pg 3 0 R /K 2 >>",
+            ],
+        );
+        let r = validate(&file, Profile::Ua1);
+        let rules: Vec<&str> = r.violations.iter().map(|v| v.rule).collect();
+        assert!(
+            !rules.contains(&"table-structure"),
+            "well-formed table should not flag: {rules:?}"
+        );
+    }
+
+    #[test]
+    fn content_annotation_without_objr_is_flagged() {
+        // A page with a Link annotation but no /OBJR in the structure tree.
+        let page = "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /StructParents 0 \
+                    /Annots [10 0 R] >>";
+        let objs = vec![
+            "<< /Type /Catalog /Pages 2 0 R /Lang (en) /MarkInfo << /Marked true >> /StructTreeRoot 4 0 R >>".to_string(),
+            PAGES.to_string(),
+            page.to_string(),
+            // 4: StructTreeRoot → H1 (no OBJR anywhere)
+            "<< /Type /StructTreeRoot /K 5 0 R /ParentTree 6 0 R /ParentTreeNextKey 1 >>".to_string(),
+            // 5: H1
+            "<< /Type /StructElem /S /H1 /P 4 0 R /Pg 3 0 R /K 0 >>".to_string(),
+            // 6: ParentTree
+            "<< /Nums [0 7 0 R] >>".to_string(),
+            // 7: array
+            "<< 5 0 R >>".to_string(),
+            // 8,9 unused slots to keep 10 the annot
+            "null".to_string(),
+            "null".to_string(),
+            // 10: Link annotation
+            "<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] /P 3 0 R >>".to_string(),
+        ];
+        let file = PdfFile::parse(build_pdf(
+            &objs.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        ))
+        .expect("parse");
+        let r = validate(&file, Profile::Ua1);
+        let rules: Vec<&str> = r.violations.iter().map(|v| v.rule).collect();
+        assert!(
+            rules.contains(&"annotation-objr"),
+            "annotation-objr should fire for a Link with no OBJR: {rules:?}"
         );
     }
 }
