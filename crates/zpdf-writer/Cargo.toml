@@ -31,6 +31,14 @@ p256 = { workspace = true, features = ["pkcs8"] }
 aes.workspace = true
 cbc = { workspace = true, features = ["alloc"] }
 getrandom = "0.2"
+# Optional RFC 3161 timestamp requester (pure-Rust HTTP via ureq + rustls).
+ureq = { workspace = true, optional = true }
+
+[features]
+# Enables the built-in `UreqTimestampRequester` (pure-Rust HTTP to a TSA URL).
+# Without it, the signing API still accepts a caller-supplied
+# `TimestampRequester` — the library has no network dependency by default.
+timestamp = ["dep:ureq"]
 
 [dev-dependencies]
 # Deterministic RSA keygen for the signing round-trip tests.

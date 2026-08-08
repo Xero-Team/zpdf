@@ -38,7 +38,7 @@ pub use outline::OutlineItem;
 pub use output_intents::OutputIntent;
 pub use page::{PdfPage, ResourceDict};
 pub use page_labels::{PageLabelStyle, PageLabels};
-pub use signature::{ByteRangeCoverage, CryptoStatus, DigestStatus, Signature};
+pub use signature::{ByteRangeCoverage, CryptoStatus, DigestStatus, RevocationStatus, Signature};
 pub use structure::{StructElem, StructKid, StructRole, StructTree};
 pub use xmp::XmpMetadata;
 

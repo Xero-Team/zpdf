@@ -652,6 +652,29 @@ fn cmd_signatures(args: &[String]) -> zpdf::Result<()> {
             println!("    => Cryptographically sound (bytes intact + signature valid); trust anchor NOT validated");
         }
 
+        // Production-grade metadata: embedded timestamp, DSS, cert count, revocation.
+        println!(
+            "    Timestamp: {}",
+            if s.has_timestamp {
+                "present (RFC 3161 unsignedAttr)"
+            } else {
+                "none"
+            }
+        );
+        println!("    Embedded certs: {}", s.cert_count);
+        println!(
+            "    /DSS (LTV): {}",
+            if s.has_dss { "present" } else { "absent" }
+        );
+        println!(
+            "    Revocation: {}",
+            match s.revocation {
+                zpdf::RevocationStatus::Unknown => "unknown (no CRL embedded)",
+                zpdf::RevocationStatus::NotRevoked => "not revoked (per embedded CRL)",
+                zpdf::RevocationStatus::Revoked => "REVOKED (per embedded CRL)",
+            }
+        );
+
         // Certificate-chain verification against the provided anchors.
         if let Some(anchors) = &anchors {
             let verdict = match &s.cms_blob {
@@ -2248,6 +2271,12 @@ fn cmd_sign(args: &[String]) -> zpdf::Result<()> {
     let mut name: Option<String> = None;
     let mut reason: Option<String> = None;
     let mut location: Option<String> = None;
+    let mut subfilter = zpdf_writer::SubFilter::AdbePkcs7Detached;
+    let mut appearance = false;
+    let mut appearance_rect: Option<String> = None;
+    let mut tsa_url: Option<String> = None;
+    let mut cert_chain_paths: Vec<String> = Vec::new();
+    let mut crl_paths: Vec<String> = Vec::new();
 
     let mut i = 0;
     while i < args.len() {
@@ -2270,6 +2299,48 @@ fn cmd_sign(args: &[String]) -> zpdf::Result<()> {
             }
             "--location" => {
                 location = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "--subfilter" => {
+                subfilter = match args.get(i + 1).map(String::as_str) {
+                    Some("pkcs7") | Some("adbe.pkcs7.detached") => {
+                        zpdf_writer::SubFilter::AdbePkcs7Detached
+                    }
+                    Some("cades") | Some("ETSI.CAdES.detached") => {
+                        zpdf_writer::SubFilter::EtsiCAdESDetached
+                    }
+                    other => {
+                        eprintln!(
+                            "Unknown --subfilter {:?} (use pkcs7 or cades)",
+                            other.unwrap_or("")
+                        );
+                        process::exit(1);
+                    }
+                };
+                i += 2;
+            }
+            "--appearance" => {
+                appearance = true;
+                i += 1;
+            }
+            "--appearance-rect" => {
+                appearance_rect = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "--tsa" => {
+                tsa_url = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "--cert-chain" => {
+                if let Some(p) = args.get(i + 1) {
+                    cert_chain_paths.push(p.clone());
+                }
+                i += 2;
+            }
+            "--crl" => {
+                if let Some(p) = args.get(i + 1) {
+                    crl_paths.push(p.clone());
+                }
                 i += 2;
             }
             "-o" => {
@@ -2299,10 +2370,64 @@ fn cmd_sign(args: &[String]) -> zpdf::Result<()> {
         process::exit(1);
     }
 
-    let key_der = fs::read(&key_path).map_err(zpdf::Error::Io)?;
-    let cert_der = fs::read(&cert_path).map_err(zpdf::Error::Io)?;
-    let key = zpdf_writer::SigningKey::from_pkcs8_der(&key_der)
-        .or_else(|_| zpdf_writer::SigningKey::rsa_from_pkcs1_der(&key_der))?;
+    let key_bytes = fs::read(&key_path).map_err(zpdf::Error::Io)?;
+    let cert_bytes = fs::read(&cert_path).map_err(zpdf::Error::Io)?;
+    // Auto-detect PEM vs DER for both key and cert.
+    let key = if key_bytes.starts_with(b"-----BEGIN") {
+        zpdf_writer::SigningKey::from_pem(&key_bytes)?
+    } else {
+        zpdf_writer::SigningKey::from_pkcs8_der(&key_bytes)
+            .or_else(|_| zpdf_writer::SigningKey::rsa_from_pkcs1_der(&key_bytes))?
+    };
+    let cert_der = if cert_bytes.starts_with(b"-----BEGIN CERTIFICATE-----") {
+        zpdf_writer::sign::pem_decode(&cert_bytes, "CERTIFICATE")?
+    } else {
+        cert_bytes
+    };
+
+    let extra_certs: Vec<Vec<u8>> = cert_chain_paths
+        .iter()
+        .map(|p| {
+            let b = fs::read(p).map_err(zpdf::Error::Io)?;
+            if b.starts_with(b"-----BEGIN CERTIFICATE-----") {
+                zpdf_writer::sign::pem_decode(&b, "CERTIFICATE")
+            } else {
+                Ok(b)
+            }
+        })
+        .collect::<zpdf::Result<_>>()?;
+    let crls: Vec<Vec<u8>> = crl_paths
+        .iter()
+        .map(|p| fs::read(p).map_err(zpdf::Error::Io))
+        .collect::<zpdf::Result<_>>()?;
+
+    let appearance = if appearance {
+        let rect = match appearance_rect.as_deref() {
+            Some(s) => parse_rect(s).unwrap_or_else(|| {
+                eprintln!("--appearance-rect X0,Y0,X1,Y1 required with --appearance");
+                process::exit(1);
+            }),
+            None => zpdf::Rect::new(20.0, 20.0, 220.0, 60.0),
+        };
+        Some(zpdf_writer::AppearanceSpec {
+            rect,
+            ..Default::default()
+        })
+    } else {
+        None
+    };
+
+    let timestamp = match tsa_url {
+        #[cfg(feature = "timestamp")]
+        Some(url) => Some(Box::new(zpdf_writer::UreqTimestampRequester::new(url))
+            as Box<dyn zpdf_writer::TimestampRequester>),
+        #[cfg(not(feature = "timestamp"))]
+        Some(_) => {
+            eprintln!("--tsa requires building zpdf with the `timestamp` feature");
+            process::exit(1);
+        }
+        None => None,
+    };
 
     let writer = build_writer(&input_path, password.as_deref())?;
     let signed = writer.sign(
@@ -2312,6 +2437,11 @@ fn cmd_sign(args: &[String]) -> zpdf::Result<()> {
             name,
             reason,
             location,
+            subfilter,
+            appearance,
+            extra_certs,
+            crls,
+            timestamp,
             ..Default::default()
         },
     )?;
@@ -2319,6 +2449,16 @@ fn cmd_sign(args: &[String]) -> zpdf::Result<()> {
     println!("Signed → {out_path}");
     println!("Note: certificate chain trust is not established by zpdf; viewers will show the signer as untrusted unless the certificate is in their trust store.");
     Ok(())
+}
+
+/// Parse a `X0,Y0,X1,Y1` rect string.
+fn parse_rect(s: &str) -> Option<zpdf::Rect> {
+    let parts: Vec<f64> = s.split(',').filter_map(|p| p.trim().parse().ok()).collect();
+    if parts.len() == 4 {
+        Some(zpdf::Rect::new(parts[0], parts[1], parts[2], parts[3]))
+    } else {
+        None
+    }
 }
 
 /// `input.pdf` → `input-split.pdf` or `input-3.pdf` for a page number.

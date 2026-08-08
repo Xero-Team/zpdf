@@ -20,8 +20,8 @@ pub use zpdf_document::{
     AcroForm, Annotation, ByteRangeCoverage, CryptoStatus, DestView, Destination, DigestStatus,
     DocInfo, EmbeddedFile, EmbeddedSource, FieldKind, FieldValue, FormField,
     GeographicCoordinateSystem, Measure, OcConfig, OutlineItem, OutputIntent, PageLabelStyle,
-    PageLabels, PdfDocument, PdfPage, ResourceDict, Signature, StructElem, StructKid, StructRole,
-    StructTree, XmpMetadata,
+    PageLabels, PdfDocument, PdfPage, ResourceDict, RevocationStatus, Signature, StructElem,
+    StructKid, StructRole, StructTree, XmpMetadata,
 };
 pub use zpdf_font::FontCache;
 pub use zpdf_image::{DecodedImage, ImageCache};

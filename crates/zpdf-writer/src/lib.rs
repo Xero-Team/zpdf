@@ -67,7 +67,9 @@ pub use merge::extract_pages;
 pub use metadata::InfoUpdate;
 pub use redact::RedactOptions;
 pub use rewrite::{rewrite_pdf, PdfaConvertConfig, PdfaProfile, RewriteOptions};
-pub use sign::{SignatureOptions, SigningKey};
+#[cfg(feature = "timestamp")]
+pub use sign::UreqTimestampRequester;
+pub use sign::{AppearanceSpec, SignatureOptions, SigningKey, SubFilter, TimestampRequester};
 pub use stamp::{jpeg_dimensions, StampImage, StampItem};
 
 /// An object queued for the incremental update, kept unserialized so later
