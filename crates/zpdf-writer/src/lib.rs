@@ -46,6 +46,7 @@ pub mod linearize;
 pub mod merge;
 pub mod metadata;
 pub mod pages;
+mod pdfa_convert;
 pub mod redact;
 pub mod rewrite;
 pub mod sign;
@@ -65,7 +66,7 @@ pub use linearize::linearize_pdf;
 pub use merge::extract_pages;
 pub use metadata::InfoUpdate;
 pub use redact::RedactOptions;
-pub use rewrite::{rewrite_pdf, RewriteOptions};
+pub use rewrite::{rewrite_pdf, PdfaConvertConfig, PdfaProfile, RewriteOptions};
 pub use sign::{SignatureOptions, SigningKey};
 pub use stamp::{jpeg_dimensions, StampImage, StampItem};
 

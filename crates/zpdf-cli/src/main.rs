@@ -1866,6 +1866,9 @@ fn cmd_optimize(args: &[String]) -> zpdf::Result<()> {
     let mut owner_pw = String::new();
     let mut max_image_dim: Option<u32> = None;
     let mut linearize = false;
+    let mut pdfa: Option<String> = None;
+    let mut fallback_font_path: Option<String> = None;
+    let mut icc_path: Option<String> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -1902,6 +1905,18 @@ fn cmd_optimize(args: &[String]) -> zpdf::Result<()> {
                 linearize = true;
                 i += 1;
             }
+            "--pdfa" => {
+                pdfa = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "--fallback-font" => {
+                fallback_font_path = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "--icc" => {
+                icc_path = args.get(i + 1).cloned();
+                i += 2;
+            }
             other if !other.starts_with('-') => {
                 if input.is_none() {
                     input = Some(other.to_string());
@@ -1934,15 +1949,52 @@ fn cmd_optimize(args: &[String]) -> zpdf::Result<()> {
         }
     };
 
+    let pdfa = match pdfa.as_deref() {
+        None => None,
+        Some("pdfa-1b") | Some("a-1b") => Some(zpdf_writer::PdfaProfile::A1b),
+        Some("pdfa-2b") | Some("a-2b") => Some(zpdf_writer::PdfaProfile::A2b),
+        Some(other) => {
+            eprintln!("Unknown --pdfa profile: {other} (use pdfa-1b or pdfa-2b)");
+            process::exit(1);
+        }
+    };
+    if pdfa.is_some() && encrypt.is_some() {
+        eprintln!("--pdfa cannot be combined with --encrypt (PDF/A forbids encryption)");
+        process::exit(1);
+    }
+    if pdfa.is_some() && linearize {
+        eprintln!("--pdfa cannot be combined with --linearize (use one or the other)");
+        process::exit(1);
+    }
+    let pdfa = match pdfa {
+        None => None,
+        Some(profile) => {
+            let icc = match icc_path.as_deref() {
+                Some(p) => Some(std::fs::read(p).map_err(zpdf::Error::Io)?),
+                None => None,
+            };
+            let fallback_font = match fallback_font_path.as_deref() {
+                Some(p) => Some(std::fs::read(p).map_err(zpdf::Error::Io)?),
+                None => None,
+            };
+            Some(zpdf_writer::PdfaConvertConfig {
+                profile,
+                icc,
+                fallback_font,
+            })
+        }
+    };
+
     let doc = open_document(&input_path, password.as_deref())?;
     warn_signatures(&doc);
-    if doc.is_encrypted() && encrypt.is_none() {
+    if doc.is_encrypted() && encrypt.is_none() && pdfa.is_none() {
         eprintln!("Note: output will be decrypted (rewrite drops /Encrypt).");
     }
     let options = zpdf_writer::RewriteOptions {
         compress_uncompressed: !no_compress,
         encrypt,
         max_image_dimension: max_image_dim,
+        pdfa,
     };
     let bytes = if linearize {
         if encrypt_algo.is_some() {
