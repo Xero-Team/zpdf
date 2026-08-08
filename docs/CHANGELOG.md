@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+### CJK vertical writing + predefined CMap authoring
+
+- `DocumentBuilder::embed_composite_font_vertical`: composite (Type0) fonts in
+  **vertical writing mode** — `/Encoding /Identity-V`, descendant CIDFont
+  `/DW2` vertical metrics (read from the font's `vhea`, default `[880 −1000]`)
+  plus sparse `/W2`, and a vertical text matrix (`0 1 -1 0 x y`) in the content
+  stream so glyphs advance top-to-bottom (tategaki).
+- `DocumentBuilder::embed_composite_font_predefined(bytes, ordering, vertical)`:
+  composite fonts using a **predefined Adobe Unicode CMap**
+  (`UniGB-UCS2`/`UniJIS-UCS2`/`UniKS-UCS2`/`UniCNS-UCS2`, `-H`/`-V` variants)
+  instead of Identity-H. The 2-byte content-stream code is the Unicode scalar,
+  `/CIDToGIDMap` is an explicit table (not `/Identity`), and `/CIDSystemInfo`
+  carries the collection's registry/ordering/supplement.
+- New public types `CidEncoding` and `PredefinedOrdering` (re-exported from
+  `zpdf_writer`). Identity-H authoring is unchanged. Predefined CMaps encode
+  the BMP only; supplementary-plane characters fall back to `.notdef` (use
+  Identity-H/V for full-plane coverage).
+
+### RSA-PSS signature verification (RFC 4055)
+
+- RSASSA-PSS signatures are now cryptographically verified (previously
+  recognised but reported `Unsupported`). The `RSASSA-PSS-params` in the CMS
+  `signatureAlgorithm` (hash / MGF1 hash / salt length) are parsed with both
+  EXPLICIT and IMPLICIT context tags, then verified with `rsa`'s PSS scheme.
+  Mismatched declared hash or salt length yields `Unsupported`/`Invalid` rather
+  than silent coercion.
+
 ### PDF creation from scratch (`DocumentBuilder`)
 
 - New `zpdf_writer::DocumentBuilder`: author complete PDFs without an existing

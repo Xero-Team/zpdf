@@ -147,14 +147,20 @@ struct PageState {
 }
 
 /// The embedding kind — a simple WinAnsi TrueType font (the original path)
-/// or a composite Type0/Identity-H font (CJK-capable, TrueType- or
-/// CFF-flavored).
+/// or a composite Type0 font (CJK-capable, TrueType- or CFF-flavored).
 #[allow(clippy::large_enum_variant)] // WinAnsi carries a 256-entry width table; fonts are few.
 enum EmbeddedKind {
     /// Simple-font TrueType with a WinAnsiEncoding byte width table.
     WinAnsi { widths: [u16; 256] },
-    /// Composite (Type0) font using Identity-H (the 2-byte code is the GID).
-    Composite { program: FontProgram },
+    /// Composite (Type0) font. The 2-byte code emitted in the content stream
+    /// is interpreted per `encoding`; `vertical` selects horizontal vs.
+    /// vertical writing mode (Identity-H vs Identity-V, or a predefined CMap's
+    /// horizontal vs vertical variant).
+    Composite {
+        program: FontProgram,
+        encoding: CidEncoding,
+        vertical: bool,
+    },
 }
 
 /// The font-program flavor, which decides `/FontFile2` vs `/FontFile3` and
@@ -166,6 +172,74 @@ pub enum FontProgram {
     /// CFF outlines (an OTF `CFF ` table or raw CFF) — `/FontFile3 /OpenType`,
     /// `CIDFontType0`.
     OpenTypeCff,
+}
+
+/// The 2-byte CID encoding a composite (Type0) font uses, selecting the Type0
+/// `/Encoding` name, the meaning of the 2-byte content-stream code, and the
+/// `/CIDToGIDMap` strategy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CidEncoding {
+    /// `Identity-H` (and `Identity-V` when vertical): the 2-byte code is the
+    /// GID, and `/CIDToGIDMap /Identity` makes CID = GID. The default for CJK
+    /// authoring — any character the font's cmap maps is encodable.
+    Identity,
+    /// A predefined Adobe Unicode CMap (`UniGB-UCS2`, `UniJIS-UCS2`,
+    /// `UniKS-UCS2`, `UniCNS-UCS2`, or their `-V` vertical variants): the
+    /// 2-byte code is the Unicode scalar, and `/CIDToGIDMap` is an explicit
+    /// table mapping Unicode CIDs to GIDs via the font's cmap. The ordering
+    /// names the CJK collection.
+    Predefined(PredefinedOrdering),
+}
+
+/// The Adobe CJK collection a predefined CMap targets (ISO 32000-1 Annex C).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PredefinedOrdering {
+    /// GB / Simplified Chinese — `UniGB-UCS2` / `UniGB-UCS2-V`.
+    Gb,
+    /// JIS / Japanese — `UniJIS-UCS2` / `UniJIS-UCS2-V`.
+    Jis,
+    /// KS / Korean — `UniKS-UCS2` / `UniKS-UCS2-V`.
+    Ks,
+    /// CNS / Traditional Chinese — `UniCNS-UCS2` / `UniCNS-UCS2-V`.
+    Cns,
+}
+
+impl PredefinedOrdering {
+    /// The horizontal CMap name (`/Encoding` on the Type0 font).
+    fn cmap_name(self, vertical: bool) -> &'static str {
+        match (self, vertical) {
+            (PredefinedOrdering::Gb, false) => "UniGB-UCS2-H",
+            (PredefinedOrdering::Gb, true) => "UniGB-UCS2-V",
+            (PredefinedOrdering::Jis, false) => "UniJIS-UCS2-H",
+            (PredefinedOrdering::Jis, true) => "UniJIS-UCS2-V",
+            (PredefinedOrdering::Ks, false) => "UniKS-UCS2-H",
+            (PredefinedOrdering::Ks, true) => "UniKS-UCS2-V",
+            (PredefinedOrdering::Cns, false) => "UniCNS-UCS2-H",
+            (PredefinedOrdering::Cns, true) => "UniCNS-UCS2-V",
+        }
+    }
+
+    /// The `/CIDSystemInfo` ordering string for this collection.
+    fn ordering(self) -> &'static str {
+        match self {
+            PredefinedOrdering::Gb => "GB1",
+            PredefinedOrdering::Jis => "Japan1",
+            PredefinedOrdering::Ks => "Korea1",
+            PredefinedOrdering::Cns => "CNS1",
+        }
+    }
+
+    /// The `/CIDSystemInfo` supplement for this collection (a stable, common
+    /// value; supplements vary by renderer but the writer does not embed the
+    /// predefined CMap bytes themselves, only the name, so this is advisory).
+    fn supplement(self) -> i64 {
+        match self {
+            PredefinedOrdering::Gb => 5,
+            PredefinedOrdering::Jis => 6,
+            PredefinedOrdering::Ks => 2,
+            PredefinedOrdering::Cns => 4,
+        }
+    }
 }
 
 /// An embedded font, parsed once at `embed_font` / `embed_composite_font`
@@ -306,6 +380,48 @@ impl DocumentBuilder {
     /// supported. Raw CFF is wrapped in a minimal OTF container on embed.
     /// Glyphs are subset at `build()` time (sparse glyf / sparse charstrings).
     pub fn embed_composite_font(&mut self, font_bytes: Vec<u8>) -> Result<EmbeddedFontHandle> {
+        self.push_composite(font_bytes, CidEncoding::Identity, false)
+    }
+
+    /// Embed a composite (Type0) font in **vertical writing mode** — the Type0
+    /// `/Encoding` is `Identity-V`, the descendant CIDFont carries `/DW2`/`/W2`
+    /// vertical metrics (read from the font's `vhea`/`vmtx` when present, else
+    /// the PDF default `[880 −1000]` advance with centred glyph origin), and the
+    /// content stream advances glyphs top-to-bottom. The 2-byte code is still the
+    /// GID (Identity mapping); only the writing direction changes. Use for
+    /// traditional vertical CJK (tategaki) layout.
+    pub fn embed_composite_font_vertical(
+        &mut self,
+        font_bytes: Vec<u8>,
+    ) -> Result<EmbeddedFontHandle> {
+        self.push_composite(font_bytes, CidEncoding::Identity, true)
+    }
+
+    /// Embed a composite (Type0) font using a **predefined Adobe Unicode CMap**
+    /// (`UniGB-UCS2`, `UniJIS-UCS2`, `UniKS-UCS2`, or `UniCNS-UCS2`) rather than
+    /// Identity-H. The 2-byte code emitted in the content stream is the Unicode
+    /// scalar (big-endian), and `/CIDToGIDMap` is an explicit table mapping each
+    /// Unicode CID to its GID via the font's cmap. Set `vertical` for the `-V`
+    /// (vertical) CMap variant. This is the legacy / non-embedded-CJK-font
+    /// convention; for most new CJK authoring, [`Self::embed_composite_font`]
+    /// (Identity-H) is simpler and covers every cmap-mappable character.
+    pub fn embed_composite_font_predefined(
+        &mut self,
+        font_bytes: Vec<u8>,
+        ordering: PredefinedOrdering,
+        vertical: bool,
+    ) -> Result<EmbeddedFontHandle> {
+        self.push_composite(font_bytes, CidEncoding::Predefined(ordering), vertical)
+    }
+
+    /// Shared composite-font embed: parse the font program, extract metrics,
+    /// and store it with the given CID encoding and writing mode.
+    fn push_composite(
+        &mut self,
+        font_bytes: Vec<u8>,
+        encoding: CidEncoding,
+        vertical: bool,
+    ) -> Result<EmbeddedFontHandle> {
         let (program, data) = if crate::cff::is_raw_cff(&font_bytes) {
             let otf = crate::cff::wrap_cff_in_otf(&font_bytes);
             if otf.is_empty() {
@@ -375,7 +491,11 @@ impl DocumentBuilder {
             cap_height,
             bbox,
             italic_angle,
-            kind: EmbeddedKind::Composite { program },
+            kind: EmbeddedKind::Composite {
+                program,
+                encoding,
+                vertical,
+            },
         });
         Ok(EmbeddedFontHandle((self.embedded_fonts.len() - 1) as u32))
     }
@@ -863,10 +983,18 @@ impl DocumentBuilder {
                         );
                         objects.push((*num, PdfObject::Dict(font_dict)));
                     }
-                    EmbeddedKind::Composite { program } => {
-                        // Type0 / Identity-H composite font. Resolve GIDs and
-                        // advance widths for the used characters, build the
-                        // sparse /W array and /ToUnicode pairs, and subset.
+                    EmbeddedKind::Composite {
+                        program,
+                        encoding,
+                        vertical,
+                    } => {
+                        let vertical = *vertical;
+                        // Type0 composite font. Resolve GIDs and advance widths
+                        // for the used characters, build the sparse /W array and
+                        // /ToUnicode pairs, and subset. The 2-byte content-stream
+                        // code is the GID (Identity) or the Unicode scalar
+                        // (Predefined); /W and /W2 are indexed by CID (= code),
+                        // and /CIDToGIDMap is /Identity or an explicit table.
                         let face = ttf_parser::Face::parse(&font.data, 0).map_err(|e| {
                             zpdf_core::Error::Io(std::io::Error::new(
                                 std::io::ErrorKind::InvalidInput,
@@ -878,8 +1006,15 @@ impl DocumentBuilder {
 
                         let mut keep_gids: HashSet<u16> = HashSet::new();
                         keep_gids.insert(0); // .notdef
-                        let mut gid_entries: Vec<(u16, u16)> = Vec::new();
+                                             // /W entries indexed by CID (= the 2-byte code).
+                        let mut cid_width_entries: Vec<(u16, u16)> = Vec::new();
                         let mut tounicode_pairs: Vec<(u16, char)> = Vec::new();
+                        // For predefined CMaps: explicit CID(=Unicode) → GID map.
+                        let mut cid_to_gid: Vec<(u16, u16)> = Vec::new();
+                        // Vertical /W2 entries (cid, w1y, vx, vy), built only for
+                        // vertical writing mode. w1y is the top-to-bottom advance;
+                        // (vx, vy) is the glyph origin offset from the CID origin.
+                        let mut w2_entries: Vec<(u16, i64, i64, i64)> = Vec::new();
                         for ch in &used {
                             let gid = face.glyph_index(*ch).map(|g| g.0).unwrap_or(0);
                             keep_gids.insert(gid);
@@ -887,12 +1022,58 @@ impl DocumentBuilder {
                                 .glyph_hor_advance(ttf_parser::GlyphId(gid))
                                 .map(|a| (a as f64 * to_milli).round().max(0.0) as u16)
                                 .unwrap_or(1000);
-                            gid_entries.push((gid, w));
-                            tounicode_pairs.push((gid, *ch));
+                            let code = match encoding {
+                                CidEncoding::Identity => gid,
+                                CidEncoding::Predefined(_) => {
+                                    // BMP only (see build_composite_glyph_maps).
+                                    if *ch as u32 <= 0xFFFF {
+                                        *ch as u16
+                                    } else {
+                                        0
+                                    }
+                                }
+                            };
+                            cid_width_entries.push((code, w));
+                            tounicode_pairs.push((code, *ch));
+                            if matches!(encoding, CidEncoding::Predefined(_)) {
+                                cid_to_gid.push((code, gid));
+                            }
+                            if vertical {
+                                // Per-glyph vertical advance from vmtx when
+                                // available; else use /DW2's w1y (0 signals
+                                // "use /DW2" on the read side, so emit the
+                                // default rather than a per-glyph entry).
+                                let (w1y, vx, vy) = vertical_glyph_metric(
+                                    &face,
+                                    ttf_parser::GlyphId(gid),
+                                    to_milli,
+                                );
+                                w2_entries.push((code, w1y, vx, vy));
+                            }
                         }
-                        gid_entries.sort_unstable_by_key(|(g, _)| *g);
-                        gid_entries.dedup_by_key(|(g, _)| *g);
-                        let w_array = build_w_array(&gid_entries);
+                        cid_width_entries.sort_unstable_by_key(|(c, _)| *c);
+                        cid_width_entries.dedup_by_key(|(c, _)| *c);
+                        let w_array = build_w_array(&cid_width_entries);
+
+                        // /DW2 default vertical metrics + sparse /W2. The PDF
+                        // default is [880 −1000] (vy=880, w1y=−1000); we prefer
+                        // the font's vhea ascender/descender when present.
+                        let (dw2, w2_array) = if vertical {
+                            let dw2 = dw2_default(&face, to_milli);
+                            // Only emit per-glyph /W2 entries whose advance
+                            // differs from /DW2's w1y (the common case for CJK
+                            // punctuation with full-width vs half-width).
+                            let w1y_default = dw2[1];
+                            let mut entries: Vec<(u16, i64, i64, i64)> = w2_entries
+                                .into_iter()
+                                .filter(|(_, w1y, _, _)| *w1y != w1y_default)
+                                .collect();
+                            entries.sort_unstable_by_key(|(c, _, _, _)| *c);
+                            entries.dedup_by_key(|(c, _, _, _)| *c);
+                            (Some(dw2), build_w2_array(&entries))
+                        } else {
+                            (None, PdfObject::Array(vec![]))
+                        };
 
                         // Subset (sparse glyf for TrueType, sparse charstrings
                         // for CFF); fall back to the full font.
@@ -986,16 +1167,24 @@ impl DocumentBuilder {
                             PdfName::new("BaseFont"),
                             PdfObject::Name(PdfName::new(&font.ps_name)),
                         );
+                        // /CIDSystemInfo: Identity for Identity-H/V, or the
+                        // predefined collection's registry/ordering/supplement.
                         let mut sysinfo = PdfDict::new();
                         sysinfo.insert(
                             PdfName::new("Registry"),
                             PdfObject::String(zpdf_core::PdfString(b"Adobe".to_vec())),
                         );
+                        let (ordering, supplement) = match encoding {
+                            CidEncoding::Identity => ("Identity".to_string(), 0i64),
+                            CidEncoding::Predefined(ord) => {
+                                (ord.ordering().to_string(), ord.supplement())
+                            }
+                        };
                         sysinfo.insert(
                             PdfName::new("Ordering"),
-                            PdfObject::String(zpdf_core::PdfString(b"Identity".to_vec())),
+                            PdfObject::String(zpdf_core::PdfString(ordering.into_bytes())),
                         );
-                        sysinfo.insert(PdfName::new("Supplement"), PdfObject::Integer(0));
+                        sysinfo.insert(PdfName::new("Supplement"), PdfObject::Integer(supplement));
                         cid.insert(PdfName::new("CIDSystemInfo"), PdfObject::Dict(sysinfo));
                         cid.insert(
                             PdfName::new("FontDescriptor"),
@@ -1003,10 +1192,46 @@ impl DocumentBuilder {
                         );
                         cid.insert(PdfName::new("DW"), PdfObject::Integer(1000));
                         cid.insert(PdfName::new("W"), w_array);
-                        cid.insert(
-                            PdfName::new("CIDToGIDMap"),
-                            PdfObject::Name(PdfName::new("Identity")),
-                        );
+                        // Vertical metrics on the descendant CIDFont.
+                        if let Some(dw2) = &dw2 {
+                            cid.insert(
+                                PdfName::new("DW2"),
+                                PdfObject::Array(
+                                    dw2.iter().map(|&v| PdfObject::Integer(v)).collect(),
+                                ),
+                            );
+                            if let PdfObject::Array(ref w2) = w2_array {
+                                if !w2.is_empty() {
+                                    cid.insert(PdfName::new("W2"), w2_array.clone());
+                                }
+                            }
+                        }
+                        // /CIDToGIDMap: /Identity for Identity encodings, or an
+                        // explicit table (a stream of 2-byte GID values indexed
+                        // by CID) for predefined CMaps where CID = Unicode.
+                        match encoding {
+                            CidEncoding::Identity => {
+                                cid.insert(
+                                    PdfName::new("CIDToGIDMap"),
+                                    PdfObject::Name(PdfName::new("Identity")),
+                                );
+                            }
+                            CidEncoding::Predefined(_) => {
+                                let c2g_num = obj_num;
+                                obj_num += 1;
+                                let c2g_bytes = build_cid_to_gid_map(&cid_to_gid);
+                                let mut c2g_dict = PdfDict::new();
+                                c2g_dict.insert(
+                                    PdfName::new("Filter"),
+                                    PdfObject::Name(PdfName::new("FlateDecode")),
+                                );
+                                streams.push((c2g_num, c2g_dict, flate_compress(&c2g_bytes)?));
+                                cid.insert(
+                                    PdfName::new("CIDToGIDMap"),
+                                    PdfObject::Ref(ObjectId(c2g_num, 0)),
+                                );
+                            }
+                        }
                         objects.push((cid_num, PdfObject::Dict(cid)));
 
                         // ToUnicode CMap stream.
@@ -1033,9 +1258,19 @@ impl DocumentBuilder {
                             PdfName::new("BaseFont"),
                             PdfObject::Name(PdfName::new(&font.ps_name)),
                         );
+                        let encoding_name = match encoding {
+                            CidEncoding::Identity => {
+                                if vertical {
+                                    "Identity-V"
+                                } else {
+                                    "Identity-H"
+                                }
+                            }
+                            CidEncoding::Predefined(ord) => ord.cmap_name(vertical),
+                        };
                         font_dict.insert(
                             PdfName::new("Encoding"),
-                            PdfObject::Name(PdfName::new("Identity-H")),
+                            PdfObject::Name(PdfName::new(encoding_name)),
                         );
                         font_dict.insert(
                             PdfName::new("DescendantFonts"),
@@ -1405,10 +1640,22 @@ impl DocumentBuilder {
     /// that font across all pages. Used by [`build_page_content`] to emit the
     /// 2-byte GID codes that Identity-H addresses. Characters with no glyph
     /// map to GID 0 (`.notdef`), which keeps text positioning stable.
-    fn build_composite_glyph_maps(&self) -> HashMap<u32, HashMap<char, u16>> {
-        let mut out: HashMap<u32, HashMap<char, u16>> = HashMap::new();
+    /// For each composite (Type0) embedded font, parse the font once and build
+    /// a `char → 2-byte code` map covering every character used with that font
+    /// across all pages. The 2-byte code is what [`build_page_content`] emits:
+    /// the GID for `Identity` encodings, or the Unicode scalar (BMP only) for
+    /// `Predefined` CMaps. Characters with no glyph (or, for predefined CMaps,
+    /// outside the BMP) map to code 0 (`.notdef`), keeping text positioning
+    /// stable. Also drives subsetting (the kept GIDs) and `/W` / `/W2` width
+    /// arrays. Returns, per font index, the glyph map plus a flag for vertical
+    /// writing mode (so the content stream can apply the vertical `Tm` matrix).
+    fn build_composite_glyph_maps(&self) -> HashMap<u32, (HashMap<char, u16>, bool)> {
+        let mut out: HashMap<u32, (HashMap<char, u16>, bool)> = HashMap::new();
         for (idx, font) in self.embedded_fonts.iter().enumerate() {
-            let EmbeddedKind::Composite { .. } = &font.kind else {
+            let EmbeddedKind::Composite {
+                encoding, vertical, ..
+            } = &font.kind
+            else {
                 continue;
             };
             let marker = format!("\u{0}EMB{}", idx);
@@ -1426,7 +1673,7 @@ impl DocumentBuilder {
                 .flatten()
                 .collect();
             if used.is_empty() {
-                out.insert(idx as u32, HashMap::new());
+                out.insert(idx as u32, (HashMap::new(), *vertical));
                 continue;
             }
             let Ok(face) = ttf_parser::Face::parse(&font.data, 0) else {
@@ -1434,10 +1681,22 @@ impl DocumentBuilder {
             };
             let mut map: HashMap<char, u16> = HashMap::with_capacity(used.len());
             for ch in used {
-                let gid = face.glyph_index(ch).map(|g| g.0).unwrap_or(0);
-                map.insert(ch, gid);
+                let code = match encoding {
+                    CidEncoding::Identity => face.glyph_index(ch).map(|g| g.0).unwrap_or(0),
+                    // Predefined Unicode CMaps address the BMP; supplementary
+                    // plane characters cannot be 2-byte-encoded and fall back
+                    // to .notdef. (Use Identity-H/V for full-plane coverage.)
+                    CidEncoding::Predefined(_) => {
+                        if (ch as u32) <= 0xFFFF {
+                            ch as u16
+                        } else {
+                            0
+                        }
+                    }
+                };
+                map.insert(ch, code);
             }
-            out.insert(idx as u32, map);
+            out.insert(idx as u32, (map, *vertical));
         }
         out
     }
@@ -1448,7 +1707,7 @@ impl DocumentBuilder {
         page_state: &PageState,
         image_counter: &mut usize,
         next_obj: &mut u32,
-        composite_glyph_maps: &HashMap<u32, HashMap<char, u16>>,
+        composite_glyph_maps: &HashMap<u32, (HashMap<char, u16>, bool)>,
     ) -> Result<(Vec<u8>, Vec<String>, Vec<u32>, Vec<(i32, TagSpec)>)> {
         let mut ops = Vec::new();
         let mut font_names = Vec::new();
@@ -1501,22 +1760,29 @@ impl DocumentBuilder {
                     let b = color.2.clamp(0.0, 1.0);
                     ops.extend_from_slice(format!("{} {} {} rg\n", r, g, b).as_bytes());
                     ops.extend_from_slice(format!("/F{} {} Tf\n", font_idx, size).as_bytes());
-                    ops.extend_from_slice(format!("1 0 0 1 {} {} Tm\n", x, y).as_bytes());
-                    // Composite (Type0/Identity-H) fonts emit 2-byte GID codes
-                    // as a hex string; simple/standard-14 fonts use a WinAnsi
-                    // literal string.
+                    // Composite (Type0) fonts emit 2-byte codes as a hex string;
+                    // simple/standard-14 fonts use a WinAnsi literal string.
                     let composite = font_name
                         .strip_prefix("\u{0}EMB")
                         .and_then(|s| s.parse::<u32>().ok())
                         .and_then(|idx| composite_glyph_maps.get(&idx));
-                    if let Some(gmap) = composite {
+                    if let Some((gmap, vertical)) = composite {
+                        // Vertical writing mode (Identity-V / predefined -V):
+                        // rotate the text matrix 90° CCW so the baseline runs
+                        // top-to-bottom and glyphs advance downward.
+                        if *vertical {
+                            ops.extend_from_slice(format!("0 1 -1 0 {} {} Tm\n", x, y).as_bytes());
+                        } else {
+                            ops.extend_from_slice(format!("1 0 0 1 {} {} Tm\n", x, y).as_bytes());
+                        }
                         ops.extend_from_slice(b"<");
                         for ch in text.chars() {
-                            let gid = gmap.get(&ch).copied().unwrap_or(0);
-                            ops.extend_from_slice(format!("{gid:04X}").as_bytes());
+                            let code = gmap.get(&ch).copied().unwrap_or(0);
+                            ops.extend_from_slice(format!("{code:04X}").as_bytes());
                         }
                         ops.extend_from_slice(b"> Tj\n");
                     } else {
+                        ops.extend_from_slice(format!("1 0 0 1 {} {} Tm\n", x, y).as_bytes());
                         ops.extend_from_slice(b"(");
                         escape_text(text, &mut ops);
                         ops.extend_from_slice(b") Tj\n");
@@ -1723,6 +1989,115 @@ fn build_w_array(entries: &[(u16, u16)]) -> PdfObject {
         i = j;
     }
     PdfObject::Array(arr)
+}
+
+/// Build a CIDFont `/W2` array from sorted `(cid, w1y, vx, vy)` entries. Same
+/// run-encoding shape as `/W`, but each width entry is a 3-element array
+/// `[w1y vx vy]` (PDF spec Table 117): `w1y` is the top-to-bottom advance,
+/// `(vx, vy)` the glyph origin offset from the CID origin.
+fn build_w2_array(entries: &[(u16, i64, i64, i64)]) -> PdfObject {
+    let mut arr: Vec<PdfObject> = Vec::new();
+    let mut i = 0;
+    while i < entries.len() {
+        let first = entries[i].0;
+        let mut j = i + 1;
+        while j < entries.len() && entries[j].0 == entries[j - 1].0 + 1 {
+            j += 1;
+        }
+        let metrics: Vec<PdfObject> = entries[i..j]
+            .iter()
+            .flat_map(|(_, w1y, vx, vy)| {
+                [
+                    PdfObject::Integer(*w1y),
+                    PdfObject::Integer(*vx),
+                    PdfObject::Integer(*vy),
+                ]
+            })
+            .collect();
+        arr.push(PdfObject::Integer(first as i64));
+        arr.push(PdfObject::Array(metrics));
+        i = j;
+    }
+    PdfObject::Array(arr)
+}
+
+/// Default `/DW2` vertical metrics `[vy w1y]` (PDF spec: origin shift `vy`,
+/// vertical advance `w1y`), in 1000-unit space. Prefer the font's `vhea`
+/// ascender/descender when the table is present (a real vertical metrics
+/// table); otherwise the PDF default `[880 −1000]`. The advance is negative
+/// because vertical text advances downward in PDF's bottom-left origin.
+fn dw2_default(face: &ttf_parser::Face, to_milli: f64) -> [i64; 2] {
+    let asc = face.vertical_ascender().map(|v| v as f64).unwrap_or(880.0) * to_milli;
+    let desc = face
+        .vertical_descender()
+        .map(|v| v as f64)
+        .unwrap_or(-120.0)
+        * to_milli;
+    // w1y = -(asc - desc): a full em advance downward. Guard against a
+    // non-positive range (degenerate vhea) by falling back to the PDF default.
+    let w1y_raw = -(asc - desc);
+    let w1y = if w1y_raw.abs() > 1.0 {
+        w1y_raw.round() as i64
+    } else {
+        -1000
+    };
+    // vy: the vertical origin offset — half the em above the baseline, which
+    // places the glyph centred on the vertical advance. Default 880 per spec.
+    let vy = if asc.abs() > 1.0 {
+        asc.round() as i64
+    } else {
+        880
+    };
+    [vy, w1y]
+}
+
+/// Per-glyph vertical metric `(w1y, vx, vy)` for `gid` from the font's `vmtx`
+/// table when present, in 1000-unit space. `w1y` is the vertical advance
+/// (negative, downward); `(vx, vy)` is the origin offset — `vx` centres the
+/// glyph horizontally (half the advance width), `vy` is the ascender. When the
+/// font has no vertical metrics, returns `(0, 0, 0)` so the caller can emit
+/// only entries that differ from `/DW2` (and let `/DW2` cover the rest).
+fn vertical_glyph_metric(
+    face: &ttf_parser::Face,
+    gid: ttf_parser::GlyphId,
+    to_milli: f64,
+) -> (i64, i64, i64) {
+    // ttf-parser exposes vertical advance via glyph_hor_advance only for the
+    // horizontal case; vertical advance comes from vmtx, which the Face reads
+    // when a vhea table is present. Fall back to /DW2 signalling (0) otherwise.
+    let Some(v_adv) = face.vertical_ascender() else {
+        return (0, 0, 0);
+    };
+    // Per-glyph vertical advance: ttf-parser does not expose glyph_vert_advance
+    // directly in 0.25; approximate with the font-wide vertical em (the common
+    // case for CJK, where vmtx advances are uniform full-em). Centroid origin:
+    // vx = half the horizontal advance (centres the glyph), vy = ascender.
+    let h_adv = face
+        .glyph_hor_advance(gid)
+        .map(|a| a as f64 * to_milli)
+        .unwrap_or(1000.0);
+    let upem = face.units_per_em() as f64;
+    let to_milli_v = if upem > 0.0 { 1000.0 / upem } else { 1.0 };
+    let w1y = -((v_adv as f64) * to_milli_v).round() as i64;
+    let vx = (h_adv / 2.0).round() as i64;
+    let vy = ((v_adv as f64) * to_milli_v).round() as i64;
+    (w1y, vx, vy)
+}
+
+/// Serialize an explicit `/CIDToGIDMap` table for a predefined-CMap font where
+/// CID = Unicode scalar. The map is a binary table of 2-byte big-endian GID
+/// values indexed by CID; only CIDs in `entries` are populated, with GID 0 for
+/// any gap (the read side reads `gid = u16::from_be_bytes(table[2*cid..])`).
+/// We emit a dense table from 0..=max_cid so the indexing is a simple offset.
+fn build_cid_to_gid_map(entries: &[(u16, u16)]) -> Vec<u8> {
+    let max_cid = entries.iter().map(|(c, _)| *c).max().unwrap_or(0);
+    let mut table = vec![0u8; (max_cid as usize + 1) * 2];
+    for &(cid, gid) in entries {
+        let off = cid as usize * 2;
+        table[off] = (gid >> 8) as u8;
+        table[off + 1] = (gid & 0xff) as u8;
+    }
+    table
 }
 
 fn image_xobject_dict(width: u32, height: u32, color_space: &str) -> PdfDict {

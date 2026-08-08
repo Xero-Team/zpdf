@@ -56,8 +56,8 @@ mod tounicode;
 
 pub use annotate::{AnnotationSpec, MarkupKind};
 pub use builder::{
-    classify_font_program, DocumentBuilder, EmbeddedFontHandle, FontProgram, ImageData, PageHandle,
-    PathSegment, PathStyle, TagSpec,
+    classify_font_program, CidEncoding, DocumentBuilder, EmbeddedFontHandle, FontProgram,
+    ImageData, PageHandle, PathSegment, PathStyle, PredefinedOrdering, TagSpec,
 };
 pub use copier::{copy_object_graph, ObjectIdMap};
 pub use encrypt::{EncryptionAlgorithm, EncryptionConfig, Permissions};
