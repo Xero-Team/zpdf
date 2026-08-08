@@ -672,6 +672,22 @@ cargo run -p zpdf-render-wgpu --example viewer -- <file.pdf>   # 交互浏览器
   矢量路径（`PathSegment`/`PathStyle`）
 - [X] 构建时自动**字体子集化**（`subset.rs` sparse-glyf：清空未用轮廓、保留
   度量与 cmap，复合字形闭包，强制 long loca；Arial 演示 549KB → 135KB）
+- [X] **CJK 竖排 + 预定义 CMap 写入**（`CidEncoding`/`PredefinedOrdering`）：
+  - `embed_composite_font_vertical`：Type0 `/Encoding /Identity-V`，后代 CIDFont
+    `/DW2`（从字体 `vhea` 取竖排度量，缺省 `[880 −1000]`）+ 稀疏 `/W2`，内容流
+    竖排文本矩阵 `0 1 -1 0 x y`（90° 旋转，自上而下推进）；2 字节码仍为 GID
+  - `embed_composite_font_predefined(bytes, ordering, vertical)`：用预定义 Adobe
+    Unicode CMap（`UniGB-UCS2`/`UniJIS-UCS2`/`UniKS-UCS2`/`UniCNS-UCS2` 的
+    `-H`/`-V` 变体）替代 Identity-H——2 字节码 = Unicode 标量，`/CIDToGIDMap` 为
+    显式表（按 CID 索引的 2 字节大端 GID，非 `/Identity`），`/CIDSystemInfo`
+    取集合的 Registry/Ordering/Supplement（GB1/Japan1/Korea1/CNS1）
+  - 子项相互正交：Identity-H（默认）/ Identity-V（竖排）/ 预定义 `-H`/`-V`
+  - 限制：预定义 CMap 仅编码 BMP 字符（UCS2 命名暗示），辅助平面字符回退
+    `.notdef`（全平面覆盖用 Identity-H/V）；`ttf-parser` 0.25 未暴露逐字形
+    `vmtx` 竖排推进，故 `/W2` 按字体级 `vhea` 度量近似（CJK 常见均匀全 em 推进）
+  - 测试：`zpdf-writer/tests/cjk.rs` 新增 5 例（Identity-V 结构 + 真实语料
+    round-trip、预定义 `-H`/`-V` 结构 + 真实语料 round-trip），文本经读取侧
+    `page0_text` round-trip 验证
 
 ### P5.2 — 保存时加密 + 加密文档编辑（`encrypt.rs`）
 - [X] `RewriteOptions::encrypt`：AES-256 R6（算法 8/9 + 2.B 强化哈希、`/Perms`）

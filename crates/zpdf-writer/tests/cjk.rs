@@ -10,7 +10,7 @@
 
 use zpdf_core::PdfObject;
 use zpdf_document::PdfDocument;
-use zpdf_writer::{classify_font_program, DocumentBuilder, FontProgram};
+use zpdf_writer::{classify_font_program, DocumentBuilder, FontProgram, PredefinedOrdering};
 
 const VAR_TTF: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -185,4 +185,216 @@ fn deref(file: &zpdf_parser::PdfFile, obj: &PdfObject) -> Option<PdfObject> {
         PdfObject::Ref(r) => file.resolve(*r).ok(),
         other => Some(other.clone()),
     }
+}
+
+// ---- Identity-V (vertical writing mode) ----------------------------------
+
+/// `embed_composite_font_vertical` produces a Type0 font whose `/Encoding`
+/// is `Identity-V` and whose descendant CIDFont carries `/DW2` vertical
+/// metrics. The content stream applies the vertical text matrix
+/// (`0 1 -1 0 x y`). Uses var.ttf for the structural assertions (the glyph
+/// itself is .notdef, but the emission path is what we check here).
+#[test]
+fn vertical_identity_v_emits_dw2_and_vertical_matrix() {
+    let font_bytes = std::fs::read(VAR_TTF).expect("read var.ttf");
+    let mut builder = DocumentBuilder::new();
+    let page = builder.add_page(400.0, 200.0);
+    let font = builder
+        .embed_composite_font_vertical(font_bytes)
+        .expect("embed vertical composite");
+    builder
+        .add_text_embedded(page, "A", 40.0, 120.0, font, 24.0, (0.0, 0.0, 0.0))
+        .expect("add text");
+    let pdf = builder.build().expect("build");
+
+    let body = String::from_utf8_lossy(&pdf);
+    assert!(
+        body.contains("/Identity-V"),
+        "missing Identity-V encoding: {body}"
+    );
+    assert!(
+        body.contains("/DW2"),
+        "missing /DW2 vertical metrics: {body}"
+    );
+    // Vertical text matrix (90° CCW rotation so the baseline runs top-to-bottom).
+    assert!(
+        body.contains("0 1 -1 0 40 120 Tm"),
+        "missing vertical Tm matrix: {body}"
+    );
+    // Still a Type0 with Identity CID→GID mapping.
+    assert!(body.contains("/Subtype /Type0"));
+    assert!(body.contains("/CIDToGIDMap /Identity"));
+
+    // Parses back cleanly.
+    let doc = PdfDocument::open(pdf.to_vec()).expect("re-open built PDF");
+    assert_eq!(doc.page_count(), 1);
+}
+
+/// Vertical mode on a real CJK corpus font round-trips: the /DW2 advance
+/// is read back, and the emitted text survives extraction. Skipped when the
+/// corpus or a mappable CJK glyph is unavailable.
+#[test]
+fn vertical_cjk_corpus_round_trips() {
+    let Ok(corpus) = std::fs::read(CJK_CORPUS) else {
+        eprintln!("(skipping vertical CJK test: corpus absent)");
+        return;
+    };
+    let doc = PdfDocument::open(corpus).expect("open corpus");
+    let Some((font_bytes, _program)) = first_embedded_type0_program(&doc) else {
+        eprintln!("(skipping vertical CJK test: no embedded Type0 font)");
+        return;
+    };
+    let face = match ttf_parser::Face::parse(&font_bytes, 0) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("(skipping vertical CJK test: {e})");
+            return;
+        }
+    };
+    let Some(cjk_char) = (0x4E00u32..=0x9FFF)
+        .find_map(|cp| char::from_u32(cp).filter(|ch| face.glyph_index(*ch).is_some()))
+    else {
+        eprintln!("(skipping vertical CJK test: no CJK BMP glyph");
+        return;
+    };
+
+    let mut builder = DocumentBuilder::new();
+    let page = builder.add_page(400.0, 400.0);
+    let font = builder
+        .embed_composite_font_vertical(font_bytes)
+        .expect("embed vertical");
+    let s: String = (0..3).map(|_| cjk_char).collect();
+    builder
+        .add_text_embedded(page, &s, 60.0, 360.0, font, 24.0, (0.0, 0.0, 0.0))
+        .expect("add text");
+    let pdf = builder.build().expect("build");
+
+    let body = String::from_utf8_lossy(&pdf);
+    assert!(body.contains("/Identity-V"), "missing Identity-V");
+    assert!(body.contains("/DW2"), "missing /DW2");
+
+    let text = page0_text(&pdf);
+    assert!(
+        text.contains(&s),
+        "vertical CJK text did not round-trip: {text:?}"
+    );
+}
+
+// ---- Predefined 2-byte CMaps (UniGB-UCS2 etc.) -----------------------------
+
+/// A predefined-CMap composite font emits the named CMap as `/Encoding`, an
+/// explicit `/CIDToGIDMap` stream (not /Identity), and the collection's
+/// `/CIDSystemInfo` ordering. Uses var.ttf for structure; the content stream
+/// 2-byte codes are Unicode scalars.
+#[test]
+fn predefined_cmap_emits_named_encoding_and_explicit_map() {
+    let font_bytes = std::fs::read(VAR_TTF).expect("read var.ttf");
+    let mut builder = DocumentBuilder::new();
+    let page = builder.add_page(400.0, 200.0);
+    let font = builder
+        .embed_composite_font_predefined(font_bytes, PredefinedOrdering::Gb, false)
+        .expect("embed predefined");
+    // 'A' = U+0041 → 2-byte code <0041>.
+    builder
+        .add_text_embedded(page, "A", 40.0, 120.0, font, 24.0, (0.0, 0.0, 0.0))
+        .expect("add text");
+    let pdf = builder.build().expect("build");
+
+    let body = String::from_utf8_lossy(&pdf);
+    assert!(
+        body.contains("/UniGB-UCS2-H"),
+        "missing UniGB-UCS2-H encoding: {body}"
+    );
+    assert!(
+        body.contains("/Ordering (GB1)"),
+        "missing GB1 CIDSystemInfo ordering: {body}"
+    );
+    // Predefined CMaps need an explicit /CIDToGIDMap, NOT /Identity.
+    assert!(
+        !body.contains("/CIDToGIDMap /Identity"),
+        "predefined CMap must not use /Identity CIDToGIDMap: {body}"
+    );
+    // The content stream emits the Unicode code <0041> for 'A'.
+    assert!(
+        body.contains("<0041> Tj"),
+        "expected 2-byte Unicode code <0041> for 'A': {body}"
+    );
+
+    let doc = PdfDocument::open(pdf.to_vec()).expect("re-open built PDF");
+    assert_eq!(doc.page_count(), 1);
+}
+
+/// A vertical predefined CMap (`-V` variant) emits the `-V` encoding name.
+#[test]
+fn predefined_cmap_vertical_uses_v_variant() {
+    let font_bytes = std::fs::read(VAR_TTF).expect("read var.ttf");
+    let mut builder = DocumentBuilder::new();
+    let page = builder.add_page(400.0, 200.0);
+    let font = builder
+        .embed_composite_font_predefined(font_bytes, PredefinedOrdering::Jis, true)
+        .expect("embed vertical predefined");
+    builder
+        .add_text_embedded(page, "A", 40.0, 120.0, font, 24.0, (0.0, 0.0, 0.0))
+        .expect("add text");
+    let pdf = builder.build().expect("build");
+
+    let body = String::from_utf8_lossy(&pdf);
+    assert!(
+        body.contains("/UniJIS-UCS2-V"),
+        "missing UniJIS-UCS2-V encoding: {body}"
+    );
+    assert!(body.contains("/Ordering (Japan1)"));
+    assert!(body.contains("/DW2"), "vertical predefined needs /DW2");
+    assert!(
+        body.contains("0 1 -1 0 40 120 Tm"),
+        "missing vertical Tm matrix: {body}"
+    );
+}
+
+/// Predefined-CMap round-trip on a real CJK font: the 2-byte Unicode codes
+/// resolve to the right GIDs via the explicit /CIDToGIDMap, and text
+/// extracts back. Skipped when the corpus is unavailable.
+#[test]
+fn predefined_cmap_corpus_round_trips() {
+    let Ok(corpus) = std::fs::read(CJK_CORPUS) else {
+        eprintln!("(skipping predefined CJK test: corpus absent)");
+        return;
+    };
+    let doc = PdfDocument::open(corpus).expect("open corpus");
+    let Some((font_bytes, _program)) = first_embedded_type0_program(&doc) else {
+        eprintln!("(skipping predefined CJK test: no embedded Type0 font)");
+        return;
+    };
+    let face = match ttf_parser::Face::parse(&font_bytes, 0) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("(skipping predefined CJK test: {e})");
+            return;
+        }
+    };
+    let Some(cjk_char) = (0x4E00u32..=0x9FFF)
+        .find_map(|cp| char::from_u32(cp).filter(|ch| face.glyph_index(*ch).is_some()))
+    else {
+        eprintln!("(skipping predefined CJK test: no CJK BMP glyph");
+        return;
+    };
+
+    let mut builder = DocumentBuilder::new();
+    let page = builder.add_page(400.0, 200.0);
+    let font = builder
+        .embed_composite_font_predefined(font_bytes, PredefinedOrdering::Gb, false)
+        .expect("embed predefined");
+    let s: String = (0..3).map(|_| cjk_char).collect();
+    builder
+        .add_text_embedded(page, &s, 40.0, 120.0, font, 24.0, (0.0, 0.0, 0.0))
+        .expect("add text");
+    let pdf = builder.build().expect("build");
+
+    // The explicit /CIDToGIDMap must map the Unicode CIDs back to the right
+    // GIDs, so the read side resolves glyphs and ToUnicode extracts text.
+    let text = page0_text(&pdf);
+    assert!(
+        text.contains(&s),
+        "predefined-CMap CJK text did not round-trip: {text:?}"
+    );
 }
