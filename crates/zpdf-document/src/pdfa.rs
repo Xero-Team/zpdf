@@ -19,7 +19,7 @@
 
 use std::collections::HashSet;
 
-use zpdf_core::{ObjectId, PdfObject};
+use zpdf_core::{ObjectId, PdfDict, PdfObject};
 use zpdf_parser::PdfFile;
 
 /// The validation profile.
@@ -387,6 +387,88 @@ fn check_forbidden_features(file: &PdfFile, profile: Profile, out: &mut Vec<Viol
             }
         }
     }
+
+    // Forbidden annotation subtypes (all parts): 3D, Sound, Movie reference
+    // non-embedded interactive/multimedia content. FileAttachment carries an
+    // embedded file, forbidden in A-1 (A-2 permits it). Annotations whose /A
+    // action is JavaScript/Launch are also forbidden. Widget annotations
+    // (form fields) are permitted with properly embedded appearance fonts.
+    check_forbidden_annotations(file, profile, &catalog, out);
+}
+
+/// Annotation subtypes PDF/A forbids in every part (interactive/multimedia
+/// types referencing non-embedded external content or scripting).
+const FORBIDDEN_ANNOT_SUBTYPES_BOTH: &[&str] = &["3D", "Sound", "Movie"];
+
+/// Annotation subtypes PDF/A-1 additionally forbids. FileAttachment carries
+/// an embedded file, which A-1 disallows (A-2 permits embedded files).
+const FORBIDDEN_ANNOT_SUBTYPES_A1B: &[&str] = &["FileAttachment"];
+
+/// Walk the page tree and flag forbidden annotation subtypes and annotations
+/// whose `/A` action is a JavaScript/Launch action. Best-effort: bounded by
+/// page-tree depth; an unresolvable annotation is skipped, not flagged.
+fn check_forbidden_annotations(
+    file: &PdfFile,
+    profile: Profile,
+    catalog: &PdfDict,
+    out: &mut Vec<Violation>,
+) {
+    let Some(pages) = catalog.get_ref("Pages").ok() else {
+        return;
+    };
+    let a1b = profile == Profile::A1b;
+    let mut stack = vec![(pages, 0usize)];
+    let mut visited: HashSet<ObjectId> = HashSet::new();
+    while let Some((node, depth)) = stack.pop() {
+        if depth > 64 || !visited.insert(node) {
+            continue;
+        }
+        let Ok(dict) = file.resolve(node).and_then(|o| o.as_dict().cloned()) else {
+            continue;
+        };
+        if let Some(PdfObject::Array(kids)) = dict.get("Kids").map(|o| deref(file, o)).as_ref() {
+            for kid in kids {
+                if let PdfObject::Ref(r) = kid {
+                    stack.push((*r, depth + 1));
+                }
+            }
+        }
+        let annots_obj = dict.get("Annots").map(|o| deref(file, o));
+        let Some(PdfObject::Array(annots)) = annots_obj.as_ref() else {
+            continue;
+        };
+        for a in annots {
+            let PdfObject::Dict(ad) = deref(file, a) else {
+                continue;
+            };
+            let subtype = ad.get_name("Subtype").unwrap_or("");
+            let forbidden = FORBIDDEN_ANNOT_SUBTYPES_BOTH.contains(&subtype)
+                || (a1b && FORBIDDEN_ANNOT_SUBTYPES_A1B.contains(&subtype));
+            if forbidden {
+                out.push(Violation {
+                    rule: "annotation-subtype",
+                    message: format!(
+                        "/Annot /Subtype /{subtype} is forbidden in PDF/A{}",
+                        if a1b && subtype == "FileAttachment" {
+                            "-1 (carries an embedded file)"
+                        } else {
+                            ""
+                        }
+                    ),
+                });
+                continue;
+            }
+            if let Some(PdfObject::Dict(action)) = ad.get("A").map(|o| deref(file, o)).as_ref() {
+                let s = action.get_name("S").unwrap_or("");
+                if s == "JavaScript" || s == "Launch" {
+                    out.push(Violation {
+                        rule: "annotation-action",
+                        message: format!("annotation /A /S /{s} action is forbidden in PDF/A"),
+                    });
+                }
+            }
+        }
+    }
 }
 
 fn deref(file: &PdfFile, obj: &PdfObject) -> PdfObject {
@@ -446,5 +528,96 @@ mod tests {
             Some("1")
         );
         assert_eq!(extract_xmp_value("<nothing/>", "pdfaid:part"), None);
+    }
+
+    /// Build a PDF with a page carrying the given `/Annots` object bodies (each
+    /// becomes its own object after the page). Returns the bytes.
+    fn pdf_with_annots(annots: &[&str]) -> Vec<u8> {
+        let n_objs = 3 + annots.len();
+        let mut data = Vec::new();
+        data.extend_from_slice(b"%PDF-1.4\n");
+        let mut offsets = Vec::new();
+        // obj 1: catalog, 2: pages, 3: page with /Annots [4 0 R 5 0 R ...]
+        let annot_refs: Vec<String> = (0..annots.len())
+            .map(|i| format!("{} 0 R", 4 + i))
+            .collect();
+        let bodies = [
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+            format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [{}] >>",
+                annot_refs.join(" ")
+            ),
+        ];
+        for (i, body) in bodies.iter().enumerate() {
+            offsets.push(data.len());
+            data.extend_from_slice(format!("{} 0 obj\n{}\nendobj\n", i + 1, body).as_bytes());
+        }
+        for (i, body) in annots.iter().enumerate() {
+            offsets.push(data.len());
+            data.extend_from_slice(format!("{} 0 obj\n{}\nendobj\n", 4 + i, body).as_bytes());
+        }
+        let xref = data.len();
+        data.extend_from_slice(format!("xref\n0 {}\n", n_objs + 1).as_bytes());
+        data.extend_from_slice(b"0000000000 65535 f \n");
+        for off in &offsets {
+            data.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        data.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                n_objs + 1
+            )
+            .as_bytes(),
+        );
+        data
+    }
+
+    #[test]
+    fn forbidden_annotation_subtypes_are_flagged() {
+        let pdf = pdf_with_annots(&[
+            "<< /Type /Annot /Subtype /Sound /Rect [0 0 10 10] >>",
+            "<< /Type /Annot /Subtype /Text /Rect [0 0 10 10] >>",
+        ]);
+        let file = PdfFile::parse(pdf).unwrap();
+        let report = validate(&file, Profile::A1b);
+        let rules: Vec<&str> = report.violations.iter().map(|v| v.rule).collect();
+        assert!(
+            rules.contains(&"annotation-subtype"),
+            "Sound annotation must be flagged: {rules:?}"
+        );
+    }
+
+    #[test]
+    fn fileattachment_flagged_under_a1b_not_a2b() {
+        let pdf =
+            pdf_with_annots(&["<< /Type /Annot /Subtype /FileAttachment /Rect [0 0 10 10] >>"]);
+        let file = PdfFile::parse(pdf).unwrap();
+        let a1b = validate(&file, Profile::A1b);
+        let a2b = validate(&file, Profile::A2b);
+        let a1b_rules: Vec<&str> = a1b.violations.iter().map(|v| v.rule).collect();
+        let a2b_rules: Vec<&str> = a2b.violations.iter().map(|v| v.rule).collect();
+        assert!(
+            a1b_rules.contains(&"annotation-subtype"),
+            "A-1b must flag FileAttachment: {a1b_rules:?}"
+        );
+        assert!(
+            !a2b_rules.contains(&"annotation-subtype"),
+            "A-2b must not flag FileAttachment: {a2b_rules:?}"
+        );
+    }
+
+    #[test]
+    fn launch_action_annotation_is_flagged() {
+        let pdf = pdf_with_annots(&[
+            "<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] /A << /S /Launch /F (x) >> >>",
+        ]);
+        let file = PdfFile::parse(pdf).unwrap();
+        let report = validate(&file, Profile::A1b);
+        let rules: Vec<&str> = report.violations.iter().map(|v| v.rule).collect();
+        assert!(
+            rules.contains(&"annotation-action"),
+            "Launch-action annotation must be flagged: {rules:?}"
+        );
     }
 }

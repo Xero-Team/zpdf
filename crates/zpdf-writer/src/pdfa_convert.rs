@@ -216,12 +216,106 @@ pub(crate) fn prepare(
         strip_transparency_groups(source, map, root, &mut edits.transforms);
     }
 
+    // --- Annotation cleanup: drop PDF/A-forbidden annotation subtypes and
+    // any annotation whose /A action is a JavaScript or Launch action. The
+    // forbidden set is profile-aware (A-1b also drops FileAttachment, which
+    // carries an embedded file A-1b forbids; A-2b permits it). ---
+    strip_forbidden_annotations(source, map, root, cfg.profile, &mut edits.transforms);
+
     // --- Font embedding (best-effort fallback) ---
     if let Some(fallback) = &cfg.fallback_font {
         embed_fallback_fonts(source, map, root, fallback, &mut next_extra, &mut edits)?;
     }
 
     Ok(edits)
+}
+
+/// Annotation subtypes PDF/A forbids outright in both profiles (PDF/A-1
+/// §6.6.3; PDF/A-2 carries the same exclusions for these interactive /
+/// multimedia types). These reference non-embedded external content or carry
+/// scripting — neither survives long-term archival. Widget annotations
+/// (form fields) are NOT stripped: PDF/A permits AcroForm fields with
+/// properly embedded appearance fonts.
+const FORBIDDEN_ANNOT_SUBTYPES_BOTH: &[&str] = &["3D", "Sound", "Movie"];
+
+/// Annotation subtypes PDF/A-1b additionally forbids. FileAttachment carries
+/// an embedded file, which A-1b disallows (A-2b permits embedded files).
+const FORBIDDEN_ANNOT_SUBTYPES_A1B: &[&str] = &["FileAttachment"];
+
+/// Walk the page tree and, for each page's `/Annots`, drop annotations whose
+/// `/Subtype` is forbidden (profile-aware) or whose `/A` action is a
+/// JavaScript/Launch action. Edits the page dict (renumbered) only when at
+/// least one annotation is removed, leaving unfiltered pages untouched.
+fn strip_forbidden_annotations(
+    source: &PdfFile,
+    map: &HashMap<ObjectId, u32>,
+    root: ObjectId,
+    profile: PdfaProfile,
+    transforms: &mut HashMap<ObjectId, PdfObject>,
+) {
+    let Ok(catalog) = source.resolve(root).and_then(|o| o.as_dict().cloned()) else {
+        return;
+    };
+    let Ok(pages_root) = catalog.get_ref("Pages") else {
+        return;
+    };
+    let a1b_extra = profile == PdfaProfile::A1b;
+    let mut stack = vec![pages_root];
+    let mut visited = std::collections::HashSet::new();
+    while let Some(node) = stack.pop() {
+        if !visited.insert(node) {
+            continue;
+        }
+        let Ok(dict) = source.resolve(node).and_then(|o| o.as_dict().cloned()) else {
+            continue;
+        };
+        if let Some(PdfObject::Array(kids)) = dict.get("Kids").map(|o| deref(source, o)).as_ref() {
+            for kid in kids {
+                if let PdfObject::Ref(r) = kid {
+                    stack.push(*r);
+                }
+            }
+        }
+        let annots_obj = dict.get("Annots").map(|o| deref(source, o));
+        let Some(PdfObject::Array(annots)) = annots_obj.as_ref() else {
+            continue;
+        };
+        let mut kept: Vec<PdfObject> = Vec::with_capacity(annots.len());
+        let mut removed = false;
+        for a in annots {
+            let resolved = deref(source, a);
+            let PdfObject::Dict(ad) = &resolved else {
+                kept.push(a.clone());
+                continue;
+            };
+            let subtype = ad.get_name("Subtype").unwrap_or("");
+            let forbidden = FORBIDDEN_ANNOT_SUBTYPES_BOTH.contains(&subtype)
+                || (a1b_extra && FORBIDDEN_ANNOT_SUBTYPES_A1B.contains(&subtype));
+            if forbidden {
+                removed = true;
+                continue;
+            }
+            // An annotation /A action that is JavaScript/Launch is forbidden.
+            if let Some(PdfObject::Dict(action)) = ad.get("A").map(|o| deref(source, o)).as_ref() {
+                let s = action.get_name("S").unwrap_or("");
+                if s == "JavaScript" || s == "Launch" {
+                    removed = true;
+                    continue;
+                }
+            }
+            kept.push(a.clone());
+        }
+        if removed {
+            let mut d = dict.clone();
+            if kept.is_empty() {
+                d.0.remove(&PdfName::new("Annots"));
+            } else {
+                d.insert(PdfName::new("Annots"), PdfObject::Array(kept));
+            }
+            let ren = renumber(&PdfObject::Dict(d), map);
+            transforms.insert(node, ren);
+        }
+    }
 }
 
 fn xmap_sub(dict: &mut PdfDict) {
@@ -286,8 +380,12 @@ fn strip_transparency_groups(
 
 /// For every non-embedded simple font, embed `fallback` as its descriptor's
 /// `/FontFile2` (best-effort: the program may not match the original glyphs,
-/// but satisfies PDF/A's embedding requirement). Type0/CID and Type3 fonts
-/// are skipped (Type3 is exempt; Type0 fallback needs composite-font authoring).
+/// but satisfies PDF/A's embedding requirement). Type3 fonts are skipped
+/// (exempt). Type0/CID fonts get the fallback embedded on their descendant
+/// CIDFont's `/FontDescriptor` as `/FontFile2`, with `/CIDToGIDMap /Identity`
+/// and a default `/W` — the same best-effort semantics (embedding satisfied,
+/// glyphs may not match). Now that composite-font authoring exists, this
+/// closes the last unembedded-font gap for PDF/A.
 fn embed_fallback_fonts(
     source: &PdfFile,
     map: &HashMap<ObjectId, u32>,
@@ -328,7 +426,24 @@ fn embed_fallback_fonts(
                         continue;
                     };
                     let subtype = font.get_name("Subtype").unwrap_or("");
-                    if subtype == "Type3" || subtype == "Type0" {
+                    if subtype == "Type3" {
+                        continue;
+                    }
+                    if subtype == "Type0" {
+                        // Descendant CIDFont: its /FontDescriptor is where the
+                        // program is embedded. Best-effort — embed the fallback
+                        // and set /CIDToGIDMap /Identity so the CID→GID path is
+                        // valid even if glyphs don't match the original.
+                        embed_type0_fallback(
+                            source,
+                            map,
+                            &font,
+                            fallback,
+                            &compressed,
+                            next_extra,
+                            &mut seen,
+                            edits,
+                        );
                         continue;
                     }
                     // A simple font: check its descriptor for an embedded file.
@@ -389,6 +504,91 @@ fn deref(file: &PdfFile, obj: &PdfObject) -> PdfObject {
         PdfObject::Ref(r) => file.resolve(*r).unwrap_or(PdfObject::Null),
         other => other.clone(),
     }
+}
+
+/// Embed the fallback font program on a non-embedded Type0 font's descendant
+/// CIDFont, satisfying PDF/A's embedding requirement. Best-effort: the
+/// fallback's glyphs need not match the original. Allocates a `/FontFile2`
+/// stream for the program and patches the descendant CIDFont dict with
+/// `/FontFile2` on its `/FontDescriptor` and `/CIDToGIDMap /Identity` (plus a
+/// default `/W`/`/DW` when absent) so the CID→GID path is valid. Skips fonts
+/// that already embed a program or have no resolvable descendant/descriptor.
+#[allow(clippy::too_many_arguments)]
+fn embed_type0_fallback(
+    source: &PdfFile,
+    map: &HashMap<ObjectId, u32>,
+    font: &PdfDict,
+    fallback: &[u8],
+    compressed: &[u8],
+    next_extra: &mut u32,
+    seen: &mut std::collections::HashSet<ObjectId>,
+    edits: &mut PdfaEdits,
+) {
+    // /DescendantFonts [cidfont_ref]
+    let descs = font.get("DescendantFonts").map(|o| deref(source, o));
+    let Some(PdfObject::Array(descs)) = descs.as_ref() else {
+        return;
+    };
+    let Some(PdfObject::Ref(cid_ref)) = descs.first() else {
+        return;
+    };
+    let Ok(cid) = source.resolve(*cid_ref).and_then(|o| o.as_dict().cloned()) else {
+        return;
+    };
+    let Some(PdfObject::Ref(desc_ref)) = cid.get("FontDescriptor") else {
+        return;
+    };
+    if !seen.insert(*desc_ref) {
+        return;
+    }
+    let Ok(desc) = source.resolve(*desc_ref).and_then(|o| o.as_dict().cloned()) else {
+        return;
+    };
+    let already_embedded = desc.get("FontFile").is_some()
+        || desc.get("FontFile2").is_some()
+        || desc.get("FontFile3").is_some();
+    if already_embedded {
+        return;
+    }
+
+    // Allocate the fallback program stream.
+    let file_num = *next_extra;
+    *next_extra += 1;
+    let mut file_dict = PdfDict::new();
+    file_dict.insert(
+        PdfName::new("Filter"),
+        PdfObject::Name(PdfName::new("FlateDecode")),
+    );
+    file_dict.insert(
+        PdfName::new("Length1"),
+        PdfObject::Integer(fallback.len() as i64),
+    );
+    edits
+        .extras
+        .push((file_num, ExtraObj::Stream(file_dict, compressed.to_vec())));
+
+    // Patch the FontDescriptor with /FontFile2.
+    let mut new_desc = desc.clone();
+    new_desc.insert(
+        PdfName::new("FontFile2"),
+        PdfObject::Ref(ObjectId(file_num, 0)),
+    );
+    let ren = renumber(&PdfObject::Dict(new_desc), map);
+    edits.transforms.insert(*desc_ref, ren);
+
+    // Patch the descendant CIDFont: /CIDToGIDMap /Identity + a default /DW
+    // when absent (so the read side resolves glyph metrics without the
+    // original, possibly-absent /W). Preserve any existing /W.
+    let mut new_cid = cid.clone();
+    new_cid.insert(
+        PdfName::new("CIDToGIDMap"),
+        PdfObject::Name(PdfName::new("Identity")),
+    );
+    if new_cid.get("DW").is_none() && new_cid.get("W").is_none() {
+        new_cid.insert(PdfName::new("DW"), PdfObject::Integer(1000));
+    }
+    let ren = renumber(&PdfObject::Dict(new_cid), map);
+    edits.transforms.insert(*cid_ref, ren);
 }
 
 /// Build a minimal `pdfaid` XMP packet declaring the given PDF/A part.
