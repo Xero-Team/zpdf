@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 0.12.0 — Writer-toolkit Deferred sweep + first publishable release
+
+This is the first release whose full crate chain is publishable to crates.io
+end-to-end (`cargo install zpdf-cli` works once the publish workflow runs). The
+0.11.0 tag's `zpdf-writer` failed `cargo publish` verification because its
+default PDF/A output-intent ICC profile was `include_bytes!`'d from a sibling
+crate's test-data directory (outside the published crate); 0.12.0 bundles the
+profile inside `zpdf-writer` and bumps the workspace to a self-contained,
+publishable state.
+
 ### Tagged PDF: coarse retagging + PDF/UA table/OBJR checks
 
 - `IncrementalWriter::tag_pdf` adds a coarse-grained tag structure to an
