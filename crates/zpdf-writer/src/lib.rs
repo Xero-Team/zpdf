@@ -38,6 +38,7 @@ use serialize::{serialize_dict, write_object, write_stream};
 
 pub mod annotate;
 pub mod builder;
+mod cff;
 pub mod copier;
 pub mod encrypt;
 pub mod forms;
@@ -45,15 +46,18 @@ pub mod linearize;
 pub mod merge;
 pub mod metadata;
 pub mod pages;
+mod pdfa_convert;
 pub mod redact;
 pub mod rewrite;
 pub mod sign;
 pub mod stamp;
 pub mod subset;
+mod tounicode;
 
 pub use annotate::{AnnotationSpec, MarkupKind};
 pub use builder::{
-    DocumentBuilder, EmbeddedFontHandle, ImageData, PageHandle, PathSegment, PathStyle,
+    classify_font_program, DocumentBuilder, EmbeddedFontHandle, FontProgram, ImageData, PageHandle,
+    PathSegment, PathStyle, TagSpec,
 };
 pub use copier::{copy_object_graph, ObjectIdMap};
 pub use encrypt::{EncryptionAlgorithm, EncryptionConfig, Permissions};
@@ -62,8 +66,10 @@ pub use linearize::linearize_pdf;
 pub use merge::extract_pages;
 pub use metadata::InfoUpdate;
 pub use redact::RedactOptions;
-pub use rewrite::{rewrite_pdf, RewriteOptions};
-pub use sign::{SignatureOptions, SigningKey};
+pub use rewrite::{rewrite_pdf, PdfaConvertConfig, PdfaProfile, RewriteOptions};
+#[cfg(feature = "timestamp")]
+pub use sign::UreqTimestampRequester;
+pub use sign::{AppearanceSpec, SignatureOptions, SigningKey, SubFilter, TimestampRequester};
 pub use stamp::{jpeg_dimensions, StampImage, StampItem};
 
 /// An object queued for the incremental update, kept unserialized so later

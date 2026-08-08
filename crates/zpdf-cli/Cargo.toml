@@ -19,6 +19,9 @@ path = "src/main.rs"
 default = ["cpu"]
 cpu = ["zpdf/cpu-render"]
 gpu = ["zpdf/gpu-render"]
+# Enables the `--tsa` RFC 3161 timestamp option for `zpdf sign` (pure-Rust
+# HTTP via zpdf-writer's ureq backend).
+timestamp = ["zpdf-writer/timestamp"]
 
 [dependencies]
 zpdf = { workspace = true, default-features = false }

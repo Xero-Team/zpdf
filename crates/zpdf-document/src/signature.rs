@@ -101,6 +101,33 @@ pub struct Signature {
     /// as certificate-chain verification ([`crate::trust`]). `None` when the
     /// dictionary carried no string /Contents.
     pub cms_blob: Option<Vec<u8>>,
+    /// True when the CMS carries an RFC 3161 timestamp token in its
+    /// `unsignedAttrs` (a `signature-time-stamp` attribute). Best-effort
+    /// detection by OID scan; the TSA signature itself is not verified.
+    pub has_timestamp: bool,
+    /// Number of certificates embedded in the CMS `certificates` set (the
+    /// signer cert plus any chain), best-effort.
+    pub cert_count: usize,
+    /// Whether the document carries a `/DSS` (Document Security Store) on its
+    /// catalog — certs/CRLs/OCSP for LTV. `None` resolution falls back to false.
+    pub has_dss: bool,
+    /// Offline revocation status derived from CRLs embedded in the CMS or the
+    /// `/DSS`. No network fetching is performed.
+    pub revocation: RevocationStatus,
+}
+
+/// Offline certificate-revocation status, derived from CRLs embedded in the
+/// signature CMS or the document's `/DSS`. OCSP/CRL *fetching* over the network
+/// is out of scope (the project has no network dependency); this checks only
+/// the revocation material already embedded in the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevocationStatus {
+    /// No CRL was available to check against.
+    Unknown,
+    /// The signer certificate is not listed on any embedded CRL.
+    NotRevoked,
+    /// The signer certificate's serial appears on an embedded CRL.
+    Revoked,
 }
 
 impl Signature {
@@ -299,6 +326,18 @@ fn build_signature(file: &PdfFile, field_name: String, sig: &PdfDict) -> Signatu
     let coverage = parse_byte_range(file, sig, file.data().len());
     let outcome = verify(file, &coverage, contents.as_deref(), sub_filter.as_deref());
 
+    // Best-effort CMS analysis: timestamp detection, embedded cert count, and
+    // offline CRL revocation. `None` contents → all-default.
+    let (has_timestamp, cert_count, revocation) = match contents.as_deref() {
+        Some(cms) => (
+            revocation::has_timestamp(cms),
+            revocation::cert_count(cms),
+            revocation::revocation_status(cms),
+        ),
+        None => (false, 0, RevocationStatus::Unknown),
+    };
+    let has_dss = catalog_has_dss(file);
+
     Signature {
         field_name,
         filter: sig.get_name("Filter").ok().map(String::from),
@@ -315,7 +354,25 @@ fn build_signature(file: &PdfFile, field_name: String, sig: &PdfDict) -> Signatu
         signature_algorithm: outcome.signature_algorithm,
         signer_common_name: outcome.signer_common_name,
         cms_blob: contents,
+        has_timestamp,
+        cert_count,
+        has_dss,
+        revocation,
     }
+}
+
+/// Whether the catalog carries a `/DSS` (Document Security Store).
+fn catalog_has_dss(file: &PdfFile) -> bool {
+    let Ok(root) = file.trailer.get_ref("Root") else {
+        return false;
+    };
+    let Ok(catalog) = file.resolve(root).and_then(|o| o.as_dict().cloned()) else {
+        return false;
+    };
+    matches!(
+        deref(file, catalog.get("DSS").unwrap_or(&PdfObject::Null)),
+        PdfObject::Dict(_) | PdfObject::Ref(_)
+    )
 }
 
 /// The full result of verifying one signature's CMS blob.
@@ -1002,6 +1059,187 @@ fn text_string(file: &PdfFile, obj: &PdfObject) -> Option<String> {
     match deref(file, obj) {
         PdfObject::String(s) => Some(pdf_string_to_unicode(s.as_bytes())),
         _ => None,
+    }
+}
+
+/// Best-effort CMS analysis for production-grade signing: timestamp
+/// detection, embedded certificate count, and offline CRL revocation. All
+/// pure-DER byte walks over the `cms_blob`; no network, no crypto verification
+/// of the TSA or CRL signatures (the material is trusted as embedded).
+mod revocation {
+    use super::RevocationStatus;
+
+    /// OID for the CMS `signature-time-stamp` attribute (1.2.840.113549.1.9.16.2.14).
+    const OID_TIMESTAMP: &[u8] = &[
+        0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x10, 0x02, 0x0e,
+    ];
+
+    /// True when the CMS carries a `signature-time-stamp` unsigned attribute.
+    pub fn has_timestamp(cms: &[u8]) -> bool {
+        cms.windows(OID_TIMESTAMP.len()).any(|w| w == OID_TIMESTAMP)
+    }
+
+    /// Count the certificates in the CMS `certificates [0]` set (best-effort).
+    pub fn cert_count(cms: &[u8]) -> usize {
+        match signed_data(cms) {
+            Some(sd) => match field(sd, 0xA0) {
+                Some(certs_blob) => children(certs_blob).len(),
+                None => 0,
+            },
+            None => 0,
+        }
+    }
+
+    /// Offline revocation: parse CRLs from `crls [1]`, collect their revoked
+    /// serials, and compare to the signer cert's serial (the first cert in
+    /// `certificates [0]`). `Unknown` when there are no CRLs or the serials
+    /// cannot be extracted.
+    pub fn revocation_status(cms: &[u8]) -> RevocationStatus {
+        let Some(sd) = signed_data(cms) else {
+            return RevocationStatus::Unknown;
+        };
+        let crls_blob = match field(sd, 0xA1) {
+            Some(b) => b,
+            None => return RevocationStatus::Unknown, // no CRLs embedded
+        };
+        let crls = children(crls_blob);
+        if crls.is_empty() {
+            return RevocationStatus::Unknown;
+        }
+        // Signer cert serial = first cert's serial.
+        let signer_serial = field(sd, 0xA0)
+            .and_then(|certs| children(certs).into_iter().next())
+            .and_then(cert_serial);
+        let Some(signer_serial) = signer_serial else {
+            return RevocationStatus::Unknown;
+        };
+        for crl in crls {
+            for revoked in crl_revoked_serials(crl) {
+                if revoked == signer_serial {
+                    return RevocationStatus::Revoked;
+                }
+            }
+        }
+        RevocationStatus::NotRevoked
+    }
+
+    /// (tag, content, rest-after-this-TLV) of the DER TLV at the start.
+    fn tlv_split(bytes: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+        let &tag = bytes.first()?;
+        let len_byte = *bytes.get(1)?;
+        let (len, hdr) = if len_byte < 0x80 {
+            (len_byte as usize, 2)
+        } else {
+            let n = (len_byte & 0x7f) as usize;
+            if !(1..=4).contains(&n) || bytes.len() < 2 + n {
+                return None;
+            }
+            let mut l = 0usize;
+            for i in 0..n {
+                l = (l << 8) | bytes[2 + i] as usize;
+            }
+            (l, 2 + n)
+        };
+        let content = bytes.get(hdr..hdr + len)?;
+        Some((tag, content, &bytes[hdr + len..]))
+    }
+
+    /// Top-level TLV byte slices within `content`.
+    fn children(content: &[u8]) -> Vec<&[u8]> {
+        let mut out = Vec::new();
+        let mut rest = content;
+        while let Some((_, _, next)) = tlv_split(rest) {
+            let total = rest.len() - next.len();
+            out.push(&rest[..total]);
+            rest = next;
+        }
+        out
+    }
+
+    /// The SignedData content (the inner of ContentInfo's `[0]`), or `None`.
+    fn signed_data(cms: &[u8]) -> Option<&[u8]> {
+        // ContentInfo ::= SEQUENCE { OID, [0] SignedData }
+        let (_, outer, _) = tlv_split(cms)?;
+        let kids = children(outer);
+        kids.into_iter().find_map(|k| {
+            let (tag, content, _) = tlv_split(k)?;
+            (tag == 0xA0).then_some(content)
+        })
+    }
+
+    /// The content of the `[ctx_tag]` IMPLICIT field within a SignedData, if present.
+    fn field(sd: &[u8], ctx_tag: u8) -> Option<&[u8]> {
+        let (_, content, _) = tlv_split(sd)?;
+        for k in children(content) {
+            let (tag, c, _) = tlv_split(k)?;
+            if tag == ctx_tag {
+                return Some(c);
+            }
+        }
+        None
+    }
+
+    /// The serial number bytes of a certificate (DER), if parseable.
+    fn cert_serial(cert: &[u8]) -> Option<Vec<u8>> {
+        // Certificate ::= SEQUENCE { tbsCertificate SEQUENCE, ... }
+        let (_, tbs, _) = tlv_split(cert)?;
+        let (_, tbs_content, _) = tlv_split(tbs)?;
+        let mut kids = children(tbs_content).into_iter();
+        // tbsCertificate: [version [0]]?, serialNumber INT, ...
+        let first = kids.next()?;
+        let (tag, _content, _) = tlv_split(first)?;
+        let serial_field = if tag == 0xA0 {
+            // version present; serial is next.
+            kids.next()?
+        } else {
+            first
+        };
+        let (st, sc, _) = tlv_split(serial_field)?;
+        (st == 0x02).then_some(sc.to_vec())
+    }
+
+    /// Revoked serials from a CRL (CertificateList), if it carries revokedCertificates.
+    fn crl_revoked_serials(crl: &[u8]) -> Vec<Vec<u8>> {
+        // CertificateList ::= SEQUENCE { tbsCertList SEQ, ... }
+        let (_, tbs, _) = match tlv_split(crl) {
+            Some(x) => x,
+            None => return Vec::new(),
+        };
+        let (_, tbs_content, _) = match tlv_split(tbs) {
+            Some(x) => x,
+            None => return Vec::new(),
+        };
+        // tbsCertList: version? INT, signature SEQ, issuer SEQ, thisUpdate Time,
+        // nextUpdate? Time, revokedCertificates? SEQ OF, extensions? [0].
+        let mut out = Vec::new();
+        let mut seen_time = false;
+        for k in children(tbs_content) {
+            let (tag, content, _) = match tlv_split(k) {
+                Some(x) => x,
+                None => continue,
+            };
+            if tag == 0x17 || tag == 0x18 {
+                // UTCTime / GeneralizedTime
+                seen_time = true;
+                continue;
+            }
+            if tag == 0x30 && seen_time {
+                // revokedCertificates: SEQUENCE OF SEQUENCE { serial INT, ... }
+                for entry in children(content) {
+                    if let Some((_, ec, _)) = tlv_split(entry) {
+                        if let Some(serial_tlv) = children(ec).into_iter().next() {
+                            if let Some((st, sc, _)) = tlv_split(serial_tlv) {
+                                if st == 0x02 {
+                                    out.push(sc.to_vec());
+                                }
+                            }
+                        }
+                    }
+                }
+                break;
+            }
+        }
+        out
     }
 }
 

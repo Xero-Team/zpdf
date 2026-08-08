@@ -159,7 +159,7 @@ fn composite_components(data: &[u8]) -> Vec<u16> {
 
 /// Reassemble the sfnt with some tables replaced. `force_long_loca` writes
 /// `indexToLocFormat = 1` into the copied `head`.
-fn rebuild_sfnt(
+pub(crate) fn rebuild_sfnt(
     font: &[u8],
     replacements: &[([u8; 4], Vec<u8>)],
     force_long_loca: bool,

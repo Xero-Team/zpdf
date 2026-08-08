@@ -15,6 +15,7 @@ pub mod output_intents;
 pub mod page;
 pub mod page_labels;
 pub mod pdfa;
+pub mod pdfua;
 pub mod signature;
 pub mod structure;
 pub mod trust;
@@ -37,7 +38,7 @@ pub use outline::OutlineItem;
 pub use output_intents::OutputIntent;
 pub use page::{PdfPage, ResourceDict};
 pub use page_labels::{PageLabelStyle, PageLabels};
-pub use signature::{ByteRangeCoverage, CryptoStatus, DigestStatus, Signature};
+pub use signature::{ByteRangeCoverage, CryptoStatus, DigestStatus, RevocationStatus, Signature};
 pub use structure::{StructElem, StructKid, StructRole, StructTree};
 pub use xmp::XmpMetadata;
 

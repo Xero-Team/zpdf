@@ -27,6 +27,34 @@ use crate::encrypt::{EncryptionConfig, Encryptor};
 use crate::serialize::{write_object, write_stream};
 use crate::{flate_compress, invalid_data};
 
+/// The PDF/A conformance profile to convert *to* (see [`PdfaConvertConfig`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PdfaProfile {
+    /// ISO 19005-1 Level B (PDF/A-1b): PDF 1.4 model, no transparency.
+    A1b,
+    /// ISO 19005-2 Level B (PDF/A-2b): PDF 1.7 model, transparency allowed.
+    A2b,
+}
+
+/// PDF/A conversion options. When set on [`RewriteOptions::pdfa`],
+/// [`rewrite_pdf`] injects a `GTS_PDFA1` output intent + sRGB ICC profile,
+/// writes a `pdfaid` XMP packet, strips PDF/A-forbidden features (JavaScript,
+/// launch actions, embedded files / transparency for A-1b), corrects the
+/// header version, and ensures a trailer `/ID`. The output then passes
+/// [`zpdf_document::pdfa::validate`] for the same profile.
+#[derive(Debug, Clone)]
+pub struct PdfaConvertConfig {
+    pub profile: PdfaProfile,
+    /// An ICC profile to embed as the `/DestOutputProfile` (defaults to sRGB
+    /// when `None`).
+    pub icc: Option<Vec<u8>>,
+    /// A TrueType fallback program embedded as `/FontFile2` for non-embedded
+    /// simple fonts (best-effort — the program may not match the original
+    /// font's glyphs, but satisfies PDF/A's embedding requirement). `None`
+    /// leaves non-embedded fonts as-is (the result will not conform on fonts).
+    pub fallback_font: Option<Vec<u8>>,
+}
+
 /// Options for [`rewrite_pdf`].
 #[derive(Debug, Clone)]
 pub struct RewriteOptions {
@@ -41,6 +69,10 @@ pub struct RewriteOptions {
     /// images at original resolution. DCT/JPX/CCITT images are never resampled
     /// (they would have to be re-encoded).
     pub max_image_dimension: Option<u32>,
+    /// Convert the output to PDF/A (inject output intent + XMP, strip
+    /// forbidden features, fix the header version). Mutually exclusive with
+    /// `encrypt` (PDF/A forbids encryption).
+    pub pdfa: Option<PdfaConvertConfig>,
 }
 
 impl Default for RewriteOptions {
@@ -49,6 +81,7 @@ impl Default for RewriteOptions {
             compress_uncompressed: true,
             encrypt: None,
             max_image_dimension: None,
+            pdfa: None,
         }
     }
 }
@@ -99,14 +132,36 @@ pub fn rewrite_pdf(source: &PdfFile, options: &RewriteOptions) -> Result<Vec<u8>
         None => None,
     };
 
+    // PDF/A conversion edits (if requested), computed against the completed
+    // walk's old→new map so transforms are pre-renumbered and injected objects
+    // get final numbers continuing past the walked set.
+    let pdfa_edits = match &options.pdfa {
+        Some(cfg) => crate::pdfa_convert::prepare(source, &order, &map, cfg)?,
+        None => crate::pdfa_convert::PdfaEdits::default(),
+    };
+    let pdfa_active = options.pdfa.is_some();
+    if pdfa_active && encryptor.is_some() {
+        return Err(invalid_data(
+            "--pdfa cannot be combined with --encrypt (PDF/A forbids encryption)",
+        )
+        .into());
+    }
+
     // Pass 2: serialize in new-number order.
     let mut out: Vec<u8> = Vec::new();
-    out.extend_from_slice(b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n");
+    out.extend_from_slice(pdfa_edits.header.as_bytes());
+    out.extend_from_slice(b"\n%\xE2\xE3\xCF\xD3\n");
     let mut offsets: Vec<u64> = Vec::with_capacity(order.len());
     for (n, id) in order.iter().enumerate() {
         let new_num = (n + 1) as u32;
         offsets.push(out.len() as u64);
-        let mut obj = renumber(&source.resolve(*id)?, &map);
+        // Use the PDF/A transform (already renumbered) when one exists for this
+        // object; otherwise resolve+renumber the original.
+        let mut obj = if let Some(t) = pdfa_edits.transforms.get(id) {
+            t.clone()
+        } else {
+            renumber(&source.resolve(*id)?, &map)
+        };
         if let Some(max_dim) = options.max_image_dimension {
             if let PdfObject::Stream(stream) = &mut obj {
                 if let Some(smaller) = downsample_image_stream(stream, max_dim) {
@@ -134,6 +189,21 @@ pub fn rewrite_pdf(source: &PdfFile, options: &RewriteOptions) -> Result<Vec<u8>
             continue;
         }
         emit(&mut out, new_num, obj, options).map_err(zpdf_core::Error::Io)?;
+    }
+
+    // Emit the PDF/A injected objects (ICC, output intent, XMP, fallback font
+    // files) after the walked set, in ascending object-number order so the
+    // xref offsets stay ascending.
+    for (num, extra) in &pdfa_edits.extras {
+        offsets.push(out.len() as u64);
+        match extra {
+            crate::pdfa_convert::ExtraObj::Object(obj) => {
+                write_object(&mut out, *num, 0, obj).map_err(zpdf_core::Error::Io)?
+            }
+            crate::pdfa_convert::ExtraObj::Stream(dict, data) => {
+                write_stream(&mut out, *num, 0, dict, data).map_err(zpdf_core::Error::Io)?
+            }
+        }
     }
 
     // The /Encrypt dictionary itself is stored in the clear, after all
@@ -191,6 +261,16 @@ pub fn rewrite_pdf(source: &PdfFile, options: &RewriteOptions) -> Result<Vec<u8>
         // Keep the original /ID (first element identifies the document across
         // revisions); /Prev is intentionally dropped.
         trailer.insert(PdfName::new("ID"), id_arr.clone());
+    } else if pdfa_active {
+        // PDF/A requires a trailer /ID; the source had none, so write a fresh
+        // one derived from the document content.
+        trailer.insert(
+            PdfName::new("ID"),
+            PdfObject::Array(vec![
+                PdfObject::String(zpdf_core::PdfString(id_first.clone())),
+                PdfObject::String(zpdf_core::PdfString(id_first)),
+            ]),
+        );
     }
     out.extend_from_slice(b"trailer\n");
     crate::serialize::serialize_dict(&mut out, &trailer).map_err(zpdf_core::Error::Io)?;
@@ -353,7 +433,7 @@ fn collect_refs(obj: &PdfObject, map: &mut HashMap<ObjectId, u32>, queue: &mut V
 
 /// Structurally rewrite references through the completed mapping. A ref to an
 /// unmapped object (impossible after a full walk, defensive) becomes null.
-fn renumber(obj: &PdfObject, map: &HashMap<ObjectId, u32>) -> PdfObject {
+pub(crate) fn renumber(obj: &PdfObject, map: &HashMap<ObjectId, u32>) -> PdfObject {
     match obj {
         PdfObject::Ref(r) => match map.get(r) {
             Some(&n) => PdfObject::Ref(ObjectId(n, 0)),
