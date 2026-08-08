@@ -52,6 +52,7 @@ pub mod rewrite;
 pub mod sign;
 pub mod stamp;
 pub mod subset;
+mod tag;
 mod tounicode;
 
 pub use annotate::{AnnotationSpec, MarkupKind};

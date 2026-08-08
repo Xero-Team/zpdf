@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### Tagged PDF: coarse retagging + PDF/UA table/OBJR checks
+
+- `IncrementalWriter::tag_pdf` adds a coarse-grained tag structure to an
+  existing **untagged** PDF: each page's `/Contents` is wrapped in a single
+  `/Part <</MCID 0>> BDC … EMC` sequence, with a `/StructTreeRoot` + `/ParentTree`
+  + `/MarkInfo /Marked true`, and one `/Part` element per page carrying the
+  page's extracted text as `/Alt`. No-op when the document is already tagged.
+  The tags are page-level only — this cannot infer paragraph/heading/table
+  semantics from existing layout; use `DocumentBuilder`'s tagged APIs for
+  fine-grained tags. CLI `zpdf tag <in> -o <out>`.
+- The PDF/UA-1 validator gained two rules: `table-structure` (a `Table`'s
+  element children must be `TR`; a `TR`'s must be `TH`/`TD`) and `annotation-objr`
+  (content-bearing annotations — Widget/Link/marked-up — should be
+  structure-reachable via `/OBJR`; flagged when the tree has none).
+
 ### CJK vertical writing + predefined CMap authoring
 
 - `DocumentBuilder::embed_composite_font_vertical`: composite (Type0) fonts in
