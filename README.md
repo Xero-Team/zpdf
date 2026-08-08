@@ -136,7 +136,7 @@ GPU (wgpu) renderers whose output matches within <1% of pixels.
 - **[docs/library.md](docs/library.md)** — using zpdf as a Rust library + architecture.
 - **[docs/CHANGELOG.md](docs/CHANGELOG.md)** — release notes.
 - **[ROADMAP.md](ROADMAP.md)** — development plan.
-- **[zpdf-skill](zpdf-skill/)** — a Claude Code skill that teaches the assistant the `zpdf` CLI (see below).
+- **[zpdf-skill](zpdf-skill/)** — an agent skill that teaches an AI coding assistant the `zpdf` CLI (see below).
 
 ## Install
 
@@ -168,20 +168,26 @@ cargo add zpdf --features gpu-render    # + the wgpu GPU backend
 Published on [crates.io](https://crates.io/crates/zpdf) · API docs on
 [docs.rs](https://docs.rs/zpdf).
 
-## Claude Code skill
+## AI coding assistant skill
 
-The [`zpdf-skill`](zpdf-skill/) submodule is a [Claude Code](https://docs.claude.com/en/docs/claude-code)
-skill that makes the assistant proficient with the `zpdf` CLI. It ships a
-`SKILL.md` plus a set of reference files (`reading-commands.md`,
+The [`zpdf-skill`](zpdf-skill/) submodule is an **agent skill** that makes an
+AI coding assistant proficient with the `zpdf` CLI. It works across any
+agent/skill-capable coding tool — [Claude Code](https://docs.claude.com/en/docs/claude-code),
+[OpenAI Codex](https://github.com/openai/codex), [opencode](https://opencode.ai),
+and others that consume a `SKILL.md` + reference files.
+
+It ships a `SKILL.md` plus a set of reference files (`reading-commands.md`,
 `editing-commands.md`, `analysis-commands.md`, …) that document every command
-and flag, and an intelligent loading strategy that pulls in only the reference
-relevant to the task at hand (reading vs. editing vs. analysis) to keep context
-overhead low.
+and flag, with an intelligent loading strategy that pulls in only the reference
+relevant to the task at hand (reading vs. editing vs. analysis) to keep
+context overhead low.
 
-Install it into your Claude Code environment by symlinking (or copying) the
-submodule's `SKILL.md` + `references/` into your skills directory, then ask
-Claude to "use the zpdf skill" for any PDF task — it will run the right `zpdf`
-commands for inspecting, rendering, converting, editing, or signing PDFs.
+Install it into your tool's skills/agents directory by symlinking or copying
+the submodule's `SKILL.md` + `references/` there (each tool's convention
+differs — Claude Code uses `~/.claude/skills/`, Codex and opencode read a
+project- or user-level skills/config). Then ask the assistant to "use the zpdf
+skill" for any PDF task — it will run the right `zpdf` commands for
+inspecting, rendering, converting, editing, or signing PDFs.
 
 The submodule tracks the [`Xero-Team/zpdf-skill`](https://github.com/Xero-Team/zpdf-skill)
 repository and is kept in sync with the CLI's capabilities.
