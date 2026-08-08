@@ -136,13 +136,16 @@ GPU (wgpu) renderers whose output matches within <1% of pixels.
 - **[docs/library.md](docs/library.md)** — using zpdf as a Rust library + architecture.
 - **[docs/CHANGELOG.md](docs/CHANGELOG.md)** — release notes.
 - **[ROADMAP.md](ROADMAP.md)** — development plan.
+- **[zpdf-skill](zpdf-skill/)** — a Claude Code skill that teaches the assistant the `zpdf` CLI (see below).
 
 ## Install
 
-**Command-line tool** — `cargo install` builds the `zpdf` binary:
+**Command-line tool** — `cargo install` builds the `zpdf` binary, or
+`cargo binstall` downloads a prebuilt one (no compile):
 
 ```bash
-cargo install zpdf-cli                  # CPU rendering (default)
+cargo binstall zpdf-cli                 # prebuilt binary (no compilation)
+cargo install zpdf-cli                  # build from source (default)
 cargo install zpdf-cli --features gpu   # + the wgpu GPU backend
 ```
 
@@ -150,6 +153,10 @@ cargo install zpdf-cli --features gpu   # + the wgpu GPU backend
 zpdf info document.pdf
 zpdf render document.pdf -p 1 -o out.png --dpi 150
 ```
+
+Prebuilt binaries (Windows x86_64, Linux x86_64 gnu/musl + aarch64, macOS
+aarch64 + x86_64) are attached to each [GitHub Release](https://github.com/Xero-Team/zpdf/releases);
+`cargo-binstall` fetches the one matching your host automatically.
 
 **Library** — add the `zpdf` facade crate to your project:
 
@@ -160,6 +167,24 @@ cargo add zpdf --features gpu-render    # + the wgpu GPU backend
 
 Published on [crates.io](https://crates.io/crates/zpdf) · API docs on
 [docs.rs](https://docs.rs/zpdf).
+
+## Claude Code skill
+
+The [`zpdf-skill`](zpdf-skill/) submodule is a [Claude Code](https://docs.claude.com/en/docs/claude-code)
+skill that makes the assistant proficient with the `zpdf` CLI. It ships a
+`SKILL.md` plus a set of reference files (`reading-commands.md`,
+`editing-commands.md`, `analysis-commands.md`, …) that document every command
+and flag, and an intelligent loading strategy that pulls in only the reference
+relevant to the task at hand (reading vs. editing vs. analysis) to keep context
+overhead low.
+
+Install it into your Claude Code environment by symlinking (or copying) the
+submodule's `SKILL.md` + `references/` into your skills directory, then ask
+Claude to "use the zpdf skill" for any PDF task — it will run the right `zpdf`
+commands for inspecting, rendering, converting, editing, or signing PDFs.
+
+The submodule tracks the [`Xero-Team/zpdf-skill`](https://github.com/Xero-Team/zpdf-skill)
+repository and is kept in sync with the CLI's capabilities.
 
 ## Quick start
 
