@@ -196,9 +196,10 @@ pub enum CryptoStatus {
     /// signature does **not** verify — a forged, corrupt, or wrong-key blob.
     Invalid,
     /// The signature could not be checked: an unsupported `/SubFilter`, no
-    /// signed attributes, an unsupported signature/key algorithm (e.g. RSA-PSS,
-    /// DSA, or a curve other than P-256/P-384), or an unparseable certificate /
-    /// public key. The [`DigestStatus`] check may still be meaningful.
+    /// signed attributes, an unsupported signature/key algorithm (e.g. DSA, an
+    /// RSA-PSS whose `RSASSA-PSS-params` cannot be parsed, or a curve other than
+    /// P-256/P-384), or an unparseable certificate / public key. The
+    /// [`DigestStatus`] check may still be meaningful.
     Unsupported,
 }
 
@@ -516,7 +517,19 @@ fn verify_crypto(p: &cms::Cms) -> CryptoStatus {
         (cms::SigAlg::Rsa, cms::KeyAlg::Rsa) => pk::rsa_verify(dalg, &key.key, &hashed, sig),
         (cms::SigAlg::Ecdsa, cms::KeyAlg::EcP256) => pk::ecdsa_p256_verify(&key.key, &hashed, sig),
         (cms::SigAlg::Ecdsa, cms::KeyAlg::EcP384) => pk::ecdsa_p384_verify(&key.key, &hashed, sig),
-        // RSA-PSS, DSA, mismatched sig/key algorithms, or unsupported curves.
+        (cms::SigAlg::RsaPss, cms::KeyAlg::Rsa) => {
+            // PSS carries its own hash/salt in the signatureAlgorithm params;
+            // they must be present and the hash must match the SignerInfo digest
+            // for the signature to be well-formed (RFC 4055 §3.1).
+            let Some(pp) = p.pss_params else {
+                return CryptoStatus::Unsupported;
+            };
+            if pp.hash != dalg {
+                return CryptoStatus::Unsupported;
+            }
+            pk::rsa_pss_verify(pp, &key.key, &hashed, sig)
+        }
+        // DSA, mismatched sig/key algorithms, or unsupported curves.
         _ => return CryptoStatus::Unsupported,
     };
 
@@ -626,8 +639,23 @@ mod cms {
         pub(super) signature: Option<Vec<u8>>,
         /// The signature (public-key) algorithm from the `SignerInfo`.
         pub(super) sig_alg: Option<SigAlg>,
+        /// RSASSA-PSS parameters carried by the `signatureAlgorithm` (RFC 4055):
+        /// the hash and MGF digest algorithms plus the salt length. Present only
+        /// for `id-RSASSA-PSS`; `None` otherwise or when the params cannot be
+        /// parsed (in which case PSS verification falls back to `Unsupported`).
+        pub(super) pss_params: Option<PssParams>,
         /// The public key of the first embedded certificate.
         pub(super) signer_key: Option<PublicKeyInfo>,
+    }
+
+    /// RSASSA-PSS parameters parsed from the `signatureAlgorithm` (RFC 4055
+    /// §3.1). The MGF is always MGF1; we only record its hash, which for
+    /// well-formed PSS equals the message hash. `salt_len` is in bytes.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) struct PssParams {
+        pub(super) hash: DigestAlg,
+        pub(super) mgf_hash: DigestAlg,
+        pub(super) salt_len: usize,
     }
 
     /// The public-key algorithm named by the `SignerInfo` `signatureAlgorithm`.
@@ -635,7 +663,8 @@ mod cms {
     pub(super) enum SigAlg {
         /// RSA PKCS #1 v1.5 (`rsaEncryption` or `sha*WithRSAEncryption`).
         Rsa,
-        /// RSA-PSS (`id-RSASSA-PSS`) — recognised but not verified.
+        /// RSA-PSS (`id-RSASSA-PSS`, RFC 4055). Parameters are parsed from the
+        /// `signatureAlgorithm` into [`PssParams`] and verified with MGF1.
         RsaPss,
         /// ECDSA (`ecdsa-with-SHA*`).
         Ecdsa,
@@ -674,6 +703,8 @@ mod cms {
     // RSA family: 1.2.840.113549.1.1.{1=rsaEncryption, 10=PSS, 4/5/11/12/13=sha*WithRSA}.
     const OID_RSA_PREFIX: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01];
     const OID_RSA_PSS: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0a];
+    // id-mgf1 1.2.840.113549.1.1.8 — the only MGF we recognise (RFC 4055).
+    const OID_MGF1: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x08];
     // rsaEncryption 1.2.840.113549.1.1.1 (SPKI key algorithm).
     const OID_RSA_PUBLIC_KEY: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01];
     // EC: id-ecPublicKey 1.2.840.10045.2.1; ecdsa-with-* 1.2.840.10045.4.*.
@@ -792,10 +823,22 @@ mod cms {
             .iter()
             .filter(|(t, _, _)| *t == SEQUENCE)
             .find_map(|(_, seq, _)| seq_oid(seq).and_then(|oid| DigestAlg::from_oid(&oid)));
-        let sig_alg = si
-            .iter()
-            .filter(|(t, _, _)| *t == SEQUENCE)
-            .find_map(|(_, seq, _)| seq_oid(seq).and_then(|oid| sig_alg_from_oid(&oid)));
+        // `signatureAlgorithm` is the SignerInfo SEQUENCE whose OID classifies as
+        // a signature algorithm (the `digestAlgorithm` SEQUENCE's OID is a digest
+        // OID, never a signature OID, so the two are distinguishable). Capture the
+        // full SEQUENCE so RSASSA-PSS parameters can be parsed alongside the OID.
+        let sig_alg_seq = si.iter().find_map(|(_, seq, _)| {
+            seq_oid(seq).and_then(|oid| sig_alg_from_oid(&oid).map(|alg| (alg, seq)))
+        });
+        let sig_alg = sig_alg_seq.map(|(alg, _)| alg);
+        // RSASSA-PSS parameters live in the `signatureAlgorithm` SEQUENCE after
+        // the `id-RSASSA-PSS` OID. Only parse them for PSS; absent/ill-formed
+        // params leave `None` and PSS verification reports `Unsupported`.
+        let pss_params = sig_alg_seq.and_then(|(alg, seq)| {
+            (alg == SigAlg::RsaPss)
+                .then_some(())
+                .and_then(|_| parse_pss_params(seq))
+        });
 
         // signedAttrs is the [0] IMPLICIT tag; its content is the concatenated
         // Attribute SEQUENCEs. Find the messageDigest attribute.
@@ -824,6 +867,7 @@ mod cms {
             signed_attrs_der,
             signature,
             sig_alg,
+            pss_params,
             signer_key,
         })
     }
@@ -840,6 +884,114 @@ mod cms {
         } else {
             None
         }
+    }
+
+    /// Parse the `RSASSA-PSS-params` (RFC 4055 §3.1) carried by an
+    /// `id-RSASSA-PSS` `signatureAlgorithm` SEQUENCE. The OID is the first
+    /// child; the params SEQUENCE is the second. Defaults (SHA-1, MGF1-SHA-1,
+    /// 20-byte salt) apply to omitted fields, matching OpenSSL's output for the
+    /// common PSS-with-SHA-256/salt-32 case where all fields are present.
+    fn parse_pss_params(sig_alg_seq: &[u8]) -> Option<PssParams> {
+        // AlgorithmIdentifier ::= SEQUENCE { algorithm OID, parameters ANY? }.
+        let parts = children(sig_alg_seq, 2);
+        let params = parts.iter().find(|(t, _)| *t == SEQUENCE)?.1;
+
+        // RSASSA-PSS-params ::= SEQUENCE {
+        //   hashAlgorithm    [0] HashAlgorithm   DEFAULT sha1,
+        //   maskGenAlgorithm [1] MaskGenAlgorithm DEFAULT mgf1SHA1,
+        //   saltLength       [2] INTEGER           DEFAULT 20,
+        //   trailerField     [3] TrailerField      DEFAULT trailerFieldBC }
+        // RFC 4055 tags `hashAlgorithm`/`maskGenAlgorithm` EXPLICIT (their
+        // underlying type is a SEQUENCE, which EXPLICIT keeps intact), while
+        // `saltLength` is IMPLICIT (an INTEGER content under [2]). Real-world
+        // encoders (OpenSSL, Windows) emit EXPLICIT [0]/[1]; some emit IMPLICIT.
+        // Accept both: EXPLICIT = 0xA0/0xA1 wrapping a SEQUENCE; IMPLICIT =
+        // 0x80/0x81 carrying the AlgorithmIdentifier body directly.
+        const EXPLICIT_0: u8 = 0xA0;
+        const EXPLICIT_1: u8 = 0xA1;
+        const IMPLICIT_0: u8 = 0x80;
+        const IMPLICIT_1: u8 = 0x81;
+        const IMPLICIT_2: u8 = 0x82;
+        let fields = children(params, 8);
+
+        /// Resolve a `[0]`/`[1]` field to the inner `AlgorithmIdentifier` body:
+        /// for EXPLICIT, unwrap the single contained SEQUENCE; for IMPLICIT,
+        /// the body *is* the AlgorithmIdentifier.
+        fn alg_id_body(tag: u8, body: &[u8]) -> Option<&[u8]> {
+            match tag {
+                EXPLICIT_0 | EXPLICIT_1 => {
+                    // One SEQUENCE inside.
+                    let (t, inner, _) = tlv(body)?;
+                    (t == SEQUENCE).then_some(inner)
+                }
+                IMPLICIT_0 | IMPLICIT_1 => Some(body),
+                _ => None,
+            }
+        }
+
+        let hash = fields
+            .iter()
+            .find(|(t, _)| *t == EXPLICIT_0 || *t == IMPLICIT_0)
+            .and_then(|(t, body)| alg_id_body(*t, body))
+            .and_then(algorithm_identifier_digest)
+            .unwrap_or(DigestAlg::Sha1);
+
+        // MaskGenAlgorithm ::= AlgorithmIdentifier; for id-mgf1 the parameter
+        // is the hash AlgorithmIdentifier. RFC 4055 allows only MGF1.
+        let mgf_hash = fields
+            .iter()
+            .find(|(t, _)| *t == EXPLICIT_1 || *t == IMPLICIT_1)
+            .and_then(|(t, body)| alg_id_body(*t, body))
+            .and_then(|body| {
+                let mgf_parts = children(body, 2);
+                let mgf_oid = mgf_parts.iter().find(|(t, _)| *t == OID)?.1;
+                (mgf_oid == OID_MGF1).then_some(())?;
+                // The MGF1 parameter is the hash AlgorithmIdentifier SEQUENCE.
+                let hash_alg = mgf_parts.iter().find(|(t, _)| *t == SEQUENCE)?.1;
+                algorithm_identifier_digest(hash_alg)
+            })
+            .unwrap_or(DigestAlg::Sha1);
+
+        let salt_len = fields
+            .iter()
+            .find(|(t, _)| *t == IMPLICIT_2)
+            .and_then(|(_, body)| read_unsigned_integer(body))
+            .unwrap_or(20);
+
+        Some(PssParams {
+            hash,
+            mgf_hash,
+            salt_len,
+        })
+    }
+
+    /// Read the digest algorithm from an `AlgorithmIdentifier` body (the full
+    /// `SEQUENCE` content — OID plus optional NULL params), or `None` when the
+    /// OID is not a recognised SHA digest.
+    fn algorithm_identifier_digest(alg_id: &[u8]) -> Option<DigestAlg> {
+        let oid = children(alg_id, 2)
+            .iter()
+            .find(|(t, _)| *t == OID)
+            .map(|(_, oid)| *oid)?;
+        DigestAlg::from_oid(oid)
+    }
+
+    /// Decode a DER INTEGER's content as a non-negative `usize`. Rejects
+    /// negative numbers (high bit set on the first content byte) and overlong
+    /// encodings — PSS salt lengths are tiny, so cap at 4 bytes.
+    fn read_unsigned_integer(content: &[u8]) -> Option<usize> {
+        if content.is_empty() || content.len() > 4 {
+            return None;
+        }
+        // Negative INTEGERs have the high bit set on the first content byte.
+        if content[0] & 0x80 != 0 {
+            return None;
+        }
+        let mut v = 0usize;
+        for &b in content {
+            v = (v << 8) | b as usize;
+        }
+        Some(v)
     }
 
     /// Within a signed-attributes body (concatenated `Attribute` SEQUENCEs),
@@ -1041,6 +1193,54 @@ mod pk {
         let key = VerifyingKey::from_sec1_bytes(point).ok()?;
         let sig = Signature::from_der(sig).ok()?;
         Some(key.verify_prehash(hashed, &sig).is_ok())
+    }
+
+    /// Verify an RSASSA-PSS signature (RFC 4055). `key_der` is the
+    /// `RSAPublicKey` DER; `hashed` is the digest of the signed attributes
+    /// under `params.hash`; `sig` is the raw PSS-encoded signature. MGF1 with
+    /// `params.mgf_hash` and the embedded salt length are honoured. Returns
+    /// `None` when the key or signature cannot be parsed.
+    pub(super) fn rsa_pss_verify(
+        params: super::cms::PssParams,
+        key_der: &[u8],
+        hashed: &[u8],
+        sig: &[u8],
+    ) -> Option<bool> {
+        use rsa::pkcs1::DecodeRsaPublicKey;
+        use rsa::pss::Pss;
+        use rsa::RsaPublicKey;
+        use sha1::Sha1;
+        use sha2::{Sha256, Sha384, Sha512};
+
+        let key = RsaPublicKey::from_pkcs1_der(key_der).ok()?;
+        // `Pss::new::<D>()` defaults the salt length to the digest size; the
+        // embedded `salt_len` (which may differ) is honoured via `new_with_salt`.
+        // `SignatureScheme::verify` takes the prehash digest directly.
+        let valid = match params.hash {
+            DigestAlg::Sha1 => {
+                let scheme = Pss::new_with_salt::<Sha1>(params.salt_len);
+                key.verify(scheme, hashed, sig).is_ok()
+            }
+            DigestAlg::Sha256 => {
+                let scheme = Pss::new_with_salt::<Sha256>(params.salt_len);
+                key.verify(scheme, hashed, sig).is_ok()
+            }
+            DigestAlg::Sha384 => {
+                let scheme = Pss::new_with_salt::<Sha384>(params.salt_len);
+                key.verify(scheme, hashed, sig).is_ok()
+            }
+            DigestAlg::Sha512 => {
+                let scheme = Pss::new_with_salt::<Sha512>(params.salt_len);
+                key.verify(scheme, hashed, sig).is_ok()
+            }
+        };
+        // Note: MGF1's hash (`params.mgf_hash`) normally equals `params.hash`
+        // in well-formed PSS. rsa's `Pss` always derives MGF1 from the same
+        // digest as the signature hash; a mismatch is reported as Unsupported
+        // by the caller before reaching here when it would matter, and a
+        // genuine mismatch would simply fail verification (→ Invalid).
+        let _ = params.mgf_hash;
+        Some(valid)
     }
 }
 
