@@ -548,6 +548,18 @@ cargo run -p zpdf-render-wgpu --example viewer -- <file.pdf>   # 交互浏览器
   后端消费的 `DisplayList`//RenderCommand`逐字节不变（测试断言装/不装文本汇时渲染命令一致）， 故 CPU↔GPU 像素一致性不可能回归，且捕获仅在装文本汇（抽取）时运行、open/render 期不触发。 facade re-export`struct_ordered_text`；CLI `zpdf text --struct`。纯 Rust 零新依赖、无解析/
   后端改动；真实标记文档端到端验证（页面上离行放置的内联代码段——几何提取会错位——被还原到
   句子的正确阅读位置）
+- [X] **既有 PDF 粗粒度补标签 + PDF/UA 表格/OBJR 校验**（`zpdf-writer/src/tag.rs` + `zpdf-document/src/pdfua.rs`）：
+  - `IncrementalWriter::tag_pdf`：给未标记既有 PDF 加粗粒度标签——每页 `/Contents` 包进单个
+    `/Part <</MCID 0>> BDC … EMC`，发 `/StructTreeRoot` + `/ParentTree` 数字树 + `/MarkInfo /Marked true`，
+    每页一个 `/Part` 元素（`/Alt` 取该页提取文本，≤4 KiB 截断），页加 `/StructParents`。**粒度限制**：
+    无法把既有内容细分为段落/标题/表格语义（需理解已绘制字形版式，范围外），每页一个 `/Part`；
+    已标记文档为 no-op（不重包不重复）；CLI `zpdf tag <in> -o <out>`（`--password` 经加密文档路径）
+  - PDF/UA-1 校验器加宽：`table-structure`（Table 子须为 TR、TR 子须为 TH/TD）、`annotation-objr`
+    （文档有 Widget/Link/标注 markup 但结构树无 `/OBJR` → flag，best-effort 全树计数）。原 4 规则不变
+  - 测试：`zpdf-writer/tests/tagged.rs` 新增 2 例（两页 PDF 补标签后每页 `/Part`+MCID 0；已标记 no-op
+    不重复）；`zpdf-document/src/pdfua.rs` 新增 4 例（非-TR Table 子、非-cell TR 子、合规 Table、
+    有 Link 无 OBJR）。全 writer+document 测试与 clippy 干净；`zpdf tag` 真实 PDF 端到端验证（`zpdf info`
+    报 `Tagged PDF: yes`/`Structure tree: 1 element`）
 
 ### P4.12 — 数字签名（Digital Signatures）
 

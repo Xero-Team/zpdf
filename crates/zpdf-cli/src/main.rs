@@ -20,7 +20,7 @@ fn main() {
     if args.len() < 2 {
         eprintln!("Usage: zpdf <command> [args...]");
         eprintln!(
-            "Commands: info, dump, render, text, search, convert, tables, forms, outline, links, struct, signatures, attachments, compare, debug-stream, fill, merge, split, optimize, annotate, sign, pages, set-meta, stamp, export-pptx, export-svg"
+            "Commands: info, dump, render, text, search, convert, tables, forms, outline, links, struct, signatures, attachments, compare, debug-stream, fill, merge, split, optimize, annotate, sign, pages, set-meta, stamp, tag, export-pptx, export-svg"
         );
         process::exit(1);
     }
@@ -52,6 +52,7 @@ fn main() {
         "pages" => cmd_pages(&args[2..]),
         "set-meta" => cmd_set_meta(&args[2..]),
         "stamp" => cmd_stamp(&args[2..]),
+        "tag" => cmd_tag(&args[2..]),
         "export-pptx" => cmd_export_pptx(&args[2..]),
         "export-svg" => cmd_export_svg(&args[2..]),
         other => {
@@ -2989,6 +2990,64 @@ fn cmd_stamp(args: &[String]) -> zpdf::Result<()> {
         page_idx + 1,
         out_path
     );
+    Ok(())
+}
+
+/// Add a coarse-grained tag structure to an untagged PDF: one `/Part` structure
+/// element per page (wrapping the page's content as MCID 0), with a
+/// `/StructTreeRoot` + `/ParentTree` + `/MarkInfo /Marked true`, and the
+/// page's extracted text as the element `/Alt`. No-op when already tagged.
+/// The tags are page-level only — this does not infer paragraph/heading/table
+/// semantics from existing layout.
+fn cmd_tag(args: &[String]) -> zpdf::Result<()> {
+    let (args, password) = extract_password(args);
+    let mut input = None;
+    let mut output = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-o" => {
+                output = args.get(i + 1).cloned();
+                i += 2;
+            }
+            other if !other.starts_with('-') => {
+                if input.is_none() {
+                    input = Some(other.to_string());
+                }
+                i += 1;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+    let Some(input_path) = input else {
+        eprintln!("Usage: zpdf tag <file.pdf> -o <out.pdf>");
+        process::exit(1);
+    };
+    let Some(out_path) = output else {
+        eprintln!("-o <out.pdf> required");
+        process::exit(1);
+    };
+    if out_path == input_path {
+        eprintln!("Output path must differ from input");
+        process::exit(1);
+    }
+
+    let data = fs::read(&input_path).map_err(zpdf::Error::Io)?;
+    // Honour --password via the incremental writer's encrypted-document path.
+    let pw: &[u8] = password.as_deref().map(|s| s.as_bytes()).unwrap_or(b"");
+    let mut writer = zpdf_writer::IncrementalWriter::new_with_password(data, pw)?;
+    if writer.document().is_tagged() {
+        eprintln!("Document is already tagged; nothing to do.");
+        // Still copy through so the caller gets a valid output file.
+        write_output(&writer, &out_path)?;
+        return Ok(());
+    }
+    warn_signatures(writer.document());
+    writer.tag_pdf()?;
+    write_output(&writer, &out_path)?;
+    println!("Tagged PDF (coarse, per-page /Part) → {}", out_path);
     Ok(())
 }
 
