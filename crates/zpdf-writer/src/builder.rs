@@ -15,7 +15,7 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use zpdf_core::{ObjectId, PdfDict, PdfName, PdfObject, Result};
 use zpdf_document::escape_text;
@@ -126,19 +126,41 @@ struct PageState {
     items: Vec<PageItem>,
 }
 
-/// An embedded TrueType font, parsed once at `embed_font` time.
+/// The embedding kind — a simple WinAnsi TrueType font (the original path)
+/// or a composite Type0/Identity-H font (CJK-capable, TrueType- or
+/// CFF-flavored).
+#[allow(clippy::large_enum_variant)] // WinAnsi carries a 256-entry width table; fonts are few.
+enum EmbeddedKind {
+    /// Simple-font TrueType with a WinAnsiEncoding byte width table.
+    WinAnsi { widths: [u16; 256] },
+    /// Composite (Type0) font using Identity-H (the 2-byte code is the GID).
+    Composite { program: FontProgram },
+}
+
+/// The font-program flavor, which decides `/FontFile2` vs `/FontFile3` and
+/// the descendant `/Subtype` (`CIDFontType2` vs `CIDFontType0`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FontProgram {
+    /// TrueType outlines (`glyf`/`loca`) — `/FontFile2`, `CIDFontType2`.
+    TrueType,
+    /// CFF outlines (an OTF `CFF ` table or raw CFF) — `/FontFile3 /OpenType`,
+    /// `CIDFontType0`.
+    OpenTypeCff,
+}
+
+/// An embedded font, parsed once at `embed_font` / `embed_composite_font`
+/// time. The `kind` selects the emission path; `data` is the raw font bytes.
 struct EmbeddedFont {
     /// PostScript-style name used as /BaseFont.
     ps_name: String,
-    /// The raw font file (embedded verbatim as FontFile2).
+    /// The raw font file (embedded, optionally subset, as FontFile2/3).
     data: Vec<u8>,
-    /// WinAnsi code → advance width in 1/1000 em units.
-    widths: [u16; 256],
     ascent: f64,
     descent: f64,
     cap_height: f64,
     bbox: [f64; 4],
     italic_angle: f64,
+    kind: EmbeddedKind,
 }
 
 /// A handle to an embedded font, returned by [`DocumentBuilder::embed_font`].
@@ -232,12 +254,98 @@ impl DocumentBuilder {
         self.embedded_fonts.push(EmbeddedFont {
             ps_name,
             data: font_bytes,
-            widths,
             ascent,
             descent,
             cap_height,
             bbox,
             italic_angle,
+            kind: EmbeddedKind::WinAnsi { widths },
+        });
+        Ok(EmbeddedFontHandle((self.embedded_fonts.len() - 1) as u32))
+    }
+
+    /// Embed a composite (Type0) font for CJK and other large glyph sets,
+    /// using **Identity-H**: the 2-byte code emitted in the content stream is
+    /// the glyph ID, and `/CIDToGIDMap /Identity` makes CID = GID. Text is
+    /// not limited to WinAnsi — any character the font's cmap can map is
+    /// encodable, including tens of thousands of CJK ideographs.
+    ///
+    /// Both TrueType-flavored (`glyf`, embedded as `/FontFile2` /
+    /// `CIDFontType2`) and CFF-flavored (OTF `CFF ` table or raw CFF,
+    /// embedded as `/FontFile3 /OpenType` / `CIDFontType0`) fonts are
+    /// supported. Raw CFF is wrapped in a minimal OTF container on embed.
+    /// Glyphs are subset at `build()` time (sparse glyf / sparse charstrings).
+    pub fn embed_composite_font(&mut self, font_bytes: Vec<u8>) -> Result<EmbeddedFontHandle> {
+        let (program, data) = if crate::cff::is_raw_cff(&font_bytes) {
+            let otf = crate::cff::wrap_cff_in_otf(&font_bytes);
+            if otf.is_empty() {
+                return Err(zpdf_core::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "cannot wrap raw CFF font into an OTF container",
+                )));
+            }
+            (FontProgram::OpenTypeCff, otf)
+        } else if crate::cff::is_cff_flavored(&font_bytes) {
+            (FontProgram::OpenTypeCff, font_bytes)
+        } else {
+            (FontProgram::TrueType, font_bytes)
+        };
+
+        let (ps_name, ascent, descent, cap_height, bbox, italic_angle) = {
+            let face = ttf_parser::Face::parse(&data, 0).map_err(|e| {
+                zpdf_core::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("cannot parse composite font: {e}"),
+                ))
+            })?;
+            let units_per_em = face.units_per_em() as f64;
+            if units_per_em <= 0.0 {
+                return Err(zpdf_core::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "composite font has invalid unitsPerEm",
+                )));
+            }
+            let to_milli = 1000.0 / units_per_em;
+            let ps_name = face
+                .names()
+                .into_iter()
+                .find(|n| n.name_id == ttf_parser::name_id::POST_SCRIPT_NAME)
+                .and_then(|n| n.to_string())
+                .or_else(|| {
+                    face.names()
+                        .into_iter()
+                        .find(|n| n.name_id == ttf_parser::name_id::FULL_NAME)
+                        .and_then(|n| n.to_string())
+                })
+                .unwrap_or_else(|| format!("ZPDFComposite{}", self.embedded_fonts.len()))
+                .replace(' ', "");
+            let bbox = face.global_bounding_box();
+            (
+                ps_name,
+                face.ascender() as f64 * to_milli,
+                face.descender() as f64 * to_milli,
+                face.capital_height()
+                    .map(|h| h as f64 * to_milli)
+                    .unwrap_or(700.0),
+                [
+                    bbox.x_min as f64 * to_milli,
+                    bbox.y_min as f64 * to_milli,
+                    bbox.x_max as f64 * to_milli,
+                    bbox.y_max as f64 * to_milli,
+                ],
+                face.italic_angle() as f64,
+            )
+        };
+
+        self.embedded_fonts.push(EmbeddedFont {
+            ps_name,
+            data,
+            ascent,
+            descent,
+            cap_height,
+            bbox,
+            italic_angle,
+            kind: EmbeddedKind::Composite { program },
         });
         Ok(EmbeddedFontHandle((self.embedded_fonts.len() - 1) as u32))
     }
@@ -447,9 +555,19 @@ impl DocumentBuilder {
         let mut image_objects: Vec<(u32, ImageData)> = Vec::new();
         let mut image_counter = 0usize;
 
+        // For composite (Type0/Identity-H) embedded fonts, build a char→GID
+        // map for every character used with that font, so build_page_content
+        // can emit 2-byte GID codes. Parsed once per font here, reused across
+        // pages (the content stream is emitted in the page loop below).
+        let composite_glyph_maps = self.build_composite_glyph_maps();
+
         for (page_idx, page_state) in self.pages.iter().enumerate() {
-            let (content_bytes, font_names, image_refs) =
-                self.build_page_content(page_state, &mut image_counter, &mut obj_num)?;
+            let (content_bytes, font_names, image_refs) = self.build_page_content(
+                page_state,
+                &mut image_counter,
+                &mut obj_num,
+                &composite_glyph_maps,
+            )?;
 
             // Record image data for the allocated object numbers.
             let mut ref_iter = image_refs.iter();
@@ -499,10 +617,8 @@ impl DocumentBuilder {
             {
                 let font = &self.embedded_fonts[idx];
 
-                // Subset to the characters actually shown with this font
-                // (sparse-glyf: unused outlines dropped, metrics preserved).
-                // Fall back to the full file when subsetting isn't possible.
-                let used: std::collections::HashSet<char> = self
+                // Collect the characters shown with this font across all pages.
+                let used: HashSet<char> = self
                     .pages
                     .iter()
                     .flat_map(|p| &p.items)
@@ -514,86 +630,281 @@ impl DocumentBuilder {
                     })
                     .flatten()
                     .collect();
-                let subset = crate::subset::subset_truetype(&font.data, &used);
-                let file_bytes: &[u8] = subset.as_deref().unwrap_or(&font.data);
 
-                // FontFile2 stream.
-                let file_num = obj_num;
-                obj_num += 1;
-                let mut file_dict = PdfDict::new();
-                file_dict.insert(
-                    PdfName::new("Filter"),
-                    PdfObject::Name(PdfName::new("FlateDecode")),
-                );
-                file_dict.insert(
-                    PdfName::new("Length1"),
-                    PdfObject::Integer(file_bytes.len() as i64),
-                );
-                streams.push((file_num, file_dict, flate_compress(file_bytes)?));
+                match &font.kind {
+                    EmbeddedKind::WinAnsi { widths } => {
+                        // Sparse-glyf subset: unused outlines dropped, metrics
+                        // preserved. Fall back to the full file when subsetting
+                        // isn't possible.
+                        let subset = crate::subset::subset_truetype(&font.data, &used);
+                        let file_bytes: &[u8] = subset.as_deref().unwrap_or(&font.data);
 
-                // FontDescriptor.
-                let desc_num = obj_num;
-                obj_num += 1;
-                let mut desc = PdfDict::new();
-                desc.insert(
-                    PdfName::new("Type"),
-                    PdfObject::Name(PdfName::new("FontDescriptor")),
-                );
-                desc.insert(
-                    PdfName::new("FontName"),
-                    PdfObject::Name(PdfName::new(&font.ps_name)),
-                );
-                // Flags: bit 6 (Nonsymbolic).
-                desc.insert(PdfName::new("Flags"), PdfObject::Integer(32));
-                desc.insert(
-                    PdfName::new("FontBBox"),
-                    PdfObject::Array(font.bbox.iter().map(|&v| PdfObject::Real(v)).collect()),
-                );
-                desc.insert(
-                    PdfName::new("ItalicAngle"),
-                    PdfObject::Real(font.italic_angle),
-                );
-                desc.insert(PdfName::new("Ascent"), PdfObject::Real(font.ascent));
-                desc.insert(PdfName::new("Descent"), PdfObject::Real(font.descent));
-                desc.insert(PdfName::new("CapHeight"), PdfObject::Real(font.cap_height));
-                desc.insert(PdfName::new("StemV"), PdfObject::Integer(80));
-                desc.insert(
-                    PdfName::new("FontFile2"),
-                    PdfObject::Ref(ObjectId(file_num, 0)),
-                );
-                objects.push((desc_num, PdfObject::Dict(desc)));
+                        // FontFile2 stream.
+                        let file_num = obj_num;
+                        obj_num += 1;
+                        let mut file_dict = PdfDict::new();
+                        file_dict.insert(
+                            PdfName::new("Filter"),
+                            PdfObject::Name(PdfName::new("FlateDecode")),
+                        );
+                        file_dict.insert(
+                            PdfName::new("Length1"),
+                            PdfObject::Integer(file_bytes.len() as i64),
+                        );
+                        streams.push((file_num, file_dict, flate_compress(file_bytes)?));
 
-                // Font dict (simple TrueType, WinAnsi).
-                let mut font_dict = PdfDict::new();
-                font_dict.insert(PdfName::new("Type"), PdfObject::Name(PdfName::new("Font")));
-                font_dict.insert(
-                    PdfName::new("Subtype"),
-                    PdfObject::Name(PdfName::new("TrueType")),
-                );
-                font_dict.insert(
-                    PdfName::new("BaseFont"),
-                    PdfObject::Name(PdfName::new(&font.ps_name)),
-                );
-                font_dict.insert(
-                    PdfName::new("Encoding"),
-                    PdfObject::Name(PdfName::new("WinAnsiEncoding")),
-                );
-                font_dict.insert(PdfName::new("FirstChar"), PdfObject::Integer(32));
-                font_dict.insert(PdfName::new("LastChar"), PdfObject::Integer(255));
-                font_dict.insert(
-                    PdfName::new("Widths"),
-                    PdfObject::Array(
-                        font.widths[32..=255]
-                            .iter()
-                            .map(|&w| PdfObject::Integer(w as i64))
-                            .collect(),
-                    ),
-                );
-                font_dict.insert(
-                    PdfName::new("FontDescriptor"),
-                    PdfObject::Ref(ObjectId(desc_num, 0)),
-                );
-                objects.push((*num, PdfObject::Dict(font_dict)));
+                        // FontDescriptor.
+                        let desc_num = obj_num;
+                        obj_num += 1;
+                        let mut desc = PdfDict::new();
+                        desc.insert(
+                            PdfName::new("Type"),
+                            PdfObject::Name(PdfName::new("FontDescriptor")),
+                        );
+                        desc.insert(
+                            PdfName::new("FontName"),
+                            PdfObject::Name(PdfName::new(&font.ps_name)),
+                        );
+                        // Flags: bit 6 (Nonsymbolic).
+                        desc.insert(PdfName::new("Flags"), PdfObject::Integer(32));
+                        desc.insert(
+                            PdfName::new("FontBBox"),
+                            PdfObject::Array(
+                                font.bbox.iter().map(|&v| PdfObject::Real(v)).collect(),
+                            ),
+                        );
+                        desc.insert(
+                            PdfName::new("ItalicAngle"),
+                            PdfObject::Real(font.italic_angle),
+                        );
+                        desc.insert(PdfName::new("Ascent"), PdfObject::Real(font.ascent));
+                        desc.insert(PdfName::new("Descent"), PdfObject::Real(font.descent));
+                        desc.insert(PdfName::new("CapHeight"), PdfObject::Real(font.cap_height));
+                        desc.insert(PdfName::new("StemV"), PdfObject::Integer(80));
+                        desc.insert(
+                            PdfName::new("FontFile2"),
+                            PdfObject::Ref(ObjectId(file_num, 0)),
+                        );
+                        objects.push((desc_num, PdfObject::Dict(desc)));
+
+                        // Font dict (simple TrueType, WinAnsi).
+                        let mut font_dict = PdfDict::new();
+                        font_dict
+                            .insert(PdfName::new("Type"), PdfObject::Name(PdfName::new("Font")));
+                        font_dict.insert(
+                            PdfName::new("Subtype"),
+                            PdfObject::Name(PdfName::new("TrueType")),
+                        );
+                        font_dict.insert(
+                            PdfName::new("BaseFont"),
+                            PdfObject::Name(PdfName::new(&font.ps_name)),
+                        );
+                        font_dict.insert(
+                            PdfName::new("Encoding"),
+                            PdfObject::Name(PdfName::new("WinAnsiEncoding")),
+                        );
+                        font_dict.insert(PdfName::new("FirstChar"), PdfObject::Integer(32));
+                        font_dict.insert(PdfName::new("LastChar"), PdfObject::Integer(255));
+                        font_dict.insert(
+                            PdfName::new("Widths"),
+                            PdfObject::Array(
+                                widths[32..=255]
+                                    .iter()
+                                    .map(|&w| PdfObject::Integer(w as i64))
+                                    .collect(),
+                            ),
+                        );
+                        font_dict.insert(
+                            PdfName::new("FontDescriptor"),
+                            PdfObject::Ref(ObjectId(desc_num, 0)),
+                        );
+                        objects.push((*num, PdfObject::Dict(font_dict)));
+                    }
+                    EmbeddedKind::Composite { program } => {
+                        // Type0 / Identity-H composite font. Resolve GIDs and
+                        // advance widths for the used characters, build the
+                        // sparse /W array and /ToUnicode pairs, and subset.
+                        let face = ttf_parser::Face::parse(&font.data, 0).map_err(|e| {
+                            zpdf_core::Error::Io(std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                format!("cannot parse composite font for emission: {e}"),
+                            ))
+                        })?;
+                        let upem = face.units_per_em() as f64;
+                        let to_milli = if upem > 0.0 { 1000.0 / upem } else { 1.0 };
+
+                        let mut keep_gids: HashSet<u16> = HashSet::new();
+                        keep_gids.insert(0); // .notdef
+                        let mut gid_entries: Vec<(u16, u16)> = Vec::new();
+                        let mut tounicode_pairs: Vec<(u16, char)> = Vec::new();
+                        for ch in &used {
+                            let gid = face.glyph_index(*ch).map(|g| g.0).unwrap_or(0);
+                            keep_gids.insert(gid);
+                            let w = face
+                                .glyph_hor_advance(ttf_parser::GlyphId(gid))
+                                .map(|a| (a as f64 * to_milli).round().max(0.0) as u16)
+                                .unwrap_or(1000);
+                            gid_entries.push((gid, w));
+                            tounicode_pairs.push((gid, *ch));
+                        }
+                        gid_entries.sort_unstable_by_key(|(g, _)| *g);
+                        gid_entries.dedup_by_key(|(g, _)| *g);
+                        let w_array = build_w_array(&gid_entries);
+
+                        // Subset (sparse glyf for TrueType, sparse charstrings
+                        // for CFF); fall back to the full font.
+                        let subset = match program {
+                            FontProgram::TrueType => {
+                                crate::subset::subset_truetype(&font.data, &used)
+                            }
+                            FontProgram::OpenTypeCff => {
+                                crate::cff::subset_cff(&font.data, &keep_gids)
+                            }
+                        };
+                        let file_bytes: &[u8] = subset.as_deref().unwrap_or(&font.data);
+
+                        // FontFile2 (TrueType) or FontFile3 /OpenType (CFF).
+                        let file_num = obj_num;
+                        obj_num += 1;
+                        let mut file_dict = PdfDict::new();
+                        file_dict.insert(
+                            PdfName::new("Filter"),
+                            PdfObject::Name(PdfName::new("FlateDecode")),
+                        );
+                        match program {
+                            FontProgram::TrueType => {
+                                file_dict.insert(
+                                    PdfName::new("Length1"),
+                                    PdfObject::Integer(file_bytes.len() as i64),
+                                );
+                            }
+                            FontProgram::OpenTypeCff => {
+                                file_dict.insert(
+                                    PdfName::new("Subtype"),
+                                    PdfObject::Name(PdfName::new("OpenType")),
+                                );
+                            }
+                        }
+                        streams.push((file_num, file_dict, flate_compress(file_bytes)?));
+
+                        // FontDescriptor.
+                        let desc_num = obj_num;
+                        obj_num += 1;
+                        let mut desc = PdfDict::new();
+                        desc.insert(
+                            PdfName::new("Type"),
+                            PdfObject::Name(PdfName::new("FontDescriptor")),
+                        );
+                        desc.insert(
+                            PdfName::new("FontName"),
+                            PdfObject::Name(PdfName::new(&font.ps_name)),
+                        );
+                        // Flags: bit 3 (Symbolic) — typical for Identity-H CJK.
+                        desc.insert(PdfName::new("Flags"), PdfObject::Integer(4));
+                        desc.insert(
+                            PdfName::new("FontBBox"),
+                            PdfObject::Array(
+                                font.bbox.iter().map(|&v| PdfObject::Real(v)).collect(),
+                            ),
+                        );
+                        desc.insert(
+                            PdfName::new("ItalicAngle"),
+                            PdfObject::Real(font.italic_angle),
+                        );
+                        desc.insert(PdfName::new("Ascent"), PdfObject::Real(font.ascent));
+                        desc.insert(PdfName::new("Descent"), PdfObject::Real(font.descent));
+                        desc.insert(PdfName::new("CapHeight"), PdfObject::Real(font.cap_height));
+                        desc.insert(PdfName::new("StemV"), PdfObject::Integer(80));
+                        match program {
+                            FontProgram::TrueType => desc.insert(
+                                PdfName::new("FontFile2"),
+                                PdfObject::Ref(ObjectId(file_num, 0)),
+                            ),
+                            FontProgram::OpenTypeCff => desc.insert(
+                                PdfName::new("FontFile3"),
+                                PdfObject::Ref(ObjectId(file_num, 0)),
+                            ),
+                        }
+                        objects.push((desc_num, PdfObject::Dict(desc)));
+
+                        // CIDFont descendant dict.
+                        let cid_num = obj_num;
+                        obj_num += 1;
+                        let mut cid = PdfDict::new();
+                        cid.insert(PdfName::new("Type"), PdfObject::Name(PdfName::new("Font")));
+                        cid.insert(
+                            PdfName::new("Subtype"),
+                            PdfObject::Name(PdfName::new(match program {
+                                FontProgram::TrueType => "CIDFontType2",
+                                FontProgram::OpenTypeCff => "CIDFontType0",
+                            })),
+                        );
+                        cid.insert(
+                            PdfName::new("BaseFont"),
+                            PdfObject::Name(PdfName::new(&font.ps_name)),
+                        );
+                        let mut sysinfo = PdfDict::new();
+                        sysinfo.insert(
+                            PdfName::new("Registry"),
+                            PdfObject::String(zpdf_core::PdfString(b"Adobe".to_vec())),
+                        );
+                        sysinfo.insert(
+                            PdfName::new("Ordering"),
+                            PdfObject::String(zpdf_core::PdfString(b"Identity".to_vec())),
+                        );
+                        sysinfo.insert(PdfName::new("Supplement"), PdfObject::Integer(0));
+                        cid.insert(PdfName::new("CIDSystemInfo"), PdfObject::Dict(sysinfo));
+                        cid.insert(
+                            PdfName::new("FontDescriptor"),
+                            PdfObject::Ref(ObjectId(desc_num, 0)),
+                        );
+                        cid.insert(PdfName::new("DW"), PdfObject::Integer(1000));
+                        cid.insert(PdfName::new("W"), w_array);
+                        cid.insert(
+                            PdfName::new("CIDToGIDMap"),
+                            PdfObject::Name(PdfName::new("Identity")),
+                        );
+                        objects.push((cid_num, PdfObject::Dict(cid)));
+
+                        // ToUnicode CMap stream.
+                        let tounicode_num = obj_num;
+                        obj_num += 1;
+                        let tounicode_bytes =
+                            crate::tounicode::build_tounicode_cmap(&tounicode_pairs);
+                        let mut tu_dict = PdfDict::new();
+                        tu_dict.insert(
+                            PdfName::new("Filter"),
+                            PdfObject::Name(PdfName::new("FlateDecode")),
+                        );
+                        streams.push((tounicode_num, tu_dict, flate_compress(&tounicode_bytes)?));
+
+                        // Type0 font dict (the font object itself).
+                        let mut font_dict = PdfDict::new();
+                        font_dict
+                            .insert(PdfName::new("Type"), PdfObject::Name(PdfName::new("Font")));
+                        font_dict.insert(
+                            PdfName::new("Subtype"),
+                            PdfObject::Name(PdfName::new("Type0")),
+                        );
+                        font_dict.insert(
+                            PdfName::new("BaseFont"),
+                            PdfObject::Name(PdfName::new(&font.ps_name)),
+                        );
+                        font_dict.insert(
+                            PdfName::new("Encoding"),
+                            PdfObject::Name(PdfName::new("Identity-H")),
+                        );
+                        font_dict.insert(
+                            PdfName::new("DescendantFonts"),
+                            PdfObject::Array(vec![PdfObject::Ref(ObjectId(cid_num, 0))]),
+                        );
+                        font_dict.insert(
+                            PdfName::new("ToUnicode"),
+                            PdfObject::Ref(ObjectId(tounicode_num, 0)),
+                        );
+                        objects.push((*num, PdfObject::Dict(font_dict)));
+                    }
+                }
             } else {
                 let mut font_dict = PdfDict::new();
                 font_dict.insert(PdfName::new("Type"), PdfObject::Name(PdfName::new("Font")));
@@ -829,11 +1140,54 @@ impl DocumentBuilder {
         Ok(out)
     }
 
+    /// For each composite (Type0/Identity-H) embedded font, parse the font
+    /// once and build a `char → GID` map covering every character used with
+    /// that font across all pages. Used by [`build_page_content`] to emit the
+    /// 2-byte GID codes that Identity-H addresses. Characters with no glyph
+    /// map to GID 0 (`.notdef`), which keeps text positioning stable.
+    fn build_composite_glyph_maps(&self) -> HashMap<u32, HashMap<char, u16>> {
+        let mut out: HashMap<u32, HashMap<char, u16>> = HashMap::new();
+        for (idx, font) in self.embedded_fonts.iter().enumerate() {
+            let EmbeddedKind::Composite { .. } = &font.kind else {
+                continue;
+            };
+            let marker = format!("\u{0}EMB{}", idx);
+            // Collect the characters used with this font on every page.
+            let used: HashSet<char> = self
+                .pages
+                .iter()
+                .flat_map(|p| &p.items)
+                .filter_map(|item| match item {
+                    PageItem::Text {
+                        text, font_name, ..
+                    } if font_name == &marker => Some(text.chars()),
+                    _ => None,
+                })
+                .flatten()
+                .collect();
+            if used.is_empty() {
+                out.insert(idx as u32, HashMap::new());
+                continue;
+            }
+            let Ok(face) = ttf_parser::Face::parse(&font.data, 0) else {
+                continue;
+            };
+            let mut map: HashMap<char, u16> = HashMap::with_capacity(used.len());
+            for ch in used {
+                let gid = face.glyph_index(ch).map(|g| g.0).unwrap_or(0);
+                map.insert(ch, gid);
+            }
+            out.insert(idx as u32, map);
+        }
+        out
+    }
+
     fn build_page_content(
         &self,
         page_state: &PageState,
         image_counter: &mut usize,
         next_obj: &mut u32,
+        composite_glyph_maps: &HashMap<u32, HashMap<char, u16>>,
     ) -> Result<(Vec<u8>, Vec<String>, Vec<u32>)> {
         let mut ops = Vec::new();
         let mut font_names = Vec::new();
@@ -870,9 +1224,25 @@ impl DocumentBuilder {
                     ops.extend_from_slice(format!("{} {} {} rg\n", r, g, b).as_bytes());
                     ops.extend_from_slice(format!("/F{} {} Tf\n", font_idx, size).as_bytes());
                     ops.extend_from_slice(format!("1 0 0 1 {} {} Tm\n", x, y).as_bytes());
-                    ops.extend_from_slice(b"(");
-                    escape_text(text, &mut ops);
-                    ops.extend_from_slice(b") Tj\n");
+                    // Composite (Type0/Identity-H) fonts emit 2-byte GID codes
+                    // as a hex string; simple/standard-14 fonts use a WinAnsi
+                    // literal string.
+                    let composite = font_name
+                        .strip_prefix("\u{0}EMB")
+                        .and_then(|s| s.parse::<u32>().ok())
+                        .and_then(|idx| composite_glyph_maps.get(&idx));
+                    if let Some(gmap) = composite {
+                        ops.extend_from_slice(b"<");
+                        for ch in text.chars() {
+                            let gid = gmap.get(&ch).copied().unwrap_or(0);
+                            ops.extend_from_slice(format!("{gid:04X}").as_bytes());
+                        }
+                        ops.extend_from_slice(b"> Tj\n");
+                    } else {
+                        ops.extend_from_slice(b"(");
+                        escape_text(text, &mut ops);
+                        ops.extend_from_slice(b") Tj\n");
+                    }
                 }
                 PageItem::Image {
                     image: _,
@@ -972,6 +1342,22 @@ impl Default for DocumentBuilder {
     }
 }
 
+/// Classify a font file's outline flavor as [`DocumentBuilder::embed_composite_font`]
+/// would: CFF (an OTF `CFF ` table or raw CFF) → [`FontProgram::OpenTypeCff`];
+/// a TrueType sfnt (`\x00\x01\x00\x00` / `true`) → [`FontProgram::TrueType`].
+/// Returns `None` for an unrecognized format. Useful for tests and callers
+/// that want to predict the descendant `/Subtype` (`CIDFontType0` vs
+/// `CIDFontType2`) before embedding.
+pub fn classify_font_program(font: &[u8]) -> Option<FontProgram> {
+    if crate::cff::is_cff_flavored(font) {
+        Some(FontProgram::OpenTypeCff)
+    } else if font.starts_with(&[0x00, 0x01, 0x00, 0x00]) || font.starts_with(b"true") {
+        Some(FontProgram::TrueType)
+    } else {
+        None
+    }
+}
+
 /// WinAnsiEncoding (CP1252) code → Unicode char. Latin-1 except 0x80–0x9F.
 fn winansi_code_to_char(code: u8) -> Option<char> {
     match code {
@@ -1005,6 +1391,29 @@ fn winansi_code_to_char(code: u8) -> Option<char> {
         0x81 | 0x8D | 0x8F | 0x90 | 0x9D => None,
         _ => Some(code as char),
     }
+}
+
+/// Build a CIDFont `/W` array from sorted `(gid, width)` entries: runs of
+/// consecutive GIDs become `first [w1 w2 …]` pairs (the compact form the read
+/// side parses via `parse_cid_widths`). Single entries are a one-element run.
+fn build_w_array(entries: &[(u16, u16)]) -> PdfObject {
+    let mut arr: Vec<PdfObject> = Vec::new();
+    let mut i = 0;
+    while i < entries.len() {
+        let first = entries[i].0;
+        let mut j = i + 1;
+        while j < entries.len() && entries[j].0 == entries[j - 1].0 + 1 {
+            j += 1;
+        }
+        let widths: Vec<PdfObject> = entries[i..j]
+            .iter()
+            .map(|(_, w)| PdfObject::Integer(*w as i64))
+            .collect();
+        arr.push(PdfObject::Integer(first as i64));
+        arr.push(PdfObject::Array(widths));
+        i = j;
+    }
+    PdfObject::Array(arr)
 }
 
 fn image_xobject_dict(width: u32, height: u32, color_space: &str) -> PdfDict {

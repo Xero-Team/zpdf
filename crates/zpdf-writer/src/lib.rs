@@ -38,6 +38,7 @@ use serialize::{serialize_dict, write_object, write_stream};
 
 pub mod annotate;
 pub mod builder;
+mod cff;
 pub mod copier;
 pub mod encrypt;
 pub mod forms;
@@ -50,10 +51,12 @@ pub mod rewrite;
 pub mod sign;
 pub mod stamp;
 pub mod subset;
+mod tounicode;
 
 pub use annotate::{AnnotationSpec, MarkupKind};
 pub use builder::{
-    DocumentBuilder, EmbeddedFontHandle, ImageData, PageHandle, PathSegment, PathStyle,
+    classify_font_program, DocumentBuilder, EmbeddedFontHandle, FontProgram, ImageData, PageHandle,
+    PathSegment, PathStyle,
 };
 pub use copier::{copy_object_graph, ObjectIdMap};
 pub use encrypt::{EncryptionAlgorithm, EncryptionConfig, Permissions};

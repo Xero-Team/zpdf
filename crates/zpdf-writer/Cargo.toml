@@ -35,3 +35,5 @@ getrandom = "0.2"
 [dev-dependencies]
 # Deterministic RSA keygen for the signing round-trip tests.
 rand_chacha = "0.3"
+# ToUnicode CMap round-trip validation in the CJK authoring tests.
+zpdf-font.workspace = true
