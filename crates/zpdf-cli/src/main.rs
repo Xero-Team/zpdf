@@ -1977,8 +1977,9 @@ fn cmd_optimize(args: &[String]) -> zpdf::Result<()> {
         None => None,
         Some("pdfa-1b") | Some("a-1b") => Some(zpdf_writer::PdfaProfile::A1b),
         Some("pdfa-2b") | Some("a-2b") => Some(zpdf_writer::PdfaProfile::A2b),
+        Some("pdfa-3b") | Some("a-3b") => Some(zpdf_writer::PdfaProfile::A3b),
         Some(other) => {
-            eprintln!("Unknown --pdfa profile: {other} (use pdfa-1b or pdfa-2b)");
+            eprintln!("Unknown --pdfa profile: {other} (use pdfa-1b, pdfa-2b, or pdfa-3b)");
             process::exit(1);
         }
     };
@@ -2780,10 +2781,14 @@ fn cmd_validate(args: &[String]) -> zpdf::Result<()> {
                     Some("pdfa-2b") | Some("a-2b") | Some("2b") => {
                         Profile::Pdfa(zpdf::pdfa::Profile::A2b)
                     }
+                    Some("pdfa-3b") | Some("a-3b") | Some("3b") => {
+                        Profile::Pdfa(zpdf::pdfa::Profile::A3b)
+                    }
                     Some("pdfua-1") | Some("ua-1") => Profile::Pdfua(zpdf::pdfua::Profile::Ua1),
+                    Some("pdfua-2") | Some("ua-2") => Profile::Pdfua(zpdf::pdfua::Profile::Ua2),
                     other => {
                         eprintln!(
-                            "Unknown profile {:?} (use pdfa-1b, pdfa-2b, or pdfua-1)",
+                            "Unknown profile {:?} (use pdfa-1b, pdfa-2b, pdfa-3b, pdfua-1, or pdfua-2)",
                             other.unwrap_or("")
                         );
                         process::exit(1);
@@ -2802,7 +2807,7 @@ fn cmd_validate(args: &[String]) -> zpdf::Result<()> {
     }
     let Some(input) = input else {
         eprintln!(
-            "Usage: zpdf validate <file.pdf> [--profile pdfa-1b|pdfa-2b|pdfua-1] [--password <pw>]"
+            "Usage: zpdf validate <file.pdf> [--profile pdfa-1b|pdfa-2b|pdfa-3b|pdfua-1|pdfua-2] [--password <pw>]"
         );
         process::exit(1);
     };
