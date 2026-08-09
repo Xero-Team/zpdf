@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+### PDF/A-3b and PDF/UA-2 conformance levels
+
+- `zpdf validate` gained two new profiles:
+  - `--profile pdfa-3b` — PDF/A-3b (ISO 19005-3). All PDF/A-2b checks plus the
+    associated-files rules: a document with `/Names /EmbeddedFiles` must
+    reference those files from a catalog/page `/AF` array (`embedded-files-af`
+    rule), and every `/AF` file specification that embeds a stream must carry
+    an `/AFRelationship` (`af-relationship` rule). A PDF 2.0 header is
+    non-conformant (A-3 is a PDF 1.7 family standard). Permits embedded files,
+    transparency, and `FileAttachment` annotations (unlike A-1b).
+  - `--profile pdfua-2` — PDF/UA-2 (ISO 14289-2). All PDF/UA-1 structural
+    checks (tagged, structure tree, `/Lang`, figure alt-text, headings, role
+    mapping, table structure, annotation `/OBJR`, `/StructParents`) plus a
+    PDF 2.0 header requirement.
+- `zpdf optimize --pdfa pdfa-3b` converts to PDF/A-3b: injects the `GTS_PDFA1`
+  output intent + ICC profile, writes a `pdfaid:part=3` XMP packet, and
+  **synthesizes the catalog `/AF` array** for existing `/Names /EmbeddedFiles`
+  entries that lack one — patching each filespec with
+  `/AFRelationship /Unspecified` — so the output passes `validate --profile
+  pdfa-3b` (roundtrip parity with the A-1b/A-2b converters). A catalog that
+  already carries `/AF` is left untouched.
+
 ## 0.12.1 — Prebuilt binaries via `cargo-binstall`
 
 ### Prebuilt CLI binaries

@@ -42,7 +42,7 @@ The release binary is at `target/release/zpdf`. The examples below use
 | `struct` | Print the Tagged-PDF structure tree. |
 | `signatures` | List digital signatures with integrity/crypto status; `--trust` verifies certificate chains. |
 | `attachments` | List (and optionally extract) embedded & associated files. |
-| `validate` | Validate against a PDF/A profile (`pdfa-1b` / `pdfa-2b`). |
+| `validate` | Validate against a conformance profile (`pdfa-1b` / `pdfa-2b` / `pdfa-3b` / `pdfua-1` / `pdfua-2`). |
 | `compare` | Pixel-diff two PNGs and report difference metrics. |
 | `dump` | Print a resolved PDF object. |
 | `debug-stream` | Print a decoded stream object's bytes. |
@@ -271,12 +271,15 @@ cargo run -p zpdf-cli -- dump document.pdf 4 0
 cargo run -p zpdf-cli -- debug-stream document.pdf 7 0
 ```
 
-### `validate` — PDF/A conformance
+### `validate` — PDF/A and PDF/UA conformance
 
 Best-effort rule engine over the structural, machine-checkable clauses of
-PDF/A-1b and PDF/A-2b (encryption, trailer `/ID`, header version, XMP
-`pdfaid` identification, `GTS_PDFA1` output intent + ICC profile, font
-embedding, forbidden features). Exit code 3 on FAIL.
+PDF/A-1b, PDF/A-2b, and PDF/A-3b (encryption, trailer `/ID`, header version,
+XMP `pdfaid` identification, `GTS_PDFA1` output intent + ICC profile, font
+embedding, forbidden features; PDF/A-3b adds the `/AF` associated-files
+rules), and PDF/UA-1 / PDF/UA-2 (tagged, structure tree, `/Lang`, figure
+alt-text, headings, role mapping, table structure, annotation `/OBJR`,
+`/StructParents`; PDF/UA-2 requires a PDF 2.0 header). Exit code 3 on FAIL.
 
 ```bash
 cargo run -p zpdf-cli -- validate document.pdf --profile pdfa-2b
