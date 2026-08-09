@@ -355,6 +355,161 @@ fn fileattachment_stripped_under_a1b_kept_under_a2b() {
     );
 }
 
+// ---- PDF/A-3b conversion ------------------------------------------------
+
+/// A builder PDF (embedded font, no attachments) converts to PDF/A-3b and the
+/// output passes `validate --profile pdfa-3b` (the A-3b AF rules are silent
+/// because there are no embedded files).
+#[test]
+fn converts_builder_pdf_to_pdfa3b() {
+    let font_bytes = std::fs::read(VAR_TTF).expect("read var.ttf");
+    let mut builder = DocumentBuilder::new();
+    let page = builder.add_page(612.0, 792.0);
+    let font = builder.embed_font(font_bytes).expect("embed");
+    builder
+        .add_text_embedded(page, "Hello", 72.0, 700.0, font, 24.0, (0.0, 0.0, 0.0))
+        .expect("add text");
+    let pdf = builder.build().expect("build");
+    let file = PdfFile::parse(pdf.to_vec()).expect("parse");
+    let converted = zpdf_writer::rewrite_pdf(
+        &file,
+        &RewriteOptions {
+            pdfa: Some(PdfaConvertConfig {
+                profile: PdfaProfile::A3b,
+                icc: None,
+                fallback_font: None,
+            }),
+            ..Default::default()
+        },
+    )
+    .expect("convert");
+    assert!(
+        converted.starts_with(b"%PDF-1.7"),
+        "A-3b keeps a 1.7 header"
+    );
+    assert!(
+        conforms(&converted, Profile::A3b).is_ok(),
+        "converted PDF should conform to PDF/A-3b: {}",
+        conforms(&converted, Profile::A3b).unwrap_err()
+    );
+    // The XMP packet must declare part 3 / conformance B. The XMP stream is
+    // FlateDecode-compressed in the output, so check via the validator's
+    // `claimed` field rather than a raw-byte substring.
+    let cfile = PdfFile::parse(converted.to_vec()).expect("parse converted");
+    let report = zpdf_document::pdfa::validate(&cfile, Profile::A3b);
+    assert_eq!(
+        report
+            .claimed
+            .as_ref()
+            .map(|(p, c)| (p.as_str(), c.as_str())),
+        Some(("3", "B")),
+        "A-3b XMP must claim pdfaid:part=3 conformance=B, got: {:?}",
+        report.claimed
+    );
+}
+
+/// A document with `/Names /EmbeddedFiles` but no `/AF` converts to PDF/A-3b
+/// by synthesizing the catalog `/AF` array (and `/AFRelationship /Unspecified`
+/// on the filespec). The output then passes `validate --profile pdfa-3b`.
+#[test]
+fn a3b_synthesizes_af_for_embedded_files() {
+    let objects: &[&str] = &[
+        "<< /Type /Catalog /Pages 2 0 R /Names << /EmbeddedFiles 4 0 R >> >>",
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+        // 4: name-tree root with one leaf entry → filespec 5.
+        "<< /Names [ (invoice.xml) 5 0 R ] >>",
+        // 5: filespec with an embedded stream (6) but NO /AFRelationship.
+        "<< /Type /Filespec /UF (invoice.xml) /EF << /F 6 0 R >> >>",
+        // 6: embedded-file stream.
+        "<< /Type /EmbeddedFile /Subtype /application#2Fxml /Length 7 >>\n\
+         stream\n<x></x>\nendstream",
+    ];
+    let pdf = build_pdf(objects);
+    let file = PdfFile::parse(pdf.to_vec()).expect("parse");
+    let converted = zpdf_writer::rewrite_pdf(
+        &file,
+        &RewriteOptions {
+            pdfa: Some(PdfaConvertConfig {
+                profile: PdfaProfile::A3b,
+                icc: None,
+                fallback_font: None,
+            }),
+            ..Default::default()
+        },
+    )
+    .expect("convert");
+
+    // The converted output must conform to PDF/A-3b (AF synthesized).
+    assert!(
+        conforms(&converted, Profile::A3b).is_ok(),
+        "A-3b conversion with synthesized /AF should conform: {}",
+        conforms(&converted, Profile::A3b).unwrap_err()
+    );
+
+    // The catalog must now carry /AF, and the filespec must carry
+    // /AFRelationship /Unspecified.
+    let cfile = PdfFile::parse(converted.to_vec()).expect("parse converted");
+    let body = String::from_utf8_lossy(&converted);
+    assert!(
+        body.contains("/AF"),
+        "A-3b conversion must synthesize a catalog /AF: {body}"
+    );
+    assert!(
+        body.contains("/AFRelationship /Unspecified"),
+        "A-3b conversion must add /AFRelationship /Unspecified: {body}"
+    );
+    // The synthesized /AF must point at a reachable filespec (resolve the
+    // catalog and check /AF is a non-empty array of refs).
+    let root = cfile.trailer.get_ref("Root").expect("Root");
+    let catalog = cfile
+        .resolve(root)
+        .and_then(|o| o.as_dict().cloned())
+        .expect("catalog");
+    let af = catalog.get("AF").and_then(|o| match o {
+        PdfObject::Array(a) => Some(a.clone()),
+        _ => None,
+    });
+    let af = af.expect("catalog /AF array present");
+    assert!(
+        af.iter().any(|o| matches!(o, PdfObject::Ref(_))),
+        "synthesized /AF must contain filespec references: {af:?}"
+    );
+}
+
+/// A-3b permits FileAttachment annotations (it permits embedded files),
+/// matching A-2b — the converter must not strip them.
+#[test]
+fn a3b_keeps_fileattachment() {
+    let objects: &[&str] = &[
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [4 0 R] >>",
+        "<< /Type /Annot /Subtype /FileAttachment /Rect [0 0 50 50] \
+         /Contents (attach) /FS << /Type /EmbeddedFile /F (x.txt) >> >>",
+    ];
+    let pdf = build_pdf(objects);
+    let file = PdfFile::parse(pdf.to_vec()).expect("parse");
+    let converted = zpdf_writer::rewrite_pdf(
+        &file,
+        &RewriteOptions {
+            pdfa: Some(PdfaConvertConfig {
+                profile: PdfaProfile::A3b,
+                icc: None,
+                fallback_font: None,
+            }),
+            ..Default::default()
+        },
+    )
+    .expect("convert");
+    let cfile = PdfFile::parse(converted.to_vec()).expect("parse converted");
+    let subs = page_annot_subtypes(&cfile);
+    assert!(
+        subs.iter().any(|s| s == "FileAttachment"),
+        "A-3b should keep FileAttachment, got: {subs:?}"
+    );
+}
+
 /// Resolve the first page's `/Annots` and return the `/Subtype` of each
 /// reachable annotation. Used to verify forbidden annotations were dropped
 /// from the page (rather than lingering unreferenced in the file body).

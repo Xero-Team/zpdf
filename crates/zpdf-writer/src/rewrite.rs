@@ -34,14 +34,22 @@ pub enum PdfaProfile {
     A1b,
     /// ISO 19005-2 Level B (PDF/A-2b): PDF 1.7 model, transparency allowed.
     A2b,
+    /// ISO 19005-3 Level B (PDF/A-3b): PDF/A-2 plus the `/AF` associated-files
+    /// mechanism — embedded files are permitted but must be referenced from a
+    /// catalog/page `/AF` array whose file-spec carries `/AFRelationship`.
+    /// Conversion synthesizes a catalog `/AF` array (with `/AFRelationship
+    /// /Unspecified`) for any existing `/Names /EmbeddedFiles` entries that
+    /// lack one, so the output passes `validate --profile pdfa-3b`.
+    A3b,
 }
 
 /// PDF/A conversion options. When set on [`RewriteOptions::pdfa`],
 /// [`rewrite_pdf`] injects a `GTS_PDFA1` output intent + sRGB ICC profile,
 /// writes a `pdfaid` XMP packet, strips PDF/A-forbidden features (JavaScript,
 /// launch actions, embedded files / transparency for A-1b), corrects the
-/// header version, and ensures a trailer `/ID`. The output then passes
-/// [`zpdf_document::pdfa::validate`] for the same profile.
+/// header version, and ensures a trailer `/ID`. For PDF/A-3b it additionally
+/// synthesizes the catalog `/AF` array for existing embedded files. The
+/// output then passes [`zpdf_document::pdfa::validate`] for the same profile.
 #[derive(Debug, Clone)]
 pub struct PdfaConvertConfig {
     pub profile: PdfaProfile,

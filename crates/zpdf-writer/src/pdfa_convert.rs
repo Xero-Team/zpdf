@@ -9,6 +9,11 @@
 //! for A-1b, and FontDescriptors gaining a fallback `/FontFile2`), and the
 //! header version to emit (`%PDF-1.4` for A-1b).
 //!
+//! For PDF/A-3b, [`synthesize_af_for_a3`] additionally synthesizes a catalog
+//! `/AF` array (with `/AFRelationship /Unspecified`) for any existing
+//! `/Names /EmbeddedFiles` entries that lack one, so the output passes the
+//! PDF/A-3 associated-files rules.
+//!
 //! The injected objects get object numbers continuing past the walked set,
 //! and the transforms are pre-renumbered through the walk's `old → new` map
 //! (existing refs) with the injected objects' final numbers (new refs), so
@@ -74,7 +79,7 @@ pub(crate) fn prepare(
         transforms: HashMap::new(),
         header: match cfg.profile {
             PdfaProfile::A1b => "%PDF-1.4",
-            PdfaProfile::A2b => "%PDF-1.7",
+            PdfaProfile::A2b | PdfaProfile::A3b => "%PDF-1.7",
         },
     };
 
@@ -201,6 +206,16 @@ pub(crate) fn prepare(
         PdfName::new("Metadata"),
         PdfObject::Ref(ObjectId(xmp_num, 0)),
     );
+
+    // --- A-3b: synthesize a catalog /AF array (with /AFRelationship) for any
+    // existing /Names /EmbeddedFiles entries, so the rewritten output passes
+    // PDF/A-3's associated-files rules. Patches `cat` (adds /AF) and registers
+    // filespec transforms (adds /AFRelationship) — must run before the catalog
+    // transform is committed below. ---
+    if cfg.profile == PdfaProfile::A3b {
+        synthesize_af_for_a3(source, map, root, &mut cat, &mut edits.transforms);
+    }
+
     edits.transforms.insert(root, PdfObject::Dict(cat));
 
     // Names object transform (strip JavaScript always, EmbeddedFiles for A-1b).
@@ -595,11 +610,185 @@ fn embed_type0_fallback(
     edits.transforms.insert(*cid_ref, ren);
 }
 
+/// PDF/A-3 associated-files synthesis. PDF/A-3 (ISO 19005-3 §6.2.4) requires
+/// every embedded file in `/Names /EmbeddedFiles` to be referenced from a
+/// catalog/page `/AF` array, and every `/AF` file specification to carry an
+/// `/AFRelationship`. When converting an existing document that has embedded
+/// files but no `/AF`, this synthesizes one so the rewritten output passes
+/// `zpdf_document::pdfa::validate --profile pdfa-3b`:
+///
+/// - Walks the OLD catalog's `/Names /EmbeddedFiles` name tree (bounded by
+///   depth and a visited set) collecting filespec **references**.
+/// - Builds a renumbered `/AF` array pointing at those filespecs' new object
+///   numbers (assigned by the reachability walk, which already followed
+///   `/Names`).
+/// - For each filespec whose resolved dict lacks `/AFRelationship`, registers a
+///   transform adding `/AFRelationship /Unspecified` (renumbered).
+/// - Inserts `/AF` into the (already-renumbered) catalog `cat`.
+///
+/// Best-effort: inline (non-ref) filespecs are skipped (their new numbers are
+/// not known); a catalog that already carries `/AF` is left untouched (a
+/// producer's relationships are not clobbered).
+fn synthesize_af_for_a3(
+    source: &PdfFile,
+    map: &HashMap<ObjectId, u32>,
+    root: ObjectId,
+    cat: &mut PdfDict,
+    transforms: &mut HashMap<ObjectId, PdfObject>,
+) {
+    // Resolve the OLD catalog fresh (the caller has already moved catalog_old
+    // into the renumbered `cat`).
+    let Ok(catalog) = source.resolve(root).and_then(|o| o.as_dict().cloned()) else {
+        return;
+    };
+    // Don't clobber an existing /AF.
+    if catalog.get("AF").is_some() {
+        return;
+    }
+    let names_obj = catalog.get("Names").map(|o| deref(source, o));
+    let Some(PdfObject::Dict(names)) = names_obj.as_ref() else {
+        return;
+    };
+    let tree_root_ref = match names.get("EmbeddedFiles") {
+        Some(PdfObject::Ref(r)) => Some(*r),
+        // An inline name-tree root: walk it directly without a visited-set seed.
+        Some(PdfObject::Dict(_)) => None,
+        _ => return,
+    };
+    let names_embedded = names.get("EmbeddedFiles").cloned();
+    let Some(tree_root) = resolve_dict(source, names_embedded.as_ref()) else {
+        return;
+    };
+
+    // Walk the name tree collecting filespec references (the value slot of
+    // each /Names pair). Bounded by depth + a visited set (mirrors
+    // zpdf_document::embedded_files::walk_name_tree).
+    let mut filespec_refs: Vec<ObjectId> = Vec::new();
+    let mut visited = std::collections::HashSet::new();
+    if let Some(seed) = tree_root_ref {
+        visited.insert(seed);
+    }
+    walk_name_tree_for_filespecs(source, &tree_root, &mut filespec_refs, &mut visited, 0);
+
+    if filespec_refs.is_empty() {
+        return;
+    }
+
+    // Build the renumbered /AF array from the filespecs the walk reached.
+    let mut af: Vec<PdfObject> = Vec::with_capacity(filespec_refs.len());
+    for fs_ref in &filespec_refs {
+        match map.get(fs_ref) {
+            Some(&n) => af.push(PdfObject::Ref(ObjectId(n, 0))),
+            // An unreached filespec (not in the walk's map) cannot be
+            // referenced; skip it rather than emit a dangling ref.
+            None => continue,
+        }
+    }
+    if af.is_empty() {
+        return;
+    }
+
+    // For each filespec lacking /AFRelationship, add a transform patching it in.
+    for fs_ref in &filespec_refs {
+        let Ok(fs_dict) = source.resolve(*fs_ref).and_then(|o| o.as_dict().cloned()) else {
+            continue;
+        };
+        if fs_dict.get("AFRelationship").is_some() {
+            continue;
+        }
+        let mut patched = fs_dict;
+        patched.insert(
+            PdfName::new("AFRelationship"),
+            PdfObject::Name(PdfName::new("Unspecified")),
+        );
+        let ren = renumber(&PdfObject::Dict(patched), map);
+        transforms.insert(*fs_ref, ren);
+    }
+
+    cat.insert(PdfName::new("AF"), PdfObject::Array(af));
+}
+
+/// Walk a `/Names /EmbeddedFiles` name-tree node, appending the filespec
+/// **references** (the value slot of each `/Names` pair) to `out`. Leaf nodes
+/// carry `/Names [key0 val0 …]`; interior nodes carry `/Kids [refs]`. Bounded
+/// by depth and a per-reference visited set so a cyclic tree terminates.
+fn walk_name_tree_for_filespecs(
+    source: &PdfFile,
+    node: &PdfDict,
+    out: &mut Vec<ObjectId>,
+    visited: &mut std::collections::HashSet<ObjectId>,
+    depth: usize,
+) {
+    if depth > 64 || out.len() >= 16_384 {
+        return;
+    }
+    // Leaf entries: alternating (name-string, filespec) pairs — collect the
+    // value when it is an indirect reference.
+    if let Some(names) = resolve_array(source, node.get("Names")) {
+        let mut i = 1; // start at the first value (index 1)
+        while i < names.len() {
+            if let PdfObject::Ref(r) = &names[i] {
+                out.push(*r);
+            }
+            i += 2;
+        }
+        if out.len() >= 16_384 {
+            return;
+        }
+    }
+    // Interior children.
+    if let Some(kids) = resolve_array(source, node.get("Kids")) {
+        for kid in &kids {
+            let kid_dict = match kid {
+                PdfObject::Ref(r) => {
+                    if !visited.insert(*r) {
+                        continue;
+                    }
+                    resolve_dict(source, Some(kid))
+                }
+                PdfObject::Dict(_) => resolve_dict(source, Some(kid)),
+                _ => None,
+            };
+            if let Some(d) = kid_dict {
+                walk_name_tree_for_filespecs(source, &d, out, visited, depth + 1);
+            }
+        }
+    }
+}
+
+/// Resolve a dictionary value that may be direct or indirect (a helper local
+/// to the AF synthesis, mirroring zpdf_document::embedded_files::resolve_dict).
+fn resolve_dict(file: &PdfFile, obj: Option<&PdfObject>) -> Option<PdfDict> {
+    match obj? {
+        PdfObject::Dict(d) => Some(d.clone()),
+        PdfObject::Stream(s) => Some(s.dict.clone()),
+        PdfObject::Ref(r) => match file.resolve(*r).ok()? {
+            PdfObject::Dict(d) => Some(d),
+            PdfObject::Stream(s) => Some(s.dict),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Resolve an array value that may be direct or indirect.
+fn resolve_array(file: &PdfFile, obj: Option<&PdfObject>) -> Option<Vec<PdfObject>> {
+    match obj? {
+        PdfObject::Array(a) => Some(a.clone()),
+        PdfObject::Ref(r) => match file.resolve(*r).ok()? {
+            PdfObject::Array(a) => Some(a),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// Build a minimal `pdfaid` XMP packet declaring the given PDF/A part.
 fn build_pdfa_xmp(profile: PdfaProfile) -> Vec<u8> {
     let (part, conf) = match profile {
         PdfaProfile::A1b => ("1", "B"),
         PdfaProfile::A2b => ("2", "B"),
+        PdfaProfile::A3b => ("3", "B"),
     };
     let xmp = format!(
         "<?xpacket begin=\"\u{FEFF}\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n\
@@ -632,6 +821,10 @@ mod tests {
         assert!(String::from_utf8(xmp2)
             .unwrap()
             .contains("<pdfaid:part>2</pdfaid:part>"));
+        let xmp3 = build_pdfa_xmp(PdfaProfile::A3b);
+        assert!(String::from_utf8(xmp3)
+            .unwrap()
+            .contains("<pdfaid:part>3</pdfaid:part>"));
     }
 
     #[test]
