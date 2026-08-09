@@ -364,9 +364,22 @@ mod tests {
 pub(crate) mod test_util {
     /// Build a synthetic PDF from numbered object bodies (index `i` becomes
     /// object `i + 1`), with a correct xref table and a trailer whose /Root is
-    /// object 1. Offsets are computed, so bodies can be edited freely.
+    /// object 1. Offsets are computed, so bodies can be edited freely. The
+    /// header is `%PDF-1.7`; use [`build_pdf_with_version`] for a different
+    /// version (e.g. a PDF 2.0 header for PDF/UA-2 tests).
     pub fn build_pdf(objects: &[&str]) -> Vec<u8> {
-        let mut buf = Vec::from(&b"%PDF-1.7\n"[..]);
+        build_pdf_with_header("%PDF-1.7\n", objects)
+    }
+
+    /// Like [`build_pdf`] but with a caller-specified header version line, e.g.
+    /// `build_pdf_with_version(2, 0, objects)` writes `%PDF-2.0`. Used by tests
+    /// that need a non-1.7 header (PDF/UA-2 requires a 2.0 header).
+    pub fn build_pdf_with_version(major: u8, minor: u8, objects: &[&str]) -> Vec<u8> {
+        build_pdf_with_header(&format!("%PDF-{major}.{minor}\n"), objects)
+    }
+
+    fn build_pdf_with_header(header: &str, objects: &[&str]) -> Vec<u8> {
+        let mut buf = Vec::from(header.as_bytes());
         let mut offsets = Vec::with_capacity(objects.len());
         for (i, body) in objects.iter().enumerate() {
             offsets.push(buf.len());
