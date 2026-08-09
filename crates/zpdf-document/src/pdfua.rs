@@ -1,9 +1,10 @@
-//! PDF/UA-1 conformance validation (ISO 14289-1).
+//! PDF/UA conformance validation (profiles UA-1 and UA-2).
 //!
 //! A rule engine over the parsed document, mirroring [`crate::pdfa`]: each
 //! check inspects one aspect and yields zero or more [`Violation`]s. This
-//! covers the high-signal, machine-checkable clauses of PDF/UA-1 (the
-//! "Universal Accessibility" conformance):
+//! covers the high-signal, machine-checkable clauses of PDF/UA-1 (ISO 14289-1,
+//! the "Universal Accessibility" conformance) and PDF/UA-2 (ISO 14289-2, the
+//! PDF 2.0 accessibility standard):
 //!
 //! - the document is tagged (`/MarkInfo /Marked true`)
 //! - a `/StructTreeRoot` is present and non-empty
@@ -33,12 +34,17 @@ use crate::structure::{
 pub enum Profile {
     /// ISO 14289-1 (PDF/UA-1).
     Ua1,
+    /// ISO 14289-2 (PDF/UA-2): PDF/UA-1's structural rules, based on PDF 2.0.
+    /// The only UA-2-specific check is a PDF 2.0 header; every UA-1 structural
+    /// check applies unchanged.
+    Ua2,
 }
 
 impl Profile {
     pub fn as_str(self) -> &'static str {
         match self {
             Profile::Ua1 => "PDF/UA-1",
+            Profile::Ua2 => "PDF/UA-2",
         }
     }
 }
@@ -65,7 +71,7 @@ impl ValidationReport {
     }
 }
 
-/// Validate `file` against PDF/UA-1.
+/// Validate `file` against `profile` (PDF/UA-1 or PDF/UA-2).
 pub fn validate(file: &PdfFile, profile: Profile) -> ValidationReport {
     let mut v: Vec<Violation> = Vec::new();
     check_tagged(file, &mut v);
@@ -79,9 +85,27 @@ pub fn validate(file: &PdfFile, profile: Profile) -> ValidationReport {
     }
     check_page_struct_parents(file, &mut v);
     check_annotation_objr(file, tree.as_ref(), &mut v);
+    if profile == Profile::Ua2 {
+        check_pdf2_header(file, &mut v);
+    }
     ValidationReport {
         profile,
         violations: v,
+    }
+}
+
+/// PDF/UA-2 is based on PDF 2.0 (ISO 32000-2). A header that is not PDF 2.0 is
+/// non-conformant. (PDF/UA-1 has no header constraint.)
+fn check_pdf2_header(file: &PdfFile, out: &mut Vec<Violation>) {
+    let h = file.header;
+    if h.major != 2 {
+        out.push(Violation {
+            rule: "header-version",
+            message: format!(
+                "header declares PDF {}.{}; PDF/UA-2 is based on PDF 2.0",
+                h.major, h.minor
+            ),
+        });
     }
 }
 
@@ -410,10 +434,22 @@ mod tests {
         PdfFile::parse(build_pdf(objects)).expect("parse pdf")
     }
 
+    /// Like [`open`] but with a PDF 2.0 header (for PDF/UA-2 tests).
+    fn open_v2(objects: &[&str]) -> PdfFile {
+        PdfFile::parse(crate::test_util::build_pdf_with_version(2, 0, objects)).expect("parse pdf")
+    }
+
     fn ua_pdf(catalog: &str, extra: &[&str]) -> PdfFile {
         let mut objs = vec![catalog, PAGES, PAGE];
         objs.extend_from_slice(extra);
         open(&objs)
+    }
+
+    /// Like [`ua_pdf`] but with a PDF 2.0 header (for PDF/UA-2 tests).
+    fn ua_pdf_v2(catalog: &str, extra: &[&str]) -> PdfFile {
+        let mut objs = vec![catalog, PAGES, PAGE];
+        objs.extend_from_slice(extra);
+        open_v2(&objs)
     }
 
     #[test]
@@ -627,5 +663,70 @@ mod tests {
             rules.contains(&"annotation-objr"),
             "annotation-objr should fire for a Link with no OBJR: {rules:?}"
         );
+    }
+
+    // ---- PDF/UA-2: PDF 2.0 header ----------------------------------------
+
+    /// The same compliant structure that passes UA-1 must still pass UA-2 when
+    /// the header is PDF 2.0 (the only UA-2-specific check is the header).
+    #[test]
+    fn ua2_compliant_pdf20_passes() {
+        let file = ua_pdf_v2(
+            "<< /Type /Catalog /Pages 2 0 R /Lang (en) /MarkInfo << /Marked true >> \
+             /StructTreeRoot 4 0 R >>",
+            &[
+                // 4: StructTreeRoot
+                "<< /Type /StructTreeRoot /K 5 0 R /ParentTree 9 0 R /ParentTreeNextKey 1 >>",
+                // 5: Document
+                "<< /Type /StructElem /S /Document /P 4 0 R /K [6 0 R 7 0 R] >>",
+                // 6: H1
+                "<< /Type /StructElem /S /H1 /P 5 0 R /Pg 3 0 R /K 0 >>",
+                // 7: P
+                "<< /Type /StructElem /S /P /P 5 0 R /Pg 3 0 R /K 1 >>",
+                // 8: parent-tree array
+                "<< 6 0 R 7 0 R >>",
+                // 9: ParentTree number tree
+                "<< /Nums [0 8 0 R] >>",
+            ],
+        );
+        let r = validate(&file, Profile::Ua2);
+        assert!(
+            r.conforms(),
+            "expected PDF/UA-2 conformance, got: {:?}",
+            r.violations
+        );
+    }
+
+    /// A PDF 1.7 header is non-conformant for PDF/UA-2 (a PDF 2.0 standard).
+    /// The compliant UA-1 structure is reused; only the header differs.
+    #[test]
+    fn ua2_pdf17_header_is_flagged() {
+        let file = ua_pdf(
+            "<< /Type /Catalog /Pages 2 0 R /Lang (en) /MarkInfo << /Marked true >> \
+             /StructTreeRoot 4 0 R >>",
+            &[
+                "<< /Type /StructTreeRoot /K 5 0 R /ParentTree 9 0 R /ParentTreeNextKey 1 >>",
+                "<< /Type /StructElem /S /Document /P 4 0 R /K [6 0 R 7 0 R] >>",
+                "<< /Type /StructElem /S /H1 /P 5 0 R /Pg 3 0 R /K 0 >>",
+                "<< /Type /StructElem /S /P /P 5 0 R /Pg 3 0 R /K 1 >>",
+                "<< 6 0 R 7 0 R >>",
+                "<< /Nums [0 8 0 R] >>",
+            ],
+        );
+        let r = validate(&file, Profile::Ua2);
+        let rules: Vec<&str> = r.violations.iter().map(|v| v.rule).collect();
+        assert!(
+            rules.contains(&"header-version"),
+            "PDF 1.7 header must be flagged for PDF/UA-2: {rules:?}"
+        );
+        assert!(!r.conforms());
+        // The same file under UA-1 has no header constraint → no header-version.
+        let r1 = validate(&file, Profile::Ua1);
+        let rules1: Vec<&str> = r1.violations.iter().map(|v| v.rule).collect();
+        assert!(
+            !rules1.contains(&"header-version"),
+            "UA-1 must not flag header-version: {rules1:?}"
+        );
+        assert!(r1.conforms(), "UA-1 should still conform: {rules1:?}");
     }
 }
