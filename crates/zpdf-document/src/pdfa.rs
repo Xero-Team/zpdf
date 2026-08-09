@@ -1,9 +1,9 @@
-//! PDF/A conformance validation (profiles A-1b and A-2b).
+//! PDF/A conformance validation (profiles A-1b, A-2b, and A-3b).
 //!
 //! A **rule engine** over the parsed document: each check inspects one aspect
 //! of the file and yields zero or more [`Violation`]s. This does not aim for
 //! veraPDF-level completeness — it covers the high-signal, machine-checkable
-//! clauses of ISO 19005-1 (PDF/A-1b) and 19005-2 (PDF/A-2b):
+//! clauses of ISO 19005-1 (PDF/A-1b), 19005-2 (PDF/A-2b), and 19005-3 (PDF/A-3b):
 //!
 //! - file structure: header version, no encryption, trailer /ID present
 //! - fonts: every used font embedded (except the standard 14 in no profile —
@@ -13,6 +13,9 @@
 //! - forbidden features: JavaScript/actions, embedded files (A-1),
 //!   transparency (A-1: soft masks / group /S /Transparency), LZW (A-1),
 //!   encryption of any kind
+//! - associated files (A-3): every embedded file in `/Names /EmbeddedFiles`
+//!   must be referenced from a catalog/page `/AF` array, and each `/AF` file
+//!   specification must carry an `/AFRelationship` (ISO 19005-3 §6.2.4)
 //!
 //! Everything is best-effort and read-only over `ParseLimits`-bounded APIs;
 //! a check that cannot run (e.g. a malformed font dict) reports what it saw.
@@ -29,6 +32,10 @@ pub enum Profile {
     A1b,
     /// ISO 19005-2 Level B (PDF/A-2b): PDF 1.7 model, transparency allowed.
     A2b,
+    /// ISO 19005-3 Level B (PDF/A-3b): PDF/A-2 plus the `/AF` associated-files
+    /// mechanism — embedded files are permitted but must be referenced from a
+    /// catalog/page `/AF` array whose file-spec carries `/AFRelationship`.
+    A3b,
 }
 
 impl Profile {
@@ -36,6 +43,7 @@ impl Profile {
         match self {
             Profile::A1b => "PDF/A-1b",
             Profile::A2b => "PDF/A-2b",
+            Profile::A3b => "PDF/A-3b",
         }
     }
 }
@@ -75,6 +83,9 @@ pub fn validate(file: &PdfFile, profile: Profile) -> ValidationReport {
     check_output_intent(file, &mut v);
     check_fonts(file, &mut v);
     check_forbidden_features(file, profile, &mut v);
+    if profile == Profile::A3b {
+        check_embedded_files_af(file, &mut v);
+    }
 
     ValidationReport {
         profile,
@@ -105,26 +116,42 @@ fn check_structure(file: &PdfFile, profile: Profile, out: &mut Vec<Violation>) {
         }),
     }
 
-    // Header version ceiling: 1.4 for A-1, 1.7 for A-2. The parser records
-    // the header; a higher version is only a violation for A-1 (A-2 is
-    // based on 1.7 which is the cap of what zpdf writes anyway).
-    if profile == Profile::A1b {
-        let data = file.data();
-        if let Some(line) = data.get(..16) {
-            let header = String::from_utf8_lossy(line);
-            if let Some(ver) = header.strip_prefix("%PDF-1.") {
-                if let Some(minor) = ver.chars().next().and_then(|c| c.to_digit(10)) {
-                    if minor > 4 {
-                        out.push(Violation {
-                            rule: "header-version",
-                            message: format!(
-                                "header declares PDF 1.{minor}; PDF/A-1 is based on PDF 1.4"
-                            ),
-                        });
+    // Header version ceiling: 1.4 for A-1, 1.7 for A-2 and A-3. The parser
+    // records the header; a higher version is a violation for A-1 (A-2/A-3 are
+    // based on 1.7, which is the cap of what zpdf writes anyway). A-3 is a PDF
+    // 1.7 family standard, so a PDF 2.0 header is also non-conformant.
+    match profile {
+        Profile::A1b => {
+            let data = file.data();
+            if let Some(line) = data.get(..16) {
+                let header = String::from_utf8_lossy(line);
+                if let Some(ver) = header.strip_prefix("%PDF-1.") {
+                    if let Some(minor) = ver.chars().next().and_then(|c| c.to_digit(10)) {
+                        if minor > 4 {
+                            out.push(Violation {
+                                rule: "header-version",
+                                message: format!(
+                                    "header declares PDF 1.{minor}; PDF/A-1 is based on PDF 1.4"
+                                ),
+                            });
+                        }
                     }
                 }
             }
         }
+        Profile::A3b => {
+            let h = file.header;
+            if h.major != 1 || h.minor > 7 {
+                out.push(Violation {
+                    rule: "header-version",
+                    message: format!(
+                        "header declares PDF {}.{}; PDF/A-3 is based on PDF 1.7",
+                        h.major, h.minor
+                    ),
+                });
+            }
+        }
+        Profile::A2b => {}
     }
 }
 
@@ -471,6 +498,95 @@ fn check_forbidden_annotations(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Associated files (PDF/A-3, ISO 19005-3 §6.2.4)
+// ---------------------------------------------------------------------------
+
+/// PDF/A-3's associated-files rules. A document may carry embedded files (in
+/// `/Names /EmbeddedFiles`), but PDF/A-3 requires that each be *associated* via
+/// a catalog or page `/AF` array, and that every `/AF` file specification carry
+/// an `/AFRelationship`. Two rules:
+///
+/// - `embedded-files-af`: if the document has embedded files but no catalog
+///   and no page `/AF` array at all, flag it (an unreachable attachment).
+/// - `af-relationship`: count `/AF` file specifications that carry an embedded
+///   stream but no `/AFRelationship`. Only embedded filespecs are counted — a
+///   bare external-path string (no stream) is not an "embedded file" under
+///   §6.2.4 and does not trigger the relationship requirement.
+fn check_embedded_files_af(file: &PdfFile, out: &mut Vec<Violation>) {
+    let embedded = crate::embedded_files::parse_embedded_files(file);
+    let catalog_af = crate::embedded_files::parse_associated_files(file);
+    let page_af = collect_page_associated_files(file);
+
+    if !embedded.is_empty() && catalog_af.is_empty() && page_af.is_empty() {
+        out.push(Violation {
+            rule: "embedded-files-af",
+            message: format!(
+                "document has {} embedded file(s) but no /AF associated-files array; \
+                 PDF/A-3 requires embedded files to be associated via /AF",
+                embedded.len()
+            ),
+        });
+    }
+
+    // Every embedded /AF filespec must declare an /AFRelationship.
+    let missing_rel = catalog_af
+        .iter()
+        .chain(page_af.iter())
+        .filter(|ef| ef.is_embedded() && ef.relationship.is_none())
+        .count();
+    if missing_rel > 0 {
+        out.push(Violation {
+            rule: "af-relationship",
+            message: format!(
+                "{missing_rel} /AF associated file(s) lack /AFRelationship; \
+                 PDF/A-3 requires an /AFRelationship on every associated file"
+            ),
+        });
+    }
+}
+
+/// Walk the page tree and collect every leaf page's `/AF` associated files
+/// (PDF 2.0). `/AF` is not an inheritable page attribute, so only leaf pages
+/// are inspected. Bounded by depth and a visited set, matching the other
+/// page-tree walks in this module.
+fn collect_page_associated_files(file: &PdfFile) -> Vec<crate::embedded_files::EmbeddedFile> {
+    let mut out = Vec::new();
+    let Ok(root) = file.trailer.get_ref("Root") else {
+        return out;
+    };
+    let Ok(catalog) = file.resolve(root).and_then(|o| o.as_dict().cloned()) else {
+        return out;
+    };
+    let Ok(pages_root) = catalog.get_ref("Pages") else {
+        return out;
+    };
+    let mut stack = vec![(pages_root, 0usize)];
+    let mut visited: HashSet<ObjectId> = HashSet::new();
+    while let Some((node, depth)) = stack.pop() {
+        if depth > 64 || !visited.insert(node) {
+            continue;
+        }
+        let Ok(dict) = file.resolve(node).and_then(|o| o.as_dict().cloned()) else {
+            continue;
+        };
+        // Leaf page: collect its /AF. An interior /Pages node is not a leaf.
+        if dict.get("Kids").is_none() {
+            out.extend(crate::embedded_files::parse_page_associated_files(
+                file, &dict,
+            ));
+        }
+        if let Some(PdfObject::Array(kids)) = dict.get("Kids").map(|o| deref(file, o)).as_ref() {
+            for kid in kids {
+                if let PdfObject::Ref(r) = kid {
+                    stack.push((*r, depth + 1));
+                }
+            }
+        }
+    }
+    out
+}
+
 fn deref(file: &PdfFile, obj: &PdfObject) -> PdfObject {
     match obj {
         PdfObject::Ref(r) => file.resolve(*r).unwrap_or(PdfObject::Null),
@@ -481,6 +597,7 @@ fn deref(file: &PdfFile, obj: &PdfObject) -> PdfObject {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::build_pdf;
 
     fn minimal_pdf() -> Vec<u8> {
         let mut data = Vec::new();
@@ -618,6 +735,204 @@ mod tests {
         assert!(
             rules.contains(&"annotation-action"),
             "Launch-action annotation must be flagged: {rules:?}"
+        );
+    }
+
+    // ---- PDF/A-3b: associated files ---------------------------------------
+
+    /// A PDF/A-3b-compliant document: everything A-2b needs plus embedded files
+    /// that are all referenced from a catalog `/AF` array, each carrying an
+    /// `/AFRelationship`. Built from object bodies so the AF rules can be
+    /// isolated from the shared (XMP / output intent / font embedding) checks.
+    fn pdfa3_compliant_pdf(af: &str, filespecs: &[&str], streams: &[&str]) -> Vec<u8> {
+        // Layout: 1 catalog, 2 pages, 3 page, 4 XMP, 5 ICC, 6 output intent,
+        // 7 name-tree root, then filespecs + embedded-file streams from `af`.
+        let mut objs: Vec<String> = vec![
+            format!(
+                "<< /Type /Catalog /Pages 2 0 R /Metadata 4 0 R /OutputIntents [6 0 R] \
+                 /Names << /EmbeddedFiles 7 0 R >> {af} >>"
+            ),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".to_string(),
+            // 4: XMP stream (pdfaid part=3, conformance=B). No /Length — the
+            // parser scans to `endstream`; the validator only inspects the bytes.
+            "<< /Type /Metadata /Subtype /XML >>\nstream\n<?xpacket begin=\"\u{FEFF}\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">\n<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n<rdf:Description rdf:about=\"\" xmlns:pdfaid=\"http://www.aiim.org/pdfa/ns/id/\">\n<pdfaid:part>3</pdfaid:part>\n<pdfaid:conformance>B</pdfaid:conformance>\n</rdf:Description>\n</rdf:RDF>\n</x:xmpmeta>\n<?xpacket end=\"w\"?>\nendstream".to_string(),
+            // 5: ICC profile stream (a placeholder: the validator only checks
+            // the stream is referenced, not its bytes).
+            "<< /N 3 >>\nstream\n\nendstream".to_string(),
+            // 6: GTS_PDFA1 output intent.
+            "<< /Type /OutputIntent /S /GTS_PDFA1 /OutputConditionIdentifier (sRGB) \
+             /DestOutputProfile 5 0 R >>"
+                .to_string(),
+            // 7: name-tree root with one leaf entry per filespec.
+            {
+                let pairs: Vec<String> = filespecs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| format!("(f{i}.bin) {} 0 R", 8 + i))
+                    .collect();
+                format!("<< /Names [ {} ] >>", pairs.join(" "))
+            },
+        ];
+        // 8..: filespec bodies, then embedded-file streams.
+        let first_stream = 8 + filespecs.len();
+        for (i, spec) in filespecs.iter().enumerate() {
+            // Substitute the /EF stream ref: the placeholder "{EF}" in each
+            // filespec body becomes a full `N 0 R` reference to its stream.
+            let s = spec.replace("{EF}", &format!("{} 0 R", first_stream + i));
+            objs.push(s);
+        }
+        for body in streams {
+            objs.push(body.to_string());
+        }
+        build_pdf(&objs.iter().map(|s| s.as_str()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn a3b_bare_pdf_fails_on_shared_checks() {
+        // A bare PDF (no XMP / output intent / ID) fails A-3b on the shared
+        // rules, exactly as A-1b/A-2b do.
+        let file = PdfFile::parse(minimal_pdf()).unwrap();
+        let report = validate(&file, Profile::A3b);
+        assert!(!report.conforms());
+        let rules: Vec<&str> = report.violations.iter().map(|v| v.rule).collect();
+        assert!(rules.contains(&"file-id"), "missing /ID flagged: {rules:?}");
+        assert!(
+            rules.contains(&"xmp-missing"),
+            "missing XMP flagged: {rules:?}"
+        );
+        assert!(
+            rules.contains(&"output-intent"),
+            "missing output intent flagged: {rules:?}"
+        );
+        // No embedded files → the A-3b-specific rules are silent.
+        assert!(
+            !rules.contains(&"embedded-files-af"),
+            "no embedded files, no AF rule: {rules:?}"
+        );
+        assert!(
+            !rules.contains(&"af-relationship"),
+            "no AF, no relationship rule: {rules:?}"
+        );
+    }
+
+    #[test]
+    fn a3b_embedded_files_without_af_are_flagged() {
+        // Compliant in every shared respect, but the embedded file is NOT
+        // referenced from /AF → the embedded-files-af rule fires.
+        let pdf = pdfa3_compliant_pdf(
+            "",
+            &["<< /Type /Filespec /UF (f0.bin) /AFRelationship /Data /EF << /F {EF} >> >>"],
+            &["<< /Type /EmbeddedFile /Length 0 >>\nstream\n\nendstream"],
+        );
+        let file = PdfFile::parse(pdf).unwrap();
+        let report = validate(&file, Profile::A3b);
+        let rules: Vec<&str> = report.violations.iter().map(|v| v.rule).collect();
+        assert!(
+            rules.contains(&"embedded-files-af"),
+            "embedded file without /AF must be flagged: {rules:?}"
+        );
+    }
+
+    #[test]
+    fn a3b_af_without_relationship_is_flagged() {
+        // The embedded file IS referenced from /AF, but the filespec omits
+        // /AFRelationship → the af-relationship rule fires (and embedded-files-af
+        // does not, since /AF is present).
+        let pdf = pdfa3_compliant_pdf(
+            "/AF [8 0 R]",
+            &["<< /Type /Filespec /UF (f0.bin) /EF << /F {EF} >> >>"],
+            &["<< /Type /EmbeddedFile /Length 0 >>\nstream\n\nendstream"],
+        );
+        let file = PdfFile::parse(pdf).unwrap();
+        let report = validate(&file, Profile::A3b);
+        let rules: Vec<&str> = report.violations.iter().map(|v| v.rule).collect();
+        assert!(
+            rules.contains(&"af-relationship"),
+            "/AF filespec without /AFRelationship must be flagged: {rules:?}"
+        );
+        assert!(
+            !rules.contains(&"embedded-files-af"),
+            "/AF present, embedded-files-af should not fire: {rules:?}"
+        );
+    }
+
+    #[test]
+    fn a3b_external_af_string_does_not_trigger_relationship_rule() {
+        // A bare external-path string in /AF (no embedded stream) is not an
+        // embedded file under §6.2.4, so it must not trigger af-relationship.
+        // (It also means no /Names /EmbeddedFiles, so embedded-files-af is silent.)
+        let pdf = pdfa3_compliant_pdf("/AF [ (../external.dat) ]", &[], &[]);
+        let file = PdfFile::parse(pdf).unwrap();
+        let report = validate(&file, Profile::A3b);
+        let rules: Vec<&str> = report.violations.iter().map(|v| v.rule).collect();
+        assert!(
+            !rules.contains(&"af-relationship"),
+            "external-path AF must not trigger af-relationship: {rules:?}"
+        );
+        assert!(
+            !rules.contains(&"embedded-files-af"),
+            "no embedded files, no AF rule: {rules:?}"
+        );
+    }
+
+    #[test]
+    fn a3b_compliant_af_does_not_flag() {
+        // Embedded file + catalog /AF + /AFRelationship → no A-3b-specific
+        // violations (embedded-files-af and af-relationship both stay silent).
+        let pdf = pdfa3_compliant_pdf(
+            "/AF [8 0 R]",
+            &["<< /Type /Filespec /UF (f0.bin) /AFRelationship /Data /EF << /F {EF} >> >>"],
+            &["<< /Type /EmbeddedFile /Length 0 >>\nstream\n\nendstream"],
+        );
+        let file = PdfFile::parse(pdf).unwrap();
+        let report = validate(&file, Profile::A3b);
+        let a3b_rules: Vec<&str> = report
+            .violations
+            .iter()
+            .filter(|v| v.rule == "embedded-files-af" || v.rule == "af-relationship")
+            .map(|v| v.rule)
+            .collect();
+        assert!(
+            a3b_rules.is_empty(),
+            "compliant A-3b should have no AF violations: {a3b_rules:?} (all: {:?})",
+            report.violations
+        );
+    }
+
+    #[test]
+    fn a3b_pdf20_header_is_flagged() {
+        // A PDF 2.0 header is non-conformant for PDF/A-3 (a PDF 1.7 family
+        // standard). build_pdf_with_version computes the xref offsets.
+        let pdf = crate::test_util::build_pdf_with_version(
+            2,
+            0,
+            &[
+                "<< /Type /Catalog /Pages 2 0 R >>",
+                "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+            ],
+        );
+        let file = PdfFile::parse(pdf).unwrap();
+        let report = validate(&file, Profile::A3b);
+        let rules: Vec<&str> = report.violations.iter().map(|v| v.rule).collect();
+        assert!(
+            rules.contains(&"header-version"),
+            "PDF 2.0 header must be flagged for A-3b: {rules:?}"
+        );
+    }
+
+    #[test]
+    fn a3b_keeps_fileattachment_unlike_a1b() {
+        // A-3b permits FileAttachment (it permits embedded files), unlike A-1b.
+        let pdf =
+            pdf_with_annots(&["<< /Type /Annot /Subtype /FileAttachment /Rect [0 0 10 10] >>"]);
+        let file = PdfFile::parse(pdf).unwrap();
+        let a3b = validate(&file, Profile::A3b);
+        let a3b_rules: Vec<&str> = a3b.violations.iter().map(|v| v.rule).collect();
+        assert!(
+            !a3b_rules.contains(&"annotation-subtype"),
+            "A-3b must not flag FileAttachment: {a3b_rules:?}"
         );
     }
 }
