@@ -482,3 +482,102 @@ bit-identical 验证通过：`zpdf compare` 0 差异像素）。但**实测无�
 **最终判定**：CPU 图像遮挡剔除对真实语料无效。代码已回退（`render-cpu` 回到 HEAD）。
 CPU 两大瓶颈（字形 outline、图像双线性上采样）均为基本工作量，无低风险优化。
 → 整体结论：CPU 渲染无可行优化空间（在不放宽保真契约下），转向 GPU（M2）。
+
+## 12. M2 GPU 资源池——假设证伪（2026-08-10）
+
+启用 `gpu_render` bench（`--features gpu-render`），先取 baseline 再设计池。
+数据再次推翻假设：
+
+**gpu_render bench**（复用单个 `WgpuRenderer`，设备初始化已摊销）：
+
+| 页 | bench wall | 内容 |
+|---|---|---|
+| test8 | 170ms | 843 字形 |
+| test6 | 166ms | 276 字形 |
+| test3 | 165ms | 110 字形 |
+| image-test10 | 170ms | 346 字形 |
+| zzztest2 | 111ms | 2 图（最小 DL） |
+
+**关键**：所有页 ~165ms **固定下限**，与 DL 大小无关（CPU 同页 4–205ms 波动）。
+→ 不是 per-page 分配开销，是 **host↔device 同步停顿**。
+
+**CLI `--stats` 证实**（`--backend wgpu`）：
+
+| 页 | wall | **gpu pass** | 比值 |
+|---|---|---|---|
+| test8 | 631ms | **0.04ms** | 15,000× |
+| test6 | 547ms | **0.03ms** | 18,000× |
+| test3 | 478ms | **0.03ms** | 16,000× |
+
+**GPU 实际工作 < 0.05ms**（GPU 几乎空闲）；wall = 478–631ms 全是**同步等待**：
+`map_and_strip` 里 `device.poll(wait_indefinitely)` 阻塞到 GPU 执行 + readback 完成。
+GPU 太快，host 一直在 idle-wait 同步。
+
+**结论**：M2 资源池**不会显著改善单页延迟**——瓶颈是 `device.poll` 阻塞同步，
+不是 per-page 分配。资源池仅帮批量多页（连续排队），但前提是**不每页同步**。
+真正优化是 **pipelining**：第 N 页 readback 等待时提交第 N+1 页，或 async map 替代
+阻塞 poll。但这是比资源池更大的架构变更（`render_display_list` API 同步，
+pipelining 需新 API）。
+
+**待用户决策**：A 实施 pipelining（大改、高收益、需 API 变更）；
+B 实施资源池（小改、仅省分配几 ms、batch 微益）；
+C 接受 GPU 现状，本会话到此。
+
+### 12.1 M2 → pipelining 设计（2026-08-10）
+
+用户选 pipelining。瓶颈确认：`map_and_strip` 和 `timer.resolve_ns` 各自
+`device.poll(wait_indefinitely)` 阻塞——每页 2 次同步等待，GPU 通道仅 0.04ms。
+
+**pipelining 原理**：`device.poll` 等待**所有** pending GPU 工作 + 映射。所以
+提交第 N 页 + 启动其 readback map，再提交第 N+1 页，一次 poll 等两者。第 N+1 页
+的提交与第 N 页的 GPU 执行重叠。0.04ms GPU pass + ~165ms sync-wake →
+多页吞吐从 N×165ms 降到 ≈ 1×sync-wake + N×0.04ms（理想）。
+
+**API 契约**（待 grill 确认）：
+- 新增 `WgpuRenderer::render_pages_batch(&mut self, pages: &[&DisplayList], scale) -> Result<Vec<GpuTexture>>`：
+  逐页 `begin_page`/`execute`/record-encoder，但**不立即 map_and_strip**；
+  提交第 N 页后启动其 readback map_async，立即提交第 N+1 页；最后统一 poll + 收集。
+- 保持 `render_display_list` 单页同步 API 不变（CLI/viewer 单页仍用旧路径）。
+- bit-identical：pipelining 只改变**提交/收集时序**，不改绘制内容；每页仍是独立
+  render pass + 独立 readback buffer。需 `zpdf compare` 逐页验证 batch vs single 一致。
+
+**正确性边界**：
+- 每页需**独立 readback buffer**（不能复用——前页 map 未 unmap 时后页不能写同 buffer）。
+  → 这正是“资源池”的部分：readback buffer 要 per-inflight，而非单 buffer 复用。
+  故 pipelining 实际是 **双缓冲 readback**（2 个 buffer 交替）+ 延迟 poll。
+- `PageTarget` 纹理能否跨页复用？submit 后 GPU 持有，但下一页 begin 可重用（若尺寸相同）。
+  保守起见先**不复用纹理**，只延迟 poll + 双缓冲 readback（最小正确性风险）。
+- `timer.resolve_ns` 的第二次 poll 也需纳入流水线（或在 batch 末尾统一）。
+
+**预期收益**：多页（如 split/convert）从 N×165ms → ~165ms + N×0.04ms。
+单页无变化（仍同步）。对“批量吞吐”目标是大胜，对“单页延迟”无影响。
+
+### 12.2 pipelining 实测——热态净负（2026-08-10）
+
+实现完成：`end_page` 拆为 `finalize_and_submit`（record+submit+start_readback，不阻塞）
++ `collect_readback`（poll+strip+resolve_ns）；`PageTarget::map_and_strip` 拆为
+`start_readback`/`finish_readback`；新增 `render_pages_batch`（depth-2 双缓冲）；
+`take_context` 在 `pending` 非空时拒绝。bit-identical 测试通过（batch-of-one 与
+multi-page 像素与 single render 完全一致）。
+
+**速度实测（关键修正）**：先前的 165ms/页是**冷态**（首次设备初始化）。
+热态（设备已初始化、renderer 复用）单页仅 **14–72ms**（中位 ~32ms）。8 页对比：
+
+| 页 | 8×热单页 | 8 页 batch (pipelined) | 结果 |
+|---|---|---|---|
+| test8 | 8×29ms ≈ 256ms | 390ms | **batch 慢 140ms** |
+| test6 | 8×35ms ≈ 280ms | 413ms | batch 慢 133ms |
+| test3 | 8×30ms ≈ 240ms | 380ms | batch 慢 140ms |
+
+**pipelining 在热态净负**：depth-2 的开销（管理 2 个 readback buffer、交错
+submit/collect、多次 poll）超过它省的同步等待——而热态单页同步仅 ~32ms
+（非先前误判的 165ms）。先前“3× 加速”是与**冷态** baseline 比，但热-热对比
+（公平对比）pipelining 慢 ~50%。
+
+**根因**：165ms baseline 含一次性设备初始化；真实每页同步等待 ~32ms。
+pipelining 的收益假设是“每页 165ms 同步”，但热态每页仅 32ms，pipelining 的
+管理开销 > 它省的同步。depth-2 不够深到摊销；更深则内存暴涨。
+
+**最终判定**：M2 pipelining 在热态净负，不应上线。代码已实现且 bit-identical，
+但速度不达预期。是否保留 API（供未来更深的 pipeline / 不同负载）或回退，
+待用户决策。
