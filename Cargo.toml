@@ -73,7 +73,7 @@ sha2 = "0.10"
 # The `oid` feature on the digests supplies the DigestInfo prefixes RSA needs.
 rsa = "0.9"
 p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
-p384 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+p384 = { version = "0.14", default-features = false, features = ["ecdsa", "std"] }
 # Pure-Rust HTTP for the optional RFC 3161 timestamp requester (behind the
 # zpdf-writer `timestamp` feature); ureq's `tls` feature uses rustls (C-free).
 ureq = { version = "2", default-features = false, features = ["tls"] }
