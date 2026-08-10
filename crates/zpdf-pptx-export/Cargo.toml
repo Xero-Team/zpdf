@@ -31,6 +31,6 @@ image.workspace = true
 zip = "2.2"
 
 # XML generation for OOXML
-quick-xml = { version = "0.37", features = ["serialize"] }
+quick-xml = { version = "0.41", features = ["serialize"] }
 
 [dev-dependencies]
