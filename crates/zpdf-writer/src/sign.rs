@@ -254,11 +254,12 @@ impl TimestampRequester for UreqTimestampRequester {
     fn request_timestamp(&self, time_stamp_req_der: &[u8]) -> Result<Vec<u8>> {
         use std::io::Read;
         let resp = ureq::post(&self.tsa_url)
-            .set("Content-Type", "application/timestamp-query")
-            .send_bytes(time_stamp_req_der)
+            .content_type("application/timestamp-query")
+            .send(time_stamp_req_der)
             .map_err(|e| invalid_data(&format!("TSA request failed: {e}")))?;
         let mut bytes = Vec::new();
-        resp.into_reader()
+        resp.into_body()
+            .into_reader()
             .read_to_end(&mut bytes)
             .map_err(|e| invalid_data(&format!("TSA response read failed: {e}")))?;
         Ok(bytes)
