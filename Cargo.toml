@@ -76,7 +76,7 @@ p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"]
 p384 = { version = "0.14", default-features = false, features = ["ecdsa", "std"] }
 # Pure-Rust HTTP for the optional RFC 3161 timestamp requester (behind the
 # zpdf-writer `timestamp` feature); ureq's `tls` feature uses rustls (C-free).
-ureq = { version = "2", default-features = false, features = ["tls"] }
+ureq = { version = "3", default-features = false, features = ["tls"] }
 zune-jpeg = "0.5"
 # Pure-Rust JPEG 2000 decoder (JPXDecode) from the hayro PDF renderer family.
 # Hand-written, #![forbid(unsafe_code)] at the crate level; the optional `simd`
