@@ -157,7 +157,7 @@ impl Pipelines {
             vertex: wgpu::VertexState {
                 module: &tex_shader,
                 entry_point: Some("vs_textured"),
-                buffers: &[tex_vbl],
+                buffers: &[Some(tex_vbl)],
                 compilation_options: Default::default(),
             },
             primitive: wgpu::PrimitiveState {
@@ -226,7 +226,7 @@ impl Pipelines {
             vertex: wgpu::VertexState {
                 module: &glyph_shader,
                 entry_point: Some("vs_glyph"),
-                buffers: &[glyph_vbl],
+                buffers: &[Some(glyph_vbl)],
                 compilation_options: Default::default(),
             },
             primitive: wgpu::PrimitiveState {
@@ -308,7 +308,7 @@ impl Pipelines {
             vertex: wgpu::VertexState {
                 module: &comp_shader,
                 entry_point: Some("vs_composite"),
-                buffers: &[comp_vbl],
+                buffers: &[Some(comp_vbl)],
                 compilation_options: Default::default(),
             },
             primitive: wgpu::PrimitiveState {
@@ -391,7 +391,7 @@ impl Pipelines {
             vertex: wgpu::VertexState {
                 module: &mask_shader,
                 entry_point: Some("vs_mask"),
-                buffers: &[mask_vbl],
+                buffers: &[Some(mask_vbl)],
                 compilation_options: Default::default(),
             },
             primitive: wgpu::PrimitiveState {
@@ -482,7 +482,7 @@ fn build_pipeline(
         vertex: wgpu::VertexState {
             module: shader,
             entry_point: Some("vs_pixel"),
-            buffers: &[vbl],
+            buffers: &[Some(vbl)],
             compilation_options: Default::default(),
         },
         primitive: wgpu::PrimitiveState {

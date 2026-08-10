@@ -230,9 +230,13 @@ impl PageTarget {
             }
         }
 
-        // wgpu 29.0.3: `get_mapped_range` returns the view directly (infallible here —
-        // the map status was already checked above via the callback Result).
-        let view = slice.get_mapped_range();
+        // wgpu 30: `get_mapped_range` now returns `Result<BufferView, MapRangeError>`
+        // (it used to return the view directly). The map status was already checked
+        // above via the callback Result, so a failure here is a range/alignment error
+        // — surface it as a readback error rather than panicking on the `?`.
+        let view = slice
+            .get_mapped_range()
+            .map_err(|e| WgpuRenderError::Readback(format!("get_mapped_range: {e}")))?;
 
         // Strip per-row padding into a tight w*h*4 buffer.
         let row = self.unpadded_bytes_per_row as usize;
