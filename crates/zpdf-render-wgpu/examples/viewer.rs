@@ -168,6 +168,9 @@ impl Gfx {
             power_preference: wgpu::PowerPreference::HighPerformance,
             force_fallback_adapter: false,
             compatible_surface: Some(&surface),
+            // wgpu 30: keep the adapter's real limits (we raise the 2D texture cap
+            // below), not bucketed ones.
+            apply_limit_buckets: false,
         }))
         .expect("adapter");
         // Start from the broadly-compatible downlevel limits, but raise the max
@@ -203,6 +206,9 @@ impl Gfx {
             desired_maximum_frame_latency: 2,
             alpha_mode: caps.alpha_modes[0],
             view_formats: vec![],
+            // wgpu 30: `color_space` is now required; `Auto` preserves wgpu's
+            // historical behavior (sRGB for non-fp16 formats).
+            color_space: wgpu::SurfaceColorSpace::Auto,
         };
         surface.configure(&device, &config);
 
@@ -243,11 +249,11 @@ impl Gfx {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs"),
-                buffers: &[wgpu::VertexBufferLayout {
+                buffers: &[Some(wgpu::VertexBufferLayout {
                     array_stride: std::mem::size_of::<Vertex>() as u64,
                     step_mode: wgpu::VertexStepMode::Vertex,
                     attributes: &attrs,
-                }],
+                })],
                 compilation_options: Default::default(),
             },
             primitive: wgpu::PrimitiveState::default(),
@@ -630,7 +636,7 @@ impl App {
             }
         }
         gfx.queue.submit(Some(enc.finish()));
-        frame.present();
+        gfx.queue.present(frame);
 
         // Title: which page is at the viewport top, total, zoom.
         let cur = self

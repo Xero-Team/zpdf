@@ -94,7 +94,8 @@ impl GpuTimer {
         });
         device.poll(wgpu::PollType::wait_indefinitely()).ok()?;
         rx.try_recv().ok()?.ok()?;
-        let view = slice.get_mapped_range();
+        // wgpu 30: `get_mapped_range` now returns `Result<BufferView, MapRangeError>`.
+        let view = slice.get_mapped_range().ok()?;
         let start = u64::from_le_bytes(view[0..8].try_into().ok()?);
         let end = u64::from_le_bytes(view[8..16].try_into().ok()?);
         drop(view);

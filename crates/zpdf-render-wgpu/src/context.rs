@@ -62,6 +62,12 @@ impl GpuContext {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 force_fallback_adapter: force_fallback,
                 compatible_surface: None,
+                // wgpu 30: limit bucketing maps the adapter's limits into a small
+                // set of predefined buckets, intended to resist fingerprinting in
+                // browsers that expose wgpu to untrusted content. We want the real
+                // adapter limits (e.g. max_texture_dimension_2d, raised below), so
+                // leave this off — zpdf is not an untrusted-content host.
+                apply_limit_buckets: false,
             })
             .await
             .map_err(|_| WgpuRenderError::NoAdapter)?;
