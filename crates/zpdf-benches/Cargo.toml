@@ -1,0 +1,29 @@
+[package]
+name = "zpdf-benches"
+description = "Criterion benchmarks for the zpdf parse → interpret → render pipeline"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[features]
+default = ["cpu-render"]
+# `cpu-render` is on by default (mirrors the `zpdf` facade). `gpu-render` is
+# opt-in so `cargo bench` without the feature stays on the CPU path; enable
+# with `cargo bench --features gpu-render --bench render -- gpu_render`.
+cpu-render = ["zpdf/cpu-render"]
+gpu-render = ["zpdf/gpu-render"]
+
+[dependencies]
+zpdf = { workspace = true, default-features = false }
+zpdf-core.workspace = true
+zpdf-display-list.workspace = true
+
+[dev-dependencies]
+criterion = "0.5"
+
+# Bench targets. `harness = false` lets criterion own `main()`.
+[[bench]]
+name = "render"
+harness = false
