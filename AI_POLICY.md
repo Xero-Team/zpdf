@@ -75,11 +75,8 @@ AI 说明放在正文末尾即可，不影响标题。
 是自动创建的 PR。
 - AI 可以辅助你写代码、跑测试、查资料，但「决定提什么、提交、回答评审」这些环节必须由人来完成。
 
-## 不允许用 AI 代写的场景
+## 安全敏感区域
 
-- 带有 `good first issue` / `E-easy` / `E-has-instructions` 标签的 issue：这类问题本意是让
-新人借此熟悉代码库，请**不要用 AI 直接代写代码**。你可以用 AI 帮助你**理解**代码库与思路，
-但代码要自己写。
 - 涉及安全敏感区域（解压、xref、加密、签名、路径处理、导出写文件、WebAssembly / GPU 隔离边界
 等）的改动：可以借助 AI，但你必须额外仔细核对边界条件、资源限制与失败路径，并在 PR 中明确说明
 你如何验证了这些点。参见 [SECURITY.md](SECURITY.md)。
@@ -195,12 +192,8 @@ Requirements:
 - AI may help you write code, run tests, or research — but the steps of deciding
   what to submit, submitting it, and answering review must be done by a human.
 
-## Cases where AI must not author code
+## Security-sensitive areas
 
-- Issues labeled `good first issue` / `E-easy` / `E-has-instructions`: these are
-  meant to help newcomers learn the codebase. **Do not let AI write the code for
-  you.** You may use AI to help you *understand* the codebase and the approach,
-  but write the code yourself.
 - Changes touching security-sensitive areas (decompression, xref, encryption,
   signatures, path handling, file writes during export, WebAssembly / GPU
   isolation boundaries, etc.): AI may help, but you must carefully verify
