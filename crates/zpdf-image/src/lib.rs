@@ -687,7 +687,7 @@ fn decode_jpx_image(
     colorspace: Option<&ResolvedColorSpace>,
     max_image_pixels: u64,
 ) -> Result<DecodedImage> {
-    use hayro_jpeg2000::{ColorSpace as JpxColorSpace, DecodeSettings, Image};
+    use hayro_jpeg2000::{ColorSpace as JpxColorSpace, DecodeSettings, DecoderContext, Image};
     use std::panic::{catch_unwind, AssertUnwindSafe};
 
     // hayro-jpeg2000 is a third-party decoder that panics (slice-index OOB) on
@@ -755,9 +755,17 @@ fn decode_jpx_image(
     let has_alpha = image.has_alpha();
     let channels = ncolor + usize::from(has_alpha);
 
-    let samples = catch_unwind(AssertUnwindSafe(|| image.decode()))
-        .map_err(|_| Error::StreamDecode("JPXDecode: decoder panicked decoding codestream".into()))?
-        .map_err(|e| Error::StreamDecode(format!("JPXDecode: {e}")))?;
+    let samples = catch_unwind(AssertUnwindSafe(|| {
+        // hayro-jpeg2000 0.4 split decoding into a reusable `DecoderContext`
+        // (owned scratch buffers) plus `Image::decode(&mut ctx)`, which now
+        // returns a `DecodedImage` borrow rather than an interleaved `Vec<u8>`.
+        // `data_u8()` re-interleaves the components back into the same layout
+        // 0.3.5 returned, so the downstream per-pixel chunking is unchanged.
+        let mut ctx = DecoderContext::default();
+        image.decode(&mut ctx).map(|decoded| decoded.data_u8())
+    }))
+    .map_err(|_| Error::StreamDecode("JPXDecode: decoder panicked decoding codestream".into()))?
+    .map_err(|e| Error::StreamDecode(format!("JPXDecode: {e}")))?;
     let pixel_count = usize::try_from(pixel_count)
         .map_err(|_| Error::StreamDecode("JPX pixel count does not fit memory size".into()))?;
     let expected_samples = pixel_count
