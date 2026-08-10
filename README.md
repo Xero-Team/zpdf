@@ -132,10 +132,12 @@ GPU (wgpu) renderers whose output matches within <1% of pixels.
 
 ## Documentation
 
-- **[docs/user-guide.md](docs/user-guide.md)** — the `zpdf` command-line tool.
-- **[docs/library.md](docs/library.md)** — using zpdf as a Rust library + architecture.
+- **[docs/guides/user-guide.md](docs/guides/user-guide.md)** — the `zpdf` command-line tool.
+- **[docs/guides/library.md](docs/guides/library.md)** — using zpdf as a Rust library + architecture.
+- **[docs/architecture/DESIGN.md](docs/architecture/DESIGN.md)** — architecture spec (Chinese).
+- **[docs/performance/PERFORMANCE.md](docs/performance/PERFORMANCE.md)** — rendering performance investigation.
 - **[docs/CHANGELOG.md](docs/CHANGELOG.md)** — release notes.
-- **[ROADMAP.md](ROADMAP.md)** — development plan.
+- **[docs/planning/ROADMAP.md](docs/planning/ROADMAP.md)** — development plan.
 - **[zpdf-skill](zpdf-skill/)** — an agent skill that teaches an AI coding assistant the `zpdf` CLI (see below).
 
 ## Install
@@ -191,6 +193,10 @@ inspecting, rendering, converting, editing, or signing PDFs.
 
 The submodule tracks the [`Xero-Team/zpdf-skill`](https://github.com/Xero-Team/zpdf-skill)
 repository and is kept in sync with the CLI's capabilities.
+
+If you use AI tools when *contributing* to zpdf itself, that is separate from
+the skill above — see [AI_POLICY.md](AI_POLICY.md) for the project's
+AI contribution policy.
 
 ## Quick start
 
@@ -266,7 +272,7 @@ page_img.save_png("out.png")?;
 ```
 
 Switch `zpdf::cpu::CpuRenderer` for `zpdf::gpu::WgpuRenderer` (with `features = ["gpu-render"]`)
-to render on the GPU — everything upstream is identical. See [docs/library.md](docs/library.md).
+to render on the GPU — everything upstream is identical. See [docs/guides/library.md](docs/guides/library.md).
 
 ### Exporting to SVG
 
@@ -414,7 +420,9 @@ All pure Rust:
 Contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) for project
 scope, development setup, test expectations, and the pull request process. For
 usage help, see [SUPPORT.md](SUPPORT.md). Report vulnerabilities privately as
-described in [SECURITY.md](SECURITY.md).
+described in [SECURITY.md](SECURITY.md). If you use AI tools when contributing,
+follow [AI_POLICY.md](AI_POLICY.md) — you may use AI, but you must understand
+what it did and add a short human note in your own words to each commit/PR.
 
 ```bash
 cargo build                                   # CPU-only (default)
@@ -426,7 +434,7 @@ cargo clippy --workspace
 
 ## Roadmap
 
-See [ROADMAP.md](ROADMAP.md).
+See [docs/planning/ROADMAP.md](docs/planning/ROADMAP.md).
 
 - **Phase 1** — PDF parsing — done
 - **Phase 2** — Content interpretation + CPU rendering — done

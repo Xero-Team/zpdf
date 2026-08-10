@@ -27,3 +27,8 @@ reduce the problem to the smallest example you can share. Include the zpdf
 version, environment, exact command or code, expected result, actual result, and
 redacted logs. For PDF-specific failures, a minimal redistributable sample often
 makes the difference between a report that can and cannot be reproduced.
+
+## Contributing
+
+To contribute, start with [CONTRIBUTING.md](CONTRIBUTING.md). If you use AI
+tools in your contribution, follow [AI_POLICY.md](AI_POLICY.md).

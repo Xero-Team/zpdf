@@ -67,5 +67,13 @@ Supporting crates feed into zpdf-content: **zpdf-font** (Type1/TrueType/CID, CMa
 
 ## Design Documents
 
-- **DESIGN.md** — comprehensive architecture spec (Chinese), covers type definitions, dependency topology, safety design, filter pipeline, text model.
-- **ROADMAP.md** — 4-phase development plan (Chinese) with milestone checklists. Phase 1-2 mostly complete, Phase 3 (wgpu) architecture ready, Phase 4 (ICC, blend modes, encryption) planned.
+- **docs/architecture/DESIGN.md** — comprehensive architecture spec (Chinese), covers type definitions, dependency topology, safety design, filter pipeline, text model.
+- **docs/planning/ROADMAP.md** — 4-phase development plan (Chinese) with milestone checklists. Phase 1-2 mostly complete, Phase 3 (wgpu) architecture ready, Phase 4 (ICC, blend modes, encryption) planned.
+
+## AI Contribution Policy
+
+When making commits or PRs on this repo, follow [AI_POLICY.md](AI_POLICY.md):
+you may use AI, but the contributor must understand the change and add a short
+`## Human note` in their own words (their mother tongue) at the bottom of each
+commit/PR. As an AI agent, do not author the human note yourself — remind the
+user to write it, and never commit or open a PR autonomously.

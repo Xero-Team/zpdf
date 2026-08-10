@@ -7,3 +7,6 @@ contact_links:
   - name: Read the documentation
     url: https://github.com/Xero-Team/zpdf#documentation
     about: Check the README, API docs, changelog, and roadmap before filing an issue.
+  - name: AI contribution policy
+    url: https://github.com/Xero-Team/zpdf/blob/main/AI_POLICY.md
+    about: If you use AI tools when contributing, read this before opening a pull request.

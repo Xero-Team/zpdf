@@ -44,3 +44,4 @@ cargo test --workspace
 - [ ] I updated public documentation and `docs/CHANGELOG.md` for user-visible changes.
 - [ ] New or changed fixtures are minimal, redistributable, and contain no confidential data.
 - [ ] I called out breaking API or behavior changes explicitly.
+- [ ] If AI tools were used, I followed [AI_POLICY.md](../../AI_POLICY.md) and added a short human-written note in my own words (my mother tongue) at the bottom of this PR explaining what I intended to do.

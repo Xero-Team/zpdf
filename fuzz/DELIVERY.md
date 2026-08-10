@@ -78,7 +78,7 @@ The fuzzer will find edge cases that hand-written tests miss: off-by-one errors,
 
 ## Roadmap alignment
 
-**Phase 1.6** (from `ROADMAP.md`):
+**Phase 1.6** (from `docs/planning/ROADMAP.md`):
 - [x] cargo-fuzz targets: lexer, object parser  ← **This delivery**
 - [ ] ParseLimits verification (recursion depth, stream size)  ← Partially covered (fuzz targets exercise the limits)
 - [ ] Hand-written minimal PDF test cases  ← Seed corpora are minimal, but more traditional unit tests could complement

@@ -107,5 +107,5 @@ zpdf info input.pdf | grep -i box
 ## More Info
 
 - Full documentation: `EXAMPLES.md`
-- Implementation details: `../../PDF_TO_PPTX_IMPLEMENTATION.md`
+- Implementation details: `../../docs/review/PDF_TO_PPTX_IMPLEMENTATION.md`
 - API reference: https://docs.rs/zpdf-pptx-export

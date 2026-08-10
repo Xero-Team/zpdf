@@ -11,6 +11,11 @@ documentation, performance work, and new PDF features are welcome.
   dependency, or architectural rewrite so the direction can be agreed on.
 - Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
   Never include exploit details, credentials, or confidential PDFs in an issue.
+- If you use AI tools (LLMs / coding assistants) when contributing, follow
+  [AI_POLICY.md](AI_POLICY.md). In short: you may use AI, but you must
+  understand what it did for you, and add a short human-written note in your own
+  words (your mother tongue) at the bottom of each commit/PR explaining what you
+  intended to do.
 - Only submit PDF fixtures and other assets that you have permission to
   redistribute. Prefer reduced or synthetic samples.
 
@@ -65,7 +70,7 @@ The main review areas are:
 - `zpdf-cli`, `zpdf-viewer-gpui`, `zpdf-wasm`: user-facing integrations.
 - `zpdf-svg-export`, `zpdf-pptx-export`: export backends.
 
-See [DESIGN.md](DESIGN.md) for the architecture and [ROADMAP.md](ROADMAP.md) for
+See [docs/architecture/DESIGN.md](docs/architecture/DESIGN.md) for the architecture and [docs/planning/ROADMAP.md](docs/planning/ROADMAP.md) for
 planned work.
 
 ## Making a change

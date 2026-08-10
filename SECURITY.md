@@ -60,6 +60,13 @@ Unsupported PDF features, rendering differences without security impact, and
 dependency advisories without a demonstrated reachable impact in zpdf should be
 reported as normal bugs or dependency updates rather than vulnerabilities.
 
+## AI-assisted changes
+
+If you use AI tools to make changes in security-sensitive areas, follow
+[AI_POLICY.md](AI_POLICY.md): you must understand the change, carefully verify
+boundary conditions, resource limits, and failure paths, and explain in the
+pull request how you verified them.
+
 ## Coordinated disclosure
 
 When a report is accepted, maintainers may use a private security advisory to
