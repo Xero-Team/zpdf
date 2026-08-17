@@ -28,4 +28,4 @@ image.workspace = true
 # Fidelity harness: full pipeline + CPU oracle, and an independent SVG
 # rasterizer (resvg, pure Rust) to verify the exported SVG pixel-matches.
 zpdf = { workspace = true, features = ["cpu-render"] }
-resvg = "0.47"
+resvg = "0.48"
