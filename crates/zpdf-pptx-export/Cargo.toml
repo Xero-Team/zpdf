@@ -27,8 +27,21 @@ tracing.workspace = true
 # Image encoding for embedded images
 image.workspace = true
 
-# ZIP handling for .pptx (which is a ZIP archive)
-zip = "8.6"
+# ZIP handling for .pptx (which is a ZIP archive).
+# `default-features = false` drops zip's default `zstd`/`bzip2`/`lzma`/`ppmd`/
+# `xz`/`aes-crypto` features — `zstd` in particular pulls `zstd-sys` (a C build
+# of libzstd via `cc`), which would break the project's pure-Rust, zero-C-deps
+# guarantee (and the C-free wasm toolchain), and `aes-crypto` would duplicate
+# our `aes 0.8`/`cipher 0.4`.
+#
+# We enable `deflate-flate2` (NOT the `deflate` super-feature): `deflate`
+# forces `deflate-flate2-zlib-rs`, which turns on `flate2/zlib-rs`. Under
+# workspace feature-unification that flips zpdf-writer's `flate2` compression
+# backend from `miniz_oxide` (our `rust_backend`) to `zlib-rs`, changing the
+# compressed bytes and breaking the byte-exact CJK/CMap writer tests. Plain
+# `deflate-flate2` uses flate2's default `rust_backend` (= `miniz_oxide`),
+# matching the rest of the workspace, so no backend changes and no C deps.
+zip = { version = "8.6", default-features = false, features = ["deflate-flate2"] }
 
 # XML generation for OOXML
 quick-xml = { version = "0.41", features = ["serialize"] }
