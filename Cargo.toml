@@ -61,7 +61,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 smallvec = "1"
 bitflags = "2"
 bytemuck = { version = "1", features = ["derive"] }
-winnow = "0.7"
+winnow = "1.0"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 # Pure-Rust crypto (RustCrypto) for the Standard security handler's AES paths.
 # NB: cbc 0.1 is the release that matches aes 0.8 (both speak `cipher` 0.4).
