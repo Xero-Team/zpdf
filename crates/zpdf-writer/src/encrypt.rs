@@ -370,7 +370,7 @@ fn hash_v5_r6(password: &[u8], salt: &[u8], udata: &[u8]) -> [u8; 32] {
 
 /// Algorithm 2.B hardened hash (mirrors the reader in zpdf-parser).
 fn hash_r6(initial: [u8; 32], password: &[u8], udata: &[u8]) -> [u8; 32] {
-    use aes::cipher::{generic_array::GenericArray, BlockEncryptMut, KeyIvInit};
+    use aes::cipher::{BlockModeEncrypt, KeyIvInit};
     let mut k: Vec<u8> = initial.to_vec();
     let mut e_last: u8 = 0;
     let mut round: i64 = 0;
@@ -385,7 +385,7 @@ fn hash_r6(initial: [u8; 32], password: &[u8], udata: &[u8]) -> [u8; 32] {
         let mut enc =
             cbc::Encryptor::<aes::Aes128>::new_from_slices(&k[..16], &k[16..32]).expect("16/16");
         for block in buf.chunks_exact_mut(16) {
-            enc.encrypt_block_mut(GenericArray::from_mut_slice(block));
+            enc.encrypt_block(block.try_into().expect("16-byte AES block"));
         }
         e_last = *buf.last().unwrap_or(&0);
         let m = buf[..16].iter().map(|&b| u32::from(b)).sum::<u32>() % 3;
@@ -403,20 +403,20 @@ fn hash_r6(initial: [u8; 32], password: &[u8], udata: &[u8]) -> [u8; 32] {
 
 /// AES-256-CBC with zero IV and no padding (for /UE and /OE, 32-byte input).
 fn aes256_cbc_encrypt_nopad_zero_iv(key: &[u8; 32], data: &[u8]) -> Vec<u8> {
-    use aes::cipher::{generic_array::GenericArray, BlockEncryptMut, KeyIvInit};
+    use aes::cipher::{BlockModeEncrypt, KeyIvInit};
     let mut buf = data.to_vec();
     let mut enc = cbc::Encryptor::<aes::Aes256>::new_from_slices(key, &[0u8; 16]).expect("32/16");
     for block in buf.chunks_exact_mut(16) {
-        enc.encrypt_block_mut(GenericArray::from_mut_slice(block));
+        enc.encrypt_block(block.try_into().expect("16-byte AES block"));
     }
     buf
 }
 
 /// One-block AES-256-ECB encrypt (for /Perms).
 fn aes256_ecb_encrypt_block(key: &[u8], block: &[u8; 16]) -> [u8; 16] {
-    use aes::cipher::{generic_array::GenericArray, BlockEncrypt, KeyInit};
+    use aes::cipher::{Array, BlockCipherEncrypt, KeyInit};
     let cipher = aes::Aes256::new_from_slice(key).expect("32-byte key");
-    let mut b = GenericArray::clone_from_slice(block);
+    let mut b = Array::from(*block);
     cipher.encrypt_block(&mut b);
     let mut out = [0u8; 16];
     out.copy_from_slice(&b);
@@ -426,7 +426,7 @@ fn aes256_ecb_encrypt_block(key: &[u8], block: &[u8; 16]) -> [u8; 16] {
 /// AES-CBC encrypt with random IV and PKCS#5 padding — the PDF stream/string
 /// payload format (IV || ciphertext). Key length selects AES-128/256.
 fn aes_cbc_encrypt(key: &[u8], data: &[u8]) -> Vec<u8> {
-    use aes::cipher::{generic_array::GenericArray, BlockEncryptMut, KeyIvInit};
+    use aes::cipher::{BlockModeEncrypt, KeyIvInit};
     let mut iv = [0u8; 16];
     // Stream content is not key material; fall back to a fixed IV only if the
     // system RNG is unavailable (never expected in practice).
@@ -441,13 +441,13 @@ fn aes_cbc_encrypt(key: &[u8], data: &[u8]) -> Vec<u8> {
         32 => {
             let mut enc = cbc::Encryptor::<aes::Aes256>::new_from_slices(key, &iv).expect("32/16");
             for block in buf.chunks_exact_mut(16) {
-                enc.encrypt_block_mut(GenericArray::from_mut_slice(block));
+                enc.encrypt_block(block.try_into().expect("16-byte AES block"));
             }
         }
         16 => {
             let mut enc = cbc::Encryptor::<aes::Aes128>::new_from_slices(key, &iv).expect("16/16");
             for block in buf.chunks_exact_mut(16) {
-                enc.encrypt_block_mut(GenericArray::from_mut_slice(block));
+                enc.encrypt_block(block.try_into().expect("16-byte AES block"));
             }
         }
         _ => unreachable!("file keys are 16 or 32 bytes"),

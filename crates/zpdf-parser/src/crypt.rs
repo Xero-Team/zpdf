@@ -22,7 +22,7 @@
 //! compressed stream are **not** decrypted individually (the container stream
 //! is), and the `/Encrypt` dictionary itself is never decrypted.
 
-use aes::cipher::{generic_array::GenericArray, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
+use aes::cipher::{BlockModeDecrypt, BlockModeEncrypt, KeyIvInit};
 use sha2::Digest;
 use std::sync::Arc;
 use zpdf_core::{ObjectId, PdfDict, PdfObject, PdfString};
@@ -695,7 +695,7 @@ fn cbc_decrypt_in_place(key: &[u8], iv: &[u8], buf: &mut [u8]) -> bool {
                 return false;
             };
             for block in buf.chunks_exact_mut(16) {
-                dec.decrypt_block_mut(GenericArray::from_mut_slice(block));
+                dec.decrypt_block(block.try_into().expect("16-byte AES block"));
             }
             true
         }
@@ -704,7 +704,7 @@ fn cbc_decrypt_in_place(key: &[u8], iv: &[u8], buf: &mut [u8]) -> bool {
                 return false;
             };
             for block in buf.chunks_exact_mut(16) {
-                dec.decrypt_block_mut(GenericArray::from_mut_slice(block));
+                dec.decrypt_block(block.try_into().expect("16-byte AES block"));
             }
             true
         }
@@ -721,7 +721,7 @@ fn aes128_cbc_encrypt_nopad(key: &[u8], iv: &[u8], data: &[u8]) -> Vec<u8> {
         return buf; // unreachable: callers always pass 16-byte key/iv slices
     };
     for block in buf.chunks_exact_mut(16) {
-        enc.encrypt_block_mut(GenericArray::from_mut_slice(block));
+        enc.encrypt_block(block.try_into().expect("16-byte AES block"));
     }
     buf
 }
@@ -754,7 +754,7 @@ fn aes_cbc_encrypt(key: &[u8], data: &[u8]) -> Vec<u8> {
         16 => {
             if let Ok(mut enc) = cbc::Encryptor::<aes::Aes128>::new_from_slices(key, &iv) {
                 for block in buf.chunks_exact_mut(16) {
-                    enc.encrypt_block_mut(GenericArray::from_mut_slice(block));
+                    enc.encrypt_block(block.try_into().expect("16-byte AES block"));
                 }
                 true
             } else {
@@ -764,7 +764,7 @@ fn aes_cbc_encrypt(key: &[u8], data: &[u8]) -> Vec<u8> {
         32 => {
             if let Ok(mut enc) = cbc::Encryptor::<aes::Aes256>::new_from_slices(key, &iv) {
                 for block in buf.chunks_exact_mut(16) {
-                    enc.encrypt_block_mut(GenericArray::from_mut_slice(block));
+                    enc.encrypt_block(block.try_into().expect("16-byte AES block"));
                 }
                 true
             } else {
@@ -921,7 +921,7 @@ mod tests {
         let mut buf = data.to_vec();
         let mut enc = cbc::Encryptor::<aes::Aes256>::new_from_slices(key, iv).unwrap();
         for block in buf.chunks_exact_mut(16) {
-            enc.encrypt_block_mut(GenericArray::from_mut_slice(block));
+            enc.encrypt_block(block.try_into().expect("16-byte AES block"));
         }
         buf
     }
