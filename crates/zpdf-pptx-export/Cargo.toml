@@ -28,7 +28,7 @@ tracing.workspace = true
 image.workspace = true
 
 # ZIP handling for .pptx (which is a ZIP archive)
-zip = "2.2"
+zip = "8.6"
 
 # XML generation for OOXML
 quick-xml = { version = "0.41", features = ["serialize"] }
