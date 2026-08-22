@@ -1016,7 +1016,7 @@ fn encode_png(image: &DecodedImage) -> Option<Vec<u8>> {
 }
 
 fn unpremultiply(data: &mut [u8]) {
-    for px in data.chunks_exact_mut(4) {
+    for px in data.as_chunks_mut::<4>().0 {
         let a = px[3] as u32;
         if a == 0 {
             px[0] = 0;

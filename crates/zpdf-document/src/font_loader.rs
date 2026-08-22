@@ -487,7 +487,13 @@ fn parse_cid_to_gid_stream(
         }
     };
     let mut map = std::collections::HashMap::new();
-    for (cid, gid_bytes) in data.chunks_exact(2).enumerate().take(u16::MAX as usize + 1) {
+    for (cid, gid_bytes) in data
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .enumerate()
+        .take(u16::MAX as usize + 1)
+    {
         let gid = u16::from_be_bytes([gid_bytes[0], gid_bytes[1]]);
         if gid != 0 {
             map.insert(cid as u16, gid);

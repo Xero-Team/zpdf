@@ -789,7 +789,7 @@ impl<'a> CpuRenderer<'a> {
         // uniformly by the per-pixel mask coverage.
         if let Some(plane) = &entry.mask {
             let data = group_pixmap.data_mut();
-            for (px, &m) in data.chunks_exact_mut(4).zip(plane.iter()) {
+            for (px, &m) in data.as_chunks_mut::<4>().0.iter_mut().zip(plane.iter()) {
                 if m == 255 {
                     continue;
                 }
@@ -1655,7 +1655,12 @@ fn paint_overprint(cmd: &RenderCommand) -> Option<Overprint> {
 /// element does not paint round-trips exactly (rgb→cmyk→rgb is the identity for
 /// the naïve model), so the backdrop is undisturbed where the element is silent.
 fn overprint_merge(canvas: &mut [u8], elem: &[u8], op: &Overprint) {
-    for (c, e) in canvas.chunks_exact_mut(4).zip(elem.chunks_exact(4)) {
+    for (c, e) in canvas
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(elem.as_chunks::<4>().0)
+    {
         let a = e[3] as f64 / 255.0; // coverage · opacity
         if a <= 0.0 {
             continue;

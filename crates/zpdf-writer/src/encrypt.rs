@@ -384,8 +384,8 @@ fn hash_r6(initial: [u8; 32], password: &[u8], udata: &[u8]) -> [u8; 32] {
         let mut buf = k1;
         let mut enc =
             cbc::Encryptor::<aes::Aes128>::new_from_slices(&k[..16], &k[16..32]).expect("16/16");
-        for block in buf.chunks_exact_mut(16) {
-            enc.encrypt_block(block.try_into().expect("16-byte AES block"));
+        for block in buf.as_chunks_mut::<16>().0 {
+            enc.encrypt_block(block.into());
         }
         e_last = *buf.last().unwrap_or(&0);
         let m = buf[..16].iter().map(|&b| u32::from(b)).sum::<u32>() % 3;
@@ -406,8 +406,8 @@ fn aes256_cbc_encrypt_nopad_zero_iv(key: &[u8; 32], data: &[u8]) -> Vec<u8> {
     use aes::cipher::{BlockModeEncrypt, KeyIvInit};
     let mut buf = data.to_vec();
     let mut enc = cbc::Encryptor::<aes::Aes256>::new_from_slices(key, &[0u8; 16]).expect("32/16");
-    for block in buf.chunks_exact_mut(16) {
-        enc.encrypt_block(block.try_into().expect("16-byte AES block"));
+    for block in buf.as_chunks_mut::<16>().0 {
+        enc.encrypt_block(block.into());
     }
     buf
 }
@@ -440,14 +440,14 @@ fn aes_cbc_encrypt(key: &[u8], data: &[u8]) -> Vec<u8> {
     match key.len() {
         32 => {
             let mut enc = cbc::Encryptor::<aes::Aes256>::new_from_slices(key, &iv).expect("32/16");
-            for block in buf.chunks_exact_mut(16) {
-                enc.encrypt_block(block.try_into().expect("16-byte AES block"));
+            for block in buf.as_chunks_mut::<16>().0 {
+                enc.encrypt_block(block.into());
             }
         }
         16 => {
             let mut enc = cbc::Encryptor::<aes::Aes128>::new_from_slices(key, &iv).expect("16/16");
-            for block in buf.chunks_exact_mut(16) {
-                enc.encrypt_block(block.try_into().expect("16-byte AES block"));
+            for block in buf.as_chunks_mut::<16>().0 {
+                enc.encrypt_block(block.into());
             }
         }
         _ => unreachable!("file keys are 16 or 32 bytes"),
@@ -513,7 +513,7 @@ fn md5(data: &[u8]) -> [u8; 16] {
         msg.push(0);
     }
     msg.extend_from_slice(&bit_len.to_le_bytes());
-    for chunk in msg.chunks_exact(64) {
+    for chunk in msg.as_chunks::<64>().0 {
         let mut m = [0u32; 16];
         for (i, word) in m.iter_mut().enumerate() {
             *word = u32::from_le_bytes([

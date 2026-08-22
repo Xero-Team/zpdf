@@ -397,7 +397,7 @@ fn parse_byte_range(file: &PdfFile, sig: &PdfDict, file_len: usize) -> ByteRange
                 _ => None,
             })
             .collect();
-        for pair in nums.chunks_exact(2) {
+        for pair in nums.as_chunks::<2>().0 {
             if let (Ok(off), Ok(len)) = (usize::try_from(pair[0]), usize::try_from(pair[1])) {
                 ranges.push((off, len));
             }
@@ -1131,7 +1131,9 @@ mod cms {
         const BMP_STRING: u8 = 0x1e;
         if tag == BMP_STRING {
             let units: Vec<u16> = value
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| u16::from_be_bytes([c[0], c[1]]))
                 .collect();
             String::from_utf16_lossy(&units)
@@ -1591,7 +1593,9 @@ mod tests {
     }
 
     fn hex(h: &[u8]) -> Vec<u8> {
-        h.chunks_exact(2)
+        h.as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| {
                 let s = std::str::from_utf8(c).unwrap();
                 u8::from_str_radix(s, 16).unwrap()

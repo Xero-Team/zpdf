@@ -119,7 +119,9 @@ fn decode_text(bytes: &[u8]) -> String {
 /// Decode UTF-16 (big- or little-endian) bytes leniently.
 fn decode_utf16(bytes: &[u8], be: bool) -> String {
     let units: Vec<u16> = bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| {
             if be {
                 u16::from_be_bytes([c[0], c[1]])

@@ -283,7 +283,7 @@ impl LoadedDocument {
 
 fn render_image_from_rgba(width: u32, height: u32, mut rgba: Vec<u8>) -> Option<Arc<RenderImage>> {
     // GPUI's RenderImage expects BGRA bytes for direct render data.
-    for pixel in rgba.chunks_exact_mut(4) {
+    for pixel in rgba.as_chunks_mut::<4>().0 {
         pixel.swap(0, 2);
     }
 

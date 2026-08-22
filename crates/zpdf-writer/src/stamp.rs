@@ -340,7 +340,7 @@ impl IncrementalWriter {
                     .ok_or_else(|| invalid_data("RGB stamp dimensions overflow"))?;
                 let mut rgb = Vec::with_capacity(rgb_len);
                 let mut alpha = Vec::with_capacity(pixel_count);
-                for chunk in pixels.chunks_exact(4) {
+                for chunk in pixels.as_chunks::<4>().0 {
                     rgb.extend_from_slice(&chunk[..3]);
                     alpha.push(chunk[3]);
                 }

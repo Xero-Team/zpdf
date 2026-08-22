@@ -402,8 +402,10 @@ pub fn apply_smask_image(image: &mut DecodedImage, mask: &DecodedImage) {
     {
         for (px, mask_px) in image
             .data
-            .chunks_exact_mut(4)
-            .zip(mask.data.chunks_exact(4))
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(mask.data.as_chunks::<4>().0)
         {
             multiply_pixel_alpha(px, mask_px[0]);
         }
@@ -412,7 +414,13 @@ pub fn apply_smask_image(image: &mut DecodedImage, mask: &DecodedImage) {
         return;
     }
     // The mask is DeviceGray, so its decoded R channel is the gray level.
-    let alpha: Vec<u8> = mask.data.chunks_exact(4).map(|px| px[0]).collect();
+    let alpha: Vec<u8> = mask
+        .data
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|px| px[0])
+        .collect();
     fold_alpha_plane(image, &alpha, mask.width, mask.height);
 }
 
@@ -458,7 +466,7 @@ pub fn apply_stencil_mask_with_limits(
         && mask_width != 0
         && mask_height != 0
     {
-        for (index, px) in image.data.chunks_exact_mut(4).enumerate() {
+        for (index, px) in image.data.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             let row = index / mask_width as usize;
             if row >= mask_height as usize {
                 break;
@@ -1023,7 +1031,9 @@ fn color_key_ranges(dict: &PdfDict, ncomp: usize) -> Option<Vec<(u16, u16)>> {
         })
         .collect::<Option<_>>()?;
     Some(
-        vals.chunks_exact(2)
+        vals.as_chunks::<2>()
+            .0
+            .iter()
             .map(|p| (p[0].min(p[1]), p[0].max(p[1])))
             .collect(),
     )
@@ -1239,7 +1249,7 @@ fn append_icc_chunk(
         .ok_or_else(|| Error::StreamDecode("ICC chunk size overflow".into()))?;
     rgb.resize(rgb_len, 0);
     transform.slice_to_rgb(comps, rgb)?;
-    for (px, &is_masked) in rgb.chunks_exact(3).zip(masked.iter()) {
+    for (px, &is_masked) in rgb.as_chunks::<3>().0.iter().zip(masked.iter()) {
         if is_masked {
             rgba.extend_from_slice(&[0, 0, 0, 0]);
         } else {
@@ -1411,7 +1421,7 @@ fn fold_alpha_plane(image: &mut DecodedImage, alpha: &[u8], aw: u32, ah: u32) {
         resampled = resample_bilinear(alpha, aw, ah, image.width, image.height);
         &resampled
     };
-    for (px, &a) in image.data.chunks_exact_mut(4).zip(plane) {
+    for (px, &a) in image.data.as_chunks_mut::<4>().0.iter_mut().zip(plane) {
         multiply_pixel_alpha(px, a);
     }
     image.has_alpha = true;

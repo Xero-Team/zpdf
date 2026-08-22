@@ -734,7 +734,7 @@ fn save_image(path: &Path, image: &mut zpdf::DecodedImage) -> Result<(), String>
 }
 
 fn unpremultiply_rgba(data: &mut [u8]) {
-    for pixel in data.chunks_exact_mut(4) {
+    for pixel in data.as_chunks_mut::<4>().0 {
         let alpha = u16::from(pixel[3]);
         if alpha == 0 {
             pixel[0] = 0;
