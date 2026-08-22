@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+### PDF/X-1a/3/4/6 conformance validation
+
+- `zpdf validate` gained four PDF/X profiles (ISO 15930, best-effort rule
+  engine mirroring the PDF/A validator):
+  - `--profile pdfx-1a` — PDF/X-1a: PDF 1.3, CMYK/Gray/spot only (no RGB of any
+    kind), no transparency, `/Trapped` required, all annotations print.
+  - `--profile pdfx-3` — PDF/X-3: PDF 1.3, CMYK plus calibrated colour
+    (`CalRGB`/`CalGray`/`ICCBased`), no transparency.
+  - `--profile pdfx-4` — PDF/X-4: PDF 1.4–1.7, CMYK plus calibrated colour,
+    transparency and layers allowed.
+  - `--profile pdfx-6` — PDF/X-6: PDF 2.0-based.
+  Rules: a `/GTS_PDFX` output intent with an embedded **CMYK** (`/N` = 4) ICC
+  profile; all fonts embedded; every page has a `/TrimBox` or `/ArtBox` with
+  `MediaBox ⊇ BleedBox ⊇ TrimBox ⊇ ArtBox` containment; no encryption;
+  trailer `/ID`; no JavaScript/Launch actions; forbidden annotation subtypes
+  (`3D`/`Sound`/`Movie`/`FileAttachment`); RGB colour restrictions; and
+  `/Trapped` (required for X-1a/X-3, `/Unknown` disallowed for X-4). The
+  report's `claimed` field carries the XMP `pdfxid:GTS_PDFXVersion` (or legacy
+  `pdfx:`) identification. Read-side only — no `--pdfx` conversion yet.
+
 ### PDF/A-3b and PDF/UA-2 conformance levels
 
 - `zpdf validate` gained two new profiles:

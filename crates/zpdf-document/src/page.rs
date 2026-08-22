@@ -31,7 +31,7 @@ const DEFAULT_MEDIA_BOX: Rect = Rect {
 /// A box is usable only if all four corners are finite and it encloses a
 /// non-empty area once normalized. Rejects NaN/∞ (which would poison the raster
 /// dimension math downstream) and zero/negative-area rectangles.
-fn is_usable_box(r: &Rect) -> bool {
+pub(crate) fn is_usable_box(r: &Rect) -> bool {
     if ![r.x0, r.y0, r.x1, r.y1].iter().all(|v| v.is_finite()) {
         return false;
     }
