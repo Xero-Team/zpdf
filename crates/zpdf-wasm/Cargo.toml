@@ -15,6 +15,11 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 zpdf = { workspace = true, features = ["cpu-render"] }
 zpdf-svg-export.workspace = true
+# Direct writer dep: RedactOptions and linearize_pdf aren't re-exported by the
+# `zpdf` facade, and this keeps the wasm surface explicit. zpdf-writer already
+# compiles for wasm32 (pulled in unconditionally by `zpdf`); the only wasm-hostile
+# dep (ureq, RFC 3161 timestamp) is behind the off-by-default `timestamp` feature.
+zpdf-writer = { workspace = true }
 
 wasm-bindgen = "0.2"
 # Surfaces Rust panics as readable JS console errors in the demo.
@@ -24,3 +29,8 @@ console_error_panic_hook = "0.1"
 # p256/p384 (signature verification) pull rand_core → getrandom, which refuses
 # to compile on wasm32-unknown-unknown unless the JS entropy backend is enabled.
 getrandom = { version = "0.2", features = ["js"] }
+# crypto-bigint (via p384) pulls getrandom 0.4, which needs its own `wasm_js`
+# backend. Renamed so it can sit beside the 0.2 entry; Cargo still unifies the
+# `wasm_js` feature onto the transitive 0.4 instance. Not referenced in code —
+# it exists solely to flip that feature on for the wasm32 build.
+getrandom_0_4 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
