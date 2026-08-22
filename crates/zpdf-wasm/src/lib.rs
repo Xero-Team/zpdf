@@ -216,8 +216,13 @@ pub(crate) fn editor_save_bytes(
 /// Host-testable core: chunk a flat `[x0,y0,x1,y1, …]` into `Rect`s. Returns a
 /// `String` error (not `JsError`, which can't be constructed on a non-wasm
 /// host) so the length check is unit-testable without a browser.
+//
+// `is_multiple_of` is Rust 1.87+; the workspace pins no MSRV and CI rides
+// `stable`, so use the universally-available `% 4` form and silence the
+// clippy `manual_is_multiple_of` suggestion it would otherwise make.
+#[allow(clippy::manual_is_multiple_of)]
 pub(crate) fn rects_from_flat(flat: &[f64]) -> Result<Vec<zpdf::Rect>, String> {
-    if !flat.len().is_multiple_of(4) {
+    if flat.len() % 4 != 0 {
         return Err(
             "expected a flat [x0,y0,x1,y1, ...] array whose length is a multiple of 4".into(),
         );
