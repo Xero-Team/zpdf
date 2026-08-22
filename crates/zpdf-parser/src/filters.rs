@@ -818,7 +818,7 @@ fn decode_dct(data: &[u8], max_image_pixels: u64, budget: &mut DecodeBudget) -> 
 /// `(1−c)(1−k)`, which over-saturated like a non-fidelity viewer.)
 fn ycck_to_rgb(ycck: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(ycck.len() / 4 * 3);
-    for px in ycck.chunks_exact(4) {
+    for px in ycck.as_chunks::<4>().0 {
         let (y, cb, cr) = (px[0] as f64, px[1] as f64, px[2] as f64);
         // JFIF YCbCr -> R'G'B' (transmitted light = complement of C/M/Y ink).
         let rp = (y + 1.402 * (cr - 128.0)).clamp(0.0, 255.0);

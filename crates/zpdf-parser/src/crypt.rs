@@ -694,8 +694,8 @@ fn cbc_decrypt_in_place(key: &[u8], iv: &[u8], buf: &mut [u8]) -> bool {
             let Ok(mut dec) = cbc::Decryptor::<aes::Aes128>::new_from_slices(key, iv) else {
                 return false;
             };
-            for block in buf.chunks_exact_mut(16) {
-                dec.decrypt_block(block.try_into().expect("16-byte AES block"));
+            for block in buf.as_chunks_mut::<16>().0 {
+                dec.decrypt_block(block.into());
             }
             true
         }
@@ -703,8 +703,8 @@ fn cbc_decrypt_in_place(key: &[u8], iv: &[u8], buf: &mut [u8]) -> bool {
             let Ok(mut dec) = cbc::Decryptor::<aes::Aes256>::new_from_slices(key, iv) else {
                 return false;
             };
-            for block in buf.chunks_exact_mut(16) {
-                dec.decrypt_block(block.try_into().expect("16-byte AES block"));
+            for block in buf.as_chunks_mut::<16>().0 {
+                dec.decrypt_block(block.into());
             }
             true
         }
@@ -720,8 +720,8 @@ fn aes128_cbc_encrypt_nopad(key: &[u8], iv: &[u8], data: &[u8]) -> Vec<u8> {
     let Ok(mut enc) = cbc::Encryptor::<aes::Aes128>::new_from_slices(key, iv) else {
         return buf; // unreachable: callers always pass 16-byte key/iv slices
     };
-    for block in buf.chunks_exact_mut(16) {
-        enc.encrypt_block(block.try_into().expect("16-byte AES block"));
+    for block in buf.as_chunks_mut::<16>().0 {
+        enc.encrypt_block(block.into());
     }
     buf
 }
@@ -753,8 +753,8 @@ fn aes_cbc_encrypt(key: &[u8], data: &[u8]) -> Vec<u8> {
     let ok = match key.len() {
         16 => {
             if let Ok(mut enc) = cbc::Encryptor::<aes::Aes128>::new_from_slices(key, &iv) {
-                for block in buf.chunks_exact_mut(16) {
-                    enc.encrypt_block(block.try_into().expect("16-byte AES block"));
+                for block in buf.as_chunks_mut::<16>().0 {
+                    enc.encrypt_block(block.into());
                 }
                 true
             } else {
@@ -763,8 +763,8 @@ fn aes_cbc_encrypt(key: &[u8], data: &[u8]) -> Vec<u8> {
         }
         32 => {
             if let Ok(mut enc) = cbc::Encryptor::<aes::Aes256>::new_from_slices(key, &iv) {
-                for block in buf.chunks_exact_mut(16) {
-                    enc.encrypt_block(block.try_into().expect("16-byte AES block"));
+                for block in buf.as_chunks_mut::<16>().0 {
+                    enc.encrypt_block(block.into());
                 }
                 true
             } else {
@@ -859,7 +859,7 @@ pub fn md5(data: &[u8]) -> [u8; 16] {
     }
     msg.extend_from_slice(&bit_len.to_le_bytes());
 
-    for chunk in msg.chunks_exact(64) {
+    for chunk in msg.as_chunks::<64>().0 {
         let mut m = [0u32; 16];
         for (i, word) in m.iter_mut().enumerate() {
             *word = u32::from_le_bytes([
@@ -920,8 +920,8 @@ mod tests {
     fn aes256_cbc_encrypt_nopad(key: &[u8], iv: &[u8], data: &[u8]) -> Vec<u8> {
         let mut buf = data.to_vec();
         let mut enc = cbc::Encryptor::<aes::Aes256>::new_from_slices(key, iv).unwrap();
-        for block in buf.chunks_exact_mut(16) {
-            enc.encrypt_block(block.try_into().expect("16-byte AES block"));
+        for block in buf.as_chunks_mut::<16>().0 {
+            enc.encrypt_block(block.into());
         }
         buf
     }

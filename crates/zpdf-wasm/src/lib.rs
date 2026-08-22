@@ -228,7 +228,9 @@ pub(crate) fn rects_from_flat(flat: &[f64]) -> Result<Vec<zpdf::Rect>, String> {
         );
     }
     Ok(flat
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| zpdf::Rect::new(c[0], c[1], c[2], c[3]))
         .collect())
 }
@@ -810,7 +812,9 @@ mod tests {
         // The blue rect must have painted: some pixel is dominated by blue.
         assert!(bitmap
             .rgba
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .any(|px| px[2] > 200 && px[0] < 60));
 
         let text = pdf.page_text(0).expect("text");

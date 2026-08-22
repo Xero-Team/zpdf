@@ -503,7 +503,7 @@ fn read_face_names(file: &mut fs::File, sfnt_offset: u64) -> Option<FaceNames> {
     file.read_exact(&mut directory).ok()?;
 
     let mut name_table: Option<(u64, usize)> = None;
-    for rec in directory.chunks_exact(16) {
+    for rec in directory.as_chunks::<16>().0 {
         if &rec[0..4] == b"name" {
             let offset = u32::from_be_bytes([rec[8], rec[9], rec[10], rec[11]]) as u64;
             let length = u32::from_be_bytes([rec[12], rec[13], rec[14], rec[15]]) as usize;
@@ -580,7 +580,9 @@ fn parse_name_table(table: &[u8]) -> FaceNames {
         } else {
             // UTF-16BE.
             let units: Vec<u16> = bytes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| u16::from_be_bytes([c[0], c[1]]))
                 .collect();
             String::from_utf16_lossy(&units)

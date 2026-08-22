@@ -194,7 +194,7 @@ fn parse_xref_stream(
             return Err(Error::InvalidXref(offset as u64));
         }
         let mut ranges = Vec::with_capacity(idx_arr.len() / 2);
-        for pair in idx_arr.chunks_exact(2) {
+        for pair in idx_arr.as_chunks::<2>().0 {
             let start =
                 u32::try_from(pair[0].as_i64()?).map_err(|_| Error::InvalidXref(offset as u64))?;
             let count =

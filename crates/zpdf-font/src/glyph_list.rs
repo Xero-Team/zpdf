@@ -109,7 +109,7 @@ pub fn glyph_name_to_char(name: &str) -> Option<char> {
     }
     if let Some(rest) = base.strip_prefix("uni") {
         if !rest.is_empty() && rest.len() % 4 == 0 && is_all_upper_hex(rest) {
-            for group in rest.as_bytes().chunks_exact(4) {
+            for group in rest.as_bytes().as_chunks::<4>().0 {
                 let group = std::str::from_utf8(group).ok()?;
                 let cp = u32::from_str_radix(group, 16).ok()?;
                 if !(0xD800..=0xDFFF).contains(&cp) {
