@@ -21,7 +21,7 @@ zpdf-core.workspace = true
 zpdf-display-list.workspace = true
 
 [dev-dependencies]
-criterion = "0.5"
+criterion = "0.8"
 
 # Bench targets. `harness = false` lets criterion own `main()`.
 [[bench]]
