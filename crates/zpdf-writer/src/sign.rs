@@ -57,9 +57,13 @@ impl SigningKey {
     /// An RSA or EC private key from PKCS#8 DER (`PrivateKeyInfo`), tried in
     /// that order.
     pub fn from_pkcs8_der(der: &[u8]) -> Result<Self> {
-        // Both crates re-export the same `pkcs8::DecodePrivateKey` trait, so a
-        // single import brings it into scope for both key types.
+        // rsa 0.9 re-exports pkcs8 0.10 while p256 0.14 re-exports pkcs8 0.11 —
+        // the two `DecodePrivateKey` traits are now distinct crate versions,
+        // so import each from its own crate to resolve the right
+        // `from_pkcs8_der` per key type (the pkcs8 duplication is harmless and
+        // already present on main via p384 0.14).
         use p256::pkcs8::DecodePrivateKey as _;
+        use rsa::pkcs8::DecodePrivateKey as _;
         if let Ok(key) = rsa::RsaPrivateKey::from_pkcs8_der(der) {
             return Ok(SigningKey::Rsa(Box::new(key)));
         }

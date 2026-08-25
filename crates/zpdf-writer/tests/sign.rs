@@ -95,7 +95,7 @@ fn ecdsa_material() -> (Vec<u8>, SigningKey) {
     let scalar = [0x42u8; 32];
     let key = SigningKey::ecdsa_p256_from_scalar(&scalar).expect("scalar");
     let sk = p256::ecdsa::SigningKey::from_slice(&scalar).unwrap();
-    let point = p256::EncodedPoint::from(sk.verifying_key())
+    let point = p256::Sec1Point::from(sk.verifying_key())
         .to_bytes()
         .to_vec();
     let cert = build_cert(&ec_p256_spki(&point), "zpdf signer");
