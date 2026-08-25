@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.13.0 — PDF/X + PDF/A-3b + PDF/UA-2 validation, dependency refresh
 
 ### PDF/X-1a/3/4/6 conformance validation
 
@@ -43,6 +43,21 @@
   `/AFRelationship /Unspecified` — so the output passes `validate --profile
   pdfa-3b` (roundtrip parity with the A-1b/A-2b converters). A catalog that
   already carries `/AF` is left untouched.
+
+### Dependencies
+
+- `p256` 0.13 → 0.14, now aligned with `p384` (both on `ecdsa` 0.17 + `pkcs8`
+  0.11). The bump is otherwise blocked by `rsa` 0.9 (still on `pkcs8` 0.10), so
+  the PKCS#8 key loader in `zpdf-writer` now imports `DecodePrivateKey` per crate
+  (`rsa::pkcs8` vs `p256::pkcs8`), and tests use `p256::Sec1Point` (0.14 dropped
+  the crate-root `EncodedPoint` re-export). No behaviour change — ECDSA P-256
+  sign/verify round-trips unchanged.
+- `tiny-skia` 0.11 → 0.12. No call-site changes needed (the breaking
+  `RadialGradient::new` signature is unused here).
+- `criterion` 0.5 → 0.8 (dev-dependency, `zpdf-benches` only).
+- `sha1`/`sha2` 0.11 **deferred**: they move to `digest` 0.11, but `rsa 0.9`
+  (latest stable) still uses `digest` 0.10, so `Pkcs1v15Sign::new::<Sha256>`
+  fails the trait bound. Revisit when `rsa 0.10` ships stable.
 
 ## 0.12.1 — Prebuilt binaries via `cargo-binstall`
 
