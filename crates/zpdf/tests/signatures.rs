@@ -449,11 +449,11 @@ fn assemble_signed_pdf(build_cms: impl Fn(&[u8]) -> Vec<u8>) -> Vec<u8> {
 fn ecdsa_p256_signer() -> (Vec<u8>, impl Fn(&[u8]) -> Vec<u8>) {
     use p256::ecdsa::signature::hazmat::PrehashSigner;
     use p256::ecdsa::{Signature, SigningKey};
-    use p256::EncodedPoint;
+    use p256::Sec1Point;
 
     let scalar = [0x11u8; 32];
     let sk = SigningKey::from_slice(&scalar).expect("signing key");
-    let point = EncodedPoint::from(sk.verifying_key()).to_bytes().to_vec();
+    let point = Sec1Point::from(sk.verifying_key()).to_bytes().to_vec();
     let cert = build_cert(&ec_p256_spki(&point), "zpdf ECDSA Test");
 
     let sign = move |msg: &[u8]| {

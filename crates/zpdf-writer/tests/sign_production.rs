@@ -99,7 +99,7 @@ fn ecdsa_material() -> (Vec<u8>, SigningKey) {
     let scalar = [0x42u8; 32];
     let key = SigningKey::ecdsa_p256_from_scalar(&scalar).expect("scalar");
     let sk = p256::ecdsa::SigningKey::from_slice(&scalar).unwrap();
-    let point = p256::EncodedPoint::from(sk.verifying_key())
+    let point = p256::Sec1Point::from(sk.verifying_key())
         .to_bytes()
         .to_vec();
     (build_cert(&ec_p256_spki(&point), "zpdf signer"), key)
@@ -267,7 +267,7 @@ fn extra_certs_dss_and_crl_revocation_detected() {
     // A second (chain) cert and a CRL that revokes the signer's serial (01).
     let scalar = [0x99u8; 32];
     let sk2 = p256::ecdsa::SigningKey::from_slice(&scalar).unwrap();
-    let point2 = p256::EncodedPoint::from(sk2.verifying_key())
+    let point2 = p256::Sec1Point::from(sk2.verifying_key())
         .to_bytes()
         .to_vec();
     let extra = build_cert(&ec_p256_spki(&point2), "zpdf intermediate");
