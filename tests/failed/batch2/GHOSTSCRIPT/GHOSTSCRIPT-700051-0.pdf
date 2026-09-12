@@ -1,0 +1,119 @@
+%PDF-1.4
+%µ¶
+
+1 0 obj
+<<
+  /Type /Catalog
+  /Pages 2 0 R
+>>
+endobj
+
+2 0 obj
+<<
+  /Count 1
+  /Kids [ 3 0 R ]
+  /Type /Pages
+>>
+endobj
+
+3 0 obj
+<<
+  /Contents 6 0 R
+  /Parent 2 0 R
+  /Resources <<
+    /Pattern <<
+      /P0 4 0 R
+    >>
+    /XObject <<
+      /Fm0 5 0 R
+    >>
+  >>
+  /Type /Page
+>>
+endobj
+
+4 0 obj
+<<
+  /Length 59
+  /PatternType 1
+  /Type /Pattern
+  /XStep 97.2
+  /YStep 97.199
+>>
+stream
+45.42 81.251 m
+36.568 66.15 55.71 46.351 74.289 58.147 c
+S
+
+endstream
+endobj
+
+5 0 obj
+<<
+  /Group <<
+    /S /Transparency
+  >>
+  /Length 154
+  /Resources <<
+    /Pattern <<
+      /P0 4 0 R
+    >>
+  >>
+  /Subtype /Form
+>>
+stream
+/P0 scn
+736.259 183.977 m
+709.466 214.075 l
+563.953 214.592 l
+532.479 183.977 l
+556.738 183.977 l
+556.738 82.479 l
+711.997 82.479 l
+711.997 183.977 l
+h
+f
+
+endstream
+endobj
+
+6 0 obj
+<<
+  /Length 161
+>>
+stream
+/Fm0 Do
+/P0 scn
+736.259 501.96 m
+709.466 532.059 l
+563.953 532.576 l
+532.479 501.96 l
+556.738 501.96 l
+556.738 400.462 l
+711.997 400.462 l
+711.997 501.96 l
+h
+f
+
+
+endstream
+endobj
+
+xref
+0 7
+0000000000 65536 f 
+0000000016 00000 n 
+0000000070 00000 n 
+0000000136 00000 n 
+0000000306 00000 n 
+0000000482 00000 n 
+0000000805 00000 n 
+
+trailer
+<<
+  /Size 7
+  /Root 1 0 R
+>>
+startxref
+1020
+%%EOF

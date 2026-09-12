@@ -1,0 +1,53 @@
+peterwannheden(~/MyApps/Python)> ocrmypdf --deskew --force-ocr /Users/peterwannheden/Scratch/ocrmypdf_input.pdf  ~/Scratch/ocr.pdf -v 1
+  DEBUG - ocrmypdf 7.2.1
+  DEBUG - tesseract 4.0.0
+  DEBUG - qpdf 8.2.1
+  DEBUG - gs 8.61
+  DEBUG - os.symlink(/Users/peterwannheden/Scratch/ocrmypdf_input.pdf, /var/folders/88/l1x361js0w928qskmlpn6qhm0000gn/T/com.github.ocrmypdf.7m1ebwvb/origin)
+
+________________________________________
+Tasks which will be run:
+
+
+Task enters queue = 'ocrmypdf._pipeline.triage'
+  DEBUG - os.symlink(/var/folders/88/l1x361js0w928qskmlpn6qhm0000gn/T/com.github.ocrmypdf.7m1ebwvb/origin, /var/folders/88/l1x361js0w928qskmlpn6qhm0000gn/T/com.github.ocrmypdf.7m1ebwvb/origin.pdf)
+Completed Task = 'ocrmypdf._pipeline.triage'
+Task enters queue = 'ocrmypdf._pipeline.repair_and_parse_pdf'
+  DEBUG -
+
+
+
+Original exception:
+
+    Exception #1
+      'ocrmypdf.exceptions.SubprocessOutputError(Ghostscript text extraction failed
+    /var/folders/88/l1x361js0w928qskmlpn6qhm0000gn/T/com.github.ocrmypdf.7m1ebwvb/origin.repaired.pdf
+    Unknown device: txtwrite
+    Unrecoverable error: undefined in .uninstallpagedevice
+    Operand stack:
+        defaultdevice
+
+    )' raised in ...
+       Task = def ocrmypdf._pipeline.repair_and_parse_pdf(...):
+       Job  = [.../origin.pdf -> .../origin.repaired.pdf, <LoggingProxy>, <ocrmypdf._jobcontext.JobContext>]
+
+    Traceback (most recent call last):
+      File "/usr/local/Cellar/ocrmypdf/7.2.1/libexec/lib/python3.7/site-packages/ruffus/task.py", line 748, in run_pooled_job_without_exceptions
+        register_cleanup, touch_files_only)
+      File "/usr/local/Cellar/ocrmypdf/7.2.1/libexec/lib/python3.7/site-packages/ruffus/task.py", line 566, in job_wrapper_io_files
+        ret_val = user_defined_work_func(*params)
+      File "/usr/local/Cellar/ocrmypdf/7.2.1/libexec/lib/python3.7/site-packages/ocrmypdf/_pipeline.py", line 166, in repair_and_parse_pdf
+        pdfinfo = PdfInfo(output_file, log=log)
+      File "/usr/local/Cellar/ocrmypdf/7.2.1/libexec/lib/python3.7/site-packages/ocrmypdf/pdfinfo.py", line 720, in __init__
+        self._pages, pdf = _pdf_get_all_pageinfo(infile, log=log)
+      File "/usr/local/Cellar/ocrmypdf/7.2.1/libexec/lib/python3.7/site-packages/ocrmypdf/pdfinfo.py", line 607, in _pdf_get_all_pageinfo
+        existing_text = ghostscript.extract_text(infile, pageno=None)
+      File "/usr/local/Cellar/ocrmypdf/7.2.1/libexec/lib/python3.7/site-packages/ocrmypdf/exec/ghostscript.py", line 96, in extract_text
+        input_file, p.stdout.decode(), p.stderr.decode()
+    ocrmypdf.exceptions.SubprocessOutputError: Ghostscript text extraction failed
+    /var/folders/88/l1x361js0w928qskmlpn6qhm0000gn/T/com.github.ocrmypdf.7m1ebwvb/origin.repaired.pdf
+    Unknown device: txtwrite
+    Unrecoverable error: undefined in .uninstallpagedevice
+    Operand stack:
+        defaultdevice
+

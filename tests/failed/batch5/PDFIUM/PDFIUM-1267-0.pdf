@@ -1,0 +1,22 @@
+%PDF-1.7
+2 0 obj <</Pages 1 0 R>>
+endobj
+3 0 obj <<>>
+stream
+getField("").setFocus()
+endstream
+endobj
+1 0 obj <<
+  /AA <</O 1 0 R>>
+  /Annots [1 0 R]
+  /FT /Ch
+  /JS 3 0 R
+  /Opt [1]
+  /S /JavaScript
+  /Subtype /Widget
+  /T (T)
+  /V [7 0 R]
+>>
+endobj
+trailer <</Root 2 0 R>>
+%%EOF

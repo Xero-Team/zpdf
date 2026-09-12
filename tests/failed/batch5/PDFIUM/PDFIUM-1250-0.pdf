@@ -1,0 +1,31 @@
+%PDF-1.7
+1 0 obj
+<</Length 46>>
+stream
+<xdp:xdp xmlns:xdp="http://ns.adobe.com/xdp/">
+endstream
+endobj
+2 0 obj
+<</Length 64>>
+stream
+<template><subform><calculate><script>!.parent.*.name=1</script>
+endstream
+endobj
+3 0 obj
+<</XFA[(xdp:xdp) 1 0 R(template) 2 0 R]>>
+endobj
+4 0 obj
+<</AcroForm 3 0 R/Type/Catalog>>
+endobj
+xref
+0 5
+0000000000 65535 f
+0000000009 00000 n
+0000000103 00000 n
+0000000215 00000 n
+0000000272 00000 n
+trailer
+<</Size 5/Root 4 0 R>>
+startxref
+320
+%%EOF

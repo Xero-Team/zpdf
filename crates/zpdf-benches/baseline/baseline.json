@@ -1,0 +1,611 @@
+{
+  "cases": {
+    "backend_cli_process/test1-text": {
+      "mean_ns": 70111166.14285715,
+      "median_ns": 70295260.71428572
+    },
+    "backend_cli_process/test10-text": {
+      "mean_ns": 81027176.56746033,
+      "median_ns": 80858350.0
+    },
+    "backend_cli_process/test11-vector": {
+      "mean_ns": 67837937.11507936,
+      "median_ns": 67672045.71428572
+    },
+    "backend_cli_process/test12-image": {
+      "mean_ns": 850613440.0,
+      "median_ns": 848856550.0
+    },
+    "backend_cli_process/test2-vector": {
+      "mean_ns": 65007946.357142866,
+      "median_ns": 65000347.61904762
+    },
+    "backend_cli_process/test4-image": {
+      "mean_ns": 64454998.972222224,
+      "median_ns": 64600868.75
+    },
+    "backend_cli_process/test7-vector": {
+      "mean_ns": 90830665.66269842,
+      "median_ns": 90458474.44444443
+    },
+    "backend_cli_process/test8-text": {
+      "mean_ns": 91928781.1309524,
+      "median_ns": 91704483.33333334
+    },
+    "backend_cli_process/testpdf-科幻电影中的ai伦理冲突-image": {
+      "mean_ns": 337457150.0,
+      "median_ns": 337736950.0
+    },
+    "backend_cpu_fresh/test1-text": {
+      "mean_ns": 14991033.5,
+      "median_ns": 15011850.0
+    },
+    "backend_cpu_fresh/test10-text": {
+      "mean_ns": 18982842.0,
+      "median_ns": 18820450.0
+    },
+    "backend_cpu_fresh/test11-vector": {
+      "mean_ns": 22821111.0,
+      "median_ns": 22754150.0
+    },
+    "backend_cpu_fresh/test12-image": {
+      "mean_ns": 389085400.0,
+      "median_ns": 389684000.0
+    },
+    "backend_cpu_fresh/test2-vector": {
+      "mean_ns": 24016931.0,
+      "median_ns": 24014200.0
+    },
+    "backend_cpu_fresh/test4-image": {
+      "mean_ns": 18312358.5,
+      "median_ns": 18204150.0
+    },
+    "backend_cpu_fresh/test7-vector": {
+      "mean_ns": 50905798.333333336,
+      "median_ns": 50969300.0
+    },
+    "backend_cpu_fresh/test8-text": {
+      "mean_ns": 9955165.75,
+      "median_ns": 9926762.5
+    },
+    "backend_cpu_fresh/testpdf-科幻电影中的ai伦理冲突-image": {
+      "mean_ns": 204850885.0,
+      "median_ns": 204682700.0
+    },
+    "backend_cpu_reused/test1-text": {
+      "mean_ns": 15265795.999999994,
+      "median_ns": 15241500.0
+    },
+    "backend_cpu_reused/test10-text": {
+      "mean_ns": 20415446.0,
+      "median_ns": 20394425.0
+    },
+    "backend_cpu_reused/test11-vector": {
+      "mean_ns": 24001723.5,
+      "median_ns": 24028950.0
+    },
+    "backend_cpu_reused/test12-image": {
+      "mean_ns": 426961920.0,
+      "median_ns": 426508450.0
+    },
+    "backend_cpu_reused/test2-vector": {
+      "mean_ns": 25151026.0,
+      "median_ns": 25021800.0
+    },
+    "backend_cpu_reused/test4-image": {
+      "mean_ns": 19049936.0,
+      "median_ns": 19044575.0
+    },
+    "backend_cpu_reused/test7-vector": {
+      "mean_ns": 53027725.0,
+      "median_ns": 52840175.0
+    },
+    "backend_cpu_reused/test8-text": {
+      "mean_ns": 10157867.666666666,
+      "median_ns": 10146150.0
+    },
+    "backend_cpu_reused/testpdf-科幻电影中的ai伦理冲突-image": {
+      "mean_ns": 225593130.0,
+      "median_ns": 225490825.0
+    },
+    "backend_cpu_stats/test1-text": {
+      "mean_ns": 15096905.0,
+      "median_ns": 15155550.0
+    },
+    "backend_cpu_stats/test10-text": {
+      "mean_ns": 19507696.0,
+      "median_ns": 19509450.0
+    },
+    "backend_cpu_stats/test11-vector": {
+      "mean_ns": 24292662.5,
+      "median_ns": 24371050.0
+    },
+    "backend_cpu_stats/test12-image": {
+      "mean_ns": 424401110.0,
+      "median_ns": 423731800.0
+    },
+    "backend_cpu_stats/test2-vector": {
+      "mean_ns": 25633098.0,
+      "median_ns": 25415150.0
+    },
+    "backend_cpu_stats/test4-image": {
+      "mean_ns": 18999204.5,
+      "median_ns": 18972825.0
+    },
+    "backend_cpu_stats/test7-vector": {
+      "mean_ns": 52103856.666666664,
+      "median_ns": 51912025.0
+    },
+    "backend_cpu_stats/test8-text": {
+      "mean_ns": 10436457.666666662,
+      "median_ns": 10446316.666666666
+    },
+    "backend_cpu_stats/testpdf-科幻电影中的ai伦理冲突-image": {
+      "mean_ns": 220922500.0,
+      "median_ns": 221532275.0
+    },
+    "backend_gpu_readback/test1-text": {
+      "mean_ns": 8851972.528911564,
+      "median_ns": 8862017.346938774
+    },
+    "backend_gpu_readback/test10-text": {
+      "mean_ns": 7972984.920068028,
+      "median_ns": 7944033.928571429
+    },
+    "backend_gpu_readback/test11-vector": {
+      "mean_ns": 9512933.695767196,
+      "median_ns": 9484361.904761905
+    },
+    "backend_gpu_readback/test12-image": {
+      "mean_ns": 24833493.26322751,
+      "median_ns": 24809989.583333336
+    },
+    "backend_gpu_readback/test2-vector": {
+      "mean_ns": 9434413.058201056,
+      "median_ns": 9432219.25925926
+    },
+    "backend_gpu_readback/test4-image": {
+      "mean_ns": 7914271.338789682,
+      "median_ns": 7930645.982142857
+    },
+    "backend_gpu_readback/test7-vector": {
+      "mean_ns": 44721586.37500001,
+      "median_ns": 44696681.25
+    },
+    "backend_gpu_readback/test8-text": {
+      "mean_ns": 8714224.651587302,
+      "median_ns": 8707173.055555556
+    },
+    "backend_gpu_readback/testpdf-科幻电影中的ai伦理冲突-image": {
+      "mean_ns": 24194954.0,
+      "median_ns": 24166155.555555556
+    },
+    "backend_gpu_submit_only/test1-text": {
+      "mean_ns": 2734023.003968254,
+      "median_ns": 2733555.7142857146
+    },
+    "backend_gpu_submit_only/test10-text": {
+      "mean_ns": 2719086.9642857146,
+      "median_ns": 2725906.25
+    },
+    "backend_gpu_submit_only/test11-vector": {
+      "mean_ns": 4641565.77744709,
+      "median_ns": 4630213.75
+    },
+    "backend_gpu_submit_only/test2-vector": {
+      "mean_ns": 3110985.758403362,
+      "median_ns": 3115986.4145658263
+    },
+    "backend_gpu_submit_only/test8-text": {
+      "mean_ns": 2664310.298059965,
+      "median_ns": 2656463.0555555555
+    },
+    "stages_encode/test1-text@150": {
+      "mean_ns": 2334078.692307692,
+      "median_ns": 2317553.846153846
+    },
+    "stages_encode/test1-text@300": {
+      "mean_ns": 8228377.5,
+      "median_ns": 8144737.5
+    },
+    "stages_encode/test1-text@96": {
+      "mean_ns": 1041570.1740046928,
+      "median_ns": 1039198.8596491228
+    },
+    "stages_encode/test10-text@150": {
+      "mean_ns": 3612859.88888889,
+      "median_ns": 3592200.0
+    },
+    "stages_encode/test10-text@300": {
+      "mean_ns": 11860634.999999998,
+      "median_ns": 11818700.0
+    },
+    "stages_encode/test10-text@96": {
+      "mean_ns": 1652467.6666666665,
+      "median_ns": 1646277.7777777778
+    },
+    "stages_encode/test11-vector@150": {
+      "mean_ns": 3335489.3,
+      "median_ns": 3303275.0
+    },
+    "stages_encode/test11-vector@300": {
+      "mean_ns": 11357493.666666662,
+      "median_ns": 11283216.666666668
+    },
+    "stages_encode/test11-vector@96": {
+      "mean_ns": 1379956.4782608694,
+      "median_ns": 1360467.3913043477
+    },
+    "stages_encode/test2-vector@150": {
+      "mean_ns": 4733069.166666665,
+      "median_ns": 4669366.666666666
+    },
+    "stages_encode/test2-vector@300": {
+      "mean_ns": 16564814.5,
+      "median_ns": 16474025.0
+    },
+    "stages_encode/test2-vector@96": {
+      "mean_ns": 2193348.6666666665,
+      "median_ns": 2207886.666666667
+    },
+    "stages_encode/test7-vector@150": {
+      "mean_ns": 2708559.363636365,
+      "median_ns": 2691722.7272727275
+    },
+    "stages_encode/test7-vector@300": {
+      "mean_ns": 10691440.0,
+      "median_ns": 10798425.0
+    },
+    "stages_encode/test7-vector@96": {
+      "mean_ns": 1207125.7307692308,
+      "median_ns": 1195323.076923077
+    },
+    "stages_encode/test8-text@150": {
+      "mean_ns": 2844710.0000000005,
+      "median_ns": 2840527.2727272725
+    },
+    "stages_encode/test8-text@300": {
+      "mean_ns": 10166472.999999996,
+      "median_ns": 10179600.0
+    },
+    "stages_encode/test8-text@96": {
+      "mean_ns": 1238333.1739130437,
+      "median_ns": 1227226.0869565215
+    },
+    "stages_interpret/test1-text@150": {
+      "mean_ns": 15732586.5,
+      "median_ns": 15676750.0
+    },
+    "stages_interpret/test1-text@300": {
+      "mean_ns": 16325226.0,
+      "median_ns": 16421350.0
+    },
+    "stages_interpret/test1-text@96": {
+      "mean_ns": 16161438.0,
+      "median_ns": 16213825.0
+    },
+    "stages_interpret/test10-text@150": {
+      "mean_ns": 2163584.333333332,
+      "median_ns": 2181870.0
+    },
+    "stages_interpret/test10-text@300": {
+      "mean_ns": 2186957.6428571423,
+      "median_ns": 2177750.0
+    },
+    "stages_interpret/test10-text@96": {
+      "mean_ns": 2175699.846153846,
+      "median_ns": 2171746.153846154
+    },
+    "stages_interpret/test11-vector@150": {
+      "mean_ns": 10208092.333333336,
+      "median_ns": 10225183.333333334
+    },
+    "stages_interpret/test11-vector@300": {
+      "mean_ns": 9882079.666666664,
+      "median_ns": 9866883.333333334
+    },
+    "stages_interpret/test11-vector@96": {
+      "mean_ns": 10386149.333333332,
+      "median_ns": 10339300.0
+    },
+    "stages_interpret/test12-image@150": {
+      "mean_ns": 397404920.0,
+      "median_ns": 396603800.0
+    },
+    "stages_interpret/test12-image@300": {
+      "mean_ns": 395491150.0,
+      "median_ns": 394400050.0
+    },
+    "stages_interpret/test12-image@96": {
+      "mean_ns": 390958840.0,
+      "median_ns": 390776000.0
+    },
+    "stages_interpret/test2-vector@150": {
+      "mean_ns": 4280831.285714287,
+      "median_ns": 4231935.714285715
+    },
+    "stages_interpret/test2-vector@300": {
+      "mean_ns": 4389961.285714285,
+      "median_ns": 4362764.285714285
+    },
+    "stages_interpret/test2-vector@96": {
+      "mean_ns": 4461963.25,
+      "median_ns": 4449362.5
+    },
+    "stages_interpret/test4-image@150": {
+      "mean_ns": 4442155.0,
+      "median_ns": 4416712.5
+    },
+    "stages_interpret/test4-image@300": {
+      "mean_ns": 4436419.57142857,
+      "median_ns": 4435757.142857144
+    },
+    "stages_interpret/test4-image@96": {
+      "mean_ns": 4294499.0,
+      "median_ns": 4281900.0
+    },
+    "stages_interpret/test7-vector@150": {
+      "mean_ns": 6412377.8,
+      "median_ns": 6357910.0
+    },
+    "stages_interpret/test7-vector@300": {
+      "mean_ns": 6399715.2,
+      "median_ns": 6357930.0
+    },
+    "stages_interpret/test7-vector@96": {
+      "mean_ns": 6494528.2,
+      "median_ns": 6474820.0
+    },
+    "stages_interpret/test8-text@150": {
+      "mean_ns": 3782151.75,
+      "median_ns": 3810025.0
+    },
+    "stages_interpret/test8-text@300": {
+      "mean_ns": 3846659.375,
+      "median_ns": 3853218.75
+    },
+    "stages_interpret/test8-text@96": {
+      "mean_ns": 3903691.25,
+      "median_ns": 3899006.25
+    },
+    "stages_interpret/testpdf-科幻电影中的ai伦理冲突-image@150": {
+      "mean_ns": 78461568.33333333,
+      "median_ns": 78631625.0
+    },
+    "stages_interpret/testpdf-科幻电影中的ai伦理冲突-image@300": {
+      "mean_ns": 78506131.66666667,
+      "median_ns": 78859675.0
+    },
+    "stages_interpret/testpdf-科幻电影中的ai伦理冲突-image@96": {
+      "mean_ns": 76596476.66666667,
+      "median_ns": 76211525.0
+    },
+    "stages_parse/test1-text@150": {
+      "mean_ns": 1438981.142857142,
+      "median_ns": 1438285.714285714
+    },
+    "stages_parse/test1-text@300": {
+      "mean_ns": 1463411.2380952386,
+      "median_ns": 1457264.285714286
+    },
+    "stages_parse/test1-text@96": {
+      "mean_ns": 1442114.7142857143,
+      "median_ns": 1446635.7142857143
+    },
+    "stages_parse/test10-text@150": {
+      "mean_ns": 20774472.0,
+      "median_ns": 20993500.0
+    },
+    "stages_parse/test10-text@300": {
+      "mean_ns": 20770959.5,
+      "median_ns": 20992850.0
+    },
+    "stages_parse/test10-text@96": {
+      "mean_ns": 20287243.5,
+      "median_ns": 20306900.0
+    },
+    "stages_parse/test11-vector@150": {
+      "mean_ns": 219758.62120812808,
+      "median_ns": 211077.74526678145
+    },
+    "stages_parse/test11-vector@300": {
+      "mean_ns": 208508.7231055859,
+      "median_ns": 207284.1666666667
+    },
+    "stages_parse/test11-vector@96": {
+      "mean_ns": 196340.506579838,
+      "median_ns": 192693.02161654137
+    },
+    "stages_parse/test12-image@150": {
+      "mean_ns": 5392800.333333331,
+      "median_ns": 5379183.333333333
+    },
+    "stages_parse/test12-image@300": {
+      "mean_ns": 5388353.666666668,
+      "median_ns": 5344766.666666667
+    },
+    "stages_parse/test12-image@96": {
+      "mean_ns": 5475835.333333334,
+      "median_ns": 5367691.666666666
+    },
+    "stages_parse/test2-vector@150": {
+      "mean_ns": 1418478.2272727275,
+      "median_ns": 1417927.2727272727
+    },
+    "stages_parse/test2-vector@300": {
+      "mean_ns": 1530035.238095238,
+      "median_ns": 1512061.9047619049
+    },
+    "stages_parse/test2-vector@96": {
+      "mean_ns": 1413450.5909090908,
+      "median_ns": 1404131.8181818184
+    },
+    "stages_parse/test4-image@150": {
+      "mean_ns": 8643143.5,
+      "median_ns": 8866125.0
+    },
+    "stages_parse/test4-image@300": {
+      "mean_ns": 8471411.5,
+      "median_ns": 8450287.5
+    },
+    "stages_parse/test4-image@96": {
+      "mean_ns": 6723088.6,
+      "median_ns": 6570920.0
+    },
+    "stages_parse/test7-vector@150": {
+      "mean_ns": 1119147.437290463,
+      "median_ns": 1115968.793604651
+    },
+    "stages_parse/test7-vector@300": {
+      "mean_ns": 1125246.583076066,
+      "median_ns": 1127808.1836734691
+    },
+    "stages_parse/test7-vector@96": {
+      "mean_ns": 1119000.3807763455,
+      "median_ns": 1118507.2283950616
+    },
+    "stages_parse/test8-text@150": {
+      "mean_ns": 10334912.666666668,
+      "median_ns": 10347483.333333332
+    },
+    "stages_parse/test8-text@300": {
+      "mean_ns": 10244441.999999996,
+      "median_ns": 10251700.0
+    },
+    "stages_parse/test8-text@96": {
+      "mean_ns": 10391172.666666672,
+      "median_ns": 10356316.666666668
+    },
+    "stages_parse/testpdf-科幻电影中的ai伦理冲突-image@150": {
+      "mean_ns": 4569365.0,
+      "median_ns": 4563457.142857143
+    },
+    "stages_parse/testpdf-科幻电影中的ai伦理冲突-image@300": {
+      "mean_ns": 4530652.714285715,
+      "median_ns": 4515542.857142856
+    },
+    "stages_parse/testpdf-科幻电影中的ai伦理冲突-image@96": {
+      "mean_ns": 4590539.142857143,
+      "median_ns": 4491635.714285715
+    },
+    "stages_render_cpu/test1-text@150": {
+      "mean_ns": 14491131.5,
+      "median_ns": 14386100.0
+    },
+    "stages_render_cpu/test1-text@300": {
+      "mean_ns": 28185576.0,
+      "median_ns": 28652800.0
+    },
+    "stages_render_cpu/test1-text@96": {
+      "mean_ns": 10525769.333333332,
+      "median_ns": 10475566.666666668
+    },
+    "stages_render_cpu/test10-text@150": {
+      "mean_ns": 19193431.0,
+      "median_ns": 19175525.0
+    },
+    "stages_render_cpu/test10-text@300": {
+      "mean_ns": 34719663.0,
+      "median_ns": 34923650.0
+    },
+    "stages_render_cpu/test10-text@96": {
+      "mean_ns": 13900029.000000002,
+      "median_ns": 13839650.0
+    },
+    "stages_render_cpu/test11-vector@150": {
+      "mean_ns": 22232771.0,
+      "median_ns": 22288900.0
+    },
+    "stages_render_cpu/test11-vector@300": {
+      "mean_ns": 51775023.0,
+      "median_ns": 51995750.0
+    },
+    "stages_render_cpu/test11-vector@96": {
+      "mean_ns": 15063020.5,
+      "median_ns": 15014825.0
+    },
+    "stages_render_cpu/test12-image@150": {
+      "mean_ns": 384896480.0,
+      "median_ns": 384840700.0
+    },
+    "stages_render_cpu/test12-image@300": {
+      "mean_ns": 1170934580.0,
+      "median_ns": 1172420950.0
+    },
+    "stages_render_cpu/test12-image@96": {
+      "mean_ns": 180986230.0,
+      "median_ns": 180875750.0
+    },
+    "stages_render_cpu/test2-vector@150": {
+      "mean_ns": 23924023.0,
+      "median_ns": 23969475.0
+    },
+    "stages_render_cpu/test2-vector@300": {
+      "mean_ns": 48350480.0,
+      "median_ns": 48280550.0
+    },
+    "stages_render_cpu/test2-vector@96": {
+      "mean_ns": 16360065.5,
+      "median_ns": 16185175.0
+    },
+    "stages_render_cpu/test4-image@150": {
+      "mean_ns": 18086949.5,
+      "median_ns": 17984600.0
+    },
+    "stages_render_cpu/test4-image@300": {
+      "mean_ns": 71993718.33333333,
+      "median_ns": 71770625.0
+    },
+    "stages_render_cpu/test4-image@96": {
+      "mean_ns": 7537191.5,
+      "median_ns": 7507775.0
+    },
+    "stages_render_cpu/test7-vector@150": {
+      "mean_ns": 50920223.0,
+      "median_ns": 50953400.0
+    },
+    "stages_render_cpu/test7-vector@300": {
+      "mean_ns": 125307650.0,
+      "median_ns": 125622650.0
+    },
+    "stages_render_cpu/test7-vector@96": {
+      "mean_ns": 37893750.0,
+      "median_ns": 37794250.0
+    },
+    "stages_render_cpu/test8-text@150": {
+      "mean_ns": 10216516.666666662,
+      "median_ns": 10184100.0
+    },
+    "stages_render_cpu/test8-text@300": {
+      "mean_ns": 21278119.5,
+      "median_ns": 21354025.0
+    },
+    "stages_render_cpu/test8-text@96": {
+      "mean_ns": 7410627.25,
+      "median_ns": 7394662.5
+    },
+    "stages_render_cpu/testpdf-科幻电影中的ai伦理冲突-image@150": {
+      "mean_ns": 224549395.0,
+      "median_ns": 224174900.0
+    },
+    "stages_render_cpu/testpdf-科幻电影中的ai伦理冲突-image@300": {
+      "mean_ns": 833367470.0,
+      "median_ns": 832288600.0
+    },
+    "stages_render_cpu/testpdf-科幻电影中的ai伦理冲突-image@96": {
+      "mean_ns": 93883336.66666669,
+      "median_ns": 93779925.0
+    }
+  },
+  "environment": {
+    "arch": "x86_64",
+    "cores": 20,
+    "corpus_entries": 19,
+    "corpus_manifest_sha256": "0820b94ee2b6966a7fdff5bdd46b9e9ff648fdf3ee3aed929a6928c49123dabe",
+    "cpu": "Intel64 Family 6 Model 198 Stepping 2, GenuineIntel",
+    "git_commit": "2777fef85e6f4662551bea1bf0667bbbf19857e6",
+    "os": "windows"
+  },
+  "recorded_unix": 1789191296,
+  "schema": 1
+}

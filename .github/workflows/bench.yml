@@ -1,0 +1,58 @@
+name: bench
+
+# What this gate can and cannot do:
+#
+# CAN: assert deterministic display-list counters on the synthetic corpus (exact,
+# zero flakiness) and catch a hang or a pathological blow-up with a loose
+# wall-clock ceiling. Those live in `crates/zpdf-benches/tests/perf_gate.rs`.
+#
+# CANNOT: gate on wall-clock drift. A shared runner is too noisy for a 5%
+# threshold, and a gate that fails at random gets ignored — which is worse than
+# no gate. Relative before/after comparison is `baseline --compare`, run on a
+# machine that has the real corpus (which is deliberately not in this repo).
+#
+# No GPU here either: `adapters` on a hosted runner are software, and their
+# timings would describe the fallback path while looking authoritative.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Benchmarks are slow; allow a manual run for a branch without waiting for a PR.
+  workflow_dispatch:
+
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  perf-gate:
+    name: perf gate (deterministic counters)
+    runs-on: ubuntu-latest
+    # Generous: the gate itself is fast, but building the workspace is not.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # The synthetic corpus is in version control, so this needs nothing else.
+      - name: Perf gate (composition counters + loose wall ceiling)
+        run: cargo test -p zpdf-benches --test perf_gate -- --nocapture
+
+      # Load the whole bench harness on the synthetic corpus, so a broken bench
+      # target cannot rot unnoticed until someone tries to use it. `--quick`
+      # keeps it to seconds, and `ZPDF_BENCH_SYNTHETIC_ONLY` is honest about not
+      # having the real corpus.
+      - name: Bench harness smoke (synthetic only)
+        env:
+          ZPDF_BENCH_SYNTHETIC_ONLY: "1"
+        run: |
+          cargo bench -p zpdf-benches --bench stages -- --quick \
+            "stages/parse/rect_fills"

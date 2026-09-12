@@ -1,0 +1,23 @@
+--- pdf_main.ps	2007-05-09 21:55:01.000000000 +0200
++++ pdf_main.ps+	2007-07-29 13:37:11.000000000 +0200
+@@ -76,6 +76,10 @@
+   } loop
+   exch pop
+   {
++    % First check for the 'minimal' PS header since interactive 
++    % apps sending small strings via stdin might need response 
++    % from the PS interpreter (e.g., Apple PAP does this). 
++    dup 2 string .peekstring pop (%!) ne { 
+     dup 1023 string .peekstring { % "1024 string" exceeds current %stdin buffer"
+       (%PDF-1.) search {
+         3 1 roll pop pop
+@@ -118,6 +122,9 @@
+       pop cvx .runps   % too short for PDF
+     } ifelse
+   } {
++      cvx .runps      % found an initial (%!) 
++    } ifelse 
++  } { 
+     closefile % file was empty
+   } ifelse
+ } bind odef

@@ -581,3 +581,136 @@ pipelining 的收益假设是“每页 165ms 同步”，但热态每页仅 32ms
 **最终判定**：M2 pipelining 在热态净负，不应上线。代码已实现且 bit-identical，
 但速度不达预期。是否保留 API（供未来更深的 pipeline / 不同负载）或回退，
 待用户决策。
+
+---
+
+## 13. 测量阶段实测（2026-09-12）— 用测量取代推断
+
+上一轮（§10–12）的六个结论**全部建立在推断而非测量之上**：探针是临时 env-var 代码、
+跑完即删；语料标签手写且**有错**；只有 150 DPI 一个点；`encode` 阶段从未进入任何数字。
+本轮先补测量基建（§13.1），再取数（§13.2），**结果推翻了上一轮的多项结论**（§13.3）。
+
+### 13.1 测量基建（已落地）
+
+| 项 | 内容 |
+|---|---|
+| 五阶段外部计时 | `parse` / `interpret` / `render` / `encode` / `total`，各一个 criterion group（`benches/stages.rs`） |
+| 页内 7 类分解 | 后端 opt-in 类型化 stats：`outline-parse`/`glyph-raster`/`fill`/`stroke`/`image`/`clip`/`soft-mask` + 9 个确定性计数器，带断言测试（`zpdf-render::StageStats`、`zpdf-render-cpu`） |
+| interpret 分解 | `zpdf-content::InterpretStats`（shading 栅格化只在 interpret 可见，后端收到的是普通 image） |
+| DPI 曲线 | `{96, 150, 300}`，区分填充率绑定与几何绑定 |
+| 冷/暖两轴 | (a) **渲染器**级：fresh vs reused `CpuRenderer`；(b) **进程**级：`cli_process` 直接 spawn CLI。二者含义不同，不可混称"冷" |
+| 负载分类 | 由 DL 组成**测量**得出（`Composition`：三类工作量折算为可比的 device-px 覆盖），不再手写标签 |
+| 并行 ceiling | `benches/batch.rs`：rayon（仅 dev-dep）页级并行，1/2/4/8/16 线程，每任务独立 open |
+| 语料完整性 | 合成语料（9 个 / 22 KB）+ 生成器入 git；真语料与 failed 大文件走 manifest **硬失败**校验（缺失/哈希不符即报错，不再静默跳过） |
+| 回退门禁 | 检出 JSON baseline（机器指纹 + 语料 manifest 哈希 + git commit）+ `baseline --compare` 按 +5% 阈值非零退出；CI 只跑确定性计数器 + 宽松墙钟上限 |
+| GPU 有效性 | 适配器身份记录与校验（本机有 2 个**虚拟显示适配器**，`request_adapter` 静默选一个）；wall 与 gpu_pass 双数；**新增无 readback 的 submit-only 路径**（viewer 消费模式） |
+
+### 13.2 实测数据（release，150 DPI，Release CLI，RTX 5080 / Vulkan）
+
+**五阶段分解（ms）**：
+
+| 页 | 类 | parse | interpret | render | encode | 说明 |
+|---|---|---|---|---|---|---|
+| test8 | text | 10.3 | 3.8 | 9.8 | 2.8 | outline-parse 1.0 vs glyph-raster 7.2 |
+| test1 | text | 1.4 | **15.7** | 14.6 | 2.3 | **interpret > render** |
+| test10 | text | 20.8 | 2.2 | 19.7 | 3.6 | parse 21 ms 出乎意料 |
+| test11 | vector | 0.2 | 10.2 | 22.6 | 3.3 | 分类=vector 但 66% 时间在 glyph |
+| test2 | vector | 1.4 | 4.3 | 23.3 | 4.7 | |
+| test7 | vector | 1.1 | 6.4 | 50.8 | — | clip 占 35% |
+| testpdf-ai | image | 4.6 | **78.5** | 209 | — | soft-mask 占 74% |
+| test12 | image | 5.4 | **397** | 438 | — | interpret 与 render 同量级 |
+| test4 | image | 8.6 | 4.3 | 18.4 | — | image 占 91% |
+
+**页内 7 类分解（%）**：
+
+| 页 | 总 | glyph | image | soft-mask | clip | fill |
+|---|---|---|---|---|---|---|
+| test8 text | 9.6 | **85** (parse 1.0 / raster 7.2) | 1 | 0 | 1 | 0 |
+| test10 text | 19.5 | **94** | 0 | 0 | 0 | 0 |
+| test11 vector | 24.9 | 66 | 0 | 0 | 2 | 22 |
+| test7 vector | 51.3 | 24 | 0 | 13 | **35** | 23 |
+| testpdf-ai image | 223 | 1 | 18 | **74** | 2 | 0 |
+| test12 image | 438 | 3 | 21 | **69** | 2 | 0 |
+| test4 image | 18.4 | 0 | **91** | 0 | 3 | 0 |
+
+**进程级 vs 进程内**：同页 test8 — 进程内复用渲染器 9.84 ms、fresh 渲染器 9.89 ms、
+**CLI 进程 91.3 ms**（9.3×）。
+
+**GPU 双数（150 DPI，ms）**：
+
+| 页 | readback | submit-only | 比值 | CPU 对照 |
+|---|---|---|---|---|
+| test8 text | 8.65 | 2.67 | 3.2× | 9.8 |
+| test11 vector | 9.51 | 4.64 | 2.0× | 22.6 |
+| test7 vector | 44.9 | — | — | 50.8 |
+| testpdf-ai image | 24.1 | — | — | 209 |
+| test12 image | 25.0 | — | — | 438 |
+
+### 13.3 被推翻的结论
+
+1. **"testpdf-ai 3.6 s，是最大单一优化目标"**（§10.3/§10.4）→ 该页 release/150 DPI 实测
+   **209 ms**。3.6 s 是**带探针的**测量（§10.3 自己标注 `ZPDF_RENDER_PROF`），§10.4 的
+   "3 张双线性上采样图 = 3.5 s"拟合的是探针开销，不是生产成本。**上一轮据此判定的
+   "CPU 无优化空间"其前提不成立。**
+2. **"冷开销是字形轮廓提取"**（§10.1）→ 实测 outline-parse : glyph-raster = **1.0 : 7.2**
+   （test8），outline 提取至多占 glyph 时间 12%。上一轮 M1'（轮廓/Face 缓存）方向正确但
+   收益上限被高估；其"净收益边际"的结论恰好与实测一致。
+3. **"慢页瓶颈是图像双线性上采样"**（§10.4/§10.6）→ 两页最慢页的主导桶都是
+   **soft-mask 合成**（74% / 69%），图像只占 18–21%。上一轮的图像剔除方向（已证伪）
+   瞄错了 70% 的时间。
+4. **"clip 假设证伪，clip 只占 89ms/3663ms"**（§10.3/§10.4）→ 仅在 testpdf-ai 成立；
+   test7 上 clip 占 **35%**（17.9 ms / 51.3 ms）。
+5. **"parser/interpret 相对渲染很轻"**（§3.1/§3.2）→ 从不成立的假设。实测 interpret 占
+   流水线 10–47%：test1 的 interpret（15.7）**高于** render（14.6）；test12 的 interpret
+   **397 ms**，与 render（438 ms）同量级，且 **DPI 无关**（388/397/396 @ 96/150/300），
+   是几何绑定工作。**上一轮完全没测过这个阶段。**
+6. **"进程内冷 179ms vs 暖 9ms，20×"**（§10.1）→ 分解为两轴后：**渲染器**级 fresh vs reused
+   差异在噪声内（9.89 vs 9.84 ms），所以 20× **不是**渲染器生命周期效应；**进程**级
+   CLI/进程内 = 9.3×，来自进程启动 + parse + interpret + encode + PNG 写盘。
+7. **GPU "瓶颈是 device.poll 同步，资源池无收益"**（§12）→ 新增的 submit-only 路径
+   （**无任何同步**）仍有 **2.67 ms/页**，即**无同步时的成本是 host 端录制+分配**。
+   上一轮因为 wall 被同步主导而否定了资源池（M2）；**去掉同步后，per-page 分配正是成本本身**，
+   M2 值得重估。
+8. **`encode`（PNG）不是瓶颈**：实测 2.3–4.7 ms/页（流水线的 3–13%）。C2 候选**排除**。
+
+### 13.4 语料与方法论修正
+
+- 语料标签由**测量**取代手写：`test8` 分类为 **text**（glyph 覆盖 349k device px vs 图像
+  仅 4811 px —— 上一轮把这张 1163 字形的页当成 "text-heavy" 只是碰巧对了）；`zzztest/2`
+  为 **image**（2.9 M px，0 字形）。
+- **分类（覆盖率）≠ 耗时**：test11 按覆盖率为 vector（17.5 M device px）却把 66% 时间花在
+  glyph 上。两者都要看。
+- 旧 6 页集**完全没有 vector 页**；新 9 页集（每类 3 页，含各类**最重页**）覆盖 text/vector/image。
+- 单页选择采用"**每类最重 + 路径序补足**"：否则 29 M px 的 testpdf-ai 会因路径序第 5 而落选。
+- 300 DPI 页面成本 ×4，故采样数**按实测单次成本**选择（≥200 ms → 10 samples），
+  否则 criterion 会把 3 s 预算静默变成 40 s（实测单案例 39 s）。
+
+### 13.5 候选重排（本轮测量后的排序）
+
+| 排名 | 候选 | 依据 | 状态 |
+|---|---|---|---|
+| **1** | **soft-mask / blend-group 合成**（新） | 两个最慢页的 **69–74%**；上一轮从未测量 | 新候选 |
+| **2** | **interpret 阶段**（新） | 占流水线 10–47%；test12 **397 ms** 且 DPI 无关；其中 shading 栅格化只在 interpret 可见 | 新候选 |
+| **3** | GPU host 端 per-page 分配（= 重估 M2 资源池） | submit-only 无同步仍 2.67 ms/页 | 复活 |
+| **4** | 图像重采样 | test4 的 91%、慢页的 18–21% | 确认（非主导） |
+| **5** | clip（clip-heavy 矢量页） | test7 的 35% | 复活（限该类） |
+| 6 | 页级并行（C1） | ceiling **未测得**（batch target 本轮被 GPU OOM 中断） | 待测 |
+| — | ~~PNG encode~~ | 2.3–4.7 ms | **排除** |
+| — | ~~outline 提取缓存~~ | 上限 12% of glyph time | 降级 |
+| — | ~~渲染器生命周期/冷启动~~ | fresh ≈ reused | **排除** |
+
+### 13.6 本轮顺带修掉的缺陷
+
+- **submit-only 路径 GPU OOM**：无 readback 即无 `device.poll`，紧密循环堆积未回收提交，
+  数百页后设备报 Out Of Memory（4 GB 级 GPU 实测）。已修为非阻塞 `PollType::Poll` 抽干，
+  并加 300 次迭代回归测试。
+- **bench 静默测空**：缺失语料原先只打一行 stderr 然后跳过、退出码 0；已改为默认硬失败。
+- **bench 重复哈希**：每个 group 都重新校验 331.7 MiB 语料（5×）；已按进程缓存一次。
+- **`cli_process` 曾测 debug CLI**：debug 二进制单页 ~15 s，会与 release 数字并列却不可比；
+  已改为仅接受 release，否则带说明跳过。
+
+### 13.7 停机点
+
+按约定（决策 11）到此**停机**：测量基建 + 基线 + 候选排序已产出，**未改动任何渲染核心**。
+下一步需就"做候选 1（soft-mask）还是候选 2（interpret）"重新 grill 后再动手。
+

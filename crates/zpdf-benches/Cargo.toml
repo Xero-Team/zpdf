@@ -1,6 +1,6 @@
 [package]
 name = "zpdf-benches"
-description = "Criterion benchmarks for the zpdf parse → interpret → render pipeline"
+description = "Criterion benchmarks for the zpdf parse → interpret → render → encode pipeline"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,20 +10,62 @@ publish = false
 [features]
 default = ["cpu-render"]
 # `cpu-render` is on by default (mirrors the `zpdf` facade). `gpu-render` is
-# opt-in so `cargo bench` without the feature stays on the CPU path; enable
-# with `cargo bench --features gpu-render --bench render -- gpu_render`.
+# opt-in so `cargo bench` without it stays on the CPU path:
+#   cargo bench -p zpdf-benches --features gpu-render --bench backend
 cpu-render = ["zpdf/cpu-render"]
 gpu-render = ["zpdf/gpu-render"]
+# `bench-long` gates the `longform` target (whole documents — hundreds of
+# pages). Those runs take minutes per case, so they must never be part of a
+# default `cargo bench`; see `benches/longform.rs`.
+bench-long = []
 
 [dependencies]
 zpdf = { workspace = true, default-features = false }
 zpdf-core.workspace = true
 zpdf-display-list.workspace = true
+# Corpus-manifest integrity (see `src/manifest.rs`). The real-PDF corpus lives
+# under `tests/`, which the root .gitignore excludes, so its identity is
+# recorded as sha256 in a checked-in manifest instead. `sha2` is already a
+# workspace dependency (parser/document/writer); no new transitive deps.
+sha2.workspace = true
+# The `stages` bench measures the encode stage, and the honest way to do that is
+# the same encoder the CLI uses (`image::save_buffer` → the png codec), not a
+# re-implementation of it.
+image = { workspace = true }
+# Reading criterion's `estimates.json` into a checked-in baseline, and writing
+# that baseline out. Dev-only tooling in a `publish = false` crate: it never
+# reaches a library build, and serde_json is pure Rust (the zero-C-dependency
+# rule is untouched).
+serde_json = "1"
 
 [dev-dependencies]
 criterion = "0.8"
+# Page-level parallelism for the `batch` bench. A dev-dependency on purpose: the
+# measurement decides whether page-level parallelism is worth building into the
+# CLI, and no library crate should take a threading dependency before that
+# measurement exists.
+rayon = "1"
 
-# Bench targets. `harness = false` lets criterion own `main()`.
+# Bench targets. `harness = false` lets criterion own `main()`, and one target
+# per concern means `cargo bench --bench stages` runs just that one.
+#
+#   stages   — the five pipeline stages (parse/interpret/render/encode/total)
+#   backend  — CPU cold vs warm, GPU readback vs submit-only (dual numbers)
+#   batch    — multi-page throughput and the 1/2/4/8/16-thread scaling curve
+#   longform — whole documents; gated behind `bench-long`, never in a default run
 [[bench]]
-name = "render"
+name = "stages"
 harness = false
+
+[[bench]]
+name = "backend"
+harness = false
+
+[[bench]]
+name = "batch"
+harness = false
+
+[[bench]]
+name = "longform"
+harness = false
+required-features = ["bench-long"]

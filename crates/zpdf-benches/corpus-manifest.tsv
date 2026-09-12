@@ -1,0 +1,26 @@
+# zpdf corpus manifest — files NOT in version control.
+# Format: sha256<TAB>size<TAB>pages<TAB>class<TAB>coverage<TAB>path   ('-' = unknown)
+# coverage = measured device-pixel coverage of page 0; page selection prefers the
+# heaviest page per class, so this column is what keeps the expensive pages in the matrix.
+# Regenerate: cargo run -p zpdf-benches --bin corpus-manifest -- --update
+# Regenerate: cargo run -p zpdf-benches --bin corpus-manifest -- --classify
+#sha256                                                           size      pages class  coverage path
+12ddb366b50dacaceb3331211accb26afe694e9b449f5dfb53b89e4ea8593d23	1585572  	16   	text  	231211  	tests/test1/1.pdf
+61a51ee1b967f1ccaa05c6502d163d482f965b1f104eb7161f5575f74c5a3863	35182905 	73   	text  	282143  	tests/test10/1.pdf
+567ebdacbd77e71e4b25f9579f16c8f3fde38115bf4e4edc04aec0ce40f18808	710970   	12   	vector	17748468	tests/test11/1.pdf
+bafba3b1c0a82d7b2b631bf996ae4992c073c1b18477d1fea8cd83b77e51853f	8608633  	2    	image 	4586323 	tests/test12/1.pdf
+9e9d743a3cca42f4bb3de27397e6f7bd8eeda787a1289ce07435e2a0cfc498fb	23931383 	92   	empty 	0       	tests/test13/1.pdf
+ba61f8ada15b3b02bd4966388e22184f304cfbecbb1d96a9f5f58cee0bd504f9	32111986 	344  	empty 	0       	tests/test13/电报5.23(1).pdf
+9ea54b79147755341f2692cc8ef4a311582a8f9c4263b1645885265084d39c20	1605910  	62   	vector	4946242 	tests/test2/1.pdf
+7b84a9d150616c5b6687bcb01bba1c6c5cb0e871b6cdacc15ee464d31536d029	113344   	3    	text  	79154   	tests/test3/17.pdf
+7c2915ecce319d765ccfbc50083be65acc71413c062150309d02799691af49c4	8918960  	400  	image 	1800711 	tests/test4/1.pdf
+a75786462cecdde9f5fc3628ff8823b180d6cba1ba414d1f1b546ecf64f5c2ff	150070222	302  	image 	4352838 	tests/test5/1.pdf
+5cf1ad236b6e961437a4ce21941789d4e64271be0a5d5fe52b73733d6cc758a1	95869    	2    	text  	250673  	tests/test6/1.pdf
+957b81b434944e49662092b0622436d7126098e6d6e49b6cc3c0aabe67e76cbd	1744377  	64   	vector	4696309 	tests/test7/1.pdf
+23866deb01fdf51cbb5ae92fe8666bd7b35c37c2da515db80f63825c194e7669	16673863 	44   	text  	354795  	tests/test8/1.pdf
+fd388f557988b4983af2d1df83ed835fc44b4a479f579e40905a11ebfb629782	1146396  	7    	vector	924365  	tests/test9/1.pdf
+5b7ee941b747e86a65f8d67724111f934d29881ea430ac336ba08316d7c5be1e	27724798 	103  	image 	9483333 	tests/testpdf/13913-堕入深渊的性奴母女②.pdf
+e765f05ab60aca5010a4300ff2897dcf21fc5935ac01a307f8b1cf9351bdd422	5917614  	15   	image 	29304012	tests/testpdf/科幻电影中的AI伦理冲突.pdf
+488258aedf9b88ed73be55c267931d7cacb87cf225f1e07a6b8dc30c045d6bdf	1345475  	42   	vector	2782615 	tests/zzztest/1.pdf
+504fbeccd6cc7a4458e27ce0403dcb0c743d5e5b3ad9eb46aba9305557788020	14683672 	526  	image 	2910442 	tests/zzztest/2.pdf
+a6152715611fd524eb765dc3de6bf657e8054a3cddfe07da84acdc175a968e0e	15693091 	388  	text  	253813  	tests/zzztest/3.pdf
