@@ -714,3 +714,70 @@ pipelining 的收益假设是“每页 165ms 同步”，但热态每页仅 32ms
 按约定（决策 11）到此**停机**：测量基建 + 基线 + 候选排序已产出，**未改动任何渲染核心**。
 下一步需就"做候选 1（soft-mask）还是候选 2（interpret）"重新 grill 后再动手。
 
+### 13.8 候选 1 的子桶测量（2026-09-12）— 目标定位
+
+soft-mask 桶占两个最慢页总时间的 69–76%，但"soft-mask"作为一个数字无法指出该打哪里。
+加四个**归属**子桶后（`mask_render` / `mask_reduce` / `mask_fold` / `mask_composite`）：
+
+| 页 | soft-mask | **composite** | render | reduce | fold | 未计入 |
+|---|---|---|---|---|---|---|
+| testpdf-ai（12 组） | 152.3 ms | **82.4（54%）** | 22.0 | 5.7 | 29.6 | 12.5（8%） |
+| test12（18 组） | 282.6 ms | **143.7（51%）** | 69.7 | 39.0 | 18.6 | 11.6（4%） |
+| test7（1 组） | 6.5 ms | **6.5（100%）** | — | — | — | — |
+
+**最大单项 = 每个混合组一次整页 `draw_pixmap`**（组内容以组的混合模式 + 常量 alpha 合成回
+backdrop），在两页上约占**整页时间的 28–40%，集中在一个调用点**。mask 的渲染/归约/折叠
+加起来反而更小。
+
+**同时修正了一个本改动自己提出的错误断言**：子桶最初被写成 `soft_mask_ns` 的**划分**，并配了
+`sum == total` 的测试。实测否定之 —— 第一版只归属了约 40%，补上 composite 后仍只覆盖
+92–96%，余下是 `shift_plane` 与缓存维护。文档与测试已改为**归属**语义（`sum ≤ total`），
+并把这次否证记录下来，而不是悄悄删掉。
+
+## 14. 方向 1 实施方案（bbox-scope 混合组合成）— 待执行
+
+### 14.1 目标
+
+把 `pop_blend_group` 里那次整页 `draw_pixmap` 收窄到组的**实际绘制范围**。test12 的
+18 个组里多数只覆盖页面一小块。
+
+### 14.2 可行性依据
+
+tiny-skia 的 `draw_pixmap` 对所有混合模式都做正确的 Porter-Duff alpha 合成 ——
+**源 alpha = 0 处结果等于 backdrop**（倍数/滤色/HSL 族同理）。因此只要 bbox 是组"画过的
+东西"的**保守超集**，区间外不合成即**像素等价**。
+
+### 14.3 实现要点
+
+- 在 `CpuRenderer` 加 `dirty: Option<(u32, u32, u32, u32)>`，语义是**当前目标表面**的已
+  绘制范围；`push_blend_group` 时置空（新表面）。
+- 每个绘制点保守并入（并与 `current_clip` 的 bounds 相交）：
+  - 路径 → `tiny_skia::Path::bounds()` 再**向外扩 1px**（AA 边缘）；
+  - 描边 → 路径 bounds 外扩 `2 × width`（覆盖 miter 溢出）；
+  - 字形 → run 内**已变换**的各字形 bounds（不用 em-box 估计）；
+  - 图像 → 变换后四角 bbox。
+- `pop_blend_group` 用 `dirty` 作为 `draw_pixmap` 的目标子矩形；mask fold 循环的 `plane`
+  是整页的，可按同一矩形收窄。
+- **保守优先**：任何拿不准的情况（Type3、嵌套组、soft-mask 子渲染、`dirty == None`）
+  **直接退回整页**。宁可慢，不可错。
+
+### 14.4 执行前必须先做的一步（否则是猜测）
+
+先量**组内容的实际覆盖率**：在 `pop_blend_group` 里打印 `group_pixmap` 的非透明像素 bbox
+与页面之比。若覆盖率普遍接近整页，本方向的收益假设**不成立**，应转去做混合模式的快路径
+（此时同样先统计这两页实际出现的模式分布）。这一步能把"预测收益"变成实测数字，成本很低。
+
+### 14.5 收益预测（待验证）
+
+composite 占两页总时间 28–40%；若组内容平均覆盖页面 20%，该项可降约 4/5 → 整页约
+**−22% ~ −32%**。**这是预测，不是结论**，落地后必须用 `mask_composite_ns` 复测说话。
+
+### 14.6 验证协议（不可省）
+
+1. `cargo fmt` + clippy + 全部单测；
+2. **同批页 before/after 字节级 PNG 比对**（沿用已验证的 6 页：test8 / test10 / test3 /
+   test6 / zzztest2 / testpdf-ai，覆盖字形、图像、clip）—— 必须**完全一致**，不是 MAE 很小；
+3. `backend/cpu_stats` 复测 `mask_composite_ns` 确认收益；
+4. CPU↔GPU oracle 套件（`gpu_softmask` / `gpu_overprint` / `gpu_acceptance`）仍通过 —— 它们
+   会抓住任何 CPU 侧像素变化。
+
