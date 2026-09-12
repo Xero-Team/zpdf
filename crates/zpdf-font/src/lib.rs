@@ -1826,7 +1826,7 @@ fn wrap_cff_in_otf(cff_data: &[u8]) -> Vec<u8> {
 /// that have already been emitted. The capacity argument is therefore an
 /// allocation hint, not an eviction limit.
 pub struct FontCache {
-    fonts: HashMap<FontId, LoadedFont>,
+    fonts: HashMap<FontId, Arc<LoadedFont>>,
     name_to_id: HashMap<String, FontId>,
     next_id: FontId,
     bytes_used: u64,
@@ -1862,17 +1862,29 @@ impl FontCache {
     }
 
     pub fn get(&self, id: FontId) -> Option<&LoadedFont> {
-        self.fonts.get(&id)
+        self.fonts.get(&id).map(|font| font.as_ref())
     }
 
     pub fn get_by_name(&self, name: &str) -> Option<(FontId, &LoadedFont)> {
         let id = self.name_to_id.get(name)?;
         let font = self.fonts.get(id)?;
-        Some((*id, font))
+        Some((*id, font.as_ref()))
     }
 
     pub fn insert(&mut self, name: String, font: LoadedFont) -> FontId {
         self.try_insert_with_limit(name, font, u64::MAX)
+            .expect("font id space exhausted")
+    }
+
+    /// Admit a font another cache may already hold, without copying it.
+    ///
+    /// A document's pages routinely reference the same font objects, so a
+    /// document-level cache hands the same parsed font to each page's cache.
+    /// Cloning a `LoadedFont` instead would deep-copy its maps (`cid_to_gid`,
+    /// `to_unicode`) — for a CJK font that costs about what re-parsing does,
+    /// which is the whole thing this exists to avoid.
+    pub fn insert_shared(&mut self, name: String, font: Arc<LoadedFont>) -> FontId {
+        self.try_insert_shared_with_limit(name, font, u64::MAX)
             .expect("font id space exhausted")
     }
 
@@ -1883,6 +1895,16 @@ impl FontCache {
         &mut self,
         name: String,
         font: LoadedFont,
+        max_bytes: u64,
+    ) -> Option<FontId> {
+        self.try_insert_shared_with_limit(name, Arc::new(font), max_bytes)
+    }
+
+    /// [`Self::try_insert_with_limit`] for a font that is already shared.
+    pub fn try_insert_shared_with_limit(
+        &mut self,
+        name: String,
+        font: Arc<LoadedFont>,
         max_bytes: u64,
     ) -> Option<FontId> {
         if let Some(&existing_id) = self.name_to_id.get(&name) {

@@ -3,41 +3,70 @@ use zpdf_font::{CidWidths, FontCache, LoadedFont, PdfFontType};
 use zpdf_parser::PdfFile;
 
 use crate::page::PdfPage;
+use crate::SharedFonts;
 
-/// Load all fonts referenced by a page into a FontCache.
-pub fn load_page_fonts(file: &PdfFile, page: &PdfPage) -> FontCache {
+/// Load all fonts referenced by a page into a FontCache, reusing what the document
+/// has already parsed. Called through [`PdfDocument::load_page_fonts`], which owns the
+/// shared cache.
+pub(crate) fn load_page_fonts(
+    file: &PdfFile,
+    page: &PdfPage,
+    shared: &mut SharedFonts,
+) -> FontCache {
     let mut cache = FontCache::new();
     let max_bytes = file.limits().max_font_cache_bytes;
 
     for (name, &font_ref) in &page.resources.fonts {
-        match load_single_font(file, font_ref) {
-            Ok(font) => {
+        match shared.get(font_ref) {
+            // Parsed for an earlier page of this document: hand the same font to
+            // this page's cache. `LoadedFont` is immutable once built, so the
+            // pages can share one without copying it.
+            Some(font) => {
                 if cache
-                    .try_insert_with_limit(name.clone(), font, max_bytes)
+                    .try_insert_shared_with_limit(name.clone(), font, max_bytes)
                     .is_none()
                 {
-                    tracing::warn!(
-                        "font cache byte limit ({max_bytes}) or ID capacity reached; using placeholder for {name}"
-                    );
-                    let _ = cache.try_insert_with_limit(
-                        name.clone(),
-                        LoadedFont::new_placeholder(name.clone()),
-                        max_bytes,
-                    );
+                    insert_placeholder(&mut cache, name, max_bytes);
                 }
             }
-            Err(e) => {
-                tracing::debug!("font {name} ({font_ref}): fallback - {e}");
-                let _ = cache.try_insert_with_limit(
-                    name.clone(),
-                    LoadedFont::new_placeholder(name.clone()),
-                    max_bytes,
-                );
-            }
+            None => match load_single_font(file, font_ref) {
+                Ok(font) => {
+                    // Retain it for the rest of the document when the shared
+                    // budget allows; past that, later pages parse it again
+                    // rather than growing without bound.
+                    let font = shared.admit(font_ref, font, max_bytes);
+                    if cache
+                        .try_insert_shared_with_limit(name.clone(), font, max_bytes)
+                        .is_none()
+                    {
+                        insert_placeholder(&mut cache, name, max_bytes);
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("font {name} ({font_ref}): fallback - {e}");
+                    insert_placeholder(&mut cache, name, max_bytes);
+                }
+            },
         }
     }
 
     cache
+}
+
+/// Cache a placeholder under `name`, warning when even that does not fit.
+fn insert_placeholder(cache: &mut FontCache, name: &str, max_bytes: u64) {
+    if cache
+        .try_insert_with_limit(
+            name.to_string(),
+            LoadedFont::new_placeholder(name.to_string()),
+            max_bytes,
+        )
+        .is_none()
+    {
+        tracing::warn!(
+            "font cache byte limit ({max_bytes}) or ID capacity reached; using placeholder for {name}"
+        );
+    }
 }
 
 pub fn load_single_font(file: &PdfFile, font_ref: ObjectId) -> Result<LoadedFont> {

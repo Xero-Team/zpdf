@@ -43,10 +43,11 @@ pub use signature::{ByteRangeCoverage, CryptoStatus, DigestStatus, RevocationSta
 pub use structure::{StructElem, StructKid, StructRole, StructTree};
 pub use xmp::XmpMetadata;
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
-use zpdf_core::{Error, ParseLimits, PdfObject, Result};
-use zpdf_font::FontCache;
+use zpdf_core::{Error, ObjectId, ParseLimits, PdfObject, Result};
+use zpdf_font::{FontCache, LoadedFont};
 use zpdf_parser::PdfFile;
 
 pub struct PdfDocument {
@@ -60,6 +61,48 @@ pub struct PdfDocument {
     /// a full-document link scan stays O(pages × links + tree), not O(pages ×
     /// tree).
     named_dests: OnceLock<HashMap<Vec<u8>, PdfObject>>,
+    /// Fonts parsed so far, keyed by the font dictionary's object id, shared by
+    /// every page of this document — see [`Self::load_page_fonts`].
+    ///
+    /// Bounded by the same `max_font_cache_bytes` budget as a page cache: past
+    /// it, further fonts are parsed per page as before, so a document with an
+    /// unusual number of distinct fonts degrades to today's behaviour rather
+    /// than growing without limit.
+    shared_fonts: RefCell<SharedFonts>,
+}
+
+/// Fonts parsed so far by one document, with the byte total the budget is
+/// checked against.
+#[derive(Default)]
+pub(crate) struct SharedFonts {
+    fonts: HashMap<ObjectId, Arc<LoadedFont>>,
+    bytes: u64,
+}
+
+impl SharedFonts {
+    /// The font parsed for `id` by an earlier page of this document, if it was
+    /// retained.
+    pub(crate) fn get(&self, id: ObjectId) -> Option<Arc<LoadedFont>> {
+        self.fonts.get(&id).map(Arc::clone)
+    }
+
+    /// Retain `font` for the rest of the document when the shared budget allows,
+    /// and return it either way — wrapped in an `Arc` so the caller's page cache
+    /// can hold it too.
+    pub(crate) fn admit(
+        &mut self,
+        id: ObjectId,
+        font: LoadedFont,
+        max_bytes: u64,
+    ) -> Arc<LoadedFont> {
+        let font = Arc::new(font);
+        let bytes = font.estimated_cache_bytes();
+        if self.bytes.saturating_add(bytes) <= max_bytes {
+            self.bytes += bytes;
+            self.fonts.insert(id, Arc::clone(&font));
+        }
+        font
+    }
 }
 
 impl PdfDocument {
@@ -90,6 +133,7 @@ impl PdfDocument {
             catalog,
             acro_form: OnceLock::new(),
             named_dests: OnceLock::new(),
+            shared_fonts: RefCell::new(SharedFonts::default()),
         })
     }
 
@@ -150,8 +194,13 @@ impl PdfDocument {
     }
 
     /// Load all fonts referenced by a page.
+    ///
+    /// Fonts already parsed for an earlier page of this document are reused
+    /// rather than re-parsed: pages routinely share font objects (a 73-page
+    /// corpus document lists 136 font references over as few as 13 distinct
+    /// objects), and re-parsing is the dominant part of a page's setup cost.
     pub fn load_page_fonts(&self, page: &PdfPage) -> FontCache {
-        font_loader::load_page_fonts(self.file(), page)
+        font_loader::load_page_fonts(self.file(), page, &mut self.shared_fonts.borrow_mut())
     }
 
     /// Parse a page's annotations into renderable form (/Rect, /F, the
@@ -358,6 +407,42 @@ mod tests {
             doc.page_content_bytes(&page),
             Err(Error::StreamSizeLimit(6))
         ));
+    }
+
+    /// Pages of one document share the fonts they have in common: the second
+    /// page's load reuses the font parsed for the first instead of re-parsing
+    /// it. Parsing dominates a page's setup cost, and pages routinely reference
+    /// the same font objects (the corpus's 73-page document lists 136 font
+    /// references over 13 distinct objects).
+    #[test]
+    fn a_documents_pages_share_one_parsed_font() {
+        // Two pages, each with its own /Resources naming the *same* font object.
+        let pdf = test_util::build_pdf(&[
+            "<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Contents 6 0 R \
+             /Resources << /Font << /F1 5 0 R >> >> >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Contents 6 0 R \
+             /Resources << /Font << /F1 5 0 R >> >> >>",
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+            "<< /Length 0 >>\nstream\n\nendstream",
+        ]);
+        let doc = PdfDocument::open(pdf).unwrap();
+        let first = doc.load_page_fonts(&doc.page(0).unwrap());
+        let second = doc.load_page_fonts(&doc.page(1).unwrap());
+
+        let (first_id, first_font) = first.get_by_name("F1").expect("page 0 font");
+        let (second_id, second_font) = second.get_by_name("F1").expect("page 1 font");
+        assert_eq!(first_id, second_id, "each page numbers its own cache");
+        assert!(
+            std::ptr::eq(first_font, second_font),
+            "the second page must reuse the parsed font, not parse it again"
+        );
+        assert_eq!(
+            doc.shared_fonts.borrow().fonts.len(),
+            1,
+            "one distinct font object, one parse"
+        );
     }
 }
 
