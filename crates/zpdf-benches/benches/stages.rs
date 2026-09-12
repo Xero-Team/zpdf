@@ -80,6 +80,20 @@ fn interpret_stage(c: &mut Criterion) {
             let comp = Composition::of(&interpret(&parsed).expect("interpret").dl, scale);
             zpdf_benches::classify::maybe_report(&parsed.label(), &comp);
 
+            // One *instrumented* interpret for the per-category work split,
+            // printed beside the composition when `ZPDF_BENCH_DEBUG=1`. Separate
+            // from the timed run above on purpose: those clocks sit on every
+            // attributed operator, so the criterion numbers must come from an
+            // uninstrumented pass.
+            if let Ok((setup, work)) = zpdf_benches::interpret_instrumented(&parsed) {
+                zpdf_benches::classify::maybe_report_interpret_work(
+                    &parsed.label(),
+                    dpi,
+                    setup.setup_ns,
+                    &work,
+                );
+            }
+
             group.bench_with_input(
                 BenchmarkId::from_parameter(case_id(
                     &page_ref.label,

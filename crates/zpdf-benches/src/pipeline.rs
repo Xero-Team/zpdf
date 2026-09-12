@@ -37,6 +37,16 @@ pub struct PageSetup {
     /// Device pixels per page-unit (DPI / 72). Pre-computed so benches share one
     /// definition of `scale`.
     pub scale: f32,
+    /// Time spent *before* the interpreter starts: loading the page's fonts,
+    /// fetching its content bytes, resolving annotations / optional content /
+    /// output intents, and building the caches.
+    ///
+    /// Recorded because `stages/interpret` times this and the interpreter
+    /// together, and the two are wildly different sizes depending on the page:
+    /// a text page can spend nearly all of it here (re-parsing every font the
+    /// page lists), while an image page spends nearly all of it in the
+    /// interpreter. Without the split, "interpret" means neither.
+    pub setup_ns: u64,
 }
 
 /// A parsed document plus the resolved page — the `parse` stage's output and the
@@ -103,6 +113,29 @@ pub fn interpret_page(
     page_box: Rect,
     dpi: f32,
 ) -> Result<(PageSetup, zpdf::InterpretStats), String> {
+    interpret_page_impl(doc, page, page_box, dpi, false)
+}
+
+/// Interpret one page with the per-category work buckets enabled — the
+/// diagnostic path behind `ZPDF_BENCH_DEBUG=1`.
+///
+/// Kept separate from [`interpret_page`] rather than driven by a parameter of
+/// its own, so it is obvious at the call site that the *timed* benchmarks never
+/// measure the instrumented path: those clocks sit on every attributed operator.
+pub fn interpret_instrumented(
+    parsed: &ParsedPage,
+) -> Result<(PageSetup, zpdf::InterpretStats), String> {
+    interpret_page_impl(&parsed.doc, &parsed.page, parsed.page_box, parsed.dpi, true)
+}
+
+fn interpret_page_impl(
+    doc: &PdfDocument,
+    page: &PdfPage,
+    page_box: Rect,
+    dpi: f32,
+    work_timing: bool,
+) -> Result<(PageSetup, zpdf::InterpretStats), String> {
+    let setup_started = std::time::Instant::now();
     let mut font_cache = doc.load_page_fonts(page);
     let content_bytes = doc
         .page_content_bytes(page)
@@ -127,6 +160,7 @@ pub fn interpret_page(
         .with_images(&mut image_cache)
         .with_colors(&mut icc_cache)
         .with_annotations(&annotations)
+        .with_work_timing(work_timing)
         .with_operand_stack_limit(doc.file().limits().max_operand_stack_depth as usize);
     if let Some(oc) = &oc_config {
         interpreter = interpreter.with_optional_content(oc);
@@ -134,6 +168,8 @@ pub fn interpret_page(
     if let Some(profile) = oi_cmyk {
         interpreter = interpreter.with_output_intent_cmyk(profile);
     }
+    // Everything above is page setup; `InterpretStats::total_ns` starts here.
+    let setup_ns = setup_started.elapsed().as_nanos() as u64;
     let (dl, stats) = interpreter.interpret_with_stats(&content_bytes);
 
     Ok((
@@ -142,6 +178,7 @@ pub fn interpret_page(
             font_cache,
             image_cache,
             scale: dpi / 72.0,
+            setup_ns,
         },
         stats,
     ))

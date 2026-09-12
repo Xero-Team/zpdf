@@ -131,6 +131,35 @@ fn unpainted_value(mask: &SoftMask) -> u8 {
     }
 }
 
+/// One mask pixel's coverage: the kind's reduction followed by the `/TR` LUT.
+///
+/// Shared by the scoped reduce and — under stats — by the leak check that
+/// verifies the reduced region was enough, so the two definitions cannot drift
+/// apart. `#[inline]` because the reduce calls it once per plane pixel, where a
+/// call would otherwise cost more than the arithmetic.
+#[inline]
+fn mask_plane_value(px: tiny_skia::PremultipliedColorU8, mask: &SoftMask) -> u8 {
+    let v = match mask.kind {
+        SoftMaskKind::Luminosity => {
+            let a = px.alpha();
+            if a == 0 {
+                (unit(mask.backdrop_luma) * 255.0).round() as u8
+            } else {
+                let d = px.demultiply();
+                // Rec. 601 luma.
+                (0.299 * d.red() as f32 + 0.587 * d.green() as f32 + 0.114 * d.blue() as f32)
+                    .round()
+                    .min(255.0) as u8
+            }
+        }
+        SoftMaskKind::Alpha => px.alpha(),
+    };
+    match &mask.transfer {
+        Some(lut) => lut[v as usize],
+        None => v,
+    }
+}
+
 /// Translate a `w`×`h` coverage plane by whole device pixels, filling vacated
 /// areas with `fill`. Offsets at or beyond the plane size yield all-`fill`.
 fn shift_plane(base: &[u8], w: u32, h: u32, dx: i64, dy: i64, fill: u8) -> Vec<u8> {
@@ -1513,32 +1542,71 @@ impl<'a> CpuRenderer<'a> {
         let rendered = rendered?;
 
         let t_reduce = self.tick();
-        let mut plane = Vec::with_capacity((w * h) as usize);
-        for px in rendered.pixels() {
-            let v = match mask.kind {
-                SoftMaskKind::Luminosity => {
-                    let a = px.alpha();
-                    if a == 0 {
-                        (unit(mask.backdrop_luma) * 255.0).round() as u8
-                    } else {
-                        let d = px.demultiply();
-                        // Rec. 601 luma.
-                        (0.299 * d.red() as f32
-                            + 0.587 * d.green() as f32
-                            + 0.114 * d.blue() as f32)
-                            .round()
-                            .min(255.0) as u8
-                    }
+        // Only the region the mask's own group painted can hold anything but the
+        // value a fresh raster carries there (`/BC` luminance for a luminosity
+        // mask, transparency for an alpha one) — which is exactly what the
+        // transfer LUT maps `unpainted_value` to. So the plane is filled with
+        // that value and only the painted region is paid for pixel by pixel.
+        // `sub.dirty` is the same conservative superset the blend-group
+        // composite relies on, tracked by the sub-renderer as it drew.
+        let fill = unpainted_value(mask);
+        let painted = sub.dirty.filter(|r| !r.is_empty());
+        let mut plane = vec![fill; (w * h) as usize];
+        if let Some(region) = painted {
+            let width = rendered.width() as usize;
+            let pixels = rendered.pixels();
+            for y in region.y0 as usize..region.y1 as usize {
+                let row = y * width;
+                let (x0, x1) = (region.x0 as usize, region.x1 as usize);
+                let (Some(src), Some(out)) = (
+                    pixels.get(row + x0..row + x1),
+                    plane.get_mut(row + x0..row + x1),
+                ) else {
+                    continue;
+                };
+                for (px, out) in src.iter().zip(out.iter_mut()) {
+                    *out = mask_plane_value(*px, mask);
                 }
-                SoftMaskKind::Alpha => px.alpha(),
-            };
-            let v = match &mask.transfer {
-                Some(lut) => lut[v as usize],
-                None => v,
-            };
-            plane.push(v);
+            }
         }
         self.tock(t_reduce, |s| &mut s.mask_reduce_ns);
+
+        // Diagnostics, and a full pass — so only while collecting stats, and
+        // after the reduce's timer has closed so they cannot inflate the bucket
+        // they explain (their cost lands in `soft_mask_ns`, like the composite's
+        // coverage scan). The leak count is the invariant this shortcut rests
+        // on, and it has to be tested on the *value*, not on the raster's alpha:
+        // a luminosity mask's target starts out opaque, so every pixel there has
+        // non-zero alpha and an alpha-based check would report the whole page as
+        // leaking. What matters is whether a pixel *outside* the region would
+        // have reduced to something other than what the fill put there.
+        if self.stage_stats.is_some() {
+            let width = rendered.width() as usize;
+            let pixels = rendered.pixels();
+            let mut leak = 0u64;
+            for y in 0..h as usize {
+                let row = y * width;
+                for x in 0..width {
+                    let inside = painted.is_some_and(|r| {
+                        (r.x0 as usize..r.x1 as usize).contains(&x)
+                            && (r.y0 as usize..r.y1 as usize).contains(&y)
+                    });
+                    if inside {
+                        continue;
+                    }
+                    if pixels
+                        .get(row + x)
+                        .is_some_and(|px| mask_plane_value(*px, mask) != fill)
+                    {
+                        leak += 1;
+                    }
+                }
+            }
+            self.count(painted.map_or(0, PaintedBounds::area), |s| {
+                &mut s.mask_reduce_px
+            });
+            self.count(leak, |s| &mut s.mask_reduce_leak_px);
+        }
         Some(plane)
     }
 
@@ -3692,6 +3760,79 @@ mod tests {
             stats.mask_fold_ns > 0 || stats.soft_mask_ns > 0,
             "the mask path must have run"
         );
+    }
+
+    /// A mask whose own group paints only a small square: the mask raster is
+    /// page-sized, but only that square can hold anything but "unpainted", so the
+    /// reduce is confined to it. The invisible fill sits inside the *mask's*
+    /// command list, which is what forces the reference render to reduce the
+    /// whole plane — so the two renders differ in exactly the work under test.
+    ///
+    /// Both mask kinds are built because they fail differently: a luminosity
+    /// mask's target starts *opaque*, so its every pixel has non-zero alpha and a
+    /// paintedness test based on alpha would call the whole page painted.
+    fn small_mask_group_scene(kind: SoftMaskKind, filler: bool) -> DisplayList {
+        let mut mask_dl = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 100.0));
+        mask_dl.push(solid_rect(
+            Color::rgb(1.0, 1.0, 1.0),
+            20.0,
+            20.0,
+            40.0,
+            40.0,
+        ));
+        if filler {
+            mask_dl.push(invisible_page_fill(&mask_dl));
+        }
+        let mask = SoftMask {
+            kind,
+            commands: Arc::new(mask_dl),
+            offset: (0.0, 0.0),
+            backdrop_luma: 0.0,
+            transfer: None,
+        };
+
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 100.0));
+        dl.push(solid_rect(
+            Color::rgb(0.0, 0.0, 1.0),
+            0.0,
+            0.0,
+            100.0,
+            100.0,
+        ));
+        dl.push(group_cmd(BlendMode::Normal, true, 1.0, Some(mask)));
+        dl.push(solid_rect(
+            Color::rgb(1.0, 0.0, 0.0),
+            10.0,
+            10.0,
+            90.0,
+            90.0,
+        ));
+        dl.push(RenderCommand::PopBlendGroup);
+        dl
+    }
+
+    #[test]
+    fn mask_reduce_is_confined_to_what_the_mask_group_painted() {
+        for kind in [SoftMaskKind::Alpha, SoftMaskKind::Luminosity] {
+            let stats = assert_scoped_is_pixel_identical(
+                |filler| small_mask_group_scene(kind, filler),
+                1.0,
+                None,
+                None,
+            );
+            assert_eq!(
+                stats.mask_reduce_leak_px, 0,
+                "{kind:?}: no pixel outside the reduced region may differ from \
+                 what the fill put there"
+            );
+            // The 20×20 square plus one pixel of anti-aliased edge on each side.
+            assert!(
+                (20 * 20..=22 * 22).contains(&stats.mask_reduce_px),
+                "{kind:?}: the reduce must cover the mask group's 20×20 (± its AA \
+                 edge), not the whole 100×100 plane — got {}",
+                stats.mask_reduce_px
+            );
+        }
     }
 
     /// Glyph ink inside a group. Marked from each *transformed* outline's own

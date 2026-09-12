@@ -23,8 +23,8 @@ pub mod pipeline;
 pub use classify::{Composition, LoadClass};
 pub use corpus::{Corpus, DocRef, PageRef};
 pub use pipeline::{
-    encode_png, estimate_pixels, interpret, interpret_with_stats, load_page, parse, PageSetup,
-    ParsedPage, Rgba,
+    encode_png, estimate_pixels, interpret, interpret_instrumented, interpret_with_stats,
+    load_page, parse, PageSetup, ParsedPage, Rgba,
 };
 
 /// The verified corpus, cached for the process.

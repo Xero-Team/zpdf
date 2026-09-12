@@ -323,6 +323,31 @@ pub fn maybe_report(label: &str, comp: &Composition) {
     }
 }
 
+/// Print the interpret stage's per-category work split, behind the same
+/// `ZPDF_BENCH_DEBUG=1` gate as [`maybe_report`].
+///
+/// `setup_ns` is the part of the criterion number that happens *before* the
+/// interpreter runs — on a text page it is most of it, so a report that omitted
+/// it would let the categories below be read as the whole stage.
+///
+/// The buckets themselves are attribution, not a partition — the formatting
+/// (and that caveat) lives on [`zpdf::InterpretStats::describe`], next to the
+/// numbers it describes.
+pub fn maybe_report_interpret_work(
+    label: &str,
+    dpi: u32,
+    setup_ns: u64,
+    stats: &zpdf::InterpretStats,
+) {
+    if std::env::var("ZPDF_BENCH_DEBUG").as_deref() == Ok("1") {
+        eprintln!(
+            "zpdf-benches: {label}@{dpi} setup={:.2}ms | {}",
+            setup_ns as f64 / 1e6,
+            stats.describe()
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -140,7 +140,9 @@ pub struct StageStats {
     /// scratch raster, including that raster's allocation and backdrop fill.
     pub mask_render_ns: u64,
     /// Attribution: reducing the scratch raster to a 1-byte coverage plane
-    /// (per-pixel demultiply + Rec.601 luma + /TR LUT).
+    /// (per-pixel demultiply + Rec.601 luma + /TR LUT), confined to the region
+    /// the mask's own group painted — see
+    /// [`StageStats::mask_reduce_leak_px`].
     pub mask_reduce_ns: u64,
     /// Attribution: folding a plane into a group's pixels (per-pixel per-channel
     /// multiply/divide over the full raster).
@@ -178,6 +180,21 @@ pub struct StageStats {
     /// value is a backend bug that silently drops content, so this is asserted
     /// in tests, where a deterministic counter belongs.
     pub mask_composite_leak_px: u64,
+    /// Coverage-plane pixels the mask reduce actually processed, summed over
+    /// every mask rasterized on the page, against `page area × masks` for a
+    /// full-plane reduce.
+    ///
+    /// The mask's scratch raster is page-sized, but only the part its group
+    /// painted can carry anything other than the unpainted value, so the rest of
+    /// the plane is filled with that value instead of being computed per pixel.
+    pub mask_reduce_px: u64,
+    /// Painted pixels found *outside* the region the mask reduce was confined to.
+    ///
+    /// **Always 0**, for the same reason as
+    /// [`StageStats::mask_composite_leak_px`]: the fill stands in for every pixel
+    /// the group did not paint, so a painted pixel outside the region would keep
+    /// the fill value instead of its own coverage.
+    pub mask_reduce_leak_px: u64,
     /// Whole-page wall time, the reference denominator for the buckets above.
     pub total_ns: u64,
 

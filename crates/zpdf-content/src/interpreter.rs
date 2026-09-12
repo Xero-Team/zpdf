@@ -148,9 +148,15 @@ pub struct ContentInterpreter<'a> {
     /// Latches when a structural memory limit is exceeded so every enclosing
     /// form/pattern loop stops after restoring its local state.
     resource_limit_hit: bool,
-    /// Interpret-stage timings; see [`InterpretStats`]. Collected always — the
-    /// clock reads are per-shading, not per-operator.
+    /// Interpret-stage timings; see [`InterpretStats`]. The whole-stage and
+    /// shading clocks are always on (one pair per page, one per shading raster);
+    /// the per-category work buckets inside it are opt-in — see
+    /// [`Self::with_work_timing`].
     stats: InterpretStats,
+    /// Collect the per-category work buckets in `stats`. Off by default: those
+    /// clocks sit on every attributed operator, and a vector page can carry
+    /// hundreds of thousands of them.
+    work_timing: bool,
 }
 
 /// State for soft-mask reuse across the tiles of one `paint_tiling_pattern`
@@ -470,6 +476,50 @@ impl Default for GraphicsState {
     }
 }
 
+/// Which category of interpret work a step belongs to, for
+/// [`InterpretStats`]'s per-category buckets.
+///
+/// Deliberately coarse: the question these buckets answer is *which kind of
+/// content* a page spends its interpret time on (an image page spending 80 % in
+/// `Image` is a different problem from one spreading it across `Path` and
+/// `Paint`), not which handler is hot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Work {
+    Path,
+    Paint,
+    Text,
+    Image,
+    Form,
+    Color,
+}
+
+impl Work {
+    /// The category an operator belongs to, or `None` for operators not worth a
+    /// clock read.
+    ///
+    /// Only operators whose handlers do real work are listed. `q`/`Q`/`gs`/`cm`
+    /// and the other state setters are the *majority* of the operators on most
+    /// pages and are individually free, so attributing them would buy a lot of
+    /// clock reads and no information.
+    ///
+    /// `Do` is absent on purpose: whether it draws an image or a form is known
+    /// only once the XObject is resolved, so those two categories are timed at
+    /// that dispatch point instead.
+    fn of_operator(op: &str) -> Option<Self> {
+        Some(match op {
+            "m" | "l" | "c" | "v" | "y" | "re" | "h" => Self::Path,
+            "f" | "F" | "f*" | "B" | "B*" | "b" | "b*" | "S" | "s" | "n" | "W" | "W*" => {
+                Self::Paint
+            }
+            "BT" | "ET" | "Td" | "TD" | "Tm" | "T*" | "Tf" | "Tj" | "TJ" | "'" | "\"" => Self::Text,
+            "cs" | "CS" | "sc" | "scn" | "SC" | "SCN" | "g" | "G" | "rg" | "RG" | "k" | "K" => {
+                Self::Color
+            }
+            _ => return None,
+        })
+    }
+}
+
 impl<'a> ContentInterpreter<'a> {
     pub fn new(page_rect: Rect) -> Self {
         let limits = ParseLimits::default();
@@ -525,10 +575,69 @@ impl<'a> ContentInterpreter<'a> {
             max_marked_content_depth: 128,
             resource_limit_hit: false,
             stats: InterpretStats::default(),
+            work_timing: false,
         }
     }
 
     /// Override the emitted-command ceiling (see [`DEFAULT_MAX_COMMANDS`]).
+    /// Collect the per-category work buckets in [`InterpretStats`] — which kind
+    /// of content the page spends its interpret time on.
+    ///
+    /// Off by default. These clocks sit on every attributed operator rather than
+    /// once per page, so a page with hundreds of thousands of path operators
+    /// would pay for the measurement; the whole-stage and shading timings are
+    /// always collected and need no flag.
+    pub fn with_work_timing(mut self, enabled: bool) -> Self {
+        self.work_timing = enabled;
+        self
+    }
+
+    /// Start a stopwatch for one step of interpret work, or `None` when it is
+    /// not worth timing (an unattributed operator, or collection off). Pair with
+    /// [`Self::tock_work`].
+    fn start_work(&self, work: Option<Work>) -> Option<(Work, zpdf_core::time::Instant)> {
+        if !self.work_timing {
+            return None;
+        }
+        work.map(|work| (work, zpdf_core::time::Instant::now()))
+    }
+
+    /// Close a [`Self::start_work`] bucket. A no-op when `started` is `None`, so
+    /// every call site is unconditional in the code and free in production.
+    fn tock_work(&mut self, started: Option<(Work, zpdf_core::time::Instant)>) {
+        let Some((work, started)) = started else {
+            return;
+        };
+        let ns = started.elapsed().as_nanos() as u64;
+        let stats = &mut self.stats;
+        match work {
+            Work::Path => {
+                stats.path_ns += ns;
+                stats.path_ops += 1;
+            }
+            Work::Paint => {
+                stats.paint_ns += ns;
+                stats.paint_ops += 1;
+            }
+            Work::Text => {
+                stats.text_ns += ns;
+                stats.text_ops += 1;
+            }
+            Work::Image => {
+                stats.image_ns += ns;
+                stats.image_ops += 1;
+            }
+            Work::Form => {
+                stats.form_ns += ns;
+                stats.form_ops += 1;
+            }
+            Work::Color => {
+                stats.color_ns += ns;
+                stats.color_ops += 1;
+            }
+        }
+    }
+
     pub fn with_command_limit(mut self, max_commands: usize) -> Self {
         self.max_commands = max_commands;
         self
@@ -789,11 +898,20 @@ impl<'a> ContentInterpreter<'a> {
                     }
                 }
                 ContentToken::Operator(op) => {
+                    // Per-category attribution, off unless
+                    // `with_work_timing` asked for it. The nested form/mask
+                    // loop below is deliberately *not* instrumented: its wall
+                    // time is already inside `form_ns`, and re-attributing its
+                    // operators would double count against that.
+                    let work = self.start_work(Work::of_operator(&op));
                     self.execute_operator(&op);
+                    self.tock_work(work);
                     self.operand_stack.clear();
                 }
                 ContentToken::InlineImage { dict, data } => {
+                    let work = self.start_work(Some(Work::Image));
                     self.do_inline_image(dict, data);
+                    self.tock_work(work);
                     self.operand_stack.clear();
                 }
             }
@@ -3097,7 +3215,12 @@ impl<'a> ContentInterpreter<'a> {
         self.current.blend_mode = BlendMode::Normal;
         self.current.fill_alpha = 1.0;
         self.current.stroke_alpha = 1.0;
+        // A soft mask's /G group *is* a form, drawn into a detached command
+        // list — attributed as form work, which is where a mask-heavy page's
+        // interpret time will show up.
+        let work = self.start_work(Some(Work::Form));
         self.do_form_xobject(Some(g_ref), &g_stream, file);
+        self.tock_work(work);
         self.current = saved_state;
         self.oc_hidden_from = saved_oc_hidden;
         let mask_dl = std::mem::replace(&mut self.display_list, saved_dl);
@@ -3183,8 +3306,16 @@ impl<'a> ContentInterpreter<'a> {
         let subtype = stream.dict.get_name("Subtype").unwrap_or_default();
 
         match subtype {
-            "Image" => self.do_image_xobject(xobj_id, stream),
-            "Form" => self.do_form_xobject(Some(xobj_id), stream, file),
+            "Image" => {
+                let work = self.start_work(Some(Work::Image));
+                self.do_image_xobject(xobj_id, stream);
+                self.tock_work(work);
+            }
+            "Form" => {
+                let work = self.start_work(Some(Work::Form));
+                self.do_form_xobject(Some(xobj_id), stream, file);
+                self.tock_work(work);
+            }
             _ => {
                 tracing::warn!("unknown XObject subtype: {subtype}");
             }
@@ -6371,6 +6502,92 @@ mod tests {
         assert!(stats.total_ns > 0, "total_ns must bracket the interpret");
         #[cfg(target_arch = "wasm32")]
         assert!(stats.is_empty() || stats.total_ns == 0);
+    }
+
+    /// The work buckets are opt-in: with no flag, an instrumented operator must
+    /// cost nothing and report nothing, while the always-on timings still work.
+    #[test]
+    fn work_buckets_are_off_unless_requested() {
+        let (_, stats) = ContentInterpreter::new(Rect::new(0.0, 0.0, 612.0, 792.0))
+            .interpret_with_stats(b"1 0 0 rg 100 200 300 400 re f 0 0 m 10 10 l S");
+        for (name, ns) in [
+            ("path", stats.path_ns),
+            ("paint", stats.paint_ns),
+            ("text", stats.text_ns),
+            ("image", stats.image_ns),
+            ("form", stats.form_ns),
+            ("color", stats.color_ns),
+        ] {
+            assert_eq!(ns, 0, "{name} bucket must stay empty without the flag");
+        }
+        assert_eq!(
+            stats.path_ops
+                + stats.paint_ops
+                + stats.text_ops
+                + stats.image_ops
+                + stats.form_ops
+                + stats.color_ops,
+            0,
+            "counters are part of the opt-in collection too"
+        );
+    }
+
+    /// With collection requested, each kind of operator lands in its own bucket
+    /// and the counters agree with what the content actually did.
+    #[test]
+    fn work_buckets_attribute_each_kind_of_operator() {
+        let (dl, stats) = ContentInterpreter::new(Rect::new(0.0, 0.0, 612.0, 792.0))
+            .with_work_timing(true)
+            .interpret_with_stats(b"1 0 0 rg 100 200 300 400 re f 0 0 m 10 10 l S");
+
+        assert_eq!(dl.commands.len(), 2, "one fill, one stroke");
+        assert_eq!(stats.color_ops, 1, "one `rg`");
+        assert_eq!(stats.path_ops, 3, "`re` + `m` + `l`");
+        assert_eq!(stats.paint_ops, 2, "`f` + `S`");
+        assert_eq!(
+            stats.text_ops + stats.image_ops + stats.form_ops,
+            0,
+            "this content has no text, image or form work"
+        );
+
+        // Wall-clock buckets say nothing on a platform without a clock.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            assert!(
+                stats.paint_ns > 0,
+                "paint work must be attributed: {stats:?}"
+            );
+            let attributed = stats.path_ns
+                + stats.paint_ns
+                + stats.text_ns
+                + stats.image_ns
+                + stats.form_ns
+                + stats.color_ns;
+            assert!(
+                attributed <= stats.total_ns,
+                "attribution {attributed} must not exceed the total {}",
+                stats.total_ns
+            );
+        }
+    }
+
+    /// An instrumented run must emit exactly what production emits: these
+    /// numbers are read as a description of the page, so a divergence in the
+    /// output would be a rendering bug, not a measurement artefact.
+    #[test]
+    fn work_timing_does_not_change_the_display_list() {
+        let page_rect = Rect::new(0.0, 0.0, 612.0, 792.0);
+        for content in [
+            &b"1 0 0 rg 100 200 300 400 re f"[..],
+            &b"q 0.5 g 100 100 50 50 re f Q 10 10 20 20 re f"[..],
+            &b"0 0 1 RG 2 w 0 0 m 100 100 l S"[..],
+        ] {
+            let plain = ContentInterpreter::new(page_rect).interpret(content);
+            let (measured, _) = ContentInterpreter::new(page_rect)
+                .with_work_timing(true)
+                .interpret_with_stats(content);
+            assert_eq!(plain.commands.len(), measured.commands.len());
+        }
     }
 
     /// A shading's cost is only observable in this stage — the backends receive
