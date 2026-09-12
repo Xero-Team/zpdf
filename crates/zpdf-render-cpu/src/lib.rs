@@ -64,6 +64,13 @@ pub struct CpuRenderer<'a> {
     /// Box-filtered image variants reused by repeated draws at the same device
     /// footprint (common for patterns and repeated XObjects).
     downscaled_images: HashMap<(ImageId, u32, u32), Arc<[u8]>>,
+    /// Opt-in per-stage timings. `None` means "not collecting": every [`Self::tick`]
+    /// then returns `None` and the hot path pays one branch, no clock read.
+    /// See [`zpdf_render::StageStats`] for why collection is opt-in, and for the
+    /// caveat that it makes the measured path slightly slower than production.
+    stage_stats: Option<zpdf_render::StageStats>,
+    /// Page start, read only while collecting, for `StageStats::total_ns`.
+    page_start: Option<zpdf_core::time::Instant>,
 }
 
 /// Identity of a [`SoftMask`] up to its offset: command list and transfer
@@ -267,6 +274,45 @@ impl<'a> CpuRenderer<'a> {
             soft_mask_cache_bytes: 0,
             soft_mask_depth: 0,
             downscaled_images: HashMap::new(),
+            stage_stats: None,
+            page_start: None,
+        }
+    }
+
+    /// Enable per-stage timing collection (off by default).
+    ///
+    /// Collection adds clock reads to the render hot path, so a measurement with
+    /// it enabled is a slightly slower path than a consumer runs. Benches report
+    /// the timing-off run as the headline number and this as a labelled
+    /// diagnostic. Retrieve with [`RenderBackend::stage_stats`].
+    pub fn with_stage_timing(mut self, enabled: bool) -> Self {
+        self.stage_stats = enabled.then(zpdf_render::StageStats::default);
+        self
+    }
+
+    /// Start a stopwatch, or `None` when not collecting. Pair with [`Self::tock`].
+    fn tick(&self) -> Option<zpdf_core::time::Instant> {
+        self.stage_stats
+            .as_ref()
+            .map(|_| zpdf_core::time::Instant::now())
+    }
+
+    /// Add `start..now` to one bucket. A no-op when `start` is `None` (timing
+    /// off), so instrumentation never branches per call site.
+    fn tock(
+        &mut self,
+        start: Option<zpdf_core::time::Instant>,
+        bucket: impl FnOnce(&mut zpdf_render::StageStats) -> &mut u64,
+    ) {
+        if let (Some(start), Some(stats)) = (start, self.stage_stats.as_mut()) {
+            *bucket(stats) += start.elapsed().as_nanos() as u64;
+        }
+    }
+
+    /// Add `n` to one counter, or nothing when not collecting.
+    fn count(&mut self, n: u64, counter: impl FnOnce(&mut zpdf_render::StageStats) -> &mut u64) {
+        if let Some(stats) = self.stage_stats.as_mut() {
+            *counter(stats) += n;
         }
     }
 
@@ -381,14 +427,19 @@ impl<'a> CpuRenderer<'a> {
     }
 
     fn render_fill(&mut self, path: &Path, rule: &FillRule, paint_spec: &Paint, alpha: f32) {
+        let t = self.tick();
         let Some(skia_path) = self.build_skia_path(path) else {
-            return;
+            return self.tock(t, |s| &mut s.fill_ns);
         };
         let paint = match paint_spec {
             Paint::Solid(c) => Self::color_to_paint(c, alpha),
-            _ => return,
+            // Non-solid paints are resolved by the interpreter into images
+            // before they reach a backend, so Pattern/Shading here paints
+            // nothing (see `StageStats`: shading is an interpret-stage cost).
+            _ => return self.tock(t, |s| &mut s.fill_ns),
         };
         let fill_rule = Self::fill_rule_to_skia(rule);
+        let mut painted = false;
         if let Some(ref mut pixmap) = self.pixmap {
             pixmap.fill_path(
                 &skia_path,
@@ -397,18 +448,23 @@ impl<'a> CpuRenderer<'a> {
                 tiny_skia::Transform::identity(),
                 self.current_clip.as_ref(),
             );
+            painted = true;
         }
+        self.tock(t, |s| &mut s.fill_ns);
+        self.count(painted as u64, |s| &mut s.fills);
     }
 
     fn render_stroke(&mut self, path: &Path, style: &StrokeStyle, paint_spec: &Paint, alpha: f32) {
+        let t = self.tick();
         let Some(skia_path) = self.build_skia_path(path) else {
-            return;
+            return self.tock(t, |s| &mut s.stroke_ns);
         };
         let paint = match paint_spec {
             Paint::Solid(c) => Self::color_to_paint(c, alpha),
-            _ => return,
+            _ => return self.tock(t, |s| &mut s.stroke_ns),
         };
         let stroke = self.build_skia_stroke(style);
+        let mut painted = false;
         if let Some(ref mut pixmap) = self.pixmap {
             pixmap.stroke_path(
                 &skia_path,
@@ -417,7 +473,10 @@ impl<'a> CpuRenderer<'a> {
                 tiny_skia::Transform::identity(),
                 self.current_clip.as_ref(),
             );
+            painted = true;
         }
+        self.tock(t, |s| &mut s.stroke_ns);
+        self.count(painted as u64, |s| &mut s.strokes);
     }
 
     /// Device-space tiny-skia stroke parameters for `style`.
@@ -482,8 +541,16 @@ impl<'a> CpuRenderer<'a> {
             _ => return,
         };
 
+        // Counted once the run is known to actually paint, so the counter means
+        // "glyph instances drawn" rather than "glyph runs seen".
+        self.count(run.glyphs.len() as u64, |s| &mut s.glyphs);
         if font.is_type3() {
+            // Type3 glyphs are content streams interpreted per glyph (see
+            // `render_type3_glyphs`). Their cost lands in `glyph_raster_ns`:
+            // they *are* glyph rasterization, just not outline-based.
+            let t = self.tick();
             self.render_type3_glyphs(run, font, &paint);
+            self.tock(t, |s| &mut s.glyph_raster_ns);
         } else {
             self.render_outline_glyphs(run, font, &paint);
         }
@@ -494,8 +561,9 @@ impl<'a> CpuRenderer<'a> {
     }
 
     fn push_clip(&mut self, path: &Path, rule: &FillRule) {
+        let t = self.tick();
         let Some(pixmap) = self.pixmap.as_ref() else {
-            return;
+            return self.tock(t, |s| &mut s.clip_ns);
         };
         let (pw, ph) = (pixmap.width(), pixmap.height());
         let mask_bytes = pw as u64 * ph as u64;
@@ -508,20 +576,20 @@ impl<'a> CpuRenderer<'a> {
             || self.clip_mask_bytes.saturating_add(mask_bytes) > MAX_CLIP_MASK_BYTES
         {
             self.clip_stack.push(ClipFrame::Skipped);
-            return;
+            return self.tock(t, |s| &mut s.clip_ns);
         }
 
         let Some(skia_path) = self.build_skia_path(path) else {
             // A non-finite/out-of-range clip path: keep push/pop balanced.
             self.clip_stack.push(ClipFrame::Skipped);
-            return;
+            return self.tock(t, |s| &mut s.clip_ns);
         };
 
         let mut mask = match tiny_skia::Mask::new(pw, ph) {
             Some(m) => m,
             None => {
                 self.clip_stack.push(ClipFrame::Skipped);
-                return;
+                return self.tock(t, |s| &mut s.clip_ns);
             }
         };
         self.clip_pixel_spent += pw as u64 * ph as u64;
@@ -563,9 +631,12 @@ impl<'a> CpuRenderer<'a> {
         };
         self.clip_stack.push(frame);
         self.current_clip = Some(mask);
+        self.tock(t, |s| &mut s.clip_ns);
+        self.count(1, |s| &mut s.clips_pushed);
     }
 
     fn pop_clip(&mut self) {
+        let t = self.tick();
         match self.clip_stack.pop() {
             // Budget-skipped push: leave the active clip untouched.
             Some(ClipFrame::Skipped) => {}
@@ -585,6 +656,7 @@ impl<'a> CpuRenderer<'a> {
             }
             None => {}
         }
+        self.tock(t, |s| &mut s.clip_ns);
     }
 
     /// Intersect the clip with a stroked path's outline. tiny-skia masks cannot
@@ -777,10 +849,15 @@ impl<'a> CpuRenderer<'a> {
             return;
         }
 
+        // Timed from here: folding the mask and compositing the group is the
+        // actual blend-group cost, while the guards above do no work.
+        let t = self.tick();
+
         let mut group_pixmap = match self.pixmap.take() {
             Some(p) => p,
             None => {
                 self.pixmap = Some(entry.pixmap);
+                self.tock(t, |s| &mut s.soft_mask_ns);
                 return;
             }
         };
@@ -823,6 +900,7 @@ impl<'a> CpuRenderer<'a> {
         self.blend_surface_bytes = self
             .blend_surface_bytes
             .saturating_sub(group_pixmap.width() as u64 * group_pixmap.height() as u64 * 4);
+        self.tock(t, |s| &mut s.soft_mask_ns);
     }
 
     /// Dispatch the four painting commands to their renderers (shared by the
@@ -984,26 +1062,37 @@ impl<'a> CpuRenderer<'a> {
             return None;
         }
 
+        // Timed from here: the guards above do no real work, while everything
+        // below is either a plane shift or a full mask-group sub-render.
+        let t = self.tick();
+
         // Page-space offset → device pixels (device y grows downward).
         let dx = (mask.offset.0 * self.scale).round() as i64;
         let dy = (-mask.offset.1 * self.scale).round() as i64;
 
         let key = SoftMaskPlaneKey::new(mask);
         if let Some(base) = self.soft_mask_planes.get(&key) {
+            // Clone out of the map before any `&mut self` accounting call.
+            let base = Arc::clone(base);
             if dx == 0 && dy == 0 {
-                return Some(Arc::clone(base));
+                self.tock(t, |s| &mut s.soft_mask_ns);
+                return Some(base);
             }
-            return Some(Arc::from(shift_plane(
-                base,
-                w,
-                h,
-                dx,
-                dy,
-                unpainted_value(mask),
-            )));
+            let shifted = Arc::from(shift_plane(&base, w, h, dx, dy, unpainted_value(mask)));
+            self.tock(t, |s| &mut s.soft_mask_ns);
+            return Some(shifted);
         }
 
-        let base: Arc<[u8]> = Arc::from(self.rasterize_soft_mask(mask)?);
+        let base: Arc<[u8]> = match self.rasterize_soft_mask(mask) {
+            Some(plane) => {
+                self.count(1, |s| &mut s.soft_mask_planes);
+                Arc::from(plane)
+            }
+            None => {
+                self.tock(t, |s| &mut s.soft_mask_ns);
+                return None;
+            }
+        };
         let base_bytes = base.len() as u64;
         if base_bytes <= self.max_soft_mask_cache_bytes {
             if self.soft_mask_cache_bytes.saturating_add(base_bytes)
@@ -1015,18 +1104,13 @@ impl<'a> CpuRenderer<'a> {
             self.soft_mask_planes.insert(key, Arc::clone(&base));
             self.soft_mask_cache_bytes = self.soft_mask_cache_bytes.saturating_add(base_bytes);
         }
-        if dx == 0 && dy == 0 {
-            Some(base)
+        let plane = if dx == 0 && dy == 0 {
+            base
         } else {
-            Some(Arc::from(shift_plane(
-                &base,
-                w,
-                h,
-                dx,
-                dy,
-                unpainted_value(mask),
-            )))
-        }
+            Arc::from(shift_plane(&base, w, h, dx, dy, unpainted_value(mask)))
+        };
+        self.tock(t, |s| &mut s.soft_mask_ns);
+        Some(plane)
     }
 
     /// Render a soft mask's group commands offscreen (same page geometry as
@@ -1084,6 +1168,11 @@ impl<'a> CpuRenderer<'a> {
                 .saturating_add(self.blend_stack.len())
                 .saturating_add(1),
             downscaled_images: HashMap::new(),
+            // The sub-renderer's work is attributed to the *parent's*
+            // `soft_mask_ns` bucket (the parent times this whole call), so
+            // collecting here too would double-count it.
+            stage_stats: None,
+            page_start: None,
         };
         for cmd in &mask.commands.commands {
             let _ = sub.execute(cmd);
@@ -1171,6 +1260,12 @@ impl<'a> CpuRenderer<'a> {
             );
             return;
         }
+
+        // Image work is the largest single measured CPU cost on the image-bound
+        // page (three full-page bilinear upsamples, ~5.4 s), so it gets its own
+        // bucket. Started after validation, so trivial rejections are not
+        // counted as image work.
+        let t = self.tick();
         // PDF images occupy the unit square [0,1]×[0,1] in user space, mapped by
         // the CTM. Image sample space has its origin at the TOP-left with y
         // pointing DOWN (PDF spec §8.9.5.2), so sample row 0 maps to the top
@@ -1244,7 +1339,10 @@ impl<'a> CpuRenderer<'a> {
         };
         let src = match tiny_skia::PixmapRef::from_bytes(data, w, h) {
             Some(p) => p,
-            None => return,
+            None => {
+                self.tock(t, |s| &mut s.image_ns);
+                return;
+            }
         };
         let iw = w as f32;
         let ih = h as f32;
@@ -1272,11 +1370,13 @@ impl<'a> CpuRenderer<'a> {
             ..Default::default()
         };
 
-        let pixmap = match self.pixmap.as_mut() {
-            Some(p) => p,
-            None => return,
-        };
-        pixmap.draw_pixmap(0, 0, src, &paint, transform, self.current_clip.as_ref());
+        let mut drawn = false;
+        if let Some(pixmap) = self.pixmap.as_mut() {
+            pixmap.draw_pixmap(0, 0, src, &paint, transform, self.current_clip.as_ref());
+            drawn = true;
+        }
+        self.tock(t, |s| &mut s.image_ns);
+        self.count(drawn as u64, |s| &mut s.images);
     }
 
     fn render_image(&mut self, draw: &ImageDraw) {
@@ -1295,11 +1395,20 @@ impl<'a> CpuRenderer<'a> {
         let upem = font.units_per_em as f32;
 
         for glyph in &run.glyphs {
-            let outline = match font.glyph_outline(glyph.glyph_id) {
-                Some(o) => o,
-                None => continue,
+            // The split that §10.1/§10.2 of the performance notes could only
+            // infer: outline *extraction* (font charstring/glyf work) versus
+            // turning that outline into a device path and rasterizing it. Cold
+            // rendering measured 20x warm without this boundary, so the two are
+            // timed separately.
+            let t_parse = self.tick();
+            let outline = font.glyph_outline(glyph.glyph_id);
+            self.tock(t_parse, |s| &mut s.outline_parse_ns);
+            let Some(outline) = outline else {
+                continue;
             };
+            self.count(1, |s| &mut s.glyph_outlines_parsed);
 
+            let t_raster = self.tick();
             // Transform each glyph outline point:
             // glyph_coord (font units) → text space → user space → page space → pixel space
             let skia_path = self.build_outline_transformed_path(
@@ -1316,6 +1425,7 @@ impl<'a> CpuRenderer<'a> {
                     );
                 }
             }
+            self.tock(t_raster, |s| &mut s.glyph_raster_ns);
         }
     }
 
@@ -1756,6 +1866,16 @@ impl<'a> RenderBackend for CpuRenderer<'a> {
     type Error = CpuRenderError;
 
     fn begin_page(&mut self, info: &PageRenderInfo) -> Result<(), Self::Error> {
+        // Start the page clock and clear the previous page's buckets first, so
+        // `total_ns` spans allocation through `end_page` — per-page raster
+        // allocation is real cost on a multi-page run, not just the drawing.
+        self.page_start = self
+            .stage_stats
+            .as_ref()
+            .map(|_| zpdf_core::time::Instant::now());
+        if self.stage_stats.is_some() {
+            self.stage_stats = Some(zpdf_render::StageStats::default());
+        }
         // A failed replacement must not leave the previous page available to a
         // later `end_page` call.
         self.pixmap = None;
@@ -1950,11 +2070,20 @@ impl<'a> RenderBackend for CpuRenderer<'a> {
         self.deadline = None;
         self.skipped_blend_depth = 0;
         self.blend_surface_bytes = 0;
+        // Close the page clock last, so `total_ns` includes any blend groups
+        // drained above and any over-budget unwinding.
+        if let (Some(start), Some(stats)) = (self.page_start.take(), self.stage_stats.as_mut()) {
+            stats.total_ns = start.elapsed().as_nanos() as u64;
+        }
         Ok(RenderedPage {
             width,
             height,
             data,
         })
+    }
+
+    fn stage_stats(&self) -> Option<zpdf_render::StageStats> {
+        self.stage_stats
     }
 }
 
@@ -2540,5 +2669,209 @@ mod tests {
             unpainted_value(&mask(SoftMaskKind::Alpha, 0.0, Some(inverting))),
             255
         );
+    }
+
+    // -- Opt-in stage timing (`StageStats`) --------------------------------
+    //
+    // The point of these tests is that stage timing cannot silently rot the way
+    // the previous round's env-var probes did (they were deleted after the
+    // investigation, so nothing caught their drift). Counters are asserted
+    // exactly; wall-clock buckets are asserted non-zero on targets that have a
+    // clock.
+
+    /// zpdf-font's own fixture: glyph 1 is a rectangle, so it always yields a
+    /// real outline to extract and rasterize.
+    const VAR_TTF: &[u8] = include_bytes!("../../zpdf-font/tests/fixtures/var.ttf");
+
+    fn var_fonts() -> (FontCache, zpdf_font::FontId) {
+        let mut fonts = FontCache::new();
+        let font = zpdf_font::LoadedFont::new_with_data(
+            zpdf_font::PdfFontType::TrueType,
+            "ZpdfVar".into(),
+            VAR_TTF.to_vec(),
+            zpdf_font::CidWidths::new(1000.0),
+        );
+        let id = fonts.insert("ZpdfVar".into(), font);
+        (fonts, id)
+    }
+
+    fn rect_path(x0: f64, y0: f64, x1: f64, y1: f64) -> Path {
+        let mut p = Path::new();
+        p.move_to(Point::new(x0, y0));
+        p.line_to(Point::new(x1, y0));
+        p.line_to(Point::new(x1, y1));
+        p.line_to(Point::new(x0, y1));
+        p.close();
+        p
+    }
+
+    fn fill_cmd(x0: f64, y0: f64, x1: f64, y1: f64) -> RenderCommand {
+        RenderCommand::FillPath {
+            path: rect_path(x0, y0, x1, y1),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(0.0, 0.0, 0.0)),
+            alpha: 1.0,
+            overprint: None,
+        }
+    }
+
+    fn glyph_run_cmd(font_id: zpdf_font::FontId) -> RenderCommand {
+        RenderCommand::DrawGlyphRun(GlyphRun {
+            font_id,
+            font_size: 12.0,
+            glyphs: vec![PositionedGlyph {
+                glyph_id: 1,
+                x: 0.0,
+                y: 0.0,
+                advance: 12.0,
+            }],
+            paint: Paint::Solid(Color::rgb(0.0, 0.0, 0.0)),
+            alpha: 1.0,
+            overprint: None,
+            transform: Matrix::new(1.0, 0.0, 0.0, 1.0, 2.0, 2.0),
+            h_scale: 1.0,
+        })
+    }
+
+    /// One page exercising every command family, rendered with timing enabled.
+    fn mixed_page_stats() -> zpdf_render::StageStats {
+        let (fonts, font_id) = var_fonts();
+        let mut images = ImageCache::new();
+        let image_id = images.insert(DecodedImage {
+            width: 4,
+            height: 4,
+            data: vec![128; 4 * 4 * 4],
+            has_alpha: false,
+            premultiplied: true,
+        });
+
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 40.0, 40.0));
+        dl.push(fill_cmd(2.0, 2.0, 12.0, 12.0));
+        dl.push(fill_cmd(14.0, 2.0, 24.0, 12.0));
+        dl.push(stroke_cmd(
+            line_path(2.0, 20.0, 30.0, 20.0),
+            StrokeStyle {
+                width: 1.0,
+                ..Default::default()
+            },
+        ));
+        dl.push(RenderCommand::PushClip {
+            path: rect_path(0.0, 0.0, 30.0, 30.0),
+            rule: FillRule::NonZero,
+        });
+        dl.push(glyph_run_cmd(font_id));
+        dl.push(RenderCommand::DrawImage(ImageDraw {
+            image_id,
+            transform: Matrix::new(10.0, 0.0, 0.0, 10.0, 2.0, 30.0),
+            alpha: 1.0,
+        }));
+        dl.push(RenderCommand::PopClip);
+
+        let mut renderer = CpuRenderer::new()
+            .with_fonts(&fonts)
+            .with_images(&images)
+            .with_stage_timing(true);
+        renderer.render_display_list(&dl, 1.0).expect("render");
+        renderer.stage_stats().expect("timing was enabled")
+    }
+
+    #[test]
+    fn stage_timing_is_off_by_default() {
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 20.0, 20.0));
+        dl.push(fill_cmd(2.0, 2.0, 10.0, 10.0));
+        let mut renderer = CpuRenderer::new();
+        renderer.render_display_list(&dl, 1.0).expect("render");
+        assert_eq!(
+            renderer.stage_stats(),
+            None,
+            "collection must be opt-in; the production path pays nothing"
+        );
+    }
+
+    #[test]
+    fn stage_timing_counts_each_command_family() {
+        let s = mixed_page_stats();
+        assert_eq!(s.fills, 2, "two fills");
+        assert_eq!(s.strokes, 1, "one stroke");
+        assert_eq!(s.images, 1, "one image");
+        assert_eq!(s.clips_pushed, 1, "one clip push");
+        assert_eq!(s.glyphs, 1, "one glyph instance");
+        assert_eq!(
+            s.glyph_outlines_parsed, 1,
+            "an outline font extracts one outline per glyph instance"
+        );
+        assert!(s.total_ns > 0, "end_page must stamp total_ns");
+        assert!(!s.is_empty());
+    }
+
+    /// The split the performance notes could only infer: extracting an outline
+    /// from the font program vs rasterizing it. Both must land in their own
+    /// bucket, and neither may swallow the other.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn stage_timing_buckets_are_non_zero() {
+        let s = mixed_page_stats();
+        assert!(s.fill_ns > 0, "fill bucket: {s:?}");
+        assert!(s.stroke_ns > 0, "stroke bucket: {s:?}");
+        assert!(s.image_ns > 0, "image bucket: {s:?}");
+        assert!(s.clip_ns > 0, "clip bucket: {s:?}");
+        assert!(s.outline_parse_ns > 0, "outline-parse bucket: {s:?}");
+        assert!(s.glyph_raster_ns > 0, "glyph-raster bucket: {s:?}");
+        assert_eq!(s.glyph_ns(), s.outline_parse_ns + s.glyph_raster_ns);
+        // Buckets are attribution, not a partition: they may overlap and need
+        // not sum to the page total, but each must be smaller than it.
+        for (name, ns) in [
+            ("fill", s.fill_ns),
+            ("stroke", s.stroke_ns),
+            ("image", s.image_ns),
+            ("clip", s.clip_ns),
+            ("glyph", s.glyph_ns()),
+            ("soft_mask", s.soft_mask_ns),
+        ] {
+            assert!(
+                ns <= s.total_ns,
+                "{name} bucket {ns}ns exceeds total {}ns",
+                s.total_ns
+            );
+        }
+    }
+
+    /// A page with no soft mask or blend group must report zero there — the
+    /// negative control, so a non-zero bucket means real work rather than a
+    /// mis-attributed neighbour.
+    #[test]
+    fn stage_timing_soft_mask_is_zero_without_transparency() {
+        let s = mixed_page_stats();
+        assert_eq!(s.soft_mask_ns, 0, "no transparency on this page");
+        assert_eq!(s.soft_mask_planes, 0, "no masks rasterized");
+    }
+
+    /// Stats describe exactly one page: a second page must not inherit the
+    /// first page's counters.
+    #[test]
+    fn stage_timing_resets_between_pages() {
+        let (fonts, font_id) = var_fonts();
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 40.0, 40.0));
+        dl.push(glyph_run_cmd(font_id));
+        let mut renderer = CpuRenderer::new()
+            .with_fonts(&fonts)
+            .with_stage_timing(true);
+
+        renderer.render_display_list(&dl, 1.0).expect("first page");
+        assert_eq!(renderer.stage_stats().unwrap().glyphs, 1);
+
+        // A page with only a fill: the glyph counter must come back to zero.
+        let mut dl2 = DisplayList::new(Rect::new(0.0, 0.0, 40.0, 40.0));
+        dl2.push(fill_cmd(2.0, 2.0, 10.0, 10.0));
+        renderer
+            .render_display_list(&dl2, 1.0)
+            .expect("second page");
+        let s = renderer.stage_stats().unwrap();
+        assert_eq!(
+            s.glyphs, 0,
+            "second page must not inherit page one's glyphs"
+        );
+        assert_eq!(s.fills, 1);
+        assert_eq!(s.glyph_outlines_parsed, 0);
     }
 }

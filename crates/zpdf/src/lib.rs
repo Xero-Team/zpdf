@@ -8,6 +8,7 @@ pub use zpdf_color::{IccCache, IccTransform};
 pub use zpdf_content::interpreter::ContentInterpreter;
 pub use zpdf_content::output_intent_cmyk_profile;
 pub use zpdf_content::search::{search_spans, SearchHit};
+pub use zpdf_content::stats::InterpretStats;
 pub use zpdf_content::tables::{detect_tables, detect_tables_with_rules, RuleLine, Table};
 pub use zpdf_content::text::{spans_to_text, struct_ordered_text, TextSpan};
 pub use zpdf_core::*;
@@ -27,7 +28,7 @@ pub use zpdf_document::{
 pub use zpdf_font::FontCache;
 pub use zpdf_image::{DecodedImage, ImageCache};
 pub use zpdf_parser::PdfFile;
-pub use zpdf_render::RenderBackend;
+pub use zpdf_render::{RenderBackend, StageStats};
 pub use zpdf_writer::{
     copy_object_graph, extract_pages, rewrite_pdf, AnnotationSpec, FormFiller, IncrementalWriter,
     InfoUpdate, MarkupKind, ObjectIdMap, RewriteOptions, SignatureOptions, SigningKey, StampImage,

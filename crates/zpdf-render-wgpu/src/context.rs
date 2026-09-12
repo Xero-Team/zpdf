@@ -17,6 +17,84 @@ pub const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 /// Stencil-only format used for clip masks.
 pub const STENCIL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Stencil8;
 
+/// Which adapter a [`GpuContext`] is bound to, and the device settings that
+/// affect its numbers.
+///
+/// Recorded because a GPU timing is uninterpretable without it. `request_adapter`
+/// picks an adapter silently, and a machine can present several: this repo's
+/// development machine exposes a remote-desktop mirror and an Android-emulator
+/// adapter alongside the real GPU. A benchmark result that does not name its
+/// adapter cannot be compared against anything — including a rerun of itself.
+///
+/// Also carries the settings that change rendering *and* timing: MSAA level
+/// (`sample_count`), the texture-dimension cap, and whether timestamp queries
+/// are available at all (without them `last_gpu_time_ns()` is permanently
+/// `None`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdapterIdentity {
+    pub name: String,
+    pub vendor: u32,
+    pub device: u32,
+    /// `wgpu::DeviceType` rendered as text (`"DiscreteGpu"`, `"Cpu"`, ...).
+    pub device_type: String,
+    /// `wgpu::Backend` rendered as text (`"Vulkan"`, `"Dx12"`, ...).
+    pub backend: String,
+    pub driver: String,
+    pub driver_info: String,
+    /// MSAA level actually in use (4, 2, or 1).
+    pub sample_count: u32,
+    pub max_texture_dim: u32,
+    /// False means GPU pass timing is unavailable and `last_gpu_time_ns()` will
+    /// always be `None` — not a bug, an adapter capability.
+    pub timestamps_supported: bool,
+}
+
+impl AdapterIdentity {
+    /// Stable one-line fingerprint for a baseline artifact, containing only the
+    /// fields that change a measurement.
+    ///
+    /// Deliberately excludes `driver_info` (which carries a version string that
+    /// moves on its own) — compare on this, and keep the full record for context.
+    pub fn fingerprint(&self) -> String {
+        format!(
+            "{}|{}|{}|msaa{}|maxdim{}|timestamps={}",
+            self.name,
+            self.backend,
+            self.driver,
+            self.sample_count,
+            self.max_texture_dim,
+            self.timestamps_supported
+        )
+    }
+
+    /// True for software/CPU adapters (`ZPDF_GPU_FORCE_FALLBACK=1`, or a machine
+    /// with no usable GPU). Their timings describe the fallback path, not GPU
+    /// rendering, so a baseline must not be compared across this boundary.
+    pub fn is_software(&self) -> bool {
+        self.device_type == "Cpu"
+    }
+
+    /// Human-readable multi-line block for a report header.
+    pub fn describe(&self) -> String {
+        format!(
+            "{}\n  backend: {}   device type: {}\n  driver: {} ({})\n  \
+             msaa x{}   max texture dim: {}   timestamps: {}",
+            self.name,
+            self.backend,
+            self.device_type,
+            self.driver,
+            self.driver_info,
+            self.sample_count,
+            self.max_texture_dim,
+            if self.timestamps_supported {
+                "available"
+            } else {
+                "UNAVAILABLE — GPU pass time will be None"
+            }
+        )
+    }
+}
+
 /// Shared GPU device state.
 pub struct GpuContext {
     pub instance: wgpu::Instance,
@@ -42,6 +120,8 @@ pub struct GpuContext {
     /// Set by the uncaptured-error handler instead of wgpu's default panic, so a
     /// render can fail with a [`WgpuRenderError`] rather than abort the process.
     device_error: Arc<Mutex<Option<String>>>,
+    /// Which adapter this context is bound to — see [`AdapterIdentity`].
+    identity: AdapterIdentity,
 }
 
 impl GpuContext {
@@ -159,13 +239,37 @@ impl GpuContext {
             );
         }
 
+        let info = adapter.get_info();
+        let identity = AdapterIdentity {
+            name: info.name,
+            vendor: info.vendor,
+            device: info.device,
+            device_type: format!("{:?}", info.device_type),
+            backend: format!("{:?}", info.backend),
+            driver: info.driver,
+            driver_info: info.driver_info,
+            sample_count,
+            max_texture_dim,
+            timestamps_supported,
+        };
+
         tracing::debug!(
-            adapter = ?adapter.get_info(),
+            adapter = %identity.name,
+            backend = %identity.backend,
+            device_type = %identity.device_type,
+            driver = %identity.driver,
             sample_count,
             max_texture_dim,
             timestamps_supported,
             "zpdf wgpu context initialized"
         );
+        if identity.is_software() {
+            tracing::warn!(
+                adapter = %identity.name,
+                "zpdf wgpu bound to a SOFTWARE adapter — timings describe the \
+                 fallback path, not GPU rendering"
+            );
+        }
 
         let pipelines = Pipelines::build(&device, COLOR_FORMAT, sample_count);
 
@@ -196,7 +300,14 @@ impl GpuContext {
             timestamps_supported,
             timestamp_period,
             device_error,
+            identity,
         })
+    }
+
+    /// Which adapter this context is bound to. Record this alongside any GPU
+    /// timing: without it the number cannot be compared to anything.
+    pub fn identity(&self) -> &AdapterIdentity {
+        &self.identity
     }
 
     /// Clear any recorded device error (call before starting a page render).

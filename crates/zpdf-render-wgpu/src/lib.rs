@@ -20,13 +20,13 @@ mod target;
 mod timing;
 mod transform;
 
-pub use context::{GpuContext, COLOR_FORMAT, STENCIL_FORMAT};
+pub use context::{AdapterIdentity, GpuContext, COLOR_FORMAT, STENCIL_FORMAT};
 
 use record::{PageOp, PageRecorder};
 use target::PageTarget;
 use transform::{quantize_premul, PageMap, PageUniform};
 use zpdf_core::ParseLimits;
-use zpdf_display_list::{Paint, RenderCommand};
+use zpdf_display_list::{Color, DisplayList, Paint, RenderCommand};
 use zpdf_render::{PageRenderInfo, RenderBackend};
 
 /// RGBA8 pixel buffer read back from the GPU. Mirrors `RenderedPage` from the CPU
@@ -123,6 +123,26 @@ fn unit(v: f32) -> f32 {
     }
 }
 
+/// Result of a submission-only render — see
+/// [`WgpuRenderer::render_display_list_submitted`].
+///
+/// Carries no pixels, by construction: not paying for the readback is the whole
+/// point of that path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Submission {
+    /// Host wall time covering record + submit, plus the timing readback when
+    /// [`WgpuRenderer::with_gpu_timing`] is enabled.
+    pub wall_ns: u64,
+    /// GPU pass time, when timestamp queries are enabled *and* the adapter
+    /// supports them; `None` otherwise.
+    ///
+    /// Note the tension: the timer's own readback is a blocking poll, so turning
+    /// timing on to populate this field reintroduces exactly the synchronization
+    /// the submit-only path exists to avoid. For the honest viewer number, leave
+    /// timing off and use `wall_ns` alone.
+    pub gpu_pass_ns: Option<u64>,
+}
+
 /// GPU renderer. Borrows font/image caches like `CpuRenderer<'a>`.
 pub struct WgpuRenderer<'a> {
     ctx: Option<GpuContext>,
@@ -202,9 +222,71 @@ impl<'a> WgpuRenderer<'a> {
 
     /// Enable per-page GPU timestamp telemetry. Disabled by default because its
     /// readback introduces an additional synchronization point.
+    ///
+    /// Consequence for measurement: a run with this **on** is a slightly slower
+    /// path than a consumer runs. Report the timing-off run as the headline
+    /// number and this one as a labelled diagnostic.
     pub fn with_gpu_timing(mut self, enabled: bool) -> Self {
         self.gpu_timing_enabled = enabled;
         self
+    }
+
+    /// Which adapter this renderer uses, initializing the GPU context if it does
+    /// not exist yet.
+    ///
+    /// Record this with any GPU timing. `request_adapter` picks an adapter
+    /// silently, and a machine can expose several (including virtual ones), so a
+    /// number without its adapter cannot be compared against anything. See
+    /// [`AdapterIdentity`](crate::context::AdapterIdentity).
+    pub fn adapter_identity(&mut self) -> Result<&AdapterIdentity, WgpuRenderError> {
+        if self.ctx.is_none() {
+            self.ctx = Some(GpuContext::new_headless()?);
+        }
+        Ok(self
+            .ctx
+            .as_ref()
+            .expect("context was just created")
+            .identity())
+    }
+
+    /// Render a page and submit the GPU work **without reading the result back**
+    /// — the viewer / GPU-pipeline consumption mode.
+    ///
+    /// Why this exists: [`RenderBackend::render_display_list`] ends in a readback
+    /// (a full-raster copy plus a blocking `device.poll`), and on a fast GPU that
+    /// is by far the largest part of the wall time — the measured GPU pass is
+    /// ~0.04 ms against a ~30 ms page wall on the development machine. A caller
+    /// that presents the texture, or feeds it to a further GPU pass, never pays
+    /// it, so quoting the readback path's wall time as "GPU render cost"
+    /// overstates the viewer case by orders of magnitude. This path is the honest
+    /// number for that mode.
+    ///
+    /// Rendering itself is identical to the readback path (same recording, same
+    /// submission, same GPU work); only the copy into the readback buffer and the
+    /// map are skipped. The pixels are dropped when the page ends.
+    ///
+    /// Measured with [`Self::with_gpu_timing`] **off** for the honest number:
+    /// the timer's readback is itself a blocking poll, so enabling it here would
+    /// put back the synchronization this path removes.
+    pub fn render_display_list_submitted(
+        &mut self,
+        dl: &DisplayList,
+        scale: f32,
+    ) -> Result<Submission, WgpuRenderError> {
+        let started = zpdf_core::time::Instant::now();
+        self.begin_page(&PageRenderInfo {
+            page_rect: dl.page_rect,
+            scale,
+            background: Color::white(),
+        })?;
+        for cmd in &dl.commands {
+            self.execute(cmd)?;
+        }
+        self.finish_page(false)?;
+        Ok(Submission {
+            wall_ns: started.elapsed().as_nanos() as u64,
+            gpu_pass_ns: self.last_gpu_time_ns,
+        })
     }
 }
 
@@ -414,6 +496,35 @@ impl<'a> RenderBackend for WgpuRenderer<'a> {
     }
 
     fn end_page(&mut self) -> Result<Self::Target, Self::Error> {
+        self.finish_page(true)?
+            .ok_or_else(|| WgpuRenderError::Wgpu("page render produced no pixels".into()))
+    }
+
+    /// The GPU backend deliberately reports **no** [`StageStats`].
+    ///
+    /// Those buckets describe host-side rasterization — glyph outline extraction,
+    /// path fills, glyph raster, image resampling, clip masks — and the GPU does
+    /// none of it on the host. Filling them with zeros would read as "this work
+    /// is free on the GPU", which is a different and misleading claim. GPU
+    /// numbers come from [`WgpuRenderer::last_gpu_time_ns`] for the pass, from
+    /// the caller for wall time, and from [`WgpuRenderer::adapter_identity`] for
+    /// the configuration they were measured on.
+    ///
+    /// [`StageStats`]: zpdf_render::StageStats
+    fn stage_stats(&self) -> Option<zpdf_render::StageStats> {
+        None
+    }
+}
+
+impl<'a> WgpuRenderer<'a> {
+    /// Shared page finalization for both consumption modes.
+    ///
+    /// `readback == false` submits the page and leaves the pixels on the GPU —
+    /// see [`Self::render_display_list_submitted`]. Only the readback copy and
+    /// the blocking map are skipped; recording, submission, and the GPU work are
+    /// identical, so a submit-only page renders exactly what a readback page
+    /// renders.
+    fn finish_page(&mut self, readback: bool) -> Result<Option<GpuTexture>, WgpuRenderError> {
         use wgpu::util::DeviceExt;
 
         let ctx = self.ctx.as_ref().ok_or(WgpuRenderError::NotInitialized)?;
@@ -613,6 +724,7 @@ impl<'a> RenderBackend for WgpuRenderer<'a> {
                 &res,
                 &timer,
                 layer_budget,
+                readback,
             )?;
             self.last_gpu_time_ns = gpu_ns;
             return Ok(texture);
@@ -638,9 +750,23 @@ impl<'a> RenderBackend for WgpuRenderer<'a> {
         }
         timer.write_end(&mut encoder);
         timer.record_resolve(&mut encoder);
-        target.record_copy(&mut encoder);
+        // The copy into the readback buffer is what the readback maps; skipping
+        // it is exactly what makes the submit-only path cheap.
+        if readback {
+            target.record_copy(&mut encoder);
+        }
         ctx.queue.submit(Some(encoder.finish()));
-        let result = target.map_and_strip(device);
+        let result = if readback {
+            target.map_and_strip(device).map(Some)
+        } else {
+            // No readback means no blocking poll — but the queue must still be
+            // given the chance to retire completed submissions, or a tight render
+            // loop piles up in-flight work until the device reports OOM (observed:
+            // a 4 GB-class GPU OOM'd within a few hundred un-synchronized pages).
+            // Non-blocking: it drains whatever has finished and returns.
+            let _ = ctx.device.poll(wgpu::PollType::Poll);
+            Ok(None)
+        };
         self.last_gpu_time_ns = timer.resolve_ns(device);
         if let Some(msg) = ctx.take_error() {
             return Err(WgpuRenderError::Wgpu(format!("device error: {msg}")));
@@ -1146,6 +1272,10 @@ fn composite_into(
 /// recycling [`blend::LayerPool`] so a page with hundreds of groups reuses a
 /// small working set instead of allocating (and never freeing) one full-page
 /// layer per group.
+// `readback` is a parameter rather than renderer state on purpose: it describes
+// this one consumption of the page, and a sticky flag would let a page render
+// silently change shape between calls.
+#[allow(clippy::too_many_arguments)]
 fn render_layered(
     ctx: &GpuContext,
     target: &PageTarget,
@@ -1154,7 +1284,8 @@ fn render_layered(
     res: &ReplayRes,
     timer: &timing::GpuTimer,
     layer_budget: u64,
-) -> Result<(GpuTexture, Option<u64>), WgpuRenderError> {
+    readback: bool,
+) -> Result<(Option<GpuTexture>, Option<u64>), WgpuRenderError> {
     let device = &ctx.device;
     let (w, h, sc) = (target.width, target.height, target.sample_count);
 
@@ -1192,9 +1323,18 @@ fn render_layered(
     )?;
     timer.write_end(&mut encoder);
     timer.record_resolve(&mut encoder);
-    target.record_copy_from(&mut encoder, pool.get(final_layer).sampleable_texture());
+    if readback {
+        target.record_copy_from(&mut encoder, pool.get(final_layer).sampleable_texture());
+    }
     ctx.queue.submit(Some(encoder.finish()));
-    let result = target.map_and_strip(device);
+    let result = if readback {
+        target.map_and_strip(device).map(Some)
+    } else {
+        // See `finish_page`: an un-synchronized loop must still drain completed
+        // submissions or it OOMs the device.
+        let _ = ctx.device.poll(wgpu::PollType::Poll);
+        Ok(None)
+    };
     let gpu_ns = timer.resolve_ns(device);
     if let Some(msg) = ctx.take_error() {
         return Err(WgpuRenderError::Wgpu(format!("device error: {msg}")));

@@ -8,6 +8,7 @@ use zpdf_font::FontCache;
 use zpdf_image::ImageCache;
 use zpdf_parser::PdfFile;
 
+use crate::stats::InterpretStats;
 use crate::tables::RuleLine;
 use crate::text::TextSpan;
 use crate::tokenizer::{ContentToken, ContentTokenizer};
@@ -147,6 +148,9 @@ pub struct ContentInterpreter<'a> {
     /// Latches when a structural memory limit is exceeded so every enclosing
     /// form/pattern loop stops after restoring its local state.
     resource_limit_hit: bool,
+    /// Interpret-stage timings; see [`InterpretStats`]. Collected always — the
+    /// clock reads are per-shading, not per-operator.
+    stats: InterpretStats,
 }
 
 /// State for soft-mask reuse across the tiles of one `paint_tiling_pattern`
@@ -520,6 +524,7 @@ impl<'a> ContentInterpreter<'a> {
             max_graphics_state_depth: 256,
             max_marked_content_depth: 128,
             resource_limit_hit: false,
+            stats: InterpretStats::default(),
         }
     }
 
@@ -748,7 +753,21 @@ impl<'a> ContentInterpreter<'a> {
         self
     }
 
-    pub fn interpret(mut self, content: &[u8]) -> DisplayList {
+    /// Interpret `content` into a [`DisplayList`].
+    ///
+    /// Discards the stage timings. Kept as the primary API so no existing caller
+    /// changes; use [`Self::interpret_with_stats`] when measuring.
+    pub fn interpret(self, content: &[u8]) -> DisplayList {
+        self.interpret_with_stats(content).0
+    }
+
+    /// Like [`Self::interpret`], but also returns the interpret-stage timings.
+    ///
+    /// These are the only place a shading's cost is observable: shadings are
+    /// rasterized in this stage and reach a render backend as a plain image.
+    /// See [`InterpretStats`].
+    pub fn interpret_with_stats(mut self, content: &[u8]) -> (DisplayList, InterpretStats) {
+        let started = zpdf_core::time::Instant::now();
         // Arm the interpret wall-clock backstop (unless already set by a caller).
         if self.deadline.is_none() {
             self.deadline = Some(zpdf_core::time::Instant::now() + INTERPRET_BUDGET);
@@ -806,7 +825,8 @@ impl<'a> ContentInterpreter<'a> {
 
         self.paint_annotations();
 
-        self.display_list
+        self.stats.total_ns = started.elapsed().as_nanos() as u64;
+        (self.display_list, self.stats)
     }
 
     pub fn command_count(&self) -> usize {
@@ -2513,9 +2533,17 @@ impl<'a> ContentInterpreter<'a> {
         let scale = (768.0 / long).min(2.0);
         let w = ((region.width() * scale).ceil() as u32).clamp(1, 2048);
         let h = ((region.height() * scale).ceil() as u32).clamp(1, 2048);
-        let Some(buf) = crate::shading::rasterize(def, region, w, h) else {
+        // Gradient/mesh evaluation is CPU work here, and the result reaches a
+        // render backend as an ordinary image — so this is the only place a
+        // shading's cost can be attributed. (Both backends paint only
+        // `Paint::Solid`; a `Paint::Shading` never reaches them.)
+        let shading_started = zpdf_core::time::Instant::now();
+        let buf = crate::shading::rasterize(def, region, w, h);
+        self.stats.shading_ns += shading_started.elapsed().as_nanos() as u64;
+        let Some(buf) = buf else {
             return;
         };
+        self.stats.shading_rasters += 1;
         let image = zpdf_image::DecodedImage {
             width: w,
             height: h,
@@ -6306,5 +6334,89 @@ mod tests {
         scale(&mut interp);
         scale(&mut interp); // would overflow without the post-concat guard
         assert!(interp.current.ctm.is_finite());
+    }
+
+    // -- Interpret-stage timings (`InterpretStats`) -------------------------
+
+    /// The wrapper split (`interpret` = `interpret_with_stats().0`) must not
+    /// change the emitted display list — otherwise every measurement taken with
+    /// stats on would describe a different page than production renders.
+    #[test]
+    fn interpret_with_stats_emits_the_same_display_list() {
+        let page_rect = Rect::new(0.0, 0.0, 612.0, 792.0);
+        for content in [
+            &b"1 0 0 rg 100 200 300 400 re f"[..],
+            &b"q 0.5 g 100 100 50 50 re f Q 10 10 20 20 re f"[..],
+            &b"0 0 1 RG 2 w 0 0 m 100 100 l S"[..],
+        ] {
+            let plain = ContentInterpreter::new(page_rect).interpret(content);
+            let (measured, _) = ContentInterpreter::new(page_rect).interpret_with_stats(content);
+            assert_eq!(
+                plain.commands.len(),
+                measured.commands.len(),
+                "command count must not depend on whether stats are collected"
+            );
+        }
+    }
+
+    #[test]
+    fn interpret_stats_stamp_total_time() {
+        let page_rect = Rect::new(0.0, 0.0, 612.0, 792.0);
+        let (_, stats) =
+            ContentInterpreter::new(page_rect).interpret_with_stats(b"100 200 300 400 re f");
+        assert_eq!(stats.shading_rasters, 0, "this page has no shading");
+        assert_eq!(stats.shading_ns, 0, "no shading work to attribute");
+        // Wall-clock: bare wasm32 has no clock (`elapsed()` is defined as zero).
+        #[cfg(not(target_arch = "wasm32"))]
+        assert!(stats.total_ns > 0, "total_ns must bracket the interpret");
+        #[cfg(target_arch = "wasm32")]
+        assert!(stats.is_empty() || stats.total_ns == 0);
+    }
+
+    /// A shading's cost is only observable in this stage — the backends receive
+    /// it as a plain image. Assert it is actually attributed.
+    #[test]
+    fn emit_shading_image_attributes_shading_cost() {
+        use crate::shading::{MeshTriangle, MeshVertex, ShadingDef, ShadingKind};
+
+        let def = ShadingDef {
+            kind: ShadingKind::Mesh {
+                triangles: vec![MeshTriangle {
+                    v: [
+                        MeshVertex {
+                            x: 0.0,
+                            y: 0.0,
+                            rgb: [1.0, 0.0, 0.0],
+                        },
+                        MeshVertex {
+                            x: 1.0,
+                            y: 0.0,
+                            rgb: [0.0, 1.0, 0.0],
+                        },
+                        MeshVertex {
+                            x: 0.0,
+                            y: 1.0,
+                            rgb: [0.0, 0.0, 1.0],
+                        },
+                    ],
+                }],
+            },
+            lut: vec![[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]],
+            extend_start: false,
+            extend_end: false,
+            to_page: Matrix::identity(),
+        };
+
+        let mut interp = ContentInterpreter::new(Rect::new(0.0, 0.0, 612.0, 792.0));
+        interp.emit_shading_image(&def, Rect::new(0.0, 0.0, 100.0, 100.0));
+        assert_eq!(
+            interp.stats.shading_rasters, 1,
+            "one mesh shading must be recorded"
+        );
+        #[cfg(not(target_arch = "wasm32"))]
+        assert!(
+            interp.stats.shading_ns > 0,
+            "shading time must be attributed"
+        );
     }
 }
