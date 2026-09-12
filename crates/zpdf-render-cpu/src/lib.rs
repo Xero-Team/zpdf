@@ -865,6 +865,7 @@ impl<'a> CpuRenderer<'a> {
         // Fold the soft mask into the group: premultiplied RGBA scales
         // uniformly by the per-pixel mask coverage.
         if let Some(plane) = &entry.mask {
+            let t_fold = self.tick();
             let data = group_pixmap.data_mut();
             for (px, &m) in data.as_chunks_mut::<4>().0.iter_mut().zip(plane.iter()) {
                 if m == 255 {
@@ -876,6 +877,7 @@ impl<'a> CpuRenderer<'a> {
                 px[2] = ((px[2] as u16 * m) / 255) as u8;
                 px[3] = ((px[3] as u16 * m) / 255) as u8;
             }
+            self.tock(t_fold, |s| &mut s.mask_fold_ns);
         }
 
         let mut base = entry.pixmap;
@@ -887,6 +889,7 @@ impl<'a> CpuRenderer<'a> {
             ..Default::default()
         };
 
+        let t_composite = self.tick();
         base.draw_pixmap(
             0,
             0,
@@ -895,6 +898,7 @@ impl<'a> CpuRenderer<'a> {
             tiny_skia::Transform::identity(),
             None,
         );
+        self.tock(t_composite, |s| &mut s.mask_composite_ns);
 
         self.pixmap = Some(base);
         self.blend_surface_bytes = self
@@ -1116,7 +1120,11 @@ impl<'a> CpuRenderer<'a> {
     /// Render a soft mask's group commands offscreen (same page geometry as
     /// the current target) and reduce to a per-pixel coverage plane, ignoring
     /// the offset (callers shift the result).
-    fn rasterize_soft_mask(&self, mask: &SoftMask) -> Option<Vec<u8>> {
+    fn rasterize_soft_mask(&mut self, mask: &SoftMask) -> Option<Vec<u8>> {
+        // Everything up to `rendered` — the full-page scratch allocation, its
+        // backdrop fill, the group's sub-render, and the blend drain — is one
+        // sub-bucket. The per-pixel reduction is the other.
+        let t_render = self.tick();
         let (w, h) = {
             let p = self.pixmap.as_ref()?;
             (p.width(), p.height())
@@ -1180,8 +1188,11 @@ impl<'a> CpuRenderer<'a> {
         while !sub.blend_stack.is_empty() {
             sub.pop_blend_group();
         }
-        let rendered = sub.pixmap.take()?;
+        let rendered = sub.pixmap.take();
+        self.tock(t_render, |s| &mut s.mask_render_ns);
+        let rendered = rendered?;
 
+        let t_reduce = self.tick();
         let mut plane = Vec::with_capacity((w * h) as usize);
         for px in rendered.pixels() {
             let v = match mask.kind {
@@ -1207,6 +1218,7 @@ impl<'a> CpuRenderer<'a> {
             };
             plane.push(v);
         }
+        self.tock(t_reduce, |s| &mut s.mask_reduce_ns);
         Some(plane)
     }
 

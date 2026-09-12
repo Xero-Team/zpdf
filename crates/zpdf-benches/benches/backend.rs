@@ -145,8 +145,8 @@ fn cpu_stats(c: &mut Criterion) {
             eprintln!(
                 "zpdf-benches stage-split {} [{}] total={:.2}ms | \
                  outline-parse={:.2}ms glyph-raster={:.2}ms fill={:.2}ms stroke={:.2}ms \
-                 image={:.2}ms clip={:.2}ms soft-mask={:.2}ms | \
-                 shares: glyph={:.0}% image={:.0}% fill={:.0}% clip={:.0}% | \
+                 image={:.2}ms clip={:.2}ms soft-mask={:.2}ms (render={:.2} reduce={:.2} fold={:.2} composite={:.2}) | \
+                 shares: glyph={:.0}% image={:.0}% fill={:.0}% clip={:.0}% mask={:.0}% | \
                  counters: glyphs={} outlines={} fills={} strokes={} images={} clips={} masks={}\n  {}",
                 case_id(&page_ref.label, page_ref.class.as_deref()),
                 comp.class().as_str(),
@@ -158,10 +158,15 @@ fn cpu_stats(c: &mut Criterion) {
                 st.image_ns as f64 / 1e6,
                 st.clip_ns as f64 / 1e6,
                 st.soft_mask_ns as f64 / 1e6,
+                st.mask_render_ns as f64 / 1e6,
+                st.mask_reduce_ns as f64 / 1e6,
+                st.mask_fold_ns as f64 / 1e6,
+                st.mask_composite_ns as f64 / 1e6,
                 st.share(st.glyph_ns()) * 100.0,
                 st.share(st.image_ns) * 100.0,
                 st.share(st.fill_ns) * 100.0,
                 st.share(st.clip_ns) * 100.0,
+                st.share(st.soft_mask_ns) * 100.0,
                 st.glyphs,
                 st.glyph_outlines_parsed,
                 st.fills,

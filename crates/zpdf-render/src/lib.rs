@@ -125,7 +125,31 @@ pub struct StageStats {
     /// `push_clip_stroke` / `pop_clip`).
     pub clip_ns: u64,
     /// Soft-mask rasterization and blend-group compositing.
+    ///
+    /// The whole soft-mask cost. [`StageStats::mask_render_ns`],
+    /// [`StageStats::mask_reduce_ns`], [`StageStats::mask_fold_ns`] and
+    /// [`StageStats::mask_composite_ns`] attribute parts of it, and their sum is
+    /// **≤** this total — not equal to it. The remainder is plane shifting
+    /// (`shift_plane`, a full-plane copy when a mask is reused at an offset) and
+    /// cache/key maintenance, which are real but small next to the four measured
+    /// terms. A strict partition was claimed here first and measurement
+    /// disproved it (~60% unaccounted), which is exactly why the sub-buckets
+    /// exist.
     pub soft_mask_ns: u64,
+    /// Attribution: re-rendering the mask group's commands into a full-page
+    /// scratch raster, including that raster's allocation and backdrop fill.
+    pub mask_render_ns: u64,
+    /// Attribution: reducing the scratch raster to a 1-byte coverage plane
+    /// (per-pixel demultiply + Rec.601 luma + /TR LUT).
+    pub mask_reduce_ns: u64,
+    /// Attribution: folding a plane into a group's pixels (per-pixel per-channel
+    /// multiply/divide over the full raster).
+    pub mask_fold_ns: u64,
+    /// Attribution: compositing the finished group onto its backdrop —
+    /// `draw_pixmap` with the group's blend mode and constant alpha, over the
+    /// full raster. Non-`SourceOver` modes (HSL family especially) cost far more
+    /// than the default, so this term is not proportional to the others.
+    pub mask_composite_ns: u64,
     /// Whole-page wall time, the reference denominator for the buckets above.
     pub total_ns: u64,
 
@@ -267,6 +291,30 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(stats.share(500), 0.5);
+    }
+
+    #[test]
+    fn mask_sub_buckets_are_attribution_not_a_partition() {
+        // The sub-buckets attribute *parts* of `soft_mask_ns`; the remainder is
+        // plane shifting and cache upkeep. Assert the documented direction
+        // (sum <= total) rather than an equality that measurement showed false.
+        let stats = StageStats {
+            soft_mask_ns: 1000,
+            mask_render_ns: 100,
+            mask_reduce_ns: 200,
+            mask_fold_ns: 300,
+            mask_composite_ns: 350,
+            ..Default::default()
+        };
+        let attributed = stats.mask_render_ns
+            + stats.mask_reduce_ns
+            + stats.mask_fold_ns
+            + stats.mask_composite_ns;
+        assert!(
+            attributed <= stats.soft_mask_ns,
+            "attribution {attributed} must not exceed the total {}",
+            stats.soft_mask_ns
+        );
     }
 
     #[test]
