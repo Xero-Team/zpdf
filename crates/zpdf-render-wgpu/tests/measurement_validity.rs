@@ -17,7 +17,7 @@
 use zpdf_core::Rect;
 use zpdf_display_list::{Color, DisplayList, FillRule, Paint, Path, RenderCommand};
 use zpdf_render::RenderBackend;
-use zpdf_render_wgpu::WgpuRenderer;
+use zpdf_render_wgpu::{WgpuRenderError, WgpuRenderer};
 
 const SCALE: f32 = 2.0;
 
@@ -126,12 +126,28 @@ fn submit_only_renders_without_returning_pixels() {
 /// device reported Out Of Memory (observed on a 4 GB-class GPU within a few
 /// hundred pages). The submit-only path must drain completed work without
 /// blocking.
+///
+/// A machine with no adapter at all — Linux CI, whose image ships no software
+/// Vulkan driver — fails the *first* render with `NoAdapter`. That says nothing
+/// about queue draining, so it skips like the other tests in this file; the loop
+/// is exercised wherever an adapter exists (Windows CI, developer machines). A
+/// `NoAdapter` after the loop has started, or any other error at all, is still
+/// the bug and still panics.
 #[test]
 fn submit_only_survives_many_iterations() {
     let mut r = WgpuRenderer::new();
     let dl = simple_dl();
+
+    if let Err(e) = r.render_display_list_submitted(&dl, SCALE) {
+        if matches!(e, WgpuRenderError::NoAdapter) {
+            eprintln!("skipping submit-only loop test (no adapter): {e}");
+            return;
+        }
+        panic!("submit-only render 0 failed (queue not draining?): {e}");
+    }
+
     // A few hundred pages: far past where the OOM appeared.
-    for i in 0..300 {
+    for i in 1..300 {
         if let Err(e) = r.render_display_list_submitted(&dl, SCALE) {
             panic!("submit-only render {i} failed (queue not draining?): {e}");
         }
