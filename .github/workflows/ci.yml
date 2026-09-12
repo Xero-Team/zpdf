@@ -67,10 +67,34 @@ jobs:
             libwayland-dev \
             libx11-xcb-dev \
             libxkbcommon-x11-dev
+      - name: Install software Vulkan driver (lavapipe)
+        if: runner.os == 'Linux'
+        run: |
+          # The runner has no GPU and, by default, no Vulkan ICD at all, so every
+          # GPU test used to skip here — including the suites whose entire point is
+          # a GPU↔CPU pixel comparison, which therefore compared nothing on Linux.
+          # Mesa's lavapipe is a conformant CPU implementation of Vulkan; wgpu
+          # enumerates it as an ordinary adapter (type Cpu, ranked last, so a real
+          # GPU still wins wherever one exists).
+          sudo apt-get install -y mesa-vulkan-drivers libvulkan1
       - name: Build (all targets)
         run: cargo build --workspace --all-targets --verbose
       - name: Test
         run: cargo test --workspace --verbose
+      - name: GPU oracle suites (software Vulkan)
+        if: runner.os == 'Linux'
+        run: |
+          set -o pipefail
+          cargo test -p zpdf --features gpu-render \
+            --test gpu_acceptance --test gpu_overprint --test gpu_softmask \
+            -- --nocapture 2>&1 | tee gpu-oracle.log
+          # These suites skip when they cannot find an adapter — which is how this
+          # step would "pass" while comparing nothing at all. Now that the driver
+          # above is installed, a skip means it went missing again.
+          if grep -q "skipping GPU" gpu-oracle.log; then
+            echo "::error::a GPU oracle suite skipped — software Vulkan driver missing?"
+            exit 1
+          fi
 
   gpu-build:
     name: build (gpu-render feature)
