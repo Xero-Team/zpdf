@@ -1092,6 +1092,55 @@ fn decode_raw_samples(
         _ => None,
     };
 
+    // Fast path: 8-bit samples and no colour key — which is the shape of every
+    // image that reaches here, since the parser's filter pipeline hands over
+    // bytes (zune-jpeg output, Flate rows, …). The general loop below re-derives
+    // each byte offset through a bit reader, re-checks the colour key and
+    // re-reserves the output buffer *per pixel*; none of that is needed when the
+    // samples already are bytes. Values come from the same LUTs and
+    // `components_to_rgb`, so the two paths agree byte for byte.
+    if bpc == 8
+        && color_key.is_none()
+        && indexed_palette.is_none()
+        && row_bytes == width as usize * ncomp
+    {
+        let row_out = width as usize * 4;
+        let mut rgba = vec![0u8; rgba_size];
+        for (src_row, dst_row) in data
+            .chunks_exact(row_bytes)
+            .zip(rgba.chunks_exact_mut(row_out))
+        {
+            for (src, dst) in src_row
+                .chunks_exact(ncomp)
+                .zip(dst_row.as_chunks_mut::<4>().0)
+            {
+                let mut comps = [0u8; 4];
+                match ncomp {
+                    1 => comps[0] = luts[0][src[0] as usize],
+                    3 => {
+                        comps[0] = luts[0][src[0] as usize];
+                        comps[1] = luts[1][src[1] as usize];
+                        comps[2] = luts[2][src[2] as usize];
+                    }
+                    _ => {
+                        for c in 0..ncomp {
+                            comps[c] = luts[c][src[c] as usize];
+                        }
+                    }
+                }
+                let [r, g, b] = components_to_rgb(cs, &comps);
+                *dst = [r, g, b, 255];
+            }
+        }
+        return Ok(DecodedImage {
+            width,
+            height,
+            data: rgba,
+            has_alpha: false,
+            premultiplied: false,
+        });
+    }
+
     let mut rgba = Vec::with_capacity(rgba_size);
     let mut any_masked = false;
 
@@ -1429,10 +1478,17 @@ fn fold_alpha_plane(image: &mut DecodedImage, alpha: &[u8], aw: u32, ah: u32) {
 }
 
 #[inline]
-fn multiply_pixel_alpha(pixel: &mut [u8], alpha: u8) {
-    for channel in pixel {
-        *channel = mul255(*channel, alpha);
+fn multiply_pixel_alpha(pixel: &mut [u8; 4], alpha: u8) {
+    // `mul255(v, 255) == v` for every `v`, and an opaque mask pixel is the
+    // common case in a soft mask — skipping it turns four multiplies into a
+    // predictable branch, with identical bytes either way.
+    if alpha == 255 {
+        return;
     }
+    pixel[0] = mul255(pixel[0], alpha);
+    pixel[1] = mul255(pixel[1], alpha);
+    pixel[2] = mul255(pixel[2], alpha);
+    pixel[3] = mul255(pixel[3], alpha);
 }
 
 /// `round(v * a / 255)` without going through floats.
