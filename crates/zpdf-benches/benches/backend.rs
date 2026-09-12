@@ -147,7 +147,8 @@ fn cpu_stats(c: &mut Criterion) {
                  outline-parse={:.2}ms glyph-raster={:.2}ms fill={:.2}ms stroke={:.2}ms \
                  image={:.2}ms clip={:.2}ms soft-mask={:.2}ms (render={:.2} reduce={:.2} fold={:.2} composite={:.2}) | \
                  shares: glyph={:.0}% image={:.0}% fill={:.0}% clip={:.0}% mask={:.0}% | \
-                 counters: glyphs={} outlines={} fills={} strokes={} images={} clips={} masks={}\n  {}",
+                 counters: glyphs={} outlines={} fills={} strokes={} images={} clips={} masks={} \
+                 composite_px={} of page×groups={} ({:.0}% covered)\n  {}",
                 case_id(&page_ref.label, page_ref.class.as_deref()),
                 comp.class().as_str(),
                 st.total_ns as f64 / 1e6,
@@ -174,6 +175,10 @@ fn cpu_stats(c: &mut Criterion) {
                 st.images,
                 st.clips_pushed,
                 st.soft_mask_planes,
+                st.mask_composite_px,
+                pixels.saturating_mul(comp.blend_groups.max(1)),
+                100.0 * st.mask_composite_px as f64
+                    / (pixels.saturating_mul(comp.blend_groups.max(1))).max(1) as f64,
                 comp.summary(),
             );
         }

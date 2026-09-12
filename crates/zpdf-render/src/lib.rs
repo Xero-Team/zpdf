@@ -150,6 +150,16 @@ pub struct StageStats {
     /// full raster. Non-`SourceOver` modes (HSL family especially) cost far more
     /// than the default, so this term is not proportional to the others.
     pub mask_composite_ns: u64,
+    /// Destination pixels the group composite actually *covers* (Σ of each
+    /// group's non-transparent bounding-box area), against `groups × page area`
+    /// for the full-raster composite.
+    ///
+    /// Diagnostic for whether scoping the composite to the group's extent is
+    /// worthwhile: if group content covers most of the page, it is not. Counted
+    /// in destination pixels rather than nanoseconds so it is deterministic and
+    /// CI-gateable — it answers "does the approach apply" independently of how
+    /// fast this machine happens to be.
+    pub mask_composite_px: u64,
     /// Whole-page wall time, the reference denominator for the buckets above.
     pub total_ns: u64,
 

@@ -150,6 +150,35 @@ fn shift_plane(base: &[u8], w: u32, h: u32, dx: i64, dy: i64, fill: u8) -> Vec<u
     out
 }
 
+/// Bounding-box area of pixels with non-zero alpha, or 0 when fully transparent.
+///
+/// Diagnostic for scoping group composites: the composite only needs to touch
+/// this rectangle. A bounding box (not exact coverage) is the right shape, since
+/// it is what a region-scoped `draw_pixmap` would actually process.
+///
+/// Costs a full pass, so callers gate it on stats collection being enabled.
+fn opaque_bounds_area(pixmap: &tiny_skia::Pixmap) -> u64 {
+    let (w, h) = (pixmap.width(), pixmap.height());
+    let data = pixmap.data();
+    let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0u32, 0u32);
+    for y in 0..h {
+        let row = (y as usize) * (w as usize) * 4;
+        for x in 0..w {
+            // Premultiplied RGBA; alpha is the fourth byte.
+            if data[row + (x as usize) * 4 + 3] != 0 {
+                x0 = x0.min(x);
+                y0 = y0.min(y);
+                x1 = x1.max(x);
+                y1 = y1.max(y);
+            }
+        }
+    }
+    if x1 < x0 || y1 < y0 {
+        return 0;
+    }
+    (x1 - x0 + 1) as u64 * (y1 - y0 + 1) as u64
+}
+
 /// Default [`CpuRenderer::render_budget`]. Generous enough that no realistic page
 /// approaches it (complex pages render in well under a second) while bounding
 /// pathological inputs to a few seconds.
@@ -888,6 +917,13 @@ impl<'a> CpuRenderer<'a> {
             opacity: unit(entry.alpha),
             ..Default::default()
         };
+
+        // Diagnostic, and a full pass — so only while collecting stats. Written
+        // before the composite timer starts so it does not inflate that bucket.
+        if self.stage_stats.is_some() {
+            let area = opaque_bounds_area(&group_pixmap);
+            self.count(area, |s| &mut s.mask_composite_px);
+        }
 
         let t_composite = self.tick();
         base.draw_pixmap(
