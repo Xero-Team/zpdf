@@ -44,6 +44,6 @@ image.workspace = true
 zip = { version = "8.6", default-features = false, features = ["deflate-flate2"] }
 
 # XML generation for OOXML
-quick-xml = { version = "0.41", features = ["serialize"] }
+quick-xml = { version = "0.42", features = ["serialize"] }
 
 [dev-dependencies]
