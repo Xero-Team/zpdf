@@ -150,16 +150,34 @@ pub struct StageStats {
     /// full raster. Non-`SourceOver` modes (HSL family especially) cost far more
     /// than the default, so this term is not proportional to the others.
     pub mask_composite_ns: u64,
-    /// Destination pixels the group composite actually *covers* (Σ of each
-    /// group's non-transparent bounding-box area), against `groups × page area`
-    /// for the full-raster composite.
+    /// Destination pixels of the group's non-transparent bounding box —
+    /// Σ of each group's own extent — against `groups × page area` for a
+    /// full-raster composite.
     ///
-    /// Diagnostic for whether scoping the composite to the group's extent is
-    /// worthwhile: if group content covers most of the page, it is not. Counted
-    /// in destination pixels rather than nanoseconds so it is deterministic and
-    /// CI-gateable — it answers "does the approach apply" independently of how
-    /// fast this machine happens to be.
+    /// This is the *ideal* scope: the tightest rectangle a composite of the
+    /// group's content could be confined to, measured from the finished raster
+    /// rather than from bookkeeping. Compare it with
+    /// [`StageStats::mask_composite_region_px`] to see how much slack the
+    /// backend's own region tracking carries. Counted in destination pixels
+    /// rather than nanoseconds so it is deterministic and CI-gateable — it
+    /// answers "does the approach apply" independently of how fast this machine
+    /// happens to be.
     pub mask_composite_px: u64,
+    /// Destination pixels the composite actually processed: Σ of each group's
+    /// painted region, the rectangle the blit is confined to.
+    ///
+    /// The honest "work done" number for the scoped composite — it is what
+    /// replaces `groups × page area`, and it collapses to zero for a group that
+    /// painted nothing (whose composite is then skipped outright).
+    pub mask_composite_region_px: u64,
+    /// Painted pixels found *outside* the region the composite was confined to.
+    ///
+    /// **Always 0**, and it is the counter that makes the scoped composite
+    /// trustworthy rather than merely believed: the confinement argument holds
+    /// only if the region contains every pixel the group painted. A non-zero
+    /// value is a backend bug that silently drops content, so this is asserted
+    /// in tests, where a deterministic counter belongs.
+    pub mask_composite_leak_px: u64,
     /// Whole-page wall time, the reference denominator for the buckets above.
     pub total_ns: u64,
 

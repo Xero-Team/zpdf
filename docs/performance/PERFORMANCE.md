@@ -689,8 +689,8 @@ pipelining 的收益假设是“每页 165ms 同步”，但热态每页仅 32ms
 
 | 排名 | 候选 | 依据 | 状态 |
 |---|---|---|---|
-| **1** | **soft-mask / blend-group 合成**（新） | 两个最慢页的 **69–74%**；上一轮从未测量 | 新候选 |
-| **2** | **interpret 阶段**（新） | 占流水线 10–47%；test12 **397 ms** 且 DPI 无关；其中 shading 栅格化只在 interpret 可见 | 新候选 |
+| **1** | **soft-mask / blend-group 合成**（新） | 两个最慢页的 **69–74%**；上一轮从未测量 | **已落地（§14，−39%/−51%）** |
+| **2** | **interpret 阶段**（新） | 占流水线 10–47%；test12 **397 ms** 且 DPI 无关；其中 shading 栅格化只在 interpret 可见 | 新候选（**现在的第一名**） |
 | **3** | GPU host 端 per-page 分配（= 重估 M2 资源池） | submit-only 无同步仍 2.67 ms/页 | 复活 |
 | **4** | 图像重采样 | test4 的 91%、慢页的 18–21% | 确认（非主导） |
 | **5** | clip（clip-heavy 矢量页） | test7 的 35% | 复活（限该类） |
@@ -734,7 +734,7 @@ backdrop），在两页上约占**整页时间的 28–40%，集中在一个调�
 92–96%，余下是 `shift_plane` 与缓存维护。文档与测试已改为**归属**语义（`sum ≤ total`），
 并把这次否证记录下来，而不是悄悄删掉。
 
-## 14. 方向 1 实施方案（bbox-scope 混合组合成）— 待执行
+## 14. 方向 1 实施方案（bbox-scope 混合组合成）— **已落地**（2026-09-12）
 
 ### 14.1 目标
 
@@ -747,19 +747,57 @@ tiny-skia 的 `draw_pixmap` 对所有混合模式都做正确的 Porter-Duff alp
 **源 alpha = 0 处结果等于 backdrop**（倍数/滤色/HSL 族同理）。因此只要 bbox 是组"画过的
 东西"的**保守超集**，区间外不合成即**像素等价**。
 
-### 14.3 实现要点
+形式化地：通用混合式 `r = s·(1−da) + d·(1−sa) + B(s,d)·sa·da` 在 `sa = 0` 时退化为 `d`。
+这条不是"看起来对"——`scoped_composite_matches_full_raster_for_every_blend_mode` 对
+**全部 16 种混合模式 × {alpha 1.0, 0.25} × {isolated, 非 isolated} × {scale 1, 2}**
+逐一做了字节比对。
 
-- 在 `CpuRenderer` 加 `dirty: Option<(u32, u32, u32, u32)>`，语义是**当前目标表面**的已
-  绘制范围；`push_blend_group` 时置空（新表面）。
-- 每个绘制点保守并入（并与 `current_clip` 的 bounds 相交）：
+### 14.3 实现要点（含落地时相对本节的偏离）
+
+落地版本与下面的计划有四处不同，逐条记录，而不是让计划与代码各说各话：
+
+1. **收窄手段：矩形 `fill_rect` 而不是 scratch 拷贝。** 计划里"整页 `draw_pixmap` 换成
+   scratch pixmap + 局部合成"要 3 遍内存搬运（拷入 backdrop、合成、拷回），实际做法是
+   直接构造 `Pattern` shader + `Pixmap::fill_rect(region, …)` —— 这正是 tiny-skia 的
+   `draw_pixmap` 的内部实现（它就是 `fill_rect(src.size().to_int_rect(x,y), pattern_paint)`），
+   只是把 blit 的矩形从"源的全幅"换成 region。**一遍、零拷贝、同一管线**，因此不存在
+   "收窄后逐像素与整页不同"的可能。
+2. **因此不需要"覆盖率 ≈ 1 走原路"的分支。** 局部合成永远不会比整页合成慢（同一次调用、
+   更小的矩形），§14.4 里担心的"无谓开销"只剩下记账本身。test7（单组覆盖整页）实测
+   6.62 → 6.55 ms，即零损失、零收益，与预测一致。
+3. **Type3 不退回整页。** 计划把 Type3 列为"拿不准"；实际上 Type3 的字形内容在渲染器内部
+   被解释成**普通设备空间路径**，与 outline 字形走同一个 `fill_path`，其 `bounds()` 同样
+   可信。记录为事实并配测试（`…with_type3_glyphs_inside_the_group`），而不是继续保守。
+   嵌套组同理：内外表面同尺寸同对齐，内层 region 在 pop 时并入外层即可。
+4. **mask fold 也一并收窄。** 计划只提到 composite；折叠循环同样只处理 region（区间外
+   组像素恒为 0，0 乘任何遮蔽值仍是 0，而合成也只读 region）。这一项不在 §14.5 的预测里，
+   实测却占了收益的相当一部分（test12 fold 17.7 → 1.8 ms）。
+
+具体规则：
+
+- `CpuRenderer` 新增 `dirty: Option<PaintedBounds>`（半开区间 `[x0,x1)×[y0,y1)`），语义是
+  **当前目标表面**的已绘制范围；`push_blend_group` 时把父表面的 region 存进 `BlendEntry`
+  并把当前置空（新表面），`pop_blend_group` 时取回并与组的 region 求并。
+- 每个绘制点保守并入，并与 `clip_bounds`（**本实现新增**：`current_clip` 的设备包围盒，
+  随 clip 栈同进同出）相交：
   - 路径 → `tiny_skia::Path::bounds()` 再**向外扩 1px**（AA 边缘）；
-  - 描边 → 路径 bounds 外扩 `2 × width`（覆盖 miter 溢出）；
+  - 描边 → 路径 bounds 外扩 `miter_limit/2 × width + 1px`。计划里写的是 `2 × width`，
+    落地时按 miter 的真实几何上界取，并由
+    `scoped_composite_covers_a_miter_spike_past_the_path_bounds` 锁定：该测试里
+    hairpin 的 miter 尖端到 x≈35，而 `2 × width` 只能覆盖到 x=32 —— 用宽度外扩会被它抓住；
   - 字形 → run 内**已变换**的各字形 bounds（不用 em-box 估计）；
-  - 图像 → 变换后四角 bbox。
-- `pop_blend_group` 用 `dirty` 作为 `draw_pixmap` 的目标子矩形；mask fold 循环的 `plane`
-  是整页的，可按同一矩形收窄。
-- **保守优先**：任何拿不准的情况（Type3、嵌套组、soft-mask 子渲染、`dirty == None`）
-  **直接退回整页**。宁可慢，不可错。
+  - 图像 → 变换后单位方形的四角 bbox；
+  - Type3 → 同路径规则；
+  - knockout / overprint → 它们通过整页 scratch + 整页合并实现，**直接标记整面**，并由
+    `knockout_and_overprint_groups_are_conservative_and_sound` 断言"确实退回整面"。
+- **保守优先**：非有限坐标 / 反向矩形 / 非有限外扩 → 退到"整面"；而**什么都没画**
+  （`dirty == None`）→ **整个合成被跳过**（不是退到整面）。跳过这一条由等价测试反向验证：
+  内容全部被 clip 剪掉的组，与"在整页上合成一个全透明组"必须字节相同。
+- clip 已知的陈旧误差被显式绕开：`push_clip`/`push_clip_stroke` 与旧 clip 求交时只遍历
+  路径 bbox（未按 miter 上界扩），因此**新的 clip 在其自身 bbox 之外仍可能非零**。
+  `clip_bounds` 于是只由**新 clip 自身**的几何导出（不与旧 clip 求交）——否则记账会把这一段
+  裁掉，成为真正的不安全收缩。代价是嵌套 clip 时 region 偏松，方向安全。
+
 
 ### 14.4 执行前必须先做的一步 —— **已做**（2026-09-12）
 
@@ -776,22 +814,78 @@ tiny-skia 的 `draw_pixmap` 对所有混合模式都做正确的 Porter-Duff alp
 | test7 | **100%**（2,174,960 / 2,176,200） | 6.5 ms | **反例**：单组覆盖整页，收窄无收益 |
 
 **判定：方向 1 成立，且比预测更好** —— 两页最慢页的整页合成处理了 **12–14 倍**冗余像素
-（预测假设是 20% 覆盖，实际 7–8%）。同时测量给出了**边界**：单组覆盖整页的页（test7）不受益，
-实现里应保留"覆盖率接近 1 时走原路"的分支以避免无谓的 bbox 记账开销。
+（预测假设是 20% 覆盖，实际 7–8%）。同时测量给出了**边界**：单组覆盖整页的页（test7）不受益。
+（§14.4 当时据此建议"保留覆盖率接近 1 时走原路的分支"；落地时发现收窄本身不引入额外开销，
+不需要该分支 —— 见 §14.3 第 2 条。）
 
-### 14.5 收益预测（待验证，依据已从 14.4 更新）
+**计数器由此从"探针"变成"结构"**：`mask_composite_px` 现在是**组内容 bbox 面积**（理想收窄
+下界，仍只在开 stats 时统计），并新增两个确定性计数器（§14.7 会给数）：
+
+- `mask_composite_region_px` —— 合成**实际处理**的像素数（Σ region 面积）。这是"做了多少
+  工作"的诚实数字，取代原来的 `页 × 组数`。
+- `mask_composite_leak_px` —— **落在 region 之外的已绘制像素数，恒应为 0**。它是整个优化的
+  正确性判据：只有当 region 真包含组画过的每个像素时，"区间外源 alpha=0"的论证才成立。
+  非 0 即后端丢像素。**测试里断言它**（确定性整数，正好是 CI 该管的东西），并用两次故意的
+  变异验证过它会响 —— 去掉图像绘制的标记、把描边外扩退化成"宽度"，都被它/等价测试抓住。
+
+### 14.5 收益预测（**已由 14.7 实测取代**）
 
 composite 占两页总时间 28–40%；组内容实测只覆盖 **7–8%**，故理想情况下该项可降约 **×12–14**
 → test12 约 −128 ms（≈ −30% 整页）、testpdf-ai 约 −76 ms（≈ −37% 整页）。
-**这仍是预测**：bbox 记账与子矩形合成的开销会吃掉一部分，且 test7 这类页不受益。
-落地后必须用 `mask_composite_ns` 复测说话。
+**实测更快**（−39% / −51%）：预测没有算进"mask fold 也一起收窄"这一项。
 
-### 14.6 验证协议（不可省）
+### 14.6 验证协议 —— **已全部执行**（结果见 14.7）
 
-1. `cargo fmt` + clippy + 全部单测；
-2. **同批页 before/after 字节级 PNG 比对**（沿用已验证的 6 页：test8 / test10 / test3 /
-   test6 / zzztest2 / testpdf-ai，覆盖字形、图像、clip）—— 必须**完全一致**，不是 MAE 很小；
-3. `backend/cpu_stats` 复测 `mask_composite_ns` 确认收益；
-4. CPU↔GPU oracle 套件（`gpu_softmask` / `gpu_overprint` / `gpu_acceptance`）仍通过 —— 它们
-   会抓住任何 CPU 侧像素变化。
+1. `cargo fmt` + clippy + 全部单测 —— ✅ clippy 无告警；workspace 全部测试通过
+   （新增 11 个测试：9 个等价/边界测试 + 1 个泄漏判据自检 + 1 个保守性断言）；
+2. **同批页 before/after 字节级 PNG 比对** —— ✅ 计划里是 6 页，实际做了 **25 页**：
+   计划那 6 页之外补上**全部有混合组的页**（test12 两页 / test7 / testpdf-ai 两页）
+   与全部 9 张合成语料夹具。**25/25 字节完全一致**（sha256）；
+3. `backend/cpu_stats` 复测 `mask_composite_ns` —— ✅ 同机 before/after，见 14.7；
+4. CPU↔GPU oracle 套件 —— ✅ `gpu_softmask`（6）/ `gpu_overprint`（6）/ `gpu_acceptance`（3）
+   全部通过。它们逐像素比对 CPU↔GPU，任何 CPU 侧像素变化都躲不过。
+5. **（协议之外补做）failed 语料鲁棒性回归** —— ✅ 用 `tests/failed_run.sh` 跑全部 **618 个**
+   对抗性 PDF（16 路并行、每个 20 s 上限），before/after **逐文件状态完全一致**
+   （425 OK / 193 FAIL / 0 TIMEOUT / 0 PANIC，按路径排序后逐行相同）。193 个 FAIL 全是解析级
+   错误（失配 xref / 无可用页 / 非 PDF），渲染根本没开始，故与本次改动无关。
+
+
+### 14.7 实测结果（2026-09-12，同机 before/after）
+
+**生产路径（criterion `backend/cpu_reused`，150 DPI，timing 关闭）**。同一代码库两次运行之间
+无混合组的页本身就有 ±3–7% 漂移（实测：test11 两次 after 相差 6.4%），故只有远超噪声的数字
+才算收益：
+
+| 页 | before | after（两次） | 变化 |
+|---|---|---|---|
+| test12（18 组） | 382.0 ms | 228.2 / 233.0 ms | **−39% ~ −40%** |
+| testpdf-ai（12 组） | 206.3 ms | 96.6 / 101.6 ms | **−51% ~ −53%** |
+| test7（1 组，覆盖整页） | 49.5 ms | 48.9 / 50.3 ms | 噪声内（预测如此） |
+| test8 / test10（text） | 9.52 / 18.94 | 9.53 / 19.00 | 噪声内 |
+| test11 / test2（vector） | 22.38 / 23.47 | 23.87·22.33 / 24.62·24.14 | 噪声内（两次 after 自相差 6%） |
+| test4（image，无组） | 19.65 | 18.39 / 19.03 | 噪声内 |
+
+**阶段分解（`backend/cpu_stats`，timing 开启，同机 before/after，ms）**：
+
+| 页 | total | soft-mask | composite | fold | render | reduce |
+|---|---|---|---|---|---|---|
+| test12 | 399.3 → **261.4** | 278.8 → **146.4** | 135.2 → **14.4**（×9.4） | 17.7 → **1.8** | 63.8 → 55.1 | 38.2 → 38.7 |
+| testpdf-ai | 214.6 → **123.0** | 164.5 → **74.9** | 82.8 → **7.5**（×11.1） | 32.1 → **3.3** | 22.0 → 23.2 | 5.8 → 6.1 |
+| test7 | 51.9 → 50.8 | 8.1 → 9.7 | 6.62 → 6.55 | — | — | — |
+
+**覆盖率计数器（after，`backend/cpu_stats`）**：
+
+| 页 | 组内容 bbox | 实际 region | 页 × 组数 | 收窄后占比 | leak |
+|---|---|---|---|---|---|
+| testpdf-ai | 2,250,000 | 2,259,384 | 27,000,000 | **8%** | **0** |
+| test12 | 2,719,406 | 3,630,452 | 37,867,500 | **10%** | **0** |
+| test7 | 2,174,960 | 2,176,200 | 2,176,200 | 100% | **0** |
+
+region 比组内容 bbox 大 0.4%（testpdf-ai）到 33%（test12）：前者是 AA 外扩与 ceil 的必然
+余量，后者来自"多个不相交绘制的包围盒并集 + clip 与 AA 余量"——仍然是 10 倍的收窄，
+且 region 偏大只会多花时间，不会出错。**leak 全页为 0**。
+
+**顺带**：`mask_render_ns` 在 test12 上 63.8 → 55.1 ms —— 遮蔽组自身的子渲染里也有混合组，
+它们一并被收窄，这一项不在原预测内。
+
 

@@ -9,6 +9,13 @@ use zpdf_render::{PageRenderInfo, RenderBackend};
 
 pub struct CpuRenderer<'a> {
     pixmap: Option<tiny_skia::Pixmap>,
+    /// Device region the current target surface has been painted in since it
+    /// became the target — see [`PaintedBounds`]. `None` == painted nothing.
+    ///
+    /// A blend group installs a fresh surface (region reset to nothing) and
+    /// claims its region back at pop, which is what confines the group's
+    /// composite and mask fold to the part of the page the group used.
+    dirty: Option<PaintedBounds>,
     scale: f32,
     /// Page rect bounds (supports CropBox / nonzero MediaBox origins):
     /// device x = (x - rect_x0) * scale, device y = (rect_y1 - y) * scale.
@@ -26,6 +33,11 @@ pub struct CpuRenderer<'a> {
     max_soft_mask_cache_bytes: u64,
     clip_stack: Vec<ClipFrame>,
     current_clip: Option<tiny_skia::Mask>,
+    /// Device region of the active clip, tracking `current_clip` frame for
+    /// frame. Intersecting a draw's extent with it keeps the painted region of a
+    /// surface inside the clip that constrains it, without having to inspect the
+    /// mask's pixels. `None` while no clip is active.
+    clip_bounds: Option<PaintedBounds>,
     /// Cumulative full-raster clip-mask work (Σ width·height over built clip
     /// masks). Bounds the O(clips × raster) cost of the raster-mask clip model:
     /// pathological pages (100k+ tiny W clips on a large raster) would otherwise
@@ -150,33 +162,133 @@ fn shift_plane(base: &[u8], w: u32, h: u32, dx: i64, dy: i64, fill: u8) -> Vec<u
     out
 }
 
-/// Bounding-box area of pixels with non-zero alpha, or 0 when fully transparent.
+/// A half-open device-pixel region `[x0, x1) × [y0, y1)` of the current target
+/// surface: the union of everything painted onto it since it became the target.
 ///
-/// Diagnostic for scoping group composites: the composite only needs to touch
-/// this rectangle. A bounding box (not exact coverage) is the right shape, since
-/// it is what a region-scoped `draw_pixmap` would actually process.
+/// This is what lets a blend group's composite be confined to the part of the
+/// page the group actually used. The region must always be a **superset** of
+/// the painted pixels: outside it a group is fully transparent, and a blend of
+/// zero source alpha leaves the backdrop pixel-identical for every blend mode
+/// (PDF 11.4.7 Porter-Duff semantics), so skipping those pixels is exact. Every
+/// draw site therefore grows its own extent conservatively — anti-aliased edges,
+/// stroke miter overshoot, the transformed corners of an image — and any extent
+/// that cannot be established with certainty degrades to the whole surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PaintedBounds {
+    x0: u32,
+    y0: u32,
+    x1: u32,
+    y1: u32,
+}
+
+impl PaintedBounds {
+    fn whole(width: u32, height: u32) -> Self {
+        Self {
+            x0: 0,
+            y0: 0,
+            x1: width,
+            y1: height,
+        }
+    }
+
+    fn union(self, other: Self) -> Self {
+        Self {
+            x0: self.x0.min(other.x0),
+            y0: self.y0.min(other.y0),
+            x1: self.x1.max(other.x1),
+            y1: self.y1.max(other.y1),
+        }
+    }
+
+    /// Intersection; may be empty (inverted), which [`Self::is_empty`] reports.
+    fn intersect(self, other: Self) -> Self {
+        Self {
+            x0: self.x0.max(other.x0),
+            y0: self.y0.max(other.y0),
+            x1: self.x1.min(other.x1),
+            y1: self.y1.min(other.y1),
+        }
+    }
+
+    fn is_empty(self) -> bool {
+        self.x1 <= self.x0 || self.y1 <= self.y0
+    }
+
+    fn area(self) -> u64 {
+        self.x1.saturating_sub(self.x0) as u64 * self.y1.saturating_sub(self.y0) as u64
+    }
+
+    /// The region as a device-space rectangle, or `None` when it is empty.
+    ///
+    /// The coordinates are integers below 2^24 (a raster dimension), so the
+    /// `u32` → `f32` conversion is exact.
+    fn to_rect(self) -> Option<tiny_skia::Rect> {
+        if self.is_empty() {
+            return None;
+        }
+        tiny_skia::Rect::from_ltrb(
+            self.x0 as f32,
+            self.y0 as f32,
+            self.x1 as f32,
+            self.y1 as f32,
+        )
+    }
+}
+
+/// One pass over a finished group raster, returning its non-transparent
+/// bounding box and the number of painted pixels that fall *outside* `region`.
 ///
-/// Costs a full pass, so callers gate it on stats collection being enabled.
-fn opaque_bounds_area(pixmap: &tiny_skia::Pixmap) -> u64 {
+/// The second number is what makes the scoped composite trustworthy: if any
+/// painted pixel lies outside the region the composite is confined to, the
+/// region is not the superset the "zero alpha changes nothing" argument needs,
+/// and the page would come out wrong. It is expected to be 0 on every page, and
+/// being a deterministic integer it is assertable in tests rather than trusted.
+///
+/// Costs a full pass, so callers gate it on stats collection being enabled —
+/// in production neither number is computed.
+fn group_coverage(
+    pixmap: &tiny_skia::Pixmap,
+    region: Option<PaintedBounds>,
+) -> (Option<PaintedBounds>, u64) {
     let (w, h) = (pixmap.width(), pixmap.height());
     let data = pixmap.data();
-    let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0u32, 0u32);
+    let mut content: Option<PaintedBounds> = None;
+    let mut leak = 0u64;
     for y in 0..h {
         let row = (y as usize) * (w as usize) * 4;
         for x in 0..w {
             // Premultiplied RGBA; alpha is the fourth byte.
-            if data[row + (x as usize) * 4 + 3] != 0 {
-                x0 = x0.min(x);
-                y0 = y0.min(y);
-                x1 = x1.max(x);
-                y1 = y1.max(y);
+            if data[row + (x as usize) * 4 + 3] == 0 {
+                continue;
             }
+            let inside = region.is_some_and(|r| x >= r.x0 && x < r.x1 && y >= r.y0 && y < r.y1);
+            if !inside {
+                leak += 1;
+            }
+            let pixel = PaintedBounds {
+                x0: x,
+                y0: y,
+                x1: x + 1,
+                y1: y + 1,
+            };
+            content = Some(match content {
+                Some(c) => c.union(pixel),
+                None => pixel,
+            });
         }
     }
-    if x1 < x0 || y1 < y0 {
-        return 0;
-    }
-    (x1 - x0 + 1) as u64 * (y1 - y0 + 1) as u64
+    (content, leak)
+}
+
+/// How far a stroke's ink can reach beyond its centerline's bounding box: a
+/// miter join is the worst case, at `miter_limit/2 × width` from the vertex
+/// (PDF's default limit is 10, so this is not the `width/2` a round join needs),
+/// plus one device pixel for the anti-aliased edge.
+///
+/// `width` and `miter_limit` come from the built [`tiny_skia::Stroke`], whose
+/// width is already floored to one device pixel and finite.
+fn stroke_overshoot(width: f32, miter_limit: f32) -> f32 {
+    width * miter_limit.max(2.0) * 0.5 + 1.0
 }
 
 /// Default [`CpuRenderer::render_budget`]. Generous enough that no realistic page
@@ -186,9 +298,12 @@ const DEFAULT_RENDER_BUDGET: std::time::Duration = std::time::Duration::from_sec
 
 /// A saved clip state for the clip stack. `Skipped` records a budget-dropped
 /// `PushClip` so its matching `PopClip` leaves `current_clip` untouched.
+///
+/// A `Mask` frame carries the device region of the clip it restores, so
+/// `clip_bounds` can be unwound in lockstep with `current_clip`.
 enum ClipFrame {
     Empty,
-    Mask(tiny_skia::Mask),
+    Mask(tiny_skia::Mask, Option<PaintedBounds>),
     Skipped,
 }
 
@@ -243,6 +358,10 @@ struct BlendEntry {
     /// The parked parent raster (the group's backdrop), restored and composited
     /// onto at `pop`. A 1×1 placeholder for a `passthrough` entry.
     pixmap: tiny_skia::Pixmap,
+    /// The backdrop surface's painted region, carried across the group so `pop`
+    /// can put it back and extend it by what the composite touches. `None` for
+    /// a `passthrough` entry, which never leaves the backdrop surface.
+    dirty: Option<PaintedBounds>,
     blend_mode: BlendMode,
     /// Group constant alpha applied at composite time.
     alpha: f32,
@@ -280,6 +399,7 @@ impl<'a> CpuRenderer<'a> {
         let limits = ParseLimits::default();
         Self {
             pixmap: None,
+            dirty: None,
             scale: 1.0,
             rect_x0: 0.0,
             rect_y0: 0.0,
@@ -291,6 +411,7 @@ impl<'a> CpuRenderer<'a> {
             max_soft_mask_cache_bytes: limits.max_softmask_cache_bytes,
             clip_stack: Vec::new(),
             current_clip: None,
+            clip_bounds: None,
             clip_pixel_spent: 0,
             clip_mask_bytes: 0,
             blend_stack: Vec::new(),
@@ -408,6 +529,82 @@ impl<'a> CpuRenderer<'a> {
         Some(path)
     }
 
+    /// Record that the current target surface may have been painted inside
+    /// `bounds` (device space), grown by `grow` device pixels to cover what the
+    /// rasterizer legitimately overshoots the geometry by.
+    ///
+    /// Called after every successful draw onto the target, never for drawing
+    /// into a scratch raster (whose extent the caller re-establishes itself).
+    fn mark_painted(&mut self, bounds: tiny_skia::Rect, grow: f32) {
+        let Some((width, height)) = self.pixmap.as_ref().map(|p| (p.width(), p.height())) else {
+            return;
+        };
+        let mut region = Self::drawn_extent(bounds, grow, width, height);
+        if let Some(clip) = self.clip_bounds {
+            region = region.intersect(clip);
+        }
+        if region.is_empty() {
+            // Provably nothing: entirely off-surface, or entirely outside the clip.
+            return;
+        }
+        self.dirty = Some(match self.dirty {
+            Some(dirty) => dirty.union(region),
+            None => region,
+        });
+    }
+
+    /// Record that the whole target surface may have been painted — for a draw
+    /// whose extent cannot be established, or one that merges over the full
+    /// raster by construction. Still narrowed by the active clip, which is the
+    /// only bound that is known to hold.
+    fn mark_all_painted(&mut self) {
+        let Some((width, height)) = self.pixmap.as_ref().map(|p| (p.width(), p.height())) else {
+            return;
+        };
+        let mut region = PaintedBounds::whole(width, height);
+        if let Some(clip) = self.clip_bounds {
+            region = region.intersect(clip);
+        }
+        if region.is_empty() {
+            return;
+        }
+        self.dirty = Some(match self.dirty {
+            Some(dirty) => dirty.union(region),
+            None => region,
+        });
+    }
+
+    /// The conservative device extent of a draw with this geometry: `bounds`
+    /// grown by `grow`, clamped to the surface.
+    ///
+    /// Anything that cannot be bounded — a non-finite coordinate or grow, an
+    /// inverted rectangle — degrades to the whole surface, because an extent
+    /// that is too small silently drops pixels while one that is too large only
+    /// costs time.
+    fn drawn_extent(bounds: tiny_skia::Rect, grow: f32, width: u32, height: u32) -> PaintedBounds {
+        let (left, top, right, bottom) =
+            (bounds.left(), bounds.top(), bounds.right(), bounds.bottom());
+        let bounded = left.is_finite()
+            && top.is_finite()
+            && right.is_finite()
+            && bottom.is_finite()
+            && grow.is_finite()
+            && right >= left
+            && bottom >= top;
+        if !bounded {
+            return PaintedBounds::whole(width, height);
+        }
+        // Floor/ceil, not round: a pixel whose *cell* the geometry touches
+        // receives coverage even when the path's edge lies inside it.
+        let grow = grow.max(0.0);
+        PaintedBounds {
+            x0: (left - grow).floor().clamp(0.0, width as f32) as u32,
+            y0: (top - grow).floor().clamp(0.0, height as f32) as u32,
+            x1: (right + grow).ceil().clamp(0.0, width as f32) as u32,
+            y1: (bottom + grow).ceil().clamp(0.0, height as f32) as u32,
+        }
+    }
+
     fn build_skia_path(&self, path: &Path) -> Option<tiny_skia::Path> {
         let mut pb = tiny_skia::PathBuilder::new();
         for elem in &path.elements {
@@ -479,6 +676,11 @@ impl<'a> CpuRenderer<'a> {
             );
             painted = true;
         }
+        if painted {
+            // One device pixel of slack: a pixel the path only clips the corner
+            // of still receives anti-aliased coverage.
+            self.mark_painted(skia_path.bounds(), 1.0);
+        }
         self.tock(t, |s| &mut s.fill_ns);
         self.count(painted as u64, |s| &mut s.fills);
     }
@@ -503,6 +705,12 @@ impl<'a> CpuRenderer<'a> {
                 self.current_clip.as_ref(),
             );
             painted = true;
+        }
+        if painted {
+            // The *centerline's* bounds say nothing about how far the ink
+            // reaches: joins, caps and miters all extend past it.
+            let grow = stroke_overshoot(stroke.width, stroke.miter_limit);
+            self.mark_painted(skia_path.bounds(), grow);
         }
         self.tock(t, |s| &mut s.stroke_ns);
         self.count(painted as u64, |s| &mut s.strokes);
@@ -655,11 +863,18 @@ impl<'a> CpuRenderer<'a> {
         }
 
         let frame = match self.current_clip.take() {
-            Some(old) => ClipFrame::Mask(old),
+            Some(old) => ClipFrame::Mask(old, self.clip_bounds),
             None => ClipFrame::Empty,
         };
         self.clip_stack.push(frame);
         self.current_clip = Some(mask);
+        // The new clip's device extent: its path's bbox plus the anti-aliased
+        // edge. It is deliberately *not* intersected with the outgoing clip.
+        // The mask is only combined with that clip across a bbox-restricted
+        // loop, so outside the loop the mask keeps the new path's own coverage;
+        // a region that must contain every pixel the active mask can be
+        // non-zero in therefore has to come from the new clip alone.
+        self.clip_bounds = Some(Self::drawn_extent(skia_path.bounds(), 1.0, pw, ph));
         self.tock(t, |s| &mut s.clip_ns);
         self.count(1, |s| &mut s.clips_pushed);
     }
@@ -669,12 +884,13 @@ impl<'a> CpuRenderer<'a> {
         match self.clip_stack.pop() {
             // Budget-skipped push: leave the active clip untouched.
             Some(ClipFrame::Skipped) => {}
-            Some(ClipFrame::Mask(prev)) => {
+            Some(ClipFrame::Mask(prev, prev_bounds)) => {
                 if let Some(removed) = self.current_clip.replace(prev) {
                     self.clip_mask_bytes = self
                         .clip_mask_bytes
                         .saturating_sub(removed.width() as u64 * removed.height() as u64);
                 }
+                self.clip_bounds = prev_bounds;
             }
             Some(ClipFrame::Empty) => {
                 if let Some(mask) = self.current_clip.take() {
@@ -682,6 +898,7 @@ impl<'a> CpuRenderer<'a> {
                         .clip_mask_bytes
                         .saturating_sub(mask.width() as u64 * mask.height() as u64);
                 }
+                self.clip_bounds = None;
             }
             None => {}
         }
@@ -753,11 +970,15 @@ impl<'a> CpuRenderer<'a> {
         }
 
         let frame = match self.current_clip.take() {
-            Some(old) => ClipFrame::Mask(old),
+            Some(old) => ClipFrame::Mask(old, self.clip_bounds),
             None => ClipFrame::Empty,
         };
         self.clip_stack.push(frame);
         self.current_clip = Some(mask);
+        // Same reasoning as `push_clip`, with the stroke's own overshoot: the
+        // centerline bbox says nothing about where the stroked outline reaches.
+        let grow = stroke_overshoot(stroke.width, stroke.miter_limit);
+        self.clip_bounds = Some(Self::drawn_extent(skia_path.bounds(), grow, pw, ph));
     }
 
     fn push_blend_group(
@@ -802,6 +1023,7 @@ impl<'a> CpuRenderer<'a> {
             if let Some(sentinel) = tiny_skia::Pixmap::new(1, 1) {
                 self.blend_stack.push(BlendEntry {
                     pixmap: sentinel,
+                    dirty: None,
                     blend_mode,
                     alpha,
                     mask: None,
@@ -827,6 +1049,7 @@ impl<'a> CpuRenderer<'a> {
             if let Some(sentinel) = tiny_skia::Pixmap::new(1, 1) {
                 self.blend_stack.push(BlendEntry {
                     pixmap: sentinel,
+                    dirty: None,
                     blend_mode,
                     alpha,
                     mask: None,
@@ -851,8 +1074,13 @@ impl<'a> CpuRenderer<'a> {
         // full-page transparent pixmap merely to represent that fact.
         let backdrop = None;
 
+        // The backdrop's painted region is parked with it; the group gets a
+        // fresh, empty surface of its own.
+        let backdrop_dirty = self.dirty.take();
+
         self.blend_stack.push(BlendEntry {
             pixmap,
+            dirty: backdrop_dirty,
             blend_mode,
             alpha,
             mask: mask_plane,
@@ -886,25 +1114,52 @@ impl<'a> CpuRenderer<'a> {
             Some(p) => p,
             None => {
                 self.pixmap = Some(entry.pixmap);
+                // Nothing was composited, so the backdrop's painted region is
+                // exactly what it was before the group opened.
+                self.dirty = entry.dirty;
                 self.tock(t, |s| &mut s.soft_mask_ns);
                 return;
             }
         };
 
+        // The group's painted region, claimed from the surface being retired.
+        // `None` (or an empty region) means it painted nothing, which makes the
+        // fold and the composite below no-ops: the backdrop is left untouched
+        // and cannot have been affected.
+        let group_dirty = self.dirty.take();
+        let region = group_dirty.filter(|r| !r.is_empty());
+
         // Fold the soft mask into the group: premultiplied RGBA scales
-        // uniformly by the per-pixel mask coverage.
-        if let Some(plane) = &entry.mask {
+        // uniformly by the per-pixel mask coverage. Confined to the composite
+        // region — outside it the group is transparent, and a transparent pixel
+        // stays transparent under any fold, so the composite (confined to the
+        // same region) cannot observe the difference.
+        if let (Some(plane), Some(region)) = (&entry.mask, region) {
             let t_fold = self.tick();
+            let stride = group_pixmap.width() as usize;
+            debug_assert_eq!(
+                plane.len(),
+                stride * group_pixmap.height() as usize,
+                "a mask plane is page-sized, like every surface it is folded into"
+            );
+            let (x0, x1) = (region.x0 as usize, region.x1 as usize);
             let data = group_pixmap.data_mut();
-            for (px, &m) in data.as_chunks_mut::<4>().0.iter_mut().zip(plane.iter()) {
-                if m == 255 {
+            for y in region.y0 as usize..region.y1 as usize {
+                let row = y * stride;
+                let Some(m_row) = plane.get(row + x0..row + x1) else {
                     continue;
+                };
+                let px_row = &mut data[(row + x0) * 4..(row + x1) * 4];
+                for (px, &m) in px_row.as_chunks_mut::<4>().0.iter_mut().zip(m_row.iter()) {
+                    if m == 255 {
+                        continue;
+                    }
+                    let m = m as u16;
+                    px[0] = ((px[0] as u16 * m) / 255) as u8;
+                    px[1] = ((px[1] as u16 * m) / 255) as u8;
+                    px[2] = ((px[2] as u16 * m) / 255) as u8;
+                    px[3] = ((px[3] as u16 * m) / 255) as u8;
                 }
-                let m = m as u16;
-                px[0] = ((px[0] as u16 * m) / 255) as u8;
-                px[1] = ((px[1] as u16 * m) / 255) as u8;
-                px[2] = ((px[2] as u16 * m) / 255) as u8;
-                px[3] = ((px[3] as u16 * m) / 255) as u8;
             }
             self.tock(t_fold, |s| &mut s.mask_fold_ns);
         }
@@ -918,25 +1173,36 @@ impl<'a> CpuRenderer<'a> {
             ..Default::default()
         };
 
-        // Diagnostic, and a full pass — so only while collecting stats. Written
-        // before the composite timer starts so it does not inflate that bucket.
+        // Diagnostics, and a full pass — so only while collecting stats, and
+        // written before the composite timer starts so they cannot inflate that
+        // bucket. `content` is the ideal scope, `region` what was actually
+        // processed, and `leak` must be zero: any painted pixel outside the
+        // region would mean the region is not the superset the composite's
+        // correctness rests on.
         if self.stage_stats.is_some() {
-            let area = opaque_bounds_area(&group_pixmap);
-            self.count(area, |s| &mut s.mask_composite_px);
+            let (content, leak) = group_coverage(&group_pixmap, region);
+            self.count(content.map_or(0, PaintedBounds::area), |s| {
+                &mut s.mask_composite_px
+            });
+            self.count(region.map_or(0, PaintedBounds::area), |s| {
+                &mut s.mask_composite_region_px
+            });
+            self.count(leak, |s| &mut s.mask_composite_leak_px);
         }
 
         let t_composite = self.tick();
-        base.draw_pixmap(
-            0,
-            0,
-            group_pixmap.as_ref(),
-            &paint,
-            tiny_skia::Transform::identity(),
-            None,
-        );
+        if let Some(rect) = region.and_then(PaintedBounds::to_rect) {
+            composite_group_region(&mut base, &group_pixmap, &paint, rect);
+        }
         self.tock(t_composite, |s| &mut s.mask_composite_ns);
 
         self.pixmap = Some(base);
+        // The composite can only have touched the group's region, so the
+        // backdrop's region is its own plus that.
+        self.dirty = match (entry.dirty, group_dirty) {
+            (Some(backdrop), Some(group)) => Some(backdrop.union(group)),
+            (backdrop, group) => backdrop.or(group),
+        };
         self.blend_surface_bytes = self
             .blend_surface_bytes
             .saturating_sub(group_pixmap.width() as u64 * group_pixmap.height() as u64 * 4);
@@ -1010,6 +1276,9 @@ impl<'a> CpuRenderer<'a> {
         }
 
         // Pass 1: the element as painted (real colour and opacity).
+        // The scratch passes below draw into throwaway surfaces, so the region
+        // the *canvas* has been painted in is put aside and restored after them.
+        let canvas_dirty = self.dirty;
         let group = self.pixmap.take();
         self.pixmap = tiny_skia::Pixmap::new(w, h);
         if self.pixmap.is_none() {
@@ -1030,6 +1299,7 @@ impl<'a> CpuRenderer<'a> {
         let shape = self.pixmap.take();
 
         self.pixmap = group;
+        self.dirty = canvas_dirty;
         let (elem, shape) = match (elem, shape) {
             (Some(e), Some(s)) => (e, s),
             _ => return,
@@ -1038,6 +1308,9 @@ impl<'a> CpuRenderer<'a> {
             let b0 = entry.backdrop.as_ref().map(|p| p.data());
             knockout_merge(g.data_mut(), elem.data(), shape.data(), b0);
         }
+        // The merge walks the whole raster (it reads each pixel's coverage to
+        // decide whether to replace or keep), so no useful bound survives it.
+        self.mark_all_painted();
     }
 
     /// Paint an overprinting element (PDF 8.6.7): render it alone to capture
@@ -1063,6 +1336,9 @@ impl<'a> CpuRenderer<'a> {
         }
         // Render the element (real colour/opacity, current clip) into a scratch
         // buffer; only its alpha channel — the covered fraction — is consumed.
+        // As in `knockout_paint`, the canvas's painted region is put aside while
+        // the scratch surface is the target.
+        let canvas_dirty = self.dirty;
         let canvas = self.pixmap.take();
         self.pixmap = tiny_skia::Pixmap::new(w, h);
         if self.pixmap.is_none() {
@@ -1074,9 +1350,12 @@ impl<'a> CpuRenderer<'a> {
         self.render_paint_cmd(cmd);
         let elem = self.pixmap.take();
         self.pixmap = canvas;
+        self.dirty = canvas_dirty;
         if let (Some(canvas), Some(elem)) = (self.pixmap.as_mut(), elem) {
             overprint_merge(canvas.data_mut(), elem.data(), op);
         }
+        // The merge reads and writes whole pixels across the raster.
+        self.mark_all_painted();
     }
 
     /// Coverage plane for `mask`, honoring its page-space offset. The base
@@ -1180,6 +1459,10 @@ impl<'a> CpuRenderer<'a> {
 
         let mut sub = CpuRenderer {
             pixmap: Some(target),
+            // The sub-renderer's own target starts as the mask group's backdrop
+            // and is composited nowhere, so only its nested groups' regions
+            // matter — and those start empty.
+            dirty: None,
             scale: self.scale,
             rect_x0: self.rect_x0,
             rect_y0: self.rect_y0,
@@ -1191,6 +1474,7 @@ impl<'a> CpuRenderer<'a> {
             max_soft_mask_cache_bytes: self.max_soft_mask_cache_bytes,
             clip_stack: Vec::new(),
             current_clip: None,
+            clip_bounds: None,
             clip_pixel_spent: 0,
             clip_mask_bytes: 0,
             blend_stack: Vec::new(),
@@ -1423,6 +1707,18 @@ impl<'a> CpuRenderer<'a> {
             pixmap.draw_pixmap(0, 0, src, &paint, transform, self.current_clip.as_ref());
             drawn = true;
         }
+        if drawn {
+            // The image occupies the unit square in its own space, so its device
+            // footprint is that square's transformed corners — the same thing the
+            // CTM above maps the samples through, not the source rectangle.
+            let footprint = tiny_skia::Rect::from_ltrb(0.0, 0.0, iw, ih)
+                .and_then(|unit| unit.transform(transform));
+            match footprint {
+                Some(footprint) => self.mark_painted(footprint, 1.0),
+                // A non-finite transform: the footprint cannot be established.
+                None => self.mark_all_painted(),
+            }
+        }
         self.tock(t, |s| &mut s.image_ns);
         self.count(drawn as u64, |s| &mut s.images);
     }
@@ -1463,7 +1759,7 @@ impl<'a> CpuRenderer<'a> {
                 &outline, upem, font_size, h_scale, tm, glyph.x, glyph.y,
             );
             if let Some(path) = skia_path {
-                if let Some(ref mut pixmap) = self.pixmap {
+                let painted = if let Some(ref mut pixmap) = self.pixmap {
                     pixmap.fill_path(
                         &path,
                         paint,
@@ -1471,6 +1767,15 @@ impl<'a> CpuRenderer<'a> {
                         tiny_skia::Transform::identity(),
                         self.current_clip.as_ref(),
                     );
+                    true
+                } else {
+                    false
+                };
+                if painted {
+                    // Marked from the *transformed* outline's own bounds rather
+                    // than an em-box estimate: advance widths, italic overshoot
+                    // and a rotated text matrix all move the ink off the box.
+                    self.mark_painted(path.bounds(), 1.0);
                 }
             }
             self.tock(t_raster, |s| &mut s.glyph_raster_ns);
@@ -1600,6 +1905,9 @@ impl<'a> CpuRenderer<'a> {
                                     self.current_clip.as_ref(),
                                 );
                             }
+                            // Type3 ink is an ordinary device path here, so it
+                            // bounds exactly like any other fill's.
+                            self.mark_painted(skia_path.bounds(), 1.0);
                         }
                     }
                     RenderCommand::StrokePath { path, style, .. } => {
@@ -1628,6 +1936,8 @@ impl<'a> CpuRenderer<'a> {
                                     self.current_clip.as_ref(),
                                 );
                             }
+                            let grow = stroke_overshoot(stroke.width, stroke.miter_limit);
+                            self.mark_painted(skia_path.bounds(), grow);
                         }
                     }
                     _ => {}
@@ -1751,6 +2061,40 @@ impl<'a> Default for CpuRenderer<'a> {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Composite a finished blend group onto its backdrop, confined to `region`
+/// (device pixels, half-open) instead of the whole raster.
+///
+/// Equivalent to `base.draw_pixmap(0, 0, group, paint, identity, None)` and
+/// pixel-identical to it inside the region: same pattern shader, same filter
+/// quality, same blend pipeline, same integer alignment. The only difference is
+/// that the blit stops at the region, which is exact wherever the group is
+/// transparent — a zero source alpha leaves the backdrop unchanged under every
+/// blend mode, since the general Porter-Duff form `s·(1−da) + d·(1−sa) +
+/// B(s,d)·sa·da` with `sa = 0` reduces to `d`. `region` must therefore contain
+/// every pixel the group painted (see [`PaintedBounds`]).
+fn composite_group_region(
+    base: &mut tiny_skia::Pixmap,
+    group: &tiny_skia::Pixmap,
+    paint: &tiny_skia::PixmapPaint,
+    region: tiny_skia::Rect,
+) {
+    let scoped = tiny_skia::Paint {
+        shader: tiny_skia::Pattern::new(
+            group.as_ref(),
+            tiny_skia::SpreadMode::Pad,
+            paint.quality,
+            paint.opacity,
+            tiny_skia::Transform::identity(),
+        ),
+        blend_mode: paint.blend_mode,
+        // A pixmap blit is not anti-aliased in Skia either, and the region is
+        // aligned to whole pixels, so there is nothing to anti-alias.
+        anti_alias: false,
+        ..Default::default()
+    };
+    base.fill_rect(region, &scoped, tiny_skia::Transform::identity(), None);
 }
 
 /// Knockout merge: `group = lerp(group, elem OVER b0, shape)`, in place,
@@ -1927,6 +2271,7 @@ impl<'a> RenderBackend for CpuRenderer<'a> {
         // A failed replacement must not leave the previous page available to a
         // later `end_page` call.
         self.pixmap = None;
+        self.dirty = None;
         self.scale = info.scale;
         self.rect_x0 = info.page_rect.x0 as f32;
         self.rect_y0 = info.page_rect.y0 as f32;
@@ -1935,6 +2280,7 @@ impl<'a> RenderBackend for CpuRenderer<'a> {
         // reused). An unbalanced group from a prior page must not leak through.
         self.clip_stack.clear();
         self.current_clip = None;
+        self.clip_bounds = None;
         self.blend_stack.clear();
         self.blend_surface_bytes = 0;
         self.skipped_blend_depth = 0;
@@ -2111,6 +2457,7 @@ impl<'a> RenderBackend for CpuRenderer<'a> {
         let data = pixmap.take();
         self.clip_stack.clear();
         self.current_clip = None;
+        self.clip_bounds = None;
         self.clip_mask_bytes = 0;
         self.soft_mask_planes.clear();
         self.soft_mask_cache_bytes = 0;
@@ -2743,6 +3090,32 @@ mod tests {
         (fonts, id)
     }
 
+    /// A Type3 font whose glyph 1 is a single filled square, drawn by a content
+    /// stream. Type3 glyph streams are interpreted *inside* the renderer, so they
+    /// are the one content family whose painted extent is not obvious from the
+    /// display list.
+    fn type3_fonts() -> (FontCache, zpdf_font::FontId) {
+        let mut char_procs: HashMap<String, Arc<[u8]>> = HashMap::new();
+        // A 600×600 square in glyph space (the FontMatrix scales by 1/1000).
+        char_procs.insert("g1".to_string(), Arc::from(&b"100 100 600 600 re f\n"[..]));
+        let font = zpdf_font::LoadedFont::new_with_data(
+            zpdf_font::PdfFontType::Type3 {
+                font_matrix: [0.001, 0.0, 0.0, 0.001, 0.0, 0.0],
+                char_procs,
+                encoding: vec!["g0".into(), "g1".into()],
+                widths: vec![1000.0, 1000.0],
+                first_char: 0,
+            },
+            "ZpdfType3".into(),
+            Vec::new(),
+            zpdf_font::CidWidths::new(1000.0),
+        );
+        assert!(font.is_type3(), "the fixture must reach the Type3 path");
+        let mut fonts = FontCache::new();
+        let id = fonts.insert("ZpdfType3".into(), font);
+        (fonts, id)
+    }
+
     fn rect_path(x0: f64, y0: f64, x1: f64, y1: f64) -> Path {
         let mut p = Path::new();
         p.move_to(Point::new(x0, y0));
@@ -2921,5 +3294,648 @@ mod tests {
         );
         assert_eq!(s.fills, 1);
         assert_eq!(s.glyph_outlines_parsed, 0);
+    }
+
+    // --- scoped blend-group composites (performance notes §14.3) -------------
+
+    /// Device pixels of a display list's page raster.
+    fn raster_pixels(dl: &DisplayList, scale: f32) -> u64 {
+        let w = (dl.page_rect.width() * scale as f64).ceil().max(1.0) as u64;
+        let h = (dl.page_rect.height() * scale as f64).ceil().max(1.0) as u64;
+        w * h
+    }
+
+    /// How many blend groups the display list opens.
+    fn group_count(dl: &DisplayList) -> u64 {
+        dl.commands
+            .iter()
+            .filter(|c| matches!(c, RenderCommand::PushBlendGroup { .. }))
+            .count() as u64
+    }
+
+    fn solid_rect(color: Color, x0: f64, y0: f64, x1: f64, y1: f64) -> RenderCommand {
+        RenderCommand::FillPath {
+            path: rect_path(x0, y0, x1, y1),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(color),
+            alpha: 1.0,
+            overprint: None,
+        }
+    }
+
+    fn group_cmd(
+        mode: BlendMode,
+        isolated: bool,
+        alpha: f32,
+        mask: Option<SoftMask>,
+    ) -> RenderCommand {
+        RenderCommand::PushBlendGroup {
+            blend_mode: mode,
+            isolated,
+            knockout: false,
+            bounds: Rect::new(0.0, 0.0, 100.0, 100.0),
+            alpha,
+            mask,
+        }
+    }
+
+    /// A fully transparent fill of the whole page.
+    ///
+    /// It paints nothing — a zero-alpha source leaves the destination unchanged
+    /// under every blend mode — but it *is* a real draw, so a correct
+    /// painted-region tracker has to widen the group's region to the whole
+    /// surface. That is the lever the equivalence tests below turn: the same
+    /// scene with and without this command composites the group over the whole
+    /// raster and over its content alone, and the two must agree byte for byte.
+    fn invisible_page_fill(dl: &DisplayList) -> RenderCommand {
+        solid_rect(
+            Color::rgba(0.0, 0.0, 0.0, 0.0),
+            dl.page_rect.x0,
+            dl.page_rect.y0,
+            dl.page_rect.x1,
+            dl.page_rect.y1,
+        )
+    }
+
+    fn render_backend(
+        dl: &DisplayList,
+        scale: f32,
+        fonts: Option<&FontCache>,
+        images: Option<&ImageCache>,
+        timing: bool,
+    ) -> (RenderedPage, Option<zpdf_render::StageStats>) {
+        let mut renderer = CpuRenderer::new().with_stage_timing(timing);
+        if let Some(fonts) = fonts {
+            renderer = renderer.with_fonts(fonts);
+        }
+        if let Some(images) = images {
+            renderer = renderer.with_images(images);
+        }
+        let page = renderer.render_display_list(dl, scale).expect("render");
+        (page, renderer.stage_stats())
+    }
+
+    /// Render `build(false)` and `build(true)` — one scene, with and without an
+    /// invisible full-page fill inside its blend groups — and require
+    /// byte-identical rasters.
+    ///
+    /// The fill widens every group's tracked region to the whole surface, so the
+    /// `true` render composites each group the *unscoped* way (a full-raster
+    /// blit: exactly the path the backend took before the region existed) while
+    /// `false` takes the scoped one. If a group's tracked region ever excludes a
+    /// pixel that group painted, that pixel is dropped and the rasters differ —
+    /// which is what pins scoping to pixel identity rather than to "the
+    /// difference is small".
+    ///
+    /// Also the two invariants that make such a comparison worth anything: the
+    /// leak counter is zero (no painted pixel outside the composited region) and
+    /// the composited region is smaller than the full raster the reference used
+    /// (so the two renders really did take different paths).
+    fn assert_scoped_is_pixel_identical(
+        build: impl Fn(bool) -> DisplayList,
+        scale: f32,
+        fonts: Option<&FontCache>,
+        images: Option<&ImageCache>,
+    ) -> zpdf_render::StageStats {
+        let scoped_dl = build(false);
+        let (scoped, stats) = render_backend(&scoped_dl, scale, fonts, images, true);
+        let (reference, _) = render_backend(&build(true), scale, fonts, images, false);
+        assert_eq!(
+            (scoped.width, scoped.height),
+            (reference.width, reference.height),
+            "the two renders produced different raster sizes"
+        );
+        if scoped.data != reference.data {
+            let byte = scoped
+                .data
+                .iter()
+                .zip(reference.data.iter())
+                .position(|(a, b)| a != b)
+                .unwrap_or(0);
+            let pixel = byte as u32 / 4;
+            panic!(
+                "scoped composite differs from the full-raster composite at ({}, {}) — \
+                 a painted pixel fell outside the tracked region",
+                pixel % scoped.width,
+                pixel / scoped.width
+            );
+        }
+
+        let stats = stats.expect("timing was enabled");
+        assert_eq!(
+            stats.mask_composite_leak_px, 0,
+            "painted pixels outside the region the composite was confined to"
+        );
+        // A scene where nothing composites reports a region of 0, which satisfies
+        // this too — harmlessly, since there is no region to get wrong. Where the
+        // scene *does* composite, this is what proves the scoping engaged.
+        assert!(
+            stats.mask_composite_region_px
+                < raster_pixels(&scoped_dl, scale) * group_count(&scoped_dl),
+            "no group was scoped (region {} px) — the comparison above is vacuous",
+            stats.mask_composite_region_px
+        );
+        stats
+    }
+
+    /// An opaque backdrop, one transparency group, and two disjoint small rects
+    /// inside it — so the region is a union, not a single draw's bounds.
+    fn two_rect_group_scene(
+        mode: BlendMode,
+        isolated: bool,
+        alpha: f32,
+        filler: bool,
+    ) -> DisplayList {
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 100.0));
+        dl.push(solid_rect(
+            Color::rgb(0.0, 0.0, 1.0),
+            0.0,
+            0.0,
+            100.0,
+            100.0,
+        ));
+        dl.push(group_cmd(mode, isolated, alpha, None));
+        dl.push(solid_rect(
+            Color::rgb(1.0, 0.0, 0.0),
+            10.0,
+            60.0,
+            40.0,
+            90.0,
+        ));
+        dl.push(solid_rect(
+            Color::rgb(0.0, 1.0, 0.0),
+            50.0,
+            20.0,
+            65.0,
+            35.0,
+        ));
+        if filler {
+            dl.push(invisible_page_fill(&dl));
+        }
+        dl.push(RenderCommand::PopBlendGroup);
+        dl
+    }
+
+    /// Every blend mode, group alpha, isolation flag and scale must come out
+    /// identical whether the composite is confined to the group's content or run
+    /// over the whole raster. That holds because the general Porter-Duff blend
+    /// `s·(1−da) + d·(1−sa) + B(s,d)·sa·da` collapses to the destination where
+    /// `sa = 0` — including the HSL family, whose blend term is not separable per
+    /// channel, and which is why they are all in the list.
+    #[test]
+    fn scoped_composite_matches_full_raster_for_every_blend_mode() {
+        for mode in [
+            BlendMode::Normal,
+            BlendMode::Multiply,
+            BlendMode::Screen,
+            BlendMode::Overlay,
+            BlendMode::Darken,
+            BlendMode::Lighten,
+            BlendMode::ColorDodge,
+            BlendMode::ColorBurn,
+            BlendMode::HardLight,
+            BlendMode::SoftLight,
+            BlendMode::Difference,
+            BlendMode::Exclusion,
+            BlendMode::Hue,
+            BlendMode::Saturation,
+            BlendMode::Color,
+            BlendMode::Luminosity,
+        ] {
+            for isolated in [true, false] {
+                for alpha in [0.25, 1.0] {
+                    for scale in [1.0, 2.0] {
+                        assert_scoped_is_pixel_identical(
+                            |filler| two_rect_group_scene(mode, isolated, alpha, filler),
+                            scale,
+                            None,
+                            None,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A page-wide fill *clipped* to a corner, inside the group: the group's ink
+    /// is a 40×40 square, so the region has to follow the clip rather than the
+    /// path. The invisible fill sits outside the clip, which is what makes the
+    /// reference render unscoped.
+    fn clip_group_scene(filler: bool) -> DisplayList {
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 100.0));
+        dl.push(solid_rect(
+            Color::rgb(0.0, 0.0, 1.0),
+            0.0,
+            0.0,
+            100.0,
+            100.0,
+        ));
+        dl.push(group_cmd(BlendMode::Multiply, true, 1.0, None));
+        dl.push(RenderCommand::PushClip {
+            path: rect_path(0.0, 0.0, 40.0, 40.0),
+            rule: FillRule::NonZero,
+        });
+        dl.push(solid_rect(
+            Color::rgb(1.0, 1.0, 0.0),
+            0.0,
+            0.0,
+            100.0,
+            100.0,
+        ));
+        dl.push(RenderCommand::PopClip);
+        if filler {
+            dl.push(invisible_page_fill(&dl));
+        }
+        dl.push(RenderCommand::PopBlendGroup);
+        dl
+    }
+
+    #[test]
+    fn scoped_composite_is_intersected_with_the_clip() {
+        let stats = assert_scoped_is_pixel_identical(clip_group_scene, 1.0, None, None);
+        assert!(
+            (40 * 40..=41 * 41).contains(&stats.mask_composite_region_px),
+            "the region must be the clip's 40×40 corner — give or take the one pixel \
+             its anti-aliased edge can reach — and not the 100×100 path, got {}",
+            stats.mask_composite_region_px
+        );
+    }
+
+    /// A hairpin stroke inside a group: the join throws a miter spike well past
+    /// the centerline's bounding box, so a region grown only by the stroke width
+    /// would cut the tip off.
+    fn miter_group_scene(filler: bool) -> DisplayList {
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 100.0));
+        dl.push(solid_rect(
+            Color::rgb(0.0, 0.0, 1.0),
+            0.0,
+            0.0,
+            100.0,
+            100.0,
+        ));
+        dl.push(group_cmd(BlendMode::Multiply, true, 1.0, None));
+        let mut path = Path::new();
+        path.move_to(Point::new(10.0, 24.0));
+        path.line_to(Point::new(30.0, 20.0));
+        path.line_to(Point::new(10.0, 16.0));
+        dl.push(stroke_cmd(
+            path,
+            StrokeStyle {
+                width: 2.0,
+                miter_limit: 10.0,
+                ..Default::default()
+            },
+        ));
+        if filler {
+            dl.push(invisible_page_fill(&dl));
+        }
+        dl.push(RenderCommand::PopBlendGroup);
+        dl
+    }
+
+    #[test]
+    fn scoped_composite_covers_a_miter_spike_past_the_path_bounds() {
+        // The spike: ~5 px past the vertex at x = 30 (page y = 20 → device y = 80).
+        let page = render_backend(&miter_group_scene(false), 1.0, None, None, false).0;
+        assert!(
+            px(&page, 34, 80)[0] < 100,
+            "expected the miter spike to reach x=34, got {:?}",
+            px(&page, 34, 80)
+        );
+        assert_scoped_is_pixel_identical(miter_group_scene, 1.0, None, None);
+    }
+
+    /// Nested groups: the inner group's region has to flow into the outer one's,
+    /// or the outer composite would drop everything the inner one contributed.
+    fn nested_group_scene(filler: bool) -> DisplayList {
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 100.0));
+        dl.push(solid_rect(
+            Color::rgb(1.0, 1.0, 1.0),
+            0.0,
+            0.0,
+            100.0,
+            100.0,
+        ));
+        dl.push(group_cmd(BlendMode::Multiply, true, 1.0, None));
+        dl.push(solid_rect(Color::rgb(1.0, 0.0, 0.0), 5.0, 5.0, 20.0, 20.0));
+        dl.push(group_cmd(BlendMode::Screen, true, 0.75, None));
+        dl.push(solid_rect(
+            Color::rgb(0.0, 0.0, 1.0),
+            60.0,
+            60.0,
+            90.0,
+            90.0,
+        ));
+        if filler {
+            dl.push(invisible_page_fill(&dl));
+        }
+        dl.push(RenderCommand::PopBlendGroup);
+        if filler {
+            dl.push(invisible_page_fill(&dl));
+        }
+        dl.push(RenderCommand::PopBlendGroup);
+        dl
+    }
+
+    #[test]
+    fn scoped_composite_carries_a_nested_groups_region_into_its_parent() {
+        let stats = assert_scoped_is_pixel_identical(nested_group_scene, 1.0, None, None);
+        // Two groups, each scoped to its own small corner (the outermost one also
+        // covers the inner one's): the sum can never approach two full pages.
+        assert!(
+            stats.mask_composite_region_px < 2 * 100 * 100,
+            "region {} px — the outer group did not stay scoped",
+            stats.mask_composite_region_px
+        );
+    }
+
+    /// A soft-masked group: both the scoped mask fold and the scoped composite
+    /// are exercised, and the mask's coverage varies across the region.
+    fn soft_mask_group_scene(filler: bool) -> DisplayList {
+        let mut mask_dl = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 100.0));
+        mask_dl.push(solid_rect(Color::rgb(1.0, 1.0, 1.0), 0.0, 0.0, 50.0, 100.0));
+        let mask = SoftMask {
+            kind: SoftMaskKind::Alpha,
+            commands: Arc::new(mask_dl),
+            offset: (0.0, 0.0),
+            backdrop_luma: 0.0,
+            transfer: None,
+        };
+
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 100.0));
+        dl.push(solid_rect(
+            Color::rgb(0.0, 0.0, 1.0),
+            0.0,
+            0.0,
+            100.0,
+            100.0,
+        ));
+        dl.push(group_cmd(BlendMode::Normal, true, 1.0, Some(mask)));
+        dl.push(solid_rect(
+            Color::rgb(1.0, 0.0, 0.0),
+            20.0,
+            20.0,
+            60.0,
+            60.0,
+        ));
+        if filler {
+            dl.push(invisible_page_fill(&dl));
+        }
+        dl.push(RenderCommand::PopBlendGroup);
+        dl
+    }
+
+    #[test]
+    fn scoped_composite_matches_full_raster_with_a_soft_mask() {
+        let stats = assert_scoped_is_pixel_identical(soft_mask_group_scene, 1.0, None, None);
+        assert!(
+            stats.mask_fold_ns > 0 || stats.soft_mask_ns > 0,
+            "the mask path must have run"
+        );
+    }
+
+    /// Glyph ink inside a group. Marked from each *transformed* outline's own
+    /// bounds, so a group of text is scoped to the text and not to an em box.
+    #[test]
+    fn scoped_composite_matches_full_raster_with_glyphs_inside_the_group() {
+        let (fonts, font_id) = var_fonts();
+        let build = |filler: bool| {
+            let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 100.0));
+            dl.push(solid_rect(
+                Color::rgb(0.0, 0.0, 1.0),
+                0.0,
+                0.0,
+                100.0,
+                100.0,
+            ));
+            dl.push(group_cmd(BlendMode::Multiply, true, 1.0, None));
+            dl.push(glyph_run_cmd(font_id));
+            if filler {
+                dl.push(invisible_page_fill(&dl));
+            }
+            dl.push(RenderCommand::PopBlendGroup);
+            dl
+        };
+        assert_scoped_is_pixel_identical(build, 1.0, Some(&fonts), None);
+    }
+
+    /// Type3 ink is an ordinary device path by the time the backend sees it, so
+    /// it bounds like any other fill — asserted rather than assumed, because a
+    /// Type3 glyph stream is the one place content is interpreted *inside* the
+    /// renderer.
+    #[test]
+    fn scoped_composite_matches_full_raster_with_type3_glyphs_inside_the_group() {
+        let (fonts, font_id) = type3_fonts();
+        let build = |filler: bool| {
+            let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 100.0));
+            dl.push(solid_rect(
+                Color::rgb(0.0, 0.0, 1.0),
+                0.0,
+                0.0,
+                100.0,
+                100.0,
+            ));
+            dl.push(group_cmd(BlendMode::Multiply, true, 1.0, None));
+            dl.push(glyph_run_cmd(font_id));
+            if filler {
+                dl.push(invisible_page_fill(&dl));
+            }
+            dl.push(RenderCommand::PopBlendGroup);
+            dl
+        };
+        assert_scoped_is_pixel_identical(build, 1.0, Some(&fonts), None);
+    }
+
+    /// An image inside a group: marked from the transformed unit square, which
+    /// is what the CTM maps the samples through — not the source rectangle.
+    #[test]
+    fn scoped_composite_matches_full_raster_with_an_image_inside_the_group() {
+        let mut images = ImageCache::new();
+        let image_id = images.insert(DecodedImage {
+            width: 4,
+            height: 4,
+            data: vec![200; 4 * 4 * 4],
+            has_alpha: false,
+            premultiplied: true,
+        });
+        let build = |filler: bool| {
+            let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 100.0));
+            dl.push(solid_rect(
+                Color::rgb(0.0, 0.0, 1.0),
+                0.0,
+                0.0,
+                100.0,
+                100.0,
+            ));
+            dl.push(group_cmd(BlendMode::Multiply, true, 1.0, None));
+            dl.push(RenderCommand::DrawImage(ImageDraw {
+                image_id,
+                transform: Matrix::new(30.0, 0.0, 0.0, 30.0, 10.0, 10.0),
+                alpha: 1.0,
+            }));
+            if filler {
+                dl.push(invisible_page_fill(&dl));
+            }
+            dl.push(RenderCommand::PopBlendGroup);
+            dl
+        };
+        assert_scoped_is_pixel_identical(build, 1.0, None, Some(&images));
+    }
+
+    /// A group whose content is entirely clipped away paints nothing, so there
+    /// is no composite at all. The reference (whose invisible fill sits outside
+    /// the clip) instead composites a fully transparent group over the whole
+    /// page — and the two must still agree, which is the "outside the region the
+    /// source is transparent" argument stated the other way round.
+    #[test]
+    fn a_group_whose_content_is_clipped_away_composites_nothing() {
+        fn build(filler: bool) -> DisplayList {
+            let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 100.0));
+            dl.push(solid_rect(
+                Color::rgb(0.0, 0.0, 1.0),
+                0.0,
+                0.0,
+                100.0,
+                100.0,
+            ));
+            dl.push(group_cmd(BlendMode::Multiply, true, 1.0, None));
+            dl.push(RenderCommand::PushClip {
+                path: rect_path(0.0, 0.0, 10.0, 10.0),
+                rule: FillRule::NonZero,
+            });
+            // Entirely outside the clip above: nothing of this reaches the group.
+            dl.push(solid_rect(
+                Color::rgb(1.0, 0.0, 0.0),
+                50.0,
+                50.0,
+                90.0,
+                90.0,
+            ));
+            dl.push(RenderCommand::PopClip);
+            if filler {
+                dl.push(invisible_page_fill(&dl));
+            }
+            dl.push(RenderCommand::PopBlendGroup);
+            dl
+        }
+        let stats = assert_scoped_is_pixel_identical(build, 1.0, None, None);
+        assert_eq!(
+            stats.mask_composite_region_px, 0,
+            "a group that painted nothing owns no region, so its composite is skipped"
+        );
+    }
+
+    /// Knockout and overprint element painting goes through full-raster scratch
+    /// passes and merges over the whole raster, so nothing finer than the whole
+    /// surface survives them. Assert that conservative outcome (and that it is
+    /// still *sound*) rather than leaving it to be inferred from the code.
+    #[test]
+    fn knockout_and_overprint_groups_are_conservative_and_sound() {
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 100.0));
+        dl.push(solid_rect(
+            Color::rgb(0.0, 0.0, 1.0),
+            0.0,
+            0.0,
+            100.0,
+            100.0,
+        ));
+        dl.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Normal,
+            isolated: true,
+            knockout: true,
+            bounds: Rect::new(0.0, 0.0, 100.0, 100.0),
+            alpha: 1.0,
+            mask: None,
+        });
+        // Two overlapping elements: the second knocks the first out where they
+        // overlap, so a missed mark would show up as a wrong pixel, not just a
+        // smaller region.
+        dl.push(solid_rect(
+            Color::rgba(1.0, 0.0, 0.0, 0.5),
+            10.0,
+            10.0,
+            60.0,
+            60.0,
+        ));
+        dl.push(solid_rect(
+            Color::rgba(0.0, 1.0, 0.0, 0.5),
+            40.0,
+            40.0,
+            90.0,
+            90.0,
+        ));
+        dl.push(RenderCommand::PopBlendGroup);
+
+        // Overprint inside a normal group.
+        dl.push(group_cmd(BlendMode::Multiply, true, 1.0, None));
+        let mut op = solid_rect(Color::rgb(1.0, 1.0, 0.0), 5.0, 70.0, 45.0, 95.0);
+        if let RenderCommand::FillPath { overprint, .. } = &mut op {
+            *overprint = Some(Overprint {
+                cmyk: [1.0, 0.0, 0.0, 0.0],
+                active: Overprint::C,
+            });
+        }
+        dl.push(op);
+        dl.push(RenderCommand::PopBlendGroup);
+
+        let (page, stats) = render_backend(&dl, 1.0, None, None, true);
+        assert_eq!(page.width, 100);
+        let stats = stats.expect("timing was enabled");
+        assert_eq!(
+            stats.mask_composite_leak_px, 0,
+            "the conservative marks must still cover every painted pixel"
+        );
+        assert_eq!(
+            stats.mask_composite_region_px,
+            100 * 100 * 2,
+            "both groups composite over the full surface — knockout and overprint \
+             cannot be scoped"
+        );
+    }
+
+    /// The leak counter is the assertion the whole optimization rests on, so it
+    /// must be able to fail: a checker that cannot fire is not a check. Feed the
+    /// coverage scan a region deliberately smaller than the content and require
+    /// it to name the pixels left outside.
+    #[test]
+    fn leak_counter_reports_painted_pixels_outside_the_region() {
+        let mut pixmap = tiny_skia::Pixmap::new(4, 4).unwrap();
+        for y in 2..4u32 {
+            for x in 2..4u32 {
+                let i = ((y * 4 + x) * 4) as usize;
+                pixmap.data_mut()[i..i + 4].copy_from_slice(&[255, 0, 0, 255]);
+            }
+        }
+        let content = PaintedBounds {
+            x0: 2,
+            y0: 2,
+            x1: 4,
+            y1: 4,
+        };
+        assert_eq!(group_coverage(&pixmap, Some(content)), (Some(content), 0));
+
+        let too_small = PaintedBounds {
+            x0: 2,
+            y0: 2,
+            x1: 3,
+            y1: 3,
+        };
+        assert_eq!(
+            group_coverage(&pixmap, Some(too_small)),
+            (Some(content), 3),
+            "three of the four painted pixels lie outside the region"
+        );
+        assert_eq!(
+            group_coverage(&pixmap, None),
+            (Some(content), 4),
+            "no region at all leaves every painted pixel unaccounted for"
+        );
+
+        let empty = tiny_skia::Pixmap::new(4, 4).unwrap();
+        assert_eq!(
+            group_coverage(&empty, None),
+            (None, 0),
+            "an untouched raster has no content and nothing to leak"
+        );
     }
 }
