@@ -2237,7 +2237,7 @@ mod tests {
     fn type3_simple_glyph_advance_applies_font_matrix() {
         let font = LoadedFont::new_with_data(
             PdfFontType::Type3 {
-                font_matrix: [0.001, 0.0, 0.0, 0.001, 0.0, 0.0],
+                font_matrix: [0.002, 0.0, 0.0, 0.002, 0.0, 0.0],
                 char_procs: HashMap::new(),
                 encoding: vec!["g0".into(), "g1".into()],
                 widths: vec![600.0, 700.0],
@@ -2248,7 +2248,11 @@ mod tests {
             CidWidths::new(1000.0),
         );
 
-        assert!((font.simple_glyph_advance(33, 1) - 0.7).abs() < f64::EPSILON);
+        // `simple_glyph_advance` returns units compatible with
+        // `advance_divisor`, so the 0.002 FontMatrix is normalized back to
+        // the font's 1000-unit advance scale here. The content interpreter
+        // applies the divisor when converting this value to text space.
+        assert!((font.simple_glyph_advance(33, 1) - 1400.0).abs() < 1e-9);
     }
 
     #[test]

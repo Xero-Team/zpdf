@@ -2088,7 +2088,8 @@ impl<'a> CpuRenderer<'a> {
         }
 
         let mut tinted = source.clone();
-        for pixel in tinted.data.chunks_exact_mut(4) {
+        let (pixels, _) = tinted.data.as_chunks_mut::<4>();
+        for pixel in pixels {
             let pixel_alpha = pixel[3] as u16;
             if pixel_alpha == 0 {
                 continue;
