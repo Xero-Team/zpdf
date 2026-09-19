@@ -1632,10 +1632,19 @@ impl<'a> CpuRenderer<'a> {
     }
 
     fn render_image_with_alpha(&mut self, draw: &ImageDraw, alpha_override: f32) {
-        let image_cache = match self.image_cache {
-            Some(c) => c,
-            None => return,
+        let Some(image_cache) = self.image_cache else {
+            return;
         };
+        self.render_image_from_cache(image_cache, draw, alpha_override, true);
+    }
+
+    fn render_image_from_cache(
+        &mut self,
+        image_cache: &ImageCache,
+        draw: &ImageDraw,
+        alpha_override: f32,
+        cache_downscaled: bool,
+    ) {
         let image = match image_cache.get(draw.image_id) {
             Some(img) => img,
             None => return,
@@ -1711,24 +1720,37 @@ impl<'a> CpuRenderer<'a> {
             let th = ((image.height as f32 * fy.min(1.0)).ceil() as u32).clamp(1, image.height);
             if tw < image.width || th < image.height {
                 let key = (draw.image_id, tw, th);
-                let data = if let Some(data) = self.downscaled_images.get(&key) {
-                    Arc::clone(data)
+                let data = if cache_downscaled {
+                    if let Some(data) = self.downscaled_images.get(&key) {
+                        Arc::clone(data)
+                    } else {
+                        let data: Arc<[u8]> = Arc::from(box_downscale_rgba(
+                            &image.data,
+                            image.width,
+                            image.height,
+                            tw,
+                            th,
+                        ));
+                        let retained: usize =
+                            self.downscaled_images.values().map(|d| d.len()).sum();
+                        if data.len() <= MAX_DOWNSCALED_IMAGE_CACHE_BYTES {
+                            if retained.saturating_add(data.len())
+                                > MAX_DOWNSCALED_IMAGE_CACHE_BYTES
+                            {
+                                self.downscaled_images.clear();
+                            }
+                            self.downscaled_images.insert(key, Arc::clone(&data));
+                        }
+                        data
+                    }
                 } else {
-                    let data: Arc<[u8]> = Arc::from(box_downscale_rgba(
+                    Arc::from(box_downscale_rgba(
                         &image.data,
                         image.width,
                         image.height,
                         tw,
                         th,
-                    ));
-                    let retained: usize = self.downscaled_images.values().map(|d| d.len()).sum();
-                    if data.len() <= MAX_DOWNSCALED_IMAGE_CACHE_BYTES {
-                        if retained.saturating_add(data.len()) > MAX_DOWNSCALED_IMAGE_CACHE_BYTES {
-                            self.downscaled_images.clear();
-                        }
-                        self.downscaled_images.insert(key, Arc::clone(&data));
-                    }
-                    data
+                    ))
                 };
                 downscaled = Some((data, tw, th));
             }
@@ -1946,7 +1968,10 @@ impl<'a> CpuRenderer<'a> {
             };
 
             let glyph_rect = zpdf_core::Rect::new(0.0, -1000.0, 1000.0, 1000.0);
-            let glyph_dl = ContentInterpreter::new(glyph_rect).interpret(stream);
+            let mut glyph_images = ImageCache::new();
+            let glyph_dl = ContentInterpreter::new(glyph_rect)
+                .with_images(&mut glyph_images)
+                .interpret(stream);
 
             // Build the full transform: glyph_space → page_space → pixel_space
             // FontMatrix transforms glyph coords to text space (typically 0.001 scale)
@@ -2008,10 +2033,82 @@ impl<'a> CpuRenderer<'a> {
                             self.mark_painted(skia_path.bounds(), grow);
                         }
                     }
+                    RenderCommand::DrawImage(draw) => {
+                        let glyph_to_page = tm
+                            .concat(&zpdf_core::Matrix::translate(glyph.x as f64, 0.0))
+                            .concat(&zpdf_core::Matrix::scale(
+                                font_size as f64 * h_scale as f64,
+                                font_size as f64,
+                            ))
+                            .concat(&zpdf_core::Matrix::new(
+                                font_matrix[0],
+                                font_matrix[1],
+                                font_matrix[2],
+                                font_matrix[3],
+                                font_matrix[4],
+                                font_matrix[5],
+                            ))
+                            .concat(&draw.transform);
+                        let draw = ImageDraw {
+                            image_id: draw.image_id,
+                            transform: glyph_to_page,
+                            alpha: draw.alpha,
+                        };
+                        self.render_type3_image(&glyph_images, &draw, paint, run.alpha);
+                    }
                     _ => {}
                 }
             }
         }
+    }
+
+    /// Type 3 glyphs in Beamer PDFs commonly use `/ImageMask true` inline
+    /// images as glyph stencils. The nested interpreter decodes those images
+    /// with its default black fill colour, so recolour their opaque samples
+    /// with the text paint before sending them through the normal image path.
+    fn render_type3_image(
+        &mut self,
+        image_cache: &ImageCache,
+        draw: &ImageDraw,
+        paint: &tiny_skia::Paint<'_>,
+        alpha: f32,
+    ) {
+        let Some(tint) = (match &paint.shader {
+            tiny_skia::Shader::SolidColor(color) => Some(*color),
+            _ => None,
+        }) else {
+            return;
+        };
+        let Some(source) = image_cache.get(draw.image_id) else {
+            return;
+        };
+        if !source.has_alpha {
+            self.render_image_from_cache(image_cache, draw, alpha, false);
+            return;
+        }
+
+        let mut tinted = source.clone();
+        for pixel in tinted.data.chunks_exact_mut(4) {
+            let pixel_alpha = pixel[3] as u16;
+            if pixel_alpha == 0 {
+                continue;
+            }
+            // ImageCache pixels are premultiplied RGBA. Type 3 masks currently
+            // have binary alpha, but multiplying here also keeps this correct
+            // for anti-aliased mask decoders.
+            pixel[0] = (tint.red() * 255.0 * pixel_alpha as f32 / 255.0) as u8;
+            pixel[1] = (tint.green() * 255.0 * pixel_alpha as f32 / 255.0) as u8;
+            pixel[2] = (tint.blue() * 255.0 * pixel_alpha as f32 / 255.0) as u8;
+        }
+
+        let mut tinted_cache = ImageCache::new();
+        let image_id = tinted_cache.insert(tinted);
+        let draw = ImageDraw {
+            image_id,
+            transform: draw.transform,
+            alpha: draw.alpha,
+        };
+        self.render_image_from_cache(&tinted_cache, &draw, alpha, false);
     }
 
     /// Transform a Type3 glyph path through: FontMatrix → text position → CTM → pixels.
