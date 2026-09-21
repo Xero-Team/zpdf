@@ -414,9 +414,11 @@ fn downsample_image_stream(stream: &PdfStream, max_dim: u32) -> Option<PdfStream
 /// Queue every indirect reference in `obj` that has not been seen yet.
 fn collect_refs(obj: &PdfObject, map: &mut HashMap<ObjectId, u32>, queue: &mut Vec<ObjectId>) {
     match obj {
-        PdfObject::Ref(r) if !map.contains_key(r) => {
-            map.insert(*r, 0);
-            queue.push(*r);
+        PdfObject::Ref(r) => {
+            if !map.contains_key(r) {
+                map.insert(*r, 0);
+                queue.push(*r);
+            }
         }
         PdfObject::Array(arr) => {
             for elem in arr {
