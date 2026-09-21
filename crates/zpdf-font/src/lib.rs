@@ -830,7 +830,10 @@ impl LoadedFont {
             // font matrix before converting them to the renderer's normalized
             // font-unit scale. Simple-font /Widths are already in 1/1000
             // text-space units and must not take this path.
-            let scale = font_matrix[0].hypot(font_matrix[1]).max(1e-12);
+            // /Widths advance along the horizontal glyph-space axis. The
+            // y-component is a shear/rotation component, not extra horizontal
+            // advance, so do not use the transformed axis length here.
+            let scale = font_matrix[0];
             return self.type3_glyph_width(code) * scale * self.units_per_em;
         }
         // PDF /Widths are in 1/1000 glyph-space units; rescale to font units.
@@ -2234,10 +2237,10 @@ mod tests {
     }
 
     #[test]
-    fn type3_simple_glyph_advance_applies_font_matrix() {
+    fn type3_simple_glyph_advance_uses_horizontal_font_matrix_component() {
         let font = LoadedFont::new_with_data(
             PdfFontType::Type3 {
-                font_matrix: [0.002, 0.0, 0.0, 0.002, 0.0, 0.0],
+                font_matrix: [0.002, 0.003, 0.0, 0.002, 0.0, 0.0],
                 char_procs: HashMap::new(),
                 encoding: vec!["g0".into(), "g1".into()],
                 widths: vec![600.0, 700.0],

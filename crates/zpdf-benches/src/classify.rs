@@ -381,6 +381,7 @@ mod tests {
             image_id: 0,
             transform: Matrix::new(area_scale, 0.0, 0.0, area_scale, 0.0, 0.0),
             alpha: 1.0,
+            is_image_mask: false,
         })
     }
 

@@ -2667,6 +2667,7 @@ impl<'a> ContentInterpreter<'a> {
             height: h,
             data: buf,
             has_alpha: true,
+            is_image_mask: false,
             premultiplied: true,
         };
         let Some(image_id) = self.admit_image(image) else {
@@ -2686,6 +2687,7 @@ impl<'a> ContentInterpreter<'a> {
             image_id,
             transform,
             alpha,
+            is_image_mask: false,
         }));
     }
 
@@ -3340,6 +3342,7 @@ impl<'a> ContentInterpreter<'a> {
                 image_id,
                 transform: self.current.ctm,
                 alpha: self.current.fill_alpha,
+                is_image_mask: false,
             });
             self.emit_painted(cmd);
             return;
@@ -3408,7 +3411,7 @@ impl<'a> ContentInterpreter<'a> {
 
         // Insert once and remember the id so repeat draws skip the decode above.
         // `/ImageMask` stencils bake in the fill colour, so they aren't cached.
-        let is_stencil = matches!(image_dict.get("ImageMask"), Some(PdfObject::Bool(true)));
+        let is_stencil = image.is_image_mask;
         let Some(image_id) = self.admit_image(image) else {
             self.rejected_image_objects.insert(obj_id);
             return;
@@ -3420,6 +3423,7 @@ impl<'a> ContentInterpreter<'a> {
             image_id,
             transform: self.current.ctm,
             alpha: self.current.fill_alpha,
+            is_image_mask: is_stencil,
         });
         self.emit_painted(cmd);
     }
@@ -3497,6 +3501,7 @@ impl<'a> ContentInterpreter<'a> {
     }
 
     fn emit_draw_image(&mut self, image: zpdf_image::DecodedImage) {
+        let is_image_mask = image.is_image_mask;
         let Some(image_id) = self.admit_image(image) else {
             return;
         };
@@ -3504,6 +3509,7 @@ impl<'a> ContentInterpreter<'a> {
             image_id,
             transform: self.current.ctm,
             alpha: self.current.fill_alpha,
+            is_image_mask,
         });
         self.emit_painted(cmd);
     }
@@ -6432,6 +6438,7 @@ mod tests {
                 height: 1,
                 data: vec![0, 0, 0, 255],
                 has_alpha: false,
+                is_image_mask: false,
                 premultiplied: false,
             });
             assert!(!interp
