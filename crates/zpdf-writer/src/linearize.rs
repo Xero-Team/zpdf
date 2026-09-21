@@ -324,10 +324,8 @@ fn collect_refs_filtered(
     skip_keys: &[&str],
 ) {
     match obj {
-        PdfObject::Ref(r) => {
-            if seen.insert(*r) {
-                queue.push(*r);
-            }
+        PdfObject::Ref(r) if seen.insert(*r) => {
+            queue.push(*r);
         }
         PdfObject::Array(arr) => {
             for e in arr {

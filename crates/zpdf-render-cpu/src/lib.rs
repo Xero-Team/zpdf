@@ -3374,10 +3374,9 @@ mod tests {
             .with_limits(&limits)
             .render_display_list(&dl, 1.0)
             .expect("render");
+        let (pixels, remainder) = page.data.as_chunks::<4>();
         assert!(
-            page.data
-                .chunks_exact(4)
-                .all(|pixel| pixel == [255, 255, 255, 255]),
+            remainder.is_empty() && pixels.iter().all(|pixel| *pixel == [255, 255, 255, 255]),
             "the nested Type3 image must honor max_image_pixels"
         );
     }

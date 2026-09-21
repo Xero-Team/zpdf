@@ -866,17 +866,18 @@ fn jpeg_is_adobe_ycck(data: &[u8]) -> bool {
         let payload = &data[payload_start..payload_end];
         match marker {
             // APP14: "Adobe" + version(2) + flags0(2) + flags1(2) + transform(1).
-            0xEE => {
-                if payload.len() >= 12 && &payload[0..5] == b"Adobe" {
-                    adobe_ycck = payload[11] == 2;
-                }
+            0xEE if payload.len() >= 12 && &payload[0..5] == b"Adobe" => {
+                adobe_ycck = payload[11] == 2;
             }
             // SOFn (baseline/progressive/etc.), excluding DHT(C4)/JPG(C8)/DAC(CC).
-            0xC0..=0xCF if marker != 0xC4 && marker != 0xC8 && marker != 0xCC => {
-                // precision(1) + height(2) + width(2) + Nf(1).
-                if payload.len() >= 6 {
-                    four_components = payload[5] == 4;
-                }
+            0xC0..=0xCF
+                if marker != 0xC4
+                    && marker != 0xC8
+                    && marker != 0xCC
+                    // precision(1) + height(2) + width(2) + Nf(1).
+                    && payload.len() >= 6 =>
+            {
+                four_components = payload[5] == 4;
             }
             // Start of scan: header is done.
             0xDA => break,
