@@ -1355,6 +1355,7 @@ mod tests {
             height: 2,
             data: vec![255; 16],
             has_alpha: false,
+            is_image_mask: false,
             premultiplied: false,
         });
         // CTM: unit square scaled 40×60, placed at (10, 20).
@@ -1369,6 +1370,7 @@ mod tests {
                 f: 20.0,
             },
             alpha: 1.0,
+            is_image_mask: false,
         }));
         let svg = display_list_to_svg(&dl, &fonts, &images, &SvgOptions::default());
         // svg_x = (40/2)ix + 10, svg_y = (60/2)iy + (200-60-20) = 30iy + 120.
@@ -1399,6 +1401,7 @@ mod tests {
             image_id: 7,
             transform: Matrix::identity(),
             alpha: 1.0,
+            is_image_mask: false,
         }));
         let svg = to_svg(&dl);
         assert!(!svg.contains("<image"), "{svg}");

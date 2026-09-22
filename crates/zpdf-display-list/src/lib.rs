@@ -327,6 +327,8 @@ pub struct ImageDraw {
     pub image_id: ImageId,
     pub transform: Matrix,
     pub alpha: f32,
+    /// True only when the source image is a PDF `/ImageMask` stencil.
+    pub is_image_mask: bool,
 }
 
 // -- Blend --

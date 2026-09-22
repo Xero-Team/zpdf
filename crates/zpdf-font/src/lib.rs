@@ -825,6 +825,17 @@ impl LoadedFont {
     /// [`advance_divisor`](Self::advance_divisor). Prefers the PDF /Widths entry
     /// (keyed by character *code*, authoritative per the spec) over the font's hmtx.
     pub fn simple_glyph_advance(&self, code: u16, gid: u16) -> f64 {
+        if let PdfFontType::Type3 { font_matrix, .. } = &self.font_type {
+            // Type 3 /Widths are expressed in glyph space, so apply the
+            // font matrix before converting them to the renderer's normalized
+            // font-unit scale. Simple-font /Widths are already in 1/1000
+            // text-space units and must not take this path.
+            // /Widths advance along the horizontal glyph-space axis. The
+            // y-component is a shear/rotation component, not extra horizontal
+            // advance, so do not use the transformed axis length here.
+            let scale = font_matrix[0];
+            return self.type3_glyph_width(code) * scale * self.units_per_em;
+        }
         // PDF /Widths are in 1/1000 glyph-space units; rescale to font units.
         if let Some(w) = self.cid_widths.get_opt(code) {
             return w / 1000.0 * self.units_per_em;
@@ -2223,6 +2234,28 @@ mod tests {
                 assert!(result.is_ok(), "panicked for len={len}, fill={fill:#x}");
             }
         }
+    }
+
+    #[test]
+    fn type3_simple_glyph_advance_uses_horizontal_font_matrix_component() {
+        let font = LoadedFont::new_with_data(
+            PdfFontType::Type3 {
+                font_matrix: [0.002, 0.003, 0.0, 0.002, 0.0, 0.0],
+                char_procs: HashMap::new(),
+                encoding: vec!["g0".into(), "g1".into()],
+                widths: vec![600.0, 700.0],
+                first_char: 32,
+            },
+            "Type3Test".into(),
+            Vec::new(),
+            CidWidths::new(1000.0),
+        );
+
+        // `simple_glyph_advance` returns units compatible with
+        // `advance_divisor`, so the 0.002 FontMatrix is normalized back to
+        // the font's 1000-unit advance scale here. The content interpreter
+        // applies the divisor when converting this value to text space.
+        assert!((font.simple_glyph_advance(33, 1) - 1400.0).abs() < 1e-9);
     }
 
     #[test]

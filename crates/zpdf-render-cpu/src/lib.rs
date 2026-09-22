@@ -31,6 +31,8 @@ pub struct CpuRenderer<'a> {
     max_blend_group_depth: usize,
     /// Maximum retained one-byte soft-mask coverage planes per page.
     max_soft_mask_cache_bytes: u64,
+    /// Security budgets used while interpreting nested Type3 glyph streams.
+    parse_limits: ParseLimits,
     clip_stack: Vec<ClipFrame>,
     current_clip: Option<tiny_skia::Mask>,
     /// Device region of the active clip, tracking `current_clip` frame for
@@ -438,6 +440,7 @@ impl<'a> CpuRenderer<'a> {
             max_page_pixels: limits.max_page_pixels,
             max_blend_group_depth: limits.max_blend_group_depth as usize,
             max_soft_mask_cache_bytes: limits.max_softmask_cache_bytes,
+            parse_limits: limits,
             clip_stack: Vec::new(),
             current_clip: None,
             clip_bounds: None,
@@ -504,6 +507,7 @@ impl<'a> CpuRenderer<'a> {
     /// Apply the render-time security budgets from the document being rendered.
     /// The values are copied, so the renderer does not borrow the limits object.
     pub fn with_limits(mut self, limits: &ParseLimits) -> Self {
+        self.parse_limits = limits.clone();
         self.max_page_pixels = limits.max_page_pixels;
         self.max_blend_group_depth = limits.max_blend_group_depth as usize;
         self.max_soft_mask_cache_bytes = limits.max_softmask_cache_bytes;
@@ -815,7 +819,7 @@ impl<'a> CpuRenderer<'a> {
             // `render_type3_glyphs`). Their cost lands in `glyph_raster_ns`:
             // they *are* glyph rasterization, just not outline-based.
             let t = self.tick();
-            self.render_type3_glyphs(run, font, &paint);
+            self.render_type3_glyphs(run, font, &paint, alpha_override);
             self.tock(t, |s| &mut s.glyph_raster_ns);
         } else {
             self.render_outline_glyphs(run, font, &paint);
@@ -1501,6 +1505,7 @@ impl<'a> CpuRenderer<'a> {
             max_page_pixels: self.max_page_pixels,
             max_blend_group_depth: self.max_blend_group_depth,
             max_soft_mask_cache_bytes: self.max_soft_mask_cache_bytes,
+            parse_limits: self.parse_limits.clone(),
             clip_stack: Vec::new(),
             current_clip: None,
             clip_bounds: None,
@@ -1632,10 +1637,19 @@ impl<'a> CpuRenderer<'a> {
     }
 
     fn render_image_with_alpha(&mut self, draw: &ImageDraw, alpha_override: f32) {
-        let image_cache = match self.image_cache {
-            Some(c) => c,
-            None => return,
+        let Some(image_cache) = self.image_cache else {
+            return;
         };
+        self.render_image_from_cache(image_cache, draw, alpha_override, true);
+    }
+
+    fn render_image_from_cache(
+        &mut self,
+        image_cache: &ImageCache,
+        draw: &ImageDraw,
+        alpha_override: f32,
+        cache_downscaled: bool,
+    ) {
         let image = match image_cache.get(draw.image_id) {
             Some(img) => img,
             None => return,
@@ -1711,24 +1725,37 @@ impl<'a> CpuRenderer<'a> {
             let th = ((image.height as f32 * fy.min(1.0)).ceil() as u32).clamp(1, image.height);
             if tw < image.width || th < image.height {
                 let key = (draw.image_id, tw, th);
-                let data = if let Some(data) = self.downscaled_images.get(&key) {
-                    Arc::clone(data)
+                let data = if cache_downscaled {
+                    if let Some(data) = self.downscaled_images.get(&key) {
+                        Arc::clone(data)
+                    } else {
+                        let data: Arc<[u8]> = Arc::from(box_downscale_rgba(
+                            &image.data,
+                            image.width,
+                            image.height,
+                            tw,
+                            th,
+                        ));
+                        let retained: usize =
+                            self.downscaled_images.values().map(|d| d.len()).sum();
+                        if data.len() <= MAX_DOWNSCALED_IMAGE_CACHE_BYTES {
+                            if retained.saturating_add(data.len())
+                                > MAX_DOWNSCALED_IMAGE_CACHE_BYTES
+                            {
+                                self.downscaled_images.clear();
+                            }
+                            self.downscaled_images.insert(key, Arc::clone(&data));
+                        }
+                        data
+                    }
                 } else {
-                    let data: Arc<[u8]> = Arc::from(box_downscale_rgba(
+                    Arc::from(box_downscale_rgba(
                         &image.data,
                         image.width,
                         image.height,
                         tw,
                         th,
-                    ));
-                    let retained: usize = self.downscaled_images.values().map(|d| d.len()).sum();
-                    if data.len() <= MAX_DOWNSCALED_IMAGE_CACHE_BYTES {
-                        if retained.saturating_add(data.len()) > MAX_DOWNSCALED_IMAGE_CACHE_BYTES {
-                            self.downscaled_images.clear();
-                        }
-                        self.downscaled_images.insert(key, Arc::clone(&data));
-                    }
-                    data
+                    ))
                 };
                 downscaled = Some((data, tw, th));
             }
@@ -1928,6 +1955,7 @@ impl<'a> CpuRenderer<'a> {
         run: &GlyphRun,
         font: &zpdf_font::LoadedFont,
         paint: &tiny_skia::Paint<'_>,
+        alpha_override: f32,
     ) {
         use zpdf_content::interpreter::ContentInterpreter;
 
@@ -1946,7 +1974,11 @@ impl<'a> CpuRenderer<'a> {
             };
 
             let glyph_rect = zpdf_core::Rect::new(0.0, -1000.0, 1000.0, 1000.0);
-            let glyph_dl = ContentInterpreter::new(glyph_rect).interpret(stream);
+            let mut glyph_images = ImageCache::new();
+            let glyph_dl = ContentInterpreter::new(glyph_rect)
+                .with_images(&mut glyph_images)
+                .with_limits(&self.parse_limits)
+                .interpret(stream);
 
             // Build the full transform: glyph_space → page_space → pixel_space
             // FontMatrix transforms glyph coords to text space (typically 0.001 scale)
@@ -2008,10 +2040,86 @@ impl<'a> CpuRenderer<'a> {
                             self.mark_painted(skia_path.bounds(), grow);
                         }
                     }
+                    RenderCommand::DrawImage(draw) => {
+                        let glyph_to_page = tm
+                            .concat(&zpdf_core::Matrix::translate(glyph.x as f64, 0.0))
+                            .concat(&zpdf_core::Matrix::scale(
+                                font_size as f64 * h_scale as f64,
+                                font_size as f64,
+                            ))
+                            .concat(&zpdf_core::Matrix::new(
+                                font_matrix[0],
+                                font_matrix[1],
+                                font_matrix[2],
+                                font_matrix[3],
+                                font_matrix[4],
+                                font_matrix[5],
+                            ))
+                            .concat(&draw.transform);
+                        let draw = ImageDraw {
+                            image_id: draw.image_id,
+                            transform: glyph_to_page,
+                            alpha: draw.alpha,
+                            is_image_mask: draw.is_image_mask,
+                        };
+                        self.render_type3_image(&glyph_images, &draw, paint, alpha_override);
+                    }
                     _ => {}
                 }
             }
         }
+    }
+
+    /// Type 3 glyphs in Beamer PDFs commonly use `/ImageMask true` inline
+    /// images as glyph stencils. The nested interpreter decodes those images
+    /// with its default black fill colour, so recolour their opaque samples
+    /// with the text paint before sending them through the normal image path.
+    fn render_type3_image(
+        &mut self,
+        image_cache: &ImageCache,
+        draw: &ImageDraw,
+        paint: &tiny_skia::Paint<'_>,
+        alpha: f32,
+    ) {
+        let Some(tint) = (match &paint.shader {
+            tiny_skia::Shader::SolidColor(color) => Some(*color),
+            _ => None,
+        }) else {
+            return;
+        };
+        let Some(source) = image_cache.get(draw.image_id) else {
+            return;
+        };
+        let alpha = alpha * draw.alpha;
+        if !draw.is_image_mask {
+            self.render_image_from_cache(image_cache, draw, alpha, false);
+            return;
+        }
+
+        let mut tinted = source.clone();
+        let (pixels, _) = tinted.data.as_chunks_mut::<4>();
+        for pixel in pixels {
+            let pixel_alpha = pixel[3] as u16;
+            if pixel_alpha == 0 {
+                continue;
+            }
+            // ImageCache pixels are premultiplied RGBA. Type 3 masks currently
+            // have binary alpha, but multiplying here also keeps this correct
+            // for anti-aliased mask decoders.
+            pixel[0] = (tint.red() * 255.0 * pixel_alpha as f32 / 255.0) as u8;
+            pixel[1] = (tint.green() * 255.0 * pixel_alpha as f32 / 255.0) as u8;
+            pixel[2] = (tint.blue() * 255.0 * pixel_alpha as f32 / 255.0) as u8;
+        }
+
+        let mut tinted_cache = ImageCache::new();
+        let image_id = tinted_cache.insert(tinted);
+        let draw = ImageDraw {
+            image_id,
+            transform: draw.transform,
+            alpha: draw.alpha,
+            is_image_mask: true,
+        };
+        self.render_image_from_cache(&tinted_cache, &draw, alpha, false);
     }
 
     /// Transform a Type3 glyph path through: FontMatrix → text position → CTM → pixels.
@@ -2737,6 +2845,7 @@ mod tests {
             height: 10,
             data: vec![0; 3],
             has_alpha: false,
+            is_image_mask: false,
             premultiplied: false,
         });
         let mut renderer = CpuRenderer::new().with_images(&images);
@@ -2752,6 +2861,7 @@ mod tests {
                 image_id,
                 transform: Matrix::identity(),
                 alpha: 1.0,
+                is_image_mask: false,
             }))
             .unwrap();
         let page = renderer.end_page().unwrap();
@@ -2766,6 +2876,7 @@ mod tests {
             height: 100,
             data: vec![255; 100 * 100 * 4],
             has_alpha: false,
+            is_image_mask: false,
             premultiplied: false,
         });
         let mut renderer = CpuRenderer::new().with_images(&images);
@@ -2780,6 +2891,7 @@ mod tests {
             image_id,
             transform: Matrix::identity(),
             alpha: 1.0,
+            is_image_mask: false,
         });
         renderer.execute(&draw).unwrap();
         renderer.execute(&draw).unwrap();
@@ -3009,6 +3121,7 @@ mod tests {
             height: 2,
             data,
             has_alpha: false,
+            is_image_mask: false,
             premultiplied: true,
         });
         let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 20.0, 20.0));
@@ -3016,6 +3129,7 @@ mod tests {
             image_id: id,
             transform: Matrix::new(20.0, 0.0, 0.0, 20.0, 0.0, 0.0),
             alpha: 1.0,
+            is_image_mask: false,
         }));
         let page = CpuRenderer::new()
             .with_images(&images)
@@ -3046,6 +3160,7 @@ mod tests {
             height: 16,
             data,
             has_alpha: false,
+            is_image_mask: false,
             premultiplied: true,
         });
         let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 8.0, 8.0));
@@ -3053,6 +3168,7 @@ mod tests {
             image_id: id,
             transform: Matrix::new(4.0, 0.0, 0.0, 4.0, 2.0, 2.0),
             alpha: 1.0,
+            is_image_mask: false,
         }));
         let page = CpuRenderer::new()
             .with_images(&images)
@@ -3184,6 +3300,26 @@ mod tests {
         (fonts, id)
     }
 
+    fn type3_image_fonts(stream: &[u8]) -> (FontCache, zpdf_font::FontId) {
+        let mut char_procs: HashMap<String, Arc<[u8]>> = HashMap::new();
+        char_procs.insert("g1".to_string(), Arc::from(stream));
+        let font = zpdf_font::LoadedFont::new_with_data(
+            zpdf_font::PdfFontType::Type3 {
+                font_matrix: [0.001, 0.0, 0.0, 0.001, 0.0, 0.0],
+                char_procs,
+                encoding: vec!["g0".into(), "g1".into()],
+                widths: vec![1000.0, 1000.0],
+                first_char: 0,
+            },
+            "ZpdfType3Image".into(),
+            Vec::new(),
+            zpdf_font::CidWidths::new(1000.0),
+        );
+        let mut fonts = FontCache::new();
+        let id = fonts.insert("ZpdfType3Image".into(), font);
+        (fonts, id)
+    }
+
     fn rect_path(x0: f64, y0: f64, x1: f64, y1: f64) -> Path {
         let mut p = Path::new();
         p.move_to(Point::new(x0, y0));
@@ -3222,6 +3358,97 @@ mod tests {
         })
     }
 
+    #[test]
+    fn type3_glyph_images_use_document_pixel_limits() {
+        let glyph_stream = b"BI /W 8 /H 8 /BPC 1 /IM true ID \0\0\0\0\0\0\0\0 EI";
+        let (fonts, font_id) = type3_image_fonts(glyph_stream);
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 20.0, 20.0));
+        dl.push(glyph_run_cmd(font_id));
+
+        let limits = ParseLimits {
+            max_image_pixels: 1,
+            ..ParseLimits::default()
+        };
+        let page = CpuRenderer::new()
+            .with_fonts(&fonts)
+            .with_limits(&limits)
+            .render_display_list(&dl, 1.0)
+            .expect("render");
+        let (pixels, remainder) = page.data.as_chunks::<4>();
+        assert!(
+            remainder.is_empty() && pixels.iter().all(|pixel| *pixel == [255, 255, 255, 255]),
+            "the nested Type3 image must honor max_image_pixels"
+        );
+    }
+
+    #[test]
+    fn type3_non_mask_transparency_keeps_source_colour() {
+        let mut images = ImageCache::new();
+        let image_id = images.insert(DecodedImage {
+            width: 1,
+            height: 1,
+            data: vec![0, 128, 0, 128],
+            has_alpha: true,
+            is_image_mask: false,
+            premultiplied: true,
+        });
+        let draw = ImageDraw {
+            image_id,
+            transform: Matrix::identity(),
+            alpha: 1.0,
+            is_image_mask: false,
+        };
+        let paint = CpuRenderer::color_to_paint(&Color::rgb(1.0, 0.0, 0.0), 1.0);
+        let mut renderer = CpuRenderer::new().with_images(&images);
+        renderer
+            .begin_page(&PageRenderInfo {
+                page_rect: Rect::new(0.0, 0.0, 1.0, 1.0),
+                scale: 1.0,
+                background: Color::white(),
+            })
+            .unwrap();
+        renderer.render_type3_image(&images, &draw, &paint, 1.0);
+        let pixel = px(&renderer.end_page().unwrap(), 0, 0);
+        assert!(
+            pixel[1] > pixel[0],
+            "source green must not be tinted red: {pixel:?}"
+        );
+    }
+
+    #[test]
+    fn type3_mask_combines_image_and_outer_alpha() {
+        let mut images = ImageCache::new();
+        let image_id = images.insert(DecodedImage {
+            width: 1,
+            height: 1,
+            data: vec![0, 0, 0, 255],
+            has_alpha: true,
+            is_image_mask: true,
+            premultiplied: true,
+        });
+        let draw = ImageDraw {
+            image_id,
+            transform: Matrix::identity(),
+            alpha: 0.5,
+            is_image_mask: true,
+        };
+        let paint = CpuRenderer::color_to_paint(&Color::rgb(1.0, 0.0, 0.0), 1.0);
+        let mut renderer = CpuRenderer::new().with_images(&images);
+        renderer
+            .begin_page(&PageRenderInfo {
+                page_rect: Rect::new(0.0, 0.0, 1.0, 1.0),
+                scale: 1.0,
+                background: Color::white(),
+            })
+            .unwrap();
+        renderer.render_type3_image(&images, &draw, &paint, 0.5);
+        let pixel = px(&renderer.end_page().unwrap(), 0, 0);
+        assert!(
+            (180..=205).contains(&pixel[1]),
+            "both alpha values must be applied: {pixel:?}"
+        );
+    }
+
     /// One page exercising every command family, rendered with timing enabled.
     fn mixed_page_stats() -> zpdf_render::StageStats {
         let (fonts, font_id) = var_fonts();
@@ -3231,6 +3458,7 @@ mod tests {
             height: 4,
             data: vec![128; 4 * 4 * 4],
             has_alpha: false,
+            is_image_mask: false,
             premultiplied: true,
         });
 
@@ -3253,6 +3481,7 @@ mod tests {
             image_id,
             transform: Matrix::new(10.0, 0.0, 0.0, 10.0, 2.0, 30.0),
             alpha: 1.0,
+            is_image_mask: false,
         }));
         dl.push(RenderCommand::PopClip);
 
@@ -3897,6 +4126,7 @@ mod tests {
             height: 4,
             data: vec![200; 4 * 4 * 4],
             has_alpha: false,
+            is_image_mask: false,
             premultiplied: true,
         });
         let build = |filler: bool| {
@@ -3913,6 +4143,7 @@ mod tests {
                 image_id,
                 transform: Matrix::new(30.0, 0.0, 0.0, 30.0, 10.0, 10.0),
                 alpha: 1.0,
+                is_image_mask: false,
             }));
             if filler {
                 dl.push(invisible_page_fill(&dl));

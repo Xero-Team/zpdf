@@ -19,6 +19,10 @@ pub struct DecodedImage {
     pub height: u32,
     pub data: Vec<u8>,
     pub has_alpha: bool,
+    /// True only for PDF `/ImageMask` (including inline `/IM true`) stencils.
+    /// This is deliberately distinct from `has_alpha`: ordinary transparent
+    /// images must keep their source RGB when rendered inside Type3 glyphs.
+    pub is_image_mask: bool,
     pub premultiplied: bool,
 }
 
@@ -560,6 +564,7 @@ fn decode_image_mask(
         height,
         data: rgba,
         has_alpha: true,
+        is_image_mask: true,
         premultiplied: true,
     })
 }
@@ -887,6 +892,7 @@ fn decode_jpx_image(
         height,
         data: rgba,
         has_alpha: use_alpha,
+        is_image_mask: false,
         premultiplied: use_alpha,
     })
 }
@@ -1137,6 +1143,7 @@ fn decode_raw_samples(
             height,
             data: rgba,
             has_alpha: false,
+            is_image_mask: false,
             premultiplied: false,
         });
     }
@@ -1185,6 +1192,7 @@ fn decode_raw_samples(
         height,
         data: rgba,
         has_alpha: any_masked,
+        is_image_mask: false,
         // Colour-key holes are transparent black, which is valid premultiplied
         // RGBA — the backends treat the bytes as premultiplied.
         premultiplied: any_masked,
@@ -1276,6 +1284,7 @@ fn decode_raw_samples_icc(
         height,
         data: rgba,
         has_alpha: any_masked,
+        is_image_mask: false,
         // Colour-key holes are transparent black, which is valid premultiplied
         // RGBA — the backends treat the bytes as premultiplied.
         premultiplied: any_masked,
@@ -1565,6 +1574,7 @@ mod tests {
             height: 1,
             data: vec![0, 0, 0, 255],
             has_alpha: false,
+            is_image_mask: false,
             premultiplied: false,
         };
         let mut cache = ImageCache::new();
@@ -1581,6 +1591,7 @@ mod tests {
             height: 1,
             data: vec![0, 0, 0, 255],
             has_alpha: false,
+            is_image_mask: false,
             premultiplied: false,
         };
         let mut cache = ImageCache::new();
@@ -1598,6 +1609,7 @@ mod tests {
             height: 1,
             data: vec![0, 0, 0, 255],
             has_alpha: false,
+            is_image_mask: false,
             premultiplied: false,
         };
         let mut cache = ImageCache::new();
@@ -1620,6 +1632,7 @@ mod tests {
             height: 1,
             data,
             has_alpha: false,
+            is_image_mask: false,
             premultiplied: false,
         };
 
@@ -1636,6 +1649,7 @@ mod tests {
             height: 1,
             data,
             has_alpha: false,
+            is_image_mask: false,
             premultiplied: false,
         };
         assert_eq!(cache.try_insert_with_limit(image, admitted_bytes), Some(0));
@@ -1695,6 +1709,7 @@ mod tests {
             height: 1,
             data: vec![10, 20, 30, 255],
             has_alpha: false,
+            is_image_mask: false,
             premultiplied: false,
         };
         apply_stencil_mask_with_limits(&mut image, &[0], 2, 2, false, &limits);
@@ -2225,6 +2240,7 @@ mod tests {
         let img = decode_image_xobject_with_fill(&[0b0100_0000], &dict, [10, 20, 30]).unwrap();
         assert_eq!(pixel(&img, 0), &[10, 20, 30, 255]); // sample 0 paints
         assert_eq!(pixel(&img, 1), &[0, 0, 0, 0]);
+        assert!(img.is_image_mask);
         assert!(img.premultiplied);
     }
 }
