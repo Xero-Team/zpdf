@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.14.0 — Type 3 rendering fixes and render-performance tooling
+
+### Type 3 rendering
+
+- Fixed Type 3 glyph rendering used by Beamer/LaTeX slide decks. Type 3
+  `/Widths` now honor the glyph `/FontMatrix`, and nested glyph streams inherit
+  the document parse limits. Image-based glyphs now distinguish `/ImageMask`
+  stencils from ordinary transparent images, preserve source colour, combine
+  image and outer text alpha, and tint masks with the current fill colour. (#42)
+- `DecodedImage` and `ImageDraw` expose an `is_image_mask` flag so backends can
+  make that distinction without treating every alpha-bearing image as a stencil.
+
+### Rendering performance
+
+- Parsed fonts are now shared across pages that reference the same font object
+  through a bounded document-level cache. Whole-document font loading dropped by
+  49–92% on the large multi-page fixtures, without changing the page-level font
+  API.
+- Added byte-identical fast paths for 8-bit image sample decoding and `/SMask`
+  alpha folding.
+- Blend-group compositing and soft-mask reduction are now scoped to the region
+  actually painted by the group instead of the full page, preserving pixels
+  while removing redundant work.
+
+### Render diagnostics and benchmarks
+
+- Added opt-in `zpdf_render::StageStats` and `zpdf_content::InterpretStats`,
+  GPU adapter identity, and a submitted-render path that avoids readback when
+  measuring viewer-style GPU rendering.
+- Fixed repeated submit-only renders so they drain the GPU queue instead of
+  accumulating submissions until device memory is exhausted.
+- Rebuilt the benchmark harness with checked-in corpus manifests, measured page
+  classification, a versioned baseline, and CI gates for deterministic counters.
+
+### Dependencies
+
+- `quick-xml` 0.41 → 0.42 for `zpdf-pptx-export`. The dependency's UTF-8/string
+  API transition required no call-site changes; OOXML generation is unchanged.
+
 ## 0.13.0 — PDF/X + PDF/A-3b + PDF/UA-2 validation, dependency refresh
 
 ### PDF/X-1a/3/4/6 conformance validation
