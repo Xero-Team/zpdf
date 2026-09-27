@@ -1350,7 +1350,10 @@ fn parse_custom_huff_table(data: &[u8]) -> Result<HuffTable> {
     }
     // Lower-range line.
     let lower_prefix = br.read_bits(prefix_size) as u8;
-    lines.push(HuffLine::lower(lower_prefix, 32, low - 1));
+    let lower_low = low
+        .checked_sub(1)
+        .ok_or_else(|| err("Huffman table LOW underflows lower-range base"))?;
+    lines.push(HuffLine::lower(lower_prefix, 32, lower_low));
     // Upper-range line.
     let upper_prefix = br.read_bits(prefix_size) as u8;
     lines.push(HuffLine::normal(upper_prefix, 32, high));
@@ -4467,6 +4470,34 @@ mod tests {
         for v in &samples {
             assert_eq!(tab.decode(&mut br), *v, "custom table value {v:?}");
         }
+    }
+
+    #[test]
+    fn malformed_custom_huff_low_min_does_not_panic() {
+        // Regression for the filters fuzz crash: a type-53 table with LOW =
+        // i32::MIN used to panic while constructing its lower-range line.
+        let mut table = vec![0u8]; // no OOB, one-bit prefix and range sizes
+        table.extend_from_slice(&i32::MIN.to_be_bytes());
+        table.extend_from_slice(&i32::MIN.to_be_bytes());
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            parse_custom_huff_table(&table)
+        }));
+        assert!(result.is_ok(), "malformed custom table must not panic");
+        assert!(result.unwrap().is_err());
+
+        // Keep the original minimized fuzz input covered through the complete
+        // JBIG2 segment path as well (the first two bytes are the fuzz target's
+        // filter-selection header and are omitted here).
+        let fuzz_payload = [
+            0x00, 0xFF, 0xFC, 0x05, 0x35, 0x05, 0xE1, 0xF1, 0x36, 0x00, 0x00, 0x00, 0x80, 0x00,
+            0x00, 0x00, 0x80, 0x00, 0x00, 0xFF, 0x00, 0x43, 0xFF, 0xFF, 0xFF, 0x00, 0x07, 0xE8,
+            0x45,
+        ];
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            decode_test(&fuzz_payload, &Jbig2Params { globals: None })
+        }));
+        assert!(result.is_ok(), "minimized fuzz input must not panic");
     }
 
     /// Huffman symbol-dictionary payload with a hand-coded MMR collective
