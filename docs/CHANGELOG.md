@@ -19,6 +19,10 @@
   glyphs are all blank) now clips out later painting in the CPU and SVG
   backends, as it already did on the GPU. Clip-mode text with no outline source
   (Type 3 glyphs, no usable font program) leaves the clip unchanged.
+- Add bounded lazy raw/zlib font packs, native and WASM registration, optional
+  host download caches with pinned SHA-256 identities and offline reuse, and
+  real licensed CJK rendering fixtures. Re-registering identical pack bytes
+  reuses the existing pack and its decoded-byte reservation.
 
 ## 0.14.0 — Type 3 rendering fixes and render-performance tooling
 
