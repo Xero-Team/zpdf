@@ -1,0 +1,129 @@
+{
+  "scope": "Reuse every prior font outcome after a benchmark-only CLI budget fix; no production library source changes",
+  "current_source_tree_sha256": "cd4c6f1aa4ce74ef65b2564edc1c215a91689d185664385e0a581731ebbcc912",
+  "unchanged_prior_source_files_checked": 318,
+  "changed_existing_crate_files": [
+    "crates/zpdf-benches/FONTS.md",
+    "crates/zpdf-benches/benches/common/mod.rs"
+  ],
+  "added_crate_file": "crates/zpdf-benches/tests/benchmark_budget.rs",
+  "mac_bindings": {
+    "scope": "Exact executable binding after benchmark-only CLI budget repair; retain every prior verdict",
+    "source_tree_sha256": "cd4c6f1aa4ce74ef65b2564edc1c215a91689d185664385e0a581731ebbcc912",
+    "records": [
+      {
+        "benchmark": "fonts",
+        "capture": "target/font-writer-preflight-controls-capture.json",
+        "previous_source": "11f20688d746c1f2ed3883588023be862d4821293372e8c3e02fc0ee5f84aa67",
+        "executable": "<workspace>/target/release/deps/fonts-ff7752b119d48fdd",
+        "sha256": "e77a8c661fa68db24154cf28d0d70ab6a72af85ed020f88b69b947c2c4af9527",
+        "unchanged": true
+      },
+      {
+        "benchmark": "font_provider",
+        "capture": "target/font-writer-preflight-provider-capture.json",
+        "previous_source": "11f20688d746c1f2ed3883588023be862d4821293372e8c3e02fc0ee5f84aa67",
+        "executable": "<workspace>/target/release/deps/font_provider-e92017cda7e2a9e7",
+        "sha256": "ae2c77690620b067dac7ee3d9bdcdb3fd42239bcd71cb7785240b509dba7ddf3",
+        "unchanged": true
+      },
+      {
+        "benchmark": "font_packs",
+        "capture": "target/font-writer-preflight-packs-capture.json",
+        "previous_source": "11f20688d746c1f2ed3883588023be862d4821293372e8c3e02fc0ee5f84aa67",
+        "executable": "<workspace>/target/release/deps/font_packs-6c6b4660bc1e8850",
+        "sha256": "bf046fc36484a97ee6effd3e61830a8be0fafb189e07c1b8bdb644309682b750",
+        "unchanged": true
+      },
+      {
+        "benchmark": "font_coverage",
+        "capture": "target/font-writer-preflight-coverage-capture.json",
+        "previous_source": "11f20688d746c1f2ed3883588023be862d4821293372e8c3e02fc0ee5f84aa67",
+        "executable": "<workspace>/target/release/deps/font_coverage-50412c150a3d1b7c",
+        "sha256": "7989a0f4b3a9ed5fde218ff726391eb4a913e906bbd943965861fdfcecf801bc",
+        "unchanged": true
+      },
+      {
+        "benchmark": "font_fallback",
+        "capture": "target/font-writer-preflight-fallback-capture.json",
+        "previous_source": "11f20688d746c1f2ed3883588023be862d4821293372e8c3e02fc0ee5f84aa67",
+        "executable": "<workspace>/target/release/deps/font_fallback-d8907b070b0dbcf4",
+        "sha256": "1d5188903c55ec8d2919c6e379152a533d99b524c038197642a055416dcbc548",
+        "unchanged": true
+      },
+      {
+        "benchmark": "font_cmaps",
+        "capture": "target/font-writer-preflight-cmaps-capture.json",
+        "previous_source": "11f20688d746c1f2ed3883588023be862d4821293372e8c3e02fc0ee5f84aa67",
+        "executable": "<workspace>/target/release/deps/font_cmaps-90b4ced9a01fd926",
+        "sha256": "ffa9fc983171eaf1b59f5e666124775073e351670039097814799666bcb5dab6",
+        "unchanged": true
+      },
+      {
+        "benchmark": "font_writer_fallback",
+        "capture": "target/font-writer-preflight-writer-capture.json",
+        "previous_source": "11f20688d746c1f2ed3883588023be862d4821293372e8c3e02fc0ee5f84aa67",
+        "executable": "<workspace>/target/release/deps/font_writer_fallback-19721370e551614b",
+        "sha256": "137c5819a479035569f59eb4c42edd92744a04810d9a811e0605deb38b7f5822",
+        "unchanged": true
+      },
+      {
+        "benchmark": "font_diagnostics",
+        "capture": "target/font-writer-preflight-diagnostics-capture.json",
+        "previous_source": "11f20688d746c1f2ed3883588023be862d4821293372e8c3e02fc0ee5f84aa67",
+        "executable": "<workspace>/target/release/deps/font_diagnostics-1586c4b2a096f46f",
+        "sha256": "9811213d8b861a759fe75dcc886c2106dda6e5791589973ef02071fbe5f37450",
+        "unchanged": true
+      },
+      {
+        "benchmark": "font_gpu",
+        "capture": "target/font-writer-preflight-gpu-capture.json",
+        "previous_source": "11f20688d746c1f2ed3883588023be862d4821293372e8c3e02fc0ee5f84aa67",
+        "executable": "<workspace>/target/release/deps/font_gpu-5613d843a832199d",
+        "sha256": "e922b2e8ab785a2d0f80bb5f9962cf537141d4b954e8f411e1895420fe8965bd",
+        "unchanged": true
+      }
+    ]
+  },
+  "linux_bindings": {
+    "control": {
+      "source": "000722df3bbb63d698a47d3963f601a7f31f3c1bcda93822898c493d75219692",
+      "font_executables": {
+        "fonts": {
+          "path": "<workspace>/target/font-linux-recheck-20261009/pipeline/control/executables/fonts",
+          "sha256": "ee5ad94752d7a708e95cea51ea7a48198c1913c709ee5e239a1fff5eb5e087ba",
+          "previous_capture_source": "55958f86c1dcbb5f727135fb264578c947b25d28b05605afa03f116d138f8217",
+          "byte_identical": true
+        },
+        "font_diagnostics": {
+          "path": "<workspace>/target/font-linux-recheck-20261009/pipeline/control/executables/font_diagnostics",
+          "sha256": "6424067450db49544db7204bfc73fdb2bf67531668315db920e28e1d72856322",
+          "previous_capture_source": "55958f86c1dcbb5f727135fb264578c947b25d28b05605afa03f116d138f8217",
+          "byte_identical": true
+        }
+      }
+    },
+    "current": {
+      "source": "cd4c6f1aa4ce74ef65b2564edc1c215a91689d185664385e0a581731ebbcc912",
+      "font_executables": {
+        "fonts": {
+          "path": "<workspace>/target/font-linux-recheck-20261009/pipeline/current/executables/fonts",
+          "sha256": "233bfa0007bd89d543a1c260210928857cf041e93a0d08b1840776f63393b3aa",
+          "previous_capture_source": "11f20688d746c1f2ed3883588023be862d4821293372e8c3e02fc0ee5f84aa67",
+          "byte_identical": true
+        },
+        "font_diagnostics": {
+          "path": "<workspace>/target/font-linux-recheck-20261009/pipeline/current/executables/font_diagnostics",
+          "sha256": "8a33e0ed72b2da4e3ea0a73c99745b0b85c6964bc020927d793a5c4d50c39009",
+          "previous_capture_source": "11f20688d746c1f2ed3883588023be862d4821293372e8c3e02fc0ee5f84aa67",
+          "byte_identical": true
+        }
+      }
+    }
+  },
+  "validation_logs": {
+    "budget-tests.log": "346c427c661ed168503bf717cedabf65cf18e77ef67a34f79c8107bfc12ee18e",
+    "budget-clippy.log": "97219a5e096ee6e30e1bef13e6961cbb1bdfe877a50f3c9017749930bf659a68",
+    "budget-fmt.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  }
+}

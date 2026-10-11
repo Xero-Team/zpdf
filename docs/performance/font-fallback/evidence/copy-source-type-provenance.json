@@ -1,0 +1,347 @@
+{
+  "scope": "Preserve all completed launches across a pre-timing diagnostic correction",
+  "sources": [
+    {
+      "source": "target/font-copy-source-type-intervention/summary.json",
+      "artifact": "copy-source-type-intervention.json",
+      "sha256": "ce1723d4e006533550237835adc4b9bdfe0c8767c78e4ad403d1a69c9535e8c8"
+    },
+    {
+      "source": "target/font_copy_source_type.py",
+      "artifact": "copy-source-type.py.txt",
+      "sha256": "62fbacd579a23452bdfcc9094cb2812f249cd2f8a226471f841cbb7d6ebcb230"
+    },
+    {
+      "source": "target/font_copy_source_type_run.py",
+      "artifact": "copy-source-type-run.py.txt",
+      "sha256": "49796a7858da6c49055633087e2f18e7d9568e164c39b295eee04c2836d5540a"
+    },
+    {
+      "source": "target/font_copy_source_type_v1.py",
+      "artifact": "copy-source-type-v1.py.txt",
+      "sha256": "2f36474592c66569e03bb37286423de7925fdb8a9d3d9b952eb43dc5bf411486"
+    },
+    {
+      "source": "target/font_copy_source_type_run_v1.py",
+      "artifact": "copy-source-type-run-v1.py.txt",
+      "sha256": "eb238afef4bb896866a0eecc1bd2cb48d78d934f762bb2e725ce6c0f1ea9d329"
+    }
+  ],
+  "interrupted_summary_sha256": "f45b4175eb6e5c502f26d45ed53a597f295be4d5dffd8ad649eab1a1677e6ffe",
+  "completed_before_fix": [
+    {
+      "run": 0,
+      "side": 0,
+      "mode": "untouched"
+    },
+    {
+      "run": 0,
+      "side": 1,
+      "mode": "untouched"
+    },
+    {
+      "run": 0,
+      "side": 0,
+      "mode": "same"
+    },
+    {
+      "run": 0,
+      "side": 1,
+      "mode": "same"
+    },
+    {
+      "run": 0,
+      "side": 0,
+      "mode": "separate"
+    },
+    {
+      "run": 0,
+      "side": 1,
+      "mode": "separate"
+    },
+    {
+      "run": 1,
+      "side": 1,
+      "mode": "same"
+    },
+    {
+      "run": 1,
+      "side": 0,
+      "mode": "same"
+    },
+    {
+      "run": 1,
+      "side": 1,
+      "mode": "separate"
+    },
+    {
+      "run": 1,
+      "side": 0,
+      "mode": "separate"
+    },
+    {
+      "run": 1,
+      "side": 1,
+      "mode": "untouched"
+    },
+    {
+      "run": 1,
+      "side": 0,
+      "mode": "untouched"
+    },
+    {
+      "run": 2,
+      "side": 0,
+      "mode": "separate"
+    },
+    {
+      "run": 2,
+      "side": 1,
+      "mode": "separate"
+    },
+    {
+      "run": 2,
+      "side": 0,
+      "mode": "untouched"
+    },
+    {
+      "run": 2,
+      "side": 1,
+      "mode": "untouched"
+    },
+    {
+      "run": 2,
+      "side": 0,
+      "mode": "same"
+    },
+    {
+      "run": 2,
+      "side": 1,
+      "mode": "same"
+    },
+    {
+      "run": 3,
+      "side": 1,
+      "mode": "untouched"
+    },
+    {
+      "run": 3,
+      "side": 0,
+      "mode": "untouched"
+    },
+    {
+      "run": 3,
+      "side": 1,
+      "mode": "same"
+    },
+    {
+      "run": 3,
+      "side": 0,
+      "mode": "same"
+    },
+    {
+      "run": 3,
+      "side": 1,
+      "mode": "separate"
+    },
+    {
+      "run": 3,
+      "side": 0,
+      "mode": "separate"
+    },
+    {
+      "run": 4,
+      "side": 0,
+      "mode": "same"
+    },
+    {
+      "run": 4,
+      "side": 1,
+      "mode": "same"
+    },
+    {
+      "run": 4,
+      "side": 0,
+      "mode": "separate"
+    },
+    {
+      "run": 4,
+      "side": 1,
+      "mode": "separate"
+    },
+    {
+      "run": 4,
+      "side": 0,
+      "mode": "untouched"
+    },
+    {
+      "run": 4,
+      "side": 1,
+      "mode": "untouched"
+    },
+    {
+      "run": 5,
+      "side": 1,
+      "mode": "separate"
+    },
+    {
+      "run": 5,
+      "side": 0,
+      "mode": "separate"
+    },
+    {
+      "run": 5,
+      "side": 1,
+      "mode": "untouched"
+    },
+    {
+      "run": 5,
+      "side": 0,
+      "mode": "untouched"
+    },
+    {
+      "run": 5,
+      "side": 1,
+      "mode": "same"
+    },
+    {
+      "run": 5,
+      "side": 0,
+      "mode": "same"
+    },
+    {
+      "run": 6,
+      "side": 0,
+      "mode": "untouched"
+    },
+    {
+      "run": 6,
+      "side": 1,
+      "mode": "untouched"
+    },
+    {
+      "run": 6,
+      "side": 0,
+      "mode": "same"
+    },
+    {
+      "run": 6,
+      "side": 1,
+      "mode": "same"
+    },
+    {
+      "run": 6,
+      "side": 0,
+      "mode": "separate"
+    },
+    {
+      "run": 6,
+      "side": 1,
+      "mode": "separate"
+    },
+    {
+      "run": 7,
+      "side": 1,
+      "mode": "same"
+    },
+    {
+      "run": 7,
+      "side": 0,
+      "mode": "same"
+    },
+    {
+      "run": 7,
+      "side": 1,
+      "mode": "separate"
+    },
+    {
+      "run": 7,
+      "side": 0,
+      "mode": "separate"
+    },
+    {
+      "run": 7,
+      "side": 1,
+      "mode": "untouched"
+    },
+    {
+      "run": 7,
+      "side": 0,
+      "mode": "untouched"
+    },
+    {
+      "run": 8,
+      "side": 0,
+      "mode": "separate"
+    },
+    {
+      "run": 8,
+      "side": 1,
+      "mode": "separate"
+    },
+    {
+      "run": 8,
+      "side": 0,
+      "mode": "untouched"
+    },
+    {
+      "run": 8,
+      "side": 1,
+      "mode": "untouched"
+    },
+    {
+      "run": 8,
+      "side": 0,
+      "mode": "same"
+    },
+    {
+      "run": 8,
+      "side": 1,
+      "mode": "same"
+    },
+    {
+      "run": 9,
+      "side": 1,
+      "mode": "untouched"
+    },
+    {
+      "run": 9,
+      "side": 0,
+      "mode": "untouched"
+    },
+    {
+      "run": 9,
+      "side": 1,
+      "mode": "same"
+    },
+    {
+      "run": 9,
+      "side": 0,
+      "mode": "same"
+    },
+    {
+      "run": 9,
+      "side": 1,
+      "mode": "separate"
+    }
+  ],
+  "failed_attempt": {
+    "run": 9,
+    "mode": "separate",
+    "side": 0,
+    "directory": "<workspace>/target/font-copy-source-type-intervention/09-separate-0"
+  },
+  "failed_log_sha256": "a3c654ddfce17bdb003024600b700c0281fa2b0cd0699afe4d8c27a5bc54ede6",
+  "failed_log": "(lldb) target create \"<workspace>/target/font-benchmark-runs/run-zcaqwew_/executable/font_diagnostics\"\nCurrent executable set to '<workspace>/target/font-benchmark-runs/run-zcaqwew_/executable/font_diagnostics' (arm64).\n(lldb) settings set target.disable-aslr false\n(lldb) script t=lldb.debugger.GetSelectedTarget(); b=t.BreakpointCreateBySBAddress(t.ResolveFileAddress(0x1000214e0)); b.SetOneShot(True)\n(lldb) run --bench --noplot --exact font_diagnostics/copy_heap --sample-size 10 --warm-up-time 0.1 --measurement-time 0.25 --nresamples 10000\nGnuplot not found, using plotters backend\nfont diagnostics: original static alignment mod 64 = 36\nProcess 29816 launched: '<workspace>/target/font-benchmark-runs/run-zcaqwew_/executable/font_diagnostics' (arm64)\nProcess 29816 stopped\n* thread #1, name = 'main', queue = 'com.apple.main-thread', stop reason = one-shot breakpoint 1\n       frame #0: 0x00000001009814e0 font_diagnostics`font_diagnostics::main + 276\nfont_diagnostics`font_diagnostics::main:\n->  0x1009814e0 <+276>: bl     0x10098de60               ; __rustc::__rust_alloc\n    0x1009814e4 <+280>: cbz    x0, 0x100981ff0           ; <+3108>\n    0x1009814e8 <+284>: mov    w19, #0x5260              ; =21088 \n    0x1009814ec <+288>: str    x19, [sp, #0x210]\nTarget 0: (font_diagnostics) stopped.\n(lldb) command script import target/font_copy_source_type.py\n(lldb) script font_copy_source_type.run('separate', '<workspace>/target/font-copy-source-type-intervention/09-separate-0/process.json')\nProcess 29816 exited with status = 9 (0x00000009) killed\nTraceback (most recent call last):\n  File \"<input>\", line 1, in <module>\n  File \"<workspace>/target/font_copy_source_type.py\", line 82, in run\n    assert reg(\"x2\") == record[\"predicted_source_xzone\"]\nAssertionError\n",
+  "zero_descriptor_successes": [
+    {
+      "run": 3,
+      "side": 0,
+      "mode": "separate",
+      "selected_source_type_descriptor": 0,
+      "actual_source_xzone": 226,
+      "predicted_destination_xzone": 228
+    }
+  ],
+  "note": "One retained zero-descriptor launch reached the desired actual source xzone; it is not treated as an ordinary hash prediction. The failed attempt produced no samples. The corrected search excludes zero and resumes only unmeasured launches."
+}

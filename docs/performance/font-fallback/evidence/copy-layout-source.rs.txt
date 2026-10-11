@@ -1,0 +1,51 @@
+//! Independent copy-layout investigation, not a replacement font benchmark.
+
+use std::hint::black_box;
+use std::io::{BufWriter, Write};
+use std::time::Instant;
+
+const INPUT: &[u8] = include_bytes!("../crates/zpdf-font/tests/fixtures/coverage-primary.ttf");
+const OFFSETS: [usize; 9] = [0, 16, 64, 128, 256, 512, 4096, 8192, 16384];
+const ROUNDS: usize = 24;
+const ITERATIONS: usize = 20_000;
+
+fn aligned_start(bytes: &[u8]) -> usize {
+    (16_384 - bytes.as_ptr() as usize % 16_384) % 16_384
+}
+
+#[inline(never)]
+fn copy_batch(source: &[u8], destination: &mut [u8]) -> f64 {
+    for _ in 0..1000 {
+        destination.copy_from_slice(black_box(source));
+        black_box(&*destination);
+    }
+    let start = Instant::now();
+    for _ in 0..ITERATIONS {
+        destination.copy_from_slice(black_box(source));
+        black_box(&*destination);
+    }
+    start.elapsed().as_nanos() as f64 / ITERATIONS as f64
+}
+
+fn main() {
+    let mut source_storage = vec![0u8; INPUT.len() + 32_768];
+    let source_start = aligned_start(&source_storage);
+    source_storage[source_start..source_start + INPUT.len()].copy_from_slice(INPUT);
+    let source = &source_storage[source_start..source_start + INPUT.len()];
+    let mut destination_storage = vec![0u8; INPUT.len() + 65_536];
+    let destination_start = aligned_start(&destination_storage);
+    let mut output = BufWriter::new(std::io::stdout().lock());
+    writeln!(output, "{{\"kind\":\"environment\",\"bytes\":{},\"rounds\":{ROUNDS},\"iterations\":{ITERATIONS},\"source_mod_16k\":{}}}", INPUT.len(), source.as_ptr() as usize % 16_384).unwrap();
+    for round in 0..ROUNDS {
+        // Rotate and reverse the fixed case order to reduce temporal confounding.
+        for index in 0..OFFSETS.len() {
+            let index = if round % 2 == 0 { index } else { OFFSETS.len() - 1 - index };
+            let offset = OFFSETS[(index + round) % OFFSETS.len()];
+            let begin = destination_start + offset;
+            let destination = &mut destination_storage[begin..begin + INPUT.len()];
+            let ns = copy_batch(source, destination);
+            assert_eq!(destination, source);
+            writeln!(output, "{{\"kind\":\"sample\",\"round\":{round},\"offset\":{offset},\"ns_per_op\":{ns},\"destination_mod_16k\":{}}}", destination.as_ptr() as usize % 16_384).unwrap();
+        }
+    }
+}

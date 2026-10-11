@@ -1,0 +1,103 @@
+"""Inspect archived benchmark allocations; never produce acceptance timings."""
+import json
+import hashlib
+from pathlib import Path
+import lldb
+
+
+def inspect(output):
+    debugger = lldb.debugger
+    debugger.SetAsync(False)
+    target = debugger.GetSelectedTarget()
+    process = target.GetProcess()
+    assert process.GetState() == lldb.eStateStopped
+    allocator = target.FindModule(lldb.SBFileSpec("libsystem_malloc.dylib"))
+    assert allocator.GetUUIDString() == "971CDCFE-4D20-300E-A1D6-EC8672FDD258", "Review runtime offsets before inspecting another OS build"
+
+    def read(address, size):
+        error = lldb.SBError()
+        value = process.ReadMemory(address, size, error)
+        assert error.Success() and len(value) == size
+        return value
+
+    def word(address):
+        return int.from_bytes(read(address, 8), "little")
+
+    def classify(entry):
+        # Offsets are corroborated by this installed allocator's instructions.
+        zone = entry["x0"]
+        main = word(zone + 0xf8) or zone
+        raw_keys = read(main + 0x190, 16)
+        key_a = int.from_bytes(raw_keys[:8], "little")
+        key_b = int.from_bytes(raw_keys[8:], "little")
+        size = entry["x1"]
+        msb = (size - 1).bit_length() - 1
+        bin_index = (msb << 2) + (((size - 1) >> (msb - 2)) & 3) - 20
+        count = read(word(main + 0x1c8) + bin_index, 1)[0]
+        offset = read(word(main + 0x1d0) + bin_index, 1)[0]
+        assert count == 6 and entry["x2"] >> 32 == 0
+        type_hash = entry["x2"]
+        assert type_hash == ((entry["lr"] >> 2) & 0xffffffff)
+        mixed = (key_a * type_hash + key_b) & ((1 << 64) - 1)
+        # The two observed caller addresses are 5,992 bytes apart.
+        delta = (key_a * 1498) & ((1 << 64) - 1)
+        step = (delta >> 32) & 3
+        carry = (delta & 0xffffffff) / (1 << 32)
+        return {
+            "bin_index": bin_index, "bin_bucket_count": count,
+            "bin_offset": offset, "keys_sha256": hashlib.sha256(raw_keys).hexdigest(),
+            "predicted_xzone_index": offset + 2 + ((mixed >> 32) & 3),
+            "destination_bucket_step_mod4_without_carry": step,
+            "destination_bucket_step_mod4_with_carry": (step + 1) & 3,
+            "carry_fraction_under_uniform_low32": carry,
+        }
+
+    def registers():
+        frame = process.GetSelectedThread().GetFrameAtIndex(0)
+        return {name: frame.FindRegister(name).GetValueAsUnsigned()
+                for name in ("x0", "x1", "x2", "x3", "lr", "pc", "sp")}
+
+    def until(name=None, address=None):
+        if name is not None:
+            bp = target.BreakpointCreateByName(name, "libsystem_malloc.dylib")
+        else:
+            bp = target.BreakpointCreateBySBAddress(target.ResolveFileAddress(address))
+        assert bp.GetNumLocations() == 1, (name, address, bp.GetNumLocations())
+        bp.SetOneShot(True)
+        error = process.Continue()
+        assert error.Success(), error.GetCString()
+        assert process.GetState() == lldb.eStateStopped
+        assert process.GetSelectedThread().GetStopReason() == lldb.eStopReasonBreakpoint
+        return registers()
+
+    record = {"scope": "Debugger-only allocation inspection; no acceptance timing",
+              "aslr_disabled": False, "allocations": {}}
+    try:
+        for stage in ("source", "destination"):
+            if stage == "destination":
+                until(address=0x100000ad0)
+                until(address=0x100022c48)
+            entry = until(name="xzm_malloc")
+            assert entry["x1"] == 21088, entry
+            classification = classify(entry)
+            bucket = until(name="_xzm_xzone_malloc")
+            assert bucket["x1"] == 21088, bucket
+            assert classification["predicted_xzone_index"] == bucket["x2"]
+            returned = until(address=0x1000214e4 if stage == "source" else 0x100022c4c)
+            record["allocations"][stage] = {
+                "request_bytes": entry["x1"], "type_descriptor": entry["x2"],
+                "caller_pc": entry["lr"], "xzone_index": bucket["x2"],
+                "pointer": returned["x0"], "entry_registers": entry,
+                "bucket_registers": bucket,
+                "classification": classification,
+            }
+        module = target.FindModule(lldb.SBFileSpec("libsystem_malloc.dylib"))
+        record["allocator_uuid"] = module.GetUUIDString()
+        source = record["allocations"]["source"]
+        dest = record["allocations"]["destination"]
+        record["same_xzone"] = source["xzone_index"] == dest["xzone_index"]
+        record["destination_minus_source"] = dest["pointer"] - source["pointer"]
+        Path(output).write_text(json.dumps(record, indent=2) + "\n")
+        print(json.dumps(record))
+    finally:
+        process.Kill()

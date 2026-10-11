@@ -1,0 +1,49 @@
+//! Controlled source/destination distances, not a font acceptance benchmark.
+
+use std::hint::black_box;
+use std::io::{BufWriter, Write};
+use std::time::Instant;
+
+const INPUT: &[u8] = include_bytes!("../crates/zpdf-font/tests/fixtures/coverage-primary.ttf");
+const GAPS: [usize; 8] = [24576, 32768, 40960, 65536, 131072, 139264, 1048576, 1056768];
+const ITERATIONS: usize = 20_000;
+const ROUNDS: usize = 24;
+
+#[inline(never)]
+fn copy_batch(source: &[u8], destination: &mut [u8]) -> f64 {
+    for _ in 0..1000 {
+        destination.copy_from_slice(black_box(source));
+        black_box(&*destination);
+    }
+    let begin = Instant::now();
+    for _ in 0..ITERATIONS {
+        destination.copy_from_slice(black_box(source));
+        black_box(&*destination);
+    }
+    begin.elapsed().as_nanos() as f64 / ITERATIONS as f64
+}
+
+fn main() {
+    let mut storage = vec![0u8; GAPS[GAPS.len() - 1] + INPUT.len() + 16_384];
+    let start = (16_384 - storage.as_ptr() as usize % 16_384) % 16_384;
+    let mut output = BufWriter::new(std::io::stdout().lock());
+    writeln!(output, "{{\"kind\":\"environment\",\"bytes\":{},\"rounds\":{ROUNDS},\"iterations\":{ITERATIONS},\"source_mod_16k\":{}}}", INPUT.len(), (storage.as_ptr() as usize + start) % 16_384).unwrap();
+    let count = GAPS.len() * 2;
+    for round in 0..ROUNDS {
+        for index in 0..count {
+            let index = if round % 2 == 0 { index } else { count - 1 - index };
+            let case = (index + round) % count;
+            let gap = GAPS[case / 2];
+            let reverse = case % 2 != 0;
+            let (left, right) = storage[start..].split_at_mut(gap);
+            let low = &mut left[..INPUT.len()];
+            let high = &mut right[..INPUT.len()];
+            low.copy_from_slice(INPUT);
+            high.copy_from_slice(INPUT);
+            let ns = if reverse { copy_batch(high, low) } else { copy_batch(low, high) };
+            assert_eq!(low, INPUT);
+            assert_eq!(high, INPUT);
+            writeln!(output, "{{\"kind\":\"sample\",\"round\":{round},\"gap\":{gap},\"reverse\":{reverse},\"ns_per_op\":{ns}}}").unwrap();
+        }
+    }
+}

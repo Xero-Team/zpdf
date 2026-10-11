@@ -1,0 +1,25 @@
+{
+  "scope": "Unchanged root helper source bindings after benchmark-only work; no tests rerun during timing",
+  "checked_unix": 1791557183.2569568,
+  "frozen_source_tree_sha256": "11f20688d746c1f2ed3883588023be862d4821293372e8c3e02fc0ee5f84aa67",
+  "transfer_manifest_sha256": "b2cd39fff1dd523f5a0611f006ecb3ad227e29ed2aacfc7505fae6b13f7d31c7",
+  "current_helper_sha256": {
+    "tools/fetch_adobe_cmaps.py": "5e843cec700c1df3180e4c80beb39677b9b67af959b22855f8ca119c1c1a369f",
+    "tools/fetch_font.py": "93788af2a9d2543531bed7c48b1613a69742db3d40c04a0b54e2bd5a3da93773",
+    "tools/generate_adobe_cmaps.py": "0b2b88da2ca14245c6d06df772616ab16a809dbd5e0544eebea8e69cfe6de830",
+    "tools/test_fetch_font.py": "1c9c9bd937ff4bf43bd3479cf9e130679fc8f4d86f0b16d1cacfd8665bbbe38b",
+    "tools/test_generate_adobe_cmaps.py": "3b0b0d92d17816b845926a86a753653bbc30fe362dcd368386462eda38f0fdcb"
+  },
+  "frozen_helper_sha256": {
+    "tools/fetch_adobe_cmaps.py": "5e843cec700c1df3180e4c80beb39677b9b67af959b22855f8ca119c1c1a369f",
+    "tools/fetch_font.py": "93788af2a9d2543531bed7c48b1613a69742db3d40c04a0b54e2bd5a3da93773",
+    "tools/generate_adobe_cmaps.py": "0b2b88da2ca14245c6d06df772616ab16a809dbd5e0544eebea8e69cfe6de830",
+    "tools/test_fetch_font.py": "1c9c9bd937ff4bf43bd3479cf9e130679fc8f4d86f0b16d1cacfd8665bbbe38b",
+    "tools/test_generate_adobe_cmaps.py": "3b0b0d92d17816b845926a86a753653bbc30fe362dcd368386462eda38f0fdcb"
+  },
+  "validation_log": {
+    "path": "target/font-acceptance-tool-tests.log",
+    "sha256": "ea6aff1dafb04466b797207411a5bc6ff09cdf88c2c93b787430cb84b04a8ba0"
+  },
+  "all_files_match": true
+}

@@ -1,0 +1,21 @@
+{
+  "source_fingerprint_unchanged": "11f20688d746c1f2ed3883588023be862d4821293372e8c3e02fc0ee5f84aa67",
+  "checked": {
+    "copy-allocator-intervention": {
+      "launches": 96,
+      "samples": 960,
+      "comparisons_recomputed": 5
+    },
+    "copy-source-type-intervention": {
+      "launches": 96,
+      "samples": 960,
+      "comparisons_recomputed": 5
+    }
+  },
+  "allocator_predictions_matched": 24,
+  "gap_samples_retained": 1536,
+  "failed_attempts_retained": 1,
+  "pre_fix_successes_retained": 59,
+  "production_tests_rerun": false,
+  "reason": "Only diagnostic artifacts and documentation changed."
+}

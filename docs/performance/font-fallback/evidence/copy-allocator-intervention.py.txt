@@ -1,0 +1,60 @@
+"""Process-local diagnostic intervention; not a benchmark acceptance policy."""
+import hashlib
+import json
+from pathlib import Path
+import lldb
+
+
+def run(mode, output):
+    assert mode in ("untouched", "same", "separate")
+    debugger = lldb.debugger
+    debugger.SetAsync(False)
+    target = debugger.GetSelectedTarget()
+    process = target.GetProcess()
+    allocator = target.FindModule(lldb.SBFileSpec("libsystem_malloc.dylib"))
+    assert allocator.GetUUIDString() == "971CDCFE-4D20-300E-A1D6-EC8672FDD258"
+
+    def read(address, size):
+        error = lldb.SBError()
+        value = process.ReadMemory(address, size, error)
+        assert error.Success() and len(value) == size
+        return value
+
+    def reg(name):
+        return process.GetSelectedThread().GetFrameAtIndex(0).FindRegister(name).GetValueAsUnsigned()
+
+    record = {"scope": "Process-local allocator diagnostic; excluded from acceptance", "mode": mode}
+    try:
+        bp = target.BreakpointCreateByName("xzm_malloc", "libsystem_malloc.dylib")
+        assert bp.GetNumLocations() == 1
+        bp.SetOneShot(True)
+        assert process.Continue().Success()
+        assert process.GetState() == lldb.eStateStopped
+        assert reg("x1") == 21088
+        zone = reg("x0")
+        main = int.from_bytes(read(zone + 0xf8, 8), "little") or zone
+        key_address = main + 0x190
+        original = read(key_address, 16)
+        record.update(allocator_uuid=allocator.GetUUIDString(),
+                      original_keys_sha256=hashlib.sha256(original).hexdigest(),
+                      source_type_descriptor=reg("x2"))
+        if mode != "untouched":
+            key_a = 0 if mode == "same" else 1 << 32
+            replacement = key_a.to_bytes(8, "little") + bytes(8)
+            error = lldb.SBError()
+            written = process.WriteMemory(key_address, replacement, error)
+            assert error.Success() and written == 16, error.GetCString()
+            assert read(key_address, 16) == replacement
+            record["replacement_keys"] = [key_a, 0]
+        assert target.DeleteAllBreakpoints()
+        record["breakpoints_before_warmup"] = target.GetNumBreakpoints()
+        assert record["breakpoints_before_warmup"] == 0
+        assert process.Continue().Success()
+        assert process.GetState() == lldb.eStateExited
+        record["exit_status"] = process.GetExitStatus()
+        assert record["exit_status"] == 0
+        Path(output).write_text(json.dumps(record, indent=2) + "\n")
+        print(json.dumps(record))
+    finally:
+        if process.GetState() not in (lldb.eStateExited, lldb.eStateDetached):
+            process.Kill()

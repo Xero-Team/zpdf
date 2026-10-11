@@ -1,0 +1,99 @@
+"""Change one disposable process allocation descriptor, then measure normally."""
+import hashlib
+import json
+from pathlib import Path
+import lldb
+
+
+def run(mode, output):
+    assert mode in ("untouched", "same", "separate")
+    debugger = lldb.debugger
+    debugger.SetAsync(False)
+    target = debugger.GetSelectedTarget()
+    process = target.GetProcess()
+    allocator = target.FindModule(lldb.SBFileSpec("libsystem_malloc.dylib"))
+    assert allocator.GetUUIDString() == "971CDCFE-4D20-300E-A1D6-EC8672FDD258"
+
+    def read(address, size):
+        error = lldb.SBError()
+        value = process.ReadMemory(address, size, error)
+        assert error.Success() and len(value) == size
+        return value
+
+    def word(address):
+        return int.from_bytes(read(address, 8), "little")
+
+    def register(name):
+        return process.GetSelectedThread().GetFrameAtIndex(0).FindRegister(name)
+
+    def reg(name):
+        return register(name).GetValueAsUnsigned()
+
+    def until(name=None, address=None):
+        if name:
+            bp = target.BreakpointCreateByName(name, "libsystem_malloc.dylib")
+        else:
+            bp = target.BreakpointCreateBySBAddress(target.ResolveFileAddress(address))
+        assert bp.GetNumLocations() == 1
+        bp.SetOneShot(True)
+        assert process.Continue().Success()
+        assert process.GetState() == lldb.eStateStopped
+        assert process.GetSelectedThread().GetStopReason() == lldb.eStopReasonBreakpoint
+
+    record = {"scope": "Single-allocation type diagnostic; excluded from acceptance", "mode": mode}
+    try:
+        until(name="xzm_malloc")
+        assert reg("x1") == 21088
+        zone = reg("x0")
+        main = word(zone + 0xf8) or zone
+        key_address = main + 0x190
+        original = read(key_address, 16)
+        key_a = int.from_bytes(original[:8], "little")
+        key_b = int.from_bytes(original[8:], "little")
+        count = read(word(main + 0x1c8) + 37, 1)[0]
+        offset = read(word(main + 0x1d0) + 37, 1)[0]
+        assert count == 6
+
+        def bucket(type_hash):
+            return (((key_a * type_hash + key_b) & ((1 << 64) - 1)) >> 32) & 3
+
+        source_type = reg("x2")
+        assert source_type == ((reg("lr") >> 2) & 0xffffffff)
+        destination_type = (source_type + 1498) & 0xffffffff
+        selected_type = source_type
+        if mode == "same":
+            selected_type = destination_type
+        elif mode == "separate":
+            desired = (bucket(destination_type) + 2) & 3
+            selected_type = next(value for value in range(65536) if bucket(value) == desired)
+        if mode != "untouched":
+            assert register("x2").SetValueFromCString(str(selected_type))
+            assert reg("x2") == selected_type
+        record.update(allocator_uuid=allocator.GetUUIDString(),
+                      original_keys_sha256=hashlib.sha256(original).hexdigest(),
+                      source_type_descriptor=source_type,
+                      selected_source_type_descriptor=selected_type,
+                      predicted_destination_type_descriptor=destination_type,
+                      predicted_destination_xzone=offset + 2 + bucket(destination_type),
+                      predicted_source_xzone=offset + 2 + bucket(selected_type))
+        until(name="_xzm_xzone_malloc")
+        assert reg("x1") == 21088
+        record["actual_source_xzone"] = reg("x2")
+        assert reg("x2") == record["predicted_source_xzone"]
+        until(address=0x1000214e4)
+        record["source_pointer"] = reg("x0")
+        assert record["source_pointer"] != 0
+        assert read(key_address, 16) == original
+        record["keys_unchanged"] = True
+        assert target.DeleteAllBreakpoints()
+        assert target.GetNumBreakpoints() == 0
+        record["breakpoints_before_warmup"] = 0
+        assert process.Continue().Success()
+        assert process.GetState() == lldb.eStateExited
+        record["exit_status"] = process.GetExitStatus()
+        assert record["exit_status"] == 0
+        Path(output).write_text(json.dumps(record, indent=2) + "\n")
+        print(json.dumps(record))
+    finally:
+        if process.GetState() not in (lldb.eStateExited, lldb.eStateDetached):
+            process.Kill()

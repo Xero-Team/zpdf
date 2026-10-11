@@ -1,0 +1,43 @@
+{
+  "repository": "apple-oss-distributions/libmalloc",
+  "revision": "c49dafa25f1efe8607701ae6014a663ad2ee437f",
+  "scope": "Public source reference; not yet asserted to match the installed OS",
+  "files": [
+    {
+      "path": "src/malloc.c",
+      "git_blob_sha": "b777921f4288d3683b5a5dcf4e0cfc0b3d8ae8c3",
+      "sha256": "756266669e8251f475d8939a3770f4d430b644104b9f3cb65460c71edea94ec6",
+      "url": "https://github.com/apple-oss-distributions/libmalloc/blob/c49dafa25f1efe8607701ae6014a663ad2ee437f/src/malloc.c"
+    },
+    {
+      "path": "src/malloc_type.c",
+      "git_blob_sha": "e5ead44364df46c330dc2e2f4e0aa25d7733610f",
+      "sha256": "0395deb01771893d620581273bac72510808a9668f8819e30fc263297e98e009",
+      "url": "https://github.com/apple-oss-distributions/libmalloc/blob/c49dafa25f1efe8607701ae6014a663ad2ee437f/src/malloc_type.c"
+    },
+    {
+      "path": "src/malloc_type_internal.h",
+      "git_blob_sha": "24378c9ebf1533669fc23630719e8b34a01fbec1",
+      "sha256": "6d20f26595e5ee30b5fc6f5f8fca537d20233343b4e2688542056df5bfd0fdcd",
+      "url": "https://github.com/apple-oss-distributions/libmalloc/blob/c49dafa25f1efe8607701ae6014a663ad2ee437f/src/malloc_type_internal.h"
+    },
+    {
+      "path": "src/xzone_malloc/xzone_malloc.c",
+      "git_blob_sha": "0b20436fb92660bae05b6ee936a7157f10754124",
+      "sha256": "8bb7920e82aee5396376fc070ee8a416b90e833e32336f476414a3af191a711c",
+      "url": "https://github.com/apple-oss-distributions/libmalloc/blob/c49dafa25f1efe8607701ae6014a663ad2ee437f/src/xzone_malloc/xzone_malloc.c"
+    },
+    {
+      "path": "src/xzone_malloc/xzone_inline_internal.h",
+      "git_blob_sha": "f0e01c15ca0b2d91f289eeca9d4f6979f193a3a9",
+      "sha256": "b42bf1d9957b880e5e778e0bb995819e9e6a9fe25a993a88f786df514e7d86e7",
+      "url": "https://github.com/apple-oss-distributions/libmalloc/blob/c49dafa25f1efe8607701ae6014a663ad2ee437f/src/xzone_malloc/xzone_inline_internal.h"
+    },
+    {
+      "path": "src/xzone_malloc/README",
+      "git_blob_sha": "3bf3c3aafd153f3245ac87fcc9e126a6dcb71b94",
+      "sha256": "4467281cbe73e93a32952dedc26ac6b6a7b005ce141419c6b0d82ee917ed093f",
+      "url": "https://github.com/apple-oss-distributions/libmalloc/blob/c49dafa25f1efe8607701ae6014a663ad2ee437f/src/xzone_malloc/README"
+    }
+  ]
+}

@@ -1,0 +1,150 @@
+# Adjacent-repeat candidate paired measurements
+
+This archived candidate table retains every first-run observation and every fixed confirmation. Inconclusive results are not passes. A newer writer preflight candidate requires its own binary verification and measurements; see STATUS.md and ACCEPTANCE.md for current status.
+
+Source fingerprint: `a4368230a3d94b1a50f2b7ff3f2f4060dcbc77bf44528feac35786bf436f7be8`.
+
+Counts: {'pass': 129, 'inconclusive': 6, 'regression': 1}; complete inventory: 136 cases.
+
+Both archived executables use default scheduling. Every observation uses ten Criterion samples, 0.1 s warmup and at least 0.25 s measurement. Changes are paired median ratios; bounds are paired bootstrap 95% intervals. The pass ceiling is +5%. This is the portable corpus, not the absent historical private corpus (0/19).
+
+[Machine-readable evidence](../evidence/adjacent-repeat-pairs.json) includes all paired nanosecond observations, input hashes, executable/source hashes, host and protocol metadata. Raw Criterion files and archived executables remain in the ignored build-output directory. Different measurement protocols are never pooled.
+
+| Case | Pairs | Change | 95% interval | Verdict |
+| --- | ---: | ---: | --- | --- |
+| `font_provider/document/empty_provider_embedded` | 21 | -68.70% | -69.61% to -68.29% | pass |
+| `font_provider/document/late_registration` | 21 | -64.42% | -64.88% to -63.54% | pass |
+| `font_provider/document/registered_cold` | 21 | -65.12% | -65.33% to -64.77% | pass |
+| `font_provider/document/registered_warm` | 21 | -72.09% | -72.92% to -71.70% | pass |
+| `font_provider/registration/cold` | 21 | -3.26% | -7.18% to -0.84% | pass |
+| `font_provider/registration/duplicate` | 21 | +1.03% | -2.18% to +2.41% | pass |
+| `font_provider/registration/name_hit` | 21 | -3.46% | -6.25% to -2.01% | pass |
+| `font_provider/registration/name_miss` | 21 | +0.65% | -0.82% to +2.54% | pass |
+| `font_packs/decode/invalid_cold` | 21 | +0.23% | -0.04% to +0.77% | pass |
+| `font_packs/decode/invalid_warm` | 21 | -4.45% | -7.93% to +1.98% | pass |
+| `font_packs/decode/over_limit` | 21 | -0.36% | -0.52% to -0.13% | pass |
+| `font_packs/decode/raw_warm` | 21 | -4.69% | -4.83% to -0.14% | pass |
+| `font_packs/decode/zlib_cold` | 21 | -0.34% | -0.46% to -0.06% | pass |
+| `font_packs/decode/zlib_warm` | 21 | -1.14% | -4.08% to +1.50% | pass |
+| `font_packs/document/real_cjk_cold` | 21 | -2.61% | -3.13% to -2.26% | pass |
+| `font_packs/document/real_cjk_late` | 21 | -2.56% | -3.08% to -2.01% | pass |
+| `font_packs/document/real_cjk_render` | 21 | +0.11% | -0.18% to +0.59% | pass |
+| `font_packs/document/real_cjk_warm` | 21 | +0.49% | -0.43% to +3.25% | pass |
+| `font_packs/provider/register_lazy` | 21 | -1.08% | -4.01% to +1.04% | pass |
+| `font_packs/provider/select_cold` | 21 | -0.77% | -1.11% to -0.22% | pass |
+| `font_packs/provider/select_warm` | 21 | -4.68% | -6.17% to -3.37% | pass |
+| `font_packs/provider/unrelated_miss` | 21 | +0.06% | -2.03% to +1.79% | pass |
+| `font_coverage/resolve/cold_hit` | 21 | -7.95% | -8.57% to -6.84% | pass |
+| `font_coverage/resolve/cold_miss` | 21 | -37.91% | -39.30% to -36.26% | pass |
+| `font_coverage/resolve/late_registration` | 21 | -2.52% | -4.34% to -1.29% | pass |
+| `font_coverage/resolve/lazy_pack_cold` | 21 | -0.34% | -0.56% to -0.11% | pass |
+| `font_coverage/resolve/mixed_256` | 21 | -2.49% | -2.65% to -2.05% | pass |
+| `font_coverage/resolve/variation_warm` | 21 | -2.07% | -2.40% to -1.85% | pass |
+| `font_coverage/resolve/warm_hit` | 21 | -1.97% | -2.18% to -1.79% | pass |
+| `font_coverage/resolve/warm_miss` | 21 | -4.98% | -5.15% to -4.80% | pass |
+| `font_fallback/pipeline/document_cold` | 21 | -1.02% | -1.61% to -0.12% | pass |
+| `font_fallback/pipeline/document_warm` | 21 | +1.12% | -0.19% to +3.44% | pass |
+| `font_fallback/pipeline/export_svg` | 21 | +0.50% | -0.19% to +1.14% | pass |
+| `font_fallback/pipeline/extract` | 21 | +0.31% | -1.56% to +2.14% | pass |
+| `font_fallback/pipeline/form` | 21 | +0.80% | -0.63% to +1.31% | pass |
+| `font_fallback/pipeline/page_cache_warm` | 21 | +0.56% | -0.92% to +2.68% | pass |
+| `font_fallback/pipeline/render_cpu` | 21 | +0.27% | -0.45% to +0.50% | pass |
+| `font_fallback/pipeline/text_clip` | 21 | +2.22% | +0.17% to +3.40% | pass |
+| `font_fallback/pipeline/vertical` | 21 | -2.20% | -2.65% to +0.39% | pass |
+| `font_cmaps/decode/gbk_four_byte` | 21 | -17.17% | -17.75% to -16.13% | pass |
+| `font_cmaps/decode/hkscs` | 21 | -26.99% | -29.28% to -24.53% | pass |
+| `font_cmaps/decode/identity_collection` | 21 | -3.43% | -5.57% to +2.28% | pass |
+| `font_cmaps/decode/unicode_gb` | 21 | -27.60% | -28.93% to -25.95% | pass |
+| `font_cmaps/decode/utf16_gb` | 21 | -0.26% | -0.70% to +0.52% | pass |
+| `font_cmaps/decode/vertical_gbk` | 21 | -26.56% | -28.45% to -24.18% | pass |
+| `font_cmaps/decode/vertical_jis` | 21 | -26.15% | -28.67% to -23.48% | pass |
+| `font_cmaps/lookup/gbk_four_byte` | 21 | -38.01% | -38.59% to -36.17% | pass |
+| `font_cmaps/lookup/hkscs` | 21 | -48.96% | -50.36% to -48.10% | pass |
+| `font_cmaps/lookup/identity_collection` | 21 | -5.62% | -10.45% to -2.99% | pass |
+| `font_cmaps/lookup/unicode_gb` | 21 | -46.71% | -47.34% to -45.53% | pass |
+| `font_cmaps/lookup/utf16_gb` | 21 | -10.67% | -11.71% to -7.61% | pass |
+| `font_cmaps/lookup/vertical_gbk` | 21 | -50.35% | -51.11% to -48.89% | pass |
+| `font_cmaps/lookup/vertical_jis` | 21 | -45.53% | -47.15% to -43.98% | pass |
+| `font_cmaps/pipeline/gbk_four_byte/embedded` | 21 | -5.12% | -9.68% to -1.10% | pass |
+| `font_cmaps/pipeline/gbk_four_byte/substitute` | 21 | -4.30% | -6.97% to +2.91% | pass |
+| `font_cmaps/pipeline/hkscs/embedded` | 21 | +1.06% | -5.22% to +4.34% | pass |
+| `font_cmaps/pipeline/hkscs/substitute` | 21 | -3.04% | -9.53% to -0.18% | pass |
+| `font_cmaps/pipeline/identity_collection/embedded` | 21 | -1.50% | -4.43% to +0.81% | pass |
+| `font_cmaps/pipeline/identity_collection/substitute` | 21 | -74.03% | -75.17% to -73.38% | pass |
+| `font_cmaps/pipeline/unicode_gb/embedded` | 21 | -2.18% | -3.24% to +1.93% | pass |
+| `font_cmaps/pipeline/unicode_gb/substitute` | 21 | -4.74% | -8.79% to -3.71% | pass |
+| `font_cmaps/pipeline/utf16_gb/embedded` | 21 | -1.93% | -10.55% to +2.22% | pass |
+| `font_cmaps/pipeline/utf16_gb/substitute` | 21 | -4.09% | -7.59% to -0.19% | pass |
+| `font_cmaps/pipeline/vertical_gbk/embedded` | 21 | -2.19% | -5.21% to -0.15% | pass |
+| `font_cmaps/pipeline/vertical_gbk/substitute` | 21 | -4.76% | -7.33% to -2.34% | pass |
+| `font_cmaps/pipeline/vertical_jis/embedded` | 63 | -0.13% | -2.82% to +2.00% | pass |
+| `font_cmaps/pipeline/vertical_jis/substitute` | 21 | -3.62% | -11.67% to +3.06% | pass |
+| `font_cmaps/writer/cff_nonidentity` | 21 | +1.54% | +0.76% to +2.14% | pass |
+| `font_cmaps/writer/predefined_h` | 21 | +0.33% | +0.19% to +1.17% | pass |
+| `font_cmaps/writer/predefined_v` | 21 | +1.00% | +0.38% to +1.48% | pass |
+| `fonts/load/cff_pdf` | 21 | -0.17% | -0.70% to +0.82% | pass |
+| `fonts/load/document_cold_12_pages` | 21 | -4.51% | -4.84% to -3.15% | pass |
+| `fonts/load/document_warm_12_pages` | 21 | -5.94% | -6.96% to -2.96% | pass |
+| `fonts/load/truetype` | 63 | +5.69% | +0.92% to +13.76% | inconclusive |
+| `fonts/load/variable` | 21 | +1.23% | -1.74% to +1.94% | pass |
+| `fonts/map/90ms-RKSJ-H` | 21 | -11.14% | -13.88% to -8.48% | pass |
+| `fonts/map/B5pc-H` | 21 | -7.56% | -7.67% to -7.39% | pass |
+| `fonts/map/EUC-H` | 21 | -2.47% | -4.24% to -0.07% | pass |
+| `fonts/map/GBK-EUC-H` | 21 | -9.17% | -11.79% to -8.75% | pass |
+| `fonts/map/GBpc-EUC-H` | 21 | -0.16% | -2.01% to +0.08% | pass |
+| `fonts/map/KSC-EUC-H` | 21 | -14.01% | -15.26% to -12.05% | pass |
+| `fonts/map/cjk_256` | 21 | -80.69% | -80.94% to -80.63% | pass |
+| `fonts/map/latin_256` | 21 | -81.58% | -81.71% to -81.45% | pass |
+| `fonts/map/missing_256` | 21 | -81.66% | -81.75% to -81.62% | pass |
+| `fonts/map/supplementary_256` | 21 | -81.66% | -81.88% to -81.59% | pass |
+| `fonts/outline/cff_256` | 21 | +0.54% | -0.36% to +0.98% | pass |
+| `fonts/outline/repeated_256` | 21 | -0.04% | -0.90% to +1.71% | pass |
+| `fonts/outline/unique_256` | 21 | -0.32% | -1.02% to +1.50% | pass |
+| `fonts/outline/variable_256` | 21 | -0.23% | -0.97% to +0.82% | pass |
+| `fonts/pipeline/extract/cjk_unique` | 63 | +4.34% | +3.83% to +5.13% | inconclusive |
+| `fonts/pipeline/extract/latin_repeated` | 21 | -63.80% | -64.14% to -63.10% | pass |
+| `fonts/pipeline/extract/mixed_supplementary` | 21 | +3.34% | +2.04% to +4.72% | pass |
+| `fonts/pipeline/render/cjk_unique@150` | 21 | +0.59% | +0.02% to +2.13% | pass |
+| `fonts/pipeline/render/cjk_unique@300` | 21 | +0.03% | -0.51% to +0.70% | pass |
+| `fonts/pipeline/render/cjk_unique@96` | 21 | +0.48% | -0.18% to +1.43% | pass |
+| `fonts/pipeline/render/latin_repeated@150` | 21 | +0.85% | +0.45% to +1.13% | pass |
+| `fonts/pipeline/render/latin_repeated@300` | 21 | +0.06% | -0.10% to +0.31% | pass |
+| `fonts/pipeline/render/latin_repeated@96` | 21 | +0.76% | +0.37% to +1.20% | pass |
+| `fonts/pipeline/render/mixed_supplementary@150` | 21 | +0.43% | +0.23% to +0.65% | pass |
+| `fonts/pipeline/render/mixed_supplementary@300` | 21 | +0.32% | -0.08% to +0.79% | pass |
+| `fonts/pipeline/render/mixed_supplementary@96` | 21 | +0.04% | -0.49% to +0.83% | pass |
+| `fonts/pipeline/render_cff/150` | 21 | +0.22% | -0.27% to +0.86% | pass |
+| `fonts/pipeline/render_cff/300` | 21 | -0.12% | -0.55% to +0.38% | pass |
+| `fonts/pipeline/render_cff/96` | 21 | +0.36% | -0.27% to +1.42% | pass |
+| `fonts/pipeline/total/cjk_unique@150` | 21 | -0.68% | -0.79% to +0.01% | pass |
+| `fonts/pipeline/total/cjk_unique@300` | 21 | +0.01% | -1.11% to +0.38% | pass |
+| `fonts/pipeline/total/cjk_unique@96` | 21 | -0.44% | -1.17% to +0.26% | pass |
+| `fonts/pipeline/total/latin_repeated@150` | 21 | -7.30% | -7.97% to -6.88% | pass |
+| `fonts/pipeline/total/latin_repeated@300` | 21 | -3.83% | -4.26% to -3.27% | pass |
+| `fonts/pipeline/total/latin_repeated@96` | 21 | -8.25% | -8.64% to -7.53% | pass |
+| `fonts/pipeline/total/mixed_supplementary@150` | 21 | +1.19% | -0.06% to +1.27% | pass |
+| `fonts/pipeline/total/mixed_supplementary@300` | 21 | -0.17% | -0.91% to +1.34% | pass |
+| `fonts/pipeline/total/mixed_supplementary@96` | 21 | +0.95% | +0.30% to +1.23% | pass |
+| `fonts/pipeline/writer/cjk_unique` | 21 | +2.70% | +2.28% to +2.88% | pass |
+| `fonts/pipeline/writer/latin_repeated` | 21 | +2.53% | +2.08% to +2.71% | pass |
+| `fonts/pipeline/writer/mixed_supplementary` | 21 | +2.98% | +2.18% to +3.25% | pass |
+| `font_gpu/render_readback/cjk_unique` | 21 | -0.62% | -3.04% to +2.12% | pass |
+| `font_gpu/render_readback/latin_repeated` | 21 | -10.16% | -12.80% to -8.36% | pass |
+| `font_gpu/render_readback/mirrored` | 21 | -0.86% | -4.43% to +0.89% | pass |
+| `font_gpu/render_readback/mixed_supplementary` | 21 | -7.55% | -10.47% to -6.41% | pass |
+| `font_gpu/render_readback/sheared` | 21 | -0.73% | -2.85% to +3.37% | pass |
+| `font_gpu/render_readback/vertical_mixed` | 21 | +0.51% | -3.17% to +4.89% | pass |
+| `font_writer_fallback/mixed_64` | 21 | +2.76% | +2.51% to +3.18% | pass |
+| `font_writer_fallback/repeated_miss` | 63 | +6.05% | +4.83% to +7.73% | inconclusive |
+| `font_writer_fallback/single_face_64` | 21 | +2.48% | +2.18% to +3.10% | pass |
+| `font_diagnostics/construct_owned` | 63 | -0.03% | -2.86% to +12.81% | inconclusive |
+| `font_diagnostics/copy_aligned` | 63 | +1.91% | -1.34% to +17.79% | inconclusive |
+| `font_diagnostics/copy_heap` | 63 | +28.64% | +7.38% to +45.78% | regression |
+| `font_diagnostics/copy_static` | 21 | +0.13% | -12.85% to +1.40% | pass |
+| `font_diagnostics/copy_unaligned` | 63 | +0.39% | -6.10% to +5.80% | inconclusive |
+| `font_diagnostics/drop_loaded` | 21 | -14.64% | -17.73% to -0.16% | pass |
+| `font_diagnostics/empty_widths` | 21 | +0.02% | -0.01% to +0.11% | pass |
+| `font_diagnostics/parse_metrics` | 21 | +0.05% | -0.26% to +3.31% | pass |
+| `font_diagnostics/type1_construct` | 21 | +0.06% | -1.58% to +0.94% | pass |
+| `font_diagnostics/unicode_variable/configured_256` | 21 | +2.29% | +1.56% to +2.50% | pass |
+| `font_diagnostics/unicode_variable/default_256` | 21 | +2.61% | +1.23% to +3.19% | pass |

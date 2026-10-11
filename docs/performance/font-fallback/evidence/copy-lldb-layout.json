@@ -1,0 +1,199 @@
+{
+  "scope": "Address inspection after warmup; debugger timings are not acceptance evidence",
+  "aslr_disabled": false,
+  "case": "font_diagnostics/copy_heap",
+  "records": [
+    {
+      "run": 0,
+      "side": 0,
+      "registers": {
+        "x0": 47291097088,
+        "x1": 47291072512,
+        "x2": 21088,
+        "sp": 6130922480,
+        "pc": 4336086108
+      },
+      "destination_minus_source": 24576,
+      "source_mod_64k": 32768,
+      "destination_mod_64k": 57344,
+      "stack_mod_16k": 13296,
+      "log": "target/font-copy-lldb-layout/0-0.log"
+    },
+    {
+      "run": 0,
+      "side": 1,
+      "registers": {
+        "x0": 34108391424,
+        "x1": 34108260352,
+        "x2": 21088,
+        "sp": 6132741104,
+        "pc": 4334267484
+      },
+      "destination_minus_source": 131072,
+      "source_mod_64k": 49152,
+      "destination_mod_64k": 49152,
+      "stack_mod_16k": 13296,
+      "log": "target/font-copy-lldb-layout/0-1.log"
+    },
+    {
+      "run": 1,
+      "side": 1,
+      "registers": {
+        "x0": 50650710016,
+        "x1": 50650578944,
+        "x2": 21088,
+        "sp": 6159119344,
+        "pc": 4307889244
+      },
+      "destination_minus_source": 131072,
+      "source_mod_64k": 32768,
+      "destination_mod_64k": 32768,
+      "stack_mod_16k": 13296,
+      "log": "target/font-copy-lldb-layout/1-1.log"
+    },
+    {
+      "run": 1,
+      "side": 0,
+      "registers": {
+        "x0": 47962185728,
+        "x1": 47962161152,
+        "x2": 21088,
+        "sp": 6133101552,
+        "pc": 4333907036
+      },
+      "destination_minus_source": 24576,
+      "source_mod_64k": 32768,
+      "destination_mod_64k": 57344,
+      "stack_mod_16k": 13296,
+      "log": "target/font-copy-lldb-layout/1-0.log"
+    },
+    {
+      "run": 2,
+      "side": 0,
+      "registers": {
+        "x0": 34712535040,
+        "x1": 34708013056,
+        "x2": 21088,
+        "sp": 6094992368,
+        "pc": 4372016220
+      },
+      "destination_minus_source": 4521984,
+      "source_mod_64k": 16384,
+      "destination_mod_64k": 16384,
+      "stack_mod_16k": 13296,
+      "log": "target/font-copy-lldb-layout/2-0.log"
+    },
+    {
+      "run": 2,
+      "side": 1,
+      "registers": {
+        "x0": 32829243392,
+        "x1": 32833208320,
+        "x2": 21088,
+        "sp": 6088750064,
+        "pc": 4378258524
+      },
+      "destination_minus_source": -3964928,
+      "source_mod_64k": 0,
+      "destination_mod_64k": 32768,
+      "stack_mod_16k": 13296,
+      "log": "target/font-copy-lldb-layout/2-1.log"
+    },
+    {
+      "run": 3,
+      "side": 1,
+      "registers": {
+        "x0": 50915246080,
+        "x1": 50918883328,
+        "x2": 21088,
+        "sp": 6170948592,
+        "pc": 4296059996
+      },
+      "destination_minus_source": -3637248,
+      "source_mod_64k": 32768,
+      "destination_mod_64k": 0,
+      "stack_mod_16k": 13296,
+      "log": "target/font-copy-lldb-layout/3-1.log"
+    },
+    {
+      "run": 3,
+      "side": 0,
+      "registers": {
+        "x0": 44069871616,
+        "x1": 44069847040,
+        "x2": 21088,
+        "sp": 6157235184,
+        "pc": 4309773404
+      },
+      "destination_minus_source": 24576,
+      "source_mod_64k": 32768,
+      "destination_mod_64k": 57344,
+      "stack_mod_16k": 13296,
+      "log": "target/font-copy-lldb-layout/3-0.log"
+    },
+    {
+      "run": 4,
+      "side": 0,
+      "registers": {
+        "x0": 38571302912,
+        "x1": 38571278336,
+        "x2": 21088,
+        "sp": 6090716144,
+        "pc": 4376292444
+      },
+      "destination_minus_source": 24576,
+      "source_mod_64k": 0,
+      "destination_mod_64k": 24576,
+      "stack_mod_16k": 13296,
+      "log": "target/font-copy-lldb-layout/4-0.log"
+    },
+    {
+      "run": 4,
+      "side": 1,
+      "registers": {
+        "x0": 53901590528,
+        "x1": 53905244160,
+        "x2": 21088,
+        "sp": 6095647728,
+        "pc": 4371360860
+      },
+      "destination_minus_source": -3653632,
+      "source_mod_64k": 49152,
+      "destination_mod_64k": 0,
+      "stack_mod_16k": 13296,
+      "log": "target/font-copy-lldb-layout/4-1.log"
+    },
+    {
+      "run": 5,
+      "side": 1,
+      "registers": {
+        "x0": 35383738368,
+        "x1": 35379003392,
+        "x2": 21088,
+        "sp": 6158545904,
+        "pc": 4308462684
+      },
+      "destination_minus_source": 4734976,
+      "source_mod_64k": 49152,
+      "destination_mod_64k": 0,
+      "stack_mod_16k": 13296,
+      "log": "target/font-copy-lldb-layout/5-1.log"
+    },
+    {
+      "run": 5,
+      "side": 0,
+      "registers": {
+        "x0": 54241067008,
+        "x1": 54236839936,
+        "x2": 21088,
+        "sp": 6094042096,
+        "pc": 4372966492
+      },
+      "destination_minus_source": 4227072,
+      "source_mod_64k": 32768,
+      "destination_mod_64k": 0,
+      "stack_mod_16k": 13296,
+      "log": "target/font-copy-lldb-layout/5-0.log"
+    }
+  ]
+}

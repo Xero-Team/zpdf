@@ -1,0 +1,1001 @@
+{
+  "scope": "Debugger-only allocator model validation; not acceptance timings",
+  "binaries": [
+    {
+      "path": "target/font-benchmark-runs/run-zcaqwew_/executable/font_diagnostics",
+      "sha256": "1494bdcb5c046a77c1a12537c90a7f9fe0180382b8af80bc5388675ecda81f2d",
+      "codesign": "Executable=<workspace>/target/font-benchmark-runs/run-zcaqwew_/executable/font_diagnostics\nIdentifier=font_diagnostics-1586c4b2a096f46f\nFormat=Mach-O thin (arm64)\nCodeDirectory v=20400 size=47688 flags=0x20002(adhoc,linker-signed) hashes=1486+0 location=embedded\nVersionPlatform=1\nVersionMin=720896\nVersionSDK=1705216\nHash type=sha256 size=32\nCandidateCDHash sha256=a1797ba345df43ebf89008b77d268a09bade6051\nCandidateCDHashFull sha256=a1797ba345df43ebf89008b77d268a09bade60510ad7fb85bca5aeac5fbc6211\nHash choices=sha256\nCMSDigest=a1797ba345df43ebf89008b77d268a09bade60510ad7fb85bca5aeac5fbc6211\nCMSDigestType=2\nExecutable Segment base=0\nExecutable Segment limit=5095424\nExecutable Segment flags=0x1\nPage size=4096\nCDHash=a1797ba345df43ebf89008b77d268a09bade6051\nSignature=adhoc\nInfo.plist=not bound\nTeamIdentifier=not set\nSealed Resources=none\nInternal requirements=none\n"
+    },
+    {
+      "path": "target/font-benchmark-runs/run-qwqd2mh0/executable/font_diagnostics",
+      "sha256": "9811213d8b861a759fe75dcc886c2106dda6e5791589973ef02071fbe5f37450",
+      "codesign": "Executable=<workspace>/target/font-benchmark-runs/run-qwqd2mh0/executable/font_diagnostics\nIdentifier=font_diagnostics-1586c4b2a096f46f\nFormat=Mach-O thin (arm64)\nCodeDirectory v=20400 size=47688 flags=0x20002(adhoc,linker-signed) hashes=1486+0 location=embedded\nVersionPlatform=1\nVersionMin=720896\nVersionSDK=1705216\nHash type=sha256 size=32\nCandidateCDHash sha256=81a89f9f24a222c8a70c70dec3c4b5428f51e701\nCandidateCDHashFull sha256=81a89f9f24a222c8a70c70dec3c4b5428f51e701f45795b3f025545899464513\nHash choices=sha256\nCMSDigest=81a89f9f24a222c8a70c70dec3c4b5428f51e701f45795b3f025545899464513\nCMSDigestType=2\nExecutable Segment base=0\nExecutable Segment limit=5095424\nExecutable Segment flags=0x1\nPage size=4096\nCDHash=81a89f9f24a222c8a70c70dec3c4b5428f51e701\nSignature=adhoc\nInfo.plist=not bound\nTeamIdentifier=not set\nSealed Resources=none\nInternal requirements=none\n"
+    }
+  ],
+  "records": [
+    {
+      "scope": "Debugger-only allocation inspection; no acceptance timing",
+      "aslr_disabled": false,
+      "allocations": {
+        "source": {
+          "request_bytes": 21088,
+          "type_descriptor": 1093817657,
+          "caller_pc": 4375270628,
+          "xzone_index": 226,
+          "pointer": 50042388480,
+          "entry_registers": {
+            "x0": 4384948224,
+            "x1": 21088,
+            "x2": 1093817657,
+            "x3": 0,
+            "lr": 4375270628,
+            "pc": 6626816348,
+            "sp": 6091736144
+          },
+          "bucket_registers": {
+            "x0": 4384948224,
+            "x1": 21088,
+            "x2": 226,
+            "x3": 0,
+            "lr": 4375270628,
+            "pc": 6626818384,
+            "sp": 6091736144
+          },
+          "classification": {
+            "bin_index": 37,
+            "bin_bucket_count": 6,
+            "bin_offset": 223,
+            "keys_sha256": "aec48e811c641e503374d3c422c750dc86d68df5b5b8106ecb021331dd144d79",
+            "predicted_xzone_index": 226,
+            "destination_bucket_step_mod4_without_carry": 3,
+            "destination_bucket_step_mod4_with_carry": 0,
+            "carry_fraction_under_uniform_low32": 0.3656911961734295
+          }
+        },
+        "destination": {
+          "request_bytes": 21088,
+          "type_descriptor": 1093819155,
+          "caller_pc": 4375276620,
+          "xzone_index": 226,
+          "pointer": 50042413056,
+          "entry_registers": {
+            "x0": 4384948224,
+            "x1": 21088,
+            "x2": 1093819155,
+            "x3": 0,
+            "lr": 4375276620,
+            "pc": 6626816348,
+            "sp": 6091731936
+          },
+          "bucket_registers": {
+            "x0": 4384948224,
+            "x1": 21088,
+            "x2": 226,
+            "x3": 0,
+            "lr": 4375276620,
+            "pc": 6626818384,
+            "sp": 6091731936
+          },
+          "classification": {
+            "bin_index": 37,
+            "bin_bucket_count": 6,
+            "bin_offset": 223,
+            "keys_sha256": "aec48e811c641e503374d3c422c750dc86d68df5b5b8106ecb021331dd144d79",
+            "predicted_xzone_index": 226,
+            "destination_bucket_step_mod4_without_carry": 3,
+            "destination_bucket_step_mod4_with_carry": 0,
+            "carry_fraction_under_uniform_low32": 0.3656911961734295
+          }
+        }
+      },
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "same_xzone": true,
+      "destination_minus_source": 24576,
+      "run": 0,
+      "side": 0,
+      "log": "target/font-copy-allocator-model/0-0.log"
+    },
+    {
+      "scope": "Debugger-only allocation inspection; no acceptance timing",
+      "aslr_disabled": false,
+      "allocations": {
+        "source": {
+          "request_bytes": 21088,
+          "type_descriptor": 1094509881,
+          "caller_pc": 4378039524,
+          "xzone_index": 226,
+          "pointer": 42161324032,
+          "entry_registers": {
+            "x0": 4393041920,
+            "x1": 21088,
+            "x2": 1094509881,
+            "x3": 0,
+            "lr": 4378039524,
+            "pc": 6626816348,
+            "sp": 6088967248
+          },
+          "bucket_registers": {
+            "x0": 4393041920,
+            "x1": 21088,
+            "x2": 226,
+            "x3": 0,
+            "lr": 4378039524,
+            "pc": 6626818384,
+            "sp": 6088967248
+          },
+          "classification": {
+            "bin_index": 37,
+            "bin_bucket_count": 6,
+            "bin_offset": 223,
+            "keys_sha256": "70e6282c6e0a0a891590f47cec97a7066f5b1ccddf3054f5c4b4d61821e67731",
+            "predicted_xzone_index": 226,
+            "destination_bucket_step_mod4_without_carry": 2,
+            "destination_bucket_step_mod4_with_carry": 3,
+            "carry_fraction_under_uniform_low32": 0.6686594877392054
+          }
+        },
+        "destination": {
+          "request_bytes": 21088,
+          "type_descriptor": 1094511379,
+          "caller_pc": 4378045516,
+          "xzone_index": 228,
+          "pointer": 42157391872,
+          "entry_registers": {
+            "x0": 4393041920,
+            "x1": 21088,
+            "x2": 1094511379,
+            "x3": 0,
+            "lr": 4378045516,
+            "pc": 6626816348,
+            "sp": 6088963040
+          },
+          "bucket_registers": {
+            "x0": 4393041920,
+            "x1": 21088,
+            "x2": 228,
+            "x3": 0,
+            "lr": 4378045516,
+            "pc": 6626818384,
+            "sp": 6088963040
+          },
+          "classification": {
+            "bin_index": 37,
+            "bin_bucket_count": 6,
+            "bin_offset": 223,
+            "keys_sha256": "70e6282c6e0a0a891590f47cec97a7066f5b1ccddf3054f5c4b4d61821e67731",
+            "predicted_xzone_index": 228,
+            "destination_bucket_step_mod4_without_carry": 2,
+            "destination_bucket_step_mod4_with_carry": 3,
+            "carry_fraction_under_uniform_low32": 0.6686594877392054
+          }
+        }
+      },
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "same_xzone": false,
+      "destination_minus_source": -3932160,
+      "run": 0,
+      "side": 1,
+      "log": "target/font-copy-allocator-model/0-1.log"
+    },
+    {
+      "scope": "Debugger-only allocation inspection; no acceptance timing",
+      "aslr_disabled": false,
+      "allocations": {
+        "source": {
+          "request_bytes": 21088,
+          "type_descriptor": 1085343033,
+          "caller_pc": 4341372132,
+          "xzone_index": 227,
+          "pointer": 43302158336,
+          "entry_registers": {
+            "x0": 4350197760,
+            "x1": 21088,
+            "x2": 1085343033,
+            "x3": 0,
+            "lr": 4341372132,
+            "pc": 6626816348,
+            "sp": 6125634640
+          },
+          "bucket_registers": {
+            "x0": 4350197760,
+            "x1": 21088,
+            "x2": 227,
+            "x3": 0,
+            "lr": 4341372132,
+            "pc": 6626818384,
+            "sp": 6125634640
+          },
+          "classification": {
+            "bin_index": 37,
+            "bin_bucket_count": 6,
+            "bin_offset": 223,
+            "keys_sha256": "70e6282c6e0a0a891590f47cec97a7066f5b1ccddf3054f5c4b4d61821e67731",
+            "predicted_xzone_index": 227,
+            "destination_bucket_step_mod4_without_carry": 2,
+            "destination_bucket_step_mod4_with_carry": 3,
+            "carry_fraction_under_uniform_low32": 0.6686594877392054
+          }
+        },
+        "destination": {
+          "request_bytes": 21088,
+          "type_descriptor": 1085344531,
+          "caller_pc": 4341378124,
+          "xzone_index": 225,
+          "pointer": 43302289408,
+          "entry_registers": {
+            "x0": 4350197760,
+            "x1": 21088,
+            "x2": 1085344531,
+            "x3": 0,
+            "lr": 4341378124,
+            "pc": 6626816348,
+            "sp": 6125630432
+          },
+          "bucket_registers": {
+            "x0": 4350197760,
+            "x1": 21088,
+            "x2": 225,
+            "x3": 0,
+            "lr": 4341378124,
+            "pc": 6626818384,
+            "sp": 6125630432
+          },
+          "classification": {
+            "bin_index": 37,
+            "bin_bucket_count": 6,
+            "bin_offset": 223,
+            "keys_sha256": "70e6282c6e0a0a891590f47cec97a7066f5b1ccddf3054f5c4b4d61821e67731",
+            "predicted_xzone_index": 225,
+            "destination_bucket_step_mod4_without_carry": 2,
+            "destination_bucket_step_mod4_with_carry": 3,
+            "carry_fraction_under_uniform_low32": 0.6686594877392054
+          }
+        }
+      },
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "same_xzone": false,
+      "destination_minus_source": 131072,
+      "run": 1,
+      "side": 1,
+      "log": "target/font-copy-allocator-model/1-1.log"
+    },
+    {
+      "scope": "Debugger-only allocation inspection; no acceptance timing",
+      "aslr_disabled": false,
+      "allocations": {
+        "source": {
+          "request_bytes": 21088,
+          "type_descriptor": 1077732665,
+          "caller_pc": 4310930660,
+          "xzone_index": 226,
+          "pointer": 51384696832,
+          "entry_registers": {
+            "x0": 4322246656,
+            "x1": 21088,
+            "x2": 1077732665,
+            "x3": 0,
+            "lr": 4310930660,
+            "pc": 6626816348,
+            "sp": 6156076112
+          },
+          "bucket_registers": {
+            "x0": 4322246656,
+            "x1": 21088,
+            "x2": 226,
+            "x3": 0,
+            "lr": 4310930660,
+            "pc": 6626818384,
+            "sp": 6156076112
+          },
+          "classification": {
+            "bin_index": 37,
+            "bin_bucket_count": 6,
+            "bin_offset": 223,
+            "keys_sha256": "aec48e811c641e503374d3c422c750dc86d68df5b5b8106ecb021331dd144d79",
+            "predicted_xzone_index": 226,
+            "destination_bucket_step_mod4_without_carry": 3,
+            "destination_bucket_step_mod4_with_carry": 0,
+            "carry_fraction_under_uniform_low32": 0.3656911961734295
+          }
+        },
+        "destination": {
+          "request_bytes": 21088,
+          "type_descriptor": 1077734163,
+          "caller_pc": 4310936652,
+          "xzone_index": 225,
+          "pointer": 51389104128,
+          "entry_registers": {
+            "x0": 4322246656,
+            "x1": 21088,
+            "x2": 1077734163,
+            "x3": 0,
+            "lr": 4310936652,
+            "pc": 6626816348,
+            "sp": 6156071904
+          },
+          "bucket_registers": {
+            "x0": 4322246656,
+            "x1": 21088,
+            "x2": 225,
+            "x3": 0,
+            "lr": 4310936652,
+            "pc": 6626818384,
+            "sp": 6156071904
+          },
+          "classification": {
+            "bin_index": 37,
+            "bin_bucket_count": 6,
+            "bin_offset": 223,
+            "keys_sha256": "aec48e811c641e503374d3c422c750dc86d68df5b5b8106ecb021331dd144d79",
+            "predicted_xzone_index": 225,
+            "destination_bucket_step_mod4_without_carry": 3,
+            "destination_bucket_step_mod4_with_carry": 0,
+            "carry_fraction_under_uniform_low32": 0.3656911961734295
+          }
+        }
+      },
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "same_xzone": false,
+      "destination_minus_source": 4407296,
+      "run": 1,
+      "side": 0,
+      "log": "target/font-copy-allocator-model/1-0.log"
+    },
+    {
+      "scope": "Debugger-only allocation inspection; no acceptance timing",
+      "aslr_disabled": false,
+      "allocations": {
+        "source": {
+          "request_bytes": 21088,
+          "type_descriptor": 1077802297,
+          "caller_pc": 4311209188,
+          "xzone_index": 226,
+          "pointer": 36721410048,
+          "entry_registers": {
+            "x0": 4321329152,
+            "x1": 21088,
+            "x2": 1077802297,
+            "x3": 0,
+            "lr": 4311209188,
+            "pc": 6626816348,
+            "sp": 6155797584
+          },
+          "bucket_registers": {
+            "x0": 4321329152,
+            "x1": 21088,
+            "x2": 226,
+            "x3": 0,
+            "lr": 4311209188,
+            "pc": 6626818384,
+            "sp": 6155797584
+          },
+          "classification": {
+            "bin_index": 37,
+            "bin_bucket_count": 6,
+            "bin_offset": 223,
+            "keys_sha256": "aec48e811c641e503374d3c422c750dc86d68df5b5b8106ecb021331dd144d79",
+            "predicted_xzone_index": 226,
+            "destination_bucket_step_mod4_without_carry": 3,
+            "destination_bucket_step_mod4_with_carry": 0,
+            "carry_fraction_under_uniform_low32": 0.3656911961734295
+          }
+        },
+        "destination": {
+          "request_bytes": 21088,
+          "type_descriptor": 1077803795,
+          "caller_pc": 4311215180,
+          "xzone_index": 225,
+          "pointer": 36725817344,
+          "entry_registers": {
+            "x0": 4321329152,
+            "x1": 21088,
+            "x2": 1077803795,
+            "x3": 0,
+            "lr": 4311215180,
+            "pc": 6626816348,
+            "sp": 6155793376
+          },
+          "bucket_registers": {
+            "x0": 4321329152,
+            "x1": 21088,
+            "x2": 225,
+            "x3": 0,
+            "lr": 4311215180,
+            "pc": 6626818384,
+            "sp": 6155793376
+          },
+          "classification": {
+            "bin_index": 37,
+            "bin_bucket_count": 6,
+            "bin_offset": 223,
+            "keys_sha256": "aec48e811c641e503374d3c422c750dc86d68df5b5b8106ecb021331dd144d79",
+            "predicted_xzone_index": 225,
+            "destination_bucket_step_mod4_without_carry": 3,
+            "destination_bucket_step_mod4_with_carry": 0,
+            "carry_fraction_under_uniform_low32": 0.3656911961734295
+          }
+        }
+      },
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "same_xzone": false,
+      "destination_minus_source": 4407296,
+      "run": 2,
+      "side": 0,
+      "log": "target/font-copy-allocator-model/2-0.log"
+    },
+    {
+      "scope": "Debugger-only allocation inspection; no acceptance timing",
+      "aslr_disabled": false,
+      "allocations": {
+        "source": {
+          "request_bytes": 21088,
+          "type_descriptor": 1074713913,
+          "caller_pc": 4298855652,
+          "xzone_index": 227,
+          "pointer": 43302420480,
+          "entry_registers": {
+            "x0": 4309680128,
+            "x1": 21088,
+            "x2": 1074713913,
+            "x3": 0,
+            "lr": 4298855652,
+            "pc": 6626816348,
+            "sp": 6168151120
+          },
+          "bucket_registers": {
+            "x0": 4309680128,
+            "x1": 21088,
+            "x2": 227,
+            "x3": 0,
+            "lr": 4298855652,
+            "pc": 6626818384,
+            "sp": 6168151120
+          },
+          "classification": {
+            "bin_index": 37,
+            "bin_bucket_count": 6,
+            "bin_offset": 223,
+            "keys_sha256": "70e6282c6e0a0a891590f47cec97a7066f5b1ccddf3054f5c4b4d61821e67731",
+            "predicted_xzone_index": 227,
+            "destination_bucket_step_mod4_without_carry": 2,
+            "destination_bucket_step_mod4_with_carry": 3,
+            "carry_fraction_under_uniform_low32": 0.6686594877392054
+          }
+        },
+        "destination": {
+          "request_bytes": 21088,
+          "type_descriptor": 1074715411,
+          "caller_pc": 4298861644,
+          "xzone_index": 226,
+          "pointer": 43302551552,
+          "entry_registers": {
+            "x0": 4309680128,
+            "x1": 21088,
+            "x2": 1074715411,
+            "x3": 0,
+            "lr": 4298861644,
+            "pc": 6626816348,
+            "sp": 6168146912
+          },
+          "bucket_registers": {
+            "x0": 4309680128,
+            "x1": 21088,
+            "x2": 226,
+            "x3": 0,
+            "lr": 4298861644,
+            "pc": 6626818384,
+            "sp": 6168146912
+          },
+          "classification": {
+            "bin_index": 37,
+            "bin_bucket_count": 6,
+            "bin_offset": 223,
+            "keys_sha256": "70e6282c6e0a0a891590f47cec97a7066f5b1ccddf3054f5c4b4d61821e67731",
+            "predicted_xzone_index": 226,
+            "destination_bucket_step_mod4_without_carry": 2,
+            "destination_bucket_step_mod4_with_carry": 3,
+            "carry_fraction_under_uniform_low32": 0.6686594877392054
+          }
+        }
+      },
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "same_xzone": false,
+      "destination_minus_source": 131072,
+      "run": 2,
+      "side": 1,
+      "log": "target/font-copy-allocator-model/2-1.log"
+    },
+    {
+      "scope": "Debugger-only allocation inspection; no acceptance timing",
+      "aslr_disabled": false,
+      "allocations": {
+        "source": {
+          "request_bytes": 21088,
+          "type_descriptor": 1082983737,
+          "caller_pc": 4331934948,
+          "xzone_index": 227,
+          "pointer": 32061685760,
+          "entry_registers": {
+            "x0": 4344217600,
+            "x1": 21088,
+            "x2": 1082983737,
+            "x3": 0,
+            "lr": 4331934948,
+            "pc": 6626816348,
+            "sp": 6135071824
+          },
+          "bucket_registers": {
+            "x0": 4344217600,
+            "x1": 21088,
+            "x2": 227,
+            "x3": 0,
+            "lr": 4331934948,
+            "pc": 6626818384,
+            "sp": 6135071824
+          },
+          "classification": {
+            "bin_index": 37,
+            "bin_bucket_count": 6,
+            "bin_offset": 223,
+            "keys_sha256": "70e6282c6e0a0a891590f47cec97a7066f5b1ccddf3054f5c4b4d61821e67731",
+            "predicted_xzone_index": 227,
+            "destination_bucket_step_mod4_without_carry": 2,
+            "destination_bucket_step_mod4_with_carry": 3,
+            "carry_fraction_under_uniform_low32": 0.6686594877392054
+          }
+        },
+        "destination": {
+          "request_bytes": 21088,
+          "type_descriptor": 1082985235,
+          "caller_pc": 4331940940,
+          "xzone_index": 226,
+          "pointer": 32061816832,
+          "entry_registers": {
+            "x0": 4344217600,
+            "x1": 21088,
+            "x2": 1082985235,
+            "x3": 0,
+            "lr": 4331940940,
+            "pc": 6626816348,
+            "sp": 6135067616
+          },
+          "bucket_registers": {
+            "x0": 4344217600,
+            "x1": 21088,
+            "x2": 226,
+            "x3": 0,
+            "lr": 4331940940,
+            "pc": 6626818384,
+            "sp": 6135067616
+          },
+          "classification": {
+            "bin_index": 37,
+            "bin_bucket_count": 6,
+            "bin_offset": 223,
+            "keys_sha256": "70e6282c6e0a0a891590f47cec97a7066f5b1ccddf3054f5c4b4d61821e67731",
+            "predicted_xzone_index": 226,
+            "destination_bucket_step_mod4_without_carry": 2,
+            "destination_bucket_step_mod4_with_carry": 3,
+            "carry_fraction_under_uniform_low32": 0.6686594877392054
+          }
+        }
+      },
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "same_xzone": false,
+      "destination_minus_source": 131072,
+      "run": 3,
+      "side": 1,
+      "log": "target/font-copy-allocator-model/3-1.log"
+    },
+    {
+      "scope": "Debugger-only allocation inspection; no acceptance timing",
+      "aslr_disabled": false,
+      "allocations": {
+        "source": {
+          "request_bytes": 21088,
+          "type_descriptor": 1074599225,
+          "caller_pc": 4298396900,
+          "xzone_index": 225,
+          "pointer": 51758055424,
+          "entry_registers": {
+            "x0": 4306321408,
+            "x1": 21088,
+            "x2": 1074599225,
+            "x3": 0,
+            "lr": 4298396900,
+            "pc": 6626816348,
+            "sp": 6168609872
+          },
+          "bucket_registers": {
+            "x0": 4306321408,
+            "x1": 21088,
+            "x2": 225,
+            "x3": 0,
+            "lr": 4298396900,
+            "pc": 6626818384,
+            "sp": 6168609872
+          },
+          "classification": {
+            "bin_index": 37,
+            "bin_bucket_count": 6,
+            "bin_offset": 223,
+            "keys_sha256": "aec48e811c641e503374d3c422c750dc86d68df5b5b8106ecb021331dd144d79",
+            "predicted_xzone_index": 225,
+            "destination_bucket_step_mod4_without_carry": 3,
+            "destination_bucket_step_mod4_with_carry": 0,
+            "carry_fraction_under_uniform_low32": 0.3656911961734295
+          }
+        },
+        "destination": {
+          "request_bytes": 21088,
+          "type_descriptor": 1074600723,
+          "caller_pc": 4298402892,
+          "xzone_index": 228,
+          "pointer": 51753811968,
+          "entry_registers": {
+            "x0": 4306321408,
+            "x1": 21088,
+            "x2": 1074600723,
+            "x3": 0,
+            "lr": 4298402892,
+            "pc": 6626816348,
+            "sp": 6168605664
+          },
+          "bucket_registers": {
+            "x0": 4306321408,
+            "x1": 21088,
+            "x2": 228,
+            "x3": 0,
+            "lr": 4298402892,
+            "pc": 6626818384,
+            "sp": 6168605664
+          },
+          "classification": {
+            "bin_index": 37,
+            "bin_bucket_count": 6,
+            "bin_offset": 223,
+            "keys_sha256": "aec48e811c641e503374d3c422c750dc86d68df5b5b8106ecb021331dd144d79",
+            "predicted_xzone_index": 228,
+            "destination_bucket_step_mod4_without_carry": 3,
+            "destination_bucket_step_mod4_with_carry": 0,
+            "carry_fraction_under_uniform_low32": 0.3656911961734295
+          }
+        }
+      },
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "same_xzone": false,
+      "destination_minus_source": -4243456,
+      "run": 3,
+      "side": 0,
+      "log": "target/font-copy-allocator-model/3-0.log"
+    },
+    {
+      "scope": "Debugger-only allocation inspection; no acceptance timing",
+      "aslr_disabled": false,
+      "allocations": {
+        "source": {
+          "request_bytes": 21088,
+          "type_descriptor": 1083233593,
+          "caller_pc": 4332934372,
+          "xzone_index": 226,
+          "pointer": 40445952000,
+          "entry_registers": {
+            "x0": 4342906880,
+            "x1": 21088,
+            "x2": 1083233593,
+            "x3": 0,
+            "lr": 4332934372,
+            "pc": 6626816348,
+            "sp": 6134072400
+          },
+          "bucket_registers": {
+            "x0": 4342906880,
+            "x1": 21088,
+            "x2": 226,
+            "x3": 0,
+            "lr": 4332934372,
+            "pc": 6626818384,
+            "sp": 6134072400
+          },
+          "classification": {
+            "bin_index": 37,
+            "bin_bucket_count": 6,
+            "bin_offset": 223,
+            "keys_sha256": "aec48e811c641e503374d3c422c750dc86d68df5b5b8106ecb021331dd144d79",
+            "predicted_xzone_index": 226,
+            "destination_bucket_step_mod4_without_carry": 3,
+            "destination_bucket_step_mod4_with_carry": 0,
+            "carry_fraction_under_uniform_low32": 0.3656911961734295
+          }
+        },
+        "destination": {
+          "request_bytes": 21088,
+          "type_descriptor": 1083235091,
+          "caller_pc": 4332940364,
+          "xzone_index": 225,
+          "pointer": 40450342912,
+          "entry_registers": {
+            "x0": 4342906880,
+            "x1": 21088,
+            "x2": 1083235091,
+            "x3": 0,
+            "lr": 4332940364,
+            "pc": 6626816348,
+            "sp": 6134068192
+          },
+          "bucket_registers": {
+            "x0": 4342906880,
+            "x1": 21088,
+            "x2": 225,
+            "x3": 0,
+            "lr": 4332940364,
+            "pc": 6626818384,
+            "sp": 6134068192
+          },
+          "classification": {
+            "bin_index": 37,
+            "bin_bucket_count": 6,
+            "bin_offset": 223,
+            "keys_sha256": "aec48e811c641e503374d3c422c750dc86d68df5b5b8106ecb021331dd144d79",
+            "predicted_xzone_index": 225,
+            "destination_bucket_step_mod4_without_carry": 3,
+            "destination_bucket_step_mod4_with_carry": 0,
+            "carry_fraction_under_uniform_low32": 0.3656911961734295
+          }
+        }
+      },
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "same_xzone": false,
+      "destination_minus_source": 4390912,
+      "run": 4,
+      "side": 0,
+      "log": "target/font-copy-allocator-model/4-0.log"
+    },
+    {
+      "scope": "Debugger-only allocation inspection; no acceptance timing",
+      "aslr_disabled": false,
+      "allocations": {
+        "source": {
+          "request_bytes": 21088,
+          "type_descriptor": 1082713401,
+          "caller_pc": 4330853604,
+          "xzone_index": 228,
+          "pointer": 48599449600,
+          "entry_registers": {
+            "x0": 4343218176,
+            "x1": 21088,
+            "x2": 1082713401,
+            "x3": 0,
+            "lr": 4330853604,
+            "pc": 6626816348,
+            "sp": 6136153168
+          },
+          "bucket_registers": {
+            "x0": 4343218176,
+            "x1": 21088,
+            "x2": 228,
+            "x3": 0,
+            "lr": 4330853604,
+            "pc": 6626818384,
+            "sp": 6136153168
+          },
+          "classification": {
+            "bin_index": 37,
+            "bin_bucket_count": 6,
+            "bin_offset": 223,
+            "keys_sha256": "70e6282c6e0a0a891590f47cec97a7066f5b1ccddf3054f5c4b4d61821e67731",
+            "predicted_xzone_index": 228,
+            "destination_bucket_step_mod4_without_carry": 2,
+            "destination_bucket_step_mod4_with_carry": 3,
+            "carry_fraction_under_uniform_low32": 0.6686594877392054
+          }
+        },
+        "destination": {
+          "request_bytes": 21088,
+          "type_descriptor": 1082714899,
+          "caller_pc": 4330859596,
+          "xzone_index": 226,
+          "pointer": 48604184576,
+          "entry_registers": {
+            "x0": 4343218176,
+            "x1": 21088,
+            "x2": 1082714899,
+            "x3": 0,
+            "lr": 4330859596,
+            "pc": 6626816348,
+            "sp": 6136148960
+          },
+          "bucket_registers": {
+            "x0": 4343218176,
+            "x1": 21088,
+            "x2": 226,
+            "x3": 0,
+            "lr": 4330859596,
+            "pc": 6626818384,
+            "sp": 6136148960
+          },
+          "classification": {
+            "bin_index": 37,
+            "bin_bucket_count": 6,
+            "bin_offset": 223,
+            "keys_sha256": "70e6282c6e0a0a891590f47cec97a7066f5b1ccddf3054f5c4b4d61821e67731",
+            "predicted_xzone_index": 226,
+            "destination_bucket_step_mod4_without_carry": 2,
+            "destination_bucket_step_mod4_with_carry": 3,
+            "carry_fraction_under_uniform_low32": 0.6686594877392054
+          }
+        }
+      },
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "same_xzone": false,
+      "destination_minus_source": 4734976,
+      "run": 4,
+      "side": 1,
+      "log": "target/font-copy-allocator-model/4-1.log"
+    },
+    {
+      "scope": "Debugger-only allocation inspection; no acceptance timing",
+      "aslr_disabled": false,
+      "allocations": {
+        "source": {
+          "request_bytes": 21088,
+          "type_descriptor": 1076262201,
+          "caller_pc": 4305048804,
+          "xzone_index": 225,
+          "pointer": 51589971968,
+          "entry_registers": {
+            "x0": 4319494144,
+            "x1": 21088,
+            "x2": 1076262201,
+            "x3": 0,
+            "lr": 4305048804,
+            "pc": 6626816348,
+            "sp": 6161957968
+          },
+          "bucket_registers": {
+            "x0": 4319494144,
+            "x1": 21088,
+            "x2": 225,
+            "x3": 0,
+            "lr": 4305048804,
+            "pc": 6626818384,
+            "sp": 6161957968
+          },
+          "classification": {
+            "bin_index": 37,
+            "bin_bucket_count": 6,
+            "bin_offset": 223,
+            "keys_sha256": "70e6282c6e0a0a891590f47cec97a7066f5b1ccddf3054f5c4b4d61821e67731",
+            "predicted_xzone_index": 225,
+            "destination_bucket_step_mod4_without_carry": 2,
+            "destination_bucket_step_mod4_with_carry": 3,
+            "carry_fraction_under_uniform_low32": 0.6686594877392054
+          }
+        },
+        "destination": {
+          "request_bytes": 21088,
+          "type_descriptor": 1076263699,
+          "caller_pc": 4305054796,
+          "xzone_index": 228,
+          "pointer": 51586334720,
+          "entry_registers": {
+            "x0": 4319494144,
+            "x1": 21088,
+            "x2": 1076263699,
+            "x3": 0,
+            "lr": 4305054796,
+            "pc": 6626816348,
+            "sp": 6161953760
+          },
+          "bucket_registers": {
+            "x0": 4319494144,
+            "x1": 21088,
+            "x2": 228,
+            "x3": 0,
+            "lr": 4305054796,
+            "pc": 6626818384,
+            "sp": 6161953760
+          },
+          "classification": {
+            "bin_index": 37,
+            "bin_bucket_count": 6,
+            "bin_offset": 223,
+            "keys_sha256": "70e6282c6e0a0a891590f47cec97a7066f5b1ccddf3054f5c4b4d61821e67731",
+            "predicted_xzone_index": 228,
+            "destination_bucket_step_mod4_without_carry": 2,
+            "destination_bucket_step_mod4_with_carry": 3,
+            "carry_fraction_under_uniform_low32": 0.6686594877392054
+          }
+        }
+      },
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "same_xzone": false,
+      "destination_minus_source": -3637248,
+      "run": 5,
+      "side": 1,
+      "log": "target/font-copy-allocator-model/5-1.log"
+    },
+    {
+      "scope": "Debugger-only allocation inspection; no acceptance timing",
+      "aslr_disabled": false,
+      "allocations": {
+        "source": {
+          "request_bytes": 21088,
+          "type_descriptor": 1093154105,
+          "caller_pc": 4372616420,
+          "xzone_index": 227,
+          "pointer": 46355922944,
+          "entry_registers": {
+            "x0": 4384243712,
+            "x1": 21088,
+            "x2": 1093154105,
+            "x3": 0,
+            "lr": 4372616420,
+            "pc": 6626816348,
+            "sp": 6094390352
+          },
+          "bucket_registers": {
+            "x0": 4384243712,
+            "x1": 21088,
+            "x2": 227,
+            "x3": 0,
+            "lr": 4372616420,
+            "pc": 6626818384,
+            "sp": 6094390352
+          },
+          "classification": {
+            "bin_index": 37,
+            "bin_bucket_count": 6,
+            "bin_offset": 223,
+            "keys_sha256": "aec48e811c641e503374d3c422c750dc86d68df5b5b8106ecb021331dd144d79",
+            "predicted_xzone_index": 227,
+            "destination_bucket_step_mod4_without_carry": 3,
+            "destination_bucket_step_mod4_with_carry": 0,
+            "carry_fraction_under_uniform_low32": 0.3656911961734295
+          }
+        },
+        "destination": {
+          "request_bytes": 21088,
+          "type_descriptor": 1093155603,
+          "caller_pc": 4372622412,
+          "xzone_index": 226,
+          "pointer": 46351417344,
+          "entry_registers": {
+            "x0": 4384243712,
+            "x1": 21088,
+            "x2": 1093155603,
+            "x3": 0,
+            "lr": 4372622412,
+            "pc": 6626816348,
+            "sp": 6094386144
+          },
+          "bucket_registers": {
+            "x0": 4384243712,
+            "x1": 21088,
+            "x2": 226,
+            "x3": 0,
+            "lr": 4372622412,
+            "pc": 6626818384,
+            "sp": 6094386144
+          },
+          "classification": {
+            "bin_index": 37,
+            "bin_bucket_count": 6,
+            "bin_offset": 223,
+            "keys_sha256": "aec48e811c641e503374d3c422c750dc86d68df5b5b8106ecb021331dd144d79",
+            "predicted_xzone_index": 226,
+            "destination_bucket_step_mod4_without_carry": 3,
+            "destination_bucket_step_mod4_with_carry": 0,
+            "carry_fraction_under_uniform_low32": 0.3656911961734295
+          }
+        }
+      },
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "same_xzone": false,
+      "destination_minus_source": -4505600,
+      "run": 5,
+      "side": 0,
+      "log": "target/font-copy-allocator-model/5-0.log"
+    }
+  ]
+}

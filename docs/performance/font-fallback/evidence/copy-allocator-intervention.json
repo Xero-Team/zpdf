@@ -1,0 +1,5498 @@
+{
+  "scope": "Process-local allocator diagnostic; never pool with acceptance data",
+  "planned_pairs_per_condition": 16,
+  "settings": {
+    "sample_size": 10,
+    "warm_up": 0.1,
+    "measurement": 0.25,
+    "aslr_disabled": false,
+    "scheduler": "default",
+    "debugger": "attached; no breakpoints during warmup or timing"
+  },
+  "binaries": [
+    {
+      "path": "<workspace>/target/font-benchmark-runs/run-zcaqwew_/executable/font_diagnostics",
+      "sha256": "1494bdcb5c046a77c1a12537c90a7f9fe0180382b8af80bc5388675ecda81f2d"
+    },
+    {
+      "path": "<workspace>/target/font-benchmark-runs/run-qwqd2mh0/executable/font_diagnostics",
+      "sha256": "9811213d8b861a759fe75dcc886c2106dda6e5791589973ef02071fbe5f37450"
+    }
+  ],
+  "records": [
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "untouched",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "aec48e811c641e503374d3c422c750dc86d68df5b5b8106ecb021331dd144d79",
+      "source_type_descriptor": 1083569465,
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 0,
+      "side": 0,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          13072.0,
+          26144.0,
+          39216.0,
+          52288.0,
+          65360.0,
+          78432.0,
+          91504.0,
+          104576.0,
+          117648.0,
+          130720.0
+        ],
+        "times": [
+          6573459.0,
+          15441167.0,
+          25735458.0,
+          34346084.0,
+          42932917.0,
+          51476708.0,
+          60096917.0,
+          68688583.0,
+          77347291.0,
+          85880042.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        502.8655905752754,
+        590.6199127906976,
+        656.248929008568,
+        656.8636015911873,
+        656.8683751529987,
+        656.3227764177886,
+        656.7681959258612,
+        656.8293203029376,
+        657.4467139262886,
+        656.9770654834762
+      ],
+      "median_ns": 656.7987581143993,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/00-untouched-0"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "untouched",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "70e6282c6e0a0a891590f47cec97a7066f5b1ccddf3054f5c4b4d61821e67731",
+      "source_type_descriptor": 1091331385,
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 0,
+      "side": 1,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          13022.0,
+          26044.0,
+          39066.0,
+          52088.0,
+          65110.0,
+          78132.0,
+          91154.0,
+          104176.0,
+          117198.0,
+          130220.0
+        ],
+        "times": [
+          6479833.0,
+          15580167.0,
+          25623042.0,
+          34161666.0,
+          42594125.0,
+          51543459.0,
+          50055542.0,
+          34821375.0,
+          57224209.0,
+          88242458.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        497.6065888496391,
+        598.2248118568576,
+        655.8911073567808,
+        655.8452234679772,
+        654.187144831823,
+        659.6971663338965,
+        549.1316014656516,
+        334.2552507295346,
+        488.26950118602707,
+        677.6413607740747
+      ],
+      "median_ns": 626.2059783443403,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/00-untouched-1"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "same",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "aec48e811c641e503374d3c422c750dc86d68df5b5b8106ecb021331dd144d79",
+      "source_type_descriptor": 1083348281,
+      "replacement_keys": [
+        0,
+        0
+      ],
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 0,
+      "side": 0,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          18442.0,
+          36884.0,
+          55326.0,
+          73768.0,
+          92210.0,
+          110652.0,
+          129094.0,
+          147536.0,
+          165978.0,
+          184420.0
+        ],
+        "times": [
+          4489958.0,
+          9742917.0,
+          15793958.0,
+          21026458.0,
+          29968292.0,
+          38464250.0,
+          44689917.0,
+          36961375.0,
+          38071125.0,
+          41877417.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        243.4637241080143,
+        264.1502277410259,
+        285.47080938437625,
+        285.0349474026678,
+        325.00045548205185,
+        347.6145935003434,
+        346.18120904147366,
+        250.5244482702527,
+        229.37452553952934,
+        227.07633120052054
+      ],
+      "median_ns": 274.5925875718468,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/00-same-0"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "same",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "70e6282c6e0a0a891590f47cec97a7066f5b1ccddf3054f5c4b4d61821e67731",
+      "source_type_descriptor": 1092482361,
+      "replacement_keys": [
+        0,
+        0
+      ],
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 0,
+      "side": 1,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          18304.0,
+          36608.0,
+          54912.0,
+          73216.0,
+          91520.0,
+          109824.0,
+          128128.0,
+          146432.0,
+          164736.0,
+          183040.0
+        ],
+        "times": [
+          4542375.0,
+          10760083.0,
+          15478833.0,
+          20015375.0,
+          27036167.0,
+          34290500.0,
+          39961209.0,
+          43343167.0,
+          49501083.0,
+          55080625.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        248.16296984265733,
+        293.9270924388112,
+        281.88434222027973,
+        273.3743307473776,
+        295.4126638986014,
+        312.2313884032634,
+        311.88506025224774,
+        295.9951854785839,
+        300.4873433857809,
+        300.92124672202794
+      ],
+      "median_ns": 295.7039246885927,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/00-same-1"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "separate",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "aec48e811c641e503374d3c422c750dc86d68df5b5b8106ecb021331dd144d79",
+      "source_type_descriptor": 1076499769,
+      "replacement_keys": [
+        4294967296,
+        0
+      ],
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 0,
+      "side": 0,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          14101.0,
+          28202.0,
+          42303.0,
+          56404.0,
+          70505.0,
+          84606.0,
+          98707.0,
+          112808.0,
+          126909.0,
+          141010.0
+        ],
+        "times": [
+          7228792.0,
+          14559750.0,
+          26389458.0,
+          38227625.0,
+          47693458.0,
+          57444333.0,
+          66758541.0,
+          75704167.0,
+          82356334.0,
+          92005584.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        512.6439259626977,
+        516.266576838522,
+        623.8200127650521,
+        677.7467023615346,
+        676.4549748244806,
+        678.9628749734061,
+        676.3303615751669,
+        671.0886373306857,
+        648.94005941265,
+        652.4755974753564
+      ],
+      "median_ns": 661.7821174030211,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/00-separate-0"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "separate",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "70e6282c6e0a0a891590f47cec97a7066f5b1ccddf3054f5c4b4d61821e67731",
+      "source_type_descriptor": 1075107129,
+      "replacement_keys": [
+        4294967296,
+        0
+      ],
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 0,
+      "side": 1,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          13046.0,
+          26092.0,
+          39138.0,
+          52184.0,
+          65230.0,
+          78276.0,
+          91322.0,
+          104368.0,
+          117414.0,
+          130460.0
+        ],
+        "times": [
+          6702750.0,
+          15200000.0,
+          26232333.0,
+          35184458.0,
+          44077166.0,
+          52954167.0,
+          61683667.0,
+          70384583.0,
+          72866166.0,
+          39265459.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        513.7781695538863,
+        582.5540395523532,
+        670.2522612294956,
+        674.2384255710563,
+        675.7192396136747,
+        676.5057872144719,
+        675.4524320536125,
+        674.3885386325311,
+        620.5918033624611,
+        300.9769967806224
+      ],
+      "median_ns": 672.2453434002759,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/00-separate-1"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "same",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "70e6282c6e0a0a891590f47cec97a7066f5b1ccddf3054f5c4b4d61821e67731",
+      "source_type_descriptor": 1091269945,
+      "replacement_keys": [
+        0,
+        0
+      ],
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 1,
+      "side": 1,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          18697.0,
+          37394.0,
+          56091.0,
+          74788.0,
+          93485.0,
+          112182.0,
+          130879.0,
+          149576.0,
+          168273.0,
+          186970.0
+        ],
+        "times": [
+          4727666.0,
+          10732625.0,
+          16907083.0,
+          22996000.0,
+          32849416.0,
+          43728416.0,
+          49800208.0,
+          55238375.0,
+          58654167.0,
+          66492000.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        252.85692891907792,
+        287.0146280151896,
+        301.42238505286053,
+        307.48248382093385,
+        351.387024656362,
+        389.7988625626215,
+        380.5057190229143,
+        369.29972054340266,
+        348.5655274464709,
+        355.629245333476
+      ],
+      "median_ns": 349.97627605141645,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/01-same-1"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "same",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "aec48e811c641e503374d3c422c750dc86d68df5b5b8106ecb021331dd144d79",
+      "source_type_descriptor": 1082373433,
+      "replacement_keys": [
+        0,
+        0
+      ],
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 1,
+      "side": 0,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          18724.0,
+          37448.0,
+          56172.0,
+          74896.0,
+          93620.0,
+          112344.0,
+          131068.0,
+          149792.0,
+          168516.0,
+          187240.0
+        ],
+        "times": [
+          4514625.0,
+          11123375.0,
+          17351125.0,
+          23873709.0,
+          35050666.0,
+          45194250.0,
+          51865916.0,
+          53373500.0,
+          47496583.0,
+          47138667.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        241.1143452253792,
+        297.035222174749,
+        308.8927757601652,
+        318.7581312753685,
+        374.3929288613544,
+        402.2845011749626,
+        395.7176122318186,
+        356.31742683187355,
+        281.8520674594697,
+        251.75532471694083
+      ],
+      "median_ns": 313.82545351776685,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/01-same-0"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "separate",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "70e6282c6e0a0a891590f47cec97a7066f5b1ccddf3054f5c4b4d61821e67731",
+      "source_type_descriptor": 1075877177,
+      "replacement_keys": [
+        4294967296,
+        0
+      ],
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 1,
+      "side": 1,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          13124.0,
+          26248.0,
+          39372.0,
+          52496.0,
+          65620.0,
+          78744.0,
+          91868.0,
+          104992.0,
+          118116.0,
+          131240.0
+        ],
+        "times": [
+          6681167.0,
+          14336959.0,
+          26399625.0,
+          35111584.0,
+          43999458.0,
+          52937417.0,
+          61637875.0,
+          70553833.0,
+          79318750.0,
+          86926792.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        509.0800822919841,
+        546.2114827796404,
+        670.5177537336178,
+        668.8430356598598,
+        670.5190185918927,
+        672.2723890074165,
+        670.939554578308,
+        671.9924660926547,
+        671.5326458735481,
+        662.3498323681804
+      ],
+      "median_ns": 670.5183861627553,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/01-separate-1"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "separate",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "aec48e811c641e503374d3c422c750dc86d68df5b5b8106ecb021331dd144d79",
+      "source_type_descriptor": 1093678393,
+      "replacement_keys": [
+        4294967296,
+        0
+      ],
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 1,
+      "side": 0,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          12994.0,
+          25988.0,
+          38982.0,
+          51976.0,
+          64970.0,
+          77964.0,
+          90958.0,
+          103952.0,
+          116946.0,
+          129940.0
+        ],
+        "times": [
+          6629375.0,
+          15830666.0,
+          26061917.0,
+          34743750.0,
+          43607500.0,
+          30676459.0,
+          46408000.0,
+          70186125.0,
+          79161250.0,
+          88185750.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        510.18739418193013,
+        609.1529167307988,
+        668.5628495202914,
+        668.4575573341542,
+        671.1943974141911,
+        393.46953722230774,
+        510.2135051342378,
+        675.1782072494998,
+        676.9042977100543,
+        678.6651531476066
+      ],
+      "median_ns": 668.5102034272228,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/01-separate-0"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "untouched",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "70e6282c6e0a0a891590f47cec97a7066f5b1ccddf3054f5c4b4d61821e67731",
+      "source_type_descriptor": 1094001977,
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 1,
+      "side": 1,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          13603.0,
+          27206.0,
+          40809.0,
+          54412.0,
+          68015.0,
+          81618.0,
+          95221.0,
+          108824.0,
+          122427.0,
+          136030.0
+        ],
+        "times": [
+          6553709.0,
+          13432917.0,
+          25726208.0,
+          34079166.0,
+          42589833.0,
+          41923000.0,
+          54255500.0,
+          72780834.0,
+          82206917.0,
+          91417333.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        481.7840917444681,
+        493.7483275747997,
+        630.4052537430468,
+        626.317099169301,
+        626.1829449386165,
+        513.6489499865226,
+        569.785026412241,
+        668.79396089098,
+        671.4770189582364,
+        672.0380283760935
+      ],
+      "median_ns": 626.2500220539587,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/01-untouched-1"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "untouched",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "aec48e811c641e503374d3c422c750dc86d68df5b5b8106ecb021331dd144d79",
+      "source_type_descriptor": 1092318521,
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 1,
+      "side": 0,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          13244.0,
+          26488.0,
+          39732.0,
+          52976.0,
+          66220.0,
+          79464.0,
+          92708.0,
+          105952.0,
+          119196.0,
+          132440.0
+        ],
+        "times": [
+          6534417.0,
+          14459834.0,
+          26101750.0,
+          35346375.0,
+          44145333.0,
+          53029625.0,
+          61896708.0,
+          70664541.0,
+          80297750.0,
+          89691500.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        493.3869676834793,
+        545.9013138024766,
+        656.9452833987717,
+        667.214870884929,
+        666.6465267290848,
+        667.3415005537098,
+        667.652284592484,
+        666.948627680459,
+        673.6614483707507,
+        677.2236484445787
+      ],
+      "median_ns": 667.0817492826941,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/01-untouched-0"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "separate",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "aec48e811c641e503374d3c422c750dc86d68df5b5b8106ecb021331dd144d79",
+      "source_type_descriptor": 1083921721,
+      "replacement_keys": [
+        4294967296,
+        0
+      ],
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 2,
+      "side": 0,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          14090.0,
+          28180.0,
+          42270.0,
+          56360.0,
+          70450.0,
+          84540.0,
+          98630.0,
+          112720.0,
+          126810.0,
+          140900.0
+        ],
+        "times": [
+          7262250.0,
+          14528833.0,
+          27589958.0,
+          38202916.0,
+          47692625.0,
+          57205709.0,
+          66716167.0,
+          76428208.0,
+          85801666.0,
+          82879958.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        515.4187366926899,
+        515.572498225692,
+        652.7077832978472,
+        677.837402413059,
+        676.9712562100781,
+        676.6703217411876,
+        676.4287437899219,
+        678.0359119943222,
+        676.6159293431117,
+        588.218296664301
+      ],
+      "median_ns": 676.5223365665167,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/02-separate-0"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "separate",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "70e6282c6e0a0a891590f47cec97a7066f5b1ccddf3054f5c4b4d61821e67731",
+      "source_type_descriptor": 1075504441,
+      "replacement_keys": [
+        4294967296,
+        0
+      ],
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 2,
+      "side": 1,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          13874.0,
+          27748.0,
+          41622.0,
+          55496.0,
+          69370.0,
+          83244.0,
+          97118.0,
+          110992.0,
+          124866.0,
+          138740.0
+        ],
+        "times": [
+          7219042.0,
+          14413875.0,
+          23928250.0,
+          37830542.0,
+          47255500.0,
+          56853291.0,
+          66222125.0,
+          75974000.0,
+          85254459.0,
+          94651792.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        520.3288164912786,
+        519.4563572149344,
+        574.8942866753159,
+        681.6805175147758,
+        681.2094565374081,
+        682.9716375955023,
+        681.8728248110546,
+        684.4997837681996,
+        682.7675988659844,
+        682.2242467925616
+      ],
+      "median_ns": 681.7766711629151,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/02-separate-1"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "untouched",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "aec48e811c641e503374d3c422c750dc86d68df5b5b8106ecb021331dd144d79",
+      "source_type_descriptor": 1074685241,
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 2,
+      "side": 0,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          15113.0,
+          30226.0,
+          45339.0,
+          60452.0,
+          75565.0,
+          90678.0,
+          105791.0,
+          120904.0,
+          136017.0,
+          151130.0
+        ],
+        "times": [
+          4988916.0,
+          9935458.0,
+          15467333.0,
+          23730334.0,
+          47135750.0,
+          51549875.0,
+          30842958.0,
+          38337584.0,
+          48692167.0,
+          46098792.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        330.1075894924899,
+        328.70568384834246,
+        341.14852555195307,
+        392.54836895388075,
+        623.7775425130682,
+        568.493736077108,
+        291.54614286659546,
+        317.09111361079863,
+        357.9858914694487,
+        305.0274068682591
+      ],
+      "median_ns": 335.6280575222215,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/02-untouched-0"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "untouched",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "70e6282c6e0a0a891590f47cec97a7066f5b1ccddf3054f5c4b4d61821e67731",
+      "source_type_descriptor": 1094157625,
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 2,
+      "side": 1,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          13025.0,
+          26050.0,
+          39075.0,
+          52100.0,
+          65125.0,
+          78150.0,
+          91175.0,
+          104200.0,
+          117225.0,
+          130250.0
+        ],
+        "times": [
+          6691625.0,
+          16088375.0,
+          25984708.0,
+          34781542.0,
+          43345500.0,
+          51918166.0,
+          32467458.0,
+          62988666.0,
+          78641917.0,
+          87438958.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        513.7523992322457,
+        617.5959692898273,
+        664.9957261676263,
+        667.5919769673704,
+        665.573896353167,
+        664.3399360204735,
+        356.1004442007129,
+        604.497754318618,
+        670.8630155683514,
+        671.3163761996161
+      ],
+      "median_ns": 664.6678310940499,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/02-untouched-1"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "same",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "aec48e811c641e503374d3c422c750dc86d68df5b5b8106ecb021331dd144d79",
+      "source_type_descriptor": 1085302073,
+      "replacement_keys": [
+        0,
+        0
+      ],
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 2,
+      "side": 0,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          18093.0,
+          36186.0,
+          54279.0,
+          72372.0,
+          90465.0,
+          108558.0,
+          126651.0,
+          144744.0,
+          162837.0,
+          180930.0
+        ],
+        "times": [
+          5390959.0,
+          10684792.0,
+          13156916.0,
+          18163250.0,
+          26295750.0,
+          34872375.0,
+          39057542.0,
+          45803791.0,
+          55227625.0,
+          48489000.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        297.9582711545902,
+        295.2741944398386,
+        242.3942224433022,
+        250.97067926822527,
+        290.6731885259493,
+        321.2326590394075,
+        308.3871584116983,
+        316.4469062620903,
+        339.1589442202939,
+        267.9986735201459
+      ],
+      "median_ns": 296.61623279721437,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/02-same-0"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "same",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "70e6282c6e0a0a891590f47cec97a7066f5b1ccddf3054f5c4b4d61821e67731",
+      "source_type_descriptor": 1083491641,
+      "replacement_keys": [
+        0,
+        0
+      ],
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 2,
+      "side": 1,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          18837.0,
+          37674.0,
+          56511.0,
+          75348.0,
+          94185.0,
+          113022.0,
+          131859.0,
+          150696.0,
+          169533.0,
+          188370.0
+        ],
+        "times": [
+          4490792.0,
+          10212042.0,
+          17321000.0,
+          20794708.0,
+          27101791.0,
+          36349750.0,
+          45958500.0,
+          51252708.0,
+          49406583.0,
+          97031167.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        238.40271805489198,
+        271.06338588947284,
+        306.5066978110456,
+        275.98221585178106,
+        287.75060784626004,
+        321.61658792093573,
+        348.54276158623986,
+        340.10662525879917,
+        291.42752738404914,
+        515.1094494877103
+      ],
+      "median_ns": 298.9671125975474,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/02-same-1"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "untouched",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "70e6282c6e0a0a891590f47cec97a7066f5b1ccddf3054f5c4b4d61821e67731",
+      "source_type_descriptor": 1083852089,
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 3,
+      "side": 1,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          13104.0,
+          26208.0,
+          39312.0,
+          52416.0,
+          65520.0,
+          78624.0,
+          91728.0,
+          104832.0,
+          117936.0,
+          131040.0
+        ],
+        "times": [
+          6739375.0,
+          15495042.0,
+          26659584.0,
+          35544750.0,
+          44487417.0,
+          53399000.0,
+          62176500.0,
+          71274375.0,
+          79994875.0,
+          88923042.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        514.299068986569,
+        591.2332875457876,
+        678.1538461538462,
+        678.1278617216117,
+        678.989880952381,
+        679.1692104192105,
+        677.835557299843,
+        679.8913976648352,
+        678.2905558947226,
+        678.5946428571428
+      ],
+      "median_ns": 678.2222010242845,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/03-untouched-1"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "untouched",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "aec48e811c641e503374d3c422c750dc86d68df5b5b8106ecb021331dd144d79",
+      "source_type_descriptor": 1091331385,
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 3,
+      "side": 0,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          13077.0,
+          26154.0,
+          39231.0,
+          52308.0,
+          65385.0,
+          78462.0,
+          91539.0,
+          104616.0,
+          117693.0,
+          130770.0
+        ],
+        "times": [
+          6695583.0,
+          15497083.0,
+          26323500.0,
+          35159083.0,
+          43836250.0,
+          52662208.0,
+          61346958.0,
+          70241666.0,
+          79190917.0,
+          88369584.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        512.0121587520074,
+        592.5320409879942,
+        670.9872294868853,
+        672.1549858530244,
+        670.432820983406,
+        671.181055797711,
+        670.1729099072527,
+        671.4237401544697,
+        672.8600426533438,
+        675.7634319798119
+      ],
+      "median_ns": 671.0841426422982,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/03-untouched-0"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "same",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "70e6282c6e0a0a891590f47cec97a7066f5b1ccddf3054f5c4b4d61821e67731",
+      "source_type_descriptor": 1093223737,
+      "replacement_keys": [
+        0,
+        0
+      ],
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 3,
+      "side": 1,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          18491.0,
+          36982.0,
+          55473.0,
+          73964.0,
+          92455.0,
+          110946.0,
+          129437.0,
+          147928.0,
+          166419.0,
+          184910.0
+        ],
+        "times": [
+          4362417.0,
+          11021000.0,
+          18465833.0,
+          24032333.0,
+          34619500.0,
+          43973584.0,
+          51157125.0,
+          57216584.0,
+          63725667.0,
+          66892166.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        235.92109674977016,
+        298.0098426261425,
+        332.8796531646026,
+        324.91932561786814,
+        374.44702828403007,
+        396.3512339336254,
+        395.22798736064647,
+        386.7867070466714,
+        382.9230256160655,
+        361.75526472337896
+      ],
+      "median_ns": 368.1011465037045,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/03-same-1"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "same",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "aec48e811c641e503374d3c422c750dc86d68df5b5b8106ecb021331dd144d79",
+      "source_type_descriptor": 1076888889,
+      "replacement_keys": [
+        0,
+        0
+      ],
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 3,
+      "side": 0,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          16232.0,
+          32464.0,
+          48696.0,
+          64928.0,
+          81160.0,
+          97392.0,
+          113624.0,
+          129856.0,
+          146088.0,
+          162320.0
+        ],
+        "times": [
+          4591041.0,
+          9490500.0,
+          11705000.0,
+          16663542.0,
+          24041291.0,
+          30217958.0,
+          58856250.0,
+          71234208.0,
+          78119416.0,
+          84936083.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        282.83889847215374,
+        292.3392065056678,
+        240.36881879415148,
+        256.646469935929,
+        296.2209339576146,
+        310.2714596681452,
+        517.9913574596916,
+        548.5630852636767,
+        534.7421827939324,
+        523.263202316412
+      ],
+      "median_ns": 303.24619681287993,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/03-same-0"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "separate",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "70e6282c6e0a0a891590f47cec97a7066f5b1ccddf3054f5c4b4d61821e67731",
+      "source_type_descriptor": 1073833273,
+      "replacement_keys": [
+        4294967296,
+        0
+      ],
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 3,
+      "side": 1,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          13081.0,
+          26162.0,
+          39243.0,
+          52324.0,
+          65405.0,
+          78486.0,
+          91567.0,
+          104648.0,
+          117729.0,
+          130810.0
+        ],
+        "times": [
+          6665833.0,
+          15021291.0,
+          25736292.0,
+          34290333.0,
+          42803500.0,
+          51469750.0,
+          59920292.0,
+          68546000.0,
+          71270542.0,
+          86342875.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        509.5813011237673,
+        574.164475193028,
+        655.8186682975307,
+        655.3461700175827,
+        654.4377341181867,
+        655.7825599469969,
+        654.3874103115751,
+        655.0149071171928,
+        605.3779612499894,
+        660.0632596896262
+      ],
+      "median_ns": 654.7263206176897,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/03-separate-1"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "separate",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "aec48e811c641e503374d3c422c750dc86d68df5b5b8106ecb021331dd144d79",
+      "source_type_descriptor": 1094427961,
+      "replacement_keys": [
+        4294967296,
+        0
+      ],
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 3,
+      "side": 0,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          13030.0,
+          26060.0,
+          39090.0,
+          52120.0,
+          65150.0,
+          78180.0,
+          91210.0,
+          104240.0,
+          117270.0,
+          130300.0
+        ],
+        "times": [
+          6638500.0,
+          15531250.0,
+          26117708.0,
+          34912917.0,
+          41421917.0,
+          52273000.0,
+          60879000.0,
+          69646708.0,
+          78266417.0,
+          86987417.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        509.4781273983116,
+        595.9804297774367,
+        668.1429521616782,
+        669.8564274750576,
+        635.7930468150422,
+        668.6236889229982,
+        667.4597083653108,
+        668.1380276285495,
+        667.403572951309,
+        667.5933768227168
+      ],
+      "median_ns": 667.5265425940138,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/03-separate-0"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "same",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "aec48e811c641e503374d3c422c750dc86d68df5b5b8106ecb021331dd144d79",
+      "source_type_descriptor": 1075737913,
+      "replacement_keys": [
+        0,
+        0
+      ],
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 4,
+      "side": 0,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          18513.0,
+          37026.0,
+          55539.0,
+          74052.0,
+          92565.0,
+          111078.0,
+          129591.0,
+          148104.0,
+          166617.0,
+          185130.0
+        ],
+        "times": [
+          4463500.0,
+          8817750.0,
+          13318209.0,
+          23882000.0,
+          31440291.0,
+          43870917.0,
+          50596500.0,
+          47955583.0,
+          63016583.0,
+          87788125.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        241.1008480527197,
+        238.15021876519202,
+        239.79922216820611,
+        322.5031059255658,
+        339.6563603953978,
+        394.9559498730622,
+        390.43220594022733,
+        323.79667665964456,
+        378.2122052371607,
+        474.1971857613569
+      ],
+      "median_ns": 331.7265185275212,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/04-same-0"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "same",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "70e6282c6e0a0a891590f47cec97a7066f5b1ccddf3054f5c4b4d61821e67731",
+      "source_type_descriptor": 1077232953,
+      "replacement_keys": [
+        0,
+        0
+      ],
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 4,
+      "side": 1,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          17162.0,
+          34324.0,
+          51486.0,
+          68648.0,
+          85810.0,
+          102972.0,
+          120134.0,
+          137296.0,
+          154458.0,
+          171620.0
+        ],
+        "times": [
+          5899750.0,
+          11849708.0,
+          17795334.0,
+          23909125.0,
+          38343292.0,
+          45325125.0,
+          51224917.0,
+          55387209.0,
+          60498000.0,
+          64820666.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        343.7682088334693,
+        345.2309754107913,
+        345.6344248922037,
+        348.2858204172008,
+        446.8394359631745,
+        440.1694149865983,
+        426.39816371718246,
+        403.41458600396226,
+        391.67929145787207,
+        377.6987880200443
+      ],
+      "median_ns": 384.6890397389582,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/04-same-1"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "separate",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "aec48e811c641e503374d3c422c750dc86d68df5b5b8106ecb021331dd144d79",
+      "source_type_descriptor": 1084781881,
+      "replacement_keys": [
+        4294967296,
+        0
+      ],
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 4,
+      "side": 0,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          13658.0,
+          27316.0,
+          40974.0,
+          54632.0,
+          68290.0,
+          81948.0,
+          95606.0,
+          109264.0,
+          122922.0,
+          136580.0
+        ],
+        "times": [
+          6954083.0,
+          13992416.0,
+          26975375.0,
+          36587458.0,
+          45824500.0,
+          54690084.0,
+          64041250.0,
+          73026167.0,
+          82368666.0,
+          46388583.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        509.15822228730417,
+        512.2424952408844,
+        658.3534680529116,
+        669.7074608288183,
+        671.0279689559233,
+        667.3754576072631,
+        669.8455117879631,
+        668.3460883731146,
+        670.0888856347927,
+        339.64404012300486
+      ],
+      "median_ns": 667.8607729901889,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/04-separate-0"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "separate",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "70e6282c6e0a0a891590f47cec97a7066f5b1ccddf3054f5c4b4d61821e67731",
+      "source_type_descriptor": 1094612281,
+      "replacement_keys": [
+        4294967296,
+        0
+      ],
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 4,
+      "side": 1,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          15030.0,
+          30060.0,
+          45090.0,
+          60120.0,
+          75150.0,
+          90180.0,
+          105210.0,
+          120240.0,
+          135270.0,
+          150300.0
+        ],
+        "times": [
+          5252708.0,
+          10533583.0,
+          17777375.0,
+          34744333.0,
+          50364666.0,
+          60721875.0,
+          71080833.0,
+          81184041.0,
+          91329542.0,
+          101445417.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        349.48157019294746,
+        350.41859614105124,
+        394.2642492792193,
+        577.916383898869,
+        670.188502994012,
+        673.3408183632735,
+        675.6090960935272,
+        675.1833083832336,
+        675.1647963332595,
+        674.952874251497
+      ],
+      "median_ns": 671.7646606786427,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/04-separate-1"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "untouched",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "aec48e811c641e503374d3c422c750dc86d68df5b5b8106ecb021331dd144d79",
+      "source_type_descriptor": 1091142969,
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 4,
+      "side": 0,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          18638.0,
+          37276.0,
+          55914.0,
+          74552.0,
+          93190.0,
+          111828.0,
+          130466.0,
+          149104.0,
+          167742.0,
+          186380.0
+        ],
+        "times": [
+          4401958.0,
+          9941792.0,
+          15869625.0,
+          21591209.0,
+          29123000.0,
+          37921708.0,
+          43877583.0,
+          49469666.0,
+          54356958.0,
+          66374791.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        236.1818864685052,
+        266.7075866509282,
+        283.8220302607576,
+        289.6127401008692,
+        312.5120721107415,
+        339.10745072790354,
+        336.31431177471524,
+        331.77960349822945,
+        324.0509711342419,
+        356.1261455091748
+      ],
+      "median_ns": 318.2815216224917,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/04-untouched-0"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "untouched",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "70e6282c6e0a0a891590f47cec97a7066f5b1ccddf3054f5c4b4d61821e67731",
+      "source_type_descriptor": 1077884217,
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 4,
+      "side": 1,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          15083.0,
+          30166.0,
+          45249.0,
+          60332.0,
+          75415.0,
+          90498.0,
+          105581.0,
+          120664.0,
+          135747.0,
+          150830.0
+        ],
+        "times": [
+          4904292.0,
+          9798625.0,
+          15426959.0,
+          25243708.0,
+          46380500.0,
+          59166333.0,
+          69092333.0,
+          78883917.0,
+          88784375.0,
+          81841958.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        325.1536166545117,
+        324.8234767619174,
+        340.93480518906495,
+        418.41324670158457,
+        615.0036464894251,
+        653.7860836703574,
+        654.4011990793798,
+        653.7485662666578,
+        654.042999108636,
+        542.6106079692369
+      ],
+      "median_ns": 578.807127229331,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/04-untouched-1"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "separate",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "70e6282c6e0a0a891590f47cec97a7066f5b1ccddf3054f5c4b4d61821e67731",
+      "source_type_descriptor": 1092183353,
+      "replacement_keys": [
+        4294967296,
+        0
+      ],
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 5,
+      "side": 1,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          13500.0,
+          27000.0,
+          40500.0,
+          54000.0,
+          67500.0,
+          81000.0,
+          94500.0,
+          108000.0,
+          121500.0,
+          135000.0
+        ],
+        "times": [
+          6452583.0,
+          13164625.0,
+          25032166.0,
+          33328917.0,
+          41755792.0,
+          50037833.0,
+          58762750.0,
+          68211250.0,
+          76730208.0,
+          87140125.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        477.9691111111111,
+        487.5787037037037,
+        618.0781728395061,
+        617.2021666666667,
+        618.6043259259259,
+        617.751024691358,
+        621.8280423280423,
+        631.5856481481482,
+        631.5243456790123,
+        645.4824074074074
+      ],
+      "median_ns": 618.341249382716,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/05-separate-1"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "separate",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "aec48e811c641e503374d3c422c750dc86d68df5b5b8106ecb021331dd144d79",
+      "source_type_descriptor": 1085539641,
+      "replacement_keys": [
+        4294967296,
+        0
+      ],
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 5,
+      "side": 0,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          12998.0,
+          25996.0,
+          38994.0,
+          51992.0,
+          64990.0,
+          77988.0,
+          90986.0,
+          103984.0,
+          116982.0,
+          129980.0
+        ],
+        "times": [
+          6648834.0,
+          16197625.0,
+          26218000.0,
+          21371584.0,
+          19100416.0,
+          25176375.0,
+          34446750.0,
+          65390416.0,
+          79000000.0,
+          87707833.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        511.5274657639637,
+        623.0814356054777,
+        672.3598502333692,
+        411.0552392675796,
+        293.8977688875212,
+        322.8237036467149,
+        378.5939595102543,
+        628.8507462686567,
+        675.317570224479,
+        674.7794506847207
+      ],
+      "median_ns": 567.3044506847207,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/05-separate-0"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "untouched",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "70e6282c6e0a0a891590f47cec97a7066f5b1ccddf3054f5c4b4d61821e67731",
+      "source_type_descriptor": 1085441337,
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 5,
+      "side": 1,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          13249.0,
+          26498.0,
+          39747.0,
+          52996.0,
+          66245.0,
+          79494.0,
+          92743.0,
+          105992.0,
+          119241.0,
+          132490.0
+        ],
+        "times": [
+          6850583.0,
+          15701291.0,
+          26849916.0,
+          36044834.0,
+          45005459.0,
+          34603125.0,
+          54378792.0,
+          60403084.0,
+          35238750.0,
+          41542416.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        517.0641557853423,
+        592.5462676428409,
+        675.5205675900067,
+        680.1425390595516,
+        679.3789569024077,
+        435.29228621028,
+        586.3385053319388,
+        569.8834251641633,
+        295.5254484615191,
+        313.55133217601326
+      ],
+      "median_ns": 578.1109652480511,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/05-untouched-1"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "untouched",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "aec48e811c641e503374d3c422c750dc86d68df5b5b8106ecb021331dd144d79",
+      "source_type_descriptor": 1093887289,
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 5,
+      "side": 0,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          16755.0,
+          33510.0,
+          50265.0,
+          67020.0,
+          83775.0,
+          100530.0,
+          117285.0,
+          134040.0,
+          150795.0,
+          167550.0
+        ],
+        "times": [
+          4927292.0,
+          9982667.0,
+          14046916.0,
+          16377083.0,
+          21616125.0,
+          32416417.0,
+          41902000.0,
+          47708917.0,
+          53500708.0,
+          59226542.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        294.07890182035214,
+        297.90113398985375,
+        279.4571968566597,
+        244.36113100566996,
+        258.0259623992838,
+        322.4551576643788,
+        357.2664876156371,
+        355.93044613548193,
+        354.79099439636593,
+        353.4857773798866
+      ],
+      "median_ns": 310.1781458271163,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/05-untouched-0"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "same",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "70e6282c6e0a0a891590f47cec97a7066f5b1ccddf3054f5c4b4d61821e67731",
+      "source_type_descriptor": 1077699897,
+      "replacement_keys": [
+        0,
+        0
+      ],
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 5,
+      "side": 1,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          18230.0,
+          36460.0,
+          54690.0,
+          72920.0,
+          91150.0,
+          109380.0,
+          127610.0,
+          145840.0,
+          164070.0,
+          182300.0
+        ],
+        "times": [
+          4636792.0,
+          9709000.0,
+          13744792.0,
+          18232625.0,
+          23983959.0,
+          32130042.0,
+          48051250.0,
+          56358959.0,
+          64245084.0,
+          67344292.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        254.34953373560066,
+        266.2918266593527,
+        251.32185042969465,
+        250.03599835436094,
+        263.1262643993417,
+        293.7469555677455,
+        376.5476843507562,
+        386.4437671420735,
+        391.5711830316328,
+        369.4146571585299
+      ],
+      "median_ns": 280.0193911135491,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/05-same-1"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "same",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "aec48e811c641e503374d3c422c750dc86d68df5b5b8106ecb021331dd144d79",
+      "source_type_descriptor": 1091315001,
+      "replacement_keys": [
+        0,
+        0
+      ],
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 5,
+      "side": 0,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          18056.0,
+          36112.0,
+          54168.0,
+          72224.0,
+          90280.0,
+          108336.0,
+          126392.0,
+          144448.0,
+          162504.0,
+          180560.0
+        ],
+        "times": [
+          4668667.0,
+          10660667.0,
+          16791542.0,
+          22212500.0,
+          30618666.0,
+          40873167.0,
+          47019042.0,
+          41341500.0,
+          38383667.0,
+          46176750.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        258.56596145325653,
+        295.21120403190076,
+        309.9900679367893,
+        307.5501218431546,
+        339.15225963668587,
+        377.28148537882146,
+        372.0096366858662,
+        286.2033396101019,
+        236.20136735095753,
+        255.74185866194063
+      ],
+      "median_ns": 301.3806629375277,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/05-same-0"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "untouched",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "aec48e811c641e503374d3c422c750dc86d68df5b5b8106ecb021331dd144d79",
+      "source_type_descriptor": 1076847929,
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 6,
+      "side": 0,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          18365.0,
+          36730.0,
+          55095.0,
+          73460.0,
+          91825.0,
+          110190.0,
+          128555.0,
+          146920.0,
+          165285.0,
+          183650.0
+        ],
+        "times": [
+          4962458.0,
+          10262166.0,
+          15240875.0,
+          20470625.0,
+          26223375.0,
+          45405583.0,
+          54944875.0,
+          63416000.0,
+          68602000.0,
+          72752792.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        270.21279607949907,
+        279.3946637625919,
+        276.6290044468645,
+        278.66355839912876,
+        285.5799074326164,
+        412.0662764316181,
+        427.40364046517055,
+        431.63626463381433,
+        415.0527876092809,
+        396.14915328069696
+      ],
+      "median_ns": 340.8645303566567,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/06-untouched-0"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "untouched",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "70e6282c6e0a0a891590f47cec97a7066f5b1ccddf3054f5c4b4d61821e67731",
+      "source_type_descriptor": 1094264121,
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 6,
+      "side": 1,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          13153.0,
+          26306.0,
+          39459.0,
+          52612.0,
+          65765.0,
+          78918.0,
+          92071.0,
+          105224.0,
+          118377.0,
+          131530.0
+        ],
+        "times": [
+          6526167.0,
+          14841625.0,
+          25736875.0,
+          34225292.0,
+          42829041.0,
+          51435833.0,
+          60008000.0,
+          68218667.0,
+          72128250.0,
+          79828000.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        496.1732684558656,
+        564.1916292860944,
+        652.2434679033934,
+        650.5225423857675,
+        651.2436858511367,
+        651.7630071720013,
+        651.75788250372,
+        648.3185109860868,
+        609.3096631947084,
+        606.9185737094199
+      ],
+      "median_ns": 649.4205266859271,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/06-untouched-1"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "same",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "aec48e811c641e503374d3c422c750dc86d68df5b5b8106ecb021331dd144d79",
+      "source_type_descriptor": 1084532025,
+      "replacement_keys": [
+        0,
+        0
+      ],
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 6,
+      "side": 0,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          17886.0,
+          35772.0,
+          53658.0,
+          71544.0,
+          89430.0,
+          107316.0,
+          125202.0,
+          143088.0,
+          160974.0,
+          178860.0
+        ],
+        "times": [
+          4768917.0,
+          10956166.0,
+          18767875.0,
+          25165709.0,
+          38670125.0,
+          46985916.0,
+          52583334.0,
+          58787500.0,
+          65485375.0,
+          71730625.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        266.62848037571285,
+        306.2777032315778,
+        349.76844086622685,
+        351.7514955831376,
+        432.40663088449065,
+        437.82768645868276,
+        419.98797143815597,
+        410.84856871295983,
+        406.80715519276407,
+        401.04341384322936
+      ],
+      "median_ns": 403.9252845179967,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/06-same-0"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "same",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "70e6282c6e0a0a891590f47cec97a7066f5b1ccddf3054f5c4b4d61821e67731",
+      "source_type_descriptor": 1074230585,
+      "replacement_keys": [
+        0,
+        0
+      ],
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 6,
+      "side": 1,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          18183.0,
+          36366.0,
+          54549.0,
+          72732.0,
+          90915.0,
+          109098.0,
+          127281.0,
+          145464.0,
+          163647.0,
+          181830.0
+        ],
+        "times": [
+          4349000.0,
+          11012791.0,
+          15380458.0,
+          21201084.0,
+          27294042.0,
+          35757084.0,
+          40840083.0,
+          46551959.0,
+          50685542.0,
+          55433500.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        239.1794533355332,
+        302.832068415553,
+        281.9567361454839,
+        291.49595776274543,
+        300.21494802837816,
+        327.7519661222021,
+        320.86551017041035,
+        320.0239165704229,
+        309.7248467738486,
+        304.86443381180226
+      ],
+      "median_ns": 303.84825111367763,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/06-same-1"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "separate",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "aec48e811c641e503374d3c422c750dc86d68df5b5b8106ecb021331dd144d79",
+      "source_type_descriptor": 1075168569,
+      "replacement_keys": [
+        4294967296,
+        0
+      ],
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 6,
+      "side": 0,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          14077.0,
+          28154.0,
+          42231.0,
+          56308.0,
+          70385.0,
+          84462.0,
+          98539.0,
+          112616.0,
+          126693.0,
+          140770.0
+        ],
+        "times": [
+          7193708.0,
+          14498375.0,
+          26252459.0,
+          37907250.0,
+          47236791.0,
+          47695333.0,
+          63335458.0,
+          75713334.0,
+          85087625.0,
+          94480041.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        511.0256446686084,
+        514.9667897989628,
+        621.6395302029315,
+        673.2125097677061,
+        671.1201392342118,
+        564.6957566716393,
+        642.7450857021078,
+        672.3141827093841,
+        671.60478479474,
+        671.1660225900405
+      ],
+      "median_ns": 656.9326124681597,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/06-separate-0"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "separate",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "70e6282c6e0a0a891590f47cec97a7066f5b1ccddf3054f5c4b4d61821e67731",
+      "source_type_descriptor": 1077839161,
+      "replacement_keys": [
+        4294967296,
+        0
+      ],
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 6,
+      "side": 1,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          14965.0,
+          29930.0,
+          44895.0,
+          59860.0,
+          74825.0,
+          89790.0,
+          104755.0,
+          119720.0,
+          134685.0,
+          149650.0
+        ],
+        "times": [
+          5286834.0,
+          10548500.0,
+          17860625.0,
+          31484000.0,
+          50725916.0,
+          60857916.0,
+          70986500.0,
+          81146958.0,
+          47528292.0,
+          48382958.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        353.27991981289676,
+        352.4390243902439,
+        397.8310502283105,
+        525.9605746742399,
+        677.9273772134982,
+        677.7805546274641,
+        677.6430719297408,
+        677.8061977948547,
+        352.8848201358726,
+        323.3074373538256
+      ],
+      "median_ns": 461.8958124512752,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/06-separate-1"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "same",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "70e6282c6e0a0a891590f47cec97a7066f5b1ccddf3054f5c4b4d61821e67731",
+      "source_type_descriptor": 1092564281,
+      "replacement_keys": [
+        0,
+        0
+      ],
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 7,
+      "side": 1,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          19048.0,
+          38096.0,
+          57144.0,
+          76192.0,
+          95240.0,
+          114288.0,
+          133336.0,
+          152384.0,
+          171432.0,
+          190480.0
+        ],
+        "times": [
+          4637958.0,
+          9954541.0,
+          17412875.0,
+          22850583.0,
+          31532833.0,
+          32804125.0,
+          30286584.0,
+          36074125.0,
+          43424625.0,
+          57529667.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        243.48792524149516,
+        261.3014752204956,
+        304.71921811563766,
+        299.90790371692566,
+        331.08812473750527,
+        287.03035314293714,
+        227.14483710325794,
+        236.73171067828645,
+        253.3052463950721,
+        302.0247112557749
+      ],
+      "median_ns": 274.1659141817164,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/07-same-1"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "same",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "aec48e811c641e503374d3c422c750dc86d68df5b5b8106ecb021331dd144d79",
+      "source_type_descriptor": 1094219065,
+      "replacement_keys": [
+        0,
+        0
+      ],
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 7,
+      "side": 0,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          18706.0,
+          37412.0,
+          56118.0,
+          74824.0,
+          93530.0,
+          112236.0,
+          130942.0,
+          149648.0,
+          168354.0,
+          187060.0
+        ],
+        "times": [
+          4487666.0,
+          10095375.0,
+          15952834.0,
+          20762416.0,
+          27685500.0,
+          36302084.0,
+          43122959.0,
+          48966833.0,
+          55631041.0,
+          61202083.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        239.90516411846465,
+        269.843232118037,
+        284.27303182579567,
+        277.48337431840054,
+        296.0066288891265,
+        323.4442068498521,
+        329.3287027844389,
+        327.21341414519406,
+        330.44086270596483,
+        327.17888912648345
+      ],
+      "median_ns": 309.7254178694893,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/07-same-0"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "separate",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "70e6282c6e0a0a891590f47cec97a7066f5b1ccddf3054f5c4b4d61821e67731",
+      "source_type_descriptor": 1083823417,
+      "replacement_keys": [
+        4294967296,
+        0
+      ],
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 7,
+      "side": 1,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          14460.0,
+          28920.0,
+          43380.0,
+          57840.0,
+          72300.0,
+          86760.0,
+          101220.0,
+          115680.0,
+          130140.0,
+          144600.0
+        ],
+        "times": [
+          7404125.0,
+          14791041.0,
+          25674500.0,
+          38735625.0,
+          48410375.0,
+          58088625.0,
+          67809500.0,
+          77460292.0,
+          87064708.0,
+          96800750.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        512.0418395573997,
+        511.44678423236513,
+        591.8510834485938,
+        669.7030601659751,
+        669.5764177040111,
+        669.5323305670817,
+        669.9219521833629,
+        669.6083333333333,
+        669.0080528661441,
+        669.4381051175657
+      ],
+      "median_ns": 669.4852178423237,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/07-separate-1"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "separate",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "aec48e811c641e503374d3c422c750dc86d68df5b5b8106ecb021331dd144d79",
+      "source_type_descriptor": 1092314425,
+      "replacement_keys": [
+        4294967296,
+        0
+      ],
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 7,
+      "side": 0,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          12782.0,
+          25564.0,
+          38346.0,
+          51128.0,
+          63910.0,
+          76692.0,
+          89474.0,
+          102256.0,
+          115038.0,
+          127820.0
+        ],
+        "times": [
+          6515375.0,
+          16735125.0,
+          25719000.0,
+          34051084.0,
+          42730750.0,
+          51111958.0,
+          60037083.0,
+          68848750.0,
+          77853542.0,
+          86520959.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        509.7304803630105,
+        654.6364027538726,
+        670.7088092630262,
+        665.9967923642622,
+        668.6081990298858,
+        666.4574923068899,
+        671.0003241165031,
+        673.2978993897668,
+        676.7636954745388,
+        676.896878422782
+      ],
+      "median_ns": 669.6585041464559,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/07-separate-0"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "untouched",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "70e6282c6e0a0a891590f47cec97a7066f5b1ccddf3054f5c4b4d61821e67731",
+      "source_type_descriptor": 1082762553,
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 7,
+      "side": 1,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          12940.0,
+          25880.0,
+          38820.0,
+          51760.0,
+          64700.0,
+          77640.0,
+          90580.0,
+          103520.0,
+          116460.0,
+          129400.0
+        ],
+        "times": [
+          6652167.0,
+          15917458.0,
+          25922250.0,
+          34594917.0,
+          43507834.0,
+          51819750.0,
+          60471166.0,
+          32410958.0,
+          36156792.0,
+          55134583.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        514.0778207109737,
+        615.0486089644513,
+        667.7550231839258,
+        668.3716576506955,
+        672.4549304482225,
+        667.4362442040185,
+        667.5995363214838,
+        313.08885239567235,
+        310.4653271509531,
+        426.0786939721793
+      ],
+      "median_ns": 641.2424265842349,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/07-untouched-1"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "untouched",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "aec48e811c641e503374d3c422c750dc86d68df5b5b8106ecb021331dd144d79",
+      "source_type_descriptor": 1094149433,
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 7,
+      "side": 0,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          12785.0,
+          25570.0,
+          38355.0,
+          51140.0,
+          63925.0,
+          76710.0,
+          89495.0,
+          102280.0,
+          115065.0,
+          127850.0
+        ],
+        "times": [
+          6541166.0,
+          16929417.0,
+          25622667.0,
+          34332792.0,
+          42941041.0,
+          51389541.0,
+          59974291.0,
+          68477000.0,
+          77020667.0,
+          85645083.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        511.6281579976535,
+        662.0812280015643,
+        668.0398122800157,
+        671.3490809542433,
+        671.7409620649198,
+        669.9197105983575,
+        670.1412481144198,
+        669.50527962456,
+        669.3665927953765,
+        669.8872350410637
+      ],
+      "median_ns": 669.6962573328119,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/07-untouched-0"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "separate",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "aec48e811c641e503374d3c422c750dc86d68df5b5b8106ecb021331dd144d79",
+      "source_type_descriptor": 1091290425,
+      "replacement_keys": [
+        4294967296,
+        0
+      ],
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 8,
+      "side": 0,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          12967.0,
+          25934.0,
+          38901.0,
+          51868.0,
+          64835.0,
+          77802.0,
+          90769.0,
+          103736.0,
+          116703.0,
+          129670.0
+        ],
+        "times": [
+          6655875.0,
+          16563833.0,
+          26083750.0,
+          34968834.0,
+          43546000.0,
+          33337458.0,
+          36589958.0,
+          67892375.0,
+          76756417.0,
+          41908500.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        513.2933600678646,
+        638.6917945554098,
+        670.5161821032879,
+        674.188979717745,
+        671.6434024832266,
+        428.49101565512456,
+        403.11073163745334,
+        654.4726517313179,
+        657.7073168641766,
+        323.1934911698928
+      ],
+      "median_ns": 646.5822231433639,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/08-separate-0"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "separate",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "70e6282c6e0a0a891590f47cec97a7066f5b1ccddf3054f5c4b4d61821e67731",
+      "source_type_descriptor": 1083888953,
+      "replacement_keys": [
+        4294967296,
+        0
+      ],
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 8,
+      "side": 1,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          12939.0,
+          25878.0,
+          38817.0,
+          51756.0,
+          64695.0,
+          77634.0,
+          90573.0,
+          103512.0,
+          116451.0,
+          129390.0
+        ],
+        "times": [
+          6576834.0,
+          16928250.0,
+          26101250.0,
+          34645666.0,
+          43426833.0,
+          52208208.0,
+          60906541.0,
+          69535667.0,
+          78304625.0,
+          87194958.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        508.295386042198,
+        654.1560398794343,
+        672.4180127263828,
+        669.4038565576938,
+        671.2548574078368,
+        672.4915372130768,
+        672.4580283307388,
+        671.7643075199011,
+        672.4255266163451,
+        673.892557384651
+      ],
+      "median_ns": 672.0911601231419,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/08-separate-1"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "untouched",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "aec48e811c641e503374d3c422c750dc86d68df5b5b8106ecb021331dd144d79",
+      "source_type_descriptor": 1076839737,
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 8,
+      "side": 0,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          12904.0,
+          25808.0,
+          38712.0,
+          51616.0,
+          64520.0,
+          77424.0,
+          90328.0,
+          103232.0,
+          116136.0,
+          129040.0
+        ],
+        "times": [
+          6577875.0,
+          16176333.0,
+          25921625.0,
+          34664416.0,
+          43245083.0,
+          51965167.0,
+          59239542.0,
+          65805083.0,
+          74147417.0,
+          78753125.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        509.75472721636703,
+        626.7952960322381,
+        669.6018030584831,
+        671.582765034098,
+        670.2585709857409,
+        671.1764698284769,
+        655.8270082366487,
+        637.4484946528208,
+        638.4533391885376,
+        610.3001007439553
+      ],
+      "median_ns": 647.1401737125932,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/08-untouched-0"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "untouched",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "70e6282c6e0a0a891590f47cec97a7066f5b1ccddf3054f5c4b4d61821e67731",
+      "source_type_descriptor": 1093432633,
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 8,
+      "side": 1,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          14838.0,
+          29676.0,
+          44514.0,
+          59352.0,
+          74190.0,
+          89028.0,
+          103866.0,
+          118704.0,
+          133542.0,
+          148380.0
+        ],
+        "times": [
+          4870208.0,
+          9785666.0,
+          15555667.0,
+          26096250.0,
+          47989666.0,
+          60238458.0,
+          70273084.0,
+          80314250.0,
+          90364625.0,
+          100566833.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        328.2253673001752,
+        329.7501684863189,
+        349.4556094711776,
+        439.686109987869,
+        646.848173608303,
+        676.6237363526081,
+        676.5744709529586,
+        676.5926169295053,
+        676.6756900450795,
+        677.7654198679068
+      ],
+      "median_ns": 661.7113222806308,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/08-untouched-1"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "same",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "aec48e811c641e503374d3c422c750dc86d68df5b5b8106ecb021331dd144d79",
+      "source_type_descriptor": 1076684089,
+      "replacement_keys": [
+        0,
+        0
+      ],
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 8,
+      "side": 0,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          18881.0,
+          37762.0,
+          56643.0,
+          75524.0,
+          94405.0,
+          113286.0,
+          132167.0,
+          151048.0,
+          169929.0,
+          188810.0
+        ],
+        "times": [
+          4680125.0,
+          10033417.0,
+          16013291.0,
+          20609708.0,
+          27179042.0,
+          35465416.0,
+          43327375.0,
+          47996708.0,
+          53872417.0,
+          58769333.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        247.87484773052276,
+        265.7014194163445,
+        282.70555938068253,
+        272.8895185636354,
+        287.89833165616227,
+        313.06089013646874,
+        327.8229437000159,
+        317.75798421693764,
+        317.028976807961,
+        311.2617604999735
+      ],
+      "median_ns": 299.5800460780679,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/08-same-0"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "same",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "70e6282c6e0a0a891590f47cec97a7066f5b1ccddf3054f5c4b4d61821e67731",
+      "source_type_descriptor": 1090868537,
+      "replacement_keys": [
+        0,
+        0
+      ],
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 8,
+      "side": 1,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          18804.0,
+          37608.0,
+          56412.0,
+          75216.0,
+          94020.0,
+          112824.0,
+          131628.0,
+          150432.0,
+          169236.0,
+          188040.0
+        ],
+        "times": [
+          4440125.0,
+          9540083.0,
+          13183667.0,
+          18553334.0,
+          37722125.0,
+          35030959.0,
+          42003125.0,
+          43552708.0,
+          47757542.0,
+          51391334.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        236.12662199532014,
+        253.67163901297596,
+        233.70323689995035,
+        246.6673845990215,
+        401.2138374813869,
+        310.4920850173722,
+        319.10478773513233,
+        289.5175760476494,
+        282.19493488383085,
+        273.30001063603487
+      ],
+      "median_ns": 277.74747275993286,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/08-same-1"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "untouched",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "70e6282c6e0a0a891590f47cec97a7066f5b1ccddf3054f5c4b4d61821e67731",
+      "source_type_descriptor": 1084089657,
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 9,
+      "side": 1,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          14188.0,
+          28376.0,
+          42564.0,
+          56752.0,
+          70940.0,
+          85128.0,
+          99316.0,
+          113504.0,
+          127692.0,
+          141880.0
+        ],
+        "times": [
+          5603417.0,
+          14652583.0,
+          22487375.0,
+          37995000.0,
+          48288292.0,
+          58020875.0,
+          35933709.0,
+          33814708.0,
+          39704417.0,
+          60430750.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        394.9405835917677,
+        516.3723921623907,
+        528.3191194436613,
+        669.4918240766846,
+        680.6920214265576,
+        681.5721619208721,
+        361.8118832816465,
+        297.9164434733578,
+        310.93895467217993,
+        425.9286016351847
+      ],
+      "median_ns": 471.1504968987877,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/09-untouched-1"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "untouched",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "aec48e811c641e503374d3c422c750dc86d68df5b5b8106ecb021331dd144d79",
+      "source_type_descriptor": 1090610489,
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 9,
+      "side": 0,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          14710.0,
+          29420.0,
+          44130.0,
+          58840.0,
+          73550.0,
+          88260.0,
+          102970.0,
+          117680.0,
+          132390.0,
+          147100.0
+        ],
+        "times": [
+          4236583.0,
+          8516541.0,
+          12829625.0,
+          18429875.0,
+          24599125.0,
+          32134542.0,
+          40398250.0,
+          36345166.0,
+          48753000.0,
+          98853375.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        288.007002039429,
+        289.481339225017,
+        290.723430772717,
+        313.2201733514616,
+        334.4544527532291,
+        364.0895309313392,
+        392.33029037583765,
+        308.8474337185588,
+        368.2528891910265,
+        672.0147858599593
+      ],
+      "median_ns": 323.83731305234534,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/09-untouched-0"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "same",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "70e6282c6e0a0a891590f47cec97a7066f5b1ccddf3054f5c4b4d61821e67731",
+      "source_type_descriptor": 1077286201,
+      "replacement_keys": [
+        0,
+        0
+      ],
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 9,
+      "side": 1,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          18666.0,
+          37332.0,
+          55998.0,
+          74664.0,
+          93330.0,
+          111996.0,
+          130662.0,
+          149328.0,
+          167994.0,
+          186660.0
+        ],
+        "times": [
+          4735167.0,
+          11559125.0,
+          18538500.0,
+          24808208.0,
+          37136208.0,
+          28925791.0,
+          31000458.0,
+          35346916.0,
+          41270000.0,
+          56434041.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        253.6787206685953,
+        309.6304778742098,
+        331.05646630236794,
+        332.264652309011,
+        397.9021536483446,
+        258.2752151862567,
+        237.25687652110025,
+        236.706552019715,
+        245.663535602462,
+        302.3360173577628
+      ],
+      "median_ns": 280.30561627200973,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/09-same-1"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "same",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "aec48e811c641e503374d3c422c750dc86d68df5b5b8106ecb021331dd144d79",
+      "source_type_descriptor": 1090815289,
+      "replacement_keys": [
+        0,
+        0
+      ],
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 9,
+      "side": 0,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          19116.0,
+          38232.0,
+          57348.0,
+          76464.0,
+          95580.0,
+          114696.0,
+          133812.0,
+          152928.0,
+          172044.0,
+          191160.0
+        ],
+        "times": [
+          4670666.0,
+          9625333.0,
+          13643500.0,
+          18832500.0,
+          24722167.0,
+          42170750.0,
+          51659417.0,
+          58560959.0,
+          64860792.0,
+          70464083.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        244.3328102113413,
+        251.76116865453022,
+        237.90716328381112,
+        246.29237288135593,
+        258.6541849759364,
+        367.6741124363535,
+        386.05967327295014,
+        382.93156910441513,
+        377.00118574318196,
+        368.61311466834064
+      ],
+      "median_ns": 313.16414870614494,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/09-same-0"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "separate",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "70e6282c6e0a0a891590f47cec97a7066f5b1ccddf3054f5c4b4d61821e67731",
+      "source_type_descriptor": 1075426617,
+      "replacement_keys": [
+        4294967296,
+        0
+      ],
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 9,
+      "side": 1,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          14644.0,
+          29288.0,
+          43932.0,
+          58576.0,
+          73220.0,
+          87864.0,
+          102508.0,
+          117152.0,
+          131796.0,
+          146440.0
+        ],
+        "times": [
+          4388375.0,
+          9823750.0,
+          13434625.0,
+          17714416.0,
+          23091417.0,
+          26540209.0,
+          35252583.0,
+          68542750.0,
+          70672791.0,
+          97410583.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        299.67051352089595,
+        335.4189429117727,
+        305.80499408176274,
+        302.4176454520623,
+        315.3703496312483,
+        302.06010425202584,
+        343.9007979864986,
+        585.0753721660749,
+        536.228648820905,
+        665.1910885004097
+      ],
+      "median_ns": 325.3946462715105,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/09-separate-1"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "separate",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "aec48e811c641e503374d3c422c750dc86d68df5b5b8106ecb021331dd144d79",
+      "source_type_descriptor": 1086133561,
+      "replacement_keys": [
+        4294967296,
+        0
+      ],
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 9,
+      "side": 0,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          13034.0,
+          26068.0,
+          39102.0,
+          52136.0,
+          65170.0,
+          78204.0,
+          91238.0,
+          104272.0,
+          117306.0,
+          130340.0
+        ],
+        "times": [
+          6700542.0,
+          15989708.0,
+          26374584.0,
+          35023459.0,
+          43602875.0,
+          52234125.0,
+          60960666.0,
+          69737042.0,
+          78419209.0,
+          86984375.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        514.0817860978979,
+        613.3845327604727,
+        674.5072886297376,
+        671.7711178456345,
+        669.0636028847629,
+        667.9213978824613,
+        668.1499594467217,
+        668.7993133343563,
+        668.5012616575452,
+        667.3651603498542
+      ],
+      "median_ns": 668.3256105521334,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/09-separate-0"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "same",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "aec48e811c641e503374d3c422c750dc86d68df5b5b8106ecb021331dd144d79",
+      "source_type_descriptor": 1091380537,
+      "replacement_keys": [
+        0,
+        0
+      ],
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 10,
+      "side": 0,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          19582.0,
+          39164.0,
+          58746.0,
+          78328.0,
+          97910.0,
+          117492.0,
+          137074.0,
+          156656.0,
+          176238.0,
+          195820.0
+        ],
+        "times": [
+          5476000.0,
+          9695125.0,
+          17627166.0,
+          23843791.0,
+          34584292.0,
+          51262250.0,
+          59127250.0,
+          67067042.0,
+          76097833.0,
+          84295083.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        279.6445715452967,
+        247.55196098457768,
+        300.0572975181289,
+        304.4095470329895,
+        353.22532938412826,
+        436.3041739012018,
+        431.35277295475436,
+        428.11665049535287,
+        431.79015308843725,
+        430.4722857726484
+      ],
+      "median_ns": 390.6709899397406,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/10-same-0"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "same",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "70e6282c6e0a0a891590f47cec97a7066f5b1ccddf3054f5c4b4d61821e67731",
+      "source_type_descriptor": 1075291449,
+      "replacement_keys": [
+        0,
+        0
+      ],
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 10,
+      "side": 1,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          18372.0,
+          36744.0,
+          55116.0,
+          73488.0,
+          91860.0,
+          110232.0,
+          128604.0,
+          146976.0,
+          165348.0,
+          183720.0
+        ],
+        "times": [
+          4391500.0,
+          12204125.0,
+          18922875.0,
+          24750209.0,
+          40504625.0,
+          51080875.0,
+          55644416.0,
+          50960417.0,
+          48289667.0,
+          82957625.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        239.0322229479643,
+        332.1392608317004,
+        343.32816242107555,
+        336.7925239494883,
+        440.9386566514261,
+        463.3942503084404,
+        432.68028988211876,
+        346.7261117461354,
+        292.04869124513147,
+        451.5437894622251
+      ],
+      "median_ns": 345.02713708360545,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/10-same-1"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "separate",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "aec48e811c641e503374d3c422c750dc86d68df5b5b8106ecb021331dd144d79",
+      "source_type_descriptor": 1091700025,
+      "replacement_keys": [
+        4294967296,
+        0
+      ],
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 10,
+      "side": 0,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          12794.0,
+          25588.0,
+          38382.0,
+          51176.0,
+          63970.0,
+          76764.0,
+          89558.0,
+          102352.0,
+          115146.0,
+          127940.0
+        ],
+        "times": [
+          6553792.0,
+          17109833.0,
+          25954417.0,
+          34588666.0,
+          43486792.0,
+          52038875.0,
+          59881417.0,
+          68581958.0,
+          77165916.0,
+          85997875.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        512.2551195873066,
+        668.666288885415,
+        676.2132510030743,
+        675.8767000156323,
+        679.7997811474129,
+        677.9072872700746,
+        668.6328077893655,
+        670.0597741128654,
+        670.1571570006774,
+        672.1734797561356
+      ],
+      "median_ns": 671.1653183784065,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/10-separate-0"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "separate",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "70e6282c6e0a0a891590f47cec97a7066f5b1ccddf3054f5c4b4d61821e67731",
+      "source_type_descriptor": 1082201401,
+      "replacement_keys": [
+        4294967296,
+        0
+      ],
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 10,
+      "side": 1,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          13593.0,
+          27186.0,
+          40779.0,
+          54372.0,
+          67965.0,
+          81558.0,
+          95151.0,
+          108744.0,
+          122337.0,
+          135930.0
+        ],
+        "times": [
+          6840083.0,
+          13712208.0,
+          26865167.0,
+          35877791.0,
+          44892041.0,
+          53797125.0,
+          61945208.0,
+          69919417.0,
+          78717500.0,
+          87739375.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        503.2062826454793,
+        504.38490399470317,
+        658.799063243336,
+        659.8578496284853,
+        660.5170455381447,
+        659.6180019127493,
+        651.0200418282519,
+        642.9726421687633,
+        643.4480165444633,
+        645.4746928566174
+      ],
+      "median_ns": 648.2473673424347,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/10-separate-1"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "untouched",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "aec48e811c641e503374d3c422c750dc86d68df5b5b8106ecb021331dd144d79",
+      "source_type_descriptor": 1085011257,
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 10,
+      "side": 0,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          15134.0,
+          30268.0,
+          45402.0,
+          60536.0,
+          75670.0,
+          90804.0,
+          105938.0,
+          121072.0,
+          136206.0,
+          151340.0
+        ],
+        "times": [
+          5048416.0,
+          10063000.0,
+          15606917.0,
+          24298167.0,
+          46672916.0,
+          61207167.0,
+          69213042.0,
+          81811750.0,
+          92299459.0,
+          102483792.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        333.5810757235364,
+        332.46332760671334,
+        343.7495484780406,
+        401.3837551209198,
+        616.7955068058676,
+        674.0580481036078,
+        653.3353659687742,
+        675.7280791595084,
+        677.6460581765855,
+        677.1758424738998
+      ],
+      "median_ns": 635.0654363873209,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/10-untouched-0"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "untouched",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "70e6282c6e0a0a891590f47cec97a7066f5b1ccddf3054f5c4b4d61821e67731",
+      "source_type_descriptor": 1092617529,
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 10,
+      "side": 1,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          12874.0,
+          25748.0,
+          38622.0,
+          51496.0,
+          64370.0,
+          77244.0,
+          90118.0,
+          102992.0,
+          115866.0,
+          128740.0
+        ],
+        "times": [
+          6572250.0,
+          16399125.0,
+          25888959.0,
+          34396417.0,
+          43043875.0,
+          51548292.0,
+          58938708.0,
+          67422708.0,
+          75876875.0,
+          84489167.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        510.50567034332767,
+        636.9086919372378,
+        670.3163740873077,
+        667.9434713375796,
+        668.6946558956035,
+        667.3436383408421,
+        654.0170443196698,
+        654.640243902439,
+        654.8674762225329,
+        656.2775128165295
+      ],
+      "median_ns": 655.5724945195311,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/10-untouched-1"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "separate",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "70e6282c6e0a0a891590f47cec97a7066f5b1ccddf3054f5c4b4d61821e67731",
+      "source_type_descriptor": 1091171641,
+      "replacement_keys": [
+        4294967296,
+        0
+      ],
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 11,
+      "side": 1,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          13525.0,
+          27050.0,
+          40575.0,
+          54100.0,
+          67625.0,
+          81150.0,
+          94675.0,
+          108200.0,
+          121725.0,
+          135250.0
+        ],
+        "times": [
+          6640834.0,
+          13798875.0,
+          26241500.0,
+          34929834.0,
+          43650667.0,
+          52450250.0,
+          61156250.0,
+          69858708.0,
+          63041000.0,
+          39866250.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        491.0043622920518,
+        510.1247689463956,
+        646.7406038200862,
+        645.653123844732,
+        645.4812125693161,
+        646.3370301910043,
+        645.9598626881436,
+        645.6442513863216,
+        517.896898747176,
+        294.7597042513863
+      ],
+      "median_ns": 645.5627319778189,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/11-separate-1"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "separate",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "aec48e811c641e503374d3c422c750dc86d68df5b5b8106ecb021331dd144d79",
+      "source_type_descriptor": 1076647225,
+      "replacement_keys": [
+        4294967296,
+        0
+      ],
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 11,
+      "side": 0,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          14885.0,
+          29770.0,
+          44655.0,
+          59540.0,
+          74425.0,
+          89310.0,
+          104195.0,
+          119080.0,
+          133965.0,
+          148850.0
+        ],
+        "times": [
+          5233667.0,
+          10448708.0,
+          21891250.0,
+          30306666.0,
+          46919375.0,
+          59706834.0,
+          56345083.0,
+          35658292.0,
+          44991334.0,
+          83734208.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        351.6067853543836,
+        350.9811219348337,
+        490.23065726122496,
+        509.0135371179039,
+        630.4249244205577,
+        668.5346993617736,
+        540.7657085272806,
+        299.44820288881425,
+        335.8439443138133,
+        562.5408666442728
+      ],
+      "median_ns": 499.62209718956444,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/11-separate-0"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "untouched",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "70e6282c6e0a0a891590f47cec97a7066f5b1ccddf3054f5c4b4d61821e67731",
+      "source_type_descriptor": 1075905849,
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 11,
+      "side": 1,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          14569.0,
+          29138.0,
+          43707.0,
+          58276.0,
+          72845.0,
+          87414.0,
+          101983.0,
+          116552.0,
+          131121.0,
+          145690.0
+        ],
+        "times": [
+          4296250.0,
+          8548583.0,
+          14112792.0,
+          19394459.0,
+          29864333.0,
+          55554416.0,
+          43512042.0,
+          36367958.0,
+          85757542.0,
+          98977875.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        294.8898345802732,
+        293.38262749673964,
+        322.89546296931843,
+        332.80353833482053,
+        409.9709382936372,
+        635.5322488388588,
+        426.65975701832656,
+        312.0320372022788,
+        654.033617803403,
+        679.3731553298098
+      ],
+      "median_ns": 371.38723831422885,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/11-untouched-1"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "untouched",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "aec48e811c641e503374d3c422c750dc86d68df5b5b8106ecb021331dd144d79",
+      "source_type_descriptor": 1094313273,
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 11,
+      "side": 0,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          16121.0,
+          32242.0,
+          48363.0,
+          64484.0,
+          80605.0,
+          96726.0,
+          112847.0,
+          128968.0,
+          145089.0,
+          161210.0
+        ],
+        "times": [
+          6442875.0,
+          9597666.0,
+          14207834.0,
+          19467125.0,
+          31497125.0,
+          54184500.0,
+          63952500.0,
+          72533750.0,
+          80167917.0,
+          86449084.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        399.6572793251039,
+        297.6758885925191,
+        293.774869218204,
+        301.8907791079958,
+        390.7589479560821,
+        560.1854723652378,
+        566.7186544613503,
+        562.4166459897028,
+        552.5430391001386,
+        536.2513739842442
+      ],
+      "median_ns": 467.95432665467405,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/11-untouched-0"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "same",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "70e6282c6e0a0a891590f47cec97a7066f5b1ccddf3054f5c4b4d61821e67731",
+      "source_type_descriptor": 1085437241,
+      "replacement_keys": [
+        0,
+        0
+      ],
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 11,
+      "side": 1,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          18471.0,
+          36942.0,
+          55413.0,
+          73884.0,
+          92355.0,
+          110826.0,
+          129297.0,
+          147768.0,
+          166239.0,
+          184710.0
+        ],
+        "times": [
+          4611292.0,
+          10677541.0,
+          15885625.0,
+          20976875.0,
+          26906833.0,
+          35223666.0,
+          41876458.0,
+          50845959.0,
+          57920875.0,
+          74125541.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        249.65037085160523,
+        289.0352715066862,
+        286.67686283002183,
+        283.91634183314386,
+        291.34137837691515,
+        317.8285420388717,
+        323.8780327463127,
+        344.09316631476366,
+        348.41929390816836,
+        401.30767689892264
+      ],
+      "median_ns": 304.58496020789346,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/11-same-1"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "same",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "aec48e811c641e503374d3c422c750dc86d68df5b5b8106ecb021331dd144d79",
+      "source_type_descriptor": 1091827001,
+      "replacement_keys": [
+        0,
+        0
+      ],
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 11,
+      "side": 0,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          18477.0,
+          36954.0,
+          55431.0,
+          73908.0,
+          92385.0,
+          110862.0,
+          129339.0,
+          147816.0,
+          166293.0,
+          184770.0
+        ],
+        "times": [
+          4651542.0,
+          11497667.0,
+          16738875.0,
+          22014125.0,
+          23822666.0,
+          28754958.0,
+          43030125.0,
+          51005708.0,
+          57334833.0,
+          62829875.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        251.7476863127131,
+        311.1345727120204,
+        301.97678194512093,
+        297.85848622611894,
+        257.8629214699356,
+        259.37614331330843,
+        332.6925753253079,
+        345.06215835904095,
+        344.78199924230125,
+        340.04370298208585
+      ],
+      "median_ns": 306.55567732857065,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/11-same-0"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "untouched",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "aec48e811c641e503374d3c422c750dc86d68df5b5b8106ecb021331dd144d79",
+      "source_type_descriptor": 1076712761,
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 12,
+      "side": 0,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          17363.0,
+          34726.0,
+          52089.0,
+          69452.0,
+          86815.0,
+          104178.0,
+          121541.0,
+          138904.0,
+          156267.0,
+          173630.0
+        ],
+        "times": [
+          5880125.0,
+          11240792.0,
+          16264458.0,
+          24445458.0,
+          45799542.0,
+          58772750.0,
+          67261208.0,
+          50674917.0,
+          41313917.0,
+          50880750.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        338.65835397108793,
+        323.69959108449,
+        312.24362149398144,
+        351.97630017854055,
+        527.553326038127,
+        564.1570197162549,
+        553.4034441052813,
+        364.8197100155503,
+        264.3803042229005,
+        293.0412371134021
+      ],
+      "median_ns": 345.3173270748142,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/12-untouched-0"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "untouched",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "70e6282c6e0a0a891590f47cec97a7066f5b1ccddf3054f5c4b4d61821e67731",
+      "source_type_descriptor": 1090606393,
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 12,
+      "side": 1,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          13919.0,
+          27838.0,
+          41757.0,
+          55676.0,
+          69595.0,
+          83514.0,
+          97433.0,
+          111352.0,
+          125271.0,
+          139190.0
+        ],
+        "times": [
+          7177041.0,
+          14375166.0,
+          21747625.0,
+          37843250.0,
+          47287125.0,
+          56309250.0,
+          65076417.0,
+          74399209.0,
+          83854542.0,
+          93128125.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        515.6290681801854,
+        516.3864501760183,
+        520.8138755178772,
+        679.7048997772829,
+        679.4615274085781,
+        674.2492276744019,
+        667.9094044112364,
+        668.1443440620734,
+        669.3851090835069,
+        669.0719520080465
+      ],
+      "median_ns": 668.6081480350599,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/12-untouched-1"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "same",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "aec48e811c641e503374d3c422c750dc86d68df5b5b8106ecb021331dd144d79",
+      "source_type_descriptor": 1092851001,
+      "replacement_keys": [
+        0,
+        0
+      ],
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 12,
+      "side": 0,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          16413.0,
+          32826.0,
+          49239.0,
+          65652.0,
+          82065.0,
+          98478.0,
+          114891.0,
+          131304.0,
+          147717.0,
+          164130.0
+        ],
+        "times": [
+          6263250.0,
+          11815958.0,
+          17582083.0,
+          25076208.0,
+          35597583.0,
+          42646625.0,
+          48397334.0,
+          52832667.0,
+          58623833.0,
+          61210459.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        381.60299762383477,
+        359.957289953086,
+        357.0763622331891,
+        381.9564978980077,
+        433.77302138548714,
+        433.057383374967,
+        421.24565022499587,
+        402.36905958691284,
+        396.8658515946032,
+        372.93888381161275
+      ],
+      "median_ns": 389.41117474630545,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/12-same-0"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "same",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "70e6282c6e0a0a891590f47cec97a7066f5b1ccddf3054f5c4b4d61821e67731",
+      "source_type_descriptor": 1082639673,
+      "replacement_keys": [
+        0,
+        0
+      ],
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 12,
+      "side": 1,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          14401.0,
+          28802.0,
+          43203.0,
+          57604.0,
+          72005.0,
+          86406.0,
+          100807.0,
+          115208.0,
+          129609.0,
+          144010.0
+        ],
+        "times": [
+          4362167.0,
+          12477916.0,
+          13298541.0,
+          17557000.0,
+          21449667.0,
+          25912584.0,
+          28889833.0,
+          33999958.0,
+          42355791.0,
+          58029708.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        302.90722866467604,
+        433.2308867439761,
+        307.8152211651969,
+        304.787861954031,
+        297.89135476703007,
+        299.8933407402264,
+        286.58558433442124,
+        295.11802999791684,
+        326.7966807860565,
+        402.95610027081455
+      ],
+      "median_ns": 303.8475453093535,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/12-same-1"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "separate",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "aec48e811c641e503374d3c422c750dc86d68df5b5b8106ecb021331dd144d79",
+      "source_type_descriptor": 1077835065,
+      "replacement_keys": [
+        4294967296,
+        0
+      ],
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 12,
+      "side": 0,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          14996.0,
+          29992.0,
+          44988.0,
+          59984.0,
+          74980.0,
+          89976.0,
+          104972.0,
+          119968.0,
+          134964.0,
+          149960.0
+        ],
+        "times": [
+          4950167.0,
+          9963667.0,
+          15496458.0,
+          23497458.0,
+          45718042.0,
+          61094167.0,
+          71164542.0,
+          81296333.0,
+          53861458.0,
+          70781958.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        330.0991597759402,
+        332.21082288610296,
+        344.45758869031744,
+        391.7287610029341,
+        609.7364897305948,
+        679.0051458166622,
+        677.9383264108524,
+        677.6501483728995,
+        399.0801843454551,
+        472.00558815684184
+      ],
+      "median_ns": 435.5428862511485,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/12-separate-0"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "separate",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "70e6282c6e0a0a891590f47cec97a7066f5b1ccddf3054f5c4b4d61821e67731",
+      "source_type_descriptor": 1085797689,
+      "replacement_keys": [
+        4294967296,
+        0
+      ],
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 12,
+      "side": 1,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          12758.0,
+          25516.0,
+          38274.0,
+          51032.0,
+          63790.0,
+          76548.0,
+          89306.0,
+          102064.0,
+          114822.0,
+          127580.0
+        ],
+        "times": [
+          6525458.0,
+          16866500.0,
+          25571042.0,
+          34036375.0,
+          42611917.0,
+          51197042.0,
+          59650916.0,
+          68138291.0,
+          76732500.0,
+          85299417.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        511.4796990123844,
+        661.0166170246121,
+        668.1047708627267,
+        666.9614163662015,
+        668.0030882583477,
+        668.8227256100747,
+        667.9385035719885,
+        667.6035722683806,
+        668.2735015937712,
+        668.5955243768616
+      ],
+      "median_ns": 667.9707959151681,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/12-separate-1"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "same",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "70e6282c6e0a0a891590f47cec97a7066f5b1ccddf3054f5c4b4d61821e67731",
+      "source_type_descriptor": 1086100793,
+      "replacement_keys": [
+        0,
+        0
+      ],
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 13,
+      "side": 1,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          17077.0,
+          34154.0,
+          51231.0,
+          68308.0,
+          85385.0,
+          102462.0,
+          119539.0,
+          136616.0,
+          153693.0,
+          170770.0
+        ],
+        "times": [
+          4252917.0,
+          8913083.0,
+          12691000.0,
+          16445084.0,
+          19532667.0,
+          27856792.0,
+          34155208.0,
+          42363041.0,
+          53924958.0,
+          70738041.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        249.04356737131815,
+        260.9674708672483,
+        247.72110636138277,
+        240.74901914856238,
+        228.75993441470985,
+        271.87437293826,
+        285.724391202871,
+        310.0884303449084,
+        350.8615096328395,
+        414.2299057211454
+      ],
+      "median_ns": 266.4209219027542,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/13-same-1"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "same",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "aec48e811c641e503374d3c422c750dc86d68df5b5b8106ecb021331dd144d79",
+      "source_type_descriptor": 1076897081,
+      "replacement_keys": [
+        0,
+        0
+      ],
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 13,
+      "side": 0,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          18211.0,
+          36422.0,
+          54633.0,
+          72844.0,
+          91055.0,
+          109266.0,
+          127477.0,
+          145688.0,
+          163899.0,
+          182110.0
+        ],
+        "times": [
+          4534583.0,
+          8887375.0,
+          12991125.0,
+          17258542.0,
+          24850917.0,
+          42126958.0,
+          37535667.0,
+          37248750.0,
+          39988666.0,
+          43907250.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        249.002416122124,
+        244.01117456482345,
+        237.78897369721597,
+        236.92468837515787,
+        272.9220471143814,
+        385.5449819706038,
+        294.4505047969438,
+        255.67479819889078,
+        243.98358745324865,
+        241.10290483773542
+      ],
+      "median_ns": 246.50679534347373,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/13-same-0"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "separate",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "70e6282c6e0a0a891590f47cec97a7066f5b1ccddf3054f5c4b4d61821e67731",
+      "source_type_descriptor": 1077134649,
+      "replacement_keys": [
+        4294967296,
+        0
+      ],
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 13,
+      "side": 1,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          13104.0,
+          26208.0,
+          39312.0,
+          52416.0,
+          65520.0,
+          78624.0,
+          91728.0,
+          104832.0,
+          117936.0,
+          131040.0
+        ],
+        "times": [
+          6690833.0,
+          14734125.0,
+          26401167.0,
+          35309042.0,
+          44253458.0,
+          52816208.0,
+          61366875.0,
+          70144709.0,
+          78949708.0,
+          87777208.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        510.5947039072039,
+        562.1995192307693,
+        671.5803571428571,
+        673.6309905372406,
+        675.4190781440782,
+        671.7568172568173,
+        669.0091902145474,
+        669.1154323107448,
+        669.4284018450685,
+        669.8504884004884
+      ],
+      "median_ns": 669.6394451227784,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/13-separate-1"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "separate",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "aec48e811c641e503374d3c422c750dc86d68df5b5b8106ecb021331dd144d79",
+      "source_type_descriptor": 1083831609,
+      "replacement_keys": [
+        4294967296,
+        0
+      ],
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 13,
+      "side": 0,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          13684.0,
+          27368.0,
+          41052.0,
+          54736.0,
+          68420.0,
+          82104.0,
+          95788.0,
+          109472.0,
+          123156.0,
+          136840.0
+        ],
+        "times": [
+          4002834.0,
+          8069792.0,
+          12130500.0,
+          16258709.0,
+          22479208.0,
+          29257875.0,
+          58813750.0,
+          73204500.0,
+          82679208.0,
+          91602250.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        292.51929260450163,
+        294.862320958784,
+        295.4910844782227,
+        297.0386765565624,
+        328.5473253434668,
+        356.3513957907045,
+        613.9991439428738,
+        668.7052396959954,
+        671.3372308291922,
+        669.4113563285589
+      ],
+      "median_ns": 342.44936056708565,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/13-separate-0"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "untouched",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "70e6282c6e0a0a891590f47cec97a7066f5b1ccddf3054f5c4b4d61821e67731",
+      "source_type_descriptor": 1084290361,
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 13,
+      "side": 1,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          12995.0,
+          25990.0,
+          38985.0,
+          51980.0,
+          64975.0,
+          77970.0,
+          90965.0,
+          103960.0,
+          116955.0,
+          129950.0
+        ],
+        "times": [
+          6522500.0,
+          16060917.0,
+          25793750.0,
+          34188041.0,
+          42540417.0,
+          45885584.0,
+          26498125.0,
+          30513750.0,
+          37924000.0,
+          64814041.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        501.92381685263564,
+        617.9652558676414,
+        661.6326792356034,
+        657.7152943439785,
+        654.7197691419777,
+        588.5030652815185,
+        291.30022536140274,
+        293.51433243555215,
+        324.261468086016,
+        498.7613774528665
+      ],
+      "median_ns": 545.213441067077,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/13-untouched-1"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "untouched",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "aec48e811c641e503374d3c422c750dc86d68df5b5b8106ecb021331dd144d79",
+      "source_type_descriptor": 1091872057,
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 13,
+      "side": 0,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          14501.0,
+          29002.0,
+          43503.0,
+          58004.0,
+          72505.0,
+          87006.0,
+          101507.0,
+          116008.0,
+          130509.0,
+          145010.0
+        ],
+        "times": [
+          4028708.0,
+          8250000.0,
+          12696167.0,
+          17099375.0,
+          21670833.0,
+          25382084.0,
+          31157000.0,
+          33026500.0,
+          40932458.0,
+          44564042.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        277.8227708433901,
+        284.46314047307084,
+        291.8457807507528,
+        294.79647955313425,
+        298.88742845321013,
+        291.7279727834862,
+        306.94434866560925,
+        284.69157299496584,
+        313.63705185083023,
+        307.3170264119716
+      ],
+      "median_ns": 293.3211301519435,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/13-untouched-0"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "separate",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "aec48e811c641e503374d3c422c750dc86d68df5b5b8106ecb021331dd144d79",
+      "source_type_descriptor": 1077470521,
+      "replacement_keys": [
+        4294967296,
+        0
+      ],
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 14,
+      "side": 0,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          14888.0,
+          29776.0,
+          44664.0,
+          59552.0,
+          74440.0,
+          89328.0,
+          104216.0,
+          119104.0,
+          133992.0,
+          148880.0
+        ],
+        "times": [
+          4526250.0,
+          9504958.0,
+          13461792.0,
+          17798542.0,
+          23675458.0,
+          28493292.0,
+          31952958.0,
+          35831208.0,
+          43665917.0,
+          45853583.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        304.02001612036537,
+        319.21540838259,
+        301.4013970983342,
+        298.8739588930682,
+        318.0475282106394,
+        318.9738044062332,
+        306.60318952943885,
+        300.8396695325094,
+        325.88450803033015,
+        307.99021359484146
+      ],
+      "median_ns": 307.29670156214013,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/14-separate-0"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "separate",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "70e6282c6e0a0a891590f47cec97a7066f5b1ccddf3054f5c4b4d61821e67731",
+      "source_type_descriptor": 1083467065,
+      "replacement_keys": [
+        4294967296,
+        0
+      ],
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 14,
+      "side": 1,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          14549.0,
+          29098.0,
+          43647.0,
+          58196.0,
+          72745.0,
+          87294.0,
+          101843.0,
+          116392.0,
+          130941.0,
+          145490.0
+        ],
+        "times": [
+          7405833.0,
+          15182375.0,
+          14153208.0,
+          19426625.0,
+          22987208.0,
+          26857208.0,
+          31340042.0,
+          36098583.0,
+          39642875.0,
+          42641291.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        509.0269434325383,
+        521.7669599285174,
+        324.2653103306069,
+        333.8137500859166,
+        315.9970857103581,
+        307.66384860356953,
+        307.7289749909174,
+        310.14659942264075,
+        302.75372114158284,
+        293.0874355625816
+      ],
+      "median_ns": 313.0718425664994,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/14-separate-1"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "untouched",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "aec48e811c641e503374d3c422c750dc86d68df5b5b8106ecb021331dd144d79",
+      "source_type_descriptor": 1076090169,
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 14,
+      "side": 0,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          12723.0,
+          25446.0,
+          38169.0,
+          50892.0,
+          63615.0,
+          76338.0,
+          89061.0,
+          101784.0,
+          114507.0,
+          127230.0
+        ],
+        "times": [
+          6869166.0,
+          17208583.0,
+          25761958.0,
+          27582000.0,
+          19137667.0,
+          22518459.0,
+          26605750.0,
+          34139208.0,
+          53089833.0,
+          75447750.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        539.9014383400141,
+        676.2785113573842,
+        674.9445361418952,
+        541.9712331997171,
+        300.83576200581626,
+        294.9836123555765,
+        298.73625941770246,
+        335.40839424663994,
+        463.6383190547303,
+        593.0028295213393
+      ],
+      "median_ns": 501.7698786973722,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/14-untouched-0"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "untouched",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "70e6282c6e0a0a891590f47cec97a7066f5b1ccddf3054f5c4b4d61821e67731",
+      "source_type_descriptor": 1086227769,
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 14,
+      "side": 1,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          12935.0,
+          25870.0,
+          38805.0,
+          51740.0,
+          64675.0,
+          77610.0,
+          90545.0,
+          103480.0,
+          116415.0,
+          129350.0
+        ],
+        "times": [
+          4293333.0,
+          8305708.0,
+          11680917.0,
+          15391375.0,
+          20388583.0,
+          23433375.0,
+          30620958.0,
+          40473209.0,
+          75467375.0,
+          42971208.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        331.9159644375725,
+        321.0555856204097,
+        301.01577116350984,
+        297.47535755701585,
+        315.2467413993042,
+        301.9375724777735,
+        338.1849688000442,
+        391.1210765365288,
+        648.2616071812051,
+        332.2087978353305
+      ],
+      "median_ns": 326.4857750289911,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/14-untouched-1"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "same",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "aec48e811c641e503374d3c422c750dc86d68df5b5b8106ecb021331dd144d79",
+      "source_type_descriptor": 1085531449,
+      "replacement_keys": [
+        0,
+        0
+      ],
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 14,
+      "side": 0,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          18623.0,
+          37246.0,
+          55869.0,
+          74492.0,
+          93115.0,
+          111738.0,
+          130361.0,
+          148984.0,
+          167607.0,
+          186230.0
+        ],
+        "times": [
+          4793917.0,
+          11582959.0,
+          18493667.0,
+          25478208.0,
+          37316209.0,
+          45077458.0,
+          49937792.0,
+          54838917.0,
+          56046125.0,
+          64666666.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        257.41915910433335,
+        310.98531385920637,
+        331.01840018614973,
+        342.0260967620684,
+        400.7540031144284,
+        403.42102060176484,
+        383.0730970152116,
+        368.08594882671963,
+        334.3901209376697,
+        347.24086344842397
+      ],
+      "median_ns": 344.6334801052462,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/14-same-0"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "same",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "70e6282c6e0a0a891590f47cec97a7066f5b1ccddf3054f5c4b4d61821e67731",
+      "source_type_descriptor": 1091736889,
+      "replacement_keys": [
+        0,
+        0
+      ],
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 14,
+      "side": 1,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          18890.0,
+          37780.0,
+          56670.0,
+          75560.0,
+          94450.0,
+          113340.0,
+          132230.0,
+          151120.0,
+          170010.0,
+          188900.0
+        ],
+        "times": [
+          4980500.0,
+          9101250.0,
+          14518750.0,
+          21084333.0,
+          28079833.0,
+          35592708.0,
+          41964916.0,
+          47221125.0,
+          51849083.0,
+          42901459.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        263.6580201164637,
+        240.9012705134992,
+        256.19816481383447,
+        279.04093435680255,
+        297.298390682901,
+        314.03483324510324,
+        317.3630492323981,
+        312.4743581259926,
+        304.976666078466,
+        227.11201164637373
+      ],
+      "median_ns": 288.1696625198518,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/14-same-1"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "untouched",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "70e6282c6e0a0a891590f47cec97a7066f5b1ccddf3054f5c4b4d61821e67731",
+      "source_type_descriptor": 1082688825,
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 15,
+      "side": 1,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          13179.0,
+          26358.0,
+          39537.0,
+          52716.0,
+          65895.0,
+          79074.0,
+          92253.0,
+          105432.0,
+          118611.0,
+          131790.0
+        ],
+        "times": [
+          6622125.0,
+          14399250.0,
+          25887583.0,
+          34619791.0,
+          43280000.0,
+          51780000.0,
+          60547750.0,
+          69189875.0,
+          79781708.0,
+          89410125.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        502.47552925108124,
+        546.2952424311404,
+        654.7685206262488,
+        656.7226458760149,
+        656.802488807952,
+        654.8296532362091,
+        656.3228296098772,
+        656.2511855983004,
+        672.633297080372,
+        678.4287502845436
+      ],
+      "median_ns": 656.2870076040888,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/15-untouched-1"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "untouched",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "aec48e811c641e503374d3c422c750dc86d68df5b5b8106ecb021331dd144d79",
+      "source_type_descriptor": 1073911097,
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 15,
+      "side": 0,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          17298.0,
+          34596.0,
+          51894.0,
+          69192.0,
+          86490.0,
+          103788.0,
+          121086.0,
+          138384.0,
+          155682.0,
+          172980.0
+        ],
+        "times": [
+          5416417.0,
+          10610833.0,
+          15885167.0,
+          20263667.0,
+          23924916.0,
+          30511375.0,
+          35781291.0,
+          60759417.0,
+          44108083.0,
+          43866625.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        313.12388715458434,
+        306.7069314371604,
+        306.10797009288166,
+        292.86141461440627,
+        276.62060353798125,
+        293.9778683470151,
+        295.50312174817896,
+        439.0638874436351,
+        283.32166210608807,
+        253.59362354029366
+      ],
+      "median_ns": 294.74049504759705,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/15-untouched-0"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "same",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "70e6282c6e0a0a891590f47cec97a7066f5b1ccddf3054f5c4b4d61821e67731",
+      "source_type_descriptor": 1076303161,
+      "replacement_keys": [
+        0,
+        0
+      ],
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 15,
+      "side": 1,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          18735.0,
+          37470.0,
+          56205.0,
+          74940.0,
+          93675.0,
+          112410.0,
+          131145.0,
+          149880.0,
+          168615.0,
+          187350.0
+        ],
+        "times": [
+          4436833.0,
+          8938125.0,
+          14654583.0,
+          19890833.0,
+          28773250.0,
+          39197542.0,
+          51345792.0,
+          60416917.0,
+          74571500.0,
+          82785458.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        236.82054977315187,
+        238.5408326661329,
+        260.7345076060849,
+        265.4234454230051,
+        307.1603949826528,
+        348.70155680099634,
+        391.5192496854627,
+        403.1019282092341,
+        442.25899237908845,
+        441.8759434214038
+      ],
+      "median_ns": 327.9309758918246,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/15-same-1"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "same",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "aec48e811c641e503374d3c422c750dc86d68df5b5b8106ecb021331dd144d79",
+      "source_type_descriptor": 1085277497,
+      "replacement_keys": [
+        0,
+        0
+      ],
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 15,
+      "side": 0,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          18085.0,
+          36170.0,
+          54255.0,
+          72340.0,
+          90425.0,
+          108510.0,
+          126595.0,
+          144680.0,
+          162765.0,
+          180850.0
+        ],
+        "times": [
+          5054417.0,
+          11356417.0,
+          17200333.0,
+          22879125.0,
+          31712833.0,
+          40071333.0,
+          46127041.0,
+          52481625.0,
+          59734834.0,
+          66438792.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        279.48117224218964,
+        313.9733757257396,
+        317.0276103584923,
+        316.2721177771634,
+        350.7086867569809,
+        369.2870058059165,
+        364.3670050159959,
+        362.7427771633951,
+        367.0004853623322,
+        367.3695991152889
+      ],
+      "median_ns": 356.725731960188,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/15-same-0"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "separate",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "70e6282c6e0a0a891590f47cec97a7066f5b1ccddf3054f5c4b4d61821e67731",
+      "source_type_descriptor": 1093674297,
+      "replacement_keys": [
+        4294967296,
+        0
+      ],
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 15,
+      "side": 1,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          14591.0,
+          29182.0,
+          43773.0,
+          58364.0,
+          72955.0,
+          87546.0,
+          102137.0,
+          116728.0,
+          131319.0,
+          145910.0
+        ],
+        "times": [
+          7060083.0,
+          14126750.0,
+          24179792.0,
+          36996416.0,
+          46298458.0,
+          47865125.0,
+          42515333.0,
+          77113458.0,
+          87693416.0,
+          97506583.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        483.8656020834761,
+        484.09122061544787,
+        552.3905603911087,
+        633.891028716332,
+        634.6166541018436,
+        546.7425696205423,
+        416.25789870468094,
+        660.6251970392708,
+        667.7892460344657,
+        668.2652525529436
+      ],
+      "median_ns": 593.1407945537203,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/15-separate-1"
+    },
+    {
+      "scope": "Process-local allocator diagnostic; excluded from acceptance",
+      "mode": "separate",
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "original_keys_sha256": "aec48e811c641e503374d3c422c750dc86d68df5b5b8106ecb021331dd144d79",
+      "source_type_descriptor": 1091228985,
+      "replacement_keys": [
+        4294967296,
+        0
+      ],
+      "breakpoints_before_warmup": 0,
+      "exit_status": 0,
+      "run": 15,
+      "side": 0,
+      "samples": {
+        "sampling_mode": "Linear",
+        "iters": [
+          12943.0,
+          25886.0,
+          38829.0,
+          51772.0,
+          64715.0,
+          77658.0,
+          90601.0,
+          103544.0,
+          116487.0,
+          129430.0
+        ],
+        "times": [
+          6649083.0,
+          15792042.0,
+          26339084.0,
+          34758500.0,
+          43592750.0,
+          52260083.0,
+          61118291.0,
+          69825083.0,
+          78526083.0,
+          87372834.0
+        ]
+      },
+      "raw_ns_per_iteration": [
+        513.7203893996755,
+        610.0611141157383,
+        678.3353678951299,
+        671.3764196863169,
+        673.6112184192227,
+        672.951698472791,
+        674.5873776227636,
+        674.3518021324268,
+        674.1188544644467,
+        675.058595379742
+      ],
+      "median_ns": 673.8650364418347,
+      "directory": "<workspace>/target/font-copy-allocator-intervention/15-separate-0"
+    }
+  ],
+  "comparisons": {
+    "untouched": {
+      "pairs": [
+        [
+          656.7987581143993,
+          626.2059783443403
+        ],
+        [
+          667.0817492826941,
+          626.2500220539587
+        ],
+        [
+          335.6280575222215,
+          664.6678310940499
+        ],
+        [
+          671.0841426422982,
+          678.2222010242845
+        ],
+        [
+          318.2815216224917,
+          578.807127229331
+        ],
+        [
+          310.1781458271163,
+          578.1109652480511
+        ],
+        [
+          340.8645303566567,
+          649.4205266859271
+        ],
+        [
+          669.6962573328119,
+          641.2424265842349
+        ],
+        [
+          647.1401737125932,
+          661.7113222806308
+        ],
+        [
+          323.83731305234534,
+          471.1504968987877
+        ],
+        [
+          635.0654363873209,
+          655.5724945195311
+        ],
+        [
+          467.95432665467405,
+          371.38723831422885
+        ],
+        [
+          345.3173270748142,
+          668.6081480350599
+        ],
+        [
+          293.3211301519435,
+          545.213441067077
+        ],
+        [
+          501.7698786973722,
+          326.4857750289911
+        ],
+        [
+          294.74049504759705,
+          656.2870076040888
+        ]
+      ],
+      "ratio": 1.2255118262308207,
+      "lower_95": 0.9575123342305963,
+      "upper_95": 1.863803021023513
+    },
+    "same": {
+      "pairs": [
+        [
+          274.5925875718468,
+          295.7039246885927
+        ],
+        [
+          313.82545351776685,
+          349.97627605141645
+        ],
+        [
+          296.61623279721437,
+          298.9671125975474
+        ],
+        [
+          303.24619681287993,
+          368.1011465037045
+        ],
+        [
+          331.7265185275212,
+          384.6890397389582
+        ],
+        [
+          301.3806629375277,
+          280.0193911135491
+        ],
+        [
+          403.9252845179967,
+          303.84825111367763
+        ],
+        [
+          309.7254178694893,
+          274.1659141817164
+        ],
+        [
+          299.5800460780679,
+          277.74747275993286
+        ],
+        [
+          313.16414870614494,
+          280.30561627200973
+        ],
+        [
+          390.6709899397406,
+          345.02713708360545
+        ],
+        [
+          306.55567732857065,
+          304.58496020789346
+        ],
+        [
+          389.41117474630545,
+          303.8475453093535
+        ],
+        [
+          246.50679534347373,
+          266.4209219027542
+        ],
+        [
+          344.6334801052462,
+          288.1696625198518
+        ],
+        [
+          356.725731960188,
+          327.9309758918246
+        ]
+      ],
+      "ratio": 0.9281218091230166,
+      "lower_95": 0.8851902309717544,
+      "upper_95": 1.0768823998616572
+    },
+    "separate": {
+      "pairs": [
+        [
+          661.7821174030211,
+          672.2453434002759
+        ],
+        [
+          668.5102034272228,
+          670.5183861627553
+        ],
+        [
+          676.5223365665167,
+          681.7766711629151
+        ],
+        [
+          667.5265425940138,
+          654.7263206176897
+        ],
+        [
+          667.8607729901889,
+          671.7646606786427
+        ],
+        [
+          567.3044506847207,
+          618.341249382716
+        ],
+        [
+          656.9326124681597,
+          461.8958124512752
+        ],
+        [
+          669.6585041464559,
+          669.4852178423237
+        ],
+        [
+          646.5822231433639,
+          672.0911601231419
+        ],
+        [
+          668.3256105521334,
+          325.3946462715105
+        ],
+        [
+          671.1653183784065,
+          648.2473673424347
+        ],
+        [
+          499.62209718956444,
+          645.5627319778189
+        ],
+        [
+          435.5428862511485,
+          667.9707959151681
+        ],
+        [
+          342.44936056708565,
+          669.6394451227784
+        ],
+        [
+          307.29670156214013,
+          313.0718425664994
+        ],
+        [
+          673.8650364418347,
+          593.1407945537203
+        ]
+      ],
+      "ratio": 1.0068055640122635,
+      "lower_95": 0.9808243999907744,
+      "upper_95": 1.0522341720552217
+    },
+    "separate_vs_same_side_0": {
+      "ratio": 1.9501684018633856,
+      "lower_95": 1.6297923481419088,
+      "upper_95": 2.1582953591470853
+    },
+    "separate_vs_same_side_1": {
+      "ratio": 2.0151205903344507,
+      "lower_95": 1.7786587377855412,
+      "upper_95": 2.273373084608941
+    }
+  },
+  "complete": true
+}

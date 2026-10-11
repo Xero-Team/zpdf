@@ -1,0 +1,55 @@
+//! Independent investigation of the system copy-size threshold.
+//! Existing font benchmark inputs and acceptance rules remain unchanged.
+
+use std::hint::black_box;
+use std::io::{BufWriter, Write};
+use std::time::Instant;
+
+const INPUT: &[u8] = include_bytes!("../crates/zpdf-font/tests/fixtures/coverage-primary.ttf");
+const LENGTHS: [usize; 9] = [8192, 12288, 15360, 16383, 16384, 16385, 21088, 24576, 32768];
+const ROUNDS: usize = 24;
+const ITERATIONS: usize = 20_000;
+
+#[inline(never)]
+fn batch(source: &[u8], destination: &mut [u8], chunked: bool) -> f64 {
+    let operation = |destination: &mut [u8]| {
+        if chunked {
+            for (source, destination) in source.chunks(8192).zip(destination.chunks_mut(8192)) {
+                destination.copy_from_slice(black_box(source));
+            }
+        } else {
+            destination.copy_from_slice(black_box(source));
+        }
+        black_box(destination);
+    };
+    for _ in 0..1000 { operation(destination); }
+    let start = Instant::now();
+    for _ in 0..ITERATIONS { operation(destination); }
+    start.elapsed().as_nanos() as f64 / ITERATIONS as f64
+}
+
+fn main() {
+    let mut source_storage = vec![0u8; 65_536];
+    let source_start = (16_384 - source_storage.as_ptr() as usize % 16_384) % 16_384;
+    for (index, byte) in source_storage[source_start..source_start + 32_768].iter_mut().enumerate() {
+        *byte = INPUT[index % INPUT.len()];
+    }
+    let source = &source_storage[source_start..source_start + 32_768];
+    let mut destination_storage = vec![0u8; 65_536];
+    let start = (16_384 - destination_storage.as_ptr() as usize % 16_384) % 16_384;
+    let mut output = BufWriter::new(std::io::stdout().lock());
+    writeln!(output, "{{\"kind\":\"environment\",\"rounds\":{ROUNDS},\"iterations\":{ITERATIONS},\"source_mod_16k\":{},\"destination_mod_16k\":{}}}", source.as_ptr() as usize % 16_384, (destination_storage.as_ptr() as usize + start) % 16_384).unwrap();
+    let count = LENGTHS.len() * 2;
+    for round in 0..ROUNDS {
+        for index in 0..count {
+            let index = if round % 2 == 0 { index } else { count - 1 - index };
+            let case = (index + round) % count;
+            let length = LENGTHS[case / 2];
+            let chunked = case % 2 != 0;
+            let destination = &mut destination_storage[start..start + length];
+            let ns = batch(&source[..length], destination, chunked);
+            assert_eq!(destination, &source[..length]);
+            writeln!(output, "{{\"kind\":\"sample\",\"round\":{round},\"bytes\":{length},\"chunked_8k\":{chunked},\"ns_per_op\":{ns}}}").unwrap();
+        }
+    }
+}

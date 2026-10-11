@@ -1,0 +1,50 @@
+{
+  "remote_archive": {
+    "file": "pipeline-evidence.tar.gz",
+    "bytes": 29258850,
+    "sha256": "75ed6c620cde0ec578a5f976e8761ffe959b4035b2a273908a0cc5da810052a8",
+    "audit": {
+      "scope": "Original synthetic pipeline; full-suite process pairing, separate from font timings",
+      "source_fingerprints": {
+        "control": "000722df3bbb63d698a47d3963f601a7f31f3c1bcda93822898c493d75219692",
+        "current": "cd4c6f1aa4ce74ef65b2564edc1c215a91689d185664385e0a581731ebbcc912"
+      },
+      "old_checkout_unchanged": "77732617a558e6d85c375cc6624d4d1c49ebe648",
+      "executable_sha256": {
+        "control/stages": "d5fa4c9e993cd62fd88fff04df5c2ec27f63c00024e0f458b542eb1309c4e43c",
+        "control/fonts": "ee5ad94752d7a708e95cea51ea7a48198c1913c709ee5e239a1fff5eb5e087ba",
+        "control/font_diagnostics": "6424067450db49544db7204bfc73fdb2bf67531668315db920e28e1d72856322",
+        "current/stages": "9ccc340143f336db8febd69d355d01211c9ed0a1d709c5f33aad9e9ebdb138c6",
+        "current/fonts": "233bfa0007bd89d543a1c260210928857cf041e93a0d08b1840776f63393b3aa",
+        "current/font_diagnostics": "8a33e0ed72b2da4e3ea0a73c99745b0b85c6964bc020927d793a5c4d50c39009"
+      },
+      "complete_processes": 84,
+      "raw_sample_files": 5712,
+      "raw_samples": 57120,
+      "comparison_case_pairs": 2835,
+      "calibration_pairs": 21,
+      "case_counts": {
+        "pass": 131,
+        "inconclusive": 4,
+        "regression": 0
+      },
+      "paired_report_sha256": "fa852e98c1c0eb72d16220c4451b872aeeb95bd437a0deef83b6deac1b4d0756"
+    }
+  },
+  "independent_local_audit": {
+    "archive_sha256": "75ed6c620cde0ec578a5f976e8761ffe959b4035b2a273908a0cc5da810052a8",
+    "verified_sample_files": 5712,
+    "verified_raw_samples": 57120,
+    "verified_complete_processes": 84,
+    "all_raw_medians_and_ratios_recomputed": true,
+    "all_bootstrap_verdicts_recomputed": true,
+    "actual_cli_sample_and_warmup_counts_verified": true,
+    "AB_BA_order_verified": true,
+    "complete_case_inventory_verified": true,
+    "case_counts": {
+      "pass": 131,
+      "inconclusive": 4,
+      "regression": 0
+    }
+  }
+}

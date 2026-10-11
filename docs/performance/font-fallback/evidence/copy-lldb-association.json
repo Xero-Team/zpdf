@@ -1,0 +1,341 @@
+{
+  "scope": "Diagnostic layout association under debugger; all raw samples retained, first sample interrupted; no acceptance claim",
+  "records": [
+    {
+      "run": 0,
+      "side": 0,
+      "registers": {
+        "x0": 38768271360,
+        "x1": 38768246784,
+        "x2": 21088,
+        "sp": 6158316512,
+        "pc": 4308692060
+      },
+      "gap": 24576,
+      "raw_ns_per_iteration": [
+        366.21644017235667,
+        243.53430560159097,
+        246.77827496040953,
+        232.73728041100432,
+        228.63725555187273,
+        251.0223732184289,
+        266.40439099073507,
+        365.9442533974146,
+        468.5764740544323,
+        472.4052093691305
+      ],
+      "diagnostic_median_without_interrupted_first_sample": 251.0223732184289,
+      "excluded_from_acceptance": true,
+      "log": "target/font-copy-lldb-association/0-0.log",
+      "sample": "target/font-copy-lldb-association/0/0/font_diagnostics/copy_heap/new/sample.json"
+    },
+    {
+      "run": 0,
+      "side": 1,
+      "registers": {
+        "x0": 50986549248,
+        "x1": 50981945344,
+        "x2": 21088,
+        "sp": 6097892320,
+        "pc": 4369116252
+      },
+      "gap": 4603904,
+      "raw_ns_per_iteration": [
+        445.1951016221068,
+        296.8866769250497,
+        295.04248680301765,
+        293.2555138808745,
+        299.10131435532475,
+        339.2319035711996,
+        375.2427206697259,
+        431.3165833173046,
+        348.82242311555643,
+        296.9900750144258
+      ],
+      "diagnostic_median_without_interrupted_first_sample": 299.10131435532475,
+      "excluded_from_acceptance": true,
+      "log": "target/font-copy-lldb-association/0-1.log",
+      "sample": "target/font-copy-lldb-association/0/1/font_diagnostics/copy_heap/new/sample.json"
+    },
+    {
+      "run": 1,
+      "side": 1,
+      "registers": {
+        "x0": 38437158912,
+        "x1": 38437027840,
+        "x2": 21088,
+        "sp": 6099088352,
+        "pc": 4367920220
+      },
+      "gap": 131072,
+      "raw_ns_per_iteration": [
+        497.1935580975316,
+        290.6099488260084,
+        290.3434176199077,
+        290.05728853100544,
+        288.6564268512944,
+        325.9995484647803,
+        399.50430033542614,
+        620.9506885912101,
+        654.3982122550003,
+        649.941044551475
+      ],
+      "diagnostic_median_without_interrupted_first_sample": 325.9995484647803,
+      "excluded_from_acceptance": true,
+      "log": "target/font-copy-lldb-association/1-1.log",
+      "sample": "target/font-copy-lldb-association/1/1/font_diagnostics/copy_heap/new/sample.json"
+    },
+    {
+      "run": 1,
+      "side": 0,
+      "registers": {
+        "x0": 49102880768,
+        "x1": 49107402752,
+        "x2": 21088,
+        "sp": 6128858080,
+        "pc": 4338150492
+      },
+      "gap": -4521984,
+      "raw_ns_per_iteration": [
+        439.7218316931111,
+        294.0419428265381,
+        294.65791881457676,
+        293.77692977170784,
+        310.9755372564772,
+        342.01238535181096,
+        518.7318547422987,
+        678.1743740376247,
+        677.4933089345622,
+        677.6402557407779
+      ],
+      "diagnostic_median_without_interrupted_first_sample": 342.01238535181096,
+      "excluded_from_acceptance": true,
+      "log": "target/font-copy-lldb-association/1-0.log",
+      "sample": "target/font-copy-lldb-association/1/0/font_diagnostics/copy_heap/new/sample.json"
+    },
+    {
+      "run": 2,
+      "side": 0,
+      "registers": {
+        "x0": 31184945152,
+        "x1": 31189172224,
+        "x2": 21088,
+        "sp": 6161265632,
+        "pc": 4305742940
+      },
+      "gap": -4227072,
+      "raw_ns_per_iteration": [
+        471.2457948996202,
+        296.2205642973413,
+        296.4412836214247,
+        294.58553600496083,
+        293.76274707387023,
+        323.28404774823656,
+        371.6397067779906,
+        637.5781625455392,
+        487.6330258636281,
+        293.8150763506705
+      ],
+      "diagnostic_median_without_interrupted_first_sample": 296.4412836214247,
+      "excluded_from_acceptance": true,
+      "log": "target/font-copy-lldb-association/2-0.log",
+      "sample": "target/font-copy-lldb-association/2/0/font_diagnostics/copy_heap/new/sample.json"
+    },
+    {
+      "run": 2,
+      "side": 1,
+      "registers": {
+        "x0": 33001095168,
+        "x1": 33000964096,
+        "x2": 21088,
+        "sp": 6124975072,
+        "pc": 4342033500
+      },
+      "gap": 131072,
+      "raw_ns_per_iteration": [
+        448.49101837778085,
+        295.98618211966283,
+        297.3262401547603,
+        294.7929736078486,
+        297.97279259361613,
+        338.64170236285753,
+        471.61371128526025,
+        367.6398196766616,
+        394.5951591359219,
+        678.0787964626227
+      ],
+      "diagnostic_median_without_interrupted_first_sample": 338.64170236285753,
+      "excluded_from_acceptance": true,
+      "log": "target/font-copy-lldb-association/2-1.log",
+      "sample": "target/font-copy-lldb-association/2/1/font_diagnostics/copy_heap/new/sample.json"
+    },
+    {
+      "run": 3,
+      "side": 1,
+      "registers": {
+        "x0": 54107111424,
+        "x1": 54102507520,
+        "x2": 21088,
+        "sp": 6163362784,
+        "pc": 4303645788
+      },
+      "gap": 4603904,
+      "raw_ns_per_iteration": [
+        567.1564976533047,
+        292.309417557898,
+        291.93275371239514,
+        289.7840078479649,
+        288.6499499884589,
+        324.26499705060144,
+        389.32518493278667,
+        545.4836500730938,
+        293.3280158669095,
+        325.102585211972
+      ],
+      "diagnostic_median_without_interrupted_first_sample": 293.3280158669095,
+      "excluded_from_acceptance": true,
+      "log": "target/font-copy-lldb-association/3-1.log",
+      "sample": "target/font-copy-lldb-association/3/1/font_diagnostics/copy_heap/new/sample.json"
+    },
+    {
+      "run": 3,
+      "side": 0,
+      "registers": {
+        "x0": 42664943616,
+        "x1": 42664919040,
+        "x2": 21088,
+        "sp": 6169654240,
+        "pc": 4297354332
+      },
+      "gap": 24576,
+      "raw_ns_per_iteration": [
+        340.06564311452297,
+        220.1300590109144,
+        228.04353578080665,
+        251.0999268891326,
+        223.38982714502063,
+        233.28749107873344,
+        251.48708996366838,
+        408.4430518564938,
+        427.4964518019508,
+        399.60942085748604
+      ],
+      "diagnostic_median_without_interrupted_first_sample": 251.0999268891326,
+      "excluded_from_acceptance": true,
+      "log": "target/font-copy-lldb-association/3-0.log",
+      "sample": "target/font-copy-lldb-association/3/0/font_diagnostics/copy_heap/new/sample.json"
+    },
+    {
+      "run": 4,
+      "side": 0,
+      "registers": {
+        "x0": 37627265024,
+        "x1": 37631787008,
+        "x2": 21088,
+        "sp": 6123434976,
+        "pc": 4343573596
+      },
+      "gap": -4521984,
+      "raw_ns_per_iteration": [
+        516.5381575889053,
+        292.70454017199967,
+        294.1373414942796,
+        294.554311613853,
+        294.8819710234756,
+        329.40727253944885,
+        350.90361819167896,
+        295.6454540172,
+        309.7231906889457,
+        405.31849384055164
+      ],
+      "diagnostic_median_without_interrupted_first_sample": 295.6454540172,
+      "excluded_from_acceptance": true,
+      "log": "target/font-copy-lldb-association/4-0.log",
+      "sample": "target/font-copy-lldb-association/4/0/font_diagnostics/copy_heap/new/sample.json"
+    },
+    {
+      "run": 4,
+      "side": 1,
+      "registers": {
+        "x0": 46926462976,
+        "x1": 46921859072,
+        "x2": 21088,
+        "sp": 6092239840,
+        "pc": 4374768732
+      },
+      "gap": 4603904,
+      "raw_ns_per_iteration": [
+        458.27043550456636,
+        294.24549022567743,
+        292.7998842679951,
+        293.9553551211412,
+        298.09230885349837,
+        335.5263667698191,
+        425.73698284506645,
+        432.67495660049815,
+        412.2736055551362,
+        653.8694693939166
+      ],
+      "diagnostic_median_without_interrupted_first_sample": 335.5263667698191,
+      "excluded_from_acceptance": true,
+      "log": "target/font-copy-lldb-association/4-1.log",
+      "sample": "target/font-copy-lldb-association/4/1/font_diagnostics/copy_heap/new/sample.json"
+    },
+    {
+      "run": 5,
+      "side": 1,
+      "registers": {
+        "x0": 47463055360,
+        "x1": 47462924288,
+        "x2": 21088,
+        "sp": 6136050656,
+        "pc": 4330957916
+      },
+      "gap": 131072,
+      "raw_ns_per_iteration": [
+        490.63531403940885,
+        293.0906326970443,
+        294.89301108374383,
+        293.87636622536945,
+        293.95397167487687,
+        329.7504618226601,
+        345.5908691062632,
+        486.4860779710591,
+        597.9530822386425,
+        644.0739147167487
+      ],
+      "diagnostic_median_without_interrupted_first_sample": 329.7504618226601,
+      "excluded_from_acceptance": true,
+      "log": "target/font-copy-lldb-association/5-1.log",
+      "sample": "target/font-copy-lldb-association/5/1/font_diagnostics/copy_heap/new/sample.json"
+    },
+    {
+      "run": 5,
+      "side": 0,
+      "registers": {
+        "x0": 45814546432,
+        "x1": 45819035648,
+        "x2": 21088,
+        "sp": 6130873312,
+        "pc": 4336135260
+      },
+      "gap": -4489216,
+      "raw_ns_per_iteration": [
+        438.65151615685755,
+        292.4629088978833,
+        292.00579479353286,
+        293.1222878375688,
+        306.9283259239599,
+        339.5958131510849,
+        470.2606045669545,
+        675.7116979629752,
+        675.8893681020945,
+        675.1832990511579
+      ],
+      "diagnostic_median_without_interrupted_first_sample": 339.5958131510849,
+      "excluded_from_acceptance": true,
+      "log": "target/font-copy-lldb-association/5-0.log",
+      "sample": "target/font-copy-lldb-association/5/0/font_diagnostics/copy_heap/new/sample.json"
+    }
+  ]
+}

@@ -1,0 +1,4475 @@
+{
+  "scope": "Independent copy-callsite diagnostic; not production acceptance",
+  "audit": {
+    "raw_processes": 168,
+    "raw_samples": 1680,
+    "raw_medians_and_calibrations_recomputed": true,
+    "condition_order_verified": true,
+    "source_and_original_binaries_unchanged": true,
+    "same_binary_calibration_counts": {
+      "pass": 0,
+      "inconclusive": 4,
+      "regression": 0
+    }
+  },
+  "archive": {
+    "file": "<workspace>/target/font-copy-callsite-evidence.tar.gz",
+    "bytes": 2479731,
+    "sha256": "491f1fc7853d8f3cb12dcccd68fd2f3d8650a31a4b1af5dbcabdd03833dc9382"
+  },
+  "report": {
+    "state": "completed",
+    "scope": "Copy-callsite diagnostic only; not a production comparison",
+    "source_tree_sha256": "b078a4d72637d8707f4ed0ab466be5d307a07f89b6e13892e63b2a2a581821d9",
+    "probe_sha256": "4a637b4b194ce3795dcf42998a0ad0ba630eedfcfcd4b9522fbc3e9167be85de",
+    "fixture_sha256": "6ce12a82bcc808114d5ced999698e03b2c053a55b01675181b5a671008ecfe22",
+    "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)\nbinary: rustc\ncommit-hash: 48a229ceaefd4985c50990b14116b6d856af0985\ncommit-date: 2026-09-01\nhost: aarch64-apple-darwin\nrelease: 1.98.1\nLLVM version: 22.1.8\n",
+    "platform": "Darwin <host> 25.6.0 Darwin Kernel Version 25.6.0: Sat Jul 11 15:26:12 PDT 2026; root:xnu-12377.161.13~4/RELEASE_ARM64_T8142 arm64",
+    "settings": {
+      "blocks": 21,
+      "warmup_min_s": 0.1,
+      "samples": 10,
+      "iterations": 131072,
+      "scheduler": "default",
+      "order": "rotated/reversed conditions, alternating repetition slots"
+    },
+    "binaries": {
+      "a": {
+        "path": "<workspace>/target/font-copy-callsite/probe-a",
+        "sha256": "1f1a56bc851d2f9039b1879d6098df11696f38e6df42575023cc00557ca082c2",
+        "build_argv": [
+          "rustc",
+          "--edition=2021",
+          "-C",
+          "opt-level=3",
+          "-C",
+          "debuginfo=1",
+          "<workspace>/target/font-copy-callsite/probe.rs",
+          "-o",
+          "<workspace>/target/font-copy-callsite/probe-a"
+        ],
+        "build_label": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "cdhash": "cc0d1414c5b1fde1db21e7f9f66407e979f2928a"
+      },
+      "b": {
+        "path": "<workspace>/target/font-copy-callsite/probe-b",
+        "sha256": "7571523e5bd883b97f3156f25a882e874fa1f10cd6727253566805da96dba517",
+        "build_argv": [
+          "rustc",
+          "--edition=2021",
+          "-C",
+          "opt-level=3",
+          "-C",
+          "debuginfo=1",
+          "<workspace>/target/font-copy-callsite/probe.rs",
+          "-o",
+          "<workspace>/target/font-copy-callsite/probe-b"
+        ],
+        "build_label": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "cdhash": "b32d89291f7aedb139aea26665e291396ad7f01e"
+      }
+    },
+    "records": [
+      {
+        "block": 0,
+        "variant": "a",
+        "mode": "shared",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/0/a/shared/0",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            45867333,
+            46490916,
+            49401584,
+            48995125,
+            49474708,
+            34575833,
+            37128625,
+            32903500,
+            33450625,
+            32782667
+          ]
+        },
+        "median_ns": 316.60445404052734,
+        "finished_unix": 1791554747.461766
+      },
+      {
+        "block": 0,
+        "variant": "a",
+        "mode": "shared",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/0/a/shared/1",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            29932833,
+            30414625,
+            29793708,
+            30328917,
+            37721125,
+            36683750,
+            37177750,
+            35905500,
+            35660583,
+            38337000
+          ]
+        },
+        "median_ns": 273.0029411315918,
+        "finished_unix": 1791554747.908175
+      },
+      {
+        "block": 0,
+        "variant": "a",
+        "mode": "distinct",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/0/a/distinct/0",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            30309292,
+            47932708,
+            51682959,
+            51743459,
+            51606875,
+            58282541,
+            61178292,
+            50131875,
+            38484250,
+            40223041
+          ]
+        },
+        "median_ns": 388.10253143310547,
+        "finished_unix": 1791554748.493522
+      },
+      {
+        "block": 0,
+        "variant": "a",
+        "mode": "distinct",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/0/a/distinct/1",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            26786166,
+            38052417,
+            75223208,
+            76001917,
+            76471416,
+            76512917,
+            76403000,
+            76721666,
+            76901375,
+            76960250
+          ]
+        },
+        "median_ns": 583.1696166992188,
+        "finished_unix": 1791554749.272762
+      },
+      {
+        "block": 0,
+        "variant": "b",
+        "mode": "shared",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/0/b/shared/0",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            52132416,
+            62090416,
+            62210167,
+            58463041,
+            53603084,
+            54294000,
+            53410000,
+            49611000,
+            46439333,
+            45825333
+          ]
+        },
+        "median_ns": 408.22251892089844,
+        "finished_unix": 1791554750.248308
+      },
+      {
+        "block": 0,
+        "variant": "b",
+        "mode": "shared",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/0/b/shared/1",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            28095666,
+            27258167,
+            29564584,
+            26681291,
+            29953667,
+            28573750,
+            27665792,
+            28612167,
+            29105166,
+            30139875
+          ]
+        },
+        "median_ns": 218.1469612121582,
+        "finished_unix": 1791554750.637673
+      },
+      {
+        "block": 0,
+        "variant": "b",
+        "mode": "distinct",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/0/b/distinct/0",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            26900166,
+            26858583,
+            26765375,
+            26982458,
+            26933083,
+            26583709,
+            26920416,
+            26782042,
+            26801542,
+            27099458
+          ]
+        },
+        "median_ns": 205.0733528137207,
+        "finished_unix": 1791554751.010148
+      },
+      {
+        "block": 0,
+        "variant": "b",
+        "mode": "distinct",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/0/b/distinct/1",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            31707708,
+            39351708,
+            39589667,
+            44603250,
+            46084542,
+            72032958,
+            89330875,
+            88514042,
+            87724917,
+            87978958
+          ]
+        },
+        "median_ns": 450.58250427246094,
+        "finished_unix": 1791554751.740578
+      },
+      {
+        "block": 1,
+        "variant": "a",
+        "mode": "shared",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/1/a/shared/1",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            34966042,
+            36783584,
+            35339709,
+            32017583,
+            40463750,
+            44313458,
+            43973917,
+            44941791,
+            44979084,
+            44447458
+          ]
+        },
+        "median_ns": 322.1041374206543,
+        "finished_unix": 1791554752.247498
+      },
+      {
+        "block": 1,
+        "variant": "a",
+        "mode": "shared",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/1/a/shared/0",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            38760458,
+            46125708,
+            41131625,
+            42725125,
+            64437375,
+            63534083,
+            45294917,
+            63139292,
+            35926875,
+            33145000
+          ]
+        },
+        "median_ns": 335.76981353759766,
+        "finished_unix": 1791554752.825908
+      },
+      {
+        "block": 1,
+        "variant": "b",
+        "mode": "distinct",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/1/b/distinct/1",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            68522625,
+            87968208,
+            54007583,
+            39682375,
+            44326250,
+            43015708,
+            41638208,
+            38637750,
+            42383416,
+            65236375
+          ]
+        },
+        "median_ns": 333.1831283569336,
+        "finished_unix": 1791554753.4556642
+      },
+      {
+        "block": 1,
+        "variant": "b",
+        "mode": "distinct",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/1/b/distinct/0",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            26962334,
+            27512292,
+            27380041,
+            31948875,
+            29940667,
+            32276458,
+            40366833,
+            60404250,
+            34357625,
+            36403750
+          ]
+        },
+        "median_ns": 245.00020217895508,
+        "finished_unix": 1791554753.9079711
+      },
+      {
+        "block": 1,
+        "variant": "b",
+        "mode": "shared",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/1/b/shared/1",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            28682167,
+            26755625,
+            27526750,
+            27269500,
+            28008250,
+            26976500,
+            27517959,
+            27232583,
+            26927792,
+            29343167
+          ]
+        },
+        "median_ns": 208.9975700378418,
+        "finished_unix": 1791554754.288
+      },
+      {
+        "block": 1,
+        "variant": "b",
+        "mode": "shared",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/1/b/shared/0",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            26143750,
+            26834875,
+            28604208,
+            26401958,
+            26645625,
+            26750333,
+            27292292,
+            27272083,
+            26984000,
+            26228917
+          ]
+        },
+        "median_ns": 204.41134643554688,
+        "finished_unix": 1791554754.660762
+      },
+      {
+        "block": 1,
+        "variant": "a",
+        "mode": "distinct",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/1/a/distinct/1",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            28973541,
+            31900917,
+            32460291,
+            32808042,
+            32128708,
+            27265792,
+            27291334,
+            27515333,
+            29175208,
+            39203125
+          ]
+        },
+        "median_ns": 232.9869270324707,
+        "finished_unix": 1791554755.0733922
+      },
+      {
+        "block": 1,
+        "variant": "a",
+        "mode": "distinct",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/1/a/distinct/0",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            55018959,
+            87777500,
+            87726792,
+            87634500,
+            87646583,
+            88499958,
+            87857708,
+            87763417,
+            87772584,
+            89008459
+          ]
+        },
+        "median_ns": 669.6167030334473,
+        "finished_unix": 1791554756.0239942
+      },
+      {
+        "block": 2,
+        "variant": "b",
+        "mode": "shared",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/2/b/shared/0",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            33444958,
+            33515334,
+            36344750,
+            40765459,
+            51990541,
+            50873625,
+            49250458,
+            49421958,
+            48754625,
+            48838958
+          ]
+        },
+        "median_ns": 372.2899742126465,
+        "finished_unix": 1791554756.5723891
+      },
+      {
+        "block": 2,
+        "variant": "b",
+        "mode": "shared",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/2/b/shared/1",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            28209125,
+            27620000,
+            27561875,
+            27403541,
+            26730333,
+            28195042,
+            28801208,
+            27392125,
+            27917459,
+            27205917
+          ]
+        },
+        "median_ns": 210.50214767456055,
+        "finished_unix": 1791554756.954456
+      },
+      {
+        "block": 2,
+        "variant": "b",
+        "mode": "distinct",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/2/b/distinct/0",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            26899708,
+            26749667,
+            26987666,
+            26916375,
+            26717792,
+            26975875,
+            26712500,
+            26721834,
+            27232291,
+            28257125
+          ]
+        },
+        "median_ns": 205.29206466674805,
+        "finished_unix": 1791554757.3284311
+      },
+      {
+        "block": 2,
+        "variant": "b",
+        "mode": "distinct",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/2/b/distinct/1",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            27014667,
+            26895208,
+            26543459,
+            27014459,
+            26869959,
+            31964750,
+            30208375,
+            31710416,
+            31845208,
+            34641375
+          ]
+        },
+        "median_ns": 218.28858184814453,
+        "finished_unix": 1791554757.726578
+      },
+      {
+        "block": 2,
+        "variant": "a",
+        "mode": "shared",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/2/a/shared/0",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            30187208,
+            30177584,
+            31098750,
+            30477834,
+            30832333,
+            31326167,
+            28278375,
+            28705584,
+            30120041,
+            32104334
+          ]
+        },
+        "median_ns": 231.41876983642578,
+        "finished_unix": 1791554758.1337018
+      },
+      {
+        "block": 2,
+        "variant": "a",
+        "mode": "shared",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/2/a/shared/1",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            28239666,
+            26211792,
+            27784667,
+            28893875,
+            31899834,
+            30696625,
+            31489958,
+            29399375,
+            29494625,
+            31145625
+          ]
+        },
+        "median_ns": 224.66278076171875,
+        "finished_unix": 1791554758.5332322
+      },
+      {
+        "block": 2,
+        "variant": "a",
+        "mode": "distinct",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/2/a/distinct/0",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            27044708,
+            26804917,
+            26792875,
+            29088667,
+            28999333,
+            29345833,
+            29564083,
+            36692708,
+            43647125,
+            43613541
+          ]
+        },
+        "median_ns": 222.90992736816406,
+        "finished_unix": 1791554758.958945
+      },
+      {
+        "block": 2,
+        "variant": "a",
+        "mode": "distinct",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/2/a/distinct/1",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            27223750,
+            28509584,
+            29633833,
+            29674333,
+            29450667,
+            29672417,
+            29528958,
+            29624708,
+            29606250,
+            29440125
+          ]
+        },
+        "median_ns": 225.58291625976562,
+        "finished_unix": 1791554759.35536
+      },
+      {
+        "block": 3,
+        "variant": "b",
+        "mode": "shared",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/3/b/shared/1",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            31353000,
+            38564500,
+            42047500,
+            41249125,
+            41627958,
+            43945750,
+            45675667,
+            43649666,
+            43812708,
+            43304000
+          ]
+        },
+        "median_ns": 325.5901336669922,
+        "finished_unix": 1791554759.8751118
+      },
+      {
+        "block": 3,
+        "variant": "b",
+        "mode": "shared",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/3/b/shared/0",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            29713125,
+            30829291,
+            32840542,
+            36527416,
+            31065459,
+            30991459,
+            34485709,
+            42583375,
+            44991209,
+            43631458
+          ]
+        },
+        "median_ns": 256.8292655944824,
+        "finished_unix": 1791554760.3376691
+      },
+      {
+        "block": 3,
+        "variant": "a",
+        "mode": "distinct",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/3/a/distinct/1",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            28185417,
+            39402583,
+            44985000,
+            44964667,
+            45064958,
+            44914500,
+            46291292,
+            46818958,
+            47026667,
+            48269125
+          ]
+        },
+        "median_ns": 343.5133285522461,
+        "finished_unix": 1791554760.878093
+      },
+      {
+        "block": 3,
+        "variant": "a",
+        "mode": "distinct",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/3/a/distinct/0",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            28447875,
+            30059333,
+            30063875,
+            30020292,
+            30116208,
+            30089667,
+            30091875,
+            30318250,
+            30018875,
+            30142375
+          ]
+        },
+        "median_ns": 229.4675521850586,
+        "finished_unix": 1791554761.2814322
+      },
+      {
+        "block": 3,
+        "variant": "a",
+        "mode": "shared",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/3/a/shared/1",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            31321750,
+            33136750,
+            40933083,
+            47321000,
+            38048208,
+            36070917,
+            46710750,
+            35396500,
+            38106709,
+            43126625
+          ]
+        },
+        "median_ns": 290.5079536437988,
+        "finished_unix": 1791554761.77608
+      },
+      {
+        "block": 3,
+        "variant": "a",
+        "mode": "shared",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/3/a/shared/0",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            28497708,
+            29117583,
+            30298417,
+            28805417,
+            29235708,
+            28550667,
+            28299791,
+            31847875,
+            32080792,
+            32954416
+          ]
+        },
+        "median_ns": 222.60013961791992,
+        "finished_unix": 1791554762.1801999
+      },
+      {
+        "block": 3,
+        "variant": "b",
+        "mode": "distinct",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/3/b/distinct/1",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            26689833,
+            26662042,
+            27057917,
+            26932416,
+            26746208,
+            27121750,
+            26694375,
+            26603875,
+            27022791,
+            26941459
+          ]
+        },
+        "median_ns": 204.7677001953125,
+        "finished_unix": 1791554762.5529358
+      },
+      {
+        "block": 3,
+        "variant": "b",
+        "mode": "distinct",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/3/b/distinct/0",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            27148458,
+            26886583,
+            26630291,
+            27213417,
+            27777541,
+            26768500,
+            27202083,
+            26421042,
+            26951000,
+            66312958
+          ]
+        },
+        "median_ns": 206.37305450439453,
+        "finished_unix": 1791554762.966362
+      },
+      {
+        "block": 4,
+        "variant": "a",
+        "mode": "shared",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/4/a/shared/0",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            26074542,
+            26275250,
+            27795334,
+            26199875,
+            28317542,
+            26223416,
+            27951917,
+            30857125,
+            25798291,
+            27690292
+          ]
+        },
+        "median_ns": 205.8622055053711,
+        "finished_unix": 1791554763.343773
+      },
+      {
+        "block": 4,
+        "variant": "a",
+        "mode": "shared",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/4/a/shared/1",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            30904875,
+            29662375,
+            31584541,
+            32878375,
+            32137125,
+            31646416,
+            32679625,
+            32128291,
+            31762667,
+            33493958
+          ]
+        },
+        "median_ns": 243.72466278076172,
+        "finished_unix": 1791554763.7668622
+      },
+      {
+        "block": 4,
+        "variant": "a",
+        "mode": "distinct",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/4/a/distinct/0",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            26668416,
+            26646750,
+            27578583,
+            28685417,
+            27147708,
+            27023375,
+            27603000,
+            28919125,
+            32202583,
+            32836750
+          ]
+        },
+        "median_ns": 210.50103378295898,
+        "finished_unix": 1791554764.15581
+      },
+      {
+        "block": 4,
+        "variant": "a",
+        "mode": "distinct",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/4/a/distinct/1",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            26482208,
+            27099084,
+            26986334,
+            26468584,
+            27182375,
+            26831417,
+            26743208,
+            27039542,
+            26889042,
+            26486375
+          ]
+        },
+        "median_ns": 204.92728805541992,
+        "finished_unix": 1791554764.527905
+      },
+      {
+        "block": 4,
+        "variant": "b",
+        "mode": "shared",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/4/b/shared/0",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            29067083,
+            28329125,
+            30695125,
+            31535083,
+            29853667,
+            34253791,
+            29962417,
+            31842000,
+            32623375,
+            32575833
+          ]
+        },
+        "median_ns": 237.389404296875,
+        "finished_unix": 1791554764.942338
+      },
+      {
+        "block": 4,
+        "variant": "b",
+        "mode": "shared",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/4/b/shared/1",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            29143541,
+            26787750,
+            28901792,
+            28124084,
+            28162917,
+            29154125,
+            27624500,
+            30760833,
+            29939958,
+            31837417
+          ]
+        },
+        "median_ns": 221.42537307739258,
+        "finished_unix": 1791554765.336737
+      },
+      {
+        "block": 4,
+        "variant": "b",
+        "mode": "distinct",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/4/b/distinct/0",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            26824292,
+            26721250,
+            26704709,
+            26647500,
+            26880916,
+            26755750,
+            26633041,
+            26919833,
+            28278542,
+            26876583
+          ]
+        },
+        "median_ns": 204.39163970947266,
+        "finished_unix": 1791554765.709856
+      },
+      {
+        "block": 4,
+        "variant": "b",
+        "mode": "distinct",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/4/b/distinct/1",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            28430958,
+            29302666,
+            29454208,
+            29487208,
+            29402542,
+            29412959,
+            29980750,
+            41461625,
+            57861125,
+            37853709
+          ]
+        },
+        "median_ns": 224.84365844726562,
+        "finished_unix": 1791554766.155218
+      },
+      {
+        "block": 5,
+        "variant": "a",
+        "mode": "shared",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/5/a/shared/1",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            27549667,
+            30316125,
+            33832541,
+            30259334,
+            31619250,
+            31921667,
+            37901500,
+            39989583,
+            41316000,
+            42229667
+          ]
+        },
+        "median_ns": 250.8323974609375,
+        "finished_unix": 1791554766.60597
+      },
+      {
+        "block": 5,
+        "variant": "a",
+        "mode": "shared",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/5/a/shared/0",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            28514584,
+            29534167,
+            31007583,
+            32926583,
+            32388084,
+            32247125,
+            35868958,
+            41730167,
+            40777583,
+            41636292
+          ]
+        },
+        "median_ns": 249.15568161010742,
+        "finished_unix": 1791554767.0577579
+      },
+      {
+        "block": 5,
+        "variant": "b",
+        "mode": "distinct",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/5/b/distinct/1",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            26937708,
+            29118917,
+            30878625,
+            31406083,
+            31328875,
+            31183458,
+            31513167,
+            31271625,
+            31390000,
+            31358292
+          ]
+        },
+        "median_ns": 238.8019561767578,
+        "finished_unix": 1791554767.468695
+      },
+      {
+        "block": 5,
+        "variant": "b",
+        "mode": "distinct",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/5/b/distinct/0",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            30186917,
+            33631708,
+            34801500,
+            39518250,
+            65317250,
+            74796875,
+            74740167,
+            74804750,
+            74819750,
+            74920250
+          ]
+        },
+        "median_ns": 534.2766456604004,
+        "finished_unix": 1791554768.150383
+      },
+      {
+        "block": 5,
+        "variant": "b",
+        "mode": "shared",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/5/b/shared/1",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            27803708,
+            26418042,
+            27222041,
+            27443167,
+            27330292,
+            28418292,
+            26718417,
+            30718834,
+            27097458,
+            26454667
+          ]
+        },
+        "median_ns": 208.10063552856445,
+        "finished_unix": 1791554768.530578
+      },
+      {
+        "block": 5,
+        "variant": "b",
+        "mode": "shared",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/5/b/shared/0",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            26428292,
+            26627333,
+            29650417,
+            26997666,
+            30207542,
+            26559375,
+            28330333,
+            27964750,
+            29267459,
+            28968750
+          ]
+        },
+        "median_ns": 214.74869918823242,
+        "finished_unix": 1791554768.915701
+      },
+      {
+        "block": 5,
+        "variant": "a",
+        "mode": "distinct",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/5/a/distinct/1",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            26592500,
+            27022417,
+            26869625,
+            26593709,
+            27057916,
+            30331417,
+            29276541,
+            31125542,
+            38812041,
+            59202583
+          ]
+        },
+        "median_ns": 214.89889907836914,
+        "finished_unix": 1791554769.342432
+      },
+      {
+        "block": 5,
+        "variant": "a",
+        "mode": "distinct",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/5/a/distinct/0",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            26835583,
+            26979125,
+            26895542,
+            26809375,
+            26981875,
+            26861167,
+            26804500,
+            27597791,
+            27014125,
+            27194792
+          ]
+        },
+        "median_ns": 205.51554489135742,
+        "finished_unix": 1791554769.7165718
+      },
+      {
+        "block": 6,
+        "variant": "b",
+        "mode": "shared",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/6/b/shared/0",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            30999041,
+            29847542,
+            29103084,
+            31790916,
+            29409542,
+            29748625,
+            30557166,
+            30587292,
+            30512291,
+            32721209
+          ]
+        },
+        "median_ns": 232.96149063110352,
+        "finished_unix": 1791554770.12571
+      },
+      {
+        "block": 6,
+        "variant": "b",
+        "mode": "shared",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/6/b/shared/1",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            28357500,
+            28706250,
+            34156750,
+            30971000,
+            28775500,
+            28379459,
+            28433208,
+            33426416,
+            33848667,
+            32661584
+          ]
+        },
+        "median_ns": 227.91481018066406,
+        "finished_unix": 1791554770.537934
+      },
+      {
+        "block": 6,
+        "variant": "b",
+        "mode": "distinct",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/6/b/distinct/0",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            27177833,
+            32484625,
+            34968750,
+            57398334,
+            66956333,
+            66982791,
+            67466708,
+            67598375,
+            67825042,
+            68290084
+          ]
+        },
+        "median_ns": 510.9372100830078,
+        "finished_unix": 1791554771.1994371
+      },
+      {
+        "block": 6,
+        "variant": "b",
+        "mode": "distinct",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/6/b/distinct/1",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            26776375,
+            26991291,
+            27095500,
+            26489458,
+            26922334,
+            26883792,
+            26686541,
+            26790667,
+            29897542,
+            30034292
+          ]
+        },
+        "median_ns": 205.25408172607422,
+        "finished_unix": 1791554771.5780952
+      },
+      {
+        "block": 6,
+        "variant": "a",
+        "mode": "shared",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/6/a/shared/0",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            30088833,
+            26972042,
+            26800333,
+            28349333,
+            29415750,
+            29112125,
+            27283875,
+            27314417,
+            27513500,
+            29841750
+          ]
+        },
+        "median_ns": 213.09979629516602,
+        "finished_unix": 1791554771.9666371
+      },
+      {
+        "block": 6,
+        "variant": "a",
+        "mode": "shared",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/6/a/shared/1",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            27158792,
+            26347500,
+            27143459,
+            26757083,
+            29002750,
+            31270750,
+            31332166,
+            33899125,
+            30398709,
+            27904125
+          ]
+        },
+        "median_ns": 217.08250045776367,
+        "finished_unix": 1791554772.367816
+      },
+      {
+        "block": 6,
+        "variant": "a",
+        "mode": "distinct",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/6/a/distinct/0",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            35450250,
+            38339583,
+            47598458,
+            37497500,
+            41211791,
+            65668459,
+            85678584,
+            86223500,
+            87306292,
+            87659500
+          ]
+        },
+        "median_ns": 432.0789985656738,
+        "finished_unix": 1791554773.084697
+      },
+      {
+        "block": 6,
+        "variant": "a",
+        "mode": "distinct",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/6/a/distinct/1",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            26888792,
+            27071042,
+            26801709,
+            26913250,
+            27086084,
+            33622333,
+            39082291,
+            38855792,
+            44529125,
+            75834583
+          ]
+        },
+        "median_ns": 231.58423233032227,
+        "finished_unix": 1791554773.55648
+      },
+      {
+        "block": 7,
+        "variant": "b",
+        "mode": "shared",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/7/b/shared/1",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            28420166,
+            29167000,
+            31867166,
+            30818125,
+            35465916,
+            33294834,
+            35200625,
+            36625583,
+            36558875,
+            35110042
+          ]
+        },
+        "median_ns": 260.9438934326172,
+        "finished_unix": 1791554773.993709
+      },
+      {
+        "block": 7,
+        "variant": "b",
+        "mode": "shared",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/7/b/shared/0",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            30668125,
+            29610666,
+            29153500,
+            32740750,
+            32088750,
+            33152000,
+            31713833,
+            33698916,
+            33203292,
+            32439125
+          ]
+        },
+        "median_ns": 246.1543083190918,
+        "finished_unix": 1791554774.41678
+      },
+      {
+        "block": 7,
+        "variant": "a",
+        "mode": "distinct",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/7/a/distinct/1",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            30382917,
+            31833083,
+            31354708,
+            31789042,
+            31354500,
+            51361208,
+            89035792,
+            89126000,
+            88918459,
+            89080042
+          ]
+        },
+        "median_ns": 317.36103439331055,
+        "finished_unix": 1791554775.085324
+      },
+      {
+        "block": 7,
+        "variant": "a",
+        "mode": "distinct",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/7/a/distinct/0",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            44765208,
+            78666542,
+            84624500,
+            54358084,
+            38958417,
+            49066667,
+            76409583,
+            67114541,
+            87072834,
+            87280375
+          ]
+        },
+        "median_ns": 547.5010833740234,
+        "finished_unix": 1791554775.8582451
+      },
+      {
+        "block": 7,
+        "variant": "a",
+        "mode": "shared",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/7/a/shared/1",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            26615500,
+            30050042,
+            33306833,
+            32795625,
+            34695916,
+            34426000,
+            41423458,
+            46211083,
+            45800042,
+            42205333
+          ]
+        },
+        "median_ns": 263.67918395996094,
+        "finished_unix": 1791554776.330212
+      },
+      {
+        "block": 7,
+        "variant": "a",
+        "mode": "shared",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/7/a/shared/0",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            28923208,
+            31456375,
+            32815041,
+            32194750,
+            30204833,
+            30293833,
+            29753042,
+            30647792,
+            30690125,
+            31055208
+          ]
+        },
+        "median_ns": 233.9855842590332,
+        "finished_unix": 1791554776.7423449
+      },
+      {
+        "block": 7,
+        "variant": "b",
+        "mode": "distinct",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/7/b/distinct/1",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            27490083,
+            26982209,
+            26874083,
+            26985125,
+            29814916,
+            38442625,
+            39321292,
+            39773250,
+            39766042,
+            40030167
+          ]
+        },
+        "median_ns": 260.3818550109863,
+        "finished_unix": 1791554777.182208
+      },
+      {
+        "block": 7,
+        "variant": "b",
+        "mode": "distinct",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/7/b/distinct/0",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            28442875,
+            30118416,
+            30366000,
+            30373417,
+            30287083,
+            30481250,
+            30268834,
+            30363209,
+            30456958,
+            30393625
+          ]
+        },
+        "median_ns": 231.66354751586914,
+        "finished_unix": 1791554777.5873852
+      },
+      {
+        "block": 8,
+        "variant": "a",
+        "mode": "shared",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/8/a/shared/0",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            29988083,
+            29130166,
+            31422709,
+            35046458,
+            36927667,
+            35122792,
+            34783541,
+            35720875,
+            34923333,
+            34928375
+          ]
+        },
+        "median_ns": 266.46311950683594,
+        "finished_unix": 1791554778.0303519
+      },
+      {
+        "block": 8,
+        "variant": "a",
+        "mode": "shared",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/8/a/shared/1",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            29588250,
+            29630917,
+            30127833,
+            29166583,
+            30523250,
+            32013875,
+            33378875,
+            29868709,
+            28751042,
+            30538208
+          ]
+        },
+        "median_ns": 228.86864471435547,
+        "finished_unix": 1791554778.4383712
+      },
+      {
+        "block": 8,
+        "variant": "a",
+        "mode": "distinct",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/8/a/distinct/0",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            29080250,
+            33482167,
+            34488583,
+            41214625,
+            69764500,
+            73739375,
+            73781541,
+            73749958,
+            73960667,
+            76743375
+          ]
+        },
+        "median_ns": 547.4238395690918,
+        "finished_unix": 1791554779.122592
+      },
+      {
+        "block": 8,
+        "variant": "a",
+        "mode": "distinct",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/8/a/distinct/1",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            28039875,
+            29313417,
+            29624042,
+            29665500,
+            29434291,
+            29325542,
+            29342334,
+            29484375,
+            27047917,
+            26938209
+          ]
+        },
+        "median_ns": 223.80018615722656,
+        "finished_unix": 1791554779.514915
+      },
+      {
+        "block": 8,
+        "variant": "b",
+        "mode": "shared",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/8/b/shared/0",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            26443916,
+            29507875,
+            29988083,
+            27961292,
+            28036833,
+            29246250,
+            32840417,
+            34104000,
+            35567375,
+            38027917
+          ]
+        },
+        "median_ns": 226.95906829833984,
+        "finished_unix": 1791554779.930169
+      },
+      {
+        "block": 8,
+        "variant": "b",
+        "mode": "shared",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/8/b/shared/1",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            31836250,
+            30912125,
+            31603792,
+            32374333,
+            34335542,
+            35298958,
+            33584250,
+            34431583,
+            32539750,
+            33711291
+          ]
+        },
+        "median_ns": 252.2430419921875,
+        "finished_unix": 1791554780.365101
+      },
+      {
+        "block": 8,
+        "variant": "b",
+        "mode": "distinct",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/8/b/distinct/0",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            48355167,
+            40963042,
+            40490833,
+            56045625,
+            88091375,
+            88599584,
+            89005625,
+            89063792,
+            88954083,
+            89042292
+          ]
+        },
+        "median_ns": 674.022518157959,
+        "finished_unix": 1791554781.1886468
+      },
+      {
+        "block": 8,
+        "variant": "b",
+        "mode": "distinct",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/8/b/distinct/1",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            26829209,
+            27718959,
+            27025084,
+            27119250,
+            26933625,
+            26977458,
+            27718042,
+            29442208,
+            29670083,
+            29542167
+          ]
+        },
+        "median_ns": 209.1876678466797,
+        "finished_unix": 1791554781.572094
+      },
+      {
+        "block": 9,
+        "variant": "a",
+        "mode": "shared",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/9/a/shared/1",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            29232042,
+            30191041,
+            31312833,
+            30816209,
+            31169416,
+            32232625,
+            30528917,
+            31905417,
+            31676292,
+            33273166
+          ]
+        },
+        "median_ns": 238.3508644104004,
+        "finished_unix": 1791554781.9887428
+      },
+      {
+        "block": 9,
+        "variant": "a",
+        "mode": "shared",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/9/a/shared/0",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            28191917,
+            28723250,
+            27106292,
+            30090958,
+            27298875,
+            28367500,
+            29149125,
+            29613542,
+            35535833,
+            34767250
+          ]
+        },
+        "median_ns": 220.7655906677246,
+        "finished_unix": 1791554782.3919418
+      },
+      {
+        "block": 9,
+        "variant": "b",
+        "mode": "distinct",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/9/b/distinct/1",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            27071708,
+            26630375,
+            26987958,
+            26927583,
+            26728250,
+            26937084,
+            27038458,
+            26630791,
+            27037000,
+            27054459
+          ]
+        },
+        "median_ns": 205.70771026611328,
+        "finished_unix": 1791554782.7653172
+      },
+      {
+        "block": 9,
+        "variant": "b",
+        "mode": "distinct",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/9/b/distinct/0",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            26520834,
+            27202750,
+            26920875,
+            26445709,
+            27298750,
+            26894834,
+            26446167,
+            27224458,
+            26887167,
+            26516708
+          ]
+        },
+        "median_ns": 205.16205215454102,
+        "finished_unix": 1791554783.138102
+      },
+      {
+        "block": 9,
+        "variant": "b",
+        "mode": "shared",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/9/b/shared/1",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            28757209,
+            28784708,
+            28645125,
+            27286667,
+            27537167,
+            30595416,
+            28625167,
+            28611958,
+            27792583,
+            29386458
+          ]
+        },
+        "median_ns": 218.4688262939453,
+        "finished_unix": 1791554783.528626
+      },
+      {
+        "block": 9,
+        "variant": "b",
+        "mode": "shared",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/9/b/shared/0",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            28454500,
+            27263667,
+            28396833,
+            30575542,
+            31001708,
+            28325541,
+            28334833,
+            27679042,
+            30039250,
+            29745000
+          ]
+        },
+        "median_ns": 216.87062454223633,
+        "finished_unix": 1791554783.922109
+      },
+      {
+        "block": 9,
+        "variant": "a",
+        "mode": "distinct",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/9/a/distinct/1",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            27146250,
+            29030792,
+            30163375,
+            32312625,
+            31957125,
+            32398791,
+            32322792,
+            32349708,
+            36922167,
+            38773416
+          ]
+        },
+        "median_ns": 246.56454849243164,
+        "finished_unix": 1791554784.3497531
+      },
+      {
+        "block": 9,
+        "variant": "a",
+        "mode": "distinct",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/9/a/distinct/0",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            26916333,
+            25884291,
+            27126792,
+            32827750,
+            34515625,
+            38948833,
+            56597833,
+            72777292,
+            76017209,
+            76000541
+          ]
+        },
+        "median_ns": 280.24466705322266,
+        "finished_unix": 1791554784.921576
+      },
+      {
+        "block": 10,
+        "variant": "b",
+        "mode": "shared",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/10/b/shared/0",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            26944667,
+            28611292,
+            26787958,
+            26015083,
+            26575959,
+            26568084,
+            25887916,
+            26665459,
+            26291541,
+            30834875
+          ]
+        },
+        "median_ns": 203.09989166259766,
+        "finished_unix": 1791554785.296988
+      },
+      {
+        "block": 10,
+        "variant": "b",
+        "mode": "shared",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/10/b/shared/1",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            31272500,
+            30768916,
+            30167459,
+            28930083,
+            29267875,
+            33238416,
+            40576250,
+            40510083,
+            31850291,
+            33774000
+          ]
+        },
+        "median_ns": 240.79433822631836,
+        "finished_unix": 1791554785.731356
+      },
+      {
+        "block": 10,
+        "variant": "b",
+        "mode": "distinct",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/10/b/distinct/0",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            26695208,
+            28306375,
+            28402583,
+            33347375,
+            33486958,
+            35170250,
+            40599375,
+            63127791,
+            37865583,
+            40744375
+          ]
+        },
+        "median_ns": 261.9064636230469,
+        "finished_unix": 1791554786.2032719
+      },
+      {
+        "block": 10,
+        "variant": "b",
+        "mode": "distinct",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/10/b/distinct/1",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            26924750,
+            27004291,
+            26813875,
+            26902292,
+            26997000,
+            26774333,
+            27041041,
+            27632958,
+            28759500,
+            29273791
+          ]
+        },
+        "median_ns": 205.99857711791992,
+        "finished_unix": 1791554786.581334
+      },
+      {
+        "block": 10,
+        "variant": "a",
+        "mode": "shared",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/10/a/shared/0",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            28078875,
+            27701333,
+            26633208,
+            26671125,
+            26467166,
+            27128833,
+            26983250,
+            27261708,
+            27856375,
+            27362667
+          ]
+        },
+        "median_ns": 207.48344802856445,
+        "finished_unix": 1791554786.9575198
+      },
+      {
+        "block": 10,
+        "variant": "a",
+        "mode": "shared",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/10/a/shared/1",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            29154958,
+            32267792,
+            34483416,
+            31679833,
+            31680500,
+            29381375,
+            29803583,
+            32492625,
+            33015125,
+            35244792
+          ]
+        },
+        "median_ns": 243.94337463378906,
+        "finished_unix": 1791554787.381577
+      },
+      {
+        "block": 10,
+        "variant": "a",
+        "mode": "distinct",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/10/a/distinct/0",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            26883958,
+            27031083,
+            26492542,
+            26822333,
+            27064833,
+            26701084,
+            26894250,
+            27015417,
+            26595208,
+            26947667
+          ]
+        },
+        "median_ns": 205.1475830078125,
+        "finished_unix": 1791554787.754507
+      },
+      {
+        "block": 10,
+        "variant": "a",
+        "mode": "distinct",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/10/a/distinct/1",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            26553292,
+            27459083,
+            29689916,
+            32246625,
+            33421166,
+            33095375,
+            33771417,
+            33668167,
+            33815583,
+            33832125
+          ]
+        },
+        "median_ns": 253.7404670715332,
+        "finished_unix": 1791554788.1760619
+      },
+      {
+        "block": 11,
+        "variant": "b",
+        "mode": "shared",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/11/b/shared/1",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            37194333,
+            53388500,
+            40202708,
+            31253292,
+            33140209,
+            41627375,
+            55220042,
+            55108167,
+            52804291,
+            52491125
+          ]
+        },
+        "median_ns": 359.03358459472656,
+        "finished_unix": 1791554788.733558
+      },
+      {
+        "block": 11,
+        "variant": "b",
+        "mode": "shared",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/11/b/shared/0",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            27662708,
+            28740416,
+            31666417,
+            30413708,
+            30849917,
+            30682375,
+            29996750,
+            30011250,
+            31025083,
+            29797375
+          ]
+        },
+        "median_ns": 230.50292205810547,
+        "finished_unix": 1791554789.1390169
+      },
+      {
+        "block": 11,
+        "variant": "a",
+        "mode": "distinct",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/11/a/distinct/1",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            25209958,
+            26595500,
+            26930167,
+            26935709,
+            26598084,
+            26900209,
+            26921083,
+            26523000,
+            26912041,
+            26930417
+          ]
+        },
+        "median_ns": 205.2774429321289,
+        "finished_unix": 1791554789.510101
+      },
+      {
+        "block": 11,
+        "variant": "a",
+        "mode": "distinct",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/11/a/distinct/0",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            29935750,
+            34541000,
+            31039209,
+            32401334,
+            34147417,
+            35581000,
+            42502166,
+            69318708,
+            73126875,
+            72936125
+          ]
+        },
+        "median_ns": 267.49420166015625,
+        "finished_unix": 1791554790.070432
+      },
+      {
+        "block": 11,
+        "variant": "a",
+        "mode": "shared",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/11/a/shared/1",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            30748583,
+            34671042,
+            35380084,
+            35747583,
+            35901250,
+            36340083,
+            36048459,
+            35130584,
+            35932167,
+            35796208
+          ]
+        },
+        "median_ns": 272.9179039001465,
+        "finished_unix": 1791554790.526697
+      },
+      {
+        "block": 11,
+        "variant": "a",
+        "mode": "shared",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/11/a/shared/0",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            27071167,
+            29050250,
+            27844666,
+            28276542,
+            26221166,
+            28403417,
+            30593333,
+            28574833,
+            28289125,
+            29615625
+          ]
+        },
+        "median_ns": 216.26488494873047,
+        "finished_unix": 1791554790.915054
+      },
+      {
+        "block": 11,
+        "variant": "b",
+        "mode": "distinct",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/11/b/distinct/1",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            37573166,
+            38869792,
+            29216916,
+            29486167,
+            33143541,
+            31141084,
+            29605625,
+            32992541,
+            49001208,
+            61608500
+          ]
+        },
+        "median_ns": 252.28913116455078,
+        "finished_unix": 1791554791.392572
+      },
+      {
+        "block": 11,
+        "variant": "b",
+        "mode": "distinct",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/11/b/distinct/0",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            26824500,
+            26720459,
+            26632417,
+            26862500,
+            26680750,
+            26642917,
+            27730042,
+            28458667,
+            28304417,
+            28421916
+          ]
+        },
+        "median_ns": 204.79965209960938,
+        "finished_unix": 1791554791.770637
+      },
+      {
+        "block": 12,
+        "variant": "a",
+        "mode": "shared",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/12/a/shared/0",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            28489208,
+            33711250,
+            35375708,
+            34687583,
+            35460625,
+            33760250,
+            34536292,
+            34647000,
+            34084042,
+            34546166
+          ]
+        },
+        "median_ns": 263.5286636352539,
+        "finished_unix": 1791554792.215534
+      },
+      {
+        "block": 12,
+        "variant": "a",
+        "mode": "shared",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/12/a/shared/1",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            27761667,
+            27015583,
+            29505167,
+            29611875,
+            27548833,
+            30353708,
+            29355167,
+            32741042,
+            31910375,
+            32456958
+          ]
+        },
+        "median_ns": 225.51361846923828,
+        "finished_unix": 1791554792.61886
+      },
+      {
+        "block": 12,
+        "variant": "a",
+        "mode": "distinct",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/12/a/distinct/0",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            26775500,
+            27074041,
+            26934250,
+            26800250,
+            27120834,
+            26818000,
+            26718875,
+            27008667,
+            27002625,
+            26709958
+          ]
+        },
+        "median_ns": 205.0485610961914,
+        "finished_unix": 1791554792.991852
+      },
+      {
+        "block": 12,
+        "variant": "a",
+        "mode": "distinct",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/12/a/distinct/1",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            29887667,
+            33209000,
+            34811375,
+            34526708,
+            34508375,
+            34587750,
+            34393292,
+            34315625,
+            34484750,
+            34464792
+          ]
+        },
+        "median_ns": 263.0216293334961,
+        "finished_unix": 1791554793.436244
+      },
+      {
+        "block": 12,
+        "variant": "b",
+        "mode": "shared",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/12/b/shared/0",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            27111125,
+            27735875,
+            26840084,
+            29677834,
+            31346416,
+            30102250,
+            31104416,
+            40112792,
+            45710875,
+            45358417
+          ]
+        },
+        "median_ns": 233.48490142822266,
+        "finished_unix": 1791554793.87604
+      },
+      {
+        "block": 12,
+        "variant": "b",
+        "mode": "shared",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/12/b/shared/1",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            30949667,
+            29935375,
+            26695042,
+            29399833,
+            27111333,
+            26454041,
+            26916667,
+            26027917,
+            26799709,
+            26498500
+          ]
+        },
+        "median_ns": 204.91171264648438,
+        "finished_unix": 1791554794.257698
+      },
+      {
+        "block": 12,
+        "variant": "b",
+        "mode": "distinct",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/12/b/distinct/0",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            27533333,
+            29246166,
+            29555833,
+            29896333,
+            29655542,
+            29657208,
+            29904000,
+            29566166,
+            29766458,
+            29876209
+          ]
+        },
+        "median_ns": 226.26018524169922,
+        "finished_unix": 1791554794.657728
+      },
+      {
+        "block": 12,
+        "variant": "b",
+        "mode": "distinct",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/12/b/distinct/1",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            26991625,
+            26616458,
+            26763666,
+            27250500,
+            26683750,
+            27094458,
+            26799208,
+            26614167,
+            26830667,
+            28328375
+          ]
+        },
+        "median_ns": 204.58173751831055,
+        "finished_unix": 1791554795.031863
+      },
+      {
+        "block": 13,
+        "variant": "a",
+        "mode": "shared",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/13/a/shared/1",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            35085500,
+            35037083,
+            42882333,
+            49848584,
+            48632041,
+            47598833,
+            48282917,
+            48062167,
+            49792125,
+            40534041
+          ]
+        },
+        "median_ns": 364.9177551269531,
+        "finished_unix": 1791554795.582485
+      },
+      {
+        "block": 13,
+        "variant": "a",
+        "mode": "shared",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/13/a/shared/0",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            28620709,
+            28190625,
+            27363042,
+            27271458,
+            32100583,
+            29011333,
+            33110500,
+            33298459,
+            33108958,
+            35535541
+          ]
+        },
+        "median_ns": 233.1234588623047,
+        "finished_unix": 1791554795.994207
+      },
+      {
+        "block": 13,
+        "variant": "b",
+        "mode": "distinct",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/13/b/distinct/1",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            29471292,
+            29368125,
+            30376333,
+            35338875,
+            52096375,
+            54999875,
+            56588500,
+            57098000,
+            56772167,
+            57384333
+          ]
+        },
+        "median_ns": 408.5397720336914,
+        "finished_unix": 1791554796.558215
+      },
+      {
+        "block": 13,
+        "variant": "b",
+        "mode": "distinct",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/13/b/distinct/0",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            26623250,
+            26990667,
+            26690958,
+            26786833,
+            26693833,
+            26571584,
+            26895667,
+            26562000,
+            26643416,
+            26913500
+          ]
+        },
+        "median_ns": 203.6468162536621,
+        "finished_unix": 1791554796.930964
+      },
+      {
+        "block": 13,
+        "variant": "b",
+        "mode": "shared",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/13/b/shared/1",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            28003833,
+            29909292,
+            29550250,
+            31191167,
+            36836625,
+            37997500,
+            38106209,
+            41232500,
+            38964958,
+            36696208
+          ]
+        },
+        "median_ns": 280.50549697875977,
+        "finished_unix": 1791554797.3840551
+      },
+      {
+        "block": 13,
+        "variant": "b",
+        "mode": "shared",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/13/b/shared/0",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            26467042,
+            27204250,
+            27285209,
+            27290791,
+            28393084,
+            26504417,
+            31070625,
+            28903083,
+            33786792,
+            30793334
+          ]
+        },
+        "median_ns": 212.4171257019043,
+        "finished_unix": 1791554797.776188
+      },
+      {
+        "block": 13,
+        "variant": "a",
+        "mode": "distinct",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/13/a/distinct/1",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            28322166,
+            30937792,
+            31516959,
+            31381417,
+            31503458,
+            31573625,
+            31332916,
+            31540750,
+            31508750,
+            31464917
+          ]
+        },
+        "median_ns": 240.2052879333496,
+        "finished_unix": 1791554798.1916978
+      },
+      {
+        "block": 13,
+        "variant": "a",
+        "mode": "distinct",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/13/a/distinct/0",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            27062875,
+            26878500,
+            26736083,
+            28089875,
+            26724459,
+            26429459,
+            27025250,
+            27492292,
+            44906917,
+            39412166
+          ]
+        },
+        "median_ns": 206.3298225402832,
+        "finished_unix": 1791554798.597124
+      },
+      {
+        "block": 14,
+        "variant": "b",
+        "mode": "shared",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/14/b/shared/0",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            34970209,
+            48595375,
+            56529375,
+            54921417,
+            54447083,
+            52993291,
+            50675125,
+            50729958,
+            51405375,
+            50733792
+          ]
+        },
+        "median_ns": 389.63000106811523,
+        "finished_unix": 1791554799.208885
+      },
+      {
+        "block": 14,
+        "variant": "b",
+        "mode": "shared",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/14/b/shared/1",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            29211750,
+            31057875,
+            31860917,
+            31600666,
+            31365959,
+            32387958,
+            34286250,
+            34414834,
+            36478167,
+            29854875
+          ]
+        },
+        "median_ns": 242.08672714233398,
+        "finished_unix": 1791554799.6362822
+      },
+      {
+        "block": 14,
+        "variant": "b",
+        "mode": "distinct",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/14/b/distinct/0",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            28539625,
+            33220083,
+            36166208,
+            36317625,
+            44253458,
+            39895667,
+            42349917,
+            41350375,
+            39908333,
+            40891417
+          ]
+        },
+        "median_ns": 304.4281005859375,
+        "finished_unix": 1791554800.123887
+      },
+      {
+        "block": 14,
+        "variant": "b",
+        "mode": "distinct",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/14/b/distinct/1",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            30498709,
+            31955625,
+            30951708,
+            29459625,
+            29369500,
+            37069000,
+            60041708,
+            63902000,
+            63578958,
+            53826917
+          ]
+        },
+        "median_ns": 263.308048248291,
+        "finished_unix": 1791554800.6589708
+      },
+      {
+        "block": 14,
+        "variant": "a",
+        "mode": "shared",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/14/a/shared/0",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            30014417,
+            31269375,
+            37009875,
+            42592334,
+            41481083,
+            40753625,
+            40352833,
+            38540625,
+            38723042,
+            39440333
+          ]
+        },
+        "median_ns": 298.1696128845215,
+        "finished_unix": 1791554801.143088
+      },
+      {
+        "block": 14,
+        "variant": "a",
+        "mode": "shared",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/14/a/shared/1",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            27089375,
+            28438084,
+            27755750,
+            28638291,
+            41609959,
+            37938417,
+            40333000,
+            39681167,
+            51324750,
+            63247250
+          ]
+        },
+        "median_ns": 296.09521484375,
+        "finished_unix": 1791554801.6346922
+      },
+      {
+        "block": 14,
+        "variant": "a",
+        "mode": "distinct",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/14/a/distinct/0",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            35813625,
+            53598208,
+            58247834,
+            59718416,
+            60203584,
+            59964875,
+            59765750,
+            59840583,
+            59865625,
+            59880250
+          ]
+        },
+        "median_ns": 456.2619514465332,
+        "finished_unix": 1791554802.3081658
+      },
+      {
+        "block": 14,
+        "variant": "a",
+        "mode": "distinct",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/14/a/distinct/1",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            27007709,
+            71697417,
+            73750084,
+            73687292,
+            56890708,
+            34604375,
+            39419250,
+            63351708,
+            76073333,
+            76606709
+          ]
+        },
+        "median_ns": 515.1715278625488,
+        "finished_unix": 1791554803.006319
+      },
+      {
+        "block": 15,
+        "variant": "b",
+        "mode": "shared",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/15/b/shared/1",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            30390458,
+            36364667,
+            45320291,
+            45194167,
+            43883542,
+            45245834,
+            43900375,
+            42794917,
+            44442375,
+            42662917
+          ]
+        },
+        "median_ns": 334.86906814575195,
+        "finished_unix": 1791554803.5320718
+      },
+      {
+        "block": 15,
+        "variant": "b",
+        "mode": "shared",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/15/b/shared/0",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            29348333,
+            29234542,
+            31968125,
+            26335958,
+            29999333,
+            27782125,
+            26446875,
+            27749417,
+            26351083,
+            29840250
+          ]
+        },
+        "median_ns": 217.50132369995117,
+        "finished_unix": 1791554803.92207
+      },
+      {
+        "block": 15,
+        "variant": "a",
+        "mode": "distinct",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/15/a/distinct/1",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            27226167,
+            27364167,
+            28058458,
+            39821000,
+            45830209,
+            46155375,
+            46264500,
+            46619750,
+            46269750,
+            46520333
+          ]
+        },
+        "median_ns": 350.89715576171875,
+        "finished_unix": 1791554804.427598
+      },
+      {
+        "block": 15,
+        "variant": "a",
+        "mode": "distinct",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/15/a/distinct/0",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            26615458,
+            27153375,
+            27006750,
+            26666834,
+            27144458,
+            28320208,
+            30716292,
+            30989084,
+            31002958,
+            31524250
+          ]
+        },
+        "median_ns": 211.61492538452148,
+        "finished_unix": 1791554804.819398
+      },
+      {
+        "block": 15,
+        "variant": "a",
+        "mode": "shared",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/15/a/shared/1",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            37121792,
+            32812667,
+            34291875,
+            35741208,
+            46181542,
+            49017541,
+            48326417,
+            48259500,
+            49203500,
+            47865875
+          ]
+        },
+        "median_ns": 358.76242446899414,
+        "finished_unix": 1791554805.353226
+      },
+      {
+        "block": 15,
+        "variant": "a",
+        "mode": "shared",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/15/a/shared/0",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            29983583,
+            31093000,
+            31388042,
+            40854333,
+            42671125,
+            43416083,
+            30031833,
+            34452792,
+            36618250,
+            41998083
+          ]
+        },
+        "median_ns": 271.11450958251953,
+        "finished_unix": 1791554805.821004
+      },
+      {
+        "block": 15,
+        "variant": "b",
+        "mode": "distinct",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/15/b/distinct/1",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            28179417,
+            29135125,
+            29642708,
+            29961333,
+            29504917,
+            29894916,
+            33509125,
+            29190417,
+            29704042,
+            32661167
+          ]
+        },
+        "median_ns": 226.38988494873047,
+        "finished_unix": 1791554806.226826
+      },
+      {
+        "block": 15,
+        "variant": "b",
+        "mode": "distinct",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/15/b/distinct/0",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            26986917,
+            26916750,
+            27045500,
+            27260542,
+            27260042,
+            27298542,
+            28099125,
+            28312083,
+            28373208,
+            28269834
+          ]
+        },
+        "median_ns": 208.1263885498047,
+        "finished_unix": 1791554806.6068301
+      },
+      {
+        "block": 16,
+        "variant": "a",
+        "mode": "shared",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/16/a/shared/0",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            26993875,
+            32455041,
+            28266083,
+            27896375,
+            30066208,
+            28935625,
+            29277708,
+            30227959,
+            34480042,
+            36998083
+          ]
+        },
+        "median_ns": 226.3790740966797,
+        "finished_unix": 1791554807.0177972
+      },
+      {
+        "block": 16,
+        "variant": "a",
+        "mode": "shared",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/16/a/shared/1",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            30446417,
+            30795917,
+            32016417,
+            31386959,
+            31299417,
+            31966167,
+            31160541,
+            30078250,
+            30927667,
+            31265666
+          ]
+        },
+        "median_ns": 238.13708114624023,
+        "finished_unix": 1791554807.4339972
+      },
+      {
+        "block": 16,
+        "variant": "a",
+        "mode": "distinct",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/16/a/distinct/0",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            27007292,
+            26805084,
+            26811041,
+            26756084,
+            27881625,
+            27753750,
+            28026500,
+            27977833,
+            27963750,
+            27581333
+          ]
+        },
+        "median_ns": 211.08658981323242,
+        "finished_unix": 1791554807.81343
+      },
+      {
+        "block": 16,
+        "variant": "a",
+        "mode": "distinct",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/16/a/distinct/1",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            27712000,
+            28042208,
+            37799542,
+            37231916,
+            27762542,
+            29956792,
+            34284083,
+            55199417,
+            58500584,
+            58469084
+          ]
+        },
+        "median_ns": 272.81188583374023,
+        "finished_unix": 1791554808.312711
+      },
+      {
+        "block": 16,
+        "variant": "b",
+        "mode": "shared",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/16/b/shared/0",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            29676083,
+            29029916,
+            34409750,
+            37753417,
+            39216708,
+            37961833,
+            38668583,
+            37828042,
+            38200250,
+            37780625
+          ]
+        },
+        "median_ns": 288.4241752624512,
+        "finished_unix": 1791554808.7787688
+      },
+      {
+        "block": 16,
+        "variant": "b",
+        "mode": "shared",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/16/b/shared/1",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            26143792,
+            28242625,
+            27224625,
+            28748792,
+            27455250,
+            29178708,
+            27239166,
+            26568375,
+            29415917,
+            26271834
+          ]
+        },
+        "median_ns": 208.64263916015625,
+        "finished_unix": 1791554809.159982
+      },
+      {
+        "block": 16,
+        "variant": "b",
+        "mode": "distinct",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/16/b/distinct/0",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            27022542,
+            27148250,
+            27495333,
+            26832833,
+            26986417,
+            27339958,
+            30801292,
+            35007708,
+            34942250,
+            34779667
+          ]
+        },
+        "median_ns": 209.18003463745117,
+        "finished_unix": 1791554809.562894
+      },
+      {
+        "block": 16,
+        "variant": "b",
+        "mode": "distinct",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/16/b/distinct/1",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            27775125,
+            27805916,
+            34891750,
+            47409375,
+            47788291,
+            29115833,
+            29520834,
+            31447459,
+            48571916,
+            54743084
+          ]
+        },
+        "median_ns": 253.0639991760254,
+        "finished_unix": 1791554810.0463512
+      },
+      {
+        "block": 17,
+        "variant": "a",
+        "mode": "shared",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/17/a/shared/1",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            32093958,
+            34086917,
+            41002125,
+            43147084,
+            42688916,
+            44389958,
+            40757792,
+            40150875,
+            41503709,
+            40332875
+          ]
+        },
+        "median_ns": 311.88933181762695,
+        "finished_unix": 1791554810.5525298
+      },
+      {
+        "block": 17,
+        "variant": "a",
+        "mode": "shared",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/17/a/shared/0",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            31608333,
+            32666875,
+            31570791,
+            32744250,
+            31399209,
+            33321834,
+            33316083,
+            32877208,
+            36783875,
+            35712000
+          ]
+        },
+        "median_ns": 250.32599639892578,
+        "finished_unix": 1791554810.9905438
+      },
+      {
+        "block": 17,
+        "variant": "b",
+        "mode": "distinct",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/17/b/distinct/1",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            27080666,
+            26892583,
+            26795708,
+            26981584,
+            26865084,
+            26724667,
+            26774417,
+            26911791,
+            27061542,
+            26510042
+          ]
+        },
+        "median_ns": 205.0692253112793,
+        "finished_unix": 1791554811.363961
+      },
+      {
+        "block": 17,
+        "variant": "b",
+        "mode": "distinct",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/17/b/distinct/0",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            27213041,
+            26619584,
+            27607333,
+            27981375,
+            27619959,
+            27791334,
+            28010834,
+            27862833,
+            28925416,
+            30352958
+          ]
+        },
+        "median_ns": 212.3037986755371,
+        "finished_unix": 1791554811.7488298
+      },
+      {
+        "block": 17,
+        "variant": "b",
+        "mode": "shared",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/17/b/shared/1",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            29096250,
+            30461167,
+            29040125,
+            28514583,
+            28144292,
+            27355250,
+            27382375,
+            28720042,
+            30406750,
+            34451000
+          ]
+        },
+        "median_ns": 220.33755111694336,
+        "finished_unix": 1791554812.1477299
+      },
+      {
+        "block": 17,
+        "variant": "b",
+        "mode": "shared",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/17/b/shared/0",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            30028500,
+            33500667,
+            30846750,
+            32161167,
+            33505708,
+            32490458,
+            31793000,
+            33951125,
+            31106333,
+            32105000
+          ]
+        },
+        "median_ns": 245.1559715270996,
+        "finished_unix": 1791554812.57394
+      },
+      {
+        "block": 17,
+        "variant": "a",
+        "mode": "distinct",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/17/a/distinct/1",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            26944916,
+            28323667,
+            27955583,
+            28111333,
+            28316958,
+            28152500,
+            28226209,
+            28256250,
+            29104875,
+            31270209
+          ]
+        },
+        "median_ns": 215.46348190307617,
+        "finished_unix": 1791554812.9637928
+      },
+      {
+        "block": 17,
+        "variant": "a",
+        "mode": "distinct",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/17/a/distinct/0",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            26483416,
+            26941542,
+            26797208,
+            27403000,
+            26886917,
+            27138250,
+            27496167,
+            32379416,
+            36030875,
+            35890833
+          ]
+        },
+        "median_ns": 208.05835723876953,
+        "finished_unix": 1791554813.361525
+      },
+      {
+        "block": 18,
+        "variant": "b",
+        "mode": "shared",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/18/b/shared/0",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            32999833,
+            44880917,
+            47404250,
+            47127791,
+            44743250,
+            31998083,
+            34512250,
+            44543292,
+            50135708,
+            49778375
+          ]
+        },
+        "median_ns": 341.88906478881836,
+        "finished_unix": 1791554813.895324
+      },
+      {
+        "block": 18,
+        "variant": "b",
+        "mode": "shared",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/18/b/shared/1",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            30480500,
+            31282666,
+            32413834,
+            33217834,
+            31813000,
+            31776875,
+            31374584,
+            31368000,
+            33550917,
+            32410458
+          ]
+        },
+        "median_ns": 242.57612228393555,
+        "finished_unix": 1791554814.319715
+      },
+      {
+        "block": 18,
+        "variant": "b",
+        "mode": "distinct",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/18/b/distinct/0",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            26946334,
+            28940458,
+            36266458,
+            37896333,
+            38041667,
+            37736166,
+            37977250,
+            38356917,
+            38853500,
+            38540292
+          ]
+        },
+        "median_ns": 289.4347496032715,
+        "finished_unix": 1791554814.783909
+      },
+      {
+        "block": 18,
+        "variant": "b",
+        "mode": "distinct",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/18/b/distinct/1",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            27075000,
+            28142333,
+            28544333,
+            28587083,
+            28688333,
+            28430167,
+            28598375,
+            34248125,
+            36580458,
+            38486417
+          ]
+        },
+        "median_ns": 218.14521026611328,
+        "finished_unix": 1791554815.195882
+      },
+      {
+        "block": 18,
+        "variant": "a",
+        "mode": "shared",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/18/a/shared/0",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            35479916,
+            30991333,
+            31717375,
+            32109166,
+            32540083,
+            43502167,
+            53773042,
+            54014666,
+            48651792,
+            52975917
+          ]
+        },
+        "median_ns": 301.2927360534668,
+        "finished_unix": 1791554815.716025
+      },
+      {
+        "block": 18,
+        "variant": "a",
+        "mode": "shared",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/18/a/shared/1",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            28405792,
+            31074833,
+            30455291,
+            34748208,
+            39182167,
+            38311375,
+            38296417,
+            38272750,
+            40796750,
+            31502708
+          ]
+        },
+        "median_ns": 278.55284881591797,
+        "finished_unix": 1791554816.1719081
+      },
+      {
+        "block": 18,
+        "variant": "a",
+        "mode": "distinct",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/18/a/distinct/0",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            32272916,
+            49384667,
+            54100250,
+            61134041,
+            68004875,
+            68466666,
+            68700000,
+            60540959,
+            35408792,
+            39083333
+          ]
+        },
+        "median_ns": 437.32150650024414,
+        "finished_unix": 1791554816.814085
+      },
+      {
+        "block": 18,
+        "variant": "a",
+        "mode": "distinct",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/18/a/distinct/1",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            35252667,
+            43642875,
+            71609958,
+            72756250,
+            72635083,
+            72955458,
+            72824083,
+            72823125,
+            72745542,
+            72974708
+          ]
+        },
+        "median_ns": 555.0452880859375,
+        "finished_unix": 1791554817.579202
+      },
+      {
+        "block": 19,
+        "variant": "b",
+        "mode": "shared",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/19/b/shared/1",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            30156292,
+            27766958,
+            28256625,
+            31856500,
+            33406458,
+            29145041,
+            28366042,
+            28033542,
+            31712666,
+            37108208
+          ]
+        },
+        "median_ns": 226.21663284301758,
+        "finished_unix": 1791554817.9902232
+      },
+      {
+        "block": 19,
+        "variant": "b",
+        "mode": "shared",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/19/b/shared/0",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            30853625,
+            28975583,
+            31618333,
+            29204333,
+            29417000,
+            29588458,
+            31969000,
+            48369209,
+            56514875,
+            55835083
+          ]
+        },
+        "median_ns": 238.31160736083984,
+        "finished_unix": 1791554818.46769
+      },
+      {
+        "block": 19,
+        "variant": "a",
+        "mode": "distinct",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/19/a/distinct/1",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            26824583,
+            27031958,
+            26757542,
+            26961083,
+            26996333,
+            26775375,
+            26999583,
+            27008125,
+            26744000,
+            26938416
+          ]
+        },
+        "median_ns": 205.61027145385742,
+        "finished_unix": 1791554818.841899
+      },
+      {
+        "block": 19,
+        "variant": "a",
+        "mode": "distinct",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/19/a/distinct/0",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            26877750,
+            28323916,
+            28367417,
+            27289708,
+            27947458,
+            29061250,
+            38682042,
+            42095916,
+            42557334,
+            42456916
+          ]
+        },
+        "median_ns": 219.07297897338867,
+        "finished_unix": 1791554819.280374
+      },
+      {
+        "block": 19,
+        "variant": "a",
+        "mode": "shared",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/19/a/shared/1",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            27743500,
+            27023500,
+            27369291,
+            27105917,
+            28251625,
+            28326542,
+            27437750,
+            26906500,
+            28269584,
+            27932334
+          ]
+        },
+        "median_ns": 210.49976348876953,
+        "finished_unix": 1791554819.661752
+      },
+      {
+        "block": 19,
+        "variant": "a",
+        "mode": "shared",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/19/a/shared/0",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            31234292,
+            31517708,
+            32458083,
+            32419708,
+            34651334,
+            30167833,
+            29304375,
+            29379083,
+            30523500,
+            29991584
+          ]
+        },
+        "median_ns": 235.5872802734375,
+        "finished_unix": 1791554820.078353
+      },
+      {
+        "block": 19,
+        "variant": "b",
+        "mode": "distinct",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/19/b/distinct/1",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            27590667,
+            31036000,
+            35253750,
+            30674250,
+            27985583,
+            28262833,
+            29452209,
+            34485209,
+            48402125,
+            48993042
+          ]
+        },
+        "median_ns": 235.40592193603516,
+        "finished_unix": 1791554820.5253172
+      },
+      {
+        "block": 19,
+        "variant": "b",
+        "mode": "distinct",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/19/b/distinct/0",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            26799334,
+            27408750,
+            28004666,
+            30520083,
+            30904083,
+            34161917,
+            74934708,
+            75308791,
+            75914834,
+            75886000
+          ]
+        },
+        "median_ns": 248.20709228515625,
+        "finished_unix": 1791554821.110661
+      },
+      {
+        "block": 20,
+        "variant": "a",
+        "mode": "shared",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/20/a/shared/0",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            36923042,
+            37315916,
+            36613625,
+            33690333,
+            32381875,
+            32294333,
+            34479583,
+            39261625,
+            45130167,
+            30388833
+          ]
+        },
+        "median_ns": 271.1990661621094,
+        "finished_unix": 1791554821.574969
+      },
+      {
+        "block": 20,
+        "variant": "a",
+        "mode": "shared",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/20/a/shared/1",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            33389875,
+            31945542,
+            35695750,
+            47644041,
+            46172333,
+            46728125,
+            45528625,
+            43209500,
+            42682459,
+            42623000
+          ]
+        },
+        "median_ns": 327.6518211364746,
+        "finished_unix": 1791554822.095671
+      },
+      {
+        "block": 20,
+        "variant": "a",
+        "mode": "distinct",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/20/a/distinct/0",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            26784125,
+            27871916,
+            28552084,
+            28322375,
+            31079083,
+            33322375,
+            32501541,
+            36880459,
+            53865167,
+            70958083
+          ]
+        },
+        "median_ns": 242.54083251953125,
+        "finished_unix": 1791554822.5707772
+      },
+      {
+        "block": 20,
+        "variant": "a",
+        "mode": "distinct",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/20/a/distinct/1",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            50222709,
+            70448375,
+            70250167,
+            70318000,
+            72781833,
+            73067625,
+            73068750,
+            73021291,
+            72937875,
+            73484416
+          ]
+        },
+        "median_ns": 555.8765716552734,
+        "finished_unix": 1791554823.376009
+      },
+      {
+        "block": 20,
+        "variant": "b",
+        "mode": "shared",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/20/b/shared/0",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            29715708,
+            34860291,
+            35497583,
+            36747458,
+            34969083,
+            35726750,
+            35028000,
+            35853875,
+            34373500,
+            35889375
+          ]
+        },
+        "median_ns": 269.033748626709,
+        "finished_unix": 1791554823.8294961
+      },
+      {
+        "block": 20,
+        "variant": "b",
+        "mode": "shared",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/20/b/shared/1",
+        "raw": {
+          "mode": "shared",
+          "iterations": 131072,
+          "samples_ns": [
+            28788542,
+            32823208,
+            37084250,
+            35855541,
+            37754667,
+            39588208,
+            36145333,
+            36288792,
+            36536709,
+            36473084
+          ]
+        },
+        "median_ns": 277.5645294189453,
+        "finished_unix": 1791554824.291819
+      },
+      {
+        "block": 20,
+        "variant": "b",
+        "mode": "distinct",
+        "slot": 0,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/20/b/distinct/0",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            27186542,
+            27624625,
+            30173208,
+            46334250,
+            51804958,
+            51676208,
+            51630083,
+            50158875,
+            31165375,
+            48439625
+          ]
+        },
+        "median_ns": 361.53364181518555,
+        "finished_unix": 1791554824.813432
+      },
+      {
+        "block": 20,
+        "variant": "b",
+        "mode": "distinct",
+        "slot": 1,
+        "raw_directory": "<workspace>/target/font-copy-callsite/runs/20/b/distinct/1",
+        "raw": {
+          "mode": "distinct",
+          "iterations": 131072,
+          "samples_ns": [
+            28228250,
+            28921167,
+            29144292,
+            29374916,
+            29086833,
+            29587959,
+            29936209,
+            29717291,
+            29935375,
+            29599084
+          ]
+        },
+        "median_ns": 224.92551803588867,
+        "finished_unix": 1791554825.212499
+      }
+    ],
+    "started_unix": 1791554545.455321,
+    "original_binaries": [
+      {
+        "path": "<workspace>/target/font-benchmark-runs/run-zcaqwew_/executable/font_diagnostics",
+        "sha256": "1494bdcb5c046a77c1a12537c90a7f9fe0180382b8af80bc5388675ecda81f2d"
+      },
+      {
+        "path": "<workspace>/target/font-benchmark-runs/run-qwqd2mh0/executable/font_diagnostics",
+        "sha256": "9811213d8b861a759fe75dcc886c2106dda6e5791589973ef02071fbe5f37450"
+      }
+    ],
+    "assembly_review": {
+      "identical_helper_instructions": true,
+      "shared_allocator_call_pc": "0x100001098",
+      "distinct_allocator_call_pc": "0x100001018",
+      "distinct_executable_cdhashes": true
+    },
+    "calibrations": {
+      "a/shared": {
+        "status": "inconclusive",
+        "ratio": 1.0519394608202128,
+        "lower_95": 0.9708062181841067,
+        "upper_95": 1.183921362264832,
+        "ratios": [
+          0.8622839560451847,
+          0.9593004625014835,
+          0.9708062181841067,
+          1.305066358639481,
+          1.183921362264832,
+          1.006729591073319,
+          1.018689385123021,
+          1.126903543203138,
+          0.8589130275812297,
+          1.0796558634408904,
+          1.1757245069505744,
+          1.2619612470366914,
+          0.8557460708766327,
+          1.5653412012151606,
+          0.9930428925311887,
+          1.3232874368156864,
+          1.0519394608202128,
+          1.2459326490429397,
+          0.9245256041170755,
+          0.8935107330262066,
+          1.2081598427799178
+        ]
+      },
+      "a/distinct": {
+        "status": "inconclusive",
+        "ratio": 1.0456576371970894,
+        "lower_95": 0.9385469281395649,
+        "upper_95": 1.2691927559835836,
+        "ratios": [
+          1.5026173999582264,
+          0.34794073382132024,
+          1.0119913407319305,
+          1.4970017559398248,
+          0.9735215280069077,
+          1.0456576371970894,
+          0.5359765994160501,
+          0.579653710340709,
+          0.40882433314082983,
+          0.879818877857916,
+          1.236867933568928,
+          0.7674089444111691,
+          1.282728481133348,
+          1.1641811395754613,
+          1.1291134976941397,
+          1.658187177128977,
+          1.292416946406315,
+          1.0355915751839204,
+          1.2691927559835836,
+          0.9385469281395649,
+          2.291888610593064
+        ]
+      },
+      "b/shared": {
+        "status": "inconclusive",
+        "ratio": 0.9783368468463703,
+        "lower_95": 0.8987647730725873,
+        "upper_95": 1.0600825767158766,
+        "ratios": [
+          0.5343824779407348,
+          1.022436247704777,
+          0.5654252390754011,
+          1.2677298784986557,
+          0.9327517111946662,
+          0.9690425893856485,
+          0.9783368468463703,
+          1.0600825767158766,
+          1.1114032317960154,
+          1.0073693786564337,
+          1.1855956015296212,
+          1.557609688367512,
+          0.8776229700209451,
+          1.3205408747146279,
+          0.6213246579541812,
+          1.5396185294380675,
+          0.7233881798233528,
+          0.8987647730725873,
+          0.7095170547024443,
+          0.949247228652574,
+          1.0317089615551283
+        ]
+      },
+      "b/distinct": {
+        "status": "inconclusive",
+        "ratio": 0.992221105061718,
+        "lower_95": 0.8649268833642424,
+        "upper_95": 1.100062892821174,
+        "ratios": [
+          2.1971772445820865,
+          1.3599300139089976,
+          1.0633074503025424,
+          0.992221105061718,
+          1.100062892821174,
+          0.44696311941837397,
+          0.4017207548706978,
+          1.12396558631284,
+          0.3103570907665966,
+          1.0026596444412694,
+          0.7865349112361225,
+          1.2318826159032914,
+          0.9041879697029728,
+          2.0061191210807587,
+          0.8649268833642424,
+          1.087751949794465,
+          1.2097904066926535,
+          0.9659234860167794,
+          0.7536939174205072,
+          0.9484254449328374,
+          0.6221427054660369
+        ]
+      }
+    },
+    "binary_identity_contrasts": {
+      "shared": {
+        "ratio": 0.9940735009135784,
+        "lower_95": 0.9167163483850661,
+        "upper_95": 1.0336280803847504,
+        "ratios": [
+          1.0150347012699847,
+          0.6284983492731163,
+          1.2277334277091343,
+          1.1371457778152423,
+          1.0235435082112088,
+          0.8456190576640699,
+          1.0713328378440312,
+          1.0203397732739954,
+          0.9688837336688587,
+          0.9489013081713397,
+          0.9829733406675213,
+          1.1841227834770112,
+          0.8972479522073609,
+          0.8369026939677784,
+          1.0336280803847504,
+          0.8653436545942328,
+          1.0565394330105211,
+          0.8317872529176986,
+          0.9940735009135784,
+          1.042637016385765,
+          0.9167163483850661
+        ]
+      },
+      "distinct": {
+        "ratio": 0.9440256234440678,
+        "lower_95": 0.7766263213265793,
+        "upper_95": 1.0180688484298397,
+        "ratios": [
+          0.6389562107709772,
+          0.7233455372744795,
+          0.9440256234440678,
+          0.7321916715808158,
+          1.032154885458264,
+          1.6996621440414887,
+          1.023749246516844,
+          0.5892029555225669,
+          1.072786172542017,
+          0.7815194794032196,
+          1.0180688484298397,
+          0.97003203513748,
+          0.9264316971046481,
+          1.295638066458132,
+          0.5839711374045565,
+          0.7965792910951125,
+          0.9587675640174217,
+          0.9854842967803293,
+          0.5100157040000342,
+          1.1389350944173693,
+          0.7766263213265793
+        ]
+      }
+    },
+    "finished_unix": 1791554825.3713422
+  },
+  "source_sha256": "4a637b4b194ce3795dcf42998a0ad0ba630eedfcfcd4b9522fbc3e9167be85de",
+  "runner_sha256": {
+    "run.py": "7b0faaecef67ffea619c2dd9b6fe4033d61d595d3bd3b42ce361d743a50e5408",
+    "measure.py": "8dcaa23cfae815d58f7037981d1d000a3cf4a1bc7cb702cc28d3318879126da8",
+    "audit.py": "875fd7c8f281d6c3a5c50075d0a86511e2f8c4bd88ae0562087245eacc76aefe"
+  }
+}

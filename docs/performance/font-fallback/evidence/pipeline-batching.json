@@ -1,0 +1,1577 @@
+{
+  "scope": "Output-retention diagnostic only; does not reclassify original acceptance",
+  "archive": {
+    "file": "pipeline-batching-evidence.tar.gz",
+    "bytes": 4645333,
+    "sha256": "e77f2215a084bb628ced7482d353eeda6a7de6148edb4632329a630150ab8ba7"
+  },
+  "audit": {
+    "raw_sample_files": 336,
+    "raw_samples": 3360,
+    "complete_processes": 84,
+    "raw_medians_ratios_and_calibrations_recomputed": true
+  },
+  "paired_report": {
+    "state": "completed",
+    "started_unix": 1791544348.291465,
+    "scope": "Same-current-binary diagnostic only; never pooled with original stages acceptance",
+    "settings": {
+      "rounds": 21,
+      "sample_size": 10,
+      "warm_up_s": 0.1,
+      "measurement_s": 0.25
+    },
+    "modes": {
+      "small": {
+        "diagnostic/output_retention/curves@300": {
+          "observations": [
+            {
+              "before_ns": 2286887.3055555555,
+              "after_ns": 2365868.34375,
+              "ratio": 1.0345364802203305,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/0/small"
+            },
+            {
+              "before_ns": 2725312.125,
+              "after_ns": 3139607.2583333333,
+              "ratio": 1.1520174990353933,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/1/small"
+            },
+            {
+              "before_ns": 2910816.145833333,
+              "after_ns": 3107550.7023809524,
+              "ratio": 1.0675874210843697,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/2/small"
+            },
+            {
+              "before_ns": 3125788.361111111,
+              "after_ns": 3756075.0,
+              "ratio": 1.2016408553856295,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/3/small"
+            },
+            {
+              "before_ns": 3702410.1944444445,
+              "after_ns": 3186324.3125,
+              "ratio": 0.8606081296127469,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/4/small"
+            },
+            {
+              "before_ns": 3012383.864583333,
+              "after_ns": 2976580.9375,
+              "ratio": 0.9881147527364395,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/5/small"
+            },
+            {
+              "before_ns": 3432241.177083333,
+              "after_ns": 2561141.125,
+              "ratio": 0.7462008037490009,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/6/small"
+            },
+            {
+              "before_ns": 2320655.9241071427,
+              "after_ns": 2430356.0,
+              "ratio": 1.0472711506920458,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/7/small"
+            },
+            {
+              "before_ns": 2426726.4464285714,
+              "after_ns": 3048921.59375,
+              "ratio": 1.2563927830584767,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/8/small"
+            },
+            {
+              "before_ns": 3131120.1625,
+              "after_ns": 3347211.5982142854,
+              "ratio": 1.069014098629083,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/9/small"
+            },
+            {
+              "before_ns": 3089901.0583333336,
+              "after_ns": 2934510.375,
+              "ratio": 0.9497101426874975,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/10/small"
+            },
+            {
+              "before_ns": 2828545.583333333,
+              "after_ns": 3654671.158333333,
+              "ratio": 1.2920672659008177,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/11/small"
+            },
+            {
+              "before_ns": 3103893.55,
+              "after_ns": 3849875.525,
+              "ratio": 1.240337486767225,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/12/small"
+            },
+            {
+              "before_ns": 3250868.607638889,
+              "after_ns": 2415232.208333333,
+              "ratio": 0.742949808139899,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/13/small"
+            },
+            {
+              "before_ns": 2743675.902777778,
+              "after_ns": 3886849.958333333,
+              "ratio": 1.4166578327994834,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/14/small"
+            },
+            {
+              "before_ns": 3721793.0,
+              "after_ns": 2864714.958333333,
+              "ratio": 0.7697136725049816,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/15/small"
+            },
+            {
+              "before_ns": 2849625.958333333,
+              "after_ns": 2466349.375,
+              "ratio": 0.8654993360751455,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/16/small"
+            },
+            {
+              "before_ns": 2904139.5535714286,
+              "after_ns": 2996186.6428571427,
+              "ratio": 1.0316951329603006,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/17/small"
+            },
+            {
+              "before_ns": 2522762.402777778,
+              "after_ns": 2528818.78125,
+              "ratio": 1.0024006931709277,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/18/small"
+            },
+            {
+              "before_ns": 3517722.075,
+              "after_ns": 2791846.15,
+              "ratio": 0.7936517128062198,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/19/small"
+            },
+            {
+              "before_ns": 2321784.375,
+              "after_ns": 2270625.208333333,
+              "ratio": 0.9779655823264523,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/20/small"
+            }
+          ],
+          "status": "inconclusive",
+          "ratio": 1.0316951329603006,
+          "lower_95": 0.9497101426874975,
+          "upper_95": 1.069014098629083
+        },
+        "diagnostic/output_retention/rect_fills@300": {
+          "observations": [
+            {
+              "before_ns": 1947380.5416666665,
+              "after_ns": 1549765.9305555555,
+              "ratio": 0.7958207948556308,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/0/small"
+            },
+            {
+              "before_ns": 1407655.1392857144,
+              "after_ns": 1398591.4821428573,
+              "ratio": 0.99356116644631,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/1/small"
+            },
+            {
+              "before_ns": 1554475.611111111,
+              "after_ns": 1468591.1833333333,
+              "ratio": 0.9447502249865541,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/2/small"
+            },
+            {
+              "before_ns": 1462525.15,
+              "after_ns": 1431993.0416666667,
+              "ratio": 0.9791237037302687,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/3/small"
+            },
+            {
+              "before_ns": 1475578.388888889,
+              "after_ns": 1436221.0714285714,
+              "ratio": 0.9733275319314254,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/4/small"
+            },
+            {
+              "before_ns": 1412935.9756944445,
+              "after_ns": 1476808.0111111111,
+              "ratio": 1.0452051872946855,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/5/small"
+            },
+            {
+              "before_ns": 1434982.0178571427,
+              "after_ns": 1437613.1464285715,
+              "ratio": 1.0018335620507341,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/6/small"
+            },
+            {
+              "before_ns": 1675232.513888889,
+              "after_ns": 1334182.9166666665,
+              "ratio": 0.7964165604507585,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/7/small"
+            },
+            {
+              "before_ns": 1385950.1746031744,
+              "after_ns": 1398182.4527777778,
+              "ratio": 1.0088259148119127,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/8/small"
+            },
+            {
+              "before_ns": 1372362.53125,
+              "after_ns": 1464630.5555555555,
+              "ratio": 1.0672329812309247,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/9/small"
+            },
+            {
+              "before_ns": 1975902.3333333335,
+              "after_ns": 1420599.3055555555,
+              "ratio": 0.7189623098217686,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/10/small"
+            },
+            {
+              "before_ns": 1395258.2285714285,
+              "after_ns": 1399900.7642857144,
+              "ratio": 1.0033273666617535,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/11/small"
+            },
+            {
+              "before_ns": 1373591.2678571427,
+              "after_ns": 1421520.6626984128,
+              "ratio": 1.0348934912173997,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/12/small"
+            },
+            {
+              "before_ns": 1439704.125,
+              "after_ns": 1424947.8392857143,
+              "ratio": 0.9897504734076624,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/13/small"
+            },
+            {
+              "before_ns": 1393850.3660714286,
+              "after_ns": 1457917.625,
+              "ratio": 1.045964230083854,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/14/small"
+            },
+            {
+              "before_ns": 1404742.6583333332,
+              "after_ns": 1445724.6666666665,
+              "ratio": 1.02917403275982,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/15/small"
+            },
+            {
+              "before_ns": 1411939.6357142855,
+              "after_ns": 1423449.0277777778,
+              "ratio": 1.0081514760067414,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/16/small"
+            },
+            {
+              "before_ns": 1416011.5888888887,
+              "after_ns": 1414498.8607142856,
+              "ratio": 0.9989316978854742,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/17/small"
+            },
+            {
+              "before_ns": 1427348.9603174604,
+              "after_ns": 1402264.7285714285,
+              "ratio": 0.9824259992171411,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/18/small"
+            },
+            {
+              "before_ns": 1384834.7107142857,
+              "after_ns": 1389660.2,
+              "ratio": 1.0034845236390886,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/19/small"
+            },
+            {
+              "before_ns": 1442663.0,
+              "after_ns": 1517351.5555555555,
+              "ratio": 1.0517713114951694,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/20/small"
+            }
+          ],
+          "status": "pass",
+          "ratio": 1.0018335620507341,
+          "lower_95": 0.9824259992171411,
+          "upper_95": 1.0088259148119127
+        },
+        "diagnostic/output_retention/strokes@300": {
+          "observations": [
+            {
+              "before_ns": 1980393.625,
+              "after_ns": 1815861.777777778,
+              "ratio": 0.9169196238842559,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/0/small"
+            },
+            {
+              "before_ns": 1576502.9333333333,
+              "after_ns": 1550644.19375,
+              "ratio": 0.983597404713572,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/1/small"
+            },
+            {
+              "before_ns": 2052392.0333333334,
+              "after_ns": 1595485.9444444445,
+              "ratio": 0.7773787456449935,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/2/small"
+            },
+            {
+              "before_ns": 1611795.7916666665,
+              "after_ns": 1553371.58125,
+              "ratio": 0.9637521014022171,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/3/small"
+            },
+            {
+              "before_ns": 1593143.3541666665,
+              "after_ns": 1512245.9404761905,
+              "ratio": 0.9492215101177813,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/4/small"
+            },
+            {
+              "before_ns": 1593575.78125,
+              "after_ns": 1532102.96875,
+              "ratio": 0.961424606709459,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/5/small"
+            },
+            {
+              "before_ns": 1519160.0916666668,
+              "after_ns": 1541482.0,
+              "ratio": 1.0146935852618693,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/6/small"
+            },
+            {
+              "before_ns": 1832123.8333333333,
+              "after_ns": 1510282.5027777776,
+              "ratio": 0.8243342918748001,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/7/small"
+            },
+            {
+              "before_ns": 1466734.5392857143,
+              "after_ns": 1520657.375,
+              "ratio": 1.0367638684915306,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/8/small"
+            },
+            {
+              "before_ns": 1510955.0753968256,
+              "after_ns": 1558408.2261904762,
+              "ratio": 1.0314060633346018,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/9/small"
+            },
+            {
+              "before_ns": 2107665.375,
+              "after_ns": 1585144.8972222223,
+              "ratio": 0.7520856564919478,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/10/small"
+            },
+            {
+              "before_ns": 1577240.5277777778,
+              "after_ns": 1520217.6944444445,
+              "ratio": 0.9638464569423191,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/11/small"
+            },
+            {
+              "before_ns": 1565753.8125,
+              "after_ns": 1516393.711111111,
+              "ratio": 0.9684751836496717,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/12/small"
+            },
+            {
+              "before_ns": 1557737.2777777778,
+              "after_ns": 1577740.4722222222,
+              "ratio": 1.0128411862063034,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/13/small"
+            },
+            {
+              "before_ns": 1520388.1027777777,
+              "after_ns": 1520880.1041666665,
+              "ratio": 1.0003236024985922,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/14/small"
+            },
+            {
+              "before_ns": 1639257.025,
+              "after_ns": 1563398.8777777776,
+              "ratio": 0.9537240676322725,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/15/small"
+            },
+            {
+              "before_ns": 1543873.027777778,
+              "after_ns": 1575395.1222222224,
+              "ratio": 1.020417543332444,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/16/small"
+            },
+            {
+              "before_ns": 1535181.0833333335,
+              "after_ns": 1560817.6666666667,
+              "ratio": 1.0166993872004133,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/17/small"
+            },
+            {
+              "before_ns": 1559431.4722222222,
+              "after_ns": 1536239.4583333335,
+              "ratio": 0.9851279044305553,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/18/small"
+            },
+            {
+              "before_ns": 1538433.8333333335,
+              "after_ns": 1576948.2916666665,
+              "ratio": 1.0250348487525678,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/19/small"
+            },
+            {
+              "before_ns": 1541920.027777778,
+              "after_ns": 1861168.1,
+              "ratio": 1.20704580423819,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/20/small"
+            }
+          ],
+          "status": "pass",
+          "ratio": 0.983597404713572,
+          "lower_95": 0.961424606709459,
+          "upper_95": 1.0146935852618693
+        },
+        "diagnostic/output_retention/text_type3@150": {
+          "observations": [
+            {
+              "before_ns": 282887.7638888889,
+              "after_ns": 271999.73784722225,
+              "ratio": 0.9615111452966797,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/0/small"
+            },
+            {
+              "before_ns": 287117.8630952381,
+              "after_ns": 293922.084375,
+              "ratio": 1.0236983558125219,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/1/small"
+            },
+            {
+              "before_ns": 283282.3732638889,
+              "after_ns": 289985.7421875,
+              "ratio": 1.023663205184202,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/2/small"
+            },
+            {
+              "before_ns": 278220.7078125,
+              "after_ns": 293323.5223214286,
+              "ratio": 1.054283574460269,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/3/small"
+            },
+            {
+              "before_ns": 292030.14375,
+              "after_ns": 278614.3767361111,
+              "ratio": 0.9540603348626443,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/4/small"
+            },
+            {
+              "before_ns": 286397.7170138889,
+              "after_ns": 294314.378125,
+              "ratio": 1.0276421934980968,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/5/small"
+            },
+            {
+              "before_ns": 280266.2760416666,
+              "after_ns": 269824.134375,
+              "ratio": 0.9627420686707444,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/6/small"
+            },
+            {
+              "before_ns": 289273.49375,
+              "after_ns": 282688.8697916666,
+              "ratio": 0.9772373753537749,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/7/small"
+            },
+            {
+              "before_ns": 295101.0406746032,
+              "after_ns": 287647.88715277775,
+              "ratio": 0.9747437233539147,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/8/small"
+            },
+            {
+              "before_ns": 277925.45625,
+              "after_ns": 279654.871875,
+              "ratio": 1.0062225880577287,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/9/small"
+            },
+            {
+              "before_ns": 285979.3354166667,
+              "after_ns": 287717.6328125,
+              "ratio": 1.0060784021100708,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/10/small"
+            },
+            {
+              "before_ns": 278049.28348214284,
+              "after_ns": 284354.30034722225,
+              "ratio": 1.0226758968270613,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/11/small"
+            },
+            {
+              "before_ns": 273792.25625,
+              "after_ns": 288259.8046875,
+              "ratio": 1.0528413353819974,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/12/small"
+            },
+            {
+              "before_ns": 258601.63194444444,
+              "after_ns": 283581.59375,
+              "ratio": 1.0965963038118878,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/13/small"
+            },
+            {
+              "before_ns": 295561.46875,
+              "after_ns": 288760.2388392857,
+              "ratio": 0.976988780237565,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/14/small"
+            },
+            {
+              "before_ns": 294023.90625,
+              "after_ns": 286175.21875,
+              "ratio": 0.97330595460722,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/15/small"
+            },
+            {
+              "before_ns": 291100.1779513889,
+              "after_ns": 287678.040625,
+              "ratio": 0.9882441249247181,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/16/small"
+            },
+            {
+              "before_ns": 296613.0,
+              "after_ns": 285529.60243055556,
+              "ratio": 0.9626334733492988,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/17/small"
+            },
+            {
+              "before_ns": 283035.10590277775,
+              "after_ns": 287815.96875,
+              "ratio": 1.0168914129290536,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/18/small"
+            },
+            {
+              "before_ns": 290963.671875,
+              "after_ns": 297965.965625,
+              "ratio": 1.0240658694773699,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/19/small"
+            },
+            {
+              "before_ns": 290125.375,
+              "after_ns": 287850.2560763889,
+              "ratio": 0.9921581525793423,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/20/small"
+            }
+          ],
+          "status": "pass",
+          "ratio": 1.0060784021100708,
+          "lower_95": 0.976988780237565,
+          "upper_95": 1.023663205184202
+        }
+      },
+      "per_iteration": {
+        "diagnostic/output_retention/curves@300": {
+          "observations": [
+            {
+              "before_ns": 1481619.434375,
+              "after_ns": 1448801.3875000002,
+              "ratio": 0.9778498809386611,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/0/per_iteration"
+            },
+            {
+              "before_ns": 1443958.6416666666,
+              "after_ns": 1448187.946875,
+              "ratio": 1.002928965613206,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/1/per_iteration"
+            },
+            {
+              "before_ns": 1445576.2375,
+              "after_ns": 1466135.9736111113,
+              "ratio": 1.0142225194201224,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/2/per_iteration"
+            },
+            {
+              "before_ns": 1447382.75625,
+              "after_ns": 1449906.56875,
+              "ratio": 1.0017437077297637,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/3/per_iteration"
+            },
+            {
+              "before_ns": 1458641.275,
+              "after_ns": 1458671.225,
+              "ratio": 1.0000205328071496,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/4/per_iteration"
+            },
+            {
+              "before_ns": 1472924.5833333335,
+              "after_ns": 1483768.725,
+              "ratio": 1.0073623196933312,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/5/per_iteration"
+            },
+            {
+              "before_ns": 1482718.38125,
+              "after_ns": 1450320.9583333335,
+              "ratio": 0.9781499822715126,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/6/per_iteration"
+            },
+            {
+              "before_ns": 1491454.3058035714,
+              "after_ns": 1502496.265625,
+              "ratio": 1.0074034851610687,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/7/per_iteration"
+            },
+            {
+              "before_ns": 1444674.55,
+              "after_ns": 1441628.225,
+              "ratio": 0.9978913416866103,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/8/per_iteration"
+            },
+            {
+              "before_ns": 1467280.6666666665,
+              "after_ns": 1449419.125,
+              "ratio": 0.9878267722921451,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/9/per_iteration"
+            },
+            {
+              "before_ns": 1461104.7098214286,
+              "after_ns": 1460872.5666666667,
+              "ratio": 0.9998411180573155,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/10/per_iteration"
+            },
+            {
+              "before_ns": 1460035.9263392857,
+              "after_ns": 1480772.41875,
+              "ratio": 1.0142027275059637,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/11/per_iteration"
+            },
+            {
+              "before_ns": 1433501.2482142858,
+              "after_ns": 1452587.5125,
+              "ratio": 1.0133144385534996,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/12/per_iteration"
+            },
+            {
+              "before_ns": 1465434.0740740742,
+              "after_ns": 1466552.38125,
+              "ratio": 1.0007631234974748,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/13/per_iteration"
+            },
+            {
+              "before_ns": 1439240.3375,
+              "after_ns": 1450005.075,
+              "ratio": 1.0074794578914448,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/14/per_iteration"
+            },
+            {
+              "before_ns": 1485002.6291666667,
+              "after_ns": 1469710.6845238095,
+              "ratio": 0.9897024124115938,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/15/per_iteration"
+            },
+            {
+              "before_ns": 1475271.665625,
+              "after_ns": 1502844.8875,
+              "ratio": 1.0186902673707345,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/16/per_iteration"
+            },
+            {
+              "before_ns": 1468185.875,
+              "after_ns": 1446660.2625,
+              "ratio": 0.9853386326169361,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/17/per_iteration"
+            },
+            {
+              "before_ns": 1483276.1666666665,
+              "after_ns": 1448028.9625,
+              "ratio": 0.9762369240747144,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/18/per_iteration"
+            },
+            {
+              "before_ns": 1433389.9625,
+              "after_ns": 1420222.865625,
+              "ratio": 0.9908140162694911,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/19/per_iteration"
+            },
+            {
+              "before_ns": 1466112.2625,
+              "after_ns": 1441103.7125,
+              "ratio": 0.9829422680379497,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/20/per_iteration"
+            }
+          ],
+          "status": "pass",
+          "ratio": 1.0000205328071496,
+          "lower_95": 0.9897024124115938,
+          "upper_95": 1.0073623196933312
+        },
+        "diagnostic/output_retention/rect_fills@300": {
+          "observations": [
+            {
+              "before_ns": 1356491.2738095238,
+              "after_ns": 1349247.05,
+              "ratio": 0.9946595868698961,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/0/per_iteration"
+            },
+            {
+              "before_ns": 1350751.6448412698,
+              "after_ns": 1329258.275,
+              "ratio": 0.9840878447763832,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/1/per_iteration"
+            },
+            {
+              "before_ns": 1415793.596875,
+              "after_ns": 1356395.6892857142,
+              "ratio": 0.958046209757982,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/2/per_iteration"
+            },
+            {
+              "before_ns": 1353147.53125,
+              "after_ns": 1326121.2222222222,
+              "ratio": 0.9800270787895451,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/3/per_iteration"
+            },
+            {
+              "before_ns": 1353633.5964285715,
+              "after_ns": 1349195.9900793652,
+              "ratio": 0.9967217078824621,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/4/per_iteration"
+            },
+            {
+              "before_ns": 1372488.2003968256,
+              "after_ns": 1356550.125,
+              "ratio": 0.9883874590745353,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/5/per_iteration"
+            },
+            {
+              "before_ns": 1388942.5267857143,
+              "after_ns": 1337856.2544642857,
+              "ratio": 0.9632193043727646,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/6/per_iteration"
+            },
+            {
+              "before_ns": 1375958.5555555555,
+              "after_ns": 1324992.0857142857,
+              "ratio": 0.9629592987118049,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/7/per_iteration"
+            },
+            {
+              "before_ns": 1280963.5666666667,
+              "after_ns": 1370843.2138888887,
+              "ratio": 1.0701656546377096,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/8/per_iteration"
+            },
+            {
+              "before_ns": 1350079.4642857143,
+              "after_ns": 1361267.5178571427,
+              "ratio": 1.0082869592993533,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/9/per_iteration"
+            },
+            {
+              "before_ns": 1322509.6892857142,
+              "after_ns": 1348466.6507936507,
+              "ratio": 1.01962704826908,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/10/per_iteration"
+            },
+            {
+              "before_ns": 1372085.3472222222,
+              "after_ns": 1377726.9089285715,
+              "ratio": 1.0041116696696533,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/11/per_iteration"
+            },
+            {
+              "before_ns": 1301007.111111111,
+              "after_ns": 1321776.4361111112,
+              "ratio": 1.0159640364934381,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/12/per_iteration"
+            },
+            {
+              "before_ns": 1362058.0125000002,
+              "after_ns": 1387497.74375,
+              "ratio": 1.018677421237959,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/13/per_iteration"
+            },
+            {
+              "before_ns": 1348247.3948412698,
+              "after_ns": 1378362.5019841269,
+              "ratio": 1.0223364845784868,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/14/per_iteration"
+            },
+            {
+              "before_ns": 1374821.8125,
+              "after_ns": 1382363.1875,
+              "ratio": 1.0054853472147687,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/15/per_iteration"
+            },
+            {
+              "before_ns": 1364427.2444444445,
+              "after_ns": 1336983.3928571427,
+              "ratio": 0.9798861744376292,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/16/per_iteration"
+            },
+            {
+              "before_ns": 1330881.5868055555,
+              "after_ns": 1341521.1567460317,
+              "ratio": 1.0079943775959916,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/17/per_iteration"
+            },
+            {
+              "before_ns": 1388611.925595238,
+              "after_ns": 1338198.9980158731,
+              "ratio": 0.9636954525233858,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/18/per_iteration"
+            },
+            {
+              "before_ns": 1356931.1904761905,
+              "after_ns": 1360964.978174603,
+              "ratio": 1.0029727282611853,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/19/per_iteration"
+            },
+            {
+              "before_ns": 1372468.5083333333,
+              "after_ns": 1346738.6125,
+              "ratio": 0.9812528333603964,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/20/per_iteration"
+            }
+          ],
+          "status": "pass",
+          "ratio": 0.9967217078824621,
+          "lower_95": 0.9812528333603964,
+          "upper_95": 1.0079943775959916
+        },
+        "diagnostic/output_retention/strokes@300": {
+          "observations": [
+            {
+              "before_ns": 1504611.0208333335,
+              "after_ns": 1497673.4166666665,
+              "ratio": 0.9953891045123247,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/0/per_iteration"
+            },
+            {
+              "before_ns": 1523209.1875,
+              "after_ns": 1497699.9166666665,
+              "ratio": 0.9832529431658686,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/1/per_iteration"
+            },
+            {
+              "before_ns": 1457387.1666666667,
+              "after_ns": 1469224.99375,
+              "ratio": 1.008122637109814,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/2/per_iteration"
+            },
+            {
+              "before_ns": 1555133.2916666665,
+              "after_ns": 1565109.6822916665,
+              "ratio": 1.0064151353960844,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/3/per_iteration"
+            },
+            {
+              "before_ns": 1546036.375,
+              "after_ns": 1509857.1354166665,
+              "ratio": 0.9765987138670438,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/4/per_iteration"
+            },
+            {
+              "before_ns": 1460302.6481481483,
+              "after_ns": 1499000.6124999998,
+              "ratio": 1.026499961772257,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/5/per_iteration"
+            },
+            {
+              "before_ns": 1570108.3666666667,
+              "after_ns": 1485470.9799107143,
+              "ratio": 0.9460945571956685,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/6/per_iteration"
+            },
+            {
+              "before_ns": 1509097.6296296297,
+              "after_ns": 1551990.96875,
+              "ratio": 1.0284231704286073,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/7/per_iteration"
+            },
+            {
+              "before_ns": 1484843.962962963,
+              "after_ns": 1546682.2722222223,
+              "ratio": 1.041646335104372,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/8/per_iteration"
+            },
+            {
+              "before_ns": 1572703.496031746,
+              "after_ns": 1487997.6666666665,
+              "ratio": 0.94613998787514,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/9/per_iteration"
+            },
+            {
+              "before_ns": 1458598.375,
+              "after_ns": 1484456.859375,
+              "ratio": 1.0177283101491184,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/10/per_iteration"
+            },
+            {
+              "before_ns": 1487478.8694444445,
+              "after_ns": 1543122.6458333335,
+              "ratio": 1.037408112163416,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/11/per_iteration"
+            },
+            {
+              "before_ns": 1513567.25,
+              "after_ns": 1533807.7916666665,
+              "ratio": 1.0133727402377837,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/12/per_iteration"
+            },
+            {
+              "before_ns": 1472542.9739583335,
+              "after_ns": 1487117.6979166665,
+              "ratio": 1.0098976561065345,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/13/per_iteration"
+            },
+            {
+              "before_ns": 1479144.6611111113,
+              "after_ns": 1439098.638888889,
+              "ratio": 0.9729262300875018,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/14/per_iteration"
+            },
+            {
+              "before_ns": 1521804.2592592593,
+              "after_ns": 1502413.09375,
+              "ratio": 0.9872577794474711,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/15/per_iteration"
+            },
+            {
+              "before_ns": 1496497.4791666665,
+              "after_ns": 1473926.1666666665,
+              "ratio": 0.984917239878968,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/16/per_iteration"
+            },
+            {
+              "before_ns": 1490367.1166666667,
+              "after_ns": 1477086.9625,
+              "ratio": 0.9910893403255105,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/17/per_iteration"
+            },
+            {
+              "before_ns": 1501230.576388889,
+              "after_ns": 1527774.701388889,
+              "ratio": 1.0176815776453543,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/18/per_iteration"
+            },
+            {
+              "before_ns": 1520604.4722222222,
+              "after_ns": 1484168.534375,
+              "ratio": 0.9760385172391514,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/19/per_iteration"
+            },
+            {
+              "before_ns": 1504629.5513888889,
+              "after_ns": 1521250.875,
+              "ratio": 1.0110467879590483,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/20/per_iteration"
+            }
+          ],
+          "status": "pass",
+          "ratio": 1.0064151353960844,
+          "lower_95": 0.984917239878968,
+          "upper_95": 1.0133727402377837
+        },
+        "diagnostic/output_retention/text_type3@150": {
+          "observations": [
+            {
+              "before_ns": 231976.121875,
+              "after_ns": 230065.825,
+              "ratio": 0.9917651141869276,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/0/per_iteration"
+            },
+            {
+              "before_ns": 235526.185,
+              "after_ns": 239413.23583333334,
+              "ratio": 1.0165036886804468,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/1/per_iteration"
+            },
+            {
+              "before_ns": 231121.7575,
+              "after_ns": 232995.70416666666,
+              "ratio": 1.008108049570654,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/2/per_iteration"
+            },
+            {
+              "before_ns": 237828.93361111113,
+              "after_ns": 241518.49375000002,
+              "ratio": 1.0155135041093104,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/3/per_iteration"
+            },
+            {
+              "before_ns": 231106.8482142857,
+              "after_ns": 230904.92233560092,
+              "ratio": 0.9991262661394718,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/4/per_iteration"
+            },
+            {
+              "before_ns": 234010.79791666666,
+              "after_ns": 238350.54875000002,
+              "ratio": 1.018545087970166,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/5/per_iteration"
+            },
+            {
+              "before_ns": 232092.93333333335,
+              "after_ns": 239926.88642857142,
+              "ratio": 1.0337535183976796,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/6/per_iteration"
+            },
+            {
+              "before_ns": 229546.95,
+              "after_ns": 236631.13124999998,
+              "ratio": 1.0308615786443687,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/7/per_iteration"
+            },
+            {
+              "before_ns": 238788.63680555555,
+              "after_ns": 246428.87375,
+              "ratio": 1.031995814569124,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/8/per_iteration"
+            },
+            {
+              "before_ns": 234743.0675,
+              "after_ns": 229936.003125,
+              "ratio": 0.979522017726892,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/9/per_iteration"
+            },
+            {
+              "before_ns": 231785.46031746033,
+              "after_ns": 235884.2,
+              "ratio": 1.01768333387662,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/10/per_iteration"
+            },
+            {
+              "before_ns": 234680.42291666666,
+              "after_ns": 232180.70625,
+              "ratio": 0.9893484226950012,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/11/per_iteration"
+            },
+            {
+              "before_ns": 232893.09999999998,
+              "after_ns": 233244.00916666666,
+              "ratio": 1.0015067392149732,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/12/per_iteration"
+            },
+            {
+              "before_ns": 234154.02346938776,
+              "after_ns": 242472.51333333334,
+              "ratio": 1.0355257182460207,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/13/per_iteration"
+            },
+            {
+              "before_ns": 230775.34375,
+              "after_ns": 235309.56875,
+              "ratio": 1.0196477878716192,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/14/per_iteration"
+            },
+            {
+              "before_ns": 232553.61527777778,
+              "after_ns": 235663.72291666665,
+              "ratio": 1.0133737230237163,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/15/per_iteration"
+            },
+            {
+              "before_ns": 234376.07565789472,
+              "after_ns": 236247.26666666666,
+              "ratio": 1.007983711663059,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/16/per_iteration"
+            },
+            {
+              "before_ns": 237329.48154761904,
+              "after_ns": 230882.40238095238,
+              "ratio": 0.9728348997156804,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/17/per_iteration"
+            },
+            {
+              "before_ns": 230968.92361111112,
+              "after_ns": 233128.09642857144,
+              "ratio": 1.0093483261025011,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/18/per_iteration"
+            },
+            {
+              "before_ns": 236351.20104166667,
+              "after_ns": 236419.25083333335,
+              "ratio": 1.000287918112397,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/19/per_iteration"
+            },
+            {
+              "before_ns": 242465.94736842107,
+              "after_ns": 233601.62,
+              "ratio": 0.9634409389663615,
+              "raw_directory": "<workspace>/target/font-linux-recheck-20261009/pipeline-batching/runs/20/per_iteration"
+            }
+          ],
+          "status": "pass",
+          "ratio": 1.0093483261025011,
+          "lower_95": 1.000287918112397,
+          "upper_95": 1.01768333387662
+        }
+      }
+    },
+    "original_captures": {
+      "control": {
+        "source_tree_sha256": "000722df3bbb63d698a47d3963f601a7f31f3c1bcda93822898c493d75219692",
+        "executables": {
+          "stages": {
+            "path": "<workspace>/target/font-linux-recheck-20261009/pipeline/control/executables/stages",
+            "sha256": "d5fa4c9e993cd62fd88fff04df5c2ec27f63c00024e0f458b542eb1309c4e43c"
+          },
+          "fonts": {
+            "path": "<workspace>/target/font-linux-recheck-20261009/pipeline/control/executables/fonts",
+            "sha256": "ee5ad94752d7a708e95cea51ea7a48198c1913c709ee5e239a1fff5eb5e087ba",
+            "previous_capture_source": "55958f86c1dcbb5f727135fb264578c947b25d28b05605afa03f116d138f8217",
+            "byte_identical": true
+          },
+          "font_diagnostics": {
+            "path": "<workspace>/target/font-linux-recheck-20261009/pipeline/control/executables/font_diagnostics",
+            "sha256": "6424067450db49544db7204bfc73fdb2bf67531668315db920e28e1d72856322",
+            "previous_capture_source": "55958f86c1dcbb5f727135fb264578c947b25d28b05605afa03f116d138f8217",
+            "byte_identical": true
+          }
+        },
+        "cases": [
+          "stages/encode/clip-synthetic@150",
+          "stages/encode/clip-synthetic@300",
+          "stages/encode/clip-synthetic@96",
+          "stages/encode/curves-synthetic@150",
+          "stages/encode/curves-synthetic@300",
+          "stages/encode/curves-synthetic@96",
+          "stages/encode/image_rgb-synthetic@150",
+          "stages/encode/image_rgb-synthetic@300",
+          "stages/encode/image_rgb-synthetic@96",
+          "stages/encode/image_under_clip-synthetic@150",
+          "stages/encode/image_under_clip-synthetic@300",
+          "stages/encode/image_under_clip-synthetic@96",
+          "stages/encode/pattern_tiling-synthetic@150",
+          "stages/encode/pattern_tiling-synthetic@300",
+          "stages/encode/pattern_tiling-synthetic@96",
+          "stages/encode/pattern_tiling_uncolored-synthetic@150",
+          "stages/encode/pattern_tiling_uncolored-synthetic@300",
+          "stages/encode/pattern_tiling_uncolored-synthetic@96",
+          "stages/encode/rect_fills-synthetic@150",
+          "stages/encode/rect_fills-synthetic@300",
+          "stages/encode/rect_fills-synthetic@96",
+          "stages/encode/strokes-synthetic@150",
+          "stages/encode/strokes-synthetic@300",
+          "stages/encode/strokes-synthetic@96",
+          "stages/encode/text_type3-synthetic@150",
+          "stages/encode/text_type3-synthetic@300",
+          "stages/encode/text_type3-synthetic@96",
+          "stages/interpret/clip-synthetic@150",
+          "stages/interpret/clip-synthetic@300",
+          "stages/interpret/clip-synthetic@96",
+          "stages/interpret/curves-synthetic@150",
+          "stages/interpret/curves-synthetic@300",
+          "stages/interpret/curves-synthetic@96",
+          "stages/interpret/image_rgb-synthetic@150",
+          "stages/interpret/image_rgb-synthetic@300",
+          "stages/interpret/image_rgb-synthetic@96",
+          "stages/interpret/image_under_clip-synthetic@150",
+          "stages/interpret/image_under_clip-synthetic@300",
+          "stages/interpret/image_under_clip-synthetic@96",
+          "stages/interpret/pattern_tiling-synthetic@150",
+          "stages/interpret/pattern_tiling-synthetic@300",
+          "stages/interpret/pattern_tiling-synthetic@96",
+          "stages/interpret/pattern_tiling_uncolored-synthetic@150",
+          "stages/interpret/pattern_tiling_uncolored-synthetic@300",
+          "stages/interpret/pattern_tiling_uncolored-synthetic@96",
+          "stages/interpret/rect_fills-synthetic@150",
+          "stages/interpret/rect_fills-synthetic@300",
+          "stages/interpret/rect_fills-synthetic@96",
+          "stages/interpret/strokes-synthetic@150",
+          "stages/interpret/strokes-synthetic@300",
+          "stages/interpret/strokes-synthetic@96",
+          "stages/interpret/text_type3-synthetic@150",
+          "stages/interpret/text_type3-synthetic@300",
+          "stages/interpret/text_type3-synthetic@96",
+          "stages/parse/clip-synthetic@150",
+          "stages/parse/clip-synthetic@300",
+          "stages/parse/clip-synthetic@96",
+          "stages/parse/curves-synthetic@150",
+          "stages/parse/curves-synthetic@300",
+          "stages/parse/curves-synthetic@96",
+          "stages/parse/image_rgb-synthetic@150",
+          "stages/parse/image_rgb-synthetic@300",
+          "stages/parse/image_rgb-synthetic@96",
+          "stages/parse/image_under_clip-synthetic@150",
+          "stages/parse/image_under_clip-synthetic@300",
+          "stages/parse/image_under_clip-synthetic@96",
+          "stages/parse/pattern_tiling-synthetic@150",
+          "stages/parse/pattern_tiling-synthetic@300",
+          "stages/parse/pattern_tiling-synthetic@96",
+          "stages/parse/pattern_tiling_uncolored-synthetic@150",
+          "stages/parse/pattern_tiling_uncolored-synthetic@300",
+          "stages/parse/pattern_tiling_uncolored-synthetic@96",
+          "stages/parse/rect_fills-synthetic@150",
+          "stages/parse/rect_fills-synthetic@300",
+          "stages/parse/rect_fills-synthetic@96",
+          "stages/parse/strokes-synthetic@150",
+          "stages/parse/strokes-synthetic@300",
+          "stages/parse/strokes-synthetic@96",
+          "stages/parse/text_type3-synthetic@150",
+          "stages/parse/text_type3-synthetic@300",
+          "stages/parse/text_type3-synthetic@96",
+          "stages/render_cpu/clip-synthetic@150",
+          "stages/render_cpu/clip-synthetic@300",
+          "stages/render_cpu/clip-synthetic@96",
+          "stages/render_cpu/curves-synthetic@150",
+          "stages/render_cpu/curves-synthetic@300",
+          "stages/render_cpu/curves-synthetic@96",
+          "stages/render_cpu/image_rgb-synthetic@150",
+          "stages/render_cpu/image_rgb-synthetic@300",
+          "stages/render_cpu/image_rgb-synthetic@96",
+          "stages/render_cpu/image_under_clip-synthetic@150",
+          "stages/render_cpu/image_under_clip-synthetic@300",
+          "stages/render_cpu/image_under_clip-synthetic@96",
+          "stages/render_cpu/pattern_tiling-synthetic@150",
+          "stages/render_cpu/pattern_tiling-synthetic@300",
+          "stages/render_cpu/pattern_tiling-synthetic@96",
+          "stages/render_cpu/pattern_tiling_uncolored-synthetic@150",
+          "stages/render_cpu/pattern_tiling_uncolored-synthetic@300",
+          "stages/render_cpu/pattern_tiling_uncolored-synthetic@96",
+          "stages/render_cpu/rect_fills-synthetic@150",
+          "stages/render_cpu/rect_fills-synthetic@300",
+          "stages/render_cpu/rect_fills-synthetic@96",
+          "stages/render_cpu/strokes-synthetic@150",
+          "stages/render_cpu/strokes-synthetic@300",
+          "stages/render_cpu/strokes-synthetic@96",
+          "stages/render_cpu/text_type3-synthetic@150",
+          "stages/render_cpu/text_type3-synthetic@300",
+          "stages/render_cpu/text_type3-synthetic@96",
+          "stages/total/clip-synthetic@150",
+          "stages/total/clip-synthetic@300",
+          "stages/total/clip-synthetic@96",
+          "stages/total/curves-synthetic@150",
+          "stages/total/curves-synthetic@300",
+          "stages/total/curves-synthetic@96",
+          "stages/total/image_rgb-synthetic@150",
+          "stages/total/image_rgb-synthetic@300",
+          "stages/total/image_rgb-synthetic@96",
+          "stages/total/image_under_clip-synthetic@150",
+          "stages/total/image_under_clip-synthetic@300",
+          "stages/total/image_under_clip-synthetic@96",
+          "stages/total/pattern_tiling-synthetic@150",
+          "stages/total/pattern_tiling-synthetic@300",
+          "stages/total/pattern_tiling-synthetic@96",
+          "stages/total/pattern_tiling_uncolored-synthetic@150",
+          "stages/total/pattern_tiling_uncolored-synthetic@300",
+          "stages/total/pattern_tiling_uncolored-synthetic@96",
+          "stages/total/rect_fills-synthetic@150",
+          "stages/total/rect_fills-synthetic@300",
+          "stages/total/rect_fills-synthetic@96",
+          "stages/total/strokes-synthetic@150",
+          "stages/total/strokes-synthetic@300",
+          "stages/total/strokes-synthetic@96",
+          "stages/total/text_type3-synthetic@150",
+          "stages/total/text_type3-synthetic@300",
+          "stages/total/text_type3-synthetic@96"
+        ],
+        "inputs": {
+          "crates/zpdf-benches/benches/stages.rs": "54eab03a96376bb32c4b0d7295eff4b0f6c89b0230144ad00a525296cbc583bb",
+          "crates/zpdf-benches/benches/common/mod.rs": "49f8f77e882a1ec2178faadd9033f0ef540c0e2461a69725663dedbe657dc4c4",
+          "crates/zpdf-benches/src/pipeline.rs": "bc185b35b4509ba5a0243fb6b05f6e043d6f3c6d0f953c6ffc8177723eca3750",
+          "crates/zpdf-benches/src/corpus.rs": "063a03b1a1a7a41060c215f5fcd5bd9f4c2f08d7a95bfa2869bb28c88c97456e",
+          "crates/zpdf-benches/src/classify.rs": "e22eebc09ead434de9d8f217bcadd438011f884767089624435867b0d734e106",
+          "tests/corpus/clip.pdf": "1de13a10a5670a52f07c38bd2f063cfb5981b7956d2a0e0d204b015977558840",
+          "tests/corpus/curves.pdf": "3a38866f96cee614bf63e8af38f5adbb2b67b67a797ef60e4b358f3f78517d06",
+          "tests/corpus/image_rgb.pdf": "ee6402870e5627270649cf9141478af325d9f5ded0fe3745922f75a9c6beda15",
+          "tests/corpus/image_under_clip.pdf": "a819663d5de6236961c7b03316d2d9e479eafbd9edb5c8f18565bd7e030db37f",
+          "tests/corpus/pattern_tiling.pdf": "ee4fae37cdb04956b03e701a6ad2909e11dd11bf70996683adb89bfad1e30964",
+          "tests/corpus/pattern_tiling_uncolored.pdf": "80a780443037436d3c2aa35be23eaa17e041af8d56cedc1c8ea550e82c4d75ce",
+          "tests/corpus/rect_fills.pdf": "4b0ffee346ef71e4f084f45eb231775eb35c5e54de41816d940d742f6ecc797b",
+          "tests/corpus/strokes.pdf": "d4e08027004ca1f7c116615eef21920434a9cefcf500f3bc966c5247f49ba76f",
+          "tests/corpus/text_type3.pdf": "447142b468ec2c91acad01df4fd0831c0c68283e99105429ff3af3684e701fd4"
+        },
+        "cargo_lock_sha256": "ab2ad856223e787aded67906f4ad9bf95f32005cbd0e2d932041a9af22eb0ef5"
+      },
+      "current": {
+        "source_tree_sha256": "cd4c6f1aa4ce74ef65b2564edc1c215a91689d185664385e0a581731ebbcc912",
+        "executables": {
+          "stages": {
+            "path": "<workspace>/target/font-linux-recheck-20261009/pipeline/current/executables/stages",
+            "sha256": "9ccc340143f336db8febd69d355d01211c9ed0a1d709c5f33aad9e9ebdb138c6"
+          },
+          "fonts": {
+            "path": "<workspace>/target/font-linux-recheck-20261009/pipeline/current/executables/fonts",
+            "sha256": "233bfa0007bd89d543a1c260210928857cf041e93a0d08b1840776f63393b3aa",
+            "previous_capture_source": "11f20688d746c1f2ed3883588023be862d4821293372e8c3e02fc0ee5f84aa67",
+            "byte_identical": true
+          },
+          "font_diagnostics": {
+            "path": "<workspace>/target/font-linux-recheck-20261009/pipeline/current/executables/font_diagnostics",
+            "sha256": "8a33e0ed72b2da4e3ea0a73c99745b0b85c6964bc020927d793a5c4d50c39009",
+            "previous_capture_source": "11f20688d746c1f2ed3883588023be862d4821293372e8c3e02fc0ee5f84aa67",
+            "byte_identical": true
+          }
+        },
+        "cases": [
+          "stages/encode/clip-synthetic@150",
+          "stages/encode/clip-synthetic@300",
+          "stages/encode/clip-synthetic@96",
+          "stages/encode/curves-synthetic@150",
+          "stages/encode/curves-synthetic@300",
+          "stages/encode/curves-synthetic@96",
+          "stages/encode/image_rgb-synthetic@150",
+          "stages/encode/image_rgb-synthetic@300",
+          "stages/encode/image_rgb-synthetic@96",
+          "stages/encode/image_under_clip-synthetic@150",
+          "stages/encode/image_under_clip-synthetic@300",
+          "stages/encode/image_under_clip-synthetic@96",
+          "stages/encode/pattern_tiling-synthetic@150",
+          "stages/encode/pattern_tiling-synthetic@300",
+          "stages/encode/pattern_tiling-synthetic@96",
+          "stages/encode/pattern_tiling_uncolored-synthetic@150",
+          "stages/encode/pattern_tiling_uncolored-synthetic@300",
+          "stages/encode/pattern_tiling_uncolored-synthetic@96",
+          "stages/encode/rect_fills-synthetic@150",
+          "stages/encode/rect_fills-synthetic@300",
+          "stages/encode/rect_fills-synthetic@96",
+          "stages/encode/strokes-synthetic@150",
+          "stages/encode/strokes-synthetic@300",
+          "stages/encode/strokes-synthetic@96",
+          "stages/encode/text_type3-synthetic@150",
+          "stages/encode/text_type3-synthetic@300",
+          "stages/encode/text_type3-synthetic@96",
+          "stages/interpret/clip-synthetic@150",
+          "stages/interpret/clip-synthetic@300",
+          "stages/interpret/clip-synthetic@96",
+          "stages/interpret/curves-synthetic@150",
+          "stages/interpret/curves-synthetic@300",
+          "stages/interpret/curves-synthetic@96",
+          "stages/interpret/image_rgb-synthetic@150",
+          "stages/interpret/image_rgb-synthetic@300",
+          "stages/interpret/image_rgb-synthetic@96",
+          "stages/interpret/image_under_clip-synthetic@150",
+          "stages/interpret/image_under_clip-synthetic@300",
+          "stages/interpret/image_under_clip-synthetic@96",
+          "stages/interpret/pattern_tiling-synthetic@150",
+          "stages/interpret/pattern_tiling-synthetic@300",
+          "stages/interpret/pattern_tiling-synthetic@96",
+          "stages/interpret/pattern_tiling_uncolored-synthetic@150",
+          "stages/interpret/pattern_tiling_uncolored-synthetic@300",
+          "stages/interpret/pattern_tiling_uncolored-synthetic@96",
+          "stages/interpret/rect_fills-synthetic@150",
+          "stages/interpret/rect_fills-synthetic@300",
+          "stages/interpret/rect_fills-synthetic@96",
+          "stages/interpret/strokes-synthetic@150",
+          "stages/interpret/strokes-synthetic@300",
+          "stages/interpret/strokes-synthetic@96",
+          "stages/interpret/text_type3-synthetic@150",
+          "stages/interpret/text_type3-synthetic@300",
+          "stages/interpret/text_type3-synthetic@96",
+          "stages/parse/clip-synthetic@150",
+          "stages/parse/clip-synthetic@300",
+          "stages/parse/clip-synthetic@96",
+          "stages/parse/curves-synthetic@150",
+          "stages/parse/curves-synthetic@300",
+          "stages/parse/curves-synthetic@96",
+          "stages/parse/image_rgb-synthetic@150",
+          "stages/parse/image_rgb-synthetic@300",
+          "stages/parse/image_rgb-synthetic@96",
+          "stages/parse/image_under_clip-synthetic@150",
+          "stages/parse/image_under_clip-synthetic@300",
+          "stages/parse/image_under_clip-synthetic@96",
+          "stages/parse/pattern_tiling-synthetic@150",
+          "stages/parse/pattern_tiling-synthetic@300",
+          "stages/parse/pattern_tiling-synthetic@96",
+          "stages/parse/pattern_tiling_uncolored-synthetic@150",
+          "stages/parse/pattern_tiling_uncolored-synthetic@300",
+          "stages/parse/pattern_tiling_uncolored-synthetic@96",
+          "stages/parse/rect_fills-synthetic@150",
+          "stages/parse/rect_fills-synthetic@300",
+          "stages/parse/rect_fills-synthetic@96",
+          "stages/parse/strokes-synthetic@150",
+          "stages/parse/strokes-synthetic@300",
+          "stages/parse/strokes-synthetic@96",
+          "stages/parse/text_type3-synthetic@150",
+          "stages/parse/text_type3-synthetic@300",
+          "stages/parse/text_type3-synthetic@96",
+          "stages/render_cpu/clip-synthetic@150",
+          "stages/render_cpu/clip-synthetic@300",
+          "stages/render_cpu/clip-synthetic@96",
+          "stages/render_cpu/curves-synthetic@150",
+          "stages/render_cpu/curves-synthetic@300",
+          "stages/render_cpu/curves-synthetic@96",
+          "stages/render_cpu/image_rgb-synthetic@150",
+          "stages/render_cpu/image_rgb-synthetic@300",
+          "stages/render_cpu/image_rgb-synthetic@96",
+          "stages/render_cpu/image_under_clip-synthetic@150",
+          "stages/render_cpu/image_under_clip-synthetic@300",
+          "stages/render_cpu/image_under_clip-synthetic@96",
+          "stages/render_cpu/pattern_tiling-synthetic@150",
+          "stages/render_cpu/pattern_tiling-synthetic@300",
+          "stages/render_cpu/pattern_tiling-synthetic@96",
+          "stages/render_cpu/pattern_tiling_uncolored-synthetic@150",
+          "stages/render_cpu/pattern_tiling_uncolored-synthetic@300",
+          "stages/render_cpu/pattern_tiling_uncolored-synthetic@96",
+          "stages/render_cpu/rect_fills-synthetic@150",
+          "stages/render_cpu/rect_fills-synthetic@300",
+          "stages/render_cpu/rect_fills-synthetic@96",
+          "stages/render_cpu/strokes-synthetic@150",
+          "stages/render_cpu/strokes-synthetic@300",
+          "stages/render_cpu/strokes-synthetic@96",
+          "stages/render_cpu/text_type3-synthetic@150",
+          "stages/render_cpu/text_type3-synthetic@300",
+          "stages/render_cpu/text_type3-synthetic@96",
+          "stages/total/clip-synthetic@150",
+          "stages/total/clip-synthetic@300",
+          "stages/total/clip-synthetic@96",
+          "stages/total/curves-synthetic@150",
+          "stages/total/curves-synthetic@300",
+          "stages/total/curves-synthetic@96",
+          "stages/total/image_rgb-synthetic@150",
+          "stages/total/image_rgb-synthetic@300",
+          "stages/total/image_rgb-synthetic@96",
+          "stages/total/image_under_clip-synthetic@150",
+          "stages/total/image_under_clip-synthetic@300",
+          "stages/total/image_under_clip-synthetic@96",
+          "stages/total/pattern_tiling-synthetic@150",
+          "stages/total/pattern_tiling-synthetic@300",
+          "stages/total/pattern_tiling-synthetic@96",
+          "stages/total/pattern_tiling_uncolored-synthetic@150",
+          "stages/total/pattern_tiling_uncolored-synthetic@300",
+          "stages/total/pattern_tiling_uncolored-synthetic@96",
+          "stages/total/rect_fills-synthetic@150",
+          "stages/total/rect_fills-synthetic@300",
+          "stages/total/rect_fills-synthetic@96",
+          "stages/total/strokes-synthetic@150",
+          "stages/total/strokes-synthetic@300",
+          "stages/total/strokes-synthetic@96",
+          "stages/total/text_type3-synthetic@150",
+          "stages/total/text_type3-synthetic@300",
+          "stages/total/text_type3-synthetic@96"
+        ],
+        "inputs": {
+          "crates/zpdf-benches/benches/stages.rs": "54eab03a96376bb32c4b0d7295eff4b0f6c89b0230144ad00a525296cbc583bb",
+          "crates/zpdf-benches/benches/common/mod.rs": "49f8f77e882a1ec2178faadd9033f0ef540c0e2461a69725663dedbe657dc4c4",
+          "crates/zpdf-benches/src/pipeline.rs": "bc185b35b4509ba5a0243fb6b05f6e043d6f3c6d0f953c6ffc8177723eca3750",
+          "crates/zpdf-benches/src/corpus.rs": "063a03b1a1a7a41060c215f5fcd5bd9f4c2f08d7a95bfa2869bb28c88c97456e",
+          "crates/zpdf-benches/src/classify.rs": "e22eebc09ead434de9d8f217bcadd438011f884767089624435867b0d734e106",
+          "tests/corpus/clip.pdf": "1de13a10a5670a52f07c38bd2f063cfb5981b7956d2a0e0d204b015977558840",
+          "tests/corpus/curves.pdf": "3a38866f96cee614bf63e8af38f5adbb2b67b67a797ef60e4b358f3f78517d06",
+          "tests/corpus/image_rgb.pdf": "ee6402870e5627270649cf9141478af325d9f5ded0fe3745922f75a9c6beda15",
+          "tests/corpus/image_under_clip.pdf": "a819663d5de6236961c7b03316d2d9e479eafbd9edb5c8f18565bd7e030db37f",
+          "tests/corpus/pattern_tiling.pdf": "ee4fae37cdb04956b03e701a6ad2909e11dd11bf70996683adb89bfad1e30964",
+          "tests/corpus/pattern_tiling_uncolored.pdf": "80a780443037436d3c2aa35be23eaa17e041af8d56cedc1c8ea550e82c4d75ce",
+          "tests/corpus/rect_fills.pdf": "4b0ffee346ef71e4f084f45eb231775eb35c5e54de41816d940d742f6ecc797b",
+          "tests/corpus/strokes.pdf": "d4e08027004ca1f7c116615eef21920434a9cefcf500f3bc966c5247f49ba76f",
+          "tests/corpus/text_type3.pdf": "447142b468ec2c91acad01df4fd0831c0c68283e99105429ff3af3684e701fd4"
+        },
+        "cargo_lock_sha256": "c87db93c73d6e6df6f0118ab11f873f2d695db66cc264c4f6414693331644157"
+      }
+    },
+    "diagnostic_source_sha256": {
+      "Cargo.toml": "7db8a4f628fb0853fa688b482ec676ebc6b90add384c4e8bb94788e43cdb802a",
+      "retention.rs": "6f846c2c2a875ab524d3f005ce3d8911d9baf18b495491df755f00e9075b968a"
+    },
+    "executable_sha256": "704e125491d78d4caa65122192196dfb3f6e358d1823a8f35d026711d909cbe2",
+    "cargo_lock_sha256": "82dea414498a02eaeac811e51a8ded274ea4f9a3c9697abdbaff4328c4194782",
+    "matched_third_party_packages": 178,
+    "finished_unix": 1791544558.918931
+  },
+  "per_iteration_over_small": {
+    "diagnostic/output_retention/curves@300": {
+      "ratio": 0.4936957144160233,
+      "lower_95": 0.4552856128202961,
+      "upper_95": 0.5231819814013017,
+      "block_ratios": [
+        0.6298760438798559,
+        0.4943608325546025,
+        0.48405100484921454,
+        0.4227803492693678,
+        0.4246838070991395,
+        0.4936957144160233,
+        0.49460185823750075,
+        0.6303348990074847,
+        0.5305521877799777,
+        0.45046612754577464,
+        0.48518428526142937,
+        0.4573199901941395,
+        0.4174394001163249,
+        0.5231819814013017,
+        0.4423704714648026,
+        0.45244180023926756,
+        0.561657874313315,
+        0.49406105814573426,
+        0.5802332394396497,
+        0.4552856128202961,
+        0.6330639190392868
+      ]
+    },
+    "diagnostic/output_retention/rect_fills@300": {
+      "ratio": 0.9490795532029543,
+      "lower_95": 0.9283169776804354,
+      "upper_95": 0.9562092382279788,
+      "block_ratios": [
+        0.7787458997205035,
+        0.9549900885458356,
+        0.9171719364896797,
+        0.9256398899118026,
+        0.9283169776804354,
+        0.9446022402280482,
+        0.9490795532029543,
+        0.90315872979567,
+        0.9519333663562793,
+        0.9562092382279788,
+        0.7970783265931061,
+        0.9837759744264444,
+        0.9384550782607702,
+        0.9597935728612389,
+        0.9562951427510294,
+        0.9673710937163869,
+        0.952706597543731,
+        0.9441342800773241,
+        0.9635421307708724,
+        0.9796007466033094,
+        0.9188979786989745
+      ]
+    },
+    "diagnostic/output_retention/strokes@300": {
+      "ratio": 0.9594578175885337,
+      "lower_95": 0.9445297747360235,
+      "upper_95": 0.9784547647878088,
+      "block_ratios": [
+        0.7915958823559853,
+        0.9660257609249434,
+        0.8086395395322361,
+        0.9859695708614635,
+        0.9843264153108835,
+        0.9468735912989082,
+        0.9979893332501024,
+        0.9200189138299103,
+        1.0147277022525154,
+        0.9969150657782577,
+        0.805037922905026,
+        0.9784165029678821,
+        0.9888231026108214,
+        0.9439343063806692,
+        0.9594578175885337,
+        0.9445297747360235,
+        0.9523033697435769,
+        0.958503650124193,
+        0.9784547647878088,
+        0.9644986053903071,
+        0.8930823146681948
+      ]
+    },
+    "diagnostic/output_retention/text_type3@150": {
+      "ratio": 0.8151583005774481,
+      "lower_95": 0.8130111241620994,
+      "upper_95": 0.8301578990720706,
+      "block_ratios": [
+        0.8328300242151522,
+        0.817424143783629,
+        0.809648049231551,
+        0.8389563561221008,
+        0.8098552474227,
+        0.8134587056330179,
+        0.8581132344999011,
+        0.8150101700709199,
+        0.8326004849666918,
+        0.833344394053445,
+        0.8151583005774481,
+        0.8301578990720706,
+        0.8296232898178358,
+        0.8798880496785543,
+        0.797667491575269,
+        0.8070502595872991,
+        0.8131402218000073,
+        0.8043602502809525,
+        0.8130111241620994,
+        0.8028189412294369,
+        0.8235446200881428
+      ]
+    }
+  }
+}

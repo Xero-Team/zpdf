@@ -1,0 +1,7133 @@
+{
+  "scope": "Standalone diagnostic only; not performance acceptance",
+  "source_sha256": "594f9676ae8b5f6cba2274d83730f3d9e0417355b49571601ca7f55a44d8dc36",
+  "executable_sha256": "122d1d448cc570e7e8cd89435b05fc3ce012a2f205adc60151a1fa197ce4d177",
+  "records": [
+    {
+      "pair": 0,
+      "mode": "normal",
+      "path": "target/font-copy-probe-v2-results/0-normal.jsonl",
+      "environment": {
+        "kind": "environment",
+        "mode": "normal",
+        "qos": 33,
+        "iterations": 50000,
+        "batches": 32,
+        "bytes": 21088
+      },
+      "batches": [
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 0,
+          "ns_per_op": 17.28834,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 1,
+          "ns_per_op": 17.21084,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 2,
+          "ns_per_op": 17.11418,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 3,
+          "ns_per_op": 17.17584,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 4,
+          "ns_per_op": 17.14416,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 5,
+          "ns_per_op": 17.19332,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 6,
+          "ns_per_op": 17.19834,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 7,
+          "ns_per_op": 17.19084,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 8,
+          "ns_per_op": 17.21416,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 9,
+          "ns_per_op": 17.21668,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 10,
+          "ns_per_op": 17.29666,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 11,
+          "ns_per_op": 17.19916,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 12,
+          "ns_per_op": 18.07668,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 13,
+          "ns_per_op": 17.60668,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 14,
+          "ns_per_op": 17.8,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 15,
+          "ns_per_op": 17.51334,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 16,
+          "ns_per_op": 17.48166,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 17,
+          "ns_per_op": 17.50584,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 18,
+          "ns_per_op": 17.51166,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 19,
+          "ns_per_op": 17.48084,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 20,
+          "ns_per_op": 17.48666,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 21,
+          "ns_per_op": 17.68084,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 22,
+          "ns_per_op": 17.67334,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 23,
+          "ns_per_op": 18.10916,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 24,
+          "ns_per_op": 17.88166,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 25,
+          "ns_per_op": 17.87668,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 26,
+          "ns_per_op": 17.78416,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 27,
+          "ns_per_op": 17.78,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 28,
+          "ns_per_op": 17.70582,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 29,
+          "ns_per_op": 17.715,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 30,
+          "ns_per_op": 17.89416,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 31,
+          "ns_per_op": 18.09,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 0,
+          "ns_per_op": 604.83334,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 1,
+          "ns_per_op": 605.025,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 2,
+          "ns_per_op": 604.2875,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 3,
+          "ns_per_op": 604.67334,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 4,
+          "ns_per_op": 605.50418,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 5,
+          "ns_per_op": 605.47416,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 6,
+          "ns_per_op": 606.25,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 7,
+          "ns_per_op": 604.9825,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 8,
+          "ns_per_op": 603.86584,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 9,
+          "ns_per_op": 606.235,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 10,
+          "ns_per_op": 605.5325,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 11,
+          "ns_per_op": 604.935,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 12,
+          "ns_per_op": 604.72584,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 13,
+          "ns_per_op": 606.15416,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 14,
+          "ns_per_op": 605.495,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 15,
+          "ns_per_op": 606.58334,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 16,
+          "ns_per_op": 603.88334,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 17,
+          "ns_per_op": 605.99082,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 18,
+          "ns_per_op": 605.32916,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 19,
+          "ns_per_op": 604.06166,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 20,
+          "ns_per_op": 604.55834,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 21,
+          "ns_per_op": 494.1775,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 22,
+          "ns_per_op": 248.70166,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 23,
+          "ns_per_op": 248.32084,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 24,
+          "ns_per_op": 248.12,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 25,
+          "ns_per_op": 248.31666,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 26,
+          "ns_per_op": 279.04,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 27,
+          "ns_per_op": 287.14416,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 28,
+          "ns_per_op": 304.27834,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 29,
+          "ns_per_op": 404.67168,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 30,
+          "ns_per_op": 322.63,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 31,
+          "ns_per_op": 252.5125,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 0,
+          "ns_per_op": 680.15666,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 1,
+          "ns_per_op": 676.0475,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 2,
+          "ns_per_op": 676.30082,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 3,
+          "ns_per_op": 678.4375,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 4,
+          "ns_per_op": 678.18916,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 5,
+          "ns_per_op": 678.0275,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 6,
+          "ns_per_op": 677.09168,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 7,
+          "ns_per_op": 677.48084,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 8,
+          "ns_per_op": 677.65416,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 9,
+          "ns_per_op": 678.33918,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 10,
+          "ns_per_op": 677.41,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 11,
+          "ns_per_op": 677.02,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 12,
+          "ns_per_op": 678.92582,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 13,
+          "ns_per_op": 678.21916,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 14,
+          "ns_per_op": 676.62332,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 15,
+          "ns_per_op": 677.04084,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 16,
+          "ns_per_op": 677.79,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 17,
+          "ns_per_op": 677.55834,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 18,
+          "ns_per_op": 675.365,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 19,
+          "ns_per_op": 677.61416,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 20,
+          "ns_per_op": 677.69166,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 21,
+          "ns_per_op": 677.10168,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 22,
+          "ns_per_op": 676.06416,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 23,
+          "ns_per_op": 511.80084,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 24,
+          "ns_per_op": 294.75334,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 25,
+          "ns_per_op": 295.77084,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 26,
+          "ns_per_op": 294.01,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 27,
+          "ns_per_op": 292.76168,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 28,
+          "ns_per_op": 326.68332,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 29,
+          "ns_per_op": 342.70584,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 30,
+          "ns_per_op": 379.05332,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 31,
+          "ns_per_op": 549.78668,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        }
+      ]
+    },
+    {
+      "pair": 0,
+      "mode": "user_initiated",
+      "path": "target/font-copy-probe-v2-results/0-user_initiated.jsonl",
+      "environment": {
+        "kind": "environment",
+        "mode": "user_initiated",
+        "qos": 25,
+        "iterations": 50000,
+        "batches": 32,
+        "bytes": 21088
+      },
+      "batches": [
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 0,
+          "ns_per_op": 18.02166,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 1,
+          "ns_per_op": 17.935,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 2,
+          "ns_per_op": 17.9275,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 3,
+          "ns_per_op": 18.12834,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 4,
+          "ns_per_op": 18.96666,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 5,
+          "ns_per_op": 18.65666,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 6,
+          "ns_per_op": 18.35584,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 7,
+          "ns_per_op": 18.34166,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 8,
+          "ns_per_op": 18.35832,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 9,
+          "ns_per_op": 18.4675,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 10,
+          "ns_per_op": 18.38668,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 11,
+          "ns_per_op": 18.3975,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 12,
+          "ns_per_op": 18.47416,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 13,
+          "ns_per_op": 18.4925,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 14,
+          "ns_per_op": 18.50166,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 15,
+          "ns_per_op": 18.27916,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 16,
+          "ns_per_op": 18.42666,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 17,
+          "ns_per_op": 18.52918,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 18,
+          "ns_per_op": 18.24832,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 19,
+          "ns_per_op": 18.45916,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 20,
+          "ns_per_op": 20.15416,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 21,
+          "ns_per_op": 20.03584,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 22,
+          "ns_per_op": 20.16,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 23,
+          "ns_per_op": 19.97,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 24,
+          "ns_per_op": 20.01416,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 25,
+          "ns_per_op": 20.0025,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 26,
+          "ns_per_op": 20.3075,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 27,
+          "ns_per_op": 20.26916,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 28,
+          "ns_per_op": 20.38584,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 29,
+          "ns_per_op": 20.44334,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 30,
+          "ns_per_op": 20.7225,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 31,
+          "ns_per_op": 20.76082,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 0,
+          "ns_per_op": 619.65082,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 1,
+          "ns_per_op": 616.6775,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 2,
+          "ns_per_op": 618.945,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 3,
+          "ns_per_op": 490.79666,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 4,
+          "ns_per_op": 269.2675,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 5,
+          "ns_per_op": 252.95,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 6,
+          "ns_per_op": 245.0975,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 7,
+          "ns_per_op": 253.00668,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 8,
+          "ns_per_op": 278.86084,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 9,
+          "ns_per_op": 290.4,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 10,
+          "ns_per_op": 300.3825,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 11,
+          "ns_per_op": 452.6025,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 12,
+          "ns_per_op": 601.10166,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 13,
+          "ns_per_op": 601.655,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 14,
+          "ns_per_op": 601.76834,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 15,
+          "ns_per_op": 601.09418,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 16,
+          "ns_per_op": 601.46668,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 17,
+          "ns_per_op": 601.06584,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 18,
+          "ns_per_op": 600.6975,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 19,
+          "ns_per_op": 601.00168,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 20,
+          "ns_per_op": 496.9775,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 21,
+          "ns_per_op": 609.54918,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 22,
+          "ns_per_op": 617.2525,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 23,
+          "ns_per_op": 529.86584,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 24,
+          "ns_per_op": 251.21,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 25,
+          "ns_per_op": 251.59334,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 26,
+          "ns_per_op": 252.44918,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 27,
+          "ns_per_op": 262.205,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 28,
+          "ns_per_op": 287.5175,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 29,
+          "ns_per_op": 301.59582,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 30,
+          "ns_per_op": 322.84,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 31,
+          "ns_per_op": 501.76584,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 0,
+          "ns_per_op": 676.4775,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 1,
+          "ns_per_op": 675.90168,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 2,
+          "ns_per_op": 676.845,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 3,
+          "ns_per_op": 677.47334,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 4,
+          "ns_per_op": 676.76582,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 5,
+          "ns_per_op": 677.4675,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 6,
+          "ns_per_op": 676.5575,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 7,
+          "ns_per_op": 677.4675,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 8,
+          "ns_per_op": 676.2725,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 9,
+          "ns_per_op": 676.26418,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 10,
+          "ns_per_op": 676.45584,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 11,
+          "ns_per_op": 677.08332,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 12,
+          "ns_per_op": 675.63666,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 13,
+          "ns_per_op": 676.3675,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 14,
+          "ns_per_op": 677.46084,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 15,
+          "ns_per_op": 675.94418,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 16,
+          "ns_per_op": 677.55418,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 17,
+          "ns_per_op": 676.45168,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 18,
+          "ns_per_op": 676.28416,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 19,
+          "ns_per_op": 676.10084,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 20,
+          "ns_per_op": 677.32,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 21,
+          "ns_per_op": 677.16168,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 22,
+          "ns_per_op": 675.73166,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 23,
+          "ns_per_op": 675.62834,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 24,
+          "ns_per_op": 676.92082,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 25,
+          "ns_per_op": 676.10668,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 26,
+          "ns_per_op": 676.18082,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 27,
+          "ns_per_op": 677.14584,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 28,
+          "ns_per_op": 681.8075,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 29,
+          "ns_per_op": 679.25084,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 30,
+          "ns_per_op": 682.88334,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 31,
+          "ns_per_op": 680.055,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        }
+      ]
+    },
+    {
+      "pair": 1,
+      "mode": "user_initiated",
+      "path": "target/font-copy-probe-v2-results/1-user_initiated.jsonl",
+      "environment": {
+        "kind": "environment",
+        "mode": "user_initiated",
+        "qos": 25,
+        "iterations": 50000,
+        "batches": 32,
+        "bytes": 21088
+      },
+      "batches": [
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 0,
+          "ns_per_op": 19.7425,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 1,
+          "ns_per_op": 19.72084,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 2,
+          "ns_per_op": 19.73082,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 3,
+          "ns_per_op": 19.71834,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 4,
+          "ns_per_op": 20.0525,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 5,
+          "ns_per_op": 19.81,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 6,
+          "ns_per_op": 19.8625,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 7,
+          "ns_per_op": 19.80082,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 8,
+          "ns_per_op": 20.13834,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 9,
+          "ns_per_op": 18.95584,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 10,
+          "ns_per_op": 18.82666,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 11,
+          "ns_per_op": 18.88668,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 12,
+          "ns_per_op": 18.99332,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 13,
+          "ns_per_op": 19.1725,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 14,
+          "ns_per_op": 19.23,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 15,
+          "ns_per_op": 19.31584,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 16,
+          "ns_per_op": 19.36916,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 17,
+          "ns_per_op": 19.34834,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 18,
+          "ns_per_op": 19.4275,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 19,
+          "ns_per_op": 19.56416,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 20,
+          "ns_per_op": 19.445,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 21,
+          "ns_per_op": 19.48334,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 22,
+          "ns_per_op": 19.615,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 23,
+          "ns_per_op": 19.445,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 24,
+          "ns_per_op": 19.45,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 25,
+          "ns_per_op": 19.65416,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 26,
+          "ns_per_op": 19.4625,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 27,
+          "ns_per_op": 19.45,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 28,
+          "ns_per_op": 19.44166,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 29,
+          "ns_per_op": 19.10084,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 30,
+          "ns_per_op": 18.6575,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 31,
+          "ns_per_op": 18.59168,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 0,
+          "ns_per_op": 514.5,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 1,
+          "ns_per_op": 515.60834,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 2,
+          "ns_per_op": 513.99666,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 3,
+          "ns_per_op": 517.3625,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 4,
+          "ns_per_op": 518.695,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 5,
+          "ns_per_op": 518.5175,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 6,
+          "ns_per_op": 519.38082,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 7,
+          "ns_per_op": 518.68584,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 8,
+          "ns_per_op": 518.8825,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 9,
+          "ns_per_op": 517.73082,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 10,
+          "ns_per_op": 518.41,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 11,
+          "ns_per_op": 520.38918,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 12,
+          "ns_per_op": 522.505,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 13,
+          "ns_per_op": 522.575,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 14,
+          "ns_per_op": 521.66666,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 15,
+          "ns_per_op": 522.44582,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 16,
+          "ns_per_op": 522.25916,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 17,
+          "ns_per_op": 522.89834,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 18,
+          "ns_per_op": 521.99,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 19,
+          "ns_per_op": 528.70332,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 20,
+          "ns_per_op": 532.94166,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 21,
+          "ns_per_op": 533.49916,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 22,
+          "ns_per_op": 395.34084,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 23,
+          "ns_per_op": 239.67416,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 24,
+          "ns_per_op": 239.02918,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 25,
+          "ns_per_op": 239.73418,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 26,
+          "ns_per_op": 248.70918,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 27,
+          "ns_per_op": 270.36418,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 28,
+          "ns_per_op": 282.23332,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 29,
+          "ns_per_op": 291.43416,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 30,
+          "ns_per_op": 424.55834,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 31,
+          "ns_per_op": 558.20168,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 0,
+          "ns_per_op": 603.7075,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 1,
+          "ns_per_op": 578.135,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 2,
+          "ns_per_op": 571.15582,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 3,
+          "ns_per_op": 372.195,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 4,
+          "ns_per_op": 271.7625,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 5,
+          "ns_per_op": 258.24918,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 6,
+          "ns_per_op": 263.40584,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 7,
+          "ns_per_op": 277.98,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 8,
+          "ns_per_op": 282.785,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 9,
+          "ns_per_op": 286.92666,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 10,
+          "ns_per_op": 382.6425,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 11,
+          "ns_per_op": 479.36332,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 12,
+          "ns_per_op": 502.74,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 13,
+          "ns_per_op": 488.15834,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 14,
+          "ns_per_op": 485.765,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 15,
+          "ns_per_op": 479.49084,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 16,
+          "ns_per_op": 490.44832,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 17,
+          "ns_per_op": 490.11584,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 18,
+          "ns_per_op": 480.58416,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 19,
+          "ns_per_op": 481.20582,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 20,
+          "ns_per_op": 465.31416,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 21,
+          "ns_per_op": 468.79084,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 22,
+          "ns_per_op": 462.23,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 23,
+          "ns_per_op": 451.06166,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 24,
+          "ns_per_op": 451.92,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 25,
+          "ns_per_op": 440.695,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 26,
+          "ns_per_op": 426.93668,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 27,
+          "ns_per_op": 421.6175,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 28,
+          "ns_per_op": 423.63416,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 29,
+          "ns_per_op": 423.44082,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 30,
+          "ns_per_op": 413.0825,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 31,
+          "ns_per_op": 399.06916,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        }
+      ]
+    },
+    {
+      "pair": 1,
+      "mode": "normal",
+      "path": "target/font-copy-probe-v2-results/1-normal.jsonl",
+      "environment": {
+        "kind": "environment",
+        "mode": "normal",
+        "qos": 33,
+        "iterations": 50000,
+        "batches": 32,
+        "bytes": 21088
+      },
+      "batches": [
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 0,
+          "ns_per_op": 18.39166,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 1,
+          "ns_per_op": 18.25166,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 2,
+          "ns_per_op": 18.23916,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 3,
+          "ns_per_op": 18.41418,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 4,
+          "ns_per_op": 18.27332,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 5,
+          "ns_per_op": 18.2475,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 6,
+          "ns_per_op": 18.26916,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 7,
+          "ns_per_op": 18.3375,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 8,
+          "ns_per_op": 18.3675,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 9,
+          "ns_per_op": 18.7775,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 10,
+          "ns_per_op": 19.2825,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 11,
+          "ns_per_op": 18.93918,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 12,
+          "ns_per_op": 18.95168,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 13,
+          "ns_per_op": 19.2375,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 14,
+          "ns_per_op": 19.21584,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 15,
+          "ns_per_op": 19.48916,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 16,
+          "ns_per_op": 19.19084,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 17,
+          "ns_per_op": 19.24166,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 18,
+          "ns_per_op": 19.24418,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 19,
+          "ns_per_op": 19.24916,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 20,
+          "ns_per_op": 19.7425,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 21,
+          "ns_per_op": 20.02666,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 22,
+          "ns_per_op": 19.3275,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 23,
+          "ns_per_op": 19.34668,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 24,
+          "ns_per_op": 19.31416,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 25,
+          "ns_per_op": 19.35332,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 26,
+          "ns_per_op": 19.32332,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 27,
+          "ns_per_op": 19.31418,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 28,
+          "ns_per_op": 19.32916,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 29,
+          "ns_per_op": 19.31334,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 30,
+          "ns_per_op": 19.68,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 31,
+          "ns_per_op": 18.82668,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 0,
+          "ns_per_op": 277.92334,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 1,
+          "ns_per_op": 278.135,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 2,
+          "ns_per_op": 278.07916,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 3,
+          "ns_per_op": 277.23,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 4,
+          "ns_per_op": 280.5525,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 5,
+          "ns_per_op": 287.36582,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 6,
+          "ns_per_op": 287.98,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 7,
+          "ns_per_op": 287.41582,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 8,
+          "ns_per_op": 288.07334,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 9,
+          "ns_per_op": 288.04416,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 10,
+          "ns_per_op": 287.19168,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 11,
+          "ns_per_op": 287.03834,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 12,
+          "ns_per_op": 287.92834,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 13,
+          "ns_per_op": 286.92916,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 14,
+          "ns_per_op": 287.16666,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 15,
+          "ns_per_op": 287.46084,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 16,
+          "ns_per_op": 287.58334,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 17,
+          "ns_per_op": 287.31418,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 18,
+          "ns_per_op": 287.655,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 19,
+          "ns_per_op": 287.07084,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 20,
+          "ns_per_op": 287.45916,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 21,
+          "ns_per_op": 287.91,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 22,
+          "ns_per_op": 287.61834,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 23,
+          "ns_per_op": 288.1725,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 24,
+          "ns_per_op": 288.78834,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 25,
+          "ns_per_op": 287.84334,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 26,
+          "ns_per_op": 290.69834,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 27,
+          "ns_per_op": 291.9325,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 28,
+          "ns_per_op": 291.395,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 29,
+          "ns_per_op": 291.96916,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 30,
+          "ns_per_op": 291.93834,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 31,
+          "ns_per_op": 291.765,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 0,
+          "ns_per_op": 306.255,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 1,
+          "ns_per_op": 297.25418,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 2,
+          "ns_per_op": 353.33166,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 3,
+          "ns_per_op": 423.3975,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 4,
+          "ns_per_op": 427.2,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 5,
+          "ns_per_op": 420.27666,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 6,
+          "ns_per_op": 445.52084,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 7,
+          "ns_per_op": 429.2075,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 8,
+          "ns_per_op": 401.22582,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 9,
+          "ns_per_op": 393.09,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 10,
+          "ns_per_op": 390.7175,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 11,
+          "ns_per_op": 393.49332,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 12,
+          "ns_per_op": 395.58918,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 13,
+          "ns_per_op": 389.81334,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 14,
+          "ns_per_op": 390.47416,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 15,
+          "ns_per_op": 394.77166,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 16,
+          "ns_per_op": 391.23916,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 17,
+          "ns_per_op": 383.83584,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 18,
+          "ns_per_op": 388.39082,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 19,
+          "ns_per_op": 388.705,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 20,
+          "ns_per_op": 380.95166,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 21,
+          "ns_per_op": 383.5575,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 22,
+          "ns_per_op": 385.97,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 23,
+          "ns_per_op": 380.085,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 24,
+          "ns_per_op": 374.52084,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 25,
+          "ns_per_op": 384.0325,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 26,
+          "ns_per_op": 382.97916,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 27,
+          "ns_per_op": 384.12334,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 28,
+          "ns_per_op": 396.39666,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 29,
+          "ns_per_op": 378.775,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 30,
+          "ns_per_op": 379.21584,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 31,
+          "ns_per_op": 370.11584,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        }
+      ]
+    },
+    {
+      "pair": 2,
+      "mode": "normal",
+      "path": "target/font-copy-probe-v2-results/2-normal.jsonl",
+      "environment": {
+        "kind": "environment",
+        "mode": "normal",
+        "qos": 33,
+        "iterations": 50000,
+        "batches": 32,
+        "bytes": 21088
+      },
+      "batches": [
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 0,
+          "ns_per_op": 17.3725,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 1,
+          "ns_per_op": 17.42,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 2,
+          "ns_per_op": 17.6825,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 3,
+          "ns_per_op": 17.43,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 4,
+          "ns_per_op": 17.48666,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 5,
+          "ns_per_op": 17.54668,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 6,
+          "ns_per_op": 17.40916,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 7,
+          "ns_per_op": 17.54,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 8,
+          "ns_per_op": 17.50334,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 9,
+          "ns_per_op": 17.39668,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 10,
+          "ns_per_op": 17.36582,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 11,
+          "ns_per_op": 17.41166,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 12,
+          "ns_per_op": 17.42918,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 13,
+          "ns_per_op": 17.39416,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 14,
+          "ns_per_op": 17.38834,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 15,
+          "ns_per_op": 17.3975,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 16,
+          "ns_per_op": 17.39582,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 17,
+          "ns_per_op": 17.53916,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 18,
+          "ns_per_op": 17.37918,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 19,
+          "ns_per_op": 18.00166,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 20,
+          "ns_per_op": 18.2025,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 21,
+          "ns_per_op": 18.07916,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 22,
+          "ns_per_op": 18.21166,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 23,
+          "ns_per_op": 18.325,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 24,
+          "ns_per_op": 18.47416,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 25,
+          "ns_per_op": 18.455,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 26,
+          "ns_per_op": 18.605,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 27,
+          "ns_per_op": 18.95834,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 28,
+          "ns_per_op": 18.51834,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 29,
+          "ns_per_op": 18.77582,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 30,
+          "ns_per_op": 18.68416,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 31,
+          "ns_per_op": 18.52084,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 0,
+          "ns_per_op": 616.68582,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 1,
+          "ns_per_op": 615.18834,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 2,
+          "ns_per_op": 619.30332,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 3,
+          "ns_per_op": 296.96584,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 4,
+          "ns_per_op": 253.1475,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 5,
+          "ns_per_op": 253.1675,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 6,
+          "ns_per_op": 252.6525,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 7,
+          "ns_per_op": 284.79584,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 8,
+          "ns_per_op": 288.0325,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 9,
+          "ns_per_op": 310.01334,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 10,
+          "ns_per_op": 425.4,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 11,
+          "ns_per_op": 578.075,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 12,
+          "ns_per_op": 620.17418,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 13,
+          "ns_per_op": 615.30666,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 14,
+          "ns_per_op": 612.7025,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 15,
+          "ns_per_op": 612.40166,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 16,
+          "ns_per_op": 612.40668,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 17,
+          "ns_per_op": 612.52084,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 18,
+          "ns_per_op": 613.22084,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 19,
+          "ns_per_op": 612.50166,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 20,
+          "ns_per_op": 611.485,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 21,
+          "ns_per_op": 612.07166,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 22,
+          "ns_per_op": 612.03,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 23,
+          "ns_per_op": 350.39668,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 24,
+          "ns_per_op": 249.665,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 25,
+          "ns_per_op": 250.04834,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 26,
+          "ns_per_op": 250.08,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 27,
+          "ns_per_op": 252.28834,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 28,
+          "ns_per_op": 284.39168,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 29,
+          "ns_per_op": 292.4025,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 30,
+          "ns_per_op": 305.78834,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 31,
+          "ns_per_op": 434.36668,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 0,
+          "ns_per_op": 621.56416,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 1,
+          "ns_per_op": 582.32916,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 2,
+          "ns_per_op": 566.62416,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 3,
+          "ns_per_op": 568.17418,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 4,
+          "ns_per_op": 571.77334,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 5,
+          "ns_per_op": 565.11334,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 6,
+          "ns_per_op": 559.26832,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 7,
+          "ns_per_op": 507.635,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 8,
+          "ns_per_op": 312.995,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 9,
+          "ns_per_op": 306.06082,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 10,
+          "ns_per_op": 409.10084,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 11,
+          "ns_per_op": 519.3325,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 12,
+          "ns_per_op": 523.6325,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 13,
+          "ns_per_op": 520.91666,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 14,
+          "ns_per_op": 532.53166,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 15,
+          "ns_per_op": 525.08834,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 16,
+          "ns_per_op": 525.46082,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 17,
+          "ns_per_op": 520.26584,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 18,
+          "ns_per_op": 522.4075,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 19,
+          "ns_per_op": 509.14666,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 20,
+          "ns_per_op": 502.34834,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 21,
+          "ns_per_op": 487.56834,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 22,
+          "ns_per_op": 502.005,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 23,
+          "ns_per_op": 484.5825,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 24,
+          "ns_per_op": 479.42584,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 25,
+          "ns_per_op": 474.445,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 26,
+          "ns_per_op": 475.20916,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 27,
+          "ns_per_op": 475.08584,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 28,
+          "ns_per_op": 475.19916,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 29,
+          "ns_per_op": 488.32332,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 30,
+          "ns_per_op": 472.06916,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 31,
+          "ns_per_op": 482.40084,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 8192,
+          "sampled_destinations": 1
+        }
+      ]
+    },
+    {
+      "pair": 2,
+      "mode": "user_initiated",
+      "path": "target/font-copy-probe-v2-results/2-user_initiated.jsonl",
+      "environment": {
+        "kind": "environment",
+        "mode": "user_initiated",
+        "qos": 25,
+        "iterations": 50000,
+        "batches": 32,
+        "bytes": 21088
+      },
+      "batches": [
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 0,
+          "ns_per_op": 21.08084,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 1,
+          "ns_per_op": 20.54834,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 2,
+          "ns_per_op": 20.17334,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 3,
+          "ns_per_op": 20.16666,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 4,
+          "ns_per_op": 20.39082,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 5,
+          "ns_per_op": 19.73168,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 6,
+          "ns_per_op": 19.63,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 7,
+          "ns_per_op": 19.64168,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 8,
+          "ns_per_op": 19.71084,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 9,
+          "ns_per_op": 19.605,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 10,
+          "ns_per_op": 18.95166,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 11,
+          "ns_per_op": 18.76418,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 12,
+          "ns_per_op": 18.97,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 13,
+          "ns_per_op": 19.0325,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 14,
+          "ns_per_op": 19.04,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 15,
+          "ns_per_op": 19.0625,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 16,
+          "ns_per_op": 19.12584,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 17,
+          "ns_per_op": 19.11916,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 18,
+          "ns_per_op": 19.1625,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 19,
+          "ns_per_op": 18.03416,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 20,
+          "ns_per_op": 17.325,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 21,
+          "ns_per_op": 17.38168,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 22,
+          "ns_per_op": 17.90418,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 23,
+          "ns_per_op": 17.735,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 24,
+          "ns_per_op": 17.7875,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 25,
+          "ns_per_op": 18.11084,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 26,
+          "ns_per_op": 17.85416,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 27,
+          "ns_per_op": 17.88,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 28,
+          "ns_per_op": 17.85,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 29,
+          "ns_per_op": 17.85584,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 30,
+          "ns_per_op": 17.97666,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 31,
+          "ns_per_op": 17.905,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 0,
+          "ns_per_op": 353.50332,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 1,
+          "ns_per_op": 352.56582,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 2,
+          "ns_per_op": 353.08,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 3,
+          "ns_per_op": 353.81916,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 4,
+          "ns_per_op": 352.87834,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 5,
+          "ns_per_op": 346.4325,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 6,
+          "ns_per_op": 231.24166,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 7,
+          "ns_per_op": 251.75334,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 8,
+          "ns_per_op": 255.87418,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 9,
+          "ns_per_op": 255.07,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 10,
+          "ns_per_op": 254.1425,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 11,
+          "ns_per_op": 280.22168,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 12,
+          "ns_per_op": 289.15834,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 13,
+          "ns_per_op": 304.7175,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 14,
+          "ns_per_op": 305.79334,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 15,
+          "ns_per_op": 310.3825,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 16,
+          "ns_per_op": 388.325,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 17,
+          "ns_per_op": 568.3875,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 18,
+          "ns_per_op": 621.64082,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 19,
+          "ns_per_op": 621.18918,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 20,
+          "ns_per_op": 621.71582,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 21,
+          "ns_per_op": 557.14416,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 22,
+          "ns_per_op": 381.23334,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 23,
+          "ns_per_op": 273.3875,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 24,
+          "ns_per_op": 298.0825,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 25,
+          "ns_per_op": 262.01416,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 26,
+          "ns_per_op": 256.05,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 27,
+          "ns_per_op": 255.80416,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 28,
+          "ns_per_op": 256.24916,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 29,
+          "ns_per_op": 256.07916,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 30,
+          "ns_per_op": 256.15666,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 31,
+          "ns_per_op": 262.355,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 0,
+          "ns_per_op": 680.4725,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 1,
+          "ns_per_op": 678.4675,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 2,
+          "ns_per_op": 678.2525,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 3,
+          "ns_per_op": 678.02084,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 4,
+          "ns_per_op": 679.61418,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 5,
+          "ns_per_op": 577.515,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 6,
+          "ns_per_op": 574.10166,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 7,
+          "ns_per_op": 574.27,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 8,
+          "ns_per_op": 573.62416,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 9,
+          "ns_per_op": 574.30166,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 10,
+          "ns_per_op": 484.95082,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 11,
+          "ns_per_op": 293.92584,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 12,
+          "ns_per_op": 295.9225,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 13,
+          "ns_per_op": 296.02582,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 14,
+          "ns_per_op": 294.59666,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 15,
+          "ns_per_op": 325.14582,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 16,
+          "ns_per_op": 337.275,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 17,
+          "ns_per_op": 364.30666,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 18,
+          "ns_per_op": 541.08334,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 19,
+          "ns_per_op": 671.99832,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 20,
+          "ns_per_op": 670.37,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 21,
+          "ns_per_op": 671.615,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 22,
+          "ns_per_op": 670.33416,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 23,
+          "ns_per_op": 670.995,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 24,
+          "ns_per_op": 672.07168,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 25,
+          "ns_per_op": 623.50084,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 26,
+          "ns_per_op": 331.65334,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 27,
+          "ns_per_op": 328.30084,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 28,
+          "ns_per_op": 319.7025,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 29,
+          "ns_per_op": 311.26666,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 30,
+          "ns_per_op": 305.83334,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 31,
+          "ns_per_op": 302.55166,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        }
+      ]
+    },
+    {
+      "pair": 3,
+      "mode": "user_initiated",
+      "path": "target/font-copy-probe-v2-results/3-user_initiated.jsonl",
+      "environment": {
+        "kind": "environment",
+        "mode": "user_initiated",
+        "qos": 25,
+        "iterations": 50000,
+        "batches": 32,
+        "bytes": 21088
+      },
+      "batches": [
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 0,
+          "ns_per_op": 20.12916,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 1,
+          "ns_per_op": 22.22334,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 2,
+          "ns_per_op": 18.43334,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 3,
+          "ns_per_op": 23.04582,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 4,
+          "ns_per_op": 20.36416,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 5,
+          "ns_per_op": 20.09834,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 6,
+          "ns_per_op": 19.5375,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 7,
+          "ns_per_op": 18.86416,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 8,
+          "ns_per_op": 19.035,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 9,
+          "ns_per_op": 19.00334,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 10,
+          "ns_per_op": 20.16584,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 11,
+          "ns_per_op": 18.71832,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 12,
+          "ns_per_op": 17.96332,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 13,
+          "ns_per_op": 18.00416,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 14,
+          "ns_per_op": 18.15416,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 15,
+          "ns_per_op": 18.04916,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 16,
+          "ns_per_op": 18.05,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 17,
+          "ns_per_op": 18.135,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 18,
+          "ns_per_op": 18.27334,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 19,
+          "ns_per_op": 18.02334,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 20,
+          "ns_per_op": 18.155,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 21,
+          "ns_per_op": 18.12584,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 22,
+          "ns_per_op": 18.03334,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 23,
+          "ns_per_op": 18.02668,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 24,
+          "ns_per_op": 18.12,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 25,
+          "ns_per_op": 18.35334,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 26,
+          "ns_per_op": 17.40416,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 27,
+          "ns_per_op": 17.60084,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 28,
+          "ns_per_op": 18.2675,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 29,
+          "ns_per_op": 19.03334,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 30,
+          "ns_per_op": 18.7575,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 31,
+          "ns_per_op": 18.27834,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 0,
+          "ns_per_op": 332.10916,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 1,
+          "ns_per_op": 253.54084,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 2,
+          "ns_per_op": 255.16834,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 3,
+          "ns_per_op": 247.19584,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 4,
+          "ns_per_op": 277.83668,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 5,
+          "ns_per_op": 285.73584,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 6,
+          "ns_per_op": 302.30166,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 7,
+          "ns_per_op": 458.785,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 8,
+          "ns_per_op": 600.91416,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 9,
+          "ns_per_op": 600.95084,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 10,
+          "ns_per_op": 602.02,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 11,
+          "ns_per_op": 601.49416,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 12,
+          "ns_per_op": 620.92,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 13,
+          "ns_per_op": 615.57668,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 14,
+          "ns_per_op": 592.29168,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 15,
+          "ns_per_op": 253.925,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 16,
+          "ns_per_op": 259.46,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 17,
+          "ns_per_op": 253.03918,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 18,
+          "ns_per_op": 267.3125,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 19,
+          "ns_per_op": 286.625,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 20,
+          "ns_per_op": 301.94582,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 21,
+          "ns_per_op": 406.31418,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 22,
+          "ns_per_op": 596.34582,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 23,
+          "ns_per_op": 596.09166,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 24,
+          "ns_per_op": 596.3,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 25,
+          "ns_per_op": 609.67918,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 26,
+          "ns_per_op": 592.065,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 27,
+          "ns_per_op": 255.90918,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 28,
+          "ns_per_op": 254.19084,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 29,
+          "ns_per_op": 256.515,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 30,
+          "ns_per_op": 252.9525,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 31,
+          "ns_per_op": 266.465,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 0,
+          "ns_per_op": 670.005,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 1,
+          "ns_per_op": 670.08666,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 2,
+          "ns_per_op": 670.92084,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 3,
+          "ns_per_op": 671.13166,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 4,
+          "ns_per_op": 670.27916,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 5,
+          "ns_per_op": 673.25918,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 6,
+          "ns_per_op": 668.505,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 7,
+          "ns_per_op": 670.64666,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 8,
+          "ns_per_op": 670.95,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 9,
+          "ns_per_op": 669.41168,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 10,
+          "ns_per_op": 664.4775,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 11,
+          "ns_per_op": 623.44834,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 12,
+          "ns_per_op": 587.445,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 13,
+          "ns_per_op": 594.3475,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 14,
+          "ns_per_op": 593.3775,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 15,
+          "ns_per_op": 593.61916,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 16,
+          "ns_per_op": 594.29916,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 17,
+          "ns_per_op": 596.97584,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 18,
+          "ns_per_op": 596.73418,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 19,
+          "ns_per_op": 595.73332,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 20,
+          "ns_per_op": 599.995,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 21,
+          "ns_per_op": 551.1775,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 22,
+          "ns_per_op": 504.02418,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 23,
+          "ns_per_op": 643.28918,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 24,
+          "ns_per_op": 643.16,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 25,
+          "ns_per_op": 643.30668,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 26,
+          "ns_per_op": 646.62666,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 27,
+          "ns_per_op": 646.35084,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 28,
+          "ns_per_op": 646.79584,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 29,
+          "ns_per_op": 646.65,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 30,
+          "ns_per_op": 512.16584,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 31,
+          "ns_per_op": 538.99416,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        }
+      ]
+    },
+    {
+      "pair": 3,
+      "mode": "normal",
+      "path": "target/font-copy-probe-v2-results/3-normal.jsonl",
+      "environment": {
+        "kind": "environment",
+        "mode": "normal",
+        "qos": 33,
+        "iterations": 50000,
+        "batches": 32,
+        "bytes": 21088
+      },
+      "batches": [
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 0,
+          "ns_per_op": 19.6675,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 1,
+          "ns_per_op": 19.9425,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 2,
+          "ns_per_op": 19.55832,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 3,
+          "ns_per_op": 19.56584,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 4,
+          "ns_per_op": 19.73416,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 5,
+          "ns_per_op": 19.62,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 6,
+          "ns_per_op": 19.73332,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 7,
+          "ns_per_op": 19.55418,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 8,
+          "ns_per_op": 20.3025,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 9,
+          "ns_per_op": 19.6825,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 10,
+          "ns_per_op": 19.45166,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 11,
+          "ns_per_op": 18.95418,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 12,
+          "ns_per_op": 19.16334,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 13,
+          "ns_per_op": 19.38918,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 14,
+          "ns_per_op": 19.30418,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 15,
+          "ns_per_op": 19.355,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 16,
+          "ns_per_op": 19.41082,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 17,
+          "ns_per_op": 19.41668,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 18,
+          "ns_per_op": 19.39916,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 19,
+          "ns_per_op": 19.69418,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 20,
+          "ns_per_op": 19.66,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 21,
+          "ns_per_op": 19.855,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 22,
+          "ns_per_op": 19.81084,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 23,
+          "ns_per_op": 19.7825,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 24,
+          "ns_per_op": 19.96668,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 25,
+          "ns_per_op": 20.01,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 26,
+          "ns_per_op": 19.69,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 27,
+          "ns_per_op": 19.745,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 28,
+          "ns_per_op": 19.39584,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 29,
+          "ns_per_op": 19.37668,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 30,
+          "ns_per_op": 18.23584,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "allocate",
+          "batch": 31,
+          "ns_per_op": 18.155,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 0,
+          "ns_per_op": 564.22084,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 1,
+          "ns_per_op": 571.615,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 2,
+          "ns_per_op": 572.22668,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 3,
+          "ns_per_op": 477.29332,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 4,
+          "ns_per_op": 335.50584,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 5,
+          "ns_per_op": 251.44832,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 6,
+          "ns_per_op": 274.56166,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 7,
+          "ns_per_op": 283.75666,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 8,
+          "ns_per_op": 301.275,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 9,
+          "ns_per_op": 345.08584,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 10,
+          "ns_per_op": 521.2475,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 11,
+          "ns_per_op": 611.49166,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 12,
+          "ns_per_op": 611.96166,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 13,
+          "ns_per_op": 612.53582,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 14,
+          "ns_per_op": 611.75916,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 15,
+          "ns_per_op": 612.58,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 16,
+          "ns_per_op": 613.62584,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 17,
+          "ns_per_op": 614.03082,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 18,
+          "ns_per_op": 615.18834,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 19,
+          "ns_per_op": 613.82916,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 20,
+          "ns_per_op": 613.21334,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 21,
+          "ns_per_op": 612.09,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 22,
+          "ns_per_op": 527.115,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 23,
+          "ns_per_op": 250.90084,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 24,
+          "ns_per_op": 251.085,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 25,
+          "ns_per_op": 251.87168,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 26,
+          "ns_per_op": 261.91166,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 27,
+          "ns_per_op": 286.20418,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 28,
+          "ns_per_op": 300.62918,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 29,
+          "ns_per_op": 324.49666,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 30,
+          "ns_per_op": 476.50584,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "copy_preallocated",
+          "batch": 31,
+          "ns_per_op": 617.85332,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 0,
+          "ns_per_op": 624.40834,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 1,
+          "ns_per_op": 670.86166,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 2,
+          "ns_per_op": 669.15666,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 3,
+          "ns_per_op": 670.255,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 4,
+          "ns_per_op": 670.93084,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 5,
+          "ns_per_op": 562.75,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 6,
+          "ns_per_op": 304.01,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 7,
+          "ns_per_op": 305.29584,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 8,
+          "ns_per_op": 369.37166,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 9,
+          "ns_per_op": 309.86168,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 10,
+          "ns_per_op": 301.98666,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 11,
+          "ns_per_op": 302.67832,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 12,
+          "ns_per_op": 292.42916,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 13,
+          "ns_per_op": 303.475,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 14,
+          "ns_per_op": 301.49416,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 15,
+          "ns_per_op": 335.94166,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 16,
+          "ns_per_op": 352.81416,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 17,
+          "ns_per_op": 353.5625,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 18,
+          "ns_per_op": 440.47082,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 19,
+          "ns_per_op": 667.97584,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 20,
+          "ns_per_op": 681.2625,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 21,
+          "ns_per_op": 682.02584,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 22,
+          "ns_per_op": 686.93582,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 23,
+          "ns_per_op": 433.24168,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 24,
+          "ns_per_op": 303.83168,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 25,
+          "ns_per_op": 302.51916,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 26,
+          "ns_per_op": 307.52334,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 27,
+          "ns_per_op": 299.79666,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 28,
+          "ns_per_op": 303.28166,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 29,
+          "ns_per_op": 301.32668,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 30,
+          "ns_per_op": 306.37416,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        },
+        {
+          "kind": "batch",
+          "stage": "clone_heap",
+          "batch": 31,
+          "ns_per_op": 297.87332,
+          "source_mod_16k": 0,
+          "destination_mod_16k": 0,
+          "sampled_destinations": 1
+        }
+      ]
+    }
+  ],
+  "groups": {
+    "normal/allocate": {
+      "median_ns": 18.3525,
+      "min_ns": 17.11418,
+      "max_ns": 20.3025,
+      "coefficient_of_variation": 0.050468231093984885,
+      "sampled_destination_counts": [
+        1
+      ],
+      "source_offsets_16k": [
+        0
+      ],
+      "destination_offsets_16k": [
+        0
+      ]
+    },
+    "normal/copy_preallocated": {
+      "median_ns": 316.32167000000004,
+      "min_ns": 248.12,
+      "max_ns": 620.17418,
+      "coefficient_of_variation": 0.372043661588199,
+      "sampled_destination_counts": [
+        1
+      ],
+      "source_offsets_16k": [
+        0
+      ],
+      "destination_offsets_16k": [
+        0
+      ]
+    },
+    "normal/clone_heap": {
+      "median_ns": 458.795,
+      "min_ns": 292.42916,
+      "max_ns": 686.93582,
+      "coefficient_of_variation": 0.2911597899814872,
+      "sampled_destination_counts": [
+        1
+      ],
+      "source_offsets_16k": [
+        0
+      ],
+      "destination_offsets_16k": [
+        0,
+        8192
+      ]
+    },
+    "user_initiated/allocate": {
+      "median_ns": 18.998330000000003,
+      "min_ns": 17.325,
+      "max_ns": 23.04582,
+      "coefficient_of_variation": 0.05141844232075141,
+      "sampled_destination_counts": [
+        1
+      ],
+      "source_offsets_16k": [
+        0
+      ],
+      "destination_offsets_16k": [
+        0
+      ]
+    },
+    "user_initiated/copy_preallocated": {
+      "median_ns": 367.52625,
+      "min_ns": 231.24166,
+      "max_ns": 621.71582,
+      "coefficient_of_variation": 0.351519606762652,
+      "sampled_destination_counts": [
+        1
+      ],
+      "source_offsets_16k": [
+        0
+      ],
+      "destination_offsets_16k": [
+        0
+      ]
+    },
+    "user_initiated/clone_heap": {
+      "median_ns": 601.8512499999999,
+      "min_ns": 258.24918,
+      "max_ns": 682.88334,
+      "coefficient_of_variation": 0.24506071029890913,
+      "sampled_destination_counts": [
+        1
+      ],
+      "source_offsets_16k": [
+        0
+      ],
+      "destination_offsets_16k": [
+        0,
+        8192
+      ]
+    }
+  }
+}

@@ -1,0 +1,759 @@
+{
+  "scope": "Debugger-only allocator classification; all launches retained; not acceptance timings",
+  "binaries": [
+    {
+      "path": "target/font-benchmark-runs/run-zcaqwew_/executable/font_diagnostics",
+      "sha256": "1494bdcb5c046a77c1a12537c90a7f9fe0180382b8af80bc5388675ecda81f2d"
+    },
+    {
+      "path": "target/font-benchmark-runs/run-qwqd2mh0/executable/font_diagnostics",
+      "sha256": "9811213d8b861a759fe75dcc886c2106dda6e5791589973ef02071fbe5f37450"
+    }
+  ],
+  "records": [
+    {
+      "scope": "Debugger-only allocation inspection; no acceptance timing",
+      "aslr_disabled": false,
+      "allocations": {
+        "source": {
+          "request_bytes": 21088,
+          "type_descriptor": 1083905337,
+          "caller_pc": 4335621348,
+          "xzone_index": 226,
+          "pointer": 33063976960,
+          "entry_registers": {
+            "x0": 4349345792,
+            "x1": 21088,
+            "x2": 1083905337,
+            "x3": 0,
+            "lr": 4335621348,
+            "pc": 6626816348,
+            "sp": 6131385408
+          },
+          "bucket_registers": {
+            "x0": 4349345792,
+            "x1": 21088,
+            "x2": 226,
+            "x3": 0,
+            "lr": 4335621348,
+            "pc": 6626818384,
+            "sp": 6131385408
+          }
+        },
+        "destination": {
+          "request_bytes": 21088,
+          "type_descriptor": 1083906835,
+          "caller_pc": 4335627340,
+          "xzone_index": 225,
+          "pointer": 33068384256,
+          "entry_registers": {
+            "x0": 4349345792,
+            "x1": 21088,
+            "x2": 1083906835,
+            "x3": 0,
+            "lr": 4335627340,
+            "pc": 6626816348,
+            "sp": 6131381200
+          },
+          "bucket_registers": {
+            "x0": 4349345792,
+            "x1": 21088,
+            "x2": 225,
+            "x3": 0,
+            "lr": 4335627340,
+            "pc": 6626818384,
+            "sp": 6131381200
+          }
+        }
+      },
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "same_xzone": false,
+      "destination_minus_source": 4407296,
+      "run": 0,
+      "side": 0,
+      "log": "target/font-copy-allocator-inspection/0-0.log"
+    },
+    {
+      "scope": "Debugger-only allocation inspection; no acceptance timing",
+      "aslr_disabled": false,
+      "allocations": {
+        "source": {
+          "request_bytes": 21088,
+          "type_descriptor": 1084007737,
+          "caller_pc": 4336030948,
+          "xzone_index": 225,
+          "pointer": 43369398272,
+          "entry_registers": {
+            "x0": 4345331712,
+            "x1": 21088,
+            "x2": 1084007737,
+            "x3": 0,
+            "lr": 4336030948,
+            "pc": 6626816348,
+            "sp": 6130975808
+          },
+          "bucket_registers": {
+            "x0": 4345331712,
+            "x1": 21088,
+            "x2": 225,
+            "x3": 0,
+            "lr": 4336030948,
+            "pc": 6626818384,
+            "sp": 6130975808
+          }
+        },
+        "destination": {
+          "request_bytes": 21088,
+          "type_descriptor": 1084009235,
+          "caller_pc": 4336036940,
+          "xzone_index": 227,
+          "pointer": 43369529344,
+          "entry_registers": {
+            "x0": 4345331712,
+            "x1": 21088,
+            "x2": 1084009235,
+            "x3": 0,
+            "lr": 4336036940,
+            "pc": 6626816348,
+            "sp": 6130971600
+          },
+          "bucket_registers": {
+            "x0": 4345331712,
+            "x1": 21088,
+            "x2": 227,
+            "x3": 0,
+            "lr": 4336036940,
+            "pc": 6626818384,
+            "sp": 6130971600
+          }
+        }
+      },
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "same_xzone": false,
+      "destination_minus_source": 131072,
+      "run": 0,
+      "side": 1,
+      "log": "target/font-copy-allocator-inspection/0-1.log"
+    },
+    {
+      "scope": "Debugger-only allocation inspection; no acceptance timing",
+      "aslr_disabled": false,
+      "allocations": {
+        "source": {
+          "request_bytes": 21088,
+          "type_descriptor": 1093444921,
+          "caller_pc": 4373779684,
+          "xzone_index": 227,
+          "pointer": 50986385408,
+          "entry_registers": {
+            "x0": 4382769152,
+            "x1": 21088,
+            "x2": 1093444921,
+            "x3": 0,
+            "lr": 4373779684,
+            "pc": 6626816348,
+            "sp": 6093227072
+          },
+          "bucket_registers": {
+            "x0": 4382769152,
+            "x1": 21088,
+            "x2": 227,
+            "x3": 0,
+            "lr": 4373779684,
+            "pc": 6626818384,
+            "sp": 6093227072
+          }
+        },
+        "destination": {
+          "request_bytes": 21088,
+          "type_descriptor": 1093446419,
+          "caller_pc": 4373785676,
+          "xzone_index": 226,
+          "pointer": 50986516480,
+          "entry_registers": {
+            "x0": 4382769152,
+            "x1": 21088,
+            "x2": 1093446419,
+            "x3": 0,
+            "lr": 4373785676,
+            "pc": 6626816348,
+            "sp": 6093222864
+          },
+          "bucket_registers": {
+            "x0": 4382769152,
+            "x1": 21088,
+            "x2": 226,
+            "x3": 0,
+            "lr": 4373785676,
+            "pc": 6626818384,
+            "sp": 6093222864
+          }
+        }
+      },
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "same_xzone": false,
+      "destination_minus_source": 131072,
+      "run": 1,
+      "side": 1,
+      "log": "target/font-copy-allocator-inspection/1-1.log"
+    },
+    {
+      "scope": "Debugger-only allocation inspection; no acceptance timing",
+      "aslr_disabled": false,
+      "allocations": {
+        "source": {
+          "request_bytes": 21088,
+          "type_descriptor": 1075561785,
+          "caller_pc": 4302247140,
+          "xzone_index": 226,
+          "pointer": 32191561728,
+          "entry_registers": {
+            "x0": 4314021888,
+            "x1": 21088,
+            "x2": 1075561785,
+            "x3": 0,
+            "lr": 4302247140,
+            "pc": 6626816348,
+            "sp": 6164759616
+          },
+          "bucket_registers": {
+            "x0": 4314021888,
+            "x1": 21088,
+            "x2": 226,
+            "x3": 0,
+            "lr": 4302247140,
+            "pc": 6626818384,
+            "sp": 6164759616
+          }
+        },
+        "destination": {
+          "request_bytes": 21088,
+          "type_descriptor": 1075563283,
+          "caller_pc": 4302253132,
+          "xzone_index": 225,
+          "pointer": 32195952640,
+          "entry_registers": {
+            "x0": 4314021888,
+            "x1": 21088,
+            "x2": 1075563283,
+            "x3": 0,
+            "lr": 4302253132,
+            "pc": 6626816348,
+            "sp": 6164755408
+          },
+          "bucket_registers": {
+            "x0": 4314021888,
+            "x1": 21088,
+            "x2": 225,
+            "x3": 0,
+            "lr": 4302253132,
+            "pc": 6626818384,
+            "sp": 6164755408
+          }
+        }
+      },
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "same_xzone": false,
+      "destination_minus_source": 4390912,
+      "run": 1,
+      "side": 0,
+      "log": "target/font-copy-allocator-inspection/1-0.log"
+    },
+    {
+      "scope": "Debugger-only allocation inspection; no acceptance timing",
+      "aslr_disabled": false,
+      "allocations": {
+        "source": {
+          "request_bytes": 21088,
+          "type_descriptor": 1085302073,
+          "caller_pc": 4341208292,
+          "xzone_index": 228,
+          "pointer": 50109513728,
+          "entry_registers": {
+            "x0": 4349509632,
+            "x1": 21088,
+            "x2": 1085302073,
+            "x3": 0,
+            "lr": 4341208292,
+            "pc": 6626816348,
+            "sp": 6125798464
+          },
+          "bucket_registers": {
+            "x0": 4349509632,
+            "x1": 21088,
+            "x2": 228,
+            "x3": 0,
+            "lr": 4341208292,
+            "pc": 6626818384,
+            "sp": 6125798464
+          }
+        },
+        "destination": {
+          "request_bytes": 21088,
+          "type_descriptor": 1085303571,
+          "caller_pc": 4341214284,
+          "xzone_index": 227,
+          "pointer": 50114002944,
+          "entry_registers": {
+            "x0": 4349509632,
+            "x1": 21088,
+            "x2": 1085303571,
+            "x3": 0,
+            "lr": 4341214284,
+            "pc": 6626816348,
+            "sp": 6125794256
+          },
+          "bucket_registers": {
+            "x0": 4349509632,
+            "x1": 21088,
+            "x2": 227,
+            "x3": 0,
+            "lr": 4341214284,
+            "pc": 6626818384,
+            "sp": 6125794256
+          }
+        }
+      },
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "same_xzone": false,
+      "destination_minus_source": 4489216,
+      "run": 2,
+      "side": 0,
+      "log": "target/font-copy-allocator-inspection/2-0.log"
+    },
+    {
+      "scope": "Debugger-only allocation inspection; no acceptance timing",
+      "aslr_disabled": false,
+      "allocations": {
+        "source": {
+          "request_bytes": 21088,
+          "type_descriptor": 1093846329,
+          "caller_pc": 4375385316,
+          "xzone_index": 228,
+          "pointer": 52022149120,
+          "entry_registers": {
+            "x0": 4385112064,
+            "x1": 21088,
+            "x2": 1093846329,
+            "x3": 0,
+            "lr": 4375385316,
+            "pc": 6626816348,
+            "sp": 6091621440
+          },
+          "bucket_registers": {
+            "x0": 4385112064,
+            "x1": 21088,
+            "x2": 228,
+            "x3": 0,
+            "lr": 4375385316,
+            "pc": 6626818384,
+            "sp": 6091621440
+          }
+        },
+        "destination": {
+          "request_bytes": 21088,
+          "type_descriptor": 1093847827,
+          "caller_pc": 4375391308,
+          "xzone_index": 227,
+          "pointer": 52026736640,
+          "entry_registers": {
+            "x0": 4385112064,
+            "x1": 21088,
+            "x2": 1093847827,
+            "x3": 0,
+            "lr": 4375391308,
+            "pc": 6626816348,
+            "sp": 6091617232
+          },
+          "bucket_registers": {
+            "x0": 4385112064,
+            "x1": 21088,
+            "x2": 227,
+            "x3": 0,
+            "lr": 4375391308,
+            "pc": 6626818384,
+            "sp": 6091617232
+          }
+        }
+      },
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "same_xzone": false,
+      "destination_minus_source": 4587520,
+      "run": 2,
+      "side": 1,
+      "log": "target/font-copy-allocator-inspection/2-1.log"
+    },
+    {
+      "scope": "Debugger-only allocation inspection; no acceptance timing",
+      "aslr_disabled": false,
+      "allocations": {
+        "source": {
+          "request_bytes": 21088,
+          "type_descriptor": 1075385657,
+          "caller_pc": 4301542628,
+          "xzone_index": 228,
+          "pointer": 35580461056,
+          "entry_registers": {
+            "x0": 4314857472,
+            "x1": 21088,
+            "x2": 1075385657,
+            "x3": 0,
+            "lr": 4301542628,
+            "pc": 6626816348,
+            "sp": 6165464128
+          },
+          "bucket_registers": {
+            "x0": 4314857472,
+            "x1": 21088,
+            "x2": 228,
+            "x3": 0,
+            "lr": 4301542628,
+            "pc": 6626818384,
+            "sp": 6165464128
+          }
+        },
+        "destination": {
+          "request_bytes": 21088,
+          "type_descriptor": 1075387155,
+          "caller_pc": 4301548620,
+          "xzone_index": 227,
+          "pointer": 35585064960,
+          "entry_registers": {
+            "x0": 4314857472,
+            "x1": 21088,
+            "x2": 1075387155,
+            "x3": 0,
+            "lr": 4301548620,
+            "pc": 6626816348,
+            "sp": 6165459920
+          },
+          "bucket_registers": {
+            "x0": 4314857472,
+            "x1": 21088,
+            "x2": 227,
+            "x3": 0,
+            "lr": 4301548620,
+            "pc": 6626818384,
+            "sp": 6165459920
+          }
+        }
+      },
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "same_xzone": false,
+      "destination_minus_source": 4603904,
+      "run": 3,
+      "side": 1,
+      "log": "target/font-copy-allocator-inspection/3-1.log"
+    },
+    {
+      "scope": "Debugger-only allocation inspection; no acceptance timing",
+      "aslr_disabled": false,
+      "allocations": {
+        "source": {
+          "request_bytes": 21088,
+          "type_descriptor": 1074689337,
+          "caller_pc": 4298757348,
+          "xzone_index": 226,
+          "pointer": 33433075712,
+          "entry_registers": {
+            "x0": 4307353600,
+            "x1": 21088,
+            "x2": 1074689337,
+            "x3": 0,
+            "lr": 4298757348,
+            "pc": 6626816348,
+            "sp": 6168249408
+          },
+          "bucket_registers": {
+            "x0": 4307353600,
+            "x1": 21088,
+            "x2": 226,
+            "x3": 0,
+            "lr": 4298757348,
+            "pc": 6626818384,
+            "sp": 6168249408
+          }
+        },
+        "destination": {
+          "request_bytes": 21088,
+          "type_descriptor": 1074690835,
+          "caller_pc": 4298763340,
+          "xzone_index": 225,
+          "pointer": 33437466624,
+          "entry_registers": {
+            "x0": 4307353600,
+            "x1": 21088,
+            "x2": 1074690835,
+            "x3": 0,
+            "lr": 4298763340,
+            "pc": 6626816348,
+            "sp": 6168245200
+          },
+          "bucket_registers": {
+            "x0": 4307353600,
+            "x1": 21088,
+            "x2": 225,
+            "x3": 0,
+            "lr": 4298763340,
+            "pc": 6626818384,
+            "sp": 6168245200
+          }
+        }
+      },
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "same_xzone": false,
+      "destination_minus_source": 4390912,
+      "run": 3,
+      "side": 0,
+      "log": "target/font-copy-allocator-inspection/3-0.log"
+    },
+    {
+      "scope": "Debugger-only allocation inspection; no acceptance timing",
+      "aslr_disabled": false,
+      "allocations": {
+        "source": {
+          "request_bytes": 21088,
+          "type_descriptor": 1090794809,
+          "caller_pc": 4363179236,
+          "xzone_index": 228,
+          "pointer": 37090394112,
+          "entry_registers": {
+            "x0": 4373905408,
+            "x1": 21088,
+            "x2": 1090794809,
+            "x3": 0,
+            "lr": 4363179236,
+            "pc": 6626816348,
+            "sp": 6103827520
+          },
+          "bucket_registers": {
+            "x0": 4373905408,
+            "x1": 21088,
+            "x2": 228,
+            "x3": 0,
+            "lr": 4363179236,
+            "pc": 6626818384,
+            "sp": 6103827520
+          }
+        },
+        "destination": {
+          "request_bytes": 21088,
+          "type_descriptor": 1090796307,
+          "caller_pc": 4363185228,
+          "xzone_index": 227,
+          "pointer": 37094883328,
+          "entry_registers": {
+            "x0": 4373905408,
+            "x1": 21088,
+            "x2": 1090796307,
+            "x3": 0,
+            "lr": 4363185228,
+            "pc": 6626816348,
+            "sp": 6103823312
+          },
+          "bucket_registers": {
+            "x0": 4373905408,
+            "x1": 21088,
+            "x2": 227,
+            "x3": 0,
+            "lr": 4363185228,
+            "pc": 6626818384,
+            "sp": 6103823312
+          }
+        }
+      },
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "same_xzone": false,
+      "destination_minus_source": 4489216,
+      "run": 4,
+      "side": 0,
+      "log": "target/font-copy-allocator-inspection/4-0.log"
+    },
+    {
+      "scope": "Debugger-only allocation inspection; no acceptance timing",
+      "aslr_disabled": false,
+      "allocations": {
+        "source": {
+          "request_bytes": 21088,
+          "type_descriptor": 1075082553,
+          "caller_pc": 4300330212,
+          "xzone_index": 227,
+          "pointer": 35786227712,
+          "entry_registers": {
+            "x0": 4310679552,
+            "x1": 21088,
+            "x2": 1075082553,
+            "x3": 0,
+            "lr": 4300330212,
+            "pc": 6626816348,
+            "sp": 6166676544
+          },
+          "bucket_registers": {
+            "x0": 4310679552,
+            "x1": 21088,
+            "x2": 227,
+            "x3": 0,
+            "lr": 4300330212,
+            "pc": 6626818384,
+            "sp": 6166676544
+          }
+        },
+        "destination": {
+          "request_bytes": 21088,
+          "type_descriptor": 1075084051,
+          "caller_pc": 4300336204,
+          "xzone_index": 226,
+          "pointer": 35786358784,
+          "entry_registers": {
+            "x0": 4310679552,
+            "x1": 21088,
+            "x2": 1075084051,
+            "x3": 0,
+            "lr": 4300336204,
+            "pc": 6626816348,
+            "sp": 6166672336
+          },
+          "bucket_registers": {
+            "x0": 4310679552,
+            "x1": 21088,
+            "x2": 226,
+            "x3": 0,
+            "lr": 4300336204,
+            "pc": 6626818384,
+            "sp": 6166672336
+          }
+        }
+      },
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "same_xzone": false,
+      "destination_minus_source": 131072,
+      "run": 4,
+      "side": 1,
+      "log": "target/font-copy-allocator-inspection/4-1.log"
+    },
+    {
+      "scope": "Debugger-only allocation inspection; no acceptance timing",
+      "aslr_disabled": false,
+      "allocations": {
+        "source": {
+          "request_bytes": 21088,
+          "type_descriptor": 1084253497,
+          "caller_pc": 4337013988,
+          "xzone_index": 226,
+          "pointer": 48201121792,
+          "entry_registers": {
+            "x0": 4349132800,
+            "x1": 21088,
+            "x2": 1084253497,
+            "x3": 0,
+            "lr": 4337013988,
+            "pc": 6626816348,
+            "sp": 6129992768
+          },
+          "bucket_registers": {
+            "x0": 4349132800,
+            "x1": 21088,
+            "x2": 226,
+            "x3": 0,
+            "lr": 4337013988,
+            "pc": 6626818384,
+            "sp": 6129992768
+          }
+        },
+        "destination": {
+          "request_bytes": 21088,
+          "type_descriptor": 1084254995,
+          "caller_pc": 4337019980,
+          "xzone_index": 225,
+          "pointer": 48201252864,
+          "entry_registers": {
+            "x0": 4349132800,
+            "x1": 21088,
+            "x2": 1084254995,
+            "x3": 0,
+            "lr": 4337019980,
+            "pc": 6626816348,
+            "sp": 6129988560
+          },
+          "bucket_registers": {
+            "x0": 4349132800,
+            "x1": 21088,
+            "x2": 225,
+            "x3": 0,
+            "lr": 4337019980,
+            "pc": 6626818384,
+            "sp": 6129988560
+          }
+        }
+      },
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "same_xzone": false,
+      "destination_minus_source": 131072,
+      "run": 5,
+      "side": 1,
+      "log": "target/font-copy-allocator-inspection/5-1.log"
+    },
+    {
+      "scope": "Debugger-only allocation inspection; no acceptance timing",
+      "aslr_disabled": false,
+      "allocations": {
+        "source": {
+          "request_bytes": 21088,
+          "type_descriptor": 1083999545,
+          "caller_pc": 4335998180,
+          "xzone_index": 227,
+          "pointer": 35685613568,
+          "entry_registers": {
+            "x0": 4349362176,
+            "x1": 21088,
+            "x2": 1083999545,
+            "x3": 0,
+            "lr": 4335998180,
+            "pc": 6626816348,
+            "sp": 6131008576
+          },
+          "bucket_registers": {
+            "x0": 4349362176,
+            "x1": 21088,
+            "x2": 227,
+            "x3": 0,
+            "lr": 4335998180,
+            "pc": 6626818384,
+            "sp": 6131008576
+          }
+        },
+        "destination": {
+          "request_bytes": 21088,
+          "type_descriptor": 1084001043,
+          "caller_pc": 4336004172,
+          "xzone_index": 227,
+          "pointer": 35685638144,
+          "entry_registers": {
+            "x0": 4349362176,
+            "x1": 21088,
+            "x2": 1084001043,
+            "x3": 0,
+            "lr": 4336004172,
+            "pc": 6626816348,
+            "sp": 6131004368
+          },
+          "bucket_registers": {
+            "x0": 4349362176,
+            "x1": 21088,
+            "x2": 227,
+            "x3": 0,
+            "lr": 4336004172,
+            "pc": 6626818384,
+            "sp": 6131004368
+          }
+        }
+      },
+      "allocator_uuid": "971CDCFE-4D20-300E-A1D6-EC8672FDD258",
+      "same_xzone": true,
+      "destination_minus_source": 24576,
+      "run": 5,
+      "side": 0,
+      "log": "target/font-copy-allocator-inspection/5-0.log"
+    }
+  ]
+}

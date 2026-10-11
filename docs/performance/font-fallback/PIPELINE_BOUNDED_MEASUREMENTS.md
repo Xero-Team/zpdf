@@ -1,0 +1,150 @@
+# Bounded-output synthetic pipeline measurements
+
+Independent Linux comparison against production baseline 137ab2b, using PerIteration rendering on both sides.
+Each archived process runs the complete 135-case matrix. Every case has 21
+AB/BA pairs, ten samples, 0.1 s warmup and 0.25 s requested measurement.
+The paired bootstrap upper 95% bound must be at most +5% to pass.
+Negative changes are faster. All observations are retained; these data
+are separate from the original SmallInput, per-case font and macOS protocols.
+
+Result: **135 pass, 0 inconclusive, 0 regression**.
+
+See [the protocol and audit](PIPELINE_RECHECK.md) and [all pairs](evidence/pipeline-bounded-pairs.json).
+
+| Case | Change | 95% interval | Result |
+| --- | ---: | ---: | --- |
+| `stages/encode/clip-synthetic@150` | +0.60% | -0.39% .. +1.12% | pass |
+| `stages/encode/clip-synthetic@300` | -0.59% | -1.15% .. -0.40% | pass |
+| `stages/encode/clip-synthetic@96` | +0.46% | -0.97% .. +1.12% | pass |
+| `stages/encode/curves-synthetic@150` | -0.25% | -0.53% .. +0.48% | pass |
+| `stages/encode/curves-synthetic@300` | +0.76% | +0.15% .. +1.65% | pass |
+| `stages/encode/curves-synthetic@96` | +1.33% | -0.24% .. +2.55% | pass |
+| `stages/encode/image_rgb-synthetic@150` | -0.62% | -1.66% .. +0.54% | pass |
+| `stages/encode/image_rgb-synthetic@300` | +0.66% | -0.73% .. +1.18% | pass |
+| `stages/encode/image_rgb-synthetic@96` | +0.49% | -2.07% .. +1.64% | pass |
+| `stages/encode/image_under_clip-synthetic@150` | +1.83% | +0.27% .. +2.48% | pass |
+| `stages/encode/image_under_clip-synthetic@300` | -0.16% | -0.52% .. +0.50% | pass |
+| `stages/encode/image_under_clip-synthetic@96` | +0.33% | -0.47% .. +1.65% | pass |
+| `stages/encode/pattern_tiling-synthetic@150` | +1.06% | -0.17% .. +2.65% | pass |
+| `stages/encode/pattern_tiling-synthetic@300` | +0.18% | -0.27% .. +1.76% | pass |
+| `stages/encode/pattern_tiling-synthetic@96` | +1.61% | +0.14% .. +3.09% | pass |
+| `stages/encode/pattern_tiling_uncolored-synthetic@150` | +0.69% | +0.46% .. +1.22% | pass |
+| `stages/encode/pattern_tiling_uncolored-synthetic@300` | -0.54% | -1.46% .. +0.12% | pass |
+| `stages/encode/pattern_tiling_uncolored-synthetic@96` | +2.26% | +1.10% .. +2.90% | pass |
+| `stages/encode/rect_fills-synthetic@150` | +0.93% | -0.74% .. +2.17% | pass |
+| `stages/encode/rect_fills-synthetic@300` | +0.30% | -0.45% .. +1.28% | pass |
+| `stages/encode/rect_fills-synthetic@96` | +1.05% | +0.42% .. +2.34% | pass |
+| `stages/encode/strokes-synthetic@150` | +0.27% | -0.20% .. +1.07% | pass |
+| `stages/encode/strokes-synthetic@300` | +1.38% | -0.47% .. +1.77% | pass |
+| `stages/encode/strokes-synthetic@96` | +0.21% | -0.54% .. +1.64% | pass |
+| `stages/encode/text_type3-synthetic@150` | +0.53% | -0.65% .. +1.10% | pass |
+| `stages/encode/text_type3-synthetic@300` | -0.34% | -1.43% .. +1.17% | pass |
+| `stages/encode/text_type3-synthetic@96` | +0.80% | -0.16% .. +1.63% | pass |
+| `stages/interpret/clip-synthetic@150` | -5.16% | -6.40% .. -3.55% | pass |
+| `stages/interpret/clip-synthetic@300` | -5.59% | -7.48% .. -4.57% | pass |
+| `stages/interpret/clip-synthetic@96` | -4.45% | -6.21% .. -3.13% | pass |
+| `stages/interpret/curves-synthetic@150` | -8.99% | -11.37% .. -5.18% | pass |
+| `stages/interpret/curves-synthetic@300` | -8.77% | -9.53% .. -7.93% | pass |
+| `stages/interpret/curves-synthetic@96` | -9.73% | -12.03% .. -8.11% | pass |
+| `stages/interpret/image_rgb-synthetic@150` | -0.64% | -1.32% .. -0.04% | pass |
+| `stages/interpret/image_rgb-synthetic@300` | -1.19% | -1.70% .. +0.19% | pass |
+| `stages/interpret/image_rgb-synthetic@96` | -0.86% | -1.63% .. +0.27% | pass |
+| `stages/interpret/image_under_clip-synthetic@150` | -3.97% | -4.45% .. -2.87% | pass |
+| `stages/interpret/image_under_clip-synthetic@300` | -3.51% | -4.29% .. -2.41% | pass |
+| `stages/interpret/image_under_clip-synthetic@96` | -2.83% | -4.26% .. -1.73% | pass |
+| `stages/interpret/pattern_tiling-synthetic@150` | -0.67% | -2.07% .. +0.95% | pass |
+| `stages/interpret/pattern_tiling-synthetic@300` | -0.77% | -2.11% .. +2.98% | pass |
+| `stages/interpret/pattern_tiling-synthetic@96` | -1.97% | -3.83% .. +0.33% | pass |
+| `stages/interpret/pattern_tiling_uncolored-synthetic@150` | -1.42% | -3.74% .. +1.38% | pass |
+| `stages/interpret/pattern_tiling_uncolored-synthetic@300` | -0.39% | -2.62% .. +0.24% | pass |
+| `stages/interpret/pattern_tiling_uncolored-synthetic@96` | -0.23% | -2.14% .. +1.66% | pass |
+| `stages/interpret/rect_fills-synthetic@150` | -8.58% | -9.12% .. -6.96% | pass |
+| `stages/interpret/rect_fills-synthetic@300` | -8.40% | -9.64% .. -7.73% | pass |
+| `stages/interpret/rect_fills-synthetic@96` | -8.02% | -8.63% .. -6.73% | pass |
+| `stages/interpret/strokes-synthetic@150` | -6.85% | -8.30% .. -5.09% | pass |
+| `stages/interpret/strokes-synthetic@300` | -7.93% | -8.64% .. -6.13% | pass |
+| `stages/interpret/strokes-synthetic@96` | -7.55% | -8.66% .. -6.34% | pass |
+| `stages/interpret/text_type3-synthetic@150` | -8.13% | -9.74% .. -5.74% | pass |
+| `stages/interpret/text_type3-synthetic@300` | -6.71% | -8.65% .. -5.02% | pass |
+| `stages/interpret/text_type3-synthetic@96` | -7.37% | -9.22% .. -5.79% | pass |
+| `stages/parse/clip-synthetic@150` | -0.82% | -1.78% .. +0.46% | pass |
+| `stages/parse/clip-synthetic@300` | -0.47% | -1.20% .. +0.97% | pass |
+| `stages/parse/clip-synthetic@96` | -1.02% | -1.70% .. +0.75% | pass |
+| `stages/parse/curves-synthetic@150` | -0.44% | -1.02% .. +1.15% | pass |
+| `stages/parse/curves-synthetic@300` | -1.34% | -2.14% .. -0.55% | pass |
+| `stages/parse/curves-synthetic@96` | -0.66% | -1.32% .. +0.37% | pass |
+| `stages/parse/image_rgb-synthetic@150` | -0.23% | -0.98% .. +0.66% | pass |
+| `stages/parse/image_rgb-synthetic@300` | +0.21% | -0.94% .. +0.82% | pass |
+| `stages/parse/image_rgb-synthetic@96` | -0.83% | -2.14% .. -0.16% | pass |
+| `stages/parse/image_under_clip-synthetic@150` | -0.47% | -1.68% .. +1.36% | pass |
+| `stages/parse/image_under_clip-synthetic@300` | -1.41% | -2.82% .. -0.04% | pass |
+| `stages/parse/image_under_clip-synthetic@96` | -1.16% | -2.44% .. +0.87% | pass |
+| `stages/parse/pattern_tiling-synthetic@150` | +0.44% | -0.60% .. +1.01% | pass |
+| `stages/parse/pattern_tiling-synthetic@300` | -0.45% | -1.86% .. +0.42% | pass |
+| `stages/parse/pattern_tiling-synthetic@96` | -0.05% | -1.81% .. +1.73% | pass |
+| `stages/parse/pattern_tiling_uncolored-synthetic@150` | +1.21% | -0.31% .. +2.02% | pass |
+| `stages/parse/pattern_tiling_uncolored-synthetic@300` | -0.13% | -1.61% .. +1.32% | pass |
+| `stages/parse/pattern_tiling_uncolored-synthetic@96` | -0.68% | -1.24% .. +1.10% | pass |
+| `stages/parse/rect_fills-synthetic@150` | +0.24% | -1.22% .. +1.34% | pass |
+| `stages/parse/rect_fills-synthetic@300` | -1.21% | -1.67% .. +0.41% | pass |
+| `stages/parse/rect_fills-synthetic@96` | +0.26% | -0.90% .. +1.21% | pass |
+| `stages/parse/strokes-synthetic@150` | -0.23% | -1.48% .. +1.05% | pass |
+| `stages/parse/strokes-synthetic@300` | -0.63% | -2.86% .. +0.89% | pass |
+| `stages/parse/strokes-synthetic@96` | -0.27% | -2.14% .. +0.40% | pass |
+| `stages/parse/text_type3-synthetic@150` | -1.20% | -2.34% .. +0.69% | pass |
+| `stages/parse/text_type3-synthetic@300` | -0.05% | -1.96% .. +1.80% | pass |
+| `stages/parse/text_type3-synthetic@96` | -1.04% | -3.58% .. -0.23% | pass |
+| `stages/render_cpu/clip-synthetic@150` | +0.89% | -1.22% .. +1.05% | pass |
+| `stages/render_cpu/clip-synthetic@300` | -0.41% | -2.88% .. +0.34% | pass |
+| `stages/render_cpu/clip-synthetic@96` | -0.26% | -1.33% .. +2.22% | pass |
+| `stages/render_cpu/curves-synthetic@150` | +1.39% | +0.11% .. +3.33% | pass |
+| `stages/render_cpu/curves-synthetic@300` | +0.36% | -1.13% .. +1.33% | pass |
+| `stages/render_cpu/curves-synthetic@96` | +0.69% | -0.36% .. +1.57% | pass |
+| `stages/render_cpu/image_rgb-synthetic@150` | -0.49% | -1.16% .. +0.48% | pass |
+| `stages/render_cpu/image_rgb-synthetic@300` | -0.46% | -1.07% .. +0.65% | pass |
+| `stages/render_cpu/image_rgb-synthetic@96` | -1.16% | -2.46% .. +0.65% | pass |
+| `stages/render_cpu/image_under_clip-synthetic@150` | +0.04% | -0.50% .. +0.67% | pass |
+| `stages/render_cpu/image_under_clip-synthetic@300` | +0.01% | -0.73% .. +1.16% | pass |
+| `stages/render_cpu/image_under_clip-synthetic@96` | +0.60% | -0.24% .. +1.32% | pass |
+| `stages/render_cpu/pattern_tiling-synthetic@150` | +0.93% | -0.53% .. +2.78% | pass |
+| `stages/render_cpu/pattern_tiling-synthetic@300` | -0.35% | -1.15% .. +0.58% | pass |
+| `stages/render_cpu/pattern_tiling-synthetic@96` | +0.84% | -0.61% .. +2.71% | pass |
+| `stages/render_cpu/pattern_tiling_uncolored-synthetic@150` | -1.24% | -2.21% .. -0.16% | pass |
+| `stages/render_cpu/pattern_tiling_uncolored-synthetic@300` | -0.02% | -0.42% .. +0.41% | pass |
+| `stages/render_cpu/pattern_tiling_uncolored-synthetic@96` | +0.79% | -0.26% .. +1.83% | pass |
+| `stages/render_cpu/rect_fills-synthetic@150` | -0.17% | -0.78% .. +2.16% | pass |
+| `stages/render_cpu/rect_fills-synthetic@300` | +0.13% | -0.74% .. +1.36% | pass |
+| `stages/render_cpu/rect_fills-synthetic@96` | -0.42% | -1.77% .. +0.16% | pass |
+| `stages/render_cpu/strokes-synthetic@150` | +0.73% | -0.83% .. +2.77% | pass |
+| `stages/render_cpu/strokes-synthetic@300` | -0.03% | -1.01% .. +0.97% | pass |
+| `stages/render_cpu/strokes-synthetic@96` | +0.71% | -0.19% .. +1.38% | pass |
+| `stages/render_cpu/text_type3-synthetic@150` | +0.33% | -0.41% .. +1.06% | pass |
+| `stages/render_cpu/text_type3-synthetic@300` | +2.67% | +0.88% .. +3.54% | pass |
+| `stages/render_cpu/text_type3-synthetic@96` | +3.08% | +1.60% .. +4.11% | pass |
+| `stages/total/clip-synthetic@150` | -0.14% | -0.40% .. +0.36% | pass |
+| `stages/total/clip-synthetic@300` | -0.50% | -1.34% .. +0.71% | pass |
+| `stages/total/clip-synthetic@96` | -0.04% | -1.90% .. +0.72% | pass |
+| `stages/total/curves-synthetic@150` | -0.37% | -0.89% .. +0.49% | pass |
+| `stages/total/curves-synthetic@300` | -0.42% | -1.36% .. -0.08% | pass |
+| `stages/total/curves-synthetic@96` | +0.66% | -1.09% .. +2.18% | pass |
+| `stages/total/image_rgb-synthetic@150` | -0.38% | -2.49% .. +0.78% | pass |
+| `stages/total/image_rgb-synthetic@300` | -0.16% | -0.76% .. +0.30% | pass |
+| `stages/total/image_rgb-synthetic@96` | -0.76% | -1.84% .. +0.78% | pass |
+| `stages/total/image_under_clip-synthetic@150` | +0.29% | -0.44% .. +1.07% | pass |
+| `stages/total/image_under_clip-synthetic@300` | +0.16% | -0.40% .. +0.42% | pass |
+| `stages/total/image_under_clip-synthetic@96` | +0.18% | -0.62% .. +0.69% | pass |
+| `stages/total/pattern_tiling-synthetic@150` | +0.88% | -1.20% .. +2.50% | pass |
+| `stages/total/pattern_tiling-synthetic@300` | +0.33% | +0.18% .. +0.48% | pass |
+| `stages/total/pattern_tiling-synthetic@96` | +0.21% | -0.29% .. +1.10% | pass |
+| `stages/total/pattern_tiling_uncolored-synthetic@150` | +1.08% | -0.40% .. +1.70% | pass |
+| `stages/total/pattern_tiling_uncolored-synthetic@300` | -0.72% | -1.61% .. +1.02% | pass |
+| `stages/total/pattern_tiling_uncolored-synthetic@96` | +0.55% | -0.39% .. +1.66% | pass |
+| `stages/total/rect_fills-synthetic@150` | -0.42% | -0.61% .. +0.61% | pass |
+| `stages/total/rect_fills-synthetic@300` | -0.23% | -0.99% .. +0.50% | pass |
+| `stages/total/rect_fills-synthetic@96` | +0.25% | -1.40% .. +1.74% | pass |
+| `stages/total/strokes-synthetic@150` | -0.02% | -0.22% .. +1.65% | pass |
+| `stages/total/strokes-synthetic@300` | +0.51% | +0.20% .. +2.44% | pass |
+| `stages/total/strokes-synthetic@96` | +0.59% | -0.56% .. +2.10% | pass |
+| `stages/total/text_type3-synthetic@150` | +0.03% | -0.73% .. +1.78% | pass |
+| `stages/total/text_type3-synthetic@300` | +1.12% | -0.45% .. +2.01% | pass |
+| `stages/total/text_type3-synthetic@96` | +0.41% | -0.68% .. +2.64% | pass |

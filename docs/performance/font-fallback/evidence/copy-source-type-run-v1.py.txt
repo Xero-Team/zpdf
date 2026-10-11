@@ -1,0 +1,94 @@
+"""Run the fixed single-allocation type diagnostic, retaining every sample."""
+import hashlib
+import json
+import os
+from pathlib import Path
+import statistics
+import subprocess
+import sys
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "crates/zpdf-benches/tools"))
+from font_pair import paired_interval
+
+os.chdir(ROOT)
+out = ROOT / "target/font-copy-source-type-intervention"
+out.mkdir(exist_ok=False)
+binaries = [ROOT / f"target/font-benchmark-runs/{run}/executable/font_diagnostics"
+            for run in ("run-zcaqwew_", "run-qwqd2mh0")]
+report = {
+    "scope": "Single-allocation type diagnostic; never pool with acceptance data",
+    "planned_pairs_per_condition": 16,
+    "settings": {"sample_size": 10, "warm_up": 0.1, "measurement": 0.25,
+                 "aslr_disabled": False, "scheduler": "default",
+                 "debugger": "attached; no breakpoints during warmup or timing"},
+    "binaries": [{"path": str(p), "sha256": hashlib.sha256(p.read_bytes()).hexdigest()}
+                 for p in binaries],
+    "records": [],
+}
+
+
+def save():
+    (out / "summary.json").write_text(json.dumps(report, indent=2) + "\n")
+
+
+modes = ["untouched", "same", "separate"]
+for run in range(16):
+    order = modes[run % 3:] + modes[:run % 3]
+    for mode in order:
+        for side in ([0, 1] if run % 2 == 0 else [1, 0]):
+            directory = out / f"{run:02}-{mode}-{side}"
+            directory.mkdir()
+            result = directory / "process.json"
+            commands = [
+                "settings set target.disable-aslr false",
+                "script t=lldb.debugger.GetSelectedTarget(); b=t.BreakpointCreateBySBAddress(t.ResolveFileAddress(0x1000214e0)); b.SetOneShot(True)",
+                "run --bench --noplot --exact font_diagnostics/copy_heap --sample-size 10 --warm-up-time 0.1 --measurement-time 0.25 --nresamples 10000",
+                "command script import target/font_copy_source_type.py",
+                f"script font_copy_source_type.run({mode!r}, {str(result)!r})",
+            ]
+            args = ["/Library/Developer/CommandLineTools/usr/bin/lldb", "--batch"]
+            for command in commands:
+                args += ["-o", command]
+            args += [str(binaries[side])]
+            with (directory / "process.log").open("w") as log:
+                attempt = subprocess.run(args, env=dict(os.environ, CRITERION_HOME=str(directory / "criterion")),
+                                         stdout=log, stderr=subprocess.STDOUT, timeout=90)
+            if attempt.returncode or not result.exists():
+                report["failure"] = {"run": run, "mode": mode, "side": side, "directory": str(directory)}
+                save()
+                raise RuntimeError((directory / "process.log").read_text()[-4000:])
+            sample_paths = list(directory.glob("criterion/**/new/sample.json"))
+            assert len(sample_paths) == 1
+            sample_path = sample_paths[0]
+            samples = json.loads(sample_path.read_text())
+            estimates = json.loads(sample_path.with_name("estimates.json").read_text())
+            identity = json.loads(sample_path.with_name("benchmark.json").read_text())
+            assert identity["full_id"] == "font_diagnostics/copy_heap"
+            values = [ns / iters for ns, iters in zip(samples["times"], samples["iters"])]
+            assert len(values) == 10
+            value = estimates["median"]["point_estimate"]
+            assert abs(value - statistics.median(values)) < 1e-8
+            record = json.loads(result.read_text())
+            record.update(run=run, side=side, samples=samples, raw_ns_per_iteration=values,
+                          median_ns=value, directory=str(directory))
+            report["records"].append(record)
+            save()
+        print(f"Completed pair {run + 1}/16 for {mode}", flush=True)
+
+report["comparisons"] = {}
+for mode in modes:
+    records = [r for r in report["records"] if r["mode"] == mode]
+    pairs = [[next(r["median_ns"] for r in records if r["run"] == run and r["side"] == side)
+              for side in (0, 1)] for run in range(16)]
+    ratio, low, high = paired_interval([b / a for a, b in pairs])
+    report["comparisons"][mode] = {"pairs": pairs, "ratio": ratio, "lower_95": low, "upper_95": high}
+for side in (0, 1):
+    samples = {(r["run"], r["mode"]): r["median_ns"] for r in report["records"] if r["side"] == side}
+    ratio, low, high = paired_interval([samples[run, "separate"] / samples[run, "same"] for run in range(16)])
+    report["comparisons"][f"separate_vs_same_side_{side}"] = {"ratio": ratio, "lower_95": low, "upper_95": high}
+for identity in report["binaries"]:
+    assert hashlib.sha256(Path(identity["path"]).read_bytes()).hexdigest() == identity["sha256"]
+report["complete"] = True
+save()
+print(json.dumps(report["comparisons"], indent=2), flush=True)

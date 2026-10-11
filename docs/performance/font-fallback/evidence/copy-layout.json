@@ -1,0 +1,6159 @@
+{
+  "scope": "Independent layout diagnostic, not acceptance",
+  "source_sha256": "067c7d77a32b15cfe5305466ea7afe9d3c78ceac98a935680fbbc284129a74b2",
+  "executable_sha256": "149bec229e167ac97f4dc57259edc1a58aaef6e779b49191f1c59d29adbb3693",
+  "records": [
+    {
+      "run": 0,
+      "environment": {
+        "kind": "environment",
+        "bytes": 21088,
+        "rounds": 24,
+        "iterations": 20000,
+        "source_mod_16k": 0
+      },
+      "samples": [
+        {
+          "kind": "sample",
+          "round": 0,
+          "offset": 0,
+          "ns_per_op": 772.8375,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 0,
+          "offset": 16,
+          "ns_per_op": 402.15625,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 0,
+          "offset": 64,
+          "ns_per_op": 344.20835,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 0,
+          "offset": 128,
+          "ns_per_op": 312.5854,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 0,
+          "offset": 256,
+          "ns_per_op": 296.5292,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 0,
+          "offset": 512,
+          "ns_per_op": 338.11875,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 0,
+          "offset": 4096,
+          "ns_per_op": 318.3729,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 0,
+          "offset": 8192,
+          "ns_per_op": 213.0125,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 0,
+          "offset": 16384,
+          "ns_per_op": 218.70625,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 1,
+          "offset": 0,
+          "ns_per_op": 346.51875,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 1,
+          "offset": 16384,
+          "ns_per_op": 251.98335,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 1,
+          "offset": 8192,
+          "ns_per_op": 209.8,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 1,
+          "offset": 4096,
+          "ns_per_op": 196.225,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 1,
+          "offset": 512,
+          "ns_per_op": 196.79375,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 1,
+          "offset": 256,
+          "ns_per_op": 183.69585,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 1,
+          "offset": 128,
+          "ns_per_op": 182.16045,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 1,
+          "offset": 64,
+          "ns_per_op": 167.0479,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 1,
+          "offset": 16,
+          "ns_per_op": 167.45835,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 2,
+          "offset": 64,
+          "ns_per_op": 169.6729,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 2,
+          "offset": 128,
+          "ns_per_op": 167.9167,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 2,
+          "offset": 256,
+          "ns_per_op": 169.95,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 2,
+          "offset": 512,
+          "ns_per_op": 196.84375,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 2,
+          "offset": 4096,
+          "ns_per_op": 164.0208,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 2,
+          "offset": 8192,
+          "ns_per_op": 166.3208,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 2,
+          "offset": 16384,
+          "ns_per_op": 163.85415,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 2,
+          "offset": 0,
+          "ns_per_op": 253.82705,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 2,
+          "offset": 16,
+          "ns_per_op": 164.37085,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 3,
+          "offset": 64,
+          "ns_per_op": 199.5,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 3,
+          "offset": 16,
+          "ns_per_op": 168.0125,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 3,
+          "offset": 0,
+          "ns_per_op": 210.04795,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 3,
+          "offset": 16384,
+          "ns_per_op": 167.3479,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 3,
+          "offset": 8192,
+          "ns_per_op": 167.95835,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 3,
+          "offset": 4096,
+          "ns_per_op": 172.5625,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 3,
+          "offset": 512,
+          "ns_per_op": 168.57705,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 3,
+          "offset": 256,
+          "ns_per_op": 167.57915,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 3,
+          "offset": 128,
+          "ns_per_op": 163.91665,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 4,
+          "offset": 256,
+          "ns_per_op": 171.7104,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 4,
+          "offset": 512,
+          "ns_per_op": 167.07915,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 4,
+          "offset": 4096,
+          "ns_per_op": 169.20835,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 4,
+          "offset": 8192,
+          "ns_per_op": 168.18125,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 4,
+          "offset": 16384,
+          "ns_per_op": 164.2125,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 4,
+          "offset": 0,
+          "ns_per_op": 168.13545,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 4,
+          "offset": 16,
+          "ns_per_op": 167.15835,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 4,
+          "offset": 64,
+          "ns_per_op": 172.0396,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 4,
+          "offset": 128,
+          "ns_per_op": 167.6646,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 5,
+          "offset": 256,
+          "ns_per_op": 168.14165,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 5,
+          "offset": 128,
+          "ns_per_op": 180.48125,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 5,
+          "offset": 64,
+          "ns_per_op": 166.5667,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 5,
+          "offset": 16,
+          "ns_per_op": 175.3667,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 5,
+          "offset": 0,
+          "ns_per_op": 164.78335,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 5,
+          "offset": 16384,
+          "ns_per_op": 167.1292,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 5,
+          "offset": 8192,
+          "ns_per_op": 203.95625,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 5,
+          "offset": 4096,
+          "ns_per_op": 168.1,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 5,
+          "offset": 512,
+          "ns_per_op": 169.9958,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 6,
+          "offset": 4096,
+          "ns_per_op": 165.54795,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 6,
+          "offset": 8192,
+          "ns_per_op": 166.92915,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 6,
+          "offset": 16384,
+          "ns_per_op": 167.61045,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 6,
+          "offset": 0,
+          "ns_per_op": 184.72295,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 6,
+          "offset": 16,
+          "ns_per_op": 180.35415,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 6,
+          "offset": 64,
+          "ns_per_op": 168.35835,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 6,
+          "offset": 128,
+          "ns_per_op": 167.7292,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 6,
+          "offset": 256,
+          "ns_per_op": 171.96665,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 6,
+          "offset": 512,
+          "ns_per_op": 170.24585,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 7,
+          "offset": 4096,
+          "ns_per_op": 167.97295,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 7,
+          "offset": 512,
+          "ns_per_op": 169.3771,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 7,
+          "offset": 256,
+          "ns_per_op": 168.1625,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 7,
+          "offset": 128,
+          "ns_per_op": 202.2521,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 7,
+          "offset": 64,
+          "ns_per_op": 165.25625,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 7,
+          "offset": 16,
+          "ns_per_op": 226.87915,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 7,
+          "offset": 0,
+          "ns_per_op": 166.8229,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 7,
+          "offset": 16384,
+          "ns_per_op": 166.6,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 7,
+          "offset": 8192,
+          "ns_per_op": 166.54795,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 8,
+          "offset": 16384,
+          "ns_per_op": 169.85835,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 8,
+          "offset": 0,
+          "ns_per_op": 188.1375,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 8,
+          "offset": 16,
+          "ns_per_op": 168.37085,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 8,
+          "offset": 64,
+          "ns_per_op": 167.1167,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 8,
+          "offset": 128,
+          "ns_per_op": 163.95625,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 8,
+          "offset": 256,
+          "ns_per_op": 167.75415,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 8,
+          "offset": 512,
+          "ns_per_op": 159.0979,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 8,
+          "offset": 4096,
+          "ns_per_op": 157.95,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 8,
+          "offset": 8192,
+          "ns_per_op": 181.96875,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 9,
+          "offset": 16384,
+          "ns_per_op": 173.6625,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 9,
+          "offset": 8192,
+          "ns_per_op": 169.14375,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 9,
+          "offset": 4096,
+          "ns_per_op": 172.79375,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 9,
+          "offset": 512,
+          "ns_per_op": 166.49375,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 9,
+          "offset": 256,
+          "ns_per_op": 171.2979,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 9,
+          "offset": 128,
+          "ns_per_op": 173.73955,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 9,
+          "offset": 64,
+          "ns_per_op": 168.72705,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 9,
+          "offset": 16,
+          "ns_per_op": 217.74165,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 9,
+          "offset": 0,
+          "ns_per_op": 164.49375,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 10,
+          "offset": 16,
+          "ns_per_op": 165.05205,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 10,
+          "offset": 64,
+          "ns_per_op": 173.0396,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 10,
+          "offset": 128,
+          "ns_per_op": 170.3375,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 10,
+          "offset": 256,
+          "ns_per_op": 282.2271,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 10,
+          "offset": 512,
+          "ns_per_op": 165.56875,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 10,
+          "offset": 4096,
+          "ns_per_op": 169.525,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 10,
+          "offset": 8192,
+          "ns_per_op": 172.3729,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 10,
+          "offset": 16384,
+          "ns_per_op": 173.27915,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 10,
+          "offset": 0,
+          "ns_per_op": 187.2771,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 11,
+          "offset": 16,
+          "ns_per_op": 162.075,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 11,
+          "offset": 0,
+          "ns_per_op": 158.8979,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 11,
+          "offset": 16384,
+          "ns_per_op": 166.14585,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 11,
+          "offset": 8192,
+          "ns_per_op": 210.2396,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 11,
+          "offset": 4096,
+          "ns_per_op": 159.5,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 11,
+          "offset": 512,
+          "ns_per_op": 168.6083,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 11,
+          "offset": 256,
+          "ns_per_op": 172.6708,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 11,
+          "offset": 128,
+          "ns_per_op": 165.43335,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 11,
+          "offset": 64,
+          "ns_per_op": 180.26875,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 12,
+          "offset": 128,
+          "ns_per_op": 168.06665,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 12,
+          "offset": 256,
+          "ns_per_op": 168.11665,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 12,
+          "offset": 512,
+          "ns_per_op": 167.26045,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 12,
+          "offset": 4096,
+          "ns_per_op": 163.7917,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 12,
+          "offset": 8192,
+          "ns_per_op": 177.86875,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 12,
+          "offset": 16384,
+          "ns_per_op": 168.2771,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 12,
+          "offset": 0,
+          "ns_per_op": 189.72085,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 12,
+          "offset": 16,
+          "ns_per_op": 168.08335,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 12,
+          "offset": 64,
+          "ns_per_op": 166.3146,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 13,
+          "offset": 128,
+          "ns_per_op": 165.4021,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 13,
+          "offset": 64,
+          "ns_per_op": 170.5729,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 13,
+          "offset": 16,
+          "ns_per_op": 223.86045,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 13,
+          "offset": 0,
+          "ns_per_op": 168.9458,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 13,
+          "offset": 16384,
+          "ns_per_op": 167.1458,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 13,
+          "offset": 8192,
+          "ns_per_op": 165.8125,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 13,
+          "offset": 4096,
+          "ns_per_op": 169.7333,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 13,
+          "offset": 512,
+          "ns_per_op": 169.7646,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 13,
+          "offset": 256,
+          "ns_per_op": 178.72085,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 14,
+          "offset": 512,
+          "ns_per_op": 189.84375,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 14,
+          "offset": 4096,
+          "ns_per_op": 164.49375,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 14,
+          "offset": 8192,
+          "ns_per_op": 165.86665,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 14,
+          "offset": 16384,
+          "ns_per_op": 173.23125,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 14,
+          "offset": 0,
+          "ns_per_op": 184.4354,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 14,
+          "offset": 16,
+          "ns_per_op": 169.37915,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 14,
+          "offset": 64,
+          "ns_per_op": 167.83545,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 14,
+          "offset": 128,
+          "ns_per_op": 165.61045,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 14,
+          "offset": 256,
+          "ns_per_op": 167.6979,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 15,
+          "offset": 512,
+          "ns_per_op": 167.5729,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 15,
+          "offset": 256,
+          "ns_per_op": 169.0854,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 15,
+          "offset": 128,
+          "ns_per_op": 170.30625,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 15,
+          "offset": 64,
+          "ns_per_op": 165.25,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 15,
+          "offset": 16,
+          "ns_per_op": 225.72085,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 15,
+          "offset": 0,
+          "ns_per_op": 166.1604,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 15,
+          "offset": 16384,
+          "ns_per_op": 171.2875,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 15,
+          "offset": 8192,
+          "ns_per_op": 167.84585,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 15,
+          "offset": 4096,
+          "ns_per_op": 167.0146,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 16,
+          "offset": 8192,
+          "ns_per_op": 164.81875,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 16,
+          "offset": 16384,
+          "ns_per_op": 168.1646,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 16,
+          "offset": 0,
+          "ns_per_op": 194.32915,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 16,
+          "offset": 16,
+          "ns_per_op": 168.1146,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 16,
+          "offset": 64,
+          "ns_per_op": 175.68125,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 16,
+          "offset": 128,
+          "ns_per_op": 165.1375,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 16,
+          "offset": 256,
+          "ns_per_op": 165.61455,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 16,
+          "offset": 512,
+          "ns_per_op": 168.0271,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 16,
+          "offset": 4096,
+          "ns_per_op": 175.79165,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 17,
+          "offset": 8192,
+          "ns_per_op": 171.02705,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 17,
+          "offset": 4096,
+          "ns_per_op": 167.61665,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 17,
+          "offset": 512,
+          "ns_per_op": 165.8979,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 17,
+          "offset": 256,
+          "ns_per_op": 168.00415,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 17,
+          "offset": 128,
+          "ns_per_op": 188.06875,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 17,
+          "offset": 64,
+          "ns_per_op": 168.19165,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 17,
+          "offset": 16,
+          "ns_per_op": 220.06875,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 17,
+          "offset": 0,
+          "ns_per_op": 164.69165,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 17,
+          "offset": 16384,
+          "ns_per_op": 167.1083,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 18,
+          "offset": 0,
+          "ns_per_op": 186.5021,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 18,
+          "offset": 16,
+          "ns_per_op": 168.8625,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 18,
+          "offset": 64,
+          "ns_per_op": 168.1396,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 18,
+          "offset": 128,
+          "ns_per_op": 167.7167,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 18,
+          "offset": 256,
+          "ns_per_op": 174.3708,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 18,
+          "offset": 512,
+          "ns_per_op": 167.8771,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 18,
+          "offset": 4096,
+          "ns_per_op": 168.32085,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 18,
+          "offset": 8192,
+          "ns_per_op": 168.86875,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 18,
+          "offset": 16384,
+          "ns_per_op": 168.8083,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 19,
+          "offset": 0,
+          "ns_per_op": 167.52085,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 19,
+          "offset": 16384,
+          "ns_per_op": 166.53125,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 19,
+          "offset": 8192,
+          "ns_per_op": 172.7333,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 19,
+          "offset": 4096,
+          "ns_per_op": 178.80625,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 19,
+          "offset": 512,
+          "ns_per_op": 187.45415,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 19,
+          "offset": 256,
+          "ns_per_op": 170.65625,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 19,
+          "offset": 128,
+          "ns_per_op": 164.85415,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 19,
+          "offset": 64,
+          "ns_per_op": 168.22085,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 19,
+          "offset": 16,
+          "ns_per_op": 230.60415,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 20,
+          "offset": 64,
+          "ns_per_op": 168.15,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 20,
+          "offset": 128,
+          "ns_per_op": 168.5708,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 20,
+          "offset": 256,
+          "ns_per_op": 167.45205,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 20,
+          "offset": 512,
+          "ns_per_op": 175,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 20,
+          "offset": 4096,
+          "ns_per_op": 178.0792,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 20,
+          "offset": 8192,
+          "ns_per_op": 274.17705,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 20,
+          "offset": 16384,
+          "ns_per_op": 168.75625,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 20,
+          "offset": 0,
+          "ns_per_op": 165.9479,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 20,
+          "offset": 16,
+          "ns_per_op": 179.70415,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 21,
+          "offset": 64,
+          "ns_per_op": 201.79585,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 21,
+          "offset": 16,
+          "ns_per_op": 170.8979,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 21,
+          "offset": 0,
+          "ns_per_op": 170.8958,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 21,
+          "offset": 16384,
+          "ns_per_op": 175.74375,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 21,
+          "offset": 8192,
+          "ns_per_op": 191.77705,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 21,
+          "offset": 4096,
+          "ns_per_op": 167.84375,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 21,
+          "offset": 512,
+          "ns_per_op": 172.1875,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 21,
+          "offset": 256,
+          "ns_per_op": 183.6875,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 21,
+          "offset": 128,
+          "ns_per_op": 173.59585,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 22,
+          "offset": 256,
+          "ns_per_op": 175.00625,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 22,
+          "offset": 512,
+          "ns_per_op": 167.2646,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 22,
+          "offset": 4096,
+          "ns_per_op": 166.81455,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 22,
+          "offset": 8192,
+          "ns_per_op": 165.29375,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 22,
+          "offset": 16384,
+          "ns_per_op": 260.69375,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 22,
+          "offset": 0,
+          "ns_per_op": 191.425,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 22,
+          "offset": 16,
+          "ns_per_op": 169.02295,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 22,
+          "offset": 64,
+          "ns_per_op": 169.0354,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 22,
+          "offset": 128,
+          "ns_per_op": 186.45625,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 23,
+          "offset": 256,
+          "ns_per_op": 167.775,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 23,
+          "offset": 128,
+          "ns_per_op": 168.7229,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 23,
+          "offset": 64,
+          "ns_per_op": 169.1042,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 23,
+          "offset": 16,
+          "ns_per_op": 202.59795,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 23,
+          "offset": 0,
+          "ns_per_op": 165.3229,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 23,
+          "offset": 16384,
+          "ns_per_op": 166.2083,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 23,
+          "offset": 8192,
+          "ns_per_op": 166.9229,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 23,
+          "offset": 4096,
+          "ns_per_op": 167.63955,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 23,
+          "offset": 512,
+          "ns_per_op": 168.33125,
+          "destination_mod_16k": 512
+        }
+      ]
+    },
+    {
+      "run": 1,
+      "environment": {
+        "kind": "environment",
+        "bytes": 21088,
+        "rounds": 24,
+        "iterations": 20000,
+        "source_mod_16k": 0
+      },
+      "samples": [
+        {
+          "kind": "sample",
+          "round": 0,
+          "offset": 0,
+          "ns_per_op": 215.275,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 0,
+          "offset": 16,
+          "ns_per_op": 199.49795,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 0,
+          "offset": 64,
+          "ns_per_op": 242.38335,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 0,
+          "offset": 128,
+          "ns_per_op": 184.2,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 0,
+          "offset": 256,
+          "ns_per_op": 168.9542,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 0,
+          "offset": 512,
+          "ns_per_op": 170.8583,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 0,
+          "offset": 4096,
+          "ns_per_op": 168.93335,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 0,
+          "offset": 8192,
+          "ns_per_op": 166.8375,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 0,
+          "offset": 16384,
+          "ns_per_op": 169.6104,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 1,
+          "offset": 0,
+          "ns_per_op": 177.30625,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 1,
+          "offset": 16384,
+          "ns_per_op": 165.32705,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 1,
+          "offset": 8192,
+          "ns_per_op": 184.9979,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 1,
+          "offset": 4096,
+          "ns_per_op": 185.55415,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 1,
+          "offset": 512,
+          "ns_per_op": 171.72085,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 1,
+          "offset": 256,
+          "ns_per_op": 169.16665,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 1,
+          "offset": 128,
+          "ns_per_op": 168.0646,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 1,
+          "offset": 64,
+          "ns_per_op": 212.98545,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 1,
+          "offset": 16,
+          "ns_per_op": 205.7729,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 2,
+          "offset": 64,
+          "ns_per_op": 174.825,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 2,
+          "offset": 128,
+          "ns_per_op": 174.7833,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 2,
+          "offset": 256,
+          "ns_per_op": 169.3708,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 2,
+          "offset": 512,
+          "ns_per_op": 173.7104,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 2,
+          "offset": 4096,
+          "ns_per_op": 174.5875,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 2,
+          "offset": 8192,
+          "ns_per_op": 167.60415,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 2,
+          "offset": 16384,
+          "ns_per_op": 165.4458,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 2,
+          "offset": 0,
+          "ns_per_op": 200.3771,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 2,
+          "offset": 16,
+          "ns_per_op": 167.92915,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 3,
+          "offset": 64,
+          "ns_per_op": 172.9354,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 3,
+          "offset": 16,
+          "ns_per_op": 168.8396,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 3,
+          "offset": 0,
+          "ns_per_op": 164.9896,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 3,
+          "offset": 16384,
+          "ns_per_op": 169.9229,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 3,
+          "offset": 8192,
+          "ns_per_op": 174.14375,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 3,
+          "offset": 4096,
+          "ns_per_op": 168.9979,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 3,
+          "offset": 512,
+          "ns_per_op": 167.66665,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 3,
+          "offset": 256,
+          "ns_per_op": 183.67085,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 3,
+          "offset": 128,
+          "ns_per_op": 169.2771,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 4,
+          "offset": 256,
+          "ns_per_op": 169.0854,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 4,
+          "offset": 512,
+          "ns_per_op": 166.46045,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 4,
+          "offset": 4096,
+          "ns_per_op": 170.38335,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 4,
+          "offset": 8192,
+          "ns_per_op": 170.1375,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 4,
+          "offset": 16384,
+          "ns_per_op": 168.5708,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 4,
+          "offset": 0,
+          "ns_per_op": 185.4125,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 4,
+          "offset": 16,
+          "ns_per_op": 169.225,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 4,
+          "offset": 64,
+          "ns_per_op": 167.62295,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 4,
+          "offset": 128,
+          "ns_per_op": 169.1417,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 5,
+          "offset": 256,
+          "ns_per_op": 169.08335,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 5,
+          "offset": 128,
+          "ns_per_op": 169.79165,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 5,
+          "offset": 64,
+          "ns_per_op": 168.6854,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 5,
+          "offset": 16,
+          "ns_per_op": 167.81665,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 5,
+          "offset": 0,
+          "ns_per_op": 165.48335,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 5,
+          "offset": 16384,
+          "ns_per_op": 167.625,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 5,
+          "offset": 8192,
+          "ns_per_op": 168.56665,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 5,
+          "offset": 4096,
+          "ns_per_op": 333.10625,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 5,
+          "offset": 512,
+          "ns_per_op": 367.7521,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 6,
+          "offset": 4096,
+          "ns_per_op": 170.78955,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 6,
+          "offset": 8192,
+          "ns_per_op": 616.3646,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 6,
+          "offset": 16384,
+          "ns_per_op": 513.7396,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 6,
+          "offset": 0,
+          "ns_per_op": 222.90205,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 6,
+          "offset": 16,
+          "ns_per_op": 312.05625,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 6,
+          "offset": 64,
+          "ns_per_op": 394.50835,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 6,
+          "offset": 128,
+          "ns_per_op": 285.08545,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 6,
+          "offset": 256,
+          "ns_per_op": 244.4229,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 6,
+          "offset": 512,
+          "ns_per_op": 267.4042,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 7,
+          "offset": 4096,
+          "ns_per_op": 252.18125,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 7,
+          "offset": 512,
+          "ns_per_op": 226.1875,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 7,
+          "offset": 256,
+          "ns_per_op": 215.56045,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 7,
+          "offset": 128,
+          "ns_per_op": 245.4021,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 7,
+          "offset": 64,
+          "ns_per_op": 228.3604,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 7,
+          "offset": 16,
+          "ns_per_op": 278.7875,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 7,
+          "offset": 0,
+          "ns_per_op": 197.69165,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 7,
+          "offset": 16384,
+          "ns_per_op": 188.35,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 7,
+          "offset": 8192,
+          "ns_per_op": 274.9979,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 8,
+          "offset": 16384,
+          "ns_per_op": 176.2521,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 8,
+          "offset": 0,
+          "ns_per_op": 159.775,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 8,
+          "offset": 16,
+          "ns_per_op": 229.1375,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 8,
+          "offset": 64,
+          "ns_per_op": 210.63545,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 8,
+          "offset": 128,
+          "ns_per_op": 176.30415,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 8,
+          "offset": 256,
+          "ns_per_op": 183.16665,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 8,
+          "offset": 512,
+          "ns_per_op": 178.9771,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 8,
+          "offset": 4096,
+          "ns_per_op": 170.2167,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 8,
+          "offset": 8192,
+          "ns_per_op": 211.175,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 9,
+          "offset": 16384,
+          "ns_per_op": 170.05,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 9,
+          "offset": 8192,
+          "ns_per_op": 167.99585,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 9,
+          "offset": 4096,
+          "ns_per_op": 182.0396,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 9,
+          "offset": 512,
+          "ns_per_op": 203.1125,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 9,
+          "offset": 256,
+          "ns_per_op": 183.10625,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 9,
+          "offset": 128,
+          "ns_per_op": 161.6667,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 9,
+          "offset": 64,
+          "ns_per_op": 169.71045,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 9,
+          "offset": 16,
+          "ns_per_op": 167.3125,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 9,
+          "offset": 0,
+          "ns_per_op": 181.98125,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 10,
+          "offset": 16,
+          "ns_per_op": 161.25625,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 10,
+          "offset": 64,
+          "ns_per_op": 168.7854,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 10,
+          "offset": 128,
+          "ns_per_op": 169.31045,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 10,
+          "offset": 256,
+          "ns_per_op": 212.16665,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 10,
+          "offset": 512,
+          "ns_per_op": 192.41875,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 10,
+          "offset": 4096,
+          "ns_per_op": 171.05625,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 10,
+          "offset": 8192,
+          "ns_per_op": 160.0979,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 10,
+          "offset": 16384,
+          "ns_per_op": 171.86875,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 10,
+          "offset": 0,
+          "ns_per_op": 186.1229,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 11,
+          "offset": 16,
+          "ns_per_op": 255.2479,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 11,
+          "offset": 0,
+          "ns_per_op": 226.1104,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 11,
+          "offset": 16384,
+          "ns_per_op": 167.9854,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 11,
+          "offset": 8192,
+          "ns_per_op": 184.2229,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 11,
+          "offset": 4096,
+          "ns_per_op": 175.05835,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 11,
+          "offset": 512,
+          "ns_per_op": 169.4625,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 11,
+          "offset": 256,
+          "ns_per_op": 185.64375,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 11,
+          "offset": 128,
+          "ns_per_op": 162.22295,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 11,
+          "offset": 64,
+          "ns_per_op": 214.7167,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 12,
+          "offset": 128,
+          "ns_per_op": 165.3979,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 12,
+          "offset": 256,
+          "ns_per_op": 171.38335,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 12,
+          "offset": 512,
+          "ns_per_op": 171.4583,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 12,
+          "offset": 4096,
+          "ns_per_op": 175.87705,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 12,
+          "offset": 8192,
+          "ns_per_op": 169.34375,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 12,
+          "offset": 16384,
+          "ns_per_op": 169.52295,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 12,
+          "offset": 0,
+          "ns_per_op": 164.21665,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 12,
+          "offset": 16,
+          "ns_per_op": 239.57705,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 12,
+          "offset": 64,
+          "ns_per_op": 167.48125,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 13,
+          "offset": 128,
+          "ns_per_op": 157.425,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 13,
+          "offset": 64,
+          "ns_per_op": 205.10415,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 13,
+          "offset": 16,
+          "ns_per_op": 184.0125,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 13,
+          "offset": 0,
+          "ns_per_op": 160.5,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 13,
+          "offset": 16384,
+          "ns_per_op": 173.5479,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 13,
+          "offset": 8192,
+          "ns_per_op": 169.1271,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 13,
+          "offset": 4096,
+          "ns_per_op": 175.77085,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 13,
+          "offset": 512,
+          "ns_per_op": 179.27085,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 13,
+          "offset": 256,
+          "ns_per_op": 165.55835,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 14,
+          "offset": 512,
+          "ns_per_op": 169.6271,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 14,
+          "offset": 4096,
+          "ns_per_op": 174.19165,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 14,
+          "offset": 8192,
+          "ns_per_op": 193.29165,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 14,
+          "offset": 16384,
+          "ns_per_op": 168.4479,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 14,
+          "offset": 0,
+          "ns_per_op": 179.8604,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 14,
+          "offset": 16,
+          "ns_per_op": 169.74165,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 14,
+          "offset": 64,
+          "ns_per_op": 170.0833,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 14,
+          "offset": 128,
+          "ns_per_op": 167.475,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 14,
+          "offset": 256,
+          "ns_per_op": 170.44375,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 15,
+          "offset": 512,
+          "ns_per_op": 168.7875,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 15,
+          "offset": 256,
+          "ns_per_op": 174.6625,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 15,
+          "offset": 128,
+          "ns_per_op": 169.9625,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 15,
+          "offset": 64,
+          "ns_per_op": 171.63125,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 15,
+          "offset": 16,
+          "ns_per_op": 222.9229,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 15,
+          "offset": 0,
+          "ns_per_op": 174.74165,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 15,
+          "offset": 16384,
+          "ns_per_op": 161.4521,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 15,
+          "offset": 8192,
+          "ns_per_op": 165.4271,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 15,
+          "offset": 4096,
+          "ns_per_op": 160.1875,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 16,
+          "offset": 8192,
+          "ns_per_op": 168.7271,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 16,
+          "offset": 16384,
+          "ns_per_op": 163.08125,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 16,
+          "offset": 0,
+          "ns_per_op": 161.06665,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 16,
+          "offset": 16,
+          "ns_per_op": 170.38125,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 16,
+          "offset": 64,
+          "ns_per_op": 167.13125,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 16,
+          "offset": 128,
+          "ns_per_op": 168.975,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 16,
+          "offset": 256,
+          "ns_per_op": 164.84795,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 16,
+          "offset": 512,
+          "ns_per_op": 174.58335,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 16,
+          "offset": 4096,
+          "ns_per_op": 174.51665,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 17,
+          "offset": 8192,
+          "ns_per_op": 169.4875,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 17,
+          "offset": 4096,
+          "ns_per_op": 171.9729,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 17,
+          "offset": 512,
+          "ns_per_op": 169.02915,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 17,
+          "offset": 256,
+          "ns_per_op": 169.66455,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 17,
+          "offset": 128,
+          "ns_per_op": 175.24585,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 17,
+          "offset": 64,
+          "ns_per_op": 168.00835,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 17,
+          "offset": 16,
+          "ns_per_op": 235.2583,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 17,
+          "offset": 0,
+          "ns_per_op": 168.41665,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 17,
+          "offset": 16384,
+          "ns_per_op": 157.51665,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 18,
+          "offset": 0,
+          "ns_per_op": 167.1875,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 18,
+          "offset": 16,
+          "ns_per_op": 160.62915,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 18,
+          "offset": 64,
+          "ns_per_op": 157.66665,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 18,
+          "offset": 128,
+          "ns_per_op": 167.6792,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 18,
+          "offset": 256,
+          "ns_per_op": 173.8271,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 18,
+          "offset": 512,
+          "ns_per_op": 161.05,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 18,
+          "offset": 4096,
+          "ns_per_op": 171.55625,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 18,
+          "offset": 8192,
+          "ns_per_op": 164.9229,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 18,
+          "offset": 16384,
+          "ns_per_op": 169.59375,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 19,
+          "offset": 0,
+          "ns_per_op": 173.30415,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 19,
+          "offset": 16384,
+          "ns_per_op": 166.2917,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 19,
+          "offset": 8192,
+          "ns_per_op": 185.36665,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 19,
+          "offset": 4096,
+          "ns_per_op": 171.51665,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 19,
+          "offset": 512,
+          "ns_per_op": 164.8625,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 19,
+          "offset": 256,
+          "ns_per_op": 177.63545,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 19,
+          "offset": 128,
+          "ns_per_op": 171.8042,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 19,
+          "offset": 64,
+          "ns_per_op": 169.0604,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 19,
+          "offset": 16,
+          "ns_per_op": 231.1875,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 20,
+          "offset": 64,
+          "ns_per_op": 161.3,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 20,
+          "offset": 128,
+          "ns_per_op": 160.0292,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 20,
+          "offset": 256,
+          "ns_per_op": 173.57085,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 20,
+          "offset": 512,
+          "ns_per_op": 161.65625,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 20,
+          "offset": 4096,
+          "ns_per_op": 169.025,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 20,
+          "offset": 8192,
+          "ns_per_op": 212.575,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 20,
+          "offset": 16384,
+          "ns_per_op": 157.825,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 20,
+          "offset": 0,
+          "ns_per_op": 175.8854,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 20,
+          "offset": 16,
+          "ns_per_op": 202.20415,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 21,
+          "offset": 64,
+          "ns_per_op": 170.85,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 21,
+          "offset": 16,
+          "ns_per_op": 169.03955,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 21,
+          "offset": 0,
+          "ns_per_op": 159.9604,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 21,
+          "offset": 16384,
+          "ns_per_op": 162.1021,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 21,
+          "offset": 8192,
+          "ns_per_op": 185.3167,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 21,
+          "offset": 4096,
+          "ns_per_op": 166.4,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 21,
+          "offset": 512,
+          "ns_per_op": 170.60625,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 21,
+          "offset": 256,
+          "ns_per_op": 168.93335,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 21,
+          "offset": 128,
+          "ns_per_op": 165.33125,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 22,
+          "offset": 256,
+          "ns_per_op": 167.7875,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 22,
+          "offset": 512,
+          "ns_per_op": 168.48125,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 22,
+          "offset": 4096,
+          "ns_per_op": 169.40625,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 22,
+          "offset": 8192,
+          "ns_per_op": 275.3354,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 22,
+          "offset": 16384,
+          "ns_per_op": 265.23125,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 22,
+          "offset": 0,
+          "ns_per_op": 310.11875,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 22,
+          "offset": 16,
+          "ns_per_op": 280.81875,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 22,
+          "offset": 64,
+          "ns_per_op": 283.31875,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 22,
+          "offset": 128,
+          "ns_per_op": 285.0021,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 23,
+          "offset": 256,
+          "ns_per_op": 321.36875,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 23,
+          "offset": 128,
+          "ns_per_op": 292.4854,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 23,
+          "offset": 64,
+          "ns_per_op": 323.6042,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 23,
+          "offset": 16,
+          "ns_per_op": 293.9833,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 23,
+          "offset": 0,
+          "ns_per_op": 288.7583,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 23,
+          "offset": 16384,
+          "ns_per_op": 182.50835,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 23,
+          "offset": 8192,
+          "ns_per_op": 1395.60625,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 23,
+          "offset": 4096,
+          "ns_per_op": 453.1958,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 23,
+          "offset": 512,
+          "ns_per_op": 256.6042,
+          "destination_mod_16k": 512
+        }
+      ]
+    },
+    {
+      "run": 2,
+      "environment": {
+        "kind": "environment",
+        "bytes": 21088,
+        "rounds": 24,
+        "iterations": 20000,
+        "source_mod_16k": 0
+      },
+      "samples": [
+        {
+          "kind": "sample",
+          "round": 0,
+          "offset": 0,
+          "ns_per_op": 253.25,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 0,
+          "offset": 16,
+          "ns_per_op": 263.6583,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 0,
+          "offset": 64,
+          "ns_per_op": 183.54585,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 0,
+          "offset": 128,
+          "ns_per_op": 192.6104,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 0,
+          "offset": 256,
+          "ns_per_op": 171.07085,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 0,
+          "offset": 512,
+          "ns_per_op": 171.7,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 0,
+          "offset": 4096,
+          "ns_per_op": 169.45835,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 0,
+          "offset": 8192,
+          "ns_per_op": 169.0604,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 0,
+          "offset": 16384,
+          "ns_per_op": 170.41455,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 1,
+          "offset": 0,
+          "ns_per_op": 189.68125,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 1,
+          "offset": 16384,
+          "ns_per_op": 249.36875,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 1,
+          "offset": 8192,
+          "ns_per_op": 198.91665,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 1,
+          "offset": 4096,
+          "ns_per_op": 170.6521,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 1,
+          "offset": 512,
+          "ns_per_op": 194.4875,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 1,
+          "offset": 256,
+          "ns_per_op": 176.9625,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 1,
+          "offset": 128,
+          "ns_per_op": 183.55,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 1,
+          "offset": 64,
+          "ns_per_op": 171.49375,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 1,
+          "offset": 16,
+          "ns_per_op": 196.0354,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 2,
+          "offset": 64,
+          "ns_per_op": 171.64585,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 2,
+          "offset": 128,
+          "ns_per_op": 166.15625,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 2,
+          "offset": 256,
+          "ns_per_op": 191.1625,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 2,
+          "offset": 512,
+          "ns_per_op": 175.375,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 2,
+          "offset": 4096,
+          "ns_per_op": 160.875,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 2,
+          "offset": 8192,
+          "ns_per_op": 171.3375,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 2,
+          "offset": 16384,
+          "ns_per_op": 169.13125,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 2,
+          "offset": 0,
+          "ns_per_op": 160.18125,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 2,
+          "offset": 16,
+          "ns_per_op": 190.45,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 3,
+          "offset": 64,
+          "ns_per_op": 179.425,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 3,
+          "offset": 16,
+          "ns_per_op": 170.23125,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 3,
+          "offset": 0,
+          "ns_per_op": 177.96665,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 3,
+          "offset": 16384,
+          "ns_per_op": 282.09165,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 3,
+          "offset": 8192,
+          "ns_per_op": 222.73125,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 3,
+          "offset": 4096,
+          "ns_per_op": 203.26665,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 3,
+          "offset": 512,
+          "ns_per_op": 330.8375,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 3,
+          "offset": 256,
+          "ns_per_op": 207.6021,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 3,
+          "offset": 128,
+          "ns_per_op": 172.3021,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 4,
+          "offset": 256,
+          "ns_per_op": 170.7521,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 4,
+          "offset": 512,
+          "ns_per_op": 167.48545,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 4,
+          "offset": 4096,
+          "ns_per_op": 169.8458,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 4,
+          "offset": 8192,
+          "ns_per_op": 174.2396,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 4,
+          "offset": 16384,
+          "ns_per_op": 180.03125,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 4,
+          "offset": 0,
+          "ns_per_op": 278.6896,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 4,
+          "offset": 16,
+          "ns_per_op": 231.54795,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 4,
+          "offset": 64,
+          "ns_per_op": 171.78335,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 4,
+          "offset": 128,
+          "ns_per_op": 170.19585,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 5,
+          "offset": 256,
+          "ns_per_op": 175.65415,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 5,
+          "offset": 128,
+          "ns_per_op": 178.60415,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 5,
+          "offset": 64,
+          "ns_per_op": 166.51875,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 5,
+          "offset": 16,
+          "ns_per_op": 249.5875,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 5,
+          "offset": 0,
+          "ns_per_op": 165.69375,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 5,
+          "offset": 16384,
+          "ns_per_op": 162.31875,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 5,
+          "offset": 8192,
+          "ns_per_op": 175.87915,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 5,
+          "offset": 4096,
+          "ns_per_op": 168.6104,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 5,
+          "offset": 512,
+          "ns_per_op": 242.61665,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 6,
+          "offset": 4096,
+          "ns_per_op": 177.00625,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 6,
+          "offset": 8192,
+          "ns_per_op": 252.96875,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 6,
+          "offset": 16384,
+          "ns_per_op": 231.29375,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 6,
+          "offset": 0,
+          "ns_per_op": 201.64375,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 6,
+          "offset": 16,
+          "ns_per_op": 275.9167,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 6,
+          "offset": 64,
+          "ns_per_op": 173.31875,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 6,
+          "offset": 128,
+          "ns_per_op": 169.98545,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 6,
+          "offset": 256,
+          "ns_per_op": 182.01875,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 6,
+          "offset": 512,
+          "ns_per_op": 172.5375,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 7,
+          "offset": 4096,
+          "ns_per_op": 227.61875,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 7,
+          "offset": 512,
+          "ns_per_op": 201.54165,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 7,
+          "offset": 256,
+          "ns_per_op": 181.48125,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 7,
+          "offset": 128,
+          "ns_per_op": 169.59795,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 7,
+          "offset": 64,
+          "ns_per_op": 172.33335,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 7,
+          "offset": 16,
+          "ns_per_op": 184.13125,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 7,
+          "offset": 0,
+          "ns_per_op": 248.45625,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 7,
+          "offset": 16384,
+          "ns_per_op": 189.33335,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 7,
+          "offset": 8192,
+          "ns_per_op": 228.5104,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 8,
+          "offset": 16384,
+          "ns_per_op": 177.15205,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 8,
+          "offset": 0,
+          "ns_per_op": 170.65625,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 8,
+          "offset": 16,
+          "ns_per_op": 171.3271,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 8,
+          "offset": 64,
+          "ns_per_op": 172.9667,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 8,
+          "offset": 128,
+          "ns_per_op": 161.59585,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 8,
+          "offset": 256,
+          "ns_per_op": 172.46665,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 8,
+          "offset": 512,
+          "ns_per_op": 175.4125,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 8,
+          "offset": 4096,
+          "ns_per_op": 179.51665,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 8,
+          "offset": 8192,
+          "ns_per_op": 168.73335,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 9,
+          "offset": 16384,
+          "ns_per_op": 170.6167,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 9,
+          "offset": 8192,
+          "ns_per_op": 170.5729,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 9,
+          "offset": 4096,
+          "ns_per_op": 168.67295,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 9,
+          "offset": 512,
+          "ns_per_op": 173.0146,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 9,
+          "offset": 256,
+          "ns_per_op": 167.95,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 9,
+          "offset": 128,
+          "ns_per_op": 358.26665,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 9,
+          "offset": 64,
+          "ns_per_op": 201.55835,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 9,
+          "offset": 16,
+          "ns_per_op": 282.7792,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 9,
+          "offset": 0,
+          "ns_per_op": 281.89375,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 10,
+          "offset": 16,
+          "ns_per_op": 303.9896,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 10,
+          "offset": 64,
+          "ns_per_op": 333.55625,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 10,
+          "offset": 128,
+          "ns_per_op": 361.73125,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 10,
+          "offset": 256,
+          "ns_per_op": 318.6021,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 10,
+          "offset": 512,
+          "ns_per_op": 216.2896,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 10,
+          "offset": 4096,
+          "ns_per_op": 262.9125,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 10,
+          "offset": 8192,
+          "ns_per_op": 251.77085,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 10,
+          "offset": 16384,
+          "ns_per_op": 266.01665,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 10,
+          "offset": 0,
+          "ns_per_op": 200.23335,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 11,
+          "offset": 16,
+          "ns_per_op": 276.96455,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 11,
+          "offset": 0,
+          "ns_per_op": 227.7479,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 11,
+          "offset": 16384,
+          "ns_per_op": 302.41875,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 11,
+          "offset": 8192,
+          "ns_per_op": 190.7479,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 11,
+          "offset": 4096,
+          "ns_per_op": 320.7792,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 11,
+          "offset": 512,
+          "ns_per_op": 203.59375,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 11,
+          "offset": 256,
+          "ns_per_op": 170.0917,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 11,
+          "offset": 128,
+          "ns_per_op": 264.8646,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 11,
+          "offset": 64,
+          "ns_per_op": 177.7708,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 12,
+          "offset": 128,
+          "ns_per_op": 248.8854,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 12,
+          "offset": 256,
+          "ns_per_op": 182.64375,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 12,
+          "offset": 512,
+          "ns_per_op": 244.3729,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 12,
+          "offset": 4096,
+          "ns_per_op": 251.1917,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 12,
+          "offset": 8192,
+          "ns_per_op": 161.10415,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 12,
+          "offset": 16384,
+          "ns_per_op": 174.17705,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 12,
+          "offset": 0,
+          "ns_per_op": 167.1208,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 12,
+          "offset": 16,
+          "ns_per_op": 161.2417,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 12,
+          "offset": 64,
+          "ns_per_op": 172.825,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 13,
+          "offset": 128,
+          "ns_per_op": 169.27705,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 13,
+          "offset": 64,
+          "ns_per_op": 171.1,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 13,
+          "offset": 16,
+          "ns_per_op": 249.11455,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 13,
+          "offset": 0,
+          "ns_per_op": 170.0083,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 13,
+          "offset": 16384,
+          "ns_per_op": 169.2042,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 13,
+          "offset": 8192,
+          "ns_per_op": 188.93125,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 13,
+          "offset": 4096,
+          "ns_per_op": 172.6521,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 13,
+          "offset": 512,
+          "ns_per_op": 175.54375,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 13,
+          "offset": 256,
+          "ns_per_op": 167.3083,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 14,
+          "offset": 512,
+          "ns_per_op": 180.2021,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 14,
+          "offset": 4096,
+          "ns_per_op": 171.28125,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 14,
+          "offset": 8192,
+          "ns_per_op": 168.62915,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 14,
+          "offset": 16384,
+          "ns_per_op": 169.23125,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 14,
+          "offset": 0,
+          "ns_per_op": 170.85,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 14,
+          "offset": 16,
+          "ns_per_op": 191.8708,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 14,
+          "offset": 64,
+          "ns_per_op": 169.6104,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 14,
+          "offset": 128,
+          "ns_per_op": 169.38545,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 14,
+          "offset": 256,
+          "ns_per_op": 174.69585,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 15,
+          "offset": 512,
+          "ns_per_op": 170.5854,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 15,
+          "offset": 256,
+          "ns_per_op": 173.2979,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 15,
+          "offset": 128,
+          "ns_per_op": 169.37915,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 15,
+          "offset": 64,
+          "ns_per_op": 172.11665,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 15,
+          "offset": 16,
+          "ns_per_op": 228.05625,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 15,
+          "offset": 0,
+          "ns_per_op": 183.4104,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 15,
+          "offset": 16384,
+          "ns_per_op": 159.5,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 15,
+          "offset": 8192,
+          "ns_per_op": 160.7,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 15,
+          "offset": 4096,
+          "ns_per_op": 172.2771,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 16,
+          "offset": 8192,
+          "ns_per_op": 179.9208,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 16,
+          "offset": 16384,
+          "ns_per_op": 161.01875,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 16,
+          "offset": 0,
+          "ns_per_op": 164.45,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 16,
+          "offset": 16,
+          "ns_per_op": 170.0229,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 16,
+          "offset": 64,
+          "ns_per_op": 166.26875,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 16,
+          "offset": 128,
+          "ns_per_op": 208.1396,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 16,
+          "offset": 256,
+          "ns_per_op": 173.54165,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 16,
+          "offset": 512,
+          "ns_per_op": 170.17705,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 16,
+          "offset": 4096,
+          "ns_per_op": 169.03545,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 17,
+          "offset": 8192,
+          "ns_per_op": 168.68125,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 17,
+          "offset": 4096,
+          "ns_per_op": 172.49795,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 17,
+          "offset": 512,
+          "ns_per_op": 168.31455,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 17,
+          "offset": 256,
+          "ns_per_op": 169.8917,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 17,
+          "offset": 128,
+          "ns_per_op": 169.71875,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 17,
+          "offset": 64,
+          "ns_per_op": 173.10415,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 17,
+          "offset": 16,
+          "ns_per_op": 233.40625,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 17,
+          "offset": 0,
+          "ns_per_op": 160.5521,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 17,
+          "offset": 16384,
+          "ns_per_op": 161.14375,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 18,
+          "offset": 0,
+          "ns_per_op": 184.3917,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 18,
+          "offset": 16,
+          "ns_per_op": 161.43125,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 18,
+          "offset": 64,
+          "ns_per_op": 161.30205,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 18,
+          "offset": 128,
+          "ns_per_op": 162.6,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 18,
+          "offset": 256,
+          "ns_per_op": 180.0771,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 18,
+          "offset": 512,
+          "ns_per_op": 160.6333,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 18,
+          "offset": 4096,
+          "ns_per_op": 177.2458,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 18,
+          "offset": 8192,
+          "ns_per_op": 168.8,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 18,
+          "offset": 16384,
+          "ns_per_op": 168.6521,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 19,
+          "offset": 0,
+          "ns_per_op": 170.3646,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 19,
+          "offset": 16384,
+          "ns_per_op": 168.72295,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 19,
+          "offset": 8192,
+          "ns_per_op": 168.6146,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 19,
+          "offset": 4096,
+          "ns_per_op": 162.6396,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 19,
+          "offset": 512,
+          "ns_per_op": 161.26665,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 19,
+          "offset": 256,
+          "ns_per_op": 161.75835,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 19,
+          "offset": 128,
+          "ns_per_op": 168.11875,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 19,
+          "offset": 64,
+          "ns_per_op": 168.77295,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 19,
+          "offset": 16,
+          "ns_per_op": 228.4854,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 20,
+          "offset": 64,
+          "ns_per_op": 169.5125,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 20,
+          "offset": 128,
+          "ns_per_op": 170.1729,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 20,
+          "offset": 256,
+          "ns_per_op": 164.9521,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 20,
+          "offset": 512,
+          "ns_per_op": 170.93335,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 20,
+          "offset": 4096,
+          "ns_per_op": 161.725,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 20,
+          "offset": 8192,
+          "ns_per_op": 205.00835,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 20,
+          "offset": 16384,
+          "ns_per_op": 168.15625,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 20,
+          "offset": 0,
+          "ns_per_op": 176.45625,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 20,
+          "offset": 16,
+          "ns_per_op": 171.9979,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 21,
+          "offset": 64,
+          "ns_per_op": 168.84375,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 21,
+          "offset": 16,
+          "ns_per_op": 169.53125,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 21,
+          "offset": 0,
+          "ns_per_op": 168.7146,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 21,
+          "offset": 16384,
+          "ns_per_op": 168.7979,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 21,
+          "offset": 8192,
+          "ns_per_op": 165.62915,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 21,
+          "offset": 4096,
+          "ns_per_op": 159.31875,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 21,
+          "offset": 512,
+          "ns_per_op": 169.6125,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 21,
+          "offset": 256,
+          "ns_per_op": 168.81665,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 21,
+          "offset": 128,
+          "ns_per_op": 169.025,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 22,
+          "offset": 256,
+          "ns_per_op": 169.7875,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 22,
+          "offset": 512,
+          "ns_per_op": 161.50625,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 22,
+          "offset": 4096,
+          "ns_per_op": 189.23125,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 22,
+          "offset": 8192,
+          "ns_per_op": 169.62085,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 22,
+          "offset": 16384,
+          "ns_per_op": 169.22915,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 22,
+          "offset": 0,
+          "ns_per_op": 171.2521,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 22,
+          "offset": 16,
+          "ns_per_op": 171.2542,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 22,
+          "offset": 64,
+          "ns_per_op": 171.47705,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 22,
+          "offset": 128,
+          "ns_per_op": 161.0625,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 23,
+          "offset": 256,
+          "ns_per_op": 165.06665,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 23,
+          "offset": 128,
+          "ns_per_op": 167.23335,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 23,
+          "offset": 64,
+          "ns_per_op": 170.9854,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 23,
+          "offset": 16,
+          "ns_per_op": 184.28955,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 23,
+          "offset": 0,
+          "ns_per_op": 168.59375,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 23,
+          "offset": 16384,
+          "ns_per_op": 169.52085,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 23,
+          "offset": 8192,
+          "ns_per_op": 173.25835,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 23,
+          "offset": 4096,
+          "ns_per_op": 171.34585,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 23,
+          "offset": 512,
+          "ns_per_op": 183.23125,
+          "destination_mod_16k": 512
+        }
+      ]
+    },
+    {
+      "run": 3,
+      "environment": {
+        "kind": "environment",
+        "bytes": 21088,
+        "rounds": 24,
+        "iterations": 20000,
+        "source_mod_16k": 0
+      },
+      "samples": [
+        {
+          "kind": "sample",
+          "round": 0,
+          "offset": 0,
+          "ns_per_op": 252.75415,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 0,
+          "offset": 16,
+          "ns_per_op": 192.0604,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 0,
+          "offset": 64,
+          "ns_per_op": 166.81045,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 0,
+          "offset": 128,
+          "ns_per_op": 169.05625,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 0,
+          "offset": 256,
+          "ns_per_op": 170.24795,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 0,
+          "offset": 512,
+          "ns_per_op": 174.32705,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 0,
+          "offset": 4096,
+          "ns_per_op": 168.825,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 0,
+          "offset": 8192,
+          "ns_per_op": 171.53125,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 0,
+          "offset": 16384,
+          "ns_per_op": 175.3917,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 1,
+          "offset": 0,
+          "ns_per_op": 216.9396,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 1,
+          "offset": 16384,
+          "ns_per_op": 168.4604,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 1,
+          "offset": 8192,
+          "ns_per_op": 169.20835,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 1,
+          "offset": 4096,
+          "ns_per_op": 170.10205,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 1,
+          "offset": 512,
+          "ns_per_op": 167.3104,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 1,
+          "offset": 256,
+          "ns_per_op": 169.1042,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 1,
+          "offset": 128,
+          "ns_per_op": 169.61045,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 1,
+          "offset": 64,
+          "ns_per_op": 166.4167,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 1,
+          "offset": 16,
+          "ns_per_op": 225.0729,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 2,
+          "offset": 64,
+          "ns_per_op": 181.7229,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 2,
+          "offset": 128,
+          "ns_per_op": 214.575,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 2,
+          "offset": 256,
+          "ns_per_op": 229.7542,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 2,
+          "offset": 512,
+          "ns_per_op": 235.02085,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 2,
+          "offset": 4096,
+          "ns_per_op": 177.10625,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 2,
+          "offset": 8192,
+          "ns_per_op": 166.0375,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 2,
+          "offset": 16384,
+          "ns_per_op": 167.6708,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 2,
+          "offset": 0,
+          "ns_per_op": 171.1229,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 2,
+          "offset": 16,
+          "ns_per_op": 211.79585,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 3,
+          "offset": 64,
+          "ns_per_op": 162.89585,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 3,
+          "offset": 16,
+          "ns_per_op": 225.40835,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 3,
+          "offset": 0,
+          "ns_per_op": 165.8104,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 3,
+          "offset": 16384,
+          "ns_per_op": 162.53125,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 3,
+          "offset": 8192,
+          "ns_per_op": 195.9125,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 3,
+          "offset": 4096,
+          "ns_per_op": 169.69585,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 3,
+          "offset": 512,
+          "ns_per_op": 168.50415,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 3,
+          "offset": 256,
+          "ns_per_op": 169.58955,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 3,
+          "offset": 128,
+          "ns_per_op": 174.825,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 4,
+          "offset": 256,
+          "ns_per_op": 174.11875,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 4,
+          "offset": 512,
+          "ns_per_op": 169.87295,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 4,
+          "offset": 4096,
+          "ns_per_op": 181.31045,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 4,
+          "offset": 8192,
+          "ns_per_op": 195.70835,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 4,
+          "offset": 16384,
+          "ns_per_op": 169.7896,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 4,
+          "offset": 0,
+          "ns_per_op": 230.40625,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 4,
+          "offset": 16,
+          "ns_per_op": 170.4,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 4,
+          "offset": 64,
+          "ns_per_op": 166.8271,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 4,
+          "offset": 128,
+          "ns_per_op": 172.70835,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 5,
+          "offset": 256,
+          "ns_per_op": 167.0917,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 5,
+          "offset": 128,
+          "ns_per_op": 158.9021,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 5,
+          "offset": 64,
+          "ns_per_op": 160.9583,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 5,
+          "offset": 16,
+          "ns_per_op": 228.9875,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 5,
+          "offset": 0,
+          "ns_per_op": 160.79585,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 5,
+          "offset": 16384,
+          "ns_per_op": 160.90415,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 5,
+          "offset": 8192,
+          "ns_per_op": 167.8729,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 5,
+          "offset": 4096,
+          "ns_per_op": 170.08335,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 5,
+          "offset": 512,
+          "ns_per_op": 170.6271,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 6,
+          "offset": 4096,
+          "ns_per_op": 170.5458,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 6,
+          "offset": 8192,
+          "ns_per_op": 169.09375,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 6,
+          "offset": 16384,
+          "ns_per_op": 170.05835,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 6,
+          "offset": 0,
+          "ns_per_op": 166.9,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 6,
+          "offset": 16,
+          "ns_per_op": 170.425,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 6,
+          "offset": 64,
+          "ns_per_op": 169.31875,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 6,
+          "offset": 128,
+          "ns_per_op": 169.10835,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 6,
+          "offset": 256,
+          "ns_per_op": 169.17915,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 6,
+          "offset": 512,
+          "ns_per_op": 169.20625,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 7,
+          "offset": 4096,
+          "ns_per_op": 167.2875,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 7,
+          "offset": 512,
+          "ns_per_op": 168.17085,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 7,
+          "offset": 256,
+          "ns_per_op": 169.0583,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 7,
+          "offset": 128,
+          "ns_per_op": 191.07915,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 7,
+          "offset": 64,
+          "ns_per_op": 168.7396,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 7,
+          "offset": 16,
+          "ns_per_op": 223.49375,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 7,
+          "offset": 0,
+          "ns_per_op": 159.97085,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 7,
+          "offset": 16384,
+          "ns_per_op": 161.17915,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 7,
+          "offset": 8192,
+          "ns_per_op": 160.68125,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 8,
+          "offset": 16384,
+          "ns_per_op": 186.1792,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 8,
+          "offset": 0,
+          "ns_per_op": 174.98125,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 8,
+          "offset": 16,
+          "ns_per_op": 168.3875,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 8,
+          "offset": 64,
+          "ns_per_op": 171.47295,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 8,
+          "offset": 128,
+          "ns_per_op": 167.22085,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 8,
+          "offset": 256,
+          "ns_per_op": 169.5854,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 8,
+          "offset": 512,
+          "ns_per_op": 169.8229,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 8,
+          "offset": 4096,
+          "ns_per_op": 166.45,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 8,
+          "offset": 8192,
+          "ns_per_op": 168.97915,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 9,
+          "offset": 16384,
+          "ns_per_op": 179.8604,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 9,
+          "offset": 8192,
+          "ns_per_op": 182.69165,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 9,
+          "offset": 4096,
+          "ns_per_op": 179.27295,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 9,
+          "offset": 512,
+          "ns_per_op": 173.14165,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 9,
+          "offset": 256,
+          "ns_per_op": 167.2667,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 9,
+          "offset": 128,
+          "ns_per_op": 191.4146,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 9,
+          "offset": 64,
+          "ns_per_op": 169.6333,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 9,
+          "offset": 16,
+          "ns_per_op": 226.7604,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 9,
+          "offset": 0,
+          "ns_per_op": 163.62085,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 10,
+          "offset": 16,
+          "ns_per_op": 174.99375,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 10,
+          "offset": 64,
+          "ns_per_op": 171.9375,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 10,
+          "offset": 128,
+          "ns_per_op": 167.38335,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 10,
+          "offset": 256,
+          "ns_per_op": 165.29375,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 10,
+          "offset": 512,
+          "ns_per_op": 183.27915,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 10,
+          "offset": 4096,
+          "ns_per_op": 169.0771,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 10,
+          "offset": 8192,
+          "ns_per_op": 169.3875,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 10,
+          "offset": 16384,
+          "ns_per_op": 169.54375,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 10,
+          "offset": 0,
+          "ns_per_op": 171.54165,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 11,
+          "offset": 16,
+          "ns_per_op": 182.9625,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 11,
+          "offset": 0,
+          "ns_per_op": 161.27915,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 11,
+          "offset": 16384,
+          "ns_per_op": 165.7021,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 11,
+          "offset": 8192,
+          "ns_per_op": 170.3771,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 11,
+          "offset": 4096,
+          "ns_per_op": 179.3208,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 11,
+          "offset": 512,
+          "ns_per_op": 188.22915,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 11,
+          "offset": 256,
+          "ns_per_op": 169.1146,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 11,
+          "offset": 128,
+          "ns_per_op": 169.79795,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 11,
+          "offset": 64,
+          "ns_per_op": 168.24165,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 12,
+          "offset": 128,
+          "ns_per_op": 179.5146,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 12,
+          "offset": 256,
+          "ns_per_op": 169.6042,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 12,
+          "offset": 512,
+          "ns_per_op": 167.725,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 12,
+          "offset": 4096,
+          "ns_per_op": 169.84165,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 12,
+          "offset": 8192,
+          "ns_per_op": 170.6104,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 12,
+          "offset": 16384,
+          "ns_per_op": 171.53335,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 12,
+          "offset": 0,
+          "ns_per_op": 174.1417,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 12,
+          "offset": 16,
+          "ns_per_op": 174.51665,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 12,
+          "offset": 64,
+          "ns_per_op": 168.8083,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 13,
+          "offset": 128,
+          "ns_per_op": 177.50835,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 13,
+          "offset": 64,
+          "ns_per_op": 170.70205,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 13,
+          "offset": 16,
+          "ns_per_op": 224.9479,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 13,
+          "offset": 0,
+          "ns_per_op": 167.7604,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 13,
+          "offset": 16384,
+          "ns_per_op": 167.99375,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 13,
+          "offset": 8192,
+          "ns_per_op": 173.29375,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 13,
+          "offset": 4096,
+          "ns_per_op": 167.65625,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 13,
+          "offset": 512,
+          "ns_per_op": 169.1729,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 13,
+          "offset": 256,
+          "ns_per_op": 168.74375,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 14,
+          "offset": 512,
+          "ns_per_op": 169.0521,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 14,
+          "offset": 4096,
+          "ns_per_op": 168.6646,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 14,
+          "offset": 8192,
+          "ns_per_op": 170.0771,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 14,
+          "offset": 16384,
+          "ns_per_op": 166.65,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 14,
+          "offset": 0,
+          "ns_per_op": 168.6958,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 14,
+          "offset": 16,
+          "ns_per_op": 169.13955,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 14,
+          "offset": 64,
+          "ns_per_op": 166.7229,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 14,
+          "offset": 128,
+          "ns_per_op": 168.9042,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 14,
+          "offset": 256,
+          "ns_per_op": 168.5,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 15,
+          "offset": 512,
+          "ns_per_op": 167.94165,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 15,
+          "offset": 256,
+          "ns_per_op": 168.75205,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 15,
+          "offset": 128,
+          "ns_per_op": 169.9125,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 15,
+          "offset": 64,
+          "ns_per_op": 168.9125,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 15,
+          "offset": 16,
+          "ns_per_op": 221.6,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 15,
+          "offset": 0,
+          "ns_per_op": 166.2354,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 15,
+          "offset": 16384,
+          "ns_per_op": 169.74375,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 15,
+          "offset": 8192,
+          "ns_per_op": 169.30415,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 15,
+          "offset": 4096,
+          "ns_per_op": 167.5625,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 16,
+          "offset": 8192,
+          "ns_per_op": 169.2854,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 16,
+          "offset": 16384,
+          "ns_per_op": 169.6042,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 16,
+          "offset": 0,
+          "ns_per_op": 170.1875,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 16,
+          "offset": 16,
+          "ns_per_op": 176.8125,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 16,
+          "offset": 64,
+          "ns_per_op": 168.82295,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 16,
+          "offset": 128,
+          "ns_per_op": 171.37085,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 16,
+          "offset": 256,
+          "ns_per_op": 169.43545,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 16,
+          "offset": 512,
+          "ns_per_op": 168.64795,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 16,
+          "offset": 4096,
+          "ns_per_op": 169.78125,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 17,
+          "offset": 8192,
+          "ns_per_op": 169.93125,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 17,
+          "offset": 4096,
+          "ns_per_op": 171.4854,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 17,
+          "offset": 512,
+          "ns_per_op": 178.04375,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 17,
+          "offset": 256,
+          "ns_per_op": 169.93335,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 17,
+          "offset": 128,
+          "ns_per_op": 170.29165,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 17,
+          "offset": 64,
+          "ns_per_op": 170.22705,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 17,
+          "offset": 16,
+          "ns_per_op": 189.37705,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 17,
+          "offset": 0,
+          "ns_per_op": 168.4125,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 17,
+          "offset": 16384,
+          "ns_per_op": 169.7125,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 18,
+          "offset": 0,
+          "ns_per_op": 186.775,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 18,
+          "offset": 16,
+          "ns_per_op": 178.23335,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 18,
+          "offset": 64,
+          "ns_per_op": 171.17915,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 18,
+          "offset": 128,
+          "ns_per_op": 167.39585,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 18,
+          "offset": 256,
+          "ns_per_op": 175.6917,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 18,
+          "offset": 512,
+          "ns_per_op": 169.69165,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 18,
+          "offset": 4096,
+          "ns_per_op": 170.3896,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 18,
+          "offset": 8192,
+          "ns_per_op": 170.71875,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 18,
+          "offset": 16384,
+          "ns_per_op": 168.8375,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 19,
+          "offset": 0,
+          "ns_per_op": 168.13125,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 19,
+          "offset": 16384,
+          "ns_per_op": 181.6979,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 19,
+          "offset": 8192,
+          "ns_per_op": 175.27705,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 19,
+          "offset": 4096,
+          "ns_per_op": 203.11665,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 19,
+          "offset": 512,
+          "ns_per_op": 189.83955,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 19,
+          "offset": 256,
+          "ns_per_op": 171.34375,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 19,
+          "offset": 128,
+          "ns_per_op": 169.5167,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 19,
+          "offset": 64,
+          "ns_per_op": 168.14375,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 19,
+          "offset": 16,
+          "ns_per_op": 226.3,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 20,
+          "offset": 64,
+          "ns_per_op": 168.6646,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 20,
+          "offset": 128,
+          "ns_per_op": 169.5396,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 20,
+          "offset": 256,
+          "ns_per_op": 179.90835,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 20,
+          "offset": 512,
+          "ns_per_op": 169.77705,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 20,
+          "offset": 4096,
+          "ns_per_op": 167.2875,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 20,
+          "offset": 8192,
+          "ns_per_op": 217.15415,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 20,
+          "offset": 16384,
+          "ns_per_op": 167.2375,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 20,
+          "offset": 0,
+          "ns_per_op": 168.43335,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 20,
+          "offset": 16,
+          "ns_per_op": 186.9146,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 21,
+          "offset": 64,
+          "ns_per_op": 165.95,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 21,
+          "offset": 16,
+          "ns_per_op": 179.2375,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 21,
+          "offset": 0,
+          "ns_per_op": 172.81045,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 21,
+          "offset": 16384,
+          "ns_per_op": 170.06045,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 21,
+          "offset": 8192,
+          "ns_per_op": 187.7375,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 21,
+          "offset": 4096,
+          "ns_per_op": 170.25625,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 21,
+          "offset": 512,
+          "ns_per_op": 174.2042,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 21,
+          "offset": 256,
+          "ns_per_op": 168.0917,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 21,
+          "offset": 128,
+          "ns_per_op": 169.13335,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 22,
+          "offset": 256,
+          "ns_per_op": 168.075,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 22,
+          "offset": 512,
+          "ns_per_op": 173.84375,
+          "destination_mod_16k": 512
+        },
+        {
+          "kind": "sample",
+          "round": 22,
+          "offset": 4096,
+          "ns_per_op": 167.0292,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 22,
+          "offset": 8192,
+          "ns_per_op": 168.53335,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 22,
+          "offset": 16384,
+          "ns_per_op": 168.94375,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 22,
+          "offset": 0,
+          "ns_per_op": 178.1,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 22,
+          "offset": 16,
+          "ns_per_op": 176.29375,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 22,
+          "offset": 64,
+          "ns_per_op": 169.125,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 22,
+          "offset": 128,
+          "ns_per_op": 167.1375,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 23,
+          "offset": 256,
+          "ns_per_op": 168.4979,
+          "destination_mod_16k": 256
+        },
+        {
+          "kind": "sample",
+          "round": 23,
+          "offset": 128,
+          "ns_per_op": 168.2646,
+          "destination_mod_16k": 128
+        },
+        {
+          "kind": "sample",
+          "round": 23,
+          "offset": 64,
+          "ns_per_op": 168.0125,
+          "destination_mod_16k": 64
+        },
+        {
+          "kind": "sample",
+          "round": 23,
+          "offset": 16,
+          "ns_per_op": 228.9,
+          "destination_mod_16k": 16
+        },
+        {
+          "kind": "sample",
+          "round": 23,
+          "offset": 0,
+          "ns_per_op": 171.3271,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 23,
+          "offset": 16384,
+          "ns_per_op": 170.72295,
+          "destination_mod_16k": 0
+        },
+        {
+          "kind": "sample",
+          "round": 23,
+          "offset": 8192,
+          "ns_per_op": 172.34585,
+          "destination_mod_16k": 8192
+        },
+        {
+          "kind": "sample",
+          "round": 23,
+          "offset": 4096,
+          "ns_per_op": 168.3271,
+          "destination_mod_16k": 4096
+        },
+        {
+          "kind": "sample",
+          "round": 23,
+          "offset": 512,
+          "ns_per_op": 169.4375,
+          "destination_mod_16k": 512
+        }
+      ]
+    }
+  ],
+  "offsets": {
+    "0": {
+      "median_ns": 171.434375,
+      "min_ns": 158.8979,
+      "max_ns": 772.8375,
+      "cv": 0.35988280027917235
+    },
+    "16": {
+      "median_ns": 185.602075,
+      "min_ns": 160.62915,
+      "max_ns": 402.15625,
+      "cv": 0.2115745105200611
+    },
+    "64": {
+      "median_ns": 169.62185,
+      "min_ns": 157.66665,
+      "max_ns": 394.50835,
+      "cv": 0.21721448435968138
+    },
+    "128": {
+      "median_ns": 169.52814999999998,
+      "min_ns": 157.425,
+      "max_ns": 361.73125,
+      "cv": 0.2141595641755457
+    },
+    "256": {
+      "median_ns": 170.02085,
+      "min_ns": 161.75835,
+      "max_ns": 321.36875,
+      "cv": 0.1627291698626489
+    },
+    "512": {
+      "median_ns": 170.41562499999998,
+      "min_ns": 159.0979,
+      "max_ns": 367.7521,
+      "cv": 0.19500804647289988
+    },
+    "4096": {
+      "median_ns": 170.23647499999998,
+      "min_ns": 157.95,
+      "max_ns": 453.1958,
+      "cv": 0.23014200042696611
+    },
+    "8192": {
+      "median_ns": 170.47500000000002,
+      "min_ns": 160.0979,
+      "max_ns": 1395.60625,
+      "cv": 0.6706696800872806
+    },
+    "16384": {
+      "median_ns": 169.216675,
+      "min_ns": 157.51665,
+      "max_ns": 513.7396,
+      "cv": 0.24328509849336766
+    }
+  }
+}
