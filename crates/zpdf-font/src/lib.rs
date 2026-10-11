@@ -6,15 +6,26 @@ pub mod gb2312;
 pub mod gbk;
 pub mod glyph_list;
 pub mod ksc;
+pub mod pack;
+pub mod provider;
+mod resolution;
 pub mod sjis;
 pub mod standard_fonts;
 pub mod system;
 pub mod type1;
+mod unicode_lookup;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 pub type FontId = u32;
+
+pub use pack::{FontPack, FontPackFormat, FontPackLimits};
+pub use provider::{
+    FontCharacter, FontProvider, FontProviderLimits, RegisteredFontId, RegisteredFontPackId,
+    RegisteredGlyph,
+};
+pub use resolution::DrawingGlyph;
 
 /// Glyph outline as a series of path commands.
 #[derive(Debug, Clone)]
@@ -504,16 +515,7 @@ impl LoadedFont {
     /// composite fonts. The advance is normalized to 1/1000 text-space units
     /// (the composite-font convention).
     pub fn unicode_glyph(&self, code: u32) -> Option<(u16, f64)> {
-        let data = self.font_data.as_ref()?;
-        let mut face = ttf_parser::Face::parse(data, self.face_index).ok()?;
-        self.apply_variations(&mut face);
-        let ch = char::from_u32(code)?;
-        let gid = face.glyph_index(ch)?;
-        let adv = face
-            .glyph_hor_advance(gid)
-            .map(|a| a as f64 * 1000.0 / self.units_per_em)
-            .unwrap_or(500.0);
-        Some((gid.0, adv))
+        unicode_lookup::lookup::<true>(self, code)
     }
 
     /// Configure OpenType variation axes from FontDescriptor values, so a
@@ -581,10 +583,8 @@ impl LoadedFont {
             // Unicode-coded (and substituted legacy-CMap) composite fonts
             // already carry real GIDs.
             glyph_id
-        } else if let Some(map) = &self.cid_to_gid {
-            *map.get(&glyph_id)?
         } else {
-            glyph_id
+            self.drawing_gid_with_face(glyph_id, &face)?
         };
         let gid = ttf_parser::GlyphId(actual_gid);
 
@@ -600,6 +600,21 @@ impl LoadedFont {
             commands: builder.commands,
             advance_width: advance,
         })
+    }
+
+    /// Resolve a glyph-run identity to the physical GID drawn from this face.
+    pub(crate) fn drawing_gid_with_face(
+        &self,
+        glyph_id: u16,
+        _face: &ttf_parser::Face<'_>,
+    ) -> Option<u16> {
+        if self.unicode_coded() || self.legacy_substitute() {
+            return Some(glyph_id);
+        }
+        match &self.cid_to_gid {
+            Some(map) => map.get(&glyph_id).copied(),
+            None => Some(glyph_id),
+        }
     }
 
     /// Fraction of sampled, mapped CIDs whose embedded outline fails to resolve.
@@ -1842,6 +1857,8 @@ pub struct FontCache {
     next_id: FontId,
     bytes_used: u64,
     shared_programs: HashSet<usize>,
+    provider: Option<Arc<FontProvider>>,
+    resolution: Option<Box<resolution::ResolutionCache>>,
 }
 
 impl FontCache {
@@ -1858,7 +1875,20 @@ impl FontCache {
             next_id: 0,
             bytes_used: 0,
             shared_programs: HashSet::with_capacity(capacity),
+            provider: None,
+            resolution: None,
         }
+    }
+
+    /// Carry the document's provider into nested Form XObject font loading.
+    pub fn with_provider(mut self, provider: Arc<FontProvider>) -> Self {
+        self.provider = Some(provider);
+        self.resolution = None;
+        self
+    }
+
+    pub fn provider(&self) -> Option<&Arc<FontProvider>> {
+        self.provider.as_ref()
     }
 
     /// Compatibility shim for the former capacity-limited cache constructor.

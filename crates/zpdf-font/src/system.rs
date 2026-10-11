@@ -56,6 +56,42 @@ pub fn find_system_font(
         return None;
     }
 
+    for key in font_candidates(base_font, hints, ordering) {
+        if let Some((path, face_index)) = index.faces.get(key.as_str()) {
+            if let Some(data) = load_font_bytes(path) {
+                tracing::debug!(
+                    "substituting system font {} (face {face_index}) for {base_font}",
+                    path.display()
+                );
+                return Some(SystemFontMatch {
+                    data,
+                    face_index: *face_index,
+                });
+            }
+        }
+    }
+    tracing::debug!("no system font found for {base_font}");
+    None
+}
+
+/// Preserve one matching order for installed and explicitly registered fonts.
+pub(crate) fn font_candidates(
+    base_font: &str,
+    hints: SubstituteHints,
+    ordering: Option<&str>,
+) -> Vec<String> {
+    font_candidates_with(base_font, hints, ordering, normalize)
+}
+
+/// [`font_candidates`] with the caller's key normalization, so lookups use the
+/// same keys as the index they search: the installed-font index is ASCII-only,
+/// while application-registered names keep non-ASCII letters.
+pub(crate) fn font_candidates_with(
+    base_font: &str,
+    hints: SubstituteHints,
+    ordering: Option<&str>,
+    normalize: fn(&str) -> String,
+) -> Vec<String> {
     let name = strip_subset_prefix(base_font);
     let (family_part, style_part) = split_family_style(name);
     let lower = name.to_ascii_lowercase();
@@ -109,26 +145,11 @@ pub fn find_system_font(
         push(&mut candidates, fam);
     }
 
-    for key in &candidates {
-        if let Some((path, face_index)) = index.faces.get(key.as_str()) {
-            if let Some(data) = load_font_bytes(path) {
-                tracing::debug!(
-                    "substituting system font {} (face {face_index}) for {base_font}",
-                    path.display()
-                );
-                return Some(SystemFontMatch {
-                    data,
-                    face_index: *face_index,
-                });
-            }
-        }
-    }
-    tracing::debug!("no system font found for {base_font}");
-    None
+    candidates
 }
 
 /// Strip a `ABCDEF+` subset prefix.
-fn strip_subset_prefix(name: &str) -> &str {
+pub(crate) fn strip_subset_prefix(name: &str) -> &str {
     match name.split_once('+') {
         Some((prefix, rest))
             if prefix.len() == 6 && prefix.bytes().all(|b| b.is_ascii_uppercase()) =>
@@ -148,7 +169,7 @@ fn split_family_style(name: &str) -> (&str, &str) {
 }
 
 /// Lowercase alphanumerics only: "Times New Roman PS-MT" → "timesnewromanpsmt".
-fn normalize(s: &str) -> String {
+pub(crate) fn normalize(s: &str) -> String {
     s.chars()
         .filter(char::is_ascii_alphanumeric)
         .map(|c| c.to_ascii_lowercase())
@@ -174,7 +195,7 @@ fn strip_ps_suffixes(norm: &str) -> String {
     }
 }
 
-fn style_suffix(bold: bool, italic: bool) -> &'static str {
+pub(crate) fn style_suffix(bold: bool, italic: bool) -> &'static str {
     match (bold, italic) {
         (true, true) => "#bi",
         (true, false) => "#b",

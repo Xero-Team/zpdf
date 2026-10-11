@@ -96,6 +96,16 @@ jobs:
             exit 1
           fi
 
+  tools:
+    name: fixture generators and host helpers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # Standard-library Python and Node only: checked-in generated fixtures
+      # must match their generators, and host-side helpers keep their tests.
+      - name: Coverage font fixtures are reproducible
+        run: python3 crates/zpdf-font/tests/fixtures/generate_coverage_fonts.py --check
+
   gpu-build:
     name: build (gpu-render feature)
     runs-on: ubuntu-latest

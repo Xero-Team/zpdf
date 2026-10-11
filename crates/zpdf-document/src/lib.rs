@@ -69,6 +69,7 @@ pub struct PdfDocument {
     /// unusual number of distinct fonts degrades to today's behaviour rather
     /// than growing without limit.
     shared_fonts: RefCell<SharedFonts>,
+    font_provider: Option<Arc<zpdf_font::FontProvider>>,
 }
 
 /// Fonts parsed so far by one document, with the byte total the budget is
@@ -77,9 +78,25 @@ pub struct PdfDocument {
 pub(crate) struct SharedFonts {
     fonts: HashMap<ObjectId, Arc<LoadedFont>>,
     bytes: u64,
+    generation: Option<u64>,
 }
 
 impl SharedFonts {
+    /// Keep embedded programs while allowing newly registered substitutes to
+    /// replace previous matches or placeholders. Existing page caches keep
+    /// their own Arc references and remain valid snapshots.
+    pub(crate) fn refresh_provider(&mut self, generation: Option<u64>) {
+        if self.generation != generation {
+            self.fonts
+                .retain(|_, font| !font.is_substitute && font.has_font_data());
+            self.bytes = self
+                .fonts
+                .values()
+                .map(|font| font.estimated_cache_bytes())
+                .sum();
+            self.generation = generation;
+        }
+    }
     /// The font parsed for `id` by an earlier page of this document, if it was
     /// retained.
     pub(crate) fn get(&self, id: ObjectId) -> Option<Arc<LoadedFont>> {
@@ -134,7 +151,23 @@ impl PdfDocument {
             acro_form: OnceLock::new(),
             named_dests: OnceLock::new(),
             shared_fonts: RefCell::new(SharedFonts::default()),
+            font_provider: None,
         })
+    }
+
+    /// Supply application fonts to page, form and appearance font loading.
+    pub fn with_font_provider(mut self, provider: Arc<zpdf_font::FontProvider>) -> Self {
+        self.set_font_provider(provider);
+        self
+    }
+
+    pub fn set_font_provider(&mut self, provider: Arc<zpdf_font::FontProvider>) {
+        self.font_provider = Some(provider);
+        *self.shared_fonts.get_mut() = SharedFonts::default();
+    }
+
+    pub fn font_provider(&self) -> Option<&Arc<zpdf_font::FontProvider>> {
+        self.font_provider.as_ref()
     }
 
     /// True when the document is encrypted (carries an `/Encrypt` dictionary).
@@ -200,7 +233,12 @@ impl PdfDocument {
     /// corpus document lists 136 font references over as few as 13 distinct
     /// objects), and re-parsing is the dominant part of a page's setup cost.
     pub fn load_page_fonts(&self, page: &PdfPage) -> FontCache {
-        font_loader::load_page_fonts(self.file(), page, &mut self.shared_fonts.borrow_mut())
+        font_loader::load_page_fonts(
+            self.file(),
+            page,
+            &mut self.shared_fonts.borrow_mut(),
+            self.font_provider.as_ref(),
+        )
     }
 
     /// Parse a page's annotations into renderable form (/Rect, /F, the

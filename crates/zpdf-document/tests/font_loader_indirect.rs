@@ -104,6 +104,25 @@ fn type0_pdf(
 }
 
 #[test]
+fn empty_cid_to_gid_map_stream_keeps_identity_but_all_notdef_is_explicit() {
+    for (data, explicit) in [
+        (&[][..], false),
+        (&[0u8][..], false),
+        (&[0u8, 0, 0, 0][..], true),
+    ] {
+        let pdf = type0_pdf("5 0 R", "FontFile2", b"JUNK", stream_obj(data));
+        let file = PdfFile::parse(pdf).expect("parse synthetic pdf");
+        let font = load_single_font(&file, ObjectId(2, 0)).expect("load font");
+        assert_eq!(
+            font.cid_to_gid.is_some_and(|map| map.is_empty()),
+            explicit,
+            "{} map bytes",
+            data.len()
+        );
+    }
+}
+
+#[test]
 fn cid_to_gid_map_stream_applied_for_cid_font_type2() {
     // CID 0 → GID 1, CID 1 → GID 5, CID 2 → GID 0 (omitted), CID 3 → GID 7.
     let map_data = [0u8, 1, 0, 5, 0, 0, 0, 7];
