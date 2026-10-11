@@ -21,6 +21,10 @@ gpui_platform = { workspace = true, features = ["font-kit", "runtime_shaders"] }
 
 [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
 gpui_platform = { workspace = true, features = ["wayland", "x11"] }
+# `gpui` pulls `async-tar` -> `xattr 0.2.3`, which reads `libc::ENOATTR` on
+# Linux. That constant was removed in libc 0.2.190, so pin the last release
+# that still provides it until the `xattr`/`async-tar` chain is updated.
+libc = "=0.2.189"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 gpui_platform.workspace = true
