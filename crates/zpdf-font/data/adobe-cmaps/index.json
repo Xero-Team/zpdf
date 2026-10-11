@@ -1,0 +1,3840 @@
+{
+  "collections": {
+    "CNS1": {
+      "count": 19179,
+      "offset": 1959224
+    },
+    "GB1": {
+      "count": 30284,
+      "offset": 2035940
+    },
+    "Japan1": {
+      "count": 23060,
+      "offset": 2157076
+    },
+    "KR": {
+      "count": 22897,
+      "offset": 2249316
+    },
+    "Korea1": {
+      "count": 18352,
+      "offset": 2340904
+    }
+  },
+  "maps": {
+    "78-RKSJ-H": {
+      "codespaces": [
+        [
+          1,
+          0,
+          128
+        ],
+        [
+          1,
+          160,
+          223
+        ],
+        [
+          2,
+          33088,
+          40956
+        ],
+        [
+          2,
+          57408,
+          64764
+        ]
+      ],
+      "collection": "Japan1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 1,
+          "direct": true,
+          "offset": 1536
+        },
+        {
+          "bucket": 0,
+          "count": 235,
+          "direct": true,
+          "offset": 61444
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 0
+    },
+    "78-RKSJ-V": {
+      "codespaces": [
+        [
+          1,
+          0,
+          128
+        ],
+        [
+          1,
+          160,
+          223
+        ],
+        [
+          2,
+          33088,
+          40956
+        ],
+        [
+          2,
+          57408,
+          64764
+        ]
+      ],
+      "collection": "Japan1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 1,
+          "direct": true,
+          "offset": 1536
+        },
+        {
+          "bucket": 0,
+          "count": 235,
+          "direct": true,
+          "offset": 66992
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 1
+    },
+    "78ms-RKSJ-H": {
+      "codespaces": [
+        [
+          1,
+          0,
+          128
+        ],
+        [
+          1,
+          160,
+          223
+        ],
+        [
+          2,
+          33088,
+          40956
+        ],
+        [
+          2,
+          57408,
+          64764
+        ]
+      ],
+      "collection": "Japan1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 1,
+          "direct": true,
+          "offset": 69468
+        },
+        {
+          "bucket": 0,
+          "count": 253,
+          "direct": true,
+          "offset": 81846
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 0
+    },
+    "78ms-RKSJ-V": {
+      "codespaces": [
+        [
+          1,
+          0,
+          128
+        ],
+        [
+          1,
+          160,
+          223
+        ],
+        [
+          2,
+          33088,
+          40956
+        ],
+        [
+          2,
+          57408,
+          64764
+        ]
+      ],
+      "collection": "Japan1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 1,
+          "direct": true,
+          "offset": 69468
+        },
+        {
+          "bucket": 0,
+          "count": 253,
+          "direct": true,
+          "offset": 87466
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 1
+    },
+    "83pv-RKSJ-H": {
+      "codespaces": [
+        [
+          1,
+          0,
+          128
+        ],
+        [
+          1,
+          160,
+          223
+        ],
+        [
+          1,
+          253,
+          255
+        ],
+        [
+          2,
+          33088,
+          40956
+        ],
+        [
+          2,
+          57408,
+          64764
+        ]
+      ],
+      "collection": "Japan1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 1,
+          "direct": true,
+          "offset": 90014
+        },
+        {
+          "bucket": 0,
+          "count": 239,
+          "direct": true,
+          "offset": 151458
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 0
+    },
+    "90ms-RKSJ-H": {
+      "codespaces": [
+        [
+          1,
+          0,
+          128
+        ],
+        [
+          1,
+          160,
+          223
+        ],
+        [
+          2,
+          33088,
+          40956
+        ],
+        [
+          2,
+          57408,
+          64764
+        ]
+      ],
+      "collection": "Japan1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 1,
+          "direct": true,
+          "offset": 69468
+        },
+        {
+          "bucket": 0,
+          "count": 253,
+          "direct": true,
+          "offset": 152414
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 0
+    },
+    "90ms-RKSJ-V": {
+      "codespaces": [
+        [
+          1,
+          0,
+          128
+        ],
+        [
+          1,
+          160,
+          223
+        ],
+        [
+          2,
+          33088,
+          40956
+        ],
+        [
+          2,
+          57408,
+          64764
+        ]
+      ],
+      "collection": "Japan1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 1,
+          "direct": true,
+          "offset": 69468
+        },
+        {
+          "bucket": 0,
+          "count": 253,
+          "direct": true,
+          "offset": 153426
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 1
+    },
+    "90msp-RKSJ-H": {
+      "codespaces": [
+        [
+          1,
+          0,
+          128
+        ],
+        [
+          1,
+          160,
+          223
+        ],
+        [
+          2,
+          33088,
+          40956
+        ],
+        [
+          2,
+          57408,
+          64764
+        ]
+      ],
+      "collection": "Japan1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 1,
+          "direct": true,
+          "offset": 155974
+        },
+        {
+          "bucket": 0,
+          "count": 253,
+          "direct": true,
+          "offset": 152414
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 0
+    },
+    "90msp-RKSJ-V": {
+      "codespaces": [
+        [
+          1,
+          0,
+          128
+        ],
+        [
+          1,
+          160,
+          223
+        ],
+        [
+          2,
+          33088,
+          40956
+        ],
+        [
+          2,
+          57408,
+          64764
+        ]
+      ],
+      "collection": "Japan1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 1,
+          "direct": true,
+          "offset": 155974
+        },
+        {
+          "bucket": 0,
+          "count": 253,
+          "direct": true,
+          "offset": 153426
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 1
+    },
+    "90pv-RKSJ-H": {
+      "codespaces": [
+        [
+          1,
+          0,
+          128
+        ],
+        [
+          1,
+          160,
+          223
+        ],
+        [
+          1,
+          253,
+          255
+        ],
+        [
+          2,
+          33088,
+          40956
+        ],
+        [
+          2,
+          57408,
+          64764
+        ]
+      ],
+      "collection": "Japan1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 1,
+          "direct": true,
+          "offset": 90014
+        },
+        {
+          "bucket": 0,
+          "count": 238,
+          "direct": true,
+          "offset": 161392
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 0
+    },
+    "90pv-RKSJ-V": {
+      "codespaces": [
+        [
+          1,
+          0,
+          128
+        ],
+        [
+          1,
+          160,
+          223
+        ],
+        [
+          1,
+          253,
+          255
+        ],
+        [
+          2,
+          33088,
+          40956
+        ],
+        [
+          2,
+          57408,
+          64764
+        ]
+      ],
+      "collection": "Japan1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 1,
+          "direct": true,
+          "offset": 90014
+        },
+        {
+          "bucket": 0,
+          "count": 238,
+          "direct": true,
+          "offset": 163880
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 1
+    },
+    "Add-RKSJ-H": {
+      "codespaces": [
+        [
+          1,
+          0,
+          128
+        ],
+        [
+          1,
+          160,
+          223
+        ],
+        [
+          2,
+          33088,
+          40956
+        ],
+        [
+          2,
+          57408,
+          64764
+        ]
+      ],
+      "collection": "Japan1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 1,
+          "direct": true,
+          "offset": 1536
+        },
+        {
+          "bucket": 0,
+          "count": 240,
+          "direct": true,
+          "offset": 223200
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 0
+    },
+    "Add-RKSJ-V": {
+      "codespaces": [
+        [
+          1,
+          0,
+          128
+        ],
+        [
+          1,
+          160,
+          223
+        ],
+        [
+          2,
+          33088,
+          40956
+        ],
+        [
+          2,
+          57408,
+          64764
+        ]
+      ],
+      "collection": "Japan1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 1,
+          "direct": true,
+          "offset": 1536
+        },
+        {
+          "bucket": 0,
+          "count": 240,
+          "direct": true,
+          "offset": 230304
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 1
+    },
+    "B5-H": {
+      "codespaces": [
+        [
+          1,
+          0,
+          128
+        ],
+        [
+          2,
+          41280,
+          65278
+        ]
+      ],
+      "collection": "CNS1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 1,
+          "direct": true,
+          "offset": 232800
+        },
+        {
+          "bucket": 0,
+          "count": 250,
+          "direct": true,
+          "offset": 365343
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 0
+    },
+    "B5-V": {
+      "codespaces": [
+        [
+          1,
+          0,
+          128
+        ],
+        [
+          2,
+          41280,
+          65278
+        ]
+      ],
+      "collection": "CNS1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 1,
+          "direct": true,
+          "offset": 232800
+        },
+        {
+          "bucket": 0,
+          "count": 250,
+          "direct": true,
+          "offset": 367879
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 1
+    },
+    "B5pc-H": {
+      "codespaces": [
+        [
+          1,
+          0,
+          128
+        ],
+        [
+          1,
+          253,
+          255
+        ],
+        [
+          2,
+          41280,
+          64766
+        ]
+      ],
+      "collection": "CNS1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 1,
+          "direct": true,
+          "offset": 370415
+        },
+        {
+          "bucket": 0,
+          "count": 250,
+          "direct": true,
+          "offset": 371955
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 0
+    },
+    "B5pc-V": {
+      "codespaces": [
+        [
+          1,
+          0,
+          128
+        ],
+        [
+          1,
+          253,
+          255
+        ],
+        [
+          2,
+          41280,
+          64766
+        ]
+      ],
+      "collection": "CNS1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 1,
+          "direct": true,
+          "offset": 370415
+        },
+        {
+          "bucket": 0,
+          "count": 250,
+          "direct": true,
+          "offset": 372955
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 1
+    },
+    "ETHK-B5-H": {
+      "codespaces": [
+        [
+          1,
+          0,
+          128
+        ],
+        [
+          2,
+          34624,
+          65278
+        ]
+      ],
+      "collection": "CNS1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 1,
+          "direct": true,
+          "offset": 375491
+        },
+        {
+          "bucket": 0,
+          "count": 255,
+          "direct": true,
+          "offset": 429255
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 0
+    },
+    "ETHK-B5-V": {
+      "codespaces": [
+        [
+          1,
+          0,
+          128
+        ],
+        [
+          2,
+          34624,
+          65278
+        ]
+      ],
+      "collection": "CNS1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 1,
+          "direct": true,
+          "offset": 375491
+        },
+        {
+          "bucket": 0,
+          "count": 255,
+          "direct": true,
+          "offset": 431811
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 1
+    },
+    "ETen-B5-H": {
+      "codespaces": [
+        [
+          1,
+          0,
+          128
+        ],
+        [
+          2,
+          41280,
+          65278
+        ]
+      ],
+      "collection": "CNS1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 1,
+          "direct": true,
+          "offset": 232800
+        },
+        {
+          "bucket": 0,
+          "count": 250,
+          "direct": true,
+          "offset": 434367
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 0
+    },
+    "ETen-B5-V": {
+      "codespaces": [
+        [
+          1,
+          0,
+          128
+        ],
+        [
+          2,
+          41280,
+          65278
+        ]
+      ],
+      "collection": "CNS1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 1,
+          "direct": true,
+          "offset": 232800
+        },
+        {
+          "bucket": 0,
+          "count": 250,
+          "direct": true,
+          "offset": 435367
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 1
+    },
+    "ETenms-B5-H": {
+      "codespaces": [
+        [
+          1,
+          0,
+          128
+        ],
+        [
+          2,
+          41280,
+          65278
+        ]
+      ],
+      "collection": "CNS1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 1,
+          "direct": true,
+          "offset": 375491
+        },
+        {
+          "bucket": 0,
+          "count": 250,
+          "direct": true,
+          "offset": 434367
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 0
+    },
+    "ETenms-B5-V": {
+      "codespaces": [
+        [
+          1,
+          0,
+          128
+        ],
+        [
+          2,
+          41280,
+          65278
+        ]
+      ],
+      "collection": "CNS1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 1,
+          "direct": true,
+          "offset": 375491
+        },
+        {
+          "bucket": 0,
+          "count": 250,
+          "direct": true,
+          "offset": 437903
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 1
+    },
+    "EUC-H": {
+      "codespaces": [
+        [
+          1,
+          0,
+          128
+        ],
+        [
+          2,
+          36512,
+          36575
+        ],
+        [
+          2,
+          41377,
+          65278
+        ]
+      ],
+      "collection": "Japan1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 1,
+          "direct": true,
+          "offset": 440439
+        },
+        {
+          "bucket": 0,
+          "count": 245,
+          "direct": true,
+          "offset": 552811
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 0
+    },
+    "EUC-V": {
+      "codespaces": [
+        [
+          1,
+          0,
+          128
+        ],
+        [
+          2,
+          36512,
+          36575
+        ],
+        [
+          2,
+          41377,
+          65278
+        ]
+      ],
+      "collection": "Japan1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 1,
+          "direct": true,
+          "offset": 440439
+        },
+        {
+          "bucket": 0,
+          "count": 245,
+          "direct": true,
+          "offset": 558399
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 1
+    },
+    "Ext-RKSJ-H": {
+      "codespaces": [
+        [
+          1,
+          0,
+          128
+        ],
+        [
+          1,
+          160,
+          223
+        ],
+        [
+          2,
+          33088,
+          40956
+        ],
+        [
+          2,
+          57408,
+          64764
+        ]
+      ],
+      "collection": "Japan1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 1,
+          "direct": true,
+          "offset": 1536
+        },
+        {
+          "bucket": 0,
+          "count": 239,
+          "direct": true,
+          "offset": 577811
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 0
+    },
+    "Ext-RKSJ-V": {
+      "codespaces": [
+        [
+          1,
+          0,
+          128
+        ],
+        [
+          1,
+          160,
+          223
+        ],
+        [
+          2,
+          33088,
+          40956
+        ],
+        [
+          2,
+          57408,
+          64764
+        ]
+      ],
+      "collection": "Japan1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 1,
+          "direct": true,
+          "offset": 1536
+        },
+        {
+          "bucket": 0,
+          "count": 239,
+          "direct": true,
+          "offset": 581839
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 1
+    },
+    "GB-EUC-H": {
+      "codespaces": [
+        [
+          1,
+          0,
+          128
+        ],
+        [
+          2,
+          41377,
+          65278
+        ]
+      ],
+      "collection": "GB1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 1,
+          "direct": true,
+          "offset": 584331
+        },
+        {
+          "bucket": 0,
+          "count": 248,
+          "direct": true,
+          "offset": 710513
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 0
+    },
+    "GB-EUC-V": {
+      "codespaces": [
+        [
+          1,
+          0,
+          128
+        ],
+        [
+          2,
+          41377,
+          65278
+        ]
+      ],
+      "collection": "GB1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 1,
+          "direct": true,
+          "offset": 584331
+        },
+        {
+          "bucket": 0,
+          "count": 248,
+          "direct": true,
+          "offset": 714577
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 1
+    },
+    "GBK-EUC-H": {
+      "codespaces": [
+        [
+          1,
+          0,
+          128
+        ],
+        [
+          2,
+          33088,
+          65278
+        ]
+      ],
+      "collection": "GB1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 1,
+          "direct": true,
+          "offset": 584331
+        },
+        {
+          "bucket": 0,
+          "count": 255,
+          "direct": true,
+          "offset": 899889
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 0
+    },
+    "GBK-EUC-V": {
+      "codespaces": [
+        [
+          1,
+          0,
+          128
+        ],
+        [
+          2,
+          33088,
+          65278
+        ]
+      ],
+      "collection": "GB1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 1,
+          "direct": true,
+          "offset": 584331
+        },
+        {
+          "bucket": 0,
+          "count": 255,
+          "direct": true,
+          "offset": 900909
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 1
+    },
+    "GBK2K-H": {
+      "codespaces": [
+        [
+          1,
+          0,
+          127
+        ],
+        [
+          2,
+          33088,
+          65278
+        ],
+        [
+          4,
+          2167439664,
+          4265213497
+        ]
+      ],
+      "collection": "GB1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 1,
+          "direct": true,
+          "offset": 375491
+        },
+        {
+          "bucket": 0,
+          "count": 255,
+          "direct": true,
+          "offset": 903465
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 965185,
+          "count": 974,
+          "direct": false,
+          "offset": 966212
+        }
+      ],
+      "wmode": 0
+    },
+    "GBK2K-V": {
+      "codespaces": [
+        [
+          1,
+          0,
+          127
+        ],
+        [
+          2,
+          33088,
+          65278
+        ],
+        [
+          4,
+          2167439664,
+          4265213497
+        ]
+      ],
+      "collection": "GB1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 1,
+          "direct": true,
+          "offset": 375491
+        },
+        {
+          "bucket": 0,
+          "count": 255,
+          "direct": true,
+          "offset": 978612
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 965185,
+          "count": 974,
+          "direct": false,
+          "offset": 966212
+        }
+      ],
+      "wmode": 1
+    },
+    "GBKp-EUC-H": {
+      "codespaces": [
+        [
+          1,
+          0,
+          128
+        ],
+        [
+          2,
+          33088,
+          65278
+        ]
+      ],
+      "collection": "GB1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 1,
+          "direct": true,
+          "offset": 375491
+        },
+        {
+          "bucket": 0,
+          "count": 255,
+          "direct": true,
+          "offset": 899889
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 0
+    },
+    "GBKp-EUC-V": {
+      "codespaces": [
+        [
+          1,
+          0,
+          128
+        ],
+        [
+          2,
+          33088,
+          65278
+        ]
+      ],
+      "collection": "GB1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 1,
+          "direct": true,
+          "offset": 375491
+        },
+        {
+          "bucket": 0,
+          "count": 255,
+          "direct": true,
+          "offset": 900909
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 1
+    },
+    "GBpc-EUC-H": {
+      "codespaces": [
+        [
+          1,
+          0,
+          128
+        ],
+        [
+          1,
+          253,
+          255
+        ],
+        [
+          2,
+          41377,
+          64766
+        ]
+      ],
+      "collection": "GB1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 1,
+          "direct": true,
+          "offset": 981168
+        },
+        {
+          "bucket": 0,
+          "count": 248,
+          "direct": true,
+          "offset": 710513
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 0
+    },
+    "GBpc-EUC-V": {
+      "codespaces": [
+        [
+          1,
+          0,
+          128
+        ],
+        [
+          1,
+          253,
+          255
+        ],
+        [
+          2,
+          41377,
+          64766
+        ]
+      ],
+      "collection": "GB1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 1,
+          "direct": true,
+          "offset": 981168
+        },
+        {
+          "bucket": 0,
+          "count": 248,
+          "direct": true,
+          "offset": 714577
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 1
+    },
+    "HKdla-B5-H": {
+      "codespaces": [
+        [
+          1,
+          0,
+          128
+        ],
+        [
+          2,
+          41280,
+          65278
+        ]
+      ],
+      "collection": "CNS1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 1,
+          "direct": true,
+          "offset": 375491
+        },
+        {
+          "bucket": 0,
+          "count": 255,
+          "direct": true,
+          "offset": 988852
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 0
+    },
+    "HKdla-B5-V": {
+      "codespaces": [
+        [
+          1,
+          0,
+          128
+        ],
+        [
+          2,
+          41280,
+          65278
+        ]
+      ],
+      "collection": "CNS1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 1,
+          "direct": true,
+          "offset": 375491
+        },
+        {
+          "bucket": 0,
+          "count": 255,
+          "direct": true,
+          "offset": 989872
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 1
+    },
+    "HKdlb-B5-H": {
+      "codespaces": [
+        [
+          1,
+          0,
+          128
+        ],
+        [
+          2,
+          36416,
+          65278
+        ]
+      ],
+      "collection": "CNS1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 1,
+          "direct": true,
+          "offset": 375491
+        },
+        {
+          "bucket": 0,
+          "count": 250,
+          "direct": true,
+          "offset": 997304
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 0
+    },
+    "HKdlb-B5-V": {
+      "codespaces": [
+        [
+          1,
+          0,
+          128
+        ],
+        [
+          2,
+          36416,
+          65278
+        ]
+      ],
+      "collection": "CNS1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 1,
+          "direct": true,
+          "offset": 375491
+        },
+        {
+          "bucket": 0,
+          "count": 250,
+          "direct": true,
+          "offset": 998304
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 1
+    },
+    "HKgccs-B5-H": {
+      "codespaces": [
+        [
+          1,
+          0,
+          128
+        ],
+        [
+          2,
+          35392,
+          65278
+        ]
+      ],
+      "collection": "CNS1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 1,
+          "direct": true,
+          "offset": 375491
+        },
+        {
+          "bucket": 0,
+          "count": 255,
+          "direct": true,
+          "offset": 1033445
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 0
+    },
+    "HKgccs-B5-V": {
+      "codespaces": [
+        [
+          1,
+          0,
+          128
+        ],
+        [
+          2,
+          35392,
+          65278
+        ]
+      ],
+      "collection": "CNS1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 1,
+          "direct": true,
+          "offset": 375491
+        },
+        {
+          "bucket": 0,
+          "count": 255,
+          "direct": true,
+          "offset": 1034465
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 1
+    },
+    "HKm314-B5-H": {
+      "codespaces": [
+        [
+          1,
+          0,
+          128
+        ],
+        [
+          2,
+          41280,
+          65278
+        ]
+      ],
+      "collection": "CNS1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 1,
+          "direct": true,
+          "offset": 375491
+        },
+        {
+          "bucket": 0,
+          "count": 250,
+          "direct": true,
+          "offset": 1038557
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 0
+    },
+    "HKm314-B5-V": {
+      "codespaces": [
+        [
+          1,
+          0,
+          128
+        ],
+        [
+          2,
+          41280,
+          65278
+        ]
+      ],
+      "collection": "CNS1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 1,
+          "direct": true,
+          "offset": 375491
+        },
+        {
+          "bucket": 0,
+          "count": 250,
+          "direct": true,
+          "offset": 1039557
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 1
+    },
+    "HKm471-B5-H": {
+      "codespaces": [
+        [
+          1,
+          0,
+          128
+        ],
+        [
+          2,
+          41280,
+          65278
+        ]
+      ],
+      "collection": "CNS1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 1,
+          "direct": true,
+          "offset": 375491
+        },
+        {
+          "bucket": 0,
+          "count": 253,
+          "direct": true,
+          "offset": 1045165
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 0
+    },
+    "HKm471-B5-V": {
+      "codespaces": [
+        [
+          1,
+          0,
+          128
+        ],
+        [
+          2,
+          41280,
+          65278
+        ]
+      ],
+      "collection": "CNS1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 1,
+          "direct": true,
+          "offset": 375491
+        },
+        {
+          "bucket": 0,
+          "count": 253,
+          "direct": true,
+          "offset": 1046177
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 1
+    },
+    "HKscs-B5-H": {
+      "codespaces": [
+        [
+          1,
+          0,
+          128
+        ],
+        [
+          2,
+          34624,
+          65278
+        ]
+      ],
+      "collection": "CNS1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 1,
+          "direct": true,
+          "offset": 375491
+        },
+        {
+          "bucket": 0,
+          "count": 255,
+          "direct": true,
+          "offset": 1050261
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 0
+    },
+    "HKscs-B5-V": {
+      "codespaces": [
+        [
+          1,
+          0,
+          128
+        ],
+        [
+          2,
+          34624,
+          65278
+        ]
+      ],
+      "collection": "CNS1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 1,
+          "direct": true,
+          "offset": 375491
+        },
+        {
+          "bucket": 0,
+          "count": 255,
+          "direct": true,
+          "offset": 1052817
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 1
+    },
+    "KSC-EUC-H": {
+      "codespaces": [
+        [
+          1,
+          0,
+          128
+        ],
+        [
+          2,
+          41377,
+          65278
+        ]
+      ],
+      "collection": "Korea1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 1,
+          "direct": true,
+          "offset": 1055373
+        },
+        {
+          "bucket": 0,
+          "count": 254,
+          "direct": true,
+          "offset": 1192081
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 0
+    },
+    "KSC-EUC-V": {
+      "codespaces": [
+        [
+          1,
+          0,
+          128
+        ],
+        [
+          2,
+          41377,
+          65278
+        ]
+      ],
+      "collection": "Korea1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 1,
+          "direct": true,
+          "offset": 1055373
+        },
+        {
+          "bucket": 0,
+          "count": 254,
+          "direct": true,
+          "offset": 1196169
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 1
+    },
+    "KSC-H": {
+      "codespaces": [
+        [
+          2,
+          8481,
+          32382
+        ]
+      ],
+      "collection": "Korea1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": true,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 126,
+          "direct": true,
+          "offset": 1333889
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 0
+    },
+    "KSC-V": {
+      "codespaces": [
+        [
+          2,
+          8481,
+          32382
+        ]
+      ],
+      "collection": "Korea1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": true,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 126,
+          "direct": true,
+          "offset": 1337465
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 1
+    },
+    "KSCms-UHC-H": {
+      "codespaces": [
+        [
+          1,
+          0,
+          128
+        ],
+        [
+          2,
+          33089,
+          65278
+        ]
+      ],
+      "collection": "Korea1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 1,
+          "direct": true,
+          "offset": 375491
+        },
+        {
+          "bucket": 0,
+          "count": 254,
+          "direct": true,
+          "offset": 1445489
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 0
+    },
+    "KSCms-UHC-HW-H": {
+      "codespaces": [
+        [
+          1,
+          0,
+          128
+        ],
+        [
+          2,
+          33089,
+          65278
+        ]
+      ],
+      "collection": "Korea1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 1,
+          "direct": true,
+          "offset": 1055373
+        },
+        {
+          "bucket": 0,
+          "count": 254,
+          "direct": true,
+          "offset": 1445489
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 0
+    },
+    "KSCms-UHC-HW-V": {
+      "codespaces": [
+        [
+          1,
+          0,
+          128
+        ],
+        [
+          2,
+          33089,
+          65278
+        ]
+      ],
+      "collection": "Korea1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 1,
+          "direct": true,
+          "offset": 1055373
+        },
+        {
+          "bucket": 0,
+          "count": 254,
+          "direct": true,
+          "offset": 1449577
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 1
+    },
+    "KSCms-UHC-V": {
+      "codespaces": [
+        [
+          1,
+          0,
+          128
+        ],
+        [
+          2,
+          33089,
+          65278
+        ]
+      ],
+      "collection": "Korea1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 1,
+          "direct": true,
+          "offset": 375491
+        },
+        {
+          "bucket": 0,
+          "count": 254,
+          "direct": true,
+          "offset": 1449577
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 1
+    },
+    "KSCpc-EUC-H": {
+      "codespaces": [
+        [
+          1,
+          0,
+          132
+        ],
+        [
+          1,
+          254,
+          255
+        ],
+        [
+          2,
+          41281,
+          65022
+        ]
+      ],
+      "collection": "Korea1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 1,
+          "direct": true,
+          "offset": 1452129
+        },
+        {
+          "bucket": 0,
+          "count": 254,
+          "direct": true,
+          "offset": 1472101
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 0
+    },
+    "KSCpc-EUC-V": {
+      "codespaces": [
+        [
+          1,
+          0,
+          132
+        ],
+        [
+          1,
+          254,
+          255
+        ],
+        [
+          2,
+          41281,
+          65022
+        ]
+      ],
+      "collection": "Korea1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 1,
+          "direct": true,
+          "offset": 1452129
+        },
+        {
+          "bucket": 0,
+          "count": 254,
+          "direct": true,
+          "offset": 1476189
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 1
+    },
+    "RKSJ-H": {
+      "codespaces": [
+        [
+          1,
+          0,
+          128
+        ],
+        [
+          1,
+          160,
+          223
+        ],
+        [
+          2,
+          33088,
+          40956
+        ],
+        [
+          2,
+          57408,
+          64764
+        ]
+      ],
+      "collection": "Japan1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 1,
+          "direct": true,
+          "offset": 1536
+        },
+        {
+          "bucket": 0,
+          "count": 235,
+          "direct": true,
+          "offset": 1477205
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 0
+    },
+    "RKSJ-V": {
+      "codespaces": [
+        [
+          1,
+          0,
+          128
+        ],
+        [
+          1,
+          160,
+          223
+        ],
+        [
+          2,
+          33088,
+          40956
+        ],
+        [
+          2,
+          57408,
+          64764
+        ]
+      ],
+      "collection": "Japan1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 1,
+          "direct": true,
+          "offset": 1536
+        },
+        {
+          "bucket": 0,
+          "count": 235,
+          "direct": true,
+          "offset": 1478145
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 1
+    },
+    "UniAKR-UTF16-H": {
+      "codespaces": [
+        [
+          2,
+          0,
+          55295
+        ],
+        [
+          2,
+          57344,
+          65535
+        ],
+        [
+          4,
+          3623934976,
+          3690979327
+        ]
+      ],
+      "collection": "KR",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": true,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 256,
+          "direct": true,
+          "offset": 1549290
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 53,
+          "direct": false,
+          "offset": 1550681
+        }
+      ],
+      "wmode": 0
+    },
+    "UniCNS-UCS2-H": {
+      "codespaces": [
+        [
+          2,
+          0,
+          55295
+        ],
+        [
+          2,
+          57344,
+          65535
+        ]
+      ],
+      "collection": "CNS1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": true,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 256,
+          "direct": true,
+          "offset": 1605999
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 0
+    },
+    "UniCNS-UCS2-V": {
+      "codespaces": [
+        [
+          2,
+          0,
+          55295
+        ],
+        [
+          2,
+          57344,
+          65535
+        ]
+      ],
+      "collection": "CNS1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": true,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 256,
+          "direct": true,
+          "offset": 1608243
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 1
+    },
+    "UniCNS-UTF16-H": {
+      "codespaces": [
+        [
+          2,
+          0,
+          55295
+        ],
+        [
+          2,
+          57344,
+          65535
+        ],
+        [
+          4,
+          3623934976,
+          3690979327
+        ]
+      ],
+      "collection": "CNS1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": true,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 256,
+          "direct": true,
+          "offset": 1660234
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 176,
+          "direct": false,
+          "offset": 1666818
+        }
+      ],
+      "wmode": 0
+    },
+    "UniCNS-UTF16-V": {
+      "codespaces": [
+        [
+          2,
+          0,
+          55295
+        ],
+        [
+          2,
+          57344,
+          65535
+        ],
+        [
+          4,
+          3623934976,
+          3690979327
+        ]
+      ],
+      "collection": "CNS1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": true,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 256,
+          "direct": true,
+          "offset": 1669482
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 176,
+          "direct": false,
+          "offset": 1666818
+        }
+      ],
+      "wmode": 1
+    },
+    "UniGB-UCS2-H": {
+      "codespaces": [
+        [
+          2,
+          0,
+          55295
+        ],
+        [
+          2,
+          57344,
+          65535
+        ]
+      ],
+      "collection": "GB1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": true,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 256,
+          "direct": true,
+          "offset": 1730833
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 0
+    },
+    "UniGB-UCS2-V": {
+      "codespaces": [
+        [
+          2,
+          0,
+          55295
+        ],
+        [
+          2,
+          57344,
+          65535
+        ]
+      ],
+      "collection": "GB1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": true,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 256,
+          "direct": true,
+          "offset": 1733050
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 1
+    },
+    "UniGB-UTF16-H": {
+      "codespaces": [
+        [
+          2,
+          0,
+          55295
+        ],
+        [
+          2,
+          57344,
+          65535
+        ],
+        [
+          4,
+          3623934976,
+          3690979327
+        ]
+      ],
+      "collection": "GB1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": true,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 256,
+          "direct": true,
+          "offset": 1740300
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 64,
+          "direct": false,
+          "offset": 1742064
+        }
+      ],
+      "wmode": 0
+    },
+    "UniGB-UTF16-V": {
+      "codespaces": [
+        [
+          2,
+          0,
+          55295
+        ],
+        [
+          2,
+          57344,
+          65535
+        ],
+        [
+          4,
+          3623934976,
+          3690979327
+        ]
+      ],
+      "collection": "GB1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": true,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 256,
+          "direct": true,
+          "offset": 1743150
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 64,
+          "direct": false,
+          "offset": 1742064
+        }
+      ],
+      "wmode": 1
+    },
+    "UniJIS-UCS2-H": {
+      "codespaces": [
+        [
+          2,
+          0,
+          55295
+        ],
+        [
+          2,
+          57344,
+          65535
+        ]
+      ],
+      "collection": "Japan1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": true,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 256,
+          "direct": true,
+          "offset": 1791094
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 0
+    },
+    "UniJIS-UCS2-HW-H": {
+      "codespaces": [
+        [
+          2,
+          0,
+          55295
+        ],
+        [
+          2,
+          57344,
+          65535
+        ]
+      ],
+      "collection": "Japan1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": true,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 256,
+          "direct": true,
+          "offset": 1792630
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 0
+    },
+    "UniJIS-UCS2-HW-V": {
+      "codespaces": [
+        [
+          2,
+          0,
+          55295
+        ],
+        [
+          2,
+          57344,
+          65535
+        ]
+      ],
+      "collection": "Japan1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": true,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 256,
+          "direct": true,
+          "offset": 1797166
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 1
+    },
+    "UniJIS-UCS2-V": {
+      "codespaces": [
+        [
+          2,
+          0,
+          55295
+        ],
+        [
+          2,
+          57344,
+          65535
+        ]
+      ],
+      "collection": "Japan1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": true,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 256,
+          "direct": true,
+          "offset": 1798702
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 1
+    },
+    "UniJIS-UTF16-H": {
+      "codespaces": [
+        [
+          2,
+          0,
+          55295
+        ],
+        [
+          2,
+          57344,
+          65535
+        ],
+        [
+          4,
+          3623934976,
+          3690979327
+        ]
+      ],
+      "collection": "Japan1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": true,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 256,
+          "direct": true,
+          "offset": 1850430
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 148,
+          "direct": false,
+          "offset": 1853544
+        }
+      ],
+      "wmode": 0
+    },
+    "UniJIS-UTF16-V": {
+      "codespaces": [
+        [
+          2,
+          0,
+          55295
+        ],
+        [
+          2,
+          57344,
+          65535
+        ],
+        [
+          4,
+          3623934976,
+          3690979327
+        ]
+      ],
+      "collection": "Japan1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": true,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 256,
+          "direct": true,
+          "offset": 1858925
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 148,
+          "direct": false,
+          "offset": 1859957
+        }
+      ],
+      "wmode": 1
+    },
+    "UniJIS2004-UTF16-H": {
+      "codespaces": [
+        [
+          2,
+          0,
+          55295
+        ],
+        [
+          2,
+          57344,
+          65535
+        ],
+        [
+          4,
+          3623934976,
+          3690979327
+        ]
+      ],
+      "collection": "Japan1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": true,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 256,
+          "direct": true,
+          "offset": 1895445
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 148,
+          "direct": false,
+          "offset": 1853544
+        }
+      ],
+      "wmode": 0
+    },
+    "UniJIS2004-UTF16-V": {
+      "codespaces": [
+        [
+          2,
+          0,
+          55295
+        ],
+        [
+          2,
+          57344,
+          65535
+        ],
+        [
+          4,
+          3623934976,
+          3690979327
+        ]
+      ],
+      "collection": "Japan1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": true,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 256,
+          "direct": true,
+          "offset": 1896469
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 148,
+          "direct": false,
+          "offset": 1859957
+        }
+      ],
+      "wmode": 1
+    },
+    "UniJISPro-UCS2-HW-V": {
+      "codespaces": [
+        [
+          2,
+          0,
+          55295
+        ],
+        [
+          2,
+          57344,
+          65535
+        ]
+      ],
+      "collection": "Japan1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": true,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 256,
+          "direct": true,
+          "offset": 1898154
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 1
+    },
+    "UniJISPro-UCS2-V": {
+      "codespaces": [
+        [
+          2,
+          0,
+          55295
+        ],
+        [
+          2,
+          57344,
+          65535
+        ]
+      ],
+      "collection": "Japan1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": true,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 256,
+          "direct": true,
+          "offset": 1899178
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 1
+    },
+    "UniKS-UCS2-H": {
+      "codespaces": [
+        [
+          2,
+          0,
+          55295
+        ],
+        [
+          2,
+          57344,
+          65535
+        ]
+      ],
+      "collection": "Korea1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": true,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 256,
+          "direct": true,
+          "offset": 1952694
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 0
+    },
+    "UniKS-UCS2-V": {
+      "codespaces": [
+        [
+          2,
+          0,
+          55295
+        ],
+        [
+          2,
+          57344,
+          65535
+        ]
+      ],
+      "collection": "Korea1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": true,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 256,
+          "direct": true,
+          "offset": 1954852
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 1
+    },
+    "UniKS-UTF16-H": {
+      "codespaces": [
+        [
+          2,
+          0,
+          55295
+        ],
+        [
+          2,
+          57344,
+          65535
+        ],
+        [
+          4,
+          3623934976,
+          3690979327
+        ]
+      ],
+      "collection": "Korea1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": true,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 256,
+          "direct": true,
+          "offset": 1957060
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 0
+    },
+    "UniKS-UTF16-V": {
+      "codespaces": [
+        [
+          2,
+          0,
+          55295
+        ],
+        [
+          2,
+          57344,
+          65535
+        ],
+        [
+          4,
+          3623934976,
+          3690979327
+        ]
+      ],
+      "collection": "Korea1",
+      "groups": [
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": true,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 256,
+          "direct": true,
+          "offset": 1958200
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        },
+        {
+          "bucket": 0,
+          "count": 0,
+          "direct": false,
+          "offset": 62384
+        }
+      ],
+      "wmode": 1
+    }
+  },
+  "page_flags": {
+    "sparse": 2147483648,
+    "unicode_source": 1073741824
+  },
+  "schema": 5,
+  "sparse_directory_record_bytes": 8
+}

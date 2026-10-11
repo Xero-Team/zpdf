@@ -1,3 +1,4 @@
+mod adobe_cmaps;
 pub mod big5;
 pub mod cmap;
 pub mod encoding;
@@ -362,38 +363,52 @@ impl LoadedFont {
             return;
         }
         // Unicode-coded CMaps resolve straight to GIDs — no CID table needed.
-        if self.unicode_coded() {
+        if self.unicode_coded() || self.legacy_substitute() {
             return;
         }
-        let Some(tu) = &self.to_unicode else { return };
+        // An absent or empty mapping must not mean CID == substitute GID.
+        // Legacy byte-encoded substitutes bypass this table explicitly.
+        self.cid_to_gid = Some(HashMap::new());
         let Some(data) = &self.font_data else { return };
         let Ok(face) = ttf_parser::Face::parse(data, self.face_index) else {
             return;
         };
-        let mut map = HashMap::new();
-        for (code, s) in tu.iter() {
-            let Some(ch) = s.chars().next() else { continue };
+        let mut map = HashMap::with_capacity(
+            self.to_unicode
+                .as_ref()
+                .map_or(0, |mapping| mapping.iter().len()),
+        );
+        let has_collection = self
+            .cid_cmap
+            .as_ref()
+            .and_then(|cm| cm.collection())
+            .is_some();
+        let to_unicode = self.to_unicode.as_ref();
+        for (code, s) in to_unicode.iter().flat_map(|tu| tu.iter()) {
             // glyph_outline receives CIDs, so key the map by CID — under a
-            // non-Identity encoding CMap the code is not the CID.
+            // non-Identity encoding CMap, or an Identity base with explicit
+            // overrides, the code is not the CID.
             let cid = match &self.cid_cmap {
-                Some(cm) if !cm.identity => {
-                    let len = if code > 0xFF { 2 } else { 1 };
-                    let cid = cm.code_to_cid(code, len);
-                    if cid == 0 && len == 1 {
-                        cm.code_to_cid(code, 2)
-                    } else {
-                        cid
-                    }
+                Some(cm) if !cm.identity || cm.has_explicit_cids() => {
+                    cm.source_key_to_cid(code, to_unicode.and_then(|tu| tu.padded_length(code)))
                 }
                 _ => code,
             };
             if cid == 0 || cid > u16::MAX as u32 {
                 continue;
             }
-            if let Some(g) = face.glyph_index(ch) {
-                if g.0 != 0 {
-                    map.insert(cid as u16, g.0);
-                }
+            // Explicit extraction overrides the canonical collection, even
+            // when it cannot be represented by one scalar or variation glyph.
+            if let Some(gid) =
+                FontCharacter::from_text(s).and_then(|ch| ch.mapped_glyph_index(&face))
+            {
+                map.insert(cid as u16, gid);
+            } else if has_collection {
+                // Prevent lazy canonical recovery from overriding an explicit
+                // ToUnicode miss or a multi-glyph extraction string.
+                map.insert(cid as u16, 0);
+            } else {
+                map.remove(&(cid as u16));
             }
         }
         if map.is_empty() {
@@ -401,9 +416,8 @@ impl LoadedFont {
                 "substitute {}: no ToUnicode-derived CID mapping; composite glyphs will drop",
                 self.base_font
             );
-        } else {
-            self.cid_to_gid = Some(map);
         }
+        self.cid_to_gid = Some(map);
     }
 
     pub fn new_standard(base_font: String) -> Option<Self> {
@@ -466,7 +480,7 @@ impl LoadedFont {
     fn unicode_coded(&self) -> bool {
         self.cid_cmap
             .as_ref()
-            .map(|c| c.codes_are_unicode)
+            .map(|c| c.codes_are_unicode && (!c.is_authoritative() || self.is_substitute))
             .unwrap_or(false)
     }
 
@@ -491,7 +505,7 @@ impl LoadedFont {
     /// .notdef. Call after `cid_cmap` is attached.
     pub fn validate_cid_cmap(&mut self) {
         let Some(cm) = &self.cid_cmap else { return };
-        if !cm.codes_are_unicode {
+        if !cm.codes_are_unicode || cm.is_authoritative() || self.font_data.is_none() {
             return;
         }
         let has_unicode_cmap = self
@@ -516,6 +530,38 @@ impl LoadedFont {
     /// (the composite-font convention).
     pub fn unicode_glyph(&self, code: u32) -> Option<(u16, f64)> {
         unicode_lookup::lookup::<true>(self, code)
+    }
+
+    /// Resolve a Unicode/legacy substitute code to a physical GID. ToUnicode
+    /// has priority, including raw UTF-16 source keys and variation sequences.
+    /// When it names no single character (`fi`) or one this face lacks, the
+    /// CMap's own Unicode for the code still selects the glyph. PDF advances
+    /// must be obtained separately from the original CID.
+    pub fn composite_unicode_gid(&self, code: u32, raw_code: u32, length: u8) -> Option<u16> {
+        self.to_unicode
+            .as_ref()
+            .and_then(|map| map.lookup(raw_code).or_else(|| map.lookup(code)))
+            .and_then(FontCharacter::from_text)
+            .and_then(|character| self.character_gid(character))
+            .or_else(|| {
+                let character = self
+                    .cid_cmap
+                    .as_ref()?
+                    .decode_text(code, length)?
+                    .font_character()?;
+                self.character_gid(character)
+            })
+    }
+
+    fn character_gid(&self, character: FontCharacter) -> Option<u16> {
+        if character.variation_selector.is_none() {
+            return unicode_lookup::lookup::<false>(self, character.character as u32)
+                .map(|(gid, _)| gid)
+                .filter(|&gid| gid != 0);
+        }
+        let data = self.font_data.as_ref()?;
+        let face = ttf_parser::Face::parse(data, self.face_index).ok()?;
+        character.mapped_glyph_index(&face)
     }
 
     /// Configure OpenType variation axes from FontDescriptor values, so a
@@ -606,15 +652,33 @@ impl LoadedFont {
     pub(crate) fn drawing_gid_with_face(
         &self,
         glyph_id: u16,
-        _face: &ttf_parser::Face<'_>,
+        face: &ttf_parser::Face<'_>,
     ) -> Option<u16> {
         if self.unicode_coded() || self.legacy_substitute() {
             return Some(glyph_id);
         }
-        match &self.cid_to_gid {
-            Some(map) => map.get(&glyph_id).copied(),
-            None => Some(glyph_id),
+        let Some(map) = &self.cid_to_gid else {
+            return Some(glyph_id);
+        };
+        if let Some(&gid) = map.get(&glyph_id) {
+            return (gid != 0).then_some(gid);
         }
+        self.collection_substitute_gid(glyph_id, face)
+    }
+
+    /// Resolve only CIDs actually drawn. Scanning all 65,536 canonical CIDs
+    /// at every font load disproportionately penalizes small substitute pages.
+    #[inline(never)]
+    fn collection_substitute_gid(&self, cid: u16, face: &ttf_parser::Face<'_>) -> Option<u16> {
+        if !self.is_substitute || cid == 0 {
+            return None;
+        }
+        self.cid_cmap
+            .as_ref()?
+            .collection()?
+            .unicode(cid as u32)?
+            .font_character()?
+            .mapped_glyph_index(face)
     }
 
     /// Fraction of sampled, mapped CIDs whose embedded outline fails to resolve.
@@ -891,17 +955,8 @@ impl LoadedFont {
                         .and_then(|tu| tu.lookup(raw_code).or_else(|| tu.lookup(code)))
                     {
                         out.push_str(s);
-                    } else if cm.codes_are_unicode {
-                        if let Some(c) = char::from_u32(code) {
-                            out.push(c);
-                        }
-                    } else if cm.is_legacy() {
-                        if let Some(c) = cm
-                            .decode_to_unicode(code, len as u8)
-                            .and_then(char::from_u32)
-                        {
-                            out.push(c);
-                        }
+                    } else if let Some(value) = cm.decode_text(code, len as u8) {
+                        value.push_to(&mut out);
                     }
                 }
                 return out;

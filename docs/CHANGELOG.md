@@ -6,6 +6,11 @@
   faces, bounded registration, PDF font aliases and memory-only substitution.
   Page and nested Form font loading share the provider; late registration
   refreshes substituted fonts without invalidating existing page caches.
+- Complete the predefined CJK CMaps from pinned Adobe resources: 84 named
+  CMaps and five canonical collections with GBK2K four-byte codes, HKSCS,
+  supplementary UTF-16 and canonical strings. Character codes, CIDs, Unicode
+  and glyph ids stay distinct namespaces, and known Adobe collections recover
+  text without `/ToUnicode`.
 
 ## 0.14.0 — Type 3 rendering fixes and render-performance tooling
 
