@@ -23,6 +23,14 @@ bench-long = []
 zpdf = { workspace = true, default-features = false }
 zpdf-core.workspace = true
 zpdf-display-list.workspace = true
+# Font workloads (`src/font_*_workloads.rs`) build their PDFs with the writer
+# and check glyph identities against the fixture faces. All workspace crates.
+zpdf-font.workspace = true
+zpdf-document.workspace = true
+zpdf-writer.workspace = true
+ttf-parser.workspace = true
+# Packs the CJK fixture with the same pure-Rust zlib that font packs decode.
+flate2.workspace = true
 # Corpus-manifest integrity (see `src/manifest.rs`). The real-PDF corpus lives
 # under `tests/`, which the root .gitignore excludes, so its identity is
 # recorded as sha256 in a checked-in manifest instead. `sha2` is already a
@@ -45,6 +53,8 @@ criterion = "0.8"
 # CLI, and no library crate should take a threading dependency before that
 # measurement exists.
 rayon = "1"
+# Fallback tests compare the vector SVG export with the CPU raster.
+zpdf-svg-export.workspace = true
 
 # Bench targets. `harness = false` lets criterion own `main()`, and one target
 # per concern means `cargo bench --bench stages` runs just that one.

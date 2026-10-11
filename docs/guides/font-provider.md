@@ -56,7 +56,9 @@ registration, including adding an alias, advances `generation()`. Subsequent
 choices while retaining embedded programs. Existing page caches remain valid
 snapshots; rebuild the page's display list to use a newly available face.
 
-Document loading selects a whole font by name and style.
+Document loading selects a whole font by name and style. During text
+interpretation, missing or damaged glyphs can select another registered face
+using reliable Unicode mappings; see [Automatic page fallback](#automatic-page-fallback).
 Predefined CMap coverage is described under
 [PDF mappings and downloaded fonts](#pdf-mappings-and-downloaded-fonts).
 
@@ -71,7 +73,8 @@ anything from the network. Register the desired fallback faces/packs first.
 
 The returned `RegisteredGlyph` includes the actual GID, shared bytes, face
 index and provider registration ID. A registration ID is not a page
-`FontCache` ID and must not be cast to one.
+`FontCache` ID and must not be cast to one. The interpreter admits drawing
+fonts through the page cache and splits adjacent runs at face changes.
 
 Valid empty spaces are coverage hits. A variation sequence needs explicit
 cmap format-14 support; an unsupported selector never silently falls back to
@@ -83,6 +86,30 @@ Positive and negative coverage decisions share a cache of at most 4,096
 entries. Successful registration clears decisions; a generation check prevents
 a racing lookup from retaining an obsolete miss. Clearing decisions never
 evicts font programs or invalidates an existing returned glyph.
+
+## Automatic page fallback
+
+Attach a provider to the document as above. Existing usable embedded glyphs
+keep priority. The logical PDF font retains its character-code mappings,
+widths, vertical metrics, text extraction and placement. A missing glyph uses
+the actual GID in a selected drawing face. Runs split at face changes; text
+and pattern clips use the combined outlines. Invisible text avoids loading
+drawing faces. Private-use mappings and arbitrary multi-scalar ligatures are
+not guessed from unrelated fonts.
+
+Page-level positive/negative decisions are bounded to 4,096 entries and clear
+on registration changes. Drawing faces respect the page font-cache byte limit
+and retain stable IDs for existing display lists. Font variation settings
+remain scoped to their logical PDF font. This supplies glyph recovery rather
+than global reshaping of already-positioned PDF text.
+
+The writer method `DocumentBuilder::add_text_with_fonts` uses registered coverage
+to write horizontal multilingual scalar text. It embeds each selected face
+and preserves run boundaries using the same rounded advances emitted in `/W`.
+`embed_composite_font_face` extracts a selected TTC face as an independent
+sfnt before embedding/subsetting. These writer paths pass TTF/TTC round-trip
+tests and reject unsupported scalars or variation selectors instead of partially
+adding text. They do not implement shaping or bidi reordering.
 
 ## Lazy font packs
 
@@ -150,3 +177,17 @@ overrides. Identity means code equals CID, not Unicode. Known Adobe
 CIDSystemInfo collections can recover Unicode without ToUnicode; an explicit
 ToUnicode mapping takes precedence. Complete canonical variation sequences
 remain available through `CidCMap::decode_text`.
+
+For missing outlines, the provider resolves a reliable Unicode scalar or
+variation sequence against registered faces and lazily decoded packs. A pack
+is decoded once, with shared backing bytes and bounded storage; it is not
+decompressed for every glyph. Rendering keeps the PDF's advances and vertical
+origins, even when the chosen replacement font has different metrics.
+
+`DocumentBuilder::add_text_with_fonts` provides horizontal scalar multilingual
+authoring with embedded subsets of the selected faces. It does not shape or
+reorder text. Predefined-CMap authoring uses collection CIDs for W/W2 and
+TrueType CIDToGIDMap; CID-keyed CFF retains its charset and must match a requested
+predefined collection. Incompatible mappings fail instead of silently emitting
+incorrect character identities. Identity authoring supports the retained CFF
+CID namespace as well as TrueType GID identity.

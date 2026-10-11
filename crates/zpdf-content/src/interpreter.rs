@@ -31,8 +31,12 @@ pub struct ContentInterpreter<'a> {
     /// intersects the union into the clip stack (see `apply_text_clip`). `None` =
     /// no glyph outlines accumulated yet. `text_clip_requested` records that a
     /// clip render mode was seen at all, even if no drawable glyph produced one.
+    /// `text_clip_unavailable` records that some clipped glyphs had no outline
+    /// source at all (Type3 CharProcs, no loaded font program), as opposed to
+    /// glyphs whose outline is known to be empty (spaces).
     text_clip_accum: Option<Path>,
     text_clip_requested: bool,
+    text_clip_unavailable: bool,
     font_cache: Option<&'a mut FontCache>,
     current_font_id: Option<zpdf_font::FontId>,
     file: Option<&'a PdfFile>,
@@ -534,6 +538,7 @@ impl<'a> ContentInterpreter<'a> {
             text_line_matrix: Matrix::identity(),
             text_clip_accum: None,
             text_clip_requested: false,
+            text_clip_unavailable: false,
             font_cache: None,
             current_font_id: None,
             file: None,
@@ -1325,6 +1330,7 @@ impl<'a> ContentInterpreter<'a> {
                 self.text_line_matrix = Matrix::identity();
                 self.text_clip_accum = None;
                 self.text_clip_requested = false;
+                self.text_clip_unavailable = false;
             }
             "ET" => {
                 self.text_active = false;
@@ -4566,28 +4572,21 @@ impl<'a> ContentInterpreter<'a> {
         let mut glyphs = Vec::new();
         let mut x_offset = 0.0f32;
         let mut vertical = false;
+        // Vertical runs: text-space horizontal extent of the glyph column.
+        let mut column = (f32::INFINITY, f32::NEG_INFINITY);
 
         if is_two_byte {
             // Composite font: segment codes through the /Encoding CMap
             // (Identity-H semantics when absent) and map code → CID → glyph.
             let cmap = font_and_id.and_then(|(_, f)| f.cid_cmap.as_ref());
             vertical = cmap.map(|c| c.wmode == 1).unwrap_or(false);
-            // Authoritative Unicode CMaps on an embedded font still select
-            // collection CIDs: its glyphs, /W widths and /W2 metrics are by CID.
-            let codes_are_unicode = cmap.is_some_and(|c| {
-                c.codes_are_unicode
-                    && (!c.is_authoritative() || font_and_id.is_some_and(|(_, f)| f.is_substitute))
-            });
-            // Legacy byte-encoded CMap (GB / GBK / Big5 / Shift-JIS / EUC-JP /
-            // KSC) on a *substituted* (non-embedded) font: decode code → Unicode
-            // and resolve through the system face. Embedded legacy-CMap fonts
-            // keep the normal code → CID → GID path.
-            let legacy = cmap.map(|c| c.is_legacy()).unwrap_or(false)
-                && font_and_id.map(|(_, f)| f.is_substitute).unwrap_or(false);
+            let direct_gid = font_and_id
+                .is_some_and(|(_, font)| font.unicode_coded() || font.legacy_substitute());
             let dw2 = font_and_id.map(|(_, f)| f.dw2).unwrap_or((880.0, -1000.0));
 
             let mut i = 0usize;
             while i < bytes.len() {
+                let start = i;
                 let (code, len) = match cmap {
                     Some(c) => c.next_code(&bytes[i..]),
                     None => {
@@ -4604,44 +4603,25 @@ impl<'a> ContentInterpreter<'a> {
                 // Resolve the glyph id, its 1/1000-unit advance, and (for CID
                 // fonts in vertical mode) the per-CID /W2 vertical metric.
                 let (glyph_id, adv_units, v_metric) = if let Some((_, font)) = font_and_id {
-                    if codes_are_unicode {
-                        match font.unicode_glyph(code) {
-                            Some((gid, adv)) => (gid, adv, None),
-                            None => (0, 500.0, None),
-                        }
-                    } else if legacy {
-                        // GID from the system face via code → Unicode; advance
-                        // from the PDF /W keyed by the Adobe CID (1-byte ASCII →
-                        // CID 1-95; 2-byte CJK → CID 0 → DW, ~1000).
-                        let cid = cmap
-                            .map(|c| c.code_to_cid(code, len as u8))
+                    let cid = cmap.map(|c| c.code_to_cid(code, len as u8)).unwrap_or(code);
+                    let cid = u16::try_from(cid).unwrap_or(0);
+                    let glyph_id = if direct_gid {
+                        let raw_code = bytes[start..i.min(bytes.len())]
+                            .iter()
+                            .fold(0u32, |value, &byte| (value << 8) | byte as u32);
+                        font.composite_unicode_gid(code, raw_code, len as u8)
                             .unwrap_or(0)
-                            .min(u16::MAX as u32) as u16;
-                        let gid = cmap
-                            .and_then(|c| c.decode_to_unicode(code, len as u8))
-                            .and_then(|u| font.unicode_glyph(u))
-                            .map(|(g, _)| g)
-                            .unwrap_or(0);
-                        let v_metric = if vertical {
-                            font.cid_v_metric(cid)
-                        } else {
-                            None
-                        };
-                        (gid, font.glyph_advance(cid), v_metric)
                     } else {
-                        let cid = cmap
-                            .map(|c| c.code_to_cid(code, len as u8))
-                            .unwrap_or(code)
-                            .min(u16::MAX as u32) as u16;
-                        let v_metric = if vertical {
-                            font.cid_v_metric(cid)
-                        } else {
-                            None
-                        };
-                        (cid, font.glyph_advance(cid), v_metric)
-                    }
+                        cid
+                    };
+                    let v_metric = if vertical {
+                        font.cid_v_metric(cid)
+                    } else {
+                        None
+                    };
+                    (glyph_id, font.glyph_advance(cid), v_metric)
                 } else {
-                    (code.min(u16::MAX as u32) as u16, 500.0, None)
+                    (u16::try_from(code).unwrap_or(0), 500.0, None)
                 };
 
                 if vertical {
@@ -4657,6 +4637,8 @@ impl<'a> ContentInterpreter<'a> {
                     let vx = vx as f32 * scale_factor;
                     let vy = vy as f32 * scale_factor;
                     let advance = w1y as f32 * scale_factor;
+                    let width = adv_units as f32 * scale_factor * h_scale;
+                    column = (column.0.min(-vx), column.1.max(-vx + width));
                     glyphs.push(PositionedGlyph {
                         glyph_id,
                         x: -vx,
@@ -4684,23 +4666,32 @@ impl<'a> ContentInterpreter<'a> {
                 }
             }
         } else {
+            let mut previous = None;
             for &byte in bytes {
                 let code = byte as u16;
-                // Map the character code through /Encoding + the font's cmap/charset
-                // to the real glyph ID. Without font data, fall back to the raw code.
-                let (glyph_id, advance) = if let Some((_, font)) = font_and_id {
+                // Type3 CharProcs are addressed by character code. Other fonts
+                // require an actual glyph mapping; an unmapped code is .notdef.
+                let (glyph_id, advance) = if let Some((_, glyph)) =
+                    previous.filter(|(previous_code, _)| *previous_code == byte)
+                {
+                    glyph
+                } else if let Some((_, font)) = font_and_id {
                     let gid = font.code_to_gid(code).unwrap_or_else(|| {
-                        tracing::debug!(
-                            "font {}: code {code} unmapped, using as raw GID",
-                            font.base_font
-                        );
-                        code
+                        if font.is_type3() {
+                            code
+                        } else {
+                            0
+                        }
                     });
                     let adv = font.simple_glyph_advance(code, gid) as f32 * scale_factor * h_scale;
                     (gid, adv)
                 } else {
                     (code, font_size * 0.6 * h_scale)
                 };
+                // Font and text-space scale are constant within this operation.
+                // Repeated codes need no repeated cmap parsing or width lookup;
+                // positions and word/character spacing are still applied below.
+                previous = Some((byte, (glyph_id, advance)));
                 glyphs.push(PositionedGlyph {
                     glyph_id,
                     x: x_offset,
@@ -4729,14 +4720,27 @@ impl<'a> ContentInterpreter<'a> {
                 });
             // The rise is already baked into `combined`.
             let start = Point::new(0.0, 0.0).transform(&combined);
-            let end = Point::new(x_offset as f64, 0.0).transform(&combined);
-            let dx = end.x - start.x;
+            let (x, dx) = if vertical && column.0 <= column.1 {
+                // A vertical run covers its glyph column across the pen travel.
+                // Its pen moves along text-space y, so end.x − start.x alone is
+                // zero for upright columns. Report the user-space x-extent.
+                let (left, right) = (column.0 as f64, column.1 as f64);
+                let travel = x_offset as f64;
+                let xs = [(left, 0.0), (right, 0.0), (left, travel), (right, travel)]
+                    .map(|(x, y)| Point::new(x, y).transform(&combined).x);
+                let min = xs.into_iter().fold(f64::INFINITY, f64::min);
+                let max = xs.into_iter().fold(f64::NEG_INFINITY, f64::max);
+                (min, max - min)
+            } else {
+                let end = Point::new(x_offset as f64, 0.0).transform(&combined);
+                (start.x, end.x - start.x)
+            };
             let cscale = ((combined.a * combined.a + combined.b * combined.b).sqrt()
                 + (combined.c * combined.c + combined.d * combined.d).sqrt())
                 / 2.0;
             Some(TextSpan {
                 text: decoded,
-                x: start.x,
+                x,
                 y: start.y,
                 size: (font_size as f64 * cscale) as f32,
                 // Signed horizontal extent of the run (end.x − start.x) so the
@@ -4749,69 +4753,24 @@ impl<'a> ContentInterpreter<'a> {
             None
         };
 
-        // Only emit a glyph run when a font is actually active; with no font the
-        // glyph IDs would be raw, unmappable codes aliased onto font 0.
-        // Text render mode 3 (invisible, the OCR-layer case) and 7 (clip only)
-        // paint nothing; stroke modes 1/2/5/6 are approximated as fills.
-        // A `/None` colorant space on the active paint (fill for modes 0/2/4/6,
-        // stroke for 1/5) likewise produces no marks — suppress the visual run,
-        // while the text-extraction sink below still records the glyphs.
-        let no_marks = match self.current.render_mode {
-            1 | 5 => cs_produces_no_marks(&self.current.stroke_cs),
-            _ => cs_produces_no_marks(&self.current.fill_cs),
-        };
-        let invisible = matches!(self.current.render_mode, 3 | 7) || no_marks;
-        // Text render modes 4–7 also *add the glyph outlines to the clipping
-        // path* (applied at ET). Accumulate them in page space now — regardless
-        // of whether the run is also painted (4=fill+clip, 5=stroke+clip,
-        // 6=fill+stroke+clip, 7=clip only). Without this, a following opaque fill
-        // or image meant to show only through the glyphs paints over everything.
-        if matches!(self.current.render_mode, 4..=7) {
-            self.text_clip_requested = true;
-            if let Some((_, font)) = font_and_id {
+        // Preserve the ordinary solid-text path without entering fallback or
+        // clipping machinery when no application fonts have been registered.
+        let ordinary = self.current.render_mode == 0
+            && self.current.fill_pattern.is_none()
+            && self
+                .font_cache
+                .as_ref()
+                .and_then(|cache| cache.provider())
+                .is_none_or(|provider| provider.generation() == 0)
+            && !cs_produces_no_marks(&self.current.fill_cs);
+        if ordinary {
+            if let Some(font_id) = self.current_font_id {
                 if !glyphs.is_empty() {
-                    if let Some((clip_path, _)) =
-                        build_glyph_clip_path(&glyphs, &combined, font, font_size, h_scale)
-                    {
-                        match self.text_clip_accum.as_mut() {
-                            Some(accum) => accum.elements.extend(clip_path.elements),
-                            None => self.text_clip_accum = Some(clip_path),
-                        }
-                    }
+                    self.emit_solid_glyph_run(font_id, font_size, glyphs, combined, h_scale);
                 }
             }
-        }
-        if let Some(font_id) = self.current_font_id {
-            if !glyphs.is_empty() && !invisible {
-                // A Pattern colour space on the active paint (fill for modes
-                // 0/2/4/6, stroke for 1/5) clips the pattern to the glyph
-                // outlines instead of painting a solid run.
-                let text_pattern = match self.current.render_mode {
-                    1 | 5 => self.current.stroke_pattern.clone(),
-                    _ => self.current.fill_pattern.clone(),
-                };
-                let glyph_clip = text_pattern.as_ref().and_then(|_| {
-                    font_and_id.and_then(|(_, font)| {
-                        build_glyph_clip_path(&glyphs, &combined, font, font_size, h_scale)
-                    })
-                });
-                match (text_pattern, glyph_clip) {
-                    (Some(pat), Some((clip_path, bounds))) => {
-                        self.display_list.push(RenderCommand::PushClip {
-                            path: clip_path,
-                            rule: FillRule::NonZero,
-                        });
-                        let painted = self.paint_pattern_in_region(&pat, bounds);
-                        self.display_list.push(RenderCommand::PopClip);
-                        if !painted {
-                            self.emit_solid_glyph_run(
-                                font_id, font_size, glyphs, combined, h_scale,
-                            );
-                        }
-                    }
-                    _ => self.emit_solid_glyph_run(font_id, font_size, glyphs, combined, h_scale),
-                }
-            }
+        } else {
+            self.paint_positioned_text(bytes, glyphs, combined, font_size, h_scale);
         }
 
         // Hidden optional-content layers also extract no text (emit_painted
@@ -4833,6 +4792,221 @@ impl<'a> ContentInterpreter<'a> {
         self.text_matrix = self.text_matrix.concat(&advance);
     }
 
+    /// Keep optional fallback and clipping state off the main decoding stack.
+    #[inline(never)]
+    fn paint_positioned_text(
+        &mut self,
+        bytes: &[u8],
+        mut glyphs: Vec<PositionedGlyph>,
+        combined: Matrix,
+        font_size: f32,
+        h_scale: f32,
+    ) {
+        let resolved_runs = self
+            .current_font_id
+            .and_then(|font_id| self.resolve_text_glyphs(font_id, bytes, &mut glyphs));
+
+        // Only emit a glyph run when a font is actually active; with no font the
+        // glyph IDs would be raw, unmappable codes aliased onto font 0.
+        // Text render mode 3 (invisible, the OCR-layer case) and 7 (clip only)
+        // paint nothing; stroke modes 1/2/5/6 are approximated as fills.
+        // A `/None` colorant space on the active paint (fill for modes 0/2/4/6,
+        // stroke for 1/5) likewise produces no marks — suppress the visual run,
+        // while the text-extraction sink below still records the glyphs.
+        let no_marks = match self.current.render_mode {
+            1 | 5 => cs_produces_no_marks(&self.current.stroke_cs),
+            _ => cs_produces_no_marks(&self.current.fill_cs),
+        };
+        let invisible = matches!(self.current.render_mode, 3 | 7) || no_marks;
+        // Text render modes 4–7 also *add the glyph outlines to the clipping
+        // path* (applied at ET). Accumulate them in page space now — regardless
+        // of whether the run is also painted (4=fill+clip, 5=stroke+clip,
+        // 6=fill+stroke+clip, 7=clip only). Without this, a following opaque fill
+        // or image meant to show only through the glyphs paints over everything.
+        let text_pattern = match self.current.render_mode {
+            1 | 5 => self.current.stroke_pattern.clone(),
+            _ => self.current.fill_pattern.clone(),
+        };
+        let wants_clip = matches!(self.current.render_mode, 4..=7);
+        // No font at all leaves the shown codes without any outline source.
+        let mut outlines_unavailable = self.current_font_id.is_none();
+        // Per resolved run: true when its font has no outlines to clip with.
+        let mut outline_less_runs: Vec<bool> = Vec::new();
+        let glyph_clip = if wants_clip || text_pattern.is_some() {
+            let mut union: Option<(Path, Rect)> = None;
+            let mut append = |font_id, glyphs: &[PositionedGlyph]| {
+                let font = self
+                    .font_cache
+                    .as_ref()
+                    .and_then(|cache| cache.get(font_id))
+                    .filter(|font| glyph_outlines_available(font));
+                let Some(font) = font else {
+                    outlines_unavailable = true;
+                    return false;
+                };
+                let mut failed = false;
+                if let Some((path, bounds)) =
+                    build_glyph_clip_path(glyphs, &combined, font, font_size, h_scale, &mut failed)
+                {
+                    match &mut union {
+                        Some((all, total)) => {
+                            all.elements.extend(path.elements);
+                            *total = Rect::new(
+                                total.x0.min(bounds.x0),
+                                total.y0.min(bounds.y0),
+                                total.x1.max(bounds.x1),
+                                total.y1.max(bounds.y1),
+                            );
+                        }
+                        None => union = Some((path, bounds)),
+                    }
+                }
+                // An unreadable glyph is not blank: its clip area is unknown.
+                outlines_unavailable |= failed;
+                true
+            };
+            if let Some(runs) = &resolved_runs {
+                outline_less_runs = runs
+                    .iter()
+                    .map(|(font_id, glyphs)| !append(*font_id, glyphs))
+                    .collect();
+            } else if let Some(font_id) = self.current_font_id {
+                append(font_id, &glyphs);
+            }
+            union
+        } else {
+            None
+        };
+        if wants_clip && (!glyphs.is_empty() || resolved_runs.is_some()) {
+            self.text_clip_requested = true;
+            self.text_clip_unavailable |= outlines_unavailable;
+            if let Some((path, _)) = &glyph_clip {
+                self.text_clip_accum
+                    .get_or_insert_with(Path::new)
+                    .elements
+                    .extend_from_slice(&path.elements);
+            }
+        }
+        if let Some(font_id) = self.current_font_id {
+            if (!glyphs.is_empty() || resolved_runs.is_some()) && !invisible {
+                // A Pattern colour space on the active paint (fill for modes
+                // 0/2/4/6, stroke for 1/5) clips the pattern to the glyph
+                // outlines instead of painting a solid run.
+                let painted = match (text_pattern, glyph_clip) {
+                    (Some(pat), Some((clip_path, bounds))) => {
+                        self.display_list.push(RenderCommand::PushClip {
+                            path: clip_path,
+                            rule: FillRule::NonZero,
+                        });
+                        let painted = self.paint_pattern_in_region(&pat, bounds);
+                        self.display_list.push(RenderCommand::PopClip);
+                        painted
+                    }
+                    _ => false,
+                };
+                if !painted {
+                    if let Some(runs) = resolved_runs {
+                        for (id, glyphs) in runs {
+                            self.emit_solid_glyph_run(id, font_size, glyphs, combined, h_scale);
+                        }
+                    } else {
+                        self.emit_solid_glyph_run(font_id, font_size, glyphs, combined, h_scale);
+                    }
+                } else if let Some(runs) = resolved_runs {
+                    // Runs without outlines (Type3 CharProcs) lie outside the
+                    // pattern clip; paint them solid, as a Type3-only run is.
+                    for ((id, glyphs), _) in runs
+                        .into_iter()
+                        .zip(outline_less_runs)
+                        .filter(|(_, outline_less)| *outline_less)
+                    {
+                        self.emit_solid_glyph_run(id, font_size, glyphs, combined, h_scale);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Keep the original positions/advances and replace only drawing identities.
+    /// The absent/empty-provider path allocates no resolution state or vectors.
+    fn resolve_text_glyphs(
+        &mut self,
+        font_id: FontId,
+        bytes: &[u8],
+        glyphs: &mut Vec<PositionedGlyph>,
+    ) -> Option<Vec<(FontId, Vec<PositionedGlyph>)>> {
+        if self.current.render_mode == 3 {
+            return None;
+        }
+        let cache = self.font_cache.as_deref_mut()?;
+        if cache.provider()?.generation() == 0 || glyphs.is_empty() {
+            return None;
+        }
+        let composite = matches!(
+            cache.get(font_id)?.font_type,
+            zpdf_font::PdfFontType::Type0CidType2
+        );
+        let cmap = cache.get(font_id)?.cid_cmap.as_ref();
+        let mut check_offset = 0usize;
+        if cache.original_glyphs_usable(
+            font_id,
+            glyphs.iter().map(|glyph| {
+                let (code, length, raw, end) = next_text_code(cmap, composite, bytes, check_offset)
+                    .unwrap_or((0, 0, 0, bytes.len()));
+                check_offset = end;
+                (glyph.glyph_id, code, raw, length as u8)
+            }),
+        ) {
+            return None;
+        }
+        let mut ids: Option<Vec<FontId>> = None;
+        let mut offset = 0;
+        let mut previous = None;
+        for (index, glyph) in glyphs.iter_mut().enumerate() {
+            let cmap = cache.get(font_id)?.cid_cmap.as_ref();
+            let (code, length, raw, end) = next_text_code(cmap, composite, bytes, offset)?;
+            offset = end;
+            let original = zpdf_font::DrawingGlyph {
+                font_id,
+                glyph_id: glyph.glyph_id,
+            };
+            let key = (code, raw, length, original.glyph_id);
+            // Adjacent repeats share a resolution within this positioned text
+            // operation. Later operations still observe provider generation.
+            let drawing = match previous {
+                Some((previous_key, drawing)) if previous_key == key => drawing,
+                _ => {
+                    let drawing = cache.resolve_drawing_glyph(
+                        original,
+                        code,
+                        raw,
+                        length as u8,
+                        self.max_font_cache_bytes,
+                    );
+                    previous = Some((key, drawing));
+                    drawing
+                }
+            };
+            if drawing != original && ids.is_none() {
+                ids = Some(vec![font_id; index]);
+            }
+            glyph.glyph_id = drawing.glyph_id;
+            if let Some(ids) = &mut ids {
+                ids.push(drawing.font_id);
+            }
+        }
+        let ids = ids?;
+        let mut runs: Vec<(FontId, Vec<PositionedGlyph>)> = Vec::new();
+        for (id, glyph) in ids.into_iter().zip(std::mem::take(glyphs)) {
+            if let Some((_, current)) = runs.last_mut().filter(|(previous, _)| *previous == id) {
+                current.push(glyph);
+            } else {
+                runs.push((id, vec![glyph]));
+            }
+        }
+        Some(runs)
+    }
+
     /// At `ET`, fold any text-clip accumulated during the block (render modes
     /// 4–7) into the clip stack. The glyph outlines are already in page space,
     /// so this mirrors a `W n` clip: push a NonZero `PushClip` and bump
@@ -4840,18 +5014,23 @@ impl<'a> ContentInterpreter<'a> {
     /// opaque fill or image meant to show only through the glyph shapes paints
     /// over the whole surrounding clip region.
     ///
-    /// A clip mode that produced no drawable glyphs (bare font, Type3, empty
-    /// run) leaves nothing to clip to; we skip pushing rather than emit an empty
-    /// path (which the renderer treats as "no clip", not "clip everything out"),
-    /// preserving the prior behaviour for that rare case.
+    /// Glyphs whose outlines are known but empty (spaces) contribute an empty
+    /// clipping region: the empty `PushClip` hides a later page-covering fill
+    /// in every backend. When the accumulated path is empty only because some
+    /// glyphs had no outline source (Type3 CharProcs, no loaded font program),
+    /// the real clip is unknown; skip it rather than hide all later painting,
+    /// as pdf.js does for Type3 text.
     fn apply_text_clip(&mut self) {
         if !self.text_clip_requested {
             return;
         }
         self.text_clip_requested = false;
-        let Some(path) = self.text_clip_accum.take().filter(|p| !p.is_empty()) else {
+        let unavailable = std::mem::take(&mut self.text_clip_unavailable);
+        let path = self.text_clip_accum.take().unwrap_or_default();
+        if path.is_empty() && unavailable {
+            tracing::debug!("text clip skipped: clipped glyphs have no outline source");
             return;
-        };
+        }
         self.intersect_clip_bounds(Self::path_bounds(&path));
         self.display_list.push(RenderCommand::PushClip {
             path,
@@ -4932,25 +5111,57 @@ fn resolve_image_metadata(file: &PdfFile, dict: &zpdf_core::PdfDict) -> zpdf_cor
     out
 }
 
+/// Split the character code at `bytes[offset..]` as `show_text` did: through
+/// the encoding CMap for composite fonts (two-byte codes without one), one
+/// byte for simple fonts. Returns `(code, length, raw source value, end)`.
+fn next_text_code(
+    cmap: Option<&zpdf_font::cmap::CidCMap>,
+    composite: bool,
+    bytes: &[u8],
+    offset: usize,
+) -> Option<(u32, usize, u32, usize)> {
+    let fold = |codes: &[u8]| {
+        codes
+            .iter()
+            .fold(0, |value, &byte| (value << 8) | byte as u32)
+    };
+    let (code, length) = match (composite, cmap) {
+        (true, Some(cmap)) => cmap.next_code(bytes.get(offset..)?),
+        (true, None) => {
+            let length = (bytes.len().checked_sub(offset)?).min(2);
+            (fold(&bytes[offset..offset + length]), length)
+        }
+        (false, _) => (*bytes.get(offset)? as u32, 1),
+    };
+    let end = (offset + length.max(1)).min(bytes.len());
+    Some((code, length, fold(&bytes[offset..end]), end))
+}
+
+/// Whether `build_glyph_clip_path` can read outlines from this font at all.
+/// Type3 glyphs are content streams and a font without a program has no
+/// outlines; for other fonts a glyph without an outline is genuinely blank.
+fn glyph_outlines_available(font: &zpdf_font::LoadedFont) -> bool {
+    font.has_font_data() && !font.is_type3() && font.units_per_em > 0.0
+}
+
 /// Build a combined glyph-outline clip path (in PAGE space) for a positioned
 /// glyph run, plus its bounding box. Used to clip a pattern/shading paint to
 /// text. Returns `None` for fonts with no usable outlines (bitmap/Type3) or an
 /// all-blank run. Quadratic segments are promoted to cubics for the display
-/// list `Path` (which carries cubics only).
+/// list `Path` (which carries cubics only). Sets `failed` when a glyph has no
+/// outline without being a well-formed blank glyph.
 fn build_glyph_clip_path(
     glyphs: &[PositionedGlyph],
     tm: &Matrix,
     font: &zpdf_font::LoadedFont,
     font_size: f32,
     h_scale: f32,
+    failed: &mut bool,
 ) -> Option<(Path, Rect)> {
-    if !font.has_font_data() || font.is_type3() {
+    if !glyph_outlines_available(font) {
         return None;
     }
     let upem = font.units_per_em as f32;
-    if upem <= 0.0 {
-        return None;
-    }
 
     // Glyph-space point (font units, + the glyph's text-space offset) → page.
     // The shape x carries the horizontal-scaling factor (Th); the offset already
@@ -4979,10 +5190,14 @@ fn build_glyph_clip_path(
     for glyph in glyphs {
         let outline = match font.glyph_outline(glyph.glyph_id) {
             Some(o) => o,
-            None => continue,
+            None => {
+                *failed |= !font.is_blank_glyph(glyph.glyph_id);
+                continue;
+            }
         };
         let (ox, oy) = (glyph.x, glyph.y);
         let mut cur = Point::new(0.0, 0.0);
+        let glyph_start = out.elements.len();
         for cmd in &outline.commands {
             match *cmd {
                 zpdf_font::OutlineCommand::MoveTo(x, y) => {
@@ -5009,6 +5224,8 @@ fn build_glyph_clip_path(
                     let c2 =
                         Point::new(e.x + 2.0 / 3.0 * (c.x - e.x), e.y + 2.0 / 3.0 * (c.y - e.y));
                     out.curve_to(c1, c2, e);
+                    track(c1, &mut bb);
+                    track(c2, &mut bb);
                     track(e, &mut bb);
                     cur = e;
                 }
@@ -5017,18 +5234,97 @@ fn build_glyph_clip_path(
                     let c2 = to_page(x2, y2, ox, oy);
                     let e = to_page(x, y, ox, oy);
                     out.curve_to(c1, c2, e);
+                    track(c1, &mut bb);
+                    track(c2, &mut bb);
                     track(e, &mut bb);
                     cur = e;
                 }
                 zpdf_font::OutlineCommand::Close => out.close(),
             }
         }
+        orient_glyph_contours(&mut out.elements, glyph_start);
     }
 
     if !(any && bb.0.is_finite() && bb.2 > bb.0 && bb.3 > bb.1) {
         return None;
     }
     Some((out, Rect::new(bb.0, bb.1, bb.2, bb.3)))
+}
+
+/// Orient the contours of the glyph at `elements[start..]` counter-clockwise
+/// in page space. TrueType outlines run clockwise and CFF ones the other way;
+/// a nonzero fill of glyphs from both would cancel their overlap into a hole
+/// instead of taking the union. Reversing every contour of the glyph together
+/// keeps its own counters intact.
+fn orient_glyph_contours(elements: &mut Vec<PathElement>, start: usize) {
+    let cross = |a: Point, b: Point| a.x * b.y - b.x * a.y;
+    // Shoelace over the control polygon; its sign matches the outline's.
+    let mut area = 0.0;
+    let (mut first, mut prev) = (None::<Point>, None::<Point>);
+    for element in &elements[start..] {
+        match *element {
+            PathElement::MoveTo(p) => {
+                if let (Some(f), Some(q)) = (first, prev) {
+                    area += cross(q, f);
+                }
+                (first, prev) = (Some(p), Some(p));
+            }
+            PathElement::LineTo(p) => {
+                let Some(q) = prev else { return };
+                area += cross(q, p);
+                prev = Some(p);
+            }
+            PathElement::CurveTo(c1, c2, p) => {
+                let Some(q) = prev else { return };
+                area += cross(q, c1) + cross(c1, c2) + cross(c2, p);
+                prev = Some(p);
+            }
+            PathElement::Close => {}
+        }
+    }
+    if let (Some(f), Some(q)) = (first, prev) {
+        area += cross(q, f);
+    }
+    if area.is_nan() || area >= 0.0 {
+        return;
+    }
+
+    fn flush(contour: &mut Vec<PathElement>, out: &mut Vec<PathElement>) {
+        let Some(PathElement::MoveTo(origin)) = contour.first().copied() else {
+            out.append(contour);
+            return;
+        };
+        let closed = matches!(contour.last(), Some(PathElement::Close));
+        let segments = &contour[1..contour.len() - closed as usize];
+        let mut starts = Vec::with_capacity(segments.len());
+        let mut at = origin;
+        for segment in segments {
+            starts.push(at);
+            if let PathElement::LineTo(p) | PathElement::CurveTo(_, _, p) = *segment {
+                at = p;
+            }
+        }
+        out.push(PathElement::MoveTo(at));
+        for (segment, from) in segments.iter().zip(starts).rev() {
+            out.push(match *segment {
+                PathElement::CurveTo(c1, c2, _) => PathElement::CurveTo(c2, c1, from),
+                _ => PathElement::LineTo(from),
+            });
+        }
+        if closed {
+            out.push(PathElement::Close);
+        }
+        contour.clear();
+    }
+    let glyph = elements.split_off(start);
+    let mut contour: Vec<PathElement> = Vec::new();
+    for element in glyph {
+        if matches!(element, PathElement::MoveTo(_)) && !contour.is_empty() {
+            flush(&mut contour, elements);
+        }
+        contour.push(element);
+    }
+    flush(&mut contour, elements);
 }
 
 /// Wrap a generated form-field appearance as a form-XObject stream so the
@@ -5452,6 +5748,49 @@ mod tests {
     }
 
     #[test]
+    fn clip_text_with_an_unreadable_outline_does_not_hide_later_paint() {
+        // An impossible contour count makes glyph 3 unreadable. Unlike a valid
+        // blank glyph, it says nothing about the clip area, so no empty clip
+        // may hide the page-covering fill that follows.
+        let mut bytes = hex_bytes(FONT_PRESENT_HEX);
+        let table = |bytes: &[u8], tag: &[u8; 4]| {
+            let count = u16::from_be_bytes([bytes[4], bytes[5]]) as usize;
+            let record = (0..count)
+                .map(|index| 12 + index * 16)
+                .find(|&record| &bytes[record..record + 4] == tag)
+                .expect("table");
+            u32::from_be_bytes(bytes[record + 8..record + 12].try_into().unwrap()) as usize
+        };
+        let (glyf, loca, head) = (
+            table(&bytes, b"glyf"),
+            table(&bytes, b"loca"),
+            table(&bytes, b"head"),
+        );
+        assert_eq!(&bytes[head + 50..head + 52], &[0, 0], "short loca");
+        let offset = u16::from_be_bytes([bytes[loca + 6], bytes[loca + 7]]) as usize * 2;
+        bytes[glyf + offset..glyf + offset + 2].copy_from_slice(&32767i16.to_be_bytes());
+        let mut font = zpdf_font::LoadedFont::new_with_data(
+            zpdf_font::PdfFontType::Type0CidType2,
+            "Broken".into(),
+            bytes,
+            zpdf_font::CidWidths::new(1000.0),
+        );
+        font.cid_cmap = Some(zpdf_font::cmap::CidCMap::identity(0));
+        assert!(font.glyph_outline(3).is_none() && !font.is_blank_glyph(3));
+        let mut fonts = FontCache::new();
+        fonts.insert("F".to_string(), font);
+        let dl = ContentInterpreter::new(Rect::new(0.0, 0.0, 612.0, 792.0))
+            .with_fonts(&mut fonts)
+            .interpret(b"q BT /F 40 Tf 7 Tr <0003> Tj ET 0 0 1000 1000 re f Q");
+        assert!(
+            !dl.commands
+                .iter()
+                .any(|command| matches!(command, RenderCommand::PushClip { .. })),
+            "no clip from an unreadable outline"
+        );
+    }
+
+    #[test]
     fn with_content_translation_shifts_emitted_geometry() {
         // with_content_translation applies a (dx, dy) shift as the initial CTM,
         // exactly like a leading `1 0 0 1 dx dy cm`, without prepending that
@@ -5778,6 +6117,99 @@ mod tests {
         }
     }
 
+    /// Nonzero winding number of a line-only path around `at`.
+    fn winding(elements: &[PathElement], at: Point) -> i32 {
+        let mut polygons: Vec<Vec<Point>> = Vec::new();
+        for element in elements {
+            match *element {
+                PathElement::MoveTo(p) => polygons.push(vec![p]),
+                PathElement::LineTo(p) => polygons.last_mut().unwrap().push(p),
+                PathElement::CurveTo(..) => panic!("line-only test path"),
+                PathElement::Close => {}
+            }
+        }
+        let mut winding = 0;
+        for polygon in polygons {
+            for (i, &a) in polygon.iter().enumerate() {
+                let b = polygon[(i + 1) % polygon.len()];
+                let side = (b.x - a.x) * (at.y - a.y) - (at.x - a.x) * (b.y - a.y);
+                if a.y <= at.y && b.y > at.y && side > 0.0 {
+                    winding += 1;
+                } else if a.y > at.y && b.y <= at.y && side < 0.0 {
+                    winding -= 1;
+                }
+            }
+        }
+        winding
+    }
+
+    fn square(path: &mut Path, x0: f64, y0: f64, size: f64, clockwise: bool) {
+        let corners = [(0.0, 0.0), (0.0, size), (size, size), (size, 0.0)];
+        path.move_to(Point::new(x0, y0));
+        for &(dx, dy) in &corners[1..] {
+            let (dx, dy) = if clockwise { (dx, dy) } else { (dy, dx) };
+            path.line_to(Point::new(x0 + dx, y0 + dy));
+        }
+        path.close();
+    }
+
+    #[test]
+    fn glyph_contours_union_regardless_of_font_winding() {
+        // A TrueType-style clockwise glyph overlapping a CFF-style
+        // counter-clockwise one: concatenated, the overlap winds to zero.
+        let mut path = Path::new();
+        square(&mut path, 0.0, 0.0, 10.0, true);
+        orient_glyph_contours(&mut path.elements, 0);
+        let second = path.elements.len();
+        square(&mut path, 5.0, 5.0, 10.0, false);
+        orient_glyph_contours(&mut path.elements, second);
+        let overlap = Point::new(7.0, 7.0);
+        assert_eq!(winding(&path.elements[..second], overlap), 1);
+        assert_eq!(winding(&path.elements[second..], overlap), 1);
+        assert_eq!(winding(&path.elements, overlap), 2);
+        assert_eq!(winding(&path.elements, Point::new(2.0, 2.0)), 1);
+        assert_eq!(winding(&path.elements, Point::new(20.0, 2.0)), 0);
+    }
+
+    #[test]
+    fn reversing_a_glyph_keeps_its_counters() {
+        // Clockwise outer contour with a counter-clockwise hole (TrueType 'O').
+        let mut path = Path::new();
+        square(&mut path, 0.0, 0.0, 10.0, true);
+        square(&mut path, 3.0, 3.0, 4.0, false);
+        orient_glyph_contours(&mut path.elements, 0);
+        assert_eq!(path.elements.len(), 10, "same contours and segments");
+        assert_eq!(winding(&path.elements, Point::new(1.0, 1.0)), 1);
+        assert_eq!(winding(&path.elements, Point::new(5.0, 5.0)), 0);
+        // Already counter-clockwise glyphs are left untouched.
+        let before = format!("{:?}", path.elements);
+        orient_glyph_contours(&mut path.elements, 0);
+        assert_eq!(format!("{:?}", path.elements), before);
+    }
+
+    #[test]
+    fn reversed_curves_swap_their_control_points() {
+        let p = Point::new;
+        let mut path = Path::new();
+        path.move_to(p(0.0, 0.0));
+        path.curve_to(p(0.0, 5.0), p(5.0, 10.0), p(10.0, 10.0));
+        path.line_to(p(10.0, 0.0));
+        path.close();
+        orient_glyph_contours(&mut path.elements, 0);
+        assert_eq!(
+            format!("{:?}", path.elements),
+            format!(
+                "{:?}",
+                [
+                    PathElement::MoveTo(p(10.0, 0.0)),
+                    PathElement::LineTo(p(10.0, 10.0)),
+                    PathElement::CurveTo(p(5.0, 10.0), p(0.0, 5.0), p(0.0, 0.0)),
+                    PathElement::Close,
+                ]
+            )
+        );
+    }
+
     /// `build_glyph_clip_path` produces a real outline clip + bbox from a
     /// loaded font (the geometry behind pattern-filled text). Uses the
     /// committed Quartz CFF fixture; skips gracefully if it is absent.
@@ -5809,8 +6241,9 @@ mod tests {
                 advance: 0.0,
             },
         ];
-        let (path, bounds) = build_glyph_clip_path(&glyphs, &Matrix::identity(), &font, 100.0, 1.0)
-            .expect("glyph clip path");
+        let (path, bounds) =
+            build_glyph_clip_path(&glyphs, &Matrix::identity(), &font, 100.0, 1.0, &mut false)
+                .expect("glyph clip path");
         assert!(
             !path.elements.is_empty(),
             "clip path should carry outline elements"

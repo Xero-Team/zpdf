@@ -95,6 +95,27 @@ impl FontProvider {
 }
 
 impl LoadedFont {
+    /// Whether the glyph exists with a well-formed but empty outline (a space,
+    /// an empty `.notdef`), as opposed to one that is missing or unreadable.
+    /// Type 1 and Type 3 glyphs are never blank in this sense.
+    pub fn is_blank_glyph(&self, glyph_id: u16) -> bool {
+        if self.type1.is_some() || self.is_type3() {
+            return false;
+        }
+        self.font_data
+            .as_ref()
+            .and_then(|data| ttf_parser::Face::parse(data, self.face_index).ok())
+            .is_some_and(|mut face| {
+                self.apply_variations(&mut face);
+                self.drawing_gid_with_face(glyph_id, &face)
+                    .is_some_and(|gid| {
+                        face.outline_glyph(ttf_parser::GlyphId(gid), &mut OutlineProbe)
+                            .is_none()
+                            && readable_glyph(&face, gid)
+                    })
+            })
+    }
+
     /// A mapped empty glyph is present even if it has no drawable outline.
     fn has_mapped_glyph(&self, glyph_id: u16) -> bool {
         if self.is_type3() {
@@ -117,12 +138,14 @@ impl LoadedFont {
     }
 
     fn fallback_character(&self, code: u32, raw_code: u32, length: u8) -> Option<FontCharacter> {
-        let character = if let Some(text) = self
+        let text = self
             .to_unicode
             .as_ref()
-            .and_then(|mapping| mapping.lookup(raw_code).or_else(|| mapping.lookup(code)))
-        {
-            FontCharacter::from_text(text)?
+            .and_then(|mapping| mapping.lookup(raw_code).or_else(|| mapping.lookup(code)));
+        // A ToUnicode string that is not one character (`fi`) still leaves the
+        // font's own identity for the code; it is never cut to its first scalar.
+        let character = if let Some(character) = text.and_then(FontCharacter::from_text) {
+            character
         } else if matches!(self.font_type, PdfFontType::Type0CidType2) {
             let cmap = self.cid_cmap.as_ref()?;
             cmap.decode_text(code, length)?.font_character()?
@@ -132,7 +155,8 @@ impl LoadedFont {
             .and_then(|encoding| encoding.glyph_name(code as u8))
         {
             FontCharacter::from_text(&crate::glyph_list::glyph_name_to_string(name)?)?
-        } else if !self.symbolic
+        } else if text.is_none()
+            && !self.symbolic
             && self.encoding.is_none()
             && length == 1
             && (32..=255).contains(&code)
@@ -181,7 +205,12 @@ impl ttf_parser::OutlineBuilder for OutlineProbe {
 
 /// Outline failures and valid empty glyphs need distinct fallback decisions.
 pub(crate) fn usable_glyph(face: &ttf_parser::Face<'_>, gid: u16) -> bool {
-    if gid == 0 || gid >= face.number_of_glyphs() {
+    gid != 0 && readable_glyph(face, gid)
+}
+
+/// The glyph exists and its outline, possibly empty, is well formed.
+fn readable_glyph(face: &ttf_parser::Face<'_>, gid: u16) -> bool {
+    if gid >= face.number_of_glyphs() {
         return false;
     }
     if face

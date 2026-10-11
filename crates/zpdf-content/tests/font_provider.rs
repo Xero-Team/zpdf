@@ -360,3 +360,36 @@ fn missing_composite_program_keeps_code_segmentation_and_pdf_metrics() {
         }
     }
 }
+
+#[test]
+fn an_unmapped_simple_code_cannot_draw_an_unrelated_glyph() {
+    let mut widths = zpdf_font::CidWidths::new(1000.0);
+    widths.set(255, 750.0);
+    let mut font = zpdf_font::LoadedFont::new_with_data(
+        zpdf_font::PdfFontType::TrueType,
+        "Sparse".into(),
+        PRIMARY.to_vec(),
+        widths,
+    );
+    assert!(font.code_to_gid(255).is_none());
+    assert!(
+        font.glyph_outline(255).is_some(),
+        "fixture exposes the accidental GID"
+    );
+    font.to_unicode = Some(zpdf_font::cmap::ToUnicodeMap::parse(
+        b"1 beginbfchar <FF> <9FFF> endbfchar",
+    ));
+    let mut fonts = zpdf_font::FontCache::new();
+    fonts.insert("F1".into(), font);
+    let mut spans = Vec::new();
+    let dl = ContentInterpreter::new(Rect::new(0.0, 0.0, 100.0, 100.0))
+        .with_fonts(&mut fonts)
+        .with_text_sink(&mut spans)
+        .interpret(b"BT /F1 10 Tf <FF> Tj ET");
+    let RenderCommand::DrawGlyphRun(run) = &dl.commands[0] else {
+        panic!("missing run")
+    };
+    assert_eq!(run.glyphs[0].glyph_id, 0);
+    assert_eq!(run.glyphs[0].advance, 7.5);
+    assert_eq!(spans[0].text, "\u{9fff}");
+}

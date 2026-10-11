@@ -477,7 +477,7 @@ impl LoadedFont {
 
     /// True when the composite-font code values are Unicode and glyph ids in
     /// glyph runs are already real GIDs (no CID → GID mapping applies).
-    fn unicode_coded(&self) -> bool {
+    pub fn unicode_coded(&self) -> bool {
         self.cid_cmap
             .as_ref()
             .map(|c| c.codes_are_unicode && (!c.is_authoritative() || self.is_substitute))
@@ -770,8 +770,8 @@ impl LoadedFont {
 
     /// Map a 1-byte character code to a glyph ID for a *simple* font, using the
     /// font's /Encoding (→ glyph name) and the embedded program's cmap/charset.
-    /// Returns `None` if no glyph data is available or no mapping is found
-    /// (callers typically fall back to treating the code as the GID).
+    /// Returns `None` if no glyph data is available or no mapping is found.
+    /// Character codes are not a valid fallback namespace for sfnt glyph IDs.
     pub fn code_to_gid(&self, code: u16) -> Option<u16> {
         // Embedded Type 1: resolve via the PDF /Encoding (or the font's built-in
         // encoding) to a glyph name, then to the synthetic Type 1 glyph id.
@@ -781,6 +781,12 @@ impl LoadedFont {
                 if let Some(name) = enc.glyph_name(code8) {
                     if let Some(g) = t1.gid_for_name(name) {
                         return Some(g);
+                    }
+                    // A missing named character must not become the built-in
+                    // glyph of another letter; a name without character meaning
+                    // (`/g3`) still falls back to the program's own encoding.
+                    if glyph_list::glyph_name_to_char(name).is_some() {
+                        return None;
                     }
                 }
             }
@@ -844,14 +850,10 @@ impl LoadedFont {
                     }
                 }
             }
-            // (1,0) Macintosh Roman: try the raw code, then the MacRoman slot
-            // of the /Encoding glyph name — the subtable is MacRoman-indexed,
-            // so a PDF encoding that differs from MacRoman needs the name detour.
+            // (1,0) Macintosh Roman: an explicit PDF encoding must resolve its
+            // glyph name through the MacRoman slot, not reuse an unrelated byte.
             for st in cmap.subtables {
                 if st.platform_id == ttf_parser::PlatformId::Macintosh && st.encoding_id == 0 {
-                    if let Some(g) = st.glyph_index(code as u32) {
-                        return Some(g.0);
-                    }
                     if let Some(mac) = self
                         .encoding
                         .as_ref()
@@ -862,11 +864,27 @@ impl LoadedFont {
                             return Some(g.0);
                         }
                     }
+                    if self.encoding.is_none() || self.symbolic {
+                        if let Some(g) = st.glyph_index(code as u32) {
+                            return Some(g.0);
+                        }
+                    }
                 }
             }
         }
 
-        // 4. Treat the code as Latin-1 and consult the Unicode cmap.
+        // An embedded TrueType program without any cmap addresses its glyphs by
+        // character code, which producers of such subsets rely on. A substitute
+        // face's glyph ids are unrelated to PDF codes, so it never does this.
+        if face.tables().cmap.is_none() && face.tables().glyf.is_some() && !self.is_substitute {
+            return (code < face.number_of_glyphs()).then_some(code);
+        }
+
+        // 4. Only an unspecified encoding permits the Latin-1 fallback. A
+        // declared missing glyph must not turn into a different encoded letter.
+        if self.encoding.is_some() && !self.symbolic {
+            return None;
+        }
         if let Some(g) = face.glyph_index(code8 as char) {
             return Some(g.0);
         }
@@ -2184,6 +2202,30 @@ mod tests {
     // ----- code_to_gid cmap fallbacks -----
 
     #[test]
+    fn embedded_truetype_without_cmap_uses_codes_as_glyph_ids() {
+        let mut head = head_table();
+        head[50..52].copy_from_slice(&0u16.to_be_bytes()); // short loca
+        let data = build_sfnt(&[
+            (*b"glyf", vec![0; 4]),
+            (*b"head", head),
+            (*b"hhea", hhea_table()),
+            (*b"loca", vec![0; 2 * 17]),
+            (*b"maxp", maxp_table(16)),
+        ]);
+        let mut font = LoadedFont::new_with_data(
+            PdfFontType::TrueType,
+            "NoCmap".into(),
+            data,
+            CidWidths::new(500.0),
+        );
+        font.encoding = Some(crate::encoding::Encoding::win_ansi());
+        assert_eq!(font.code_to_gid(5), Some(5));
+        assert_eq!(font.code_to_gid(16), None, "beyond numGlyphs");
+        font.is_substitute = true;
+        assert_eq!(font.code_to_gid(5), None, "substitute GIDs are not codes");
+    }
+
+    #[test]
     fn symbolic_f000_retry_on_windows_unicode_subtable() {
         // Only a (3,1) subtable, glyph parked at PUA 0xF041.
         let cmap = build_cmap(&[(3, 1, cmap_format4_single(0xF041, 5))]);
@@ -2202,6 +2244,7 @@ mod tests {
         // is where the (1,0) subtable indexes it.
         let mut glyph_ids = [0u8; 256];
         glyph_ids[0xA5] = 7;
+        glyph_ids[0xB4] = 9; // MacRoman yen, distinct from bullet.
         let cmap = build_cmap(&[(1, 0, cmap_format0(&glyph_ids))]);
         let mut font = font_with_cmap(cmap);
 
@@ -2210,8 +2253,8 @@ mod tests {
 
         font.encoding = Some(encoding::Encoding::from_base(&encoding::WIN_ANSI_ENCODING));
         assert_eq!(font.code_to_gid(0x95), Some(7));
-        // Raw-code hits still win where the PDF encoding agrees with MacRoman.
-        assert_eq!(font.code_to_gid(0xA5), Some(7));
+        // WinAnsi 0xA5 means yen; reusing raw MacRoman 0xA5 would draw bullet.
+        assert_eq!(font.code_to_gid(0xA5), Some(9));
     }
 
     #[test]
