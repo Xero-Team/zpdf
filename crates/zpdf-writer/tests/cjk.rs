@@ -191,11 +191,11 @@ fn deref(file: &zpdf_parser::PdfFile, obj: &PdfObject) -> Option<PdfObject> {
 
 /// `embed_composite_font_vertical` produces a Type0 font whose `/Encoding`
 /// is `Identity-V` and whose descendant CIDFont carries `/DW2` vertical
-/// metrics. The content stream applies the vertical text matrix
-/// (`0 1 -1 0 x y`). Uses var.ttf for the structural assertions (the glyph
+/// metrics. WMode chooses the vertical advance axis while the text matrix
+/// keeps glyphs upright (`1 0 0 1 x y`). Uses var.ttf for structural assertions (the glyph
 /// itself is .notdef, but the emission path is what we check here).
 #[test]
-fn vertical_identity_v_emits_dw2_and_vertical_matrix() {
+fn vertical_identity_v_emits_dw2_and_upright_matrix() {
     let font_bytes = std::fs::read(VAR_TTF).expect("read var.ttf");
     let mut builder = DocumentBuilder::new();
     let page = builder.add_page(400.0, 200.0);
@@ -216,10 +216,10 @@ fn vertical_identity_v_emits_dw2_and_vertical_matrix() {
         body.contains("/DW2"),
         "missing /DW2 vertical metrics: {body}"
     );
-    // Vertical text matrix (90° CCW rotation so the baseline runs top-to-bottom).
+    // WMode selects vertical advances without rotating glyph shapes.
     assert!(
-        body.contains("0 1 -1 0 40 120 Tm"),
-        "missing vertical Tm matrix: {body}"
+        body.contains("1 0 0 1 40 120 Tm"),
+        "vertical writing must keep the glyph matrix upright: {body}"
     );
     // Still a Type0 with Identity CID→GID mapping.
     assert!(body.contains("/Subtype /Type0"));
@@ -346,8 +346,8 @@ fn predefined_cmap_vertical_uses_v_variant() {
     assert!(body.contains("/Ordering (Japan1)"));
     assert!(body.contains("/DW2"), "vertical predefined needs /DW2");
     assert!(
-        body.contains("0 1 -1 0 40 120 Tm"),
-        "missing vertical Tm matrix: {body}"
+        body.contains("1 0 0 1 40 120 Tm"),
+        "vertical writing must keep the glyph matrix upright: {body}"
     );
 }
 

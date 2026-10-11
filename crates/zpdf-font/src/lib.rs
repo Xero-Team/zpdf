@@ -1,3 +1,4 @@
+mod adobe_cmaps;
 pub mod big5;
 pub mod cmap;
 pub mod encoding;
@@ -6,15 +7,26 @@ pub mod gb2312;
 pub mod gbk;
 pub mod glyph_list;
 pub mod ksc;
+pub mod pack;
+pub mod provider;
+mod resolution;
 pub mod sjis;
 pub mod standard_fonts;
 pub mod system;
 pub mod type1;
+mod unicode_lookup;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 pub type FontId = u32;
+
+pub use pack::{FontPack, FontPackFormat, FontPackLimits};
+pub use provider::{
+    FontCharacter, FontProvider, FontProviderLimits, RegisteredFontId, RegisteredFontPackId,
+    RegisteredGlyph,
+};
+pub use resolution::DrawingGlyph;
 
 /// Glyph outline as a series of path commands.
 #[derive(Debug, Clone)]
@@ -251,7 +263,22 @@ impl LoadedFont {
                 dw2: (880.0, -1000.0),
                 variations: Vec::new(),
             }
-        } else if let Some(t1) = type1::Type1Font::parse(&font_data) {
+        } else {
+            Self::new_legacy_data(font_type, base_font, font_data, cid_widths)
+        }
+    }
+
+    /// Keep the legacy-program parser and malformed-font fallback out of the
+    /// common sfnt constructor's instruction and stack working set.
+    #[cold]
+    #[inline(never)]
+    fn new_legacy_data(
+        font_type: PdfFontType,
+        base_font: String,
+        font_data: Vec<u8>,
+        cid_widths: CidWidths,
+    ) -> Self {
+        if let Some(t1) = type1::Type1Font::parse(&font_data) {
             // Embedded Type 1 (PostScript) program — ttf-parser cannot parse it.
             let units_per_em = t1.units_per_em;
             Self {
@@ -351,38 +378,48 @@ impl LoadedFont {
             return;
         }
         // Unicode-coded CMaps resolve straight to GIDs — no CID table needed.
-        if self.unicode_coded() {
+        if self.unicode_coded() || self.legacy_substitute() {
             return;
         }
-        let Some(tu) = &self.to_unicode else { return };
+        // An absent or empty mapping must not mean CID == substitute GID.
+        // Legacy byte-encoded substitutes bypass this table explicitly.
+        self.cid_to_gid = Some(HashMap::new());
         let Some(data) = &self.font_data else { return };
         let Ok(face) = ttf_parser::Face::parse(data, self.face_index) else {
             return;
         };
-        let mut map = HashMap::new();
-        for (code, s) in tu.iter() {
-            let Some(ch) = s.chars().next() else { continue };
+        let mut map = HashMap::with_capacity(
+            self.to_unicode
+                .as_ref()
+                .map_or(0, |mapping| mapping.iter().len()),
+        );
+        let has_collection = self
+            .cid_cmap
+            .as_ref()
+            .and_then(|cm| cm.collection())
+            .is_some();
+        for (code, s) in self.to_unicode.iter().flat_map(|tu| tu.iter()) {
             // glyph_outline receives CIDs, so key the map by CID — under a
             // non-Identity encoding CMap the code is not the CID.
             let cid = match &self.cid_cmap {
-                Some(cm) if !cm.identity => {
-                    let len = if code > 0xFF { 2 } else { 1 };
-                    let cid = cm.code_to_cid(code, len);
-                    if cid == 0 && len == 1 {
-                        cm.code_to_cid(code, 2)
-                    } else {
-                        cid
-                    }
-                }
+                Some(cm) if !cm.identity => cm.raw_code_to_cid(code),
                 _ => code,
             };
             if cid == 0 || cid > u16::MAX as u32 {
                 continue;
             }
-            if let Some(g) = face.glyph_index(ch) {
-                if g.0 != 0 {
-                    map.insert(cid as u16, g.0);
-                }
+            // Explicit extraction overrides the canonical collection, even
+            // when it cannot be represented by one scalar or variation glyph.
+            if let Some(gid) =
+                FontCharacter::from_text(s).and_then(|ch| ch.mapped_glyph_index(&face))
+            {
+                map.insert(cid as u16, gid);
+            } else if has_collection {
+                // Prevent lazy canonical recovery from overriding an explicit
+                // ToUnicode miss or a multi-glyph extraction string.
+                map.insert(cid as u16, 0);
+            } else {
+                map.remove(&(cid as u16));
             }
         }
         if map.is_empty() {
@@ -390,9 +427,8 @@ impl LoadedFont {
                 "substitute {}: no ToUnicode-derived CID mapping; composite glyphs will drop",
                 self.base_font
             );
-        } else {
-            self.cid_to_gid = Some(map);
         }
+        self.cid_to_gid = Some(map);
     }
 
     pub fn new_standard(base_font: String) -> Option<Self> {
@@ -452,10 +488,10 @@ impl LoadedFont {
 
     /// True when the composite-font code values are Unicode and glyph ids in
     /// glyph runs are already real GIDs (no CID → GID mapping applies).
-    fn unicode_coded(&self) -> bool {
+    pub fn unicode_coded(&self) -> bool {
         self.cid_cmap
             .as_ref()
-            .map(|c| c.codes_are_unicode)
+            .map(|c| c.codes_are_unicode && (!c.is_authoritative() || self.is_substitute))
             .unwrap_or(false)
     }
 
@@ -480,7 +516,7 @@ impl LoadedFont {
     /// .notdef. Call after `cid_cmap` is attached.
     pub fn validate_cid_cmap(&mut self) {
         let Some(cm) = &self.cid_cmap else { return };
-        if !cm.codes_are_unicode {
+        if !cm.codes_are_unicode || cm.is_authoritative() || self.font_data.is_none() {
             return;
         }
         let has_unicode_cmap = self
@@ -504,16 +540,33 @@ impl LoadedFont {
     /// composite fonts. The advance is normalized to 1/1000 text-space units
     /// (the composite-font convention).
     pub fn unicode_glyph(&self, code: u32) -> Option<(u16, f64)> {
+        unicode_lookup::lookup::<true>(self, code)
+    }
+
+    /// Resolve a Unicode/legacy substitute code to a physical GID. ToUnicode
+    /// has priority, including raw UTF-16 source keys and variation sequences.
+    /// PDF advances must be obtained separately from the original CID.
+    pub fn composite_unicode_gid(&self, code: u32, raw_code: u32, length: u8) -> Option<u16> {
+        let character = if let Some(text) = self
+            .to_unicode
+            .as_ref()
+            .and_then(|map| map.lookup(raw_code).or_else(|| map.lookup(code)))
+        {
+            FontCharacter::from_text(text)?
+        } else {
+            self.cid_cmap
+                .as_ref()?
+                .decode_text(code, length)?
+                .font_character()?
+        };
+        if character.variation_selector.is_none() {
+            return unicode_lookup::lookup::<false>(self, character.character as u32)
+                .map(|(gid, _)| gid)
+                .filter(|&gid| gid != 0);
+        }
         let data = self.font_data.as_ref()?;
-        let mut face = ttf_parser::Face::parse(data, self.face_index).ok()?;
-        self.apply_variations(&mut face);
-        let ch = char::from_u32(code)?;
-        let gid = face.glyph_index(ch)?;
-        let adv = face
-            .glyph_hor_advance(gid)
-            .map(|a| a as f64 * 1000.0 / self.units_per_em)
-            .unwrap_or(500.0);
-        Some((gid.0, adv))
+        let face = ttf_parser::Face::parse(data, self.face_index).ok()?;
+        character.mapped_glyph_index(&face)
     }
 
     /// Configure OpenType variation axes from FontDescriptor values, so a
@@ -577,15 +630,7 @@ impl LoadedFont {
         let mut face = ttf_parser::Face::parse(data, self.face_index).ok()?;
         self.apply_variations(&mut face);
 
-        let actual_gid = if self.unicode_coded() || self.legacy_substitute() {
-            // Unicode-coded (and substituted legacy-CMap) composite fonts
-            // already carry real GIDs.
-            glyph_id
-        } else if let Some(map) = &self.cid_to_gid {
-            *map.get(&glyph_id)?
-        } else {
-            glyph_id
-        };
+        let actual_gid = self.drawing_gid_with_face(glyph_id, &face)?;
         let gid = ttf_parser::GlyphId(actual_gid);
 
         let mut builder = OutlineBuilder::new();
@@ -600,6 +645,38 @@ impl LoadedFont {
             commands: builder.commands,
             advance_width: advance,
         })
+    }
+
+    pub(crate) fn drawing_gid_with_face(
+        &self,
+        glyph_id: u16,
+        face: &ttf_parser::Face<'_>,
+    ) -> Option<u16> {
+        if self.unicode_coded() || self.legacy_substitute() {
+            return Some(glyph_id);
+        }
+        let Some(map) = &self.cid_to_gid else {
+            return Some(glyph_id);
+        };
+        if let Some(&gid) = map.get(&glyph_id) {
+            return (gid != 0).then_some(gid);
+        }
+        self.collection_substitute_gid(glyph_id, face)
+    }
+
+    /// Resolve only CIDs actually drawn. Scanning all 65,536 canonical CIDs
+    /// at every font load disproportionately penalizes small substitute pages.
+    #[inline(never)]
+    fn collection_substitute_gid(&self, cid: u16, face: &ttf_parser::Face<'_>) -> Option<u16> {
+        if !self.is_substitute || cid == 0 {
+            return None;
+        }
+        self.cid_cmap
+            .as_ref()?
+            .collection()?
+            .unicode(cid as u32)?
+            .font_character()?
+            .mapped_glyph_index(face)
     }
 
     /// Fraction of sampled, mapped CIDs whose embedded outline fails to resolve.
@@ -691,8 +768,8 @@ impl LoadedFont {
 
     /// Map a 1-byte character code to a glyph ID for a *simple* font, using the
     /// font's /Encoding (→ glyph name) and the embedded program's cmap/charset.
-    /// Returns `None` if no glyph data is available or no mapping is found
-    /// (callers typically fall back to treating the code as the GID).
+    /// Returns `None` if no glyph data is available or no mapping is found.
+    /// Character codes are not a valid fallback namespace for sfnt glyph IDs.
     pub fn code_to_gid(&self, code: u16) -> Option<u16> {
         // Embedded Type 1: resolve via the PDF /Encoding (or the font's built-in
         // encoding) to a glyph name, then to the synthetic Type 1 glyph id.
@@ -703,6 +780,7 @@ impl LoadedFont {
                     if let Some(g) = t1.gid_for_name(name) {
                         return Some(g);
                     }
+                    return None;
                 }
             }
             if let Some(name) = t1.builtin_name(code8) {
@@ -765,14 +843,10 @@ impl LoadedFont {
                     }
                 }
             }
-            // (1,0) Macintosh Roman: try the raw code, then the MacRoman slot
-            // of the /Encoding glyph name — the subtable is MacRoman-indexed,
-            // so a PDF encoding that differs from MacRoman needs the name detour.
+            // (1,0) Macintosh Roman: an explicit PDF encoding must resolve its
+            // glyph name through the MacRoman slot, not reuse an unrelated byte.
             for st in cmap.subtables {
                 if st.platform_id == ttf_parser::PlatformId::Macintosh && st.encoding_id == 0 {
-                    if let Some(g) = st.glyph_index(code as u32) {
-                        return Some(g.0);
-                    }
                     if let Some(mac) = self
                         .encoding
                         .as_ref()
@@ -783,11 +857,20 @@ impl LoadedFont {
                             return Some(g.0);
                         }
                     }
+                    if self.encoding.is_none() || self.symbolic {
+                        if let Some(g) = st.glyph_index(code as u32) {
+                            return Some(g.0);
+                        }
+                    }
                 }
             }
         }
 
-        // 4. Treat the code as Latin-1 and consult the Unicode cmap.
+        // 4. Only an unspecified encoding permits the Latin-1 fallback. A
+        // declared missing glyph must not turn into a different encoded letter.
+        if self.encoding.is_some() && !self.symbolic {
+            return None;
+        }
         if let Some(g) = face.glyph_index(code8 as char) {
             return Some(g.0);
         }
@@ -865,17 +948,8 @@ impl LoadedFont {
                         .and_then(|tu| tu.lookup(raw_code).or_else(|| tu.lookup(code)))
                     {
                         out.push_str(s);
-                    } else if cm.codes_are_unicode {
-                        if let Some(c) = char::from_u32(code) {
-                            out.push(c);
-                        }
-                    } else if cm.is_legacy() {
-                        if let Some(c) = cm
-                            .decode_to_unicode(code, len as u8)
-                            .and_then(char::from_u32)
-                        {
-                            out.push(c);
-                        }
+                    } else if let Some(value) = cm.decode_text(code, len as u8) {
+                        value.push_to(&mut out);
                     }
                 }
                 return out;
@@ -1831,6 +1905,8 @@ pub struct FontCache {
     next_id: FontId,
     bytes_used: u64,
     shared_programs: HashSet<usize>,
+    provider: Option<Arc<FontProvider>>,
+    resolution: Option<Box<resolution::ResolutionCache>>,
 }
 
 impl FontCache {
@@ -1847,7 +1923,20 @@ impl FontCache {
             next_id: 0,
             bytes_used: 0,
             shared_programs: HashSet::with_capacity(capacity),
+            provider: None,
+            resolution: None,
         }
+    }
+
+    /// Carry the document's provider into nested Form XObject font loading.
+    pub fn with_provider(mut self, provider: Arc<FontProvider>) -> Self {
+        self.provider = Some(provider);
+        self.resolution = None;
+        self
+    }
+
+    pub fn provider(&self) -> Option<&Arc<FontProvider>> {
+        self.provider.as_ref()
     }
 
     /// Compatibility shim for the former capacity-limited cache constructor.
@@ -2106,6 +2195,7 @@ mod tests {
         // is where the (1,0) subtable indexes it.
         let mut glyph_ids = [0u8; 256];
         glyph_ids[0xA5] = 7;
+        glyph_ids[0xB4] = 9; // MacRoman yen, distinct from bullet.
         let cmap = build_cmap(&[(1, 0, cmap_format0(&glyph_ids))]);
         let mut font = font_with_cmap(cmap);
 
@@ -2114,8 +2204,8 @@ mod tests {
 
         font.encoding = Some(encoding::Encoding::from_base(&encoding::WIN_ANSI_ENCODING));
         assert_eq!(font.code_to_gid(0x95), Some(7));
-        // Raw-code hits still win where the PDF encoding agrees with MacRoman.
-        assert_eq!(font.code_to_gid(0xA5), Some(7));
+        // WinAnsi 0xA5 means yen; reusing raw MacRoman 0xA5 would draw bullet.
+        assert_eq!(font.code_to_gid(0xA5), Some(9));
     }
 
     #[test]

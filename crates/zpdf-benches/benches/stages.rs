@@ -145,7 +145,12 @@ fn render_stage(c: &mut Criterion) {
                                 .with_images(&s.image_cache)
                         },
                         |mut r| r.render_display_list(&s.dl, s.scale).expect("render"),
-                        BatchSize::SmallInput,
+                        // A full RGBA page is a large output. Retaining a
+                        // sample-dependent batch changes allocation reuse
+                        // and can dominate the renderer's measured cost.
+                        // Keep renderer setup and output destruction outside
+                        // timing, with only one output live per iteration.
+                        BatchSize::PerIteration,
                     )
                 },
             );

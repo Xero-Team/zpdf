@@ -86,6 +86,22 @@ All methods are synchronous (the wasm module doesn't yield back to JS mid-page).
 
 ## Limitations
 
+Application fonts can be supplied with `Pdf.register_font(bytes, faceIndex,
+alias)` or lazily with `Pdf.register_zlib_font(bytes, faceIndex, alias,
+decodedLimit)`. Raw TTF/OTF/TTC does not need decompression. The optional
+[`font-packs.mjs`](www/font-packs.mjs) host helper fetches a caller-selected
+HTTPS zlib pack, verifies its encoded SHA-256, persists it in CacheStorage and
+supports verified offline reuse. Rebuild/redraw the page after registration.
+See the [provider guide](../../docs/guides/font-provider.md) for memory budgets
+and the distinction between whole-face substitution and per-glyph fallback.
+
+```js
+import { registerFontPack } from "./font-packs.mjs";
+// source is application configuration: {url, sha256, alias, decodedLimit}.
+await registerFontPack(pdf, source);
+const bitmap = pdf.render_page(0, 2);
+```
+
 - Wall-clock anti-hang budgets are disabled (bare wasm32 has no `Instant::now`); the deterministic budgets (operator/command counts, pixel caps) in `ParseLimits` still bound adversarial inputs.
 - No GPU backend (WebGPU is API-compatible but the buffer/layout code assumes native-sized pointers; a `wasm32` build of `zpdf-render-wgpu` is planned but not wired yet).
 - Signature verification works (p256/p384 via RustCrypto), but CRL/OCSP revocation checks aren't implemented.

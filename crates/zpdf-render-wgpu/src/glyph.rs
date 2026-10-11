@@ -75,19 +75,26 @@ pub fn render_glyph_run(rec: &mut PageRecorder, fonts: &FontCache, map: &PageMap
     };
 
     for g in &run.glyphs {
+        let atlas_key = atlas_key_size.map(|(x_millipx_per_em, y_millipx_per_em)| GlyphKey {
+            font_id: run.font_id,
+            glyph_id: g.glyph_id,
+            x_millipx_per_em,
+            y_millipx_per_em,
+        });
+        if let Some(entry) = atlas_key.and_then(|key| rec.glyph_atlas.lookup(key)) {
+            let origin = outline_to_pixel(0.0, 0.0, (g.x, g.y), tm, &x);
+            let quad =
+                glyph_atlas::glyph_quad(entry, rec.glyph_atlas.size(), (origin.x, origin.y), color);
+            rec.add_glyph_quad(quad);
+            continue;
+        }
         let Some(outline) = font.glyph_outline(g.glyph_id) else {
             continue;
         };
 
-        if let Some((x_millipx_per_em, y_millipx_per_em)) = atlas_key_size {
-            let key = GlyphKey {
-                font_id: run.font_id,
-                glyph_id: g.glyph_id,
-                x_millipx_per_em,
-                y_millipx_per_em,
-            };
+        if let Some(key) = atlas_key {
             if let Some(entry) = rec.glyph_atlas.get_or_rasterize(key, &outline, x.upem) {
-                let origin = outline_to_pixel(0.0, 0.0, g.x, tm, &x);
+                let origin = outline_to_pixel(0.0, 0.0, (g.x, g.y), tm, &x);
                 let quad = glyph_atlas::glyph_quad(
                     entry,
                     rec.glyph_atlas.size(),
@@ -99,7 +106,7 @@ pub fn render_glyph_run(rec: &mut PageRecorder, fonts: &FontCache, map: &PageMap
             }
         }
 
-        if let Some(path) = build_outline_path(&outline, g.x, tm, &x) {
+        if let Some(path) = build_outline_path(&outline, (g.x, g.y), tm, &x) {
             if let Some(mesh) = fill_lyon_path(&path, FillRule::NonZero, color) {
                 rec.add_mesh(mesh);
             }
@@ -158,14 +165,14 @@ fn glyph_atlas_enabled() -> bool {
 fn outline_to_pixel(
     gx: f64,
     gy: f64,
-    glyph_x: f32,
+    glyph_offset: (f32, f32),
     tm: &Matrix,
     x: &GlyphXform,
 ) -> lyon::math::Point {
-    // Th (h_scale) multiplies the glyph shape x only; the advance in glyph_x
+    // Th (h_scale) multiplies the glyph shape x only; the positioned x offset
     // already includes it.
-    let tx = (gx as f32 / x.upem * x.font_size * x.h_scale + glyph_x) as f64;
-    let ty = (gy as f32 / x.upem * x.font_size) as f64;
+    let tx = (gx as f32 / x.upem * x.font_size * x.h_scale + glyph_offset.0) as f64;
+    let ty = (gy as f32 / x.upem * x.font_size + glyph_offset.1) as f64;
     let page_x = tm.a * tx + tm.c * ty + tm.e;
     let page_y = tm.b * tx + tm.d * ty + tm.f;
     let px = (page_x as f32 - x.map.x0) * x.map.scale;
@@ -175,14 +182,14 @@ fn outline_to_pixel(
 
 fn build_outline_path(
     outline: &GlyphOutline,
-    glyph_x: f32,
+    glyph_offset: (f32, f32),
     tm: &Matrix,
     x: &GlyphXform,
 ) -> Option<LyonPath> {
     if outline.commands.is_empty() {
         return None;
     }
-    let p = |gx: f64, gy: f64| outline_to_pixel(gx, gy, glyph_x, tm, x);
+    let p = |gx: f64, gy: f64| outline_to_pixel(gx, gy, glyph_offset, tm, x);
     let mut b = LyonPath::builder();
     let mut open = false;
     for cmd in &outline.commands {
@@ -257,9 +264,15 @@ fn render_type3(
         for cmd in &glyph_dl.commands {
             match cmd {
                 RenderCommand::FillPath { path, rule, .. } => {
-                    if let Some(p) =
-                        build_type3_path(path, &font_matrix, font_size, h_scale, tm, g.x, map)
-                    {
+                    if let Some(p) = build_type3_path(
+                        path,
+                        &font_matrix,
+                        font_size,
+                        h_scale,
+                        tm,
+                        (g.x, g.y),
+                        map,
+                    ) {
                         if let Some(mesh) = fill_lyon_path(&p, *rule, color) {
                             rec.add_mesh(mesh);
                         }
@@ -270,9 +283,15 @@ fn render_type3(
                     // font size, with a 0.5px floor.
                     let width = (style.width * font_matrix[0].abs() as f32 * font_size * map.scale)
                         .max(0.5);
-                    if let Some(p) =
-                        build_type3_path(path, &font_matrix, font_size, h_scale, tm, g.x, map)
-                    {
+                    if let Some(p) = build_type3_path(
+                        path,
+                        &font_matrix,
+                        font_size,
+                        h_scale,
+                        tm,
+                        (g.x, g.y),
+                        map,
+                    ) {
                         let opts = StrokeOptions::tolerance(TOLERANCE).with_line_width(width);
                         if let Some(mesh) = stroke_lyon_path(&p, &opts, color) {
                             rec.add_mesh(mesh);
@@ -286,7 +305,7 @@ fn render_type3(
 }
 
 /// Reproduce `CpuRenderer::type3_to_pixel`: glyph space -> text space (FontMatrix)
-/// -> scale by font size -> add glyph x -> page space (matrix) -> device pixels.
+/// -> scale by font size -> add glyph offsets -> page space -> device pixels.
 #[allow(clippy::too_many_arguments)]
 fn type3_to_pixel(
     gx: f64,
@@ -295,13 +314,13 @@ fn type3_to_pixel(
     font_size: f32,
     h_scale: f32,
     tm: &Matrix,
-    glyph_x: f32,
+    glyph_offset: (f32, f32),
     map: &PageMap,
 ) -> lyon::math::Point {
     let tx = font_matrix[0] * gx + font_matrix[2] * gy + font_matrix[4];
     let ty = font_matrix[1] * gx + font_matrix[3] * gy + font_matrix[5];
-    let tx = tx * font_size as f64 * h_scale as f64 + glyph_x as f64;
-    let ty = ty * font_size as f64;
+    let tx = tx * font_size as f64 * h_scale as f64 + glyph_offset.0 as f64;
+    let ty = ty * font_size as f64 + glyph_offset.1 as f64;
     let page_x = tm.a * tx + tm.c * ty + tm.e;
     let page_y = tm.b * tx + tm.d * ty + tm.f;
     let px = (page_x as f32 - map.x0) * map.scale;
@@ -316,7 +335,7 @@ fn build_type3_path(
     font_size: f32,
     h_scale: f32,
     tm: &Matrix,
-    glyph_x: f32,
+    glyph_offset: (f32, f32),
     map: &PageMap,
 ) -> Option<LyonPath> {
     if path.elements.is_empty() {
@@ -330,7 +349,7 @@ fn build_type3_path(
             font_size,
             h_scale,
             tm,
-            glyph_x,
+            glyph_offset,
             map,
         )
     };
@@ -401,7 +420,7 @@ mod tests {
         };
         // glyph (500, 200) font units: tx = 5, ty = 2; page = (55, 52);
         // px = 110; py = (100-52)*2 = 96.
-        let p = outline_to_pixel(500.0, 200.0, 0.0, &tm, &x);
+        let p = outline_to_pixel(500.0, 200.0, (0.0, 0.0), &tm, &x);
         assert_eq!(p.x, 110.0);
         assert_eq!(p.y, 96.0);
     }
@@ -426,7 +445,7 @@ mod tests {
             f: 50.0,
         };
         // ty = 2; page_y = -1*2 + 50 = 48; py = (100-48)*2 = 104.
-        let p = outline_to_pixel(500.0, 200.0, 0.0, &tm, &x);
+        let p = outline_to_pixel(500.0, 200.0, (0.0, 0.0), &tm, &x);
         assert_eq!(p.x, 110.0);
         assert_eq!(p.y, 104.0);
     }
@@ -450,7 +469,7 @@ mod tests {
         };
         // tx = 500/1000*10*(-1) + 0 = -5; page_x = 45; px = 90.
         // ty unaffected: 2; page_y = 52; py = (100-52)*2 = 96.
-        let p = outline_to_pixel(500.0, 200.0, 0.0, &tm, &x);
+        let p = outline_to_pixel(500.0, 200.0, (0.0, 0.0), &tm, &x);
         assert_eq!(p.x, 90.0);
         assert_eq!(p.y, 96.0);
     }
@@ -477,7 +496,7 @@ mod tests {
             f: 50.0,
         };
         // page = (55, 52): px = (55-20)*2 = 70; py = (110-52)*2 = 116.
-        let p = outline_to_pixel(500.0, 200.0, 0.0, &tm, &x);
+        let p = outline_to_pixel(500.0, 200.0, (0.0, 0.0), &tm, &x);
         assert_eq!(p.x, 70.0);
         assert_eq!(p.y, 116.0);
     }

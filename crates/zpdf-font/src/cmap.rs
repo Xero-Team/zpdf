@@ -17,6 +17,8 @@
 //! malformed input — every byte access is bounds-checked and unparsable tokens
 //! are skipped.
 
+use crate::adobe_cmaps::{self, PredefinedMap, SourceEncoding};
+pub use crate::adobe_cmaps::{CMapUnicode, CharacterCollection};
 use std::collections::HashMap;
 
 const MAX_CMAP_ENTRIES: usize = 65_536;
@@ -77,7 +79,7 @@ impl ToUnicodeMap {
     }
 
     /// Iterate over all (code, unicode string) mappings.
-    pub fn iter(&self) -> impl Iterator<Item = (u32, &str)> {
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = (u32, &str)> {
         self.map.iter().map(|(&code, s)| (code, s.as_str()))
     }
 
@@ -358,29 +360,6 @@ impl LegacyEncoding {
         None
     }
 
-    /// Byte-length codespace ranges `(len, lo, hi)` used to segment a show-text
-    /// byte string into codes for this encoding.
-    fn codespace(self) -> &'static [(u8, u32, u32)] {
-        match self {
-            // EUC: 1-byte ASCII + 2-byte lead/trail in 0xA1..=0xFE.
-            LegacyEncoding::EucCn => &[(1, 0x00, 0x80), (2, 0xA1A1, 0xFEFE)],
-            // EUC-JP additionally has SS2 half-width kana (0x8E 0xA1..=0xDF).
-            LegacyEncoding::EucJp => &[(1, 0x00, 0x80), (2, 0x8EA1, 0x8EDF), (2, 0xA1A1, 0xFEFE)],
-            // GBK / Big5 / UHC: 1-byte ASCII + 2-byte lead 0x81..=0xFE.
-            LegacyEncoding::Gbk | LegacyEncoding::Big5 | LegacyEncoding::EucKr => {
-                &[(1, 0x00, 0x80), (2, 0x8140, 0xFEFE)]
-            }
-            // Shift-JIS: 1-byte ASCII + 1-byte half-width kana (0xA1..=0xDF) +
-            // 2-byte lead 0x81..=0x9F and 0xE0..=0xFC.
-            LegacyEncoding::ShiftJis => &[
-                (1, 0x00, 0x80),
-                (1, 0xA1, 0xDF),
-                (2, 0x8140, 0x9FFC),
-                (2, 0xE040, 0xFCFC),
-            ],
-        }
-    }
-
     /// Decode a single-byte code: ASCII identity for every encoding, plus the
     /// Shift-JIS half-width katakana block (0xA1..=0xDF → U+FF61..=U+FF9F).
     fn decode_single(self, b: u8) -> Option<u32> {
@@ -410,14 +389,16 @@ impl LegacyEncoding {
 pub struct CidCMap {
     /// Codespace ranges as (byte_len, lo, hi).
     codespace: Vec<(u8, u32, u32)>,
-    /// cidrange entries as (byte_len, lo, hi, first_cid).
-    cid_ranges: Vec<(u8, u32, u32, u32)>,
-    /// cidchar singles (keyed by code).
-    cid_chars: HashMap<u32, u32>,
+    /// cidrange entries as (byte_len, lo, hi, first_cid, declaration).
+    cid_ranges: Vec<(u8, u32, u32, u32, usize)>,
+    /// Length-sensitive cidchar singles and their declaration order.
+    cid_chars: HashMap<(u8, u32), (u32, usize)>,
+    predefined: Option<&'static PredefinedMap>,
+    collection: Option<CharacterCollection>,
     /// Writing mode: 0 horizontal, 1 vertical.
     pub wmode: u8,
-    /// Codes are UTF-16BE/UCS-2 Unicode (the predefined UniXX-UCS2/UTF16
-    /// families): glyphs resolve via the font's Unicode cmap, not CID → GID.
+    /// Source codes are UTF-16BE/UCS-2 Unicode. Authoritative predefined maps
+    /// still resolve them to collection CIDs for embedded glyphs and metrics.
     pub codes_are_unicode: bool,
     /// CID = code (the Identity family; also the lenient fallback).
     pub identity: bool,
@@ -428,8 +409,8 @@ pub struct CidCMap {
     /// `90ms-RKSJ`, `KSC-EUC`, …) and the national encoding it uses. For a
     /// *substituted* (non-embedded) font the code is decoded to Unicode via
     /// [`Self::decode_to_unicode`] and the glyph resolves through the system
-    /// face's Unicode cmap; the 1-byte ASCII → CID range stays installed in
-    /// `cid_ranges` for Latin advances. `None` for non-legacy CMaps.
+    /// face's Unicode cmap. Named maps use pinned Adobe mappings; this field
+    /// remains available for manually configured legacy decoder compatibility.
     pub legacy: Option<LegacyEncoding>,
 }
 
@@ -442,28 +423,13 @@ impl CidCMap {
         }
     }
 
-    /// Build a predefined legacy byte-encoded CMap for `enc`.
-    ///
-    /// The encoding's codespace segments the show-text bytes; the 1-byte ASCII →
-    /// CID range (CID = code − 0x1F, i.e. 0x20 → CID 1 … 0x7E → CID 95) gives
-    /// reasonable /W-based Latin advances — the Adobe CJK collections (GB1 /
-    /// CNS1 / Japan1 / Korea1) all place the proportional ASCII set at low CIDs
-    /// starting near 0x20. CJK codes carry no CID range, so they fall to /DW
-    /// (full width); their glyphs come from the substituted face via Unicode.
-    fn legacy(enc: LegacyEncoding, wmode: u8) -> Self {
-        Self {
-            wmode,
-            legacy: Some(enc),
-            codespace: enc.codespace().to_vec(),
-            cid_ranges: vec![(1, 0x20, 0x7E, 1)],
-            ..Default::default()
-        }
-    }
-
     /// True for a predefined legacy byte-encoded CMap (GB / GBK / Big5 /
     /// Shift-JIS / EUC-JP / KSC).
     pub fn is_legacy(&self) -> bool {
         self.legacy.is_some()
+            || self
+                .predefined
+                .is_some_and(|map| map.encoding == SourceEncoding::Legacy)
     }
 
     /// Resolve a predefined CMap by name. Identity, the Unicode families, and
@@ -474,42 +440,82 @@ impl CidCMap {
         if name == "Identity-H" || name == "Identity-V" {
             return Some(Self::identity(wmode));
         }
-        let unicode_family = (name.starts_with("UniGB")
-            || name.starts_with("UniCNS")
-            || name.starts_with("UniJIS")
-            || name.starts_with("UniKS")
-            || name.starts_with("UniAKR"))
-            && (name.contains("UCS2") || name.contains("UTF16"));
-        if unicode_family {
-            return Some(Self {
-                wmode,
-                codes_are_unicode: true,
-                utf16: name.contains("UTF16"),
-                ..Default::default()
-            });
-        }
-        if let Some(enc) = LegacyEncoding::from_cmap_name(name) {
-            return Some(Self::legacy(enc, wmode));
-        }
-        None
+        let map = adobe_cmaps::predefined(name)?;
+        Some(Self {
+            wmode: map.wmode,
+            codes_are_unicode: map.encoding != SourceEncoding::Legacy,
+            utf16: map.encoding == SourceEncoding::Utf16,
+            legacy: (map.encoding == SourceEncoding::Legacy)
+                .then(|| LegacyEncoding::from_cmap_name(name))
+                .flatten(),
+            predefined: Some(map),
+            collection: Some(map.collection),
+            ..Default::default()
+        })
     }
 
-    /// Decode a code (with its byte length) to a Unicode scalar for a legacy
-    /// byte-encoded CMap: 1-byte codes are ASCII (plus Shift-JIS half-width
-    /// kana), 2-byte codes go through the encoding's baked table. `None` for
-    /// non-legacy CMaps or undefined codes.
-    pub fn decode_to_unicode(&self, code: u32, len: u8) -> Option<u32> {
-        let enc = self.legacy?;
-        if len == 1 {
-            return enc.decode_single(code as u8);
+    /// True when code-to-CID semantics come from a pinned Adobe resource.
+    pub fn is_authoritative(&self) -> bool {
+        self.predefined.is_some()
+    }
+
+    pub fn collection(&self) -> Option<CharacterCollection> {
+        self.collection
+    }
+
+    /// Attach CIDSystemInfo for Identity/custom CMaps without overriding a
+    /// named CMap's authoritative collection.
+    pub fn set_collection(&mut self, ordering: &str) {
+        if self.collection.is_none() {
+            self.collection = CharacterCollection::from_ordering(ordering);
         }
-        enc.decode_double(code as u16).map(|c| c as u32)
+    }
+
+    pub fn decode_text(&self, code: u32, len: u8) -> Option<CMapUnicode> {
+        if let Some(cid) = self.explicit_cid(code, len) {
+            return self.collection?.unicode(cid);
+        }
+        if let Some(map) = self.predefined {
+            return map
+                .lookup(code, len)
+                .or_else(|| map.source_unicode(code, len));
+        }
+        if self.codes_are_unicode {
+            return char::from_u32(code).map(CMapUnicode::Scalar);
+        }
+        if let Some(collection) = self.collection {
+            return collection.unicode(self.code_to_cid(code, len));
+        }
+        let encoding = self.legacy?;
+        let character = if len == 1 {
+            encoding.decode_single(code as u8).and_then(char::from_u32)
+        } else if len == 2 {
+            encoding.decode_double(code as u16)
+        } else {
+            None
+        };
+        character.map(CMapUnicode::Scalar)
+    }
+
+    /// Decode a code to one Unicode scalar. Use `decode_text` when complete
+    /// canonical strings, including variation selectors, are required.
+    pub fn decode_to_unicode(&self, code: u32, len: u8) -> Option<u32> {
+        if self.cid_chars.is_empty() && self.cid_ranges.is_empty() {
+            if let Some(map) = self.predefined {
+                return map
+                    .lookup_scalar(code, len)
+                    .or_else(|| map.source_unicode(code, len)?.scalar());
+            }
+        }
+        self.decode_text(code, len)?.scalar()
     }
 
     /// Parse an embedded CMap stream: codespacerange, cidrange, cidchar,
-    /// /WMode, and `usecmap` (Identity bases only). Never panics.
+    /// /WMode, and `usecmap` with named Adobe or Identity bases. Never panics.
     pub fn parse(data: &[u8]) -> Self {
         let mut cmap = CidCMap::default();
+        let mut explicit_wmode = false;
+        let mut declaration = 0;
         let tokens = tokenize(data);
         let mut i = 0usize;
 
@@ -553,7 +559,9 @@ impl CidCMap {
                                             low,
                                             high,
                                             ascii_to_u32(cid),
+                                            declaration,
                                         ));
+                                        declaration += 1;
                                     }
                                 }
                                 i += 3;
@@ -567,12 +575,17 @@ impl CidCMap {
                     while i + 1 < tokens.len() {
                         match (&tokens[i], &tokens[i + 1]) {
                             (Token::HexString(code), Token::Number(cid)) => {
-                                if code.len() <= 4
+                                if (1..=4).contains(&code.len())
                                     && (cmap.cid_chars.len() < MAX_CMAP_ENTRIES
-                                        || cmap.cid_chars.contains_key(&bytes_to_code(code)))
+                                        || cmap
+                                            .cid_chars
+                                            .contains_key(&(code.len() as u8, bytes_to_code(code))))
                                 {
-                                    cmap.cid_chars
-                                        .insert(bytes_to_code(code), ascii_to_u32(cid));
+                                    cmap.cid_chars.insert(
+                                        (code.len() as u8, bytes_to_code(code)),
+                                        (ascii_to_u32(cid), declaration),
+                                    );
+                                    declaration += 1;
                                 }
                                 i += 2;
                             }
@@ -588,15 +601,27 @@ impl CidCMap {
                         _ => None,
                     });
                     if let Some(base) = base {
+                        for &range in base.codespaces() {
+                            if !cmap.codespace.contains(&range) {
+                                cmap.codespace.push(range);
+                            }
+                        }
                         cmap.identity |= base.identity;
                         cmap.codes_are_unicode |= base.codes_are_unicode;
                         cmap.utf16 |= base.utf16;
+                        cmap.predefined = base.predefined;
+                        cmap.collection = base.collection;
+                        cmap.legacy = base.legacy;
+                        if !explicit_wmode {
+                            cmap.wmode = base.wmode;
+                        }
                     }
                     i += 1;
                 }
                 Token::Name(n) if n == b"WMode" => {
                     if let Some(Token::Number(v)) = tokens.get(i + 1) {
                         cmap.wmode = (ascii_to_u32(v) == 1) as u8;
+                        explicit_wmode = true;
                         i += 1;
                     }
                     i += 1;
@@ -608,7 +633,11 @@ impl CidCMap {
         }
 
         // A CMap with no mappings at all degrades to Identity (lenient).
-        if cmap.cid_ranges.is_empty() && cmap.cid_chars.is_empty() && !cmap.codes_are_unicode {
+        if cmap.cid_ranges.is_empty()
+            && cmap.cid_chars.is_empty()
+            && !cmap.codes_are_unicode
+            && cmap.predefined.is_none()
+        {
             cmap.identity = true;
         }
         cmap
@@ -633,7 +662,8 @@ impl CidCMap {
             let len = bytes.len().min(2);
             return (bytes_to_code(&bytes[..len]), len);
         }
-        if self.codespace.is_empty() {
+        let spaces = self.codespaces();
+        if spaces.is_empty() {
             let len = bytes.len().min(2);
             return (bytes_to_code(&bytes[..len]), len);
         }
@@ -643,15 +673,14 @@ impl CidCMap {
                 break;
             }
             let v = bytes_to_code(&bytes[..want]);
-            for &(len, lo, hi) in &self.codespace {
+            for &(len, lo, hi) in spaces {
                 if len as usize == want && v >= lo && v <= hi {
                     return (v, want);
                 }
             }
         }
         // No range matched: consume the shortest declared length.
-        let min_len = self
-            .codespace
+        let min_len = spaces
             .iter()
             .map(|&(l, _, _)| l as usize)
             .min()
@@ -662,19 +691,65 @@ impl CidCMap {
 
     /// Map a code (with its byte length) to a CID.
     pub fn code_to_cid(&self, code: u32, len: u8) -> u32 {
-        if let Some(&cid) = self.cid_chars.get(&code) {
+        if let Some(cid) = self.explicit_cid(code, len) {
             return cid;
         }
-        for &(rlen, lo, hi, first) in &self.cid_ranges {
-            if rlen == len && code >= lo && code <= hi {
-                return first.checked_add(code - lo).unwrap_or(0);
-            }
+        if let Some(map) = self.predefined {
+            return map.lookup_cid(code, len).map_or(0, u32::from);
         }
         if self.identity {
             code
         } else {
             0
         }
+    }
+
+    /// Resolve a packed source key from ToUnicode, using this CMap's declared
+    /// code lengths instead of assuming that every non-ASCII key is two bytes.
+    pub fn raw_code_to_cid(&self, raw: u32) -> u32 {
+        let bytes = raw.to_be_bytes();
+        for length in 1..=4 {
+            if length < 4 && raw >= (1u32 << (length * 8)) {
+                continue;
+            }
+            let source = &bytes[4 - length..];
+            let (code, consumed) = self.next_code(source);
+            if consumed != length {
+                continue;
+            }
+            let cid = self.code_to_cid(code, length as u8);
+            if cid != 0 {
+                return cid;
+            }
+        }
+        0
+    }
+
+    fn codespaces(&self) -> &[(u8, u32, u32)] {
+        if self.codespace.is_empty() {
+            self.predefined.map_or(&[], |map| map.codespaces)
+        } else {
+            &self.codespace
+        }
+    }
+
+    fn explicit_cid(&self, code: u32, len: u8) -> Option<u32> {
+        let code = if self.utf16 && len == 4 && (0x10000..=0x10FFFF).contains(&code) {
+            let scalar = code - 0x10000;
+            ((0xD800 + (scalar >> 10)) << 16) | (0xDC00 + (scalar & 1023))
+        } else {
+            code
+        };
+        let single = self.cid_chars.get(&(len, code));
+        for &(rlen, lo, hi, first, declaration) in self.cid_ranges.iter().rev() {
+            if single.is_some_and(|&(_, order)| order > declaration) {
+                break;
+            }
+            if rlen == len && code >= lo && code <= hi {
+                return Some(first.checked_add(code - lo).unwrap_or(0));
+            }
+        }
+        single.map(|&(cid, _)| cid)
     }
 }
 
@@ -1189,7 +1264,7 @@ mod tests {
     #[test]
     fn overflowing_cid_range_is_invalid_not_a_panic() {
         let cmap = CidCMap {
-            cid_ranges: vec![(1, 0, 1, u32::MAX)],
+            cid_ranges: vec![(1, 0, 1, u32::MAX, 0)],
             ..CidCMap::default()
         };
         assert_eq!(cmap.code_to_cid(1, 1), 0);

@@ -23,6 +23,11 @@ bench-long = []
 zpdf = { workspace = true, default-features = false }
 zpdf-core.workspace = true
 zpdf-display-list.workspace = true
+zpdf-font.workspace = true
+zpdf-document.workspace = true
+zpdf-writer.workspace = true
+ttf-parser.workspace = true
+flate2.workspace = true
 # Corpus-manifest integrity (see `src/manifest.rs`). The real-PDF corpus lives
 # under `tests/`, which the root .gitignore excludes, so its identity is
 # recorded as sha256 in a checked-in manifest instead. `sha2` is already a
@@ -45,6 +50,7 @@ criterion = "0.8"
 # CLI, and no library crate should take a threading dependency before that
 # measurement exists.
 rayon = "1"
+zpdf-svg-export.workspace = true
 
 # Bench targets. `harness = false` lets criterion own `main()`, and one target
 # per concern means `cargo bench --bench stages` runs just that one.
@@ -55,6 +61,43 @@ rayon = "1"
 #   longform — whole documents; gated behind `bench-long`, never in a default run
 [[bench]]
 name = "stages"
+harness = false
+
+[[bench]]
+name = "fonts"
+harness = false
+
+[[bench]]
+name = "font_provider"
+harness = false
+
+[[bench]]
+name = "font_diagnostics"
+harness = false
+
+[[bench]]
+name = "font_packs"
+harness = false
+
+[[bench]]
+name = "font_coverage"
+harness = false
+
+[[bench]]
+name = "font_fallback"
+harness = false
+
+[[bench]]
+name = "font_writer_fallback"
+harness = false
+
+[[bench]]
+name = "font_gpu"
+harness = false
+required-features = ["gpu-render"]
+
+[[bench]]
+name = "font_cmaps"
 harness = false
 
 [[bench]]

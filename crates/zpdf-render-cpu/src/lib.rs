@@ -845,11 +845,12 @@ impl<'a> CpuRenderer<'a> {
             return self.tock(t, |s| &mut s.clip_ns);
         }
 
-        let Some(skia_path) = self.build_skia_path(path) else {
+        let skia_path = self.build_skia_path(path);
+        if skia_path.is_none() && !path.is_empty() {
             // A non-finite/out-of-range clip path: keep push/pop balanced.
             self.clip_stack.push(ClipFrame::Skipped);
             return self.tock(t, |s| &mut s.clip_ns);
-        };
+        }
 
         let mut mask = match tiny_skia::Mask::new(pw, ph) {
             Some(m) => m,
@@ -861,18 +862,20 @@ impl<'a> CpuRenderer<'a> {
         self.clip_pixel_spent += pw as u64 * ph as u64;
         self.clip_mask_bytes += mask_bytes;
 
-        mask.fill_path(
-            &skia_path,
-            Self::fill_rule_to_skia(rule),
-            true, // anti-alias clip edges (fills/strokes are AA'd too)
-            tiny_skia::Transform::identity(),
-        );
+        if let Some(skia_path) = &skia_path {
+            mask.fill_path(
+                skia_path,
+                Self::fill_rule_to_skia(rule),
+                true, // anti-alias clip edges (fills/strokes are AA'd too)
+                tiny_skia::Transform::identity(),
+            );
+        }
 
         // Intersect with the current clip, but only across the new clip path's
         // device bbox: outside it the new mask is already 0, so the intersection
         // there is 0 too and need not be touched. This turns the per-clip
         // intersection from O(raster) into O(clip bbox).
-        if let Some(ref current) = self.current_clip {
+        if let (Some(current), Some(skia_path)) = (&self.current_clip, &skia_path) {
             let b = skia_path.bounds();
             let w = pw as usize;
             let h = ph as usize;
@@ -903,7 +906,15 @@ impl<'a> CpuRenderer<'a> {
         // loop, so outside the loop the mask keeps the new path's own coverage;
         // a region that must contain every pixel the active mask can be
         // non-zero in therefore has to come from the new clip alone.
-        self.clip_bounds = Some(Self::drawn_extent(skia_path.bounds(), 1.0, pw, ph));
+        self.clip_bounds = Some(skia_path.as_ref().map_or(
+            PaintedBounds {
+                x0: 0,
+                y0: 0,
+                x1: 0,
+                y1: 0,
+            },
+            |path| Self::drawn_extent(path.bounds(), 1.0, pw, ph),
+        ));
         self.tock(t, |s| &mut s.clip_ns);
         self.count(1, |s| &mut s.clips_pushed);
     }

@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+- Add an optional shared `FontProvider` for validated in-memory TTF/OTF/TTC
+  faces, bounded registration, PDF font aliases and memory-only substitution.
+  Page and nested Form font loading share the provider; late registration
+  refreshes substituted fonts without invalidating existing page caches.
+- Add portable font and provider benchmarks with glyph/placement/ink checks,
+  complete case inventories, archived executables and strict comparison tools.
+- Add bounded lazy raw/zlib font packs, native and WASM registration, optional
+  host download caches with pinned SHA-256 identities and offline reuse, and
+  real licensed CJK rendering fixtures with dedicated pack benchmarks.
+- Resolve missing glyphs through registered coverage while preserving PDF
+  advances, vertical origins and extraction; split drawing faces and combine
+  text clipping outlines. Bound page/provider decisions and refresh misses on
+  registration. Honor positioned glyph y offsets in GPU rendering.
+
 ## 0.13.0 — PDF/X + PDF/A-3b + PDF/UA-2 validation, dependency refresh
 
 ### PDF/X-1a/3/4/6 conformance validation

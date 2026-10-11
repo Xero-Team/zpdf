@@ -10,7 +10,39 @@
 #![allow(dead_code)]
 
 use criterion::{BenchmarkGroup, BenchmarkId, Criterion};
+use std::sync::OnceLock;
 use std::time::Duration;
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ExplicitBudget {
+    warm_up: bool,
+    measurement: bool,
+    samples: bool,
+}
+
+impl ExplicitBudget {
+    fn from_args(args: impl IntoIterator<Item = impl AsRef<str>>) -> Self {
+        let mut budget = Self::default();
+        for arg in args {
+            let arg = arg.as_ref();
+            if arg == "--" {
+                break;
+            }
+            match arg.split('=').next().unwrap_or(arg) {
+                "--warm-up-time" => budget.warm_up = true,
+                "--measurement-time" => budget.measurement = true,
+                "--sample-size" => budget.samples = true,
+                _ => {}
+            }
+        }
+        budget
+    }
+}
+
+fn explicit_budget() -> &'static ExplicitBudget {
+    static BUDGET: OnceLock<ExplicitBudget> = OnceLock::new();
+    BUDGET.get_or_init(|| ExplicitBudget::from_args(std::env::args().skip(1)))
+}
 
 /// The DPI values the default matrix covers.
 ///
@@ -67,7 +99,11 @@ pub fn apply_cost_budget(
     cost: Duration,
 ) {
     apply_time_budget(group);
-    group.sample_size(samples_for(cost));
+    // Criterion has already parsed and validated explicit CLI settings. Leave
+    // the group override unset so those values remain authoritative.
+    if !explicit_budget().samples {
+        group.sample_size(samples_for(cost));
+    }
 }
 
 /// [`apply_cost_budget`], measuring the cost from one probe call.
@@ -89,8 +125,13 @@ pub fn apply_cost_budget_probing<T>(
 /// page?") needs many cases rather than extreme precision on a few. Raise it with
 /// `-- --measurement-time 10` for a publication-quality run.
 pub fn apply_time_budget(group: &mut BenchmarkGroup<'_, criterion::measurement::WallTime>) {
-    group.warm_up_time(Duration::from_secs(1));
-    group.measurement_time(Duration::from_secs(3));
+    let explicit = explicit_budget();
+    if !explicit.warm_up {
+        group.warm_up_time(Duration::from_secs(1));
+    }
+    if !explicit.measurement {
+        group.measurement_time(Duration::from_secs(3));
+    }
 }
 
 /// `test8-p0-text@150` — label, measured class, and DPI, so a criterion report is
@@ -117,3 +158,68 @@ pub fn id(label: &str, class: Option<&str>, dpi: u32) -> BenchmarkId {
 
 /// Silences an unused-import warning in targets that only use some helpers.
 pub fn _unused(_: &Criterion) {}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn default_budget_remains_adaptive() {
+        assert_eq!(
+            super::ExplicitBudget::from_args(["--bench", "--noplot", "stages/parse"]),
+            super::ExplicitBudget::default()
+        );
+        assert_eq!(
+            super::samples_for(std::time::Duration::from_millis(10)),
+            100
+        );
+        assert_eq!(super::samples_for(std::time::Duration::from_millis(50)), 30);
+        assert_eq!(
+            super::samples_for(std::time::Duration::from_millis(200)),
+            10
+        );
+    }
+
+    #[test]
+    fn explicit_split_options_inherit_criterion_values() {
+        assert_eq!(
+            super::ExplicitBudget::from_args([
+                "--bench",
+                "--warm-up-time",
+                "0.1",
+                "--measurement-time",
+                "0.25",
+                "--sample-size",
+                "10",
+            ]),
+            super::ExplicitBudget {
+                warm_up: true,
+                measurement: true,
+                samples: true,
+            }
+        );
+    }
+
+    #[test]
+    fn equals_options_override_only_the_requested_budget() {
+        assert_eq!(
+            super::ExplicitBudget::from_args(["--measurement-time=0.25", "--sample-size=10"]),
+            super::ExplicitBudget {
+                measurement: true,
+                samples: true,
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn positional_filters_and_similar_names_are_not_options() {
+        assert_eq!(
+            super::ExplicitBudget::from_args([
+                "stages/warm-up-time",
+                "--measurement-timeout=5",
+                "--",
+                "--sample-size=10",
+            ]),
+            super::ExplicitBudget::default()
+        );
+    }
+}

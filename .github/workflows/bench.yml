@@ -43,8 +43,28 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       # The synthetic corpus is in version control, so this needs nothing else.
-      - name: Perf gate (composition counters + loose wall ceiling)
-        run: cargo test -p zpdf-benches --test perf_gate -- --nocapture
+      - name: Benchmark budgets and deterministic performance gate
+        run: cargo test -p zpdf-benches --test benchmark_budget --test perf_gate -- --nocapture
+
+      - name: Font workload correctness and fixture reproducibility
+        run: |
+          python3 crates/zpdf-font/tests/fixtures/generate_coverage_fonts.py --check
+          python3 -m unittest discover -s crates/zpdf-benches/tools -p 'test_font*.py'
+          python3 -m unittest discover -s tools -p 'test_fetch_font.py'
+          node --test crates/zpdf-wasm/www/font-packs.test.mjs
+          cargo test -p zpdf-benches --test font_workloads
+          cargo test -p zpdf-font --test packs -p zpdf-benches --test font_packs
+          cargo test -p zpdf-font --test coverage --test missing_mapping
+          cargo test -p zpdf-font --test resolution -p zpdf-benches --test font_fallback
+          cargo test -p zpdf-benches --test font_writer_fallback
+          cargo test -p zpdf-font --test provider -p zpdf-content --test font_provider
+          python3 -B tools/generate_adobe_cmaps.py --check
+          python3 -B -m unittest discover -s tools -p 'test_generate_adobe_cmaps.py'
+          cargo test -p zpdf-font --test adobe_cmaps -p zpdf-benches --test font_cmaps
+          cargo test -p zpdf-font --lib --test unicode_lookup --test constructors
+
+      - name: Font benchmark harness smoke
+        run: cargo bench -p zpdf-benches --bench fonts --bench font_provider --bench font_packs --bench font_coverage --bench font_fallback --bench font_writer_fallback --bench font_cmaps -- --test
 
       # Load the whole bench harness on the synthetic corpus, so a broken bench
       # target cannot rot unnoticed until someone tries to use it. `--quick`

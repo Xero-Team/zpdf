@@ -58,8 +58,61 @@ pub struct Pdf {
     icc: zpdf::IccCache,
 }
 
+impl Pdf {
+    fn application_fonts(&mut self) -> std::sync::Arc<zpdf::FontProvider> {
+        if let Some(provider) = self.doc.font_provider() {
+            return std::sync::Arc::clone(provider);
+        }
+        let provider = std::sync::Arc::new(zpdf::FontProvider::memory_only());
+        self.doc.set_font_provider(std::sync::Arc::clone(&provider));
+        provider
+    }
+}
+
 #[wasm_bindgen]
 impl Pdf {
+    /// Supply a raw TTF/OTF/TTC face; rebuild a page to use newly registered fonts.
+    pub fn register_font(
+        &mut self,
+        data: &[u8],
+        face_index: u32,
+        alias: &str,
+    ) -> Result<u32, JsError> {
+        let provider = self.application_fonts();
+        let aliases: Vec<&str> = if alias.is_empty() {
+            Vec::new()
+        } else {
+            vec![alias]
+        };
+        provider
+            .register_with_aliases(data, face_index, &aliases)
+            .map(|id| id.0)
+            .map_err(js_err)
+    }
+
+    /// Register compressed bytes without decoding until the named face is needed.
+    /// The host performs fetch/cache operations before calling this method.
+    pub fn register_zlib_font(
+        &mut self,
+        data: &[u8],
+        face_index: u32,
+        alias: &str,
+        decoded_limit: u32,
+    ) -> Result<u32, JsError> {
+        let pack = zpdf::FontPack::new(
+            data,
+            zpdf::FontPackFormat::Zlib,
+            zpdf::FontPackLimits {
+                max_decoded_bytes: decoded_limit as u64,
+                ..Default::default()
+            },
+        )
+        .map_err(js_err)?;
+        self.application_fonts()
+            .register_pack(std::sync::Arc::new(pack), face_index, &[alias])
+            .map(|id| id.0)
+            .map_err(js_err)
+    }
     /// Open a PDF from bytes (empty-password encrypted files open too).
     pub fn open(data: &[u8]) -> Result<Pdf, JsError> {
         let doc = zpdf::PdfDocument::open(data.to_vec()).map_err(js_err)?;
