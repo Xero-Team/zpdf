@@ -53,7 +53,8 @@ warnings-denied clippy and actual wasm32 compilation. Historical private PDFs
 remain absent (0/19); skipped corpus paths are not counted as historical
 coverage. Current complete comparisons and the copy/allocator investigation
 remain tracked in #52. The campaign is committed and published as a pull
-request against `main`; every sub-issue stays open.
+request (#53, https://github.com/Xero-Team/zpdf/pull/53); every sub-issue
+stays open.
 
 The current 136-case inventory is complete: all 125 functional controls pass;
 including diagnostics, 135 pass and one copy diagnostic remains classified as

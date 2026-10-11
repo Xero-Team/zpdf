@@ -57,9 +57,9 @@ diagnostics; changed binaries receive fresh measurements.
 Current validation reports 847 passes across 46 suites, warnings-denied clippy
 and actual wasm32 compilation. Historical private PDFs remain absent (0/19);
 the real Noto fixture has only six code points. The campaign is committed and
-published as a pull request against `main`, linked from this issue; every
-sub-issue stays open. Evidence, implementation reports and limits are under
-docs/performance/font-fallback/.
+published as pull request #53 (https://github.com/Xero-Team/zpdf/pull/53);
+every sub-issue stays open. Evidence, implementation reports and limits are
+under docs/performance/font-fallback/.
 
 - [#47: bench(font): add reproducible coverage, loading and rendering baselines](https://github.com/Xero-Team/zpdf/issues/47)
 - [#48: feat(font): support registered memory fonts through a shared provider](https://github.com/Xero-Team/zpdf/issues/48)

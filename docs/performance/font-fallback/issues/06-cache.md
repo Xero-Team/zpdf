@@ -99,7 +99,8 @@ font-repeat-final-<suite>-paired.json. Fixed confirmations and pooled
 reports retain those prefixes. Source/input/executable fingerprints and every
 raw observation remain archived. English report, acceptance audit and issue
 sources are under docs/performance/font-fallback/. The campaign is committed
-and published as a pull request against `main`; every sub-issue stays open.
+and published as pull request #53 (https://github.com/Xero-Team/zpdf/pull/53);
+every sub-issue stays open.
 
 ## Current writer preflight candidate
 
