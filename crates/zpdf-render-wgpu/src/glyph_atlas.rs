@@ -119,6 +119,11 @@ impl GlyphAtlas {
         self.slots.is_empty()
     }
 
+    /// Page-local hits need no font parsing, outline extraction or rasterization.
+    pub fn lookup(&self, key: GlyphKey) -> Option<AtlasEntry> {
+        self.slots.get(&key).copied()
+    }
+
     pub fn pixels(&self) -> &[u8] {
         &self.pixels
     }

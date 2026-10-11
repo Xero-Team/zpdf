@@ -81,6 +81,13 @@ pub fn render_glyph_run(rec: &mut PageRecorder, fonts: &FontCache, map: &PageMap
             x_millipx_per_em,
             y_millipx_per_em,
         });
+        if let Some(entry) = atlas_key.and_then(|key| rec.glyph_atlas.lookup(key)) {
+            let origin = outline_to_pixel(0.0, 0.0, (g.x, g.y), tm, &x);
+            let quad =
+                glyph_atlas::glyph_quad(entry, rec.glyph_atlas.size(), (origin.x, origin.y), color);
+            rec.add_glyph_quad(quad);
+            continue;
+        }
         let Some(outline) = font.glyph_outline(g.glyph_id) else {
             continue;
         };
