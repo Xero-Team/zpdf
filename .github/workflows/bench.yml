@@ -46,6 +46,11 @@ jobs:
       - name: Perf gate (composition counters + loose wall ceiling)
         run: cargo test -p zpdf-benches --test perf_gate -- --nocapture
 
+      # Each font workload validates glyphs, placement and text before timing;
+      # `--test` runs every case once.
+      - name: Font benchmark smoke
+        run: cargo bench -p zpdf-benches --bench fonts --bench font_fallback -- --test
+
       # Load the whole bench harness on the synthetic corpus, so a broken bench
       # target cannot rot unnoticed until someone tries to use it. `--quick`
       # keeps it to seconds, and `ZPDF_BENCH_SYNTHETIC_ONLY` is honest about not

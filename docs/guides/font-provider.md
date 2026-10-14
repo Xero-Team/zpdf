@@ -214,3 +214,18 @@ TrueType CIDToGIDMap; CID-keyed CFF retains its charset and must match a request
 predefined collection. Incompatible mappings fail instead of silently emitting
 incorrect character identities. Identity authoring supports the retained CFF
 CID namespace as well as TrueType GID identity.
+
+## Measurement
+
+The `fonts` benchmark target covers provider registration, duplicate
+registration, name hits and misses, cold, warm and late document loading,
+coverage selection and predefined CMap lookups; `font_fallback` covers
+mixed-face pages, writer authoring and lazy packs. Every workload asserts
+glyph identity, PDF placement, text extraction and ink before timing.
+
+```sh
+cargo bench -p zpdf-benches --bench fonts -- font_provider
+```
+
+See [font benchmarks](../performance/fonts.md) for every case and for
+comparing runs.

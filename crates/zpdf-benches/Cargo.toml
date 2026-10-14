@@ -68,6 +68,19 @@ name = "stages"
 harness = false
 
 [[bench]]
+name = "fonts"
+harness = false
+
+[[bench]]
+name = "font_fallback"
+harness = false
+
+[[bench]]
+name = "font_gpu"
+harness = false
+required-features = ["gpu-render"]
+
+[[bench]]
 name = "backend"
 harness = false
 
