@@ -23,6 +23,9 @@
   host download caches with pinned SHA-256 identities and offline reuse, and
   real licensed CJK rendering fixtures. Re-registering identical pack bytes
   reuses the existing pack and its decoded-byte reservation.
+- Add `fonts`, `font_fallback` and opt-in `font_gpu` benchmarks whose workloads
+  validate glyphs, placement and text before timing; see
+  `docs/performance/fonts.md`.
 
 ## 0.14.0 — Type 3 rendering fixes and render-performance tooling
 
