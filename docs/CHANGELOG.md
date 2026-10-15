@@ -1,31 +1,56 @@
 # Changelog
 
-## Unreleased
+## 0.15.0 — Application fonts, glyph fallback and complete CJK CMaps
+
+### Application fonts
 
 - Add an optional shared `FontProvider` for validated in-memory TTF/OTF/TTC
   faces, bounded registration, PDF font aliases and memory-only substitution.
   Page and nested Form font loading share the provider; late registration
   refreshes substituted fonts without invalidating existing page caches.
+- Add bounded lazy raw/zlib font packs, native and WASM registration, optional
+  host download caches with pinned SHA-256 identities and offline reuse, and
+  real licensed CJK rendering fixtures. Re-registering identical pack bytes
+  reuses the existing pack and its decoded-byte reservation.
+- One provider can be shared across rendering threads: original-glyph checks
+  use read-mostly locks sharded by font identity, so parallel page
+  interpretation scales as with one provider per thread.
+
+### Glyph fallback and CJK CMaps
+
+- Resolve missing glyphs through registered coverage while preserving PDF
+  advances, vertical origins and extraction; split drawing faces and combine
+  text clipping outlines. Bound page/provider decisions and refresh misses on
+  registration. Honor positioned glyph y offsets in GPU rendering.
 - Complete the predefined CJK CMaps from pinned Adobe resources: 84 named
   CMaps and five canonical collections with GBK2K four-byte codes, HKSCS,
   supplementary UTF-16 and canonical strings. Character codes, CIDs, Unicode
   and glyph ids stay distinct namespaces, and known Adobe collections recover
   text without `/ToUnicode`.
-- Resolve missing glyphs through registered coverage while preserving PDF
-  advances, vertical origins and extraction; split drawing faces and combine
-  text clipping outlines. Bound page/provider decisions and refresh misses on
-  registration. Honor positioned glyph y offsets in GPU rendering.
+
+### Behavior changes
+
 - An empty clip path (`W n` without a current path, or clip-mode text whose
   glyphs are all blank) now clips out later painting in the CPU and SVG
   backends, as it already did on the GPU. Clip-mode text with no outline source
   (Type 3 glyphs, no usable font program) leaves the clip unchanged.
-- Add bounded lazy raw/zlib font packs, native and WASM registration, optional
-  host download caches with pinned SHA-256 identities and offline reuse, and
-  real licensed CJK rendering fixtures. Re-registering identical pack bytes
-  reuses the existing pack and its decoded-byte reservation.
+- `LoadedFont::code_to_gid` no longer returns an unresolved character code as
+  a glyph id, so an unmapped code cannot draw an unrelated glyph. Type 3 fonts
+  and embedded TrueType programs without any cmap still address glyphs by code.
+- For vertical writing, `TextSpan::x` is the left edge of the glyph column and
+  `TextSpan::advance` its width, instead of a zero-width pen origin.
+
+### Benchmarks
+
 - Add `fonts`, `font_fallback` and opt-in `font_gpu` benchmarks whose workloads
-  validate glyphs, placement and text before timing; see
-  `docs/performance/fonts.md`.
+  validate glyphs, placement and text before timing, and the `font_parallel`
+  example for shared-provider scaling; see `docs/performance/fonts.md`.
+
+### Build
+
+- Pin `libc` to 0.2.189 for the Linux `zpdf-viewer-gpui` dependency chain until
+  `xattr`/`async-tar` stop using the `ENOATTR` alias removed in libc 0.2.190.
+  The pin does not reach published crates.
 
 ## 0.14.0 — Type 3 rendering fixes and render-performance tooling
 
