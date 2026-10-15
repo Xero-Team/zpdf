@@ -88,6 +88,9 @@ jobs:
           cargo test -p zpdf --features gpu-render \
             --test gpu_acceptance --test gpu_overprint --test gpu_softmask \
             -- --nocapture 2>&1 | tee gpu-oracle.log
+          # Mixed-face fallback glyphs must land in the same cells as on the CPU.
+          cargo test -p zpdf-benches --features gpu-render --test font_fallback \
+            -- --nocapture 2>&1 | tee -a gpu-oracle.log
           # These suites skip when they cannot find an adapter — which is how this
           # step would "pass" while comparing nothing at all. Now that the driver
           # above is installed, a skip means it went missing again.

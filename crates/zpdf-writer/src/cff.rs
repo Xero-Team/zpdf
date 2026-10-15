@@ -9,8 +9,8 @@
 //! byte offsets inside the Top DICT, and those operands use a variable
 //! integer encoding. By blanking charstrings in place (same byte length) the
 //! INDEX's total data length is unchanged, so every absolute offset in the
-//! Top DICT stays valid. CID→GID identity (which Identity-H relies on) is
-//! preserved because GIDs are unchanged.
+//! Top DICT stays valid. Both GIDs and the original CID charset are preserved;
+//! the writer uses the retained CIDs for Identity character codes.
 //!
 //! CFF charstrings are independent (unlike TrueType composite glyphs), so
 //! there is no transitive component closure to do. CFF2 (variable, major
@@ -37,17 +37,7 @@ pub(crate) fn subset_cff(font: &[u8], keep: &HashSet<u16>) -> Option<Vec<u8>> {
         // OTF-wrapped CFF: subset the CFF table, splice it back.
         let cff = font.get(off..off + len)?;
         let new_cff = blank_charstrings(cff, keep)?;
-        if new_cff.len() == len {
-            // In-place splice keeps the table length identical, so all other
-            // sfnt offsets/checksums are recomputed by rebuild_sfnt anyway.
-            let mut out = font.to_vec();
-            out[off..off + len].copy_from_slice(&new_cff);
-            Some(out)
-        } else {
-            // Length changed (should not happen: we preserve entry lengths),
-            // but fall back to a full table swap if it ever does.
-            crate::subset::rebuild_sfnt(font, &[(*b"CFF ", new_cff)], false)
-        }
+        crate::subset::rebuild_sfnt(font, &[(*b"CFF ", new_cff)], false)
     } else if is_raw_cff(font) {
         blank_charstrings(font, keep)
     } else {
@@ -217,6 +207,12 @@ fn count_cff_index_entries(cff: &[u8], pos: usize) -> Option<usize> {
 /// Last integer operand of `target_key` in a CFF Top DICT. Two-byte operators
 /// (12 x) are addressed as `256 + x`.
 fn parse_top_dict_int(dict_data: &[u8], target_key: u16) -> Option<usize> {
+    parse_top_dict_operands(dict_data, target_key)?
+        .last()
+        .and_then(|&value| usize::try_from(value).ok())
+}
+
+fn parse_top_dict_operands(dict_data: &[u8], target_key: u16) -> Option<Vec<i64>> {
     let mut pos = 0;
     let mut operand_stack: Vec<i64> = Vec::new();
     while pos < dict_data.len() {
@@ -233,9 +229,7 @@ fn parse_top_dict_int(dict_data: &[u8], target_key: u16) -> Option<usize> {
                     b0 as u16
                 };
                 if key == target_key {
-                    return operand_stack
-                        .last()
-                        .and_then(|&value| usize::try_from(value).ok());
+                    return Some(operand_stack);
                 }
                 operand_stack.clear();
                 pos += 1;
@@ -300,6 +294,28 @@ fn parse_top_dict_int(dict_data: &[u8], target_key: u16) -> Option<usize> {
         }
     }
     None
+}
+
+/// Preserve the CFF's Registry/Ordering/Supplement on its PDF descendant.
+/// CID registries and orderings conventionally reside in the String INDEX.
+pub(crate) fn cid_system_info(font: &[u8]) -> Option<(String, String, i64)> {
+    let (offset, length) = find_cff_table(font)?;
+    let cff = font.get(offset..offset.checked_add(length)?)?;
+    let top = skip_cff_index(cff, *cff.get(2)? as usize)?;
+    let strings = skip_cff_index(cff, top)?;
+    let operands = parse_top_dict_operands(cff_index_entry(cff, top, 0)?, 256 + 30)?;
+    let [registry, ordering, supplement] = operands.as_slice() else {
+        return None;
+    };
+    let string = |sid: i64| -> Option<String> {
+        let index = usize::try_from(sid).ok()?.checked_sub(391)?;
+        let bytes = cff_index_entry(cff, strings, index)?;
+        Some(std::str::from_utf8(bytes).ok()?.to_owned())
+    };
+    if *supplement < 0 {
+        return None;
+    }
+    Some((string(*registry)?, string(*ordering)?, *supplement))
 }
 
 /// Wrap a raw CFF program in a minimal `OTTO` sfnt (CFF + head + hhea + maxp +

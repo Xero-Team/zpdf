@@ -17,6 +17,10 @@ use std::sync::OnceLock;
 
 pub mod classify;
 pub mod corpus;
+pub mod font_cmap_workloads;
+pub mod font_fallback_workloads;
+pub mod font_pack_workloads;
+pub mod font_workloads;
 pub mod manifest;
 pub mod pipeline;
 

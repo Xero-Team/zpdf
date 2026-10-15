@@ -375,10 +375,14 @@ impl SvgWriter<'_> {
 
     /// Register a `<clipPath>` def intersected with the enclosing clip (via
     /// `clip-path` on the `clipPath` element itself, SVG 1.1 §14.3.5) and make
-    /// it the active clip. Degenerate geometry leaves the outer clip in force,
-    /// like the CPU backend's skipped clip frames.
+    /// it the active clip. An explicitly empty path clips out all painting;
+    /// invalid nonempty geometry leaves the outer clip in force.
     fn push_clip(&mut self, path: &Path, rule: &FillRule) {
-        let Some(d) = self.path_data(path) else {
+        let Some(d) = (if path.is_empty() {
+            Some(String::new())
+        } else {
+            self.path_data(path)
+        }) else {
             return;
         };
         let id = self.fresh_id();

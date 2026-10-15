@@ -86,6 +86,9 @@ pub fn subset_truetype(font: &[u8], chars: &HashSet<char>) -> Option<Vec<u8>> {
 /// (offset, length) of a top-level sfnt table.
 fn raw_table(font: &[u8], tag: &[u8; 4]) -> Option<(usize, usize)> {
     let num_tables = read_u16(font, 4)? as usize;
+    if !(1..=4095).contains(&num_tables) {
+        return None;
+    }
     for i in 0..num_tables {
         let rec = 12 + i * 16;
         if font.get(rec..rec + 4)? == tag {
@@ -165,6 +168,24 @@ pub(crate) fn rebuild_sfnt(
     force_long_loca: bool,
 ) -> Option<Vec<u8>> {
     let num_tables = read_u16(font, 4)? as usize;
+    if !(1..=4095).contains(&num_tables) {
+        return None;
+    }
+    // Bound the aggregate before copying table payloads. A valid directory
+    // must not amplify overlapping/duplicate records into unbounded output.
+    let mut original_bytes = 0usize;
+    let mut tags = HashSet::with_capacity(num_tables);
+    for index in 0..num_tables {
+        let record = 12 + index * 16;
+        let tag: [u8; 4] = font.get(record..record + 4)?.try_into().ok()?;
+        if !tags.insert(tag) {
+            return None;
+        }
+        original_bytes = original_bytes.checked_add(read_u32(font, record + 12)? as usize)?;
+        if original_bytes > font.len() {
+            return None;
+        }
+    }
 
     // Collect (tag, data) for every table, applying replacements.
     let mut tables: Vec<([u8; 4], Vec<u8>)> = Vec::with_capacity(num_tables);
@@ -172,19 +193,20 @@ pub(crate) fn rebuild_sfnt(
         let rec = 12 + i * 16;
         let mut tag = [0u8; 4];
         tag.copy_from_slice(font.get(rec..rec + 4)?);
-        let data = match replacements.iter().find(|(t, _)| *t == tag) {
+        let mut data = match replacements.iter().find(|(t, _)| *t == tag) {
             Some((_, d)) => d.clone(),
             None => {
                 let offset = read_u32(font, rec + 8)? as usize;
                 let length = read_u32(font, rec + 12)? as usize;
-                let mut d = font.get(offset..offset + length)?.to_vec();
-                if &tag == b"head" && force_long_loca && d.len() >= 52 {
-                    d[50] = 0;
-                    d[51] = 1; // indexToLocFormat = 1
-                }
-                d
+                font.get(offset..offset.checked_add(length)?)?.to_vec()
             }
         };
+        if &tag == b"head" {
+            data.get_mut(8..12)?.fill(0);
+            if force_long_loca {
+                data.get_mut(50..52)?.copy_from_slice(&1u16.to_be_bytes());
+            }
+        }
         tables.push((tag, data));
     }
 
@@ -208,14 +230,18 @@ pub(crate) fn rebuild_sfnt(
 
     let dir_len = 12 + tables.len() * 16;
     let mut offset = dir_len;
+    let mut head_offset = None;
     let mut dir: Vec<u8> = Vec::with_capacity(tables.len() * 16);
     for (tag, data) in &tables {
-        let padded = (data.len() + 3) & !3;
+        let padded = data.len().checked_add(3)? & !3;
         dir.extend_from_slice(tag);
         dir.extend_from_slice(&table_checksum(data).to_be_bytes());
-        dir.extend_from_slice(&(offset as u32).to_be_bytes());
-        dir.extend_from_slice(&(data.len() as u32).to_be_bytes());
-        offset += padded;
+        dir.extend_from_slice(&u32::try_from(offset).ok()?.to_be_bytes());
+        dir.extend_from_slice(&u32::try_from(data.len()).ok()?.to_be_bytes());
+        if tag == b"head" {
+            head_offset = Some(offset);
+        }
+        offset = offset.checked_add(padded)?;
     }
     out.extend_from_slice(&dir);
     for (_, data) in &tables {
@@ -224,6 +250,10 @@ pub(crate) fn rebuild_sfnt(
             out.push(0);
         }
     }
+    let head_offset = head_offset?;
+    let adjustment = 0xB1B0AFBAu32.wrapping_sub(table_checksum(&out));
+    out.get_mut(head_offset + 8..head_offset + 12)?
+        .copy_from_slice(&adjustment.to_be_bytes());
     Some(out)
 }
 
@@ -248,4 +278,50 @@ fn read_u32(data: &[u8], pos: usize) -> Option<u32> {
         *data.get(pos + 2)?,
         *data.get(pos + 3)?,
     ]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FONT: &[u8] = include_bytes!("../../zpdf-font/tests/fixtures/coverage-primary.ttf");
+
+    #[test]
+    fn sparse_subset_recomputes_head_and_table_checksums() {
+        let subset = subset_truetype(FONT, &HashSet::from(['A', '中'])).unwrap();
+        assert_eq!(table_checksum(&subset), 0xB1B0AFBA);
+        let count = read_u16(&subset, 4).unwrap() as usize;
+        for index in 0..count {
+            let record = 12 + index * 16;
+            let offset = read_u32(&subset, record + 8).unwrap() as usize;
+            let length = read_u32(&subset, record + 12).unwrap() as usize;
+            let mut table = subset[offset..offset + length].to_vec();
+            if &subset[record..record + 4] == b"head" {
+                table[8..12].fill(0);
+            }
+            assert_eq!(
+                table_checksum(&table),
+                read_u32(&subset, record + 4).unwrap()
+            );
+        }
+        let face = ttf_parser::Face::parse(&subset, 0).unwrap();
+        assert!(face
+            .glyph_bounding_box(face.glyph_index('中').unwrap())
+            .is_some());
+    }
+
+    #[test]
+    fn repeated_table_payloads_are_rejected_before_copying() {
+        let mut font = FONT.to_vec();
+        let size = font.len() as u32;
+        let count = read_u16(&font, 4).unwrap() as usize;
+        for index in 0..count {
+            let record = 12 + index * 16;
+            font[record + 8..record + 12].copy_from_slice(&0u32.to_be_bytes());
+            font[record + 12..record + 16].copy_from_slice(&size.to_be_bytes());
+        }
+        assert!(rebuild_sfnt(&font, &[], false).is_none());
+        font[4..6].copy_from_slice(&u16::MAX.to_be_bytes());
+        assert!(rebuild_sfnt(&font, &[], false).is_none());
+    }
 }

@@ -11,6 +11,14 @@
   supplementary UTF-16 and canonical strings. Character codes, CIDs, Unicode
   and glyph ids stay distinct namespaces, and known Adobe collections recover
   text without `/ToUnicode`.
+- Resolve missing glyphs through registered coverage while preserving PDF
+  advances, vertical origins and extraction; split drawing faces and combine
+  text clipping outlines. Bound page/provider decisions and refresh misses on
+  registration. Honor positioned glyph y offsets in GPU rendering.
+- An empty clip path (`W n` without a current path, or clip-mode text whose
+  glyphs are all blank) now clips out later painting in the CPU and SVG
+  backends, as it already did on the GPU. Clip-mode text with no outline source
+  (Type 3 glyphs, no usable font program) leaves the clip unchanged.
 
 ## 0.14.0 — Type 3 rendering fixes and render-performance tooling
 
