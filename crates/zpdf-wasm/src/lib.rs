@@ -58,8 +58,38 @@ pub struct Pdf {
     icc: zpdf::IccCache,
 }
 
+impl Pdf {
+    fn application_fonts(&mut self) -> std::sync::Arc<zpdf::FontProvider> {
+        if let Some(provider) = self.doc.font_provider() {
+            return std::sync::Arc::clone(provider);
+        }
+        let provider = std::sync::Arc::new(zpdf::FontProvider::memory_only());
+        self.doc.set_font_provider(std::sync::Arc::clone(&provider));
+        provider
+    }
+}
+
 #[wasm_bindgen]
 impl Pdf {
+    /// Supply a raw TTF/OTF/TTC face; rebuild a page to use newly registered fonts.
+    pub fn register_font(
+        &mut self,
+        data: &[u8],
+        face_index: u32,
+        alias: &str,
+    ) -> Result<u32, JsError> {
+        let provider = self.application_fonts();
+        let aliases: Vec<&str> = if alias.is_empty() {
+            Vec::new()
+        } else {
+            vec![alias]
+        };
+        provider
+            .register_with_aliases(data, face_index, &aliases)
+            .map(|id| id.0)
+            .map_err(js_err)
+    }
+
     /// Open a PDF from bytes (empty-password encrypted files open too).
     pub fn open(data: &[u8]) -> Result<Pdf, JsError> {
         let doc = zpdf::PdfDocument::open(data.to_vec()).map_err(js_err)?;

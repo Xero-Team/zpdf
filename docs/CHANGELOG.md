@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Add an optional shared `FontProvider` for validated in-memory TTF/OTF/TTC
+  faces, bounded registration, PDF font aliases and memory-only substitution.
+  Page and nested Form font loading share the provider; late registration
+  refreshes substituted fonts without invalidating existing page caches.
+
 ## 0.14.0 — Type 3 rendering fixes and render-performance tooling
 
 ### Type 3 rendering

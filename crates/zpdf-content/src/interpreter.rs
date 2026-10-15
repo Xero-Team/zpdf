@@ -3784,12 +3784,17 @@ impl<'a> ContentInterpreter<'a> {
             // A font entry is normally an indirect reference; a synthesized
             // form-field appearance may instead carry an inline font dict.
             let load_into = |fc: &mut FontCache, target: &str| -> Result<(), zpdf_core::Error> {
+                let provider = fc.provider().map(|provider| provider.as_ref());
                 let font = match obj {
                     PdfObject::Ref(font_ref) => {
-                        zpdf_document::font_loader::load_single_font(file, *font_ref)?
+                        zpdf_document::font_loader::load_single_font_with_provider(
+                            file, *font_ref, provider,
+                        )?
                     }
                     PdfObject::Dict(font_dict) => {
-                        zpdf_document::font_loader::load_single_font_dict(file, font_dict)?
+                        zpdf_document::font_loader::load_single_font_dict_with_provider(
+                            file, font_dict, provider,
+                        )?
                     }
                     _ => return Ok(()),
                 };

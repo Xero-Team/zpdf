@@ -25,7 +25,10 @@ pub use zpdf_document::{
     PageLabels, PdfDocument, PdfPage, ResourceDict, RevocationStatus, Signature, StructElem,
     StructKid, StructRole, StructTree, XmpMetadata,
 };
-pub use zpdf_font::FontCache;
+pub use zpdf_font::{
+    DrawingGlyph, FontCache, FontCharacter, FontPack, FontPackFormat, FontPackLimits, FontProvider,
+    FontProviderLimits, RegisteredFontId, RegisteredFontPackId, RegisteredGlyph,
+};
 pub use zpdf_image::{DecodedImage, ImageCache};
 pub use zpdf_parser::PdfFile;
 pub use zpdf_render::{RenderBackend, StageStats};
