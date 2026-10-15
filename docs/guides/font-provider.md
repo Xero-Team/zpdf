@@ -145,7 +145,7 @@ ordinary font storage cannot exceed `max_total_bytes`. Encoded pack storage
 has a separate budget of the same size. Pack and face counts are each bounded
 by `max_faces`. A pack is charged once even when registered again, under
 multiple aliases or TTC face indices, or rebuilt from the same bytes and
-limits. Reservations are
+limits (as the WASM binding does on every call). Reservations are
 conservative and are retained for the provider's lifetime; supply a realistic
 decoded limit rather than the default for every small pack.
 
@@ -157,11 +157,34 @@ optional hints used by `resolve_character` to skip irrelevant undecoded packs;
 they do not prove actual cmap coverage. Whole-face alias selection still loads
 its matching pack regardless of these character hints.
 
-## Browser
+## Opt-in download and offline reuse
+
+`tools/fetch_font.py` downloads a caller-selected raw TTF/OTF/TTC from HTTPS,
+checks its pinned SHA-256 and size, and atomically publishes a zlib cache
+entry. HTTPS redirects are checked. Reads are streamed; no partial or wrong
+font is admitted to the cache. Every reuse, including `--offline`, verifies
+bounded decompression and the original digest. License selection and choosing
+the appropriate face remain the host's responsibility.
+
+See the [real fixture provenance](../../crates/zpdf-font/tests/fixtures/Noto-CJK-PROVENANCE.md)
+for an executable download command with an actual URL and digest. Its six
+characters are a test fixture, not general CJK coverage.
+
+After acquisition, the native example renders the first page to a PPM image:
+
+```sh
+cargo run -p zpdf --example font_pack -- \
+  input.pdf path/to/cache.font.zlib MissingPdfFont 16777216 output.ppm
+```
 
 The browser exposes `Pdf.register_font(bytes, faceIndex, alias)` for raw
-programs. After registration, rebuild/redraw the page; no network operation
-occurs inside synchronous Rust rendering.
+programs and `Pdf.register_zlib_font(bytes, faceIndex, alias, decodedLimit)`
+for lazy packs. `crates/zpdf-wasm/www/font-packs.mjs` is an optional HTTPS,
+SHA-256, CacheStorage and offline helper. Its digest identifies the **encoded**
+pack bytes, whereas the Python tool identifies the **original raw** program.
+It forbids redirects and requires a source that permits browser CORS access.
+After registration, rebuild/redraw the page; no network operation occurs
+inside synchronous Rust rendering.
 
 ## PDF mappings and downloaded fonts
 
