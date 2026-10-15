@@ -406,8 +406,8 @@ fn parse_type0_encoding(file: &PdfFile, dict: &zpdf_core::PdfDict) -> zpdf_font:
                     }
                 };
                 // /WMode may also live on the stream dict.
-                if let Ok(1) = s.dict.get_i64("WMode") {
-                    cmap.wmode = 1;
+                if let Ok(wmode) = s.dict.get_i64("WMode") {
+                    cmap.apply_stream_wmode(wmode);
                 }
                 cmap
             }
@@ -444,8 +444,25 @@ fn load_type0_font(
 
     let mut cid_widths = parse_cid_widths(file, desc_dict);
     parse_cid_w2(file, desc_dict, &mut cid_widths);
-    let cmap = parse_type0_encoding(file, dict);
-    let ordering = desc_ordering(file, desc_dict);
+    let mut cmap = parse_type0_encoding(file, dict);
+    let mut ordering = None;
+    if let Some(info) = resolve_dict(file, desc_dict, "CIDSystemInfo") {
+        ordering = match info.get("Ordering") {
+            Some(PdfObject::String(value)) => Some(value.to_string_lossy()),
+            Some(PdfObject::Name(value)) => Some(value.as_str().to_string()),
+            _ => None,
+        };
+        let adobe = match info.get("Registry") {
+            Some(PdfObject::String(value)) => value.0 == b"Adobe",
+            Some(PdfObject::Name(value)) => value.as_str() == "Adobe",
+            _ => false,
+        };
+        if adobe {
+            if let Some(ordering) = &ordering {
+                cmap.set_collection(ordering);
+            }
+        }
+    }
     let dw2 = parse_dw2(file, desc_dict);
 
     // Reuse the descriptor for font bytes, substitution hints and variations.
@@ -531,15 +548,6 @@ fn load_type0_font(
 /// A registered CJK character-collection ordering (not Adobe-Identity).
 fn is_cjk_ordering(ordering: Option<&str>) -> bool {
     matches!(ordering, Some("GB1" | "CNS1" | "Japan1" | "Korea1" | "KR"))
-}
-
-/// The descendant CIDFont's `/CIDSystemInfo /Ordering` (e.g. "GB1", "Identity").
-fn desc_ordering(file: &PdfFile, desc_dict: &zpdf_core::PdfDict) -> Option<String> {
-    resolve_dict(file, desc_dict, "CIDSystemInfo").and_then(|csi| match csi.get("Ordering") {
-        Some(PdfObject::String(s)) => Some(s.to_string_lossy()),
-        Some(PdfObject::Name(n)) => Some(n.as_str().to_string()),
-        _ => None,
-    })
 }
 
 /// Build a system-font substitute for a composite (Type0) font, carrying over

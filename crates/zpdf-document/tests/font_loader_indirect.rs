@@ -294,3 +294,39 @@ fn inline_descendant_cidfont_resolves() {
         "inline /DescendantFonts CIDFont dict resolved and program loaded"
     );
 }
+
+#[test]
+fn embedded_cmap_stream_dict_wmode_zero_overrides_inherited_vertical_base() {
+    // The CMap program inherits vertical mode from its `usecmap` base and
+    // declares none itself; the stream dictionary's explicit /WMode 0
+    // (Table 120) must still make the font horizontal.
+    for (dict_entry, expected) in [(" /WMode 0", 0), ("", 1)] {
+        let body = b"/UniJIS-UCS2-V usecmap";
+        let mut cmap = format!(
+            "<< /Type /CMap /CMapName /Custom{dict_entry} /Length {} >>\nstream\n",
+            body.len()
+        )
+        .into_bytes();
+        cmap.extend_from_slice(body);
+        cmap.extend_from_slice(b"\nendstream");
+        let pdf = build_pdf(&[
+            dict_obj("<< /Type /Catalog >>"),
+            dict_obj(
+                "<< /Type /Font /Subtype /Type0 /BaseFont /T /Encoding 3 0 R \
+                 /DescendantFonts [4 0 R] >>",
+            ),
+            cmap,
+            dict_obj(
+                "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /T /DW 1000 \
+                 /CIDSystemInfo << /Registry (Adobe) /Ordering (Japan1) /Supplement 6 >> \
+                 /FontDescriptor 5 0 R >>",
+            ),
+            dict_obj("<< /Type /FontDescriptor /FontName /T /Flags 4 /FontFile2 6 0 R >>"),
+            stream_obj(b"JUNK"),
+        ]);
+
+        let file = PdfFile::parse(pdf).expect("parse synthetic pdf");
+        let font = load_single_font(&file, ObjectId(2, 0)).expect("load font");
+        assert_eq!(font.cid_cmap.expect("encoding CMap").wmode, expected);
+    }
+}

@@ -125,10 +125,7 @@ impl LoadedFont {
             FontCharacter::from_text(text)?
         } else if matches!(self.font_type, PdfFontType::Type0CidType2) {
             let cmap = self.cid_cmap.as_ref()?;
-            FontCharacter {
-                character: char::from_u32(cmap.decode_to_unicode(code, length)?)?,
-                variation_selector: None,
-            }
+            cmap.decode_text(code, length)?.font_character()?
         } else if let Some(name) = self
             .encoding
             .as_ref()

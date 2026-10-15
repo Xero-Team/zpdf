@@ -4572,7 +4572,12 @@ impl<'a> ContentInterpreter<'a> {
             // (Identity-H semantics when absent) and map code → CID → glyph.
             let cmap = font_and_id.and_then(|(_, f)| f.cid_cmap.as_ref());
             vertical = cmap.map(|c| c.wmode == 1).unwrap_or(false);
-            let codes_are_unicode = cmap.map(|c| c.codes_are_unicode).unwrap_or(false);
+            // Authoritative Unicode CMaps on an embedded font still select
+            // collection CIDs: its glyphs, /W widths and /W2 metrics are by CID.
+            let codes_are_unicode = cmap.is_some_and(|c| {
+                c.codes_are_unicode
+                    && (!c.is_authoritative() || font_and_id.is_some_and(|(_, f)| f.is_substitute))
+            });
             // Legacy byte-encoded CMap (GB / GBK / Big5 / Shift-JIS / EUC-JP /
             // KSC) on a *substituted* (non-embedded) font: decode code → Unicode
             // and resolve through the system face. Embedded legacy-CMap fonts
@@ -4617,7 +4622,12 @@ impl<'a> ContentInterpreter<'a> {
                             .and_then(|u| font.unicode_glyph(u))
                             .map(|(g, _)| g)
                             .unwrap_or(0);
-                        (gid, font.glyph_advance(cid), None)
+                        let v_metric = if vertical {
+                            font.cid_v_metric(cid)
+                        } else {
+                            None
+                        };
+                        (gid, font.glyph_advance(cid), v_metric)
                     } else {
                         let cid = cmap
                             .map(|c| c.code_to_cid(code, len as u8))

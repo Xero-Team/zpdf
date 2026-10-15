@@ -57,6 +57,8 @@ choices while retaining embedded programs. Existing page caches remain valid
 snapshots; rebuild the page's display list to use a newly available face.
 
 Document loading selects a whole font by name and style.
+Predefined CMap coverage is described under
+[PDF mappings and downloaded fonts](#pdf-mappings-and-downloaded-fonts).
 
 ## Explicit character coverage
 
@@ -140,3 +142,11 @@ A font file supplies outlines and a Unicode-to-GID cmap. A PDF Encoding CMap
 supplies a different mapping: its byte codes select CIDs, which address the
 PDF's W/W2 metrics and the embedded font's CID namespace. A downloaded TTF
 therefore complements the PDF mappings; it cannot replace them.
+
+The predefined mapping layer now uses pinned Adobe resources for 84 named
+CMaps and five canonical collections. It distinguishes source-code byte
+lengths, four-byte GBK2K, UTF-16 supplementary characters, HKSCS and vertical
+overrides. Identity means code equals CID, not Unicode. Known Adobe
+CIDSystemInfo collections can recover Unicode without ToUnicode; an explicit
+ToUnicode mapping takes precedence. Complete canonical variation sequences
+remain available through `CidCMap::decode_text`.
