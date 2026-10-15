@@ -263,7 +263,22 @@ impl LoadedFont {
                 dw2: (880.0, -1000.0),
                 variations: Vec::new(),
             }
-        } else if let Some(t1) = type1::Type1Font::parse(&font_data) {
+        } else {
+            Self::new_legacy_data(font_type, base_font, font_data, cid_widths)
+        }
+    }
+
+    /// Keep the legacy-program parser and malformed-font fallback out of the
+    /// common sfnt constructor's instruction and stack working set.
+    #[cold]
+    #[inline(never)]
+    fn new_legacy_data(
+        font_type: PdfFontType,
+        base_font: String,
+        font_data: Vec<u8>,
+        cid_widths: CidWidths,
+    ) -> Self {
+        if let Some(t1) = type1::Type1Font::parse(&font_data) {
             // Embedded Type 1 (PostScript) program — ttf-parser cannot parse it.
             let units_per_em = t1.units_per_em;
             Self {
@@ -625,13 +640,7 @@ impl LoadedFont {
         let mut face = ttf_parser::Face::parse(data, self.face_index).ok()?;
         self.apply_variations(&mut face);
 
-        let actual_gid = if self.unicode_coded() || self.legacy_substitute() {
-            // Unicode-coded (and substituted legacy-CMap) composite fonts
-            // already carry real GIDs.
-            glyph_id
-        } else {
-            self.drawing_gid_with_face(glyph_id, &face)?
-        };
+        let actual_gid = self.drawing_gid_with_face(glyph_id, &face)?;
         let gid = ttf_parser::GlyphId(actual_gid);
 
         let mut builder = OutlineBuilder::new();
@@ -648,7 +657,6 @@ impl LoadedFont {
         })
     }
 
-    /// Resolve a glyph-run identity to the physical GID drawn from this face.
     pub(crate) fn drawing_gid_with_face(
         &self,
         glyph_id: u16,

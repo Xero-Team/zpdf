@@ -113,7 +113,6 @@ impl Pdf {
             .map(|id| id.0)
             .map_err(js_err)
     }
-
     /// Open a PDF from bytes (empty-password encrypted files open too).
     pub fn open(data: &[u8]) -> Result<Pdf, JsError> {
         let doc = zpdf::PdfDocument::open(data.to_vec()).map_err(js_err)?;
