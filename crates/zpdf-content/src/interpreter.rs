@@ -4806,7 +4806,7 @@ impl<'a> ContentInterpreter<'a> {
                 {
                     match &mut union {
                         Some((all, total)) => {
-                            all.extend(&path);
+                            all.extend_from_path(&path);
                             *total = Rect::new(
                                 total.x0.min(bounds.x0),
                                 total.y0.min(bounds.y0),
@@ -4839,7 +4839,7 @@ impl<'a> ContentInterpreter<'a> {
             if let Some((path, _)) = &glyph_clip {
                 self.text_clip_accum
                     .get_or_insert_with(Path::new)
-                    .extend(path);
+                    .extend_from_path(path);
             }
         }
         if let Some(font_id) = self.current_font_id {
@@ -5201,7 +5201,7 @@ fn build_glyph_clip_path(
             }
         }
         orient_glyph_contours(&mut glyph_path);
-        all.extend(&glyph_path);
+        all.extend_from_path(&glyph_path);
     }
 
     if !(any && bb.0.is_finite() && bb.2 > bb.0 && bb.3 > bb.1) {
@@ -6126,7 +6126,7 @@ mod tests {
         assert_eq!(winding(&first, overlap), 1);
         assert_eq!(winding(&second, overlap), 1);
         let mut path = first;
-        path.extend(&second);
+        path.extend_from_path(&second);
         assert_eq!(winding(&path, overlap), 2);
         assert_eq!(winding(&path, Point::new(2.0, 2.0)), 1);
         assert_eq!(winding(&path, Point::new(20.0, 2.0)), 0);

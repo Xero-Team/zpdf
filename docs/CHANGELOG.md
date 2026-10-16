@@ -13,17 +13,20 @@
 
 ### Breaking changes
 
-- `Path::elements` is no longer a public `Vec<PathElement>`. Iterate segments by
-  value with `path.iter()` or `for element in &path`, and build paths with
-  `push`, `extend` or `collect`. `PathElement` is unchanged and now also
-  implements `PartialEq`.
+- `Path::elements` is no longer a public `Vec<PathElement>`. Iterating a path
+  (`path.iter()`, `&path` or an owned `path`) yields segments by value. Paths
+  are built with `push`, `extend`, `extend_from_path`, `From<Vec<PathElement>>`
+  or `collect`; the last two store the result at its exact size. `PathElement`
+  is unchanged and now also implements `PartialEq`.
 
   | Before | After |
   |---|---|
+  | `Path { elements }` | `Path::from(elements)` or `elements.into_iter().collect::<Path>()` |
   | `for e in &path.elements { match *e { .. } }` | `for e in &path { match e { .. } }` |
+  | `for e in path.elements { .. }` | `for e in path { .. }` |
   | `path.elements.len()`, `path.elements.is_empty()` | `path.len()`, `path.is_empty()` |
-  | `path.elements.push(e)`, `.extend(..)` | `path.push(e)`, `path.extend(..)` |
-  | `Path { elements }` | `elements.into_iter().collect::<Path>()` |
+  | `path.elements.push(e)`, `path.elements.extend(..)` | `path.push(e)`, `path.extend(..)` (elements or `&PathElement`s) |
+  | `path.elements.extend_from_slice(&other.elements)` | `path.extend_from_path(&other)` |
   | Visiting every point (bounds, transforms) | `path.points()`, `path.points_mut()`, `path.map_points(f)` |
 
 ## 0.15.1 — Installable CLI and PPTX export again

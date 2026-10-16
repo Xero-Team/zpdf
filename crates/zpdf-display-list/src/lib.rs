@@ -98,7 +98,7 @@ pub enum SoftMaskKind {
 
 // -- Path --
 
-pub use path::{Path, PathElement, PathIter};
+pub use path::{Path, PathElement, PathIntoIter, PathIter};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FillRule {
