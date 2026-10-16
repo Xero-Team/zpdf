@@ -2,6 +2,9 @@ use std::collections::HashMap;
 
 use zpdf_core::{Error, ParseLimits, PdfDict, PdfObject, Result};
 
+mod footprint;
+pub use footprint::{box_downscale, box_downscale_rgba, box_filter_size};
+
 pub type ImageId = u32;
 
 /// Display-list image store. Entries remain stable because render commands keep

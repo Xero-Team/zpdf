@@ -524,6 +524,54 @@ impl<'a> CpuRenderer<'a> {
         self
     }
 
+    /// The scale [`RenderBackend::render_display_list`] rasterizes a page of
+    /// `page_rect` at when asked for `scale`: the request itself, or the
+    /// reduced scale that fits this renderer's page-pixel budget. `None` when
+    /// the page cannot be rendered at all.
+    ///
+    /// Pass it to `ContentInterpreter::with_image_downscale` when the display
+    /// list is interpreted for this renderer: images then arrive already
+    /// box-filtered to the size this renderer would filter them to on draw.
+    pub fn raster_scale(&self, page_rect: zpdf_core::Rect, scale: f32) -> Option<f32> {
+        let info = PageRenderInfo {
+            page_rect,
+            scale,
+            background: Color::white(),
+        };
+        self.fit_raster(&info).ok().map(|(scale, _, _)| scale)
+    }
+
+    /// Raster scale and dimensions for `info` within the page-pixel budget.
+    ///
+    /// A pathological MediaBox (or a high DPI on a huge page) otherwise demands
+    /// a multi-gigabyte Pixmap that aborts the process on the allocation alone,
+    /// or makes per-pixel work (fills, blits, per-clip masks) hang. Scaling BOTH
+    /// the dimensions and the scale by the same factor keeps geometry
+    /// consistent, so the output is a smaller-but-complete render instead of a
+    /// crash/timeout.
+    fn fit_raster(&self, info: &PageRenderInfo) -> Result<(f32, u32, u32), CpuRenderError> {
+        // ceil(), not truncation: a 595x842pt page at 110 DPI is 909.03x1286.6px
+        // and must produce a 910x1287 raster (pdfium semantics) so no content is
+        // sliced off the right/bottom edges.
+        let (w, h) = info.raster_dimensions()?;
+        let pixels = w as u64 * h as u64;
+        if pixels <= self.max_page_pixels {
+            return Ok((info.scale, w, h));
+        }
+        fit_raster_to_pixel_limit(
+            info.page_rect.width(),
+            info.page_rect.height(),
+            info.scale,
+            self.max_page_pixels,
+        )
+        .ok_or_else(|| {
+            CpuRenderError::LimitExceeded(format!(
+                "page raster {w}x{h} cannot fit max_page_pixels={}",
+                self.max_page_pixels
+            ))
+        })
+    }
+
     /// Convert PDF Y coordinate (origin bottom-left) to pixel Y (origin top-left),
     /// relative to the page rect's top edge.
     fn flip_y(&self, y: f32) -> f32 {
@@ -1720,56 +1768,46 @@ impl<'a> CpuRenderer<'a> {
             tm.f as f32,
         );
 
-        // Device-space footprint of the unit square's axes: how many device
-        // pixels one image axis spans (column lengths of the scaled CTM).
-        let dev_w = (a * a + b * b).sqrt() * s;
-        let dev_h = (c * c + d * d).sqrt() * s;
-        let fx = dev_w / image.width as f32;
-        let fy = dev_h / image.height as f32;
-
         // Below ~0.5x per axis, bilinear sampling starts skipping source pixels
         // entirely (thin strokes in downscaled scans break up). Pre-downscale
         // with a box filter (plain average) to the target device scale first.
+        // An interpreter given `with_image_downscale` at this scale has already
+        // applied the same rule, so its images arrive at their target size.
         let mut downscaled: Option<(Arc<[u8]>, u32, u32)> = None;
-        if fx < 0.5 || fy < 0.5 {
-            let tw = ((image.width as f32 * fx.min(1.0)).ceil() as u32).clamp(1, image.width);
-            let th = ((image.height as f32 * fy.min(1.0)).ceil() as u32).clamp(1, image.height);
-            if tw < image.width || th < image.height {
-                let key = (draw.image_id, tw, th);
-                let data = if cache_downscaled {
-                    if let Some(data) = self.downscaled_images.get(&key) {
-                        Arc::clone(data)
-                    } else {
-                        let data: Arc<[u8]> = Arc::from(box_downscale_rgba(
-                            &image.data,
-                            image.width,
-                            image.height,
-                            tw,
-                            th,
-                        ));
-                        let retained: usize =
-                            self.downscaled_images.values().map(|d| d.len()).sum();
-                        if data.len() <= MAX_DOWNSCALED_IMAGE_CACHE_BYTES {
-                            if retained.saturating_add(data.len())
-                                > MAX_DOWNSCALED_IMAGE_CACHE_BYTES
-                            {
-                                self.downscaled_images.clear();
-                            }
-                            self.downscaled_images.insert(key, Arc::clone(&data));
-                        }
-                        data
-                    }
+        if let Some((tw, th)) =
+            zpdf_image::box_filter_size(&draw.transform, s, image.width, image.height)
+        {
+            let key = (draw.image_id, tw, th);
+            let data = if cache_downscaled {
+                if let Some(data) = self.downscaled_images.get(&key) {
+                    Arc::clone(data)
                 } else {
-                    Arc::from(box_downscale_rgba(
+                    let data: Arc<[u8]> = Arc::from(zpdf_image::box_downscale_rgba(
                         &image.data,
                         image.width,
                         image.height,
                         tw,
                         th,
-                    ))
-                };
-                downscaled = Some((data, tw, th));
-            }
+                    ));
+                    let retained: usize = self.downscaled_images.values().map(|d| d.len()).sum();
+                    if data.len() <= MAX_DOWNSCALED_IMAGE_CACHE_BYTES {
+                        if retained.saturating_add(data.len()) > MAX_DOWNSCALED_IMAGE_CACHE_BYTES {
+                            self.downscaled_images.clear();
+                        }
+                        self.downscaled_images.insert(key, Arc::clone(&data));
+                    }
+                    data
+                }
+            } else {
+                Arc::from(zpdf_image::box_downscale_rgba(
+                    &image.data,
+                    image.width,
+                    image.height,
+                    tw,
+                    th,
+                ))
+            };
+            downscaled = Some((data, tw, th));
         }
         let (data, w, h) = match &downscaled {
             Some((data, w, h)) => (data.as_ref(), *w, *h),
@@ -2387,41 +2425,6 @@ fn overprint_merge(canvas: &mut [u8], elem: &[u8], op: &Overprint) {
     }
 }
 
-/// Box-filter (area-average) downscale of a tight RGBA8 buffer. Each target
-/// pixel averages its covering source block, so no source pixel is dropped —
-/// unlike point/bilinear sampling at strong minification. Channels are averaged
-/// independently, which is correct for the premultiplied data tiny-skia consumes.
-fn box_downscale_rgba(data: &[u8], sw: u32, sh: u32, tw: u32, th: u32) -> Vec<u8> {
-    debug_assert!(tw >= 1 && th >= 1 && tw <= sw && th <= sh);
-    let mut out = vec![0u8; tw as usize * th as usize * 4];
-    let (sw64, sh64, tw64, th64) = (sw as u64, sh as u64, tw as u64, th as u64);
-    for ty in 0..th as u64 {
-        let y0 = (ty * sh64 / th64) as u32;
-        let y1 = (((ty + 1) * sh64).div_ceil(th64) as u32).clamp(y0 + 1, sh);
-        for tx in 0..tw as u64 {
-            let x0 = (tx * sw64 / tw64) as u32;
-            let x1 = (((tx + 1) * sw64).div_ceil(tw64) as u32).clamp(x0 + 1, sw);
-            let mut acc = [0u64; 4];
-            for sy in y0..y1 {
-                let row = (sy as usize * sw as usize + x0 as usize) * 4;
-                for sx in 0..(x1 - x0) as usize {
-                    let px = row + sx * 4;
-                    acc[0] += data[px] as u64;
-                    acc[1] += data[px + 1] as u64;
-                    acc[2] += data[px + 2] as u64;
-                    acc[3] += data[px + 3] as u64;
-                }
-            }
-            let n = ((x1 - x0) as u64) * ((y1 - y0) as u64);
-            let o = (ty as usize * tw as usize + tx as usize) * 4;
-            for ch in 0..4 {
-                out[o + ch] = ((acc[ch] + n / 2) / n) as u8;
-            }
-        }
-    }
-    out
-}
-
 /// RGBA pixel buffer output.
 pub struct RenderedPage {
     pub width: u32,
@@ -2459,7 +2462,6 @@ impl<'a> RenderBackend for CpuRenderer<'a> {
         // later `end_page` call.
         self.pixmap = None;
         self.dirty = None;
-        self.scale = info.scale;
         self.rect_x0 = info.page_rect.x0 as f32;
         self.rect_y0 = info.page_rect.y0 as f32;
         self.rect_y1 = info.page_rect.y1 as f32;
@@ -2482,42 +2484,16 @@ impl<'a> RenderBackend for CpuRenderer<'a> {
             .render_budget
             .map(|d| zpdf_core::time::Instant::now() + d);
 
-        // ceil(), not truncation: a 595x842pt page at 110 DPI is 909.03x1286.6px
-        // and must produce a 910x1287 raster (pdfium semantics) so no content is
-        // sliced off the right/bottom edges.
-        let (mut w, mut h) = info.raster_dimensions()?;
-
-        // Clamp the raster to a total-pixel budget. A pathological MediaBox (or
-        // a high DPI on a huge page) otherwise demands a multi-gigabyte Pixmap
-        // that aborts the process on the allocation alone, or makes per-pixel
-        // work (fills, blits, per-clip masks) hang. Scaling BOTH the dimensions
-        // and `self.scale` by the same factor keeps geometry consistent, so the
-        // output is a smaller-but-complete render instead of a crash/timeout.
-        let pixels = w as u64 * h as u64;
-        if pixels > self.max_page_pixels {
-            let requested_scale = self.scale;
-            let (limited_scale, limited_width, limited_height) = fit_raster_to_pixel_limit(
-                info.page_rect.width(),
-                info.page_rect.height(),
-                requested_scale,
-                self.max_page_pixels,
-            )
-            .ok_or_else(|| {
-                CpuRenderError::LimitExceeded(format!(
-                    "page raster {w}x{h} cannot fit max_page_pixels={}",
-                    self.max_page_pixels
-                ))
-            })?;
-            self.scale = limited_scale;
-            w = limited_width;
-            h = limited_height;
+        let (scale, w, h) = self.fit_raster(info)?;
+        if scale != info.scale {
             tracing::warn!(
                 limit = self.max_page_pixels,
-                "raster {pixels} px exceeds configured budget; clamped to {w}x{h} (scale {:.4} -> {:.4})",
-                requested_scale,
-                self.scale
+                "raster exceeds configured budget; clamped to {w}x{h} (scale {:.4} -> {:.4})",
+                info.scale,
+                scale
             );
         }
+        self.scale = scale;
 
         let mut pixmap = tiny_skia::Pixmap::new(w, h).ok_or(CpuRenderError::PixmapCreation)?;
 
@@ -3199,7 +3175,7 @@ mod tests {
             0, 0, 0, 255, 255, 255, 255, 255, 100, 100, 100, 255, 200, 200, 200, 255, //
             0, 0, 0, 255, 255, 255, 255, 255, 100, 100, 100, 255, 200, 200, 200, 255,
         ];
-        let out = box_downscale_rgba(&data, 4, 2, 2, 1);
+        let out = zpdf_image::box_downscale_rgba(&data, 4, 2, 2, 1);
         assert_eq!(out.len(), 8);
         assert_eq!(out[0], 128); // round((0+255+0+255)/4)
         assert_eq!(out[4], 150); // (100+200+100+200)/4

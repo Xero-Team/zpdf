@@ -1497,6 +1497,19 @@ fn cmd_render(args: &[String]) -> zpdf::Result<()> {
         println!("  Output intent: DeviceCMYK colour-managed via /DestOutputProfile");
         interpreter = interpreter.with_output_intent_cmyk(profile);
     }
+    let scale = dpi / 72.0;
+    // The CPU backend receives images already box-filtered to the footprint it
+    // would filter them to on draw, so full-size scans are not retained for
+    // the render. Other backends need the decoded sources.
+    #[cfg(feature = "cpu")]
+    if backend == "cpu" {
+        if let Some(raster_scale) = zpdf::cpu::CpuRenderer::new()
+            .with_limits(doc.file().limits())
+            .raster_scale(page_box, scale)
+        {
+            interpreter = interpreter.with_image_downscale(raster_scale);
+        }
+    }
     let display_list = interpreter.interpret(&content_bytes);
 
     if font_cache.len() > initial_fonts {
@@ -1529,7 +1542,6 @@ fn cmd_render(args: &[String]) -> zpdf::Result<()> {
     // we branch only here. Both arms route through `save_rgba` for one encoder path.
     #[allow(unused_imports)]
     use zpdf::RenderBackend;
-    let scale = dpi / 72.0;
 
     match backend.as_str() {
         #[cfg(feature = "cpu")]

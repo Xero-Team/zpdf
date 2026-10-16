@@ -11,6 +11,21 @@
   half the display-list heap with fewer allocations, and rendering output is
   unchanged; see `docs/performance/paths.md` and the `path_memory` example.
 
+### Rendering performance
+
+- Add `ContentInterpreter::with_image_downscale(scale)`: an image the CPU
+  backend would box-filter on draw (an axis below 0.5x of its samples) is
+  stored already filtered to that draw's footprint, cached per image and size
+  and always filtered from the decoded source. Rendering with the CPU backend
+  at that scale is byte-identical; `CpuRenderer::raster_scale` returns the
+  scale to pass, including the page-pixel budget. `zpdf render --backend cpu`
+  and the WASM `render_page` enable it; GPU, SVG, PPTX and image extraction
+  keep source pixels. A page of eight 3000×3000 scans drawn small peaks at
+  81 MiB instead of 320 MiB; an image drawn at two minified sizes is decoded
+  twice. (#17)
+- The CPU backend and the interpreter share one footprint rule and box filter,
+  `zpdf_image::box_filter_size` and `zpdf_image::box_downscale`.
+
 ### Breaking changes
 
 - `Path::elements` is no longer a public `Vec<PathElement>`. Iterating a path

@@ -56,20 +56,22 @@ pub struct ContentInterpreter<'a> {
     /// `None` ⇒ every conversion keeps the SWOP polynomial (byte-identical to
     /// pre-output-intent behaviour).
     output_intent_cmyk: Option<std::sync::Arc<zpdf_color::IccTransform>>,
-    /// Maps an image XObject's object id to its already-decoded entry in
+    /// Maps an image XObject's object id and stored size to its entry in
     /// `image_cache`, so an image drawn many times (e.g. a map symbol repeated
     /// thousands of times) is decoded — colour-converted, soft-mask-folded — only
-    /// once instead of per `Do`. Keyed only for stateless images; `/ImageMask`
-    /// stencils bake in the current fill colour and are never cached here.
-    image_obj_cache: HashMap<ObjectId, zpdf_display_list::ImageId>,
-    /// Render scale at which decoded images are pre-downscaled to their on-page
-    /// device footprint before caching, so an oversized raster (a scan far larger
-    /// than the area it fills) does not sit in the image cache at full source
-    /// resolution. `0.0` disables it (images cached as decoded). Set to the same
-    /// scale later used by the renderer (see [`Self::with_image_downscale`]); the
-    /// backend already box-downscales minified images per draw, so pre-shrinking
-    /// to that exact target keeps the rasterized output identical while cutting
-    /// both cache memory and repeated per-draw downscaling.
+    /// once instead of per `Do`. Without [`Self::with_image_downscale`] every
+    /// draw stores the decoded size. Keyed only for stateless images;
+    /// `/ImageMask` stencils bake in the current fill colour and are never
+    /// cached here.
+    image_obj_cache: HashMap<(ObjectId, u32, u32), zpdf_display_list::ImageId>,
+    /// Decoded size of each image XObject in `image_obj_cache`, and its pixels
+    /// while they are retained to filter further footprints.
+    image_sources: HashMap<ObjectId, ImageSource>,
+    /// Bytes of the sources retained in `image_sources`. They count against
+    /// `max_image_cache_bytes` together with the image cache.
+    retained_image_bytes: u64,
+    /// CPU render scale for [`Self::with_image_downscale`]; `0.0` stores
+    /// decoded images at their source size.
     image_downscale_scale: f32,
     rejected_image_objects: HashSet<ObjectId>,
     /// Built shadings (256-entry LUT + parsed functions) cached by object id, so a
@@ -170,6 +172,26 @@ pub struct ContentInterpreter<'a> {
     /// clocks sit on every attributed operator, and a vector page can carry
     /// hundreds of thousands of them.
     work_timing: bool,
+}
+
+/// A cached image XObject's decoded source.
+struct ImageSource {
+    width: u32,
+    height: u32,
+    /// Times the stream has been decoded; never more than two.
+    decodes: u8,
+    /// The decoded pixels, kept from the second decode on so that further
+    /// footprints are filtered without decoding again.
+    retained: Option<zpdf_image::DecodedImage>,
+}
+
+/// Outcome of storing a new footprint of an already decoded image XObject.
+enum DerivedImage {
+    Admitted(zpdf_image::ImageId),
+    /// The image cache is full, or the source would need a third decode.
+    Rejected,
+    /// No decoded pixels are available yet.
+    NeedsDecode,
 }
 
 /// State for soft-mask reuse across the tiles of one `paint_tiling_pattern`
@@ -559,6 +581,8 @@ impl<'a> ContentInterpreter<'a> {
             icc_cache: None,
             output_intent_cmyk: None,
             image_obj_cache: HashMap::new(),
+            image_sources: HashMap::new(),
+            retained_image_bytes: 0,
             image_downscale_scale: 0.0,
             rejected_image_objects: HashSet::new(),
             shading_cache: HashMap::new(),
@@ -805,16 +829,29 @@ impl<'a> ContentInterpreter<'a> {
         self
     }
 
-    /// Pre-downscale decoded images to their on-page device footprint at this
-    /// render scale before caching (see [`image_downscale_scale`]). Pass the same
-    /// scale later handed to the renderer; `0.0` (default) disables it. The
-    /// pre-shrink uses the same box filter and target size the backend would use
-    /// on draw, so the rasterized output is unchanged — it only keeps the image
-    /// cache from holding a scan far larger than the area it fills.
+    /// Prepare images for the CPU backend rendering at `render_scale`: an image
+    /// that backend would box-filter on draw (an axis below 0.5x of its
+    /// samples) is stored already filtered to that draw's footprint, so the
+    /// image cache does not retain a scan far larger than the area it fills.
     ///
-    /// [`image_downscale_scale`]: Self::image_downscale_scale
+    /// Defined output: the CPU backend rendering the display list at
+    /// `render_scale` produces the same pixels as without this option. Every
+    /// footprint is filtered from the decoded source and cached by its size,
+    /// so an image drawn under several transforms never reuses or refilters
+    /// another draw's copy. A source is decoded at most twice; from the second
+    /// decode on it is retained (within the image byte limit) for further
+    /// sizes.
+    ///
+    /// Pass `CpuRenderer::raster_scale(page_rect, scale)`, which includes the
+    /// renderer's page-pixel budget. Other consumers (GPU, SVG, PPTX, image
+    /// extraction) need source pixels and must keep the default `0.0`, which
+    /// disables the option.
     pub fn with_image_downscale(mut self, render_scale: f32) -> Self {
-        self.image_downscale_scale = render_scale.max(0.0);
+        self.image_downscale_scale = if render_scale.is_finite() {
+            render_scale.max(0.0)
+        } else {
+            0.0
+        };
         self
     }
 
@@ -2697,9 +2734,6 @@ impl<'a> ContentInterpreter<'a> {
             is_image_mask: false,
             premultiplied: true,
         };
-        let Some(image_id) = self.admit_image(image) else {
-            return;
-        };
         // Unit-square image -> page-space region.
         let transform = Matrix::new(
             region.width(),
@@ -2709,13 +2743,11 @@ impl<'a> ContentInterpreter<'a> {
             region.x0,
             region.y0,
         );
-        let alpha = self.current.fill_alpha;
-        self.emit_painted(RenderCommand::DrawImage(ImageDraw {
-            image_id,
-            transform,
-            alpha,
-            is_image_mask: false,
-        }));
+        let image = self.fit_image_to_footprint(image, &transform);
+        let Some(image_id) = self.admit_image(image) else {
+            return;
+        };
+        self.emit_image_draw(image_id, transform, false);
     }
 
     /// Page-space bounding box of a path (for clipping shading fills).
@@ -3349,21 +3381,33 @@ impl<'a> ContentInterpreter<'a> {
         if self.image_cache.is_none() {
             return;
         }
+        let transform = self.current.ctm;
+
+        // Fast path: this image object was already decoded at the size this
+        // draw stores — re-emit it under the current CTM/alpha without
+        // re-decoding (huge win for repeated symbols).
+        if let Some(source) = self.image_sources.get(&obj_id) {
+            let (width, height) = self.image_footprint(&transform, source.width, source.height);
+            if let Some(&image_id) = self.image_obj_cache.get(&(obj_id, width, height)) {
+                self.emit_image_draw(image_id, transform, false);
+                return;
+            }
+        }
         if self.rejected_image_objects.contains(&obj_id) {
             return;
         }
-
-        // Fast path: this image object was already decoded — re-emit it under the
-        // current CTM/alpha without re-decoding (huge win for repeated symbols).
-        if let Some(&image_id) = self.image_obj_cache.get(&obj_id) {
-            let cmd = RenderCommand::DrawImage(ImageDraw {
-                image_id,
-                transform: self.current.ctm,
-                alpha: self.current.fill_alpha,
-                is_image_mask: false,
-            });
-            self.emit_painted(cmd);
-            return;
+        // A new footprint of a known image is filtered from pixels already
+        // decoded rather than decoding the stream again.
+        match self.derive_image_footprint(obj_id, &transform) {
+            DerivedImage::Admitted(image_id) => {
+                self.emit_image_draw(image_id, transform, false);
+                return;
+            }
+            DerivedImage::Rejected => {
+                self.rejected_image_objects.insert(obj_id);
+                return;
+            }
+            DerivedImage::NeedsDecode => {}
         }
 
         let file = match self.file {
@@ -3427,29 +3471,173 @@ impl<'a> ContentInterpreter<'a> {
             fold_stencil_mask(&mut image, mask_ref, file, &self.parse_limits);
         }
 
-        // Shrink an oversized raster to the device footprint it actually covers
-        // under the current CTM, so the cache never holds a scan larger than the
-        // area it fills. Mirrors the renderer's per-draw box-downscale exactly
-        // (same target size, same filter) so the rasterized page is unchanged.
-        maybe_downscale_to_footprint(&mut image, &self.current.ctm, self.image_downscale_scale);
-
-        // Insert once and remember the id so repeat draws skip the decode above.
         // `/ImageMask` stencils bake in the fill colour, so they aren't cached.
-        let is_stencil = image.is_image_mask;
-        let Some(image_id) = self.admit_image(image) else {
+        if image.is_image_mask {
+            let image = self.fit_image_to_footprint(image, &transform);
+            let Some(image_id) = self.admit_image(image) else {
+                self.rejected_image_objects.insert(obj_id);
+                return;
+            };
+            self.emit_image_draw(image_id, transform, true);
+            return;
+        }
+        // Insert once and remember the id so repeat draws skip the decode above.
+        let Some(image_id) = self.cache_image_source(obj_id, image, &transform) else {
             self.rejected_image_objects.insert(obj_id);
             return;
         };
-        if !is_stencil {
-            self.image_obj_cache.insert(obj_id, image_id);
+        self.emit_image_draw(image_id, transform, false);
+    }
+
+    /// The size an image of `width`×`height` samples is stored at for a draw
+    /// under `transform`: its CPU footprint with
+    /// [`Self::with_image_downscale`], otherwise the decoded size.
+    fn image_footprint(&self, transform: &Matrix, width: u32, height: u32) -> (u32, u32) {
+        if self.image_downscale_scale > 0.0 {
+            if let Some(size) =
+                zpdf_image::box_filter_size(transform, self.image_downscale_scale, width, height)
+            {
+                return size;
+            }
         }
-        let cmd = RenderCommand::DrawImage(ImageDraw {
+        (width, height)
+    }
+
+    /// Filter a freshly decoded image that is not cached to its footprint.
+    fn fit_image_to_footprint(
+        &self,
+        image: zpdf_image::DecodedImage,
+        transform: &Matrix,
+    ) -> zpdf_image::DecodedImage {
+        let (width, height) = self.image_footprint(transform, image.width, image.height);
+        if (width, height) == (image.width, image.height) {
+            image
+        } else {
+            zpdf_image::box_downscale(&image, width, height)
+        }
+    }
+
+    /// Cache a freshly decoded image XObject at the size this draw stores. A
+    /// filtered copy is made from the source, which is kept only when the draw
+    /// uses it unfiltered, or from the second decode on so that a third size
+    /// never costs a third decode.
+    fn cache_image_source(
+        &mut self,
+        obj_id: ObjectId,
+        image: zpdf_image::DecodedImage,
+        transform: &Matrix,
+    ) -> Option<zpdf_image::ImageId> {
+        let (width, height) = (image.width, image.height);
+        let size = self.image_footprint(transform, width, height);
+        let decodes = self
+            .image_sources
+            .get(&obj_id)
+            .map_or(1, |source| source.decodes.saturating_add(1));
+        let mut retained = None;
+        let image_id = if size == (width, height) {
+            self.admit_image(image)
+        } else {
+            let filtered = zpdf_image::box_downscale(&image, size.0, size.1);
+            if decodes >= 2 {
+                let bytes = u64::try_from(image.data.capacity()).unwrap_or(u64::MAX);
+                let committed = self
+                    .image_cache
+                    .as_ref()
+                    .map_or(0, |cache| cache.bytes_used())
+                    .saturating_add(self.retained_image_bytes)
+                    .saturating_add(u64::try_from(filtered.data.capacity()).unwrap_or(u64::MAX));
+                if committed.saturating_add(bytes) <= self.max_image_cache_bytes {
+                    retained = Some(image);
+                }
+            }
+            self.admit_image(filtered)
+        };
+        // Retain only for an admitted image; a rejected object is never drawn.
+        let image_id = image_id?;
+        if let Some(image) = &retained {
+            self.retained_image_bytes = self
+                .retained_image_bytes
+                .saturating_add(u64::try_from(image.data.capacity()).unwrap_or(u64::MAX));
+        }
+        self.image_sources.insert(
+            obj_id,
+            ImageSource {
+                width,
+                height,
+                decodes,
+                retained,
+            },
+        );
+        self.image_obj_cache
+            .insert((obj_id, size.0, size.1), image_id);
+        Some(image_id)
+    }
+
+    /// Store the footprint this draw needs from pixels already decoded: the
+    /// retained source, or the unfiltered copy in the image cache.
+    fn derive_image_footprint(&mut self, obj_id: ObjectId, transform: &Matrix) -> DerivedImage {
+        let Some(source) = self.image_sources.get(&obj_id) else {
+            return DerivedImage::NeedsDecode;
+        };
+        let (width, height) = (source.width, source.height);
+        let size = self.image_footprint(transform, width, height);
+        let image = if let Some(retained) = &source.retained {
+            if size == (width, height) {
+                // The draw uses the source itself: move it into the cache,
+                // where it also serves every later footprint.
+                let Some(image) = self
+                    .image_sources
+                    .get_mut(&obj_id)
+                    .and_then(|source| source.retained.take())
+                else {
+                    return DerivedImage::NeedsDecode;
+                };
+                self.retained_image_bytes = self
+                    .retained_image_bytes
+                    .saturating_sub(u64::try_from(image.data.capacity()).unwrap_or(u64::MAX));
+                image
+            } else {
+                zpdf_image::box_downscale(retained, size.0, size.1)
+            }
+        } else if let Some(unfiltered) = self
+            .image_obj_cache
+            .get(&(obj_id, width, height))
+            .and_then(|&id| self.image_cache.as_ref()?.get(id))
+        {
+            // The fast path already returned when `size` is the source size.
+            zpdf_image::box_downscale(unfiltered, size.0, size.1)
+        } else if source.decodes >= 2 {
+            // The source did not fit the byte limit after its second decode.
+            // Draw only the sizes already cached rather than decode per draw.
+            tracing::warn!(
+                "image {obj_id:?}: source too large to retain for another size; skipping draw"
+            );
+            return DerivedImage::Rejected;
+        } else {
+            return DerivedImage::NeedsDecode;
+        };
+        match self.admit_image(image) {
+            Some(image_id) => {
+                self.image_obj_cache
+                    .insert((obj_id, size.0, size.1), image_id);
+                DerivedImage::Admitted(image_id)
+            }
+            None => DerivedImage::Rejected,
+        }
+    }
+
+    fn emit_image_draw(
+        &mut self,
+        image_id: zpdf_image::ImageId,
+        transform: Matrix,
+        is_image_mask: bool,
+    ) {
+        self.emit_painted(RenderCommand::DrawImage(ImageDraw {
             image_id,
-            transform: self.current.ctm,
+            transform,
             alpha: self.current.fill_alpha,
-            is_image_mask: is_stencil,
-        });
-        self.emit_painted(cmd);
+            is_image_mask,
+        }));
     }
 
     fn do_inline_image(&mut self, dict: zpdf_core::PdfDict, data: Vec<u8>) {
@@ -3525,23 +3713,22 @@ impl<'a> ContentInterpreter<'a> {
     }
 
     fn emit_draw_image(&mut self, image: zpdf_image::DecodedImage) {
+        let transform = self.current.ctm;
+        let image = self.fit_image_to_footprint(image, &transform);
         let is_image_mask = image.is_image_mask;
         let Some(image_id) = self.admit_image(image) else {
             return;
         };
-        let cmd = RenderCommand::DrawImage(ImageDraw {
-            image_id,
-            transform: self.current.ctm,
-            alpha: self.current.fill_alpha,
-            is_image_mask,
-        });
-        self.emit_painted(cmd);
+        self.emit_image_draw(image_id, transform, is_image_mask);
     }
 
     fn admit_image(&mut self, image: zpdf_image::DecodedImage) -> Option<zpdf_image::ImageId> {
         let bytes = image.data.capacity();
+        let limit = self
+            .max_image_cache_bytes
+            .saturating_sub(self.retained_image_bytes);
         let cache = self.image_cache.as_mut()?;
-        let id = cache.try_insert_with_limit(image, self.max_image_cache_bytes);
+        let id = cache.try_insert_with_limit(image, limit);
         if id.is_none() {
             tracing::warn!(
                 "image cache byte limit ({}) or ID capacity reached; dropping {bytes}-byte image",
@@ -5051,73 +5238,6 @@ impl<'a> ContentInterpreter<'a> {
 /// `/Decode` must be resolved or an `/ImageMask` stencil would paint with the
 /// wrong polarity. `/SMask` and `/Mask` are intentionally left as references
 /// (handled separately, and they are streams we don't want to inline here).
-fn maybe_downscale_to_footprint(
-    image: &mut zpdf_image::DecodedImage,
-    ctm: &Matrix,
-    scale: f32,
-) {
-    if scale <= 0.0 || image.width == 0 || image.height == 0 {
-        return;
-    }
-    // Device-space length of each unit-square axis (columns of the scaled CTM),
-    // i.e. how many output pixels one image axis spans. Computed exactly as the
-    // renderer does (CTM cast to f32 first) so the target size matches to the bit
-    // and the backend's own downscale becomes a no-op.
-    let (a, b, c, d) = (ctm.a as f32, ctm.b as f32, ctm.c as f32, ctm.d as f32);
-    let dev_w = (a * a + b * b).sqrt() * scale;
-    let dev_h = (c * c + d * d).sqrt() * scale;
-    let fx = dev_w / image.width as f32;
-    let fy = dev_h / image.height as f32;
-    // Only when the image is minified past the point where the backend would box-
-    // downscale anyway (below 0.5x on an axis). Above that it samples the source
-    // directly, so shrinking here would change the output.
-    if !(fx < 0.5 || fy < 0.5) {
-        return;
-    }
-    let tw = ((image.width as f32 * fx.min(1.0)).ceil() as u32).clamp(1, image.width);
-    let th = ((image.height as f32 * fy.min(1.0)).ceil() as u32).clamp(1, image.height);
-    if tw >= image.width && th >= image.height {
-        return;
-    }
-    image.data = box_downscale_rgba(&image.data, image.width, image.height, tw, th);
-    image.width = tw;
-    image.height = th;
-}
-
-/// Box-filter (area-average) downscale of a tight RGBA8 buffer — a verbatim copy
-/// of the CPU renderer's `box_downscale_rgba`, so pre-shrinking at decode time
-/// produces byte-identical pixels to the backend's on-draw downscale.
-fn box_downscale_rgba(data: &[u8], sw: u32, sh: u32, tw: u32, th: u32) -> Vec<u8> {
-    debug_assert!(tw >= 1 && th >= 1 && tw <= sw && th <= sh);
-    let mut out = vec![0u8; tw as usize * th as usize * 4];
-    let (sw64, sh64, tw64, th64) = (sw as u64, sh as u64, tw as u64, th as u64);
-    for ty in 0..th as u64 {
-        let y0 = (ty * sh64 / th64) as u32;
-        let y1 = (((ty + 1) * sh64).div_ceil(th64) as u32).clamp(y0 + 1, sh);
-        for tx in 0..tw as u64 {
-            let x0 = (tx * sw64 / tw64) as u32;
-            let x1 = (((tx + 1) * sw64).div_ceil(tw64) as u32).clamp(x0 + 1, sw);
-            let mut acc = [0u64; 4];
-            for sy in y0..y1 {
-                let row = (sy as usize * sw as usize + x0 as usize) * 4;
-                for sx in 0..(x1 - x0) as usize {
-                    let px = row + sx * 4;
-                    acc[0] += data[px] as u64;
-                    acc[1] += data[px + 1] as u64;
-                    acc[2] += data[px + 2] as u64;
-                    acc[3] += data[px + 3] as u64;
-                }
-            }
-            let n = ((x1 - x0) as u64) * ((y1 - y0) as u64);
-            let o = (ty as usize * tw as usize + tx as usize) * 4;
-            for ch in 0..4 {
-                out[o + ch] = ((acc[ch] + n / 2) / n) as u8;
-            }
-        }
-    }
-    out
-}
-
 fn resolve_image_metadata(file: &PdfFile, dict: &zpdf_core::PdfDict) -> zpdf_core::PdfDict {
     use zpdf_core::{PdfName, PdfObject};
     let mut out = dict.clone();
@@ -5877,39 +5997,232 @@ mod tests {
         );
     }
 
-    // ---- Image footprint pre-downscale ----
+    // ---- Image footprints for the CPU backend (`with_image_downscale`) ----
+
+    const FOOTPRINT_SOURCE: u32 = 64;
+
+    /// A one-object file holding a 64x64 DeviceGray image XObject whose
+    /// samples are not periodic, so filtering a filtered copy differs from
+    /// filtering the source.
+    fn footprint_image_file() -> (PdfFile, ObjectId) {
+        let size = FOOTPRINT_SOURCE as usize;
+        let samples: Vec<u8> = (0..size * size)
+            .map(|i| ((i * 37 + (i / size) * 11) % 251) as u8)
+            .collect();
+        let mut pdf = b"%PDF-1.7\n".to_vec();
+        let offset = pdf.len();
+        pdf.extend_from_slice(
+            format!(
+                "1 0 obj\n<< /Type /XObject /Subtype /Image /Width {size} /Height {size} \
+                 /ColorSpace /DeviceGray /BitsPerComponent 8 /Length {} >>\nstream\n",
+                samples.len()
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(&samples);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+        let xref = pdf.len();
+        pdf.extend_from_slice(
+            format!(
+                "xref\n0 2\n0000000000 65535 f \n{offset:010} 00000 n \n\
+                 trailer\n<< /Size 2 >>\nstartxref\n{xref}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        (PdfFile::parse(pdf).expect("image file"), ObjectId(1, 0))
+    }
+
+    /// Draw the image at `side`×`side` points at the origin.
+    fn draw_footprint(
+        interp: &mut ContentInterpreter<'_>,
+        file: &PdfFile,
+        id: ObjectId,
+        side: f64,
+    ) {
+        let object = file.resolve(id).expect("image object");
+        let stream = object.as_stream().expect("image stream");
+        interp.current.ctm = Matrix::new(side, 0.0, 0.0, side, 0.0, 0.0);
+        interp.do_image_xobject(id, stream);
+    }
+
+    /// Stored size of each emitted draw, in order.
+    fn drawn_sizes(interp: &ContentInterpreter<'_>) -> Vec<(u32, u32)> {
+        let cache = interp.image_cache.as_deref().expect("image cache");
+        interp
+            .display_list
+            .commands
+            .iter()
+            .filter_map(|command| match command {
+                RenderCommand::DrawImage(draw) => {
+                    let image = cache.get(draw.image_id).expect("admitted image");
+                    Some((image.width, image.height))
+                }
+                _ => None,
+            })
+            .collect()
+    }
 
     #[test]
-    fn image_downscale_to_footprint_shrinks_oversized_and_is_a_noop_otherwise() {
-        let make = |w: u32, h: u32| zpdf_image::DecodedImage {
-            width: w,
-            height: h,
-            data: vec![0u8; (w as usize) * (h as usize) * 4],
-            has_alpha: false,
-            is_image_mask: false,
-            premultiplied: false,
-        };
-        // A unit-square image placed at 100x100 user units, rendered at scale 2,
-        // covers a 200px device footprint. A 1000px source is 0.2x minified —
-        // well below the 0.5x threshold where the backend box-downscales anyway —
-        // so it is pre-shrunk to the 200x200 target (same size/filter the backend
-        // would use on draw, so the rasterized output is unchanged).
-        let ctm = Matrix::new(100.0, 0.0, 0.0, 100.0, 0.0, 0.0);
-        let mut img = make(1000, 1000);
-        maybe_downscale_to_footprint(&mut img, &ctm, 2.0);
-        assert_eq!((img.width, img.height), (200, 200));
-        assert_eq!(img.data.len(), 200 * 200 * 4);
+    fn image_footprints_are_filtered_from_the_source_and_cached_by_size() {
+        let (file, id) = footprint_image_file();
+        let resources = ResourceDict::default();
+        let mut cache = ImageCache::new();
+        let mut interp = ContentInterpreter::new(Rect::new(0.0, 0.0, 100.0, 100.0))
+            .with_document(&file, &resources)
+            .with_images(&mut cache)
+            .with_image_downscale(1.0);
+        // Small, then large, then the unfiltered source, then more sizes and
+        // repeats. 64 samples over 30 points is below 0.5x; 40 points is not.
+        for side in [30.0, 40.0, 10.0, 30.0, 64.0, 20.0, 10.0] {
+            draw_footprint(&mut interp, &file, id, side);
+        }
+        assert_eq!(
+            drawn_sizes(&interp),
+            [
+                (30, 30),
+                (64, 64),
+                (10, 10),
+                (30, 30),
+                (64, 64),
+                (20, 20),
+                (10, 10)
+            ],
+            "each draw uses its own footprint; a later larger draw never reuses a smaller copy"
+        );
+        let source = interp.image_sources.get(&id).expect("source entry");
+        assert_eq!(
+            source.decodes, 2,
+            "the 40pt draw decodes again; later sizes do not"
+        );
+        assert!(
+            source.retained.is_none(),
+            "the unfiltered copy in the cache serves later sizes"
+        );
+        assert_eq!(interp.retained_image_bytes, 0);
 
-        // Same footprint, but the source (250px, 0.8x) is above the 0.5x
-        // threshold: the backend samples it directly, so no pre-shrink.
-        let mut img2 = make(250, 250);
-        maybe_downscale_to_footprint(&mut img2, &ctm, 2.0);
-        assert_eq!((img2.width, img2.height), (250, 250));
+        let images = interp.image_cache.as_deref().expect("image cache");
+        assert_eq!(images.len(), 4, "one cached copy per size");
+        let full_id = interp.image_obj_cache[&(id, FOOTPRINT_SOURCE, FOOTPRINT_SOURCE)];
+        let full = images.get(full_id).expect("unfiltered copy");
+        for side in [30, 20, 10] {
+            let copy = images
+                .get(interp.image_obj_cache[&(id, side, side)])
+                .expect("filtered copy");
+            assert_eq!(
+                copy.data,
+                zpdf_image::box_downscale(full, side, side).data,
+                "{side}x{side} is filtered from the source, not from another copy"
+            );
+        }
+        let refiltered =
+            zpdf_image::box_downscale(&zpdf_image::box_downscale(full, 30, 30), 10, 10);
+        assert_ne!(
+            refiltered.data,
+            zpdf_image::box_downscale(full, 10, 10).data,
+            "the fixture distinguishes double filtering"
+        );
+    }
 
-        // scale 0.0 disables the pass entirely.
-        let mut img3 = make(1000, 1000);
-        maybe_downscale_to_footprint(&mut img3, &ctm, 0.0);
-        assert_eq!((img3.width, img3.height), (1000, 1000));
+    #[test]
+    fn large_then_small_filters_the_cached_source_without_decoding() {
+        let (file, id) = footprint_image_file();
+        let resources = ResourceDict::default();
+        let mut cache = ImageCache::new();
+        let mut interp = ContentInterpreter::new(Rect::new(0.0, 0.0, 100.0, 100.0))
+            .with_document(&file, &resources)
+            .with_images(&mut cache)
+            .with_image_downscale(1.0);
+        for side in [64.0, 10.0, 25.0] {
+            draw_footprint(&mut interp, &file, id, side);
+        }
+        assert_eq!(drawn_sizes(&interp), [(64, 64), (10, 10), (25, 25)]);
+        assert_eq!(interp.image_sources[&id].decodes, 1);
+    }
+
+    #[test]
+    fn minified_only_images_never_cache_their_source() {
+        let (file, id) = footprint_image_file();
+        let resources = ResourceDict::default();
+        let mut cache = ImageCache::new();
+        {
+            let mut interp = ContentInterpreter::new(Rect::new(0.0, 0.0, 100.0, 100.0))
+                .with_document(&file, &resources)
+                .with_images(&mut cache)
+                .with_image_downscale(1.0);
+            for _ in 0..3 {
+                draw_footprint(&mut interp, &file, id, 16.0);
+            }
+            assert_eq!(drawn_sizes(&interp), [(16, 16); 3]);
+            assert_eq!(interp.image_sources[&id].decodes, 1);
+        }
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.bytes_used(), 16 * 16 * 4);
+    }
+
+    #[test]
+    fn without_downscale_every_draw_shares_the_decoded_source() {
+        let (file, id) = footprint_image_file();
+        let resources = ResourceDict::default();
+        let mut cache = ImageCache::new();
+        let mut interp = ContentInterpreter::new(Rect::new(0.0, 0.0, 100.0, 100.0))
+            .with_document(&file, &resources)
+            .with_images(&mut cache);
+        for side in [10.0, 64.0, 30.0] {
+            draw_footprint(&mut interp, &file, id, side);
+        }
+        assert_eq!(drawn_sizes(&interp), [(64, 64); 3]);
+        assert_eq!(interp.image_sources[&id].decodes, 1);
+        assert_eq!(interp.image_cache.as_deref().map(ImageCache::len), Some(1));
+    }
+
+    #[test]
+    fn a_source_too_large_to_retain_is_never_decoded_a_third_time() {
+        let (file, id) = footprint_image_file();
+        let resources = ResourceDict::default();
+        let mut cache = ImageCache::new();
+        // Room for the filtered copies, not for the 16 KiB source.
+        let mut interp = ContentInterpreter::new(Rect::new(0.0, 0.0, 100.0, 100.0))
+            .with_document(&file, &resources)
+            .with_images(&mut cache)
+            .with_image_cache_limit(4096)
+            .with_image_downscale(1.0);
+        for side in [10.0, 20.0, 15.0, 10.0, 20.0, 12.0] {
+            draw_footprint(&mut interp, &file, id, side);
+        }
+        assert_eq!(
+            drawn_sizes(&interp),
+            [(10, 10), (20, 20), (10, 10), (20, 20)],
+            "new sizes after the second decode are skipped; cached sizes still draw"
+        );
+        assert_eq!(interp.image_sources[&id].decodes, 2);
+        assert!(interp.image_sources[&id].retained.is_none());
+        assert!(interp.rejected_image_objects.contains(&id));
+    }
+
+    #[test]
+    fn retained_sources_count_against_the_image_byte_limit() {
+        let (file, id) = footprint_image_file();
+        let resources = ResourceDict::default();
+        let mut cache = ImageCache::new();
+        let source_bytes = (FOOTPRINT_SOURCE * FOOTPRINT_SOURCE * 4) as u64;
+        // The source plus its first two copies fit; a fourth copy does not.
+        let limit = source_bytes + (10 * 10 + 20 * 20 + 15 * 15) * 4;
+        let mut interp = ContentInterpreter::new(Rect::new(0.0, 0.0, 100.0, 100.0))
+            .with_document(&file, &resources)
+            .with_images(&mut cache)
+            .with_image_cache_limit(limit)
+            .with_image_downscale(1.0);
+        for side in [10.0, 20.0, 15.0, 30.0] {
+            draw_footprint(&mut interp, &file, id, side);
+        }
+        assert_eq!(drawn_sizes(&interp), [(10, 10), (20, 20), (15, 15)]);
+        assert_eq!(interp.retained_image_bytes, source_bytes);
+        let used = interp
+            .image_cache
+            .as_deref()
+            .map_or(0, ImageCache::bytes_used);
+        assert!(used + interp.retained_image_bytes <= limit);
+        assert_eq!(interp.image_sources[&id].decodes, 2);
     }
 
     // ---- Ruled-line capture (rule sink for table detection) ----
