@@ -77,6 +77,11 @@ pub struct InterpretStats {
     pub image_ops: u64,
     pub form_ops: u64,
     pub color_ops: u64,
+    /// Glyphs and show operators drawn with another page font by the bounded
+    /// CAD font recovery. Deterministic.
+    pub font_repairs: u64,
+    /// Candidate validations that recovery spent; capped per page.
+    pub font_repair_probes: u64,
 }
 
 impl InterpretStats {

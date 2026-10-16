@@ -1,3 +1,4 @@
+mod font_repair;
 pub mod interpreter;
 mod mesh;
 pub mod output_intent;

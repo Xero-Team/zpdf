@@ -30,6 +30,35 @@
 - The CPU backend and the interpreter share one footprint rule and box filter,
   `zpdf_image::box_filter_size` and `zpdf_image::box_downscale`.
 
+### CAD font recovery
+
+- Recover text from malformed CAD (AutoCAD/nanoCAD) fonts while the page is
+  interpreted, within the page's operand, operator and time budgets and a
+  per-page validation cap. A broken embedded TrueType subset whose shown
+  glyphs have zero-length `loca` entries draws each such letter from another
+  page font only when that font maps the code to the identical `/ToUnicode`
+  text, draws a glyph for it and declares the same width; positions and
+  advances stay the original font's. Registered coverage stands in when no
+  page font validates.
+- A show whose bytes were typeset for a Type0 font but inherit a simple font
+  is shown with that Type0 font for the operator only, when its CMap decodes
+  every string exactly, every code has a glyph and the font has shown one of
+  the codes before. A show its Type0 font's CMap cannot decode exactly uses a
+  simple font of the same base name already used on the page that draws every
+  byte.
+- `InterpretStats` gains deterministic `font_repairs` and
+  `font_repair_probes` counters. `CidCMap::exact_code` and
+  `decodes_exactly` judge codespace membership without lenient recovery;
+  `LoadedFont::blank_hides_text`, `glyphs_usable`, `glyph_drawn`,
+  `blank_glyph_table` and `zpdf_font::is_visible_text` expose the checks.
+
+### Behavior changes
+
+- With a `FontProvider`, a blank glyph shown for visible `/ToUnicode` text in
+  an embedded font is treated as missing and resolved through registered
+  coverage. Whitespace, controls, format characters and private-use text keep
+  their blank glyphs.
+
 ### Breaking changes
 
 - `Path::elements` is no longer a public `Vec<PathElement>`. Iterating a path
