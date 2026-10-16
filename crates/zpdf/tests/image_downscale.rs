@@ -1,6 +1,7 @@
 //! `ContentInterpreter::with_image_downscale` must not change CPU output: a
 //! page rendered with images stored at their CPU footprint is byte-identical
-//! to the same page rendered from the full decoded sources.
+//! to the same page rendered from the full decoded sources, while no image is
+//! dropped for the image byte limit.
 #![cfg(feature = "cpu-render")]
 
 use std::io::Write;
@@ -73,6 +74,11 @@ fn image_obj(width: usize, height: usize, extra: &str, samples: &[u8]) -> Vec<u8
 /// draws `/Im`, `/GS0` a luminosity soft mask whose group draws `/Im`, and
 /// `/Sh` an axial shading.
 fn pdf(content: &[u8]) -> Vec<u8> {
+    page_pdf("/MediaBox [0 0 200 200]", content)
+}
+
+/// [`pdf`] with other page attributes (boxes, `/Rotate`).
+fn page_pdf(attributes: &str, content: &[u8]) -> Vec<u8> {
     let rgb = noise(300 * 200 * 3, 1);
     let alpha = noise(300 * 200, 2);
     let stencil = noise(300_usize.div_ceil(8) * 200, 3);
@@ -82,10 +88,12 @@ fn pdf(content: &[u8]) -> Vec<u8> {
     assemble(&[
         b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
         b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
-        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R \
-          /Resources << /XObject << /Im 5 0 R /Al 6 0 R /St 8 0 R /Wide 9 0 R >> \
-          /Pattern << /P0 10 0 R >> /ExtGState << /GS0 11 0 R >> /Shading << /Sh 13 0 R >> >> >>"
-            .to_vec(),
+        format!(
+            "<< /Type /Page /Parent 2 0 R {attributes} /Contents 4 0 R \
+             /Resources << /XObject << /Im 5 0 R /Al 6 0 R /St 8 0 R /Wide 9 0 R >> \
+             /Pattern << /P0 10 0 R >> /ExtGState << /GS0 11 0 R >> /Shading << /Sh 13 0 R >> >> >>"
+        )
+        .into_bytes(),
         stream_obj("", content),
         image_obj(300, 200, "/ColorSpace /DeviceRGB /BitsPerComponent 8", &rgb),
         image_obj(
@@ -114,12 +122,34 @@ fn pdf(content: &[u8]) -> Vec<u8> {
     ])
 }
 
+/// A page with a single `/Im` RGB image of `width`×`height` samples.
+fn single_image_pdf(width: usize, height: usize, attributes: &str, content: &[u8]) -> Vec<u8> {
+    assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        format!(
+            "<< /Type /Page /Parent 2 0 R {attributes} /Contents 4 0 R \
+             /Resources << /XObject << /Im 5 0 R >> >> >>"
+        )
+        .into_bytes(),
+        stream_obj("", content),
+        image_obj(
+            width,
+            height,
+            "/ColorSpace /DeviceRGB /BitsPerComponent 8",
+            &noise(width * height * 3, 7),
+        ),
+    ])
+}
+
 /// Stored image sizes, in display-list order.
 type Sizes = Vec<(u32, u32)>;
 
 struct Rendered {
     page: RenderedPage,
     sizes: Sizes,
+    /// Decoded image bytes the image cache retains for the render.
+    bytes: u64,
 }
 
 /// Which scale, if any, the interpreter stores image footprints for.
@@ -138,6 +168,7 @@ fn render(pdf: &[u8], scale: f32, limits: &ParseLimits, footprints: Footprints) 
     let mut images = ImageCache::new();
     let page_box = page.effective_box();
     let mut interpreter = ContentInterpreter::new(page_box)
+        .with_page_rotation(page.rotate)
         .with_fonts(&mut fonts)
         .with_document(doc.file(), &page.resources)
         .with_images(&mut images);
@@ -173,21 +204,27 @@ fn render(pdf: &[u8], scale: f32, limits: &ParseLimits, footprints: Footprints) 
             collect(&mask.commands.commands);
         }
     }
+    let bytes = images.bytes_used();
     let page = CpuRenderer::new()
         .with_limits(doc.file().limits())
         .with_fonts(&fonts)
         .with_images(&images)
         .render_display_list(&dl, scale)
         .expect("cpu render");
-    Rendered { page, sizes }
+    Rendered { page, sizes, bytes }
 }
 
-/// Render with and without footprint storage; the pixels must match exactly.
-/// Returns the stored image sizes of both runs.
+/// Render the shared fixture with and without footprint storage; the pixels
+/// must match exactly. Returns the stored image sizes of both runs.
 fn assert_identical(content: &[u8], scale: f32, limits: &ParseLimits) -> (Sizes, Sizes) {
-    let pdf = pdf(content);
-    let plain = render(&pdf, scale, limits, Footprints::Off);
-    let fitted = render(&pdf, scale, limits, Footprints::Renderer);
+    let (plain, fitted) = assert_identical_pdf(&pdf(content), scale, limits);
+    (plain.sizes, fitted.sizes)
+}
+
+/// Render `pdf` with and without footprint storage; the pixels must match.
+fn assert_identical_pdf(pdf: &[u8], scale: f32, limits: &ParseLimits) -> (Rendered, Rendered) {
+    let plain = render(pdf, scale, limits, Footprints::Off);
+    let fitted = render(pdf, scale, limits, Footprints::Renderer);
     assert_eq!(
         (plain.page.width, plain.page.height),
         (fitted.page.width, fitted.page.height)
@@ -218,7 +255,7 @@ fn assert_identical(content: &[u8], scale: f32, limits: &ParseLimits) -> (Sizes,
             &fitted.page.data[pixel * 4..pixel * 4 + 4],
         );
     }
-    (plain.sizes, fitted.sizes)
+    (plain, fitted)
 }
 
 fn largest(sizes: &[(u32, u32)]) -> u64 {
@@ -253,6 +290,7 @@ fn small_then_large_under_two_transforms() {
         &ParseLimits::default(),
     );
     assert_eq!(plain, [(300, 200); 3]);
+    // The unminified draw puts the source in the image cache.
     assert_eq!(fitted, [(41, 31), (100, 70), (300, 200)]);
 }
 
@@ -264,7 +302,9 @@ fn large_then_small_under_two_transforms() {
         1.0,
         &ParseLimits::default(),
     );
-    assert_eq!(fitted, [(300, 200), (100, 70), (41, 31)]);
+    // Once the source is cached, later draws use it and the renderer
+    // filters them exactly as without the option.
+    assert_eq!(fitted, [(300, 200); 3]);
 }
 
 #[test]
@@ -388,4 +428,81 @@ fn footprints_for_another_scale_change_the_raster() {
     let other = render(&pdf, 1.0, &limits, Footprints::At(0.7));
     assert_eq!(other.sizes, [(28, 21)]);
     assert_ne!(plain.page.data, other.page.data);
+}
+
+#[test]
+fn a_sub_pixel_axis_is_filtered_once_from_the_source() {
+    // 0.45 device pixels wide: the footprint keeps one column, and filtering
+    // that 1x310 copy again would give 1x309. The source must stay unfiltered
+    // so the renderer filters it once, as without the option.
+    let pdf = single_image_pdf(
+        2,
+        2446,
+        "/MediaBox [0 0 40 329]",
+        b"q 0.45 0 0 309 10.3 5 cm /Im Do Q",
+    );
+    let (plain, fitted) = assert_identical_pdf(&pdf, 1.0, &ParseLimits::default());
+    assert_eq!(plain.sizes, [(2, 2446)]);
+    assert_eq!(fitted.sizes, [(2, 2446)]);
+}
+
+#[test]
+fn the_image_byte_limit_drops_nothing_the_source_path_draws() {
+    let limits = ParseLimits {
+        max_image_cache_bytes: 400_000,
+        ..ParseLimits::default()
+    };
+    let pdf = single_image_pdf(
+        300,
+        200,
+        "/MediaBox [0 0 300 200]",
+        b"q 140 0 0 90 0 0 cm /Im Do Q q 130 0 0 85 10 100 cm /Im Do Q \
+          q 120 0 0 80 150 0 cm /Im Do Q q 110 0 0 75 150 100 cm /Im Do Q \
+          q 100 0 0 70 50 50 cm /Im Do Q",
+    );
+    let (plain, fitted) = assert_identical_pdf(&pdf, 1.0, &limits);
+    assert_eq!(plain.sizes.len(), 5);
+    assert_eq!(fitted.sizes.len(), 5, "{:?}", fitted.sizes);
+    assert!(fitted.bytes <= limits.max_image_cache_bytes);
+}
+
+#[test]
+fn many_sizes_of_one_image_stay_within_twice_its_source() {
+    let content: String = (0..60)
+        .map(|i| format!("q {} 0 0 {} 0 0 cm /Im Do Q ", 299 - i * 3, 199 - i * 2))
+        .collect();
+    let pdf = single_image_pdf(600, 400, "/MediaBox [0 0 300 200]", content.as_bytes());
+    let (plain, fitted) = assert_identical_pdf(&pdf, 1.0, &ParseLimits::default());
+    assert_eq!(plain.bytes, 600 * 400 * 4);
+    assert!(
+        fitted.bytes <= 2 * plain.bytes,
+        "{} retained for a {}-byte source",
+        fitted.bytes,
+        plain.bytes
+    );
+    assert_eq!(fitted.sizes.len(), 60);
+}
+
+#[test]
+fn rotated_cropped_pages() {
+    let limits = ParseLimits {
+        max_page_pixels: 9_000,
+        ..ParseLimits::default()
+    };
+    let content: &[u8] = b"q 150 0 0 100 30 40 cm /Im Do Q q 40 30 -20 50 160 120 cm /Im Do Q \
+        q 40 0 0 30 20 150 cm /St Do Q";
+    for rotate in [90, 180, 270] {
+        let pdf = page_pdf(
+            &format!("/MediaBox [0 0 250 230] /CropBox [13.3 7.7 211.1 207.9] /Rotate {rotate}"),
+            content,
+        );
+        for (scale, limits) in [(1.0, ParseLimits::default()), (2.0, limits.clone())] {
+            let (plain, fitted) = assert_identical_pdf(&pdf, scale, &limits);
+            assert!(
+                fitted.sizes != plain.sizes,
+                "rotate {rotate}, scale {scale}: {:?}",
+                fitted.sizes
+            );
+        }
+    }
 }
