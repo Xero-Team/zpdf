@@ -41,7 +41,7 @@ image.workspace = true
 # compressed bytes and breaking the byte-exact CJK/CMap writer tests. Plain
 # `deflate-flate2` uses flate2's default `rust_backend` (= `miniz_oxide`),
 # matching the rest of the workspace, so no backend changes and no C deps.
-zip = { version = "8.6", default-features = false, features = ["deflate-flate2"] }
+zip = { version = "9.0", default-features = false, features = ["deflate-flate2"] }
 
 # XML generation for OOXML
 quick-xml = { version = "0.42", features = ["serialize"] }
