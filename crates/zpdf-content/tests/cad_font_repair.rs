@@ -3,6 +3,7 @@
 //! blocks overridden for one operator. Every repair needs evidence gathered
 //! during interpretation and stops when its page budget is spent.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use zpdf_content::interpreter::ContentInterpreter;
@@ -628,6 +629,75 @@ fn broken_simple_subsets_are_repaired_per_glyph_too() {
     );
     assert_eq!(stats.font_repairs, 2);
     assert_eq!(spans[0].text, "A B");
+}
+
+#[test]
+fn one_code_outside_the_collection_keeps_the_type0_operator() {
+    // UniJIS-UCS2-H codes are Unicode scalars; U+4E66 (书) has no
+    // Adobe-Japan1 CID while the rest of the line does. Every byte of these
+    // codes is printable ASCII, so the same-name simple font could draw the
+    // whole operator.
+    let cmap = CidCMap::predefined("UniJIS-UCS2-H").unwrap();
+    let codes: Vec<u16> = "中字本年大山水书".encode_utf16().collect();
+    assert_eq!(cmap.code_to_cid(0x4E66, 2), 0);
+    assert!(codes[..7]
+        .iter()
+        .all(|&code| cmap.code_to_cid(code as u32, 2) != 0));
+    assert!(codes
+        .iter()
+        .flat_map(|code| code.to_be_bytes())
+        .all(|byte| (0x20..0x7F).contains(&byte)));
+    let mut composite = type0(large(), "ABCDEF+Large", b"");
+    composite.cid_cmap = Some(cmap);
+    let mut page = new_page(vec![("T0", composite), ("S0", latin("GHIJKL+Large"))]);
+    let t0 = page.ids[0];
+    let bytes: Vec<u8> = codes.iter().flat_map(|code| code.to_be_bytes()).collect();
+    let content = format!("BT /S0 10 Tf (x) Tj /T0 10 Tf <{}> Tj ET", hex(&bytes));
+    let (list, stats, _) = page.run(content.as_bytes());
+    let runs = fonts_and_glyphs(&list);
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[1].0, t0, "one missing character is not leaked text");
+    assert_eq!(runs[1].1.len(), 8);
+    assert_eq!(runs[1].1[7], 0, "the missing character keeps .notdef");
+    assert_eq!(stats.font_repairs, 0);
+}
+
+#[test]
+fn one_cid_missing_from_the_cid_map_keeps_the_type0_operator() {
+    let mut composite = type0(
+        large(),
+        "ABCDEF+Large",
+        b"3 beginbfchar <4142> <4E2D> <4344> <6587> <4546> <5B57> endbfchar",
+    );
+    composite.cid_to_gid = Some(HashMap::from([(0x4142, 0x4142), (0x4344, 0x4344)]));
+    let mut page = new_page(vec![("T0", composite), ("S0", latin("GHIJKL+Large"))]);
+    let t0 = page.ids[0];
+    let (list, stats, spans) = page.run(b"BT /S0 10 Tf (x) Tj /T0 10 Tf <414243444546> Tj ET");
+    assert_eq!(
+        fonts_and_glyphs(&list)[1],
+        (t0, vec![0x4142, 0x4344, 0x4546])
+    );
+    assert_eq!(stats.font_repairs, 0);
+    assert_eq!(spans[1].text, "中文字");
+}
+
+#[test]
+fn a_type0_show_with_no_drawable_code_is_still_leaked_simple_text() {
+    let mut composite = type0(CAD, "ABCDEF+ZpdfCadSubset", TO_UNICODE);
+    composite.cid_to_gid = Some(HashMap::from([(2, 2), (3, 3)]));
+    let mut page = new_page(vec![
+        ("C2", composite),
+        ("TT", simple("GHIJKL+ZpdfCadSubset")),
+    ]);
+    let (c2, tt) = (page.ids[0], page.ids[1]);
+    // Even-length `AB` decodes to one code, 0x4142, which has no glyph.
+    let (list, stats, spans) = page.run(b"BT /TT 10 Tf (D) Tj /C2 10 Tf <0002> Tj (AB) Tj ET");
+    assert_eq!(
+        fonts_and_glyphs(&list),
+        vec![(tt, vec![5]), (c2, vec![2]), (tt, vec![2, 3])]
+    );
+    assert_eq!(stats.font_repairs, 1);
+    assert_eq!(spans[2].text, "AB");
 }
 
 /// A realistic page with a system CJK font: Chinese text in a full

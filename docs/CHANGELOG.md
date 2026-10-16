@@ -49,7 +49,7 @@
   font cannot draw. At least half of the codes must have been shown with
   that font under its own `Tf`, and it must draw every code (a blank glyph
   only where the code means whitespace). A show its Type0 font cannot decode
-  even leniently (a trailing fragment, or a code without CID or glyph) uses
+  even leniently (a trailing fragment, or no code with a CID and glyph) uses
   a simple font of the same base name shown on the page that draws every
   byte. Shows under such an override are never evidence.
 - `CidCMap::exact_code` and `CidCMap::decodes_exactly` judge codespace

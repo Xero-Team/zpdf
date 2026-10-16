@@ -20,8 +20,8 @@
 //!   candidate before, and its glyphs must draw every code (blank only where
 //!   the code means whitespace).
 //! - **Leaked simple text.** A show under a Type0 font whose CMap cannot
-//!   decode it even leniently (a fragment shorter than any code, or a code
-//!   without CID or glyph) is shown with a simple font of the same base name
+//!   decode it even leniently (a fragment shorter than any code, or no code
+//!   with a CID and glyph) is shown with a simple font of the same base name
 //!   already shown on the page, when that font draws every byte.
 //!
 //! Leak repairs override the font for one operator only and never become the
@@ -435,10 +435,10 @@ impl FontRepair {
         Some(id)
     }
 
-    /// Simple bytes shown with a Type0 font: only strings its CMap cannot
-    /// decode even leniently (a fragment shorter than any code, or a code
-    /// without a CID or glyph) count, and the replacement is a simple font of
-    /// the same base name shown on the page that draws every byte.
+    /// Simple bytes shown with a Type0 font: only an operator its CMap cannot
+    /// decode even leniently counts (see [`undecodable`]), and the
+    /// replacement is a simple font of the same base name shown on the page
+    /// that draws every byte.
     fn simple_text_in_composite<'b, I>(
         &mut self,
         cache: &FontCache,
@@ -462,7 +462,7 @@ impl FontRepair {
                 })
             })
             .collect();
-        if candidates.is_empty() || !strings().any(|bytes| undecodable(font, bytes)) {
+        if candidates.is_empty() || !undecodable(font, strings()) {
             return None;
         }
         let total: usize = strings().map(<[u8]>::len).sum();
@@ -490,45 +490,49 @@ impl FontRepair {
 }
 
 /// Whether a Type0 font's lenient decoding, as `show_text` performs it,
-/// fails for `bytes`: a fragment shorter than any declared code is left, or
-/// a code has no CID or no glyph in the font's CID → GID map. Codes outside
-/// the declared codespace that still decode are not evidence.
-fn undecodable(font: &LoadedFont, bytes: &[u8]) -> bool {
+/// genuinely fails for an operator's strings: one ends in a fragment shorter
+/// than any declared code, or no code at all has a CID with a glyph in the
+/// font's CID → GID map. One code outside the font's collection among
+/// drawable ones is a missing character, not leaked text, and codes outside
+/// the declared codespace that still decode are not evidence either.
+fn undecodable<'b>(font: &LoadedFont, strings: impl Iterator<Item = &'b [u8]>) -> bool {
     let cmap = font.cid_cmap.as_ref();
     let shortest = cmap.map_or(2, CidCMap::shortest_code_length);
+    // Unicode-coded and legacy substitutes draw by code, not by CID.
     let direct = font.unicode_coded() || font.legacy_substitute();
-    let mut rest = bytes;
-    while !rest.is_empty() {
-        let (code, length) = match cmap {
-            Some(cmap) => cmap.next_code(rest),
-            None => {
-                let length = rest.len().min(2);
-                let code = rest[..length]
-                    .iter()
-                    .fold(0u32, |value, &byte| (value << 8) | byte as u32);
-                (code, length)
-            }
-        };
-        if length < shortest {
-            return true;
-        }
-        if !direct {
-            let cid = cmap.map_or(code, |cmap| cmap.code_to_cid(code, length as u8));
-            let mapped = u16::try_from(cid)
-                .ok()
-                .filter(|&cid| cid != 0)
-                .is_some_and(|cid| {
-                    font.cid_to_gid
-                        .as_ref()
-                        .is_none_or(|map| map.get(&cid).is_some_and(|&gid| gid != 0))
-                });
-            if !mapped {
+    let (mut codes, mut drawable) = (0usize, false);
+    for bytes in strings {
+        let mut rest = bytes;
+        while !rest.is_empty() {
+            let (code, length) = match cmap {
+                Some(cmap) => cmap.next_code(rest),
+                None => {
+                    let length = rest.len().min(2);
+                    let code = rest[..length]
+                        .iter()
+                        .fold(0u32, |value, &byte| (value << 8) | byte as u32);
+                    (code, length)
+                }
+            };
+            if length < shortest {
                 return true;
             }
+            codes += 1;
+            drawable = drawable || direct || {
+                let cid = cmap.map_or(code, |cmap| cmap.code_to_cid(code, length as u8));
+                u16::try_from(cid)
+                    .ok()
+                    .filter(|&cid| cid != 0)
+                    .is_some_and(|cid| {
+                        font.cid_to_gid
+                            .as_ref()
+                            .is_none_or(|map| map.get(&cid).is_some_and(|&gid| gid != 0))
+                    })
+            };
+            rest = &rest[length.max(1)..];
         }
-        rest = &rest[length.max(1)..];
     }
-    false
+    codes > 0 && !drawable
 }
 
 /// Per-page simple-font code → glyph id table (0 = not looked up yet).
