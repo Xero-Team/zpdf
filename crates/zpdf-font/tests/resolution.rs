@@ -248,3 +248,125 @@ fn explicit_encoding_miss_does_not_alias_an_ascii_glyph() {
     let face = ttf_parser::Face::parse(FALLBACK, 0).unwrap();
     assert_eq!(result.glyph_id, face.glyph_index('\u{4F01}').unwrap().0);
 }
+
+const CAD: &[u8] = include_bytes!("fixtures/cad-subset.ttf");
+const CAD_BROKEN: &[u8] = include_bytes!("fixtures/cad-subset-broken.ttf");
+
+/// Identity-H composite over a CAD fixture: CID n is glyph n (1 = space,
+/// 2..=5 = `A`..`D`, 6 = `Ж`).
+fn cad_font(program: &[u8], to_unicode: &[u8]) -> LoadedFont {
+    let mut font = LoadedFont::new_with_data(
+        PdfFontType::Type0CidType2,
+        "ABCDEF+ZpdfCadSubset".into(),
+        program.to_vec(),
+        CidWidths::new(1000.0),
+    );
+    font.cid_cmap = Some(zpdf_font::cmap::CidCMap::identity(0));
+    font.to_unicode = Some(ToUnicodeMap::parse(to_unicode));
+    font
+}
+
+#[test]
+fn blank_glyph_tables_read_loca_lengths() {
+    let healthy = cad_font(CAD, b"");
+    let broken = cad_font(CAD_BROKEN, b"");
+    let table = healthy.blank_glyph_table().unwrap();
+    assert!(table.is_blank(&healthy, 1), "space glyph");
+    assert!(!table.is_blank(&healthy, 2));
+    assert!(
+        !table.is_blank(&healthy, 0),
+        ".notdef is missing, not blank"
+    );
+    assert!(!table.is_blank(&healthy, 7), "beyond numGlyphs");
+    let table = broken.blank_glyph_table().unwrap();
+    assert!((1..=6).all(|gid| table.is_blank(&broken, gid)));
+    // Substitutes and programs without `glyf` are never inspected.
+    let substitute = LoadedFont::new_substitute(
+        PdfFontType::TrueType,
+        "Sub".into(),
+        Arc::from(CAD_BROKEN),
+        0,
+        CidWidths::new(1000.0),
+    )
+    .unwrap();
+    assert!(substitute.blank_glyph_table().is_none());
+    let cff = LoadedFont::new_with_data(
+        PdfFontType::Type0CidType2,
+        "Cff".into(),
+        include_bytes!("fixtures/coverage-cid.otf").to_vec(),
+        CidWidths::new(1000.0),
+    );
+    assert!(cff.blank_glyph_table().is_none());
+}
+
+#[test]
+fn visible_text_excludes_spaces_controls_format_and_private_use() {
+    for text in ["A", "Ж", "中", "fi", " A", "\u{200B}A"] {
+        assert!(zpdf_font::is_visible_text(text), "{text:?}");
+    }
+    for text in [
+        "",
+        " ",
+        "\u{A0}",
+        "\u{3000}",
+        "\t",
+        "\u{0}",
+        "\u{AD}",
+        "\u{200B}",
+        "\u{FEFF}",
+        "\u{E000}",
+        "\u{F0000}",
+        "\u{2800}",
+    ] {
+        assert!(!zpdf_font::is_visible_text(text), "{text:?}");
+    }
+}
+
+#[test]
+fn blank_glyph_shown_for_visible_text_falls_back_to_registered_coverage() {
+    let provider = Arc::new(FontProvider::memory_only());
+    provider.register(PRIMARY, 0).unwrap();
+    let mut cache = FontCache::new().with_provider(provider);
+    let font = cad_font(
+        CAD_BROKEN,
+        b"2 beginbfchar <0002> <0041> <0001> <0020> endbfchar",
+    );
+    assert!(font.blank_hides_text(2, 2));
+    assert!(!font.blank_hides_text(1, 1));
+    let id = cache.insert("F".into(), font);
+    assert!(!cache.original_glyphs_usable(id, [(2, 2, 2, 2)].into_iter()));
+    let resolved = cache.resolve_drawing_glyph(
+        DrawingGlyph {
+            font_id: id,
+            glyph_id: 2,
+        },
+        2,
+        2,
+        2,
+        u64::MAX,
+    );
+    assert_ne!(resolved.font_id, id);
+    let face = ttf_parser::Face::parse(PRIMARY, 0).unwrap();
+    assert_eq!(resolved.glyph_id, face.glyph_index('A').unwrap().0);
+}
+
+#[test]
+fn genuine_blank_spaces_keep_their_font() {
+    let provider = Arc::new(FontProvider::memory_only());
+    provider.register(PRIMARY, 0).unwrap();
+    for space in ["0020", "00A0", "3000"] {
+        let mut cache = FontCache::new().with_provider(Arc::clone(&provider));
+        let mapping = format!("1 beginbfchar <0001> <{space}> endbfchar");
+        let id = cache.insert("F".into(), cad_font(CAD, mapping.as_bytes()));
+        assert!(cache.original_glyphs_usable(id, [(1, 1, 1, 2)].into_iter()));
+        let original = DrawingGlyph {
+            font_id: id,
+            glyph_id: 1,
+        };
+        assert_eq!(
+            cache.resolve_drawing_glyph(original, 1, 1, 2, u64::MAX),
+            original
+        );
+        assert_eq!(cache.len(), 1, "U+{space} admitted no fallback face");
+    }
+}

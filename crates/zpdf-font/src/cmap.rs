@@ -681,13 +681,8 @@ impl CidCMap {
             return (0, 1);
         }
         if self.codes_are_unicode && self.utf16 {
-            let high = u16::from_be_bytes([bytes[0], *bytes.get(1).unwrap_or(&0)]);
-            if (0xD800..=0xDBFF).contains(&high) && bytes.len() >= 4 {
-                let low = u16::from_be_bytes([bytes[2], bytes[3]]);
-                if (0xDC00..=0xDFFF).contains(&low) {
-                    let scalar = 0x1_0000 + ((high as u32 - 0xD800) << 10) + (low as u32 - 0xDC00);
-                    return (scalar, 4);
-                }
+            if let Some(pair) = utf16_pair(bytes) {
+                return pair;
             }
             let len = bytes.len().min(2);
             return (bytes_to_code(&bytes[..len]), len);
@@ -697,17 +692,8 @@ impl CidCMap {
             let len = bytes.len().min(2);
             return (bytes_to_code(&bytes[..len]), len);
         }
-        // Match the shortest declared range containing the prefix value.
-        for want in 1..=4usize {
-            if bytes.len() < want {
-                break;
-            }
-            let v = bytes_to_code(&bytes[..want]);
-            for &(len, lo, hi) in spaces {
-                if len as usize == want && v >= lo && v <= hi {
-                    return (v, want);
-                }
-            }
+        if let Some(code) = codespace_code(spaces, bytes) {
+            return code;
         }
         // No range matched: consume the shortest declared length.
         let min_len = spaces
@@ -717,6 +703,46 @@ impl CidCMap {
             .unwrap_or(2)
             .min(bytes.len());
         (bytes_to_code(&bytes[..min_len.max(1)]), min_len.max(1))
+    }
+
+    /// [`Self::next_code`] without its lenient recovery: `None` unless the
+    /// next code is complete and lies in a declared codespace range (two-byte
+    /// code units for Identity and UTF-16 maps).
+    pub fn exact_code(&self, bytes: &[u8]) -> Option<(u32, usize)> {
+        if self.codes_are_unicode && self.utf16 {
+            let unit = bytes.get(..2)?;
+            return Some(utf16_pair(bytes).unwrap_or((bytes_to_code(unit), 2)));
+        }
+        let spaces = self.codespaces();
+        if spaces.is_empty() {
+            return (bytes.len() >= 2).then(|| (bytes_to_code(&bytes[..2]), 2));
+        }
+        codespace_code(spaces, bytes)
+    }
+
+    /// Whether `bytes` segment completely into in-codespace codes, so that a
+    /// string can be judged as text for this CMap rather than recovered.
+    pub fn decodes_exactly(&self, bytes: &[u8]) -> bool {
+        // UTF-16 accepts every complete code unit; one full-range codespace
+        // accepts every complete code. Only the length can then fail.
+        if self.codes_are_unicode && self.utf16 {
+            return bytes.len().is_multiple_of(2);
+        }
+        match self.codespaces() {
+            [] => return bytes.len().is_multiple_of(2),
+            &[(length @ 1..=4, 0, high)] if high == u32::MAX >> (32 - 8 * length as u32) => {
+                return bytes.len().is_multiple_of(length as usize);
+            }
+            _ => {}
+        }
+        let mut rest = bytes;
+        while !rest.is_empty() {
+            match self.exact_code(rest) {
+                Some((_, length)) => rest = &rest[length..],
+                None => return false,
+            }
+        }
+        true
     }
 
     /// Map a code (with its byte length) to a CID.
@@ -1090,6 +1116,29 @@ fn is_number(word: &[u8]) -> bool {
 // ---------------------------------------------------------------------------
 // Numeric / Unicode helpers
 // ---------------------------------------------------------------------------
+
+/// A UTF-16 surrogate pair at the start of `bytes`, as one scalar code.
+fn utf16_pair(bytes: &[u8]) -> Option<(u32, usize)> {
+    let high = u16::from_be_bytes([*bytes.first()?, *bytes.get(1)?]);
+    let low = u16::from_be_bytes([*bytes.get(2)?, *bytes.get(3)?]);
+    ((0xD800..=0xDBFF).contains(&high) && (0xDC00..=0xDFFF).contains(&low)).then(|| {
+        let scalar = 0x1_0000 + ((high as u32 - 0xD800) << 10) + (low as u32 - 0xDC00);
+        (scalar, 4)
+    })
+}
+
+/// The shortest declared codespace range containing the prefix value.
+fn codespace_code(spaces: &[(u8, u32, u32)], bytes: &[u8]) -> Option<(u32, usize)> {
+    for want in 1..=4usize.min(bytes.len()) {
+        let v = bytes_to_code(&bytes[..want]);
+        for &(len, lo, hi) in spaces {
+            if len as usize == want && v >= lo && v <= hi {
+                return Some((v, want));
+            }
+        }
+    }
+    None
+}
 
 /// Interpret raw bytes as a big-endian unsigned integer (source character code).
 fn bytes_to_code(bytes: &[u8]) -> u32 {
@@ -1494,6 +1543,31 @@ mod tests {
         assert_eq!(m.code_to_cid(0x80, 1), 9999);
         // Unmapped code in a non-identity CMap → CID 0.
         assert_eq!(m.code_to_cid(0x9000, 2), 0);
+    }
+
+    #[test]
+    fn exact_codes_follow_mixed_codespaces_without_lenient_recovery() {
+        let m =
+            CidCMap::parse(b"2 begincodespacerange\n<00> <7F>\n<8140> <FEFF>\nendcodespacerange\n");
+        // Odd lengths are valid text when one-byte ranges exist.
+        assert!(m.decodes_exactly(b"\x41\x81\x40"));
+        assert_eq!(m.exact_code(b"\x81\x40\x41"), Some((0x8140, 2)));
+        // A partial trailing code or a byte outside every range is not text,
+        // although `next_code` still consumes it leniently.
+        assert!(!m.decodes_exactly(b"\x41\x81"));
+        assert_eq!(m.exact_code(b"\x80\x41"), None);
+        assert_eq!(m.next_code(b"\x80\x41"), (0x80, 1));
+
+        let identity = CidCMap::identity(0);
+        assert!(identity.decodes_exactly(b"\x00\x13\x01\x16"));
+        assert!(!identity.decodes_exactly(b"\x31"));
+        assert_eq!(identity.exact_code(b"\x31"), None);
+        assert_eq!(identity.next_code(b"\x31"), (0x31, 1));
+
+        let utf16 = CidCMap::predefined("UniGB-UTF16-H").unwrap();
+        assert_eq!(utf16.exact_code(b"\xD8\x40\xDC\x00"), Some((0x20000, 4)));
+        assert!(utf16.decodes_exactly(b"\x4E\x2D\xD8\x40\xDC\x00"));
+        assert!(!utf16.decodes_exactly(b"\x4E\x2D\x41"));
     }
 
     #[test]

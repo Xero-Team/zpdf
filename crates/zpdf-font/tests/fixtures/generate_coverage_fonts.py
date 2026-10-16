@@ -34,13 +34,14 @@ def outline(index):
             + struct.pack(">hhhh", 0, 0, height, 0))
 
 
-def make_font(family, codepoints, bold=False, variations=False, vertical=False, vorg=False):
+def make_font(family, codepoints, bold=False, variations=False, vertical=False, vorg=False,
+              blank=frozenset({32})):
     codepoints = sorted(set(codepoints))
     count = len(codepoints) + 1
     glyf = bytearray()
     offsets = [0]
     for index, codepoint in enumerate([None] + codepoints):
-        if codepoint != 32:
+        if codepoint not in blank:
             glyf.extend(outline(index))
             glyf.extend(bytes((-len(glyf)) % 4))
         offsets.append(len(glyf))
@@ -258,6 +259,18 @@ def main():
         else:
             path.write_bytes(data)
         print(f"{filename}: {len(codepoints)} mapped scalars, {len(data)} bytes")
+    # A CAD subset and a broken copy that keeps the same glyph ids but zero
+    # `loca` lengths for every glyph, as some AutoCAD Identity-H subsets do.
+    cad = [32, 0x41, 0x42, 0x43, 0x44, 0x416]
+    for filename, blank in [("cad-subset.ttf", {32}), ("cad-subset-broken.ttf", set(cad))]:
+        data = make_font("ZpdfCadSubset", cad, blank=blank)
+        path = directory / filename
+        if args.check:
+            if path.read_bytes() != data:
+                raise SystemExit(f"Fixture is not reproducible: {path}")
+        else:
+            path.write_bytes(data)
+        print(f"{filename}: {len(cad)} mapped scalars, {len(data)} bytes")
     path = directory / "coverage-type1.pfa"
     data = make_type1()
     if args.check:
