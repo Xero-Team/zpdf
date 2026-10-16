@@ -32,25 +32,30 @@
 
 ### CAD font recovery
 
-- Recover text from malformed CAD (AutoCAD/nanoCAD) fonts while the page is
-  interpreted, within the page's operand, operator and time budgets and a
-  per-page validation cap. A broken embedded TrueType subset whose shown
-  glyphs have zero-length `loca` entries draws each such letter from another
-  page font only when that font maps the code to the identical `/ToUnicode`
-  text, draws a glyph for it and declares the same width; positions and
-  advances stay the original font's. Registered coverage stands in when no
-  page font validates.
+- Recover text from malformed CAD (AutoCAD/nanoCAD) fonts from evidence
+  gathered while the page is interpreted, without a pre-scan. Recovery is
+  bounded per operator and by a per-page validation cap, after which it is
+  disabled for the page.
+- A broken embedded TrueType subset whose shown glyphs have zero-length
+  `loca` entries draws each such letter from another font of the page or
+  enclosing Form only when that font maps the code to the identical
+  `/ToUnicode` text, draws a glyph for it and declares the same width;
+  positions and advances stay the original font's. Registered coverage
+  stands in when no font validates.
 - A show whose bytes were typeset for a Type0 font but inherit a simple font
-  is shown with that Type0 font for the operator only, when its CMap decodes
-  every string exactly, every code has a glyph and the font has shown one of
-  the codes before. A show its Type0 font's CMap cannot decode exactly uses a
-  simple font of the same base name already used on the page that draws every
-  byte.
+  is shown with that Type0 font for the operator only when the bytes have the
+  shape of such a leak: the Type0 font's CMap decodes every string exactly
+  and every multi-byte code starts with a non-whitespace byte the simple
+  font cannot draw. At least half of the codes must have been shown with
+  that font under its own `Tf`, and it must draw every code (a blank glyph
+  only where the code means whitespace). A show its Type0 font cannot decode
+  even leniently (a trailing fragment, or a code without CID or glyph) uses
+  a simple font of the same base name shown on the page that draws every
+  byte. Shows under such an override are never evidence.
+- `CidCMap::exact_code` and `CidCMap::decodes_exactly` judge codespace
+  membership without the lenient recovery of `next_code`.
 - `InterpretStats` gains deterministic `font_repairs` and
-  `font_repair_probes` counters. `CidCMap::exact_code` and
-  `decodes_exactly` judge codespace membership without lenient recovery;
-  `LoadedFont::blank_hides_text`, `glyphs_usable`, `glyph_drawn`,
-  `blank_glyph_table` and `zpdf_font::is_visible_text` expose the checks.
+  `font_repair_probes` counters, also reported by `describe()`.
 
 ### Behavior changes
 
@@ -76,6 +81,8 @@
   | `path.elements.push(e)`, `path.elements.extend(..)` | `path.push(e)`, `path.extend(..)` (elements or `&PathElement`s) |
   | `path.elements.extend_from_slice(&other.elements)` | `path.extend_from_path(&other)` |
   | Visiting every point (bounds, transforms) | `path.points()`, `path.points_mut()`, `path.map_points(f)` |
+- `InterpretStats` is `#[non_exhaustive]` and has new fields: build it with
+  `InterpretStats::default()` and assign fields instead of a struct literal.
 
 ## 0.15.1 — Installable CLI and PPTX export again
 

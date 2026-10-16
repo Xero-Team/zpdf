@@ -720,6 +720,20 @@ impl CidCMap {
         codespace_code(spaces, bytes)
     }
 
+    /// Byte length of the shortest declared code. A code [`Self::next_code`]
+    /// returns with fewer bytes is a fragment left at the end of a string.
+    #[doc(hidden)]
+    pub fn shortest_code_length(&self) -> usize {
+        if self.codes_are_unicode && self.utf16 {
+            return 2;
+        }
+        self.codespaces()
+            .iter()
+            .map(|&(length, _, _)| length as usize)
+            .min()
+            .unwrap_or(2)
+    }
+
     /// Whether `bytes` segment completely into in-codespace codes, so that a
     /// string can be judged as text for this CMap rather than recovered.
     pub fn decodes_exactly(&self, bytes: &[u8]) -> bool {

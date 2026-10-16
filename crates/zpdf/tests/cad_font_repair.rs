@@ -50,8 +50,73 @@ enum Font {
     Simple(&'static [u8], &'static str),
 }
 
+/// Font objects appended to `objects`; returns the font dictionary's id.
+fn push_font(objects: &mut Vec<Vec<u8>>, font: &Font) -> usize {
+    let first = objects.len() + 1;
+    match *font {
+        Font::Type0(program, name) => {
+            objects.push(
+                format!(
+                    "<< /Type /Font /Subtype /Type0 /BaseFont /{name} /Encoding /Identity-H \
+                     /DescendantFonts [{} 0 R] /ToUnicode {} 0 R >>",
+                    first + 1,
+                    first + 4
+                )
+                .into_bytes(),
+            );
+            objects.push(
+                format!(
+                    "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /{name} \
+                     /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> \
+                     /FontDescriptor {} 0 R /DW 1000 /W [1 [350]] /CIDToGIDMap /Identity >>",
+                    first + 2
+                )
+                .into_bytes(),
+            );
+            objects.push(
+                format!(
+                    "<< /Type /FontDescriptor /FontName /{name} /Flags 4 \
+                     /FontBBox [0 -200 1000 900] /ItalicAngle 0 /Ascent 900 /Descent -200 \
+                     /CapHeight 700 /StemV 80 /FontFile2 {} 0 R >>",
+                    first + 3
+                )
+                .into_bytes(),
+            );
+            objects.push(stream(&format!("/Length1 {}", program.len()), program));
+            objects.push(stream("", TO_UNICODE));
+        }
+        Font::Simple(program, name) => {
+            objects.push(
+                format!(
+                    "<< /Type /Font /Subtype /TrueType /BaseFont /{name} \
+                     /FontDescriptor {} 0 R >>",
+                    first + 1
+                )
+                .into_bytes(),
+            );
+            objects.push(
+                format!(
+                    "<< /Type /FontDescriptor /FontName /{name} /Flags 32 \
+                     /FontBBox [0 -200 1000 900] /ItalicAngle 0 /Ascent 900 /Descent -200 \
+                     /CapHeight 700 /StemV 80 /FontFile2 {} 0 R >>",
+                    first + 2
+                )
+                .into_bytes(),
+            );
+            objects.push(stream(&format!("/Length1 {}", program.len()), program));
+        }
+    }
+    first
+}
+
 /// One page whose resources name each font in order (`/F0`, `/F1`, …).
 fn pdf(content: &[u8], fonts: &[Font]) -> Vec<u8> {
+    pdf_with_form(content, fonts, None)
+}
+
+/// [`pdf`] plus a Form XObject `/Fm` whose own resources name its fonts
+/// `/G0`, `/G1`, ….
+fn pdf_with_form(content: &[u8], fonts: &[Font], form: Option<(&[u8], &[Font])>) -> Vec<u8> {
     let mut objects = vec![
         b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
         b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
@@ -60,65 +125,28 @@ fn pdf(content: &[u8], fonts: &[Font]) -> Vec<u8> {
     ];
     let mut names = String::new();
     for (index, font) in fonts.iter().enumerate() {
-        let first = objects.len() + 1;
-        names.push_str(&format!("/F{index} {first} 0 R "));
-        match *font {
-            Font::Type0(program, name) => {
-                objects.push(
-                    format!(
-                        "<< /Type /Font /Subtype /Type0 /BaseFont /{name} /Encoding /Identity-H \
-                         /DescendantFonts [{} 0 R] /ToUnicode {} 0 R >>",
-                        first + 1,
-                        first + 4
-                    )
-                    .into_bytes(),
-                );
-                objects.push(
-                    format!(
-                        "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /{name} \
-                         /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> \
-                         /FontDescriptor {} 0 R /DW 1000 /W [1 [350]] /CIDToGIDMap /Identity >>",
-                        first + 2
-                    )
-                    .into_bytes(),
-                );
-                objects.push(
-                    format!(
-                        "<< /Type /FontDescriptor /FontName /{name} /Flags 4 \
-                         /FontBBox [0 -200 1000 900] /ItalicAngle 0 /Ascent 900 /Descent -200 \
-                         /CapHeight 700 /StemV 80 /FontFile2 {} 0 R >>",
-                        first + 3
-                    )
-                    .into_bytes(),
-                );
-                objects.push(stream(&format!("/Length1 {}", program.len()), program));
-                objects.push(stream("", TO_UNICODE));
-            }
-            Font::Simple(program, name) => {
-                objects.push(
-                    format!(
-                        "<< /Type /Font /Subtype /TrueType /BaseFont /{name} \
-                         /FontDescriptor {} 0 R >>",
-                        first + 1
-                    )
-                    .into_bytes(),
-                );
-                objects.push(
-                    format!(
-                        "<< /Type /FontDescriptor /FontName /{name} /Flags 32 \
-                         /FontBBox [0 -200 1000 900] /ItalicAngle 0 /Ascent 900 /Descent -200 \
-                         /CapHeight 700 /StemV 80 /FontFile2 {} 0 R >>",
-                        first + 2
-                    )
-                    .into_bytes(),
-                );
-                objects.push(stream(&format!("/Length1 {}", program.len()), program));
-            }
+        let id = push_font(&mut objects, font);
+        names.push_str(&format!("/F{index} {id} 0 R "));
+    }
+    let mut xobjects = String::new();
+    if let Some((form_content, form_fonts)) = form {
+        let mut form_names = String::new();
+        for (index, font) in form_fonts.iter().enumerate() {
+            let id = push_font(&mut objects, font);
+            form_names.push_str(&format!("/G{index} {id} 0 R "));
         }
+        objects.push(stream(
+            &format!(
+                "/Type /XObject /Subtype /Form /BBox [0 0 240 160] \
+                 /Resources << /Font << {form_names}>> >>"
+            ),
+            form_content,
+        ));
+        xobjects = format!("/XObject << /Fm {} 0 R >>", objects.len());
     }
     objects[2] = format!(
         "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 240 160] /Contents 4 0 R \
-         /Resources << /Font << {names}>> >> >>"
+         /Resources << /Font << {names}>> {xobjects} >> >>"
     )
     .into_bytes();
     assemble(&objects)
@@ -211,4 +239,45 @@ fn leaked_composite_show_draws_the_intended_glyphs() {
     let leaked = render(pdf(&page("F1"), &fonts), None);
     assert!(dark(&reference) > 300, "{}", dark(&reference));
     assert_eq!(leaked, reference, "no .notdef boxes for the leaked show");
+}
+
+#[test]
+fn form_fonts_are_siblings_only_inside_the_form() {
+    let page_fonts = [Font::Type0(CAD_BROKEN, "ABCDEF+Iso")];
+    let form_fonts = [Font::Type0(CAD, "GHIJKL+Gost")];
+    let shown =
+        |font: &str, y: u32| format!("BT /{font} 48 Tf 10 {y} Td <00020003> Tj ET").into_bytes();
+    let page = |content: &[u8], form: &[u8]| {
+        render(
+            pdf_with_form(content, &page_fonts, Some((form, &form_fonts))),
+            None,
+        )
+    };
+    // Inside the Form, its own font is in scope and supplies the glyphs.
+    let reference = page(b"/Fm Do", &shown("G0", 60));
+    assert!(dark(&reference) > 300, "{}", dark(&reference));
+    assert_eq!(page(b"/Fm Do", &shown("F0", 60)), reference);
+    // After the Form ends, its font is out of scope again: a decision made
+    // inside the Form is not reused for the page's own broken text.
+    let after = [b"/Fm Do ".as_slice(), &shown("F0", 110)].concat();
+    assert_eq!(page(&after, &shown("F0", 60)), reference);
+}
+
+#[test]
+fn clip_mode_text_clips_with_repaired_glyphs() {
+    let fonts = [
+        Font::Type0(CAD_BROKEN, "ABCDEF+Iso"),
+        Font::Type0(CAD, "GHIJKL+Gost"),
+    ];
+    let page = |font: &str| {
+        format!(
+            "q BT 7 Tr /{font} 48 Tf 10 60 Td <000200030004> Tj ET \
+             0 0 0 rg 0 0 240 160 re f Q"
+        )
+        .into_bytes()
+    };
+    let reference = render(pdf(&page("F1"), &fonts), None);
+    let painted = dark(&reference);
+    assert!(painted > 300 && painted < 240 * 160 / 2, "{painted}");
+    assert_eq!(render(pdf(&page("F0"), &fonts), None), reference);
 }

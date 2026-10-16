@@ -12,20 +12,24 @@
 //!   font's. No whole-font redirect is made. A font is inspected until its
 //!   first 32 distinct glyphs on a page prove healthy.
 //! - **Leaked composite text.** A show under a simple font, inheriting it
-//!   instead of the intended Type0 font, can carry multi-byte codes. When the
-//!   simple font has no glyph for one of its bytes, the operator is shown with
-//!   a Type0 font already used on the page whose CMap decodes every string
-//!   exactly, whose glyphs exist for every code, and which has shown at least
-//!   one of these codes before.
-//! - **Leaked simple text.** A show under a Type0 font that its CMap cannot
-//!   decode exactly is shown with a simple font of the same base name already
-//!   used on the page, when that font draws every byte.
+//!   instead of the intended Type0 font, can carry multi-byte codes. It is
+//!   shown with a Type0 font already shown on the page only when the bytes
+//!   have that shape: the candidate's CMap decodes every string exactly and
+//!   every multi-byte code starts with a non-whitespace byte the simple font
+//!   cannot draw. At least half of the codes must have been shown with the
+//!   candidate before, and its glyphs must draw every code (blank only where
+//!   the code means whitespace).
+//! - **Leaked simple text.** A show under a Type0 font whose CMap cannot
+//!   decode it even leniently (a fragment shorter than any code, or a code
+//!   without CID or glyph) is shown with a simple font of the same base name
+//!   already shown on the page, when that font draws every byte.
 //!
 //! Leak repairs override the font for one operator only and never become the
-//! graphics state's font. Work is capped per page; past the cap, recovery is
-//! disabled for the rest of the page.
+//! graphics state's font, and shows under an override are never evidence.
+//! Work is capped per page; past the cap, recovery is disabled for the rest
+//! of the page.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use zpdf_display_list::PositionedGlyph;
 use zpdf_document::page::ResourceDict;
@@ -55,13 +59,22 @@ pub(crate) struct FontRepair {
     disabled: bool,
     /// Candidate validations spent on this page.
     pub(crate) probes: u64,
-    /// Glyphs drawn from another font plus operators shown with another font.
+    /// Distinct broken-subset codes drawn from another page font, plus show
+    /// operators shown with another font.
     pub(crate) repairs: u64,
     // Pages use few fonts: per-font state is searched linearly, which is
     // cheaper per show than hashing the font id.
     blanks: Vec<(FontId, Option<Box<BlankGlyphs>>)>,
     simple_codes: Vec<(FontId, Box<SimpleCodes>)>,
+    /// Type0 fonts shown under their own `Tf`, with the codes they showed.
     evidence: Vec<(FontId, CodeSet)>,
+    /// Simple fonts shown under their own `Tf`.
+    simple_shown: Vec<FontId>,
+    /// Sibling candidates of the current page and Form scope.
+    scope: Vec<FontId>,
+    /// `scope` matches the Form fonts in effect.
+    scope_current: bool,
+    /// Sibling decisions, valid for `scope`.
     decisions: HashMap<(FontId, u32, u8), Option<DrawingGlyph>>,
 }
 
@@ -69,29 +82,6 @@ pub(crate) struct FontRepair {
 pub(crate) struct RepairScope<'s> {
     pub(crate) page: Option<&'s ResourceDict>,
     pub(crate) forms: &'s [HashMap<String, String>],
-}
-
-impl RepairScope<'_> {
-    /// Distinct fonts in a stable order (by resource name).
-    fn fonts(&self, cache: &FontCache) -> Vec<FontId> {
-        let mut names: Vec<&str> = self
-            .page
-            .into_iter()
-            .flat_map(|resources| resources.fonts.keys())
-            .chain(self.forms.iter().flat_map(|names| names.values()))
-            .map(String::as_str)
-            .collect();
-        names.sort_unstable();
-        let mut ids: Vec<FontId> = Vec::new();
-        for name in names {
-            if let Some((id, _)) = cache.get_by_name(name) {
-                if !ids.contains(&id) {
-                    ids.push(id);
-                }
-            }
-        }
-        ids
-    }
 }
 
 impl FontRepair {
@@ -104,6 +94,51 @@ impl FontRepair {
             self.disabled = true;
         }
         !self.disabled
+    }
+
+    /// A Form with its own font resources began or ended.
+    pub(crate) fn scope_changed(&mut self) {
+        self.scope_current = false;
+    }
+
+    /// Rebuild the sibling candidates when the Form scope changed: distinct
+    /// font programs in resource-name order, at most `MAX_FONTS`. The work
+    /// is charged at one probe per 16 names; decisions made for a different
+    /// candidate list are dropped.
+    fn current_scope(&mut self, cache: &FontCache, scope: &RepairScope<'_>) -> bool {
+        if self.scope_current {
+            return true;
+        }
+        let mut names: Vec<&str> = scope
+            .page
+            .into_iter()
+            .flat_map(|resources| resources.fonts.keys())
+            .chain(scope.forms.iter().flat_map(|names| names.values()))
+            .map(String::as_str)
+            .collect();
+        if self.disabled || !self.spend(1 + names.len() as u64 / 16) {
+            return false;
+        }
+        names.sort_unstable();
+        names.dedup();
+        let mut programs = HashSet::new();
+        let mut fonts = Vec::new();
+        for name in names {
+            if let Some((id, font)) = cache.get_by_name(name) {
+                if programs.insert(font as *const LoadedFont) {
+                    fonts.push(id);
+                    if fonts.len() == MAX_FONTS {
+                        break;
+                    }
+                }
+            }
+        }
+        if fonts != self.scope {
+            self.decisions.clear();
+            self.scope = fonts;
+        }
+        self.scope_current = true;
+        true
     }
 
     /// Code → glyph lookups for a simple font, shared by `show_text` and the
@@ -120,7 +155,16 @@ impl FontRepair {
         Some(&mut self.simple_codes[index].1)
     }
 
-    /// Remember the codes a Type0 font shows, the evidence for leak repairs.
+    /// A simple font shown under its own `Tf`: a sibling for leaked simple
+    /// text. Shows under a leak override are not evidence.
+    pub(crate) fn note_simple(&mut self, font_id: FontId) {
+        if !self.simple_shown.contains(&font_id) && self.simple_shown.len() < MAX_EVIDENCE_FONTS {
+            self.simple_shown.push(font_id);
+        }
+    }
+
+    /// Remember the codes a Type0 font shows under its own `Tf`, the evidence
+    /// for leak repairs. Shows under a leak override are not evidence.
     pub(crate) fn evidence(&mut self, font_id: FontId) -> Option<&mut CodeSet> {
         if self.disabled {
             return None;
@@ -221,6 +265,9 @@ impl FontRepair {
         length: u8,
         raw_code: u32,
     ) -> Option<DrawingGlyph> {
+        if !self.current_scope(cache, scope) {
+            return None;
+        }
         let key = (font_id, code, length);
         if let Some(decision) = self.decisions.get(&key) {
             return *decision;
@@ -232,7 +279,8 @@ impl FontRepair {
         let text = to_unicode(font, code, raw_code)?;
         let original = code_glyph(font, code, length, raw_code)?;
         let mut found = None;
-        for id in scope.fonts(cache) {
+        for index in 0..self.scope.len() {
+            let id = self.scope[index];
             if id == font_id {
                 continue;
             }
@@ -261,6 +309,7 @@ impl FontRepair {
                     font_id: id,
                     glyph_id: candidate.glyph_id,
                 });
+                self.repairs += 1;
                 break;
             }
         }
@@ -286,9 +335,9 @@ impl FontRepair {
         // Without shows of the other kind there is nothing to recover with;
         // decided before looking the font up.
         let composite = self.evidence.iter().any(|(id, _)| *id == current);
-        let simple = self.simple_codes.iter().any(|(id, _)| *id == current);
-        if (self.evidence.is_empty() || composite) && self.simple_codes.is_empty()
-            || (self.simple_codes.is_empty() || simple) && self.evidence.is_empty()
+        let simple = self.simple_shown.contains(&current);
+        if (self.evidence.is_empty() || composite) && self.simple_shown.is_empty()
+            || (self.simple_shown.is_empty() || simple) && self.evidence.is_empty()
         {
             return None;
         }
@@ -300,6 +349,13 @@ impl FontRepair {
         }
     }
 
+    /// Composite codes shown with a simple font. The bytes must have the
+    /// shape such a leak leaves: every multi-byte code of the candidate's own
+    /// segmentation starts with a non-whitespace byte the simple font cannot
+    /// draw (real simple-font text never has one at every lead position), and
+    /// at least half of the codes were shown with the candidate before. CAD
+    /// drawings reuse a small set of codes across labels; a coincidental
+    /// decoding of other text rarely repeats that many.
     fn composite_text_in_simple<'b, I>(
         &mut self,
         cache: &FontCache,
@@ -310,7 +366,6 @@ impl FontRepair {
     where
         I: Iterator<Item = &'b [u8]>,
     {
-        // Without an earlier Type0 show there is nothing the bytes can mean.
         if self.evidence.is_empty() || font.is_type3() || !has_program(font) {
             return None;
         }
@@ -318,11 +373,19 @@ impl FontRepair {
         if total == 0 || total > MAX_OPERATOR_BYTES {
             return None;
         }
+        // Bytes the simple font cannot draw that may lead a leaked code.
+        // Layout whitespace (tab, line breaks, space) is simple-font text even
+        // when the font has no glyph for it.
         let codes = self.simple_codes(current)?;
-        if strings()
-            .flatten()
-            .all(|&byte| codes.glyph(font, byte).is_some())
-        {
+        let mut lead_bytes = [false; 256];
+        let mut any = false;
+        for &byte in strings().flatten() {
+            if codes.glyph(font, byte).is_none() {
+                any = true;
+                lead_bytes[byte as usize] = !byte.is_ascii_whitespace() && byte != 0x0B;
+            }
+        }
+        if !any {
             return None;
         }
         let candidates: Vec<FontId> = self.evidence.iter().rev().map(|(id, _)| *id).collect();
@@ -337,25 +400,30 @@ impl FontRepair {
             let Some(decoded) = decode_exactly(candidate.cid_cmap.as_ref(), strings()) else {
                 continue;
             };
+            let lead = |&(_, length, raw): &(u32, u8, u32)| (raw >> (8 * (length - 1))) as u8;
+            if !decoded.iter().any(|&(_, length, _)| length > 1)
+                || decoded
+                    .iter()
+                    .any(|code| code.1 > 1 && !lead_bytes[lead(code) as usize])
+            {
+                continue;
+            }
             let set = &self.evidence.iter().find(|(font, _)| *font == id)?.1;
             let seen = decoded
                 .iter()
                 .filter(|(code, ..)| set.contains(*code))
                 .count();
-            if seen == 0 || best.is_some_and(|(_, best)| best >= seen) {
+            if seen * 2 < decoded.len() || best.is_some_and(|(_, best)| best >= seen) {
                 continue;
             }
             if !self.spend(decoded.len() as u64) {
                 return None;
             }
-            let glyphs: Option<Vec<(u16, u32, u32)>> = decoded
+            let glyphs: Option<Vec<(u16, u32, u32, u8)>> = decoded
                 .iter()
                 .map(|&(code, length, raw)| {
-                    Some((
-                        code_glyph(candidate, code, length, raw)?.glyph_id,
-                        code,
-                        raw,
-                    ))
+                    let glyph = code_glyph(candidate, code, length, raw)?.glyph_id;
+                    Some((glyph, code, raw, length))
                 })
                 .collect();
             if glyphs.is_some_and(|glyphs| candidate.glyphs_usable(glyphs)) {
@@ -367,6 +435,10 @@ impl FontRepair {
         Some(id)
     }
 
+    /// Simple bytes shown with a Type0 font: only strings its CMap cannot
+    /// decode even leniently (a fragment shorter than any code, or a code
+    /// without a CID or glyph) count, and the replacement is a simple font of
+    /// the same base name shown on the page that draws every byte.
     fn simple_text_in_composite<'b, I>(
         &mut self,
         cache: &FontCache,
@@ -376,45 +448,37 @@ impl FontRepair {
     where
         I: Iterator<Item = &'b [u8]>,
     {
-        // Without an earlier simple-font show there is no sibling to use.
-        if self.simple_codes.is_empty() {
-            return None;
-        }
-        let cmap = font.cid_cmap.as_ref();
-        if strings().all(|bytes| match cmap {
-            Some(cmap) => cmap.decodes_exactly(bytes),
-            None => bytes.len().is_multiple_of(2),
-        }) {
+        let base = without_subset_prefix(&font.base_font);
+        let mut candidates: Vec<FontId> = self
+            .simple_shown
+            .iter()
+            .copied()
+            .filter(|&id| {
+                cache.get(id).is_some_and(|sibling| {
+                    !is_composite(sibling)
+                        && !sibling.is_type3()
+                        && has_program(sibling)
+                        && without_subset_prefix(&sibling.base_font) == base
+                })
+            })
+            .collect();
+        if candidates.is_empty() || !strings().any(|bytes| undecodable(font, bytes)) {
             return None;
         }
         let total: usize = strings().map(<[u8]>::len).sum();
         if total > MAX_OPERATOR_BYTES {
             return None;
         }
-        let base = without_subset_prefix(&font.base_font);
-        let mut candidates: Vec<FontId> = self.simple_codes.iter().map(|(id, _)| *id).collect();
         candidates.sort_unstable();
         for id in candidates {
-            if !self.spend(1) {
+            if !self.spend(1 + total as u64) {
                 return None;
             }
-            let Some(sibling) = cache.get(id) else {
-                continue;
-            };
-            if is_composite(sibling)
-                || sibling.is_type3()
-                || !has_program(sibling)
-                || without_subset_prefix(&sibling.base_font) != base
-            {
-                continue;
-            }
-            if !self.spend(total as u64) {
-                return None;
-            }
+            let sibling = cache.get(id)?;
             let codes = self.simple_codes(id)?;
-            let glyphs: Option<Vec<(u16, u32, u32)>> = strings()
+            let glyphs: Option<Vec<(u16, u32, u32, u8)>> = strings()
                 .flatten()
-                .map(|&byte| Some((codes.glyph(sibling, byte)?, byte as u32, byte as u32)))
+                .map(|&byte| Some((codes.glyph(sibling, byte)?, byte as u32, byte as u32, 1)))
                 .collect();
             if glyphs.is_some_and(|glyphs| sibling.glyphs_usable(glyphs)) {
                 self.repairs += 1;
@@ -423,6 +487,48 @@ impl FontRepair {
         }
         None
     }
+}
+
+/// Whether a Type0 font's lenient decoding, as `show_text` performs it,
+/// fails for `bytes`: a fragment shorter than any declared code is left, or
+/// a code has no CID or no glyph in the font's CID → GID map. Codes outside
+/// the declared codespace that still decode are not evidence.
+fn undecodable(font: &LoadedFont, bytes: &[u8]) -> bool {
+    let cmap = font.cid_cmap.as_ref();
+    let shortest = cmap.map_or(2, CidCMap::shortest_code_length);
+    let direct = font.unicode_coded() || font.legacy_substitute();
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        let (code, length) = match cmap {
+            Some(cmap) => cmap.next_code(rest),
+            None => {
+                let length = rest.len().min(2);
+                let code = rest[..length]
+                    .iter()
+                    .fold(0u32, |value, &byte| (value << 8) | byte as u32);
+                (code, length)
+            }
+        };
+        if length < shortest {
+            return true;
+        }
+        if !direct {
+            let cid = cmap.map_or(code, |cmap| cmap.code_to_cid(code, length as u8));
+            let mapped = u16::try_from(cid)
+                .ok()
+                .filter(|&cid| cid != 0)
+                .is_some_and(|cid| {
+                    font.cid_to_gid
+                        .as_ref()
+                        .is_none_or(|map| map.get(&cid).is_some_and(|&gid| gid != 0))
+                });
+            if !mapped {
+                return true;
+            }
+        }
+        rest = &rest[length.max(1)..];
+    }
+    false
 }
 
 /// Per-page simple-font code → glyph id table (0 = not looked up yet).

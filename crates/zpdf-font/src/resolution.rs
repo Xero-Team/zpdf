@@ -173,6 +173,7 @@ impl LoadedFont {
     /// Broken CAD subsets keep the glyph ids they show but zero their `loca`
     /// entries. Whitespace, controls, format characters and private-use
     /// meanings are never evidence; substitutes are judged by their own cmap.
+    #[doc(hidden)]
     pub fn blank_hides_text(&self, code: u32, raw_code: u32) -> bool {
         !self.is_substitute
             && self
@@ -182,10 +183,13 @@ impl LoadedFont {
                 .is_some_and(is_visible_text)
     }
 
-    /// Whether every `(glyph id, code, raw code)` draws a real glyph: mapped,
-    /// readable, and blank only where the code is not visible text. Parses the
-    /// program once for the whole batch.
-    pub fn glyphs_usable(&self, glyphs: impl IntoIterator<Item = (u16, u32, u32)>) -> bool {
+    /// Whether every `(glyph id, code, raw code, code length)` draws what the
+    /// code means: a glyph with an outline, or a blank glyph only where the
+    /// font's own meaning for the code (`/ToUnicode`, else its CMap or
+    /// encoding) is whitespace or invisible. An unknown meaning does not
+    /// excuse a blank glyph. Parses the program once for the whole batch.
+    #[doc(hidden)]
+    pub fn glyphs_usable(&self, glyphs: impl IntoIterator<Item = (u16, u32, u32, u8)>) -> bool {
         let face = if self.is_type3() || self.type1.is_some() {
             None
         } else {
@@ -194,17 +198,42 @@ impl LoadedFont {
                 None => return false,
             }
         };
-        glyphs.into_iter().all(|(glyph_id, code, raw_code)| {
-            let state = match &face {
-                Some(face) if glyph_id != 0 => self.face_glyph_state(glyph_id, face),
-                Some(_) => GlyphState::Missing,
-                None => self.glyph_state(glyph_id),
-            };
-            state.usable(self, code, raw_code)
-        })
+        glyphs
+            .into_iter()
+            .all(|(glyph_id, code, raw_code, length)| {
+                let state = match &face {
+                    Some(face) if glyph_id != 0 => self.face_glyph_state(glyph_id, face),
+                    Some(_) => GlyphState::Missing,
+                    None => self.glyph_state(glyph_id),
+                };
+                match state {
+                    GlyphState::Missing => false,
+                    GlyphState::Drawn => true,
+                    GlyphState::Blank => self.blank_is_space(code, raw_code, length),
+                }
+            })
+    }
+
+    /// A blank glyph is right for this code: the font's meaning for it is
+    /// known and is whitespace or invisible.
+    fn blank_is_space(&self, code: u32, raw_code: u32, length: u8) -> bool {
+        let text = self
+            .to_unicode
+            .as_ref()
+            .and_then(|map| map.lookup(raw_code).or_else(|| map.lookup(code)));
+        match text {
+            Some(text) => !is_visible_text(text),
+            None => self
+                .fallback_character(code, raw_code, length)
+                .is_some_and(|character| {
+                    let mut buffer = [0; 4];
+                    !is_visible_text(character.character.encode_utf8(&mut buffer))
+                }),
+        }
     }
 
     /// Whether the glyph has a drawable, non-empty outline.
+    #[doc(hidden)]
     pub fn glyph_drawn(&self, glyph_id: u16) -> bool {
         self.glyph_state(glyph_id) == GlyphState::Drawn
     }
@@ -298,6 +327,7 @@ fn physical_glyph_state(face: &ttf_parser::Face<'_>, gid: u16) -> GlyphState {
 /// Whether text names something visible: at least one character that is not
 /// whitespace, a control or format character, a default-ignorable code point,
 /// or private use (whose meaning belongs to one font).
+#[doc(hidden)]
 pub fn is_visible_text(text: &str) -> bool {
     text.chars().any(|character| {
         !character.is_whitespace()
@@ -387,6 +417,7 @@ fn readable_glyph(face: &ttf_parser::Face<'_>, gid: u16) -> bool {
 
 /// Constant-time blank-glyph checks read straight from an embedded TrueType
 /// program's `loca` table, for per-glyph checks on every shown glyph.
+#[doc(hidden)]
 pub struct BlankGlyphTable {
     data: Arc<[u8]>,
     loca: std::ops::Range<usize>,
@@ -400,6 +431,7 @@ pub struct BlankGlyphTable {
 impl LoadedFont {
     /// The `loca` view of an embedded `glyf` program. `None` for substitutes,
     /// Type 1, Type 3 and CFF outlines.
+    #[doc(hidden)]
     pub fn blank_glyph_table(&self) -> Option<BlankGlyphTable> {
         if self.is_substitute || self.type1.is_some() || self.is_type3() {
             return None;

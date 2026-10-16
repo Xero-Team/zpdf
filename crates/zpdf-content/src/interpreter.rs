@@ -82,6 +82,9 @@ pub struct ContentInterpreter<'a> {
     /// Bounded recovery for malformed CAD text fonts (broken subsets, fonts
     /// leaked across text blocks), fed while the page is interpreted.
     font_repair: crate::font_repair::FontRepair,
+    /// The current font is a leak override for this show operator, not one
+    /// a `Tf` selected; its shows are not recovery evidence.
+    font_override: bool,
     /// Owned /Resources of the form XObjects currently being interpreted,
     /// innermost last. Lookups search these before the page resources.
     form_resources: Vec<ResourceDict>,
@@ -606,6 +609,7 @@ impl<'a> ContentInterpreter<'a> {
             shading_cache: HashMap::new(),
             form_font_overrides: Vec::new(),
             font_repair: Default::default(),
+            font_override: false,
             form_resources: Vec::new(),
             form_depth: 0,
             state_floor: 0,
@@ -4070,7 +4074,7 @@ impl<'a> ContentInterpreter<'a> {
         self.mc_stack = saved_mc_stack;
         self.oc_hidden_from = saved_oc_hidden;
         self.base_ctm = saved_base_ctm;
-        self.form_font_overrides.pop();
+        self.pop_form_fonts();
         if pushed_resources {
             self.form_resources.pop();
         }
@@ -4214,6 +4218,9 @@ impl<'a> ContentInterpreter<'a> {
             }
         }
 
+        if !overrides.is_empty() {
+            self.font_repair.scope_changed();
+        }
         self.form_font_overrides.push(overrides);
     }
 
@@ -4802,7 +4809,7 @@ impl<'a> ContentInterpreter<'a> {
         self.text_matrix = saved_text_matrix;
         self.text_line_matrix = saved_text_line_matrix;
         self.operand_stack = saved_operand_stack;
-        self.form_font_overrides.pop();
+        self.pop_form_fonts();
         if pushed_resources {
             self.form_resources.pop();
         }
@@ -4860,12 +4867,25 @@ impl<'a> ContentInterpreter<'a> {
         let current = self.current_font_id?;
         let cache = self.font_cache.as_deref()?;
         let target = self.font_repair.leaked_font(cache, current, strings)?;
+        self.font_override = true;
         Some(self.current_font_id.replace(target))
     }
 
     fn restore_font(&mut self, restore: Option<Option<zpdf_font::FontId>>) {
         if let Some(previous) = restore {
             self.current_font_id = previous;
+            self.font_override = false;
+        }
+    }
+
+    /// Leave a Form's font scope; sibling candidates change with it.
+    fn pop_form_fonts(&mut self) {
+        if self
+            .form_font_overrides
+            .pop()
+            .is_some_and(|names| !names.is_empty())
+        {
+            self.font_repair.scope_changed();
         }
     }
 
@@ -4914,7 +4934,9 @@ impl<'a> ContentInterpreter<'a> {
             let direct_gid = font_and_id
                 .is_some_and(|(_, font)| font.unicode_coded() || font.legacy_substitute());
             let dw2 = font_and_id.map(|(_, f)| f.dw2).unwrap_or((880.0, -1000.0));
-            let mut evidence = font_and_id.and_then(|(fid, _)| self.font_repair.evidence(fid));
+            let mut evidence = font_and_id
+                .filter(|_| !self.font_override)
+                .and_then(|(fid, _)| self.font_repair.evidence(fid));
 
             let mut i = 0usize;
             while i < bytes.len() {
@@ -5003,6 +5025,9 @@ impl<'a> ContentInterpreter<'a> {
         } else {
             let mut previous = None;
             // Codes resolve once per font and page, not once per show.
+            if let (Some((fid, _)), false) = (font_and_id, self.font_override) {
+                self.font_repair.note_simple(fid);
+            }
             let mut codes = font_and_id.and_then(|(fid, _)| self.font_repair.simple_codes(fid));
             for &byte in bytes {
                 let code = byte as u16;
@@ -5359,9 +5384,6 @@ impl<'a> ContentInterpreter<'a> {
                     drawing
                 }
             };
-            if suspicious && drawing != original {
-                repairs.repairs += 1;
-            }
             if drawing != original && ids.is_none() {
                 ids = Some(vec![font_id; index]);
             }
