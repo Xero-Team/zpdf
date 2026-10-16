@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased
+
+### Display list
+
+- Store `Path` as compact verb and point arrays sharing one allocation (#16).
+  A line segment takes 17 bytes and a cubic 49, instead of 56 bytes for every
+  element; a two-segment `m l S` stroke still allocates once, and the
+  interpreter reuses its user-space path buffer. Line-heavy pages retain about
+  half the display-list heap with fewer allocations, and rendering output is
+  unchanged; see `docs/performance/paths.md` and the `path_memory` example.
+
+### Breaking changes
+
+- `Path::elements` is no longer a public `Vec<PathElement>`. Iterate segments by
+  value with `path.iter()` or `for element in &path`, and build paths with
+  `push`, `extend` or `collect`. `PathElement` is unchanged and now also
+  implements `PartialEq`.
+
+  | Before | After |
+  |---|---|
+  | `for e in &path.elements { match *e { .. } }` | `for e in &path { match e { .. } }` |
+  | `path.elements.len()`, `path.elements.is_empty()` | `path.len()`, `path.is_empty()` |
+  | `path.elements.push(e)`, `.extend(..)` | `path.push(e)`, `path.extend(..)` |
+  | `Path { elements }` | `elements.into_iter().collect::<Path>()` |
+  | Visiting every point (bounds, transforms) | `path.points()`, `path.points_mut()`, `path.map_points(f)` |
+
 ## 0.15.1 — Installable CLI and PPTX export again
 
 ### Dependencies

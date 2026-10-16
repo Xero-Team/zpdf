@@ -29,7 +29,7 @@
 
 use std::path::Path;
 
-use zpdf::display_list::{DisplayList, Paint, Path as DlPath, PathElement, RenderCommand};
+use zpdf::display_list::{DisplayList, Paint, Path as DlPath, RenderCommand};
 use zpdf_core::Matrix;
 
 use crate::pipeline;
@@ -194,23 +194,12 @@ impl Composition {
 fn path_area_device(path: &DlPath, s2: f64) -> u64 {
     let (mut x0, mut y0) = (f64::INFINITY, f64::INFINITY);
     let (mut x1, mut y1) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
-    for el in &path.elements {
-        let mut visit = |p: &zpdf_core::Point| {
-            if p.x.is_finite() && p.y.is_finite() {
-                x0 = x0.min(p.x);
-                y0 = y0.min(p.y);
-                x1 = x1.max(p.x);
-                y1 = y1.max(p.y);
-            }
-        };
-        match el {
-            PathElement::MoveTo(p) | PathElement::LineTo(p) => visit(p),
-            PathElement::CurveTo(a, b, c) => {
-                visit(a);
-                visit(b);
-                visit(c);
-            }
-            PathElement::Close => {}
+    for p in path.points() {
+        if p.x.is_finite() && p.y.is_finite() {
+            x0 = x0.min(p.x);
+            y0 = y0.min(p.y);
+            x1 = x1.max(p.x);
+            y1 = y1.max(p.y);
         }
     }
     if !(x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite()) {

@@ -1173,13 +1173,11 @@ impl<'a> ContentInterpreter<'a> {
                 self.current_path.close();
                 self.paint_fill_then_stroke(FillRule::EvenOdd);
             }
-            "n" => {
-                self.current_path = Path::new();
-            }
+            "n" => self.current_path.clear(),
 
             // -- Clipping --
             "W" => {
-                let path = self.transform_path_to_page_space(&self.current_path.clone());
+                let path = self.transform_path_to_page_space(&self.current_path);
                 self.intersect_clip_bounds(Self::path_bounds(&path));
                 self.display_list.push(RenderCommand::PushClip {
                     path,
@@ -1188,7 +1186,7 @@ impl<'a> ContentInterpreter<'a> {
                 self.current.clip_depth += 1;
             }
             "W*" => {
-                let path = self.transform_path_to_page_space(&self.current_path.clone());
+                let path = self.transform_path_to_page_space(&self.current_path);
                 self.intersect_clip_bounds(Self::path_bounds(&path));
                 self.display_list.push(RenderCommand::PushClip {
                     path,
@@ -2707,17 +2705,8 @@ impl<'a> ContentInterpreter<'a> {
             max.x = max.x.max(p.x);
             max.y = max.y.max(p.y);
         };
-        for elem in &path.elements {
-            match elem {
-                PathElement::MoveTo(p) | PathElement::LineTo(p) => acc(p),
-                PathElement::CurveTo(c1, c2, p) => {
-                    acc(c1);
-                    acc(c2);
-                    acc(p);
-                }
-                PathElement::Close => {}
-            }
-        }
+        // Every point, including curve control points.
+        path.points().iter().for_each(&mut acc);
         (min.x.is_finite() && min.y.is_finite() && max.x > min.x && max.y > min.y)
             .then(|| Rect::new(min.x, min.y, max.x, max.y))
     }
@@ -3880,36 +3869,11 @@ impl<'a> ContentInterpreter<'a> {
         if *ctm == Matrix::identity() {
             return path.clone();
         }
-        let mut result = Path::new();
-        for elem in &path.elements {
-            match *elem {
-                PathElement::MoveTo(p) => {
-                    result.move_to(p.transform(ctm));
-                }
-                PathElement::LineTo(p) => {
-                    result.line_to(p.transform(ctm));
-                }
-                PathElement::CurveTo(c1, c2, end) => {
-                    result.curve_to(c1.transform(ctm), c2.transform(ctm), end.transform(ctm));
-                }
-                PathElement::Close => {
-                    result.close();
-                }
-            }
-        }
-        result
+        path.map_points(|p| p.transform(ctm))
     }
 
     fn current_point(&self) -> Point {
-        for elem in self.current_path.elements.iter().rev() {
-            match *elem {
-                PathElement::MoveTo(p) | PathElement::LineTo(p) | PathElement::CurveTo(_, _, p) => {
-                    return p
-                }
-                PathElement::Close => {}
-            }
-        }
-        Point::zero()
+        self.current_path.last_point().unwrap_or_else(Point::zero)
     }
 
     fn ctm_scale_factor(&self) -> f32 {
@@ -3969,8 +3933,8 @@ impl<'a> ContentInterpreter<'a> {
         let mut rules: Vec<RuleLine> = Vec::new();
         let mut cur: Option<Point> = None;
         let mut start: Option<Point> = None;
-        for elem in &page_path.elements {
-            match *elem {
+        for elem in page_path {
+            match elem {
                 PathElement::MoveTo(p) => {
                     cur = Some(p);
                     start = Some(p);
@@ -4048,8 +4012,8 @@ impl<'a> ContentInterpreter<'a> {
                 f64::NEG_INFINITY,
             );
         };
-        for elem in &page_path.elements {
-            match *elem {
+        for elem in page_path {
+            match elem {
                 PathElement::MoveTo(p) => {
                     flush(
                         &mut n,
@@ -4112,32 +4076,34 @@ impl<'a> ContentInterpreter<'a> {
         }
     }
 
-    fn paint_stroke(&mut self) {
-        let path = std::mem::take(&mut self.current_path);
-        if path.is_empty() {
-            return;
+    /// The current path in page space, ending the path object. The user-space
+    /// buffer is cleared rather than dropped, so the next path reuses it.
+    fn take_page_path(&mut self) -> Option<Path> {
+        if self.current_path.is_empty() {
+            return None;
         }
-        let page_path = self.transform_path_to_page_space(&path);
-        self.emit_stroke(page_path);
+        let page_path = self.transform_path_to_page_space(&self.current_path);
+        self.current_path.clear();
+        Some(page_path)
+    }
+
+    fn paint_stroke(&mut self) {
+        if let Some(page_path) = self.take_page_path() {
+            self.emit_stroke(page_path);
+        }
     }
 
     fn paint_fill(&mut self, rule: FillRule) {
-        let path = std::mem::take(&mut self.current_path);
-        if path.is_empty() {
-            return;
+        if let Some(page_path) = self.take_page_path() {
+            self.fill_page_path(page_path, rule);
         }
-        let page_path = self.transform_path_to_page_space(&path);
-        self.fill_page_path(page_path, rule);
     }
 
     fn paint_fill_then_stroke(&mut self, rule: FillRule) {
-        let path = std::mem::take(&mut self.current_path);
-        if path.is_empty() {
-            return;
+        if let Some(page_path) = self.take_page_path() {
+            self.fill_page_path(page_path.clone(), rule);
+            self.emit_stroke(page_path);
         }
-        let page_path = self.transform_path_to_page_space(&path);
-        self.fill_page_path(page_path.clone(), rule);
-        self.emit_stroke(page_path);
     }
 
     /// Stroke a page-space path. A stroke pattern (tiling or shading) is clipped
@@ -4196,17 +4162,7 @@ impl<'a> ContentInterpreter<'a> {
             x1 = x1.max(p.x);
             y1 = y1.max(p.y);
         };
-        for elem in &path.elements {
-            match elem {
-                PathElement::MoveTo(p) | PathElement::LineTo(p) => acc(p),
-                PathElement::CurveTo(c1, c2, p) => {
-                    acc(c1);
-                    acc(c2);
-                    acc(p);
-                }
-                PathElement::Close => {}
-            }
-        }
+        path.points().iter().for_each(&mut acc);
         if !(x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite()) {
             return None;
         }
@@ -4850,7 +4806,7 @@ impl<'a> ContentInterpreter<'a> {
                 {
                     match &mut union {
                         Some((all, total)) => {
-                            all.elements.extend(path.elements);
+                            all.extend(&path);
                             *total = Rect::new(
                                 total.x0.min(bounds.x0),
                                 total.y0.min(bounds.y0),
@@ -4883,8 +4839,7 @@ impl<'a> ContentInterpreter<'a> {
             if let Some((path, _)) = &glyph_clip {
                 self.text_clip_accum
                     .get_or_insert_with(Path::new)
-                    .elements
-                    .extend_from_slice(&path.elements);
+                    .extend(path);
             }
         }
         if let Some(font_id) = self.current_font_id {
@@ -5172,7 +5127,9 @@ fn build_glyph_clip_path(
         Point::new(tm.a * tx + tm.c * ty + tm.e, tm.b * tx + tm.d * ty + tm.f)
     };
 
-    let mut out = Path::new();
+    let mut all = Path::new();
+    // One glyph at a time, oriented before it joins the run's clip path.
+    let mut glyph_path = Path::new();
     let mut bb = (
         f64::INFINITY,
         f64::INFINITY,
@@ -5197,7 +5154,8 @@ fn build_glyph_clip_path(
         };
         let (ox, oy) = (glyph.x, glyph.y);
         let mut cur = Point::new(0.0, 0.0);
-        let glyph_start = out.elements.len();
+        let out = &mut glyph_path;
+        out.clear();
         for cmd in &outline.commands {
             match *cmd {
                 zpdf_font::OutlineCommand::MoveTo(x, y) => {
@@ -5242,27 +5200,28 @@ fn build_glyph_clip_path(
                 zpdf_font::OutlineCommand::Close => out.close(),
             }
         }
-        orient_glyph_contours(&mut out.elements, glyph_start);
+        orient_glyph_contours(&mut glyph_path);
+        all.extend(&glyph_path);
     }
 
     if !(any && bb.0.is_finite() && bb.2 > bb.0 && bb.3 > bb.1) {
         return None;
     }
-    Some((out, Rect::new(bb.0, bb.1, bb.2, bb.3)))
+    Some((all, Rect::new(bb.0, bb.1, bb.2, bb.3)))
 }
 
-/// Orient the contours of the glyph at `elements[start..]` counter-clockwise
-/// in page space. TrueType outlines run clockwise and CFF ones the other way;
-/// a nonzero fill of glyphs from both would cancel their overlap into a hole
+/// Orient the contours of one glyph's `path` counter-clockwise in page
+/// space. TrueType outlines run clockwise and CFF ones the other way; a
+/// nonzero fill of glyphs from both would cancel their overlap into a hole
 /// instead of taking the union. Reversing every contour of the glyph together
 /// keeps its own counters intact.
-fn orient_glyph_contours(elements: &mut Vec<PathElement>, start: usize) {
+fn orient_glyph_contours(path: &mut Path) {
     let cross = |a: Point, b: Point| a.x * b.y - b.x * a.y;
     // Shoelace over the control polygon; its sign matches the outline's.
     let mut area = 0.0;
     let (mut first, mut prev) = (None::<Point>, None::<Point>);
-    for element in &elements[start..] {
-        match *element {
+    for element in &*path {
+        match element {
             PathElement::MoveTo(p) => {
                 if let (Some(f), Some(q)) = (first, prev) {
                     area += cross(q, f);
@@ -5289,9 +5248,9 @@ fn orient_glyph_contours(elements: &mut Vec<PathElement>, start: usize) {
         return;
     }
 
-    fn flush(contour: &mut Vec<PathElement>, out: &mut Vec<PathElement>) {
+    fn flush(contour: &mut Vec<PathElement>, out: &mut Path) {
         let Some(PathElement::MoveTo(origin)) = contour.first().copied() else {
-            out.append(contour);
+            out.extend(contour.drain(..));
             return;
         };
         let closed = matches!(contour.last(), Some(PathElement::Close));
@@ -5304,7 +5263,7 @@ fn orient_glyph_contours(elements: &mut Vec<PathElement>, start: usize) {
                 at = p;
             }
         }
-        out.push(PathElement::MoveTo(at));
+        out.move_to(at);
         for (segment, from) in segments.iter().zip(starts).rev() {
             out.push(match *segment {
                 PathElement::CurveTo(c1, c2, _) => PathElement::CurveTo(c2, c1, from),
@@ -5312,19 +5271,20 @@ fn orient_glyph_contours(elements: &mut Vec<PathElement>, start: usize) {
             });
         }
         if closed {
-            out.push(PathElement::Close);
+            out.close();
         }
         contour.clear();
     }
-    let glyph = elements.split_off(start);
+    let glyph: Vec<PathElement> = path.iter().collect();
+    path.clear();
     let mut contour: Vec<PathElement> = Vec::new();
     for element in glyph {
         if matches!(element, PathElement::MoveTo(_)) && !contour.is_empty() {
-            flush(&mut contour, elements);
+            flush(&mut contour, path);
         }
         contour.push(element);
     }
-    flush(&mut contour, elements);
+    flush(&mut contour, path);
 }
 
 /// Wrap a generated form-field appearance as a form-XObject stream so the
@@ -5801,7 +5761,7 @@ mod tests {
         let first_move = |dl: &DisplayList| -> (f64, f64) {
             for c in &dl.commands {
                 if let RenderCommand::FillPath { path, .. } = c {
-                    if let Some(PathElement::MoveTo(p)) = path.elements.first() {
+                    if let Some(PathElement::MoveTo(p)) = path.iter().next() {
                         return (p.x, p.y);
                     }
                 }
@@ -6118,10 +6078,10 @@ mod tests {
     }
 
     /// Nonzero winding number of a line-only path around `at`.
-    fn winding(elements: &[PathElement], at: Point) -> i32 {
+    fn winding(path: &Path, at: Point) -> i32 {
         let mut polygons: Vec<Vec<Point>> = Vec::new();
-        for element in elements {
-            match *element {
+        for element in path {
+            match element {
                 PathElement::MoveTo(p) => polygons.push(vec![p]),
                 PathElement::LineTo(p) => polygons.last_mut().unwrap().push(p),
                 PathElement::CurveTo(..) => panic!("line-only test path"),
@@ -6157,18 +6117,19 @@ mod tests {
     fn glyph_contours_union_regardless_of_font_winding() {
         // A TrueType-style clockwise glyph overlapping a CFF-style
         // counter-clockwise one: concatenated, the overlap winds to zero.
-        let mut path = Path::new();
-        square(&mut path, 0.0, 0.0, 10.0, true);
-        orient_glyph_contours(&mut path.elements, 0);
-        let second = path.elements.len();
-        square(&mut path, 5.0, 5.0, 10.0, false);
-        orient_glyph_contours(&mut path.elements, second);
+        let (mut first, mut second) = (Path::new(), Path::new());
+        square(&mut first, 0.0, 0.0, 10.0, true);
+        orient_glyph_contours(&mut first);
+        square(&mut second, 5.0, 5.0, 10.0, false);
+        orient_glyph_contours(&mut second);
         let overlap = Point::new(7.0, 7.0);
-        assert_eq!(winding(&path.elements[..second], overlap), 1);
-        assert_eq!(winding(&path.elements[second..], overlap), 1);
-        assert_eq!(winding(&path.elements, overlap), 2);
-        assert_eq!(winding(&path.elements, Point::new(2.0, 2.0)), 1);
-        assert_eq!(winding(&path.elements, Point::new(20.0, 2.0)), 0);
+        assert_eq!(winding(&first, overlap), 1);
+        assert_eq!(winding(&second, overlap), 1);
+        let mut path = first;
+        path.extend(&second);
+        assert_eq!(winding(&path, overlap), 2);
+        assert_eq!(winding(&path, Point::new(2.0, 2.0)), 1);
+        assert_eq!(winding(&path, Point::new(20.0, 2.0)), 0);
     }
 
     #[test]
@@ -6177,14 +6138,14 @@ mod tests {
         let mut path = Path::new();
         square(&mut path, 0.0, 0.0, 10.0, true);
         square(&mut path, 3.0, 3.0, 4.0, false);
-        orient_glyph_contours(&mut path.elements, 0);
-        assert_eq!(path.elements.len(), 10, "same contours and segments");
-        assert_eq!(winding(&path.elements, Point::new(1.0, 1.0)), 1);
-        assert_eq!(winding(&path.elements, Point::new(5.0, 5.0)), 0);
+        orient_glyph_contours(&mut path);
+        assert_eq!(path.len(), 10, "same contours and segments");
+        assert_eq!(winding(&path, Point::new(1.0, 1.0)), 1);
+        assert_eq!(winding(&path, Point::new(5.0, 5.0)), 0);
         // Already counter-clockwise glyphs are left untouched.
-        let before = format!("{:?}", path.elements);
-        orient_glyph_contours(&mut path.elements, 0);
-        assert_eq!(format!("{:?}", path.elements), before);
+        let before = path.clone();
+        orient_glyph_contours(&mut path);
+        assert_eq!(path, before);
     }
 
     #[test]
@@ -6195,18 +6156,15 @@ mod tests {
         path.curve_to(p(0.0, 5.0), p(5.0, 10.0), p(10.0, 10.0));
         path.line_to(p(10.0, 0.0));
         path.close();
-        orient_glyph_contours(&mut path.elements, 0);
+        orient_glyph_contours(&mut path);
         assert_eq!(
-            format!("{:?}", path.elements),
-            format!(
-                "{:?}",
-                [
-                    PathElement::MoveTo(p(10.0, 0.0)),
-                    PathElement::LineTo(p(10.0, 10.0)),
-                    PathElement::CurveTo(p(5.0, 10.0), p(0.0, 5.0), p(0.0, 0.0)),
-                    PathElement::Close,
-                ]
-            )
+            path.iter().collect::<Vec<_>>(),
+            [
+                PathElement::MoveTo(p(10.0, 0.0)),
+                PathElement::LineTo(p(10.0, 10.0)),
+                PathElement::CurveTo(p(5.0, 10.0), p(0.0, 5.0), p(0.0, 0.0)),
+                PathElement::Close,
+            ]
         );
     }
 
@@ -6244,10 +6202,7 @@ mod tests {
         let (path, bounds) =
             build_glyph_clip_path(&glyphs, &Matrix::identity(), &font, 100.0, 1.0, &mut false)
                 .expect("glyph clip path");
-        assert!(
-            !path.elements.is_empty(),
-            "clip path should carry outline elements"
-        );
+        assert!(!path.is_empty(), "clip path should carry outline elements");
         assert!(
             bounds.x1 > bounds.x0 && bounds.y1 > bounds.y0,
             "non-empty bbox: {bounds:?}"

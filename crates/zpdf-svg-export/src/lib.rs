@@ -824,8 +824,8 @@ impl SvgWriter<'_> {
             return None;
         }
         let mut d = String::new();
-        for elem in &path.elements {
-            match *elem {
+        for elem in path {
+            match elem {
                 PathElement::MoveTo(p) => {
                     let (x, y) = map(p.x, p.y)?;
                     d.push('M');

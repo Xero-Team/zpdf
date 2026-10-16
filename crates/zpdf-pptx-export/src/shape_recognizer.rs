@@ -8,19 +8,19 @@ use zpdf_display_list::{Path, PathElement};
 
 /// Recognize if a path is a simple rectangle.
 pub fn recognize_rectangle(path: &Path) -> Option<Rect> {
-    if path.elements.len() != 5 {
+    if path.len() != 5 {
         return None;
     }
 
     let mut corners = Vec::new();
 
-    for elem in &path.elements {
+    for elem in path {
         match elem {
             PathElement::MoveTo(p) => {
-                corners.push(*p);
+                corners.push(p);
             }
             PathElement::LineTo(p) => {
-                corners.push(*p);
+                corners.push(p);
             }
             PathElement::Close => {}
             _ => return None, // Curves disqualify it as a rectangle
@@ -65,7 +65,7 @@ pub fn recognize_ellipse(path: &Path) -> Option<Rect> {
     let mut has_move = false;
     let mut has_close = false;
 
-    for elem in &path.elements {
+    for elem in path {
         match elem {
             PathElement::MoveTo(p) => {
                 has_move = true;
@@ -100,12 +100,13 @@ pub fn recognize_ellipse(path: &Path) -> Option<Rect> {
 
 /// Recognize if a path is a simple line.
 pub fn recognize_line(path: &Path) -> Option<(Point, Point)> {
-    if path.elements.len() != 2 {
+    if path.len() != 2 {
         return None;
     }
 
-    match (&path.elements[0], &path.elements[1]) {
-        (PathElement::MoveTo(p1), PathElement::LineTo(p2)) => Some((*p1, *p2)),
+    let mut elements = path.iter();
+    match (elements.next(), elements.next()) {
+        (Some(PathElement::MoveTo(p1)), Some(PathElement::LineTo(p2))) => Some((p1, p2)),
         _ => None,
     }
 }

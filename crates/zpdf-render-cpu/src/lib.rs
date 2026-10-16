@@ -640,8 +640,8 @@ impl<'a> CpuRenderer<'a> {
 
     fn build_skia_path(&self, path: &Path) -> Option<tiny_skia::Path> {
         let mut pb = tiny_skia::PathBuilder::new();
-        for elem in &path.elements {
-            match *elem {
+        for elem in path {
+            match elem {
                 PathElement::MoveTo(p) => {
                     pb.move_to(self.to_pixel_x(p.x as f32), self.flip_y(p.y as f32));
                 }
@@ -2146,8 +2146,8 @@ impl<'a> CpuRenderer<'a> {
     ) -> Option<tiny_skia::Path> {
         let mut pb = tiny_skia::PathBuilder::new();
 
-        for elem in &path.elements {
-            match *elem {
+        for elem in path {
+            match elem {
                 PathElement::MoveTo(p) => {
                     let (px, py) = self.type3_to_pixel(
                         p.x,

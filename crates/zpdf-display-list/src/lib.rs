@@ -1,4 +1,6 @@
-use zpdf_core::{Matrix, Point, Rect};
+use zpdf_core::{Matrix, Rect};
+
+mod path;
 
 #[derive(Debug, Clone)]
 pub struct DisplayList {
@@ -96,60 +98,7 @@ pub enum SoftMaskKind {
 
 // -- Path --
 
-#[derive(Debug, Clone)]
-pub struct Path {
-    pub elements: Vec<PathElement>,
-}
-
-impl Path {
-    pub fn new() -> Self {
-        Self {
-            elements: Vec::new(),
-        }
-    }
-
-    pub fn move_to(&mut self, p: Point) {
-        self.elements.push(PathElement::MoveTo(p));
-    }
-
-    pub fn line_to(&mut self, p: Point) {
-        self.elements.push(PathElement::LineTo(p));
-    }
-
-    pub fn curve_to(&mut self, c1: Point, c2: Point, end: Point) {
-        self.elements.push(PathElement::CurveTo(c1, c2, end));
-    }
-
-    pub fn close(&mut self) {
-        self.elements.push(PathElement::Close);
-    }
-
-    pub fn rect(&mut self, r: Rect) {
-        self.move_to(Point::new(r.x0, r.y0));
-        self.line_to(Point::new(r.x1, r.y0));
-        self.line_to(Point::new(r.x1, r.y1));
-        self.line_to(Point::new(r.x0, r.y1));
-        self.close();
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.elements.is_empty()
-    }
-}
-
-impl Default for Path {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum PathElement {
-    MoveTo(Point),
-    LineTo(Point),
-    CurveTo(Point, Point, Point),
-    Close,
-}
+pub use path::{Path, PathElement, PathIter};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FillRule {

@@ -160,7 +160,7 @@ pub fn stroke_lyon_path(path: &LyonPath, opts: &StrokeOptions, color: [f32; 4]) 
 /// Build a lyon path from display-list elements, mapping each point to device
 /// pixels. Balances sub-paths (lyon panics on unbalanced begin/end).
 fn build_lyon_path(path: &DlPath, map: &PageMap) -> Option<LyonPath> {
-    if path.elements.is_empty() {
+    if path.is_empty() {
         return None;
     }
     let mut b = LyonPath::builder();
@@ -169,8 +169,8 @@ fn build_lyon_path(path: &DlPath, map: &PageMap) -> Option<LyonPath> {
         let p = map.pt(p);
         safe_point(p).then_some(p)
     };
-    for el in &path.elements {
-        match *el {
+    for el in path {
+        match el {
             PathElement::MoveTo(p) => {
                 if open {
                     b.end(false);
