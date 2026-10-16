@@ -79,6 +79,12 @@ pub struct ContentInterpreter<'a> {
     /// LUT only once. Reuse overwrites `to_page` with the current CTM.
     shading_cache: HashMap<ObjectId, crate::shading::ShadingDef>,
     form_font_overrides: Vec<HashMap<String, String>>,
+    /// Bounded recovery for malformed CAD text fonts (broken subsets, fonts
+    /// leaked across text blocks), fed while the page is interpreted.
+    font_repair: crate::font_repair::FontRepair,
+    /// The current font is a leak override for this show operator, not one
+    /// a `Tf` selected; its shows are not recovery evidence.
+    font_override: bool,
     /// Owned /Resources of the form XObjects currently being interpreted,
     /// innermost last. Lookups search these before the page resources.
     form_resources: Vec<ResourceDict>,
@@ -602,6 +608,8 @@ impl<'a> ContentInterpreter<'a> {
             rejected_image_objects: HashSet::new(),
             shading_cache: HashMap::new(),
             form_font_overrides: Vec::new(),
+            font_repair: Default::default(),
+            font_override: false,
             form_resources: Vec::new(),
             form_depth: 0,
             state_floor: 0,
@@ -1035,6 +1043,8 @@ impl<'a> ContentInterpreter<'a> {
 
         self.paint_annotations();
 
+        self.stats.font_repairs = self.font_repair.repairs;
+        self.stats.font_repair_probes = self.font_repair.probes;
         self.stats.total_ns = started.elapsed().as_nanos() as u64;
         (self.display_list, self.stats)
     }
@@ -1475,10 +1485,20 @@ impl<'a> ContentInterpreter<'a> {
             "Tr" => self.current.render_mode = self.pop_f64() as u8,
             "Tj" => {
                 let bytes = self.pop_string_bytes();
+                let restore = self.leaked_font_override(|| std::iter::once(bytes.as_slice()));
                 self.show_text(&bytes);
+                self.restore_font(restore);
             }
             "TJ" => {
                 if let Some(PdfObject::Array(arr)) = self.operand_stack.pop() {
+                    // A leaked font is judged for the whole array before any
+                    // element is shown.
+                    let restore = self.leaked_font_override(|| {
+                        arr.iter().filter_map(|item| match item {
+                            PdfObject::String(s) => Some(s.0.as_slice()),
+                            _ => None,
+                        })
+                    });
                     for item in arr {
                         match item {
                             PdfObject::String(s) => self.show_text(&s.0),
@@ -1491,6 +1511,7 @@ impl<'a> ContentInterpreter<'a> {
                             _ => {}
                         }
                     }
+                    self.restore_font(restore);
                 }
             }
             "'" => {
@@ -1500,7 +1521,9 @@ impl<'a> ContentInterpreter<'a> {
                 self.text_line_matrix = self.text_line_matrix.concat(&translate);
                 self.text_matrix = self.text_line_matrix;
                 let bytes = self.pop_string_bytes();
+                let restore = self.leaked_font_override(|| std::iter::once(bytes.as_slice()));
                 self.show_text(&bytes);
+                self.restore_font(restore);
             }
             "\"" => {
                 let bytes = self.pop_string_bytes();
@@ -1512,7 +1535,9 @@ impl<'a> ContentInterpreter<'a> {
                 let translate = Matrix::translate(0.0, -leading);
                 self.text_line_matrix = self.text_line_matrix.concat(&translate);
                 self.text_matrix = self.text_line_matrix;
+                let restore = self.leaked_font_override(|| std::iter::once(bytes.as_slice()));
                 self.show_text(&bytes);
+                self.restore_font(restore);
             }
 
             // -- XObject --
@@ -4049,7 +4074,7 @@ impl<'a> ContentInterpreter<'a> {
         self.mc_stack = saved_mc_stack;
         self.oc_hidden_from = saved_oc_hidden;
         self.base_ctm = saved_base_ctm;
-        self.form_font_overrides.pop();
+        self.pop_form_fonts();
         if pushed_resources {
             self.form_resources.pop();
         }
@@ -4193,6 +4218,9 @@ impl<'a> ContentInterpreter<'a> {
             }
         }
 
+        if !overrides.is_empty() {
+            self.font_repair.scope_changed();
+        }
         self.form_font_overrides.push(overrides);
     }
 
@@ -4781,7 +4809,7 @@ impl<'a> ContentInterpreter<'a> {
         self.text_matrix = saved_text_matrix;
         self.text_line_matrix = saved_text_line_matrix;
         self.operand_stack = saved_operand_stack;
-        self.form_font_overrides.pop();
+        self.pop_form_fonts();
         if pushed_resources {
             self.form_resources.pop();
         }
@@ -4824,6 +4852,41 @@ impl<'a> ContentInterpreter<'a> {
             h_scale,
         });
         self.emit_painted(cmd);
+    }
+
+    /// CAD output can show text under a font leaked from another text block.
+    /// When a validated replacement exists, show this operator with it and
+    /// return the font to restore afterwards (see [`crate::font_repair`]).
+    fn leaked_font_override<'b, I>(
+        &mut self,
+        strings: impl Fn() -> I,
+    ) -> Option<Option<zpdf_font::FontId>>
+    where
+        I: Iterator<Item = &'b [u8]>,
+    {
+        let current = self.current_font_id?;
+        let cache = self.font_cache.as_deref()?;
+        let target = self.font_repair.leaked_font(cache, current, strings)?;
+        self.font_override = true;
+        Some(self.current_font_id.replace(target))
+    }
+
+    fn restore_font(&mut self, restore: Option<Option<zpdf_font::FontId>>) {
+        if let Some(previous) = restore {
+            self.current_font_id = previous;
+            self.font_override = false;
+        }
+    }
+
+    /// Leave a Form's font scope; sibling candidates change with it.
+    fn pop_form_fonts(&mut self) {
+        if self
+            .form_font_overrides
+            .pop()
+            .is_some_and(|names| !names.is_empty())
+        {
+            self.font_repair.scope_changed();
+        }
     }
 
     fn show_text(&mut self, bytes: &[u8]) {
@@ -4871,6 +4934,9 @@ impl<'a> ContentInterpreter<'a> {
             let direct_gid = font_and_id
                 .is_some_and(|(_, font)| font.unicode_coded() || font.legacy_substitute());
             let dw2 = font_and_id.map(|(_, f)| f.dw2).unwrap_or((880.0, -1000.0));
+            let mut evidence = font_and_id
+                .filter(|_| !self.font_override)
+                .and_then(|(fid, _)| self.font_repair.evidence(fid));
 
             let mut i = 0usize;
             while i < bytes.len() {
@@ -4887,6 +4953,9 @@ impl<'a> ContentInterpreter<'a> {
                     }
                 };
                 i += len.max(1);
+                if let Some(evidence) = evidence.as_deref_mut() {
+                    evidence.insert(code);
+                }
 
                 // Resolve the glyph id, its 1/1000-unit advance, and (for CID
                 // fonts in vertical mode) the per-CID /W2 vertical metric.
@@ -4955,6 +5024,11 @@ impl<'a> ContentInterpreter<'a> {
             }
         } else {
             let mut previous = None;
+            // Codes resolve once per font and page, not once per show.
+            if let (Some((fid, _)), false) = (font_and_id, self.font_override) {
+                self.font_repair.note_simple(fid);
+            }
+            let mut codes = font_and_id.and_then(|(fid, _)| self.font_repair.simple_codes(fid));
             for &byte in bytes {
                 let code = byte as u16;
                 // Type3 CharProcs are addressed by character code. Other fonts
@@ -4964,13 +5038,11 @@ impl<'a> ContentInterpreter<'a> {
                 {
                     glyph
                 } else if let Some((_, font)) = font_and_id {
-                    let gid = font.code_to_gid(code).unwrap_or_else(|| {
-                        if font.is_type3() {
-                            code
-                        } else {
-                            0
-                        }
-                    });
+                    let gid = match codes.as_deref_mut() {
+                        Some(codes) => codes.glyph(font, byte),
+                        None => font.code_to_gid(code),
+                    };
+                    let gid = gid.unwrap_or_else(|| if font.is_type3() { code } else { 0 });
                     let adv = font.simple_glyph_advance(code, gid) as f32 * scale_factor * h_scale;
                     (gid, adv)
                 } else {
@@ -4993,6 +5065,13 @@ impl<'a> ContentInterpreter<'a> {
                 }
             }
         }
+
+        // A blank glyph shown for visible text is a broken subset's missing
+        // glyph; such text takes the resolving path below.
+        let repair = self.current.render_mode != 3
+            && !glyphs.is_empty()
+            && font_and_id
+                .is_some_and(|(fid, font)| self.font_repair.scan_blanks(fid, font, bytes, &glyphs));
 
         // Decode the text and compute its user-space placement for extraction,
         // while the immutable font borrow is still live.
@@ -5050,7 +5129,8 @@ impl<'a> ContentInterpreter<'a> {
                 .as_ref()
                 .and_then(|cache| cache.provider())
                 .is_none_or(|provider| provider.generation() == 0)
-            && !cs_produces_no_marks(&self.current.fill_cs);
+            && !cs_produces_no_marks(&self.current.fill_cs)
+            && !repair;
         if ordinary {
             if let Some(font_id) = self.current_font_id {
                 if !glyphs.is_empty() {
@@ -5058,7 +5138,7 @@ impl<'a> ContentInterpreter<'a> {
                 }
             }
         } else {
-            self.paint_positioned_text(bytes, glyphs, combined, font_size, h_scale);
+            self.paint_positioned_text(bytes, glyphs, combined, font_size, h_scale, repair);
         }
 
         // Hidden optional-content layers also extract no text (emit_painted
@@ -5089,10 +5169,11 @@ impl<'a> ContentInterpreter<'a> {
         combined: Matrix,
         font_size: f32,
         h_scale: f32,
+        repair: bool,
     ) {
         let resolved_runs = self
             .current_font_id
-            .and_then(|font_id| self.resolve_text_glyphs(font_id, bytes, &mut glyphs));
+            .and_then(|font_id| self.resolve_text_glyphs(font_id, bytes, &mut glyphs, repair));
 
         // Only emit a glyph run when a font is actually active; with no font the
         // glyph IDs would be raw, unmappable codes aliased onto font 0.
@@ -5216,17 +5297,29 @@ impl<'a> ContentInterpreter<'a> {
 
     /// Keep the original positions/advances and replace only drawing identities.
     /// The absent/empty-provider path allocates no resolution state or vectors.
+    /// `repair` marks a show with broken-subset blanks (see `font_repair`):
+    /// those draw from a validated page font first, then from the provider.
     fn resolve_text_glyphs(
         &mut self,
         font_id: FontId,
         bytes: &[u8],
         glyphs: &mut Vec<PositionedGlyph>,
+        repair: bool,
     ) -> Option<Vec<(FontId, Vec<PositionedGlyph>)>> {
-        if self.current.render_mode == 3 {
+        if self.current.render_mode == 3 || glyphs.is_empty() {
             return None;
         }
+        let max_bytes = self.max_font_cache_bytes;
+        let scope = crate::font_repair::RepairScope {
+            page: self.resources,
+            forms: &self.form_font_overrides,
+        };
+        let repairs = &mut self.font_repair;
         let cache = self.font_cache.as_deref_mut()?;
-        if cache.provider()?.generation() == 0 || glyphs.is_empty() {
+        let provider = cache
+            .provider()
+            .is_some_and(|provider| provider.generation() != 0);
+        if !provider && !repair {
             return None;
         }
         let composite = matches!(
@@ -5235,15 +5328,22 @@ impl<'a> ContentInterpreter<'a> {
         );
         let cmap = cache.get(font_id)?.cid_cmap.as_ref();
         let mut check_offset = 0usize;
-        if cache.original_glyphs_usable(
-            font_id,
-            glyphs.iter().map(|glyph| {
-                let (code, length, raw, end) = next_text_code(cmap, composite, bytes, check_offset)
+        if !repair
+            && cache.original_glyphs_usable(
+                font_id,
+                glyphs.iter().map(|glyph| {
+                    let (code, length, raw, end) = next_text_code(
+                        cmap,
+                        composite,
+                        bytes,
+                        check_offset,
+                    )
                     .unwrap_or((0, 0, 0, bytes.len()));
-                check_offset = end;
-                (glyph.glyph_id, code, raw, length as u8)
-            }),
-        ) {
+                    check_offset = end;
+                    (glyph.glyph_id, code, raw, length as u8)
+                }),
+            )
+        {
             return None;
         }
         let mut ids: Option<Vec<FontId>> = None;
@@ -5260,16 +5360,26 @@ impl<'a> ContentInterpreter<'a> {
             let key = (code, raw, length, original.glyph_id);
             // Adjacent repeats share a resolution within this positioned text
             // operation. Later operations still observe provider generation.
+            let suspicious = repair && repairs.is_suspicious(font_id, original.glyph_id);
             let drawing = match previous {
                 Some((previous_key, drawing)) if previous_key == key => drawing,
                 _ => {
-                    let drawing = cache.resolve_drawing_glyph(
-                        original,
-                        code,
-                        raw,
-                        length as u8,
-                        self.max_font_cache_bytes,
-                    );
+                    let sibling = if suspicious {
+                        repairs.sibling_glyph(cache, &scope, font_id, code, length as u8, raw)
+                    } else {
+                        None
+                    };
+                    let drawing = match sibling {
+                        Some(sibling) => sibling,
+                        None if provider => cache.resolve_drawing_glyph(
+                            original,
+                            code,
+                            raw,
+                            length as u8,
+                            max_bytes,
+                        ),
+                        None => original,
+                    };
                     previous = Some((key, drawing));
                     drawing
                 }
@@ -5401,7 +5511,7 @@ fn resolve_image_metadata(file: &PdfFile, dict: &zpdf_core::PdfDict) -> zpdf_cor
 /// Split the character code at `bytes[offset..]` as `show_text` did: through
 /// the encoding CMap for composite fonts (two-byte codes without one), one
 /// byte for simple fonts. Returns `(code, length, raw source value, end)`.
-fn next_text_code(
+pub(crate) fn next_text_code(
     cmap: Option<&zpdf_font::cmap::CidCMap>,
     composite: bool,
     bytes: &[u8],

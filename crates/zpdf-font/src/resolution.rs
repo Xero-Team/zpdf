@@ -43,7 +43,26 @@ pub(crate) struct GlyphChecks {
 
 struct CheckedFont {
     _identity: Weak<LoadedFont>,
-    glyphs: Vec<(u16, bool)>,
+    glyphs: Vec<(u16, GlyphState)>,
+}
+
+/// What a font program holds for one glyph id. A blank glyph is a space unless
+/// the code shown with it names visible text (see [`LoadedFont::blank_hides_text`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GlyphState {
+    Missing,
+    Drawn,
+    Blank,
+}
+
+impl GlyphState {
+    fn usable(self, font: &LoadedFont, code: u32, raw_code: u32) -> bool {
+        match self {
+            GlyphState::Missing => false,
+            GlyphState::Drawn => true,
+            GlyphState::Blank => !font.blank_hides_text(code, raw_code),
+        }
+    }
 }
 
 impl GlyphChecks {
@@ -64,12 +83,12 @@ impl GlyphChecks {
 }
 
 impl FontProvider {
-    fn has_mapped_glyph(&self, font: &Arc<LoadedFont>, glyph: u16) -> bool {
+    fn glyph_state(&self, font: &Arc<LoadedFont>, glyph: u16) -> GlyphState {
         if glyph == 0 && !font.is_type3() {
-            return false;
+            return GlyphState::Missing;
         }
         let key = Arc::as_ptr(font) as usize;
-        if let Some(Some(usable)) = self.read_glyph_checks(key, |cache| {
+        if let Some(Some(state)) = self.read_glyph_checks(key, |cache| {
             let entry = cache.entries.get(&key)?;
             let index = entry
                 .glyphs
@@ -77,20 +96,25 @@ impl FontProvider {
                 .ok()?;
             Some(entry.glyphs[index].1)
         }) {
-            return usable;
+            return state;
         }
-        let usable = font.has_mapped_glyph(glyph);
+        let state = font.glyph_state(glyph);
         self.with_glyph_checks(key, |cache| {
             let (entry, count) = cache.for_font(font);
             match entry.glyphs.binary_search_by_key(&glyph, |(gid, _)| *gid) {
                 Ok(_) => {}
                 Err(index) => {
-                    entry.glyphs.insert(index, (glyph, usable));
+                    entry.glyphs.insert(index, (glyph, state));
                     *count += 1;
                 }
             }
         });
-        usable
+        state
+    }
+
+    #[cfg(test)]
+    fn has_mapped_glyph(&self, font: &Arc<LoadedFont>, glyph: u16) -> bool {
+        self.glyph_state(font, glyph) != GlyphState::Missing
     }
 }
 
@@ -117,24 +141,101 @@ impl LoadedFont {
     }
 
     /// A mapped empty glyph is present even if it has no drawable outline.
-    fn has_mapped_glyph(&self, glyph_id: u16) -> bool {
+    fn glyph_state(&self, glyph_id: u16) -> GlyphState {
+        let mapped = |present: bool| {
+            if present {
+                GlyphState::Drawn
+            } else {
+                GlyphState::Missing
+            }
+        };
         if self.is_type3() {
-            return self.type3_glyph_stream(glyph_id).is_some();
+            return mapped(self.type3_glyph_stream(glyph_id).is_some());
         }
         if glyph_id == 0 {
-            return false;
+            return GlyphState::Missing;
         }
         if let Some(type1) = &self.type1 {
-            return type1.glyph_outline_by_gid(glyph_id).is_some();
+            return mapped(type1.glyph_outline_by_gid(glyph_id).is_some());
         }
-        self.font_data
-            .as_ref()
-            .and_then(|data| ttf_parser::Face::parse(data, self.face_index).ok())
-            .is_some_and(|mut face| {
-                self.apply_variations(&mut face);
-                self.drawing_gid_with_face(glyph_id, &face)
-                    .is_some_and(|gid| usable_glyph(&face, gid))
+        parsed_face(self).map_or(GlyphState::Missing, |face| {
+            self.face_glyph_state(glyph_id, &face)
+        })
+    }
+
+    fn face_glyph_state(&self, glyph_id: u16, face: &ttf_parser::Face<'_>) -> GlyphState {
+        self.drawing_gid_with_face(glyph_id, face)
+            .map_or(GlyphState::Missing, |gid| physical_glyph_state(face, gid))
+    }
+
+    /// Whether a blank glyph shown for this code stands in for a missing one:
+    /// the embedded program's own `/ToUnicode` names visible text for it.
+    /// Broken CAD subsets keep the glyph ids they show but zero their `loca`
+    /// entries. Whitespace, controls, format characters and private-use
+    /// meanings are never evidence; substitutes are judged by their own cmap.
+    #[doc(hidden)]
+    pub fn blank_hides_text(&self, code: u32, raw_code: u32) -> bool {
+        !self.is_substitute
+            && self
+                .to_unicode
+                .as_ref()
+                .and_then(|map| map.lookup(raw_code).or_else(|| map.lookup(code)))
+                .is_some_and(is_visible_text)
+    }
+
+    /// Whether every `(glyph id, code, raw code, code length)` draws what the
+    /// code means: a glyph with an outline, or a blank glyph only where the
+    /// font's own meaning for the code (`/ToUnicode`, else its CMap or
+    /// encoding) is whitespace or invisible. An unknown meaning does not
+    /// excuse a blank glyph. Parses the program once for the whole batch.
+    #[doc(hidden)]
+    pub fn glyphs_usable(&self, glyphs: impl IntoIterator<Item = (u16, u32, u32, u8)>) -> bool {
+        let face = if self.is_type3() || self.type1.is_some() {
+            None
+        } else {
+            match parsed_face(self) {
+                Some(face) => Some(face),
+                None => return false,
+            }
+        };
+        glyphs
+            .into_iter()
+            .all(|(glyph_id, code, raw_code, length)| {
+                let state = match &face {
+                    Some(face) if glyph_id != 0 => self.face_glyph_state(glyph_id, face),
+                    Some(_) => GlyphState::Missing,
+                    None => self.glyph_state(glyph_id),
+                };
+                match state {
+                    GlyphState::Missing => false,
+                    GlyphState::Drawn => true,
+                    GlyphState::Blank => self.blank_is_space(code, raw_code, length),
+                }
             })
+    }
+
+    /// A blank glyph is right for this code: the font's meaning for it is
+    /// known and is whitespace or invisible.
+    fn blank_is_space(&self, code: u32, raw_code: u32, length: u8) -> bool {
+        let text = self
+            .to_unicode
+            .as_ref()
+            .and_then(|map| map.lookup(raw_code).or_else(|| map.lookup(code)));
+        match text {
+            Some(text) => !is_visible_text(text),
+            None => self
+                .fallback_character(code, raw_code, length)
+                .is_some_and(|character| {
+                    let mut buffer = [0; 4];
+                    !is_visible_text(character.character.encode_utf8(&mut buffer))
+                }),
+        }
+    }
+
+    /// Whether the glyph has a drawable, non-empty outline.
+    #[doc(hidden)]
+    pub fn glyph_drawn(&self, glyph_id: u16) -> bool {
+        self.glyph_state(glyph_id) == GlyphState::Drawn
     }
 
     fn fallback_character(&self, code: u32, raw_code: u32, length: u8) -> Option<FontCharacter> {
@@ -208,6 +309,55 @@ pub(crate) fn usable_glyph(face: &ttf_parser::Face<'_>, gid: u16) -> bool {
     gid != 0 && readable_glyph(face, gid)
 }
 
+fn physical_glyph_state(face: &ttf_parser::Face<'_>, gid: u16) -> GlyphState {
+    if gid == 0 || gid >= face.number_of_glyphs() {
+        GlyphState::Missing
+    } else if face
+        .outline_glyph(ttf_parser::GlyphId(gid), &mut OutlineProbe)
+        .is_some()
+    {
+        GlyphState::Drawn
+    } else if readable_glyph(face, gid) {
+        GlyphState::Blank
+    } else {
+        GlyphState::Missing
+    }
+}
+
+/// Whether text names something visible: at least one character that is not
+/// whitespace, a control or format character, a default-ignorable code point,
+/// or private use (whose meaning belongs to one font).
+#[doc(hidden)]
+pub fn is_visible_text(text: &str) -> bool {
+    text.chars().any(|character| {
+        !character.is_whitespace()
+            && !character.is_control()
+            && !matches!(
+                character as u32,
+                0xAD | 0x34F
+                    | 0x61C
+                    | 0x115F..=0x1160
+                    | 0x17B4..=0x17B5
+                    | 0x180B..=0x180F
+                    | 0x200B..=0x200F
+                    | 0x202A..=0x202E
+                    | 0x2060..=0x206F
+                    | 0x2800
+                    | 0x3164
+                    | 0xFE00..=0xFE0F
+                    | 0xFEFF
+                    | 0xFFA0
+                    | 0xFFF0..=0xFFF8
+                    | 0x1BCA0..=0x1BCA3
+                    | 0x1D173..=0x1D17A
+                    | 0xE0000..=0xE0FFF
+                    | 0xE000..=0xF8FF
+                    | 0xF0000..=0xFFFFD
+                    | 0x100000..=0x10FFFD
+            )
+    })
+}
+
 /// The glyph exists and its outline, possibly empty, is well formed.
 fn readable_glyph(face: &ttf_parser::Face<'_>, gid: u16) -> bool {
     if gid >= face.number_of_glyphs() {
@@ -265,6 +415,87 @@ fn readable_glyph(face: &ttf_parser::Face<'_>, gid: u16) -> bool {
     start == end || (end - start >= 10 && glyf.get(start..start + 2) == Some(&[0, 0]))
 }
 
+/// Constant-time blank-glyph checks read straight from an embedded TrueType
+/// program's `loca` table, for per-glyph checks on every shown glyph.
+#[doc(hidden)]
+pub struct BlankGlyphTable {
+    data: Arc<[u8]>,
+    loca: std::ops::Range<usize>,
+    glyf: std::ops::Range<usize>,
+    long: bool,
+    glyph_count: u16,
+    /// Run glyph ids are physical GIDs (no CID → GID step).
+    direct: bool,
+}
+
+impl LoadedFont {
+    /// The `loca` view of an embedded `glyf` program. `None` for substitutes,
+    /// Type 1, Type 3 and CFF outlines.
+    #[doc(hidden)]
+    pub fn blank_glyph_table(&self) -> Option<BlankGlyphTable> {
+        if self.is_substitute || self.type1.is_some() || self.is_type3() {
+            return None;
+        }
+        // Only the table directory is read; no table is parsed.
+        let data = self.font_data.as_ref()?;
+        let raw = ttf_parser::RawFace::parse(data, self.face_index).ok()?;
+        let table = |tag: &[u8; 4]| raw.table(ttf_parser::Tag::from_bytes(tag));
+        let range = |tag: &[u8; 4]| {
+            let table = table(tag)?;
+            let start = (table.as_ptr() as usize).checked_sub(data.as_ptr() as usize)?;
+            Some(start..start + table.len())
+        };
+        let glyph_count = table(b"maxp")?.get(4..6)?;
+        Some(BlankGlyphTable {
+            loca: range(b"loca")?,
+            glyf: range(b"glyf")?,
+            long: table(b"head")?.get(50..52)? == [0, 1],
+            glyph_count: u16::from_be_bytes([glyph_count[0], glyph_count[1]]),
+            direct: self.unicode_coded() || self.cid_to_gid.is_none(),
+            data: Arc::clone(data),
+        })
+    }
+}
+
+impl BlankGlyphTable {
+    /// Whether `glyph_id`, as carried in `font`'s glyph runs, maps to a real
+    /// glyph whose outline is well formed but empty (a zero-length `loca`
+    /// entry or zero contours). `font` is the font the table was taken from.
+    pub fn is_blank(&self, font: &LoadedFont, glyph_id: u16) -> bool {
+        let gid = match &font.cid_to_gid {
+            Some(map) if !self.direct => match map.get(&glyph_id) {
+                Some(&gid) => gid,
+                None => return false,
+            },
+            _ => glyph_id,
+        };
+        self.physical_blank(gid)
+    }
+
+    fn physical_blank(&self, gid: u16) -> bool {
+        if gid == 0 || gid >= self.glyph_count {
+            return false;
+        }
+        let loca = &self.data[self.loca.clone()];
+        let glyf = &self.data[self.glyf.clone()];
+        let offset = |index: usize| -> Option<usize> {
+            if self.long {
+                let bytes = loca.get(index * 4..index * 4 + 4)?;
+                Some(u32::from_be_bytes(bytes.try_into().ok()?) as usize)
+            } else {
+                let bytes = loca.get(index * 2..index * 2 + 2)?;
+                Some(u16::from_be_bytes(bytes.try_into().ok()?) as usize * 2)
+            }
+        };
+        let (Some(start), Some(end)) = (offset(gid as usize), offset(gid as usize + 1)) else {
+            return false;
+        };
+        start <= end
+            && end <= glyf.len()
+            && (start == end || (end - start >= 10 && glyf[start..start + 2] == [0, 0]))
+    }
+}
+
 /// The font's own face at its configured variation instance.
 fn parsed_face(font: &LoadedFont) -> Option<ttf_parser::Face<'_>> {
     let mut face = ttf_parser::Face::parse(font.font_data.as_ref()?, font.face_index).ok()?;
@@ -318,7 +549,7 @@ impl FontCache {
                         .glyphs
                         .binary_search_by_key(&glyph, |(gid, _)| *gid)
                         .ok()?;
-                    Some(entry.glyphs[index].1)
+                    Some(entry.glyphs[index].1.usable(font, code, raw_code))
                 });
                 match known {
                     Some(false) => return Err(()),
@@ -337,7 +568,7 @@ impl FontCache {
         };
         // New glyphs and variation sequences: probe without holding the lock,
         // then record what was learned in one short write.
-        let known: Vec<(u16, bool)> = provider
+        let known: Vec<(u16, GlyphState)> = provider
             .read_glyph_checks(key, |checks| {
                 checks.entries.get(&key).map(|entry| entry.glyphs.clone())
             })
@@ -345,7 +576,7 @@ impl FontCache {
             .unwrap_or_default();
         let mut face = None;
         let mut parsed = false;
-        let mut learned: Vec<(u16, bool)> = Vec::new();
+        let mut learned: Vec<(u16, GlyphState)> = Vec::new();
         let mut usable_all = true;
         let mut previous = None;
         for (index, source @ (glyph, code, raw_code, length)) in first.into_iter().chain(glyphs) {
@@ -357,32 +588,31 @@ impl FontCache {
                 continue;
             }
             previous = Some(source);
-            let lookup = |list: &[(u16, bool)]| {
+            let lookup = |list: &[(u16, GlyphState)]| {
                 list.binary_search_by_key(&glyph, |(gid, _)| *gid)
                     .ok()
                     .map(|index| list[index].1)
             };
-            let usable = match lookup(&known).or_else(|| lookup(&learned)) {
-                Some(usable) => usable,
+            let state = match lookup(&known).or_else(|| lookup(&learned)) {
+                Some(state) => state,
                 None => {
-                    let usable = if font.is_type3() || font.type1.is_some() {
-                        font.has_mapped_glyph(glyph)
+                    let state = if font.is_type3() || font.type1.is_some() {
+                        font.glyph_state(glyph)
                     } else {
                         if !parsed {
                             (face, parsed) = (parsed_face(font), true);
                         }
-                        face.as_ref().is_some_and(|face| {
-                            font.drawing_gid_with_face(glyph, face)
-                                .is_some_and(|gid| usable_glyph(face, gid))
+                        face.as_ref().map_or(GlyphState::Missing, |face| {
+                            font.face_glyph_state(glyph, face)
                         })
                     };
                     if let Err(index) = learned.binary_search_by_key(&glyph, |(gid, _)| *gid) {
-                        learned.insert(index, (glyph, usable));
+                        learned.insert(index, (glyph, state));
                     }
-                    usable
+                    state
                 }
             };
-            if !usable {
+            if !state.usable(font, code, raw_code) {
                 usable_all = false;
                 break;
             }
@@ -403,12 +633,12 @@ impl FontCache {
         if !learned.is_empty() {
             provider.with_glyph_checks(key, |checks| {
                 let (entry, count) = checks.for_font(font);
-                for (glyph, usable) in learned {
+                for (glyph, state) in learned {
                     if *count >= 4096 {
                         break;
                     }
                     if let Err(index) = entry.glyphs.binary_search_by_key(&glyph, |(gid, _)| *gid) {
-                        entry.glyphs.insert(index, (glyph, usable));
+                        entry.glyphs.insert(index, (glyph, state));
                         *count += 1;
                     }
                 }
@@ -452,7 +682,10 @@ impl FontCache {
         let Some(font) = self.fonts.get(&original.font_id) else {
             return original;
         };
-        if provider.has_mapped_glyph(font, original.glyph_id) {
+        if provider
+            .glyph_state(font, original.glyph_id)
+            .usable(font, code, raw_code)
+        {
             let character = font
                 .is_substitute
                 .then(|| font.fallback_character(code, raw_code, length))
@@ -629,7 +862,7 @@ mod tests {
                 .entries
                 .values()
                 .flat_map(|font| &font.glyphs)
-                .any(|(_, usable)| !usable);
+                .any(|(_, state)| *state == GlyphState::Missing);
         });
         assert!(negative);
     }

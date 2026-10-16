@@ -30,6 +30,40 @@
 - The CPU backend and the interpreter share one footprint rule and box filter,
   `zpdf_image::box_filter_size` and `zpdf_image::box_downscale`.
 
+### CAD font recovery
+
+- Recover text from malformed CAD (AutoCAD/nanoCAD) fonts from evidence
+  gathered while the page is interpreted, without a pre-scan. Recovery is
+  bounded per operator and by a per-page validation cap, after which it is
+  disabled for the page.
+- A broken embedded TrueType subset whose shown glyphs have zero-length
+  `loca` entries draws each such letter from another font of the page or
+  enclosing Form only when that font maps the code to the identical
+  `/ToUnicode` text, draws a glyph for it and declares the same width;
+  positions and advances stay the original font's. Registered coverage
+  stands in when no font validates.
+- A show whose bytes were typeset for a Type0 font but inherit a simple font
+  is shown with that Type0 font for the operator only when the bytes have the
+  shape of such a leak: the Type0 font's CMap decodes every string exactly
+  and every multi-byte code starts with a non-whitespace byte the simple
+  font cannot draw. At least half of the codes must have been shown with
+  that font under its own `Tf`, and it must draw every code (a blank glyph
+  only where the code means whitespace). A show its Type0 font cannot decode
+  even leniently (a trailing fragment, or no code with a CID and glyph) uses
+  a simple font of the same base name shown on the page that draws every
+  byte. Shows under such an override are never evidence.
+- `CidCMap::exact_code` and `CidCMap::decodes_exactly` judge codespace
+  membership without the lenient recovery of `next_code`.
+- `InterpretStats` gains deterministic `font_repairs` and
+  `font_repair_probes` counters, also reported by `describe()`.
+
+### Behavior changes
+
+- With a `FontProvider`, a blank glyph shown for visible `/ToUnicode` text in
+  an embedded font is treated as missing and resolved through registered
+  coverage. Whitespace, controls, format characters and private-use text keep
+  their blank glyphs.
+
 ### Breaking changes
 
 - `Path::elements` is no longer a public `Vec<PathElement>`. Iterating a path
@@ -47,6 +81,8 @@
   | `path.elements.push(e)`, `path.elements.extend(..)` | `path.push(e)`, `path.extend(..)` (elements or `&PathElement`s) |
   | `path.elements.extend_from_slice(&other.elements)` | `path.extend_from_path(&other)` |
   | Visiting every point (bounds, transforms) | `path.points()`, `path.points_mut()`, `path.map_points(f)` |
+- `InterpretStats` is `#[non_exhaustive]` and has new fields: build it with
+  `InterpretStats::default()` and assign fields instead of a struct literal.
 
 ## 0.15.1 — Installable CLI and PPTX export again
 

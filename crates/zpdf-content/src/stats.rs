@@ -35,7 +35,11 @@
 /// the total. The earlier performance notes claimed a strict partition for the
 /// render-side sub-buckets first and measurement disproved it; this one is
 /// documented as attribution from the start.
+///
+/// Non-exhaustive so that later counters are not breaking changes; build one
+/// with `Default` and assign fields.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct InterpretStats {
     /// Gradient/mesh evaluation into a raster — `shading::rasterize`.
     ///
@@ -77,6 +81,13 @@ pub struct InterpretStats {
     pub image_ops: u64,
     pub form_ops: u64,
     pub color_ops: u64,
+    /// CAD font recovery: distinct broken-subset codes drawn from another
+    /// page font, plus show operators shown with a leak-override font.
+    /// Provider fallback is not counted. Deterministic.
+    pub font_repairs: u64,
+    /// Validation work CAD font recovery spent (candidate checks, codes
+    /// validated, scope rebuilds); capped per page. Deterministic.
+    pub font_repair_probes: u64,
 }
 
 impl InterpretStats {
@@ -102,7 +113,8 @@ impl InterpretStats {
             "interpret total={:.2}ms (shading={:.2} {:.0}%) | \
              text={:.2} {:.0}% image={:.2} {:.0}% form={:.2} {:.0}% \
              paint={:.2} {:.0}% path={:.2} {:.0}% color={:.2} {:.0}% | \
-             ops: text={} paint={} path={} image={} form={} color={} shading={}",
+             ops: text={} paint={} path={} image={} form={} color={} shading={} | \
+             font repairs={} probes={}",
             ms(self.total_ns),
             ms(self.shading_ns),
             pct(self.shading_ns),
@@ -125,6 +137,8 @@ impl InterpretStats {
             self.form_ops,
             self.color_ops,
             self.shading_rasters,
+            self.font_repairs,
+            self.font_repair_probes,
         )
     }
 

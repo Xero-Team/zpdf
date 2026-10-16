@@ -26,7 +26,7 @@ pub use provider::{
     FontCharacter, FontProvider, FontProviderLimits, RegisteredFontId, RegisteredFontPackId,
     RegisteredGlyph,
 };
-pub use resolution::DrawingGlyph;
+pub use resolution::{is_visible_text, BlankGlyphTable, DrawingGlyph};
 
 /// Glyph outline as a series of path commands.
 #[derive(Debug, Clone)]

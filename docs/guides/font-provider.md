@@ -95,7 +95,10 @@ widths, vertical metrics, text extraction and placement. A missing glyph uses
 the actual GID in a selected drawing face. Runs split at face changes; text
 and pattern clips use the combined outlines. Invisible text avoids loading
 drawing faces. Private-use mappings and arbitrary multi-scalar ligatures are
-not guessed from unrelated fonts.
+not guessed from unrelated fonts. An embedded glyph that is blank although its
+`/ToUnicode` names visible text (a broken CAD subset) counts as missing;
+another page font with the identical mapping and width is preferred, then
+registered coverage. Blank whitespace glyphs stay as they are.
 
 Page-level positive/negative decisions are bounded to 4,096 entries and clear
 on registration changes. Drawing faces respect the page font-cache byte limit
