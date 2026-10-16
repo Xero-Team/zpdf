@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.15.1 — Installable CLI and PPTX export again
+
+### Dependencies
+
+- Require `zip` 9.0 in `zpdf-pptx-export` (#62). Every `zip` release before
+  9.0.3 has been yanked from crates.io, so 0.15.0's `zpdf-pptx-export` and
+  `zpdf-cli` no longer resolve without an existing lockfile, and
+  `cargo install zpdf-cli` failed. zip 9 builds unchanged with
+  `deflate-flate2` only; `flate2` keeps its pure-Rust `miniz_oxide` backend and
+  exported `.pptx` files are byte-identical.
+
+### Build
+
+- Bump `taiki-e/install-action` in the fuzz workflow (#45).
+
 ## 0.15.0 — Application fonts, glyph fallback and complete CJK CMaps
 
 ### Application fonts
