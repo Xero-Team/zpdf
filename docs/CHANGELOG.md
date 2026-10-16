@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.16.0 — Compact paths, CPU image footprints and CAD font recovery
 
 ### Display list
 
@@ -10,6 +10,7 @@
   interpreter reuses its user-space path buffer. Line-heavy pages retain about
   half the display-list heap with fewer allocations, and rendering output is
   unchanged; see `docs/performance/paths.md` and the `path_memory` example.
+  (#63)
 
 ### Rendering performance
 
@@ -32,7 +33,7 @@
 
 ### CAD font recovery
 
-- Recover text from malformed CAD (AutoCAD/nanoCAD) fonts from evidence
+- Recover text from malformed CAD (AutoCAD/nanoCAD) fonts (#15) from evidence
   gathered while the page is interpreted, without a pre-scan. Recovery is
   bounded per operator and by a per-page validation cap, after which it is
   disabled for the page.
