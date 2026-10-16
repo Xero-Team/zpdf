@@ -399,7 +399,7 @@ impl<'a> SlideConverter<'a> {
         use zpdf_display_list::PathElement;
 
         let mut svg = String::new();
-        for elem in &path.elements {
+        for elem in path {
             match elem {
                 PathElement::MoveTo(p) => {
                     let (x, y) = self.pdf_to_ppt_coords(p.x, p.y);

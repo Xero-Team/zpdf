@@ -338,7 +338,7 @@ fn build_type3_path(
     glyph_offset: (f32, f32),
     map: &PageMap,
 ) -> Option<LyonPath> {
-    if path.elements.is_empty() {
+    if path.is_empty() {
         return None;
     }
     let p = |pt: zpdf_core::Point| {
@@ -355,8 +355,8 @@ fn build_type3_path(
     };
     let mut b = LyonPath::builder();
     let mut open = false;
-    for el in &path.elements {
-        match *el {
+    for el in path {
+        match el {
             PathElement::MoveTo(pt) => {
                 if open {
                     b.end(false);
