@@ -168,14 +168,23 @@ impl Pdf {
         let mut fonts = self.doc.load_page_fonts(&page);
         let mut images = zpdf::ImageCache::new();
         let content = self.doc.page_content_bytes(&page).map_err(js_err)?;
-        let dl = zpdf::ContentInterpreter::new(page.effective_box())
+        let page_box = page.effective_box();
+        let mut interpreter = zpdf::ContentInterpreter::new(page_box)
             .with_page_rotation(page.rotate)
             .with_fonts(&mut fonts)
             .with_document(self.doc.file(), &page.resources)
             .with_images(&mut images)
             .with_colors(&mut self.icc)
-            .with_operand_stack_limit(self.doc.file().limits().max_operand_stack_depth as usize)
-            .interpret(&content);
+            .with_operand_stack_limit(self.doc.file().limits().max_operand_stack_depth as usize);
+        // Store images at the footprint the CPU renderer below filters them
+        // to, instead of keeping full-size scans in wasm memory for the render.
+        if let Some(raster_scale) = zpdf::cpu::CpuRenderer::new()
+            .with_limits(self.doc.file().limits())
+            .raster_scale(page_box, scale)
+        {
+            interpreter = interpreter.with_image_downscale(raster_scale);
+        }
+        let dl = interpreter.interpret(&content);
 
         let target = zpdf::cpu::CpuRenderer::new()
             .with_limits(self.doc.file().limits())
