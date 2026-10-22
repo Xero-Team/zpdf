@@ -1,5 +1,12 @@
 //! True redaction: excise content under regions from a page's content stream.
 //!
+//! [`redact_pdf`] is the destructive, end-to-end entry point: it performs the
+//! excision below and then rewrites the whole document, so superseded object
+//! revisions (including the original page content) are not present in the
+//! returned bytes. [`IncrementalWriter::redact_page`] only updates the current
+//! revision and leaves the original bytes in place; use it only when a later
+//! [`crate::rewrite_pdf`] pass will garbage-collect the file.
+//!
 //! Unlike a cosmetic black box, [`IncrementalWriter::redact_page`] rewrites
 //! the page's content stream(s) with the matching operators **removed**:
 //! - text-show ops (`Tj`, `'`, `"`, `TJ`) whose glyph extent intersects a
@@ -21,7 +28,9 @@ use std::io::Cursor;
 
 use zpdf_content::tokenizer::{ContentToken, ContentTokenizer};
 use zpdf_core::{Matrix, ObjectId, PdfDict, PdfName, PdfObject, Rect, Result};
+use zpdf_document::PdfDocument;
 
+use crate::rewrite::{rewrite_pdf, RewriteOptions};
 use crate::{invalid_data, IncrementalWriter};
 
 /// Options for a redaction pass.
@@ -150,6 +159,31 @@ impl IncrementalWriter {
         self.overwrite_object(page_id, PdfObject::Dict(page_dict));
         Ok(())
     }
+}
+
+/// Destructively redact a page and return a fresh, garbage-collected PDF.
+///
+/// This is the safe end-to-end API: it runs [`IncrementalWriter::redact_page`],
+/// then rewrites the whole document so superseded object revisions — in
+/// particular the original, unredacted content stream — are not present in the
+/// returned bytes. The output is decrypted (a full rewrite drops `/Encrypt`);
+/// pass an empty `password` for unencrypted inputs.
+pub fn redact_pdf(
+    input: Vec<u8>,
+    password: &[u8],
+    page_index: usize,
+    rects: &[Rect],
+    options: &RedactOptions,
+) -> Result<Vec<u8>> {
+    let mut writer = IncrementalWriter::new_with_password(input, password)?;
+    writer.redact_page(page_index, rects, options)?;
+    let mut updated = Cursor::new(Vec::new());
+    writer.write(&mut updated)?;
+
+    // Re-open the update and serialize only the reachable object graph. The
+    // original file prefix (and every superseded revision in it) is dropped.
+    let doc = PdfDocument::open_with_password(updated.into_inner(), password)?;
+    rewrite_pdf(doc.file(), &RewriteOptions::default())
 }
 
 fn annot_rect(dict: &PdfDict) -> Option<Rect> {
