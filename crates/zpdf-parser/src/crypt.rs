@@ -785,18 +785,9 @@ fn aes128_cbc_encrypt_nopad(key: &[u8], iv: &[u8], data: &[u8]) -> Vec<u8> {
 /// encrypted document.
 fn aes_cbc_encrypt(key: &[u8], data: &[u8]) -> Vec<u8> {
     let mut iv = [0u8; 16];
-    // The IV must be unpredictable but need not be secret. getrandom is not a
-    // parser dependency, so derive it from entropy we have: MD5 over the data
-    // plus a process-unique counter. (Writers with stronger requirements
-    // encrypt via zpdf-writer's Encryptor, which uses the system RNG.)
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let nonce = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let mut seed = Vec::with_capacity(data.len().min(256) + 16);
-    seed.extend_from_slice(&nonce.to_le_bytes());
-    seed.extend_from_slice(&(data.len() as u64).to_le_bytes());
-    seed.extend_from_slice(&data[..data.len().min(240)]);
-    iv.copy_from_slice(&md5(&seed));
+    // CBC needs an unpredictable IV. A failure of the OS CSPRNG is fatal for
+    // confidentiality, so do not fall back to a predictable value.
+    getrandom::getrandom(&mut iv).expect("OS CSPRNG unavailable for AES-CBC IV");
 
     let pad = 16 - (data.len() % 16);
     let mut buf = Vec::with_capacity(data.len() + pad);
