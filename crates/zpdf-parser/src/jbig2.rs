@@ -127,6 +127,12 @@ struct PixelLimits {
     /// Ceiling for `drawn`: [`DRAW_BUDGET_FACTOR`] passes over the largest
     /// page or region bitmap seen, and at least [`DRAW_BUDGET_FLOOR`].
     draw_limit: u64,
+    /// Bytes retained by intermediate regions and dictionaries.
+    retained: u64,
+    /// Cumulative cap for `retained`. One bitmap is capped by `max_pixels`;
+    /// this bounds the *sum* so many small-but-legal segments cannot exhaust
+    /// memory.
+    retained_limit: u64,
 }
 
 impl PixelLimits {
@@ -137,6 +143,10 @@ impl PixelLimits {
                 .min(MAX_BITMAP_PIXELS),
             drawn: 0,
             draw_limit: DRAW_BUDGET_FLOOR,
+            retained: 0,
+            retained_limit: (usize::try_from(max_image_pixels).unwrap_or(usize::MAX) as u64)
+                .saturating_mul(4)
+                .max(64 * 1024 * 1024),
         }
     }
 
@@ -156,6 +166,18 @@ impl PixelLimits {
         self.draw_limit = self
             .draw_limit
             .max((area as u64).saturating_mul(DRAW_BUDGET_FACTOR));
+    }
+
+    /// Account for bitmap bytes kept alive for later segments.
+    fn retain(&mut self, bytes: u64, what: &str) -> Result<()> {
+        self.retained = self.retained.saturating_add(bytes);
+        if self.retained > self.retained_limit {
+            return Err(err(format!(
+                "retained {what} exceeded the {}-byte budget",
+                self.retained_limit
+            )));
+        }
+        Ok(())
     }
 
     /// Account for `pixels` about to be composited. Once the budget is spent
@@ -1815,12 +1837,18 @@ impl<'a> Decoder<'a> {
                         None
                     }
                 };
+                let bytes = dict
+                    .as_ref()
+                    .map_or(0, |d| d.iter().map(|b| b.data.len() as u64).sum::<u64>());
+                self.pixels.retain(bytes, "symbol dictionary")?;
                 self.symbol_dicts.insert(h.number, dict);
             }
             // Text region: intermediate (4) is stored; immediate (6/7) composes.
             4 | 6 | 7 => match self.decode_text_region(h, data) {
                 Ok((info, bm)) => {
                     if h.seg_type == 4 {
+                        self.pixels
+                            .retain(bm.data.len() as u64, "intermediate region")?;
                         self.regions.insert(h.number, (info, bm));
                     } else {
                         self.compose_to_page(&info, &bm)?;
@@ -1835,6 +1863,8 @@ impl<'a> Decoder<'a> {
             36 | 38 | 39 => match self.decode_generic_region_segment(data) {
                 Ok((info, bm)) => {
                     if h.seg_type == 36 {
+                        self.pixels
+                            .retain(bm.data.len() as u64, "intermediate region")?;
                         self.regions.insert(h.number, (info, bm));
                     } else {
                         self.compose_to_page(&info, &bm)?;
@@ -1851,6 +1881,8 @@ impl<'a> Decoder<'a> {
             40 | 42 | 43 => match self.decode_refinement_region_segment(h, data) {
                 Ok((info, bm)) => {
                     if h.seg_type == 40 {
+                        self.pixels
+                            .retain(bm.data.len() as u64, "intermediate region")?;
                         self.regions.insert(h.number, (info, bm));
                     } else {
                         self.compose_to_page(&info, &bm)?;
@@ -1874,12 +1906,18 @@ impl<'a> Decoder<'a> {
                         None
                     }
                 };
+                let bytes = pd.as_ref().map_or(0, |d| {
+                    d.patterns.iter().map(|b| b.data.len() as u64).sum::<u64>()
+                });
+                self.pixels.retain(bytes, "pattern dictionary")?;
                 self.pattern_dicts.insert(h.number, pd);
             }
             // Halftone region: intermediate (20) stored; immediate (22/23) composes.
             20 | 22 | 23 => match self.decode_halftone_region(h, data) {
                 Ok((info, bm)) => {
                     if h.seg_type == 20 {
+                        self.pixels
+                            .retain(bm.data.len() as u64, "intermediate region")?;
                         self.regions.insert(h.number, (info, bm));
                     } else {
                         self.compose_to_page(&info, &bm)?;
@@ -5338,6 +5376,14 @@ mod tests {
     /// Symbol-ID tables hold one line per symbol. The linear scan (plus a
     /// per-call max-length pass) cost O(lines) per bit; 2^16 symbols × 10^5
     /// IDs was ~10^11 steps. The index makes each bit one lookup.
+    #[test]
+    fn retained_bitmap_budget_is_cumulative() {
+        let mut limits = PixelLimits::new(1024);
+        let cap = limits.retained_limit;
+        limits.retain(cap, "test").unwrap();
+        assert!(limits.retain(1, "test").is_err());
+    }
+
     #[test]
     fn huff_symbol_id_table_decodes_quickly() {
         let n = 1usize << 16;

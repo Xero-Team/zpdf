@@ -174,6 +174,12 @@ fn decode_row_1d(reader: &mut BitReader, columns: usize) -> Option<Vec<usize>> {
         a0 = (a0 + run).min(columns);
         changes.push(a0);
         white = !white;
+        // A stream of zero-length runs never advances a0. Bound the vector the
+        // same way the 2-D decoder does so a tiny input cannot allocate
+        // millions of transitions.
+        if changes.len() > columns + 2 {
+            return None;
+        }
     }
     Some(changes)
 }
@@ -594,6 +600,23 @@ mod tests {
         let out = decode_test(&data, &p).unwrap();
         // WWWBBWWW, white=0 black=1 → 0001 1000 = 0x18
         assert_eq!(out, vec![0b00011000]);
+    }
+
+    #[test]
+    fn one_d_zero_length_runs_are_bounded() {
+        // Alternating zero-length white/black runs never advance a0. Without a
+        // cap this would push one transition per code until the input ends.
+        let mut bits = String::new();
+        for _ in 0..4000 {
+            bits.push_str("00110101"); // white run 0
+            bits.push_str("0000110111"); // black run 0
+        }
+        let data = bits_to_bytes(&bits);
+        let mut reader = BitReader::new(&data);
+        assert!(
+            decode_row_1d(&mut reader, 1000).is_none(),
+            "zero-length run stream must hit the transition cap"
+        );
     }
 
     /// A crafted stream that would expand without bound (huge declared /Rows,
