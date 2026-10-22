@@ -264,6 +264,10 @@ pub struct GlyphRun {
 #[derive(Debug, Clone, Copy)]
 pub struct PositionedGlyph {
     pub glyph_id: u16,
+    /// Source character code from the PDF string (before CID/CMap mapping).
+    /// `/ToUnicode` CMaps are keyed by this, not by the glyph id; exporters
+    /// that only need outlines can ignore it.
+    pub code: u32,
     pub x: f32,
     pub y: f32,
     pub advance: f32,

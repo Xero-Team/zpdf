@@ -192,12 +192,21 @@ impl<'a> SlideConverter<'a> {
         let mut max_y = f32::NEG_INFINITY;
 
         for glyph in &glyph_run.glyphs {
-            // Try to get Unicode text for this glyph via ToUnicode map
-            if let Some(to_unicode) = &font.to_unicode {
-                // For now, use glyph_id as a fallback character code
-                // In a full implementation, we'd need the original character code
-                if let Some(unicode_str) = to_unicode.lookup(glyph.glyph_id as u32) {
-                    text.push_str(unicode_str);
+            // /ToUnicode is keyed by the source character code, not the glyph
+            // id. Use the code recorded by the content interpreter; for simple
+            // fonts a missing map can still fall back to the code itself.
+            let mapped = font
+                .to_unicode
+                .as_ref()
+                .and_then(|to_unicode| to_unicode.lookup(glyph.code));
+            match mapped {
+                Some(unicode) => text.push_str(unicode),
+                None => {
+                    if let Some(ch) = char::from_u32(glyph.code) {
+                        if !ch.is_control() {
+                            text.push(ch);
+                        }
+                    }
                 }
             }
 
@@ -456,5 +465,104 @@ mod tests {
     fn pt_to_emu_conversion() {
         assert_eq!(pt_to_emu(72.0), 914400); // 1 inch
         assert_eq!(pt_to_emu(0.0), 0);
+    }
+}
+
+#[cfg(test)]
+mod export_tests {
+    use super::*;
+    use zpdf_core::Matrix;
+    use zpdf_display_list::{Color, DisplayList, GlyphRun, Paint, PositionedGlyph, RenderCommand};
+    use zpdf_font::cmap::ToUnicodeMap;
+    use zpdf_font::{FontCache, LoadedFont};
+
+    #[test]
+    fn to_unicode_is_keyed_by_character_code_not_glyph_id() {
+        let mut font = LoadedFont::new_placeholder("Simple".into());
+        font.to_unicode = Some(ToUnicodeMap::parse(
+            b"begincmap 1 begincodespacerange <00> <FF> endcodespacerange \
+              1 beginbfchar <41> <0041> endbfchar endcmap",
+        ));
+        let mut fonts = FontCache::new();
+        let font_id = fonts.insert("F1".into(), font);
+
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 612.0, 792.0));
+        dl.push(RenderCommand::DrawGlyphRun(GlyphRun {
+            font_id,
+            font_size: 12.0,
+            glyphs: vec![PositionedGlyph {
+                glyph_id: 99,
+                code: 0x41,
+                x: 100.0,
+                y: 100.0,
+                advance: 6.0,
+            }],
+            paint: Paint::Solid(Color::black()),
+            alpha: 1.0,
+            overprint: None,
+            transform: Matrix::identity(),
+            h_scale: 1.0,
+        }));
+
+        let slide = display_list_to_slide(
+            &dl,
+            0,
+            &fonts,
+            &ImageCache::new(),
+            &ConversionOptions::default(),
+        )
+        .expect("slide");
+        let text: String = slide
+            .elements
+            .iter()
+            .filter_map(|e| match e {
+                SlideElement::TextBox { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "A");
+    }
+
+    #[test]
+    fn image_ids_are_renumbered_across_slides() {
+        let image = |id: &str| PptxSlide {
+            page_index: 0,
+            elements: vec![SlideElement::Image {
+                x_emu: 0,
+                y_emu: 0,
+                width_emu: 100,
+                height_emu: 100,
+                image_data: vec![0x89, b'P', b'N', b'G'],
+                image_id: id.to_string(),
+            }],
+        };
+        let presentation = PptxPresentation {
+            slides: vec![image("image1"), image("image1")],
+            width_emu: 914400,
+            height_emu: 914400,
+        };
+        let bytes = PptxWriter::new(presentation)
+            .write_to_bytes()
+            .expect("write pptx");
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("zip");
+        let names: Vec<String> = (0..archive.len())
+            .map(|i| archive.by_index(i).unwrap().name().unwrap().to_string())
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "ppt/media/image1.png"),
+            "{names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "ppt/media/image2.png"),
+            "{names:?}"
+        );
+        let mut unique = names.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            names.len(),
+            "duplicate ZIP members: {names:?}"
+        );
     }
 }
