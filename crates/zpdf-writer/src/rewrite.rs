@@ -172,7 +172,7 @@ pub fn rewrite_pdf(source: &PdfFile, options: &RewriteOptions) -> Result<Vec<u8>
         };
         if let Some(max_dim) = options.max_image_dimension {
             if let PdfObject::Stream(stream) = &mut obj {
-                if let Some(smaller) = downsample_image_stream(stream, max_dim) {
+                if let Some(smaller) = downsample_image_stream(stream, max_dim, source.limits()) {
                     *stream = smaller;
                 }
             }
@@ -319,7 +319,11 @@ fn prepared_stream_parts(stream: &PdfStream, compress: bool) -> (PdfDict, Vec<u8
 /// image XObject whose longer side exceeds `max_dim`. Returns the replacement
 /// stream, or `None` when the image is not eligible (other filters, palettes,
 /// masks, unusual bit depths) or already small enough.
-fn downsample_image_stream(stream: &PdfStream, max_dim: u32) -> Option<PdfStream> {
+fn downsample_image_stream(
+    stream: &PdfStream,
+    max_dim: u32,
+    limits: &zpdf_core::ParseLimits,
+) -> Option<PdfStream> {
     let dict = &stream.dict;
     if dict.get_name("Subtype").ok() != Some("Image") {
         return None;
@@ -352,20 +356,30 @@ fn downsample_image_stream(stream: &PdfStream, max_dim: u32) -> Option<PdfStream
     if width.max(height) <= max_dim || width == 0 || height == 0 {
         return None;
     }
+    if (width as u64).saturating_mul(height as u64) > limits.max_image_pixels {
+        return None;
+    }
+    let row = (width as usize).checked_mul(channels as usize)?;
+    // The declared sample size is the only amount this pass can legitimately
+    // use. Reject images whose *expected* size already exceeds the decoded
+    // budget, and cap the zlib read so a bomb cannot expand past it.
+    let expected = row.checked_mul(height as usize)?;
+    if expected as u64 > limits.max_decoded_stream_bytes {
+        return None;
+    }
 
     // Decode the sample data.
     let raw: Vec<u8> = if dict.get("Filter").is_some() {
         use flate2::read::ZlibDecoder;
         use std::io::Read;
-        let mut decoder = ZlibDecoder::new(stream.data.as_ref());
+        let decoder = ZlibDecoder::new(stream.data.as_ref());
         let mut buf = Vec::new();
-        decoder.read_to_end(&mut buf).ok()?;
+        decoder.take(expected as u64).read_to_end(&mut buf).ok()?;
         buf
     } else {
-        stream.data.to_vec()
+        stream.data.get(..expected)?.to_vec()
     };
-    let row = (width as usize).checked_mul(channels as usize)?;
-    if raw.len() < row.checked_mul(height as usize)? {
+    if raw.len() < expected {
         return None;
     }
 
@@ -374,7 +388,10 @@ fn downsample_image_stream(stream: &PdfStream, max_dim: u32) -> Option<PdfStream
     let (mut w, mut h) = (width, height);
     while w.max(h) > max_dim && w >= 2 && h >= 2 {
         let (nw, nh) = (w / 2, h / 2);
-        let mut next = vec![0u8; nw as usize * nh as usize * channels as usize];
+        let next_len = (nw as usize)
+            .checked_mul(nh as usize)?
+            .checked_mul(channels as usize)?;
+        let mut next = vec![0u8; next_len];
         for y in 0..nh as usize {
             for x in 0..nw as usize {
                 for c in 0..channels as usize {
@@ -485,5 +502,55 @@ fn emit(out: &mut Vec<u8>, num: u32, obj: PdfObject, options: &RewriteOptions) -
             write_stream(out, num, 0, &stream.dict, &stream.data)
         }
         other => write_object(out, num, 0, &other),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zpdf_core::ParseLimits;
+
+    fn rgb_image(width: i64, height: i64, data: Vec<u8>) -> PdfStream {
+        let mut dict = PdfDict::new();
+        dict.insert(
+            PdfName::new("Subtype"),
+            PdfObject::Name(PdfName::new("Image")),
+        );
+        dict.insert(PdfName::new("Width"), PdfObject::Integer(width));
+        dict.insert(PdfName::new("Height"), PdfObject::Integer(height));
+        dict.insert(PdfName::new("BitsPerComponent"), PdfObject::Integer(8));
+        dict.insert(
+            PdfName::new("ColorSpace"),
+            PdfObject::Name(PdfName::new("DeviceRGB")),
+        );
+        dict.insert(
+            PdfName::new("Filter"),
+            PdfObject::Name(PdfName::new("FlateDecode")),
+        );
+        PdfStream {
+            dict,
+            data: data.into(),
+        }
+    }
+
+    #[test]
+    fn downsample_refuses_samples_above_the_decoded_budget() {
+        // Declared samples are 3 MB but the caller allows 1 KiB. Reject before
+        // touching the zlib stream, so no expansion work or allocation occurs.
+        let stream = rgb_image(1000, 1000, flate_compress(&vec![0u8; 3_000_000]));
+        let limits = ParseLimits {
+            max_decoded_stream_bytes: 1024,
+            ..ParseLimits::default()
+        };
+        assert!(downsample_image_stream(&stream, 100, &limits).is_none());
+    }
+
+    #[test]
+    fn downsample_bounds_the_inflate_read_to_the_declared_size() {
+        // A tiny declared image whose zlib payload expands far beyond it: only
+        // the declared 3 bytes may be read.
+        let stream = rgb_image(1, 1, flate_compress(&vec![0u8; 1_000_000]));
+        let limits = ParseLimits::default();
+        assert!(downsample_image_stream(&stream, 0, &limits).is_none());
     }
 }
