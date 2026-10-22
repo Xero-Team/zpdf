@@ -1651,10 +1651,13 @@ fn cmd_debug_stream(args: &[String]) -> zpdf::Result<()> {
 /// Shared: build an IncrementalWriter from a file path, erroring on encrypted docs.
 fn build_writer(
     path: &str,
-    _password: Option<&str>,
+    password: Option<&str>,
 ) -> zpdf::Result<zpdf_writer::IncrementalWriter> {
     let data = fs::read(path).map_err(zpdf::Error::Io)?;
-    zpdf_writer::IncrementalWriter::new(data)
+    match password {
+        Some(pw) => zpdf_writer::IncrementalWriter::new_with_password(data, pw.as_bytes()),
+        None => zpdf_writer::IncrementalWriter::new(data),
+    }
 }
 
 /// Shared: write the incremental update to disk, refusing when output == input.
@@ -1763,6 +1766,7 @@ fn cmd_fill(args: &[String]) -> zpdf::Result<()> {
 /// Concatenate two or more PDFs: the first file is the base, the pages of
 /// every following file are appended (deep-copied with renumbering).
 fn cmd_merge(args: &[String]) -> zpdf::Result<()> {
+    let (args, password) = extract_password(args);
     let mut inputs: Vec<String> = Vec::new();
     let mut output = None;
 
@@ -1794,13 +1798,16 @@ fn cmd_merge(args: &[String]) -> zpdf::Result<()> {
         process::exit(1);
     }
 
-    let mut writer = build_writer(&inputs[0], None)?;
+    let mut writer = build_writer(&inputs[0], password.as_deref())?;
     warn_signatures(writer.document());
     let mut total = writer.document().page_count();
     for path in &inputs[1..] {
         let data = fs::read(path).map_err(zpdf::Error::Io)?;
-        let file = zpdf::PdfFile::parse(data)?;
-        let appended = writer.append_document(&file)?;
+        let source = match password.as_deref() {
+            Some(pw) => zpdf::PdfDocument::open_with_password(data, pw.as_bytes())?,
+            None => zpdf::PdfDocument::open(data)?,
+        };
+        let appended = writer.append_document(source.file())?;
         total += appended;
         println!("{path}: {appended} page(s) appended");
     }
