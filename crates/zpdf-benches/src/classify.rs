@@ -381,6 +381,7 @@ mod tests {
             glyphs: (0..n)
                 .map(|i| PositionedGlyph {
                     glyph_id: i as u16,
+                    code: 0,
                     x: i as f32,
                     y: 0.0,
                     advance: 6.0,
