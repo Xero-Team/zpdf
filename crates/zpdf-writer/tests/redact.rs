@@ -5,7 +5,7 @@ use std::io::Cursor;
 use zpdf_core::Rect;
 use zpdf_document::PdfDocument;
 use zpdf_writer::redact::RedactOptions;
-use zpdf_writer::{DocumentBuilder, IncrementalWriter};
+use zpdf_writer::{redact_pdf, DocumentBuilder, IncrementalWriter};
 
 fn two_line_pdf() -> Vec<u8> {
     let mut b = DocumentBuilder::new();
@@ -137,4 +137,28 @@ fn non_finite_rect_is_rejected() {
         &RedactOptions::default(),
     );
     assert!(result.is_err());
+}
+
+#[test]
+fn destructive_redaction_removes_original_bytes() {
+    let out = redact_pdf(
+        two_line_pdf(),
+        b"",
+        0,
+        &[Rect::new(60.0, 690.0, 400.0, 720.0)],
+        &RedactOptions::default(),
+    )
+    .expect("redact");
+
+    // The original incremental update must not be present in the output: the
+    // secret may only survive if an old object revision was left behind.
+    assert!(
+        !out.windows(b"TOP SECRET".len()).any(|w| w == b"TOP SECRET"),
+        "unredacted bytes survived the destructive rewrite"
+    );
+
+    let doc = PdfDocument::open(out).expect("open");
+    let content = page_content(&doc);
+    assert!(!content.contains("TOP SECRET"));
+    assert!(content.contains("public information"));
 }
