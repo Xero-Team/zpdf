@@ -161,3 +161,30 @@ fn form_fonts_load_once_per_document_with_shared_fonts() {
         assert!(std::ptr::eq(a, b), "{key} is parsed once and shared");
     }
 }
+
+#[test]
+fn sibling_forms_with_inline_fonts_get_distinct_cache_slots() {
+    // Same resource name /R7, but each form carries its own inline font dict.
+    // There is no object id to key on, so the cache slot must still be unique
+    // per form instead of falling back to the bare resource name.
+    let pdf = build_pdf_with_fonts(
+        &[
+            "<< /R7 << /Type /Font /Subtype /Type1 /BaseFont /FontA >> >>",
+            "<< /R7 << /Type /Font /Subtype /Type1 /BaseFont /FontB >> >>",
+        ],
+        Vec::new(),
+    );
+    let doc = PdfDocument::open(pdf).expect("parse synthetic PDF");
+    let page = doc.page(0).expect("page 0");
+    let content = doc.page_content_bytes(&page).expect("content");
+    let mut cache = FontCache::new();
+    let _ = ContentInterpreter::new(Rect::new(0.0, 0.0, 200.0, 200.0))
+        .with_fonts(&mut cache)
+        .with_document(doc.file(), &page.resources)
+        .interpret(&content);
+    assert_eq!(
+        cache.len(),
+        2,
+        "sibling inline fonts reusing /R7 must not share one cache slot"
+    );
+}
