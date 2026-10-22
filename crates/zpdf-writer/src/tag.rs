@@ -273,6 +273,7 @@ fn page_text(doc: &PdfDocument, idx: usize) -> String {
         let interp = zpdf_content::interpreter::ContentInterpreter::new(page.effective_box())
             .with_fonts(&mut font_cache)
             .with_document(doc.file(), &page.resources)
+            .with_shared_fonts(doc)
             .with_text_sink(&mut spans);
         let _ = interp.interpret(&content);
     }

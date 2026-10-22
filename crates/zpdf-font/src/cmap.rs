@@ -24,6 +24,10 @@ use std::collections::HashMap;
 const MAX_CMAP_ENTRIES: usize = 65_536;
 const MAX_CMAP_TOKENS: usize = MAX_CMAP_ENTRIES * 4 + 1024;
 const MAX_CMAP_HEX_BYTES: usize = 512;
+/// Codes a ToUnicode CMap's `bfrange` blocks may assign in total. Each range
+/// covers up to 65,536 codes, and repeating an overlapping range re-assigns
+/// codes already in the map, so the entry cap alone does not bound the work.
+const MAX_CMAP_RANGE_CODES: usize = MAX_CMAP_ENTRIES * 4;
 const MAX_CMAP_WORD_BYTES: usize = 256;
 
 /// A parsed `/ToUnicode` CMap: maps a character code to its Unicode string.
@@ -35,6 +39,8 @@ pub struct ToUnicodeMap {
     /// Byte lengths of source keys written with leading zero bytes (`<0041>`),
     /// which the numeric key alone would read as shorter codes.
     padded_lengths: HashMap<u32, u8>,
+    /// Codes assigned by `bfrange` so far (see [`MAX_CMAP_RANGE_CODES`]).
+    range_codes: usize,
 }
 
 impl ToUnicodeMap {
@@ -298,9 +304,12 @@ impl ToUnicodeMap {
         if lo > hi {
             return;
         }
-        // Guard against pathological ranges.
+        // Guard against pathological ranges: at most 65536 codes per range,
+        // and within the budget left for all ranges.
         let count = (hi - lo) as u64 + 1;
-        let limit = count.min(0x1_0000) as u32; // at most 65536 codes per range
+        let budget = MAX_CMAP_RANGE_CODES.saturating_sub(self.range_codes) as u64;
+        let limit = count.min(0x1_0000).min(budget) as u32;
+        self.range_codes += limit as usize;
 
         for n in 0..limit {
             let code = lo + n;
@@ -404,8 +413,9 @@ impl LegacyEncoding {
 pub struct CidCMap {
     /// Codespace ranges as (byte_len, lo, hi).
     codespace: Vec<(u8, u32, u32)>,
-    /// cidrange entries as (byte_len, lo, hi, first_cid, declaration).
-    cid_ranges: Vec<(u8, u32, u32, u32, usize)>,
+    /// cidrange entries flattened to disjoint segments (see
+    /// [`index_cid_ranges`]), sorted by (byte_len, lo).
+    cid_ranges: Vec<RangeSegment>,
     /// Length-sensitive cidchar singles and their declaration order.
     cid_chars: HashMap<(u8, u32), (u32, usize)>,
     predefined: Option<&'static PredefinedMap>,
@@ -531,6 +541,8 @@ impl CidCMap {
     /// /WMode, and `usecmap` with named Adobe or Identity bases. Never panics.
     pub fn parse(data: &[u8]) -> Self {
         let mut cmap = CidCMap::default();
+        // cidrange entries as (byte_len, lo, hi, first_cid, declaration).
+        let mut ranges = Vec::new();
         let mut explicit_wmode = false;
         let mut declaration = 0;
         let tokens = tokenize(data);
@@ -564,14 +576,14 @@ impl CidCMap {
                     while i + 2 < tokens.len() {
                         match (&tokens[i], &tokens[i + 1], &tokens[i + 2]) {
                             (Token::HexString(lo), Token::HexString(hi), Token::Number(cid)) => {
-                                if cmap.cid_ranges.len() < MAX_CMAP_ENTRIES
+                                if ranges.len() < MAX_CMAP_ENTRIES
                                     && lo.len() == hi.len()
                                     && (1..=4).contains(&lo.len())
                                 {
                                     let low = bytes_to_code(lo);
                                     let high = bytes_to_code(hi);
                                     if low <= high {
-                                        cmap.cid_ranges.push((
+                                        ranges.push((
                                             lo.len() as u8,
                                             low,
                                             high,
@@ -651,6 +663,7 @@ impl CidCMap {
             }
         }
 
+        cmap.cid_ranges = index_cid_ranges(&ranges);
         // A CMap with no mappings at all degrades to Identity (lenient).
         if cmap.cid_ranges.is_empty()
             && cmap.cid_chars.is_empty()
@@ -830,16 +843,96 @@ impl CidCMap {
             code
         };
         let single = self.cid_chars.get(&(len, code));
-        for &(rlen, lo, hi, first, declaration) in self.cid_ranges.iter().rev() {
-            if single.is_some_and(|&(_, order)| order > declaration) {
-                break;
+        let at = self
+            .cid_ranges
+            .partition_point(|segment| (segment.len, segment.hi) < (len, code));
+        let range = self
+            .cid_ranges
+            .get(at)
+            .filter(|segment| segment.len == len && segment.lo <= code);
+        // The later declaration of the covering range and the cidchar wins.
+        match (range, single) {
+            (Some(range), Some(&(cid, order))) if order > range.declaration => Some(cid),
+            (Some(range), _) => Some(range.first.checked_add(code - range.range_lo).unwrap_or(0)),
+            (None, single) => single.map(|&(cid, _)| cid),
+        }
+    }
+}
+
+/// A run of codes of one byte length whose latest-declared covering
+/// `cidrange` is the same range.
+#[derive(Debug, Clone, Copy)]
+struct RangeSegment {
+    len: u8,
+    lo: u32,
+    hi: u32,
+    /// The covering range's first code and the CID it maps to.
+    range_lo: u32,
+    first: u32,
+    declaration: usize,
+}
+
+/// Flatten `cidrange` entries, given as (byte_len, lo, hi, first_cid,
+/// declaration), into disjoint segments sorted by (byte_len, lo), each
+/// carrying its latest-declared covering range — so a lookup is a binary
+/// search, not a scan of up to 65,536 possibly overlapping ranges.
+fn index_cid_ranges(ranges: &[(u8, u32, u32, u32, usize)]) -> Vec<RangeSegment> {
+    use std::collections::BinaryHeap;
+    let mut segments: Vec<RangeSegment> = Vec::new();
+    for len in 1..=4u8 {
+        let mut by_start: Vec<usize> = (0..ranges.len()).filter(|&k| ranges[k].0 == len).collect();
+        by_start.sort_unstable_by_key(|&k| ranges[k].1);
+        // No range starts or ends strictly inside [bounds[n], bounds[n + 1]).
+        let mut bounds: Vec<u64> = by_start
+            .iter()
+            .flat_map(|&k| [u64::from(ranges[k].1), u64::from(ranges[k].2) + 1])
+            .collect();
+        bounds.sort_unstable();
+        bounds.dedup();
+        // Ranges started so far by (declaration, index); ended ones are
+        // dropped when they surface.
+        let mut live = BinaryHeap::new();
+        let mut next = 0;
+        for bound in bounds.windows(2) {
+            let (start, end) = (bound[0], bound[1]);
+            while let Some(&k) = by_start
+                .get(next)
+                .filter(|&&k| u64::from(ranges[k].1) <= start)
+            {
+                live.push((ranges[k].4, k));
+                next += 1;
             }
-            if rlen == len && code >= lo && code <= hi {
-                return Some(first.checked_add(code - lo).unwrap_or(0));
+            while live
+                .peek()
+                .is_some_and(|&(_, k)| u64::from(ranges[k].2) < start)
+            {
+                live.pop();
+            }
+            let Some(&(declaration, k)) = live.peek() else {
+                continue;
+            };
+            // `end - 1` is a covered code, so it fits in u32.
+            let hi = (end - 1) as u32;
+            match segments.last_mut() {
+                Some(last)
+                    if last.len == len
+                        && last.declaration == declaration
+                        && u64::from(last.hi) + 1 == start =>
+                {
+                    last.hi = hi;
+                }
+                _ => segments.push(RangeSegment {
+                    len,
+                    lo: start as u32,
+                    hi,
+                    range_lo: ranges[k].1,
+                    first: ranges[k].3,
+                    declaration,
+                }),
             }
         }
-        single.map(|&(cid, _)| cid)
     }
+    segments
 }
 
 /// Parse ASCII decimal bytes to u32 (CID operands in cidrange/cidchar).
@@ -1375,12 +1468,53 @@ mod tests {
     }
 
     #[test]
+    fn repeated_full_bfranges_share_one_budget() {
+        let mut cmap = b"beginbfrange\n".to_vec();
+        for _ in 0..64 {
+            cmap.extend_from_slice(b"<0000> <FFFF> <0041>\n");
+        }
+        cmap.extend_from_slice(b"<0000> <0000> <0042>\nendbfrange\n");
+        let map = ToUnicodeMap::parse(&cmap);
+        assert_eq!(map.range_codes, MAX_CMAP_RANGE_CODES);
+        assert_eq!(map.map.len(), MAX_CMAP_ENTRIES);
+        // Ranges past the budget assign nothing.
+        assert_eq!(map.lookup(0), Some("A"));
+    }
+
+    #[test]
     fn overflowing_cid_range_is_invalid_not_a_panic() {
-        let cmap = CidCMap {
-            cid_ranges: vec![(1, 0, 1, u32::MAX, 0)],
-            ..CidCMap::default()
-        };
+        let cmap = CidCMap::parse(b"begincidrange <00> <01> 4294967295 endcidrange");
         assert_eq!(cmap.code_to_cid(1, 1), 0);
+    }
+
+    #[test]
+    fn overlapping_cid_ranges_resolve_to_the_latest_declaration() {
+        let cmap = CidCMap::parse(
+            b"1 begincodespacerange <0000> <FFFF> endcodespacerange\n\
+              begincidrange\n\
+              <0000> <00FF> 1000\n\
+              <0010> <001F> 2000\n\
+              endcidrange\n\
+              begincidchar\n\
+              <0012> 7\n\
+              <0030> 8\n\
+              endcidchar\n\
+              begincidrange\n\
+              <0030> <0031> 3000\n\
+              endcidrange\n",
+        );
+        assert_eq!(cmap.code_to_cid(0x0005, 2), 1005);
+        assert_eq!(cmap.code_to_cid(0x0011, 2), 2001, "later range wins");
+        assert_eq!(cmap.code_to_cid(0x0012, 2), 7, "later cidchar wins");
+        assert_eq!(cmap.code_to_cid(0x0020, 2), 1032, "earlier range resumes");
+        assert_eq!(
+            cmap.code_to_cid(0x0030, 2),
+            3000,
+            "later range beats cidchar"
+        );
+        assert_eq!(cmap.code_to_cid(0x0031, 2), 3001);
+        assert_eq!(cmap.code_to_cid(0x00FF, 2), 1255);
+        assert_eq!(cmap.code_to_cid(0x05, 1), 0, "byte length must match");
     }
 
     #[test]

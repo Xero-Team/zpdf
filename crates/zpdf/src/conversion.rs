@@ -136,6 +136,7 @@ pub fn convert_pdf(
         let mut interpreter = ContentInterpreter::new(page_box)
             .with_fonts(&mut fonts)
             .with_document(doc.file(), &page.resources)
+            .with_shared_fonts(doc)
             .with_text_sink(&mut spans)
             .with_operand_stack_limit(limits.max_operand_stack_depth as usize);
         if rich {

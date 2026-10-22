@@ -23,6 +23,13 @@ pub enum XrefEntry {
 #[derive(Debug, Clone, Default)]
 pub struct XrefTable {
     entries: HashMap<ObjectId, XrefEntry>,
+    /// The section revision each entry came from (0 = newest; see
+    /// [`Self::begin_older_revision`]).
+    revisions: HashMap<ObjectId, u32>,
+    /// Revision of the section being parsed.
+    revision: u32,
+    /// Older-revision objects a newer revision deleted (see [`Self::insert`]).
+    superseded: std::collections::HashSet<ObjectId>,
 }
 
 impl XrefTable {
@@ -34,8 +41,37 @@ impl XrefTable {
         self.entries.get(&id)
     }
 
+    /// First-wins insert, for sections parsed newest-to-oldest. An entry
+    /// whose next generation a newer revision already lists (freed, or reused
+    /// under the next generation number) was deleted by that incremental
+    /// update; it is recorded as superseded instead (PDF 32000-1 §7.5.4).
     pub fn insert(&mut self, id: ObjectId, entry: XrefEntry) {
-        self.entries.entry(id).or_insert(entry);
+        if self.entries.contains_key(&id) {
+            return;
+        }
+        let next_gen = id.1.checked_add(1).map(|gen| ObjectId(id.0, gen));
+        if next_gen
+            .and_then(|next| self.revisions.get(&next))
+            .is_some_and(|&revision| revision < self.revision)
+        {
+            self.superseded.insert(id);
+            return;
+        }
+        self.entries.insert(id, entry);
+        self.revisions.insert(id, self.revision);
+    }
+
+    /// Start inserting the entries of the next older section (an earlier
+    /// revision reached through `/Prev`). A hybrid section's `/XRefStm`
+    /// belongs to the same revision as its table.
+    pub fn begin_older_revision(&mut self) {
+        self.revision = self.revision.saturating_add(1);
+    }
+
+    /// Whether `id` names an object an incremental update deleted. Such a
+    /// reference resolves to null even though the old bytes remain.
+    pub fn is_superseded(&self, id: ObjectId) -> bool {
+        self.superseded.contains(&id)
     }
 
     /// Insert overwriting any existing entry. Used by tail-scan recovery, where a
@@ -81,6 +117,7 @@ pub fn parse_xref_and_trailer(data: &[u8], limits: &ParseLimits) -> Result<(Xref
         if !visited.insert(prev_offset_usize) {
             break;
         }
+        table.begin_older_revision();
         let (section_trailer, next) =
             parse_xref_section(data, prev_offset_usize, &mut table, limits)?;
         parse_hybrid_xrefstm(data, &section_trailer, &mut table, limits, &mut visited);

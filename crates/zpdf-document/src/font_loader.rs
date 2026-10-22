@@ -25,11 +25,8 @@ pub(crate) fn load_page_fonts(
     let max_bytes = file.limits().max_font_cache_bytes;
 
     for (name, &font_ref) in &page.resources.fonts {
-        match shared.get(font_ref) {
-            // Parsed for an earlier page of this document: hand the same font to
-            // this page's cache. `LoadedFont` is immutable once built, so the
-            // pages can share one without copying it.
-            Some(font) => {
+        match shared_or_load(file, font_ref, shared, provider) {
+            Ok(font) => {
                 if cache
                     .try_insert_shared_with_limit(name.clone(), font, max_bytes)
                     .is_none()
@@ -37,30 +34,46 @@ pub(crate) fn load_page_fonts(
                     insert_placeholder(&mut cache, name, max_bytes);
                 }
             }
-            None => {
-                match load_single_font_with_provider(file, font_ref, provider.map(|p| p.as_ref())) {
-                    Ok(font) => {
-                        // Retain it for the rest of the document when the shared
-                        // budget allows; past that, later pages parse it again
-                        // rather than growing without bound.
-                        let font = shared.admit(font_ref, font, max_bytes);
-                        if cache
-                            .try_insert_shared_with_limit(name.clone(), font, max_bytes)
-                            .is_none()
-                        {
-                            insert_placeholder(&mut cache, name, max_bytes);
-                        }
-                    }
-                    Err(e) => {
-                        tracing::debug!("font {name} ({font_ref}): fallback - {e}");
-                        insert_placeholder(&mut cache, name, max_bytes);
-                    }
-                }
+            Err(e) => {
+                tracing::debug!("font {name} ({font_ref}): fallback - {e}");
+                insert_placeholder(&mut cache, name, max_bytes);
             }
         }
     }
 
     cache
+}
+
+/// Load one font dictionary through the document's shared cache. Called through
+/// [`PdfDocument::shared_font`](crate::PdfDocument::shared_font), for fonts
+/// that Form XObjects and annotation appearances reference outside the page's
+/// own `/Resources`.
+pub(crate) fn load_shared_font(
+    file: &PdfFile,
+    font_ref: ObjectId,
+    shared: &mut SharedFonts,
+    provider: Option<&std::sync::Arc<FontProvider>>,
+) -> Result<std::sync::Arc<LoadedFont>> {
+    shared.refresh_provider(provider.map(|provider| provider.generation()));
+    shared_or_load(file, font_ref, shared, provider)
+}
+
+/// The font parsed for `font_ref` by an earlier page or form of this document,
+/// or a fresh parse of it. `LoadedFont` is immutable once built, so every cache
+/// can share one without copying it. A fresh parse is retained for the rest of
+/// the document when the shared budget allows; past that, later loads parse it
+/// again rather than growing without bound.
+fn shared_or_load(
+    file: &PdfFile,
+    font_ref: ObjectId,
+    shared: &mut SharedFonts,
+    provider: Option<&std::sync::Arc<FontProvider>>,
+) -> Result<std::sync::Arc<LoadedFont>> {
+    if let Some(font) = shared.get(font_ref) {
+        return Ok(font);
+    }
+    let font = load_single_font_with_provider(file, font_ref, provider.map(|p| p.as_ref()))?;
+    Ok(shared.admit(font_ref, font, file.limits().max_font_cache_bytes))
 }
 
 /// Cache a placeholder under `name`, warning when even that does not fit.
@@ -659,7 +672,10 @@ fn type3_differences(diffs: &[PdfObject]) -> Vec<String> {
             }
             PdfObject::Name(name) => {
                 let Some(code) = current else { continue };
-                encoding.resize(code + 1, String::new());
+                // A later run may restart at a lower code; never shrink.
+                if encoding.len() <= code {
+                    encoding.resize(code + 1, String::new());
+                }
                 encoding[code] = name.0.clone();
                 current = code.checked_add(1).filter(|&next| next <= 255);
             }
@@ -736,6 +752,14 @@ fn load_type3_font(
         .take(256)
         .map(|o| o.as_f64().unwrap_or(0.0))
         .collect();
+    // Codes outside /Widths advance by /MissingWidth (0 by default), in glyph
+    // space like /Widths. Without a /Widths array at all, keep the 1000
+    // fallback rather than collapsing every glyph onto the first.
+    let default_width = if widths.is_empty() {
+        1000.0
+    } else {
+        resolve_dict(file, dict, "FontDescriptor").map_or(0.0, |fd| missing_width(file, &fd))
+    };
 
     let font = LoadedFont {
         font_type: zpdf_font::PdfFontType::Type3 {
@@ -749,7 +773,7 @@ fn load_type3_font(
         font_data: None,
         face_index: 0,
         is_substitute: false,
-        cid_widths: CidWidths::new(1000.0),
+        cid_widths: CidWidths::new(default_width),
         units_per_em: 1000.0,
         ascent: 880.0,
         descent: -120.0,
@@ -862,6 +886,12 @@ fn resolve_dict(
     }
 }
 
+/// Per-CID metrics a /W or /W2 array may assign in total. A range entry
+/// covers up to 65,536 CIDs and a list entry's (shared, indirect) sub-array as
+/// many, while the array's entry count is unbounded; repeated entries would
+/// otherwise re-assign the whole CID space each.
+const MAX_CID_METRIC_ASSIGNMENTS: usize = 4 * 65_536;
+
 /// Parse CID /W array: format is [cid [w1 w2 ...]] or [cid_first cid_last w]
 fn parse_cid_widths(file: &PdfFile, dict: &zpdf_core::PdfDict) -> CidWidths {
     let dw = dict.get_f64("DW").unwrap_or(1000.0);
@@ -872,8 +902,9 @@ fn parse_cid_widths(file: &PdfFile, dict: &zpdf_core::PdfDict) -> CidWidths {
         None => return widths,
     };
 
+    let mut budget = MAX_CID_METRIC_ASSIGNMENTS;
     let mut i = 0;
-    while i < w_array.len() {
+    while i < w_array.len() && budget > 0 {
         let cid_start = match w_array[i].as_i64().ok().and_then(|v| u16::try_from(v).ok()) {
             Some(v) => v,
             None => break,
@@ -899,7 +930,9 @@ fn parse_cid_widths(file: &PdfFile, dict: &zpdf_core::PdfDict) -> CidWidths {
         match entry {
             PdfObject::Array(arr) => {
                 // [cid_start [w1 w2 w3 ...]]
-                for (j, obj) in arr.iter().enumerate() {
+                let count = arr.len().min(budget);
+                budget -= count;
+                for (j, obj) in arr[..count].iter().enumerate() {
                     let Some(cid) = u16::try_from(j)
                         .ok()
                         .and_then(|delta| cid_start.checked_add(delta))
@@ -922,8 +955,9 @@ fn parse_cid_widths(file: &PdfFile, dict: &zpdf_core::PdfDict) -> CidWidths {
                 i += 1;
                 if i < w_array.len() {
                     let w = w_array[i].as_f64().unwrap_or(dw);
-                    for cid in cid_start..=cid_end {
+                    for cid in (cid_start..=cid_end).take(budget) {
                         widths.set(cid, w);
+                        budget -= 1;
                     }
                     i += 1;
                 }
@@ -949,8 +983,9 @@ fn parse_cid_w2(file: &PdfFile, dict: &zpdf_core::PdfDict, widths: &mut CidWidth
 }
 
 fn apply_w2_array(w2_array: &[PdfObject], widths: &mut CidWidths) {
+    let mut budget = MAX_CID_METRIC_ASSIGNMENTS;
     let mut i = 0;
-    while i < w2_array.len() {
+    while i < w2_array.len() && budget > 0 {
         let cid_start = match w2_array[i]
             .as_i64()
             .ok()
@@ -968,7 +1003,8 @@ fn apply_w2_array(w2_array: &[PdfObject], widths: &mut CidWidths) {
             PdfObject::Array(arr) => {
                 // List form: triples (w1y, vx, vy) starting at cid_start.
                 let mut k = 0;
-                while k + 2 < arr.len() {
+                while k + 2 < arr.len() && budget > 0 {
+                    budget -= 1;
                     let (Ok(w1y), Ok(vx), Ok(vy)) =
                         (arr[k].as_f64(), arr[k + 1].as_f64(), arr[k + 2].as_f64())
                     else {
@@ -1000,8 +1036,9 @@ fn apply_w2_array(w2_array: &[PdfObject], widths: &mut CidWidths) {
                     ) else {
                         break;
                     };
-                    for cid in cid_start..=cid_end {
+                    for cid in (cid_start..=cid_end).take(budget) {
                         widths.set_v(cid, w1y, vx, vy);
+                        budget -= 1;
                     }
                     i += 4;
                 } else {
@@ -1022,9 +1059,18 @@ fn parse_simple_widths(file: &PdfFile, dict: &zpdf_core::PdfDict) -> CidWidths {
         .and_then(|v| u8::try_from(v).ok())
         .map(u16::from)
         .unwrap_or(0);
-    let mut widths = CidWidths::new(1000.0);
+    let widths_array = resolve_array(file, dict, "Widths");
+    // Codes the /Widths array does not cover take the descriptor's
+    // /MissingWidth, which defaults to 0 (Table 122). Fonts without /Widths or
+    // without a descriptor (the standard 14 among them) keep the 1000
+    // fallback; their advances come from built-in metrics or the program.
+    let default_width = match (&widths_array, resolve_dict(file, dict, "FontDescriptor")) {
+        (Some(_), Some(fd)) => missing_width(file, &fd),
+        _ => 1000.0,
+    };
+    let mut widths = CidWidths::new(default_width);
 
-    if let Some(arr) = resolve_array(file, dict, "Widths") {
+    if let Some(arr) = widths_array {
         for (j, obj) in arr.iter().take(256).enumerate() {
             let Some(code) = u16::try_from(j)
                 .ok()
@@ -1040,6 +1086,18 @@ fn parse_simple_widths(file: &PdfFile, dict: &zpdf_core::PdfDict) -> CidWidths {
     }
 
     widths
+}
+
+/// A font descriptor's `/MissingWidth`: the advance of codes `/Widths` does
+/// not cover, 0 when absent (Table 122).
+fn missing_width(file: &PdfFile, descriptor: &zpdf_core::PdfDict) -> f64 {
+    match descriptor.get("MissingWidth") {
+        Some(PdfObject::Ref(id)) => file.resolve(*id).ok().and_then(|o| o.as_f64().ok()),
+        Some(other) => other.as_f64().ok(),
+        None => None,
+    }
+    .filter(|w| w.is_finite())
+    .unwrap_or(0.0)
 }
 
 #[cfg(test)]
@@ -1088,6 +1146,19 @@ mod tests {
     }
 
     #[test]
+    fn w2_repeated_full_ranges_stop_at_the_assignment_budget() {
+        let mut arr = Vec::new();
+        for _ in 0..8 {
+            arr.extend([int(0), int(65_535), int(-1000), int(500), int(880)]);
+        }
+        // Past the budget: never applied.
+        arr.extend([int(7), int(7), int(-1), int(1), int(1)]);
+        let mut w = CidWidths::new(1000.0);
+        apply_w2_array(&arr, &mut w);
+        assert_eq!(w.get_v(7), Some((-1000.0, 500.0, 880.0)));
+    }
+
+    #[test]
     fn w2_truncated_entry_is_ignored_not_panic() {
         // Range header without the trailing metric numbers must not panic.
         let arr = vec![int(10), int(12), int(-1000)];
@@ -1114,6 +1185,15 @@ mod tests {
     }
 
     #[test]
+    fn type3_differences_keep_higher_codes_when_a_run_restarts_lower() {
+        let name = |s: &str| PdfObject::Name(zpdf_core::PdfName::new(s));
+        let diffs = vec![int(65), name("A"), int(32), name("space")];
+        let encoding = type3_differences(&diffs);
+        assert_eq!(encoding[65], "A");
+        assert_eq!(encoding[32], "space");
+    }
+
+    #[test]
     fn simple_differences_do_not_overflow_after_huge_code() {
         let mut dict = zpdf_core::PdfDict::new();
         dict.insert(
@@ -1126,5 +1206,68 @@ mod tests {
         let mut encoding =
             zpdf_font::encoding::Encoding::from_base(&zpdf_font::encoding::STANDARD_ENCODING);
         apply_differences(&dict, &mut encoding);
+    }
+
+    /// Type 3 codes outside /Widths advance by /MissingWidth (0 by default),
+    /// not by 1000 glyph-space units, which a FontMatrix other than 0.001
+    /// would turn into a many-em gap.
+    #[test]
+    fn type3_codes_outside_widths_take_missing_width() {
+        let file = PdfFile::parse(crate::test_util::build_pdf(&[
+            "<< /Type /Catalog >>",
+            "<< /Type /Font /Subtype /Type3 /FontMatrix [0.01 0 0 0.01 0 0] \
+             /FontBBox [0 0 100 100] /CharProcs << >> /FirstChar 65 /Widths [60] >>",
+            "<< /Type /Font /Subtype /Type3 /FontMatrix [0.01 0 0 0.01 0 0] \
+             /FontBBox [0 0 100 100] /CharProcs << >> /FirstChar 65 /Widths [60] \
+             /FontDescriptor 4 0 R >>",
+            "<< /Type /FontDescriptor /MissingWidth 25 >>",
+        ]))
+        .expect("parse");
+        let width = |n| {
+            load_single_font_with_provider(&file, ObjectId(n, 0), None)
+                .expect("type3 font")
+                .type3_glyph_width(66)
+        };
+        assert_eq!(width(2), 0.0);
+        assert_eq!(width(3), 25.0);
+    }
+
+    /// Codes outside /Widths take the descriptor's /MissingWidth (0 when the
+    /// descriptor omits it); without /Widths or a descriptor the 1000 fallback
+    /// is kept.
+    #[test]
+    fn simple_widths_default_to_missing_width() {
+        use zpdf_core::{PdfDict, PdfName};
+        let file = PdfFile::parse(crate::test_util::build_pdf(&[
+            "<< /Type /Catalog >>",
+            "<< /Type /FontDescriptor /MissingWidth 333 >>",
+            "<< /Type /FontDescriptor >>",
+        ]))
+        .expect("parse");
+        let font = |widths: bool, descriptor: Option<u32>| {
+            let mut d = PdfDict::new();
+            d.insert(PdfName::new("FirstChar"), int(65));
+            if widths {
+                d.insert(
+                    PdfName::new("Widths"),
+                    PdfObject::Array(vec![int(500), int(600)]),
+                );
+            }
+            if let Some(n) = descriptor {
+                d.insert(
+                    PdfName::new("FontDescriptor"),
+                    PdfObject::Ref(ObjectId(n, 0)),
+                );
+            }
+            parse_simple_widths(&file, &d)
+        };
+
+        let w = font(true, Some(2));
+        assert_eq!((w.get(65), w.get(66)), (500.0, 600.0));
+        assert_eq!(w.get(64), 333.0, "below /FirstChar");
+        assert_eq!(w.get(67), 333.0, "past /LastChar");
+        assert_eq!(font(true, Some(3)).get(67), 0.0, "spec default");
+        assert_eq!(font(true, None).get(67), 1000.0);
+        assert_eq!(font(false, Some(2)).get(67), 1000.0);
     }
 }

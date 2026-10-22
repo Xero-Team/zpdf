@@ -7,11 +7,27 @@ use crate::lexer::Lexer;
 pub struct ObjectParser<'a> {
     data: &'a [u8],
     limits: &'a ParseLimits,
+    /// Value of an indirect stream `/Length` (see [`Self::with_length_resolver`]).
+    length_resolver: Option<&'a dyn Fn(ObjectId) -> Option<i64>>,
 }
 
 impl<'a> ObjectParser<'a> {
     pub fn new(data: &'a [u8], limits: &'a ParseLimits) -> Self {
-        Self { data, limits }
+        Self {
+            data,
+            limits,
+            length_resolver: None,
+        }
+    }
+
+    /// Look up an indirect stream `/Length` with `resolver`. Without one (or
+    /// when it returns `None`) the stream's end is found by scanning for
+    /// `endstream`, which cannot tell a final CR data byte from the EOL before
+    /// the keyword. The resolver must not parse streams itself, so that a
+    /// `/Length` cycle cannot recurse.
+    pub fn with_length_resolver(mut self, resolver: &'a dyn Fn(ObjectId) -> Option<i64>) -> Self {
+        self.length_resolver = Some(resolver);
+        self
     }
 
     /// Parse an indirect object at the given byte offset.
@@ -105,16 +121,18 @@ impl<'a> ObjectParser<'a> {
             pos += 1;
         }
 
-        // Determine the stream's byte length. Trust a direct, non-negative
-        // /Length ONLY if `endstream` actually follows it; otherwise (missing,
-        // indirect `N G R`, negative, or simply wrong) fall back to scanning for
-        // the `endstream` keyword. The low-level parser cannot resolve an
-        // indirect /Length, so without this fallback such streams (very common,
-        // e.g. Acrobat output) would decode to empty/garbage data.
+        // Determine the stream's byte length. Trust a non-negative /Length
+        // (an indirect one through the length resolver) ONLY if `endstream`
+        // actually follows it; otherwise (missing, unresolvable, negative, or
+        // simply wrong) fall back to scanning for the `endstream` keyword, so
+        // such streams (very common, e.g. Acrobat output) do not decode to
+        // empty/garbage data.
         let declared = match dict.get("Length") {
-            Some(PdfObject::Integer(n)) if *n >= 0 => usize::try_from(*n).ok(),
+            Some(PdfObject::Integer(n)) => Some(*n),
+            Some(PdfObject::Ref(id)) => self.length_resolver.and_then(|resolve| resolve(*id)),
             _ => None,
-        };
+        }
+        .and_then(|n| usize::try_from(n).ok());
 
         let end = match declared {
             Some(len)
@@ -132,10 +150,9 @@ impl<'a> ObjectParser<'a> {
             return Err(Error::StreamSizeLimit(self.limits.max_stream_bytes));
         }
 
-        let stream_data = self.data[pos..end].to_vec();
         Ok(PdfStream {
             dict,
-            data: Arc::from(stream_data),
+            data: Arc::from(&self.data[pos..end]),
         })
     }
 
@@ -191,6 +208,31 @@ impl<'a> ObjectParser<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn indirect_length_keeps_a_final_cr_data_byte() {
+        let data = b"1 0 obj\n<< /Length 2 0 R >>\nstream\nABC\r\nendstream\nendobj\n";
+        let limits = ParseLimits::default();
+        let scanned = ObjectParser::new(data, &limits)
+            .parse_indirect_at(0)
+            .unwrap();
+        assert_eq!(
+            &*scanned.as_stream().unwrap().data,
+            b"ABC",
+            "scan strips CR LF"
+        );
+
+        let resolve = |id: ObjectId| (id == ObjectId(2, 0)).then_some(4);
+        let parser = ObjectParser::new(data, &limits).with_length_resolver(&resolve);
+        let obj = parser.parse_indirect_at(0).unwrap();
+        assert_eq!(&*obj.as_stream().unwrap().data, b"ABC\r");
+
+        // A resolved length that `endstream` does not follow is not trusted.
+        let wrong = |_: ObjectId| Some(2);
+        let parser = ObjectParser::new(data, &limits).with_length_resolver(&wrong);
+        let obj = parser.parse_indirect_at(0).unwrap();
+        assert_eq!(&*obj.as_stream().unwrap().data, b"ABC");
+    }
 
     #[test]
     fn parse_simple_indirect() {

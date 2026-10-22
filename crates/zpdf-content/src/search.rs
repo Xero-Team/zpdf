@@ -15,7 +15,9 @@ use crate::text::TextSpan;
 /// One search match on a page.
 #[derive(Debug, Clone)]
 pub struct SearchHit {
-    /// The full text of the line containing the match (context for display).
+    /// The text of the line containing the match (context for display). A
+    /// line longer than [`MAX_HIT_CONTEXT_CHARS`] is cut to that many chars
+    /// around the match, so a huge line with many hits stays linear.
     pub line: String,
     /// Char offset of the match within `line`.
     pub start: usize,
@@ -60,6 +62,9 @@ struct LineChar {
     synthetic: bool,
 }
 
+/// Longest [`SearchHit::line`] context kept, in chars.
+pub const MAX_HIT_CONTEXT_CHARS: usize = 2048;
+
 /// Case-fold a char for caseless matching (first lowercase mapping; full
 /// multi-char expansions like ß→ss are intentionally not applied so char
 /// offsets stay 1:1 with the source line).
@@ -90,10 +95,24 @@ pub fn search_spans(spans: &[TextSpan], query: &str, case_sensitive: bool) -> Ve
         if folded.len() < query.len() {
             continue;
         }
+        let chars: Vec<char> = line.iter().map(|c| c.ch).collect();
+        let whole: Option<String> =
+            (chars.len() <= MAX_HIT_CONTEXT_CHARS).then(|| chars.iter().collect());
         let mut i = 0;
         while i + query.len() <= folded.len() {
             if folded[i..i + query.len()] == query[..] {
-                hits.push(hit_from(&line, i, query.len()));
+                let mut hit = hit_from(&line, i, query.len());
+                match &whole {
+                    Some(text) => hit.line = text.clone(),
+                    None => {
+                        let pad = MAX_HIT_CONTEXT_CHARS.saturating_sub(query.len()) / 2;
+                        let lo = i.saturating_sub(pad);
+                        let hi = (i + query.len() + pad).min(chars.len());
+                        hit.line = chars[lo..hi].iter().collect();
+                        hit.start = i - lo;
+                    }
+                }
+                hits.push(hit);
                 i += query.len();
             } else {
                 i += 1;
@@ -108,7 +127,7 @@ pub fn search_spans(spans: &[TextSpan], query: &str, case_sensitive: bool) -> Ve
 /// synthetic space where a word gap separates adjacent spans.
 fn build_lines(spans: &[TextSpan]) -> Vec<Vec<LineChar>> {
     let mut idx: Vec<usize> = (0..spans.len())
-        .filter(|&i| !spans[i].text.is_empty())
+        .filter(|&i| !spans[i].text.is_empty() && spans[i].is_finite())
         .collect();
     if idx.is_empty() {
         return Vec::new();
@@ -190,9 +209,9 @@ fn build_lines(spans: &[TextSpan]) -> Vec<Vec<LineChar>> {
         .collect()
 }
 
-/// Build a hit from a matched char range on one line.
+/// Build a hit from a matched char range on one line; its `line` text is
+/// left for the caller to fill.
 fn hit_from(line: &[LineChar], start: usize, len: usize) -> SearchHit {
-    let text: String = line.iter().map(|c| c.ch).collect();
     let matched = &line[start..start + len];
 
     // Vertical extent from the matched glyphs' baselines and sizes, using the
@@ -217,7 +236,7 @@ fn hit_from(line: &[LineChar], start: usize, len: usize) -> SearchHit {
     }
 
     SearchHit {
-        line: text,
+        line: String::new(),
         start,
         len,
         rects: vec![Rect::new(x0, y0, x1, y1)],
@@ -227,6 +246,22 @@ fn hit_from(line: &[LineChar], start: usize, len: usize) -> SearchHit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hits_on_a_huge_line_carry_a_bounded_window() {
+        let spans: Vec<TextSpan> = (0..2000)
+            .map(|k| span("ab", k as f64 * 12.0, 700.0, 10.0, 10.0))
+            .collect();
+        let hits = search_spans(&spans, "b", true);
+        assert_eq!(hits.len(), 2000);
+        for hit in &hits {
+            assert!(hit.line.chars().count() <= MAX_HIT_CONTEXT_CHARS);
+            assert_eq!(hit.line.chars().nth(hit.start), Some('b'));
+        }
+        // A short line keeps its whole text.
+        let short = search_spans(&spans[..3], "b", true);
+        assert_eq!(short[0].line, "ababab");
+    }
 
     fn span(text: &str, x: f64, y: f64, size: f32, advance: f64) -> TextSpan {
         TextSpan {

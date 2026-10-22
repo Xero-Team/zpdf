@@ -217,11 +217,18 @@ impl InheritedAttrs {
     fn gather(file: &PdfFile, leaf: &PdfDict) -> Self {
         let mut attrs = Self::default();
         let mut visited: HashSet<ObjectId> = HashSet::new();
-        let mut current: Cow<'_, PdfDict> = Cow::Borrowed(leaf);
+        // The ancestor being read, shared with the object cache: a page-tree
+        // node is read once per page beneath it, and cloning one with many
+        // `/Kids` per page made opening a flat tree quadratic.
+        let mut parent: Option<std::sync::Arc<PdfObject>> = None;
         let mut depth = 0usize;
 
         loop {
-            attrs.absorb(file, &current);
+            let current = match parent.as_deref() {
+                Some(PdfObject::Dict(d)) => d,
+                _ => leaf,
+            };
+            attrs.absorb(file, current);
             if attrs.is_complete() {
                 break;
             }
@@ -238,21 +245,23 @@ impl InheritedAttrs {
                 warn!("page-tree /Parent cycle at {parent_ref}; stopping inheritance walk");
                 break;
             }
-            match file.resolve(parent_ref) {
-                Ok(PdfObject::Dict(d)) => current = Cow::Owned(d),
-                Ok(PdfObject::Null) => {
-                    warn!(
-                        "page-tree parent {parent_ref} resolves to null; stopping inheritance walk"
-                    );
-                    break;
-                }
-                Ok(other) => {
-                    warn!(
-                        "page-tree parent {parent_ref} is {}, expected Dict; stopping inheritance walk",
-                        other.type_name()
-                    );
-                    break;
-                }
+            match file.resolve_shared(parent_ref) {
+                Ok(obj) => match &*obj {
+                    PdfObject::Dict(_) => parent = Some(obj),
+                    PdfObject::Null => {
+                        warn!(
+                            "page-tree parent {parent_ref} resolves to null; stopping inheritance walk"
+                        );
+                        break;
+                    }
+                    other => {
+                        warn!(
+                            "page-tree parent {parent_ref} is {}, expected Dict; stopping inheritance walk",
+                            other.type_name()
+                        );
+                        break;
+                    }
+                },
                 Err(e) => {
                     warn!("failed to resolve page-tree parent {parent_ref}: {e}");
                     break;
@@ -272,7 +281,7 @@ impl InheritedAttrs {
             self.crop_box = resolve_rect(file, dict, "CropBox");
         }
         if self.rotate.is_none() {
-            self.rotate = resolve_i64(file, dict.get("Rotate")).map(|n| n as i32);
+            self.rotate = resolve_i64(file, dict.get("Rotate")).map(normalize_rotate);
         }
         if self.resources.is_none() {
             if let Some(d) = resolve_sub_dict(dict, "Resources", file) {
@@ -318,6 +327,19 @@ pub(crate) fn resolve_rect(file: &PdfFile, dict: &PdfDict, key: &str) -> Option<
         };
     }
     Some(Rect::new(v[0], v[1], v[2], v[3]))
+}
+
+/// A /Rotate value as degrees in {0, 90, 180, 270}. The value must be a
+/// multiple of 90 (PDF 32000-1 Table 30); any other is ignored, as when
+/// rendering, rather than reported as a rotated page.
+fn normalize_rotate(rotate: i64) -> i32 {
+    match rotate.rem_euclid(360) {
+        r @ (0 | 90 | 180 | 270) => r as i32,
+        _ => {
+            warn!("/Rotate {rotate} is not a multiple of 90; ignoring it");
+            0
+        }
+    }
 }
 
 /// Read an integer value that may be direct or an indirect ref.
@@ -506,6 +528,24 @@ mod tests {
         assert!(page.resources.fonts.contains_key("F2"));
         // The leaf's own /Resources replaces (not merges with) the parent's.
         assert!(!page.resources.fonts.contains_key("F1"));
+    }
+
+    #[test]
+    fn rotate_is_normalized_to_a_quarter_turn() {
+        let rotate = |value: &str| {
+            let leaf = format!("<< /Type /Page /Parent 2 0 R /Rotate {value} >>");
+            page0(&[
+                "<< /Type /Catalog /Pages 2 0 R >>",
+                "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>",
+                &leaf,
+            ])
+            .rotate
+        };
+        assert_eq!(rotate("-90"), 270);
+        assert_eq!(rotate("450"), 90);
+        assert_eq!(rotate("45"), 0);
+        // Not 90 after truncation to 32 bits.
+        assert_eq!(rotate("4294967386"), 0);
     }
 
     #[test]

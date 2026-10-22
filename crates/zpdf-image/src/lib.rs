@@ -143,7 +143,20 @@ pub enum ResolvedColorSpace {
         hival: u8,
         lookup: Vec<u8>,
     },
+    /// Separation (`n == 1`) or DeviceN/NChannel (`n` colorants). Samples are
+    /// colorant tints (0..=1 after `/Decode`) mapped through the tint
+    /// transform into `alternate`. Without a usable transform a tint renders
+    /// as `gray(1 − max tint)`, which keeps colorant polarity (0 = no ink).
+    Tint {
+        n: u8,
+        transform: Option<std::sync::Arc<zpdf_color::PdfFunction>>,
+        alternate: Box<ResolvedColorSpace>,
+    },
 }
+
+/// Most colorants a DeviceN space may have (ISO 32000-1 Annex C), and so the
+/// most components any image sample can carry.
+const MAX_COMPONENTS: usize = 32;
 
 /// Manual impl because transforms have no structural equality: two `Icc`
 /// spaces are equal when they share the same compiled transform (used by the
@@ -184,6 +197,26 @@ impl PartialEq for ResolvedColorSpace {
                     lookup: l2,
                 },
             ) => b1 == b2 && h1 == h2 && l1 == l2,
+            (
+                Self::Tint {
+                    n: n1,
+                    transform: t1,
+                    alternate: a1,
+                },
+                Self::Tint {
+                    n: n2,
+                    transform: t2,
+                    alternate: a2,
+                },
+            ) => {
+                n1 == n2
+                    && a1 == a2
+                    && match (t1, t2) {
+                        (None, None) => true,
+                        (Some(t1), Some(t2)) => std::sync::Arc::ptr_eq(t1, t2),
+                        _ => false,
+                    }
+            }
             _ => false,
         }
     }
@@ -201,6 +234,7 @@ impl ResolvedColorSpace {
             // `ncomp` hint here could make malformed caller input index past
             // the fixed four-component scratch arrays below.
             Self::Icc { transform, .. } => transform.components(),
+            Self::Tint { n, .. } => *n as usize,
         }
     }
 
@@ -226,6 +260,19 @@ impl ResolvedColorSpace {
                     ));
                 }
                 base.validate(depth + 1)?;
+            }
+            Self::Tint { n, alternate, .. } => {
+                if *n == 0 || *n as usize > MAX_COMPONENTS {
+                    return Err(Error::StreamDecode(format!(
+                        "Separation/DeviceN colour space with {n} colorants"
+                    )));
+                }
+                if matches!(alternate.as_ref(), Self::Indexed { .. } | Self::Tint { .. }) {
+                    return Err(Error::StreamDecode(
+                        "Separation/DeviceN alternate cannot be a special colour space".into(),
+                    ));
+                }
+                alternate.validate(depth + 1)?;
             }
             Self::Lab { white_point, range }
                 if white_point.iter().any(|v| !v.is_finite() || *v <= 0.0)
@@ -370,16 +417,17 @@ pub fn decode_image_xobject_resolved_with_limits(
     cs.validate(0)?;
 
     if is_dct_encoded(dict) {
-        return decode_dct_image(decoded_data, width, height, &cs, dict);
+        return decode_dct_image(
+            decoded_data,
+            width,
+            height,
+            &cs,
+            dict,
+            limits.max_image_pixels,
+        );
     }
 
-    let bpc_value = dict.get_i64("BitsPerComponent").unwrap_or(8);
-    let bpc = u8::try_from(bpc_value).unwrap_or(0);
-    if !matches!(bpc, 1 | 2 | 4 | 8 | 16) {
-        return Err(Error::StreamDecode(format!(
-            "invalid BitsPerComponent {bpc_value}"
-        )));
-    }
+    let bpc = bits_per_component(dict)?;
 
     let ncomp = cs.components();
     let decode = decode_array(dict, ncomp);
@@ -429,6 +477,109 @@ pub fn apply_smask_image(image: &mut DecodedImage, mask: &DecodedImage) {
         .map(|px| px[0])
         .collect();
     fold_alpha_plane(image, &alpha, mask.width, mask.height);
+}
+
+/// The `/Matte` array of a soft-mask stream dictionary: the colour (in the
+/// parent image's colour space) its samples were pre-blended with.
+pub fn smask_matte(smask_dict: &PdfDict) -> Option<Vec<f64>> {
+    let values = smask_dict.get("Matte")?.as_array().ok()?;
+    if values.is_empty() || values.len() > MAX_COMPONENTS {
+        return None;
+    }
+    values
+        .iter()
+        .map(|value| value.as_f64().ok().filter(|v| v.is_finite()))
+        .collect()
+}
+
+/// [`apply_smask_image`] for a soft mask carrying `/Matte` (ISO 32000-1
+/// §11.6.5.3): the parent's colours were pre-blended with the matte colour
+/// `m`, so each is un-premultiplied — `c = m + (c′ − m) / α`, clamped; pixels
+/// with `α = 0` are left alone — before the alpha folds in.
+///
+/// `matte` holds the parent colour space's components and `colorspace` is
+/// that space (as passed to the image decode); without it, 1/3/4 components
+/// are read as DeviceGray/RGB/CMYK. The un-premultiply runs on the decoded
+/// RGB, which is exact for Gray/RGB parents (the overwhelmingly common case,
+/// with a black or white matte) and an approximation for non-linear spaces.
+/// `matte: None` (or an unconvertible one) behaves as [`apply_smask_image`].
+pub fn apply_smask_image_with_matte(
+    image: &mut DecodedImage,
+    mask: &DecodedImage,
+    matte: Option<&[f64]>,
+    colorspace: Option<&ResolvedColorSpace>,
+) {
+    let Some(matte) = matte.and_then(|matte| matte_to_rgb(matte, colorspace)) else {
+        apply_smask_image(image, mask);
+        return;
+    };
+    if image.width == 0 || image.height == 0 || mask.width == 0 || mask.height == 0 {
+        return;
+    }
+    let alpha: Vec<u8> = mask
+        .data
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|px| px[0])
+        .collect();
+    let resampled;
+    let plane: &[u8] = if (mask.width, mask.height) == (image.width, image.height) {
+        &alpha
+    } else {
+        resampled = resample_bilinear(&alpha, mask.width, mask.height, image.width, image.height);
+        &resampled
+    };
+    for (px, &a) in image.data.as_chunks_mut::<4>().0.iter_mut().zip(plane) {
+        // Only opaque, not-yet-premultiplied pixels carry pre-blended colour.
+        if a != 0 && a != 255 && px[3] == 255 {
+            for (c, &m) in px[..3].iter_mut().zip(&matte) {
+                let unblended = m as f32 + (*c as f32 - m as f32) * 255.0 / a as f32;
+                *c = unblended.round().clamp(0.0, 255.0) as u8;
+            }
+        }
+        multiply_pixel_alpha(px, a);
+    }
+    image.has_alpha = true;
+    image.premultiplied = true;
+}
+
+/// Convert a `/Matte` colour to 8-bit RGB through the parent colour space.
+fn matte_to_rgb(matte: &[f64], colorspace: Option<&ResolvedColorSpace>) -> Option<[u8; 3]> {
+    let inferred;
+    let cs = match colorspace {
+        Some(cs) => cs,
+        None => {
+            inferred = match matte.len() {
+                1 => ResolvedColorSpace::Gray,
+                3 => ResolvedColorSpace::Rgb,
+                4 => ResolvedColorSpace::Cmyk,
+                _ => return None,
+            };
+            &inferred
+        }
+    };
+    if matte.len() != cs.components() || cs.validate(0).is_err() {
+        return None;
+    }
+    Some(match cs {
+        // An Indexed parent's matte is a palette index.
+        ResolvedColorSpace::Indexed {
+            base,
+            hival,
+            lookup,
+        } => {
+            let index = matte[0].round().clamp(0.0, *hival as f64) as u8;
+            let palette = build_indexed_rgb_palette(base, *hival, lookup);
+            palette[index as usize]
+        }
+        ResolvedColorSpace::Tint {
+            transform,
+            alternate,
+            ..
+        } => tint_to_rgb(transform.as_deref(), alternate, matte),
+        other => float_components_to_rgb(other, matte),
+    })
 }
 
 /// Fold a `/Mask` stencil stream (1 bpc) into `image`: per spec 8.9.6.4 a
@@ -635,26 +786,71 @@ fn infer_colorspace_array(arr: &[PdfObject]) -> ResolvedColorSpace {
                 }
             }
         }
-        "Lab" => {
-            let params = match arr.get(1) {
-                Some(PdfObject::Dict(dict)) => dict,
-                _ => {
-                    tracing::warn!("Lab image colour space has no parameter dictionary");
-                    return ResolvedColorSpace::Gray;
-                }
-            };
-            let white_point = numeric_array::<3>(params.get("WhitePoint"))
-                .filter(|v| v.iter().all(|n| n.is_finite() && *n > 0.0))
-                .unwrap_or([0.9642, 1.0, 0.8249]);
-            let range = numeric_array::<4>(params.get("Range"))
-                .filter(|v| v.iter().all(|n| n.is_finite()) && v[0] <= v[1] && v[2] <= v[3])
-                .unwrap_or([-100.0, 100.0, -100.0, 100.0]);
-            ResolvedColorSpace::Lab { white_point, range }
-        }
+        "Lab" => match arr.get(1) {
+            Some(PdfObject::Dict(params)) => lab_colorspace(params),
+            _ => {
+                tracing::warn!("Lab image colour space has no parameter dictionary");
+                ResolvedColorSpace::Gray
+            }
+        },
+        "Separation" | "DeviceN" => infer_tint_colorspace(head == "Separation", arr),
         other => {
             tracing::warn!("unsupported colour space {other}, treating as gray");
             ResolvedColorSpace::Gray
         }
+    }
+}
+
+/// The Lab space described by a `[/Lab params]` parameter dictionary, with
+/// the D50 white point and `[-100 100 -100 100]` range defaults for missing
+/// or malformed entries.
+pub fn lab_colorspace(params: &PdfDict) -> ResolvedColorSpace {
+    let white_point = numeric_array::<3>(params.get("WhitePoint"))
+        .filter(|v| v.iter().all(|n| n.is_finite() && *n > 0.0))
+        .unwrap_or([0.9642, 1.0, 0.8249]);
+    let range = numeric_array::<4>(params.get("Range"))
+        .filter(|v| v.iter().all(|n| n.is_finite()) && v[0] <= v[1] && v[2] <= v[3])
+        .unwrap_or([-100.0, 100.0, -100.0, 100.0]);
+    ResolvedColorSpace::Lab { white_point, range }
+}
+
+/// Inline `[/Separation name alt fn]` / `[/DeviceN names alt fn …]`. Only a
+/// direct-dictionary tint transform (types 2/3) is reachable without object
+/// access; otherwise the tint keeps colorant polarity via the gray fallback.
+fn infer_tint_colorspace(is_separation: bool, arr: &[PdfObject]) -> ResolvedColorSpace {
+    let n = if is_separation {
+        1
+    } else {
+        match arr.get(1) {
+            Some(PdfObject::Array(names)) if !names.is_empty() => names.len(),
+            _ => {
+                tracing::warn!("DeviceN image colour space has no colorant names");
+                return ResolvedColorSpace::Gray;
+            }
+        }
+    };
+    let Ok(n) = u8::try_from(n) else {
+        return ResolvedColorSpace::Gray;
+    };
+    let alternate = match arr.get(2) {
+        Some(PdfObject::Name(name)) => colorspace_from_name(name.as_str()),
+        Some(PdfObject::Array(alt)) => Some(infer_colorspace_array(alt)),
+        _ => None,
+    }
+    .filter(|alt| {
+        !matches!(
+            alt,
+            ResolvedColorSpace::Indexed { .. } | ResolvedColorSpace::Tint { .. }
+        )
+    })
+    .unwrap_or(ResolvedColorSpace::Gray);
+    let transform = arr.get(3).and_then(|f| {
+        zpdf_color::PdfFunction::parse_object(f, &mut |_| None).map(std::sync::Arc::new)
+    });
+    ResolvedColorSpace::Tint {
+        n,
+        transform,
+        alternate: Box::new(alternate),
     }
 }
 
@@ -862,16 +1058,11 @@ fn decode_jpx_image(
         .checked_mul(4)
         .ok_or_else(|| Error::StreamDecode("JPX RGBA buffer size overflow".into()))?;
     let mut rgba = Vec::with_capacity(rgba_size);
+    let mut color = effective_cs.map(|cs| PixelColor::new(cs, pixel_count));
     for px in samples.chunks_exact(channels).take(pixel_count) {
-        let [mut r, mut g, mut b] = match effective_cs {
-            Some(cs) => {
-                let mut comps = [0u8; 4];
-                comps[..ncolor].copy_from_slice(&px[..ncolor]);
-                if let ResolvedColorSpace::Indexed { hival, .. } = cs {
-                    comps[0] = comps[0].min(*hival);
-                }
-                components_to_rgb(cs, &comps)
-            }
+        let [mut r, mut g, mut b] = match &mut color {
+            // Indexed lookups clamp the index to `hival`.
+            Some(color) => color.convert(&px[..ncolor]),
             None => match ncolor {
                 1 => [px[0]; 3],
                 3 => [px[0], px[1], px[2]],
@@ -916,66 +1107,38 @@ fn decode_dct_image(
     height: u32,
     cs: &ResolvedColorSpace,
     dict: &PdfDict,
+    max_image_pixels: u64,
 ) -> Result<DecodedImage> {
-    // DCTDecode was already run by the parser's filter pipeline (zune-jpeg with
-    // default options), which converts YCbCr/CMYK/YCCK to RGB — including the
-    // Adobe APP14 transform and CMYK inversion — so the data is normally
-    // 3 bytes/pixel regardless of the PDF colour space. Sniff the component
-    // count from the data length to stay robust if that ever changes. An ICC
-    // space whose component count matches the sniffed one is kept, so its
-    // transform applies to the JPEG's output samples.
-    let pixel_count = (width as usize)
-        .checked_mul(height as usize)
-        .ok_or_else(|| Error::StreamDecode("DCT image pixel count overflow".into()))?;
-
-    // L4 Fix: Explicit validation of component count from data length
-    // JPEG can only produce 1 (grayscale), 3 (RGB/YCbCr), or 4 (CMYK/YCCK) components
-    if decoded_data.len() < pixel_count {
+    // DCTDecode was already run by the parser's filter pipeline, which emits
+    // the JPEG's own components: gray (1 byte/pixel), RGB from YCbCr (3) or
+    // CMYK (4; Adobe YCCK is converted to CMYK there). CMYK stays CMYK so the
+    // DeviceCMYK conversion — SWOP polynomial, ICC profile or output intent —
+    // and a 4-component /Decode apply here exactly as for raw CMYK samples.
+    // The component count (and, when the JPEG disagrees with the dict, its
+    // real geometry) is recovered from the data length.
+    let (width, height, ncomp) = dct_layout(decoded_data.len(), width, height, cs)?;
+    if (width as u64).saturating_mul(height as u64) > max_image_pixels {
         return Err(Error::StreamDecode(format!(
-            "DCT decoded data too short: {} bytes for {}x{} image",
-            decoded_data.len(),
-            width,
-            height
-        )));
-    }
-    if !decoded_data.len().is_multiple_of(pixel_count) {
-        return Err(Error::StreamDecode(format!(
-            "DCT decoded data length {} is not a whole number of pixels for {}x{} image",
-            decoded_data.len(),
-            width,
-            height
-        )));
-    }
-    let bytes_per_pixel = decoded_data.len() / pixel_count;
-
-    if !matches!(bytes_per_pixel, 1 | 3 | 4) {
-        return Err(Error::StreamDecode(format!(
-            "DCT image has invalid component count: {} bytes/pixel (expected 1, 3, or 4)",
-            bytes_per_pixel
+            "DCT image {width}x{height} exceeds the {max_image_pixels}-pixel limit"
         )));
     }
 
-    let (sniffed, ncomp) = match bytes_per_pixel {
-        4 => match cs {
-            ResolvedColorSpace::Icc { .. } if cs.components() == 4 => (cs.clone(), 4),
-            _ => (ResolvedColorSpace::Cmyk, 4),
-        },
-        3 => match cs {
-            ResolvedColorSpace::Icc { .. } if cs.components() == 3 => (cs.clone(), 3),
-            ResolvedColorSpace::Lab { .. } => (cs.clone(), 3),
-            _ => (ResolvedColorSpace::Rgb, 3),
-        },
-        1 => match cs {
-            ResolvedColorSpace::Icc { .. } if cs.components() == 1 => (cs.clone(), 1),
-            _ => (ResolvedColorSpace::Gray, 1),
-        },
-        _ => unreachable!("component count was validated above"),
+    // Keep the resolved space when it describes what the JPEG produced (ICC,
+    // Lab, a Separation over a gray JPEG, …); otherwise interpret the
+    // components by count. (Indexed is not a valid DCT colour space.)
+    let sniffed = if cs.components() == ncomp && !matches!(cs, ResolvedColorSpace::Indexed { .. }) {
+        cs.clone()
+    } else {
+        match ncomp {
+            4 => ResolvedColorSpace::Cmyk,
+            3 => ResolvedColorSpace::Rgb,
+            _ => ResolvedColorSpace::Gray,
+        }
     };
 
     // /Decode and colour-key /Mask entries apply to the JPEG's output
     // components; only honour them when their length matches what the JPEG
-    // actually produced (a 4-component CMYK /Decode on zune's RGB output would
-    // double-invert). The mismatching case is logged inside the extractors.
+    // actually produced. The mismatching case is logged inside the extractors.
     let decode = decode_array(dict, ncomp);
     let color_key = color_key_ranges(dict, ncomp);
     decode_raw_samples(
@@ -987,6 +1150,100 @@ fn decode_dct_image(
         decode.as_deref(),
         color_key.as_deref(),
     )
+}
+
+/// Recover `(width, height, components)` of decoded DCT samples. The parser
+/// hands over bare samples, so the length is all there is: first the dict's
+/// dimensions at 1, 3 or 4 bytes/pixel; failing that the JPEG disagrees with
+/// the dict (a common writer bug), and the dict width — or else its height —
+/// is kept with the other axis taken from the data, preferring the colour
+/// space's own component count. The image then renders at the JPEG's real
+/// size, stretched over the same unit square, instead of being dropped.
+fn dct_layout(
+    len: usize,
+    width: u32,
+    height: u32,
+    cs: &ResolvedColorSpace,
+) -> Result<(u32, u32, usize)> {
+    let pixel_count = (width as usize)
+        .checked_mul(height as usize)
+        .ok_or_else(|| Error::StreamDecode("DCT image pixel count overflow".into()))?;
+    if len >= pixel_count && len.is_multiple_of(pixel_count) {
+        let ncomp = len / pixel_count;
+        if matches!(ncomp, 1 | 3 | 4) {
+            return Ok((width, height, ncomp));
+        }
+    }
+    let preferred = cs.components();
+    let candidates = [preferred, 3, 1, 4]
+        .into_iter()
+        .enumerate()
+        .filter(|&(index, n)| matches!(n, 1 | 3 | 4) && (index == 0 || n != preferred))
+        .map(|(_, n)| n);
+    for (fixed, fixed_is_width) in [(width, true), (height, false)] {
+        for ncomp in candidates.clone() {
+            let Some(line) = (fixed as usize).checked_mul(ncomp) else {
+                continue;
+            };
+            if len < line || !len.is_multiple_of(line) {
+                continue;
+            }
+            let Ok(other) = u32::try_from(len / line) else {
+                continue;
+            };
+            let (w, h) = if fixed_is_width {
+                (width, other)
+            } else {
+                (other, height)
+            };
+            tracing::warn!(
+                "DCT image dict says {width}x{height} but the JPEG decoded to {w}x{h} \
+                 ({ncomp} components); using the JPEG dimensions"
+            );
+            return Ok((w, h, ncomp));
+        }
+    }
+    Err(Error::StreamDecode(format!(
+        "DCT decoded data length {len} does not fit a {width}x{height} image"
+    )))
+}
+
+/// `/BitsPerComponent` (default 8 when absent or not a number). An integral
+/// real such as `8.0` is accepted like the integer it spells.
+fn bits_per_component(dict: &PdfDict) -> Result<u8> {
+    let invalid = |value: &dyn std::fmt::Display| {
+        Error::StreamDecode(format!("invalid BitsPerComponent {value}"))
+    };
+    let bpc = match dict.get("BitsPerComponent") {
+        Some(PdfObject::Integer(value)) => u8::try_from(*value).map_err(|_| invalid(value))?,
+        Some(PdfObject::Real(value)) if value.fract() == 0.0 && (1.0..=16.0).contains(value) => {
+            *value as u8
+        }
+        Some(PdfObject::Real(value)) => return Err(invalid(value)),
+        _ => 8,
+    };
+    if !matches!(bpc, 1 | 2 | 4 | 8 | 16) {
+        return Err(invalid(&bpc));
+    }
+    Ok(bpc)
+}
+
+/// Check the post-filter sample length against the `required` bytes,
+/// returning whether the data is short and must be padded. Truncated streams
+/// are common (a writer that stopped early, a damaged Flate tail) and viewers
+/// render what is there with the missing samples read as 0; less than one
+/// full row is treated as no usable image data.
+fn check_sample_data_len(len: usize, row_bytes: usize, required: usize) -> Result<bool> {
+    if len >= required {
+        return Ok(false);
+    }
+    if len < row_bytes {
+        return Err(Error::StreamDecode(format!(
+            "image data too short: {len} bytes, expected {required}"
+        )));
+    }
+    tracing::warn!("image data has {len} of {required} bytes; padding missing samples with 0");
+    Ok(true)
 }
 
 /// `/Decode` as `[min, max]` pairs per component, if present with the
@@ -1017,6 +1274,13 @@ fn decode_array(dict: &PdfDict, ncomp: usize) -> Option<Vec<f32>> {
 /// `/Mask [min₁ max₁ …]` colour-key ranges, compared against RAW sample values
 /// (before /Decode is applied), per spec 8.9.6.4.
 fn color_key_ranges(dict: &PdfDict, ncomp: usize) -> Option<Vec<(u16, u16)>> {
+    // A soft mask overrides /Mask (ISO 32000-1 Table 89, /SMask entry).
+    if matches!(
+        dict.get("SMask"),
+        Some(PdfObject::Ref(_) | PdfObject::Stream(_))
+    ) {
+        return None;
+    }
     let arr = match dict.get("Mask") {
         Some(PdfObject::Array(a)) => a,
         _ => return None,
@@ -1078,28 +1342,25 @@ fn decode_raw_samples(
     let required_data = row_bytes
         .checked_mul(height as usize)
         .ok_or_else(|| Error::StreamDecode("raw samples: data size overflow".into()))?;
-    if data.len() < required_data {
-        return Err(Error::StreamDecode(format!(
-            "raw image data too short: {} bytes, expected {required_data}",
-            data.len()
-        )));
-    }
+    // Truncated streams are padded with zero samples rather than dropped.
+    let padded;
+    let data = if check_sample_data_len(data.len(), row_bytes, required_data)? {
+        padded = [data, &vec![0; required_data - data.len()]].concat();
+        &padded[..]
+    } else {
+        data
+    };
 
     let rgba_size = pixel_count
         .checked_mul(4)
         .ok_or_else(|| Error::StreamDecode("raw samples: RGBA buffer size overflow".into()))?;
 
     let luts = build_component_luts(bpc, cs, decode);
-    // Resolve Indexed entries once. In particular this avoids invoking an ICC
-    // transform separately for every pixel when the palette has an ICC base.
-    let indexed_palette = match cs {
-        ResolvedColorSpace::Indexed {
-            base,
-            hival,
-            lookup,
-        } => Some(build_indexed_rgb_palette(base, *hival, lookup)),
-        _ => None,
-    };
+    // Palettes, tint tables and caches are resolved once per image. In
+    // particular this avoids invoking an ICC transform separately for every
+    // pixel when an Indexed palette has an ICC base.
+    let mut color = PixelColor::new(cs, pixel_count);
+    let mut comps = [0u8; MAX_COMPONENTS];
 
     // Fast path: 8-bit samples and no colour key — which is the shape of every
     // image that reaches here, since the parser's filter pipeline hands over
@@ -1107,38 +1368,29 @@ fn decode_raw_samples(
     // each byte offset through a bit reader, re-checks the colour key and
     // re-reserves the output buffer *per pixel*; none of that is needed when the
     // samples already are bytes. Values come from the same LUTs and
-    // `components_to_rgb`, so the two paths agree byte for byte.
-    if bpc == 8
-        && color_key.is_none()
-        && indexed_palette.is_none()
-        && row_bytes == width as usize * ncomp
-    {
-        let row_out = width as usize * 4;
+    // `PixelColor`, so the two paths agree byte for byte.
+    if bpc == 8 && color_key.is_none() && row_bytes == width as usize * ncomp {
+        // 8-bpc rows carry no padding, so pixels are contiguous. The loop is
+        // monomorphized per component count, with Gray/RGB converted inline.
         let mut rgba = vec![0u8; rgba_size];
-        for (src_row, dst_row) in data
-            .chunks_exact(row_bytes)
-            .zip(rgba.chunks_exact_mut(row_out))
-        {
-            for (src, dst) in src_row
-                .chunks_exact(ncomp)
-                .zip(dst_row.as_chunks_mut::<4>().0)
-            {
-                let mut comps = [0u8; 4];
-                match ncomp {
-                    1 => comps[0] = luts[0][src[0] as usize],
-                    3 => {
-                        comps[0] = luts[0][src[0] as usize];
-                        comps[1] = luts[1][src[1] as usize];
-                        comps[2] = luts[2][src[2] as usize];
+        match (cs, ncomp) {
+            (ResolvedColorSpace::Gray, _) => {
+                fill_rgba_8bpc::<1>(data, &mut rgba, &luts, |c| [c[0]; 3])
+            }
+            (ResolvedColorSpace::Rgb, _) => {
+                fill_rgba_8bpc::<3>(data, &mut rgba, &luts, |c| [c[0], c[1], c[2]])
+            }
+            (_, 1) => fill_rgba_8bpc::<1>(data, &mut rgba, &luts, |c| color.convert(c)),
+            (_, 3) => fill_rgba_8bpc::<3>(data, &mut rgba, &luts, |c| color.convert(c)),
+            (_, 4) => fill_rgba_8bpc::<4>(data, &mut rgba, &luts, |c| color.convert(c)),
+            _ => {
+                for (src, dst) in data.chunks_exact(ncomp).zip(rgba.as_chunks_mut::<4>().0) {
+                    for c in 0..ncomp {
+                        comps[c] = luts[c][src[c] as usize];
                     }
-                    _ => {
-                        for c in 0..ncomp {
-                            comps[c] = luts[c][src[c] as usize];
-                        }
-                    }
+                    let [r, g, b] = color.convert(&comps[..ncomp]);
+                    *dst = [r, g, b, 255];
                 }
-                let [r, g, b] = components_to_rgb(cs, &comps);
-                *dst = [r, g, b, 255];
             }
         }
         return Ok(DecodedImage {
@@ -1151,14 +1403,72 @@ fn decode_raw_samples(
         });
     }
 
+    let layout = SampleLayout {
+        width,
+        height,
+        row_bytes,
+        bpc,
+        ncomp,
+    };
+    // Bitonal and other sub-byte gray scans are common: keep their conversion
+    // inline rather than behind the generic per-pixel dispatch.
+    let (rgba, any_masked) = match cs {
+        ResolvedColorSpace::Gray => {
+            unpack_rgba(data, &layout, &luts, color_key, rgba_size, |c| [c[0]; 3])
+        }
+        _ => unpack_rgba(data, &layout, &luts, color_key, rgba_size, |c| {
+            color.convert(c)
+        }),
+    };
+
+    Ok(DecodedImage {
+        width,
+        height,
+        data: rgba,
+        has_alpha: any_masked,
+        is_image_mask: false,
+        // Colour-key holes are transparent black, which is valid premultiplied
+        // RGBA — the backends treat the bytes as premultiplied.
+        premultiplied: any_masked,
+    })
+}
+
+/// Geometry of packed raw samples (rows are byte-aligned).
+struct SampleLayout {
+    width: u32,
+    height: u32,
+    row_bytes: usize,
+    bpc: u8,
+    ncomp: usize,
+}
+
+/// The general inner loop of [`decode_raw_samples`]: unpack each pixel's
+/// samples through a bit reader, key out colour-key matches on the raw values,
+/// map the rest through the LUTs and `convert`. Returns the RGBA buffer and
+/// whether any pixel was keyed out.
+fn unpack_rgba(
+    data: &[u8],
+    layout: &SampleLayout,
+    luts: &[Vec<u8>],
+    color_key: Option<&[(u16, u16)]>,
+    rgba_size: usize,
+    mut convert: impl FnMut(&[u8]) -> [u8; 3],
+) -> (Vec<u8>, bool) {
+    let SampleLayout {
+        width,
+        height,
+        row_bytes,
+        bpc,
+        ncomp,
+    } = *layout;
     let mut rgba = Vec::with_capacity(rgba_size);
     let mut any_masked = false;
-
+    let mut raw = [0u16; MAX_COMPONENTS];
+    let mut comps = [0u8; MAX_COMPONENTS];
     for row in 0..height as usize {
         let row_start = row * row_bytes;
         let mut bit = 0usize;
         for _col in 0..width {
-            let mut raw = [0u16; 4];
             for r in raw.iter_mut().take(ncomp) {
                 *r = read_sample(data, row_start, &mut bit, bpc);
             }
@@ -1173,7 +1483,6 @@ fn decode_raw_samples(
                 rgba.extend_from_slice(&[0, 0, 0, 0]);
                 continue;
             }
-            let mut comps = [0u8; 4];
             for c in 0..ncomp {
                 let idx = if bpc == 16 {
                     (raw[c] >> 8) as usize
@@ -1182,24 +1491,34 @@ fn decode_raw_samples(
                 };
                 comps[c] = luts[c][idx];
             }
-            let [r, g, b] = indexed_palette
-                .as_ref()
-                .map(|palette| palette[comps[0] as usize])
-                .unwrap_or_else(|| components_to_rgb(cs, &comps));
+            let [r, g, b] = convert(&comps[..ncomp]);
             rgba.extend_from_slice(&[r, g, b, 255]);
         }
     }
+    (rgba, any_masked)
+}
 
-    Ok(DecodedImage {
-        width,
-        height,
-        data: rgba,
-        has_alpha: any_masked,
-        is_image_mask: false,
-        // Colour-key holes are transparent black, which is valid premultiplied
-        // RGBA — the backends treat the bytes as premultiplied.
-        premultiplied: any_masked,
-    })
+/// The 8-bpc, colour-key-free inner loop of [`decode_raw_samples`]: map each
+/// pixel's `N` bytes through the per-component LUTs, convert, and write
+/// opaque RGBA (as many pixels as both buffers hold).
+#[inline]
+fn fill_rgba_8bpc<const N: usize>(
+    data: &[u8],
+    rgba: &mut [u8],
+    luts: &[Vec<u8>],
+    mut convert: impl FnMut(&[u8; N]) -> [u8; 3],
+) {
+    let luts: &[Vec<u8>; N] = luts.try_into().expect("one LUT per component");
+    for (src, dst) in data
+        .as_chunks::<N>()
+        .0
+        .iter()
+        .zip(rgba.as_chunks_mut::<4>().0)
+    {
+        let comps: [u8; N] = std::array::from_fn(|c| luts[c][src[c] as usize]);
+        let [r, g, b] = convert(&comps);
+        *dst = [r, g, b, 255];
+    }
 }
 
 /// ICC variant of [`decode_raw_samples`]: unpack and /Decode-map the whole
@@ -1231,12 +1550,8 @@ fn decode_raw_samples_icc(
     let required_data = row_bytes
         .checked_mul(height as usize)
         .ok_or_else(|| Error::StreamDecode("ICC image data size overflow".into()))?;
-    if data.len() < required_data {
-        return Err(Error::StreamDecode(format!(
-            "ICC image data too short: {} bytes, expected {required_data}",
-            data.len()
-        )));
-    }
+    // Short data needs no copy here: `read_sample` reads missing samples as 0.
+    check_sample_data_len(data.len(), row_bytes, required_data)?;
     let rgba_size = pixel_count
         .checked_mul(4)
         .ok_or_else(|| Error::StreamDecode("ICC image RGBA size overflow".into()))?;
@@ -1399,53 +1714,414 @@ fn read_sample(data: &[u8], row_start: usize, bit: &mut usize, bpc: u8) -> u16 {
     }
 }
 
-/// Convert one pixel's decoded components to RGB. For Indexed spaces,
-/// `comps[0]` is the (already clamped) palette index.
-fn components_to_rgb(cs: &ResolvedColorSpace, comps: &[u8; 4]) -> [u8; 3] {
+/// Direct-mapped cache slots (`2^PIXEL_CACHE_BITS`) for colour spaces
+/// converted per distinct sample tuple.
+const PIXEL_CACHE_BITS: u32 = 12;
+const PIXEL_CACHE_SLOTS: usize = 1 << PIXEL_CACHE_BITS;
+
+/// Exact tint-transform evaluations one image may spend on cache misses. A
+/// calculator function can run thousands of steps per evaluation, so a large
+/// DeviceN image of mostly distinct pixels must be bounded: past the budget
+/// the remaining misses interpolate a grid of transform samples instead.
+const MAX_TINT_EVALUATIONS: u32 = 1 << 15;
+/// Samples in that grid: `256²`, so two-colorant images stay exact.
+const TINT_GRID_POINTS: usize = 1 << 16;
+/// Colorants the grid supports (each lookup blends `2^n` corners); beyond
+/// that, past-budget pixels take the gray tint fallback.
+const MAX_TINT_GRID_COLORANTS: usize = 6;
+
+/// Per-image sample → RGB conversion, built once so the per-pixel work is a
+/// table lookup wherever the space allows: Indexed palettes and
+/// single-colorant tints become tables, while multi-colorant tints (a tint
+/// transform evaluation each) and Lab (`powf`-heavy) memoize recent sample
+/// tuples. Every variant yields exactly what [`components_to_rgb`] would,
+/// except multi-colorant tints past [`MAX_TINT_EVALUATIONS`].
+enum PixelColor<'a> {
+    Direct(&'a ResolvedColorSpace),
+    /// RGB by Indexed palette index or by 8-bit Separation tint.
+    Table(Vec<[u8; 3]>),
+    /// Up to four components, packed into the key with a presence bit (an
+    /// all-zero slot is empty).
+    CachedNarrow {
+        cs: &'a ResolvedColorSpace,
+        slots: Vec<(u64, [u8; 3])>,
+        miss: Miss,
+    },
+    CachedWide {
+        cs: &'a ResolvedColorSpace,
+        slots: Vec<Option<([u8; MAX_COMPONENTS], [u8; 3])>>,
+        miss: Miss,
+    },
+}
+
+/// How a cached conversion handles misses.
+enum Miss {
+    /// Exact conversion; the cache is dropped when it rarely hits.
+    Exact(CacheStats),
+    /// Tint evaluation within the image's budget, then the grid.
+    Tint(TintBudget),
+}
+
+impl Miss {
+    #[inline]
+    fn hit(&mut self) {
+        if let Self::Exact(stats) = self {
+            stats.record(true);
+        }
+    }
+
+    /// Convert a missed tuple; true when the cache should be dropped.
+    fn convert(&mut self, cs: &ResolvedColorSpace, comps: &[u8]) -> ([u8; 3], bool) {
+        match self {
+            Self::Exact(stats) => (components_to_rgb(cs, comps), stats.record(false)),
+            Self::Tint(budget) => (budget.convert(cs, comps), false),
+        }
+    }
+}
+
+/// Hit accounting over an image's first pixels: a cache that rarely hits
+/// (photographic content) only adds overhead, so it is dropped.
+#[derive(Default)]
+struct CacheStats {
+    lookups: u32,
+    hits: u32,
+}
+
+impl CacheStats {
+    const PROBE_WINDOW: u32 = 1 << 14;
+
+    /// Record one lookup; true when the probe window just closed with under
+    /// a quarter of lookups hitting.
+    #[inline]
+    fn record(&mut self, hit: bool) -> bool {
+        if self.lookups >= Self::PROBE_WINDOW {
+            return false;
+        }
+        self.lookups += 1;
+        self.hits += u32::from(hit);
+        self.lookups == Self::PROBE_WINDOW && self.hits < Self::PROBE_WINDOW / 4
+    }
+}
+
+#[derive(Default)]
+struct TintBudget {
+    evaluations: u32,
+    /// Built on first need; `Some(None)` when the colorant count has no grid.
+    grid: Option<Option<TintGrid>>,
+}
+
+impl TintBudget {
+    fn convert(&mut self, cs: &ResolvedColorSpace, comps: &[u8]) -> [u8; 3] {
+        let ResolvedColorSpace::Tint {
+            n,
+            transform,
+            alternate,
+        } = cs
+        else {
+            return components_to_rgb(cs, comps);
+        };
+        if self.evaluations < MAX_TINT_EVALUATIONS {
+            self.evaluations += 1;
+            return components_to_rgb(cs, comps);
+        }
+        let grid = self.grid.get_or_insert_with(|| {
+            tracing::warn!(
+                "tint transform evaluation budget exhausted; interpolating the rest of the image"
+            );
+            TintGrid::build(transform.as_deref(), alternate, *n as usize)
+        });
+        match grid {
+            Some(grid) => grid.lookup(comps),
+            // gray(1 − max tint), as `tint_to_rgb` falls back to.
+            None => [255 - comps.iter().copied().max().unwrap_or(0); 3],
+        }
+    }
+}
+
+/// A tint transform sampled on a regular grid over the colorant cube (axis 0
+/// varying fastest), looked up by multilinear interpolation.
+struct TintGrid {
+    n: usize,
+    side: usize,
+    rgb: Vec<[u8; 3]>,
+}
+
+impl TintGrid {
+    fn build(
+        transform: Option<&zpdf_color::PdfFunction>,
+        alternate: &ResolvedColorSpace,
+        n: usize,
+    ) -> Option<Self> {
+        if n == 0 || n > MAX_TINT_GRID_COLORANTS {
+            return None;
+        }
+        let points = |side: usize| side.checked_pow(n as u32).unwrap_or(usize::MAX);
+        let mut side = 2;
+        while side < 256 && points(side + 1) <= TINT_GRID_POINTS {
+            side += 1;
+        }
+        let mut tints = [0.0f64; MAX_TINT_GRID_COLORANTS];
+        let rgb = (0..points(side))
+            .map(|index| {
+                let mut rest = index;
+                for tint in tints.iter_mut().take(n) {
+                    *tint = (rest % side) as f64 / (side - 1) as f64;
+                    rest /= side;
+                }
+                tint_to_rgb(transform, alternate, &tints[..n])
+            })
+            .collect();
+        Some(Self { n, side, rgb })
+    }
+
+    fn lookup(&self, comps: &[u8]) -> [u8; 3] {
+        let scale = (self.side - 1) as f32 / 255.0;
+        let mut base = 0;
+        let mut stride = 1;
+        let mut strides = [0usize; MAX_TINT_GRID_COLORANTS];
+        let mut fracs = [0.0f32; MAX_TINT_GRID_COLORANTS];
+        for axis in 0..self.n {
+            let pos = comps.get(axis).copied().unwrap_or(0) as f32 * scale;
+            let cell = (pos as usize).min(self.side - 2);
+            fracs[axis] = pos - cell as f32;
+            strides[axis] = stride;
+            base += cell * stride;
+            stride *= self.side;
+        }
+        let mut acc = [0.0f32; 3];
+        for corner in 0..1usize << self.n {
+            let mut weight = 1.0f32;
+            let mut index = base;
+            for axis in 0..self.n {
+                if corner >> axis & 1 == 1 {
+                    weight *= fracs[axis];
+                    index += strides[axis];
+                } else {
+                    weight *= 1.0 - fracs[axis];
+                }
+            }
+            if weight != 0.0 {
+                for (sum, &value) in acc.iter_mut().zip(&self.rgb[index]) {
+                    *sum += weight * value as f32;
+                }
+            }
+        }
+        acc.map(|value| value.round().clamp(0.0, 255.0) as u8)
+    }
+}
+
+impl<'a> PixelColor<'a> {
+    /// Pick the conversion for an image of `pixels` pixels. Tables and caches
+    /// cost up-front work (a tint table evaluates the transform 256 times),
+    /// so small images — tiny inline images are common — convert directly.
+    fn new(cs: &'a ResolvedColorSpace, pixels: usize) -> Self {
+        match cs {
+            ResolvedColorSpace::Indexed {
+                base,
+                hival,
+                lookup,
+            } if pixels > *hival as usize
+                || !matches!(base.as_ref(), ResolvedColorSpace::Tint { .. }) =>
+            {
+                Self::Table(build_indexed_rgb_palette(base, *hival, lookup))
+            }
+            ResolvedColorSpace::Tint { n: 1, .. } if pixels > 256 => {
+                Self::Table((0..=255u8).map(|t| components_to_rgb(cs, &[t])).collect())
+            }
+            _ if pixels < PIXEL_CACHE_SLOTS => Self::Direct(cs),
+            ResolvedColorSpace::Lab { .. } => Self::CachedNarrow {
+                cs,
+                slots: vec![(0, [0; 3]); PIXEL_CACHE_SLOTS],
+                miss: Miss::Exact(CacheStats::default()),
+            },
+            ResolvedColorSpace::Tint { n: 2..=4, .. } => Self::CachedNarrow {
+                cs,
+                slots: vec![(0, [0; 3]); PIXEL_CACHE_SLOTS],
+                miss: Miss::Tint(TintBudget::default()),
+            },
+            ResolvedColorSpace::Tint { .. } => Self::CachedWide {
+                cs,
+                slots: vec![None; PIXEL_CACHE_SLOTS],
+                miss: Miss::Tint(TintBudget::default()),
+            },
+            _ => Self::Direct(cs),
+        }
+    }
+
+    /// Convert one pixel's decoded 8-bit components (`cs.components()` of
+    /// them; an Indexed index beyond `hival` reads the last entry).
+    #[inline]
+    fn convert(&mut self, comps: &[u8]) -> [u8; 3] {
+        let (rgb, drop_cache) = match self {
+            Self::Direct(cs) => return components_to_rgb(cs, comps),
+            Self::Table(table) => {
+                return table
+                    .get(comps[0] as usize)
+                    .or(table.last())
+                    .copied()
+                    .unwrap_or([0; 3])
+            }
+            Self::CachedNarrow { cs, slots, miss } => {
+                let packed = comps
+                    .iter()
+                    .fold(0u32, |key, &byte| (key << 8) | byte as u32);
+                let key = (1u64 << 32) | packed as u64;
+                // Fibonacci hashing: the top bits of the product pick the slot.
+                let index = (packed.wrapping_mul(0x9E37_79B1) >> (32 - PIXEL_CACHE_BITS)) as usize;
+                let slot = &mut slots[index];
+                if slot.0 == key {
+                    miss.hit();
+                    return slot.1;
+                }
+                let (rgb, drop_cache) = miss.convert(cs, comps);
+                *slot = (key, rgb);
+                (rgb, drop_cache)
+            }
+            Self::CachedWide { cs, slots, miss } => {
+                let mut key = [0u8; MAX_COMPONENTS];
+                key[..comps.len()].copy_from_slice(comps);
+                // FNV-1a over the tuple picks the slot.
+                let hash = comps.iter().fold(0x811c_9dc5u32, |hash, &byte| {
+                    (hash ^ byte as u32).wrapping_mul(0x0100_0193)
+                });
+                let slot = &mut slots[hash as usize & (PIXEL_CACHE_SLOTS - 1)];
+                if let Some((cached, rgb)) = slot {
+                    if *cached == key {
+                        miss.hit();
+                        return *rgb;
+                    }
+                }
+                let (rgb, drop_cache) = miss.convert(cs, comps);
+                *slot = Some((key, rgb));
+                (rgb, drop_cache)
+            }
+        };
+        if drop_cache {
+            if let Self::CachedNarrow { cs, .. } | Self::CachedWide { cs, .. } = self {
+                *self = Self::Direct(cs);
+            }
+        }
+        rgb
+    }
+}
+
+/// Convert one pixel's decoded 8-bit components to RGB. For Indexed spaces,
+/// `comps[0]` is the palette index (clamped to `hival`); for
+/// Separation/DeviceN they are tints scaled to 0..=255. Missing components
+/// read as 0.
+fn components_to_rgb(cs: &ResolvedColorSpace, comps: &[u8]) -> [u8; 3] {
+    let get = |i: usize| comps.get(i).copied().unwrap_or(0);
     match cs {
-        ResolvedColorSpace::Gray => [comps[0]; 3],
-        ResolvedColorSpace::Rgb => [comps[0], comps[1], comps[2]],
-        ResolvedColorSpace::Cmyk => cmyk_to_rgb(comps),
+        ResolvedColorSpace::Gray => [get(0); 3],
+        ResolvedColorSpace::Rgb => [get(0), get(1), get(2)],
+        ResolvedColorSpace::Cmyk => cmyk_to_rgb(&[get(0), get(1), get(2), get(3)]),
         ResolvedColorSpace::Lab { white_point, range } => {
-            let l = comps[0] as f64 / 255.0 * 100.0;
-            let a = range[0] + comps[1] as f64 / 255.0 * (range[1] - range[0]);
-            let b = range[2] + comps[2] as f64 / 255.0 * (range[3] - range[2]);
+            let l = get(0) as f64 / 255.0 * 100.0;
+            let a = range[0] + get(1) as f64 / 255.0 * (range[1] - range[0]);
+            let b = range[2] + get(2) as f64 / 255.0 * (range[3] - range[2]);
             let (r, g, b) = zpdf_color::lab_to_rgb(l, a, b, *white_point);
-            [
-                (r * 255.0).round() as u8,
-                (g * 255.0).round() as u8,
-                (b * 255.0).round() as u8,
-            ]
+            [unit_to_u8(r), unit_to_u8(g), unit_to_u8(b)]
         }
         // Whole images take the buffer-level path in decode_raw_samples_icc;
         // this per-pixel call serves Indexed bases built without the
         // interpreter's palette pre-baking.
-        ResolvedColorSpace::Icc { transform, .. } => transform.comps8_to_rgb8(comps),
-        ResolvedColorSpace::Indexed { base, lookup, .. } => {
-            let n = base.components();
-            let off = comps[0] as usize * n;
-            let mut bc = [0u8; 4];
+        ResolvedColorSpace::Icc { transform, .. } => {
+            transform.comps8_to_rgb8(&[get(0), get(1), get(2), get(3)])
+        }
+        ResolvedColorSpace::Indexed {
+            base,
+            hival,
+            lookup,
+        } => {
+            let n = base.components().min(MAX_COMPONENTS);
+            let off = get(0).min(*hival) as usize * n;
+            let mut bc = [0u8; MAX_COMPONENTS];
             for (i, b) in bc.iter_mut().enumerate().take(n) {
                 // A short palette reads as 0 rather than failing the image.
                 *b = lookup.get(off + i).copied().unwrap_or(0);
             }
             // Recursion terminates: `base` is a strictly smaller tree (and an
             // Indexed base of Indexed is illegal per spec 8.6.6.3 anyway).
-            components_to_rgb(base, &bc)
+            components_to_rgb(base, &bc[..n])
+        }
+        ResolvedColorSpace::Tint {
+            n,
+            transform,
+            alternate,
+        } => {
+            let n = (*n as usize).min(MAX_COMPONENTS);
+            let mut tints = [0.0f64; MAX_COMPONENTS];
+            for (i, tint) in tints.iter_mut().enumerate().take(n) {
+                *tint = get(i) as f64 / 255.0;
+            }
+            tint_to_rgb(transform.as_deref(), alternate, &tints[..n])
         }
     }
 }
 
+/// Map colorant tints through a Separation/DeviceN tint transform into its
+/// alternate space. A missing transform, an evaluation error or too few
+/// outputs falls back to `gray(1 − max tint)` (full ink = black).
+fn tint_to_rgb(
+    transform: Option<&zpdf_color::PdfFunction>,
+    alternate: &ResolvedColorSpace,
+    tints: &[f64],
+) -> [u8; 3] {
+    if let Some(out) = transform.and_then(|f| f.eval(tints)) {
+        if out.len() >= alternate.components() {
+            return float_components_to_rgb(alternate, &out);
+        }
+    }
+    let max_tint = tints
+        .iter()
+        .fold(0.0f64, |max, &tint| max.max(tint.clamp(0.0, 1.0)));
+    [unit_to_u8(1.0 - max_tint); 3]
+}
+
+/// Convert colour components in a space's natural ranges (0..=1 for device
+/// and ICC spaces, L*a*b* values for Lab) to RGB — the form tint-transform
+/// outputs and `/Matte` entries take. Special spaces cannot appear here
+/// (validation rejects them as alternates); they map to black.
+fn float_components_to_rgb(cs: &ResolvedColorSpace, vals: &[f64]) -> [u8; 3] {
+    let get = |i: usize| vals.get(i).copied().unwrap_or(0.0);
+    match cs {
+        ResolvedColorSpace::Gray => [unit_to_u8(get(0)); 3],
+        ResolvedColorSpace::Rgb => [unit_to_u8(get(0)), unit_to_u8(get(1)), unit_to_u8(get(2))],
+        ResolvedColorSpace::Cmyk => {
+            let (r, g, b) = zpdf_color::cmyk_to_rgb(get(0), get(1), get(2), get(3));
+            [unit_to_u8(r), unit_to_u8(g), unit_to_u8(b)]
+        }
+        ResolvedColorSpace::Lab { white_point, range } => {
+            let l = get(0).clamp(0.0, 100.0);
+            let a = get(1).clamp(range[0], range[1]);
+            let b = get(2).clamp(range[2], range[3]);
+            let (r, g, b) = zpdf_color::lab_to_rgb(l, a, b, *white_point);
+            [unit_to_u8(r), unit_to_u8(g), unit_to_u8(b)]
+        }
+        ResolvedColorSpace::Icc { transform, .. } => {
+            let (r, g, b) = transform.color_to_rgb(vals);
+            [unit_to_u8(r), unit_to_u8(g), unit_to_u8(b)]
+        }
+        ResolvedColorSpace::Indexed { .. } | ResolvedColorSpace::Tint { .. } => [0; 3],
+    }
+}
+
+/// `0.0..=1.0` → `0..=255`, rounding; NaN reads as 0.
+#[inline]
+fn unit_to_u8(value: f64) -> u8 {
+    (value.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
 fn build_indexed_rgb_palette(base: &ResolvedColorSpace, hival: u8, lookup: &[u8]) -> Vec<[u8; 3]> {
-    let n = base.components();
+    let n = base.components().min(MAX_COMPONENTS);
     (0..=hival)
         .map(|index| {
             let offset = index as usize * n;
-            let mut comps = [0u8; 4];
+            let mut comps = [0u8; MAX_COMPONENTS];
             for (component, value) in comps.iter_mut().take(n).enumerate() {
                 *value = lookup.get(offset + component).copied().unwrap_or(0);
             }
-            components_to_rgb(base, &comps)
+            components_to_rgb(base, &comps[..n])
         })
         .collect()
 }
@@ -2123,21 +2799,40 @@ mod tests {
 
     // ---- item 6: CMYK JPEG (Adobe APP14, inverted storage) ----
 
-    #[test]
-    fn cmyk_jpeg_decodes_to_cyan() {
-        // 8x8 pure-cyan CMYK JPEG written by Pillow (Adobe APP14, transform 0,
-        // inverted samples). The parser's filter pipeline runs zune-jpeg with
-        // default options; replicate that here and feed the output through the
-        // DCT image path.
-        let jpeg = include_bytes!("testdata/cmyk_cyan_8x8.jpg");
-        let mut decoder = zune_jpeg::JpegDecoder::new(std::io::Cursor::new(&jpeg[..]));
-        let decoded = decoder.decode().expect("zune-jpeg decode");
-
+    /// The 8x8 pure-cyan CMYK JPEG written by Pillow (Adobe APP14, transform
+    /// 0, Adobe-inverted samples) run through the parser's real DCTDecode
+    /// filter, plus the image dict Pillow's PDF writer pairs it with
+    /// (`/Decode [1 0 1 0 1 0 1 0]` undoes the inversion).
+    fn cmyk_cyan_jpeg() -> (Vec<u8>, PdfDict) {
         let mut dict = image_dict(8, 8, 8, Some("DeviceCMYK"));
         dict.insert(
             PdfName::new("Filter"),
             PdfObject::Name(PdfName::new("DCTDecode")),
         );
+        let jpeg = include_bytes!("testdata/cmyk_cyan_8x8.jpg");
+        let decoded = zpdf_parser::filters::decode_stream(jpeg, &dict).expect("DCTDecode");
+        dict.insert(PdfName::new("Decode"), int_array(&[1, 0, 1, 0, 1, 0, 1, 0]));
+        (decoded, dict)
+    }
+
+    fn to_u8(value: f64) -> u8 {
+        (value * 255.0).round() as u8
+    }
+
+    fn assert_near(actual: &[u8], expected: [u8; 3], tolerance: i16) {
+        for (a, e) in actual.iter().zip(expected) {
+            assert!(
+                (*a as i16 - e as i16).abs() <= tolerance,
+                "{actual:?} not within {tolerance} of {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cmyk_jpeg_decodes_to_cyan() {
+        let (decoded, dict) = cmyk_cyan_jpeg();
+        // The filter hands over raw CMYK, not zune's naïve RGB.
+        assert_eq!(decoded.len(), 8 * 8 * 4);
         let img = decode_image_xobject_resolved(
             &decoded,
             &dict,
@@ -2145,12 +2840,25 @@ mod tests {
             Some(ResolvedColorSpace::Cmyk),
         )
         .unwrap();
-        // Cyan ≈ (0, 255, 255), with JPEG-loss tolerance.
+        // 100 % cyan through the Adobe DeviceCMYK polynomial ≈ (0, 184, 242),
+        // not the naïve pure (0, 255, 255); JPEG loss allows a few levels.
+        let (r, g, b) = zpdf_color::cmyk_to_rgb(1.0, 0.0, 0.0, 0.0);
         let px = pixel(&img, 0);
-        assert!(px[0] < 60, "R too high: {px:?}");
-        assert!(px[1] > 180, "G too low: {px:?}");
-        assert!(px[2] > 180, "B too low: {px:?}");
+        assert_near(px, [to_u8(r), to_u8(g), to_u8(b)], 6);
         assert_eq!(px[3], 255);
+    }
+
+    #[test]
+    fn ycck_jpeg_cmyk_goes_through_the_cmyk_conversion() {
+        // A CMYK sample from a 4-component JPEG converts exactly like a raw
+        // DeviceCMYK sample (here the K-only near-black).
+        let mut dict = image_dict(1, 1, 8, Some("DeviceCMYK"));
+        dict.insert(
+            PdfName::new("Filter"),
+            PdfObject::Name(PdfName::new("DCTDecode")),
+        );
+        let img = decode_image_xobject(&[0, 0, 0, 255], &dict).unwrap();
+        assert_eq!(pixel(&img, 0), &[44, 46, 53, 255]);
     }
 
     // ---- ICCBased colour spaces (buffer-level CMS transforms) ----
@@ -2216,22 +2924,485 @@ mod tests {
     #[test]
     fn icc_cmyk_jpeg_applies_transform() {
         // Same CMYK JPEG as cmyk_jpeg_decodes_to_cyan, but resolved through
-        // the LUT profile: the DCT sniffer must keep the ICC space.
-        let jpeg = include_bytes!("testdata/cmyk_cyan_8x8.jpg");
-        let mut decoder = zune_jpeg::JpegDecoder::new(std::io::Cursor::new(&jpeg[..]));
-        let decoded = decoder.decode().expect("zune-jpeg decode");
+        // the LUT profile: the DCT sniffer must keep the ICC space, so the
+        // pixel is the profile's rendering of the JPEG's own CMYK sample (the
+        // old 3-byte zune output silently skipped the transform).
+        let (decoded, dict) = cmyk_cyan_jpeg();
+        let cs = icc_cs(include_bytes!("testdata/cmyk_lut.icc"));
+        let ResolvedColorSpace::Icc { transform, .. } = cs.clone() else {
+            unreachable!()
+        };
+        let sample: [u8; 4] = std::array::from_fn(|c| 255 - decoded[c]);
+        let expected = transform.comps8_to_rgb8(&sample);
+        let img = decode_image_xobject_resolved(&decoded, &dict, [0, 0, 0], Some(cs)).unwrap();
+        assert_eq!(&pixel(&img, 0)[..3], &expected);
+        // …which is the LUT profile's cyan, not the polynomial's.
+        assert_near(&transform.comps8_to_rgb8(&[255, 0, 0, 0]), expected, 6);
+    }
 
-        let mut dict = image_dict(8, 8, 8, Some("DeviceCMYK"));
+    // ---- Separation / DeviceN images ----
+
+    fn real_array(vals: &[f64]) -> PdfObject {
+        PdfObject::Array(vals.iter().map(|&v| PdfObject::Real(v)).collect())
+    }
+
+    /// FunctionType 2 dict `x → C0 + x·(C1 − C0)`.
+    fn exponential(c0: &[f64], c1: &[f64]) -> PdfObject {
+        let mut d = PdfDict::new();
+        d.insert(PdfName::new("FunctionType"), PdfObject::Integer(2));
+        d.insert(PdfName::new("Domain"), real_array(&[0.0, 1.0]));
+        d.insert(PdfName::new("C0"), real_array(c0));
+        d.insert(PdfName::new("C1"), real_array(c1));
+        d.insert(PdfName::new("N"), PdfObject::Real(1.0));
+        PdfObject::Dict(d)
+    }
+
+    fn parsed(function: &PdfObject) -> std::sync::Arc<zpdf_color::PdfFunction> {
+        std::sync::Arc::new(zpdf_color::PdfFunction::parse_object(function, &mut |_| None).unwrap())
+    }
+
+    /// `[/Separation /Black /DeviceCMYK {t → (0 0 0 t)}]`.
+    fn black_separation() -> ResolvedColorSpace {
+        ResolvedColorSpace::Tint {
+            n: 1,
+            transform: Some(parsed(&exponential(&[0.0; 4], &[0.0, 0.0, 0.0, 1.0]))),
+            alternate: Box::new(ResolvedColorSpace::Cmyk),
+        }
+    }
+
+    fn name(n: &str) -> PdfObject {
+        PdfObject::Name(PdfName::new(n))
+    }
+
+    #[test]
+    fn separation_image_maps_tints_through_the_alternate() {
+        // Tint 0 = no ink (white), tint 1 = full black ink — the reverse of
+        // reading the samples as DeviceGray.
+        let dict = image_dict(2, 1, 8, None);
+        let img =
+            decode_image_xobject_resolved(&[0, 255], &dict, [0, 0, 0], Some(black_separation()))
+                .unwrap();
+        assert_eq!(pixel(&img, 0), &[255, 255, 255, 255]);
+        assert_eq!(pixel(&img, 1), &[44, 46, 53, 255]);
+
+        // 1 bpc with the default /Decode [0 1]: bit 1 is full tint.
+        let dict = image_dict(2, 1, 1, None);
+        let img = decode_image_xobject_resolved(
+            &[0b0100_0000],
+            &dict,
+            [0, 0, 0],
+            Some(black_separation()),
+        )
+        .unwrap();
+        assert_eq!(pixel(&img, 0), &[255, 255, 255, 255]);
+        assert_eq!(pixel(&img, 1), &[44, 46, 53, 255]);
+
+        // /Decode [1 0] inverts the tint.
+        let mut dict = image_dict(1, 1, 8, None);
+        dict.insert(PdfName::new("Decode"), int_array(&[1, 0]));
+        let img = decode_image_xobject_resolved(&[255], &dict, [0, 0, 0], Some(black_separation()))
+            .unwrap();
+        assert_eq!(pixel(&img, 0), &[255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn inline_separation_without_resolution_keeps_polarity() {
+        // The dict-only inference path (no caller resolution): an inline
+        // type-2 tint transform is evaluated, and a missing one falls back to
+        // `gray(1 − tint)` rather than plain DeviceGray.
+        let mut dict = image_dict(2, 1, 8, None);
+        dict.insert(
+            PdfName::new("ColorSpace"),
+            PdfObject::Array(vec![
+                name("Separation"),
+                name("Black"),
+                name("DeviceCMYK"),
+                exponential(&[0.0; 4], &[0.0, 0.0, 0.0, 1.0]),
+            ]),
+        );
+        let img = decode_image_xobject(&[0, 255], &dict).unwrap();
+        assert_eq!(pixel(&img, 0), &[255, 255, 255, 255]);
+        assert_eq!(pixel(&img, 1), &[44, 46, 53, 255]);
+
+        dict.insert(
+            PdfName::new("ColorSpace"),
+            PdfObject::Array(vec![
+                name("Separation"),
+                name("Spot"),
+                name("DeviceGray"),
+                PdfObject::Null,
+            ]),
+        );
+        let img = decode_image_xobject(&[0, 255], &dict).unwrap();
+        assert_eq!(pixel(&img, 0), &[255, 255, 255, 255]);
+        assert_eq!(pixel(&img, 1), &[0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn devicen_image_is_sized_by_colorant_count() {
+        // [/DeviceN [/Cyan /Magenta] /DeviceCMYK {c m → (c m 0 0)}]: two
+        // components per pixel (the old gray fallback read one).
+        let mut f = PdfDict::new();
+        f.insert(PdfName::new("FunctionType"), PdfObject::Integer(4));
+        f.insert(PdfName::new("Domain"), real_array(&[0.0, 1.0, 0.0, 1.0]));
+        f.insert(PdfName::new("Range"), real_array(&[0.0, 1.0].repeat(4)));
+        let transform = zpdf_color::PdfFunction::parse(&f, Some(b"{ 0 0 }"), &mut |_| None)
+            .map(std::sync::Arc::new);
+        assert!(transform.is_some());
+        let cs = ResolvedColorSpace::Tint {
+            n: 2,
+            transform,
+            alternate: Box::new(ResolvedColorSpace::Cmyk),
+        };
+        let dict = image_dict(3, 1, 8, None);
+        let samples = [255, 0, 0, 255, 0, 0];
+        let img = decode_image_xobject_resolved(&samples, &dict, [0, 0, 0], Some(cs)).unwrap();
+        assert_eq!(&pixel(&img, 0)[..3], &cmyk_to_rgb(&[255, 0, 0, 0])); // cyan
+        assert_eq!(&pixel(&img, 1)[..3], &cmyk_to_rgb(&[0, 255, 0, 0])); // magenta
+        assert_eq!(pixel(&img, 2), &[255, 255, 255, 255]); // no ink
+    }
+
+    #[test]
+    fn tint_tables_and_caches_match_direct_conversion() {
+        // Large enough images take the 256-entry tint table (Separation) and
+        // the tuple cache (DeviceN, 6 colorants → wide keys); both must equal
+        // the per-pixel conversion small images use.
+        let separation = black_separation();
+        let samples: Vec<u8> = (0..512).map(|i| (i % 256) as u8).collect();
+        let dict = image_dict(512, 1, 8, None);
+        let img =
+            decode_image_xobject_resolved(&samples, &dict, [0, 0, 0], Some(separation.clone()))
+                .unwrap();
+        for (px, &s) in img.data.as_chunks::<4>().0.iter().zip(&samples) {
+            assert_eq!(px[..3], components_to_rgb(&separation, &[s]));
+        }
+
+        let mut f = PdfDict::new();
+        f.insert(PdfName::new("FunctionType"), PdfObject::Integer(4));
+        f.insert(PdfName::new("Domain"), real_array(&[0.0, 1.0].repeat(6)));
+        f.insert(PdfName::new("Range"), real_array(&[0.0, 1.0].repeat(4)));
+        // (c m y k s1 s2) → (c m y max(k, s1, s2)).
+        let program = b"{ 2 copy lt { exch } if pop 2 copy lt { exch } if pop }";
+        let devicen = ResolvedColorSpace::Tint {
+            n: 6,
+            transform: zpdf_color::PdfFunction::parse(&f, Some(program), &mut |_| None)
+                .map(std::sync::Arc::new),
+            alternate: Box::new(ResolvedColorSpace::Cmyk),
+        };
+        assert!(matches!(
+            &devicen,
+            ResolvedColorSpace::Tint {
+                transform: Some(_),
+                ..
+            }
+        ));
+        let (w, h) = (128usize, 64usize);
+        let samples: Vec<u8> = (0..w * h * 6).map(|i| (i * 7 % 13 * 19) as u8).collect();
+        let dict = image_dict(w as i64, h as i64, 8, None);
+        let img = decode_image_xobject_resolved(&samples, &dict, [0, 0, 0], Some(devicen.clone()))
+            .unwrap();
+        for (px, src) in img
+            .data
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(samples.as_chunks::<6>().0)
+        {
+            assert_eq!(px[..3], components_to_rgb(&devicen, src));
+        }
+    }
+
+    /// Type 4 `n`-in tint transform from a PostScript program.
+    fn calculator(
+        n: usize,
+        outputs: usize,
+        program: &[u8],
+    ) -> std::sync::Arc<zpdf_color::PdfFunction> {
+        let mut f = PdfDict::new();
+        f.insert(PdfName::new("FunctionType"), PdfObject::Integer(4));
+        f.insert(PdfName::new("Domain"), real_array(&[0.0, 1.0].repeat(n)));
+        f.insert(
+            PdfName::new("Range"),
+            real_array(&[0.0, 1.0].repeat(outputs)),
+        );
+        std::sync::Arc::new(
+            zpdf_color::PdfFunction::parse(&f, Some(program), &mut |_| None).unwrap(),
+        )
+    }
+
+    #[test]
+    fn noisy_devicen_image_bounds_tint_evaluations() {
+        // 65 536 distinct 3-colorant tuples exceed the exact-evaluation budget;
+        // the rest interpolates a sampled grid. The transform here is linear
+        // (t → 1 − t into RGB), so interpolation is exact up to rounding.
+        let cs = ResolvedColorSpace::Tint {
+            n: 3,
+            transform: Some(calculator(
+                3,
+                3,
+                b"{ 1 exch sub 3 1 roll 1 exch sub 3 1 roll 1 exch sub 3 1 roll }",
+            )),
+            alternate: Box::new(ResolvedColorSpace::Rgb),
+        };
+        let samples: Vec<u8> = (0..256usize * 256)
+            .flat_map(|i| {
+                let (x, y) = (i % 256, i / 256);
+                [x as u8, y as u8, (x + y) as u8]
+            })
+            .collect();
+        let dict = image_dict(256, 256, 8, None);
+        let img = decode_image_xobject_resolved(&samples, &dict, [0, 0, 0], Some(cs)).unwrap();
+        for (px, src) in img
+            .data
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(samples.as_chunks::<3>().0)
+        {
+            for (&got, &tint) in px[..3].iter().zip(src) {
+                assert!(
+                    (got as i16 - (255 - tint) as i16).abs() <= 1,
+                    "{px:?} for {src:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn two_colorant_tint_grid_is_exact() {
+        // 256 samples per axis: every 8-bit tuple is a grid point, so the
+        // past-budget path reproduces the exact conversion even for a
+        // non-linear transform.
+        let transform = calculator(2, 4, b"{ dup mul exch dup mul exch 0 0 }");
+        let grid = TintGrid::build(Some(&transform), &ResolvedColorSpace::Cmyk, 2).unwrap();
+        assert_eq!(grid.side, 256);
+        for comps in [[0u8, 0], [17, 200], [128, 128], [255, 3], [255, 255]] {
+            let tints = comps.map(|c| c as f64 / 255.0);
+            assert_eq!(
+                grid.lookup(&comps),
+                tint_to_rgb(Some(&transform), &ResolvedColorSpace::Cmyk, &tints)
+            );
+        }
+        assert!(TintGrid::build(None, &ResolvedColorSpace::Cmyk, 7).is_none());
+    }
+
+    #[test]
+    fn devicen_image_with_many_colorants_and_no_transform() {
+        // Six colorants exceed the old four-component scratch arrays; with no
+        // usable transform each pixel is gray(1 − max tint).
+        let cs = ResolvedColorSpace::Tint {
+            n: 6,
+            transform: None,
+            alternate: Box::new(ResolvedColorSpace::Cmyk),
+        };
+        let dict = image_dict(2, 1, 4, None);
+        // 4 bpc: pixel 0 all zero; pixel 1 has only the sixth colorant at 15.
+        let samples = [0x00, 0x00, 0x00, 0x00, 0x00, 0x0F];
+        let img = decode_image_xobject_resolved(&samples, &dict, [0, 0, 0], Some(cs)).unwrap();
+        assert_eq!(pixel(&img, 0), &[255, 255, 255, 255]);
+        assert_eq!(pixel(&img, 1), &[0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn indexed_image_with_separation_base() {
+        // Palette entries are tints: index 0 → no ink, index 1 → full ink.
+        let cs = ResolvedColorSpace::Indexed {
+            base: Box::new(black_separation()),
+            hival: 1,
+            lookup: vec![0, 255],
+        };
+        let dict = image_dict(2, 1, 8, None);
+        let img = decode_image_xobject_resolved(&[0, 1], &dict, [0, 0, 0], Some(cs)).unwrap();
+        assert_eq!(pixel(&img, 0), &[255, 255, 255, 255]);
+        assert_eq!(pixel(&img, 1), &[44, 46, 53, 255]);
+    }
+
+    #[test]
+    fn indexed_image_with_lab_base() {
+        // Lab palette bytes scale to L* 0..100 and a*/b* over the Range.
+        let cs = ResolvedColorSpace::Indexed {
+            base: Box::new(ResolvedColorSpace::Lab {
+                white_point: [0.9642, 1.0, 0.8249],
+                range: [-128.0, 127.0, -128.0, 127.0],
+            }),
+            hival: 1,
+            lookup: vec![0, 128, 128, 255, 128, 128],
+        };
+        let dict = image_dict(2, 1, 8, None);
+        let img = decode_image_xobject_resolved(&[0, 1], &dict, [0, 0, 0], Some(cs)).unwrap();
+        let (black, white) = (pixel(&img, 0), pixel(&img, 1));
+        assert!(black[..3].iter().all(|&v| v < 8), "{black:?}");
+        assert!(white[..3].iter().all(|&v| v > 247), "{white:?}");
+    }
+
+    #[test]
+    fn separation_gray_jpeg_keeps_the_tint_space() {
+        // A 1-component JPEG under a Separation space is a tint image, not
+        // DeviceGray.
+        let mut dict = image_dict(2, 1, 8, None);
         dict.insert(
             PdfName::new("Filter"),
             PdfObject::Name(PdfName::new("DCTDecode")),
         );
-        let cs = icc_cs(include_bytes!("testdata/cmyk_lut.icc"));
-        let img = decode_image_xobject_resolved(&decoded, &dict, [0, 0, 0], Some(cs)).unwrap();
-        let px = pixel(&img, 0);
-        assert!(px[0] < 60, "R too high: {px:?}");
-        assert!(px[1] > 180, "G too low: {px:?}");
-        assert!(px[2] > 180, "B too low: {px:?}");
+        let img =
+            decode_image_xobject_resolved(&[0, 255], &dict, [0, 0, 0], Some(black_separation()))
+                .unwrap();
+        assert_eq!(pixel(&img, 0), &[255, 255, 255, 255]);
+        assert_eq!(pixel(&img, 1), &[44, 46, 53, 255]);
+    }
+
+    #[test]
+    fn special_alternate_spaces_are_rejected() {
+        let cs = ResolvedColorSpace::Tint {
+            n: 1,
+            transform: None,
+            alternate: Box::new(black_separation()),
+        };
+        let dict = image_dict(1, 1, 8, None);
+        assert!(decode_image_xobject_resolved(&[0], &dict, [0, 0, 0], Some(cs)).is_err());
+    }
+
+    // ---- short data, DCT geometry, /BitsPerComponent ----
+
+    #[test]
+    fn short_raw_data_pads_missing_samples_with_zero() {
+        // 4x4 gray with 15 of 16 bytes: the last pixel reads sample 0.
+        let dict = image_dict(4, 4, 8, Some("DeviceGray"));
+        let img = decode_image_xobject(&[200; 15], &dict).unwrap();
+        assert_eq!(pixel(&img, 14), &[200, 200, 200, 255]);
+        assert_eq!(pixel(&img, 15), &[0, 0, 0, 255]);
+        // Sub-byte slow path too.
+        let dict = image_dict(8, 2, 1, Some("DeviceGray"));
+        let img = decode_image_xobject(&[0xFF], &dict).unwrap();
+        assert_eq!(pixel(&img, 7), &[255, 255, 255, 255]);
+        assert_eq!(pixel(&img, 8), &[0, 0, 0, 255]);
+        // Less than one row is still no image.
+        let dict = image_dict(4, 4, 8, Some("DeviceGray"));
+        assert!(decode_image_xobject(&[200; 3], &dict).is_err());
+    }
+
+    #[test]
+    fn short_icc_data_pads_missing_samples_with_zero() {
+        let cs = icc_cs(include_bytes!("testdata/gray_linear.icc"));
+        let dict = image_dict(2, 2, 8, None);
+        let img =
+            decode_image_xobject_resolved(&[255, 255, 255], &dict, [0, 0, 0], Some(cs)).unwrap();
+        assert_eq!(pixel(&img, 2), &[255, 255, 255, 255]);
+        assert_eq!(pixel(&img, 3), &[0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn dct_output_with_other_dimensions_adopts_them() {
+        // Dict says 4x4 RGB but the JPEG decoded to 4x5: keep the JPEG's rows.
+        let mut dict = image_dict(4, 4, 8, Some("DeviceRGB"));
+        dict.insert(
+            PdfName::new("Filter"),
+            PdfObject::Name(PdfName::new("DCTDecode")),
+        );
+        let img = decode_image_xobject(&[128; 60], &dict).unwrap();
+        assert_eq!((img.width, img.height), (4, 5));
+        assert_eq!(pixel(&img, 19), &[128, 128, 128, 255]);
+        // Width disagreement with a matching height.
+        let img = decode_image_xobject(&[64; 3 * 4 * 6], &dict).unwrap();
+        assert_eq!((img.width, img.height), (4, 6));
+        let mut tall = image_dict(3, 4, 8, Some("DeviceGray"));
+        tall.insert(
+            PdfName::new("Filter"),
+            PdfObject::Name(PdfName::new("DCTDecode")),
+        );
+        let img = decode_image_xobject(&[9; 5 * 4], &tall).unwrap();
+        assert_eq!((img.width, img.height), (5, 4));
+        // Data that fits no geometry still fails.
+        assert!(decode_image_xobject(&[1; 7], &dict).is_err());
+    }
+
+    #[test]
+    fn integral_real_bits_per_component_is_honored() {
+        let mut dict = image_dict(8, 1, 1, Some("DeviceGray"));
+        dict.insert(PdfName::new("BitsPerComponent"), PdfObject::Real(1.0));
+        let img = decode_image_xobject(&[0b1000_0000], &dict).unwrap();
+        assert_eq!(pixel(&img, 0), &[255, 255, 255, 255]);
+        assert_eq!(pixel(&img, 1), &[0, 0, 0, 255]);
+        dict.insert(PdfName::new("BitsPerComponent"), PdfObject::Real(1.5));
+        assert!(decode_image_xobject(&[0], &dict).is_err());
+    }
+
+    // ---- /SMask interplay ----
+
+    #[test]
+    fn smask_overrides_color_key_mask() {
+        let mut dict = image_dict(2, 1, 8, Some("DeviceGray"));
+        dict.insert(PdfName::new("Mask"), int_array(&[0, 0]));
+        dict.insert(
+            PdfName::new("SMask"),
+            PdfObject::Ref(zpdf_core::ObjectId(9, 0)),
+        );
+        let img = decode_image_xobject(&[0, 200], &dict).unwrap();
+        assert!(!img.has_alpha);
+        assert_eq!(pixel(&img, 0), &[0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn matte_soft_mask_unpremultiplies_preblended_colour() {
+        // Red pre-blended with a white matte at α = 0.5: c′ = 1 + 0.5·(c − 1)
+        // → (255, 128, 128). Un-premultiplied it is red again, then the fold
+        // premultiplies it to (128, 0, 0, 128).
+        let dict = image_dict(2, 1, 8, Some("DeviceRGB"));
+        let preblended = [255, 128, 128, 255, 128, 128];
+        let mask_dict = image_dict(2, 1, 8, Some("DeviceGray"));
+        let mask = decode_image_xobject(&[128, 0], &mask_dict).unwrap();
+        let mut smask_dict = mask_dict.clone();
+        smask_dict.insert(PdfName::new("Matte"), int_array(&[1, 1, 1]));
+        let matte = smask_matte(&smask_dict);
+        assert_eq!(matte.as_deref(), Some(&[1.0, 1.0, 1.0][..]));
+
+        let mut img = decode_image_xobject(&preblended, &dict).unwrap();
+        apply_smask_image_with_matte(
+            &mut img,
+            &mask,
+            matte.as_deref(),
+            Some(&ResolvedColorSpace::Rgb),
+        );
+        assert!(img.premultiplied);
+        // α is 128/255, not exactly ½, hence the 1-level slack.
+        assert_near(pixel(&img, 0), [128, 0, 0], 1);
+        assert_eq!(pixel(&img, 0)[3], 128);
+        assert_eq!(pixel(&img, 1), &[0, 0, 0, 0]); // α = 0 stays transparent
+
+        // A black matte (c′ = α·c), here with the colour space left out so the
+        // single component reads as DeviceGray.
+        let mut img = decode_image_xobject(&[128, 0, 64, 0, 0, 0], &dict).unwrap();
+        apply_smask_image_with_matte(&mut img, &mask, Some(&[0.0]), None);
+        assert_eq!(pixel(&img, 0), &[128, 0, 64, 128]);
+
+        // No /Matte: identical to apply_smask_image.
+        let mut plain = decode_image_xobject(&preblended, &dict).unwrap();
+        let mut reference = plain.clone();
+        apply_smask_image_with_matte(&mut plain, &mask, None, None);
+        apply_smask_image(&mut reference, &mask);
+        assert_eq!(plain.data, reference.data);
+    }
+
+    #[test]
+    fn lab_image_cache_matches_direct_conversion() {
+        // The Lab pixel cache must reproduce the uncached conversion exactly.
+        let cs = ResolvedColorSpace::Lab {
+            white_point: [0.9642, 1.0, 0.8249],
+            range: [-100.0, 100.0, -100.0, 100.0],
+        };
+        let samples: Vec<u8> = (0..3 * 64 * 64).map(|i| (i * 37 % 251) as u8).collect();
+        let dict = image_dict(64, 64, 8, None);
+        let img =
+            decode_image_xobject_resolved(&samples, &dict, [0, 0, 0], Some(cs.clone())).unwrap();
+        for (px, src) in img
+            .data
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(samples.as_chunks::<3>().0)
+        {
+            assert_eq!(px[..3], components_to_rgb(&cs, src));
+        }
     }
 
     // ---- ImageMask stencil (pre-existing behaviour) ----

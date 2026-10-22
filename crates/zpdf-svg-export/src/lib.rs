@@ -16,15 +16,17 @@
 //! soft-mask `/TR` transfer functions are ignored.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::rc::Rc;
 
 use image::ImageEncoder;
 use zpdf_display_list::{
     BlendMode, Color, DisplayList, FillRule, GlyphRun, ImageDraw, LineCap, LineJoin, Paint, Path,
     PathElement, RenderCommand, SoftMask, SoftMaskKind, StrokeStyle,
 };
-use zpdf_font::{FontCache, LoadedFont, OutlineCommand};
-use zpdf_image::{DecodedImage, ImageCache};
+use zpdf_font::{FontCache, FontId, GlyphOutline, LoadedFont, OutlineCommand};
+use zpdf_image::{DecodedImage, ImageCache, ImageId};
 
 /// Options for SVG export.
 #[derive(Debug, Clone)]
@@ -59,6 +61,13 @@ const MAX_COORD: f64 = 1.0e8;
 /// Soft masks nest through their own display lists; bound the recursion the
 /// same way the renderers bound blend-group depth.
 const MAX_MASK_DEPTH: u8 = 8;
+/// Outline commands kept by the per-export glyph outline cache. Past it,
+/// further glyphs are extracted on every use, as without the cache.
+const MAX_CACHED_OUTLINE_COMMANDS: usize = 512 * 1024;
+/// Display-list commands kept by the per-export Type 3 glyph cache.
+const MAX_CACHED_TYPE3_COMMANDS: usize = 256 * 1024;
+/// Decoded image bytes kept by the per-export Type 3 glyph cache.
+const MAX_CACHED_TYPE3_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Convert one page's display list to a standalone SVG document.
 ///
@@ -97,6 +106,13 @@ pub fn display_list_to_svg(
         warned_overprint: false,
         warned_knockout: false,
         warned_transfer: false,
+        image_defs: HashMap::new(),
+        mask_defs: HashMap::new(),
+        glyph_outlines: HashMap::new(),
+        glyph_outline_commands: 0,
+        type3_glyphs: HashMap::new(),
+        type3_glyph_commands: 0,
+        type3_glyph_image_bytes: 0,
     };
 
     writer
@@ -171,6 +187,54 @@ struct SvgWriter<'a> {
     warned_overprint: bool,
     warned_knockout: bool,
     warned_transfer: bool,
+    /// `<image>` defs already written (`None`: the image cannot be encoded).
+    /// Every later draw of the image is a `<use>` of its def, so a repeated
+    /// image is PNG-encoded and embedded once, not once per draw.
+    image_defs: HashMap<ImageDefKey, Option<u32>>,
+    /// Soft-mask defs already written. A soft mask the interpreter reuses
+    /// (one `gs` applied to many objects shares one mask list) is written
+    /// once and referenced by every group it masks.
+    mask_defs: HashMap<MaskDefKey, u32>,
+    /// Outlines of the page's glyphs, extracted once each
+    /// (`MAX_CACHED_OUTLINE_COMMANDS`).
+    glyph_outlines: HashMap<(FontId, u16), Option<Rc<GlyphOutline>>>,
+    glyph_outline_commands: usize,
+    /// Type 3 glyph programs, interpreted once each
+    /// (`MAX_CACHED_TYPE3_COMMANDS`, `MAX_CACHED_TYPE3_IMAGE_BYTES`).
+    type3_glyphs: HashMap<(FontId, u16), Option<Rc<Type3Glyph>>>,
+    type3_glyph_commands: usize,
+    type3_glyph_image_bytes: u64,
+}
+
+/// What an `<image>` def holds: a page image, or a Type 3 stencil glyph's
+/// image tinted with the text colour (RGBA bits).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum ImageDefKey {
+    Page(ImageId),
+    Type3Stencil {
+        font: FontId,
+        glyph: u16,
+        image: ImageId,
+        tint: [u32; 4],
+    },
+}
+
+/// Identity of a soft-mask def: the shared mask list plus the parameters
+/// written around it.
+#[derive(PartialEq, Eq, Hash)]
+struct MaskDefKey {
+    commands: *const DisplayList,
+    kind: SoftMaskKind,
+    offset: [u32; 2],
+    backdrop_luma: u32,
+}
+
+/// An interpreted Type 3 glyph procedure.
+struct Type3Glyph {
+    list: DisplayList,
+    /// Images the procedure draws (stencil glyphs), by the ids in `list`.
+    images: ImageCache,
+    font_matrix: [f64; 6],
 }
 
 impl SvgWriter<'_> {
@@ -473,7 +537,17 @@ impl SvgWriter<'_> {
         if mask.transfer.is_some() {
             self.warn_transfer();
         }
+        let key = MaskDefKey {
+            commands: std::sync::Arc::as_ptr(&mask.commands),
+            kind: mask.kind,
+            offset: [mask.offset.0.to_bits(), mask.offset.1.to_bits()],
+            backdrop_luma: mask.backdrop_luma.to_bits(),
+        };
+        if let Some(&id) = self.mask_defs.get(&key) {
+            return Some(id);
+        }
         let id = self.fresh_id();
+        self.mask_defs.insert(key, id);
         let _ = write!(self.out, "<mask id=\"m{id}\" maskUnits=\"userSpaceOnUse\"");
         if mask.kind == SoftMaskKind::Alpha {
             self.out.push_str(" style=\"mask-type:alpha\"");
@@ -551,7 +625,7 @@ impl SvgWriter<'_> {
         }
         let mut d = String::new();
         for glyph in &run.glyphs {
-            let Some(outline) = font.glyph_outline(glyph.glyph_id) else {
+            let Some(outline) = self.glyph_outline(run.font_id, font, glyph.glyph_id) else {
                 continue;
             };
             let off = (glyph.x, glyph.y);
@@ -638,22 +712,108 @@ impl SvgWriter<'_> {
         true
     }
 
-    /// Type3 glyphs: interpret the glyph's content stream (as the CPU backend
-    /// does) and emit its fill/stroke paths through the Type3 transform chain.
-    fn emit_type3_run(&mut self, run: &GlyphRun, font: &LoadedFont, color: &Color, opacity: f32) {
-        use zpdf_content::interpreter::ContentInterpreter;
+    /// Outline of `glyph_id` of `font` (cache id `font_id`), extracted once
+    /// per export while the cache has room.
+    fn glyph_outline(
+        &mut self,
+        font_id: FontId,
+        font: &LoadedFont,
+        glyph_id: u16,
+    ) -> Option<Rc<GlyphOutline>> {
+        if let Some(outline) = self.glyph_outlines.get(&(font_id, glyph_id)) {
+            return outline.clone();
+        }
+        let outline = font.glyph_outline(glyph_id).map(Rc::new);
+        let commands = outline.as_ref().map_or(1, |o| o.commands.len().max(1));
+        let total = self.glyph_outline_commands.saturating_add(commands);
+        if total <= MAX_CACHED_OUTLINE_COMMANDS {
+            self.glyph_outline_commands = total;
+            self.glyph_outlines
+                .insert((font_id, glyph_id), outline.clone());
+        }
+        outline
+    }
 
+    /// The interpreted procedure of Type 3 glyph `glyph_id` of `font` (cache
+    /// id `font_id`), interpreted once per export while the cache has room.
+    fn type3_glyph(
+        &mut self,
+        font_id: FontId,
+        font: &LoadedFont,
+        glyph_id: u16,
+    ) -> Option<Rc<Type3Glyph>> {
+        use zpdf_content::interpreter::ContentInterpreter;
+        if let Some(glyph) = self.type3_glyphs.get(&(font_id, glyph_id)) {
+            return glyph.clone();
+        }
+        let glyph = font
+            .type3_glyph_stream(glyph_id)
+            .map(|(stream, font_matrix)| {
+                let glyph_rect = zpdf_core::Rect::new(0.0, -1000.0, 1000.0, 1000.0);
+                let mut images = ImageCache::new();
+                let mut interp = ContentInterpreter::new(glyph_rect).with_images(&mut images);
+                if let Some(deadline) = self.deadline {
+                    interp = interp.with_deadline(deadline);
+                }
+                let list = interp.interpret(stream);
+                Rc::new(Type3Glyph {
+                    list,
+                    images,
+                    font_matrix,
+                })
+            });
+        let (commands, image_bytes) = glyph.as_ref().map_or((1, 0), |g| {
+            (g.list.commands.len().max(1), g.images.bytes_used())
+        });
+        let total_commands = self.type3_glyph_commands.saturating_add(commands);
+        let total_image_bytes = self.type3_glyph_image_bytes.saturating_add(image_bytes);
+        if total_commands <= MAX_CACHED_TYPE3_COMMANDS
+            && total_image_bytes <= MAX_CACHED_TYPE3_IMAGE_BYTES
+        {
+            self.type3_glyph_commands = total_commands;
+            self.type3_glyph_image_bytes = total_image_bytes;
+            self.type3_glyphs.insert((font_id, glyph_id), glyph.clone());
+        }
+        glyph
+    }
+
+    /// Type3 glyphs: interpret the glyph's content stream (as the CPU backend
+    /// does) and emit its fills, strokes and images through the Type3
+    /// transform chain.
+    fn emit_type3_run(&mut self, run: &GlyphRun, font: &LoadedFont, color: &Color, opacity: f32) {
         for glyph in &run.glyphs {
             if self.check_over_budget() {
                 break;
             }
-            let Some((stream, font_matrix)) = font.type3_glyph_stream(glyph.glyph_id) else {
+            let Some(program) = self.type3_glyph(run.font_id, font, glyph.glyph_id) else {
                 continue;
             };
-            let glyph_rect = zpdf_core::Rect::new(0.0, -1000.0, 1000.0, 1000.0);
-            let glyph_dl = ContentInterpreter::new(glyph_rect).interpret(stream);
+            let font_matrix = program.font_matrix;
+            // Glyph space → page space (SVG units are page points).
+            let glyph_to_page = run
+                .transform
+                .concat(&zpdf_core::Matrix::translate(glyph.x as f64, 0.0))
+                .concat(&zpdf_core::Matrix::scale(
+                    run.font_size as f64 * run.h_scale as f64,
+                    run.font_size as f64,
+                ))
+                .concat(&zpdf_core::Matrix::new(
+                    font_matrix[0],
+                    font_matrix[1],
+                    font_matrix[2],
+                    font_matrix[3],
+                    font_matrix[4],
+                    font_matrix[5],
+                ));
+            // Stroke widths are in glyph space; scale them by the whole
+            // glyph-to-page transform (its mean axis scale), as the CPU
+            // backend does.
+            let stroke_scale = (glyph_to_page.a * glyph_to_page.d
+                - glyph_to_page.b * glyph_to_page.c)
+                .abs()
+                .sqrt();
 
-            for cmd in &glyph_dl.commands {
+            for cmd in &program.list.commands {
                 match cmd {
                     RenderCommand::FillPath { path, rule, .. } => {
                         let Some(d) = self.type3_path_data(path, &font_matrix, run, glyph.x) else {
@@ -676,11 +836,10 @@ impl SvgWriter<'_> {
                         let Some(d) = self.type3_path_data(path, &font_matrix, run, glyph.x) else {
                             continue;
                         };
-                        // Stroke width scales from glyph space through the
-                        // FontMatrix and font size (page units at scale 1).
-                        let width =
-                            (style.width as f64 * font_matrix[0].abs() * run.font_size as f64)
-                                .max(0.05);
+                        let width = (style.width as f64 * stroke_scale).max(0.05);
+                        if !width.is_finite() {
+                            continue;
+                        }
                         self.out.push_str("<path d=\"");
                         self.out.push_str(&d);
                         self.out.push_str("\" fill=\"none\" stroke=\"");
@@ -692,6 +851,39 @@ impl SvgWriter<'_> {
                         let placement = self.placement_attrs();
                         self.out.push_str(&placement);
                         self.out.push_str("/>\n");
+                    }
+                    RenderCommand::DrawImage(draw) => {
+                        let Some(image) = program.images.get(draw.image_id) else {
+                            continue;
+                        };
+                        let transform = glyph_to_page.concat(&draw.transform);
+                        let alpha = if draw.alpha.is_finite() {
+                            draw.alpha.clamp(0.0, 1.0)
+                        } else {
+                            0.0
+                        };
+                        if draw.is_image_mask {
+                            // The glyph interpreter paints stencils in its
+                            // default black; the text colour is the paint.
+                            let tint = [color.r, color.g, color.b, color.a].map(f32::to_bits);
+                            let key = ImageDefKey::Type3Stencil {
+                                font: run.font_id,
+                                glyph: glyph.glyph_id,
+                                image: draw.image_id,
+                                tint,
+                            };
+                            self.place_image(key, image, Some(color), &transform, alpha * opacity);
+                        } else {
+                            // A coloured (`d0`) glyph's image keeps its own
+                            // colours; cache it per glyph like a stencil.
+                            let key = ImageDefKey::Type3Stencil {
+                                font: run.font_id,
+                                glyph: glyph.glyph_id,
+                                image: draw.image_id,
+                                tint: [u32::MAX; 4],
+                            };
+                            self.place_image(key, image, None, &transform, alpha * opacity);
+                        }
                     }
                     _ => {}
                 }
@@ -740,18 +932,36 @@ impl SvgWriter<'_> {
             );
             return;
         };
-        let Some(png) = encode_png(image) else {
-            tracing::warn!(image_id = draw.image_id, "skipping unencodable image");
-            return;
-        };
+        self.place_image(
+            ImageDefKey::Page(draw.image_id),
+            image,
+            None,
+            &draw.transform,
+            alpha,
+        );
+    }
 
+    /// Draw `image` (the def `key`, written on first use) over the unit square
+    /// mapped by the page-space `transform`. A `tint` recolours a stencil's
+    /// opaque samples.
+    fn place_image(
+        &mut self,
+        key: ImageDefKey,
+        image: &DecodedImage,
+        tint: Option<&Color>,
+        transform: &zpdf_core::Matrix,
+        alpha: f32,
+    ) {
+        if alpha <= 0.0 {
+            return;
+        }
         // PDF images occupy the unit square mapped by the CTM, with sample row
         // 0 at the TOP edge (v = 1); composing with the fixed page flip at
         // scale 1 gives, for image pixel (ix, iy):
         //   svg_x = (a/iw)·ix + (-c/ih)·iy + (c + e - x0)
         //   svg_y = (-b/iw)·ix + (d/ih)·iy + (y1 - d - f)
         // — the same affine as the CPU backend's `render_image`.
-        let tm = &draw.transform;
+        let tm = transform;
         let iw = image.width as f64;
         let ih = image.height as f64;
         let m = [
@@ -763,28 +973,52 @@ impl SvgWriter<'_> {
             self.y1 - tm.d - tm.f,
         ];
         if m.iter().any(|v| !v.is_finite() || v.abs() > MAX_COORD) {
-            tracing::warn!(
-                image_id = draw.image_id,
-                "skipping image with corrupt transform"
-            );
+            tracing::warn!("skipping image with corrupt transform");
             return;
         }
 
-        // The image's own `transform` redefines its user space, and `clip-path`
-        // on an element resolves in that (post-transform) space — so the active
-        // clip must go on a plain wrapper `<g>` instead. A wrapper around a
-        // single Normal-blended leaf cannot change compositing (the isolation
-        // a clipped group introduces only matters for blend modes crossing it).
+        let id = match self.image_defs.get(&key) {
+            Some(id) => *id,
+            None => {
+                let png = match tint {
+                    Some(color) => encode_png(&tinted(image, color)),
+                    None => encode_png(image),
+                };
+                let id = png.map(|png| {
+                    let id = self.fresh_id();
+                    let _ = write!(
+                        self.out,
+                        "<defs><image id=\"i{id}\" width=\"{}\" height=\"{}\" \
+                         preserveAspectRatio=\"none\" href=\"data:image/png;base64,",
+                        image.width, image.height
+                    );
+                    push_base64(&mut self.out, &png);
+                    self.out.push_str("\"/></defs>\n");
+                    id
+                });
+                if id.is_none() {
+                    tracing::warn!("skipping unencodable image");
+                }
+                self.image_defs.insert(key, id);
+                id
+            }
+        };
+        let Some(id) = id else {
+            return;
+        };
+
+        // The `<use>`'s own `transform` redefines its user space, and
+        // `clip-path` on an element resolves in that (post-transform) space —
+        // so the active clip must go on a plain wrapper `<g>` instead. A
+        // wrapper around a single Normal-blended leaf cannot change
+        // compositing (the isolation a clipped group introduces only matters
+        // for blend modes crossing it).
         let placement = self.placement_attrs();
         let wrapped = !placement.is_empty();
         if wrapped {
             let _ = write!(self.out, "<g{placement}>");
         }
-        let _ = write!(
-            self.out,
-            "<image width=\"{}\" height=\"{}\" preserveAspectRatio=\"none\" transform=\"matrix(",
-            image.width, image.height
-        );
+        let _ = write!(self.out, "<use href=\"#i{id}\" transform=\"matrix(");
         for (i, v) in m.iter().enumerate() {
             if i > 0 {
                 self.out.push(' ');
@@ -793,9 +1027,7 @@ impl SvgWriter<'_> {
         }
         self.out.push_str(")\"");
         push_opacity(&mut self.out, "opacity", alpha);
-        self.out.push_str(" href=\"data:image/png;base64,");
-        push_base64(&mut self.out, &png);
-        self.out.push_str("\"/>");
+        self.out.push_str("/>");
         if wrapped {
             self.out.push_str("</g>");
         }
@@ -993,6 +1225,21 @@ fn push_stroke_attrs(out: &mut String, style: &StrokeStyle) {
 /// PNG-encode a decoded RGBA image, un-premultiplying alpha first when needed
 /// (PNG stores straight alpha; `DecodedImage` is premultiplied once a soft
 /// mask or stencil has been folded in).
+/// A stencil image recoloured with `color`: its coverage (alpha) is kept and
+/// its colour replaced, as the CPU backend paints Type 3 stencil glyphs.
+fn tinted(image: &DecodedImage, color: &Color) -> DecodedImage {
+    let mut out = image.clone();
+    let rgb = [color.r, color.g, color.b].map(|c| c.clamp(0.0, 1.0));
+    for px in out.data.as_chunks_mut::<4>().0 {
+        let a = px[3] as f32 / 255.0;
+        let scale = if out.premultiplied { a } else { 1.0 };
+        for (dst, c) in px[..3].iter_mut().zip(rgb) {
+            *dst = (c * scale * 255.0).round() as u8;
+        }
+    }
+    out
+}
+
 fn encode_png(image: &DecodedImage) -> Option<Vec<u8>> {
     let expected = (image.width as usize)
         .checked_mul(image.height as usize)?

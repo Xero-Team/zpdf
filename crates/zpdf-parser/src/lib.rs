@@ -44,7 +44,9 @@ pub struct PdfFile {
     /// Cache of resolved top-level indirect objects, keyed by ObjectId.
     /// `RefCell` suffices: `PdfFile` is never shared across threads in this
     /// workspace (swap to `Mutex` if that ever changes).
-    object_cache: RefCell<HashMap<ObjectId, PdfObject>>,
+    /// Entries are shared so [`Self::resolve_shared`] can hand them out
+    /// without cloning.
+    object_cache: RefCell<HashMap<ObjectId, Arc<PdfObject>>>,
     /// Estimated retained bytes in `object_cache`. Cache admission stops at the
     /// caller's limit; resolution still succeeds without retaining the object.
     object_cache_bytes: Cell<u64>,
@@ -53,6 +55,9 @@ pub struct PdfFile {
     objstm_cache: RefCell<HashMap<u32, Arc<DecodedObjStm>>>,
     /// Retained decoded-object-stream bytes, including parsed header entries.
     objstm_cache_bytes: Cell<u64>,
+    /// Object streams that failed to decode, so the members of a broken one
+    /// do not each inflate it again.
+    objstm_failed: RefCell<std::collections::HashSet<u32>>,
     /// Lazily-built repair table: populated at most once by a full-file object
     /// scan, the first time an xref offset turns out to hold the wrong object
     /// (or no parseable object at all). The inner `None` means the scan itself
@@ -134,6 +139,7 @@ impl PdfFile {
             object_cache_bytes: Cell::new(0),
             objstm_cache: RefCell::new(HashMap::new()),
             objstm_cache_bytes: Cell::new(0),
+            objstm_failed: RefCell::new(Default::default()),
             repair_table: OnceCell::new(),
         };
         // Build the decryptor *after* construction so it can use `resolve` to
@@ -208,6 +214,21 @@ impl PdfFile {
         self.resolve_depth(id, 0)
     }
 
+    /// Like [`Self::resolve`], but shares a cached object instead of cloning
+    /// it — for callers that only read a large object, such as a page-tree
+    /// node's `/Kids`, once per page.
+    pub fn resolve_shared(&self, id: zpdf_core::ObjectId) -> Result<Arc<PdfObject>> {
+        if let Some(obj) = self.object_cache.borrow().get(&id) {
+            return Ok(Arc::clone(obj));
+        }
+        let obj = self.resolve_depth(id, 0)?;
+        // `resolve_depth` cached it unless the cache budget is spent.
+        if let Some(cached) = self.object_cache.borrow().get(&id) {
+            return Ok(Arc::clone(cached));
+        }
+        Ok(Arc::new(obj))
+    }
+
     fn resolve_depth(&self, id: ObjectId, depth: u32) -> Result<PdfObject> {
         /// Maximum length of a ref-to-ref chain (`1 0 obj 2 0 R endobj` ...)
         /// followed before the reference is treated as null. Guards against
@@ -222,7 +243,7 @@ impl PdfFile {
 
         // Fast path: already resolved. The borrow ends with this block.
         if let Some(obj) = self.object_cache.borrow().get(&id) {
-            return Ok(obj.clone());
+            return Ok(PdfObject::clone(obj));
         }
 
         // ISO 32000-1, 7.3.10: a reference to an object that is missing from
@@ -238,7 +259,15 @@ impl PdfFile {
             Some(XrefEntry::Compressed {
                 stream_obj,
                 index_in_stream,
-            }) => self.extract_from_object_stream(*stream_obj, *index_in_stream)?,
+            }) => match self.extract_from_object_stream(*stream_obj, *index_in_stream, id) {
+                Ok(obj) => obj,
+                // A damaged container or a wrong entry: the object may still
+                // exist elsewhere in the file.
+                Err(e) => self.repaired_object(id).ok_or(e)?,
+            },
+            // Deleted by an incremental update: the stale bytes the repair
+            // scan would find are exactly what the update removed.
+            None if self.xref.is_superseded(id) => PdfObject::Null,
             Some(XrefEntry::Free { .. }) => match self.repaired_object(id) {
                 Some(obj) => obj,
                 None => {
@@ -278,7 +307,9 @@ impl PdfFile {
         if cost > self.limits.max_object_cache_bytes.saturating_sub(used) {
             return;
         }
-        self.object_cache.borrow_mut().insert(id, obj.clone());
+        self.object_cache
+            .borrow_mut()
+            .insert(id, Arc::new(obj.clone()));
         self.object_cache_bytes.set(used.saturating_add(cost));
     }
 
@@ -287,7 +318,9 @@ impl PdfFile {
     /// parse failure, consult the lazily-built repair table (full-file object
     /// scan, run at most once) before giving up.
     fn parse_at_offset_checked(&self, offset: u64, id: ObjectId) -> Result<PdfObject> {
-        let parser = ObjectParser::new(&self.data, &self.limits);
+        let resolve_length = |id| self.indirect_length(id);
+        let parser =
+            ObjectParser::new(&self.data, &self.limits).with_length_resolver(&resolve_length);
         let file_offset = usize::try_from(offset).map_err(|_| {
             zpdf_core::Error::InvalidObject(offset, "xref offset exceeds address space".into())
         })?;
@@ -322,6 +355,25 @@ impl PdfFile {
         }
     }
 
+    /// The integer value of object `id`, for an indirect stream `/Length`:
+    /// from the object cache, or parsed straight from its xref offset. A
+    /// compressed or non-integer object yields `None` (the caller then scans
+    /// for `endstream`): decoding an object stream here could recurse through
+    /// that stream's own `/Length`.
+    fn indirect_length(&self, id: ObjectId) -> Option<i64> {
+        if let Some(obj) = self.object_cache.borrow().get(&id) {
+            return obj.as_i64().ok();
+        }
+        let Some(XrefEntry::InUse { offset, .. }) = self.xref.get(id) else {
+            return None;
+        };
+        let offset = usize::try_from(*offset).ok()?;
+        match ObjectParser::new(&self.data, &self.limits).parse_indirect_with_id(offset) {
+            Ok((pid, PdfObject::Integer(n))) if pid == id => Some(n),
+            _ => None,
+        }
+    }
+
     /// Look up `id` in the repair table, building the table on first use by
     /// running tail-scan recovery over the whole file (memoized; the scan runs
     /// at most once per `PdfFile`). Returns `None` if the scan failed, the id
@@ -330,8 +382,8 @@ impl PdfFile {
         let table = self
             .repair_table
             .get_or_init(
-                || match recovery::scan_all_objects(&self.data, &self.limits) {
-                    Ok((table, _trailer)) => Some(table),
+                || match recovery::scan_object_table(&self.data, &self.limits) {
+                    Ok(table) => Some(table),
                     Err(e) => {
                         tracing::warn!("repair object scan failed: {e}");
                         None
@@ -356,7 +408,7 @@ impl PdfFile {
                 stream_obj,
                 index_in_stream,
             } => self
-                .extract_from_object_stream(*stream_obj, *index_in_stream)
+                .extract_from_object_stream(*stream_obj, *index_in_stream, id)
                 .ok(),
             XrefEntry::Free { .. } => None,
         }
@@ -462,23 +514,38 @@ impl PdfFile {
     }
 
     /// Extract an object from a compressed object stream (/Type /ObjStm).
+    /// Extract object `id`, listed at `index_in_stream` of object stream
+    /// `stream_obj_num`. A member at that index with another object number
+    /// means a wrong xref entry; the header is then searched for `id` instead
+    /// of returning an unrelated object (the listed index still serves a
+    /// header whose numbers are wrong).
     fn extract_from_object_stream(
         &self,
         stream_obj_num: u32,
         index_in_stream: u32,
+        id: ObjectId,
     ) -> Result<PdfObject> {
         let objstm = self.get_or_decode_objstm(stream_obj_num)?;
 
-        let idx = index_in_stream as usize;
-        if idx >= objstm.entries.len() {
-            return Err(zpdf_core::Error::InvalidObject(
-                0,
-                format!(
-                    "object stream index {idx} out of range (n={})",
-                    objstm.entries.len()
-                ),
-            ));
-        }
+        let listed = index_in_stream as usize;
+        let idx = match objstm.entries.get(listed) {
+            Some(&(num, _)) if num == id.0 => listed,
+            _ => objstm
+                .entries
+                .iter()
+                .position(|&(num, _)| num == id.0)
+                .or((listed < objstm.entries.len()).then_some(listed))
+                .ok_or_else(|| {
+                    zpdf_core::Error::InvalidObject(
+                        0,
+                        format!(
+                            "object stream {stream_obj_num} has no object {} (index {listed}, n={})",
+                            id.0,
+                            objstm.entries.len()
+                        ),
+                    )
+                })?,
+        };
 
         let (_, obj_offset) = objstm.entries[idx];
         let oob = || {
@@ -518,7 +585,19 @@ impl PdfFile {
         if let Some(hit) = self.objstm_cache.borrow().get(&stream_obj_num) {
             return Ok(Arc::clone(hit));
         }
+        if self.objstm_failed.borrow().contains(&stream_obj_num) {
+            return Err(zpdf_core::Error::StreamDecode(format!(
+                "object stream {stream_obj_num} failed to decode"
+            )));
+        }
+        let decoded = self.decode_objstm(stream_obj_num);
+        if decoded.is_err() {
+            self.objstm_failed.borrow_mut().insert(stream_obj_num);
+        }
+        decoded
+    }
 
+    fn decode_objstm(&self, stream_obj_num: u32) -> Result<Arc<DecodedObjStm>> {
         let stream_id = zpdf_core::ObjectId(stream_obj_num, 0);
         let stream_entry = self
             .xref
@@ -526,7 +605,9 @@ impl PdfFile {
             .ok_or(zpdf_core::Error::ObjectNotFound(stream_id))?;
         let stream_obj = match stream_entry {
             XrefEntry::InUse { offset, .. } => {
-                let parser = ObjectParser::new(&self.data, &self.limits);
+                let resolve_length = |id| self.indirect_length(id);
+                let parser = ObjectParser::new(&self.data, &self.limits)
+                    .with_length_resolver(&resolve_length);
                 let file_offset = usize::try_from(*offset).map_err(|_| {
                     zpdf_core::Error::InvalidObject(
                         *offset,
@@ -568,17 +649,32 @@ impl PdfFile {
         // bounded by the header length to avoid a huge allocation on a bogus /N.
         let header = &decoded[..first.min(decoded.len())];
         let mut header_lexer = Lexer::new(header, 0, &self.limits);
+        // A malformed pair (or a /N larger than the pairs present, a common
+        // writer off-by-one) ends the header; the members before it stay usable.
         let mut entries = Vec::with_capacity(n.min(header.len()));
         for _ in 0..n {
-            let obj_num_tok = header_lexer.next_token()?;
-            let offset_tok = header_lexer.next_token()?;
-            let obj_num = u32::try_from(obj_num_tok.as_i64()?).map_err(|_| {
-                zpdf_core::Error::StreamDecode("ObjStm: object number out of range".into())
-            })?;
-            let offset = usize::try_from(offset_tok.as_i64()?).map_err(|_| {
-                zpdf_core::Error::StreamDecode("ObjStm: member offset out of range".into())
-            })?;
+            let pair = (header_lexer.next_token(), header_lexer.next_token());
+            let (Ok(obj_num_tok), Ok(offset_tok)) = pair else {
+                break;
+            };
+            let num = obj_num_tok
+                .as_i64()
+                .ok()
+                .and_then(|n| u32::try_from(n).ok());
+            let offset = offset_tok
+                .as_i64()
+                .ok()
+                .and_then(|o| usize::try_from(o).ok());
+            let (Some(obj_num), Some(offset)) = (num, offset) else {
+                break;
+            };
             entries.push((obj_num, offset));
+        }
+        if entries.len() < n {
+            tracing::warn!(
+                "object stream {stream_obj_num}: header lists {} of /N {n} members",
+                entries.len()
+            );
         }
 
         let decoded_arc = Arc::new(DecodedObjStm {
@@ -612,8 +708,8 @@ impl PdfFile {
     pub fn force_repair_scan(&self) -> Option<&XrefTable> {
         self.repair_table
             .get_or_init(
-                || match recovery::scan_all_objects(&self.data, &self.limits) {
-                    Ok((table, _trailer)) => Some(table),
+                || match recovery::scan_object_table(&self.data, &self.limits) {
+                    Ok(table) => Some(table),
                     Err(e) => {
                         tracing::warn!("repair object scan failed: {e}");
                         None
@@ -815,6 +911,118 @@ mod tests {
                 .as_bytes(),
         );
         d
+    }
+
+    #[test]
+    fn an_object_freed_by_an_incremental_update_resolves_to_null() {
+        // The original section has `5 0 n`; the update frees it as `5 1 f`.
+        let mut d = b"%PDF-1.4\n".to_vec();
+        let o1 = d.len();
+        d.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+        let o5 = d.len();
+        d.extend_from_slice(b"5 0 obj\n<< /Deleted true >>\nendobj\n");
+        let x1 = d.len();
+        d.extend_from_slice(
+            format!(
+                "xref\n0 2\n0000000000 65535 f \n{o1:010} 00000 n \n5 1\n{o5:010} 00000 n \n\
+                 trailer\n<< /Size 6 /Root 1 0 R >>\n"
+            )
+            .as_bytes(),
+        );
+        let x2 = d.len();
+        d.extend_from_slice(
+            format!(
+                "xref\n0 1\n0000000005 65535 f \n5 1\n0000000000 00001 f \n\
+                 trailer\n<< /Size 6 /Root 1 0 R /Prev {x1} >>\nstartxref\n{x2}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        let file = PdfFile::parse(d).unwrap();
+        assert_eq!(file.resolve(ObjectId(5, 0)).unwrap(), PdfObject::Null);
+        assert_eq!(
+            file.resolve(ObjectId(1, 0))
+                .unwrap()
+                .as_dict()
+                .unwrap()
+                .get_name("Type")
+                .unwrap(),
+            "Catalog"
+        );
+    }
+
+    #[test]
+    fn object_stream_members_survive_an_overstated_n() {
+        // /N 3 but two header pairs; members 6 and 7 at indices 0 and 1.
+        let dec = b"6 0 7 3 42 43";
+        let mut d = b"%PDF-1.5\n".to_vec();
+        let o1 = d.len();
+        d.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+        let o5 = d.len();
+        d.extend_from_slice(
+            format!(
+                "5 0 obj\n<< /Type /ObjStm /N 3 /First 8 /Length {} >>\nstream\n",
+                dec.len()
+            )
+            .as_bytes(),
+        );
+        d.extend_from_slice(dec);
+        d.extend_from_slice(b"\nendstream\nendobj\n");
+        let mut xref = Vec::new();
+        for (kind, field2, field3) in [
+            (1u8, o1 as u32, 0u8),
+            (1, o5 as u32, 0),
+            (2, 5, 0),
+            (2, 5, 1),
+        ] {
+            xref.push(kind);
+            xref.extend_from_slice(&field2.to_be_bytes());
+            xref.push(field3);
+        }
+        let xo = d.len();
+        d.extend_from_slice(
+            format!(
+                "9 0 obj\n<< /Type /XRef /Size 10 /W [1 4 1] /Index [1 1 5 3] /Root 1 0 R \
+                 /Length {} >>\nstream\n",
+                xref.len()
+            )
+            .as_bytes(),
+        );
+        d.extend_from_slice(&xref);
+        d.extend_from_slice(format!("\nendstream\nendobj\nstartxref\n{xo}\n%%EOF\n").as_bytes());
+        let file = PdfFile::parse(d).unwrap();
+        assert_eq!(
+            file.resolve(ObjectId(6, 0)).unwrap(),
+            PdfObject::Integer(42)
+        );
+        assert_eq!(
+            file.resolve(ObjectId(7, 0)).unwrap(),
+            PdfObject::Integer(43)
+        );
+    }
+
+    #[test]
+    fn resolve_shared_hands_out_the_cached_object() {
+        let pdf = build_pdf(&[(1, "<< /Type /Catalog /Kids [1 0 R 1 0 R] >>")], 1);
+        let file = PdfFile::parse(pdf).unwrap();
+        let a = file.resolve_shared(ObjectId(1, 0)).unwrap();
+        let b = file.resolve_shared(ObjectId(1, 0)).unwrap();
+        assert!(Arc::ptr_eq(&a, &b));
+        assert_eq!(*a, file.resolve(ObjectId(1, 0)).unwrap());
+    }
+
+    #[test]
+    fn indirect_stream_length_is_resolved() {
+        let pdf = build_pdf(
+            &[
+                (1, "<< /Type /Catalog >>"),
+                (2, "<< /Length 3 0 R >>\nstream\nABC\r\nendstream"),
+                (3, "4"),
+            ],
+            1,
+        );
+        let file = PdfFile::parse(pdf).unwrap();
+        let obj = file.resolve(ObjectId(2, 0)).unwrap();
+        assert_eq!(&*obj.as_stream().unwrap().data, b"ABC\r");
     }
 
     #[test]

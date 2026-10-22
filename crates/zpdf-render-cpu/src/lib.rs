@@ -46,11 +46,25 @@ pub struct CpuRenderer<'a> {
     /// allocate/zero gigabytes of mask memory and hang. Past the budget, further
     /// clips are skipped (the page renders complete but slightly over-painted).
     clip_pixel_spent: u64,
-    /// Bytes retained by the active clip plus saved masks on the clip stack.
+    /// Bytes retained by clip masks: the active one, those saved on the clip
+    /// stack and the zeroed ones in `mask_pool`.
     clip_mask_bytes: u64,
+    /// Zeroed page-sized clip masks left by popped clips. A popped mask is
+    /// cleared over its own `clip_bounds` — the only pixels it can be non-zero
+    /// in — so the next clip reuses it instead of allocating and zeroing a full
+    /// raster.
+    mask_pool: Vec<tiny_skia::Mask>,
     blend_stack: Vec<BlendEntry>,
     /// Bytes retained by the live page/group pixmap plus parked blend parents.
     blend_surface_bytes: u64,
+    /// Transparent page-sized surfaces left by finished blend groups and
+    /// overprint/knockout scratch passes, cleared over their painted region
+    /// (see [`PaintedBounds`]). Reusing one replaces a full-raster allocation
+    /// per group — pages wrap every element in its own blend group.
+    surface_pool: Vec<tiny_skia::Pixmap>,
+    /// Bytes of `surface_pool`. They count against [`MAX_BLEND_SURFACE_BYTES`]
+    /// beside `blend_surface_bytes`, and are released when room is needed.
+    pooled_surface_bytes: u64,
     /// Blend pushes skipped after reaching a configured depth limit or the
     /// render deadline. Keeping a separate depth lets matching pops unwind
     /// without accidentally popping a real outer group.
@@ -78,6 +92,21 @@ pub struct CpuRenderer<'a> {
     /// Box-filtered image variants reused by repeated draws at the same device
     /// footprint (common for patterns and repeated XObjects).
     downscaled_images: HashMap<(ImageId, u32, u32), Arc<[u8]>>,
+    /// Outlines extracted from font programs this page, by font and glyph id
+    /// (`None` for a glyph without one), so a glyph drawn many times is parsed
+    /// once. Cleared per page: font ids are only stable within one font cache.
+    glyph_outlines: HashMap<(FontId, u16), Option<Arc<GlyphOutline>>>,
+    /// Outline commands held by `glyph_outlines` (see
+    /// [`MAX_CACHED_OUTLINE_COMMANDS`]).
+    glyph_outline_commands: usize,
+    /// Interpreted Type 3 glyph programs this page, by font and glyph id
+    /// (`None` for a code without one), so a glyph drawn many times is
+    /// interpreted once. Cleared per page like `glyph_outlines`.
+    type3_glyphs: HashMap<(FontId, u16), Option<Arc<Type3Glyph>>>,
+    /// Commands and image bytes held by `type3_glyphs` (see
+    /// [`MAX_CACHED_TYPE3_COMMANDS`], [`MAX_CACHED_TYPE3_IMAGE_BYTES`]).
+    type3_glyph_commands: usize,
+    type3_glyph_image_bytes: u64,
     /// Opt-in per-stage timings. `None` means "not collecting": every [`Self::tick`]
     /// then returns `None` and the hot path pays one branch, no clock read.
     /// See [`zpdf_render::StageStats`] for why collection is opt-in, and for the
@@ -327,6 +356,24 @@ fn stroke_overshoot(width: f32, miter_limit: f32) -> f32 {
 /// pathological inputs to a few seconds.
 const DEFAULT_RENDER_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
 
+/// Outline commands [`CpuRenderer`] keeps per page for reuse (about 28 MiB);
+/// glyphs past it are extracted from the font program on every draw.
+const MAX_CACHED_OUTLINE_COMMANDS: usize = 512 * 1024;
+
+/// Display commands and decoded image bytes of interpreted Type 3 glyphs
+/// [`CpuRenderer`] keeps per page; glyphs past either are interpreted on every
+/// draw.
+const MAX_CACHED_TYPE3_COMMANDS: usize = 256 * 1024;
+const MAX_CACHED_TYPE3_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// A Type 3 glyph program interpreted in glyph space.
+struct Type3Glyph {
+    list: DisplayList,
+    /// Images its `DrawImage` commands reference.
+    images: ImageCache,
+    font_matrix: [f64; 6],
+}
+
 /// A saved clip state for the clip stack. `Skipped` records a budget-dropped
 /// `PushClip` so its matching `PopClip` leaves `current_clip` untouched.
 ///
@@ -346,6 +393,8 @@ const MAX_CLIP_MASK_BYTES: u64 = 128 * 1024 * 1024;
 
 const MAX_DOWNSCALED_IMAGE_CACHE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_BLEND_SURFACE_BYTES: u64 = 512 * 1024 * 1024;
+/// Surfaces [`CpuRenderer::surface_pool`] keeps at most.
+const MAX_POOLED_SURFACES: usize = 4;
 
 /// Uniformly reduce `scale` until ceil-rounded dimensions fit an exact pixel
 /// budget. Recomputing after every reduction matters for very thin pages: one
@@ -446,8 +495,11 @@ impl<'a> CpuRenderer<'a> {
             clip_bounds: None,
             clip_pixel_spent: 0,
             clip_mask_bytes: 0,
+            mask_pool: Vec::new(),
             blend_stack: Vec::new(),
             blend_surface_bytes: 0,
+            surface_pool: Vec::new(),
+            pooled_surface_bytes: 0,
             skipped_blend_depth: 0,
             render_budget: Some(DEFAULT_RENDER_BUDGET),
             deadline: None,
@@ -456,6 +508,11 @@ impl<'a> CpuRenderer<'a> {
             soft_mask_cache_bytes: 0,
             soft_mask_depth: 0,
             downscaled_images: HashMap::new(),
+            glyph_outlines: HashMap::new(),
+            glyph_outline_commands: 0,
+            type3_glyphs: HashMap::new(),
+            type3_glyph_commands: 0,
+            type3_glyph_image_bytes: 0,
             stage_stats: None,
             page_start: None,
         }
@@ -634,6 +691,20 @@ impl<'a> CpuRenderer<'a> {
         });
     }
 
+    /// Whether a draw with this geometry can change any pixel of the target:
+    /// false when its extent ([`Self::drawn_extent`]) lies entirely off the
+    /// surface or outside the active clip, whose mask is zero there.
+    fn reaches_target(&self, bounds: tiny_skia::Rect, grow: f32) -> bool {
+        let Some((width, height)) = self.pixmap.as_ref().map(|p| (p.width(), p.height())) else {
+            return false;
+        };
+        let mut region = Self::drawn_extent(bounds, grow, width, height);
+        if let Some(clip) = self.clip_bounds {
+            region = region.intersect(clip);
+        }
+        !region.is_empty()
+    }
+
     /// Record that the whole target surface may have been painted — for a draw
     /// whose extent cannot be established, or one that merges over the full
     /// raster by construction. Still narrowed by the active clip, which is the
@@ -746,6 +817,11 @@ impl<'a> CpuRenderer<'a> {
             _ => return self.tock(t, |s| &mut s.fill_ns),
         };
         let fill_rule = Self::fill_rule_to_skia(rule);
+        // One device pixel of slack: a pixel the path only clips the corner of
+        // still receives anti-aliased coverage.
+        if !self.reaches_target(skia_path.bounds(), 1.0) {
+            return self.tock(t, |s| &mut s.fill_ns);
+        }
         let mut painted = false;
         if let Some(ref mut pixmap) = self.pixmap {
             pixmap.fill_path(
@@ -758,8 +834,6 @@ impl<'a> CpuRenderer<'a> {
             painted = true;
         }
         if painted {
-            // One device pixel of slack: a pixel the path only clips the corner
-            // of still receives anti-aliased coverage.
             self.mark_painted(skia_path.bounds(), 1.0);
         }
         self.tock(t, |s| &mut s.fill_ns);
@@ -776,6 +850,12 @@ impl<'a> CpuRenderer<'a> {
             _ => return self.tock(t, |s| &mut s.stroke_ns),
         };
         let stroke = self.build_skia_stroke(style);
+        // The *centerline's* bounds say nothing about how far the ink reaches:
+        // joins, caps and miters all extend past it.
+        let grow = stroke_overshoot(stroke.width, stroke.miter_limit);
+        if !self.reaches_target(skia_path.bounds(), grow) {
+            return self.tock(t, |s| &mut s.stroke_ns);
+        }
         let mut painted = false;
         if let Some(ref mut pixmap) = self.pixmap {
             pixmap.stroke_path(
@@ -788,9 +868,6 @@ impl<'a> CpuRenderer<'a> {
             painted = true;
         }
         if painted {
-            // The *centerline's* bounds say nothing about how far the ink
-            // reaches: joins, caps and miters all extend past it.
-            let grow = stroke_overshoot(stroke.width, stroke.miter_limit);
             self.mark_painted(skia_path.bounds(), grow);
         }
         self.tock(t, |s| &mut s.stroke_ns);
@@ -799,11 +876,17 @@ impl<'a> CpuRenderer<'a> {
 
     /// Device-space tiny-skia stroke parameters for `style`.
     fn build_skia_stroke(&self, style: &StrokeStyle) -> tiny_skia::Stroke {
+        // Hairline boost: never let a stroke fall below one device pixel
+        // (matches pdfium; keeps thin diagram strokes legible at low DPI, and
+        // renders PDF zero-width strokes as 1px hairlines).
+        Self::skia_stroke(style, self.scale, 1.0)
+    }
+
+    /// tiny-skia stroke parameters for `style` with lengths scaled by `scale`
+    /// and the width at least `min_width`.
+    fn skia_stroke(style: &StrokeStyle, scale: f32, min_width: f32) -> tiny_skia::Stroke {
         tiny_skia::Stroke {
-            // Hairline boost: never let a stroke fall below one device pixel
-            // (matches pdfium; keeps thin diagram strokes legible at low DPI,
-            // and renders PDF zero-width strokes as 1px hairlines).
-            width: (style.width * self.scale).max(1.0),
+            width: (style.width * scale).max(min_width),
             line_cap: match style.cap {
                 LineCap::Butt => tiny_skia::LineCap::Butt,
                 LineCap::Round => tiny_skia::LineCap::Round,
@@ -815,7 +898,7 @@ impl<'a> CpuRenderer<'a> {
                 LineJoin::Bevel => tiny_skia::LineJoin::Bevel,
             },
             miter_limit: style.miter_limit,
-            dash: self.build_stroke_dash(style),
+            dash: Self::stroke_dash(style, scale),
         }
     }
 
@@ -823,12 +906,12 @@ impl<'a> CpuRenderer<'a> {
     /// patterns (empty/all-zero/negative entries) return `None` → solid stroke.
     /// PDF allows odd-length dash arrays (the pattern repeats, so `[3]` means
     /// 3 on / 3 off); tiny-skia requires an even count, so odd arrays are doubled.
-    fn build_stroke_dash(&self, style: &StrokeStyle) -> Option<tiny_skia::StrokeDash> {
+    fn stroke_dash(style: &StrokeStyle, scale: f32) -> Option<tiny_skia::StrokeDash> {
         let dash = style.dash.as_ref()?;
         if zpdf_render::dash::is_degenerate(&dash.array) {
             return None;
         }
-        let mut array: Vec<f32> = dash.array.iter().map(|v| v * self.scale).collect();
+        let mut array: Vec<f32> = dash.array.iter().map(|v| v * scale).collect();
         if array.len() % 2 == 1 {
             // Avoid clone: reserve and extend from within the same vec
             array.reserve(array.len());
@@ -837,7 +920,7 @@ impl<'a> CpuRenderer<'a> {
                 array.push(array[i]);
             }
         }
-        tiny_skia::StrokeDash::new(array, dash.phase * self.scale)
+        tiny_skia::StrokeDash::new(array, dash.phase * scale)
     }
 
     /// Render a glyph run with a specific alpha override (used by knockout groups).
@@ -884,15 +967,12 @@ impl<'a> CpuRenderer<'a> {
             return self.tock(t, |s| &mut s.clip_ns);
         };
         let (pw, ph) = (pixmap.width(), pixmap.height());
-        let mask_bytes = pw as u64 * ph as u64;
 
         // Budget guard: once the page has spent its clip-mask pixel-work, stop
-        // building new full-raster masks (which would hang on 100k-clip pages).
-        // The matching PopClip pops a `Skipped` frame and the previously-active
+        // building new masks (which would hang on 100k-clip pages). The
+        // matching PopClip pops a `Skipped` frame and the previously-active
         // clip stays in force — strictly tighter than dropping clipping entirely.
-        if self.clip_pixel_spent >= MAX_CLIP_PIXEL_WORK
-            || self.clip_mask_bytes.saturating_add(mask_bytes) > MAX_CLIP_MASK_BYTES
-        {
+        if self.clip_pixel_spent >= MAX_CLIP_PIXEL_WORK {
             self.clip_stack.push(ClipFrame::Skipped);
             return self.tock(t, |s| &mut s.clip_ns);
         }
@@ -904,15 +984,15 @@ impl<'a> CpuRenderer<'a> {
             return self.tock(t, |s| &mut s.clip_ns);
         }
 
-        let mut mask = match tiny_skia::Mask::new(pw, ph) {
-            Some(m) => m,
-            None => {
-                self.clip_stack.push(ClipFrame::Skipped);
-                return self.tock(t, |s| &mut s.clip_ns);
-            }
+        let Some(mut mask) = self.take_mask(pw, ph) else {
+            self.clip_stack.push(ClipFrame::Skipped);
+            return self.tock(t, |s| &mut s.clip_ns);
         };
-        self.clip_pixel_spent += pw as u64 * ph as u64;
-        self.clip_mask_bytes += mask_bytes;
+        // The fill and the intersection below only touch the path's extent.
+        let extent = skia_path.as_ref().map_or(0, |path| {
+            Self::drawn_extent(path.bounds(), 1.0, pw, ph).area()
+        });
+        self.clip_pixel_spent = self.clip_pixel_spent.saturating_add(extent);
 
         if let Some(skia_path) = &skia_path {
             mask.fill_path(
@@ -978,23 +1058,123 @@ impl<'a> CpuRenderer<'a> {
             Some(ClipFrame::Skipped) => {}
             Some(ClipFrame::Mask(prev, prev_bounds)) => {
                 if let Some(removed) = self.current_clip.replace(prev) {
-                    self.clip_mask_bytes = self
-                        .clip_mask_bytes
-                        .saturating_sub(removed.width() as u64 * removed.height() as u64);
+                    self.recycle_mask(removed, self.clip_bounds);
                 }
                 self.clip_bounds = prev_bounds;
             }
             Some(ClipFrame::Empty) => {
                 if let Some(mask) = self.current_clip.take() {
-                    self.clip_mask_bytes = self
-                        .clip_mask_bytes
-                        .saturating_sub(mask.width() as u64 * mask.height() as u64);
+                    self.recycle_mask(mask, self.clip_bounds);
                 }
                 self.clip_bounds = None;
             }
             None => {}
         }
         self.tock(t, |s| &mut s.clip_ns);
+    }
+
+    /// A zeroed `width`×`height` clip mask: a pooled one, else a new one
+    /// within [`MAX_CLIP_MASK_BYTES`] (charged as full-raster clip work, since
+    /// the allocation zeroes it all).
+    fn take_mask(&mut self, width: u32, height: u32) -> Option<tiny_skia::Mask> {
+        if let Some(at) = self
+            .mask_pool
+            .iter()
+            .rposition(|m| (m.width(), m.height()) == (width, height))
+        {
+            return Some(self.mask_pool.swap_remove(at));
+        }
+        let bytes = width as u64 * height as u64;
+        if self.clip_mask_bytes.saturating_add(bytes) > MAX_CLIP_MASK_BYTES {
+            return None;
+        }
+        let mask = tiny_skia::Mask::new(width, height)?;
+        self.clip_mask_bytes += bytes;
+        self.clip_pixel_spent = self.clip_pixel_spent.saturating_add(bytes);
+        Some(mask)
+    }
+
+    /// Zero a retired clip mask over `bounds`, which holds every pixel it can
+    /// be non-zero in (the clip's `clip_bounds`), and keep it for reuse.
+    fn recycle_mask(&mut self, mut mask: tiny_skia::Mask, bounds: Option<PaintedBounds>) {
+        let width = mask.width() as usize;
+        let height = mask.height() as usize;
+        let data = mask.data_mut();
+        match bounds {
+            Some(b) => {
+                let (x0, x1) = ((b.x0 as usize).min(width), (b.x1 as usize).min(width));
+                for y in (b.y0 as usize).min(height)..(b.y1 as usize).min(height) {
+                    if x0 < x1 {
+                        data[y * width + x0..y * width + x1].fill(0);
+                    }
+                }
+            }
+            None => data.fill(0),
+        }
+        self.mask_pool.push(mask);
+    }
+
+    /// A fully transparent `width`×`height` surface: a pooled one, or a new
+    /// allocation (`None` when that fails).
+    fn take_surface(&mut self, width: u32, height: u32) -> Option<tiny_skia::Pixmap> {
+        if let Some(at) = self
+            .surface_pool
+            .iter()
+            .rposition(|p| (p.width(), p.height()) == (width, height))
+        {
+            let surface = self.surface_pool.swap_remove(at);
+            self.pooled_surface_bytes = self
+                .pooled_surface_bytes
+                .saturating_sub(surface_bytes(&surface));
+            return Some(surface);
+        }
+        tiny_skia::Pixmap::new(width, height)
+    }
+
+    /// Whether `bytes` more surface memory fit [`MAX_BLEND_SURFACE_BYTES`]
+    /// beside the live surfaces, releasing pooled ones to make room.
+    fn surface_room(&mut self, bytes: u64) -> bool {
+        while self
+            .blend_surface_bytes
+            .saturating_add(self.pooled_surface_bytes)
+            .saturating_add(bytes)
+            > MAX_BLEND_SURFACE_BYTES
+        {
+            let Some(surface) = self.surface_pool.pop() else {
+                return self.blend_surface_bytes.saturating_add(bytes) <= MAX_BLEND_SURFACE_BYTES;
+            };
+            self.pooled_surface_bytes = self
+                .pooled_surface_bytes
+                .saturating_sub(surface_bytes(&surface));
+        }
+        true
+    }
+
+    /// Clear a retired surface over `painted`, which holds every pixel it
+    /// painted (see [`PaintedBounds`]), and pool it when the budget has room.
+    fn recycle_surface(&mut self, mut surface: tiny_skia::Pixmap, painted: Option<PaintedBounds>) {
+        let bytes = surface_bytes(&surface);
+        if self.surface_pool.len() >= MAX_POOLED_SURFACES
+            || self
+                .blend_surface_bytes
+                .saturating_add(self.pooled_surface_bytes)
+                .saturating_add(bytes)
+                > MAX_BLEND_SURFACE_BYTES
+        {
+            return;
+        }
+        if let Some(region) = painted.filter(|r| !r.is_empty()) {
+            let stride = surface.width() as usize * 4;
+            let (x0, x1) = (region.x0 as usize * 4, region.x1 as usize * 4);
+            let data = surface.data_mut();
+            for y in region.y0 as usize..region.y1 as usize {
+                if let Some(row) = data.get_mut(y * stride + x0..y * stride + x1) {
+                    row.fill(0);
+                }
+            }
+        }
+        self.pooled_surface_bytes += bytes;
+        self.surface_pool.push(surface);
     }
 
     /// Intersect the clip with a stroked path's outline. tiny-skia masks cannot
@@ -1006,11 +1186,8 @@ impl<'a> CpuRenderer<'a> {
             return;
         };
         let (pw, ph) = (pixmap.width(), pixmap.height());
-        let mask_bytes = pw as u64 * ph as u64;
 
-        if self.clip_pixel_spent >= MAX_CLIP_PIXEL_WORK
-            || self.clip_mask_bytes.saturating_add(mask_bytes) > MAX_CLIP_MASK_BYTES
-        {
+        if self.clip_pixel_spent >= MAX_CLIP_PIXEL_WORK {
             self.clip_stack.push(ClipFrame::Skipped);
             return;
         }
@@ -1018,17 +1195,35 @@ impl<'a> CpuRenderer<'a> {
             self.clip_stack.push(ClipFrame::Skipped);
             return;
         };
-        let Some(mut scratch) = tiny_skia::Pixmap::new(pw, ph) else {
+        let stroke = self.build_skia_stroke(style);
+        // Where the stroked outline can reach: the centerline bbox says nothing
+        // about joins, caps and miters (see `stroke_overshoot`).
+        let grow = stroke_overshoot(stroke.width, stroke.miter_limit);
+        let extent = Self::drawn_extent(skia_path.bounds(), grow, pw, ph);
+        let scratch_bytes = pw as u64 * ph as u64 * 4;
+        if !self
+            .surface_pool
+            .iter()
+            .any(|p| (p.width(), p.height()) == (pw, ph))
+            && !self.surface_room(scratch_bytes)
+        {
+            self.clip_stack.push(ClipFrame::Skipped);
+            return;
+        }
+        let Some(mut scratch) = self.take_surface(pw, ph) else {
             self.clip_stack.push(ClipFrame::Skipped);
             return;
         };
-        self.clip_pixel_spent += pw as u64 * ph as u64;
-        self.clip_mask_bytes += mask_bytes;
+        let Some(mut mask) = self.take_mask(pw, ph) else {
+            self.recycle_surface(scratch, None);
+            self.clip_stack.push(ClipFrame::Skipped);
+            return;
+        };
+        self.clip_pixel_spent = self.clip_pixel_spent.saturating_add(extent.area());
 
         let mut paint = tiny_skia::Paint::default();
         paint.set_color(tiny_skia::Color::WHITE);
         paint.anti_alias = true;
-        let stroke = self.build_skia_stroke(style);
         scratch.stroke_path(
             &skia_path,
             &paint,
@@ -1036,30 +1231,27 @@ impl<'a> CpuRenderer<'a> {
             tiny_skia::Transform::identity(),
             None,
         );
-        let mut mask = tiny_skia::Mask::from_pixmap(scratch.as_ref(), tiny_skia::MaskType::Alpha);
 
-        // Intersect with the active clip over the stroke's device bbox (the
-        // centerline bounds grown by the stroke width). Outside that box the
-        // stroke mask is already 0, so the intersection is 0 there too.
-        if let Some(ref current) = self.current_clip {
-            let b = skia_path.bounds();
-            let grow = stroke.width.max(1.0);
-            let w = pw as usize;
-            let h = ph as usize;
-            let x0 = ((b.left() - grow).floor().max(0.0) as usize).min(w);
-            let x1 = ((b.right() + grow).ceil().max(0.0) as usize).min(w);
-            let y0 = ((b.top() - grow).floor().max(0.0) as usize).min(h);
-            let y1 = ((b.bottom() + grow).ceil().max(0.0) as usize).min(h);
-            let current_data = current.data();
-            let mask_data = mask.data_mut();
-            for y in y0..y1 {
-                let row = y * w;
-                for x in x0..x1 {
-                    let i = row + x;
-                    mask_data[i] = ((mask_data[i] as u16 * current_data[i] as u16) / 255) as u8;
-                }
+        // Lift the stroke's coverage into the mask, intersected with the
+        // active clip, over the stroke's extent. Outside it the stroke covers
+        // nothing, so the mask stays 0 there.
+        let w = pw as usize;
+        let (x0, x1) = (extent.x0 as usize, extent.x1 as usize);
+        let current_data = self.current_clip.as_ref().map(|current| current.data());
+        let pixels = scratch.pixels();
+        let mask_data = mask.data_mut();
+        for y in extent.y0 as usize..extent.y1 as usize {
+            let row = y * w;
+            for x in x0..x1 {
+                let i = row + x;
+                let coverage = pixels[i].alpha();
+                mask_data[i] = match current_data {
+                    Some(current) => ((coverage as u16 * current[i] as u16) / 255) as u8,
+                    None => coverage,
+                };
             }
         }
+        self.recycle_surface(scratch, Some(extent));
 
         let frame = match self.current_clip.take() {
             Some(old) => ClipFrame::Mask(old, self.clip_bounds),
@@ -1067,10 +1259,7 @@ impl<'a> CpuRenderer<'a> {
         };
         self.clip_stack.push(frame);
         self.current_clip = Some(mask);
-        // Same reasoning as `push_clip`, with the stroke's own overshoot: the
-        // centerline bbox says nothing about where the stroked outline reaches.
-        let grow = stroke_overshoot(stroke.width, stroke.miter_limit);
-        self.clip_bounds = Some(Self::drawn_extent(skia_path.bounds(), grow, pw, ph));
+        self.clip_bounds = Some(extent);
     }
 
     fn push_blend_group(
@@ -1135,7 +1324,11 @@ impl<'a> CpuRenderer<'a> {
         let h = pixmap.height();
         let surface_bytes = w as u64 * h as u64 * 4;
 
-        if self.blend_surface_bytes.saturating_add(surface_bytes) > MAX_BLEND_SURFACE_BYTES {
+        let pooled = self
+            .surface_pool
+            .iter()
+            .any(|p| (p.width(), p.height()) == (w, h));
+        if !pooled && !self.surface_room(surface_bytes) {
             self.pixmap = Some(pixmap);
             tracing::warn!("blend-group surfaces exceed memory budget; using passthrough");
             if let Some(sentinel) = tiny_skia::Pixmap::new(1, 1) {
@@ -1158,7 +1351,7 @@ impl<'a> CpuRenderer<'a> {
         // effect (alpha/mask/blend) and is approximated as isolated — element
         // blends against the backdrop are the rare loss. `None` on allocation
         // failure degrades to a no-op group, which `pop_blend_group` handles.
-        let group = tiny_skia::Pixmap::new(w, h);
+        let group = self.take_surface(w, h);
         // Per-element knockout composites against the (transparent) initial
         // backdrop preserved here.
         // This backend currently approximates every non-passthrough group as
@@ -1297,7 +1490,8 @@ impl<'a> CpuRenderer<'a> {
         };
         self.blend_surface_bytes = self
             .blend_surface_bytes
-            .saturating_sub(group_pixmap.width() as u64 * group_pixmap.height() as u64 * 4);
+            .saturating_sub(surface_bytes(&group_pixmap));
+        self.recycle_surface(group_pixmap, group_dirty);
         self.tock(t, |s| &mut s.soft_mask_ns);
     }
 
@@ -1361,7 +1555,7 @@ impl<'a> CpuRenderer<'a> {
             None => return,
         };
         let scratch_bytes = w as u64 * h as u64 * 4 * 2;
-        if self.blend_surface_bytes.saturating_add(scratch_bytes) > MAX_BLEND_SURFACE_BYTES {
+        if !self.surface_room(scratch_bytes) {
             tracing::warn!("knockout scratch surfaces exceed memory budget; using accumulation");
             self.render_paint_cmd(cmd);
             return;
@@ -1369,26 +1563,34 @@ impl<'a> CpuRenderer<'a> {
 
         // Pass 1: the element as painted (real colour and opacity).
         // The scratch passes below draw into throwaway surfaces, so the region
-        // the *canvas* has been painted in is put aside and restored after them.
-        let canvas_dirty = self.dirty;
+        // the *canvas* has been painted in is put aside and restored after them;
+        // each pass starts from an empty region so it reports its own extent.
+        let canvas_dirty = self.dirty.take();
         let group = self.pixmap.take();
-        self.pixmap = tiny_skia::Pixmap::new(w, h);
+        self.pixmap = self.take_surface(w, h);
         if self.pixmap.is_none() {
             self.pixmap = group;
+            self.dirty = canvas_dirty;
             self.render_paint_cmd(cmd); // OOM: fall back to accumulation
             return;
         }
         self.render_paint_cmd(cmd);
         let elem = self.pixmap.take();
+        let elem_dirty = self.dirty.take();
 
         // Pass 2: the element at full opacity → its shape (alpha = coverage).
-        self.pixmap = tiny_skia::Pixmap::new(w, h);
+        self.pixmap = self.take_surface(w, h);
         if self.pixmap.is_none() {
             self.pixmap = group;
+            self.dirty = canvas_dirty;
+            if let Some(elem) = elem {
+                self.recycle_surface(elem, elem_dirty);
+            }
             return;
         }
         self.render_shape_cmd(cmd);
         let shape = self.pixmap.take();
+        let shape_dirty = self.dirty.take();
 
         self.pixmap = group;
         self.dirty = canvas_dirty;
@@ -1396,13 +1598,31 @@ impl<'a> CpuRenderer<'a> {
             (Some(e), Some(s)) => (e, s),
             _ => return,
         };
-        if let (Some(g), Some(entry)) = (self.pixmap.as_mut(), self.blend_stack.last()) {
+        // The merge changes only pixels the shape covers, all inside the
+        // passes' regions.
+        let region = match (elem_dirty, shape_dirty) {
+            (Some(a), Some(b)) => Some(a.union(b)),
+            (a, b) => a.or(b),
+        };
+        if let (Some(region), Some(g), Some(entry)) =
+            (region, self.pixmap.as_mut(), self.blend_stack.last())
+        {
             let b0 = entry.backdrop.as_ref().map(|p| p.data());
-            knockout_merge(g.data_mut(), elem.data(), shape.data(), b0);
+            for_region_rows(region, w, |range| {
+                knockout_merge(
+                    &mut g.data_mut()[range.clone()],
+                    &elem.data()[range.clone()],
+                    &shape.data()[range.clone()],
+                    b0.map(|b| &b[range]),
+                );
+            });
+            self.dirty = Some(match self.dirty {
+                Some(dirty) => dirty.union(region),
+                None => region,
+            });
         }
-        // The merge walks the whole raster (it reads each pixel's coverage to
-        // decide whether to replace or keep), so no useful bound survives it.
-        self.mark_all_painted();
+        self.recycle_surface(elem, elem_dirty);
+        self.recycle_surface(shape, shape_dirty);
     }
 
     /// Paint an overprinting element (PDF 8.6.7): render it alone to capture
@@ -1421,7 +1641,7 @@ impl<'a> CpuRenderer<'a> {
             None => return,
         };
         let scratch_bytes = w as u64 * h as u64 * 4;
-        if self.blend_surface_bytes.saturating_add(scratch_bytes) > MAX_BLEND_SURFACE_BYTES {
+        if !self.surface_room(scratch_bytes) {
             tracing::warn!("overprint scratch surface exceeds memory budget; using source-over");
             self.render_paint_cmd(cmd);
             return;
@@ -1429,25 +1649,40 @@ impl<'a> CpuRenderer<'a> {
         // Render the element (real colour/opacity, current clip) into a scratch
         // buffer; only its alpha channel — the covered fraction — is consumed.
         // As in `knockout_paint`, the canvas's painted region is put aside while
-        // the scratch surface is the target.
-        let canvas_dirty = self.dirty;
+        // the scratch surface is the target, which reports the element's extent.
+        let canvas_dirty = self.dirty.take();
         let canvas = self.pixmap.take();
-        self.pixmap = tiny_skia::Pixmap::new(w, h);
+        self.pixmap = self.take_surface(w, h);
         if self.pixmap.is_none() {
             // OOM: fall back to a normal paint so content still appears.
             self.pixmap = canvas;
+            self.dirty = canvas_dirty;
             self.render_paint_cmd(cmd);
             return;
         }
         self.render_paint_cmd(cmd);
         let elem = self.pixmap.take();
+        let elem_dirty = self.dirty.take();
         self.pixmap = canvas;
         self.dirty = canvas_dirty;
-        if let (Some(canvas), Some(elem)) = (self.pixmap.as_mut(), elem) {
-            overprint_merge(canvas.data_mut(), elem.data(), op);
+        let Some(elem) = elem else {
+            return;
+        };
+        // The merge changes only pixels the element covers.
+        if let (Some(region), Some(canvas)) = (elem_dirty, self.pixmap.as_mut()) {
+            for_region_rows(region, w, |range| {
+                overprint_merge(
+                    &mut canvas.data_mut()[range.clone()],
+                    &elem.data()[range],
+                    op,
+                );
+            });
+            self.dirty = Some(match self.dirty {
+                Some(dirty) => dirty.union(region),
+                None => region,
+            });
         }
-        // The merge reads and writes whole pixels across the raster.
-        self.mark_all_painted();
+        self.recycle_surface(elem, elem_dirty);
     }
 
     /// Coverage plane for `mask`, honoring its page-space offset. The base
@@ -1468,7 +1703,7 @@ impl<'a> CpuRenderer<'a> {
             (p.width(), p.height())
         };
         let mask_work_bytes = w as u64 * h as u64 * 5; // RGBA scratch + 1-byte plane
-        if self.blend_surface_bytes.saturating_add(mask_work_bytes) > MAX_BLEND_SURFACE_BYTES {
+        if !self.surface_room(mask_work_bytes) {
             tracing::warn!("soft-mask scratch exceeds memory budget; skipping mask");
             return None;
         }
@@ -1570,8 +1805,17 @@ impl<'a> CpuRenderer<'a> {
             clip_bounds: None,
             clip_pixel_spent: 0,
             clip_mask_bytes: 0,
+            mask_pool: Vec::new(),
             blend_stack: Vec::new(),
-            blend_surface_bytes: w as u64 * h as u64 * 4,
+            // Everything the page holds stays allocated while the mask group
+            // renders, so its groups share the page's budget rather than
+            // starting a fresh one per nesting level.
+            blend_surface_bytes: self
+                .blend_surface_bytes
+                .saturating_add(self.pooled_surface_bytes)
+                .saturating_add(w as u64 * h as u64 * 5),
+            surface_pool: Vec::new(),
+            pooled_surface_bytes: 0,
             skipped_blend_depth: 0,
             // Share the parent page's deadline so a soft-mask group cannot hang
             // past the budget the top-level render already started counting.
@@ -1589,6 +1833,11 @@ impl<'a> CpuRenderer<'a> {
                 .saturating_add(self.blend_stack.len())
                 .saturating_add(1),
             downscaled_images: HashMap::new(),
+            glyph_outlines: HashMap::new(),
+            glyph_outline_commands: 0,
+            type3_glyphs: HashMap::new(),
+            type3_glyph_commands: 0,
+            type3_glyph_image_bytes: 0,
             // The sub-renderer's work is attributed to the *parent's*
             // `soft_mask_ns` bucket (the parent times this whole call), so
             // collecting here too would double-count it.
@@ -1889,12 +2138,11 @@ impl<'a> CpuRenderer<'a> {
             // rendering measured 20x warm without this boundary, so the two are
             // timed separately.
             let t_parse = self.tick();
-            let outline = font.glyph_outline(glyph.glyph_id);
+            let outline = self.glyph_outline(run.font_id, font, glyph.glyph_id);
             self.tock(t_parse, |s| &mut s.outline_parse_ns);
             let Some(outline) = outline else {
                 continue;
             };
-            self.count(1, |s| &mut s.glyph_outlines_parsed);
 
             let t_raster = self.tick();
             // Transform each glyph outline point:
@@ -1924,6 +2172,29 @@ impl<'a> CpuRenderer<'a> {
             }
             self.tock(t_raster, |s| &mut s.glyph_raster_ns);
         }
+    }
+
+    /// The outline of `glyph_id` in `font` (the font cache's `font_id`),
+    /// extracted from the font program once per page.
+    fn glyph_outline(
+        &mut self,
+        font_id: FontId,
+        font: &zpdf_font::LoadedFont,
+        glyph_id: u16,
+    ) -> Option<Arc<GlyphOutline>> {
+        if let Some(outline) = self.glyph_outlines.get(&(font_id, glyph_id)) {
+            return outline.clone();
+        }
+        let outline = font.glyph_outline(glyph_id).map(Arc::new);
+        self.count(outline.is_some() as u64, |s| &mut s.glyph_outlines_parsed);
+        let commands = outline.as_ref().map_or(1, |o| o.commands.len().max(1));
+        let total = self.glyph_outline_commands.saturating_add(commands);
+        if total <= MAX_CACHED_OUTLINE_COMMANDS {
+            self.glyph_outline_commands = total;
+            self.glyph_outlines
+                .insert((font_id, glyph_id), outline.clone());
+        }
+        outline
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2006,8 +2277,6 @@ impl<'a> CpuRenderer<'a> {
         paint: &tiny_skia::Paint<'_>,
         alpha_override: f32,
     ) {
-        use zpdf_content::interpreter::ContentInterpreter;
-
         // run.transform = CTM * Tm (already includes all coordinate transforms)
         // The CTM may already flip Y (e.g., Skia PDFs use negative y scale).
         // We must apply the full transform chain: FontMatrix * glyph_coords → text space,
@@ -2017,17 +2286,41 @@ impl<'a> CpuRenderer<'a> {
         let h_scale = run.h_scale;
 
         for glyph in &run.glyphs {
-            let (stream, font_matrix) = match font.type3_glyph_stream(glyph.glyph_id) {
-                Some(s) => s,
-                None => continue,
+            // One run can hold many glyphs, each a whole content program, so
+            // the page deadline is checked per glyph, not just per command.
+            if self
+                .deadline
+                .is_some_and(|deadline| zpdf_core::time::Instant::now() >= deadline)
+            {
+                self.over_budget = true;
+                tracing::warn!("render exceeded time budget inside a Type 3 run; truncating page");
+                return;
+            }
+            let Some(program) = self.type3_glyph(run.font_id, font, glyph.glyph_id) else {
+                continue;
             };
-
-            let glyph_rect = zpdf_core::Rect::new(0.0, -1000.0, 1000.0, 1000.0);
-            let mut glyph_images = ImageCache::new();
-            let glyph_dl = ContentInterpreter::new(glyph_rect)
-                .with_images(&mut glyph_images)
-                .with_limits(&self.parse_limits)
-                .interpret(stream);
+            let font_matrix = program.font_matrix;
+            let glyph_dl = &program.list;
+            let glyph_images = &program.images;
+            // Glyph space → device pixels, for scaling stroke widths.
+            let glyph_to_page = tm
+                .concat(&zpdf_core::Matrix::scale(
+                    font_size as f64 * h_scale as f64,
+                    font_size as f64,
+                ))
+                .concat(&zpdf_core::Matrix::new(
+                    font_matrix[0],
+                    font_matrix[1],
+                    font_matrix[2],
+                    font_matrix[3],
+                    font_matrix[4],
+                    font_matrix[5],
+                ));
+            let stroke_scale = ((glyph_to_page.a * glyph_to_page.d
+                - glyph_to_page.b * glyph_to_page.c)
+                .abs()
+                .sqrt()
+                * self.scale as f64) as f32;
 
             // Build the full transform: glyph_space → page_space → pixel_space
             // FontMatrix transforms glyph coords to text space (typically 0.001 scale)
@@ -2068,14 +2361,9 @@ impl<'a> CpuRenderer<'a> {
                             tm,
                             glyph.x,
                         ) {
-                            let stroke = tiny_skia::Stroke {
-                                width: (style.width
-                                    * font_matrix[0].abs() as f32
-                                    * font_size
-                                    * self.scale)
-                                    .max(0.5),
-                                ..Default::default()
-                            };
+                            // The glyph's stroke style is in glyph space; scale
+                            // it by the whole glyph-to-device transform.
+                            let stroke = Self::skia_stroke(style, stroke_scale, 0.5);
                             if let Some(ref mut pixmap) = self.pixmap {
                                 pixmap.stroke_path(
                                     &skia_path,
@@ -2111,12 +2399,57 @@ impl<'a> CpuRenderer<'a> {
                             alpha: draw.alpha,
                             is_image_mask: draw.is_image_mask,
                         };
-                        self.render_type3_image(&glyph_images, &draw, paint, alpha_override);
+                        self.render_type3_image(glyph_images, &draw, paint, alpha_override);
                     }
                     _ => {}
                 }
             }
         }
+    }
+
+    /// The interpreted program of Type 3 glyph `glyph_id` of `font` (the font
+    /// cache's `font_id`), interpreted once per page.
+    fn type3_glyph(
+        &mut self,
+        font_id: FontId,
+        font: &zpdf_font::LoadedFont,
+        glyph_id: u16,
+    ) -> Option<Arc<Type3Glyph>> {
+        use zpdf_content::interpreter::ContentInterpreter;
+        if let Some(glyph) = self.type3_glyphs.get(&(font_id, glyph_id)) {
+            return glyph.clone();
+        }
+        let glyph = font
+            .type3_glyph_stream(glyph_id)
+            .map(|(stream, font_matrix)| {
+                let glyph_rect = zpdf_core::Rect::new(0.0, -1000.0, 1000.0, 1000.0);
+                let mut images = ImageCache::new();
+                let mut interp = ContentInterpreter::new(glyph_rect)
+                    .with_images(&mut images)
+                    .with_limits(&self.parse_limits);
+                if let Some(deadline) = self.deadline {
+                    interp = interp.with_deadline(deadline);
+                }
+                let list = interp.interpret(stream);
+                Arc::new(Type3Glyph {
+                    list,
+                    images,
+                    font_matrix,
+                })
+            });
+        let (commands, image_bytes) = glyph.as_ref().map_or((1, 0), |g| {
+            (g.list.commands.len().max(1), g.images.bytes_used())
+        });
+        let total_commands = self.type3_glyph_commands.saturating_add(commands);
+        let total_image_bytes = self.type3_glyph_image_bytes.saturating_add(image_bytes);
+        if total_commands <= MAX_CACHED_TYPE3_COMMANDS
+            && total_image_bytes <= MAX_CACHED_TYPE3_IMAGE_BYTES
+        {
+            self.type3_glyph_commands = total_commands;
+            self.type3_glyph_image_bytes = total_image_bytes;
+            self.type3_glyphs.insert((font_id, glyph_id), glyph.clone());
+        }
+        glyph
     }
 
     /// Type 3 glyphs in Beamer PDFs commonly use `/ImageMask true` inline
@@ -2322,6 +2655,21 @@ fn composite_group_region(
     base.fill_rect(region, &scoped, tiny_skia::Transform::identity(), None);
 }
 
+/// Bytes of an RGBA surface.
+fn surface_bytes(surface: &tiny_skia::Pixmap) -> u64 {
+    surface.width() as u64 * surface.height() as u64 * 4
+}
+
+/// Call `f` with the byte range of each row of `region` in an RGBA surface
+/// `width` pixels wide.
+fn for_region_rows(region: PaintedBounds, width: u32, mut f: impl FnMut(std::ops::Range<usize>)) {
+    let stride = width as usize * 4;
+    let (x0, x1) = (region.x0 as usize * 4, region.x1 as usize * 4);
+    for y in region.y0 as usize..region.y1 as usize {
+        f(y * stride + x0..y * stride + x1);
+    }
+}
+
 /// Knockout merge: `group = lerp(group, elem OVER b0, shape)`, in place,
 /// premultiplied RGBA8. `shape` carries the element's geometric coverage in its
 /// alpha channel (a full-opacity render of the same element), while `elem`
@@ -2472,14 +2820,22 @@ impl<'a> RenderBackend for CpuRenderer<'a> {
         self.clip_bounds = None;
         self.blend_stack.clear();
         self.blend_surface_bytes = 0;
+        self.surface_pool.clear();
+        self.pooled_surface_bytes = 0;
         self.skipped_blend_depth = 0;
         self.clip_pixel_spent = 0;
         self.clip_mask_bytes = 0;
+        self.mask_pool.clear();
         self.over_budget = false;
         self.soft_mask_depth = 0;
         self.soft_mask_planes.clear();
         self.soft_mask_cache_bytes = 0;
         self.downscaled_images.clear();
+        self.glyph_outlines.clear();
+        self.glyph_outline_commands = 0;
+        self.type3_glyphs.clear();
+        self.type3_glyph_commands = 0;
+        self.type3_glyph_image_bytes = 0;
         self.deadline = self
             .render_budget
             .map(|d| zpdf_core::time::Instant::now() + d);
@@ -2622,12 +2978,15 @@ impl<'a> RenderBackend for CpuRenderer<'a> {
         self.current_clip = None;
         self.clip_bounds = None;
         self.clip_mask_bytes = 0;
+        self.mask_pool.clear();
         self.soft_mask_planes.clear();
         self.soft_mask_cache_bytes = 0;
         self.downscaled_images.clear();
         self.deadline = None;
         self.skipped_blend_depth = 0;
         self.blend_surface_bytes = 0;
+        self.surface_pool.clear();
+        self.pooled_surface_bytes = 0;
         // Close the page clock last, so `total_ns` includes any blend groups
         // drained above and any over-budget unwinding.
         if let (Some(start), Some(stats)) = (self.page_start.take(), self.stage_stats.as_mut()) {
@@ -3307,6 +3666,63 @@ mod tests {
         (fonts, id)
     }
 
+    /// A Type 3 glyph run of `count` glyphs 1 under text matrix `tm`, 12pt.
+    fn type3_run(font_id: zpdf_font::FontId, count: usize, tm: Matrix) -> RenderCommand {
+        RenderCommand::DrawGlyphRun(GlyphRun {
+            font_id,
+            font_size: 12.0,
+            glyphs: (0..count)
+                .map(|k| PositionedGlyph {
+                    glyph_id: 1,
+                    x: k as f32 * 12.0,
+                    y: 0.0,
+                    advance: 12.0,
+                })
+                .collect(),
+            paint: Paint::Solid(Color::rgb(0.0, 0.0, 0.0)),
+            alpha: 1.0,
+            overprint: None,
+            transform: tm,
+            h_scale: 1.0,
+        })
+    }
+
+    #[test]
+    fn repeated_type3_glyphs_are_interpreted_once_per_page() {
+        let (fonts, font_id) = type3_fonts();
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 20.0));
+        dl.push(type3_run(
+            font_id,
+            5,
+            Matrix::new(1.0, 0.0, 0.0, 1.0, 2.0, 2.0),
+        ));
+        let mut renderer = CpuRenderer::new().with_fonts(&fonts);
+        let page = renderer.render_display_list(&dl, 1.0).expect("render");
+        assert_eq!(renderer.type3_glyphs.len(), 1);
+        // Every instance still paints: the last glyph's square at x ≈ 50..57.
+        let ink = |x: u32| page.data[((14 * page.width + x) * 4) as usize] < 128;
+        assert!(ink(4) && ink(53));
+    }
+
+    #[test]
+    fn type3_stroke_width_follows_the_text_matrix() {
+        // A 100-unit stroke in glyph space: 1.2 user units at 12pt, 12 under a
+        // 10x text matrix.
+        let (fonts, font_id) = type3_image_fonts(b"100 w 0 500 m 1000 500 l S");
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 200.0, 200.0));
+        dl.push(type3_run(
+            font_id,
+            1,
+            Matrix::new(10.0, 0.0, 0.0, 10.0, 20.0, 20.0),
+        ));
+        let page = render_backend(&dl, 1.0, Some(&fonts), None, false).0;
+        // The stroke runs along page y = 20 + 60, device row 120; count its rows.
+        let rows = (0..page.height)
+            .filter(|&y| page.data[((y * page.width + 80) * 4) as usize] < 128)
+            .count();
+        assert!((11..=14).contains(&rows), "stroke covers {rows} rows");
+    }
+
     fn rect_path(x0: f64, y0: f64, x1: f64, y1: f64) -> Path {
         let mut p = Path::new();
         p.move_to(Point::new(x0, y0));
@@ -3549,6 +3965,27 @@ mod tests {
         let s = mixed_page_stats();
         assert_eq!(s.soft_mask_ns, 0, "no transparency on this page");
         assert_eq!(s.soft_mask_planes, 0, "no masks rasterized");
+    }
+
+    #[test]
+    fn repeated_glyphs_extract_their_outline_once_per_page() {
+        let (fonts, font_id) = var_fonts();
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 40.0, 40.0));
+        dl.push(glyph_run_cmd(font_id));
+        dl.push(glyph_run_cmd(font_id));
+        dl.push(glyph_run_cmd(font_id));
+        let mut renderer = CpuRenderer::new()
+            .with_fonts(&fonts)
+            .with_stage_timing(true);
+        let first = renderer.render_display_list(&dl, 1.0).expect("first page");
+        let s = renderer.stage_stats().unwrap();
+        assert_eq!(s.glyphs, 3);
+        assert_eq!(s.glyph_outlines_parsed, 1);
+
+        // The next page extracts it again, and draws the same pixels.
+        let second = renderer.render_display_list(&dl, 1.0).expect("second page");
+        assert_eq!(renderer.stage_stats().unwrap().glyph_outlines_parsed, 1);
+        assert_eq!(first.data, second.data);
     }
 
     /// Stats describe exactly one page: a second page must not inherit the
@@ -4184,12 +4621,11 @@ mod tests {
         );
     }
 
-    /// Knockout and overprint element painting goes through full-raster scratch
-    /// passes and merges over the whole raster, so nothing finer than the whole
-    /// surface survives them. Assert that conservative outcome (and that it is
-    /// still *sound*) rather than leaving it to be inferred from the code.
+    /// Knockout and overprint elements render alone into scratch surfaces whose
+    /// painted regions bound the merge, so their groups composite over just
+    /// those regions — and the leak count shows the regions are still *sound*.
     #[test]
-    fn knockout_and_overprint_groups_are_conservative_and_sound() {
+    fn knockout_and_overprint_groups_are_scoped_and_sound() {
         let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 100.0));
         dl.push(solid_rect(
             Color::rgb(0.0, 0.0, 1.0),
@@ -4244,12 +4680,105 @@ mod tests {
             stats.mask_composite_leak_px, 0,
             "the conservative marks must still cover every painted pixel"
         );
+        // Each element's extent carries one pixel of anti-aliasing slack. The
+        // knockout elements span x, y ∈ [9, 91); the overprinted rect (device
+        // y = 100 − PDF y) spans x ∈ [4, 46), y ∈ [4, 31).
         assert_eq!(
             stats.mask_composite_region_px,
-            100 * 100 * 2,
-            "both groups composite over the full surface — knockout and overprint \
-             cannot be scoped"
+            82 * 82 + 42 * 27,
+            "each group composites over its elements' extent only"
         );
+    }
+
+    /// RGBA of the device pixel at (x, y).
+    fn pixel(page: &RenderedPage, x: u32, y: u32) -> [u8; 4] {
+        let i = ((y * page.width + x) * 4) as usize;
+        page.data[i..i + 4].try_into().unwrap()
+    }
+
+    /// Sequential clips are charged their own extent, not the raster's: at 300
+    /// DPI a page with thousands of small clips still honours the last one
+    /// (charged per raster, clips stopped being built after about 240).
+    #[test]
+    fn many_sequential_clips_all_stay_in_force() {
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 612.0, 792.0));
+        for i in 0..3000 {
+            let x = (i % 60) as f64 * 10.0;
+            let y = (i / 60) as f64 * 10.0;
+            dl.push(RenderCommand::PushClip {
+                path: rect_path(x, y, x + 5.0, y + 5.0),
+                rule: FillRule::NonZero,
+            });
+            dl.push(solid_rect(
+                Color::rgb(0.0, 0.0, 1.0),
+                x,
+                y,
+                x + 5.0,
+                y + 5.0,
+            ));
+            dl.push(RenderCommand::PopClip);
+        }
+        dl.push(RenderCommand::PushClip {
+            path: rect_path(600.0, 700.0, 610.0, 710.0),
+            rule: FillRule::NonZero,
+        });
+        dl.push(solid_rect(
+            Color::rgb(1.0, 0.0, 0.0),
+            0.0,
+            0.0,
+            612.0,
+            792.0,
+        ));
+        dl.push(RenderCommand::PopClip);
+
+        let (page, stats) = render_backend(&dl, 300.0 / 72.0, None, None, true);
+        assert_eq!(stats.expect("timing").clips_pushed, 3001);
+        // Device (10, 10) is PDF (2.4, 789.6): outside every clip.
+        assert_eq!(pixel(&page, 10, 10), [255; 4], "the last clip held");
+        // Inside the last clip: PDF (605, 705).
+        let (x, y) = (605.0 * 300.0 / 72.0, (792.0 - 705.0) * 300.0 / 72.0);
+        assert_eq!(pixel(&page, x as u32, y as u32), [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn strokes_outside_the_clip_are_culled() {
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 100.0));
+        dl.push(RenderCommand::PushClip {
+            path: rect_path(0.0, 0.0, 20.0, 20.0),
+            rule: FillRule::NonZero,
+        });
+        let mut line = Path::new();
+        line.move_to(Point::new(50.0, 10.0));
+        line.line_to(Point::new(90.0, 10.0));
+        dl.push(stroke_cmd(line, StrokeStyle::default()));
+        dl.push(RenderCommand::PopClip);
+        let (page, stats) = render_backend(&dl, 1.0, None, None, true);
+        assert_eq!(stats.expect("timing").strokes, 0);
+        assert!(page.data.iter().all(|&b| b == 255), "page stays white");
+    }
+
+    #[test]
+    fn recycled_surfaces_and_masks_come_back_clear() {
+        let mut renderer = CpuRenderer::new();
+        renderer
+            .begin_page(&PageRenderInfo {
+                page_rect: Rect::new(0.0, 0.0, 40.0, 40.0),
+                scale: 1.0,
+                background: Color::white(),
+            })
+            .expect("page");
+        let mut surface = renderer.take_surface(40, 40).expect("surface");
+        surface.fill(tiny_skia::Color::BLACK);
+        let mut mask = renderer.take_mask(40, 40).expect("mask");
+        mask.data_mut().fill(255);
+        // Both claim the whole raster as their painted region.
+        renderer.recycle_surface(surface, Some(PaintedBounds::whole(40, 40)));
+        renderer.recycle_mask(mask, None);
+        let surface = renderer.take_surface(40, 40).expect("pooled surface");
+        assert!(surface.data().iter().all(|&b| b == 0));
+        let mask = renderer.take_mask(40, 40).expect("pooled mask");
+        assert!(mask.data().iter().all(|&b| b == 0));
+        assert_eq!(renderer.pooled_surface_bytes, 0);
     }
 
     /// The leak counter is the assertion the whole optimization rests on, so it

@@ -1176,6 +1176,7 @@ fn cmd_text(args: &[String]) -> zpdf::Result<()> {
             let interpreter = zpdf::ContentInterpreter::new(page.effective_box())
                 .with_fonts(&mut font_cache)
                 .with_document(doc.file(), &page.resources)
+                .with_shared_fonts(&doc)
                 .with_colors(&mut icc_cache)
                 .with_text_sink(&mut spans)
                 .with_operand_stack_limit(doc.file().limits().max_operand_stack_depth as usize);
@@ -1256,6 +1257,7 @@ fn cmd_search(args: &[String]) -> zpdf::Result<()> {
             let interpreter = zpdf::ContentInterpreter::new(page.effective_box())
                 .with_fonts(&mut font_cache)
                 .with_document(doc.file(), &page.resources)
+                .with_shared_fonts(&doc)
                 .with_colors(&mut icc_cache)
                 .with_text_sink(&mut spans)
                 .with_operand_stack_limit(doc.file().limits().max_operand_stack_depth as usize);
@@ -1341,6 +1343,7 @@ fn cmd_tables(args: &[String]) -> zpdf::Result<()> {
             let interpreter = zpdf::ContentInterpreter::new(page.effective_box())
                 .with_fonts(&mut font_cache)
                 .with_document(doc.file(), &page.resources)
+                .with_shared_fonts(&doc)
                 .with_colors(&mut icc_cache)
                 .with_text_sink(&mut spans)
                 .with_rule_sink(&mut rules)
@@ -1486,6 +1489,7 @@ fn cmd_render(args: &[String]) -> zpdf::Result<()> {
         .with_page_rotation(page.rotate)
         .with_fonts(&mut font_cache)
         .with_document(doc.file(), &page.resources)
+        .with_shared_fonts(&doc)
         .with_images(&mut image_cache)
         .with_colors(&mut icc_cache)
         .with_annotations(&annotations)
@@ -3246,6 +3250,7 @@ fn cmd_export_pptx(args: &[String]) -> zpdf::Result<()> {
             .with_page_rotation(page.rotate)
             .with_fonts(&mut font_cache)
             .with_document(doc.file(), &page.resources)
+            .with_shared_fonts(&doc)
             .with_images(&mut image_cache)
             .with_colors(&mut icc_cache)
             .with_operand_stack_limit(doc.file().limits().max_operand_stack_depth as usize);
@@ -3384,6 +3389,7 @@ fn cmd_export_svg(args: &[String]) -> zpdf::Result<()> {
             .with_page_rotation(page.rotate)
             .with_fonts(&mut font_cache)
             .with_document(doc.file(), &page.resources)
+            .with_shared_fonts(&doc)
             .with_images(&mut image_cache)
             .with_colors(&mut icc_cache)
             .with_operand_stack_limit(doc.file().limits().max_operand_stack_depth as usize);

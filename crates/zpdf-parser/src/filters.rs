@@ -69,16 +69,22 @@ pub fn decode_stream_with_limits(
     // H1 Fix: Use cumulative budget from ParseLimits instead of per-filter 1 GiB cap
     let mut budget = DecodeBudget::new(limits.max_decoded_stream_bytes);
 
-    // H1 Fix: Process filter chain properly, using previous output as next input
-    let mut current = data.to_vec();
+    // H1 Fix: Process filter chain properly, using previous output as next input.
+    // The first filter reads the raw bytes in place.
+    let mut current: std::borrow::Cow<'_, [u8]> = std::borrow::Cow::Borrowed(data);
     for (i, filter) in filters.iter().enumerate() {
+        // A `/Crypt` filter selects the stream's cipher; the decryption it
+        // names was applied when the object was resolved.
+        if filter.as_str() == "Crypt" {
+            continue;
+        }
         let params = decode_parms[i].as_ref();
 
         // Apply filter to current data
         let decoded = apply_filter(filter, &current, params, limits, &mut budget)?;
 
         // Apply predictor if specified
-        current = if let Some(p) = params {
+        current = std::borrow::Cow::Owned(if let Some(p) = params {
             let predictor = p.get_i64("Predictor").unwrap_or(1);
             if predictor == 2 || predictor >= 10 {
                 apply_predictor(&decoded, p, &mut budget)?
@@ -89,10 +95,10 @@ pub fn decode_stream_with_limits(
             }
         } else {
             decoded
-        };
+        });
     }
 
-    Ok(current)
+    Ok(current.into_owned())
 }
 
 /// Decode a PDF stream through its filter chain using default limits.
@@ -129,14 +135,14 @@ fn extract_decode_parms(dict: &PdfDict, filter_count: usize) -> Vec<Option<PdfDi
     }
 }
 
+/// Undo a TIFF or PNG predictor. The output replaces the filter output it is
+/// computed from, which the filter already charged to `budget`; only growth
+/// beyond it (a padded partial PNG row) is charged again.
 fn apply_predictor(data: &[u8], params: &PdfDict, budget: &mut DecodeBudget) -> Result<Vec<u8>> {
     let predictor = params.get_i64("Predictor").unwrap_or(1) as u32;
     if predictor == 1 {
         return Ok(data.to_vec());
     }
-
-    // H1 Fix: Reserve budget for predictor output before allocation
-    budget.reserve(data.len() as u64)?;
 
     // Validate parameters with reasonable PDF limits to prevent overflow attacks.
     // PDF spec typically uses modest values, but we allow generous bounds.
@@ -160,7 +166,7 @@ fn apply_predictor(data: &[u8], params: &PdfDict, budget: &mut DecodeBudget) -> 
     if predictor == 2 {
         decode_tiff_predictor(data, colors, bpc, columns)
     } else if predictor >= 10 {
-        decode_png_predictor(data, colors, bpc, columns)
+        decode_png_predictor(data, colors, bpc, columns, budget)
     } else {
         Ok(data.to_vec())
     }
@@ -207,7 +213,13 @@ fn decode_tiff_predictor(
     Ok(output)
 }
 
-fn decode_png_predictor(data: &[u8], colors: usize, bpc: usize, columns: usize) -> Result<Vec<u8>> {
+fn decode_png_predictor(
+    data: &[u8],
+    colors: usize,
+    bpc: usize,
+    columns: usize,
+    budget: &mut DecodeBudget,
+) -> Result<Vec<u8>> {
     // L1 Fix: Explicit validation of parameters before processing
     if colors == 0 || columns == 0 {
         return Err(Error::StreamDecode(
@@ -255,6 +267,9 @@ fn decode_png_predictor(data: &[u8], colors: usize, bpc: usize, columns: usize) 
     let output_size = num_rows
         .checked_mul(row_bytes)
         .ok_or_else(|| Error::StreamDecode("PNG predictor: output size overflow".into()))?;
+    // Rows lose their filter byte, but a partial last row is padded to a full
+    // one, which can outgrow the input.
+    budget.reserve(output_size.saturating_sub(data.len()) as u64)?;
     let mut output = Vec::with_capacity(output_size);
     let mut prev_row = vec![0u8; row_bytes];
 
@@ -359,7 +374,7 @@ fn apply_filter(
         "JBIG2Decode" => {
             let jbig2_params = crate::jbig2::Jbig2Params::from_dict(params);
             // M2 Fix: Thread budget through to prevent decompression bombs
-            crate::jbig2::decode(data, &jbig2_params, budget)
+            crate::jbig2::decode(data, &jbig2_params, limits.max_image_pixels, budget)
         }
         // JPXDecode output is decoded *pixels*, not raw samples, and JPEG 2000
         // carries its own colour-space/alpha metadata that a bytes-only filter
@@ -381,49 +396,77 @@ fn apply_filter(
 /// DecodeParms EarlyChange value (default 1); when 1 the code width is increased
 /// one code earlier than the natural boundary.
 fn lzw_decode(data: &[u8], early_change: i64, budget: &mut DecodeBudget) -> Result<Vec<u8>> {
-    const CLEAR: u32 = 256;
-    const EOD: u32 = 257;
+    const CLEAR: usize = 256;
+    const EOD: usize = 257;
+    const NO_PREFIX: u16 = u16::MAX;
+
+    /// A dictionary string: its last byte appended to the string of code
+    /// `prefix`. Strings are written out by walking the prefix chain from the
+    /// end, so no entry owns a copy of its bytes.
+    #[derive(Clone, Copy)]
+    struct Entry {
+        prefix: u16,
+        byte: u8,
+        first: u8,
+        len: u16,
+    }
+
+    /// Write the string of `code` into `buf`, which is exactly its length.
+    fn write_string(table: &[Entry], mut code: usize, buf: &mut [u8]) {
+        for slot in buf.iter_mut().rev() {
+            let entry = table[code];
+            *slot = entry.byte;
+            code = entry.prefix as usize;
+        }
+    }
 
     // EarlyChange is effectively a flag: any nonzero -> 1, explicit 0 -> 0.
     let early: u32 = if early_change == 0 { 0 } else { 1 };
 
-    // Dictionary: index = code, value = decoded byte string. Slots 0..=255 are
-    // single bytes; 256/257 are placeholders so the first dynamic code is 258.
-    let mut table: Vec<Vec<u8>> = Vec::with_capacity(4096);
-    let reset = |t: &mut Vec<Vec<u8>>| {
+    // Dictionary: index = code. Slots 0..=255 are single bytes; 256/257 are
+    // placeholders so the first dynamic code is 258.
+    let mut table: Vec<Entry> = Vec::with_capacity(4096);
+    let reset = |t: &mut Vec<Entry>| {
         t.clear();
-        for i in 0..256u32 {
-            t.push(vec![i as u8]);
-        }
-        t.push(Vec::new()); // 256 CLEAR (unused as a string)
-        t.push(Vec::new()); // 257 EOD   (unused as a string)
+        t.extend((0..=255u8).map(|b| Entry {
+            prefix: NO_PREFIX,
+            byte: b,
+            first: b,
+            len: 1,
+        }));
+        let placeholder = Entry {
+            prefix: NO_PREFIX,
+            byte: 0,
+            first: 0,
+            len: 0,
+        };
+        t.push(placeholder); // 256 CLEAR (unused as a string)
+        t.push(placeholder); // 257 EOD   (unused as a string)
     };
     reset(&mut table);
 
     let mut width: u32 = 9;
-    let mut bit_pos: usize = 0;
-    let total_bits = data.len() * 8;
-
-    // MSB-first reader; returns None when fewer than `width` bits remain.
-    let read_code = |bit_pos: &mut usize, width: u32| -> Option<u32> {
-        if *bit_pos + width as usize > total_bits {
-            return None;
+    // MSB-first reader over a small bit accumulator; returns None when fewer
+    // than `width` bits remain.
+    let mut acc: u32 = 0;
+    let mut acc_bits: u32 = 0;
+    let mut bytes = data.iter();
+    let mut read_code = |width: u32| -> Option<usize> {
+        while acc_bits < width {
+            acc = (acc << 8) | *bytes.next()? as u32;
+            acc_bits += 8;
         }
-        let mut code: u32 = 0;
-        for _ in 0..width {
-            let byte = data[*bit_pos / 8];
-            let bit = (byte >> (7 - (*bit_pos % 8))) & 1;
-            code = (code << 1) | bit as u32;
-            *bit_pos += 1;
-        }
-        Some(code)
+        acc_bits -= width;
+        let code = acc >> acc_bits;
+        acc &= (1 << acc_bits) - 1;
+        Some(code as usize)
     };
 
     let mut out: Vec<u8> = Vec::new();
-    let mut prev: Option<u32> = None;
+    let mut prev: Option<usize> = None;
 
     // Stop when input is exhausted (some streams omit the EOD marker).
-    while let Some(code) = read_code(&mut bit_pos, width) {
+    while let Some(code) = read_code(width) {
         if code == EOD {
             break;
         }
@@ -434,17 +477,14 @@ fn lzw_decode(data: &[u8], early_change: i64, budget: &mut DecodeBudget) -> Resu
             continue;
         }
 
-        // Resolve the output string for this code.
-        let entry: Vec<u8> = if (code as usize) < table.len() {
-            table[code as usize].clone()
-        } else if code as usize == table.len() {
-            // KwKwK: code refers to the entry we are about to define.
+        // Resolve the output string for this code: its length and first byte.
+        let (len, first) = if code < table.len() {
+            (table[code].len as usize, table[code].first)
+        } else if code == table.len() {
+            // KwKwK: code refers to the entry we are about to define, the
+            // previous string plus its own first byte.
             match prev {
-                Some(p) => {
-                    let mut e = table[p as usize].clone();
-                    e.push(table[p as usize][0]);
-                    e
-                }
+                Some(p) => (table[p].len as usize + 1, table[p].first),
                 None => {
                     return Err(Error::StreamDecode(format!(
                         "LZWDecode: code {code} before any literal"
@@ -459,22 +499,32 @@ fn lzw_decode(data: &[u8], early_change: i64, budget: &mut DecodeBudget) -> Resu
         };
 
         // H1 Fix: Reserve budget before extending output
-        budget.reserve(entry.len() as u64)?;
-        out.extend_from_slice(&entry);
+        budget.reserve(len as u64)?;
+        let start = out.len();
+        out.resize(start + len, 0);
+        match prev {
+            Some(p) if code == table.len() => {
+                write_string(&table, p, &mut out[start..start + len - 1]);
+                out[start + len - 1] = first;
+            }
+            _ => write_string(&table, code, &mut out[start..]),
+        }
 
         // Add new dictionary entry = previous string + first byte of this entry.
         // (Skipped for the first code after a clear, when prev is None.)
         if let Some(p) = prev {
             // M5 Fix: Enforce the LZW table size limit of 4096 entries (codes 0-4095).
             // The spec dictates max code width is 12 bits (2^12 = 4096), so adding
-            // beyond this would violate the protocol.
-            if table.len() >= 4096 {
-                // Table is full; don't add new entries until a CLEAR resets it.
-                // This is standard LZW behavior when the table maxes out.
-            } else {
-                let mut new_entry = table[p as usize].clone();
-                new_entry.push(entry[0]);
-                table.push(new_entry);
+            // beyond this would violate the protocol. Once full, no entries are
+            // added until a CLEAR resets it (standard LZW behavior).
+            if table.len() < 4096 {
+                let base = table[p];
+                table.push(Entry {
+                    prefix: p as u16,
+                    byte: first,
+                    first: base.first,
+                    len: base.len + 1,
+                });
             }
         }
         prev = Some(code);
@@ -649,13 +699,10 @@ fn decode_ascii_hex(data: &[u8], budget: &mut DecodeBudget) -> Result<Vec<u8>> {
 /// the alphabet are skipped (warned, not fatal), and everything from the `~`
 /// of the `~>` EOD marker on is ignored, salvaging partial output.
 fn decode_ascii85(data: &[u8], budget: &mut DecodeBudget) -> Result<Vec<u8>> {
-    // M6 Fix: Reserve budget upfront for worst-case output size.
-    // Each 5-char ASCII85 group decodes to 4 bytes, plus special 'z' → 4 bytes.
-    // Worst case: all 'z' chars → data.len() * 4 bytes. Over-reservation is safe.
-    let max_output = (data.len() as u64).saturating_mul(4);
-    budget.reserve(max_output)?;
-
-    let mut output = Vec::new();
+    // M6 Fix: charge the budget per decoded group, i.e. exactly the output.
+    // A 'z' expands one byte to four, so reserving the 4x worst case up front
+    // rejected ordinary streams (about 0.8x) beyond a quarter of the budget.
+    let mut output = Vec::with_capacity(data.len() / 5 * 4);
     // u64 accumulator: a 5-char group of bytes near 'u' encodes a value just
     // above u32::MAX; the spec calls it invalid, but it must not overflow.
     let mut tuple: u64 = 0;
@@ -671,6 +718,7 @@ fn decode_ascii85(data: &[u8], budget: &mut DecodeBudget) -> Result<Vec<u8>> {
         }
 
         if b == b'z' && count == 0 {
+            budget.reserve(4)?;
             output.extend_from_slice(&[0, 0, 0, 0]);
             continue;
         }
@@ -684,6 +732,7 @@ fn decode_ascii85(data: &[u8], budget: &mut DecodeBudget) -> Result<Vec<u8>> {
         count += 1;
 
         if count == 5 {
+            budget.reserve(4)?;
             let t = (tuple & 0xFFFF_FFFF) as u32;
             output.extend_from_slice(&t.to_be_bytes());
             tuple = 0;
@@ -693,6 +742,7 @@ fn decode_ascii85(data: &[u8], budget: &mut DecodeBudget) -> Result<Vec<u8>> {
 
     // Handle remaining bytes
     if count > 1 {
+        budget.reserve(count as u64 - 1)?;
         for _ in count..5 {
             tuple = tuple * 85 + 84; // pad with 'u'
         }
@@ -747,43 +797,9 @@ fn validate_jpeg_dimensions(
 }
 
 fn decode_dct(data: &[u8], max_image_pixels: u64, budget: &mut DecodeBudget) -> Result<Vec<u8>> {
+    use zune_jpeg::zune_core::colorspace::ColorSpace;
+    use zune_jpeg::zune_core::options::DecoderOptions;
     use zune_jpeg::JpegDecoder;
-
-    // Adobe YCCK JPEGs (APP14 transform == 2, 4 components) are mis-handled by
-    // zune-jpeg's built-in YCCK->RGB: it applies a spurious `255 - x`, producing
-    // a colour-negative image (a white CMYK page reads back as black). zune has
-    // no YCCK->CMYK arm either, so we take the raw YCCK channels and convert them
-    // ourselves. Plain Adobe CMYK (transform 0) decodes correctly via zune's
-    // CMYK->RGB, so it stays on the default path.
-    if jpeg_is_adobe_ycck(data) {
-        use zune_jpeg::zune_core::colorspace::ColorSpace;
-        use zune_jpeg::zune_core::options::DecoderOptions;
-        let opts = DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::YCCK);
-        let mut decoder = JpegDecoder::new_with_options(std::io::Cursor::new(data), opts);
-
-        // H2 Fix: Validate JPEG dimensions before decode to prevent allocation bomb
-        decoder
-            .decode_headers()
-            .map_err(|e| Error::StreamDecode(format!("DCTDecode header parse failed: {e}")))?;
-        if let Some(info) = decoder.info() {
-            validate_jpeg_dimensions(
-                info.width,
-                info.height,
-                info.components,
-                max_image_pixels,
-                budget,
-            )?;
-        }
-
-        match decoder.decode() {
-            Ok(ycck) if decoder.output_colorspace() == Some(ColorSpace::YCCK) => {
-                return Ok(ycck_to_rgb(&ycck));
-            }
-            // Unexpected (e.g. not actually 4-component): fall through to the
-            // default decode rather than mangle the data.
-            _ => {}
-        }
-    }
 
     let mut decoder = JpegDecoder::new(std::io::Cursor::new(data));
 
@@ -801,90 +817,57 @@ fn decode_dct(data: &[u8], max_image_pixels: u64, budget: &mut DecodeBudget) -> 
         )?;
     }
 
+    // Four-component JPEGs (plain CMYK, or Adobe YCCK — APP14 transform 2)
+    // are emitted as raw CMYK, 4 bytes/pixel, never colour-converted here:
+    // zune-jpeg's CMYK/YCCK→RGB is the naïve `C·K/255` product (with a
+    // spurious inversion on YCCK), which would bypass the DeviceCMYK
+    // conversion — SWOP polynomial, ICCBased profile or output intent — and a
+    // 4-component /Decode that the image decoder applies to CMYK samples. The
+    // samples keep their stored polarity, as libjpeg delivers them: in PDF an
+    // Adobe-inverted CMYK JPEG carries `/Decode [1 0 1 0 1 0 1 0]` (the
+    // pdf.js/MuPDF convention).
+    if let Some(cs @ (ColorSpace::CMYK | ColorSpace::YCCK)) = decoder.input_colorspace() {
+        let opts = DecoderOptions::default().jpeg_set_out_colorspace(cs);
+        let mut raw = JpegDecoder::new_with_options(std::io::Cursor::new(data), opts);
+        match raw.decode() {
+            Ok(mut samples)
+                if raw.output_colorspace() == Some(cs) && samples.len().is_multiple_of(4) =>
+            {
+                if cs == ColorSpace::YCCK {
+                    ycck_to_cmyk(&mut samples);
+                }
+                return Ok(samples);
+            }
+            // Unexpected (e.g. not actually 4-component): fall back to the
+            // default decode rather than mangle the data.
+            Ok(_) => tracing::warn!("DCTDecode: unexpected raw {cs:?} output; decoding as RGB"),
+            Err(e) => tracing::warn!("DCTDecode: raw {cs:?} decode failed ({e}); decoding as RGB"),
+        }
+    }
+
     decoder
         .decode()
         .map_err(|e| Error::StreamDecode(format!("DCTDecode: {e}")))
 }
 
-/// Convert raw upsampled Adobe YCCK samples (`Y, Cb, Cr, K` per pixel) to RGB.
+/// Convert raw upsampled Adobe YCCK samples (`Y, Cb, Cr, K` per pixel) to
+/// CMYK in place, as libjpeg's YCCK→CMYK does.
 ///
 /// In Adobe YCCK the chroma channels encode the *complement* of C/M/Y, so the
-/// JFIF YCbCr->RGB output is the transmitted (inverted) ink: `C = 1 − R'`,
-/// `M = 1 − G'`, `Y = 1 − B'`. The 4th channel is the black-ink amount
-/// (`K_raw = 255` ⇒ full black). The recovered DeviceCMYK is converted through
-/// the shared Adobe polynomial ([`zpdf_color::cmyk_to_rgb`]) so YCCK JPEGs match
-/// every other DeviceCMYK path — e.g. 100 % K is a dark near-black, not pure
-/// black. (The previous `channel * (255 − K_raw)` shortcut was the naïve
-/// `(1−c)(1−k)`, which over-saturated like a non-fidelity viewer.)
-fn ycck_to_rgb(ycck: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(ycck.len() / 4 * 3);
-    for px in ycck.as_chunks::<4>().0 {
+/// JFIF YCbCr→RGB output is the transmitted light: `C = 255 − R'`,
+/// `M = 255 − G'`, `Y = 255 − B'`. The 4th channel is the black-ink amount
+/// and passes through unchanged (`K_raw = 255` ⇒ full black).
+fn ycck_to_cmyk(samples: &mut [u8]) {
+    for px in samples.as_chunks_mut::<4>().0 {
         let (y, cb, cr) = (px[0] as f64, px[1] as f64, px[2] as f64);
         // JFIF YCbCr -> R'G'B' (transmitted light = complement of C/M/Y ink).
         let rp = (y + 1.402 * (cr - 128.0)).clamp(0.0, 255.0);
         let gp = (y - 0.344_136 * (cb - 128.0) - 0.714_136 * (cr - 128.0)).clamp(0.0, 255.0);
         let bp = (y + 1.772 * (cb - 128.0)).clamp(0.0, 255.0);
-        let (r, g, b) = zpdf_color::cmyk_to_rgb(
-            1.0 - rp / 255.0,
-            1.0 - gp / 255.0,
-            1.0 - bp / 255.0,
-            px[3] as f64 / 255.0,
-        );
-        out.push((r * 255.0).round() as u8);
-        out.push((g * 255.0).round() as u8);
-        out.push((b * 255.0).round() as u8);
+        px[0] = (255.0 - rp).round() as u8;
+        px[1] = (255.0 - gp).round() as u8;
+        px[2] = (255.0 - bp).round() as u8;
     }
-    out
-}
-
-/// Scan a JPEG for an Adobe APP14 marker with transform 2 (YCCK) over a SOF that
-/// declares 4 components. Cheap byte walk over the marker segments only.
-fn jpeg_is_adobe_ycck(data: &[u8]) -> bool {
-    let mut adobe_ycck = false;
-    let mut four_components = false;
-    let mut i = 2; // skip SOI (FFD8)
-    while i + 3 < data.len() {
-        if data[i] != 0xFF {
-            i += 1;
-            continue;
-        }
-        let marker = data[i + 1];
-        // Standalone markers (no length): padding fill, SOI/EOI, RSTn, TEM.
-        if marker == 0xFF || marker == 0x01 || (0xD0..=0xD9).contains(&marker) {
-            i += 2;
-            continue;
-        }
-        let seg_len = ((data[i + 2] as usize) << 8) | data[i + 3] as usize;
-        if seg_len < 2 {
-            break;
-        }
-        let payload_start = i + 4;
-        let payload_end = i + 2 + seg_len;
-        if payload_end > data.len() {
-            break;
-        }
-        let payload = &data[payload_start..payload_end];
-        match marker {
-            // APP14: "Adobe" + version(2) + flags0(2) + flags1(2) + transform(1).
-            0xEE => {
-                if payload.len() >= 12 && &payload[0..5] == b"Adobe" {
-                    adobe_ycck = payload[11] == 2;
-                }
-            }
-            // SOFn (baseline/progressive/etc.), excluding DHT(C4)/JPG(C8)/DAC(CC).
-            0xC0..=0xCF if marker != 0xC4 && marker != 0xC8 && marker != 0xCC => {
-                // precision(1) + height(2) + width(2) + Nf(1).
-                if payload.len() >= 6 {
-                    four_components = payload[5] == 4;
-                }
-            }
-            // Start of scan: header is done.
-            0xDA => break,
-            _ => {}
-        }
-        i = payload_end;
-    }
-    adobe_ycck && four_components
 }
 
 fn decode_run_length(data: &[u8], budget: &mut DecodeBudget) -> Result<Vec<u8>> {
@@ -929,54 +912,82 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ycck_white_decodes_white_not_black() {
-        // Adobe white (no ink): Y=255, Cb=Cr=128 (neutral), K_raw=0 → CMYK all 0.
-        let rgb = ycck_to_rgb(&[255, 128, 128, 0]);
-        assert_eq!(rgb, vec![255, 255, 255], "Adobe YCCK white must stay white");
+    fn ycck_white_decodes_to_no_ink() {
+        // Adobe white: Y=255, Cb=Cr=128 (neutral), K_raw=0 → CMYK all 0.
+        let mut px = [255, 128, 128, 0];
+        ycck_to_cmyk(&mut px);
+        assert_eq!(px, [0, 0, 0, 0], "Adobe YCCK white must stay white");
     }
 
     #[test]
-    fn ycck_full_black_ink_decodes_near_black() {
-        // K_raw=255 ⇒ CMYK (0,0,0,1). The Adobe DeviceCMYK polynomial renders
-        // 100% K as a dark near-black, not pure black (matches every other path).
-        let rgb = ycck_to_rgb(&[255, 128, 128, 255]);
-        assert_eq!(rgb, vec![44, 46, 53]);
+    fn ycck_black_channel_passes_through() {
+        // K_raw is the black-ink amount, unchanged by the conversion.
+        let mut px = [255, 128, 128, 255, 255, 128, 128, 128];
+        ycck_to_cmyk(&mut px);
+        assert_eq!(px, [0, 0, 0, 255, 0, 0, 0, 128]);
     }
 
     #[test]
-    fn ycck_neutral_gray_via_polynomial() {
-        // No CMY (chroma neutral, luma full) with half black ink ⇒ CMYK
-        // (0,0,0,0.5); the polynomial maps it lighter than the naïve 127.
-        let rgb = ycck_to_rgb(&[255, 128, 128, 128]);
-        assert_eq!(rgb, vec![154, 156, 159]);
+    fn ycck_colored_pixel_recovers_cmy() {
+        // Non-neutral chroma exercises the C/M/Y recovery:
+        // R' = 200 + 1.402·22 ≈ 230.8, G' ≈ 200 + 9.6 − 15.7 ≈ 193.9,
+        // B' = 200 − 49.6 ≈ 150.4.
+        let mut px = [200, 100, 150, 50];
+        ycck_to_cmyk(&mut px);
+        assert_eq!(px, [24, 61, 105, 50]);
     }
 
-    #[test]
-    fn ycck_colored_pixel_via_polynomial() {
-        // Non-neutral chroma exercises the C/M/Y recovery + the full polynomial.
-        let rgb = ycck_to_rgb(&[200, 100, 150, 50]);
-        assert_eq!(rgb, vec![198, 165, 131]);
-    }
-
-    #[test]
-    fn adobe_ycck_detection() {
-        // Minimal marker stream: SOI, APP14(Adobe, transform=2), SOF0(4 comp), SOS.
+    /// Smallest 4-component baseline JPEG (8x8, every coefficient 0 → each
+    /// channel decodes to 128), optionally tagged with an Adobe APP14 marker.
+    fn tiny_four_component_jpeg(adobe_transform: Option<u8>) -> Vec<u8> {
         let mut j = vec![0xFF, 0xD8];
-        // APP14, len=16: "Adobe"(5)+ver(2)+f0(2)+f1(2)+transform(1) = 12 payload, +2 len = 14... use 16 with pad.
-        j.extend_from_slice(&[0xFF, 0xEE, 0x00, 0x0E]);
-        j.extend_from_slice(b"Adobe");
-        j.extend_from_slice(&[0x00, 0x64, 0x00, 0x00, 0x00, 0x00, 0x02]); // version, flags, transform=2
-                                                                          // SOF0, len=17 (1 prec + 2 h + 2 w + 1 Nf=4 + 4*3 comp specs) -> payload 6+ needed.
-        j.extend_from_slice(&[0xFF, 0xC0, 0x00, 0x11, 0x08, 0x00, 0x10, 0x00, 0x10, 0x04]);
+        if let Some(transform) = adobe_transform {
+            j.extend_from_slice(&[0xFF, 0xEE, 0x00, 0x0E]);
+            j.extend_from_slice(b"Adobe");
+            j.extend_from_slice(&[0x00, 0x64, 0x00, 0x00, 0x00, 0x00, transform]);
+        }
+        // DQT: table 0, all ones.
+        j.extend_from_slice(&[0xFF, 0xDB, 0x00, 0x43, 0x00]);
+        j.extend_from_slice(&[1; 64]);
+        // SOF0: 8-bit, 8x8, 4 components, 1x1 sampling, quant table 0.
+        j.extend_from_slice(&[0xFF, 0xC0, 0x00, 0x14, 0x08, 0x00, 0x08, 0x00, 0x08, 0x04]);
         j.extend_from_slice(&[1, 0x11, 0, 2, 0x11, 0, 3, 0x11, 0, 4, 0x11, 0]);
-        j.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x02]); // SOS
-        assert!(jpeg_is_adobe_ycck(&j));
+        // DHT DC table 0: a single 1-bit code for category 0.
+        j.extend_from_slice(&[0xFF, 0xC4, 0x00, 0x14, 0x00, 1]);
+        j.extend_from_slice(&[0; 15]);
+        j.push(0);
+        // DHT AC table 0: a single 1-bit code for EOB (0x00).
+        j.extend_from_slice(&[0xFF, 0xC4, 0x00, 0x14, 0x10, 1]);
+        j.extend_from_slice(&[0; 15]);
+        j.push(0);
+        // SOS over all four components, then the entropy data: per component
+        // DC "0" + AC EOB "0" = 8 zero bits in all, padded to one byte.
+        j.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x0E, 0x04]);
+        j.extend_from_slice(&[1, 0x00, 2, 0x00, 3, 0x00, 4, 0x00, 0x00, 0x3F, 0x00]);
+        j.push(0x00);
+        j.extend_from_slice(&[0xFF, 0xD9]);
+        j
+    }
 
-        // transform=0 (plain CMYK) must NOT take the YCCK path.
-        let mut j0 = j.clone();
-        // transform byte is at: 2 (SOI) + 4 (app14 hdr) + 11 = index 17.
-        j0[17] = 0;
-        assert!(!jpeg_is_adobe_ycck(&j0));
+    #[test]
+    fn four_component_jpegs_decode_to_raw_cmyk() {
+        // Plain CMYK (no marker, or Adobe transform 0): raw samples, 4 bytes
+        // per pixel, no naïve CMYK→RGB product and no inversion.
+        for transform in [None, Some(0)] {
+            let jpeg = tiny_four_component_jpeg(transform);
+            let out = decode_dct(&jpeg, u64::MAX, &mut DecodeBudget::new(1 << 20)).unwrap();
+            assert_eq!(out.len(), 8 * 8 * 4, "{transform:?}");
+            assert!(
+                out.iter().all(|&v| v == 128),
+                "{transform:?}: {:?}",
+                &out[..4]
+            );
+        }
+        // Adobe YCCK: neutral chroma at Y=128 → C=M=Y=127, K unchanged.
+        let jpeg = tiny_four_component_jpeg(Some(2));
+        let out = decode_dct(&jpeg, u64::MAX, &mut DecodeBudget::new(1 << 20)).unwrap();
+        assert_eq!(out.len(), 8 * 8 * 4);
+        assert_eq!(&out[..4], &[127, 127, 127, 128]);
     }
 
     #[test]
@@ -1110,6 +1121,69 @@ mod tests {
         assert_eq!(decoded, b"Hello");
     }
 
+    fn limits_with_budget(bytes: u64) -> ParseLimits {
+        ParseLimits {
+            max_decoded_stream_bytes: bytes,
+            ..ParseLimits::default()
+        }
+    }
+
+    fn zlib(data: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(data).unwrap();
+        enc.finish().unwrap()
+    }
+
+    /// The budget is charged with what a stream actually decodes to: ASCII85
+    /// per decoded group (not 4x its input), a predictor only for growth.
+    #[test]
+    fn decode_budget_charges_actual_output() {
+        let mut dict = PdfDict::new();
+        dict.insert(
+            PdfName::new("Filter"),
+            PdfObject::Name(PdfName::new("ASCII85Decode")),
+        );
+        let a85 = [b"9jqo^".repeat(60), b"~>".to_vec()].concat(); // 302 bytes -> 240
+        let out = decode_stream_with_limits(&a85, &dict, &limits_with_budget(1000)).unwrap();
+        assert_eq!(out.len(), 240);
+        assert!(decode_stream_with_limits(&a85, &dict, &limits_with_budget(239)).is_err());
+
+        // 100 rows of (filter byte + 9 samples): 1000 inflated bytes, 900 out.
+        let rows: Vec<u8> = (0..100).flat_map(|_| [0u8; 10]).collect();
+        let mut parms = PdfDict::new();
+        parms.insert(PdfName::new("Predictor"), PdfObject::Integer(12));
+        parms.insert(PdfName::new("Columns"), PdfObject::Integer(9));
+        let mut dict = PdfDict::new();
+        dict.insert(
+            PdfName::new("Filter"),
+            PdfObject::Name(PdfName::new("FlateDecode")),
+        );
+        dict.insert(PdfName::new("DecodeParms"), PdfObject::Dict(parms));
+        let out =
+            decode_stream_with_limits(&zlib(&rows), &dict, &limits_with_budget(1500)).unwrap();
+        assert_eq!(out.len(), 900);
+    }
+
+    /// A partial last PNG row is padded to a full row; that growth is charged.
+    #[test]
+    fn padded_predictor_row_is_charged() {
+        let mut parms = PdfDict::new();
+        parms.insert(PdfName::new("Predictor"), PdfObject::Integer(12));
+        parms.insert(PdfName::new("Columns"), PdfObject::Integer(65_536));
+        parms.insert(PdfName::new("Colors"), PdfObject::Integer(4));
+        let mut dict = PdfDict::new();
+        dict.insert(
+            PdfName::new("Filter"),
+            PdfObject::Name(PdfName::new("FlateDecode")),
+        );
+        dict.insert(PdfName::new("DecodeParms"), PdfObject::Dict(parms));
+        let data = zlib(&[0]);
+        assert!(decode_stream_with_limits(&data, &dict, &limits_with_budget(100_000)).is_err());
+        let out = decode_stream_with_limits(&data, &dict, &limits_with_budget(1 << 20)).unwrap();
+        assert_eq!(out.len(), 65_536 * 4);
+    }
+
     #[test]
     fn ascii85_basic() {
         // "Man " encodes to "9jqo^" in ASCII85
@@ -1166,7 +1240,8 @@ mod tests {
         // 2 columns, 1 color, 8 bpc → row_bytes = 2, stride = 3
         // filter=0 (None): [0, 0x41, 0x42]
         let data = [0, 0x41, 0x42];
-        let result = decode_png_predictor(&data, 1, 8, 2).unwrap();
+        let result =
+            decode_png_predictor(&data, 1, 8, 2, &mut DecodeBudget::new(u64::MAX)).unwrap();
         assert_eq!(result, vec![0x41, 0x42]);
     }
 
@@ -1175,7 +1250,8 @@ mod tests {
         // filter=1 (Sub), bpp=1: each byte += left
         // row: [1, 10, 5, 3] → decoded: [10, 15, 18]
         let data = [1, 10, 5, 3];
-        let result = decode_png_predictor(&data, 1, 8, 3).unwrap();
+        let result =
+            decode_png_predictor(&data, 1, 8, 3, &mut DecodeBudget::new(u64::MAX)).unwrap();
         assert_eq!(result, vec![10, 15, 18]);
     }
 
@@ -1185,7 +1261,8 @@ mod tests {
         // row1: [0, 10, 20] → [10, 20]
         // row2: [2, 5, 3]   → [15, 23]
         let data = [0, 10, 20, 2, 5, 3];
-        let result = decode_png_predictor(&data, 1, 8, 2).unwrap();
+        let result =
+            decode_png_predictor(&data, 1, 8, 2, &mut DecodeBudget::new(u64::MAX)).unwrap();
         assert_eq!(result, vec![10, 20, 15, 23]);
     }
 
@@ -1198,7 +1275,8 @@ mod tests {
         //   i=1: paeth(15, 20, 10)=20, 7+20=27
         //   i=2: paeth(27, 30, 20)=30, 3+30=33
         let data = [0, 10, 20, 30, 4, 5, 7, 3];
-        let result = decode_png_predictor(&data, 1, 8, 3).unwrap();
+        let result =
+            decode_png_predictor(&data, 1, 8, 3, &mut DecodeBudget::new(u64::MAX)).unwrap();
         assert_eq!(result, vec![10, 20, 30, 15, 27, 33]);
     }
 

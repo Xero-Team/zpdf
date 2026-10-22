@@ -28,9 +28,20 @@ use crate::filters::DecodeBudget;
 /// Output-size safety cap for the packed page bitmap (matches the sibling
 /// CCITT decoder and the ParseLimits::max_stream_bytes default).
 const MAX_OUTPUT: usize = 256 * 1024 * 1024;
-/// Cap on any single bitmap's pixel count (page, region, or symbol). Internal
-/// bitmaps spend one byte per pixel, so this also bounds working memory.
+/// Hard cap on any single bitmap's pixel count (page, region, or symbol).
+/// Internal bitmaps spend one byte per pixel, so this also bounds working
+/// memory. `ParseLimits::max_image_pixels` tightens it per decode
+/// ([`PixelLimits`]).
 const MAX_BITMAP_PIXELS: usize = 1 << 28;
+/// Region drawing (halftone pattern placement, text-region symbol placement)
+/// may composite at most this many passes over the largest page or region
+/// bitmap of the decode. Real streams tile their patterns and glyphs; a grid
+/// or instance list that piles placements onto one spot is a hang vector,
+/// since its cost is placements × pattern area, not output area.
+const DRAW_BUDGET_FACTOR: u64 = 64;
+/// Floor of the drawing budget, so small pages and dictionaries decoded
+/// before any page (globals) are never constrained by the factor alone.
+const DRAW_BUDGET_FLOOR: u64 = 1 << 26;
 /// Plausibility bound on any declared width/height/placement (mirrors the
 /// CCITT decoder's /Columns bound).
 const MAX_DIMENSION: usize = 1 << 20;
@@ -86,8 +97,15 @@ impl Jbig2Params {
 ///
 /// M2 Fix: Now tracks cumulative budget to prevent decompression bombs. The
 /// budget is threaded through to nested CCITT MMR decoding within JBIG2.
-pub fn decode(data: &[u8], params: &Jbig2Params, budget: &mut DecodeBudget) -> Result<Vec<u8>> {
-    let mut dec = Decoder::new(budget);
+/// `max_image_pixels` (from `ParseLimits`) caps every bitmap and halftone grid
+/// the decoder allocates, the page included.
+pub fn decode(
+    data: &[u8],
+    params: &Jbig2Params,
+    max_image_pixels: u64,
+    budget: &mut DecodeBudget,
+) -> Result<Vec<u8>> {
+    let mut dec = Decoder::new(budget, max_image_pixels);
     if let Some(globals) = &params.globals {
         dec.process_segments(globals)?;
     }
@@ -97,6 +115,62 @@ pub fn decode(data: &[u8], params: &Jbig2Params, budget: &mut DecodeBudget) -> R
 
 fn err(msg: impl std::fmt::Display) -> Error {
     Error::StreamDecode(format!("JBIG2Decode: {msg}"))
+}
+
+/// Per-decode pixel limits shared by every segment of one stream.
+struct PixelLimits {
+    /// Cap on any single bitmap or halftone grid: [`MAX_BITMAP_PIXELS`]
+    /// tightened by `ParseLimits::max_image_pixels`.
+    max_pixels: usize,
+    /// Pixels composited so far by the region drawing loops.
+    drawn: u64,
+    /// Ceiling for `drawn`: [`DRAW_BUDGET_FACTOR`] passes over the largest
+    /// page or region bitmap seen, and at least [`DRAW_BUDGET_FLOOR`].
+    draw_limit: u64,
+}
+
+impl PixelLimits {
+    fn new(max_image_pixels: u64) -> Self {
+        Self {
+            max_pixels: usize::try_from(max_image_pixels)
+                .unwrap_or(usize::MAX)
+                .min(MAX_BITMAP_PIXELS),
+            drawn: 0,
+            draw_limit: DRAW_BUDGET_FLOOR,
+        }
+    }
+
+    /// Reject a `width`×`height` bitmap (or grid) above the pixel cap.
+    fn check(&self, width: usize, height: usize, what: &str) -> Result<()> {
+        match width.checked_mul(height) {
+            Some(p) if p <= self.max_pixels => Ok(()),
+            _ => Err(err(format!(
+                "{what} {width}x{height} exceeds the {}-pixel limit",
+                self.max_pixels
+            ))),
+        }
+    }
+
+    /// Extend the drawing budget to cover a destination of `area` pixels.
+    fn cover(&mut self, area: usize) {
+        self.draw_limit = self
+            .draw_limit
+            .max((area as u64).saturating_mul(DRAW_BUDGET_FACTOR));
+    }
+
+    /// Account for `pixels` about to be composited. Once the budget is spent
+    /// every later placement fails too, so the offending region (and any
+    /// after it) renders blank instead of spinning.
+    fn charge(&mut self, pixels: usize) -> Result<()> {
+        self.drawn = self.drawn.saturating_add(pixels as u64);
+        if self.drawn > self.draw_limit {
+            return Err(err(format!(
+                "region drawing exceeded the {}-pixel budget",
+                self.draw_limit
+            )));
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -166,54 +240,53 @@ fn compose_bitmap(dst: &mut Bitmap, src: &Bitmap, x0: usize, y0: usize, op: u8) 
     }
 }
 
-/// Place a halftone pattern onto a region bitmap at a possibly-negative origin
-/// with a combination operator (0 = OR, 1 = AND, 2 = XOR, 3 = XNOR, 4 = REPLACE).
-fn place_pattern(dst: &mut Bitmap, pat: &Bitmap, x0: i32, y0: i32, op: u8) {
-    for sy in 0..pat.height as i32 {
-        let py = y0 + sy;
-        if py < 0 || py >= dst.height as i32 {
-            continue;
-        }
-        for sx in 0..pat.width as i32 {
-            let px = x0 + sx;
-            if px < 0 || px >= dst.width as i32 {
-                continue;
-            }
-            let s = pat.data[sy as usize * pat.width + sx as usize];
-            let d = &mut dst.data[py as usize * dst.width + px as usize];
-            *d = match op {
-                0 => *d | s,
-                1 => *d & s,
-                2 => *d ^ s,
-                3 => 1 ^ (*d ^ s),
-                _ => s,
-            };
-        }
+/// Composite `src` onto `dst` with its top-left corner at (x0, y0), which may
+/// lie partly or wholly outside `dst`, using a combination operator (0 = OR,
+/// 1 = AND, 2 = XOR, 3 = XNOR, 4+ = REPLACE). Places halftone patterns and
+/// text-region symbols (SBCOMBOP only spans 0–3). Only the overlapping
+/// rectangle is visited, and its area is charged to the drawing budget first,
+/// so a placement costs what it draws rather than the full source area.
+fn draw_clipped(
+    dst: &mut Bitmap,
+    src: &Bitmap,
+    x0: i64,
+    y0: i64,
+    op: u8,
+    pixels: &mut PixelLimits,
+) -> Result<()> {
+    // Overlap in destination coordinates; empty when `src` misses `dst`.
+    let dx0 = x0.max(0);
+    let dy0 = y0.max(0);
+    let dx1 = x0.saturating_add(src.width as i64).min(dst.width as i64);
+    let dy1 = y0.saturating_add(src.height as i64).min(dst.height as i64);
+    if dx0 >= dx1 || dy0 >= dy1 {
+        return Ok(());
     }
+    let (w, h) = ((dx1 - dx0) as usize, (dy1 - dy0) as usize);
+    pixels.charge(w * h)?;
+    let (sx0, sy0) = ((dx0 - x0) as usize, (dy0 - y0) as usize);
+    let (dx0, dy0) = (dx0 as usize, dy0 as usize);
+    for row in 0..h {
+        let s = (sy0 + row) * src.width + sx0;
+        let d = (dy0 + row) * dst.width + dx0;
+        combine_row(&mut dst.data[d..d + w], &src.data[s..s + w], op);
+    }
+    Ok(())
 }
 
-/// Draw a symbol bitmap onto a text-region bitmap at a possibly-negative
-/// origin with an SBCOMBOP operator (0 = OR, 1 = AND, 2 = XOR, 3 = XNOR).
-fn draw_symbol(dst: &mut Bitmap, sym: &Bitmap, x0: i64, y0: i64, op: u8) {
-    for sy in 0..sym.height as i64 {
-        let py = y0 + sy;
-        if py < 0 || py >= dst.height as i64 {
-            continue;
-        }
-        for sx in 0..sym.width as i64 {
-            let px = x0 + sx;
-            if px < 0 || px >= dst.width as i64 {
-                continue;
-            }
-            let s = sym.data[sy as usize * sym.width + sx as usize];
-            let d = &mut dst.data[py as usize * dst.width + px as usize];
-            *d = match op {
-                0 => *d | s,
-                1 => *d & s,
-                2 => *d ^ s,
-                _ => 1 ^ (*d ^ s),
-            };
-        }
+/// Combine a run of source pixels into a destination run (operators as in
+/// [`draw_clipped`]). The operator is matched once per run, not per pixel.
+#[inline]
+fn combine_row(dst: &mut [u8], src: &[u8], op: u8) {
+    match op {
+        0 => dst.iter_mut().zip(src).for_each(|(d, &s)| *d |= s),
+        1 => dst.iter_mut().zip(src).for_each(|(d, &s)| *d &= s),
+        2 => dst.iter_mut().zip(src).for_each(|(d, &s)| *d ^= s),
+        3 => dst
+            .iter_mut()
+            .zip(src)
+            .for_each(|(d, &s)| *d = 1 ^ (*d ^ s)),
+        _ => dst.copy_from_slice(src),
     }
 }
 
@@ -556,6 +629,11 @@ fn decode_generic(
     p: &GenericParams,
     budget: usize,
 ) -> Result<Bitmap> {
+    // Without TPGDON every pixel costs one iteration, so a region larger than
+    // the budget is bound to fail; fail before allocating it.
+    if !p.tpgdon && width.saturating_mul(height) > budget {
+        return Err(err("generic region MQ decode exceeded iteration budget"));
+    }
     let mut bm = Bitmap::new(width, height, 0)?;
     let ctx_at = context_fn(p.template);
     let tpgd_cx = tpgd_context(p.template);
@@ -795,19 +873,20 @@ fn place_instance(
     t: i64,
     curs: i64,
     geom: &TextRegionGeom,
-) -> i64 {
+    pixels: &mut PixelLimits,
+) -> Result<i64> {
     let placed = refined.as_ref().unwrap_or(sym);
     let (w, hh) = (placed.width as i64, placed.height as i64);
     if !geom.transposed {
         let y0 = t - if geom.ref_corner & 1 == 0 { hh - 1 } else { 0 };
         let x0 = curs;
-        draw_symbol(bm, placed, x0, y0, geom.comb_op);
-        w - 1
+        draw_clipped(bm, placed, x0, y0, geom.comb_op, pixels)?;
+        Ok(w - 1)
     } else {
         let x0 = t - if geom.ref_corner & 2 != 0 { w - 1 } else { 0 };
         let y0 = curs;
-        draw_symbol(bm, placed, x0, y0, geom.comb_op);
-        hh - 1
+        draw_clipped(bm, placed, x0, y0, geom.comb_op, pixels)?;
+        Ok(hh - 1)
     }
 }
 
@@ -824,8 +903,10 @@ fn decode_text_region_arith(
     geom: &TextRegionGeom,
     ctx: &mut TextArithCtx,
     budget: usize,
+    pixels: &mut PixelLimits,
 ) -> Result<Bitmap> {
     let mut bm = Bitmap::new(width, height, geom.def_pixel)?;
+    pixels.cover(bm.data.len());
     let strips = geom.strips;
 
     let mut stript =
@@ -882,6 +963,7 @@ fn decode_text_region_arith(
                     {
                         return Err(err("implausible refined symbol size"));
                     }
+                    pixels.check(nw as usize, nh as usize, "refined symbol")?;
                     // The reference offset (T.88 6.4.11): floor(RDW/2)+RDX,
                     // floor(RDH/2)+RDY.
                     let dx = (rdw >> 1) + rdx;
@@ -908,7 +990,7 @@ fn decode_text_region_arith(
                 None
             };
 
-            curs += place_instance(&mut bm, &sym, refined, t, curs, geom);
+            curs += place_instance(&mut bm, &sym, refined, t, curs, geom, pixels)?;
             inst += 1;
         }
     }
@@ -1012,83 +1094,101 @@ impl HuffLine {
     }
 }
 
-/// A built Huffman table: lines paired with assigned prefix codes (T.88 B.3).
+/// A built Huffman table: lines plus their canonical prefix-code layout
+/// (T.88 B.3), indexed by prefix length for decoding.
+///
+/// B.3 hands out the codes of each length consecutively, in line order,
+/// starting at that length's first code. So the line whose length-`L` code is
+/// `c` is the `(c - first_code[L])`-th length-`L` line, and HUFFDEC needs one
+/// subtraction per bit read rather than a scan over every line (symbol-ID
+/// tables hold one line per symbol, up to [`MAX_SYMBOLS`]).
 #[derive(Clone)]
 struct HuffTable {
     lines: Vec<HuffLine>,
-    /// Assigned prefix code per line, parallel to `lines`. Lines with
-    /// `prefix_len == 0` are unused and carry an unreachable code.
-    codes: Vec<u32>,
+    /// Longest prefix length in use (0 when every line is unused).
+    max_len: usize,
+    /// First code assigned at each prefix length (index = length). `u64`: a
+    /// complete code with 32-bit prefixes carries the B.3 arithmetic past
+    /// 2^32, which overflowed the old `u32` accumulator.
+    first_code: Vec<u64>,
+    /// `by_len[len_start[L]..len_start[L + 1]]` are the indices of the
+    /// length-`L` lines, in table order (= code order). Unused lines
+    /// (`prefix_len == 0`) are left out: they never match.
+    len_start: Vec<usize>,
+    by_len: Vec<u32>,
 }
 
 impl HuffTable {
     /// Assign prefix codes from the lines' prefix lengths (T.88 B.3).
     fn build(lines: Vec<HuffLine>) -> Result<Self> {
         let max_len = lines.iter().map(|l| l.prefix_len).max().unwrap_or(0) as usize;
-        if max_len == 0 {
-            return Ok(Self {
-                codes: vec![0; lines.len()],
-                lines,
-            });
-        }
         if max_len > 32 {
             return Err(err("Huffman prefix length exceeds 32 bits"));
         }
-        let mut len_count = vec![0u32; max_len + 1];
+        let mut len_count = vec![0usize; max_len + 1];
         for l in &lines {
             len_count[l.prefix_len as usize] += 1;
         }
         len_count[0] = 0;
         // First code per length (T.88 B.3 step 3).
-        let mut first_code = vec![0u32; max_len + 2];
-        let mut curcode = 0u32;
+        let mut first_code = vec![0u64; max_len + 1];
+        let mut curcode = 0u64;
         for len in 1..=max_len {
             first_code[len] = curcode;
-            curcode = (curcode + len_count[len]) << 1;
+            curcode = (curcode + len_count[len] as u64) << 1;
         }
-        let mut next = first_code.clone();
-        let mut codes = vec![0u32; lines.len()];
+        // Bucket the lines by prefix length, keeping table order per bucket.
+        let mut len_start = vec![0usize; max_len + 2];
+        for len in 1..=max_len {
+            len_start[len + 1] = len_start[len] + len_count[len];
+        }
+        let mut fill = len_start.clone();
+        let mut by_len = vec![0u32; len_start[max_len + 1]];
         for (i, l) in lines.iter().enumerate() {
             let len = l.prefix_len as usize;
             if len > 0 {
-                codes[i] = next[len];
-                next[len] += 1;
+                by_len[fill[len]] = i as u32;
+                fill[len] += 1;
             }
         }
-        Ok(Self { lines, codes })
+        Ok(Self {
+            lines,
+            max_len,
+            first_code,
+            len_start,
+            by_len,
+        })
     }
 
     /// HUFFDEC (T.88 B.2): read a value or OOB. Returns `None` for OOB.
     fn decode(&self, br: &mut BitReader) -> Option<i64> {
-        let mut len = 0u32;
-        let mut code = 0u32;
+        let mut code = 0u64;
         // Bound the prefix scan by the longest assigned length plus slack so a
-        // corrupt stream cannot loop forever.
-        let max_len = self.lines.iter().map(|l| l.prefix_len).max().unwrap_or(0) as u32;
-        while len <= max_len + 1 {
-            code = (code << 1) | br.read_bit();
-            len += 1;
-            for (i, l) in self.lines.iter().enumerate() {
-                if l.prefix_len as u32 == len && self.codes[i] == code {
-                    if l.is_oob {
-                        return None;
-                    }
-                    if l.range_len == 32 {
-                        // (Upper/lower) 32-bit range line.
-                        let mag = br.read_bits(32) as i64;
-                        return Some(if l.is_lower {
-                            l.range_low as i64 - mag
-                        } else {
-                            l.range_low as i64 + mag
-                        });
-                    }
-                    let mag = br.read_bits(l.range_len as u32) as i64;
-                    return Some(if l.is_lower {
-                        l.range_low as i64 - mag
-                    } else {
-                        l.range_low as i64 + mag
-                    });
+        // corrupt stream cannot loop forever. The slack is two bits: an
+        // unmatched prefix consumes `max_len + 2` bits, and callers keep
+        // reading after the resulting OOB.
+        for len in 1..=self.max_len + 2 {
+            code = (code << 1) | br.read_bit() as u64;
+            if len > self.max_len {
+                continue;
+            }
+            let bucket = &self.by_len[self.len_start[len]..self.len_start[len + 1]];
+            let line = code
+                .checked_sub(self.first_code[len])
+                .and_then(|rank| usize::try_from(rank).ok())
+                .and_then(|rank| bucket.get(rank));
+            if let Some(&i) = line {
+                let l = &self.lines[i as usize];
+                if l.is_oob {
+                    return None;
                 }
+                // The upper/lower range lines carry a 32-bit magnitude.
+                let mag = br.read_bits(l.range_len as u32) as i64;
+                return Some(if l.is_lower {
+                    l.range_low as i64 - mag
+                } else {
+                    l.range_low as i64 + mag
+                });
             }
         }
         // No prefix matched (corrupt table or stream): treat as OOB so the
@@ -1591,7 +1691,7 @@ struct RegionInfo {
     op: u8,
 }
 
-fn parse_region_info(r: &mut Reader) -> Result<RegionInfo> {
+fn parse_region_info(r: &mut Reader, limits: &PixelLimits) -> Result<RegionInfo> {
     let width = r.u32()? as usize;
     let height = r.u32()? as usize;
     let x = r.u32()? as usize;
@@ -1602,6 +1702,7 @@ fn parse_region_info(r: &mut Reader) -> Result<RegionInfo> {
             "implausible region geometry {width}x{height}+{x}+{y}"
         )));
     }
+    limits.check(width, height, "region")?;
     Ok(RegionInfo {
         width,
         height,
@@ -1638,10 +1739,12 @@ struct Decoder<'a> {
     huff_tables: HashMap<u32, HuffTable>,
     /// M2 Fix: DecodeBudget for tracking cumulative output across filter chain
     budget: &'a mut DecodeBudget,
+    /// Bitmap size cap and cumulative drawing budget for this decode.
+    pixels: PixelLimits,
 }
 
 impl<'a> Decoder<'a> {
-    fn new(budget: &'a mut DecodeBudget) -> Self {
+    fn new(budget: &'a mut DecodeBudget, max_image_pixels: u64) -> Self {
         Self {
             page: None,
             page_auto_height: false,
@@ -1651,6 +1754,7 @@ impl<'a> Decoder<'a> {
             pattern_dicts: HashMap::new(),
             huff_tables: HashMap::new(),
             budget,
+            pixels: PixelLimits::new(max_image_pixels),
         }
     }
     /// Parse and process every segment in `data` (globals or page stream).
@@ -1824,6 +1928,8 @@ impl<'a> Decoder<'a> {
         if width.div_ceil(8).saturating_mul(h) > MAX_OUTPUT {
             return Err(err("page exceeds the output size limit"));
         }
+        self.pixels.check(width, h, "page")?;
+        self.pixels.cover(width * h);
         self.page_default_pixel = (flags >> 2) & 1;
         self.page_auto_height = auto_height;
         self.page = Some(Bitmap::new(width, h, self.page_default_pixel)?);
@@ -1848,7 +1954,7 @@ impl<'a> Decoder<'a> {
         if rows <= page.height {
             return;
         }
-        let row_cap = (MAX_BITMAP_PIXELS / page.width.max(1))
+        let row_cap = (self.pixels.max_pixels / page.width.max(1))
             .min(MAX_OUTPUT / page.width.div_ceil(8))
             .min(MAX_DIMENSION);
         let new_h = rows.min(row_cap);
@@ -1867,11 +1973,12 @@ impl<'a> Decoder<'a> {
     fn compose_to_page(&mut self, info: &RegionInfo, bm: &Bitmap) -> Result<()> {
         if self.page.is_none() {
             warn!("JBIG2Decode: region segment before page information; creating implicit page");
-            self.page = Some(Bitmap::new(
+            let (w, h) = (
                 info.x.saturating_add(bm.width),
                 info.y.saturating_add(bm.height),
-                0,
-            )?);
+            );
+            self.pixels.check(w, h, "implicit page")?;
+            self.page = Some(Bitmap::new(w, h, 0)?);
         } else {
             self.grow_page_rows(info.y.saturating_add(bm.height));
         }
@@ -1883,7 +1990,7 @@ impl<'a> Decoder<'a> {
     /// Generic region segment (T.88 7.4.6): MMR or arithmetic coding.
     fn decode_generic_region_segment(&mut self, data: &[u8]) -> Result<(RegionInfo, Bitmap)> {
         let mut r = Reader::new(data);
-        let info = parse_region_info(&mut r)?;
+        let info = parse_region_info(&mut r, &self.pixels)?;
         let flags = r.u8()?;
         let mmr = flags & 1 != 0;
         let template = (flags >> 1) & 3;
@@ -1937,7 +2044,7 @@ impl<'a> Decoder<'a> {
         data: &[u8],
     ) -> Result<(RegionInfo, Bitmap)> {
         let mut r = Reader::new(data);
-        let info = parse_region_info(&mut r)?;
+        let info = parse_region_info(&mut r, &self.pixels)?;
         let flags = r.u8()?;
         let template = flags & 1;
         let tpgron = flags & 2 != 0;
@@ -2148,7 +2255,7 @@ impl<'a> Decoder<'a> {
     /// stream, returning the exported symbols (T.88 6.5.5–6.5.10).
     #[allow(clippy::too_many_arguments)]
     fn decode_symbol_dict_arith(
-        &self,
+        &mut self,
         payload: &[u8],
         num_new: usize,
         num_ex: usize,
@@ -2185,6 +2292,14 @@ impl<'a> Decoder<'a> {
         };
 
         let mut new_syms: Vec<Rc<Bitmap>> = Vec::with_capacity(num_new.min(1024));
+        // REFAGG symbol IDs index input ++ new (T.88 6.5.8.2); keep that
+        // concatenation up to date as symbols are decoded instead of
+        // rebuilding it for every symbol (quadratic in the symbol count).
+        let mut refagg_syms: Vec<Rc<Bitmap>> = if sd_refagg {
+            input.to_vec()
+        } else {
+            Vec::new()
+        };
         let mut hc_height: i64 = 0;
         let mut total_area: usize = 0;
         let mut iterations = 0usize;
@@ -2220,15 +2335,13 @@ impl<'a> Decoder<'a> {
                     return Err(err("more symbols coded than declared"));
                 }
                 total_area = total_area.saturating_add((sym_width * hc_height) as usize);
-                if total_area > MAX_BITMAP_PIXELS {
+                if total_area > self.pixels.max_pixels {
                     return Err(err("symbol dictionary exceeds the pixel limit"));
                 }
                 let bm = if sd_refagg {
                     // REFAGG: IAAI counts the aggregate instances (T.88 6.5.8.2).
                     let n_inst = decode_int(&mut mq, &mut iaai)?
                         .ok_or_else(|| err("unexpected OOB in IAAI"))?;
-                    let all: Vec<Rc<Bitmap>> =
-                        input.iter().chain(new_syms.iter()).cloned().collect();
                     if n_inst == 1 {
                         // Single-instance refinement of an existing symbol.
                         let id = decode_iaid(&mut mq, &mut iaid, sym_code_len)?;
@@ -2236,7 +2349,7 @@ impl<'a> Decoder<'a> {
                             .ok_or_else(|| err("unexpected OOB in IARDX"))?;
                         let rdy = decode_int(&mut mq, &mut iardy)?
                             .ok_or_else(|| err("unexpected OOB in IARDY"))?;
-                        let refr = all.get(id).ok_or_else(|| {
+                        let refr = refagg_syms.get(id).ok_or_else(|| {
                             err(format!("refinement symbol id {id} out of range"))
                         })?;
                         decode_refinement(
@@ -2276,12 +2389,13 @@ impl<'a> Decoder<'a> {
                             &mut mq,
                             sym_width as usize,
                             hc_height as usize,
-                            &all,
+                            &refagg_syms,
                             n_inst as usize,
                             sym_code_len,
                             &TextRegionGeom::aggregate(r_template, r_at),
                             &mut ctx,
                             budget,
+                            &mut self.pixels,
                         )?
                     }
                 } else {
@@ -2294,7 +2408,11 @@ impl<'a> Decoder<'a> {
                         budget,
                     )?
                 };
-                new_syms.push(Rc::new(bm));
+                let bm = Rc::new(bm);
+                if sd_refagg {
+                    refagg_syms.push(Rc::clone(&bm));
+                }
+                new_syms.push(bm);
             }
         }
 
@@ -2392,7 +2510,7 @@ impl<'a> Decoder<'a> {
                 totwidth += sym_width;
                 widths.push(sym_width as usize);
                 total_area = total_area.saturating_add((sym_width * hc_height) as usize);
-                if total_area > MAX_BITMAP_PIXELS {
+                if total_area > self.pixels.max_pixels {
                     return Err(err("symbol dictionary exceeds the pixel limit"));
                 }
             }
@@ -2488,9 +2606,13 @@ impl<'a> Decoder<'a> {
 
     /// Text region segment (T.88 6.4 / 7.4.4): arithmetic or Huffman coding,
     /// with optional per-instance symbol refinement.
-    fn decode_text_region(&self, h: &SegmentHeader, data: &[u8]) -> Result<(RegionInfo, Bitmap)> {
+    fn decode_text_region(
+        &mut self,
+        h: &SegmentHeader,
+        data: &[u8],
+    ) -> Result<(RegionInfo, Bitmap)> {
         let mut r = Reader::new(data);
-        let info = parse_region_info(&mut r)?;
+        let info = parse_region_info(&mut r, &self.pixels)?;
         let flags = r.u16()?;
         let sb_huff = flags & 1 != 0;
         let sb_refine = flags & 2 != 0;
@@ -2602,6 +2724,7 @@ impl<'a> Decoder<'a> {
             &geom,
             &mut ctx,
             budget,
+            &mut self.pixels,
         )?;
         Ok((info, bm))
     }
@@ -2611,7 +2734,7 @@ impl<'a> Decoder<'a> {
     /// runs the placement loop with optional refinement.
     #[allow(clippy::too_many_arguments)]
     fn decode_text_region_huff(
-        &self,
+        &mut self,
         payload: &[u8],
         info: &RegionInfo,
         geom: &TextRegionGeom,
@@ -2686,6 +2809,7 @@ impl<'a> Decoder<'a> {
         let id_tab = read_symbol_id_huff_table(&mut br, symbols.len())?;
 
         let mut bm = Bitmap::new(info.width, info.height, geom.def_pixel)?;
+        self.pixels.cover(bm.data.len());
         let strips = geom.strips;
 
         let mut stript = -dt_tab
@@ -2768,6 +2892,8 @@ impl<'a> Decoder<'a> {
                         {
                             return Err(err("implausible refined symbol size"));
                         }
+                        self.pixels
+                            .check(nw as usize, nh as usize, "refined symbol")?;
                         let dx = (rdw >> 1) + rdx;
                         let dy = (rdh >> 1) + rdy;
                         let refine_payload = &payload[br.byte_pos().min(payload.len())..];
@@ -2799,7 +2925,7 @@ impl<'a> Decoder<'a> {
                     None
                 };
 
-                curs += place_instance(&mut bm, &sym, refined, t, curs, geom);
+                curs += place_instance(&mut bm, &sym, refined, t, curs, geom, &mut self.pixels)?;
                 inst += 1;
             }
         }
@@ -2830,7 +2956,7 @@ impl<'a> Decoder<'a> {
             .ok_or_else(|| err("pattern dictionary collective bitmap too wide"))?;
         if collective_w
             .checked_mul(hdph)
-            .map(|p| p > MAX_BITMAP_PIXELS)
+            .map(|p| p > self.pixels.max_pixels)
             .unwrap_or(true)
         {
             return Err(err("pattern dictionary exceeds the pixel limit"));
@@ -2861,8 +2987,10 @@ impl<'a> Decoder<'a> {
             let packed = crate::ccitt::decode(r.rest(), &params, self.budget)?;
             unpack_rows(&packed, collective_w, hdph)?
         } else {
+            // A1 = -HDPW, clamped to the i8 AT range: exact up to HDPW = 128
+            // (wider patterns cannot express their nominal A1 offset).
             let at = [
-                (-(hdpw as i64).min(127) as i8, 0i8),
+                ((-(hdpw as i64)).max(i8::MIN as i64) as i8, 0i8),
                 (-3, -1),
                 (2, -2),
                 (-2, -2),
@@ -2911,7 +3039,7 @@ impl<'a> Decoder<'a> {
         data: &[u8],
     ) -> Result<(RegionInfo, Bitmap)> {
         let mut r = Reader::new(data);
-        let info = parse_region_info(&mut r)?;
+        let info = parse_region_info(&mut r, &self.pixels)?;
         let flags = r.u8()?;
         let mmr = flags & 1 != 0;
         let template = (flags >> 1) & 3;
@@ -2922,16 +3050,24 @@ impl<'a> Decoder<'a> {
         let hgh = r.u32()? as usize;
         let hgx = r.u32()? as i32;
         let hgy = r.u32()? as i32;
-        let hrx = r.u16()? as i32;
-        let hry = r.u16()? as i32;
+        let hrx = r.u16()?;
+        let hry = r.u16()?;
 
         if hgw == 0 || hgh == 0 || hgw > MAX_DIMENSION || hgh > MAX_DIMENSION {
             return Err(err(format!("implausible halftone grid {hgw}x{hgh}")));
         }
-        let grid_cells = hgw
-            .checked_mul(hgh)
-            .filter(|&n| n <= MAX_BITMAP_PIXELS)
-            .ok_or_else(|| err("halftone grid exceeds the pixel limit"))?;
+        self.pixels.check(hgw, hgh, "halftone grid")?;
+        let grid_cells = hgw * hgh;
+        // Cell (m, n) origin (T.88 6.6.5.2). In i64: with HGW/HGH up to 2^20
+        // and HRX/HRY up to 0xFFFF the products overflow i32.
+        let cell_origin = |m: usize, n: usize| -> (i64, i64) {
+            let (m, n) = (m as i64, n as i64);
+            let (hrx, hry) = (hrx as i64, hry as i64);
+            (
+                (hgx as i64 + m * hry + n * hrx) >> 8,
+                (hgy as i64 + m * hrx - n * hry) >> 8,
+            )
+        };
 
         // Find the referred pattern dictionary.
         let pd = h
@@ -2951,23 +3087,30 @@ impl<'a> Decoder<'a> {
         if hbpp > 31 {
             return Err(err("implausible halftone bit depth"));
         }
+        let payload = r.rest();
+        let budget = mq_iteration_budget(payload.len());
+        // Arithmetic bitplanes cost one MQ decode per cell per plane, all off
+        // one budget: reject a grid that cannot fit before allocating it.
+        if !mmr && grid_cells.saturating_mul(hbpp) > budget {
+            return Err(err("halftone grid exceeds the MQ iteration budget"));
+        }
 
         let mut bm = Bitmap::new(info.width, info.height, def_pixel)?;
+        self.pixels.cover(bm.data.len());
 
         // Optional skip bitmap (T.88 6.6.5.1): a cell is skipped when its
         // pattern would fall entirely outside the region.
         let skip = if enable_skip {
             let mut s = Bitmap::new(hgw, hgh, 0)?;
-            for m in 0..hgh as i32 {
-                for n in 0..hgw as i32 {
-                    let x = (hgx + m * hry + n * hrx) >> 8;
-                    let y = (hgy + m * hrx - n * hry) >> 8;
-                    if x + (pat_w as i32) <= 0
-                        || x >= info.width as i32
-                        || y + (pat_h as i32) <= 0
-                        || y >= info.height as i32
+            for m in 0..hgh {
+                for n in 0..hgw {
+                    let (x, y) = cell_origin(m, n);
+                    if x + (pat_w as i64) <= 0
+                        || x >= info.width as i64
+                        || y + (pat_h as i64) <= 0
+                        || y >= info.height as i64
                     {
-                        s.set(n as usize, m as usize, 1);
+                        s.set(n, m, 1);
                     }
                 }
             }
@@ -2987,8 +3130,6 @@ impl<'a> Decoder<'a> {
             (2, -2),
             (-2, -2),
         ];
-        let payload = r.rest();
-        let budget = mq_iteration_budget(payload.len());
         let mut mq = if mmr {
             None
         } else {
@@ -2999,8 +3140,6 @@ impl<'a> Decoder<'a> {
         // image per call but does not report bytes consumed, so multi-plane
         // MMR halftones can only be tracked for the common single-plane case.
         let mmr_data = payload;
-        // `bit[j+1]` accumulator for the Gray decode, per cell.
-        let mut prev_bit = vec![0u8; grid_cells];
         for j in (0..hbpp).rev() {
             let plane = if let Some(mqd) = mq.as_mut() {
                 decode_generic(
@@ -3026,13 +3165,12 @@ impl<'a> Decoder<'a> {
                 let packed = crate::ccitt::decode(mmr_data, &params, self.budget)?;
                 unpack_rows(&packed, hgw, hgh)?
             };
-            // Gray-code combine: the j-th gray bit is plane XOR the (j+1)-th bit.
-            for i in 0..grid_cells {
-                let py = (i / hgw) as i64;
-                let px = (i % hgw) as i64;
-                let bit = plane.get(px, py) ^ prev_bit[i];
-                gray[i] |= (bit as u32) << j;
-                prev_bit[i] = bit;
+            // Gray-code combine: the j-th gray bit is plane XOR the (j+1)-th
+            // bit, already in `gray` (zero above the top plane). The plane is
+            // exactly HGW×HGH, so cell i is its i-th pixel.
+            for (g, &p) in gray.iter_mut().zip(&plane.data) {
+                let bit = p as u32 ^ ((*g >> (j + 1)) & 1);
+                *g |= bit << j;
             }
         }
 
@@ -3048,9 +3186,8 @@ impl<'a> Decoder<'a> {
                 let gi = gray[m * hgw + n] as usize;
                 let idx = gi.min(n_pat - 1);
                 let pat = &pd.patterns[idx];
-                let x = (hgx + (m as i32) * hry + (n as i32) * hrx) >> 8;
-                let y = (hgy + (m as i32) * hrx - (n as i32) * hry) >> 8;
-                place_pattern(&mut bm, pat, x, y, comb_op);
+                let (x, y) = cell_origin(m, n);
+                draw_clipped(&mut bm, pat, x, y, comb_op, &mut self.pixels)?;
             }
         }
         Ok((info, bm))
@@ -3111,7 +3248,7 @@ mod tests {
     /// Helper for tests: decode with unlimited budget
     fn decode_test(data: &[u8], params: &Jbig2Params) -> Result<Vec<u8>> {
         let mut budget = crate::filters::DecodeBudget::new(u64::MAX);
-        decode(data, params, &mut budget)
+        decode(data, params, u64::MAX, &mut budget)
     }
 
     // -----------------------------------------------------------------------
@@ -3405,9 +3542,39 @@ mod tests {
         }
     }
 
+    /// Independent T.88 B.3 prefix-code assignment, one code per line (0 for
+    /// unused lines): the encoder side, kept apart from the decoder's
+    /// per-length index so round trips check one against the other.
+    fn assign_codes(lines: &[HuffLine]) -> Vec<u64> {
+        let max_len = lines.iter().map(|l| l.prefix_len).max().unwrap_or(0) as usize;
+        let mut len_count = vec![0u64; max_len + 1];
+        for l in lines {
+            len_count[l.prefix_len as usize] += 1;
+        }
+        len_count[0] = 0;
+        let mut next = vec![0u64; max_len + 1];
+        let mut curcode = 0u64;
+        for len in 1..=max_len {
+            next[len] = curcode;
+            curcode = (curcode + len_count[len]) << 1;
+        }
+        lines
+            .iter()
+            .map(|l| {
+                let len = l.prefix_len as usize;
+                if len == 0 {
+                    return 0;
+                }
+                next[len] += 1;
+                next[len] - 1
+            })
+            .collect()
+    }
+
     /// Encode `value` (or OOB) with a Huffman table by finding the matching
     /// line and emitting its prefix code plus the range magnitude.
     fn huff_encode(bw: &mut BitWriter, tab: &HuffTable, value: Option<i64>) {
+        let codes = assign_codes(&tab.lines);
         for (i, l) in tab.lines.iter().enumerate() {
             let matches = match value {
                 None => l.is_oob,
@@ -3431,7 +3598,7 @@ mod tests {
                 }
             };
             if matches && l.prefix_len > 0 {
-                bw.write_bits(tab.codes[i], l.prefix_len as u32);
+                bw.write_bits(codes[i] as u32, l.prefix_len as u32);
                 if l.is_oob {
                     return;
                 }
@@ -4734,5 +4901,580 @@ mod tests {
             result.is_ok(),
             "page decodes with failed symbol dict (warns, not fatal)"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Audit regressions: halftone overflow, drawing budget, pixel limits,
+    // Huffman lookup, REFAGG indexing, pattern-dict AT1.
+    // -----------------------------------------------------------------------
+
+    /// Decode with a chosen drawing-budget floor (`DRAW_BUDGET_FLOOR` by
+    /// default), returning the output plus the decoder's (drawn, limit).
+    fn decode_with_draw_floor(data: &[u8], floor: u64) -> (Result<Vec<u8>>, u64, u64) {
+        let mut budget = crate::filters::DecodeBudget::new(u64::MAX);
+        let mut dec = Decoder::new(&mut budget, u64::MAX);
+        dec.pixels.draw_limit = floor;
+        let out = dec
+            .process_segments(data)
+            .and_then(|()| dec.into_packed_output());
+        (out, dec.pixels.drawn, dec.pixels.draw_limit)
+    }
+
+    /// Arithmetic (template 0) pattern-dictionary payload holding `patterns`
+    /// side by side, encoded with the spec's A1 = (-HDPW, 0).
+    fn pattern_dict_payload(patterns: &[&Bitmap]) -> Vec<u8> {
+        let (hdpw, hdph) = (patterns[0].width, patterns[0].height);
+        let mut pd = vec![0x00, hdpw as u8, hdph as u8];
+        pd.extend_from_slice(&(patterns.len() as u32 - 1).to_be_bytes());
+        let mut collective = Bitmap::new(hdpw * patterns.len(), hdph, 0).unwrap();
+        for (i, pat) in patterns.iter().enumerate() {
+            for y in 0..hdph {
+                for x in 0..hdpw {
+                    if pat.get(x as i64, y as i64) != 0 {
+                        collective.set(i * hdpw + x, y, 1);
+                    }
+                }
+            }
+        }
+        let at = [(-(hdpw as i64) as i8, 0i8), (-3, -1), (2, -2), (-2, -2)];
+        let mut enc = MqEncoder::new();
+        let mut cx = vec![0u8; 1 << 16];
+        encode_generic(
+            &mut enc,
+            &mut cx,
+            &collective,
+            &GenericParams {
+                template: 0,
+                tpgdon: false,
+                at,
+            },
+        );
+        pd.extend_from_slice(&enc.finish());
+        pd
+    }
+
+    /// MMR halftone-region payload with an empty gray-scale stream, so every
+    /// cell selects pattern 0. `flags` is OR-ed onto MMR = 1.
+    fn mmr_halftone_payload(
+        region: (u32, u32),
+        flags: u8,
+        grid: (u32, u32),
+        origin: (u32, u32),
+        vector: (u16, u16),
+    ) -> Vec<u8> {
+        let mut ht = region_info(region.0, region.1, 0, 0, 0);
+        ht.push(0x01 | flags);
+        ht.extend_from_slice(&grid.0.to_be_bytes()); // HGW
+        ht.extend_from_slice(&grid.1.to_be_bytes()); // HGH
+        ht.extend_from_slice(&origin.0.to_be_bytes()); // HGX
+        ht.extend_from_slice(&origin.1.to_be_bytes()); // HGY
+        ht.extend_from_slice(&vector.0.to_be_bytes()); // HRX
+        ht.extend_from_slice(&vector.1.to_be_bytes()); // HRY
+        ht
+    }
+
+    /// Page + pattern dictionary + immediate halftone region stream.
+    fn halftone_stream(page: (u32, u32), pd: &[u8], ht: &[u8]) -> Vec<u8> {
+        let mut stream = segment(0, 48, &[], 1, &page_info_payload(page.0, page.1, 0));
+        stream.extend_from_slice(&segment(1, 16, &[], 1, pd));
+        stream.extend_from_slice(&segment(2, 22, &[1], 1, ht));
+        stream
+    }
+
+    /// Audit repro: HGH = 40000 with HRY = 0xFFFF made `m * HRY` overflow i32
+    /// (a panic in debug builds) in the grid-placement loop.
+    #[test]
+    fn halftone_audit_overflow_repro_does_not_panic() {
+        // MMR pattern dictionary: one 1x1 pattern, empty MMR data (white).
+        let mut pd = vec![0x01, 1, 1];
+        pd.extend_from_slice(&0u32.to_be_bytes());
+        let ht = mmr_halftone_payload((4, 4), 0, (1, 40000), (0, 0), (0, 0xFFFF));
+        let stream = halftone_stream((100, 100), &pd, &ht);
+        let out = decode_test(&stream, &Jbig2Params { globals: None }).unwrap();
+        let mut row = vec![0xFFu8; 12];
+        row.push(0xF0);
+        assert_eq!(out, row.repeat(100));
+    }
+
+    /// Grid coordinates must be computed exactly (i64), in both the placement
+    /// loop and the skip computation. Cell m = 65536 with HRY = 0x8000 adds
+    /// exactly 2^31 to HGX.
+    #[test]
+    fn halftone_grid_coordinates_are_exact() {
+        let pd = pattern_dict_payload(&[&bitmap_from(&["##"])]);
+        for skip in [0u8, 0x08] {
+            // HGX = 2^31 - 128: the last cell's true x is (2^32 - 128) >> 8,
+            // far right of the region. Wrapping i32 arithmetic put it at
+            // x = -1, painting column 0.
+            let ht = mmr_halftone_payload((4, 1), skip, (1, 65537), (0x7FFF_FF80, 0), (0, 0x8000));
+            let out = decode_test(
+                &halftone_stream((4, 1), &pd, &ht),
+                &Jbig2Params { globals: None },
+            )
+            .unwrap();
+            assert_eq!(
+                out,
+                vec![0xF0],
+                "skip flag {skip:#x}: nothing lands on the page"
+            );
+
+            // HGX = -2^31: the same cell lands exactly at x = 0.
+            let ht = mmr_halftone_payload((4, 1), skip, (1, 65537), (0x8000_0000, 0), (0, 0x8000));
+            let out = decode_test(
+                &halftone_stream((4, 1), &pd, &ht),
+                &Jbig2Params { globals: None },
+            )
+            .unwrap();
+            assert_eq!(
+                out,
+                vec![0x30],
+                "skip flag {skip:#x}: pattern drawn at x = 0"
+            );
+        }
+    }
+
+    /// Audit repro: a 2048x2048 grid of 255x255 patterns over a 64x64 region
+    /// took ~12 s (debug) visiting every pattern pixel, though almost every
+    /// cell misses the region. Clipping makes each cell cost its overlap.
+    #[test]
+    fn halftone_audit_hang_repro_is_clipped() {
+        let mut pd = vec![0x01, 255, 255];
+        pd.extend_from_slice(&0u32.to_be_bytes());
+        let ht = mmr_halftone_payload((64, 64), 0, (2048, 2048), (0, 0), (256, 0));
+        let (out, drawn, _) =
+            decode_with_draw_floor(&halftone_stream((64, 64), &pd, &ht), DRAW_BUDGET_FLOOR);
+        assert_eq!(out.unwrap(), vec![0xFF; 512]);
+        // Cells (n, m) with n, m < 64 overlap (64 - n) x (64 - m) pixels.
+        assert_eq!(drawn, (64 * 65 / 2u64).pow(2));
+    }
+
+    /// Placements piled onto one spot (HRX = HRY = 0) cost cells × pattern
+    /// area no matter how small the region. The cumulative drawing budget
+    /// stops the region (left blank) instead of compositing 2^22 cells.
+    #[test]
+    fn halftone_pileup_stops_at_draw_budget() {
+        let black = Bitmap::new(64, 64, 1).unwrap();
+        let pd = pattern_dict_payload(&[&black]);
+
+        // Within budget: 16 stacked cells draw the black pattern.
+        let ht = mmr_halftone_payload((64, 64), 0, (4, 4), (0, 0), (0, 0));
+        let (out, drawn, limit) =
+            decode_with_draw_floor(&halftone_stream((64, 64), &pd, &ht), DRAW_BUDGET_FLOOR);
+        assert_eq!(out.unwrap(), vec![0x00; 512]);
+        assert_eq!((drawn, limit), (16 * 4096, DRAW_BUDGET_FLOOR));
+
+        // 2048x2048 stacked cells: stopped once the floor is spent.
+        let ht = mmr_halftone_payload((64, 64), 0, (2048, 2048), (0, 0), (0, 0));
+        let (out, drawn, limit) =
+            decode_with_draw_floor(&halftone_stream((64, 64), &pd, &ht), DRAW_BUDGET_FLOOR);
+        assert_eq!(out.unwrap(), vec![0xFF; 512], "region blank, page kept");
+        assert!(drawn > limit && drawn <= limit + 4096);
+    }
+
+    /// The text-region placement loop shares the budget: with no floor it is
+    /// DRAW_BUDGET_FACTOR passes over the largest page/region (8x8 here).
+    #[test]
+    fn text_region_pileup_stops_at_draw_budget() {
+        let sym = Bitmap::new(8, 8, 1).unwrap();
+        let dict = symbol_dict_payload(&[&sym]);
+        let stream = |n: usize| {
+            // First instance at S = 0, then IDS = -7 undoes the advance.
+            let placements: Vec<(usize, i64)> =
+                (0..n).map(|i| (0, if i == 0 { 0 } else { -7 })).collect();
+            let mut s = segment(0, 48, &[], 1, &page_info_payload(8, 8, 0));
+            s.extend_from_slice(&segment(1, 0, &[], 1, &dict));
+            s.extend_from_slice(&segment(
+                2,
+                6,
+                &[1],
+                1,
+                &text_region_payload(8, 8, 1, &placements),
+            ));
+            s
+        };
+        let limit = 64 * DRAW_BUDGET_FACTOR;
+        let (out, drawn, got_limit) = decode_with_draw_floor(&stream(64), 0);
+        assert_eq!(out.unwrap(), vec![0x00; 8]);
+        assert_eq!((drawn, got_limit), (limit, limit));
+
+        let (out, drawn, _) = decode_with_draw_floor(&stream(65), 0);
+        assert_eq!(out.unwrap(), vec![0xFF; 8], "region blank, page kept");
+        assert_eq!(drawn, limit + 64);
+    }
+
+    /// The clipped compositor must match the per-pixel loop it replaced for
+    /// every operator and any placement, on or off the destination.
+    #[test]
+    fn draw_clipped_matches_per_pixel_reference() {
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let random_bitmap = |w: usize, h: usize, next: &mut dyn FnMut(u64) -> u64| {
+            let mut bm = Bitmap::new(w, h, 0).unwrap();
+            for p in bm.data.iter_mut() {
+                *p = next(2) as u8;
+            }
+            bm
+        };
+        for _ in 0..2000 {
+            let (dw, dh) = (1 + next(12) as usize, 1 + next(12) as usize);
+            let (sw, sh) = (1 + next(12) as usize, 1 + next(12) as usize);
+            let dst = random_bitmap(dw, dh, &mut next);
+            let src = random_bitmap(sw, sh, &mut next);
+            let x0 = next(40) as i64 - 20;
+            let y0 = next(40) as i64 - 20;
+            let op = next(5) as u8;
+
+            let mut want = dst.clone();
+            for sy in 0..sh as i64 {
+                for sx in 0..sw as i64 {
+                    let (px, py) = (x0 + sx, y0 + sy);
+                    if px < 0 || py < 0 || px >= dw as i64 || py >= dh as i64 {
+                        continue;
+                    }
+                    let s = src.data[sy as usize * sw + sx as usize];
+                    let d = &mut want.data[py as usize * dw + px as usize];
+                    *d = match op {
+                        0 => *d | s,
+                        1 => *d & s,
+                        2 => *d ^ s,
+                        3 => 1 ^ (*d ^ s),
+                        _ => s,
+                    };
+                }
+            }
+            let mut got = dst.clone();
+            let mut pixels = PixelLimits::new(u64::MAX);
+            draw_clipped(&mut got, &src, x0, y0, op, &mut pixels).unwrap();
+            assert_eq!(
+                got.data, want.data,
+                "{sw}x{sh} at ({x0},{y0}) on {dw}x{dh}, op {op}"
+            );
+            let overlap = |a: i64, len: usize, max: usize| {
+                (a + len as i64)
+                    .min(max as i64)
+                    .saturating_sub(a.max(0))
+                    .max(0) as u64
+            };
+            assert_eq!(pixels.drawn, overlap(x0, sw, dw) * overlap(y0, sh, dh));
+        }
+    }
+
+    /// `ParseLimits::max_image_pixels` caps the page, every region and the
+    /// halftone grid (the u32-per-cell gray image was up to 1 GiB before).
+    #[test]
+    fn max_image_pixels_bounds_page_regions_and_grid() {
+        let pd = pattern_dict_payload(&[&bitmap_from(&["#"])]);
+        // A 200x100 grid at 1-pixel spacing blackens the 100x100 page.
+        let ht = mmr_halftone_payload((100, 100), 0, (200, 100), (0, 0), (256, 0));
+        let stream = halftone_stream((100, 100), &pd, &ht);
+        let decode_limited = |data: &[u8], max_pixels: u64| {
+            let mut budget = crate::filters::DecodeBudget::new(u64::MAX);
+            decode(
+                data,
+                &Jbig2Params { globals: None },
+                max_pixels,
+                &mut budget,
+            )
+        };
+        let black_page = [0u8; 13].repeat(100);
+        assert_eq!(decode_limited(&stream, u64::MAX).unwrap(), black_page);
+        // 20,000 grid cells > 10,000: the region is refused, the page kept.
+        let mut white_row = vec![0xFFu8; 12];
+        white_row.push(0xF0);
+        assert_eq!(
+            decode_limited(&stream, 10_000).unwrap(),
+            white_row.repeat(100)
+        );
+        // A page above the limit is a hard error, as for oversized JPEGs.
+        assert!(decode_limited(&stream, 9_999).is_err());
+
+        // A region above the limit is refused on its own.
+        let mut region = mmr_halftone_payload((101, 100), 0, (1, 1), (0, 0), (0, 0));
+        region[0..4].copy_from_slice(&101u32.to_be_bytes());
+        let stream = halftone_stream((100, 100), &pd, &region);
+        assert_eq!(
+            decode_limited(&stream, 10_000).unwrap(),
+            white_row.repeat(100)
+        );
+
+        // The limit arrives from ParseLimits through the filter layer.
+        let mut dict = PdfDict::new();
+        dict.insert(
+            zpdf_core::PdfName::new("Filter"),
+            PdfObject::Name(zpdf_core::PdfName::new("JBIG2Decode")),
+        );
+        let limits = zpdf_core::ParseLimits {
+            max_image_pixels: 9_999,
+            ..Default::default()
+        };
+        let stream = halftone_stream((100, 100), &pd, &ht);
+        assert!(crate::filters::decode_stream_with_limits(&stream, &dict, &limits).is_err());
+        assert!(crate::filters::decode_stream_with_limits(
+            &stream,
+            &dict,
+            &zpdf_core::ParseLimits::default()
+        )
+        .is_ok());
+    }
+
+    /// A1 for a 128-pixel-wide pattern dictionary is (-128, 0). The old clamp
+    /// `-(hdpw).min(127)` produced -127, desynchronising the context.
+    #[test]
+    fn pattern_dict_at1_reaches_minus_128() {
+        let mut seed = 0x1234_5678u32;
+        let mut patterns = Vec::new();
+        for _ in 0..2 {
+            let mut p = Bitmap::new(128, 6, 0).unwrap();
+            for px in p.data.iter_mut() {
+                seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                *px = ((seed >> 16) & 1) as u8;
+            }
+            patterns.push(p);
+        }
+        let refs: Vec<&Bitmap> = patterns.iter().collect();
+        let payload = pattern_dict_payload(&refs);
+        let mut budget = crate::filters::DecodeBudget::new(u64::MAX);
+        let mut dec = Decoder::new(&mut budget, u64::MAX);
+        let pd = dec.decode_pattern_dict(&payload).unwrap();
+        assert_eq!(pd.patterns.len(), 2);
+        for (got, want) in pd.patterns.iter().zip(&patterns) {
+            assert_eq!(got.data, want.data);
+        }
+    }
+
+    /// The pre-index HUFFDEC: scan every line at every prefix length.
+    fn huff_decode_linear(tab: &HuffTable, codes: &[u64], br: &mut BitReader) -> Option<i64> {
+        let max_len = tab.lines.iter().map(|l| l.prefix_len).max().unwrap_or(0) as u32;
+        let mut len = 0u32;
+        let mut code = 0u64;
+        while len <= max_len + 1 {
+            code = (code << 1) | br.read_bit() as u64;
+            len += 1;
+            for (i, l) in tab.lines.iter().enumerate() {
+                if l.prefix_len as u32 == len && codes[i] == code {
+                    if l.is_oob {
+                        return None;
+                    }
+                    let mag = br.read_bits(l.range_len as u32) as i64;
+                    return Some(if l.is_lower {
+                        l.range_low as i64 - mag
+                    } else {
+                        l.range_low as i64 + mag
+                    });
+                }
+            }
+        }
+        None
+    }
+
+    /// The per-length index must decode exactly like the linear scan —
+    /// values, OOBs and bits consumed — on arbitrary tables, including
+    /// incomplete, over-subscribed and unused-line ones, over random bits.
+    #[test]
+    fn huff_index_matches_linear_scan() {
+        let mut seed = 0xD1B5_4A32_D192_ED03u64;
+        let mut next = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        for _ in 0..500 {
+            let n_lines = 1 + next(48) as usize;
+            let lines: Vec<HuffLine> = (0..n_lines)
+                .map(|_| {
+                    let prefix_len = next(10) as u8;
+                    let range_len = next(6) as u8;
+                    let low = next(2000) as i32 - 1000;
+                    match next(10) {
+                        0 => HuffLine::oob(prefix_len),
+                        1 | 2 => HuffLine::lower(prefix_len, range_len, low),
+                        _ => HuffLine::normal(prefix_len, range_len, low),
+                    }
+                })
+                .collect();
+            let tab = HuffTable::build(lines).unwrap();
+            let codes = assign_codes(&tab.lines);
+            let data: Vec<u8> = (0..48).map(|_| next(256) as u8).collect();
+            let (mut fast, mut slow) = (BitReader::new(&data), BitReader::new(&data));
+            for _ in 0..64 {
+                assert_eq!(
+                    tab.decode(&mut fast),
+                    huff_decode_linear(&tab, &codes, &mut slow)
+                );
+                assert_eq!(fast.pos, slow.pos);
+            }
+        }
+    }
+
+    /// A complete code with 32-bit prefixes (lengths 1..=31 once, 32 twice)
+    /// drove the u32 B.3 arithmetic past 2^32: a debug-build overflow panic
+    /// on a valid custom table. Its longest codes must round-trip.
+    #[test]
+    fn huff_table_with_32_bit_prefixes_builds_and_decodes() {
+        let mut lines: Vec<HuffLine> = (1..=31)
+            .map(|len| HuffLine::normal(len, 0, len as i32))
+            .collect();
+        lines.push(HuffLine::normal(32, 0, 100));
+        lines.push(HuffLine::normal(32, 2, 200));
+        let tab = HuffTable::build(lines).unwrap();
+        let samples = [Some(1), Some(31), Some(100), Some(203), Some(17)];
+        let mut bw = BitWriter::new();
+        for v in &samples {
+            huff_encode(&mut bw, &tab, *v);
+        }
+        let data = bw.finish();
+        let mut br = BitReader::new(&data);
+        for v in &samples {
+            assert_eq!(tab.decode(&mut br), *v);
+        }
+    }
+
+    /// Symbol-ID tables hold one line per symbol. The linear scan (plus a
+    /// per-call max-length pass) cost O(lines) per bit; 2^16 symbols × 10^5
+    /// IDs was ~10^11 steps. The index makes each bit one lookup.
+    #[test]
+    fn huff_symbol_id_table_decodes_quickly() {
+        let n = 1usize << 16;
+        let tab =
+            HuffTable::build((0..n).map(|i| HuffLine::normal(16, 0, i as i32)).collect()).unwrap();
+        // A complete 16-bit code: line i's code is i.
+        let ids: Vec<u32> = (0..100_000u32)
+            .map(|i| i.wrapping_mul(40_503) % n as u32)
+            .collect();
+        let mut bw = BitWriter::new();
+        for &id in &ids {
+            bw.write_bits(id, 16);
+        }
+        let data = bw.finish();
+        let mut br = BitReader::new(&data);
+        for &id in &ids {
+            assert_eq!(tab.decode(&mut br), Some(id as i64));
+        }
+    }
+
+    /// REFAGG symbols may refer to symbols decoded earlier in the same
+    /// dictionary (IDs past the input symbols), both as a single refinement
+    /// reference and as aggregate instances. Covers the incremental
+    /// input ++ new list that replaced the per-symbol rebuild.
+    #[test]
+    fn symbol_dict_refagg_refers_to_new_symbols() {
+        let a = bitmap_from(&["####", "#..#", "#..#", "####"]);
+        let t1 = bitmap_from(&["####", "#..#", "#.##", "####"]);
+        let t2 = bitmap_from(&["####", "##.#", "#.##", "####"]);
+
+        // flags: SDREFAGG = 1, SDRTEMPLATE = 1 (no refinement AT bytes).
+        let mut p = Vec::new();
+        p.extend_from_slice(&(0x0002u16 | (1 << 12)).to_be_bytes());
+        for &(ax, ay) in nominal_at(0).iter() {
+            p.push(ax as u8);
+            p.push(ay as u8);
+        }
+        p.extend_from_slice(&3u32.to_be_bytes()); // SDNUMEXSYMS
+        p.extend_from_slice(&3u32.to_be_bytes()); // SDNUMNEWSYMS
+
+        let code_len = ceil_log2(4).max(1); // 1 input + 3 new symbols
+        let mut enc = MqEncoder::new();
+        let mut cx_gr = vec![0u8; 1 << 13];
+        let mut iadh = vec![0u8; INT_CTX_SIZE];
+        let mut iadw = vec![0u8; INT_CTX_SIZE];
+        let mut iaex = vec![0u8; INT_CTX_SIZE];
+        let mut iaai = vec![0u8; INT_CTX_SIZE];
+        let mut iardx = vec![0u8; INT_CTX_SIZE];
+        let mut iardy = vec![0u8; INT_CTX_SIZE];
+        let mut iadt = vec![0u8; INT_CTX_SIZE];
+        let mut iafs = vec![0u8; INT_CTX_SIZE];
+        let mut iads = vec![0u8; INT_CTX_SIZE];
+        let mut iari = vec![0u8; INT_CTX_SIZE];
+        let mut iaid = vec![0u8; 1usize << (code_len + 1)];
+        let refine = |enc: &mut MqEncoder, cx: &mut [u8], target: &Bitmap, refr: &Bitmap| {
+            let params = RefinementParams {
+                template: 1,
+                tpgron: false,
+                at: nominal_refine_at(),
+                dx: 0,
+                dy: 0,
+            };
+            encode_refinement(enc, cx, target, refr, &params);
+        };
+
+        encode_int(&mut enc, &mut iadh, Some(4)); // one height class of 4
+                                                  // New symbol 1 (ID 1): t1, refined from input symbol A (ID 0).
+        encode_int(&mut enc, &mut iadw, Some(4));
+        encode_int(&mut enc, &mut iaai, Some(1));
+        encode_iaid(&mut enc, &mut iaid, code_len, 0);
+        encode_int(&mut enc, &mut iardx, Some(0));
+        encode_int(&mut enc, &mut iardy, Some(0));
+        refine(&mut enc, &mut cx_gr, &t1, &a);
+        // New symbol 2 (ID 2): t2, refined from new symbol 1 (ID 1).
+        encode_int(&mut enc, &mut iadw, Some(0));
+        encode_int(&mut enc, &mut iaai, Some(1));
+        encode_iaid(&mut enc, &mut iaid, code_len, 1);
+        encode_int(&mut enc, &mut iardx, Some(0));
+        encode_int(&mut enc, &mut iardy, Some(0));
+        refine(&mut enc, &mut cx_gr, &t2, &t1);
+        // New symbol 3 (8x4): aggregate of A (ID 0) at S = 0 and new symbol
+        // 2 (ID 2) at S = 4, no per-instance refinement.
+        encode_int(&mut enc, &mut iadw, Some(4));
+        encode_int(&mut enc, &mut iaai, Some(2));
+        encode_int(&mut enc, &mut iadt, Some(0)); // STRIPT
+        encode_int(&mut enc, &mut iadt, Some(0)); // strip DT
+        encode_int(&mut enc, &mut iafs, Some(0)); // first S
+        encode_iaid(&mut enc, &mut iaid, code_len, 0);
+        encode_int(&mut enc, &mut iari, Some(0));
+        encode_int(&mut enc, &mut iads, Some(1)); // S = 0 + 3 + 1
+        encode_iaid(&mut enc, &mut iaid, code_len, 2);
+        encode_int(&mut enc, &mut iari, Some(0));
+        encode_int(&mut enc, &mut iads, None); // OOB ends the strip
+        encode_int(&mut enc, &mut iadw, None); // OOB ends the height class
+        encode_int(&mut enc, &mut iaex, Some(1)); // skip the input symbol
+        encode_int(&mut enc, &mut iaex, Some(3)); // export the three new ones
+        p.extend_from_slice(&enc.finish());
+
+        // Page: exported symbol 1 (t2) at S = 0, symbol 2 (A | t2) at S = 4.
+        let mut stream = segment(0, 48, &[], 1, &page_info_payload(12, 4, 0));
+        stream.extend_from_slice(&segment(1, 0, &[], 1, &symbol_dict_payload(&[&a])));
+        stream.extend_from_slice(&segment(2, 0, &[1], 1, &p));
+        stream.extend_from_slice(&segment(
+            3,
+            6,
+            &[2],
+            1,
+            &text_region_payload(12, 4, 3, &[(1, 0), (2, 1)]),
+        ));
+        let out = decode_test(&stream, &Jbig2Params { globals: None }).unwrap();
+        assert_eq!(
+            out,
+            packed_from(&[
+                "############",
+                "##.##..###.#",
+                "#.###..##.##",
+                "############"
+            ])
+        );
+    }
+
+    #[test]
+    fn pixel_limits_cap_and_budget() {
+        let mut px = PixelLimits::new(1_000);
+        assert_eq!(px.max_pixels, 1_000);
+        assert!(px.check(10, 100, "bitmap").is_ok());
+        assert!(px.check(10, 101, "bitmap").is_err());
+        assert!(px.check(usize::MAX, 2, "bitmap").is_err());
+        assert_eq!(PixelLimits::new(u64::MAX).max_pixels, MAX_BITMAP_PIXELS);
+
+        assert_eq!(px.draw_limit, DRAW_BUDGET_FLOOR);
+        px.cover(10); // below the floor: no change
+        assert_eq!(px.draw_limit, DRAW_BUDGET_FLOOR);
+        px.cover(1 << 22);
+        assert_eq!(px.draw_limit, (1 << 22) * DRAW_BUDGET_FACTOR);
+        assert!(px.charge(1 << 28).is_ok());
+        assert!(px.charge(1).is_err());
+        assert!(px.charge(0).is_err(), "a spent budget stays spent");
     }
 }

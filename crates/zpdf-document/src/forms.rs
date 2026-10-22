@@ -20,6 +20,7 @@
 //! modelled but never generate an appearance.
 
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use zpdf_core::{Matrix, ObjectId, PdfDict, PdfName, PdfObject, Rect};
 use zpdf_parser::PdfFile;
@@ -28,6 +29,24 @@ use zpdf_parser::PdfFile;
 /// malformed or adversarial `/Kids` graphs (in concert with the visited set).
 const MAX_FIELD_DEPTH: usize = 50;
 const MAX_FIELDS: usize = 20_000;
+/// Cap on `/Kids` entries examined over the whole walk. Each one is resolved to
+/// classify it, so a large kids array shared by many field dicts would
+/// otherwise cost fields × kids resolves. Far above any real form.
+const MAX_KID_ENTRIES: usize = 1_000_000;
+/// Cap (UTF-8 bytes) on a fully-qualified field name. Real names are a few
+/// dozen bytes; longer ones are truncated so a huge ancestor `/T` is not
+/// copied into every descendant's name.
+const MAX_FIELD_NAME_BYTES: usize = 64 * 1024;
+/// Raw bytes of a `/T` or `/DA` string that are decoded: enough to fill the
+/// name cap even as UTF-16 (two bytes per unit, plus the BOM). The rest of a
+/// longer string could only be truncated away.
+const MAX_TEXT_RAW_BYTES: usize = 2 * MAX_FIELD_NAME_BYTES + 2;
+/// Budget (bytes) for everything the terminal fields retain: names, inherited
+/// `/V` and `/DA` copies, `/Opt` labels, and widget ids. The field and depth
+/// caps bound counts, not sizes. Without this, a megabyte `/V` inherited by a
+/// few hundred kids would be copied into each of them. The walk stops at the
+/// first field that does not fit.
+const MAX_FIELD_RETAINED_BYTES: usize = 32 * 1024 * 1024;
 
 // Field flags (`/Ff`, PDF Tables 226/228/230). Bit numbering is 1-based in the
 // spec; the shift is `bit - 1`.
@@ -186,19 +205,24 @@ impl AcroForm {
                 None => None,
             });
 
-        let root_inherited = Inherited {
-            ft: None,
-            flags: 0,
-            value: None,
-            da: af.get("DA").and_then(|o| text_string(file, o)),
-            quadding: int_value(file, af.get("Q")).unwrap_or(0),
-        };
-
         let mut state = WalkState {
             file,
             fields: Vec::new(),
             widget_owner: HashMap::new(),
             visited: HashSet::new(),
+            kid_budget: MAX_KID_ENTRIES,
+            retained_bytes: 0,
+            stopped: false,
+            name_truncated: false,
+            text_cache: HashMap::new(),
+            value_cache: HashMap::new(),
+        };
+        let root_inherited = Inherited {
+            ft: None,
+            flags: 0,
+            value: None,
+            da: af.get("DA").and_then(|o| state.text(o)),
+            quadding: int_value(file, af.get("Q")).unwrap_or(0),
         };
         if let Some(arr) = deref_array(file, af.get("Fields")) {
             for obj in &arr {
@@ -222,13 +246,15 @@ impl AcroForm {
     }
 }
 
-/// Attributes inherited down the field tree (PDF 12.7.3.2).
+/// Attributes inherited down the field tree (PDF 12.7.3.2). The strings are
+/// shared, not copied, at each level; a terminal field copies them out once,
+/// against [`MAX_FIELD_RETAINED_BYTES`].
 #[derive(Clone)]
 struct Inherited {
-    ft: Option<String>,
+    ft: Option<Rc<str>>,
     flags: i64,
-    value: Option<FieldValue>,
-    da: Option<String>,
+    value: Option<Rc<FieldValue>>,
+    da: Option<Rc<str>>,
     quadding: i64,
 }
 
@@ -237,6 +263,48 @@ struct WalkState<'a> {
     fields: Vec<FormField>,
     widget_owner: HashMap<ObjectId, usize>,
     visited: HashSet<ObjectId>,
+    /// `/Kids` entries that may still be examined ([`MAX_KID_ENTRIES`]).
+    kid_budget: usize,
+    /// Bytes retained by `fields` so far ([`MAX_FIELD_RETAINED_BYTES`]).
+    retained_bytes: usize,
+    /// Set when a budget ran out; the rest of the tree is skipped.
+    stopped: bool,
+    /// Whether a name has been truncated yet (to warn only once).
+    name_truncated: bool,
+    /// Decoded text strings of indirect objects. A string shared by many field
+    /// dicts is resolved and decoded once.
+    text_cache: HashMap<ObjectId, Option<Rc<str>>>,
+    /// Decoded `/V` values of indirect objects, shared the same way.
+    value_cache: HashMap<ObjectId, Option<Rc<FieldValue>>>,
+}
+
+impl WalkState<'_> {
+    /// A `/T` or `/DA` text string, decoding at most [`MAX_TEXT_RAW_BYTES`] of
+    /// it. Indirect strings are cached by object id.
+    fn text(&mut self, obj: &PdfObject) -> Option<Rc<str>> {
+        let file = self.file;
+        match obj {
+            PdfObject::Ref(r) => self
+                .text_cache
+                .entry(*r)
+                .or_insert_with(|| text_string_capped(file, obj, MAX_TEXT_RAW_BYTES).map(Rc::from))
+                .clone(),
+            _ => text_string_capped(file, obj, MAX_TEXT_RAW_BYTES).map(Rc::from),
+        }
+    }
+
+    /// A field value (`/V`), with indirect values cached by object id.
+    fn value(&mut self, obj: &PdfObject) -> Option<Rc<FieldValue>> {
+        let file = self.file;
+        match obj {
+            PdfObject::Ref(r) => self
+                .value_cache
+                .entry(*r)
+                .or_insert_with(|| field_value(file, Some(obj)).map(Rc::new))
+                .clone(),
+            _ => field_value(file, Some(obj)).map(Rc::new),
+        }
+    }
 }
 
 fn walk_field(
@@ -246,7 +314,7 @@ fn walk_field(
     inherited: &Inherited,
     depth: usize,
 ) {
-    if depth > MAX_FIELD_DEPTH || state.fields.len() >= MAX_FIELDS {
+    if state.stopped || depth > MAX_FIELD_DEPTH || state.fields.len() >= MAX_FIELDS {
         return;
     }
     if !state.visited.insert(id) {
@@ -261,25 +329,32 @@ fn walk_field(
 
     // Fully-qualified name: append this node's partial name `/T` (if any),
     // resolving one level of indirection like the other inherited attributes.
-    let partial = dict.get("T").and_then(|o| text_string(file, o));
-    let name = match &partial {
-        Some(t) if parent_name.is_empty() => t.clone(),
+    let partial = dict.get("T").and_then(|o| state.text(o));
+    let mut name = match &partial {
+        Some(t) if parent_name.is_empty() => t.to_string(),
         Some(t) => format!("{parent_name}.{t}"),
         None => parent_name.to_string(),
     };
+    if truncate_to_char_boundary(&mut name, MAX_FIELD_NAME_BYTES) && !state.name_truncated {
+        state.name_truncated = true;
+        tracing::warn!("form field name longer than {MAX_FIELD_NAME_BYTES} bytes; truncating");
+    }
 
     // Merge inheritable attributes (this node's own values win).
     let merged = Inherited {
         ft: dict
             .get_name("FT")
             .ok()
-            .map(String::from)
+            .map(Rc::from)
             .or_else(|| inherited.ft.clone()),
         flags: int_value(file, dict.get("Ff")).unwrap_or(inherited.flags),
-        value: field_value(file, dict.get("V")).or_else(|| inherited.value.clone()),
+        value: dict
+            .get("V")
+            .and_then(|o| state.value(o))
+            .or_else(|| inherited.value.clone()),
         da: dict
             .get("DA")
-            .and_then(|o| text_string(file, o))
+            .and_then(|o| state.text(o))
             .or_else(|| inherited.da.clone()),
         quadding: int_value(file, dict.get("Q")).unwrap_or(inherited.quadding),
     };
@@ -290,6 +365,14 @@ fn walk_field(
     let mut child_fields = Vec::new();
     let mut widget_kids = Vec::new();
     for kid in &kids {
+        if state.kid_budget == 0 {
+            if !state.stopped {
+                state.stopped = true;
+                tracing::warn!("form field tree exceeds {MAX_KID_ENTRIES} kid entries; truncating");
+            }
+            return;
+        }
+        state.kid_budget -= 1;
         if let PdfObject::Ref(r) = kid {
             let kid_obj = file.resolve(*r).ok();
             let has_t = kid_obj
@@ -324,16 +407,33 @@ fn walk_field(
     } else {
         vec![id] // the field dict is itself the widget
     };
-    if widgets.is_empty() {
+    if widgets.is_empty() || state.stopped {
         return;
     }
 
+    // Charge what this field will retain against the shared budget before
+    // copying anything out of the shared inherited values.
+    let remaining = MAX_FIELD_RETAINED_BYTES - state.retained_bytes;
+    let base_cost = name.len()
+        + merged.value.as_deref().map_or(0, field_value_bytes)
+        + merged.da.as_deref().map_or(0, str::len)
+        + widgets.len() * std::mem::size_of::<ObjectId>();
     let kind = field_kind(merged.ft.as_deref());
-    let options = if kind == FieldKind::Choice {
-        parse_options(file, dict)
-    } else {
-        Vec::new()
+    let options = match remaining.checked_sub(base_cost) {
+        Some(left) if kind == FieldKind::Choice => parse_options(file, dict, left),
+        Some(_) => Some(Vec::new()),
+        None => None,
     };
+    let Some(options) = options else {
+        state.stopped = true;
+        tracing::warn!(
+            "form fields exceed the {MAX_FIELD_RETAINED_BYTES}-byte retention budget; \
+             ignoring the remaining fields"
+        );
+        return;
+    };
+    let options_cost: usize = options.iter().map(|(e, d)| e.len() + d.len()).sum();
+    state.retained_bytes += base_cost + options_cost;
     let max_len = int_value(file, dict.get("MaxLen"));
 
     let index = state.fields.len();
@@ -345,13 +445,35 @@ fn walk_field(
         name,
         kind,
         flags: merged.flags,
-        value: merged.value,
-        default_appearance: merged.da,
+        value: merged.value.map(Rc::unwrap_or_clone),
+        default_appearance: merged.da.map(|s| s.to_string()),
         quadding: merged.quadding,
         max_len,
         options,
         widgets,
     });
+}
+
+/// Bytes of text a field value holds.
+fn field_value_bytes(value: &FieldValue) -> usize {
+    match value {
+        FieldValue::Text(s) | FieldValue::Name(s) => s.len(),
+        FieldValue::List(items) => items.iter().map(String::len).sum(),
+    }
+}
+
+/// Truncate `s` to at most `max` bytes on a `char` boundary. Returns whether
+/// anything was cut.
+fn truncate_to_char_boundary(s: &mut String, max: usize) -> bool {
+    if s.len() <= max {
+        return false;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.truncate(end);
+    true
 }
 
 fn field_kind(ft: Option<&str>) -> FieldKind {
@@ -366,29 +488,41 @@ fn field_kind(ft: Option<&str>) -> FieldKind {
 
 /// `/Opt`: each entry is a display string, or an `[export, display]` pair. The
 /// returned `(export, display)` keeps both; plain strings export == display.
-fn parse_options(file: &PdfFile, dict: &PdfDict) -> Vec<(String, String)> {
+/// `None` when the decoded labels would exceed `max_bytes`.
+fn parse_options(
+    file: &PdfFile,
+    dict: &PdfDict,
+    max_bytes: usize,
+) -> Option<Vec<(String, String)>> {
     let as_text = |o: &PdfObject| match o {
         PdfObject::String(s) => Some(pdf_string_to_unicode(s.as_bytes())),
         _ => None,
     };
-    deref_array(file, dict.get("Opt"))
-        .map(|arr| {
-            arr.iter()
-                .map(|o| match deref(file, o) {
-                    PdfObject::String(s) => {
-                        let t = pdf_string_to_unicode(s.as_bytes());
-                        (t.clone(), t)
-                    }
-                    PdfObject::Array(a) => {
-                        let export = a.first().and_then(as_text).unwrap_or_default();
-                        let display = a.get(1).and_then(as_text).unwrap_or_else(|| export.clone());
-                        (export, display)
-                    }
-                    _ => (String::new(), String::new()),
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+    let Some(arr) = deref_array(file, dict.get("Opt")) else {
+        return Some(Vec::new());
+    };
+    let mut options = Vec::new();
+    let mut bytes = 0usize;
+    for o in &arr {
+        let (export, display) = match deref(file, o) {
+            PdfObject::String(s) => {
+                let t = pdf_string_to_unicode(s.as_bytes());
+                (t.clone(), t)
+            }
+            PdfObject::Array(a) => {
+                let export = a.first().and_then(as_text).unwrap_or_default();
+                let display = a.get(1).and_then(as_text).unwrap_or_else(|| export.clone());
+                (export, display)
+            }
+            _ => (String::new(), String::new()),
+        };
+        bytes = bytes.saturating_add(export.len() + display.len());
+        if bytes > max_bytes {
+            return None;
+        }
+        options.push((export, display));
+    }
+    Some(options)
 }
 
 // ---------------------------------------------------------------------------
@@ -691,10 +825,16 @@ pub(crate) fn is_safe_resource_name(name: &str) -> bool {
 }
 
 /// Greedy word-wrap, also breaking on explicit newlines.
+///
+/// Widths are additive per character, so the current line's width is kept as
+/// a running total and only each new word (and its joining space) is measured.
+/// Re-measuring the whole candidate line per word was quadratic in the line
+/// length, and the auto-size loop runs this up to nine times per widget.
 fn wrap_lines(text: &str, base_font: &str, size: f64, usable: f64) -> Vec<String> {
     // Anti-runaway ceiling, checked at the top so a newline-heavy value cannot
     // bypass it through the empty-paragraph fast path.
     const MAX_LINES: usize = 1000;
+    let space_w = measure(" ", base_font, size);
     let mut out = Vec::new();
     for paragraph in text.split('\n') {
         if out.len() > MAX_LINES {
@@ -705,17 +845,21 @@ fn wrap_lines(text: &str, base_font: &str, size: f64, usable: f64) -> Vec<String
             continue;
         }
         let mut line = String::new();
+        let mut line_w = 0.0;
         for word in paragraph.split(' ') {
-            let candidate = if line.is_empty() {
-                word.to_string()
+            let word_w = measure(word, base_font, size);
+            if line.is_empty() {
+                // Nothing to break before: the word starts the line even when
+                // it alone overflows.
+                line.push_str(word);
+                line_w = word_w;
+            } else if line_w + space_w + word_w <= usable {
+                line.push(' ');
+                line.push_str(word);
+                line_w += space_w + word_w;
             } else {
-                format!("{line} {word}")
-            };
-            if measure(&candidate, base_font, size) <= usable || line.is_empty() {
-                line = candidate;
-            } else {
-                out.push(std::mem::take(&mut line));
-                line = word.to_string();
+                out.push(std::mem::replace(&mut line, word.to_string()));
+                line_w = word_w;
             }
         }
         out.push(line);
@@ -995,10 +1139,15 @@ fn deref_array(file: &PdfFile, obj: Option<&PdfObject>) -> Option<Vec<PdfObject>
     }
 }
 
-/// A string's text, resolving one level of indirection.
-fn text_string(file: &PdfFile, obj: &PdfObject) -> Option<String> {
+/// A string's text, resolving one level of indirection. Only the first
+/// `max_raw` bytes are decoded, so a caller that will cut the result anyway
+/// does not decode a crafted multi-megabyte string in full.
+fn text_string_capped(file: &PdfFile, obj: &PdfObject, max_raw: usize) -> Option<String> {
     match deref(file, obj) {
-        PdfObject::String(s) => Some(pdf_string_to_unicode(s.as_bytes())),
+        PdfObject::String(s) => {
+            let bytes = s.as_bytes();
+            Some(pdf_string_to_unicode(&bytes[..bytes.len().min(max_raw)]))
+        }
         _ => None,
     }
 }
@@ -1279,6 +1428,147 @@ mod tests {
         assert!(s.contains("(Test) Tj"));
         // Resources define the DA font name.
         assert!(ap.resources.get("Font").is_some());
+    }
+
+    /// A huge `/T` and `/V` on a parent field are inherited by every kid. The
+    /// kids must not each get a full copy: names are capped and the fields'
+    /// retained bytes stay within the budget (the walk stops once it is spent).
+    #[test]
+    fn inherited_strings_are_bounded_by_retention_budget() {
+        const KIDS: usize = 300;
+        let big_t = "T".repeat(1 << 20);
+        let big_v = "V".repeat(1 << 20);
+        let kid_refs: String = (0..KIDS).map(|i| format!("{} 0 R ", 6 + i)).collect();
+        let mut objs = vec![
+            "<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>".to_string(),
+            "<< /Fields [5 0 R] >>".to_string(),
+            format!("<< /T ({big_t}) /FT /Tx /V ({big_v}) /Kids [{kid_refs}] >>"),
+        ];
+        objs.extend((0..KIDS).map(|i| format!("<< /T (k{i}) >>")));
+        let refs: Vec<&str> = objs.iter().map(String::as_str).collect();
+        let doc = PdfDocument::open(build_pdf(&refs)).expect("open");
+
+        let form = doc.acro_form().expect("acroform");
+        assert!(!form.fields.is_empty(), "fields up to the budget are kept");
+        assert!(form.fields.len() < KIDS, "the budget stops the walk");
+        let mut retained = 0;
+        for f in &form.fields {
+            assert!(f.name.len() <= MAX_FIELD_NAME_BYTES, "name is capped");
+            assert!(f.name.starts_with("TTTT"));
+            retained += f.name.len() + f.value.as_ref().map_or(0, field_value_bytes);
+        }
+        assert!(
+            retained <= MAX_FIELD_RETAINED_BYTES,
+            "retained {retained} bytes"
+        );
+        // The inherited value itself is kept intact on the fields that fit.
+        assert_eq!(form.fields[0].value, Some(FieldValue::Text(big_v)));
+    }
+
+    /// A long `/T` chain is truncated on a `char` boundary, and a small form
+    /// alongside it is unaffected.
+    #[test]
+    fn long_field_name_is_truncated_on_char_boundary() {
+        // UTF-16BE: BOM then 70k copies of U+00E9 ("é", two UTF-8 bytes).
+        let mut hex = String::from("FEFF");
+        hex.push_str(&"00E9".repeat(70_000));
+        let doc = PdfDocument::open(build_pdf(&[
+            "<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>",
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>",
+            "<< /Fields [5 0 R 6 0 R] >>",
+            &format!("<< /T <{hex}> /FT /Tx /V (x) >>"),
+            "<< /T (small) /FT /Tx /V (y) >>",
+        ]))
+        .expect("open");
+
+        let form = doc.acro_form().expect("acroform");
+        assert_eq!(form.fields.len(), 2);
+        let long = &form.fields[0].name;
+        assert!(long.len() <= MAX_FIELD_NAME_BYTES && long.len() > MAX_FIELD_NAME_BYTES - 2);
+        assert!(long.chars().all(|c| c == '\u{e9}'));
+        assert_eq!(form.fields[1].name, "small");
+        assert_eq!(form.fields[1].value, Some(FieldValue::Text("y".into())));
+    }
+
+    /// The old wrap: re-measure the whole candidate line for every word.
+    fn wrap_lines_reference(text: &str, base_font: &str, size: f64, usable: f64) -> Vec<String> {
+        let mut out = Vec::new();
+        for paragraph in text.split('\n') {
+            if out.len() > 1000 {
+                break;
+            }
+            if paragraph.is_empty() {
+                out.push(String::new());
+                continue;
+            }
+            let mut line = String::new();
+            for word in paragraph.split(' ') {
+                let candidate = if line.is_empty() {
+                    word.to_string()
+                } else {
+                    format!("{line} {word}")
+                };
+                if measure(&candidate, base_font, size) <= usable || line.is_empty() {
+                    line = candidate;
+                } else {
+                    out.push(std::mem::take(&mut line));
+                    line = word.to_string();
+                }
+            }
+            out.push(line);
+        }
+        out
+    }
+
+    #[test]
+    fn wrap_lines_matches_full_remeasure() {
+        let texts = [
+            "The quick brown fox jumps over the lazy dog",
+            "  leading and  doubled   spaces ",
+            "first paragraph\n\nsecond one is somewhat longer than the box\nthird",
+            "Supercalifragilisticexpialidocious overflows alone",
+            "",
+        ];
+        for text in texts {
+            for (font, usable) in [("Helvetica", 60.0), ("Courier", 95.5), ("Unknown", 33.0)] {
+                assert_eq!(
+                    wrap_lines(text, font, 10.0, usable),
+                    wrap_lines_reference(text, font, 10.0, usable),
+                    "{text:?} / {font} / {usable}"
+                );
+            }
+        }
+    }
+
+    /// A maximal value in a wide, short auto-size multiline field: every word
+    /// lands on one line and the size loop runs to its floor. Re-measuring
+    /// the line per word took seconds here; the running width is linear.
+    #[test]
+    fn auto_size_wrap_of_long_value_is_linear() {
+        let f = FormField {
+            field_id: ObjectId(0, 0),
+            name: "notes".into(),
+            kind: FieldKind::Text,
+            flags: FF_MULTILINE,
+            value: Some(FieldValue::Text("a ".repeat(MAX_APPEARANCE_TEXT_CHARS / 2))),
+            default_appearance: Some("/Helv 0 Tf 0 g".into()),
+            quadding: 0,
+            max_len: None,
+            options: vec![],
+            widgets: vec![],
+        };
+        let start = std::time::Instant::now();
+        let ap = generate_widget_appearance(&f, Rect::new(0.0, 0.0, 1.0e7, 10.0), None)
+            .expect("appearance");
+        let elapsed = start.elapsed();
+        assert!(String::from_utf8_lossy(&ap.content).contains("(a a a"));
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "wrap took {elapsed:?}"
+        );
     }
 
     #[test]

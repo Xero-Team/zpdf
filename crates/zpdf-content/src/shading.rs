@@ -66,6 +66,17 @@ pub struct MeshTriangle {
 }
 
 impl ShadingDef {
+    /// Approximate heap bytes held: the colour LUT plus any mesh triangles.
+    pub fn heap_bytes(&self) -> usize {
+        let triangles = match &self.kind {
+            ShadingKind::Mesh { triangles } => triangles.len(),
+            _ => 0,
+        };
+        std::mem::size_of::<Self>()
+            + self.lut.len() * std::mem::size_of::<[f32; 3]>()
+            + triangles * std::mem::size_of::<MeshTriangle>()
+    }
+
     /// Mean LUT color — used as the solid approximation for shading-pattern
     /// strokes and as a last-resort fill.
     pub fn average_rgb(&self) -> [f32; 3] {
@@ -217,11 +228,25 @@ fn rasterize_mesh(triangles: &[MeshTriangle], region: Rect, w: u32, h: u32) -> O
             ((region.y1 - y as f64) / rh * h as f64) as f32,
         )
     };
+    // Each triangle scans its clipped bounding box, so a mesh of large
+    // overlapping triangles costs far more than its triangle count suggests.
+    // Real meshes cover the raster a few times over; stop past a budget.
+    let budget = u64::from(w) * u64::from(h) * MESH_COVERAGE_BUDGET;
+    let mut scanned = 0u64;
     for tri in triangles {
-        raster_triangle(&mut buf, w, h, tri, &to_px);
+        scanned = scanned.saturating_add(raster_triangle(&mut buf, w, h, tri, &to_px));
+        if scanned > budget {
+            tracing::warn!(
+                "mesh shading scanned over {MESH_COVERAGE_BUDGET}x its raster; truncating"
+            );
+            break;
+        }
     }
     Some(buf)
 }
+
+/// Times a mesh shading may scan its raster in total (see [`rasterize_mesh`]).
+const MESH_COVERAGE_BUDGET: u64 = 64;
 
 fn rgba_len(w: u32, h: u32) -> Option<usize> {
     let pixels = u64::from(w).checked_mul(u64::from(h))?;
@@ -233,14 +258,15 @@ fn rgba_len(w: u32, h: u32) -> Option<usize> {
 
 /// Scanline-fill one triangle with barycentric RGB interpolation. The top-left
 /// fill rule ensures pixels on a shared edge are painted by exactly one of the
-/// two adjacent triangles (no seams, no double blend).
+/// two adjacent triangles (no seams, no double blend). Returns the number of
+/// pixels scanned (the triangle's bounding box within the raster).
 fn raster_triangle(
     buf: &mut [u8],
     w: u32,
     h: u32,
     tri: &MeshTriangle,
     to_px: &impl Fn(f32, f32) -> (f32, f32),
-) {
+) -> u64 {
     let p = [
         to_px(tri.v[0].x, tri.v[0].y),
         to_px(tri.v[1].x, tri.v[1].y),
@@ -273,8 +299,9 @@ fn raster_triangle(
         .min(h as f32) as i32;
     let area = edge(p[0], p[1], p[2]);
     if area.abs() < 1e-7 {
-        return; // degenerate
+        return 0; // degenerate
     }
+    let scanned = (maxx - minx).max(0) as u64 * (maxy - miny).max(0) as u64;
     let inv = 1.0 / area;
     // An edge a→b is a "top or left" edge (its zero-coverage pixels are filled).
     let tl = |a: (f32, f32), b: (f32, f32)| -> bool { a.1 > b.1 || (a.1 == b.1 && a.0 < b.0) };
@@ -308,6 +335,7 @@ fn raster_triangle(
             buf[o + 3] = 255;
         }
     }
+    scanned
 }
 
 /// Signed area (×2) of triangle `a,b,c` — the edge function for `c` against `a→b`.
@@ -466,6 +494,42 @@ mod tests {
             "near (0,0) should be red-dominant: {:?}",
             &buf[o..o + 4]
         );
+    }
+
+    #[test]
+    fn mesh_rasterization_stops_at_its_coverage_budget() {
+        // Every triangle covers the whole raster; the first 65 (the budget is
+        // exceeded by the 65th) are red, the rest green.
+        let tri = |rgb| MeshTriangle {
+            v: [
+                MeshVertex {
+                    x: -10.0,
+                    y: -10.0,
+                    rgb,
+                },
+                MeshVertex {
+                    x: 30.0,
+                    y: -10.0,
+                    rgb,
+                },
+                MeshVertex {
+                    x: -10.0,
+                    y: 30.0,
+                    rgb,
+                },
+            ],
+        };
+        let mut triangles = vec![tri([1.0, 0.0, 0.0]); MESH_COVERAGE_BUDGET as usize + 1];
+        triangles.extend(std::iter::repeat_n(tri([0.0, 1.0, 0.0]), 100_000));
+        let def = ShadingDef {
+            kind: ShadingKind::Mesh { triangles },
+            lut: vec![[0.0, 0.0, 0.0]],
+            extend_start: false,
+            extend_end: false,
+            to_page: Matrix::identity(),
+        };
+        let buf = rasterize(&def, Rect::new(0.0, 0.0, 1.0, 1.0), 16, 16).unwrap();
+        assert_eq!(&buf[..4], &[255, 0, 0, 255]);
     }
 
     #[test]

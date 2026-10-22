@@ -187,9 +187,10 @@ fn decode_row_2d(
     let mut changes = Vec::new();
     let mut a0: i64 = -1;
     let mut color_white = true; // current coding colour
+    let reference = RefLine::new(reference);
 
     while a0 < columns as i64 {
-        let (b1, b2) = find_b1_b2(reference, a0, color_white, columns);
+        let (b1, b2) = find_b1_b2(&reference, a0, color_white, columns);
 
         match read_mode(reader)? {
             Mode::Pass => {
@@ -223,19 +224,56 @@ fn decode_row_2d(
     Some(changes)
 }
 
+/// A reference line prepared for b1 lookups.
+///
+/// The b1 search wants the first element greater than a0. Rescanning from
+/// index 0 for every coded element is O(columns²) per row, and /Columns may
+/// be 2^20. The running prefix maximum is non-decreasing even when a corrupt
+/// stream leaves the line out of order (a vertical-left code can step back
+/// past earlier transitions), and its first entry above a0 sits at exactly
+/// the index a linear scan from 0 stops at. So a binary search over it is
+/// exact for every input. Well-formed lines are already sorted and are used
+/// as they are.
+struct RefLine<'a> {
+    elements: &'a [usize],
+    prefix_max: std::borrow::Cow<'a, [usize]>,
+}
+
+impl<'a> RefLine<'a> {
+    fn new(elements: &'a [usize]) -> Self {
+        let prefix_max = if elements.windows(2).all(|w| w[0] <= w[1]) {
+            std::borrow::Cow::Borrowed(elements)
+        } else {
+            let mut max = 0usize;
+            std::borrow::Cow::Owned(
+                elements
+                    .iter()
+                    .map(|&e| {
+                        max = max.max(e);
+                        max
+                    })
+                    .collect(),
+            )
+        };
+        Self {
+            elements,
+            prefix_max,
+        }
+    }
+}
+
 /// b1 = first changing element on the reference line right of a0 with colour
 /// opposite to the current coding colour; b2 = the element after b1.
 /// Reference elements alternate colour starting black (index 0 = white→black).
-fn find_b1_b2(reference: &[usize], a0: i64, color_white: bool, columns: usize) -> (usize, usize) {
+fn find_b1_b2(reference: &RefLine, a0: i64, color_white: bool, columns: usize) -> (usize, usize) {
+    // First i with reference[i] > a0 (see `RefLine`).
+    let mut i = reference.prefix_max.partition_point(|&e| (e as i64) <= a0);
     // Colour of reference changing element i: black when i even, white when odd.
     // We want b1's colour opposite to a0's colour.
     let want_black = color_white; // opposite of white is black
-    let mut i = 0;
-    while i < reference.len() && (reference[i] as i64) <= a0 {
-        i += 1;
-    }
-    // Fix parity so reference[i] has the wanted colour.
+                                  // Fix parity so reference[i] has the wanted colour.
     let is_black = |idx: usize| idx.is_multiple_of(2);
+    let reference = reference.elements;
     if i < reference.len() && is_black(i) != want_black {
         i += 1;
     }
@@ -248,9 +286,9 @@ fn find_b1_b2(reference: &[usize], a0: i64, color_white: bool, columns: usize) -
 /// terminating code (0..=63).
 fn read_run(reader: &mut BitReader, white: bool) -> Option<usize> {
     let mut total = 0usize;
+    let lut = run_lut(white);
     loop {
-        let table = if white { &WHITE_CODES } else { &BLACK_CODES };
-        let run = match_code(reader, table)?;
+        let run = match_code(reader, lut)?;
         total += run as usize;
         if run < 64 {
             return Some(total);
@@ -319,17 +357,49 @@ fn read_mode(reader: &mut BitReader) -> Option<Mode> {
     None
 }
 
-/// Match the next bits against a prefix-free code table; returns the run value.
-fn match_code(reader: &mut BitReader, table: &[(u8, u16, u16)]) -> Option<u16> {
-    let mut code: u16 = 0;
+/// Longest T.4 run-length code (the black make-up codes are 13 bits).
+const MAX_CODE_LEN: u8 = 13;
+/// Empty [`run_lut`] slot.
+const NO_CODE: u16 = u16::MAX;
+
+/// Direct-lookup form of a run-length code table, indexed by `1 << len | code`.
+/// The leading marker bit keeps codes of different lengths in separate slots,
+/// so each bit read costs one probe instead of a scan of the whole table.
+fn build_run_lut(table: &[(u8, u16, u16)]) -> Box<[u16]> {
+    let mut lut = vec![NO_CODE; 1 << (MAX_CODE_LEN + 1)].into_boxed_slice();
+    // Insert in reverse so the first entry for a slot wins, as the linear
+    // scan did (the tables are prefix-free, so no slot is actually shared).
+    for &(len, code, run) in table.iter().rev() {
+        // A code wider than its length could never equal a `len`-bit read.
+        if (1..=MAX_CODE_LEN).contains(&len) && (code as usize) < 1 << len {
+            lut[1 << len | code as usize] = run;
+        }
+    }
+    lut
+}
+
+/// The white or black run-length lookup table, built on first use.
+fn run_lut(white: bool) -> &'static [u16] {
+    static WHITE: std::sync::OnceLock<Box<[u16]>> = std::sync::OnceLock::new();
+    static BLACK: std::sync::OnceLock<Box<[u16]>> = std::sync::OnceLock::new();
+    if white {
+        WHITE.get_or_init(|| build_run_lut(&WHITE_CODES))
+    } else {
+        BLACK.get_or_init(|| build_run_lut(&BLACK_CODES))
+    }
+}
+
+/// Match the next bits against a prefix-free code table (in [`run_lut`] form);
+/// returns the run value.
+fn match_code(reader: &mut BitReader, lut: &[u16]) -> Option<u16> {
+    let mut code = 0usize;
     let mut len: u8 = 0;
     while len < 14 {
-        code = (code << 1) | reader.read_bit()? as u16;
+        code = (code << 1) | reader.read_bit()? as usize;
         len += 1;
-        for &(clen, cbits, run) in table {
-            if clen == len && cbits == code {
-                return Some(run);
-            }
+        match lut.get(1 << len | code) {
+            Some(&run) if run != NO_CODE => return Some(run),
+            _ => {}
         }
     }
     None
@@ -546,6 +616,168 @@ mod tests {
             "output must stay bounded by input bits, got {}",
             out.len()
         );
+    }
+
+    /// Hand-coded Group 4 rows exercising every 2-D mode (pass, horizontal,
+    /// V0, VR1, VR2, VL1) against real reference lines, checked pixel-exact.
+    #[test]
+    fn two_d_modes_decode_exactly() {
+        let bits = concat!(
+            "001", "1000", "11", "1", // row 1 WWWBBWWW: H(W3,B2), V0
+            "1", "1", "1", //            row 2 WWWBBWWW: V0, V0, V0
+            "0001", "1", //              row 3 WWWWWWWW: P, V0
+            "001", "0111", "011", "1", // row 4 WWBBBBWW: H(W2,B4), V0
+            "011", "000011", //          row 5 WWWBBBBB: VR1, VR2
+            "010", "1", //               row 6 WWBBBBBB: VL1, V0
+        );
+        let p = CcittParams {
+            k: -1,
+            columns: 8,
+            rows: 6,
+            black_is_1: false,
+            byte_align: false,
+        };
+        let out = decode_test(&bits_to_bytes(bits), &p).unwrap();
+        assert_eq!(out, vec![0xE7, 0xE7, 0xFF, 0xC3, 0xE0, 0xC0]);
+    }
+
+    /// The pre-cursor `find_b1_b2`: a linear scan from index 0 on every call.
+    fn find_b1_b2_linear(
+        reference: &[usize],
+        a0: i64,
+        color_white: bool,
+        columns: usize,
+    ) -> (usize, usize) {
+        let want_black = color_white;
+        let mut i = 0;
+        while i < reference.len() && (reference[i] as i64) <= a0 {
+            i += 1;
+        }
+        if i < reference.len() && i.is_multiple_of(2) != want_black {
+            i += 1;
+        }
+        let b1 = reference.get(i).copied().unwrap_or(columns);
+        let b2 = reference.get(i + 1).copied().unwrap_or(columns);
+        (b1.min(columns), b2.min(columns))
+    }
+
+    /// The prefix-maximum binary search must agree with the linear scan for
+    /// every a0 and colour, including malformed (non-monotonic, duplicated)
+    /// reference lines that corrupt streams can produce.
+    #[test]
+    fn find_b1_b2_matches_linear_scan() {
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for case in 0..400 {
+            let columns = 1 + (next() % 40) as usize;
+            let len = (next() % 24) as usize;
+            let mut reference: Vec<usize> = (0..len)
+                .map(|_| (next() % (columns as u64 + 1)) as usize)
+                .collect();
+            if case % 2 == 0 {
+                reference.sort_unstable(); // well-formed lines are sorted
+            }
+            reference.push(columns);
+            reference.push(columns);
+            let prefix_max = RefLine::new(&reference);
+            for a0 in -1..=columns as i64 + 1 {
+                for color_white in [true, false] {
+                    assert_eq!(
+                        find_b1_b2(&prefix_max, a0, color_white, columns),
+                        find_b1_b2_linear(&reference, a0, color_white, columns),
+                        "reference {reference:?}, a0 {a0}, white {color_white}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// MSB-first bit packer for building large fixtures.
+    #[derive(Default)]
+    struct Bits {
+        out: Vec<u8>,
+        n: usize,
+    }
+
+    impl Bits {
+        fn push(&mut self, code: &str) {
+            for ch in code.bytes() {
+                if self.n.is_multiple_of(8) {
+                    self.out.push(0);
+                }
+                if ch == b'1' {
+                    *self.out.last_mut().unwrap() |= 0x80 >> (self.n % 8);
+                }
+                self.n += 1;
+            }
+        }
+    }
+
+    /// Regression for the O(columns²) reference rescan: a maximally wide row
+    /// with a transition every two pixels, followed by rows that each code
+    /// every transition in V0 against it. Rescanning the reference line from
+    /// index 0 per b1 lookup made this ~10^10 comparisons; it must now finish
+    /// promptly and still decode exactly.
+    #[test]
+    fn wide_dense_rows_decode_quickly() {
+        let columns = 1usize << 20;
+        let mut bits = Bits::default();
+        // Row 1: H(W2, B2) repeated → WWBB WWBB …
+        for _ in 0..columns / 4 {
+            bits.push("001");
+            bits.push("0111"); // white 2
+            bits.push("11"); // black 2
+        }
+        // Rows 2–4: every changing element vertically aligned (V0).
+        for _ in 0..3 {
+            for _ in 0..columns / 2 {
+                bits.push("1");
+            }
+        }
+        let p = CcittParams {
+            k: -1,
+            columns,
+            rows: 4,
+            black_is_1: false,
+            byte_align: false,
+        };
+        let start = std::time::Instant::now();
+        let out = decode_test(&bits.out, &p).unwrap();
+        assert_eq!(out.len(), 4 * columns / 8);
+        assert!(out.iter().all(|&b| b == 0xCC), "rows must read WWBB…");
+        // Generous bound (debug build); the quadratic scan took minutes.
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(30),
+            "wide dense rows took {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// The direct-lookup run-code matcher must accept exactly the table
+    /// codes, at exactly their lengths, for both colours.
+    #[test]
+    fn run_code_lookup_matches_tables() {
+        for (white, table) in [(true, &WHITE_CODES[..]), (false, &BLACK_CODES[..])] {
+            for &(len, code, run) in table {
+                let bits: String = (0..len)
+                    .rev()
+                    .map(|b| if (code >> b) & 1 == 1 { '1' } else { '0' })
+                    .collect();
+                let data = bits_to_bytes(&bits);
+                let mut reader = BitReader::new(&data);
+                assert_eq!(match_code(&mut reader, run_lut(white)), Some(run));
+                assert_eq!(reader.bit, len as usize, "code for run {run} length");
+            }
+        }
+        // EOL (000000000001) is no run code: the matcher gives up.
+        let data = bits_to_bytes("0000000000010000");
+        let mut reader = BitReader::new(&data);
+        assert_eq!(match_code(&mut reader, run_lut(true)), None);
     }
 
     fn bits_to_bytes(bits: &str) -> Vec<u8> {

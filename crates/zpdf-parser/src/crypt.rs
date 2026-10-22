@@ -67,6 +67,12 @@ pub struct Decryptor {
     stm_algo: Algo,
     /// Cipher for strings (`/StrF` crypt filter).
     str_algo: Algo,
+    /// Cipher for embedded-file streams (`/EFF` crypt filter, default
+    /// `/StmF`).
+    eff_algo: Algo,
+    /// Ciphers of the `/CF` crypt filters by name, for streams that name one
+    /// with a `/Crypt` filter of their own (V4/V5 only).
+    crypt_filters: Vec<(String, Algo)>,
     /// The `/Encrypt` dictionary's own object id, which must never be
     /// decrypted (its strings are stored in the clear). `None` when the
     /// trailer carries a direct (non-reference) `/Encrypt` dict.
@@ -107,13 +113,23 @@ impl Decryptor {
         // V4/V5: `/CF` crypt filters selected by `/StmF` (streams) and `/StrF`
         // (strings); per spec the default for each is `Identity` (no
         // encryption for that class).
-        let (stm_algo, str_algo) = if v >= 4 {
+        let (stm_algo, str_algo, eff_algo) = if v >= 4 {
+            let stmf = dict.get_name("StmF").unwrap_or("Identity");
             (
-                algo_for_filter(dict, dict.get_name("StmF").unwrap_or("Identity")),
+                algo_for_filter(dict, stmf),
                 algo_for_filter(dict, dict.get_name("StrF").unwrap_or("Identity")),
+                algo_for_filter(dict, dict.get_name("EFF").unwrap_or(stmf)),
             )
         } else {
-            (Algo::Rc4, Algo::Rc4)
+            (Algo::Rc4, Algo::Rc4, Algo::Rc4)
+        };
+        let crypt_filters = match dict.get_dict("CF") {
+            Ok(cf) if v >= 4 => {
+                cf.0.keys()
+                    .map(|name| (name.0.clone(), algo_for_filter(dict, &name.0)))
+                    .collect()
+            }
+            _ => Vec::new(),
         };
 
         // Default true (R<4 has no such key and always encrypts metadata).
@@ -187,6 +203,8 @@ impl Decryptor {
             key,
             stm_algo,
             str_algo,
+            eff_algo,
+            crypt_filters,
             encrypt_id,
             encrypt_metadata,
         })
@@ -286,8 +304,9 @@ impl Decryptor {
                 // are detectable here (we don't know if this object is the
                 // catalog's /Metadata target) — that covers conforming files.
                 let plain_meta = !self.encrypt_metadata && typ == "Metadata";
-                if !is_xref && !plain_meta && self.stm_algo != Algo::Identity {
-                    let dec = self.decrypt(id, &s.data, self.stm_algo);
+                let algo = self.stream_algo(&s.dict);
+                if !is_xref && !plain_meta && algo != Algo::Identity {
+                    let dec = self.decrypt(id, &s.data, algo);
                     s.data = Arc::from(dec);
                 }
                 for v in s.dict.0.values_mut() {
@@ -297,6 +316,40 @@ impl Decryptor {
             // Refs are followed (and decrypted) when resolved; scalars are plain.
             _ => {}
         }
+    }
+
+    /// The cipher of a stream with dictionary `dict`: the crypt filter its own
+    /// leading `/Crypt` filter names (`/DecodeParms /Name`, default
+    /// `Identity` — ISO 32000-1 §7.4.10), else `/EFF` for an embedded file,
+    /// else `/StmF`.
+    fn stream_algo(&self, dict: &PdfDict) -> Algo {
+        let first_filter = match dict.get("Filter") {
+            Some(PdfObject::Name(n)) => Some(n.as_str()),
+            Some(PdfObject::Array(a)) => a.first().and_then(|f| f.as_name().ok()),
+            _ => None,
+        };
+        if first_filter == Some("Crypt") {
+            let parms = match dict.get("DecodeParms").or_else(|| dict.get("DP")) {
+                Some(PdfObject::Dict(d)) => Some(d),
+                Some(PdfObject::Array(a)) => a.first().and_then(|p| p.as_dict().ok()),
+                _ => None,
+            };
+            let name = parms
+                .and_then(|p| p.get_name("Name").ok())
+                .unwrap_or("Identity");
+            if name == "Identity" {
+                return Algo::Identity;
+            }
+            return self
+                .crypt_filters
+                .iter()
+                .find(|(n, _)| n == name)
+                .map_or(self.stm_algo, |&(_, algo)| algo);
+        }
+        if dict.get_name("Type").ok() == Some("EmbeddedFile") {
+            return self.eff_algo;
+        }
+        self.stm_algo
     }
 
     /// Per-object key derivation (Algorithm 1) + cipher application.
@@ -974,6 +1027,8 @@ mod tests {
             key,
             stm_algo: Algo::Rc4,
             str_algo: Algo::Rc4,
+            eff_algo: Algo::Rc4,
+            crypt_filters: Vec::new(),
             encrypt_id: None,
             encrypt_metadata: true,
         };
@@ -1149,6 +1204,84 @@ mod tests {
         }
     }
 
+    /// A stream's own `/Crypt` filter selects its cipher: `/Name /Identity`
+    /// (or no name) exempts it from `/StmF`, a named `/CF` filter applies that
+    /// filter. Embedded files use `/EFF`. The `/Crypt` entry itself is then
+    /// skipped by the filter pipeline.
+    #[test]
+    fn per_stream_crypt_filters_select_the_cipher() {
+        let mut stdcf = PdfDict::new();
+        stdcf.insert(PdfName::new("CFM"), PdfObject::Name(PdfName::new("V2")));
+        stdcf.insert(PdfName::new("Length"), PdfObject::Integer(16));
+        let mut cf = PdfDict::new();
+        cf.insert(PdfName::new("StdCF"), PdfObject::Dict(stdcf));
+        let mut dict = PdfDict::new();
+        dict.insert(
+            PdfName::new("Filter"),
+            PdfObject::Name(PdfName::new("Standard")),
+        );
+        dict.insert(PdfName::new("V"), PdfObject::Integer(4));
+        dict.insert(PdfName::new("R"), PdfObject::Integer(4));
+        dict.insert(PdfName::new("CF"), PdfObject::Dict(cf));
+        dict.insert(PdfName::new("StmF"), PdfObject::Name(PdfName::new("StdCF")));
+        dict.insert(PdfName::new("StrF"), PdfObject::Name(PdfName::new("StdCF")));
+        dict.insert(
+            PdfName::new("EFF"),
+            PdfObject::Name(PdfName::new("Identity")),
+        );
+        let dec = match Decryptor::from_encrypt_dict(&dict, &[], None, b"") {
+            BuildResult::Decryptor(d) => d,
+            _ => panic!("decryptor"),
+        };
+
+        let crypt = |name: Option<&str>| {
+            let mut d = PdfDict::new();
+            d.insert(
+                PdfName::new("Filter"),
+                PdfObject::Array(vec![PdfObject::Name(PdfName::new("Crypt"))]),
+            );
+            if let Some(name) = name {
+                let mut parms = PdfDict::new();
+                parms.insert(PdfName::new("Name"), PdfObject::Name(PdfName::new(name)));
+                d.insert(
+                    PdfName::new("DecodeParms"),
+                    PdfObject::Array(vec![PdfObject::Dict(parms)]),
+                );
+            }
+            d
+        };
+        let decrypted = |stream_dict: PdfDict| {
+            let mut obj = PdfObject::Stream(PdfStream::new(stream_dict, b"payload".to_vec()));
+            dec.decrypt_object(&mut obj, ObjectId(9, 0));
+            let PdfObject::Stream(s) = obj else {
+                unreachable!()
+            };
+            s
+        };
+
+        assert_eq!(
+            &decrypted(crypt(None)).data[..],
+            b"payload",
+            "default Identity"
+        );
+        let exempt = decrypted(crypt(Some("Identity")));
+        assert_eq!(&exempt.data[..], b"payload");
+        assert_eq!(
+            crate::filters::decode_stream(&exempt.data, &exempt.dict).unwrap(),
+            b"payload",
+            "the /Crypt filter is not a decode step"
+        );
+        assert_ne!(&decrypted(crypt(Some("StdCF"))).data[..], b"payload");
+        assert_ne!(&decrypted(PdfDict::new()).data[..], b"payload", "/StmF");
+
+        let mut embedded = PdfDict::new();
+        embedded.insert(
+            PdfName::new("Type"),
+            PdfObject::Name(PdfName::new("EmbeddedFile")),
+        );
+        assert_eq!(&decrypted(embedded).data[..], b"payload", "/EFF Identity");
+    }
+
     /// /StmF Identity + /StrF StdCF(RC4): strings decrypt, streams pass through.
     #[test]
     fn v4_identity_stream_filter_leaves_streams_alone() {
@@ -1214,6 +1347,8 @@ mod tests {
             key: vec![1, 2, 3, 4, 5],
             stm_algo: Algo::Rc4,
             str_algo: Algo::Rc4,
+            eff_algo: Algo::Rc4,
+            crypt_filters: Vec::new(),
             encrypt_id: None,
             encrypt_metadata: false,
         };
@@ -1303,6 +1438,8 @@ mod tests {
             key,
             stm_algo: Algo::Rc4,
             str_algo: Algo::Rc4,
+            eff_algo: Algo::Rc4,
+            crypt_filters: Vec::new(),
             encrypt_id: None,
             encrypt_metadata: true,
         };
@@ -1405,6 +1542,8 @@ mod tests {
             key,
             stm_algo: Algo::Rc4,
             str_algo: Algo::Rc4,
+            eff_algo: Algo::Rc4,
+            crypt_filters: Vec::new(),
             encrypt_id: None,
             encrypt_metadata: true,
         };

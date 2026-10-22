@@ -167,8 +167,14 @@ impl GlyphAtlas {
         let (min_x, _min_y, max_x, max_y) = outline_bbox(outline)?;
         let scale_x = key.x_millipx_per_em as f64 / GlyphKey::MILLI / upem as f64;
         let scale_y = key.y_millipx_per_em as f64 / GlyphKey::MILLI / upem as f64;
-        let w = (((max_x - min_x) * scale_x).ceil() as u32 + 2 * PAD).max(1);
-        let h = (((max_y - _min_y) * scale_y).ceil() as u32 + 2 * PAD).max(1);
+        // `as u32` saturates a huge extent; the padding must not then wrap it
+        // back to a small, atlas-able size.
+        let w = (((max_x - min_x) * scale_x).ceil() as u32)
+            .saturating_add(2 * PAD)
+            .max(1);
+        let h = (((max_y - _min_y) * scale_y).ceil() as u32)
+            .saturating_add(2 * PAD)
+            .max(1);
         if w > self.size || h > self.size {
             return None; // pathologically large glyph — not atlas-able
         }
@@ -537,6 +543,23 @@ mod tests {
         assert!(atlas
             .get_or_rasterize(key(1000, 1000), &outline, 1000.0)
             .is_none());
+    }
+
+    /// An extent that saturates `u32` must stay too large once padded, not
+    /// wrap to a tiny atlas-able size (or panic in debug builds).
+    #[test]
+    fn saturated_glyph_extent_returns_none() {
+        let mut atlas = GlyphAtlas::new(64);
+        let huge = GlyphOutline {
+            commands: vec![
+                OutlineCommand::MoveTo(0.0, 0.0),
+                OutlineCommand::LineTo(1.0e30, 0.0),
+                OutlineCommand::LineTo(1.0e30, 1.0e30),
+                OutlineCommand::Close,
+            ],
+            advance_width: 1000.0,
+        };
+        assert!(atlas.get_or_rasterize(key(20, 20), &huge, 1000.0).is_none());
     }
 
     #[test]
