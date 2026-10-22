@@ -552,3 +552,76 @@ fn page_annot_subtypes(file: &PdfFile) -> Vec<String> {
     }
     out
 }
+
+// ---- A-1b transparency stripping across object kinds ---------------------
+
+fn object_has_key(obj: &PdfObject, key: &str) -> bool {
+    match obj {
+        PdfObject::Dict(dict) | PdfObject::Stream(zpdf_core::PdfStream { dict, .. }) => {
+            dict.get(key).is_some() || dict.0.values().any(|v| object_has_key(v, key))
+        }
+        PdfObject::Array(items) => items.iter().any(|v| object_has_key(v, key)),
+        _ => false,
+    }
+}
+
+fn converted_has_key(bytes: &[u8], key: &str) -> bool {
+    let file = PdfFile::parse(bytes.to_vec()).expect("parse converted");
+    file.all_object_ids()
+        .into_iter()
+        .filter_map(|id| file.resolve(id).ok())
+        .any(|obj| object_has_key(&obj, key))
+}
+
+#[test]
+fn a1b_strips_transparency_from_forms_extgstates_and_annotations() {
+    let objects: &[&str] = &[
+        // 1: catalog with an associated file and an XFA form.
+        "<< /Type /Catalog /Pages 2 0 R /AF [9 0 R] \
+           /AcroForm << /Fields [] /XFA 8 0 R >> >>",
+        // 2: pages root
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        // 3: page with a form, an ExtGState and an additional-action dict.
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+           /Resources << /XObject << /Fm 5 0 R >> /ExtGState << /GS 6 0 R >> >> \
+           /AA << /O 4 0 R >> >>",
+        // 4: a JavaScript additional action.
+        "<< /S /JavaScript /JS (app.alert(1)) >>",
+        // 5: Form XObject with a transparency group and a soft mask.
+        "<< /Type /XObject /Subtype /Form /BBox [0 0 10 10] /Group << /S /Transparency >> \
+           /SMask 10 0 R /Length 0 >>\nstream\n\nendstream",
+        // 6: non-opaque ExtGState with a blend mode.
+        "<< /Type /ExtGState /ca 0.5 /CA 0.5 /BM /Multiply >>",
+        // 7: image with a soft mask.
+        "<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /BitsPerComponent 8 \
+           /ColorSpace /DeviceGray /SMask 10 0 R /Length 1 >>\nstream\n\x00\nendstream",
+        // 8: XFA stream.
+        "<< /Length 0 >>\nstream\n\nendstream",
+        // 9: filespec.
+        "<< /Type /Filespec /F (a.txt) /EF << /F 8 0 R >> >>",
+        // 10: soft mask stream.
+        "<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /BitsPerComponent 8 \
+           /ColorSpace /DeviceGray /Length 1 >>\nstream\nA\nendstream",
+    ];
+    let pdf = build_pdf(objects);
+    let file = PdfFile::parse(pdf).expect("parse");
+    let converted = zpdf_writer::rewrite_pdf(
+        &file,
+        &RewriteOptions {
+            pdfa: Some(PdfaConvertConfig {
+                profile: PdfaProfile::A1b,
+                icc: None,
+                fallback_font: None,
+            }),
+            ..Default::default()
+        },
+    )
+    .expect("convert");
+
+    for key in ["Group", "SMask", "ca", "CA", "BM", "AA", "XFA", "AF"] {
+        assert!(
+            !converted_has_key(&converted, key),
+            "A-1b output still contains /{key}"
+        );
+    }
+}
