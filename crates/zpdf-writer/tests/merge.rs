@@ -284,3 +284,116 @@ fn append_document_without_extras_still_works() {
     let doc = PdfDocument::open(out.into_inner()).expect("open");
     assert_eq!(doc.page_count(), 2);
 }
+
+/// Build a PDF from `(object number, body)` pairs with a classic xref.
+fn pdf_from_objects(objects: &[(u32, String)]) -> Vec<u8> {
+    let max_num = objects.iter().map(|(n, _)| *n).max().unwrap_or(0);
+    let mut pdf = b"%PDF-1.7\n".to_vec();
+    let mut offsets = vec![0u64; max_num as usize + 1];
+    for (num, body) in objects {
+        offsets[*num as usize] = pdf.len() as u64;
+        pdf.extend_from_slice(format!("{num} 0 obj\n{body}\nendobj\n").as_bytes());
+    }
+    let xref = pdf.len();
+    pdf.extend_from_slice(format!("xref\n0 {}\n", max_num + 1).as_bytes());
+    pdf.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in &offsets[1..] {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+            max_num + 1
+        )
+        .as_bytes(),
+    );
+    pdf
+}
+
+#[test]
+fn merge_recurses_through_pages_nodes_without_type() {
+    // Interior nodes carrying /Kids but no /Type must still be walked; some
+    // producers omit /Type on one level of the page tree.
+    let source = pdf_from_objects(&[
+        (1, "<< /Type /Catalog /Pages 2 0 R >>".to_string()),
+        (2, "<< /Kids [3 0 R] /Count 2 >>".to_string()),
+        (3, "<< /Kids [4 0 R 5 0 R] /Count 2 >>".to_string()),
+        (
+            4,
+            "<< /Type /Page /Parent 3 0 R /MediaBox [0 0 700 792] >>".to_string(),
+        ),
+        (
+            5,
+            "<< /Type /Page /Parent 3 0 R /MediaBox [0 0 701 792] >>".to_string(),
+        ),
+    ]);
+
+    let mut writer = IncrementalWriter::new(pdf_with_pages(1, 600)).expect("writer");
+    let src = PdfFile::parse(source).expect("parse source");
+    assert_eq!(writer.append_document(&src).expect("append"), 2);
+
+    let mut out = Cursor::new(Vec::new());
+    writer.write(&mut out).expect("write");
+    let doc = PdfDocument::open(out.into_inner()).expect("open merged");
+    assert_eq!(doc.page_count(), 3);
+    assert_eq!(doc.page(1).expect("page").width(), 700.0);
+    assert_eq!(doc.page(2).expect("page").width(), 701.0);
+}
+
+#[test]
+fn merged_separate_widgets_get_their_parent_back() {
+    use zpdf_core::PdfObject;
+
+    // Field 6 has a separate widget kid 7 (the layout produced by most form
+    // designers). Page copying drops the widget's /Parent; the AcroForm merge
+    // must restore it.
+    let source = pdf_from_objects(&[
+        (
+            1,
+            "<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [6 0 R] >> >>".to_string(),
+        ),
+        (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string()),
+        (
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [7 0 R] >>".to_string(),
+        ),
+        (6, "<< /FT /Tx /T (name) /Kids [7 0 R] >>".to_string()),
+        (
+            7,
+            "<< /Type /Annot /Subtype /Widget /Parent 6 0 R /Rect [100 700 300 720] /P 3 0 R >>"
+                .to_string(),
+        ),
+    ]);
+
+    let mut writer = IncrementalWriter::new(pdf_with_pages(1, 600)).expect("writer");
+    let src = PdfFile::parse(source).expect("parse source");
+    writer.append_document(&src).expect("append");
+
+    let mut out = Cursor::new(Vec::new());
+    writer.write(&mut out).expect("write");
+    let doc = PdfDocument::open(out.into_inner()).expect("open merged");
+
+    let form = zpdf_document::AcroForm::parse(doc.file()).expect("acroform");
+    let field = form
+        .fields
+        .iter()
+        .find(|f| f.name == "name")
+        .expect("merged field");
+    assert_ne!(field.field_id, field.widgets[0], "separate widget");
+    let widget = doc
+        .file()
+        .resolve(field.widgets[0])
+        .expect("widget")
+        .as_dict()
+        .expect("widget dict")
+        .clone();
+    let parent = match widget.get("Parent") {
+        Some(PdfObject::Ref(r)) => Some(*r),
+        _ => None,
+    };
+    assert_eq!(
+        parent,
+        Some(field.field_id),
+        "widget /Parent must point at the copied field"
+    );
+}

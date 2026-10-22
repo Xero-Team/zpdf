@@ -294,6 +294,35 @@ impl IncrementalWriter {
         Ok(())
     }
 
+    /// Restore `/Parent` links from a copied field to its widget kids. Page
+    /// copying deliberately drops every `/Parent`, because following one would
+    /// pull in the whole source page tree; the AcroForm merge must put the
+    /// field→widget back-references back.
+    fn reparent_field_kids(&mut self, field: ObjectId, depth: usize) -> Result<()> {
+        if depth > 32 {
+            return Ok(());
+        }
+        let dict = self.resolve_current(field)?.as_dict()?.clone();
+        let kids = match dict.get("Kids").cloned() {
+            Some(PdfObject::Array(a)) => a,
+            Some(PdfObject::Ref(r)) => match self.resolve_current(r)? {
+                PdfObject::Array(a) => a,
+                _ => return Ok(()),
+            },
+            _ => return Ok(()),
+        };
+        for kid in kids {
+            let PdfObject::Ref(kid_id) = kid else {
+                continue;
+            };
+            let mut kid_dict = self.resolve_current(kid_id)?.as_dict()?.clone();
+            kid_dict.insert(PdfName::new("Parent"), PdfObject::Ref(field));
+            self.overwrite_object(kid_id, PdfObject::Dict(kid_dict));
+            self.reparent_field_kids(kid_id, depth + 1)?;
+        }
+        Ok(())
+    }
+
     /// Merge the source's AcroForm: fields are deep-copied (their widgets are
     /// usually already in `id_map` from the page copy, so field→widget links
     /// stay intact) and appended to the destination `/AcroForm /Fields`.
@@ -393,6 +422,7 @@ impl IncrementalWriter {
                     names.insert(base);
                 }
             }
+            self.reparent_field_kids(dest_field, 0)?;
             dest_fields.push(PdfObject::Ref(dest_field));
         }
 
@@ -642,28 +672,26 @@ fn walk_pages(
         return Ok(());
     }
     let dict = source.resolve(node)?.as_dict()?.clone();
-    match dict.get_name("Type") {
-        Ok("Pages") => {
-            let kids = match dict.get("Kids") {
-                Some(PdfObject::Array(a)) => a.clone(),
-                Some(PdfObject::Ref(r)) => match source.resolve(*r)? {
-                    PdfObject::Array(a) => a,
-                    _ => Vec::new(),
-                },
-                _ => Vec::new(),
-            };
+    // Recurse whenever /Kids is present, regardless of /Type: real files carry
+    // interior nodes with a missing or misspelt /Type, and treating those as
+    // leaves silently dropped every page below them.
+    let kids = match dict.get("Kids") {
+        Some(PdfObject::Array(a)) => Some(a.clone()),
+        Some(PdfObject::Ref(r)) => match source.resolve(*r)? {
+            PdfObject::Array(a) => Some(a),
+            _ => Some(Vec::new()),
+        },
+        _ => None,
+    };
+    match kids {
+        Some(kids) => {
             for kid in kids {
                 if let PdfObject::Ref(r) = kid {
                     walk_pages(source, r, depth + 1, max_depth, max_pages, seen, out)?;
                 }
             }
         }
-        // Leaf page — or a node with no /Type but also no /Kids (lenient).
-        _ => {
-            if dict.get("Kids").is_none() {
-                out.push(node);
-            }
-        }
+        None => out.push(node),
     }
     Ok(())
 }
