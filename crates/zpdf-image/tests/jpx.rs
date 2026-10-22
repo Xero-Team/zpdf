@@ -170,3 +170,25 @@ fn oversized_codestream_dimensions_rejected() {
     let res = decode_image_xobject(&data, &jpx_dict(W as i64, H as i64));
     assert!(res.is_err());
 }
+
+#[test]
+fn jpx_without_dict_dimensions_decodes() {
+    // /Width and /Height may be absent for JPXDecode: the codestream is
+    // authoritative.
+    let mut d = PdfDict::new();
+    d.insert(
+        PdfName::new("Filter"),
+        PdfObject::Name(PdfName::new("JPXDecode")),
+    );
+    let img = decode_image_xobject(RGB_JP2, &d).unwrap();
+    assert_eq!((img.width, img.height), (W, H));
+}
+
+#[test]
+fn jpx_stale_oversized_dict_dimensions_are_ignored() {
+    // The dict claims 20000x20000 (over the default 100M pixel cap) while the
+    // codestream is 32x24. The codestream dimensions decide, so this must not
+    // be rejected before the JPX decoder rewrites the geometry.
+    let img = decode_image_xobject(RGB_JP2, &jpx_dict(20_000, 20_000)).unwrap();
+    assert_eq!((img.width, img.height), (W, H));
+}
