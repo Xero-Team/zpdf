@@ -20,6 +20,7 @@ tracing.workspace = true
 aes.workspace = true
 cbc.workspace = true
 sha2.workspace = true
+getrandom = "0.2"
 
 [dev-dependencies]
 # Pure-Rust LZW codec (the backend used by the `tiff`/`gif` crates). Used ONLY
