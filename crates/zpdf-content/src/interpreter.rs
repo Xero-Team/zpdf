@@ -5260,6 +5260,7 @@ impl<'a> ContentInterpreter<'a> {
                     column = (column.0.min(-vx), column.1.max(-vx + width));
                     glyphs.push(PositionedGlyph {
                         glyph_id,
+                        code,
                         x: -vx,
                         y: x_offset - vy,
                         advance,
@@ -5272,6 +5273,7 @@ impl<'a> ContentInterpreter<'a> {
                     let advance = adv_units as f32 * scale_factor * h_scale;
                     glyphs.push(PositionedGlyph {
                         glyph_id,
+                        code,
                         x: x_offset,
                         y: 0.0,
                         advance,
@@ -5316,6 +5318,7 @@ impl<'a> ContentInterpreter<'a> {
                 previous = Some((byte, (glyph_id, advance)));
                 glyphs.push(PositionedGlyph {
                     glyph_id,
+                    code: code as u32,
                     x: x_offset,
                     y: 0.0,
                     advance,
@@ -7526,12 +7529,14 @@ mod tests {
         let glyphs = vec![
             PositionedGlyph {
                 glyph_id: 26,
+                code: 0,
                 x: 0.0,
                 y: 0.0,
                 advance: 0.0,
             },
             PositionedGlyph {
                 glyph_id: 42,
+                code: 0,
                 x: 50.0,
                 y: 0.0,
                 advance: 0.0,
