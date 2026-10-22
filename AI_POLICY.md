@@ -60,20 +60,22 @@ AI 说明放在正文末尾即可，不影响标题。
 
 ## 与维护者的沟通
 
-- **不要用 AI 撰写你在 issue / PR 中的评论与回复。** 我们希望看到人写的讨论。
-  维护者可能隐藏那些明显由 AI 生成的评论。
-- 开 issue 时，请用你自己的话描述问题——复现步骤、预期与实际、你的环境。
+- **评审过程中的评论与回复应由人撰写。** AI 可以协助起草 issue/PR 的技术描述，
+  但提交前必须由你审阅、改写为你自己能解释的内容；维护者可能隐藏明显由 AI 生成、
+  未经人类确认的讨论。
+- 开 issue 时，复现步骤、预期与实际、你的环境仍应由你确认并负责。
 - 回答维护者提问时，请基于你自己的理解作答。**不要把 AI 的回答直接贴上来**；
 如果你需要引用 AI 的一段内容，必须放在引用块（`>`）里并明确标注来源，同时附上你自己的
 解说：这段为何相关、意味着什么、你怎么看。不要贴大段原文。
 - 非英语母语贡献者可以用 AI 润色语言或翻译——但请先确认它表达的是你自己的观点与声音。
 若用于翻译，建议用你的母语写出原意，再把 AI 译文附在引用块中。
 
-## 自主智能体
+## 智能体辅助提交
 
-- **不允许使用自主智能体（autonomous agents）自动开启 PR 或 issue。** 我们会关闭任何被认为
-是自动创建的 PR。
-- AI 可以辅助你写代码、跑测试、查资料，但「决定提什么、提交、回答评审」这些环节必须由人来完成。
+- 智能体可以协助或直接创建 issue 与 PR。创建者仍需是负责的人类贡献者：你必须审阅并理解
+  全部内容，并在提交/PR 正文末尾亲自写 `## Human note`。
+- AI 可以辅助写代码、跑测试、查资料和起草 issue/PR 文本；批准、合并与评审回复仍应由人完成。
+  没有 Human note 或明显未经人类审阅的提交可能被关闭。
 
 ## 安全敏感区域
 
@@ -170,11 +172,12 @@ Requirements:
 
 ## Communicating with maintainers
 
-- **Do not use AI to write your comments or replies in issues / PRs.** We expect
-  human-written discussion. Maintainers may hide comments that appear to be
-  AI-generated.
-- When opening an issue, describe the problem in your own words — reproduction
-  steps, expected vs. actual, your environment.
+- **Comments and replies during review should be written by a human.** AI may
+  help draft the technical description of an issue or PR, but you must review
+  it, rewrite it in terms you can explain, and take responsibility for it.
+  Maintainers may hide discussion that appears AI-generated and unconfirmed.
+- When opening an issue, you remain responsible for the reproduction steps,
+  expected vs. actual behavior, and environment.
 - When answering maintainers' questions, answer from your own understanding.
   **Do not paste AI responses directly.** If you need to quote a passage from an
   AI, put it in a blockquote (`>`) and label it as such, then add your own
@@ -185,12 +188,16 @@ Requirements:
   translation, we suggest writing the original in your native language and
   including the AI translation in a blockquote.
 
-## Autonomous agents
+## Agent-assisted submissions
 
-- **Autonomous agents are not allowed to open PRs or issues automatically.** We
-  will close any pull request we believe was created autonomously.
-- AI may help you write code, run tests, or research — but the steps of deciding
-  what to submit, submitting it, and answering review must be done by a human.
+- Agents may help create or directly open issues and pull requests. The
+  submitting contributor remains responsible: you must review and understand
+  every part and add a human-written `## Human note` at the bottom of the
+  commit/PR body.
+- AI may help write code, run tests, research, and draft issue/PR text;
+  approval, merging, and review replies remain human responsibilities.
+  Submissions without a human note, or that are clearly unreviewed, may be
+  closed.
 
 ## Security-sensitive areas
 
