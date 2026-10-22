@@ -110,6 +110,9 @@ pub struct ContentInterpreter<'a> {
     /// the mask group once. See [`SoftMaskCacheKey`].
     soft_mask_cache: HashMap<SoftMaskCacheKey, Option<SoftMask>>,
     form_font_overrides: Vec<HashMap<String, String>>,
+    /// Distinguishes inline font dictionaries in sibling forms/tiles that
+    /// reuse the same resource name but have no object identity.
+    form_font_serial: u64,
     /// Bounded recovery for malformed CAD text fonts (broken subsets, fonts
     /// leaked across text blocks), fed while the page is interpreted.
     font_repair: crate::font_repair::FontRepair,
@@ -670,6 +673,7 @@ impl<'a> ContentInterpreter<'a> {
             content_cache_bytes: 0,
             soft_mask_cache: HashMap::new(),
             form_font_overrides: Vec::new(),
+            form_font_serial: 0,
             font_repair: Default::default(),
             font_override: false,
             form_resources: Vec::new(),
@@ -882,19 +886,22 @@ impl<'a> ContentInterpreter<'a> {
         }
         let rect = self.display_list.page_rect;
         let (w, h) = (rect.width(), rect.height());
+        let (x0, y0) = (rect.x0, rect.y0);
         // Matrix::new(a,b,c,d,e,f) maps (x,y) -> (a*x+c*y+e, b*x+d*y+f). Each
         // turn maps the W×H page into the rotated box with origin bottom-left.
+        // Translate the effective-box origin to zero as part of the rotation;
+        // otherwise a CropBox/MediaBox whose origin is not (0,0) is shifted.
         let (base, rotated) = match r {
             90 => (
-                Matrix::new(0.0, -1.0, 1.0, 0.0, 0.0, w),
+                Matrix::new(0.0, -1.0, 1.0, 0.0, -y0, w + x0),
                 Rect::new(0.0, 0.0, h, w),
             ),
             180 => (
-                Matrix::new(-1.0, 0.0, 0.0, -1.0, w, h),
+                Matrix::new(-1.0, 0.0, 0.0, -1.0, w + x0, h + y0),
                 Rect::new(0.0, 0.0, w, h),
             ),
             270 => (
-                Matrix::new(0.0, 1.0, -1.0, 0.0, h, 0.0),
+                Matrix::new(0.0, 1.0, -1.0, 0.0, h + y0, -x0),
                 Rect::new(0.0, 0.0, h, w),
             ),
             _ => return self,
@@ -4123,7 +4130,7 @@ impl<'a> ContentInterpreter<'a> {
         };
 
         // Load fonts from the form's own Resources into the FontCache
-        self.load_form_fonts(&stream.dict, file);
+        self.load_form_fonts(&stream.dict, file, xobj_id);
 
         // The form's full /Resources (xobjects, gstates, colorspaces,
         // patterns, shadings) shadow the page's for the duration of the form.
@@ -4309,7 +4316,12 @@ impl<'a> ContentInterpreter<'a> {
         name.to_string()
     }
 
-    fn load_form_fonts(&mut self, form_dict: &zpdf_core::PdfDict, file: &PdfFile) {
+    fn load_form_fonts(
+        &mut self,
+        form_dict: &zpdf_core::PdfDict,
+        file: &PdfFile,
+        identity: Option<ObjectId>,
+    ) {
         // Either level may be an indirect reference.
         let fonts_of = |res: &zpdf_core::PdfDict| match res.get("Font") {
             Some(PdfObject::Dict(f)) => Some(f.clone()),
@@ -4344,6 +4356,13 @@ impl<'a> ContentInterpreter<'a> {
 
         let mut overrides = HashMap::new();
         let form_depth = self.form_font_overrides.len();
+        let scope = match identity {
+            Some(id) => format!("{}_{}", id.0, id.1),
+            None => {
+                self.form_font_serial = self.form_font_serial.saturating_add(1);
+                format!("s{}", self.form_font_serial)
+            }
+        };
         let max_font_bytes = self.max_font_cache_bytes;
         let shared_doc = self.shared_font_doc;
 
@@ -4355,7 +4374,10 @@ impl<'a> ContentInterpreter<'a> {
             }
         };
 
-        for (name, obj) in &fonts.0 {
+        // Page resources are capped by MAX_RESOURCE_ENTRIES; a form's raw
+        // /Font dictionary bypasses that parser, so bound it here too.
+        const MAX_FORM_FONT_ENTRIES: usize = 65_536;
+        for (name, obj) in fonts.0.iter().take(MAX_FORM_FONT_ENTRIES) {
             // A font entry is normally an indirect reference; a synthesized
             // form-field appearance may instead carry an inline font dict.
             let load_into = |fc: &mut FontCache, target: &str| -> Result<(), zpdf_core::Error> {
@@ -4419,15 +4441,11 @@ impl<'a> ContentInterpreter<'a> {
                     overrides.insert(name.0.clone(), unique_name);
                 }
                 PdfObject::Dict(_) => {
-                    // Inline font dict: rename to avoid clobbering a same-named
-                    // page font in the shared cache.
-                    let target = if page_font_ids.contains_key(&name.0) {
-                        let unique = format!("__form{}_{}", form_depth, name.0);
-                        overrides.insert(name.0.clone(), unique.clone());
-                        unique
-                    } else {
-                        name.0.clone()
-                    };
+                    // Inline font dict: always scope it. Sibling forms at the
+                    // same depth may reuse the name for a different dict, and
+                    // keying by depth+name made the first one win.
+                    let target = format!("__form{}_{}_{}", scope, form_depth, name.0);
+                    overrides.insert(name.0.clone(), target.clone());
                     if fc.get_by_name(&target).is_none() {
                         if let Err(e) = load_into(fc, &target) {
                             tracing::debug!("form inline font {}: {e}", name.0);
@@ -4897,7 +4915,7 @@ impl<'a> ContentInterpreter<'a> {
 
         // Pattern /Resources and fonts shadow the page's for the cell body,
         // exactly like a form XObject's.
-        self.load_form_fonts(&def.dict, file);
+        self.load_form_fonts(&def.dict, file, None);
         let own_resources = def
             .dict
             .get("Resources")
@@ -6484,6 +6502,24 @@ mod tests {
         let dl = ContentInterpreter::new(page_rect).interpret(content);
         assert_eq!(dl.commands.len(), 1);
         assert!(matches!(&dl.commands[0], RenderCommand::FillPath { .. }));
+    }
+
+    #[test]
+    fn rotation_accounts_for_nonzero_box_origin() {
+        let page = Rect::new(10.0, 20.0, 110.0, 220.0);
+        let dl = ContentInterpreter::new(page)
+            .with_page_rotation(90)
+            .interpret(b"10 20 10 10 re f");
+        assert_eq!(dl.page_rect, Rect::new(0.0, 0.0, 200.0, 100.0));
+        let RenderCommand::FillPath { path, .. } = &dl.commands[0] else {
+            panic!("expected fill");
+        };
+        let mut points: Vec<(f64, f64)> = path.points().iter().map(|p| (p.x, p.y)).collect();
+        points.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(
+            points,
+            vec![(0.0, 90.0), (0.0, 100.0), (10.0, 90.0), (10.0, 100.0)]
+        );
     }
 
     #[test]
