@@ -307,3 +307,88 @@ fn destructive_redaction_leaves_no_reachable_copy() {
         "the removed widget is unlinked from /Fields"
     );
 }
+
+/// Copies of redacted content that live outside the content stream and the
+/// redacted annotations: the page thumbnail, a named marked-content property
+/// list in `/Resources /Properties`, and the value held by a parent field
+/// whose only widget was redacted.
+#[test]
+fn redaction_drops_thumbnail_named_properties_and_emptied_fields() {
+    let content = "/Span /MC0 BDC BT /F1 12 Tf 1 0 0 1 72 700 Tm (HIDDEN) Tj ET EMC\n\
+                   /Span /MC1 BDC BT /F1 12 Tf 1 0 0 1 72 100 Tm (public) Tj ET EMC\n";
+    let widget = |parent: u32, y: u32| {
+        format!(
+            "<< /Type /Annot /Subtype /Widget /Parent {parent} 0 R \
+             /Rect [60 {y} 300 {}] /P 3 0 R >>",
+            y + 20
+        )
+    };
+    let objects = vec![
+        "<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [6 0 R 9 0 R] >> >>".to_string(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+         /Resources << /Font << /F1 4 0 R >> /Properties << \
+         /MC0 << /ActualText (SECRET-NAMED-PROPS) >> /MC1 << /ActualText (KEPT-PROPS) >> >> >> \
+         /Contents 5 0 R /Annots [8 0 R 10 0 R 11 0 R] /Thumb 12 0 R >>"
+            .to_string(),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
+        stream("", content),
+        // gp > p > widget 8: redacting the widget empties p, then gp.
+        "<< /T (gp) /Kids [7 0 R] >>".to_string(),
+        "<< /T (p) /FT /Tx /V (SECRET-PARENT-VALUE) /DV (SECRET-PARENT-DEFAULT) \
+         /Parent 6 0 R /Kids [8 0 R] >>"
+            .to_string(),
+        widget(7, 600),
+        // q keeps widget 11 outside the regions, so it keeps its value.
+        "<< /T (q) /FT /Tx /V (KEPT-VALUE) /Kids [10 0 R 11 0 R] >>".to_string(),
+        widget(9, 560),
+        widget(9, 40),
+        stream(
+            "/Width 16 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8",
+            "SECRET-THUMB-PIX",
+        ),
+    ];
+    let out = redact_pdf(
+        build_pdf(&objects),
+        b"",
+        0,
+        &[
+            Rect::new(60.0, 690.0, 400.0, 720.0),
+            Rect::new(50.0, 590.0, 310.0, 630.0),
+            Rect::new(50.0, 550.0, 310.0, 585.0),
+        ],
+        &RedactOptions::default(),
+    )
+    .expect("redact");
+
+    let doc = PdfDocument::open(out).expect("open");
+    let payload = all_payload_bytes(&doc);
+    let has = |s: &str| payload.windows(s.len()).any(|w| w == s.as_bytes());
+    for secret in [
+        "HIDDEN",
+        "SECRET-NAMED-PROPS",
+        "SECRET-PARENT-VALUE",
+        "SECRET-PARENT-DEFAULT",
+        "SECRET-THUMB-PIX",
+    ] {
+        assert!(!has(secret), "{secret} survived the destructive redaction");
+    }
+    for kept in ["public", "KEPT-PROPS", "KEPT-VALUE"] {
+        assert!(has(kept), "{kept} was removed");
+    }
+
+    let file = doc.file();
+    let catalog = file.resolve(file.trailer.get_ref("Root").unwrap()).unwrap();
+    let form = catalog.as_dict().unwrap().get("AcroForm").cloned();
+    let Some(zpdf_core::PdfObject::Dict(form)) = form else {
+        panic!("AcroForm kept: {form:?}");
+    };
+    let fields = form.get_array("Fields").expect("fields");
+    assert_eq!(fields.len(), 1, "only q is left: {fields:?}");
+    let q = file.resolve(fields[0].as_ref().unwrap()).unwrap();
+    assert_eq!(
+        q.as_dict().unwrap().get_array("Kids").unwrap().len(),
+        1,
+        "q keeps its unredacted widget"
+    );
+}

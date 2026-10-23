@@ -158,23 +158,36 @@ impl IncrementalWriter {
             PdfObject::Ref(ObjectId(stream_ref.0, stream_ref.1 as u16)),
         );
 
-        // An XObject whose every draw was removed must not stay reachable
-        // through the resources, or a full rewrite would keep the redacted
-        // image/form. Give the page its own copy so other pages sharing the
-        // dictionary keep theirs.
+        // An XObject whose every draw was removed, or a named property list
+        // whose every use was replaced by a scrubbed inline copy, must not stay
+        // reachable through the resources, or a full rewrite would keep the
+        // redacted image/form or replacement text. Give the page its own copy
+        // so other pages sharing the dictionary keep theirs.
         if let Some(res) = resources.as_mut() {
-            let xobjects = res.get("XObject").map(|x| self.deref_current(x));
-            if let Some(PdfObject::Dict(mut xobjects)) = xobjects {
-                let before = xobjects.0.len();
-                xobjects
-                    .0
-                    .retain(|name, _| !outcome.dropped_xobjects.contains(name.as_str()));
-                if xobjects.0.len() != before {
-                    res.insert(PdfName::new("XObject"), PdfObject::Dict(xobjects));
-                    page_dict.insert(PdfName::new("Resources"), PdfObject::Dict(res.clone()));
+            let mut pruned = false;
+            for (category, dropped) in [
+                ("XObject", &outcome.dropped_xobjects),
+                ("Properties", &outcome.dropped_properties),
+            ] {
+                if dropped.is_empty() {
+                    continue;
+                }
+                let entries = res.get(category).map(|x| self.deref_current(x));
+                if let Some(PdfObject::Dict(mut entries)) = entries {
+                    let before = entries.0.len();
+                    entries.0.retain(|name, _| !dropped.contains(name.as_str()));
+                    if entries.0.len() != before {
+                        res.insert(PdfName::new(category), PdfObject::Dict(entries));
+                        pruned = true;
+                    }
                 }
             }
+            if pruned {
+                page_dict.insert(PdfName::new("Resources"), PdfObject::Dict(res.clone()));
+            }
         }
+        // The thumbnail is a raster of the unredacted page.
+        page_dict.0.remove(&PdfName::new("Thumb"));
 
         // Remove annotations whose /Rect intersects a redaction region (their
         // appearance may reproduce redacted content).
@@ -226,38 +239,72 @@ impl IncrementalWriter {
         Ok(())
     }
 
-    /// Drop a removed widget annotation from its parent field's `/Kids`, or
-    /// from `/AcroForm /Fields` when it is a top-level field itself.
+    /// Drop a removed widget annotation from the form tree. A parent field
+    /// left without kids holds the value the widget displayed (`/V`, `/DV`,
+    /// `/RV`), so it is unlinked and replaced with null in turn, up the tree.
+    /// A field that keeps other widgets keeps its value: they still show it.
     fn unlink_removed_widget(&mut self, annot: ObjectId) {
-        let parent = match self.resolve_current(annot) {
+        /// Bound on field-tree levels climbed (cyclic `/Parent` chains).
+        const MAX_FIELD_DEPTH: usize = 64;
+        let mut node = annot;
+        let mut seen = HashSet::new();
+        while seen.len() < MAX_FIELD_DEPTH && seen.insert(node) {
+            let parent = self.unlink_field_node(node);
+            if node != annot {
+                self.overwrite_object(node, PdfObject::Null);
+            }
+            match parent {
+                Some(parent) if self.has_no_kids(parent) => node = parent,
+                _ => return,
+            }
+        }
+    }
+
+    /// Remove `node` from its parent field's `/Kids`, or from `/AcroForm
+    /// /Fields` when it is a top-level field. Returns the parent field.
+    fn unlink_field_node(&mut self, node: ObjectId) -> Option<ObjectId> {
+        let parent = match self.resolve_current(node) {
             Ok(PdfObject::Dict(d)) => d.get("Parent").cloned(),
-            _ => return,
+            _ => return None,
         };
         let (owner, key) = match parent {
             Some(PdfObject::Ref(p)) => (p, "Kids"),
             _ => {
                 let Ok(PdfObject::Dict(mut catalog)) = self.resolve_current(self.catalog_ref())
                 else {
-                    return;
+                    return None;
                 };
                 match catalog.get("AcroForm").cloned() {
                     Some(PdfObject::Ref(f)) => (f, "Fields"),
                     Some(PdfObject::Dict(mut form)) => {
-                        if remove_ref_from(&mut form, "Fields", annot, self) {
+                        if remove_ref_from(&mut form, "Fields", node, self) {
                             catalog.insert(PdfName::new("AcroForm"), PdfObject::Dict(form));
                             self.overwrite_object(self.catalog_ref(), PdfObject::Dict(catalog));
                         }
-                        return;
+                        return None;
                     }
-                    _ => return,
+                    _ => return None,
                 }
             }
         };
         let Ok(PdfObject::Dict(mut dict)) = self.resolve_current(owner) else {
-            return;
+            return None;
         };
-        if remove_ref_from(&mut dict, key, annot, self) {
+        if remove_ref_from(&mut dict, key, node, self) {
             self.overwrite_object(owner, PdfObject::Dict(dict));
+        }
+        (key == "Kids").then_some(owner)
+    }
+
+    /// Whether field `id` has no `/Kids` entries left (or none at all).
+    fn has_no_kids(&self, id: ObjectId) -> bool {
+        let Ok(PdfObject::Dict(dict)) = self.resolve_current(id) else {
+            return false;
+        };
+        match dict.get("Kids").map(|k| self.deref_current(k)) {
+            None => true,
+            Some(PdfObject::Array(kids)) => kids.is_empty(),
+            Some(_) => false,
         }
     }
 
@@ -504,6 +551,9 @@ struct FilterOutcome {
     redacted_mcids: HashSet<i64>,
     /// XObject names that were drawn only by removed `Do` operators.
     dropped_xobjects: HashSet<String>,
+    /// `/Properties` names whose every use was replaced by a scrubbed inline
+    /// copy of the property list.
+    dropped_properties: HashSet<String>,
 }
 
 /// A `BDC` operator already written to the output, kept so its property list
@@ -514,6 +564,8 @@ struct MarkedSequence {
     operands: Vec<PdfObject>,
     /// The property list, resolved from `/Properties` when given by name.
     properties: Option<PdfDict>,
+    /// The `/Properties` name of a named property list.
+    name: Option<String>,
     redacted: bool,
 }
 
@@ -542,6 +594,7 @@ fn filter_content(
     let mut open: Vec<Option<usize>> = Vec::new();
     let mut dropped_xobjects = HashSet::new();
     let mut kept_xobjects = HashSet::new();
+    let mut kept_properties = HashSet::new();
 
     while let Some(token) = tokenizer.next_token() {
         let removed = match token {
@@ -582,15 +635,18 @@ fn filter_content(
                 let removed = !matches!(keep, Keep::Yes);
                 match op.as_str() {
                     "BDC" => {
-                        let props = match operands.get(1) {
-                            Some(PdfObject::Dict(d)) => Some(d.clone()),
-                            Some(PdfObject::Name(n)) => properties(n.as_str()),
-                            _ => None,
+                        let (props, name) = match operands.get(1) {
+                            Some(PdfObject::Dict(d)) => (Some(d.clone()), None),
+                            Some(PdfObject::Name(n)) => {
+                                (properties(n.as_str()), Some(n.as_str().to_string()))
+                            }
+                            _ => (None, None),
                         };
                         sequences.push(MarkedSequence {
                             range: start..out.len(),
                             operands: std::mem::take(&mut operands),
                             properties: props,
+                            name,
                             redacted: false,
                         });
                         open.push(Some(sequences.len() - 1));
@@ -598,12 +654,14 @@ fn filter_content(
                     "BMC" => open.push(None),
                     "EMC" => {
                         // A sequence can only be marked while open: once
-                        // closed untouched, its operands are no longer needed.
+                        // closed untouched, its operands are no longer needed
+                        // and its named property list stays in use.
                         if let Some(Some(i)) = open.pop() {
                             let seq = &mut sequences[i];
                             if !seq.redacted {
                                 seq.operands = Vec::new();
                                 seq.properties = None;
+                                kept_properties.extend(seq.name.take());
                             }
                         }
                     }
@@ -633,34 +691,47 @@ fn filter_content(
     // Scrub the property lists of sequences that lost content. Splice back to
     // front so earlier byte ranges stay valid.
     let mut redacted_mcids = HashSet::new();
+    let mut dropped_properties = HashSet::new();
     for seq in sequences.iter_mut().rev().filter(|s| s.redacted) {
-        let Some(mut props) = seq.properties.take() else {
-            continue;
-        };
-        if let Some(PdfObject::Integer(mcid)) = props.get("MCID") {
-            redacted_mcids.insert(*mcid);
+        let name = seq.name.take();
+        let inlined = seq.properties.take().is_some_and(|mut props| {
+            if let Some(PdfObject::Integer(mcid)) = props.get("MCID") {
+                redacted_mcids.insert(*mcid);
+            }
+            // Optional-content names must keep pointing at their OCG/OCMD,
+            // and carry no replacement text anyway.
+            let optional_content =
+                matches!(seq.operands.first(), Some(PdfObject::Name(t)) if t.as_str() == "OC");
+            if optional_content || !strip_sensitive_keys(&mut props) {
+                return false;
+            }
+            // An inline property list holds direct objects only: inline the
+            // scrubbed copy of a named one without its indirect values.
+            props.0.retain(|_, v| !matches!(v, PdfObject::Ref(_)));
+            let mut operator = Vec::new();
+            let tag = seq.operands.first().cloned().unwrap_or(PdfObject::Null);
+            write_op(&mut operator, &[tag, PdfObject::Dict(props)], "BDC");
+            out.splice(seq.range.clone(), operator);
+            true
+        });
+        if let Some(name) = name {
+            if inlined {
+                dropped_properties.insert(name);
+            } else {
+                kept_properties.insert(name);
+            }
         }
-        // Optional-content names must keep pointing at their OCG/OCMD, and
-        // carry no replacement text anyway.
-        let optional_content =
-            matches!(seq.operands.first(), Some(PdfObject::Name(t)) if t.as_str() == "OC");
-        if optional_content || !strip_sensitive_keys(&mut props) {
-            continue;
-        }
-        // An inline property list holds direct objects only: inline the
-        // scrubbed copy of a named one without its indirect values.
-        props.0.retain(|_, v| !matches!(v, PdfObject::Ref(_)));
-        let mut operator = Vec::new();
-        let tag = seq.operands.first().cloned().unwrap_or(PdfObject::Null);
-        write_op(&mut operator, &[tag, PdfObject::Dict(props)], "BDC");
-        out.splice(seq.range.clone(), operator);
     }
+    // Sequences left open at the end still name their property list.
+    kept_properties.extend(sequences.iter_mut().filter_map(|s| s.name.take()));
 
     dropped_xobjects.retain(|name| !kept_xobjects.contains(name));
+    dropped_properties.retain(|name| !kept_properties.contains(name));
     FilterOutcome {
         content: out,
         redacted_mcids,
         dropped_xobjects,
+        dropped_properties,
     }
 }
 
@@ -1065,6 +1136,37 @@ mod tests {
             "optional content untouched: {text}"
         );
         assert_eq!(outcome.redacted_mcids, HashSet::from([7]));
+        assert_eq!(
+            outcome.dropped_properties,
+            HashSet::from(["MC0".to_string()])
+        );
+    }
+
+    /// A property list that a kept sequence still names stays in the
+    /// resources, even when a redacted sequence used an inline copy of it.
+    #[test]
+    fn property_list_still_named_elsewhere_is_kept() {
+        let content = b"/Span /MC0 BDC BT /F1 12 Tf 1 0 0 1 50 700 Tm (XXX) Tj ET EMC\n\
+                        /Span /MC0 BDC BT /F1 12 Tf 1 0 0 1 50 100 Tm (ZZZ) Tj ET EMC\n\
+                        /Span /MC1 BDC BT /F1 12 Tf 1 0 0 1 50 700 Tm (XXX) Tj ET\n";
+        let lookup = |_: &str| {
+            let mut d = PdfDict::new();
+            d.insert(
+                PdfName::new("ActualText"),
+                PdfObject::String(zpdf_core::PdfString(b"TOP SECRET".to_vec())),
+            );
+            Some(d)
+        };
+        let rects = [Rect::new(40.0, 690.0, 200.0, 720.0)];
+        let outcome = filter_content(content, &rects, &lookup);
+        let text = String::from_utf8_lossy(&outcome.content);
+        assert!(text.contains("/Span /MC0 BDC"), "kept use: {text}");
+        // MC1 is never closed: its scrubbed copy is inlined all the same.
+        assert!(!text.contains("/MC1"), "{text}");
+        assert_eq!(
+            outcome.dropped_properties,
+            HashSet::from(["MC1".to_string()])
+        );
     }
 
     #[test]
