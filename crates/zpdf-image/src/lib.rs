@@ -373,8 +373,10 @@ pub fn decode_image_xobject_resolved_with_limits(
     // space, bit depth and alpha, and /ColorSpace + /BitsPerComponent may
     // legally be absent from the dict (spec 7.4.9). A present /ColorSpace
     // overrides the codestream's colour declaration, so infer it here rather
-    // than after this branch.
-    if is_jpx_encoded(dict, decoded_data) {
+    // than after this branch. A stencil mask is never JPX-coded (its samples
+    // are 1-bit and may happen to start with a JPEG 2000 signature), so it
+    // keeps its own path below.
+    if !is_image_mask(dict) && is_jpx_encoded(dict, decoded_data) {
         let cs = colorspace.or_else(|| {
             dict.get("ColorSpace")
                 .is_some()
@@ -894,7 +896,12 @@ fn is_jpx_encoded(dict: &PdfDict, data: &[u8]) -> bool {
     // Sniff only when the dict declares no filter: after an explicit
     // non-JPX filter (FlateDecode, DCTDecode, …) the bytes are whatever that
     // filter produced and a coincidental signature must not reroute them.
-    if dict.get("Filter").is_some() {
+    let declared = match dict.get("Filter") {
+        Some(PdfObject::Name(_)) => true,
+        Some(PdfObject::Array(arr)) => !arr.is_empty(),
+        _ => false,
+    };
+    if declared {
         return filter_says;
     }
     filter_says || data.starts_with(JP2_SIGNATURE) || data.starts_with(J2K_SOC_SIZ)
@@ -2484,6 +2491,10 @@ mod tests {
             PdfObject::Name(PdfName::new("FlateDecode")),
         );
         assert!(!is_jpx_encoded(&flate, b"\xFF\x4F\xFF\x51rest"));
+        // An empty filter array declares nothing, so sniffing still applies.
+        let mut empty = image_dict(1, 1, 8, None);
+        empty.insert(PdfName::new("Filter"), PdfObject::Array(Vec::new()));
+        assert!(is_jpx_encoded(&empty, b"\xFF\x4F\xFF\x51rest"));
         // A truncated signature box must not match.
         assert!(!is_jpx_encoded(&d, b"\x00\x00\x00\x0C\x6A\x50\x20\x20"));
         assert!(!is_jpx_encoded(&d, b"\xFF\x4F\xFF\x52"));
