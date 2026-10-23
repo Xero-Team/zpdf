@@ -17,7 +17,7 @@
 //! rows of `ceil(width/8)` bytes with **black = 0** / white = 1. JBIG2's
 //! native polarity is 1 = black, so bits are inverted when packing.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use tracing::{debug, warn};
@@ -133,7 +133,15 @@ struct PixelLimits {
     /// this bounds the *sum* so many small-but-legal segments cannot exhaust
     /// memory.
     retained_limit: u64,
+    /// Addresses of shared (`Rc`) bitmaps already charged to `retained`, so a
+    /// symbol re-exported by several dictionaries is paid for once. Retained
+    /// bitmaps live until the decode ends, so an address is never reused.
+    charged: HashSet<usize>,
 }
+
+/// Bytes charged per retained bitmap on top of its pixels: the `Bitmap`
+/// header and its `Rc` allocation.
+const RETAINED_BITMAP_OVERHEAD: u64 = 64;
 
 impl PixelLimits {
     fn new(max_image_pixels: u64) -> Self {
@@ -147,6 +155,7 @@ impl PixelLimits {
             retained_limit: (usize::try_from(max_image_pixels).unwrap_or(usize::MAX) as u64)
                 .saturating_mul(4)
                 .max(64 * 1024 * 1024),
+            charged: HashSet::new(),
         }
     }
 
@@ -168,16 +177,41 @@ impl PixelLimits {
             .max((area as u64).saturating_mul(DRAW_BUDGET_FACTOR));
     }
 
-    /// Account for bitmap bytes kept alive for later segments.
-    fn retain(&mut self, bytes: u64, what: &str) -> Result<()> {
-        self.retained = self.retained.saturating_add(bytes);
-        if self.retained > self.retained_limit {
+    /// Check, before allocating, that `bytes` more would still fit the
+    /// retention budget. Nothing is charged.
+    fn reserve(&self, bytes: u64, what: &str) -> Result<()> {
+        if self.retained.saturating_add(bytes) > self.retained_limit {
             return Err(err(format!(
-                "retained {what} exceeded the {}-byte budget",
+                "retained {what} would exceed the {}-byte budget",
                 self.retained_limit
             )));
         }
         Ok(())
+    }
+
+    /// Account for bitmap bytes kept alive for later segments.
+    fn retain(&mut self, bytes: u64, what: &str) -> Result<()> {
+        self.reserve(bytes, what)?;
+        self.retained += bytes;
+        Ok(())
+    }
+
+    /// Account for an owned bitmap kept alive for later segments.
+    fn retain_bitmap(&mut self, bm: &Bitmap, what: &str) -> Result<()> {
+        self.retain(bm.data.len() as u64 + RETAINED_BITMAP_OVERHEAD, what)
+    }
+
+    /// Account for a dictionary's list of shared bitmaps: one pointer slot per
+    /// entry, plus each bitmap's pixels the first time it is retained. (A
+    /// failure aborts the whole decode, so marking before the check is fine.)
+    fn retain_shared(&mut self, bitmaps: &[Rc<Bitmap>], what: &str) -> Result<()> {
+        let mut bytes = std::mem::size_of_val(bitmaps) as u64;
+        for bm in bitmaps {
+            if self.charged.insert(Rc::as_ptr(bm) as usize) {
+                bytes += bm.data.len() as u64 + RETAINED_BITMAP_OVERHEAD;
+            }
+        }
+        self.retain(bytes, what)
     }
 
     /// Account for `pixels` about to be composited. Once the budget is spent
@@ -1734,6 +1768,14 @@ fn parse_region_info(r: &mut Reader, limits: &PixelLimits) -> Result<RegionInfo>
     })
 }
 
+/// Width × height from a region segment's information field, read without
+/// validating the rest of the segment.
+fn declared_region_area(data: &[u8]) -> Option<u64> {
+    let width = u32::from_be_bytes(data.get(0..4)?.try_into().ok()?);
+    let height = u32::from_be_bytes(data.get(4..8)?.try_into().ok()?);
+    Some(u64::from(width) * u64::from(height))
+}
+
 // ---------------------------------------------------------------------------
 // Segment processing and page assembly.
 // ---------------------------------------------------------------------------
@@ -1823,6 +1865,14 @@ impl<'a> Decoder<'a> {
     }
 
     fn process_segment(&mut self, h: &SegmentHeader, data: &[u8]) -> Result<()> {
+        // An intermediate region is kept for later segments: refuse it before
+        // decoding (and allocating) when it cannot fit the retention budget.
+        if matches!(h.seg_type, 4 | 20 | 36 | 40) {
+            if let Some(area) = declared_region_area(data) {
+                self.pixels
+                    .reserve(area + RETAINED_BITMAP_OVERHEAD, "intermediate region")?;
+            }
+        }
         match h.seg_type {
             // Symbol dictionary: a failure poisons only dependent regions.
             0 => {
@@ -1837,18 +1887,16 @@ impl<'a> Decoder<'a> {
                         None
                     }
                 };
-                let bytes = dict
-                    .as_ref()
-                    .map_or(0, |d| d.iter().map(|b| b.data.len() as u64).sum::<u64>());
-                self.pixels.retain(bytes, "symbol dictionary")?;
+                if let Some(d) = &dict {
+                    self.pixels.retain_shared(d, "symbol dictionary")?;
+                }
                 self.symbol_dicts.insert(h.number, dict);
             }
             // Text region: intermediate (4) is stored; immediate (6/7) composes.
             4 | 6 | 7 => match self.decode_text_region(h, data) {
                 Ok((info, bm)) => {
                     if h.seg_type == 4 {
-                        self.pixels
-                            .retain(bm.data.len() as u64, "intermediate region")?;
+                        self.pixels.retain_bitmap(&bm, "intermediate region")?;
                         self.regions.insert(h.number, (info, bm));
                     } else {
                         self.compose_to_page(&info, &bm)?;
@@ -1863,8 +1911,7 @@ impl<'a> Decoder<'a> {
             36 | 38 | 39 => match self.decode_generic_region_segment(data) {
                 Ok((info, bm)) => {
                     if h.seg_type == 36 {
-                        self.pixels
-                            .retain(bm.data.len() as u64, "intermediate region")?;
+                        self.pixels.retain_bitmap(&bm, "intermediate region")?;
                         self.regions.insert(h.number, (info, bm));
                     } else {
                         self.compose_to_page(&info, &bm)?;
@@ -1881,8 +1928,7 @@ impl<'a> Decoder<'a> {
             40 | 42 | 43 => match self.decode_refinement_region_segment(h, data) {
                 Ok((info, bm)) => {
                     if h.seg_type == 40 {
-                        self.pixels
-                            .retain(bm.data.len() as u64, "intermediate region")?;
+                        self.pixels.retain_bitmap(&bm, "intermediate region")?;
                         self.regions.insert(h.number, (info, bm));
                     } else {
                         self.compose_to_page(&info, &bm)?;
@@ -1906,18 +1952,17 @@ impl<'a> Decoder<'a> {
                         None
                     }
                 };
-                let bytes = pd.as_ref().map_or(0, |d| {
-                    d.patterns.iter().map(|b| b.data.len() as u64).sum::<u64>()
-                });
-                self.pixels.retain(bytes, "pattern dictionary")?;
+                if let Some(d) = &pd {
+                    self.pixels
+                        .retain_shared(&d.patterns, "pattern dictionary")?;
+                }
                 self.pattern_dicts.insert(h.number, pd);
             }
             // Halftone region: intermediate (20) stored; immediate (22/23) composes.
             20 | 22 | 23 => match self.decode_halftone_region(h, data) {
                 Ok((info, bm)) => {
                     if h.seg_type == 20 {
-                        self.pixels
-                            .retain(bm.data.len() as u64, "intermediate region")?;
+                        self.pixels.retain_bitmap(&bm, "intermediate region")?;
                         self.regions.insert(h.number, (info, bm));
                     } else {
                         self.compose_to_page(&info, &bm)?;
@@ -2376,6 +2421,11 @@ impl<'a> Decoder<'a> {
                 if total_area > self.pixels.max_pixels {
                     return Err(err("symbol dictionary exceeds the pixel limit"));
                 }
+                // Every new symbol is alive until the export flags are read.
+                self.pixels.reserve(
+                    total_area as u64 + (new_syms.len() as u64 + 1) * RETAINED_BITMAP_OVERHEAD,
+                    "symbol dictionary",
+                )?;
                 let bm = if sd_refagg {
                     // REFAGG: IAAI counts the aggregate instances (T.88 6.5.8.2).
                     let n_inst = decode_int(&mut mq, &mut iaai)?
@@ -2551,6 +2601,12 @@ impl<'a> Decoder<'a> {
                 if total_area > self.pixels.max_pixels {
                     return Err(err("symbol dictionary exceeds the pixel limit"));
                 }
+                // Every new symbol is alive until the export flags are read.
+                self.pixels.reserve(
+                    total_area as u64
+                        + (new_syms.len() + widths.len()) as u64 * RETAINED_BITMAP_OVERHEAD,
+                    "symbol dictionary",
+                )?;
             }
             if totwidth <= 0 {
                 continue;
@@ -3011,6 +3067,12 @@ impl<'a> Decoder<'a> {
                 "pattern dictionary: {pixels} px declared, only {payload_bytes} bytes payload"
             )));
         }
+        // The patterns are retained; the collective bitmap they are sliced
+        // from is alive alongside them until this returns.
+        self.pixels.reserve(
+            2 * pixels as u64 + n_patterns as u64 * RETAINED_BITMAP_OVERHEAD,
+            "pattern dictionary",
+        )?;
 
         // Decode the collective bitmap. The AT pixels are fixed (T.88 6.7.5):
         // A1 = (-HDPW, 0), A2 = (-3, -1), A3 = (2, -2), A4 = (-2, -2).
@@ -5373,9 +5435,6 @@ mod tests {
         }
     }
 
-    /// Symbol-ID tables hold one line per symbol. The linear scan (plus a
-    /// per-call max-length pass) cost O(lines) per bit; 2^16 symbols × 10^5
-    /// IDs was ~10^11 steps. The index makes each bit one lookup.
     #[test]
     fn retained_bitmap_budget_is_cumulative() {
         let mut limits = PixelLimits::new(1024);
@@ -5384,6 +5443,100 @@ mod tests {
         assert!(limits.retain(1, "test").is_err());
     }
 
+    fn checker_bitmap(w: usize, h: usize) -> Bitmap {
+        let mut bm = Bitmap::new(w, h, 0).unwrap();
+        for y in 0..h {
+            for x in 0..w {
+                if (x + y) % 3 == 0 {
+                    bm.set(x, y, 1);
+                }
+            }
+        }
+        bm
+    }
+
+    /// Stored (intermediate) regions are charged as they are kept, so a run of
+    /// individually small segments still hits the cumulative budget.
+    #[test]
+    fn intermediate_regions_are_charged_cumulatively() {
+        let bm = checker_bitmap(32, 32);
+        let cost = 32 * 32 + RETAINED_BITMAP_OVERHEAD;
+        let mut stream = segment(0, 48, &[], 1, &page_info_payload(32, 32, 0));
+        for n in 1..=3 {
+            stream.extend(segment(
+                n,
+                36,
+                &[],
+                1,
+                &generic_region_payload(&bm, 0, false),
+            ));
+        }
+        let mut budget = crate::filters::DecodeBudget::new(u64::MAX);
+        let mut dec = Decoder::new(&mut budget, 1 << 20);
+        dec.pixels.retained_limit = 3 * cost;
+        dec.process_segments(&stream).unwrap();
+        assert_eq!(dec.pixels.retained, 3 * cost);
+
+        let fourth = segment(4, 36, &[], 1, &generic_region_payload(&bm, 0, false));
+        let e = dec.process_segments(&fourth).unwrap_err();
+        assert!(e.to_string().contains("budget"), "{e}");
+    }
+
+    /// The budget is checked before a stored region is decoded: a segment
+    /// that cannot fit is refused even if its body would not decode at all.
+    #[test]
+    fn intermediate_region_is_refused_before_allocation() {
+        let mut payload = region_info(64, 64, 0, 0, 0);
+        payload.push(0); // flags; the rest of the body is missing
+        let stream = segment(1, 36, &[], 1, &payload);
+        let mut budget = crate::filters::DecodeBudget::new(u64::MAX);
+        let mut dec = Decoder::new(&mut budget, 1 << 20);
+        dec.pixels.retained_limit = 1024;
+        let e = dec.process_segments(&stream).unwrap_err();
+        assert!(e.to_string().contains("would exceed"), "{e}");
+    }
+
+    /// Arithmetic symbol dictionary that imports `n` symbols and re-exports
+    /// all of them without coding new ones.
+    fn reexport_dict_payload(n: usize) -> Vec<u8> {
+        let mut p = Vec::new();
+        p.extend_from_slice(&0u16.to_be_bytes()); // flags: arithmetic, template 0
+        for &(ax, ay) in nominal_at(0).iter() {
+            p.push(ax as u8);
+            p.push(ay as u8);
+        }
+        p.extend_from_slice(&(n as u32).to_be_bytes()); // SDNUMEXSYMS
+        p.extend_from_slice(&0u32.to_be_bytes()); // SDNUMNEWSYMS
+        let mut enc = MqEncoder::new();
+        let mut iaex = vec![0u8; INT_CTX_SIZE];
+        encode_int(&mut enc, &mut iaex, Some(0));
+        encode_int(&mut enc, &mut iaex, Some(n as i64));
+        p.extend_from_slice(&enc.finish());
+        p
+    }
+
+    /// A symbol re-exported by a second dictionary shares the first one's
+    /// bitmap: only the second list's pointer slots are charged again.
+    #[test]
+    fn reexported_symbols_are_charged_once() {
+        let (a, b) = (checker_bitmap(8, 8), checker_bitmap(8, 8));
+        let mut budget = crate::filters::DecodeBudget::new(u64::MAX);
+        let mut dec = Decoder::new(&mut budget, 1 << 20);
+        dec.process_segments(&segment(1, 0, &[], 1, &symbol_dict_payload(&[&a, &b])))
+            .unwrap();
+        let slot = std::mem::size_of::<Rc<Bitmap>>() as u64;
+        let first = 2 * (slot + 64 + RETAINED_BITMAP_OVERHEAD);
+        assert_eq!(dec.pixels.retained, first);
+
+        dec.process_segments(&segment(2, 0, &[1], 1, &reexport_dict_payload(2)))
+            .unwrap();
+        assert_eq!(dec.symbol_dicts[&2].as_ref().map(Vec::len), Some(2));
+        assert_eq!(dec.pixels.retained, first + 2 * slot);
+    }
+
+    /// Symbol-ID tables hold one line per symbol. The linear scan (plus a
+    /// per-call max-length pass) cost O(lines) per bit; 2^16 symbols × 10^5
+    /// IDs was ~10^11 steps. The index makes each bit one lookup.
     #[test]
     fn huff_symbol_id_table_decodes_quickly() {
         let n = 1usize << 16;

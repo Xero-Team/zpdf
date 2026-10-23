@@ -613,9 +613,14 @@ mod tests {
         }
         let data = bits_to_bytes(&bits);
         let mut reader = BitReader::new(&data);
+        assert!(decode_row_1d(&mut reader, 1000).is_none());
+        // Running out of input also yields None: the cap must stop the row
+        // after ~1000 transitions, long before the 8000 coded runs end.
         assert!(
-            decode_row_1d(&mut reader, 1000).is_none(),
-            "zero-length run stream must hit the transition cap"
+            reader.bit < bits.len() / 4,
+            "zero-length run stream must hit the transition cap (read {} of {} bits)",
+            reader.bit,
+            bits.len()
         );
     }
 

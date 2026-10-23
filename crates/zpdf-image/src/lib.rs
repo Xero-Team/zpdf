@@ -1229,7 +1229,7 @@ fn bits_per_component(dict: &PdfDict) -> Result<u8> {
 }
 
 /// Check the post-filter sample length against the `required` bytes,
-/// returning whether the data is short and must be padded. Truncated streams
+/// returning whether the data is short (missing samples read as 0). Truncated streams
 /// are common (a writer that stopped early, a damaged Flate tail) and viewers
 /// render what is there with the missing samples read as 0; less than one
 /// full row is treated as no usable image data.
