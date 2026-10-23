@@ -49,7 +49,9 @@ pub enum PdfaProfile {
 /// launch actions, embedded files / transparency for A-1b), corrects the
 /// header version, and ensures a trailer `/ID`. For PDF/A-3b it additionally
 /// synthesizes the catalog `/AF` array for existing embedded files. The
-/// output then passes [`zpdf_document::pdfa::validate`] for the same profile.
+/// conversion is best-effort: the output is checked against
+/// [`zpdf_document::pdfa::validate`] for the same profile, but run an external
+/// conformance checker such as veraPDF before relying on it for archiving.
 #[derive(Debug, Clone)]
 pub struct PdfaConvertConfig {
     pub profile: PdfaProfile,
@@ -547,10 +549,25 @@ mod tests {
 
     #[test]
     fn downsample_bounds_the_inflate_read_to_the_declared_size() {
-        // A tiny declared image whose zlib payload expands far beyond it: only
-        // the declared 3 bytes may be read.
-        let stream = rgb_image(1, 1, flate_compress(&vec![0u8; 1_000_000]));
-        let limits = ParseLimits::default();
-        assert!(downsample_image_stream(&stream, 0, &limits).is_none());
+        use flate2::{write::ZlibEncoder, Compression};
+        use std::io::Write;
+
+        // A 4x4 RGB image (48 declared bytes) whose zlib stream inflates to
+        // far more than that, followed by an invalid deflate block. Reading
+        // only the declared size stops while surplus output is still pending,
+        // so the garbage is never reached and the image downsamples; reading
+        // the whole stream (as a bomb would make us) runs into it and fails.
+        let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(&[200u8; 48]).unwrap();
+        enc.write_all(&[7u8; 1 << 16]).unwrap();
+        enc.flush().unwrap(); // sync flush: end on a block boundary
+        let mut payload = enc.get_ref().clone();
+        payload.extend_from_slice(&[0xFF; 8]); // BFINAL + reserved BTYPE 11
+        let stream = rgb_image(4, 4, payload);
+
+        let small = downsample_image_stream(&stream, 2, &ParseLimits::default())
+            .expect("eligible image is downsampled from the declared samples");
+        assert_eq!(small.dict.get_i64("Width").ok(), Some(2));
+        assert_eq!(small.dict.get_i64("Height").ok(), Some(2));
     }
 }

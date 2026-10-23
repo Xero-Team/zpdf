@@ -210,11 +210,6 @@ pub(crate) fn prepare(
         PdfObject::Ref(ObjectId(xmp_num, 0)),
     );
 
-    if cfg.profile == PdfaProfile::A1b {
-        // A-1b forbids associated files wherever they appear.
-        cat.0.remove(&PdfName::new("AF"));
-    }
-
     // --- A-3b: synthesize a catalog /AF array (with /AFRelationship) for any
     // existing /Names /EmbeddedFiles entries, so the rewritten output passes
     // PDF/A-3's associated-files rules. Patches `cat` (adds /AF) and registers
@@ -251,8 +246,9 @@ pub(crate) fn prepare(
 
     // --- A-1b: strip remaining transparency features from every reachable
     // object (Form XObject /Group, soft masks, blend modes, non-opaque
-    // ExtGState alpha) plus /AA and /XFA. The page-only pass above misses
-    // forms, annotations and ExtGState dictionaries. ---
+    // ExtGState alpha, transfer functions) plus /AA, /XFA and /AF (associated
+    // files are forbidden wherever they appear). The page-only pass above
+    // misses forms, annotations and ExtGState dictionaries. ---
     if cfg.profile == PdfaProfile::A1b {
         strip_a1b_features_all(source, order, map, &mut edits.transforms);
     }
@@ -320,10 +316,28 @@ fn strip_a1b_object(obj: &mut PdfObject) -> bool {
 
 fn strip_a1b_dict(dict: &mut PdfDict) -> bool {
     let mut changed = false;
-    for key in [
-        "AA", "XFA", "SMask", "ca", "CA", "BM", "AIS", "TK", "TR", "Group",
-    ] {
+    // Each key is forbidden in A-1 (or only allowed with the value its
+    // absence implies): actions, XFA, associated files, transparency groups
+    // and soft masks, blend modes, alpha-is-shape, text knockout, transfer
+    // functions.
+    for key in ["AA", "XFA", "AF", "SMask", "BM", "AIS", "TK", "TR", "Group"] {
         changed |= dict.0.remove(&PdfName::new(key)).is_some();
+    }
+    // /TR2 is allowed only as /Default.
+    if matches!(dict.get("TR2"), Some(v) if !matches!(v, PdfObject::Name(n) if n.as_str() == "Default"))
+    {
+        changed |= dict.0.remove(&PdfName::new("TR2")).is_some();
+    }
+    // /ca and /CA are opacities in ExtGState and annotation dictionaries
+    // (absent = 1.0, the only A-1 value), but an appearance-characteristics
+    // /MK /CA is a widget's caption text and must stay.
+    for key in ["ca", "CA"] {
+        if matches!(
+            dict.get(key),
+            Some(PdfObject::Integer(_) | PdfObject::Real(_))
+        ) {
+            changed |= dict.0.remove(&PdfName::new(key)).is_some();
+        }
     }
     for value in dict.0.values_mut() {
         changed |= strip_a1b_object(value);
