@@ -91,3 +91,15 @@ fn a_soft_mask_under_another_ctm_is_built_again() {
     assert_eq!(masks.len(), 2);
     assert!(!Arc::ptr_eq(&masks[0].commands, &masks[1].commands));
 }
+
+/// The mask group inherits the clip (its `/BBox` and any `sh` are cut to
+/// it), so the same `gs` under another clip needs its own mask.
+#[test]
+fn a_soft_mask_under_another_clip_is_built_again() {
+    let masks = masks(
+        b"q 0 0 50 50 re W n /GS1 gs 0 0 10 10 re f Q \
+          q 100 100 50 50 re W n /GS1 gs 120 120 10 10 re f Q",
+    );
+    assert_eq!(masks.len(), 2);
+    assert!(!Arc::ptr_eq(&masks[0].commands, &masks[1].commands));
+}

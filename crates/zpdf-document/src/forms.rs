@@ -432,7 +432,7 @@ fn walk_field(
         );
         return;
     };
-    let options_cost: usize = options.iter().map(|(e, d)| e.len() + d.len()).sum();
+    let options_cost: usize = options.iter().map(|(e, d)| option_bytes(e, d)).sum();
     state.retained_bytes += base_cost + options_cost;
     let max_len = int_value(file, dict.get("MaxLen"));
 
@@ -516,13 +516,19 @@ fn parse_options(
             }
             _ => (String::new(), String::new()),
         };
-        bytes = bytes.saturating_add(export.len() + display.len());
+        bytes = bytes.saturating_add(option_bytes(&export, &display));
         if bytes > max_bytes {
             return None;
         }
         options.push((export, display));
     }
     Some(options)
+}
+
+/// Bytes an `/Opt` entry retains: its labels plus the entry itself, so a
+/// shared `/Opt` of many empty or non-string entries is not free.
+fn option_bytes(export: &str, display: &str) -> usize {
+    std::mem::size_of::<(String, String)>() + export.len() + display.len()
 }
 
 // ---------------------------------------------------------------------------
@@ -1465,6 +1471,40 @@ mod tests {
         );
         // The inherited value itself is kept intact on the fields that fit.
         assert_eq!(form.fields[0].value, Some(FieldValue::Text(big_v)));
+    }
+
+    /// Choice fields sharing one indirect `/Opt` of non-string entries each
+    /// retain a full options list; its entries are charged even though they
+    /// hold no text.
+    #[test]
+    fn shared_options_of_empty_entries_are_charged() {
+        const FIELDS: usize = 100;
+        let nulls = "null ".repeat(20_000);
+        let field_refs: String = (0..FIELDS).map(|i| format!("{} 0 R ", 6 + i)).collect();
+        let mut objs = vec![
+            "<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>".to_string(),
+            format!("<< /Fields [{field_refs}] >>"),
+            format!("[{nulls}]"),
+        ];
+        objs.extend((0..FIELDS).map(|i| format!("<< /T (c{i}) /FT /Ch /Opt 5 0 R >>")));
+        let refs: Vec<&str> = objs.iter().map(String::as_str).collect();
+        let doc = PdfDocument::open(build_pdf(&refs)).expect("open");
+
+        let form = doc.acro_form().expect("acroform");
+        assert!(!form.fields.is_empty(), "fields up to the budget are kept");
+        assert!(form.fields.len() < FIELDS, "the budget stops the walk");
+        let retained: usize = form
+            .fields
+            .iter()
+            .flat_map(|f| &f.options)
+            .map(|(e, d)| option_bytes(e, d))
+            .sum();
+        assert!(
+            retained <= MAX_FIELD_RETAINED_BYTES,
+            "retained {retained} bytes"
+        );
     }
 
     /// A long `/T` chain is truncated on a `char` boundary, and a small form

@@ -156,8 +156,9 @@ impl Decryptor {
                 Some(PdfObject::Real(n)) => *n as i32,
                 _ => 0,
             };
-            // AESV2 always uses a 128-bit key regardless of what /Length says.
-            let length_bits = if stm_algo == Algo::AesV2 || str_algo == Algo::AesV2 {
+            // AESV2 always uses a 128-bit key regardless of what /Length says,
+            // whichever class (streams, strings, attachments) uses it.
+            let length_bits = if [stm_algo, str_algo, eff_algo].contains(&Algo::AesV2) {
                 128
             } else {
                 key_length_bits(dict, v)
@@ -386,22 +387,25 @@ impl Decryptor {
 /// Effective file-key length, in bits. For V≥4 the key size of an RC4 crypt
 /// filter lives in `/CF/<StmF>/Length` and is expressed in **bytes** (ISO 32000
 /// §7.6.5), distinct from the document-level `/Encrypt /Length` (in **bits**,
-/// §7.6.3). Prefer the crypt-filter length; fall back to the document length,
-/// then to 40.
+/// §7.6.3). Prefer the length of the first crypt filter in use (`/StmF`, then
+/// `/StrF`, then `/EFF`); fall back to the document length, then to 40.
 fn key_length_bits(dict: &PdfDict, v: i64) -> i64 {
     if v >= 4 {
         let stmf = dict.get_name("StmF").unwrap_or("Identity");
-        if stmf != "Identity" {
-            if let Some(len) = dict
-                .get_dict("CF")
-                .ok()
-                .and_then(|cf| cf.get_dict(stmf).ok())
-                .and_then(|f| f.get_i64("Length").ok())
-            {
-                // Spec says bytes (5..=16); a value clearly too large for bytes is
-                // a non-conforming producer that wrote bits — accept either.
-                return if len <= 32 { len * 8 } else { len };
-            }
+        let filters = [
+            stmf,
+            dict.get_name("StrF").unwrap_or("Identity"),
+            dict.get_name("EFF").unwrap_or(stmf),
+        ];
+        let cf = dict.get_dict("CF").ok();
+        if let Some(len) = filters
+            .into_iter()
+            .filter(|&name| name != "Identity")
+            .find_map(|name| cf?.get_dict(name).ok()?.get_i64("Length").ok())
+        {
+            // Spec says bytes (5..=16); a value clearly too large for bytes is
+            // a non-conforming producer that wrote bits — accept either.
+            return if len <= 32 { len * 8 } else { len };
         }
     }
     dict.get_i64("Length").unwrap_or(40)
@@ -1280,6 +1284,37 @@ mod tests {
             PdfObject::Name(PdfName::new("EmbeddedFile")),
         );
         assert_eq!(&decrypted(embedded).data[..], b"payload", "/EFF Identity");
+    }
+
+    /// With streams and strings in the clear, the attachment filter alone sets
+    /// the file key's length: 128 bits for AESV2, its `/Length` for RC4.
+    #[test]
+    fn attachment_filter_sets_the_key_length() {
+        let key_len = |cfm: &str, length: Option<i64>| {
+            let mut stdcf = PdfDict::new();
+            stdcf.insert(PdfName::new("CFM"), PdfObject::Name(PdfName::new(cfm)));
+            if let Some(length) = length {
+                stdcf.insert(PdfName::new("Length"), PdfObject::Integer(length));
+            }
+            let mut cf = PdfDict::new();
+            cf.insert(PdfName::new("StdCF"), PdfObject::Dict(stdcf));
+            let mut dict = PdfDict::new();
+            dict.insert(
+                PdfName::new("Filter"),
+                PdfObject::Name(PdfName::new("Standard")),
+            );
+            dict.insert(PdfName::new("V"), PdfObject::Integer(4));
+            dict.insert(PdfName::new("R"), PdfObject::Integer(4));
+            dict.insert(PdfName::new("CF"), PdfObject::Dict(cf));
+            dict.insert(PdfName::new("EFF"), PdfObject::Name(PdfName::new("StdCF")));
+            match Decryptor::from_encrypt_dict(&dict, &[], None, b"") {
+                BuildResult::Decryptor(d) => d.key.len(),
+                _ => panic!("decryptor"),
+            }
+        };
+        assert_eq!(key_len("AESV2", None), 16);
+        assert_eq!(key_len("V2", Some(16)), 16);
+        assert_eq!(key_len("V2", None), 5, "the 40-bit default");
     }
 
     /// /StmF Identity + /StrF StdCF(RC4): strings decrypt, streams pass through.

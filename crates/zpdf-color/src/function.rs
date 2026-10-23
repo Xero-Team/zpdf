@@ -399,6 +399,11 @@ impl PdfFunction {
                     k = 0;
                 }
                 k = k.min(functions.len() - 1);
+                // Domain end: intervals starting at Domain1 (bounds clamped
+                // onto it) are empty, so x ends the last non-empty one.
+                while k > 0 && x >= d1 && bounds[k - 1] >= d1 {
+                    k -= 1;
+                }
                 let lo = if k == 0 { d0 } else { bounds[k - 1] };
                 let hi = if k == functions.len() - 1 {
                     d1
@@ -1222,6 +1227,9 @@ mod tests {
         let mut r = no_resolve();
         let f = PdfFunction::parse(&d, None, &mut r).expect("rounded bound is clamped");
         assert!((f.eval(&[0.5]).unwrap()[0] - 0.5).abs() < 1e-9);
+        // The clamped bound leaves an empty last interval at Domain1: the end
+        // of the domain is the end of the first ramp, not the second's start.
+        assert!((f.eval(&[1.0]).unwrap()[0] - 1.0).abs() < 1e-9);
     }
 
     #[test]

@@ -262,12 +262,14 @@ struct TileMaskReuse {
 
 /// What a soft mask built at a `gs` depends on: the ExtGState object, and the
 /// graphics state the mask group starts from — its CTM (and the pattern
-/// anchor), the inherited colours and line width the group may paint with
-/// unset, and the resource scope it falls back to.
+/// anchor), the clip bounds its `/BBox` and shadings are cut to, the inherited
+/// colours and line width the group may paint with unset, and the resource
+/// scope it falls back to.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct SoftMaskCacheKey {
     gs_id: ObjectId,
     matrices: [u64; 12],
+    clip: Option<[u64; 4]>,
     paint: [u32; 9],
     resource_depth: usize,
 }
@@ -3368,6 +3370,10 @@ impl<'a> ContentInterpreter<'a> {
                     base.e, base.f,
                 ]
                 .map(f64::to_bits),
+                clip: self
+                    .current
+                    .clip_bounds
+                    .map(|r| [r.x0, r.y0, r.x1, r.y1].map(f64::to_bits)),
                 paint: [
                     fill.r,
                     fill.g,
@@ -3665,6 +3671,9 @@ impl<'a> ContentInterpreter<'a> {
             intent,
         );
         let colorspace = self.colormanage_cmyk_image(colorspace);
+        let smask_ref = stream.dict.get_ref("SMask").ok();
+        // A soft mask's `/Matte` is a colour in this space.
+        let matte_colorspace = smask_ref.and_then(|_| colorspace.clone());
         let mut image = match zpdf_image::decode_image_xobject_resolved_with_limits(
             &decoded_data,
             &image_dict,
@@ -3683,8 +3692,14 @@ impl<'a> ContentInterpreter<'a> {
         // predictors, any bpc, /Decode — and its gray level becomes the alpha.
         // /Mask as a stream ref is a 1-bpc stencil; /Mask colour-key arrays
         // were already handled inside decode_image_xobject_resolved.
-        if let Ok(smask_ref) = stream.dict.get_ref("SMask") {
-            fold_soft_mask(&mut image, smask_ref, file, &self.parse_limits);
+        if let Some(smask_ref) = smask_ref {
+            fold_soft_mask(
+                &mut image,
+                smask_ref,
+                matte_colorspace.as_ref(),
+                file,
+                &self.parse_limits,
+            );
         } else if let Ok(mask_ref) = stream.dict.get_ref("Mask") {
             fold_stencil_mask(&mut image, mask_ref, file, &self.parse_limits);
         }
@@ -6346,9 +6361,12 @@ fn parse_image_function(
 /// Decode an image's `/SMask` through the full image-decode path (filters,
 /// predictors, any bpc, /Decode) and fold it into `image` as premultiplied
 /// alpha. Failures leave the image opaque rather than dropping it.
+/// `colorspace` is the image's resolved colour space, which a `/Matte` colour
+/// is given in (`None`: inferred from its component count).
 fn fold_soft_mask(
     image: &mut zpdf_image::DecodedImage,
     smask_ref: zpdf_core::ObjectId,
+    colorspace: Option<&zpdf_image::ResolvedColorSpace>,
     file: &PdfFile,
     limits: &ParseLimits,
 ) {
@@ -6377,12 +6395,12 @@ fn fold_soft_mask(
         limits,
     ) {
         // A `/Matte` mask means the parent's colours were pre-blended with
-        // the matte colour; read its components by count (Gray/RGB/CMYK).
+        // the matte colour.
         Ok(mask) => zpdf_image::apply_smask_image_with_matte(
             image,
             &mask,
             zpdf_image::smask_matte(&dict).as_deref(),
-            None,
+            colorspace,
         ),
         Err(e) => tracing::warn!("failed to decode /SMask image: {e}"),
     }

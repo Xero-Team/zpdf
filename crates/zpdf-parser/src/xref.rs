@@ -28,8 +28,9 @@ pub struct XrefTable {
     revisions: HashMap<ObjectId, u32>,
     /// Revision of the section being parsed.
     revision: u32,
-    /// Older-revision objects a newer revision deleted (see [`Self::insert`]).
-    superseded: std::collections::HashSet<ObjectId>,
+    /// Older-revision objects a newer revision deleted (see [`Self::insert`]),
+    /// with the revision they were listed in.
+    superseded: HashMap<ObjectId, u32>,
 }
 
 impl XrefTable {
@@ -44,17 +45,19 @@ impl XrefTable {
     /// First-wins insert, for sections parsed newest-to-oldest. An entry
     /// whose next generation a newer revision already lists (freed, or reused
     /// under the next generation number) was deleted by that incremental
-    /// update; it is recorded as superseded instead (PDF 32000-1 §7.5.4).
+    /// update; it is recorded as superseded instead (PDF 32000-1 §7.5.4). A
+    /// superseded next generation counts too: a delete, a reuse and another
+    /// delete supersede every older generation.
     pub fn insert(&mut self, id: ObjectId, entry: XrefEntry) {
-        if self.entries.contains_key(&id) {
+        if self.entries.contains_key(&id) || self.superseded.contains_key(&id) {
             return;
         }
         let next_gen = id.1.checked_add(1).map(|gen| ObjectId(id.0, gen));
         if next_gen
-            .and_then(|next| self.revisions.get(&next))
+            .and_then(|next| self.revisions.get(&next).or(self.superseded.get(&next)))
             .is_some_and(|&revision| revision < self.revision)
         {
-            self.superseded.insert(id);
+            self.superseded.insert(id, self.revision);
             return;
         }
         self.entries.insert(id, entry);
@@ -71,7 +74,7 @@ impl XrefTable {
     /// Whether `id` names an object an incremental update deleted. Such a
     /// reference resolves to null even though the old bytes remain.
     pub fn is_superseded(&self, id: ObjectId) -> bool {
-        self.superseded.contains(&id)
+        self.superseded.contains_key(&id)
     }
 
     /// Insert overwriting any existing entry. Used by tail-scan recovery, where a
@@ -529,6 +532,24 @@ fn skip_eol(data: &[u8], pos: &mut usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Delete, reuse, delete again across three revisions: both older
+    /// generations are gone, the oldest through the superseded middle one.
+    #[test]
+    fn every_older_generation_of_a_deleted_object_is_superseded() {
+        let mut table = XrefTable::default();
+        // Newest section first: `5 2 f`, then `5 1 n`, then the original `5 0 n`.
+        table.insert(ObjectId(5, 2), XrefEntry::Free { next: 0, gen: 2 });
+        table.begin_older_revision();
+        table.insert(ObjectId(5, 1), XrefEntry::InUse { offset: 10, gen: 1 });
+        table.begin_older_revision();
+        table.insert(ObjectId(5, 0), XrefEntry::InUse { offset: 20, gen: 0 });
+        for gen in [0, 1] {
+            let id = ObjectId(5, gen);
+            assert!(table.get(id).is_none(), "{id:?} still resolves");
+            assert!(table.is_superseded(id), "{id:?}");
+        }
+    }
 
     #[test]
     fn find_startxref_offset() {

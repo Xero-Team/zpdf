@@ -26,9 +26,9 @@ fn image(width: u32, colorspace: &str, data: &[u8]) -> Vec<u8> {
     )
 }
 
-/// One page drawing images `/I1`..`/I5` in order, each in its own space.
+/// One page drawing images `/I1`..`/I6` in order, each in its own space.
 fn build_pdf() -> Vec<u8> {
-    let content: &[u8] = b"/I1 Do /I2 Do /I3 Do /I4 Do /I5 Do";
+    let content: &[u8] = b"/I1 Do /I2 Do /I3 Do /I4 Do /I5 Do /I6 Do";
     let objs: Vec<(u32, Vec<u8>)> = vec![
         (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
         (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec()),
@@ -36,7 +36,7 @@ fn build_pdf() -> Vec<u8> {
             3,
             b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
               /Resources << /XObject << /I1 10 0 R /I2 11 0 R /I3 12 0 R \
-              /I4 13 0 R /I5 14 0 R >> >> /Contents 4 0 R >>"
+              /I4 13 0 R /I5 14 0 R /I6 16 0 R >> >> /Contents 4 0 R >>"
                 .to_vec(),
         ),
         (4, stream("", content)),
@@ -72,6 +72,25 @@ fn build_pdf() -> Vec<u8> {
         (12, image(2, "[/Indexed [/Lab 7 0 R] 1 8 0 R]", &[0, 1])),
         (13, image(2, "[/Indexed 9 0 R 1 <00FF>]", &[0, 1])),
         (14, image(1, "[/Lab 7 0 R]", &[255, 128, 128])),
+        // Half-transparent mask whose /Matte is palette entry 1 (black).
+        (
+            15,
+            stream(
+                "/Type /XObject /Subtype /Image /Width 1 /Height 1 \
+                 /BitsPerComponent 8 /ColorSpace /DeviceGray /Matte [1]",
+                &[128],
+            ),
+        ),
+        // Indexed gray 128, pre-blended with that matte.
+        (
+            16,
+            stream(
+                "/Type /XObject /Subtype /Image /Width 1 /Height 1 \
+                 /BitsPerComponent 8 /ColorSpace [/Indexed /DeviceRGB 1 <808080000000>] \
+                 /SMask 15 0 R",
+                &[0],
+            ),
+        ),
     ];
 
     let mut out = b"%PDF-1.4\n".to_vec();
@@ -140,7 +159,7 @@ fn decode_images(
 #[test]
 fn special_and_lab_image_colorspaces_resolve() {
     let decoded = decode_images(None);
-    assert_eq!(decoded.len(), 5, "every image decodes");
+    assert_eq!(decoded.len(), 6, "every image decodes");
     let px = |image: usize, i: usize| decoded[image][i];
 
     // Separation /Black: tint 0 is no ink, tint 1 is black ink.
@@ -163,6 +182,15 @@ fn special_and_lab_image_colorspaces_resolve() {
 
     // Lab with an indirect parameter dict.
     assert!(px(4, 0).iter().all(|&v| v > 247), "{:?}", px(4, 0));
+
+    // An Indexed parent's /Matte is a palette index: un-blending gray 128
+    // from black at alpha 1/2 gives white, premultiplied back to 128. Read
+    // as a gray level, the same /Matte [1] would un-blend from white.
+    assert!(
+        px(5, 0).iter().all(|&v| v.abs_diff(128) <= 1),
+        "{:?}",
+        px(5, 0)
+    );
 }
 
 #[test]
