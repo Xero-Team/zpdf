@@ -305,7 +305,7 @@ impl PptxWriter {
                 };
 
                 let stroke_xml = if let Some(rgb) = stroke_rgb {
-                    let width_emu = (stroke_width_pt * 12700.0) as i64;
+                    let width_emu = line_width_emu(*stroke_width_pt);
                     format!(
                         r#"          <a:ln w="{}">
             <a:solidFill>
@@ -367,7 +367,7 @@ impl PptxWriter {
                 };
 
                 let stroke_xml = if let Some(rgb) = stroke_rgb {
-                    let width_emu = (stroke_width_pt * 12700.0) as i64;
+                    let width_emu = line_width_emu(*stroke_width_pt);
                     format!(
                         r#"          <a:ln w="{}">
             <a:solidFill>
@@ -415,7 +415,7 @@ impl PptxWriter {
                 stroke_rgb,
                 stroke_width_pt,
             } => {
-                let width_emu = (stroke_width_pt * 12700.0) as i64;
+                let width_emu = line_width_emu(*stroke_width_pt);
                 let flip_h = if x2_emu < x1_emu { " flipH=\"1\"" } else { "" };
                 let flip_v = if y2_emu < y1_emu { " flipV=\"1\"" } else { "" };
                 format!(
@@ -665,11 +665,11 @@ fn freeform_shape(
         None => "<a:noFill/>".to_string(),
     };
     let line_xml = match stroke {
-        Some((r, g, b)) if stroke_width_pt > 0.0 => format!(
+        Some((r, g, b)) => format!(
             "<a:ln w=\"{}\"><a:solidFill><a:srgbClr val=\"{r:02X}{g:02X}{b:02X}\"/></a:solidFill></a:ln>",
-            pt_to_emu(stroke_width_pt).max(1)
+            line_width_emu(stroke_width_pt)
         ),
-        _ => "<a:ln><a:noFill/></a:ln>".to_string(),
+        None => "<a:ln><a:noFill/></a:ln>".to_string(),
     };
     let off_x = pt_to_emu(min_x);
     let off_y = pt_to_emu(min_y);
@@ -701,6 +701,16 @@ fn freeform_shape(
 
 fn pt_to_emu(pt: f64) -> i64 {
     (pt * 12700.0).round() as i64
+}
+
+/// The thinnest line drawn for a stroke: 0.25 pt, PowerPoint's minimum.
+const HAIRLINE_EMU: i64 = 3175;
+
+/// DrawingML line width for a PDF stroke width. PDF's 0 (and anything
+/// thinner than a device pixel) is a hairline that must stay visible
+/// (ISO 32000-1 §8.4.3.2), so widths never drop below [`HAIRLINE_EMU`].
+fn line_width_emu(stroke_width_pt: f64) -> i64 {
+    pt_to_emu(stroke_width_pt).max(HAIRLINE_EMU)
 }
 
 #[cfg(test)]

@@ -193,19 +193,22 @@ impl<'a> SlideConverter<'a> {
 
         for glyph in &glyph_run.glyphs {
             // /ToUnicode is keyed by the source character code, not the glyph
-            // id. Use the code recorded by the content interpreter; for simple
-            // fonts a missing map can still fall back to the code itself.
-            let mapped = font
-                .to_unicode
-                .as_ref()
-                .and_then(|to_unicode| to_unicode.lookup(glyph.code));
-            match mapped {
-                Some(unicode) => text.push_str(unicode),
-                None => {
-                    if let Some(ch) = char::from_u32(glyph.code) {
-                        if !ch.is_control() {
-                            text.push(ch);
-                        }
+            // id. A simple font's one-byte code decodes exactly as in text
+            // extraction (/ToUnicode, then the encoding's glyph names); a
+            // composite font's code means nothing without /ToUnicode.
+            match font.font_type {
+                zpdf_font::PdfFontType::Type0CidType2 => {
+                    if let Some(unicode) = font
+                        .to_unicode
+                        .as_ref()
+                        .and_then(|to_unicode| to_unicode.lookup(glyph.code))
+                    {
+                        text.push_str(unicode);
+                    }
+                }
+                _ => {
+                    if let Ok(byte) = u8::try_from(glyph.code) {
+                        text.push_str(&font.decode_to_string(&[byte]));
                     }
                 }
             }
@@ -476,12 +479,71 @@ mod export_tests {
     use zpdf_font::cmap::ToUnicodeMap;
     use zpdf_font::{FontCache, LoadedFont};
 
+    /// Text of every text box on a one-run slide drawn with `font`.
+    fn run_text(font: LoadedFont, glyph_id: u16, code: u32) -> String {
+        let mut fonts = FontCache::new();
+        let font_id = fonts.insert("F1".into(), font);
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 612.0, 792.0));
+        dl.push(RenderCommand::DrawGlyphRun(GlyphRun {
+            font_id,
+            font_size: 12.0,
+            glyphs: vec![PositionedGlyph {
+                glyph_id,
+                code,
+                x: 100.0,
+                y: 100.0,
+                advance: 6.0,
+            }],
+            paint: Paint::Solid(Color::black()),
+            alpha: 1.0,
+            overprint: None,
+            transform: Matrix::identity(),
+            h_scale: 1.0,
+        }));
+        let slide = display_list_to_slide(
+            &dl,
+            0,
+            &fonts,
+            &ImageCache::new(),
+            &ConversionOptions::default(),
+        )
+        .expect("slide");
+        slide
+            .elements
+            .iter()
+            .filter_map(|e| match e {
+                SlideElement::TextBox { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn composite_font_text_comes_from_to_unicode_by_code() {
+        let font = || {
+            let mut font = LoadedFont::new_placeholder("Cid".into());
+            font.font_type = zpdf_font::PdfFontType::Type0CidType2;
+            font.to_unicode = Some(ToUnicodeMap::parse(
+                b"begincmap 1 begincodespacerange <0000> <FFFF> endcodespacerange \
+                  1 beginbfchar <0102> <00E9> endbfchar endcmap",
+            ));
+            font
+        };
+        // Looking up the glyph id instead of the code finds nothing for the
+        // first run and the mapped character for the second; an unmapped code
+        // yields no text rather than the code read as a character.
+        assert_eq!(run_text(font(), 7, 0x0102), "\u{e9}");
+        assert_eq!(run_text(font(), 0x0102, 0x4E00), "");
+    }
+
     #[test]
     fn to_unicode_is_keyed_by_character_code_not_glyph_id() {
         let mut font = LoadedFont::new_placeholder("Simple".into());
+        // Map code 0x41 to a non-ASCII character, so falling back to the code
+        // itself ("A") cannot pass for a ToUnicode hit.
         font.to_unicode = Some(ToUnicodeMap::parse(
             b"begincmap 1 begincodespacerange <00> <FF> endcodespacerange \
-              1 beginbfchar <41> <0041> endbfchar endcmap",
+              1 beginbfchar <41> <00E9> endbfchar endcmap",
         ));
         let mut fonts = FontCache::new();
         let font_id = fonts.insert("F1".into(), font);
@@ -520,24 +582,36 @@ mod export_tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(text, "A");
+        assert_eq!(text, "\u{e9}");
+    }
+
+    fn zip_entry(archive: &mut zip::ZipArchive<std::io::Cursor<Vec<u8>>>, name: &str) -> Vec<u8> {
+        use std::io::Read;
+        let mut entry = archive
+            .by_name(name)
+            .unwrap_or_else(|_| panic!("{name} missing"));
+        let mut out = Vec::new();
+        entry.read_to_end(&mut out).unwrap();
+        out
     }
 
     #[test]
     fn image_ids_are_renumbered_across_slides() {
-        let image = |id: &str| PptxSlide {
+        // Both slides number their picture "image1"; each carries different
+        // bytes so a slide pointing at the other's media part is caught.
+        let image = |data: &[u8]| PptxSlide {
             page_index: 0,
             elements: vec![SlideElement::Image {
                 x_emu: 0,
                 y_emu: 0,
                 width_emu: 100,
                 height_emu: 100,
-                image_data: vec![0x89, b'P', b'N', b'G'],
-                image_id: id.to_string(),
+                image_data: data.to_vec(),
+                image_id: "image1".to_string(),
             }],
         };
         let presentation = PptxPresentation {
-            slides: vec![image("image1"), image("image1")],
+            slides: vec![image(b"first-slide"), image(b"second-slide")],
             width_emu: 914400,
             height_emu: 914400,
         };
@@ -564,5 +638,59 @@ mod export_tests {
             names.len(),
             "duplicate ZIP members: {names:?}"
         );
+
+        // Each slide's picture resolves, through its own relationship, to the
+        // media part holding that slide's bytes.
+        for (slide, data) in [(1, &b"first-slide"[..]), (2, &b"second-slide"[..])] {
+            let xml = String::from_utf8(zip_entry(
+                &mut archive,
+                &format!("ppt/slides/slide{slide}.xml"),
+            ))
+            .unwrap();
+            let rels = String::from_utf8(zip_entry(
+                &mut archive,
+                &format!("ppt/slides/_rels/slide{slide}.xml.rels"),
+            ))
+            .unwrap();
+            let embed = xml
+                .split("r:embed=\"")
+                .nth(1)
+                .and_then(|rest| rest.split('"').next())
+                .expect("picture reference");
+            let target = rels
+                .split(&format!("Id=\"{embed}\""))
+                .nth(1)
+                .and_then(|rest| rest.split("Target=\"../").nth(1))
+                .and_then(|rest| rest.split('"').next())
+                .expect("relationship for the picture");
+            assert_eq!(zip_entry(&mut archive, &format!("ppt/{target}")), data);
+        }
+    }
+
+    #[test]
+    fn freeform_paths_reach_the_slide_xml() {
+        let presentation = PptxPresentation {
+            slides: vec![PptxSlide {
+                page_index: 0,
+                elements: vec![SlideElement::FreeformPath {
+                    path_data: "M 10 10 L 30 10 C 35 10 40 15 40 20 Z".to_string(),
+                    fill_rgb: None,
+                    stroke_rgb: Some((0, 0, 0)),
+                    stroke_width_pt: 0.0,
+                }],
+            }],
+            width_emu: 914400,
+            height_emu: 914400,
+        };
+        let bytes = PptxWriter::new(presentation)
+            .write_to_bytes()
+            .expect("write pptx");
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("zip");
+        let xml = String::from_utf8(zip_entry(&mut archive, "ppt/slides/slide1.xml")).unwrap();
+        assert!(xml.contains("<a:custGeom>"), "{xml}");
+        assert!(xml.contains("<a:cubicBezTo>"), "{xml}");
+        // A zero-width PDF stroke is a hairline, not an invisible outline.
+        assert!(!xml.contains("<a:ln><a:noFill/></a:ln>"), "{xml}");
+        assert!(xml.contains("<a:ln w=\"3175\">"), "{xml}");
     }
 }
