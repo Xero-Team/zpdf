@@ -35,10 +35,12 @@ impl TextSpan {
         )
     }
 
-    /// Whether the span's geometry is finite. A non-finite coordinate breaks
-    /// the total order the layout sorts need (a panic on Rust ≥ 1.81).
+    /// Whether the span's geometry is finite, its right edge included (two
+    /// finite values can still overflow). A non-finite coordinate breaks the
+    /// total order the layout sorts need (a panic on Rust ≥ 1.81).
     pub(crate) fn is_finite(&self) -> bool {
-        self.x.is_finite()
+        (self.x + self.advance).is_finite()
+            && self.x.is_finite()
             && self.y.is_finite()
             && self.advance.is_finite()
             && self.size.is_finite()
@@ -678,11 +680,16 @@ mod tests {
             ));
             spans.push(span("nan", f64::NAN, i as f64, f32::NAN));
             spans.push(span("inf", 10.0, f64::INFINITY, 12.0));
+            // Finite, but the right edge overflows.
+            let mut far = span("far", 1e308, i as f64, 12.0);
+            far.advance = 1e308;
+            spans.push(far);
         }
         let text = spans_to_text(spans.clone(), 2.0);
         assert!(text.contains("word"));
-        assert!(!text.contains("nan") && !text.contains("inf"));
+        assert!(!text.contains("nan") && !text.contains("inf") && !text.contains("far"));
         assert!(crate::search::search_spans(&spans, "nan", false).is_empty());
+        assert!(crate::search::search_spans(&spans, "far", false).is_empty());
     }
 
     #[test]

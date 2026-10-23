@@ -454,11 +454,15 @@ fn walk_field(
     });
 }
 
-/// Bytes of text a field value holds.
+/// Bytes a field value holds: its text, plus each list entry itself (a list
+/// of empty strings is not free).
 fn field_value_bytes(value: &FieldValue) -> usize {
     match value {
         FieldValue::Text(s) | FieldValue::Name(s) => s.len(),
-        FieldValue::List(items) => items.iter().map(String::len).sum(),
+        FieldValue::List(items) => items
+            .iter()
+            .map(|s| std::mem::size_of::<String>() + s.len())
+            .sum(),
     }
 }
 
@@ -1505,6 +1509,29 @@ mod tests {
             retained <= MAX_FIELD_RETAINED_BYTES,
             "retained {retained} bytes"
         );
+    }
+
+    /// The same for a shared multi-select `/V` of empty strings: each field
+    /// copies the list, so its entries are charged.
+    #[test]
+    fn shared_list_values_of_empty_strings_are_charged() {
+        const FIELDS: usize = 100;
+        let empties = "() ".repeat(20_000);
+        let field_refs: String = (0..FIELDS).map(|i| format!("{} 0 R ", 6 + i)).collect();
+        let mut objs = vec![
+            "<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>".to_string(),
+            format!("<< /Fields [{field_refs}] >>"),
+            format!("[{empties}]"),
+        ];
+        objs.extend((0..FIELDS).map(|i| format!("<< /T (c{i}) /FT /Ch /V 5 0 R >>")));
+        let refs: Vec<&str> = objs.iter().map(String::as_str).collect();
+        let doc = PdfDocument::open(build_pdf(&refs)).expect("open");
+
+        let form = doc.acro_form().expect("acroform");
+        assert!(!form.fields.is_empty(), "fields up to the budget are kept");
+        assert!(form.fields.len() < FIELDS, "the budget stops the walk");
     }
 
     /// A long `/T` chain is truncated on a `char` boundary, and a small form

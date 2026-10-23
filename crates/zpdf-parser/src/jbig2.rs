@@ -3087,6 +3087,15 @@ impl<'a> Decoder<'a> {
         if hbpp > 31 {
             return Err(err("implausible halftone bit depth"));
         }
+        // Each cell holds a `u32` gray value and is decoded once per bitplane:
+        // charge the grid as a bitmap that many times wider, so a halftone
+        // (MMR planes have no payload-tied budget) costs no more than the
+        // largest bitmap the decode may allocate.
+        self.pixels.check(
+            hgw.saturating_mul(hbpp.max(4)),
+            hgh,
+            "halftone grayscale image",
+        )?;
         let payload = r.rest();
         let budget = mq_iteration_budget(payload.len());
         // Arithmetic bitplanes cost one MQ decode per cell per plane, all off
@@ -5192,6 +5201,13 @@ mod tests {
         );
         // A page above the limit is a hard error, as for oversized JPEGs.
         assert!(decode_limited(&stream, 9_999).is_err());
+        // The grid's gray values take four bytes per cell: 20,000 cells cost
+        // as much as an 80,000-pixel bitmap.
+        assert_eq!(
+            decode_limited(&stream, 79_999).unwrap(),
+            white_row.repeat(100)
+        );
+        assert_eq!(decode_limited(&stream, 80_000).unwrap(), black_page);
 
         // A region above the limit is refused on its own.
         let mut region = mmr_halftone_payload((101, 100), 0, (1, 1), (0, 0), (0, 0));

@@ -1103,9 +1103,11 @@ impl<'a> ContentInterpreter<'a> {
         }
 
         // Annotation appearances render independently of wherever the page
-        // content stream left the graphics state (12.5.5): rebalance any
-        // unclosed q-levels and top-level W clips, then reset to the page's
-        // initial state (an unbalanced BDC /OC must not blank annotations).
+        // content stream left the graphics state (12.5.5): drop a `W` never
+        // painted, rebalance any unclosed q-levels and top-level W clips, then
+        // reset to the page's initial state (an unbalanced BDC /OC must not
+        // blank annotations).
+        self.pending_clip = None;
         while self.state_stack.len() > self.state_floor {
             for _ in 0..self.current.clip_depth {
                 self.display_list.push(RenderCommand::PopClip);
@@ -4229,6 +4231,11 @@ impl<'a> ContentInterpreter<'a> {
         }
 
         self.form_depth += 1;
+        // A pending `W` belongs to the stream that set it: the invoking
+        // stream's waits for its own painting operator (a pattern fill runs
+        // this form while painting), and one the form leaves unpainted ends
+        // with the form.
+        let outer_clip = self.pending_clip.take();
         let tokenizer = ContentTokenizer::new(&decoded);
         for token in tokenizer {
             if self.over_budget() {
@@ -4250,6 +4257,7 @@ impl<'a> ContentInterpreter<'a> {
                 }
             }
         }
+        self.pending_clip = outer_clip;
         self.form_depth -= 1;
 
         // Balance: pop clips opened by any unbalanced q-levels left by the
@@ -5015,6 +5023,9 @@ impl<'a> ContentInterpreter<'a> {
                     rule: FillRule::NonZero,
                 });
 
+                // The `W` of the fill painting this pattern stays pending for
+                // it; one the cell leaves unpainted ends with the cell.
+                let outer_clip = self.pending_clip.take();
                 let tokenizer = ContentTokenizer::new(&def.content);
                 for token in tokenizer {
                     if self.over_budget() {
@@ -5036,6 +5047,7 @@ impl<'a> ContentInterpreter<'a> {
                         }
                     }
                 }
+                self.pending_clip = outer_clip;
 
                 // Rebalance clips/state left open by the cell body.
                 while self.state_stack.len() > depth_floor + 1 {
@@ -7820,6 +7832,61 @@ mod tests {
         assert_eq!(
             kinds(b"q 100 100 200 200 re W* n 0 0 400 400 re f Q"),
             ["clip", "fill", "pop"]
+        );
+    }
+
+    /// A pending `W` belongs to the stream that set it: the tiling cell its
+    /// own `f` paints must not consume it, and a form ending on `re W` must
+    /// not clip what follows the form.
+    #[test]
+    fn pending_clips_stay_in_their_own_content_stream() {
+        // Bounds of the clips still open around the last fill.
+        let clips_at_last_fill = |file: &PdfFile, resources: &ResourceDict, content: &[u8]| {
+            let list = ContentInterpreter::new(Rect::new(0.0, 0.0, 100.0, 100.0))
+                .with_document(file, resources)
+                .interpret(content);
+            let mut open = Vec::new();
+            let mut at_fill = Vec::new();
+            for command in &list.commands {
+                match command {
+                    RenderCommand::PushClip { path, .. } => {
+                        open.push(ContentInterpreter::path_bounds(path))
+                    }
+                    RenderCommand::PopClip => {
+                        open.pop();
+                    }
+                    RenderCommand::FillPath { .. } => at_fill.clone_from(&open),
+                    _ => {}
+                }
+            }
+            at_fill
+        };
+
+        let pattern = single_object_file(
+            "<< /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 10 10] \
+             /XStep 10 /YStep 10 /Resources << >> /Length 11 >>\n\
+             stream\n0 0 5 5 re f\nendstream",
+        );
+        let mut resources = ResourceDict::default();
+        resources.patterns.insert("P0".into(), ObjectId(1, 0));
+        assert_eq!(
+            clips_at_last_fill(
+                &pattern,
+                &resources,
+                b"/Pattern cs /P0 scn 0 0 50 50 re W f 0 g 0 0 100 100 re f",
+            ),
+            [Some(Rect::new(0.0, 0.0, 50.0, 50.0))]
+        );
+
+        let form = single_object_file(
+            "<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] /Length 13 >>\n\
+             stream\n0 0 10 10 re W\nendstream",
+        );
+        let mut resources = ResourceDict::default();
+        resources.xobjects.insert("Fm0".into(), ObjectId(1, 0));
+        assert_eq!(
+            clips_at_last_fill(&form, &resources, b"/Fm0 Do 0 0 100 100 re f"),
+            []
         );
     }
 

@@ -453,9 +453,11 @@ fn parse_byte_range(file: &PdfFile, sig: &PdfDict, file_len: usize) -> (ByteRang
         }
     }
 
-    // Whole-document coverage: first span at 0, last span ends at EOF. A
-    // truncated list does not show where the declared spans end.
+    // Whole-document coverage: first span at 0, last span ends at EOF, in
+    // order between them. A truncated list does not show where the declared
+    // spans end.
     let covers_whole_document = !truncated
+        && spans_in_order(&ranges)
         && ranges.first().zip(ranges.last()).is_some_and(
             |(&(first_off, _), &(last_off, last_len))| {
                 first_off == 0 && last_off.saturating_add(last_len) == file_len
@@ -617,20 +619,25 @@ fn signature_alg_name(p: &cms::Cms) -> Option<String> {
 /// The covered byte spans as slices of the file, in order, for hashing in
 /// place (never concatenated into a copy). `None` (a malformed or tampered
 /// `/ByteRange`) when there are no spans, any span falls outside the file, or
-/// the spans add up to more than the file, which means they overlap. That
-/// last check also bounds the hashing work to one pass over the file.
+/// the spans are out of order or overlap: a repeated byte can stand in for
+/// one left unsigned. In-order disjoint spans also bound the hashing work to
+/// one pass over the file.
 fn covered_spans<'d>(data: &'d [u8], ranges: &[(usize, usize)]) -> Option<Vec<&'d [u8]>> {
-    if ranges.is_empty() {
+    if ranges.is_empty() || !spans_in_order(ranges) {
         return None;
     }
-    let mut total = 0usize;
-    let mut spans = Vec::with_capacity(ranges.len());
-    for &(off, len) in ranges {
-        let end = off.checked_add(len)?;
-        spans.push(data.get(off..end)?);
-        total = total.checked_add(len)?;
-    }
-    (total <= data.len()).then_some(spans)
+    ranges
+        .iter()
+        .map(|&(off, len)| data.get(off..off.checked_add(len)?))
+        .collect()
+}
+
+/// Whether each `(offset, length)` span starts at or after the previous one's
+/// end (no overlap, no going back).
+fn spans_in_order(ranges: &[(usize, usize)]) -> bool {
+    ranges
+        .windows(2)
+        .all(|w| w[0].0.checked_add(w[0].1).is_some_and(|end| end <= w[1].0))
 }
 
 // ---------------------------------------------------------------------------
@@ -1660,10 +1667,14 @@ mod tests {
         assert!(covered_spans(data, &[(0, 3), (7, 99)]).is_none());
         assert!(covered_spans(data, &[(usize::MAX, 2)]).is_none());
         assert!(covered_spans(data, &[]).is_none());
-        // Spans adding up to more than the file must overlap: rejected, so
-        // hashing never reads more than one file's worth of bytes.
+        // Overlapping or backward spans are rejected, so hashing never reads
+        // more than one file's worth of bytes and no byte stands in for one
+        // left unsigned: here byte 1 repeats while 2–3 are skipped.
         assert!(covered_spans(data, &[(0, 10), (0, 10)]).is_none());
+        assert!(covered_spans(data, &[(0, 2), (1, 1), (4, 6)]).is_none());
+        assert!(covered_spans(data, &[(7, 3), (0, 3)]).is_none());
         assert!(covered_spans(data, &[(0, 10)]).is_some());
+        assert!(covered_spans(data, &[(0, 3), (3, 7)]).is_some(), "adjacent");
     }
 
     #[test]
@@ -1750,6 +1761,33 @@ mod tests {
         assert_eq!(sigs[0].coverage.ranges.len(), MAX_BYTE_RANGE_PAIRS);
         assert!(!sigs[0].coverage.covers_whole_document);
         assert_eq!(sigs[0].digest, DigestStatus::Unsupported);
+    }
+
+    /// Spans running from offset 0 to EOF do not cover the document when an
+    /// overlap hides a gap (byte 1 repeats, bytes 2–3 are left out).
+    #[test]
+    fn overlapping_byte_range_does_not_cover_the_document() {
+        let pdf_with = |last_len: &str| {
+            build_pdf(&[
+                "<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>",
+                "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>",
+                "<< /Fields [5 0 R] >>",
+                &format!(
+                    "<< /FT /Sig /T (S) /V << /ByteRange [0 2 1 1 4 {last_len}] \
+                     /Contents <00> >> >>"
+                ),
+            ])
+        };
+        // Fixed-width length, so filling it in keeps the file length.
+        let len = pdf_with("0000000000").len();
+        let pdf = pdf_with(&format!("{:010}", len - 4));
+        assert_eq!(pdf.len(), len);
+        let file = PdfFile::parse(pdf.as_slice()).expect("parse");
+        let sigs = parse_signatures(&file);
+        assert_eq!(sigs.len(), 1);
+        assert_eq!(sigs[0].coverage.ranges.last(), Some(&(4, len - 4)));
+        assert!(!sigs[0].coverage.covers_whole_document);
     }
 
     /// Fields sharing one signature dictionary report it once; distinct

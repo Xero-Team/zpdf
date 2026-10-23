@@ -89,6 +89,12 @@ impl XrefTable {
         self.entries.len()
     }
 
+    /// Object ids the table holds, superseded ones included: what
+    /// `ParseLimits::max_objects` bounds.
+    fn retained_len(&self) -> usize {
+        self.entries.len() + self.superseded.len()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -255,7 +261,7 @@ fn parse_xref_stream(
 
         // H3 Fix: Check total entry count against max_objects before processing range
         let new_total = table
-            .len()
+            .retained_len()
             .checked_add(count as usize)
             .ok_or(Error::InvalidXref(offset as u64))?;
         if new_total > limits.max_objects as usize {
@@ -372,7 +378,7 @@ fn parse_traditional_xref(
         // magnitude of object numbers (a sparse xref with one high-numbered
         // entry should be allowed)
         let new_total = table
-            .len()
+            .retained_len()
             .checked_add(count as usize)
             .ok_or(Error::InvalidXref(pos as u64))?;
         if new_total > limits.max_objects as usize {
@@ -668,6 +674,42 @@ mod tests {
         let d = xref_stream_bytes("[1 1 3]", 1, "/Index [0 1]", &[1, 0, 1, 0, 0]);
         let mut table = XrefTable::new();
         assert!(parse_xref_stream(&d, 0, &mut table, &ParseLimits::default()).is_err());
+    }
+
+    /// Superseded generations are held too, so they count against
+    /// `max_objects` like live entries.
+    #[test]
+    fn superseded_entries_count_against_max_objects() {
+        let limits = ParseLimits {
+            max_objects: 2,
+            ..ParseLimits::default()
+        };
+        let section = |entry: &str| format!("xref\n5 1\n{entry} \ntrailer\n<< /Size 6 >>\n");
+        let mut table = XrefTable::new();
+        parse_traditional_xref(
+            section("0000000000 00002 f").as_bytes(),
+            0,
+            &mut table,
+            &limits,
+        )
+        .unwrap();
+        table.begin_older_revision();
+        parse_traditional_xref(
+            section("0000000010 00001 n").as_bytes(),
+            0,
+            &mut table,
+            &limits,
+        )
+        .unwrap();
+        table.begin_older_revision();
+        // One live entry plus one superseded: a third id is over the limit.
+        assert!(parse_traditional_xref(
+            section("0000000020 00000 n").as_bytes(),
+            0,
+            &mut table,
+            &limits
+        )
+        .is_err());
     }
 
     #[test]
