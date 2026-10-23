@@ -2757,8 +2757,13 @@ fn cmd_redact(args: &[String]) -> zpdf::Result<()> {
     }
 
     let bytes = fs::read(&input_path).map_err(zpdf::Error::Io)?;
-    if password.is_some() {
-        eprintln!("Note: redaction output is fully rewritten and will be decrypted.");
+    // A document with an empty user password opens without --password, so
+    // ask the file rather than the flag.
+    if zpdf::PdfFile::parse(bytes.clone()).is_ok_and(|f| f.is_encrypted()) {
+        eprintln!(
+            "Note: the redacted output is a full rewrite and is NOT encrypted; \
+             re-encrypt it with `zpdf optimize --encrypt` if needed."
+        );
     }
     let out_bytes = zpdf_writer::redact_pdf(
         bytes,

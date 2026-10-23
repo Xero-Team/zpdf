@@ -97,9 +97,12 @@ GPU (wgpu) renderers whose output matches within <1% of pixels.
   - **Full rewrite** (`rewrite_pdf`): garbage-collect, renumber, decrypt,
     Flate-compress, optional **image downsampling** — and **encrypt on save**
     (AES-256 R6 or RC4-128 with user/owner passwords and permissions).
-  - **True redaction** (`redact_page`): removes text/image/path operators
-    intersecting a region from the content stream itself (not a cosmetic box)
-    and drops overlapping annotations.
+  - **True redaction** (`redact_pdf`): removes text/image/path operators
+    intersecting a region from the content stream itself (not a cosmetic box),
+    drops overlapping annotations, scrubs `/ActualText`/`/Alt` covering the
+    removed content, then fully rewrites the file so no earlier revision keeps
+    the original bytes. (`redact_page` alone is only an incremental edit — the
+    original content stays recoverable from the file prefix.)
   - **Linearization** (`linearize_pdf`): "fast web view" output per
     ISO 32000-1 Annex F.
 - **PDF/A validation** — a best-effort conformance rule engine for
