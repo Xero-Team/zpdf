@@ -294,33 +294,47 @@ impl IncrementalWriter {
         Ok(())
     }
 
-    /// Restore `/Parent` links from a copied field to its widget kids. Page
-    /// copying deliberately drops every `/Parent`, because following one would
-    /// pull in the whole source page tree; the AcroForm merge must put the
-    /// field→widget back-references back.
-    fn reparent_field_kids(&mut self, field: ObjectId, depth: usize) -> Result<()> {
-        if depth > 32 {
-            return Ok(());
-        }
-        let dict = self.resolve_current(field)?.as_dict()?.clone();
-        let kids = match dict.get("Kids").cloned() {
-            Some(PdfObject::Array(a)) => a,
-            Some(PdfObject::Ref(r)) => match self.resolve_current(r)? {
-                PdfObject::Array(a) => a,
-                _ => return Ok(()),
-            },
-            _ => return Ok(()),
-        };
-        for kid in kids {
-            let PdfObject::Ref(kid_id) = kid else {
-                continue;
+    /// Restore `/Parent` links below a copied field. Page copying
+    /// deliberately drops every `/Parent` (following one would pull in the
+    /// whole source page tree), so the AcroForm merge puts the field→kid
+    /// back-references back on every descendant field and widget.
+    ///
+    /// The walk covers the whole hierarchy, visits each object once (so
+    /// repeated or cyclic `/Kids` cannot blow up) and skips kids that are not
+    /// dictionaries instead of failing: the pages are already appended, so an
+    /// error here would leave a half-merged document.
+    fn reparent_field_kids(&mut self, root: ObjectId) {
+        let mut visited = HashSet::from([root]);
+        let mut pending = vec![root];
+        while let Some(field) = pending.pop() {
+            let kids = match self.resolve_current(field) {
+                Ok(PdfObject::Dict(d)) => match d.get("Kids") {
+                    Some(PdfObject::Array(a)) => a.clone(),
+                    Some(PdfObject::Ref(r)) => match self.resolve_current(*r) {
+                        Ok(PdfObject::Array(a)) => a,
+                        _ => continue,
+                    },
+                    _ => continue,
+                },
+                _ => continue,
             };
-            let mut kid_dict = self.resolve_current(kid_id)?.as_dict()?.clone();
-            kid_dict.insert(PdfName::new("Parent"), PdfObject::Ref(field));
-            self.overwrite_object(kid_id, PdfObject::Dict(kid_dict));
-            self.reparent_field_kids(kid_id, depth + 1)?;
+            for kid in kids {
+                let PdfObject::Ref(kid_id) = kid else {
+                    continue;
+                };
+                if !visited.insert(kid_id) {
+                    continue;
+                }
+                match self.resolve_current(kid_id) {
+                    Ok(PdfObject::Dict(mut kid_dict)) => {
+                        kid_dict.insert(PdfName::new("Parent"), PdfObject::Ref(field));
+                        self.overwrite_object(kid_id, PdfObject::Dict(kid_dict));
+                        pending.push(kid_id);
+                    }
+                    _ => tracing::warn!("form field kid {kid_id} is not a dictionary; skipped"),
+                }
+            }
         }
-        Ok(())
     }
 
     /// Merge the source's AcroForm: fields are deep-copied (their widgets are
@@ -422,7 +436,7 @@ impl IncrementalWriter {
                     names.insert(base);
                 }
             }
-            self.reparent_field_kids(dest_field, 0)?;
+            self.reparent_field_kids(dest_field);
             dest_fields.push(PdfObject::Ref(dest_field));
         }
 
@@ -671,27 +685,42 @@ fn walk_pages(
     if depth > max_depth || out.len() >= max_pages || !seen.insert(node) {
         return Ok(());
     }
-    let dict = source.resolve(node)?.as_dict()?.clone();
-    // Recurse whenever /Kids is present, regardless of /Type: real files carry
-    // interior nodes with a missing or misspelt /Type, and treating those as
-    // leaves silently dropped every page below them.
-    let kids = match dict.get("Kids") {
-        Some(PdfObject::Array(a)) => Some(a.clone()),
-        Some(PdfObject::Ref(r)) => match source.resolve(*r)? {
-            PdfObject::Array(a) => Some(a),
-            _ => Some(Vec::new()),
-        },
-        _ => None,
-    };
-    match kids {
-        Some(kids) => {
-            for kid in kids {
-                if let PdfObject::Ref(r) = kid {
-                    walk_pages(source, r, depth + 1, max_depth, max_pages, seen, out)?;
-                }
-            }
+    // Classify and skip nodes exactly like the reader's page-tree walk
+    // (zpdf-document `collect_page_refs`), so a merge appends the pages the
+    // source is seen to have. /Type is required but missing or wrong in real
+    // files: without a usable one, /Kids marks an interior node.
+    let dict = match source.resolve(node) {
+        Ok(PdfObject::Dict(d)) => d,
+        Ok(other) => {
+            tracing::warn!("page tree node {node} is {}; skipped", other.type_name());
+            return Ok(());
         }
-        None => out.push(node),
+        Err(e) => {
+            tracing::warn!("page tree node {node} failed to resolve ({e}); skipped");
+            return Ok(());
+        }
+    };
+    let is_pages = match dict.get_name("Type") {
+        Ok("Pages") => true,
+        Ok("Page") => false,
+        _ => dict.get("Kids").is_some(),
+    };
+    if !is_pages {
+        out.push(node);
+        return Ok(());
+    }
+    let kids = match dict.get("Kids") {
+        Some(PdfObject::Array(a)) => a.clone(),
+        Some(PdfObject::Ref(r)) => match source.resolve(*r) {
+            Ok(PdfObject::Array(a)) => a,
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    };
+    for kid in kids {
+        if let PdfObject::Ref(r) = kid {
+            walk_pages(source, r, depth + 1, max_depth, max_pages, seen, out)?;
+        }
     }
     Ok(())
 }
