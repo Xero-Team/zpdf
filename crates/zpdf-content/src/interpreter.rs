@@ -110,9 +110,6 @@ pub struct ContentInterpreter<'a> {
     /// the mask group once. See [`SoftMaskCacheKey`].
     soft_mask_cache: HashMap<SoftMaskCacheKey, Option<SoftMask>>,
     form_font_overrides: Vec<HashMap<String, String>>,
-    /// Distinguishes inline font dictionaries in sibling forms/tiles that
-    /// reuse the same resource name but have no object identity.
-    form_font_serial: u64,
     /// Bounded recovery for malformed CAD text fonts (broken subsets, fonts
     /// leaked across text blocks), fed while the page is interpreted.
     font_repair: crate::font_repair::FontRepair,
@@ -673,7 +670,6 @@ impl<'a> ContentInterpreter<'a> {
             content_cache_bytes: 0,
             soft_mask_cache: HashMap::new(),
             form_font_overrides: Vec::new(),
-            form_font_serial: 0,
             font_repair: Default::default(),
             font_override: false,
             form_resources: Vec::new(),
@@ -4130,7 +4126,7 @@ impl<'a> ContentInterpreter<'a> {
         };
 
         // Load fonts from the form's own Resources into the FontCache
-        self.load_form_fonts(&stream.dict, file, xobj_id);
+        self.load_form_fonts(&stream.dict, file);
 
         // The form's full /Resources (xobjects, gstates, colorspaces,
         // patterns, shadings) shadow the page's for the duration of the form.
@@ -4316,12 +4312,7 @@ impl<'a> ContentInterpreter<'a> {
         name.to_string()
     }
 
-    fn load_form_fonts(
-        &mut self,
-        form_dict: &zpdf_core::PdfDict,
-        file: &PdfFile,
-        identity: Option<ObjectId>,
-    ) {
+    fn load_form_fonts(&mut self, form_dict: &zpdf_core::PdfDict, file: &PdfFile) {
         // Either level may be an indirect reference.
         let fonts_of = |res: &zpdf_core::PdfDict| match res.get("Font") {
             Some(PdfObject::Dict(f)) => Some(f.clone()),
@@ -4355,14 +4346,6 @@ impl<'a> ContentInterpreter<'a> {
             .unwrap_or_default();
 
         let mut overrides = HashMap::new();
-        let form_depth = self.form_font_overrides.len();
-        let scope = match identity {
-            Some(id) => format!("{}_{}", id.0, id.1),
-            None => {
-                self.form_font_serial = self.form_font_serial.saturating_add(1);
-                format!("s{}", self.form_font_serial)
-            }
-        };
         let max_font_bytes = self.max_font_cache_bytes;
         let shared_doc = self.shared_font_doc;
 
@@ -4440,11 +4423,14 @@ impl<'a> ContentInterpreter<'a> {
                     }
                     overrides.insert(name.0.clone(), unique_name);
                 }
-                PdfObject::Dict(_) => {
-                    // Inline font dict: always scope it. Sibling forms at the
-                    // same depth may reuse the name for a different dict, and
-                    // keying by depth+name made the first one win.
-                    let target = format!("__form{}_{}_{}", scope, form_depth, name.0);
+                PdfObject::Dict(font_dict) => {
+                    // Inline font dict: key the slot by the dictionary itself.
+                    // Sibling forms and tiling patterns reuse resource names
+                    // for different inline dicts (a name or depth key let the
+                    // first one win); a content key tells them apart, yet stays
+                    // stable across repeated paints and across interpreters
+                    // sharing one FontCache.
+                    let target = format!("__inline_font_{:016x}", inline_font_key(font_dict));
                     overrides.insert(name.0.clone(), target.clone());
                     if fc.get_by_name(&target).is_none() {
                         if let Err(e) = load_into(fc, &target) {
@@ -4915,7 +4901,7 @@ impl<'a> ContentInterpreter<'a> {
 
         // Pattern /Resources and fonts shadow the page's for the cell body,
         // exactly like a form XObject's.
-        self.load_form_fonts(&def.dict, file, None);
+        self.load_form_fonts(&def.dict, file);
         let own_resources = def
             .dict
             .get("Resources")
@@ -6107,6 +6093,15 @@ fn load_font_ref(
         .ok_or_else(|| font_cache_full(max_bytes))
 }
 
+/// Content key for an inline font dictionary: the same dictionary always
+/// maps to the same font-cache slot, different ones (almost surely) do not.
+fn inline_font_key(font_dict: &zpdf_core::PdfDict) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    format!("{font_dict:?}").hash(&mut hasher);
+    hasher.finish()
+}
+
 fn font_cache_full(max_bytes: u64) -> zpdf_core::Error {
     zpdf_core::Error::StreamDecode(format!(
         "font cache byte limit ({max_bytes}) or ID capacity reached"
@@ -6520,6 +6515,28 @@ mod tests {
             points,
             vec![(0.0, 90.0), (0.0, 100.0), (10.0, 90.0), (10.0, 100.0)]
         );
+    }
+
+    #[test]
+    fn every_quarter_turn_maps_an_offset_box_onto_the_rotated_rect() {
+        // A full-box fill must land exactly on the rotated page rect, whatever
+        // the box origin, for every quarter turn (incl. normalised values).
+        let page = Rect::new(10.0, 20.0, 110.0, 220.0);
+        for rotate in [90, 180, 270, -90, 450] {
+            let dl = ContentInterpreter::new(page)
+                .with_page_rotation(rotate)
+                .interpret(b"10 20 100 200 re f");
+            let RenderCommand::FillPath { path, .. } = &dl.commands[0] else {
+                panic!("expected fill");
+            };
+            let r = dl.page_rect;
+            assert_eq!((r.x0, r.y0), (0.0, 0.0), "rotate {rotate}");
+            for p in path.points() {
+                let on_x = (p.x - r.x0).abs() < 1e-9 || (p.x - r.x1).abs() < 1e-9;
+                let on_y = (p.y - r.y0).abs() < 1e-9 || (p.y - r.y1).abs() < 1e-9;
+                assert!(on_x && on_y, "rotate {rotate}: {p:?} not a corner of {r:?}");
+            }
+        }
     }
 
     #[test]
