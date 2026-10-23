@@ -331,6 +331,9 @@ impl IncrementalWriter {
         if certificate_der.is_empty() {
             return Err(invalid_data("certificate must not be empty").into());
         }
+        // Parse the signer identifier first, so a malformed certificate fails
+        // before any timestamp request is made.
+        let sid = signer_identifier(certificate_der)?;
 
         // --- 1. The signature dictionary, as a raw body with placeholders.
         let field_name = options.field_name.as_deref().unwrap_or("Signature1");
@@ -627,7 +630,6 @@ impl IncrementalWriter {
             None
         };
 
-        let sid = signer_identifier(certificate_der)?;
         let cms = build_cms(
             certificate_der,
             &sid,
@@ -912,7 +914,8 @@ fn tlv_split(bytes: &[u8]) -> Option<(u8, &[u8])> {
         }
         (l, 2 + n)
     };
-    let content = bytes.get(header..header + len)?;
+    // checked: a 4-byte length overflows `usize` on 32-bit targets (wasm32).
+    let content = bytes.get(header..header.checked_add(len)?)?;
     Some((tag, content))
 }
 
@@ -1053,6 +1056,7 @@ mod tests {
         let mut pos = 0;
         let (tag, content, _) = take_tlv(&sid, &mut pos).expect("sid SEQUENCE");
         assert_eq!(tag, SEQ);
+        assert_eq!(pos, sid.len(), "nothing follows the SID SEQUENCE");
         let mut inner = 0;
         let (tag, _, issuer_der) = take_tlv(content, &mut inner).expect("issuer");
         assert_eq!(tag, SEQ);
@@ -1060,11 +1064,29 @@ mod tests {
         let (tag, _, serial_der) = take_tlv(content, &mut inner).expect("serial");
         assert_eq!(tag, INT);
         assert_eq!(serial_der, der(INT, &[0x2a]).as_slice());
+        assert_eq!(inner, content.len(), "SID holds exactly issuer + serial");
+
+        // A v1 certificate has no [0] version: the serial comes first.
+        let v1_tbs = der(
+            SEQ,
+            &[
+                der(INT, &[0x07]),
+                der(SEQ, &der(OID, &[0x2a])),
+                issuer.clone(),
+            ]
+            .concat(),
+        );
+        let v1 = der(SEQ, &[v1_tbs, der(SEQ, &[])].concat());
+        let sid = signer_identifier(&v1).expect("v1 certificate");
+        assert_eq!(sid, der(SEQ, &[issuer, der(INT, &[0x07])].concat()));
     }
 
     #[test]
     fn signer_identifier_rejects_non_certificate_der() {
         assert!(signer_identifier(b"not a certificate").is_err());
         assert!(signer_identifier(&der(SEQ, &[])).is_err());
+        // Indefinite and oversized lengths are rejected, not trusted.
+        assert!(signer_identifier(&[SEQ, 0x80, 0x00, 0x00]).is_err());
+        assert!(signer_identifier(&[SEQ, 0x84, 0xff, 0xff, 0xff, 0xff, 0x00]).is_err());
     }
 }
