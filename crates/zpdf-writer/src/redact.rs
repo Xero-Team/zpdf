@@ -27,9 +27,9 @@
 //!
 //! The tracker mirrors just enough interpreter state to place operators in
 //! user space: `cm` (CTM with q/Q stack), `BT`/`ET`, `Tm`/`Td`/`TD`/`T*`/`TL`,
-//! font size for a conservative glyph-height estimate. Precise glyph metrics
-//! are not needed — the extent estimate errs wider (more redaction), never
-//! narrower.
+//! font size for a glyph-height estimate. Text extents are approximate: custom
+//! widths, spacing and writing modes can differ from this tracker. Inspect
+//! extracted text and rendered output before distributing sensitive documents.
 
 use std::collections::HashSet;
 use std::io::Cursor;
@@ -998,8 +998,8 @@ fn rect_extent(rect: Rect, ctm: &Matrix) -> Rect {
     r
 }
 
-/// Conservative width estimate for a shown string: 0.55 em per byte (wider
-/// than most body fonts average, so extents err on the redacting side).
+/// Approximate width of a shown string: 0.55 em per byte. This is not a
+/// conservative bound for arbitrary PDF fonts or text-state settings.
 fn estimate_text_width(operands: &[PdfObject], font_size: f64) -> f64 {
     let mut units = 0.0f64;
     for obj in operands {
