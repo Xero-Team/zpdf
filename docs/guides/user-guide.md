@@ -410,18 +410,16 @@ scanned images.
 
 ## Known limitations
 
-- **Tiling patterns** (hatches/textures) paint a neutral gray placeholder.
-- **ExtGState soft masks** (vignettes, gradient-faded groups) are ignored.
-- **Non-embedded CJK fonts** render no glyphs yet (embedded fonts are fine).
+- **Non-embedded CJK fonts** need suitable system fonts or a registered
+  `FontProvider`; portable deployments should supply their own font pack.
 - **Annotation appearances** are synthesized for most markup/geometric subtypes
   when absent, but some fidelity trade-offs remain: a `Redact` mark shows the
   *marked* region (content is never actually removed, and `/OverlayText` is not
   drawn); a `Caret` does not distinguish the `/Sy` paragraph variant; rotated /
   skewed text-markup uses an axis-aligned approximation. The PDF 2.0 `Projection`
   subtype has no synthesized default appearance.
-- **JBIG2 / JPEG-2000** compressed images are skipped.
-- **Password-protected PDFs** (non-empty user password) won't decrypt — there
-  is no password prompt/API yet.
+- **PDF/A conversion** is best-effort; validate archival output with an
+  independent conformance checker such as veraPDF.
 - **Dense CJK text** can differ from the CPU renderer by ~1–1.4% of pixels at threshold
   16 (anti-aliasing only — the text is correct). It passes at threshold ~24–32.
 
@@ -431,6 +429,6 @@ scanned images.
 | --- | --- |
 | `--backend wgpu requires building with --features gpu` | Rebuild with `--features gpu`. |
 | GPU render errors with "no compatible GPU adapter found" | No usable GPU. Use `--backend cpu`, or set `ZPDF_GPU_FORCE_FALLBACK=1` if a software adapter (e.g. lavapipe/WARP) is installed. |
-| Encrypted PDF renders blank | A non-empty user password is required to open it; only empty-password (owner-locked) decryption is supported. |
-| Blank image areas on a scanned PDF | The images may be JBIG2 or JPEG-2000 compressed — not yet supported, see [CHANGELOG.md](../CHANGELOG.md). |
+| Encrypted PDF cannot open | Supply `--password=<pw>`; non-empty user and owner passwords are supported. |
+| Blank image areas on a scanned PDF | JBIG2 and JPEG-2000 are supported; inspect diagnostics for corrupt image data or a resource limit. |
 | Output size differs by 1px from an old golden image | Raster dims now use `ceil` (matches pdfium); re-bless goldens. |

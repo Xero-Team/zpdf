@@ -237,9 +237,9 @@ fn rasterize_mesh(triangles: &[MeshTriangle], region: Rect, w: u32, h: u32) -> O
         scanned = scanned.saturating_add(raster_triangle(&mut buf, w, h, tri, &to_px));
         if scanned > budget {
             tracing::warn!(
-                "mesh shading scanned over {MESH_COVERAGE_BUDGET}x its raster; truncating"
+                "mesh shading scanned over {MESH_COVERAGE_BUDGET}x its raster; dropping"
             );
-            break;
+            return None;
         }
     }
     Some(buf)
@@ -528,8 +528,7 @@ mod tests {
             extend_end: false,
             to_page: Matrix::identity(),
         };
-        let buf = rasterize(&def, Rect::new(0.0, 0.0, 1.0, 1.0), 16, 16).unwrap();
-        assert_eq!(&buf[..4], &[255, 0, 0, 255]);
+        assert!(rasterize(&def, Rect::new(0.0, 0.0, 1.0, 1.0), 16, 16).is_none());
     }
 
     #[test]

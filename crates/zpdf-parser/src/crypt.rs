@@ -305,9 +305,19 @@ impl Decryptor {
                 // are detectable here (we don't know if this object is the
                 // catalog's /Metadata target) — that covers conforming files.
                 let plain_meta = !self.encrypt_metadata && typ == "Metadata";
-                let algo = self.stream_algo(&s.dict);
+                let (algo, explicit) = self.stream_algo(&s.dict);
                 if !is_xref && !plain_meta && algo != Algo::Identity {
-                    let dec = self.decrypt(id, &s.data, algo);
+                    // An explicit /Crypt uses the security handler's key as
+                    // is, without Algorithm 1 (ISO 32000-1 section 7.4.10).
+                    let dec = if explicit {
+                        match algo {
+                            Algo::Rc4 => rc4(&self.key, &s.data),
+                            Algo::AesV2 | Algo::AesV3 => aes_cbc_decrypt(&self.key, &s.data),
+                            Algo::Identity => unreachable!(),
+                        }
+                    } else {
+                        self.decrypt(id, &s.data, algo)
+                    };
                     s.data = Arc::from(dec);
                 }
                 for v in s.dict.0.values_mut() {
@@ -323,7 +333,7 @@ impl Decryptor {
     /// leading `/Crypt` filter names (`/DecodeParms /Name`, default
     /// `Identity` — ISO 32000-1 §7.4.10), else `/EFF` for an embedded file,
     /// else `/StmF`.
-    fn stream_algo(&self, dict: &PdfDict) -> Algo {
+    fn stream_algo(&self, dict: &PdfDict) -> (Algo, bool) {
         let first_filter = match dict.get("Filter") {
             Some(PdfObject::Name(n)) => Some(n.as_str()),
             Some(PdfObject::Array(a)) => a.first().and_then(|f| f.as_name().ok()),
@@ -339,18 +349,19 @@ impl Decryptor {
                 .and_then(|p| p.get_name("Name").ok())
                 .unwrap_or("Identity");
             if name == "Identity" {
-                return Algo::Identity;
+                return (Algo::Identity, true);
             }
-            return self
+            let algo = self
                 .crypt_filters
                 .iter()
                 .find(|(n, _)| n == name)
                 .map_or(self.stm_algo, |&(_, algo)| algo);
+            return (algo, true);
         }
         if dict.get_name("Type").ok() == Some("EmbeddedFile") {
-            return self.eff_algo;
+            return (self.eff_algo, false);
         }
-        self.stm_algo
+        (self.stm_algo, false)
     }
 
     /// Per-object key derivation (Algorithm 1) + cipher application.
@@ -1284,6 +1295,69 @@ mod tests {
             PdfObject::Name(PdfName::new("EmbeddedFile")),
         );
         assert_eq!(&decrypted(embedded).data[..], b"payload", "/EFF Identity");
+    }
+
+    #[test]
+    fn explicit_crypt_uses_the_file_key_without_object_derivation() {
+        for algo in [Algo::Rc4, Algo::AesV2, Algo::AesV3] {
+            let dec = Decryptor {
+                key: vec![42; if algo == Algo::AesV3 { 32 } else { 16 }],
+                stm_algo: algo,
+                str_algo: algo,
+                eff_algo: algo,
+                crypt_filters: vec![("StdCF".into(), algo)],
+                encrypt_id: None,
+                encrypt_metadata: true,
+            };
+            let plain = b"explicit crypt payload";
+            let encrypted = match algo {
+                Algo::Rc4 => rc4(&dec.key, plain),
+                _ => aes_cbc_encrypt(&dec.key, plain).unwrap(),
+            };
+            let mut parms = PdfDict::new();
+            parms.insert(PdfName::new("Name"), PdfObject::Name(PdfName::new("StdCF")));
+            for array in [false, true] {
+                let mut dict = PdfDict::new();
+                let filter = PdfObject::Name(PdfName::new("Crypt"));
+                let params = PdfObject::Dict(parms.clone());
+                dict.insert(
+                    PdfName::new("Filter"),
+                    if array {
+                        PdfObject::Array(vec![filter])
+                    } else {
+                        filter
+                    },
+                );
+                dict.insert(
+                    PdfName::new("DecodeParms"),
+                    if array {
+                        PdfObject::Array(vec![params])
+                    } else {
+                        params
+                    },
+                );
+                for id in [ObjectId(9, 0), ObjectId(512, 2)] {
+                    let mut obj =
+                        PdfObject::Stream(PdfStream::new(dict.clone(), encrypted.clone()));
+                    dec.decrypt_object(&mut obj, id);
+                    let PdfObject::Stream(stream) = obj else {
+                        panic!("stream")
+                    };
+                    assert_eq!(&*stream.data, plain);
+                }
+            }
+            let id = ObjectId(9, 0);
+            let encrypted = dec.try_encrypt_stream_bytes(id, plain).unwrap();
+            let mut obj = PdfObject::Stream(PdfStream::new(PdfDict::new(), encrypted));
+            dec.decrypt_object(&mut obj, id);
+            let PdfObject::Stream(stream) = obj else {
+                panic!("stream")
+            };
+            assert_eq!(
+                &*stream.data, plain,
+                "implicit filters still use Algorithm 1"
+            );
+        }
     }
 
     /// With streams and strings in the clear, the attachment filter alone sets

@@ -393,11 +393,6 @@ impl PdfFunction {
                 let [d0, d1] = self.domain[0];
                 // Select sub-function k: x in [bounds[k-1], bounds[k]).
                 let mut k = bounds.partition_point(|&b| b <= x);
-                // Domain edge: x == Domain0 belongs to the first interval even
-                // if bounds[0] == Domain0.
-                if x <= d0 {
-                    k = 0;
-                }
                 k = k.min(functions.len() - 1);
                 // Domain end: intervals starting at Domain1 (bounds clamped
                 // onto it) are empty, so x ends the last non-empty one.
@@ -1230,6 +1225,23 @@ mod tests {
         // The clamped bound leaves an empty last interval at Domain1: the end
         // of the domain is the end of the first ramp, not the second's start.
         assert!((f.eval(&[1.0]).unwrap()[0] - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn stitching_skips_empty_leading_intervals() {
+        for bound in [0.0, -0.000_000_1] {
+            let d = dict(vec![
+                ("FunctionType", PdfObject::Integer(3)),
+                ("Domain", arr(&[0.0, 1.0])),
+                ("Functions", PdfObject::Array(vec![ramp(), ramp(), ramp()])),
+                ("Bounds", arr(&[bound, bound])),
+                ("Encode", arr(&[0.0, 1.0, 0.0, 1.0, 1.0, 0.0])),
+            ]);
+            let f = PdfFunction::parse(&d, None, &mut no_resolve()).unwrap();
+            assert_eq!(f.eval(&[0.0]).unwrap(), vec![1.0]);
+            assert_eq!(f.eval(&[-1.0]).unwrap(), vec![1.0]);
+            assert_eq!(f.eval(&[0.5]).unwrap(), vec![0.5]);
+        }
     }
 
     #[test]
