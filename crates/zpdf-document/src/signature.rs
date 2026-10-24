@@ -437,7 +437,7 @@ fn parse_byte_range(file: &PdfFile, sig: &PdfDict, file_len: usize) -> (ByteRang
                 arr.len()
             );
         }
-        for pair in arr.chunks_exact(2).take(MAX_BYTE_RANGE_PAIRS) {
+        for pair in arr.as_chunks::<2>().0.iter().take(MAX_BYTE_RANGE_PAIRS) {
             let numbers = match (deref(file, &pair[0]), deref(file, &pair[1])) {
                 (PdfObject::Integer(off), PdfObject::Integer(len)) => {
                     usize::try_from(off).ok().zip(usize::try_from(len).ok())
