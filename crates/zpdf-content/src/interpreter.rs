@@ -262,12 +262,14 @@ struct TileMaskReuse {
 
 /// What a soft mask built at a `gs` depends on: the ExtGState object, and the
 /// graphics state the mask group starts from — its CTM (and the pattern
-/// anchor), the inherited colours and line width the group may paint with
-/// unset, and the resource scope it falls back to.
+/// anchor), the clip bounds its `/BBox` and shadings are cut to, the inherited
+/// colours and line width the group may paint with unset, and the resource
+/// scope it falls back to.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct SoftMaskCacheKey {
     gs_id: ObjectId,
     matrices: [u64; 12],
+    clip: Option<[u64; 4]>,
     paint: [u32; 9],
     resource_depth: usize,
 }
@@ -882,19 +884,22 @@ impl<'a> ContentInterpreter<'a> {
         }
         let rect = self.display_list.page_rect;
         let (w, h) = (rect.width(), rect.height());
+        let (x0, y0) = (rect.x0, rect.y0);
         // Matrix::new(a,b,c,d,e,f) maps (x,y) -> (a*x+c*y+e, b*x+d*y+f). Each
         // turn maps the W×H page into the rotated box with origin bottom-left.
+        // Translate the effective-box origin to zero as part of the rotation;
+        // otherwise a CropBox/MediaBox whose origin is not (0,0) is shifted.
         let (base, rotated) = match r {
             90 => (
-                Matrix::new(0.0, -1.0, 1.0, 0.0, 0.0, w),
+                Matrix::new(0.0, -1.0, 1.0, 0.0, -y0, w + x0),
                 Rect::new(0.0, 0.0, h, w),
             ),
             180 => (
-                Matrix::new(-1.0, 0.0, 0.0, -1.0, w, h),
+                Matrix::new(-1.0, 0.0, 0.0, -1.0, w + x0, h + y0),
                 Rect::new(0.0, 0.0, w, h),
             ),
             270 => (
-                Matrix::new(0.0, 1.0, -1.0, 0.0, h, 0.0),
+                Matrix::new(0.0, 1.0, -1.0, 0.0, h + y0, -x0),
                 Rect::new(0.0, 0.0, h, w),
             ),
             _ => return self,
@@ -1101,9 +1106,11 @@ impl<'a> ContentInterpreter<'a> {
         }
 
         // Annotation appearances render independently of wherever the page
-        // content stream left the graphics state (12.5.5): rebalance any
-        // unclosed q-levels and top-level W clips, then reset to the page's
-        // initial state (an unbalanced BDC /OC must not blank annotations).
+        // content stream left the graphics state (12.5.5): drop a `W` never
+        // painted, rebalance any unclosed q-levels and top-level W clips, then
+        // reset to the page's initial state (an unbalanced BDC /OC must not
+        // blank annotations).
+        self.pending_clip = None;
         while self.state_stack.len() > self.state_floor {
             for _ in 0..self.current.clip_depth {
                 self.display_list.push(RenderCommand::PopClip);
@@ -3368,6 +3375,10 @@ impl<'a> ContentInterpreter<'a> {
                     base.e, base.f,
                 ]
                 .map(f64::to_bits),
+                clip: self
+                    .current
+                    .clip_bounds
+                    .map(|r| [r.x0, r.y0, r.x1, r.y1].map(f64::to_bits)),
                 paint: [
                     fill.r,
                     fill.g,
@@ -3665,6 +3676,9 @@ impl<'a> ContentInterpreter<'a> {
             intent,
         );
         let colorspace = self.colormanage_cmyk_image(colorspace);
+        let smask_ref = stream.dict.get_ref("SMask").ok();
+        // A soft mask's `/Matte` is a colour in this space.
+        let matte_colorspace = smask_ref.and_then(|_| colorspace.clone());
         let mut image = match zpdf_image::decode_image_xobject_resolved_with_limits(
             &decoded_data,
             &image_dict,
@@ -3683,8 +3697,14 @@ impl<'a> ContentInterpreter<'a> {
         // predictors, any bpc, /Decode — and its gray level becomes the alpha.
         // /Mask as a stream ref is a 1-bpc stencil; /Mask colour-key arrays
         // were already handled inside decode_image_xobject_resolved.
-        if let Ok(smask_ref) = stream.dict.get_ref("SMask") {
-            fold_soft_mask(&mut image, smask_ref, file, &self.parse_limits);
+        if let Some(smask_ref) = smask_ref {
+            fold_soft_mask(
+                &mut image,
+                smask_ref,
+                matte_colorspace.as_ref(),
+                file,
+                &self.parse_limits,
+            );
         } else if let Ok(mask_ref) = stream.dict.get_ref("Mask") {
             fold_stencil_mask(&mut image, mask_ref, file, &self.parse_limits);
         }
@@ -4214,6 +4234,11 @@ impl<'a> ContentInterpreter<'a> {
         }
 
         self.form_depth += 1;
+        // A pending `W` belongs to the stream that set it: the invoking
+        // stream's waits for its own painting operator (a pattern fill runs
+        // this form while painting), and one the form leaves unpainted ends
+        // with the form.
+        let outer_clip = self.pending_clip.take();
         let tokenizer = ContentTokenizer::new(&decoded);
         for token in tokenizer {
             if self.over_budget() {
@@ -4235,6 +4260,7 @@ impl<'a> ContentInterpreter<'a> {
                 }
             }
         }
+        self.pending_clip = outer_clip;
         self.form_depth -= 1;
 
         // Balance: pop clips opened by any unbalanced q-levels left by the
@@ -4343,7 +4369,6 @@ impl<'a> ContentInterpreter<'a> {
             .unwrap_or_default();
 
         let mut overrides = HashMap::new();
-        let form_depth = self.form_font_overrides.len();
         let max_font_bytes = self.max_font_cache_bytes;
         let shared_doc = self.shared_font_doc;
 
@@ -4355,7 +4380,10 @@ impl<'a> ContentInterpreter<'a> {
             }
         };
 
-        for (name, obj) in &fonts.0 {
+        // Page resources are capped by MAX_RESOURCE_ENTRIES; a form's raw
+        // /Font dictionary bypasses that parser, so bound it here too.
+        const MAX_FORM_FONT_ENTRIES: usize = 65_536;
+        for (name, obj) in fonts.0.iter().take(MAX_FORM_FONT_ENTRIES) {
             // A font entry is normally an indirect reference; a synthesized
             // form-field appearance may instead carry an inline font dict.
             let load_into = |fc: &mut FontCache, target: &str| -> Result<(), zpdf_core::Error> {
@@ -4418,16 +4446,15 @@ impl<'a> ContentInterpreter<'a> {
                     }
                     overrides.insert(name.0.clone(), unique_name);
                 }
-                PdfObject::Dict(_) => {
-                    // Inline font dict: rename to avoid clobbering a same-named
-                    // page font in the shared cache.
-                    let target = if page_font_ids.contains_key(&name.0) {
-                        let unique = format!("__form{}_{}", form_depth, name.0);
-                        overrides.insert(name.0.clone(), unique.clone());
-                        unique
-                    } else {
-                        name.0.clone()
-                    };
+                PdfObject::Dict(font_dict) => {
+                    // Inline font dict: key the slot by the dictionary itself.
+                    // Sibling forms and tiling patterns reuse resource names
+                    // for different inline dicts (a name or depth key let the
+                    // first one win); a content key tells them apart, yet stays
+                    // stable across repeated paints and across interpreters
+                    // sharing one FontCache.
+                    let target = format!("__inline_font_{:016x}", inline_font_key(font_dict));
+                    overrides.insert(name.0.clone(), target.clone());
                     if fc.get_by_name(&target).is_none() {
                         if let Err(e) = load_into(fc, &target) {
                             tracing::debug!("form inline font {}: {e}", name.0);
@@ -5000,6 +5027,9 @@ impl<'a> ContentInterpreter<'a> {
                     rule: FillRule::NonZero,
                 });
 
+                // The `W` of the fill painting this pattern stays pending for
+                // it; one the cell leaves unpainted ends with the cell.
+                let outer_clip = self.pending_clip.take();
                 let tokenizer = ContentTokenizer::new(&def.content);
                 for token in tokenizer {
                     if self.over_budget() {
@@ -5021,6 +5051,7 @@ impl<'a> ContentInterpreter<'a> {
                         }
                     }
                 }
+                self.pending_clip = outer_clip;
 
                 // Rebalance clips/state left open by the cell body.
                 while self.state_stack.len() > depth_floor + 1 {
@@ -5242,6 +5273,7 @@ impl<'a> ContentInterpreter<'a> {
                     column = (column.0.min(-vx), column.1.max(-vx + width));
                     glyphs.push(PositionedGlyph {
                         glyph_id,
+                        code,
                         x: -vx,
                         y: x_offset - vy,
                         advance,
@@ -5254,6 +5286,7 @@ impl<'a> ContentInterpreter<'a> {
                     let advance = adv_units as f32 * scale_factor * h_scale;
                     glyphs.push(PositionedGlyph {
                         glyph_id,
+                        code,
                         x: x_offset,
                         y: 0.0,
                         advance,
@@ -5298,6 +5331,7 @@ impl<'a> ContentInterpreter<'a> {
                 previous = Some((byte, (glyph_id, advance)));
                 glyphs.push(PositionedGlyph {
                     glyph_id,
+                    code: code as u32,
                     x: x_offset,
                     y: 0.0,
                     advance,
@@ -6089,6 +6123,15 @@ fn load_font_ref(
         .ok_or_else(|| font_cache_full(max_bytes))
 }
 
+/// Content key for an inline font dictionary: the same dictionary always
+/// maps to the same font-cache slot, different ones (almost surely) do not.
+fn inline_font_key(font_dict: &zpdf_core::PdfDict) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    format!("{font_dict:?}").hash(&mut hasher);
+    hasher.finish()
+}
+
 fn font_cache_full(max_bytes: u64) -> zpdf_core::Error {
     zpdf_core::Error::StreamDecode(format!(
         "font cache byte limit ({max_bytes}) or ID capacity reached"
@@ -6346,9 +6389,12 @@ fn parse_image_function(
 /// Decode an image's `/SMask` through the full image-decode path (filters,
 /// predictors, any bpc, /Decode) and fold it into `image` as premultiplied
 /// alpha. Failures leave the image opaque rather than dropping it.
+/// `colorspace` is the image's resolved colour space, which a `/Matte` colour
+/// is given in (`None`: inferred from its component count).
 fn fold_soft_mask(
     image: &mut zpdf_image::DecodedImage,
     smask_ref: zpdf_core::ObjectId,
+    colorspace: Option<&zpdf_image::ResolvedColorSpace>,
     file: &PdfFile,
     limits: &ParseLimits,
 ) {
@@ -6377,12 +6423,12 @@ fn fold_soft_mask(
         limits,
     ) {
         // A `/Matte` mask means the parent's colours were pre-blended with
-        // the matte colour; read its components by count (Gray/RGB/CMYK).
+        // the matte colour.
         Ok(mask) => zpdf_image::apply_smask_image_with_matte(
             image,
             &mask,
             zpdf_image::smask_matte(&dict).as_deref(),
-            None,
+            colorspace,
         ),
         Err(e) => tracing::warn!("failed to decode /SMask image: {e}"),
     }
@@ -6484,6 +6530,46 @@ mod tests {
         let dl = ContentInterpreter::new(page_rect).interpret(content);
         assert_eq!(dl.commands.len(), 1);
         assert!(matches!(&dl.commands[0], RenderCommand::FillPath { .. }));
+    }
+
+    #[test]
+    fn rotation_accounts_for_nonzero_box_origin() {
+        let page = Rect::new(10.0, 20.0, 110.0, 220.0);
+        let dl = ContentInterpreter::new(page)
+            .with_page_rotation(90)
+            .interpret(b"10 20 10 10 re f");
+        assert_eq!(dl.page_rect, Rect::new(0.0, 0.0, 200.0, 100.0));
+        let RenderCommand::FillPath { path, .. } = &dl.commands[0] else {
+            panic!("expected fill");
+        };
+        let mut points: Vec<(f64, f64)> = path.points().iter().map(|p| (p.x, p.y)).collect();
+        points.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(
+            points,
+            vec![(0.0, 90.0), (0.0, 100.0), (10.0, 90.0), (10.0, 100.0)]
+        );
+    }
+
+    #[test]
+    fn every_quarter_turn_maps_an_offset_box_onto_the_rotated_rect() {
+        // A full-box fill must land exactly on the rotated page rect, whatever
+        // the box origin, for every quarter turn (incl. normalised values).
+        let page = Rect::new(10.0, 20.0, 110.0, 220.0);
+        for rotate in [90, 180, 270, -90, 450] {
+            let dl = ContentInterpreter::new(page)
+                .with_page_rotation(rotate)
+                .interpret(b"10 20 100 200 re f");
+            let RenderCommand::FillPath { path, .. } = &dl.commands[0] else {
+                panic!("expected fill");
+            };
+            let r = dl.page_rect;
+            assert_eq!((r.x0, r.y0), (0.0, 0.0), "rotate {rotate}");
+            for p in path.points() {
+                let on_x = (p.x - r.x0).abs() < 1e-9 || (p.x - r.x1).abs() < 1e-9;
+                let on_y = (p.y - r.y0).abs() < 1e-9 || (p.y - r.y1).abs() < 1e-9;
+                assert!(on_x && on_y, "rotate {rotate}: {p:?} not a corner of {r:?}");
+            }
+        }
     }
 
     #[test]
@@ -7490,12 +7576,14 @@ mod tests {
         let glyphs = vec![
             PositionedGlyph {
                 glyph_id: 26,
+                code: 0,
                 x: 0.0,
                 y: 0.0,
                 advance: 0.0,
             },
             PositionedGlyph {
                 glyph_id: 42,
+                code: 0,
                 x: 50.0,
                 y: 0.0,
                 advance: 0.0,
@@ -7802,6 +7890,61 @@ mod tests {
         assert_eq!(
             kinds(b"q 100 100 200 200 re W* n 0 0 400 400 re f Q"),
             ["clip", "fill", "pop"]
+        );
+    }
+
+    /// A pending `W` belongs to the stream that set it: the tiling cell its
+    /// own `f` paints must not consume it, and a form ending on `re W` must
+    /// not clip what follows the form.
+    #[test]
+    fn pending_clips_stay_in_their_own_content_stream() {
+        // Bounds of the clips still open around the last fill.
+        let clips_at_last_fill = |file: &PdfFile, resources: &ResourceDict, content: &[u8]| {
+            let list = ContentInterpreter::new(Rect::new(0.0, 0.0, 100.0, 100.0))
+                .with_document(file, resources)
+                .interpret(content);
+            let mut open = Vec::new();
+            let mut at_fill = Vec::new();
+            for command in &list.commands {
+                match command {
+                    RenderCommand::PushClip { path, .. } => {
+                        open.push(ContentInterpreter::path_bounds(path))
+                    }
+                    RenderCommand::PopClip => {
+                        open.pop();
+                    }
+                    RenderCommand::FillPath { .. } => at_fill.clone_from(&open),
+                    _ => {}
+                }
+            }
+            at_fill
+        };
+
+        let pattern = single_object_file(
+            "<< /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 10 10] \
+             /XStep 10 /YStep 10 /Resources << >> /Length 11 >>\n\
+             stream\n0 0 5 5 re f\nendstream",
+        );
+        let mut resources = ResourceDict::default();
+        resources.patterns.insert("P0".into(), ObjectId(1, 0));
+        assert_eq!(
+            clips_at_last_fill(
+                &pattern,
+                &resources,
+                b"/Pattern cs /P0 scn 0 0 50 50 re W f 0 g 0 0 100 100 re f",
+            ),
+            [Some(Rect::new(0.0, 0.0, 50.0, 50.0))]
+        );
+
+        let form = single_object_file(
+            "<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] /Length 13 >>\n\
+             stream\n0 0 10 10 re W\nendstream",
+        );
+        let mut resources = ResourceDict::default();
+        resources.xobjects.insert("Fm0".into(), ObjectId(1, 0));
+        assert_eq!(
+            clips_at_last_fill(&form, &resources, b"/Fm0 Do 0 0 100 100 re f"),
+            []
         );
     }
 

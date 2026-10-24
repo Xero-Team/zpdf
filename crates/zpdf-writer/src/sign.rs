@@ -331,6 +331,9 @@ impl IncrementalWriter {
         if certificate_der.is_empty() {
             return Err(invalid_data("certificate must not be empty").into());
         }
+        // Parse the signer identifier first, so a malformed certificate fails
+        // before any timestamp request is made.
+        let sid = signer_identifier(certificate_der)?;
 
         // --- 1. The signature dictionary, as a raw body with placeholders.
         let field_name = options.field_name.as_deref().unwrap_or("Signature1");
@@ -629,6 +632,7 @@ impl IncrementalWriter {
 
         let cms = build_cms(
             certificate_der,
+            &sid,
             &options.extra_certs,
             &options.crls,
             &signed_attrs,
@@ -699,12 +703,79 @@ fn build_signed_attrs(digest: &[u8]) -> Vec<u8> {
     [ct_attr, md_attr].concat()
 }
 
+/// Extract the certificate's `issuerAndSerialNumber` DER for the CMS
+/// SignerIdentifier (RFC 5652 §5.3). External verifiers bind the signature to
+/// a signer through this field; an empty SEQUENCE is not a valid CHOICE.
+///
+/// Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm, signature }
+/// TBSCertificate ::= SEQUENCE { [0] version OPTIONAL, serialNumber,
+///                               signature, issuer, ... }
+fn signer_identifier(cert: &[u8]) -> Result<Vec<u8>> {
+    let mut pos = 0;
+    let (tag, cert_content, _) =
+        take_tlv(cert, &mut pos).ok_or_else(|| invalid_data("malformed certificate DER"))?;
+    if tag != SEQ {
+        return Err(invalid_data("certificate is not a SEQUENCE").into());
+    }
+    let mut tbs_pos = 0;
+    let (tag, tbs, _) = take_tlv(cert_content, &mut tbs_pos)
+        .ok_or_else(|| invalid_data("certificate has no tbsCertificate"))?;
+    if tag != SEQ {
+        return Err(invalid_data("tbsCertificate is not a SEQUENCE").into());
+    }
+
+    let mut pos = 0;
+    let first = take_tlv(tbs, &mut pos).ok_or_else(|| invalid_data("tbsCertificate is empty"))?;
+    let (serial_tag, _, serial) = if first.0 == CTX0 {
+        // version [0] EXPLICIT precedes the serial number in v3 certificates.
+        take_tlv(tbs, &mut pos).ok_or_else(|| invalid_data("tbsCertificate has no serialNumber"))?
+    } else {
+        first
+    };
+    if serial_tag != INT {
+        return Err(invalid_data("tbsCertificate serialNumber is not an INTEGER").into());
+    }
+    // signature AlgorithmIdentifier, then issuer Name.
+    let _ = take_tlv(tbs, &mut pos)
+        .ok_or_else(|| invalid_data("tbsCertificate has no signature algorithm"))?;
+    let (issuer_tag, _, issuer) =
+        take_tlv(tbs, &mut pos).ok_or_else(|| invalid_data("tbsCertificate has no issuer"))?;
+    if issuer_tag != SEQ {
+        return Err(invalid_data("certificate issuer is not a Name SEQUENCE").into());
+    }
+
+    let mut body = Vec::with_capacity(issuer.len() + serial.len());
+    body.extend_from_slice(issuer);
+    body.extend_from_slice(serial);
+    Ok(der(SEQ, &body))
+}
+
+/// (tag, content, full TLV) of the DER element at `*pos`, advancing `pos`.
+fn take_tlv<'a>(bytes: &'a [u8], pos: &mut usize) -> Option<(u8, &'a [u8], &'a [u8])> {
+    let rest = bytes.get(*pos..)?;
+    let len_byte = *rest.get(1)?;
+    let header = if len_byte < 0x80 {
+        2
+    } else {
+        2 + (len_byte & 0x7f) as usize
+    };
+    let total = tlv_total_len(rest);
+    if total < header || total > rest.len() {
+        return None;
+    }
+    let (tag, content) = tlv_split(rest)?;
+    *pos += total;
+    Some((tag, content, &rest[..total]))
+}
+
 /// Build the detached CMS `SignedData` over `digest` (the SHA-256 of the
 /// signed byte ranges), embedding the signer cert plus any `extra_certs`
 /// (chain) and `crls`, carrying pre-computed `signed_attrs` and `signature`,
 /// and an optional `unsigned_attrs` (RFC 3161 timestamp token).
+#[allow(clippy::too_many_arguments)]
 fn build_cms(
     signer_cert: &[u8],
+    sid: &[u8],
     extra_certs: &[Vec<u8>],
     crls: &[Vec<u8>],
     signed_attrs: &[u8],
@@ -734,7 +805,7 @@ fn build_cms(
 
     let mut signer_info_fields = vec![
         der(INT, &[1]),
-        der(SEQ, &[]), // sid: not read by verifiers that scan by OID
+        sid.to_vec(), // issuerAndSerialNumber
         digest_alg.clone(),
         der(CTX0, signed_attrs), // signedAttrs [0] IMPLICIT
         der(SEQ, &der(OID, sig_alg_oid)),
@@ -843,7 +914,8 @@ fn tlv_split(bytes: &[u8]) -> Option<(u8, &[u8])> {
         }
         (l, 2 + n)
     };
-    let content = bytes.get(header..header + len)?;
+    // checked: a 4-byte length overflows `usize` on 32-bit targets (wasm32).
+    let content = bytes.get(header..header.checked_add(len)?)?;
     Some((tag, content))
 }
 
@@ -943,5 +1015,78 @@ fn escape_appearance_text(s: &str, out: &mut Vec<u8>) {
             b'\r' => out.extend_from_slice(b"\\r"),
             _ => out.push(b),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn signer_identifier_uses_tbs_issuer_and_serial() {
+        let issuer = der(
+            SEQ,
+            &der(
+                SET,
+                &der(
+                    SEQ,
+                    &[der(OID, &[0x55, 0x04, 0x03]), der(0x0c, b"CA")].concat(),
+                ),
+            ),
+        );
+        let tbs = der(
+            SEQ,
+            &[
+                der(0xa0, &der(INT, &[2])), // version v3
+                der(INT, &[0x2a]),          // serialNumber
+                der(SEQ, &der(OID, &[0x2a])),
+                issuer.clone(),
+                der(SEQ, &[]), // validity
+                der(SEQ, &[]), // subject
+                der(SEQ, &[]), // subjectPublicKeyInfo
+            ]
+            .concat(),
+        );
+        let cert = der(
+            SEQ,
+            &[tbs, der(SEQ, &der(OID, &[0x2a])), der(0x03, &[0x00, 0x00])].concat(),
+        );
+
+        let sid = signer_identifier(&cert).expect("parse certificate");
+        let mut pos = 0;
+        let (tag, content, _) = take_tlv(&sid, &mut pos).expect("sid SEQUENCE");
+        assert_eq!(tag, SEQ);
+        assert_eq!(pos, sid.len(), "nothing follows the SID SEQUENCE");
+        let mut inner = 0;
+        let (tag, _, issuer_der) = take_tlv(content, &mut inner).expect("issuer");
+        assert_eq!(tag, SEQ);
+        assert_eq!(issuer_der, issuer.as_slice());
+        let (tag, _, serial_der) = take_tlv(content, &mut inner).expect("serial");
+        assert_eq!(tag, INT);
+        assert_eq!(serial_der, der(INT, &[0x2a]).as_slice());
+        assert_eq!(inner, content.len(), "SID holds exactly issuer + serial");
+
+        // A v1 certificate has no [0] version: the serial comes first.
+        let v1_tbs = der(
+            SEQ,
+            &[
+                der(INT, &[0x07]),
+                der(SEQ, &der(OID, &[0x2a])),
+                issuer.clone(),
+            ]
+            .concat(),
+        );
+        let v1 = der(SEQ, &[v1_tbs, der(SEQ, &[])].concat());
+        let sid = signer_identifier(&v1).expect("v1 certificate");
+        assert_eq!(sid, der(SEQ, &[issuer, der(INT, &[0x07])].concat()));
+    }
+
+    #[test]
+    fn signer_identifier_rejects_non_certificate_der() {
+        assert!(signer_identifier(b"not a certificate").is_err());
+        assert!(signer_identifier(&der(SEQ, &[])).is_err());
+        // Indefinite and oversized lengths are rejected, not trusted.
+        assert!(signer_identifier(&[SEQ, 0x80, 0x00, 0x00]).is_err());
+        assert!(signer_identifier(&[SEQ, 0x84, 0xff, 0xff, 0xff, 0xff, 0x00]).is_err());
     }
 }

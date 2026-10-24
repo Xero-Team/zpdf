@@ -220,13 +220,15 @@ enum ImageDefKey {
 }
 
 /// Identity of a soft-mask def: the shared mask list plus the parameters
-/// written around it.
+/// written around it, and the nesting depth it was written at (masks nested
+/// past [`MAX_MASK_DEPTH`] are left out of it).
 #[derive(PartialEq, Eq, Hash)]
 struct MaskDefKey {
     commands: *const DisplayList,
     kind: SoftMaskKind,
     offset: [u32; 2],
     backdrop_luma: u32,
+    depth: u8,
 }
 
 /// An interpreted Type 3 glyph procedure.
@@ -542,6 +544,7 @@ impl SvgWriter<'_> {
             kind: mask.kind,
             offset: [mask.offset.0.to_bits(), mask.offset.1.to_bits()],
             backdrop_luma: mask.backdrop_luma.to_bits(),
+            depth,
         };
         if let Some(&id) = self.mask_defs.get(&key) {
             return Some(id);
@@ -1510,6 +1513,63 @@ mod tests {
         assert_eq!(svg.matches("<g ").count(), svg.matches("</g>").count());
     }
 
+    /// A mask first written too deep to include its own nested mask must not
+    /// stand in for the complete mask at a shallower use.
+    #[test]
+    fn mask_def_written_at_the_depth_limit_is_not_reused_shallower() {
+        let fill = |color: Color| RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 10.0, 10.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(color),
+            alpha: 1.0,
+            overprint: None,
+        };
+        let masked = |mask: SoftMask, inner: RenderCommand| {
+            [
+                RenderCommand::PushBlendGroup {
+                    blend_mode: BlendMode::Normal,
+                    isolated: false,
+                    knockout: false,
+                    bounds: Rect::new(0.0, 0.0, 10.0, 10.0),
+                    alpha: 1.0,
+                    mask: Some(mask),
+                },
+                inner,
+                RenderCommand::PopBlendGroup,
+            ]
+        };
+        let soft_mask = |commands: Vec<RenderCommand>| {
+            let mut list = page();
+            commands.into_iter().for_each(|c| list.push(c));
+            SoftMask {
+                kind: SoftMaskKind::Luminosity,
+                commands: std::sync::Arc::new(list),
+                offset: (0.0, 0.0),
+                backdrop_luma: 0.0,
+                transfer: None,
+            }
+        };
+        let leaf = soft_mask(vec![fill(Color::rgb(0.2, 0.4, 0.6))]);
+        let shared = soft_mask(masked(leaf, fill(Color::black())).to_vec());
+        // `shared` first at depth MAX_MASK_DEPTH - 1, where `leaf` is dropped.
+        let mut deep = shared.clone();
+        for _ in 0..MAX_MASK_DEPTH - 1 {
+            deep = soft_mask(masked(deep, fill(Color::black())).to_vec());
+        }
+        let mut dl = page();
+        for c in masked(deep, fill(Color::black()))
+            .into_iter()
+            .chain(masked(shared, fill(Color::black())))
+        {
+            dl.push(c);
+        }
+        let svg = to_svg(&dl);
+        assert!(
+            svg.contains("#336699"),
+            "the shallow use includes leaf: {svg}"
+        );
+    }
+
     #[test]
     fn skipped_clip_keeps_pop_balanced_and_outer_clip_in_force() {
         let mut dl = page();
@@ -1638,6 +1698,7 @@ mod tests {
             font_size: 12.0,
             glyphs: vec![PositionedGlyph {
                 glyph_id: 1,
+                code: 0,
                 x: 0.0,
                 y: 0.0,
                 advance: 6.0,

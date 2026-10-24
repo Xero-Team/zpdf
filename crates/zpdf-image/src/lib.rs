@@ -369,6 +369,25 @@ pub fn decode_image_xobject_resolved_with_limits(
     colorspace: Option<ResolvedColorSpace>,
     limits: &ParseLimits,
 ) -> Result<DecodedImage> {
+    // JPEG 2000 first: the codestream carries its own dimensions, colour
+    // space, bit depth and alpha, and /ColorSpace + /BitsPerComponent may
+    // legally be absent from the dict (spec 7.4.9). A present /ColorSpace
+    // overrides the codestream's colour declaration, so infer it here rather
+    // than after this branch. A stencil mask is never JPX-coded (its samples
+    // are 1-bit and may happen to start with a JPEG 2000 signature), so it
+    // keeps its own path below.
+    if !is_image_mask(dict) && is_jpx_encoded(dict, decoded_data) {
+        let cs = colorspace.or_else(|| {
+            dict.get("ColorSpace")
+                .is_some()
+                .then(|| infer_colorspace(dict))
+        });
+        if let Some(cs) = &cs {
+            cs.validate(0)?;
+        }
+        return decode_jpx_image(decoded_data, dict, cs.as_ref(), limits.max_image_pixels);
+    }
+
     let width_value = dict.get_i64("Width")?;
     let height_value = dict.get_i64("Height")?;
     let width = u32::try_from(width_value)
@@ -379,44 +398,28 @@ pub fn decode_image_xobject_resolved_with_limits(
         .ok()
         .filter(|&v| v != 0)
         .ok_or_else(|| Error::StreamDecode(format!("invalid image Height {height_value}")))?;
-
-    // Bound the RGBA allocation (4 bytes/pixel) before dispatching to any image
-    // path, including the 1-bpp stencil below.
-    if (width as u64).saturating_mul(height as u64) > limits.max_image_pixels {
-        return Err(Error::StreamDecode(format!(
-            "image {width}x{height} exceeds the {}-pixel limit",
-            limits.max_image_pixels
-        )));
-    }
+    let pixel_count = (width as u64).saturating_mul(height as u64);
 
     // Stencil mask: 1 bpc, paints `fill_rgb` where the sample selects the page
     // (default /Decode [0 1] → sample 0 paints; [1 0] inverts).
     if is_image_mask(dict) {
+        if pixel_count > limits.max_image_pixels {
+            return Err(Error::StreamDecode(format!(
+                "image {width}x{height} exceeds the {}-pixel limit",
+                limits.max_image_pixels
+            )));
+        }
         let invert = mask_decode_inverts(dict);
         return decode_image_mask(decoded_data, width, height, fill_rgb, invert);
-    }
-
-    if let Some(cs) = &colorspace {
-        cs.validate(0)?;
-    }
-
-    // JPEG 2000 first: the codestream carries its own dimensions, colour
-    // space, bit depth and alpha, and /ColorSpace + /BitsPerComponent may
-    // legally be absent from the dict (spec 7.4.9). A present /ColorSpace
-    // overrides the codestream's colour declaration.
-    if is_jpx_encoded(dict, decoded_data) {
-        return decode_jpx_image(
-            decoded_data,
-            dict,
-            colorspace.as_ref(),
-            limits.max_image_pixels,
-        );
     }
 
     let cs = colorspace.unwrap_or_else(|| infer_colorspace(dict));
     cs.validate(0)?;
 
     if is_dct_encoded(dict) {
+        // The JPEG's own geometry (recovered from the decoded sample length)
+        // is authoritative here, so do not reject a stale/large dict /Width ×
+        // /Height before decode_dct_image has a chance to correct it.
         return decode_dct_image(
             decoded_data,
             width,
@@ -425,6 +428,13 @@ pub fn decode_image_xobject_resolved_with_limits(
             dict,
             limits.max_image_pixels,
         );
+    }
+
+    if pixel_count > limits.max_image_pixels {
+        return Err(Error::StreamDecode(format!(
+            "image {width}x{height} exceeds the {}-pixel limit",
+            limits.max_image_pixels
+        )));
     }
 
     let bpc = bits_per_component(dict)?;
@@ -883,6 +893,17 @@ fn is_jpx_encoded(dict: &PdfDict, data: &[u8]) -> bool {
             .any(|o| matches!(o, PdfObject::Name(n) if n.as_str() == "JPXDecode")),
         _ => false,
     };
+    // Sniff only when the dict declares no filter: after an explicit
+    // non-JPX filter (FlateDecode, DCTDecode, …) the bytes are whatever that
+    // filter produced and a coincidental signature must not reroute them.
+    let declared = match dict.get("Filter") {
+        Some(PdfObject::Name(_)) => true,
+        Some(PdfObject::Array(arr)) => !arr.is_empty(),
+        _ => false,
+    };
+    if declared {
+        return filter_says;
+    }
     filter_says || data.starts_with(JP2_SIGNATURE) || data.starts_with(J2K_SOC_SIZ)
 }
 
@@ -1229,7 +1250,7 @@ fn bits_per_component(dict: &PdfDict) -> Result<u8> {
 }
 
 /// Check the post-filter sample length against the `required` bytes,
-/// returning whether the data is short and must be padded. Truncated streams
+/// returning whether the data is short (missing samples read as 0). Truncated streams
 /// are common (a writer that stopped early, a damaged Flate tail) and viewers
 /// render what is there with the missing samples read as 0; less than one
 /// full row is treated as no usable image data.
@@ -1342,14 +1363,11 @@ fn decode_raw_samples(
     let required_data = row_bytes
         .checked_mul(height as usize)
         .ok_or_else(|| Error::StreamDecode("raw samples: data size overflow".into()))?;
-    // Truncated streams are padded with zero samples rather than dropped.
-    let padded;
-    let data = if check_sample_data_len(data.len(), row_bytes, required_data)? {
-        padded = [data, &vec![0; required_data - data.len()]].concat();
-        &padded[..]
-    } else {
-        data
-    };
+    // Truncated streams are not copied or padded: the generic unpacker reads
+    // missing samples as 0. Only take the contiguous 8-bpc fast path when every
+    // row is present; otherwise it would leave the tail transparent instead of
+    // filling it with opaque black.
+    let short = check_sample_data_len(data.len(), row_bytes, required_data)?;
 
     let rgba_size = pixel_count
         .checked_mul(4)
@@ -1369,7 +1387,7 @@ fn decode_raw_samples(
     // re-reserves the output buffer *per pixel*; none of that is needed when the
     // samples already are bytes. Values come from the same LUTs and
     // `PixelColor`, so the two paths agree byte for byte.
-    if bpc == 8 && color_key.is_none() && row_bytes == width as usize * ncomp {
+    if bpc == 8 && color_key.is_none() && row_bytes == width as usize * ncomp && !short {
         // 8-bpc rows carry no padding, so pixels are contiguous. The loop is
         // monomorphized per component count, with Gray/RGB converted inline.
         let mut rgba = vec![0u8; rgba_size];
@@ -2462,6 +2480,18 @@ mod tests {
             b"\x00\x00\x00\x0C\x6A\x50\x20\x20\x0D\x0A\x87\x0Arest"
         ));
         assert!(is_jpx_encoded(&d, b"\xFF\x4F\xFF\x51rest"));
+        // An explicit non-JPX filter owns the bytes; ignore a signature that
+        // happens to appear after that filter's output.
+        let mut flate = image_dict(1, 1, 8, None);
+        flate.insert(
+            PdfName::new("Filter"),
+            PdfObject::Name(PdfName::new("FlateDecode")),
+        );
+        assert!(!is_jpx_encoded(&flate, b"\xFF\x4F\xFF\x51rest"));
+        // An empty filter array declares nothing, so sniffing still applies.
+        let mut empty = image_dict(1, 1, 8, None);
+        empty.insert(PdfName::new("Filter"), PdfObject::Array(Vec::new()));
+        assert!(is_jpx_encoded(&empty, b"\xFF\x4F\xFF\x51rest"));
         // A truncated signature box must not match.
         assert!(!is_jpx_encoded(&d, b"\x00\x00\x00\x0C\x6A\x50\x20\x20"));
         assert!(!is_jpx_encoded(&d, b"\xFF\x4F\xFF\x52"));

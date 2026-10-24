@@ -405,11 +405,22 @@ impl RecoveredObjStm {
 
         let header = &decoded[..first.min(decoded.len())];
         let mut hlex = Lexer::new(header, 0, limits);
+        // A malformed pair (or a /N larger than the pairs present) ends the
+        // header, as in `PdfFile::decode_objstm`; earlier members stay usable.
         let mut offsets = Vec::with_capacity(n.min(header.len()));
         for _ in 0..n {
-            let _num = hlex.next_token().ok()?.as_i64().ok()?;
-            let m_off = usize::try_from(hlex.next_token().ok()?.as_i64().ok()?).ok()?;
-            offsets.push(m_off);
+            let pair = (hlex.next_token(), hlex.next_token());
+            let (Ok(num_tok), Ok(offset_tok)) = pair else {
+                break;
+            };
+            let offset = offset_tok
+                .as_i64()
+                .ok()
+                .and_then(|o| usize::try_from(o).ok());
+            let (Ok(_), Some(offset)) = (num_tok.as_i64(), offset) else {
+                break;
+            };
+            offsets.push(offset);
         }
         Some(Self {
             decoded,
@@ -555,28 +566,31 @@ mod tests {
         let pages = "<< /Type /Pages /Kids [3 0 R] /Count 1 >>";
         let header = format!("1 0 2 {} ", catalog.len() + 1);
         let body = format!("{header}{catalog} {pages}");
-        let mut d = b"%PDF-1.5\n".to_vec();
-        d.extend_from_slice(
-            format!(
-                "4 0 obj\n<< /Type /ObjStm /N 2 /First {} /Length {} >>\nstream\n{body}\nendstream\nendobj\n",
-                header.len(),
-                body.len()
-            )
-            .as_bytes(),
-        );
-        d.extend_from_slice(
-            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
-        );
-        d.extend_from_slice(b"startxref\n99999\n%%EOF\n");
-        let (table, trailer) = scan_all_objects(&d, &ParseLimits::default()).unwrap();
-        assert_eq!(trailer.get_ref("Root").unwrap(), ObjectId(1, 0));
-        assert!(matches!(
-            table.get(ObjectId(2, 0)),
-            Some(XrefEntry::Compressed {
-                index_in_stream: 1,
-                ..
-            })
-        ));
+        // /N 3 overstates the two header pairs (a writer off-by-one).
+        for n in [2, 3] {
+            let mut d = b"%PDF-1.5\n".to_vec();
+            d.extend_from_slice(
+                format!(
+                    "4 0 obj\n<< /Type /ObjStm /N {n} /First {} /Length {} >>\nstream\n{body}\nendstream\nendobj\n",
+                    header.len(),
+                    body.len()
+                )
+                .as_bytes(),
+            );
+            d.extend_from_slice(
+                b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+            );
+            d.extend_from_slice(b"startxref\n99999\n%%EOF\n");
+            let (table, trailer) = scan_all_objects(&d, &ParseLimits::default()).unwrap();
+            assert_eq!(trailer.get_ref("Root").unwrap(), ObjectId(1, 0), "/N {n}");
+            assert!(matches!(
+                table.get(ObjectId(2, 0)),
+                Some(XrefEntry::Compressed {
+                    index_in_stream: 1,
+                    ..
+                })
+            ));
+        }
     }
 
     #[test]

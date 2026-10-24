@@ -72,12 +72,14 @@ pub fn decode_stream_with_limits(
     // H1 Fix: Process filter chain properly, using previous output as next input.
     // The first filter reads the raw bytes in place.
     let mut current: std::borrow::Cow<'_, [u8]> = std::borrow::Cow::Borrowed(data);
+    let mut applied = false;
     for (i, filter) in filters.iter().enumerate() {
         // A `/Crypt` filter selects the stream's cipher; the decryption it
         // names was applied when the object was resolved.
         if filter.as_str() == "Crypt" {
             continue;
         }
+        applied = true;
         let params = decode_parms[i].as_ref();
 
         // Apply filter to current data
@@ -96,6 +98,13 @@ pub fn decode_stream_with_limits(
         } else {
             decoded
         });
+    }
+
+    // An empty /Filter array or a chain containing only /Crypt applies no
+    // decoding, so the output is the raw stream and must still respect the
+    // decoded-size limit (the None branch above does the same).
+    if !applied && current.len() as u64 > limits.max_decoded_stream_bytes {
+        return Err(Error::StreamSizeLimit(limits.max_decoded_stream_bytes));
     }
 
     Ok(current.into_owned())
@@ -1137,6 +1146,22 @@ mod tests {
 
     /// The budget is charged with what a stream actually decodes to: ASCII85
     /// per decoded group (not 4x its input), a predictor only for growth.
+    #[test]
+    fn empty_filter_array_still_obeys_decoded_limit() {
+        let mut dict = PdfDict::new();
+        dict.insert(
+            PdfName::new("Filter"),
+            PdfObject::Array(vec![PdfObject::Name(PdfName::new("Crypt"))]),
+        );
+        let data = vec![0u8; 64];
+        assert!(decode_stream_with_limits(&data, &dict, &limits_with_budget(32)).is_err());
+        assert!(decode_stream_with_limits(&data, &dict, &limits_with_budget(64)).is_ok());
+
+        dict.insert(PdfName::new("Filter"), PdfObject::Array(Vec::new()));
+        assert!(decode_stream_with_limits(&data, &dict, &limits_with_budget(32)).is_err());
+        assert!(decode_stream_with_limits(&data, &dict, &limits_with_budget(64)).is_ok());
+    }
+
     #[test]
     fn decode_budget_charges_actual_output() {
         let mut dict = PdfDict::new();

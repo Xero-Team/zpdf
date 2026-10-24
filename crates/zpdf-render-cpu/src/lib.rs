@@ -3674,6 +3674,7 @@ mod tests {
             glyphs: (0..count)
                 .map(|k| PositionedGlyph {
                     glyph_id: 1,
+                    code: 0,
                     x: k as f32 * 12.0,
                     y: 0.0,
                     advance: 12.0,
@@ -3749,6 +3750,7 @@ mod tests {
             font_size: 12.0,
             glyphs: vec![PositionedGlyph {
                 glyph_id: 1,
+                code: 0,
                 x: 0.0,
                 y: 0.0,
                 advance: 12.0,

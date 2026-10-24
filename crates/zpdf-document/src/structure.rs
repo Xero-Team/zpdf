@@ -554,6 +554,13 @@ impl StructWalk<'_> {
         let raw_type = self.file_name(dict, "S").unwrap_or_default();
         let role = StructRole::from_name(&self.resolve_role(&raw_type));
 
+        // The element's own text is charged before its descendants', so they
+        // cannot spend the tree's budget out from under it.
+        let title = self.capped_text(dict, "T");
+        let lang = self.capped_text(dict, "Lang");
+        let alt = self.capped_text(dict, "Alt");
+        let actual_text = self.capped_text(dict, "ActualText");
+        let expansion = self.capped_text(dict, "E");
         let kids = normalize_kids(self.file, dict)
             .iter()
             .filter_map(|k| self.parse_kid(k, page, depth + 1))
@@ -562,11 +569,11 @@ impl StructWalk<'_> {
         Some(StructElem {
             role,
             raw_type,
-            title: self.capped_text(dict, "T"),
-            lang: self.capped_text(dict, "Lang"),
-            alt: self.capped_text(dict, "Alt"),
-            actual_text: self.capped_text(dict, "ActualText"),
-            expansion: self.capped_text(dict, "E"),
+            title,
+            lang,
+            alt,
+            actual_text,
+            expansion,
             page,
             kids,
         })
@@ -1109,6 +1116,28 @@ mod tests {
         assert!(alts.iter().all(|&n| n == MAX_TEXT_CHARS));
         assert_eq!(alts.len(), MAX_TREE_TEXT_BYTES / MAX_TEXT_CHARS);
         assert!(tree.children.last().unwrap().alt.is_none(), "budget spent");
+    }
+
+    /// A parent's text is read before its children spend the budget.
+    #[test]
+    fn parent_text_is_charged_before_its_children() {
+        const ELEMENTS: usize = 600;
+        let kids: String = (0..ELEMENTS).map(|i| format!("{} 0 R ", 7 + i)).collect();
+        let mut objs = vec![
+            "<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 4 0 R >>".to_string(),
+            PAGES.to_string(),
+            PAGE.to_string(),
+            "<< /Type /StructTreeRoot /K 6 0 R >>".to_string(),
+            format!("({})", "A".repeat(1 << 20)),
+            format!("<< /Type /StructElem /S /Sect /ActualText (parent) /K [{kids}] >>"),
+        ];
+        objs.extend((0..ELEMENTS).map(|_| "<< /Type /StructElem /S /Figure /Alt 5 0 R >>".into()));
+        let refs: Vec<&str> = objs.iter().map(String::as_str).collect();
+        let tree = open(&refs).struct_tree().expect("tree");
+
+        let parent = &tree.children[0];
+        assert_eq!(parent.actual_text.as_deref(), Some("parent"));
+        assert!(parent.kids.len() == ELEMENTS, "children are all kept");
     }
 
     #[test]

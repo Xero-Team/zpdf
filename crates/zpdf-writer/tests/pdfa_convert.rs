@@ -552,3 +552,142 @@ fn page_annot_subtypes(file: &PdfFile) -> Vec<String> {
     }
     out
 }
+
+// ---- A-1b transparency stripping across object kinds ---------------------
+
+fn object_has_key(obj: &PdfObject, key: &str) -> bool {
+    match obj {
+        PdfObject::Dict(dict) | PdfObject::Stream(zpdf_core::PdfStream { dict, .. }) => {
+            dict.get(key).is_some() || dict.0.values().any(|v| object_has_key(v, key))
+        }
+        PdfObject::Array(items) => items.iter().any(|v| object_has_key(v, key)),
+        _ => false,
+    }
+}
+
+fn converted_has_key(bytes: &[u8], key: &str) -> bool {
+    let file = PdfFile::parse(bytes.to_vec()).expect("parse converted");
+    file.all_object_ids()
+        .into_iter()
+        .filter_map(|id| file.resolve(id).ok())
+        .any(|obj| object_has_key(&obj, key))
+}
+
+#[test]
+fn a1b_strips_transparency_from_forms_extgstates_and_annotations() {
+    let objects: &[&str] = &[
+        // 1: catalog with an associated file and an XFA form.
+        "<< /Type /Catalog /Pages 2 0 R /AF [9 0 R] \
+           /AcroForm << /Fields [] /XFA 8 0 R >> >>",
+        // 2: pages root
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        // 3: page with a form, an ExtGState and an additional-action dict.
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+           /Resources << /XObject << /Fm 5 0 R >> /ExtGState << /GS 6 0 R >> >> \
+           /AA << /O 4 0 R >> >>",
+        // 4: a JavaScript additional action.
+        "<< /S /JavaScript /JS (app.alert(1)) >>",
+        // 5: Form XObject with a transparency group and a soft mask.
+        "<< /Type /XObject /Subtype /Form /BBox [0 0 10 10] /Group << /S /Transparency >> \
+           /SMask 10 0 R /Length 0 >>\nstream\n\nendstream",
+        // 6: non-opaque ExtGState with a blend mode.
+        "<< /Type /ExtGState /ca 0.5 /CA 0.5 /BM /Multiply >>",
+        // 7: image with a soft mask.
+        "<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /BitsPerComponent 8 \
+           /ColorSpace /DeviceGray /SMask 10 0 R /Length 1 >>\nstream\n\x00\nendstream",
+        // 8: XFA stream.
+        "<< /Length 0 >>\nstream\n\nendstream",
+        // 9: filespec.
+        "<< /Type /Filespec /F (a.txt) /EF << /F 8 0 R >> >>",
+        // 10: soft mask stream.
+        "<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /BitsPerComponent 8 \
+           /ColorSpace /DeviceGray /Length 1 >>\nstream\nA\nendstream",
+    ];
+    let pdf = build_pdf(objects);
+    let file = PdfFile::parse(pdf).expect("parse");
+    let converted = zpdf_writer::rewrite_pdf(
+        &file,
+        &RewriteOptions {
+            pdfa: Some(PdfaConvertConfig {
+                profile: PdfaProfile::A1b,
+                icc: None,
+                fallback_font: None,
+            }),
+            ..Default::default()
+        },
+    )
+    .expect("convert");
+
+    for key in ["Group", "SMask", "ca", "CA", "BM", "AA", "XFA", "AF"] {
+        assert!(
+            !converted_has_key(&converted, key),
+            "A-1b output still contains /{key}"
+        );
+    }
+}
+
+#[test]
+fn a1b_stripping_keeps_captions_and_default_transfer() {
+    let objects: &[&str] = &[
+        "<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [4 0 R] >> >>",
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        // 3: page with an associated file, a widget and two ExtGStates.
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [4 0 R] /AF [] \
+           /Resources << /ExtGState << /G1 5 0 R /G2 6 0 R >> >> >>",
+        // 4: push button whose caption lives in /MK /CA; the widget itself is
+        // semi-transparent (/CA 0.5).
+        "<< /Type /Annot /Subtype /Widget /FT /Btn /Ff 65536 /T (b) /Rect [0 0 50 20] \
+           /CA 0.5 /MK << /CA (Submit) >> >>",
+        "<< /Type /ExtGState /TR2 /Default >>",
+        "<< /Type /ExtGState /TR2 [/Identity /Identity /Identity /Identity] >>",
+    ];
+    let file = PdfFile::parse(build_pdf(objects)).expect("parse");
+    let converted = zpdf_writer::rewrite_pdf(
+        &file,
+        &RewriteOptions {
+            pdfa: Some(PdfaConvertConfig {
+                profile: PdfaProfile::A1b,
+                icc: None,
+                fallback_font: None,
+            }),
+            ..Default::default()
+        },
+    )
+    .expect("convert");
+    let out = PdfFile::parse(converted).expect("parse converted");
+    let dicts: Vec<zpdf_core::PdfDict> = out
+        .all_object_ids()
+        .into_iter()
+        .filter_map(|id| out.resolve(id).ok()?.as_dict().ok().cloned())
+        .collect();
+
+    let widget = dicts
+        .iter()
+        .find(|d| d.get_name("Subtype").ok() == Some("Widget"))
+        .expect("widget kept");
+    assert!(widget.get("CA").is_none(), "annotation opacity stripped");
+    let caption = match widget.get("MK") {
+        Some(PdfObject::Dict(mk)) => mk.get("CA").cloned(),
+        _ => None,
+    };
+    assert_eq!(
+        caption,
+        Some(PdfObject::String(zpdf_core::PdfString(b"Submit".to_vec()))),
+        "the /MK caption is text, not opacity"
+    );
+
+    let page = dicts
+        .iter()
+        .find(|d| d.get_name("Type").ok() == Some("Page"))
+        .expect("page");
+    assert!(page.get("AF").is_none(), "page /AF stripped");
+
+    let tr2: Vec<Option<&PdfObject>> = dicts
+        .iter()
+        .filter(|d| d.get_name("Type").ok() == Some("ExtGState"))
+        .map(|d| d.get("TR2"))
+        .collect();
+    assert_eq!(tr2.len(), 2);
+    assert!(tr2.contains(&Some(&PdfObject::Name(zpdf_core::PdfName::new("Default")))));
+    assert!(tr2.contains(&None), "a non-default /TR2 is stripped");
+}
