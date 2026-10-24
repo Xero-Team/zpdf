@@ -20,6 +20,13 @@ tracing.workspace = true
 aes.workspace = true
 cbc.workspace = true
 sha2.workspace = true
+getrandom = "0.2"
+
+# getrandom 0.2 has no entropy source on bare wasm32 unless its `js` backend
+# (crypto.getRandomValues) is enabled; without this, a wasm consumer of this
+# crate alone would not compile.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
 
 [dev-dependencies]
 # Pure-Rust LZW codec (the backend used by the `tiff`/`gif` crates). Used ONLY

@@ -179,12 +179,12 @@ pub fn rewrite_pdf(source: &PdfFile, options: &RewriteOptions) -> Result<Vec<u8>
         }
         if let Some(enc) = &encryptor {
             let new_id = ObjectId(new_num, 0);
-            enc.encrypt_strings(&mut obj, new_id);
+            enc.try_encrypt_strings(&mut obj, new_id)?;
             if let PdfObject::Stream(stream) = &mut obj {
                 // Compress-then-encrypt: run the optional compression first so
                 // ciphertext is not (incompressibly) recompressed.
                 let (dict, data) = prepared_stream_parts(stream, options.compress_uncompressed);
-                let encrypted = enc.encrypt_bytes(new_id, &data);
+                let encrypted = enc.try_encrypt_bytes(new_id, &data)?;
                 *stream = PdfStream {
                     dict,
                     data: encrypted.into(),

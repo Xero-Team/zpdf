@@ -25,7 +25,7 @@
 use aes::cipher::{BlockModeDecrypt, BlockModeEncrypt, KeyIvInit};
 use sha2::Digest;
 use std::sync::Arc;
-use zpdf_core::{ObjectId, PdfDict, PdfObject, PdfString};
+use zpdf_core::{Error, ObjectId, PdfDict, PdfObject, PdfString, Result};
 
 /// The 32-byte password-padding string from PDF 1.7 §7.6.3.3 (Algorithm 2).
 const PAD: [u8; 32] = [
@@ -231,12 +231,34 @@ impl Decryptor {
     /// **Encrypt** a stream payload for object `id` (the write-side inverse of
     /// [`Self::decrypt_stream_bytes`]). Used by the incremental writer to add
     /// objects to an already-encrypted document with its existing key.
+    ///
+    /// # Panics
+    ///
+    /// When AES needs an IV and the OS random number generator is unavailable;
+    /// [`Self::try_encrypt_stream_bytes`] reports that as an error instead.
     pub fn encrypt_stream_bytes(&self, id: ObjectId, data: &[u8]) -> Vec<u8> {
+        self.try_encrypt_stream_bytes(id, data)
+            .expect("OS random number generator unavailable for the AES-CBC IV")
+    }
+
+    /// Fallible [`Self::encrypt_stream_bytes`]: errors when the OS random
+    /// number generator cannot supply an AES-CBC IV.
+    pub fn try_encrypt_stream_bytes(&self, id: ObjectId, data: &[u8]) -> Result<Vec<u8>> {
         self.encrypt(id, data, self.stm_algo)
     }
 
     /// **Encrypt** a string payload for object `id`.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::encrypt_stream_bytes`]; see [`Self::try_encrypt_string_bytes`].
     pub fn encrypt_string_bytes(&self, id: ObjectId, data: &[u8]) -> Vec<u8> {
+        self.try_encrypt_string_bytes(id, data)
+            .expect("OS random number generator unavailable for the AES-CBC IV")
+    }
+
+    /// Fallible [`Self::encrypt_string_bytes`].
+    pub fn try_encrypt_string_bytes(&self, id: ObjectId, data: &[u8]) -> Result<Vec<u8>> {
         self.encrypt(id, data, self.str_algo)
     }
 
@@ -244,39 +266,50 @@ impl Decryptor {
     /// key for `id`. Stream payloads are NOT touched (they are encrypted
     /// separately via [`Self::encrypt_stream_bytes`], since writers carry the
     /// payload out-of-band).
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::encrypt_stream_bytes`]; see [`Self::try_encrypt_object_strings`].
     pub fn encrypt_object_strings(&self, obj: &mut PdfObject, id: ObjectId) {
+        self.try_encrypt_object_strings(obj, id)
+            .expect("OS random number generator unavailable for the AES-CBC IV")
+    }
+
+    /// Fallible [`Self::encrypt_object_strings`].
+    pub fn try_encrypt_object_strings(&self, obj: &mut PdfObject, id: ObjectId) -> Result<()> {
         match obj {
             PdfObject::String(s) if self.str_algo != Algo::Identity => {
-                *s = PdfString(self.encrypt(id, &s.0, self.str_algo));
+                *s = PdfString(self.encrypt(id, &s.0, self.str_algo)?);
             }
             PdfObject::String(_) => {}
             PdfObject::Array(a) => {
                 for o in a.iter_mut() {
-                    self.encrypt_object_strings(o, id);
+                    self.try_encrypt_object_strings(o, id)?;
                 }
             }
             PdfObject::Dict(d) => {
                 for v in d.0.values_mut() {
-                    self.encrypt_object_strings(v, id);
+                    self.try_encrypt_object_strings(v, id)?;
                 }
             }
             PdfObject::Stream(s) => {
                 for v in s.dict.0.values_mut() {
-                    self.encrypt_object_strings(v, id);
+                    self.try_encrypt_object_strings(v, id)?;
                 }
             }
             _ => {}
         }
+        Ok(())
     }
 
     /// Per-object key derivation + cipher application, encrypt direction.
-    fn encrypt(&self, id: ObjectId, data: &[u8], algo: Algo) -> Vec<u8> {
-        match algo {
+    fn encrypt(&self, id: ObjectId, data: &[u8], algo: Algo) -> Result<Vec<u8>> {
+        Ok(match algo {
             Algo::Identity => data.to_vec(),
             // RC4 is symmetric.
             Algo::Rc4 => rc4(&self.object_key(id, algo), data),
-            Algo::AesV2 | Algo::AesV3 => aes_cbc_encrypt(&self.object_key(id, algo), data),
-        }
+            Algo::AesV2 | Algo::AesV3 => aes_cbc_encrypt(&self.object_key(id, algo), data)?,
+        })
     }
 
     fn walk(&self, obj: &mut PdfObject, id: ObjectId) {
@@ -798,20 +831,15 @@ fn aes128_cbc_encrypt_nopad(key: &[u8], iv: &[u8], data: &[u8]) -> Vec<u8> {
 /// PKCS#5 padding. Key length selects AES-128 (AESV2) vs AES-256 (AESV3). The
 /// write-side inverse of [`aes_cbc_decrypt`]; used when adding objects to an
 /// encrypted document.
-fn aes_cbc_encrypt(key: &[u8], data: &[u8]) -> Vec<u8> {
+fn aes_cbc_encrypt(key: &[u8], data: &[u8]) -> Result<Vec<u8>> {
     let mut iv = [0u8; 16];
-    // The IV must be unpredictable but need not be secret. getrandom is not a
-    // parser dependency, so derive it from entropy we have: MD5 over the data
-    // plus a process-unique counter. (Writers with stronger requirements
-    // encrypt via zpdf-writer's Encryptor, which uses the system RNG.)
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let nonce = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let mut seed = Vec::with_capacity(data.len().min(256) + 16);
-    seed.extend_from_slice(&nonce.to_le_bytes());
-    seed.extend_from_slice(&(data.len() as u64).to_le_bytes());
-    seed.extend_from_slice(&data[..data.len().min(240)]);
-    iv.copy_from_slice(&md5(&seed));
+    // CBC needs an unpredictable IV. A failure of the OS CSPRNG is fatal for
+    // confidentiality, so do not fall back to a predictable value.
+    getrandom::getrandom(&mut iv).map_err(|e| {
+        Error::Io(std::io::Error::other(format!(
+            "OS random number generator unavailable for the AES-CBC IV: {e}"
+        )))
+    })?;
 
     let pad = 16 - (data.len() % 16);
     let mut buf = Vec::with_capacity(data.len() + pad);
@@ -846,13 +874,13 @@ fn aes_cbc_encrypt(key: &[u8], data: &[u8]) -> Vec<u8> {
             "invalid AES key length {}; data left unencrypted",
             key.len()
         );
-        return data.to_vec();
+        return Ok(data.to_vec());
     }
 
     let mut out = Vec::with_capacity(16 + buf.len());
     out.extend_from_slice(&iv);
     out.extend_from_slice(&buf);
-    out
+    Ok(out)
 }
 
 // ----------------------------------------------------------------------------
