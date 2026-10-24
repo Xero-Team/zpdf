@@ -320,6 +320,14 @@ content stream and earlier revisions are not left in the file. Consequences:
 - Only the page region is redacted: document metadata (`/Info`, XMP),
   bookmarks, attachments and other pages are kept as they are — review them
   separately (e.g. `set-meta`).
+- Text selection uses estimated extents, not the renderer's complete glyph
+  geometry. Custom widths, spacing and vertical text can differ from that
+  estimate. Check both extraction and rendering of sensitive output; this
+  API does not guarantee sanitization of arbitrary PDFs.
+- A shared resource still reachable from another page, an inherited resource
+  dictionary or another retained object can remain in the output. The rewrite
+  removes superseded revisions and unreachable objects, not every duplicate
+  occurrence of sensitive data.
 
 ### `optimize` — compress, encrypt, downsample, linearize
 
