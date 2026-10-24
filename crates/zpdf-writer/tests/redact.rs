@@ -194,6 +194,43 @@ fn stream(dict: &str, data: &str) -> String {
     )
 }
 
+#[test]
+fn form_redaction_uses_bbox_and_matrix_instead_of_the_image_unit_square() {
+    let pdf = build_pdf(&[
+        "<< /Type /Catalog /Pages 2 0 R >>".into(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 400] /Contents 4 0 R \
+         /Resources << /XObject << /Secret 5 0 R /Public 6 0 R >> >> >>"
+            .into(),
+        stream("", "q 2 0 0 2 10 20 cm /Secret Do Q /Public Do"),
+        stream(
+            "/Type /XObject /Subtype /Form /BBox [0 0 100 80] /Matrix [1 0 0 1 30 40]",
+            "% SECRET_FORM_PAYLOAD\n0 0 100 80 re f",
+        ),
+        stream(
+            "/Type /XObject /Subtype /Form /BBox [300 300 350 350]",
+            "% PUBLIC_FORM_PAYLOAD\n300 300 50 50 re f",
+        ),
+    ]);
+    // The form paints [70,100,270,260]; the image-unit-square guess [10,20,12,22]
+    // misses this region entirely.
+    let out = redact_pdf(
+        pdf,
+        b"",
+        0,
+        &[Rect::new(100.0, 120.0, 150.0, 160.0)],
+        &RedactOptions { fill: None },
+    )
+    .unwrap();
+    let doc = PdfDocument::open(out).unwrap();
+    let payload = String::from_utf8_lossy(&all_payload_bytes(&doc)).into_owned();
+    assert!(!payload.contains("SECRET_FORM_PAYLOAD"));
+    assert!(payload.contains("PUBLIC_FORM_PAYLOAD"));
+    let content = page_content(&doc);
+    assert!(!content.contains("/Secret Do"));
+    assert!(content.contains("/Public Do"));
+}
+
 /// Every string, name and decoded stream payload reachable in the file.
 fn all_payload_bytes(doc: &PdfDocument) -> Vec<u8> {
     fn walk(obj: &zpdf_core::PdfObject, out: &mut Vec<u8>) {
