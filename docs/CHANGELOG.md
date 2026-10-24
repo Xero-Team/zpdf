@@ -51,6 +51,9 @@ Released 2026-10-24.
   surfaces and deduplicate SVG image/mask definitions. Soft-mask keys include
   clip bounds and SVG nesting depth. These changes make no new quantified
   performance claim. (#85)
+- Share one native headless wgpu Instance across default GPU contexts to avoid
+  concurrent instance teardown racing device creation in the system Vulkan
+  loader. Devices and per-renderer resources remain independently owned.
 
 ### Writing and export
 
