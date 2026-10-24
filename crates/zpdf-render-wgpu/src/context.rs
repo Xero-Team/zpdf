@@ -17,6 +17,23 @@ pub const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 /// Stencil-only format used for clip masks.
 pub const STENCIL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Stencil8;
 
+/// Keep the native loader alive across independent headless renderers. Creating
+/// and dropping separate instances concurrently can race in the system Vulkan
+/// loader (observed in vkCreateDevice/dlclose on Linux software adapters).
+/// Devices, queues and render resources still belong to each GpuContext.
+fn headless_instance() -> wgpu::Instance {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        static INSTANCE: std::sync::OnceLock<wgpu::Instance> = std::sync::OnceLock::new();
+        INSTANCE.get_or_init(wgpu::Instance::default).clone()
+    }
+    // Browser handles are not Send + Sync and cannot live in a native static.
+    #[cfg(target_arch = "wasm32")]
+    {
+        wgpu::Instance::default()
+    }
+}
+
 /// Which adapter a [`GpuContext`] is bound to, and the device settings that
 /// affect its numbers.
 ///
@@ -135,7 +152,7 @@ impl GpuContext {
     }
 
     async fn new_headless_async(force_fallback: bool) -> Result<Self, WgpuRenderError> {
-        let instance = wgpu::Instance::default();
+        let instance = headless_instance();
 
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
