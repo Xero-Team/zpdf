@@ -85,6 +85,88 @@ fn type3_pdf() -> Vec<u8> {
     ])
 }
 
+/// A Type3 font whose glyph (code 65) is `glyph`, painted by `content`.
+fn type3_font_pdf(glyph: &[u8], content: &[u8]) -> Vec<u8> {
+    assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R \
+          /Resources << /Font << /F1 5 0 R >> >> >>"
+            .to_vec(),
+        stream_obj("", content),
+        b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] \
+          /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs 6 0 R /Encoding 7 0 R \
+          /FirstChar 65 /LastChar 65 /Widths [1000] /Resources << >> >>"
+            .to_vec(),
+        b"<< /g 8 0 R >>".to_vec(),
+        b"<< /Type /Encoding /Differences [65 /g] >>".to_vec(),
+        stream_obj("", glyph),
+    ])
+}
+
+/// A stroked Type3 glyph under a scaled text matrix: the stroke width scales
+/// with the whole glyph-to-page transform, not just FontMatrix × size.
+fn type3_stroke_pdf() -> Vec<u8> {
+    type3_font_pdf(
+        b"1000 0 d0\n60 w 100 100 m 900 900 l 900 100 l S",
+        b"0 0 0 rg\nBT /F1 20 Tf 3 0 0 3 20 40 Tm (AA) Tj ET",
+    )
+}
+
+/// A bitmap Type3 glyph (an `/ImageMask` inline image, as TeX bitmap fonts
+/// emit) painted in red.
+fn type3_bitmap_pdf() -> Vec<u8> {
+    let mut glyph = b"1000 0 0 0 1000 1000 d1\nq 1000 0 0 1000 0 0 cm \
+        BI /W 8 /H 8 /IM true /BPC 1 ID "
+        .to_vec();
+    glyph.extend_from_slice(&[0xFF, 0xC3, 0xA5, 0x99, 0x99, 0xA5, 0xC3, 0xFF]);
+    glyph.extend_from_slice(b" EI Q");
+    type3_font_pdf(&glyph, b"1 0 0 rg\nBT /F1 60 Tf 15 70 Td (AAA) Tj ET")
+}
+
+/// One image XObject drawn at several places and sizes.
+fn repeated_image_pdf() -> Vec<u8> {
+    let pixels = [255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 0];
+    assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R \
+          /Resources << /XObject << /Im1 5 0 R >> >> >>"
+            .to_vec(),
+        stream_obj(
+            "",
+            b"q 60 0 0 60 10 10 cm /Im1 Do Q q 80 0 0 80 100 20 cm /Im1 Do Q \
+              q 0 50 -50 0 80 120 cm /Im1 Do Q",
+        ),
+        stream_obj(
+            "/Type /XObject /Subtype /Image /Width 2 /Height 2 /ColorSpace /DeviceRGB \
+             /BitsPerComponent 8",
+            &pixels,
+        ),
+    ])
+}
+
+/// One luminosity soft-mask ExtGState applied to several objects.
+fn repeated_soft_mask_pdf() -> Vec<u8> {
+    assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R \
+          /Resources << /ExtGState << /GS1 5 0 R >> >> >>"
+            .to_vec(),
+        stream_obj(
+            "",
+            b"q /GS1 gs 0 0 1 rg 10 10 80 80 re f Q q /GS1 gs 1 0 0 rg 60 60 120 120 re f Q",
+        ),
+        b"<< /Type /ExtGState /SMask << /Type /Mask /S /Luminosity /G 6 0 R >> >>".to_vec(),
+        stream_obj(
+            "/Type /XObject /Subtype /Form /BBox [0 0 200 200] \
+             /Group << /S /Transparency /CS /DeviceGray >>",
+            b"1 g 0 0 120 200 re f 0.5 g 120 0 80 200 re f",
+        ),
+    ])
+}
+
 /// Real outline glyph ('A' → GID 1 in `TEST_TTF`) repeated across a grid.
 fn outline_text_pdf(font_size: f32) -> Vec<u8> {
     let content = format!(
@@ -198,6 +280,10 @@ fn corpus() -> Vec<(&'static str, Vec<u8>)> {
         ("text_type3", type3_pdf()),
         ("text_outline", outline_text_pdf(40.0)),
         ("blend_group", blend_groups_pdf(6)),
+        ("text_type3_stroke", type3_stroke_pdf()),
+        ("text_type3_bitmap", type3_bitmap_pdf()),
+        ("image_repeated", repeated_image_pdf()),
+        ("soft_mask_repeated", repeated_soft_mask_pdf()),
     ]
 }
 
@@ -260,4 +346,32 @@ fn svg_export_matches_cpu_oracle() {
         }
     }
     assert!(failures.is_empty(), "SVG fidelity failures: {failures:?}");
+}
+
+/// Export page 0 of `pdf` to SVG.
+fn export_svg(pdf: Vec<u8>) -> String {
+    let doc = PdfDocument::open(pdf).expect("open pdf");
+    let page = doc.page(0).expect("page 0");
+    let mut fonts = doc.load_page_fonts(&page);
+    let content = doc.page_content_bytes(&page).expect("content bytes");
+    let mut images = ImageCache::new();
+    let dl = ContentInterpreter::new(page.media_box)
+        .with_fonts(&mut fonts)
+        .with_document(doc.file(), &page.resources)
+        .with_images(&mut images)
+        .interpret(&content);
+    display_list_to_svg(&dl, &fonts, &images, &SvgOptions::default())
+}
+
+/// A repeated image is embedded once and a repeated soft mask defined once;
+/// every draw references the shared def.
+#[test]
+fn repeated_images_and_masks_are_defined_once() {
+    let svg = export_svg(repeated_image_pdf());
+    assert_eq!(svg.matches("<image ").count(), 1, "{svg}");
+    assert_eq!(svg.matches("<use ").count(), 3, "{svg}");
+
+    let svg = export_svg(repeated_soft_mask_pdf());
+    assert_eq!(svg.matches("<mask ").count(), 1, "{svg}");
+    assert_eq!(svg.matches("mask=\"url(#m").count(), 2, "{svg}");
 }

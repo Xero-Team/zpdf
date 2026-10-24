@@ -17,8 +17,11 @@
 //! The injected objects get object numbers continuing past the walked set,
 //! and the transforms are pre-renumbered through the walk's `old → new` map
 //! (existing refs) with the injected objects' final numbers (new refs), so
-//! `rewrite_pdf` emits them verbatim. The output then passes
-//! `zpdf_document::pdfa::validate` for the same profile.
+//! `rewrite_pdf` emits them verbatim. This is a best-effort converter: it
+//! strips the common forbidden features (actions, embedded files for A-1b,
+//! transparency groups, soft masks, non-opaque ExtGState alpha and blend
+//! modes) and is checked by `zpdf_document::pdfa::validate`. External
+//! conformance suites such as veraPDF should still be run for archival use.
 
 use std::collections::HashMap;
 
@@ -241,6 +244,15 @@ pub(crate) fn prepare(
     // carries an embedded file A-1b forbids; A-2b permits it). ---
     strip_forbidden_annotations(source, map, root, cfg.profile, &mut edits.transforms);
 
+    // --- A-1b: strip remaining transparency features from every reachable
+    // object (Form XObject /Group, soft masks, blend modes, non-opaque
+    // ExtGState alpha, transfer functions) plus /AA, /XFA and /AF (associated
+    // files are forbidden wherever they appear). The page-only pass above
+    // misses forms, annotations and ExtGState dictionaries. ---
+    if cfg.profile == PdfaProfile::A1b {
+        strip_a1b_features_all(source, order, map, &mut edits.transforms);
+    }
+
     // --- Font embedding (best-effort fallback) ---
     if let Some(fallback) = &cfg.fallback_font {
         embed_fallback_fonts(source, map, root, fallback, &mut next_extra, &mut edits)?;
@@ -260,6 +272,78 @@ const FORBIDDEN_ANNOT_SUBTYPES_BOTH: &[&str] = &["3D", "Sound", "Movie"];
 /// Annotation subtypes PDF/A-1b additionally forbids. FileAttachment carries
 /// an embedded file, which A-1b disallows (A-2b permits embedded files).
 const FORBIDDEN_ANNOT_SUBTYPES_A1B: &[&str] = &["FileAttachment"];
+
+/// Strip PDF/A-1b-forbidden transparency/action features from every reachable
+/// object. Existing transforms (catalog, pages, font descriptors, …) are
+/// preserved; untouched objects are only re-inserted when a key was removed.
+fn strip_a1b_features_all(
+    source: &PdfFile,
+    order: &[ObjectId],
+    map: &HashMap<ObjectId, u32>,
+    transforms: &mut HashMap<ObjectId, PdfObject>,
+) {
+    for id in order {
+        let existing = transforms.remove(id);
+        let had_existing = existing.is_some();
+        let mut obj = match existing {
+            Some(obj) => obj,
+            None => match source.resolve(*id) {
+                Ok(obj) => renumber(&obj, map),
+                Err(_) => continue,
+            },
+        };
+        let changed = strip_a1b_object(&mut obj);
+        if changed || had_existing {
+            transforms.insert(*id, obj);
+        }
+    }
+}
+
+fn strip_a1b_object(obj: &mut PdfObject) -> bool {
+    match obj {
+        PdfObject::Dict(dict) => strip_a1b_dict(dict),
+        PdfObject::Stream(stream) => strip_a1b_dict(&mut stream.dict),
+        PdfObject::Array(items) => {
+            let mut changed = false;
+            for item in items {
+                changed |= strip_a1b_object(item);
+            }
+            changed
+        }
+        _ => false,
+    }
+}
+
+fn strip_a1b_dict(dict: &mut PdfDict) -> bool {
+    let mut changed = false;
+    // Each key is forbidden in A-1 (or only allowed with the value its
+    // absence implies): actions, XFA, associated files, transparency groups
+    // and soft masks, blend modes, alpha-is-shape, text knockout, transfer
+    // functions.
+    for key in ["AA", "XFA", "AF", "SMask", "BM", "AIS", "TK", "TR", "Group"] {
+        changed |= dict.0.remove(&PdfName::new(key)).is_some();
+    }
+    // /TR2 is allowed only as /Default.
+    if matches!(dict.get("TR2"), Some(v) if !matches!(v, PdfObject::Name(n) if n.as_str() == "Default"))
+    {
+        changed |= dict.0.remove(&PdfName::new("TR2")).is_some();
+    }
+    // /ca and /CA are opacities in ExtGState and annotation dictionaries
+    // (absent = 1.0, the only A-1 value), but an appearance-characteristics
+    // /MK /CA is a widget's caption text and must stay.
+    for key in ["ca", "CA"] {
+        if matches!(
+            dict.get(key),
+            Some(PdfObject::Integer(_) | PdfObject::Real(_))
+        ) {
+            changed |= dict.0.remove(&PdfName::new(key)).is_some();
+        }
+    }
+    for value in dict.0.values_mut() {
+        changed |= strip_a1b_object(value);
+    }
+    changed
+}
 
 /// Walk the page tree and, for each page's `/Annots`, drop annotations whose
 /// `/Subtype` is forbidden (profile-aware) or whose `/A` action is a

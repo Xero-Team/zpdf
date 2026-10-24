@@ -85,6 +85,12 @@ impl CidWidths {
         self.widths.get(&cid).copied()
     }
 
+    /// The width used for codes with no explicit entry (`/DW` for CID fonts,
+    /// the descriptor's `/MissingWidth` for simple fonts).
+    pub fn default_width(&self) -> f64 {
+        self.default_width
+    }
+
     /// True when no per-glyph widths were set (every code falls to the default).
     pub fn is_empty(&self) -> bool {
         self.widths.is_empty()
@@ -1060,15 +1066,18 @@ impl LoadedFont {
         }
     }
 
-    /// For Type3 fonts: get glyph width from the Widths array.
+    /// For Type3 fonts: get glyph width from the Widths array. Codes outside
+    /// `/FirstChar` .. `/FirstChar + len` take the font's default width, on
+    /// either side of the range (a code below `/FirstChar` must not borrow the
+    /// first entry).
     pub fn type3_glyph_width(&self, char_code: u16) -> f64 {
         match &self.font_type {
             PdfFontType::Type3 {
                 widths, first_char, ..
-            } => {
-                let idx = char_code.saturating_sub(*first_char) as usize;
-                widths.get(idx).copied().unwrap_or(1000.0)
-            }
+            } => char_code
+                .checked_sub(*first_char)
+                .and_then(|idx| widths.get(idx as usize).copied())
+                .unwrap_or_else(|| self.cid_widths.default_width()),
             _ => 1000.0,
         }
     }
@@ -2392,6 +2401,30 @@ mod tests {
         // the font's 1000-unit advance scale here. The content interpreter
         // applies the divisor when converting this value to text space.
         assert!((font.simple_glyph_advance(33, 1) - 1400.0).abs() < 1e-9);
+    }
+
+    /// `/Widths` starts at `/FirstChar`: a code below it has no entry and
+    /// takes the default width, exactly like a code past the end, rather than
+    /// the first entry's width.
+    #[test]
+    fn type3_width_outside_first_char_range_uses_default() {
+        let font = LoadedFont::new_with_data(
+            PdfFontType::Type3 {
+                font_matrix: [0.001, 0.0, 0.0, 0.001, 0.0, 0.0],
+                char_procs: HashMap::new(),
+                encoding: Vec::new(),
+                widths: vec![600.0, 700.0],
+                first_char: 32,
+            },
+            "Type3Test".into(),
+            Vec::new(),
+            CidWidths::new(250.0),
+        );
+        assert_eq!(font.type3_glyph_width(32), 600.0);
+        assert_eq!(font.type3_glyph_width(33), 700.0);
+        assert_eq!(font.type3_glyph_width(31), 250.0, "below /FirstChar");
+        assert_eq!(font.type3_glyph_width(0), 250.0, "below /FirstChar");
+        assert_eq!(font.type3_glyph_width(34), 250.0, "past the end");
     }
 
     #[test]

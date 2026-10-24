@@ -10,10 +10,18 @@
 //! (for streams) the decoded stream data, so this crate stays independent of
 //! the parser.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use zpdf_core::{ObjectId, PdfDict, PdfObject};
 
 /// Maximum nesting for stitching sub-functions (guards cyclic references).
 const MAX_FUNCTION_DEPTH: u32 = 8;
+/// Total function nodes one top-level parse may visit, counting every
+/// (sub-)function reference — including re-references of an already parsed
+/// object. Depth and width limits alone still allow `256^8` nodes when wide
+/// stitching levels all point at the next level, so the whole tree is bounded.
+const MAX_FUNCTION_NODES: u32 = 4096;
 /// Sampled functions require `2^n` interpolation corners. Above this limit
 /// evaluation would be prohibitively expensive; older code also silently
 /// ignored dimensions above 16.
@@ -47,9 +55,10 @@ enum FunctionKind {
     },
     /// Type 2 — exponential interpolation between C0 and C1.
     Exponential { c0: Vec<f64>, c1: Vec<f64>, n: f64 },
-    /// Type 3 — 1-in stitching of k sub-functions.
+    /// Type 3 — 1-in stitching of k sub-functions. Sub-functions parsed from
+    /// the same indirect object are shared rather than re-parsed.
     Stitching {
-        functions: Vec<PdfFunction>,
+        functions: Vec<Arc<PdfFunction>>,
         bounds: Vec<f64>,
         encode: Vec<[f64; 2]>,
     },
@@ -61,6 +70,28 @@ enum FunctionKind {
 /// target is a stream, its decoded data.
 pub type Resolver<'a> = dyn FnMut(ObjectId) -> Option<(PdfObject, Option<Vec<u8>>)> + 'a;
 
+/// State shared by every level of one top-level parse.
+struct ParseState {
+    /// Remaining node budget (see [`MAX_FUNCTION_NODES`]).
+    nodes: u32,
+    /// Sub-functions already parsed from indirect objects during this parse.
+    memo: HashMap<ObjectId, Arc<PdfFunction>>,
+}
+
+impl ParseState {
+    fn new() -> Self {
+        Self {
+            nodes: MAX_FUNCTION_NODES,
+            memo: HashMap::new(),
+        }
+    }
+
+    fn take_node(&mut self) -> Option<()> {
+        self.nodes = self.nodes.checked_sub(1)?;
+        Some(())
+    }
+}
+
 impl PdfFunction {
     /// Parse a function from a (resolved) dict plus optional decoded stream
     /// data (required for types 0 and 4). `resolve` is used for indirect
@@ -70,40 +101,65 @@ impl PdfFunction {
         stream_data: Option<&[u8]>,
         resolve: &mut Resolver<'_>,
     ) -> Option<PdfFunction> {
-        Self::parse_depth(dict, stream_data, resolve, 0)
+        Self::parse_depth(dict, stream_data, resolve, &mut ParseState::new(), 0)
     }
 
     /// Convenience: parse from any object shape — dict, stream-backed ref, or
     /// direct dict-with-data pair already produced by the caller's resolver.
     pub fn parse_object(obj: &PdfObject, resolve: &mut Resolver<'_>) -> Option<PdfFunction> {
-        Self::parse_object_depth(obj, resolve, 0)
+        Self::parse_object_depth(obj, resolve, &mut ParseState::new(), 0)
     }
 
     fn parse_object_depth(
         obj: &PdfObject,
         resolve: &mut Resolver<'_>,
+        state: &mut ParseState,
         depth: u32,
     ) -> Option<PdfFunction> {
         match obj {
             PdfObject::Ref(id) => {
                 let (resolved, data) = resolve(*id)?;
                 let dict = resolved.as_dict().ok()?;
-                Self::parse_depth(dict, data.as_deref(), resolve, depth)
+                Self::parse_depth(dict, data.as_deref(), resolve, state, depth)
             }
-            PdfObject::Dict(d) => Self::parse_depth(d, None, resolve, depth),
+            PdfObject::Dict(d) => Self::parse_depth(d, None, resolve, state, depth),
             _ => None,
         }
+    }
+
+    /// Parse a stitching sub-function, reusing an indirect object already
+    /// parsed during this parse instead of resolving and parsing it again.
+    fn parse_sub_function(
+        obj: &PdfObject,
+        resolve: &mut Resolver<'_>,
+        state: &mut ParseState,
+        depth: u32,
+    ) -> Option<Arc<PdfFunction>> {
+        if let PdfObject::Ref(id) = obj {
+            if let Some(function) = state.memo.get(id) {
+                let function = function.clone();
+                state.take_node()?;
+                return Some(function);
+            }
+        }
+        let function = Arc::new(Self::parse_object_depth(obj, resolve, state, depth)?);
+        if let PdfObject::Ref(id) = obj {
+            state.memo.insert(*id, function.clone());
+        }
+        Some(function)
     }
 
     fn parse_depth(
         dict: &PdfDict,
         stream_data: Option<&[u8]>,
         resolve: &mut Resolver<'_>,
+        state: &mut ParseState,
         depth: u32,
     ) -> Option<PdfFunction> {
         if depth > MAX_FUNCTION_DEPTH {
             return None;
         }
+        state.take_node()?;
         let ftype = dict.get_i64("FunctionType").ok()?;
         let domain = number_pairs(dict.get("Domain")?)?;
         if domain.is_empty() || domain.len() > MAX_FUNCTION_COMPONENTS || !ordered_pairs(&domain) {
@@ -223,22 +279,25 @@ impl PdfFunction {
                 }
                 let mut functions = Vec::with_capacity(funcs_arr.len());
                 for f in funcs_arr {
-                    functions.push(Self::parse_object_depth(f, resolve, depth + 1)?);
+                    functions.push(Self::parse_sub_function(f, resolve, state, depth + 1)?);
                 }
-                let bounds = match dict.get("Bounds") {
+                let mut bounds = match dict.get("Bounds") {
                     Some(obj) => numbers(obj)?,
                     None => Vec::new(),
                 };
                 if bounds.len() + 1 != functions.len() {
                     return None;
                 }
-                let [domain_min, domain_max] = domain[0];
-                if !bounds.windows(2).all(|w| w[0] < w[1])
-                    || !bounds
-                        .iter()
-                        .all(|&bound| domain_min <= bound && bound <= domain_max)
-                {
+                // Coincident bounds are legal in practice (hard colour stops:
+                // the zero-width interval is simply never selected), and
+                // writers round bounds slightly outside the domain; only a
+                // decreasing sequence is unusable.
+                if !bounds.windows(2).all(|w| w[0] <= w[1]) {
                     return None;
+                }
+                let [domain_min, domain_max] = domain[0];
+                for bound in &mut bounds {
+                    *bound = bound.clamp(domain_min, domain_max);
                 }
                 let encode = number_pairs(dict.get("Encode")?)?;
                 if encode.len() != functions.len() {
@@ -334,12 +393,12 @@ impl PdfFunction {
                 let [d0, d1] = self.domain[0];
                 // Select sub-function k: x in [bounds[k-1], bounds[k]).
                 let mut k = bounds.partition_point(|&b| b <= x);
-                // Domain edge: x == Domain0 belongs to the first interval even
-                // if bounds[0] == Domain0.
-                if x <= d0 {
-                    k = 0;
-                }
                 k = k.min(functions.len() - 1);
+                // Domain end: intervals starting at Domain1 (bounds clamped
+                // onto it) are empty, so x ends the last non-empty one.
+                while k > 0 && x >= d1 && bounds[k - 1] >= d1 {
+                    k -= 1;
+                }
                 let lo = if k == 0 { d0 } else { bounds[k - 1] };
                 let hi = if k == functions.len() - 1 {
                     d1
@@ -736,17 +795,20 @@ fn exec_ps(ops: &[PsOp], stack: &mut Vec<f64>, steps: &mut u32) -> Option<()> {
         if *steps > MAX_PS_STEPS || stack.len() > 256 {
             return None;
         }
+        // Only arithmetic can create a non-finite value (inputs and literals
+        // are finite; stack operators merely move existing values), so check
+        // each computed result instead of rescanning the whole stack per op.
         macro_rules! un {
             (|$a:ident| $e:expr) => {{
                 let $a = stack.pop()?;
-                stack.push($e);
+                stack.push(finite($e)?);
             }};
         }
         macro_rules! bin {
             (|$a:ident, $b:ident| $e:expr) => {{
                 let $b = stack.pop()?;
                 let $a = stack.pop()?;
-                stack.push($e);
+                stack.push(finite($e)?);
             }};
         }
         match op {
@@ -878,11 +940,15 @@ fn exec_ps(ops: &[PsOp], stack: &mut Vec<f64>, steps: &mut u32) -> Option<()> {
                 }
             }
         }
-        if stack.len() > 256 || stack.iter().any(|v| !v.is_finite()) {
+        if stack.len() > 256 {
             return None;
         }
     }
     Some(())
+}
+
+fn finite(value: f64) -> Option<f64> {
+    value.is_finite().then_some(value)
 }
 
 fn ps_i64(value: f64) -> Option<i64> {
@@ -1052,6 +1118,146 @@ mod tests {
         assert!((f.eval(&[0.25]).unwrap()[0] - 0.5).abs() < 1e-9);
         assert!((f.eval(&[0.75]).unwrap()[0] - 0.5).abs() < 1e-9);
         assert!((f.eval(&[0.5]).unwrap()[0] - 1.0).abs() < 1e-9);
+    }
+
+    fn ramp() -> PdfObject {
+        PdfObject::Dict(dict(vec![
+            ("FunctionType", PdfObject::Integer(2)),
+            ("Domain", arr(&[0.0, 1.0])),
+            ("C0", arr(&[0.0])),
+            ("C1", arr(&[1.0])),
+        ]))
+    }
+
+    /// A stitching function of `width` copies of `child` over equal intervals.
+    fn stitch(width: usize, child: PdfObject) -> PdfObject {
+        let bounds: Vec<f64> = (1..width).map(|i| i as f64 / width as f64).collect();
+        PdfObject::Dict(dict(vec![
+            ("FunctionType", PdfObject::Integer(3)),
+            ("Domain", arr(&[0.0, 1.0])),
+            ("Functions", PdfObject::Array(vec![child; width])),
+            ("Bounds", arr(&bounds)),
+            ("Encode", arr(&[0.0, 1.0].repeat(width))),
+        ]))
+    }
+
+    #[test]
+    fn stitching_shares_re_referenced_sub_functions() {
+        // Each level references the next level's object `width` times. Parsed
+        // naively that is width^levels sub-parses; shared, each object is
+        // resolved once.
+        let (levels, width) = (3u32, 128usize);
+        let mut objects = vec![PdfObject::Null, ramp()];
+        for k in 2..=levels + 1 {
+            objects.push(stitch(width, PdfObject::Ref(ObjectId(k - 1, 0))));
+        }
+        let mut calls = 0u32;
+        let mut resolve = |id: ObjectId| {
+            calls += 1;
+            Some((objects[id.0 as usize].clone(), None))
+        };
+        let top = PdfObject::Ref(ObjectId(levels + 1, 0));
+        let f = PdfFunction::parse_object(&top, &mut resolve).expect("shared tree parses");
+        assert_eq!(calls, levels + 1, "every object resolved exactly once");
+        // Each level maps its interval back onto [0, 1].
+        let expected = (0..levels).fold(0.3f64, |x, _| (x * width as f64).fract());
+        assert!((f.eval(&[0.3]).unwrap()[0] - expected).abs() < 1e-6);
+    }
+
+    #[test]
+    fn stitching_tree_exceeding_node_budget_is_rejected() {
+        // Distinct inline sub-functions cannot be shared: 2 levels of 256
+        // direct children is 65k nodes, far past the budget.
+        let tree = stitch(256, stitch(256, ramp()));
+        let mut r = no_resolve();
+        assert!(PdfFunction::parse_object(&tree, &mut r).is_none());
+        // A modest tree still parses.
+        let small = stitch(16, stitch(16, ramp()));
+        assert!(PdfFunction::parse_object(&small, &mut r).is_some());
+    }
+
+    #[test]
+    fn stitching_accepts_coincident_bounds_as_hard_stop() {
+        let flat = |c: f64| {
+            PdfObject::Dict(dict(vec![
+                ("FunctionType", PdfObject::Integer(2)),
+                ("Domain", arr(&[0.0, 1.0])),
+                ("C0", arr(&[c])),
+                ("C1", arr(&[c])),
+            ]))
+        };
+        let d = dict(vec![
+            ("FunctionType", PdfObject::Integer(3)),
+            ("Domain", arr(&[0.0, 1.0])),
+            (
+                "Functions",
+                PdfObject::Array(vec![flat(0.0), flat(0.5), flat(1.0)]),
+            ),
+            ("Bounds", arr(&[0.5, 0.5])),
+            ("Encode", arr(&[0.0, 1.0, 0.0, 1.0, 0.0, 1.0])),
+        ]);
+        let mut r = no_resolve();
+        let f = PdfFunction::parse(&d, None, &mut r).expect("hard stop parses");
+        assert_eq!(f.eval(&[0.49]).unwrap(), vec![0.0]);
+        // The zero-width middle interval is never selected.
+        assert_eq!(f.eval(&[0.5]).unwrap(), vec![1.0]);
+        assert_eq!(f.eval(&[0.9]).unwrap(), vec![1.0]);
+
+        // Decreasing bounds remain invalid.
+        let mut bad = d.clone();
+        bad.0
+            .insert(zpdf_core::PdfName("Bounds".into()), arr(&[0.6, 0.4]));
+        assert!(PdfFunction::parse(&bad, None, &mut r).is_none());
+    }
+
+    #[test]
+    fn stitching_clamps_bounds_slightly_outside_domain() {
+        let d = dict(vec![
+            ("FunctionType", PdfObject::Integer(3)),
+            ("Domain", arr(&[0.0, 1.0])),
+            ("Functions", PdfObject::Array(vec![ramp(), ramp()])),
+            ("Bounds", arr(&[1.000_000_1])),
+            ("Encode", arr(&[0.0, 1.0, 0.0, 1.0])),
+        ]);
+        let mut r = no_resolve();
+        let f = PdfFunction::parse(&d, None, &mut r).expect("rounded bound is clamped");
+        assert!((f.eval(&[0.5]).unwrap()[0] - 0.5).abs() < 1e-9);
+        // The clamped bound leaves an empty last interval at Domain1: the end
+        // of the domain is the end of the first ramp, not the second's start.
+        assert!((f.eval(&[1.0]).unwrap()[0] - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn stitching_skips_empty_leading_intervals() {
+        for bound in [0.0, -0.000_000_1] {
+            let d = dict(vec![
+                ("FunctionType", PdfObject::Integer(3)),
+                ("Domain", arr(&[0.0, 1.0])),
+                ("Functions", PdfObject::Array(vec![ramp(), ramp(), ramp()])),
+                ("Bounds", arr(&[bound, bound])),
+                ("Encode", arr(&[0.0, 1.0, 0.0, 1.0, 1.0, 0.0])),
+            ]);
+            let f = PdfFunction::parse(&d, None, &mut no_resolve()).unwrap();
+            assert_eq!(f.eval(&[0.0]).unwrap(), vec![1.0]);
+            assert_eq!(f.eval(&[-1.0]).unwrap(), vec![1.0]);
+            assert_eq!(f.eval(&[0.5]).unwrap(), vec![0.5]);
+        }
+    }
+
+    #[test]
+    fn postscript_non_finite_result_is_an_eval_error() {
+        let d = dict(vec![
+            ("FunctionType", PdfObject::Integer(4)),
+            ("Domain", arr(&[0.0, 1.0])),
+            ("Range", arr(&[0.0, 1.0])),
+        ]);
+        let mut r = no_resolve();
+        // 10^400 overflows to infinity mid-program and is then dropped: the
+        // intermediate value must still fail the evaluation.
+        let f = PdfFunction::parse(&d, Some(b"{ 10 400 exp pop }"), &mut r).unwrap();
+        assert!(f.eval(&[0.5]).is_none());
+        let ok = PdfFunction::parse(&d, Some(b"{ 2 exp }"), &mut r).unwrap();
+        assert_eq!(ok.eval(&[0.5]).unwrap(), vec![0.25]);
     }
 
     #[test]

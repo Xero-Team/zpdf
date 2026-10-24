@@ -66,7 +66,7 @@ pub use forms::FormFiller;
 pub use linearize::linearize_pdf;
 pub use merge::extract_pages;
 pub use metadata::InfoUpdate;
-pub use redact::RedactOptions;
+pub use redact::{redact_pdf, RedactOptions};
 pub use rewrite::{rewrite_pdf, PdfaConvertConfig, PdfaProfile, RewriteOptions};
 #[cfg(feature = "timestamp")]
 pub use sign::UreqTimestampRequester;
@@ -520,7 +520,8 @@ impl IncrementalWriter {
                 PendingObject::Object(obj) => match decryptor {
                     Some(dec) => {
                         let mut obj = obj.clone();
-                        dec.encrypt_object_strings(&mut obj, id);
+                        dec.try_encrypt_object_strings(&mut obj, id)
+                            .map_err(io::Error::other)?;
                         write_object(&mut out, num, *gen as u32, &obj)?
                     }
                     None => write_object(&mut out, num, *gen as u32, obj)?,
@@ -529,12 +530,15 @@ impl IncrementalWriter {
                     Some(dec) => {
                         let mut dict = dict.clone();
                         let mut dict_obj = PdfObject::Dict(dict);
-                        dec.encrypt_object_strings(&mut dict_obj, id);
+                        dec.try_encrypt_object_strings(&mut dict_obj, id)
+                            .map_err(io::Error::other)?;
                         dict = match dict_obj {
                             PdfObject::Dict(d) => d,
                             _ => unreachable!(),
                         };
-                        let encrypted = dec.encrypt_stream_bytes(id, data);
+                        let encrypted = dec
+                            .try_encrypt_stream_bytes(id, data)
+                            .map_err(io::Error::other)?;
                         write_stream(&mut out, num, *gen as u32, &dict, &encrypted)?
                     }
                     None => write_stream(&mut out, num, *gen as u32, dict, data)?,

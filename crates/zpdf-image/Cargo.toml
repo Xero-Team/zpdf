@@ -19,3 +19,6 @@ hayro-jpeg2000.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+# Tests feed JPEG fixtures through the real DCTDecode filter. Path-only (no
+# version) so publishing strips it and imposes no publish order.
+zpdf-parser = { path = "../zpdf-parser" }

@@ -75,7 +75,12 @@ pub(crate) fn extract_password(args: &[String]) -> (Vec<String>, Option<String>)
     let mut password = None;
     let mut i = 0;
     while i < args.len() {
-        if args[i] == "--password" {
+        if let Some(v) = args[i].strip_prefix("--password=") {
+            // The `=` form is unambiguous, so any value — including one that
+            // starts with '-' — is taken verbatim.
+            password = Some(v.to_string());
+            i += 1;
+        } else if args[i] == "--password" {
             // Require a value that is not itself a flag, so a forgotten value
             // (`--password -o out.png`) does not silently swallow the next flag.
             match args.get(i + 1) {
@@ -84,7 +89,10 @@ pub(crate) fn extract_password(args: &[String]) -> (Vec<String>, Option<String>)
                     i += 2;
                 }
                 _ => {
-                    eprintln!("--password requires a value (a password not starting with '-')");
+                    eprintln!(
+                        "--password requires a value; use --password=<pw> for a \
+                         password starting with '-'"
+                    );
                     process::exit(2);
                 }
             }
@@ -1176,6 +1184,7 @@ fn cmd_text(args: &[String]) -> zpdf::Result<()> {
             let interpreter = zpdf::ContentInterpreter::new(page.effective_box())
                 .with_fonts(&mut font_cache)
                 .with_document(doc.file(), &page.resources)
+                .with_shared_fonts(&doc)
                 .with_colors(&mut icc_cache)
                 .with_text_sink(&mut spans)
                 .with_operand_stack_limit(doc.file().limits().max_operand_stack_depth as usize);
@@ -1256,6 +1265,7 @@ fn cmd_search(args: &[String]) -> zpdf::Result<()> {
             let interpreter = zpdf::ContentInterpreter::new(page.effective_box())
                 .with_fonts(&mut font_cache)
                 .with_document(doc.file(), &page.resources)
+                .with_shared_fonts(&doc)
                 .with_colors(&mut icc_cache)
                 .with_text_sink(&mut spans)
                 .with_operand_stack_limit(doc.file().limits().max_operand_stack_depth as usize);
@@ -1341,6 +1351,7 @@ fn cmd_tables(args: &[String]) -> zpdf::Result<()> {
             let interpreter = zpdf::ContentInterpreter::new(page.effective_box())
                 .with_fonts(&mut font_cache)
                 .with_document(doc.file(), &page.resources)
+                .with_shared_fonts(&doc)
                 .with_colors(&mut icc_cache)
                 .with_text_sink(&mut spans)
                 .with_rule_sink(&mut rules)
@@ -1486,6 +1497,7 @@ fn cmd_render(args: &[String]) -> zpdf::Result<()> {
         .with_page_rotation(page.rotate)
         .with_fonts(&mut font_cache)
         .with_document(doc.file(), &page.resources)
+        .with_shared_fonts(&doc)
         .with_images(&mut image_cache)
         .with_colors(&mut icc_cache)
         .with_annotations(&annotations)
@@ -1644,13 +1656,18 @@ fn cmd_debug_stream(args: &[String]) -> zpdf::Result<()> {
     Ok(())
 }
 
-/// Shared: build an IncrementalWriter from a file path, erroring on encrypted docs.
+/// Shared: build an IncrementalWriter from a file path. An encrypted input is
+/// opened with `password` (user or owner); without one, only a document whose
+/// user password is empty opens, and the update is written with its key.
 fn build_writer(
     path: &str,
-    _password: Option<&str>,
+    password: Option<&str>,
 ) -> zpdf::Result<zpdf_writer::IncrementalWriter> {
     let data = fs::read(path).map_err(zpdf::Error::Io)?;
-    zpdf_writer::IncrementalWriter::new(data)
+    match password {
+        Some(pw) => zpdf_writer::IncrementalWriter::new_with_password(data, pw.as_bytes()),
+        None => zpdf_writer::IncrementalWriter::new(data),
+    }
 }
 
 /// Shared: write the incremental update to disk, refusing when output == input.
@@ -1713,7 +1730,9 @@ fn cmd_fill(args: &[String]) -> zpdf::Result<()> {
     }
 
     let Some(input_path) = input else {
-        eprintln!("Usage: zpdf fill <file.pdf> --set NAME=VALUE [--set ...] [--list] -o <out.pdf>");
+        eprintln!(
+            "Usage: zpdf fill <file.pdf> --set NAME=VALUE [--set ...] [--list] [--password <pw>] -o <out.pdf>"
+        );
         process::exit(1);
     };
 
@@ -1759,6 +1778,7 @@ fn cmd_fill(args: &[String]) -> zpdf::Result<()> {
 /// Concatenate two or more PDFs: the first file is the base, the pages of
 /// every following file are appended (deep-copied with renumbering).
 fn cmd_merge(args: &[String]) -> zpdf::Result<()> {
+    let (args, password) = extract_password(args);
     let mut inputs: Vec<String> = Vec::new();
     let mut output = None;
 
@@ -1778,7 +1798,9 @@ fn cmd_merge(args: &[String]) -> zpdf::Result<()> {
     }
 
     if inputs.len() < 2 {
-        eprintln!("Usage: zpdf merge <a.pdf> <b.pdf> [more.pdf ...] -o <out.pdf>");
+        eprintln!(
+            "Usage: zpdf merge <a.pdf> <b.pdf> [more.pdf ...] [--password <pw>] -o <out.pdf>"
+        );
         process::exit(1);
     }
     let Some(out_path) = output else {
@@ -1790,13 +1812,29 @@ fn cmd_merge(args: &[String]) -> zpdf::Result<()> {
         process::exit(1);
     }
 
-    let mut writer = build_writer(&inputs[0], None)?;
+    // One --password serves every input: an input that opens without it
+    // (unencrypted, or encrypted with an empty user password) must not fail
+    // on a password meant for another input.
+    let mut writer = match build_writer(&inputs[0], password.as_deref()) {
+        Err(zpdf::Error::WrongPassword) if password.is_some() => {
+            build_writer(&inputs[0], None).map_err(|_| zpdf::Error::WrongPassword)?
+        }
+        other => other?,
+    };
     warn_signatures(writer.document());
     let mut total = writer.document().page_count();
     for path in &inputs[1..] {
-        let data = fs::read(path).map_err(zpdf::Error::Io)?;
-        let file = zpdf::PdfFile::parse(data)?;
-        let appended = writer.append_document(&file)?;
+        let data: std::sync::Arc<[u8]> = fs::read(path).map_err(zpdf::Error::Io)?.into();
+        let source = match password.as_deref() {
+            Some(pw) => match zpdf::PdfDocument::open_with_password(data.clone(), pw.as_bytes()) {
+                Err(zpdf::Error::WrongPassword) => {
+                    zpdf::PdfDocument::open(data).map_err(|_| zpdf::Error::WrongPassword)?
+                }
+                other => other?,
+            },
+            None => zpdf::PdfDocument::open(data)?,
+        };
+        let appended = writer.append_document(source.file())?;
         total += appended;
         println!("{path}: {appended} page(s) appended");
     }
@@ -2073,7 +2111,7 @@ fn cmd_annotate(args: &[String]) -> zpdf::Result<()> {
 
     let usage = || {
         eprintln!(
-            "Usage: zpdf annotate <file.pdf> -p <page> --kind <highlight|underline|strikeout|squiggly|note|freetext|square|circle|line>\n       [--rect X0,Y0,X1,Y1] [--at X,Y] [--to X,Y] [--text STR] [--color R,G,B] [--interior R,G,B]\n       [--width W] [--size S] [--icon NAME] -o <out.pdf>"
+            "Usage: zpdf annotate <file.pdf> -p <page> --kind <highlight|underline|strikeout|squiggly|note|freetext|square|circle|line>\n       [--rect X0,Y0,X1,Y1] [--at X,Y] [--to X,Y] [--text STR] [--color R,G,B] [--interior R,G,B]\n       [--width W] [--size S] [--icon NAME] [--password <pw>] -o <out.pdf>"
         );
         process::exit(1);
     };
@@ -2375,7 +2413,7 @@ fn cmd_sign(args: &[String]) -> zpdf::Result<()> {
         (input, output, key_path, cert_path)
     else {
         eprintln!(
-            "Usage: zpdf sign <file.pdf> --key <key.p8.der> --cert <cert.der> [--name S] [--reason S] [--location S] -o <out.pdf>\n  key: PKCS#8 DER (RSA or ECDSA P-256); cert: X.509 DER with the matching public key"
+            "Usage: zpdf sign <file.pdf> --key <key.p8.der> --cert <cert.der> [--name S] [--reason S] [--location S] [--password <pw>] -o <out.pdf>\n  key: PKCS#8 DER (RSA or ECDSA P-256); cert: X.509 DER with the matching public key"
         );
         process::exit(1);
     };
@@ -2566,7 +2604,9 @@ fn cmd_pages(args: &[String]) -> zpdf::Result<()> {
     }
 
     let Some(input_path) = input else {
-        eprintln!("Usage: zpdf pages <file.pdf> [--rotate PAGES:DEG] [--delete LIST] [--order LIST] -o <out.pdf>");
+        eprintln!(
+            "Usage: zpdf pages <file.pdf> [--rotate PAGES:DEG] [--delete LIST] [--order LIST] [--password <pw>] -o <out.pdf>"
+        );
         process::exit(1);
     };
     let Some(out_path) = output else {
@@ -2649,7 +2689,9 @@ fn cmd_set_meta(args: &[String]) -> zpdf::Result<()> {
     }
 
     let Some(input_path) = input else {
-        eprintln!("Usage: zpdf set-meta <file.pdf> [--title S] [--author S] ... -o <out.pdf>");
+        eprintln!(
+            "Usage: zpdf set-meta <file.pdf> [--title S] [--author S] ... [--password <pw>] -o <out.pdf>"
+        );
         process::exit(1);
     };
     let Some(out_path) = output else {
@@ -2753,18 +2795,22 @@ fn cmd_redact(args: &[String]) -> zpdf::Result<()> {
     }
 
     let bytes = fs::read(&input_path).map_err(zpdf::Error::Io)?;
-    let mut writer = match password.as_deref() {
-        Some(pw) => zpdf_writer::IncrementalWriter::new_with_password(bytes, pw.as_bytes())?,
-        None => zpdf_writer::IncrementalWriter::new(bytes)?,
-    };
-    writer.redact_page(
+    // A document with an empty user password opens without --password, so
+    // ask the file rather than the flag.
+    if zpdf::PdfFile::parse(bytes.clone()).is_ok_and(|f| f.is_encrypted()) {
+        eprintln!(
+            "Note: the redacted output is a full rewrite and is NOT encrypted; \
+             re-encrypt it with `zpdf optimize --encrypt` if needed."
+        );
+    }
+    let out_bytes = zpdf_writer::redact_pdf(
+        bytes,
+        password.as_deref().unwrap_or("").as_bytes(),
         page_num.saturating_sub(1),
         &rects,
         &zpdf_writer::RedactOptions { fill },
     )?;
-    let mut out = std::io::Cursor::new(Vec::new());
-    writer.write(&mut out).map_err(zpdf::Error::Io)?;
-    fs::write(&out_path, out.into_inner()).map_err(zpdf::Error::Io)?;
+    fs::write(&out_path, out_bytes).map_err(zpdf::Error::Io)?;
     println!(
         "{} region(s) redacted on page {page_num} → {out_path}",
         rects.len()
@@ -3004,7 +3050,9 @@ fn cmd_stamp(args: &[String]) -> zpdf::Result<()> {
     }
 
     let Some(input_path) = input else {
-        eprintln!("Usage: zpdf stamp <file.pdf> -p N --text STR --at X,Y [--font F] [--size N] [--color R,G,B] -o <out.pdf>");
+        eprintln!(
+            "Usage: zpdf stamp <file.pdf> -p N --text STR --at X,Y [--font F] [--size N] [--color R,G,B] [--password <pw>] -o <out.pdf>"
+        );
         process::exit(1);
     };
     let Some(out_path) = output else {
@@ -3246,6 +3294,7 @@ fn cmd_export_pptx(args: &[String]) -> zpdf::Result<()> {
             .with_page_rotation(page.rotate)
             .with_fonts(&mut font_cache)
             .with_document(doc.file(), &page.resources)
+            .with_shared_fonts(&doc)
             .with_images(&mut image_cache)
             .with_colors(&mut icc_cache)
             .with_operand_stack_limit(doc.file().limits().max_operand_stack_depth as usize);
@@ -3384,6 +3433,7 @@ fn cmd_export_svg(args: &[String]) -> zpdf::Result<()> {
             .with_page_rotation(page.rotate)
             .with_fonts(&mut font_cache)
             .with_document(doc.file(), &page.resources)
+            .with_shared_fonts(&doc)
             .with_images(&mut image_cache)
             .with_colors(&mut icc_cache)
             .with_operand_stack_limit(doc.file().limits().max_operand_stack_depth as usize);
@@ -3420,8 +3470,33 @@ fn cmd_export_svg(args: &[String]) -> zpdf::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{collect_attachments, create_unique, parse_page_list, sanitize_filename};
+    use super::{
+        collect_attachments, create_unique, extract_password, parse_page_list, sanitize_filename,
+    };
     use std::io::Write;
+
+    fn strings(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn password_flag_takes_a_separate_or_inline_value() {
+        let (rest, pw) = extract_password(&strings(&["in.pdf", "--password", "s3cret", "-o", "x"]));
+        assert_eq!(
+            (rest, pw.as_deref()),
+            (strings(&["in.pdf", "-o", "x"]), Some("s3cret"))
+        );
+        // The `=` form carries passwords that start with '-' (and empty ones).
+        let (rest, pw) = extract_password(&strings(&["in.pdf", "--password=-dash", "-o", "x"]));
+        assert_eq!(
+            (rest, pw.as_deref()),
+            (strings(&["in.pdf", "-o", "x"]), Some("-dash"))
+        );
+        let (_, pw) = extract_password(&strings(&["--password="]));
+        assert_eq!(pw.as_deref(), Some(""));
+        let (rest, pw) = extract_password(&strings(&["a.pdf", "b.pdf"]));
+        assert_eq!((rest, pw), (strings(&["a.pdf", "b.pdf"]), None));
+    }
 
     #[test]
     fn page_list_parsing_is_checked_and_bounded() {

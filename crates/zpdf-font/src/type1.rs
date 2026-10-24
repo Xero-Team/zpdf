@@ -17,7 +17,11 @@ const CHARSTRING_R: u16 = 4330;
 const C1: u16 = 52845;
 const C2: u16 = 22719;
 const MAX_SUBR_DEPTH: u32 = 60;
-const MAX_SEAC_DEPTH: u32 = 16;
+/// `seac` components must not be accented characters themselves (Adobe Type 1
+/// Font Format §6.4), so composition is one level deep. Each level builds two
+/// components: a deeper limit lets a chain of distinct composites multiply a
+/// leaf outline 2^depth times.
+const MAX_SEAC_DEPTH: u32 = 1;
 const MAX_CHARSTRING_STEPS: usize = 100_000;
 const MAX_CHARSTRING_STACK: usize = 96;
 const MAX_TYPE1_SUBRS: usize = 65_536;
@@ -1142,6 +1146,28 @@ mod tests {
         font.char_strings
             .insert("A".to_string(), vec![139, 139, 139, 204, 204, 12, 6]);
         assert!(font.glyph_outline_by_name("A").is_none());
+    }
+
+    #[test]
+    fn seac_composes_base_and_accent_but_not_nested_composites() {
+        let mut font = font_with_matrix([0.001, 0.0, 0.0, 0.001, 0.0, 0.0]);
+        let simple = font.char_strings["A"].clone();
+        font.char_strings.insert("grave".to_string(), simple);
+        // seac 0 0 0 65 193: /A with /grave (StandardEncoding 193).
+        let agrave = vec![139, 139, 139, 204, 247, 85, 12, 6];
+        font.char_strings
+            .insert("Agrave".to_string(), agrave.clone());
+        let base = font.glyph_outline_by_name("A").expect("base");
+        let outline = font.glyph_outline_by_name("Agrave").expect("composite");
+        assert_eq!(
+            outline.commands.len(),
+            2 * base.commands.len(),
+            "base and accent outlines"
+        );
+
+        // A composite whose base is itself a composite is malformed.
+        font.char_strings.insert("A".to_string(), agrave);
+        assert!(font.glyph_outline_by_name("Agrave").is_none());
     }
 
     #[test]

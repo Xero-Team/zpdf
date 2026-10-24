@@ -14,7 +14,20 @@ pub struct PptxWriter {
 }
 
 impl PptxWriter {
-    pub fn new(presentation: PptxPresentation) -> Self {
+    pub fn new(mut presentation: PptxPresentation) -> Self {
+        // slide generation numbers images per slide, but the media part name
+        // is presentation-wide. Renumber here so two pages both using
+        // "image1.png" do not produce duplicate ZIP members (or one slide
+        // pointing at another slide's picture).
+        let mut next = 0usize;
+        for slide in &mut presentation.slides {
+            for element in &mut slide.elements {
+                if let SlideElement::Image { image_id, .. } = element {
+                    next += 1;
+                    *image_id = format!("image{next}");
+                }
+            }
+        }
         Self { presentation }
     }
 
@@ -292,7 +305,7 @@ impl PptxWriter {
                 };
 
                 let stroke_xml = if let Some(rgb) = stroke_rgb {
-                    let width_emu = (stroke_width_pt * 12700.0) as i64;
+                    let width_emu = line_width_emu(*stroke_width_pt);
                     format!(
                         r#"          <a:ln w="{}">
             <a:solidFill>
@@ -354,7 +367,7 @@ impl PptxWriter {
                 };
 
                 let stroke_xml = if let Some(rgb) = stroke_rgb {
-                    let width_emu = (stroke_width_pt * 12700.0) as i64;
+                    let width_emu = line_width_emu(*stroke_width_pt);
                     format!(
                         r#"          <a:ln w="{}">
             <a:solidFill>
@@ -402,7 +415,9 @@ impl PptxWriter {
                 stroke_rgb,
                 stroke_width_pt,
             } => {
-                let width_emu = (stroke_width_pt * 12700.0) as i64;
+                let width_emu = line_width_emu(*stroke_width_pt);
+                let flip_h = if x2_emu < x1_emu { " flipH=\"1\"" } else { "" };
+                let flip_v = if y2_emu < y1_emu { " flipV=\"1\"" } else { "" };
                 format!(
                     r#"      <p:cxnSp>
         <p:nvCxnSpPr>
@@ -411,7 +426,7 @@ impl PptxWriter {
           <p:nvPr/>
         </p:nvCxnSpPr>
         <p:spPr>
-          <a:xfrm>
+          <a:xfrm{}{}>
             <a:off x="{}" y="{}"/>
             <a:ext cx="{}" cy="{}"/>
           </a:xfrm>
@@ -428,6 +443,8 @@ impl PptxWriter {
 "#,
                     id,
                     id,
+                    flip_h,
+                    flip_v,
                     x1_emu.min(x2_emu),
                     y1_emu.min(y2_emu),
                     (x2_emu - x1_emu).abs(),
@@ -475,10 +492,13 @@ impl PptxWriter {
                     id, id, image_id, x_emu, y_emu, width_emu, height_emu
                 )
             }
-            SlideElement::FreeformPath { .. } => {
-                // Complex paths not yet implemented
-                String::new()
-            }
+            SlideElement::FreeformPath {
+                path_data,
+                fill_rgb,
+                stroke_rgb,
+                stroke_width_pt,
+            } => freeform_shape(id, path_data, *fill_rgb, *stroke_rgb, *stroke_width_pt)
+                .unwrap_or_default(),
         }
     }
 
@@ -519,5 +539,205 @@ mod tests {
     #[test]
     fn escapes_xml_entities() {
         assert_eq!(escape_xml("a<b&c>d"), "a&lt;b&amp;c&gt;d");
+    }
+}
+
+/// Convert the SVG-style path data emitted by `SlideConverter::path_to_svg`
+/// into a DrawingML custom-geometry shape. Coordinates in `path_data` are in
+/// point space with y already flipped for PowerPoint.
+fn freeform_shape(
+    id: usize,
+    path_data: &str,
+    fill: Option<(u8, u8, u8)>,
+    stroke: Option<(u8, u8, u8)>,
+    stroke_width_pt: f64,
+) -> Option<String> {
+    #[derive(Clone, Copy)]
+    enum Cmd {
+        Move(f64, f64),
+        Line(f64, f64),
+        Cubic(f64, f64, f64, f64, f64, f64),
+        Close,
+    }
+
+    let tokens: Vec<&str> = path_data.split_whitespace().collect();
+    let mut cmds = Vec::new();
+    let mut i = 0;
+    let next_num = |i: &mut usize| -> Option<f64> {
+        let value = tokens.get(*i)?.parse::<f64>().ok()?;
+        if !value.is_finite() {
+            return None;
+        }
+        *i += 1;
+        Some(value)
+    };
+    while i < tokens.len() {
+        match tokens[i] {
+            "M" => {
+                i += 1;
+                cmds.push(Cmd::Move(next_num(&mut i)?, next_num(&mut i)?));
+            }
+            "L" => {
+                i += 1;
+                cmds.push(Cmd::Line(next_num(&mut i)?, next_num(&mut i)?));
+            }
+            "C" => {
+                i += 1;
+                cmds.push(Cmd::Cubic(
+                    next_num(&mut i)?,
+                    next_num(&mut i)?,
+                    next_num(&mut i)?,
+                    next_num(&mut i)?,
+                    next_num(&mut i)?,
+                    next_num(&mut i)?,
+                ));
+            }
+            "Z" => {
+                i += 1;
+                cmds.push(Cmd::Close);
+            }
+            _ => return None,
+        }
+    }
+    if cmds.is_empty() {
+        return None;
+    }
+
+    let mut min_x = f64::INFINITY;
+    let mut min_y = f64::INFINITY;
+    let mut max_x = f64::NEG_INFINITY;
+    let mut max_y = f64::NEG_INFINITY;
+    let mut include = |x: f64, y: f64| {
+        min_x = min_x.min(x);
+        min_y = min_y.min(y);
+        max_x = max_x.max(x);
+        max_y = max_y.max(y);
+    };
+    for cmd in &cmds {
+        match *cmd {
+            Cmd::Move(x, y) | Cmd::Line(x, y) => include(x, y),
+            Cmd::Cubic(x1, y1, x2, y2, x, y) => {
+                include(x1, y1);
+                include(x2, y2);
+                include(x, y);
+            }
+            Cmd::Close => {}
+        }
+    }
+    if !(min_x.is_finite() && min_y.is_finite() && max_x.is_finite() && max_y.is_finite()) {
+        return None;
+    }
+    let width = pt_to_emu((max_x - min_x).max(0.0));
+    let height = pt_to_emu((max_y - min_y).max(0.0));
+    let ext_w = width.max(1);
+    let ext_h = height.max(1);
+    let conv = |x: f64, y: f64| (pt_to_emu(x - min_x), pt_to_emu(y - min_y));
+
+    let mut path = String::new();
+    for cmd in &cmds {
+        match *cmd {
+            Cmd::Move(x, y) => {
+                let (px, py) = conv(x, y);
+                path.push_str(&format!(
+                    "<a:moveTo><a:pt x=\"{px}\" y=\"{py}\"/></a:moveTo>"
+                ));
+            }
+            Cmd::Line(x, y) => {
+                let (px, py) = conv(x, y);
+                path.push_str(&format!("<a:lnTo><a:pt x=\"{px}\" y=\"{py}\"/></a:lnTo>"));
+            }
+            Cmd::Cubic(x1, y1, x2, y2, x, y) => {
+                let (ax, ay) = conv(x1, y1);
+                let (bx, by) = conv(x2, y2);
+                let (cx, cy) = conv(x, y);
+                path.push_str(&format!(
+                    "<a:cubicBezTo><a:pt x=\"{ax}\" y=\"{ay}\"/><a:pt x=\"{bx}\" y=\"{by}\"/><a:pt x=\"{cx}\" y=\"{cy}\"/></a:cubicBezTo>"
+                ));
+            }
+            Cmd::Close => path.push_str("<a:close/>"),
+        }
+    }
+
+    let fill_xml = match fill {
+        Some((r, g, b)) => {
+            format!("<a:solidFill><a:srgbClr val=\"{r:02X}{g:02X}{b:02X}\"/></a:solidFill>")
+        }
+        None => "<a:noFill/>".to_string(),
+    };
+    let line_xml = match stroke {
+        Some((r, g, b)) => format!(
+            "<a:ln w=\"{}\"><a:solidFill><a:srgbClr val=\"{r:02X}{g:02X}{b:02X}\"/></a:solidFill></a:ln>",
+            line_width_emu(stroke_width_pt)
+        ),
+        None => "<a:ln><a:noFill/></a:ln>".to_string(),
+    };
+    let off_x = pt_to_emu(min_x);
+    let off_y = pt_to_emu(min_y);
+
+    Some(format!(
+        r#"      <p:sp>
+        <p:nvSpPr>
+          <p:cNvPr id="{id}" name="Freeform {id}"/>
+          <p:cNvSpPr/>
+          <p:nvPr/>
+        </p:nvSpPr>
+        <p:spPr>
+          <a:xfrm>
+            <a:off x="{off_x}" y="{off_y}"/>
+            <a:ext cx="{ext_w}" cy="{ext_h}"/>
+          </a:xfrm>
+          <a:custGeom>
+            <a:avLst/><a:gdLst/><a:ahLst/><a:cxnLst/>
+            <a:rect l="0" t="0" r="{ext_w}" b="{ext_h}"/>
+            <a:pathLst><a:path w="{ext_w}" h="{ext_h}">{path}</a:path></a:pathLst>
+          </a:custGeom>
+          {fill_xml}
+          {line_xml}
+        </p:spPr>
+      </p:sp>
+"#
+    ))
+}
+
+fn pt_to_emu(pt: f64) -> i64 {
+    (pt * 12700.0).round() as i64
+}
+
+/// The thinnest line drawn for a stroke: 0.25 pt, PowerPoint's minimum.
+const HAIRLINE_EMU: i64 = 3175;
+
+/// DrawingML line width for a PDF stroke width. PDF's 0 (and anything
+/// thinner than a device pixel) is a hairline that must stay visible
+/// (ISO 32000-1 §8.4.3.2), so widths never drop below [`HAIRLINE_EMU`].
+fn line_width_emu(stroke_width_pt: f64) -> i64 {
+    pt_to_emu(stroke_width_pt).max(HAIRLINE_EMU)
+}
+
+#[cfg(test)]
+mod freeform_tests {
+    use super::*;
+
+    #[test]
+    fn freeform_path_becomes_custom_geometry() {
+        let shape = freeform_shape(
+            7,
+            "M 10 10 L 30 10 C 35 10 40 15 40 20 Z",
+            Some((255, 0, 0)),
+            Some((0, 0, 0)),
+            1.0,
+        )
+        .expect("shape");
+        assert!(shape.contains("<a:custGeom>"), "{shape}");
+        assert!(shape.contains("<a:moveTo>"), "{shape}");
+        assert!(shape.contains("<a:lnTo>"), "{shape}");
+        assert!(shape.contains("<a:cubicBezTo>"), "{shape}");
+        assert!(shape.contains("<a:close/>"), "{shape}");
+        assert!(shape.contains("val=\"FF0000\""), "{shape}");
+    }
+
+    #[test]
+    fn malformed_path_data_is_skipped() {
+        assert!(freeform_shape(1, "M 10", None, None, 0.0).is_none());
+        assert!(freeform_shape(1, "garbage", None, None, 0.0).is_none());
     }
 }

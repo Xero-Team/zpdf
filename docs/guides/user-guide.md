@@ -63,10 +63,19 @@ The release binary is at `target/release/zpdf`. The examples below use
 | `stamp` | Overlay text or images on a page. |
 
 > **Encrypted PDFs.** Documents protected with a non-empty password open with
-> `--password <pw>` (accepted by `info`, `dump`, `render`, `text`, `convert`, `tables`,
-> `forms`, `outline`, and `attachments`).
+> `--password <pw>` — or `--password=<pw>` for a password that starts with `-`.
+> Every command accepts it except `compare` and `debug-stream` — including the
+> writer commands `fill`, `merge`, `split`, `optimize`, `annotate`, `redact`,
+> `sign`, `pages`, `set-meta`, `stamp` and `tag`.
 > The password may be the user or owner password; a wrong one reports an error.
 > Documents encrypted with an empty password open without the flag.
+>
+> Incremental writer commands (`fill`, `annotate`, `sign`, `pages`, `set-meta`,
+> `stamp`, `merge`) keep the input's encryption: new objects are encrypted with
+> the document's key. `merge` tries the one `--password` on every input, so it
+> can combine a protected file with unencrypted ones; the output is encrypted
+> only when the first (base) file is. The `/P` permission flags are not
+> enforced — any password that opens the file allows editing.
 
 ### `info` — inspect a document
 
@@ -306,7 +315,28 @@ cargo run -p zpdf-cli -- redact document.pdf -p 1 --rect 60,690,400,730 --fill 1
 ```
 
 Verify with `zpdf text redacted.pdf` — the covered text is gone from
-extraction, not merely hidden.
+extraction, not merely hidden. `/ActualText`/`/Alt` replacement text of the
+removed content is scrubbed (in the content stream, the page's marked-content
+property lists and the structure tree), images/forms that were only drawn
+inside the region are dropped, and so is the page thumbnail. A form field whose
+every widget was removed is removed with its value.
+
+The output is a **full rewrite**, not an incremental update, so the original
+content stream and earlier revisions are not left in the file. Consequences:
+
+- An encrypted input (`--password`) is written **decrypted**; re-encrypt it
+  with `optimize --encrypt` if needed.
+- Only the page region is redacted: document metadata (`/Info`, XMP),
+  bookmarks, attachments and other pages are kept as they are — review them
+  separately (e.g. `set-meta`).
+- Text selection uses estimated extents, not the renderer's complete glyph
+  geometry. Custom widths, spacing and vertical text can differ from that
+  estimate. Check both extraction and rendering of sensitive output; this
+  API does not guarantee sanitization of arbitrary PDFs.
+- A shared resource still reachable from another page, an inherited resource
+  dictionary or another retained object can remain in the output. The rewrite
+  removes superseded revisions and unreachable objects, not every duplicate
+  occurrence of sensitive data.
 
 ### `optimize` — compress, encrypt, downsample, linearize
 
@@ -410,18 +440,16 @@ scanned images.
 
 ## Known limitations
 
-- **Tiling patterns** (hatches/textures) paint a neutral gray placeholder.
-- **ExtGState soft masks** (vignettes, gradient-faded groups) are ignored.
-- **Non-embedded CJK fonts** render no glyphs yet (embedded fonts are fine).
+- **Non-embedded CJK fonts** need suitable system fonts or a registered
+  `FontProvider`; portable deployments should supply their own font pack.
 - **Annotation appearances** are synthesized for most markup/geometric subtypes
   when absent, but some fidelity trade-offs remain: a `Redact` mark shows the
   *marked* region (content is never actually removed, and `/OverlayText` is not
   drawn); a `Caret` does not distinguish the `/Sy` paragraph variant; rotated /
   skewed text-markup uses an axis-aligned approximation. The PDF 2.0 `Projection`
   subtype has no synthesized default appearance.
-- **JBIG2 / JPEG-2000** compressed images are skipped.
-- **Password-protected PDFs** (non-empty user password) won't decrypt — there
-  is no password prompt/API yet.
+- **PDF/A conversion** is best-effort; validate archival output with an
+  independent conformance checker such as veraPDF.
 - **Dense CJK text** can differ from the CPU renderer by ~1–1.4% of pixels at threshold
   16 (anti-aliasing only — the text is correct). It passes at threshold ~24–32.
 
@@ -431,6 +459,6 @@ scanned images.
 | --- | --- |
 | `--backend wgpu requires building with --features gpu` | Rebuild with `--features gpu`. |
 | GPU render errors with "no compatible GPU adapter found" | No usable GPU. Use `--backend cpu`, or set `ZPDF_GPU_FORCE_FALLBACK=1` if a software adapter (e.g. lavapipe/WARP) is installed. |
-| Encrypted PDF renders blank | A non-empty user password is required to open it; only empty-password (owner-locked) decryption is supported. |
-| Blank image areas on a scanned PDF | The images may be JBIG2 or JPEG-2000 compressed — not yet supported, see [CHANGELOG.md](../CHANGELOG.md). |
+| Encrypted PDF cannot open | Supply `--password=<pw>`; non-empty user and owner passwords are supported. |
+| Blank image areas on a scanned PDF | JBIG2 and JPEG-2000 are supported; inspect diagnostics for corrupt image data or a resource limit. |
 | Output size differs by 1px from an old golden image | Raster dims now use `ceil` (matches pdfium); re-bless goldens. |

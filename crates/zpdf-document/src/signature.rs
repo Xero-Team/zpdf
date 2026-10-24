@@ -54,6 +54,10 @@ const MAX_SIG_FIELDS: usize = 4_096;
 /// full certificate chain and timestamp token — are comfortably under this;
 /// the cap bounds work against an adversarial `/Contents`.
 const MAX_CMS_BYTES: usize = 4 * 1024 * 1024;
+/// Cap on `/ByteRange` pairs. A real signature has exactly two spans (either
+/// side of the `/Contents` hole). A longer array is reported truncated, never
+/// as covering the document, and its digest is not checked.
+const MAX_BYTE_RANGE_PAIRS: usize = 64;
 
 /// A digital signature attached to a `/Sig` form field.
 #[derive(Debug, Clone)]
@@ -149,7 +153,9 @@ impl Signature {
 /// How a signature's `/ByteRange` covers the file.
 #[derive(Debug, Clone)]
 pub struct ByteRangeCoverage {
-    /// The `(offset, length)` spans of the file that are signed, in order.
+    /// The `(offset, length)` spans of the file that are signed, in order. A
+    /// `/ByteRange` of more than 64 pairs is malformed: only the first 64 are
+    /// listed, and its digest is reported [`DigestStatus::Unsupported`].
     pub ranges: Vec<(usize, usize)>,
     /// True when the ranges start at byte 0 and the last range ends exactly at
     /// end-of-file (the single gap being the `/Contents` placeholder) — i.e. the
@@ -307,25 +313,55 @@ fn walk(
     if ft.as_deref() != Some("Sig") {
         return;
     }
-    let Some(sig_dict) = deref(file, dict.get("V").unwrap_or(&PdfObject::Null))
-        .as_dict()
-        .ok()
-        .cloned()
-    else {
+    let v = dict.get("V").unwrap_or(&PdfObject::Null);
+    // A signature dictionary belongs to one field. The id joins the visited
+    // set so fields sharing one `/V` do not re-verify the same signature (and
+    // copy its `/Contents` again) once each.
+    if let PdfObject::Ref(r) = v {
+        if !visited.insert(*r) {
+            tracing::warn!(
+                "signature dictionary {r} is shared by several fields; reporting it once"
+            );
+            return;
+        }
+    }
+    let Some(sig_dict) = deref(file, v).as_dict().ok().cloned() else {
         return;
     };
-    out.push(build_signature(file, name, &sig_dict));
+    out.push(build_signature(file, name, &sig_dict, visited));
 }
 
-fn build_signature(file: &PdfFile, field_name: String, sig: &PdfDict) -> Signature {
+fn build_signature(
+    file: &PdfFile,
+    field_name: String,
+    sig: &PdfDict,
+    visited: &mut HashSet<ObjectId>,
+) -> Signature {
     let sub_filter = sig.get_name("SubFilter").ok().map(String::from);
-    let contents = match deref(file, sig.get("Contents").unwrap_or(&PdfObject::Null)) {
-        PdfObject::String(s) => Some(s.as_bytes().to_vec()),
+    let contents_obj = sig.get("Contents").unwrap_or(&PdfObject::Null);
+    // Likewise an indirect `/Contents` string is used by one signature only:
+    // distinct dictionaries sharing a large one would each retain a copy.
+    let shared_contents = match contents_obj {
+        PdfObject::Ref(r) => !visited.insert(*r),
+        _ => false,
+    };
+    let contents = match deref(file, contents_obj) {
+        PdfObject::String(_) if shared_contents => {
+            tracing::warn!("signature /Contents is shared with another signature; ignoring it");
+            None
+        }
+        PdfObject::String(s) => Some(s.0),
         _ => None,
     };
 
-    let coverage = parse_byte_range(file, sig, file.data().len());
-    let outcome = verify(file, &coverage, contents.as_deref(), sub_filter.as_deref());
+    let (coverage, ranges_truncated) = parse_byte_range(file, sig, file.data().len());
+    let outcome = verify(
+        file,
+        &coverage,
+        ranges_truncated,
+        contents.as_deref(),
+        sub_filter.as_deref(),
+    );
 
     // Best-effort CMS analysis: timestamp detection, embedded cert count, and
     // offline CRL revocation. `None` contents → all-default.
@@ -386,48 +422,95 @@ struct VerifyOutcome {
 }
 
 /// Parse `/ByteRange` into `(offset, length)` spans and classify coverage.
-fn parse_byte_range(file: &PdfFile, sig: &PdfDict, file_len: usize) -> ByteRangeCoverage {
+/// The flag rejects malformed or over-budget arrays for digest verification;
+/// at most [`MAX_BYTE_RANGE_PAIRS`] valid pairs are retained.
+fn parse_byte_range(file: &PdfFile, sig: &PdfDict, file_len: usize) -> (ByteRangeCoverage, bool) {
     let mut ranges = Vec::new();
+    let mut truncated = true;
     if let PdfObject::Array(arr) = deref(file, sig.get("ByteRange").unwrap_or(&PdfObject::Null)) {
-        let nums: Vec<i64> = arr
-            .iter()
-            .filter_map(|o| match deref(file, o) {
-                PdfObject::Integer(n) => Some(n),
-                PdfObject::Real(r) if r.is_finite() => Some(r as i64),
+        // Look at no more elements than the cap needs, so a huge array costs
+        // nothing beyond its (already resolved) self.
+        truncated = arr.is_empty() || arr.len() % 2 != 0 || arr.len() > 2 * MAX_BYTE_RANGE_PAIRS;
+        if arr.len() > 2 * MAX_BYTE_RANGE_PAIRS {
+            tracing::warn!(
+                "/ByteRange has {} entries, over the {MAX_BYTE_RANGE_PAIRS}-pair cap",
+                arr.len()
+            );
+        }
+        for pair in arr.as_chunks::<2>().0.iter().take(MAX_BYTE_RANGE_PAIRS) {
+            let numbers = match (deref(file, &pair[0]), deref(file, &pair[1])) {
+                (PdfObject::Integer(off), PdfObject::Integer(len)) => {
+                    usize::try_from(off).ok().zip(usize::try_from(len).ok())
+                }
                 _ => None,
-            })
-            .collect();
-        for pair in nums.as_chunks::<2>().0 {
-            if let (Ok(off), Ok(len)) = (usize::try_from(pair[0]), usize::try_from(pair[1])) {
-                ranges.push((off, len));
-            }
+            };
+            let Some((off, len)) = numbers
+                .filter(|&(off, len)| off.checked_add(len).is_some_and(|end| end <= file_len))
+            else {
+                truncated = true;
+                break;
+            };
+            ranges.push((off, len));
         }
     }
 
-    // Whole-document coverage: first span at 0, last span ends at EOF.
-    let covers_whole_document = ranges.first().zip(ranges.last()).is_some_and(
-        |(&(first_off, _), &(last_off, last_len))| {
-            first_off == 0 && last_off.saturating_add(last_len) == file_len
-        },
-    );
+    // Whole-document coverage: first span at 0, last span ends at EOF, in
+    // order between them. A truncated list does not show where the declared
+    // spans end.
+    let covers_whole_document = !truncated
+        && spans_in_order(&ranges)
+        && contents_is_only_gap(file, sig, &ranges)
+        && ranges.first().zip(ranges.last()).is_some_and(
+            |(&(first_off, _), &(last_off, last_len))| {
+                first_off == 0 && last_off.saturating_add(last_len) == file_len
+            },
+        );
     let end = ranges
         .last()
         .map(|&(off, len)| off.saturating_add(len))
         .unwrap_or(0);
     let bytes_after_signature = file_len.saturating_sub(end);
 
-    ByteRangeCoverage {
-        ranges,
-        covers_whole_document,
-        bytes_after_signature,
+    (
+        ByteRangeCoverage {
+            ranges,
+            covers_whole_document,
+            bytes_after_signature,
+        },
+        truncated,
+    )
+}
+
+/// ISO 32000-1 section 12.8: the only unsigned bytes in a whole-document
+/// signature are the serialized /Contents string, including its delimiters.
+/// Merely starting at zero and ending at EOF does not prove this.
+fn contents_is_only_gap(file: &PdfFile, sig: &PdfDict, ranges: &[(usize, usize)]) -> bool {
+    let [(0, first_len), (second_off, _)] = ranges else {
+        return false;
+    };
+    let Some(gap) = file.data().get(*first_len..*second_off) else {
+        return false;
+    };
+    if !matches!(gap.first(), Some(b'<' | b'(')) {
+        return false;
     }
+    let mut lexer = zpdf_parser::Lexer::new(gap, 0, file.limits());
+    let Ok(PdfObject::String(value)) = lexer.next_token() else {
+        return false;
+    };
+    lexer.pos() == gap.len()
+        && matches!(deref(file, sig.get("Contents").unwrap_or(&PdfObject::Null)),
+            PdfObject::String(expected) if value == expected)
 }
 
 /// Recompute the covered-bytes digest, compare it to the CMS `messageDigest`,
 /// and verify the signer's public-key signature over the signed attributes.
+/// `ranges_truncated` (an over-long `/ByteRange`) makes the digest
+/// unverifiable.
 fn verify(
     file: &PdfFile,
     coverage: &ByteRangeCoverage,
+    ranges_truncated: bool,
     contents: Option<&[u8]>,
     sub_filter: Option<&str>,
 ) -> VerifyOutcome {
@@ -470,16 +553,18 @@ fn verify(
 
     // (1) Byte-range digest vs the messageDigest signed attribute.
     let digest = match (parsed.digest_alg, parsed.message_digest.as_deref()) {
-        (Some(alg), Some(embedded)) => match gather_ranges(file.data(), &coverage.ranges) {
-            Some(spans) => {
-                if alg.hash(&spans) == embedded {
-                    DigestStatus::Verified
-                } else {
-                    DigestStatus::Mismatch
+        (Some(alg), Some(embedded)) if !ranges_truncated => {
+            match covered_spans(file.data(), &coverage.ranges) {
+                Some(spans) => {
+                    if alg.hash_spans(&spans) == embedded {
+                        DigestStatus::Verified
+                    } else {
+                        DigestStatus::Mismatch
+                    }
                 }
+                None => DigestStatus::Unsupported, // malformed /ByteRange
             }
-            None => DigestStatus::Unsupported, // /ByteRange out of file bounds
-        },
+        }
         _ => DigestStatus::Unsupported,
     };
 
@@ -555,19 +640,28 @@ fn signature_alg_name(p: &cms::Cms) -> Option<String> {
     })
 }
 
-/// Collect the covered byte spans into a single buffer, or `None` if any span
-/// falls outside the file (a malformed or tampered `/ByteRange`).
-fn gather_ranges(data: &[u8], ranges: &[(usize, usize)]) -> Option<Vec<u8>> {
-    if ranges.is_empty() {
+/// The covered byte spans as slices of the file, in order, for hashing in
+/// place (never concatenated into a copy). `None` (a malformed or tampered
+/// `/ByteRange`) when there are no spans, any span falls outside the file, or
+/// the spans are out of order or overlap: a repeated byte can stand in for
+/// one left unsigned. In-order disjoint spans also bound the hashing work to
+/// one pass over the file.
+fn covered_spans<'d>(data: &'d [u8], ranges: &[(usize, usize)]) -> Option<Vec<&'d [u8]>> {
+    if ranges.is_empty() || !spans_in_order(ranges) {
         return None;
     }
-    let mut buf = Vec::new();
-    for &(off, len) in ranges {
-        let end = off.checked_add(len)?;
-        let slice = data.get(off..end)?;
-        buf.extend_from_slice(slice);
-    }
-    Some(buf)
+    ranges
+        .iter()
+        .map(|&(off, len)| data.get(off..off.checked_add(len)?))
+        .collect()
+}
+
+/// Whether each `(offset, length)` span starts at or after the previous one's
+/// end (no overlap, no going back).
+fn spans_in_order(ranges: &[(usize, usize)]) -> bool {
+    ranges
+        .windows(2)
+        .all(|w| w[0].0.checked_add(w[0].1).is_some_and(|end| end <= w[1].0))
 }
 
 // ---------------------------------------------------------------------------
@@ -593,11 +687,24 @@ impl DigestAlg {
     }
 
     fn hash(self, data: &[u8]) -> Vec<u8> {
+        self.hash_spans(&[data])
+    }
+
+    /// Digest of the concatenation of `spans`, fed to the hasher one span at a
+    /// time.
+    fn hash_spans(self, spans: &[&[u8]]) -> Vec<u8> {
+        fn run<D: Digest>(spans: &[&[u8]]) -> Vec<u8> {
+            let mut hasher = D::new();
+            for span in spans {
+                hasher.update(span);
+            }
+            hasher.finalize().to_vec()
+        }
         match self {
-            DigestAlg::Sha1 => Sha1::digest(data).to_vec(),
-            DigestAlg::Sha256 => Sha256::digest(data).to_vec(),
-            DigestAlg::Sha384 => Sha384::digest(data).to_vec(),
-            DigestAlg::Sha512 => Sha512::digest(data).to_vec(),
+            DigestAlg::Sha1 => run::<Sha1>(spans),
+            DigestAlg::Sha256 => run::<Sha256>(spans),
+            DigestAlg::Sha384 => run::<Sha384>(spans),
+            DigestAlg::Sha512 => run::<Sha512>(spans),
         }
     }
 
@@ -1326,7 +1433,7 @@ mod revocation {
     }
 
     /// (tag, content, rest-after-this-TLV) of the DER TLV at the start.
-    fn tlv_split(bytes: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+    pub(super) fn tlv_split(bytes: &[u8]) -> Option<(u8, &[u8], &[u8])> {
         let &tag = bytes.first()?;
         let len_byte = *bytes.get(1)?;
         let (len, hdr) = if len_byte < 0x80 {
@@ -1342,8 +1449,11 @@ mod revocation {
             }
             (l, 2 + n)
         };
-        let content = bytes.get(hdr..hdr + len)?;
-        Some((tag, content, &bytes[hdr + len..]))
+        // A four-byte length can reach `usize::MAX` on 32-bit targets, so the
+        // end offset must not wrap (mirrors `cms::tlv`).
+        let end = hdr.checked_add(len)?;
+        let content = bytes.get(hdr..end)?;
+        Some((tag, content, &bytes[end..]))
     }
 
     /// Top-level TLV byte slices within `content`.
@@ -1571,15 +1681,244 @@ mod tests {
     }
 
     #[test]
-    fn gather_ranges_bounds_checked() {
+    fn covered_spans_bounds_checked() {
         let data = b"0123456789";
         assert_eq!(
-            gather_ranges(data, &[(0, 3), (7, 3)]).as_deref(),
-            Some(&b"012789"[..])
+            covered_spans(data, &[(0, 3), (7, 3)]),
+            Some(vec![&b"012"[..], &b"789"[..]])
         );
         // Out-of-range span is rejected.
-        assert!(gather_ranges(data, &[(0, 3), (7, 99)]).is_none());
-        assert!(gather_ranges(data, &[]).is_none());
+        assert!(covered_spans(data, &[(0, 3), (7, 99)]).is_none());
+        assert!(covered_spans(data, &[(usize::MAX, 2)]).is_none());
+        assert!(covered_spans(data, &[]).is_none());
+        // Overlapping or backward spans are rejected, so hashing never reads
+        // more than one file's worth of bytes and no byte stands in for one
+        // left unsigned: here byte 1 repeats while 2–3 are skipped.
+        assert!(covered_spans(data, &[(0, 10), (0, 10)]).is_none());
+        assert!(covered_spans(data, &[(0, 2), (1, 1), (4, 6)]).is_none());
+        assert!(covered_spans(data, &[(7, 3), (0, 3)]).is_none());
+        assert!(covered_spans(data, &[(0, 10)]).is_some());
+        assert!(covered_spans(data, &[(0, 3), (3, 7)]).is_some(), "adjacent");
+    }
+
+    #[test]
+    fn span_hash_equals_hash_of_concatenation() {
+        for alg in [
+            DigestAlg::Sha1,
+            DigestAlg::Sha256,
+            DigestAlg::Sha384,
+            DigestAlg::Sha512,
+        ] {
+            assert_eq!(
+                alg.hash_spans(&[b"ab", b"", b"c"]),
+                alg.hash(b"abc"),
+                "{}",
+                alg.name()
+            );
+        }
+    }
+
+    /// The digest is checked span by span against the file; a `/ByteRange`
+    /// over the pair cap, or one repeating the whole file, is not verified
+    /// even though its digest would match.
+    #[test]
+    fn byte_range_digest_is_bounded() {
+        let pdf = build_pdf(&[
+            "<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>",
+        ]);
+        let file = PdfFile::parse(pdf.as_slice()).expect("parse");
+        let data = file.data();
+        let verdict = |ranges: Vec<(usize, usize)>, truncated: bool| {
+            let mut covered = Vec::new();
+            for &(off, len) in &ranges {
+                covered.extend_from_slice(&data[off..off + len]);
+            }
+            let cms = synth_cms(&Sha256::digest(&covered));
+            let coverage = ByteRangeCoverage {
+                ranges,
+                covers_whole_document: false,
+                bytes_after_signature: 0,
+            };
+            verify(
+                &file,
+                &coverage,
+                truncated,
+                Some(&cms),
+                Some("adbe.pkcs7.detached"),
+            )
+            .digest
+        };
+
+        assert_eq!(
+            verdict(vec![(0, 10), (20, 10)], false),
+            DigestStatus::Verified
+        );
+        assert_eq!(
+            verdict(vec![(0, 10), (20, 10)], true),
+            DigestStatus::Unsupported,
+            "an over-long /ByteRange is never verified"
+        );
+        assert_eq!(
+            verdict(vec![(0, data.len()); 3], false),
+            DigestStatus::Unsupported,
+            "spans repeating the file are rejected, not hashed"
+        );
+    }
+
+    #[test]
+    fn over_long_byte_range_is_truncated() {
+        let pairs: String = (0..MAX_BYTE_RANGE_PAIRS + 1)
+            .map(|i| format!("{} 1 ", i * 2))
+            .collect();
+        let pdf = build_pdf(&[
+            "<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>",
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>",
+            "<< /Fields [5 0 R] >>",
+            &format!("<< /FT /Sig /T (S) /V << /ByteRange [{pairs}] /Contents <00> >> >>"),
+        ]);
+        let file = PdfFile::parse(pdf.as_slice()).expect("parse");
+        let sigs = parse_signatures(&file);
+        assert_eq!(sigs.len(), 1);
+        assert_eq!(sigs[0].coverage.ranges.len(), MAX_BYTE_RANGE_PAIRS);
+        assert!(!sigs[0].coverage.covers_whole_document);
+        assert_eq!(sigs[0].digest, DigestStatus::Unsupported);
+    }
+
+    /// Spans running from offset 0 to EOF do not cover the document when an
+    /// overlap hides a gap (byte 1 repeats, bytes 2–3 are left out).
+    #[test]
+    fn overlapping_byte_range_does_not_cover_the_document() {
+        let pdf_with = |last_len: &str| {
+            build_pdf(&[
+                "<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>",
+                "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>",
+                "<< /Fields [5 0 R] >>",
+                &format!(
+                    "<< /FT /Sig /T (S) /V << /ByteRange [0 2 1 1 4 {last_len}] \
+                     /Contents <00> >> >>"
+                ),
+            ])
+        };
+        // Fixed-width length, so filling it in keeps the file length.
+        let len = pdf_with("0000000000").len();
+        let pdf = pdf_with(&format!("{:010}", len - 4));
+        assert_eq!(pdf.len(), len);
+        let file = PdfFile::parse(pdf.as_slice()).expect("parse");
+        let sigs = parse_signatures(&file);
+        assert_eq!(sigs.len(), 1);
+        assert_eq!(sigs[0].coverage.ranges.last(), Some(&(4, len - 4)));
+        assert!(!sigs[0].coverage.covers_whole_document);
+    }
+
+    #[test]
+    fn whole_document_coverage_requires_only_the_contents_gap() {
+        let pdf = build_pdf(&[
+            "<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>",
+            "<< /Contents <aabb> /Reason (reason) >>",
+        ]);
+        let start = pdf.windows(6).position(|w| w == b"<aabb>").unwrap();
+        let file = PdfFile::parse(pdf.as_slice()).unwrap();
+        let mut sig = file
+            .resolve(ObjectId(4, 0))
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .clone();
+        let mut coverage = |pairs: &[(usize, usize)]| {
+            sig.insert(
+                zpdf_core::PdfName::new("ByteRange"),
+                PdfObject::Array(
+                    pairs
+                        .iter()
+                        .flat_map(|&(a, b)| {
+                            [PdfObject::Integer(a as i64), PdfObject::Integer(b as i64)]
+                        })
+                        .collect(),
+                ),
+            );
+            parse_byte_range(&file, &sig, pdf.len())
+                .0
+                .covers_whole_document
+        };
+        assert!(coverage(&[(0, start), (start + 6, pdf.len() - start - 6)]));
+        assert!(!coverage(&[(0, 2), (4, pdf.len() - 4)]), "arbitrary gap");
+        assert!(
+            !coverage(&[(0, start), (start + 7, pdf.len() - start - 7)]),
+            "extra unsigned byte"
+        );
+        assert!(
+            !coverage(&[
+                (0, start),
+                (start + 6, 1),
+                (start + 8, pdf.len() - start - 8)
+            ]),
+            "second gap"
+        );
+    }
+
+    #[test]
+    fn malformed_byte_ranges_are_not_repaired_for_verification() {
+        for ranges in [
+            "0 2 /bad 4 2",
+            "0 2 4",
+            "0 2 -1 2 4 2",
+            "0 2 4.5 2",
+            "0 999999",
+        ] {
+            let pdf = build_pdf(&[
+                "<< /Type /Catalog /Pages 2 0 R >>",
+                "<< /Type /Pages /Kids [] /Count 0 >>",
+                &format!("<< /ByteRange [{ranges}] /Contents <00> >>"),
+            ]);
+            let file = PdfFile::parse(pdf.as_slice()).unwrap();
+            let sig = file.resolve(ObjectId(3, 0)).unwrap();
+            let (coverage, invalid) = parse_byte_range(&file, sig.as_dict().unwrap(), pdf.len());
+            assert!(invalid, "{ranges}");
+            assert!(!coverage.covers_whole_document, "{ranges}");
+        }
+    }
+
+    /// Fields sharing one signature dictionary report it once; distinct
+    /// dictionaries sharing one indirect `/Contents` do not each keep a copy.
+    #[test]
+    fn shared_signature_objects_are_reported_once() {
+        let pdf = build_pdf(&[
+            "<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>",
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>",
+            "<< /Fields [5 0 R 6 0 R 7 0 R] >>",
+            "<< /FT /Sig /T (A) /V 8 0 R >>",
+            "<< /FT /Sig /T (B) /V 8 0 R >>",
+            "<< /FT /Sig /T (C) /V 9 0 R >>",
+            "<< /ByteRange [0 10 20 10] /Contents 10 0 R >>",
+            "<< /ByteRange [0 10 20 10] /Contents 10 0 R >>",
+            "<aabbcc>",
+        ]);
+        let file = PdfFile::parse(pdf.as_slice()).expect("parse");
+        let sigs = parse_signatures(&file);
+        let names: Vec<&str> = sigs.iter().map(|s| s.field_name.as_str()).collect();
+        assert_eq!(names, ["A", "C"]);
+        assert_eq!(sigs[0].cms_blob.as_deref(), Some(&[0xaa, 0xbb, 0xcc][..]));
+        assert_eq!(sigs[1].cms_blob, None);
+    }
+
+    /// A four-byte DER length of `0xFFFF_FFFF` overflowed `hdr + len` on
+    /// 32-bit targets (wasm32 among them); it must be rejected instead.
+    #[test]
+    fn revocation_tlv_rejects_maximal_length() {
+        let blob = [0x30, 0x84, 0xFF, 0xFF, 0xFF, 0xFF, 0x00];
+        assert!(revocation::tlv_split(&blob).is_none());
+        assert_eq!(revocation::cert_count(&blob), 0);
+        assert_eq!(
+            revocation::revocation_status(&blob),
+            RevocationStatus::Unknown
+        );
     }
 
     #[test]

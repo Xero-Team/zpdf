@@ -173,6 +173,7 @@ impl Pdf {
             .with_page_rotation(page.rotate)
             .with_fonts(&mut fonts)
             .with_document(self.doc.file(), &page.resources)
+            .with_shared_fonts(&self.doc)
             .with_images(&mut images)
             .with_colors(&mut self.icc)
             .with_operand_stack_limit(self.doc.file().limits().max_operand_stack_depth as usize);
@@ -210,6 +211,7 @@ impl Pdf {
             let interpreter = zpdf::ContentInterpreter::new(page.effective_box())
                 .with_fonts(&mut fonts)
                 .with_document(self.doc.file(), &page.resources)
+                .with_shared_fonts(&self.doc)
                 .with_colors(&mut self.icc)
                 .with_text_sink(&mut spans)
                 .with_operand_stack_limit(
@@ -233,6 +235,7 @@ impl Pdf {
             .with_page_rotation(page.rotate)
             .with_fonts(&mut fonts)
             .with_document(self.doc.file(), &page.resources)
+            .with_shared_fonts(&self.doc)
             .with_images(&mut images)
             .with_colors(&mut self.icc)
             .with_operand_stack_limit(self.doc.file().limits().max_operand_stack_depth as usize)

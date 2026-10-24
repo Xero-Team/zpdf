@@ -17,6 +17,12 @@ use zpdf_core::{Error, ObjectId, Result};
 
 const MAX_ICC_PROFILE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_ICC_CACHE_ENTRIES: usize = 1024;
+/// Component ranges of a Lab-data ICCBased space (the `/Range` writers give
+/// such spaces; also the ICC 8-bit Lab encoding: `L* = 100·v/255`,
+/// `a*/b* = v − 128`), so normalizing by it yields the CMS input bytes.
+const LAB_DATA_RANGE: [[f64; 2]; 3] = [[0.0, 100.0], [-128.0, 127.0], [-128.0, 127.0]];
+/// Default `/Range` of every other ICCBased space.
+const UNIT_RANGE: [[f64; 2]; 4] = [[0.0, 1.0]; 4];
 
 /// PDF colour rendering intent (ISO 32000-1 §8.6.5.8) — the `ri` operator,
 /// ExtGState `/RI`, and image `/Intent`. Defaults to media-relative
@@ -58,6 +64,9 @@ impl RenderIntent {
 /// across threads behind its usual `Arc`.
 pub struct IccTransform {
     ncomp: u8,
+    /// The profile's data colour space is CIE Lab: colour operands are L*a*b*
+    /// values, not 0..=1 fractions.
+    lab: bool,
     executor: Arc<Transform8BitExecutor>,
 }
 
@@ -65,6 +74,7 @@ impl fmt::Debug for IccTransform {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("IccTransform")
             .field("ncomp", &self.ncomp)
+            .field("lab", &self.lab)
             .finish_non_exhaustive()
     }
 }
@@ -126,7 +136,11 @@ impl IccTransform {
             .ok_or_else(|| {
                 Error::StreamDecode("ICC profile cannot be connected to sRGB".to_string())
             })?;
-        Ok(Self { ncomp, executor })
+        Ok(Self {
+            ncomp,
+            lab: profile.color_space == DataColorSpace::Lab,
+            executor,
+        })
     }
 
     /// Input components per colour (1, 3, or 4).
@@ -134,15 +148,42 @@ impl IccTransform {
         self.ncomp as usize
     }
 
-    /// Convert one colour with components in 0..=1 to sRGB in 0..=1.
+    /// True when the profile's data colour space is CIE Lab.
+    pub fn is_lab(&self) -> bool {
+        self.lab
+    }
+
+    /// Convert one colour to sRGB in 0..=1. Components are in the space's
+    /// default `/Range`: 0..=1 for device-like profiles, `[0 100 −128 127
+    /// −128 127]` (L*a*b* values) for Lab-data profiles.
     ///
     /// Components are quantized to 8 bits — the same precision as the raster
-    /// path. Missing components read as 0.
+    /// path. Missing components read as the range minimum.
     pub fn color_to_rgb(&self, comps: &[f64]) -> (f64, f64, f64) {
+        let range: &[[f64; 2]] = if self.lab {
+            &LAB_DATA_RANGE
+        } else {
+            &UNIT_RANGE
+        };
+        self.color_to_rgb_in_range(comps, range)
+    }
+
+    /// [`Self::color_to_rgb`] with an explicit per-component `/Range`: each
+    /// component is normalized from its `[min, max]` pair before quantizing.
+    /// Components without a usable pair are treated as 0..=1.
+    pub fn color_to_rgb_in_range(&self, comps: &[f64], range: &[[f64; 2]]) -> (f64, f64, f64) {
         let mut src = [0u8; 4];
         for (i, s) in src.iter_mut().enumerate().take(self.components()) {
-            let v = comps.get(i).copied().unwrap_or(0.0);
-            *s = (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+            let [min, max] = range
+                .get(i)
+                .copied()
+                .filter(|[min, max]| min.is_finite() && max.is_finite() && max > min)
+                .unwrap_or([0.0, 1.0]);
+            let unit = match comps.get(i) {
+                Some(v) if v.is_finite() => ((v - min) / (max - min)).clamp(0.0, 1.0),
+                _ => 0.0,
+            };
+            *s = (unit * 255.0).round() as u8;
         }
         let [r, g, b] = self.comps8_to_rgb8(&src);
         (r as f64 / 255.0, g as f64 / 255.0, b as f64 / 255.0)
@@ -320,6 +361,46 @@ mod tests {
             (out[0] as i16 - 60).abs() > 30,
             "expected a visible shift, got {out:?}"
         );
+    }
+
+    #[test]
+    fn lab_data_profile_takes_lab_operands() {
+        // A Lab-data ICCBased colour arrives as L*a*b* values; clamping them
+        // to 0..=1 (the old behaviour) turned L*=50 into L*=100 with extreme
+        // negative a*/b*.
+        let bytes = moxcms::ColorProfile::new_lab().encode().unwrap();
+        let t = IccTransform::from_profile_bytes(&bytes, ri()).unwrap();
+        assert!(t.is_lab());
+        // Compare against the CMS fed the ICC 8-bit Lab encoding directly, so
+        // the test pins the operand normalization, not the CMS's Lab math.
+        let via_bytes = |bytes: [u8; 4]| {
+            let [r, g, b] = t.comps8_to_rgb8(&bytes);
+            (r as f64 / 255.0, g as f64 / 255.0, b as f64 / 255.0)
+        };
+        assert_eq!(
+            t.color_to_rgb(&[50.0, 0.0, 0.0]),
+            via_bytes([128, 128, 128, 0])
+        );
+        assert_eq!(
+            t.color_to_rgb(&[100.0, -128.0, 127.0]),
+            via_bytes([255, 0, 255, 0])
+        );
+        assert_ne!(
+            t.color_to_rgb(&[50.0, 0.0, 0.0]),
+            via_bytes([255, 0, 0, 0]),
+            "operands must not be clamped to 0..=1"
+        );
+        // An explicit /Range overrides the default normalization.
+        assert_eq!(
+            t.color_to_rgb_in_range(&[0.5, 0.5, 0.5], &[[0.0, 1.0]; 3]),
+            via_bytes([128, 128, 128, 0])
+        );
+
+        // Device profiles keep the 0..=1 convention.
+        let srgb = IccTransform::from_profile_bytes(SRGB, ri()).unwrap();
+        assert!(!srgb.is_lab());
+        let (r, _, _) = srgb.color_to_rgb(&[1.0, 0.0, 0.0]);
+        assert!(r > 0.98);
     }
 
     #[test]

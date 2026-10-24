@@ -28,15 +28,18 @@
 //! renders — and it runs only when explicitly called, never during `open` or
 //! rendering. Every descent is bounded (depth cap, a per-reference visited set
 //! seeded with the tree-root reference, a shared node/entry budget, role-map
-//! resolution depth, and per-string length caps) so a malformed or adversarial
-//! tree cannot hang, recurse without bound, or exhaust memory.
+//! resolution depth, per-string length caps, and a tree-wide text budget) so a
+//! malformed or adversarial tree cannot hang, recurse without bound, or exhaust
+//! memory.
 
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use zpdf_core::{ObjectId, PdfDict, PdfObject};
 use zpdf_parser::PdfFile;
 
-use crate::obj_util::{catalog_dict, resolve_dict, text};
+use crate::forms::pdf_string_to_unicode;
+use crate::obj_util::{catalog_dict, resolve_dict};
 use crate::Catalog;
 
 /// Maximum nesting depth of the structure tree before a subtree is pruned
@@ -55,6 +58,15 @@ const MAX_ROLE_MAP_ENTRIES: usize = 65_536;
 /// Cap (in `char`s) on a per-element text string (`/Alt`, `/ActualText`, `/T`,
 /// `/E`, `/Lang`). Real values are short; this bounds an adversarial one.
 const MAX_TEXT_CHARS: usize = 64 * 1024;
+/// Raw bytes of a text string decoded before the `char` cap applies: enough
+/// for [`MAX_TEXT_CHARS`] characters even as UTF-16 surrogate pairs (four bytes
+/// each), plus the BOM. The rest of a longer string could only be cut away.
+const MAX_TEXT_RAW_BYTES: usize = 2 + 4 * MAX_TEXT_CHARS;
+/// Budget (UTF-8 bytes) for the text strings of all elements in one tree. The
+/// per-string cap alone still lets every element carry 64K characters (many
+/// elements can share one huge indirect `/Alt`); once this is spent, further
+/// text entries read as absent.
+const MAX_TREE_TEXT_BYTES: usize = 32 * 1024 * 1024;
 
 /// A standard structure type (ISO 32000-1 §14.8.4), the *role* of a structure
 /// element after resolving its `/S` through the document's `/RoleMap`. A type
@@ -433,6 +445,8 @@ pub fn parse_struct_tree(file: &PdfFile, catalog: &Catalog) -> Option<StructTree
         role_map: read_role_map(file, &tree_root),
         visited,
         budget: MAX_STRUCT_ELEMENTS,
+        text_budget: MAX_TREE_TEXT_BYTES,
+        text_cache: HashMap::new(),
     };
 
     // The root's /K holds the top-level structure element(s). Its own /Pg (rare)
@@ -463,6 +477,11 @@ struct StructWalk<'a> {
     visited: HashSet<ObjectId>,
     /// Remaining element + kid-entry budget (shared across the whole walk).
     budget: usize,
+    /// Remaining bytes of element text ([`MAX_TREE_TEXT_BYTES`]).
+    text_budget: usize,
+    /// Capped text of indirect string objects, so one shared by many elements
+    /// is resolved and decoded once.
+    text_cache: HashMap<ObjectId, Option<Rc<str>>>,
 }
 
 impl StructWalk<'_> {
@@ -535,6 +554,13 @@ impl StructWalk<'_> {
         let raw_type = self.file_name(dict, "S").unwrap_or_default();
         let role = StructRole::from_name(&self.resolve_role(&raw_type));
 
+        // The element's own text is charged before its descendants', so they
+        // cannot spend the tree's budget out from under it.
+        let title = self.capped_text(dict, "T");
+        let lang = self.capped_text(dict, "Lang");
+        let alt = self.capped_text(dict, "Alt");
+        let actual_text = self.capped_text(dict, "ActualText");
+        let expansion = self.capped_text(dict, "E");
         let kids = normalize_kids(self.file, dict)
             .iter()
             .filter_map(|k| self.parse_kid(k, page, depth + 1))
@@ -543,14 +569,46 @@ impl StructWalk<'_> {
         Some(StructElem {
             role,
             raw_type,
-            title: capped_text(self.file, dict, "T"),
-            lang: capped_text(self.file, dict, "Lang"),
-            alt: capped_text(self.file, dict, "Alt"),
-            actual_text: capped_text(self.file, dict, "ActualText"),
-            expansion: capped_text(self.file, dict, "E"),
+            title,
+            lang,
+            alt,
+            actual_text,
+            expansion,
             page,
             kids,
         })
+    }
+
+    /// Read a text-string entry (following one indirect reference), capped to
+    /// [`MAX_TEXT_CHARS`] and charged to the tree's text budget. `None` once
+    /// the budget is spent.
+    fn capped_text(&mut self, dict: &PdfDict, key: &str) -> Option<String> {
+        if self.text_budget == 0 {
+            return None;
+        }
+        let text: Rc<str> = match dict.get(key)? {
+            PdfObject::String(s) => capped_decode(s.as_bytes()).into(),
+            PdfObject::Ref(r) => {
+                let file = self.file;
+                self.text_cache
+                    .entry(*r)
+                    .or_insert_with(|| match file.resolve(*r) {
+                        Ok(PdfObject::String(s)) => Some(capped_decode(s.as_bytes()).into()),
+                        _ => None,
+                    })
+                    .clone()?
+            }
+            _ => return None,
+        };
+        if text.len() > self.text_budget {
+            self.text_budget = 0;
+            tracing::warn!(
+                "structure tree text exceeds {MAX_TREE_TEXT_BYTES} bytes; dropping the rest"
+            );
+            return None;
+        }
+        self.text_budget -= text.len();
+        Some(text.to_string())
     }
 
     /// Build a [`StructKid::MarkedContent`] from a `/MCR` dict (or a kid dict
@@ -679,15 +737,17 @@ fn int_value(obj: Option<&PdfObject>) -> Option<i64> {
     }
 }
 
-/// Read a text-string entry and cap it to [`MAX_TEXT_CHARS`] on a `char`
-/// boundary (an adversarial `/Alt`/`/ActualText` can be arbitrarily long).
-fn capped_text(file: &PdfFile, dict: &PdfDict, key: &str) -> Option<String> {
-    match text(file, dict, key) {
-        Some(s) if s.chars().count() > MAX_TEXT_CHARS => {
-            Some(s.chars().take(MAX_TEXT_CHARS).collect())
-        }
-        other => other,
+/// Decode a text string (see [`pdf_string_to_unicode`]) capped to
+/// [`MAX_TEXT_CHARS`] on a `char` boundary. Only the first
+/// [`MAX_TEXT_RAW_BYTES`] are decoded: an adversarial `/Alt`/`/ActualText`
+/// can be arbitrarily long, and decoding all of it only to cut it would cost
+/// its full size per element.
+fn capped_decode(bytes: &[u8]) -> String {
+    let mut s = pdf_string_to_unicode(&bytes[..bytes.len().min(MAX_TEXT_RAW_BYTES)]);
+    if let Some((end, _)) = s.char_indices().nth(MAX_TEXT_CHARS) {
+        s.truncate(end);
     }
+    s
 }
 
 #[cfg(test)]
@@ -1007,6 +1067,77 @@ mod tests {
         );
         let alt = d.struct_tree().unwrap().children[0].alt.clone().unwrap();
         assert_eq!(alt.chars().count(), MAX_TEXT_CHARS);
+    }
+
+    /// Only a prefix of the raw string is decoded, yet the cap still yields
+    /// exactly `MAX_TEXT_CHARS` whole characters, including UTF-16 surrogate
+    /// pairs (four raw bytes each) and Latin-1 bytes (one each).
+    #[test]
+    fn capped_decode_cuts_raw_bytes_first() {
+        let mut utf16 = vec![0xFE, 0xFF];
+        for _ in 0..MAX_TEXT_CHARS + 500 {
+            utf16.extend_from_slice(&[0xD8, 0x3D, 0xDE, 0x00]); // U+1F600
+        }
+        let s = capped_decode(&utf16);
+        assert_eq!(s.chars().count(), MAX_TEXT_CHARS);
+        assert!(s.chars().all(|c| c == '\u{1F600}'));
+
+        let latin1 = vec![0xE9; MAX_TEXT_RAW_BYTES * 2];
+        let s = capped_decode(&latin1);
+        assert_eq!(s.chars().count(), MAX_TEXT_CHARS);
+        assert!(s.chars().all(|c| c == '\u{e9}'));
+
+        assert_eq!(capped_decode(b"short"), "short");
+    }
+
+    /// Many elements sharing one huge indirect `/Alt` each get the capped
+    /// text until the tree's text budget is spent, then none.
+    #[test]
+    fn shared_huge_alt_is_bounded_across_the_tree() {
+        const ELEMENTS: usize = 600;
+        let kids: String = (0..ELEMENTS).map(|i| format!("{} 0 R ", 6 + i)).collect();
+        let mut objs = vec![
+            "<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 4 0 R >>".to_string(),
+            PAGES.to_string(),
+            PAGE.to_string(),
+            format!("<< /Type /StructTreeRoot /K [{kids}] >>"),
+            format!("({})", "A".repeat(1 << 20)),
+        ];
+        objs.extend((0..ELEMENTS).map(|_| "<< /Type /StructElem /S /Figure /Alt 5 0 R >>".into()));
+        let refs: Vec<&str> = objs.iter().map(String::as_str).collect();
+        let tree = open(&refs).struct_tree().expect("tree");
+
+        assert_eq!(tree.children.len(), ELEMENTS, "elements are all kept");
+        let alts: Vec<usize> = tree
+            .children
+            .iter()
+            .filter_map(|e| e.alt.as_ref().map(String::len))
+            .collect();
+        assert!(alts.iter().all(|&n| n == MAX_TEXT_CHARS));
+        assert_eq!(alts.len(), MAX_TREE_TEXT_BYTES / MAX_TEXT_CHARS);
+        assert!(tree.children.last().unwrap().alt.is_none(), "budget spent");
+    }
+
+    /// A parent's text is read before its children spend the budget.
+    #[test]
+    fn parent_text_is_charged_before_its_children() {
+        const ELEMENTS: usize = 600;
+        let kids: String = (0..ELEMENTS).map(|i| format!("{} 0 R ", 7 + i)).collect();
+        let mut objs = vec![
+            "<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 4 0 R >>".to_string(),
+            PAGES.to_string(),
+            PAGE.to_string(),
+            "<< /Type /StructTreeRoot /K 6 0 R >>".to_string(),
+            format!("({})", "A".repeat(1 << 20)),
+            format!("<< /Type /StructElem /S /Sect /ActualText (parent) /K [{kids}] >>"),
+        ];
+        objs.extend((0..ELEMENTS).map(|_| "<< /Type /StructElem /S /Figure /Alt 5 0 R >>".into()));
+        let refs: Vec<&str> = objs.iter().map(String::as_str).collect();
+        let tree = open(&refs).struct_tree().expect("tree");
+
+        let parent = &tree.children[0];
+        assert_eq!(parent.actual_text.as_deref(), Some("parent"));
+        assert!(parent.kids.len() == ELEMENTS, "children are all kept");
     }
 
     #[test]

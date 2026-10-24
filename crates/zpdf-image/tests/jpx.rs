@@ -2,7 +2,7 @@
 //! `fixtures/gen_jpx_fixtures.py` (lossless fixtures ship byte-exact `.raw`
 //! references dumped at generation time).
 
-use zpdf_core::{ParseLimits, PdfDict, PdfName, PdfObject};
+use zpdf_core::{ParseLimits, PdfDict, PdfName, PdfObject, PdfString};
 use zpdf_image::{decode_image_xobject, decode_image_xobject_with_limits, DecodedImage};
 
 const W: u32 = 32;
@@ -169,4 +169,60 @@ fn oversized_codestream_dimensions_rejected() {
     data[12..16].copy_from_slice(&big);
     let res = decode_image_xobject(&data, &jpx_dict(W as i64, H as i64));
     assert!(res.is_err());
+}
+
+#[test]
+fn jpx_without_dict_dimensions_decodes() {
+    // /Width and /Height may be absent for JPXDecode: the codestream is
+    // authoritative.
+    let mut d = PdfDict::new();
+    d.insert(
+        PdfName::new("Filter"),
+        PdfObject::Name(PdfName::new("JPXDecode")),
+    );
+    let img = decode_image_xobject(RGB_JP2, &d).unwrap();
+    assert_eq!((img.width, img.height), (W, H));
+}
+
+#[test]
+fn jpx_stale_oversized_dict_dimensions_are_ignored() {
+    // The dict claims 20000x20000 (over the default 100M pixel cap) while the
+    // codestream is 32x24. The codestream dimensions decide, so this must not
+    // be rejected before the JPX decoder rewrites the geometry.
+    let img = decode_image_xobject(RGB_JP2, &jpx_dict(20_000, 20_000)).unwrap();
+    assert_eq!((img.width, img.height), (W, H));
+}
+
+#[test]
+fn dict_colorspace_overrides_codestream_without_caller_colorspace() {
+    // A gray codestream under an /Indexed palette: the dict's /ColorSpace must
+    // apply even though the caller resolved no colour space (spec 7.4.9).
+    let lookup: Vec<u8> = (0..=255u8).flat_map(|k| [k, 0, 255 - k]).collect();
+    let mut d = jpx_dict(W as i64, H as i64);
+    d.insert(
+        PdfName::new("ColorSpace"),
+        PdfObject::Array(vec![
+            PdfObject::Name(PdfName::new("Indexed")),
+            PdfObject::Name(PdfName::new("DeviceRGB")),
+            PdfObject::Integer(255),
+            PdfObject::String(PdfString(lookup)),
+        ]),
+    );
+    let img = decode_image_xobject(GRAY_J2K, &d).unwrap();
+    for (i, &g) in GRAY_REF.iter().enumerate().take((W * H) as usize) {
+        assert_eq!(px(&img, i), &[g, 0, 255 - g, 255], "pixel {i}");
+    }
+}
+
+#[test]
+fn stencil_mask_starting_with_a_jpx_signature_stays_a_stencil() {
+    // 1-bit stencil rows that happen to begin with SOC+SIZ, no /Filter: the
+    // signature sniff must not reroute an image mask to the JPX decoder.
+    let mut d = PdfDict::new();
+    d.insert(PdfName::new("Width"), PdfObject::Integer(8));
+    d.insert(PdfName::new("Height"), PdfObject::Integer(4));
+    d.insert(PdfName::new("ImageMask"), PdfObject::Bool(true));
+    let img = decode_image_xobject(b"\xFF\x4F\xFF\x51", &d).unwrap();
+    assert!(img.is_image_mask);
+    assert_eq!((img.width, img.height), (8, 4));
 }

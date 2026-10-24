@@ -25,7 +25,7 @@
 use aes::cipher::{BlockModeDecrypt, BlockModeEncrypt, KeyIvInit};
 use sha2::Digest;
 use std::sync::Arc;
-use zpdf_core::{ObjectId, PdfDict, PdfObject, PdfString};
+use zpdf_core::{Error, ObjectId, PdfDict, PdfObject, PdfString, Result};
 
 /// The 32-byte password-padding string from PDF 1.7 §7.6.3.3 (Algorithm 2).
 const PAD: [u8; 32] = [
@@ -67,6 +67,12 @@ pub struct Decryptor {
     stm_algo: Algo,
     /// Cipher for strings (`/StrF` crypt filter).
     str_algo: Algo,
+    /// Cipher for embedded-file streams (`/EFF` crypt filter, default
+    /// `/StmF`).
+    eff_algo: Algo,
+    /// Ciphers of the `/CF` crypt filters by name, for streams that name one
+    /// with a `/Crypt` filter of their own (V4/V5 only).
+    crypt_filters: Vec<(String, Algo)>,
     /// The `/Encrypt` dictionary's own object id, which must never be
     /// decrypted (its strings are stored in the clear). `None` when the
     /// trailer carries a direct (non-reference) `/Encrypt` dict.
@@ -107,13 +113,23 @@ impl Decryptor {
         // V4/V5: `/CF` crypt filters selected by `/StmF` (streams) and `/StrF`
         // (strings); per spec the default for each is `Identity` (no
         // encryption for that class).
-        let (stm_algo, str_algo) = if v >= 4 {
+        let (stm_algo, str_algo, eff_algo) = if v >= 4 {
+            let stmf = dict.get_name("StmF").unwrap_or("Identity");
             (
-                algo_for_filter(dict, dict.get_name("StmF").unwrap_or("Identity")),
+                algo_for_filter(dict, stmf),
                 algo_for_filter(dict, dict.get_name("StrF").unwrap_or("Identity")),
+                algo_for_filter(dict, dict.get_name("EFF").unwrap_or(stmf)),
             )
         } else {
-            (Algo::Rc4, Algo::Rc4)
+            (Algo::Rc4, Algo::Rc4, Algo::Rc4)
+        };
+        let crypt_filters = match dict.get_dict("CF") {
+            Ok(cf) if v >= 4 => {
+                cf.0.keys()
+                    .map(|name| (name.0.clone(), algo_for_filter(dict, &name.0)))
+                    .collect()
+            }
+            _ => Vec::new(),
         };
 
         // Default true (R<4 has no such key and always encrypts metadata).
@@ -140,8 +156,9 @@ impl Decryptor {
                 Some(PdfObject::Real(n)) => *n as i32,
                 _ => 0,
             };
-            // AESV2 always uses a 128-bit key regardless of what /Length says.
-            let length_bits = if stm_algo == Algo::AesV2 || str_algo == Algo::AesV2 {
+            // AESV2 always uses a 128-bit key regardless of what /Length says,
+            // whichever class (streams, strings, attachments) uses it.
+            let length_bits = if [stm_algo, str_algo, eff_algo].contains(&Algo::AesV2) {
                 128
             } else {
                 key_length_bits(dict, v)
@@ -187,6 +204,8 @@ impl Decryptor {
             key,
             stm_algo,
             str_algo,
+            eff_algo,
+            crypt_filters,
             encrypt_id,
             encrypt_metadata,
         })
@@ -212,12 +231,34 @@ impl Decryptor {
     /// **Encrypt** a stream payload for object `id` (the write-side inverse of
     /// [`Self::decrypt_stream_bytes`]). Used by the incremental writer to add
     /// objects to an already-encrypted document with its existing key.
+    ///
+    /// # Panics
+    ///
+    /// When AES needs an IV and the OS random number generator is unavailable;
+    /// [`Self::try_encrypt_stream_bytes`] reports that as an error instead.
     pub fn encrypt_stream_bytes(&self, id: ObjectId, data: &[u8]) -> Vec<u8> {
+        self.try_encrypt_stream_bytes(id, data)
+            .expect("OS random number generator unavailable for the AES-CBC IV")
+    }
+
+    /// Fallible [`Self::encrypt_stream_bytes`]: errors when the OS random
+    /// number generator cannot supply an AES-CBC IV.
+    pub fn try_encrypt_stream_bytes(&self, id: ObjectId, data: &[u8]) -> Result<Vec<u8>> {
         self.encrypt(id, data, self.stm_algo)
     }
 
     /// **Encrypt** a string payload for object `id`.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::encrypt_stream_bytes`]; see [`Self::try_encrypt_string_bytes`].
     pub fn encrypt_string_bytes(&self, id: ObjectId, data: &[u8]) -> Vec<u8> {
+        self.try_encrypt_string_bytes(id, data)
+            .expect("OS random number generator unavailable for the AES-CBC IV")
+    }
+
+    /// Fallible [`Self::encrypt_string_bytes`].
+    pub fn try_encrypt_string_bytes(&self, id: ObjectId, data: &[u8]) -> Result<Vec<u8>> {
         self.encrypt(id, data, self.str_algo)
     }
 
@@ -225,39 +266,50 @@ impl Decryptor {
     /// key for `id`. Stream payloads are NOT touched (they are encrypted
     /// separately via [`Self::encrypt_stream_bytes`], since writers carry the
     /// payload out-of-band).
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::encrypt_stream_bytes`]; see [`Self::try_encrypt_object_strings`].
     pub fn encrypt_object_strings(&self, obj: &mut PdfObject, id: ObjectId) {
+        self.try_encrypt_object_strings(obj, id)
+            .expect("OS random number generator unavailable for the AES-CBC IV")
+    }
+
+    /// Fallible [`Self::encrypt_object_strings`].
+    pub fn try_encrypt_object_strings(&self, obj: &mut PdfObject, id: ObjectId) -> Result<()> {
         match obj {
             PdfObject::String(s) if self.str_algo != Algo::Identity => {
-                *s = PdfString(self.encrypt(id, &s.0, self.str_algo));
+                *s = PdfString(self.encrypt(id, &s.0, self.str_algo)?);
             }
             PdfObject::String(_) => {}
             PdfObject::Array(a) => {
                 for o in a.iter_mut() {
-                    self.encrypt_object_strings(o, id);
+                    self.try_encrypt_object_strings(o, id)?;
                 }
             }
             PdfObject::Dict(d) => {
                 for v in d.0.values_mut() {
-                    self.encrypt_object_strings(v, id);
+                    self.try_encrypt_object_strings(v, id)?;
                 }
             }
             PdfObject::Stream(s) => {
                 for v in s.dict.0.values_mut() {
-                    self.encrypt_object_strings(v, id);
+                    self.try_encrypt_object_strings(v, id)?;
                 }
             }
             _ => {}
         }
+        Ok(())
     }
 
     /// Per-object key derivation + cipher application, encrypt direction.
-    fn encrypt(&self, id: ObjectId, data: &[u8], algo: Algo) -> Vec<u8> {
-        match algo {
+    fn encrypt(&self, id: ObjectId, data: &[u8], algo: Algo) -> Result<Vec<u8>> {
+        Ok(match algo {
             Algo::Identity => data.to_vec(),
             // RC4 is symmetric.
             Algo::Rc4 => rc4(&self.object_key(id, algo), data),
-            Algo::AesV2 | Algo::AesV3 => aes_cbc_encrypt(&self.object_key(id, algo), data),
-        }
+            Algo::AesV2 | Algo::AesV3 => aes_cbc_encrypt(&self.object_key(id, algo), data)?,
+        })
     }
 
     fn walk(&self, obj: &mut PdfObject, id: ObjectId) {
@@ -286,8 +338,19 @@ impl Decryptor {
                 // are detectable here (we don't know if this object is the
                 // catalog's /Metadata target) — that covers conforming files.
                 let plain_meta = !self.encrypt_metadata && typ == "Metadata";
-                if !is_xref && !plain_meta && self.stm_algo != Algo::Identity {
-                    let dec = self.decrypt(id, &s.data, self.stm_algo);
+                let (algo, explicit) = self.stream_algo(&s.dict);
+                if !is_xref && !plain_meta && algo != Algo::Identity {
+                    // An explicit /Crypt uses the security handler's key as
+                    // is, without Algorithm 1 (ISO 32000-1 section 7.4.10).
+                    let dec = if explicit {
+                        match algo {
+                            Algo::Rc4 => rc4(&self.key, &s.data),
+                            Algo::AesV2 | Algo::AesV3 => aes_cbc_decrypt(&self.key, &s.data),
+                            Algo::Identity => unreachable!(),
+                        }
+                    } else {
+                        self.decrypt(id, &s.data, algo)
+                    };
                     s.data = Arc::from(dec);
                 }
                 for v in s.dict.0.values_mut() {
@@ -297,6 +360,41 @@ impl Decryptor {
             // Refs are followed (and decrypted) when resolved; scalars are plain.
             _ => {}
         }
+    }
+
+    /// The cipher of a stream with dictionary `dict`: the crypt filter its own
+    /// leading `/Crypt` filter names (`/DecodeParms /Name`, default
+    /// `Identity` — ISO 32000-1 §7.4.10), else `/EFF` for an embedded file,
+    /// else `/StmF`.
+    fn stream_algo(&self, dict: &PdfDict) -> (Algo, bool) {
+        let first_filter = match dict.get("Filter") {
+            Some(PdfObject::Name(n)) => Some(n.as_str()),
+            Some(PdfObject::Array(a)) => a.first().and_then(|f| f.as_name().ok()),
+            _ => None,
+        };
+        if first_filter == Some("Crypt") {
+            let parms = match dict.get("DecodeParms").or_else(|| dict.get("DP")) {
+                Some(PdfObject::Dict(d)) => Some(d),
+                Some(PdfObject::Array(a)) => a.first().and_then(|p| p.as_dict().ok()),
+                _ => None,
+            };
+            let name = parms
+                .and_then(|p| p.get_name("Name").ok())
+                .unwrap_or("Identity");
+            if name == "Identity" {
+                return (Algo::Identity, true);
+            }
+            let algo = self
+                .crypt_filters
+                .iter()
+                .find(|(n, _)| n == name)
+                .map_or(self.stm_algo, |&(_, algo)| algo);
+            return (algo, true);
+        }
+        if dict.get_name("Type").ok() == Some("EmbeddedFile") {
+            return (self.eff_algo, false);
+        }
+        (self.stm_algo, false)
     }
 
     /// Per-object key derivation (Algorithm 1) + cipher application.
@@ -333,22 +431,25 @@ impl Decryptor {
 /// Effective file-key length, in bits. For V≥4 the key size of an RC4 crypt
 /// filter lives in `/CF/<StmF>/Length` and is expressed in **bytes** (ISO 32000
 /// §7.6.5), distinct from the document-level `/Encrypt /Length` (in **bits**,
-/// §7.6.3). Prefer the crypt-filter length; fall back to the document length,
-/// then to 40.
+/// §7.6.3). Prefer the length of the first crypt filter in use (`/StmF`, then
+/// `/StrF`, then `/EFF`); fall back to the document length, then to 40.
 fn key_length_bits(dict: &PdfDict, v: i64) -> i64 {
     if v >= 4 {
         let stmf = dict.get_name("StmF").unwrap_or("Identity");
-        if stmf != "Identity" {
-            if let Some(len) = dict
-                .get_dict("CF")
-                .ok()
-                .and_then(|cf| cf.get_dict(stmf).ok())
-                .and_then(|f| f.get_i64("Length").ok())
-            {
-                // Spec says bytes (5..=16); a value clearly too large for bytes is
-                // a non-conforming producer that wrote bits — accept either.
-                return if len <= 32 { len * 8 } else { len };
-            }
+        let filters = [
+            stmf,
+            dict.get_name("StrF").unwrap_or("Identity"),
+            dict.get_name("EFF").unwrap_or(stmf),
+        ];
+        let cf = dict.get_dict("CF").ok();
+        if let Some(len) = filters
+            .into_iter()
+            .filter(|&name| name != "Identity")
+            .find_map(|name| cf?.get_dict(name).ok()?.get_i64("Length").ok())
+        {
+            // Spec says bytes (5..=16); a value clearly too large for bytes is
+            // a non-conforming producer that wrote bits — accept either.
+            return if len <= 32 { len * 8 } else { len };
         }
     }
     dict.get_i64("Length").unwrap_or(40)
@@ -730,20 +831,15 @@ fn aes128_cbc_encrypt_nopad(key: &[u8], iv: &[u8], data: &[u8]) -> Vec<u8> {
 /// PKCS#5 padding. Key length selects AES-128 (AESV2) vs AES-256 (AESV3). The
 /// write-side inverse of [`aes_cbc_decrypt`]; used when adding objects to an
 /// encrypted document.
-fn aes_cbc_encrypt(key: &[u8], data: &[u8]) -> Vec<u8> {
+fn aes_cbc_encrypt(key: &[u8], data: &[u8]) -> Result<Vec<u8>> {
     let mut iv = [0u8; 16];
-    // The IV must be unpredictable but need not be secret. getrandom is not a
-    // parser dependency, so derive it from entropy we have: MD5 over the data
-    // plus a process-unique counter. (Writers with stronger requirements
-    // encrypt via zpdf-writer's Encryptor, which uses the system RNG.)
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let nonce = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let mut seed = Vec::with_capacity(data.len().min(256) + 16);
-    seed.extend_from_slice(&nonce.to_le_bytes());
-    seed.extend_from_slice(&(data.len() as u64).to_le_bytes());
-    seed.extend_from_slice(&data[..data.len().min(240)]);
-    iv.copy_from_slice(&md5(&seed));
+    // CBC needs an unpredictable IV. A failure of the OS CSPRNG is fatal for
+    // confidentiality, so do not fall back to a predictable value.
+    getrandom::getrandom(&mut iv).map_err(|e| {
+        Error::Io(std::io::Error::other(format!(
+            "OS random number generator unavailable for the AES-CBC IV: {e}"
+        )))
+    })?;
 
     let pad = 16 - (data.len() % 16);
     let mut buf = Vec::with_capacity(data.len() + pad);
@@ -778,13 +874,13 @@ fn aes_cbc_encrypt(key: &[u8], data: &[u8]) -> Vec<u8> {
             "invalid AES key length {}; data left unencrypted",
             key.len()
         );
-        return data.to_vec();
+        return Ok(data.to_vec());
     }
 
     let mut out = Vec::with_capacity(16 + buf.len());
     out.extend_from_slice(&iv);
     out.extend_from_slice(&buf);
-    out
+    Ok(out)
 }
 
 // ----------------------------------------------------------------------------
@@ -974,6 +1070,8 @@ mod tests {
             key,
             stm_algo: Algo::Rc4,
             str_algo: Algo::Rc4,
+            eff_algo: Algo::Rc4,
+            crypt_filters: Vec::new(),
             encrypt_id: None,
             encrypt_metadata: true,
         };
@@ -1149,6 +1247,178 @@ mod tests {
         }
     }
 
+    /// A stream's own `/Crypt` filter selects its cipher: `/Name /Identity`
+    /// (or no name) exempts it from `/StmF`, a named `/CF` filter applies that
+    /// filter. Embedded files use `/EFF`. The `/Crypt` entry itself is then
+    /// skipped by the filter pipeline.
+    #[test]
+    fn per_stream_crypt_filters_select_the_cipher() {
+        let mut stdcf = PdfDict::new();
+        stdcf.insert(PdfName::new("CFM"), PdfObject::Name(PdfName::new("V2")));
+        stdcf.insert(PdfName::new("Length"), PdfObject::Integer(16));
+        let mut cf = PdfDict::new();
+        cf.insert(PdfName::new("StdCF"), PdfObject::Dict(stdcf));
+        let mut dict = PdfDict::new();
+        dict.insert(
+            PdfName::new("Filter"),
+            PdfObject::Name(PdfName::new("Standard")),
+        );
+        dict.insert(PdfName::new("V"), PdfObject::Integer(4));
+        dict.insert(PdfName::new("R"), PdfObject::Integer(4));
+        dict.insert(PdfName::new("CF"), PdfObject::Dict(cf));
+        dict.insert(PdfName::new("StmF"), PdfObject::Name(PdfName::new("StdCF")));
+        dict.insert(PdfName::new("StrF"), PdfObject::Name(PdfName::new("StdCF")));
+        dict.insert(
+            PdfName::new("EFF"),
+            PdfObject::Name(PdfName::new("Identity")),
+        );
+        let dec = match Decryptor::from_encrypt_dict(&dict, &[], None, b"") {
+            BuildResult::Decryptor(d) => d,
+            _ => panic!("decryptor"),
+        };
+
+        let crypt = |name: Option<&str>| {
+            let mut d = PdfDict::new();
+            d.insert(
+                PdfName::new("Filter"),
+                PdfObject::Array(vec![PdfObject::Name(PdfName::new("Crypt"))]),
+            );
+            if let Some(name) = name {
+                let mut parms = PdfDict::new();
+                parms.insert(PdfName::new("Name"), PdfObject::Name(PdfName::new(name)));
+                d.insert(
+                    PdfName::new("DecodeParms"),
+                    PdfObject::Array(vec![PdfObject::Dict(parms)]),
+                );
+            }
+            d
+        };
+        let decrypted = |stream_dict: PdfDict| {
+            let mut obj = PdfObject::Stream(PdfStream::new(stream_dict, b"payload".to_vec()));
+            dec.decrypt_object(&mut obj, ObjectId(9, 0));
+            let PdfObject::Stream(s) = obj else {
+                unreachable!()
+            };
+            s
+        };
+
+        assert_eq!(
+            &decrypted(crypt(None)).data[..],
+            b"payload",
+            "default Identity"
+        );
+        let exempt = decrypted(crypt(Some("Identity")));
+        assert_eq!(&exempt.data[..], b"payload");
+        assert_eq!(
+            crate::filters::decode_stream(&exempt.data, &exempt.dict).unwrap(),
+            b"payload",
+            "the /Crypt filter is not a decode step"
+        );
+        assert_ne!(&decrypted(crypt(Some("StdCF"))).data[..], b"payload");
+        assert_ne!(&decrypted(PdfDict::new()).data[..], b"payload", "/StmF");
+
+        let mut embedded = PdfDict::new();
+        embedded.insert(
+            PdfName::new("Type"),
+            PdfObject::Name(PdfName::new("EmbeddedFile")),
+        );
+        assert_eq!(&decrypted(embedded).data[..], b"payload", "/EFF Identity");
+    }
+
+    #[test]
+    fn explicit_crypt_uses_the_file_key_without_object_derivation() {
+        for algo in [Algo::Rc4, Algo::AesV2, Algo::AesV3] {
+            let dec = Decryptor {
+                key: vec![42; if algo == Algo::AesV3 { 32 } else { 16 }],
+                stm_algo: algo,
+                str_algo: algo,
+                eff_algo: algo,
+                crypt_filters: vec![("StdCF".into(), algo)],
+                encrypt_id: None,
+                encrypt_metadata: true,
+            };
+            let plain = b"explicit crypt payload";
+            let encrypted = match algo {
+                Algo::Rc4 => rc4(&dec.key, plain),
+                _ => aes_cbc_encrypt(&dec.key, plain).unwrap(),
+            };
+            let mut parms = PdfDict::new();
+            parms.insert(PdfName::new("Name"), PdfObject::Name(PdfName::new("StdCF")));
+            for array in [false, true] {
+                let mut dict = PdfDict::new();
+                let filter = PdfObject::Name(PdfName::new("Crypt"));
+                let params = PdfObject::Dict(parms.clone());
+                dict.insert(
+                    PdfName::new("Filter"),
+                    if array {
+                        PdfObject::Array(vec![filter])
+                    } else {
+                        filter
+                    },
+                );
+                dict.insert(
+                    PdfName::new("DecodeParms"),
+                    if array {
+                        PdfObject::Array(vec![params])
+                    } else {
+                        params
+                    },
+                );
+                for id in [ObjectId(9, 0), ObjectId(512, 2)] {
+                    let mut obj =
+                        PdfObject::Stream(PdfStream::new(dict.clone(), encrypted.clone()));
+                    dec.decrypt_object(&mut obj, id);
+                    let PdfObject::Stream(stream) = obj else {
+                        panic!("stream")
+                    };
+                    assert_eq!(&*stream.data, plain);
+                }
+            }
+            let id = ObjectId(9, 0);
+            let encrypted = dec.try_encrypt_stream_bytes(id, plain).unwrap();
+            let mut obj = PdfObject::Stream(PdfStream::new(PdfDict::new(), encrypted));
+            dec.decrypt_object(&mut obj, id);
+            let PdfObject::Stream(stream) = obj else {
+                panic!("stream")
+            };
+            assert_eq!(
+                &*stream.data, plain,
+                "implicit filters still use Algorithm 1"
+            );
+        }
+    }
+
+    /// With streams and strings in the clear, the attachment filter alone sets
+    /// the file key's length: 128 bits for AESV2, its `/Length` for RC4.
+    #[test]
+    fn attachment_filter_sets_the_key_length() {
+        let key_len = |cfm: &str, length: Option<i64>| {
+            let mut stdcf = PdfDict::new();
+            stdcf.insert(PdfName::new("CFM"), PdfObject::Name(PdfName::new(cfm)));
+            if let Some(length) = length {
+                stdcf.insert(PdfName::new("Length"), PdfObject::Integer(length));
+            }
+            let mut cf = PdfDict::new();
+            cf.insert(PdfName::new("StdCF"), PdfObject::Dict(stdcf));
+            let mut dict = PdfDict::new();
+            dict.insert(
+                PdfName::new("Filter"),
+                PdfObject::Name(PdfName::new("Standard")),
+            );
+            dict.insert(PdfName::new("V"), PdfObject::Integer(4));
+            dict.insert(PdfName::new("R"), PdfObject::Integer(4));
+            dict.insert(PdfName::new("CF"), PdfObject::Dict(cf));
+            dict.insert(PdfName::new("EFF"), PdfObject::Name(PdfName::new("StdCF")));
+            match Decryptor::from_encrypt_dict(&dict, &[], None, b"") {
+                BuildResult::Decryptor(d) => d.key.len(),
+                _ => panic!("decryptor"),
+            }
+        };
+        assert_eq!(key_len("AESV2", None), 16);
+        assert_eq!(key_len("V2", Some(16)), 16);
+        assert_eq!(key_len("V2", None), 5, "the 40-bit default");
+    }
+
     /// /StmF Identity + /StrF StdCF(RC4): strings decrypt, streams pass through.
     #[test]
     fn v4_identity_stream_filter_leaves_streams_alone() {
@@ -1214,6 +1484,8 @@ mod tests {
             key: vec![1, 2, 3, 4, 5],
             stm_algo: Algo::Rc4,
             str_algo: Algo::Rc4,
+            eff_algo: Algo::Rc4,
+            crypt_filters: Vec::new(),
             encrypt_id: None,
             encrypt_metadata: false,
         };
@@ -1303,6 +1575,8 @@ mod tests {
             key,
             stm_algo: Algo::Rc4,
             str_algo: Algo::Rc4,
+            eff_algo: Algo::Rc4,
+            crypt_filters: Vec::new(),
             encrypt_id: None,
             encrypt_metadata: true,
         };
@@ -1405,6 +1679,8 @@ mod tests {
             key,
             stm_algo: Algo::Rc4,
             str_algo: Algo::Rc4,
+            eff_algo: Algo::Rc4,
+            crypt_filters: Vec::new(),
             encrypt_id: None,
             encrypt_metadata: true,
         };

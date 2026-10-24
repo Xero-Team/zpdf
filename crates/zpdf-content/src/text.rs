@@ -34,6 +34,17 @@ impl TextSpan {
             self.x.max(self.x + self.advance),
         )
     }
+
+    /// Whether the span's geometry is finite, its right edge included (two
+    /// finite values can still overflow). A non-finite coordinate breaks the
+    /// total order the layout sorts need (a panic on Rust ≥ 1.81).
+    pub(crate) fn is_finite(&self) -> bool {
+        (self.x + self.advance).is_finite()
+            && self.x.is_finite()
+            && self.y.is_finite()
+            && self.advance.is_finite()
+            && self.size.is_finite()
+    }
 }
 
 /// Reconstruct plain text from extracted spans, recovering reading order.
@@ -47,7 +58,10 @@ impl TextSpan {
 /// `line_tol` is the minimum baseline tolerance for grouping spans onto one line
 /// (an adaptive `0.5 · font size` is also applied).
 pub fn spans_to_text(spans: Vec<TextSpan>, line_tol: f64) -> String {
-    let spans: Vec<TextSpan> = spans.into_iter().filter(|s| !s.text.is_empty()).collect();
+    let spans: Vec<TextSpan> = spans
+        .into_iter()
+        .filter(|s| !s.text.is_empty() && s.is_finite())
+        .collect();
     if spans.is_empty() {
         return String::new();
     }
@@ -292,9 +306,22 @@ fn vertical_cut(idx: &[usize], spans: &[TextSpan], unit: f64) -> Option<(Vec<usi
 
     // Among balanced candidates, the x covered by the most row-gaps is the column river.
     let mut points: Vec<f64> = gaps.iter().flat_map(|&(a, b)| [a, b]).collect();
-    points.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+    points.sort_by(f64::total_cmp);
+    // Sweep: strictly between consecutive endpoints, a gap covers the midpoint
+    // iff it starts at or before the left one and does not end there.
+    let mut starts: Vec<f64> = gaps.iter().map(|&(a, _)| a).collect();
+    let mut ends: Vec<f64> = gaps.iter().map(|&(_, b)| b).collect();
+    starts.sort_by(f64::total_cmp);
+    ends.sort_by(f64::total_cmp);
+    let (mut started, mut ended) = (0usize, 0usize);
     let (mut best_depth, mut best_x) = (0usize, 0.0f64);
     for w in points.windows(2) {
+        while starts.get(started).is_some_and(|&a| a <= w[0]) {
+            started += 1;
+        }
+        while ends.get(ended).is_some_and(|&b| b <= w[0]) {
+            ended += 1;
+        }
         if w[1] - w[0] < 1e-6 {
             continue;
         }
@@ -302,7 +329,7 @@ fn vertical_cut(idx: &[usize], spans: &[TextSpan], unit: f64) -> Option<(Vec<usi
         if mid - bx0 < margin || bx1 - mid < margin {
             continue; // too close to an edge to be a column boundary
         }
-        let depth = gaps.iter().filter(|&&(a, b)| a <= mid && mid <= b).count();
+        let depth = started - ended;
         if depth > best_depth {
             best_depth = depth;
             best_x = mid;
@@ -639,6 +666,30 @@ mod tests {
             advance: text.chars().count() as f64 * size as f64 * 0.5,
             mcid: None,
         }
+    }
+
+    #[test]
+    fn non_finite_spans_are_left_out_of_the_layout() {
+        let mut spans = Vec::new();
+        for i in 0..200 {
+            spans.push(span(
+                "word",
+                (i % 20) as f64 * 30.0,
+                700.0 - (i / 20) as f64 * 14.0,
+                12.0,
+            ));
+            spans.push(span("nan", f64::NAN, i as f64, f32::NAN));
+            spans.push(span("inf", 10.0, f64::INFINITY, 12.0));
+            // Finite, but the right edge overflows.
+            let mut far = span("far", 1e308, i as f64, 12.0);
+            far.advance = 1e308;
+            spans.push(far);
+        }
+        let text = spans_to_text(spans.clone(), 2.0);
+        assert!(text.contains("word"));
+        assert!(!text.contains("nan") && !text.contains("inf") && !text.contains("far"));
+        assert!(crate::search::search_spans(&spans, "nan", false).is_empty());
+        assert!(crate::search::search_spans(&spans, "far", false).is_empty());
     }
 
     #[test]

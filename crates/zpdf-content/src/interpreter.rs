@@ -36,8 +36,15 @@ pub struct ContentInterpreter<'a> {
     /// glyphs whose outline is known to be empty (spaces).
     text_clip_accum: Option<Path>,
     text_clip_requested: bool,
+    /// The page-space path and rule of a `W`/`W*` awaiting its painting
+    /// operator: the new clip applies only after that operator paints (PDF
+    /// 32000-1 §8.5.4), so `re W S` strokes under the previous clip.
+    pending_clip: Option<(Path, FillRule)>,
     text_clip_unavailable: bool,
     font_cache: Option<&'a mut FontCache>,
+    /// Document whose shared font cache form and ExtGState fonts load through
+    /// (see [`Self::with_shared_fonts`]).
+    shared_font_doc: Option<&'a zpdf_document::PdfDocument>,
     current_font_id: Option<zpdf_font::FontId>,
     file: Option<&'a PdfFile>,
     resources: Option<&'a ResourceDict>,
@@ -64,6 +71,12 @@ pub struct ContentInterpreter<'a> {
     /// `/ImageMask` stencils bake in the current fill colour and are never
     /// cached here.
     image_obj_cache: HashMap<(ObjectId, u32, u32), zpdf_display_list::ImageId>,
+    /// `/ImageMask` stencils keyed by object id, the fill colour baked into
+    /// them and their stored size. A stencil repeated across a page (or a
+    /// tiling-pattern cell) in one colour is decoded once instead of per `Do`.
+    image_mask_cache: HashMap<(ObjectId, [u8; 3], u32, u32), zpdf_display_list::ImageId>,
+    /// Decoded size of each stencil in `image_mask_cache`.
+    image_mask_sizes: HashMap<ObjectId, (u32, u32)>,
     /// Decoded size of each image XObject in `image_obj_cache`, and its pixels
     /// while they are retained to filter further footprints.
     image_sources: HashMap<ObjectId, ImageSource>,
@@ -78,6 +91,24 @@ pub struct ContentInterpreter<'a> {
     /// shading painted many times (`sh` markers repeated across a map) rebuilds its
     /// LUT only once. Reuse overwrites `to_page` with the current CTM.
     shading_cache: HashMap<ObjectId, crate::shading::ShadingDef>,
+    /// Decoded form XObject content by object id (see
+    /// [`MAX_CONTENT_CACHE_BYTES`]).
+    form_content_cache: HashMap<ObjectId, std::sync::Arc<[u8]>>,
+    /// Tiling patterns built at `scn` by object id, `None` for an unusable
+    /// pattern, so reselecting a pattern does not decode its cell again.
+    tiling_pattern_cache: HashMap<ObjectId, Option<std::sync::Arc<TilingPatternDef>>>,
+    /// Shading patterns built at `scn`, by pattern object and the `base_ctm`
+    /// bits they were built under (`None` for an unusable pattern). Content
+    /// that reselects one pattern per path reuses one evaluated shading (and
+    /// one mesh tessellation) rather than rebuilding and storing it per fill.
+    shading_pattern_cache: HashMap<ShadingPatternKey, Option<ShadingPatternPaint>>,
+    /// Bytes held by `form_content_cache`, `tiling_pattern_cache` and
+    /// `shading_pattern_cache`.
+    content_cache_bytes: usize,
+    /// Soft masks built outside tiling patterns (which reuse masks across
+    /// tiles separately), so content that repeats `/GS1 gs` per object builds
+    /// the mask group once. See [`SoftMaskCacheKey`].
+    soft_mask_cache: HashMap<SoftMaskCacheKey, Option<SoftMask>>,
     form_font_overrides: Vec<HashMap<String, String>>,
     /// Bounded recovery for malformed CAD text fonts (broken subsets, fonts
     /// leaked across text blocks), fed while the page is interpreted.
@@ -229,6 +260,24 @@ struct TileMaskReuse {
     cur_delta: (f64, f64),
 }
 
+/// What a soft mask built at a `gs` depends on: the ExtGState object, and the
+/// graphics state the mask group starts from — its CTM (and the pattern
+/// anchor), the clip bounds its `/BBox` and shadings are cut to, the inherited
+/// colours and line width the group may paint with unset, and the resource
+/// scope it falls back to.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SoftMaskCacheKey {
+    gs_id: ObjectId,
+    matrices: [u64; 12],
+    clip: Option<[u64; 4]>,
+    paint: [u32; 9],
+    resource_depth: usize,
+}
+
+/// Soft masks [`ContentInterpreter`] keeps per page; later masks are built
+/// for every use.
+const MAX_CACHED_SOFT_MASKS: usize = 256;
+
 /// Key for tiling-pattern soft-mask reuse: a `gs` site (operator index within
 /// the tile replay + ExtGState object) plus the CTM's linear part. A hit
 /// means the cached mask differs from the needed one only by the CTM
@@ -265,6 +314,12 @@ const DEFAULT_MAX_COMMANDS: usize = 500_000;
 /// (operators executed) so exponential form/pattern fanout that emits few
 /// commands per call still terminates promptly.
 const DEFAULT_MAX_OPS: u64 = 4_000_000;
+
+/// Decoded form XObject and tiling-pattern cell content kept per page, so a
+/// form or pattern replayed many times (a symbol repeated across a map, a
+/// form drawn in every tile) is inflated once. Past this many bytes further
+/// content is decoded per use again.
+const MAX_CONTENT_CACHE_BYTES: usize = 32 << 20;
 
 #[derive(Debug, Clone)]
 enum ActiveColorSpace {
@@ -590,8 +645,10 @@ impl<'a> ContentInterpreter<'a> {
             text_line_matrix: Matrix::identity(),
             text_clip_accum: None,
             text_clip_requested: false,
+            pending_clip: None,
             text_clip_unavailable: false,
             font_cache: None,
+            shared_font_doc: None,
             current_font_id: None,
             file: None,
             resources: None,
@@ -602,11 +659,18 @@ impl<'a> ContentInterpreter<'a> {
             icc_cache: None,
             output_intent_cmyk: None,
             image_obj_cache: HashMap::new(),
+            image_mask_cache: HashMap::new(),
+            image_mask_sizes: HashMap::new(),
             image_sources: HashMap::new(),
             retained_image_bytes: 0,
             image_downscale_scale: 0.0,
             rejected_image_objects: HashSet::new(),
             shading_cache: HashMap::new(),
+            form_content_cache: HashMap::new(),
+            tiling_pattern_cache: HashMap::new(),
+            shading_pattern_cache: HashMap::new(),
+            content_cache_bytes: 0,
+            soft_mask_cache: HashMap::new(),
             form_font_overrides: Vec::new(),
             font_repair: Default::default(),
             font_override: false,
@@ -723,6 +787,14 @@ impl<'a> ContentInterpreter<'a> {
         self
     }
 
+    /// Stop interpreting at `deadline` rather than a fresh interpret budget
+    /// from the start — for a nested program (e.g. a Type 3 glyph drawn by a
+    /// render backend) that must not outlive the page it is part of.
+    pub fn with_deadline(mut self, deadline: zpdf_core::time::Instant) -> Self {
+        self.deadline = Some(deadline);
+        self
+    }
+
     /// Apply the content-related limits from a document's [`ParseLimits`].
     ///
     /// [`Self::with_document`] calls this automatically. It remains public for
@@ -812,19 +884,22 @@ impl<'a> ContentInterpreter<'a> {
         }
         let rect = self.display_list.page_rect;
         let (w, h) = (rect.width(), rect.height());
+        let (x0, y0) = (rect.x0, rect.y0);
         // Matrix::new(a,b,c,d,e,f) maps (x,y) -> (a*x+c*y+e, b*x+d*y+f). Each
         // turn maps the W×H page into the rotated box with origin bottom-left.
+        // Translate the effective-box origin to zero as part of the rotation;
+        // otherwise a CropBox/MediaBox whose origin is not (0,0) is shifted.
         let (base, rotated) = match r {
             90 => (
-                Matrix::new(0.0, -1.0, 1.0, 0.0, 0.0, w),
+                Matrix::new(0.0, -1.0, 1.0, 0.0, -y0, w + x0),
                 Rect::new(0.0, 0.0, h, w),
             ),
             180 => (
-                Matrix::new(-1.0, 0.0, 0.0, -1.0, w, h),
+                Matrix::new(-1.0, 0.0, 0.0, -1.0, w + x0, h + y0),
                 Rect::new(0.0, 0.0, w, h),
             ),
             270 => (
-                Matrix::new(0.0, 1.0, -1.0, 0.0, h, 0.0),
+                Matrix::new(0.0, 1.0, -1.0, 0.0, h + y0, -x0),
                 Rect::new(0.0, 0.0, h, w),
             ),
             _ => return self,
@@ -849,6 +924,19 @@ impl<'a> ContentInterpreter<'a> {
 
     pub fn with_fonts(mut self, cache: &'a mut FontCache) -> Self {
         self.font_cache = Some(cache);
+        self
+    }
+
+    /// Load the fonts Form XObjects and ExtGState `/Font` entries reference
+    /// through `doc`'s shared font cache ([`PdfDocument::shared_font`]), so a
+    /// form font drawn on every page (a header, a watermark) is parsed once
+    /// per document instead of once per page. Applies while the interpreted
+    /// file is `doc.file()` and the font cache uses the document's provider;
+    /// otherwise fonts are parsed into the page cache as without it.
+    ///
+    /// [`PdfDocument::shared_font`]: zpdf_document::PdfDocument::shared_font
+    pub fn with_shared_fonts(mut self, doc: &'a zpdf_document::PdfDocument) -> Self {
+        self.shared_font_doc = Some(doc);
         self
     }
 
@@ -1018,9 +1106,11 @@ impl<'a> ContentInterpreter<'a> {
         }
 
         // Annotation appearances render independently of wherever the page
-        // content stream left the graphics state (12.5.5): rebalance any
-        // unclosed q-levels and top-level W clips, then reset to the page's
-        // initial state (an unbalanced BDC /OC must not blank annotations).
+        // content stream left the graphics state (12.5.5): drop a `W` never
+        // painted, rebalance any unclosed q-levels and top-level W clips, then
+        // reset to the page's initial state (an unbalanced BDC /OC must not
+        // blank annotations).
+        self.pending_clip = None;
         while self.state_stack.len() > self.state_floor {
             for _ in 0..self.current.clip_depth {
                 self.display_list.push(RenderCommand::PopClip);
@@ -1085,6 +1175,15 @@ impl<'a> ContentInterpreter<'a> {
         // Count every operator toward the global work budget so exponential
         // form/pattern fanout (which emits few commands per call) still stops.
         self.ops_executed = self.ops_executed.saturating_add(1);
+
+        // A clip still pending here was not followed by a painting operator
+        // (malformed); apply it before anything else can observe the state.
+        if !matches!(
+            op,
+            "S" | "s" | "f" | "F" | "f*" | "B" | "B*" | "b" | "b*" | "n"
+        ) {
+            self.flush_pending_clip();
+        }
 
         // Position counter for tiling-pattern soft-mask reuse: the n-th
         // operator of tile k is the n-th operator of every other tile, so the
@@ -1248,48 +1347,55 @@ impl<'a> ContentInterpreter<'a> {
                 self.current_path.rect(Rect::new(x, y, x + w, y + h));
             }
 
-            // -- Path painting --
-            "S" => self.paint_stroke(),
+            // -- Path painting -- (each then applies a pending `W` clip)
+            "S" => {
+                self.paint_stroke();
+                self.flush_pending_clip();
+            }
             "s" => {
                 self.current_path.close();
                 self.paint_stroke();
+                self.flush_pending_clip();
             }
-            "f" | "F" => self.paint_fill(FillRule::NonZero),
-            "f*" => self.paint_fill(FillRule::EvenOdd),
+            "f" | "F" => {
+                self.paint_fill(FillRule::NonZero);
+                self.flush_pending_clip();
+            }
+            "f*" => {
+                self.paint_fill(FillRule::EvenOdd);
+                self.flush_pending_clip();
+            }
             "B" => {
                 self.paint_fill_then_stroke(FillRule::NonZero);
+                self.flush_pending_clip();
             }
             "B*" => {
                 self.paint_fill_then_stroke(FillRule::EvenOdd);
+                self.flush_pending_clip();
             }
             "b" => {
                 self.current_path.close();
                 self.paint_fill_then_stroke(FillRule::NonZero);
+                self.flush_pending_clip();
             }
             "b*" => {
                 self.current_path.close();
                 self.paint_fill_then_stroke(FillRule::EvenOdd);
+                self.flush_pending_clip();
             }
-            "n" => self.current_path.clear(),
+            "n" => {
+                self.current_path.clear();
+                self.flush_pending_clip();
+            }
 
             // -- Clipping --
             "W" => {
                 let path = self.transform_path_to_page_space(&self.current_path);
-                self.intersect_clip_bounds(Self::path_bounds(&path));
-                self.display_list.push(RenderCommand::PushClip {
-                    path,
-                    rule: FillRule::NonZero,
-                });
-                self.current.clip_depth += 1;
+                self.pending_clip = Some((path, FillRule::NonZero));
             }
             "W*" => {
                 let path = self.transform_path_to_page_space(&self.current_path);
-                self.intersect_clip_bounds(Self::path_bounds(&path));
-                self.display_list.push(RenderCommand::PushClip {
-                    path,
-                    rule: FillRule::EvenOdd,
-                });
-                self.current.clip_depth += 1;
+                self.pending_clip = Some((path, FillRule::EvenOdd));
             }
 
             // -- Color --
@@ -1503,7 +1609,7 @@ impl<'a> ContentInterpreter<'a> {
                         match item {
                             PdfObject::String(s) => self.show_text(&s.0),
                             PdfObject::Integer(n) => {
-                                self.adjust_text_position(-n as f64);
+                                self.adjust_text_position(-(n as f64));
                             }
                             PdfObject::Real(n) => {
                                 self.adjust_text_position(-n);
@@ -1612,6 +1718,14 @@ impl<'a> ContentInterpreter<'a> {
     }
 
     fn resolve_color_space(&mut self, name: &str) -> ActiveColorSpace {
+        self.resolve_color_space_depth(name, 0)
+    }
+
+    /// [`Self::resolve_color_space`] `depth` levels into a colour space
+    /// definition. A resource name met again inside a definition (`/CS0 /CS0`,
+    /// or an Indexed base naming its own resource) keeps counting, so a cycle
+    /// ends at the depth limit instead of overflowing the stack.
+    fn resolve_color_space_depth(&mut self, name: &str, depth: u8) -> ActiveColorSpace {
         match name {
             "DeviceGray" | "G" => ActiveColorSpace::DeviceGray,
             "DeviceRGB" | "RGB" => ActiveColorSpace::DeviceRGB,
@@ -1620,17 +1734,15 @@ impl<'a> ContentInterpreter<'a> {
             _ => {
                 // Resource lookup: direct (inline) values first, then refs.
                 if let Some(obj) = self.lookup_res(|r| r.color_spaces_inline.get(name).cloned()) {
-                    return self.resolve_color_space_obj(&obj, 0);
+                    return self.resolve_color_space_obj(&obj, depth);
                 }
                 let cs_id = match self.lookup_res(|r| r.color_spaces.get(name).copied()) {
                     Some(id) => id,
                     None => return ActiveColorSpace::DeviceGray,
                 };
-                let obj = match self.file.map(|f| f.resolve(cs_id)) {
-                    Some(Ok(o)) => o,
-                    _ => return ActiveColorSpace::DeviceGray,
-                };
-                self.resolve_color_space_obj(&obj, 0)
+                // Pass the reference itself so the space is built once per
+                // object (`cs_cache`), not on every `cs`/`CS`/`sh` naming it.
+                self.resolve_color_space_obj(&PdfObject::Ref(cs_id), depth)
             }
         }
     }
@@ -1664,7 +1776,7 @@ impl<'a> ContentInterpreter<'a> {
             obj
         };
         let arr = match obj {
-            PdfObject::Name(n) => return self.resolve_color_space(&n.0),
+            PdfObject::Name(n) => return self.resolve_color_space_depth(&n.0, depth + 1),
             PdfObject::Array(arr) => arr,
             _ => return ActiveColorSpace::DeviceGray,
         };
@@ -1788,10 +1900,17 @@ impl<'a> ContentInterpreter<'a> {
                     }
                     if let Ok(rg) = d.get_array("Range") {
                         for (i, v) in rg.iter().take(4).enumerate() {
-                            if let Ok(x) = v.as_f64() {
+                            if let Some(x) = v.as_f64().ok().filter(|x| x.is_finite()) {
                                 range[i] = x;
                             }
                         }
+                    }
+                }
+                // Every use clamps into these pairs, which panics on an
+                // inverted (`/Range [10 -10 …]`) or NaN one; order them.
+                for pair in range.chunks_mut(2) {
+                    if pair[0] > pair[1] {
+                        pair.swap(0, 1);
                     }
                 }
                 ActiveColorSpace::Lab { white_point, range }
@@ -2035,32 +2154,54 @@ impl<'a> ContentInterpreter<'a> {
     /// `Cmyk` space becomes the profile's `Icc` space (so the decoder colour-
     /// manages every pixel); an `Indexed` space with a DeviceCMYK base has its
     /// palette baked to RGB through the profile (the same one-buffer transform
-    /// `resolve_image_colorspace` applies to embedded-ICC bases). No-op when no
+    /// `resolve_image_colorspace` applies to embedded-ICC bases); a
+    /// Separation/DeviceN alternate is re-routed the same way. No-op when no
     /// output intent is active, leaving the existing SWOP path untouched.
     fn colormanage_cmyk_image(
         &self,
         cs: Option<zpdf_image::ResolvedColorSpace>,
     ) -> Option<zpdf_image::ResolvedColorSpace> {
         use zpdf_image::ResolvedColorSpace as Rcs;
+        fn route(cs: Rcs, oi: &std::sync::Arc<zpdf_color::IccTransform>) -> Rcs {
+            match cs {
+                Rcs::Cmyk => Rcs::Icc {
+                    ncomp: 4,
+                    transform: oi.clone(),
+                },
+                Rcs::Indexed {
+                    base,
+                    hival,
+                    lookup,
+                } if matches!(*base, Rcs::Cmyk) => Rcs::Indexed {
+                    base: Box::new(Rcs::Rgb),
+                    hival,
+                    lookup: oi.palette_to_rgb(&lookup),
+                },
+                Rcs::Indexed {
+                    base,
+                    hival,
+                    lookup,
+                } => Rcs::Indexed {
+                    base: Box::new(route(*base, oi)),
+                    hival,
+                    lookup,
+                },
+                Rcs::Tint {
+                    n,
+                    transform,
+                    alternate,
+                } => Rcs::Tint {
+                    n,
+                    transform,
+                    alternate: Box::new(route(*alternate, oi)),
+                },
+                other => other,
+            }
+        }
         let Some(oi) = &self.output_intent_cmyk else {
             return cs;
         };
-        cs.map(|cs| match cs {
-            Rcs::Cmyk => Rcs::Icc {
-                ncomp: 4,
-                transform: oi.clone(),
-            },
-            Rcs::Indexed {
-                base,
-                hival,
-                lookup,
-            } if matches!(*base, Rcs::Cmyk) => Rcs::Indexed {
-                base: Box::new(Rcs::Rgb),
-                hival,
-                lookup: oi.palette_to_rgb(&lookup),
-            },
-            other => other,
-        })
+        cs.map(|cs| route(cs, oi))
     }
 
     /// Convert component values in `cs` to an RGB display color.
@@ -2311,6 +2452,13 @@ impl<'a> ContentInterpreter<'a> {
             tracing::debug!("pattern {name} not found in resources");
             return (None, Color::gray(0.5));
         };
+        if let Some(def) = self.tiling_pattern_cache.get(&pat_id) {
+            return (def.clone().map(PatternPaint::Tiling), Color::gray(0.5));
+        }
+        let shading_key = (pat_id, matrix_bits(&self.base_ctm));
+        if let Some(built) = self.shading_pattern_cache.get(&shading_key) {
+            return shading_pattern_paint(built.as_ref());
+        }
         let Ok(obj) = file.resolve(pat_id) else {
             return (None, Color::gray(0.5));
         };
@@ -2330,77 +2478,34 @@ impl<'a> ContentInterpreter<'a> {
             .unwrap_or_else(Matrix::identity);
 
         if ptype == 2 {
-            if let Some(sh_obj) = dict.get("Shading") {
-                // The pattern /Matrix maps pattern space to the page's *default*
-                // user space, so the shading→page transform is base_ctm · matrix
-                // (mirrors the tiling path). Without base_ctm a shading pattern
-                // ignores page /Rotate and any enclosing form CTM.
-                if let Some(def) = self.build_shading(sh_obj, self.base_ctm.concat(&matrix)) {
+            // The pattern /Matrix maps pattern space to the page's *default*
+            // user space, so the shading→page transform is base_ctm · matrix
+            // (mirrors the tiling path). Without base_ctm a shading pattern
+            // ignores page /Rotate and any enclosing form CTM.
+            let built = dict
+                .get("Shading")
+                .and_then(|sh_obj| self.build_shading(sh_obj, self.base_ctm.concat(&matrix)))
+                .map(|def| {
                     let avg = def.average_rgb();
-                    let approx = Color::rgb(avg[0], avg[1], avg[2]);
-                    return (
-                        Some(PatternPaint::Shading(std::sync::Arc::new(def))),
-                        approx,
-                    );
-                }
+                    (std::sync::Arc::new(def), Color::rgb(avg[0], avg[1], avg[2]))
+                });
+            let bytes = built.as_ref().map_or(0, |(def, _)| def.heap_bytes());
+            if self.reserve_content_cache(bytes) {
+                self.shading_pattern_cache
+                    .insert(shading_key, built.clone());
             }
-            return (None, Color::gray(0.5));
+            return shading_pattern_paint(built.as_ref());
         }
 
         // Tiling pattern (PatternType 1): capture everything needed to replay
         // the cell at fill time. The gray approximation remains the fallback
         // for paths that cannot take the real paint (e.g. strokes).
-        let PdfObject::Stream(stream) = &obj else {
-            return (None, Color::gray(0.5));
-        };
-        let content = match file
-            .resolve_stream_data(pat_id)
-            .or_else(|_| decode_stream_for_file(Some(file), &stream.data, &stream.dict))
-        {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::debug!("tiling pattern {name}: undecodable stream - {e}");
-                return (None, Color::gray(0.5));
-            }
-        };
-        let get4 = |key: &str| {
-            dict.get_array(key).ok().and_then(|arr| {
-                let v: Vec<f64> = arr.iter().filter_map(|o| o.as_f64().ok()).collect();
-                (v.len() == 4).then(|| {
-                    Rect::new(
-                        v[0].min(v[2]),
-                        v[1].min(v[3]),
-                        v[0].max(v[2]),
-                        v[1].max(v[3]),
-                    )
-                })
-            })
-        };
-        let Some(bbox) = get4("BBox").filter(|b| b.width() > 0.0 && b.height() > 0.0) else {
-            tracing::debug!("tiling pattern {name}: missing/degenerate BBox");
-            return (None, Color::gray(0.5));
-        };
-        // Steps default to the cell size; zero/non-finite steps are degenerate.
-        let x_step = dict.get_f64("XStep").unwrap_or(bbox.width());
-        let y_step = dict.get_f64("YStep").unwrap_or(bbox.height());
-        if !x_step.is_finite() || !y_step.is_finite() || x_step == 0.0 || y_step == 0.0 {
-            tracing::debug!("tiling pattern {name}: degenerate steps");
-            return (None, Color::gray(0.5));
+        let def = build_tiling_pattern(file, pat_id, &obj, matrix, name);
+        let bytes = def.as_ref().map_or(0, |def| def.content.len());
+        if self.reserve_content_cache(bytes) {
+            self.tiling_pattern_cache.insert(pat_id, def.clone());
         }
-        let paint_type = dict.get_i64("PaintType").unwrap_or(1);
-        let def = TilingPatternDef {
-            content,
-            dict: dict.clone(),
-            bbox,
-            x_step,
-            y_step,
-            matrix,
-            paint_type,
-        };
-        (
-            Some(PatternPaint::Tiling(std::sync::Arc::new(def))),
-            Color::gray(0.5),
-        )
+        (def.map(PatternPaint::Tiling), Color::gray(0.5))
     }
 
     /// For an uncolored (PaintType 2) tiling pattern selected by `scn`, pop the
@@ -2676,12 +2781,11 @@ impl<'a> ContentInterpreter<'a> {
         self.current.clip_bounds = Some(match self.current.clip_bounds {
             Some(c) => {
                 let c = c.normalize();
-                Rect::new(
-                    c.x0.max(n.x0),
-                    c.y0.max(n.y0),
-                    c.x1.min(n.x1),
-                    c.y1.min(n.y1),
-                )
+                let (x0, y0) = (c.x0.max(n.x0), c.y0.max(n.y0));
+                // Disjoint clips leave an empty region. Keep it empty (zero
+                // area at its corner): an inverted rect would `normalize()`
+                // back into a non-empty one at the next intersection.
+                Rect::new(x0, y0, c.x1.min(n.x1).max(x0), c.y1.min(n.y1).max(y0))
             }
             None => n,
         });
@@ -3162,6 +3266,25 @@ impl<'a> ContentInterpreter<'a> {
         if let Ok(m) = dict.get_f64("ML") {
             self.current.miter_limit = m as f32;
         }
+        // /D: `[dash-array phase]`, as the `d` operator takes them.
+        if let Some(PdfObject::Array(d)) = dict.get("D").map(|o| self.resolve_plain(o)) {
+            if let Some(PdfObject::Array(arr)) = d.first().map(|o| self.resolve_plain(o)) {
+                let array: Vec<f32> = arr
+                    .iter()
+                    .filter_map(|o| o.as_f64().ok().map(|v| v as f32))
+                    .collect();
+                let phase = d.get(1).and_then(|o| o.as_f64().ok()).unwrap_or(0.0) as f32;
+                self.current.dash = (!array.is_empty()).then_some(DashPattern { array, phase });
+            }
+        }
+        // /Font: `[font-dict-ref size]`, selecting the font as `Tf` would.
+        if let Some(PdfObject::Array(f)) = dict.get("Font").map(|o| self.resolve_plain(o)) {
+            if let (Some(PdfObject::Ref(font_ref)), Some(size)) =
+                (f.first(), f.get(1).and_then(|o| o.as_f64().ok()))
+            {
+                self.select_font_object(*font_ref, size as f32);
+            }
+        }
         // /RI: rendering intent name.
         if let Ok(ri) = dict.get_name("RI") {
             self.current.rendering_intent = zpdf_color::RenderIntent::from_pdf_name(ri);
@@ -3236,7 +3359,48 @@ impl<'a> ContentInterpreter<'a> {
             _ => None,
         };
         let Some(key) = key else {
-            return self.build_soft_mask(sm);
+            let Some(gs_id) = gs_id else {
+                return self.build_soft_mask(sm);
+            };
+            let (ctm, base, fill, stroke) = (
+                &self.current.ctm,
+                &self.base_ctm,
+                &self.current.fill_color,
+                &self.current.stroke_color,
+            );
+            let key = SoftMaskCacheKey {
+                gs_id,
+                matrices: [
+                    ctm.a, ctm.b, ctm.c, ctm.d, ctm.e, ctm.f, base.a, base.b, base.c, base.d,
+                    base.e, base.f,
+                ]
+                .map(f64::to_bits),
+                clip: self
+                    .current
+                    .clip_bounds
+                    .map(|r| [r.x0, r.y0, r.x1, r.y1].map(f64::to_bits)),
+                paint: [
+                    fill.r,
+                    fill.g,
+                    fill.b,
+                    fill.a,
+                    stroke.r,
+                    stroke.g,
+                    stroke.b,
+                    stroke.a,
+                    self.current.line_width,
+                ]
+                .map(f32::to_bits),
+                resource_depth: self.form_resources.len(),
+            };
+            if let Some(mask) = self.soft_mask_cache.get(&key) {
+                return mask.clone();
+            }
+            let mask = self.build_soft_mask(sm);
+            if self.soft_mask_cache.len() < MAX_CACHED_SOFT_MASKS {
+                self.soft_mask_cache.insert(key, mask.clone());
+            }
+            return mask;
         };
 
         if !self
@@ -3445,6 +3609,17 @@ impl<'a> ContentInterpreter<'a> {
         if self.rejected_image_objects.contains(&obj_id) {
             return;
         }
+        if let Some(&(width, height)) = self.image_mask_sizes.get(&obj_id) {
+            if cs_produces_no_marks(&self.current.fill_cs) {
+                return;
+            }
+            let (width, height) = self.image_footprint(&transform, width, height);
+            let key = (obj_id, self.fill_rgb_u8(), width, height);
+            if let Some(&image_id) = self.image_mask_cache.get(&key) {
+                self.emit_image_draw(image_id, transform, true);
+                return;
+            }
+        }
         // A new footprint of a known image comes from its retained source
         // rather than from decoding the stream again.
         match self.store_from_retained(obj_id, &transform) {
@@ -3501,6 +3676,9 @@ impl<'a> ContentInterpreter<'a> {
             intent,
         );
         let colorspace = self.colormanage_cmyk_image(colorspace);
+        let smask_ref = stream.dict.get_ref("SMask").ok();
+        // A soft mask's `/Matte` is a colour in this space.
+        let matte_colorspace = smask_ref.and_then(|_| colorspace.clone());
         let mut image = match zpdf_image::decode_image_xobject_resolved_with_limits(
             &decoded_data,
             &image_dict,
@@ -3519,19 +3697,30 @@ impl<'a> ContentInterpreter<'a> {
         // predictors, any bpc, /Decode — and its gray level becomes the alpha.
         // /Mask as a stream ref is a 1-bpc stencil; /Mask colour-key arrays
         // were already handled inside decode_image_xobject_resolved.
-        if let Ok(smask_ref) = stream.dict.get_ref("SMask") {
-            fold_soft_mask(&mut image, smask_ref, file, &self.parse_limits);
+        if let Some(smask_ref) = smask_ref {
+            fold_soft_mask(
+                &mut image,
+                smask_ref,
+                matte_colorspace.as_ref(),
+                file,
+                &self.parse_limits,
+            );
         } else if let Ok(mask_ref) = stream.dict.get_ref("Mask") {
             fold_stencil_mask(&mut image, mask_ref, file, &self.parse_limits);
         }
 
-        // `/ImageMask` stencils bake in the fill colour, so they aren't cached.
+        // `/ImageMask` stencils bake in the fill colour, so they are cached
+        // per colour, apart from the stateless images below.
         if image.is_image_mask {
+            self.image_mask_sizes
+                .insert(obj_id, (image.width, image.height));
             let image = self.fit_image_to_footprint(image, &transform);
+            let key = (obj_id, self.fill_rgb_u8(), image.width, image.height);
             let Some(image_id) = self.admit_image(image) else {
                 self.rejected_image_objects.insert(obj_id);
                 return;
             };
+            self.image_mask_cache.insert(key, image_id);
             self.emit_image_draw(image_id, transform, true);
             return;
         }
@@ -3746,6 +3935,17 @@ impl<'a> ContentInterpreter<'a> {
         Some(image_id)
     }
 
+    /// Count `bytes` of decoded content against [`MAX_CONTENT_CACHE_BYTES`];
+    /// false (nothing counted) when they don't fit.
+    fn reserve_content_cache(&mut self, bytes: usize) -> bool {
+        let total = self.content_cache_bytes.saturating_add(bytes);
+        if total > MAX_CONTENT_CACHE_BYTES {
+            return false;
+        }
+        self.content_cache_bytes = total;
+        true
+    }
+
     /// Whether `bytes` more decoded pixels fit the image byte limit beside
     /// the cache and the retained sources.
     fn image_room(&self, bytes: u64) -> bool {
@@ -3900,20 +4100,33 @@ impl<'a> ContentInterpreter<'a> {
             return;
         }
 
-        // For a real form, resolve_stream_data handles decryption, indirect
-        // /Filter refs and caching (with a direct-decode fallback). A synthetic
-        // stream has no object id, so its bytes are decoded directly — never
-        // looked up in the xref / repair machinery.
-        let direct = || decode_stream_for_file(Some(file), &stream.data, &stream.dict);
-        let decoded = match xobj_id {
-            Some(id) => file.resolve_stream_data(id).or_else(|_| direct()),
-            None => direct(),
-        };
-        let decoded = match decoded {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::warn!("failed to decode form XObject: {e}");
-                return;
+        // For a real form, resolve_stream_data handles decryption and indirect
+        // /Filter refs (with a direct-decode fallback), and the result is kept
+        // for the form's later draws. A synthetic stream has no object id, so
+        // its bytes are decoded directly — never looked up in the xref /
+        // repair machinery.
+        let cached = xobj_id.and_then(|id| self.form_content_cache.get(&id).cloned());
+        let decoded = match cached {
+            Some(decoded) => decoded,
+            None => {
+                let direct = || decode_stream_for_file(Some(file), &stream.data, &stream.dict);
+                let decoded = match xobj_id {
+                    Some(id) => file.resolve_stream_data(id).or_else(|_| direct()),
+                    None => direct(),
+                };
+                let decoded: std::sync::Arc<[u8]> = match decoded {
+                    Ok(d) => d.into(),
+                    Err(e) => {
+                        tracing::warn!("failed to decode form XObject: {e}");
+                        return;
+                    }
+                };
+                if let Some(id) = xobj_id {
+                    if self.reserve_content_cache(decoded.len()) {
+                        self.form_content_cache.insert(id, decoded.clone());
+                    }
+                }
+                decoded
             }
         };
 
@@ -4021,6 +4234,11 @@ impl<'a> ContentInterpreter<'a> {
         }
 
         self.form_depth += 1;
+        // A pending `W` belongs to the stream that set it: the invoking
+        // stream's waits for its own painting operator (a pattern fill runs
+        // this form while painting), and one the form leaves unpainted ends
+        // with the form.
+        let outer_clip = self.pending_clip.take();
         let tokenizer = ContentTokenizer::new(&decoded);
         for token in tokenizer {
             if self.over_budget() {
@@ -4042,6 +4260,7 @@ impl<'a> ContentInterpreter<'a> {
                 }
             }
         }
+        self.pending_clip = outer_clip;
         self.form_depth -= 1;
 
         // Balance: pop clips opened by any unbalanced q-levels left by the
@@ -4080,6 +4299,33 @@ impl<'a> ContentInterpreter<'a> {
         }
     }
 
+    /// Make the font dictionary `font_ref` the current font at `size`, as an
+    /// ExtGState `/Font` entry does. It is cached under the same object-id key
+    /// form fonts use, so the font loads once however often it is selected.
+    fn select_font_object(&mut self, font_ref: ObjectId, size: f32) {
+        let name = format!("__font_{}_{}", font_ref.0, font_ref.1);
+        self.current.font_name = name.clone();
+        self.current.font_size = size;
+        self.current_font_id = None;
+        let (Some(file), Some(fc)) = (self.file, self.font_cache.as_mut()) else {
+            return;
+        };
+        if fc.get_by_name(&name).is_none() {
+            let max_bytes = self.max_font_cache_bytes;
+            if let Err(e) =
+                load_font_ref(self.shared_font_doc, file, fc, font_ref, &name, max_bytes)
+            {
+                tracing::debug!("ExtGState font {font_ref}: {e}");
+                let _ = fc.try_insert_with_limit(
+                    name.clone(),
+                    zpdf_font::LoadedFont::new_placeholder(name.clone()),
+                    max_bytes,
+                );
+            }
+        }
+        self.current_font_id = fc.get_by_name(&name).map(|(fid, _)| fid);
+    }
+
     fn resolve_font_name(&self, name: &str) -> String {
         for overrides in self.form_font_overrides.iter().rev() {
             if let Some(mapped) = overrides.get(name) {
@@ -4090,19 +4336,21 @@ impl<'a> ContentInterpreter<'a> {
     }
 
     fn load_form_fonts(&mut self, form_dict: &zpdf_core::PdfDict, file: &PdfFile) {
-        let fonts_dict = match form_dict.get("Resources") {
-            Some(PdfObject::Dict(res)) => match res.get("Font") {
-                Some(PdfObject::Dict(f)) => Some(f.clone()),
-                _ => None,
-            },
+        // Either level may be an indirect reference.
+        let fonts_of = |res: &zpdf_core::PdfDict| match res.get("Font") {
+            Some(PdfObject::Dict(f)) => Some(f.clone()),
             Some(PdfObject::Ref(r)) => file
                 .resolve(*r)
                 .ok()
-                .and_then(|o| o.as_dict().ok().cloned())
-                .and_then(|d| match d.get("Font") {
-                    Some(PdfObject::Dict(f)) => Some(f.clone()),
-                    _ => None,
-                }),
+                .and_then(|o| o.as_dict().ok().cloned()),
+            _ => None,
+        };
+        let fonts_dict = match form_dict.get("Resources") {
+            Some(PdfObject::Dict(res)) => fonts_of(res),
+            Some(PdfObject::Ref(r)) => file
+                .resolve(*r)
+                .ok()
+                .and_then(|o| o.as_dict().ok().and_then(fonts_of)),
             _ => None,
         };
 
@@ -4121,8 +4369,8 @@ impl<'a> ContentInterpreter<'a> {
             .unwrap_or_default();
 
         let mut overrides = HashMap::new();
-        let form_depth = self.form_font_overrides.len();
         let max_font_bytes = self.max_font_cache_bytes;
+        let shared_doc = self.shared_font_doc;
 
         let fc = match self.font_cache.as_mut() {
             Some(fc) => fc,
@@ -4132,31 +4380,36 @@ impl<'a> ContentInterpreter<'a> {
             }
         };
 
-        for (name, obj) in &fonts.0 {
+        // Page resources are capped by MAX_RESOURCE_ENTRIES; a form's raw
+        // /Font dictionary bypasses that parser, so bound it here too.
+        const MAX_FORM_FONT_ENTRIES: usize = 65_536;
+        for (name, obj) in fonts.0.iter().take(MAX_FORM_FONT_ENTRIES) {
             // A font entry is normally an indirect reference; a synthesized
             // form-field appearance may instead carry an inline font dict.
             let load_into = |fc: &mut FontCache, target: &str| -> Result<(), zpdf_core::Error> {
-                let provider = fc.provider().map(|provider| provider.as_ref());
                 let font = match obj {
                     PdfObject::Ref(font_ref) => {
-                        zpdf_document::font_loader::load_single_font_with_provider(
-                            file, *font_ref, provider,
-                        )?
+                        return load_font_ref(
+                            shared_doc,
+                            file,
+                            fc,
+                            *font_ref,
+                            target,
+                            max_font_bytes,
+                        );
                     }
                     PdfObject::Dict(font_dict) => {
                         zpdf_document::font_loader::load_single_font_dict_with_provider(
-                            file, font_dict, provider,
+                            file,
+                            font_dict,
+                            fc.provider().map(|provider| provider.as_ref()),
                         )?
                     }
                     _ => return Ok(()),
                 };
                 fc.try_insert_with_limit(target.to_string(), font, max_font_bytes)
                     .map(|_| ())
-                    .ok_or_else(|| {
-                        zpdf_core::Error::StreamDecode(format!(
-                            "font cache byte limit ({max_font_bytes}) or ID capacity reached"
-                        ))
-                    })
+                    .ok_or_else(|| font_cache_full(max_font_bytes))
             };
 
             match obj {
@@ -4193,16 +4446,15 @@ impl<'a> ContentInterpreter<'a> {
                     }
                     overrides.insert(name.0.clone(), unique_name);
                 }
-                PdfObject::Dict(_) => {
-                    // Inline font dict: rename to avoid clobbering a same-named
-                    // page font in the shared cache.
-                    let target = if page_font_ids.contains_key(&name.0) {
-                        let unique = format!("__form{}_{}", form_depth, name.0);
-                        overrides.insert(name.0.clone(), unique.clone());
-                        unique
-                    } else {
-                        name.0.clone()
-                    };
+                PdfObject::Dict(font_dict) => {
+                    // Inline font dict: key the slot by the dictionary itself.
+                    // Sibling forms and tiling patterns reuse resource names
+                    // for different inline dicts (a name or depth key let the
+                    // first one win); a content key tells them apart, yet stays
+                    // stable across repeated paints and across interpreters
+                    // sharing one FontCache.
+                    let target = format!("__inline_font_{:016x}", inline_font_key(font_dict));
+                    overrides.insert(name.0.clone(), target.clone());
                     if fc.get_by_name(&target).is_none() {
                         if let Err(e) = load_into(fc, &target) {
                             tracing::debug!("form inline font {}: {e}", name.0);
@@ -4222,6 +4474,16 @@ impl<'a> ContentInterpreter<'a> {
             self.font_repair.scope_changed();
         }
         self.form_font_overrides.push(overrides);
+    }
+
+    /// Install the clip a `W`/`W*` left pending (see `pending_clip`).
+    fn flush_pending_clip(&mut self) {
+        if let Some((path, rule)) = self.pending_clip.take() {
+            self.intersect_clip_bounds(Self::path_bounds(&path));
+            self.display_list
+                .push(RenderCommand::PushClip { path, rule });
+            self.current.clip_depth += 1;
+        }
     }
 
     fn transform_path_to_page_space(&self, path: &Path) -> Path {
@@ -4481,7 +4743,7 @@ impl<'a> ContentInterpreter<'a> {
             // The stroke region is the centerline extent grown by the stroke
             // width. Unlike `path_bounds`, a flat path (a horizontal/vertical
             // line) is fine here — growing makes the region two-dimensional.
-            if let Some(bounds) = Self::stroke_region_bounds(&page_path, self.current.line_width) {
+            if let Some(bounds) = Self::stroke_region_bounds(&page_path, &style) {
                 self.display_list.push(RenderCommand::PushClipStroke {
                     path: page_path.clone(),
                     style: style.clone(),
@@ -4507,9 +4769,10 @@ impl<'a> ContentInterpreter<'a> {
     }
 
     /// Page-space bounding box of a stroke: the path's point extent grown by
-    /// the stroke width on every side (so even a degenerate flat path yields a
-    /// 2-D region for the pattern paint to cover).
-    fn stroke_region_bounds(path: &Path, line_width: f32) -> Option<Rect> {
+    /// how far the page-space stroke reaches past its centerline on every side
+    /// (so even a degenerate flat path yields a 2-D region for the pattern
+    /// paint to cover).
+    fn stroke_region_bounds(path: &Path, style: &StrokeStyle) -> Option<Rect> {
         let (mut x0, mut y0, mut x1, mut y1) = (
             f64::INFINITY,
             f64::INFINITY,
@@ -4526,7 +4789,15 @@ impl<'a> ContentInterpreter<'a> {
         if !(x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite()) {
             return None;
         }
-        let grow = (line_width.max(1.0) as f64).max(0.5);
+        // Half the width, out to a miter tip (at most `miter_limit` half-widths;
+        // the cap keeps a huge limit from inflating the region) or a square
+        // cap's corner.
+        let reach = match style.join {
+            LineJoin::Miter => style.miter_limit.clamp(1.0, 100.0),
+            _ => std::f32::consts::SQRT_2,
+        };
+        let grow = (style.width.max(1.0) as f64 * 0.5 * reach.max(std::f32::consts::SQRT_2) as f64)
+            .max(0.5);
         Some(Rect::new(x0 - grow, y0 - grow, x1 + grow, y1 + grow))
     }
 
@@ -4756,6 +5027,9 @@ impl<'a> ContentInterpreter<'a> {
                     rule: FillRule::NonZero,
                 });
 
+                // The `W` of the fill painting this pattern stays pending for
+                // it; one the cell leaves unpainted ends with the cell.
+                let outer_clip = self.pending_clip.take();
                 let tokenizer = ContentTokenizer::new(&def.content);
                 for token in tokenizer {
                     if self.over_budget() {
@@ -4777,6 +5051,7 @@ impl<'a> ContentInterpreter<'a> {
                         }
                     }
                 }
+                self.pending_clip = outer_clip;
 
                 // Rebalance clips/state left open by the cell body.
                 while self.state_stack.len() > depth_floor + 1 {
@@ -4998,6 +5273,7 @@ impl<'a> ContentInterpreter<'a> {
                     column = (column.0.min(-vx), column.1.max(-vx + width));
                     glyphs.push(PositionedGlyph {
                         glyph_id,
+                        code,
                         x: -vx,
                         y: x_offset - vy,
                         advance,
@@ -5010,6 +5286,7 @@ impl<'a> ContentInterpreter<'a> {
                     let advance = adv_units as f32 * scale_factor * h_scale;
                     glyphs.push(PositionedGlyph {
                         glyph_id,
+                        code,
                         x: x_offset,
                         y: 0.0,
                         advance,
@@ -5054,6 +5331,7 @@ impl<'a> ContentInterpreter<'a> {
                 previous = Some((byte, (glyph_id, advance)));
                 glyphs.push(PositionedGlyph {
                     glyph_id,
+                    code: code as u32,
                     x: x_offset,
                     y: 0.0,
                     advance,
@@ -5105,7 +5383,7 @@ impl<'a> ContentInterpreter<'a> {
             let cscale = ((combined.a * combined.a + combined.b * combined.b).sqrt()
                 + (combined.c * combined.c + combined.d * combined.d).sqrt())
                 / 2.0;
-            Some(TextSpan {
+            let span = TextSpan {
                 text: decoded,
                 x,
                 y: start.y,
@@ -5115,7 +5393,10 @@ impl<'a> ContentInterpreter<'a> {
                 advance: dx,
                 // The marked-content id binding this run to a structure element.
                 mcid: self.current_mcid(),
-            })
+            };
+            // A degenerate text matrix (e.g. 1e300-scale Tm under a large CTM)
+            // places the run nowhere.
+            span.is_finite().then_some(span)
         } else {
             None
         };
@@ -5786,6 +6067,137 @@ fn decode_stream_for_file(
     }
 }
 
+/// [`ContentInterpreter::shading_pattern_cache`] key: the pattern object and
+/// the bits of the `base_ctm` its shading was built under.
+type ShadingPatternKey = (ObjectId, [u64; 6]);
+/// A built shading pattern and its average colour (the stroke fallback).
+type ShadingPatternPaint = (std::sync::Arc<crate::shading::ShadingDef>, Color);
+
+fn matrix_bits(m: &Matrix) -> [u64; 6] {
+    [m.a, m.b, m.c, m.d, m.e, m.f].map(f64::to_bits)
+}
+
+/// `resolve_pattern`'s result for a (possibly unusable) shading pattern.
+fn shading_pattern_paint(built: Option<&ShadingPatternPaint>) -> (Option<PatternPaint>, Color) {
+    match built {
+        Some((def, approx)) => (Some(PatternPaint::Shading(def.clone())), *approx),
+        None => (None, Color::gray(0.5)),
+    }
+}
+
+/// Parse the font dictionary `font_ref` into `fc` under `name`. Through `doc`'s
+/// shared cache (parsed once per document) when `doc` serves this file and
+/// the cache's font provider; otherwise parsed afresh.
+fn load_font_ref(
+    doc: Option<&zpdf_document::PdfDocument>,
+    file: &PdfFile,
+    fc: &mut FontCache,
+    font_ref: ObjectId,
+    name: &str,
+    max_bytes: u64,
+) -> Result<(), zpdf_core::Error> {
+    let shared = doc.filter(|doc| {
+        std::ptr::eq(doc.file(), file)
+            && match (doc.font_provider(), fc.provider()) {
+                (None, None) => true,
+                (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b),
+                _ => false,
+            }
+    });
+    let inserted = match shared {
+        Some(doc) => {
+            let font = doc.shared_font(font_ref)?;
+            fc.try_insert_shared_with_limit(name.to_string(), font, max_bytes)
+        }
+        None => {
+            let font = zpdf_document::font_loader::load_single_font_with_provider(
+                file,
+                font_ref,
+                fc.provider().map(|provider| provider.as_ref()),
+            )?;
+            fc.try_insert_with_limit(name.to_string(), font, max_bytes)
+        }
+    };
+    inserted
+        .map(|_| ())
+        .ok_or_else(|| font_cache_full(max_bytes))
+}
+
+/// Content key for an inline font dictionary: the same dictionary always
+/// maps to the same font-cache slot, different ones (almost surely) do not.
+fn inline_font_key(font_dict: &zpdf_core::PdfDict) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    format!("{font_dict:?}").hash(&mut hasher);
+    hasher.finish()
+}
+
+fn font_cache_full(max_bytes: u64) -> zpdf_core::Error {
+    zpdf_core::Error::StreamDecode(format!(
+        "font cache byte limit ({max_bytes}) or ID capacity reached"
+    ))
+}
+
+/// Build the tiling pattern `obj` (object `pat_id`, resource `name`), with its
+/// cell content decoded. `None` when the pattern is unusable: not a stream,
+/// undecodable, or with a degenerate /BBox or steps.
+fn build_tiling_pattern(
+    file: &PdfFile,
+    pat_id: ObjectId,
+    obj: &PdfObject,
+    matrix: Matrix,
+    name: &str,
+) -> Option<std::sync::Arc<TilingPatternDef>> {
+    let PdfObject::Stream(stream) = obj else {
+        return None;
+    };
+    let dict = &stream.dict;
+    let content = match file
+        .resolve_stream_data(pat_id)
+        .or_else(|_| decode_stream_for_file(Some(file), &stream.data, dict))
+    {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::debug!("tiling pattern {name}: undecodable stream - {e}");
+            return None;
+        }
+    };
+    let get4 = |key: &str| {
+        dict.get_array(key).ok().and_then(|arr| {
+            let v: Vec<f64> = arr.iter().filter_map(|o| o.as_f64().ok()).collect();
+            (v.len() == 4).then(|| {
+                Rect::new(
+                    v[0].min(v[2]),
+                    v[1].min(v[3]),
+                    v[0].max(v[2]),
+                    v[1].max(v[3]),
+                )
+            })
+        })
+    };
+    let Some(bbox) = get4("BBox").filter(|b| b.width() > 0.0 && b.height() > 0.0) else {
+        tracing::debug!("tiling pattern {name}: missing/degenerate BBox");
+        return None;
+    };
+    // Steps default to the cell size; zero/non-finite steps are degenerate.
+    let x_step = dict.get_f64("XStep").unwrap_or(bbox.width());
+    let y_step = dict.get_f64("YStep").unwrap_or(bbox.height());
+    if !x_step.is_finite() || !y_step.is_finite() || x_step == 0.0 || y_step == 0.0 {
+        tracing::debug!("tiling pattern {name}: degenerate steps");
+        return None;
+    }
+    let paint_type = dict.get_i64("PaintType").unwrap_or(1);
+    Some(std::sync::Arc::new(TilingPatternDef {
+        content,
+        dict: dict.clone(),
+        bbox,
+        x_step,
+        y_step,
+        matrix,
+        paint_type,
+    }))
+}
+
 /// Build an ICC transform from an inline (synthetic) profile stream.
 fn build_inline_icc_transform(
     file: Option<&PdfFile>,
@@ -5805,9 +6217,10 @@ fn build_inline_icc_transform(
 /// Resolve a PDF `/ColorSpace` object into the pre-digested form consumed by
 /// zpdf-image (which has no `PdfFile` access): chases indirect refs, ICCBased
 /// profiles (compiled into transforms through `icc`, falling back to `/N`
-/// 1/3/4 → gray/RGB/CMYK) and Indexed palettes (string or stream; an ICC base
-/// is baked into the palette). Returns `None` for spaces it cannot resolve,
-/// letting zpdf-image fall back to its own inference.
+/// 1/3/4 → gray/RGB/CMYK), Indexed palettes (string or stream; an ICC base
+/// is baked into the palette), Lab parameters and Separation/DeviceN tint
+/// transforms. Returns `None` for spaces it cannot resolve, letting
+/// zpdf-image fall back to its own inference.
 fn resolve_image_colorspace(
     file: Option<&PdfFile>,
     icc: Option<&mut zpdf_color::IccCache>,
@@ -5904,6 +6317,43 @@ fn resolve_image_colorspace(
                         lookup,
                     })
                 }
+                "Separation" | "DeviceN" => {
+                    // Separation has one colorant; DeviceN (NChannel included)
+                    // one per name.
+                    let n = if head == "Separation" {
+                        1
+                    } else {
+                        let names = match arr.get(1)? {
+                            PdfObject::Ref(r) => file?.resolve(*r).ok()?,
+                            other => other.clone(),
+                        };
+                        names.as_array().ok()?.len()
+                    };
+                    let n = u8::try_from(n).ok().filter(|&n| n > 0)?;
+                    // An alternate that cannot be resolved (or is itself a
+                    // special space) leaves the tints on the polarity-correct
+                    // gray fallback rather than misreading transform outputs.
+                    let alternate =
+                        resolve_image_colorspace(file, icc, arr.get(2), depth + 1, intent)
+                            .filter(|alt| !matches!(alt, Rcs::Indexed { .. } | Rcs::Tint { .. }));
+                    let transform = alternate
+                        .as_ref()
+                        .and(arr.get(3))
+                        .and_then(|f| parse_image_function(file, f))
+                        .map(std::sync::Arc::new);
+                    Some(Rcs::Tint {
+                        n,
+                        transform,
+                        alternate: Box::new(alternate.unwrap_or(Rcs::Gray)),
+                    })
+                }
+                "Lab" => {
+                    let params = match arr.get(1)? {
+                        PdfObject::Ref(r) => file?.resolve(*r).ok()?,
+                        other => other.clone(),
+                    };
+                    Some(zpdf_image::lab_colorspace(params.as_dict().ok()?))
+                }
                 other => zpdf_image::colorspace_from_name(other),
             }
         }
@@ -5911,12 +6361,40 @@ fn resolve_image_colorspace(
     }
 }
 
+/// Parse an image colour space's tint transform (stream-backed functions get
+/// their decoded data). A free-function twin of the interpreter's
+/// `parse_function`, for [`resolve_image_colorspace`].
+fn parse_image_function(
+    file: Option<&PdfFile>,
+    obj: &PdfObject,
+) -> Option<zpdf_color::PdfFunction> {
+    let mut resolve = |id: zpdf_core::ObjectId| {
+        let file = file?;
+        let o = file.resolve(id).ok()?;
+        let data = if o.as_stream().is_ok() {
+            file.resolve_stream_data(id).ok()
+        } else {
+            None
+        };
+        // Streams must hand back their dict, not the stream object.
+        let obj = match &o {
+            PdfObject::Stream(s) => PdfObject::Dict(s.dict.clone()),
+            other => other.clone(),
+        };
+        Some((obj, data))
+    };
+    zpdf_color::PdfFunction::parse_object(obj, &mut resolve)
+}
+
 /// Decode an image's `/SMask` through the full image-decode path (filters,
 /// predictors, any bpc, /Decode) and fold it into `image` as premultiplied
 /// alpha. Failures leave the image opaque rather than dropping it.
+/// `colorspace` is the image's resolved colour space, which a `/Matte` colour
+/// is given in (`None`: inferred from its component count).
 fn fold_soft_mask(
     image: &mut zpdf_image::DecodedImage,
     smask_ref: zpdf_core::ObjectId,
+    colorspace: Option<&zpdf_image::ResolvedColorSpace>,
     file: &PdfFile,
     limits: &ParseLimits,
 ) {
@@ -5944,7 +6422,14 @@ fn fold_soft_mask(
         Some(zpdf_image::ResolvedColorSpace::Gray),
         limits,
     ) {
-        Ok(mask) => zpdf_image::apply_smask_image(image, &mask),
+        // A `/Matte` mask means the parent's colours were pre-blended with
+        // the matte colour.
+        Ok(mask) => zpdf_image::apply_smask_image_with_matte(
+            image,
+            &mask,
+            zpdf_image::smask_matte(&dict).as_deref(),
+            colorspace,
+        ),
         Err(e) => tracing::warn!("failed to decode /SMask image: {e}"),
     }
 }
@@ -6045,6 +6530,46 @@ mod tests {
         let dl = ContentInterpreter::new(page_rect).interpret(content);
         assert_eq!(dl.commands.len(), 1);
         assert!(matches!(&dl.commands[0], RenderCommand::FillPath { .. }));
+    }
+
+    #[test]
+    fn rotation_accounts_for_nonzero_box_origin() {
+        let page = Rect::new(10.0, 20.0, 110.0, 220.0);
+        let dl = ContentInterpreter::new(page)
+            .with_page_rotation(90)
+            .interpret(b"10 20 10 10 re f");
+        assert_eq!(dl.page_rect, Rect::new(0.0, 0.0, 200.0, 100.0));
+        let RenderCommand::FillPath { path, .. } = &dl.commands[0] else {
+            panic!("expected fill");
+        };
+        let mut points: Vec<(f64, f64)> = path.points().iter().map(|p| (p.x, p.y)).collect();
+        points.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(
+            points,
+            vec![(0.0, 90.0), (0.0, 100.0), (10.0, 90.0), (10.0, 100.0)]
+        );
+    }
+
+    #[test]
+    fn every_quarter_turn_maps_an_offset_box_onto_the_rotated_rect() {
+        // A full-box fill must land exactly on the rotated page rect, whatever
+        // the box origin, for every quarter turn (incl. normalised values).
+        let page = Rect::new(10.0, 20.0, 110.0, 220.0);
+        for rotate in [90, 180, 270, -90, 450] {
+            let dl = ContentInterpreter::new(page)
+                .with_page_rotation(rotate)
+                .interpret(b"10 20 100 200 re f");
+            let RenderCommand::FillPath { path, .. } = &dl.commands[0] else {
+                panic!("expected fill");
+            };
+            let r = dl.page_rect;
+            assert_eq!((r.x0, r.y0), (0.0, 0.0), "rotate {rotate}");
+            for p in path.points() {
+                let on_x = (p.x - r.x0).abs() < 1e-9 || (p.x - r.x1).abs() < 1e-9;
+                let on_y = (p.y - r.y0).abs() < 1e-9 || (p.y - r.y1).abs() < 1e-9;
+                assert!(on_x && on_y, "rotate {rotate}: {p:?} not a corner of {r:?}");
+            }
+        }
     }
 
     #[test]
@@ -6221,6 +6746,74 @@ mod tests {
                 && (shifted.1 - (base.1 + 200.0)).abs() < 1e-6,
             "content shifted by exactly (100, 200): base={base:?} shifted={shifted:?}"
         );
+    }
+
+    /// A one-object file holding an 8x8 `/ImageMask` stencil XObject.
+    fn stencil_image_file() -> (PdfFile, ObjectId) {
+        let samples = [0b1010_1010u8, 0b0101_0101].repeat(4);
+        let mut pdf = b"%PDF-1.7\n".to_vec();
+        let offset = pdf.len();
+        pdf.extend_from_slice(
+            format!(
+                "1 0 obj\n<< /Type /XObject /Subtype /Image /Width 8 /Height 8 \
+                 /ImageMask true /BitsPerComponent 1 /Length {} >>\nstream\n",
+                samples.len()
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(&samples);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+        let xref = pdf.len();
+        pdf.extend_from_slice(
+            format!(
+                "xref\n0 2\n0000000000 65535 f \n{offset:010} 00000 n \n\
+                 trailer\n<< /Size 2 >>\nstartxref\n{xref}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        (PdfFile::parse(pdf).expect("stencil file"), ObjectId(1, 0))
+    }
+
+    #[test]
+    fn repeated_stencil_draws_decode_once_per_fill_colour() {
+        let (file, id) = stencil_image_file();
+        let object = file.resolve(id).expect("stencil object");
+        let stream = object.as_stream().expect("stencil stream");
+        let resources = ResourceDict::default();
+        let mut cache = ImageCache::new();
+        let mut interp = ContentInterpreter::new(Rect::new(0.0, 0.0, 100.0, 100.0))
+            .with_document(&file, &resources)
+            .with_images(&mut cache);
+        for (color, x) in [
+            (Color::black(), 0.0),
+            (Color::black(), 10.0),
+            (Color::rgb(1.0, 0.0, 0.0), 20.0),
+            (Color::black(), 30.0),
+            (Color::rgb(1.0, 0.0, 0.0), 40.0),
+        ] {
+            interp.current.fill_color = color;
+            interp.current.ctm = Matrix::new(8.0, 0.0, 0.0, 8.0, x, 0.0);
+            interp.do_image_xobject(id, stream);
+        }
+        let draws: Vec<_> = interp
+            .display_list
+            .commands
+            .iter()
+            .filter_map(|command| match command {
+                RenderCommand::DrawImage(draw) => Some((draw.image_id, draw.is_image_mask)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(draws.len(), 5);
+        assert!(draws.iter().all(|&(_, mask)| mask));
+        assert_eq!(draws[0].0, draws[1].0, "same colour reuses the stencil");
+        assert_eq!(draws[0].0, draws[3].0);
+        assert_eq!(draws[2].0, draws[4].0);
+        assert_ne!(draws[0].0, draws[2].0, "another colour is its own stencil");
+        let images = interp.image_cache.as_deref().expect("image cache");
+        assert_eq!(images.len(), 2, "one stencil per fill colour");
+        let red = images.get(draws[2].0).expect("red stencil");
+        assert!(red.data.chunks(4).any(|px| px == [255, 0, 0, 255]));
     }
 
     // ---- Image footprints for the CPU backend (`with_image_downscale`) ----
@@ -6983,12 +7576,14 @@ mod tests {
         let glyphs = vec![
             PositionedGlyph {
                 glyph_id: 26,
+                code: 0,
                 x: 0.0,
                 y: 0.0,
                 advance: 0.0,
             },
             PositionedGlyph {
                 glyph_id: 42,
+                code: 0,
                 x: 50.0,
                 y: 0.0,
                 advance: 0.0,
@@ -7165,6 +7760,231 @@ mod tests {
             }
             other => panic!("expected Indexed, got {other:?}"),
         }
+    }
+
+    /// Interpret `content` with `/CS0` bound to the inline colour space `cs`.
+    /// A file holding `body` as object 1.
+    fn single_object_file(body: &str) -> PdfFile {
+        let mut pdf = b"%PDF-1.7\n".to_vec();
+        let offset = pdf.len();
+        pdf.extend_from_slice(format!("1 0 obj\n{body}\nendobj\n").as_bytes());
+        let xref = pdf.len();
+        pdf.extend_from_slice(
+            format!(
+                "xref\n0 2\n0000000000 65535 f \n{offset:010} 00000 n \n\
+                 trailer\n<< /Size 2 >>\nstartxref\n{xref}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        PdfFile::parse(pdf).expect("single-object file")
+    }
+
+    #[test]
+    fn disjoint_clips_stay_empty() {
+        let mut interp = ContentInterpreter::new(Rect::new(0.0, 0.0, 100.0, 100.0));
+        interp.intersect_clip_bounds(Some(Rect::new(0.0, 0.0, 10.0, 10.0)));
+        interp.intersect_clip_bounds(Some(Rect::new(20.0, 20.0, 30.0, 30.0)));
+        interp.intersect_clip_bounds(Some(Rect::new(0.0, 0.0, 100.0, 100.0)));
+        let region = interp.shading_region();
+        assert!(
+            region.width() <= 0.0 || region.height() <= 0.0,
+            "{region:?}"
+        );
+    }
+
+    #[test]
+    fn a_reselected_shading_pattern_is_built_once_per_base_ctm() {
+        let file = single_object_file(
+            "<< /PatternType 2 /Shading << /ShadingType 2 /ColorSpace /DeviceRGB \
+             /Coords [0 0 100 0] /Function << /FunctionType 2 /Domain [0 1] \
+             /C0 [1 0 0] /C1 [0 0 1] /N 1 >> >> >>",
+        );
+        let mut resources = ResourceDict::default();
+        resources.patterns.insert("P0".into(), ObjectId(1, 0));
+        let mut interp = ContentInterpreter::new(Rect::new(0.0, 0.0, 100.0, 100.0))
+            .with_document(&file, &resources);
+        let shading = |interp: &mut ContentInterpreter| match interp.resolve_pattern("P0") {
+            (Some(PatternPaint::Shading(def)), _) => def,
+            _ => panic!("shading pattern"),
+        };
+        let first = shading(&mut interp);
+        assert!(std::sync::Arc::ptr_eq(&first, &shading(&mut interp)));
+
+        // Under another base CTM (a form, a tile) the shading maps elsewhere.
+        interp.base_ctm = Matrix::new(2.0, 0.0, 0.0, 2.0, 0.0, 0.0);
+        let scaled = shading(&mut interp);
+        assert!(!std::sync::Arc::ptr_eq(&first, &scaled));
+        assert_eq!(scaled.to_page, interp.base_ctm);
+    }
+
+    fn fill_with_color_space(cs: PdfObject, content: &[u8]) -> DisplayList {
+        let (file, _) = stencil_image_file();
+        let mut resources = ResourceDict::default();
+        resources.color_spaces_inline.insert("CS0".into(), cs);
+        ContentInterpreter::new(Rect::new(0.0, 0.0, 100.0, 100.0))
+            .with_document(&file, &resources)
+            .interpret(content)
+    }
+
+    #[test]
+    fn ext_gstate_dash_pattern_applies() {
+        use zpdf_core::PdfName;
+        let mut gs = PdfDict::new();
+        gs.insert(
+            PdfName::new("D"),
+            PdfObject::Array(vec![
+                PdfObject::Array(vec![PdfObject::Integer(3), PdfObject::Integer(2)]),
+                PdfObject::Integer(1),
+            ]),
+        );
+        let mut resources = ResourceDict::default();
+        resources.ext_g_state_inline.insert("GS0".into(), gs);
+        let (file, _) = stencil_image_file();
+        let dl = ContentInterpreter::new(Rect::new(0.0, 0.0, 100.0, 100.0))
+            .with_document(&file, &resources)
+            .interpret(b"/GS0 gs 0 0 m 50 0 l S");
+        let dash = dl.commands.iter().find_map(|c| match c {
+            RenderCommand::StrokePath { style, .. } => style.dash.clone(),
+            _ => None,
+        });
+        let dash = dash.expect("dashed stroke");
+        assert_eq!((dash.array, dash.phase), (vec![3.0, 2.0], 1.0));
+    }
+
+    #[test]
+    fn stroke_pattern_region_covers_the_page_space_stroke() {
+        // `10 0 0 10 0 0 cm 5 w`: a 50-unit stroke along y = 100.
+        let mut path = Path::new();
+        path.move_to(Point::new(100.0, 100.0));
+        path.line_to(Point::new(200.0, 100.0));
+        let style = StrokeStyle {
+            width: 50.0,
+            join: LineJoin::Round,
+            ..StrokeStyle::default()
+        };
+        let bounds = ContentInterpreter::stroke_region_bounds(&path, &style).unwrap();
+        assert!(bounds.y0 <= 75.0 && bounds.y1 >= 125.0, "{bounds:?}");
+    }
+
+    #[test]
+    fn clipping_operators_apply_after_the_painting_operator() {
+        let kinds = |content: &[u8]| -> Vec<&'static str> {
+            ContentInterpreter::new(Rect::new(0.0, 0.0, 400.0, 400.0))
+                .interpret(content)
+                .commands
+                .iter()
+                .filter_map(|c| match c {
+                    RenderCommand::PushClip { .. } => Some("clip"),
+                    RenderCommand::PopClip => Some("pop"),
+                    RenderCommand::StrokePath { .. } => Some("stroke"),
+                    RenderCommand::FillPath { .. } => Some("fill"),
+                    _ => None,
+                })
+                .collect()
+        };
+        // The stroke is painted under the previous (no) clip, not its own.
+        assert_eq!(
+            kinds(b"q 100 100 200 200 re W S 0 0 400 400 re f Q"),
+            ["stroke", "clip", "fill", "pop"]
+        );
+        assert_eq!(
+            kinds(b"q 100 100 200 200 re W* n 0 0 400 400 re f Q"),
+            ["clip", "fill", "pop"]
+        );
+    }
+
+    /// A pending `W` belongs to the stream that set it: the tiling cell its
+    /// own `f` paints must not consume it, and a form ending on `re W` must
+    /// not clip what follows the form.
+    #[test]
+    fn pending_clips_stay_in_their_own_content_stream() {
+        // Bounds of the clips still open around the last fill.
+        let clips_at_last_fill = |file: &PdfFile, resources: &ResourceDict, content: &[u8]| {
+            let list = ContentInterpreter::new(Rect::new(0.0, 0.0, 100.0, 100.0))
+                .with_document(file, resources)
+                .interpret(content);
+            let mut open = Vec::new();
+            let mut at_fill = Vec::new();
+            for command in &list.commands {
+                match command {
+                    RenderCommand::PushClip { path, .. } => {
+                        open.push(ContentInterpreter::path_bounds(path))
+                    }
+                    RenderCommand::PopClip => {
+                        open.pop();
+                    }
+                    RenderCommand::FillPath { .. } => at_fill.clone_from(&open),
+                    _ => {}
+                }
+            }
+            at_fill
+        };
+
+        let pattern = single_object_file(
+            "<< /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 10 10] \
+             /XStep 10 /YStep 10 /Resources << >> /Length 11 >>\n\
+             stream\n0 0 5 5 re f\nendstream",
+        );
+        let mut resources = ResourceDict::default();
+        resources.patterns.insert("P0".into(), ObjectId(1, 0));
+        assert_eq!(
+            clips_at_last_fill(
+                &pattern,
+                &resources,
+                b"/Pattern cs /P0 scn 0 0 50 50 re W f 0 g 0 0 100 100 re f",
+            ),
+            [Some(Rect::new(0.0, 0.0, 50.0, 50.0))]
+        );
+
+        let form = single_object_file(
+            "<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] /Length 13 >>\n\
+             stream\n0 0 10 10 re W\nendstream",
+        );
+        let mut resources = ResourceDict::default();
+        resources.xobjects.insert("Fm0".into(), ObjectId(1, 0));
+        assert_eq!(
+            clips_at_last_fill(&form, &resources, b"/Fm0 Do 0 0 100 100 re f"),
+            []
+        );
+    }
+
+    #[test]
+    fn self_referencing_color_space_names_terminate() {
+        use zpdf_core::{PdfName, PdfString};
+        // `/CS0 /CS0`, and an Indexed space whose base names its own resource.
+        let cycle = PdfObject::Name(PdfName::new("CS0"));
+        let indexed = PdfObject::Array(vec![
+            PdfObject::Name(PdfName::new("Indexed")),
+            PdfObject::Name(PdfName::new("CS0")),
+            PdfObject::Integer(0),
+            PdfObject::String(PdfString::new(vec![0, 0, 0])),
+        ]);
+        for cs in [cycle, indexed] {
+            let dl = fill_with_color_space(cs, b"/CS0 cs 0 sc 0 0 10 10 re f");
+            assert!(dl
+                .commands
+                .iter()
+                .any(|c| matches!(c, RenderCommand::FillPath { .. })));
+        }
+    }
+
+    #[test]
+    fn lab_with_an_inverted_range_does_not_panic() {
+        use zpdf_core::PdfName;
+        let mut params = PdfDict::new();
+        params.insert(
+            PdfName::new("Range"),
+            PdfObject::Array([10.0, -10.0, 100.0, -100.0].map(PdfObject::Real).to_vec()),
+        );
+        let lab = PdfObject::Array(vec![
+            PdfObject::Name(PdfName::new("Lab")),
+            PdfObject::Dict(params),
+        ]);
+        let dl = fill_with_color_space(lab, b"/CS0 cs 50 0 0 sc 0 0 10 10 re f");
+        assert!(dl
+            .commands
+            .iter()
+            .any(|c| matches!(c, RenderCommand::FillPath { .. })));
     }
 
     #[test]

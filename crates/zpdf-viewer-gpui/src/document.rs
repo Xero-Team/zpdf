@@ -172,6 +172,7 @@ impl LoadedDocument {
             .with_page_rotation(page.rotate)
             .with_fonts(&mut fonts)
             .with_document(self.pdf.file(), &page.resources)
+            .with_shared_fonts(&self.pdf)
             .with_images(&mut images)
             .with_colors(&mut colors)
             .with_operand_stack_limit(self.pdf.file().limits().max_operand_stack_depth as usize);
@@ -197,6 +198,7 @@ impl LoadedDocument {
                         let mut annot_interp = ContentInterpreter::new(annot.rect)
                             .with_fonts(&mut fonts)
                             .with_document(self.pdf.file(), &page.resources)
+                            .with_shared_fonts(&self.pdf)
                             .with_images(&mut images)
                             .with_colors(&mut colors)
                             .with_operand_stack_limit(

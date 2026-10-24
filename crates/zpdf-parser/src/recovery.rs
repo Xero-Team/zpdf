@@ -19,20 +19,7 @@ use crate::xref::{XrefEntry, XrefTable};
 
 /// Entry point for recovery. Single linear pass + trailer recovery.
 pub fn scan_all_objects(data: &[u8], limits: &ParseLimits) -> Result<(XrefTable, PdfDict)> {
-    let headers = scan_object_headers(data, limits)?;
-
-    let mut table = XrefTable::new();
-    // LATER occurrence wins (incremental update): overwrite earlier offsets.
-    for &(id, offset) in &headers {
-        table.insert_overwrite(id, XrefEntry::InUse { offset, gen: id.1 });
-    }
-
-    if table.is_empty() {
-        return Err(Error::InvalidXref(0));
-    }
-
-    // Optional, recommended: index members of any /ObjStm we found. Never fatal.
-    index_objstm_members(data, &mut table, limits);
+    let (headers, mut table) = build_object_table(data, limits)?;
 
     // Locate a catalog among ALL header occurrences (not just the later-wins
     // survivors) and any /ObjStm members. When the catalog is a direct object
@@ -47,8 +34,38 @@ pub fn scan_all_objects(data: &[u8], limits: &ParseLimits) -> Result<(XrefTable,
     // catalog we return a (possibly Root-less) trailer so the file opens, and
     // the document layer then scans for /Type /Page objects to build the page
     // list. This is what lets headerless / catalog-less fragments render.
-    let trailer = recover_trailer(data, &table, limits, catalog.map(|(id, _)| id));
+    let trailer = recover_trailer(data, &headers, &table, limits, catalog.map(|(id, _)| id));
     Ok((table, trailer))
+}
+
+/// The object table of [`scan_all_objects`] alone, for resolving objects the
+/// xref misplaces: no catalog search or trailer recovery, which only opening a
+/// file needs.
+pub fn scan_object_table(data: &[u8], limits: &ParseLimits) -> Result<XrefTable> {
+    build_object_table(data, limits).map(|(_, table)| table)
+}
+
+/// Every object header in file order, and the table they and the members of
+/// any /ObjStm among them make.
+fn build_object_table(
+    data: &[u8],
+    limits: &ParseLimits,
+) -> Result<(Vec<(ObjectId, u64)>, XrefTable)> {
+    let headers = scan_object_headers(data, limits)?;
+
+    let mut table = XrefTable::new();
+    // LATER occurrence wins (incremental update): overwrite earlier offsets.
+    for &(id, offset) in &headers {
+        table.insert_overwrite(id, XrefEntry::InUse { offset, gen: id.1 });
+    }
+
+    if table.is_empty() {
+        return Err(Error::InvalidXref(0));
+    }
+
+    // Optional, recommended: index members of any /ObjStm we found. Never fatal.
+    index_objstm_members(data, &mut table, limits);
+    Ok((headers, table))
 }
 
 /// Linear scanner. Returns `(id, offset)` for every `<int> <int> obj` header,
@@ -153,11 +170,14 @@ fn parse_uint(bytes: &[u8]) -> Option<u32> {
 /// (the document layer scans for `/Type /Page` objects to build the page list).
 fn recover_trailer(
     data: &[u8],
+    headers: &[(ObjectId, u64)],
     table: &XrefTable,
     limits: &ParseLimits,
     recovered_catalog: Option<ObjectId>,
 ) -> PdfDict {
-    if let Some(mut d) = find_trailer_dict(data, limits) {
+    let explicit =
+        find_trailer_dict(data, limits).or_else(|| find_xref_stream_dict(data, headers, limits));
+    if let Some(mut d) = explicit {
         // Trust an explicit /Root only if it genuinely points at a catalog —
         // fuzzed files routinely carry a /Root aimed at a free/wrong object.
         if let Ok(root) = d.get_ref("Root") {
@@ -207,6 +227,36 @@ fn root_points_at_catalog(
         .unwrap_or(false)
 }
 
+/// The trailer entries of the LAST cross-reference stream among `headers`, for
+/// files with no `trailer` keyword (PDF 1.5+ xref streams carry the trailer in
+/// their dict). Without them a recovered encrypted file would lose `/Encrypt`
+/// and `/ID` and open with no decryptor.
+fn find_xref_stream_dict(
+    data: &[u8],
+    headers: &[(ObjectId, u64)],
+    limits: &ParseLimits,
+) -> Option<PdfDict> {
+    let parser = ObjectParser::new(data, limits);
+    headers.iter().rev().find_map(|&(_, offset)| {
+        let PdfObject::Stream(stream) = parser
+            .parse_indirect_at(usize::try_from(offset).ok()?)
+            .ok()?
+        else {
+            return None;
+        };
+        if stream.dict.get_name("Type").ok() != Some("XRef") {
+            return None;
+        }
+        let mut trailer = PdfDict::new();
+        for key in ["Root", "Encrypt", "ID", "Info"] {
+            if let Some(value) = stream.dict.get(key) {
+                trailer.insert(PdfName::new(key), value.clone());
+            }
+        }
+        Some(trailer)
+    })
+}
+
 /// Find the LAST `trailer` keyword in the buffer and lex the following dict.
 fn find_trailer_dict(data: &[u8], limits: &ParseLimits) -> Option<PdfDict> {
     let kw = b"trailer";
@@ -247,16 +297,27 @@ fn find_catalog(
     if best.is_some() {
         return best;
     }
-    // None direct: look inside object streams (catalog compressed in an /ObjStm).
+    // None direct: look inside object streams (catalog compressed in an /ObjStm),
+    // decoding each container once for all of its members.
+    let mut members: std::collections::BTreeMap<u32, Vec<(ObjectId, u32)>> = Default::default();
     for id in table.object_ids() {
         if let Some(XrefEntry::Compressed {
             stream_obj,
             index_in_stream,
         }) = table.get(id)
         {
-            if let Some(obj) =
-                decode_objstm_member(data, table, *stream_obj, *index_in_stream, limits)
-            {
+            members
+                .entry(*stream_obj)
+                .or_default()
+                .push((id, *index_in_stream));
+        }
+    }
+    for (stream_obj, members) in members {
+        let Some(objstm) = RecoveredObjStm::decode(data, table, stream_obj, limits) else {
+            continue;
+        };
+        for (id, index_in_stream) in members {
+            if let Some(obj) = objstm.member(index_in_stream, limits) {
                 if dict_is_catalog(object_dict(&obj)) {
                     best = Some((id, None));
                 }
@@ -303,48 +364,86 @@ fn decode_objstm_member(
     index_in_stream: u32,
     limits: &ParseLimits,
 ) -> Option<PdfObject> {
-    use crate::filters;
-    let off = match table.get(ObjectId(stream_obj, 0))? {
-        XrefEntry::InUse { offset, .. } => *offset,
-        _ => return None,
-    };
-    let obj = ObjectParser::new(data, limits)
-        .parse_indirect_at(usize::try_from(off).ok()?)
-        .ok()?;
-    let PdfObject::Stream(stream) = obj else {
-        return None;
-    };
-    if stream.dict.get_name("Type").unwrap_or("") != "ObjStm" {
-        return None;
-    }
-    let n = usize::try_from(stream.dict.get_i64("N").ok()?).ok()?;
-    let first = usize::try_from(stream.dict.get_i64("First").ok()?).ok()?;
-    if n > limits.max_objects as usize {
-        return None;
-    }
-    let decoded = filters::decode_stream_with_limits(&stream.data, &stream.dict, limits).ok()?;
+    RecoveredObjStm::decode(data, table, stream_obj, limits)?.member(index_in_stream, limits)
+}
 
-    let header = &decoded[..first.min(decoded.len())];
-    let mut hlex = Lexer::new(header, 0, limits);
-    let mut offsets = Vec::with_capacity(n.min(header.len()));
-    for _ in 0..n {
-        let _num = hlex.next_token().ok()?.as_i64().ok()?;
-        let m_off = usize::try_from(hlex.next_token().ok()?.as_i64().ok()?).ok()?;
-        offsets.push(m_off);
+/// A decoded `/ObjStm` container and its members' offsets.
+struct RecoveredObjStm {
+    decoded: Vec<u8>,
+    first: usize,
+    offsets: Vec<usize>,
+}
+
+impl RecoveredObjStm {
+    fn decode(
+        data: &[u8],
+        table: &XrefTable,
+        stream_obj: u32,
+        limits: &ParseLimits,
+    ) -> Option<Self> {
+        use crate::filters;
+        let off = match table.get(ObjectId(stream_obj, 0))? {
+            XrefEntry::InUse { offset, .. } => *offset,
+            _ => return None,
+        };
+        let obj = ObjectParser::new(data, limits)
+            .parse_indirect_at(usize::try_from(off).ok()?)
+            .ok()?;
+        let PdfObject::Stream(stream) = obj else {
+            return None;
+        };
+        if stream.dict.get_name("Type").unwrap_or("") != "ObjStm" {
+            return None;
+        }
+        let n = usize::try_from(stream.dict.get_i64("N").ok()?).ok()?;
+        let first = usize::try_from(stream.dict.get_i64("First").ok()?).ok()?;
+        if n > limits.max_objects as usize {
+            return None;
+        }
+        let decoded =
+            filters::decode_stream_with_limits(&stream.data, &stream.dict, limits).ok()?;
+
+        let header = &decoded[..first.min(decoded.len())];
+        let mut hlex = Lexer::new(header, 0, limits);
+        // A malformed pair (or a /N larger than the pairs present) ends the
+        // header, as in `PdfFile::decode_objstm`; earlier members stay usable.
+        let mut offsets = Vec::with_capacity(n.min(header.len()));
+        for _ in 0..n {
+            let pair = (hlex.next_token(), hlex.next_token());
+            let (Ok(num_tok), Ok(offset_tok)) = pair else {
+                break;
+            };
+            let offset = offset_tok
+                .as_i64()
+                .ok()
+                .and_then(|o| usize::try_from(o).ok());
+            let (Ok(_), Some(offset)) = (num_tok.as_i64(), offset) else {
+                break;
+            };
+            offsets.push(offset);
+        }
+        Some(Self {
+            decoded,
+            first,
+            offsets,
+        })
     }
-    let idx = index_in_stream as usize;
-    let start = first.checked_add(*offsets.get(idx)?)?;
-    let end = match offsets.get(idx + 1) {
-        Some(next) => first.checked_add(*next)?,
-        None => decoded.len(),
+
+    fn member(&self, index_in_stream: u32, limits: &ParseLimits) -> Option<PdfObject> {
+        let idx = index_in_stream as usize;
+        let start = self.first.checked_add(*self.offsets.get(idx)?)?;
+        let end = match self.offsets.get(idx + 1) {
+            Some(next) => self.first.checked_add(*next)?,
+            None => self.decoded.len(),
+        }
+        .min(self.decoded.len());
+        if start > end {
+            return None;
+        }
+        Lexer::new(&self.decoded[start..end], 0, limits)
+            .next_token()
+            .ok()
     }
-    .min(decoded.len());
-    if start > end {
-        return None;
-    }
-    Lexer::new(&decoded[start..end], 0, limits)
-        .next_token()
-        .ok()
 }
 
 /// For each recovered /Type /ObjStm object, decode it and add Compressed entries
@@ -459,6 +558,55 @@ mod tests {
         assert_eq!(root, ObjectId(1, 0));
         let cat = file.resolve(root).unwrap();
         assert_eq!(cat.as_dict().unwrap().get_name("Type").unwrap(), "Catalog");
+    }
+
+    #[test]
+    fn recovers_a_catalog_compressed_in_an_object_stream() {
+        let catalog = "<< /Type /Catalog /Pages 2 0 R >>";
+        let pages = "<< /Type /Pages /Kids [3 0 R] /Count 1 >>";
+        let header = format!("1 0 2 {} ", catalog.len() + 1);
+        let body = format!("{header}{catalog} {pages}");
+        // /N 3 overstates the two header pairs (a writer off-by-one).
+        for n in [2, 3] {
+            let mut d = b"%PDF-1.5\n".to_vec();
+            d.extend_from_slice(
+                format!(
+                    "4 0 obj\n<< /Type /ObjStm /N {n} /First {} /Length {} >>\nstream\n{body}\nendstream\nendobj\n",
+                    header.len(),
+                    body.len()
+                )
+                .as_bytes(),
+            );
+            d.extend_from_slice(
+                b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+            );
+            d.extend_from_slice(b"startxref\n99999\n%%EOF\n");
+            let (table, trailer) = scan_all_objects(&d, &ParseLimits::default()).unwrap();
+            assert_eq!(trailer.get_ref("Root").unwrap(), ObjectId(1, 0), "/N {n}");
+            assert!(matches!(
+                table.get(ObjectId(2, 0)),
+                Some(XrefEntry::Compressed {
+                    index_in_stream: 1,
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn xref_stream_trailer_entries_survive_recovery() {
+        let mut d = broken_pdf();
+        d.truncate(d.len() - b"startxref\n99999\n%%EOF\n".len());
+        d.extend_from_slice(b"4 0 obj\n<< /Producer (x) >>\nendobj\n");
+        d.extend_from_slice(
+            b"5 0 obj\n<< /Type /XRef /Size 6 /Root 1 0 R /Info 4 0 R /ID [<01> <02>] \
+              /W [1 2 1] /Length 0 >>\nstream\n\nendstream\nendobj\n",
+        );
+        d.extend_from_slice(b"startxref\n99999\n%%EOF\n");
+        let (_, trailer) = scan_all_objects(&d, &ParseLimits::default()).unwrap();
+        assert_eq!(trailer.get_ref("Root").unwrap(), ObjectId(1, 0));
+        assert_eq!(trailer.get_ref("Info").unwrap(), ObjectId(4, 0));
+        assert!(trailer.get("ID").is_some());
     }
 
     #[test]

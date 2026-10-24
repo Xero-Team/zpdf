@@ -241,6 +241,25 @@ impl PdfDocument {
         )
     }
 
+    /// The font dictionary `font_ref`, parsed at most once per document while
+    /// the shared font budget allows. This is the same cache
+    /// [`Self::load_page_fonts`] fills, so a font a Form XObject or annotation
+    /// appearance references is reused across pages and forms, and a font the
+    /// page already loaded is handed back without a second parse. Insert the
+    /// result into a page's [`FontCache`] with
+    /// [`FontCache::try_insert_shared_with_limit`].
+    ///
+    /// Uses this document's font provider, which is also the provider
+    /// [`Self::load_page_fonts`] attaches to the page caches it builds.
+    pub fn shared_font(&self, font_ref: ObjectId) -> Result<Arc<LoadedFont>> {
+        font_loader::load_shared_font(
+            &self.file,
+            font_ref,
+            &mut self.shared_fonts.borrow_mut(),
+            self.font_provider.as_ref(),
+        )
+    }
+
     /// Parse a page's annotations into renderable form (/Rect, /F, the
     /// /AS-selected appearance stream, /OC membership). Widget annotations for
     /// interactive-form fields gain a generated appearance when the producer
@@ -481,6 +500,43 @@ mod tests {
             1,
             "one distinct font object, one parse"
         );
+    }
+
+    /// Fonts referenced outside the page resources (Form XObjects, annotation
+    /// appearances) go through the same document cache as page fonts.
+    #[test]
+    fn form_fonts_share_the_document_font_cache() {
+        let pdf = test_util::build_pdf(&[
+            "<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Contents 7 0 R \
+             /Resources << /Font << /F1 5 0 R >> >> >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Contents 7 0 R \
+             /Resources << /Font << /F2 6 0 R >> >> >>",
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>",
+            "<< /Length 0 >>\nstream\n\nendstream",
+        ]);
+        let doc = PdfDocument::open(pdf).unwrap();
+
+        // A page font is handed back to a form without a second parse.
+        let page_fonts = doc.load_page_fonts(&doc.page(0).unwrap());
+        let (_, page_font) = page_fonts.get_by_name("F1").expect("page font");
+        let from_form = doc.shared_font(ObjectId(5, 0)).expect("shared font");
+        assert!(std::ptr::eq(page_font, &*from_form));
+
+        // A font first met in a form is parsed once and reused by later forms
+        // and by a later page that lists it.
+        let first = doc.shared_font(ObjectId(6, 0)).expect("form font");
+        let again = doc.shared_font(ObjectId(6, 0)).expect("form font");
+        assert!(Arc::ptr_eq(&first, &again));
+        let page_fonts = doc.load_page_fonts(&doc.page(1).unwrap());
+        let (_, page_font) = page_fonts.get_by_name("F2").expect("page font");
+        assert!(std::ptr::eq(page_font, &*first));
+        assert_eq!(doc.shared_fonts.borrow().fonts.len(), 2);
+
+        // A reference that is not a font dictionary is an error, not a font.
+        assert!(doc.shared_font(ObjectId(7, 0)).is_err());
     }
 }
 
