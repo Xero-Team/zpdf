@@ -315,7 +315,28 @@ cargo run -p zpdf-cli -- redact document.pdf -p 1 --rect 60,690,400,730 --fill 1
 ```
 
 Verify with `zpdf text redacted.pdf` — the covered text is gone from
-extraction, not merely hidden.
+extraction, not merely hidden. `/ActualText`/`/Alt` replacement text of the
+removed content is scrubbed (in the content stream, the page's marked-content
+property lists and the structure tree), images/forms that were only drawn
+inside the region are dropped, and so is the page thumbnail. A form field whose
+every widget was removed is removed with its value.
+
+The output is a **full rewrite**, not an incremental update, so the original
+content stream and earlier revisions are not left in the file. Consequences:
+
+- An encrypted input (`--password`) is written **decrypted**; re-encrypt it
+  with `optimize --encrypt` if needed.
+- Only the page region is redacted: document metadata (`/Info`, XMP),
+  bookmarks, attachments and other pages are kept as they are — review them
+  separately (e.g. `set-meta`).
+- Text selection uses estimated extents, not the renderer's complete glyph
+  geometry. Custom widths, spacing and vertical text can differ from that
+  estimate. Check both extraction and rendering of sensitive output; this
+  API does not guarantee sanitization of arbitrary PDFs.
+- A shared resource still reachable from another page, an inherited resource
+  dictionary or another retained object can remain in the output. The rewrite
+  removes superseded revisions and unreachable objects, not every duplicate
+  occurrence of sensitive data.
 
 ### `optimize` — compress, encrypt, downsample, linearize
 

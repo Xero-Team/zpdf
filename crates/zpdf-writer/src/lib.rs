@@ -66,7 +66,7 @@ pub use forms::FormFiller;
 pub use linearize::linearize_pdf;
 pub use merge::extract_pages;
 pub use metadata::InfoUpdate;
-pub use redact::RedactOptions;
+pub use redact::{redact_pdf, RedactOptions};
 pub use rewrite::{rewrite_pdf, PdfaConvertConfig, PdfaProfile, RewriteOptions};
 #[cfg(feature = "timestamp")]
 pub use sign::UreqTimestampRequester;

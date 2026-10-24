@@ -2795,18 +2795,22 @@ fn cmd_redact(args: &[String]) -> zpdf::Result<()> {
     }
 
     let bytes = fs::read(&input_path).map_err(zpdf::Error::Io)?;
-    let mut writer = match password.as_deref() {
-        Some(pw) => zpdf_writer::IncrementalWriter::new_with_password(bytes, pw.as_bytes())?,
-        None => zpdf_writer::IncrementalWriter::new(bytes)?,
-    };
-    writer.redact_page(
+    // A document with an empty user password opens without --password, so
+    // ask the file rather than the flag.
+    if zpdf::PdfFile::parse(bytes.clone()).is_ok_and(|f| f.is_encrypted()) {
+        eprintln!(
+            "Note: the redacted output is a full rewrite and is NOT encrypted; \
+             re-encrypt it with `zpdf optimize --encrypt` if needed."
+        );
+    }
+    let out_bytes = zpdf_writer::redact_pdf(
+        bytes,
+        password.as_deref().unwrap_or("").as_bytes(),
         page_num.saturating_sub(1),
         &rects,
         &zpdf_writer::RedactOptions { fill },
     )?;
-    let mut out = std::io::Cursor::new(Vec::new());
-    writer.write(&mut out).map_err(zpdf::Error::Io)?;
-    fs::write(&out_path, out.into_inner()).map_err(zpdf::Error::Io)?;
+    fs::write(&out_path, out_bytes).map_err(zpdf::Error::Io)?;
     println!(
         "{} region(s) redacted on page {page_num} → {out_path}",
         rects.len()
