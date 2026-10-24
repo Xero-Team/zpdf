@@ -147,37 +147,59 @@ impl Encryptor {
     }
 
     /// Encrypt a string/stream payload for object `id`.
+    ///
+    /// # Panics
+    ///
+    /// When AES needs an IV and the system RNG is unavailable;
+    /// [`Self::try_encrypt_bytes`] reports that as an error instead.
     pub fn encrypt_bytes(&self, id: ObjectId, data: &[u8]) -> Vec<u8> {
-        match self.algorithm {
+        self.try_encrypt_bytes(id, data)
+            .expect("system RNG unavailable for the AES-CBC IV")
+    }
+
+    /// Fallible [`Self::encrypt_bytes`].
+    pub fn try_encrypt_bytes(&self, id: ObjectId, data: &[u8]) -> Result<Vec<u8>> {
+        Ok(match self.algorithm {
             EncryptionAlgorithm::Rc4_128 => rc4(&self.object_key_rc4(id), data),
-            EncryptionAlgorithm::Aes256 => aes_cbc_encrypt(&self.key, data),
-        }
+            EncryptionAlgorithm::Aes256 => aes_cbc_encrypt(&self.key, data)?,
+        })
     }
 
     /// Recursively encrypt every string in `obj` in place (streams are
     /// handled separately since their payload is carried out-of-band).
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::encrypt_bytes`]; see [`Self::try_encrypt_strings`].
     pub fn encrypt_strings(&self, obj: &mut PdfObject, id: ObjectId) {
+        self.try_encrypt_strings(obj, id)
+            .expect("system RNG unavailable for the AES-CBC IV")
+    }
+
+    /// Fallible [`Self::encrypt_strings`].
+    pub fn try_encrypt_strings(&self, obj: &mut PdfObject, id: ObjectId) -> Result<()> {
         match obj {
             PdfObject::String(s) => {
-                *s = PdfString(self.encrypt_bytes(id, &s.0));
+                *s = PdfString(self.try_encrypt_bytes(id, &s.0)?);
             }
             PdfObject::Array(a) => {
                 for o in a.iter_mut() {
-                    self.encrypt_strings(o, id);
+                    self.try_encrypt_strings(o, id)?;
                 }
             }
             PdfObject::Dict(d) => {
                 for v in d.0.values_mut() {
-                    self.encrypt_strings(v, id);
+                    self.try_encrypt_strings(v, id)?;
                 }
             }
             PdfObject::Stream(s) => {
                 for v in s.dict.0.values_mut() {
-                    self.encrypt_strings(v, id);
+                    self.try_encrypt_strings(v, id)?;
                 }
             }
             _ => {}
         }
+        Ok(())
     }
 
     // ---- AES-256 / V5 / R6 --------------------------------------------------
@@ -425,12 +447,10 @@ fn aes256_ecb_encrypt_block(key: &[u8], block: &[u8; 16]) -> [u8; 16] {
 
 /// AES-CBC encrypt with random IV and PKCS#5 padding — the PDF stream/string
 /// payload format (IV || ciphertext). Key length selects AES-128/256.
-fn aes_cbc_encrypt(key: &[u8], data: &[u8]) -> Vec<u8> {
+fn aes_cbc_encrypt(key: &[u8], data: &[u8]) -> Result<Vec<u8>> {
     use aes::cipher::{BlockModeEncrypt, KeyIvInit};
-    let mut iv = [0u8; 16];
-    // Stream content is not key material; fall back to a fixed IV only if the
-    // system RNG is unavailable (never expected in practice).
-    let _ = getrandom::getrandom(&mut iv);
+    // CBC needs an unpredictable IV; never fall back to a fixed one.
+    let iv = random_bytes(16)?;
 
     let pad = 16 - (data.len() % 16);
     let mut buf = Vec::with_capacity(data.len() + pad);
@@ -456,7 +476,7 @@ fn aes_cbc_encrypt(key: &[u8], data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(16 + buf.len());
     out.extend_from_slice(&iv);
     out.extend_from_slice(&buf);
-    out
+    Ok(out)
 }
 
 /// RC4 (symmetric).
@@ -576,9 +596,12 @@ mod tests {
     #[test]
     fn aes_roundtrip_via_padding_shape() {
         let key = [7u8; 32];
-        let ct = aes_cbc_encrypt(&key, b"hello world");
+        let ct = aes_cbc_encrypt(&key, b"hello world").unwrap();
         // 16 IV + 16 ciphertext (11 bytes + 5 padding)
         assert_eq!(ct.len(), 32);
+        // A fresh random IV per call: equal plaintexts never share one.
+        let again = aes_cbc_encrypt(&key, b"hello world").unwrap();
+        assert_ne!(ct[..16], again[..16]);
     }
 
     #[test]
