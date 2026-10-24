@@ -75,7 +75,7 @@ jobs:
           else
             cp "target/${{ matrix.target }}/release/zpdf" "$dist/"
           fi
-          cp README.md ROADMAP.md LICENSE* "$dist/" 2>/dev/null || true
+          cp README.md LICENSE docs/planning/ROADMAP.md "$dist/"
           if [ "${{ runner.os }}" = "Windows" ]; then
             7z a "${dist}.zip" "$dist" >/dev/null
             echo "ASSET=${dist}.zip" >> "$GITHUB_ENV"

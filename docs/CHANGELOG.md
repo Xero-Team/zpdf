@@ -1,5 +1,89 @@
 # Changelog
 
+## 0.17.0 — Decoder hardening, writer fixes and export fidelity
+
+Released 2026-10-24.
+
+### Security and bounded processing
+
+- Add `redact_pdf`, which rewrites the document after region redaction so
+  superseded revisions are removed. Scrub replacement text associated with
+  removed content, unused page XObjects and property lists, thumbnails and
+  removed widget values. Form placements use their `/BBox` and `/Matrix`.
+  `IncrementalWriter::redact_page` alone still leaves the original file prefix.
+  Text extents remain approximate, and shared resources reachable elsewhere,
+  metadata, attachments and other pages are retained; see the user guide's
+  scope and verification requirements. Encrypted input is rewritten decrypted.
+  (#66, #75)
+- Bound CCITT transitions, retained JBIG2 bitmap and dictionary storage, mesh
+  coverage work, font/function/structure/form traversal, signature byte ranges
+  and image downsampling inflation. Avoid oversized raw-image padding and
+  enforce decoded-size limits for empty or Crypt-only filter arrays. Drop a
+  mesh when its coverage budget is exceeded instead of emitting a partial
+  raster. (#67, #73, #76, #82, #85)
+- Use OS randomness for incremental AES-CBC IVs and emit the certificate's
+  actual issuer and serial in CMS SignerInfo. Fallible encryption helpers
+  propagate entropy failures through writer paths. Standalone parser WASM
+  builds enable the browser entropy backend. (#70, #79)
+- Reject malformed, overlapping and backward signature ranges. Whole-document
+  coverage requires the sole unsigned gap to contain exactly the `/Contents`
+  string; merely spanning byte zero to EOF is insufficient. Hash spans in
+  place, without concatenating file-sized buffers. (#85)
+
+### Parsing and rendering
+
+- Respect deleted objects across incremental xref generations; resolve
+  indirect stream lengths; recover partial object-stream headers and compressed
+  catalogs; retain encryption metadata during recovery. Honor stream `/Crypt`
+  and attachment `/EFF` selection, using the file key unchanged for explicit
+  Crypt filters. (#85)
+- Correct Separation, DeviceN, Lab, Indexed and CMYK/YCCK image conversion,
+  soft-mask matte handling, JPEG dimension recovery and JPX dictionary colour
+  space overrides. JPEG 2000 codestream geometry takes precedence over stale
+  or absent dictionary dimensions; stencil images retain their mask semantics.
+  (#69, #78, #85)
+- Rotate pages about the effective page-box origin and distinguish inline
+  fonts across Forms and interpreters while reusing repeated pattern fonts.
+  Apply pending clips after painting and keep them inside their originating
+  content stream. Handle empty stitching-function intervals at both domain
+  endpoints. (#68, #77, #85)
+- Cache repeated Form content, fonts, masks, patterns and glyph work; reuse CPU
+  surfaces and deduplicate SVG image/mask definitions. Soft-mask keys include
+  clip bounds and SVG nesting depth. These changes make no new quantified
+  performance claim. (#85)
+- Share one native headless wgpu Instance across default GPU contexts to avoid
+  concurrent instance teardown racing device creation in the system Vulkan
+  loader. Devices and per-renderer resources remain independently owned.
+
+### Writing and export
+
+- Honor `--password` in writer commands and across merge inputs; support
+  `--password=<value>` for empty or dash-prefixed passwords. Existing `/P`
+  permission flags remain informational rather than enforced. (#71, #80)
+- Preserve typeless interior page-tree nodes and restore copied field/widget
+  parent links, including deep and cyclic field trees. (#72, #81)
+- Apply PDF/A-1b cleanup across reachable objects, including Form transparency,
+  soft masks, graphics states, actions and associated-file entries. Conversion
+  is best-effort and still requires independent conformance validation. (#73, #82)
+- Export presentation-wide unique image parts, map text with source character
+  codes rather than glyph IDs, and serialize freeform DrawingML geometry with
+  visible hairlines and correct connector orientation. (#74, #83)
+
+### Compatibility and maintenance
+
+- **Source-breaking API change:** `PositionedGlyph` has a new `code: u32` field.
+  Update struct literals with the original PDF character code before CID/GID
+  mapping; `/ToUnicode` is keyed by this code, not `glyph_id`. This is why the
+  release increments the minor version to 0.17.0.
+- Upgrade general hashing to sha2 0.11 while retaining explicit sha2 0.10
+  dependencies for rsa 0.9 signing, verification and RSA oracle tests. (#65)
+- Retain the Linux viewer's libc 0.2.189 pin: xattr 0.2.3 still needs the removed
+  `ENOATTR` constant, so #64 remains deferred until the upstream chain changes.
+- Align agent-submission wording, human responsibility, issue note fields and
+  repository guidance. (#84)
+- Correct stale user-guide limitations and package the roadmap from its actual
+  location instead of silently ignoring missing release documentation.
+
 ## 0.16.0 — Compact paths, CPU image footprints and CAD font recovery
 
 ### Display list
