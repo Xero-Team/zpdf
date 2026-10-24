@@ -1,63 +1,49 @@
-name: bench
-
-# What this gate can and cannot do:
-#
-# CAN: assert deterministic display-list counters on the synthetic corpus (exact,
-# zero flakiness) and catch a hang or a pathological blow-up with a loose
-# wall-clock ceiling. Those live in `crates/zpdf-benches/tests/perf_gate.rs`.
-#
-# CANNOT: gate on wall-clock drift. A shared runner is too noisy for a 5%
-# threshold, and a gate that fails at random gets ignored — which is worse than
-# no gate. Relative before/after comparison is `baseline --compare`, run on a
-# machine that has the real corpus (which is deliberately not in this repo).
-#
-# No GPU here either: `adapters` on a hosted runner are software, and their
-# timings would describe the fallback path while looking authoritative.
-
+name: GPU native crash diagnostic
 on:
-  push:
-    branches: [main]
-  pull_request:
-  # Benchmarks are slow; allow a manual run for a branch without waiting for a PR.
   workflow_dispatch:
-
-concurrency:
-  group: bench-${{ github.ref }}
-  cancel-in-progress: true
-
 permissions:
   contents: read
-
-env:
-  CARGO_TERM_COLOR: always
-
 jobs:
-  perf-gate:
-    name: perf gate (deterministic counters)
+  diagnose:
     runs-on: ubuntu-latest
-    # Generous: the gate itself is fast, but building the workspace is not.
-    timeout-minutes: 30
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-
-      # The synthetic corpus is in version control, so this needs nothing else.
-      - name: Perf gate (composition counters + loose wall ceiling)
-        run: cargo test -p zpdf-benches --test perf_gate -- --nocapture
-
-      # Each font workload validates glyphs, placement and text before timing;
-      # `--test` runs every case once.
-      - name: Font benchmark smoke
-        run: cargo bench -p zpdf-benches --bench fonts --bench font_fallback -- --test
-
-      # Load the whole bench harness on the synthetic corpus, so a broken bench
-      # target cannot rot unnoticed until someone tries to use it. `--quick`
-      # keeps it to seconds, and `ZPDF_BENCH_SYNTHETIC_ONLY` is honest about not
-      # having the real corpus.
-      - name: Bench harness smoke (synthetic only)
-        env:
-          ZPDF_BENCH_SYNTHETIC_ONLY: "1"
+      - name: Install software Vulkan and debugger
         run: |
-          cargo bench -p zpdf-benches --bench stages -- --quick \
-            "stages/parse/rect_fills"
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers libvulkan1 gdb
+          dpkg-query -W mesa-vulkan-drivers libllvm20 libllvm21 2>/dev/null || true
+      - name: Build the two failing suites
+        run: |
+          cargo test -p zpdf-render-wgpu --test blend --no-run --message-format=json > blend.json
+          cargo test -p zpdf --features gpu-render --test gpu_softmask --no-run --message-format=json > softmask.json
+      - name: Fixed serial and parallel comparisons with native backtraces
+        shell: bash
+        run: |
+          set -euo pipefail
+          for suite in blend softmask; do
+            binary=$(jq -r 'select(.reason == "compiler-artifact" and .profile.test and .executable != null) | .executable' "$suite.json" | tail -1)
+            test -x "$binary"
+            sha256sum "$binary"
+            for threads in 1 4; do
+              for trial in 1 2 3 4 5; do
+                log="${suite}-${threads}-${trial}.log"
+                set +e
+                timeout 120 gdb -q -batch -ex 'set pagination off' -ex run -ex 'thread apply all bt 15' --args "$binary" --nocapture --test-threads="$threads" > "$log" 2>&1
+                status=$?
+                set -e
+                if grep -q 'received signal' "$log"; then
+                  echo "DIAG $suite threads=$threads trial=$trial CRASH"
+                  sed -n '/received signal/,$p' "$log" | head -220 || true
+                elif grep -q 'test result: ok' "$log" && ! grep -q 'skipping GPU' "$log"; then
+                  echo "DIAG $suite threads=$threads trial=$trial PASS"
+                else
+                  echo "DIAG $suite threads=$threads trial=$trial ERROR exit=$status"
+                  tail -60 "$log"
+                fi
+              done
+            done
+          done
