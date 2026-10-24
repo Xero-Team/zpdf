@@ -11,8 +11,8 @@
 //! the page's content stream(s) with the matching operators **removed**:
 //! - text-show ops (`Tj`, `'`, `"`, `TJ`) whose glyph extent intersects a
 //!   redaction rect are dropped;
-//! - XObject draws (`Do`) and inline images (`BI…EI`) whose unit-square image
-//!   footprint intersects a rect are dropped;
+//! - XObject draws (`Do`) and inline images (`BI…EI`) whose image footprint or
+//!   transformed Form bounding box intersects a rect are dropped;
 //! - path paint ops (`S`/`f`/`B`…) whose accumulated path bbox intersects a
 //!   rect are downgraded to `n` (no-op paint), keeping any clip (`W`) intact.
 //!
@@ -129,7 +129,37 @@ impl IncrementalWriter {
         };
 
         // Filter the combined stream.
-        let outcome = filter_content(&content, &rects, &lookup_properties);
+        let xobjects = resources
+            .as_ref()
+            .and_then(|r| r.get("XObject"))
+            .map(|x| self.deref_current(x));
+        let lookup_xobject = |name: &str, ctm: &Matrix| {
+            let xobjects = xobjects.as_ref()?.as_dict().ok()?;
+            let obj = self.deref_current(xobjects.get(name)?);
+            let dict = &obj.as_stream().ok()?.dict;
+            match dict.get_name("Subtype").ok()? {
+                "Image" => Some(unit_square_extent(ctm)),
+                "Form" => {
+                    let bounds = self.deref_current(dict.get("BBox")?);
+                    let [x0, y0, x1, y1] = finite_numbers(&bounds)?;
+                    let matrix = match dict.get("Matrix") {
+                        Some(value) => {
+                            let [a, b, c, d, e, f] = finite_numbers(&self.deref_current(value))?;
+                            Matrix::new(a, b, c, d, e, f)
+                        }
+                        None => Matrix::identity(),
+                    };
+                    let transform = ctm.concat(&matrix);
+                    let extent = rect_extent(Rect::new(x0, y0, x1, y1), &transform);
+                    [extent.x0, extent.y0, extent.x1, extent.y1]
+                        .iter()
+                        .all(|v| v.is_finite())
+                        .then_some(extent)
+                }
+                _ => None,
+            }
+        };
+        let outcome = filter_content(&content, &rects, &lookup_properties, &lookup_xobject);
         let mut filtered = outcome.content;
 
         // Optional fill boxes, appended in a fresh graphics state.
@@ -576,6 +606,7 @@ fn filter_content(
     content: &[u8],
     rects: &[Rect],
     properties: &dyn Fn(&str) -> Option<PdfDict>,
+    xobject_extent: &dyn Fn(&str, &Matrix) -> Option<Rect>,
 ) -> FilterOutcome {
     let mut out = Vec::with_capacity(content.len());
     let mut tokenizer = ContentTokenizer::new(content);
@@ -622,6 +653,7 @@ fn filter_content(
                     &mut path_bbox,
                     &mut cur_point,
                     rects,
+                    xobject_extent,
                 );
                 let start = out.len();
                 match keep {
@@ -751,6 +783,7 @@ fn apply_operator(
     path_bbox: &mut Option<Rect>,
     cur_point: &mut Option<(f64, f64)>,
     rects: &[Rect],
+    xobject_extent: &dyn Fn(&str, &Matrix) -> Option<Rect>,
 ) -> Keep {
     let num = |i: usize| -> f64 {
         match operands.get(i) {
@@ -845,8 +878,12 @@ fn apply_operator(
 
         // ---- XObjects ----
         "Do" => {
-            let extent = unit_square_extent(&state.ctm);
-            if rects.iter().any(|r| intersects(&extent, r)) {
+            let extent = operands
+                .first()
+                .and_then(|o| o.as_name().ok())
+                .and_then(|name| xobject_extent(name, &state.ctm));
+            // Unknown or malformed placements cannot safely be kept.
+            if extent.is_none_or(|extent| rects.iter().any(|r| intersects(&extent, r))) {
                 Keep::No
             } else {
                 Keep::Yes
@@ -926,11 +963,30 @@ fn extend_bbox(bbox: &mut Option<Rect>, x: f64, y: f64) {
 
 /// The user-space extent of the CTM-mapped unit square (image placement).
 fn unit_square_extent(ctm: &Matrix) -> Rect {
+    rect_extent(Rect::new(0.0, 0.0, 1.0, 1.0), ctm)
+}
+
+fn finite_numbers<const N: usize>(obj: &PdfObject) -> Option<[f64; N]> {
+    let array = obj.as_array().ok()?;
+    if array.len() != N {
+        return None;
+    }
+    let mut numbers = [0.0; N];
+    for (number, value) in numbers.iter_mut().zip(array) {
+        *number = value.as_f64().ok()?;
+        if !number.is_finite() {
+            return None;
+        }
+    }
+    Some(numbers)
+}
+
+fn rect_extent(rect: Rect, ctm: &Matrix) -> Rect {
     let corners = [
-        user_point(0.0, 0.0, ctm),
-        user_point(1.0, 0.0, ctm),
-        user_point(0.0, 1.0, ctm),
-        user_point(1.0, 1.0, ctm),
+        user_point(rect.x0, rect.y0, ctm),
+        user_point(rect.x1, rect.y0, ctm),
+        user_point(rect.x0, rect.y1, ctm),
+        user_point(rect.x1, rect.y1, ctm),
     ];
     let mut r = Rect::new(corners[0].0, corners[0].1, corners[0].0, corners[0].1);
     for (x, y) in corners.iter().skip(1) {
@@ -1030,7 +1086,10 @@ mod tests {
     use super::*;
 
     fn filter(content: &[u8], rects: &[Rect]) -> Vec<u8> {
-        filter_content(content, rects, &|_| None).content
+        filter_content(content, rects, &|_| None, &|_, ctm| {
+            Some(unit_square_extent(ctm))
+        })
+        .content
     }
 
     #[test]
@@ -1086,7 +1145,9 @@ mod tests {
                         /Span <</ActualText (public) /MCID 4>> BDC \
                         BT /F1 12 Tf 1 0 0 1 50 100 Tm (public) Tj ET EMC\n";
         let rects = [Rect::new(40.0, 690.0, 200.0, 720.0)];
-        let outcome = filter_content(content, &rects, &|_| None);
+        let outcome = filter_content(content, &rects, &|_| None, &|_, ctm| {
+            Some(unit_square_extent(ctm))
+        });
         let text = String::from_utf8_lossy(&outcome.content);
         assert!(!text.contains("TOP SECRET"), "ActualText scrubbed: {text}");
         assert!(
@@ -1125,7 +1186,9 @@ mod tests {
             })
         };
         let rects = [Rect::new(40.0, 690.0, 200.0, 720.0)];
-        let outcome = filter_content(content, &rects, &lookup);
+        let outcome = filter_content(content, &rects, &lookup, &|_, ctm| {
+            Some(unit_square_extent(ctm))
+        });
         let text = String::from_utf8_lossy(&outcome.content);
         assert!(!text.contains("/MC0"), "named list replaced: {text}");
         assert!(!text.contains("TOP SECRET"), "{text}");
@@ -1158,7 +1221,9 @@ mod tests {
             Some(d)
         };
         let rects = [Rect::new(40.0, 690.0, 200.0, 720.0)];
-        let outcome = filter_content(content, &rects, &lookup);
+        let outcome = filter_content(content, &rects, &lookup, &|_, ctm| {
+            Some(unit_square_extent(ctm))
+        });
         let text = String::from_utf8_lossy(&outcome.content);
         assert!(text.contains("/Span /MC0 BDC"), "kept use: {text}");
         // MC1 is never closed: its scrubbed copy is inlined all the same.
@@ -1175,7 +1240,9 @@ mod tests {
                         q 100 0 0 100 50 500 cm /Im2 Do Q\n\
                         q 100 0 0 100 400 500 cm /Im2 Do Q\n";
         let rects = [Rect::new(40.0, 490.0, 160.0, 610.0)];
-        let outcome = filter_content(content, &rects, &|_| None);
+        let outcome = filter_content(content, &rects, &|_| None, &|_, ctm| {
+            Some(unit_square_extent(ctm))
+        });
         assert_eq!(outcome.dropped_xobjects, HashSet::from(["Im1".to_string()]));
     }
 
