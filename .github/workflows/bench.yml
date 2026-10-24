@@ -29,10 +29,12 @@ jobs:
             test -x "$binary"
             sha256sum "$binary"
             for threads in 1 4; do
-              for trial in 1 2 3 4 5; do
+              trials=5
+              if [ "$threads" = 4 ]; then trials=25; fi
+              for trial in $(seq 1 "$trials"); do
                 log="${suite}-${threads}-${trial}.log"
                 set +e
-                timeout 120 gdb -q -batch -ex 'set pagination off' -ex run -ex 'thread apply all bt 15' --args "$binary" --nocapture --test-threads="$threads" > "$log" 2>&1
+                timeout 120 gdb -q -batch -ex 'set pagination off' -ex run -ex bt -ex 'thread apply all bt 15' --args "$binary" --nocapture --test-threads="$threads" > "$log" 2>&1
                 status=$?
                 set -e
                 if grep -q 'received signal' "$log"; then
