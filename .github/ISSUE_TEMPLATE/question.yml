@@ -48,3 +48,11 @@ body:
     attributes:
       label: Environment and additional context
       description: Include OS, target, feature flags, and any other details needed to answer.
+
+  - type: textarea
+    id: human_note
+    attributes:
+      label: Human note
+      description: If AI assisted this issue, a responsible human must write this note in their own mother tongue, explain the intent and verification, and disclose the assistance. See AI_POLICY.md. This includes issues created by an agent account.
+    validations:
+      required: false

@@ -85,3 +85,11 @@ body:
     attributes:
       label: Additional context
       description: Add mockups, sample files, links, benchmarks, or related work.
+
+  - type: textarea
+    id: human_note
+    attributes:
+      label: Human note
+      description: If AI assisted this issue, a responsible human must write this note in their own mother tongue, explain the intent and verification, and disclose the assistance. See AI_POLICY.md. This includes issues created by an agent account.
+    validations:
+      required: false
