@@ -72,8 +72,9 @@ AI 说明放在正文末尾即可，不影响标题。
 
 ## 智能体辅助提交
 
-- 智能体可以协助或直接创建 issue 与 PR。创建者仍需是负责的人类贡献者：你必须审阅并理解
-  全部内容，并在提交/PR 正文末尾亲自写 `## Human note`。
+- 智能体可以协助或直接创建 issue 与 PR，也可以使用智能体账号作为创建账号。
+  无论创建账号是谁，都必须有负责的人类贡献者：你必须审阅并理解全部内容，并在
+  issue、提交或 PR 正文末尾亲自写 `## Human note`；只有 issue 的提交也适用。
 - AI 可以辅助写代码、跑测试、查资料和起草 issue/PR 文本；批准、合并与评审回复仍应由人完成。
   没有 Human note 或明显未经人类审阅的提交可能被关闭。
 
@@ -190,10 +191,11 @@ Requirements:
 
 ## Agent-assisted submissions
 
-- Agents may help create or directly open issues and pull requests. The
-  submitting contributor remains responsible: you must review and understand
-  every part and add a human-written `## Human note` at the bottom of the
-  commit/PR body.
+- Agents may help create or directly open issues and pull requests, including
+  under an agent account. A human contributor remains responsible regardless
+  of the creating account: you must review and understand every part and add
+  a human-written `## Human note` at the bottom of the issue, commit, or PR
+  body. This also applies to issue-only submissions.
 - AI may help write code, run tests, research, and draft issue/PR text;
   approval, merging, and review replies remain human responsibilities.
   Submissions without a human note, or that are clearly unreviewed, may be

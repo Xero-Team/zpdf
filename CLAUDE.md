@@ -75,5 +75,7 @@ Supporting crates feed into zpdf-content: **zpdf-font** (Type1/TrueType/CID, CMa
 When making commits or PRs on this repo, follow [AI_POLICY.md](AI_POLICY.md):
 you may use AI, but the contributor must understand the change and add a short
 `## Human note` in their own words (their mother tongue) at the bottom of each
-commit/PR. As an AI agent, do not author the human note yourself — remind the
-user to write it, and never commit or open a PR autonomously.
+issue/commit/PR. An agent may create issues and PRs as described in the policy;
+a human contributor remains responsible for them. Do not author a human note
+or claim human review yourself. Approval, merging and review replies remain
+the human contributor's responsibility.
