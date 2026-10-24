@@ -1229,7 +1229,7 @@ fn bits_per_component(dict: &PdfDict) -> Result<u8> {
 }
 
 /// Check the post-filter sample length against the `required` bytes,
-/// returning whether the data is short and must be padded. Truncated streams
+/// returning whether the data is short (missing samples read as 0). Truncated streams
 /// are common (a writer that stopped early, a damaged Flate tail) and viewers
 /// render what is there with the missing samples read as 0; less than one
 /// full row is treated as no usable image data.
@@ -1342,14 +1342,11 @@ fn decode_raw_samples(
     let required_data = row_bytes
         .checked_mul(height as usize)
         .ok_or_else(|| Error::StreamDecode("raw samples: data size overflow".into()))?;
-    // Truncated streams are padded with zero samples rather than dropped.
-    let padded;
-    let data = if check_sample_data_len(data.len(), row_bytes, required_data)? {
-        padded = [data, &vec![0; required_data - data.len()]].concat();
-        &padded[..]
-    } else {
-        data
-    };
+    // Truncated streams are not copied or padded: the generic unpacker reads
+    // missing samples as 0. Only take the contiguous 8-bpc fast path when every
+    // row is present; otherwise it would leave the tail transparent instead of
+    // filling it with opaque black.
+    let short = check_sample_data_len(data.len(), row_bytes, required_data)?;
 
     let rgba_size = pixel_count
         .checked_mul(4)
@@ -1369,7 +1366,7 @@ fn decode_raw_samples(
     // re-reserves the output buffer *per pixel*; none of that is needed when the
     // samples already are bytes. Values come from the same LUTs and
     // `PixelColor`, so the two paths agree byte for byte.
-    if bpc == 8 && color_key.is_none() && row_bytes == width as usize * ncomp {
+    if bpc == 8 && color_key.is_none() && row_bytes == width as usize * ncomp && !short {
         // 8-bpc rows carry no padding, so pixels are contiguous. The loop is
         // monomorphized per component count, with Gray/RGB converted inline.
         let mut rgba = vec![0u8; rgba_size];
