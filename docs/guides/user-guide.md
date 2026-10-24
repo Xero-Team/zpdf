@@ -63,10 +63,19 @@ The release binary is at `target/release/zpdf`. The examples below use
 | `stamp` | Overlay text or images on a page. |
 
 > **Encrypted PDFs.** Documents protected with a non-empty password open with
-> `--password <pw>` (accepted by `info`, `dump`, `render`, `text`, `convert`, `tables`,
-> `forms`, `outline`, and `attachments`).
+> `--password <pw>` — or `--password=<pw>` for a password that starts with `-`.
+> Every command accepts it except `compare` and `debug-stream` — including the
+> writer commands `fill`, `merge`, `split`, `optimize`, `annotate`, `redact`,
+> `sign`, `pages`, `set-meta`, `stamp` and `tag`.
 > The password may be the user or owner password; a wrong one reports an error.
 > Documents encrypted with an empty password open without the flag.
+>
+> Incremental writer commands (`fill`, `annotate`, `sign`, `pages`, `set-meta`,
+> `stamp`, `merge`) keep the input's encryption: new objects are encrypted with
+> the document's key. `merge` tries the one `--password` on every input, so it
+> can combine a protected file with unencrypted ones; the output is encrypted
+> only when the first (base) file is. The `/P` permission flags are not
+> enforced — any password that opens the file allows editing.
 
 ### `info` — inspect a document
 
