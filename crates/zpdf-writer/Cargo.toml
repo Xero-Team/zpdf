@@ -25,7 +25,8 @@ tracing.workspace = true
 ttf-parser.workspace = true
 # Pure-Rust signing (RustCrypto) for CMS/PKCS#7 signature creation:
 # RSA PKCS#1 v1.5 and ECDSA P-256, SHA-256 digests.
-sha2.workspace = true
+# Keep signing on rsa 0.9's digest/AssociatedOid generation.
+sha2 = { version = "0.10", features = ["oid"] }
 rsa.workspace = true
 p256 = { workspace = true, features = ["pkcs8"] }
 # Encryption on save (Standard security handler, RC4 + AES-CBC).
