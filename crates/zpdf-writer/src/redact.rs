@@ -84,27 +84,8 @@ impl IncrementalWriter {
         let mut page_dict = page_obj.as_dict()?.clone();
 
         // Collect the decoded content bytes of every /Contents stream.
-        let content_ids: Vec<ObjectId> = match page_dict.get("Contents") {
-            Some(PdfObject::Ref(r)) => vec![*r],
-            Some(PdfObject::Array(arr)) => arr
-                .iter()
-                .filter_map(|o| match o {
-                    PdfObject::Ref(r) => Some(*r),
-                    _ => None,
-                })
-                .collect(),
-            _ => Vec::new(),
-        };
-        let mut content = Vec::new();
-        for id in &content_ids {
-            let bytes = self
-                .document()
-                .file()
-                .resolve_stream_data(*id)
-                .unwrap_or_default();
-            content.extend_from_slice(&bytes);
-            content.push(b'\n');
-        }
+        let content_ids = self.current_content_refs(&page_dict)?;
+        let content = self.current_content_bytes(&content_ids)?;
 
         // The page's effective resources: named marked-content property lists
         // are looked up in them, and undrawn XObjects are dropped from them.

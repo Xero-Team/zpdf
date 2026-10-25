@@ -70,6 +70,7 @@ impl IncrementalWriter {
         let page_id = self.page_id(page_index)?;
         let page_obj = self.resolve_current(page_id)?;
         let page_dict = page_obj.as_dict()?.clone();
+        let orig_contents = self.current_content_refs(&page_dict)?;
 
         // Resolve inherited page data and choose the resource name before
         // adding streams. All document/input errors therefore leave the
@@ -236,20 +237,11 @@ impl IncrementalWriter {
 
         // Rewrite page: /Contents → [q, ...originals, tail], /Resources merged.
         let mut new_page_dict = page_dict.clone();
-        let orig_contents = match page_dict.get("Contents") {
-            Some(PdfObject::Array(a)) => a.clone(),
-            Some(PdfObject::Ref(r)) => vec![PdfObject::Ref(*r)],
-            Some(PdfObject::Stream(_)) => {
-                // Shouldn't happen (page dict streams are indirect), but handle it.
-                vec![]
-            }
-            _ => vec![],
-        };
         let mut new_contents = vec![PdfObject::Ref(ObjectId(
             q_stream_ref.0,
             q_stream_ref.1 as u16,
         ))];
-        new_contents.extend(orig_contents);
+        new_contents.extend(orig_contents.into_iter().map(PdfObject::Ref));
         new_contents.push(PdfObject::Ref(ObjectId(tail_ref.0, tail_ref.1 as u16)));
         new_page_dict.insert(PdfName::new("Contents"), PdfObject::Array(new_contents));
 
