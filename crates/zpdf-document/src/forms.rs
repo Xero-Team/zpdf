@@ -1188,21 +1188,7 @@ fn int_value(file: &PdfFile, obj: Option<&PdfObject>) -> Option<i64> {
     }
 }
 
-/// Decode a PDF text string: UTF-16BE when it carries the `FE FF` BOM, else the
-/// bytes as PDFDocEncoding (approximated by Latin-1 for the common range).
-pub(crate) fn pdf_string_to_unicode(bytes: &[u8]) -> String {
-    if bytes.len() >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF {
-        let units: Vec<u16> = bytes[2..]
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|c| u16::from_be_bytes([c[0], c[1]]))
-            .collect();
-        String::from_utf16_lossy(&units)
-    } else {
-        bytes.iter().map(|&b| b as char).collect()
-    }
-}
+pub(crate) use zpdf_core::decode_text_string as pdf_string_to_unicode;
 
 #[cfg(test)]
 mod tests {

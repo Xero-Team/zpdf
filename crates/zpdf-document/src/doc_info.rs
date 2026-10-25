@@ -173,6 +173,20 @@ mod tests {
     }
 
     #[test]
+    fn metadata_uses_pdfdocencoding_and_pdf2_utf8() {
+        let doc = PdfDocument::open(build_with_info(
+            &[
+                "<< /Type /Catalog /Pages 2 0 R >>", PAGES, PAGE,
+                "<< /Title <808a93a0> /Author <efbbbfe4b8adf09f9880> /Subject <FEFF00A000AD0080> >>",
+            ], 4,
+        )).unwrap();
+        let info = doc.info().unwrap();
+        assert_eq!(info.title.as_deref(), Some("•−ﬁ€"));
+        assert_eq!(info.author.as_deref(), Some("中😀"));
+        assert_eq!(info.subject.as_deref(), Some("\u{a0}\u{ad}\u{80}"));
+    }
+
+    #[test]
     fn direct_info_dict_in_trailer_is_read() {
         // Some lax producers inline /Info as a direct dictionary in the trailer
         // rather than as an indirect reference; we should still read it (parity

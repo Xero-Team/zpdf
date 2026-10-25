@@ -61,7 +61,7 @@ const MAX_TEXT_CHARS: usize = 64 * 1024;
 /// Raw bytes of a text string decoded before the `char` cap applies: enough
 /// for [`MAX_TEXT_CHARS`] characters even as UTF-16 surrogate pairs (four bytes
 /// each), plus the BOM. The rest of a longer string could only be cut away.
-const MAX_TEXT_RAW_BYTES: usize = 2 + 4 * MAX_TEXT_CHARS;
+const MAX_TEXT_RAW_BYTES: usize = 3 + 4 * MAX_TEXT_CHARS;
 /// Budget (UTF-8 bytes) for the text strings of all elements in one tree. The
 /// per-string cap alone still lets every element carry 64K characters (many
 /// elements can share one huge indirect `/Alt`); once this is spent, further
@@ -1079,6 +1079,11 @@ mod tests {
             utf16.extend_from_slice(&[0xD8, 0x3D, 0xDE, 0x00]); // U+1F600
         }
         let s = capped_decode(&utf16);
+        assert_eq!(s.chars().count(), MAX_TEXT_CHARS);
+        assert!(s.chars().all(|c| c == '\u{1F600}'));
+
+        let utf8 = format!("\u{feff}{}", "\u{1F600}".repeat(MAX_TEXT_CHARS + 500));
+        let s = capped_decode(utf8.as_bytes());
         assert_eq!(s.chars().count(), MAX_TEXT_CHARS);
         assert!(s.chars().all(|c| c == '\u{1F600}'));
 
