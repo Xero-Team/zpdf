@@ -190,6 +190,14 @@ warning and render blank.
 
 ## Writing PDFs
 
+Incremental writer page operations use stable editing indices. Original pages
+keep their original indices after deletion or reordering; appended pages receive
+new indices. Use `writer.page_indices()` for the current order,
+`writer.page_count()` for the surviving count, and `writer.page_index_at(position)`
+to translate a current page position. Repeated deletion of a stable index is a
+no-op. The read-only `writer.document()` remains the original snapshot. WASM's
+`PdfEditor` translates its page arguments from current positions automatically.
+
 The `zpdf-writer` crate (re-exported through the facade) covers three writing
 models:
 

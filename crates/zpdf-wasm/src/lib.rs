@@ -346,7 +346,7 @@ impl PdfEditor {
 
     #[wasm_bindgen(getter)]
     pub fn page_count(&self) -> usize {
-        self.writer.document().page_count()
+        self.writer.page_count()
     }
 
     /// Serialize all queued edits as one incremental update → `Uint8Array`.
@@ -358,17 +358,28 @@ impl PdfEditor {
 
     /// Rotate a page by a multiple of 90° (cumulative on existing /Rotate).
     pub fn rotate_page(&mut self, page: usize, degrees: i32) -> Result<(), JsError> {
+        let page = self.writer.page_index_at(page).map_err(js_err)?;
         self.writer.rotate_page(page, degrees).map_err(js_err)
     }
 
     /// Delete the given (0-based) pages. Deleting every page is an error.
     pub fn delete_pages(&mut self, pages: Vec<usize>) -> Result<(), JsError> {
+        let pages = pages
+            .into_iter()
+            .map(|p| self.writer.page_index_at(p))
+            .collect::<zpdf::Result<Vec<_>>>()
+            .map_err(js_err)?;
         self.writer.delete_pages(&pages).map_err(js_err)
     }
 
-    /// Reorder pages: `order[i]` is the original index of the page that becomes
+    /// Reorder pages: `order[i]` is the current position of the page that becomes
     /// new page `i` (a full permutation of `0..page_count`).
     pub fn reorder_pages(&mut self, order: Vec<usize>) -> Result<(), JsError> {
+        let order = order
+            .into_iter()
+            .map(|p| self.writer.page_index_at(p))
+            .collect::<zpdf::Result<Vec<_>>>()
+            .map_err(js_err)?;
         self.writer.reorder_pages(&order).map_err(js_err)
     }
 
@@ -443,6 +454,7 @@ impl PdfEditor {
             size,
             color: (r, g, b),
         };
+        let page = self.writer.page_index_at(page).map_err(js_err)?;
         self.writer.stamp_page(page, &[item]).map_err(js_err)
     }
 
@@ -480,6 +492,7 @@ impl PdfEditor {
             width: w,
             height: h,
         };
+        let page = self.writer.page_index_at(page).map_err(js_err)?;
         self.writer.stamp_page(page, &[item]).map_err(js_err)
     }
 
@@ -591,6 +604,7 @@ impl PdfEditor {
     ) -> Result<(), JsError> {
         let rect = zpdf::Rect::new(x0, y0, x1, y1);
         let spec = zpdf_writer::AnnotationSpec::markup_from_rects(kind, &[rect], (r, g, b), None);
+        let page = self.writer.page_index_at(page).map_err(js_err)?;
         self.writer.add_annotation(page, &spec).map_err(js_err)?;
         Ok(())
     }
@@ -613,6 +627,7 @@ impl PdfEditor {
             color: color3(r, g, b),
             icon,
         };
+        let page = self.writer.page_index_at(page).map_err(js_err)?;
         self.writer.add_annotation(page, &spec).map_err(js_err)?;
         Ok(())
     }
@@ -636,6 +651,7 @@ impl PdfEditor {
             size,
             color: color3(r, g, b),
         };
+        let page = self.writer.page_index_at(page).map_err(js_err)?;
         self.writer.add_annotation(page, &spec).map_err(js_err)?;
         Ok(())
     }
@@ -661,6 +677,7 @@ impl PdfEditor {
             interior: color3(ir, ig, ib),
             width,
         };
+        let page = self.writer.page_index_at(page).map_err(js_err)?;
         self.writer.add_annotation(page, &spec).map_err(js_err)?;
         Ok(())
     }
@@ -686,6 +703,7 @@ impl PdfEditor {
             interior: color3(ir, ig, ib),
             width,
         };
+        let page = self.writer.page_index_at(page).map_err(js_err)?;
         self.writer.add_annotation(page, &spec).map_err(js_err)?;
         Ok(())
     }
@@ -710,6 +728,7 @@ impl PdfEditor {
             color: (r, g, b),
             width,
         };
+        let page = self.writer.page_index_at(page).map_err(js_err)?;
         self.writer.add_annotation(page, &spec).map_err(js_err)?;
         Ok(())
     }
@@ -735,6 +754,7 @@ impl PdfEditor {
             }
             None => None,
         };
+        let page = self.writer.page_index_at(page).map_err(js_err)?;
         self.writer
             .redact_page(page, &rects, &zpdf_writer::RedactOptions { fill })
             .map_err(js_err)
@@ -903,6 +923,22 @@ mod tests {
         let out = ed.save().expect("save");
         let doc = reopen(out);
         assert_eq!(doc.page_count(), 1);
+    }
+
+    #[test]
+    fn editor_page_positions_follow_pending_delete_merge_and_reorder() {
+        let mut ed = PdfEditor::open(&tiny_pdf()).unwrap();
+        ed.merge(&tiny_pdf()).unwrap();
+        assert_eq!(ed.page_count(), 2);
+        ed.delete_pages(vec![0]).unwrap();
+        assert_eq!(ed.page_count(), 1);
+        ed.rotate_page(0, 90).unwrap();
+        ed.merge(&tiny_pdf()).unwrap();
+        ed.reorder_pages(vec![1, 0]).unwrap();
+        let doc = reopen(ed.save().unwrap());
+        assert_eq!(ed.page_count(), doc.page_count());
+        assert_eq!(doc.page(0).unwrap().rotate, 0);
+        assert_eq!(doc.page(1).unwrap().rotate, 90);
     }
 
     #[test]
