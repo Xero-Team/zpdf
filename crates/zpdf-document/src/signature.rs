@@ -97,9 +97,8 @@ pub struct Signature {
     /// CMS `SignerInfo` and the signer certificate (`RSA`, `ECDSA (P-256)`, …),
     /// when it could be identified.
     pub signature_algorithm: Option<String>,
-    /// The Common Name (`CN`) of the first certificate in the CMS blob —
-    /// typically, but not guaranteed to be, the signer's leaf certificate.
-    /// Best-effort; `None` when no certificate / CN could be extracted.
+    /// The Common Name (`CN`) of the certificate matched by `SignerInfo.sid`.
+    /// `None` when the signer cannot be identified uniquely or has no CN.
     pub signer_common_name: Option<String>,
     /// The raw CMS `SignedData` blob (`/Contents`), for follow-up checks such
     /// as certificate-chain verification ([`crate::trust`]). `None` when the
@@ -196,7 +195,7 @@ impl DigestStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CryptoStatus {
     /// The signer's signature over the signed attributes verifies against the
-    /// public key of the embedded (first) certificate.
+    /// public key of the certificate uniquely selected by SignerInfo.sid.
     Valid,
     /// A signature and key were present and of a supported algorithm, but the
     /// signature does **not** verify — a forged, corrupt, or wrong-key blob.
@@ -726,8 +725,12 @@ impl DigestAlg {
 //
 // A hand-written TLV walker: enough of RFC 5652 (CMS SignedData) and X.509 to
 // pull the digest algorithm, the messageDigest signed attribute, and the first
-// certificate's subject CN. It never recurses without a depth bound, never
+// matching certificate's subject CN. It never recurses without a depth bound, never
 // indexes past the buffer, and returns `None` on any structural surprise.
+
+pub(crate) fn signer_certificate(blob: &[u8]) -> Option<&[u8]> {
+    cms::signer_certificate(blob)
+}
 
 mod cms {
     use super::DigestAlg;
@@ -751,7 +754,7 @@ mod cms {
         /// for `id-RSASSA-PSS`; `None` otherwise or when the params cannot be
         /// parsed (in which case PSS verification falls back to `Unsupported`).
         pub(super) pss_params: Option<PssParams>,
-        /// The public key of the first embedded certificate.
+        /// The public key of the certificate selected by SignerInfo.sid.
         pub(super) signer_key: Option<PublicKeyInfo>,
     }
 
@@ -964,8 +967,9 @@ mod cms {
             .find(|(t, _, _)| *t == OCTET_STRING)
             .map(|(_, body, _)| body.to_vec());
 
-        let signer_cn = certs.and_then(first_cert_cn);
-        let signer_key = certs.and_then(first_cert_public_key);
+        let signer = certs.and_then(|certs| select_certificate(certs, si.get(1)?.2));
+        let signer_cn = signer.and_then(certificate_cn);
+        let signer_key = signer.and_then(certificate_public_key);
 
         Some(Cms {
             digest_alg,
@@ -977,6 +981,138 @@ mod cms {
             pss_params,
             signer_key,
         })
+    }
+
+    /// Select the first SignerInfo's certificate by its RFC 5652 5.3 sid.
+    /// CertificateSet order is irrelevant; unmatched/ambiguous IDs fail closed.
+    pub(super) fn signer_certificate(blob: &[u8]) -> Option<&[u8]> {
+        let (SEQUENCE, ci, _) = tlv(blob)? else {
+            return None;
+        };
+        let ci = children(ci, 4);
+        if ci.iter().find(|(tag, _)| *tag == OID)?.1 != OID_SIGNED_DATA {
+            return None;
+        }
+        let content = ci.iter().find(|(tag, _)| *tag == CONTEXT_0)?.1;
+        let (SEQUENCE, sd, _) = tlv(content)? else {
+            return None;
+        };
+        let sd = children(sd, 16);
+        let certs = sd.iter().find(|(tag, _)| *tag == CONTEXT_0)?.1;
+        let infos = sd.iter().rev().find(|(tag, _)| *tag == SET)?.1;
+        let (SEQUENCE, info, _) = tlv(infos)? else {
+            return None;
+        };
+        let info = children_raw(info, 16);
+        select_certificate(certs, info.get(1)?.2)
+    }
+
+    fn serial(value: &[u8]) -> Option<&[u8]> {
+        if value.first()? & 0x80 != 0 {
+            return None;
+        }
+        let first = value
+            .iter()
+            .position(|b| *b != 0)
+            .unwrap_or(value.len() - 1);
+        Some(&value[first..])
+    }
+
+    fn select_certificate<'a>(certs: &'a [u8], sid: &[u8]) -> Option<&'a [u8]> {
+        let (sid_tag, sid_body, tail) = tlv(sid)?;
+        if !tail.is_empty() {
+            return None;
+        }
+        let issuer_serial = if sid_tag == SEQUENCE {
+            let parts = children_raw(sid_body, 3);
+            if parts.len() != 2 || parts[0].0 != SEQUENCE || parts[1].0 != 2 {
+                return None;
+            }
+            Some((parts[0].2, serial(parts[1].1)?))
+        } else if sid_tag == 0x80 && !sid_body.is_empty() {
+            None // subjectKeyIdentifier [0] IMPLICIT OCTET STRING
+        } else {
+            return None;
+        };
+        let mut selected: Option<&[u8]> = None;
+        let mut rest = certs;
+        for _ in 0..32 {
+            if rest.is_empty() {
+                return selected;
+            }
+            let before = rest;
+            let (tag, cert, next) = tlv(rest)?;
+            rest = next;
+            if tag != SEQUENCE {
+                continue;
+            } // other CertificateChoices
+            let der = &before[..before.len() - next.len()];
+            let (SEQUENCE, tbs, _) = tlv(cert)? else {
+                return None;
+            };
+            let fields = children_raw(tbs, 16);
+            let offset = usize::from(fields.first()?.0 == CONTEXT_0);
+            let number = fields.get(offset)?;
+            let issuer = fields.get(offset + 2)?;
+            if number.0 != 2 || issuer.0 != SEQUENCE {
+                return None;
+            }
+            let matches = if let Some((name, number_sid)) = issuer_serial {
+                name == issuer.2 && serial(number.1)? == number_sid
+            } else {
+                certificate_ski(&fields).is_some_and(|ski| ski == sid_body)
+            };
+            if matches {
+                if selected.is_some_and(|previous| previous != der) {
+                    return None;
+                }
+                selected = Some(der);
+            }
+        }
+        if rest.is_empty() {
+            selected
+        } else {
+            None
+        }
+    }
+
+    fn certificate_ski<'a>(fields: &[(u8, &'a [u8], &'a [u8])]) -> Option<&'a [u8]> {
+        let extensions = fields.iter().find(|(tag, _, _)| *tag == 0xa3)?.1;
+        let (SEQUENCE, mut rest, tail) = tlv(extensions)? else {
+            return None;
+        };
+        if !tail.is_empty() {
+            return None;
+        }
+        let mut ski = None;
+        for _ in 0..64 {
+            if rest.is_empty() {
+                return ski;
+            }
+            let (SEQUENCE, body, next) = tlv(rest)? else {
+                return None;
+            };
+            rest = next;
+            let parts = children(body, 4);
+            if parts.first()?.0 == OID && parts[0].1 == [0x55, 0x1d, 0x0e] {
+                if ski.is_some() {
+                    return None;
+                }
+                let value = parts.iter().find(|(tag, _)| *tag == OCTET_STRING)?.1;
+                let (OCTET_STRING, value, tail) = tlv(value)? else {
+                    return None;
+                };
+                if !tail.is_empty() || value.is_empty() {
+                    return None;
+                }
+                ski = Some(value);
+            }
+        }
+        if rest.is_empty() {
+            ski
+        } else {
+            None
+        }
     }
 
     /// Classify a `SignerInfo` `signatureAlgorithm` OID into an [`SigAlg`].
@@ -1126,9 +1262,8 @@ mod cms {
         None
     }
 
-    /// Extract the subject Common Name of the first X.509 certificate in the
-    /// `certificates [0]` body. Best-effort.
-    fn first_cert_cn(certs: &[u8]) -> Option<String> {
+    /// Extract the subject Common Name of the selected X.509 certificate.
+    fn certificate_cn(certs: &[u8]) -> Option<String> {
         // The first Certificate ::= SEQUENCE { tbsCertificate, sigAlg, sig }.
         let (tag, cert, _) = tlv(certs)?;
         if tag != SEQUENCE {
@@ -1168,10 +1303,10 @@ mod cms {
         None
     }
 
-    /// Extract the [`PublicKeyInfo`] from the first X.509 certificate's
+    /// Extract the [`PublicKeyInfo`] from the selected X.509 certificate's
     /// `SubjectPublicKeyInfo`. Best-effort; `None` on any structural surprise or
     /// an unsupported key algorithm / curve.
-    fn first_cert_public_key(certs: &[u8]) -> Option<PublicKeyInfo> {
+    fn certificate_public_key(certs: &[u8]) -> Option<PublicKeyInfo> {
         // Certificate ::= SEQUENCE { tbsCertificate, sigAlg, sig }.
         let (tag, cert, _) = tlv(certs)?;
         if tag != SEQUENCE {
@@ -1400,8 +1535,8 @@ mod revocation {
     }
 
     /// Offline revocation: parse CRLs from `crls [1]`, collect their revoked
-    /// serials, and compare to the signer cert's serial (the first cert in
-    /// `certificates [0]`). `Unknown` when there are no CRLs or the serials
+    /// serials, and compare to the sid-selected signer cert's serial.
+    /// `Unknown` when there are no CRLs or the serials
     /// cannot be extracted.
     pub fn revocation_status(cms: &[u8]) -> RevocationStatus {
         let Some(sd) = signed_data(cms) else {
@@ -1415,10 +1550,7 @@ mod revocation {
         if crls.is_empty() {
             return RevocationStatus::Unknown;
         }
-        // Signer cert serial = first cert's serial.
-        let signer_serial = field(sd, 0xA0)
-            .and_then(|certs| children(certs).into_iter().next())
-            .and_then(cert_serial);
+        let signer_serial = super::signer_certificate(cms).and_then(cert_serial);
         let Some(signer_serial) = signer_serial else {
             return RevocationStatus::Unknown;
         };

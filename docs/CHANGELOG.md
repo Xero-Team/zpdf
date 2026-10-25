@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Select CMS signer certificates by issuer/serial or subject key identifier,
+  independent of certificate order. Use that certificate for crypto, identity,
+  chain and offline CRL checks; reject missing or ambiguous matches. (#103)
+
 - Fail opening encrypted PDFs when authentication is missing, incorrect or
   unverifiable. Add PasswordRequired/UnsupportedEncryption errors, retain valid
   empty-password opening, and reject unknown security/crypt filters. (#102)
