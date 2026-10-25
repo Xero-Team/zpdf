@@ -30,6 +30,13 @@ are feature-gated.
 
 ## The rendering pipeline
 
+For complete page semantics, prefer `interpret_page(&doc, index,
+PageInterpretOptions::default())`. It returns the display list and owned
+font/image caches with annotations, default layer visibility, output intents,
+rotation and document limits already applied. Use `interpret_page_with_cache`
+to reuse an `IccCache` across pages. Low-level `ContentInterpreter` construction
+remains available for standalone streams or intentionally customized semantics.
+
 ```
 PDF bytes ─▶ PdfDocument ─▶ PdfPage ─▶ ContentInterpreter ─▶ DisplayList ─▶ RenderBackend ─▶ pixels
             (parse/xref)   (page tree)  (operator interp.)   (flat commands)  (cpu | gpu)
