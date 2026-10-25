@@ -210,6 +210,13 @@ pages, including inherited field attributes and default appearance resources.
 Widgets belonging only to excluded pages are removed. Document-wide XFA
 packets and calculation-order arrays are not copied into an extracted subset.
 
+For Unicode form filling and stamps, register suitable TTF/OTF faces with a
+`FontProvider` and call `writer.set_font_provider(Arc::new(provider))`.
+The output embeds subset fonts and ToUnicode mappings. A memory-only provider
+is deterministic; without an explicit provider, native authoring attempts
+installed substitutes. Missing coverage returns an error before changing PDF
+objects. This scalar text path does not add shaping or bidi layout.
+
 The `zpdf-writer` crate (re-exported through the facade) covers three writing
 models:
 

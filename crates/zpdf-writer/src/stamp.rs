@@ -65,7 +65,7 @@ impl IncrementalWriter {
         if items.is_empty() {
             return Ok(());
         }
-        let required_objects = required_stamp_objects(items)?;
+        let mut required_objects = required_stamp_objects(items)?;
         self.ensure_object_capacity(required_objects)?;
         let page_id = self.page_id(page_index)?;
         let page_obj = self.resolve_current(page_id)?;
@@ -99,6 +99,42 @@ impl IncrementalWriter {
             PdfObject::Dict(d) => d,
             _ => PdfDict::new(),
         };
+        let bbox_value = self.deref_current(&bbox);
+        let coords = bbox_value.as_array()?;
+        if coords.len() != 4 {
+            return Err(invalid_data("invalid page MediaBox").into());
+        }
+        let text_bbox = zpdf_core::Rect::new(
+            coords[0].as_f64()?,
+            coords[1].as_f64()?,
+            coords[2].as_f64()?,
+            coords[3].as_f64()?,
+        );
+        let mut unicode_forms = Vec::with_capacity(items.len());
+        for item in items {
+            let prepared = match item {
+                StampItem::Text {
+                    text,
+                    font,
+                    x,
+                    y,
+                    size,
+                    color,
+                } if crate::unicode_text::requires_unicode(text)
+                    || self.document().font_provider().is_some() =>
+                {
+                    Some(self.prepare_unicode_text(text, font, *x, *y, *size, *color, text_bbox)?)
+                }
+                _ => None,
+            };
+            if let Some(prepared) = &prepared {
+                required_objects = required_objects
+                    .checked_add(prepared.object_budget())
+                    .ok_or_else(|| invalid_data("too many stamp font objects"))?;
+            }
+            unicode_forms.push(prepared);
+        }
+        self.ensure_object_capacity(required_objects)?;
         let image_objects = required_objects - 3;
         let image_objects = u32::try_from(image_objects)
             .map_err(|_| invalid_data("too many stamp image objects"))?;
@@ -124,7 +160,15 @@ impl IncrementalWriter {
         let mut image_counter = 0usize;
         let mut content_ops = Vec::new();
 
-        for item in items {
+        for (item, prepared) in items.iter().zip(&unicode_forms) {
+            if let Some(prepared) = prepared {
+                let name = format!("ZU{image_counter}");
+                image_counter += 1;
+                let id = self.import_text_form(prepared)?;
+                images.insert(PdfName::new(&name), PdfObject::Ref(id));
+                push_str(&mut content_ops, &format!("q /{name} Do Q\n"));
+                continue;
+            }
             match item {
                 StampItem::Text {
                     text,
@@ -220,7 +264,6 @@ impl IncrementalWriter {
         stamp_dict.insert(PdfName::new("Resources"), PdfObject::Dict(resources));
 
         let stamp_ref = self.try_add_flate_stream(&stamp_dict, &content_ops)?;
-        debug_assert_eq!(stamp_ref.0, stamp_number);
 
         // Merge /Resources before writing the tail stream so the content uses
         // the exact collision-free name inserted into /XObject.

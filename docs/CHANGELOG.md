@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Embed registered or discovered Unicode fonts for text stamps and form
+  appearances, including multiline and comb fields. Missing coverage is an
+  error before PDF mutation. Add writer/editor font registration and CLI
+  fill/stamp --font-file. (#94)
+
 - Reject invalid redaction page numbers, coordinates, missing output paths and
   unknown arguments before creating an output file. (#93)
 

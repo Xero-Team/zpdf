@@ -13,6 +13,7 @@ categories.workspace = true
 
 [dependencies]
 zpdf-font.workspace = true
+zpdf-color.workspace = true
 zpdf-core.workspace = true
 zpdf-parser.workspace = true
 zpdf-document.workspace = true

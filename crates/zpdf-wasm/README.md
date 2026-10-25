@@ -2,6 +2,12 @@
 
 WebAssembly bindings for zpdf, exposing the read pipeline (parse, render, text extraction, SVG export) to JavaScript in the browser or Node.
 
+Before filling Unicode fields or adding Unicode text stamps, call
+`editor.register_font(fontBytes, faceIndex)` on the `PdfEditor`. Register
+additional faces for fallback coverage. The saved PDF embeds the selected
+subset fonts; unavailable characters cause an error rather than substitution
+with question marks.
+
 Pure Rust with zero C dependencies — no pdfium, no MuPDF, no `poppler` — makes this build feasible on `wasm32-unknown-unknown` where native-library ports would struggle. The CPU backend's tiny-skia rasterizer and the SVG exporter's direct DisplayList translation run entirely in your browser; no uploads, no server round-trips.
 
 ## Build

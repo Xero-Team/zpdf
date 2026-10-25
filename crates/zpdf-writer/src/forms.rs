@@ -19,6 +19,7 @@ pub struct FormFiller<'w> {
     /// standard-14, or no `/DA` at all) — triggers `/NeedAppearances true`.
     need_appearances: bool,
     dr_fonts: Option<PdfDict>,
+    changed_widgets: std::collections::HashSet<ObjectId>,
 }
 
 impl<'w> FormFiller<'w> {
@@ -35,6 +36,7 @@ impl<'w> FormFiller<'w> {
             writer,
             need_appearances: false,
             dr_fonts,
+            changed_widgets: Default::default(),
         })
     }
 
@@ -65,12 +67,13 @@ impl<'w> FormFiller<'w> {
             FieldKind::Button => self.set_button(&field, value)?,
             _ => {}
         }
+        self.changed_widgets.extend(field.widgets.iter().copied());
         Ok(())
     }
 
     /// Flush the `/NeedAppearances` flag if any widget could not be regenerated.
     pub fn finish(self) -> Result<()> {
-        if !self.need_appearances {
+        if self.changed_widgets.is_empty() {
             return Ok(());
         }
         let catalog_ref = self.writer.catalog_ref;
@@ -81,14 +84,51 @@ impl<'w> FormFiller<'w> {
             .ok_or_else(|| invalid_data("catalog has no /AcroForm"))?
             .clone();
 
+        // Stored appearances generated in this session are authoritative.
+        // Previously stale, untouched text appearances remain eligible for
+        // regeneration by dropping their old /AP before clearing the flag.
+        if !self.need_appearances
+            && self
+                .writer
+                .deref_current(&af_ref)
+                .as_dict()
+                .ok()
+                .is_some_and(|form| {
+                    matches!(form.get("NeedAppearances"), Some(PdfObject::Bool(true)))
+                })
+        {
+            let untouched: Vec<_> = self
+                .writer
+                .document()
+                .acro_form()
+                .unwrap()
+                .fields
+                .iter()
+                .filter(|field| matches!(field.kind, FieldKind::Text | FieldKind::Choice))
+                .flat_map(|field| field.widgets.iter().copied())
+                .filter(|id| !self.changed_widgets.contains(id))
+                .collect();
+            for id in untouched {
+                if let Ok(PdfObject::Dict(mut dict)) = self.writer.resolve_current(id) {
+                    dict.0.remove(&PdfName::new("AP"));
+                    self.writer.overwrite_object(id, PdfObject::Dict(dict));
+                }
+            }
+        }
         match af_ref {
             PdfObject::Ref(r) => {
                 let mut af_dict = self.writer.resolve_current(r)?.as_dict()?.clone();
-                af_dict.insert(PdfName::new("NeedAppearances"), PdfObject::Bool(true));
+                af_dict.insert(
+                    PdfName::new("NeedAppearances"),
+                    PdfObject::Bool(self.need_appearances),
+                );
                 self.writer.overwrite_object(r, PdfObject::Dict(af_dict));
             }
             PdfObject::Dict(mut d) => {
-                d.insert(PdfName::new("NeedAppearances"), PdfObject::Bool(true));
+                d.insert(
+                    PdfName::new("NeedAppearances"),
+                    PdfObject::Bool(self.need_appearances),
+                );
                 let mut new_catalog = catalog_dict.clone();
                 new_catalog.insert(PdfName::new("AcroForm"), PdfObject::Dict(d));
                 self.writer
@@ -117,6 +157,30 @@ impl<'w> FormFiller<'w> {
         }
         let mut filled = field.clone();
         filled.value = Some(FieldValue::Text(value.to_string()));
+        let da = zpdf_document::forms::parse_da(
+            field
+                .default_appearance
+                .as_deref()
+                .unwrap_or("/Helv 0 Tf 0 g"),
+        );
+        let font_dict = da
+            .font
+            .as_deref()
+            .and_then(|name| self.dr_fonts.as_ref()?.get(name))
+            .map(|object| self.writer.deref_current(object))
+            .and_then(|object| object.as_dict().ok().cloned());
+        let preferred_font = font_dict
+            .as_ref()
+            .and_then(|dict| dict.get_name("BaseFont").ok())
+            .map(str::to_owned);
+        let unicode = filled
+            .display_value()
+            .is_some_and(|text| crate::unicode_text::requires_unicode(&text))
+            || self.writer.document().font_provider().is_some()
+            || font_dict.as_ref().is_some_and(|dict| {
+                dict.get_name("Subtype").ok() == Some("Type0")
+                    || matches!(dict.get("Encoding"), Some(PdfObject::Dict(_)))
+            });
         let mut prepared_widgets = Vec::with_capacity(field.widgets.len());
         let mut appearance_count = 0usize;
         for &widget_id in &field.widgets {
@@ -129,19 +193,36 @@ impl<'w> FormFiller<'w> {
                 self.writer.resolve_current(widget_id)?.as_dict()?.clone()
             };
             let rect = rect_from_array(widget_dict.get("Rect"))?;
-            if widget_will_have_appearance(field, value, rect) {
+            let prepared = if unicode {
+                self.writer
+                    .prepare_unicode_field(&filled, rect, preferred_font.as_deref())?
+            } else {
+                None
+            };
+            if let Some(prepared) = &prepared {
+                appearance_count = appearance_count
+                    .checked_add(prepared.object_budget())
+                    .ok_or_else(|| invalid_data("too many appearance objects"))?;
+            } else if widget_will_have_appearance(field, value, rect) {
                 appearance_count = appearance_count
                     .checked_add(1)
                     .ok_or_else(|| invalid_data("too many widget appearances"))?;
             }
-            prepared_widgets.push((widget_id, widget_dict, rect));
+            prepared_widgets.push((widget_id, widget_dict, rect, prepared));
         }
 
         self.writer.ensure_object_capacity(appearance_count)?;
         let mut widget_updates = Vec::with_capacity(prepared_widgets.len());
         let mut need_appearances = false;
-        for (widget_id, mut widget_dict, rect) in prepared_widgets {
-            if let Some(ap) = generate_widget_appearance(&filled, rect, self.dr_fonts.as_ref()) {
+        for (widget_id, mut widget_dict, rect, prepared) in prepared_widgets {
+            if let Some(prepared) = prepared {
+                let id = self.writer.import_text_form(&prepared)?;
+                let mut ap = PdfDict::new();
+                ap.insert(PdfName::new("N"), PdfObject::Ref(id));
+                widget_dict.insert(PdfName::new("AP"), PdfObject::Dict(ap));
+            } else if let Some(ap) =
+                generate_widget_appearance(&filled, rect, self.dr_fonts.as_ref())
+            {
                 let mut ap_dict = PdfDict::new();
                 ap_dict.insert(
                     PdfName::new("Type"),
@@ -170,7 +251,7 @@ impl<'w> FormFiller<'w> {
                 );
                 widget_dict.insert(PdfName::new("AP"), PdfObject::Dict(ap_outer));
             } else {
-                need_appearances = true;
+                need_appearances |= widget_will_have_appearance(field, value, rect);
                 widget_dict.0.remove(&PdfName::new("AP"));
             }
             widget_updates.push((widget_id, widget_dict));
