@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Apply text transforms, scaled font sizes and basic font styles in PPTX
+  export; preserve text/image rotation and reflection with a new
+  SlideElement::Transformed variant (exhaustive matches need updating).
+  Emit valid run property nesting. (#91)
+
 - Preserve selected AcroForm field branches, Widget parent links, values and
   default font resources when splitting or extracting pages. (#90)
 

@@ -22,7 +22,7 @@ impl PptxWriter {
         let mut next = 0usize;
         for slide in &mut presentation.slides {
             for element in &mut slide.elements {
-                if let SlideElement::Image { image_id, .. } = element {
+                if let SlideElement::Image { image_id, .. } = element.base_mut() {
                     next += 1;
                     *image_id = format!("image{next}");
                 }
@@ -89,7 +89,7 @@ impl PptxWriter {
                     image_data,
                     image_id,
                     ..
-                } = elem
+                } = elem.base()
                 {
                     zip.start_file(format!("ppt/media/{}.png", image_id), options)
                         .map_err(|e| zpdf_core::Error::Io(std::io::Error::other(e)))?;
@@ -216,6 +216,27 @@ impl PptxWriter {
 
     fn generate_shape_xml(&self, elem: &SlideElement, id: usize) -> String {
         match elem {
+            SlideElement::Transformed {
+                element,
+                rotation_degrees,
+                flip_h,
+                flip_v,
+            } => {
+                let rotation = if rotation_degrees.is_finite() {
+                    (rotation_degrees.rem_euclid(360.0) * 60_000.0).round() as i64
+                } else {
+                    0
+                };
+                self.generate_shape_xml(element, id).replacen(
+                    "<a:xfrm>",
+                    &format!(
+                        "<a:xfrm rot=\"{rotation}\" flipH=\"{}\" flipV=\"{}\">",
+                        u8::from(*flip_h),
+                        u8::from(*flip_v)
+                    ),
+                    1,
+                )
+            }
             SlideElement::TextBox {
                 text,
                 x_emu,
@@ -252,17 +273,18 @@ impl PptxWriter {
           <a:noFill/>
         </p:spPr>
         <p:txBody>
-          <a:bodyPr wrap="square" rtlCol="0">
+          <a:bodyPr wrap="none" rtlCol="0" lIns="0" rIns="0" tIns="0" bIns="0">
             <a:spAutoFit/>
           </a:bodyPr>
           <a:lstStyle/>
           <a:p>
             <a:r>
-              <a:rPr lang="en-US" sz="{}"{}{}/>
+              <a:rPr lang="en-US" sz="{}"{}{}>
               <a:solidFill>
                 <a:srgbClr val="{}"/>
               </a:solidFill>
               <a:latin typeface="{}"/>
+              </a:rPr>
               <a:t>{}</a:t>
             </a:r>
           </a:p>
@@ -510,7 +532,7 @@ impl PptxWriter {
         );
 
         for elem in &slide.elements {
-            if let SlideElement::Image { image_id, .. } = elem {
+            if let SlideElement::Image { image_id, .. } = elem.base() {
                 xml.push_str(&format!(
                     r#"  <Relationship Id="rId_{}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/{}.png"/>
 "#,

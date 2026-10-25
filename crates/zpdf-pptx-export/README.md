@@ -2,6 +2,13 @@
 
 PowerPoint (PPTX) export functionality for zpdf - converts PDF pages to editable PowerPoint presentations.
 
+Text and image placement applies the display-list transform, including
+translation, scaling, rotation and reflection. Rotated/reflected objects use
+the new `SlideElement::Transformed` wrapper; exhaustive enum matches must
+handle it, while existing TextBox/Image construction is unchanged. Arbitrary
+shear and PDF clipping/blending still have no complete editable DrawingML
+equivalent in this exporter.
+
 ## Overview
 
 This crate provides PDF-to-PowerPoint conversion that preserves content editability rather than simply converting pages to images. It extracts structured content from PDF pages (text, shapes, images) and maps them to OOXML PowerPoint format.
