@@ -125,6 +125,8 @@ pub enum ResolvedColorSpace {
     Gray,
     Rgb,
     Cmyk,
+    CalGray(zpdf_color::CalGrayParams),
+    CalRGB(zpdf_color::CalRGBParams),
     /// CIE L*a*b* with the parameters from its PDF colour-space dictionary.
     Lab {
         white_point: [f64; 3],
@@ -164,6 +166,8 @@ const MAX_COMPONENTS: usize = 32;
 impl PartialEq for ResolvedColorSpace {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
+            (Self::CalGray(a), Self::CalGray(b)) => a == b,
+            (Self::CalRGB(a), Self::CalRGB(b)) => a == b,
             (Self::Gray, Self::Gray) | (Self::Rgb, Self::Rgb) | (Self::Cmyk, Self::Cmyk) => true,
             (
                 Self::Lab {
@@ -227,8 +231,8 @@ impl ResolvedColorSpace {
     /// palette indices regardless of the base space).
     fn components(&self) -> usize {
         match self {
-            Self::Gray | Self::Indexed { .. } => 1,
-            Self::Rgb | Self::Lab { .. } => 3,
+            Self::Gray | Self::CalGray(_) | Self::Indexed { .. } => 1,
+            Self::Rgb | Self::CalRGB(_) | Self::Lab { .. } => 3,
             Self::Cmyk => 4,
             // The compiled transform is authoritative. Trusting the public
             // `ncomp` hint here could make malformed caller input index past
@@ -294,8 +298,14 @@ impl ResolvedColorSpace {
 /// caller-side resolution helper so the name table lives in one place.
 pub fn colorspace_from_name(name: &str) -> Option<ResolvedColorSpace> {
     match name {
-        "DeviceGray" | "CalGray" | "G" => Some(ResolvedColorSpace::Gray),
-        "DeviceRGB" | "CalRGB" | "RGB" => Some(ResolvedColorSpace::Rgb),
+        "DeviceGray" | "G" => Some(ResolvedColorSpace::Gray),
+        "DeviceRGB" | "RGB" => Some(ResolvedColorSpace::Rgb),
+        "CalGray" => Some(ResolvedColorSpace::CalGray(
+            zpdf_color::CalGrayParams::from_pdf_dict(&PdfDict::new(), &mut |_| None),
+        )),
+        "CalRGB" => Some(ResolvedColorSpace::CalRGB(
+            zpdf_color::CalRGBParams::from_pdf_dict(&PdfDict::new(), &mut |_| None),
+        )),
         "DeviceCMYK" | "CMYK" => Some(ResolvedColorSpace::Cmyk),
         _ => None,
     }
@@ -753,10 +763,27 @@ fn infer_colorspace_array(arr: &[PdfObject]) -> ResolvedColorSpace {
         Some(PdfObject::Name(n)) => n.as_str(),
         _ => return ResolvedColorSpace::Gray,
     };
-    if let Some(cs) = colorspace_from_name(head) {
-        return cs;
+    if !matches!(head, "CalGray" | "CalRGB") {
+        if let Some(cs) = colorspace_from_name(head) {
+            return cs;
+        }
     }
     match head {
+        "CalGray" | "CalRGB" => {
+            let empty = PdfDict::new();
+            let params = arr.get(1).and_then(|o| o.as_dict().ok()).unwrap_or(&empty);
+            if head == "CalGray" {
+                ResolvedColorSpace::CalGray(zpdf_color::CalGrayParams::from_pdf_dict(
+                    params,
+                    &mut |_| None,
+                ))
+            } else {
+                ResolvedColorSpace::CalRGB(zpdf_color::CalRGBParams::from_pdf_dict(
+                    params,
+                    &mut |_| None,
+                ))
+            }
+        }
         "ICCBased" => {
             // /N lives in the profile stream's dict; only an inline stream is
             // visible here. Most ICC image profiles are RGB, so default there.
@@ -1947,7 +1974,9 @@ impl<'a> PixelColor<'a> {
                 Self::Table((0..=255u8).map(|t| components_to_rgb(cs, &[t])).collect())
             }
             _ if pixels < PIXEL_CACHE_SLOTS => Self::Direct(cs),
-            ResolvedColorSpace::Lab { .. } => Self::CachedNarrow {
+            ResolvedColorSpace::Lab { .. }
+            | ResolvedColorSpace::CalGray(_)
+            | ResolvedColorSpace::CalRGB(_) => Self::CachedNarrow {
                 cs,
                 slots: vec![(0, [0; 3]); PIXEL_CACHE_SLOTS],
                 miss: Miss::Exact(CacheStats::default()),
@@ -2030,6 +2059,14 @@ impl<'a> PixelColor<'a> {
 fn components_to_rgb(cs: &ResolvedColorSpace, comps: &[u8]) -> [u8; 3] {
     let get = |i: usize| comps.get(i).copied().unwrap_or(0);
     match cs {
+        ResolvedColorSpace::CalGray(_) | ResolvedColorSpace::CalRGB(_) => float_components_to_rgb(
+            cs,
+            &[
+                get(0) as f64 / 255.0,
+                get(1) as f64 / 255.0,
+                get(2) as f64 / 255.0,
+            ],
+        ),
         ResolvedColorSpace::Gray => [get(0); 3],
         ResolvedColorSpace::Rgb => [get(0), get(1), get(2)],
         ResolvedColorSpace::Cmyk => cmyk_to_rgb(&[get(0), get(1), get(2), get(3)]),
@@ -2103,6 +2140,14 @@ fn tint_to_rgb(
 fn float_components_to_rgb(cs: &ResolvedColorSpace, vals: &[f64]) -> [u8; 3] {
     let get = |i: usize| vals.get(i).copied().unwrap_or(0.0);
     match cs {
+        ResolvedColorSpace::CalGray(params) => {
+            let (r, g, b) = params.to_rgb(get(0));
+            [unit_to_u8(r), unit_to_u8(g), unit_to_u8(b)]
+        }
+        ResolvedColorSpace::CalRGB(params) => {
+            let (r, g, b) = params.to_rgb([get(0), get(1), get(2)]);
+            [unit_to_u8(r), unit_to_u8(g), unit_to_u8(b)]
+        }
         ResolvedColorSpace::Gray => [unit_to_u8(get(0)); 3],
         ResolvedColorSpace::Rgb => [unit_to_u8(get(0)), unit_to_u8(get(1)), unit_to_u8(get(2))],
         ResolvedColorSpace::Cmyk => {
@@ -2243,6 +2288,35 @@ fn resample_bilinear(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_calgray_dictionary_is_not_inferred_as_device_gray() {
+        let mut params = PdfDict::new();
+        params.insert(zpdf_core::PdfName::new("Gamma"), PdfObject::Integer(2));
+        let mut dict = PdfDict::new();
+        for key in ["Width", "Height"] {
+            dict.insert(zpdf_core::PdfName::new(key), PdfObject::Integer(1));
+        }
+        dict.insert(
+            zpdf_core::PdfName::new("BitsPerComponent"),
+            PdfObject::Integer(8),
+        );
+        dict.insert(
+            zpdf_core::PdfName::new("ColorSpace"),
+            PdfObject::Array(vec![
+                PdfObject::Name(zpdf_core::PdfName::new("CalGray")),
+                PdfObject::Dict(params),
+            ]),
+        );
+        let image = decode_image_xobject(&[128], &dict).unwrap();
+        assert!(
+            image.data[..3]
+                .iter()
+                .all(|v| (i32::from(*v) - 138).abs() <= 1),
+            "{:?}",
+            image.data
+        );
+    }
     use zpdf_core::PdfName;
 
     fn image_dict(width: i64, height: i64, bpc: i64, cs_name: Option<&str>) -> PdfDict {
