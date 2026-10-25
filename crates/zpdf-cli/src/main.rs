@@ -2684,8 +2684,15 @@ fn cmd_redact(args: &[String]) -> zpdf::Result<()> {
     let mut fill: Option<(f64, f64, f64)> = Some((0.0, 0.0, 0.0));
 
     let parse_nums = |s: &str, n: usize, what: &str| -> Vec<f64> {
-        let vals: Vec<f64> = s.split(',').filter_map(|p| p.trim().parse().ok()).collect();
-        if vals.len() != n {
+        let vals: Vec<f64> = s
+            .split(',')
+            .map(|p| p.trim().parse::<f64>())
+            .collect::<Result<_, _>>()
+            .unwrap_or_else(|_| {
+                eprintln!("{what} requires {n} finite comma-separated numbers");
+                process::exit(2);
+            });
+        if vals.len() != n || vals.iter().any(|value| !value.is_finite()) {
             eprintln!("{what} requires {n} comma-separated numbers");
             process::exit(1);
         }
@@ -2696,11 +2703,26 @@ fn cmd_redact(args: &[String]) -> zpdf::Result<()> {
     while i < args.len() {
         match args[i].as_str() {
             "-o" => {
-                output = args.get(i + 1).cloned();
+                output = Some(
+                    args.get(i + 1)
+                        .filter(|value| !value.starts_with('-'))
+                        .unwrap_or_else(|| {
+                            eprintln!("-o requires an output path");
+                            process::exit(2);
+                        })
+                        .clone(),
+                );
                 i += 2;
             }
             "-p" => {
-                page_num = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(1);
+                page_num = args
+                    .get(i + 1)
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .filter(|&page| page > 0)
+                    .unwrap_or_else(|| {
+                        eprintln!("-p requires a positive page number");
+                        process::exit(2);
+                    });
                 i += 2;
             }
             "--rect" => {
@@ -2728,10 +2750,16 @@ fn cmd_redact(args: &[String]) -> zpdf::Result<()> {
             other if !other.starts_with('-') => {
                 if input.is_none() {
                     input = Some(other.to_string());
+                } else {
+                    eprintln!("unexpected argument: {other}");
+                    process::exit(2);
                 }
                 i += 1;
             }
-            _ => i += 1,
+            other => {
+                eprintln!("unknown redact option: {other}");
+                process::exit(2);
+            }
         }
     }
 
@@ -2763,7 +2791,7 @@ fn cmd_redact(args: &[String]) -> zpdf::Result<()> {
     let out_bytes = zpdf_writer::redact_pdf(
         bytes,
         password.as_deref().unwrap_or("").as_bytes(),
-        page_num.saturating_sub(1),
+        page_num - 1,
         &rects,
         &zpdf_writer::RedactOptions { fill },
     )?;

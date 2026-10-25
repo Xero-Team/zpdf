@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Reject invalid redaction page numbers, coordinates, missing output paths and
+  unknown arguments before creating an output file. (#93)
+
 - Add a shared high-level page interpretation API and use it for CLI raster,
   SVG/PPTX export and WASM rendering, keeping annotations, default layers and
   output intents consistent across these entry points. (#92)
