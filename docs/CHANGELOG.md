@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Resolve copied local named destinations to explicit page references when
+  merging or extracting pages, preserving links and bookmarks despite name
+  collisions. Keep inherited attributes on pages reached through links. (#95)
+
 - Embed registered or discovered Unicode fonts for text stamps and form
   appearances, including multiline and comb fields. Missing coverage is an
   error before PDF mutation. Add writer/editor font registration and CLI

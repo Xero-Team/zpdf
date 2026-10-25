@@ -10,8 +10,9 @@
 //! during the copy precisely so the copier does not chase the whole source
 //! tree), so anything inherited would otherwise be lost.
 //!
-//! Limitations: tagged-PDF structure trees and name trees of the appended
-//! files are not merged. Outlines, AcroForm fields (with collision renaming)
+//! Local named destinations in links and outlines become explicit destinations.
+//! Tagged-PDF structure trees and other name trees of the appended files are
+//! not merged. Outlines, AcroForm fields (with collision renaming)
 //! and OCG configurations are — see [`IncrementalWriter::append_document`].
 
 use std::collections::HashSet;
@@ -124,6 +125,7 @@ impl IncrementalWriter {
             }
         }
 
+        id_map.prepare_named_dests(source, &src_pages);
         let root = self.root_pages_id_pub()?;
         // One id-map per source document: pages sharing fonts/images copy the
         // shared objects once.
@@ -596,10 +598,12 @@ fn copy_patched_page(
     // Wrap the patched dict in a temporary object and remap it through the
     // copier by copying each referenced value. Reserve the page's own number
     // first so self-references resolve.
-    if let Some(dest) = id_map.get(src_page) {
-        return Ok(dest);
-    }
-    let dest = crate::copier::reserve(writer, src_page, id_map)?;
+    // A link from an earlier page may already have copied this page. Still
+    // write the materialized leaf, including its inherited resources/boxes.
+    let dest = match id_map.get(src_page) {
+        Some(dest) => dest,
+        None => crate::copier::reserve(writer, src_page, id_map)?,
+    };
     let remapped = crate::copier::remap_via_copy(
         &PdfObject::Dict(leaf.clone()),
         source,
