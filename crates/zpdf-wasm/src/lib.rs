@@ -354,7 +354,7 @@ impl PdfEditor {
 
     // — page operations ————————————————————————————————————————————————
 
-    /// Rotate a page by a multiple of 90° (cumulative on existing /Rotate).
+    /// Set a page's absolute rotation to a multiple of 90 degrees.
     pub fn rotate_page(&mut self, page: usize, degrees: i32) -> Result<(), JsError> {
         let page = self.writer.page_index_at(page).map_err(js_err)?;
         self.writer.rotate_page(page, degrees).map_err(js_err)

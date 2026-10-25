@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Rebuild the shipped WASM/JS package with current editing and font APIs; add
+  source/artifact fingerprints and real packaged-runtime smoke tests in CI. (#105)
+
 - Expose bounded processing diagnostics for partial page decoding, interpretation
   and conversion. Report resource/time limits, missing resources, unsupported
   operations and malformed tokens. CLI/WASM exports reject known partial output;
