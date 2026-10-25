@@ -47,14 +47,14 @@ fn stream_obj(dict: &str, content: &[u8]) -> Vec<u8> {
     v
 }
 
-fn page_with_font(content: &[u8], font: Vec<Vec<u8>>) -> Vec<u8> {
+fn page_with_font(content: &[u8], font: Vec<Vec<u8>>, after: &[u8]) -> Vec<u8> {
     let mut objs = vec![
         b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
         b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
         b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R \
-          /Resources << /Font << /F1 5 0 R >> >> >>"
+          /Resources << /Font << /F1 5 0 R >> /ExtGState << /GS << /ca 0.25 /CA 0.5 >> >> >> >>"
             .to_vec(),
-        stream_obj("", &[content, PAINT_AFTER].concat()),
+        stream_obj("", &[content, after].concat()),
     ];
     objs.extend(font);
     assemble(&objs)
@@ -73,10 +73,15 @@ fn type3_pdf(content: &[u8]) -> Vec<u8> {
             b"<< /Type /Encoding /Differences [65 /sq] >>".to_vec(),
             stream_obj("", b"1000 0 d0\n150 150 700 700 re\nf"),
         ],
+        PAINT_AFTER,
     )
 }
 
 fn truetype_pdf(content: &[u8]) -> Vec<u8> {
+    truetype_pdf_with_tail(content, PAINT_AFTER)
+}
+
+fn truetype_pdf_with_tail(content: &[u8], after: &[u8]) -> Vec<u8> {
     page_with_font(
         content,
         vec![
@@ -88,6 +93,7 @@ fn truetype_pdf(content: &[u8]) -> Vec<u8> {
                 .to_vec(),
             stream_obj(&format!("/Length1 {}", TEST_TTF.len()), TEST_TTF),
         ],
+        after,
     )
 }
 
@@ -120,6 +126,64 @@ fn render_document(doc: PdfDocument) -> impl Fn(u32, u32) -> [u8; 3] {
 const RED: [u8; 3] = [255, 0, 0];
 const GREEN: [u8; 3] = [0, 255, 0];
 const WHITE: [u8; 3] = [255, 255, 255];
+
+#[test]
+fn text_stroke_modes_paint_edges_separately_from_interior() {
+    for mode in [1, 2, 5, 6] {
+        let content = format!("q 0 1 0 rg 1 0 0 RG 4 w BT /F1 60 Tf 15 70 Td {mode} Tr (A) Tj ET");
+        let px = render(truetype_pdf_with_tail(content.as_bytes(), b" Q"));
+        assert_eq!(px(20, 110), RED, "mode {mode}: outside half of stroke");
+        assert_eq!(
+            px(30, 110),
+            if mode == 2 || mode == 6 { GREEN } else { WHITE },
+            "mode {mode}: interior"
+        );
+        assert_eq!(px(18, 110), WHITE, "mode {mode}: outside stroke");
+    }
+}
+
+#[test]
+fn text_strokes_use_stroke_alpha_and_user_space_width() {
+    let px = render(truetype_pdf_with_tail(
+        b"q /GS gs 0 1 0 rg 1 0 0 RG 4 w BT /F1 60 Tf 2 0 0 2 15 70 Tm 2 Tr (A) Tj ET",
+        b" Q",
+    ));
+    assert_eq!(
+        px(23, 100),
+        WHITE,
+        "text matrix must not double the line width"
+    );
+    for (actual, expected) in [
+        (px(25, 100), [255, 127, 127]),
+        (px(45, 100), [191, 255, 191]),
+    ] {
+        assert!(
+            actual
+                .iter()
+                .zip(expected)
+                .all(|(a, b)| (*a as i32 - b).abs() <= 1),
+            "{actual:?} versus {expected:?}"
+        );
+    }
+}
+
+#[test]
+fn stroke_and_clip_modes_clip_to_glyph_interior_at_et() {
+    for mode in [5, 6] {
+        let content = format!("q 1 0 0 RG 4 w BT /F1 60 Tf 15 70 Td {mode} Tr (A) Tj ET");
+        let px = render(truetype_pdf_with_tail(
+            content.as_bytes(),
+            b" 0 0 1 rg 0 0 200 200 re f Q",
+        ));
+        assert_eq!(px(30, 110), [0, 0, 255]);
+        assert_eq!(
+            px(20, 110),
+            RED,
+            "stroke outside the outline survives later clipped fill"
+        );
+        assert_eq!(px(100, 100), WHITE);
+    }
+}
 
 #[test]
 fn blank_glyph_text_clip_hides_later_paint_until_q() {

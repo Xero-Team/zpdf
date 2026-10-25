@@ -4749,6 +4749,11 @@ impl<'a> ContentInterpreter<'a> {
     /// the region is degenerate).
     fn emit_stroke(&mut self, page_path: Path) {
         self.capture_stroke_rules(&page_path);
+        self.stroke_page_path(page_path);
+    }
+
+    /// Paint without treating glyph contours as table-rule candidates.
+    fn stroke_page_path(&mut self, page_path: Path) {
         // A `/None` (or all-`None` DeviceN) stroke colour space produces no marks.
         if cs_produces_no_marks(&self.current.stroke_cs) {
             return;
@@ -5116,21 +5121,11 @@ impl<'a> ContentInterpreter<'a> {
         transform: Matrix,
         h_scale: f32,
     ) {
-        // Text-fill modes (0/2/4/6) take the nonstroking colour + overprint;
-        // text-stroke modes (1/5) take the stroking colour + overprint.
-        let (paint_color, overprint) = match self.current.render_mode {
-            1 | 5 => (
-                self.current.stroke_color,
-                self.overprint_descriptor(
-                    self.current.stroke_overprint,
-                    self.current.stroke_colorant,
-                ),
-            ),
-            _ => (
-                self.current.fill_color,
-                self.overprint_descriptor(self.current.fill_overprint, self.current.fill_colorant),
-            ),
-        };
+        // GlyphRun is a fill operation. Stroke modes use actual outline paths;
+        // Type3 CharProcs retain their ordinary nonstroking paint.
+        let paint_color = self.current.fill_color;
+        let overprint =
+            self.overprint_descriptor(self.current.fill_overprint, self.current.fill_colorant);
         let cmd = RenderCommand::DrawGlyphRun(GlyphRun {
             font_id,
             font_size,
@@ -5474,12 +5469,16 @@ impl<'a> ContentInterpreter<'a> {
         // Only emit a glyph run when a font is actually active; with no font the
         // glyph IDs would be raw, unmappable codes aliased onto font 0.
         // Text render mode 3 (invisible, the OCR-layer case) and 7 (clip only)
-        // paint nothing; stroke modes 1/2/5/6 are approximated as fills.
+        // paint nothing; stroke modes 1/2/5/6 use outline paths below.
         // A `/None` colorant space on the active paint (fill for modes 0/2/4/6,
         // stroke for 1/5) likewise produces no marks — suppress the visual run,
         // while the text-extraction sink below still records the glyphs.
         let no_marks = match self.current.render_mode {
             1 | 5 => cs_produces_no_marks(&self.current.stroke_cs),
+            2 | 6 => {
+                cs_produces_no_marks(&self.current.fill_cs)
+                    && cs_produces_no_marks(&self.current.stroke_cs)
+            }
             _ => cs_produces_no_marks(&self.current.fill_cs),
         };
         let invisible = matches!(self.current.render_mode, 3 | 7) || no_marks;
@@ -5553,6 +5552,16 @@ impl<'a> ContentInterpreter<'a> {
         }
         if let Some(font_id) = self.current_font_id {
             if (!glyphs.is_empty() || resolved_runs.is_some()) && !invisible {
+                if matches!(self.current.render_mode, 1 | 2 | 5 | 6) {
+                    if let Some(runs) = resolved_runs {
+                        for (id, glyphs) in runs {
+                            self.paint_stroked_text(id, glyphs, combined, font_size, h_scale);
+                        }
+                    } else {
+                        self.paint_stroked_text(font_id, glyphs, combined, font_size, h_scale);
+                    }
+                    return;
+                }
                 // A Pattern colour space on the active paint (fill for modes
                 // 0/2/4/6, stroke for 1/5) clips the pattern to the glyph
                 // outlines instead of painting a solid run.
@@ -5587,6 +5596,52 @@ impl<'a> ContentInterpreter<'a> {
                         self.emit_solid_glyph_run(id, font_size, glyphs, combined, h_scale);
                     }
                 }
+            }
+        }
+    }
+
+    /// ISO 32000-1 9.3.6: fill then stroke each glyph, using user-space line
+    /// parameters (not text-matrix-scaled widths), separate paints and alpha.
+    fn paint_stroked_text(
+        &mut self,
+        font_id: FontId,
+        glyphs: Vec<PositionedGlyph>,
+        transform: Matrix,
+        font_size: f32,
+        h_scale: f32,
+    ) {
+        let type3 = self
+            .font_cache
+            .as_ref()
+            .and_then(|c| c.get(font_id))
+            .is_some_and(|font| font.is_type3());
+        if type3 {
+            self.emit_solid_glyph_run(font_id, font_size, glyphs, transform, h_scale);
+            return;
+        }
+        let fill = matches!(self.current.render_mode, 2 | 6);
+        for glyph in glyphs {
+            let outline = self
+                .font_cache
+                .as_ref()
+                .and_then(|c| c.get(font_id))
+                .and_then(|font| {
+                    build_glyph_clip_path(
+                        std::slice::from_ref(&glyph),
+                        &transform,
+                        font,
+                        font_size,
+                        h_scale,
+                        &mut false,
+                    )
+                });
+            if let Some((path, _)) = outline {
+                if fill {
+                    self.fill_page_path(path.clone(), FillRule::NonZero);
+                }
+                self.stroke_page_path(path);
+            } else if fill {
+                self.emit_solid_glyph_run(font_id, font_size, vec![glyph], transform, h_scale);
             }
         }
     }
