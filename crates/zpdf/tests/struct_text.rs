@@ -208,7 +208,7 @@ fn text_sink_does_not_change_render_commands() {
     // be byte-for-byte identical with and without a text sink installed — the
     // structural guarantee that extraction cannot perturb CPU/GPU rendering.
     let content = b"BT /F0 12 Tf 1 0 0 1 100 700 Tm \
-        /Span <</MCID 0>> BDC (Alpha) Tj EMC \
+        /Span <</MCID 0 /ActualText (Replacement)>> BDC (Alpha) Tj EMC \
         /Span <</MCID 1>> BDC 1 0 0 1 100 680 Tm (Beta) Tj EMC ET";
     let pdf = assemble(&[
         dict("<< /Type /Catalog /Pages 2 0 R >>"),
@@ -242,4 +242,58 @@ fn text_sink_does_not_change_render_commands() {
     let with = render(Some(&mut spans));
     assert_eq!(without, with, "text sink must not change render commands");
     assert!(!spans.is_empty(), "spans were still extracted");
+}
+
+fn actual_text_document(content: &[u8], form: &[u8]) -> PdfDocument {
+    PdfDocument::open(assemble(&[
+        dict("<< /Type /Catalog /Pages 2 0 R /OCProperties << /OCGs [9 0 R] /D << /OFF [9 0 R] >> >> >>"),
+        dict("<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+        dict("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R /Resources << /Font << /F0 5 0 R >> /Properties << /P 6 0 R /Hidden 9 0 R >> /XObject << /X 8 0 R >> >> >>"),
+        stream_obj("", content), dict(HELV),
+        dict("<< /ActualText 7 0 R /MCID 42 >>"),
+        dict("<EFBBBFE4B8ADF09F9880>"),
+        stream_obj("/Subtype /Form /BBox [0 0 200 200] /Resources << /Font << /F0 5 0 R >> >>", form),
+        dict("<< /Type /OCG /Name (hidden) >>"),
+    ])).unwrap()
+}
+
+#[test]
+fn actual_text_replaces_multiple_shows_nested_scopes_and_empty_values() {
+    let doc = actual_text_document(
+        b"BT /F0 12 Tf 10 100 Td /Span << /MCID 7 /ActualText (outer) >> BDC \
+          (old1) Tj /Span << /ActualText (inner) >> BDC (old2) Tj EMC (old3) Tj EMC \
+          /Span << /ActualText () >> BDC (discard) Tj EMC /Span /P BDC (codes) Tj EMC ET",
+        b"",
+    );
+    let spans = extract_spans(&doc, 0);
+    assert_eq!(
+        spans.iter().map(|s| s.text.as_str()).collect::<Vec<_>>(),
+        ["outer", "中😀"]
+    );
+    assert_eq!(spans[0].mcid, Some(7));
+    assert_eq!(spans[1].mcid, Some(42));
+    assert!(spans[0].advance > 50.0, "combined source geometry retained");
+    let converted = zpdf::convert_pdf(&doc, &[0], Default::default()).unwrap();
+    assert!(converted.pages[0].text.contains("outer"));
+    assert!(converted.pages[0].text.contains("中😀"));
+    assert!(!converted.pages[0].text.contains("old"));
+}
+
+#[test]
+fn actual_text_scopes_do_not_leak_across_forms_or_hidden_layers() {
+    let doc = actual_text_document(
+        b"/OC /Hidden BDC /Span << /ActualText (hidden replacement) >> BDC BT /F0 12 Tf (hidden codes) Tj ET EMC EMC \
+          BT /F0 12 Tf 10 100 Td /Span << /ActualText (whole form) >> BDC /X Do EMC (after) Tj ET",
+        b"EMC /Span << /ActualText (unclosed form replacement) >> BDC BT /F0 12 Tf (inside) Tj ET",
+    );
+    let converted = zpdf::convert_pdf(&doc, &[0], Default::default()).unwrap();
+    let text = &converted.pages[0].text;
+    assert!(
+        text.contains("whole form") && text.contains("after"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("hidden") && !text.contains("inside") && !text.contains("unclosed"),
+        "{text}"
+    );
 }
