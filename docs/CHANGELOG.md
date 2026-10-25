@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Preserve filled values and choice indices when an AcroForm field shares
+  its dictionary with its Widget annotation. (#87)
+
 ## 0.17.0 — Decoder hardening, writer fixes and export fidelity
 
 Released 2026-10-24.
