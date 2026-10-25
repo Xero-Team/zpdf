@@ -59,7 +59,10 @@ pub fn extract_pages(source: &PdfFile, page_indices: &[usize]) -> Result<Vec<u8>
         return Err(invalid_data("no pages selected").into());
     }
     let mut writer = IncrementalWriter::new(stub_pdf())?;
-    writer.append_pages(source, page_indices)?;
+    let mut id_map = writer.append_pages_mapped(source, page_indices)?;
+    let page_ids = source_page_ids(source)?;
+    let selected: Vec<ObjectId> = page_indices.iter().map(|&index| page_ids[index]).collect();
+    crate::extract_forms::copy_selected_form(&mut writer, source, &selected, &mut id_map)?;
 
     writer.delete_pages(&[0])?;
 

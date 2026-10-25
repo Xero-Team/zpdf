@@ -42,6 +42,7 @@ mod cff;
 mod contents;
 pub mod copier;
 pub mod encrypt;
+mod extract_forms;
 pub mod forms;
 pub mod linearize;
 pub mod merge;

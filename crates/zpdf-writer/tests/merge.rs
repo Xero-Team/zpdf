@@ -359,6 +359,107 @@ fn pdf_from_objects(objects: &[(u32, String)]) -> Vec<u8> {
 }
 
 #[test]
+fn extracted_form_keeps_hierarchy_defaults_and_only_selected_widgets() {
+    use zpdf_core::PdfObject;
+    use zpdf_document::FieldValue;
+    let source = pdf_from_objects(&[
+        (1,"<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [7 0 R 9 0 R] /DA (/Helv 12 Tf 0 g) /DR << /Font << /Helv 10 0 R >> >> >> >>".into()),
+        (2,"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>".into()),
+        (3,"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Annots [5 0 R] >>".into()),
+        (4,"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Annots [6 0 R 9 0 R] >>".into()),
+        (5,"<< /Subtype /Widget /Rect [10 10 100 30] /Parent 8 0 R /P 3 0 R >>".into()),
+        (6,"<< /Subtype /Widget /Rect [10 10 100 30] /Parent 8 0 R /P 4 0 R >>".into()),
+        (7,"<< /T (group) /FT /Tx /Kids [8 0 R] >>".into()),
+        (8,"<< /T (name) /Parent 7 0 R /V (old) /Kids [5 0 R 6 0 R] >>".into()),
+        (9,"<< /Subtype /Widget /FT /Tx /T (excluded) /V (EXCLUDED_VALUE) /Rect [10 40 100 60] /P 4 0 R >>".into()),
+        (10,"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into()),
+    ]);
+    let source = PdfFile::parse(source).unwrap();
+    let bytes = zpdf_writer::extract_pages(&source, &[0]).unwrap();
+    assert!(!String::from_utf8_lossy(&bytes).contains("EXCLUDED_VALUE"));
+    let doc = PdfDocument::open(bytes.clone()).unwrap();
+    assert_eq!(doc.page_count(), 1);
+    let fields = &doc.acro_form().unwrap().fields;
+    assert_eq!(fields.len(), 1);
+    assert_eq!(fields[0].name, "group.name");
+    assert_eq!(fields[0].widgets.len(), 1);
+    let widget = doc.file().resolve(fields[0].widgets[0]).unwrap();
+    assert_eq!(
+        widget.as_dict().unwrap().get_ref("Parent").unwrap(),
+        fields[0].field_id
+    );
+    assert_eq!(
+        widget.as_dict().unwrap().get_ref("P").unwrap(),
+        doc.page(0).unwrap().id
+    );
+    assert!(doc.page_annotations(&doc.page(0).unwrap())[0]
+        .generated
+        .is_some());
+    let mut writer = IncrementalWriter::new(bytes).unwrap();
+    let mut filler = zpdf_writer::FormFiller::new(&mut writer).unwrap();
+    filler.set("group.name", "updated").unwrap();
+    filler.finish().unwrap();
+    let mut out = Cursor::new(Vec::new());
+    writer.write(&mut out).unwrap();
+    let doc = PdfDocument::open(out.into_inner()).unwrap();
+    assert!(
+        matches!(&doc.acro_form().unwrap().fields[0].value,Some(FieldValue::Text(s)) if s=="updated")
+    );
+    assert!(matches!(
+        doc.file()
+            .resolve(doc.acro_form().unwrap().fields[0].field_id)
+            .unwrap(),
+        PdfObject::Dict(_)
+    ));
+}
+
+#[test]
+fn extracted_merged_widget_remains_fillable() {
+    let source = pdf_from_objects(&[
+        (
+            1,
+            "<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [4 0 R] >> >>".into(),
+        ),
+        (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into()),
+        (
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Annots [4 0 R] >>".into(),
+        ),
+        (
+            4,
+            "<< /Subtype /Widget /FT /Tx /T (name) /V (old) /Rect [10 10 100 30] /P 3 0 R >>"
+                .into(),
+        ),
+    ]);
+    let source = PdfFile::parse(source).unwrap();
+    let doc = PdfDocument::open(zpdf_writer::extract_pages(&source, &[0]).unwrap()).unwrap();
+    let field = &doc.acro_form().unwrap().fields[0];
+    assert_eq!(field.field_id, field.widgets[0]);
+    assert_eq!(field.name, "name");
+}
+
+#[test]
+fn extraction_rejects_cyclic_field_trees() {
+    let source = pdf_from_objects(&[
+        (
+            1,
+            "<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [4 0 R] >> >>".into(),
+        ),
+        (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into()),
+        (
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Annots [4 0 R] >>".into(),
+        ),
+        (
+            4,
+            "<< /Subtype /Widget /FT /Tx /T (name) /Kids [4 0 R] /Rect [10 10 100 30] >>".into(),
+        ),
+    ]);
+    let source = PdfFile::parse(source).unwrap();
+    assert!(zpdf_writer::extract_pages(&source, &[0]).is_err());
+}
+
+#[test]
 fn merge_recurses_through_pages_nodes_without_type() {
     // Interior nodes carrying /Kids but no /Type must still be walked; some
     // producers omit /Type on one level of the page tree.
