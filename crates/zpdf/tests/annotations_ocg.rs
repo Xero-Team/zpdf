@@ -67,6 +67,47 @@ fn assert_near(c: [u8; 3], want: [u8; 3], what: &str) {
     assert!(ok, "{what}: got {c:?}, want ≈{want:?}");
 }
 
+#[test]
+fn user_unit_scales_cropped_rotated_content_and_annotations() {
+    for rotate in [0, 90] {
+        let pdf = assemble(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            format!("<< /Type /Page /Parent 2 0 R /MediaBox [10 20 110 100] /CropBox [20 30 100 90] /UserUnit 2 /Rotate {rotate} /Contents 4 0 R /Annots [5 0 R] >>").into_bytes(),
+            stream_obj("", b"1 0 0 rg 30 40 10 10 re f"),
+            b"<< /Subtype /Square /Rect [50 60 60 70] /AP << /N 6 0 R >> >>".to_vec(),
+            stream_obj("/Subtype /Form /BBox [0 0 10 10]", b"0 1 0 rg 0 0 10 10 re f"),
+        ]);
+        let doc = PdfDocument::open(pdf.clone()).unwrap();
+        let page = doc.page(0).unwrap();
+        assert_eq!((page.width(), page.height()), (200.0, 160.0));
+        assert_eq!(
+            page.effective_box().width(),
+            80.0,
+            "editing stays in user space"
+        );
+        let converted = zpdf::convert_pdf(&doc, &[0], Default::default()).unwrap();
+        assert_eq!(
+            (
+                converted.pages[0].width_points,
+                converted.pages[0].height_points
+            ),
+            (160.0, 120.0)
+        );
+        let rendered = render(pdf);
+        let (dimensions, red, green) = if rotate == 0 {
+            ((320, 240), (60, 180), (140, 100))
+        } else {
+            ((240, 320), (60, 60), (140, 140))
+        };
+        assert_eq!((rendered.width, rendered.height), dimensions);
+        for ((x, y), expected) in [(red, [255, 0, 0]), (green, [0, 255, 0])] {
+            let offset = ((y * rendered.width + x) * 4) as usize;
+            assert_eq!(&rendered.data[offset..offset + 3], &expected);
+        }
+    }
+}
+
 /// A Square annotation whose /AP /N draws a red square over BBox [0,10]²,
 /// mapped onto /Rect [50 50 150 150] — the 12.5.5 scale-to-rect algebra.
 #[test]

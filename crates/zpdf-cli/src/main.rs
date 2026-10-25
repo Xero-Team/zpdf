@@ -1182,6 +1182,7 @@ fn cmd_text(args: &[String]) -> zpdf::Result<()> {
         let mut spans: Vec<zpdf::TextSpan> = Vec::new();
         {
             let interpreter = zpdf::ContentInterpreter::new(page.effective_box())
+                .with_page_user_unit(page.user_unit)
                 .with_fonts(&mut font_cache)
                 .with_document(doc.file(), &page.resources)
                 .with_shared_fonts(&doc)
@@ -1263,6 +1264,7 @@ fn cmd_search(args: &[String]) -> zpdf::Result<()> {
         let mut spans: Vec<zpdf::TextSpan> = Vec::new();
         {
             let interpreter = zpdf::ContentInterpreter::new(page.effective_box())
+                .with_page_user_unit(page.user_unit)
                 .with_fonts(&mut font_cache)
                 .with_document(doc.file(), &page.resources)
                 .with_shared_fonts(&doc)
@@ -1349,6 +1351,7 @@ fn cmd_tables(args: &[String]) -> zpdf::Result<()> {
         let mut rules: Vec<zpdf::RuleLine> = Vec::new();
         {
             let interpreter = zpdf::ContentInterpreter::new(page.effective_box())
+                .with_page_user_unit(page.user_unit)
                 .with_fonts(&mut font_cache)
                 .with_document(doc.file(), &page.resources)
                 .with_shared_fonts(&doc)
@@ -1448,7 +1451,7 @@ fn cmd_render(args: &[String]) -> zpdf::Result<()> {
     let page = doc.page(page_index)?;
 
     // CropBox ∩ MediaBox: the rect actually rendered (falls back to MediaBox).
-    let page_box = page.effective_box();
+    let page_box = page.effective_box_points();
 
     println!(
         "Rendering page {} ({:.0}x{:.0} pt) at {} DPI...",
@@ -3298,7 +3301,7 @@ fn cmd_export_pptx(args: &[String]) -> zpdf::Result<()> {
 
     // Determine slide size from first page
     let first_page = doc.page(page_indices[0])?;
-    let page_box = first_page.effective_box();
+    let page_box = first_page.effective_box_points();
     let (width_pt, height_pt) = if first_page.rotate.rem_euclid(180) == 90 {
         (page_box.height(), page_box.width())
     } else {
