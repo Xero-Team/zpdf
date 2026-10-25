@@ -6,7 +6,9 @@
 //! certificate chain to a root I trust?"** — chain building (subject/issuer
 //! matching over the CMS `certificates` set), per-link signature verification
 //! (RSA PKCS#1 v1.5 and ECDSA P-256/P-384, SHA-1/256/384/512), validity-period
-//! checks, and anchoring at a caller-supplied root set (PEM or DER).
+//! checks, issuer BasicConstraints/keyUsage/path-length checks, and anchoring
+//! at a caller-supplied root set (PEM or DER). Unsupported critical extensions
+//! fail closed rather than being silently discarded.
 //!
 //! Deliberately out of scope: revocation (CRL/OCSP fetching needs a network),
 //! name constraints, policy mapping, and RSA-PSS.
@@ -92,10 +94,15 @@ pub fn verify_certificate_chain(
         Some(c) if !c.is_empty() => c,
         _ => return ChainStatus::Unsupported("no certificates in signature".into()),
     };
-    let parsed: Vec<CertInfo> = certs.iter().filter_map(|d| CertInfo::parse(d)).collect();
-    if parsed.is_empty() {
+    // Never silently remove an unparseable signer and promote the next
+    // certificate in the set to its place.
+    let Some(parsed) = certs
+        .iter()
+        .map(|d| CertInfo::parse(d))
+        .collect::<Option<Vec<_>>>()
+    else {
         return ChainStatus::Unsupported("certificates could not be parsed".into());
-    }
+    };
 
     // The leaf is the first certificate (the same convention the signature
     // verifier uses for the signer key).
@@ -108,6 +115,15 @@ pub fn verify_certificate_chain(
             return ChainStatus::Untrusted("chain too long".into());
         }
         let current = *chain.last().expect("nonempty");
+        let ca_below = chain
+            .iter()
+            .skip(1)
+            .take(chain.len().saturating_sub(2))
+            .filter(|cert| cert.subject_raw != cert.issuer_raw)
+            .count();
+        if let Some(error) = check_constraints(current, chain.len() > 1, false, ca_below) {
+            return error;
+        }
 
         // Validity window.
         if let Some(now) = at_seconds_since_epoch {
@@ -124,6 +140,8 @@ pub fn verify_certificate_chain(
                         current.subject_cn.as_deref().unwrap_or("?")
                     ));
                 }
+            } else {
+                return ChainStatus::Unsupported("certificate validity period is malformed".into());
             }
         }
 
@@ -136,6 +154,14 @@ pub fn verify_certificate_chain(
                 return ChainStatus::Trusted(names);
             }
             if anchor.cert.subject_raw == current.issuer_raw {
+                let ca_below = chain
+                    .iter()
+                    .skip(1)
+                    .filter(|cert| cert.subject_raw != cert.issuer_raw)
+                    .count();
+                if let Some(error) = check_constraints(&anchor.cert, true, true, ca_below) {
+                    return error;
+                }
                 match verify_cert_signature(current, &anchor.cert) {
                     Some(true) => {
                         names.push(anchor.cert.subject_cn.clone().unwrap_or_default());
@@ -243,6 +269,166 @@ struct CertInfo {
     sig_hash: Option<HashAlg>,
     sig_is_ecdsa: bool,
     signature: Vec<u8>,
+    version: u8,
+    constraints: std::result::Result<CertificateConstraints, &'static str>,
+}
+
+#[derive(Debug, Default)]
+struct CertificateConstraints {
+    basic: Option<(bool, Option<u32>)>,
+    key_usage: Option<u8>,
+    unsupported_critical: bool,
+}
+
+/// RFC 5280 §§4.2.1.3, 4.2.1.9 and 6.1: only authorized CAs may issue
+/// certificates, and unknown critical extensions cannot be ignored.
+fn check_constraints(
+    cert: &CertInfo,
+    issuer: bool,
+    anchor: bool,
+    ca_below: usize,
+) -> Option<ChainStatus> {
+    let constraints = match &cert.constraints {
+        Ok(c) => c,
+        Err(reason) => return Some(ChainStatus::Untrusted((*reason).into())),
+    };
+    if constraints.unsupported_critical {
+        return Some(ChainStatus::Unsupported(
+            "unhandled critical certificate extension".into(),
+        ));
+    }
+    if issuer {
+        match constraints.basic {
+            Some((true, limit)) => {
+                if limit.is_some_and(|limit| ca_below > limit as usize) {
+                    return Some(ChainStatus::Untrusted(
+                        "certificate path length constraint exceeded".into(),
+                    ));
+                }
+            }
+            // Legacy roots are explicitly trusted input; an untrusted
+            // intermediate without a CA assertion must never inherit this.
+            None if anchor && cert.version < 3 => {}
+            _ => {
+                return Some(ChainStatus::Untrusted(
+                    "issuer is not a certificate authority".into(),
+                ))
+            }
+        }
+        if constraints.key_usage.is_some_and(|bits| bits & 0x04 == 0) {
+            return Some(ChainStatus::Untrusted(
+                "issuer key usage does not permit certificate signing".into(),
+            ));
+        }
+    }
+    None
+}
+
+fn certificate_constraints(
+    fields: &[(u8, &[u8], &[u8])],
+) -> std::result::Result<CertificateConstraints, &'static str> {
+    let mut result = CertificateConstraints::default();
+    let mut containers = fields.iter().filter(|(tag, _, _)| *tag == 0xa3);
+    let Some((_, encoded, _)) = containers.next() else {
+        return Ok(result);
+    };
+    if containers.next().is_some() {
+        return Err("duplicate certificate extensions");
+    }
+    let (tag, mut rest, tail) = tlv(encoded).ok_or("malformed certificate extensions")?;
+    if tag != SEQUENCE || !tail.is_empty() {
+        return Err("malformed certificate extensions");
+    }
+    let mut seen = Vec::new();
+    while !rest.is_empty() {
+        if seen.len() >= 64 {
+            return Err("too many certificate extensions");
+        }
+        let (tag, extension, next) = tlv(rest).ok_or("malformed certificate extension")?;
+        rest = next;
+        if tag != SEQUENCE {
+            return Err("malformed certificate extension");
+        }
+        let (tag, oid, mut value) = tlv(extension).ok_or("missing extension identifier")?;
+        if tag != OID || oid.is_empty() || seen.contains(&oid) {
+            return Err("invalid or duplicate extension identifier");
+        }
+        seen.push(oid);
+        let mut critical = false;
+        if value.first() == Some(&0x01) {
+            let (_, boolean, tail) = tlv(value).ok_or("malformed extension critical flag")?;
+            critical = match boolean {
+                [0] => false,
+                [0xff] => true,
+                _ => return Err("malformed extension critical flag"),
+            };
+            value = tail;
+        }
+        let (tag, data, tail) = tlv(value).ok_or("missing extension value")?;
+        if tag != 0x04 || !tail.is_empty() {
+            return Err("malformed extension value");
+        }
+        match oid {
+            [0x55, 0x1d, 0x13] => result.basic = Some(parse_basic_constraints(data)?),
+            [0x55, 0x1d, 0x0f] => {
+                let (tag, bits, tail) = tlv(data).ok_or("malformed key usage")?;
+                if tag != BIT_STRING
+                    || !tail.is_empty()
+                    || !(2..=3).contains(&bits.len())
+                    || bits[0] > 7
+                    || bits[bits.len() - 1] & ((1u8 << bits[0]) - 1) != 0
+                {
+                    return Err("malformed key usage");
+                }
+                result.key_usage = Some(bits[1]);
+            }
+            _ => result.unsupported_critical |= critical,
+        }
+    }
+    Ok(result)
+}
+
+fn parse_basic_constraints(data: &[u8]) -> std::result::Result<(bool, Option<u32>), &'static str> {
+    let (tag, mut rest, tail) = tlv(data).ok_or("malformed basic constraints")?;
+    if tag != SEQUENCE || !tail.is_empty() {
+        return Err("malformed basic constraints");
+    }
+    let mut ca = false;
+    if rest.first() == Some(&0x01) {
+        let (_, boolean, tail) = tlv(rest).ok_or("malformed CA flag")?;
+        ca = match boolean {
+            [0] => false,
+            [0xff] => true,
+            _ => return Err("malformed CA flag"),
+        };
+        rest = tail;
+    }
+    let limit = if rest.is_empty() {
+        None
+    } else {
+        let (tag, integer, tail) = tlv(rest).ok_or("malformed path length")?;
+        if tag != 0x02
+            || !tail.is_empty()
+            || integer.is_empty()
+            || integer[0] & 0x80 != 0
+            || integer.len() > 5
+            || (integer.len() > 1 && integer[0] == 0 && integer[1] & 0x80 == 0)
+        {
+            return Err("malformed path length");
+        }
+        let mut n = 0u32;
+        for &b in integer {
+            n = n
+                .checked_mul(256)
+                .and_then(|v| v.checked_add(u32::from(b)))
+                .ok_or("path length overflow")?;
+        }
+        if !ca {
+            return Err("path length on a non-CA certificate");
+        }
+        Some(n)
+    };
+    Ok((ca, limit))
 }
 
 impl CertInfo {
@@ -289,6 +475,22 @@ impl CertInfo {
         //   3: subject Name
         //   4: subjectPublicKeyInfo
         let tbs_children = children_raw(tbs, 16);
+        if tbs_children
+            .iter()
+            .map(|(_, _, raw)| raw.len())
+            .sum::<usize>()
+            != tbs.len()
+        {
+            return None;
+        }
+        let version = match tbs_children.first() {
+            Some((CONTEXT_0, body, _)) => match tlv(body)? {
+                (0x02, [value @ 0..=2], []) => value + 1,
+                _ => return None,
+            },
+            _ => 1,
+        };
+        let constraints = certificate_constraints(&tbs_children);
         let seqs: Vec<(u8, &[u8], &[u8])> = tbs_children
             .iter()
             .filter(|(t, _, _)| *t == SEQUENCE)
@@ -347,6 +549,8 @@ impl CertInfo {
             sig_hash,
             sig_is_ecdsa,
             signature,
+            version,
+            constraints,
         })
     }
 }

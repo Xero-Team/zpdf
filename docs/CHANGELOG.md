@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Validate certificate issuer CA status, key usage, path length and critical
+  extensions before reporting a PDF signature chain as trusted. Reject
+  malformed validity periods when time validation is requested.
+
 ## 0.17.0 — Decoder hardening, writer fixes and export fidelity
 
 Released 2026-10-24.
