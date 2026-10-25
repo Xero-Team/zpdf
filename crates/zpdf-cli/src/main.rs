@@ -1443,9 +1443,6 @@ fn cmd_render(args: &[String]) -> zpdf::Result<()> {
     }
 
     let doc = open_document(pdf_path, password.as_deref())?;
-    if doc.is_encrypted() && password.is_none() {
-        eprintln!("  note: document is encrypted; if output looks wrong, pass --password <pw>");
-    }
 
     let page_index = page_num.saturating_sub(1);
     let page = doc.page(page_index)?;
