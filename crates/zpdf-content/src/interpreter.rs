@@ -141,6 +141,7 @@ pub struct ContentInterpreter<'a> {
     annotations: Option<&'a [zpdf_document::Annotation]>,
     /// Marked-content nesting depth (BMC/BDC vs EMC).
     mc_depth: u32,
+    compatibility_depth: u32,
     /// Stack of marked-content `/MCID`s, one entry per open marked-content
     /// sequence (`None` for a sequence with no `/MCID`), parallel to `mc_depth`.
     /// Lets the text sink tag each span with the marked-content id that binds it
@@ -702,6 +703,7 @@ impl<'a> ContentInterpreter<'a> {
             oc_config: None,
             annotations: None,
             mc_depth: 0,
+            compatibility_depth: 0,
             mc_stack: Vec::new(),
             actual_text_bytes: 0,
             max_actual_text_bytes: 16 << 20,
@@ -847,6 +849,7 @@ impl<'a> ContentInterpreter<'a> {
             || self.display_list.commands.len() >= self.max_commands
             || self.ops_executed >= self.max_ops
         {
+            self.stats.diagnostics.resource_limit_reached = true;
             return true;
         }
         if !self.timed_out {
@@ -1105,9 +1108,9 @@ impl<'a> ContentInterpreter<'a> {
         if self.deadline.is_none() {
             self.deadline = Some(zpdf_core::time::Instant::now() + INTERPRET_BUDGET);
         }
-        let tokenizer = ContentTokenizer::new(content);
+        let mut tokenizer = ContentTokenizer::new(content);
 
-        for token in tokenizer {
+        for token in tokenizer.by_ref() {
             if self.over_budget() {
                 tracing::warn!(
                     "content exceeded {} display commands; truncating page",
@@ -1141,6 +1144,7 @@ impl<'a> ContentInterpreter<'a> {
             }
         }
 
+        self.stats.diagnostics.merge(tokenizer.diagnostics());
         while !self.mc_stack.is_empty() {
             self.end_marked_content();
         }
@@ -1173,6 +1177,8 @@ impl<'a> ContentInterpreter<'a> {
         self.paint_annotations();
 
         self.stats.font_repairs = self.font_repair.repairs;
+        self.stats.diagnostics.resource_limit_reached |= self.resource_limit_hit;
+        self.stats.diagnostics.time_limit_reached |= self.timed_out;
         self.stats.font_repair_probes = self.font_repair.probes;
         self.stats.total_ns = started.elapsed().as_nanos() as u64;
         (self.display_list, self.stats)
@@ -1187,7 +1193,11 @@ impl<'a> ContentInterpreter<'a> {
             .pop()
             .and_then(|o| o.as_f64().ok())
             .filter(|n| n.is_finite())
-            .unwrap_or(0.0)
+            .unwrap_or_else(|| {
+                self.stats.diagnostics.malformed_content =
+                    self.stats.diagnostics.malformed_content.saturating_add(1);
+                0.0
+            })
     }
 
     fn pop_name(&mut self) -> String {
@@ -1197,7 +1207,11 @@ impl<'a> ContentInterpreter<'a> {
                 PdfObject::Name(n) => Some(n.0),
                 _ => None,
             })
-            .unwrap_or_default()
+            .unwrap_or_else(|| {
+                self.stats.diagnostics.malformed_content =
+                    self.stats.diagnostics.malformed_content.saturating_add(1);
+                String::new()
+            })
     }
 
     fn pop_string_bytes(&mut self) -> Vec<u8> {
@@ -1207,7 +1221,11 @@ impl<'a> ContentInterpreter<'a> {
                 PdfObject::String(s) => Some(s.0),
                 _ => None,
             })
-            .unwrap_or_default()
+            .unwrap_or_else(|| {
+                self.stats.diagnostics.malformed_content =
+                    self.stats.diagnostics.malformed_content.saturating_add(1);
+                Vec::new()
+            })
     }
 
     fn execute_operator(&mut self, op: &str) {
@@ -1283,6 +1301,8 @@ impl<'a> ContentInterpreter<'a> {
                 if next.is_finite() {
                     self.current.ctm = next;
                 } else {
+                    self.stats.diagnostics.malformed_content =
+                        self.stats.diagnostics.malformed_content.saturating_add(1);
                     tracing::warn!("content transform overflowed; ignoring cm operator");
                 }
             }
@@ -1746,7 +1766,15 @@ impl<'a> ContentInterpreter<'a> {
             }
             "EMC" => self.end_marked_content(),
             "MP" | "DP" => {}
-
+            "BX" => self.compatibility_depth = self.compatibility_depth.saturating_add(1),
+            "EX" => self.compatibility_depth = self.compatibility_depth.saturating_sub(1),
+            _ if self.compatibility_depth == 0 => {
+                self.stats.diagnostics.unsupported_features = self
+                    .stats
+                    .diagnostics
+                    .unsupported_features
+                    .saturating_add(1);
+            }
             _ => {}
         }
     }
@@ -2884,6 +2912,8 @@ impl<'a> ContentInterpreter<'a> {
             None => match self.lookup_res(|r| r.shadings.get(name).copied()) {
                 Some(id) => (PdfObject::Ref(id), Some(id)),
                 None => {
+                    self.stats.diagnostics.missing_resources =
+                        self.stats.diagnostics.missing_resources.saturating_add(1);
                     tracing::debug!("shading {name} not found in resources");
                     return;
                 }
@@ -2904,6 +2934,11 @@ impl<'a> ContentInterpreter<'a> {
             }
             None => {
                 let Some(d) = self.build_shading(&sh_obj, self.current.ctm) else {
+                    self.stats.diagnostics.unsupported_features = self
+                        .stats
+                        .diagnostics
+                        .unsupported_features
+                        .saturating_add(1);
                     return;
                 };
                 // Mesh defs bake their vertices against the current CTM, so they
@@ -3212,6 +3247,8 @@ impl<'a> ContentInterpreter<'a> {
             } else {
                 let Some(ap_id) = a.appearance else { continue };
                 let Ok(PdfObject::Stream(s)) = file.resolve(ap_id) else {
+                    self.stats.diagnostics.missing_resources =
+                        self.stats.diagnostics.missing_resources.saturating_add(1);
                     continue;
                 };
                 (s, Some(ap_id))
@@ -3230,6 +3267,8 @@ impl<'a> ContentInterpreter<'a> {
                 })
             });
             let Some(bbox) = bbox.filter(|b| b.width() > 0.0 && b.height() > 0.0) else {
+                self.stats.diagnostics.malformed_content =
+                    self.stats.diagnostics.malformed_content.saturating_add(1);
                 continue;
             };
             let matrix = stream
@@ -3319,12 +3358,19 @@ impl<'a> ContentInterpreter<'a> {
 
         let gs_id = match self.lookup_res(|r| r.ext_g_state.get(name).copied()) {
             Some(id) => id,
-            None => return,
+            None => {
+                self.stats.diagnostics.missing_resources =
+                    self.stats.diagnostics.missing_resources.saturating_add(1);
+                return;
+            }
         };
 
         let obj = match file.resolve(gs_id) {
             Ok(o) => o,
-            Err(_) => return,
+            Err(e) => {
+                self.stats.diagnostics.record_decode_failure(&e);
+                return;
+            }
         };
 
         if let Ok(dict) = obj.as_dict() {
@@ -3661,6 +3707,8 @@ impl<'a> ContentInterpreter<'a> {
         let xobj_id = match self.lookup_res(|r| r.xobjects.get(name).copied()) {
             Some(id) => id,
             None => {
+                self.stats.diagnostics.missing_resources =
+                    self.stats.diagnostics.missing_resources.saturating_add(1);
                 tracing::warn!("XObject not found: {name}");
                 return;
             }
@@ -3669,6 +3717,8 @@ impl<'a> ContentInterpreter<'a> {
         let obj = match file.resolve(xobj_id) {
             Ok(o) => o,
             Err(e) => {
+                self.stats.diagnostics.missing_resources =
+                    self.stats.diagnostics.missing_resources.saturating_add(1);
                 tracing::warn!("failed to resolve XObject {name}: {e}");
                 return;
             }
@@ -3704,6 +3754,11 @@ impl<'a> ContentInterpreter<'a> {
                 self.tock_work(work);
             }
             _ => {
+                self.stats.diagnostics.unsupported_features = self
+                    .stats
+                    .diagnostics
+                    .unsupported_features
+                    .saturating_add(1);
                 tracing::warn!("unknown XObject subtype: {subtype}");
             }
         }
@@ -3761,6 +3816,7 @@ impl<'a> ContentInterpreter<'a> {
         let decoded_data = match file.resolve_stream_data(obj_id) {
             Ok(d) => d,
             Err(e) => {
+                self.stats.diagnostics.record_object_failure(obj_id, &e);
                 tracing::warn!("failed to decode image stream: {e}");
                 return;
             }
@@ -3807,6 +3863,7 @@ impl<'a> ContentInterpreter<'a> {
         ) {
             Ok(img) => img,
             Err(e) => {
+                self.stats.diagnostics.record_object_failure(obj_id, &e);
                 tracing::warn!("failed to decode image: {e}");
                 return;
             }
@@ -3823,9 +3880,16 @@ impl<'a> ContentInterpreter<'a> {
                 matte_colorspace.as_ref(),
                 file,
                 &self.parse_limits,
+                &mut self.stats.diagnostics,
             );
         } else if let Ok(mask_ref) = stream.dict.get_ref("Mask") {
-            fold_stencil_mask(&mut image, mask_ref, file, &self.parse_limits);
+            fold_stencil_mask(
+                &mut image,
+                mask_ref,
+                file,
+                &self.parse_limits,
+                &mut self.stats.diagnostics,
+            );
         }
 
         // `/ImageMask` stencils bake in the fill colour, so they are cached
@@ -3989,6 +4053,7 @@ impl<'a> ContentInterpreter<'a> {
                 tracing::warn!(
                     "image {obj_id:?}: no room to keep the source for another size; skipping draw"
                 );
+                self.stats.diagnostics.resource_limit_reached = true;
                 return Stored::Skipped;
             }
             return Stored::NeedsDecode;
@@ -4107,6 +4172,7 @@ impl<'a> ContentInterpreter<'a> {
             {
                 Ok(d) => d,
                 Err(e) => {
+                    self.stats.diagnostics.record_decode_failure(&e);
                     tracing::warn!("inline image: filter decode failed: {e}");
                     return;
                 }
@@ -4151,7 +4217,10 @@ impl<'a> ContentInterpreter<'a> {
             &self.parse_limits,
         ) {
             Ok(img) => self.emit_draw_image(img),
-            Err(e) => tracing::warn!("inline image: {e}"),
+            Err(e) => {
+                self.stats.diagnostics.record_decode_failure(&e);
+                tracing::warn!("inline image: {e}");
+            }
         }
     }
 
@@ -4191,7 +4260,8 @@ impl<'a> ContentInterpreter<'a> {
             .try_insert_with_limit(image, limit)
     }
 
-    fn warn_image_dropped(&self, bytes: u64) {
+    fn warn_image_dropped(&mut self, bytes: u64) {
+        self.stats.diagnostics.resource_limit_reached = true;
         tracing::warn!(
             "image cache byte limit ({}) or ID capacity reached; dropping {bytes}-byte image",
             self.max_image_cache_bytes
@@ -4210,6 +4280,7 @@ impl<'a> ContentInterpreter<'a> {
     ) {
         const MAX_FORM_DEPTH: u32 = 16;
         if self.form_depth >= MAX_FORM_DEPTH {
+            self.stats.diagnostics.resource_limit_reached = true;
             tracing::warn!("form XObject nesting exceeds {MAX_FORM_DEPTH}; skipping");
             return;
         }
@@ -4236,6 +4307,11 @@ impl<'a> ContentInterpreter<'a> {
                 let decoded: std::sync::Arc<[u8]> = match decoded {
                     Ok(d) => d.into(),
                     Err(e) => {
+                        if let Some(id) = xobj_id {
+                            self.stats.diagnostics.record_object_failure(id, &e);
+                        } else {
+                            self.stats.diagnostics.record_decode_failure(&e);
+                        }
                         tracing::warn!("failed to decode form XObject: {e}");
                         return;
                     }
@@ -4292,6 +4368,7 @@ impl<'a> ContentInterpreter<'a> {
         // suppressed) page-level marked-content state. The form's content is a
         // separate marked-content scope, so its /MCIDs start fresh and cannot
         // bleed into (or be polluted by) the page's enclosing sequence.
+        let saved_compatibility = std::mem::replace(&mut self.compatibility_depth, 0);
         let saved_mc_depth = self.mc_depth;
         let saved_mc_stack = std::mem::take(&mut self.mc_stack);
         let saved_oc_hidden = self.oc_hidden_from;
@@ -4358,8 +4435,8 @@ impl<'a> ContentInterpreter<'a> {
         // this form while painting), and one the form leaves unpainted ends
         // with the form.
         let outer_clip = self.pending_clip.take();
-        let tokenizer = ContentTokenizer::new(&decoded);
-        for token in tokenizer {
+        let mut tokenizer = ContentTokenizer::new(&decoded);
+        for token in tokenizer.by_ref() {
             if self.over_budget() {
                 break;
             }
@@ -4379,6 +4456,7 @@ impl<'a> ContentInterpreter<'a> {
                 }
             }
         }
+        self.stats.diagnostics.merge(tokenizer.diagnostics());
         while !self.mc_stack.is_empty() {
             self.end_marked_content();
         }
@@ -4413,6 +4491,7 @@ impl<'a> ContentInterpreter<'a> {
         self.operand_stack = saved_operand_stack;
         self.mc_depth = saved_mc_depth;
         self.mc_stack = saved_mc_stack;
+        self.compatibility_depth = saved_compatibility;
         self.oc_hidden_from = saved_oc_hidden;
         self.base_ctm = saved_base_ctm;
         self.pop_form_fonts();
@@ -4989,6 +5068,7 @@ impl<'a> ContentInterpreter<'a> {
             return true;
         }
         if self.form_depth >= MAX_FORM_DEPTH {
+            self.stats.diagnostics.resource_limit_reached = true;
             tracing::warn!("tiling pattern nesting exceeds {MAX_FORM_DEPTH}; skipping");
             return false;
         }
@@ -5038,6 +5118,7 @@ impl<'a> ContentInterpreter<'a> {
             return false;
         }
         if nx.saturating_mul(ny) > MAX_TILES {
+            self.stats.diagnostics.resource_limit_reached = true;
             tracing::warn!(
                 "tiling pattern: {nx}x{ny} tiles exceeds {MAX_TILES}; using solid approximation"
             );
@@ -5074,6 +5155,7 @@ impl<'a> ContentInterpreter<'a> {
         // /MCID stack is saved before the tile loop and restored per tile.
         let saved_mc_depth = self.mc_depth;
         let saved_mc_stack = self.mc_stack.clone();
+        let saved_compatibility = self.compatibility_depth;
         let saved_oc_hidden = self.oc_hidden_from;
         // Patterns selected inside the cell anchor to the cell's space.
         let saved_base_ctm = self.base_ctm;
@@ -5121,6 +5203,7 @@ impl<'a> ContentInterpreter<'a> {
                 let saved_floor = self.state_floor;
                 self.state_floor = depth_floor + 1;
                 self.current.ctm = tile_ctm;
+                self.compatibility_depth = 0;
                 self.current.clip_depth = 0;
                 self.current.fill_pattern = None;
                 self.current.stroke_pattern = None;
@@ -5160,8 +5243,8 @@ impl<'a> ContentInterpreter<'a> {
                 // The `W` of the fill painting this pattern stays pending for
                 // it; one the cell leaves unpainted ends with the cell.
                 let outer_clip = self.pending_clip.take();
-                let tokenizer = ContentTokenizer::new(&def.content);
-                for token in tokenizer {
+                let mut tokenizer = ContentTokenizer::new(&def.content);
+                for token in tokenizer.by_ref() {
                     if self.over_budget() {
                         break;
                     }
@@ -5181,6 +5264,7 @@ impl<'a> ContentInterpreter<'a> {
                         }
                     }
                 }
+                self.stats.diagnostics.merge(tokenizer.diagnostics());
                 self.pending_clip = outer_clip;
 
                 // Rebalance clips/state left open by the cell body.
@@ -5203,6 +5287,7 @@ impl<'a> ContentInterpreter<'a> {
                 self.suppress_color_ops = saved_suppress;
                 self.mc_depth = saved_mc_depth;
                 self.mc_stack.clone_from(&saved_mc_stack);
+                self.compatibility_depth = saved_compatibility;
                 self.oc_hidden_from = saved_oc_hidden;
                 self.base_ctm = saved_base_ctm;
             }
@@ -5286,6 +5371,10 @@ impl<'a> ContentInterpreter<'a> {
     }
 
     fn show_text(&mut self, bytes: &[u8]) {
+        if !bytes.is_empty() && self.current_font_id.is_none() && !self.oc_suppressed() {
+            self.stats.diagnostics.missing_resources =
+                self.stats.diagnostics.missing_resources.saturating_add(1);
+        }
         let tm = self.text_matrix;
         let ctm = self.current.ctm;
         // Bake the text rise (Ts) into the run transform as a text-space
@@ -5732,6 +5821,9 @@ impl<'a> ContentInterpreter<'a> {
         }
         let fill = matches!(self.current.render_mode, 2 | 6);
         for glyph in glyphs {
+            if self.over_budget() {
+                break;
+            }
             let outline = self
                 .font_cache
                 .as_ref()
@@ -6597,18 +6689,26 @@ fn fold_soft_mask(
     colorspace: Option<&zpdf_image::ResolvedColorSpace>,
     file: &PdfFile,
     limits: &ParseLimits,
+    diagnostics: &mut zpdf_core::ProcessingDiagnostics,
 ) {
     let obj = match file.resolve(smask_ref) {
         Ok(o) => o,
-        Err(_) => return,
+        Err(e) => {
+            diagnostics.record_decode_failure(&e);
+            return;
+        }
     };
     let stream = match obj.as_stream() {
         Ok(s) => s,
-        Err(_) => return,
+        Err(e) => {
+            diagnostics.record_decode_failure(&e);
+            return;
+        }
     };
     let data = match file.resolve_stream_data(smask_ref) {
         Ok(d) => d,
         Err(e) => {
+            diagnostics.record_decode_failure(&e);
             tracing::warn!("failed to decode /SMask stream: {e}");
             return;
         }
@@ -6630,7 +6730,10 @@ fn fold_soft_mask(
             zpdf_image::smask_matte(&dict).as_deref(),
             colorspace,
         ),
-        Err(e) => tracing::warn!("failed to decode /SMask image: {e}"),
+        Err(e) => {
+            diagnostics.record_decode_failure(&e);
+            tracing::warn!("failed to decode /SMask image: {e}");
+        }
     }
 }
 
@@ -6641,20 +6744,27 @@ fn fold_stencil_mask(
     mask_ref: zpdf_core::ObjectId,
     file: &PdfFile,
     limits: &ParseLimits,
+    diagnostics: &mut zpdf_core::ProcessingDiagnostics,
 ) {
     let obj = match file.resolve(mask_ref) {
         Ok(o) => o,
-        Err(_) => return,
+        Err(e) => {
+            diagnostics.record_decode_failure(&e);
+            return;
+        }
     };
     let stream = match obj.as_stream() {
         Ok(s) => s,
-        // A /Mask ref can also point at a colour-key array, which
-        // resolve_image_metadata already inlined for the image decoder.
-        Err(_) => return,
+        Err(_) if matches!(obj, PdfObject::Array(_)) => return,
+        Err(e) => {
+            diagnostics.record_decode_failure(&e);
+            return;
+        }
     };
     let data = match file.resolve_stream_data(mask_ref) {
         Ok(d) => d,
         Err(e) => {
+            diagnostics.record_decode_failure(&e);
             tracing::warn!("failed to decode /Mask stencil stream: {e}");
             return;
         }
@@ -6662,6 +6772,14 @@ fn fold_stencil_mask(
     let dict = resolve_image_metadata(file, &stream.dict);
     let width = dict.get_i64("Width").unwrap_or(0) as u32;
     let height = dict.get_i64("Height").unwrap_or(0) as u32;
+    if width == 0 || height == 0 {
+        diagnostics.malformed_content = diagnostics.malformed_content.saturating_add(1);
+        return;
+    }
+    if u64::from(width) * u64::from(height) > limits.max_image_pixels {
+        diagnostics.resource_limit_reached = true;
+        return;
+    }
     let invert = zpdf_image::mask_decode_inverts(&dict);
     zpdf_image::apply_stencil_mask_with_limits(image, &data, width, height, invert, limits);
 }

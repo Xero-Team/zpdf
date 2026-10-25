@@ -69,6 +69,10 @@ fn text_only_conversion_extracts_no_rich_content() {
     assert!(converted.pages[0].images.is_empty());
     assert!(converted.info.is_none());
     assert!(converted.xmp.is_none());
+    assert!(
+        converted.is_complete(),
+        "images are intentionally omitted in text mode"
+    );
 }
 
 #[test]
@@ -85,6 +89,8 @@ fn rich_conversion_keeps_text_and_skips_bad_images() {
     .expect("convert");
 
     let page = &converted.pages[0];
+    assert_eq!(page.diagnostics.decode_failures, 1);
+    assert!(converted.ensure_complete().is_err());
     assert_eq!(page.text, "Text survives images");
     assert_eq!(page.images.len(), 1, "the invalid image must be discarded");
     assert_eq!(
@@ -121,4 +127,5 @@ fn rich_image_budget_exhaustion_does_not_drop_text() {
 
     assert_eq!(converted.pages[0].text, "Text survives images");
     assert!(converted.pages[0].images.is_empty());
+    assert!(converted.pages[0].diagnostics.resource_limit_reached);
 }

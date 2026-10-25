@@ -1189,7 +1189,9 @@ fn cmd_text(args: &[String]) -> zpdf::Result<()> {
                 .with_colors(&mut icc_cache)
                 .with_text_sink(&mut spans)
                 .with_operand_stack_limit(doc.file().limits().max_operand_stack_depth as usize);
-            let _ = interpreter.interpret(&content_bytes);
+            let (_, mut stats) = interpreter.interpret_with_stats(&content_bytes);
+            stats.diagnostics.set_page(pi);
+            stats.diagnostics.ensure_complete()?;
         }
 
         if all {
@@ -1271,7 +1273,9 @@ fn cmd_search(args: &[String]) -> zpdf::Result<()> {
                 .with_colors(&mut icc_cache)
                 .with_text_sink(&mut spans)
                 .with_operand_stack_limit(doc.file().limits().max_operand_stack_depth as usize);
-            let _ = interpreter.interpret(&content_bytes);
+            let (_, mut stats) = interpreter.interpret_with_stats(&content_bytes);
+            stats.diagnostics.set_page(pi);
+            stats.diagnostics.ensure_complete()?;
         }
 
         for hit in zpdf::search_spans(&spans, query, case_sensitive) {
@@ -1359,7 +1363,9 @@ fn cmd_tables(args: &[String]) -> zpdf::Result<()> {
                 .with_text_sink(&mut spans)
                 .with_rule_sink(&mut rules)
                 .with_operand_stack_limit(doc.file().limits().max_operand_stack_depth as usize);
-            let _ = interpreter.interpret(&content_bytes);
+            let (_, mut stats) = interpreter.interpret_with_stats(&content_bytes);
+            stats.diagnostics.set_page(pi);
+            stats.diagnostics.ensure_complete()?;
         }
 
         let tables = zpdf::detect_tables_with_rules(&spans, &rules);
@@ -1478,12 +1484,14 @@ fn cmd_render(args: &[String]) -> zpdf::Result<()> {
     let mut options = zpdf::PageInterpretOptions::default();
     options.image_downscale = image_downscale;
     let zpdf::InterpretedPage {
+        stats: interpretation_stats,
         display_list,
         fonts: font_cache,
         images: image_cache,
         content_bytes,
         ..
     } = zpdf::interpret_page(&doc, page_index, options)?;
+    interpretation_stats.diagnostics.ensure_complete()?;
     println!("  Fonts loaded: {}", font_cache.len());
     println!("  Content stream: {content_bytes} bytes decoded");
 
@@ -3309,6 +3317,7 @@ fn cmd_export_pptx(args: &[String]) -> zpdf::Result<()> {
 
     for &page_index in &page_indices {
         let zpdf::InterpretedPage {
+            stats: interpretation_stats,
             display_list,
             fonts: font_cache,
             images: image_cache,
@@ -3319,6 +3328,7 @@ fn cmd_export_pptx(args: &[String]) -> zpdf::Result<()> {
             zpdf::PageInterpretOptions::default(),
             &mut icc_cache,
         )?;
+        interpretation_stats.diagnostics.ensure_complete()?;
 
         // Convert display list to PowerPoint slide
         let options = zpdf_pptx_export::ConversionOptions::default();
@@ -3442,6 +3452,7 @@ fn cmd_export_svg(args: &[String]) -> zpdf::Result<()> {
     let mut icc_cache = zpdf::IccCache::new();
     for &page_index in &page_indices {
         let zpdf::InterpretedPage {
+            stats: interpretation_stats,
             display_list,
             fonts: font_cache,
             images: image_cache,
@@ -3452,6 +3463,7 @@ fn cmd_export_svg(args: &[String]) -> zpdf::Result<()> {
             zpdf::PageInterpretOptions::default(),
             &mut icc_cache,
         )?;
+        interpretation_stats.diagnostics.ensure_complete()?;
 
         let svg = zpdf_svg_export::display_list_to_svg(
             &display_list,

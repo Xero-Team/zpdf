@@ -50,6 +50,8 @@ pub struct PdfPage {
     pub user_unit: f64,
     pub resources: ResourceDict,
     pub contents: Vec<ObjectId>,
+    /// Malformed or truncated content references encountered while reading the page.
+    pub content_diagnostics: zpdf_core::ProcessingDiagnostics,
     /// Annotation object ids from `/Annots`, parsed but not yet rendered.
     pub annots: Vec<ObjectId>,
     /// PDF 2.0 page-level `/OutputIntents`. Overrides the document-level intents
@@ -111,6 +113,24 @@ impl PdfPage {
         let resources = inherited.resources.unwrap_or_default();
 
         let contents = Self::collect_content_refs(file, dict.get("Contents"));
+        let mut content_diagnostics = zpdf_core::ProcessingDiagnostics::default();
+        let raw_contents = dict.get("Contents").map(|obj| match obj {
+            PdfObject::Ref(id) => file.resolve(*id).unwrap_or_else(|_| obj.clone()),
+            other => other.clone(),
+        });
+        if let Some(PdfObject::Array(a)) = &raw_contents {
+            content_diagnostics.resource_limit_reached = a.len() > MAX_PAGE_CONTENT_STREAMS;
+            if a.iter().any(|o| !matches!(o, PdfObject::Ref(_))) {
+                content_diagnostics.malformed_content = 1;
+            }
+        } else if raw_contents.as_ref().is_some_and(|o| {
+            !matches!(
+                o,
+                PdfObject::Stream(_) | PdfObject::Ref(_) | PdfObject::Null
+            )
+        }) {
+            content_diagnostics.malformed_content = 1;
+        }
         let annots = Self::collect_annot_refs(file, dict.get("Annots"));
         // PDF 2.0 page-level output intents (off the leaf dict, not inherited).
         let output_intents = crate::output_intents::parse_page_output_intents(file, dict);
@@ -123,6 +143,7 @@ impl PdfPage {
             user_unit,
             resources,
             contents,
+            content_diagnostics,
             annots,
             output_intents,
         })
@@ -636,6 +657,7 @@ mod tests {
             user_unit: 1.0,
             resources: ResourceDict::default(),
             contents: vec![],
+            content_diagnostics: Default::default(),
             annots: vec![],
             output_intents: vec![],
         }

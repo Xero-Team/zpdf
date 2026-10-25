@@ -170,12 +170,14 @@ impl Pdf {
             .with_limits(self.doc.file().limits())
             .raster_scale(page.effective_box_points(), scale);
         let zpdf::InterpretedPage {
+            stats,
             display_list: dl,
             fonts,
             images,
             ..
         } = zpdf::interpret_page_with_cache(&self.doc, index, options, &mut self.icc)
             .map_err(js_err)?;
+        stats.diagnostics.ensure_complete().map_err(js_err)?;
 
         let target = zpdf::cpu::CpuRenderer::new()
             .with_limits(self.doc.file().limits())
@@ -202,12 +204,14 @@ impl Pdf {
             },
         )
         .map_err(js_err)?;
+        result.ensure_complete().map_err(js_err)?;
         Ok(result.pages.into_iter().map(|page| page.text).collect())
     }
 
     /// Export a page as a standalone vector SVG document.
     pub fn page_svg(&mut self, index: usize) -> Result<String, JsError> {
         let zpdf::InterpretedPage {
+            stats,
             display_list: dl,
             fonts,
             images,
@@ -219,6 +223,7 @@ impl Pdf {
             &mut self.icc,
         )
         .map_err(js_err)?;
+        stats.diagnostics.ensure_complete().map_err(js_err)?;
         Ok(zpdf_svg_export::display_list_to_svg(
             &dl,
             &fonts,

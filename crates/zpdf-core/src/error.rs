@@ -46,6 +46,9 @@ pub enum Error {
     #[error("unsupported PDF encryption handler or crypt filter")]
     UnsupportedEncryption,
 
+    #[error("incomplete output: {0}")]
+    IncompleteOutput(crate::ProcessingDiagnostics),
+
     #[error("recursion depth exceeded (max {0})")]
     RecursionLimit(u32),
 
