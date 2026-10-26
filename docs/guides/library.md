@@ -215,9 +215,10 @@ let obj = doc.file().resolve(zpdf::ObjectId(4, 0))?;          // a PdfObject
 let stream = doc.file().resolve_stream_data(zpdf::ObjectId(7, 0))?; // decoded bytes
 ```
 
-Encrypted documents (RC4 and AES-128/256, empty user password) open and decrypt
-transparently in `PdfDocument::open`; password-protected files degrade to a
-warning and render blank.
+Encrypted documents with an empty user password open and decrypt transparently
+in `PdfDocument::open`. Other protected documents return `PasswordRequired`;
+use `open_with_password` to authenticate. Incorrect passwords return
+`WrongPassword`, and unsupported encryption returns `UnsupportedEncryption`.
 
 ## Writing PDFs
 
@@ -228,6 +229,8 @@ new indices. Use `writer.page_indices()` for the current order,
 to translate a current page position. Repeated deletion of a stable index is a
 no-op. The read-only `writer.document()` remains the original snapshot. WASM's
 `PdfEditor` translates its page arguments from current positions automatically.
+`append_pages` and `extract_pages` require distinct source indices; repeated
+indices return an error before changing the writer's page tree.
 
 `extract_pages` preserves the AcroForm branches owning Widgets on selected
 pages, including inherited field attributes and default appearance resources.
@@ -240,6 +243,8 @@ The output embeds subset fonts and ToUnicode mappings. A memory-only provider
 is deterministic; without an explicit provider, native authoring attempts
 installed substitutes. Missing coverage returns an error before changing PDF
 objects. This scalar text path does not add shaping or bidi layout.
+Filling selected fields preserves the stored appearances of untouched widgets,
+including their embedded fonts and custom artwork.
 
 The `zpdf-writer` crate (re-exported through the facade) covers three writing
 models:
