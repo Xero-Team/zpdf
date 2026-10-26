@@ -40,6 +40,15 @@ pub enum Error {
     #[error("incorrect password for an encrypted document")]
     WrongPassword,
 
+    #[error("password required for this encrypted document; supply --password when using the CLI")]
+    PasswordRequired,
+
+    #[error("unsupported PDF encryption handler or crypt filter")]
+    UnsupportedEncryption,
+
+    #[error("incomplete output: {0}")]
+    IncompleteOutput(crate::ProcessingDiagnostics),
+
     #[error("recursion depth exceeded (max {0})")]
     RecursionLimit(u32),
 

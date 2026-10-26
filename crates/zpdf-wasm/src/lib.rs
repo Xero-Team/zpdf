@@ -147,7 +147,7 @@ impl Pdf {
     /// with `/Rotate` taken into account (90°/270° swap the sides).
     pub fn page_size(&self, index: usize) -> Result<Vec<f64>, JsError> {
         let page = self.doc.page(index).map_err(js_err)?;
-        let rect = page.effective_box();
+        let rect = page.effective_box_points();
         let (w, h) = if page.rotate % 180 != 0 {
             (rect.height(), rect.width())
         } else {
@@ -165,27 +165,19 @@ impl Pdf {
             1.0
         };
         let page = self.doc.page(index).map_err(js_err)?;
-        let mut fonts = self.doc.load_page_fonts(&page);
-        let mut images = zpdf::ImageCache::new();
-        let content = self.doc.page_content_bytes(&page).map_err(js_err)?;
-        let page_box = page.effective_box();
-        let mut interpreter = zpdf::ContentInterpreter::new(page_box)
-            .with_page_rotation(page.rotate)
-            .with_fonts(&mut fonts)
-            .with_document(self.doc.file(), &page.resources)
-            .with_shared_fonts(&self.doc)
-            .with_images(&mut images)
-            .with_colors(&mut self.icc)
-            .with_operand_stack_limit(self.doc.file().limits().max_operand_stack_depth as usize);
-        // Store images at the footprint the CPU renderer below filters them
-        // to, instead of keeping full-size scans in wasm memory for the render.
-        if let Some(raster_scale) = zpdf::cpu::CpuRenderer::new()
+        let mut options = zpdf::PageInterpretOptions::default();
+        options.image_downscale = zpdf::cpu::CpuRenderer::new()
             .with_limits(self.doc.file().limits())
-            .raster_scale(page_box, scale)
-        {
-            interpreter = interpreter.with_image_downscale(raster_scale);
-        }
-        let dl = interpreter.interpret(&content);
+            .raster_scale(page.effective_box_points(), scale);
+        let zpdf::InterpretedPage {
+            stats,
+            display_list: dl,
+            fonts,
+            images,
+            ..
+        } = zpdf::interpret_page_with_cache(&self.doc, index, options, &mut self.icc)
+            .map_err(js_err)?;
+        stats.diagnostics.ensure_complete().map_err(js_err)?;
 
         let target = zpdf::cpu::CpuRenderer::new()
             .with_limits(self.doc.file().limits())
@@ -203,43 +195,35 @@ impl Pdf {
     /// Extract a page's text in reading order (struct-tree order when the
     /// document is tagged, geometric order otherwise).
     pub fn page_text(&mut self, index: usize) -> Result<String, JsError> {
-        let page = self.doc.page(index).map_err(js_err)?;
-        let mut fonts = self.doc.load_page_fonts(&page);
-        let content = self.doc.page_content_bytes(&page).map_err(js_err)?;
-        let mut spans: Vec<zpdf::TextSpan> = Vec::new();
-        {
-            let interpreter = zpdf::ContentInterpreter::new(page.effective_box())
-                .with_fonts(&mut fonts)
-                .with_document(self.doc.file(), &page.resources)
-                .with_shared_fonts(&self.doc)
-                .with_colors(&mut self.icc)
-                .with_text_sink(&mut spans)
-                .with_operand_stack_limit(
-                    self.doc.file().limits().max_operand_stack_depth as usize,
-                );
-            let _ = interpreter.interpret(&content);
-        }
-        Ok(match self.doc.struct_tree() {
-            Some(tree) => zpdf::struct_ordered_text(&spans, index, &tree),
-            None => zpdf::spans_to_text(spans, 2.0),
-        })
+        let result = zpdf::convert_pdf(
+            &self.doc,
+            &[index],
+            zpdf::ConversionOptions {
+                mode: zpdf::ConversionMode::TextOnly,
+                use_structure: true,
+            },
+        )
+        .map_err(js_err)?;
+        result.ensure_complete().map_err(js_err)?;
+        Ok(result.pages.into_iter().map(|page| page.text).collect())
     }
 
     /// Export a page as a standalone vector SVG document.
     pub fn page_svg(&mut self, index: usize) -> Result<String, JsError> {
-        let page = self.doc.page(index).map_err(js_err)?;
-        let mut fonts = self.doc.load_page_fonts(&page);
-        let mut images = zpdf::ImageCache::new();
-        let content = self.doc.page_content_bytes(&page).map_err(js_err)?;
-        let dl = zpdf::ContentInterpreter::new(page.effective_box())
-            .with_page_rotation(page.rotate)
-            .with_fonts(&mut fonts)
-            .with_document(self.doc.file(), &page.resources)
-            .with_shared_fonts(&self.doc)
-            .with_images(&mut images)
-            .with_colors(&mut self.icc)
-            .with_operand_stack_limit(self.doc.file().limits().max_operand_stack_depth as usize)
-            .interpret(&content);
+        let zpdf::InterpretedPage {
+            stats,
+            display_list: dl,
+            fonts,
+            images,
+            ..
+        } = zpdf::interpret_page_with_cache(
+            &self.doc,
+            index,
+            zpdf::PageInterpretOptions::default(),
+            &mut self.icc,
+        )
+        .map_err(js_err)?;
+        stats.diagnostics.ensure_complete().map_err(js_err)?;
         Ok(zpdf_svg_export::display_list_to_svg(
             &dl,
             &fonts,
@@ -330,6 +314,20 @@ pub(crate) fn color3(r: Option<f64>, g: Option<f64>, b: Option<f64>) -> Option<(
 #[wasm_bindgen]
 #[allow(clippy::too_many_arguments)] // FFI surface: each edit takes its operands flat
 impl PdfEditor {
+    /// Register an authoring font for Unicode form values and text stamps.
+    pub fn register_font(&mut self, bytes: &[u8], face_index: u32) -> Result<u32, JsError> {
+        let provider = self
+            .writer
+            .document()
+            .font_provider()
+            .cloned()
+            .unwrap_or_else(|| std::sync::Arc::new(zpdf::FontProvider::memory_only()));
+        let id = provider
+            .register(bytes.to_vec(), face_index)
+            .map_err(js_err)?;
+        self.writer.set_font_provider(provider);
+        Ok(id.0)
+    }
     /// Open a PDF for editing (empty-password encrypted files open too).
     pub fn open(data: &[u8]) -> Result<PdfEditor, JsError> {
         let writer = zpdf_writer::IncrementalWriter::new(data.to_vec()).map_err(js_err)?;
@@ -346,7 +344,7 @@ impl PdfEditor {
 
     #[wasm_bindgen(getter)]
     pub fn page_count(&self) -> usize {
-        self.writer.document().page_count()
+        self.writer.page_count()
     }
 
     /// Serialize all queued edits as one incremental update → `Uint8Array`.
@@ -356,19 +354,30 @@ impl PdfEditor {
 
     // — page operations ————————————————————————————————————————————————
 
-    /// Rotate a page by a multiple of 90° (cumulative on existing /Rotate).
+    /// Set a page's absolute rotation to a multiple of 90 degrees.
     pub fn rotate_page(&mut self, page: usize, degrees: i32) -> Result<(), JsError> {
+        let page = self.writer.page_index_at(page).map_err(js_err)?;
         self.writer.rotate_page(page, degrees).map_err(js_err)
     }
 
     /// Delete the given (0-based) pages. Deleting every page is an error.
     pub fn delete_pages(&mut self, pages: Vec<usize>) -> Result<(), JsError> {
+        let pages = pages
+            .into_iter()
+            .map(|p| self.writer.page_index_at(p))
+            .collect::<zpdf::Result<Vec<_>>>()
+            .map_err(js_err)?;
         self.writer.delete_pages(&pages).map_err(js_err)
     }
 
-    /// Reorder pages: `order[i]` is the original index of the page that becomes
+    /// Reorder pages: `order[i]` is the current position of the page that becomes
     /// new page `i` (a full permutation of `0..page_count`).
     pub fn reorder_pages(&mut self, order: Vec<usize>) -> Result<(), JsError> {
+        let order = order
+            .into_iter()
+            .map(|p| self.writer.page_index_at(p))
+            .collect::<zpdf::Result<Vec<_>>>()
+            .map_err(js_err)?;
         self.writer.reorder_pages(&order).map_err(js_err)
     }
 
@@ -443,6 +452,7 @@ impl PdfEditor {
             size,
             color: (r, g, b),
         };
+        let page = self.writer.page_index_at(page).map_err(js_err)?;
         self.writer.stamp_page(page, &[item]).map_err(js_err)
     }
 
@@ -480,6 +490,7 @@ impl PdfEditor {
             width: w,
             height: h,
         };
+        let page = self.writer.page_index_at(page).map_err(js_err)?;
         self.writer.stamp_page(page, &[item]).map_err(js_err)
     }
 
@@ -591,6 +602,7 @@ impl PdfEditor {
     ) -> Result<(), JsError> {
         let rect = zpdf::Rect::new(x0, y0, x1, y1);
         let spec = zpdf_writer::AnnotationSpec::markup_from_rects(kind, &[rect], (r, g, b), None);
+        let page = self.writer.page_index_at(page).map_err(js_err)?;
         self.writer.add_annotation(page, &spec).map_err(js_err)?;
         Ok(())
     }
@@ -613,6 +625,7 @@ impl PdfEditor {
             color: color3(r, g, b),
             icon,
         };
+        let page = self.writer.page_index_at(page).map_err(js_err)?;
         self.writer.add_annotation(page, &spec).map_err(js_err)?;
         Ok(())
     }
@@ -636,6 +649,7 @@ impl PdfEditor {
             size,
             color: color3(r, g, b),
         };
+        let page = self.writer.page_index_at(page).map_err(js_err)?;
         self.writer.add_annotation(page, &spec).map_err(js_err)?;
         Ok(())
     }
@@ -661,6 +675,7 @@ impl PdfEditor {
             interior: color3(ir, ig, ib),
             width,
         };
+        let page = self.writer.page_index_at(page).map_err(js_err)?;
         self.writer.add_annotation(page, &spec).map_err(js_err)?;
         Ok(())
     }
@@ -686,6 +701,7 @@ impl PdfEditor {
             interior: color3(ir, ig, ib),
             width,
         };
+        let page = self.writer.page_index_at(page).map_err(js_err)?;
         self.writer.add_annotation(page, &spec).map_err(js_err)?;
         Ok(())
     }
@@ -710,6 +726,7 @@ impl PdfEditor {
             color: (r, g, b),
             width,
         };
+        let page = self.writer.page_index_at(page).map_err(js_err)?;
         self.writer.add_annotation(page, &spec).map_err(js_err)?;
         Ok(())
     }
@@ -735,6 +752,7 @@ impl PdfEditor {
             }
             None => None,
         };
+        let page = self.writer.page_index_at(page).map_err(js_err)?;
         self.writer
             .redact_page(page, &rects, &zpdf_writer::RedactOptions { fill })
             .map_err(js_err)
@@ -903,6 +921,22 @@ mod tests {
         let out = ed.save().expect("save");
         let doc = reopen(out);
         assert_eq!(doc.page_count(), 1);
+    }
+
+    #[test]
+    fn editor_page_positions_follow_pending_delete_merge_and_reorder() {
+        let mut ed = PdfEditor::open(&tiny_pdf()).unwrap();
+        ed.merge(&tiny_pdf()).unwrap();
+        assert_eq!(ed.page_count(), 2);
+        ed.delete_pages(vec![0]).unwrap();
+        assert_eq!(ed.page_count(), 1);
+        ed.rotate_page(0, 90).unwrap();
+        ed.merge(&tiny_pdf()).unwrap();
+        ed.reorder_pages(vec![1, 0]).unwrap();
+        let doc = reopen(ed.save().unwrap());
+        assert_eq!(ed.page_count(), doc.page_count());
+        assert_eq!(doc.page(0).unwrap().rotate, 0);
+        assert_eq!(doc.page(1).unwrap().rotate, 90);
     }
 
     #[test]

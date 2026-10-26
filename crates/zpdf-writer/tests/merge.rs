@@ -119,6 +119,68 @@ fn merge_three_documents() {
 }
 
 #[test]
+fn repeated_deletion_is_idempotent_and_cannot_delete_the_last_pages() {
+    let mut writer = IncrementalWriter::new(pdf_with_pages(3, 600)).unwrap();
+    writer.delete_pages(&[0]).unwrap();
+    writer.delete_pages(&[0, 0]).unwrap();
+    assert_eq!(writer.page_count(), 2);
+    assert_eq!(writer.page_indices(), &[1, 2]);
+    let mut out = Cursor::new(Vec::new());
+    writer.write(&mut out).unwrap();
+    let doc = PdfDocument::open(out.into_inner()).unwrap();
+    assert_eq!(doc.page_count(), 2);
+    assert_eq!(
+        doc.file()
+            .resolve(zpdf_core::ObjectId(2, 0))
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get_i64("Count")
+            .unwrap(),
+        2
+    );
+    assert!(writer.delete_pages(&[1, 2]).is_err());
+    assert!(writer.rotate_page(0, 90).is_err());
+    assert_eq!(writer.page_count(), 2);
+}
+
+#[test]
+fn duplicate_source_pages_are_rejected_before_the_page_tree_changes() {
+    let mut writer = IncrementalWriter::new(pdf_with_pages(1, 600)).unwrap();
+    let source = PdfFile::parse(pdf_with_pages(1, 700)).unwrap();
+    let mut before = Cursor::new(Vec::new());
+    writer.write(&mut before).unwrap();
+    assert!(writer.append_pages(&source, &[0, 0]).is_err());
+    assert_eq!(writer.page_indices(), &[0]);
+    let mut after = Cursor::new(Vec::new());
+    writer.write(&mut after).unwrap();
+    assert_eq!(before.into_inner(), after.into_inner());
+    assert!(zpdf_writer::extract_pages(&source, &[0, 0]).is_err());
+}
+
+#[test]
+fn reorder_uses_only_surviving_stable_indices_including_appended_pages() {
+    let mut writer = IncrementalWriter::new(pdf_with_pages(3, 600)).unwrap();
+    writer.delete_pages(&[0]).unwrap();
+    assert!(writer.reorder_pages(&[2, 1, 0]).is_err());
+    writer.reorder_pages(&[2, 1]).unwrap();
+    writer
+        .append_document_pages(&PdfFile::parse(pdf_with_pages(1, 700)).unwrap())
+        .unwrap();
+    assert_eq!(writer.page_indices(), &[2, 1, 3]);
+    writer.reorder_pages(&[3, 1, 2]).unwrap();
+    writer.rotate_page(3, 90).unwrap();
+    let mut out = Cursor::new(Vec::new());
+    writer.write(&mut out).unwrap();
+    let doc = PdfDocument::open(out.into_inner()).unwrap();
+    assert_eq!(doc.page_count(), 3);
+    for (index, width) in [700.0, 601.0, 602.0].into_iter().enumerate() {
+        assert_eq!(doc.page(index).unwrap().width(), width);
+    }
+    assert_eq!(doc.page(0).unwrap().rotate, 90);
+}
+
+#[test]
 fn append_selected_pages_in_custom_order() {
     let a = pdf_with_pages(1, 600);
     let b = pdf_with_pages(3, 700);
@@ -308,6 +370,209 @@ fn pdf_from_objects(objects: &[(u32, String)]) -> Vec<u8> {
         .as_bytes(),
     );
     pdf
+}
+
+#[test]
+fn merged_named_links_and_outlines_keep_source_targets_despite_collisions() {
+    use zpdf_core::PdfObject;
+    let base = pdf_from_objects(&[
+        (
+            1,
+            "<< /Type /Catalog /Pages 2 0 R /Dests << /chapter [3 0 R /Fit] >> >>".into(),
+        ),
+        (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into()),
+        (
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 792] /Annots [4 0 R] >>".into(),
+        ),
+        (
+            4,
+            "<< /Subtype /Link /Rect [0 0 50 20] /Dest /chapter >>".into(),
+        ),
+    ]);
+    for registry in [
+        "/Names << /Dests 7 0 R >>",
+        "/Dests << /chapter [4 0 R /Fit] /alias /chapter >>",
+    ] {
+        let source = pdf_from_objects(&[
+            (1, format!("<< /Type /Catalog /Pages 2 0 R {registry} /Outlines 8 0 R >>")),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /MediaBox [0 0 700 792] >>".into()),
+            (3, "<< /Type /Page /Parent 2 0 R /Annots [5 0 R 10 0 R] >>".into()),
+            (4, "<< /Type /Page /Parent 2 0 R /Annots [6 0 R] >>".into()),
+            (5, "<< /Subtype /Link /Rect [0 0 50 20] /Dest (chapter) >>".into()),
+            (6, "<< /Subtype /Link /Rect [0 0 50 20] /A << /S /GoToR /F (other.pdf) /D (chapter) >> >>".into()),
+            (7, "<< /Names [(alias) (chapter) (chapter) << /D [4 0 R /Fit] >>] >>".into()),
+            (8, "<< /Type /Outlines /First 9 0 R /Last 9 0 R /Count 1 >>".into()),
+            (9, "<< /Title (chapter) /Parent 8 0 R /Dest (chapter) >>".into()),
+            (10, "<< /Subtype /Link /Rect [0 20 50 40] /A << /S /GoTo /D /alias >> >>".into()),
+        ]);
+        let mut writer = IncrementalWriter::new(base.clone()).unwrap();
+        writer
+            .append_document(&PdfFile::parse(source).unwrap())
+            .unwrap();
+        let mut out = Cursor::new(Vec::new());
+        writer.write(&mut out).unwrap();
+        let doc = PdfDocument::open(out.into_inner()).unwrap();
+        assert_eq!(doc.page_count(), 3);
+        assert_eq!(
+            doc.page_annotations(&doc.page(0).unwrap())[0]
+                .dest
+                .as_ref()
+                .unwrap()
+                .page,
+            Some(0)
+        );
+        for link in doc.page_annotations(&doc.page(1).unwrap()) {
+            assert_eq!(link.dest.unwrap().page, Some(2));
+        }
+        assert_eq!(doc.outline()[0].dest.as_ref().unwrap().page, Some(2));
+        let target = doc.page(2).unwrap();
+        assert_eq!(
+            target.width(),
+            700.0,
+            "linked page keeps inherited dimensions"
+        );
+        let remote = doc.file().resolve(target.annots[0]).unwrap();
+        let action = remote
+            .as_dict()
+            .unwrap()
+            .get("A")
+            .unwrap()
+            .as_dict()
+            .unwrap();
+        assert!(
+            matches!(action.get("D"), Some(PdfObject::String(s)) if s.as_bytes() == b"chapter")
+        );
+    }
+}
+
+#[test]
+fn cyclic_named_destination_does_not_bind_to_destination_catalog() {
+    use zpdf_core::PdfObject;
+    let source = pdf_from_objects(&[
+        (
+            1,
+            "<< /Type /Catalog /Pages 2 0 R /Dests << /cycle /cycle >> >>".into(),
+        ),
+        (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into()),
+        (
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Annots [4 0 R] >>".into(),
+        ),
+        (
+            4,
+            "<< /Subtype /Link /Rect [0 0 50 20] /Dest /cycle >>".into(),
+        ),
+    ]);
+    let bytes = merge(pdf_with_pages(1, 600), &[source]);
+    let doc = PdfDocument::open(bytes).unwrap();
+    let page = doc.page(1).unwrap();
+    let link = doc.file().resolve(page.annots[0]).unwrap();
+    assert!(matches!(
+        link.as_dict().unwrap().get("Dest"),
+        Some(PdfObject::Null)
+    ));
+}
+
+#[test]
+fn extracted_form_keeps_hierarchy_defaults_and_only_selected_widgets() {
+    use zpdf_core::PdfObject;
+    use zpdf_document::FieldValue;
+    let source = pdf_from_objects(&[
+        (1,"<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [7 0 R 9 0 R] /DA (/Helv 12 Tf 0 g) /DR << /Font << /Helv 10 0 R >> >> >> >>".into()),
+        (2,"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>".into()),
+        (3,"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Annots [5 0 R] >>".into()),
+        (4,"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Annots [6 0 R 9 0 R] >>".into()),
+        (5,"<< /Subtype /Widget /Rect [10 10 100 30] /Parent 8 0 R /P 3 0 R >>".into()),
+        (6,"<< /Subtype /Widget /Rect [10 10 100 30] /Parent 8 0 R /P 4 0 R >>".into()),
+        (7,"<< /T (group) /FT /Tx /Kids [8 0 R] >>".into()),
+        (8,"<< /T (name) /Parent 7 0 R /V (old) /Kids [5 0 R 6 0 R] >>".into()),
+        (9,"<< /Subtype /Widget /FT /Tx /T (excluded) /V (EXCLUDED_VALUE) /Rect [10 40 100 60] /P 4 0 R >>".into()),
+        (10,"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into()),
+    ]);
+    let source = PdfFile::parse(source).unwrap();
+    let bytes = zpdf_writer::extract_pages(&source, &[0]).unwrap();
+    assert!(!String::from_utf8_lossy(&bytes).contains("EXCLUDED_VALUE"));
+    let doc = PdfDocument::open(bytes.clone()).unwrap();
+    assert_eq!(doc.page_count(), 1);
+    let fields = &doc.acro_form().unwrap().fields;
+    assert_eq!(fields.len(), 1);
+    assert_eq!(fields[0].name, "group.name");
+    assert_eq!(fields[0].widgets.len(), 1);
+    let widget = doc.file().resolve(fields[0].widgets[0]).unwrap();
+    assert_eq!(
+        widget.as_dict().unwrap().get_ref("Parent").unwrap(),
+        fields[0].field_id
+    );
+    assert_eq!(
+        widget.as_dict().unwrap().get_ref("P").unwrap(),
+        doc.page(0).unwrap().id
+    );
+    assert!(doc.page_annotations(&doc.page(0).unwrap())[0]
+        .generated
+        .is_some());
+    let mut writer = IncrementalWriter::new(bytes).unwrap();
+    let mut filler = zpdf_writer::FormFiller::new(&mut writer).unwrap();
+    filler.set("group.name", "updated").unwrap();
+    filler.finish().unwrap();
+    let mut out = Cursor::new(Vec::new());
+    writer.write(&mut out).unwrap();
+    let doc = PdfDocument::open(out.into_inner()).unwrap();
+    assert!(
+        matches!(&doc.acro_form().unwrap().fields[0].value,Some(FieldValue::Text(s)) if s=="updated")
+    );
+    assert!(matches!(
+        doc.file()
+            .resolve(doc.acro_form().unwrap().fields[0].field_id)
+            .unwrap(),
+        PdfObject::Dict(_)
+    ));
+}
+
+#[test]
+fn extracted_merged_widget_remains_fillable() {
+    let source = pdf_from_objects(&[
+        (
+            1,
+            "<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [4 0 R] >> >>".into(),
+        ),
+        (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into()),
+        (
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Annots [4 0 R] >>".into(),
+        ),
+        (
+            4,
+            "<< /Subtype /Widget /FT /Tx /T (name) /V (old) /Rect [10 10 100 30] /P 3 0 R >>"
+                .into(),
+        ),
+    ]);
+    let source = PdfFile::parse(source).unwrap();
+    let doc = PdfDocument::open(zpdf_writer::extract_pages(&source, &[0]).unwrap()).unwrap();
+    let field = &doc.acro_form().unwrap().fields[0];
+    assert_eq!(field.field_id, field.widgets[0]);
+    assert_eq!(field.name, "name");
+}
+
+#[test]
+fn extraction_rejects_cyclic_field_trees() {
+    let source = pdf_from_objects(&[
+        (
+            1,
+            "<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [4 0 R] >> >>".into(),
+        ),
+        (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into()),
+        (
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Annots [4 0 R] >>".into(),
+        ),
+        (
+            4,
+            "<< /Subtype /Widget /FT /Tx /T (name) /Kids [4 0 R] /Rect [10 10 100 30] >>".into(),
+        ),
+    ]);
+    let source = PdfFile::parse(source).unwrap();
+    assert!(zpdf_writer::extract_pages(&source, &[0]).is_err());
 }
 
 #[test]

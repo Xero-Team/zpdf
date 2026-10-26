@@ -1,5 +1,6 @@
 //! PDF color space definitions and conversion.
 
+mod calibrated;
 pub mod function;
 pub mod icc;
 
@@ -31,14 +32,14 @@ pub enum ColorSpace {
     Pattern,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CalGrayParams {
     pub white_point: [f64; 3],
     pub black_point: [f64; 3],
     pub gamma: f64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CalRGBParams {
     pub white_point: [f64; 3],
     pub black_point: [f64; 3],

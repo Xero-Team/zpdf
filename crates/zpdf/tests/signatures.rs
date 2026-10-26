@@ -275,6 +275,10 @@ fn bit_string(body: &[u8]) -> Vec<u8> {
 /// whose subject carries the given Common Name. The signature-algorithm and
 /// signature fields are placeholders — the verifier only reads the SPKI and CN.
 fn build_cert(spki: &[u8], cn: &str) -> Vec<u8> {
+    build_cert_with_id(spki, cn, 1, None)
+}
+
+fn build_cert_with_id(spki: &[u8], cn: &str, serial: u8, ski: Option<&[u8]>) -> Vec<u8> {
     let cn_oid = [0x55, 0x04, 0x03]; // 2.5.4.3
     let atv = der(
         SEQ,
@@ -284,18 +288,28 @@ fn build_cert(spki: &[u8], cn: &str) -> Vec<u8> {
 
     // TBSCertificate: serial INT, then five SEQUENCEs — the verifier filters to
     // SEQUENCEs and takes the 4th (subject) and 5th (SPKI).
-    let tbs = der(
-        SEQ,
-        &[
-            der(INT, &[0x01]),            // serialNumber
-            der(SEQ, &der(OID, &[0x2a])), // signature AlgorithmIdentifier (dummy)
-            der(SEQ, &[]),                // issuer (dummy)
-            der(SEQ, &[]),                // validity (dummy)
-            subject,                      // subject (carries CN)
-            spki.to_vec(),                // subjectPublicKeyInfo
-        ]
-        .concat(),
-    );
+    let mut fields = vec![
+        der(INT, &[serial]),          // serialNumber
+        der(SEQ, &der(OID, &[0x2a])), // signature AlgorithmIdentifier (dummy)
+        der(SEQ, &[]),                // issuer (dummy)
+        der(SEQ, &[]),                // validity (dummy)
+        subject,                      // subject (carries CN)
+        spki.to_vec(),                // subjectPublicKeyInfo
+    ];
+    if let Some(ski) = ski {
+        fields.insert(0, der(CTX0_TAG, &der(INT, &[2])));
+        fields.push(der(
+            0xa3,
+            &der(
+                SEQ,
+                &der(
+                    SEQ,
+                    &[der(OID, &[0x55, 0x1d, 0x0e]), der(OCTET, &der(OCTET, ski))].concat(),
+                ),
+            ),
+        ));
+    }
+    let tbs = der(SEQ, &fields.concat());
     der(
         SEQ,
         &[tbs, der(SEQ, &der(OID, &[0x2a])), bit_string(&[0xde, 0xad])].concat(),
@@ -328,6 +342,22 @@ fn build_real_cms(
     sig_alg: &[u8],
     sign: impl Fn(&[u8]) -> Vec<u8>,
 ) -> Vec<u8> {
+    build_real_cms_with_sid(
+        digest,
+        cert,
+        &der(SEQ, &[der(SEQ, &[]), der(INT, &[1])].concat()),
+        sig_alg,
+        sign,
+    )
+}
+
+fn build_real_cms_with_sid(
+    digest: &[u8],
+    cert: &[u8],
+    sid: &[u8],
+    sig_alg: &[u8],
+    sign: impl Fn(&[u8]) -> Vec<u8>,
+) -> Vec<u8> {
     let sha256_oid = [0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01];
     let md_oid = [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x04];
     let data_oid = [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x01];
@@ -345,8 +375,8 @@ fn build_real_cms(
     let signer_info = der(
         SEQ,
         &[
-            der(INT, &[1]),
-            der(SEQ, &[]), // sid placeholder (empty SEQUENCE, skipped by OID scan)
+            der(INT, &[if sid[0] == 0x80 { 3 } else { 1 }]),
+            sid.to_vec(),
             digest_alg.clone(),
             der(CTX0_TAG, &md_attr), // signedAttrs [0] IMPLICIT
             sig_alg.to_vec(),        // signatureAlgorithm SEQUENCE
@@ -503,6 +533,58 @@ fn ecdsa_p256_signature_verifies() {
     assert_eq!(s.signature_algorithm.as_deref(), Some("ECDSA (P-256)"));
     assert_eq!(s.signer_common_name.as_deref(), Some("zpdf ECDSA Test"));
     assert!(s.is_cryptographically_valid());
+}
+
+#[test]
+fn signer_certificate_selection_handles_unordered_sets_and_ski() {
+    use p256::ecdsa::SigningKey;
+    let (cert, sign) = ecdsa_p256_signer();
+    let decoy_key = SigningKey::from_slice(&[0x22; 32]).unwrap();
+    let decoy_spki = ec_p256_spki(&p256::Sec1Point::from(decoy_key.verifying_key()).to_bytes());
+    let decoy = build_cert_with_id(&decoy_spki, "decoy", 2, Some(b"other-key"));
+    let sig_alg = der(SEQ, &der(OID, &[0x2a, 0x86, 0x48, 0xce, 0x3d, 4, 3, 2]));
+    let issuer_sid = der(SEQ, &[der(SEQ, &[]), der(INT, &[1])].concat());
+    let real_key = SigningKey::from_slice(&[0x11; 32]).unwrap();
+    let ski_cert = build_cert_with_id(
+        &ec_p256_spki(&p256::Sec1Point::from(real_key.verifying_key()).to_bytes()),
+        "zpdf ECDSA Test",
+        1,
+        Some(b"signer-key"),
+    );
+    for (leaf, sid) in [(&cert, issuer_sid), (&ski_cert, der(0x80, b"signer-key"))] {
+        for bag in [
+            [decoy.clone(), leaf.clone()].concat(),
+            [leaf.clone(), decoy.clone()].concat(),
+        ] {
+            let pdf =
+                assemble_signed_pdf(|d| build_real_cms_with_sid(d, &bag, &sid, &sig_alg, &sign));
+            let doc = PdfDocument::open(pdf).unwrap();
+            let signature = &doc.signatures()[0];
+            assert_eq!(signature.crypto, CryptoStatus::Valid);
+            assert_eq!(
+                signature.signer_common_name.as_deref(),
+                Some("zpdf ECDSA Test")
+            );
+        }
+    }
+    let ambiguous = build_cert_with_id(&decoy_spki, "different key, same ID", 1, None);
+    for (bag, sid) in [
+        (
+            cert.clone(),
+            der(SEQ, &[der(SEQ, &[]), der(INT, &[99])].concat()),
+        ),
+        (
+            [ambiguous, cert.clone()].concat(),
+            der(SEQ, &[der(SEQ, &[]), der(INT, &[1])].concat()),
+        ),
+        (cert, der(0x80, b"missing-key")),
+    ] {
+        let pdf = assemble_signed_pdf(|d| build_real_cms_with_sid(d, &bag, &sid, &sig_alg, &sign));
+        let doc = PdfDocument::open(pdf).unwrap();
+        let signature = &doc.signatures()[0];
+        assert_eq!(signature.crypto, CryptoStatus::Unsupported);
+        assert!(signature.signer_common_name.is_none());
+    }
 }
 
 #[test]

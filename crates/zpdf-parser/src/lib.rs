@@ -38,7 +38,7 @@ pub struct PdfFile {
     pub trailer: zpdf_core::PdfDict,
     limits: ParseLimits,
     /// Standard-security-handler decryptor, built once at open time from the
-    /// trailer `/Encrypt` dict. `None` for unencrypted (or unsupported-handler)
+    /// trailer `/Encrypt` dict. `None` for unencrypted
     /// documents, in which case `resolve`/object-stream decoding are unchanged.
     decryptor: Option<crypt::Decryptor>,
     /// Cache of resolved top-level indirect objects, keyed by ObjectId.
@@ -149,8 +149,7 @@ impl PdfFile {
         Ok(file)
     }
 
-    /// True when the trailer carries an `/Encrypt` dictionary. Note this does not
-    /// imply decryption succeeded — open the document to find out.
+    /// True when this successfully opened document is encrypted.
     pub fn is_encrypted(&self) -> bool {
         self.trailer.get("Encrypt").is_some()
     }
@@ -163,8 +162,8 @@ impl PdfFile {
 
     /// Construct the Standard-security-handler decryptor from the trailer
     /// `/Encrypt` dictionary, the first element of `/ID`, and the password.
-    /// `Ok(None)` for unencrypted documents or unsupported/degraded handlers;
-    /// `Err(WrongPassword)` when a non-empty password fails to authenticate.
+    /// `Ok(None)` only for unencrypted documents. Authentication failures,
+    /// unsupported handlers and malformed dictionaries return distinct errors.
     fn build_decryptor(&self, password: &[u8]) -> Result<Option<crypt::Decryptor>> {
         // /Encrypt is normally an indirect reference, but a direct dict is
         // legal too (a direct dict has no object id to exempt from decryption).
@@ -173,20 +172,19 @@ impl PdfFile {
             return Ok(None);
         };
         let (enc_obj, encrypt_ref) = match enc {
-            PdfObject::Ref(r) => match self.resolve(*r) {
-                Ok(o) => (o, Some(*r)),
-                Err(_) => return Ok(None),
-            },
+            PdfObject::Ref(r) => (self.resolve(*r)?, Some(*r)),
             direct => (direct.clone(), None),
         };
-        let Ok(enc_dict) = enc_obj.as_dict() else {
-            return Ok(None);
-        };
+        let enc_dict = enc_obj.as_dict()?;
         let id_first = self.first_id_bytes();
         match crypt::Decryptor::from_encrypt_dict(enc_dict, &id_first, encrypt_ref, password) {
             crypt::BuildResult::Decryptor(d) => Ok(Some(d)),
-            crypt::BuildResult::Degrade => Ok(None),
+            crypt::BuildResult::Degrade => Err(zpdf_core::Error::UnsupportedEncryption),
             crypt::BuildResult::WrongPassword => Err(zpdf_core::Error::WrongPassword),
+            crypt::BuildResult::PasswordRequired => Err(zpdf_core::Error::PasswordRequired),
+            crypt::BuildResult::InvalidEncryption(message) => {
+                Err(zpdf_core::Error::InvalidObject(0, message.into()))
+            }
         }
     }
 

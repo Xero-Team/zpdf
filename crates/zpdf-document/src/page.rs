@@ -45,8 +45,13 @@ pub struct PdfPage {
     pub media_box: Rect,
     pub crop_box: Rect,
     pub rotate: i32,
+    /// Size of one default user-space unit in points (1/72 inch). `/UserUnit`
+    /// is not inherited. Boxes and editing coordinates remain in user space.
+    pub user_unit: f64,
     pub resources: ResourceDict,
     pub contents: Vec<ObjectId>,
+    /// Malformed or truncated content references encountered while reading the page.
+    pub content_diagnostics: zpdf_core::ProcessingDiagnostics,
     /// Annotation object ids from `/Annots`, parsed but not yet rendered.
     pub annots: Vec<ObjectId>,
     /// PDF 2.0 page-level `/OutputIntents`. Overrides the document-level intents
@@ -96,9 +101,36 @@ impl PdfPage {
             .filter(is_usable_box)
             .unwrap_or(media_box);
         let rotate = inherited.rotate.unwrap_or(0);
+        let unit_object = dict.get("UserUnit").and_then(|obj| match obj {
+            PdfObject::Ref(id) => file.resolve(*id).ok(),
+            other => Some(other.clone()),
+        });
+        // ISO 32000-1 Table 30 and Annex C: positive, at most 75,000.
+        let user_unit = unit_object
+            .and_then(|obj| obj.as_f64().ok())
+            .filter(|u| u.is_finite() && *u > 0.0 && *u <= 75_000.0)
+            .unwrap_or(1.0);
         let resources = inherited.resources.unwrap_or_default();
 
         let contents = Self::collect_content_refs(file, dict.get("Contents"));
+        let mut content_diagnostics = zpdf_core::ProcessingDiagnostics::default();
+        let raw_contents = dict.get("Contents").map(|obj| match obj {
+            PdfObject::Ref(id) => file.resolve(*id).unwrap_or_else(|_| obj.clone()),
+            other => other.clone(),
+        });
+        if let Some(PdfObject::Array(a)) = &raw_contents {
+            content_diagnostics.resource_limit_reached = a.len() > MAX_PAGE_CONTENT_STREAMS;
+            if a.iter().any(|o| !matches!(o, PdfObject::Ref(_))) {
+                content_diagnostics.malformed_content = 1;
+            }
+        } else if raw_contents.as_ref().is_some_and(|o| {
+            !matches!(
+                o,
+                PdfObject::Stream(_) | PdfObject::Ref(_) | PdfObject::Null
+            )
+        }) {
+            content_diagnostics.malformed_content = 1;
+        }
         let annots = Self::collect_annot_refs(file, dict.get("Annots"));
         // PDF 2.0 page-level output intents (off the leaf dict, not inherited).
         let output_intents = crate::output_intents::parse_page_output_intents(file, dict);
@@ -108,8 +140,10 @@ impl PdfPage {
             media_box,
             crop_box,
             rotate,
+            user_unit,
             resources,
             contents,
+            content_diagnostics,
             annots,
             output_intents,
         })
@@ -167,18 +201,29 @@ impl PdfPage {
         }
     }
 
+    /// Unrotated MediaBox width in physical points, including `/UserUnit`.
     pub fn width(&self) -> f64 {
-        self.media_box.width()
+        self.media_box.width() * self.user_unit
     }
 
+    /// Unrotated MediaBox height in physical points, including `/UserUnit`.
     pub fn height(&self) -> f64 {
-        self.media_box.height()
+        self.media_box.height() * self.user_unit
+    }
+
+    /// Effective box in physical points, before page rotation. Use
+    /// [`Self::effective_box`] for raw PDF editing/content coordinates.
+    pub fn effective_box_points(&self) -> Rect {
+        let r = self.effective_box();
+        let u = self.user_unit;
+        Rect::new(r.x0 * u, r.y0 * u, r.x1 * u, r.y1 * u)
     }
 
     /// The rectangle the page is rendered into: `/CropBox` intersected with
     /// `/MediaBox`. Per spec a CropBox extending beyond the MediaBox is
     /// clamped to it; an empty or non-overlapping CropBox falls back to the
-    /// full MediaBox.
+    /// full MediaBox. Coordinates are in default user space, before UserUnit
+    /// scaling and rotation.
     pub fn effective_box(&self) -> Rect {
         let media = self.media_box.normalize();
         let crop = self.crop_box.normalize();
@@ -609,10 +654,34 @@ mod tests {
             media_box: media,
             crop_box: crop,
             rotate: 0,
+            user_unit: 1.0,
             resources: ResourceDict::default(),
             contents: vec![],
+            content_diagnostics: Default::default(),
             annots: vec![],
             output_intents: vec![],
+        }
+    }
+
+    #[test]
+    fn user_unit_is_local_bounded_and_may_be_indirect() {
+        for (entry, expected) in [
+            ("", 1.0),
+            ("/UserUnit 0", 1.0),
+            ("/UserUnit -2", 1.0),
+            ("/UserUnit 75001", 1.0),
+            ("/UserUnit /Bad", 1.0),
+            ("/UserUnit 0.5", 0.5),
+            ("/UserUnit 4 0 R", 2.0),
+        ] {
+            let leaf = format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] {entry} >>");
+            let page = page0(&[
+                "<< /Type /Catalog /Pages 2 0 R >>",
+                "<< /Type /Pages /Kids [3 0 R] /Count 1 /UserUnit 3 >>",
+                &leaf,
+                "2",
+            ]);
+            assert_eq!(page.user_unit, expected, "{entry}");
         }
     }
 

@@ -1,4 +1,8 @@
 mod conversion;
+mod page_pipeline;
+pub use page_pipeline::{
+    interpret_page, interpret_page_with_cache, InterpretedPage, PageInterpretOptions,
+};
 
 pub use conversion::{
     convert_pdf, ConversionMode, ConversionOptions, ConvertedDocument, ConvertedImage,

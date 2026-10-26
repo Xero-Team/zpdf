@@ -9,8 +9,9 @@
 //!   inherited attributes (`/Resources`, `/MediaBox`, `/CropBox`, `/Rotate`)
 //!   onto each leaf so nothing is lost when leaves are re-parented.
 //!
-//! Operations take **original** 0-based page indices: the writer's view of the
-//! page list is fixed at [`IncrementalWriter::new`] time.
+//! Operations use stable 0-based editing indices. Original pages retain their
+//! indices; appended pages receive new ones and deleted indices are not reused.
+//! See [`IncrementalWriter::page_indices`] for the surviving order.
 
 use std::collections::{HashMap, HashSet};
 
@@ -46,13 +47,17 @@ impl IncrementalWriter {
     /// Deleting every page is an error. The deleted page objects and their
     /// annotations are orphaned, not freed.
     pub fn delete_pages(&mut self, indices: &[usize]) -> Result<()> {
-        let total = self.document().page_count();
-        let unique: HashSet<usize> = indices.iter().copied().collect();
+        let total = self.page_count();
+        if indices.iter().any(|&index| index >= self.page_slots.len()) {
+            return Err(invalid_data("page index out of range").into());
+        }
+        let unique: HashSet<usize> = indices
+            .iter()
+            .copied()
+            .filter(|&index| self.page_slots[index].is_some())
+            .collect();
         if unique.is_empty() {
             return Ok(());
-        }
-        if unique.iter().any(|&index| index >= total) {
-            return Err(invalid_data("page index out of range").into());
         }
         if unique.len() == total {
             return Err(invalid_data("cannot delete every page of the document").into());
@@ -126,23 +131,29 @@ impl IncrementalWriter {
                 break;
             }
         }
+        for &index in &unique {
+            self.page_slots[index] = None;
+        }
+        self.page_order.retain(|index| !unique.contains(index));
         Ok(())
     }
 
-    /// Reorder pages to the given permutation of `0..page_count` (`order[i]`
-    /// is the original index of the page that becomes new page `i`).
+    /// Reorder all surviving pages by their stable editing indices.
+    /// `order` must be a permutation of [`Self::page_indices`].
     ///
     /// The tree is flattened: every leaf is re-parented onto the root `/Pages`
     /// node with its inherited attributes materialized, so intermediate nodes
     /// become orphaned. Outline/link destinations keep working — they point at
     /// page *objects*, which survive.
     pub fn reorder_pages(&mut self, order: &[usize]) -> Result<()> {
-        let total = self.document().page_count();
+        let total = self.page_count();
         if order.len() != total || {
             let s: HashSet<usize> = order.iter().copied().collect();
-            s.len() != total || order.iter().any(|&i| i >= total)
+            s.len() != total || order.iter().any(|&i| self.page_id(i).is_err())
         } {
-            return Err(invalid_data(&format!("order must be a permutation of 0..{total}")).into());
+            return Err(
+                invalid_data("order must contain each surviving page index exactly once").into(),
+            );
         }
 
         let root = self.root_pages_id()?;
@@ -169,6 +180,7 @@ impl IncrementalWriter {
         root_dict.insert(PdfName::new("Kids"), PdfObject::Array(kid_refs));
         root_dict.insert(PdfName::new("Count"), PdfObject::Integer(total as i64));
         self.overwrite_object(root, PdfObject::Dict(root_dict));
+        self.page_order = order.to_vec();
         Ok(())
     }
 

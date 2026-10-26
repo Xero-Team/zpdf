@@ -41,6 +41,8 @@
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct InterpretStats {
+    /// Known omissions, malformed content and resource/time truncation.
+    pub diagnostics: zpdf_core::ProcessingDiagnostics,
     /// Gradient/mesh evaluation into a raster — `shading::rasterize`.
     ///
     /// This is the whole cost of gradients on a page as far as any measurement

@@ -141,11 +141,14 @@ pub struct ContentInterpreter<'a> {
     annotations: Option<&'a [zpdf_document::Annotation]>,
     /// Marked-content nesting depth (BMC/BDC vs EMC).
     mc_depth: u32,
+    compatibility_depth: u32,
     /// Stack of marked-content `/MCID`s, one entry per open marked-content
     /// sequence (`None` for a sequence with no `/MCID`), parallel to `mc_depth`.
     /// Lets the text sink tag each span with the marked-content id that binds it
     /// to a Tagged-PDF structure element. Only meaningful during text extraction.
-    mc_stack: Vec<Option<i32>>,
+    mc_stack: Vec<MarkedContent>,
+    actual_text_bytes: usize,
+    max_actual_text_bytes: usize,
     /// Depth at which a hidden `BDC /OC` block began; painting is suppressed
     /// until the matching EMC.
     oc_hidden_from: Option<u32>,
@@ -230,6 +233,20 @@ struct ImageSource {
     /// The decoded pixels, kept from the second decode on so that further
     /// footprints need no decode. Counted against the image byte limit.
     retained: Option<zpdf_image::DecodedImage>,
+}
+
+#[derive(Clone, Default)]
+struct MarkedContent {
+    mcid: Option<i32>,
+    actual: Option<ActualText>,
+}
+
+#[derive(Clone)]
+struct ActualText {
+    text: std::sync::Arc<str>,
+    start: usize,
+    anchor: TextSpan,
+    visible: bool,
 }
 
 /// Outcome of storing a draw of a known image XObject without decoding.
@@ -326,6 +343,8 @@ enum ActiveColorSpace {
     DeviceGray,
     DeviceRGB,
     DeviceCMYK,
+    CalGray(zpdf_color::CalGrayParams),
+    CalRGB(zpdf_color::CalRGBParams),
     ICCBased(u8),
     /// ICCBased with a compiled profile→sRGB transform (shared through the
     /// document's `IccCache`). Without a usable profile the space resolves to
@@ -369,8 +388,8 @@ enum ActiveColorSpace {
 impl ActiveColorSpace {
     fn components(&self) -> usize {
         match self {
-            Self::DeviceGray => 1,
-            Self::DeviceRGB => 3,
+            Self::DeviceGray | Self::CalGray(_) => 1,
+            Self::DeviceRGB | Self::CalRGB(_) => 3,
             Self::DeviceCMYK => 4,
             Self::ICCBased(n) => (*n).max(1) as usize,
             Self::Icc(t) => t.components(),
@@ -684,7 +703,10 @@ impl<'a> ContentInterpreter<'a> {
             oc_config: None,
             annotations: None,
             mc_depth: 0,
+            compatibility_depth: 0,
             mc_stack: Vec::new(),
+            actual_text_bytes: 0,
+            max_actual_text_bytes: 16 << 20,
             oc_hidden_from: None,
             max_commands: DEFAULT_MAX_COMMANDS,
             ops_executed: 0,
@@ -810,6 +832,7 @@ impl<'a> ContentInterpreter<'a> {
         self.max_operand_stack_depth = limits.max_operand_stack_depth as usize;
         self.max_graphics_state_depth = limits.max_graphics_state_depth as usize;
         self.max_marked_content_depth = limits.max_marked_content_depth as usize;
+        self.max_actual_text_bytes = (limits.max_decoded_stream_bytes.min(16 << 20)) as usize;
         self.max_image_cache_bytes = limits.max_image_cache_bytes;
         self.max_font_cache_bytes = limits.max_font_cache_bytes;
         self.parse_limits = limits.clone();
@@ -826,6 +849,7 @@ impl<'a> ContentInterpreter<'a> {
             || self.display_list.commands.len() >= self.max_commands
             || self.ops_executed >= self.max_ops
         {
+            self.stats.diagnostics.resource_limit_reached = true;
             return true;
         }
         if !self.timed_out {
@@ -919,6 +943,21 @@ impl<'a> ContentInterpreter<'a> {
     /// after [`with_page_rotation`](Self::with_page_rotation).
     pub fn with_content_translation(mut self, dx: f64, dy: f64) -> Self {
         self.current.ctm = self.current.ctm.concat(&Matrix::translate(dx, dy));
+        self
+    }
+
+    /// Convert default page user space to physical points. Call after
+    /// [`Self::with_page_rotation`], before interpreting content. Annotation
+    /// appearances and patterns use the same scaled base transform.
+    pub fn with_page_user_unit(mut self, unit: f64) -> Self {
+        if unit.is_finite() && unit > 0.0 && unit <= 75_000.0 {
+            let scale = Matrix::scale(unit, unit);
+            self.current.ctm = scale.concat(&self.current.ctm);
+            self.base_ctm = scale.concat(&self.base_ctm);
+            let r = self.display_list.page_rect;
+            self.display_list.page_rect =
+                Rect::new(r.x0 * unit, r.y0 * unit, r.x1 * unit, r.y1 * unit);
+        }
         self
     }
 
@@ -1069,9 +1108,9 @@ impl<'a> ContentInterpreter<'a> {
         if self.deadline.is_none() {
             self.deadline = Some(zpdf_core::time::Instant::now() + INTERPRET_BUDGET);
         }
-        let tokenizer = ContentTokenizer::new(content);
+        let mut tokenizer = ContentTokenizer::new(content);
 
-        for token in tokenizer {
+        for token in tokenizer.by_ref() {
             if self.over_budget() {
                 tracing::warn!(
                     "content exceeded {} display commands; truncating page",
@@ -1105,6 +1144,10 @@ impl<'a> ContentInterpreter<'a> {
             }
         }
 
+        self.stats.diagnostics.merge(tokenizer.diagnostics());
+        while !self.mc_stack.is_empty() {
+            self.end_marked_content();
+        }
         // Annotation appearances render independently of wherever the page
         // content stream left the graphics state (12.5.5): drop a `W` never
         // painted, rebalance any unclosed q-levels and top-level W clips, then
@@ -1134,6 +1177,8 @@ impl<'a> ContentInterpreter<'a> {
         self.paint_annotations();
 
         self.stats.font_repairs = self.font_repair.repairs;
+        self.stats.diagnostics.resource_limit_reached |= self.resource_limit_hit;
+        self.stats.diagnostics.time_limit_reached |= self.timed_out;
         self.stats.font_repair_probes = self.font_repair.probes;
         self.stats.total_ns = started.elapsed().as_nanos() as u64;
         (self.display_list, self.stats)
@@ -1148,7 +1193,11 @@ impl<'a> ContentInterpreter<'a> {
             .pop()
             .and_then(|o| o.as_f64().ok())
             .filter(|n| n.is_finite())
-            .unwrap_or(0.0)
+            .unwrap_or_else(|| {
+                self.stats.diagnostics.malformed_content =
+                    self.stats.diagnostics.malformed_content.saturating_add(1);
+                0.0
+            })
     }
 
     fn pop_name(&mut self) -> String {
@@ -1158,7 +1207,11 @@ impl<'a> ContentInterpreter<'a> {
                 PdfObject::Name(n) => Some(n.0),
                 _ => None,
             })
-            .unwrap_or_default()
+            .unwrap_or_else(|| {
+                self.stats.diagnostics.malformed_content =
+                    self.stats.diagnostics.malformed_content.saturating_add(1);
+                String::new()
+            })
     }
 
     fn pop_string_bytes(&mut self) -> Vec<u8> {
@@ -1168,7 +1221,11 @@ impl<'a> ContentInterpreter<'a> {
                 PdfObject::String(s) => Some(s.0),
                 _ => None,
             })
-            .unwrap_or_default()
+            .unwrap_or_else(|| {
+                self.stats.diagnostics.malformed_content =
+                    self.stats.diagnostics.malformed_content.saturating_add(1);
+                Vec::new()
+            })
     }
 
     fn execute_operator(&mut self, op: &str) {
@@ -1244,6 +1301,8 @@ impl<'a> ContentInterpreter<'a> {
                 if next.is_finite() {
                     self.current.ctm = next;
                 } else {
+                    self.stats.diagnostics.malformed_content =
+                        self.stats.diagnostics.malformed_content.saturating_add(1);
                     tracing::warn!("content transform overflowed; ignoring cm operator");
                 }
             }
@@ -1672,7 +1731,7 @@ impl<'a> ContentInterpreter<'a> {
                 }
                 self.mc_depth += 1;
                 // A plain marked-content sequence declares no /MCID.
-                self.mc_stack.push(None);
+                self.mc_stack.push(MarkedContent::default());
             }
             "BDC" => {
                 if self.mc_stack.len() >= self.max_marked_content_depth {
@@ -1693,7 +1752,6 @@ impl<'a> ContentInterpreter<'a> {
                 // Capture this sequence's /MCID (if any) for text extraction; a
                 // sequence with no /MCID inherits the enclosing one via the stack.
                 let mcid = props.as_ref().and_then(|p| self.marked_content_id(p));
-                self.mc_stack.push(mcid);
                 if tag == "OC" && self.oc_hidden_from.is_none() {
                     let visible = props
                         .as_ref()
@@ -1703,16 +1761,20 @@ impl<'a> ContentInterpreter<'a> {
                         self.oc_hidden_from = Some(self.mc_depth);
                     }
                 }
+                let actual = props.as_ref().and_then(|p| self.begin_actual_text(p, mcid));
+                self.mc_stack.push(MarkedContent { mcid, actual });
             }
-            "EMC" => {
-                if self.oc_hidden_from == Some(self.mc_depth) {
-                    self.oc_hidden_from = None;
-                }
-                self.mc_depth = self.mc_depth.saturating_sub(1);
-                self.mc_stack.pop();
-            }
+            "EMC" => self.end_marked_content(),
             "MP" | "DP" => {}
-
+            "BX" => self.compatibility_depth = self.compatibility_depth.saturating_add(1),
+            "EX" => self.compatibility_depth = self.compatibility_depth.saturating_sub(1),
+            _ if self.compatibility_depth == 0 => {
+                self.stats.diagnostics.unsupported_features = self
+                    .stats
+                    .diagnostics
+                    .unsupported_features
+                    .saturating_add(1);
+            }
             _ => {}
         }
     }
@@ -1915,8 +1977,24 @@ impl<'a> ContentInterpreter<'a> {
                 }
                 ActiveColorSpace::Lab { white_point, range }
             }
-            "CalGray" => ActiveColorSpace::DeviceGray,
-            "CalRGB" => ActiveColorSpace::DeviceRGB,
+            "CalGray" | "CalRGB" => {
+                let params = arr
+                    .get(1)
+                    .and_then(|o| self.resolve_dict_of(o))
+                    .unwrap_or_default();
+                let mut resolve = |id| self.file.and_then(|f| f.resolve(id).ok());
+                if cs_name.as_str() == "CalGray" {
+                    ActiveColorSpace::CalGray(zpdf_color::CalGrayParams::from_pdf_dict(
+                        &params,
+                        &mut resolve,
+                    ))
+                } else {
+                    ActiveColorSpace::CalRGB(zpdf_color::CalRGBParams::from_pdf_dict(
+                        &params,
+                        &mut resolve,
+                    ))
+                }
+            }
             // `[/Pattern base]` — retain the base space for uncolored patterns.
             "Pattern" => ActiveColorSpace::Pattern {
                 base: arr
@@ -2208,6 +2286,14 @@ impl<'a> ContentInterpreter<'a> {
     fn components_to_rgb(&self, cs: &ActiveColorSpace, vals: &[f64]) -> Color {
         let get = |i: usize| vals.get(i).copied().unwrap_or(0.0);
         match cs {
+            ActiveColorSpace::CalGray(params) => {
+                let (r, g, b) = params.to_rgb(get(0));
+                Color::rgb(r as f32, g as f32, b as f32)
+            }
+            ActiveColorSpace::CalRGB(params) => {
+                let (r, g, b) = params.to_rgb([get(0), get(1), get(2)]);
+                Color::rgb(r as f32, g as f32, b as f32)
+            }
             ActiveColorSpace::DeviceGray | ActiveColorSpace::ICCBased(1) => {
                 Color::gray(get(0) as f32)
             }
@@ -2826,6 +2912,8 @@ impl<'a> ContentInterpreter<'a> {
             None => match self.lookup_res(|r| r.shadings.get(name).copied()) {
                 Some(id) => (PdfObject::Ref(id), Some(id)),
                 None => {
+                    self.stats.diagnostics.missing_resources =
+                        self.stats.diagnostics.missing_resources.saturating_add(1);
                     tracing::debug!("shading {name} not found in resources");
                     return;
                 }
@@ -2846,6 +2934,11 @@ impl<'a> ContentInterpreter<'a> {
             }
             None => {
                 let Some(d) = self.build_shading(&sh_obj, self.current.ctm) else {
+                    self.stats.diagnostics.unsupported_features = self
+                        .stats
+                        .diagnostics
+                        .unsupported_features
+                        .saturating_add(1);
                     return;
                 };
                 // Mesh defs bake their vertices against the current CTM, so they
@@ -2954,7 +3047,68 @@ impl<'a> ContentInterpreter<'a> {
     /// §14.7.4.2). `None` when no enclosing sequence carries one. Used only to
     /// tag extracted text spans so a Tagged-PDF structure element can bind them.
     fn current_mcid(&self) -> Option<i32> {
-        self.mc_stack.iter().rev().flatten().next().copied()
+        self.mc_stack.iter().rev().find_map(|frame| frame.mcid)
+    }
+
+    fn begin_actual_text(&mut self, props: &PdfObject, mcid: Option<i32>) -> Option<ActualText> {
+        let start = self.text_sink.as_ref()?.len();
+        let dict = self.resolve_property_dict(props)?;
+        let value = self.resolve_plain(dict.get("ActualText")?);
+        let PdfObject::String(value) = value else {
+            return None;
+        };
+        // Decoding can expand PDFDocEncoding to three UTF-8 bytes per byte.
+        // Charge all replacements, including repeatedly referenced properties.
+        let remaining = self
+            .max_actual_text_bytes
+            .saturating_sub(self.actual_text_bytes);
+        if value.as_bytes().len() > remaining / 3 {
+            self.resource_limit_hit = true;
+            return None;
+        }
+        let text = zpdf_core::decode_text_string(value.as_bytes());
+        self.actual_text_bytes += text.len();
+        let tm = self.current.ctm.concat(&self.text_matrix);
+        Some(ActualText {
+            text: text.into(),
+            start,
+            anchor: TextSpan {
+                text: String::new(),
+                x: tm.e,
+                y: tm.f,
+                size: self.current.font_size * self.ctm_scale_factor(),
+                advance: 0.0,
+                mcid: mcid.or_else(|| self.current_mcid()),
+            },
+            visible: !self.oc_suppressed(),
+        })
+    }
+
+    /// Replace the entire marked sequence once. Closing an outer replacement
+    /// also consumes any inner replacement, so nested ActualText never doubles.
+    fn end_marked_content(&mut self) {
+        if let Some(actual) = self.mc_stack.pop().and_then(|frame| frame.actual) {
+            if let Some(sink) = self.text_sink.as_mut() {
+                let start = actual.start.min(sink.len());
+                let mut span = sink
+                    .get(start)
+                    .cloned()
+                    .unwrap_or_else(|| actual.anchor.clone());
+                if let Some(last) = sink.last().filter(|_| start < sink.len()) {
+                    span.advance = last.x + last.advance - span.x;
+                }
+                span.mcid = actual.anchor.mcid;
+                span.text = actual.text.to_string();
+                sink.truncate(start);
+                if actual.visible && !span.text.is_empty() && span.is_finite() {
+                    sink.push(span);
+                }
+            }
+        }
+        if self.oc_hidden_from == Some(self.mc_depth) {
+            self.oc_hidden_from = None;
+        }
+        self.mc_depth = self.mc_depth.saturating_sub(1);
     }
 
     /// Read the `/MCID` of a `BDC` properties operand (an inline dict, or a name
@@ -3093,6 +3247,8 @@ impl<'a> ContentInterpreter<'a> {
             } else {
                 let Some(ap_id) = a.appearance else { continue };
                 let Ok(PdfObject::Stream(s)) = file.resolve(ap_id) else {
+                    self.stats.diagnostics.missing_resources =
+                        self.stats.diagnostics.missing_resources.saturating_add(1);
                     continue;
                 };
                 (s, Some(ap_id))
@@ -3111,6 +3267,8 @@ impl<'a> ContentInterpreter<'a> {
                 })
             });
             let Some(bbox) = bbox.filter(|b| b.width() > 0.0 && b.height() > 0.0) else {
+                self.stats.diagnostics.malformed_content =
+                    self.stats.diagnostics.malformed_content.saturating_add(1);
                 continue;
             };
             let matrix = stream
@@ -3200,12 +3358,19 @@ impl<'a> ContentInterpreter<'a> {
 
         let gs_id = match self.lookup_res(|r| r.ext_g_state.get(name).copied()) {
             Some(id) => id,
-            None => return,
+            None => {
+                self.stats.diagnostics.missing_resources =
+                    self.stats.diagnostics.missing_resources.saturating_add(1);
+                return;
+            }
         };
 
         let obj = match file.resolve(gs_id) {
             Ok(o) => o,
-            Err(_) => return,
+            Err(e) => {
+                self.stats.diagnostics.record_decode_failure(&e);
+                return;
+            }
         };
 
         if let Ok(dict) = obj.as_dict() {
@@ -3479,6 +3644,10 @@ impl<'a> ContentInterpreter<'a> {
         let saved_dl = std::mem::replace(&mut self.display_list, DisplayList::new(page_rect));
         let saved_state = self.current.clone();
         let saved_oc_hidden = self.oc_hidden_from.take();
+        // Mask glyphs and rules define opacity, not logical page content.
+        // Keep /ActualText in those painting resources out of extraction too.
+        let saved_text_sink = self.text_sink.take();
+        let saved_rule_sink = self.rule_sink.take();
         self.current.soft_mask = None;
         self.current.blend_mode = BlendMode::Normal;
         self.current.fill_alpha = 1.0;
@@ -3491,6 +3660,8 @@ impl<'a> ContentInterpreter<'a> {
         self.tock_work(work);
         self.current = saved_state;
         self.oc_hidden_from = saved_oc_hidden;
+        self.text_sink = saved_text_sink;
+        self.rule_sink = saved_rule_sink;
         let mask_dl = std::mem::replace(&mut self.display_list, saved_dl);
 
         // /BC components live in the group's /CS; the mean is a serviceable
@@ -3534,6 +3705,11 @@ impl<'a> ContentInterpreter<'a> {
     }
 
     fn execute_do(&mut self, name: &str) {
+        // A hidden draw does not need a resource. In strict mode, failures in
+        // invisible layers must not reject otherwise complete visible output.
+        if self.oc_suppressed() {
+            return;
+        }
         let file = match self.file {
             Some(f) => f,
             _ => return,
@@ -3542,6 +3718,8 @@ impl<'a> ContentInterpreter<'a> {
         let xobj_id = match self.lookup_res(|r| r.xobjects.get(name).copied()) {
             Some(id) => id,
             None => {
+                self.stats.diagnostics.missing_resources =
+                    self.stats.diagnostics.missing_resources.saturating_add(1);
                 tracing::warn!("XObject not found: {name}");
                 return;
             }
@@ -3550,6 +3728,7 @@ impl<'a> ContentInterpreter<'a> {
         let obj = match file.resolve(xobj_id) {
             Ok(o) => o,
             Err(e) => {
+                self.stats.diagnostics.record_object_failure(xobj_id, &e);
                 tracing::warn!("failed to resolve XObject {name}: {e}");
                 return;
             }
@@ -3557,14 +3736,14 @@ impl<'a> ContentInterpreter<'a> {
 
         let stream = match obj.as_stream() {
             Ok(s) => s,
-            Err(_) => return,
+            Err(e) => {
+                self.stats.diagnostics.record_object_failure(xobj_id, &e);
+                return;
+            }
         };
 
         // Hidden optional content: skip the XObject entirely (both the
         // surrounding BDC /OC state and the XObject's own /OC key).
-        if self.oc_suppressed() {
-            return;
-        }
         if let Some(oc) = stream.dict.get("OC") {
             if !self.oc_object_visible(oc, 0) {
                 return;
@@ -3585,6 +3764,11 @@ impl<'a> ContentInterpreter<'a> {
                 self.tock_work(work);
             }
             _ => {
+                self.stats.diagnostics.unsupported_features = self
+                    .stats
+                    .diagnostics
+                    .unsupported_features
+                    .saturating_add(1);
                 tracing::warn!("unknown XObject subtype: {subtype}");
             }
         }
@@ -3642,6 +3826,7 @@ impl<'a> ContentInterpreter<'a> {
         let decoded_data = match file.resolve_stream_data(obj_id) {
             Ok(d) => d,
             Err(e) => {
+                self.stats.diagnostics.record_object_failure(obj_id, &e);
                 tracing::warn!("failed to decode image stream: {e}");
                 return;
             }
@@ -3688,6 +3873,7 @@ impl<'a> ContentInterpreter<'a> {
         ) {
             Ok(img) => img,
             Err(e) => {
+                self.stats.diagnostics.record_object_failure(obj_id, &e);
                 tracing::warn!("failed to decode image: {e}");
                 return;
             }
@@ -3704,9 +3890,16 @@ impl<'a> ContentInterpreter<'a> {
                 matte_colorspace.as_ref(),
                 file,
                 &self.parse_limits,
+                &mut self.stats.diagnostics,
             );
         } else if let Ok(mask_ref) = stream.dict.get_ref("Mask") {
-            fold_stencil_mask(&mut image, mask_ref, file, &self.parse_limits);
+            fold_stencil_mask(
+                &mut image,
+                mask_ref,
+                file,
+                &self.parse_limits,
+                &mut self.stats.diagnostics,
+            );
         }
 
         // `/ImageMask` stencils bake in the fill colour, so they are cached
@@ -3870,6 +4063,7 @@ impl<'a> ContentInterpreter<'a> {
                 tracing::warn!(
                     "image {obj_id:?}: no room to keep the source for another size; skipping draw"
                 );
+                self.stats.diagnostics.resource_limit_reached = true;
                 return Stored::Skipped;
             }
             return Stored::NeedsDecode;
@@ -3988,6 +4182,7 @@ impl<'a> ContentInterpreter<'a> {
             {
                 Ok(d) => d,
                 Err(e) => {
+                    self.stats.diagnostics.record_decode_failure(&e);
                     tracing::warn!("inline image: filter decode failed: {e}");
                     return;
                 }
@@ -4032,7 +4227,10 @@ impl<'a> ContentInterpreter<'a> {
             &self.parse_limits,
         ) {
             Ok(img) => self.emit_draw_image(img),
-            Err(e) => tracing::warn!("inline image: {e}"),
+            Err(e) => {
+                self.stats.diagnostics.record_decode_failure(&e);
+                tracing::warn!("inline image: {e}");
+            }
         }
     }
 
@@ -4072,7 +4270,8 @@ impl<'a> ContentInterpreter<'a> {
             .try_insert_with_limit(image, limit)
     }
 
-    fn warn_image_dropped(&self, bytes: u64) {
+    fn warn_image_dropped(&mut self, bytes: u64) {
+        self.stats.diagnostics.resource_limit_reached = true;
         tracing::warn!(
             "image cache byte limit ({}) or ID capacity reached; dropping {bytes}-byte image",
             self.max_image_cache_bytes
@@ -4091,6 +4290,7 @@ impl<'a> ContentInterpreter<'a> {
     ) {
         const MAX_FORM_DEPTH: u32 = 16;
         if self.form_depth >= MAX_FORM_DEPTH {
+            self.stats.diagnostics.resource_limit_reached = true;
             tracing::warn!("form XObject nesting exceeds {MAX_FORM_DEPTH}; skipping");
             return;
         }
@@ -4117,6 +4317,11 @@ impl<'a> ContentInterpreter<'a> {
                 let decoded: std::sync::Arc<[u8]> = match decoded {
                     Ok(d) => d.into(),
                     Err(e) => {
+                        if let Some(id) = xobj_id {
+                            self.stats.diagnostics.record_object_failure(id, &e);
+                        } else {
+                            self.stats.diagnostics.record_decode_failure(&e);
+                        }
                         tracing::warn!("failed to decode form XObject: {e}");
                         return;
                     }
@@ -4173,6 +4378,7 @@ impl<'a> ContentInterpreter<'a> {
         // suppressed) page-level marked-content state. The form's content is a
         // separate marked-content scope, so its /MCIDs start fresh and cannot
         // bleed into (or be polluted by) the page's enclosing sequence.
+        let saved_compatibility = std::mem::replace(&mut self.compatibility_depth, 0);
         let saved_mc_depth = self.mc_depth;
         let saved_mc_stack = std::mem::take(&mut self.mc_stack);
         let saved_oc_hidden = self.oc_hidden_from;
@@ -4239,8 +4445,8 @@ impl<'a> ContentInterpreter<'a> {
         // this form while painting), and one the form leaves unpainted ends
         // with the form.
         let outer_clip = self.pending_clip.take();
-        let tokenizer = ContentTokenizer::new(&decoded);
-        for token in tokenizer {
+        let mut tokenizer = ContentTokenizer::new(&decoded);
+        for token in tokenizer.by_ref() {
             if self.over_budget() {
                 break;
             }
@@ -4259,6 +4465,10 @@ impl<'a> ContentInterpreter<'a> {
                     self.operand_stack.clear();
                 }
             }
+        }
+        self.stats.diagnostics.merge(tokenizer.diagnostics());
+        while !self.mc_stack.is_empty() {
+            self.end_marked_content();
         }
         self.pending_clip = outer_clip;
         self.form_depth -= 1;
@@ -4291,6 +4501,7 @@ impl<'a> ContentInterpreter<'a> {
         self.operand_stack = saved_operand_stack;
         self.mc_depth = saved_mc_depth;
         self.mc_stack = saved_mc_stack;
+        self.compatibility_depth = saved_compatibility;
         self.oc_hidden_from = saved_oc_hidden;
         self.base_ctm = saved_base_ctm;
         self.pop_form_fonts();
@@ -4734,6 +4945,11 @@ impl<'a> ContentInterpreter<'a> {
     /// the region is degenerate).
     fn emit_stroke(&mut self, page_path: Path) {
         self.capture_stroke_rules(&page_path);
+        self.stroke_page_path(page_path);
+    }
+
+    /// Paint without treating glyph contours as table-rule candidates.
+    fn stroke_page_path(&mut self, page_path: Path) {
         // A `/None` (or all-`None` DeviceN) stroke colour space produces no marks.
         if cs_produces_no_marks(&self.current.stroke_cs) {
             return;
@@ -4862,6 +5078,7 @@ impl<'a> ContentInterpreter<'a> {
             return true;
         }
         if self.form_depth >= MAX_FORM_DEPTH {
+            self.stats.diagnostics.resource_limit_reached = true;
             tracing::warn!("tiling pattern nesting exceeds {MAX_FORM_DEPTH}; skipping");
             return false;
         }
@@ -4911,6 +5128,7 @@ impl<'a> ContentInterpreter<'a> {
             return false;
         }
         if nx.saturating_mul(ny) > MAX_TILES {
+            self.stats.diagnostics.resource_limit_reached = true;
             tracing::warn!(
                 "tiling pattern: {nx}x{ny} tiles exceeds {MAX_TILES}; using solid approximation"
             );
@@ -4939,11 +5157,15 @@ impl<'a> ContentInterpreter<'a> {
         let saved_text_line_matrix = self.text_line_matrix;
         let saved_operand_stack = std::mem::take(&mut self.operand_stack);
         let saved_suppress = self.suppress_color_ops;
+        // Pattern-cell glyphs are painting resources, not logical page text;
+        // their EMC operators must never edit the surrounding extraction sink.
+        let saved_text_sink = self.text_sink.take();
         // Unbalanced BDC/EMC inside a cell must not leak marked-content state
         // into later tiles or the rest of the page; like `mc_depth`, the cell's
         // /MCID stack is saved before the tile loop and restored per tile.
         let saved_mc_depth = self.mc_depth;
         let saved_mc_stack = self.mc_stack.clone();
+        let saved_compatibility = self.compatibility_depth;
         let saved_oc_hidden = self.oc_hidden_from;
         // Patterns selected inside the cell anchor to the cell's space.
         let saved_base_ctm = self.base_ctm;
@@ -4991,6 +5213,7 @@ impl<'a> ContentInterpreter<'a> {
                 let saved_floor = self.state_floor;
                 self.state_floor = depth_floor + 1;
                 self.current.ctm = tile_ctm;
+                self.compatibility_depth = 0;
                 self.current.clip_depth = 0;
                 self.current.fill_pattern = None;
                 self.current.stroke_pattern = None;
@@ -5030,8 +5253,8 @@ impl<'a> ContentInterpreter<'a> {
                 // The `W` of the fill painting this pattern stays pending for
                 // it; one the cell leaves unpainted ends with the cell.
                 let outer_clip = self.pending_clip.take();
-                let tokenizer = ContentTokenizer::new(&def.content);
-                for token in tokenizer {
+                let mut tokenizer = ContentTokenizer::new(&def.content);
+                for token in tokenizer.by_ref() {
                     if self.over_budget() {
                         break;
                     }
@@ -5051,6 +5274,7 @@ impl<'a> ContentInterpreter<'a> {
                         }
                     }
                 }
+                self.stats.diagnostics.merge(tokenizer.diagnostics());
                 self.pending_clip = outer_clip;
 
                 // Rebalance clips/state left open by the cell body.
@@ -5073,6 +5297,7 @@ impl<'a> ContentInterpreter<'a> {
                 self.suppress_color_ops = saved_suppress;
                 self.mc_depth = saved_mc_depth;
                 self.mc_stack.clone_from(&saved_mc_stack);
+                self.compatibility_depth = saved_compatibility;
                 self.oc_hidden_from = saved_oc_hidden;
                 self.base_ctm = saved_base_ctm;
             }
@@ -5080,6 +5305,7 @@ impl<'a> ContentInterpreter<'a> {
         self.form_depth -= 1;
         self.soft_mask_reuse = saved_mask_reuse;
         self.tile_op_index = saved_tile_op_index;
+        self.text_sink = saved_text_sink;
 
         self.text_matrix = saved_text_matrix;
         self.text_line_matrix = saved_text_line_matrix;
@@ -5101,21 +5327,11 @@ impl<'a> ContentInterpreter<'a> {
         transform: Matrix,
         h_scale: f32,
     ) {
-        // Text-fill modes (0/2/4/6) take the nonstroking colour + overprint;
-        // text-stroke modes (1/5) take the stroking colour + overprint.
-        let (paint_color, overprint) = match self.current.render_mode {
-            1 | 5 => (
-                self.current.stroke_color,
-                self.overprint_descriptor(
-                    self.current.stroke_overprint,
-                    self.current.stroke_colorant,
-                ),
-            ),
-            _ => (
-                self.current.fill_color,
-                self.overprint_descriptor(self.current.fill_overprint, self.current.fill_colorant),
-            ),
-        };
+        // GlyphRun is a fill operation. Stroke modes use actual outline paths;
+        // Type3 CharProcs retain their ordinary nonstroking paint.
+        let paint_color = self.current.fill_color;
+        let overprint =
+            self.overprint_descriptor(self.current.fill_overprint, self.current.fill_colorant);
         let cmd = RenderCommand::DrawGlyphRun(GlyphRun {
             font_id,
             font_size,
@@ -5165,6 +5381,10 @@ impl<'a> ContentInterpreter<'a> {
     }
 
     fn show_text(&mut self, bytes: &[u8]) {
+        if !bytes.is_empty() && self.current_font_id.is_none() && !self.oc_suppressed() {
+            self.stats.diagnostics.missing_resources =
+                self.stats.diagnostics.missing_resources.saturating_add(1);
+        }
         let tm = self.text_matrix;
         let ctm = self.current.ctm;
         // Bake the text rise (Ts) into the run transform as a text-space
@@ -5459,12 +5679,16 @@ impl<'a> ContentInterpreter<'a> {
         // Only emit a glyph run when a font is actually active; with no font the
         // glyph IDs would be raw, unmappable codes aliased onto font 0.
         // Text render mode 3 (invisible, the OCR-layer case) and 7 (clip only)
-        // paint nothing; stroke modes 1/2/5/6 are approximated as fills.
+        // paint nothing; stroke modes 1/2/5/6 use outline paths below.
         // A `/None` colorant space on the active paint (fill for modes 0/2/4/6,
         // stroke for 1/5) likewise produces no marks — suppress the visual run,
         // while the text-extraction sink below still records the glyphs.
         let no_marks = match self.current.render_mode {
             1 | 5 => cs_produces_no_marks(&self.current.stroke_cs),
+            2 | 6 => {
+                cs_produces_no_marks(&self.current.fill_cs)
+                    && cs_produces_no_marks(&self.current.stroke_cs)
+            }
             _ => cs_produces_no_marks(&self.current.fill_cs),
         };
         let invisible = matches!(self.current.render_mode, 3 | 7) || no_marks;
@@ -5538,6 +5762,16 @@ impl<'a> ContentInterpreter<'a> {
         }
         if let Some(font_id) = self.current_font_id {
             if (!glyphs.is_empty() || resolved_runs.is_some()) && !invisible {
+                if matches!(self.current.render_mode, 1 | 2 | 5 | 6) {
+                    if let Some(runs) = resolved_runs {
+                        for (id, glyphs) in runs {
+                            self.paint_stroked_text(id, glyphs, combined, font_size, h_scale);
+                        }
+                    } else {
+                        self.paint_stroked_text(font_id, glyphs, combined, font_size, h_scale);
+                    }
+                    return;
+                }
                 // A Pattern colour space on the active paint (fill for modes
                 // 0/2/4/6, stroke for 1/5) clips the pattern to the glyph
                 // outlines instead of painting a solid run.
@@ -5572,6 +5806,55 @@ impl<'a> ContentInterpreter<'a> {
                         self.emit_solid_glyph_run(id, font_size, glyphs, combined, h_scale);
                     }
                 }
+            }
+        }
+    }
+
+    /// ISO 32000-1 9.3.6: fill then stroke each glyph, using user-space line
+    /// parameters (not text-matrix-scaled widths), separate paints and alpha.
+    fn paint_stroked_text(
+        &mut self,
+        font_id: FontId,
+        glyphs: Vec<PositionedGlyph>,
+        transform: Matrix,
+        font_size: f32,
+        h_scale: f32,
+    ) {
+        let type3 = self
+            .font_cache
+            .as_ref()
+            .and_then(|c| c.get(font_id))
+            .is_some_and(|font| font.is_type3());
+        if type3 {
+            self.emit_solid_glyph_run(font_id, font_size, glyphs, transform, h_scale);
+            return;
+        }
+        let fill = matches!(self.current.render_mode, 2 | 6);
+        for glyph in glyphs {
+            if self.over_budget() {
+                break;
+            }
+            let outline = self
+                .font_cache
+                .as_ref()
+                .and_then(|c| c.get(font_id))
+                .and_then(|font| {
+                    build_glyph_clip_path(
+                        std::slice::from_ref(&glyph),
+                        &transform,
+                        font,
+                        font_size,
+                        h_scale,
+                        &mut false,
+                    )
+                });
+            if let Some((path, _)) = outline {
+                if fill {
+                    self.fill_page_path(path.clone(), FillRule::NonZero);
+                }
+                self.stroke_page_path(path);
+            } else if fill {
+                self.emit_solid_glyph_run(font_id, font_size, vec![glyph], transform, h_scale);
             }
         }
     }
@@ -6347,6 +6630,25 @@ fn resolve_image_colorspace(
                         alternate: Box::new(alternate.unwrap_or(Rcs::Gray)),
                     })
                 }
+                "CalGray" | "CalRGB" => {
+                    let params = match arr.get(1)? {
+                        PdfObject::Ref(r) => file?.resolve(*r).ok()?,
+                        other => other.clone(),
+                    };
+                    let params = params.as_dict().ok()?;
+                    let mut resolve = |id| file.and_then(|f| f.resolve(id).ok());
+                    Some(if head == "CalGray" {
+                        Rcs::CalGray(zpdf_color::CalGrayParams::from_pdf_dict(
+                            params,
+                            &mut resolve,
+                        ))
+                    } else {
+                        Rcs::CalRGB(zpdf_color::CalRGBParams::from_pdf_dict(
+                            params,
+                            &mut resolve,
+                        ))
+                    })
+                }
                 "Lab" => {
                     let params = match arr.get(1)? {
                         PdfObject::Ref(r) => file?.resolve(*r).ok()?,
@@ -6397,18 +6699,26 @@ fn fold_soft_mask(
     colorspace: Option<&zpdf_image::ResolvedColorSpace>,
     file: &PdfFile,
     limits: &ParseLimits,
+    diagnostics: &mut zpdf_core::ProcessingDiagnostics,
 ) {
     let obj = match file.resolve(smask_ref) {
         Ok(o) => o,
-        Err(_) => return,
+        Err(e) => {
+            diagnostics.record_decode_failure(&e);
+            return;
+        }
     };
     let stream = match obj.as_stream() {
         Ok(s) => s,
-        Err(_) => return,
+        Err(e) => {
+            diagnostics.record_decode_failure(&e);
+            return;
+        }
     };
     let data = match file.resolve_stream_data(smask_ref) {
         Ok(d) => d,
         Err(e) => {
+            diagnostics.record_decode_failure(&e);
             tracing::warn!("failed to decode /SMask stream: {e}");
             return;
         }
@@ -6430,7 +6740,10 @@ fn fold_soft_mask(
             zpdf_image::smask_matte(&dict).as_deref(),
             colorspace,
         ),
-        Err(e) => tracing::warn!("failed to decode /SMask image: {e}"),
+        Err(e) => {
+            diagnostics.record_decode_failure(&e);
+            tracing::warn!("failed to decode /SMask image: {e}");
+        }
     }
 }
 
@@ -6441,20 +6754,27 @@ fn fold_stencil_mask(
     mask_ref: zpdf_core::ObjectId,
     file: &PdfFile,
     limits: &ParseLimits,
+    diagnostics: &mut zpdf_core::ProcessingDiagnostics,
 ) {
     let obj = match file.resolve(mask_ref) {
         Ok(o) => o,
-        Err(_) => return,
+        Err(e) => {
+            diagnostics.record_decode_failure(&e);
+            return;
+        }
     };
     let stream = match obj.as_stream() {
         Ok(s) => s,
-        // A /Mask ref can also point at a colour-key array, which
-        // resolve_image_metadata already inlined for the image decoder.
-        Err(_) => return,
+        Err(_) if matches!(obj, PdfObject::Array(_)) => return,
+        Err(e) => {
+            diagnostics.record_decode_failure(&e);
+            return;
+        }
     };
     let data = match file.resolve_stream_data(mask_ref) {
         Ok(d) => d,
         Err(e) => {
+            diagnostics.record_decode_failure(&e);
             tracing::warn!("failed to decode /Mask stencil stream: {e}");
             return;
         }
@@ -6462,6 +6782,14 @@ fn fold_stencil_mask(
     let dict = resolve_image_metadata(file, &stream.dict);
     let width = dict.get_i64("Width").unwrap_or(0) as u32;
     let height = dict.get_i64("Height").unwrap_or(0) as u32;
+    if width == 0 || height == 0 {
+        diagnostics.malformed_content = diagnostics.malformed_content.saturating_add(1);
+        return;
+    }
+    if u64::from(width) * u64::from(height) > limits.max_image_pixels {
+        diagnostics.resource_limit_reached = true;
+        return;
+    }
     let invert = zpdf_image::mask_decode_inverts(&dict);
     zpdf_image::apply_stencil_mask_with_limits(image, &data, width, height, invert, limits);
 }
@@ -7685,7 +8013,7 @@ mod tests {
             Some(Rcs::Cmyk)
         );
         let cs = PdfObject::Name(PdfName::new("CalGray"));
-        assert_eq!(
+        assert!(matches!(
             resolve_image_colorspace(
                 None,
                 None,
@@ -7693,8 +8021,8 @@ mod tests {
                 0,
                 zpdf_color::RenderIntent::default()
             ),
-            Some(Rcs::Gray)
-        );
+            Some(Rcs::CalGray(_))
+        ));
         let cs = PdfObject::Name(PdfName::new("Pattern"));
         assert_eq!(
             resolve_image_colorspace(

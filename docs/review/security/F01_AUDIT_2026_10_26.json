@@ -1,13 +1,13 @@
 {
   "audit_date": "2026-10-26",
-  "visibility": "Private advisory remediation fork only; do not publish before coordinated disclosure",
+  "visibility": "Release audit; disclose with coordinated security release 0.18.0",
   "advisory": "GHSA-vjj5-mgj6-4cwm",
   "cve_id": null,
   "original_fix": "ecd56340b7dc5b6ffb303fc3e063d6568c1747d5",
   "release_baseline": "03fb9336b9c5e550867c5ee3c8ec8358ccc72255",
-  "private_pr": "https://github.com/Xero-Team/zpdf-ghsa-vjj5-mgj6-4cwm/pull/1",
+  "private_pr": "Historical remediation PR in the temporary advisory fork, PR #1",
   "auditor": "Codex; automated review, no human approval claimed",
-  "conclusion": "The original fix rejects the reported unauthorized-issuer chain. Two additional certificate-set boundary regressions failed against that fix and are corrected in this follow-up. Published users do not yet have a patched release.",
+  "conclusion": "The unauthorized-issuer vulnerability and two certificate-set boundary findings are fixed in the 0.18.0 release candidate. The candidate includes the main branch signer-selection fix. Actual registry availability is tracked on the security advisory.",
   "findings": [
     {
       "id": "F01-R1",
@@ -45,7 +45,9 @@
     "requirement": "Include the public SignerInfo.sid selection fix from PR #122 in the same release so trust verification starts from the actual CMS signer.",
     "tested_public_stack_base": "ef1363085e43417f91c22e85772ef05fb95e1d98",
     "test": "Combined issuer-constraint, certificate-set boundary and signer-selection regressions",
-    "result": "11 tests passed; combined with the public SID-selection fix"
+    "result": "Resolved merge matches the verified combined implementation; complete 0.18.0 workspace validation passed",
+    "release_version": "0.18.0",
+    "current_main": "f32e6d187de607de58d7b955f19b19be1db93318"
   },
   "version_evidence": {
     "introduced_commit": "d56233e",
@@ -123,13 +125,25 @@
       "ignored_test": "system_font_probe_latin_lines_on_a_chinese_page"
     },
     "format_and_whitespace": "cargo fmt --all --check and git diff --check passed",
-    "workspace_clippy_command": "cargo clippy --workspace --all-targets --offline --locked -- -D warnings"
+    "workspace_clippy_command": "cargo clippy --workspace --all-targets --offline --locked -- -D warnings",
+    "release_candidate": {
+      "version": "0.18.0",
+      "workspace_passed": 1614,
+      "workspace_failed": 0,
+      "workspace_ignored": 1,
+      "fmt": "passed",
+      "clippy_all_targets_warnings_denied": "passed",
+      "wasm_release": "passed",
+      "shipped_wasm_runtime_and_helper_tests": 10
+    }
   },
   "disclosure": {
-    "cve_request": "Optional; not submitted. Recommend considering a CVE because confirmed impact reaches published versions.",
-    "advisory_state": "Keep draft until coordinated release; do not close merely because a private fix exists.",
-    "patched_versions": "Do not name an unreleased version as an available patch.",
-    "release_artifacts": "Regenerate source-fingerprinted WASM artifacts when the release branch includes the verifier changes."
+    "advisory": "https://github.com/Xero-Team/zpdf/security/advisories/GHSA-vjj5-mgj6-4cwm",
+    "cve_request": "Maintainer reports submission; preserve GitHub assignment status without making a duplicate request",
+    "coordinated_release": "0.18.0",
+    "patched_versions": "Update the advisory after 0.18.0 is confirmed available on crates.io",
+    "public_release": "https://github.com/Xero-Team/zpdf/releases/tag/v0.18.0",
+    "release_artifacts": "Rebuild and verify JS/WASM and native packages for the release candidate"
   },
   "references": [
     "https://www.rfc-editor.org/rfc/rfc5280#section-4.2.1.3",

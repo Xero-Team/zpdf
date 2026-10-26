@@ -30,6 +30,37 @@ are feature-gated.
 
 ## The rendering pipeline
 
+For complete page semantics, prefer `interpret_page(&doc, index,
+PageInterpretOptions::default())`. It returns the display list and owned
+font/image caches with annotations, default layer visibility, output intents,
+rotation and document limits already applied. Use `interpret_page_with_cache`
+to reuse an `IccCache` across pages. Low-level `ContentInterpreter` construction
+remains available for standalone streams or intentionally customized semantics.
+
+`InterpretedPage::is_complete()` and `stats.diagnostics` report known omissions
+and truncation. `convert_pdf` retains surviving content with diagnostics on each
+`ConvertedPage`; `ConvertedDocument::ensure_complete()` rejects partial output.
+For publication/export, check completion before writing files:
+
+```rust
+let page = zpdf::interpret_page(&doc, 0, Default::default())?;
+page.ensure_complete()?;
+// Render/export page.display_list with page.fonts and page.images.
+```
+
+Diagnostics have bounded counters for decode failures, missing resources,
+unsupported features and malformed content, plus resource/time-limit flags.
+They retain the first affected page/object when known and expose `to_json()`
+for machine-readable reports without a serialization dependency.
+They describe known loss, not full PDF conformance or visual fidelity. Low-level
+callers can use `ContentInterpreter::interpret_with_stats` and inspect
+`stats.diagnostics`. `PdfDocument::page_content_bytes` now rejects skipped
+streams; `page_content_with_diagnostics` explicitly returns surviving bytes.
+The CLI rejects known partial output with a nonzero exit status and diagnostic
+counts; text-only conversion intentionally omits images without marking that as
+an error. Exhaustive error matches and literal `PdfPage`/`ConvertedPage`
+construction must account for the new fields/variants.
+
 ```
 PDF bytes ─▶ PdfDocument ─▶ PdfPage ─▶ ContentInterpreter ─▶ DisplayList ─▶ RenderBackend ─▶ pixels
             (parse/xref)   (page tree)  (operator interp.)   (flat commands)  (cpu | gpu)
@@ -184,11 +215,36 @@ let obj = doc.file().resolve(zpdf::ObjectId(4, 0))?;          // a PdfObject
 let stream = doc.file().resolve_stream_data(zpdf::ObjectId(7, 0))?; // decoded bytes
 ```
 
-Encrypted documents (RC4 and AES-128/256, empty user password) open and decrypt
-transparently in `PdfDocument::open`; password-protected files degrade to a
-warning and render blank.
+Encrypted documents with an empty user password open and decrypt transparently
+in `PdfDocument::open`. Other protected documents return `PasswordRequired`;
+use `open_with_password` to authenticate. Incorrect passwords return
+`WrongPassword`, and unsupported encryption returns `UnsupportedEncryption`.
 
 ## Writing PDFs
+
+Incremental writer page operations use stable editing indices. Original pages
+keep their original indices after deletion or reordering; appended pages receive
+new indices. Use `writer.page_indices()` for the current order,
+`writer.page_count()` for the surviving count, and `writer.page_index_at(position)`
+to translate a current page position. Repeated deletion of a stable index is a
+no-op. The read-only `writer.document()` remains the original snapshot. WASM's
+`PdfEditor` translates its page arguments from current positions automatically.
+`append_pages` and `extract_pages` require distinct source indices; repeated
+indices return an error before changing the writer's page tree.
+
+`extract_pages` preserves the AcroForm branches owning Widgets on selected
+pages, including inherited field attributes and default appearance resources.
+Widgets belonging only to excluded pages are removed. Document-wide XFA
+packets and calculation-order arrays are not copied into an extracted subset.
+
+For Unicode form filling and stamps, register suitable TTF/OTF faces with a
+`FontProvider` and call `writer.set_font_provider(Arc::new(provider))`.
+The output embeds subset fonts and ToUnicode mappings. A memory-only provider
+is deterministic; without an explicit provider, native authoring attempts
+installed substitutes. Missing coverage returns an error before changing PDF
+objects. This scalar text path does not add shaping or bidi layout.
+Filling selected fields preserves the stored appearances of untouched widgets,
+including their embedded fonts and custom artwork.
 
 The `zpdf-writer` crate (re-exported through the facade) covers three writing
 models:

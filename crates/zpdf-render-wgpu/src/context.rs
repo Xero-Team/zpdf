@@ -21,15 +21,30 @@ pub const STENCIL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Stencil8;
 /// and dropping separate instances concurrently can race in the system Vulkan
 /// loader (observed in vkCreateDevice/dlclose on Linux software adapters).
 /// Devices, queues and render resources still belong to each GpuContext.
-fn headless_instance() -> wgpu::Instance {
+fn headless_instance(gl_fallback: bool) -> wgpu::Instance {
     #[cfg(not(target_arch = "wasm32"))]
     {
-        static INSTANCE: std::sync::OnceLock<wgpu::Instance> = std::sync::OnceLock::new();
-        INSTANCE.get_or_init(wgpu::Instance::default).clone()
+        static PRIMARY: std::sync::OnceLock<wgpu::Instance> = std::sync::OnceLock::new();
+        static GL: std::sync::OnceLock<wgpu::Instance> = std::sync::OnceLock::new();
+        let slot = if gl_fallback { &GL } else { &PRIMARY };
+        slot.get_or_init(|| {
+            let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+            // Enumerating GLES can make its EGL context current even when a
+            // Vulkan adapter wins. Concurrent headless requests then panic with
+            // EGL_BAD_ACCESS on some desktop drivers. Try native backends first.
+            descriptor.backends = if gl_fallback {
+                wgpu::Backends::GL
+            } else {
+                wgpu::Backends::PRIMARY
+            };
+            wgpu::Instance::new(descriptor.with_env())
+        })
+        .clone()
     }
     // Browser handles are not Send + Sync and cannot live in a native static.
     #[cfg(target_arch = "wasm32")]
     {
+        let _ = gl_fallback;
         wgpu::Instance::default()
     }
 }
@@ -152,22 +167,31 @@ impl GpuContext {
     }
 
     async fn new_headless_async(force_fallback: bool) -> Result<Self, WgpuRenderError> {
-        let instance = headless_instance();
-
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                force_fallback_adapter: force_fallback,
-                compatible_surface: None,
-                // wgpu 30: limit bucketing maps the adapter's limits into a small
-                // set of predefined buckets, intended to resist fingerprinting in
-                // browsers that expose wgpu to untrusted content. We want the real
-                // adapter limits (e.g. max_texture_dimension_2d, raised below), so
-                // leave this off — zpdf is not an untrusted-content host.
-                apply_limit_buckets: false,
-            })
-            .await
-            .map_err(|_| WgpuRenderError::NoAdapter)?;
+        let mut instance = headless_instance(false);
+        let options = wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            force_fallback_adapter: force_fallback,
+            compatible_surface: None,
+            // wgpu 30: limit bucketing maps the adapter's limits into a small
+            // set of predefined buckets, intended to resist fingerprinting in
+            // browsers that expose wgpu to untrusted content. We want the real
+            // adapter limits (e.g. max_texture_dimension_2d, raised below), so
+            // leave this off — zpdf is not an untrusted-content host.
+            apply_limit_buckets: false,
+        };
+        let adapter = match instance.request_adapter(&options).await {
+            Ok(adapter) => adapter,
+            Err(_) if !cfg!(target_arch = "wasm32") && wgpu::Backends::from_env().is_none() => {
+                // Keep older GLES-only machines working, and respect explicit
+                // WGPU_BACKEND choices instead of silently overriding them.
+                instance = headless_instance(true);
+                instance
+                    .request_adapter(&options)
+                    .await
+                    .map_err(|_| WgpuRenderError::NoAdapter)?
+            }
+            Err(_) => return Err(WgpuRenderError::NoAdapter),
+        };
 
         // Raise the texture-dimension cap from the downlevel default (2048) to the
         // adapter maximum so large pages / high-DPI images don't trip a validation

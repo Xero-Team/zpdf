@@ -2,6 +2,12 @@
 
 WebAssembly bindings for zpdf, exposing the read pipeline (parse, render, text extraction, SVG export) to JavaScript in the browser or Node.
 
+Before filling Unicode fields or adding Unicode text stamps, call
+`editor.register_font(fontBytes, faceIndex)` on the `PdfEditor`. Register
+additional faces for fallback coverage. The saved PDF embeds the selected
+subset fonts; unavailable characters cause an error rather than substitution
+with question marks.
+
 Pure Rust with zero C dependencies — no pdfium, no MuPDF, no `poppler` — makes this build feasible on `wasm32-unknown-unknown` where native-library ports would struggle. The CPU backend's tiny-skia rasterizer and the SVG exporter's direct DisplayList translation run entirely in your browser; no uploads, no server round-trips.
 
 ## Build
@@ -15,6 +21,15 @@ bash crates/zpdf-wasm/build-web.sh
 ```
 
 This compiles for wasm32 and generates ES-module bindings into `www/pkg/`.
+Node.js is also required: the build records source/artifact fingerprints in
+`www/pkg/build.json` and runs the packaged JS/WASM smoke tests. Commit all three
+generated files together. CI checks the fingerprint and exercises reading,
+font registration, Unicode editing, extraction and optimization against the
+shipped binary. For a package-only check, run:
+
+```bash
+node --test crates/zpdf-wasm/www/package.test.mjs
+```
 
 ## Demo
 
@@ -75,6 +90,7 @@ const fast = optimize(bytes, (() => { const o = new OptimizeOptions(); o.lineari
 ```
 
 `PdfEditor` methods: `rotate_page`, `delete_pages`, `reorder_pages`,
+`register_font`,
 `set_title/author/subject/keywords/creator/producer` (`Some` sets, `null`
 deletes, not calling leaves unchanged), `stamp_text`, `stamp_image_rgba`,
 `add_highlight/underline/strikeout/squiggly`, `add_note`, `add_freetext`,
@@ -108,4 +124,8 @@ const bitmap = pdf.render_page(0, 2);
 
 ## Size
 
-The release `.wasm` is ~2.8 MiB before gzip (includes font subsetting, color management, all of zpdf-parser/document/content/render-cpu/svg-export, plus signature crypto). Typical gzip transfer is ~900 KiB. For production, disable unused crate features and run `wasm-opt` for another 10–15% win.
+The currently shipped release `.wasm` is about 6.41 MiB before gzip and 2.59 MiB
+with gzip. It includes the reader, editor, font embedding, color management,
+CPU rendering, SVG export and signature crypto. `www/pkg/build.json` records
+the compiler/binding versions and hashes for the shipped build; size varies
+with the enabled functionality and toolchain.

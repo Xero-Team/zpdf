@@ -104,10 +104,22 @@ pub fn verify_certificate_chain(
         return ChainStatus::Unsupported("certificates could not be parsed".into());
     };
 
-    // The leaf is the first certificate (the same convention the signature
-    // verifier uses for the signer key).
-    let mut chain: Vec<&CertInfo> = vec![&parsed[0]];
-    let mut names = vec![parsed[0].subject_cn.clone().unwrap_or_default()];
+    let Some(signer) = crate::signature::signer_certificate(cms_blob) else {
+        return ChainStatus::Unsupported(
+            "SignerInfo.sid has no unique matching certificate".into(),
+        );
+    };
+    let Some(selected) = CertInfo::parse(signer) else {
+        return ChainStatus::Unsupported("signer certificate could not be parsed".into());
+    };
+    let Some(index) = parsed
+        .iter()
+        .position(|cert| cert.tbs_raw == selected.tbs_raw)
+    else {
+        return ChainStatus::Unsupported("signer certificate exceeds certificate limit".into());
+    };
+    let mut chain: Vec<&CertInfo> = vec![&parsed[index]];
+    let mut names = vec![parsed[index].subject_cn.clone().unwrap_or_default()];
 
     const MAX_CHAIN: usize = 16;
     loop {

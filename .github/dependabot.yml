@@ -13,6 +13,19 @@ updates:
       - dependencies
     commit-message:
       prefix: chore(deps)
+    ignore:
+      # RSA 0.9 uses digest 0.10. Keep its sha2 0.10 consumers compatible;
+      # workspace sha2 0.11 still receives compatible patch updates. For 0.x
+      # crates, Dependabot calls a breaking 0.10 -> 0.11 bump a minor update.
+      - dependency-name: sha2
+        update-types:
+          - version-update:semver-major
+          - version-update:semver-minor
+      # GPUI's async-tar -> xattr 0.2.3 still uses Linux libc::ENOATTR.
+      # Remove together with the viewer pin once that chain is upgraded.
+      - dependency-name: libc
+        versions:
+          - ">=0.2.190"
     groups:
       cargo-minor-and-patch:
         patterns:

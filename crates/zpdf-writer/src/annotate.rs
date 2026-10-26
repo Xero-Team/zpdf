@@ -1,11 +1,9 @@
 //! Annotation authoring: add markup and note annotations to pages.
 //!
 //! Writes spec-conformant annotation dictionaries (ISO 32000-1 §12.5.6)
-//! **without** `/AP` streams — zpdf's own renderer (and Acrobat, per the
-//! spec's "shall generate an appearance" rule) synthesizes the appearance
-//! from the geometry properties via `annot_appearance.rs`, so the authored
-//! annotations render identically on both backends with zero new render
-//! code. `/InkList` annotations (which carry an `/AP`) go through the
+//! with stored `/AP` streams synthesized from geometry and text properties,
+//! so consumers display edits without regenerating appearances themselves.
+//! `/InkList` annotations can also go through the
 //! existing [`crate::IncrementalWriter::add_ink_annotation_to_page`].
 //!
 //! All coordinates are PDF user space (origin bottom-left, y-up).
@@ -131,66 +129,7 @@ impl IncrementalWriter {
         let page_id = self.page_id(page_index)?;
         self.ensure_object_capacity(2)?;
 
-        // Synthesize the appearance from the finished dict. `None` (e.g. a
-        // degenerate rect) simply leaves the annotation without /AP.
-        let appearance = subtype_name(&dict).and_then(|subtype| {
-            let rect = rect_from_dict(&dict)?;
-            zpdf_document::annot_appearance::generate_annotation_appearance(
-                self.document().file(),
-                &dict,
-                &subtype,
-                rect,
-            )
-        });
-
-        if let Some(ap) = appearance {
-            let mut form = PdfDict::new();
-            form.insert(
-                PdfName::new("Type"),
-                PdfObject::Name(PdfName::new("XObject")),
-            );
-            form.insert(
-                PdfName::new("Subtype"),
-                PdfObject::Name(PdfName::new("Form")),
-            );
-            form.insert(PdfName::new("FormType"), PdfObject::Integer(1));
-            form.insert(
-                PdfName::new("BBox"),
-                PdfObject::Array(vec![
-                    PdfObject::Real(ap.bbox.x0),
-                    PdfObject::Real(ap.bbox.y0),
-                    PdfObject::Real(ap.bbox.x1),
-                    PdfObject::Real(ap.bbox.y1),
-                ]),
-            );
-            let m = ap.matrix;
-            if m != zpdf_core::Matrix::identity() {
-                form.insert(
-                    PdfName::new("Matrix"),
-                    PdfObject::Array(vec![
-                        PdfObject::Real(m.a),
-                        PdfObject::Real(m.b),
-                        PdfObject::Real(m.c),
-                        PdfObject::Real(m.d),
-                        PdfObject::Real(m.e),
-                        PdfObject::Real(m.f),
-                    ]),
-                );
-            }
-            if !ap.resources.0.is_empty() {
-                form.insert(
-                    PdfName::new("Resources"),
-                    PdfObject::Dict(ap.resources.clone()),
-                );
-            }
-            let (ap_num, ap_gen) = self.try_add_stream(&form, &ap.content)?;
-            let mut ap_dict = PdfDict::new();
-            ap_dict.insert(
-                PdfName::new("N"),
-                PdfObject::Ref(ObjectId(ap_num, ap_gen as u16)),
-            );
-            dict.insert(PdfName::new("AP"), PdfObject::Dict(ap_dict));
-        }
+        self.regenerate_annotation_appearance(&mut dict, 1)?;
 
         let (num, gen) = self.try_add_object(&PdfObject::Dict(dict))?;
         let annot_id = ObjectId(num, gen as u16);
@@ -213,16 +152,8 @@ impl IncrementalWriter {
     }
 }
 
-/// The `/Subtype` name of a finished annotation dict.
-fn subtype_name(dict: &PdfDict) -> Option<String> {
-    match dict.get("Subtype") {
-        Some(PdfObject::Name(n)) => Some(n.as_str().to_string()),
-        _ => None,
-    }
-}
-
 /// The `/Rect` of a finished annotation dict.
-fn rect_from_dict(dict: &PdfDict) -> Option<Rect> {
+pub(crate) fn rect_from_dict(dict: &PdfDict) -> Option<Rect> {
     match dict.get("Rect") {
         Some(PdfObject::Array(a)) if a.len() == 4 => {
             let mut v = [0.0f64; 4];

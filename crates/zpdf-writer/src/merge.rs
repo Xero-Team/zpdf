@@ -10,13 +10,14 @@
 //! during the copy precisely so the copier does not chase the whole source
 //! tree), so anything inherited would otherwise be lost.
 //!
-//! Limitations: tagged-PDF structure trees and name trees of the appended
-//! files are not merged. Outlines, AcroForm fields (with collision renaming)
+//! Local named destinations in links and outlines become explicit destinations.
+//! Tagged-PDF structure trees and other name trees of the appended files are
+//! not merged. Outlines, AcroForm fields (with collision renaming)
 //! and OCG configurations are — see [`IncrementalWriter::append_document`].
 
 use std::collections::HashSet;
 
-use zpdf_core::{ObjectId, PdfDict, PdfName, PdfObject, PdfString, Result};
+use zpdf_core::{ObjectId, PdfDict, PdfName, PdfObject, Result};
 use zpdf_parser::PdfFile;
 
 use crate::copier::ObjectIdMap;
@@ -59,27 +60,12 @@ pub fn extract_pages(source: &PdfFile, page_indices: &[usize]) -> Result<Vec<u8>
         return Err(invalid_data("no pages selected").into());
     }
     let mut writer = IncrementalWriter::new(stub_pdf())?;
-    writer.append_pages(source, page_indices)?;
+    let mut id_map = writer.append_pages_mapped(source, page_indices)?;
+    let page_ids = source_page_ids(source)?;
+    let selected: Vec<ObjectId> = page_indices.iter().map(|&index| page_ids[index]).collect();
+    crate::extract_forms::copy_selected_form(&mut writer, source, &selected, &mut id_map)?;
 
-    // Drop the stub's placeholder page (object 3 0) from the root /Kids.
-    // delete_pages can't be used here: its "don't delete every page" guard
-    // works off the parse-time page count, which is 1 for the stub.
-    let root = ObjectId(2, 0);
-    let mut root_dict = writer.resolve_current(root)?.as_dict()?.clone();
-    let kids = match root_dict.get("Kids") {
-        Some(PdfObject::Array(a)) => a.clone(),
-        _ => return Err(invalid_data("stub root /Kids missing").into()),
-    };
-    let filtered: Vec<PdfObject> = kids
-        .into_iter()
-        .filter(|k| !matches!(k, PdfObject::Ref(r) if *r == ObjectId(3, 0)))
-        .collect();
-    root_dict.insert(
-        PdfName::new("Count"),
-        PdfObject::Integer(filtered.len() as i64),
-    );
-    root_dict.insert(PdfName::new("Kids"), PdfObject::Array(filtered));
-    writer.overwrite_object(root, PdfObject::Dict(root_dict));
+    writer.delete_pages(&[0])?;
 
     let mut out = std::io::Cursor::new(Vec::new());
     writer.write(&mut out)?;
@@ -110,7 +96,8 @@ impl IncrementalWriter {
         Ok(count)
     }
 
-    /// Append the given 0-based pages of `source`, in the given order.
+    /// Append the given distinct 0-based pages of `source`, in the given order.
+    /// Duplicate indices are rejected before modifying the writer.
     pub fn append_pages(&mut self, source: &PdfFile, page_indices: &[usize]) -> Result<()> {
         self.append_pages_mapped(source, page_indices)?;
         Ok(())
@@ -139,6 +126,13 @@ impl IncrementalWriter {
             }
         }
 
+        if page_indices.iter().copied().collect::<HashSet<_>>().len() != page_indices.len() {
+            // Reusing one source->destination map would put the same leaf into
+            // /Kids twice. Stable editing indices must identify distinct pages.
+            return Err(invalid_data("source page indices must be distinct").into());
+        }
+
+        id_map.prepare_named_dests(source, &src_pages);
         let root = self.root_pages_id_pub()?;
         // One id-map per source document: pages sharing fonts/images copy the
         // shared objects once.
@@ -192,6 +186,9 @@ impl IncrementalWriter {
             PdfObject::Integer(old_count + new_kids.len() as i64),
         );
         self.overwrite_object(root, PdfObject::Dict(root_dict));
+        let first = self.page_slots.len();
+        self.page_slots.extend(new_kids.iter().copied().map(Some));
+        self.page_order.extend(first..self.page_slots.len());
         Ok(id_map)
     }
 
@@ -389,7 +386,7 @@ impl IncrementalWriter {
                 if let Ok(obj) = self.resolve_current(*r) {
                     if let Ok(d) = obj.as_dict() {
                         if let Some(PdfObject::String(s)) = d.get("T") {
-                            names.insert(String::from_utf8_lossy(&s.0).into_owned());
+                            names.insert(zpdf_core::decode_text_string(s.as_bytes()));
                         }
                     }
                 }
@@ -416,7 +413,7 @@ impl IncrementalWriter {
             // Collision rename on the copied field's /T.
             let mut dict = self.resolve_current(dest_field)?.as_dict()?.clone();
             if let Some(PdfObject::String(s)) = dict.get("T") {
-                let base = String::from_utf8_lossy(&s.0).into_owned();
+                let base = zpdf_core::decode_text_string(s.as_bytes());
                 if names.contains(&base) {
                     let mut n = 2usize;
                     let renamed = loop {
@@ -428,7 +425,7 @@ impl IncrementalWriter {
                     };
                     dict.insert(
                         PdfName::new("T"),
-                        PdfObject::String(PdfString(renamed.clone().into_bytes())),
+                        PdfObject::String(zpdf_core::encode_text_string(&renamed)),
                     );
                     self.overwrite_object(dest_field, PdfObject::Dict(dict));
                     names.insert(renamed);
@@ -608,10 +605,12 @@ fn copy_patched_page(
     // Wrap the patched dict in a temporary object and remap it through the
     // copier by copying each referenced value. Reserve the page's own number
     // first so self-references resolve.
-    if let Some(dest) = id_map.get(src_page) {
-        return Ok(dest);
-    }
-    let dest = crate::copier::reserve(writer, src_page, id_map)?;
+    // A link from an earlier page may already have copied this page. Still
+    // write the materialized leaf, including its inherited resources/boxes.
+    let dest = match id_map.get(src_page) {
+        Some(dest) => dest,
+        None => crate::copier::reserve(writer, src_page, id_map)?,
+    };
     let remapped = crate::copier::remap_via_copy(
         &PdfObject::Dict(leaf.clone()),
         source,

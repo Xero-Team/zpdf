@@ -2,11 +2,115 @@
 
 ## Unreleased
 
-- Validate certificate issuer CA status, key usage, path length and critical
-  extensions before reporting a PDF signature chain as trusted. Reject
-  malformed validity periods when time validation is requested.
+## 0.18.0 — Signature trust hardening and audited PDF workflows
+
+Released 2026-10-26.
+
+### Security
+
+- Fix certificate-chain trust validation in `zpdf-document`: require issuer CA
+  authorization and certificate-signing key usage, enforce path-length limits,
+  and reject malformed or unsupported critical constraints. The issue affects
+  published versions 0.11.0 through 0.17.0. Upgrade to 0.18.0.
+  ([GHSA-vjj5-mgj6-4cwm](https://github.com/Xero-Team/zpdf/security/advisories/GHSA-vjj5-mgj6-4cwm))
 - Reject malformed, unsupported or oversized CMS certificate sets instead of
-  reporting trust after checking only a parsed prefix of the set.
+  assessing only a parsed prefix. Preserve explicit signer pins and bounded
+  certificate/extension traversal. Include the SignerInfo.sid selection fix so
+  chain and cryptographic verification use the same actual signer certificate.
+
+### Audited fixes and APIs
+
+- Decode current indirect Filter/DecodeParms/DP and JBIG2Globals for content
+  edits, enforce encoded-stream limits, charge separators only between streams,
+  and reject undecodable source content before stamping. (#88)
+- Prefer native GPU backends during headless initialization; probe GLES only
+  when no native adapter is available and honor `WGPU_BACKEND`. Avoid EGL
+  context races when independent renderers request adapters concurrently.
+- Preserve untouched form appearances during partial fills, reject duplicate
+  source pages before appending/extracting, and reject annotation regeneration
+  when required geometry is damaged. (#87, #89, #94, #101)
+- Keep disabled layers out of CLI text/search/table extraction. Use the shared
+  page pipeline for desktop previews, including annotations, physical UserUnit
+  dimensions and incomplete-output rejection. (#92, #96, #104)
+- Exclude soft-mask text and ActualText from logical extraction; report malformed
+  visible XObjects while skipping resource lookup in hidden draws. (#100, #104)
+- Include embedded data outside Rust source directories in the shipped WASM
+  fingerprint, and retain intentional sha2/libc compatibility constraints in
+  automated dependency updates. (#105)
+
+- Rebuild the shipped WASM/JS package with current editing and font APIs; add
+  source/artifact fingerprints and real packaged-runtime smoke tests in CI. (#105)
+
+- Expose bounded processing diagnostics for partial page decoding, interpretation
+  and conversion. Report resource/time limits, missing resources, unsupported
+  operations and malformed tokens. CLI/WASM exports reject known partial output;
+  library callers can inspect surviving content or require completion. (#104)
+
+- Select CMS signer certificates by issuer/serial or subject key identifier,
+  independent of certificate order. Use that certificate for crypto, identity,
+  chain and offline CRL checks; reject missing or ambiguous matches. (#103)
+
+- Fail opening encrypted PDFs when authentication is missing, incorrect or
+  unverifiable. Add PasswordRequired/UnsupportedEncryption errors, retain valid
+  empty-password opening, and reject unknown security/crypt filters. (#102)
+
+- Rebuild stored annotation appearances after color, border and FreeText edits,
+  including embedded Unicode text. Move geometry with rectangles so subsequent
+  edits keep their location; reject unsupported custom appearance edits. (#101)
+
+- Honor marked-content ActualText during extraction, including property
+  resources, nested/empty replacements, forms and optional content. Bound
+  replacement text and isolate painting resources from extraction. (#100)
+
+- Share exact PDFDocEncoding and BOM-aware UTF-16BE/PDF 2.0 UTF-8 text-string
+  decoding. Encode metadata/form/annotation strings losslessly and preserve
+  Unicode field names when merging colliding forms. (#99)
+
+- Apply CalGray/CalRGB white point, gamma, matrix and relative black-point
+  compensation in vectors and images, including Indexed/tint bases. Share
+  calibrated conversion and bound indirect parameter resolution. (#98)
+
+- Render text modes 1/2/5/6 with actual glyph-outline strokes, separate fill
+  and stroke paints/alpha, graphics-state line styles and text clipping. (#97)
+
+- Honor page UserUnit in physical sizes, interpretation, CLI rendering/exports
+  and WASM. Raw page boxes/editing coordinates stay in default user space;
+  PdfPage gains user_unit and effective_box_points. (#96)
+
+- Resolve copied local named destinations to explicit page references when
+  merging or extracting pages, preserving links and bookmarks despite name
+  collisions. Keep inherited attributes on pages reached through links. (#95)
+
+- Embed registered or discovered Unicode fonts for text stamps and form
+  appearances, including multiline and comb fields. Missing coverage is an
+  error before PDF mutation. Add writer/editor font registration and CLI
+  fill/stamp --font-file. (#94)
+
+- Reject invalid redaction page numbers, coordinates, missing output paths and
+  unknown arguments before creating an output file. (#93)
+
+- Add a shared high-level page interpretation API and use it for CLI raster,
+  SVG/PPTX export and WASM rendering, keeping annotations, default layers and
+  output intents consistent across these entry points. (#92)
+
+- Apply text transforms, scaled font sizes and basic font styles in PPTX
+  export; preserve text/image rotation and reflection with a new
+  SlideElement::Transformed variant (exhaustive matches need updating).
+  Emit valid run property nesting. (#91)
+
+- Preserve selected AcroForm field branches, Widget parent links, values and
+  default font resources when splitting or extracting pages. (#90)
+
+- Track surviving page identities across repeated deletions, reordering and
+  appending. Expose current page count/order and map WASM page positions to
+  stable writer indices. (#89)
+
+- Preserve indirect content arrays and pending stream edits when stamping or
+  redacting pages; abort on undecodable content instead of replacing it with
+  an empty stream. (#88)
+
+- Preserve filled values and clear stale choice indices when an AcroForm field
+  shares its dictionary with its Widget annotation. (#87)
 
 ## 0.17.0 — Decoder hardening, writer fixes and export fidelity
 
