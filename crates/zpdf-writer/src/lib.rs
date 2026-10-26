@@ -39,6 +39,7 @@ use serialize::{serialize_dict, write_object, write_stream};
 pub mod annotate;
 pub mod builder;
 mod cff;
+mod contents;
 pub mod copier;
 pub mod encrypt;
 pub mod forms;
