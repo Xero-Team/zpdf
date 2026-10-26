@@ -71,6 +71,7 @@ impl IncrementalWriter {
         let page_obj = self.resolve_current(page_id)?;
         let page_dict = page_obj.as_dict()?.clone();
         let orig_contents = self.current_content_refs(&page_dict)?;
+        self.current_content_bytes(&orig_contents)?;
 
         // Resolve inherited page data and choose the resource name before
         // adding streams. All document/input errors therefore leave the
