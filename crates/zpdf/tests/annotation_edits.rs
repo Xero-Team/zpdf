@@ -81,6 +81,36 @@ fn moved_line_stays_moved_when_its_appearance_is_regenerated() {
 }
 
 #[test]
+fn malformed_geometry_does_not_erase_a_stored_appearance() {
+    let mut writer = IncrementalWriter::new(blank()).unwrap();
+    let id = writer
+        .add_annotation(
+            0,
+            &AnnotationSpec::Line {
+                x1: 10.0,
+                y1: 10.0,
+                x2: 50.0,
+                y2: 50.0,
+                color: (1.0, 0.0, 0.0),
+                width: 4.0,
+            },
+        )
+        .unwrap();
+    let mut dict = writer
+        .resolve_current(id)
+        .unwrap()
+        .as_dict()
+        .unwrap()
+        .clone();
+    dict.0.remove("L");
+    writer.overwrite_object(id, zpdf::PdfObject::Dict(dict));
+    let before = save(&writer);
+    assert!(writer.update_annotation_color(id, (0.0, 1.0, 0.0)).is_err());
+    assert_eq!(save(&writer), before);
+    assert_eq!(render(save(&writer))(30, 30), [255, 0, 0, 255]);
+}
+
+#[test]
 fn freetext_replacement_embeds_unicode_and_rejects_missing_coverage_without_mutation() {
     let mut writer = IncrementalWriter::new(blank()).unwrap();
     let id = writer

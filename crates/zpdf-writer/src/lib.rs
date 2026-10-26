@@ -1043,34 +1043,28 @@ mod tests {
 
     /// Create a minimal test PDF with one annotation for testing
     fn create_test_pdf_with_annotation() -> Vec<u8> {
-        // Minimal PDF with one page and one ink annotation
-        let pdf = b"%PDF-1.4
-1 0 obj
-<< /Type /Catalog /Pages 2 0 R >>
-endobj
-2 0 obj
-<< /Type /Pages /Kids [3 0 R] /Count 1 >>
-endobj
-3 0 obj
-<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [4 0 R] >>
-endobj
-4 0 obj
-<< /Type /Annot /Subtype /Ink /Rect [100 100 200 200] /C [0 0 0] /InkList [[[100 100 200 200]]] /BS << /W 2 >> >>
-endobj
-xref
-0 5
-0000000000 65535 f
-0000000009 00000 n
-0000000058 00000 n
-0000000115 00000 n
-0000000223 00000 n
-trailer
-<< /Size 5 /Root 1 0 R >>
-startxref
-362
-%%EOF
-";
-        pdf.to_vec()
+        // One stroke is an array of coordinate pairs, nested once in /InkList.
+        let objects = [
+            "<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [4 0 R] >>",
+            "<< /Type /Annot /Subtype /Ink /Rect [100 100 200 200] /C [0 0 0] /InkList [[100 100 200 200]] /BS << /W 2 >> >>",
+        ];
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        for (index, object) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.extend_from_slice(format!("{} 0 obj\n{object}\nendobj\n", index + 1).as_bytes());
+        }
+        let xref = pdf.len();
+        pdf.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n");
+        for offset in offsets {
+            pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+        );
+        pdf
     }
 
     #[test]

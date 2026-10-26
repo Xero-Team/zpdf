@@ -43,6 +43,23 @@ fn stream_obj(dict_str: &str, content: &[u8]) -> Vec<u8> {
 
 const HELV: &str = "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>";
 
+#[test]
+fn soft_mask_text_and_actual_text_are_paint_resources_only() {
+    let pdf = assemble(&[
+        dict("<< /Type /Catalog /Pages 2 0 R >>"),
+        dict("<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+        dict("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R /Resources << /Font << /F0 5 0 R >> /ExtGState << /Mask 6 0 R >> >> >>"),
+        stream_obj("", b"/Mask gs BT /F0 12 Tf 10 50 Td (VISIBLE) Tj ET"),
+        dict(HELV),
+        dict("<< /SMask << /S /Alpha /G 7 0 R >> >>"),
+        stream_obj("/Type /XObject /Subtype /Form /BBox [0 0 200 200] /Group << /S /Transparency >> /Resources << /Font << /F0 5 0 R >> >>",
+            b"BT /F0 12 Tf 10 100 Td (MASK_ONLY) Tj /Span << /ActualText (MASK_REPLACEMENT) >> BDC (X) Tj EMC ET"),
+    ]);
+    let doc = PdfDocument::open(pdf).unwrap();
+    let converted = zpdf::convert_pdf(&doc, &[0], Default::default()).unwrap();
+    assert_eq!(converted.pages[0].text.trim(), "VISIBLE");
+}
+
 /// Run the interpreter over page `pi` with a text sink and return its spans.
 fn extract_spans(doc: &PdfDocument, pi: usize) -> Vec<TextSpan> {
     let page = doc.page(pi).expect("page");
