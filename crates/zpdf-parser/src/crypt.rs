@@ -48,15 +48,17 @@ enum Algo {
 
 /// Outcome of attempting to build a [`Decryptor`] for a document.
 pub enum BuildResult {
-    /// A usable decryptor (the password authenticated, or the empty-password
-    /// best-effort path was taken for an unvalidated RC4 document).
+    /// A usable decryptor after successful password authentication.
     Decryptor(Decryptor),
-    /// No decryption: an unsupported security handler, or a V5 document whose
-    /// empty password did not validate. The document opens undecrypted.
+    /// An unsupported security handler/version/filter. File opening must fail.
     Degrade,
     /// A non-empty password was supplied but authenticated as neither the user
     /// nor the owner password.
     WrongPassword,
+    /// The empty password failed authentication.
+    PasswordRequired,
+    /// Required authentication data is missing or malformed.
+    InvalidEncryption(&'static str),
 }
 
 /// A built Standard-security-handler decryptor for one file.
@@ -89,9 +91,8 @@ impl Decryptor {
     ///
     /// The password is authenticated against `/U` (user) and `/O` (owner). A
     /// non-empty password that matches neither yields [`BuildResult::WrongPassword`].
-    /// The empty-password default preserves the lenient behavior: an RC4 document
-    /// whose `/U` does not validate still opens (best-effort, with a warning),
-    /// since malformed-but-empty-password files are common.
+    /// A failed empty password yields [`BuildResult::PasswordRequired`]. No
+    /// unverified key is used to open an encrypted document.
     pub fn from_encrypt_dict(
         dict: &PdfDict,
         id_first: &[u8],
@@ -108,6 +109,35 @@ impl Decryptor {
 
         let v = dict.get_i64("V").unwrap_or(0);
         let r = dict.get_i64("R").unwrap_or(0);
+        if !matches!((v, r), (1, 2) | (2, 2..=3) | (4, 4) | (5, 5..=6)) {
+            return BuildResult::Degrade;
+        }
+        if v >= 4 {
+            let cf = dict.get_dict("CF").ok();
+            for name in [
+                dict.get_name("StmF").unwrap_or("Identity"),
+                dict.get_name("StrF").unwrap_or("Identity"),
+                dict.get_name("EFF")
+                    .unwrap_or(dict.get_name("StmF").unwrap_or("Identity")),
+            ] {
+                if name != "Identity" && cf.and_then(|d| d.get_dict(name).ok()).is_none() {
+                    return BuildResult::InvalidEncryption("missing selected crypt filter");
+                }
+            }
+            if let Some(cf) = cf {
+                for value in cf.0.values() {
+                    let Ok(filter) = value.as_dict() else {
+                        return BuildResult::InvalidEncryption("invalid crypt filter dictionary");
+                    };
+                    if !matches!(
+                        (v, filter.get_name("CFM").unwrap_or("None")),
+                        (_, "None") | (4, "V2" | "AESV2") | (5, "AESV3")
+                    ) {
+                        return BuildResult::Degrade;
+                    }
+                }
+            }
+        }
 
         // Per-class ciphers. V<4: one document-wide RC4 cipher for everything.
         // V4/V5: `/CF` crypt filters selected by `/StmF` (streams) and `/StrF`
@@ -139,17 +169,30 @@ impl Decryptor {
         };
 
         let key = if v >= 5 {
+            if string_bytes(dict, "O").len() < 48
+                || string_bytes(dict, "U").len() < 48
+                || (string_bytes(dict, "UE").len() != 32 && string_bytes(dict, "OE").len() != 32)
+            {
+                return BuildResult::InvalidEncryption(
+                    "missing or malformed AES-256 authentication data",
+                );
+            }
             // V5 (AESV3): ISO 32000-2 Algorithm 2.A. Validates the password and
             // recovers the 32-byte file key from /UE or /OE. No best-effort path —
             // the key can only come from a correct password.
             match compute_key_v5(dict, r, password) {
                 Some(k) => k,
-                None if password.is_empty() => return BuildResult::Degrade,
+                None if password.is_empty() => return BuildResult::PasswordRequired,
                 None => return BuildResult::WrongPassword,
             }
         } else {
             let o = string_bytes(dict, "O");
             let u = string_bytes(dict, "U");
+            if o.len() != 32 || u.len() < if r == 2 { 32 } else { 16 } {
+                return BuildResult::InvalidEncryption(
+                    "missing or malformed password authentication data",
+                );
+            }
             // /P is an integer bit-field, but some producers write it as a Real.
             let p = match dict.get("P") {
                 Some(PdfObject::Integer(n)) => *n as i32,
@@ -175,28 +218,8 @@ impl Decryptor {
                 encrypt_metadata,
             ) {
                 Ok(key) => key,
-                // Authentication failed. Refuse only when a non-empty password
-                // was supplied AND there was a /U to check it against — that is
-                // an unambiguously wrong password. Otherwise open best-effort
-                // with the derived key (the lenient empty-password default, or a
-                // malformed document with no /U), preserving prior behavior.
-                Err(_) if !password.is_empty() && !u.is_empty() => {
-                    return BuildResult::WrongPassword;
-                }
-                Err(best_effort_key) => {
-                    if u.is_empty() && !password.is_empty() {
-                        tracing::warn!(
-                            "encrypted document has no /U to authenticate the password against \
-                             (V={v} R={r}); proceeding with the supplied password unverified"
-                        );
-                    } else {
-                        tracing::warn!(
-                            "encryption key did not validate against /U (V={v} R={r}); the PDF \
-                             may require a password — decrypted content may be garbage"
-                        );
-                    }
-                    best_effort_key
-                }
+                Err(_) if password.is_empty() => return BuildResult::PasswordRequired,
+                Err(_) => return BuildResult::WrongPassword,
             }
         };
 
@@ -458,8 +481,7 @@ fn key_length_bits(dict: &PdfDict, v: i64) -> i64 {
 /// Validate the derived file key against `/U` (Algorithm 6).
 /// R2: `/U` == RC4(key, PAD) (Algorithm 4). R≥3: the first 16 bytes of `/U`
 /// match the Algorithm 5 computation. Returns `false` when `/U` is absent —
-/// there is nothing to authenticate against, which the caller handles as a
-/// best-effort open rather than a confirmed match.
+/// there is nothing to authenticate against, so opening must fail.
 fn validate_user_password(key: &[u8], u: &[u8], id_first: &[u8], r: i64) -> bool {
     if u.is_empty() {
         return false;
@@ -494,7 +516,7 @@ fn algo_for_filter(dict: &PdfDict, filter_name: &str) -> Algo {
         .ok()
         .and_then(|cf| cf.get_dict(filter_name).ok())
         .and_then(|f| f.get_name("CFM").ok())
-        .unwrap_or("V2");
+        .unwrap_or("None");
     match cfm {
         "AESV2" => Algo::AesV2,
         "AESV3" => Algo::AesV3,
@@ -524,9 +546,8 @@ fn rc4_key_len(r: i64, length_bits: i64) -> usize {
 
 /// Authenticate `password` for an RC4/AES-128 document: try it as the user
 /// password (Algorithm 6), then as the owner password (Algorithm 7, which
-/// recovers the user password from `/O`). `Ok(key)` is a validated key; `Err(key)`
-/// carries the user-password-derived key as a best-effort fallback (for the
-/// lenient empty-password open, or a malformed document with no `/U` to check).
+/// recovers the user password from `/O`). Only `Ok(key)` is authenticated;
+/// the error carries no usable decryption key.
 #[allow(clippy::too_many_arguments)]
 fn authenticate_rc4(
     password: &[u8],
@@ -537,7 +558,7 @@ fn authenticate_rc4(
     r: i64,
     length_bits: i64,
     encrypt_metadata: bool,
-) -> std::result::Result<Vec<u8>, Vec<u8>> {
+) -> std::result::Result<Vec<u8>, ()> {
     // User password (Algorithm 6).
     let key = compute_key_rc4(password, o, p, id_first, r, length_bits, encrypt_metadata);
     if validate_user_password(&key, u, id_first, r) {
@@ -550,7 +571,7 @@ fn authenticate_rc4(
     if validate_user_password(&owner_key, u, id_first, r) {
         return Ok(owner_key);
     }
-    Err(key)
+    Err(())
 }
 
 /// Algorithm 7: recover the (padded) user password from `/O` using the supplied
@@ -1000,6 +1021,20 @@ mod tests {
     use super::*;
     use zpdf_core::{PdfName, PdfStream};
 
+    fn add_empty_test_auth(dict: &mut PdfDict, bits: i64) {
+        let o = vec![0; 32];
+        let key = compute_key_rc4(b"", &o, 0, &[], 4, bits, true);
+        let mut u = rc4(&key, &md5(&PAD));
+        for i in 1u8..=19 {
+            let step: Vec<u8> = key.iter().map(|b| b ^ i).collect();
+            u = rc4(&step, &u);
+        }
+        u.extend_from_slice(&[0; 16]);
+        dict.insert(PdfName::new("O"), PdfObject::String(PdfString(o)));
+        dict.insert(PdfName::new("U"), PdfObject::String(PdfString(u)));
+        dict.insert(PdfName::new("P"), PdfObject::Integer(0));
+    }
+
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
     }
@@ -1272,6 +1307,7 @@ mod tests {
             PdfName::new("EFF"),
             PdfObject::Name(PdfName::new("Identity")),
         );
+        add_empty_test_auth(&mut dict, 128);
         let dec = match Decryptor::from_encrypt_dict(&dict, &[], None, b"") {
             BuildResult::Decryptor(d) => d,
             _ => panic!("decryptor"),
@@ -1409,6 +1445,14 @@ mod tests {
             dict.insert(PdfName::new("R"), PdfObject::Integer(4));
             dict.insert(PdfName::new("CF"), PdfObject::Dict(cf));
             dict.insert(PdfName::new("EFF"), PdfObject::Name(PdfName::new("StdCF")));
+            add_empty_test_auth(
+                &mut dict,
+                if cfm == "AESV2" {
+                    128
+                } else {
+                    length.unwrap_or(5) * 8
+                },
+            );
             match Decryptor::from_encrypt_dict(&dict, &[], None, b"") {
                 BuildResult::Decryptor(d) => d.key.len(),
                 _ => panic!("decryptor"),
@@ -1441,6 +1485,7 @@ mod tests {
         );
         dict.insert(PdfName::new("StrF"), PdfObject::Name(PdfName::new("StdCF")));
 
+        add_empty_test_auth(&mut dict, 128);
         let dec = match Decryptor::from_encrypt_dict(&dict, &[], None, b"") {
             BuildResult::Decryptor(d) => d,
             _ => panic!("decryptor"),
@@ -1759,32 +1804,46 @@ mod tests {
     }
 
     #[test]
-    fn empty_password_open_degrades_without_erroring() {
-        // The default open (empty password) must NOT error on a password-needing
-        // document — it opens best-effort, but the content does not decrypt to
-        // the plaintext.
-        let plain = b"BT (needs a password) Tj ET";
-        let pdf = build_rc4_password_pdf(b"secret", b"master", plain, false);
-        let file = crate::PdfFile::parse(pdf).expect("default open still succeeds");
-        assert!(file.is_encrypted());
-        assert_ne!(content_stream_bytes(&file), plain);
+    fn empty_password_open_requires_authentication() {
+        let pdf = build_rc4_password_pdf(b"secret", b"master", b"secret payload", false);
+        assert!(matches!(
+            crate::PdfFile::parse(pdf),
+            Err(Error::PasswordRequired)
+        ));
     }
 
     #[test]
-    fn missing_u_opens_best_effort_not_wrong_password() {
-        // A malformed document with no /U cannot be authenticated, so a supplied
-        // password is used unverified (best-effort) rather than reported wrong.
-        // The correct password still yields the right key and decrypts.
-        let plain = b"BT (no /U to check) Tj ET";
-        let pdf = build_rc4_password_pdf(b"secret", b"master", plain, true);
-        let file =
-            crate::PdfFile::parse_with_password(pdf, b"secret").expect("correct password opens");
-        assert_eq!(content_stream_bytes(&file), plain);
+    fn missing_authentication_data_is_an_error() {
+        for password in [b"secret".as_slice(), b"nope", b""] {
+            let pdf = build_rc4_password_pdf(b"secret", b"master", b"payload", true);
+            assert!(matches!(
+                crate::PdfFile::parse_with_password(pdf, password),
+                Err(Error::InvalidObject(_, _))
+            ));
+        }
+    }
 
-        // A wrong password also opens (garbage), but never WrongPassword.
-        let pdf = build_rc4_password_pdf(b"secret", b"master", plain, true);
-        let file = crate::PdfFile::parse_with_password(pdf, b"nope")
-            .expect("wrong password still opens best-effort (no /U to reject against)");
-        assert_ne!(content_stream_bytes(&file), plain);
+    #[test]
+    fn unsupported_handlers_fail_instead_of_opening_undecrypted() {
+        let pdf = build_rc4_password_pdf(b"secret", b"master", b"payload", false);
+        // /Encrypt is inline in the trailer, after the object offsets.
+        let mut modified = pdf;
+        let offset = modified.windows(9).position(|w| w == b"/Standard").unwrap();
+        modified[offset..offset + 9].copy_from_slice(b"/Unknown ");
+        assert!(matches!(
+            crate::PdfFile::parse(modified),
+            Err(Error::UnsupportedEncryption)
+        ));
+        let mut dict = PdfDict::new();
+        dict.insert(
+            PdfName::new("Filter"),
+            PdfObject::Name(PdfName::new("Standard")),
+        );
+        dict.insert(PdfName::new("V"), PdfObject::Integer(99));
+        dict.insert(PdfName::new("R"), PdfObject::Integer(99));
+        assert!(matches!(
+            Decryptor::from_encrypt_dict(&dict, &[], None, b""),
+            BuildResult::Degrade
+        ));
     }
 }

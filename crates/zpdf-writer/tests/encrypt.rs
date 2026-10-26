@@ -118,6 +118,36 @@ fn wrong_password_is_rejected() {
 }
 
 #[test]
+fn missing_password_is_distinct_from_wrong_password_for_all_written_ciphers() {
+    for config in [
+        EncryptionConfig::aes256("user", "owner"),
+        EncryptionConfig::rc4_128("user", "owner"),
+    ] {
+        let file = PdfFile::parse(source_pdf()).unwrap();
+        let encrypted = rewrite_pdf(
+            &file,
+            &RewriteOptions {
+                encrypt: Some(config),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            PdfDocument::open(encrypted.clone()),
+            Err(zpdf_core::Error::PasswordRequired)
+        ));
+        assert!(matches!(
+            PdfDocument::open_with_password(encrypted.clone(), b"wrong"),
+            Err(zpdf_core::Error::WrongPassword)
+        ));
+        for password in [b"user".as_slice(), b"owner"] {
+            let doc = PdfDocument::open_with_password(encrypted.clone(), password).unwrap();
+            assert!(page_content(&doc).contains("secret payload"));
+        }
+    }
+}
+
+#[test]
 fn decrypt_on_rewrite_still_works() {
     // Encrypt, then rewrite without encryption: output is decrypted again.
     let source = source_pdf();

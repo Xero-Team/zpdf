@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Fail opening encrypted PDFs when authentication is missing, incorrect or
+  unverifiable. Add PasswordRequired/UnsupportedEncryption errors, retain valid
+  empty-password opening, and reject unknown security/crypt filters. (#102)
+
 - Rebuild stored annotation appearances after color, border and FreeText edits,
   including embedded Unicode text. Move geometry with rectangles so subsequent
   edits keep their location; reject unsupported custom appearance edits. (#101)
