@@ -12,6 +12,7 @@
 //! the stack.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use zpdf_core::{ObjectId, PdfDict, PdfObject, PdfStream, Result};
 use zpdf_parser::PdfFile;
@@ -25,6 +26,7 @@ use crate::IncrementalWriter;
 #[derive(Debug, Default, Clone)]
 pub struct ObjectIdMap {
     mapping: HashMap<ObjectId, ObjectId>,
+    named_dests: Option<Arc<HashMap<Vec<u8>, PdfObject>>>,
 }
 
 impl ObjectIdMap {
@@ -45,6 +47,47 @@ impl ObjectIdMap {
     pub fn is_empty(&self) -> bool {
         self.mapping.is_empty()
     }
+
+    /// Normalize local named destinations before detaching pages from their
+    /// catalog (ISO 32000-1, 12.3.2.3). Explicit destinations avoid collisions
+    /// with an identically named destination in the receiving document.
+    pub(crate) fn prepare_named_dests(&mut self, source: &PdfFile, pages: &[ObjectId]) {
+        let names = zpdf_document::destinations::collect_named_dests(source);
+        let mut resolved = HashMap::new();
+        for (name, value) in &names {
+            if let Some(dest) = resolve_named_target(source, &names, pages, value) {
+                resolved.insert(name.clone(), dest);
+            }
+        }
+        self.named_dests = Some(Arc::new(resolved));
+    }
+}
+
+fn resolve_named_target(
+    source: &PdfFile,
+    names: &HashMap<Vec<u8>, PdfObject>,
+    pages: &[ObjectId],
+    value: &PdfObject,
+) -> Option<PdfObject> {
+    let mut current = value.clone();
+    // Bounds aliases, reference chains and malformed cycles alike.
+    for _ in 0..32 {
+        current = match current {
+            PdfObject::Array(mut a) if !a.is_empty() => {
+                if let PdfObject::Integer(index) = a[0] {
+                    let page = pages.get(usize::try_from(index).ok()?)?;
+                    a[0] = PdfObject::Ref(*page);
+                }
+                return Some(PdfObject::Array(a));
+            }
+            PdfObject::Ref(id) => source.resolve(id).ok()?,
+            PdfObject::Dict(d) => d.get("D")?.clone(),
+            PdfObject::Name(n) => names.get(n.as_str().as_bytes())?.clone(),
+            PdfObject::String(s) => names.get(s.as_bytes())?.clone(),
+            _ => return None,
+        };
+    }
+    None
 }
 
 /// Copy `source_id` and everything reachable from it out of `source_file`
@@ -176,7 +219,34 @@ fn remap_dict(
         if skip_keys.iter().any(|s| *s == k.as_str()) {
             continue;
         }
-        out.insert(k.clone(), remap(v, writer, id_map, skip_keys, work)?);
+        let local_dest =
+            k.as_str() == "Dest" || (k.as_str() == "D" && dict.get_name("S").ok() == Some("GoTo"));
+        let named = match v {
+            PdfObject::Name(n) => Some(n.as_str().as_bytes()),
+            PdfObject::String(s) => Some(s.as_bytes()),
+            _ => None,
+        };
+        let explicit = if local_dest {
+            named.and_then(|name| {
+                id_map.named_dests.as_ref().map(|names| {
+                    // An invalid source destination must not accidentally bind
+                    // to a same-named destination in the receiving catalog.
+                    names.get(name).cloned().unwrap_or(PdfObject::Null)
+                })
+            })
+        } else {
+            None
+        };
+        out.insert(
+            k.clone(),
+            remap(
+                explicit.as_ref().unwrap_or(v),
+                writer,
+                id_map,
+                skip_keys,
+                work,
+            )?,
+        );
     }
     Ok(out)
 }

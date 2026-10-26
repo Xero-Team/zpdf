@@ -453,7 +453,7 @@ fn limits_may_contain(file: &PdfFile, node: &PdfDict, key: &[u8]) -> bool {
 /// precedence over the legacy dict, and the first occurrence of a duplicate key
 /// wins — matching [`lookup_named_value`]'s search order. Returns an empty map
 /// (built instantly) when the document declares no named destinations.
-pub(crate) fn collect_named_dests(file: &PdfFile) -> HashMap<Vec<u8>, PdfObject> {
+pub fn collect_named_dests(file: &PdfFile) -> HashMap<Vec<u8>, PdfObject> {
     let mut map = HashMap::new();
     let Some(root) = catalog_dict(file) else {
         return map;

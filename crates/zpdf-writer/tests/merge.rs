@@ -373,6 +373,108 @@ fn pdf_from_objects(objects: &[(u32, String)]) -> Vec<u8> {
 }
 
 #[test]
+fn merged_named_links_and_outlines_keep_source_targets_despite_collisions() {
+    use zpdf_core::PdfObject;
+    let base = pdf_from_objects(&[
+        (
+            1,
+            "<< /Type /Catalog /Pages 2 0 R /Dests << /chapter [3 0 R /Fit] >> >>".into(),
+        ),
+        (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into()),
+        (
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 792] /Annots [4 0 R] >>".into(),
+        ),
+        (
+            4,
+            "<< /Subtype /Link /Rect [0 0 50 20] /Dest /chapter >>".into(),
+        ),
+    ]);
+    for registry in [
+        "/Names << /Dests 7 0 R >>",
+        "/Dests << /chapter [4 0 R /Fit] /alias /chapter >>",
+    ] {
+        let source = pdf_from_objects(&[
+            (1, format!("<< /Type /Catalog /Pages 2 0 R {registry} /Outlines 8 0 R >>")),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /MediaBox [0 0 700 792] >>".into()),
+            (3, "<< /Type /Page /Parent 2 0 R /Annots [5 0 R 10 0 R] >>".into()),
+            (4, "<< /Type /Page /Parent 2 0 R /Annots [6 0 R] >>".into()),
+            (5, "<< /Subtype /Link /Rect [0 0 50 20] /Dest (chapter) >>".into()),
+            (6, "<< /Subtype /Link /Rect [0 0 50 20] /A << /S /GoToR /F (other.pdf) /D (chapter) >> >>".into()),
+            (7, "<< /Names [(alias) (chapter) (chapter) << /D [4 0 R /Fit] >>] >>".into()),
+            (8, "<< /Type /Outlines /First 9 0 R /Last 9 0 R /Count 1 >>".into()),
+            (9, "<< /Title (chapter) /Parent 8 0 R /Dest (chapter) >>".into()),
+            (10, "<< /Subtype /Link /Rect [0 20 50 40] /A << /S /GoTo /D /alias >> >>".into()),
+        ]);
+        let mut writer = IncrementalWriter::new(base.clone()).unwrap();
+        writer
+            .append_document(&PdfFile::parse(source).unwrap())
+            .unwrap();
+        let mut out = Cursor::new(Vec::new());
+        writer.write(&mut out).unwrap();
+        let doc = PdfDocument::open(out.into_inner()).unwrap();
+        assert_eq!(doc.page_count(), 3);
+        assert_eq!(
+            doc.page_annotations(&doc.page(0).unwrap())[0]
+                .dest
+                .as_ref()
+                .unwrap()
+                .page,
+            Some(0)
+        );
+        for link in doc.page_annotations(&doc.page(1).unwrap()) {
+            assert_eq!(link.dest.unwrap().page, Some(2));
+        }
+        assert_eq!(doc.outline()[0].dest.as_ref().unwrap().page, Some(2));
+        let target = doc.page(2).unwrap();
+        assert_eq!(
+            target.width(),
+            700.0,
+            "linked page keeps inherited dimensions"
+        );
+        let remote = doc.file().resolve(target.annots[0]).unwrap();
+        let action = remote
+            .as_dict()
+            .unwrap()
+            .get("A")
+            .unwrap()
+            .as_dict()
+            .unwrap();
+        assert!(
+            matches!(action.get("D"), Some(PdfObject::String(s)) if s.as_bytes() == b"chapter")
+        );
+    }
+}
+
+#[test]
+fn cyclic_named_destination_does_not_bind_to_destination_catalog() {
+    use zpdf_core::PdfObject;
+    let source = pdf_from_objects(&[
+        (
+            1,
+            "<< /Type /Catalog /Pages 2 0 R /Dests << /cycle /cycle >> >>".into(),
+        ),
+        (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into()),
+        (
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Annots [4 0 R] >>".into(),
+        ),
+        (
+            4,
+            "<< /Subtype /Link /Rect [0 0 50 20] /Dest /cycle >>".into(),
+        ),
+    ]);
+    let bytes = merge(pdf_with_pages(1, 600), &[source]);
+    let doc = PdfDocument::open(bytes).unwrap();
+    let page = doc.page(1).unwrap();
+    let link = doc.file().resolve(page.annots[0]).unwrap();
+    assert!(matches!(
+        link.as_dict().unwrap().get("Dest"),
+        Some(PdfObject::Null)
+    ));
+}
+
+#[test]
 fn extracted_form_keeps_hierarchy_defaults_and_only_selected_widgets() {
     use zpdf_core::PdfObject;
     use zpdf_document::FieldValue;
