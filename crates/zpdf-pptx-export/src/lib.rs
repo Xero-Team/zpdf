@@ -32,6 +32,14 @@ pub struct PptxSlide {
 /// An element on a PowerPoint slide.
 #[derive(Debug, Clone)]
 pub enum SlideElement {
+    /// Rotation/reflection about an element's center. Existing untransformed
+    /// element constructors are unchanged; consumers should handle this variant.
+    Transformed {
+        element: Box<SlideElement>,
+        rotation_degrees: f64,
+        flip_h: bool,
+        flip_v: bool,
+    },
     TextBox {
         text: String,
         x_emu: i64,
@@ -84,6 +92,38 @@ pub enum SlideElement {
         image_data: Vec<u8>, // PNG data
         image_id: String,
     },
+}
+
+impl SlideElement {
+    pub(crate) fn base(&self) -> &Self {
+        let mut element = self;
+        while let Self::Transformed { element: inner, .. } = element {
+            element = inner;
+        }
+        element
+    }
+    pub(crate) fn base_mut(&mut self) -> &mut Self {
+        let mut element = self;
+        while let Self::Transformed { element: inner, .. } = element {
+            element = inner;
+        }
+        element
+    }
+}
+
+fn transformed_element(element: SlideElement, matrix: &zpdf_core::Matrix) -> SlideElement {
+    let rotation_degrees = (-matrix.b.atan2(matrix.a).to_degrees()).rem_euclid(360.0);
+    let flip_v = matrix.determinant() < 0.0;
+    if rotation_degrees.abs() < 1e-8 && !flip_v {
+        element
+    } else {
+        SlideElement::Transformed {
+            element: Box::new(element),
+            rotation_degrees,
+            flip_h: false,
+            flip_v,
+        }
+    }
 }
 
 /// Options for PDF to PowerPoint conversion.
@@ -236,25 +276,52 @@ impl<'a> SlideConverter<'a> {
         };
 
         // Convert PDF coordinates (bottom-left origin) to PowerPoint (top-left origin)
-        let (x_ppt, y_ppt) = self.pdf_to_ppt_coords(min_x as f64, max_y as f64);
-        let width = (max_x - min_x) as f64;
-        let height = (max_y - min_y) as f64;
+        let matrix = &glyph_run.transform;
+        if !matrix.is_finite() {
+            return Err(zpdf_core::Error::StreamDecode(
+                "non-finite PPTX text transform".into(),
+            ));
+        }
+        let scale_x = matrix.a.hypot(matrix.b);
+        let scale_y = matrix.c.hypot(matrix.d);
+        if scale_x == 0.0 || scale_y == 0.0 {
+            return Ok(());
+        }
+        let center = zpdf_core::Point::new(
+            (min_x as f64 + max_x as f64) / 2.0,
+            (min_y as f64 + max_y as f64) / 2.0,
+        )
+        .transform(matrix);
+        let (center_x, center_y) = self.pdf_to_ppt_coords(center.x, center.y);
+        let width = (max_x - min_x) as f64 * scale_x;
+        let height = (max_y - min_y) as f64 * scale_y;
+        let (x_ppt, y_ppt) = (center_x - width / 2.0, center_y - height / 2.0);
 
         // Extract font family name from base_font
-        let font_family = font.base_font.clone();
+        let font_family = font
+            .base_font
+            .split_once('+')
+            .filter(|(prefix, _)| {
+                prefix.len() == 6 && prefix.bytes().all(|b| b.is_ascii_uppercase())
+            })
+            .map(|(_, name)| name)
+            .unwrap_or(&font.base_font)
+            .to_string();
+        let style = font_family.to_ascii_lowercase();
 
-        self.elements.push(SlideElement::TextBox {
+        let element = SlideElement::TextBox {
             text,
             x_emu: pt_to_emu(x_ppt),
             y_emu: pt_to_emu(y_ppt),
             width_emu: pt_to_emu(width),
             height_emu: pt_to_emu(height),
             font_family,
-            font_size_pt: glyph_run.font_size as f64,
+            font_size_pt: glyph_run.font_size as f64 * scale_y,
             color_rgb,
-            bold: false, // Font style detection not easily available from LoadedFont
-            italic: false,
-        });
+            bold: style.contains("bold") || style.contains("demi"),
+            italic: style.contains("italic") || style.contains("oblique"),
+        };
+        self.elements.push(transformed_element(element, matrix));
 
         Ok(())
     }
@@ -372,14 +439,19 @@ impl<'a> SlideConverter<'a> {
 
         // Extract transform to get position and size
         let mat = &image_draw.transform;
-        let x = mat.e;
-        let y = mat.f;
+        if !mat.is_finite() {
+            return Err(zpdf_core::Error::StreamDecode(
+                "non-finite PPTX image transform".into(),
+            ));
+        }
 
         // Image transform: unit square [0,1]×[0,1] → page space
         let width = (mat.a * mat.a + mat.b * mat.b).sqrt();
         let height = (mat.c * mat.c + mat.d * mat.d).sqrt();
 
-        let (x_ppt, y_ppt) = self.pdf_to_ppt_coords(x, y + height);
+        let center = zpdf_core::Point::new(0.5, 0.5).transform(mat);
+        let (cx, cy) = self.pdf_to_ppt_coords(center.x, center.y);
+        let (x_ppt, y_ppt) = (cx - width / 2.0, cy - height / 2.0);
 
         // Convert image to PNG
         let png_data = image_to_png(image)?;
@@ -387,14 +459,15 @@ impl<'a> SlideConverter<'a> {
         self.image_counter += 1;
         let image_id = format!("image{}", self.image_counter);
 
-        self.elements.push(SlideElement::Image {
+        let element = SlideElement::Image {
             x_emu: pt_to_emu(x_ppt),
             y_emu: pt_to_emu(y_ppt),
             width_emu: pt_to_emu(width),
             height_emu: pt_to_emu(height),
             image_data: png_data,
             image_id,
-        });
+        };
+        self.elements.push(transformed_element(element, mat));
 
         Ok(())
     }
@@ -478,6 +551,98 @@ mod export_tests {
     use zpdf_display_list::{Color, DisplayList, GlyphRun, Paint, PositionedGlyph, RenderCommand};
     use zpdf_font::cmap::ToUnicodeMap;
     use zpdf_font::{FontCache, LoadedFont};
+
+    fn positioned_slide(transforms: &[Matrix]) -> PptxSlide {
+        let mut font = LoadedFont::new_placeholder("ABCDEF+Helvetica-BoldOblique".into());
+        font.to_unicode = Some(ToUnicodeMap::parse(
+            b"begincmap 1 beginbfchar <41> <0041> endbfchar endcmap",
+        ));
+        let mut fonts = FontCache::new();
+        let font_id = fonts.insert("F1".into(), font);
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 120.0, 80.0));
+        for &transform in transforms {
+            dl.push(RenderCommand::DrawGlyphRun(GlyphRun {
+                font_id,
+                font_size: 12.0,
+                glyphs: vec![PositionedGlyph {
+                    glyph_id: 1,
+                    code: 65,
+                    x: 0.0,
+                    y: 0.0,
+                    advance: 6.0,
+                }],
+                paint: Paint::Solid(Color::black()),
+                alpha: 1.0,
+                overprint: None,
+                transform,
+                h_scale: 1.0,
+            }));
+        }
+        display_list_to_slide(
+            &dl,
+            0,
+            &fonts,
+            &ImageCache::new(),
+            &ConversionOptions::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn text_boxes_keep_translation_scale_and_style() {
+        let slide = positioned_slide(&[
+            Matrix::new(2.0, 0.0, 0.0, 2.0, 20.0, 30.0),
+            Matrix::translate(60.0, 20.0),
+        ]);
+        match &slide.elements[0] {
+            SlideElement::TextBox {
+                x_emu,
+                y_emu,
+                width_emu,
+                height_emu,
+                font_size_pt,
+                font_family,
+                bold,
+                italic,
+                ..
+            } => {
+                assert_eq!(
+                    (*x_emu, *y_emu, *width_emu, *height_emu),
+                    (254000, 330200, 152400, 304800)
+                );
+                assert_eq!(*font_size_pt, 24.0);
+                assert_eq!(font_family, "Helvetica-BoldOblique");
+                assert!(*bold && *italic);
+            }
+            _ => panic!("unrotated text"),
+        }
+        assert!(
+            matches!(&slide.elements[1],SlideElement::TextBox{x_emu,y_emu,..} if (*x_emu,*y_emu)==(762000,609600))
+        );
+    }
+
+    #[test]
+    fn rotated_and_reflected_text_remains_editable_in_drawingml() {
+        let slide = positioned_slide(&[
+            Matrix::new(0.0, 1.0, -1.0, 0.0, 40.0, 20.0),
+            Matrix::new(1.0, 0.0, 0.0, -1.0, 10.0, 30.0),
+        ]);
+        let presentation = PptxPresentation {
+            slides: vec![slide],
+            width_emu: 1524000,
+            height_emu: 1016000,
+        };
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(
+            PptxWriter::new(presentation).write_to_bytes().unwrap(),
+        ))
+        .unwrap();
+        let xml = String::from_utf8(zip_entry(&mut zip, "ppt/slides/slide1.xml")).unwrap();
+        assert!(xml.contains("rot=\"16200000\""));
+        assert!(xml.contains("flipV=\"1\""));
+        assert_eq!(xml.matches("<a:t>A</a:t>").count(), 2);
+        assert!(xml.contains("</a:rPr>"));
+        assert!(!xml.contains("sz=\"1200\" b=\"1\" i=\"1\"/>"));
+    }
 
     /// Text of every text box on a one-run slide drawn with `font`.
     fn run_text(font: LoadedFont, glyph_id: u16, code: u32) -> String {
