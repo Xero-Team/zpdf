@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Expose bounded processing diagnostics for partial page decoding, interpretation
+  and conversion. Report resource/time limits, missing resources, unsupported
+  operations and malformed tokens. CLI/WASM exports reject known partial output;
+  library callers can inspect surviving content or require completion. (#104)
+
 - Select CMS signer certificates by issuer/serial or subject key identifier,
   independent of certificate order. Use that certificate for crypto, identity,
   chain and offline CRL checks; reject missing or ambiguous matches. (#103)

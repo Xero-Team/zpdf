@@ -43,7 +43,8 @@ GPU (wgpu) renderers whose output matches within <1% of pixels.
 - **TXT, Markdown & HTML conversion** — text-only conversion skips image
   decoding entirely; rich Markdown/HTML exports decoded images as PNG assets and
   includes document/page metadata. Unsupported or malformed images are discarded
-  without interrupting text extraction (`convert_pdf`, CLI `convert`).
+  while the library retains surviving text with structured completion diagnostics.
+  CLI conversion rejects known incomplete output (`convert_pdf`, CLI `convert`).
 - **PowerPoint (PPTX) export** — converts PDF pages to editable PowerPoint
   presentations preserving text (with font/size/color/style), shapes
   (rectangles, ellipses, lines with fill/stroke), and embedded images as native

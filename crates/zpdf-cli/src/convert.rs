@@ -82,6 +82,7 @@ pub(crate) fn run(args: &[String]) -> zpdf::Result<()> {
             use_structure: parsed.use_structure,
         },
     )?;
+    converted.ensure_complete()?;
     if parsed.use_structure && !converted.structure_order_used {
         eprintln!("no usable structure tree; used geometric reading order");
     }

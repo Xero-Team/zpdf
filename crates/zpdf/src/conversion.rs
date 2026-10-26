@@ -52,6 +52,8 @@ pub struct ConvertedImage {
 /// Extracted content and metadata for one PDF page.
 #[derive(Debug, Clone)]
 pub struct ConvertedPage {
+    /// Known omissions/truncation for this page and the requested mode.
+    pub diagnostics: zpdf_core::ProcessingDiagnostics,
     /// Zero-based physical page index in the source PDF.
     pub index: usize,
     /// Printed page label from `/PageLabels`, when present in rich mode.
@@ -77,6 +79,22 @@ pub struct ConvertedDocument {
     pub pages: Vec<ConvertedPage>,
     /// Whether Tagged-PDF logical order was actually available and used.
     pub structure_order_used: bool,
+}
+
+impl ConvertedDocument {
+    pub fn diagnostics(&self) -> zpdf_core::ProcessingDiagnostics {
+        let mut all = zpdf_core::ProcessingDiagnostics::default();
+        for page in &self.pages {
+            all.merge(page.diagnostics);
+        }
+        all
+    }
+    pub fn is_complete(&self) -> bool {
+        self.diagnostics().is_complete()
+    }
+    pub fn ensure_complete(&self) -> Result<()> {
+        self.diagnostics().ensure_complete()
+    }
 }
 
 /// Extract selected pages from an already-open PDF.
@@ -118,7 +136,7 @@ pub fn convert_pdf(
         let page = doc.page(page_index)?;
         let page_box = page.effective_box();
         let mut fonts = doc.load_page_fonts(&page);
-        let content = doc.page_content_bytes(&page)?;
+        let (content, mut diagnostics) = doc.page_content_with_diagnostics(&page)?;
         let mut spans = Vec::new();
         let mut images = ImageCache::new();
 
@@ -144,12 +162,10 @@ pub fn convert_pdf(
             let remaining_image_bytes = limits
                 .max_image_cache_bytes
                 .saturating_sub(retained_image_bytes);
-            if remaining_image_bytes > 0 {
-                interpreter = interpreter
-                    .with_colors(&mut icc_cache)
-                    .with_images(&mut images)
-                    .with_image_cache_limit(remaining_image_bytes);
-            }
+            interpreter = interpreter
+                .with_colors(&mut icc_cache)
+                .with_images(&mut images)
+                .with_image_cache_limit(remaining_image_bytes);
         }
         if let Some(oc) = &oc_config {
             interpreter = interpreter.with_optional_content(oc);
@@ -157,7 +173,9 @@ pub fn convert_pdf(
         if let Some(profile) = output_intent {
             interpreter = interpreter.with_output_intent_cmyk(profile);
         }
-        let display_list = interpreter.interpret(&content);
+        let (display_list, stats) = interpreter.interpret_with_stats(&content);
+        diagnostics.merge(stats.diagnostics);
+        diagnostics.set_page(page_index);
 
         let text = match &struct_tree {
             Some(tree) => zpdf_content::text::struct_ordered_text(&spans, page_index, tree),
@@ -186,6 +204,7 @@ pub fn convert_pdf(
         );
 
         pages.push(ConvertedPage {
+            diagnostics,
             index: page_index,
             label: page_labels
                 .as_ref()

@@ -31,6 +31,16 @@ pub struct InterpretedPage {
     pub content_bytes: usize,
 }
 
+impl InterpretedPage {
+    /// Reject a known partial result before publishing or exporting it.
+    pub fn ensure_complete(&self) -> Result<()> {
+        self.stats.diagnostics.ensure_complete()
+    }
+    pub fn is_complete(&self) -> bool {
+        self.stats.diagnostics.is_complete()
+    }
+}
+
 /// Interpret a page with rotation, annotations, default layer visibility,
 /// output intents, font fallback and the document's limits applied.
 pub fn interpret_page(
@@ -49,11 +59,18 @@ pub fn interpret_page_with_cache(
     colors: &mut IccCache,
 ) -> Result<InterpretedPage> {
     let page = doc.page(index)?;
-    let content = doc.page_content_bytes(&page)?;
+    let (content, mut diagnostics) = doc.page_content_with_diagnostics(&page)?;
     let mut fonts = doc.load_page_fonts(&page);
     let mut images = ImageCache::new();
     let annotations = if options.include_annotations {
-        doc.page_annotations(&page)
+        let annotations = doc.page_annotations(&page);
+        diagnostics.malformed_content = diagnostics.malformed_content.saturating_add(
+            page.annots
+                .len()
+                .saturating_sub(annotations.len())
+                .min(u32::MAX as usize) as u32,
+        );
+        annotations
     } else {
         Vec::new()
     };
@@ -82,7 +99,9 @@ pub fn interpret_page_with_cache(
     if let Some(scale) = options.image_downscale {
         interpreter = interpreter.with_image_downscale(scale);
     }
-    let (display_list, stats) = interpreter.interpret_with_stats(&content);
+    let (display_list, mut stats) = interpreter.interpret_with_stats(&content);
+    stats.diagnostics.merge(diagnostics);
+    stats.diagnostics.set_page(index);
     Ok(InterpretedPage {
         display_list,
         fonts,

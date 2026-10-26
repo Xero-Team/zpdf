@@ -36,6 +36,7 @@ pub struct ContentTokenizer<'a> {
     depth: u32,
     /// Objects retained by nested arrays/dicts over this tokenizer's lifetime.
     retained_objects: usize,
+    diagnostics: zpdf_core::ProcessingDiagnostics,
 }
 
 impl<'a> ContentTokenizer<'a> {
@@ -45,7 +46,17 @@ impl<'a> ContentTokenizer<'a> {
             pos: 0,
             depth: 0,
             retained_objects: 0,
+            diagnostics: Default::default(),
         }
+    }
+
+    /// Known token damage or bounded truncation encountered so far.
+    pub fn diagnostics(&self) -> zpdf_core::ProcessingDiagnostics {
+        self.diagnostics
+    }
+
+    fn malformed(&mut self) {
+        self.diagnostics.malformed_content = self.diagnostics.malformed_content.saturating_add(1);
     }
 
     fn peek(&self) -> Option<u8> {
@@ -68,6 +79,7 @@ impl<'a> ContentTokenizer<'a> {
 
     fn retain_slot(&mut self) -> bool {
         if self.retained_objects >= MAX_RETAINED_OBJECTS {
+            self.diagnostics.resource_limit_reached = true;
             return false;
         }
         self.retained_objects += 1;
@@ -146,6 +158,7 @@ impl<'a> ContentTokenizer<'a> {
                 Some(ContentToken::Operator(op))
             }
             _ => {
+                self.malformed();
                 self.pos += 1;
                 None
             }
@@ -174,10 +187,16 @@ impl<'a> ContentTokenizer<'a> {
                 s.parse::<f64>()
                     .ok()
                     .filter(|n| n.is_finite())
-                    .unwrap_or(0.0),
+                    .unwrap_or_else(|| {
+                        self.malformed();
+                        0.0
+                    }),
             )
         } else {
-            PdfObject::Integer(s.parse().unwrap_or(0))
+            PdfObject::Integer(s.parse().unwrap_or_else(|_| {
+                self.malformed();
+                0
+            }))
         }
     }
 
@@ -191,6 +210,9 @@ impl<'a> ContentTokenizer<'a> {
             self.pos += 1;
         }
         let raw = &self.data[start..self.pos];
+        if raw.len() > MAX_CONTENT_NAME_BYTES {
+            self.diagnostics.resource_limit_reached = true;
+        }
         PdfName::new(decode_name(&raw[..raw.len().min(MAX_CONTENT_NAME_BYTES)]))
     }
 
@@ -203,27 +225,27 @@ impl<'a> ContentTokenizer<'a> {
             match b {
                 b'(' => {
                     depth += 1;
-                    push_string_byte(&mut buf, b'(');
+                    push_string_byte(&mut buf, &mut self.diagnostics, b'(');
                 }
                 b')' => {
                     depth -= 1;
                     if depth == 0 {
                         break;
                     }
-                    push_string_byte(&mut buf, b')');
+                    push_string_byte(&mut buf, &mut self.diagnostics, b')');
                 }
                 b'\\' => {
                     if let Some(&esc) = self.data.get(self.pos) {
                         self.pos += 1;
                         match esc {
-                            b'n' => push_string_byte(&mut buf, b'\n'),
-                            b'r' => push_string_byte(&mut buf, b'\r'),
-                            b't' => push_string_byte(&mut buf, b'\t'),
-                            b'b' => push_string_byte(&mut buf, 0x08),
-                            b'f' => push_string_byte(&mut buf, 0x0c),
-                            b'(' => push_string_byte(&mut buf, b'('),
-                            b')' => push_string_byte(&mut buf, b')'),
-                            b'\\' => push_string_byte(&mut buf, b'\\'),
+                            b'n' => push_string_byte(&mut buf, &mut self.diagnostics, b'\n'),
+                            b'r' => push_string_byte(&mut buf, &mut self.diagnostics, b'\r'),
+                            b't' => push_string_byte(&mut buf, &mut self.diagnostics, b'\t'),
+                            b'b' => push_string_byte(&mut buf, &mut self.diagnostics, 0x08),
+                            b'f' => push_string_byte(&mut buf, &mut self.diagnostics, 0x0c),
+                            b'(' => push_string_byte(&mut buf, &mut self.diagnostics, b'('),
+                            b')' => push_string_byte(&mut buf, &mut self.diagnostics, b')'),
+                            b'\\' => push_string_byte(&mut buf, &mut self.diagnostics, b'\\'),
                             // Line continuation: a backslash before an EOL is elided.
                             b'\n' => {}
                             b'\r' => {
@@ -243,14 +265,17 @@ impl<'a> ContentTokenizer<'a> {
                                         _ => break,
                                     }
                                 }
-                                push_string_byte(&mut buf, val as u8);
+                                push_string_byte(&mut buf, &mut self.diagnostics, val as u8);
                             }
-                            _ => push_string_byte(&mut buf, esc),
+                            _ => push_string_byte(&mut buf, &mut self.diagnostics, esc),
                         }
                     }
                 }
-                _ => push_string_byte(&mut buf, b),
+                _ => push_string_byte(&mut buf, &mut self.diagnostics, b),
             }
+        }
+        if depth != 0 {
+            self.malformed();
         }
         PdfString::new(buf)
     }
@@ -259,9 +284,11 @@ impl<'a> ContentTokenizer<'a> {
         self.pos += 1; // skip '<'
         let mut buf = Vec::new();
         let mut high: Option<u8> = None;
+        let mut closed = false;
         while let Some(&b) = self.data.get(self.pos) {
             self.pos += 1;
             if b == b'>' {
+                closed = true;
                 break;
             }
             if is_whitespace(b) {
@@ -271,18 +298,24 @@ impl<'a> ContentTokenizer<'a> {
                 b'0'..=b'9' => b - b'0',
                 b'a'..=b'f' => b - b'a' + 10,
                 b'A'..=b'F' => b - b'A' + 10,
-                _ => continue,
+                _ => {
+                    self.malformed();
+                    continue;
+                }
             };
             match high {
                 None => high = Some(nibble),
                 Some(h) => {
-                    push_string_byte(&mut buf, (h << 4) | nibble);
+                    push_string_byte(&mut buf, &mut self.diagnostics, (h << 4) | nibble);
                     high = None;
                 }
             }
         }
+        if !closed {
+            self.malformed();
+        }
         if let Some(h) = high {
-            push_string_byte(&mut buf, h << 4);
+            push_string_byte(&mut buf, &mut self.diagnostics, h << 4);
         }
         PdfString::new(buf)
     }
@@ -293,6 +326,7 @@ impl<'a> ContentTokenizer<'a> {
         // Bail out (without recursing) on pathologically deep nesting. `pos` has
         // already advanced past '[', so forward progress is guaranteed.
         if self.depth > MAX_CONTENT_DEPTH {
+            self.diagnostics.resource_limit_reached = true;
             self.depth -= 1;
             return Vec::new();
         }
@@ -304,6 +338,7 @@ impl<'a> ContentTokenizer<'a> {
                 break;
             }
             if self.is_eof() {
+                self.malformed();
                 break;
             }
             if let Some(ContentToken::Operand(obj)) = self.next_token() {
@@ -320,6 +355,7 @@ impl<'a> ContentTokenizer<'a> {
         self.pos += 2; // skip '<<'
         self.depth += 1;
         if self.depth > MAX_CONTENT_DEPTH {
+            self.diagnostics.resource_limit_reached = true;
             self.depth -= 1;
             return PdfObject::Dict(zpdf_core::PdfDict::new());
         }
@@ -331,9 +367,11 @@ impl<'a> ContentTokenizer<'a> {
                 break;
             }
             if self.is_eof() {
+                self.malformed();
                 break;
             }
             if self.peek() != Some(b'/') {
+                self.malformed();
                 // A dictionary key must be a name. Consume one malformed token
                 // and keep looking instead of manufacturing a key from it.
                 let before = self.pos;
@@ -362,6 +400,9 @@ impl<'a> ContentTokenizer<'a> {
             }
             self.pos += 1;
         }
+        if self.pos - start > MAX_CONTENT_OPERATOR_BYTES {
+            self.diagnostics.resource_limit_reached = true;
+        }
         let end = start
             .saturating_add(MAX_CONTENT_OPERATOR_BYTES)
             .min(self.pos);
@@ -377,6 +418,7 @@ impl<'a> ContentTokenizer<'a> {
         loop {
             self.skip_whitespace();
             if self.is_eof() {
+                self.malformed();
                 return ContentToken::InlineImage {
                     dict,
                     data: Vec::new(),
@@ -398,6 +440,7 @@ impl<'a> ContentTokenizer<'a> {
                 if op.is_empty() {
                     self.pos += 1; // guard against stalling on stray bytes
                 } else {
+                    self.malformed();
                     // Malformed parameters (no `ID`): recover by skipping past the
                     // `EI` terminator so the binary section is never re-tokenized.
                     let end = self.scan_for_ei(self.pos);
@@ -430,6 +473,8 @@ impl<'a> ContentTokenizer<'a> {
         self.skip_whitespace();
         if self.data[self.pos..].starts_with(b"EI") {
             self.pos += 2;
+        } else {
+            self.malformed();
         }
 
         ContentToken::InlineImage { dict, data }
@@ -559,9 +604,15 @@ fn decode_name(raw: &[u8]) -> String {
     String::from_utf8_lossy(&decoded).into_owned()
 }
 
-fn push_string_byte(buffer: &mut Vec<u8>, byte: u8) {
+fn push_string_byte(
+    buffer: &mut Vec<u8>,
+    diagnostics: &mut zpdf_core::ProcessingDiagnostics,
+    byte: u8,
+) {
     if buffer.len() < MAX_CONTENT_STRING_BYTES {
         buffer.push(byte);
+    } else {
+        diagnostics.resource_limit_reached = true;
     }
 }
 

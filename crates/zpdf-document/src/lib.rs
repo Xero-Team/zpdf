@@ -196,9 +196,23 @@ impl PdfDocument {
         (self.file.header.major, self.file.header.minor)
     }
 
-    /// Get decoded content stream bytes for a page.
+    /// Get decoded content stream bytes for a page. Returns an error rather
+    /// than silently omitting a damaged stream. Use the diagnostic variant to
+    /// explicitly consume partial content.
     pub fn page_content_bytes(&self, page: &PdfPage) -> Result<Vec<u8>> {
+        let (bytes, diagnostics) = self.page_content_with_diagnostics(page)?;
+        diagnostics.ensure_complete()?;
+        Ok(bytes)
+    }
+
+    /// Decode surviving page content and report any omitted streams. Aggregate
+    /// byte/allocation limits remain hard errors. The report is bounded.
+    pub fn page_content_with_diagnostics(
+        &self,
+        page: &PdfPage,
+    ) -> Result<(Vec<u8>, zpdf_core::ProcessingDiagnostics)> {
         let mut all_bytes = Vec::new();
+        let mut diagnostics = page.content_diagnostics;
         let limit = self.file.limits().max_decoded_stream_bytes;
         for &content_id in &page.contents {
             match self.file.resolve_stream_data(content_id) {
@@ -224,11 +238,12 @@ impl PdfDocument {
                     all_bytes.extend_from_slice(&bytes);
                 }
                 Err(e) => {
+                    diagnostics.record_object_failure(content_id, &e);
                     tracing::warn!("failed to decode content stream {content_id}: {e}");
                 }
             }
         }
-        Ok(all_bytes)
+        Ok((all_bytes, diagnostics))
     }
 
     /// Load all fonts referenced by a page.

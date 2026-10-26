@@ -37,6 +37,30 @@ rotation and document limits already applied. Use `interpret_page_with_cache`
 to reuse an `IccCache` across pages. Low-level `ContentInterpreter` construction
 remains available for standalone streams or intentionally customized semantics.
 
+`InterpretedPage::is_complete()` and `stats.diagnostics` report known omissions
+and truncation. `convert_pdf` retains surviving content with diagnostics on each
+`ConvertedPage`; `ConvertedDocument::ensure_complete()` rejects partial output.
+For publication/export, check completion before writing files:
+
+```rust
+let page = zpdf::interpret_page(&doc, 0, Default::default())?;
+page.ensure_complete()?;
+// Render/export page.display_list with page.fonts and page.images.
+```
+
+Diagnostics have bounded counters for decode failures, missing resources,
+unsupported features and malformed content, plus resource/time-limit flags.
+They retain the first affected page/object when known and expose `to_json()`
+for machine-readable reports without a serialization dependency.
+They describe known loss, not full PDF conformance or visual fidelity. Low-level
+callers can use `ContentInterpreter::interpret_with_stats` and inspect
+`stats.diagnostics`. `PdfDocument::page_content_bytes` now rejects skipped
+streams; `page_content_with_diagnostics` explicitly returns surviving bytes.
+The CLI rejects known partial output with a nonzero exit status and diagnostic
+counts; text-only conversion intentionally omits images without marking that as
+an error. Exhaustive error matches and literal `PdfPage`/`ConvertedPage`
+construction must account for the new fields/variants.
+
 ```
 PDF bytes ─▶ PdfDocument ─▶ PdfPage ─▶ ContentInterpreter ─▶ DisplayList ─▶ RenderBackend ─▶ pixels
             (parse/xref)   (page tree)  (operator interp.)   (flat commands)  (cpu | gpu)
