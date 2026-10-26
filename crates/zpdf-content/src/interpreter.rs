@@ -3598,6 +3598,10 @@ impl<'a> ContentInterpreter<'a> {
         let saved_dl = std::mem::replace(&mut self.display_list, DisplayList::new(page_rect));
         let saved_state = self.current.clone();
         let saved_oc_hidden = self.oc_hidden_from.take();
+        // Mask glyphs and rules define opacity, not logical page content.
+        // Keep /ActualText in those painting resources out of extraction too.
+        let saved_text_sink = self.text_sink.take();
+        let saved_rule_sink = self.rule_sink.take();
         self.current.soft_mask = None;
         self.current.blend_mode = BlendMode::Normal;
         self.current.fill_alpha = 1.0;
@@ -3610,6 +3614,8 @@ impl<'a> ContentInterpreter<'a> {
         self.tock_work(work);
         self.current = saved_state;
         self.oc_hidden_from = saved_oc_hidden;
+        self.text_sink = saved_text_sink;
+        self.rule_sink = saved_rule_sink;
         let mask_dl = std::mem::replace(&mut self.display_list, saved_dl);
 
         // /BC components live in the group's /CS; the mean is a serviceable
