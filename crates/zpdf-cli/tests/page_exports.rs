@@ -10,7 +10,7 @@ fn fixture() -> Vec<u8> {
     let objects=[
         "<< /Type /Catalog /Pages 2 0 R /OCProperties << /OCGs [6 0 R] /D << /BaseState /ON /OFF [6 0 R] >> >> >>".into(),
         "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(),
-        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 120 80] /Contents 4 0 R /Annots [5 0 R] /Resources << /Properties << /Layer 6 0 R >> /Font << /F1 8 0 R >> >> >>".into(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 120 80] /UserUnit 2 /Contents 4 0 R /Annots [5 0 R] /Resources << /Properties << /Layer 6 0 R >> /Font << /F1 8 0 R >> >> >>".into(),
         stream("/OC /Layer BDC 0 0 1 rg 0 0 120 80 re f BT /F1 12 Tf 10 50 Td (HIDDEN) Tj ET EMC",""),
         "<< /Type /Annot /Subtype /Square /Rect [40 20 80 60] /AP << /N 7 0 R >> >>".into(),
         "<< /Type /OCG /Name (Hidden) >>".into(),
@@ -71,6 +71,10 @@ fn cli_exports_keep_annotations_and_hide_disabled_layers() {
             let svg = fs::read_to_string(&output).unwrap();
             assert!(svg.contains("#ff0000"), "{svg}");
             assert!(!svg.contains("#0000ff"), "{svg}");
+            assert!(
+                svg.contains("240") && svg.contains("160"),
+                "scaled SVG dimensions: {svg}"
+            );
         } else {
             assert!(
                 String::from_utf8_lossy(&result.stdout).contains("(1 elements)"),
@@ -92,7 +96,8 @@ fn cli_exports_keep_annotations_and_hide_disabled_layers() {
             .unwrap();
         assert!(result.status.success());
         let bitmap = image::open(&output).unwrap().to_rgba8();
-        assert_eq!(bitmap.get_pixel(60, 40).0, [255, 0, 0, 255]);
+        assert_eq!(bitmap.dimensions(), (240, 160));
+        assert_eq!(bitmap.get_pixel(120, 80).0, [255, 0, 0, 255]);
         assert_eq!(bitmap.get_pixel(10, 10).0, [255, 255, 255, 255]);
         fs::remove_file(output).unwrap();
     }

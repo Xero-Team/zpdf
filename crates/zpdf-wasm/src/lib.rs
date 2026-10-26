@@ -147,7 +147,7 @@ impl Pdf {
     /// with `/Rotate` taken into account (90°/270° swap the sides).
     pub fn page_size(&self, index: usize) -> Result<Vec<f64>, JsError> {
         let page = self.doc.page(index).map_err(js_err)?;
-        let rect = page.effective_box();
+        let rect = page.effective_box_points();
         let (w, h) = if page.rotate % 180 != 0 {
             (rect.height(), rect.width())
         } else {
@@ -168,7 +168,7 @@ impl Pdf {
         let mut options = zpdf::PageInterpretOptions::default();
         options.image_downscale = zpdf::cpu::CpuRenderer::new()
             .with_limits(self.doc.file().limits())
-            .raster_scale(page.effective_box(), scale);
+            .raster_scale(page.effective_box_points(), scale);
         let zpdf::InterpretedPage {
             display_list: dl,
             fonts,

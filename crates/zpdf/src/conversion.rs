@@ -35,7 +35,7 @@ pub struct ConversionOptions {
     pub use_structure: bool,
 }
 
-/// One occurrence of an extracted image in page user space.
+/// One occurrence of an extracted image in unrotated page space, in points.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ImagePlacement {
     pub transform: Matrix,
@@ -134,6 +134,7 @@ pub fn convert_pdf(
         };
 
         let mut interpreter = ContentInterpreter::new(page_box)
+            .with_page_user_unit(page.user_unit)
             .with_fonts(&mut fonts)
             .with_document(doc.file(), &page.resources)
             .with_shared_fonts(doc)
@@ -189,8 +190,8 @@ pub fn convert_pdf(
             label: page_labels
                 .as_ref()
                 .and_then(|labels| labels.label(page_index)),
-            width_points: page_box.width(),
-            height_points: page_box.height(),
+            width_points: page_box.width() * page.user_unit,
+            height_points: page_box.height() * page.user_unit,
             rotation: page.rotate,
             text,
             images: converted_images,

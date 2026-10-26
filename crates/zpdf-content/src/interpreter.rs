@@ -922,6 +922,21 @@ impl<'a> ContentInterpreter<'a> {
         self
     }
 
+    /// Convert default page user space to physical points. Call after
+    /// [`Self::with_page_rotation`], before interpreting content. Annotation
+    /// appearances and patterns use the same scaled base transform.
+    pub fn with_page_user_unit(mut self, unit: f64) -> Self {
+        if unit.is_finite() && unit > 0.0 && unit <= 75_000.0 {
+            let scale = Matrix::scale(unit, unit);
+            self.current.ctm = scale.concat(&self.current.ctm);
+            self.base_ctm = scale.concat(&self.base_ctm);
+            let r = self.display_list.page_rect;
+            self.display_list.page_rect =
+                Rect::new(r.x0 * unit, r.y0 * unit, r.x1 * unit, r.y1 * unit);
+        }
+        self
+    }
+
     pub fn with_fonts(mut self, cache: &'a mut FontCache) -> Self {
         self.font_cache = Some(cache);
         self

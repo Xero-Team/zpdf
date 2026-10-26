@@ -66,6 +66,7 @@ pub fn interpret_page_with_cache(
     );
     let mut interpreter = ContentInterpreter::new(page.effective_box())
         .with_page_rotation(page.rotate)
+        .with_page_user_unit(page.user_unit)
         .with_document(doc.file(), &page.resources)
         .with_fonts(&mut fonts)
         .with_shared_fonts(doc)

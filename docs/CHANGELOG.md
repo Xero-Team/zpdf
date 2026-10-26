@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Honor page UserUnit in physical sizes, interpretation, CLI rendering/exports
+  and WASM. Raw page boxes/editing coordinates stay in default user space;
+  PdfPage gains user_unit and effective_box_points. (#96)
+
 - Resolve copied local named destinations to explicit page references when
   merging or extracting pages, preserving links and bookmarks despite name
   collisions. Keep inherited attributes on pages reached through links. (#95)
