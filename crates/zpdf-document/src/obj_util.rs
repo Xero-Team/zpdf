@@ -43,11 +43,8 @@ pub(crate) fn resolve_array(file: &PdfFile, obj: Option<&PdfObject>) -> Option<V
     }
 }
 
-/// Decode a text-string dict entry, following one indirect reference. UTF-16BE
-/// when the value carries the `FE FF` BOM, otherwise the bytes are taken as
-/// PDFDocEncoding *approximated by Latin-1* (exact for the common range; a few
-/// PDFDoc-specific code points in `0x18`–`0x1F` / `0x80`–`0xA0` differ) — see
-/// [`pdf_string_to_unicode`].
+/// Decode PDFDocEncoding, UTF-16BE or PDF 2.0 UTF-8 text, following one
+/// indirect reference. See [`pdf_string_to_unicode`].
 pub(crate) fn text(file: &PdfFile, dict: &PdfDict, key: &str) -> Option<String> {
     let value = match dict.get(key)? {
         PdfObject::String(s) => return Some(pdf_string_to_unicode(s.as_bytes())),

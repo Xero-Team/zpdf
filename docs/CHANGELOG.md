@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Share exact PDFDocEncoding and BOM-aware UTF-16BE/PDF 2.0 UTF-8 text-string
+  decoding. Encode metadata/form/annotation strings losslessly and preserve
+  Unicode field names when merging colliding forms. (#99)
+
 - Apply CalGray/CalRGB white point, gamma, matrix and relative black-point
   compensation in vectors and images, including Indexed/tint bases. Share
   calibrated conversion and bound indirect parameter resolution. (#98)

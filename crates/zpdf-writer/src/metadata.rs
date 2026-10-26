@@ -88,19 +88,7 @@ impl IncrementalWriter {
     }
 }
 
-/// Encode a PDF text string (ISO 32000-1 §7.9.2.2): plain bytes when every
-/// char fits PDFDocEncoding's Latin-1 range, else UTF-16BE with a `FE FF` BOM.
-pub(crate) fn encode_text_string(s: &str) -> PdfString {
-    if s.chars().all(|c| (c as u32) < 0x100) {
-        PdfString::new(s.chars().map(|c| c as u8).collect())
-    } else {
-        let mut bytes = vec![0xFE, 0xFF];
-        for unit in s.encode_utf16() {
-            bytes.extend_from_slice(&unit.to_be_bytes());
-        }
-        PdfString::new(bytes)
-    }
-}
+pub(crate) use zpdf_core::encode_text_string;
 
 /// The current UTC time as a PDF date string (`D:YYYYMMDDHHMMSSZ`).
 fn pdf_date_now() -> String {

@@ -17,7 +17,7 @@
 
 use std::collections::HashSet;
 
-use zpdf_core::{ObjectId, PdfDict, PdfName, PdfObject, PdfString, Result};
+use zpdf_core::{ObjectId, PdfDict, PdfName, PdfObject, Result};
 use zpdf_parser::PdfFile;
 
 use crate::copier::ObjectIdMap;
@@ -386,7 +386,7 @@ impl IncrementalWriter {
                 if let Ok(obj) = self.resolve_current(*r) {
                     if let Ok(d) = obj.as_dict() {
                         if let Some(PdfObject::String(s)) = d.get("T") {
-                            names.insert(String::from_utf8_lossy(&s.0).into_owned());
+                            names.insert(zpdf_core::decode_text_string(s.as_bytes()));
                         }
                     }
                 }
@@ -413,7 +413,7 @@ impl IncrementalWriter {
             // Collision rename on the copied field's /T.
             let mut dict = self.resolve_current(dest_field)?.as_dict()?.clone();
             if let Some(PdfObject::String(s)) = dict.get("T") {
-                let base = String::from_utf8_lossy(&s.0).into_owned();
+                let base = zpdf_core::decode_text_string(s.as_bytes());
                 if names.contains(&base) {
                     let mut n = 2usize;
                     let renamed = loop {
@@ -425,7 +425,7 @@ impl IncrementalWriter {
                     };
                     dict.insert(
                         PdfName::new("T"),
-                        PdfObject::String(PdfString(renamed.clone().into_bytes())),
+                        PdfObject::String(zpdf_core::encode_text_string(&renamed)),
                     );
                     self.overwrite_object(dest_field, PdfObject::Dict(dict));
                     names.insert(renamed);
