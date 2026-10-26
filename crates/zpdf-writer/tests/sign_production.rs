@@ -58,6 +58,10 @@ fn bit_string(body: &[u8]) -> Vec<u8> {
 }
 
 fn build_cert(spki: &[u8], cn: &str) -> Vec<u8> {
+    build_cert_with_serial(spki, cn, 1)
+}
+
+fn build_cert_with_serial(spki: &[u8], cn: &str, serial: u8) -> Vec<u8> {
     let cn_oid = [0x55, 0x04, 0x03];
     let atv = der(
         SEQ,
@@ -67,7 +71,7 @@ fn build_cert(spki: &[u8], cn: &str) -> Vec<u8> {
     let tbs = der(
         SEQ,
         &[
-            der(INT, &[0x01]),
+            der(INT, &[serial]),
             der(SEQ, &der(OID, &[0x2a])),
             der(SEQ, &[]),
             der(SEQ, &[]),
@@ -270,7 +274,9 @@ fn extra_certs_dss_and_crl_revocation_detected() {
     let point2 = p256::Sec1Point::from(sk2.verifying_key())
         .to_bytes()
         .to_vec();
-    let extra = build_cert(&ec_p256_spki(&point2), "zpdf intermediate");
+    // Different certificates from the same dummy issuer need distinct serials;
+    // otherwise SignerInfo.sid is ambiguous and verification must reject it.
+    let extra = build_cert_with_serial(&ec_p256_spki(&point2), "zpdf intermediate", 2);
     let crl = crl_revoking(&[0x01]); // signer serial is 01
 
     let signed = IncrementalWriter::new(minimal_pdf())
