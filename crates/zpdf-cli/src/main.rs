@@ -1641,8 +1641,40 @@ fn warn_signatures(doc: &zpdf::PdfDocument) {
     }
 }
 
+/// Load explicitly supplied authoring fonts; a configured provider never
+/// falls back to machine-specific fonts.
+fn extract_font_files(
+    args: &[String],
+) -> zpdf::Result<(Vec<String>, Option<std::sync::Arc<zpdf::FontProvider>>)> {
+    let mut rest = Vec::new();
+    let mut provider = None;
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--font-file" {
+            let path = args
+                .get(i + 1)
+                .filter(|s| !s.starts_with('-'))
+                .ok_or_else(|| {
+                    zpdf::Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "--font-file requires a path",
+                    ))
+                })?;
+            let p = provider
+                .get_or_insert_with(|| std::sync::Arc::new(zpdf::FontProvider::memory_only()));
+            p.register(fs::read(path).map_err(zpdf::Error::Io)?, 0)?;
+            i += 2;
+        } else {
+            rest.push(args[i].clone());
+            i += 1;
+        }
+    }
+    Ok((rest, provider))
+}
+
 fn cmd_fill(args: &[String]) -> zpdf::Result<()> {
     let (args, password) = extract_password(args);
+    let (args, font_provider) = extract_font_files(&args)?;
     let mut input = None;
     let mut output = None;
     let mut sets: Vec<(String, String)> = Vec::new();
@@ -1688,7 +1720,7 @@ fn cmd_fill(args: &[String]) -> zpdf::Result<()> {
 
     let Some(input_path) = input else {
         eprintln!(
-            "Usage: zpdf fill <file.pdf> --set NAME=VALUE [--set ...] [--list] [--password <pw>] -o <out.pdf>"
+            "Usage: zpdf fill <file.pdf> --set NAME=VALUE [--set ...] [--list] [--font-file font.ttf] [--password <pw>] -o <out.pdf>"
         );
         process::exit(1);
     };
@@ -1721,6 +1753,9 @@ fn cmd_fill(args: &[String]) -> zpdf::Result<()> {
     }
 
     let mut writer = build_writer(&input_path, password.as_deref())?;
+    if let Some(provider) = font_provider {
+        writer.set_font_provider(provider);
+    }
     warn_signatures(writer.document());
     let mut filler = zpdf_writer::FormFiller::new(&mut writer)?;
     for (name, value) in &sets {
@@ -2916,6 +2951,7 @@ fn cmd_validate(args: &[String]) -> zpdf::Result<()> {
 
 fn cmd_stamp(args: &[String]) -> zpdf::Result<()> {
     let (args, password) = extract_password(args);
+    let (args, font_provider) = extract_font_files(&args)?;
     let mut input = None;
     let mut output = None;
     let mut page: Option<usize> = None;
@@ -3036,7 +3072,7 @@ fn cmd_stamp(args: &[String]) -> zpdf::Result<()> {
 
     let Some(input_path) = input else {
         eprintln!(
-            "Usage: zpdf stamp <file.pdf> -p N --text STR --at X,Y [--font F] [--size N] [--color R,G,B] [--password <pw>] -o <out.pdf>"
+            "Usage: zpdf stamp <file.pdf> -p N --text STR --at X,Y [--font F] [--size N] [--color R,G,B] [--font-file font.ttf] [--password <pw>] -o <out.pdf>"
         );
         process::exit(1);
     };
@@ -3054,6 +3090,9 @@ fn cmd_stamp(args: &[String]) -> zpdf::Result<()> {
     };
 
     let mut writer = build_writer(&input_path, password.as_deref())?;
+    if let Some(provider) = font_provider {
+        writer.set_font_provider(provider);
+    }
     warn_signatures(writer.document());
     writer.stamp_page(page_idx, &items)?;
     write_output(&writer, &out_path)?;

@@ -56,6 +56,7 @@ pub mod stamp;
 pub mod subset;
 mod tag;
 mod tounicode;
+mod unicode_text;
 
 pub use annotate::{AnnotationSpec, MarkupKind};
 pub use builder::{
@@ -197,6 +198,13 @@ impl IncrementalWriter {
     /// reflected — use [`Self::resolve_current`] for those).
     pub fn document(&self) -> &PdfDocument {
         &self.doc
+    }
+
+    /// Fonts used for Unicode form appearances and text stamps. Registered
+    /// faces are embedded/subset into the output; a memory-only provider keeps
+    /// authoring deterministic and works without installed system fonts.
+    pub fn set_font_provider(&mut self, provider: Arc<zpdf_font::FontProvider>) {
+        self.doc.set_font_provider(provider);
     }
 
     /// Current number of surviving pages, including appended pages.

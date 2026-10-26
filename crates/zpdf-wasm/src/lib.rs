@@ -309,6 +309,20 @@ pub(crate) fn color3(r: Option<f64>, g: Option<f64>, b: Option<f64>) -> Option<(
 #[wasm_bindgen]
 #[allow(clippy::too_many_arguments)] // FFI surface: each edit takes its operands flat
 impl PdfEditor {
+    /// Register an authoring font for Unicode form values and text stamps.
+    pub fn register_font(&mut self, bytes: &[u8], face_index: u32) -> Result<u32, JsError> {
+        let provider = self
+            .writer
+            .document()
+            .font_provider()
+            .cloned()
+            .unwrap_or_else(|| std::sync::Arc::new(zpdf::FontProvider::memory_only()));
+        let id = provider
+            .register(bytes.to_vec(), face_index)
+            .map_err(js_err)?;
+        self.writer.set_font_provider(provider);
+        Ok(id.0)
+    }
     /// Open a PDF for editing (empty-password encrypted files open too).
     pub fn open(data: &[u8]) -> Result<PdfEditor, JsError> {
         let writer = zpdf_writer::IncrementalWriter::new(data.to_vec()).map_err(js_err)?;

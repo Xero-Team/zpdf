@@ -302,6 +302,15 @@ Result: FAIL — 2 violation(s)
   [output-intent] no GTS_PDFA1 output intent; PDF/A requires one for device-dependent color
 ```
 
+### `fill` / `stamp` — Unicode authoring
+
+Unicode authoring: `fill` and `stamp` accept repeatable
+`--font-file path/to/font.ttf` (TTF/OTF, or the first face of a TTC).
+For example, `zpdf fill in.pdf --set name=中文 --font-file NotoSansCJK.otf -o out.pdf`.
+Fonts are embedded into the output. Without a supplied font, native builds
+attempt installed substitutes; missing character coverage is reported as an
+error, instead of writing question marks.
+
 ### `redact` — remove content under a region
 
 Unlike drawing a black box, `redact` **removes** the matching operators from

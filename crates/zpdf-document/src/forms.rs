@@ -899,16 +899,16 @@ fn measure(text: &str, base_font: &str, size: f64) -> f64 {
 /// Parsed `/DA` default-appearance pieces we care about. Shared with the
 /// markup-annotation appearance generator ([`crate::annot_appearance`]), which
 /// reuses this whole text-layout engine for `FreeText` annotations.
-pub(crate) struct DaInfo {
-    pub(crate) font: Option<String>,
-    pub(crate) size: f64,
+pub struct DaInfo {
+    pub font: Option<String>,
+    pub size: f64,
     /// A color-setting fragment (`0 g`, `1 0 0 rg`, …) ready to emit verbatim.
-    pub(crate) color_ops: String,
+    pub color_ops: String,
 }
 
 /// Extract the font resource name, size, and color operators from a `/DA`
 /// content fragment (e.g. `0 0 1 rg /Helv 12 Tf`).
-pub(crate) fn parse_da(da: &str) -> DaInfo {
+pub fn parse_da(da: &str) -> DaInfo {
     let mut font = None;
     let mut size: f64 = 0.0;
     let mut color = String::new();
