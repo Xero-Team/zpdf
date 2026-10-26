@@ -213,3 +213,105 @@ fn explicitly_trusted_signer_need_not_be_a_ca() {
         ChainStatus::Trusted(_)
     ));
 }
+
+#[test]
+fn malformed_certificate_set_tail_fails_closed() {
+    let root_key = key(1);
+    let leaf_key = key(2);
+    let root = cert(
+        "Root",
+        &root_key,
+        "Root",
+        &root_key,
+        &[basic(true, None), usage(4)],
+    );
+    let leaf = cert("Leaf", &leaf_key, "Root", &root_key, &[]);
+    let anchors = parse_trust_anchors(&root);
+    // Truncated DER and unsupported CertificateChoices must both fail closed.
+    for tail in [vec![0x30, 0x80], der(0xa2, &seq(&[]))] {
+        let blob = cms(&[leaf.clone(), tail], "Root");
+        assert!(matches!(
+            verify_certificate_chain(&blob, &anchors, Some(1_800_000_000)),
+            ChainStatus::Unsupported(_)
+        ));
+    }
+}
+
+#[test]
+fn certificate_count_limit_does_not_accept_a_truncated_set() {
+    let root_key = key(1);
+    let inter_key = key(2);
+    let leaf_key = key(3);
+    let root = cert(
+        "Root",
+        &root_key,
+        "Root",
+        &root_key,
+        &[basic(true, None), usage(4)],
+    );
+    let intermediate = cert(
+        "Intermediate",
+        &inter_key,
+        "Root",
+        &root_key,
+        &[basic(true, None), usage(4)],
+    );
+    let leaf = cert("Leaf", &leaf_key, "Intermediate", &inter_key, &[]);
+    let mut certs = vec![leaf, intermediate];
+    certs.extend(std::iter::repeat_n(root.clone(), 30));
+    let anchors = parse_trust_anchors(&root);
+    assert!(matches!(
+        verify_certificate_chain(&cms(&certs, "Intermediate"), &anchors, Some(1_800_000_000)),
+        ChainStatus::Trusted(_)
+    ));
+    certs.push(root);
+    assert!(matches!(
+        verify_certificate_chain(&cms(&certs, "Intermediate"), &anchors, Some(1_800_000_000)),
+        ChainStatus::Unsupported(_)
+    ));
+}
+
+#[test]
+fn intermediate_path_length_excludes_the_end_entity() {
+    let root_key = key(1);
+    let upper_key = key(2);
+    let lower_key = key(3);
+    let leaf_key = key(4);
+    let root = cert(
+        "Root",
+        &root_key,
+        "Root",
+        &root_key,
+        &[basic(true, Some(2)), usage(4)],
+    );
+    let lower = cert(
+        "Lower",
+        &lower_key,
+        "Upper",
+        &upper_key,
+        &[basic(true, Some(0)), usage(4)],
+    );
+    let leaf = cert("Leaf", &leaf_key, "Lower", &lower_key, &[]);
+    let anchors = parse_trust_anchors(&root);
+    for limit in [0, 1] {
+        let upper = cert(
+            "Upper",
+            &upper_key,
+            "Root",
+            &root_key,
+            &[basic(true, Some(limit)), usage(4)],
+        );
+        let status = verify_certificate_chain(
+            &cms(&[leaf.clone(), lower.clone(), upper], "Lower"),
+            &anchors,
+            Some(1_800_000_000),
+        );
+        if limit == 0 {
+            assert!(
+                matches!(status, ChainStatus::Untrusted(ref reason) if reason.contains("path length"))
+            );
+        } else {
+            assert!(matches!(status, ChainStatus::Trusted(_)));
+        }
+    }
+}

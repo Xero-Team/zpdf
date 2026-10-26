@@ -649,15 +649,19 @@ fn extract_cms_certificates(blob: &[u8]) -> Option<Vec<Vec<u8>>> {
 
     let mut out = Vec::new();
     let mut rest = certs_body;
-    while !rest.is_empty() && out.len() < 32 {
-        let before = rest;
-        let Some((tag, _, next)) = tlv(rest) else {
-            break;
-        };
-        let consumed = before.len() - next.len();
-        if tag == SEQUENCE {
-            out.push(before[..consumed].to_vec());
+    while !rest.is_empty() {
+        // A trust verdict must cover the complete certificate set. Never
+        // accept a parsed prefix when the set is malformed or over budget.
+        if out.len() >= 32 {
+            return None;
         }
+        let before = rest;
+        let (tag, _, next) = tlv(rest)?;
+        if tag != SEQUENCE {
+            return None;
+        }
+        let consumed = before.len() - next.len();
+        out.push(before[..consumed].to_vec());
         rest = next;
     }
     Some(out)

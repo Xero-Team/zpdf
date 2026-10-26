@@ -5,6 +5,8 @@
 - Validate certificate issuer CA status, key usage, path length and critical
   extensions before reporting a PDF signature chain as trusted. Reject
   malformed validity periods when time validation is requested.
+- Reject malformed, unsupported or oversized CMS certificate sets instead of
+  reporting trust after checking only a parsed prefix of the set.
 
 ## 0.17.0 — Decoder hardening, writer fixes and export fidelity
 
