@@ -95,9 +95,9 @@ presentation.write_to_file("output.pptx")?;
 ## Limitations
 
 - **Text Extraction**: Relies on ToUnicode CMap; some PDFs may have incomplete text mapping
-- **Clipping**: Complex clipping paths are flattened to images
-- **Transparency Groups**: Soft masks and blend modes are rasterized
-- **Advanced Features**: Patterns, shadings, and some paint types fall back to simplified representations
+- **Clipping**: Clip commands are currently ignored; there is no raster fallback for clipped content.
+- **Transparency Groups**: Group compositing, soft masks and blend modes are not preserved in editable output.
+- **Advanced Features**: Patterns, shadings, arbitrary shear and nonuniform text scaling have incomplete editable representations.
 
 ## Coordinate Systems
 
