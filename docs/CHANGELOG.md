@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+## 0.18.0 — Signature trust hardening and audited PDF workflows
+
+Released 2026-10-26.
+
+### Security
+
+- Fix certificate-chain trust validation in `zpdf-document`: require issuer CA
+  authorization and certificate-signing key usage, enforce path-length limits,
+  and reject malformed or unsupported critical constraints. The issue affects
+  published versions 0.11.0 through 0.17.0. Upgrade to 0.18.0.
+  ([GHSA-vjj5-mgj6-4cwm](https://github.com/Xero-Team/zpdf/security/advisories/GHSA-vjj5-mgj6-4cwm))
+- Reject malformed, unsupported or oversized CMS certificate sets instead of
+  assessing only a parsed prefix. Preserve explicit signer pins and bounded
+  certificate/extension traversal. Include the SignerInfo.sid selection fix so
+  chain and cryptographic verification use the same actual signer certificate.
+
+### Audited fixes and APIs
+
 - Decode current indirect Filter/DecodeParms/DP and JBIG2Globals for content
   edits, enforce encoded-stream limits, charge separators only between streams,
   and reject undecodable source content before stamping. (#88)
