@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Apply CalGray/CalRGB white point, gamma, matrix and relative black-point
+  compensation in vectors and images, including Indexed/tint bases. Share
+  calibrated conversion and bound indirect parameter resolution. (#98)
+
 - Render text modes 1/2/5/6 with actual glyph-outline strokes, separate fill
   and stroke paints/alpha, graphics-state line styles and text clipping. (#97)
 

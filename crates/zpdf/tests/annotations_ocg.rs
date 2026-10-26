@@ -108,6 +108,34 @@ fn user_unit_scales_cropped_rotated_content_and_annotations() {
     }
 }
 
+#[test]
+fn calibrated_vector_and_image_colours_share_gamma_and_matrix_conversion() {
+    for (space, values, samples) in [
+        ("[/CalGray << /WhitePoint [0.9642 1 0.8249] /Gamma 2 >>]", "0.501960784", vec![128]),
+        ("[/CalRGB 6 0 R]", "0.501960784 0.501960784 0.501960784", vec![128,128,128]),
+        ("[/Indexed [/CalRGB 6 0 R] 0 <808080>]", "0", vec![0]),
+        ("[/Separation /Spot [/CalGray << /WhitePoint [0.95047 1 1.08883] /Gamma 2 >>] << /FunctionType 2 /Domain [0 1] /C0 [0] /C1 [1] /N 1 >>]", "0.501960784", vec![128]),
+    ] {
+        let content = format!("/C cs {values} scn 0 0 50 50 re f q 50 0 0 50 60 0 cm /Im Do Q");
+        let pdf = assemble(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R /Resources << /ColorSpace << /C {space} >> /XObject << /Im 5 0 R >> >> >>").into_bytes(),
+            stream_obj("", content.as_bytes()),
+            stream_obj(&format!("/Subtype /Image /Width 1 /Height 1 /BitsPerComponent 8 /ColorSpace {space}"), &samples),
+            b"<< /WhitePoint 7 0 R /Gamma 8 0 R /Matrix 9 0 R >>".to_vec(),
+            b"[0.95047 1 1.08883]".to_vec(),
+            b"[2 2 2]".to_vec(),
+            b"[0.4124 0.2126 0.0193 0.3576 0.7152 0.1192 0.1805 0.0722 0.9505]".to_vec(),
+        ]);
+        let rendered = render(pdf);
+        let vector = px(&rendered, 25.0, 25.0);
+        let image = px(&rendered, 85.0, 25.0);
+        assert_eq!(vector, image, "{space}");
+        assert!(vector.iter().all(|v| (i32::from(*v) - 138).abs() <= 1), "{space}: {vector:?}");
+    }
+}
+
 /// A Square annotation whose /AP /N draws a red square over BBox [0,10]²,
 /// mapped onto /Rect [50 50 150 150] — the 12.5.5 scale-to-rect algebra.
 #[test]

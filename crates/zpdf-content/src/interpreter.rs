@@ -326,6 +326,8 @@ enum ActiveColorSpace {
     DeviceGray,
     DeviceRGB,
     DeviceCMYK,
+    CalGray(zpdf_color::CalGrayParams),
+    CalRGB(zpdf_color::CalRGBParams),
     ICCBased(u8),
     /// ICCBased with a compiled profile→sRGB transform (shared through the
     /// document's `IccCache`). Without a usable profile the space resolves to
@@ -369,8 +371,8 @@ enum ActiveColorSpace {
 impl ActiveColorSpace {
     fn components(&self) -> usize {
         match self {
-            Self::DeviceGray => 1,
-            Self::DeviceRGB => 3,
+            Self::DeviceGray | Self::CalGray(_) => 1,
+            Self::DeviceRGB | Self::CalRGB(_) => 3,
             Self::DeviceCMYK => 4,
             Self::ICCBased(n) => (*n).max(1) as usize,
             Self::Icc(t) => t.components(),
@@ -1930,8 +1932,24 @@ impl<'a> ContentInterpreter<'a> {
                 }
                 ActiveColorSpace::Lab { white_point, range }
             }
-            "CalGray" => ActiveColorSpace::DeviceGray,
-            "CalRGB" => ActiveColorSpace::DeviceRGB,
+            "CalGray" | "CalRGB" => {
+                let params = arr
+                    .get(1)
+                    .and_then(|o| self.resolve_dict_of(o))
+                    .unwrap_or_default();
+                let mut resolve = |id| self.file.and_then(|f| f.resolve(id).ok());
+                if cs_name.as_str() == "CalGray" {
+                    ActiveColorSpace::CalGray(zpdf_color::CalGrayParams::from_pdf_dict(
+                        &params,
+                        &mut resolve,
+                    ))
+                } else {
+                    ActiveColorSpace::CalRGB(zpdf_color::CalRGBParams::from_pdf_dict(
+                        &params,
+                        &mut resolve,
+                    ))
+                }
+            }
             // `[/Pattern base]` — retain the base space for uncolored patterns.
             "Pattern" => ActiveColorSpace::Pattern {
                 base: arr
@@ -2223,6 +2241,14 @@ impl<'a> ContentInterpreter<'a> {
     fn components_to_rgb(&self, cs: &ActiveColorSpace, vals: &[f64]) -> Color {
         let get = |i: usize| vals.get(i).copied().unwrap_or(0.0);
         match cs {
+            ActiveColorSpace::CalGray(params) => {
+                let (r, g, b) = params.to_rgb(get(0));
+                Color::rgb(r as f32, g as f32, b as f32)
+            }
+            ActiveColorSpace::CalRGB(params) => {
+                let (r, g, b) = params.to_rgb([get(0), get(1), get(2)]);
+                Color::rgb(r as f32, g as f32, b as f32)
+            }
             ActiveColorSpace::DeviceGray | ActiveColorSpace::ICCBased(1) => {
                 Color::gray(get(0) as f32)
             }
@@ -6417,6 +6443,25 @@ fn resolve_image_colorspace(
                         alternate: Box::new(alternate.unwrap_or(Rcs::Gray)),
                     })
                 }
+                "CalGray" | "CalRGB" => {
+                    let params = match arr.get(1)? {
+                        PdfObject::Ref(r) => file?.resolve(*r).ok()?,
+                        other => other.clone(),
+                    };
+                    let params = params.as_dict().ok()?;
+                    let mut resolve = |id| file.and_then(|f| f.resolve(id).ok());
+                    Some(if head == "CalGray" {
+                        Rcs::CalGray(zpdf_color::CalGrayParams::from_pdf_dict(
+                            params,
+                            &mut resolve,
+                        ))
+                    } else {
+                        Rcs::CalRGB(zpdf_color::CalRGBParams::from_pdf_dict(
+                            params,
+                            &mut resolve,
+                        ))
+                    })
+                }
                 "Lab" => {
                     let params = match arr.get(1)? {
                         PdfObject::Ref(r) => file?.resolve(*r).ok()?,
@@ -7755,7 +7800,7 @@ mod tests {
             Some(Rcs::Cmyk)
         );
         let cs = PdfObject::Name(PdfName::new("CalGray"));
-        assert_eq!(
+        assert!(matches!(
             resolve_image_colorspace(
                 None,
                 None,
@@ -7763,8 +7808,8 @@ mod tests {
                 0,
                 zpdf_color::RenderIntent::default()
             ),
-            Some(Rcs::Gray)
-        );
+            Some(Rcs::CalGray(_))
+        ));
         let cs = PdfObject::Name(PdfName::new("Pattern"));
         assert_eq!(
             resolve_image_colorspace(
