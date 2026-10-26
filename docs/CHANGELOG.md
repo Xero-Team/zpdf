@@ -5,6 +5,9 @@
 - Decode current indirect Filter/DecodeParms/DP and JBIG2Globals for content
   edits, enforce encoded-stream limits, charge separators only between streams,
   and reject undecodable source content before stamping. (#88)
+- Prefer native GPU backends during headless initialization; probe GLES only
+  when no native adapter is available and honor `WGPU_BACKEND`. Avoid EGL
+  context races when independent renderers request adapters concurrently.
 - Preserve untouched form appearances during partial fills, reject duplicate
   source pages before appending/extracting, and reject annotation regeneration
   when required geometry is damaged. (#87, #89, #94, #101)
