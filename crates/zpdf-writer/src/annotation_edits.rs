@@ -58,6 +58,37 @@ impl IncrementalWriter {
                 inputs.insert(PdfName::new(key), value);
             }
         }
+        // An existing custom /AP may still render when the source geometry is
+        // damaged. Do not replace it with an empty appearance on regeneration.
+        let coordinates = |key: &str, min: usize, multiple: usize| {
+            inputs.get_array(key).is_ok_and(|values| {
+                values.len() >= min
+                    && values.len().is_multiple_of(multiple)
+                    && values.iter().all(|v| v.as_f64().is_ok())
+            })
+        };
+        let usable_geometry = match subtype.as_str() {
+            "Highlight" | "Underline" | "StrikeOut" | "Squiggly" => coordinates("QuadPoints", 8, 8),
+            "Line" => coordinates("L", 4, 4) && inputs.get_array("L")?.len() == 4,
+            "Polygon" => coordinates("Vertices", 6, 2),
+            "PolyLine" => coordinates("Vertices", 4, 2),
+            "Ink" => inputs.get_array("InkList").is_ok_and(|paths| {
+                !paths.is_empty()
+                    && paths.iter().all(|path| {
+                        path.as_array().is_ok_and(|points| {
+                            points.len() >= 4
+                                && points.len().is_multiple_of(2)
+                                && points.iter().all(|v| v.as_f64().is_ok())
+                        })
+                    })
+            }),
+            _ => true,
+        };
+        if !usable_geometry {
+            return Err(
+                invalid_data("annotation geometry cannot regenerate its appearance").into(),
+            );
+        }
         let rect = crate::annotate::rect_from_dict(&inputs)
             .ok_or_else(|| invalid_data("annotation has no usable Rect"))?
             .normalize();
