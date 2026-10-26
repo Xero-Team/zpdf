@@ -84,37 +84,9 @@ impl<'w> FormFiller<'w> {
             .ok_or_else(|| invalid_data("catalog has no /AcroForm"))?
             .clone();
 
-        // Stored appearances generated in this session are authoritative.
-        // Previously stale, untouched text appearances remain eligible for
-        // regeneration by dropping their old /AP before clearing the flag.
-        if !self.need_appearances
-            && self
-                .writer
-                .deref_current(&af_ref)
-                .as_dict()
-                .ok()
-                .is_some_and(|form| {
-                    matches!(form.get("NeedAppearances"), Some(PdfObject::Bool(true)))
-                })
-        {
-            let untouched: Vec<_> = self
-                .writer
-                .document()
-                .acro_form()
-                .unwrap()
-                .fields
-                .iter()
-                .filter(|field| matches!(field.kind, FieldKind::Text | FieldKind::Choice))
-                .flat_map(|field| field.widgets.iter().copied())
-                .filter(|id| !self.changed_widgets.contains(id))
-                .collect();
-            for id in untouched {
-                if let Ok(PdfObject::Dict(mut dict)) = self.writer.resolve_current(id) {
-                    dict.0.remove(&PdfName::new("AP"));
-                    self.writer.overwrite_object(id, PdfObject::Dict(dict));
-                }
-            }
-        }
+        // Only widgets filled in this session have been regenerated. Retain
+        // every untouched /AP: it may contain embedded fonts or custom artwork
+        // that a viewer cannot reconstruct from the field's /DA and /V.
         match af_ref {
             PdfObject::Ref(r) => {
                 let mut af_dict = self.writer.resolve_current(r)?.as_dict()?.clone();
@@ -520,5 +492,69 @@ mod tests {
         let doc = zpdf_document::PdfDocument::open(output.into_inner()).unwrap();
         assert!(matches!(&doc.acro_form().unwrap().fields[0].value,
             Some(FieldValue::Text(value)) if value.is_empty()));
+    }
+
+    #[test]
+    fn filling_one_field_preserves_an_untouched_stored_appearance() {
+        let mut source = IncrementalWriter::new(pdf_with_text_field()).unwrap();
+        let mut ap = PdfDict::new();
+        ap.insert(
+            PdfName::new("Subtype"),
+            PdfObject::Name(PdfName::new("Form")),
+        );
+        ap.insert(
+            PdfName::new("BBox"),
+            PdfObject::Array([0, 0, 100, 20].map(PdfObject::Integer).to_vec()),
+        );
+        let (n, g) = source
+            .try_add_stream(&ap, b"1 0 0 rg 0 0 100 20 re f")
+            .unwrap();
+        let appearance = ObjectId(n, g as u16);
+        let mut untouched = source
+            .resolve_current(ObjectId(4, 0))
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .clone();
+        untouched.insert(
+            PdfName::new("T"),
+            PdfObject::String(encode_text_string("other")),
+        );
+        let mut appearances = PdfDict::new();
+        appearances.insert(PdfName::new("N"), PdfObject::Ref(appearance));
+        untouched.insert(PdfName::new("AP"), PdfObject::Dict(appearances));
+        let (n, g) = source.try_add_object(&PdfObject::Dict(untouched)).unwrap();
+        let other = ObjectId(n, g as u16);
+        let mut form = source
+            .resolve_current(ObjectId(5, 0))
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .clone();
+        form.insert(
+            PdfName::new("Fields"),
+            PdfObject::Array(vec![PdfObject::Ref(ObjectId(4, 0)), PdfObject::Ref(other)]),
+        );
+        form.insert(PdfName::new("NeedAppearances"), PdfObject::Bool(true));
+        source.overwrite_object(ObjectId(5, 0), PdfObject::Dict(form));
+        let mut page = source
+            .resolve_current(ObjectId(3, 0))
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .clone();
+        page.insert(
+            PdfName::new("Annots"),
+            PdfObject::Array(vec![PdfObject::Ref(ObjectId(4, 0)), PdfObject::Ref(other)]),
+        );
+        source.overwrite_object(ObjectId(3, 0), PdfObject::Dict(page));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        source.write(&mut bytes).unwrap();
+        let mut writer = IncrementalWriter::new(bytes.into_inner()).unwrap();
+        let original = writer.resolve_current(other).unwrap();
+        let mut filler = FormFiller::new(&mut writer).unwrap();
+        filler.set("name", "new").unwrap();
+        filler.finish().unwrap();
+        assert_eq!(writer.resolve_current(other).unwrap(), original);
     }
 }
