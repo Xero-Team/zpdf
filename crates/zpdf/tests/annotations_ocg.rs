@@ -1,7 +1,7 @@
 //! Annotation /AP painting and optional-content (OCG) acceptance tests.
 #![cfg(feature = "cpu-render")]
 
-use zpdf::{ContentInterpreter, ImageCache, PdfDocument, RenderBackend};
+use zpdf::{PdfDocument, RenderBackend};
 
 const SCALE: f32 = 2.0;
 
@@ -38,21 +38,12 @@ fn stream_obj(dict: &str, content: &[u8]) -> Vec<u8> {
 /// Render page 0 with annotations + optional content wired like the CLI does.
 fn render(pdf: Vec<u8>) -> zpdf::cpu::RenderedPage {
     let doc = PdfDocument::open(pdf).expect("open pdf");
-    let page = doc.page(0).expect("page 0");
-    let mut fonts = doc.load_page_fonts(&page);
-    let content = doc.page_content_bytes(&page).expect("content bytes");
-    let mut images = ImageCache::new();
-    let annotations = doc.page_annotations(&page);
-    let oc = doc.oc_config();
-    let mut interp = ContentInterpreter::new(page.media_box)
-        .with_fonts(&mut fonts)
-        .with_document(doc.file(), &page.resources)
-        .with_images(&mut images)
-        .with_annotations(&annotations);
-    if let Some(oc) = &oc {
-        interp = interp.with_optional_content(oc);
-    }
-    let dl = interp.interpret(&content);
+    let zpdf::InterpretedPage {
+        display_list: dl,
+        fonts,
+        images,
+        ..
+    } = zpdf::interpret_page(&doc, 0, zpdf::PageInterpretOptions::default()).unwrap();
     zpdf::cpu::CpuRenderer::new()
         .with_fonts(&fonts)
         .with_images(&images)

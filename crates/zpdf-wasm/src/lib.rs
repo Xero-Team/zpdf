@@ -165,27 +165,17 @@ impl Pdf {
             1.0
         };
         let page = self.doc.page(index).map_err(js_err)?;
-        let mut fonts = self.doc.load_page_fonts(&page);
-        let mut images = zpdf::ImageCache::new();
-        let content = self.doc.page_content_bytes(&page).map_err(js_err)?;
-        let page_box = page.effective_box();
-        let mut interpreter = zpdf::ContentInterpreter::new(page_box)
-            .with_page_rotation(page.rotate)
-            .with_fonts(&mut fonts)
-            .with_document(self.doc.file(), &page.resources)
-            .with_shared_fonts(&self.doc)
-            .with_images(&mut images)
-            .with_colors(&mut self.icc)
-            .with_operand_stack_limit(self.doc.file().limits().max_operand_stack_depth as usize);
-        // Store images at the footprint the CPU renderer below filters them
-        // to, instead of keeping full-size scans in wasm memory for the render.
-        if let Some(raster_scale) = zpdf::cpu::CpuRenderer::new()
+        let mut options = zpdf::PageInterpretOptions::default();
+        options.image_downscale = zpdf::cpu::CpuRenderer::new()
             .with_limits(self.doc.file().limits())
-            .raster_scale(page_box, scale)
-        {
-            interpreter = interpreter.with_image_downscale(raster_scale);
-        }
-        let dl = interpreter.interpret(&content);
+            .raster_scale(page.effective_box(), scale);
+        let zpdf::InterpretedPage {
+            display_list: dl,
+            fonts,
+            images,
+            ..
+        } = zpdf::interpret_page_with_cache(&self.doc, index, options, &mut self.icc)
+            .map_err(js_err)?;
 
         let target = zpdf::cpu::CpuRenderer::new()
             .with_limits(self.doc.file().limits())
@@ -203,43 +193,32 @@ impl Pdf {
     /// Extract a page's text in reading order (struct-tree order when the
     /// document is tagged, geometric order otherwise).
     pub fn page_text(&mut self, index: usize) -> Result<String, JsError> {
-        let page = self.doc.page(index).map_err(js_err)?;
-        let mut fonts = self.doc.load_page_fonts(&page);
-        let content = self.doc.page_content_bytes(&page).map_err(js_err)?;
-        let mut spans: Vec<zpdf::TextSpan> = Vec::new();
-        {
-            let interpreter = zpdf::ContentInterpreter::new(page.effective_box())
-                .with_fonts(&mut fonts)
-                .with_document(self.doc.file(), &page.resources)
-                .with_shared_fonts(&self.doc)
-                .with_colors(&mut self.icc)
-                .with_text_sink(&mut spans)
-                .with_operand_stack_limit(
-                    self.doc.file().limits().max_operand_stack_depth as usize,
-                );
-            let _ = interpreter.interpret(&content);
-        }
-        Ok(match self.doc.struct_tree() {
-            Some(tree) => zpdf::struct_ordered_text(&spans, index, &tree),
-            None => zpdf::spans_to_text(spans, 2.0),
-        })
+        let result = zpdf::convert_pdf(
+            &self.doc,
+            &[index],
+            zpdf::ConversionOptions {
+                mode: zpdf::ConversionMode::TextOnly,
+                use_structure: true,
+            },
+        )
+        .map_err(js_err)?;
+        Ok(result.pages.into_iter().map(|page| page.text).collect())
     }
 
     /// Export a page as a standalone vector SVG document.
     pub fn page_svg(&mut self, index: usize) -> Result<String, JsError> {
-        let page = self.doc.page(index).map_err(js_err)?;
-        let mut fonts = self.doc.load_page_fonts(&page);
-        let mut images = zpdf::ImageCache::new();
-        let content = self.doc.page_content_bytes(&page).map_err(js_err)?;
-        let dl = zpdf::ContentInterpreter::new(page.effective_box())
-            .with_page_rotation(page.rotate)
-            .with_fonts(&mut fonts)
-            .with_document(self.doc.file(), &page.resources)
-            .with_shared_fonts(&self.doc)
-            .with_images(&mut images)
-            .with_colors(&mut self.icc)
-            .with_operand_stack_limit(self.doc.file().limits().max_operand_stack_depth as usize)
-            .interpret(&content);
+        let zpdf::InterpretedPage {
+            display_list: dl,
+            fonts,
+            images,
+            ..
+        } = zpdf::interpret_page_with_cache(
+            &self.doc,
+            index,
+            zpdf::PageInterpretOptions::default(),
+            &mut self.icc,
+        )
+        .map_err(js_err)?;
         Ok(zpdf_svg_export::display_list_to_svg(
             &dl,
             &fonts,

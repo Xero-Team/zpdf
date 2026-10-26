@@ -1458,78 +1458,35 @@ fn cmd_render(args: &[String]) -> zpdf::Result<()> {
         dpi
     );
 
-    // Load page fonts
-    let mut font_cache = doc.load_page_fonts(&page);
-    let initial_fonts = font_cache.len();
-    let initial_with_data = (0..initial_fonts)
-        .filter(|&i| {
-            font_cache
-                .get(i as u32)
-                .map(|f| f.has_font_data())
-                .unwrap_or(false)
-        })
-        .count();
-    println!(
-        "  Fonts loaded: {} ({} with embedded data)",
-        initial_fonts, initial_with_data
-    );
-
-    // Decode content stream
-    let content_bytes = doc.page_content_bytes(&page)?;
-    println!("  Content stream: {} bytes decoded", content_bytes.len());
-
-    // Interpret content stream → display list
-    let mut image_cache = zpdf::ImageCache::new();
-    let annotations = doc.page_annotations(&page);
-    let oc_config = doc.oc_config();
-    let mut icc_cache = zpdf::IccCache::new();
-    // PDF/X & PDF 2.0 output intents: colour-manage DeviceCMYK through the
-    // page's (or document's) /DestOutputProfile when it is a CMYK ICC profile.
-    // Compiled via `icc_cache` here, before `with_colors` takes its borrow.
-    let doc_intents = doc.output_intents();
-    let oi_cmyk = zpdf::output_intent_cmyk_profile(
-        doc.file(),
-        doc.page_output_intents(&page),
-        &doc_intents,
-        &mut icc_cache,
-    );
-    let mut interpreter = zpdf::ContentInterpreter::new(page_box)
-        .with_page_rotation(page.rotate)
-        .with_fonts(&mut font_cache)
-        .with_document(doc.file(), &page.resources)
-        .with_shared_fonts(&doc)
-        .with_images(&mut image_cache)
-        .with_colors(&mut icc_cache)
-        .with_annotations(&annotations)
-        .with_operand_stack_limit(doc.file().limits().max_operand_stack_depth as usize);
-    if let Some(oc) = &oc_config {
-        interpreter = interpreter.with_optional_content(oc);
-    }
-    if let Some(profile) = oi_cmyk {
-        println!("  Output intent: DeviceCMYK colour-managed via /DestOutputProfile");
-        interpreter = interpreter.with_output_intent_cmyk(profile);
-    }
     let scale = dpi / 72.0;
-    // The CPU backend receives images already box-filtered to the footprint it
-    // would filter them to on draw, so full-size scans are not retained for
-    // the render. Other backends need the decoded sources.
-    #[cfg(feature = "cpu")]
-    if backend == "cpu" {
-        if let Some(raster_scale) = zpdf::cpu::CpuRenderer::new()
-            .with_limits(doc.file().limits())
-            .raster_scale(page_box, scale)
+    let image_downscale = {
+        #[cfg(feature = "cpu")]
         {
-            interpreter = interpreter.with_image_downscale(raster_scale);
+            if backend == "cpu" {
+                zpdf::cpu::CpuRenderer::new()
+                    .with_limits(doc.file().limits())
+                    .raster_scale(page_box, scale)
+            } else {
+                None
+            }
         }
-    }
-    let display_list = interpreter.interpret(&content_bytes);
+        #[cfg(not(feature = "cpu"))]
+        {
+            None
+        }
+    };
+    let mut options = zpdf::PageInterpretOptions::default();
+    options.image_downscale = image_downscale;
+    let zpdf::InterpretedPage {
+        display_list,
+        fonts: font_cache,
+        images: image_cache,
+        content_bytes,
+        ..
+    } = zpdf::interpret_page(&doc, page_index, options)?;
+    println!("  Fonts loaded: {}", font_cache.len());
+    println!("  Content stream: {content_bytes} bytes decoded");
 
-    if font_cache.len() > initial_fonts {
-        println!(
-            "  Form XObject fonts: {} additional",
-            font_cache.len() - initial_fonts
-        );
-    }
     println!("  Display list: {} commands", display_list.commands.len());
 
     // Count command types
@@ -3275,31 +3232,26 @@ fn cmd_export_pptx(args: &[String]) -> zpdf::Result<()> {
     // Determine slide size from first page
     let first_page = doc.page(page_indices[0])?;
     let page_box = first_page.effective_box();
-    let width_pt = page_box.width();
-    let height_pt = page_box.height();
+    let (width_pt, height_pt) = if first_page.rotate.rem_euclid(180) == 90 {
+        (page_box.height(), page_box.width())
+    } else {
+        (page_box.width(), page_box.height())
+    };
     let width_emu = ((width_pt / 72.0) * 914400.0) as i64;
     let height_emu = ((height_pt / 72.0) * 914400.0) as i64;
 
     for &page_index in &page_indices {
-        let page = doc.page(page_index)?;
-        let page_box = page.effective_box();
-
-        // Load fonts and images for this page
-        let mut font_cache = doc.load_page_fonts(&page);
-        let mut image_cache = zpdf::ImageCache::new();
-
-        // Interpret content stream to display list
-        let content_bytes = doc.page_content_bytes(&page)?;
-        let interpreter = zpdf::ContentInterpreter::new(page_box)
-            .with_page_rotation(page.rotate)
-            .with_fonts(&mut font_cache)
-            .with_document(doc.file(), &page.resources)
-            .with_shared_fonts(&doc)
-            .with_images(&mut image_cache)
-            .with_colors(&mut icc_cache)
-            .with_operand_stack_limit(doc.file().limits().max_operand_stack_depth as usize);
-
-        let display_list = interpreter.interpret(&content_bytes);
+        let zpdf::InterpretedPage {
+            display_list,
+            fonts: font_cache,
+            images: image_cache,
+            ..
+        } = zpdf::interpret_page_with_cache(
+            &doc,
+            page_index,
+            zpdf::PageInterpretOptions::default(),
+            &mut icc_cache,
+        )?;
 
         // Convert display list to PowerPoint slide
         let options = zpdf_pptx_export::ConversionOptions::default();
@@ -3422,22 +3374,17 @@ fn cmd_export_svg(args: &[String]) -> zpdf::Result<()> {
 
     let mut icc_cache = zpdf::IccCache::new();
     for &page_index in &page_indices {
-        let page = doc.page(page_index)?;
-        let page_box = page.effective_box();
-
-        let mut font_cache = doc.load_page_fonts(&page);
-        let mut image_cache = zpdf::ImageCache::new();
-
-        let content_bytes = doc.page_content_bytes(&page)?;
-        let interpreter = zpdf::ContentInterpreter::new(page_box)
-            .with_page_rotation(page.rotate)
-            .with_fonts(&mut font_cache)
-            .with_document(doc.file(), &page.resources)
-            .with_shared_fonts(&doc)
-            .with_images(&mut image_cache)
-            .with_colors(&mut icc_cache)
-            .with_operand_stack_limit(doc.file().limits().max_operand_stack_depth as usize);
-        let display_list = interpreter.interpret(&content_bytes);
+        let zpdf::InterpretedPage {
+            display_list,
+            fonts: font_cache,
+            images: image_cache,
+            ..
+        } = zpdf::interpret_page_with_cache(
+            &doc,
+            page_index,
+            zpdf::PageInterpretOptions::default(),
+            &mut icc_cache,
+        )?;
 
         let svg = zpdf_svg_export::display_list_to_svg(
             &display_list,

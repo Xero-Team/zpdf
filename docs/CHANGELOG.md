@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add a shared high-level page interpretation API and use it for CLI raster,
+  SVG/PPTX export and WASM rendering, keeping annotations, default layers and
+  output intents consistent across these entry points. (#92)
+
 - Apply text transforms, scaled font sizes and basic font styles in PPTX
   export; preserve text/image rotation and reflection with a new
   SlideElement::Transformed variant (exhaustive matches need updating).
