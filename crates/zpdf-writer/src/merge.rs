@@ -61,25 +61,7 @@ pub fn extract_pages(source: &PdfFile, page_indices: &[usize]) -> Result<Vec<u8>
     let mut writer = IncrementalWriter::new(stub_pdf())?;
     writer.append_pages(source, page_indices)?;
 
-    // Drop the stub's placeholder page (object 3 0) from the root /Kids.
-    // delete_pages can't be used here: its "don't delete every page" guard
-    // works off the parse-time page count, which is 1 for the stub.
-    let root = ObjectId(2, 0);
-    let mut root_dict = writer.resolve_current(root)?.as_dict()?.clone();
-    let kids = match root_dict.get("Kids") {
-        Some(PdfObject::Array(a)) => a.clone(),
-        _ => return Err(invalid_data("stub root /Kids missing").into()),
-    };
-    let filtered: Vec<PdfObject> = kids
-        .into_iter()
-        .filter(|k| !matches!(k, PdfObject::Ref(r) if *r == ObjectId(3, 0)))
-        .collect();
-    root_dict.insert(
-        PdfName::new("Count"),
-        PdfObject::Integer(filtered.len() as i64),
-    );
-    root_dict.insert(PdfName::new("Kids"), PdfObject::Array(filtered));
-    writer.overwrite_object(root, PdfObject::Dict(root_dict));
+    writer.delete_pages(&[0])?;
 
     let mut out = std::io::Cursor::new(Vec::new());
     writer.write(&mut out)?;
@@ -110,7 +92,8 @@ impl IncrementalWriter {
         Ok(count)
     }
 
-    /// Append the given 0-based pages of `source`, in the given order.
+    /// Append the given distinct 0-based pages of `source`, in the given order.
+    /// Duplicate indices are rejected before modifying the writer.
     pub fn append_pages(&mut self, source: &PdfFile, page_indices: &[usize]) -> Result<()> {
         self.append_pages_mapped(source, page_indices)?;
         Ok(())
@@ -137,6 +120,12 @@ impl IncrementalWriter {
                 ))
                 .into());
             }
+        }
+
+        if page_indices.iter().copied().collect::<HashSet<_>>().len() != page_indices.len() {
+            // Reusing one source->destination map would put the same leaf into
+            // /Kids twice. Stable editing indices must identify distinct pages.
+            return Err(invalid_data("source page indices must be distinct").into());
         }
 
         let root = self.root_pages_id_pub()?;
@@ -192,6 +181,9 @@ impl IncrementalWriter {
             PdfObject::Integer(old_count + new_kids.len() as i64),
         );
         self.overwrite_object(root, PdfObject::Dict(root_dict));
+        let first = self.page_slots.len();
+        self.page_slots.extend(new_kids.iter().copied().map(Some));
+        self.page_order.extend(first..self.page_slots.len());
         Ok(id_map)
     }
 

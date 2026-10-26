@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Track surviving page identities across repeated deletions, reordering and
+  appending. Expose current page count/order and map WASM page positions to
+  stable writer indices. (#89)
+
 - Preserve indirect content arrays and pending stream edits when stamping or
   redacting pages; abort on undecodable content instead of replacing it with
   an empty stream. (#88)

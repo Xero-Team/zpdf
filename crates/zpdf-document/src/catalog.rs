@@ -201,12 +201,14 @@ impl Catalog {
     }
 
     pub fn get_page(&self, file: &PdfFile, index: usize) -> Result<PdfPage> {
-        let page_ref =
-            self.page_refs.get(index).copied().ok_or_else(|| {
-                Error::InvalidObject(0, format!("page index {index} out of range"))
-            })?;
+        PdfPage::from_object(file, self.page_id(index)?)
+    }
 
-        PdfPage::from_object(file, page_ref)
+    pub(crate) fn page_id(&self, index: usize) -> Result<ObjectId> {
+        self.page_refs
+            .get(index)
+            .copied()
+            .ok_or_else(|| Error::InvalidObject(0, format!("page index {index} out of range")))
     }
 }
 

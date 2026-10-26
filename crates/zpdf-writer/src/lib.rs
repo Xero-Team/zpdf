@@ -113,6 +113,10 @@ pub struct IncrementalWriter {
     /// Set when `/Info` was created (rather than overwritten in place) and the
     /// new trailer must point at the new object.
     info_ref_override: Option<ObjectId>,
+    /// Stable editing indices; deleted slots are never reused.
+    page_slots: Vec<Option<ObjectId>>,
+    /// Surviving stable indices in the current display order.
+    page_order: Vec<usize>,
 }
 
 impl IncrementalWriter {
@@ -170,6 +174,10 @@ impl IncrementalWriter {
             .ok_or_else(|| invalid_data("could not find startxref in original PDF"))?;
 
         let xref_kind = detect_xref_kind(file.data(), original_xref_pos);
+        let page_slots = (0..doc.page_count())
+            .map(|index| doc.page_id(index).map(Some))
+            .collect::<Result<Vec<_>>>()?;
+        let page_order = (0..page_slots.len()).collect();
 
         Ok(Self {
             doc,
@@ -179,6 +187,8 @@ impl IncrementalWriter {
             catalog_ref: root,
             xref_kind,
             info_ref_override: None,
+            page_slots,
+            page_order,
         })
     }
 
@@ -186,6 +196,25 @@ impl IncrementalWriter {
     /// reflected — use [`Self::resolve_current`] for those).
     pub fn document(&self) -> &PdfDocument {
         &self.doc
+    }
+
+    /// Current number of surviving pages, including appended pages.
+    pub fn page_count(&self) -> usize {
+        self.page_order.len()
+    }
+
+    /// Stable editing indices in current page order. Original page indices
+    /// retain their identity; newly appended pages receive new indices.
+    pub fn page_indices(&self) -> &[usize] {
+        &self.page_order
+    }
+
+    /// Translate a current page position into its stable editing index.
+    pub fn page_index_at(&self, position: usize) -> Result<usize> {
+        self.page_order
+            .get(position)
+            .copied()
+            .ok_or_else(|| invalid_data("page position out of range").into())
     }
 
     /// The catalog (trailer `/Root`) reference of the base document.
@@ -376,14 +405,13 @@ impl IncrementalWriter {
         Ok(())
     }
 
-    /// The object id of a 0-based page index (pending edits do not change page
-    /// identity, so the original page tree is authoritative).
+    /// Resolve a stable editing index; deleted pages cannot be edited.
     pub(crate) fn page_id(&self, page_index: usize) -> Result<ObjectId> {
-        Ok(self
-            .doc
-            .page(page_index)
-            .map_err(|_| invalid_data(&format!("page {} not found", page_index)))?
-            .id)
+        self.page_slots
+            .get(page_index)
+            .copied()
+            .flatten()
+            .ok_or_else(|| invalid_data(&format!("page {page_index} not found or deleted")).into())
     }
 
     /// Build a page dict with one more `/Annots` entry.

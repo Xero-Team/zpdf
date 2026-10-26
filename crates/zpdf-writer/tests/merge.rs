@@ -119,6 +119,68 @@ fn merge_three_documents() {
 }
 
 #[test]
+fn repeated_deletion_is_idempotent_and_cannot_delete_the_last_pages() {
+    let mut writer = IncrementalWriter::new(pdf_with_pages(3, 600)).unwrap();
+    writer.delete_pages(&[0]).unwrap();
+    writer.delete_pages(&[0, 0]).unwrap();
+    assert_eq!(writer.page_count(), 2);
+    assert_eq!(writer.page_indices(), &[1, 2]);
+    let mut out = Cursor::new(Vec::new());
+    writer.write(&mut out).unwrap();
+    let doc = PdfDocument::open(out.into_inner()).unwrap();
+    assert_eq!(doc.page_count(), 2);
+    assert_eq!(
+        doc.file()
+            .resolve(zpdf_core::ObjectId(2, 0))
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get_i64("Count")
+            .unwrap(),
+        2
+    );
+    assert!(writer.delete_pages(&[1, 2]).is_err());
+    assert!(writer.rotate_page(0, 90).is_err());
+    assert_eq!(writer.page_count(), 2);
+}
+
+#[test]
+fn duplicate_source_pages_are_rejected_before_the_page_tree_changes() {
+    let mut writer = IncrementalWriter::new(pdf_with_pages(1, 600)).unwrap();
+    let source = PdfFile::parse(pdf_with_pages(1, 700)).unwrap();
+    let mut before = Cursor::new(Vec::new());
+    writer.write(&mut before).unwrap();
+    assert!(writer.append_pages(&source, &[0, 0]).is_err());
+    assert_eq!(writer.page_indices(), &[0]);
+    let mut after = Cursor::new(Vec::new());
+    writer.write(&mut after).unwrap();
+    assert_eq!(before.into_inner(), after.into_inner());
+    assert!(zpdf_writer::extract_pages(&source, &[0, 0]).is_err());
+}
+
+#[test]
+fn reorder_uses_only_surviving_stable_indices_including_appended_pages() {
+    let mut writer = IncrementalWriter::new(pdf_with_pages(3, 600)).unwrap();
+    writer.delete_pages(&[0]).unwrap();
+    assert!(writer.reorder_pages(&[2, 1, 0]).is_err());
+    writer.reorder_pages(&[2, 1]).unwrap();
+    writer
+        .append_document_pages(&PdfFile::parse(pdf_with_pages(1, 700)).unwrap())
+        .unwrap();
+    assert_eq!(writer.page_indices(), &[2, 1, 3]);
+    writer.reorder_pages(&[3, 1, 2]).unwrap();
+    writer.rotate_page(3, 90).unwrap();
+    let mut out = Cursor::new(Vec::new());
+    writer.write(&mut out).unwrap();
+    let doc = PdfDocument::open(out.into_inner()).unwrap();
+    assert_eq!(doc.page_count(), 3);
+    for (index, width) in [700.0, 601.0, 602.0].into_iter().enumerate() {
+        assert_eq!(doc.page(index).unwrap().width(), width);
+    }
+    assert_eq!(doc.page(0).unwrap().rotate, 90);
+}
+
+#[test]
 fn append_selected_pages_in_custom_order() {
     let a = pdf_with_pages(1, 600);
     let b = pdf_with_pages(3, 700);

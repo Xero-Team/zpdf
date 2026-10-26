@@ -183,6 +183,11 @@ impl PdfDocument {
         self.catalog.get_page(&self.file, index)
     }
 
+    /// Page identity without loading its resources or inherited attributes.
+    pub fn page_id(&self, index: usize) -> Result<ObjectId> {
+        self.catalog.page_id(index)
+    }
+
     pub fn file(&self) -> &PdfFile {
         &self.file
     }
