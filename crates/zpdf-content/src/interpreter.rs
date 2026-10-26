@@ -3644,6 +3644,10 @@ impl<'a> ContentInterpreter<'a> {
         let saved_dl = std::mem::replace(&mut self.display_list, DisplayList::new(page_rect));
         let saved_state = self.current.clone();
         let saved_oc_hidden = self.oc_hidden_from.take();
+        // Mask glyphs and rules define opacity, not logical page content.
+        // Keep /ActualText in those painting resources out of extraction too.
+        let saved_text_sink = self.text_sink.take();
+        let saved_rule_sink = self.rule_sink.take();
         self.current.soft_mask = None;
         self.current.blend_mode = BlendMode::Normal;
         self.current.fill_alpha = 1.0;
@@ -3656,6 +3660,8 @@ impl<'a> ContentInterpreter<'a> {
         self.tock_work(work);
         self.current = saved_state;
         self.oc_hidden_from = saved_oc_hidden;
+        self.text_sink = saved_text_sink;
+        self.rule_sink = saved_rule_sink;
         let mask_dl = std::mem::replace(&mut self.display_list, saved_dl);
 
         // /BC components live in the group's /CS; the mean is a serviceable
@@ -3699,6 +3705,11 @@ impl<'a> ContentInterpreter<'a> {
     }
 
     fn execute_do(&mut self, name: &str) {
+        // A hidden draw does not need a resource. In strict mode, failures in
+        // invisible layers must not reject otherwise complete visible output.
+        if self.oc_suppressed() {
+            return;
+        }
         let file = match self.file {
             Some(f) => f,
             _ => return,
@@ -3717,8 +3728,7 @@ impl<'a> ContentInterpreter<'a> {
         let obj = match file.resolve(xobj_id) {
             Ok(o) => o,
             Err(e) => {
-                self.stats.diagnostics.missing_resources =
-                    self.stats.diagnostics.missing_resources.saturating_add(1);
+                self.stats.diagnostics.record_object_failure(xobj_id, &e);
                 tracing::warn!("failed to resolve XObject {name}: {e}");
                 return;
             }
@@ -3726,14 +3736,14 @@ impl<'a> ContentInterpreter<'a> {
 
         let stream = match obj.as_stream() {
             Ok(s) => s,
-            Err(_) => return,
+            Err(e) => {
+                self.stats.diagnostics.record_object_failure(xobj_id, &e);
+                return;
+            }
         };
 
         // Hidden optional content: skip the XObject entirely (both the
         // surrounding BDC /OC state and the XObject's own /OC key).
-        if self.oc_suppressed() {
-            return;
-        }
         if let Some(oc) = stream.dict.get("OC") {
             if !self.oc_object_visible(oc, 0) {
                 return;

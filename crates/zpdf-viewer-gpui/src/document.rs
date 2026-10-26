@@ -6,7 +6,7 @@ use image::{Frame, RgbaImage};
 use smallvec::SmallVec;
 use thiserror::Error;
 use zpdf::gpu::{GpuContext, WgpuRenderError, WgpuRenderer};
-use zpdf::{ContentInterpreter, IccCache, ImageCache, PdfDocument, RenderBackend};
+use zpdf::{InterpretedPage, PdfDocument, RenderBackend};
 
 pub struct LoadedDocument {
     pub summary: DocumentSummary,
@@ -107,7 +107,7 @@ pub fn load_document(path: PathBuf) -> Result<LoadedDocument, DocumentError> {
         // Report the rendered (effective) page box so the sidebar/footer point
         // dimensions match what the viewer actually rasterizes; rotation is shown
         // separately, as page size is conventionally reported pre-rotation.
-        let eb = page.effective_box();
+        let eb = page.effective_box_points();
         pages.push(PageSummary {
             index,
             width: eb.width(),
@@ -132,98 +132,33 @@ impl LoadedDocument {
         &self.pdf
     }
 
+    // Shared by preview rendering and headless tests. Reject known partial
+    // pages before acquiring a GPU context or publishing an image.
+    fn interpret_preview(&self, index: usize) -> Result<InterpretedPage, DocumentError> {
+        let interpret = || {
+            let page = zpdf::interpret_page(&self.pdf, index, Default::default())?;
+            page.ensure_complete()?;
+            Ok(page)
+        };
+        interpret().map_err(|source| DocumentError::ReadPageContent {
+            path: self.summary.path.clone(),
+            page: index + 1,
+            source,
+        })
+    }
+
     pub fn render_page_preview(
         &self,
         index: usize,
         dpi: f32,
         context_slot: &mut Option<GpuContext>,
     ) -> Result<PagePreview, DocumentError> {
-        let page = self
-            .pdf
-            .page(index)
-            .map_err(|source| DocumentError::ReadPage {
-                path: self.summary.path.clone(),
-                page: index + 1,
-                source,
-            })?;
-        let mut fonts = self.pdf.load_page_fonts(&page);
-        let content = self.pdf.page_content_bytes(&page).map_err(|source| {
-            DocumentError::ReadPageContent {
-                path: self.summary.path.clone(),
-                page: index + 1,
-                source,
-            }
-        })?;
-        let mut images = ImageCache::new();
-        let mut colors = IccCache::new();
-        // Output intents (PDF/X & PDF 2.0): colour-manage DeviceCMYK through the
-        // page's/document's CMYK /DestOutputProfile when present, matching the CLI.
-        let doc_intents = self.pdf.output_intents();
-        let oi_cmyk = zpdf::output_intent_cmyk_profile(
-            self.pdf.file(),
-            self.pdf.page_output_intents(&page),
-            &doc_intents,
-            &mut colors,
-        );
-        // Render the effective box (CropBox ∩ MediaBox) with `/Rotate` baked in,
-        // matching the winit viewer and `PdfPage::effective_box()` invariant — the
-        // raw `media_box` would show the untrimmed sheet and ignore page rotation.
-        let mut interpreter = ContentInterpreter::new(page.effective_box())
-            .with_page_rotation(page.rotate)
-            .with_fonts(&mut fonts)
-            .with_document(self.pdf.file(), &page.resources)
-            .with_shared_fonts(&self.pdf)
-            .with_images(&mut images)
-            .with_colors(&mut colors)
-            .with_operand_stack_limit(self.pdf.file().limits().max_operand_stack_depth as usize);
-        if let Some(ref profile) = oi_cmyk {
-            interpreter = interpreter.with_output_intent_cmyk(profile.clone());
-        }
-        let mut display_list = interpreter.interpret(&content);
-
-        // Render annotations on top of page content
-        let annotations = self.pdf.page_annotations(&page);
-        for annot in annotations {
-            // Skip hidden or no-view annotations
-            if (annot.flags & 0x02) != 0 || (annot.flags & 0x20) != 0 {
-                continue;
-            }
-
-            // Render the annotation's appearance stream
-            if let Some(appearance_id) = annot.appearance {
-                // Try to decode the appearance stream
-                match self.pdf.file().resolve_stream_data(appearance_id) {
-                    Ok(appearance_content) => {
-                        // Create an interpreter for the annotation appearance
-                        let mut annot_interp = ContentInterpreter::new(annot.rect)
-                            .with_fonts(&mut fonts)
-                            .with_document(self.pdf.file(), &page.resources)
-                            .with_shared_fonts(&self.pdf)
-                            .with_images(&mut images)
-                            .with_colors(&mut colors)
-                            .with_operand_stack_limit(
-                                self.pdf.file().limits().max_operand_stack_depth as usize,
-                            );
-                        if let Some(ref profile) = oi_cmyk {
-                            annot_interp = annot_interp.with_output_intent_cmyk(profile.clone());
-                        }
-
-                        let annot_display_list = annot_interp.interpret(&appearance_content);
-
-                        // Merge annotation display list commands into main display list
-                        display_list.commands.extend(annot_display_list.commands);
-                    }
-                    Err(e) => {
-                        // Skip annotations with invalid appearance streams
-                        tracing::warn!(
-                            "Failed to decode annotation appearance {}: {}",
-                            appearance_id,
-                            e
-                        );
-                    }
-                }
-            }
-        }
+        let InterpretedPage {
+            display_list,
+            fonts,
+            images,
+            ..
+        } = self.interpret_preview(index)?;
 
         let mut renderer = WgpuRenderer::new()
             .with_limits(self.pdf.file().limits())
@@ -292,4 +227,113 @@ fn render_image_from_rgba(width: u32, height: u32, mut rgba: Vec<u8>) -> Option<
     let buffer = RgbaImage::from_raw(width, height, rgba)?;
     let frame = Frame::new(buffer);
     Some(Arc::new(RenderImage::new(SmallVec::from_elem(frame, 1))))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zpdf::{ObjectId, PdfDict, PdfName, PdfObject, Rect};
+    use zpdf_writer::{AnnotationSpec, DocumentBuilder, IncrementalWriter};
+
+    fn fixture(content: &[u8]) -> LoadedDocument {
+        let mut builder = DocumentBuilder::new();
+        builder.add_page(120.0, 80.0);
+        let mut writer = IncrementalWriter::new(builder.build().unwrap()).unwrap();
+        writer
+            .add_annotation(
+                0,
+                &AnnotationSpec::Square {
+                    rect: Rect::new(40.0, 20.0, 80.0, 60.0),
+                    color: (1.0, 0.0, 0.0),
+                    interior: Some((1.0, 0.0, 0.0)),
+                    width: 0.0,
+                },
+            )
+            .unwrap();
+        let mut group = PdfDict::new();
+        group.insert(PdfName::new("Type"), PdfObject::Name(PdfName::new("OCG")));
+        let (n, g) = writer.try_add_object(&PdfObject::Dict(group)).unwrap();
+        let group = ObjectId(n, g as u16);
+        let mut config = PdfDict::new();
+        config.insert(
+            PdfName::new("OFF"),
+            PdfObject::Array(vec![PdfObject::Ref(group)]),
+        );
+        let mut oc = PdfDict::new();
+        oc.insert(PdfName::new("D"), PdfObject::Dict(config));
+        let root = writer.document().file().trailer.get_ref("Root").unwrap();
+        let mut catalog = writer
+            .resolve_current(root)
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .clone();
+        catalog.insert(PdfName::new("OCProperties"), PdfObject::Dict(oc));
+        writer.overwrite_object(root, PdfObject::Dict(catalog));
+        let page = writer.document().page(0).unwrap();
+        let mut page_dict = writer
+            .resolve_current(page.id)
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .clone();
+        let mut properties = PdfDict::new();
+        properties.insert(PdfName::new("Layer"), PdfObject::Ref(group));
+        let mut resources = PdfDict::new();
+        resources.insert(PdfName::new("Properties"), PdfObject::Dict(properties));
+        page_dict.insert(PdfName::new("Resources"), PdfObject::Dict(resources));
+        page_dict.insert(PdfName::new("UserUnit"), PdfObject::Integer(2));
+        page_dict.insert(PdfName::new("Rotate"), PdfObject::Integer(90));
+        let (n, g) = writer.try_add_stream(&PdfDict::new(), content).unwrap();
+        page_dict.insert(
+            PdfName::new("Contents"),
+            PdfObject::Ref(ObjectId(n, g as u16)),
+        );
+        writer.overwrite_object(page.id, PdfObject::Dict(page_dict));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        writer.write(&mut bytes).unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "zpdf-preview-{}-{}.pdf",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, bytes.into_inner()).unwrap();
+        let document = load_document(path.clone()).unwrap();
+        std::fs::remove_file(path).unwrap();
+        document
+    }
+
+    #[test]
+    fn preview_honors_layers_annotations_rotation_and_user_units() {
+        let doc = fixture(b"/OC /Layer BDC 0 0 1 rg 0 0 120 80 re f EMC");
+        assert_eq!(
+            (doc.summary.pages[0].width, doc.summary.pages[0].height),
+            (240.0, 160.0)
+        );
+        let page = doc.interpret_preview(0).unwrap();
+        let pixels = zpdf::cpu::CpuRenderer::new()
+            .with_fonts(&page.fonts)
+            .with_images(&page.images)
+            .render_display_list(&page.display_list, 1.0)
+            .unwrap();
+        assert_eq!((pixels.width, pixels.height), (160, 240));
+        let center = (120 * pixels.width as usize + 80) * 4;
+        assert_eq!(&pixels.data[center..center + 4], &[255, 0, 0, 255]);
+        assert_eq!(&pixels.data[..4], &[255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn incomplete_preview_is_rejected_before_rendering() {
+        let doc = fixture(b"/Missing Do");
+        assert!(matches!(
+            doc.interpret_preview(0),
+            Err(DocumentError::ReadPageContent {
+                source: zpdf::Error::IncompleteOutput(_),
+                ..
+            })
+        ));
+    }
 }

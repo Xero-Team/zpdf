@@ -1181,12 +1181,14 @@ fn cmd_text(args: &[String]) -> zpdf::Result<()> {
 
         let mut spans: Vec<zpdf::TextSpan> = Vec::new();
         {
+            let oc_config = doc.oc_config().unwrap_or_default();
             let interpreter = zpdf::ContentInterpreter::new(page.effective_box())
                 .with_page_user_unit(page.user_unit)
                 .with_fonts(&mut font_cache)
                 .with_document(doc.file(), &page.resources)
                 .with_shared_fonts(&doc)
                 .with_colors(&mut icc_cache)
+                .with_optional_content(&oc_config)
                 .with_text_sink(&mut spans)
                 .with_operand_stack_limit(doc.file().limits().max_operand_stack_depth as usize);
             let (_, mut stats) = interpreter.interpret_with_stats(&content_bytes);
@@ -1265,12 +1267,14 @@ fn cmd_search(args: &[String]) -> zpdf::Result<()> {
 
         let mut spans: Vec<zpdf::TextSpan> = Vec::new();
         {
+            let oc_config = doc.oc_config().unwrap_or_default();
             let interpreter = zpdf::ContentInterpreter::new(page.effective_box())
                 .with_page_user_unit(page.user_unit)
                 .with_fonts(&mut font_cache)
                 .with_document(doc.file(), &page.resources)
                 .with_shared_fonts(&doc)
                 .with_colors(&mut icc_cache)
+                .with_optional_content(&oc_config)
                 .with_text_sink(&mut spans)
                 .with_operand_stack_limit(doc.file().limits().max_operand_stack_depth as usize);
             let (_, mut stats) = interpreter.interpret_with_stats(&content_bytes);
@@ -1354,12 +1358,14 @@ fn cmd_tables(args: &[String]) -> zpdf::Result<()> {
         let mut spans: Vec<zpdf::TextSpan> = Vec::new();
         let mut rules: Vec<zpdf::RuleLine> = Vec::new();
         {
+            let oc_config = doc.oc_config().unwrap_or_default();
             let interpreter = zpdf::ContentInterpreter::new(page.effective_box())
                 .with_page_user_unit(page.user_unit)
                 .with_fonts(&mut font_cache)
                 .with_document(doc.file(), &page.resources)
                 .with_shared_fonts(&doc)
                 .with_colors(&mut icc_cache)
+                .with_optional_content(&oc_config)
                 .with_text_sink(&mut spans)
                 .with_rule_sink(&mut rules)
                 .with_operand_stack_limit(doc.file().limits().max_operand_stack_depth as usize);
