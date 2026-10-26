@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Rebuild stored annotation appearances after color, border and FreeText edits,
+  including embedded Unicode text. Move geometry with rectangles so subsequent
+  edits keep their location; reject unsupported custom appearance edits. (#101)
+
 - Honor marked-content ActualText during extraction, including property
   resources, nested/empty replacements, forms and optional content. Bound
   replacement text and isolate painting resources from extraction. (#100)

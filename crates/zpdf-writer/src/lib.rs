@@ -37,6 +37,7 @@ mod serialize;
 use serialize::{serialize_dict, write_object, write_stream};
 
 pub mod annotate;
+mod annotation_edits;
 pub mod builder;
 mod cff;
 mod contents;
@@ -780,10 +781,8 @@ impl IncrementalWriter {
     /// * `new_rect` - New rectangle in PDF coordinates (bottom-left origin)
     ///
     /// # Note
-    /// For annotations with appearance streams, this only updates the `/Rect`.
-    /// The appearance stream itself is not regenerated. For ink annotations and
-    /// stamps where the appearance uses relative coordinates within the BBox,
-    /// this is sufficient.
+    /// Stored appearances scale with `/Rect`. Geometry properties are moved
+    /// alongside it so later color/border edits regenerate at the new location.
     ///
     /// # Example
     /// ```no_run
@@ -805,6 +804,7 @@ impl IncrementalWriter {
     ) -> Result<()> {
         let annot_obj = self.resolve_current(annot_id)?;
         let mut annot_dict = annot_obj.as_dict()?.clone();
+        self.move_annotation_geometry(&mut annot_dict, new_rect)?;
 
         annot_dict.insert(
             PdfName::new("Rect"),
@@ -827,9 +827,8 @@ impl IncrementalWriter {
     /// * `color` - RGB color as (r, g, b) tuple with values in [0.0, 1.0]
     ///
     /// # Note
-    /// This updates the annotation dictionary but does not regenerate the
-    /// appearance stream. For full visual effect, the annotation's appearance
-    /// would need to be regenerated.
+    /// Regenerates supported annotation appearances. FreeText `/C` changes
+    /// its background. Unsupported custom appearances return an error.
     ///
     /// # Example
     /// ```no_run
@@ -848,6 +847,14 @@ impl IncrementalWriter {
         annot_id: ObjectId,
         color: (f64, f64, f64),
     ) -> Result<()> {
+        if ![color.0, color.1, color.2]
+            .iter()
+            .all(|v| v.is_finite() && (0.0..=1.0).contains(v))
+        {
+            return Err(
+                invalid_data("annotation RGB components must be finite and within 0..1").into(),
+            );
+        }
         let annot_obj = self.resolve_current(annot_id)?;
         let mut annot_dict = annot_obj.as_dict()?.clone();
 
@@ -860,6 +867,7 @@ impl IncrementalWriter {
             ]),
         );
 
+        self.regenerate_annotation_appearance(&mut annot_dict, 0)?;
         self.overwrite_object(annot_id, PdfObject::Dict(annot_dict));
         Ok(())
     }
@@ -886,23 +894,15 @@ impl IncrementalWriter {
         let annot_obj = self.resolve_current(annot_id)?;
         let mut annot_dict = annot_obj.as_dict()?.clone();
 
-        // Use UTF-16BE encoding for non-ASCII text (PDF text strings)
-        let encoded = if content.is_ascii() {
-            content.as_bytes().to_vec()
-        } else {
-            let mut bytes = vec![0xfe, 0xff]; // UTF-16BE BOM
-            for ch in content.encode_utf16() {
-                bytes.push((ch >> 8) as u8);
-                bytes.push((ch & 0xff) as u8);
-            }
-            bytes
-        };
-
         annot_dict.insert(
             PdfName::new("Contents"),
-            PdfObject::String(zpdf_core::PdfString(encoded)),
+            PdfObject::String(zpdf_core::encode_text_string(content)),
         );
-
+        if annot_dict.get_name("Subtype").ok() == Some("FreeText") {
+            // Plain text replaces any old rich-content representation too.
+            annot_dict.0.remove("RC");
+            self.regenerate_annotation_appearance(&mut annot_dict, 0)?;
+        }
         self.overwrite_object(annot_id, PdfObject::Dict(annot_dict));
         Ok(())
     }
@@ -911,7 +911,7 @@ impl IncrementalWriter {
     ///
     /// # Arguments
     /// * `annot_id` - Object ID of the annotation to update
-    /// * `width` - New border width in points (minimum 0.1)
+    /// * `width` - New non-negative border width in default user-space units.
     ///
     /// # Example
     /// ```no_run
@@ -926,20 +926,32 @@ impl IncrementalWriter {
     /// # }
     /// ```
     pub fn update_annotation_border_width(&mut self, annot_id: ObjectId, width: f64) -> Result<()> {
+        if !width.is_finite() || width < 0.0 {
+            return Err(
+                invalid_data("annotation border width must be finite and non-negative").into(),
+            );
+        }
         let annot_obj = self.resolve_current(annot_id)?;
         let mut annot_dict = annot_obj.as_dict()?.clone();
 
-        let width = width.max(0.1); // Minimum width
-
         // Get or create the /BS dictionary
+        if !matches!(
+            annot_dict.get_name("Subtype").ok(),
+            Some(
+                "Square" | "Circle" | "Line" | "Polygon" | "PolyLine" | "Ink" | "Link" | "FreeText"
+            )
+        ) {
+            return Err(unsupported("this annotation subtype has no editable border width").into());
+        }
         let mut bs = match annot_dict.get("BS") {
             Some(PdfObject::Dict(d)) => d.clone(),
+            Some(PdfObject::Ref(id)) => self.resolve_current(*id)?.as_dict()?.clone(),
             _ => PdfDict::new(),
         };
 
         bs.insert(PdfName::new("W"), PdfObject::Real(width));
         annot_dict.insert(PdfName::new("BS"), PdfObject::Dict(bs));
-
+        self.regenerate_annotation_appearance(&mut annot_dict, 0)?;
         self.overwrite_object(annot_id, PdfObject::Dict(annot_dict));
         Ok(())
     }
@@ -1031,34 +1043,28 @@ mod tests {
 
     /// Create a minimal test PDF with one annotation for testing
     fn create_test_pdf_with_annotation() -> Vec<u8> {
-        // Minimal PDF with one page and one ink annotation
-        let pdf = b"%PDF-1.4
-1 0 obj
-<< /Type /Catalog /Pages 2 0 R >>
-endobj
-2 0 obj
-<< /Type /Pages /Kids [3 0 R] /Count 1 >>
-endobj
-3 0 obj
-<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [4 0 R] >>
-endobj
-4 0 obj
-<< /Type /Annot /Subtype /Ink /Rect [100 100 200 200] /C [0 0 0] /InkList [[[100 100 200 200]]] /BS << /W 2 >> >>
-endobj
-xref
-0 5
-0000000000 65535 f
-0000000009 00000 n
-0000000058 00000 n
-0000000115 00000 n
-0000000223 00000 n
-trailer
-<< /Size 5 /Root 1 0 R >>
-startxref
-362
-%%EOF
-";
-        pdf.to_vec()
+        // One stroke is an array of coordinate pairs, nested once in /InkList.
+        let objects = [
+            "<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [4 0 R] >>",
+            "<< /Type /Annot /Subtype /Ink /Rect [100 100 200 200] /C [0 0 0] /InkList [[100 100 200 200]] /BS << /W 2 >> >>",
+        ];
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        for (index, object) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.extend_from_slice(format!("{} 0 obj\n{object}\nendobj\n", index + 1).as_bytes());
+        }
+        let xref = pdf.len();
+        pdf.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n");
+        for offset in offsets {
+            pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+        );
+        pdf
     }
 
     #[test]
