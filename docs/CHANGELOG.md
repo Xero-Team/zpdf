@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Preserve selected AcroForm field branches, Widget parent links, values and
+  default font resources when splitting or extracting pages. (#90)
+
 - Track surviving page identities across repeated deletions, reordering and
   appending. Expose current page count/order and map WASM page positions to
   stable writer indices. (#89)

@@ -198,6 +198,11 @@ to translate a current page position. Repeated deletion of a stable index is a
 no-op. The read-only `writer.document()` remains the original snapshot. WASM's
 `PdfEditor` translates its page arguments from current positions automatically.
 
+`extract_pages` preserves the AcroForm branches owning Widgets on selected
+pages, including inherited field attributes and default appearance resources.
+Widgets belonging only to excluded pages are removed. Document-wide XFA
+packets and calculation-order arrays are not copied into an extracted subset.
+
 The `zpdf-writer` crate (re-exported through the facade) covers three writing
 models:
 
