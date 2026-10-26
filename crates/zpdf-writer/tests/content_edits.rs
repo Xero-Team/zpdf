@@ -67,24 +67,39 @@ fn outside(writer: &mut IncrementalWriter) {
         .redact_page(
             0,
             &[Rect::new(180.0, 180.0, 190.0, 190.0)],
-            &RedactOptions { fill: None },
+            &RedactOptions {
+                fill: Some((0.7, 0.2, 0.1)),
+            },
         )
         .unwrap();
+    assert_has_fill(writer, b"180 180 10 10 re f");
 }
-fn stamp(writer: &mut IncrementalWriter) {
-    writer
-        .stamp_page(
-            0,
-            &[StampItem::Text {
-                text: "STAMP".into(),
-                x: 10.0,
-                y: 10.0,
-                font: "Helvetica".into(),
-                size: 8.0,
-                color: (0.0, 0.0, 0.0),
-            }],
-        )
-        .unwrap();
+fn assert_has_fill(writer: &IncrementalWriter, operation: &[u8]) {
+    let page_id = writer.document().page(0).unwrap().id;
+    let page = writer.resolve_current(page_id).unwrap();
+    let id = page.as_dict().unwrap().get_ref("Contents").unwrap();
+    let object = writer.resolve_current(id).unwrap();
+    let stream = object.as_stream().unwrap();
+    let bytes = zpdf_parser::filters::decode_stream_with_limits(
+        &stream.data,
+        &stream.dict,
+        writer.document().file().limits(),
+    )
+    .unwrap();
+    assert!(bytes.windows(operation.len()).any(|part| part == operation));
+}
+fn stamp(writer: &mut IncrementalWriter) -> zpdf_core::Result<()> {
+    writer.stamp_page(
+        0,
+        &[StampItem::Text {
+            text: "STAMP".into(),
+            x: 10.0,
+            y: 10.0,
+            font: "Helvetica".into(),
+            size: 8.0,
+            color: (0.0, 0.0, 0.0),
+        }],
+    )
 }
 #[test]
 fn redaction_preserves_indirect_content_outside_the_region() {
@@ -96,7 +111,7 @@ fn redaction_preserves_indirect_content_outside_the_region() {
 #[test]
 fn stamp_keeps_indirect_content_and_survives_a_later_redaction() {
     let mut writer = IncrementalWriter::new(indirect_pdf()).unwrap();
-    stamp(&mut writer);
+    stamp(&mut writer).unwrap();
     let before = text(save(&writer));
     assert!(
         before.contains("HELLO") && before.contains("STAMP"),
@@ -108,9 +123,12 @@ fn stamp_keeps_indirect_content_and_survives_a_later_redaction() {
         .redact_page(
             0,
             &[Rect::new(210.0, 210.0, 220.0, 220.0)],
-            &RedactOptions { fill: None },
+            &RedactOptions {
+                fill: Some((0.7, 0.2, 0.1)),
+            },
         )
         .unwrap();
+    assert_has_fill(&writer, b"210 210 10 10 re f");
     let after = text(save(&writer));
     assert!(
         after.contains("HELLO") && after.contains("STAMP"),
@@ -161,4 +179,32 @@ fn failed_decoding_leaves_the_edit_unchanged() {
         )
         .is_err());
     assert_eq!(save(&writer), before);
+    assert!(stamp(&mut writer).is_err());
+    assert_eq!(save(&writer), before);
+}
+
+#[test]
+fn encrypted_original_contents_survive_current_stream_decoding() {
+    for config in [
+        zpdf_writer::EncryptionConfig::rc4_128("secret", "owner"),
+        zpdf_writer::EncryptionConfig::aes256("secret", "owner"),
+    ] {
+        let source = zpdf_parser::PdfFile::parse(indirect_pdf()).unwrap();
+        let bytes = zpdf_writer::rewrite_pdf(
+            &source,
+            &zpdf_writer::RewriteOptions {
+                encrypt: Some(config),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut writer = IncrementalWriter::new_with_password(bytes, b"secret").unwrap();
+        stamp(&mut writer).unwrap();
+        outside(&mut writer);
+        let doc = PdfDocument::open_with_password(save(&writer), b"secret").unwrap();
+        let page = doc.page(0).unwrap();
+        let content = doc.page_content_bytes(&page).unwrap();
+        assert!(content.windows(5).any(|part| part == b"HELLO"));
+        assert!(content.windows(6).any(|part| part == b"PUBLIC"));
+    }
 }
