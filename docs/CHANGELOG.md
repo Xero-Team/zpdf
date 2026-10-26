@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Render text modes 1/2/5/6 with actual glyph-outline strokes, separate fill
+  and stroke paints/alpha, graphics-state line styles and text clipping. (#97)
+
 - Honor page UserUnit in physical sizes, interpretation, CLI rendering/exports
   and WASM. Raw page boxes/editing coordinates stay in default user space;
   PdfPage gains user_unit and effective_box_points. (#96)
