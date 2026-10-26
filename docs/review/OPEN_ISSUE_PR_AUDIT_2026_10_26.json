@@ -1,0 +1,695 @@
+{
+  "audit_date": "2026-10-26",
+  "repository": "Xero-Team/zpdf",
+  "auditor": "Codex (automated review; does not claim human approval)",
+  "main_baseline": "03fb9336b9c5e550867c5ee3c8ec8358ccc72255",
+  "stack_baseline": "fff564f290600d1a000bbecc325c4b50b1e24e8f",
+  "open_issues": 19,
+  "open_prs": 21,
+  "method": [
+    "Read all open issue reports and linked PR descriptions and deltas.",
+    "Read issue comments, PR discussions, inline review threads and workflow results.",
+    "Check original regression coverage, add focused counterexamples, then validate the integrated stack."
+  ],
+  "issues": [
+    {
+      "issue": 87,
+      "title": "[Audit F02] Preserve filled values when a field and Widget share one object",
+      "url": "https://github.com/Xero-Team/zpdf/issues/87",
+      "pr": 106,
+      "pr_url": "https://github.com/Xero-Team/zpdf/pull/106",
+      "base": "main",
+      "original_head": "366a1ce8a7a1717d78f91ed307551c6fe825c218",
+      "draft_at_audit": true,
+      "original_ci": [
+        {
+          "name": "CI",
+          "conclusion": "success",
+          "run_id": 40203164535
+        },
+        {
+          "name": "bench",
+          "conclusion": "success",
+          "run_id": 40203164502
+        }
+      ],
+      "follow_up_findings": [
+        "R01",
+        "R14"
+      ]
+    },
+    {
+      "issue": 88,
+      "title": "[Audit F03] Preserve indirect Contents arrays during redaction and stamping",
+      "url": "https://github.com/Xero-Team/zpdf/issues/88",
+      "pr": 107,
+      "pr_url": "https://github.com/Xero-Team/zpdf/pull/107",
+      "base": "pr/audit-20261025/f02",
+      "original_head": "cd263050884b4370046bea35ec13326878c066d0",
+      "draft_at_audit": true,
+      "original_ci": [
+        {
+          "name": "bench",
+          "conclusion": "success",
+          "run_id": 40203169883
+        },
+        {
+          "name": "CI",
+          "conclusion": "success",
+          "run_id": 40203169876
+        }
+      ],
+      "follow_up_findings": [
+        "R13"
+      ]
+    },
+    {
+      "issue": 89,
+      "title": "[Audit F04] Keep page edit state consistent across repeated and combined operations",
+      "url": "https://github.com/Xero-Team/zpdf/issues/89",
+      "pr": 108,
+      "pr_url": "https://github.com/Xero-Team/zpdf/pull/108",
+      "base": "pr/audit-20261025/f03",
+      "original_head": "12e7b5f0c75bc98993c120202c2ec92b413ad005",
+      "draft_at_audit": true,
+      "original_ci": [
+        {
+          "name": "bench",
+          "conclusion": "success",
+          "run_id": 40203174081
+        },
+        {
+          "name": "CI",
+          "conclusion": "success",
+          "run_id": 40203174075
+        }
+      ],
+      "follow_up_findings": [
+        "R02"
+      ]
+    },
+    {
+      "issue": 90,
+      "title": "[Audit F05] Preserve AcroForm fields when extracting or splitting pages",
+      "url": "https://github.com/Xero-Team/zpdf/issues/90",
+      "pr": 109,
+      "pr_url": "https://github.com/Xero-Team/zpdf/pull/109",
+      "base": "pr/audit-20261025/f04",
+      "original_head": "eec867c89401d7e62b767a88419e0e393da272dc",
+      "draft_at_audit": true,
+      "original_ci": [
+        {
+          "name": "CI",
+          "conclusion": "success",
+          "run_id": 40203177861
+        },
+        {
+          "name": "bench",
+          "conclusion": "success",
+          "run_id": 40203177864
+        }
+      ],
+      "follow_up_findings": []
+    },
+    {
+      "issue": 91,
+      "title": "[Audit F06] Apply glyph transforms when positioning editable PPTX text",
+      "url": "https://github.com/Xero-Team/zpdf/issues/91",
+      "pr": 110,
+      "pr_url": "https://github.com/Xero-Team/zpdf/pull/110",
+      "base": "pr/audit-20261025/f05",
+      "original_head": "2b7181be3273f0359ecd6ce1a8779d8ad75933a9",
+      "draft_at_audit": true,
+      "original_ci": [
+        {
+          "name": "bench",
+          "conclusion": "success",
+          "run_id": 40203181683
+        },
+        {
+          "name": "CI",
+          "conclusion": "success",
+          "run_id": 40203181655
+        }
+      ],
+      "follow_up_findings": [
+        "R11"
+      ]
+    },
+    {
+      "issue": 92,
+      "title": "[Audit F07] Use a complete shared page interpretation pipeline for CLI exports",
+      "url": "https://github.com/Xero-Team/zpdf/issues/92",
+      "pr": 111,
+      "pr_url": "https://github.com/Xero-Team/zpdf/pull/111",
+      "base": "pr/audit-20261025/f06",
+      "original_head": "58095084067d859ae8c65ecbc5392cf324764eb2",
+      "draft_at_audit": true,
+      "original_ci": [
+        {
+          "name": "CI",
+          "conclusion": "success",
+          "run_id": 40203188576
+        },
+        {
+          "name": "bench",
+          "conclusion": "success",
+          "run_id": 40203188638
+        }
+      ],
+      "follow_up_findings": [
+        "R03",
+        "R04"
+      ]
+    },
+    {
+      "issue": 93,
+      "title": "[Audit F08] Reject invalid page arguments before redaction",
+      "url": "https://github.com/Xero-Team/zpdf/issues/93",
+      "pr": 112,
+      "pr_url": "https://github.com/Xero-Team/zpdf/pull/112",
+      "base": "pr/audit-20261025/f07",
+      "original_head": "0c3fbfebb7651259e5f329145d227d9767cfd0a2",
+      "draft_at_audit": true,
+      "original_ci": [
+        {
+          "name": "bench",
+          "conclusion": "success",
+          "run_id": 40203193103
+        },
+        {
+          "name": "CI",
+          "conclusion": "success",
+          "run_id": 40203193154
+        }
+      ],
+      "follow_up_findings": []
+    },
+    {
+      "issue": 94,
+      "title": "[Audit F09] Support Unicode appearances for form filling and text stamps",
+      "url": "https://github.com/Xero-Team/zpdf/issues/94",
+      "pr": 113,
+      "pr_url": "https://github.com/Xero-Team/zpdf/pull/113",
+      "base": "pr/audit-20261025/f08",
+      "original_head": "ce0f09b18d81d255b80e39acefca0dc09a465cb3",
+      "draft_at_audit": true,
+      "original_ci": [
+        {
+          "name": "CI",
+          "conclusion": "success",
+          "run_id": 40203197130
+        },
+        {
+          "name": "bench",
+          "conclusion": "success",
+          "run_id": 40203197200
+        }
+      ],
+      "follow_up_findings": [
+        "R01"
+      ]
+    },
+    {
+      "issue": 95,
+      "title": "[Audit F10] Preserve named navigation targets when merging documents",
+      "url": "https://github.com/Xero-Team/zpdf/issues/95",
+      "pr": 114,
+      "pr_url": "https://github.com/Xero-Team/zpdf/pull/114",
+      "base": "pr/audit-20261025/f09",
+      "original_head": "0affe69ac146f274e4fc48579cb495d75b8ce8c4",
+      "draft_at_audit": true,
+      "original_ci": [
+        {
+          "name": "bench",
+          "conclusion": "success",
+          "run_id": 40203201482
+        },
+        {
+          "name": "CI",
+          "conclusion": "success",
+          "run_id": 40203201538
+        }
+      ],
+      "follow_up_findings": []
+    },
+    {
+      "issue": 96,
+      "title": "[Audit F11] Honor UserUnit in physical page sizes and rendering",
+      "url": "https://github.com/Xero-Team/zpdf/issues/96",
+      "pr": 115,
+      "pr_url": "https://github.com/Xero-Team/zpdf/pull/115",
+      "base": "pr/audit-20261025/f10",
+      "original_head": "128945910ebbc99ae7fbe1f86d0875400bcda3af",
+      "draft_at_audit": true,
+      "original_ci": [
+        {
+          "name": "CI",
+          "conclusion": "success",
+          "run_id": 40203204684
+        },
+        {
+          "name": "bench",
+          "conclusion": "success",
+          "run_id": 40203204700
+        }
+      ],
+      "follow_up_findings": [
+        "R04"
+      ]
+    },
+    {
+      "issue": 97,
+      "title": "[Audit F12] Implement stroke and fill-stroke text rendering modes",
+      "url": "https://github.com/Xero-Team/zpdf/issues/97",
+      "pr": 116,
+      "pr_url": "https://github.com/Xero-Team/zpdf/pull/116",
+      "base": "pr/audit-20261025/f11",
+      "original_head": "7717f0e63020382c9aede168237b3cf9ff9b68fd",
+      "draft_at_audit": true,
+      "original_ci": [
+        {
+          "name": "bench",
+          "conclusion": "success",
+          "run_id": 40203210118
+        },
+        {
+          "name": "CI",
+          "conclusion": "success",
+          "run_id": 40203210141
+        }
+      ],
+      "follow_up_findings": []
+    },
+    {
+      "issue": 98,
+      "title": "[Audit F13] Apply CalGray and CalRGB calibration parameters",
+      "url": "https://github.com/Xero-Team/zpdf/issues/98",
+      "pr": 117,
+      "pr_url": "https://github.com/Xero-Team/zpdf/pull/117",
+      "base": "pr/audit-20261025/f12",
+      "original_head": "60b72e1d0d5a6aada988619f00d150900dc7b8e2",
+      "draft_at_audit": true,
+      "original_ci": [
+        {
+          "name": "bench",
+          "conclusion": "success",
+          "run_id": 40203215658
+        },
+        {
+          "name": "CI",
+          "conclusion": "success",
+          "run_id": 40203215674
+        }
+      ],
+      "follow_up_findings": []
+    },
+    {
+      "issue": 99,
+      "title": "[Audit F14] Decode and encode PDF text strings with PDFDocEncoding and Unicode BOMs",
+      "url": "https://github.com/Xero-Team/zpdf/issues/99",
+      "pr": 118,
+      "pr_url": "https://github.com/Xero-Team/zpdf/pull/118",
+      "base": "pr/audit-20261025/f13",
+      "original_head": "ad15000c5cb90b632d725c036bc255ff58e6e19b",
+      "draft_at_audit": true,
+      "original_ci": [
+        {
+          "name": "CI",
+          "conclusion": "success",
+          "run_id": 40203220871
+        },
+        {
+          "name": "bench",
+          "conclusion": "success",
+          "run_id": 40203220711
+        }
+      ],
+      "follow_up_findings": []
+    },
+    {
+      "issue": 100,
+      "title": "[Audit F15] Honor ActualText in marked-content properties during text extraction",
+      "url": "https://github.com/Xero-Team/zpdf/issues/100",
+      "pr": 119,
+      "pr_url": "https://github.com/Xero-Team/zpdf/pull/119",
+      "base": "pr/audit-20261025/f14",
+      "original_head": "681df6342a7df27a6b4b4f926af78ac0e1416e55",
+      "draft_at_audit": true,
+      "original_ci": [
+        {
+          "name": "CI",
+          "conclusion": "success",
+          "run_id": 40203224828
+        },
+        {
+          "name": "bench",
+          "conclusion": "success",
+          "run_id": 40203224798
+        }
+      ],
+      "follow_up_findings": [
+        "R05"
+      ]
+    },
+    {
+      "issue": 101,
+      "title": "[Audit F16] Regenerate annotation appearances after visual edits",
+      "url": "https://github.com/Xero-Team/zpdf/issues/101",
+      "pr": 120,
+      "pr_url": "https://github.com/Xero-Team/zpdf/pull/120",
+      "base": "pr/audit-20261025/f15",
+      "original_head": "cf2db9a573eaa9a57d082267efd50dcc1a6c0059",
+      "draft_at_audit": true,
+      "original_ci": [
+        {
+          "name": "CI",
+          "conclusion": "success",
+          "run_id": 40203228289
+        },
+        {
+          "name": "bench",
+          "conclusion": "success",
+          "run_id": 40203228333
+        }
+      ],
+      "follow_up_findings": [
+        "R06"
+      ]
+    },
+    {
+      "issue": 102,
+      "title": "[Audit F17] Report required passwords instead of returning undecrypted documents",
+      "url": "https://github.com/Xero-Team/zpdf/issues/102",
+      "pr": 121,
+      "pr_url": "https://github.com/Xero-Team/zpdf/pull/121",
+      "base": "pr/audit-20261025/f16",
+      "original_head": "1031ee57ca586af28a16bf8231ee5ec08318e2f5",
+      "draft_at_audit": true,
+      "original_ci": [
+        {
+          "name": "CI",
+          "conclusion": "success",
+          "run_id": 40203234326
+        },
+        {
+          "name": "bench",
+          "conclusion": "success",
+          "run_id": 40203234301
+        }
+      ],
+      "follow_up_findings": [
+        "R12"
+      ]
+    },
+    {
+      "issue": 103,
+      "title": "[Audit F18] Select CMS signer certificates using SignerInfo.sid",
+      "url": "https://github.com/Xero-Team/zpdf/issues/103",
+      "pr": 122,
+      "pr_url": "https://github.com/Xero-Team/zpdf/pull/122",
+      "base": "pr/audit-20261025/f17",
+      "original_head": "1e5c577909b81c61f699b7f4ea86775e664afccd",
+      "draft_at_audit": true,
+      "original_ci": [
+        {
+          "name": "CI",
+          "conclusion": "success",
+          "run_id": 40203241100
+        },
+        {
+          "name": "bench",
+          "conclusion": "success",
+          "run_id": 40203241039
+        }
+      ],
+      "follow_up_findings": []
+    },
+    {
+      "issue": 104,
+      "title": "[Audit F19] Report partial interpretation and conversion through structured diagnostics",
+      "url": "https://github.com/Xero-Team/zpdf/issues/104",
+      "pr": 123,
+      "pr_url": "https://github.com/Xero-Team/zpdf/pull/123",
+      "base": "pr/audit-20261025/f18",
+      "original_head": "9fbb8d7126d8ea836ee57dec7cf507bdf6c0d571",
+      "draft_at_audit": true,
+      "original_ci": [
+        {
+          "name": "bench",
+          "conclusion": "success",
+          "run_id": 40203246865
+        },
+        {
+          "name": "CI",
+          "conclusion": "success",
+          "run_id": 40203246843
+        }
+      ],
+      "follow_up_findings": [
+        "R04",
+        "R07"
+      ]
+    },
+    {
+      "issue": 105,
+      "title": "[Audit F20] Regenerate shipped WASM bindings and verify public exports",
+      "url": "https://github.com/Xero-Team/zpdf/issues/105",
+      "pr": 124,
+      "pr_url": "https://github.com/Xero-Team/zpdf/pull/124",
+      "base": "pr/audit-20261025/f19",
+      "original_head": "fff564f290600d1a000bbecc325c4b50b1e24e8f",
+      "draft_at_audit": true,
+      "original_ci": [
+        {
+          "name": "bench",
+          "conclusion": "success",
+          "run_id": 40203253724
+        },
+        {
+          "name": "CI",
+          "conclusion": "success",
+          "run_id": 40203253702
+        }
+      ],
+      "follow_up_findings": [
+        "R08"
+      ]
+    }
+  ],
+  "findings": [
+    {
+      "id": "R01",
+      "priority": "P1",
+      "prs": [
+        113
+      ],
+      "description": "Partial form filling deleted stored appearances on untouched widgets when NeedAppearances was true.",
+      "fix": "Preserve untouched appearance dictionaries, including custom artwork and embedded fonts.",
+      "regression": "forms::tests::filling_one_field_preserves_an_untouched_stored_appearance"
+    },
+    {
+      "id": "R02",
+      "priority": "P1",
+      "prs": [
+        108
+      ],
+      "description": "Repeated source indices appended the same page object twice, breaking stable page identities and subsequent deletion counts.",
+      "fix": "Reject duplicate source indices before copying or editing the page tree.",
+      "regression": "duplicate_source_pages_are_rejected_before_the_page_tree_changes"
+    },
+    {
+      "id": "R03",
+      "priority": "P1",
+      "prs": [
+        123
+      ],
+      "description": "CLI text, search and tables did not pass the optional-content configuration, exposing disabled-layer text.",
+      "fix": "Use the document's default layer visibility in all three extraction entry points.",
+      "regression": "text_search_and_tables_exclude_disabled_layers"
+    },
+    {
+      "id": "R04",
+      "priority": "P1",
+      "prs": [
+        123
+      ],
+      "description": "Desktop previews used a separate interpretation path with incorrect annotation placement, missing generated appearances, hidden-layer visibility and UserUnit handling.",
+      "fix": "Reuse the shared page pipeline and reject known incomplete previews before GPU initialization.",
+      "regression": "preview_honors_layers_annotations_rotation_and_user_units; incomplete_preview_is_rejected_before_rendering"
+    },
+    {
+      "id": "R05",
+      "priority": "P1",
+      "prs": [
+        119
+      ],
+      "description": "Text and marked-content ActualText inside soft-mask painting resources entered the logical extraction sink.",
+      "fix": "Suspend text and rule extraction while interpreting the mask group.",
+      "reproduction_before": "MASK_ONLYMASK_REPLACEMENT\\nVISIBLE",
+      "reproduction_after": "VISIBLE",
+      "regression": "soft_mask_text_and_actual_text_are_paint_resources_only"
+    },
+    {
+      "id": "R06",
+      "priority": "P1",
+      "prs": [
+        120
+      ],
+      "description": "Regenerating annotations with damaged required geometry could replace an existing visible appearance with an empty stream.",
+      "fix": "Validate required point arrays before changing appearances, and preserve output on failure.",
+      "regression": "malformed_geometry_does_not_erase_a_stored_appearance"
+    },
+    {
+      "id": "R07",
+      "priority": "P2",
+      "prs": [
+        123
+      ],
+      "description": "Non-stream XObjects were silently omitted without diagnostics; hidden draws could incorrectly report missing resources.",
+      "fix": "Record visible object failures with object IDs and skip hidden draws before resource lookup.",
+      "regression": "malformed_xobjects_are_reported_but_hidden_draws_are_not_failures"
+    },
+    {
+      "id": "R08",
+      "priority": "P2",
+      "prs": [
+        124
+      ],
+      "description": "The packaged WASM fingerprint omitted embedded CMap data outside src directories.",
+      "fix": "Hash embedded data directories, add an isolated asset-change regression and regenerate matching JS/WASM.",
+      "regression": "changes to embedded assets outside src invalidate the WASM fingerprint"
+    },
+    {
+      "id": "R09",
+      "priority": "P1",
+      "branch": "fix/audit-headless-native-backends",
+      "description": "Concurrent headless adapter requests panicked in EGL make_current with BadAccess while enumerating unused GLES adapters.",
+      "fix": "Prefer shared native-backend instances, retain GLES fallback when no native adapter exists, and honor WGPU_BACKEND.",
+      "regression": "concurrent_headless_adapter_requests_do_not_panic; workspace GPU oracle suites"
+    },
+    {
+      "id": "R10",
+      "priority": "P1",
+      "prs": [
+        125,
+        126
+      ],
+      "description": "Dependency PR #125 upgrades RSA digest compatibility consumers to sha2 0.11 and fails trait bounds; #126 removes a required libc pin and fails Linux xattr::ENOATTR compilation.",
+      "fix": "Retain working sha2/libc requirements and prevent incompatible automated upgrades.",
+      "ci_evidence": [
+        {
+          "pr": 125,
+          "job_id": 121348775181,
+          "error": "Sha256/Sha384/Sha512 do not implement rsa 0.9 digest/AssociatedOid traits"
+        },
+        {
+          "pr": 126,
+          "job_id": 121348843390,
+          "error": "cannot find value ENOATTR in crate libc"
+        }
+      ]
+    },
+    {
+      "id": "R11",
+      "priority": "P2",
+      "prs": [
+        110
+      ],
+      "description": "PPTX documentation claimed clipping and group compositing were rasterized, although those commands are currently skipped.",
+      "fix": "Document actual editable-export limits without claiming raster fallbacks."
+    },
+    {
+      "id": "R12",
+      "priority": "P2",
+      "prs": [
+        124
+      ],
+      "description": "The library guide still described unauthenticated encrypted files as successful blank renders after F17 changed opening to fail.",
+      "fix": "Document PasswordRequired, WrongPassword and UnsupportedEncryption consistently."
+    },
+    {
+      "id": "R13",
+      "priority": "P1",
+      "prs": [
+        107
+      ],
+      "description": "Fresh review found indirect DP, pending metadata on original streams, JBIG2Globals, encoded-size limits, a trailing separator boundary and missing source validation before stamping.",
+      "fix": "Decode original and pending streams against current metadata with bounded reference resolution, inline current globals, enforce encoded limits, separate streams without a trailing byte, and preflight stamping. Strengthen preservation tests with observable fill operations.",
+      "regressions": [
+        "pending_streams_resolve_decode_parameter_aliases_and_arrays",
+        "original_streams_use_pending_filter_and_predictor_metadata",
+        "content_limits_charge_encoded_bytes_and_only_between_stream_separators",
+        "current_jbig2_globals_are_decoded_and_cycles_are_bounded",
+        "failed_decoding_leaves_the_edit_unchanged",
+        "encrypted_original_contents_survive_current_stream_decoding"
+      ],
+      "review_urls": [
+        "https://github.com/Xero-Team/zpdf/pull/107#discussion_r4373618887",
+        "https://github.com/Xero-Team/zpdf/pull/107#discussion_r4373618892",
+        "https://github.com/Xero-Team/zpdf/pull/107#discussion_r4373618894",
+        "https://github.com/Xero-Team/zpdf/pull/107#discussion_r4373618900",
+        "https://github.com/Xero-Team/zpdf/pull/107#discussion_r4373618909",
+        "https://github.com/Xero-Team/zpdf/pull/107#discussion_r4373624717"
+      ]
+    },
+    {
+      "id": "R14",
+      "priority": "P2",
+      "prs": [
+        106
+      ],
+      "description": "The F02 changelog incorrectly promised to preserve choice indices although stale I entries are cleared.",
+      "fix": "Document preservation of field values and clearing of stale choice indices.",
+      "review_urls": [
+        "https://github.com/Xero-Team/zpdf/pull/106#discussion_r4373615067"
+      ]
+    }
+  ],
+  "validation": {
+    "writer_suite": "passed",
+    "focused_annotation_diagnostics_actualtext": "15 tests passed",
+    "packaged_wasm_runtime": "4 tests passed",
+    "embedded_asset_fingerprint": "1 test passed",
+    "font_pack_helpers": "5 tests passed",
+    "workspace": {
+      "command": "cargo test --workspace",
+      "result": "passed",
+      "passed": 1604,
+      "failed": 0,
+      "ignored": 1,
+      "ignored_test": "system_font_probe_latin_lines_on_a_chinese_page (pre-existing opt-in system-font probe)"
+    },
+    "clippy": {
+      "command": "cargo clippy --workspace --all-targets -- -D warnings",
+      "result": "passed"
+    },
+    "format": {
+      "commands": [
+        "cargo fmt --all --check",
+        "git diff --check"
+      ],
+      "result": "passed"
+    },
+    "current_stream_metadata_and_encryption": "90 focused tests passed; final integrated workspace rerun passed",
+    "gpu_pixel_oracles": "15 tests passed with gpu-render enabled; no GPU skips",
+    "gpu_font_fallback": "8 tests passed with gpu-render enabled; no GPU skips",
+    "gpu_adapter": "NVIDIA GeForce RTX 3060 Laptop GPU; Vulkan; NVIDIA driver 615.78.08",
+    "wasm_release": "wasm32-unknown-unknown release build passed; wasm-bindgen 0.2.129; all 10 packaged runtime, fingerprint and font-pack helper tests passed",
+    "remote_ci": "Original-head results are recorded per PR; refreshed-head checks are tracked on GitHub after publication."
+  },
+  "limitations": [
+    "PPTX clipping, transparency groups, arbitrary shear and nonuniform text scaling remain documented editable-export limitations.",
+    "AcroForm extraction excludes document-wide XFA and calculation-order migration.",
+    "Native local validation uses Fedora x86_64 / Rust 1.99.0; Windows coverage is supplied by repository CI."
+  ],
+  "sources": [
+    "https://docs.github.com/en/code-security/reference/supply-chain-security/dependabot-options-reference"
+  ],
+  "delivery": {
+    "strategy": "Preserve existing PR history with forward merge commits; do not merge into main or claim human approval.",
+    "gpu_follow_up_branch": "fix/audit-headless-native-backends",
+    "ready_transition": "Only after publishing validated fixes.",
+    "dependency_prs": "PRs #125 and #126 remain incompatible with the current dependency graph; the audited stack retains working constraints and excludes those incompatible Dependabot upgrades."
+  }
+}

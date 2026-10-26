@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Decode current indirect Filter/DecodeParms/DP and JBIG2Globals for content
+  edits, enforce encoded-stream limits, charge separators only between streams,
+  and reject undecodable source content before stamping. (#88)
+- Preserve untouched form appearances during partial fills, reject duplicate
+  source pages before appending/extracting, and reject annotation regeneration
+  when required geometry is damaged. (#87, #89, #94, #101)
+- Keep disabled layers out of CLI text/search/table extraction. Use the shared
+  page pipeline for desktop previews, including annotations, physical UserUnit
+  dimensions and incomplete-output rejection. (#92, #96, #104)
+- Exclude soft-mask text and ActualText from logical extraction; report malformed
+  visible XObjects while skipping resource lookup in hidden draws. (#100, #104)
+- Include embedded data outside Rust source directories in the shipped WASM
+  fingerprint, and retain intentional sha2/libc compatibility constraints in
+  automated dependency updates. (#105)
+
 - Rebuild the shipped WASM/JS package with current editing and font APIs; add
   source/artifact fingerprints and real packaged-runtime smoke tests in CI. (#105)
 
@@ -73,8 +88,8 @@
   redacting pages; abort on undecodable content instead of replacing it with
   an empty stream. (#88)
 
-- Preserve filled values and choice indices when an AcroForm field shares
-  its dictionary with its Widget annotation. (#87)
+- Preserve filled values and clear stale choice indices when an AcroForm field
+  shares its dictionary with its Widget annotation. (#87)
 
 ## 0.17.0 — Decoder hardening, writer fixes and export fidelity
 

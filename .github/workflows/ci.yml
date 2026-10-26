@@ -117,7 +117,7 @@ jobs:
           python3 -B -m unittest discover -s tools -p 'test_fetch_font.py'
           node --test crates/zpdf-wasm/www/font-packs.test.mjs
       - name: Shipped WASM package matches library sources and runs
-        run: node --test crates/zpdf-wasm/www/package.test.mjs
+        run: node --test crates/zpdf-wasm/www/package.test.mjs crates/zpdf-wasm/www/package-fingerprint.test.mjs
 
   gpu-build:
     name: build (gpu-render feature)

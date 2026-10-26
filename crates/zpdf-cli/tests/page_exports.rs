@@ -11,7 +11,7 @@ fn fixture() -> Vec<u8> {
         "<< /Type /Catalog /Pages 2 0 R /OCProperties << /OCGs [6 0 R] /D << /BaseState /ON /OFF [6 0 R] >> >> >>".into(),
         "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(),
         "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 120 80] /UserUnit 2 /Contents 4 0 R /Annots [5 0 R] /Resources << /Properties << /Layer 6 0 R >> /Font << /F1 8 0 R >> >> >>".into(),
-        stream("/OC /Layer BDC 0 0 1 rg 0 0 120 80 re f BT /F1 12 Tf 10 50 Td (HIDDEN) Tj ET EMC",""),
+        stream("/OC /Layer BDC 0 0 1 rg 0 0 120 80 re f BT /F1 8 Tf 10 60 Td (HIDDEN) Tj 65 0 Td (RIGHT) Tj -65 -20 Td (BOTTOM) Tj 65 0 Td (CELL) Tj ET EMC",""),
         "<< /Type /Annot /Subtype /Square /Rect [40 20 80 60] /AP << /N 7 0 R >> >>".into(),
         "<< /Type /OCG /Name (Hidden) >>".into(),
         stream("1 0 0 rg 0 0 40 40 re f","/Type /XObject /Subtype /Form /BBox [0 0 40 40] /Resources << >>"),
@@ -38,6 +38,34 @@ fn fixture() -> Vec<u8> {
         .as_bytes(),
     );
     pdf
+}
+
+#[test]
+fn text_search_and_tables_exclude_disabled_layers() {
+    let dir = std::env::temp_dir().join(format!("zpdf-hidden-text-{}", std::process::id()));
+    fs::create_dir(&dir).unwrap();
+    let input = dir.join("in.pdf");
+    fs::write(&input, fixture()).unwrap();
+    for command in ["text", "search", "tables"] {
+        let mut process = Command::new(env!("CARGO_BIN_EXE_zpdf"));
+        process.arg(command).arg(&input);
+        if command == "search" {
+            process.arg("HIDDEN");
+        }
+        let result = process.output().unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let text = String::from_utf8_lossy(&result.stdout);
+        assert!(
+            !text.contains("HIDDEN") && !text.contains("BOTTOM"),
+            "{command}: {text}"
+        );
+    }
+    fs::remove_file(input).unwrap();
+    fs::remove_dir(dir).unwrap();
 }
 
 #[test]

@@ -15,10 +15,10 @@ const sha256 = bytes => createHash("sha256").update(bytes).digest("hex");
 const normalized = (path, bytes) => [".rs", ".toml", ".js"].includes(extname(path))
   ? Buffer.from(bytes.toString("utf8").replace(/\r\n/g, "\n")) : bytes;
 
-export function sourceFingerprint() {
+export function sourceFingerprint(sourceRoot = root) {
   const files = ["Cargo.toml"];
   const walk = path => {
-    for (const item of readdirSync(resolve(root, path), { withFileTypes: true })) {
+    for (const item of readdirSync(resolve(sourceRoot, path), { withFileTypes: true })) {
       const next = `${path}/${item.name}`;
       if (item.isDirectory()) walk(next);
       else if (item.isFile()) files.push(next);
@@ -27,14 +27,17 @@ export function sourceFingerprint() {
   for (const crate of crates) {
     const dir = `crates/${crate}`;
     files.push(`${dir}/Cargo.toml`);
-    if (existsSync(resolve(root, dir, "build.rs"))) files.push(`${dir}/build.rs`);
+    if (existsSync(resolve(sourceRoot, dir, "build.rs"))) files.push(`${dir}/build.rs`);
     walk(`${dir}/src`);
+    // include_bytes!/include! also link assets outside src, notably Adobe's
+    // compiled CMaps. Their changes must invalidate the shipped WASM too.
+    if (existsSync(resolve(sourceRoot, dir, "data"))) walk(`${dir}/data`);
   }
-  if (existsSync(resolve(root, ".cargo/config.toml"))) files.push(".cargo/config.toml");
+  if (existsSync(resolve(sourceRoot, ".cargo/config.toml"))) files.push(".cargo/config.toml");
   const hash = createHash("sha256");
   for (const path of files.sort()) {
     hash.update(path).update("\0");
-    hash.update(sha256(normalized(path, readFileSync(resolve(root, path))))).update("\n");
+    hash.update(sha256(normalized(path, readFileSync(resolve(sourceRoot, path))))).update("\n");
   }
   return { source_sha256: hash.digest("hex"), source_files: files.length };
 }

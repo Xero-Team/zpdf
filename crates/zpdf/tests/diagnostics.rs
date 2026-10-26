@@ -94,3 +94,42 @@ fn limits_malformed_tokens_and_unknown_operators_are_reported() {
         ContentInterpreter::new(rect).interpret_with_stats(b"BX vendor_operator EX 0 0 1 1 re f");
     assert_eq!(stats.diagnostics, ProcessingDiagnostics::default());
 }
+
+#[test]
+fn malformed_xobjects_are_reported_but_hidden_draws_are_not_failures() {
+    let mut builder = DocumentBuilder::new();
+    builder.add_page(100.0, 100.0);
+    let mut writer = IncrementalWriter::new(builder.build().unwrap()).unwrap();
+    let page = writer.document().page(0).unwrap();
+    let (n, g) = writer.try_add_object(&PdfObject::Integer(42)).unwrap();
+    let bad = zpdf::ObjectId(n, g as u16);
+    let mut objects = PdfDict::new();
+    objects.insert(PdfName::new("Bad"), PdfObject::Ref(bad));
+    let mut resources = PdfDict::new();
+    resources.insert(PdfName::new("XObject"), PdfObject::Dict(objects));
+    let mut dict = writer
+        .resolve_current(page.id)
+        .unwrap()
+        .as_dict()
+        .unwrap()
+        .clone();
+    dict.insert(PdfName::new("Resources"), PdfObject::Dict(resources));
+    writer.overwrite_object(page.id, PdfObject::Dict(dict));
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    writer.write(&mut bytes).unwrap();
+    let doc = PdfDocument::open(bytes.into_inner()).unwrap();
+    let page = doc.page(0).unwrap();
+    let (_, stats) = ContentInterpreter::new(page.effective_box())
+        .with_document(doc.file(), &page.resources)
+        .interpret_with_stats(b"/Bad Do");
+    assert!(!stats.diagnostics.is_complete());
+    assert_eq!(stats.diagnostics.first_failed_object, Some(bad));
+    let oc = zpdf::OcConfig::default();
+    let (_, stats) = ContentInterpreter::new(page.effective_box())
+        .with_document(doc.file(), &page.resources)
+        .with_optional_content(&oc)
+        .interpret_with_stats(
+            b"/OC << /Type /OCMD /VE [/Not << /Type /OCG >>] >> BDC /Bad Do /Missing Do EMC",
+        );
+    assert!(stats.diagnostics.is_complete(), "{:?}", stats.diagnostics);
+}
