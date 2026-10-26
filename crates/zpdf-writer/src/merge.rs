@@ -96,7 +96,8 @@ impl IncrementalWriter {
         Ok(count)
     }
 
-    /// Append the given 0-based pages of `source`, in the given order.
+    /// Append the given distinct 0-based pages of `source`, in the given order.
+    /// Duplicate indices are rejected before modifying the writer.
     pub fn append_pages(&mut self, source: &PdfFile, page_indices: &[usize]) -> Result<()> {
         self.append_pages_mapped(source, page_indices)?;
         Ok(())
@@ -123,6 +124,12 @@ impl IncrementalWriter {
                 ))
                 .into());
             }
+        }
+
+        if page_indices.iter().copied().collect::<HashSet<_>>().len() != page_indices.len() {
+            // Reusing one source->destination map would put the same leaf into
+            // /Kids twice. Stable editing indices must identify distinct pages.
+            return Err(invalid_data("source page indices must be distinct").into());
         }
 
         id_map.prepare_named_dests(source, &src_pages);

@@ -145,6 +145,20 @@ fn repeated_deletion_is_idempotent_and_cannot_delete_the_last_pages() {
 }
 
 #[test]
+fn duplicate_source_pages_are_rejected_before_the_page_tree_changes() {
+    let mut writer = IncrementalWriter::new(pdf_with_pages(1, 600)).unwrap();
+    let source = PdfFile::parse(pdf_with_pages(1, 700)).unwrap();
+    let mut before = Cursor::new(Vec::new());
+    writer.write(&mut before).unwrap();
+    assert!(writer.append_pages(&source, &[0, 0]).is_err());
+    assert_eq!(writer.page_indices(), &[0]);
+    let mut after = Cursor::new(Vec::new());
+    writer.write(&mut after).unwrap();
+    assert_eq!(before.into_inner(), after.into_inner());
+    assert!(zpdf_writer::extract_pages(&source, &[0, 0]).is_err());
+}
+
+#[test]
 fn reorder_uses_only_surviving_stable_indices_including_appended_pages() {
     let mut writer = IncrementalWriter::new(pdf_with_pages(3, 600)).unwrap();
     writer.delete_pages(&[0]).unwrap();
