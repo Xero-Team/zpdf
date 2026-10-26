@@ -120,7 +120,14 @@ impl<'w> FormFiller<'w> {
         let mut prepared_widgets = Vec::with_capacity(field.widgets.len());
         let mut appearance_count = 0usize;
         for &widget_id in &field.widgets {
-            let widget_dict = self.writer.resolve_current(widget_id)?.as_dict()?.clone();
+            // A terminal field may also be its own Widget (ISO 32000-1
+            // 12.7.3.1). Its appearance update must retain the new /V and /I
+            // edits prepared above instead of restoring the original field.
+            let widget_dict = if widget_id == field.field_id {
+                field_dict.clone()
+            } else {
+                self.writer.resolve_current(widget_id)?.as_dict()?.clone()
+            };
             let rect = rect_from_array(widget_dict.get("Rect"))?;
             if widget_will_have_appearance(field, value, rect) {
                 appearance_count = appearance_count
@@ -344,7 +351,7 @@ mod tests {
             "<< /Type /Catalog /Pages 2 0 R /AcroForm 5 0 R >>",
             "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
             "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Annots [4 0 R] >>",
-            "<< /Type /Annot /Subtype /Widget /FT /Tx /T (name) /Rect [0 0 100 20] /P 3 0 R /DA (/Helv 12 Tf 0 g) >>",
+            "<< /Type /Annot /Subtype /Widget /FT /Tx /T (name) /V (old) /Rect [0 0 100 20] /P 3 0 R /DA (/Helv 12 Tf 0 g) >>",
             "<< /Fields [4 0 R] /DA (/Helv 12 Tf 0 g) >>",
         ];
         let mut pdf = b"%PDF-1.4\n".to_vec();
@@ -379,5 +386,58 @@ mod tests {
         }
         assert!(writer.pending.is_empty());
         assert_eq!(writer.next_obj_num, u32::MAX);
+    }
+
+    #[test]
+    fn merged_text_and_choice_values_match_the_saved_appearance() {
+        for choice in [false, true] {
+            let mut bytes = pdf_with_text_field();
+            if choice {
+                let pos = bytes.windows(3).position(|w| w == b"/Tx").unwrap();
+                bytes[pos..pos + 3].copy_from_slice(b"/Ch");
+            }
+            let mut writer = IncrementalWriter::new(bytes).unwrap();
+            if choice {
+                let mut dict = writer
+                    .resolve_current(ObjectId(4, 0))
+                    .unwrap()
+                    .as_dict()
+                    .unwrap()
+                    .clone();
+                dict.insert(
+                    PdfName::new("I"),
+                    PdfObject::Array(vec![PdfObject::Integer(0)]),
+                );
+                writer.overwrite_object(ObjectId(4, 0), PdfObject::Dict(dict));
+            }
+            let mut filler = FormFiller::new(&mut writer).unwrap();
+            filler.set("name", "first").unwrap();
+            filler.set("name", "updated").unwrap();
+            filler.finish().unwrap();
+            let mut output = std::io::Cursor::new(Vec::new());
+            writer.write(&mut output).unwrap();
+            let doc = zpdf_document::PdfDocument::open(output.into_inner()).unwrap();
+            assert!(matches!(&doc.acro_form().unwrap().fields[0].value,
+                Some(FieldValue::Text(value)) if value == "updated"));
+            let obj = doc.file().resolve(ObjectId(4, 0)).unwrap();
+            let dict = obj.as_dict().unwrap();
+            assert!(dict.get("I").is_none());
+            let ap = dict.get_dict("AP").unwrap().get_ref("N").unwrap();
+            let content = doc.file().resolve_stream_data(ap).unwrap();
+            assert!(content.windows(12).any(|w| w == b"(updated) Tj"));
+        }
+    }
+
+    #[test]
+    fn clearing_a_merged_field_removes_its_old_value() {
+        let mut writer = IncrementalWriter::new(pdf_with_text_field()).unwrap();
+        let mut filler = FormFiller::new(&mut writer).unwrap();
+        filler.set("name", "").unwrap();
+        filler.finish().unwrap();
+        let mut output = std::io::Cursor::new(Vec::new());
+        writer.write(&mut output).unwrap();
+        let doc = zpdf_document::PdfDocument::open(output.into_inner()).unwrap();
+        assert!(matches!(&doc.acro_form().unwrap().fields[0].value,
+            Some(FieldValue::Text(value)) if value.is_empty()));
     }
 }
