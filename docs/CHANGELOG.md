@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Honor marked-content ActualText during extraction, including property
+  resources, nested/empty replacements, forms and optional content. Bound
+  replacement text and isolate painting resources from extraction. (#100)
+
 - Share exact PDFDocEncoding and BOM-aware UTF-16BE/PDF 2.0 UTF-8 text-string
   decoding. Encode metadata/form/annotation strings losslessly and preserve
   Unicode field names when merging colliding forms. (#99)

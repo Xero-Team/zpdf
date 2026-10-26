@@ -145,7 +145,9 @@ pub struct ContentInterpreter<'a> {
     /// sequence (`None` for a sequence with no `/MCID`), parallel to `mc_depth`.
     /// Lets the text sink tag each span with the marked-content id that binds it
     /// to a Tagged-PDF structure element. Only meaningful during text extraction.
-    mc_stack: Vec<Option<i32>>,
+    mc_stack: Vec<MarkedContent>,
+    actual_text_bytes: usize,
+    max_actual_text_bytes: usize,
     /// Depth at which a hidden `BDC /OC` block began; painting is suppressed
     /// until the matching EMC.
     oc_hidden_from: Option<u32>,
@@ -230,6 +232,20 @@ struct ImageSource {
     /// The decoded pixels, kept from the second decode on so that further
     /// footprints need no decode. Counted against the image byte limit.
     retained: Option<zpdf_image::DecodedImage>,
+}
+
+#[derive(Clone, Default)]
+struct MarkedContent {
+    mcid: Option<i32>,
+    actual: Option<ActualText>,
+}
+
+#[derive(Clone)]
+struct ActualText {
+    text: std::sync::Arc<str>,
+    start: usize,
+    anchor: TextSpan,
+    visible: bool,
 }
 
 /// Outcome of storing a draw of a known image XObject without decoding.
@@ -687,6 +703,8 @@ impl<'a> ContentInterpreter<'a> {
             annotations: None,
             mc_depth: 0,
             mc_stack: Vec::new(),
+            actual_text_bytes: 0,
+            max_actual_text_bytes: 16 << 20,
             oc_hidden_from: None,
             max_commands: DEFAULT_MAX_COMMANDS,
             ops_executed: 0,
@@ -812,6 +830,7 @@ impl<'a> ContentInterpreter<'a> {
         self.max_operand_stack_depth = limits.max_operand_stack_depth as usize;
         self.max_graphics_state_depth = limits.max_graphics_state_depth as usize;
         self.max_marked_content_depth = limits.max_marked_content_depth as usize;
+        self.max_actual_text_bytes = (limits.max_decoded_stream_bytes.min(16 << 20)) as usize;
         self.max_image_cache_bytes = limits.max_image_cache_bytes;
         self.max_font_cache_bytes = limits.max_font_cache_bytes;
         self.parse_limits = limits.clone();
@@ -1122,6 +1141,9 @@ impl<'a> ContentInterpreter<'a> {
             }
         }
 
+        while !self.mc_stack.is_empty() {
+            self.end_marked_content();
+        }
         // Annotation appearances render independently of wherever the page
         // content stream left the graphics state (12.5.5): drop a `W` never
         // painted, rebalance any unclosed q-levels and top-level W clips, then
@@ -1689,7 +1711,7 @@ impl<'a> ContentInterpreter<'a> {
                 }
                 self.mc_depth += 1;
                 // A plain marked-content sequence declares no /MCID.
-                self.mc_stack.push(None);
+                self.mc_stack.push(MarkedContent::default());
             }
             "BDC" => {
                 if self.mc_stack.len() >= self.max_marked_content_depth {
@@ -1710,7 +1732,6 @@ impl<'a> ContentInterpreter<'a> {
                 // Capture this sequence's /MCID (if any) for text extraction; a
                 // sequence with no /MCID inherits the enclosing one via the stack.
                 let mcid = props.as_ref().and_then(|p| self.marked_content_id(p));
-                self.mc_stack.push(mcid);
                 if tag == "OC" && self.oc_hidden_from.is_none() {
                     let visible = props
                         .as_ref()
@@ -1720,14 +1741,10 @@ impl<'a> ContentInterpreter<'a> {
                         self.oc_hidden_from = Some(self.mc_depth);
                     }
                 }
+                let actual = props.as_ref().and_then(|p| self.begin_actual_text(p, mcid));
+                self.mc_stack.push(MarkedContent { mcid, actual });
             }
-            "EMC" => {
-                if self.oc_hidden_from == Some(self.mc_depth) {
-                    self.oc_hidden_from = None;
-                }
-                self.mc_depth = self.mc_depth.saturating_sub(1);
-                self.mc_stack.pop();
-            }
+            "EMC" => self.end_marked_content(),
             "MP" | "DP" => {}
 
             _ => {}
@@ -2995,7 +3012,68 @@ impl<'a> ContentInterpreter<'a> {
     /// §14.7.4.2). `None` when no enclosing sequence carries one. Used only to
     /// tag extracted text spans so a Tagged-PDF structure element can bind them.
     fn current_mcid(&self) -> Option<i32> {
-        self.mc_stack.iter().rev().flatten().next().copied()
+        self.mc_stack.iter().rev().find_map(|frame| frame.mcid)
+    }
+
+    fn begin_actual_text(&mut self, props: &PdfObject, mcid: Option<i32>) -> Option<ActualText> {
+        let start = self.text_sink.as_ref()?.len();
+        let dict = self.resolve_property_dict(props)?;
+        let value = self.resolve_plain(dict.get("ActualText")?);
+        let PdfObject::String(value) = value else {
+            return None;
+        };
+        // Decoding can expand PDFDocEncoding to three UTF-8 bytes per byte.
+        // Charge all replacements, including repeatedly referenced properties.
+        let remaining = self
+            .max_actual_text_bytes
+            .saturating_sub(self.actual_text_bytes);
+        if value.as_bytes().len() > remaining / 3 {
+            self.resource_limit_hit = true;
+            return None;
+        }
+        let text = zpdf_core::decode_text_string(value.as_bytes());
+        self.actual_text_bytes += text.len();
+        let tm = self.current.ctm.concat(&self.text_matrix);
+        Some(ActualText {
+            text: text.into(),
+            start,
+            anchor: TextSpan {
+                text: String::new(),
+                x: tm.e,
+                y: tm.f,
+                size: self.current.font_size * self.ctm_scale_factor(),
+                advance: 0.0,
+                mcid: mcid.or_else(|| self.current_mcid()),
+            },
+            visible: !self.oc_suppressed(),
+        })
+    }
+
+    /// Replace the entire marked sequence once. Closing an outer replacement
+    /// also consumes any inner replacement, so nested ActualText never doubles.
+    fn end_marked_content(&mut self) {
+        if let Some(actual) = self.mc_stack.pop().and_then(|frame| frame.actual) {
+            if let Some(sink) = self.text_sink.as_mut() {
+                let start = actual.start.min(sink.len());
+                let mut span = sink
+                    .get(start)
+                    .cloned()
+                    .unwrap_or_else(|| actual.anchor.clone());
+                if let Some(last) = sink.last().filter(|_| start < sink.len()) {
+                    span.advance = last.x + last.advance - span.x;
+                }
+                span.mcid = actual.anchor.mcid;
+                span.text = actual.text.to_string();
+                sink.truncate(start);
+                if actual.visible && !span.text.is_empty() && span.is_finite() {
+                    sink.push(span);
+                }
+            }
+        }
+        if self.oc_hidden_from == Some(self.mc_depth) {
+            self.oc_hidden_from = None;
+        }
+        self.mc_depth = self.mc_depth.saturating_sub(1);
     }
 
     /// Read the `/MCID` of a `BDC` properties operand (an inline dict, or a name
@@ -3520,6 +3598,10 @@ impl<'a> ContentInterpreter<'a> {
         let saved_dl = std::mem::replace(&mut self.display_list, DisplayList::new(page_rect));
         let saved_state = self.current.clone();
         let saved_oc_hidden = self.oc_hidden_from.take();
+        // Mask glyphs and rules define opacity, not logical page content.
+        // Keep /ActualText in those painting resources out of extraction too.
+        let saved_text_sink = self.text_sink.take();
+        let saved_rule_sink = self.rule_sink.take();
         self.current.soft_mask = None;
         self.current.blend_mode = BlendMode::Normal;
         self.current.fill_alpha = 1.0;
@@ -3532,6 +3614,8 @@ impl<'a> ContentInterpreter<'a> {
         self.tock_work(work);
         self.current = saved_state;
         self.oc_hidden_from = saved_oc_hidden;
+        self.text_sink = saved_text_sink;
+        self.rule_sink = saved_rule_sink;
         let mask_dl = std::mem::replace(&mut self.display_list, saved_dl);
 
         // /BC components live in the group's /CS; the mean is a serviceable
@@ -4301,6 +4385,9 @@ impl<'a> ContentInterpreter<'a> {
                 }
             }
         }
+        while !self.mc_stack.is_empty() {
+            self.end_marked_content();
+        }
         self.pending_clip = outer_clip;
         self.form_depth -= 1;
 
@@ -4985,6 +5072,9 @@ impl<'a> ContentInterpreter<'a> {
         let saved_text_line_matrix = self.text_line_matrix;
         let saved_operand_stack = std::mem::take(&mut self.operand_stack);
         let saved_suppress = self.suppress_color_ops;
+        // Pattern-cell glyphs are painting resources, not logical page text;
+        // their EMC operators must never edit the surrounding extraction sink.
+        let saved_text_sink = self.text_sink.take();
         // Unbalanced BDC/EMC inside a cell must not leak marked-content state
         // into later tiles or the rest of the page; like `mc_depth`, the cell's
         // /MCID stack is saved before the tile loop and restored per tile.
@@ -5126,6 +5216,7 @@ impl<'a> ContentInterpreter<'a> {
         self.form_depth -= 1;
         self.soft_mask_reuse = saved_mask_reuse;
         self.tile_op_index = saved_tile_op_index;
+        self.text_sink = saved_text_sink;
 
         self.text_matrix = saved_text_matrix;
         self.text_line_matrix = saved_text_line_matrix;
