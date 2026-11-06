@@ -231,11 +231,15 @@ fn render_image_from_rgba(width: u32, height: u32, mut rgba: Vec<u8>) -> Option<
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::*;
     use zpdf::{ObjectId, PdfDict, PdfName, PdfObject, Rect};
     use zpdf_writer::{AnnotationSpec, DocumentBuilder, IncrementalWriter};
 
     fn fixture(content: &[u8]) -> LoadedDocument {
+        static NEXT_FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
+
         let mut builder = DocumentBuilder::new();
         builder.add_page(120.0, 80.0);
         let mut writer = IncrementalWriter::new(builder.build().unwrap()).unwrap();
@@ -292,13 +296,15 @@ mod tests {
         writer.overwrite_object(page.id, PdfObject::Dict(page_dict));
         let mut bytes = std::io::Cursor::new(Vec::new());
         writer.write(&mut bytes).unwrap();
+        // Clock resolution can give parallel tests the same timestamp on Windows.
         let path = std::env::temp_dir().join(format!(
-            "zpdf-preview-{}-{}.pdf",
+            "zpdf-preview-{}-{}-{}.pdf",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            NEXT_FIXTURE_ID.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::write(&path, bytes.into_inner()).unwrap();
         let document = load_document(path.clone()).unwrap();
