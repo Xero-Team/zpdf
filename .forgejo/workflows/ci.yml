@@ -1,0 +1,114 @@
+name: CI
+
+# Keep the checks aligned with .github/workflows/{ci,bench}.yml. The Forgejo
+# runner provides Rust (including rustfmt/clippy), Node and Python in its image.
+on:
+  push:
+    branches: [main, staging, 'automation/xero/**']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ forgejo.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+  # This runner shares its host with Forgejo and the bridge service.
+  CARGO_BUILD_JOBS: '2'
+
+jobs:
+  check:
+    name: Linux checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      # Qualify action URLs: Forgejo's default action host is not github.com.
+      - uses: https://data.forgejo.org/actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Check runner toolchain
+        run: |
+          rustc --version
+          cargo --version
+          cargo fmt --version
+          cargo clippy --version
+          python3 --version
+          node --version
+
+      - name: rustfmt
+        run: cargo fmt --all --check
+
+      - name: Coverage font fixtures are reproducible
+        run: python3 crates/zpdf-font/tests/fixtures/generate_coverage_fonts.py --check
+
+      - name: Adobe CMap data is reproducible
+        run: |
+          python3 -B tools/generate_adobe_cmaps.py --check
+          python3 -B -m unittest discover -s tools -p 'test_generate_adobe_cmaps.py'
+
+      - name: Font acquisition helpers
+        run: |
+          python3 -B -m unittest discover -s tools -p 'test_fetch_font.py'
+          node --test crates/zpdf-wasm/www/font-packs.test.mjs
+
+      - name: Shipped WASM package matches library sources and runs
+        run: node --test crates/zpdf-wasm/www/package.test.mjs crates/zpdf-wasm/www/package-fingerprint.test.mjs
+
+      - name: Install Linux GUI dependencies and software Vulkan
+        run: |
+          # Job containers run as root; also allow a runner with sudo installed.
+          as_root() {
+            if [ "$(id -u)" -eq 0 ]; then "$@"; else sudo "$@"; fi
+          }
+          as_root apt-get update
+          as_root apt-get install -y --no-install-recommends \
+            pkg-config libssl-dev libfontconfig-dev libwayland-dev \
+            libx11-xcb-dev libxkbcommon-x11-dev mesa-vulkan-drivers libvulkan1
+          mkdir -p "$RUNNER_TEMP/xdg-runtime"
+          chmod 700 "$RUNNER_TEMP/xdg-runtime"
+          echo "XDG_RUNTIME_DIR=$RUNNER_TEMP/xdg-runtime" >> "$GITHUB_ENV"
+
+      - name: clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Build (all targets)
+        run: cargo build --locked --workspace --all-targets --verbose
+
+      - name: Test
+        run: cargo test --locked --workspace --verbose
+
+      - name: Build (gpu-render feature)
+        run: cargo build --locked -p zpdf --features gpu-render --verbose
+
+      - name: GPU oracle suites (software Vulkan)
+        run: |
+          set -o pipefail
+          cargo test --locked -p zpdf --features gpu-render \
+            --test gpu_acceptance --test gpu_overprint --test gpu_softmask \
+            -- --nocapture 2>&1 | tee gpu-oracle.log
+          cargo test --locked -p zpdf-benches --features gpu-render --test font_fallback \
+            -- --nocapture 2>&1 | tee -a gpu-oracle.log
+          # A missing adapter must fail instead of silently skipping comparisons.
+          if grep -q "skipping GPU" gpu-oracle.log; then
+            echo "::error::a GPU oracle suite skipped — software Vulkan driver missing?"
+            exit 1
+          fi
+
+      - name: Perf gate (composition counters and loose wall ceiling)
+        run: cargo test --locked -p zpdf-benches --test perf_gate -- --nocapture
+
+      - name: Font benchmark smoke
+        run: cargo bench --locked -p zpdf-benches --bench fonts --bench font_fallback -- --test
+
+      - name: Bench harness smoke (synthetic only)
+        env:
+          ZPDF_BENCH_SYNTHETIC_ONLY: '1'
+        run: |
+          cargo bench --locked -p zpdf-benches --bench stages -- --quick \
+            "stages/parse/rect_fills"
