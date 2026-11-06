@@ -31,9 +31,13 @@ Until `main` contains `.forgejo/workflows`, it still falls back to
 Changing that workflow only in the PR does not change the target-branch run.
 
 Triage uses GitHub API actions and runs only on GitHub. The bridge synchronizes
-its labels to Forgejo. During migration, disable only `triage.yml` in the
-Forgejo repository's Actions page before pushing the next PR revision. Keep
-the native `ci.yml` enabled and verify its run for the new commit. Disabling
-Triage prevents new runs; it does not erase failures recorded on older commits.
-The GitHub-only job condition also prevents accidental execution if a later
-branch falls back to `.github/workflows`.
+its labels to Forgejo. On Forgejo 17.0.1, the disabled-workflow filter is not
+applied to target-branch `pull_request_target` workflows. Disabling `triage.yml`
+in the Actions page alone therefore does not stop these runs.
+
+To validate the migration PR while it remains open, first land the GitHub-only
+job condition from `.github/workflows/triage.yml` on the target branch, then
+sync that branch to Forgejo before updating the PR. Keep the native `ci.yml`
+enabled and verify checks against the new PR revision. Once the native
+workflow directory reaches `main`, Forgejo no longer falls back to the GitHub
+workflows. Historical failures remain recorded on their original revisions.
