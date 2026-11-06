@@ -75,24 +75,24 @@ jobs:
           echo "XDG_RUNTIME_DIR=$RUNNER_TEMP/xdg-runtime" >> "$GITHUB_ENV"
 
       - name: clippy
-        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Build (all targets)
-        run: cargo build --locked --workspace --all-targets --verbose
+        run: cargo build --workspace --all-targets --verbose
 
       - name: Test
-        run: cargo test --locked --workspace --verbose
+        run: cargo test --workspace --verbose
 
       - name: Build (gpu-render feature)
-        run: cargo build --locked -p zpdf --features gpu-render --verbose
+        run: cargo build -p zpdf --features gpu-render --verbose
 
       - name: GPU oracle suites (software Vulkan)
         run: |
           set -o pipefail
-          cargo test --locked -p zpdf --features gpu-render \
+          cargo test -p zpdf --features gpu-render \
             --test gpu_acceptance --test gpu_overprint --test gpu_softmask \
             -- --nocapture 2>&1 | tee gpu-oracle.log
-          cargo test --locked -p zpdf-benches --features gpu-render --test font_fallback \
+          cargo test -p zpdf-benches --features gpu-render --test font_fallback \
             -- --nocapture 2>&1 | tee -a gpu-oracle.log
           # A missing adapter must fail instead of silently skipping comparisons.
           if grep -q "skipping GPU" gpu-oracle.log; then
@@ -101,14 +101,14 @@ jobs:
           fi
 
       - name: Perf gate (composition counters and loose wall ceiling)
-        run: cargo test --locked -p zpdf-benches --test perf_gate -- --nocapture
+        run: cargo test -p zpdf-benches --test perf_gate -- --nocapture
 
       - name: Font benchmark smoke
-        run: cargo bench --locked -p zpdf-benches --bench fonts --bench font_fallback -- --test
+        run: cargo bench -p zpdf-benches --bench fonts --bench font_fallback -- --test
 
       - name: Bench harness smoke (synthetic only)
         env:
           ZPDF_BENCH_SYNTHETIC_ONLY: '1'
         run: |
-          cargo bench --locked -p zpdf-benches --bench stages -- --quick \
+          cargo bench -p zpdf-benches --bench stages -- --quick \
             "stages/parse/rect_fills"
