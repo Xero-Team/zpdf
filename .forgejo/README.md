@@ -22,3 +22,18 @@ CI runs for pull requests, pushes to `main`, `staging`, or `automation/xero/**`,
 and manual dispatches for a selected branch. GitHub publishing, release,
 scheduled fuzzing, and issue automation remain in `.github/workflows`; this
 directory does not enable a second publisher or duplicate scheduled jobs.
+
+## Migrating the target branch
+
+Forgejo resolves `pull_request_target` workflows from the PR's target branch.
+Until `main` contains `.forgejo/workflows`, it still falls back to
+`.github/workflows/triage.yml`, even when the PR already uses the native CI.
+Changing that workflow only in the PR does not change the target-branch run.
+
+Triage uses GitHub API actions and runs only on GitHub. The bridge synchronizes
+its labels to Forgejo. During migration, disable only `triage.yml` in the
+Forgejo repository's Actions page before pushing the next PR revision. Keep
+the native `ci.yml` enabled and verify its run for the new commit. Disabling
+Triage prevents new runs; it does not erase failures recorded on older commits.
+The GitHub-only job condition also prevents accidental execution if a later
+branch falls back to `.github/workflows`.

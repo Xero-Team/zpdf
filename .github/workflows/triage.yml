@@ -18,6 +18,8 @@ concurrency:
 jobs:
   label:
     name: Apply routing labels
+    # GitHub's API actions cannot label Forgejo PRs; the bridge syncs labels.
+    if: github.server_url == 'https://github.com'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
