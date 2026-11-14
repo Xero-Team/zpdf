@@ -75,6 +75,9 @@ pub fn render_glyph_run(rec: &mut PageRecorder, fonts: &FontCache, map: &PageMap
     };
 
     for g in &run.glyphs {
+        if !rec.can_record() {
+            return;
+        }
         let atlas_key = atlas_key_size.map(|(x_millipx_per_em, y_millipx_per_em)| GlyphKey {
             font_id: run.font_id,
             glyph_id: g.glyph_id,
@@ -249,19 +252,24 @@ fn render_type3(
     map: &PageMap,
     h_scale: f32,
 ) {
-    use zpdf_content::interpreter::ContentInterpreter;
-
     let tm = &run.transform;
     let font_size = run.font_size;
 
     for g in &run.glyphs {
+        if !rec.can_record() {
+            return;
+        }
         let Some((stream, font_matrix)) = font.type3_glyph_stream(g.glyph_id) else {
             continue;
         };
-        let glyph_rect = zpdf_core::Rect::new(0.0, -1000.0, 1000.0, 1000.0);
-        let glyph_dl = ContentInterpreter::new(glyph_rect).interpret(stream);
+        let Some(glyph_dl) = rec.interpret_type3_stream(stream) else {
+            return;
+        };
 
         for cmd in &glyph_dl.commands {
+            if !rec.can_record() {
+                return;
+            }
             match cmd {
                 RenderCommand::FillPath { path, rule, .. } => {
                     if let Some(p) = build_type3_path(
@@ -399,6 +407,66 @@ mod tests {
 
     fn map(scale: f32, y1: f32) -> PageMap {
         PageMap { scale, x0: 0.0, y1 }
+    }
+
+    #[test]
+    fn type3_run_stops_at_shared_operator_budget_without_recording_partial_child() {
+        use zpdf_core::ParseLimits;
+        use zpdf_display_list::{Color, PositionedGlyph};
+        use zpdf_font::{CidWidths, PdfFontType};
+
+        let font = LoadedFont::new_with_data(
+            PdfFontType::Type3 {
+                font_matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                char_procs: std::collections::HashMap::from([(
+                    "A".into(),
+                    std::sync::Arc::<[u8]>::from(&b"0 0 1 1 re f"[..]),
+                )]),
+                encoding: vec!["A".into()],
+                widths: vec![1.0],
+                first_char: 0,
+            },
+            "Type3BudgetTest".into(),
+            Vec::new(),
+            CidWidths::new(1.0),
+        );
+        let mut fonts = FontCache::new();
+        let font_id = fonts.insert("F1".into(), font);
+        let run = GlyphRun {
+            font_id,
+            font_size: 1.0,
+            glyphs: (0..3)
+                .map(|i| PositionedGlyph {
+                    glyph_id: 0,
+                    code: 0,
+                    x: i as f32 * 2.0,
+                    y: 0.0,
+                    advance: 2.0,
+                })
+                .collect(),
+            paint: Paint::Solid(Color::black()),
+            alpha: 1.0,
+            overprint: None,
+            transform: Matrix::identity(),
+            h_scale: 1.0,
+        };
+        let limits = ParseLimits {
+            max_page_operators: 3,
+            ..ParseLimits::default()
+        };
+        let mut limited = PageRecorder::default().with_limits(&limits);
+        render_glyph_run(&mut limited, &fonts, &map(1.0, 10.0), &run);
+        assert_eq!(
+            limited.ops.len(),
+            1,
+            "only the complete first glyph was recorded"
+        );
+        assert!(limited.ensure_within_budget().is_err());
+
+        let mut normal = PageRecorder::default().with_limits(&ParseLimits::default());
+        render_glyph_run(&mut normal, &fonts, &map(1.0, 10.0), &run);
+        assert_eq!(normal.ops.len(), 3);
+        assert!(normal.ensure_within_budget().is_ok());
     }
 
     #[test]

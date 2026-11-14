@@ -1177,6 +1177,7 @@ impl<'a> ContentInterpreter<'a> {
         self.paint_annotations();
 
         self.stats.font_repairs = self.font_repair.repairs;
+        self.stats.operators_executed = self.ops_executed;
         self.stats.diagnostics.resource_limit_reached |= self.resource_limit_hit;
         self.stats.diagnostics.time_limit_reached |= self.timed_out;
         self.stats.font_repair_probes = self.font_repair.probes;
@@ -4166,6 +4167,11 @@ impl<'a> ContentInterpreter<'a> {
     }
 
     fn do_inline_image(&mut self, dict: zpdf_core::PdfDict, data: Vec<u8>) {
+        // BI ... EI is one operation in every content loop. Charge it even
+        // when rendering is skipped (for example a Type3 child without an
+        // image cache), just as execute_operator charges suppressed operators.
+        self.ops_executed = self.ops_executed.saturating_add(1);
+
         if self.image_cache.is_none() || self.oc_suppressed() {
             return;
         }
@@ -8855,6 +8861,134 @@ mod tests {
         assert!(stats.total_ns > 0, "total_ns must bracket the interpret");
         #[cfg(target_arch = "wasm32")]
         assert!(stats.is_empty() || stats.total_ns == 0);
+    }
+
+    // Two complete one-pixel inline images; each BI ... EI is one operation.
+    const INLINE_IMAGE_PAIR: &str =
+        "BI /W 1 /H 1 /BPC 8 /CS /G ID x EI BI /W 1 /H 1 /BPC 8 /CS /G ID y EI";
+
+    #[test]
+    fn inline_images_count_toward_the_operator_limit() {
+        let page = Rect::new(0.0, 0.0, 10.0, 10.0);
+        for render_images in [false, true] {
+            for max_ops in [1, 2] {
+                let limits = ParseLimits {
+                    max_page_operators: max_ops,
+                    ..ParseLimits::default()
+                };
+                let mut cache = ImageCache::new();
+                let interp = ContentInterpreter::new(page).with_limits(&limits);
+                let interp = if render_images {
+                    interp.with_images(&mut cache)
+                } else {
+                    interp
+                };
+                let (dl, stats) = interp.interpret_with_stats(INLINE_IMAGE_PAIR.as_bytes());
+                assert_eq!(stats.operators_executed, max_ops);
+                assert_eq!(stats.diagnostics.resource_limit_reached, max_ops == 1);
+                assert_eq!(
+                    dl.commands
+                        .iter()
+                        .filter(|cmd| matches!(cmd, RenderCommand::DrawImage(_)))
+                        .count(),
+                    if render_images { max_ops as usize } else { 0 },
+                );
+                if max_ops == 2 {
+                    assert!(stats.diagnostics.is_complete());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn inline_images_in_forms_share_the_operator_limit() {
+        let form = single_object_file(&format!(
+            "<< /Type /XObject /Subtype /Form /BBox [0 0 10 10] /Length {} >>\n\
+             stream\n{INLINE_IMAGE_PAIR}\nendstream",
+            INLINE_IMAGE_PAIR.len(),
+        ));
+        let mut resources = ResourceDict::default();
+        resources.xobjects.insert("Fm0".into(), ObjectId(1, 0));
+        for max_ops in [2, 3] {
+            let limits = ParseLimits {
+                max_page_operators: max_ops,
+                ..ParseLimits::default()
+            };
+            let mut cache = ImageCache::new();
+            let (dl, stats) = ContentInterpreter::new(Rect::new(0.0, 0.0, 10.0, 10.0))
+                .with_document(&form, &resources)
+                .with_images(&mut cache)
+                .with_limits(&limits)
+                .interpret_with_stats(b"/Fm0 Do");
+            // The invoking Do and each inline image consume one operation.
+            assert_eq!(stats.operators_executed, max_ops);
+            assert_eq!(stats.diagnostics.resource_limit_reached, max_ops == 2);
+            assert_eq!(
+                dl.commands
+                    .iter()
+                    .filter(|cmd| matches!(cmd, RenderCommand::DrawImage(_)))
+                    .count(),
+                (max_ops - 1) as usize,
+            );
+            if max_ops == 3 {
+                assert!(stats.diagnostics.is_complete());
+            }
+        }
+    }
+
+    #[test]
+    fn inline_images_in_patterns_share_the_operator_limit() {
+        let pattern = single_object_file(&format!(
+            "<< /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 10 10] \
+             /XStep 10 /YStep 10 /Resources << >> /Length {} >>\n\
+             stream\n{INLINE_IMAGE_PAIR}\nendstream",
+            INLINE_IMAGE_PAIR.len(),
+        ));
+        let mut resources = ResourceDict::default();
+        resources.patterns.insert("P0".into(), ObjectId(1, 0));
+        for max_ops in [5, 100] {
+            let limits = ParseLimits {
+                max_page_operators: max_ops,
+                ..ParseLimits::default()
+            };
+            let mut cache = ImageCache::new();
+            let (dl, stats) = ContentInterpreter::new(Rect::new(0.0, 0.0, 10.0, 10.0))
+                .with_document(&pattern, &resources)
+                .with_images(&mut cache)
+                .with_limits(&limits)
+                .interpret_with_stats(b"/Pattern cs /P0 scn 0 0 1 1 re f");
+            let images = dl
+                .commands
+                .iter()
+                .filter(|cmd| matches!(cmd, RenderCommand::DrawImage(_)))
+                .count();
+            // cs, scn, re, f plus every image in every replicated cell.
+            assert_eq!(stats.operators_executed, 4 + images as u64);
+            if max_ops == 5 {
+                assert_eq!(images, 1);
+                assert!(stats.diagnostics.resource_limit_reached);
+            } else {
+                assert!(images > 2, "the pattern must execute more than one cell");
+                assert!(stats.diagnostics.is_complete());
+            }
+        }
+    }
+
+    #[test]
+    fn operator_count_includes_unattributed_work_and_stops_at_the_limit() {
+        let page = Rect::new(0.0, 0.0, 10.0, 10.0);
+        let (_, complete) = ContentInterpreter::new(page).interpret_with_stats(b"q Q q Q");
+        assert_eq!(complete.operators_executed, 4);
+        assert!(complete.diagnostics.is_complete());
+        let limits = ParseLimits {
+            max_page_operators: 3,
+            ..ParseLimits::default()
+        };
+        let (_, partial) = ContentInterpreter::new(page)
+            .with_limits(&limits)
+            .interpret_with_stats(b"q Q q Q");
+        assert_eq!(partial.operators_executed, 3);
+        assert!(partial.diagnostics.resource_limit_reached);
     }
 
     /// The work buckets are opt-in: with no flag, an instrumented operator must

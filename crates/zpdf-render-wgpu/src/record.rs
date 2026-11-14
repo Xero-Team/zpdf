@@ -9,6 +9,7 @@
 use crate::glyph_atlas::GlyphAtlas;
 use crate::path::{fill_mesh, stroke_mesh, Mesh};
 use crate::transform::{PageMap, SolidVertex, TexturedVertex};
+use zpdf_core::{time::Instant, ParseLimits};
 use zpdf_display_list::{
     BlendMode, FillRule, Overprint, Path as DlPath, SoftMaskKind, StrokeStyle,
 };
@@ -99,6 +100,27 @@ struct ClipEntry {
     advanced: bool,
 }
 
+/// One cooperative deadline covers page recording, including child programs
+/// and soft masks. A single tessellation call is not preemptible.
+const RECORD_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
+
+fn geometry_bytes<V>(vertices: usize, indices: usize) -> Option<u64> {
+    let vertices = u64::try_from(vertices)
+        .ok()?
+        .checked_mul(std::mem::size_of::<V>() as u64)?;
+    let indices = u64::try_from(indices)
+        .ok()?
+        .checked_mul(std::mem::size_of::<u32>() as u64)?;
+    vertices.checked_add(indices)
+}
+
+fn arena_fits_u32(current: usize, additional: usize) -> bool {
+    current
+        .checked_add(additional)
+        .and_then(|total| u32::try_from(total).ok())
+        .is_some()
+}
+
 /// Accumulates geometry + ops for one page.
 #[derive(Default)]
 pub struct PageRecorder {
@@ -127,9 +149,117 @@ pub struct PageRecorder {
     /// Groups omitted after reaching the depth cap. Matching pops consume this
     /// counter instead of closing a real outer group.
     skipped_blend_depth: usize,
+    /// Shared by the page and every soft-mask sub-list; never saved/restored
+    /// with the local clip/blend state in `record_subops`.
+    limits: ParseLimits,
+    /// Actual child operators, with a minimum charge of one per dispatch so
+    /// empty/operand-only programs cannot replay for free (including on wasm).
+    type3_work_used: u64,
+    geometry_bytes: u64,
+    deadline: Option<Instant>,
+    /// A failed child or append invalidates the whole page. Latching the error
+    /// lets sub-list recording unwind its state before the renderer drops it.
+    recording_error: Option<&'static str>,
 }
 
 impl PageRecorder {
+    pub fn with_limits(mut self, limits: &ParseLimits) -> Self {
+        self.limits = limits.clone();
+        self.deadline = Some(Instant::now() + RECORD_BUDGET);
+        self.with_max_blend_depth(limits.max_blend_group_depth as usize)
+    }
+
+    /// Check at command/glyph boundaries and before appends. All nested work
+    /// observes the same deadline and the first failure remains authoritative.
+    pub fn can_record(&mut self) -> bool {
+        if self.recording_error.is_none()
+            && self
+                .deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            self.recording_error = Some("GPU page recording exceeded time budget");
+        }
+        self.recording_error.is_none()
+    }
+
+    pub fn ensure_within_budget(&mut self) -> Result<(), crate::WgpuRenderError> {
+        self.can_record();
+        match self.recording_error {
+            Some(reason) => Err(crate::WgpuRenderError::Unsupported(reason.into())),
+            None => Ok(()),
+        }
+    }
+
+    /// Interpret a Type3 occurrence with the document's content policy and
+    /// debit max(1, operators executed) from one render-page allowance. The
+    /// minimum charge bounds children with no operators as well.
+    /// Work timing is optional; the total operator counter is always available.
+    pub fn interpret_type3_stream(
+        &mut self,
+        stream: &[u8],
+    ) -> Option<zpdf_display_list::DisplayList> {
+        if !self.can_record() {
+            return None;
+        }
+        let mut limits = self.limits.clone();
+        limits.max_page_operators = limits
+            .max_page_operators
+            .saturating_sub(self.type3_work_used);
+        if limits.max_page_operators == 0 {
+            self.recording_error = Some("GPU Type3 interpretation exceeded content limits");
+            return None;
+        }
+        let deadline = *self
+            .deadline
+            .get_or_insert_with(|| Instant::now() + RECORD_BUDGET);
+        let rect = zpdf_core::Rect::new(0.0, -1000.0, 1000.0, 1000.0);
+        let (dl, stats) = zpdf_content::interpreter::ContentInterpreter::new(rect)
+            .with_limits(&limits)
+            .with_deadline(deadline)
+            .interpret_with_stats(stream);
+        self.type3_work_used = self
+            .type3_work_used
+            .saturating_add(stats.operators_executed.max(1));
+        if stats.diagnostics.time_limit_reached {
+            self.recording_error = Some("GPU Type3 interpretation exceeded page time budget");
+        } else if stats.diagnostics.resource_limit_reached {
+            self.recording_error = Some("GPU Type3 interpretation exceeded content limits");
+        }
+        // Reject a partial child before any of its geometry is recorded. The
+        // post-check also catches short children below the interpreter's clock
+        // sampling interval.
+        if !self.can_record() {
+            return None;
+        }
+        Some(dl)
+    }
+
+    fn reserve_geometry<V>(
+        &mut self,
+        current_vertices: usize,
+        current_indices: usize,
+        vertices: usize,
+        indices: usize,
+    ) -> bool {
+        if !self.can_record() {
+            return false;
+        }
+        if !arena_fits_u32(current_vertices, vertices) || !arena_fits_u32(current_indices, indices)
+        {
+            self.recording_error = Some("GPU page geometry exceeds u32 indexing");
+            return false;
+        }
+        let total = geometry_bytes::<V>(vertices, indices)
+            .and_then(|bytes| self.geometry_bytes.checked_add(bytes))
+            .filter(|&bytes| bytes <= self.limits.max_gpu_geometry_bytes);
+        let Some(total) = total else {
+            self.recording_error = Some("GPU page geometry exceeds max_gpu_geometry_bytes");
+            return false;
+        };
+        self.geometry_bytes = total;
+        true
+    }
+
     pub fn with_max_blend_depth(mut self, max_depth: usize) -> Self {
         self.max_blend_depth = Some(max_depth);
         self
@@ -141,7 +271,15 @@ impl PageRecorder {
                 < self.max_blend_depth.unwrap_or(usize::MAX)
     }
 
-    fn append(&mut self, mesh: Mesh) -> MeshRange {
+    fn append(&mut self, mesh: Mesh) -> Option<MeshRange> {
+        if !self.reserve_geometry::<SolidVertex>(
+            self.vertices.len(),
+            self.indices.len(),
+            mesh.vertices.len(),
+            mesh.indices.len(),
+        ) {
+            return None;
+        }
         // Indices are rebased to absolute (base_vertex baked in) so every draw
         // can use base_vertex 0 uniformly. This makes a contiguous run of
         // same-key ops trivially concatenable into one draw_indexed call
@@ -154,11 +292,11 @@ impl PageRecorder {
         self.vertices.extend_from_slice(&mesh.vertices);
         self.indices
             .extend(mesh.indices.iter().map(|&i| i + base_vertex));
-        MeshRange {
+        Some(MeshRange {
             first_index,
             index_count,
             base_vertex: 0,
-        }
+        })
     }
 
     /// Record a pre-tessellated mesh as a content draw at the current clip depth.
@@ -167,7 +305,9 @@ impl PageRecorder {
         if mesh.indices.is_empty() {
             return;
         }
-        let range = self.append(mesh);
+        let Some(range) = self.append(mesh) else {
+            return;
+        };
         self.ops.push(PageOp::Draw {
             range,
             clip_ref: self.clip_depth,
@@ -176,6 +316,14 @@ impl PageRecorder {
 
     /// Record an image quad (4 textured vertices) at the current clip depth.
     pub fn add_image(&mut self, quad: [TexturedVertex; 4], image_id: u32) {
+        if !self.reserve_geometry::<TexturedVertex>(
+            self.tex_vertices.len(),
+            self.tex_indices.len(),
+            4,
+            6,
+        ) {
+            return;
+        }
         let base_vertex = self.tex_vertices.len() as u32;
         let first_index = self.tex_indices.len() as u32;
         self.tex_vertices.extend_from_slice(&quad);
@@ -203,6 +351,14 @@ impl PageRecorder {
     /// `add_image`'s per-quad `base_vertex`) so consecutive glyph quads are
     /// trivially batchable.
     pub fn add_glyph_quad(&mut self, quad: [TexturedVertex; 4]) {
+        if !self.reserve_geometry::<TexturedVertex>(
+            self.glyph_vertices.len(),
+            self.glyph_indices.len(),
+            4,
+            6,
+        ) {
+            return;
+        }
         let base_vertex = self.glyph_vertices.len() as u32;
         let first_index = self.glyph_indices.len() as u32;
         self.glyph_vertices.extend_from_slice(&quad);
@@ -225,6 +381,9 @@ impl PageRecorder {
     }
 
     pub fn add_fill(&mut self, path: &DlPath, rule: FillRule, color: [f32; 4], map: &PageMap) {
+        if !self.can_record() {
+            return;
+        }
         if let Some(mesh) = fill_mesh(path, rule, color, map) {
             self.add_mesh(mesh);
         }
@@ -237,6 +396,9 @@ impl PageRecorder {
         color: [f32; 4],
         map: &PageMap,
     ) {
+        if !self.can_record() {
+            return;
+        }
         if let Some(mesh) = stroke_mesh(path, style, color, map) {
             self.add_mesh(mesh);
         }
@@ -247,19 +409,28 @@ impl PageRecorder {
     /// path is empty (an empty clip ⇒ nothing passes at the deeper level, which
     /// is the correct "clip to nothing" behavior).
     pub fn push_clip(&mut self, path: &DlPath, rule: FillRule, map: &PageMap) {
-        let range = fill_mesh(path, rule, [0.0; 4], map).map(|m| self.append(m));
+        if !self.can_record() {
+            return;
+        }
+        let range = fill_mesh(path, rule, [0.0; 4], map).and_then(|m| self.append(m));
         self.push_clip_range(range);
     }
 
     /// Push a clip to a *stroked* path's outline (tessellated as a stroke mesh).
     pub fn push_clip_stroke(&mut self, path: &DlPath, style: &StrokeStyle, map: &PageMap) {
-        let range = stroke_mesh(path, style, [0.0; 4], map).map(|m| self.append(m));
+        if !self.can_record() {
+            return;
+        }
+        let range = stroke_mesh(path, style, [0.0; 4], map).and_then(|m| self.append(m));
         self.push_clip_range(range);
     }
 
     /// Common tail of the clip-push variants: stamp the (optional) mesh as a clip
     /// path and advance the clip depth (an empty mesh still occupies a level).
     fn push_clip_range(&mut self, range: Option<MeshRange>) {
+        if !self.can_record() {
+            return;
+        }
         // Stencil8 can encode references 0..=255. Saturate deeper malformed
         // nesting instead of wrapping the reference to zero and leaking draws.
         if self.clip_depth == u8::MAX as u32 {
@@ -430,7 +601,7 @@ impl PageRecorder {
     }
 
     /// Append a fullscreen quad in device pixels (for `ResetStencil`).
-    pub fn append_fullscreen(&mut self, w_px: f32, h_px: f32) -> MeshRange {
+    pub fn append_fullscreen(&mut self, w_px: f32, h_px: f32) -> Option<MeshRange> {
         let v = |x: f32, y: f32| SolidVertex {
             pos: [x, y],
             color: [0.0; 4],
@@ -464,6 +635,233 @@ mod tests {
         p.line_to(Point::new(x0, y1));
         p.close();
         p
+    }
+
+    #[test]
+    fn type3_work_is_cumulative_across_occurrences_and_masks() {
+        let limits = ParseLimits {
+            max_page_operators: 5,
+            ..ParseLimits::default()
+        };
+        let mut r = PageRecorder::default().with_limits(&limits);
+        let deadline = r.deadline;
+        let stream = b"0 0 1 1 re f"; // two operators, one visible command
+        let first = r.interpret_type3_stream(stream).unwrap();
+        assert_eq!(first.commands.len(), 1);
+        let sub = r.record_subops(|nested| {
+            let second = nested.interpret_type3_stream(stream).unwrap();
+            assert_eq!(second.commands.len(), 1);
+        });
+        assert!(sub.is_empty());
+        assert_eq!(r.type3_work_used, 4);
+        assert_eq!(r.deadline, deadline);
+        assert!(r.interpret_type3_stream(stream).is_none());
+        assert_eq!(r.type3_work_used, 5);
+        assert!(r.ensure_within_budget().is_err());
+        assert!(r.interpret_type3_stream(b"q Q").is_none());
+        assert_eq!(r.type3_work_used, 5, "failure stops later work");
+    }
+
+    #[test]
+    fn type3_inline_images_over_the_operator_limit_reject_the_child() {
+        let stream = b"BI /W 1 /H 1 /BPC 8 /CS /G ID x EI BI /W 1 /H 1 /BPC 8 /CS /G ID y EI";
+        let limits = ParseLimits {
+            max_page_operators: 1,
+            ..ParseLimits::default()
+        };
+        let mut r = PageRecorder::default().with_limits(&limits);
+        assert!(r.interpret_type3_stream(stream).is_none());
+        assert_eq!(r.type3_work_used, 1);
+        assert!(r.ensure_within_budget().is_err());
+        assert!(r.vertices.is_empty());
+        assert!(r.ops.is_empty());
+
+        let limits = ParseLimits {
+            max_page_operators: 2,
+            ..ParseLimits::default()
+        };
+        let mut r = PageRecorder::default().with_limits(&limits);
+        assert!(r.interpret_type3_stream(stream).is_some());
+        assert_eq!(r.type3_work_used, 2);
+        assert!(r.ensure_within_budget().is_ok());
+    }
+
+    #[test]
+    fn type3_inline_images_share_the_allowance_across_occurrences_and_masks() {
+        let stream = b"BI /W 1 /H 1 /BPC 8 /CS /G ID x EI BI /W 1 /H 1 /BPC 8 /CS /G ID y EI";
+        let limits = ParseLimits {
+            max_page_operators: 3,
+            ..ParseLimits::default()
+        };
+        let mut r = PageRecorder::default().with_limits(&limits);
+        assert!(r.interpret_type3_stream(stream).is_some());
+        assert_eq!(r.type3_work_used, 2);
+        let sub = r.record_subops(|nested| {
+            assert!(nested.interpret_type3_stream(stream).is_none());
+        });
+        assert!(sub.is_empty());
+        assert_eq!(r.type3_work_used, 3);
+        assert!(r.ensure_within_budget().is_err());
+        assert!(r.interpret_type3_stream(stream).is_none());
+        assert_eq!(r.type3_work_used, 3, "failure stops later work");
+        assert!(r.vertices.is_empty());
+        assert!(r.ops.is_empty());
+    }
+
+    #[test]
+    fn empty_and_operand_only_type3_dispatches_are_not_free() {
+        let limits = ParseLimits {
+            max_page_operators: 2,
+            ..ParseLimits::default()
+        };
+        let mut r = PageRecorder::default().with_limits(&limits);
+        assert!(r.interpret_type3_stream(b"").is_some());
+        assert!(r.interpret_type3_stream(b"1").is_some());
+        assert_eq!(r.type3_work_used, 2);
+        assert!(r.interpret_type3_stream(b"").is_none());
+        assert_eq!(r.type3_work_used, 2);
+        assert!(r.ensure_within_budget().is_err());
+    }
+
+    #[test]
+    fn type3_children_enforce_custom_content_limits() {
+        let cases: [(ParseLimits, &[u8]); 4] = [
+            (
+                ParseLimits {
+                    max_page_operators: 1,
+                    ..ParseLimits::default()
+                },
+                b"q Q",
+            ),
+            (
+                ParseLimits {
+                    max_operand_stack_depth: 1,
+                    ..ParseLimits::default()
+                },
+                b"1 2",
+            ),
+            (
+                ParseLimits {
+                    max_graphics_state_depth: 1,
+                    ..ParseLimits::default()
+                },
+                b"q q",
+            ),
+            (
+                ParseLimits {
+                    max_marked_content_depth: 1,
+                    ..ParseLimits::default()
+                },
+                b"/Span BMC /Span BMC",
+            ),
+        ];
+        for (limits, stream) in cases {
+            let mut r = PageRecorder::default().with_limits(&limits);
+            assert!(r.interpret_type3_stream(stream).is_none());
+            assert!(r.ensure_within_budget().is_err());
+            assert!(r.vertices.is_empty());
+            assert!(r.ops.is_empty());
+        }
+    }
+
+    #[test]
+    fn type3_child_does_not_reset_an_expired_page_deadline() {
+        let mut r = PageRecorder::default().with_limits(&ParseLimits::default());
+        r.deadline = Some(Instant::now()); // deterministic expiry, no sleep
+        let deadline = r.deadline;
+        let sub = r.record_subops(|nested| {
+            assert!(nested.interpret_type3_stream(b"0 0 1 1 re f").is_none());
+        });
+        assert!(sub.is_empty());
+        assert_eq!(r.deadline, deadline);
+        assert_eq!(r.type3_work_used, 0);
+        assert!(r.ensure_within_budget().is_err());
+    }
+
+    fn triangle() -> Mesh {
+        let mut mesh = Mesh::new();
+        mesh.vertices.extend_from_slice(&[
+            SolidVertex {
+                pos: [0.0, 0.0],
+                color: [1.0; 4],
+            },
+            SolidVertex {
+                pos: [1.0, 0.0],
+                color: [1.0; 4],
+            },
+            SolidVertex {
+                pos: [0.0, 1.0],
+                color: [1.0; 4],
+            },
+        ]);
+        mesh.indices.extend_from_slice(&[0, 1, 2]);
+        mesh
+    }
+
+    #[test]
+    fn geometry_admission_is_shared_across_arenas_and_masks() {
+        let limit = geometry_bytes::<SolidVertex>(3, 3).unwrap()
+            + 2 * geometry_bytes::<TexturedVertex>(4, 6).unwrap();
+        let limits = ParseLimits {
+            max_gpu_geometry_bytes: limit,
+            ..ParseLimits::default()
+        };
+        let mut r = PageRecorder::default().with_limits(&limits);
+        let quad = [TexturedVertex {
+            pos: [0.0; 2],
+            uv: [0.0; 2],
+            color: [1.0; 4],
+        }; 4];
+        r.add_mesh(triangle());
+        r.add_image(quad, 1);
+        let sub = r.record_subops(|nested| {
+            nested.add_glyph_quad(quad);
+            assert!(nested.ensure_within_budget().is_ok());
+            // One more triangle would exceed the shared limit. Neither arena
+            // data nor its draw op may be appended on failure.
+            nested.add_mesh(triangle());
+        });
+        assert_eq!(r.geometry_bytes, limit);
+        assert_eq!((r.vertices.len(), r.indices.len()), (3, 3));
+        assert_eq!((r.tex_vertices.len(), r.tex_indices.len()), (4, 6));
+        assert_eq!((r.glyph_vertices.len(), r.glyph_indices.len()), (4, 6));
+        assert_eq!(r.ops.len(), 2, "outer ops restored after mask failure");
+        assert_eq!(sub.len(), 1);
+        assert_eq!(r.blend_depth_offset, 0);
+        assert!(
+            r.ensure_within_budget().is_err(),
+            "mask error survives restore"
+        );
+    }
+
+    #[test]
+    fn clips_and_fullscreen_geometry_obey_admission() {
+        let limits = ParseLimits {
+            max_gpu_geometry_bytes: 0,
+            ..ParseLimits::default()
+        };
+        let mut r = PageRecorder::default().with_limits(&limits);
+        r.push_clip(&rect(0.0, 0.0, 1.0, 1.0), FillRule::NonZero, &map());
+        assert!(r.ensure_within_budget().is_err());
+        assert!(r.vertices.is_empty());
+        assert!(r.indices.is_empty());
+        assert!(r.clip_stack.is_empty());
+        assert!(r.ops.is_empty());
+
+        let mut r = PageRecorder::default().with_limits(&limits);
+        assert!(r.append_fullscreen(1.0, 1.0).is_none());
+        assert!(r.ensure_within_budget().is_err());
+        assert!(r.vertices.is_empty());
+        assert!(r.indices.is_empty());
+    }
+
+    #[test]
+    fn geometry_count_checks_do_not_wrap() {
+        assert!(arena_fits_u32(u32::MAX as usize - 1, 1));
+        assert!(!arena_fits_u32(u32::MAX as usize, 1));
+        assert!(!arena_fits_u32(usize::MAX, 1));
+        #[cfg(target_pointer_width = "64")]
+        assert!(geometry_bytes::<SolidVertex>(usize::MAX, 0).is_none());
     }
 
     #[test]

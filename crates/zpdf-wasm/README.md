@@ -67,9 +67,13 @@ const svg = pdf.page_svg(0);    // standalone vector SVG
 ## Editing
 
 `PdfEditor` wraps the incremental writer: open a document, queue any number of
-edits, then `save()` to serialize them as **one incremental update** (the
-original bytes plus the new revision — the smallest possible output). Page
-indices are 0-based.
+edits, then `save()` to serialize them as one incremental update. After a
+redaction, `save()` instead writes a fresh document containing the current
+object graph, excluding superseded unredacted revisions. Page indices are
+0-based. Encrypted-input redaction is rejected: the browser API cannot select
+an output-encryption policy. Ordinary encrypted-document edits retain their
+existing encryption; use the native writer for redaction with explicit output
+encryption.
 
 ```js
 import init, { PdfEditor, split_pages, optimize, OptimizeOptions } from "./pkg/zpdf_wasm.js";

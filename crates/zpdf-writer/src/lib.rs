@@ -38,6 +38,7 @@ use serialize::{serialize_dict, write_object, write_stream};
 
 pub mod annotate;
 mod annotation_edits;
+mod bounded;
 pub mod builder;
 mod cff;
 mod contents;
@@ -546,9 +547,9 @@ impl IncrementalWriter {
         //    For an encrypted document, every new/modified object is encrypted
         //    with the document key (resolve_current returned plaintext, since
         //    the parser decrypts on resolve). Raw bodies (the signer's
-        //    byte-exact dict) are emitted verbatim — signature dicts store
-        //    /Contents unencrypted by design (§7.6.2 note: signature
-        //    dictionaries' Contents are excluded from encryption).
+        //    byte-exact dict) are emitted verbatim. The signer encrypts their
+        //    metadata before queueing; only /Contents remains unencrypted
+        //    (§7.6.2: signature dictionaries' Contents are excluded).
         let decryptor = self.doc.file().decryptor();
         let mut xref_entries: Vec<(u32, u16, u64)> = Vec::new();
         for (&num, (gen, pending)) in &self.pending {

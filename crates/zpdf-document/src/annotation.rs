@@ -70,7 +70,10 @@ impl Annotation {
 /// a generated appearance where the producer left none. Link targets (`/Dest` /
 /// `/A`) are resolved to a [`Destination`] or URI via `catalog` and the
 /// document-wide `named` destination map (flattened once by the caller, so the
-/// name tree is never re-walked per page).
+/// name tree is never re-walked per page). The document's decoded-content
+/// budget also bounds the aggregate estimated storage of generated appearances
+/// for this call. Once exhausted, later appearances are not generated; records
+/// and any stored `/AP` remain available to callers.
 pub fn parse_annotations(
     file: &PdfFile,
     page: &PdfPage,
@@ -78,10 +81,71 @@ pub fn parse_annotations(
     named: &HashMap<Vec<u8>, PdfObject>,
     acro_form: Option<&AcroForm>,
 ) -> Vec<Annotation> {
-    page.annots
-        .iter()
-        .filter_map(|&id| parse_annotation(file, id, catalog, named, acro_form))
-        .collect()
+    let mut remaining = file.limits().max_decoded_stream_bytes;
+    let mut generate = remaining != 0;
+    if !generate && !page.annots.is_empty() {
+        tracing::debug!("generated annotation appearances disabled by zero decoded-content budget");
+    }
+    let mut annotations = Vec::new();
+    for &id in &page.annots {
+        let Some(mut annotation) = parse_annotation(file, id, catalog, named, acro_form, generate)
+        else {
+            continue;
+        };
+        if let Some(appearance) = &annotation.generated {
+            let cost = generated_appearance_bytes(appearance);
+            if let Some(left) = remaining.checked_sub(cost) {
+                remaining = left;
+                generate = remaining != 0;
+                if !generate {
+                    tracing::debug!("generated annotation appearance budget exhausted");
+                }
+            } else {
+                // Drop this appearance before retaining the annotation. A
+                // widget's selected stored AP is still a usable fallback.
+                annotation.generated = None;
+                generate = false;
+                tracing::warn!(
+                    "generated annotation appearances exceed the page decoded-content budget; \
+                     skipping further generation"
+                );
+            }
+        }
+        annotations.push(annotation);
+    }
+    annotations
+}
+
+/// Conservative owned-storage estimate. Indirect resources remain object IDs;
+/// direct arrays/dictionaries/strings are copied by generation and must count.
+/// Shared stream payloads are conservatively charged when present inline.
+fn generated_appearance_bytes(appearance: &GeneratedAppearance) -> u64 {
+    fn dict_bytes(dict: &zpdf_core::PdfDict) -> u64 {
+        dict.0.iter().fold(0u64, |sum, (key, value)| {
+            sum.saturating_add(key.0.capacity() as u64)
+                .saturating_add(48) // BTree node/link overhead.
+                .saturating_add(object_bytes(value))
+        })
+    }
+    fn object_bytes(object: &PdfObject) -> u64 {
+        let payload = match object {
+            PdfObject::String(s) => s.0.capacity() as u64,
+            PdfObject::Name(n) => n.0.capacity() as u64,
+            PdfObject::Array(items) => items.iter().fold(
+                (items.capacity() as u64).saturating_mul(std::mem::size_of::<PdfObject>() as u64),
+                |sum, item| sum.saturating_add(object_bytes(item)),
+            ),
+            PdfObject::Dict(dict) => dict_bytes(dict),
+            PdfObject::Stream(stream) => {
+                (stream.data.len() as u64).saturating_add(dict_bytes(&stream.dict))
+            }
+            _ => 0,
+        };
+        (std::mem::size_of::<PdfObject>() as u64).saturating_add(payload)
+    }
+    (std::mem::size_of::<GeneratedAppearance>() as u64)
+        .saturating_add(appearance.content.capacity() as u64)
+        .saturating_add(dict_bytes(&appearance.resources))
 }
 
 fn parse_annotation(
@@ -90,6 +154,7 @@ fn parse_annotation(
     catalog: &Catalog,
     named: &HashMap<Vec<u8>, PdfObject>,
     acro_form: Option<&AcroForm>,
+    generate: bool,
 ) -> Option<Annotation> {
     let obj = file.resolve(id).ok()?;
     let dict = obj.as_dict().ok()?;
@@ -119,7 +184,9 @@ fn parse_annotation(
     // the AcroForm generator (which also honours /NeedAppearances and keeps
     // button /AP states); markup & geometric annotations synthesize their
     // appearance from geometry properties (/QuadPoints, /Vertices, /L, …).
-    let generated = if subtype == "Widget" {
+    let generated = if !generate {
+        None
+    } else if subtype == "Widget" {
         acro_form
             .and_then(|af| af.field_for_widget(id).map(|field| (af, field)))
             .filter(|(af, _)| af.need_appearances || appearance.is_none())
@@ -204,6 +271,14 @@ mod tests {
     /// Two-page document; page 0 (object 3) carries the `/Annots` under test,
     /// page 1 (object 4) is a destination target. Annotation objects start at 5.
     fn doc_with_annots(annot_refs: &str, annots: &[&str]) -> PdfDocument {
+        doc_with_annots_and_limits(annot_refs, annots, zpdf_core::ParseLimits::default())
+    }
+
+    fn doc_with_annots_and_limits(
+        annot_refs: &str,
+        annots: &[&str],
+        limits: zpdf_core::ParseLimits,
+    ) -> PdfDocument {
         let mut objs: Vec<String> = vec![
             "<< /Type /Catalog /Pages 2 0 R >>".into(),
             "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>".into(),
@@ -214,7 +289,61 @@ mod tests {
         ];
         objs.extend(annots.iter().map(|a| (*a).to_string()));
         let refs: Vec<&str> = objs.iter().map(|s| s.as_str()).collect();
-        PdfDocument::open(build_pdf(&refs)).expect("open")
+        PdfDocument::open_with_limits(build_pdf(&refs), limits).expect("open")
+    }
+
+    #[test]
+    fn generated_appearances_share_a_page_storage_budget() {
+        let refs = "5 0 R 5 0 R 5 0 R";
+        let objects = ["<< /Type /Annot /Subtype /Square /Rect [0 0 20 20] /C [1 0 0] >>"];
+        let doc = doc_with_annots(refs, &objects);
+        let annotations = doc.page_annotations(&doc.page(0).unwrap());
+        let cost = super::generated_appearance_bytes(annotations[0].generated.as_ref().unwrap());
+        let limits = zpdf_core::ParseLimits {
+            max_decoded_stream_bytes: cost,
+            ..Default::default()
+        };
+        let doc = doc_with_annots_and_limits(refs, &objects, limits);
+        let annotations = doc.page_annotations(&doc.page(0).unwrap());
+        assert_eq!(annotations.len(), 3, "annotation records remain available");
+        assert_eq!(
+            annotations.iter().filter(|a| a.generated.is_some()).count(),
+            1
+        );
+        let mut appearance = annotations[0].generated.clone().unwrap();
+        let before_resource = super::generated_appearance_bytes(&appearance);
+        appearance.resources.insert(
+            zpdf_core::PdfName::new("Direct"),
+            zpdf_core::PdfObject::String(zpdf_core::PdfString(vec![0; 8])),
+        );
+        assert!(
+            super::generated_appearance_bytes(&appearance) > before_resource,
+            "direct resource storage must count as well as content"
+        );
+    }
+
+    #[test]
+    fn generated_widget_budget_keeps_stored_appearance_fallback() {
+        let pdf = build_pdf(&[
+            "<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [4 0 R] /NeedAppearances true /DA (/Helv 10 Tf 0 g) >> >>",
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Annots [4 0 R] >>",
+            "<< /Type /Annot /Subtype /Widget /FT /Tx /T (field) /V (hello) /Rect [0 0 80 20] /AP << /N 5 0 R >> >>",
+            "<< /Length 0 >>\nstream\n\nendstream",
+        ]);
+        let doc = PdfDocument::open(pdf.clone()).unwrap();
+        assert!(doc.page_annotations(&doc.page(0).unwrap())[0]
+            .generated
+            .is_some());
+        let limits = zpdf_core::ParseLimits {
+            max_decoded_stream_bytes: 1,
+            ..Default::default()
+        };
+        let doc = PdfDocument::open_with_limits(pdf, limits).unwrap();
+        let annotations = doc.page_annotations(&doc.page(0).unwrap());
+        assert!(annotations[0].generated.is_none());
+        assert_eq!(annotations[0].appearance, Some(zpdf_core::ObjectId(5, 0)));
+        assert!(annotations[0].is_viewable());
     }
 
     #[test]

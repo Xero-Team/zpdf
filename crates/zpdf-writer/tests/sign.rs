@@ -226,3 +226,70 @@ fn empty_certificate_is_rejected() {
         .sign(&[], &key, &SignatureOptions::default())
         .is_err());
 }
+
+#[test]
+fn encrypted_signing_keeps_private_metadata_encrypted_and_signature_readable() {
+    use zpdf_writer::{rewrite_pdf, EncryptionConfig, RewriteOptions};
+    let (certificate, key) = ecdsa_material();
+    for config in [
+        EncryptionConfig::rc4_128("test-user", "test-owner"),
+        EncryptionConfig::aes256("test-user", "test-owner"),
+    ] {
+        let original = PdfDocument::open(minimal_pdf()).unwrap();
+        let encrypted = rewrite_pdf(
+            original.file(),
+            &RewriteOptions {
+                encrypt: Some(config),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let options = SignatureOptions {
+            reason: Some("private-test-reason".into()),
+            location: Some("private-test-location".into()),
+            contact: Some("private-test-contact".into()),
+            ..Default::default()
+        };
+        let signed = IncrementalWriter::new_with_password(encrypted, b"test-user")
+            .unwrap()
+            .sign(&certificate, &key, &options)
+            .unwrap();
+        for marker in [
+            "private-test-reason",
+            "private-test-location",
+            "private-test-contact",
+        ] {
+            assert!(!signed
+                .windows(marker.len())
+                .any(|bytes| bytes == marker.as_bytes()));
+        }
+        assert!(PdfDocument::open(signed.clone()).is_err());
+        let document = PdfDocument::open_with_password(signed, b"test-user").unwrap();
+        assert!(document.is_encrypted());
+        let signatures = document.signatures();
+        assert_eq!(signatures.len(), 1);
+        assert_eq!(signatures[0].reason.as_deref(), options.reason.as_deref());
+        assert_eq!(signatures[0].digest, DigestStatus::Verified);
+        assert_eq!(signatures[0].crypto, CryptoStatus::Valid);
+        // Check every private field through the decrypted dictionary too.
+        let signature = document
+            .file()
+            .all_object_ids()
+            .into_iter()
+            .find_map(|id| {
+                let object = document.file().resolve(id).ok()?;
+                let dict = object.as_dict().ok()?;
+                (dict.get_name("Type").ok() == Some("Sig")).then(|| dict.clone())
+            })
+            .unwrap();
+        for (field, text) in [
+            ("Reason", "private-test-reason"),
+            ("Location", "private-test-location"),
+            ("ContactInfo", "private-test-contact"),
+        ] {
+            assert!(
+                matches!(signature.get(field), Some(zpdf_core::PdfObject::String(value)) if value.as_bytes() == text.as_bytes())
+            );
+        }
+    }
+}
