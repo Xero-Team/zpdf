@@ -190,14 +190,18 @@ impl IncrementalWriter {
         let page_dict = page_obj.as_dict()?.clone();
         let prefix = b"q /Part <</MCID 0>> BDC\n";
         let suffix = b"\nEMC Q\n";
-        let (pnum, _) = self.try_add_stream(&PdfDict::new(), prefix)?;
-        let (snum, _) = self.try_add_stream(&PdfDict::new(), suffix)?;
-        // Rebuild /Contents as [prefix, ...originals, suffix].
+        // Rebuild /Contents as [prefix, ...originals, suffix]. Resolve through
+        // pending edits as appended pages can refer to a newly copied array.
         let orig = match page_dict.get("Contents") {
             Some(PdfObject::Array(a)) => a.clone(),
-            Some(r @ PdfObject::Ref(_)) => vec![r.clone()],
+            Some(PdfObject::Ref(id)) => match self.resolve_current(*id)? {
+                PdfObject::Array(a) => a,
+                _ => vec![PdfObject::Ref(*id)],
+            },
             _ => Vec::new(),
         };
+        let (pnum, _) = self.try_add_stream(&PdfDict::new(), prefix)?;
+        let (snum, _) = self.try_add_stream(&PdfDict::new(), suffix)?;
         let mut new_contents = vec![PdfObject::Ref(ObjectId(pnum, 0))];
         new_contents.extend(orig);
         new_contents.push(PdfObject::Ref(ObjectId(snum, 0)));

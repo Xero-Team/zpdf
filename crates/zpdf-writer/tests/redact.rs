@@ -195,6 +195,39 @@ fn stream(dict: &str, data: &str) -> String {
 }
 
 #[test]
+fn inline_annotations_in_redacted_region_leave_no_reachable_contents() {
+    for indirect_array in [false, true] {
+        let annots = "[<< /Type /Annot /Subtype /Text /Rect [10 10 20 20] \
+            /Contents (INLINE_ANNOT_SECRET) >> \
+            << /Type /Annot /Subtype /Text /Rect [200 200 220 220] \
+            /Contents (inline public annotation) >>]";
+        let pdf = build_pdf(&[
+            "<< /Type /Catalog /Pages 2 0 R >>".into(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(),
+            format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] \
+                 /Contents 4 0 R /Annots {} >>",
+                if indirect_array { "5 0 R" } else { annots }
+            ),
+            stream("", "10 10 5 5 re f"),
+            annots.into(),
+        ]);
+        let out = redact_pdf(
+            pdf,
+            b"",
+            0,
+            &[Rect::new(0.0, 0.0, 30.0, 30.0)],
+            &RedactOptions { fill: None },
+        )
+        .unwrap();
+        let document = PdfDocument::open(out).unwrap();
+        let payload = String::from_utf8_lossy(&all_payload_bytes(&document)).into_owned();
+        assert!(!payload.contains("INLINE_ANNOT_SECRET"));
+        assert!(payload.contains("inline public annotation"));
+    }
+}
+
+#[test]
 fn form_redaction_uses_bbox_and_matrix_instead_of_the_image_unit_square() {
     let pdf = build_pdf(&[
         "<< /Type /Catalog /Pages 2 0 R >>".into(),
@@ -733,4 +766,225 @@ fn ext_gstate_type3_selection_refuses_ambiguous_cleanup_before_edits() {
         writer.write(&mut after).unwrap();
         assert_eq!(after.into_inner(), before.into_inner());
     }
+}
+
+/// The unused Wrapper can keep removed roots reachable without executing a
+/// single Do. Its resources may be direct, indirect, cyclic, or ref aliases.
+fn unused_wrapper_pdf(
+    inherited: bool,
+    resources: &str,
+    removed_alias: bool,
+    alias_target: u32,
+    second_use: &str,
+) -> Vec<u8> {
+    let resources_location = if inherited { " /Resources 10 0 R" } else { "" };
+    let page_resources = if inherited { "" } else { " /Resources 10 0 R" };
+    let kids = if inherited { "3 0 R 4 0 R" } else { "3 0 R" };
+    let secret = if removed_alias && alias_target == 5 {
+        13
+    } else {
+        5
+    };
+    let caption = if removed_alias && alias_target == 9 {
+        13
+    } else {
+        9
+    };
+    build_pdf(&[
+        "<< /Type /Catalog /Pages 2 0 R >>".into(),
+        format!("<< /Type /Pages /Kids [{kids}] /Count {}{resources_location} >>", if inherited { 2 } else { 1 }),
+        format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 7 0 R{page_resources} >>"),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 8 0 R >>".into(),
+        stream("/Type /XObject /Subtype /Form /BBox [0 0 10 10]", "% removed-form-payload\n0 0 10 10 re f"),
+        stream(&format!("/Type /XObject /Subtype /Form /BBox [200 200 210 210] /Resources {resources}"), "% retained-wrapper-payload\n"),
+        stream("", "/Secret Do /Span /Caption BDC 10 10 10 10 re f EMC"),
+        stream("", second_use),
+        "<< /ActualText (removed-property-payload) >>".into(),
+        format!("<< /XObject << /Secret {secret} 0 R /Wrapper 6 0 R >> /Properties << /Caption {caption} 0 R >> >>"),
+        "<< /XObject 12 0 R >>".into(),
+        "<< /Loop 6 0 R /Hidden 5 0 R >>".into(),
+        format!("{alias_target} 0 R"),
+        stream("/Type /XObject /Subtype /Form /BBox [200 200 210 210]", "% unrelated-resource-payload\n200 200 10 10 re f"),
+    ])
+}
+
+/// Both safe outcomes are allowed: complete graph cleanup, or an error before
+/// queuing any edits. A successful rewrite retaining either marker is a leak.
+fn assert_no_removed_resource_after_redaction(bytes: Vec<u8>) {
+    let mut writer = IncrementalWriter::new(bytes).unwrap();
+    let mut before = Cursor::new(Vec::new());
+    writer.write(&mut before).unwrap();
+    let result = writer.redact_page(
+        0,
+        &[Rect::new(-1.0, -1.0, 100.0, 100.0)],
+        &RedactOptions { fill: None },
+    );
+    let mut after = Cursor::new(Vec::new());
+    writer.write(&mut after).unwrap();
+    if result.is_err() {
+        assert_eq!(
+            before.into_inner(),
+            after.into_inner(),
+            "a refused graph cleanup must not queue edits"
+        );
+        return;
+    }
+    let current = PdfDocument::open(after.into_inner()).unwrap();
+    let output = zpdf_writer::rewrite_pdf(current.file(), &Default::default()).unwrap();
+    let document = PdfDocument::open(output).unwrap();
+    let payload = String::from_utf8_lossy(&all_payload_bytes(&document)).into_owned();
+    for marker in ["removed-form-payload", "removed-property-payload"] {
+        assert!(
+            !payload.contains(marker),
+            "unused resource graph retained {marker}"
+        );
+    }
+}
+
+#[test]
+fn unused_wrapper_resource_graph_cannot_keep_redacted_payloads() {
+    for inherited in [false, true] {
+        for resources in [
+            "<< /XObject << /Hidden 5 0 R >> >>",
+            "<< /Properties << /Hidden 9 0 R >> >>",
+            "<< /XObject 12 0 R >>",
+            "11 0 R",
+        ] {
+            assert_no_removed_resource_after_redaction(unused_wrapper_pdf(
+                inherited, resources, false, 5, "",
+            ));
+        }
+    }
+}
+
+#[test]
+fn unused_wrapper_resource_graph_detects_both_ref_alias_directions() {
+    for alias_target in [5, 9] {
+        let category = if alias_target == 5 {
+            "XObject"
+        } else {
+            "Properties"
+        };
+        for removed_alias in [false, true] {
+            let hidden = if removed_alias { alias_target } else { 13 };
+            let resources = format!("<< /{category} << /Hidden {hidden} 0 R >> >>");
+            assert_no_removed_resource_after_redaction(unused_wrapper_pdf(
+                true,
+                &resources,
+                removed_alias,
+                alias_target,
+                "",
+            ));
+        }
+    }
+}
+
+#[test]
+fn unrelated_cyclic_resource_graph_keeps_surviving_sibling_uses() {
+    for second_use in ["", "/Secret Do /Span /Caption BDC 200 200 10 10 re f EMC"] {
+        let bytes = unused_wrapper_pdf(
+            true,
+            "<< /XObject << /Loop 6 0 R /Public 14 0 R >> >>",
+            false,
+            5,
+            second_use,
+        );
+        let output = redact_pdf(
+            bytes,
+            b"",
+            0,
+            &[Rect::new(-1.0, -1.0, 100.0, 100.0)],
+            &RedactOptions { fill: None },
+        )
+        .unwrap();
+        let document = PdfDocument::open(output).unwrap();
+        let payload = String::from_utf8_lossy(&all_payload_bytes(&document)).into_owned();
+        assert!(payload.contains("retained-wrapper-payload"));
+        assert!(payload.contains("unrelated-resource-payload"));
+        for marker in ["removed-form-payload", "removed-property-payload"] {
+            assert_eq!(
+                payload.contains(marker),
+                !second_use.is_empty(),
+                "sibling use of {marker} changed"
+            );
+        }
+        assert!(!page_content(&document).contains("/Secret Do"));
+    }
+}
+
+/// The retained wrapper refers to a descendant rather than the removed root.
+/// alias_side: 0 = direct, 1 = removed edge aliases, 2 = retained edge aliases.
+fn unused_wrapper_descendant_pdf(property: bool, alias_side: u8) -> Vec<u8> {
+    let removed = if alias_side == 1 { 9 } else { 8 };
+    let retained = if alias_side == 2 { 9 } else { 8 };
+    let (content, secret, wrapper_resources, caption, descendant) = if property {
+        (
+            "/Span /Caption BDC 10 10 10 10 re f EMC".to_string(),
+            stream("/Type /XObject /Subtype /Form /BBox [0 0 10 10]", ""),
+            "<< /Properties << /Unrelated 10 0 R >> >>".to_string(),
+            format!("<< /ActualText {removed} 0 R >>"),
+            "(removed-property-payload)".to_string(),
+        )
+    } else {
+        (
+            "/Secret Do".to_string(),
+            stream(
+                &format!("/Type /XObject /Subtype /Form /BBox [0 0 10 10] /Resources << /XObject << /Inside {removed} 0 R >> >>"),
+                "/Inside Do",
+            ),
+            format!("<< /XObject << /Unrelated {retained} 0 R >> >>"),
+            "<< >>".to_string(),
+            stream(
+                "/Type /XObject /Subtype /Image /Width 20 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8",
+                "removed-form-payload",
+            ),
+        )
+    };
+    build_pdf(&[
+        "<< /Type /Catalog /Pages 2 0 R >>".into(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 /Resources << /XObject << /Secret 5 0 R /Wrapper 6 0 R >> /Properties << /Caption 7 0 R >> >> >>".into(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R >>".into(),
+        stream("", &content),
+        secret,
+        stream(&format!("/Type /XObject /Subtype /Form /BBox [200 200 210 210] /Resources {wrapper_resources}"), "% retained-wrapper-payload\n"),
+        caption,
+        descendant,
+        "8 0 R".into(),
+        // Different owning dictionaries, so comparing only root fingerprints
+        // cannot discover the shared string in this descendant object.
+        format!("<< /ActualText {retained} 0 R /Lang (en) >>"),
+    ])
+}
+
+#[test]
+fn unused_wrapper_resource_graph_cannot_keep_descendant_images() {
+    for alias_side in [0, 1, 2] {
+        assert_no_removed_resource_after_redaction(unused_wrapper_descendant_pdf(
+            false, alias_side,
+        ));
+    }
+}
+
+#[test]
+fn unused_wrapper_resource_graph_cannot_keep_descendant_property_strings() {
+    for alias_side in [0, 1, 2] {
+        assert_no_removed_resource_after_redaction(unused_wrapper_descendant_pdf(true, alias_side));
+    }
+}
+
+#[test]
+fn resource_graph_allows_ordinary_inline_values_and_empty_resources() {
+    let output = redact_pdf(
+        unused_wrapper_pdf(true, "<< >>", false, 5, ""),
+        b"",
+        0,
+        &[Rect::new(-1.0, -1.0, 100.0, 100.0)],
+        &RedactOptions { fill: None },
+    )
+    .unwrap();
+    let document = PdfDocument::open(output).unwrap();
+    let payload = String::from_utf8_lossy(&all_payload_bytes(&document)).into_owned();
+    assert!(!payload.contains("removed-form-payload"));
+    assert!(!payload.contains("removed-property-payload"));
+    assert!(payload.contains("retained-wrapper-payload"));
 }

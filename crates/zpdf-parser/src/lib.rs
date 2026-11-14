@@ -441,7 +441,7 @@ impl PdfFile {
     ) -> Result<Vec<u8>> {
         let obj = self.resolve(id)?;
         let stream = obj.as_stream()?;
-        match self.dict_with_resolved_filters(&stream.dict, inline_globals, limits) {
+        match self.dict_with_resolved_filters(&stream.dict, inline_globals, limits)? {
             Some(resolved) => filters::decode_stream_with_limits(&stream.data, &resolved, limits),
             None => filters::decode_stream_with_limits(&stream.data, &stream.dict, limits),
         }
@@ -458,7 +458,7 @@ impl PdfFile {
         dict: &PdfDict,
         inline_globals: bool,
         limits: &ParseLimits,
-    ) -> Option<PdfDict> {
+    ) -> Result<Option<PdfDict>> {
         const KEYS: [&str; 3] = ["Filter", "DecodeParms", "DP"];
         // A DecodeParms dict containing a /JBIG2Globals reference needs the
         // globals stream inlined even though the dict itself is direct.
@@ -475,7 +475,7 @@ impl PdfFile {
             other => dict_needs_globals(other),
         };
         if !KEYS.iter().any(|k| dict.get(k).is_some_and(needs_resolve)) {
-            return None;
+            return Ok(None);
         }
 
         let resolve_shallow = |obj: &PdfObject| match obj {
@@ -486,7 +486,7 @@ impl PdfFile {
             if inline_globals {
                 self.inline_jbig2_globals(obj, limits)
             } else {
-                obj
+                Ok(obj)
             }
         };
         let mut out = dict.clone();
@@ -494,14 +494,17 @@ impl PdfFile {
             let Some(value) = dict.get(key) else { continue };
             let resolved = match resolve_shallow(value) {
                 // Also resolve refs *inside* a (possibly itself indirect) array.
-                PdfObject::Array(a) => {
-                    PdfObject::Array(a.iter().map(resolve_shallow).map(inline).collect())
-                }
-                other => inline(other),
+                PdfObject::Array(a) => PdfObject::Array(
+                    a.iter()
+                        .map(resolve_shallow)
+                        .map(inline)
+                        .collect::<Result<Vec<_>>>()?,
+                ),
+                other => inline(other)?,
             };
             out.insert(PdfName::new(key), resolved);
         }
-        Some(out)
+        Ok(Some(out))
     }
 
     /// If `obj` is a DecodeParms dict whose `/JBIG2Globals` is an indirect
@@ -510,22 +513,23 @@ impl PdfFile {
     /// access to chase references itself. The globals stream is decoded
     /// without globals inlining of its own, so a crafted reference cycle
     /// cannot recurse. Anything else passes through unchanged.
-    fn inline_jbig2_globals(&self, obj: PdfObject, limits: &ParseLimits) -> PdfObject {
+    fn inline_jbig2_globals(&self, obj: PdfObject, limits: &ParseLimits) -> Result<PdfObject> {
         let PdfObject::Dict(mut d) = obj else {
-            return obj;
+            return Ok(obj);
         };
         if let Some(PdfObject::Ref(r)) = d.get("JBIG2Globals") {
             let r = *r;
-            let value = match self.resolve_stream_data_inner(r, false, limits) {
-                Ok(bytes) => PdfObject::String(zpdf_core::PdfString(bytes)),
-                Err(e) => {
-                    tracing::warn!("failed to decode /JBIG2Globals stream {r}: {e}");
-                    PdfObject::Null
-                }
-            };
-            d.insert(PdfName::new("JBIG2Globals"), value);
+            // An explicitly referenced globals stream is required input.
+            // Propagate every decoding failure: filter budget exhaustion can
+            // also be a StreamDecode error, and dropping globals can turn a
+            // dependent text region into a successful but blank page.
+            let bytes = self.resolve_stream_data_inner(r, false, limits)?;
+            d.insert(
+                PdfName::new("JBIG2Globals"),
+                PdfObject::String(zpdf_core::PdfString(bytes)),
+            );
         }
-        PdfObject::Dict(d)
+        Ok(PdfObject::Dict(d))
     }
 
     /// Extract an object from a compressed object stream (/Type /ObjStm).

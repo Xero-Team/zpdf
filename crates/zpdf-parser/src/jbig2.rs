@@ -4282,6 +4282,149 @@ mod tests {
     }
 
     #[test]
+    fn globals_decode_allowance_failure_is_not_a_blank_page() {
+        use crate::PdfFile;
+        use flate2::{write::ZlibEncoder, Compression};
+        use std::io::Write;
+        use zpdf_core::{ObjectId, ParseLimits};
+
+        // The packed page is just two bytes, but its required global symbol
+        // dictionary is larger. Dropping the globals silently turns the glyph
+        // into a white page because region failures are intentionally lenient.
+        let sym = bitmap_from(&["##", "##"]);
+        let globals = segment(1, 0, &[], 0, &symbol_dict_payload(&[&sym]));
+        let mut page = segment(2, 48, &[], 1, &page_info_payload(4, 2, 0));
+        page.extend_from_slice(&segment(
+            3,
+            6,
+            &[1],
+            1,
+            &text_region_payload(4, 2, 1, &[(0, 1)]),
+        ));
+        let expected = packed_from(&[".##.", ".##."]);
+        let allowance = globals.len() as u64 - 1;
+        assert!(expected.len() as u64 <= allowance);
+        assert_eq!(
+            decode_test(&page, &Jbig2Params { globals: None }).unwrap(),
+            packed_from(&["....", "...."])
+        );
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&globals).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let make_pdf = |globals_filter: &str, globals_data: &[u8], filter_entries: &str| {
+            let stream = |entries: &str, bytes: &[u8]| {
+                let mut object =
+                    format!("<< /Length {} {entries} >>\nstream\n", bytes.len()).into_bytes();
+                object.extend_from_slice(bytes);
+                object.extend_from_slice(b"\nendstream");
+                object
+            };
+            let objects = [
+                (1, b"<< /Type /Catalog >>".to_vec()),
+                (3, stream(filter_entries, &page)),
+                (4, stream(globals_filter, globals_data)),
+                (5, b"<< /JBIG2Globals 4 0 R >>".to_vec()),
+                (6, b"[5 0 R]".to_vec()),
+            ];
+            let mut pdf = b"%PDF-1.4\n".to_vec();
+            let mut offsets = Vec::new();
+            for (number, body) in objects {
+                offsets.push((number, pdf.len()));
+                pdf.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+                pdf.extend_from_slice(&body);
+                pdf.extend_from_slice(b"\nendobj\n");
+            }
+            let xref = pdf.len();
+            pdf.extend_from_slice(b"xref\n0 1\n0000000000 65535 f \n");
+            for (number, offset) in offsets {
+                pdf.extend_from_slice(format!("{number} 1\n{offset:010} 00000 n \n").as_bytes());
+            }
+            pdf.extend_from_slice(
+                format!("trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n")
+                    .as_bytes(),
+            );
+            pdf
+        };
+        let assert_allowance_failure = |result: Result<Vec<u8>>, compressed: bool| match result {
+            Err(Error::StreamSizeLimit(limit)) if !compressed => assert_eq!(limit, allowance),
+            // The filter pipeline reports DecodeBudget exhaustion using this
+            // variant; it must be propagated just like the raw-stream limit.
+            Err(Error::StreamDecode(message)) if compressed => {
+                assert!(message.starts_with("decoded stream exceeds budget:"));
+            }
+            other => panic!("expected globals allowance failure, got {other:?}"),
+        };
+        // Cover both raw and compressed globals, direct/indirect parameter
+        // dictionaries and arrays, and /DP. None may replace a failure by Null.
+        for (globals_filter, data) in [
+            ("", globals.as_slice()),
+            ("/Filter /FlateDecode", compressed.as_slice()),
+        ] {
+            let is_compressed = !globals_filter.is_empty();
+            for filter_entries in [
+                "/Filter /JBIG2Decode /DecodeParms << /JBIG2Globals 4 0 R >>",
+                "/Filter [/JBIG2Decode] /DecodeParms [5 0 R]",
+                "/Filter [/JBIG2Decode] /DecodeParms 6 0 R",
+                "/Filter /JBIG2Decode /DP 5 0 R",
+            ] {
+                let pdf = make_pdf(globals_filter, data, filter_entries);
+                let file = PdfFile::parse(pdf.clone()).unwrap();
+                assert_eq!(file.resolve_stream_data(ObjectId(3, 0)).unwrap(), expected);
+                assert_allowance_failure(
+                    file.resolve_stream_data_with_limit(ObjectId(4, 0), allowance),
+                    is_compressed,
+                );
+                assert_allowance_failure(
+                    file.resolve_stream_data_with_limit(ObjectId(3, 0), allowance),
+                    is_compressed,
+                );
+                // A failed tight decode must not poison a sufficient retry.
+                assert_eq!(
+                    file.resolve_stream_data_with_limit(ObjectId(3, 0), globals.len() as u64)
+                        .unwrap(),
+                    expected
+                );
+                let limits = ParseLimits {
+                    max_decoded_stream_bytes: allowance,
+                    ..ParseLimits::default()
+                };
+                let file = PdfFile::parse_with_limits(pdf, limits).unwrap();
+                assert_allowance_failure(file.resolve_stream_data(ObjectId(3, 0)), is_compressed);
+                assert_allowance_failure(
+                    file.resolve_stream_data_with_limit(ObjectId(3, 0), u64::MAX),
+                    is_compressed,
+                );
+            }
+        }
+        // Explicit globals also cannot be silently discarded for other
+        // decoding failures, or when the reference resolves to a null object.
+        let invalid = PdfFile::parse(make_pdf(
+            "/Filter /UnsupportedGlobals",
+            &globals,
+            "/Filter /JBIG2Decode /DecodeParms << /JBIG2Globals 4 0 R >>",
+        ))
+        .unwrap();
+        assert!(matches!(
+            invalid.resolve_stream_data(ObjectId(3, 0)),
+            Err(Error::UnsupportedFilter(name)) if name == "UnsupportedGlobals"
+        ));
+        let missing = PdfFile::parse(make_pdf(
+            "",
+            &globals,
+            "/Filter /JBIG2Decode /DecodeParms << /JBIG2Globals 99 0 R >>",
+        ))
+        .unwrap();
+        assert!(matches!(
+            missing.resolve_stream_data(ObjectId(3, 0)),
+            Err(Error::TypeMismatch {
+                expected: "Stream",
+                actual: "Null"
+            })
+        ));
+    }
+
+    #[test]
     fn page_default_pixel_and_packing_polarity() {
         // A page with no regions: default pixel 0 = white = PDF sample 1.
         let stream = segment(0, 48, &[], 1, &page_info_payload(10, 3, 0));

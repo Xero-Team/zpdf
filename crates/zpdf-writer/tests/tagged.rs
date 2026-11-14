@@ -381,3 +381,90 @@ fn pending_tagging_snapshot_preserves_export_encryption() {
         .unwrap()
         .contains("private test text"));
 }
+
+/// A pending append preserves the source's /Contents representation. Tagging
+/// must flatten an indirect array before adding its prefix/suffix streams.
+#[test]
+fn appended_page_tagging_preserves_all_contents_representations() {
+    use std::io::Cursor;
+    use zpdf_core::PdfObject;
+    use zpdf_parser::PdfFile;
+
+    let first = b"BT /F1 12 Tf 10 100 Td (First fragment) Tj ET\n";
+    let second = b"BT /F1 12 Tf 10 80 Td (Second fragment) Tj ET\n";
+    let stream = |bytes: &[u8]| {
+        let mut object = format!("<< /Length {} >>\nstream\n", bytes.len()).into_bytes();
+        object.extend_from_slice(bytes);
+        object.extend_from_slice(b"\nendstream");
+        object
+    };
+    for (contents, expected_streams) in [("4 0 R", 1), ("[4 0 R 5 0 R]", 2), ("6 0 R", 2)] {
+        let objects = [
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
+                 /Resources << /Font << /F1 7 0 R >> >> /Contents {contents} >>"
+            )
+            .into_bytes(),
+            stream(first),
+            stream(second),
+            b"[4 0 R 5 0 R]".to_vec(),
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+        ];
+        let mut source = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        for (index, object) in objects.iter().enumerate() {
+            offsets.push(source.len());
+            source.extend_from_slice(format!("{} 0 obj\n", index + 1).as_bytes());
+            source.extend_from_slice(object);
+            source.extend_from_slice(b"\nendobj\n");
+        }
+        let xref = source.len();
+        source.extend_from_slice(b"xref\n0 8\n0000000000 65535 f \n");
+        for offset in offsets {
+            source.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        source.extend_from_slice(
+            format!("trailer\n<< /Size 8 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+        );
+        let original = PdfDocument::open(source.clone()).unwrap();
+        let original_content = original
+            .page_content_bytes(&original.page(0).unwrap())
+            .unwrap();
+
+        let mut base = DocumentBuilder::new();
+        base.add_page(200.0, 200.0);
+        let mut writer = IncrementalWriter::new(base.build().unwrap()).unwrap();
+        writer
+            .append_document_pages(&PdfFile::parse(source).unwrap())
+            .unwrap();
+        writer.tag_pdf().unwrap();
+        let mut output = Cursor::new(Vec::new());
+        writer.write(&mut output).unwrap();
+        let document = PdfDocument::open(output.into_inner()).unwrap();
+        assert_eq!(document.page_count(), 2);
+        assert!(document.is_tagged());
+        let page = document.page(1).unwrap();
+        let content = document
+            .page_content_bytes(&page)
+            .unwrap_or_else(|error| panic!("{contents}: tagged content failed: {error}"));
+        assert!(content.starts_with(b"q /Part <</MCID 0>> BDC\n"));
+        assert!(content.ends_with(b"\nEMC Q\n"));
+        assert!(content
+            .windows(original_content.len())
+            .any(|part| part == original_content));
+        assert_eq!(page.contents.len(), expected_streams + 2);
+        for id in &page.contents {
+            assert!(matches!(
+                document.file().resolve(*id).unwrap(),
+                PdfObject::Stream(_)
+            ));
+        }
+        let tree = document.struct_tree().unwrap();
+        assert_eq!(tree.children.len(), 2);
+        let alt = tree.children[1].alt.as_deref().unwrap();
+        assert!(alt.contains("First fragment"));
+        assert_eq!(alt.contains("Second fragment"), expected_streams == 2);
+    }
+}

@@ -663,6 +663,52 @@ mod tests {
     }
 
     #[test]
+    fn type3_inline_images_over_the_operator_limit_reject_the_child() {
+        let stream = b"BI /W 1 /H 1 /BPC 8 /CS /G ID x EI BI /W 1 /H 1 /BPC 8 /CS /G ID y EI";
+        let limits = ParseLimits {
+            max_page_operators: 1,
+            ..ParseLimits::default()
+        };
+        let mut r = PageRecorder::default().with_limits(&limits);
+        assert!(r.interpret_type3_stream(stream).is_none());
+        assert_eq!(r.type3_work_used, 1);
+        assert!(r.ensure_within_budget().is_err());
+        assert!(r.vertices.is_empty());
+        assert!(r.ops.is_empty());
+
+        let limits = ParseLimits {
+            max_page_operators: 2,
+            ..ParseLimits::default()
+        };
+        let mut r = PageRecorder::default().with_limits(&limits);
+        assert!(r.interpret_type3_stream(stream).is_some());
+        assert_eq!(r.type3_work_used, 2);
+        assert!(r.ensure_within_budget().is_ok());
+    }
+
+    #[test]
+    fn type3_inline_images_share_the_allowance_across_occurrences_and_masks() {
+        let stream = b"BI /W 1 /H 1 /BPC 8 /CS /G ID x EI BI /W 1 /H 1 /BPC 8 /CS /G ID y EI";
+        let limits = ParseLimits {
+            max_page_operators: 3,
+            ..ParseLimits::default()
+        };
+        let mut r = PageRecorder::default().with_limits(&limits);
+        assert!(r.interpret_type3_stream(stream).is_some());
+        assert_eq!(r.type3_work_used, 2);
+        let sub = r.record_subops(|nested| {
+            assert!(nested.interpret_type3_stream(stream).is_none());
+        });
+        assert!(sub.is_empty());
+        assert_eq!(r.type3_work_used, 3);
+        assert!(r.ensure_within_budget().is_err());
+        assert!(r.interpret_type3_stream(stream).is_none());
+        assert_eq!(r.type3_work_used, 3, "failure stops later work");
+        assert!(r.vertices.is_empty());
+        assert!(r.ops.is_empty());
+    }
+
+    #[test]
     fn empty_and_operand_only_type3_dispatches_are_not_free() {
         let limits = ParseLimits {
             max_page_operators: 2,

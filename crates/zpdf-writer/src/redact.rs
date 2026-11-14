@@ -74,6 +74,7 @@ impl IncrementalWriter {
         if rects.is_empty() {
             return Ok(());
         }
+        let deadline = zpdf_core::time::Instant::now() + std::time::Duration::from_secs(8);
         for r in rects {
             if ![r.x0, r.y0, r.x1, r.y1].iter().all(|v| v.is_finite()) {
                 return Err(invalid_data("redaction rectangles must be finite").into());
@@ -145,57 +146,32 @@ impl IncrementalWriter {
                 _ => None,
             }
         };
-        let mut outcome = filter_content(
+        let mut outcome = filter_content_with_deadline(
             &content,
             &rects,
             &lookup_properties,
             &lookup_xobject,
             self.document().file().limits(),
+            deadline,
         )?;
         let mut filtered = outcome.content;
         // Establish surviving annotations before resource pruning. Overlapping
         // annotations are removed; their appearances must not keep resources
         // reachable after the redaction.
-        let mut removed_annots = HashSet::new();
-        if let Some(annots_obj) = page_dict.get("Annots").cloned() {
-            let annots = match &annots_obj {
-                PdfObject::Ref(r) => self.resolve_current(*r)?.as_array()?.to_vec(),
-                PdfObject::Array(a) => a.to_vec(),
-                PdfObject::Null => Vec::new(),
-                _ => {
-                    return Err(
-                        invalid_data("redaction cannot resolve annotation ownership").into(),
-                    )
-                }
-            };
-            let kept: Vec<PdfObject> = annots
-                .into_iter()
-                .filter(|a| {
-                    let PdfObject::Ref(r) = a else { return true };
-                    let Ok(obj) = self.resolve_current(*r) else {
-                        return true;
-                    };
-                    let Ok(dict) = obj.as_dict() else { return true };
-                    let keep = match annot_rect(dict) {
-                        Some(ar) => !rects.iter().any(|rr| intersects(&ar, rr)),
-                        None => true,
-                    };
-                    if !keep {
-                        removed_annots.insert(*r);
-                    }
-                    keep
-                })
-                .collect();
-            page_dict.insert(PdfName::new("Annots"), PdfObject::Array(kept));
-        }
+        let removed_annots = self.prune_annotations(&mut page_dict, &rects, deadline)?;
 
         // Kept content and annotation Forms can still use a name whose
         // top-level draw was removed. Retain those legitimate shared uses.
         if let Some(resources) = resources.as_ref().filter(|_| {
             !outcome.dropped_xobjects.is_empty() || !outcome.dropped_properties.is_empty()
         }) {
-            let (xobjects, properties) =
-                self.inherited_resource_uses(&filtered, resources, &page_dict, &removed_annots)?;
+            let (xobjects, properties) = self.inherited_resource_uses(
+                &filtered,
+                resources,
+                &page_dict,
+                &removed_annots,
+                deadline,
+            )?;
             outcome
                 .dropped_xobjects
                 .retain(|name| !xobjects.contains(name));
@@ -242,30 +218,18 @@ impl IncrementalWriter {
                         page_id,
                         owner,
                         res,
-                        &outcome.dropped_xobjects,
-                        &outcome.dropped_properties,
+                        (&outcome.dropped_xobjects, &outcome.dropped_properties),
                         &removed_annots,
+                        deadline,
                     )?;
                 }
             }
-            let mut pruned = false;
-            for (category, dropped) in [
-                ("XObject", &outcome.dropped_xobjects),
-                ("Properties", &outcome.dropped_properties),
-            ] {
-                if dropped.is_empty() {
-                    continue;
-                }
-                let entries = res.get(category).map(|x| self.deref_current(x));
-                if let Some(PdfObject::Dict(mut entries)) = entries {
-                    let before = entries.0.len();
-                    entries.0.retain(|name, _| !dropped.contains(name.as_str()));
-                    if entries.0.len() != before {
-                        res.insert(PdfName::new(category), PdfObject::Dict(entries));
-                        pruned = true;
-                    }
-                }
-            }
+            let pruned = self.prune_resource_candidates(
+                res,
+                &outcome.dropped_xobjects,
+                &outcome.dropped_properties,
+                deadline,
+            )?;
             if pruned || !resource_edits.is_empty() {
                 page_dict.insert(PdfName::new("Resources"), PdfObject::Dict(res.clone()));
             }
@@ -323,6 +287,71 @@ impl IncrementalWriter {
         Ok(())
     }
 
+    /// Prepare the retained annotation array before queuing any writer edits.
+    fn prune_annotations(
+        &self,
+        page_dict: &mut PdfDict,
+        rects: &[Rect],
+        deadline: zpdf_core::time::Instant,
+    ) -> Result<HashSet<ObjectId>> {
+        let check_deadline = || -> Result<()> {
+            if zpdf_core::time::Instant::now() >= deadline {
+                return Err(invalid_data("redaction exceeds annotation time limit").into());
+            }
+            Ok(())
+        };
+        check_deadline()?;
+        let mut removed_annots = HashSet::new();
+        if let Some(annots_obj) = page_dict.get("Annots").cloned() {
+            let annots = match &annots_obj {
+                PdfObject::Ref(r) => self.resolve_current(*r)?.as_array()?.to_vec(),
+                PdfObject::Array(a) => a.to_vec(),
+                PdfObject::Null => Vec::new(),
+                _ => {
+                    return Err(
+                        invalid_data("redaction cannot resolve annotation ownership").into(),
+                    )
+                }
+            };
+            let mut kept = Vec::new();
+            for annotation in annots {
+                check_deadline()?;
+                let resolved;
+                let object = match &annotation {
+                    PdfObject::Ref(id) => {
+                        resolved = self.resolve_current(*id)?;
+                        &resolved
+                    }
+                    object => object,
+                };
+                let mut remove = false;
+                if !matches!(object, PdfObject::Null) {
+                    let dict = object.as_dict()?;
+                    if let Some(bounds) = annot_rect(dict) {
+                        for rect in rects {
+                            check_deadline()?;
+                            if intersects(&bounds, rect) {
+                                remove = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if remove {
+                    if let PdfObject::Ref(id) = annotation {
+                        removed_annots.insert(id);
+                    }
+                } else {
+                    kept.push(annotation);
+                }
+            }
+            check_deadline()?;
+            page_dict.insert(PdfName::new("Annots"), PdfObject::Array(kept));
+        }
+
+        Ok(removed_annots)
+    }
+
     /// Locate the effective Resources owner without changing the page tree.
     fn current_resource_owner(&self, page: ObjectId) -> Result<Option<ObjectId>> {
         let mut seen = HashSet::new();
@@ -352,12 +381,15 @@ impl IncrementalWriter {
         page: ObjectId,
         owner: ObjectId,
         resources: &PdfDict,
-        dropped_xobjects: &HashSet<String>,
-        dropped_properties: &HashSet<String>,
+        (dropped_xobjects, dropped_properties): (&HashSet<String>, &HashSet<String>),
         removed_annots: &HashSet<ObjectId>,
+        deadline: zpdf_core::time::Instant,
     ) -> Result<BTreeMap<ObjectId, PdfObject>> {
         let mut edits = BTreeMap::new();
         for index in self.page_indices() {
+            if zpdf_core::time::Instant::now() >= deadline {
+                return Err(invalid_data("resource cleanup exceeds time limit").into());
+            }
             let id = self.page_id(*index)?;
             if id == page || self.current_resource_owner(id)? != Some(owner) {
                 continue;
@@ -365,21 +397,22 @@ impl IncrementalWriter {
             let mut leaf = self.resolve_current(id)?.as_dict()?.clone();
             let content = self.current_content_bytes(&self.current_content_refs(&leaf)?)?;
             let (used_xobjects, used_properties) =
-                self.inherited_resource_uses(&content, resources, &leaf, removed_annots)?;
+                self.inherited_resource_uses(&content, resources, &leaf, removed_annots, deadline)?;
             let mut own = resources.clone();
-            for (category, dropped, used) in [
-                ("XObject", dropped_xobjects, &used_xobjects),
-                ("Properties", dropped_properties, &used_properties),
-            ] {
-                if let Some(PdfObject::Dict(mut entries)) =
-                    own.get(category).map(|value| self.deref_current(value))
-                {
-                    entries.0.retain(|name, _| {
-                        !dropped.contains(name.as_str()) || used.contains(name.as_str())
-                    });
-                    own.insert(PdfName::new(category), PdfObject::Dict(entries));
-                }
-            }
+            let dropped_xobjects = dropped_xobjects
+                .difference(&used_xobjects)
+                .cloned()
+                .collect();
+            let dropped_properties = dropped_properties
+                .difference(&used_properties)
+                .cloned()
+                .collect();
+            self.prune_resource_candidates(
+                &mut own,
+                &dropped_xobjects,
+                &dropped_properties,
+                deadline,
+            )?;
             leaf.insert(PdfName::new("Resources"), PdfObject::Dict(own));
             edits.insert(id, PdfObject::Dict(leaf));
         }
@@ -387,6 +420,53 @@ impl IncrementalWriter {
         ancestor.0.remove(&PdfName::new("Resources"));
         edits.insert(owner, PdfObject::Dict(ancestor));
         Ok(edits)
+    }
+
+    /// Pruning a name is not sufficient if another retained resource points
+    /// back to its payload. Inspect the entire retained resource graph,
+    /// including unused Forms, before allowing any edit to be queued. This
+    /// intentionally refuses ambiguous aliases rather than deleting resources
+    /// whose use could not be proved. A sibling checks only its own removals.
+    fn prune_resource_candidates(
+        &self,
+        resources: &mut PdfDict,
+        dropped_xobjects: &HashSet<String>,
+        dropped_properties: &HashSet<String>,
+        deadline: zpdf_core::time::Instant,
+    ) -> Result<bool> {
+        let mut graph = ResourceGraphCheck::new(self, deadline);
+        let mut pruned = false;
+        for (category, dropped) in [
+            ("XObject", dropped_xobjects),
+            ("Properties", dropped_properties),
+        ] {
+            if dropped.is_empty() {
+                continue;
+            }
+            let Some(value) = resources.get(category) else {
+                continue;
+            };
+            let object = match value {
+                PdfObject::Ref(id) => self.resolve_current(*id)?,
+                value => value.clone(),
+            };
+            let PdfObject::Dict(mut entries) = object else {
+                return Err(invalid_data("resource cleanup cannot resolve resource table").into());
+            };
+            for name in dropped {
+                if let Some(value) = entries.0.remove(name.as_str()) {
+                    graph.remember_removed(&value, 0)?;
+                    pruned = true;
+                }
+            }
+            resources.insert(PdfName::new(category), PdfObject::Dict(entries));
+        }
+        if pruned {
+            for value in resources.0.values() {
+                graph.check_retained(value, 0)?;
+            }
+        }
+        Ok(pruned)
     }
 
     /// The renderer falls back per name, even when /Resources exists. Only
@@ -515,6 +595,7 @@ impl IncrementalWriter {
         resources: &PdfDict,
         page: &PdfDict,
         removed_annots: &HashSet<ObjectId>,
+        deadline: zpdf_core::time::Instant,
     ) -> Result<(HashSet<String>, HashSet<String>)> {
         let limits = self.document().file().limits();
         let mut xobjects = HashSet::new();
@@ -526,7 +607,6 @@ impl IncrementalWriter {
             .checked_sub(content.len() as u64)
             .ok_or_else(|| invalid_data("resource cleanup exceeds decoded byte limit"))?;
         let mut ops_left = limits.max_page_operators;
-        let deadline = zpdf_core::time::Instant::now() + std::time::Duration::from_secs(8);
         let category = |key: &str| resources.get(key).map(|object| self.deref_current(object));
         let fonts = category("Font");
         let states = category("ExtGState");
@@ -1047,6 +1127,237 @@ struct FilterOutcome {
     dropped_properties: HashSet<String>,
 }
 
+/// Source-object graph validation only: stream bytes are hashed as stored,
+/// never decoded. The canonical fingerprints also catch ref-to-ref aliases,
+/// which the parser resolves transparently. Removed roots and their referenced
+/// descendants are tracked; an identical retained object at a reference
+/// boundary is conservatively treated as ambiguous ownership under another ID.
+struct ResourceGraphCheck<'a> {
+    writer: &'a IncrementalWriter,
+    removed_ids: HashSet<ObjectId>,
+    removed_fingerprints: HashSet<[u8; 32]>,
+    visited: HashSet<ObjectId>,
+    nodes_left: u32,
+    bytes_left: u64,
+    depth_limit: u32,
+    deadline: zpdf_core::time::Instant,
+}
+
+impl<'a> ResourceGraphCheck<'a> {
+    fn new(writer: &'a IncrementalWriter, deadline: zpdf_core::time::Instant) -> Self {
+        let limits = writer.document().file().limits();
+        Self {
+            writer,
+            removed_ids: HashSet::new(),
+            removed_fingerprints: HashSet::new(),
+            visited: HashSet::new(),
+            nodes_left: limits.max_objects,
+            bytes_left: limits.max_decoded_stream_bytes,
+            depth_limit: limits.max_object_depth.min(128),
+            deadline,
+        }
+    }
+
+    fn charge_node(&mut self, depth: u32) -> Result<()> {
+        if zpdf_core::time::Instant::now() >= self.deadline {
+            return Err(invalid_data("resource cleanup exceeds time limit").into());
+        }
+        if depth > self.depth_limit {
+            return Err(invalid_data("resource cleanup exceeds graph depth limit").into());
+        }
+        self.nodes_left = self
+            .nodes_left
+            .checked_sub(1)
+            .ok_or_else(|| invalid_data("resource cleanup exceeds graph work limit"))?;
+        Ok(())
+    }
+
+    fn remember_removed(&mut self, object: &PdfObject, depth: u32) -> Result<()> {
+        self.remember_removed_object(object, depth, true)
+    }
+
+    fn remember_removed_object(
+        &mut self,
+        object: &PdfObject,
+        depth: u32,
+        reference_boundary: bool,
+    ) -> Result<()> {
+        self.charge_node(depth)?;
+        if let PdfObject::Ref(id) = object {
+            if self.removed_ids.insert(*id) {
+                self.remember_removed_object(&self.writer.resolve_current(*id)?, depth + 1, true)?;
+            }
+            return Ok(());
+        }
+        // Root objects and referenced descendants carry the owned payload.
+        // Do not add every inline scalar/dictionary: common Rect numbers,
+        // names and empty Resources are not evidence of shared secret data.
+        if reference_boundary && Self::has_payload(object) {
+            let fingerprint = self.fingerprint(object)?;
+            self.removed_fingerprints.insert(fingerprint);
+        }
+        match object {
+            PdfObject::Array(values) => {
+                for value in values {
+                    self.remember_removed_object(value, depth + 1, false)?;
+                }
+            }
+            PdfObject::Dict(dict) => {
+                for value in dict.0.values() {
+                    self.remember_removed_object(value, depth + 1, false)?;
+                }
+            }
+            PdfObject::Stream(stream) => {
+                for value in stream.dict.0.values() {
+                    self.remember_removed_object(value, depth + 1, false)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn has_payload(object: &PdfObject) -> bool {
+        match object {
+            PdfObject::String(value) => !value.0.is_empty(),
+            PdfObject::Array(values) => !values.is_empty(),
+            PdfObject::Dict(dict) => !dict.0.is_empty(),
+            PdfObject::Stream(stream) => !stream.dict.0.is_empty() || !stream.data.is_empty(),
+            _ => false,
+        }
+    }
+
+    fn check_retained(&mut self, object: &PdfObject, depth: u32) -> Result<()> {
+        self.charge_node(depth)?;
+        if let PdfObject::Ref(id) = object {
+            if self.removed_ids.contains(id) {
+                return Err(invalid_data("resource cleanup retains a removed payload").into());
+            }
+            if self.visited.insert(*id) {
+                let resolved = self.writer.resolve_current(*id)?;
+                // Compare at object boundaries, including indirect strings,
+                // so transparent aliases to owned descendants cannot bypass
+                // the ID check. Inline scalar coincidences are ignored.
+                if Self::has_payload(&resolved) {
+                    let fingerprint = self.fingerprint(&resolved)?;
+                    if self.removed_fingerprints.contains(&fingerprint) {
+                        return Err(
+                            invalid_data("resource cleanup retains a removed payload").into()
+                        );
+                    }
+                }
+                self.check_retained(&resolved, depth + 1)?;
+            }
+            return Ok(());
+        }
+        match object {
+            PdfObject::Array(values) => {
+                for value in values {
+                    self.check_retained(value, depth + 1)?;
+                }
+            }
+            PdfObject::Dict(dict) => {
+                for value in dict.0.values() {
+                    self.check_retained(value, depth + 1)?;
+                }
+            }
+            PdfObject::Stream(stream) => {
+                for value in stream.dict.0.values() {
+                    self.check_retained(value, depth + 1)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn fingerprint(&mut self, object: &PdfObject) -> Result<[u8; 32]> {
+        use sha2::Digest;
+        let mut hash = sha2::Sha256::new();
+        self.hash_object(object, &mut hash, 0)?;
+        Ok(hash.finalize().into())
+    }
+
+    fn hash_bytes(&mut self, hash: &mut sha2::Sha256, bytes: &[u8]) -> Result<()> {
+        use sha2::Digest;
+        if zpdf_core::time::Instant::now() >= self.deadline {
+            return Err(invalid_data("resource cleanup exceeds time limit").into());
+        }
+        self.bytes_left = self
+            .bytes_left
+            .checked_sub(bytes.len() as u64)
+            .ok_or_else(|| invalid_data("resource cleanup exceeds graph byte limit"))?;
+        hash.update(bytes);
+        Ok(())
+    }
+
+    fn hash_dict(&mut self, dict: &PdfDict, hash: &mut sha2::Sha256, depth: u32) -> Result<()> {
+        self.hash_bytes(hash, &(dict.0.len() as u64).to_le_bytes())?;
+        for (key, value) in &dict.0 {
+            self.hash_bytes(hash, &(key.as_str().len() as u64).to_le_bytes())?;
+            self.hash_bytes(hash, key.as_str().as_bytes())?;
+            self.hash_object(value, hash, depth + 1)?;
+        }
+        Ok(())
+    }
+
+    /// Type tags, explicit lengths and fixed-width scalars make the hash
+    /// unambiguous without a second payload allocation or PDF serialization.
+    fn hash_object(
+        &mut self,
+        object: &PdfObject,
+        hash: &mut sha2::Sha256,
+        depth: u32,
+    ) -> Result<()> {
+        self.charge_node(depth)?;
+        match object {
+            PdfObject::Null => self.hash_bytes(hash, &[0]),
+            PdfObject::Bool(value) => self.hash_bytes(hash, &[1, u8::from(*value)]),
+            PdfObject::Integer(value) => {
+                self.hash_bytes(hash, &[2])?;
+                self.hash_bytes(hash, &value.to_le_bytes())
+            }
+            PdfObject::Real(value) => {
+                self.hash_bytes(hash, &[3])?;
+                self.hash_bytes(hash, &value.to_bits().to_le_bytes())
+            }
+            PdfObject::Name(value) => {
+                self.hash_bytes(hash, &[4])?;
+                self.hash_bytes(hash, &(value.as_str().len() as u64).to_le_bytes())?;
+                self.hash_bytes(hash, value.as_str().as_bytes())
+            }
+            PdfObject::String(value) => {
+                self.hash_bytes(hash, &[5])?;
+                self.hash_bytes(hash, &(value.0.len() as u64).to_le_bytes())?;
+                self.hash_bytes(hash, &value.0)
+            }
+            PdfObject::Array(values) => {
+                self.hash_bytes(hash, &[6])?;
+                self.hash_bytes(hash, &(values.len() as u64).to_le_bytes())?;
+                for value in values {
+                    self.hash_object(value, hash, depth + 1)?;
+                }
+                Ok(())
+            }
+            PdfObject::Dict(dict) => {
+                self.hash_bytes(hash, &[7])?;
+                self.hash_dict(dict, hash, depth)
+            }
+            PdfObject::Ref(id) => {
+                self.hash_bytes(hash, &[8])?;
+                self.hash_bytes(hash, &id.0.to_le_bytes())?;
+                self.hash_bytes(hash, &id.1.to_le_bytes())
+            }
+            PdfObject::Stream(stream) => {
+                self.hash_bytes(hash, &[9])?;
+                self.hash_dict(&stream.dict, hash, depth)?;
+                self.hash_bytes(hash, &(stream.data.len() as u64).to_le_bytes())?;
+                self.hash_bytes(hash, &stream.data)
+            }
+        }
+    }
+}
+
 /// An open BDC, retained only until its first removed operation or EMC.
 struct MarkedSequence {
     range: std::ops::Range<usize>,
@@ -1055,12 +1366,13 @@ struct MarkedSequence {
 
 /// Walk and filter within the same content limits as the document interpreter.
 /// A budget failure aborts before the writer queues the page edit.
-fn filter_content(
+fn filter_content_with_deadline(
     content: &[u8],
     rects: &[Rect],
     properties: &dyn Fn(&str) -> Option<PdfDict>,
     xobject_extent: &dyn Fn(&str, &Matrix) -> Option<Rect>,
     limits: &ParseLimits,
+    deadline: zpdf_core::time::Instant,
 ) -> Result<FilterOutcome> {
     let mut out = BoundedBytes::new(limits.max_decoded_stream_bytes);
     let mut tokenizer = ContentTokenizer::new(content);
@@ -1084,7 +1396,6 @@ fn filter_content(
     let mut dropped_xobjects = HashSet::new();
     let mut kept_xobjects = HashSet::new();
     let mut operators = 0u64;
-    let deadline = zpdf_core::time::Instant::now() + std::time::Duration::from_secs(8);
 
     while let Some(token) = tokenizer.next_token() {
         if zpdf_core::time::Instant::now() >= deadline {
@@ -1579,6 +1890,67 @@ fn write_inline_image<W: Write>(out: &mut W, dict: &PdfDict, data: &[u8]) -> io:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn filter_content(
+        content: &[u8],
+        rects: &[Rect],
+        properties: &dyn Fn(&str) -> Option<PdfDict>,
+        xobject_extent: &dyn Fn(&str, &Matrix) -> Option<Rect>,
+        limits: &ParseLimits,
+    ) -> Result<FilterOutcome> {
+        filter_content_with_deadline(
+            content,
+            rects,
+            properties,
+            xobject_extent,
+            limits,
+            zpdf_core::time::Instant::now() + std::time::Duration::from_secs(8),
+        )
+    }
+
+    #[test]
+    fn expired_annotation_deadline_aborts_without_changing_page() {
+        let mut builder = crate::DocumentBuilder::new();
+        builder.add_page(100.0, 100.0);
+        let writer = IncrementalWriter::new(builder.build().unwrap()).unwrap();
+        let mut page = PdfDict::new();
+        page.insert(
+            PdfName::new("Annots"),
+            PdfObject::Array(vec![PdfObject::Null]),
+        );
+        let before = page.clone();
+        let result = writer.prune_annotations(
+            &mut page,
+            &[Rect::new(0.0, 0.0, 10.0, 10.0)],
+            zpdf_core::time::Instant::now(),
+        );
+        assert!(result.is_err(), "expired annotation work must be rejected");
+        assert_eq!(
+            page, before,
+            "failure must not replace the annotation array"
+        );
+    }
+
+    #[test]
+    fn annotation_deadline_does_not_add_an_entry_limit() {
+        let mut builder = crate::DocumentBuilder::new();
+        builder.add_page(100.0, 100.0);
+        let writer = IncrementalWriter::new(builder.build().unwrap()).unwrap();
+        let mut page = PdfDict::new();
+        page.insert(
+            PdfName::new("Annots"),
+            PdfObject::Array(vec![PdfObject::Null; 65_537]),
+        );
+        let before = page.clone();
+        writer
+            .prune_annotations(
+                &mut page,
+                &[Rect::new(0.0, 0.0, 10.0, 10.0)],
+                zpdf_core::time::Instant::now() + std::time::Duration::from_secs(8),
+            )
+            .unwrap();
+        assert_eq!(page, before);
+    }
 
     fn default_filter_content(
         content: &[u8],

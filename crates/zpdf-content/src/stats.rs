@@ -43,7 +43,8 @@
 pub struct InterpretStats {
     /// Known omissions, malformed content and resource/time truncation.
     pub diagnostics: zpdf_core::ProcessingDiagnostics,
-    /// Total operators executed, including nested content. Collected even
+    /// Total operators executed, including nested content and one per inline
+    /// image (`BI ... EI`). Collected even
     /// without work timing so callers replaying standalone child streams can
     /// debit a shared operator allowance instead of resetting it per child.
     pub operators_executed: u64,
