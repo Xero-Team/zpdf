@@ -429,3 +429,308 @@ fn redaction_drops_thumbnail_named_properties_and_emptied_fields() {
         "q keeps its unredacted widget"
     );
 }
+
+/// Moving a shared inherited table must remove its unused redacted entries,
+/// while retaining direct and Form-mediated uses on another page.
+#[test]
+fn inherited_resources_are_detached_without_losing_surviving_uses() {
+    for second_use in [
+        "",
+        "/Tile Do /Span /Caption BDC 200 200 10 10 re f EMC",
+        "/Wrapper Do",
+    ] {
+        let objects = vec![
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /Resources << /Font << /F1 5 0 R >> /XObject << /Tile 6 0 R /Wrapper 10 0 R >> /Properties << /Caption 7 0 R >> >> >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 8 0 R >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 9 0 R >>".to_string(),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
+            stream("/Type /XObject /Subtype /Form /BBox [0 0 10 10] /Resources << >>", "% test-tile-data\n0 0 10 10 re f"),
+            "<< /ActualText (test-caption-data) /Lang (en) >>".to_string(),
+            stream("", "/Tile Do /Span /Caption BDC 10 10 10 10 re f EMC"),
+            stream("", &format!("BT /F1 12 Tf 200 200 Td (public page) Tj ET {second_use}")),
+            stream("/Type /XObject /Subtype /Form /BBox [0 0 10 10]", "/Tile Do /Span /Caption BDC 200 200 10 10 re f EMC"),
+        ];
+        let output = redact_pdf(
+            build_pdf(&objects),
+            b"",
+            0,
+            &[Rect::new(-1.0, -1.0, 100.0, 100.0)],
+            &RedactOptions { fill: None },
+        )
+        .unwrap();
+        let document = PdfDocument::open(output).unwrap();
+        let payload = all_payload_bytes(&document);
+        for marker in ["test-tile-data", "test-caption-data"] {
+            assert_eq!(
+                payload
+                    .windows(marker.len())
+                    .any(|bytes| bytes == marker.as_bytes()),
+                !second_use.is_empty()
+            );
+        }
+        let catalog = document
+            .file()
+            .resolve(document.file().trailer.get_ref("Root").unwrap())
+            .unwrap();
+        let pages = document
+            .file()
+            .resolve(catalog.as_dict().unwrap().get_ref("Pages").unwrap())
+            .unwrap();
+        assert!(pages.as_dict().unwrap().get("Resources").is_none());
+        assert!(!page_content(&document).contains("/Tile Do"));
+        let other_page = document.page(1).unwrap();
+        assert!(
+            String::from_utf8_lossy(&document.page_content_bytes(&other_page).unwrap())
+                .contains("public page")
+        );
+    }
+}
+
+#[test]
+fn supported_structure_child_shapes_lose_only_related_replacement_text() {
+    let cases = [
+        (
+            "<< /S /P /ActualText (test-inline) /K 0 >>",
+            "9 0 R",
+            "<< /S /P /Alt (test-descendant) /K 0 >>",
+        ),
+        ("<< /MCID 0.0 >>", "<< /MCID 0.0 >>", "null"),
+        ("9 0 R", "9 0 R", "<< /Type /MCR /MCID 0 >>"),
+        ("9 0 R", "9 0 R", "[<< /MCID 0.0 >>]"),
+        ("<< /Obj 11 0 R >>", "9 0 R", "<< /Obj 11 0 R >>"),
+    ];
+    for (first, second, shared) in cases {
+        let objects = vec![
+            "<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 6 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R /Annots [11 0 R] >>".to_string(),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
+            stream("", "/P <</MCID 0>> BDC BT /F1 12 Tf 20 20 Td (selected text) Tj ET EMC /P <</MCID 1>> BDC BT /F1 12 Tf 200 200 Td (public text) Tj ET EMC"),
+            "<< /Type /StructTreeRoot /Pg 3 0 R /K [7 0 R 8 0 R 10 0 R] >>".to_string(),
+            format!("<< /Type /StructElem /S /P /P 6 0 R /ActualText (test-owner-one) /K {first} >>"),
+            format!("<< /Type /StructElem /S /P /P 6 0 R /Alt (test-owner-two) /K {second} >>"),
+            shared.to_string(),
+            "<< /Type /StructElem /S /P /P 6 0 R /ActualText (public structure) /K 1 >>".to_string(),
+            "<< /Type /Annot /Subtype /Text /Rect [10 10 50 50] /P 3 0 R >>".to_string(),
+        ];
+        let original = build_pdf(&objects);
+        assert_eq!(
+            PdfDocument::open(original.clone())
+                .unwrap()
+                .struct_tree()
+                .unwrap()
+                .children
+                .len(),
+            3
+        );
+        let output = redact_pdf(
+            original,
+            b"",
+            0,
+            &[Rect::new(0.0, 0.0, 180.0, 60.0)],
+            &RedactOptions { fill: None },
+        )
+        .unwrap();
+        let document = PdfDocument::open(output).unwrap();
+        assert!(!page_content(&document).contains("selected text"));
+        let payload = String::from_utf8_lossy(&all_payload_bytes(&document)).into_owned();
+        for removed in [
+            "test-owner-one",
+            "test-owner-two",
+            "test-inline",
+            "test-descendant",
+        ] {
+            assert!(
+                !payload.contains(removed),
+                "{removed} survived for {first}, {second}, {shared}"
+            );
+        }
+        assert!(payload.contains("public structure"));
+        assert!(page_content(&document).contains("public text"));
+    }
+}
+
+#[test]
+fn tagging_and_redaction_compose_in_both_orders() {
+    for tag_first in [false, true] {
+        let mut writer = IncrementalWriter::new(two_line_pdf()).unwrap();
+        if tag_first {
+            writer.tag_pdf().unwrap();
+        }
+        writer
+            .redact_page(
+                0,
+                &[Rect::new(60.0, 690.0, 400.0, 720.0)],
+                &RedactOptions { fill: None },
+            )
+            .unwrap();
+        if !tag_first {
+            writer.tag_pdf().unwrap();
+        }
+        // A second tag call must see the pending MarkInfo too.
+        writer.tag_pdf().unwrap();
+        let mut update = Cursor::new(Vec::new());
+        writer.write(&mut update).unwrap();
+        let current = PdfDocument::open(update.into_inner()).unwrap();
+        let output = zpdf_writer::rewrite_pdf(current.file(), &Default::default()).unwrap();
+        let document = PdfDocument::open(output).unwrap();
+        let payload = all_payload_bytes(&document);
+        assert!(!payload
+            .windows(b"TOP SECRET".len())
+            .any(|bytes| bytes == b"TOP SECRET"));
+        assert!(page_content(&document).contains("public information"));
+        let tree = document.struct_tree().unwrap();
+        assert_eq!(tree.children.len(), 1);
+        if !tag_first {
+            assert!(tree.children[0]
+                .alt
+                .as_deref()
+                .unwrap()
+                .contains("public information"));
+        }
+    }
+}
+
+/// Retained stored AP streams are independent roots for page-resource use.
+/// The other page deliberately has no Contents, and an overlapping annotation
+/// is removed so its appearance cannot keep the unrelated Gone resource alive.
+#[test]
+fn retained_annotation_appearances_preserve_inherited_resource_uses() {
+    for same_page in [false, true] {
+        for appearances in [
+            "/N 12 0 R",
+            "/N << /Off 13 0 R /On 12 0 R >>",
+            "/N 13 0 R /R << /Hover 12 0 R >>",
+            "/N 13 0 R /D 12 0 R",
+        ] {
+            let first_annots = if same_page { "10 0 R 11 0 R" } else { "11 0 R" };
+            let second_annots = if same_page { "" } else { "10 0 R" };
+            let objects = vec![
+                "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+                "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /Resources << /XObject << /Tile 5 0 R /Gone 6 0 R >> /Properties << /Caption 7 0 R /GoneCaption 8 0 R >> >> >>".to_string(),
+                format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 9 0 R /Annots [{first_annots}] >>"),
+                format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Annots [{second_annots}] >>"),
+                stream("/Type /XObject /Subtype /Form /BBox [0 0 10 10] /Resources << >>", "% retained-ap-tile\n0 0 10 10 re f"),
+                stream("/Type /XObject /Subtype /Form /BBox [0 0 10 10] /Resources << >>", "% removed-ap-tile\n0 0 10 10 re f"),
+                "<< /ActualText (retained-ap-caption) >>".to_string(),
+                "<< /ActualText (removed-ap-caption) >>".to_string(),
+                stream("", "/Tile Do /Gone Do /P /Caption BDC 10 10 2 2 re f EMC /P /GoneCaption BDC 10 10 2 2 re f EMC"),
+                format!("<< /Type /Annot /Subtype /Stamp /P {} 0 R /Rect [200 200 220 220] /AS /Off /AP << {appearances} >> >>", if same_page { 3 } else { 4 }),
+                "<< /Type /Annot /Subtype /Stamp /P 3 0 R /Rect [10 10 20 20] /AP << /N 14 0 R >> >>".to_string(),
+                stream("/Type /XObject /Subtype /Form /BBox [0 0 10 10]", "/Tile Do /P /Caption BDC 0 0 10 10 re f EMC"),
+                stream("/Type /XObject /Subtype /Form /BBox [0 0 10 10]", ""),
+                stream("/Type /XObject /Subtype /Form /BBox [0 0 10 10]", "/Gone Do /P /GoneCaption BDC 0 0 10 10 re f EMC"),
+            ];
+            let output = redact_pdf(
+                build_pdf(&objects),
+                b"",
+                0,
+                &[Rect::new(-1.0, -1.0, 100.0, 100.0)],
+                &RedactOptions { fill: None },
+            )
+            .unwrap();
+            let document = PdfDocument::open(output).unwrap();
+            let annotated_page = document.page(if same_page { 0 } else { 1 }).unwrap();
+            assert_eq!(annotated_page.annots.len(), 1);
+            assert!(annotated_page.resources.xobjects.contains_key("Tile"));
+            assert!(!annotated_page.resources.xobjects.contains_key("Gone"));
+            assert!(!page_content(&document).contains("/Tile Do"));
+            let payload = String::from_utf8_lossy(&all_payload_bytes(&document)).into_owned();
+            assert!(payload.contains("retained-ap-tile"));
+            assert!(payload.contains("retained-ap-caption"));
+            assert!(!payload.contains("removed-ap-tile"));
+            assert!(!payload.contains("removed-ap-caption"));
+        }
+    }
+}
+
+/// lookup_res falls back to the page for missing names in an own resource
+/// table. Empty tables are supported; partial overrides must fail before edits
+/// until a context-aware dependency walk can prove the surviving uses.
+#[test]
+fn empty_form_resources_preserve_fallback_and_partial_resources_fail_without_edits() {
+    for annotation in [false, true] {
+        for own_resources in ["<< >>", "<< /XObject << /Other 5 0 R >> >>"] {
+            let second_page = if annotation {
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Annots [9 0 R] >>"
+            } else {
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 8 0 R >>"
+            };
+            let objects = vec![
+                "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+                "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /Resources << /XObject << /Tile 5 0 R /Wrapper 6 0 R >> >> >>".to_string(),
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 7 0 R >>".to_string(),
+                second_page.to_string(),
+                stream("/Type /XObject /Subtype /Form /BBox [0 0 10 10] /Resources << >>", "% fallback-tile-payload\n0 0 10 10 re f"),
+                stream(&format!("/Type /XObject /Subtype /Form /BBox [0 0 10 10] /Resources {own_resources}"), "/Tile Do"),
+                stream("", "/Tile Do"),
+                stream("", "/Wrapper Do"),
+                "<< /Type /Annot /Subtype /Stamp /P 4 0 R /Rect [200 200 220 220] /AP << /N 6 0 R >> >>".to_string(),
+            ];
+            let mut writer = IncrementalWriter::new(build_pdf(&objects)).unwrap();
+            let mut before = Cursor::new(Vec::new());
+            writer.write(&mut before).unwrap();
+            let result = writer.redact_page(
+                0,
+                &[Rect::new(-1.0, -1.0, 100.0, 100.0)],
+                &RedactOptions { fill: None },
+            );
+            let mut after = Cursor::new(Vec::new());
+            writer.write(&mut after).unwrap();
+            if own_resources == "<< >>" {
+                result.unwrap();
+                let current = PdfDocument::open(after.into_inner()).unwrap();
+                let output = zpdf_writer::rewrite_pdf(current.file(), &Default::default()).unwrap();
+                let document = PdfDocument::open(output).unwrap();
+                assert!(document
+                    .page(1)
+                    .unwrap()
+                    .resources
+                    .xobjects
+                    .contains_key("Tile"));
+                assert!(String::from_utf8_lossy(&all_payload_bytes(&document))
+                    .contains("fallback-tile-payload"));
+            } else {
+                assert!(result.is_err());
+                assert_eq!(
+                    after.into_inner(),
+                    before.into_inner(),
+                    "unsupported ownership must not queue partial edits"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn ext_gstate_type3_selection_refuses_ambiguous_cleanup_before_edits() {
+    for font_entry in ["[9 0 R 12]", "11 0 R"] {
+        let objects = vec![
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /Resources << /XObject << /Tile 5 0 R >> /ExtGState << /GS 6 0 R >> >> >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 7 0 R >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 8 0 R >>".to_string(),
+            stream("/Type /XObject /Subtype /Form /BBox [0 0 10 10] /Resources << >>", "0 0 10 10 re f"),
+            format!("<< /Font {font_entry} >>"),
+            stream("", "/Tile Do"),
+            stream("", "BT /GS gs (A) Tj ET"),
+            "<< /Type /Font /Subtype /Type3 /FontBBox [0 0 10 10] /FontMatrix [1 0 0 1 0 0] /CharProcs << /A 10 0 R >> /Encoding << /Differences [65 /A] >> /FirstChar 65 /LastChar 65 /Widths [10] >>".to_string(),
+            stream("", "10 0 d0 /Tile Do"),
+            "[9 0 R 12]".to_string(),
+        ];
+        let mut writer = IncrementalWriter::new(build_pdf(&objects)).unwrap();
+        let mut before = Cursor::new(Vec::new());
+        writer.write(&mut before).unwrap();
+        assert!(writer
+            .redact_page(
+                0,
+                &[Rect::new(-1.0, -1.0, 100.0, 100.0)],
+                &RedactOptions { fill: None }
+            )
+            .is_err());
+        let mut after = Cursor::new(Vec::new());
+        writer.write(&mut after).unwrap();
+        assert_eq!(after.into_inner(), before.into_inner());
+    }
+}

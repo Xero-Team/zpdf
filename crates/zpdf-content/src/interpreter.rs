@@ -1177,6 +1177,7 @@ impl<'a> ContentInterpreter<'a> {
         self.paint_annotations();
 
         self.stats.font_repairs = self.font_repair.repairs;
+        self.stats.operators_executed = self.ops_executed;
         self.stats.diagnostics.resource_limit_reached |= self.resource_limit_hit;
         self.stats.diagnostics.time_limit_reached |= self.timed_out;
         self.stats.font_repair_probes = self.font_repair.probes;
@@ -8855,6 +8856,23 @@ mod tests {
         assert!(stats.total_ns > 0, "total_ns must bracket the interpret");
         #[cfg(target_arch = "wasm32")]
         assert!(stats.is_empty() || stats.total_ns == 0);
+    }
+
+    #[test]
+    fn operator_count_includes_unattributed_work_and_stops_at_the_limit() {
+        let page = Rect::new(0.0, 0.0, 10.0, 10.0);
+        let (_, complete) = ContentInterpreter::new(page).interpret_with_stats(b"q Q q Q");
+        assert_eq!(complete.operators_executed, 4);
+        assert!(complete.diagnostics.is_complete());
+        let limits = ParseLimits {
+            max_page_operators: 3,
+            ..ParseLimits::default()
+        };
+        let (_, partial) = ContentInterpreter::new(page)
+            .with_limits(&limits)
+            .interpret_with_stats(b"q Q q Q");
+        assert_eq!(partial.operators_executed, 3);
+        assert!(partial.diagnostics.resource_limit_reached);
     }
 
     /// The work buckets are opt-in: with no flag, an instrumented operator must

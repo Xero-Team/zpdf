@@ -417,21 +417,33 @@ impl PdfFile {
     /// containing them); resolve those before handing the dict to the filter
     /// layer, which has no access to the file.
     pub fn resolve_stream_data(&self, id: zpdf_core::ObjectId) -> Result<Vec<u8>> {
-        self.resolve_stream_data_inner(id, true)
+        self.resolve_stream_data_inner(id, true, &self.limits)
+    }
+
+    /// Decode with an additional output allowance, for callers accumulating
+    /// several decoded streams. This can only tighten the document's existing
+    /// filter-chain budget; raw-stream and other parser limits are unchanged.
+    pub fn resolve_stream_data_with_limit(
+        &self,
+        id: ObjectId,
+        max_decoded_bytes: u64,
+    ) -> Result<Vec<u8>> {
+        let mut limits = self.limits.clone();
+        limits.max_decoded_stream_bytes = limits.max_decoded_stream_bytes.min(max_decoded_bytes);
+        self.resolve_stream_data_inner(id, true, &limits)
     }
 
     fn resolve_stream_data_inner(
         &self,
         id: zpdf_core::ObjectId,
         inline_globals: bool,
+        limits: &ParseLimits,
     ) -> Result<Vec<u8>> {
         let obj = self.resolve(id)?;
         let stream = obj.as_stream()?;
-        match self.dict_with_resolved_filters(&stream.dict, inline_globals) {
-            Some(resolved) => {
-                filters::decode_stream_with_limits(&stream.data, &resolved, &self.limits)
-            }
-            None => filters::decode_stream_with_limits(&stream.data, &stream.dict, &self.limits),
+        match self.dict_with_resolved_filters(&stream.dict, inline_globals, limits) {
+            Some(resolved) => filters::decode_stream_with_limits(&stream.data, &resolved, limits),
+            None => filters::decode_stream_with_limits(&stream.data, &stream.dict, limits),
         }
     }
 
@@ -441,7 +453,12 @@ impl PdfFile {
     /// avoids cloning the dict). When `inline_globals` is set, a DecodeParms
     /// `/JBIG2Globals` stream reference is also inlined (see
     /// [`Self::inline_jbig2_globals`]).
-    fn dict_with_resolved_filters(&self, dict: &PdfDict, inline_globals: bool) -> Option<PdfDict> {
+    fn dict_with_resolved_filters(
+        &self,
+        dict: &PdfDict,
+        inline_globals: bool,
+        limits: &ParseLimits,
+    ) -> Option<PdfDict> {
         const KEYS: [&str; 3] = ["Filter", "DecodeParms", "DP"];
         // A DecodeParms dict containing a /JBIG2Globals reference needs the
         // globals stream inlined even though the dict itself is direct.
@@ -467,7 +484,7 @@ impl PdfFile {
         };
         let inline = |obj: PdfObject| {
             if inline_globals {
-                self.inline_jbig2_globals(obj)
+                self.inline_jbig2_globals(obj, limits)
             } else {
                 obj
             }
@@ -493,13 +510,13 @@ impl PdfFile {
     /// access to chase references itself. The globals stream is decoded
     /// without globals inlining of its own, so a crafted reference cycle
     /// cannot recurse. Anything else passes through unchanged.
-    fn inline_jbig2_globals(&self, obj: PdfObject) -> PdfObject {
+    fn inline_jbig2_globals(&self, obj: PdfObject, limits: &ParseLimits) -> PdfObject {
         let PdfObject::Dict(mut d) = obj else {
             return obj;
         };
         if let Some(PdfObject::Ref(r)) = d.get("JBIG2Globals") {
             let r = *r;
-            let value = match self.resolve_stream_data_inner(r, false) {
+            let value = match self.resolve_stream_data_inner(r, false, limits) {
                 Ok(bytes) => PdfObject::String(zpdf_core::PdfString(bytes)),
                 Err(e) => {
                     tracing::warn!("failed to decode /JBIG2Globals stream {r}: {e}");
@@ -1116,6 +1133,36 @@ mod tests {
         );
         let file = PdfFile::parse(pdf).unwrap();
         assert_eq!(file.resolve(ObjectId(4, 0)).unwrap(), PdfObject::Null);
+    }
+
+    #[test]
+    fn decoded_stream_allowance_only_tightens_document_limit() {
+        let pdf = build_pdf(
+            &[
+                (1, "<< /Type /Catalog >>"),
+                (2, "<< /Length 3 >>\nstream\nq Q\nendstream"),
+            ],
+            1,
+        );
+        let file = PdfFile::parse(pdf.clone()).unwrap();
+        assert!(matches!(
+            file.resolve_stream_data_with_limit(ObjectId(2, 0), 2),
+            Err(zpdf_core::Error::StreamSizeLimit(2))
+        ));
+        assert_eq!(
+            file.resolve_stream_data_with_limit(ObjectId(2, 0), 3)
+                .unwrap(),
+            b"q Q"
+        );
+        let limits = ParseLimits {
+            max_decoded_stream_bytes: 2,
+            ..ParseLimits::default()
+        };
+        let file = PdfFile::parse_with_limits(pdf, limits).unwrap();
+        assert!(matches!(
+            file.resolve_stream_data_with_limit(ObjectId(2, 0), u64::MAX),
+            Err(zpdf_core::Error::StreamSizeLimit(2))
+        ));
     }
 
     #[test]

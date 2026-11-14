@@ -718,6 +718,9 @@ fn load_type3_font(
 
     // CharProcs: name → stream ref
     let mut char_procs = std::collections::HashMap::new();
+    let mut decoded: std::collections::HashMap<ObjectId, Arc<[u8]>> =
+        std::collections::HashMap::new();
+    let mut remaining = file.limits().max_font_cache_bytes;
     let encoded_names: std::collections::HashSet<&str> = encoding
         .iter()
         .map(String::as_str)
@@ -732,9 +735,27 @@ fn load_type3_font(
                 continue;
             }
             if let PdfObject::Ref(r) = obj {
-                if let Ok(data) = file.resolve_stream_data(*r) {
-                    char_procs.insert(name.0.clone(), Arc::from(data));
-                }
+                let data = if let Some(data) = decoded.get(r) {
+                    Arc::clone(data)
+                } else {
+                    // Bound the next unique program before decoding, while
+                    // already-admitted programs remain live. Aliased glyph
+                    // names share one decoded buffer and consume no bytes twice.
+                    let data = match file.resolve_stream_data_with_limit(*r, remaining) {
+                        Ok(data) => data,
+                        Err(error) => {
+                            tracing::debug!("Type3 glyph {name}: skipped - {error}");
+                            continue;
+                        }
+                    };
+                    remaining = remaining.checked_sub(data.len() as u64).ok_or(
+                        zpdf_core::Error::StreamSizeLimit(file.limits().max_font_cache_bytes),
+                    )?;
+                    let data: Arc<[u8]> = Arc::from(data);
+                    decoded.insert(*r, Arc::clone(&data));
+                    data
+                };
+                char_procs.insert(name.0.clone(), data);
             }
         }
     }
@@ -1165,6 +1186,40 @@ mod tests {
         let mut w = CidWidths::new(1000.0);
         apply_w2_array(&arr, &mut w);
         assert_eq!(w.get_v(10), None);
+    }
+
+    #[test]
+    fn type3_programs_use_the_remaining_budget_and_share_references() {
+        let pdf = crate::test_util::build_pdf(&[
+            "<< /Type /Catalog >>",
+            "<< /Type /Font /Subtype /Type3 /Encoding << /Differences [65 /A /B /C] >> /CharProcs << /A 3 0 R /B 3 0 R /C 4 0 R >> >>",
+            "<< /Length 3 >>\nstream\nq Q\nendstream",
+            "<< /Length 3 >>\nstream\nq Q\nendstream",
+        ]);
+        let limits = zpdf_core::ParseLimits {
+            max_font_cache_bytes: 3,
+            ..Default::default()
+        };
+        let file = PdfFile::parse_with_limits(pdf.clone(), limits).unwrap();
+        let font = load_single_font(&file, ObjectId(2, 0)).unwrap();
+        let PdfFontType::Type3 { char_procs, .. } = &font.font_type else {
+            panic!("Type3")
+        };
+        assert_eq!(char_procs.len(), 2);
+        assert!(std::sync::Arc::ptr_eq(&char_procs["A"], &char_procs["B"]));
+        assert_eq!(char_procs["A"].as_ref(), b"q Q");
+        assert!(!char_procs.contains_key("C"));
+        let limits = zpdf_core::ParseLimits {
+            max_font_cache_bytes: 6,
+            ..Default::default()
+        };
+        let file = PdfFile::parse_with_limits(pdf, limits).unwrap();
+        let font = load_single_font(&file, ObjectId(2, 0)).unwrap();
+        let PdfFontType::Type3 { char_procs, .. } = &font.font_type else {
+            panic!("Type3")
+        };
+        assert_eq!(char_procs.len(), 3);
+        assert!(!std::sync::Arc::ptr_eq(&char_procs["A"], &char_procs["C"]));
     }
 
     #[test]

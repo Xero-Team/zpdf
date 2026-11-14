@@ -104,3 +104,26 @@ test("packaged editor saves Unicode, page edits, extraction and optimization", (
     assert.deepEqual(Array.from(one.page_size(0)), [80, 120]);
   } finally { one.free(); }
 });
+
+test("packaged redaction saves a fresh document and preserves later edits", () => {
+  const input = fixture();
+  const editor = bindings.PdfEditor.open(input);
+  try {
+    editor.set_title("Before redaction");
+    editor.redact(0, new Float64Array([0, 0, 120, 80]), null);
+    editor.rotate_page(1, 90);
+    for (const title of ["Redacted", "Saved again"]) {
+      editor.set_title(title);
+      const saved = Buffer.from(editor.save());
+      assert.equal(saved.includes(input), false, "original revision must not survive");
+      assert.equal(saved.includes(Buffer.from("(HELLO) Tj")), false);
+      const pdf = bindings.Pdf.open(saved);
+      try {
+        assert.equal(pdf.page_count, 3);
+        assert.equal(pdf.page_text(0).trim(), "");
+        assert.equal(pdf.title, title);
+        assert.deepEqual(Array.from(pdf.page_size(1)), [100, 200]);
+      } finally { pdf.free(); }
+    }
+  } finally { editor.free(); }
+});

@@ -303,9 +303,9 @@ if (Symbol.dispose) Pdf.prototype[Symbol.dispose] = Pdf.prototype.free;
  * A mutable PDF editor wrapping an [`zpdf_writer::IncrementalWriter`]. Open a
  * document, queue any number of edits (page ops, metadata, stamps,
  * annotations, redaction, form fill, merge), then call [`PdfEditor::save`] to
- * serialize them as **one incremental update** (the original bytes plus the
- * new revision — the smallest possible output, matching the CLI's
- * composition). Page indices are 0-based (JS convention; the CLI is 1-based).
+ * serialize them as one incremental update, or as a fresh document after
+ * redaction so superseded content is not returned to the caller. Page indices
+ * are 0-based (JS convention; the CLI is 1-based).
  *
  * `split_pages` and `optimize` are one-shot free functions instead — they
  * fully rewrite or extract, so they don't fit the incremental-editor model.
@@ -573,7 +573,9 @@ export class PdfEditor {
     /**
      * Redact regions of a page: `rects` is a flat `[x0,y0,x1,y1, …]` array;
      * `fill` is an optional `[r,g,b]` cover colour (pass `null` to remove
-     * content without painting a box).
+     * content without painting a box). `save()` subsequently rewrites the
+     * document. Encrypted inputs are rejected because this API cannot select
+     * an output-encryption policy.
      * @param {number} page
      * @param {Float64Array} rects
      * @param {Float64Array | null} [fill]
@@ -628,7 +630,8 @@ export class PdfEditor {
         }
     }
     /**
-     * Serialize all queued edits as one incremental update → `Uint8Array`.
+     * Serialize all queued edits → `Uint8Array`. After redaction, rewrite
+     * the current object graph to remove superseded unredacted revisions.
      * @returns {Uint8Array}
      */
     save() {

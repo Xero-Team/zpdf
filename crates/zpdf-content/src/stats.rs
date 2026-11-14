@@ -43,6 +43,10 @@
 pub struct InterpretStats {
     /// Known omissions, malformed content and resource/time truncation.
     pub diagnostics: zpdf_core::ProcessingDiagnostics,
+    /// Total operators executed, including nested content. Collected even
+    /// without work timing so callers replaying standalone child streams can
+    /// debit a shared operator allowance instead of resetting it per child.
+    pub operators_executed: u64,
     /// Gradient/mesh evaluation into a raster — `shading::rasterize`.
     ///
     /// This is the whole cost of gradients on a page as far as any measurement

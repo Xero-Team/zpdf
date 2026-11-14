@@ -338,3 +338,46 @@ fn tag_pdf_is_noop_on_already_tagged() {
     // but no tagging objects were added — sanity-check it didn't shrink.
     assert!(out.len() >= original_len);
 }
+
+#[test]
+fn pending_tagging_snapshot_preserves_export_encryption() {
+    use zpdf_writer::{rewrite_pdf, EncryptionConfig, RewriteOptions};
+    let mut builder = DocumentBuilder::new();
+    let page = builder.add_page(200.0, 200.0);
+    builder
+        .add_text(
+            page,
+            "private test text",
+            10.0,
+            100.0,
+            "Helvetica",
+            12.0,
+            (0.0, 0.0, 0.0),
+        )
+        .unwrap();
+    let original = PdfDocument::open(builder.build().unwrap()).unwrap();
+    let encrypted = rewrite_pdf(
+        original.file(),
+        &RewriteOptions {
+            encrypt: Some(EncryptionConfig::rc4_128("test-user", "test-owner")),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut writer = IncrementalWriter::new_with_password(encrypted, b"test-user").unwrap();
+    writer.tag_pdf().unwrap();
+    let mut output = std::io::Cursor::new(Vec::new());
+    writer.write(&mut output).unwrap();
+    let output = output.into_inner();
+    assert!(PdfDocument::open(output.clone()).is_err());
+    assert!(!output
+        .windows(b"private test text".len())
+        .any(|bytes| bytes == b"private test text"));
+    let document = PdfDocument::open_with_password(output, b"test-user").unwrap();
+    assert!(document.is_encrypted());
+    assert!(document.struct_tree().unwrap().children[0]
+        .alt
+        .as_deref()
+        .unwrap()
+        .contains("private test text"));
+}

@@ -2198,6 +2198,34 @@ impl<'a> Decoder<'a> {
             .collect()
     }
 
+    /// Check the aggregate import count before allocating the temporary list.
+    /// Referral order and repeated occurrences are meaningful symbol indices.
+    fn imported_symbols(&self, h: &SegmentHeader, limit: usize) -> Result<Vec<Rc<Bitmap>>> {
+        let mut total = 0usize;
+        for referred in &h.referred {
+            match self.symbol_dicts.get(referred) {
+                Some(Some(symbols)) => {
+                    total = total
+                        .checked_add(symbols.len())
+                        .filter(|&count| count <= limit)
+                        .ok_or_else(|| err("too many imported symbols"))?;
+                }
+                Some(None) => return Err(err("referred symbol dictionary failed to decode")),
+                None => {}
+            }
+        }
+        let mut imported = Vec::new();
+        imported
+            .try_reserve_exact(total)
+            .map_err(|_| err("cannot reserve imported symbols"))?;
+        for referred in &h.referred {
+            if let Some(Some(symbols)) = self.symbol_dicts.get(referred) {
+                imported.extend(symbols.iter().cloned());
+            }
+        }
+        Ok(imported)
+    }
+
     /// Symbol dictionary segment (T.88 6.5 / 7.4.3). Supports arithmetic and
     /// Huffman entropy coding, and refinement/aggregate (SDREFAGG) symbols.
     fn decode_symbol_dict(&mut self, h: &SegmentHeader, data: &[u8]) -> Result<Vec<Rc<Bitmap>>> {
@@ -2240,17 +2268,7 @@ impl<'a> Decoder<'a> {
 
         // Input symbols: the exported symbols of referred symbol dictionaries,
         // in referral order. Other referred segment types are ignored.
-        let mut input: Vec<Rc<Bitmap>> = Vec::new();
-        for rs in &h.referred {
-            match self.symbol_dicts.get(rs) {
-                Some(Some(d)) => input.extend(d.iter().cloned()),
-                Some(None) => return Err(err("referred symbol dictionary failed to decode")),
-                None => {}
-            }
-        }
-        if input.len() > MAX_SYMBOLS {
-            return Err(err("too many input symbols"));
-        }
+        let input = self.imported_symbols(h, MAX_SYMBOLS)?;
 
         // Resolve the Huffman tables for SDHUFF (selectors 0/1 = standard,
         // 3 = next custom table in referral order). DH uses B.4/B.5, DW uses
@@ -2738,21 +2756,11 @@ impl<'a> Decoder<'a> {
         }
 
         // Gather symbols from the referred symbol dictionaries.
-        let mut symbols: Vec<Rc<Bitmap>> = Vec::new();
-        for rs in &h.referred {
-            match self.symbol_dicts.get(rs) {
-                Some(Some(d)) => symbols.extend(d.iter().cloned()),
-                Some(None) => return Err(err("referred symbol dictionary failed to decode")),
-                None => {}
-            }
-        }
+        let symbols = self.imported_symbols(h, MAX_SYMBOLS)?;
         if symbols.is_empty() {
             return Err(err("text region refers to no usable symbols"));
         }
-        if symbols.len() > MAX_SYMBOLS {
-            // Also bounds the IAID context allocation below.
-            return Err(err("too many symbols for text region"));
-        }
+        // The import admission check also bounds the IAID context allocation.
         // T.88 (as amended) and shipping encoders use max(1, ceil(log2 n)).
         let sym_code_len = ceil_log2(symbols.len()).max(1);
 
@@ -5529,6 +5537,35 @@ mod tests {
         encode_int(&mut enc, &mut iaex, Some(n as i64));
         p.extend_from_slice(&enc.finish());
         p
+    }
+
+    #[test]
+    fn imported_symbol_limit_precedes_pointer_growth() {
+        let first = Rc::new(checker_bitmap(1, 1));
+        let second = Rc::new(checker_bitmap(1, 1));
+        let mut budget = crate::filters::DecodeBudget::new(u64::MAX);
+        let mut decoder = Decoder::new(&mut budget, 16);
+        decoder
+            .symbol_dicts
+            .insert(1, Some(vec![Rc::clone(&first)]));
+        decoder
+            .symbol_dicts
+            .insert(2, Some(vec![Rc::clone(&second)]));
+        let header = SegmentHeader {
+            number: 3,
+            seg_type: 0,
+            referred: vec![1, 2, 1],
+            page: 1,
+            data_length: 0,
+        };
+        let owners = Rc::strong_count(&first);
+        assert!(decoder.imported_symbols(&header, 2).is_err());
+        assert_eq!(Rc::strong_count(&first), owners);
+        let imported = decoder.imported_symbols(&header, 3).unwrap();
+        assert_eq!(imported.len(), 3);
+        assert!(Rc::ptr_eq(&imported[0], &first));
+        assert!(Rc::ptr_eq(&imported[1], &second));
+        assert!(Rc::ptr_eq(&imported[2], &first));
     }
 
     /// A symbol re-exported by a second dictionary shares the first one's

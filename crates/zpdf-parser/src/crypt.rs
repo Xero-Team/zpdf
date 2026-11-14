@@ -311,8 +311,15 @@ impl Decryptor {
                 }
             }
             PdfObject::Dict(d) => {
-                for v in d.0.values_mut() {
-                    self.try_encrypt_object_strings(v, id)?;
+                let signature = matches!(d.get_name("Type"), Ok("Sig" | "DocTimeStamp"));
+                for (key, value) in &mut d.0 {
+                    if signature
+                        && key.as_str() == "Contents"
+                        && matches!(value, PdfObject::String(_))
+                    {
+                        continue; // Signature CMS bytes are never encrypted.
+                    }
+                    self.try_encrypt_object_strings(value, id)?;
                 }
             }
             PdfObject::Stream(s) => {
@@ -347,8 +354,15 @@ impl Decryptor {
                 }
             }
             PdfObject::Dict(d) => {
-                for v in d.0.values_mut() {
-                    self.walk(v, id);
+                let signature = matches!(d.get_name("Type"), Ok("Sig" | "DocTimeStamp"));
+                for (key, value) in &mut d.0 {
+                    if signature
+                        && key.as_str() == "Contents"
+                        && matches!(value, PdfObject::String(_))
+                    {
+                        continue; // The Contents-only signature exception (§7.6.2).
+                    }
+                    self.walk(value, id);
                 }
             }
             PdfObject::Stream(s) => {
@@ -1520,6 +1534,46 @@ mod tests {
             dec.decrypt_stream_bytes(ObjectId(9, 0), b"objstm"),
             b"objstm"
         );
+    }
+
+    #[test]
+    fn signature_contents_only_is_exempt_from_string_encryption() {
+        let dec = Decryptor {
+            key: vec![1, 2, 3, 4, 5],
+            stm_algo: Algo::Rc4,
+            str_algo: Algo::Rc4,
+            eff_algo: Algo::Rc4,
+            crypt_filters: Vec::new(),
+            encrypt_id: None,
+            encrypt_metadata: true,
+        };
+        for kind in ["Sig", "DocTimeStamp", "Annot"] {
+            let mut dict = PdfDict::new();
+            dict.insert(PdfName::new("Type"), PdfObject::Name(PdfName::new(kind)));
+            dict.insert(
+                PdfName::new("Contents"),
+                PdfObject::String(PdfString(b"test CMS".to_vec())),
+            );
+            dict.insert(
+                PdfName::new("Reason"),
+                PdfObject::String(PdfString(b"test metadata".to_vec())),
+            );
+            let original = PdfObject::Dict(dict);
+            let mut encrypted = original.clone();
+            dec.try_encrypt_object_strings(&mut encrypted, ObjectId(7, 0))
+                .unwrap();
+            let dict = encrypted.as_dict().unwrap();
+            assert_ne!(
+                dict.get("Reason"),
+                original.as_dict().unwrap().get("Reason")
+            );
+            assert_eq!(
+                dict.get("Contents") == original.as_dict().unwrap().get("Contents"),
+                kind != "Annot"
+            );
+            dec.decrypt_object(&mut encrypted, ObjectId(7, 0));
+            assert_eq!(encrypted, original);
+        }
     }
 
     /// /EncryptMetadata false leaves /Type /Metadata stream payloads alone.

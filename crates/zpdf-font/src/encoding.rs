@@ -1119,6 +1119,16 @@ pub struct Encoding {
 }
 
 impl Encoding {
+    pub(crate) fn estimated_cache_bytes(&self) -> u64 {
+        self.table.iter().fold(
+            std::mem::size_of_val(self.table.as_ref()) as u64,
+            |sum, name| match name {
+                Some(Cow::Owned(name)) => sum.saturating_add(name.capacity() as u64),
+                _ => sum,
+            },
+        )
+    }
+
     /// Build an effective encoding from a static base table.
     pub fn from_base(table: &'static EncodingTable) -> Self {
         let arr: [Option<Cow<'static, str>>; 256] =
