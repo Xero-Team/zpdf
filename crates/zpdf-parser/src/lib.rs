@@ -888,16 +888,12 @@ fn root_resolves(
             let Some(file_offset) = usize::try_from(*offset).ok() else {
                 return false;
             };
-            matches!(
-                parser
-                    .parse_indirect_at(file_offset)
-                    .ok()
-                    .and_then(|o| o
-                        .as_dict()
-                        .ok()
-                        .map(|d| d.get_name("Type").unwrap_or("").to_string())),
-                Some(t) if t == "Catalog"
-            )
+            // Compare while the parsed object is alive; copying the name only
+            // to discard it adds an allocation to every document open.
+            parser.parse_indirect_at(file_offset).is_ok_and(|obj| {
+                obj.as_dict()
+                    .is_ok_and(|dict| matches!(dict.get_name("Type"), Ok("Catalog")))
+            })
         }
         Some(_) => true, // compressed/free-but-present: trust the normal pipeline
         None => false,

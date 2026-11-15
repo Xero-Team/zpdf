@@ -28,7 +28,8 @@ assert_eq!(view.as_slice(), b"PAYLOAD");
 
 `From<Vec<u8>>`, `From<Arc<[u8]>>` and `From<&[u8]>` construct independent data.
 The Arc conversion reuses the supplied byte allocation. A Vec or borrowed slice
-is converted to an Arc allocation. `from_shared` checks the entire range and
+is converted to an Arc allocation. Independent data has no additional range
+descriptor allocation. `from_shared` checks the entire range and
 returns an error for reversed/out-of-bounds ranges. Empty views release the
 supplied backing storage.
 
@@ -39,9 +40,14 @@ copy with `to_vec()`, modify the Vec, then replace `stream.data` with `vec.into(
 
 ## Source lifetimes
 
-`PdfFile` parses raw streams as checked ranges into its immutable source file.
-Cloning a stream shares its payload. Keeping any nonempty parsed stream after
-dropping the file can therefore keep the **entire source allocation** alive.
+`PdfFile` parses larger raw streams as checked ranges into its immutable source
+file. Payloads of at most 32 bytes are copied into independent storage: for
+these tiny streams, copying avoids the range descriptor and reference-counting
+costs. This cutoff is an implementation detail; explicit `from_shared` calls
+always make a view without copying nonempty bytes, regardless of length.
+
+Cloning a stream shares its payload. Keeping a parsed view after dropping the
+file can therefore keep the **entire source allocation** alive.
 Use `stream.data = stream.data.into_detached()` when this is undesirable;
 `to_detached()` returns a detached handle while preserving the original.
 Already independent payload allocations remain shared.
@@ -56,7 +62,8 @@ the supplied storage: detach explicitly if manually importing a stream through
 those lower-level APIs. Dictionaries/references still need graph remapping.
 
 `ObjectParser::new(&[u8], &limits)` keeps its borrowed-input API and copies stream
-bytes. `ObjectParser::new_shared(&Arc<[u8]>, &limits)` opts into shared storage.
+bytes. `ObjectParser::new_shared(&Arc<[u8]>, &limits)` opts into shared storage
+with the same short-stream policy as `PdfFile`.
 
 ## Limits and encryption
 

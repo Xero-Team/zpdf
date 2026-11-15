@@ -185,6 +185,7 @@ pub struct PdfStream {
 }
 
 impl PdfStream {
+    #[inline]
     pub fn new(dict: PdfDict, data: Vec<u8>) -> Self {
         Self {
             dict,

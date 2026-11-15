@@ -24,10 +24,17 @@ use crate::{Error, Result};
 /// # Ok::<(), zpdf_core::Error>(())
 /// ```
 #[derive(Clone)]
-pub struct PdfStreamData(Arc<Storage>);
+pub struct PdfStreamData(Repr);
 
-// Keep range metadata out of PdfObject: enlarging that enum also enlarges every
-// array element and dictionary node, including objects that contain no streams.
+// Owned payloads keep the original Arc directly, without a descriptor allocation.
+// Only a shared range needs metadata. The enum fits in the former Arc field on
+// our supported targets, avoiding growth of every PdfObject array/dictionary slot.
+#[derive(Clone)]
+enum Repr {
+    Owned(Arc<[u8]>),
+    Shared(Arc<Storage>),
+}
+
 struct Storage {
     bytes: Arc<[u8]>,
     range: Range<usize>,
@@ -46,26 +53,32 @@ impl PdfStreamData {
         if range.is_empty() {
             return Ok(Self::default());
         }
-        Ok(Self(Arc::new(Storage { bytes, range })))
+        Ok(Self(Repr::Shared(Arc::new(Storage { bytes, range }))))
     }
 
     /// Borrow only this stream's visible bytes, without copying or decoding.
     #[inline]
     pub fn as_slice(&self) -> &[u8] {
-        &self.0.bytes[self.0.range.clone()]
+        match &self.0 {
+            Repr::Owned(bytes) => bytes,
+            Repr::Shared(storage) => &storage.bytes[storage.range.clone()],
+        }
     }
 
     /// The visible byte count. The checked range makes constructing a slice
     /// unnecessary when only its length is needed for budget accounting.
     #[inline]
     pub fn len(&self) -> usize {
-        self.0.range.end - self.0.range.start
+        match &self.0 {
+            Repr::Owned(bytes) => bytes.len(),
+            Repr::Shared(storage) => storage.range.end - storage.range.start,
+        }
     }
 
     /// Whether the visible byte range is empty.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.0.range.is_empty()
+        self.len() == 0
     }
 
     /// Retain only the visible byte allocation. Partial views copy their bytes;
@@ -73,11 +86,7 @@ impl PdfStreamData {
     /// bytes, including views made with [`Self::from_shared`]. This does not
     /// guarantee unique ownership or a different allocation identity.
     pub fn into_detached(self) -> Self {
-        if self.is_whole() {
-            self
-        } else {
-            Self::from(self.as_slice())
-        }
+        Self::from(self.into_arc())
     }
 
     /// An independent copy of this view, sharing storage when already detached.
@@ -88,13 +97,18 @@ impl PdfStreamData {
     /// Convert to the former stream-data type. Whole allocations are reused;
     /// partial views copy exactly their visible bytes, never the whole file.
     pub fn into_arc(self) -> Arc<[u8]> {
-        if self.is_whole() {
-            match Arc::try_unwrap(self.0) {
-                Ok(storage) => storage.bytes,
-                Err(storage) => Arc::clone(&storage.bytes),
+        match self.0 {
+            Repr::Owned(bytes) => bytes,
+            Repr::Shared(storage) => {
+                if storage.range.start == 0 && storage.range.end == storage.bytes.len() {
+                    match Arc::try_unwrap(storage) {
+                        Ok(storage) => storage.bytes,
+                        Err(storage) => Arc::clone(&storage.bytes),
+                    }
+                } else {
+                    Arc::from(&storage.bytes[storage.range.clone()])
+                }
             }
-        } else {
-            Arc::from(self.as_slice())
         }
     }
 
@@ -104,13 +118,13 @@ impl PdfStreamData {
     /// This is a logical cache charge, not the complete backing-file size.
     #[inline]
     pub fn cache_bytes(&self) -> u64 {
+        let descriptor = match &self.0 {
+            Repr::Owned(_) => 0,
+            Repr::Shared(_) => std::mem::size_of::<Storage>() as u64,
+        };
         (self.len() as u64)
-            .saturating_add(std::mem::size_of::<Storage>() as u64)
+            .saturating_add(descriptor)
             .saturating_add(2 * std::mem::size_of::<usize>() as u64)
-    }
-
-    fn is_whole(&self) -> bool {
-        self.0.range.start == 0 && self.0.range.end == self.0.bytes.len()
     }
 }
 
@@ -121,19 +135,21 @@ impl Default for PdfStreamData {
 }
 
 impl From<Arc<[u8]>> for PdfStreamData {
+    #[inline]
     fn from(bytes: Arc<[u8]>) -> Self {
-        let range = 0..bytes.len();
-        Self(Arc::new(Storage { bytes, range }))
+        Self(Repr::Owned(bytes))
     }
 }
 
 impl From<Vec<u8>> for PdfStreamData {
+    #[inline]
     fn from(bytes: Vec<u8>) -> Self {
         Self::from(Arc::<[u8]>::from(bytes))
     }
 }
 
 impl From<&[u8]> for PdfStreamData {
+    #[inline]
     fn from(bytes: &[u8]) -> Self {
         Self::from(Arc::<[u8]>::from(bytes))
     }
@@ -156,7 +172,12 @@ impl AsRef<[u8]> for PdfStreamData {
 
 impl PartialEq for PdfStreamData {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0) || self.as_slice() == other.as_slice()
+        let same = match (&self.0, &other.0) {
+            (Repr::Owned(a), Repr::Owned(b)) => Arc::ptr_eq(a, b),
+            (Repr::Shared(a), Repr::Shared(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        };
+        same || self.as_slice() == other.as_slice()
     }
 }
 impl Eq for PdfStreamData {}
@@ -170,6 +191,11 @@ impl fmt::Debug for PdfStreamData {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn payload_handle_stays_within_the_former_arc_field_size() {
+        assert!(std::mem::size_of::<PdfStreamData>() <= std::mem::size_of::<Arc<[u8]>>());
+    }
 
     #[test]
     fn views_share_bytes_but_only_expose_their_range() {

@@ -189,12 +189,14 @@ fn import_fixture() -> Vec<u8> {
 fn main() {
     let case = std::env::args().nth(1).expect("case");
     let count = match case.as_str() {
-        "small-streams" | "tiny-streams" => 1024,
+        "small-streams" | "tiny-streams" | "owned-streams" => 1024,
         "scalar-objects" => 512,
         _ => 1,
     };
     let input = match case.as_str() {
         "scalar-objects" => scalar_pdf(count),
+        "owned-streams" => b"1024 independent payloads, 128 bytes each".to_vec(),
+        "borrowed-parse" => pdf(&[vec![b'A'; 128]], ""),
         "small-streams" => pdf(&vec![vec![b'A'; 128]; count], ""),
         "tiny-streams" => pdf(&vec![vec![b'A'; 1]; count], ""),
         "imports" => import_fixture(),
@@ -239,7 +241,40 @@ fn main() {
         PdfFile::parse_with_password_and_limits(Arc::clone(&input), b"user", limits.clone())
             .unwrap()
     };
-    if case == "imports" {
+    if case == "owned-streams" {
+        report(
+            &case,
+            &input,
+            64,
+            || {
+                (0..count)
+                    .map(|_| {
+                        PdfObject::Stream(zpdf::PdfStream::new(
+                            zpdf::PdfDict::new(),
+                            vec![b'A'; 128],
+                        ))
+                    })
+                    .collect::<Vec<_>>()
+            },
+            |objects| objects_hash(objects),
+        );
+    } else if case == "borrowed-parse" {
+        let offset = match parse().xref.get(ObjectId(4, 0)).unwrap() {
+            zpdf_parser::XrefEntry::InUse { offset, .. } => *offset as usize,
+            _ => panic!("direct fixture stream"),
+        };
+        report(
+            &case,
+            &input,
+            8192,
+            || {
+                zpdf_parser::ObjectParser::new(&input, &limits)
+                    .parse_indirect_at(offset)
+                    .unwrap()
+            },
+            |object| objects_hash(std::slice::from_ref(object)),
+        );
+    } else if case == "imports" {
         let base = pdf(&[], "");
         report(
             &case,
