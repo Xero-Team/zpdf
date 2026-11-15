@@ -145,6 +145,10 @@ Double Stamped:
 - Check file permissions
 - Ensure disk space available
 - Try closing other apps that may have the file open
+- Check the [save-location requirements](../../docs/guides/user-guide.md#saving-edited-files).
+  Linux filesystems with POSIX ACLs disabled (including `noacl` mounts) are
+  unsupported for saving, even when the file has no custom ACL. The original
+  document remains unchanged when its access policy cannot be preserved.
 
 ## Testing the Feature
 

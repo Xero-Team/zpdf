@@ -52,7 +52,7 @@ fn drawing_admission_respects_budget_and_never_changes_original_ids() {
         font_id: id,
         glyph_id: 0,
     };
-    let needed = (PRIMARY.len() + FALLBACK.len()) as u64;
+    let needed = cache.bytes_used() + FALLBACK.len() as u64;
     assert_eq!(
         cache.resolve_drawing_glyph(original, 255, 255, 1, needed - 1),
         original

@@ -48,14 +48,34 @@ pub struct Type1Font {
 }
 
 impl Type1Font {
-    pub(crate) fn estimated_program_bytes(&self) -> u64 {
-        let charstrings: u64 = self
-            .char_strings
+    pub(crate) fn estimated_cache_bytes(&self) -> u64 {
+        let mut bytes = crate::estimated_map_bytes(&self.char_strings)
+            .saturating_add(crate::estimated_map_bytes(&self.name_to_gid))
+            .saturating_add(crate::allocation_bytes::<Vec<u8>>(self.subrs.capacity()))
+            .saturating_add(crate::allocation_bytes::<Option<String>>(
+                self.builtin_encoding.capacity(),
+            ))
+            .saturating_add(crate::allocation_bytes::<String>(
+                self.gid_to_name.capacity(),
+            ));
+        for (name, data) in &self.char_strings {
+            bytes = bytes
+                .saturating_add(name.capacity() as u64)
+                .saturating_add(data.capacity() as u64);
+        }
+        for data in &self.subrs {
+            bytes = bytes.saturating_add(data.capacity() as u64);
+        }
+        for name in self
+            .builtin_encoding
             .iter()
-            .map(|(name, data)| (name.len() + data.len()) as u64)
-            .sum();
-        let subrs: u64 = self.subrs.iter().map(|data| data.len() as u64).sum();
-        charstrings.saturating_add(subrs)
+            .flatten()
+            .chain(self.gid_to_name.iter())
+            .chain(self.name_to_gid.keys())
+        {
+            bytes = bytes.saturating_add(name.capacity() as u64);
+        }
+        bytes
     }
 
     /// Parse a Type 1 font program. Returns `None` if it does not look like one.

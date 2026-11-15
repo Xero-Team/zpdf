@@ -152,7 +152,8 @@ pub struct WgpuRenderer<'a> {
     image_cache: Option<&'a zpdf_image::ImageCache>,
     max_page_pixels: u64,
     max_gpu_texture_bytes: u64,
-    max_blend_group_depth: usize,
+    /// Content policy for nested Type3 streams and the page geometry budget.
+    parse_limits: ParseLimits,
     page: Option<PageState>,
     /// GPU pass time (nanoseconds) from the most recently completed
     /// `end_page()`, or `None` if timestamp queries are unsupported on this
@@ -173,7 +174,7 @@ impl<'a> WgpuRenderer<'a> {
             image_cache: None,
             max_page_pixels: limits.max_page_pixels,
             max_gpu_texture_bytes: limits.max_gpu_texture_bytes,
-            max_blend_group_depth: limits.max_blend_group_depth as usize,
+            parse_limits: limits,
             page: None,
             last_gpu_time_ns: None,
             gpu_timing_enabled: false,
@@ -192,10 +193,12 @@ impl<'a> WgpuRenderer<'a> {
 
     /// Apply render-time security budgets from the source document. Values are
     /// copied, so this does not extend the renderer's borrow lifetime.
+    /// `max_page_operators` bounds cumulative Type3 replay work in this render
+    /// stage, with a minimum charge of one per child dispatch.
     pub fn with_limits(mut self, limits: &ParseLimits) -> Self {
         self.max_page_pixels = limits.max_page_pixels;
         self.max_gpu_texture_bytes = limits.max_gpu_texture_bytes;
-        self.max_blend_group_depth = limits.max_blend_group_depth as usize;
+        self.parse_limits = limits.clone();
         self
     }
 
@@ -367,7 +370,7 @@ impl<'a> RenderBackend for WgpuRenderer<'a> {
             clear,
             map,
             uniform,
-            recorder: PageRecorder::default().with_max_blend_depth(self.max_blend_group_depth),
+            recorder: PageRecorder::default().with_limits(&self.parse_limits),
         });
         Ok(())
     }
@@ -378,6 +381,10 @@ impl<'a> RenderBackend for WgpuRenderer<'a> {
         let Some(page) = self.page.as_mut() else {
             return Err(WgpuRenderError::NoActivePage);
         };
+        if let Err(error) = page.recorder.ensure_within_budget() {
+            self.page = None;
+            return Err(error);
+        }
         match cmd {
             RenderCommand::FillPath {
                 path,
@@ -492,7 +499,12 @@ impl<'a> RenderBackend for WgpuRenderer<'a> {
             }
             _ => {}
         }
-        Ok(())
+        let result = page.recorder.ensure_within_budget();
+        if result.is_err() {
+            // No partial page may be finalized after a failed child or append.
+            self.page = None;
+        }
+        result
     }
 
     fn end_page(&mut self) -> Result<Self::Target, Self::Error> {
@@ -530,6 +542,7 @@ impl<'a> WgpuRenderer<'a> {
         let ctx = self.ctx.as_ref().ok_or(WgpuRenderError::NotInitialized)?;
         let mut page = self.page.take().ok_or(WgpuRenderError::NoActivePage)?;
         let device = &ctx.device;
+        page.recorder.ensure_within_budget()?;
         page.recorder.close_open_blends();
 
         // Fullscreen quad: needed for clip rebuild (ResetStencil) and blend composites.
@@ -540,13 +553,12 @@ impl<'a> WgpuRenderer<'a> {
         // before or after `batch::batch_ops` below.
         let has_blend_groups = page.recorder.has_blend_groups();
         let fs_range = if needs_fs {
-            Some(
-                page.recorder
-                    .append_fullscreen(page.uniform.w_px, page.uniform.h_px),
-            )
+            page.recorder
+                .append_fullscreen(page.uniform.w_px, page.uniform.h_px)
         } else {
             None
         };
+        page.recorder.ensure_within_budget()?;
 
         // Collapse consecutive same-state ops into single draw_indexed calls
         // (P3.7). Must happen before `rec` borrows `page.recorder` below (this
@@ -898,6 +910,9 @@ fn record_dl_commands(
 ) {
     use zpdf_display_list::Paint;
     for cmd in &dl.commands {
+        if !rec.can_record() {
+            return;
+        }
         match cmd {
             RenderCommand::FillPath {
                 path,
@@ -1528,12 +1543,68 @@ mod resource_tests {
             max_page_pixels: 123,
             max_gpu_texture_bytes: 456,
             max_blend_group_depth: 7,
+            max_page_operators: 8,
+            max_operand_stack_depth: 9,
+            max_gpu_geometry_bytes: 10,
             ..ParseLimits::default()
         };
         let renderer = WgpuRenderer::new().with_limits(&limits);
         assert_eq!(renderer.max_page_pixels, 123);
         assert_eq!(renderer.max_gpu_texture_bytes, 456);
-        assert_eq!(renderer.max_blend_group_depth, 7);
+        assert_eq!(renderer.parse_limits.max_blend_group_depth, 7);
+        assert_eq!(renderer.parse_limits.max_page_operators, 8);
+        assert_eq!(renderer.parse_limits.max_operand_stack_depth, 9);
+        assert_eq!(renderer.parse_limits.max_gpu_geometry_bytes, 10);
+    }
+
+    #[test]
+    fn failed_geometry_admission_discards_the_active_page_without_a_gpu() {
+        let limits = ParseLimits {
+            max_gpu_geometry_bytes: 0,
+            ..ParseLimits::default()
+        };
+        let mut renderer = WgpuRenderer::new().with_limits(&limits);
+        // Recording itself does not require a device. Install only its small
+        // page state to exercise the public execute/error-cleanup path.
+        renderer.page = Some(PageState {
+            width: 1,
+            height: 1,
+            clear: wgpu::Color {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+                a: 1.0,
+            },
+            map: PageMap::new(Rect::new(0.0, 0.0, 1.0, 1.0), 1.0),
+            uniform: PageUniform {
+                w_px: 1.0,
+                h_px: 1.0,
+                scale: 1.0,
+                page_height: 1.0,
+            },
+            recorder: PageRecorder::default().with_limits(&limits),
+        });
+        let mut path = zpdf_display_list::Path::new();
+        path.move_to(zpdf_core::Point::new(0.0, 0.0));
+        path.line_to(zpdf_core::Point::new(1.0, 0.0));
+        path.line_to(zpdf_core::Point::new(0.0, 1.0));
+        path.close();
+        let error = renderer
+            .execute(&RenderCommand::FillPath {
+                path,
+                rule: zpdf_display_list::FillRule::NonZero,
+                paint: Paint::Solid(Color::black()),
+                alpha: 1.0,
+                overprint: None,
+            })
+            .unwrap_err();
+        assert!(matches!(error, WgpuRenderError::Unsupported(_)));
+        assert!(renderer.page.is_none());
+        assert!(renderer.ctx.is_none());
+        assert!(matches!(
+            renderer.execute(&RenderCommand::PopClip),
+            Err(WgpuRenderError::NoActivePage)
+        ));
     }
 
     #[test]

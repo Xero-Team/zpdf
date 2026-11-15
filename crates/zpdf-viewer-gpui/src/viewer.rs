@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::fs::File;
 
 use gpui::{
     div, img, prelude::*, px, rgb, App, Context, FocusHandle, Focusable, FontWeight,
@@ -17,6 +16,7 @@ use crate::actions::{
     SaveEdits, ToggleInkMode, ToggleSelectMode, ZoomIn, ZoomOut,
 };
 use crate::document::{load_document, DocumentError, LoadedDocument, PagePreview, PageSummary};
+use crate::save_temp::SaveTemp;
 
 const PREVIEW_DPI: f32 = 144.0;
 const MIN_ZOOM: f32 = 0.35;
@@ -426,15 +426,11 @@ impl Viewer {
         // Add the annotation
         writer.add_ink_annotation_to_page(self.current_page, annot_dict, appearance)?;
 
-        // Write to temporary file
-        let temp_path = self.document.summary.path.with_extension("pdf.tmp");
-        let mut temp_file = File::create(&temp_path)?;
-        writer.write(&mut temp_file)?;
-        temp_file.sync_all()?;
-        drop(temp_file);
-
-        // Atomic rename
-        std::fs::rename(&temp_path, &self.document.summary.path)?;
+        // Write to a fresh sibling file, then atomically replace the original.
+        let mut temp_file = SaveTemp::new(&self.document.summary.path)?;
+        writer.write(temp_file.file_mut())?;
+        temp_file.file_mut().sync_all()?;
+        temp_file.commit()?;
 
         Ok(())
     }
@@ -504,8 +500,7 @@ impl Viewer {
         }
 
         // Write to temporary file
-        let temp_path = self.document.summary.path.with_extension("pdf.tmp");
-        let mut temp_file = match File::create(&temp_path) {
+        let mut temp_file = match SaveTemp::new(&self.document.summary.path) {
             Ok(f) => f,
             Err(e) => {
                 self.last_error = Some(format!("Failed to create temp file: {}", e));
@@ -514,21 +509,19 @@ impl Viewer {
             }
         };
 
-        if let Err(e) = writer.write(&mut temp_file) {
+        if let Err(e) = writer.write(temp_file.file_mut()) {
             self.last_error = Some(format!("Failed to write: {}", e));
             cx.notify();
             return;
         }
 
-        if let Err(e) = temp_file.sync_all() {
+        if let Err(e) = temp_file.file_mut().sync_all() {
             self.last_error = Some(format!("Failed to sync: {}", e));
             cx.notify();
             return;
         }
-        drop(temp_file);
-
         // Atomic rename
-        if let Err(e) = std::fs::rename(&temp_path, &self.document.summary.path) {
+        if let Err(e) = temp_file.commit() {
             self.last_error = Some(format!("Failed to rename: {}", e));
             cx.notify();
             return;
@@ -885,8 +878,7 @@ impl Viewer {
         }
 
         // Write to temp file
-        let temp_path = self.document.summary.path.with_extension("pdf.tmp");
-        let mut temp_file = match File::create(&temp_path) {
+        let mut temp_file = match SaveTemp::new(&self.document.summary.path) {
             Ok(f) => f,
             Err(e) => {
                 self.last_error = Some(format!("Failed to create temp file: {}", e));
@@ -895,21 +887,19 @@ impl Viewer {
             }
         };
 
-        if let Err(e) = writer.write(&mut temp_file) {
+        if let Err(e) = writer.write(temp_file.file_mut()) {
             self.last_error = Some(format!("Failed to write: {}", e));
             cx.notify();
             return;
         }
 
-        if let Err(e) = temp_file.sync_all() {
+        if let Err(e) = temp_file.file_mut().sync_all() {
             self.last_error = Some(format!("Failed to sync: {}", e));
             cx.notify();
             return;
         }
-        drop(temp_file);
-
         // Atomic rename
-        if let Err(e) = std::fs::rename(&temp_path, &self.document.summary.path) {
+        if let Err(e) = temp_file.commit() {
             self.last_error = Some(format!("Failed to rename: {}", e));
             cx.notify();
             return;

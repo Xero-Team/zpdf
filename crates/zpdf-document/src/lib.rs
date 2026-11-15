@@ -47,7 +47,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use zpdf_core::{Error, ObjectId, ParseLimits, PdfObject, Result};
-use zpdf_font::{FontCache, LoadedFont};
+use zpdf_font::{FontCache, FontCacheBudget, LoadedFont};
 use zpdf_parser::PdfFile;
 
 pub struct PdfDocument {
@@ -77,7 +77,7 @@ pub struct PdfDocument {
 #[derive(Default)]
 pub(crate) struct SharedFonts {
     fonts: HashMap<ObjectId, Arc<LoadedFont>>,
-    bytes: u64,
+    budget: FontCacheBudget,
     generation: Option<u64>,
 }
 
@@ -89,11 +89,10 @@ impl SharedFonts {
         if self.generation != generation {
             self.fonts
                 .retain(|_, font| !font.is_substitute && font.has_font_data());
-            self.bytes = self
-                .fonts
-                .values()
-                .map(|font| font.estimated_cache_bytes())
-                .sum();
+            let mut budget = FontCacheBudget::default();
+            self.fonts
+                .retain(|_, font| budget.try_admit(font, u64::MAX));
+            self.budget = budget;
             self.generation = generation;
         }
     }
@@ -112,10 +111,11 @@ impl SharedFonts {
         font: LoadedFont,
         max_bytes: u64,
     ) -> Arc<LoadedFont> {
+        if let Some(existing) = self.get(id) {
+            return existing;
+        }
         let font = Arc::new(font);
-        let bytes = font.estimated_cache_bytes();
-        if self.bytes.saturating_add(bytes) <= max_bytes {
-            self.bytes += bytes;
+        if self.budget.try_admit(&font, max_bytes) {
             self.fonts.insert(id, Arc::clone(&font));
         }
         font
@@ -464,6 +464,33 @@ impl PdfDocument {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn document_cache_charges_mappings_while_sharing_programs() {
+        let data: Arc<[u8]> = Arc::from(&b"program"[..]);
+        let make_font = || {
+            let mut font = LoadedFont::new_placeholder("Mapping".into());
+            font.font_data = Some(Arc::clone(&data));
+            font.to_unicode = Some(zpdf_font::cmap::ToUnicodeMap::parse(
+                b"1 beginbfchar <41> <0041> endbfchar",
+            ));
+            font
+        };
+        let first_cost = make_font().estimated_cache_bytes();
+        let total = first_cost * 2 - data.len() as u64;
+        let mut shared = SharedFonts::default();
+        shared.admit(ObjectId(1, 0), make_font(), first_cost - 1);
+        assert!(shared.get(ObjectId(1, 0)).is_none());
+        let first = shared.admit(ObjectId(1, 0), make_font(), first_cost);
+        assert!(Arc::ptr_eq(&first, &shared.get(ObjectId(1, 0)).unwrap()));
+        shared.admit(ObjectId(2, 0), make_font(), total - 1);
+        assert!(shared.get(ObjectId(2, 0)).is_none());
+        shared.admit(ObjectId(2, 0), make_font(), total);
+        assert_eq!(shared.budget.bytes_used(), total);
+        shared.refresh_provider(Some(1));
+        assert_eq!(shared.fonts.len(), 2);
+        assert_eq!(shared.budget.bytes_used(), total);
+    }
 
     #[test]
     fn combined_page_content_respects_decode_limit() {

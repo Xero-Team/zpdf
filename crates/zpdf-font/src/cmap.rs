@@ -44,6 +44,15 @@ pub struct ToUnicodeMap {
 }
 
 impl ToUnicodeMap {
+    pub(crate) fn estimated_cache_bytes(&self) -> u64 {
+        let bytes = crate::estimated_map_bytes(&self.map)
+            .saturating_add(crate::estimated_map_bytes(&self.padded_lengths))
+            .saturating_add(self.code_lengths.capacity() as u64);
+        self.map.values().fold(bytes, |sum, text| {
+            sum.saturating_add(text.capacity() as u64)
+        })
+    }
+
     /// Parse a decoded ToUnicode CMap.
     ///
     /// `data` is the decoded stream content (the bytes between/inside
@@ -442,6 +451,14 @@ pub struct CidCMap {
 }
 
 impl CidCMap {
+    pub(crate) fn estimated_cache_bytes(&self) -> u64 {
+        crate::allocation_bytes::<(u8, u32, u32)>(self.codespace.capacity())
+            .saturating_add(crate::allocation_bytes::<RangeSegment>(
+                self.cid_ranges.capacity(),
+            ))
+            .saturating_add(crate::estimated_map_bytes(&self.cid_chars))
+    }
+
     pub fn identity(wmode: u8) -> Self {
         Self {
             wmode,

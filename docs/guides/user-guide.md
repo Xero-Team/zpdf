@@ -416,6 +416,31 @@ This version rasterizes bitmap previews for pages and provides basic page
 navigation plus zoom controls. It is still intentionally small in scope: no
 search, annotations, or advanced continuous-scroll behavior yet.
 
+#### Saving edited files
+
+The GPUI viewer saves through a temporary file in the destination directory.
+On Unix, replacing an existing regular file requires preserving its owner,
+group, access ACL and mode. If the current account cannot restore that policy,
+the save fails before replacing the original document.
+
+Supported save locations have these requirements:
+
+- **Linux:** the filesystem must support POSIX access ACL operations. Mounts
+  with ACLs disabled (for example, ext4 mounted with `noacl`) and filesystems
+  that report unsupported ACL operations are **not supported for saving**,
+  including when the destination has no custom ACL. Reading a document from
+  such a location is still allowed.
+- **macOS:** existing destination ACLs are preserved, but the directory must
+  not add inherited ACL entries to new files. Such directories cause saving
+  to fail before document data is written to the temporary file.
+- **FreeBSD:** ACLs must be equivalent to ordinary file permissions, or the
+  filesystem must explicitly report that both supported ACL types are disabled.
+  Nontrivial ACLs are unsupported for saving.
+- Other Unix platforms are currently unsupported for saving.
+
+If a location is unsupported, use a document copy in a directory meeting these
+requirements and check that saving succeeds before relying on the edited copy.
+
 ## DPI, sizes, and coordinates
 
 PDF pages are measured in points (1 pt = 1/72 inch). The rendered pixel dimensions are

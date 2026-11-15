@@ -30,8 +30,8 @@ pub fn scan_all_objects(data: &[u8], limits: &ParseLimits) -> Result<(XrefTable,
         table.insert_overwrite(id, XrefEntry::InUse { offset, gen: id.1 });
     }
 
-    // Recovery NEVER fails once objects were found: even with no discoverable
-    // catalog we return a (possibly Root-less) trailer so the file opens, and
+    // Once a bounded object table is built, a missing catalog is not fatal:
+    // return a (possibly Root-less) trailer so the file opens, and
     // the document layer then scans for /Type /Page objects to build the page
     // list. This is what lets headerless / catalog-less fragments render.
     let trailer = recover_trailer(data, &headers, &table, limits, catalog.map(|(id, _)| id));
@@ -63,8 +63,9 @@ fn build_object_table(
         return Err(Error::InvalidXref(0));
     }
 
-    // Optional, recommended: index members of any /ObjStm we found. Never fatal.
-    index_objstm_members(data, &mut table, limits);
+    // Invalid containers remain optional; exhausting the aggregate object
+    // budget is fatal just as it is during the direct-header scan.
+    index_objstm_members(data, &mut table, limits)?;
     Ok((headers, table))
 }
 
@@ -447,8 +448,9 @@ impl RecoveredObjStm {
 }
 
 /// For each recovered /Type /ObjStm object, decode it and add Compressed entries
-/// for members not already present as direct objects. Never fatal.
-fn index_objstm_members(data: &[u8], table: &mut XrefTable, limits: &ParseLimits) {
+/// for members not already present as direct objects. Invalid containers are
+/// skipped, but the aggregate direct-plus-compressed object limit is enforced.
+fn index_objstm_members(data: &[u8], table: &mut XrefTable, limits: &ParseLimits) -> Result<()> {
     use crate::filters;
     let parser = ObjectParser::new(data, limits);
     // Snapshot direct stream ids first (avoid mutating while iterating).
@@ -508,6 +510,9 @@ fn index_objstm_members(data: &[u8], table: &mut XrefTable, limits: &ParseLimits
             let member_id = ObjectId(member_num, 0);
             // Direct objects already found by tail-scan take precedence.
             if table.get(member_id).is_none() {
+                if table.len() >= limits.max_objects as usize {
+                    return Err(Error::InvalidXref(0));
+                }
                 table.insert_overwrite(
                     member_id,
                     XrefEntry::Compressed {
@@ -518,6 +523,7 @@ fn index_objstm_members(data: &[u8], table: &mut XrefTable, limits: &ParseLimits
             }
         }
     }
+    Ok(())
 }
 
 fn is_whitespace(b: u8) -> bool {
@@ -581,7 +587,26 @@ mod tests {
                 b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
             );
             d.extend_from_slice(b"startxref\n99999\n%%EOF\n");
-            let (table, trailer) = scan_all_objects(&d, &ParseLimits::default()).unwrap();
+            let limits = ParseLimits {
+                max_objects: 4, // Two direct objects plus two compressed members.
+                ..ParseLimits::default()
+            };
+            let (table, trailer) = scan_all_objects(&d, &limits).unwrap();
+            assert_eq!(table.len(), 4);
+            assert_eq!(scan_object_table(&d, &limits).unwrap().len(), 4);
+            let smaller = ParseLimits {
+                max_objects: 3,
+                ..limits
+            };
+            assert!(matches!(
+                scan_all_objects(&d, &smaller),
+                Err(Error::InvalidXref(0))
+            ));
+            assert!(matches!(
+                scan_object_table(&d, &smaller),
+                Err(Error::InvalidXref(0))
+            ));
+            assert!(PdfFile::parse_with_limits(d.clone(), smaller).is_err());
             assert_eq!(trailer.get_ref("Root").unwrap(), ObjectId(1, 0), "/N {n}");
             assert!(matches!(
                 table.get(ObjectId(2, 0)),

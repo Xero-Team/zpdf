@@ -21,6 +21,17 @@ use std::sync::Arc;
 
 pub type FontId = u32;
 
+fn allocation_bytes<T>(capacity: usize) -> u64 {
+    (capacity as u64).saturating_mul(std::mem::size_of::<T>() as u64)
+}
+
+/// Conservative reserved-table estimate including bucket/control overhead.
+fn estimated_map_bytes<K, V>(map: &HashMap<K, V>) -> u64 {
+    (map.capacity() as u64)
+        .saturating_mul((std::mem::size_of::<(K, V)>() as u64).saturating_add(1))
+        .saturating_mul(2)
+}
+
 pub use pack::{FontPack, FontPackFormat, FontPackLimits};
 pub use provider::{
     FontCharacter, FontProvider, FontProviderLimits, RegisteredFontId, RegisteredFontPackId,
@@ -107,6 +118,10 @@ impl CidWidths {
     pub fn get_v(&self, cid: u16) -> Option<(f64, f64, f64)> {
         self.v_metrics.get(&cid).copied()
     }
+
+    fn estimated_cache_bytes(&self) -> u64 {
+        estimated_map_bytes(&self.widths).saturating_add(estimated_map_bytes(&self.v_metrics))
+    }
 }
 
 /// A loaded font with embedded TrueType/CFF data.
@@ -178,24 +193,81 @@ pub enum PdfFontType {
 }
 
 impl LoadedFont {
-    /// Retained font-program bytes used for cache admission accounting.
+    /// Estimated retained font programs and owned mapping/table storage.
+    /// Shared program buffers count once within this font. Cache admission
+    /// additionally deduplicates programs and identical `Arc<LoadedFont>`s
+    /// across fonts. This is not a total allocator/process-memory measure.
     pub fn estimated_cache_bytes(&self) -> u64 {
-        if let Some(data) = &self.font_data {
-            return data.len() as u64;
-        }
-        if let Some(font) = &self.type1 {
-            return font.estimated_program_bytes();
-        }
-        match &self.font_type {
-            PdfFontType::Type3 { char_procs, .. } => {
-                char_procs.values().map(|stream| stream.len() as u64).sum()
-            }
-            _ => 0,
-        }
+        let mut seen = HashSet::new();
+        self.shared_programs()
+            .fold(self.estimated_owned_cache_bytes(), |sum, data| {
+                if seen.insert(data.as_ptr() as usize) {
+                    sum.saturating_add(data.len() as u64)
+                } else {
+                    sum
+                }
+            })
     }
 
-    fn shared_program_key(&self) -> Option<usize> {
-        self.font_data.as_ref().map(|data| data.as_ptr() as usize)
+    fn shared_programs(&self) -> impl Iterator<Item = &Arc<[u8]>> {
+        let char_procs = match &self.font_type {
+            PdfFontType::Type3 { char_procs, .. } => Some(char_procs.values()),
+            _ => None,
+        };
+        self.font_data
+            .iter()
+            .chain(char_procs.into_iter().flatten())
+    }
+
+    fn estimated_owned_cache_bytes(&self) -> u64 {
+        let mut bytes = self.cid_widths.estimated_cache_bytes();
+        for map in [&self.cid_to_gid, &self.builtin_encoding_gids]
+            .into_iter()
+            .flatten()
+        {
+            bytes = bytes.saturating_add(estimated_map_bytes(map));
+        }
+        bytes = bytes
+            .saturating_add(allocation_bytes::<u16>(self.orphan_gids.capacity()))
+            .saturating_add(allocation_bytes::<([u8; 4], f32)>(
+                self.variations.capacity(),
+            ))
+            .saturating_add(
+                self.encoding
+                    .as_ref()
+                    .map_or(0, encoding::Encoding::estimated_cache_bytes),
+            )
+            .saturating_add(
+                self.to_unicode
+                    .as_ref()
+                    .map_or(0, cmap::ToUnicodeMap::estimated_cache_bytes),
+            )
+            .saturating_add(
+                self.cid_cmap
+                    .as_ref()
+                    .map_or(0, cmap::CidCMap::estimated_cache_bytes),
+            )
+            .saturating_add(
+                self.type1
+                    .as_ref()
+                    .map_or(0, type1::Type1Font::estimated_cache_bytes),
+            );
+        if let PdfFontType::Type3 {
+            char_procs,
+            encoding,
+            widths,
+            ..
+        } = &self.font_type
+        {
+            bytes = bytes
+                .saturating_add(estimated_map_bytes(char_procs))
+                .saturating_add(allocation_bytes::<String>(encoding.capacity()))
+                .saturating_add(allocation_bytes::<f64>(widths.capacity()));
+            for name in char_procs.keys().chain(encoding.iter()) {
+                bytes = bytes.saturating_add(name.capacity() as u64);
+            }
+        }
+        bytes
     }
 
     pub fn new_with_data(
@@ -1935,6 +2007,55 @@ fn wrap_cff_in_otf(cff_data: &[u8]) -> Vec<u8> {
     buf
 }
 
+/// Shared admission accounting for the page and document font stores.
+/// Owners must retain admitted fonts until this accounting is dropped or
+/// rebuilt; removing fonts without rebuilding would leave stale identities.
+#[doc(hidden)]
+#[derive(Default)]
+pub struct FontCacheBudget {
+    bytes: u64,
+    fonts: HashSet<usize>,
+    programs: HashSet<usize>,
+}
+
+impl FontCacheBudget {
+    fn admission_total(&self, font: &Arc<LoadedFont>, max_bytes: u64) -> Option<u64> {
+        let mut added = 0u64;
+        if !self.fonts.contains(&(Arc::as_ptr(font) as usize)) {
+            added = font.estimated_owned_cache_bytes();
+            let mut seen = HashSet::new();
+            for data in font.shared_programs() {
+                let key = data.as_ptr() as usize;
+                if !self.programs.contains(&key) && seen.insert(key) {
+                    added = added.checked_add(data.len() as u64)?;
+                }
+            }
+        }
+        self.bytes
+            .checked_add(added)
+            .filter(|&total| total <= max_bytes)
+    }
+
+    fn record(&mut self, font: &Arc<LoadedFont>, total: u64) {
+        self.fonts.insert(Arc::as_ptr(font) as usize);
+        self.programs
+            .extend(font.shared_programs().map(|data| data.as_ptr() as usize));
+        self.bytes = total;
+    }
+
+    pub fn try_admit(&mut self, font: &Arc<LoadedFont>, max_bytes: u64) -> bool {
+        let Some(total) = self.admission_total(font, max_bytes) else {
+            return false;
+        };
+        self.record(font, total);
+        true
+    }
+
+    pub fn bytes_used(&self) -> u64 {
+        self.bytes
+    }
+}
+
 /// Page/display-list font store keyed by [`FontId`].
 ///
 /// Entries are intentionally stable for the lifetime of the store: display
@@ -1945,8 +2066,7 @@ pub struct FontCache {
     fonts: HashMap<FontId, Arc<LoadedFont>>,
     name_to_id: HashMap<String, FontId>,
     next_id: FontId,
-    bytes_used: u64,
-    shared_programs: HashSet<usize>,
+    budget: FontCacheBudget,
     provider: Option<Arc<FontProvider>>,
     resolution: Option<Box<resolution::ResolutionCache>>,
 }
@@ -1963,8 +2083,7 @@ impl FontCache {
             fonts: HashMap::with_capacity(capacity),
             name_to_id: HashMap::with_capacity(capacity),
             next_id: 0,
-            bytes_used: 0,
-            shared_programs: HashSet::with_capacity(capacity),
+            budget: FontCacheBudget::default(),
             provider: None,
             resolution: None,
         }
@@ -2020,8 +2139,9 @@ impl FontCache {
     }
 
     /// Admit a font without evicting any existing ID. Shared `Arc` font files
-    /// (notably multiple TTC faces) are charged once. Returns `None` when the
-    /// retained-program byte limit would be exceeded or no ID remains.
+    /// (notably multiple TTC faces) are charged once; independently owned
+    /// mappings count for each font. Aliases of one `Arc<LoadedFont>` count
+    /// once. Returns `None` when the parsed-font budget or ID space is exhausted.
     pub fn try_insert_with_limit(
         &mut self,
         name: String,
@@ -2042,22 +2162,9 @@ impl FontCache {
             return Some(existing_id);
         }
 
-        let program_key = font.shared_program_key();
-        let added_bytes = if program_key.is_some_and(|key| self.shared_programs.contains(&key)) {
-            0
-        } else {
-            font.estimated_cache_bytes()
-        };
-        let new_total = self.bytes_used.checked_add(added_bytes)?;
-        if new_total > max_bytes {
-            return None;
-        }
-
+        let new_total = self.budget.admission_total(&font, max_bytes)?;
         let id = self.next_free_id()?;
-        if let Some(key) = program_key {
-            self.shared_programs.insert(key);
-        }
-        self.bytes_used = new_total;
+        self.budget.record(&font, new_total);
         self.name_to_id.insert(name, id);
         self.fonts.insert(id, font);
         Some(id)
@@ -2085,9 +2192,9 @@ impl FontCache {
         self.fonts.is_empty()
     }
 
-    /// Total unique font-program bytes retained by this store.
+    /// Estimated retained programs and mappings, accounting for shared ownership.
     pub fn bytes_used(&self) -> u64 {
-        self.bytes_used
+        self.budget.bytes_used()
     }
 }
 
@@ -2446,6 +2553,76 @@ mod tests {
         assert_eq!(last, u32::MAX);
         assert_eq!(zero, 0);
         assert!(cache.get(last).is_some() && cache.get(zero).is_some());
+    }
+
+    #[test]
+    fn mapping_storage_is_charged_per_font_but_not_per_alias() {
+        let data: Arc<[u8]> = Arc::from(vec![0u8; 8]);
+        let make_font = || {
+            let mut font = LoadedFont::new_placeholder("Mapping".into());
+            font.font_data = Some(Arc::clone(&data));
+            font.to_unicode = Some(cmap::ToUnicodeMap::parse(
+                b"1 beginbfchar <41> <0041> endbfchar",
+            ));
+            Arc::new(font)
+        };
+        let first = make_font();
+        let first_cost = first.estimated_cache_bytes();
+        assert!(first_cost > data.len() as u64);
+        let second = make_font();
+        let total = first_cost + second.estimated_cache_bytes() - data.len() as u64;
+        let mut cache = FontCache::new();
+        assert_eq!(
+            cache.try_insert_shared_with_limit("A".into(), Arc::clone(&first), first_cost - 1),
+            None
+        );
+        assert_eq!(
+            cache.try_insert_shared_with_limit("A".into(), Arc::clone(&first), first_cost),
+            Some(0)
+        );
+        assert_eq!(
+            cache.try_insert_shared_with_limit("Alias".into(), first, first_cost),
+            Some(1)
+        );
+        assert_eq!(cache.bytes_used(), first_cost);
+        assert_eq!(
+            cache.try_insert_shared_with_limit("B".into(), Arc::clone(&second), total - 1),
+            None
+        );
+        assert_eq!(
+            cache.try_insert_shared_with_limit("B".into(), second, total),
+            Some(2)
+        );
+        assert_eq!(cache.bytes_used(), total);
+
+        let mut mapping_only = LoadedFont::new_placeholder("NoProgram".into());
+        mapping_only.to_unicode = Some(cmap::ToUnicodeMap::parse(
+            b"1 beginbfchar <41> <0041> endbfchar",
+        ));
+        let cost = mapping_only.estimated_cache_bytes();
+        assert!(cost > 0);
+        let mut cache = FontCache::new();
+        assert_eq!(
+            cache.try_insert_with_limit("F".into(), mapping_only, cost - 1),
+            None
+        );
+    }
+
+    #[test]
+    fn type3_shared_charprocs_count_program_bytes_once() {
+        let data: Arc<[u8]> = Arc::from(&b"q Q"[..]);
+        let mut font = LoadedFont::new_placeholder("Type3".into());
+        font.font_type = PdfFontType::Type3 {
+            font_matrix: [0.001, 0.0, 0.0, 0.001, 0.0, 0.0],
+            char_procs: HashMap::from([("A".into(), Arc::clone(&data)), ("B".into(), data)]),
+            encoding: vec!["A".into(), "B".into()],
+            widths: vec![500.0, 500.0],
+            first_char: 0,
+        };
+        assert_eq!(
+            font.estimated_cache_bytes(),
+            font.estimated_owned_cache_bytes() + 3
+        );
     }
 
     #[test]

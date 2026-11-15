@@ -240,15 +240,16 @@ impl Pdf {
 /// A mutable PDF editor wrapping an [`zpdf_writer::IncrementalWriter`]. Open a
 /// document, queue any number of edits (page ops, metadata, stamps,
 /// annotations, redaction, form fill, merge), then call [`PdfEditor::save`] to
-/// serialize them as **one incremental update** (the original bytes plus the
-/// new revision — the smallest possible output, matching the CLI's
-/// composition). Page indices are 0-based (JS convention; the CLI is 1-based).
+/// serialize them as one incremental update, or as a fresh document after
+/// redaction so superseded content is not returned to the caller. Page indices
+/// are 0-based (JS convention; the CLI is 1-based).
 ///
 /// `split_pages` and `optimize` are one-shot free functions instead — they
 /// fully rewrite or extract, so they don't fit the incremental-editor model.
 #[wasm_bindgen]
 pub struct PdfEditor {
     writer: zpdf_writer::IncrementalWriter,
+    requires_rewrite: bool,
 }
 
 /// Host-testable core: serialize a writer's pending edits to a byte vec.
@@ -256,10 +257,53 @@ pub struct PdfEditor {
 /// both on wasm32 and on the host.)
 pub(crate) fn editor_save_bytes(
     writer: &zpdf_writer::IncrementalWriter,
-) -> std::io::Result<Vec<u8>> {
+    requires_rewrite: bool,
+) -> zpdf::Result<Vec<u8>> {
+    // A default rewrite drops encryption. The browser has no output-encryption
+    // options, so it must never silently change that policy after redaction.
+    if requires_rewrite && writer.document().is_encrypted() {
+        return Err(encrypted_redaction_error());
+    }
     let mut cur = std::io::Cursor::new(Vec::new());
     writer.write(&mut cur)?;
-    Ok(cur.into_inner())
+    if !requires_rewrite {
+        return Ok(cur.into_inner());
+    }
+    let current = zpdf::PdfFile::parse_with_limits(
+        cur.into_inner(),
+        writer.document().file().limits().clone(),
+    )?;
+    zpdf_writer::rewrite_pdf(&current, &zpdf_writer::RewriteOptions::default())
+}
+
+fn encrypted_redaction_error() -> zpdf::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "browser redaction of encrypted PDFs requires an explicit output encryption policy; use the native writer",
+    )
+    .into()
+}
+
+impl PdfEditor {
+    /// Keep the lifecycle and failure policy testable without constructing a
+    /// JavaScript exception on the native test target.
+    fn redact_core(
+        &mut self,
+        page: usize,
+        rects: &[zpdf::Rect],
+        options: &zpdf_writer::RedactOptions,
+    ) -> zpdf::Result<()> {
+        let page = self.writer.page_index_at(page)?;
+        if !rects.is_empty() {
+            if self.writer.document().is_encrypted() {
+                return Err(encrypted_redaction_error());
+            }
+            // Mark before the writer can queue edits, including an operation
+            // that later fails. A subsequent save must not expose old bytes.
+            self.requires_rewrite = true;
+        }
+        self.writer.redact_page(page, rects, options)
+    }
 }
 
 /// Host-testable core: chunk a flat `[x0,y0,x1,y1, …]` into `Rect`s. Returns a
@@ -331,7 +375,10 @@ impl PdfEditor {
     /// Open a PDF for editing (empty-password encrypted files open too).
     pub fn open(data: &[u8]) -> Result<PdfEditor, JsError> {
         let writer = zpdf_writer::IncrementalWriter::new(data.to_vec()).map_err(js_err)?;
-        Ok(PdfEditor { writer })
+        Ok(PdfEditor {
+            writer,
+            requires_rewrite: false,
+        })
     }
 
     /// Open an encrypted PDF with a user or owner password.
@@ -339,7 +386,10 @@ impl PdfEditor {
         let writer =
             zpdf_writer::IncrementalWriter::new_with_password(data.to_vec(), password.as_bytes())
                 .map_err(js_err)?;
-        Ok(PdfEditor { writer })
+        Ok(PdfEditor {
+            writer,
+            requires_rewrite: false,
+        })
     }
 
     #[wasm_bindgen(getter)]
@@ -347,9 +397,10 @@ impl PdfEditor {
         self.writer.page_count()
     }
 
-    /// Serialize all queued edits as one incremental update → `Uint8Array`.
+    /// Serialize all queued edits → `Uint8Array`. After redaction, rewrite
+    /// the current object graph to remove superseded unredacted revisions.
     pub fn save(&self) -> Result<Vec<u8>, JsError> {
-        editor_save_bytes(&self.writer).map_err(js_err)
+        editor_save_bytes(&self.writer, self.requires_rewrite).map_err(js_err)
     }
 
     // — page operations ————————————————————————————————————————————————
@@ -735,7 +786,9 @@ impl PdfEditor {
 
     /// Redact regions of a page: `rects` is a flat `[x0,y0,x1,y1, …]` array;
     /// `fill` is an optional `[r,g,b]` cover colour (pass `null` to remove
-    /// content without painting a box).
+    /// content without painting a box). `save()` subsequently rewrites the
+    /// document. Encrypted inputs are rejected because this API cannot select
+    /// an output-encryption policy.
     pub fn redact(
         &mut self,
         page: usize,
@@ -752,9 +805,7 @@ impl PdfEditor {
             }
             None => None,
         };
-        let page = self.writer.page_index_at(page).map_err(js_err)?;
-        self.writer
-            .redact_page(page, &rects, &zpdf_writer::RedactOptions { fill })
+        self.redact_core(page, &rects, &zpdf_writer::RedactOptions { fill })
             .map_err(js_err)
     }
 
@@ -990,6 +1041,82 @@ mod tests {
             .expect("redact");
         let doc = reopen(ed.save().expect("save"));
         assert_eq!(doc.page_count(), 1);
+    }
+
+    #[test]
+    fn editor_redact_save_drops_history_and_preserves_composed_edits() {
+        let original = tiny_pdf();
+        let mut ed = PdfEditor::open(&original).unwrap();
+        ed.set_title(Some("Before redaction".into())).unwrap();
+        ed.redact_core(
+            0,
+            &[zpdf::Rect::new(0.0, 0.0, 200.0, 200.0)],
+            &zpdf_writer::RedactOptions { fill: None },
+        )
+        .unwrap();
+        ed.rotate_page(0, 90).unwrap();
+        for title in ["Redacted", "Saved again"] {
+            ed.set_title(Some(title.into())).unwrap();
+            let saved = editor_save_bytes(&ed.writer, ed.requires_rewrite).unwrap();
+            assert!(!saved
+                .windows(original.len())
+                .any(|part| part == original.as_slice()));
+            assert!(!saved
+                .windows(b"(Hi) Tj".len())
+                .any(|part| part == b"(Hi) Tj"));
+            let doc = reopen(saved.clone());
+            assert_eq!(doc.page_count(), 1);
+            assert_eq!(doc.page(0).unwrap().rotate, 90);
+            assert_eq!(
+                doc.info().and_then(|info| info.title).as_deref(),
+                Some(title)
+            );
+            assert!(Pdf::open(&saved)
+                .unwrap()
+                .page_text(0)
+                .unwrap()
+                .trim()
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn encrypted_redaction_fails_before_edits_without_dropping_encryption() {
+        let source = zpdf::PdfFile::parse(tiny_pdf()).unwrap();
+        let encrypted = zpdf_writer::rewrite_pdf(
+            &source,
+            &zpdf_writer::RewriteOptions {
+                encrypt: Some(zpdf_writer::EncryptionConfig::rc4_128("reader", "owner")),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut ed = PdfEditor::open_with_password(&encrypted, "reader").unwrap();
+        let before = editor_save_bytes(&ed.writer, ed.requires_rewrite).unwrap();
+        let error = ed
+            .redact_core(
+                0,
+                &[zpdf::Rect::new(0.0, 0.0, 200.0, 200.0)],
+                &zpdf_writer::RedactOptions { fill: None },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("output encryption policy"));
+        assert!(!ed.requires_rewrite);
+        assert_eq!(
+            editor_save_bytes(&ed.writer, ed.requires_rewrite).unwrap(),
+            before
+        );
+        assert!(editor_save_bytes(&ed.writer, true).is_err());
+
+        ed.set_title(Some("Still encrypted".into())).unwrap();
+        let saved = editor_save_bytes(&ed.writer, ed.requires_rewrite).unwrap();
+        assert!(zpdf::PdfDocument::open(saved.clone()).is_err());
+        let reopened = zpdf::PdfDocument::open_with_password(saved, b"reader").unwrap();
+        assert!(reopened.is_encrypted());
+        assert_eq!(
+            reopened.info().and_then(|info| info.title).as_deref(),
+            Some("Still encrypted")
+        );
     }
 
     #[test]

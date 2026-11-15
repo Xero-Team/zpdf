@@ -280,8 +280,8 @@ impl PaintedBounds {
 
     /// The region as a device-space rectangle, or `None` when it is empty.
     ///
-    /// The coordinates are integers below 2^24 (a raster dimension), so the
-    /// `u32` → `f32` conversion is exact.
+    /// Axes above the exact-integer range of `f32` can round here. Integer
+    /// pixel ranges must still be clamped to the original surface dimensions.
     fn to_rect(self) -> Option<tiny_skia::Rect> {
         if self.is_empty() {
             return None;
@@ -749,11 +749,14 @@ impl<'a> CpuRenderer<'a> {
         // Floor/ceil, not round: a pixel whose *cell* the geometry touches
         // receives coverage even when the path's edge lies inside it.
         let grow = grow.max(0.0);
+        // Float-to-integer casts saturate at zero and u32::MAX. Apply the
+        // surface limit afterwards: converting an integer axis to f32 first
+        // can round it either above or below the actual allocated dimension.
         PaintedBounds {
-            x0: (left - grow).floor().clamp(0.0, width as f32) as u32,
-            y0: (top - grow).floor().clamp(0.0, height as f32) as u32,
-            x1: (right + grow).ceil().clamp(0.0, width as f32) as u32,
-            y1: (bottom + grow).ceil().clamp(0.0, height as f32) as u32,
+            x0: ((left - grow).floor() as u32).min(width),
+            y0: ((top - grow).floor() as u32).min(height),
+            x1: ((right + grow).ceil() as u32).min(width),
+            y1: ((bottom + grow).ceil() as u32).min(height),
         }
     }
 
@@ -3085,6 +3088,52 @@ mod tests {
         assert!(scale > 0.0);
         assert_eq!(width, 1);
         assert!(width as u64 * height as u64 <= 100);
+    }
+
+    #[test]
+    fn drawn_extent_clamps_to_integer_axes_above_f32_precision() {
+        // Exercise both rounding directions without allocating a large raster.
+        for long_axis in [16_777_217, 16_777_219, 33_554_431, 63_999_999] {
+            for (width, height) in [(long_axis, 1), (1, long_axis)] {
+                let right = width as f32 + 16.0;
+                let bottom = height as f32 + 16.0;
+                let covering = tiny_skia::Rect::from_ltrb(0.0, 0.0, right, bottom).unwrap();
+                assert_eq!(
+                    CpuRenderer::drawn_extent(covering, 0.0, width, height),
+                    PaintedBounds::whole(width, height),
+                );
+
+                let outside =
+                    tiny_skia::Rect::from_ltrb(right, bottom, right + 16.0, bottom + 16.0).unwrap();
+                assert_eq!(
+                    CpuRenderer::drawn_extent(outside, 0.0, width, height),
+                    PaintedBounds {
+                        x0: width,
+                        y0: height,
+                        x1: width,
+                        y1: height,
+                    },
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn drawn_extent_keeps_conservative_small_raster_rounding() {
+        let bounds = tiny_skia::Rect::from_ltrb(2.25, 3.75, 7.25, 8.25).unwrap();
+        assert_eq!(
+            CpuRenderer::drawn_extent(bounds, 0.5, 10, 10),
+            PaintedBounds {
+                x0: 1,
+                y0: 3,
+                x1: 8,
+                y1: 9,
+            },
+        );
+        assert_eq!(
+            CpuRenderer::drawn_extent(bounds, f32::INFINITY, 10, 10),
+            PaintedBounds::whole(10, 10),
+        );
     }
 
     #[test]

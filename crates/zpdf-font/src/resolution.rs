@@ -769,21 +769,9 @@ impl FontCache {
     fn admit_drawing_font(&mut self, font: Arc<LoadedFont>, max_bytes: u64) -> Option<FontId> {
         // Drawing faces have no PDF resource name, so hostile resource names
         // cannot collide with an internal alias or redirect an existing run.
-        let program_key = font.shared_program_key();
-        let added = if program_key.is_some_and(|key| self.shared_programs.contains(&key)) {
-            0
-        } else {
-            font.estimated_cache_bytes()
-        };
-        let total = self.bytes_used.checked_add(added)?;
-        if total > max_bytes {
-            return None;
-        }
+        let total = self.budget.admission_total(&font, max_bytes)?;
         let id = self.next_free_id()?;
-        if let Some(key) = program_key {
-            self.shared_programs.insert(key);
-        }
-        self.bytes_used = total;
+        self.budget.record(&font, total);
         self.fonts.insert(id, font);
         Some(id)
     }

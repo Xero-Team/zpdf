@@ -336,6 +336,11 @@ impl IncrementalWriter {
         let sid = signer_identifier(certificate_der)?;
 
         // --- 1. The signature dictionary, as a raw body with placeholders.
+        // Fix the object key before encoding any strings. Raw emission is
+        // needed for the placeholders, but only /Contents is exempt from
+        // the document's string encryption policy.
+        self.ensure_object_capacity(2)?;
+        let sig_ref = ObjectId(self.next_obj_num, 0);
         let field_name = options.field_name.as_deref().unwrap_or("Signature1");
         let mut sig_body = Vec::new();
         sig_body.extend_from_slice(
@@ -345,26 +350,30 @@ impl IncrementalWriter {
             )
             .as_bytes(),
         );
+        let timestamp = format!("D:{}Z", pdf_timestamp());
         for (k, v) in [
-            ("Name", &options.name),
-            ("Reason", &options.reason),
-            ("Location", &options.location),
-            ("ContactInfo", &options.contact),
+            ("Name", options.name.as_deref()),
+            ("Reason", options.reason.as_deref()),
+            ("Location", options.location.as_deref()),
+            ("ContactInfo", options.contact.as_deref()),
+            ("M", Some(timestamp.as_str())),
         ] {
             if let Some(text) = v {
+                let mut value = PdfObject::String(encode_text_string(text));
+                if let Some(decryptor) = self.document().file().decryptor() {
+                    decryptor.try_encrypt_object_strings(&mut value, sig_ref)?;
+                }
                 sig_body.extend_from_slice(format!(" /{k} ").as_bytes());
-                serialize_object_body(&mut sig_body, &PdfObject::String(encode_text_string(text)))?;
+                serialize_object_body(&mut sig_body, &value)?;
             }
         }
-        sig_body.extend_from_slice(format!(" /M (D:{}Z)", pdf_timestamp()).as_bytes());
         sig_body.extend_from_slice(b" /ByteRange [0000000000 0000000000 0000000000 0000000000]");
         sig_body.extend_from_slice(b" /Contents <");
         sig_body.extend_from_slice(&vec![b'0'; RESERVED_HEX]);
         sig_body.extend_from_slice(b"> >>");
 
-        self.ensure_object_capacity(2)?;
-        let (sig_num, _) = self.try_add_raw_object(&sig_body)?;
-        let sig_ref = ObjectId(sig_num, 0);
+        let (sig_num, sig_gen) = self.try_add_raw_object(&sig_body)?;
+        debug_assert_eq!(sig_ref, ObjectId(sig_num, sig_gen as u16));
 
         // --- 2. The signature form field / widget annotation.
         let page_id = self.page_id(0)?;

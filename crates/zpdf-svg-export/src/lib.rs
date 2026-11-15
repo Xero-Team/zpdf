@@ -89,31 +89,7 @@ pub fn display_list_to_svg(
         height = 1.0;
     }
 
-    let mut writer = SvgWriter {
-        out: String::new(),
-        x0: rect.x0,
-        y1: rect.y1,
-        page_width: width,
-        page_height: height,
-        fonts,
-        images,
-        next_id: 0,
-        clip: None,
-        stroke_mask: None,
-        deadline: options.budget.map(|b| zpdf_core::time::Instant::now() + b),
-        over_budget: false,
-        budget_checks: 0,
-        warned_overprint: false,
-        warned_knockout: false,
-        warned_transfer: false,
-        image_defs: HashMap::new(),
-        mask_defs: HashMap::new(),
-        glyph_outlines: HashMap::new(),
-        glyph_outline_commands: 0,
-        type3_glyphs: HashMap::new(),
-        type3_glyph_commands: 0,
-        type3_glyph_image_bytes: 0,
-    };
+    let mut writer = SvgWriter::new(rect, width, height, fonts, images, options);
 
     writer
         .out
@@ -239,7 +215,42 @@ struct Type3Glyph {
     font_matrix: [f64; 6],
 }
 
-impl SvgWriter<'_> {
+impl<'a> SvgWriter<'a> {
+    fn new(
+        rect: zpdf_core::Rect,
+        width: f64,
+        height: f64,
+        fonts: &'a FontCache,
+        images: &'a ImageCache,
+        options: &SvgOptions,
+    ) -> Self {
+        Self {
+            out: String::new(),
+            x0: rect.x0,
+            y1: rect.y1,
+            page_width: width,
+            page_height: height,
+            fonts,
+            images,
+            next_id: 0,
+            clip: None,
+            stroke_mask: None,
+            deadline: options.budget.map(|b| zpdf_core::time::Instant::now() + b),
+            over_budget: false,
+            budget_checks: 0,
+            warned_overprint: false,
+            warned_knockout: false,
+            warned_transfer: false,
+            image_defs: HashMap::new(),
+            mask_defs: HashMap::new(),
+            glyph_outlines: HashMap::new(),
+            glyph_outline_commands: 0,
+            type3_glyphs: HashMap::new(),
+            type3_glyph_commands: 0,
+            type3_glyph_image_bytes: 0,
+        }
+    }
+
     fn fresh_id(&mut self) -> u32 {
         self.next_id += 1;
         self.next_id
@@ -260,7 +271,9 @@ impl SvgWriter<'_> {
             return false;
         };
         self.budget_checks = self.budget_checks.wrapping_add(1);
-        if self.budget_checks.is_multiple_of(64) && zpdf_core::time::Instant::now() >= deadline {
+        if (self.budget_checks == 1 || self.budget_checks.is_multiple_of(64))
+            && zpdf_core::time::Instant::now() >= deadline
+        {
             self.over_budget = true;
             tracing::warn!("svg export exceeded time budget; output truncated");
         }
@@ -627,7 +640,10 @@ impl SvgWriter<'_> {
             return;
         }
         let mut d = String::new();
-        for glyph in &run.glyphs {
+        'glyphs: for glyph in &run.glyphs {
+            if self.check_over_budget() {
+                break;
+            }
             let Some(outline) = self.glyph_outline(run.font_id, font, glyph.glyph_id) else {
                 continue;
             };
@@ -635,6 +651,10 @@ impl SvgWriter<'_> {
             let mut ok = true;
             let mut part = String::new();
             for cmd in &outline.commands {
+                if self.check_over_budget() {
+                    // Never emit the unfinished glyph path.
+                    break 'glyphs;
+                }
                 match *cmd {
                     OutlineCommand::MoveTo(x, y) => {
                         ok &= self.push_glyph_point(&mut part, 'M', &[(x, y)], upem, run, off);
@@ -817,6 +837,9 @@ impl SvgWriter<'_> {
                 .sqrt();
 
             for cmd in &program.list.commands {
+                if self.check_over_budget() {
+                    break;
+                }
                 match cmd {
                     RenderCommand::FillPath { path, rule, .. } => {
                         let Some(d) = self.type3_path_data(path, &font_matrix, run, glyph.x) else {
@@ -895,12 +918,13 @@ impl SvgWriter<'_> {
     }
 
     fn type3_path_data(
-        &self,
+        &mut self,
         path: &Path,
         font_matrix: &[f64; 6],
         run: &GlyphRun,
         glyph_x_offset: f32,
     ) -> Option<String> {
+        let (x0, y1) = (self.x0, self.y1);
         let map = |gx: f64, gy: f64| -> Option<(f64, f64)> {
             // FontMatrix → text space, scale by size (x also carries Th),
             // advance offset, then Tm/CTM, then the fixed page flip.
@@ -911,7 +935,7 @@ impl SvgWriter<'_> {
             let tm = &run.transform;
             let px = tm.a * tx + tm.c * ty + tm.e;
             let py = tm.b * tx + tm.d * ty + tm.f;
-            let (sx, sy) = self.map(px, py);
+            let (sx, sy) = (px - x0, y1 - py);
             (coord_ok(sx) && coord_ok(sy)).then_some((sx, sy))
         };
         self.path_data_with(path, map)
@@ -1039,9 +1063,10 @@ impl SvgWriter<'_> {
 
     // -- path serialization --
 
-    fn path_data(&self, path: &Path) -> Option<String> {
+    fn path_data(&mut self, path: &Path) -> Option<String> {
+        let (x0, y1) = (self.x0, self.y1);
         let map = |x: f64, y: f64| -> Option<(f64, f64)> {
-            let (sx, sy) = self.map(x, y);
+            let (sx, sy) = (x - x0, y1 - y);
             (coord_ok(sx) && coord_ok(sy)).then_some((sx, sy))
         };
         self.path_data_with(path, map)
@@ -1051,7 +1076,7 @@ impl SvgWriter<'_> {
     /// the path is empty or any point maps to corrupt geometry (the caller
     /// skips the command, as the raster backends do).
     fn path_data_with(
-        &self,
+        &mut self,
         path: &Path,
         map: impl Fn(f64, f64) -> Option<(f64, f64)>,
     ) -> Option<String> {
@@ -1060,6 +1085,9 @@ impl SvgWriter<'_> {
         }
         let mut d = String::new();
         for elem in path {
+            if self.check_over_budget() {
+                return None;
+            }
             match elem {
                 PathElement::MoveTo(p) => {
                     let (x, y) = map(p.x, p.y)?;
@@ -1329,6 +1357,94 @@ mod tests {
         let mut p = Path::new();
         p.rect(Rect::new(x0, y0, x1, y1));
         p
+    }
+
+    fn one_glyph_run() -> GlyphRun {
+        GlyphRun {
+            font_id: 0,
+            font_size: 12.0,
+            glyphs: vec![PositionedGlyph {
+                glyph_id: 1,
+                code: 65,
+                x: 0.0,
+                y: 0.0,
+                advance: 1.0,
+            }],
+            paint: Paint::Solid(Color::black()),
+            alpha: 1.0,
+            overprint: None,
+            transform: Matrix::identity(),
+            h_scale: 1.0,
+        }
+    }
+
+    #[test]
+    fn outline_and_type3_replay_check_deadlines_inside_one_glyph() {
+        let (fonts, images) = empty_caches();
+        let mut font = LoadedFont::new_placeholder("Budget".into());
+        font.units_per_em = 1000.0;
+        let run = one_glyph_run();
+        for budget in [Some(std::time::Duration::ZERO), None] {
+            let options = SvgOptions {
+                background: None,
+                budget,
+            };
+            let mut writer =
+                SvgWriter::new(page().page_rect, 100.0, 200.0, &fonts, &images, &options);
+            writer.glyph_outlines.insert(
+                (0, 1),
+                Some(Rc::new(GlyphOutline {
+                    commands: vec![
+                        OutlineCommand::MoveTo(0.0, 0.0),
+                        OutlineCommand::LineTo(1.0, 1.0),
+                        OutlineCommand::Close,
+                    ],
+                    advance_width: 1.0,
+                })),
+            );
+            // The outer glyph check is #63; the first inner command is #64.
+            writer.budget_checks = 62;
+            writer.emit_outline_run(&run, &font, &Color::black(), 1.0);
+            assert_eq!(writer.over_budget, budget.is_some());
+            assert_eq!(writer.out.contains("<path"), budget.is_none());
+
+            let mut writer =
+                SvgWriter::new(page().page_rect, 100.0, 200.0, &fonts, &images, &options);
+            let mut list = page();
+            list.push(RenderCommand::FillPath {
+                path: rect_path(0.0, 0.0, 1.0, 1.0),
+                rule: FillRule::NonZero,
+                paint: Paint::Solid(Color::black()),
+                alpha: 1.0,
+                overprint: None,
+            });
+            writer.type3_glyphs.insert(
+                (0, 1),
+                Some(Rc::new(Type3Glyph {
+                    list,
+                    images: ImageCache::new(),
+                    font_matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                })),
+            );
+            writer.budget_checks = 62;
+            writer.emit_type3_run(&run, &font, &Color::black(), 1.0);
+            assert_eq!(writer.over_budget, budget.is_some());
+            assert_eq!(writer.out.contains("<path"), budget.is_none());
+        }
+    }
+
+    #[test]
+    fn path_serialization_discards_an_unfinished_path_after_deadline() {
+        let (fonts, images) = empty_caches();
+        let options = SvgOptions {
+            background: None,
+            budget: Some(std::time::Duration::ZERO),
+        };
+        let mut writer = SvgWriter::new(page().page_rect, 100.0, 200.0, &fonts, &images, &options);
+        writer.budget_checks = 63;
+        assert!(writer.path_data(&rect_path(0.0, 0.0, 1.0, 1.0)).is_none());
+        assert!(writer.over_budget);
+        assert!(writer.out.is_empty());
     }
 
     #[test]

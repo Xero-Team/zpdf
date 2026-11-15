@@ -227,31 +227,23 @@ impl PdfFile {
         Ok(Arc::new(obj))
     }
 
-    fn resolve_depth(&self, id: ObjectId, depth: u32) -> Result<PdfObject> {
-        /// Maximum length of a ref-to-ref chain (`1 0 obj 2 0 R endobj` ...)
-        /// followed before the reference is treated as null. Guards against
-        /// reference cycles (`A -> B -> A`) without a per-call visited set.
-        const MAX_REF_CHAIN: u32 = 32;
-        if depth > MAX_REF_CHAIN {
-            tracing::warn!(
-                "indirect reference chain longer than {MAX_REF_CHAIN} at {id}; treating as null"
-            );
-            return Ok(PdfObject::Null);
-        }
-
-        // Fast path: already resolved. The borrow ends with this block.
-        if let Some(obj) = self.object_cache.borrow().get(&id) {
-            return Ok(PdfObject::clone(obj));
-        }
-
+    /// Resolve one indirect object without following a reference stored as its
+    /// body. Strings and streams are decrypted, and object-stream members and
+    /// repaired xref entries use the same parsing rules as [`Self::resolve`].
+    ///
+    /// This preserves every graph edge for editors that must consult pending
+    /// replacements while following a reference chain. The resolved-object
+    /// cache deliberately cannot serve this operation: its values have already
+    /// followed those edges.
+    pub fn resolve_unfollowed(&self, id: ObjectId) -> Result<PdfObject> {
         // ISO 32000-1, 7.3.10: a reference to an object that is missing from
         // the xref, or marked free, is a reference to the null object — not an
         // error. BUT a damaged xref frequently just omits (or wrongly frees)
         // objects that physically exist in the file, which would silently empty
         // the page tree. So before treating a missing/free entry as null, give
         // the lazy repair table (one memoized full-file scan) a chance to locate
-        // the real object. The Null is cached either way so the warning fires
-        // once per object and a genuinely-dangling ref stays cheap.
+        // the real object. Normal resolution caches Null too, so repeated
+        // dangling references remain cheap for ordinary resolving callers.
         let obj = match self.xref.get(id) {
             Some(XrefEntry::InUse { offset, .. }) => self.parse_at_offset_checked(*offset, id)?,
             Some(XrefEntry::Compressed {
@@ -281,6 +273,28 @@ impl PdfFile {
                 }
             },
         };
+
+        Ok(obj)
+    }
+
+    fn resolve_depth(&self, id: ObjectId, depth: u32) -> Result<PdfObject> {
+        /// Maximum length of a ref-to-ref chain (`1 0 obj 2 0 R endobj` ...)
+        /// followed before the reference is treated as null. Guards against
+        /// reference cycles (`A -> B -> A`) without a per-call visited set.
+        const MAX_REF_CHAIN: u32 = 32;
+        if depth > MAX_REF_CHAIN {
+            tracing::warn!(
+                "indirect reference chain longer than {MAX_REF_CHAIN} at {id}; treating as null"
+            );
+            return Ok(PdfObject::Null);
+        }
+
+        // Fast path: already resolved. The borrow ends with this block.
+        if let Some(obj) = self.object_cache.borrow().get(&id) {
+            return Ok(PdfObject::clone(obj));
+        }
+
+        let obj = self.resolve_unfollowed(id)?;
 
         // A top-level object body may itself be an indirect reference; follow
         // the chain (depth-limited) so callers always get a direct value.
@@ -417,32 +431,64 @@ impl PdfFile {
     /// containing them); resolve those before handing the dict to the filter
     /// layer, which has no access to the file.
     pub fn resolve_stream_data(&self, id: zpdf_core::ObjectId) -> Result<Vec<u8>> {
-        self.resolve_stream_data_inner(id, true)
+        self.resolve_stream_data_inner(id, true, &self.limits)
+    }
+
+    /// Decode with an additional output allowance, for callers accumulating
+    /// several decoded streams. This can only tighten the document's existing
+    /// filter-chain budget; raw-stream and other parser limits are unchanged.
+    pub fn resolve_stream_data_with_limit(
+        &self,
+        id: ObjectId,
+        max_decoded_bytes: u64,
+    ) -> Result<Vec<u8>> {
+        let mut limits = self.limits.clone();
+        limits.max_decoded_stream_bytes = limits.max_decoded_stream_bytes.min(max_decoded_bytes);
+        self.resolve_stream_data_inner(id, true, &limits)
     }
 
     fn resolve_stream_data_inner(
         &self,
         id: zpdf_core::ObjectId,
         inline_globals: bool,
+        limits: &ParseLimits,
     ) -> Result<Vec<u8>> {
         let obj = self.resolve(id)?;
-        let stream = obj.as_stream()?;
-        match self.dict_with_resolved_filters(&stream.dict, inline_globals) {
-            Some(resolved) => {
-                filters::decode_stream_with_limits(&stream.data, &resolved, &self.limits)
-            }
-            None => filters::decode_stream_with_limits(&stream.data, &stream.dict, &self.limits),
+        self.decode_resolved_stream(obj.as_stream()?, inline_globals, limits)
+    }
+
+    fn decode_resolved_stream(
+        &self,
+        stream: &PdfStream,
+        inline_globals: bool,
+        limits: &ParseLimits,
+    ) -> Result<Vec<u8>> {
+        match self.dict_with_resolved_filters(&stream.dict, inline_globals, limits)? {
+            Some(resolved) => filters::decode_stream_with_limits(&stream.data, &resolved, limits),
+            None => filters::decode_stream_with_limits(&stream.data, &stream.dict, limits),
         }
     }
 
-    /// If `/Filter`, `/DecodeParms`, or `/DP` is an indirect reference (or an
-    /// array containing one), return a clone of `dict` with those values
+    /// If `/Filter` or the selected `/DecodeParms` (falling back to `/DP`)
+    /// is an indirect reference or array containing one, clone `dict` with it
     /// resolved one level. `None` when nothing needs resolving (common case —
     /// avoids cloning the dict). When `inline_globals` is set, a DecodeParms
     /// `/JBIG2Globals` stream reference is also inlined (see
     /// [`Self::inline_jbig2_globals`]).
-    fn dict_with_resolved_filters(&self, dict: &PdfDict, inline_globals: bool) -> Option<PdfDict> {
-        const KEYS: [&str; 3] = ["Filter", "DecodeParms", "DP"];
+    fn dict_with_resolved_filters(
+        &self,
+        dict: &PdfDict,
+        inline_globals: bool,
+        limits: &ParseLimits,
+    ) -> Result<Option<PdfDict>> {
+        // Match extract_decode_parms, including an explicitly present null:
+        // an ignored DP must not cause resolution or globals decoding errors.
+        let parameters_key = if dict.get("DecodeParms").is_some() {
+            "DecodeParms"
+        } else {
+            "DP"
+        };
+        let keys = ["Filter", parameters_key];
         // A DecodeParms dict containing a /JBIG2Globals reference needs the
         // globals stream inlined even though the dict itself is direct.
         let dict_needs_globals = |obj: &PdfObject| {
@@ -457,8 +503,8 @@ impl PdfFile {
                 .any(|e| matches!(e, PdfObject::Ref(_)) || dict_needs_globals(e)),
             other => dict_needs_globals(other),
         };
-        if !KEYS.iter().any(|k| dict.get(k).is_some_and(needs_resolve)) {
-            return None;
+        if !keys.iter().any(|k| dict.get(k).is_some_and(needs_resolve)) {
+            return Ok(None);
         }
 
         let resolve_shallow = |obj: &PdfObject| match obj {
@@ -467,24 +513,27 @@ impl PdfFile {
         };
         let inline = |obj: PdfObject| {
             if inline_globals {
-                self.inline_jbig2_globals(obj)
+                self.inline_jbig2_globals(obj, limits)
             } else {
-                obj
+                Ok(obj)
             }
         };
         let mut out = dict.clone();
-        for key in KEYS {
+        for key in keys {
             let Some(value) = dict.get(key) else { continue };
             let resolved = match resolve_shallow(value) {
                 // Also resolve refs *inside* a (possibly itself indirect) array.
-                PdfObject::Array(a) => {
-                    PdfObject::Array(a.iter().map(resolve_shallow).map(inline).collect())
-                }
-                other => inline(other),
+                PdfObject::Array(a) => PdfObject::Array(
+                    a.iter()
+                        .map(resolve_shallow)
+                        .map(inline)
+                        .collect::<Result<Vec<_>>>()?,
+                ),
+                other => inline(other)?,
             };
             out.insert(PdfName::new(key), resolved);
         }
-        Some(out)
+        Ok(Some(out))
     }
 
     /// If `obj` is a DecodeParms dict whose `/JBIG2Globals` is an indirect
@@ -493,22 +542,30 @@ impl PdfFile {
     /// access to chase references itself. The globals stream is decoded
     /// without globals inlining of its own, so a crafted reference cycle
     /// cannot recurse. Anything else passes through unchanged.
-    fn inline_jbig2_globals(&self, obj: PdfObject) -> PdfObject {
+    fn inline_jbig2_globals(&self, obj: PdfObject, limits: &ParseLimits) -> Result<PdfObject> {
         let PdfObject::Dict(mut d) = obj else {
-            return obj;
+            return Ok(obj);
         };
         if let Some(PdfObject::Ref(r)) = d.get("JBIG2Globals") {
             let r = *r;
-            let value = match self.resolve_stream_data_inner(r, false) {
-                Ok(bytes) => PdfObject::String(zpdf_core::PdfString(bytes)),
-                Err(e) => {
-                    tracing::warn!("failed to decode /JBIG2Globals stream {r}: {e}");
+            // Preserve lenient decoding only for an absent or non-stream
+            // object. Resolution errors and every actual stream decoding error
+            // remain fatal: StreamDecode also carries filter budget exhaustion.
+            let globals = match self.resolve(r)? {
+                PdfObject::Stream(stream) => PdfObject::String(zpdf_core::PdfString(
+                    self.decode_resolved_stream(&stream, false, limits)?,
+                )),
+                other => {
+                    tracing::warn!(
+                        "JBIG2Globals {r} resolves to {}; ignoring non-stream globals",
+                        other.type_name()
+                    );
                     PdfObject::Null
                 }
             };
-            d.insert(PdfName::new("JBIG2Globals"), value);
+            d.insert(PdfName::new("JBIG2Globals"), globals);
         }
-        PdfObject::Dict(d)
+        Ok(PdfObject::Dict(d))
     }
 
     /// Extract an object from a compressed object stream (/Type /ObjStm).
@@ -1009,6 +1066,27 @@ mod tests {
     }
 
     #[test]
+    fn resolve_unfollowed_preserves_alias_edges_after_normal_resolution() {
+        let pdf = build_pdf(
+            &[
+                (1, "<< /Type /Catalog >>"),
+                (2, "3 0 R"),
+                (3, "<< /Marker (resolved target) >>"),
+            ],
+            1,
+        );
+        let file = PdfFile::parse(pdf).unwrap();
+        let target = file.resolve(ObjectId(2, 0)).unwrap();
+        assert!(matches!(target, PdfObject::Dict(_)));
+        assert_eq!(
+            file.resolve_unfollowed(ObjectId(2, 0)).unwrap(),
+            PdfObject::Ref(ObjectId(3, 0))
+        );
+        assert_eq!(file.resolve(ObjectId(2, 0)).unwrap(), target);
+        assert_eq!(file.resolve_unfollowed(ObjectId(3, 0)).unwrap(), target);
+    }
+
+    #[test]
     fn indirect_stream_length_is_resolved() {
         let pdf = build_pdf(
             &[
@@ -1116,6 +1194,36 @@ mod tests {
         );
         let file = PdfFile::parse(pdf).unwrap();
         assert_eq!(file.resolve(ObjectId(4, 0)).unwrap(), PdfObject::Null);
+    }
+
+    #[test]
+    fn decoded_stream_allowance_only_tightens_document_limit() {
+        let pdf = build_pdf(
+            &[
+                (1, "<< /Type /Catalog >>"),
+                (2, "<< /Length 3 >>\nstream\nq Q\nendstream"),
+            ],
+            1,
+        );
+        let file = PdfFile::parse(pdf.clone()).unwrap();
+        assert!(matches!(
+            file.resolve_stream_data_with_limit(ObjectId(2, 0), 2),
+            Err(zpdf_core::Error::StreamSizeLimit(2))
+        ));
+        assert_eq!(
+            file.resolve_stream_data_with_limit(ObjectId(2, 0), 3)
+                .unwrap(),
+            b"q Q"
+        );
+        let limits = ParseLimits {
+            max_decoded_stream_bytes: 2,
+            ..ParseLimits::default()
+        };
+        let file = PdfFile::parse_with_limits(pdf, limits).unwrap();
+        assert!(matches!(
+            file.resolve_stream_data_with_limit(ObjectId(2, 0), u64::MAX),
+            Err(zpdf_core::Error::StreamSizeLimit(2))
+        ));
     }
 
     #[test]

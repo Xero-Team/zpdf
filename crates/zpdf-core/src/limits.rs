@@ -4,6 +4,9 @@ pub struct ParseLimits {
     pub max_object_depth: u32,
     pub max_stream_bytes: u64,
     pub max_image_pixels: u64,
+    /// Maximum operators during content interpretation. GPU Type3 replay
+    /// applies the same value as a shared allowance for the rendering stage,
+    /// charging each child dispatch at least one unit even if it runs no operators.
     pub max_page_operators: u64,
     pub max_string_length: u32,
     /// Max number of objects a tail-scan recovery pass will index before
@@ -13,6 +16,8 @@ pub struct ParseLimits {
     // ─── New Cumulative Budget Fields (2026-07-10 Security Audit) ───
     /// Maximum total bytes for decoded filter output (cumulative across filter chain).
     /// Prevents decompression bombs where small input expands to GiB output.
+    /// Also independently bounds aggregate page content and estimated generated
+    /// annotation-appearance storage during page preparation.
     /// Default: same as max_stream_bytes (256 MiB).
     pub max_decoded_stream_bytes: u64,
 
@@ -48,6 +53,8 @@ pub struct ParseLimits {
     pub max_image_cache_bytes: u64,
 
     /// Maximum total bytes for parsed font data (programs + tables).
+    /// Shared programs and identical loaded-font instances are charged once
+    /// within each cache; independently owned mappings are charged per font.
     /// Default: 256 MiB.
     pub max_font_cache_bytes: u64,
 
@@ -63,6 +70,12 @@ pub struct ParseLimits {
     /// Maximum total bytes for GPU textures uploaded per page.
     /// Default: 1 GiB.
     pub max_gpu_texture_bytes: u64,
+
+    /// Maximum total vertex/index bytes recorded for one GPU-rendered page,
+    /// including geometry in soft masks. Separate from the texture budget;
+    /// excludes transient tessellation scratch and allocator overhead.
+    /// Default: 256 MiB.
+    pub max_gpu_geometry_bytes: u64,
 }
 
 impl Default for ParseLimits {
@@ -91,6 +104,7 @@ impl Default for ParseLimits {
             max_softmask_cache_bytes: 512 * 1024 * 1024,
             max_page_pixels: 64_000_000,
             max_gpu_texture_bytes: 1024 * 1024 * 1024,
+            max_gpu_geometry_bytes: 256 * 1024 * 1024,
         }
     }
 }

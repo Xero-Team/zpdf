@@ -38,6 +38,7 @@ use serialize::{serialize_dict, write_object, write_stream};
 
 pub mod annotate;
 mod annotation_edits;
+mod bounded;
 pub mod builder;
 mod cff;
 mod contents;
@@ -369,6 +370,37 @@ impl IncrementalWriter {
         }
     }
 
+    /// Read one current object body, preserving top-level reference edges so
+    /// strict callers can consult pending edits at every step of an alias.
+    pub(crate) fn resolve_current_unfollowed(&self, id: ObjectId) -> Result<PdfObject> {
+        match self.pending.get(&id.0) {
+            Some((_, PendingObject::Object(object))) => Ok(object.clone()),
+            Some((_, PendingObject::Stream(dict, data))) => {
+                Ok(PdfObject::Stream(zpdf_core::PdfStream {
+                    dict: dict.clone(),
+                    data: Arc::clone(data),
+                }))
+            }
+            // Preserve the ordinary resolver's source fallback for raw bodies.
+            Some((_, PendingObject::Raw(_))) | None => self.doc.file().resolve_unfollowed(id),
+        }
+    }
+
+    /// Follow a bounded alias chain against pending state. Unlike the normal
+    /// source resolver, this must not flatten a chain past an edited target.
+    pub(crate) fn resolve_current_chain(&self, mut id: ObjectId) -> Result<PdfObject> {
+        // Match PdfFile's reference-chain bound. The object parser's separate
+        // nesting limit must not hide an alias the normal reader can resolve.
+        let limit = 32;
+        for _ in 0..=limit {
+            match self.resolve_current_unfollowed(id)? {
+                PdfObject::Ref(next) => id = next,
+                object => return Ok(object),
+            }
+        }
+        Err(zpdf_core::Error::RecursionLimit(limit))
+    }
+
     /// Resolve one level of indirection against the current (pending-aware)
     /// state, returning `Null` on failure.
     pub(crate) fn deref_current(&self, obj: &PdfObject) -> PdfObject {
@@ -546,9 +578,9 @@ impl IncrementalWriter {
         //    For an encrypted document, every new/modified object is encrypted
         //    with the document key (resolve_current returned plaintext, since
         //    the parser decrypts on resolve). Raw bodies (the signer's
-        //    byte-exact dict) are emitted verbatim — signature dicts store
-        //    /Contents unencrypted by design (§7.6.2 note: signature
-        //    dictionaries' Contents are excluded from encryption).
+        //    byte-exact dict) are emitted verbatim. The signer encrypts their
+        //    metadata before queueing; only /Contents remains unencrypted
+        //    (§7.6.2: signature dictionaries' Contents are excluded).
         let decryptor = self.doc.file().decryptor();
         let mut xref_entries: Vec<(u32, u16, u64)> = Vec::new();
         for (&num, (gen, pending)) in &self.pending {
