@@ -691,13 +691,11 @@ impl PdfFile {
             )));
         }
 
-        // An encrypted document encrypts the ObjStm *container* once (keyed by
-        // the container's own object id); its member objects are not separately
-        // encrypted. Decrypt the raw bytes before running the filter pipeline.
+        // Decrypt the ObjStm container once, honoring its own crypt filter and
+        // Identity exemption just like ordinary streams. Member strings are
+        // already plaintext; do not decrypt them again under their object ids.
         let raw: std::borrow::Cow<[u8]> = match &self.decryptor {
-            Some(dec) => std::borrow::Cow::Owned(
-                dec.decrypt_stream_bytes(zpdf_core::ObjectId(stream_obj_num, 0), &stream.data),
-            ),
+            Some(dec) => dec.decrypt_stream_with_dict(stream_id, &stream.dict, &stream.data),
             None => std::borrow::Cow::Borrowed(&stream.data),
         };
         let decoded = filters::decode_stream_with_limits(&raw, &stream.dict, &self.limits)?;

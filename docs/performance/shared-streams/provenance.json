@@ -2,7 +2,7 @@
   "baseline_commit": "4c5e4a5995d072c99496368fd18ee7b27662c1d0",
   "baseline_tree": "6d4ee20b908990edd987614f806c257f3ce47f1d",
   "lock_sha256": "1b2e140284e26d2e66e7539f59163f47096cba22589a15d918d839d89220e276",
-  "final_measurement": "measure-confirm",
+  "final_measurement": "measure-objstm",
   "phases": {
     "measure-candidate-1": {
       "snapshot_sha256": "b117e3698712cc29779d411ca51fa5767806510b34a7bc05a8e151d73296eff8",
@@ -328,6 +328,40 @@
       "elapsed_seconds": 18.064,
       "exit_code": 0,
       "lock_sha256": "1b2e140284e26d2e66e7539f59163f47096cba22589a15d918d839d89220e276"
+    },
+    "measure-objstm": {
+      "snapshot_sha256": "f8a9b1c645460f9d6c79bf9115b8683774fbcbcb9b88d6f10e2ad9101669511f",
+      "image_id": "sha256:ea15510f04ded2c73682c87d70aa8d0e8697c7feb2b0aebf626e92ed29f93fde",
+      "limits": {
+        "network": "none",
+        "cpus": 2,
+        "memory_bytes": 5368709120,
+        "pids": 192,
+        "file_bytes": 536870912,
+        "scratch_bytes": 3670016000,
+        "wall_seconds": 900,
+        "cpu_seconds": 1100
+      },
+      "raw_sha256": "872227d36ce911aa62e6ca19800a453e897968be9e8e3ecd6a7ff0b02aed1f8b",
+      "binary_sha256": {
+        "baseline": "34374e4c33f947ac366acbc550a1a52a149beaed839a50d39064eeec2cc501f1",
+        "current": "33bf4c1de608fabe23e77bf608655ab7f3b43c5e03e363daeaaf08846be5a3ba"
+      },
+      "lock_sha256": "1b2e140284e26d2e66e7539f59163f47096cba22589a15d918d839d89220e276"
+    },
+    "baseline-objstm": {
+      "snapshot_sha256": "6f5aa5e25a243296e375f28e0f262d382373bf4cbaca081d0a25de21048304c2",
+      "image_id": "sha256:ea15510f04ded2c73682c87d70aa8d0e8697c7feb2b0aebf626e92ed29f93fde",
+      "elapsed_seconds": 57.021,
+      "exit_code": 0,
+      "lock_sha256": "1b2e140284e26d2e66e7539f59163f47096cba22589a15d918d839d89220e276"
+    },
+    "current-objstm": {
+      "snapshot_sha256": "f8a9b1c645460f9d6c79bf9115b8683774fbcbcb9b88d6f10e2ad9101669511f",
+      "image_id": "sha256:ea15510f04ded2c73682c87d70aa8d0e8697c7feb2b0aebf626e92ed29f93fde",
+      "elapsed_seconds": 16.966,
+      "exit_code": 0,
+      "lock_sha256": "1b2e140284e26d2e66e7539f59163f47096cba22589a15d918d839d89220e276"
     }
   },
   "notes": {
@@ -343,7 +377,8 @@
     "measure-constructor": "Inline the small public PdfStream constructor. Frozen final candidate: all 13 cases have no positive interval lower bound and no increased heap/allocation counts.",
     "measure-confirm": "Independent fixed 31-pair confirmation, planned before inspecting the candidate, after WASM rebuild. Same two executable hashes; all 13 cases again have no positive interval lower bound. No concurrent build; all observations retained and reported separately.",
     "baseline-enum": "Harness compile stopped because its new borrowed-parser control lacked a direct dev-dependency; no measurement emitted. Fixed in baseline-enum-2.",
-    "baseline-enum-2": "Baseline library sources from main; identical current benchmark harness plus its direct internal parser dev-dependency, with the same resolved lock as the candidate."
+    "baseline-enum-2": "Baseline library sources from main; identical current benchmark harness plus its direct internal parser dev-dependency, with the same resolved lock as the candidate.",
+    "measure-objstm": "Post-review fix: share dictionary-aware decryption between ordinary streams and ObjStm, borrowing Identity bytes. Same fixed 31-pair, 13-case plan against main; all inputs/outputs agree, no positive timing-interval lower bounds or higher requested heap/allocation counts."
   },
   "validation": {
     "baseline-proof": {
@@ -451,6 +486,37 @@
           "zpdf_wasm_bg.wasm": "10bd6e6a016bab18b5641e24a4443d61c4f6605f0a0e38bddaa979507e6a894d"
         }
       }
+    },
+    "objstm-repro-2": {
+      "snapshot_sha256": "6596811de06e4aec19fcb589b948b2e7648344af7898a4580f92db0ffe52eb15",
+      "result_sha256": "617d8bbde31de3f2f1ee59b94f45c393fb987aa9d58ccdf6d63defe4018b6938",
+      "exit_code": 0,
+      "expected_test_outcome": "The implicit V4/R4 RC4 container control succeeds; an overwritten /Crypt container with default Identity fails to resolve member 5 before the fix. The harness verifies this runtime failure."
+    },
+    "native-objstm": {
+      "snapshot_sha256": "ecdd51d0389c874d5d123725cf12143e07ebbf52df8dd9070753a224971c7b77",
+      "result_sha256": "84d1e58d00d82420384361a96f5100caefc29a7615cb221c0a0e56b9a10a73af",
+      "exit_code": 0,
+      "tests_passed": 515,
+      "acl_runner_tests_passed": 17
+    },
+    "wasm-objstm": {
+      "snapshot_sha256": "f8a9b1c645460f9d6c79bf9115b8683774fbcbcb9b88d6f10e2ad9101669511f",
+      "result_sha256": "a9e714afd8efa33128c9f411fc572854f7b25cc0daca30a144bb14e82a296381",
+      "exit_code": 0,
+      "node_tests_passed": 13,
+      "python_tests_passed": 14,
+      "package": {
+        "schema_version": 1,
+        "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+        "wasm_bindgen": "wasm-bindgen 0.2.129",
+        "source_sha256": "44619f9b7f22dcad0b1483829e17273ad96bf586d9125d69ce6ee9c5132aa323",
+        "source_files": 150,
+        "artifacts": {
+          "zpdf_wasm.js": "46ddc893a8a5888d6fad3e46464c72eba7ff29436a77060d4b14f98699745916",
+          "zpdf_wasm_bg.wasm": "702a87a9ba095dfb0120985c8c915e96e015242b3434c97e5dbf04b11b4f111e"
+        }
+      }
     }
   },
   "previous_lock_sha256": "4b5582155fb00882972849b074fb7f63140e91aa76a7209ec9780b86b50d590f",
@@ -461,8 +527,12 @@
     "crates/zpdf-core/src/stream_data.rs": "83b0bb1a1ee29e403669d1253aecd664f215d4977a56b8c004401b0b8ae5c9a9",
     "crates/zpdf-parser/src/object_parser.rs": "7fc725743519cd9837134ecb1d947845843159146c15a873fc29f6a44a99d065",
     "crates/zpdf-parser/src/lexer.rs": "01a7b705cffb9705865e8da401778b1ad0d295c044f72be27c56835af792c837",
-    "crates/zpdf-parser/src/lib.rs": "893b9c0760d93931e73e98bc47a76a8b08086c9b0c8e93319d732588c295a5c7",
+    "crates/zpdf-parser/src/lib.rs": "0fea20852481d7c6260d35fbef9040605d00d25860356afeb3eb0637ccf76fbc",
     "crates/zpdf-benches/Cargo.toml": "eacc07ccd41f37957164c3d033a296553aeb634c55db51733002717cc124cde9",
-    "crates/zpdf-benches/examples/shared_streams.rs": "5d6756e67defafbae1b65358ffeea772e3481faaf5a9634ddc459a230e69d978"
-  }
+    "crates/zpdf-benches/examples/shared_streams.rs": "5d6756e67defafbae1b65358ffeea772e3481faaf5a9634ddc459a230e69d978",
+    "crates/zpdf-parser/src/crypt.rs": "92bb1a1b1800feaf93ff894a6d38673f855153e303fa2aca2f0aa8bffdbcad3d",
+    "crates/zpdf-writer/src/lib.rs": "c3e10ffdd07efe64b0780b13293701e1047f9653cb33f0221ad139a37062fe56",
+    "crates/zpdf-writer/src/object_stream_tests.rs": "90dabd3b6179c7df09d5f57518074e38bf1d73fabdd93bac909ee9b9a765cafe"
+  },
+  "optimization_confirmation": "measure-confirm"
 }

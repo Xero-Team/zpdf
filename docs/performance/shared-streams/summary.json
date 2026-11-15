@@ -2,13 +2,13 @@
   {
     "case": "raw-large",
     "pairs": 31,
-    "time_percent": -99.31,
+    "time_percent": -99.3,
     "interval": [
-      -99.31,
-      -99.3
+      -99.3,
+      -99.29
     ],
-    "baseline_ns": 148824,
-    "current_ns": 1026,
+    "baseline_ns": 137349,
+    "current_ns": 962,
     "peak_bytes": [
       8391576,
       3000
@@ -33,13 +33,13 @@
   {
     "case": "small-streams",
     "pairs": 31,
-    "time_percent": -6.02,
+    "time_percent": -5.96,
     "interval": [
-      -6.97,
-      -5.16
+      -6.26,
+      -5.47
     ],
-    "baseline_ns": 455628,
-    "current_ns": 424157,
+    "baseline_ns": 414767,
+    "current_ns": 391258,
     "peak_bytes": [
       2042696,
       1944392
@@ -64,13 +64,13 @@
   {
     "case": "tiny-streams",
     "pairs": 31,
-    "time_percent": -7.03,
+    "time_percent": -6.45,
     "interval": [
-      -8.04,
-      -5.89
+      -6.66,
+      -6.21
     ],
-    "baseline_ns": 448091,
-    "current_ns": 414986,
+    "baseline_ns": 407985,
+    "current_ns": 384556,
     "peak_bytes": [
       1919816,
       1919816
@@ -95,13 +95,13 @@
   {
     "case": "scalar-objects",
     "pairs": 31,
-    "time_percent": -18.57,
+    "time_percent": -17.5,
     "interval": [
-      -19.53,
-      -18.18
+      -18.45,
+      -16.86
     ],
-    "baseline_ns": 568093,
-    "current_ns": 460329,
+    "baseline_ns": 518939,
+    "current_ns": 426223,
     "peak_bytes": [
       1687372,
       1687372
@@ -126,13 +126,13 @@
   {
     "case": "cold-open",
     "pairs": 31,
-    "time_percent": -4.19,
+    "time_percent": -4.04,
     "interval": [
-      -4.44,
-      -3.83
+      -4.54,
+      -3.65
     ],
-    "baseline_ns": 807,
-    "current_ns": 775,
+    "baseline_ns": 744,
+    "current_ns": 715,
     "peak_bytes": [
       1967,
       1965
@@ -159,11 +159,11 @@
     "pairs": 31,
     "time_percent": -0.94,
     "interval": [
-      -1.34,
-      -0.33
+      -1.78,
+      -0.51
     ],
-    "baseline_ns": 1510,
-    "current_ns": 1496,
+    "baseline_ns": 1388,
+    "current_ns": 1375,
     "peak_bytes": [
       27584,
       27584
@@ -193,8 +193,8 @@
       -99.36,
       -99.34
     ],
-    "baseline_ns": 149355,
-    "current_ns": 965,
+    "baseline_ns": 137543,
+    "current_ns": 897,
     "peak_bytes": [
       8391436,
       2046
@@ -219,13 +219,13 @@
   {
     "case": "recovery",
     "pairs": 31,
-    "time_percent": -13.68,
+    "time_percent": -12.92,
     "interval": [
-      -14.89,
-      -13.01
+      -13.51,
+      -12.01
     ],
-    "baseline_ns": 3488889,
-    "current_ns": 3092149,
+    "baseline_ns": 3280181,
+    "current_ns": 2867412,
     "peak_bytes": [
       8391464,
       2888
@@ -250,13 +250,13 @@
   {
     "case": "encrypted",
     "pairs": 31,
-    "time_percent": -2.05,
+    "time_percent": -1.98,
     "interval": [
-      -3.15,
-      -1.12
+      -2.12,
+      -1.76
     ],
-    "baseline_ns": 1961740,
-    "current_ns": 1924795,
+    "baseline_ns": 1807663,
+    "current_ns": 1772167,
     "peak_bytes": [
       6294772,
       4197652
@@ -281,13 +281,13 @@
   {
     "case": "imports",
     "pairs": 31,
-    "time_percent": -0.04,
+    "time_percent": -0.22,
     "interval": [
-      -0.54,
-      0.49
+      -0.43,
+      0.06
     ],
-    "baseline_ns": 625802,
-    "current_ns": 626683,
+    "baseline_ns": 578044,
+    "current_ns": 577033,
     "peak_bytes": [
       8402213,
       8402213
@@ -312,13 +312,13 @@
   {
     "case": "pipeline",
     "pairs": 31,
-    "time_percent": -2.91,
+    "time_percent": -1.57,
     "interval": [
-      -4.41,
-      -0.75
+      -2.29,
+      1.46
     ],
-    "baseline_ns": 139830,
-    "current_ns": 137148,
+    "baseline_ns": 126624,
+    "current_ns": 124590,
     "peak_bytes": [
       83933,
       83133
@@ -343,13 +343,13 @@
   {
     "case": "owned-streams",
     "pairs": 31,
-    "time_percent": -26.91,
+    "time_percent": -27.98,
     "interval": [
-      -27.52,
-      -26.29
+      -28.73,
+      -27.48
     ],
-    "baseline_ns": 28463,
-    "current_ns": 20829,
+    "baseline_ns": 26235,
+    "current_ns": 18875,
     "peak_bytes": [
       196736,
       196736
@@ -374,13 +374,13 @@
   {
     "case": "borrowed-parse",
     "pairs": 31,
-    "time_percent": -29.93,
+    "time_percent": -29.5,
     "interval": [
-      -30.72,
-      -28.67
+      -29.93,
+      -29.2
     ],
-    "baseline_ns": 150,
-    "current_ns": 106,
+    "baseline_ns": 138,
+    "current_ns": 97,
     "peak_bytes": [
       1772,
       958

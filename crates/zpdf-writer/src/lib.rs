@@ -1071,6 +1071,9 @@ fn detect_xref_kind(data: &[u8], pos: u64) -> XrefKind {
 }
 
 #[cfg(test)]
+mod object_stream_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Cursor;

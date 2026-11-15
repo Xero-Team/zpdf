@@ -22,6 +22,8 @@
 //! compressed stream are **not** decrypted individually (the container stream
 //! is), and the `/Encrypt` dictionary itself is never decrypted.
 
+use std::borrow::Cow;
+
 use aes::cipher::{BlockModeDecrypt, BlockModeEncrypt, KeyIvInit};
 use sha2::Digest;
 use zpdf_core::{Error, ObjectId, PdfDict, PdfObject, PdfString, Result};
@@ -243,11 +245,38 @@ impl Decryptor {
         self.walk(obj, id);
     }
 
-    /// Decrypt a raw stream byte buffer with the per-object key for `id`. Used
-    /// for the `/Type /ObjStm` container, which is decrypted directly (not via
-    /// [`decrypt_object`](Self::decrypt_object)) before its filter pipeline.
+    /// Decrypt a raw stream byte buffer with the document's default stream
+    /// cipher and the key for `id`. This low-level API does not inspect a stream
+    /// dictionary; object parsing also honors per-stream crypt filters.
     pub fn decrypt_stream_bytes(&self, id: ObjectId, data: &[u8]) -> Vec<u8> {
         self.decrypt(id, data, self.stm_algo)
+    }
+
+    /// Shared policy for ordinary streams and ObjStm containers. Identity
+    /// borrows its bytes; encrypted streams allocate just the plaintext buffer,
+    /// which the object-stream path can decode without first copying into Arc.
+    #[inline]
+    pub(crate) fn decrypt_stream_with_dict<'a>(
+        &self,
+        id: ObjectId,
+        dict: &PdfDict,
+        data: &'a [u8],
+    ) -> Cow<'a, [u8]> {
+        let (algo, explicit) = self.stream_algo(dict);
+        if algo == Algo::Identity {
+            return Cow::Borrowed(data);
+        }
+        Cow::Owned(if explicit {
+            // Explicit /Crypt uses the file key without Algorithm 1
+            // (ISO 32000-1 §7.4.10), just as on the write path.
+            match algo {
+                Algo::Rc4 => rc4(&self.key, data),
+                Algo::AesV2 | Algo::AesV3 => aes_cbc_decrypt(&self.key, data),
+                Algo::Identity => unreachable!(),
+            }
+        } else {
+            self.decrypt(id, data, algo)
+        })
     }
 
     /// **Encrypt** a stream payload for object `id` (the write-side inverse of
@@ -387,19 +416,7 @@ impl Decryptor {
                 }
             }
             PdfObject::Stream(s) => {
-                let (algo, explicit) = self.stream_algo(&s.dict);
-                if algo != Algo::Identity {
-                    // An explicit /Crypt uses the security handler's key as
-                    // is, without Algorithm 1 (ISO 32000-1 section 7.4.10).
-                    let dec = if explicit {
-                        match algo {
-                            Algo::Rc4 => rc4(&self.key, &s.data),
-                            Algo::AesV2 | Algo::AesV3 => aes_cbc_decrypt(&self.key, &s.data),
-                            Algo::Identity => unreachable!(),
-                        }
-                    } else {
-                        self.decrypt(id, &s.data, algo)
-                    };
+                if let Cow::Owned(dec) = self.decrypt_stream_with_dict(id, &s.dict, &s.data) {
                     s.data = dec.into();
                 }
                 for v in s.dict.0.values_mut() {
@@ -1440,6 +1457,11 @@ mod tests {
                         _ => aes_cbc_decrypt(&dec.key, &written),
                     };
                     assert_eq!(decoded, plain, "explicit writes use the file key");
+                    assert_eq!(
+                        &*dec.decrypt_stream_with_dict(id, &dict, &encrypted),
+                        plain,
+                        "direct container decryption uses the same explicit file key"
+                    );
                     let mut obj =
                         PdfObject::Stream(PdfStream::new(dict.clone(), encrypted.clone()));
                     dec.decrypt_object(&mut obj, id);
@@ -1484,6 +1506,10 @@ mod tests {
                 plain,
                 "{typ}"
             );
+            assert!(matches!(
+                dec.decrypt_stream_with_dict(id, &dict, plain),
+                Cow::Borrowed(bytes) if bytes.as_ptr() == plain.as_ptr()
+            ));
         }
         let mut crypt = PdfDict::new();
         crypt.insert(
@@ -1495,6 +1521,10 @@ mod tests {
             plain,
             "default Identity"
         );
+        assert!(matches!(
+            dec.decrypt_stream_with_dict(id, &crypt, plain),
+            Cow::Borrowed(bytes) if bytes.as_ptr() == plain.as_ptr()
+        ));
         let mut metadata = PdfDict::new();
         metadata.insert(
             PdfName::new("Type"),

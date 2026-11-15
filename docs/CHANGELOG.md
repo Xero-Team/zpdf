@@ -10,6 +10,9 @@
 - Serialize stream replacements through the stream writer, including encryption,
   when using `IncrementalWriter::overwrite_object`. Honor explicit crypt filters,
   attachment filters and unencrypted metadata/xref payloads on write. (#144)
+- Honor object-stream containers' own crypt filters when reopening encrypted
+  updates. Share ordinary-stream decryption policy, borrow Identity payloads and
+  avoid decrypting compressed member strings twice. (#144)
 - Reap completed macOS ACL test children before retrying a zombie-group signal;
   retain failures for live-process signal denials and always close output pipes.
 - Reuse compact page-content buffers and reconstruct TIFF predictor samples in
