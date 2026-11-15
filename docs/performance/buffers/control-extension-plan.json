@@ -1,0 +1,12 @@
+{
+  "cases": [
+    "pipeline",
+    "flate"
+  ],
+  "additional_pairs": 64,
+  "pooled_pairs": 75,
+  "reason": "The fixed final 11-pair comparison had upper bootstrap bounds above +5% for these controls; keep the initial 11 pairs and append exactly 64 pairs with the same binaries, inputs, order and per-process protocol. No early stopping.",
+  "wasm_pairs": 7,
+  "wasm_samples_per_process": 11,
+  "wasm_first_transfer_measured_separately": true
+}

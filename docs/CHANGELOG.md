@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Reuse compact page-content buffers and reconstruct TIFF predictor samples in
+  place, reducing transient copies without changing output or decode limits.
+- Add `PageBitmap.into_rgba()` to transfer WASM raster pixels without cloning
+  them inside Rust; retain `rgba()` and update the browser demo and package.
+
 ## 0.19.0 — Redaction hardening and native save validation
 
 Released 2026-11-15.

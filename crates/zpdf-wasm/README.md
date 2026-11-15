@@ -60,13 +60,20 @@ pdf.title       // string | undefined
 pdf.page_size(0)  // [width_pt, height_pt]
 
 const bitmap = pdf.render_page(0, scale);  // scale = dpi / 72
-// bitmap.width, bitmap.height (pixels), bitmap.rgba() → Uint8Array
-const imgData = new ImageData(new Uint8ClampedArray(bitmap.rgba().buffer), bitmap.width, bitmap.height);
+const width = bitmap.width, height = bitmap.height;
+const rgba = bitmap.into_rgba();  // consumes bitmap; do not call bitmap.free()
+const imgData = new ImageData(new Uint8ClampedArray(rgba.buffer), width, height);
 canvas.getContext("2d").putImageData(imgData, 0, 0);
 
 const text = pdf.page_text(0);  // reading-order plain text
 const svg = pdf.page_svg(0);    // standalone vector SVG
 ```
+
+`into_rgba()` transfers the pixel buffer without an intermediate Rust clone.
+The bindings still copy pixels into a JavaScript-owned `Uint8Array`; this is
+not a borrowed view into WASM memory. Read dimensions before consuming the
+bitmap. The existing `rgba()` method remains available for repeated copies;
+when using it, call `bitmap.free()` after the last copy.
 
 ## Editing
 

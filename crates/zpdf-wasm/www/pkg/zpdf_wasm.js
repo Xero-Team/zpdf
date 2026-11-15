@@ -92,6 +92,20 @@ export class PageBitmap {
         return ret >>> 0;
     }
     /**
+     * Consume this bitmap and transfer its RGBA8 buffer to JavaScript.
+     * Avoids cloning pixels inside WASM; the bindings still copy them to a
+     * JavaScript-owned Uint8Array. Read width/height first, and do not use or
+     * free the consumed bitmap afterwards.
+     * @returns {Uint8Array}
+     */
+    into_rgba() {
+        const ptr = this.__destroy_into_raw();
+        const ret = wasm.pagebitmap_into_rgba(ptr);
+        var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        return v1;
+    }
+    /**
      * The RGBA8 pixels (copied out to a `Uint8Array`).
      * @returns {Uint8Array}
      */

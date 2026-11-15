@@ -1,0 +1,42 @@
+{
+  "baseline_commit": "0e0f8dd3d3e4d12269197758ef5b651e221514b2",
+  "rustc": "1.99.1 (58cf8f9c3 2026-10-13)",
+  "kernel": "Linux 6.8.0-117-generic aarch64",
+  "cpu": "Apple vendor, model not exposed; four visible CPUs; Docker quota two CPUs",
+  "memory_limit_bytes": 5368709120,
+  "lock_sha256": "4b5582155fb00882972849b074fb7f63140e91aa76a7209ec9780b86b50d590f",
+  "phases": {
+    "measure-native": {
+      "snapshot_sha256": "a67c7c3fbcd07a15596c2c02bf57189485b9966d7fd3aae00699894329346972",
+      "image_id": "sha256:ea15510f04ded2c73682c87d70aa8d0e8697c7feb2b0aebf626e92ed29f93fde",
+      "raw_sha256": "8a2f58d5559c91acb6854d22ed1326cec80f5294d68446ec27d5a16c27514991",
+      "binary_sha256": {
+        "baseline": "743e7bd1c140b47ba443404fe844ba145da4cf9779041005b4016cdad26d48b0",
+        "current": "2a9b15573e6484f645b98900471856153c84613b99f38c69c8ef2cc951a45d2d"
+      }
+    },
+    "measure-native-final": {
+      "snapshot_sha256": "b5d010765ff311fc26479fed5a00f98eb5b2622756f8e04961335fe6fbb09496",
+      "image_id": "sha256:ea15510f04ded2c73682c87d70aa8d0e8697c7feb2b0aebf626e92ed29f93fde",
+      "raw_sha256": "850cf00645d85613fcb81bd614945224cd14724f9e3e85c98c220d85eddff8a5",
+      "binary_sha256": {
+        "baseline": "743e7bd1c140b47ba443404fe844ba145da4cf9779041005b4016cdad26d48b0",
+        "current": "cdec61b3387775424e3d840d71461035aea8532e4c4c29d54b17caf6a85e88f6"
+      }
+    },
+    "measure-controls": {
+      "snapshot_sha256": "54a5dbfcded0ceb487ba4abf3aae9b3309cc601f862474fe05c68c3b592a3a97",
+      "image_id": "sha256:ea15510f04ded2c73682c87d70aa8d0e8697c7feb2b0aebf626e92ed29f93fde",
+      "raw_sha256": "21549433f3410930adec325e1a208ca51d74c126758de2421068444e2a00c012",
+      "binary_sha256": {
+        "baseline": "743e7bd1c140b47ba443404fe844ba145da4cf9779041005b4016cdad26d48b0",
+        "current": "cdec61b3387775424e3d840d71461035aea8532e4c4c29d54b17caf6a85e88f6"
+      }
+    },
+    "wasm-final": {
+      "snapshot_sha256": "b5d010765ff311fc26479fed5a00f98eb5b2622756f8e04961335fe6fbb09496",
+      "image_id": "sha256:ea15510f04ded2c73682c87d70aa8d0e8697c7feb2b0aebf626e92ed29f93fde",
+      "raw_sha256": "8e5941efbbafaf86a50548db66d42fa65d7771ba2df8593cdf5425ff440f6922"
+    }
+  }
+}

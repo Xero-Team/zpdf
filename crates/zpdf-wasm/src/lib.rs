@@ -49,6 +49,14 @@ impl PageBitmap {
     pub fn rgba(&self) -> Vec<u8> {
         self.rgba.clone()
     }
+
+    /// Consume this bitmap and transfer its RGBA8 buffer to JavaScript.
+    /// Avoids cloning pixels inside WASM; the bindings still copy them to a
+    /// JavaScript-owned Uint8Array. Read width/height first, and do not use or
+    /// free the consumed bitmap afterwards.
+    pub fn into_rgba(self) -> Vec<u8> {
+        self.rgba
+    }
 }
 
 /// An open PDF document.
@@ -889,6 +897,23 @@ pub fn optimize(data: &[u8], opts: OptimizeOptions) -> Result<Vec<u8>, JsError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bitmap_transfer_reuses_pixels_and_copy_api_stays_independent() {
+        let bitmap = PageBitmap {
+            width: 2,
+            height: 1,
+            rgba: vec![1, 2, 3, 255, 4, 5, 6, 255],
+        };
+        let pointer = bitmap.rgba.as_ptr();
+        let mut copy = bitmap.rgba();
+        assert_ne!(copy.as_ptr(), pointer);
+        copy[0] = 99;
+        assert_eq!((bitmap.width(), bitmap.height()), (2, 1));
+        let transferred = bitmap.into_rgba();
+        assert_eq!(transferred.as_ptr(), pointer);
+        assert_eq!(transferred, [1, 2, 3, 255, 4, 5, 6, 255]);
+    }
 
     /// Minimal single-page PDF exercising open → size → render → text → svg
     /// natively (the same code paths the wasm build runs).
