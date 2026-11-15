@@ -38,5 +38,9 @@
     "parent_plan": "longbench-plan.json",
     "change": "Expose checked length directly and inline slice accessors/cache-hit path; same fixed counts. Previous inline run overlapped briefly with rustfmt and is retained as exploratory only.",
     "candidate": "3"
+  },
+  "review-plan.json": {
+    "parent_plan": "longbench-plan.json",
+    "reason": "Revalidate full 31-pair plan after dictionary-aware stream encryption review fix; same harness and baseline executable, no selective extension."
   }
 }

@@ -611,7 +611,7 @@ impl IncrementalWriter {
                             _ => unreachable!(),
                         };
                         let encrypted = dec
-                            .try_encrypt_stream_bytes(id, data)
+                            .try_encrypt_stream_with_dict(id, &dict, data)
                             .map_err(io::Error::other)?;
                         write_stream(&mut out, num, *gen as u32, &dict, &encrypted)?
                     }

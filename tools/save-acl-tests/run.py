@@ -26,6 +26,22 @@ class ChildFailure(RuntimeError):
         self.output = output[:64 * 1024]
 
 
+def kill_child_group(process):
+    try:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except PermissionError:
+            # XNU killpg1 skips zombies and may return EPERM when no live
+            # member remains. Reap a completed leader, then retry the group:
+            # surviving descendants must still be killed, and a real signal
+            # denial must still fail rather than silently bypass cleanup.
+            if sys.platform != "darwin" or process.poll() is None:
+                raise
+            os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
 def collect_child(process, *, output_limit=4 * 1024**2, wall_seconds=180, monitor=None):
     """Drain a new process group without unbounded communicate() buffering."""
     output = bytearray()
@@ -65,11 +81,12 @@ def collect_child(process, *, output_limit=4 * 1024**2, wall_seconds=180, monito
         # This does not cover descendants that deliberately leave that group;
         # the disposable runner VM/job lifetime remains the outer boundary.
         try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        process.wait(timeout=5)
-        process.stdout.close()
+            kill_child_group(process)
+        finally:
+            try:
+                process.wait(timeout=5)
+            finally:
+                process.stdout.close()
 
 
 def monitor_darwin_group(pid):

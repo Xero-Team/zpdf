@@ -68,8 +68,10 @@ impl PdfStreamData {
         self.0.range.is_empty()
     }
 
-    /// Return an independent visible-byte buffer. A whole-allocation view is
-    /// already detached and can be reused; a partial view copies its bytes.
+    /// Retain only the visible byte allocation. Partial views copy their bytes;
+    /// whole-allocation views reuse their backing because it has no unrelated
+    /// bytes, including views made with [`Self::from_shared`]. This does not
+    /// guarantee unique ownership or a different allocation identity.
     pub fn into_detached(self) -> Self {
         if self.is_whole() {
             self
@@ -200,6 +202,9 @@ mod tests {
         let data = PdfStreamData::from(Arc::clone(&bytes));
         assert!(Arc::ptr_eq(&data.clone().into_arc(), &bytes));
         assert!(Arc::ptr_eq(&data.into_detached().into_arc(), &bytes));
+        let whole = PdfStreamData::from_shared(Arc::clone(&bytes), 0..bytes.len()).unwrap();
+        assert!(Arc::ptr_eq(&whole.to_detached().into_arc(), &bytes));
+        assert!(Arc::ptr_eq(&whole.into_detached().into_arc(), &bytes));
     }
 
     #[test]

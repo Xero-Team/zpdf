@@ -123,3 +123,59 @@ fn overwritten_encrypted_stream_is_reencrypted_without_mutating_source() {
     let result = PdfFile::parse_with_password(out.into_inner(), b"user").unwrap();
     assert_eq!(result.resolve_stream_data(id).unwrap(), expected);
 }
+
+#[test]
+fn overwritten_identity_stream_stays_plain_in_an_encrypted_document() {
+    use zpdf_core::{PdfName, PdfStream};
+    use zpdf_writer::{rewrite_pdf, EncryptionConfig, RewriteOptions};
+    let encrypted = rewrite_pdf(
+        &PdfFile::parse(page()).unwrap(),
+        &RewriteOptions {
+            encrypt: Some(EncryptionConfig::aes256("user", "owner")),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    for array in [false, true] {
+        for alias in ["DecodeParms", "DP"] {
+            let mut writer =
+                IncrementalWriter::new_with_password(encrypted.clone(), b"user").unwrap();
+            let id = writer.document().page(0).unwrap().contents[0];
+            let mut dict = PdfDict::new();
+            let mut params = PdfDict::new();
+            params.insert(
+                PdfName::new("Name"),
+                PdfObject::Name(PdfName::new("Identity")),
+            );
+            let filter = PdfObject::Name(PdfName::new("Crypt"));
+            let params = PdfObject::Dict(params);
+            dict.insert(
+                PdfName::new("Filter"),
+                if array {
+                    PdfObject::Array(vec![filter])
+                } else {
+                    filter
+                },
+            );
+            dict.insert(
+                PdfName::new(alias),
+                if array {
+                    PdfObject::Array(vec![params])
+                } else {
+                    params
+                },
+            );
+            let plain = b"0 0 1 rg 10 10 20 20 re f";
+            writer.overwrite_object(id, PdfObject::Stream(PdfStream::new(dict, plain.to_vec())));
+            let mut out = Cursor::new(Vec::new());
+            writer.write(&mut out).unwrap();
+            assert!(out.get_ref().starts_with(&encrypted));
+            let result = PdfFile::parse_with_password(out.into_inner(), b"user").unwrap();
+            assert_eq!(
+                result.resolve_stream_data(id).unwrap(),
+                plain,
+                "array={array}, {alias}"
+            );
+        }
+    }
+}

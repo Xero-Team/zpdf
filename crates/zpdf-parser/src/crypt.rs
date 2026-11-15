@@ -269,6 +269,28 @@ impl Decryptor {
         self.encrypt(id, data, self.stm_algo)
     }
 
+    /// Encrypt encoded stream bytes using the same dictionary-specific policy
+    /// as [`Self::decrypt_object`]. Honors explicit `/Crypt`, `/EFF`, unencrypted
+    /// metadata and xref streams. An explicit crypt filter uses the file key
+    /// directly (ISO 32000-1 §7.4.10), rather than the default object-key path.
+    pub fn try_encrypt_stream_with_dict(
+        &self,
+        id: ObjectId,
+        dict: &PdfDict,
+        data: &[u8],
+    ) -> Result<Vec<u8>> {
+        let (algo, explicit) = self.stream_algo(dict);
+        if explicit {
+            match algo {
+                Algo::Identity => Ok(data.to_vec()),
+                Algo::Rc4 => Ok(rc4(&self.key, data)),
+                Algo::AesV2 | Algo::AesV3 => aes_cbc_encrypt(&self.key, data),
+            }
+        } else {
+            self.encrypt(id, data, algo)
+        }
+    }
+
     /// **Encrypt** a string payload for object `id`.
     ///
     /// # Panics
@@ -365,17 +387,8 @@ impl Decryptor {
                 }
             }
             PdfObject::Stream(s) => {
-                let typ = s.dict.get_name("Type").unwrap_or("");
-                // Cross-reference streams are never encrypted (PDF 1.7 §7.6.1).
-                let is_xref = typ == "XRef";
-                // /EncryptMetadata false: metadata stream payloads are stored
-                // in the clear; "decrypting" them would corrupt the XMP.
-                // Limitation: only streams self-identifying as /Type /Metadata
-                // are detectable here (we don't know if this object is the
-                // catalog's /Metadata target) — that covers conforming files.
-                let plain_meta = !self.encrypt_metadata && typ == "Metadata";
                 let (algo, explicit) = self.stream_algo(&s.dict);
-                if !is_xref && !plain_meta && algo != Algo::Identity {
+                if algo != Algo::Identity {
                     // An explicit /Crypt uses the security handler's key as
                     // is, without Algorithm 1 (ISO 32000-1 section 7.4.10).
                     let dec = if explicit {
@@ -403,6 +416,13 @@ impl Decryptor {
     /// `Identity` — ISO 32000-1 §7.4.10), else `/EFF` for an embedded file,
     /// else `/StmF`.
     fn stream_algo(&self, dict: &PdfDict) -> (Algo, bool) {
+        let typ = dict.get_name("Type").unwrap_or("");
+        // ISO 32000-1 §7.6.1: xref streams are never encrypted. Metadata is
+        // exempt when /EncryptMetadata is false. As on the read path, only
+        // conforming streams self-identifying as /Type /Metadata are detectable.
+        if typ == "XRef" || (!self.encrypt_metadata && typ == "Metadata") {
+            return (Algo::Identity, false);
+        }
         let first_filter = match dict.get("Filter") {
             Some(PdfObject::Name(n)) => Some(n.as_str()),
             Some(PdfObject::Array(a)) => a.first().and_then(|f| f.as_name().ok()),
@@ -427,7 +447,7 @@ impl Decryptor {
                 .map_or(self.stm_algo, |&(_, algo)| algo);
             return (algo, true);
         }
-        if dict.get_name("Type").ok() == Some("EmbeddedFile") {
+        if typ == "EmbeddedFile" {
             return (self.eff_algo, false);
         }
         (self.stm_algo, false)
@@ -1414,6 +1434,12 @@ mod tests {
                     },
                 );
                 for id in [ObjectId(9, 0), ObjectId(512, 2)] {
+                    let written = dec.try_encrypt_stream_with_dict(id, &dict, plain).unwrap();
+                    let decoded = match algo {
+                        Algo::Rc4 => rc4(&dec.key, &written),
+                        _ => aes_cbc_decrypt(&dec.key, &written),
+                    };
+                    assert_eq!(decoded, plain, "explicit writes use the file key");
                     let mut obj =
                         PdfObject::Stream(PdfStream::new(dict.clone(), encrypted.clone()));
                     dec.decrypt_object(&mut obj, id);
@@ -1434,6 +1460,51 @@ mod tests {
                 &*stream.data, plain,
                 "implicit filters still use Algorithm 1"
             );
+        }
+    }
+
+    #[test]
+    fn stream_writes_honor_plaintext_exceptions_and_attachment_filter() {
+        let mut dec = Decryptor {
+            key: vec![42; 16],
+            stm_algo: Algo::AesV2,
+            str_algo: Algo::AesV2,
+            eff_algo: Algo::Identity,
+            crypt_filters: Vec::new(),
+            encrypt_id: None,
+            encrypt_metadata: false,
+        };
+        let id = ObjectId(9, 0);
+        let plain = b"stream payload";
+        for typ in ["XRef", "Metadata", "EmbeddedFile"] {
+            let mut dict = PdfDict::new();
+            dict.insert(PdfName::new("Type"), PdfObject::Name(PdfName::new(typ)));
+            assert_eq!(
+                dec.try_encrypt_stream_with_dict(id, &dict, plain).unwrap(),
+                plain,
+                "{typ}"
+            );
+        }
+        let mut crypt = PdfDict::new();
+        crypt.insert(
+            PdfName::new("Filter"),
+            PdfObject::Name(PdfName::new("Crypt")),
+        );
+        assert_eq!(
+            dec.try_encrypt_stream_with_dict(id, &crypt, plain).unwrap(),
+            plain,
+            "default Identity"
+        );
+        let mut metadata = PdfDict::new();
+        metadata.insert(
+            PdfName::new("Type"),
+            PdfObject::Name(PdfName::new("Metadata")),
+        );
+        dec.encrypt_metadata = true;
+        for dict in [PdfDict::new(), metadata] {
+            let encrypted = dec.try_encrypt_stream_with_dict(id, &dict, plain).unwrap();
+            assert_ne!(encrypted, plain);
+            assert_eq!(dec.decrypt(id, &encrypted, Algo::AesV2), plain);
         }
     }
 

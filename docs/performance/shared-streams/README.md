@@ -42,22 +42,23 @@ operation, so accidentally retained source files would appear in retained heap.
 
 | Case | Peak bytes before → after | Retained bytes before → after | Time change | Paired 95% interval |
 | --- | --- | --- | --- | --- |
-| Resolve one 8 MiB raw stream | 8,391,576 → 2,720 | 8,391,576 → 2,720 | -99.24% | -99.25..-99.24% |
-| 1,024 streams, 128 bytes each | 2,042,696 → 1,747,696 | 2,042,696 → 1,747,696 | -0.30% | -0.90..+0.06% |
-| 1,024 streams, one byte each | 1,919,816 → 1,747,696 | 1,919,816 → 1,747,696 | -0.32% | -0.70..+0.08% |
-| 512 arrays of 32 integers | 1,687,372 → 1,416,948 | 1,687,372 → 1,416,948 | +0.39% | -0.30..+0.97% |
-| Open without resolving the stream | 1,967 → 1,791 | 1,136 → 1,048 | -0.40% | -0.67..-0.14% |
-| Clone 32 cached stream objects | 27,584 → 24,512 | 27,584 → 24,512 | -1.01% | -1.41..-0.57% |
-| Resolve 8 MiB with object cache disabled | 8,391,436 → 2,588 | 8,390,622 → 1,862 | -99.30% | -99.30..-99.28% |
-| Recover damaged xref, resolve 8 MiB | 8,391,464 → 2,608 | 8,391,464 → 2,608 | -12.70% | -13.47..-12.10% |
-| Resolve encrypted 2 MiB stream | 6,294,772 → 4,197,340 | 2,101,330 → 2,100,970 | -1.82% | -2.04..-1.75% |
-| Import four documents with unused 4 MiB payloads | 8,402,213 → 8,401,069 | 14,510 → 13,182 | -0.12% | -0.38..-0.05% |
-| Open, interpret and rasterize 32 rectangles | 83,933 → 82,613 | 65,536 → 65,536 | +1.05% | -0.02..+1.80% |
+| Resolve one 8 MiB raw stream | 8,391,576 → 2,720 | 8,391,576 → 2,720 | -99.24% | -99.25..-99.23% |
+| 1,024 streams, 128 bytes each | 2,042,696 → 1,747,696 | 2,042,696 → 1,747,696 | +0.45% | +0.18..+0.73% |
+| 1,024 streams, one byte each | 1,919,816 → 1,747,696 | 1,919,816 → 1,747,696 | +0.48% | +0.21..+1.03% |
+| 512 arrays of 32 integers | 1,687,372 → 1,416,948 | 1,687,372 → 1,416,948 | -0.54% | -1.36..+0.23% |
+| Open without resolving the stream | 1,967 → 1,791 | 1,136 → 1,048 | -0.53% | -1.07..-0.26% |
+| Clone 32 cached stream objects | 27,584 → 24,512 | 27,584 → 24,512 | -1.14% | -1.66..-0.86% |
+| Resolve 8 MiB with object cache disabled | 8,391,436 → 2,588 | 8,390,622 → 1,862 | -99.29% | -99.30..-99.29% |
+| Recover damaged xref, resolve 8 MiB | 8,391,464 → 2,608 | 8,391,464 → 2,608 | -13.12% | -14.21..-12.31% |
+| Resolve encrypted 2 MiB stream | 6,294,772 → 4,197,340 | 2,101,330 → 2,100,970 | -1.66% | -1.83..-1.60% |
+| Import four documents with unused 4 MiB payloads | 8,402,213 → 8,401,069 | 14,510 → 13,182 | -0.14% | -0.46..+0.23% |
+| Open, interpret and rasterize 32 rectangles | 83,933 → 82,613 | 65,536 → 65,536 | +0.34% | -0.53..+2.50% |
 
-Peak and retained heap do not increase in these cases. No final interval lies
-wholly above zero, but this is **not a universal no-regression guarantee**.
-The scalar and raster point estimates are slightly slower; the raster interval
-in particular is close to zero and does not establish a speedup. The large raw
+Peak and retained heap do not increase in these cases. The final small-stream
+and tiny-stream timings show slight slowdowns (+0.45% and +0.48%) with positive
+95% intervals. These are explicitly reported and require a performance tradeoff
+decision under the issue acceptance plan. The raster interval spans zero and
+does not establish a speedup. There is **no universal no-regression guarantee**. The large raw
 stream result measures parse/resolve and destruction, not decompression or full
 PDF rendering. Decryption and imports add respectively one and eight descriptor
 allocations, even though their peak/retained bytes fall. Allocation counts and
@@ -85,7 +86,7 @@ target/release/examples/shared_streams pipeline 48
 ```
 
 Use every case/count in `measurement-plans.json`, alternate executable order
-per pair, and keep every JSON result. `measurements.jsonl` records all four
+per pair, and keep every JSON result. `measurements.jsonl` records all five
 measurement phases; `summary.json` contains the final phase, and
 `provenance.json` records snapshot, image, dependency-lock and binary hashes.
 

@@ -2,7 +2,7 @@
   "baseline_commit": "4c5e4a5995d072c99496368fd18ee7b27662c1d0",
   "baseline_tree": "6d4ee20b908990edd987614f806c257f3ce47f1d",
   "lock_sha256": "4b5582155fb00882972849b074fb7f63140e91aa76a7209ec9780b86b50d590f",
-  "final_measurement": "measure-accessors",
+  "final_measurement": "measure-review",
   "phases": {
     "measure-candidate-1": {
       "snapshot_sha256": "b117e3698712cc29779d411ca51fa5767806510b34a7bc05a8e151d73296eff8",
@@ -121,13 +121,39 @@
       "image_id": "sha256:ea15510f04ded2c73682c87d70aa8d0e8697c7feb2b0aebf626e92ed29f93fde",
       "elapsed_seconds": 16.779,
       "exit_code": 0
+    },
+    "current-review": {
+      "snapshot_sha256": "8fba77cbfe513ce2cac425deb1e54476fa5fbf0939b83b5991ce5b79ba374c9d",
+      "image_id": "sha256:ea15510f04ded2c73682c87d70aa8d0e8697c7feb2b0aebf626e92ed29f93fde",
+      "exit_code": 0
+    },
+    "measure-review": {
+      "snapshot_sha256": "8fba77cbfe513ce2cac425deb1e54476fa5fbf0939b83b5991ce5b79ba374c9d",
+      "image_id": "sha256:ea15510f04ded2c73682c87d70aa8d0e8697c7feb2b0aebf626e92ed29f93fde",
+      "exit_code": 0,
+      "raw_sha256": "ec9775ea8fae084179e3ba805d502e6ffe027d8ab3ea8d2c2f02a68805006a85",
+      "binary_sha256": {
+        "baseline": "326f37a49c08b8d8b9661e4a570ac0d9897a56302fae7b941ef2bbd376f10d29",
+        "current": "f528d107f1044e0165068b9ffb69ca6f83f39e8725c9b928d9af4f97736ba823"
+      },
+      "limits": {
+        "network": "none",
+        "cpus": 2,
+        "memory_bytes": 5368709120,
+        "pids": 192,
+        "file_bytes": 536870912,
+        "scratch_bytes": 3670016000,
+        "wall_seconds": 900,
+        "cpu_seconds": 1100
+      }
     }
   },
   "notes": {
     "measure-candidate-1": "Exploratory 15-pair short batches; no inline/accessor optimization.",
     "measure-long-1": "31-pair longer batches confirmed +0.73% warm-read slowdown; not accepted as final.",
     "measure-inline": "Cache-path inline experiment. Brief overlap with rustfmt; retained as exploratory, excluded from final inference.",
-    "measure-accessors": "Final candidate with inlined cache path and direct checked-length/slice accessors. 31 pairs, no concurrent target build."
+    "measure-accessors": "Pre-review implementation, 31 pairs without concurrent builds.",
+    "measure-review": "Final review fixes: dictionary-aware stream write encryption, detached-view documentation and macOS runner cleanup. Full 31-pair revalidation, same harness and archived baseline; no concurrent build."
   },
   "validation": {
     "baseline-proof": {
@@ -157,6 +183,43 @@
         "artifacts": {
           "zpdf_wasm.js": "46ddc893a8a5888d6fad3e46464c72eba7ff29436a77060d4b14f98699745916",
           "zpdf_wasm_bg.wasm": "407bd8b38840e0c5a63c0ded3d299699fe110838d6f2cabd897b138cb3125e37"
+        }
+      }
+    },
+    "acl-repro": {
+      "snapshot_sha256": "575440d46abc884eea43231a1a237529bed5a49904a8be1c5cf4077461870561",
+      "result_sha256": "be3f01c8e39c0edaa32eb621f7ade08ea76a26172717182e2d4e4b75448eedfd",
+      "exit_code": 0,
+      "expected_test_outcome": "Regression fails before the cleanup fix with PermissionError: zombie group."
+    },
+    "crypt-repro": {
+      "snapshot_sha256": "9fb78560aa5706ffa77b14983fc19e5fd414a4bdbf8b7bf167af256fda29db29",
+      "result_sha256": "ad4060c1cbf645c7f2f03f9149590e549cf14eb917234bf982b2789ea7633016",
+      "exit_code": 0,
+      "expected_test_outcome": "Identity overwrite regression fails before policy fix with ciphertext instead of plaintext."
+    },
+    "native-review": {
+      "snapshot_sha256": "8fba77cbfe513ce2cac425deb1e54476fa5fbf0939b83b5991ce5b79ba374c9d",
+      "result_sha256": "0e341b9ea99db50ec1a3b491c5dcdbe19e31d6e6f7a77bb928aae64cc9794a9c",
+      "exit_code": 0,
+      "tests_passed": 511,
+      "acl_runner_tests_passed": 17
+    },
+    "wasm-review": {
+      "snapshot_sha256": "8fba77cbfe513ce2cac425deb1e54476fa5fbf0939b83b5991ce5b79ba374c9d",
+      "result_sha256": "238d4d19a48159f18da7e5c053309974d5bd18058f815955f1ee35e2b26fd04f",
+      "exit_code": 0,
+      "node_tests_passed": 13,
+      "python_tests_passed": 14,
+      "package": {
+        "schema_version": 1,
+        "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+        "wasm_bindgen": "wasm-bindgen 0.2.129",
+        "source_sha256": "22b015bb3224281473f0902627c871e4d1a426a543026dbc7514d82f083644bf",
+        "source_files": 149,
+        "artifacts": {
+          "zpdf_wasm.js": "46ddc893a8a5888d6fad3e46464c72eba7ff29436a77060d4b14f98699745916",
+          "zpdf_wasm_bg.wasm": "070f7210ae8ff7892e877e3578649d1f0229bdf10414da5b71fb09ec68430c92"
         }
       }
     }

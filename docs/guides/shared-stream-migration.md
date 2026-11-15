@@ -45,6 +45,9 @@ dropping the file can therefore keep the **entire source allocation** alive.
 Use `stream.data = stream.data.into_detached()` when this is undesirable;
 `to_detached()` returns a detached handle while preserving the original.
 Already independent payload allocations remain shared.
+Whole-range views also reuse their backing: there are no unrelated bytes to
+release. Detachment does not promise unique ownership or a new allocation
+identity, regardless of which constructor produced the view.
 
 `copy_object_graph`, page extraction and document append/merge detach imported
 stream payloads by default, so pending imported objects do not retain their
