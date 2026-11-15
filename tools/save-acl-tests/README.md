@@ -8,7 +8,7 @@ GUI or cross-compilation is involved.
 | Runner | Required kernel cases |
 | --- | --- |
 | macOS 15, Apple Silicon and Intel | Ordered allow/deny ACLs survive replacement; inherited allow and deny ACEs reject the empty temporary file before document writes. |
-| FreeBSD 14.4 and 15.0, amd64 | Separate UFS mounts exercise POSIX ACLs, NFSv4 ACLs and explicitly disabled ACLs. Trivial ACLs and disabled ACLs allow saves; nontrivial destination and inherited ACLs fail without changing the destination or leaving a temporary file. |
+| FreeBSD 14.4 and 15.1, amd64 | Separate UFS mounts exercise POSIX ACLs, NFSv4 ACLs and explicitly disabled ACLs. Trivial ACLs and disabled ACLs allow saves; nontrivial destination and inherited ACLs fail without changing the destination or leaving a temporary file. |
 
 The same jobs also run the portable save tests for private creation, atomic
 replacement, mode preservation, symlinks, abandoned saves and error cleanup.
@@ -24,9 +24,11 @@ Dependencies are provisioned before execution. Builds and tests then run offline
 with a fresh environment and an unprivileged identity: a macOS Seatbelt sandbox
 or a FreeBSD jail with IPv4/IPv6 disabled. Source and toolchains are read-only to
 the tested process. Writable space is bounded to a 512 MiB APFS image or tmpfs
-plus three 64 MiB UFS volumes. Each child has CPU, address-space, process,
-descriptor and file-size limits, a 180-second deadline, and process-group cleanup.
-The FreeBSD VM has two CPUs and 4 GiB RAM. Tests use dummy ACL principals and no
+plus three 64 MiB UFS volumes. Each child has CPU, process, descriptor and file-size
+limits, a 180-second deadline, and process-group cleanup. FreeBSD uses a 4 GiB
+address-space limit in a two-CPU, 4 GiB VM. Darwin rejects address-space limits:
+the parent monitors aggregate process-group RSS with a 4 GiB kill threshold,
+in addition to the hosted VM's memory bound. Tests use dummy ACL principals and no
 repository secrets; checkout does not persist credentials.
 
 These checks establish native save-policy behavior on the listed OS/filesystem

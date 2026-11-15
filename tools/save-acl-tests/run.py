@@ -7,6 +7,7 @@ import resource
 import signal
 import subprocess
 import sys
+import time
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--source", type=Path, required=True)
@@ -45,13 +46,16 @@ if sys.platform.startswith("freebsd"):
 def limits():
     for kind, value in [
         (resource.RLIMIT_CPU, 120),
-        (resource.RLIMIT_AS, 4 * 1024**3),
         (resource.RLIMIT_NPROC, 128),
         (resource.RLIMIT_NOFILE, 256),
         (resource.RLIMIT_FSIZE, 128 * 1024**2),
         (resource.RLIMIT_CORE, 0),
     ]:
         resource.setrlimit(kind, (value, value))
+    # Modern Darwin rejects RLIMIT_AS/DATA/RSS. Its runner VM bounds total
+    # memory; below, the trusted parent also enforces a process-group RSS budget.
+    if sys.platform.startswith("freebsd"):
+        resource.setrlimit(resource.RLIMIT_AS, (4 * 1024**3, 4 * 1024**3))
 
 
 def run(command):
@@ -63,14 +67,32 @@ def run(command):
         start_new_session=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True,
     )
+    deadline = time.monotonic() + 180
     try:
-        output, _ = process.communicate(timeout=180)
+        while True:
+            try:
+                output, _ = process.communicate(timeout=0.5)
+                break
+            except subprocess.TimeoutExpired:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("native ACL child exceeded 180 seconds")
+                if sys.platform == "darwin":
+                    listing = subprocess.check_output(
+                        ["/bin/ps", "-axo", "pgid=,rss="], text=True,
+                        env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"}, timeout=5,
+                    )
+                    resident_kib = sum(int(rss) for group, rss in
+                                       (line.split() for line in listing.splitlines())
+                                       if int(group) == process.pid)
+                    if resident_kib > 4 * 1024**2:
+                        raise RuntimeError("native ACL process group exceeded 4 GiB RSS")
     finally:
         # Also remove any descendants after normal completion.
         try:
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
+        process.wait(timeout=5)
     print(output, flush=True)
     if process.returncode:
         raise SystemExit(process.returncode)
