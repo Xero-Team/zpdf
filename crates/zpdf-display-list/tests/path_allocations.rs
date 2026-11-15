@@ -2,20 +2,34 @@
 //! allocation for storing verbs apart from points.
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::cell::Cell;
 
 use zpdf_core::{Point, Rect};
 use zpdf_display_list::{Path, PathElement};
 
 struct Counting;
 
-static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    // Even a single-test binary has harness threads that can allocate while the
+    // test runs. Const-initialized, non-dropping TLS does not allocate itself.
+    static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+}
+
+fn record_allocation() {
+    // Allocators must not unwind, including during thread-local destruction.
+    let _ = ALLOCATIONS.try_with(|count| count.set(count.get().wrapping_add(1)));
+}
 
 // SAFETY: every call forwards to `System` unchanged; only a counter is added.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        record_allocation();
         unsafe { System.alloc(layout) }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        record_allocation();
+        unsafe { System.alloc_zeroed(layout) }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
@@ -23,7 +37,7 @@ unsafe impl GlobalAlloc for Counting {
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        record_allocation();
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 }
@@ -32,12 +46,37 @@ unsafe impl GlobalAlloc for Counting {
 static GLOBAL: Counting = Counting;
 
 fn allocations<T>(f: impl FnOnce() -> T) -> (T, usize) {
-    let before = ALLOCATIONS.load(Ordering::Relaxed);
+    let before = ALLOCATIONS.with(Cell::get);
     let out = std::hint::black_box(f());
-    (out, ALLOCATIONS.load(Ordering::Relaxed) - before)
+    (out, ALLOCATIONS.with(Cell::get).wrapping_sub(before))
 }
 
-// One test only: the harness runs nothing else in this binary concurrently.
+#[test]
+fn allocation_counts_exclude_other_threads() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let start = AtomicBool::new(false);
+    let done = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(|| {
+            while !start.load(Ordering::Acquire) {
+                std::hint::spin_loop();
+            }
+            let allocation = std::hint::black_box(Box::new(42_u64));
+            done.store(true, Ordering::Release);
+            drop(allocation);
+        });
+        let (_, count) = allocations(|| {
+            start.store(true, Ordering::Release);
+            while !done.load(Ordering::Acquire) {
+                std::hint::spin_loop();
+            }
+        });
+        worker.join().unwrap();
+        assert_eq!(count, 0, "another thread's allocations must not be counted");
+    });
+}
+
 #[test]
 fn short_paths_take_one_allocation() {
     let (line, count) = allocations(|| {
