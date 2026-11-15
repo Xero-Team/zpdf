@@ -74,6 +74,21 @@ fn document(streams: &[(&[u8], bool)], limit: u64) -> PdfDocument {
 }
 
 #[test]
+fn resolving_a_raw_stream_does_not_copy_its_payload() {
+    let data = vec![b' '; LARGE];
+    let doc = document(&[(&data, false)], LARGE as u64);
+    let id = doc.page(0).unwrap().contents[0];
+    let before = LARGE_ALLOCATIONS.with(Cell::get);
+    let object = doc.file().resolve(id).unwrap();
+    let count = LARGE_ALLOCATIONS.with(Cell::get).wrapping_sub(before);
+    assert_eq!(object.as_stream().unwrap().data.as_ref(), data.as_slice());
+    assert_eq!(
+        count, 0,
+        "raw payload must be a view of the file allocation"
+    );
+}
+
+#[test]
 fn single_stream_needs_only_one_decoded_buffer() {
     let data = vec![b' '; LARGE];
     let doc = document(&[(&data, false)], LARGE as u64);

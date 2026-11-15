@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **Breaking, next 0.x minor:** replace `PdfStream.data: Arc<[u8]>` with
+  `PdfStreamData`. Parse raw streams as checked views of immutable file storage;
+  detach payloads at cross-document copy boundaries. See the
+  [migration guide](guides/shared-stream-migration.md) for conversions and source
+  lifetime rules. Keep conservative stream-cache admission charges. (#144)
+- Serialize stream replacements through the stream writer, including encryption,
+  when using `IncrementalWriter::overwrite_object`. (#144)
 - Reuse compact page-content buffers and reconstruct TIFF predictor samples in
   place, reducing transient copies without changing output or decode limits.
 - Add `PageBitmap.into_rgba()` to transfer WASM raster pixels without cloning

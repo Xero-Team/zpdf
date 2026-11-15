@@ -6,6 +6,7 @@
 //! `max_stream_bytes` guard). Invariant: never panic, never hang.
 
 use libfuzzer_sys::fuzz_target;
+use std::sync::Arc;
 use zpdf_core::ParseLimits;
 use zpdf_parser::ObjectParser;
 
@@ -17,5 +18,12 @@ fuzz_target!(|data: &[u8]| {
         ..Default::default()
     };
     let parser = ObjectParser::new(data, &limits);
-    let _ = parser.parse_indirect_with_id(0);
+    let borrowed = parser.parse_indirect_with_id(0);
+    let storage: Arc<[u8]> = Arc::from(data);
+    let shared = ObjectParser::new_shared(&storage, &limits).parse_indirect_with_id(0);
+    match (borrowed, shared) {
+        (Ok(a), Ok(b)) => assert_eq!(a, b),
+        (Err(a), Err(b)) => assert_eq!(a.to_string(), b.to_string()),
+        other => panic!("borrowed/shared mismatch: {other:?}"),
+    }
 });

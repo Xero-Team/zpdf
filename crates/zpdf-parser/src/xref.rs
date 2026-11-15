@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use std::collections::HashMap;
 
 use zpdf_core::{Error, ObjectId, ParseLimits, PdfDict, PdfObject, Result};
@@ -104,7 +106,10 @@ impl XrefTable {
     }
 }
 
-pub fn parse_xref_and_trailer(data: &[u8], limits: &ParseLimits) -> Result<(XrefTable, PdfDict)> {
+pub fn parse_xref_and_trailer(
+    data: &Arc<[u8]>,
+    limits: &ParseLimits,
+) -> Result<(XrefTable, PdfDict)> {
     let startxref_offset = find_startxref(data)?;
     let mut table = XrefTable::new();
 
@@ -144,7 +149,7 @@ pub fn parse_xref_and_trailer(data: &[u8], limits: &ParseLimits) -> Result<(Xref
 /// main-table > XRefStm > /Prev chain. Never fatal: a broken /XRefStm only
 /// loses the hybrid entries.
 fn parse_hybrid_xrefstm(
-    data: &[u8],
+    data: &Arc<[u8]>,
     trailer: &PdfDict,
     table: &mut XrefTable,
     limits: &ParseLimits,
@@ -167,7 +172,7 @@ fn parse_hybrid_xrefstm(
 }
 
 fn parse_xref_section(
-    data: &[u8],
+    data: &Arc<[u8]>,
     offset: usize,
     table: &mut XrefTable,
     limits: &ParseLimits,
@@ -186,7 +191,7 @@ fn parse_xref_section(
 }
 
 fn parse_xref_stream(
-    data: &[u8],
+    data: &Arc<[u8]>,
     offset: usize,
     table: &mut XrefTable,
     limits: &ParseLimits,
@@ -194,7 +199,7 @@ fn parse_xref_stream(
     use crate::filters;
     use crate::object_parser::ObjectParser;
 
-    let parser = ObjectParser::new(data, limits);
+    let parser = ObjectParser::new_shared(data, limits);
     let obj = parser.parse_indirect_at(offset)?;
     let stream = match obj {
         PdfObject::Stream(s) => s,
@@ -610,7 +615,8 @@ mod tests {
                 .as_bytes(),
         );
 
-        let (table, trailer) = parse_xref_and_trailer(&d, &ParseLimits::default()).unwrap();
+        let (table, trailer) =
+            parse_xref_and_trailer(&Arc::from(d.as_slice()), &ParseLimits::default()).unwrap();
         assert_eq!(trailer.get_ref("Root").unwrap(), ObjectId(1, 0));
         match table.get(ObjectId(1, 0)).unwrap() {
             XrefEntry::InUse { offset, .. } => assert_eq!(*offset as usize, off1),
@@ -639,28 +645,52 @@ mod tests {
     fn xref_stream_rejects_negative_w_width() {
         let d = xref_stream_bytes("[1 -2 2]", 1, "", &[]);
         let mut table = XrefTable::new();
-        assert!(parse_xref_stream(&d, 0, &mut table, &ParseLimits::default()).is_err());
+        assert!(parse_xref_stream(
+            &Arc::from(d.as_slice()),
+            0,
+            &mut table,
+            &ParseLimits::default()
+        )
+        .is_err());
     }
 
     #[test]
     fn xref_stream_rejects_oversized_w_width() {
         let d = xref_stream_bytes("[9 4 2]", 1, "", &[]);
         let mut table = XrefTable::new();
-        assert!(parse_xref_stream(&d, 0, &mut table, &ParseLimits::default()).is_err());
+        assert!(parse_xref_stream(
+            &Arc::from(d.as_slice()),
+            0,
+            &mut table,
+            &ParseLimits::default()
+        )
+        .is_err());
     }
 
     #[test]
     fn xref_stream_rejects_zero_entry_size() {
         let d = xref_stream_bytes("[0 0 0]", 1, "", &[]);
         let mut table = XrefTable::new();
-        assert!(parse_xref_stream(&d, 0, &mut table, &ParseLimits::default()).is_err());
+        assert!(parse_xref_stream(
+            &Arc::from(d.as_slice()),
+            0,
+            &mut table,
+            &ParseLimits::default()
+        )
+        .is_err());
     }
 
     #[test]
     fn xref_stream_rejects_negative_index_values() {
         let d = xref_stream_bytes("[1 1 1]", 1, "/Index [-1 1]", &[1, 0, 0]);
         let mut table = XrefTable::new();
-        assert!(parse_xref_stream(&d, 0, &mut table, &ParseLimits::default()).is_err());
+        assert!(parse_xref_stream(
+            &Arc::from(d.as_slice()),
+            0,
+            &mut table,
+            &ParseLimits::default()
+        )
+        .is_err());
     }
 
     #[test]
@@ -668,12 +698,24 @@ mod tests {
         // A two-byte type value of 257 must not wrap to type 1.
         let d = xref_stream_bytes("[2 0 0]", 1, "/Index [0 1]", &[1, 1]);
         let mut table = XrefTable::new();
-        assert!(parse_xref_stream(&d, 0, &mut table, &ParseLimits::default()).is_err());
+        assert!(parse_xref_stream(
+            &Arc::from(d.as_slice()),
+            0,
+            &mut table,
+            &ParseLimits::default()
+        )
+        .is_err());
 
         // Generation 65536 must not wrap to generation zero.
         let d = xref_stream_bytes("[1 1 3]", 1, "/Index [0 1]", &[1, 0, 1, 0, 0]);
         let mut table = XrefTable::new();
-        assert!(parse_xref_stream(&d, 0, &mut table, &ParseLimits::default()).is_err());
+        assert!(parse_xref_stream(
+            &Arc::from(d.as_slice()),
+            0,
+            &mut table,
+            &ParseLimits::default()
+        )
+        .is_err());
     }
 
     /// Superseded generations are held too, so they count against
@@ -720,7 +762,7 @@ mod tests {
             ..ParseLimits::default()
         };
         let mut table = XrefTable::new();
-        parse_xref_stream(&d, 0, &mut table, &limits).unwrap();
+        parse_xref_stream(&Arc::from(d.as_slice()), 0, &mut table, &limits).unwrap();
         assert!(matches!(
             table.get(ObjectId(1_000_000, 0)),
             Some(XrefEntry::InUse { .. })
@@ -789,7 +831,8 @@ mod tests {
             .as_bytes(),
         );
 
-        let (table, trailer) = parse_xref_and_trailer(&d, &ParseLimits::default()).unwrap();
+        let (table, trailer) =
+            parse_xref_and_trailer(&Arc::from(d.as_slice()), &ParseLimits::default()).unwrap();
         assert_eq!(trailer.get_ref("Root").unwrap(), ObjectId(1, 0));
         // Object 5 exists only via the /XRefStm.
         match table.get(ObjectId(5, 0)).unwrap() {

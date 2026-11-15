@@ -83,7 +83,7 @@ pub use stamp::{jpeg_dimensions, StampImage, StampItem};
 enum PendingObject {
     Object(PdfObject),
     /// Stream dict + (possibly already compressed) data.
-    Stream(PdfDict, Arc<[u8]>),
+    Stream(PdfDict, zpdf_core::PdfStreamData),
     /// A pre-serialized object body, emitted verbatim between `N G obj` and
     /// `endobj`. Used by the signer, whose `/ByteRange` and `/Contents`
     /// placeholders must land in the file at exactly known widths.
@@ -246,7 +246,7 @@ impl IncrementalWriter {
         self.ensure_object_capacity(1)?;
         let pending = match obj {
             PdfObject::Stream(stream) => {
-                PendingObject::Stream(stream.dict.clone(), Arc::clone(&stream.data))
+                PendingObject::Stream(stream.dict.clone(), stream.data.clone())
             }
             _ => PendingObject::Object(obj.clone()),
         };
@@ -274,7 +274,7 @@ impl IncrementalWriter {
         let num = self.next_obj_num;
         self.next_obj_num += 1;
         self.pending
-            .insert(num, (0, PendingObject::Stream(dict, data)));
+            .insert(num, (0, PendingObject::Stream(dict, data.into())));
         Ok((num, 0))
     }
 
@@ -347,8 +347,11 @@ impl IncrementalWriter {
     /// Queue a replacement for an existing object. The replacement is written
     /// with the same object/generation number, shadowing the original.
     pub fn overwrite_object(&mut self, id: ObjectId, obj: PdfObject) {
-        self.pending
-            .insert(id.0, (id.1, PendingObject::Object(obj)));
+        let pending = match obj {
+            PdfObject::Stream(stream) => PendingObject::Stream(stream.dict, stream.data),
+            other => PendingObject::Object(other),
+        };
+        self.pending.insert(id.0, (id.1, pending));
     }
 
     /// Resolve an object as the *update* will see it: the pending (edited)
@@ -360,7 +363,7 @@ impl IncrementalWriter {
             Some((_, PendingObject::Stream(dict, data))) => {
                 Ok(PdfObject::Stream(zpdf_core::PdfStream {
                     dict: dict.clone(),
-                    data: Arc::clone(data),
+                    data: data.clone(),
                 }))
             }
             // Raw bodies are write-only (they exist for byte-exact offsets);
@@ -378,7 +381,7 @@ impl IncrementalWriter {
             Some((_, PendingObject::Stream(dict, data))) => {
                 Ok(PdfObject::Stream(zpdf_core::PdfStream {
                     dict: dict.clone(),
-                    data: Arc::clone(data),
+                    data: data.clone(),
                 }))
             }
             // Preserve the ordinary resolver's source fallback for raw bodies.

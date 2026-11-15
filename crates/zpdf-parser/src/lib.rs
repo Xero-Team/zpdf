@@ -208,6 +208,7 @@ impl PdfFile {
         }
     }
 
+    #[inline]
     pub fn resolve(&self, id: zpdf_core::ObjectId) -> Result<PdfObject> {
         self.resolve_depth(id, 0)
     }
@@ -277,6 +278,7 @@ impl PdfFile {
         Ok(obj)
     }
 
+    #[inline]
     fn resolve_depth(&self, id: ObjectId, depth: u32) -> Result<PdfObject> {
         /// Maximum length of a ref-to-ref chain (`1 0 obj 2 0 R endobj` ...)
         /// followed before the reference is treated as null. Guards against
@@ -331,8 +333,8 @@ impl PdfFile {
     /// scan, run at most once) before giving up.
     fn parse_at_offset_checked(&self, offset: u64, id: ObjectId) -> Result<PdfObject> {
         let resolve_length = |id| self.indirect_length(id);
-        let parser =
-            ObjectParser::new(&self.data, &self.limits).with_length_resolver(&resolve_length);
+        let parser = ObjectParser::new_shared(&self.data, &self.limits)
+            .with_length_resolver(&resolve_length);
         let file_offset = usize::try_from(offset).map_err(|_| {
             zpdf_core::Error::InvalidObject(offset, "xref offset exceeds address space".into())
         })?;
@@ -380,7 +382,7 @@ impl PdfFile {
             return None;
         };
         let offset = usize::try_from(*offset).ok()?;
-        match ObjectParser::new(&self.data, &self.limits).parse_indirect_with_id(offset) {
+        match ObjectParser::new_shared(&self.data, &self.limits).parse_indirect_with_id(offset) {
             Ok((pid, PdfObject::Integer(n))) if pid == id => Some(n),
             _ => None,
         }
@@ -405,7 +407,7 @@ impl PdfFile {
             .as_ref()?;
         match table.get(id)? {
             XrefEntry::InUse { offset, .. } => {
-                let parser = ObjectParser::new(&self.data, &self.limits);
+                let parser = ObjectParser::new_shared(&self.data, &self.limits);
                 let file_offset = usize::try_from(*offset).ok()?;
                 let (pid, mut obj) = parser.parse_indirect_with_id(file_offset).ok()?;
                 if pid != id {
@@ -661,7 +663,7 @@ impl PdfFile {
         let stream_obj = match stream_entry {
             XrefEntry::InUse { offset, .. } => {
                 let resolve_length = |id| self.indirect_length(id);
-                let parser = ObjectParser::new(&self.data, &self.limits)
+                let parser = ObjectParser::new_shared(&self.data, &self.limits)
                     .with_length_resolver(&resolve_length);
                 let file_offset = usize::try_from(*offset).map_err(|_| {
                     zpdf_core::Error::InvalidObject(
@@ -840,9 +842,10 @@ fn estimate_cached_object_bytes(obj: &PdfObject) -> u64 {
                 |sum, item| sum.saturating_add(object_bytes(item)),
             ),
             PdfObject::Dict(dict) => dict_bytes(dict),
-            PdfObject::Stream(stream) => {
-                (stream.data.len() as u64).saturating_add(dict_bytes(&stream.dict))
-            }
+            PdfObject::Stream(stream) => stream
+                .data
+                .cache_bytes()
+                .saturating_add(dict_bytes(&stream.dict)),
             PdfObject::Null
             | PdfObject::Bool(_)
             | PdfObject::Integer(_)
@@ -871,7 +874,7 @@ fn estimate_objstm_bytes(stream: &DecodedObjStm) -> u64 {
 /// (the normal pipeline handles it); only a direct InUse Root is strictly
 /// checked for `/Type /Catalog`. A missing Root triggers recovery.
 fn root_resolves(
-    data: &[u8],
+    data: &Arc<[u8]>,
     xref: &XrefTable,
     trailer: &zpdf_core::PdfDict,
     limits: &ParseLimits,
@@ -881,7 +884,7 @@ fn root_resolves(
     };
     match xref.get(root_ref) {
         Some(XrefEntry::InUse { offset, .. }) => {
-            let parser = ObjectParser::new(data, limits);
+            let parser = ObjectParser::new_shared(data, limits);
             let Some(file_offset) = usize::try_from(*offset).ok() else {
                 return false;
             };

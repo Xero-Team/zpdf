@@ -200,7 +200,9 @@ fn remap(
         }
         PdfObject::Stream(stream) => PdfObject::Stream(PdfStream {
             dict: remap_dict(&stream.dict, writer, id_map, skip_keys, work)?,
-            data: stream.data.clone(),
+            // Imported objects must not keep an entire source PDF alive after
+            // append/extract returns. Already-independent payloads remain shared.
+            data: stream.data.to_detached(),
         }),
         // Scalars carry no references.
         other => other.clone(),

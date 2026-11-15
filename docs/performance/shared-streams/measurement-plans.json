@@ -1,0 +1,42 @@
+{
+  "calibration-plan.json": {
+    "stage": "initial layout comparison",
+    "pairs": 15,
+    "cases": 11,
+    "samples_per_process": 11,
+    "order": "alternating AB/BA per case",
+    "stop": "fixed count, keep all observations",
+    "baseline": "4c5e4a5995d072c99496368fd18ee7b27662c1d0"
+  },
+  "longbench-plan.json": {
+    "pairs": 31,
+    "samples_per_process": 11,
+    "order": "AB/BA alternating per pair",
+    "iterations": {
+      "raw-large": 128,
+      "small-streams": 16,
+      "tiny-streams": 16,
+      "scalar-objects": 16,
+      "cold-open": 8192,
+      "warm-read": 4096,
+      "no-cache": 128,
+      "recovery": 2,
+      "encrypted": 4,
+      "imports": 8,
+      "pipeline": 48
+    },
+    "analysis": "median of paired process-median ratios; 10000 resamples, seed 144, percentile 95% interval; retain every pair",
+    "baseline": "4c5e4a5995d072c99496368fd18ee7b27662c1d0",
+    "purpose": "Lengthen sub-microsecond control measurements; identical harness and fixed count before running"
+  },
+  "inline-plan.json": {
+    "parent_plan": "longbench-plan.json",
+    "change": "Inline resolve and resolve_depth to expose the cache-hit path across crates; all timing counts and analysis unchanged.",
+    "candidate": "2"
+  },
+  "accessors-plan.json": {
+    "parent_plan": "longbench-plan.json",
+    "change": "Expose checked length directly and inline slice accessors/cache-hit path; same fixed counts. Previous inline run overlapped briefly with rustfmt and is retained as exploratory only.",
+    "candidate": "3"
+  }
+}

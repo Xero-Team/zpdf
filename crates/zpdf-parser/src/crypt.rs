@@ -24,7 +24,6 @@
 
 use aes::cipher::{BlockModeDecrypt, BlockModeEncrypt, KeyIvInit};
 use sha2::Digest;
-use std::sync::Arc;
 use zpdf_core::{Error, ObjectId, PdfDict, PdfObject, PdfString, Result};
 
 /// The 32-byte password-padding string from PDF 1.7 §7.6.3.3 (Algorithm 2).
@@ -388,7 +387,7 @@ impl Decryptor {
                     } else {
                         self.decrypt(id, &s.data, algo)
                     };
-                    s.data = Arc::from(dec);
+                    s.data = dec.into();
                 }
                 for v in s.dict.0.values_mut() {
                     self.walk(v, id);

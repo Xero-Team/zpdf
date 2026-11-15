@@ -136,9 +136,10 @@ fn generated_appearance_bytes(appearance: &GeneratedAppearance) -> u64 {
                 |sum, item| sum.saturating_add(object_bytes(item)),
             ),
             PdfObject::Dict(dict) => dict_bytes(dict),
-            PdfObject::Stream(stream) => {
-                (stream.data.len() as u64).saturating_add(dict_bytes(&stream.dict))
-            }
+            PdfObject::Stream(stream) => stream
+                .data
+                .cache_bytes()
+                .saturating_add(dict_bytes(&stream.dict)),
             _ => 0,
         };
         (std::mem::size_of::<PdfObject>() as u64).saturating_add(payload)

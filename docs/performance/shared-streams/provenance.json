@@ -1,0 +1,164 @@
+{
+  "baseline_commit": "4c5e4a5995d072c99496368fd18ee7b27662c1d0",
+  "baseline_tree": "6d4ee20b908990edd987614f806c257f3ce47f1d",
+  "lock_sha256": "4b5582155fb00882972849b074fb7f63140e91aa76a7209ec9780b86b50d590f",
+  "final_measurement": "measure-accessors",
+  "phases": {
+    "measure-candidate-1": {
+      "snapshot_sha256": "b117e3698712cc29779d411ca51fa5767806510b34a7bc05a8e151d73296eff8",
+      "image_id": "sha256:ea15510f04ded2c73682c87d70aa8d0e8697c7feb2b0aebf626e92ed29f93fde",
+      "limits": {
+        "network": "none",
+        "cpus": 2,
+        "memory_bytes": 5368709120,
+        "pids": 192,
+        "file_bytes": 536870912,
+        "scratch_bytes": 3670016000,
+        "wall_seconds": 900,
+        "cpu_seconds": 1100
+      },
+      "raw_sha256": "43d83bd402684cedf848d82260a6a2eff77bc03757e1edb571031066f65972a1",
+      "binary_sha256": {
+        "baseline": "3ed2856496dab0654beb8306c6b0eec9c5014f043705da1a959f1724f2305375",
+        "current": "3fed0e409e74f9795295ebcbc777b043e1b5e2f30026f2ee8dcaf4effeac2b89"
+      }
+    },
+    "measure-long-1": {
+      "snapshot_sha256": "9eb904bd816072c5f4445eca05b9b1c5fbeac9aef0ad838f2de84c8c0c4cd8f1",
+      "image_id": "sha256:ea15510f04ded2c73682c87d70aa8d0e8697c7feb2b0aebf626e92ed29f93fde",
+      "limits": {
+        "network": "none",
+        "cpus": 2,
+        "memory_bytes": 5368709120,
+        "pids": 192,
+        "file_bytes": 536870912,
+        "scratch_bytes": 3670016000,
+        "wall_seconds": 900,
+        "cpu_seconds": 1100
+      },
+      "raw_sha256": "bd5021981d11928463a2124369bd881590a25aa6df10f66a3f382175fd427c73",
+      "binary_sha256": {
+        "baseline": "30919d66e9b46df69061873a54d10b6756355f92bda3723daf0eec77a19272e4",
+        "current": "914312f7028c78a074631f0d42a812461f26e8a8144eb30cfcc722b6109eae8e"
+      }
+    },
+    "measure-inline": {
+      "snapshot_sha256": "192bb03f035912e6b28fbd7254b6c321c97975ae1674f2b9e909e039dbc3e375",
+      "image_id": "sha256:ea15510f04ded2c73682c87d70aa8d0e8697c7feb2b0aebf626e92ed29f93fde",
+      "limits": {
+        "network": "none",
+        "cpus": 2,
+        "memory_bytes": 5368709120,
+        "pids": 192,
+        "file_bytes": 536870912,
+        "scratch_bytes": 3670016000,
+        "wall_seconds": 900,
+        "cpu_seconds": 1100
+      },
+      "raw_sha256": "b8835341c17affc0fefde17eb99b83a15c5341ef865917ee2154da572d5c767d",
+      "binary_sha256": {
+        "baseline": "30919d66e9b46df69061873a54d10b6756355f92bda3723daf0eec77a19272e4",
+        "current": "8858900125a12179ae12c89496dd891506d031bff96b1dd4d8b97ce27b73ae43"
+      }
+    },
+    "measure-accessors": {
+      "snapshot_sha256": "1f0b7232c1d75f36d575358de515808f6971505579c474516c5bde3d518dcc95",
+      "image_id": "sha256:ea15510f04ded2c73682c87d70aa8d0e8697c7feb2b0aebf626e92ed29f93fde",
+      "limits": {
+        "network": "none",
+        "cpus": 2,
+        "memory_bytes": 5368709120,
+        "pids": 192,
+        "file_bytes": 536870912,
+        "scratch_bytes": 3670016000,
+        "wall_seconds": 900,
+        "cpu_seconds": 1100
+      },
+      "raw_sha256": "46b1fac3101dd0bf8f28d372e6a9c148141e41de957580a2cdd734bf7349046a",
+      "binary_sha256": {
+        "baseline": "326f37a49c08b8d8b9661e4a570ac0d9897a56302fae7b941ef2bbd376f10d29",
+        "current": "e099a33ab174d74ac42c595e4e996cd440906049075aab3bfe6bb62ae6b4f16f"
+      }
+    },
+    "baseline-bench": {
+      "snapshot_sha256": "7538a6b32191727c0c2428991a2fc6097f11ac41c2a3b39f887fbfda113bdd14",
+      "image_id": "sha256:ea15510f04ded2c73682c87d70aa8d0e8697c7feb2b0aebf626e92ed29f93fde",
+      "elapsed_seconds": 52.864,
+      "exit_code": 0
+    },
+    "current-smoke": {
+      "snapshot_sha256": "b117e3698712cc29779d411ca51fa5767806510b34a7bc05a8e151d73296eff8",
+      "image_id": "sha256:ea15510f04ded2c73682c87d70aa8d0e8697c7feb2b0aebf626e92ed29f93fde",
+      "elapsed_seconds": 17.416,
+      "exit_code": 0
+    },
+    "baseline-longbench": {
+      "snapshot_sha256": "660aa00eb4ac1ba614589722d8b67d3c397093b9378d47fa35971dd54c9c708a",
+      "image_id": "sha256:ea15510f04ded2c73682c87d70aa8d0e8697c7feb2b0aebf626e92ed29f93fde",
+      "elapsed_seconds": 16.657,
+      "exit_code": 0
+    },
+    "current-longbench": {
+      "snapshot_sha256": "9eb904bd816072c5f4445eca05b9b1c5fbeac9aef0ad838f2de84c8c0c4cd8f1",
+      "image_id": "sha256:ea15510f04ded2c73682c87d70aa8d0e8697c7feb2b0aebf626e92ed29f93fde",
+      "elapsed_seconds": 16.849,
+      "exit_code": 0
+    },
+    "current-inline": {
+      "snapshot_sha256": "523e06506b4cc5c754dc257baa0056613257b0bfeba51f07a5fef2287f0786b6",
+      "image_id": "sha256:ea15510f04ded2c73682c87d70aa8d0e8697c7feb2b0aebf626e92ed29f93fde",
+      "elapsed_seconds": 16.581,
+      "exit_code": 0
+    },
+    "current-accessors": {
+      "snapshot_sha256": "1f0b7232c1d75f36d575358de515808f6971505579c474516c5bde3d518dcc95",
+      "image_id": "sha256:ea15510f04ded2c73682c87d70aa8d0e8697c7feb2b0aebf626e92ed29f93fde",
+      "elapsed_seconds": 16.795,
+      "exit_code": 0
+    },
+    "baseline-formatted": {
+      "snapshot_sha256": "12a0bfd51d78034c7c67620c1f4ab510bf7a14ad72202d0babca9326d646d257",
+      "image_id": "sha256:ea15510f04ded2c73682c87d70aa8d0e8697c7feb2b0aebf626e92ed29f93fde",
+      "elapsed_seconds": 16.779,
+      "exit_code": 0
+    }
+  },
+  "notes": {
+    "measure-candidate-1": "Exploratory 15-pair short batches; no inline/accessor optimization.",
+    "measure-long-1": "31-pair longer batches confirmed +0.73% warm-read slowdown; not accepted as final.",
+    "measure-inline": "Cache-path inline experiment. Brief overlap with rustfmt; retained as exploratory, excluded from final inference.",
+    "measure-accessors": "Final candidate with inlined cache path and direct checked-length/slice accessors. 31 pairs, no concurrent target build."
+  },
+  "validation": {
+    "baseline-proof": {
+      "snapshot_sha256": "05d314f7a818df8e05ccd1fa57b130b2f25340443d5e051003b1759141bdd173",
+      "result_sha256": "aad8ee69c9e278ab3a0fe1dff6cdfdb2349c756c60dfec58178459d89073cd21",
+      "exit_code": 0,
+      "expected_test_outcome": "The new allocation regression fails on baseline with left: 1, right: 0; the harness verifies this failure."
+    },
+    "native-final": {
+      "snapshot_sha256": "1f0b7232c1d75f36d575358de515808f6971505579c474516c5bde3d518dcc95",
+      "result_sha256": "574d727758ac5a7506f9a31e6711af98c18dfd41d62c7f3537f6e312e0e47acc",
+      "exit_code": 0,
+      "tests_passed": 509
+    },
+    "wasm": {
+      "snapshot_sha256": "ff0a14849840bca01f2929c57e72bd227c776a69ededab43c732d5812beeae08",
+      "result_sha256": "5804e45ec04087b87255d0403f3157db34a6831cad7e1d207bb2891987099902",
+      "exit_code": 0,
+      "node_tests_passed": 13,
+      "python_tests_passed": 14,
+      "package": {
+        "schema_version": 1,
+        "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+        "wasm_bindgen": "wasm-bindgen 0.2.129",
+        "source_sha256": "169502f4e5e086105d6e207152e316cad93b718e54316c616e8c5fb04aa1c5dd",
+        "source_files": 149,
+        "artifacts": {
+          "zpdf_wasm.js": "46ddc893a8a5888d6fad3e46464c72eba7ff29436a77060d4b14f98699745916",
+          "zpdf_wasm_bg.wasm": "407bd8b38840e0c5a63c0ded3d299699fe110838d6f2cabd897b138cb3125e37"
+        }
+      }
+    }
+  }
+}
