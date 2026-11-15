@@ -1,0 +1,55 @@
+name: Native save ACL
+
+on:
+  push:
+    branches: [main, staging]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: save-acl-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos:
+    name: ACL (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-15-intel]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Native macOS ACL preservation and inheritance
+        run: sh tools/save-acl-tests/macos.sh
+
+  freebsd:
+    name: ACL (FreeBSD ${{ matrix.release }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        release: ['14.4', '15.0']
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Native UFS POSIX, NFSv4 and disabled ACLs
+        uses: vmactions/freebsd-vm@c46abacb49f09938ca4e1702d15d836285d694cc # v1.5.9
+        with:
+          release: ${{ matrix.release }}
+          arch: x86_64
+          cpu: 2
+          mem: 4096
+          sync: rsync
+          copyback: false
+          prepare: pkg install -y rust python311
+          run: sh tools/save-acl-tests/freebsd.sh

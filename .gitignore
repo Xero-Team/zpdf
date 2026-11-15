@@ -4,6 +4,8 @@
 /review
 /.claude
 Cargo.lock
+!tools/save-acl-tests/Cargo.lock
+/tools/save-acl-tests/target
 *.swp
 *.swo
 *~
