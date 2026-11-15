@@ -6,6 +6,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 const MAX_TEMP_ATTEMPTS: usize = 64;
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(all(test, any(target_os = "macos", target_os = "freebsd")))]
+#[path = "save_temp_acl_tests.rs"]
+mod native_acl_tests;
+
 /// A fresh sibling file owned by one save attempt. Failed saves close and
 /// remove it; a successful commit atomically replaces the destination.
 ///
@@ -460,10 +464,14 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
-    struct TestDir(PathBuf);
+    pub(super) struct TestDir(pub(super) PathBuf);
 
     impl TestDir {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
+            Self::under(&std::env::temp_dir())
+        }
+
+        pub(super) fn under(parent: &Path) -> Self {
             let mut builder = fs::DirBuilder::new();
             #[cfg(unix)]
             {
@@ -472,8 +480,7 @@ mod tests {
             }
             for _ in 0..MAX_TEMP_ATTEMPTS {
                 let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
-                let path = std::env::temp_dir()
-                    .join(format!("zpdf-save-test-{}-{id}", std::process::id()));
+                let path = parent.join(format!("zpdf-save-test-{}-{id}", std::process::id()));
                 match builder.create(&path) {
                     Ok(()) => return Self(path),
                     Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,

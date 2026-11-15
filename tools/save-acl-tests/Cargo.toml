@@ -1,0 +1,15 @@
+[package]
+name = "zpdf-save-acl-tests"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Compile the production module itself, without the desktop GUI dependencies.
+[workspace]
+
+[lib]
+path = "../../crates/zpdf-viewer-gpui/src/save_temp.rs"
+doctest = false
+
+[dependencies]
+libc = "=0.2.189"
