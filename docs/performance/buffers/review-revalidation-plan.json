@@ -1,0 +1,19 @@
+{
+  "baseline": "0e0f8dd3d3e4d12269197758ef5b651e221514b2",
+  "reason": "Review follow-up moves TIFF validation before compact-copy and preserves compact output for wrapped no-op predictor values. Rebuild and remeasure final production sources; preserve all previous observations separately.",
+  "native_pairs": {
+    "content-single": 11,
+    "content-multi": 11,
+    "content-small": 11,
+    "pipeline": 75,
+    "tiff": 11,
+    "tiff-tail": 11,
+    "tiff-small": 11,
+    "flate": 75,
+    "png": 11
+  },
+  "wasm_pairs": 7,
+  "samples_per_process": 11,
+  "order": "alternating AB/BA, fixed counts declared before running",
+  "summary": "median paired process medians; bootstrap 10000, seed 142; compare input/output hashes and peak/retained bytes; do not pool across revisions"
+}

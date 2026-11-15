@@ -37,6 +37,57 @@
       "snapshot_sha256": "b5d010765ff311fc26479fed5a00f98eb5b2622756f8e04961335fe6fbb09496",
       "image_id": "sha256:ea15510f04ded2c73682c87d70aa8d0e8697c7feb2b0aebf626e92ed29f93fde",
       "raw_sha256": "8e5941efbbafaf86a50548db66d42fa65d7771ba2df8593cdf5425ff440f6922"
+    },
+    "measure-native-review": {
+      "snapshot_sha256": "ae01db51163db94a9410f386f18890901e941fd85e37e19516d0a4890b8c2a78",
+      "image_id": "sha256:ea15510f04ded2c73682c87d70aa8d0e8697c7feb2b0aebf626e92ed29f93fde",
+      "raw_sha256": "a3dc3e219eba87119e4a428024ece77a19bc42df4bce101eccc1b09633885185",
+      "binary_sha256": {
+        "baseline": "743e7bd1c140b47ba443404fe844ba145da4cf9779041005b4016cdad26d48b0",
+        "current": "d9c481423cd59afa51c390c165ea57f230a3374fa6ba1c1da757dae9af86f9fd"
+      }
+    },
+    "measure-review-png": {
+      "snapshot_sha256": "af4cfb2ad53ed17a037c4765da981152659639c89deb8e49c57d0a441538a8f6",
+      "image_id": "sha256:ea15510f04ded2c73682c87d70aa8d0e8697c7feb2b0aebf626e92ed29f93fde",
+      "raw_sha256": "aaa824d4bec3eccfa047b40417f4d83ab259c3559aedf8dd2120aad235c7357b",
+      "binary_sha256": {
+        "baseline": "743e7bd1c140b47ba443404fe844ba145da4cf9779041005b4016cdad26d48b0",
+        "current": "d9c481423cd59afa51c390c165ea57f230a3374fa6ba1c1da757dae9af86f9fd"
+      }
+    },
+    "wasm-review": {
+      "snapshot_sha256": "ae01db51163db94a9410f386f18890901e941fd85e37e19516d0a4890b8c2a78",
+      "image_id": "sha256:ea15510f04ded2c73682c87d70aa8d0e8697c7feb2b0aebf626e92ed29f93fde",
+      "raw_sha256": "f5b3374b16b6f859144610127ee62b5e486afa6156870ea0a914f0dfab934e2e",
+      "package": {
+        "schema_version": 1,
+        "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+        "wasm_bindgen": "wasm-bindgen 0.2.129",
+        "source_sha256": "44d627c2fa3773e08509b4dde72e6f4694ebd04202e7bf2c4c6241886000ffd7",
+        "source_files": 148,
+        "artifacts": {
+          "zpdf_wasm.js": "46ddc893a8a5888d6fad3e46464c72eba7ff29436a77060d4b14f98699745916",
+          "zpdf_wasm_bg.wasm": "650bc02ce22b97d9a385ea6adc3db3818508eb640b26c4cbac18ef229ee10838"
+        }
+      }
+    }
+  },
+  "review_validation": {
+    "review-repro": {
+      "source_snapshot_sha256": "f76aed5efec3b5497889d0776d284d625e8deb23a4a7be626b4a5c8c795620d4",
+      "result_sha256": "6c99f4d4c0aeacc3993f7445d9fd41ddd8d794bd2068d6011039e3a67d93ecf9",
+      "exit_code": 101
+    },
+    "native-review-fixed": {
+      "source_snapshot_sha256": "ae01db51163db94a9410f386f18890901e941fd85e37e19516d0a4890b8c2a78",
+      "result_sha256": "1056bc23db51c6fef70d50f33b540e31a994965b717ddfb83f049998ebaa01d3",
+      "exit_code": 0
+    },
+    "wasm-review": {
+      "source_snapshot_sha256": "ae01db51163db94a9410f386f18890901e941fd85e37e19516d0a4890b8c2a78",
+      "result_sha256": "76c48be19346489123fd9985349f8762c4ef074a20af9484e0116d1213b9adc6",
+      "exit_code": 0
     }
   }
 }

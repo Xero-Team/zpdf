@@ -1,0 +1,15 @@
+{
+  "reason": "Final review-follow-up PNG control has a +0.75% median but a +8.10% upper interval with 11 pairs. Resolve uncertainty with a fixed 64 further pairs before drawing a conclusion.",
+  "cases": [
+    "png"
+  ],
+  "additional_pair_numbers": [
+    11,
+    74
+  ],
+  "fixed_additional_pairs": 64,
+  "pooled_pairs": 75,
+  "retain_initial_pairs": true,
+  "same_native_binaries_as": "measure-native-review",
+  "no_early_stopping": true
+}
