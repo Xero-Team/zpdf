@@ -151,7 +151,8 @@ fn garbage_with_jpx_filter_errors_cleanly() {
 
 #[test]
 fn truncated_codestream_errors_cleanly() {
-    // Valid magic, then cut off mid-stream: must error, never panic.
+    // Valid magic, then truncate the header or tile data: must error, never panic.
+    // A recovered full-size buffer must not hide an incomplete image from exports.
     for len in [4usize, 12, 40, GRAY_J2K.len() / 2] {
         let res = decode_image_xobject(&GRAY_J2K[..len], &jpx_dict(W as i64, H as i64));
         assert!(res.is_err(), "len {len} should fail");

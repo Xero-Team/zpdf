@@ -73,6 +73,46 @@ test("packaged reader renders and loads raw/compressed fonts", () => {
   } finally { pdf.free(); }
 });
 
+test("packaged reader rejects truncated JPX before exporting", () => {
+  const codestream = readFileSync(new URL("../../zpdf-image/tests/fixtures/gray.j2k", import.meta.url));
+  const content = "q 32 0 0 24 0 0 cm /Im0 Do Q";
+  for (const length of [codestream.length, Math.floor(codestream.length / 2)]) {
+    const objects = [
+      "<< /Type /Catalog /Pages 2 0 R >>",
+      "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+      "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 32 24] /Resources << /XObject << /Im0 4 0 R >> >> /Contents 5 0 R >>",
+      Buffer.concat([
+        Buffer.from(`<< /Type /XObject /Subtype /Image /Width 32 /Height 24 /Filter /JPXDecode /Length ${length} >>\nstream\n`),
+        codestream.subarray(0, length), Buffer.from("\nendstream"),
+      ]),
+      `<< /Length ${content.length} >>\nstream\n${content}\nendstream`,
+    ];
+    const chunks = [Buffer.from("%PDF-1.7\n")];
+    const offsets = [];
+    let size = chunks[0].length;
+    for (const [i, body] of objects.entries()) {
+      offsets.push(size);
+      const object = Buffer.concat([Buffer.from(`${i + 1} 0 obj\n`), Buffer.from(body), Buffer.from("\nendobj\n")]);
+      chunks.push(object);
+      size += object.length;
+    }
+    const xref = offsets.map(offset => `${String(offset).padStart(10, "0")} 00000 n \n`).join("");
+    chunks.push(Buffer.from(`xref\n0 6\n0000000000 65535 f \n${xref}trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n${size}\n%%EOF\n`));
+    const pdf = bindings.Pdf.open(Buffer.concat(chunks));
+    try {
+      if (length === codestream.length) {
+        assert.match(pdf.page_svg(0), /<svg/);
+        const bitmap = pdf.render_page(0, 1);
+        try { assert.deepEqual([bitmap.width, bitmap.height], [32, 24]); }
+        finally { bitmap.free(); }
+      } else {
+        assert.throws(() => pdf.page_svg(0), /incomplete output.*decode_failures=1/);
+        assert.throws(() => pdf.render_page(0, 1), /incomplete output.*decode_failures=1/);
+      }
+    } finally { pdf.free(); }
+  }
+});
+
 test("packaged editor saves Unicode, page edits, extraction and optimization", () => {
   const editor = bindings.PdfEditor.open(fixture());
   let saved;

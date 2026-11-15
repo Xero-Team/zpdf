@@ -955,7 +955,16 @@ fn decode_jpx_image(
     // all of its internal invariants. Catch the unwind and surface a clean Err
     // so a single bad image is skipped rather than aborting the whole render.
     let image = catch_unwind(AssertUnwindSafe(|| {
-        Image::new(data, &DecodeSettings::default())
+        // Recovery can return a full-size buffer for truncated tile data without
+        // exposing a completeness flag. Fail decoding so page diagnostics and
+        // strict export frontends can report the missing image instead.
+        Image::new(
+            data,
+            &DecodeSettings {
+                strict: true,
+                ..DecodeSettings::default()
+            },
+        )
     }))
     .map_err(|_| {
         Error::StreamDecode("JPXDecode: decoder panicked parsing codestream header".into())

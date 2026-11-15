@@ -2,6 +2,46 @@
 
 ## Unreleased
 
+## 0.19.0 — Redaction hardening and native save validation
+
+Released 2026-11-15.
+
+### Security and correctness
+
+- Rewrite browser redaction saves to remove superseded content and resource
+  payloads while preserving composed edits and resources still used by surviving
+  content. Clean up aliased form/annotation references before saving. (#137)
+- Enforce shared processing deadlines and parser, font, content and GPU geometry
+  budgets; preserve decoding failures rather than silently accepting incomplete
+  output. Bound private tagging snapshots and encrypt signature metadata. (#137)
+- Preserve supported destination permissions, ownership and ACLs during desktop
+  saves, rejecting locations whose access policy cannot be preserved. (#137, #139)
+
+### Compatibility
+
+- `ParseLimits` adds `max_gpu_geometry_bytes`. Callers using exhaustive struct
+  literals must supply this field or use `..Default::default()`. This source
+  compatibility change requires a pre-1.0 minor release. The non-exhaustive
+  `InterpretStats` also exposes `operators_executed` for shared replay budgets.
+- Update the JPEG 2000 decoder to hayro-jpeg2000 0.5 with strict decoding.
+  Truncated headers and tile data remain errors, so recovered image buffers
+  cannot silently bypass incomplete-output checks in exports. (#135, #141)
+- Rebuild the shipped browser WASM/JS package and its source/artifact fingerprint
+  for the current library and dependency versions.
+
+### Validation and tooling
+
+- Run native save/ACL checks on Apple Silicon and Intel macOS, and FreeBSD 14.4
+  and 15.1, with bounded test runners and regression coverage. (#139)
+- Isolate allocation accounting per thread so background test-harness activity
+  cannot fail Ubuntu's exact path-allocation assertions; add a synchronized
+  concurrent-allocation regression. (#140)
+- Update resvg to 0.49 for SVG export validation and taiki-e/install-action to
+  2.88.0 for fuzz tooling. Retain the sha2 0.10 pins required by RSA 0.9.
+  (#129, #132, #125)
+- Add the Forgejo collaboration bridge, repair Forgejo validation and isolate
+  Windows preview fixtures. (#133, #134)
+
 ## 0.18.0 — Signature trust hardening and audited PDF workflows
 
 Released 2026-10-26.

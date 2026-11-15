@@ -16,9 +16,13 @@ Requires `wasm32-unknown-unknown` target and `wasm-bindgen-cli` at the version m
 
 ```bash
 rustup target add wasm32-unknown-unknown
-cargo install wasm-bindgen-cli --version 0.2.122  # match Cargo.lock
+cargo install wasm-bindgen-cli --version 0.2.129 --locked
 bash crates/zpdf-wasm/build-web.sh
 ```
+
+The checked-in package records `wasm-bindgen 0.2.129` in `www/pkg/build.json`.
+If dependency resolution changes the `wasm-bindgen` version in your local
+`Cargo.lock`, install that exact CLI version before rebuilding the bindings.
 
 This compiles for wasm32 and generates ES-module bindings into `www/pkg/`.
 Node.js is also required: the build records source/artifact fingerprints in
