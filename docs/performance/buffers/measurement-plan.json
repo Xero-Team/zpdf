@@ -1,0 +1,20 @@
+{
+  "baseline": "0e0f8dd3d3e4d12269197758ef5b651e221514b2",
+  "cases": [
+    "content-single",
+    "content-multi",
+    "content-small",
+    "pipeline",
+    "tiff",
+    "tiff-tail",
+    "tiff-small",
+    "flate",
+    "png"
+  ],
+  "pairs": 11,
+  "order": "alternating AB/BA",
+  "samples_per_process": 11,
+  "summary": "median paired process medians; fixed 11 pairs; retain all observations; compare output and input hashes and peak/retained bytes",
+  "scope": "Linux aarch64 offline Docker, release, synthetic workloads only; no universal speed guarantee",
+  "revision_note": "Initial shrink-to-fit candidate regressed tiff-tail by 5.98% (95% interval +5.79..+6.41). Preserve those observations; final candidate copies overallocated TIFF buffers as before and is evaluated in a new full 11-pair comparison."
+}

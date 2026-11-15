@@ -73,6 +73,25 @@ test("packaged reader renders and loads raw/compressed fonts", () => {
   } finally { pdf.free(); }
 });
 
+test("packaged bitmap transfers pixels while the copy API stays independent", () => {
+  const pdf = bindings.Pdf.open(fixture());
+  try {
+    const bitmap = pdf.render_page(0, 1);
+    const width = bitmap.width, height = bitmap.height;
+    const expected = bitmap.rgba();
+    const copy = bitmap.rgba();
+    copy.fill(0);
+    const transferred = bitmap.into_rgba(); // consumes bitmap; no free() afterwards
+    assert.equal(transferred.length, width * height * 4);
+    assert.deepEqual(transferred, expected);
+    // JS owns the returned bytes after the Rust bitmap has been consumed and
+    // after a later render allocates and releases WASM memory.
+    const next = pdf.render_page(1, 2);
+    next.free();
+    assert.deepEqual(transferred, expected);
+  } finally { pdf.free(); }
+});
+
 test("packaged reader rejects truncated JPX before exporting", () => {
   const codestream = readFileSync(new URL("../../zpdf-image/tests/fixtures/gray.j2k", import.meta.url));
   const content = "q 32 0 0 24 0 0 cm /Im0 Do Q";

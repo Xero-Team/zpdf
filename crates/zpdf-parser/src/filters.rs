@@ -89,7 +89,7 @@ pub fn decode_stream_with_limits(
         current = std::borrow::Cow::Owned(if let Some(p) = params {
             let predictor = p.get_i64("Predictor").unwrap_or(1);
             if predictor == 2 || predictor >= 10 {
-                apply_predictor(&decoded, p, &mut budget)?
+                apply_predictor(decoded, p, &mut budget)?
             } else {
                 // Predictor 1 (and unknown values) is a no-op. Keep ownership of
                 // the filter output instead of cloning the entire stream.
@@ -147,10 +147,10 @@ fn extract_decode_parms(dict: &PdfDict, filter_count: usize) -> Vec<Option<PdfDi
 /// Undo a TIFF or PNG predictor. The output replaces the filter output it is
 /// computed from, which the filter already charged to `budget`; only growth
 /// beyond it (a padded partial PNG row) is charged again.
-fn apply_predictor(data: &[u8], params: &PdfDict, budget: &mut DecodeBudget) -> Result<Vec<u8>> {
+fn apply_predictor(data: Vec<u8>, params: &PdfDict, budget: &mut DecodeBudget) -> Result<Vec<u8>> {
     let predictor = params.get_i64("Predictor").unwrap_or(1) as u32;
     if predictor == 1 {
-        return Ok(data.to_vec());
+        return Ok(compact_predictor_output(data));
     }
 
     // Validate parameters with reasonable PDF limits to prevent overflow attacks.
@@ -175,14 +175,25 @@ fn apply_predictor(data: &[u8], params: &PdfDict, budget: &mut DecodeBudget) -> 
     if predictor == 2 {
         decode_tiff_predictor(data, colors, bpc, columns)
     } else if predictor >= 10 {
-        decode_png_predictor(data, colors, bpc, columns, budget)
+        decode_png_predictor(&data, colors, bpc, columns, budget)
     } else {
-        Ok(data.to_vec())
+        Ok(compact_predictor_output(data))
+    }
+}
+
+fn compact_predictor_output(data: Vec<u8>) -> Vec<u8> {
+    // Reuse compact output. If the decoder overallocated, retain the previous
+    // compact-copy path: keeping slack raises retained memory, while shrinking
+    // the original allocation regressed the large partial-row benchmark.
+    if data.capacity() == data.len() {
+        data
+    } else {
+        data.to_vec()
     }
 }
 
 fn decode_tiff_predictor(
-    data: &[u8],
+    data: Vec<u8>,
     colors: usize,
     bpc: usize,
     columns: usize,
@@ -191,7 +202,7 @@ fn decode_tiff_predictor(
     // TIFF predictor (Predictor 2) in PDF spec only supports BPC=8
     if bpc != 8 {
         // Not an error per spec - just means predictor doesn't apply
-        return Ok(data.to_vec());
+        return Ok(compact_predictor_output(data));
     }
 
     // M4 Fix: Explicit validation that parameters are non-zero
@@ -206,20 +217,24 @@ fn decode_tiff_predictor(
         .checked_mul(colors)
         .ok_or_else(|| Error::StreamDecode("TIFF predictor: columns * colors overflow".into()))?;
 
+    // Invalid row sizes must fail before allocating another sample buffer.
+    let mut data = compact_predictor_output(data);
+
     // M4 Fix: Validate data length is consistent with parameters
     // Data should be a multiple of row_bytes (though we handle partial rows gracefully)
     if data.is_empty() {
-        return Ok(data.to_vec());
+        return Ok(data);
     }
 
-    let mut output = data.to_vec();
-    for row_start in (0..output.len()).step_by(row_bytes) {
-        let row_end = (row_start + row_bytes).min(output.len());
+    // ISO 32000-1 7.4.4.2: horizontal differencing only needs earlier samples
+    // in this row. Reconstruct the owned filter output in place.
+    for row_start in (0..data.len()).step_by(row_bytes) {
+        let row_end = (row_start + row_bytes).min(data.len());
         for i in (row_start + colors)..row_end {
-            output[i] = output[i].wrapping_add(output[i - colors]);
+            data[i] = data[i].wrapping_add(data[i - colors]);
         }
     }
-    Ok(output)
+    Ok(data)
 }
 
 fn decode_png_predictor(
@@ -919,6 +934,40 @@ fn decode_run_length(data: &[u8], budget: &mut DecodeBudget) -> Result<Vec<u8>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    const LARGE_ALLOCATION: usize = 1024 * 1024;
+    thread_local! {
+        static LARGE_ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+    }
+    struct Counting;
+    fn record_allocation(size: usize) {
+        if size >= LARGE_ALLOCATION {
+            let _ = LARGE_ALLOCATIONS.try_with(|n| n.set(n.get().wrapping_add(1)));
+        }
+    }
+    // SAFETY: all allocation operations forward pointers and layouts unchanged.
+    // Const-initialized, non-dropping TLS does not allocate and isolates tests.
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            record_allocation(layout.size());
+            unsafe { System.alloc(layout) }
+        }
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            record_allocation(layout.size());
+            unsafe { System.alloc_zeroed(layout) }
+        }
+        unsafe fn dealloc(&self, p: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(p, layout) };
+        }
+        unsafe fn realloc(&self, p: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+            record_allocation(size);
+            unsafe { System.realloc(p, layout, size) }
+        }
+    }
+    #[global_allocator]
+    static ALLOCATOR: Counting = Counting;
 
     #[test]
     fn ycck_white_decodes_to_no_ink() {
@@ -1310,8 +1359,122 @@ mod tests {
         // 3 colors (RGB), 8bpc, 2 columns → row = 6 bytes
         // [R0,G0,B0, dR1,dG1,dB1] → [R0,G0,B0, R0+dR1, G0+dG1, B0+dB1]
         let data = [100, 150, 200, 10, 20, 30];
-        let result = decode_tiff_predictor(&data, 3, 8, 2).unwrap();
+        let result = decode_tiff_predictor(data.to_vec(), 3, 8, 2).unwrap();
         assert_eq!(result, vec![100, 150, 200, 110, 170, 230]);
+    }
+
+    #[test]
+    fn tiff_predictor_reuses_compact_samples_and_preserves_partial_rows() {
+        let data = vec![250, 10, 20, 10, 250, 240, 1, 2, 3, 4];
+        let pointer = data.as_ptr();
+        let output = decode_tiff_predictor(data, 3, 8, 2).unwrap();
+        assert_eq!(output.as_ptr(), pointer, "must reuse the filter output");
+        assert_eq!(output, [250, 10, 20, 4, 4, 4, 1, 2, 3, 5]);
+        for bpc in [1, 4, 16] {
+            let data = vec![250, 10, 20];
+            let pointer = data.as_ptr();
+            let output = decode_tiff_predictor(data, 3, bpc, 2).unwrap();
+            assert_eq!(output.as_ptr(), pointer);
+            assert_eq!(output, [250, 10, 20]);
+        }
+        assert!(decode_tiff_predictor(Vec::new(), 1, 8, 1)
+            .unwrap()
+            .is_empty());
+        assert!(decode_tiff_predictor(vec![1], 0, 8, 1).is_err());
+        assert!(decode_tiff_predictor(vec![1], 1, 8, 0).is_err());
+        assert!(decode_tiff_predictor(vec![1], usize::MAX, 8, 2).is_err());
+    }
+
+    #[test]
+    fn tiff_predictor_keeps_filter_budget_and_chain_semantics() {
+        let mut params = PdfDict::new();
+        params.insert(PdfName::new("Predictor"), PdfObject::Integer(2));
+        params.insert(PdfName::new("Columns"), PdfObject::Integer(3));
+        let mut dict = PdfDict::new();
+        dict.insert(
+            PdfName::new("Filter"),
+            PdfObject::Name(PdfName::new("FlateDecode")),
+        );
+        dict.insert(PdfName::new("DecodeParms"), PdfObject::Dict(params));
+        let encoded = zlib(&[250, 10, 5, 1, 2]);
+        assert_eq!(
+            decode_stream_with_limits(&encoded, &dict, &limits_with_budget(5)).unwrap(),
+            [250, 4, 9, 1, 3]
+        );
+        assert!(decode_stream_with_limits(&encoded, &dict, &limits_with_budget(4)).is_err());
+        // The following filter must see reconstructed ASCIIHex samples, not
+        // the original differenced bytes: [52, 253, 13] -> "41>" -> "A".
+        dict.insert(
+            PdfName::new("Filter"),
+            PdfObject::Array(vec![
+                PdfObject::Name(PdfName::new("FlateDecode")),
+                PdfObject::Name(PdfName::new("ASCIIHexDecode")),
+            ]),
+        );
+        let params = dict.get("DecodeParms").unwrap().clone();
+        dict.insert(
+            PdfName::new("DecodeParms"),
+            PdfObject::Array(vec![params, PdfObject::Null]),
+        );
+        // ASCIIHex reserves its conservative two-byte output allowance.
+        assert_eq!(
+            decode_stream_with_limits(&zlib(&[52, 253, 13]), &dict, &limits_with_budget(5))
+                .unwrap(),
+            b"A"
+        );
+        assert!(
+            decode_stream_with_limits(&zlib(&[52, 253, 13]), &dict, &limits_with_budget(4))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn tiff_predictor_rejects_invalid_parameters_before_copying_samples() {
+        for (colors, columns) in [(0, 1), (1, 0), (usize::MAX, 2)] {
+            let mut data = Vec::with_capacity(2 * LARGE_ALLOCATION);
+            data.resize(LARGE_ALLOCATION, 1);
+            let before = LARGE_ALLOCATIONS.with(Cell::get);
+            let output = decode_tiff_predictor(data, colors, 8, columns);
+            let copies = LARGE_ALLOCATIONS.with(Cell::get).wrapping_sub(before);
+            assert!(output.is_err());
+            assert_eq!(copies, 0, "invalid parameters must not copy the samples");
+        }
+    }
+
+    #[test]
+    fn tiff_predictor_compacts_overallocated_samples_including_noop_paths() {
+        for bpc in [1, 4, 8, 16] {
+            let mut data = Vec::with_capacity(64);
+            data.extend_from_slice(&[250, 10, 20]);
+            let output = decode_tiff_predictor(data, 1, bpc, 3).unwrap();
+            assert_eq!(
+                output,
+                if bpc == 8 {
+                    [250, 4, 24]
+                } else {
+                    [250, 10, 20]
+                }
+            );
+            assert_eq!(output.capacity(), output.len());
+        }
+        // Unsupported bit depths remain no-ops even with invalid row sizes.
+        let output = decode_tiff_predictor(vec![1], 0, 4, 0).unwrap();
+        assert_eq!(output, [1]);
+        let empty = decode_tiff_predictor(Vec::with_capacity(64), 1, 8, 1).unwrap();
+        assert_eq!(empty.capacity(), 0);
+    }
+
+    #[test]
+    fn predictor_noop_paths_preserve_compact_output_for_wrapped_values() {
+        for predictor in [1, (1_i64 << 32) + 1, (1_i64 << 32) + 3] {
+            let mut params = PdfDict::new();
+            params.insert(PdfName::new("Predictor"), PdfObject::Integer(predictor));
+            let mut data = Vec::with_capacity(64);
+            data.extend_from_slice(&[1, 2, 3]);
+            let output = apply_predictor(data, &params, &mut DecodeBudget::new(0)).unwrap();
+            assert_eq!(output, [1, 2, 3]);
+            assert_eq!(output.capacity(), output.len());
+        }
     }
 
     // --- LZWDecode ---

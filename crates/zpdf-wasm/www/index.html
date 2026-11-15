@@ -122,9 +122,8 @@ function renderPage() {
   canvas.style.width = (w / dpr) + "px";
   canvas.style.height = (h / dpr) + "px";
   canvas.hidden = false;
-  const image = new ImageData(new Uint8ClampedArray(bitmap.rgba().buffer), w, h);
+  const image = new ImageData(new Uint8ClampedArray(bitmap.into_rgba().buffer), w, h);
   canvas.getContext("2d").putImageData(image, 0, 0);
-  bitmap.free();
   const ms = (performance.now() - t0).toFixed(0);
   $("page-label").textContent = `${pageIndex + 1} / ${pdf.page_count}`;
   $("zoom-label").textContent = Math.round(zoom * 100) + "%";

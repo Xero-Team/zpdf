@@ -227,6 +227,15 @@ impl PdfDocument {
                     if combined_len > limit {
                         return Err(Error::StreamSizeLimit(limit));
                     }
+                    // Reuse the first decoded stream instead of keeping a
+                    // second full copy of a single-stream page's contents.
+                    // Keep the existing compact result when a decoder's growth
+                    // strategy left excess capacity; retaining that slack until
+                    // interpretation ends would trade copies for extra memory.
+                    if all_bytes.is_empty() && bytes.capacity() <= bytes.len().max(8) {
+                        all_bytes = bytes;
+                        continue;
+                    }
                     all_bytes
                         .try_reserve(separator.saturating_add(bytes.len()))
                         .map_err(|e| {
