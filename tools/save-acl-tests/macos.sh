@@ -22,9 +22,14 @@ python3 - "$acl_root/profile.sb" "$acl_mount" "$acl_source" "$acl_toolchain" <<'
 import json, pathlib, sys
 profile, mount, source, toolchain = sys.argv[1:]
 q = json.dumps
+read_roots = [pathlib.Path(source), pathlib.Path(toolchain).parent, pathlib.Path(mount)]
+# Cargo canonicalizes dep-info paths by stat'ing each ancestor. Permit only
+# metadata there; directory contents and unrelated home files stay unreadable.
+ancestors = sorted({str(parent) for root in read_roots for parent in root.parents})
 pathlib.Path(profile).write_text('\n'.join([
     '(version 1)', '(allow default)', '(deny network*)', '(deny file-write*)',
     '(deny file-read* (subpath "/Users"))',
+    '(allow file-read-metadata ' + ' '.join(f'(literal {q(p)})' for p in ancestors) + ')',
     f'(allow file-read* (subpath {q(source)}) (subpath {q(str(pathlib.Path(toolchain).parent))}) (subpath {q(mount)}))',
     f'(allow file-write* (subpath {q(mount + "/work")}) (literal "/dev/null"))',
 ]))
