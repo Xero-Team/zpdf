@@ -72,6 +72,62 @@ fn partial_page_content_is_explicit_in_both_high_level_apis() {
 }
 
 #[test]
+fn truncated_jpx_tile_data_is_incomplete_output() {
+    let codestream = include_bytes!("../../zpdf-image/tests/fixtures/gray.j2k");
+    for len in [codestream.len(), codestream.len() / 2] {
+        let complete = len == codestream.len();
+        let mut builder = DocumentBuilder::new();
+        builder.add_page(32.0, 24.0);
+        let mut writer = IncrementalWriter::new(builder.build().unwrap()).unwrap();
+        let page = writer.document().page(0).unwrap();
+        let mut image = PdfDict::new();
+        for (key, value) in [
+            ("Type", "XObject"),
+            ("Subtype", "Image"),
+            ("Filter", "JPXDecode"),
+        ] {
+            image.insert(PdfName::new(key), PdfObject::Name(PdfName::new(value)));
+        }
+        image.insert(PdfName::new("Width"), PdfObject::Integer(32));
+        image.insert(PdfName::new("Height"), PdfObject::Integer(24));
+        let (n, g) = writer.try_add_stream(&image, &codestream[..len]).unwrap();
+        let image_id = zpdf::ObjectId(n, g as u16);
+        let mut objects = PdfDict::new();
+        objects.insert(PdfName::new("Im0"), PdfObject::Ref(image_id));
+        let mut resources = PdfDict::new();
+        resources.insert(PdfName::new("XObject"), PdfObject::Dict(objects));
+        let (n, g) = writer
+            .try_add_stream(&PdfDict::new(), b"q 32 0 0 24 0 0 cm /Im0 Do Q")
+            .unwrap();
+        let mut dict = writer
+            .resolve_current(page.id)
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .clone();
+        dict.insert(PdfName::new("Resources"), PdfObject::Dict(resources));
+        dict.insert(
+            PdfName::new("Contents"),
+            PdfObject::Ref(zpdf::ObjectId(n, g as u16)),
+        );
+        writer.overwrite_object(page.id, PdfObject::Dict(dict));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        writer.write(&mut bytes).unwrap();
+        let doc = PdfDocument::open(bytes.into_inner()).unwrap();
+        let interpreted = zpdf::interpret_page(&doc, 0, Default::default()).unwrap();
+        assert_eq!(interpreted.is_complete(), complete, "codestream len {len}");
+        assert_eq!(interpreted.ensure_complete().is_ok(), complete);
+        if !complete {
+            assert_eq!(interpreted.stats.diagnostics.decode_failures, 1);
+            assert_eq!(
+                interpreted.stats.diagnostics.first_failed_object,
+                Some(image_id)
+            );
+        }
+    }
+}
+
+#[test]
 fn limits_malformed_tokens_and_unknown_operators_are_reported() {
     let rect = Rect::new(0.0, 0.0, 100.0, 100.0);
     let (_, stats) = ContentInterpreter::new(rect)

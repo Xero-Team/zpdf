@@ -23,8 +23,9 @@ Released 2026-11-15.
   literals must supply this field or use `..Default::default()`. This source
   compatibility change requires a pre-1.0 minor release. The non-exhaustive
   `InterpretStats` also exposes `operators_executed` for shared replay budgets.
-- Update the JPEG 2000 decoder to hayro-jpeg2000 0.5. Truncated main headers still
-  fail cleanly; the decoder may recover images with truncated tile data. (#135)
+- Update the JPEG 2000 decoder to hayro-jpeg2000 0.5 with strict decoding.
+  Truncated headers and tile data remain errors, so recovered image buffers
+  cannot silently bypass incomplete-output checks in exports. (#135, #141)
 - Rebuild the shipped browser WASM/JS package and its source/artifact fingerprint
   for the current library and dependency versions.
 
