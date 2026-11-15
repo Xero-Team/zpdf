@@ -227,31 +227,23 @@ impl PdfFile {
         Ok(Arc::new(obj))
     }
 
-    fn resolve_depth(&self, id: ObjectId, depth: u32) -> Result<PdfObject> {
-        /// Maximum length of a ref-to-ref chain (`1 0 obj 2 0 R endobj` ...)
-        /// followed before the reference is treated as null. Guards against
-        /// reference cycles (`A -> B -> A`) without a per-call visited set.
-        const MAX_REF_CHAIN: u32 = 32;
-        if depth > MAX_REF_CHAIN {
-            tracing::warn!(
-                "indirect reference chain longer than {MAX_REF_CHAIN} at {id}; treating as null"
-            );
-            return Ok(PdfObject::Null);
-        }
-
-        // Fast path: already resolved. The borrow ends with this block.
-        if let Some(obj) = self.object_cache.borrow().get(&id) {
-            return Ok(PdfObject::clone(obj));
-        }
-
+    /// Resolve one indirect object without following a reference stored as its
+    /// body. Strings and streams are decrypted, and object-stream members and
+    /// repaired xref entries use the same parsing rules as [`Self::resolve`].
+    ///
+    /// This preserves every graph edge for editors that must consult pending
+    /// replacements while following a reference chain. The resolved-object
+    /// cache deliberately cannot serve this operation: its values have already
+    /// followed those edges.
+    pub fn resolve_unfollowed(&self, id: ObjectId) -> Result<PdfObject> {
         // ISO 32000-1, 7.3.10: a reference to an object that is missing from
         // the xref, or marked free, is a reference to the null object — not an
         // error. BUT a damaged xref frequently just omits (or wrongly frees)
         // objects that physically exist in the file, which would silently empty
         // the page tree. So before treating a missing/free entry as null, give
         // the lazy repair table (one memoized full-file scan) a chance to locate
-        // the real object. The Null is cached either way so the warning fires
-        // once per object and a genuinely-dangling ref stays cheap.
+        // the real object. Normal resolution caches Null too, so repeated
+        // dangling references remain cheap for ordinary resolving callers.
         let obj = match self.xref.get(id) {
             Some(XrefEntry::InUse { offset, .. }) => self.parse_at_offset_checked(*offset, id)?,
             Some(XrefEntry::Compressed {
@@ -281,6 +273,28 @@ impl PdfFile {
                 }
             },
         };
+
+        Ok(obj)
+    }
+
+    fn resolve_depth(&self, id: ObjectId, depth: u32) -> Result<PdfObject> {
+        /// Maximum length of a ref-to-ref chain (`1 0 obj 2 0 R endobj` ...)
+        /// followed before the reference is treated as null. Guards against
+        /// reference cycles (`A -> B -> A`) without a per-call visited set.
+        const MAX_REF_CHAIN: u32 = 32;
+        if depth > MAX_REF_CHAIN {
+            tracing::warn!(
+                "indirect reference chain longer than {MAX_REF_CHAIN} at {id}; treating as null"
+            );
+            return Ok(PdfObject::Null);
+        }
+
+        // Fast path: already resolved. The borrow ends with this block.
+        if let Some(obj) = self.object_cache.borrow().get(&id) {
+            return Ok(PdfObject::clone(obj));
+        }
+
+        let obj = self.resolve_unfollowed(id)?;
 
         // A top-level object body may itself be an indirect reference; follow
         // the chain (depth-limited) so callers always get a direct value.
@@ -455,8 +469,8 @@ impl PdfFile {
         }
     }
 
-    /// If `/Filter`, `/DecodeParms`, or `/DP` is an indirect reference (or an
-    /// array containing one), return a clone of `dict` with those values
+    /// If `/Filter` or the selected `/DecodeParms` (falling back to `/DP`)
+    /// is an indirect reference or array containing one, clone `dict` with it
     /// resolved one level. `None` when nothing needs resolving (common case —
     /// avoids cloning the dict). When `inline_globals` is set, a DecodeParms
     /// `/JBIG2Globals` stream reference is also inlined (see
@@ -467,7 +481,14 @@ impl PdfFile {
         inline_globals: bool,
         limits: &ParseLimits,
     ) -> Result<Option<PdfDict>> {
-        const KEYS: [&str; 3] = ["Filter", "DecodeParms", "DP"];
+        // Match extract_decode_parms, including an explicitly present null:
+        // an ignored DP must not cause resolution or globals decoding errors.
+        let parameters_key = if dict.get("DecodeParms").is_some() {
+            "DecodeParms"
+        } else {
+            "DP"
+        };
+        let keys = ["Filter", parameters_key];
         // A DecodeParms dict containing a /JBIG2Globals reference needs the
         // globals stream inlined even though the dict itself is direct.
         let dict_needs_globals = |obj: &PdfObject| {
@@ -482,7 +503,7 @@ impl PdfFile {
                 .any(|e| matches!(e, PdfObject::Ref(_)) || dict_needs_globals(e)),
             other => dict_needs_globals(other),
         };
-        if !KEYS.iter().any(|k| dict.get(k).is_some_and(needs_resolve)) {
+        if !keys.iter().any(|k| dict.get(k).is_some_and(needs_resolve)) {
             return Ok(None);
         }
 
@@ -498,7 +519,7 @@ impl PdfFile {
             }
         };
         let mut out = dict.clone();
-        for key in KEYS {
+        for key in keys {
             let Some(value) = dict.get(key) else { continue };
             let resolved = match resolve_shallow(value) {
                 // Also resolve refs *inside* a (possibly itself indirect) array.
@@ -1042,6 +1063,27 @@ mod tests {
         let b = file.resolve_shared(ObjectId(1, 0)).unwrap();
         assert!(Arc::ptr_eq(&a, &b));
         assert_eq!(*a, file.resolve(ObjectId(1, 0)).unwrap());
+    }
+
+    #[test]
+    fn resolve_unfollowed_preserves_alias_edges_after_normal_resolution() {
+        let pdf = build_pdf(
+            &[
+                (1, "<< /Type /Catalog >>"),
+                (2, "3 0 R"),
+                (3, "<< /Marker (resolved target) >>"),
+            ],
+            1,
+        );
+        let file = PdfFile::parse(pdf).unwrap();
+        let target = file.resolve(ObjectId(2, 0)).unwrap();
+        assert!(matches!(target, PdfObject::Dict(_)));
+        assert_eq!(
+            file.resolve_unfollowed(ObjectId(2, 0)).unwrap(),
+            PdfObject::Ref(ObjectId(3, 0))
+        );
+        assert_eq!(file.resolve(ObjectId(2, 0)).unwrap(), target);
+        assert_eq!(file.resolve_unfollowed(ObjectId(3, 0)).unwrap(), target);
     }
 
     #[test]

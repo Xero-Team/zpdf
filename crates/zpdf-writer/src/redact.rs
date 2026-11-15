@@ -83,7 +83,7 @@ impl IncrementalWriter {
         let rects: Vec<Rect> = rects.iter().map(|r| r.normalize()).collect();
 
         let page_id = self.page_id(page_index)?;
-        let page_obj = self.resolve_current(page_id)?;
+        let page_obj = self.resolve_current_chain(page_id)?;
         let mut page_dict = page_obj.as_dict()?.clone();
 
         // Collect the decoded content bytes of every /Contents stream.
@@ -236,8 +236,12 @@ impl IncrementalWriter {
         // The thumbnail is a raster of the unredacted page.
         page_dict.0.remove(&PdfName::new("Thumb"));
 
-        let structure_edits =
-            self.prepare_structure_scrub(page_id, &outcome.redacted_mcids, &removed_annots)?;
+        let structure_edits = self.prepare_structure_scrub(
+            page_id,
+            &outcome.redacted_mcids,
+            &removed_annots,
+            deadline,
+        )?;
 
         // Resolve and merge every fallible edit before mutating the writer.
         // Structure nodes may alias a page or resource owner, so merge against
@@ -267,6 +271,16 @@ impl IncrementalWriter {
             };
             prepared_edits.insert(id, object);
         }
+
+        // Even a text-only edit supersedes its old content streams. Unknown
+        // resource fields, annotation appearances or another page can retain
+        // them independently of any names dropped by the content filter.
+        resource_graph.check_superseded_contents(
+            page_id,
+            &content_ids,
+            &prepared_edits,
+            &removed_annots,
+        )?;
         let Some(PdfObject::Dict(page_dict)) = prepared_edits.get_mut(&page_id) else {
             return Err(invalid_data("structure cleanup replaced the page dictionary").into());
         };
@@ -302,17 +316,12 @@ impl IncrementalWriter {
         rects: &[Rect],
         deadline: zpdf_core::time::Instant,
     ) -> Result<HashSet<ObjectId>> {
-        let check_deadline = || -> Result<()> {
-            if zpdf_core::time::Instant::now() >= deadline {
-                return Err(invalid_data("redaction exceeds annotation time limit").into());
-            }
-            Ok(())
-        };
+        let check_deadline = || check_redaction_deadline(deadline);
         check_deadline()?;
         let mut removed_annots = HashSet::new();
         if let Some(annots_obj) = page_dict.get("Annots").cloned() {
             let annots = match &annots_obj {
-                PdfObject::Ref(r) => self.resolve_current(*r)?.as_array()?.to_vec(),
+                PdfObject::Ref(r) => self.resolve_current_chain(*r)?.as_array()?.to_vec(),
                 PdfObject::Array(a) => a.to_vec(),
                 PdfObject::Null => Vec::new(),
                 _ => {
@@ -327,7 +336,7 @@ impl IncrementalWriter {
                 let resolved;
                 let object = match &annotation {
                     PdfObject::Ref(id) => {
-                        resolved = self.resolve_current(*id)?;
+                        resolved = self.resolve_current_chain(*id)?;
                         &resolved
                     }
                     object => object,
@@ -335,7 +344,7 @@ impl IncrementalWriter {
                 let mut remove = false;
                 if !matches!(object, PdfObject::Null) {
                     let dict = object.as_dict()?;
-                    if let Some(bounds) = annot_rect(dict) {
+                    if let Some(bounds) = annot_rect(self, dict, deadline)? {
                         for rect in rects {
                             check_deadline()?;
                             if intersects(&bounds, rect) {
@@ -686,7 +695,9 @@ impl IncrementalWriter {
         page: ObjectId,
         mcids: &HashSet<i64>,
         objects: &HashSet<ObjectId>,
+        deadline: zpdf_core::time::Instant,
     ) -> Result<BTreeMap<ObjectId, PdfObject>> {
+        check_redaction_deadline(deadline)?;
         let mut walk = StructureScrub {
             writer: self,
             page,
@@ -696,11 +707,14 @@ impl IncrementalWriter {
             active: HashSet::new(),
             edits: BTreeMap::new(),
             remaining: 1 << 20,
+            deadline,
         };
         if mcids.is_empty() && objects.is_empty() {
             return Ok(walk.edits);
         }
+        check_redaction_deadline(deadline)?;
         let mut catalog = self.resolve_current(self.catalog_ref())?.as_dict()?.clone();
+        check_redaction_deadline(deadline)?;
         let Some(root_value) = catalog.get("StructTreeRoot") else {
             return Ok(walk.edits);
         };
@@ -709,6 +723,7 @@ impl IncrementalWriter {
             _ => None,
         };
         let mut root = self.deref_current(root_value).as_dict()?.clone();
+        check_redaction_deadline(deadline)?;
         let pg = walk.page_of(&root, None);
         if let Some(mut kids) = root.get("K").cloned() {
             let (_, changed) = walk.kid(&mut kids, pg, true, 0)?;
@@ -723,6 +738,7 @@ impl IncrementalWriter {
                 }
             }
         }
+        check_redaction_deadline(deadline)?;
         Ok(walk.edits)
     }
 }
@@ -739,6 +755,7 @@ struct StructureScrub<'a> {
     active: HashSet<ObjectId>,
     edits: BTreeMap<ObjectId, PdfObject>,
     remaining: usize,
+    deadline: zpdf_core::time::Instant,
 }
 
 impl StructureScrub<'_> {
@@ -756,6 +773,7 @@ impl StructureScrub<'_> {
         normalize_array: bool,
         depth: u32,
     ) -> Result<(bool, bool)> {
+        check_redaction_deadline(self.deadline)?;
         if depth > 256 || self.remaining == 0 {
             return Err(invalid_data("structure redaction exceeds traversal limit").into());
         }
@@ -922,21 +940,64 @@ pub fn redact_pdf(
     rewrite_pdf(doc.file(), &RewriteOptions::default())
 }
 
-fn annot_rect(dict: &PdfDict) -> Option<Rect> {
-    match dict.get("Rect") {
-        Some(PdfObject::Array(a)) if a.len() == 4 => {
-            let mut v = [0.0f64; 4];
-            for (i, o) in a.iter().enumerate() {
-                v[i] = match o {
-                    PdfObject::Integer(n) => *n as f64,
-                    PdfObject::Real(f) => *f,
-                    _ => return None,
-                };
-            }
-            Some(Rect::new(v[0], v[1], v[2], v[3]).normalize())
-        }
-        _ => None,
+fn check_redaction_deadline(deadline: zpdf_core::time::Instant) -> Result<()> {
+    if zpdf_core::time::Instant::now() >= deadline {
+        return Err(invalid_data("redaction exceeds time limit").into());
     }
+    Ok(())
+}
+
+/// Match the reader's direct/indirect rectangle shapes, but resolve against
+/// pending edits. Missing, malformed or unresolvable values have no bounds;
+/// traversal/deadline exhaustion remains an error rather than missing bounds.
+fn annot_rect(
+    writer: &IncrementalWriter,
+    dict: &PdfDict,
+    deadline: zpdf_core::time::Instant,
+) -> Result<Option<Rect>> {
+    check_redaction_deadline(deadline)?;
+    let values = match dict.get("Rect") {
+        Some(PdfObject::Array(values)) => std::borrow::Cow::Borrowed(values.as_slice()),
+        Some(PdfObject::Ref(id)) => {
+            let object = writer.resolve_current_chain(*id);
+            check_redaction_deadline(deadline)?;
+            match object {
+                Ok(PdfObject::Array(values)) => std::borrow::Cow::Owned(values),
+                Err(error @ zpdf_core::Error::RecursionLimit(_)) => return Err(error),
+                _ => return Ok(None),
+            }
+        }
+        _ => return Ok(None),
+    };
+    if values.len() != 4 {
+        return Ok(None);
+    }
+    let mut numbers = [0.0; 4];
+    for (slot, value) in numbers.iter_mut().zip(values.iter()) {
+        check_redaction_deadline(deadline)?;
+        let resolved;
+        let value = match value {
+            PdfObject::Ref(id) => {
+                resolved = writer.resolve_current_chain(*id);
+                check_redaction_deadline(deadline)?;
+                match &resolved {
+                    Ok(value) => value,
+                    Err(zpdf_core::Error::RecursionLimit(limit)) => {
+                        return Err(zpdf_core::Error::RecursionLimit(*limit));
+                    }
+                    Err(_) => return Ok(None),
+                }
+            }
+            value => value,
+        };
+        let Ok(number) = value.as_f64() else {
+            return Ok(None);
+        };
+        *slot = number;
+    }
+    Ok(Some(
+        Rect::new(numbers[0], numbers[1], numbers[2], numbers[3]).normalize(),
+    ))
 }
 
 fn intersects(a: &Rect, b: &Rect) -> bool {
@@ -1453,6 +1514,135 @@ impl<'a> ResourceGraphCheck<'a> {
         Ok(())
     }
 
+    fn current_unfollowed(&self, id: ObjectId) -> Result<PdfObject> {
+        if matches!(
+            self.writer.pending.get(&id.0),
+            Some((_, crate::PendingObject::Raw(_)))
+        ) {
+            return Err(invalid_data("redaction cannot inspect a pending raw object").into());
+        }
+        self.writer.resolve_current_unfollowed(id)
+    }
+
+    /// Walk the graph the eventual rewrite will retain, applying the prepared
+    /// edits and omitting only the edges that this transaction replaces. This
+    /// lets ordinary annotation /P and page /Parent backrefs see the edited
+    /// page, while a sibling or arbitrary resource alias to its old Contents
+    /// still causes refusal. Stream payloads are neither decoded nor hashed.
+    fn check_superseded_contents(
+        &mut self,
+        page_id: ObjectId,
+        content_ids: &[ObjectId],
+        prepared: &BTreeMap<ObjectId, PdfObject>,
+        removed_annots: &HashSet<ObjectId>,
+    ) -> Result<()> {
+        if content_ids.is_empty() {
+            return Ok(());
+        }
+
+        let mut superseded = HashSet::new();
+        for &root in content_ids {
+            let mut id = root;
+            loop {
+                self.charge_node(0)?;
+                if !superseded.insert(id) {
+                    break;
+                }
+                match self.current_unfollowed(id)? {
+                    PdfObject::Ref(next) => id = next,
+                    PdfObject::Stream(_) => break,
+                    _ => {
+                        return Err(invalid_data(
+                            "redaction content no longer resolves to a stream",
+                        )
+                        .into())
+                    }
+                }
+            }
+        }
+
+        let mut pending = vec![self.writer.catalog_ref()];
+        if let Some(info) = self
+            .writer
+            .info_ref_override
+            .or_else(|| self.writer.document().file().trailer.get_ref("Info").ok())
+        {
+            pending.push(info);
+        }
+        let mut visited: HashSet<ObjectId> = pending.iter().copied().collect();
+        while let Some(id) = pending.pop() {
+            self.charge_node(0)?;
+            if removed_annots.contains(&id) {
+                continue; // This annotation's committed value will be null.
+            }
+            if superseded.contains(&id) {
+                return Err(
+                    invalid_data("redaction would retain an original content stream").into(),
+                );
+            }
+            let mut object = match prepared.get(&id) {
+                Some(object) => object.clone(),
+                None => self.current_unfollowed(id)?,
+            };
+            if id == page_id {
+                let PdfObject::Dict(dict) = &mut object else {
+                    return Err(
+                        invalid_data("structure cleanup replaced the page dictionary").into(),
+                    );
+                };
+                // The new stream is allocated only after this preflight. It
+                // has no references, so omit the replaced edge from this view.
+                dict.0.remove(&PdfName::new("Contents"));
+            }
+            self.collect_surviving_content_refs(&object, 0, &mut visited, &mut pending)?;
+        }
+        Ok(())
+    }
+
+    fn collect_surviving_content_refs(
+        &mut self,
+        object: &PdfObject,
+        depth: u32,
+        visited: &mut HashSet<ObjectId>,
+        pending: &mut Vec<ObjectId>,
+    ) -> Result<()> {
+        self.charge_node(depth)?;
+        let bytes = match object {
+            PdfObject::Name(name) => name.as_str().len(),
+            PdfObject::String(string) => string.0.len(),
+            _ => 0,
+        };
+        self.charge_graph_bytes(bytes)?;
+        match object {
+            PdfObject::Ref(id) => {
+                if visited.insert(*id) {
+                    pending.push(*id);
+                }
+            }
+            PdfObject::Array(values) => {
+                for value in values {
+                    self.collect_surviving_content_refs(value, depth + 1, visited, pending)?;
+                }
+            }
+            PdfObject::Dict(dict) | PdfObject::Stream(zpdf_core::PdfStream { dict, .. }) => {
+                for (key, value) in &dict.0 {
+                    self.charge_graph_bytes(key.as_str().len())?;
+                    self.collect_surviving_content_refs(value, depth + 1, visited, pending)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn charge_graph_bytes(&mut self, bytes: usize) -> Result<()> {
+        self.bytes_left = self
+            .bytes_left
+            .checked_sub(bytes as u64)
+            .ok_or_else(|| invalid_data("resource cleanup exceeds graph byte limit"))?;
+        Ok(())
+    }
+
     /// Only interpreter-recognized dependency edges can establish a shared
     /// descendant's use. Unknown fields remain reachable, but cannot bless an
     /// otherwise removed image/string merely by pointing to it.
@@ -1560,12 +1750,14 @@ impl<'a> ResourceGraphCheck<'a> {
 
     fn mark_stream_filters(&mut self, dict: &PdfDict, depth: u32) -> Result<()> {
         self.mark_key(dict, "Filter", depth, ResourceRole::Numeric)?;
-        self.mark_keys(
-            dict,
-            &["DecodeParms", "DP"],
-            depth,
-            ResourceRole::DecodeParms,
-        )
+        // An ignored DP cannot establish a real use of a removed payload.
+        // Its stored references are still inspected by check_retained.
+        let parameters_key = if dict.get("DecodeParms").is_some() {
+            "DecodeParms"
+        } else {
+            "DP"
+        };
+        self.mark_key(dict, parameters_key, depth, ResourceRole::DecodeParms)
     }
 
     fn mark_used_children(
@@ -2693,6 +2885,178 @@ mod tests {
             limits,
             zpdf_core::time::Instant::now() + std::time::Duration::from_secs(8),
         )
+    }
+
+    #[test]
+    fn expired_structure_deadline_preserves_pending_writer_edits() {
+        let mut builder = crate::DocumentBuilder::new();
+        builder.add_page(100.0, 100.0);
+        let mut writer = IncrementalWriter::new(builder.build().unwrap()).unwrap();
+        let page = writer.page_id(0).unwrap();
+        let mut element = PdfDict::new();
+        element.insert(PdfName::new("S"), PdfObject::Name(PdfName::new("P")));
+        element.insert(PdfName::new("Pg"), PdfObject::Ref(page));
+        element.insert(PdfName::new("K"), PdfObject::Integer(0));
+        element.insert(
+            PdfName::new("ActualText"),
+            PdfObject::String(zpdf_core::PdfString(b"selected replacement".to_vec())),
+        );
+        let (element_num, _) = writer.try_add_object(&PdfObject::Dict(element)).unwrap();
+        let mut root = PdfDict::new();
+        root.insert(
+            PdfName::new("Type"),
+            PdfObject::Name(PdfName::new("StructTreeRoot")),
+        );
+        root.insert(PdfName::new("K"), PdfObject::Ref(ObjectId(element_num, 0)));
+        let (root_num, _) = writer.try_add_object(&PdfObject::Dict(root)).unwrap();
+        let catalog_id = writer.catalog_ref();
+        let mut catalog = writer
+            .resolve_current(catalog_id)
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .clone();
+        catalog.insert(
+            PdfName::new("StructTreeRoot"),
+            PdfObject::Ref(ObjectId(root_num, 0)),
+        );
+        writer.overwrite_object(catalog_id, PdfObject::Dict(catalog));
+        let mcids = HashSet::from([0]);
+        let objects = HashSet::new();
+        let mut before = Cursor::new(Vec::new());
+        writer.write(&mut before).unwrap();
+
+        let result =
+            writer.prepare_structure_scrub(page, &mcids, &objects, zpdf_core::time::Instant::now());
+        assert!(
+            result.is_err(),
+            "expired structure preflight must stop before resolving its tree"
+        );
+        let edits = writer
+            .prepare_structure_scrub(
+                page,
+                &mcids,
+                &objects,
+                zpdf_core::time::Instant::now() + std::time::Duration::from_secs(8),
+            )
+            .unwrap();
+        assert!(edits
+            .get(&ObjectId(element_num, 0))
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get("ActualText")
+            .is_none());
+        let mut after = Cursor::new(Vec::new());
+        writer.write(&mut after).unwrap();
+        assert_eq!(
+            before.into_inner(),
+            after.into_inner(),
+            "preflight must preserve existing edits"
+        );
+    }
+
+    #[test]
+    fn structure_deadline_is_checked_before_revisiting_unchanged_child() {
+        let mut builder = crate::DocumentBuilder::new();
+        builder.add_page(100.0, 100.0);
+        let mut writer = IncrementalWriter::new(builder.build().unwrap()).unwrap();
+        let page = writer.page_id(0).unwrap();
+        let mut element = PdfDict::new();
+        element.insert(PdfName::new("S"), PdfObject::Name(PdfName::new("P")));
+        element.insert(PdfName::new("Pg"), PdfObject::Ref(page));
+        element.insert(PdfName::new("K"), PdfObject::Integer(1));
+        element.insert(
+            PdfName::new("ActualText"),
+            PdfObject::String(zpdf_core::PdfString(b"public replacement".to_vec())),
+        );
+        let (number, _) = writer.try_add_object(&PdfObject::Dict(element)).unwrap();
+        let mut child = PdfObject::Ref(ObjectId(number, 0));
+        let before = child.clone();
+        let mcids = HashSet::from([0]);
+        let objects = HashSet::new();
+        let mut walk = StructureScrub {
+            writer: &writer,
+            page,
+            mcids: &mcids,
+            objects: &objects,
+            pages: HashSet::from([page]),
+            active: HashSet::new(),
+            edits: BTreeMap::new(),
+            remaining: 32,
+            deadline: zpdf_core::time::Instant::now() + std::time::Duration::from_secs(8),
+        };
+        assert_eq!(
+            walk.kid(&mut child, Some(page), true, 0).unwrap(),
+            (false, false)
+        );
+        assert!(walk.edits.is_empty());
+        assert!(walk.active.is_empty());
+        let remaining = walk.remaining;
+        walk.deadline = zpdf_core::time::Instant::now();
+        assert!(
+            walk.kid(&mut child, Some(page), true, 0).is_err(),
+            "a repeated unaffected reference must not bypass the deadline"
+        );
+        assert_eq!(
+            walk.remaining, remaining,
+            "stop before charging or resolving another node"
+        );
+        assert!(walk.active.is_empty());
+        assert!(walk.edits.is_empty());
+        assert_eq!(child, before);
+    }
+
+    #[test]
+    fn annotation_alias_limit_aborts_without_changing_page() {
+        for array_alias in [false, true] {
+            let mut builder = crate::DocumentBuilder::new();
+            builder.add_page(100.0, 100.0);
+            let mut writer = IncrementalWriter::new(builder.build().unwrap()).unwrap();
+            let (number, _) = writer.try_add_object(&PdfObject::Null).unwrap();
+            let alias = PdfObject::Ref(ObjectId(number, 0));
+            writer.overwrite_object(ObjectId(number, 0), alias.clone());
+            let mut annotation = PdfDict::new();
+            annotation.insert(
+                PdfName::new("Rect"),
+                if array_alias {
+                    alias
+                } else {
+                    PdfObject::Array(vec![
+                        alias,
+                        PdfObject::Integer(0),
+                        PdfObject::Integer(10),
+                        PdfObject::Integer(10),
+                    ])
+                },
+            );
+            let page_id = writer.page_id(0).unwrap();
+            let mut page = writer
+                .resolve_current(page_id)
+                .unwrap()
+                .as_dict()
+                .unwrap()
+                .clone();
+            page.insert(
+                PdfName::new("Annots"),
+                PdfObject::Array(vec![PdfObject::Dict(annotation)]),
+            );
+            writer.overwrite_object(page_id, PdfObject::Dict(page));
+            let mut before = Cursor::new(Vec::new());
+            writer.write(&mut before).unwrap();
+            let result = writer.redact_page(
+                0,
+                &[Rect::new(0.0, 0.0, 20.0, 20.0)],
+                &RedactOptions { fill: None },
+            );
+            assert!(
+                matches!(result, Err(zpdf_core::Error::RecursionLimit(32))),
+                "reference work exhaustion must stop redaction"
+            );
+            let mut after = Cursor::new(Vec::new());
+            writer.write(&mut after).unwrap();
+            assert_eq!(before.into_inner(), after.into_inner());
+        }
     }
 
     #[test]

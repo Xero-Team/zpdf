@@ -4461,6 +4461,52 @@ mod tests {
     }
 
     #[test]
+    fn decode_parms_presence_ignores_inactive_dp_globals() {
+        use crate::PdfFile;
+        use zpdf_core::ObjectId;
+
+        let art = ["#..#", ".##."];
+        let mut page = segment(1, 48, &[], 1, &page_info_payload(4, 2, 0));
+        page.extend_from_slice(&segment(
+            2,
+            38,
+            &[],
+            1,
+            &generic_region_payload(&bitmap_from(&art), 0, false),
+        ));
+        let expected = packed_from(&art);
+        for parameters in ["<< >>", "null", "[null]", "1 0 R"] {
+            for ignored in ["<< /JBIG2Globals 4 0 R >>", "5 0 R", "6 0 R"] {
+                let entries =
+                    format!("/Filter /JBIG2Decode /DecodeParms {parameters} /DP {ignored}");
+                let file = PdfFile::parse(pdf_with_jbig2_globals(
+                    &page,
+                    "/Filter /UnsupportedGlobals",
+                    b"ignored",
+                    &entries,
+                ))
+                .unwrap();
+                assert_eq!(
+                    file.resolve_stream_data(ObjectId(3, 0)).unwrap(),
+                    expected,
+                    "DecodeParms {parameters}; DP {ignored}"
+                );
+            }
+        }
+        // Removing DecodeParms makes DP active again; actual decode failures
+        // must still propagate rather than producing a partially decoded page.
+        let file = PdfFile::parse(pdf_with_jbig2_globals(
+            &page,
+            "/Filter /UnsupportedGlobals",
+            b"required",
+            "/Filter /JBIG2Decode /DP << /JBIG2Globals 4 0 R >>",
+        ))
+        .unwrap();
+        assert!(matches!(file.resolve_stream_data(ObjectId(3, 0)),
+            Err(Error::UnsupportedFilter(name)) if name == "UnsupportedGlobals"));
+    }
+
+    #[test]
     fn page_default_pixel_and_packing_polarity() {
         // A page with no regions: default pixel 0 = white = PDF sample 1.
         let stream = segment(0, 48, &[], 1, &page_info_payload(10, 3, 0));

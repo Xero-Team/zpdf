@@ -129,6 +129,46 @@ fn annotations_in_region_are_removed() {
 }
 
 #[test]
+fn retained_image_with_inactive_dp_allows_redaction() {
+    let original = build_pdf(&[
+        "<< /Type /Catalog /Pages 2 0 R >>".into(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R /Resources << /XObject << /Secret 5 0 R /Public 6 0 R >> >> >>".into(),
+        stream("", "/Secret Do q 1 0 0 1 200 200 cm /Public Do Q"),
+        stream("/Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8", "removed-image-bytes"),
+        stream("/Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /DecodeParms << >> /DP 7 0 R", "public-image-bytes"),
+        "(ignored malformed DP)".into(),
+    ]);
+    let output = redact_pdf(
+        original,
+        b"",
+        0,
+        &[Rect::new(-1.0, -1.0, 100.0, 100.0)],
+        &RedactOptions { fill: None },
+    )
+    .unwrap();
+    let document = PdfDocument::open(output).unwrap();
+    let payload = String::from_utf8_lossy(&all_payload_bytes(&document)).into_owned();
+    assert!(!payload.contains("removed-image-bytes"));
+    assert!(payload.contains("public-image-bytes"));
+    assert!(page_content(&document).contains("/Public Do"));
+}
+
+#[test]
+fn inactive_dp_cannot_prove_removed_descendant_is_used() {
+    let original = build_pdf(&[
+        "<< /Type /Catalog /Pages 2 0 R >>".into(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R /Resources << /XObject << /Secret 5 0 R /Public 6 0 R >> >> >>".into(),
+        stream("", "/Secret Do q 1 0 0 1 200 200 cm /Public Do Q"),
+        stream("/Type /XObject /Subtype /Form /BBox [0 0 10 10] /Resources << /XObject << /Inside 7 0 R >> >>", "/Inside Do"),
+        stream("/Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /DecodeParms << >> /DP << /JBIG2Globals 7 0 R >>", "public-image-bytes"),
+        stream("/Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8", "removed-form-payload"),
+    ]);
+    assert_no_removed_resource_after_redaction(original);
+}
+
+#[test]
 fn non_finite_rect_is_rejected() {
     let mut writer = IncrementalWriter::new(two_line_pdf()).expect("writer");
     let result = writer.redact_page(
@@ -194,6 +234,303 @@ fn stream(dict: &str, data: &str) -> String {
     )
 }
 
+const ORIGINAL_CONTENT_SECRET: &str = "original-content-secret";
+const ORIGINAL_CONTENT_TEXT: &str = "BT /F1 12 Tf 20 20 Td (original-content-secret) Tj ET \
+    BT /F1 12 Tf 200 200 Td (public text) Tj ET";
+
+/// Objects 1..5 are the catalog, page tree, page, original content and font.
+fn original_content_alias_pdf(
+    contents: &str,
+    resources: &str,
+    annots: &str,
+    extras: &[String],
+) -> Vec<u8> {
+    let mut objects = vec![
+        "<< /Type /Catalog /Pages 2 0 R >>".into(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(),
+        format!(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] \
+             /Contents {contents} /Resources << /Font << /F1 5 0 R >> {resources} >> \
+             {annots} >>"
+        ),
+        stream("/Subtype /Form /BBox [0 0 300 300]", ORIGINAL_CONTENT_TEXT),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into(),
+    ];
+    objects.extend_from_slice(extras);
+    build_pdf(&objects)
+}
+
+/// Retaining an original content stream must fail atomically. Record the
+/// decoded leak too, so a regression explains the unsafe successful result.
+fn assert_original_content_alias_refused(mut writer: IncrementalWriter) {
+    use zpdf_core::{ObjectId, PdfName, PdfObject, PdfString};
+
+    let mut page = writer
+        .resolve_current(ObjectId(3, 0))
+        .unwrap()
+        .as_dict()
+        .unwrap()
+        .clone();
+    page.insert(
+        PdfName::new("PriorEdit"),
+        PdfObject::String(PdfString(b"keep prior edit".to_vec())),
+    );
+    writer.overwrite_object(ObjectId(3, 0), PdfObject::Dict(page));
+    let mut before = Cursor::new(Vec::new());
+    writer.write(&mut before).unwrap();
+    let result = writer.redact_page(
+        0,
+        &[Rect::new(0.0, 0.0, 190.0, 60.0)],
+        &RedactOptions { fill: None },
+    );
+    let mut after = Cursor::new(Vec::new());
+    writer.write(&mut after).unwrap();
+    if result.is_ok() {
+        let current = PdfDocument::open(after.into_inner()).unwrap();
+        let rewritten = zpdf_writer::rewrite_pdf(current.file(), &Default::default()).unwrap();
+        let rewritten = PdfDocument::open(rewritten).unwrap();
+        let payload = all_payload_bytes(&rewritten);
+        let leaked = payload
+            .windows(ORIGINAL_CONTENT_SECRET.len())
+            .any(|value| value == ORIGINAL_CONTENT_SECRET.as_bytes());
+        panic!(
+            "retained original content must be refused; decoded secret survived rewrite: {leaked}"
+        );
+    }
+    assert_eq!(
+        before.into_inner(),
+        after.into_inner(),
+        "refusal changed pending edits or allocation state"
+    );
+}
+
+#[test]
+fn text_redaction_refuses_original_content_in_unused_resources() {
+    for (resources, extras) in [
+        ("/XObject << /Backup 4 0 R >>", vec![]),
+        (
+            "/XObject << /Wrapper 6 0 R >>",
+            vec![
+                stream(
+                    "/Subtype /Form /BBox [200 200 220 220] /Resources 7 0 R",
+                    "",
+                ),
+                "<< /XObject << /Backup 8 0 R >> /Loop 6 0 R >>".into(),
+                "9 0 R".into(),
+                "4 0 R".into(),
+            ],
+        ),
+    ] {
+        let pdf = original_content_alias_pdf("4 0 R", resources, "", &extras);
+        assert_original_content_alias_refused(IncrementalWriter::new(pdf).unwrap());
+    }
+}
+
+#[test]
+fn text_redaction_refuses_original_content_in_retained_annotations() {
+    for alias in ["/AP << /N 4 0 R >>", "/Backup 4 0 R"] {
+        let pdf = original_content_alias_pdf(
+            "4 0 R",
+            "",
+            "/Annots [6 0 R]",
+            &[format!(
+                "<< /Type /Annot /Subtype /Text /P 3 0 R /Rect [220 220 240 240] {alias} >>"
+            )],
+        );
+        assert_original_content_alias_refused(IncrementalWriter::new(pdf).unwrap());
+    }
+}
+
+#[test]
+fn text_redaction_tracks_all_original_content_streams_and_aliases() {
+    for contents in ["[6 0 R 4 0 R]", "7 0 R", "8 0 R"] {
+        let pdf = original_content_alias_pdf(
+            contents,
+            "/XObject << /Backup 4 0 R >>",
+            "",
+            &[
+                stream("", "BT /F1 12 Tf 200 240 Td (another public line) Tj ET"),
+                "[6 0 R 4 0 R]".into(),
+                "9 0 R".into(),
+                "4 0 R".into(),
+            ],
+        );
+        assert_original_content_alias_refused(IncrementalWriter::new(pdf).unwrap());
+    }
+}
+
+#[test]
+fn text_redaction_refuses_aliases_to_pending_content() {
+    use zpdf_core::{ObjectId, PdfDict, PdfName, PdfObject};
+
+    for resources in [
+        "/XObject << /Backup 7 0 R >>",
+        "/XObject << /Backup 6 0 R >>",
+    ] {
+        // The source alias initially dangles. It starts retaining content only
+        // after the writer allocates the pending stream numbered 7.
+        let pdf = original_content_alias_pdf("4 0 R", resources, "", &["7 0 R".into()]);
+        let mut writer = IncrementalWriter::new(pdf).unwrap();
+        let pending = writer.add_stream(&PdfDict::new(), ORIGINAL_CONTENT_TEXT.as_bytes());
+        assert_eq!(pending, (7, 0));
+        let mut page = writer
+            .resolve_current(ObjectId(3, 0))
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .clone();
+        page.insert(
+            PdfName::new("Contents"),
+            PdfObject::Ref(ObjectId(pending.0, pending.1 as u16)),
+        );
+        writer.overwrite_object(ObjectId(3, 0), PdfObject::Dict(page));
+        assert_original_content_alias_refused(writer);
+    }
+}
+
+#[test]
+fn text_redaction_reads_pending_targets_inside_source_content_aliases() {
+    use zpdf_core::{ObjectId, PdfDict, PdfObject};
+
+    for indirect_array in [false, true] {
+        let pdf = original_content_alias_pdf("6 0 R", "", "", &["7 0 R".into(), "4 0 R".into()]);
+        let mut writer = IncrementalWriter::new(pdf).unwrap();
+        let pending = writer.add_stream(&PdfDict::new(), b"BT /F1 12 Tf 20 20 Td (pending selected) Tj ET BT /F1 12 Tf 200 200 Td (pending public) Tj ET");
+        assert_eq!(pending, (8, 0));
+        let target = PdfObject::Ref(ObjectId(pending.0, pending.1 as u16));
+        writer.overwrite_object(
+            ObjectId(7, 0),
+            if indirect_array {
+                PdfObject::Array(vec![target])
+            } else {
+                target
+            },
+        );
+        writer
+            .redact_page(
+                0,
+                &[Rect::new(0.0, 0.0, 190.0, 60.0)],
+                &RedactOptions { fill: None },
+            )
+            .unwrap();
+        let mut updated = Cursor::new(Vec::new());
+        writer.write(&mut updated).unwrap();
+        let current = PdfDocument::open(updated.into_inner()).unwrap();
+        let output = zpdf_writer::rewrite_pdf(current.file(), &Default::default()).unwrap();
+        let document = PdfDocument::open(output).unwrap();
+        let payload = String::from_utf8_lossy(&all_payload_bytes(&document)).into_owned();
+        assert!(!payload.contains("pending selected"));
+        assert!(!payload.contains(ORIGINAL_CONTENT_SECRET));
+        assert!(page_content(&document).contains("pending public"));
+        assert!(!page_content(&document).contains("public text"));
+    }
+}
+
+#[test]
+fn text_redaction_tracks_pending_contents_through_a_page_alias() {
+    use zpdf_core::{ObjectId, PdfDict, PdfName, PdfObject};
+
+    let pdf = build_pdf(&[
+        "<< /Type /Catalog /Pages 2 0 R >>".into(),
+        "<< /Type /Pages /Kids [6 0 R] /Count 1 >>".into(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> /Annots [7 0 R] >>".into(),
+        stream("", "BT /F1 12 Tf 200 200 Td (source public) Tj ET"),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into(),
+        "3 0 R".into(),
+        "<< /Type /Annot /Subtype /Text /P 3 0 R /Rect [220 220 240 240] /Contents (public annotation) >>".into(),
+    ]);
+    let mut writer = IncrementalWriter::new(pdf).unwrap();
+    let pending = writer.add_stream(&PdfDict::new(), ORIGINAL_CONTENT_TEXT.as_bytes());
+    assert_eq!(pending, (8, 0));
+    let mut page = writer
+        .resolve_current(ObjectId(3, 0))
+        .unwrap()
+        .as_dict()
+        .unwrap()
+        .clone();
+    page.insert(
+        PdfName::new("Contents"),
+        PdfObject::Ref(ObjectId(pending.0, pending.1 as u16)),
+    );
+    writer.overwrite_object(ObjectId(3, 0), PdfObject::Dict(page));
+    assert_original_content_alias_refused(writer);
+}
+
+#[test]
+fn text_redaction_refuses_original_content_shared_with_a_sibling() {
+    let pdf = build_pdf(&[
+        "<< /Type /Catalog /Pages 2 0 R >>".into(),
+        "<< /Type /Pages /Kids [3 0 R 6 0 R] /Count 2 /Resources << /Font << /F1 5 0 R >> >> >>"
+            .into(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R >>".into(),
+        stream("", ORIGINAL_CONTENT_TEXT),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R >>".into(),
+    ]);
+    assert_original_content_alias_refused(IncrementalWriter::new(pdf).unwrap());
+}
+
+#[test]
+fn text_redaction_accepts_removed_aliases_and_retained_page_backrefs() {
+    let pdf = original_content_alias_pdf(
+        "4 0 R", "", "/Annots [6 0 R 7 0 R]",
+        &[
+            "<< /Type /Annot /Subtype /Text /P 3 0 R /Rect [10 10 30 30] /AP << /N 4 0 R >> >>".into(),
+            "<< /Type /Annot /Subtype /Text /P 8 0 R /Rect [220 220 240 240] /Contents (public annotation) >>".into(),
+            "3 0 R".into(),
+        ],
+    );
+    let output = redact_pdf(
+        pdf,
+        b"",
+        0,
+        &[Rect::new(0.0, 0.0, 190.0, 60.0)],
+        &RedactOptions { fill: None },
+    )
+    .unwrap();
+    let document = PdfDocument::open(output).unwrap();
+    let payload = String::from_utf8_lossy(&all_payload_bytes(&document)).into_owned();
+    assert!(!payload.contains(ORIGINAL_CONTENT_SECRET));
+    assert!(payload.contains("public annotation"));
+    assert!(page_content(&document).contains("public text"));
+}
+
+#[test]
+fn text_redaction_accepts_type3_pattern_and_soft_mask_resources() {
+    let pdf = build_pdf(&[
+        "<< /Type /Catalog /Pages 2 0 R >>".into(),
+        "<< /Type /Pages /Kids [3 0 R 12 0 R] /Count 2 /Resources << /Font << /F1 5 0 R /F3 6 0 R >> /Pattern << /P1 8 0 R >> /ExtGState << /GS 9 0 R >> >> >>".into(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R >>".into(),
+        stream("", &format!("{ORIGINAL_CONTENT_TEXT} BT /F3 12 Tf 220 250 Td (A) Tj ET q /GS gs /Pattern cs /P1 scn 220 220 10 10 re f Q")),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into(),
+        "<< /Type /Font /Subtype /Type3 /FontBBox [0 0 10 10] /FontMatrix [1 0 0 1 0 0] /CharProcs << /A 7 0 R >> /Encoding << /Differences [65 /A] >> /FirstChar 65 /LastChar 65 /Widths [10] >>".into(),
+        stream("", "10 0 d0 0 0 5 5 re f"),
+        stream("/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 10 10] /XStep 10 /YStep 10 /Resources << >>", "0 0 5 5 re f"),
+        "<< /Type /ExtGState /SMask << /S /Luminosity /G 10 0 R >> >>".into(),
+        stream("/Subtype /Form /BBox [0 0 10 10] /Group << /S /Transparency /CS /DeviceGray >> /Resources << >>", "1 g 0 0 10 10 re f"),
+        stream("", "BT /F1 12 Tf 200 200 Td (public sibling) Tj ET"),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 11 0 R >>".into(),
+    ]);
+    let output = redact_pdf(
+        pdf,
+        b"",
+        0,
+        &[Rect::new(0.0, 0.0, 190.0, 60.0)],
+        &RedactOptions { fill: None },
+    )
+    .unwrap();
+    let document = PdfDocument::open(output).unwrap();
+    let payload = String::from_utf8_lossy(&all_payload_bytes(&document)).into_owned();
+    assert!(!payload.contains(ORIGINAL_CONTENT_SECRET));
+    assert!(page_content(&document).contains("public text"));
+    assert!(payload.contains("public sibling"));
+    let sibling = document.page(1).unwrap();
+    assert!(
+        String::from_utf8_lossy(&document.page_content_bytes(&sibling).unwrap())
+            .contains("public sibling")
+    );
+}
+
 #[test]
 fn inline_annotations_in_redacted_region_leave_no_reachable_contents() {
     for indirect_array in [false, true] {
@@ -224,6 +561,210 @@ fn inline_annotations_in_redacted_region_leave_no_reachable_contents() {
         let payload = String::from_utf8_lossy(&all_payload_bytes(&document)).into_owned();
         assert!(!payload.contains("INLINE_ANNOT_SECRET"));
         assert!(payload.contains("inline public annotation"));
+    }
+}
+
+fn annotation_rect_reference_pdf(array_ref: bool, element_refs: bool) -> Vec<u8> {
+    let inside = if element_refs {
+        "[11 0 R 12 0 R 13 0 R 14 0 R]"
+    } else {
+        "[10 10 20 20]"
+    };
+    let outside = if element_refs {
+        "[15 0 R 16 0 R 17 0 R 18 0 R]"
+    } else {
+        "[200 200 220 220]"
+    };
+    build_pdf(&[
+        "<< /Type /Catalog /Pages 2 0 R >>".into(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R /Annots [5 0 R 6 0 R 7 0 R 8 0 R] >>".into(),
+        stream("", "10 10 5 5 re f"),
+        format!("<< /Type /Annot /Subtype /Text /Rect {} /Contents (first annotation payload) >>", if array_ref { "9 0 R" } else { inside }),
+        format!("<< /Type /Annot /Subtype /Text /Rect {} /Contents (second annotation payload) >>", if array_ref { "10 0 R" } else { outside }),
+        "<< /Type /Annot /Subtype /Text /Rect [10 10 /Bad 20] /Contents (malformed rectangle retained) >>".into(),
+        "<< /Type /Annot /Subtype /Text /Contents (missing rectangle retained) >>".into(),
+        inside.into(),
+        outside.into(),
+        "10".into(), "10.0".into(), "20".into(), "20.0".into(),
+        "200".into(), "200.0".into(), "220".into(), "220.0".into(),
+    ])
+}
+
+fn check_annotation_rect_references(array_ref: bool, element_refs: bool) {
+    let output = redact_pdf(
+        annotation_rect_reference_pdf(array_ref, element_refs),
+        b"",
+        0,
+        &[Rect::new(0.0, 0.0, 30.0, 30.0)],
+        &RedactOptions { fill: None },
+    )
+    .unwrap();
+    let document = PdfDocument::open(output).unwrap();
+    let payload = String::from_utf8_lossy(&all_payload_bytes(&document)).into_owned();
+    assert!(
+        !payload.contains("first annotation payload"),
+        "overlapping annotation remains: {payload}"
+    );
+    assert!(payload.contains("second annotation payload"));
+    assert!(payload.contains("malformed rectangle retained"));
+    assert!(payload.contains("missing rectangle retained"));
+    assert_eq!(document.page(0).unwrap().annots.len(), 3);
+}
+
+#[test]
+fn annotation_rect_array_reference_is_resolved_before_overlap() {
+    check_annotation_rect_references(true, false);
+}
+
+#[test]
+fn annotation_rect_element_references_are_resolved_before_overlap() {
+    check_annotation_rect_references(false, true);
+}
+
+#[test]
+fn annotation_rect_combined_references_are_resolved_before_overlap() {
+    check_annotation_rect_references(true, true);
+}
+
+#[test]
+fn annotation_rect_references_follow_pending_coordinate_edits() {
+    use zpdf_core::{ObjectId, PdfObject};
+
+    let mut writer = IncrementalWriter::new(annotation_rect_reference_pdf(true, true)).unwrap();
+    // Move the first annotation outside and the second inside using pending
+    // indirect-number replacements; the original reader sees the opposite.
+    for (id, value) in [
+        (11, 200),
+        (12, 200),
+        (13, 220),
+        (14, 220),
+        (15, 10),
+        (16, 10),
+        (17, 20),
+        (18, 20),
+    ] {
+        writer.overwrite_object(ObjectId(id, 0), PdfObject::Integer(value));
+    }
+    writer
+        .redact_page(
+            0,
+            &[Rect::new(0.0, 0.0, 30.0, 30.0)],
+            &RedactOptions { fill: None },
+        )
+        .unwrap();
+    let mut output = Cursor::new(Vec::new());
+    writer.write(&mut output).unwrap();
+    let current = PdfDocument::open(output.into_inner()).unwrap();
+    let rewritten = zpdf_writer::rewrite_pdf(current.file(), &Default::default()).unwrap();
+    let document = PdfDocument::open(rewritten).unwrap();
+    let payload = String::from_utf8_lossy(&all_payload_bytes(&document)).into_owned();
+    assert!(payload.contains("first annotation payload"));
+    assert!(!payload.contains("second annotation payload"));
+    assert!(payload.contains("malformed rectangle retained"));
+    assert!(payload.contains("missing rectangle retained"));
+    assert_eq!(document.page(0).unwrap().annots.len(), 3);
+}
+
+#[test]
+fn annotation_rect_alias_chains_follow_pending_targets() {
+    use zpdf_core::{ObjectId, PdfObject};
+
+    for pending_alias in [false, true] {
+        let pdf = build_pdf(&[
+            "<< /Type /Catalog /Pages 2 0 R >>".into(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R /Annots [5 0 R] >>".into(),
+            stream("", "10 10 5 5 re f"),
+            "<< /Type /Annot /Subtype /Text /Rect 6 0 R /Contents (aliased annotation payload) >>".into(),
+            "7 0 R".into(),
+            "[8 0 R 9 0 R 10 0 R 11 0 R]".into(),
+            "12 0 R".into(), "13 0 R".into(), "14 0 R".into(), "15 0 R".into(),
+            "200".into(), "200".into(), "220".into(), "220".into(),
+        ]);
+        let mut writer = IncrementalWriter::new(pdf).unwrap();
+        for (id, value) in [(12, 10), (13, 10), (14, 20), (15, 20)] {
+            writer.overwrite_object(ObjectId(id, 0), PdfObject::Integer(value));
+        }
+        if pending_alias {
+            writer.overwrite_object(ObjectId(6, 0), PdfObject::Ref(ObjectId(7, 0)));
+            writer.overwrite_object(ObjectId(8, 0), PdfObject::Ref(ObjectId(12, 0)));
+        }
+        writer
+            .redact_page(
+                0,
+                &[Rect::new(0.0, 0.0, 30.0, 30.0)],
+                &RedactOptions { fill: None },
+            )
+            .unwrap();
+        let mut output = Cursor::new(Vec::new());
+        writer.write(&mut output).unwrap();
+        let current = PdfDocument::open(output.into_inner()).unwrap();
+        let rewritten = zpdf_writer::rewrite_pdf(current.file(), &Default::default()).unwrap();
+        let document = PdfDocument::open(rewritten).unwrap();
+        assert!(document.page(0).unwrap().annots.is_empty());
+        assert!(!String::from_utf8_lossy(&all_payload_bytes(&document))
+            .contains("aliased annotation payload"));
+    }
+}
+
+#[test]
+fn annotation_alias_entries_follow_pending_array_and_dictionary_edits() {
+    use zpdf_core::{ObjectId, PdfDict, PdfName, PdfObject, PdfString};
+    for indirect_array in [false, true] {
+        let pdf = build_pdf(&[
+            "<< /Type /Catalog /Pages 2 0 R >>".into(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(),
+            format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R /Annots {} >>", if indirect_array { "6 0 R" } else { "[8 0 R 9 0 R]" }),
+            stream("", "10 10 5 5 re f"),
+            "<< /Type /Annot /Subtype /Text /Rect [200 200 220 220] /Contents (source annotation) >>".into(),
+            "7 0 R".into(), "[8 0 R]".into(), "5 0 R".into(),
+            "<< /Type /Annot /Subtype /Text /Rect [200 200 220 220] /Contents (public annotation) >>".into(),
+        ]);
+        let mut writer = IncrementalWriter::new(pdf).unwrap();
+        let mut annotation = PdfDict::new();
+        annotation.insert(PdfName::new("Type"), PdfObject::Name(PdfName::new("Annot")));
+        annotation.insert(
+            PdfName::new("Subtype"),
+            PdfObject::Name(PdfName::new("Text")),
+        );
+        annotation.insert(
+            PdfName::new("Rect"),
+            PdfObject::Array(
+                [10, 10, 20, 20]
+                    .into_iter()
+                    .map(PdfObject::Integer)
+                    .collect(),
+            ),
+        );
+        annotation.insert(
+            PdfName::new("Contents"),
+            PdfObject::String(PdfString(b"pending annotation secret".to_vec())),
+        );
+        writer.overwrite_object(ObjectId(5, 0), PdfObject::Dict(annotation));
+        writer.overwrite_object(
+            ObjectId(7, 0),
+            PdfObject::Array(vec![
+                PdfObject::Ref(ObjectId(8, 0)),
+                PdfObject::Ref(ObjectId(9, 0)),
+            ]),
+        );
+        writer
+            .redact_page(
+                0,
+                &[Rect::new(0.0, 0.0, 30.0, 30.0)],
+                &RedactOptions { fill: None },
+            )
+            .unwrap();
+        let mut output = Cursor::new(Vec::new());
+        writer.write(&mut output).unwrap();
+        let current = PdfDocument::open(output.into_inner()).unwrap();
+        let rewritten = zpdf_writer::rewrite_pdf(current.file(), &Default::default()).unwrap();
+        let document = PdfDocument::open(rewritten).unwrap();
+        let payload = String::from_utf8_lossy(&all_payload_bytes(&document)).into_owned();
+        assert!(!payload.contains("pending annotation secret"));
+        assert!(payload.contains("public annotation"));
+        assert_eq!(document.page(0).unwrap().annots.len(), 1);
     }
 }
 

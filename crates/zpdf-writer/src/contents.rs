@@ -10,7 +10,7 @@ impl IncrementalWriter {
         let value = match page.get("Contents") {
             None | Some(PdfObject::Null) => return Ok(Vec::new()),
             Some(PdfObject::Ref(id)) => {
-                let object = self.resolve_current(*id)?;
+                let object = self.resolve_current_chain(*id)?;
                 if matches!(object, PdfObject::Stream(_)) {
                     return Ok(vec![*id]);
                 }
@@ -32,7 +32,7 @@ impl IncrementalWriter {
                         invalid_data("page Contents array must contain stream references").into(),
                     );
                 };
-                if !matches!(self.resolve_current(id)?, PdfObject::Stream(_)) {
+                if !matches!(self.resolve_current_chain(id)?, PdfObject::Stream(_)) {
                     return Err(invalid_data("page Contents entry is not a stream").into());
                 }
                 Ok(id)
@@ -76,12 +76,12 @@ impl IncrementalWriter {
         Ok(content)
     }
 
-    // resolve_current returns decrypted bytes for original streams and plain
+    // Chain resolution returns decrypted bytes for original streams and plain
     // bytes for pending ones. In both cases filter metadata must come from the
     // current writer state, including indirect /DP and /JBIG2Globals values.
     fn decode_current_content_stream(&self, id: ObjectId, inline_globals: bool) -> Result<Vec<u8>> {
         let limits = self.document().file().limits();
-        let object = self.resolve_current(id)?;
+        let object = self.resolve_current_chain(id)?;
         let stream = object.as_stream()?;
         if stream.data.len() as u64 > limits.max_stream_bytes {
             return Err(zpdf_core::Error::StreamSizeLimit(limits.max_stream_bytes));
@@ -89,7 +89,12 @@ impl IncrementalWriter {
         let mut dict = stream.dict.clone();
         let mut remaining = 1024;
         let mut globals_budget = limits.max_decoded_stream_bytes;
-        for key in ["Filter", "DecodeParms", "DP"] {
+        let parameters_key = if dict.get("DecodeParms").is_some() {
+            "DecodeParms"
+        } else {
+            "DP"
+        };
+        for key in ["Filter", parameters_key] {
             if let Some(value) = dict.get(key) {
                 let value = self.current_filter_value(
                     value,
@@ -119,7 +124,7 @@ impl IncrementalWriter {
         *remaining -= 1;
         match value {
             PdfObject::Ref(id) => self.current_filter_value(
-                &self.resolve_current(*id)?,
+                &self.resolve_current_unfollowed(*id)?,
                 inline_globals,
                 depth + 1,
                 remaining,
@@ -208,6 +213,37 @@ mod tests {
         );
         dict.insert(PdfName::new("Columns"), PdfObject::Integer(3));
         dict
+    }
+
+    #[test]
+    fn pending_decode_parms_ignores_inactive_dp_globals() {
+        let mut writer = writer(Default::default());
+        let mut globals_dict = PdfDict::new();
+        globals_dict.insert(
+            PdfName::new("Filter"),
+            PdfObject::Name(PdfName::new("UnsupportedGlobals")),
+        );
+        let globals = stream(&mut writer, &globals_dict, b"unused globals");
+        let mut dp = PdfDict::new();
+        dp.insert(PdfName::new("JBIG2Globals"), PdfObject::Ref(globals));
+        let dp = object(&mut writer, PdfObject::Dict(dp));
+        let indirect = object(&mut writer, PdfObject::Dict(PdfDict::new()));
+        for parameters in [
+            PdfObject::Dict(PdfDict::new()),
+            PdfObject::Null,
+            PdfObject::Array(vec![PdfObject::Null]),
+            PdfObject::Ref(indirect),
+        ] {
+            let mut dict = PdfDict::new();
+            dict.insert(
+                PdfName::new("Filter"),
+                PdfObject::Name(PdfName::new("ASCIIHexDecode")),
+            );
+            dict.insert(PdfName::new("DecodeParms"), parameters);
+            dict.insert(PdfName::new("DP"), PdfObject::Ref(dp));
+            let id = stream(&mut writer, &dict, b"712051>");
+            assert_eq!(writer.current_content_bytes(&[id]).unwrap(), b"q Q");
+        }
     }
 
     #[test]
