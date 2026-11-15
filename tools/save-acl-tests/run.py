@@ -169,6 +169,10 @@ def main():
         "RUST_TEST_THREADS": "1",
         "LC_ALL": "C",
     }
+    if sys.platform == "darwin":
+        # Apple's /usr/bin developer-tool shims otherwise write an xcrun cache
+        # in the per-user system temp directory, outside the allowed scratch.
+        env["xcrun_nocache"] = "1"
     if sys.platform.startswith("freebsd"):
         env["ZPDF_ACL_FIXTURES"] = str(args.scratch / "fixtures")
         env["TMPDIR"] = str(args.scratch / "fixtures/disabled/tmp")

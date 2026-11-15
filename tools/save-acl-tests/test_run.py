@@ -14,8 +14,12 @@ import run
 
 
 def child(script, *arguments):
-    environment = {"PATH": "/usr/bin:/bin:/usr/local/bin", "LC_ALL": "C",
+    # Reuse the running interpreter's directory, avoiding Apple's xcrun shim
+    # for each tiny fixture (which would add unrelated cache diagnostics).
+    environment = {"PATH": f"{Path(sys.executable).parent}:/usr/bin:/bin:/usr/local/bin", "LC_ALL": "C",
                    "HOME": os.environ["HOME"], "TMPDIR": tempfile.gettempdir()}
+    if sys.platform == "darwin":
+        environment["xcrun_nocache"] = "1"
     if sys.platform.startswith("freebsd"):
         environment["LD_LIBRARY_PATH"] = "/usr/local/lib"
     options = dict(env=environment,
@@ -54,15 +58,17 @@ class CaptureTests(unittest.TestCase):
         self.assertEqual(run.collect_child(process, output_limit=3, wall_seconds=5), "\ufffdé")
 
     def test_deadline_applies_after_stdout_closes(self):
-        process = child('import os, time; os.close(1); os.close(2); time.sleep(5)')
-        with self.assertRaisesRegex(run.ChildFailure, "exceeded .* seconds"):
-            run.collect_child(process, wall_seconds=0.2)
+        process = child('import os, time; os.write(1, b"ready\\n"); os.close(1); os.close(2); time.sleep(5)')
+        with self.assertRaisesRegex(run.ChildFailure, "exceeded .* seconds") as caught:
+            run.collect_child(process, wall_seconds=1)
+        self.assertEqual(caught.exception.output, b"ready\n")
         self.assertEqual(process.returncode, -signal.SIGKILL)
 
     def test_deadline_applies_while_output_continues(self):
         process = child('import os, time\nfor _ in range(1000):\n os.write(1, b"x" * 64)\n time.sleep(0.005)')
-        with self.assertRaisesRegex(run.ChildFailure, "exceeded .* seconds"):
-            run.collect_child(process, wall_seconds=0.2)
+        with self.assertRaisesRegex(run.ChildFailure, "exceeded .* seconds") as caught:
+            run.collect_child(process, wall_seconds=1)
+        self.assertGreater(len(caught.exception.output), 0)
         self.assertIsNotNone(process.returncode)
 
     def test_monitor_keeps_running_while_output_continues(self):
