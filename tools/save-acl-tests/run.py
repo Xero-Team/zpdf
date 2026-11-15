@@ -136,7 +136,10 @@ def start_task(task, args, env, limits):
         )
     if sys.platform.startswith("freebsd"):
         if task is Task.RUNNER_TESTS:
-            return subprocess.Popen(["/usr/local/bin/python3.11", *arguments], **options)
+            return subprocess.Popen(
+                ["/usr/local/bin/python3.11", "-B", "-m", "unittest", "discover",
+                 "-s", "tools/save-acl-tests", "-p", "test_run.py", "-v"], **options,
+            )
         if task is Task.VERSION:
             return subprocess.Popen(["/usr/local/bin/rustc", *arguments], **options)
         return subprocess.Popen(["/usr/local/bin/cargo", *arguments], **options)
