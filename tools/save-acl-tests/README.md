@@ -25,7 +25,7 @@ with a fresh environment and an unprivileged identity: a macOS Seatbelt sandbox
 or a FreeBSD jail with IPv4/IPv6 disabled. Source and toolchains are read-only to
 the tested process. Writable space is bounded to a 512 MiB APFS image or tmpfs
 plus three 64 MiB UFS volumes. Each child has CPU, process, descriptor and file-size
-limits, a 180-second deadline, and process-group cleanup. The parent drains
+limits, a 180-second deadline, and cleanup of its original process group. The parent drains
 stdout/stderr incrementally, rejects output above 4 MiB per child and retains at
 most 64 KiB of failure diagnostics. Deadlines and RSS checks apply even to a
 child that continuously writes output or closes stdout before exiting.
@@ -44,6 +44,23 @@ system executable paths inside the jail. All invocations use argv lists with
 the shell disabled. The runner's regression tests run inside the same sandbox
 or jail before Rust tests; small finite fixtures cover output boundaries,
 timeouts, process-group cleanup and rejection of unsupported launch inputs.
+
+The workflow and provisioning/launcher scripts themselves are reviewed CI code.
+The per-test sandbox constrains the child build/test tasks; it does not contain
+an adversarial PR that changes those scripts or the workflow itself. The outer
+isolation boundary for this PR workflow is the disposable GitHub-hosted VM.
+This workflow uses read-only repository permissions, no repository secrets and
+no persistent checkout credentials. It is not intended for a self-hosted runner
+or a privileged workflow that executes unreviewed PR code.
+
+Likewise, the 4 GiB Darwin RSS monitor and cleanup cover the original process
+group, not descendants that deliberately create another session/group. They
+are early failure controls, not an inescapable process-tree memory quota. The
+hosted VM's memory allocation and the job timeout (15 minutes on macOS,
+25 minutes for the FreeBSD VM job) provide the outer resource/lifetime bounds.
+FreeBSD additionally bounds its VM to two CPUs/4 GiB and removes the entire jail
+during cleanup. Stronger isolation against malicious changes to CI infrastructure
+requires a separately trusted runner policy, outside this test harness.
 
 These checks establish native save-policy behavior on the listed OS/filesystem
 combinations. They do not validate GUI interaction, network filesystems, every

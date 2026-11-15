@@ -61,7 +61,9 @@ def collect_child(process, *, output_limit=4 * 1024**2, wall_seconds=180, monito
     except (RuntimeError, OSError) as error:
         raise ChildFailure(str(error), bytes(output[:64 * 1024])) from error
     finally:
-        # Also remove descendants after normal completion or a closed pipe.
+        # Remove remaining members of the original group even after success.
+        # This does not cover descendants that deliberately leave that group;
+        # the disposable runner VM/job lifetime remains the outer boundary.
         try:
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
