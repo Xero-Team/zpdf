@@ -275,7 +275,7 @@ impl IncrementalWriter {
         // Even a text-only edit supersedes its old content streams. Unknown
         // resource fields, annotation appearances or another page can retain
         // them independently of any names dropped by the content filter.
-        resource_graph.check_superseded_contents(
+        resource_graph.check_prepared_graph(
             page_id,
             &content_ids,
             &prepared_edits,
@@ -302,8 +302,12 @@ impl IncrementalWriter {
         // unlink it from the form tree.
         // The page edit is already queued, so these clean-ups skip whatever
         // they cannot resolve instead of failing half-way.
+        // Keep the complete alias chain readable until every edge has been
+        // unlinked; nulling its target first would hide later alias owners.
         for id in &removed_annots {
             self.unlink_removed_widget(*id);
+        }
+        for id in &removed_annots {
             self.overwrite_object(*id, PdfObject::Null);
         }
         Ok(())
@@ -334,9 +338,12 @@ impl IncrementalWriter {
             for annotation in annots {
                 check_deadline()?;
                 let resolved;
+                let mut aliases = Vec::new();
                 let object = match &annotation {
                     PdfObject::Ref(id) => {
-                        resolved = self.resolve_current_chain(*id)?;
+                        let (object, ids) = self.resolve_annotation_with_aliases(*id, deadline)?;
+                        resolved = object;
+                        aliases = ids;
                         &resolved
                     }
                     object => object,
@@ -355,9 +362,7 @@ impl IncrementalWriter {
                     }
                 }
                 if remove {
-                    if let PdfObject::Ref(id) = annotation {
-                        removed_annots.insert(id);
-                    }
+                    removed_annots.extend(aliases);
                 } else {
                     kept.push(annotation);
                 }
@@ -367,6 +372,29 @@ impl IncrementalWriter {
         }
 
         Ok(removed_annots)
+    }
+
+    /// Preserve every current alias and the final annotation object so all
+    /// alternate form/structure references are neutralized when it is removed.
+    fn resolve_annotation_with_aliases(
+        &self,
+        mut id: ObjectId,
+        deadline: zpdf_core::time::Instant,
+    ) -> Result<(PdfObject, Vec<ObjectId>)> {
+        // Match resolve_current_chain and PdfFile's reference-chain bound.
+        let limit = 32;
+        let mut aliases = Vec::new();
+        for _ in 0..=limit {
+            check_redaction_deadline(deadline)?;
+            aliases.push(id);
+            let object = self.resolve_current_unfollowed(id)?;
+            check_redaction_deadline(deadline)?;
+            match object {
+                PdfObject::Ref(next) => id = next,
+                object => return Ok((object, aliases)),
+            }
+        }
+        Err(zpdf_core::Error::RecursionLimit(limit))
     }
 
     /// Locate the effective Resources owner without changing the page tree.
@@ -477,14 +505,9 @@ impl IncrementalWriter {
             }
             resources.insert(PdfName::new(category), PdfObject::Dict(entries));
         }
-        if pruned {
-            for value in resources.0.values() {
-                graph.check_retained(value, 0)?;
-            }
-            for id in graph.appearances.clone() {
-                graph.check_retained(&PdfObject::Ref(id), 0)?;
-            }
-        }
+        // Validate the retained graph after all page, ancestor and structure
+        // edits have been prepared. Source-only recursion here would revisit
+        // old resource dictionaries through otherwise harmless backrefs.
         Ok(pruned)
     }
 
@@ -600,7 +623,6 @@ impl IncrementalWriter {
         budget: &mut ResourceScanBudget,
     ) -> Result<ResourceNames> {
         let appearances = self.page_appearance_refs(page, removed_annots, graph.deadline)?;
-        graph.appearances.extend(appearances.iter().copied());
         let context = ResourceContext::new(self, resources, graph)?;
         let mut scan = ResourceUseScan {
             writer: self,
@@ -642,7 +664,7 @@ impl IncrementalWriter {
     /// Remove `node` from its parent field's `/Kids`, or from `/AcroForm
     /// /Fields` when it is a top-level field. Returns the parent field.
     fn unlink_field_node(&mut self, node: ObjectId) -> Option<ObjectId> {
-        let parent = match self.resolve_current(node) {
+        let parent = match self.resolve_current_chain(node) {
             Ok(PdfObject::Dict(d)) => d.get("Parent").cloned(),
             _ => return None,
         };
@@ -759,6 +781,30 @@ struct StructureScrub<'a> {
 }
 
 impl StructureScrub<'_> {
+    /// An OBJR may use a different alias from /Annots or /Fields. Follow its
+    /// current edges to the removed target before deciding to keep replacement
+    /// text on the containing structure element.
+    fn object_was_removed(&mut self, mut id: ObjectId) -> Result<bool> {
+        if self.objects.is_empty() {
+            return Ok(false);
+        }
+        for _ in 0..=32 {
+            check_redaction_deadline(self.deadline)?;
+            self.remaining = self
+                .remaining
+                .checked_sub(1)
+                .ok_or_else(|| invalid_data("structure redaction exceeds traversal limit"))?;
+            if self.objects.contains(&id) {
+                return Ok(true);
+            }
+            match self.writer.resolve_current_unfollowed(id)? {
+                PdfObject::Ref(next) => id = next,
+                _ => return Ok(false),
+            }
+        }
+        Err(zpdf_core::Error::RecursionLimit(32))
+    }
+
     fn page_of(&self, dict: &PdfDict, inherited: Option<ObjectId>) -> Option<ObjectId> {
         dict.get_ref("Pg")
             .ok()
@@ -838,12 +884,13 @@ impl StructureScrub<'_> {
                             false,
                         ))
                     }
-                    "OBJR" => Ok((
-                        dict.get_ref("Obj")
-                            .ok()
-                            .is_some_and(|id| self.objects.contains(&id)),
-                        false,
-                    )),
+                    "OBJR" => {
+                        let hit = match dict.get_ref("Obj") {
+                            Ok(id) => self.object_was_removed(id)?,
+                            Err(_) => false,
+                        };
+                        Ok((hit, false))
+                    }
                     _ => {
                         let (hit, mut changed) = match dict.0.get_mut(&PdfName::new("K")) {
                             Some(kids) => self.kid(kids, pg, true, depth + 1)?,
@@ -1466,13 +1513,12 @@ struct ResourceGraphCheck<'a> {
     writer: &'a IncrementalWriter,
     removed_ids: HashSet<ObjectId>,
     removed_fingerprints: HashSet<[u8; 32]>,
+    removed_shapes: HashSet<(u8, usize, usize)>,
     removed_root_ids: HashSet<ObjectId>,
     removed_root_fingerprints: HashSet<[u8; 32]>,
     used_ids: HashSet<ObjectId>,
     used_entries: HashSet<(ObjectId, ResourceRole)>,
     used_fingerprints: HashSet<[u8; 32]>,
-    appearances: HashSet<ObjectId>,
-    visited: HashSet<ObjectId>,
     nodes_left: u32,
     bytes_left: u64,
     depth_limit: u32,
@@ -1486,13 +1532,12 @@ impl<'a> ResourceGraphCheck<'a> {
             writer,
             removed_ids: HashSet::new(),
             removed_fingerprints: HashSet::new(),
+            removed_shapes: HashSet::new(),
             removed_root_ids: HashSet::new(),
             removed_root_fingerprints: HashSet::new(),
             used_ids: HashSet::new(),
             used_entries: HashSet::new(),
             used_fingerprints: HashSet::new(),
-            appearances: HashSet::new(),
-            visited: HashSet::new(),
             nodes_left: limits.max_objects,
             bytes_left: limits.max_decoded_stream_bytes,
             depth_limit: limits.max_object_depth.min(128),
@@ -1527,16 +1572,20 @@ impl<'a> ResourceGraphCheck<'a> {
     /// Walk the graph the eventual rewrite will retain, applying the prepared
     /// edits and omitting only the edges that this transaction replaces. This
     /// lets ordinary annotation /P and page /Parent backrefs see the edited
-    /// page, while a sibling or arbitrary resource alias to its old Contents
-    /// still causes refusal. Stream payloads are neither decoded nor hashed.
-    fn check_superseded_contents(
+    /// page. Reject surviving old Contents and removed resource payloads,
+    /// including custom references outside resource tables. Only payloads with
+    /// a removed object's shape are hashed; stream data is never decoded.
+    fn check_prepared_graph(
         &mut self,
         page_id: ObjectId,
         content_ids: &[ObjectId],
         prepared: &BTreeMap<ObjectId, PdfObject>,
         removed_annots: &HashSet<ObjectId>,
     ) -> Result<()> {
-        if content_ids.is_empty() {
+        if content_ids.is_empty()
+            && self.removed_fingerprints.is_empty()
+            && self.removed_ids.is_empty()
+        {
             return Ok(());
         }
 
@@ -1594,19 +1643,21 @@ impl<'a> ResourceGraphCheck<'a> {
                 // has no references, so omit the replaced edge from this view.
                 dict.0.remove(&PdfName::new("Contents"));
             }
-            self.collect_surviving_content_refs(&object, 0, &mut visited, &mut pending)?;
+            self.check_surviving_object(&object, Some(id), 0, &mut visited, &mut pending)?;
         }
         Ok(())
     }
 
-    fn collect_surviving_content_refs(
+    fn check_surviving_object(
         &mut self,
         object: &PdfObject,
+        id: Option<ObjectId>,
         depth: u32,
         visited: &mut HashSet<ObjectId>,
         pending: &mut Vec<ObjectId>,
     ) -> Result<()> {
         self.charge_node(depth)?;
+        self.check_surviving_payload(object, id, depth)?;
         let bytes = match object {
             PdfObject::Name(name) => name.as_str().len(),
             PdfObject::String(string) => string.0.len(),
@@ -1621,13 +1672,13 @@ impl<'a> ResourceGraphCheck<'a> {
             }
             PdfObject::Array(values) => {
                 for value in values {
-                    self.collect_surviving_content_refs(value, depth + 1, visited, pending)?;
+                    self.check_surviving_object(value, None, depth + 1, visited, pending)?;
                 }
             }
             PdfObject::Dict(dict) | PdfObject::Stream(zpdf_core::PdfStream { dict, .. }) => {
                 for (key, value) in &dict.0 {
                     self.charge_graph_bytes(key.as_str().len())?;
-                    self.collect_surviving_content_refs(value, depth + 1, visited, pending)?;
+                    self.check_surviving_object(value, None, depth + 1, visited, pending)?;
                 }
             }
             _ => {}
@@ -1656,7 +1707,7 @@ impl<'a> ResourceGraphCheck<'a> {
         self.charge_node(depth)?;
         if let PdfObject::Ref(id) = object {
             if self.used_entries.insert((*id, role)) {
-                let resolved = self.writer.resolve_current(*id)?;
+                let resolved = self.current_unfollowed(*id)?;
                 self.mark_used(&resolved, depth + 1, true, role)?;
                 if !self.has_unconsumed_replacement_text(
                     &resolved,
@@ -1669,7 +1720,7 @@ impl<'a> ResourceGraphCheck<'a> {
             return Ok(());
         }
         self.mark_used_children(object, depth, role)?;
-        if reference_boundary
+        if (reference_boundary || matches!(object, PdfObject::String(_)))
             && Self::has_payload(object)
             && !self.has_unconsumed_replacement_text(
                 object,
@@ -1751,7 +1802,7 @@ impl<'a> ResourceGraphCheck<'a> {
     fn mark_stream_filters(&mut self, dict: &PdfDict, depth: u32) -> Result<()> {
         self.mark_key(dict, "Filter", depth, ResourceRole::Numeric)?;
         // An ignored DP cannot establish a real use of a removed payload.
-        // Its stored references are still inspected by check_retained.
+        // Its stored references are still inspected by the final graph check.
         let parameters_key = if dict.get("DecodeParms").is_some() {
             "DecodeParms"
         } else {
@@ -2123,7 +2174,7 @@ impl<'a> ResourceGraphCheck<'a> {
             }
             if self.removed_ids.insert(*id) || root {
                 self.remember_removed_object(
-                    &self.writer.resolve_current(*id)?,
+                    &self.current_unfollowed(*id)?,
                     depth + 1,
                     true,
                     root,
@@ -2135,6 +2186,8 @@ impl<'a> ResourceGraphCheck<'a> {
         // Do not add every inline scalar/dictionary: common Rect numbers,
         // names and empty Resources are not evidence of shared secret data.
         if reference_boundary && Self::has_payload(object) {
+            self.removed_shapes
+                .insert(Self::payload_shape(object).unwrap());
             let fingerprint = self.fingerprint(object)?;
             self.removed_fingerprints.insert(fingerprint);
             if root {
@@ -2200,54 +2253,50 @@ impl<'a> ResourceGraphCheck<'a> {
         }
     }
 
-    fn check_retained(&mut self, object: &PdfObject, depth: u32) -> Result<()> {
-        self.charge_node(depth)?;
-        if let PdfObject::Ref(id) = object {
-            if self.removed_root_ids.contains(id) {
-                return Err(invalid_data("resource cleanup retains a removed payload").into());
-            }
-            if self.visited.insert(*id) {
-                let resolved = self.writer.resolve_current(*id)?;
-                // Fingerprints recover transparent ref aliases. An identical
-                // ICC/font descendant is not exclusive ownership evidence if
-                // actual retained content independently needs that payload.
-                if Self::has_payload(&resolved) {
-                    let fingerprint = self.fingerprint(&resolved)?;
-                    if self.removed_root_fingerprints.contains(&fingerprint)
-                        || ((self.removed_ids.contains(id)
-                            || self.removed_fingerprints.contains(&fingerprint))
-                            && !self.used_ids.contains(id)
-                            && !self.used_fingerprints.contains(&fingerprint)
-                            && self.has_inline_payload(&resolved, depth + 1)?)
-                    {
-                        return Err(
-                            invalid_data("resource cleanup retains a removed payload").into()
-                        );
-                    }
-                }
-                self.check_retained(&resolved, depth + 1)?;
-            }
+    /// Compare one retained value, never recursively resolve its children here:
+    /// the prepared-graph walk owns that traversal and applies every overlay.
+    /// Inline copies of an owned root or referenced descendant need the same
+    /// check as indirect values, but ordinary inline numbers/names do not.
+    fn check_surviving_payload(
+        &mut self,
+        object: &PdfObject,
+        id: Option<ObjectId>,
+        depth: u32,
+    ) -> Result<()> {
+        if id.is_some_and(|id| self.removed_root_ids.contains(&id)) {
+            return Err(invalid_data("resource cleanup retains a removed payload").into());
+        }
+        let Some(shape) = Self::payload_shape(object) else {
+            return Ok(());
+        };
+        let removed_id = id.is_some_and(|id| self.removed_ids.contains(&id));
+        if !removed_id && !self.removed_shapes.contains(&shape) {
             return Ok(());
         }
-        match object {
-            PdfObject::Array(values) => {
-                for value in values {
-                    self.check_retained(value, depth + 1)?;
-                }
-            }
-            PdfObject::Dict(dict) => {
-                for value in dict.0.values() {
-                    self.check_retained(value, depth + 1)?;
-                }
-            }
-            PdfObject::Stream(stream) => {
-                for value in stream.dict.0.values() {
-                    self.check_retained(value, depth + 1)?;
-                }
-            }
-            _ => {}
+        let fingerprint = self.fingerprint(object)?;
+        if self.removed_root_fingerprints.contains(&fingerprint)
+            || ((removed_id || self.removed_fingerprints.contains(&fingerprint))
+                && !id.is_some_and(|id| self.used_ids.contains(&id))
+                && !self.used_fingerprints.contains(&fingerprint)
+                && self.has_inline_payload(object, depth + 1)?)
+        {
+            return Err(invalid_data("resource cleanup retains a removed payload").into());
         }
         Ok(())
+    }
+
+    /// A cheap discriminator avoids hashing every unrelated stream in a large
+    /// document. Equal canonical fingerprints necessarily have equal shapes.
+    fn payload_shape(object: &PdfObject) -> Option<(u8, usize, usize)> {
+        match object {
+            PdfObject::String(value) if !value.0.is_empty() => Some((0, value.0.len(), 0)),
+            PdfObject::Array(values) if !values.is_empty() => Some((1, values.len(), 0)),
+            PdfObject::Dict(dict) if !dict.0.is_empty() => Some((2, dict.0.len(), 0)),
+            PdfObject::Stream(stream) if !stream.dict.0.is_empty() || !stream.data.is_empty() => {
+                Some((3, stream.dict.0.len(), stream.data.len()))
+            }
+            _ => None,
+        }
     }
 
     fn fingerprint(&mut self, object: &PdfObject) -> Result<[u8; 32]> {

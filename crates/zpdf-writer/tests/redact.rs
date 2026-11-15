@@ -768,6 +768,196 @@ fn annotation_alias_entries_follow_pending_array_and_dictionary_edits() {
     }
 }
 
+fn widget_annotation_alias_pdf(multihop: bool) -> Vec<u8> {
+    let fields = if multihop {
+        "5 0 R 8 0 R 9 0 R 10 0 R 11 0 R"
+    } else {
+        "5 0 R 10 0 R"
+    };
+    let structure = if multihop {
+        "/StructTreeRoot 13 0 R"
+    } else {
+        ""
+    };
+    build_pdf(&[
+        format!("<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [{fields}] >> {structure} >>"),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R /Annots [8 0 R 11 0 R] >>".into(),
+        stream("", "10 10 5 5 re f 200 200 5 5 re f"),
+        "<< /Type /Annot /Subtype /Widget /FT /Tx /T (selected) /V (ALIAS-PRIVATE-VALUE) /Contents (ALIAS-PRIVATE-CONTENTS) /Rect [10 10 20 20] /P 3 0 R /AP << /N 6 0 R >> >>".into(),
+        stream("/Type /XObject /Subtype /Form /BBox [0 0 10 10]", "% ALIAS-PRIVATE-AP\n0 0 10 10 re f"),
+        "5 0 R".into(),
+        if multihop { "9 0 R".into() } else { "5 0 R".into() },
+        "5 0 R".into(),
+        "<< /Type /Annot /Subtype /Widget /FT /Tx /T (retained) /V (ALIAS-PUBLIC-VALUE) /Contents (ALIAS-PUBLIC-CONTENTS) /Rect [200 200 220 220] /P 3 0 R /AP << /N 12 0 R >> >>".into(),
+        "10 0 R".into(),
+        stream("/Type /XObject /Subtype /Form /BBox [0 0 20 20]", "% ALIAS-PUBLIC-AP\n0 0 20 20 re f"),
+        "<< /Type /StructTreeRoot /K [14 0 R 15 0 R 16 0 R 17 0 R 18 0 R] >>".into(),
+        "<< /Type /StructElem /S /Form /Pg 3 0 R /K << /Type /OBJR /Obj 5 0 R >> /ActualText (ALIAS-PRIVATE-STRUCT-TARGET) >>".into(),
+        "<< /Type /StructElem /S /Form /Pg 3 0 R /K << /Type /OBJR /Obj 9 0 R >> /Alt (ALIAS-PRIVATE-STRUCT-MIDDLE) >>".into(),
+        "<< /Type /StructElem /S /Form /Pg 3 0 R /K << /Type /OBJR /Obj 8 0 R >> /E (ALIAS-PRIVATE-STRUCT-ENTRY) >>".into(),
+        "<< /Type /StructElem /S /Form /Pg 3 0 R /K << /Type /OBJR /Obj 11 0 R >> /ActualText (ALIAS-PUBLIC-STRUCT) >>".into(),
+        "<< /Type /StructElem /S /Form /Pg 3 0 R /K << /Type /OBJR /Obj 7 0 R >> /ActualText (ALIAS-PRIVATE-STRUCT-OTHER) >>".into(),
+    ])
+}
+
+fn assert_widget_annotation_alias_cleanup(document: &PdfDocument, multihop: bool) {
+    let payload = String::from_utf8_lossy(&all_payload_bytes(document)).into_owned();
+    for secret in [
+        "ALIAS-PRIVATE-VALUE",
+        "ALIAS-PRIVATE-CONTENTS",
+        "ALIAS-PRIVATE-AP",
+        "ALIAS-PRIVATE-STRUCT-TARGET",
+        "ALIAS-PRIVATE-STRUCT-MIDDLE",
+        "ALIAS-PRIVATE-STRUCT-ENTRY",
+        "ALIAS-PRIVATE-PENDING",
+        "ALIAS-PRIVATE-STRUCT-OTHER",
+    ] {
+        assert!(
+            !payload.contains(secret),
+            "{secret} survived through an annotation alias"
+        );
+    }
+    for public in [
+        "ALIAS-PUBLIC-VALUE",
+        "ALIAS-PUBLIC-CONTENTS",
+        "ALIAS-PUBLIC-AP",
+    ] {
+        assert!(payload.contains(public), "outside annotation lost {public}");
+    }
+    if multihop {
+        assert!(payload.contains("ALIAS-PUBLIC-STRUCT"));
+    }
+    assert_eq!(document.page(0).unwrap().annots.len(), 1);
+    let file = document.file();
+    let catalog = file.resolve(file.trailer.get_ref("Root").unwrap()).unwrap();
+    let fields = catalog
+        .as_dict()
+        .unwrap()
+        .get("AcroForm")
+        .unwrap()
+        .as_dict()
+        .unwrap()
+        .get_array("Fields")
+        .unwrap();
+    assert_eq!(
+        fields.len(),
+        if multihop { 2 } else { 1 },
+        "removed aliases must all be unlinked"
+    );
+    for field in fields {
+        let value = file.resolve(field.as_ref().unwrap()).unwrap();
+        let expected =
+            zpdf_core::PdfObject::String(zpdf_core::PdfString(b"ALIAS-PUBLIC-VALUE".to_vec()));
+        assert_eq!(value.as_dict().unwrap().get("V"), Some(&expected));
+    }
+}
+
+#[test]
+fn annotation_widget_alias_removes_direct_acroform_target() {
+    let output = redact_pdf(
+        widget_annotation_alias_pdf(false),
+        b"",
+        0,
+        &[Rect::new(0.0, 0.0, 30.0, 30.0)],
+        &RedactOptions { fill: None },
+    )
+    .unwrap();
+    let document = PdfDocument::open(output).unwrap();
+    assert_widget_annotation_alias_cleanup(&document, false);
+}
+
+#[test]
+fn annotation_widget_alias_multihop_scrubs_all_field_and_objr_targets() {
+    let output = redact_pdf(
+        widget_annotation_alias_pdf(true),
+        b"",
+        0,
+        &[Rect::new(0.0, 0.0, 30.0, 30.0)],
+        &RedactOptions { fill: None },
+    )
+    .unwrap();
+    let document = PdfDocument::open(output).unwrap();
+    assert_widget_annotation_alias_cleanup(&document, true);
+}
+
+#[test]
+fn annotation_widget_alias_cleanup_follows_pending_middle_and_target() {
+    use zpdf_core::{ObjectId, PdfName, PdfObject, PdfString};
+    let mut writer = IncrementalWriter::new(widget_annotation_alias_pdf(true)).unwrap();
+    // Make the middle edge and target both pending; ordinary resolution of a
+    // pending top-level reference must not hide the target's field ownership.
+    writer.overwrite_object(ObjectId(9, 0), PdfObject::Ref(ObjectId(5, 0)));
+    let mut widget = writer
+        .resolve_current(ObjectId(5, 0))
+        .unwrap()
+        .as_dict()
+        .unwrap()
+        .clone();
+    widget.insert(
+        PdfName::new("V"),
+        PdfObject::String(PdfString(b"ALIAS-PRIVATE-PENDING".to_vec())),
+    );
+    writer.overwrite_object(ObjectId(5, 0), PdfObject::Dict(widget));
+    writer
+        .redact_page(
+            0,
+            &[Rect::new(0.0, 0.0, 30.0, 30.0)],
+            &RedactOptions { fill: None },
+        )
+        .unwrap();
+    let mut output = Cursor::new(Vec::new());
+    writer.write(&mut output).unwrap();
+    let current = PdfDocument::open(output.into_inner()).unwrap();
+    let output = zpdf_writer::rewrite_pdf(current.file(), &Default::default()).unwrap();
+    let document = PdfDocument::open(output).unwrap();
+    assert_widget_annotation_alias_cleanup(&document, true);
+}
+
+#[test]
+fn annotation_widget_alias_budget_failure_preserves_pending_edits() {
+    use zpdf_core::{ObjectId, PdfName, PdfObject};
+    let mut writer = IncrementalWriter::new(widget_annotation_alias_pdf(false)).unwrap();
+    let aliases: Vec<_> = (0..33)
+        .map(|_| {
+            let (number, generation) = writer.try_add_object(&PdfObject::Null).unwrap();
+            ObjectId(number, generation as u16)
+        })
+        .collect();
+    for (index, alias) in aliases.iter().enumerate() {
+        let next = aliases.get(index + 1).copied().unwrap_or(ObjectId(5, 0));
+        writer.overwrite_object(*alias, PdfObject::Ref(next));
+    }
+    let mut page = writer
+        .resolve_current(ObjectId(3, 0))
+        .unwrap()
+        .as_dict()
+        .unwrap()
+        .clone();
+    page.insert(
+        PdfName::new("Annots"),
+        PdfObject::Array(vec![
+            PdfObject::Ref(ObjectId(8, 0)),
+            PdfObject::Ref(aliases[0]),
+        ]),
+    );
+    writer.overwrite_object(ObjectId(3, 0), PdfObject::Dict(page));
+    let mut before = Cursor::new(Vec::new());
+    writer.write(&mut before).unwrap();
+    let result = writer.redact_page(
+        0,
+        &[Rect::new(0.0, 0.0, 30.0, 30.0)],
+        &RedactOptions { fill: None },
+    );
+    assert!(
+        matches!(result, Err(zpdf_core::Error::RecursionLimit(32))),
+        "an over-budget entry chain must fail before committing the earlier removal"
+    );
+    let mut after = Cursor::new(Vec::new());
+    writer.write(&mut after).unwrap();
+    assert_eq!(before.into_inner(), after.into_inner());
+}
+
 #[test]
 fn form_redaction_uses_bbox_and_matrix_instead_of_the_image_unit_square() {
     let pdf = build_pdf(&[
@@ -1695,6 +1885,166 @@ fn removed_and_kept_forms_can_share_indirect_resource_containers() {
         .resources
         .xobjects
         .contains_key("Public"));
+}
+
+fn document_resource_alias_pdf(owner: &str, backup: &str, descendant: bool) -> Vec<u8> {
+    let custom = |where_: &str| {
+        if owner == where_ {
+            format!(" /Backup {backup}")
+        } else {
+            String::new()
+        }
+    };
+    let secret = if descendant {
+        stream("/Type /XObject /Subtype /Form /BBox [0 0 10 10] /Resources << /XObject << /Inside 11 0 R >> >>", "/Inside Do")
+    } else {
+        stream("/Type /XObject /Subtype /Image /Width 20 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8", "removed-form-payload")
+    };
+    let pdf = build_pdf(&[
+        format!("<< /Type /Catalog /Pages 2 0 R{} >>", custom("Catalog")),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(),
+        format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R /Resources << /XObject << /Secret 5 0 R /Public 6 0 R >> /Properties << /Caption 9 0 R >> >>{} >>", custom("Page")),
+        stream("", "q 10 0 0 10 10 10 cm /Secret Do Q /P /Caption BDC 10 10 10 10 re f EMC q 10 0 0 10 200 200 cm /Public Do Q"),
+        secret,
+        stream("/Type /XObject /Subtype /Image /Width 20 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8", "public-image-payload"),
+        "5 0 R".into(),
+        format!("<< /Title (public metadata){} >>", custom("Info")),
+        "<< /ActualText 10 0 R >>".into(),
+        "(removed-property-payload)".into(),
+        stream("/Type /XObject /Subtype /Image /Width 20 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8", "removed-form-payload"),
+    ]);
+    String::from_utf8(pdf)
+        .unwrap()
+        .replace("/Root 1 0 R >>", "/Root 1 0 R /Info 8 0 R >>")
+        .into_bytes()
+}
+
+fn assert_document_resource_alias_refused(mut writer: IncrementalWriter) {
+    let mut before = Cursor::new(Vec::new());
+    writer.write(&mut before).unwrap();
+    let result = writer.redact_page(
+        0,
+        &[Rect::new(-1.0, -1.0, 100.0, 100.0)],
+        &RedactOptions { fill: None },
+    );
+    let mut after = Cursor::new(Vec::new());
+    writer.write(&mut after).unwrap();
+    if result.is_ok() {
+        let current = PdfDocument::open(after.into_inner()).unwrap();
+        let output = zpdf_writer::rewrite_pdf(current.file(), &Default::default()).unwrap();
+        let document = PdfDocument::open(output).unwrap();
+        let payload = String::from_utf8_lossy(&all_payload_bytes(&document)).into_owned();
+        panic!(
+            "removed resource alias survived preflight; decoded leak: {}",
+            payload.contains("removed-form-payload")
+                || payload.contains("removed-property-payload")
+        );
+    }
+    assert_eq!(
+        before.into_inner(),
+        after.into_inner(),
+        "refusal changed pending writer state"
+    );
+}
+
+#[test]
+fn document_resource_aliases_cannot_keep_removed_roots() {
+    for owner in ["Page", "Catalog", "Info"] {
+        for backup in ["5 0 R", "7 0 R"] {
+            let pdf = document_resource_alias_pdf(owner, backup, false);
+            assert_document_resource_alias_refused(IncrementalWriter::new(pdf).unwrap());
+        }
+    }
+}
+
+#[test]
+fn document_resource_aliases_cannot_keep_descendants_or_inline_copies() {
+    for (owner, backup) in [
+        ("Page", "11 0 R"),
+        ("Catalog", "10 0 R"),
+        ("Info", "(removed-property-payload)"),
+        ("Page", "<< /ActualText 10 0 R >>"),
+        ("Catalog", "[<< /Copy (removed-property-payload) >>]"),
+    ] {
+        let pdf = document_resource_alias_pdf(owner, backup, true);
+        assert_document_resource_alias_refused(IncrementalWriter::new(pdf).unwrap());
+    }
+}
+
+#[test]
+fn document_resource_aliases_follow_pending_edges() {
+    use zpdf_core::{ObjectId, PdfObject};
+    let mut writer =
+        IncrementalWriter::new(document_resource_alias_pdf("Page", "7 0 R", false)).unwrap();
+    writer.overwrite_object(ObjectId(7, 0), PdfObject::Ref(ObjectId(10, 0)));
+    assert_document_resource_alias_refused(writer);
+}
+
+#[test]
+fn document_resource_alias_walk_uses_prepared_pages_and_ancestors() {
+    for inherited in [false, true] {
+        let resources = "/Resources << /XObject << /Secret 5 0 R /Public 6 0 R >> >>";
+        let objects = vec![
+            "<< /Type /Catalog /Pages 2 0 R >>".into(),
+            format!("<< /Type /Pages /Kids [3 0 R] /Count 1 {} >>", if inherited { resources } else { "" }),
+            format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R {} >>", if inherited { "" } else { resources }),
+            stream("", "q 10 0 0 10 10 10 cm /Secret Do Q q 10 0 0 10 200 200 cm /Public Do Q"),
+            stream("/Type /XObject /Subtype /Image /Width 20 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8", "removed-form-payload"),
+            stream("/Type /XObject /Subtype /Image /Width 20 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /Owner 3 0 R /Parent 2 0 R", "public-image-payload"),
+        ];
+        let output = redact_pdf(
+            build_pdf(&objects),
+            b"",
+            0,
+            &[Rect::new(-1.0, -1.0, 100.0, 100.0)],
+            &RedactOptions { fill: None },
+        )
+        .unwrap();
+        let document = PdfDocument::open(output).unwrap();
+        let payload = String::from_utf8_lossy(&all_payload_bytes(&document)).into_owned();
+        assert!(!payload.contains("removed-form-payload"));
+        assert!(payload.contains("public-image-payload"));
+        assert!(page_content(&document).contains("/Public Do"));
+    }
+}
+
+#[test]
+fn document_resource_aliases_allow_proven_shared_color_payloads() {
+    use zpdf_core::{ObjectId, PdfName, PdfObject};
+    let objects = vec![
+        "<< /Type /Catalog /Pages 2 0 R /Backup 7 0 R >>".into(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R /Resources << /XObject << /Secret 5 0 R /Public 6 0 R >> >> >>".into(),
+        stream("", "q 10 0 0 10 10 10 cm /Secret Do Q q 10 0 0 10 200 200 cm /Public Do Q"),
+        stream("/Type /XObject /Subtype /Image /Width 20 /Height 1 /ColorSpace [/ICCBased 7 0 R] /BitsPerComponent 8", "removed-form-payload"),
+        stream("/Type /XObject /Subtype /Image /Width 20 /Height 1 /ColorSpace [/ICCBased 7 0 R] /BitsPerComponent 8", "public-image-payload"),
+        stream("/N 1", "shared-color-profile"),
+    ];
+    let mut writer = IncrementalWriter::new(build_pdf(&objects)).unwrap();
+    let mut page = writer
+        .resolve_current(ObjectId(3, 0))
+        .unwrap()
+        .as_dict()
+        .unwrap()
+        .clone();
+    page.insert(PdfName::new("Backup"), PdfObject::Ref(ObjectId(7, 0)));
+    writer.overwrite_object(ObjectId(3, 0), PdfObject::Dict(page));
+    writer
+        .redact_page(
+            0,
+            &[Rect::new(-1.0, -1.0, 100.0, 100.0)],
+            &RedactOptions { fill: None },
+        )
+        .unwrap();
+    let mut updated = Cursor::new(Vec::new());
+    writer.write(&mut updated).unwrap();
+    let current = PdfDocument::open(updated.into_inner()).unwrap();
+    let output = zpdf_writer::rewrite_pdf(current.file(), &Default::default()).unwrap();
+    let document = PdfDocument::open(output).unwrap();
+    let payload = String::from_utf8_lossy(&all_payload_bytes(&document)).into_owned();
+    assert!(!payload.contains("removed-form-payload"));
+    assert!(payload.contains("shared-color-profile"));
+    assert!(payload.contains("public-image-payload"));
 }
 
 /// The unused Wrapper can keep removed roots reachable without executing a
