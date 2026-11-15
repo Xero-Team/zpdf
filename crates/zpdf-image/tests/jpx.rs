@@ -151,10 +151,17 @@ fn garbage_with_jpx_filter_errors_cleanly() {
 
 #[test]
 fn truncated_codestream_errors_cleanly() {
-    // Valid magic, then cut off mid-stream: must error, never panic.
-    for len in [4usize, 12, 40, GRAY_J2K.len() / 2] {
+    // Valid magic, then cut off inside the main header: must error, never panic.
+    for len in [4usize, 12, 40] {
         let res = decode_image_xobject(&GRAY_J2K[..len], &jpx_dict(W as i64, H as i64));
         assert!(res.is_err(), "len {len} should fail");
+    }
+    // Cut off inside the tile data: hayro-jpeg2000 >= 0.5 recovers what it
+    // can, like other PDF viewers. Either outcome is fine as long as it does
+    // not panic and a recovered image keeps the codestream dimensions.
+    let len = GRAY_J2K.len() / 2;
+    if let Ok(img) = decode_image_xobject(&GRAY_J2K[..len], &jpx_dict(W as i64, H as i64)) {
+        assert_eq!((img.width, img.height), (W, H), "len {len}");
     }
 }
 
