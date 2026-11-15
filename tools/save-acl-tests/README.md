@@ -25,13 +25,25 @@ with a fresh environment and an unprivileged identity: a macOS Seatbelt sandbox
 or a FreeBSD jail with IPv4/IPv6 disabled. Source and toolchains are read-only to
 the tested process. Writable space is bounded to a 512 MiB APFS image or tmpfs
 plus three 64 MiB UFS volumes. Each child has CPU, process, descriptor and file-size
-limits, a 180-second deadline, and process-group cleanup. FreeBSD uses a 4 GiB
+limits, a 180-second deadline, and process-group cleanup. The parent drains
+stdout/stderr incrementally, rejects output above 4 MiB per child and retains at
+most 64 KiB of failure diagnostics. Deadlines and RSS checks apply even to a
+child that continuously writes output or closes stdout before exiting.
+FreeBSD uses a 4 GiB
 address-space limit in a two-CPU, 4 GiB VM. Darwin rejects address-space limits:
 the parent monitors aggregate process-group RSS with a 4 GiB kill threshold,
 in addition to the hosted VM's memory bound. Darwin's per-user process limit
 reserves 128 slots above the runner's existing service processes; the parent
 also enforces a 128-process limit on the tested process group. Tests use dummy ACL principals and no
 repository secrets; checkout does not persist credentials.
+
+The launcher accepts only fixed version, runner-regression and Cargo test tasks.
+macOS requires the provisioned Seatbelt profile and an executable Cargo/rustc
+pair in the runner's installed rustup toolchain directory. FreeBSD uses fixed
+system executable paths inside the jail. All invocations use argv lists with
+the shell disabled. The runner's regression tests run inside the same sandbox
+or jail before Rust tests; small finite fixtures cover output boundaries,
+timeouts, process-group cleanup and rejection of unsupported launch inputs.
 
 These checks establish native save-policy behavior on the listed OS/filesystem
 combinations. They do not validate GUI interaction, network filesystems, every
