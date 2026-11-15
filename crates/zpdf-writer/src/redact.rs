@@ -160,24 +160,27 @@ impl IncrementalWriter {
         // reachable after the redaction.
         let removed_annots = self.prune_annotations(&mut page_dict, &rects, deadline)?;
 
+        let mut resource_graph = ResourceGraphCheck::new(self, deadline);
+        let mut resource_budget = ResourceScanBudget::new(self.document().file().limits());
         // Kept content and annotation Forms can still use a name whose
         // top-level draw was removed. Retain those legitimate shared uses.
         if let Some(resources) = resources.as_ref().filter(|_| {
             !outcome.dropped_xobjects.is_empty() || !outcome.dropped_properties.is_empty()
         }) {
-            let (xobjects, properties) = self.inherited_resource_uses(
+            let used = self.inherited_resource_uses(
                 &filtered,
                 resources,
                 &page_dict,
                 &removed_annots,
-                deadline,
+                &mut resource_graph,
+                &mut resource_budget,
             )?;
             outcome
                 .dropped_xobjects
-                .retain(|name| !xobjects.contains(name));
+                .retain(|name| !used.xobjects.contains(name));
             outcome
                 .dropped_properties
-                .retain(|name| !properties.contains(name));
+                .retain(|name| !used.properties.contains(name));
         }
 
         // Optional fill boxes, appended in a fresh graphics state.
@@ -205,33 +208,29 @@ impl IncrementalWriter {
             ));
         }
 
-        // An XObject whose every draw was removed, or a named property list
-        // whose every use was replaced by a scrubbed inline copy, must not stay
-        // reachable through the resources, or a full rewrite would keep the
-        // redacted image/form or replacement text. Give the page its own copy
-        // so other pages sharing the dictionary keep theirs.
+        // Candidate roots must become unreachable unless another surviving
+        // consumer still selects the name. For an inherited table, gather the
+        // sibling union and prune one ancestor instead of copying it N times.
         let mut resource_edits = BTreeMap::new();
         if let Some(res) = resources.as_mut() {
-            if let Some(owner) = inherited_resource_owner {
-                if !outcome.dropped_xobjects.is_empty() || !outcome.dropped_properties.is_empty() {
+            if !outcome.dropped_xobjects.is_empty() || !outcome.dropped_properties.is_empty() {
+                if let Some(owner) = inherited_resource_owner {
                     resource_edits = self.prepare_inherited_resource_cleanup(
-                        page_id,
-                        owner,
+                        (page_id, owner),
                         res,
                         (&outcome.dropped_xobjects, &outcome.dropped_properties),
                         &removed_annots,
-                        deadline,
+                        &mut resource_graph,
+                        &mut resource_budget,
                     )?;
+                } else if self.prune_resource_candidates(
+                    res,
+                    &outcome.dropped_xobjects,
+                    &outcome.dropped_properties,
+                    &mut resource_graph,
+                )? {
+                    page_dict.insert(PdfName::new("Resources"), PdfObject::Dict(res.clone()));
                 }
-            }
-            let pruned = self.prune_resource_candidates(
-                res,
-                &outcome.dropped_xobjects,
-                &outcome.dropped_properties,
-                deadline,
-            )?;
-            if pruned || !resource_edits.is_empty() {
-                page_dict.insert(PdfName::new("Resources"), PdfObject::Dict(res.clone()));
             }
         }
         // The thumbnail is a raster of the unredacted page.
@@ -240,22 +239,17 @@ impl IncrementalWriter {
         let structure_edits =
             self.prepare_structure_scrub(page_id, &outcome.redacted_mcids, &removed_annots)?;
 
-        // Replace the page's contents with a single new stream.
-        let stream_ref = self.try_add_flate_stream(&PdfDict::new(), &filtered)?;
-        page_dict.insert(
-            PdfName::new("Contents"),
-            PdfObject::Ref(ObjectId(stream_ref.0, stream_ref.1 as u16)),
-        );
-
-        self.overwrite_object(page_id, PdfObject::Dict(page_dict));
-        for (id, object) in resource_edits {
-            self.overwrite_object(id, object);
-        }
+        // Resolve and merge every fallible edit before mutating the writer.
+        // Structure nodes may alias a page or resource owner, so merge against
+        // the planned objects rather than restoring their original contents.
+        let mut prepared_edits = resource_edits;
+        prepared_edits.insert(page_id, PdfObject::Dict(page_dict));
         for (id, object) in structure_edits {
-            // An unusual structure dictionary can alias a catalog/page/tree
-            // object. Merge only fields touched by structure cleanup, so it
-            // cannot restore the pre-redaction page or inherited resources.
-            let object = match (object, self.resolve_current(id)?) {
+            let current = match prepared_edits.get(&id) {
+                Some(current) => current.clone(),
+                None => self.resolve_current(id)?,
+            };
+            let object = match (object, current) {
                 (PdfObject::Dict(edited), PdfObject::Dict(mut current)) => {
                     for key in SENSITIVE_KEYS {
                         if edited.get(key).is_none() {
@@ -271,6 +265,20 @@ impl IncrementalWriter {
                 }
                 (object, _) => object,
             };
+            prepared_edits.insert(id, object);
+        }
+        let Some(PdfObject::Dict(page_dict)) = prepared_edits.get_mut(&page_id) else {
+            return Err(invalid_data("structure cleanup replaced the page dictionary").into());
+        };
+
+        // Allocation is the last fallible step; it checks capacity before
+        // changing state. From this point on, commit only prepared objects.
+        let stream_ref = self.try_add_flate_stream(&PdfDict::new(), &filtered)?;
+        page_dict.insert(
+            PdfName::new("Contents"),
+            PdfObject::Ref(ObjectId(stream_ref.0, stream_ref.1 as u16)),
+        );
+        for (id, object) in prepared_edits {
             self.overwrite_object(id, object);
         }
 
@@ -373,68 +381,67 @@ impl IncrementalWriter {
         Err(invalid_data("page resources exceed inheritance depth").into())
     }
 
-    /// Move an affected inherited table onto its consumers before disconnecting
-    /// the ancestor copy. Only removed candidate entries are pruned; all other
-    /// resources, including candidates used by another page, are preserved.
-    fn prepare_inherited_resource_cleanup(
-        &self,
-        page: ObjectId,
-        owner: ObjectId,
-        resources: &PdfDict,
+    /// All consumers of an inherited table share its surviving-name union.
+    /// Preserve the inheritance graph and prepare only the resource owner's
+    /// edit; no page receives a duplicate of the whole shared dictionary.
+    fn prepare_inherited_resource_cleanup<'a>(
+        &'a self,
+        (page, owner): (ObjectId, ObjectId),
+        resources: &mut PdfDict,
         (dropped_xobjects, dropped_properties): (&HashSet<String>, &HashSet<String>),
         removed_annots: &HashSet<ObjectId>,
-        deadline: zpdf_core::time::Instant,
+        graph: &mut ResourceGraphCheck<'a>,
+        budget: &mut ResourceScanBudget,
     ) -> Result<BTreeMap<ObjectId, PdfObject>> {
-        let mut edits = BTreeMap::new();
+        let mut dropped_xobjects = dropped_xobjects.clone();
+        let mut dropped_properties = dropped_properties.clone();
         for index in self.page_indices() {
-            if zpdf_core::time::Instant::now() >= deadline {
-                return Err(invalid_data("resource cleanup exceeds time limit").into());
-            }
+            graph.charge_node(0)?;
             let id = self.page_id(*index)?;
             if id == page || self.current_resource_owner(id)? != Some(owner) {
                 continue;
             }
-            let mut leaf = self.resolve_current(id)?.as_dict()?.clone();
+            let leaf = self.resolve_current(id)?.as_dict()?.clone();
             let content = self.current_content_bytes(&self.current_content_refs(&leaf)?)?;
-            let (used_xobjects, used_properties) =
-                self.inherited_resource_uses(&content, resources, &leaf, removed_annots, deadline)?;
-            let mut own = resources.clone();
-            let dropped_xobjects = dropped_xobjects
-                .difference(&used_xobjects)
-                .cloned()
-                .collect();
-            let dropped_properties = dropped_properties
-                .difference(&used_properties)
-                .cloned()
-                .collect();
-            self.prune_resource_candidates(
-                &mut own,
-                &dropped_xobjects,
-                &dropped_properties,
-                deadline,
+            let used = self.inherited_resource_uses(
+                &content,
+                resources,
+                &leaf,
+                removed_annots,
+                graph,
+                budget,
             )?;
-            leaf.insert(PdfName::new("Resources"), PdfObject::Dict(own));
-            edits.insert(id, PdfObject::Dict(leaf));
+            dropped_xobjects.retain(|name| !used.xobjects.contains(name));
+            dropped_properties.retain(|name| !used.properties.contains(name));
         }
-        let mut ancestor = self.resolve_current(owner)?.as_dict()?.clone();
-        ancestor.0.remove(&PdfName::new("Resources"));
-        edits.insert(owner, PdfObject::Dict(ancestor));
+        let mut edits = BTreeMap::new();
+        if self.prune_resource_candidates(
+            resources,
+            &dropped_xobjects,
+            &dropped_properties,
+            graph,
+        )? {
+            let mut ancestor = self.resolve_current(owner)?.as_dict()?.clone();
+            ancestor.insert(
+                PdfName::new("Resources"),
+                PdfObject::Dict(resources.clone()),
+            );
+            edits.insert(owner, PdfObject::Dict(ancestor));
+        }
         Ok(edits)
     }
 
-    /// Pruning a name is not sufficient if another retained resource points
-    /// back to its payload. Inspect the entire retained resource graph,
-    /// including unused Forms, before allowing any edit to be queued. This
-    /// intentionally refuses ambiguous aliases rather than deleting resources
-    /// whose use could not be proved. A sibling checks only its own removals.
+    /// Unused resource entries remain reachable to a rewrite. Validate them
+    /// and retained annotation appearances against the removed roots and their
+    /// owned descendants, while permitting ancillary objects proved necessary
+    /// by retained content (shared fonts, colorspaces and ICC profiles).
     fn prune_resource_candidates(
         &self,
         resources: &mut PdfDict,
         dropped_xobjects: &HashSet<String>,
         dropped_properties: &HashSet<String>,
-        deadline: zpdf_core::time::Instant,
+        graph: &mut ResourceGraphCheck<'_>,
     ) -> Result<bool> {
-        let mut graph = ResourceGraphCheck::new(self, deadline);
         let mut pruned = false;
         for (category, dropped) in [
             ("XObject", dropped_xobjects),
@@ -465,26 +472,11 @@ impl IncrementalWriter {
             for value in resources.0.values() {
                 graph.check_retained(value, 0)?;
             }
-        }
-        Ok(pruned)
-    }
-
-    /// The renderer falls back per name, even when /Resources exists. Only
-    /// an empty/missing effective table can be scanned wholly in the page
-    /// context; partial overrides require a context-aware dependency walk.
-    fn require_page_resource_context(&self, dict: &PdfDict) -> Result<()> {
-        if let Some(PdfObject::Dict(resources)) = dict
-            .get("Resources")
-            .map(|object| self.deref_current(object))
-        {
-            if !resources.0.is_empty() {
-                return Err(invalid_data(
-                    "resource cleanup cannot prove Form resource ownership with nonempty Resources",
-                )
-                .into());
+            for id in graph.appearances.clone() {
+                graph.check_retained(&PdfObject::Ref(id), 0)?;
             }
         }
-        Ok(())
+        Ok(pruned)
     }
 
     /// Stored appearance roots of annotations that remain in the update.
@@ -586,177 +578,35 @@ impl IncrementalWriter {
         Ok(())
     }
 
-    /// Resource names used directly, or by Forms falling back to this resource
-    /// table. Refuse ambiguous inherited resource dependencies instead of
-    /// deleting unrelated content or silently claiming complete cleanup.
-    fn inherited_resource_uses(
-        &self,
+    /// Scan actual retained operators with the same nested per-name fallback
+    /// as the interpreter. AP streams are independent content roots, including
+    /// inactive states a viewer may select later.
+    fn inherited_resource_uses<'a>(
+        &'a self,
         content: &[u8],
         resources: &PdfDict,
         page: &PdfDict,
         removed_annots: &HashSet<ObjectId>,
-        deadline: zpdf_core::time::Instant,
-    ) -> Result<(HashSet<String>, HashSet<String>)> {
-        let limits = self.document().file().limits();
-        let mut xobjects = HashSet::new();
-        let mut properties = HashSet::new();
-        let mut visited = HashSet::new();
-        let mut pending = vec![content.to_vec()];
-        let mut bytes_left = limits
-            .max_decoded_stream_bytes
-            .checked_sub(content.len() as u64)
-            .ok_or_else(|| invalid_data("resource cleanup exceeds decoded byte limit"))?;
-        let mut ops_left = limits.max_page_operators;
-        let category = |key: &str| resources.get(key).map(|object| self.deref_current(object));
-        let fonts = category("Font");
-        let states = category("ExtGState");
-        let patterns = category("Pattern");
-        let lookup = |category: &str, name: &str| -> Option<PdfObject> {
-            let entries = match category {
-                "Font" => &fonts,
-                "ExtGState" => &states,
-                "Pattern" => &patterns,
-                _ => return None,
-            };
-            entries
-                .as_ref()?
-                .as_dict()
-                .ok()?
-                .get(name)
-                .map(|object| self.deref_current(object))
+        graph: &mut ResourceGraphCheck<'a>,
+        budget: &mut ResourceScanBudget,
+    ) -> Result<ResourceNames> {
+        let appearances = self.page_appearance_refs(page, removed_annots, graph.deadline)?;
+        graph.appearances.extend(appearances.iter().copied());
+        let context = ResourceContext::new(self, resources, graph)?;
+        let mut scan = ResourceUseScan {
+            writer: self,
+            graph,
+            budget,
+            contexts: vec![context],
+            path: Vec::new(),
+            visited: HashSet::new(),
+            names: ResourceNames::default(),
         };
-        // Appearance replay has the same page-resource fallback as a Do.
-        // Include every retained normal/rollover/down appearance state, even
-        // an inactive state that a viewer can select later.
-        for id in self.page_appearance_refs(page, removed_annots, deadline)? {
-            if zpdf_core::time::Instant::now() >= deadline {
-                return Err(invalid_data("resource cleanup exceeds time limit").into());
-            }
-            if visited.insert(id) {
-                let object = self.resolve_current(id)?;
-                self.require_page_resource_context(&object.as_stream()?.dict)?;
-                let bytes = self.current_content_bytes(&[id])?;
-                bytes_left = bytes_left
-                    .checked_sub(bytes.len() as u64)
-                    .ok_or_else(|| invalid_data("resource cleanup exceeds decoded byte limit"))?;
-                pending.push(bytes);
-            }
+        scan.scan_content(content)?;
+        for id in appearances {
+            scan.scan_form(id)?;
         }
-        let xobject_entries = category("XObject");
-        while let Some(content) = pending.pop() {
-            let mut tokenizer = ContentTokenizer::new(&content);
-            let mut operands = Vec::new();
-            while let Some(token) = tokenizer.next_token() {
-                if zpdf_core::time::Instant::now() >= deadline {
-                    return Err(invalid_data("resource cleanup exceeds time limit").into());
-                }
-                match token {
-                    ContentToken::Operand(object) => {
-                        if operands.len() >= limits.max_operand_stack_depth as usize {
-                            return Err(
-                                invalid_data("resource cleanup exceeds operand limit").into()
-                            );
-                        }
-                        operands.push(object);
-                        continue;
-                    }
-                    ContentToken::Operator(op) => {
-                        ops_left = ops_left.checked_sub(1).ok_or_else(|| {
-                            invalid_data("resource cleanup exceeds operator limit")
-                        })?;
-                        match op.as_str() {
-                            "BDC" | "DP" => {
-                                if let Some(PdfObject::Name(name)) = operands.get(1) {
-                                    properties.insert(name.as_str().to_string());
-                                }
-                            }
-                            "Do" => {
-                                if let Some(PdfObject::Name(name)) = operands.first() {
-                                    xobjects.insert(name.as_str().to_string());
-                                    let value = xobject_entries
-                                        .as_ref()
-                                        .and_then(|object| object.as_dict().ok())
-                                        .and_then(|dict| dict.get(name.as_str()));
-                                    if let Some(PdfObject::Ref(id)) = value {
-                                        if visited.insert(*id) {
-                                            let object = self.resolve_current(*id)?;
-                                            let stream = object.as_stream()?;
-                                            if stream.dict.get_name("Subtype").ok() == Some("Form")
-                                            {
-                                                self.require_page_resource_context(&stream.dict)?;
-                                                let bytes = self.current_content_bytes(&[*id])?;
-                                                bytes_left = bytes_left.checked_sub(bytes.len() as u64)
-                                                    .ok_or_else(|| invalid_data("resource cleanup exceeds decoded byte limit"))?;
-                                                pending.push(bytes);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            "Tf" => {
-                                if let Some(PdfObject::Name(name)) = operands.first() {
-                                    if let Some(PdfObject::Dict(font)) =
-                                        lookup("Font", name.as_str())
-                                    {
-                                        if font.get_name("Subtype").ok() == Some("Type3") {
-                                            return Err(invalid_data("resource cleanup cannot prove Type3 resource ownership").into());
-                                        }
-                                    }
-                                }
-                            }
-                            "gs" => {
-                                if let Some(PdfObject::Name(name)) = operands.first() {
-                                    if let Some(PdfObject::Dict(state)) =
-                                        lookup("ExtGState", name.as_str())
-                                    {
-                                        // ExtGState can select a font without a Tf
-                                        // operator, including inside an appearance.
-                                        if let Some(PdfObject::Array(font)) =
-                                            state.get("Font").map(|value| self.deref_current(value))
-                                        {
-                                            if let Some(PdfObject::Dict(font)) =
-                                                font.first().map(|value| self.deref_current(value))
-                                            {
-                                                if font.get_name("Subtype").ok() == Some("Type3") {
-                                                    return Err(invalid_data("resource cleanup cannot prove Type3 resource ownership").into());
-                                                }
-                                            }
-                                        }
-                                        if let Some(mask) = state.get("SMask") {
-                                            if !matches!(mask, PdfObject::Name(name) if name.as_str() == "None")
-                                            {
-                                                return Err(invalid_data("resource cleanup cannot prove soft-mask resource ownership").into());
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            "scn" | "SCN" => {
-                                if let Some(PdfObject::Name(name)) = operands.last() {
-                                    if let Some(object) = lookup("Pattern", name.as_str()) {
-                                        if matches!(object, PdfObject::Stream(_)) {
-                                            return Err(invalid_data("resource cleanup cannot prove pattern resource ownership").into());
-                                        }
-                                    }
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                    ContentToken::InlineImage { .. } => {
-                        ops_left = ops_left.checked_sub(1).ok_or_else(|| {
-                            invalid_data("resource cleanup exceeds operator limit")
-                        })?;
-                    }
-                }
-                operands.clear();
-            }
-            let diagnostics = tokenizer.diagnostics();
-            if !diagnostics.is_complete() {
-                return Err(zpdf_core::Error::IncompleteOutput(diagnostics));
-            }
-        }
-        Ok((xobjects, properties))
+        Ok(scan.names)
     }
 
     /// Drop a removed widget annotation from the form tree. A parent field
@@ -1127,15 +977,440 @@ struct FilterOutcome {
     dropped_properties: HashSet<String>,
 }
 
+/// The names selected from the page table, excluding names shadowed by a Form.
+#[derive(Default)]
+struct ResourceNames {
+    xobjects: HashSet<String>,
+    properties: HashSet<String>,
+}
+
+/// One allowance across the target, sibling pages and their Form/AP content.
+struct ResourceScanBudget {
+    bytes_left: u64,
+    ops_left: u64,
+}
+
+impl ResourceScanBudget {
+    fn new(limits: &ParseLimits) -> Self {
+        Self {
+            bytes_left: limits.max_decoded_stream_bytes,
+            ops_left: limits.max_page_operators,
+        }
+    }
+}
+
+/// Semantic roles restrict shared-payload exemptions to actual dependencies.
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+enum ResourceRole {
+    XObject,
+    Content,
+    Image,
+    ImageMask,
+    Font,
+    FontList,
+    FontDescriptor,
+    Encoding,
+    CidInfo,
+    ColorSpace,
+    Icc,
+    Data,
+    StreamData,
+    NamedData,
+    Text,
+    CMap,
+    Properties,
+    ExtGState,
+    FontSelection,
+    Pattern,
+    Shading,
+    Function,
+    DecodeParms,
+    Numeric,
+}
+
+/// Resolve each category once per context. Entries retain their original
+/// references, so dependency marking does not lose the identity of aliases.
+struct ResourceContext {
+    categories: BTreeMap<&'static str, PdfDict>,
+}
+
+impl ResourceContext {
+    fn new(
+        writer: &IncrementalWriter,
+        resources: &PdfDict,
+        graph: &mut ResourceGraphCheck<'_>,
+    ) -> Result<Self> {
+        let mut categories = BTreeMap::new();
+        // parse_resource_dict consumes this shared cap in this order. Refuse
+        // truncation rather than proving a use the renderer would never see.
+        let mut accepted = 0usize;
+        for key in [
+            "Font",
+            "XObject",
+            "ExtGState",
+            "ColorSpace",
+            "Pattern",
+            "Shading",
+            "Properties",
+        ] {
+            graph.charge_node(0)?;
+            if let Some(value) = resources.get(key) {
+                let object = match value {
+                    PdfObject::Ref(id) => writer.resolve_current(*id)?,
+                    value => value.clone(),
+                };
+                if let PdfObject::Dict(entries) = object {
+                    for value in entries.0.values() {
+                        graph.charge_node(0)?;
+                        if Self::supported(key, value) {
+                            accepted += 1;
+                            if accepted > 65_536 {
+                                return Err(invalid_data(
+                                    "resource cleanup exceeds resource entry limit",
+                                )
+                                .into());
+                            }
+                        }
+                    }
+                    categories.insert(key, entries);
+                }
+            }
+        }
+        Ok(Self { categories })
+    }
+
+    fn lookup(&self, category: &str, name: &str) -> Option<&PdfObject> {
+        let value = self.categories.get(category)?.get(name)?;
+        // Match parse_resource_dict: malformed local entries do not shadow a
+        // valid enclosing/page entry that the interpreter can actually use.
+        Self::supported(category, value).then_some(value)
+    }
+
+    fn supported(category: &str, value: &PdfObject) -> bool {
+        match category {
+            "XObject" | "Font" | "Pattern" => matches!(value, PdfObject::Ref(_)),
+            "Properties" | "ExtGState" | "Shading" => {
+                matches!(value, PdfObject::Ref(_) | PdfObject::Dict(_))
+            }
+            "ColorSpace" => matches!(
+                value,
+                PdfObject::Ref(_) | PdfObject::Array(_) | PdfObject::Name(_)
+            ),
+            _ => false,
+        }
+    }
+}
+
+/// The interpreter resolves names from innermost Form to outer Forms and
+/// finally the page. Visit a reused Form separately for each enclosing path;
+/// an object-ID-only cache would miss dependencies under a different shadow.
+struct ResourceUseScan<'a, 'b> {
+    writer: &'a IncrementalWriter,
+    graph: &'b mut ResourceGraphCheck<'a>,
+    budget: &'b mut ResourceScanBudget,
+    contexts: Vec<ResourceContext>,
+    path: Vec<ObjectId>,
+    visited: HashSet<(ObjectId, Vec<ObjectId>)>,
+    names: ResourceNames,
+}
+
+impl<'a, 'b> ResourceUseScan<'a, 'b> {
+    fn lookup(&self, category: &str, name: &str) -> Option<(PdfObject, bool)> {
+        // The interpreter first searches inline values across the whole stack,
+        // then indirect values, for these four split ResourceDict maps.
+        if matches!(
+            category,
+            "Properties" | "ExtGState" | "ColorSpace" | "Shading"
+        ) {
+            for indirect in [false, true] {
+                for (index, context) in self.contexts.iter().enumerate().rev() {
+                    if let Some(value) = context.lookup(category, name) {
+                        if matches!(value, PdfObject::Ref(_)) == indirect {
+                            return Some((value.clone(), index == 0));
+                        }
+                    }
+                }
+            }
+            None
+        } else {
+            self.contexts
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(index, context)| {
+                    context
+                        .lookup(category, name)
+                        .map(|value| (value.clone(), index == 0))
+                })
+        }
+    }
+
+    fn use_named(&mut self, category: &str, name: &str) -> Result<Option<PdfObject>> {
+        let Some((value, page)) = self.lookup(category, name) else {
+            return Ok(None);
+        };
+        if page {
+            match category {
+                "XObject" => {
+                    self.names.xobjects.insert(name.to_string());
+                }
+                "Properties" => {
+                    self.names.properties.insert(name.to_string());
+                }
+                _ => {}
+            }
+        }
+        let role = match category {
+            "XObject" => ResourceRole::XObject,
+            "Font" => ResourceRole::Font,
+            "Properties" => ResourceRole::Properties,
+            "ExtGState" => ResourceRole::ExtGState,
+            "Pattern" => ResourceRole::Pattern,
+            "ColorSpace" => ResourceRole::ColorSpace,
+            "Shading" => ResourceRole::Shading,
+            _ => return Err(invalid_data("unknown resource category").into()),
+        };
+        self.graph.mark_used(&value, 0, true, role)?;
+        Ok(Some(value))
+    }
+
+    fn resolve(&self, value: &PdfObject) -> Result<PdfObject> {
+        match value {
+            PdfObject::Ref(id) => self.writer.resolve_current(*id),
+            value => Ok(value.clone()),
+        }
+    }
+
+    fn check_font(&self, value: &PdfObject) -> Result<()> {
+        if let PdfObject::Dict(font) = self.resolve(value)? {
+            if font.get_name("Subtype").ok() == Some("Type3") {
+                return Err(
+                    invalid_data("resource cleanup cannot prove Type3 resource ownership").into(),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn use_color_space(&mut self, value: &PdfObject) -> Result<()> {
+        self.use_color_space_depth(value, 0)
+    }
+
+    fn use_color_space_depth(&mut self, value: &PdfObject, depth: u32) -> Result<()> {
+        self.graph.charge_node(depth)?;
+        if depth > 4 {
+            return Err(invalid_data("resource cleanup exceeds colorspace depth limit").into());
+        }
+        match self.resolve(value)? {
+            PdfObject::Name(name) => {
+                if !matches!(
+                    name.as_str(),
+                    "DeviceGray" | "G" | "DeviceRGB" | "RGB" | "DeviceCMYK" | "CMYK" | "Pattern"
+                ) {
+                    if let Some(value) = self.use_named("ColorSpace", name.as_str())? {
+                        self.use_color_space_depth(&value, depth + 1)?;
+                    }
+                }
+            }
+            PdfObject::Array(values) => {
+                match values.first().and_then(|value| value.as_name().ok()) {
+                    Some("Indexed" | "I" | "Pattern") => {
+                        if let Some(base) = values.get(1) {
+                            self.use_color_space_depth(base, depth + 1)?;
+                        }
+                    }
+                    Some("Separation" | "DeviceN") => {
+                        if let Some(base) = values.get(2) {
+                            self.use_color_space_depth(base, depth + 1)?;
+                        }
+                    }
+                    Some("ICCBased") => {
+                        if let Some(profile) = values.get(1) {
+                            if let PdfObject::Stream(profile) = self.resolve(profile)? {
+                                if let Some(alternate) = profile.dict.get("Alternate") {
+                                    self.use_color_space_depth(alternate, depth + 1)?;
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn scan_form(&mut self, id: ObjectId) -> Result<()> {
+        self.graph.charge_node(self.path.len() as u32)?;
+        if self.path.len()
+            >= self
+                .writer
+                .document()
+                .file()
+                .limits()
+                .max_object_depth
+                .min(32) as usize
+        {
+            return Err(invalid_data("resource cleanup exceeds Form depth limit").into());
+        }
+        let key = (id, self.path.clone());
+        if !self.visited.insert(key) {
+            return Ok(());
+        }
+        self.graph
+            .mark_used(&PdfObject::Ref(id), 0, true, ResourceRole::Content)?;
+        let object = self.writer.resolve_current(id)?;
+        let stream = object.as_stream()?;
+        let own = match stream.dict.get("Resources") {
+            Some(value) => match self.resolve(value)? {
+                PdfObject::Dict(resources) => {
+                    Some(ResourceContext::new(self.writer, &resources, self.graph)?)
+                }
+                _ => None,
+            },
+            None => None,
+        };
+        let pushed = own.is_some();
+        if let Some(own) = own {
+            self.contexts.push(own);
+        }
+        self.path.push(id);
+        let content = self.writer.current_content_bytes(&[id])?;
+        self.scan_content(&content)?;
+        self.path.pop();
+        if pushed {
+            self.contexts.pop();
+        }
+        Ok(())
+    }
+
+    fn scan_content(&mut self, content: &[u8]) -> Result<()> {
+        let limits = self.writer.document().file().limits();
+        self.budget.bytes_left = self
+            .budget
+            .bytes_left
+            .checked_sub(content.len() as u64)
+            .ok_or_else(|| invalid_data("resource cleanup exceeds decoded byte limit"))?;
+        let mut tokenizer = ContentTokenizer::new(content);
+        let mut operands = Vec::new();
+        while let Some(token) = tokenizer.next_token() {
+            self.graph.charge_node(0)?;
+            if let ContentToken::Operand(object) = token {
+                if operands.len() >= limits.max_operand_stack_depth as usize {
+                    return Err(invalid_data("resource cleanup exceeds operand limit").into());
+                }
+                operands.push(object);
+                continue;
+            }
+            self.budget.ops_left = self
+                .budget
+                .ops_left
+                .checked_sub(1)
+                .ok_or_else(|| invalid_data("resource cleanup exceeds operator limit"))?;
+            match token {
+                ContentToken::Operator(op) => {
+                    match op.as_str() {
+                        "BDC" | "DP" => {
+                            if let Some(PdfObject::Name(name)) = operands.get(1) {
+                                self.use_named("Properties", name.as_str())?;
+                            }
+                        }
+                        "Do" => {
+                            if let Some(PdfObject::Name(name)) = operands.first() {
+                                if let Some(value) = self.use_named("XObject", name.as_str())? {
+                                    let object = self.resolve(&value)?;
+                                    let stream = object.as_stream()?;
+                                    if stream.dict.get_name("Subtype").ok() == Some("Form") {
+                                        self.scan_form(value.as_ref()?)?;
+                                    } else if let Some(color) = stream.dict.get("ColorSpace") {
+                                        self.use_color_space(color)?;
+                                    }
+                                }
+                            }
+                        }
+                        "Tf" => {
+                            if let Some(PdfObject::Name(name)) = operands.first() {
+                                if let Some(value) = self.use_named("Font", name.as_str())? {
+                                    self.check_font(&value)?;
+                                }
+                            }
+                        }
+                        "gs" => {
+                            if let Some(PdfObject::Name(name)) = operands.first() {
+                                if let Some(value) = self.use_named("ExtGState", name.as_str())? {
+                                    if let PdfObject::Dict(state) = self.resolve(&value)? {
+                                        if let Some(value) = state.get("Font") {
+                                            if let PdfObject::Array(font) = self.resolve(value)? {
+                                                if let Some(font) = font.first() {
+                                                    self.check_font(font)?;
+                                                }
+                                            }
+                                        }
+                                        if let Some(mask) = state.get("SMask") {
+                                            if !matches!(mask, PdfObject::Name(name) if name.as_str() == "None")
+                                            {
+                                                return Err(invalid_data("resource cleanup cannot prove soft-mask resource ownership").into());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        "scn" | "SCN" => {
+                            if let Some(PdfObject::Name(name)) = operands.last() {
+                                if let Some(value) = self.use_named("Pattern", name.as_str())? {
+                                    if matches!(self.resolve(&value)?, PdfObject::Stream(_)) {
+                                        return Err(invalid_data("resource cleanup cannot prove pattern resource ownership").into());
+                                    }
+                                }
+                            }
+                        }
+                        "cs" | "CS" => {
+                            if let Some(value) = operands.first() {
+                                self.use_color_space(value)?;
+                            }
+                        }
+                        "sh" => {
+                            if let Some(PdfObject::Name(name)) = operands.first() {
+                                self.use_named("Shading", name.as_str())?;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                ContentToken::InlineImage { dict, .. } => {
+                    if let Some(value) = dict.get("CS").or_else(|| dict.get("ColorSpace")) {
+                        self.use_color_space(value)?;
+                    }
+                }
+                ContentToken::Operand(_) => unreachable!(),
+            }
+            operands.clear();
+        }
+        let diagnostics = tokenizer.diagnostics();
+        if !diagnostics.is_complete() {
+            return Err(zpdf_core::Error::IncompleteOutput(diagnostics));
+        }
+        Ok(())
+    }
+}
+
 /// Source-object graph validation only: stream bytes are hashed as stored,
 /// never decoded. The canonical fingerprints also catch ref-to-ref aliases,
-/// which the parser resolves transparently. Removed roots and their referenced
-/// descendants are tracked; an identical retained object at a reference
-/// boundary is conservatively treated as ambiguous ownership under another ID.
+/// which the parser resolves transparently. Removed roots remain forbidden;
+/// shared descendants are allowed only after retained operators prove their
+/// use. Merely storing an unused Form resource never establishes such use.
 struct ResourceGraphCheck<'a> {
     writer: &'a IncrementalWriter,
     removed_ids: HashSet<ObjectId>,
     removed_fingerprints: HashSet<[u8; 32]>,
+    removed_root_ids: HashSet<ObjectId>,
+    removed_root_fingerprints: HashSet<[u8; 32]>,
+    used_ids: HashSet<ObjectId>,
+    used_entries: HashSet<(ObjectId, ResourceRole)>,
+    used_fingerprints: HashSet<[u8; 32]>,
+    appearances: HashSet<ObjectId>,
     visited: HashSet<ObjectId>,
     nodes_left: u32,
     bytes_left: u64,
@@ -1150,6 +1425,12 @@ impl<'a> ResourceGraphCheck<'a> {
             writer,
             removed_ids: HashSet::new(),
             removed_fingerprints: HashSet::new(),
+            removed_root_ids: HashSet::new(),
+            removed_root_fingerprints: HashSet::new(),
+            used_ids: HashSet::new(),
+            used_entries: HashSet::new(),
+            used_fingerprints: HashSet::new(),
+            appearances: HashSet::new(),
             visited: HashSet::new(),
             nodes_left: limits.max_objects,
             bytes_left: limits.max_decoded_stream_bytes,
@@ -1172,8 +1453,468 @@ impl<'a> ResourceGraphCheck<'a> {
         Ok(())
     }
 
+    /// Only interpreter-recognized dependency edges can establish a shared
+    /// descendant's use. Unknown fields remain reachable, but cannot bless an
+    /// otherwise removed image/string merely by pointing to it.
+    fn mark_used(
+        &mut self,
+        object: &PdfObject,
+        depth: u32,
+        reference_boundary: bool,
+        role: ResourceRole,
+    ) -> Result<()> {
+        self.charge_node(depth)?;
+        if let PdfObject::Ref(id) = object {
+            if self.used_entries.insert((*id, role)) {
+                let resolved = self.writer.resolve_current(*id)?;
+                self.mark_used(&resolved, depth + 1, true, role)?;
+                if !self.has_unconsumed_replacement_text(
+                    &resolved,
+                    role == ResourceRole::Properties,
+                    depth + 1,
+                )? {
+                    self.used_ids.insert(*id);
+                }
+            }
+            return Ok(());
+        }
+        self.mark_used_children(object, depth, role)?;
+        if reference_boundary
+            && Self::has_payload(object)
+            && !self.has_unconsumed_replacement_text(
+                object,
+                role == ResourceRole::Properties,
+                depth,
+            )?
+        {
+            let fingerprint = self.fingerprint(object)?;
+            self.used_fingerprints.insert(fingerprint);
+        }
+        Ok(())
+    }
+
+    /// Selecting an ExtGState/font/etc. does not consume replacement text
+    /// attached to it. Do not exempt that whole owned payload merely because
+    /// another field is used. A subsequent Properties use may still prove the
+    /// text necessary, independent of visitation order. Inline nested fields
+    /// need this check too; referenced children have their own boundaries.
+    fn has_unconsumed_replacement_text(
+        &mut self,
+        object: &PdfObject,
+        consumes_properties: bool,
+        depth: u32,
+    ) -> Result<bool> {
+        self.charge_node(depth)?;
+        let dict = match object {
+            PdfObject::Dict(dict) => Some(dict),
+            PdfObject::Stream(stream) => Some(&stream.dict),
+            PdfObject::Array(values) => {
+                for value in values {
+                    if self.has_unconsumed_replacement_text(value, false, depth + 1)? {
+                        return Ok(true);
+                    }
+                }
+                None
+            }
+            _ => None,
+        };
+        if let Some(dict) = dict {
+            for (key, value) in &dict.0 {
+                if SENSITIVE_KEYS.contains(&key.as_str()) {
+                    if !consumes_properties && !matches!(value, PdfObject::Null) {
+                        return Ok(true);
+                    }
+                } else if self.has_unconsumed_replacement_text(value, false, depth + 1)? {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    fn mark_key(
+        &mut self,
+        dict: &PdfDict,
+        key: &str,
+        depth: u32,
+        role: ResourceRole,
+    ) -> Result<()> {
+        if let Some(value) = dict.get(key) {
+            self.mark_used(value, depth + 1, false, role)?;
+        }
+        Ok(())
+    }
+
+    fn mark_keys(
+        &mut self,
+        dict: &PdfDict,
+        keys: &[&str],
+        depth: u32,
+        role: ResourceRole,
+    ) -> Result<()> {
+        for key in keys {
+            self.mark_key(dict, key, depth, role)?;
+        }
+        Ok(())
+    }
+
+    fn mark_stream_filters(&mut self, dict: &PdfDict, depth: u32) -> Result<()> {
+        self.mark_key(dict, "Filter", depth, ResourceRole::Numeric)?;
+        self.mark_keys(
+            dict,
+            &["DecodeParms", "DP"],
+            depth,
+            ResourceRole::DecodeParms,
+        )
+    }
+
+    fn mark_used_children(
+        &mut self,
+        object: &PdfObject,
+        depth: u32,
+        role: ResourceRole,
+    ) -> Result<()> {
+        use ResourceRole::*;
+        match (role, object) {
+            (_, PdfObject::Null) => Ok(()),
+            (XObject, PdfObject::Stream(stream)) => match stream.dict.get_name("Subtype").ok() {
+                Some("Image") => self.mark_used_children(object, depth, Image),
+                Some("Form") => self.mark_used_children(object, depth, Content),
+                _ => Err(invalid_data("resource cleanup cannot classify XObject").into()),
+            },
+            (Content, PdfObject::Stream(stream)) => {
+                // Resources are selected by scan_form, never recursively
+                // marked. Unknown metadata fields are not rendering edges.
+                self.mark_keys(&stream.dict, &["BBox", "Matrix"], depth, Numeric)?;
+                self.mark_stream_filters(&stream.dict, depth)
+            }
+            (Image, PdfObject::Stream(stream)) => {
+                if stream.dict.get_name("Subtype").ok() != Some("Image") {
+                    return Err(
+                        invalid_data("resource cleanup cannot classify image dependency").into(),
+                    );
+                }
+                self.mark_key(&stream.dict, "ColorSpace", depth, ColorSpace)?;
+                self.mark_keys(&stream.dict, &["Mask", "SMask"], depth, ImageMask)?;
+                self.mark_keys(
+                    &stream.dict,
+                    &[
+                        "Width",
+                        "Height",
+                        "BitsPerComponent",
+                        "Decode",
+                        "ImageMask",
+                        "Interpolate",
+                        "SMaskInData",
+                    ],
+                    depth,
+                    Numeric,
+                )?;
+                self.mark_stream_filters(&stream.dict, depth)
+            }
+            (ImageMask, PdfObject::Stream(_)) => self.mark_used_children(object, depth, Image),
+            (ImageMask, _) => self.mark_used_children(object, depth, Numeric),
+            (Font, PdfObject::Dict(dict)) => {
+                if !matches!(
+                    dict.get_name("Subtype").ok(),
+                    Some(
+                        "Type1"
+                            | "MMType1"
+                            | "TrueType"
+                            | "Type0"
+                            | "CIDFontType0"
+                            | "CIDFontType2"
+                    )
+                ) {
+                    return Err(
+                        invalid_data("resource cleanup cannot classify font dependency").into(),
+                    );
+                }
+                self.mark_key(dict, "FontDescriptor", depth, FontDescriptor)?;
+                self.mark_key(dict, "Encoding", depth, Encoding)?;
+                self.mark_key(dict, "ToUnicode", depth, CMap)?;
+                self.mark_key(dict, "CIDToGIDMap", depth, NamedData)?;
+                self.mark_key(dict, "DescendantFonts", depth, FontList)?;
+                self.mark_key(dict, "CIDSystemInfo", depth, CidInfo)?;
+                self.mark_keys(
+                    dict,
+                    &[
+                        "Widths",
+                        "W",
+                        "W2",
+                        "DW",
+                        "DW2",
+                        "FirstChar",
+                        "LastChar",
+                        "FontBBox",
+                        "FontMatrix",
+                        "BaseFont",
+                        "Name",
+                    ],
+                    depth,
+                    Numeric,
+                )
+            }
+            (FontList, PdfObject::Array(values)) => {
+                for value in values {
+                    self.mark_used(value, depth + 1, false, Font)?;
+                }
+                Ok(())
+            }
+            (FontDescriptor, PdfObject::Dict(dict)) => {
+                self.mark_keys(
+                    dict,
+                    &["FontFile", "FontFile2", "FontFile3", "CIDSet"],
+                    depth,
+                    StreamData,
+                )?;
+                self.mark_keys(dict, &["FontFamily", "CharSet"], depth, Text)?;
+                self.mark_keys(
+                    dict,
+                    &[
+                        "FontName",
+                        "FontStretch",
+                        "FontWeight",
+                        "Flags",
+                        "FontBBox",
+                        "ItalicAngle",
+                        "Ascent",
+                        "Descent",
+                        "Leading",
+                        "CapHeight",
+                        "XHeight",
+                        "StemV",
+                        "StemH",
+                        "AvgWidth",
+                        "MaxWidth",
+                        "MissingWidth",
+                    ],
+                    depth,
+                    Numeric,
+                )
+            }
+            (Encoding, PdfObject::Dict(dict)) => {
+                self.mark_keys(dict, &["BaseEncoding", "Differences"], depth, Numeric)
+            }
+            (Encoding, PdfObject::Name(_)) => Ok(()),
+            (Encoding, PdfObject::Stream(_)) => self.mark_used_children(object, depth, CMap),
+            (CidInfo, PdfObject::Dict(dict)) => {
+                self.mark_keys(dict, &["Registry", "Ordering"], depth, Text)?;
+                self.mark_key(dict, "Supplement", depth, Numeric)
+            }
+            (ColorSpace, PdfObject::Name(_)) => Ok(()),
+            (ColorSpace, PdfObject::Array(values)) => {
+                let family = values.first().and_then(|value| value.as_name().ok());
+                match (family, values.as_slice()) {
+                    (Some("ICCBased"), [_, profile]) => {
+                        self.mark_used(profile, depth + 1, false, Icc)
+                    }
+                    (Some("Indexed" | "I"), [_, base, count, lookup]) => {
+                        self.mark_used(base, depth + 1, false, ColorSpace)?;
+                        self.mark_used(count, depth + 1, false, Numeric)?;
+                        self.mark_used(lookup, depth + 1, false, Data)
+                    }
+                    (Some("CalGray" | "CalRGB" | "Lab"), [_, parameters]) => {
+                        self.mark_used(parameters, depth + 1, false, Numeric)
+                    }
+                    (Some("Separation"), [_, colorant, alternate, function]) => {
+                        self.mark_used(colorant, depth + 1, false, Numeric)?;
+                        self.mark_used(alternate, depth + 1, false, ColorSpace)?;
+                        self.mark_used(function, depth + 1, false, Function)
+                    }
+                    (Some("DeviceN"), [_, colorants, alternate, function, ..]) => {
+                        self.mark_used(colorants, depth + 1, false, Numeric)?;
+                        self.mark_used(alternate, depth + 1, false, ColorSpace)?;
+                        self.mark_used(function, depth + 1, false, Function)
+                    }
+                    (Some("Pattern"), [_]) => Ok(()),
+                    (Some("Pattern"), [_, base]) => {
+                        self.mark_used(base, depth + 1, false, ColorSpace)
+                    }
+                    _ => Err(invalid_data(
+                        "resource cleanup cannot classify colorspace dependency",
+                    )
+                    .into()),
+                }
+            }
+            (Icc, PdfObject::Stream(stream)) => {
+                self.mark_key(&stream.dict, "Alternate", depth, ColorSpace)?;
+                self.mark_keys(&stream.dict, &["N", "Range"], depth, Numeric)?;
+                self.mark_stream_filters(&stream.dict, depth)
+            }
+            (Text | Data, PdfObject::String(_)) => Ok(()),
+            (NamedData | CMap, PdfObject::Name(_)) => Ok(()),
+            (Data | StreamData | NamedData, PdfObject::Stream(stream)) => {
+                self.mark_stream_filters(&stream.dict, depth)
+            }
+            (CMap, PdfObject::Stream(stream)) => {
+                self.mark_key(&stream.dict, "UseCMap", depth, CMap)?;
+                self.mark_stream_filters(&stream.dict, depth)
+            }
+            (Properties, PdfObject::Dict(dict)) => {
+                self.mark_keys(dict, &["ActualText", "Alt", "E", "Lang"], depth, Text)?;
+                self.mark_key(dict, "MCID", depth, Numeric)
+            }
+            (ExtGState, PdfObject::Dict(dict)) => {
+                self.mark_key(dict, "Font", depth, FontSelection)?;
+                self.mark_keys(
+                    dict,
+                    &["BG", "BG2", "UCR", "UCR2", "TR", "TR2"],
+                    depth,
+                    Function,
+                )?;
+                self.mark_keys(
+                    dict,
+                    &[
+                        "LW", "LC", "LJ", "ML", "D", "RI", "OP", "op", "OPM", "FL", "SM", "SA",
+                        "BM", "CA", "ca", "AIS", "TK",
+                    ],
+                    depth,
+                    Numeric,
+                )
+            }
+            (FontSelection, PdfObject::Array(values)) if values.len() == 2 => {
+                self.mark_used(&values[0], depth + 1, false, Font)?;
+                self.mark_used(&values[1], depth + 1, false, Numeric)
+            }
+            (Pattern, PdfObject::Dict(dict)) if dict.get_i64("PatternType").ok() == Some(2) => {
+                self.mark_key(dict, "Shading", depth, Shading)?;
+                self.mark_key(dict, "Matrix", depth, Numeric)
+            }
+            (Pattern, PdfObject::Stream(_)) => {
+                Err(invalid_data("resource cleanup cannot prove pattern resource ownership").into())
+            }
+            (Shading, PdfObject::Dict(dict))
+                if matches!(dict.get_i64("ShadingType").ok(), Some(2 | 3)) =>
+            {
+                self.mark_shading(dict, depth)
+            }
+            (Shading, PdfObject::Stream(stream))
+                if matches!(stream.dict.get_i64("ShadingType").ok(), Some(4..=7)) =>
+            {
+                self.mark_shading(&stream.dict, depth)
+            }
+            (Function, PdfObject::Name(name))
+                if matches!(name.as_str(), "Identity" | "Default") =>
+            {
+                Ok(())
+            }
+            (Function, PdfObject::Array(values)) => {
+                for value in values {
+                    self.mark_used(value, depth + 1, false, Function)?;
+                }
+                Ok(())
+            }
+            (Function, PdfObject::Dict(dict))
+                if matches!(dict.get_i64("FunctionType").ok(), Some(2 | 3)) =>
+            {
+                self.mark_function(dict, depth)
+            }
+            (Function, PdfObject::Stream(stream))
+                if matches!(stream.dict.get_i64("FunctionType").ok(), Some(0 | 4)) =>
+            {
+                self.mark_function(&stream.dict, depth)
+            }
+            (DecodeParms, PdfObject::Array(values)) => {
+                for value in values {
+                    self.mark_used(value, depth + 1, false, DecodeParms)?;
+                }
+                Ok(())
+            }
+            (DecodeParms, PdfObject::Dict(dict)) => {
+                self.mark_key(dict, "JBIG2Globals", depth, StreamData)?;
+                self.mark_keys(
+                    dict,
+                    &[
+                        "Predictor",
+                        "Colors",
+                        "BitsPerComponent",
+                        "Columns",
+                        "EarlyChange",
+                        "K",
+                        "EndOfLine",
+                        "EncodedByteAlign",
+                        "Rows",
+                        "EndOfBlock",
+                        "BlackIs1",
+                        "DamagedRowsBeforeError",
+                        "ColorTransform",
+                        "Name",
+                    ],
+                    depth,
+                    Numeric,
+                )
+            }
+            (
+                Numeric,
+                PdfObject::Bool(_)
+                | PdfObject::Integer(_)
+                | PdfObject::Real(_)
+                | PdfObject::Name(_),
+            ) => Ok(()),
+            (Numeric, PdfObject::Array(values)) => {
+                for value in values {
+                    self.mark_used(value, depth + 1, false, Numeric)?;
+                }
+                Ok(())
+            }
+            (Numeric, PdfObject::Dict(dict)) => {
+                for value in dict.0.values() {
+                    self.mark_used(value, depth + 1, false, Numeric)?;
+                }
+                Ok(())
+            }
+            _ => Err(invalid_data("resource cleanup cannot classify resource dependency").into()),
+        }
+    }
+
+    fn mark_shading(&mut self, dict: &PdfDict, depth: u32) -> Result<()> {
+        self.mark_key(dict, "ColorSpace", depth, ResourceRole::ColorSpace)?;
+        self.mark_key(dict, "Function", depth, ResourceRole::Function)?;
+        self.mark_keys(
+            dict,
+            &[
+                "Background",
+                "BBox",
+                "Coords",
+                "Domain",
+                "Extend",
+                "Decode",
+                "VerticesPerRow",
+                "BitsPerCoordinate",
+                "BitsPerComponent",
+                "BitsPerFlag",
+            ],
+            depth,
+            ResourceRole::Numeric,
+        )?;
+        self.mark_stream_filters(dict, depth)
+    }
+
+    fn mark_function(&mut self, dict: &PdfDict, depth: u32) -> Result<()> {
+        self.mark_keys(dict, &["Domain", "Range"], depth, ResourceRole::Numeric)?;
+        match dict.get_i64("FunctionType").ok() {
+            Some(0) => {
+                self.mark_keys(
+                    dict,
+                    &["Size", "Encode", "Decode", "BitsPerSample", "Order"],
+                    depth,
+                    ResourceRole::Numeric,
+                )?;
+                self.mark_stream_filters(dict, depth)
+            }
+            Some(2) => self.mark_keys(dict, &["N", "C0", "C1"], depth, ResourceRole::Numeric),
+            Some(3) => {
+                self.mark_key(dict, "Functions", depth, ResourceRole::Function)?;
+                self.mark_keys(dict, &["Bounds", "Encode"], depth, ResourceRole::Numeric)
+            }
+            Some(4) => self.mark_stream_filters(dict, depth),
+            _ => Err(invalid_data("resource cleanup cannot classify function dependency").into()),
+        }
+    }
+
     fn remember_removed(&mut self, object: &PdfObject, depth: u32) -> Result<()> {
-        self.remember_removed_object(object, depth, true)
+        self.remember_removed_object(object, depth, true, true)
     }
 
     fn remember_removed_object(
@@ -1181,11 +1922,20 @@ impl<'a> ResourceGraphCheck<'a> {
         object: &PdfObject,
         depth: u32,
         reference_boundary: bool,
+        root: bool,
     ) -> Result<()> {
         self.charge_node(depth)?;
         if let PdfObject::Ref(id) = object {
-            if self.removed_ids.insert(*id) {
-                self.remember_removed_object(&self.writer.resolve_current(*id)?, depth + 1, true)?;
+            if root {
+                self.removed_root_ids.insert(*id);
+            }
+            if self.removed_ids.insert(*id) || root {
+                self.remember_removed_object(
+                    &self.writer.resolve_current(*id)?,
+                    depth + 1,
+                    true,
+                    root,
+                )?;
             }
             return Ok(());
         }
@@ -1195,21 +1945,24 @@ impl<'a> ResourceGraphCheck<'a> {
         if reference_boundary && Self::has_payload(object) {
             let fingerprint = self.fingerprint(object)?;
             self.removed_fingerprints.insert(fingerprint);
+            if root {
+                self.removed_root_fingerprints.insert(fingerprint);
+            }
         }
         match object {
             PdfObject::Array(values) => {
                 for value in values {
-                    self.remember_removed_object(value, depth + 1, false)?;
+                    self.remember_removed_object(value, depth + 1, false, false)?;
                 }
             }
             PdfObject::Dict(dict) => {
                 for value in dict.0.values() {
-                    self.remember_removed_object(value, depth + 1, false)?;
+                    self.remember_removed_object(value, depth + 1, false, false)?;
                 }
             }
             PdfObject::Stream(stream) => {
                 for value in stream.dict.0.values() {
-                    self.remember_removed_object(value, depth + 1, false)?;
+                    self.remember_removed_object(value, depth + 1, false, false)?;
                 }
             }
             _ => {}
@@ -1227,20 +1980,54 @@ impl<'a> ResourceGraphCheck<'a> {
         }
     }
 
+    /// A shared Resources/category dictionary is a container, not an owned
+    /// text/image payload. Its referenced children are checked separately.
+    /// Inline strings/streams cannot be skipped with the container, however.
+    fn has_inline_payload(&mut self, object: &PdfObject, depth: u32) -> Result<bool> {
+        self.charge_node(depth)?;
+        match object {
+            PdfObject::String(value) => Ok(!value.0.is_empty()),
+            PdfObject::Stream(_) => Ok(true),
+            PdfObject::Array(values) => {
+                for value in values {
+                    if self.has_inline_payload(value, depth + 1)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            PdfObject::Dict(dict) => {
+                for value in dict.0.values() {
+                    if self.has_inline_payload(value, depth + 1)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            _ => Ok(false),
+        }
+    }
+
     fn check_retained(&mut self, object: &PdfObject, depth: u32) -> Result<()> {
         self.charge_node(depth)?;
         if let PdfObject::Ref(id) = object {
-            if self.removed_ids.contains(id) {
+            if self.removed_root_ids.contains(id) {
                 return Err(invalid_data("resource cleanup retains a removed payload").into());
             }
             if self.visited.insert(*id) {
                 let resolved = self.writer.resolve_current(*id)?;
-                // Compare at object boundaries, including indirect strings,
-                // so transparent aliases to owned descendants cannot bypass
-                // the ID check. Inline scalar coincidences are ignored.
+                // Fingerprints recover transparent ref aliases. An identical
+                // ICC/font descendant is not exclusive ownership evidence if
+                // actual retained content independently needs that payload.
                 if Self::has_payload(&resolved) {
                     let fingerprint = self.fingerprint(&resolved)?;
-                    if self.removed_fingerprints.contains(&fingerprint) {
+                    if self.removed_root_fingerprints.contains(&fingerprint)
+                        || ((self.removed_ids.contains(id)
+                            || self.removed_fingerprints.contains(&fingerprint))
+                            && !self.used_ids.contains(id)
+                            && !self.used_fingerprints.contains(&fingerprint)
+                            && self.has_inline_payload(&resolved, depth + 1)?)
+                    {
                         return Err(
                             invalid_data("resource cleanup retains a removed payload").into()
                         );
@@ -2139,6 +2926,7 @@ mod tests {
         assert!(text.contains("(top)"), "top text kept: {text}");
         assert!(!text.contains("(bottom)"), "bottom text dropped: {text}");
     }
+
     #[test]
     fn redaction_obeys_small_document_content_limits() {
         let no_properties = |_: &str| None;

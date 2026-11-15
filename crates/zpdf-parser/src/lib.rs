@@ -440,7 +440,15 @@ impl PdfFile {
         limits: &ParseLimits,
     ) -> Result<Vec<u8>> {
         let obj = self.resolve(id)?;
-        let stream = obj.as_stream()?;
+        self.decode_resolved_stream(obj.as_stream()?, inline_globals, limits)
+    }
+
+    fn decode_resolved_stream(
+        &self,
+        stream: &PdfStream,
+        inline_globals: bool,
+        limits: &ParseLimits,
+    ) -> Result<Vec<u8>> {
         match self.dict_with_resolved_filters(&stream.dict, inline_globals, limits)? {
             Some(resolved) => filters::decode_stream_with_limits(&stream.data, &resolved, limits),
             None => filters::decode_stream_with_limits(&stream.data, &stream.dict, limits),
@@ -519,15 +527,22 @@ impl PdfFile {
         };
         if let Some(PdfObject::Ref(r)) = d.get("JBIG2Globals") {
             let r = *r;
-            // An explicitly referenced globals stream is required input.
-            // Propagate every decoding failure: filter budget exhaustion can
-            // also be a StreamDecode error, and dropping globals can turn a
-            // dependent text region into a successful but blank page.
-            let bytes = self.resolve_stream_data_inner(r, false, limits)?;
-            d.insert(
-                PdfName::new("JBIG2Globals"),
-                PdfObject::String(zpdf_core::PdfString(bytes)),
-            );
+            // Preserve lenient decoding only for an absent or non-stream
+            // object. Resolution errors and every actual stream decoding error
+            // remain fatal: StreamDecode also carries filter budget exhaustion.
+            let globals = match self.resolve(r)? {
+                PdfObject::Stream(stream) => PdfObject::String(zpdf_core::PdfString(
+                    self.decode_resolved_stream(&stream, false, limits)?,
+                )),
+                other => {
+                    tracing::warn!(
+                        "JBIG2Globals {r} resolves to {}; ignoring non-stream globals",
+                        other.type_name()
+                    );
+                    PdfObject::Null
+                }
+            };
+            d.insert(PdfName::new("JBIG2Globals"), globals);
         }
         Ok(PdfObject::Dict(d))
     }

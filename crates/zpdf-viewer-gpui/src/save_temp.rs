@@ -58,6 +58,20 @@ impl SaveTemp {
 
     /// The caller must finish writing and sync the file before committing.
     pub(crate) fn commit(mut self) -> io::Result<()> {
+        // Keep incomplete output private, then preserve a regular destination's
+        // Unix mode only after the caller has finished writing. Use the open
+        // file descriptor, and do not follow a destination symlink whose entry
+        // the rename will replace. New files retain their private creation mode.
+        #[cfg(unix)]
+        match fs::symlink_metadata(&self.destination) {
+            Ok(metadata) if metadata.is_file() => {
+                self.file_mut().set_permissions(metadata.permissions())?;
+                self.file_mut().sync_all()?;
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
         // Close before rename (and before error cleanup), including on Windows.
         drop(self.file.take());
         fs::rename(&self.path, &self.destination)?;
@@ -90,6 +104,8 @@ fn create_private_file(path: &Path) -> io::Result<File> {
 mod tests {
     use super::*;
     use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     struct TestDir(PathBuf);
 
@@ -141,14 +157,26 @@ mod tests {
         let dir = TestDir::new();
         let destination = dir.0.join("document.pdf");
         fs::write(&destination, b"original").unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o660)).unwrap();
         let temp_path;
         {
             let mut save = SaveTemp::new(&destination).unwrap();
             temp_path = save.path.clone();
             save.file_mut().write_all(b"partial output").unwrap();
+            #[cfg(unix)]
+            assert_eq!(
+                fs::metadata(&temp_path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
         }
         assert!(!temp_path.exists());
         assert_eq!(fs::read(&destination).unwrap(), b"original");
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+            0o660
+        );
     }
 
     #[test]
@@ -164,14 +192,86 @@ mod tests {
         save.commit().unwrap();
         assert_eq!(fs::read(&destination).unwrap(), b"updated");
         assert!(!temp_path.exists());
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn commit_preserves_existing_permissions_after_private_writes() {
+        for mode in [0o644, 0o660] {
+            let dir = TestDir::new();
+            let destination = dir.0.join("document.pdf");
+            fs::write(&destination, b"original").unwrap();
+            fs::set_permissions(&destination, fs::Permissions::from_mode(mode)).unwrap();
+            let mut save = SaveTemp::new(&destination).unwrap();
+            let temp_path = save.path.clone();
+            save.file_mut().write_all(b"updated").unwrap();
             assert_eq!(
-                fs::metadata(&destination).unwrap().permissions().mode() & 0o077,
-                0
+                fs::metadata(&temp_path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+                mode
+            );
+            save.file_mut().sync_all().unwrap();
+            save.commit().unwrap();
+            assert_eq!(fs::read(&destination).unwrap(), b"updated");
+            assert!(!temp_path.exists());
+            assert_eq!(
+                fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+                mode
             );
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn new_destination_remains_private_after_commit() {
+        let dir = TestDir::new();
+        let destination = dir.0.join("new-document.pdf");
+        let mut save = SaveTemp::new(&destination).unwrap();
+        let temp_path = save.path.clone();
+        save.file_mut().write_all(b"new output").unwrap();
+        assert_eq!(
+            fs::metadata(&temp_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        save.file_mut().sync_all().unwrap();
+        save.commit().unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), b"new output");
+        assert!(!temp_path.exists());
+        assert_eq!(
+            fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn replacing_a_symlink_does_not_borrow_its_targets_permissions() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TestDir::new();
+        let destination = dir.0.join("document.pdf");
+        let target = dir.0.join("unrelated.pdf");
+        fs::write(&target, b"unrelated file").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o664)).unwrap();
+        symlink(&target, &destination).unwrap();
+        let mut save = SaveTemp::new(&destination).unwrap();
+        save.file_mut().write_all(b"updated").unwrap();
+        save.file_mut().sync_all().unwrap();
+        save.commit().unwrap();
+        assert!(fs::symlink_metadata(&destination).unwrap().is_file());
+        assert_eq!(fs::read(&destination).unwrap(), b"updated");
+        assert_eq!(fs::read(&target).unwrap(), b"unrelated file");
+        assert_eq!(
+            fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o664
+        );
     }
 
     #[test]

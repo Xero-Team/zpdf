@@ -111,7 +111,10 @@ impl IncrementalWriter {
         Ok(())
     }
 
-    /// Serialize the current reachable graph only to private, bounded memory.
+    /// Serialize the current text-extraction graph to private, bounded memory.
+    /// Images, document metadata, attachments and annotations are not needed
+    /// for page_text and must not consume the snapshot's byte budget. Keep
+    /// page inheritance, Form XObjects and font dependencies unchanged.
     /// resolve_current has already decrypted source objects. A fresh trailer
     /// deliberately omits /Encrypt here, never in the externally saved file.
     fn current_tagging_document(&self) -> Result<PdfDocument, zpdf_core::Error> {
@@ -127,7 +130,7 @@ impl IncrementalWriter {
         while head < queue.len() {
             let id = queue[head];
             head += 1;
-            let object = self.resolve_current(id)?;
+            let object = tagging_snapshot_object(self.resolve_current(id)?, id == root);
             let mut direct = vec![&object];
             while let Some(value) = direct.pop() {
                 entries += 1;
@@ -337,6 +340,49 @@ impl IncrementalWriter {
     }
 }
 
+/// Project only the private extraction copy; never modify pending objects or
+/// the source file. In particular, page_text has no image cache and already
+/// skips image drawing, while Form content and font programs can supply text.
+fn tagging_snapshot_object(object: PdfObject, is_catalog: bool) -> PdfObject {
+    match object {
+        PdfObject::Dict(mut dict) if is_catalog => {
+            dict.0
+                .retain(|key, _| matches!(key.as_str(), "Type" | "Pages"));
+            PdfObject::Dict(dict)
+        }
+        PdfObject::Dict(mut dict) if matches!(dict.get_name("Type"), Ok("Page" | "Pages")) => {
+            dict.0.retain(|key, _| {
+                matches!(
+                    key.as_str(),
+                    "Type"
+                        | "Parent"
+                        | "Kids"
+                        | "Count"
+                        | "Resources"
+                        | "MediaBox"
+                        | "CropBox"
+                        | "Rotate"
+                        | "UserUnit"
+                        | "Contents"
+                )
+            });
+            PdfObject::Dict(dict)
+        }
+        PdfObject::Stream(stream)
+            if matches!(stream.dict.get_name("Subtype"), Ok("Image"))
+                || matches!(
+                    stream.dict.get_name("Type"),
+                    Ok("Metadata" | "EmbeddedFile")
+                ) =>
+        {
+            // Do not traverse image masks, ICC profiles or other payload
+            // dependencies either. The original objects remain intact on save.
+            PdfObject::Null
+        }
+        other => other,
+    }
+}
+
 /// Best-effort per-page text extraction for the `/Alt` of each page's `/Part`
 /// element. Returns an empty string when extraction is unavailable (no fonts,
 /// parse error) so we emit no `/Alt` rather than a misleading one.
@@ -370,5 +416,157 @@ fn page_text(doc: &PdfDocument, idx: usize) -> String {
             end -= 1;
         }
         text[..end].to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use super::*;
+    use zpdf_core::ParseLimits;
+
+    fn stream(dict: &str, data: &[u8]) -> Vec<u8> {
+        let mut bytes = format!("<< {dict} /Length {} >>\nstream\n", data.len()).into_bytes();
+        bytes.extend_from_slice(data);
+        bytes.extend_from_slice(b"\nendstream");
+        bytes
+    }
+
+    fn image_heavy_pdf() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let image = vec![0x5a; 32 * 1024];
+        let attachment = vec![0x6b; 32 * 1024];
+        let objects = vec![
+            b"<< /Type /Catalog /Pages 2 0 R /Metadata 11 0 R \
+              /Names << /EmbeddedFiles << /Names [(file) 10 0 R] >> >> >>"
+                .to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 200 200] \
+              /Resources << /Font << /F1 5 0 R >> \
+              /XObject << /Im 6 0 R /Fm 8 0 R >> >> >>"
+                .to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Annots [9 0 R] \
+              /AF [10 0 R] >>"
+                .to_vec(),
+            stream(
+                "",
+                b"BT /F1 12 Tf 10 100 Td (Stale page) Tj ET /Im Do /Fm Do",
+            ),
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+            stream(
+                "/Type /XObject /Subtype /Image /Width 256 /Height 128 \
+                    /ColorSpace /DeviceGray /BitsPerComponent 8",
+                &image,
+            ),
+            stream("/Type /EmbeddedFile", &attachment),
+            stream(
+                "/Type /XObject /Subtype /Form /BBox [0 0 200 200] \
+                    /Resources << /Font << /F2 5 0 R >> /XObject << /Im 6 0 R >> >>",
+                b"BT /F2 12 Tf 10 80 Td (Stale form) Tj ET /Im Do",
+            ),
+            b"<< /Type /Annot /Subtype /FileAttachment /Rect [0 0 10 10] /FS 10 0 R >>".to_vec(),
+            b"<< /Type /Filespec /F (file) /EF << /F 7 0 R >> >>".to_vec(),
+            stream("/Type /Metadata /Subtype /XML", &attachment),
+        ];
+        let mut pdf = b"%PDF-1.7\n".to_vec();
+        let mut offsets = Vec::new();
+        for (index, object) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.extend_from_slice(format!("{} 0 obj\n", index + 1).as_bytes());
+            pdf.extend_from_slice(object);
+            pdf.extend_from_slice(b"\nendobj\n");
+        }
+        let xref = pdf.len();
+        pdf.extend_from_slice(
+            format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+        );
+        for offset in offsets {
+            pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                objects.len() + 1,
+            )
+            .as_bytes(),
+        );
+        (pdf, image, attachment)
+    }
+
+    #[test]
+    fn tagging_large_images_keeps_current_page_and_form_text() {
+        let (pdf, image, attachment) = image_heavy_pdf();
+        let mut writer = IncrementalWriter::new(pdf.clone()).unwrap();
+        // A modest budget makes the regression deterministic without a
+        // hundreds-of-megabytes fixture. Raw image storage has its own limit.
+        let limits = ParseLimits {
+            max_decoded_stream_bytes: 8 * 1024,
+            ..Default::default()
+        };
+        writer.doc = PdfDocument::open_with_limits(pdf, limits).unwrap();
+        let (content, _) = writer
+            .try_add_stream(
+                &PdfDict::new(),
+                b"BT /F1 12 Tf 10 100 Td (Current page) Tj ET /Im Do /Fm Do",
+            )
+            .unwrap();
+        let mut page = writer
+            .resolve_current(ObjectId(3, 0))
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .clone();
+        page.insert(
+            PdfName::new("Contents"),
+            PdfObject::Ref(ObjectId(content, 0)),
+        );
+        writer.overwrite_object(ObjectId(3, 0), PdfObject::Dict(page));
+
+        let form = writer.resolve_current(ObjectId(8, 0)).unwrap();
+        let (form, _) = writer
+            .try_add_stream(
+                &form.as_stream().unwrap().dict,
+                b"BT /F2 12 Tf 10 80 Td (Current form) Tj ET /Im Do",
+            )
+            .unwrap();
+        // Keep resource inheritance while replacing the Form reference in the
+        // pending ancestor. Both page content and Form lookup must see edits.
+        let mut pages = writer
+            .resolve_current(ObjectId(2, 0))
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .clone();
+        let mut resources = pages.get("Resources").unwrap().as_dict().unwrap().clone();
+        let mut xobjects = resources.get("XObject").unwrap().as_dict().unwrap().clone();
+        xobjects.insert(PdfName::new("Fm"), PdfObject::Ref(ObjectId(form, 0)));
+        resources.insert(PdfName::new("XObject"), PdfObject::Dict(xobjects));
+        pages.insert(PdfName::new("Resources"), PdfObject::Dict(resources));
+        writer.overwrite_object(ObjectId(2, 0), PdfObject::Dict(pages));
+
+        writer
+            .tag_pdf()
+            .expect("large non-text payloads must not exhaust the text snapshot budget");
+        let mut output = Cursor::new(Vec::new());
+        writer.write(&mut output).unwrap();
+        let document = PdfDocument::open(output.into_inner()).unwrap();
+        let tree = document.struct_tree().unwrap();
+        let alt = tree.children[0].alt.as_deref().unwrap();
+        assert!(alt.contains("Current page"), "{alt}");
+        assert!(alt.contains("Current form"), "{alt}");
+        assert!(!alt.contains("Stale"), "{alt}");
+        for (id, expected) in [
+            (ObjectId(6, 0), &image),
+            (ObjectId(7, 0), &attachment),
+            (ObjectId(11, 0), &attachment),
+        ] {
+            let object = document.file().resolve(id).unwrap();
+            assert_eq!(
+                object.as_stream().unwrap().data.as_ref(),
+                expected.as_slice()
+            );
+        }
+        let page = document.page(0).unwrap();
+        assert!(page.resources.xobjects.contains_key("Im"));
+        assert_eq!(page.annots, [ObjectId(9, 0)]);
     }
 }

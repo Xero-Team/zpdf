@@ -463,10 +463,10 @@ fn redaction_drops_thumbnail_named_properties_and_emptied_fields() {
     );
 }
 
-/// Moving a shared inherited table must remove its unused redacted entries,
-/// while retaining direct and Form-mediated uses on another page.
+/// Prune the inherited table once, preserving inheritance and direct or
+/// Form-mediated uses on another page.
 #[test]
-fn inherited_resources_are_detached_without_losing_surviving_uses() {
+fn inherited_resources_are_pruned_once_without_losing_surviving_uses() {
     for second_use in [
         "",
         "/Tile Do /Span /Caption BDC 200 200 10 10 re f EMC",
@@ -510,7 +510,14 @@ fn inherited_resources_are_detached_without_losing_surviving_uses() {
             .file()
             .resolve(catalog.as_dict().unwrap().get_ref("Pages").unwrap())
             .unwrap();
-        assert!(pages.as_dict().unwrap().get("Resources").is_none());
+        assert!(pages.as_dict().unwrap().get("Resources").is_some());
+        for index in 0..2 {
+            let leaf = document
+                .file()
+                .resolve(document.page(index).unwrap().id)
+                .unwrap();
+            assert!(leaf.as_dict().unwrap().get("Resources").is_none());
+        }
         assert!(!page_content(&document).contains("/Tile Do"));
         let other_page = document.page(1).unwrap();
         assert!(
@@ -518,6 +525,70 @@ fn inherited_resources_are_detached_without_losing_surviving_uses() {
                 .contains("public page")
         );
     }
+}
+
+#[test]
+fn structure_alias_to_page_preserves_prepared_redaction() {
+    let original = build_pdf(&[
+        "<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 6 0 R >>".into(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R /Thumb 7 0 R /S /P /Pg 3 0 R /K 0 /ActualText (selected replacement) >>".into(),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into(),
+        stream("", "/P <</MCID 0>> BDC BT /F1 12 Tf 20 20 Td (selected text) Tj ET EMC BT /F1 12 Tf 200 200 Td (public text) Tj ET"),
+        "<< /Type /StructTreeRoot /K 3 0 R >>".into(),
+        stream("/Subtype /Image", "selected thumbnail"),
+    ]);
+    let output = redact_pdf(
+        original,
+        b"",
+        0,
+        &[Rect::new(0.0, 0.0, 180.0, 60.0)],
+        &RedactOptions { fill: None },
+    )
+    .unwrap();
+    let document = PdfDocument::open(output).unwrap();
+    let payload = String::from_utf8_lossy(&all_payload_bytes(&document)).into_owned();
+    assert!(!payload.contains("selected"), "{payload}");
+    assert!(page_content(&document).contains("public text"));
+}
+
+#[test]
+fn malformed_structure_leaves_existing_writer_edits_unchanged() {
+    use zpdf_core::{ObjectId, PdfName, PdfObject, PdfString};
+
+    let original = build_pdf(&[
+        "<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 6 0 R >>".into(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>".into(),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into(),
+        stream("", "/P <</MCID 0>> BDC BT /F1 12 Tf 20 20 Td (selected text) Tj ET EMC"),
+        "<< /Type /StructTreeRoot /Pg 3 0 R /K 7 0 R >>".into(),
+        "<< /S /P /K 7 0 R /ActualText (selected replacement) >>".into(),
+    ]);
+    let mut writer = IncrementalWriter::new(original).unwrap();
+    let mut page = writer
+        .resolve_current(ObjectId(3, 0))
+        .unwrap()
+        .as_dict()
+        .unwrap()
+        .clone();
+    page.insert(
+        PdfName::new("PriorEdit"),
+        PdfObject::String(PdfString(b"keep prior edit".to_vec())),
+    );
+    writer.overwrite_object(ObjectId(3, 0), PdfObject::Dict(page));
+    let mut before = Cursor::new(Vec::new());
+    writer.write(&mut before).unwrap();
+    assert!(writer
+        .redact_page(
+            0,
+            &[Rect::new(0.0, 0.0, 180.0, 60.0)],
+            &RedactOptions { fill: None },
+        )
+        .is_err());
+    let mut after = Cursor::new(Vec::new());
+    writer.write(&mut after).unwrap();
+    assert_eq!(before.into_inner(), after.into_inner());
 }
 
 #[test]
@@ -679,10 +750,9 @@ fn retained_annotation_appearances_preserve_inherited_resource_uses() {
 }
 
 /// lookup_res falls back to the page for missing names in an own resource
-/// table. Empty tables are supported; partial overrides must fail before edits
-/// until a context-aware dependency walk can prove the surviving uses.
+/// table. Empty and partial tables must both preserve the fallback use.
 #[test]
-fn empty_form_resources_preserve_fallback_and_partial_resources_fail_without_edits() {
+fn empty_and_partial_form_resources_preserve_per_name_fallback() {
     for annotation in [false, true] {
         for own_resources in ["<< >>", "<< /XObject << /Other 5 0 R >> >>"] {
             let second_page = if annotation {
@@ -702,8 +772,6 @@ fn empty_form_resources_preserve_fallback_and_partial_resources_fail_without_edi
                 "<< /Type /Annot /Subtype /Stamp /P 4 0 R /Rect [200 200 220 220] /AP << /N 6 0 R >> >>".to_string(),
             ];
             let mut writer = IncrementalWriter::new(build_pdf(&objects)).unwrap();
-            let mut before = Cursor::new(Vec::new());
-            writer.write(&mut before).unwrap();
             let result = writer.redact_page(
                 0,
                 &[Rect::new(-1.0, -1.0, 100.0, 100.0)],
@@ -711,27 +779,19 @@ fn empty_form_resources_preserve_fallback_and_partial_resources_fail_without_edi
             );
             let mut after = Cursor::new(Vec::new());
             writer.write(&mut after).unwrap();
-            if own_resources == "<< >>" {
-                result.unwrap();
-                let current = PdfDocument::open(after.into_inner()).unwrap();
-                let output = zpdf_writer::rewrite_pdf(current.file(), &Default::default()).unwrap();
-                let document = PdfDocument::open(output).unwrap();
-                assert!(document
-                    .page(1)
-                    .unwrap()
-                    .resources
-                    .xobjects
-                    .contains_key("Tile"));
-                assert!(String::from_utf8_lossy(&all_payload_bytes(&document))
-                    .contains("fallback-tile-payload"));
-            } else {
-                assert!(result.is_err());
-                assert_eq!(
-                    after.into_inner(),
-                    before.into_inner(),
-                    "unsupported ownership must not queue partial edits"
-                );
-            }
+            result.unwrap();
+            let current = PdfDocument::open(after.into_inner()).unwrap();
+            let output = zpdf_writer::rewrite_pdf(current.file(), &Default::default()).unwrap();
+            let document = PdfDocument::open(output).unwrap();
+            assert!(document
+                .page(1)
+                .unwrap()
+                .resources
+                .xobjects
+                .contains_key("Tile"));
+            assert!(String::from_utf8_lossy(&all_payload_bytes(&document))
+                .contains("fallback-tile-payload"));
+            assert!(!page_content(&document).contains("/Tile Do"));
         }
     }
 }
@@ -766,6 +826,334 @@ fn ext_gstate_type3_selection_refuses_ambiguous_cleanup_before_edits() {
         writer.write(&mut after).unwrap();
         assert_eq!(after.into_inner(), before.into_inner());
     }
+}
+
+/// These normal-PDF controls require success; a fail-closed error is a regression.
+#[test]
+fn removed_image_preserves_shared_and_identical_color_space_resources() {
+    for separate in [false, true] {
+        for indexed in [false, true] {
+            let kept_space = if separate { 9 } else { 7 };
+            let color_space = |profile: u32| {
+                if indexed {
+                    format!("[/Indexed /DeviceRGB 1 {profile} 0 R]")
+                } else {
+                    format!("[/ICCBased {profile} 0 R]")
+                }
+            };
+            let profile = stream(if indexed { "" } else { "/N 1" }, "shared-color-profile");
+            let objects = vec![
+                "<< /Type /Catalog /Pages 2 0 R >>".into(),
+                "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(),
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R /Resources << /XObject << /Secret 5 0 R /Public 6 0 R >> >> >>".into(),
+                stream("", "q 10 0 0 10 10 10 cm /Secret Do Q q 10 0 0 10 200 200 cm /Public Do Q"),
+                stream("/Type /XObject /Subtype /Image /Width 20 /Height 1 /ColorSpace 7 0 R /BitsPerComponent 8", "removed-image-bytes"),
+                stream(&format!("/Type /XObject /Subtype /Image /Width 20 /Height 1 /ColorSpace {kept_space} 0 R /BitsPerComponent 8"), "public-image-bytes"),
+                color_space(8),
+                profile.clone(),
+                color_space(10),
+                profile,
+            ];
+            let output = redact_pdf(
+                build_pdf(&objects),
+                b"",
+                0,
+                &[Rect::new(0.0, 0.0, 100.0, 100.0)],
+                &RedactOptions { fill: None },
+            )
+            .unwrap();
+            let document = PdfDocument::open(output).unwrap();
+            let payload = String::from_utf8_lossy(&all_payload_bytes(&document)).into_owned();
+            assert!(!payload.contains("removed-image-bytes"));
+            assert!(payload.contains("public-image-bytes"));
+            assert!(payload.contains("shared-color-profile"));
+            let page = document.page(0).unwrap();
+            assert!(!page.resources.xobjects.contains_key("Secret"));
+            assert!(page.resources.xobjects.contains_key("Public"));
+            assert!(page_content(&document).contains("/Public Do"));
+        }
+    }
+}
+
+#[test]
+fn removed_form_preserves_page_font_used_by_surviving_text() {
+    let objects = vec![
+        "<< /Type /Catalog /Pages 2 0 R >>".into(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R /Resources << /Font << /F1 6 0 R >> /XObject << /Secret 5 0 R >> >> >>".into(),
+        stream("", "/Secret Do BT /F1 12 Tf 200 200 Td (public text) Tj ET"),
+        stream("/Type /XObject /Subtype /Form /BBox [0 0 10 10] /Resources << /Font << /F1 6 0 R >> >>", "% removed-form-bytes\nBT /F1 8 Tf (private) Tj ET"),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /TestMarker (shared-font-payload) >>".into(),
+    ];
+    let output = redact_pdf(
+        build_pdf(&objects),
+        b"",
+        0,
+        &[Rect::new(-1.0, -1.0, 100.0, 100.0)],
+        &RedactOptions { fill: None },
+    )
+    .unwrap();
+    let document = PdfDocument::open(output).unwrap();
+    let payload = String::from_utf8_lossy(&all_payload_bytes(&document)).into_owned();
+    assert!(!payload.contains("removed-form-bytes"));
+    assert!(!payload.contains("private"));
+    assert!(payload.contains("shared-font-payload"));
+    assert!(page_content(&document).contains("public text"));
+    assert!(document.page(0).unwrap().resources.fonts.contains_key("F1"));
+}
+
+#[test]
+fn kept_form_and_freetext_appearance_with_own_font_resources_allow_redaction() {
+    for annotation in [false, true] {
+        let annots = if annotation { "/Annots [6 0 R]" } else { "" };
+        let kept_draw = if annotation { "" } else { "/Public Do" };
+        let objects = vec![
+            "<< /Type /Catalog /Pages 2 0 R >>".into(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(),
+            format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R /Resources << /XObject << /Secret 5 0 R /Public 7 0 R >> >> {annots} >>"),
+            stream("", &format!("/Secret Do {kept_draw}")),
+            stream("/Type /XObject /Subtype /Image /Width 20 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8", "removed-image-bytes"),
+            "<< /Type /Annot /Subtype /FreeText /Rect [200 200 230 230] /Contents (public annotation) /AP << /N 7 0 R >> >>".into(),
+            stream("/Type /XObject /Subtype /Form /BBox [200 200 230 230] /Resources << /Font << /Helv 8 0 R >> >>", "BT /Helv 12 Tf 200 200 Td (public appearance) Tj ET"),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /TestMarker (appearance-font-payload) >>".into(),
+        ];
+        let output = redact_pdf(
+            build_pdf(&objects),
+            b"",
+            0,
+            &[Rect::new(-1.0, -1.0, 100.0, 100.0)],
+            &RedactOptions { fill: None },
+        )
+        .unwrap();
+        let document = PdfDocument::open(output).unwrap();
+        let payload = String::from_utf8_lossy(&all_payload_bytes(&document)).into_owned();
+        assert!(!payload.contains("removed-image-bytes"));
+        assert!(payload.contains("public appearance"));
+        assert!(payload.contains("appearance-font-payload"));
+        assert_eq!(
+            document.page(0).unwrap().annots.len(),
+            usize::from(annotation)
+        );
+        if annotation {
+            assert!(payload.contains("public annotation"));
+        } else {
+            assert!(page_content(&document).contains("/Public Do"));
+        }
+    }
+}
+
+#[test]
+fn inherited_resource_cleanup_keeps_one_table_for_many_siblings() {
+    const PAGES: usize = 24;
+    let content_id = PAGES + 3;
+    let image_id = PAGES + 5;
+    let kids = (3..PAGES + 3)
+        .map(|id| format!("{id} 0 R"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut objects = vec![
+        "<< /Type /Catalog /Pages 2 0 R >>".into(),
+        format!("<< /Type /Pages /Kids [{kids}] /Count {PAGES} /Resources << /XObject << /Secret {image_id} 0 R >> >> >>"),
+    ];
+    for index in 0..PAGES {
+        let contents = content_id + usize::from(index != 0);
+        objects.push(format!(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents {contents} 0 R >>"
+        ));
+    }
+    objects.push(stream("", "/Secret Do"));
+    objects.push(stream("", "200 200 10 10 re f"));
+    objects.push(stream("/Type /XObject /Subtype /Image /Width 20 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8", "removed-image-bytes"));
+    let output = redact_pdf(
+        build_pdf(&objects),
+        b"",
+        0,
+        &[Rect::new(-1.0, -1.0, 100.0, 100.0)],
+        &RedactOptions { fill: None },
+    )
+    .unwrap();
+    let document = PdfDocument::open(output).unwrap();
+    let catalog = document
+        .file()
+        .resolve(document.file().trailer.get_ref("Root").unwrap())
+        .unwrap();
+    let pages = document
+        .file()
+        .resolve(catalog.as_dict().unwrap().get_ref("Pages").unwrap())
+        .unwrap();
+    assert!(pages.as_dict().unwrap().get("Resources").is_some());
+    for index in 0..PAGES {
+        let page = document.page(index).unwrap();
+        let leaf = document.file().resolve(page.id).unwrap();
+        assert!(
+            leaf.as_dict().unwrap().get("Resources").is_none(),
+            "page {index} duplicated Resources"
+        );
+        assert!(!page.resources.xobjects.contains_key("Secret"));
+    }
+    assert!(!String::from_utf8_lossy(&all_payload_bytes(&document)).contains("removed-image-bytes"));
+}
+
+#[test]
+fn nested_forms_preserve_context_fallback_and_do_not_promote_shadowed_names() {
+    for include_second_context in [false, true] {
+        let second = if include_second_context {
+            "/OuterB Do"
+        } else {
+            ""
+        };
+        let objects = vec![
+            "<< /Type /Catalog /Pages 2 0 R >>".into(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 /Resources << /XObject << /Secret 5 0 R /Tile 6 0 R /OuterA 7 0 R /OuterB 8 0 R >> >> >>".into(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R >>".into(),
+            stream("", &format!("/Secret Do /Tile Do /OuterA Do {second}")),
+            stream("/Type /XObject /Subtype /Image /Width 20 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8", "removed-image-bytes"),
+            stream("/Type /XObject /Subtype /Image /Width 20 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8", "page-fallback-image"),
+            stream("/Type /XObject /Subtype /Form /BBox [200 200 210 210] /Resources << /XObject << /Inner 10 0 R /Tile 9 0 R >> >>", "/Inner Do"),
+            stream("/Type /XObject /Subtype /Form /BBox [220 220 230 230] /Resources << /XObject << /Inner 10 0 R >> >>", "/Inner Do"),
+            stream("/Type /XObject /Subtype /Image /Width 20 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8", "local-shadow-image"),
+            stream("/Type /XObject /Subtype /Form /BBox [0 0 10 10] /Resources << /Font << /F1 11 0 R >> >>", "/Tile Do BT /F1 12 Tf (nested public text) Tj ET"),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into(),
+        ];
+        let output = redact_pdf(
+            build_pdf(&objects),
+            b"",
+            0,
+            &[Rect::new(-1.0, -1.0, 100.0, 100.0)],
+            &RedactOptions { fill: None },
+        )
+        .unwrap();
+        let document = PdfDocument::open(output).unwrap();
+        let payload = String::from_utf8_lossy(&all_payload_bytes(&document)).into_owned();
+        assert!(!payload.contains("removed-image-bytes"));
+        assert!(payload.contains("local-shadow-image"));
+        assert!(payload.contains("nested public text"));
+        assert_eq!(
+            payload.contains("page-fallback-image"),
+            include_second_context
+        );
+        assert_eq!(
+            document
+                .page(0)
+                .unwrap()
+                .resources
+                .xobjects
+                .contains_key("Tile"),
+            include_second_context
+        );
+        assert!(!page_content(&document).contains("/Tile Do"));
+    }
+}
+
+#[test]
+fn extgstate_font_selection_preserves_shared_font_descendants() {
+    let objects = vec![
+        "<< /Type /Catalog /Pages 2 0 R >>".into(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R /Resources << /XObject << /Secret 5 0 R >> /ExtGState << /GS << /Font [6 0 R 12] >> >> >> >>".into(),
+        stream("", "/Secret Do BT /GS gs 200 200 Td (public text) Tj ET"),
+        stream("/Type /XObject /Subtype /Form /BBox [0 0 10 10] /Resources << /Font << /F1 6 0 R >> >>", "% removed-form-bytes\nBT /F1 12 Tf (private text) Tj ET"),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /FontDescriptor 7 0 R >>".into(),
+        "<< /Type /FontDescriptor /FontName /Helvetica /FontFamily (shared-font-family) /Flags 32 /FontBBox [0 0 1000 1000] >>".into(),
+    ];
+    let output = redact_pdf(
+        build_pdf(&objects),
+        b"",
+        0,
+        &[Rect::new(-1.0, -1.0, 100.0, 100.0)],
+        &RedactOptions { fill: None },
+    )
+    .unwrap();
+    let document = PdfDocument::open(output).unwrap();
+    let payload = String::from_utf8_lossy(&all_payload_bytes(&document)).into_owned();
+    assert!(!payload.contains("removed-form-bytes"));
+    assert!(payload.contains("shared-font-family"));
+    assert!(page_content(&document).contains("public text"));
+}
+
+#[test]
+fn used_forms_and_appearances_do_not_promote_unused_resource_descendants() {
+    for annotation in [false, true] {
+        let annots = if annotation { "/Annots [8 0 R]" } else { "" };
+        let draw = if annotation { "" } else { "/Wrapper Do" };
+        let objects = vec![
+            "<< /Type /Catalog /Pages 2 0 R >>".into(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 /Resources << /XObject << /Secret 5 0 R /Wrapper 6 0 R >> >> >>".into(),
+            format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R {annots} >>"),
+            stream("", &format!("/Secret Do {draw}")),
+            stream("/Type /XObject /Subtype /Form /BBox [0 0 10 10] /Resources << /XObject << /Inside 7 0 R >> >>", "/Inside Do"),
+            stream("/Type /XObject /Subtype /Form /BBox [200 200 210 210] /Resources << /XObject << /Unused 7 0 R >> >>", "% public-wrapper\n200 200 10 10 re f"),
+            stream("/Type /XObject /Subtype /Image /Width 20 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8", "removed-form-payload"),
+            "<< /Type /Annot /Subtype /Stamp /Rect [200 200 210 210] /AP << /N 6 0 R >> >>".into(),
+        ];
+        assert_no_removed_resource_after_redaction(build_pdf(&objects));
+    }
+}
+
+#[test]
+fn oversized_resource_tables_refuse_cleanup_before_edits() {
+    // The renderer exhausts its shared 65,536-entry cap on fonts before it
+    // reaches XObject. Cleanup must not infer additional rendered consumers.
+    let fonts = (0..65_536)
+        .map(|index| format!("/F{index} 6 0 R "))
+        .collect::<String>();
+    let objects = vec![
+        "<< /Type /Catalog /Pages 2 0 R >>".into(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(),
+        format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R /Resources << /Font << {fonts} >> /XObject << /Secret 5 0 R >> >> >>"),
+        stream("", "/Secret Do"),
+        stream("/Type /XObject /Subtype /Image /Width 20 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8", "removed-image-bytes"),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into(),
+    ];
+    let mut writer = IncrementalWriter::new(build_pdf(&objects)).unwrap();
+    let mut before = Cursor::new(Vec::new());
+    writer.write(&mut before).unwrap();
+    assert!(writer
+        .redact_page(
+            0,
+            &[Rect::new(-1.0, -1.0, 100.0, 100.0)],
+            &RedactOptions { fill: None }
+        )
+        .is_err());
+    let mut after = Cursor::new(Vec::new());
+    writer.write(&mut after).unwrap();
+    assert_eq!(before.into_inner(), after.into_inner());
+}
+
+#[test]
+fn removed_and_kept_forms_can_share_indirect_resource_containers() {
+    let objects = vec![
+        "<< /Type /Catalog /Pages 2 0 R >>".into(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R /Resources << /XObject << /Secret 5 0 R /Public 6 0 R >> >> >>".into(),
+        stream("", "/Secret Do /Public Do"),
+        stream("/Type /XObject /Subtype /Form /BBox [0 0 10 10] /Resources 7 0 R", "% removed-form-bytes\nBT /F1 12 Tf (private text) Tj ET"),
+        stream("/Type /XObject /Subtype /Form /BBox [200 200 230 230] /Resources 7 0 R", "BT /F1 12 Tf 200 200 Td (public text) Tj ET"),
+        "<< /Font 8 0 R >>".into(),
+        "<< /F1 9 0 R >>".into(),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /FontDescriptor 10 0 R >>".into(),
+        "<< /Type /FontDescriptor /FontName /Helvetica /FontFamily (shared-font-family) /Flags 32 /FontBBox [0 0 1000 1000] >>".into(),
+    ];
+    let output = redact_pdf(
+        build_pdf(&objects),
+        b"",
+        0,
+        &[Rect::new(-1.0, -1.0, 100.0, 100.0)],
+        &RedactOptions { fill: None },
+    )
+    .unwrap();
+    let document = PdfDocument::open(output).unwrap();
+    let payload = String::from_utf8_lossy(&all_payload_bytes(&document)).into_owned();
+    assert!(!payload.contains("removed-form-bytes"));
+    assert!(!payload.contains("private text"));
+    assert!(payload.contains("public text"));
+    assert!(payload.contains("shared-font-family"));
+    assert!(document
+        .page(0)
+        .unwrap()
+        .resources
+        .xobjects
+        .contains_key("Public"));
 }
 
 /// The unused Wrapper can keep removed roots reachable without executing a
@@ -987,4 +1375,151 @@ fn resource_graph_allows_ordinary_inline_values_and_empty_resources() {
     assert!(!payload.contains("removed-form-payload"));
     assert!(!payload.contains("removed-property-payload"));
     assert!(payload.contains("retained-wrapper-payload"));
+}
+
+/// An actually drawn Form's private keys are not rendering dependencies. They
+/// must not turn a removed Form's replacement-text descendants into allowed
+/// shared resources just because the other Form has a surviving Do operator.
+#[test]
+fn drawn_form_private_key_cannot_whitelist_removed_property_text() {
+    let original = build_pdf(&[
+        "<< /Type /Catalog /Pages 2 0 R >>".into(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R /Resources << /XObject << /Secret 5 0 R /Public 6 0 R >> >> >>".into(),
+        stream("", "/Secret Do /Public Do"),
+        stream("/Type /XObject /Subtype /Form /BBox [0 0 10 10] /Resources << /Properties << /Caption 7 0 R >> >>", "% removed-form-payload\n/Span /Caption BDC 0 0 10 10 re f EMC"),
+        stream("/Type /XObject /Subtype /Form /BBox [200 200 210 210] /Ignored 8 0 R", "% public-form-payload\n200 200 10 10 re f"),
+        "<< /ActualText 8 0 R >>".into(),
+        "(removed-property-payload)".into(),
+    ]);
+    assert_no_removed_resource_after_redaction(original);
+}
+
+/// The interpreter checks inline Properties across the resource stack before
+/// checking references. Resource cleanup must preserve the same selected name.
+#[test]
+fn retained_form_preserves_page_inline_properties_before_local_reference() {
+    let original = build_pdf(&[
+        "<< /Type /Catalog /Pages 2 0 R >>".into(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R /Resources << /XObject << /Public 5 0 R >> /Properties << /Caption << /ActualText (public-inline-caption) >> >> >> >>".into(),
+        stream("", "/Span /Caption BDC 10 10 10 10 re f EMC /Public Do"),
+        stream("/Type /XObject /Subtype /Form /BBox [200 200 210 210] /Resources << /Properties << /Caption 6 0 R >> >>", "/Span /Caption BDC 200 200 10 10 re f EMC"),
+        "<< /ActualText (local-reference-caption) >>".into(),
+    ]);
+    let output = redact_pdf(
+        original,
+        b"",
+        0,
+        &[Rect::new(-1.0, -1.0, 100.0, 100.0)],
+        &RedactOptions { fill: None },
+    )
+    .unwrap();
+    let document = PdfDocument::open(output).unwrap();
+    assert!(
+        document
+            .page(0)
+            .unwrap()
+            .resources
+            .properties_inline
+            .contains_key("Caption"),
+        "the kept Form still selects the page's inline Caption before its local ref"
+    );
+    assert!(
+        String::from_utf8_lossy(&all_payload_bytes(&document)).contains("public-inline-caption")
+    );
+    assert!(!page_content(&document).contains("/Caption BDC"));
+}
+
+fn removed_image_via_misclassified_resource(
+    extra_resources: &str,
+    retained_content: &str,
+    extra_object: &str,
+) -> Vec<u8> {
+    build_pdf(&[
+        "<< /Type /Catalog /Pages 2 0 R >>".into(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(),
+        format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R /Resources << /XObject << /Secret 5 0 R >> {extra_resources} >> >>"),
+        stream("", &format!("/Secret Do {retained_content}")),
+        stream("/Type /XObject /Subtype /Form /BBox [0 0 10 10] /Resources << /XObject << /Image 7 0 R >> >>", "% removed-form-payload\n/Image Do"),
+        extra_object.into(),
+        stream("/Type /XObject /Subtype /Image /Width 24 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8", "removed-property-payload"),
+    ])
+}
+
+#[test]
+fn image_without_shading_type_cannot_whitelist_removed_descendant() {
+    assert_no_removed_resource_after_redaction(removed_image_via_misclassified_resource(
+        "/Shading << /Fake 7 0 R >>",
+        "/Fake sh",
+        "null",
+    ));
+}
+
+#[test]
+fn image_without_function_type_cannot_whitelist_removed_descendant() {
+    assert_no_removed_resource_after_redaction(removed_image_via_misclassified_resource(
+        "/ExtGState << /Fake 6 0 R >>",
+        "/Fake gs",
+        "<< /TR 7 0 R >>",
+    ));
+}
+
+#[test]
+fn property_dict_without_pattern_type_cannot_whitelist_removed_descendant() {
+    let original = build_pdf(&[
+        "<< /Type /Catalog /Pages 2 0 R >>".into(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R /Resources << /XObject << /Secret 5 0 R >> /Pattern << /Fake 6 0 R >> >> >>".into(),
+        stream("", "/Secret Do /Pattern cs /Fake scn"),
+        stream("/Type /XObject /Subtype /Form /BBox [0 0 10 10] /Resources << /Properties << /Caption 6 0 R >> >>", "% removed-form-payload\n/Span /Caption BDC 0 0 10 10 re f EMC"),
+        "<< /ActualText (removed-property-payload) >>".into(),
+    ]);
+    assert_no_removed_resource_after_redaction(original);
+}
+
+/// Selecting the dictionary for its line width does not make its unrelated
+/// ActualText a retained replacement-text use. Sharing the object across two
+/// semantic roles must not retain the removed Form's readable caption.
+#[test]
+fn shared_extgstate_does_not_whitelist_unused_replacement_text() {
+    let original = build_pdf(&[
+        "<< /Type /Catalog /Pages 2 0 R >>".into(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R /Resources << /XObject << /Secret 5 0 R >> /ExtGState << /Public 6 0 R >> >> >>".into(),
+        stream("", "/Secret Do /Public gs 200 200 10 10 re S"),
+        stream("/Type /XObject /Subtype /Form /BBox [0 0 10 10] /Resources << /Properties << /Caption 6 0 R >> >>", "% removed-form-payload\n/Span /Caption BDC 0 0 10 10 re f EMC"),
+        "<< /Type /ExtGState /LW 1 /ActualText (removed-property-payload) >>".into(),
+    ]);
+    assert_no_removed_resource_after_redaction(original);
+}
+
+/// A non-text selection may precede a genuine replacement-text selection of
+/// the same shared object; only the retained semantic use justifies the text.
+#[test]
+fn shared_extgstate_then_properties_preserves_retained_replacement_text() {
+    let original = build_pdf(&[
+        "<< /Type /Catalog /Pages 2 0 R >>".into(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R /Resources << /XObject << /Secret 5 0 R >> /ExtGState << /Public 6 0 R >> /Properties << /Caption 6 0 R >> >> >>".into(),
+        stream("", "/Secret Do /Public gs /Span /Caption BDC 200 200 10 10 re f EMC"),
+        stream("/Type /XObject /Subtype /Form /BBox [0 0 10 10] /Resources << /Properties << /Caption 6 0 R >> >>", "% removed-form-payload\n/Span /Caption BDC 0 0 10 10 re f EMC"),
+        "<< /Type /ExtGState /LW 1 /ActualText (public-shared-caption) >>".into(),
+    ]);
+    let output = redact_pdf(
+        original,
+        b"",
+        0,
+        &[Rect::new(-1.0, -1.0, 100.0, 100.0)],
+        &RedactOptions { fill: None },
+    )
+    .unwrap();
+    let document = PdfDocument::open(output).unwrap();
+    let payload = String::from_utf8_lossy(&all_payload_bytes(&document)).into_owned();
+    assert!(!payload.contains("removed-form-payload"));
+    assert!(payload.contains("public-shared-caption"));
+    assert!(page_content(&document).contains("/Caption BDC"));
+    let page = document.page(0).unwrap();
+    assert!(page.resources.ext_g_state.contains_key("Public"));
+    assert!(page.resources.properties.contains_key("Caption"));
 }
