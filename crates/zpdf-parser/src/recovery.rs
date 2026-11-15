@@ -11,6 +11,8 @@
 //!  * Objects that live only inside an /ObjStm are found via an optional second
 //!    pass (`index_objstm_members`) once the direct objects are located.
 
+use std::sync::Arc;
+
 use zpdf_core::{Error, ObjectId, ParseLimits, PdfDict, PdfName, PdfObject, Result};
 
 use crate::lexer::Lexer;
@@ -18,7 +20,7 @@ use crate::object_parser::ObjectParser;
 use crate::xref::{XrefEntry, XrefTable};
 
 /// Entry point for recovery. Single linear pass + trailer recovery.
-pub fn scan_all_objects(data: &[u8], limits: &ParseLimits) -> Result<(XrefTable, PdfDict)> {
+pub fn scan_all_objects(data: &Arc<[u8]>, limits: &ParseLimits) -> Result<(XrefTable, PdfDict)> {
     let (headers, mut table) = build_object_table(data, limits)?;
 
     // Locate a catalog among ALL header occurrences (not just the later-wins
@@ -41,14 +43,14 @@ pub fn scan_all_objects(data: &[u8], limits: &ParseLimits) -> Result<(XrefTable,
 /// The object table of [`scan_all_objects`] alone, for resolving objects the
 /// xref misplaces: no catalog search or trailer recovery, which only opening a
 /// file needs.
-pub fn scan_object_table(data: &[u8], limits: &ParseLimits) -> Result<XrefTable> {
+pub fn scan_object_table(data: &Arc<[u8]>, limits: &ParseLimits) -> Result<XrefTable> {
     build_object_table(data, limits).map(|(_, table)| table)
 }
 
 /// Every object header in file order, and the table they and the members of
 /// any /ObjStm among them make.
 fn build_object_table(
-    data: &[u8],
+    data: &Arc<[u8]>,
     limits: &ParseLimits,
 ) -> Result<(Vec<(ObjectId, u64)>, XrefTable)> {
     let headers = scan_object_headers(data, limits)?;
@@ -170,7 +172,7 @@ fn parse_uint(bytes: &[u8]) -> Option<u32> {
 /// `/Root` as a last resort; otherwise a Root-less dict so the file still opens
 /// (the document layer scans for `/Type /Page` objects to build the page list).
 fn recover_trailer(
-    data: &[u8],
+    data: &Arc<[u8]>,
     headers: &[(ObjectId, u64)],
     table: &XrefTable,
     limits: &ParseLimits,
@@ -205,14 +207,14 @@ fn recover_trailer(
 /// True if `root` resolves (via the recovered table, direct or compressed) to a
 /// catalog-shaped dict. Used to vet an explicit `trailer /Root` before trusting it.
 fn root_points_at_catalog(
-    data: &[u8],
+    data: &Arc<[u8]>,
     table: &XrefTable,
     root: ObjectId,
     limits: &ParseLimits,
 ) -> bool {
     let obj = match table.get(root) {
         Some(XrefEntry::InUse { offset, .. }) => usize::try_from(*offset).ok().and_then(|offset| {
-            ObjectParser::new(data, limits)
+            ObjectParser::new_shared(data, limits)
                 .parse_indirect_at(offset)
                 .ok()
         }),
@@ -233,11 +235,11 @@ fn root_points_at_catalog(
 /// their dict). Without them a recovered encrypted file would lose `/Encrypt`
 /// and `/ID` and open with no decryptor.
 fn find_xref_stream_dict(
-    data: &[u8],
+    data: &Arc<[u8]>,
     headers: &[(ObjectId, u64)],
     limits: &ParseLimits,
 ) -> Option<PdfDict> {
-    let parser = ObjectParser::new(data, limits);
+    let parser = ObjectParser::new_shared(data, limits);
     headers.iter().rev().find_map(|&(_, offset)| {
         let PdfObject::Stream(stream) = parser
             .parse_indirect_at(usize::try_from(offset).ok()?)
@@ -277,12 +279,12 @@ fn find_trailer_dict(data: &[u8], limits: &ParseLimits) -> Option<PdfDict> {
 /// can re-point the xref entry); a `None` offset means a compressed member that
 /// is already addressable via its existing `Compressed` table entry.
 fn find_catalog(
-    data: &[u8],
+    data: &Arc<[u8]>,
     headers: &[(ObjectId, u64)],
     table: &XrefTable,
     limits: &ParseLimits,
 ) -> Option<(ObjectId, Option<u64>)> {
-    let parser = ObjectParser::new(data, limits);
+    let parser = ObjectParser::new_shared(data, limits);
     let mut best: Option<(ObjectId, Option<u64>)> = None;
     // Direct headers in file order: a later occurrence supersedes an earlier one.
     for &(id, offset) in headers {
@@ -359,7 +361,7 @@ fn dict_is_catalog(dict: Option<&PdfDict>) -> bool {
 /// than erroring — recovery is best-effort. Mirrors the bounds/ordering guards
 /// of `PdfFile::extract_from_object_stream`.
 fn decode_objstm_member(
-    data: &[u8],
+    data: &Arc<[u8]>,
     table: &XrefTable,
     stream_obj: u32,
     index_in_stream: u32,
@@ -377,7 +379,7 @@ struct RecoveredObjStm {
 
 impl RecoveredObjStm {
     fn decode(
-        data: &[u8],
+        data: &Arc<[u8]>,
         table: &XrefTable,
         stream_obj: u32,
         limits: &ParseLimits,
@@ -387,7 +389,7 @@ impl RecoveredObjStm {
             XrefEntry::InUse { offset, .. } => *offset,
             _ => return None,
         };
-        let obj = ObjectParser::new(data, limits)
+        let obj = ObjectParser::new_shared(data, limits)
             .parse_indirect_at(usize::try_from(off).ok()?)
             .ok()?;
         let PdfObject::Stream(stream) = obj else {
@@ -450,9 +452,13 @@ impl RecoveredObjStm {
 /// For each recovered /Type /ObjStm object, decode it and add Compressed entries
 /// for members not already present as direct objects. Invalid containers are
 /// skipped, but the aggregate direct-plus-compressed object limit is enforced.
-fn index_objstm_members(data: &[u8], table: &mut XrefTable, limits: &ParseLimits) -> Result<()> {
+fn index_objstm_members(
+    data: &Arc<[u8]>,
+    table: &mut XrefTable,
+    limits: &ParseLimits,
+) -> Result<()> {
     use crate::filters;
-    let parser = ObjectParser::new(data, limits);
+    let parser = ObjectParser::new_shared(data, limits);
     // Snapshot direct stream ids first (avoid mutating while iterating).
     let stream_ids: Vec<(ObjectId, u64)> = table
         .object_ids()
@@ -591,19 +597,24 @@ mod tests {
                 max_objects: 4, // Two direct objects plus two compressed members.
                 ..ParseLimits::default()
             };
-            let (table, trailer) = scan_all_objects(&d, &limits).unwrap();
+            let (table, trailer) = scan_all_objects(&Arc::from(d.as_slice()), &limits).unwrap();
             assert_eq!(table.len(), 4);
-            assert_eq!(scan_object_table(&d, &limits).unwrap().len(), 4);
+            assert_eq!(
+                scan_object_table(&Arc::from(d.as_slice()), &limits)
+                    .unwrap()
+                    .len(),
+                4
+            );
             let smaller = ParseLimits {
                 max_objects: 3,
                 ..limits
             };
             assert!(matches!(
-                scan_all_objects(&d, &smaller),
+                scan_all_objects(&Arc::from(d.as_slice()), &smaller),
                 Err(Error::InvalidXref(0))
             ));
             assert!(matches!(
-                scan_object_table(&d, &smaller),
+                scan_object_table(&Arc::from(d.as_slice()), &smaller),
                 Err(Error::InvalidXref(0))
             ));
             assert!(PdfFile::parse_with_limits(d.clone(), smaller).is_err());
@@ -628,7 +639,8 @@ mod tests {
               /W [1 2 1] /Length 0 >>\nstream\n\nendstream\nendobj\n",
         );
         d.extend_from_slice(b"startxref\n99999\n%%EOF\n");
-        let (_, trailer) = scan_all_objects(&d, &ParseLimits::default()).unwrap();
+        let (_, trailer) =
+            scan_all_objects(&Arc::from(d.as_slice()), &ParseLimits::default()).unwrap();
         assert_eq!(trailer.get_ref("Root").unwrap(), ObjectId(1, 0));
         assert_eq!(trailer.get_ref("Info").unwrap(), ObjectId(4, 0));
         assert!(trailer.get("ID").is_some());
@@ -638,7 +650,7 @@ mod tests {
     fn scan_finds_all_three_objects() {
         let data = broken_pdf();
         let limits = ParseLimits::default();
-        let (table, _trailer) = scan_all_objects(&data, &limits).unwrap();
+        let (table, _trailer) = scan_all_objects(&Arc::from(data.as_slice()), &limits).unwrap();
         assert!(table.get(ObjectId(1, 0)).is_some());
         assert!(table.get(ObjectId(2, 0)).is_some());
         assert!(table.get(ObjectId(3, 0)).is_some());
@@ -655,7 +667,7 @@ mod tests {
         d.extend_from_slice(b"startxref\n0\n%%EOF\n");
 
         let limits = ParseLimits::default();
-        let (table, _t) = scan_all_objects(&d, &limits).unwrap();
+        let (table, _t) = scan_all_objects(&Arc::from(d.as_slice()), &limits).unwrap();
         match table.get(ObjectId(1, 0)).unwrap() {
             XrefEntry::InUse { offset, .. } => assert_eq!(*offset as usize, second_off),
             _ => panic!("expected InUse"),
@@ -670,7 +682,7 @@ mod tests {
         d.extend_from_slice(b"8 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n");
         d.extend_from_slice(b"trailer\n<< /Root 7 0 R >>\nstartxref\n88888\n%%EOF\n");
         let limits = ParseLimits::default();
-        let (_table, trailer) = scan_all_objects(&d, &limits).unwrap();
+        let (_table, trailer) = scan_all_objects(&Arc::from(d.as_slice()), &limits).unwrap();
         assert_eq!(trailer.get_ref("Root").unwrap(), ObjectId(7, 0));
     }
 
@@ -678,7 +690,7 @@ mod tests {
     fn empty_buffer_errors() {
         let data = b"%PDF-1.4\nnothing useful here\n".to_vec();
         let limits = ParseLimits::default();
-        assert!(scan_all_objects(&data, &limits).is_err());
+        assert!(scan_all_objects(&Arc::from(data.as_slice()), &limits).is_err());
     }
 
     #[test]
@@ -691,7 +703,7 @@ mod tests {
             max_objects: 3,
             ..Default::default()
         };
-        assert!(scan_all_objects(&d, &limits).is_err());
+        assert!(scan_all_objects(&Arc::from(d.as_slice()), &limits).is_err());
     }
 
     #[test]

@@ -32,6 +32,15 @@ def child(script, *arguments):
 
 
 class CaptureTests(unittest.TestCase):
+    def test_signal_permission_errors_are_not_ignored(self):
+        for platform, status in [("darwin", None), ("darwin", 0), ("freebsd14", 0)]:
+            with self.subTest(platform=platform, status=status):
+                process = mock.Mock(pid=123, poll=mock.Mock(return_value=status))
+                with mock.patch.object(run.sys, "platform", platform), \
+                        mock.patch.object(run.os, "killpg", side_effect=PermissionError()):
+                    with self.assertRaises(PermissionError):
+                        run.kill_child_group(process)
+
     def test_exact_limit_accepts_both_output_streams(self):
         process = child('import os; os.write(1, b"a" * 512); os.write(2, b"b" * 512)')
         self.assertEqual(run.collect_child(process, output_limit=1024, wall_seconds=5),
@@ -52,6 +61,20 @@ class CaptureTests(unittest.TestCase):
         with self.assertRaisesRegex(run.ChildFailure, "status 7") as caught:
             run.collect_child(process, wall_seconds=5)
         self.assertEqual(len(caught.exception.output), 64 * 1024)
+
+    def test_darwin_exited_group_does_not_mask_output_failure(self):
+        process = child('import os; os.write(1, b"x" * 1025)')
+        # Force the completed-leader case. Darwin can report EPERM for a group
+        # with only zombies; after the leader is reaped the group is absent.
+        process.wait(timeout=5)
+        with mock.patch.object(run.sys, "platform", "darwin"), \
+                mock.patch.object(run.os, "killpg", side_effect=[
+                    PermissionError("zombie group"), ProcessLookupError(),
+                ]) as kill:
+            with self.assertRaisesRegex(run.ChildFailure, "output exceeded 1024 bytes"):
+                run.collect_child(process, output_limit=1024, wall_seconds=5)
+        self.assertEqual(kill.call_count, 2)
+        self.assertTrue(process.stdout.closed)
 
     def test_invalid_utf8_is_bounded_and_decoded(self):
         process = child(r'import os; os.write(1, b"\xff\xc3\xa9")')

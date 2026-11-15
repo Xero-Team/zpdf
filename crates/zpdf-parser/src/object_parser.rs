@@ -1,11 +1,18 @@
 use std::sync::Arc;
 
-use zpdf_core::{Error, ObjectId, ParseLimits, PdfDict, PdfObject, PdfStream, Result};
+use zpdf_core::{
+    Error, ObjectId, ParseLimits, PdfDict, PdfObject, PdfStream, PdfStreamData, Result,
+};
 
 use crate::lexer::Lexer;
 
+// For very short streams, copying costs less than allocating a range descriptor.
+// Keep this policy out of from_shared: explicitly requested views never copy.
+const SMALL_STREAM_BYTES: usize = 32;
+
 pub struct ObjectParser<'a> {
     data: &'a [u8],
+    shared: Option<&'a Arc<[u8]>>,
     limits: &'a ParseLimits,
     /// Value of an indirect stream `/Length` (see [`Self::with_length_resolver`]).
     length_resolver: Option<&'a dyn Fn(ObjectId) -> Option<i64>>,
@@ -15,6 +22,20 @@ impl<'a> ObjectParser<'a> {
     pub fn new(data: &'a [u8], limits: &'a ParseLimits) -> Self {
         Self {
             data,
+            shared: None,
+            limits,
+            length_resolver: None,
+        }
+    }
+
+    /// Parse against shared file storage. Larger streams retain checked views
+    /// of `data`; very short streams copy to avoid range-allocation overhead.
+    /// The parser itself only borrows the Arc.
+    /// [`Self::new`] continues to copy streams from borrowed slices.
+    pub fn new_shared(data: &'a Arc<[u8]>, limits: &'a ParseLimits) -> Self {
+        Self {
+            data,
+            shared: Some(data),
             limits,
             length_resolver: None,
         }
@@ -75,14 +96,16 @@ impl<'a> ObjectParser<'a> {
         // can follow ref-to-ref chains.
         let obj = lex.maybe_resolve_ref(obj)?;
 
-        // Check if this is a stream object
+        // A stream takes ownership of its already parsed dictionary. Cloning it
+        // here would allocate another BTreeMap (and every nested value) only to
+        // drop the original immediately afterward.
         lex.skip_whitespace_and_comments();
-        if let PdfObject::Dict(dict) = &obj {
-            if self.starts_with_at(lex.pos(), b"stream") {
-                let stream = self.read_stream(dict.clone(), lex.pos())?;
-                return Ok((id, PdfObject::Stream(stream)));
+        let obj = match obj {
+            PdfObject::Dict(dict) if self.starts_with_at(lex.pos(), b"stream") => {
+                PdfObject::Stream(self.read_stream(dict, lex.pos())?)
             }
-        }
+            other => other,
+        };
 
         Ok((id, obj))
     }
@@ -152,7 +175,12 @@ impl<'a> ObjectParser<'a> {
 
         Ok(PdfStream {
             dict,
-            data: Arc::from(&self.data[pos..end]),
+            data: match self.shared {
+                Some(bytes) if end - pos > SMALL_STREAM_BYTES => {
+                    PdfStreamData::from_shared(Arc::clone(bytes), pos..end)?
+                }
+                _ => PdfStreamData::from(&self.data[pos..end]),
+            },
         })
     }
 
@@ -208,6 +236,97 @@ impl<'a> ObjectParser<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_parser_preserves_borrowed_results_and_range_boundaries() {
+        let inputs: &[&[u8]] = &[
+            b"1 0 obj << /Length 3 >> stream\nABC\nendstream endobj",
+            b"1 0 obj << /Length 99 >> stream\r\nABC\r\nendstream endobj",
+            b"1 0 obj << /Length -1 >> stream\nABC\nendstream endobj",
+            b"1 0 obj << /Length 2 0 R >> stream\nABC\r\nendstream endobj",
+            b"1 0 obj << /Length 0 >> stream\nendstream endobj",
+            b"1 0 obj << /Length 3 >> stream\nAB",
+            b"1 0 obj << /Length 40 >> stream\n0123456789012345678901234567890123456789\nendstream endobj",
+        ];
+        for input in inputs {
+            for max_stream_bytes in [0, 2, 3, 4, 128] {
+                let limits = ParseLimits {
+                    max_stream_bytes,
+                    ..Default::default()
+                };
+                let bytes: Arc<[u8]> = Arc::from(*input);
+                let resolve = |id: ObjectId| (id == ObjectId(2, 0)).then_some(4);
+                let borrowed = ObjectParser::new(input, &limits)
+                    .with_length_resolver(&resolve)
+                    .parse_indirect_with_id(0);
+                let shared = ObjectParser::new_shared(&bytes, &limits)
+                    .with_length_resolver(&resolve)
+                    .parse_indirect_with_id(0);
+                match (borrowed, shared) {
+                    (Ok(a), Ok(b)) => {
+                        assert_eq!(a, b);
+                        let data = &b.1.as_stream().unwrap().data;
+                        if data.len() > SMALL_STREAM_BYTES {
+                            let offset = data.as_ptr() as usize - bytes.as_ptr() as usize;
+                            assert_eq!(
+                                bytes.get(offset..offset + data.len()),
+                                Some(data.as_slice())
+                            );
+                        }
+                    }
+                    (Err(a), Err(b)) => assert_eq!(a.to_string(), b.to_string()),
+                    other => panic!("borrowed/shared mismatch: {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shared_stream_outlives_parser_and_detaches_from_file() {
+        let bytes: Arc<[u8]> = Arc::from(
+            b"1 0 obj << /Length 40 >> stream\n0123456789012345678901234567890123456789\nendstream"
+                .as_slice(),
+        );
+        let weak = Arc::downgrade(&bytes);
+        let limits = ParseLimits::default();
+        let obj = ObjectParser::new_shared(&bytes, &limits)
+            .parse_indirect_at(0)
+            .unwrap();
+        drop(bytes);
+        assert!(weak.upgrade().is_some());
+        let PdfObject::Stream(mut stream) = obj else {
+            panic!("stream")
+        };
+        stream.data = stream.data.into_detached();
+        assert!(weak.upgrade().is_none());
+        assert_eq!(
+            stream.data.as_slice(),
+            b"0123456789012345678901234567890123456789"
+        );
+    }
+
+    #[test]
+    fn tiny_streams_do_not_retain_shared_file_storage() {
+        for len in [0, 1, SMALL_STREAM_BYTES, SMALL_STREAM_BYTES + 1] {
+            let payload = "A".repeat(len);
+            let bytes: Arc<[u8]> =
+                format!("1 0 obj << /Length {len} >> stream\n{payload}\nendstream")
+                    .into_bytes()
+                    .into();
+            let weak = Arc::downgrade(&bytes);
+            let object = ObjectParser::new_shared(&bytes, &ParseLimits::default())
+                .parse_indirect_at(0)
+                .unwrap();
+            drop(bytes);
+            assert_eq!(weak.upgrade().is_some(), len > SMALL_STREAM_BYTES);
+            assert_eq!(
+                object.as_stream().unwrap().data.as_slice(),
+                payload.as_bytes()
+            );
+            drop(object);
+            assert!(weak.upgrade().is_none());
+        }
+    }
 
     #[test]
     fn indirect_length_keeps_a_final_cr_data_byte() {

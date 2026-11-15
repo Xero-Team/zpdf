@@ -1,0 +1,405 @@
+[
+  {
+    "case": "raw-large",
+    "pairs": 31,
+    "time_percent": -99.3,
+    "interval": [
+      -99.3,
+      -99.29
+    ],
+    "baseline_ns": 137349,
+    "current_ns": 962,
+    "peak_bytes": [
+      8391576,
+      3000
+    ],
+    "retained_bytes": [
+      8391576,
+      3000
+    ],
+    "allocations": [
+      31,
+      26
+    ],
+    "object_size": [
+      48,
+      48
+    ],
+    "stream_size": [
+      40,
+      40
+    ]
+  },
+  {
+    "case": "small-streams",
+    "pairs": 31,
+    "time_percent": -5.96,
+    "interval": [
+      -6.26,
+      -5.47
+    ],
+    "baseline_ns": 414767,
+    "current_ns": 391258,
+    "peak_bytes": [
+      2042696,
+      1944392
+    ],
+    "retained_bytes": [
+      2042696,
+      1944392
+    ],
+    "allocations": [
+      10286,
+      7212
+    ],
+    "object_size": [
+      48,
+      48
+    ],
+    "stream_size": [
+      40,
+      40
+    ]
+  },
+  {
+    "case": "tiny-streams",
+    "pairs": 31,
+    "time_percent": -6.45,
+    "interval": [
+      -6.66,
+      -6.21
+    ],
+    "baseline_ns": 407985,
+    "current_ns": 384556,
+    "peak_bytes": [
+      1919816,
+      1919816
+    ],
+    "retained_bytes": [
+      1919816,
+      1919816
+    ],
+    "allocations": [
+      10286,
+      7212
+    ],
+    "object_size": [
+      48,
+      48
+    ],
+    "stream_size": [
+      40,
+      40
+    ]
+  },
+  {
+    "case": "scalar-objects",
+    "pairs": 31,
+    "time_percent": -17.5,
+    "interval": [
+      -18.45,
+      -16.86
+    ],
+    "baseline_ns": 518939,
+    "current_ns": 426223,
+    "peak_bytes": [
+      1687372,
+      1687372
+    ],
+    "retained_bytes": [
+      1687372,
+      1687372
+    ],
+    "allocations": [
+      3636,
+      3120
+    ],
+    "object_size": [
+      48,
+      48
+    ],
+    "stream_size": [
+      40,
+      40
+    ]
+  },
+  {
+    "case": "cold-open",
+    "pairs": 31,
+    "time_percent": -4.04,
+    "interval": [
+      -4.54,
+      -3.65
+    ],
+    "baseline_ns": 744,
+    "current_ns": 715,
+    "peak_bytes": [
+      1967,
+      1965
+    ],
+    "retained_bytes": [
+      1136,
+      1136
+    ],
+    "allocations": [
+      19,
+      17
+    ],
+    "object_size": [
+      48,
+      48
+    ],
+    "stream_size": [
+      40,
+      40
+    ]
+  },
+  {
+    "case": "warm-read",
+    "pairs": 31,
+    "time_percent": -0.94,
+    "interval": [
+      -1.78,
+      -0.51
+    ],
+    "baseline_ns": 1388,
+    "current_ns": 1375,
+    "peak_bytes": [
+      27584,
+      27584
+    ],
+    "retained_bytes": [
+      27584,
+      27584
+    ],
+    "allocations": [
+      65,
+      65
+    ],
+    "object_size": [
+      48,
+      48
+    ],
+    "stream_size": [
+      40,
+      40
+    ]
+  },
+  {
+    "case": "no-cache",
+    "pairs": 31,
+    "time_percent": -99.35,
+    "interval": [
+      -99.36,
+      -99.34
+    ],
+    "baseline_ns": 137543,
+    "current_ns": 897,
+    "peak_bytes": [
+      8391436,
+      2046
+    ],
+    "retained_bytes": [
+      8390622,
+      2046
+    ],
+    "allocations": [
+      27,
+      22
+    ],
+    "object_size": [
+      48,
+      48
+    ],
+    "stream_size": [
+      40,
+      40
+    ]
+  },
+  {
+    "case": "recovery",
+    "pairs": 31,
+    "time_percent": -12.92,
+    "interval": [
+      -13.51,
+      -12.01
+    ],
+    "baseline_ns": 3280181,
+    "current_ns": 2867412,
+    "peak_bytes": [
+      8391464,
+      2888
+    ],
+    "retained_bytes": [
+      8391464,
+      2888
+    ],
+    "allocations": [
+      116,
+      102
+    ],
+    "object_size": [
+      48,
+      48
+    ],
+    "stream_size": [
+      40,
+      40
+    ]
+  },
+  {
+    "case": "encrypted",
+    "pairs": 31,
+    "time_percent": -1.98,
+    "interval": [
+      -2.12,
+      -1.76
+    ],
+    "baseline_ns": 1807663,
+    "current_ns": 1772167,
+    "peak_bytes": [
+      6294772,
+      4197652
+    ],
+    "retained_bytes": [
+      2101330,
+      2101330
+    ],
+    "allocations": [
+      288,
+      278
+    ],
+    "object_size": [
+      48,
+      48
+    ],
+    "stream_size": [
+      40,
+      40
+    ]
+  },
+  {
+    "case": "imports",
+    "pairs": 31,
+    "time_percent": -0.22,
+    "interval": [
+      -0.43,
+      0.06
+    ],
+    "baseline_ns": 578044,
+    "current_ns": 577033,
+    "peak_bytes": [
+      8402213,
+      8402213
+    ],
+    "retained_bytes": [
+      14510,
+      14510
+    ],
+    "allocations": [
+      1306,
+      1264
+    ],
+    "object_size": [
+      48,
+      48
+    ],
+    "stream_size": [
+      40,
+      40
+    ]
+  },
+  {
+    "case": "pipeline",
+    "pairs": 31,
+    "time_percent": -1.57,
+    "interval": [
+      -2.29,
+      1.46
+    ],
+    "baseline_ns": 126624,
+    "current_ns": 124590,
+    "peak_bytes": [
+      83933,
+      83133
+    ],
+    "retained_bytes": [
+      65536,
+      65536
+    ],
+    "allocations": [
+      418,
+      411
+    ],
+    "object_size": [
+      48,
+      48
+    ],
+    "stream_size": [
+      40,
+      40
+    ]
+  },
+  {
+    "case": "owned-streams",
+    "pairs": 31,
+    "time_percent": -27.98,
+    "interval": [
+      -28.73,
+      -27.48
+    ],
+    "baseline_ns": 26235,
+    "current_ns": 18875,
+    "peak_bytes": [
+      196736,
+      196736
+    ],
+    "retained_bytes": [
+      196608,
+      196608
+    ],
+    "allocations": [
+      2049,
+      2049
+    ],
+    "object_size": [
+      48,
+      48
+    ],
+    "stream_size": [
+      40,
+      40
+    ]
+  },
+  {
+    "case": "borrowed-parse",
+    "pairs": 31,
+    "time_percent": -29.5,
+    "interval": [
+      -29.93,
+      -29.2
+    ],
+    "baseline_ns": 138,
+    "current_ns": 97,
+    "peak_bytes": [
+      1772,
+      958
+    ],
+    "retained_bytes": [
+      958,
+      958
+    ],
+    "allocations": [
+      7,
+      4
+    ],
+    "object_size": [
+      48,
+      48
+    ],
+    "stream_size": [
+      40,
+      40
+    ]
+  }
+]

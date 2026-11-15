@@ -385,15 +385,11 @@ impl<'a> Lexer<'a> {
         if let PdfObject::Integer(num) = obj {
             let saved = self.pos;
             self.skip_whitespace_and_comments();
-            if let Ok(PdfObject::Integer(gen)) = self.read_number_if_available() {
-                self.skip_whitespace_and_comments();
-                if self.peek() == Some(b'R') {
-                    self.pos += 1;
-                    if let (Ok(num), Ok(gen)) = (u32::try_from(num), u16::try_from(gen)) {
-                        return Ok(PdfObject::Ref(ObjectId(num, gen)));
-                    }
-                    return Ok(PdfObject::Null);
+            if let Some(gen) = self.read_reference_generation() {
+                if let (Ok(num), Ok(gen)) = (u32::try_from(num), u16::try_from(gen)) {
+                    return Ok(PdfObject::Ref(ObjectId(num, gen)));
                 }
+                return Ok(PdfObject::Null);
             }
             self.pos = saved;
             Ok(PdfObject::Integer(num))
@@ -402,12 +398,29 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    fn read_number_if_available(&mut self) -> Result<PdfObject> {
-        if matches!(self.peek(), Some(b'0'..=b'9' | b'+' | b'-' | b'.')) {
-            self.read_number()
-        } else {
-            Err(Error::InvalidObject(self.pos as u64, "not a number".into()))
+    // ISO 32000-1, 7.3.10: the generation in N G R must be an integer.
+    // Scan its spelling first, and convert it only when R follows. Numeric
+    // arrays otherwise parse almost every number twice. Non-reference lookahead
+    // is normal; its caller restores the position without allocating an error.
+    fn read_reference_generation(&mut self) -> Option<i64> {
+        let start = self.pos;
+        if matches!(self.peek(), Some(b'+' | b'-')) {
+            self.pos += 1;
         }
+        while matches!(self.peek(), Some(b'0'..=b'9')) {
+            self.pos += 1;
+        }
+        let end = self.pos;
+        self.skip_whitespace_and_comments();
+        if self.peek() != Some(b'R') {
+            return None;
+        }
+        let generation = std::str::from_utf8(self.data.get(start..end)?)
+            .ok()?
+            .parse::<i64>()
+            .ok()?;
+        self.pos += 1;
+        Some(generation)
     }
 }
 
@@ -572,6 +585,67 @@ mod tests {
         let mut lex = Lexer::new(b"[12 0 R]", 0, &l);
         let obj = lex.next_token().unwrap();
         assert_eq!(obj, PdfObject::Array(vec![PdfObject::Ref(ObjectId(12, 0))]));
+    }
+
+    #[test]
+    fn reference_lookahead_matches_previous_numeric_parser_and_position() {
+        // Keep the former speculative numeric parse as an independent oracle:
+        // malformed, real and overflowing generations must still rewind, while
+        // a valid i64 outside the object-id range consumes R and becomes Null.
+        fn previous(lex: &mut Lexer<'_>, num: i64) -> PdfObject {
+            let saved = lex.pos;
+            lex.skip_whitespace_and_comments();
+            if matches!(lex.peek(), Some(b'0'..=b'9' | b'+' | b'-' | b'.')) {
+                if let Ok(PdfObject::Integer(gen)) = lex.read_number() {
+                    lex.skip_whitespace_and_comments();
+                    if lex.peek() == Some(b'R') {
+                        lex.pos += 1;
+                        return match (u32::try_from(num), u16::try_from(gen)) {
+                            (Ok(num), Ok(gen)) => PdfObject::Ref(ObjectId(num, gen)),
+                            _ => PdfObject::Null,
+                        };
+                    }
+                }
+            }
+            lex.pos = saved;
+            PdfObject::Integer(num)
+        }
+
+        let limits = lim();
+        for num in [-1, 0, 12, u32::MAX as i64, u32::MAX as i64 + 1, i64::MAX] {
+            for separator in [" ", "% lookahead\r\n", "\0\t"] {
+                for generation in [
+                    "",
+                    "0",
+                    "0001",
+                    "+2",
+                    "-1",
+                    "65535",
+                    "65536",
+                    "2147483648",
+                    "9223372036854775807",
+                    "9223372036854775808",
+                    "-9223372036854775809",
+                    "0.0",
+                    "-.5",
+                    "+",
+                    "-",
+                    "1..",
+                    "1e2",
+                    "abc",
+                    "１２",
+                ] {
+                    for suffix in [" R", "R", "% comment\nR", " ", "]", " Rtail"] {
+                        let input = format!("{separator}{generation}{suffix}");
+                        let mut old = Lexer::new(input.as_bytes(), 0, &limits);
+                        let expected = previous(&mut old, num);
+                        let mut new = Lexer::new(input.as_bytes(), 0, &limits);
+                        let actual = new.maybe_resolve_ref(PdfObject::Integer(num)).unwrap();
+                        assert_eq!((actual, new.pos), (expected, old.pos), "{num}, {input:?}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]

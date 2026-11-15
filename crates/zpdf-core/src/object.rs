@@ -1,9 +1,8 @@
 use std::borrow::Borrow;
 use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::Arc;
 
-use crate::{Error, Rect, Result};
+use crate::{Error, PdfStreamData, Rect, Result};
 
 /// Indirect object identifier: (object number, generation number).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -180,10 +179,13 @@ impl Default for PdfDict {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PdfStream {
     pub dict: PdfDict,
-    pub data: Arc<[u8]>,
+    /// Encoded bytes, possibly sharing their source file. Cloning does not copy
+    /// the payload. Use [`PdfStreamData::into_detached`] to release file backing.
+    pub data: PdfStreamData,
 }
 
 impl PdfStream {
+    #[inline]
     pub fn new(dict: PdfDict, data: Vec<u8>) -> Self {
         Self {
             dict,

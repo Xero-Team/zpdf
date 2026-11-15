@@ -4,6 +4,7 @@ mod error;
 mod geometry;
 mod limits;
 mod object;
+mod stream_data;
 mod text_string;
 pub mod time;
 
@@ -13,4 +14,5 @@ pub use error::{Error, Result};
 pub use geometry::{Matrix, Point, Rect};
 pub use limits::ParseLimits;
 pub use object::{ObjectId, PdfDict, PdfName, PdfObject, PdfStream, PdfString};
+pub use stream_data::PdfStreamData;
 pub use text_string::{decode_text_string, encode_text_string};

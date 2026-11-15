@@ -48,6 +48,8 @@ serde_json = "1"
 
 [dev-dependencies]
 criterion = "0.8"
+# Direct borrowed-parser control for the shared-stream storage comparison.
+zpdf-parser.workspace = true
 # Page-level parallelism for the `batch` bench. A dev-dependency on purpose: the
 # measurement decides whether page-level parallelism is worth building into the
 # CLI, and no library crate should take a threading dependency before that
