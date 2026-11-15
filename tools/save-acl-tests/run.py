@@ -42,11 +42,21 @@ if sys.platform.startswith("freebsd"):
     Path(env["TMPDIR"]).mkdir()
     env["LD_LIBRARY_PATH"] = "/usr/local/lib"
 
+# Darwin's hosted runner shares its uid with background services. RLIMIT_NPROC
+# counts those too; reserve a bounded allowance above the existing baseline.
+process_limit = 128
+if sys.platform == "darwin":
+    users = subprocess.check_output(
+        ["/bin/ps", "-axo", "uid="], text=True,
+        env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"}, timeout=5,
+    )
+    process_limit += sum(int(uid) == os.geteuid() for uid in users.split())
+
 
 def limits():
     for kind, value in [
         (resource.RLIMIT_CPU, 120),
-        (resource.RLIMIT_NPROC, 128),
+        (resource.RLIMIT_NPROC, process_limit),
         (resource.RLIMIT_NOFILE, 256),
         (resource.RLIMIT_FSIZE, 128 * 1024**2),
         (resource.RLIMIT_CORE, 0),
@@ -81,9 +91,12 @@ def run(command):
                         ["/bin/ps", "-axo", "pgid=,rss="], text=True,
                         env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"}, timeout=5,
                     )
-                    resident_kib = sum(int(rss) for group, rss in
-                                       (line.split() for line in listing.splitlines())
-                                       if int(group) == process.pid)
+                    members = [int(rss) for group, rss in
+                               (line.split() for line in listing.splitlines())
+                               if int(group) == process.pid]
+                    if len(members) > 128:
+                        raise RuntimeError("native ACL process group exceeded 128 processes")
+                    resident_kib = sum(members)
                     if resident_kib > 4 * 1024**2:
                         raise RuntimeError("native ACL process group exceeded 4 GiB RSS")
     finally:

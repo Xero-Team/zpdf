@@ -28,7 +28,9 @@ plus three 64 MiB UFS volumes. Each child has CPU, process, descriptor and file-
 limits, a 180-second deadline, and process-group cleanup. FreeBSD uses a 4 GiB
 address-space limit in a two-CPU, 4 GiB VM. Darwin rejects address-space limits:
 the parent monitors aggregate process-group RSS with a 4 GiB kill threshold,
-in addition to the hosted VM's memory bound. Tests use dummy ACL principals and no
+in addition to the hosted VM's memory bound. Darwin's per-user process limit
+reserves 128 slots above the runner's existing service processes; the parent
+also enforces a 128-process limit on the tested process group. Tests use dummy ACL principals and no
 repository secrets; checkout does not persist credentials.
 
 These checks establish native save-policy behavior on the listed OS/filesystem
