@@ -2,30 +2,46 @@
 
 ## Unreleased
 
+## 0.20.0 — Shared stream storage and lower pipeline memory
+
+Released 2026-11-16.
+
+### Compatibility
+
+- **Breaking:** replace `PdfStream.data: Arc<[u8]>` with `PdfStreamData`.
+  Parse raw streams as checked views of immutable file storage; detach payloads
+  at cross-document copy boundaries. See the
+  [migration guide](https://github.com/Xero-Team/zpdf/blob/v0.20.0/docs/guides/shared-stream-migration.md)
+  for conversions and source lifetime rules. Keep conservative stream-cache
+  admission charges. (#144, #145)
+
+### Performance and APIs
+
 - Reduce read-path allocations: reconstruct PNG predictor rows in final output,
   borrow content operators internally, reuse cached object trees on read paths,
-  and add shared decoded-stream access while retaining the owned APIs. (#148)
+  and add shared decoded-stream access while retaining the owned APIs. (#148, #149)
 - Convert eligible opaque Gray/RGB scans by row when minifying to the requested
-  footprint, preserving exact box-filter pixels and existing cache budgets. (#148)
+  footprint, preserving exact box-filter pixels and existing cache budgets. (#148, #149)
 - Open WASM readers/editors without an intermediate Rust file buffer; add native
-  `IncrementalWriter::from_shared` constructors for existing `Arc<[u8]>` input. (#148)
-- **Breaking, next 0.x minor:** replace `PdfStream.data: Arc<[u8]>` with
-  `PdfStreamData`. Parse raw streams as checked views of immutable file storage;
-  detach payloads at cross-document copy boundaries. See the
-  [migration guide](guides/shared-stream-migration.md) for conversions and source
-  lifetime rules. Keep conservative stream-cache admission charges. (#144)
+  `IncrementalWriter::from_shared` constructors for existing `Arc<[u8]>` input. (#148, #149)
+- Reuse compact page-content buffers and reconstruct TIFF predictor samples in
+  place, reducing transient copies without changing output or decode limits. (#143)
+- Add `PageBitmap.into_rgba()` to transfer WASM raster pixels without cloning
+  them inside Rust; retain `rgba()` and update the browser demo and package. (#143)
+
+### Correctness and validation
+
 - Serialize stream replacements through the stream writer, including encryption,
   when using `IncrementalWriter::overwrite_object`. Honor explicit crypt filters,
-  attachment filters and unencrypted metadata/xref payloads on write. (#144)
+  attachment filters and unencrypted metadata/xref payloads on write. (#144, #145)
 - Honor object-stream containers' own crypt filters when reopening encrypted
   updates. Share ordinary-stream decryption policy, borrow Identity payloads and
-  avoid decrypting compressed member strings twice. (#144)
+  avoid decrypting compressed member strings twice. (#144, #145)
 - Reap completed macOS ACL test children before retrying a zombie-group signal;
   retain failures for live-process signal denials and always close output pipes.
-- Reuse compact page-content buffers and reconstruct TIFF predictor samples in
-  place, reducing transient copies without changing output or decode limits.
-- Add `PageBitmap.into_rgba()` to transfer WASM raster pixels without cloning
-  them inside Rust; retain `rgba()` and update the browser demo and package.
+- Preserve reproducible allocation and memory measurements, including the
+  archived historical pipeline probe and its build/run instructions. (#149)
+- Rebuild the shipped WASM/JS package and source/artifact fingerprint for 0.20.0.
 
 ## 0.19.0 — Redaction hardening and native save validation
 
