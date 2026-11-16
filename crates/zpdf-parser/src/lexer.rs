@@ -458,7 +458,15 @@ fn decode_name(raw: &[u8]) -> String {
         result.push(raw[i]);
         i += 1;
     }
-    String::from_utf8_lossy(&result).into_owned()
+    match String::from_utf8_lossy(&result) {
+        std::borrow::Cow::Borrowed(name) => name.to_owned(),
+        std::borrow::Cow::Owned(mut name) => {
+            // Replacement characters can leave growth slack. Dictionary keys
+            // are immutable once inserted, so compact them before sharing.
+            name.shrink_to_fit();
+            name
+        }
+    }
 }
 
 #[cfg(test)]

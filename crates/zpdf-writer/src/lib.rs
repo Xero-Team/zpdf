@@ -138,8 +138,18 @@ impl IncrementalWriter {
     /// New and modified objects written by the update are encrypted with the
     /// document's existing encryption key, as §7.5.6 requires.
     pub fn new_with_password(original: Vec<u8>, password: &[u8]) -> Result<Self> {
-        let original_arc: Arc<[u8]> = original.into();
-        let doc = PdfDocument::open_with_password(original_arc, password)?;
+        Self::from_shared_with_password(original.into(), password)
+    }
+
+    /// Open immutable shared file bytes without an intermediate Vec copy.
+    pub fn from_shared(original: Arc<[u8]>) -> Result<Self> {
+        Self::from_shared_with_password(original, b"")
+    }
+
+    /// Like [`Self::from_shared`], with the document's user or owner password.
+    /// The writer keeps the original bytes immutable, including ciphertext.
+    pub fn from_shared_with_password(original: Arc<[u8]>, password: &[u8]) -> Result<Self> {
+        let doc = PdfDocument::open_with_password(original, password)?;
         if doc.is_encrypted() && doc.file().decryptor().is_none() {
             return Err(unsupported(
                 "cannot update an encrypted document whose key was not recovered \

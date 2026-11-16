@@ -163,15 +163,24 @@ fn overwritten_object_stream_honors_crypt_filters() {
                             Some(XrefEntry::Compressed { .. })
                         ));
                         if container_first {
-                            assert_eq!(file.resolve_stream_data(CONTAINER).unwrap(), PAYLOAD);
+                            assert_eq!(
+                                file.resolve_stream_data_shared(CONTAINER).unwrap().as_ref(),
+                                PAYLOAD
+                            );
                         }
                         for _ in 0..2 {
                             let member = file.resolve(MEMBER).unwrap_or_else(|error| {
                                 panic!("compressed member: {:?}, filter={filter:?}, flate={flate}, cached={cached}, container_first={container_first}: {error}", config.algorithm)
                             });
                             assert_eq!(member, expected_member());
+                            assert_eq!(*file.resolve_shared(MEMBER).unwrap(), expected_member());
                         }
                         assert_eq!(file.resolve_stream_data(CONTAINER).unwrap(), PAYLOAD);
+                        assert_eq!(
+                            file.resolve_stream_data_shared(CONTAINER).unwrap().as_ref(),
+                            PAYLOAD
+                        );
+                        assert_eq!(file.data(), output);
                     }
                 }
             }

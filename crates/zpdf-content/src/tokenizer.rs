@@ -13,6 +13,27 @@ pub enum ContentToken {
     },
 }
 
+/// Internal tokens borrow ordinary ASCII operators from the input. The owned
+/// public token API remains available for callers that retain tokens.
+pub(crate) enum BorrowedContentToken<'a> {
+    Operand(PdfObject),
+    Operator(std::borrow::Cow<'a, str>),
+    InlineImage {
+        dict: zpdf_core::PdfDict,
+        data: Vec<u8>,
+    },
+}
+
+impl BorrowedContentToken<'_> {
+    fn into_owned(self) -> ContentToken {
+        match self {
+            Self::Operand(obj) => ContentToken::Operand(obj),
+            Self::Operator(op) => ContentToken::Operator(op.into_owned()),
+            Self::InlineImage { dict, data } => ContentToken::InlineImage { dict, data },
+        }
+    }
+}
+
 /// Maximum array/dict nesting depth in a content stream. Real content is shallow;
 /// this only exists to bound recursion so adversarial deeply-nested input cannot
 /// overflow the native stack.
@@ -105,6 +126,26 @@ impl<'a> ContentTokenizer<'a> {
     }
 
     pub fn next_token(&mut self) -> Option<ContentToken> {
+        self.next_borrowed().map(BorrowedContentToken::into_owned)
+    }
+
+    /// Iterator recovery semantics, also used by the interpreter's borrowed path.
+    pub(crate) fn next_borrowed_recovering(&mut self) -> Option<BorrowedContentToken<'a>> {
+        loop {
+            let before = self.pos;
+            if let Some(token) = self.next_borrowed() {
+                return Some(token);
+            }
+            if self.is_eof() {
+                return None;
+            }
+            if self.pos == before {
+                self.pos += 1;
+            }
+        }
+    }
+
+    pub(crate) fn next_borrowed(&mut self) -> Option<BorrowedContentToken<'a>> {
         self.skip_whitespace();
 
         if self.is_eof() {
@@ -116,46 +157,46 @@ impl<'a> ContentTokenizer<'a> {
         match b {
             b'0'..=b'9' | b'+' | b'-' | b'.' => {
                 let obj = self.read_number();
-                Some(ContentToken::Operand(obj))
+                Some(BorrowedContentToken::Operand(obj))
             }
             b'/' => {
                 let name = self.read_name();
-                Some(ContentToken::Operand(PdfObject::Name(name)))
+                Some(BorrowedContentToken::Operand(PdfObject::Name(name)))
             }
             b'(' => {
                 let s = self.read_literal_string();
-                Some(ContentToken::Operand(PdfObject::String(s)))
+                Some(BorrowedContentToken::Operand(PdfObject::String(s)))
             }
             b'<' => {
                 if self.data.get(self.pos + 1) == Some(&b'<') {
-                    Some(ContentToken::Operand(self.read_dict()))
+                    Some(BorrowedContentToken::Operand(self.read_dict()))
                 } else {
                     let s = self.read_hex_string();
-                    Some(ContentToken::Operand(PdfObject::String(s)))
+                    Some(BorrowedContentToken::Operand(PdfObject::String(s)))
                 }
             }
             b'[' => {
                 let arr = self.read_array();
-                Some(ContentToken::Operand(PdfObject::Array(arr)))
+                Some(BorrowedContentToken::Operand(PdfObject::Array(arr)))
             }
             b't' if self.starts_keyword(b"true") => {
                 self.pos += 4;
-                Some(ContentToken::Operand(PdfObject::Bool(true)))
+                Some(BorrowedContentToken::Operand(PdfObject::Bool(true)))
             }
             b'f' if self.starts_keyword(b"false") => {
                 self.pos += 5;
-                Some(ContentToken::Operand(PdfObject::Bool(false)))
+                Some(BorrowedContentToken::Operand(PdfObject::Bool(false)))
             }
             b'n' if self.starts_keyword(b"null") => {
                 self.pos += 4;
-                Some(ContentToken::Operand(PdfObject::Null))
+                Some(BorrowedContentToken::Operand(PdfObject::Null))
             }
             _ if b.is_ascii_alphabetic() || b == b'\'' || b == b'"' || b == b'*' => {
                 let op = self.read_operator();
                 if op == "BI" {
                     return Some(self.read_inline_image());
                 }
-                Some(ContentToken::Operator(op))
+                Some(BorrowedContentToken::Operator(op))
             }
             _ => {
                 self.malformed();
@@ -341,7 +382,7 @@ impl<'a> ContentTokenizer<'a> {
                 self.malformed();
                 break;
             }
-            if let Some(ContentToken::Operand(obj)) = self.next_token() {
+            if let Some(BorrowedContentToken::Operand(obj)) = self.next_borrowed() {
                 if self.retain_slot() {
                     items.push(obj);
                 }
@@ -375,14 +416,14 @@ impl<'a> ContentTokenizer<'a> {
                 // A dictionary key must be a name. Consume one malformed token
                 // and keep looking instead of manufacturing a key from it.
                 let before = self.pos;
-                let _ = self.next_token();
+                let _ = self.next_borrowed();
                 if self.pos == before {
                     self.pos += 1;
                 }
                 continue;
             }
             let key = self.read_name();
-            if let Some(ContentToken::Operand(val)) = self.next_token() {
+            if let Some(BorrowedContentToken::Operand(val)) = self.next_borrowed() {
                 if self.retain_slot() {
                     dict.insert(key, val);
                 }
@@ -392,7 +433,7 @@ impl<'a> ContentTokenizer<'a> {
         PdfObject::Dict(dict)
     }
 
-    fn read_operator(&mut self) -> String {
+    fn read_operator(&mut self) -> std::borrow::Cow<'a, str> {
         let start = self.pos;
         while let Some(b) = self.peek() {
             if is_whitespace(b) || is_delimiter(b) {
@@ -406,12 +447,12 @@ impl<'a> ContentTokenizer<'a> {
         let end = start
             .saturating_add(MAX_CONTENT_OPERATOR_BYTES)
             .min(self.pos);
-        String::from_utf8_lossy(&self.data[start..end]).into_owned()
+        String::from_utf8_lossy(&self.data[start..end])
     }
 
     /// Parse the body of an inline image after the `BI` operator: the parameter
     /// pairs up to `ID`, then the raw sample bytes up to `EI`.
-    fn read_inline_image(&mut self) -> ContentToken {
+    fn read_inline_image(&mut self) -> BorrowedContentToken<'a> {
         let mut dict = zpdf_core::PdfDict::new();
 
         // Parameter key/value pairs, terminated by the `ID` operator.
@@ -419,7 +460,7 @@ impl<'a> ContentTokenizer<'a> {
             self.skip_whitespace();
             if self.is_eof() {
                 self.malformed();
-                return ContentToken::InlineImage {
+                return BorrowedContentToken::InlineImage {
                     dict,
                     data: Vec::new(),
                 };
@@ -427,7 +468,7 @@ impl<'a> ContentTokenizer<'a> {
             if self.peek() == Some(b'/') {
                 let key = self.read_name();
                 self.skip_whitespace();
-                if let Some(ContentToken::Operand(val)) = self.next_token() {
+                if let Some(BorrowedContentToken::Operand(val)) = self.next_borrowed() {
                     if self.retain_slot() {
                         dict.insert(key, val);
                     }
@@ -449,7 +490,7 @@ impl<'a> ContentTokenizer<'a> {
                     if self.data[self.pos..].starts_with(b"EI") {
                         self.pos += 2;
                     }
-                    return ContentToken::InlineImage {
+                    return BorrowedContentToken::InlineImage {
                         dict,
                         data: Vec::new(),
                     };
@@ -477,7 +518,7 @@ impl<'a> ContentTokenizer<'a> {
             self.malformed();
         }
 
-        ContentToken::InlineImage { dict, data }
+        BorrowedContentToken::InlineImage { dict, data }
     }
 
     /// Determine where the inline-image sample data ends. For uncompressed data
@@ -568,22 +609,11 @@ fn inline_image_components(dict: &zpdf_core::PdfDict) -> Option<usize> {
     }
 }
 
-impl<'a> Iterator for ContentTokenizer<'a> {
+impl Iterator for ContentTokenizer<'_> {
     type Item = ContentToken;
-
     fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            let before = self.pos;
-            if let Some(token) = self.next_token() {
-                return Some(token);
-            }
-            if self.is_eof() {
-                return None;
-            }
-            if self.pos == before {
-                self.pos += 1;
-            }
-        }
+        self.next_borrowed_recovering()
+            .map(BorrowedContentToken::into_owned)
     }
 }
 
@@ -638,6 +668,48 @@ fn is_delimiter(b: u8) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn borrowed_iteration_recovers_past_stray_delimiters() {
+        let mut tokenizer = super::ContentTokenizer::new(b"] q ) Q }");
+        let mut ops = Vec::new();
+        while let Some(token) = tokenizer.next_borrowed_recovering() {
+            if let super::BorrowedContentToken::Operator(op) = token {
+                ops.push(op.into_owned());
+            }
+        }
+        assert_eq!(ops, ["q", "Q"]);
+        assert_eq!(tokenizer.diagnostics().malformed_content, 3);
+    }
+    #[test]
+    fn borrowed_operators_keep_input_and_lossy_diagnostics() {
+        use super::*;
+        let data = b"q Q Tj T* ' \" bogus\xff";
+        let mut t = ContentTokenizer::new(data);
+        for expected in ["q", "Q", "Tj", "T*", "'", "\""] {
+            let Some(BorrowedContentToken::Operator(op)) = t.next_borrowed() else {
+                panic!("operator");
+            };
+            assert!(matches!(&op, std::borrow::Cow::Borrowed(_)));
+            assert_eq!(op, expected);
+            assert!(
+                (data.as_ptr() as usize..data.as_ptr() as usize + data.len())
+                    .contains(&(op.as_ptr() as usize))
+            );
+        }
+        let Some(BorrowedContentToken::Operator(op)) = t.next_borrowed() else {
+            panic!("lossy operator");
+        };
+        assert_eq!(op, "bogus\u{fffd}");
+        assert!(matches!(op, std::borrow::Cow::Owned(_)));
+        let long = vec![b'x'; MAX_CONTENT_OPERATOR_BYTES + 17];
+        let mut t = ContentTokenizer::new(&long);
+        let Some(BorrowedContentToken::Operator(op)) = t.next_borrowed() else {
+            panic!("long operator");
+        };
+        assert_eq!(op.len(), MAX_CONTENT_OPERATOR_BYTES);
+        assert!(t.diagnostics().resource_limit_reached);
+        assert!(t.next_borrowed().is_none());
+    }
     use super::*;
 
     #[test]

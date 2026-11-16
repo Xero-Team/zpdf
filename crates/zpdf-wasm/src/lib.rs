@@ -123,7 +123,7 @@ impl Pdf {
     }
     /// Open a PDF from bytes (empty-password encrypted files open too).
     pub fn open(data: &[u8]) -> Result<Pdf, JsError> {
-        let doc = zpdf::PdfDocument::open(data.to_vec()).map_err(js_err)?;
+        let doc = zpdf::PdfDocument::open(data).map_err(js_err)?;
         Ok(Pdf {
             doc,
             icc: zpdf::IccCache::new(),
@@ -132,8 +132,8 @@ impl Pdf {
 
     /// Open an encrypted PDF with a user or owner password.
     pub fn open_with_password(data: &[u8], password: &str) -> Result<Pdf, JsError> {
-        let doc = zpdf::PdfDocument::open_with_password(data.to_vec(), password.as_bytes())
-            .map_err(js_err)?;
+        let doc =
+            zpdf::PdfDocument::open_with_password(data, password.as_bytes()).map_err(js_err)?;
         Ok(Pdf {
             doc,
             icc: zpdf::IccCache::new(),
@@ -382,7 +382,7 @@ impl PdfEditor {
     }
     /// Open a PDF for editing (empty-password encrypted files open too).
     pub fn open(data: &[u8]) -> Result<PdfEditor, JsError> {
-        let writer = zpdf_writer::IncrementalWriter::new(data.to_vec()).map_err(js_err)?;
+        let writer = zpdf_writer::IncrementalWriter::from_shared(data.into()).map_err(js_err)?;
         Ok(PdfEditor {
             writer,
             requires_rewrite: false,
@@ -391,9 +391,11 @@ impl PdfEditor {
 
     /// Open an encrypted PDF with a user or owner password.
     pub fn open_with_password(data: &[u8], password: &str) -> Result<PdfEditor, JsError> {
-        let writer =
-            zpdf_writer::IncrementalWriter::new_with_password(data.to_vec(), password.as_bytes())
-                .map_err(js_err)?;
+        let writer = zpdf_writer::IncrementalWriter::from_shared_with_password(
+            data.into(),
+            password.as_bytes(),
+        )
+        .map_err(js_err)?;
         Ok(PdfEditor {
             writer,
             requires_rewrite: false,
@@ -843,7 +845,7 @@ impl PdfEditor {
 /// Extract selected (0-based) pages into a fresh self-contained PDF.
 #[wasm_bindgen]
 pub fn split_pages(data: &[u8], pages: Vec<usize>) -> Result<Vec<u8>, JsError> {
-    let file = zpdf::PdfFile::parse(data.to_vec()).map_err(js_err)?;
+    let file = zpdf::PdfFile::parse(data).map_err(js_err)?;
     zpdf_writer::extract_pages(&file, &pages).map_err(js_err)
 }
 
@@ -880,7 +882,7 @@ impl Default for OptimizeOptions {
 /// round — they need more option types; use the native facade for those.)
 #[wasm_bindgen]
 pub fn optimize(data: &[u8], opts: OptimizeOptions) -> Result<Vec<u8>, JsError> {
-    let file = zpdf::PdfFile::parse(data.to_vec()).map_err(js_err)?;
+    let file = zpdf::PdfFile::parse(data).map_err(js_err)?;
     if opts.linearize {
         zpdf_writer::linearize_pdf(&file).map_err(js_err)
     } else {
