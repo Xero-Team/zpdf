@@ -254,7 +254,14 @@
     "samples_per_process": 11,
     "iterations": 256,
     "order": "AB/BA alternating per pair",
-    "purpose": "Diagnose measure-2 pipeline regression; retain original binaries and compare new stage probes without production source changes."
+    "purpose": "Diagnose measure-2 pipeline regression; retain original binaries and compare new stage probes without production source changes.",
+    "cases": [
+      "pipeline-original",
+      "pipeline",
+      "pipeline-interpret",
+      "pipeline-render"
+    ],
+    "pipeline_original_producer": "archive/pipeline-original.json"
   },
   "wasm-plan.json": {
     "pairs": 31,

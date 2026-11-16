@@ -308,10 +308,57 @@
           "zpdf_wasm_bg.wasm": "c0103a52ca9b54bb332d48910960a116717146abe57c577d93b910df6e5a62a1"
         }
       }
+    },
+    "repro-original-baseline": {
+      "source_snapshot_sha256": "8f8e4df528ca27c0e437f2b6c8527f5624d00dd1edab5a172256fb0add7bc6a5",
+      "image_id": "sha256:ea15510f04ded2c73682c87d70aa8d0e8697c7feb2b0aebf626e92ed29f93fde",
+      "limits": {
+        "network": "none",
+        "cpus": 2,
+        "memory_bytes": 5368709120,
+        "pids": 192,
+        "file_bytes": 536870912,
+        "scratch_bytes": 3670016000,
+        "wall_seconds": 900,
+        "cpu_seconds": 1100
+      },
+      "exit_code": 0,
+      "elapsed_seconds": 16.086,
+      "promoted": [
+        {
+          "name": "original-repro.json",
+          "sha256": "382e53ee907fc80b8817fd5f1f3b86962223d573ec2d36c4d93b87ff2cb9cf49",
+          "bytes": 331
+        }
+      ]
+    },
+    "repro-original-current": {
+      "source_snapshot_sha256": "d3026106e64df960d8a71a2a719e245b69403fa8a259dbfee2c7829294279611",
+      "image_id": "sha256:ea15510f04ded2c73682c87d70aa8d0e8697c7feb2b0aebf626e92ed29f93fde",
+      "limits": {
+        "network": "none",
+        "cpus": 2,
+        "memory_bytes": 5368709120,
+        "pids": 192,
+        "file_bytes": 536870912,
+        "scratch_bytes": 3670016000,
+        "wall_seconds": 900,
+        "cpu_seconds": 1100
+      },
+      "exit_code": 0,
+      "elapsed_seconds": 16.164,
+      "promoted": [
+        {
+          "name": "original-repro.json",
+          "sha256": "a89f59e1f2b3cbe1ed487807e0d1401113a1599ff630f816619cd0ff68108b02",
+          "bytes": 330
+        }
+      ]
     }
   },
   "notes": [
     "native-final-1: all targeted tests passed; Clippy flagged an RGB index loop. native-final-2 uses explicit channel accumulation and passes image tests and all selected Clippy targets.",
     "The original pipeline control counted verification-buffer growth. Corrected only in measure-3; earlier results remain separate."
-  ]
+  ],
+  "historical_probe_producer": "archive/pipeline-original.json"
 }

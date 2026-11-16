@@ -74,6 +74,51 @@ tracking and retains separate stage controls. This corrects the measurement;
 it is not claimed as a renderer code optimization. Earlier aggregate timings
 are not pooled with the corrected measurements.
 
+### Producer of `pipeline-original`
+
+`pipeline-original` identifies the saved **measure-2** `pipeline` executable.
+The collector invoked its supported CLI case `pipeline 256`, then changed only
+its output `case` field to `pipeline-original` and added `pair`/`variant`.
+Each invocation still produced 11 samples. The probe ran 31 AB/BA alternating
+pairs. This timed operation includes interpretation, CPU rendering and the old
+verification append; the separate stage cases measure their respective stages.
+The live harness uses the corrected operation, so it intentionally has no
+`pipeline-original` alias.
+
+The exact pre-commit `format-5` harness snapshot is archived as
+[`archive/read_memory-measure-2.rs`](archive/read_memory-measure-2.rs).
+[`archive/pipeline-original.json`](archive/pipeline-original.json) records its
+SHA-256, production revisions, original executable hashes, commands, relabeling
+and byte-identical rebuild verification for both variants.
+
+In separate isolated checkouts of baseline `8945e3a0152bf40c568bf33fca38d1b359163876`
+and candidate `53ee92c4ba8b2f1f407e304d6b85bd01e08b10c6`, copy that same archived
+harness and dependency lock. For binary identity, use the recorded image/compiler
+and `/scratch/source` working directory with `/scratch/target` as target directory.
+`EVIDENCE_DIR` below points to this PR's report, outside the checkout being built:
+
+```sh
+cp "$EVIDENCE_DIR/archive/read_memory-measure-2.rs" crates/zpdf-benches/examples/read_memory.rs
+cp "$EVIDENCE_DIR/dependencies.lock" Cargo.lock
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/scratch/target \
+  cargo build --offline --locked -p zpdf-benches --release --example read_memory
+```
+
+Save each resulting executable under its variant path and run the exact probe
+commands in alternating order for each pair:
+
+```sh
+/scratch/measure2/baseline/read_memory pipeline 256
+/scratch/measure2/current/read_memory pipeline 256
+```
+
+The collector's metadata-only relabeling was:
+
+```python
+row = json.loads(subprocess.check_output(command, text=True, timeout=120))
+row.update(case="pipeline-original", pair=pair, variant=variant)
+```
+
 ## Final native results
 
 `measure-3`, corrected harness; negative time changes are faster.
