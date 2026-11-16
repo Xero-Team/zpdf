@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Reduce read-path allocations: reconstruct PNG predictor rows in final output,
+  borrow content operators internally, reuse cached object trees on read paths,
+  and add shared decoded-stream access while retaining the owned APIs. (#148)
+- Convert eligible opaque Gray/RGB scans by row when minifying to the requested
+  footprint, preserving exact box-filter pixels and existing cache budgets. (#148)
+- Open WASM readers/editors without an intermediate Rust file buffer; add native
+  `IncrementalWriter::from_shared` constructors for existing `Arc<[u8]>` input. (#148)
 - **Breaking, next 0.x minor:** replace `PdfStream.data: Arc<[u8]>` with
   `PdfStreamData`. Parse raw streams as checked views of immutable file storage;
   detach payloads at cross-document copy boundaries. See the

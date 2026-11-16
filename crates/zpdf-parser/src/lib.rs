@@ -1,6 +1,8 @@
 mod ccitt;
 mod crypt;
 pub use crypt::Decryptor;
+mod decoded_stream;
+pub use decoded_stream::DecodedStreamData;
 pub mod filters;
 mod header;
 mod jbig2;
@@ -217,15 +219,38 @@ impl PdfFile {
     /// it — for callers that only read a large object, such as a page-tree
     /// node's `/Kids`, once per page.
     pub fn resolve_shared(&self, id: zpdf_core::ObjectId) -> Result<Arc<PdfObject>> {
+        self.resolve_shared_depth(id, 0)
+    }
+
+    fn resolve_shared_depth(&self, id: ObjectId, depth: u32) -> Result<Arc<PdfObject>> {
+        // Same bound and null result as owned resolution, including ref cycles.
+        if depth > 32 {
+            tracing::warn!("indirect reference chain longer than 32 at {id}; treating as null");
+            return Ok(Arc::new(PdfObject::Null));
+        }
         if let Some(obj) = self.object_cache.borrow().get(&id) {
             return Ok(Arc::clone(obj));
         }
-        let obj = self.resolve_depth(id, 0)?;
-        // `resolve_depth` cached it unless the cache budget is spent.
-        if let Some(cached) = self.object_cache.borrow().get(&id) {
-            return Ok(Arc::clone(cached));
+        let mut obj = match self.resolve_unfollowed(id)? {
+            PdfObject::Ref(next) => self.resolve_shared_depth(next, depth + 1)?,
+            obj => Arc::new(obj),
+        };
+        // Move the parsed tree into its Arc once. Owned resolve retains its
+        // existing fast path and callers can still mutate their independent copy.
+        let cost = estimate_cached_object_bytes(&obj);
+        let used = self.object_cache_bytes.get();
+        if cost <= self.limits.max_object_cache_bytes.saturating_sub(used)
+            && !self.object_cache.borrow().contains_key(&id)
+        {
+            // Compact only admitted cold objects, as the former cached clone
+            // did. Uncached reads keep their original allocation behavior.
+            if let Some(parsed) = Arc::get_mut(&mut obj) {
+                compact_shared_object(parsed);
+            }
+            self.object_cache.borrow_mut().insert(id, Arc::clone(&obj));
+            self.object_cache_bytes.set(used.saturating_add(cost));
         }
-        Ok(Arc::new(obj))
+        Ok(obj)
     }
 
     /// Resolve one indirect object without following a reference stored as its
@@ -436,6 +461,32 @@ impl PdfFile {
         self.resolve_stream_data_inner(id, true, &self.limits)
     }
 
+    /// Decode a stream, sharing unchanged bytes and moving decoded output.
+    /// Shared views may retain this PDF's backing storage after it is dropped.
+    pub fn resolve_stream_data_shared(&self, id: ObjectId) -> Result<DecodedStreamData> {
+        self.resolve_stream_data_shared_with_limit(id, self.limits.max_decoded_stream_bytes)
+    }
+
+    /// Like [`Self::resolve_stream_data_shared`], with a tightened decoded limit.
+    pub fn resolve_stream_data_shared_with_limit(
+        &self,
+        id: ObjectId,
+        max_decoded_bytes: u64,
+    ) -> Result<DecodedStreamData> {
+        let mut limits = self.limits.clone();
+        limits.max_decoded_stream_bytes = limits.max_decoded_stream_bytes.min(max_decoded_bytes);
+        let obj = self.resolve_shared(id)?;
+        let stream = obj.as_stream()?;
+        let resolved = self.dict_with_resolved_filters(&stream.dict, true, &limits)?;
+        let dict = resolved.as_ref().unwrap_or(&stream.dict);
+        Ok(
+            match filters::decode_stream_borrowed_with_limits(&stream.data, dict, &limits)? {
+                std::borrow::Cow::Borrowed(_) => DecodedStreamData::Shared(stream.data.clone()),
+                std::borrow::Cow::Owned(bytes) => DecodedStreamData::Owned(bytes),
+            },
+        )
+    }
+
     /// Decode with an additional output allowance, for callers accumulating
     /// several decoded streams. This can only tighten the document's existing
     /// filter-chain budget; raw-stream and other parser limits are unchanged.
@@ -455,7 +506,7 @@ impl PdfFile {
         inline_globals: bool,
         limits: &ParseLimits,
     ) -> Result<Vec<u8>> {
-        let obj = self.resolve(id)?;
+        let obj = self.resolve_shared(id)?;
         self.decode_resolved_stream(obj.as_stream()?, inline_globals, limits)
     }
 
@@ -856,6 +907,34 @@ fn estimate_cached_object_bytes(obj: &PdfObject) -> u64 {
     ENTRY_OVERHEAD.saturating_add(object_bytes(obj))
 }
 
+// The old cold shared path retained a deep clone, which compacted Vec buffers.
+// Moving parsed objects directly must not retain their geometric-growth slack
+// or undercut the existing length-based cache charges. Parser depth limits
+// already bound this tree, just as they bound the cache estimator.
+fn compact_shared_object(obj: &mut PdfObject) {
+    match obj {
+        PdfObject::String(s) => s.0.shrink_to_fit(),
+        PdfObject::Name(n) => n.0.shrink_to_fit(),
+        PdfObject::Array(items) => {
+            items.shrink_to_fit();
+            for item in items {
+                compact_shared_object(item);
+            }
+        }
+        PdfObject::Dict(dict) => {
+            for value in dict.0.values_mut() {
+                compact_shared_object(value);
+            }
+        }
+        PdfObject::Stream(stream) => {
+            for value in stream.dict.0.values_mut() {
+                compact_shared_object(value);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn estimate_objstm_bytes(stream: &DecodedObjStm) -> u64 {
     const ENTRY_OVERHEAD: u64 = 64;
     ENTRY_OVERHEAD
@@ -1060,6 +1139,105 @@ mod tests {
         let b = file.resolve_shared(ObjectId(1, 0)).unwrap();
         assert!(Arc::ptr_eq(&a, &b));
         assert_eq!(*a, file.resolve(ObjectId(1, 0)).unwrap());
+    }
+
+    #[test]
+    fn shared_resolution_preserves_owned_isolation_and_alias_limits() {
+        let pdf = build_pdf(
+            &[
+                (1, "<< /Type /Catalog >>"),
+                (2, "3 0 R"),
+                (3, "<< /Items [(original!) 42] /Bad#FF /Bad#FF >>"),
+                (4, "5 0 R"),
+                (5, "4 0 R"),
+            ],
+            1,
+        );
+        for max_object_cache_bytes in [0, 1 << 20] {
+            let limits = ParseLimits {
+                max_object_cache_bytes,
+                ..Default::default()
+            };
+            let file = PdfFile::parse_with_limits(pdf.clone(), limits).unwrap();
+            let shared = file.resolve_shared(ObjectId(2, 0)).unwrap();
+            let items = shared
+                .as_dict()
+                .unwrap()
+                .get("Items")
+                .unwrap()
+                .as_array()
+                .unwrap();
+            assert_eq!(items.len(), 2);
+            match shared.as_dict().unwrap().get("Items").unwrap() {
+                PdfObject::Array(values) if max_object_cache_bytes > 0 => {
+                    assert_eq!(values.capacity(), values.len());
+                    if let PdfObject::String(value) = &values[0] {
+                        assert_eq!(value.0.capacity(), value.0.len());
+                    }
+                }
+                _ => {}
+            }
+            for name in shared.as_dict().unwrap().0.keys() {
+                assert_eq!(name.0.capacity(), name.0.len());
+            }
+            let mut owned = file.resolve(ObjectId(2, 0)).unwrap();
+            if let PdfObject::Dict(dict) = &mut owned {
+                dict.insert(PdfName::new("Items"), PdfObject::Null);
+            }
+            assert!(matches!(
+                shared.as_dict().unwrap().get("Items"),
+                Some(PdfObject::Array(_))
+            ));
+            assert_eq!(
+                *file.resolve_shared(ObjectId(4, 0)).unwrap(),
+                PdfObject::Null
+            );
+            assert!(file.object_cache_bytes.get() <= max_object_cache_bytes);
+            assert_eq!(*shared, file.resolve(ObjectId(3, 0)).unwrap());
+        }
+    }
+
+    #[test]
+    fn shared_decode_lifetime_limits_and_owned_output() {
+        let payload = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef";
+        let stream = format!(
+            "<< /Length {} >>\nstream\n{}\nendstream",
+            payload.len(),
+            payload
+        );
+        let bytes: Arc<[u8]> = build_pdf(
+            &[
+                (1, "<< /Type /Catalog >>"),
+                (2, &stream),
+                (
+                    3,
+                    "<< /Length 7 /Filter /ASCIIHexDecode >>\nstream\n414243>\nendstream",
+                ),
+            ],
+            1,
+        )
+        .into();
+        let weak = Arc::downgrade(&bytes);
+        let file = PdfFile::parse(bytes).unwrap();
+        let view = file.resolve_stream_data_shared(ObjectId(2, 0)).unwrap();
+        assert!(matches!(&view, DecodedStreamData::Shared(_)));
+        assert_eq!(&*view, payload.as_bytes());
+        let original = file.resolve_shared(ObjectId(2, 0)).unwrap();
+        assert_eq!(view.as_ptr(), original.as_stream().unwrap().data.as_ptr());
+        assert!(file
+            .resolve_stream_data_shared_with_limit(ObjectId(2, 0), 1)
+            .is_err());
+        let decoded = file.resolve_stream_data_shared(ObjectId(3, 0)).unwrap();
+        assert!(matches!(&decoded, DecodedStreamData::Owned(_)));
+        let ptr = decoded.as_ptr();
+        let moved = decoded.into_vec();
+        assert_eq!(ptr, moved.as_ptr());
+        assert_eq!(moved, b"ABC");
+        drop(original);
+        drop(file);
+        assert!(weak.upgrade().is_some());
+        assert_eq!(view.into_vec(), payload.as_bytes());
+        assert!(weak.upgrade().is_none());
     }
 
     #[test]

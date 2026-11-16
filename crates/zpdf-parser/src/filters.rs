@@ -38,6 +38,17 @@ pub fn decode_stream_with_limits(
     dict: &PdfDict,
     limits: &ParseLimits,
 ) -> Result<Vec<u8>> {
+    decode_stream_borrowed_with_limits(data, dict, limits).map(std::borrow::Cow::into_owned)
+}
+
+/// Decode while borrowing unchanged input (no filters, Crypt-only, or JPX
+/// passthrough). All filter and cumulative-output limits still apply. A caller
+/// retaining the result must also retain its input, or call `into_owned()`.
+pub fn decode_stream_borrowed_with_limits<'a>(
+    data: &'a [u8],
+    dict: &PdfDict,
+    limits: &ParseLimits,
+) -> Result<std::borrow::Cow<'a, [u8]>> {
     let filters = match dict.get("Filter") {
         Some(PdfObject::Name(n)) => vec![n.clone()],
         Some(PdfObject::Array(arr)) => arr
@@ -60,7 +71,7 @@ pub fn decode_stream_with_limits(
             if data.len() as u64 > limits.max_decoded_stream_bytes {
                 return Err(Error::StreamSizeLimit(limits.max_decoded_stream_bytes));
             }
-            return Ok(data.to_vec());
+            return Ok(std::borrow::Cow::Borrowed(data));
         }
     };
 
@@ -83,13 +94,20 @@ pub fn decode_stream_with_limits(
         let params = decode_parms[i].as_ref();
 
         // Apply filter to current data
-        let decoded = apply_filter(filter, &current, params, limits, &mut budget)?;
+        let decoded = if filter.as_str() == "JPXDecode" {
+            // The image decoder, not this byte pipeline, decodes JPX. Keep its
+            // codestream in place, but charge the same filter-chain budget.
+            budget.reserve(current.len() as u64)?;
+            current
+        } else {
+            std::borrow::Cow::Owned(apply_filter(filter, &current, params, limits, &mut budget)?)
+        };
 
         // Apply predictor if specified
-        current = std::borrow::Cow::Owned(if let Some(p) = params {
+        current = if let Some(p) = params {
             let predictor = p.get_i64("Predictor").unwrap_or(1);
             if predictor == 2 || predictor >= 10 {
-                apply_predictor(decoded, p, &mut budget)?
+                std::borrow::Cow::Owned(apply_predictor(decoded.into_owned(), p, &mut budget)?)
             } else {
                 // Predictor 1 (and unknown values) is a no-op. Keep ownership of
                 // the filter output instead of cloning the entire stream.
@@ -97,7 +115,7 @@ pub fn decode_stream_with_limits(
             }
         } else {
             decoded
-        });
+        };
     }
 
     // An empty /Filter array or a chain containing only /Crypt applies no
@@ -107,7 +125,7 @@ pub fn decode_stream_with_limits(
         return Err(Error::StreamSizeLimit(limits.max_decoded_stream_bytes));
     }
 
-    Ok(current.into_owned())
+    Ok(current)
 }
 
 /// Decode a PDF stream through its filter chain using default limits.
@@ -295,7 +313,7 @@ fn decode_png_predictor(
     // one, which can outgrow the input.
     budget.reserve(output_size.saturating_sub(data.len()) as u64)?;
     let mut output = Vec::with_capacity(output_size);
-    let mut prev_row = vec![0u8; row_bytes];
+    let first_row = vec![0u8; row_bytes];
 
     let mut pos = 0;
     while pos < data.len() {
@@ -305,7 +323,16 @@ fn decode_png_predictor(
         let available = (data.len() - pos).min(row_bytes);
         let cur = &data[pos..pos + available];
 
-        let mut row = vec![0u8; row_bytes];
+        // Reconstruct directly in the final output. The preceding output row
+        // is already decoded, so no per-row allocation or history copy is needed.
+        let start = output.len();
+        output.resize(start + row_bytes, 0);
+        let (previous, row) = output.split_at_mut(start);
+        let prev_row = if previous.is_empty() {
+            &first_row[..]
+        } else {
+            &previous[start - row_bytes..]
+        };
         row[..available].copy_from_slice(cur);
 
         match filter_type {
@@ -348,8 +375,6 @@ fn decode_png_predictor(
             }
         }
 
-        output.extend_from_slice(&row);
-        prev_row.copy_from_slice(&row);
         pos += available;
     }
 
@@ -1592,5 +1617,54 @@ mod tests {
             ..ParseLimits::default()
         };
         assert!(decode_stream_with_limits(b"four", &dict, &limits).is_err());
+    }
+}
+
+#[cfg(test)]
+mod png_reference_tests;
+
+#[cfg(test)]
+mod borrowed_tests {
+    use super::*;
+    use std::borrow::Cow;
+
+    #[test]
+    fn passthrough_borrows_and_still_charges_limits() {
+        let data = b"opaque codestream";
+        for filter in [None, Some("Crypt"), Some("JPXDecode"), Some("")] {
+            let mut dict = PdfDict::new();
+            if let Some(name) = filter {
+                dict.insert(
+                    PdfName::new("Filter"),
+                    if name.is_empty() {
+                        PdfObject::Array(vec![])
+                    } else {
+                        PdfObject::Name(PdfName::new(name))
+                    },
+                );
+            }
+            let mut limits = ParseLimits::default();
+            let decoded = decode_stream_borrowed_with_limits(data, &dict, &limits).unwrap();
+            assert!(matches!(decoded, Cow::Borrowed(bytes) if bytes.as_ptr() == data.as_ptr()));
+            limits.max_decoded_stream_bytes = data.len() as u64 - 1;
+            assert!(decode_stream_borrowed_with_limits(data, &dict, &limits).is_err());
+        }
+        let mut dict = PdfDict::new();
+        dict.insert(
+            PdfName::new("Filter"),
+            PdfObject::Array(vec![
+                PdfObject::Name(PdfName::new("ASCIIHexDecode")),
+                PdfObject::Name(PdfName::new("JPXDecode")),
+            ]),
+        );
+        let mut limits = ParseLimits {
+            max_decoded_stream_bytes: 7,
+            ..Default::default()
+        };
+        assert!(
+            matches!(decode_stream_borrowed_with_limits(b"414243>", &dict, &limits).unwrap(), Cow::Owned(bytes) if bytes == b"ABC")
+        );
+        limits.max_decoded_stream_bytes = 6;
+        assert!(decode_stream_borrowed_with_limits(b"414243>", &dict, &limits).is_err());
     }
 }

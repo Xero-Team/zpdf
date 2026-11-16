@@ -34,7 +34,7 @@ pub use zpdf_font::{
     FontProviderLimits, RegisteredFontId, RegisteredFontPackId, RegisteredGlyph,
 };
 pub use zpdf_image::{DecodedImage, ImageCache};
-pub use zpdf_parser::PdfFile;
+pub use zpdf_parser::{DecodedStreamData, PdfFile};
 pub use zpdf_render::{RenderBackend, StageStats};
 pub use zpdf_writer::{
     copy_object_graph, extract_pages, rewrite_pdf, AnnotationSpec, FormFiller, IncrementalWriter,

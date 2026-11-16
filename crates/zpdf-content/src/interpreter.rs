@@ -11,7 +11,7 @@ use zpdf_parser::PdfFile;
 use crate::stats::InterpretStats;
 use crate::tables::RuleLine;
 use crate::text::TextSpan;
-use crate::tokenizer::{ContentToken, ContentTokenizer};
+use crate::tokenizer::{BorrowedContentToken as ContentToken, ContentTokenizer};
 
 /// Cached CMYK→RGB conversion entry
 type CmykCacheEntry = ([f64; 4], (f64, f64, f64));
@@ -1110,7 +1110,7 @@ impl<'a> ContentInterpreter<'a> {
         }
         let mut tokenizer = ContentTokenizer::new(content);
 
-        for token in tokenizer.by_ref() {
+        while let Some(token) = tokenizer.next_borrowed_recovering() {
             if self.over_budget() {
                 tracing::warn!(
                     "content exceeded {} display commands; truncating page",
@@ -3366,7 +3366,7 @@ impl<'a> ContentInterpreter<'a> {
             }
         };
 
-        let obj = match file.resolve(gs_id) {
+        let obj = match file.resolve_shared(gs_id) {
             Ok(o) => o,
             Err(e) => {
                 self.stats.diagnostics.record_decode_failure(&e);
@@ -3375,8 +3375,7 @@ impl<'a> ContentInterpreter<'a> {
         };
 
         if let Ok(dict) = obj.as_dict() {
-            let dict = dict.clone();
-            self.apply_ext_gstate_dict(&dict, Some(gs_id));
+            self.apply_ext_gstate_dict(dict, Some(gs_id));
         }
     }
 
@@ -3726,7 +3725,7 @@ impl<'a> ContentInterpreter<'a> {
             }
         };
 
-        let obj = match file.resolve(xobj_id) {
+        let obj = match file.resolve_shared(xobj_id) {
             Ok(o) => o,
             Err(e) => {
                 self.stats.diagnostics.record_object_failure(xobj_id, &e);
@@ -3824,7 +3823,7 @@ impl<'a> ContentInterpreter<'a> {
             None => return,
         };
 
-        let decoded_data = match file.resolve_stream_data(obj_id) {
+        let decoded_data = match file.resolve_stream_data_shared(obj_id) {
             Ok(d) => d,
             Err(e) => {
                 self.stats.diagnostics.record_object_failure(obj_id, &e);
@@ -3863,6 +3862,50 @@ impl<'a> ContentInterpreter<'a> {
         );
         let colorspace = self.colormanage_cmyk_image(colorspace);
         let smask_ref = stream.dict.get_ref("SMask").ok();
+        // On the first minified draw, opaque Gray/RGB scans need only one
+        // converted source row, not a full-resolution RGBA allocation. Later
+        // sizes retain the existing two-decode/source-retention policy.
+        if self.image_downscale_scale > 0.0 && !self.image_sources.contains_key(&obj_id) {
+            match zpdf_image::decode_scan_at_footprint(
+                &decoded_data,
+                &image_dict,
+                colorspace.as_ref(),
+                &transform,
+                self.image_downscale_scale,
+                &self.parse_limits,
+            ) {
+                Ok(Some(scan)) => {
+                    let size = (scan.image.width, scan.image.height);
+                    self.image_sources.insert(
+                        obj_id,
+                        ImageSource {
+                            width: scan.source_width,
+                            height: scan.source_height,
+                            bytes: rgba_bytes((scan.source_width, scan.source_height)),
+                            intent,
+                            decodes: 1,
+                            filtered_bytes: 0,
+                            unfiltered: false,
+                            retained: None,
+                        },
+                    );
+                    let bytes = scan.image.data.capacity() as u64;
+                    if let Some(image_id) = self.cache_filtered(obj_id, size, scan.image) {
+                        self.emit_image_draw(image_id, transform, false);
+                    } else {
+                        self.warn_image_dropped(bytes);
+                        self.rejected_image_objects.insert(obj_id);
+                    }
+                    return;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    self.stats.diagnostics.record_object_failure(obj_id, &e);
+                    tracing::warn!("failed to decode scan: {e}");
+                    return;
+                }
+            }
+        }
         // A soft mask's `/Matte` is a colour in this space.
         let matte_colorspace = smask_ref.and_then(|_| colorspace.clone());
         let mut image = match zpdf_image::decode_image_xobject_resolved_with_limits(
@@ -4183,16 +4226,18 @@ impl<'a> ContentInterpreter<'a> {
         {
             return;
         }
-        let decoded =
-            match zpdf_parser::filters::decode_stream_with_limits(&data, &norm, &self.parse_limits)
-            {
-                Ok(d) => d,
-                Err(e) => {
-                    self.stats.diagnostics.record_decode_failure(&e);
-                    tracing::warn!("inline image: filter decode failed: {e}");
-                    return;
-                }
-            };
+        let decoded = match zpdf_parser::filters::decode_stream_borrowed_with_limits(
+            &data,
+            &norm,
+            &self.parse_limits,
+        ) {
+            Ok(d) => d,
+            Err(e) => {
+                self.stats.diagnostics.record_decode_failure(&e);
+                tracing::warn!("inline image: filter decode failed: {e}");
+                return;
+            }
+        };
         // An inline-image /CS naming a non-device space refers to a
         // /ColorSpace resource; substitute the resolved object.
         if let Some(PdfObject::Name(n)) = norm.get("ColorSpace") {
@@ -4452,7 +4497,7 @@ impl<'a> ContentInterpreter<'a> {
         // with the form.
         let outer_clip = self.pending_clip.take();
         let mut tokenizer = ContentTokenizer::new(&decoded);
-        for token in tokenizer.by_ref() {
+        while let Some(token) = tokenizer.next_borrowed_recovering() {
             if self.over_budget() {
                 break;
             }
@@ -5260,7 +5305,7 @@ impl<'a> ContentInterpreter<'a> {
                 // it; one the cell leaves unpainted ends with the cell.
                 let outer_clip = self.pending_clip.take();
                 let mut tokenizer = ContentTokenizer::new(&def.content);
-                for token in tokenizer.by_ref() {
+                while let Some(token) = tokenizer.next_borrowed_recovering() {
                     if self.over_budget() {
                         break;
                     }
@@ -6707,7 +6752,7 @@ fn fold_soft_mask(
     limits: &ParseLimits,
     diagnostics: &mut zpdf_core::ProcessingDiagnostics,
 ) {
-    let obj = match file.resolve(smask_ref) {
+    let obj = match file.resolve_shared(smask_ref) {
         Ok(o) => o,
         Err(e) => {
             diagnostics.record_decode_failure(&e);
@@ -6721,7 +6766,7 @@ fn fold_soft_mask(
             return;
         }
     };
-    let data = match file.resolve_stream_data(smask_ref) {
+    let data = match file.resolve_stream_data_shared(smask_ref) {
         Ok(d) => d,
         Err(e) => {
             diagnostics.record_decode_failure(&e);
@@ -6762,7 +6807,7 @@ fn fold_stencil_mask(
     limits: &ParseLimits,
     diagnostics: &mut zpdf_core::ProcessingDiagnostics,
 ) {
-    let obj = match file.resolve(mask_ref) {
+    let obj = match file.resolve_shared(mask_ref) {
         Ok(o) => o,
         Err(e) => {
             diagnostics.record_decode_failure(&e);
@@ -6771,13 +6816,13 @@ fn fold_stencil_mask(
     };
     let stream = match obj.as_stream() {
         Ok(s) => s,
-        Err(_) if matches!(obj, PdfObject::Array(_)) => return,
+        Err(_) if matches!(*obj, PdfObject::Array(_)) => return,
         Err(e) => {
             diagnostics.record_decode_failure(&e);
             return;
         }
     };
-    let data = match file.resolve_stream_data(mask_ref) {
+    let data = match file.resolve_stream_data_shared(mask_ref) {
         Ok(d) => d,
         Err(e) => {
             diagnostics.record_decode_failure(&e);

@@ -4,6 +4,8 @@ use zpdf_core::{Error, ParseLimits, PdfDict, PdfObject, Result};
 
 mod footprint;
 pub use footprint::{box_downscale, box_downscale_rgba, box_filter_size};
+mod scan;
+pub use scan::{decode_scan_at_footprint, FootprintScan};
 
 pub type ImageId = u32;
 
