@@ -1,6 +1,7 @@
 # Migrating shared stream storage
 
-This change is intended for the next **0.x minor release**, not a 0.19.x patch.
+Starting with **0.20.0**, shared stream storage introduces a source compatibility
+change from 0.19.x.
 `PdfStream.data` changes from `Arc<[u8]>` to `PdfStreamData`, exported by both
 `zpdf_core` and `zpdf`. Exhaustive struct literals and Arc-specific operations
 need updating. The representation of `PdfStreamData` is private.
