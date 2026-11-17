@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Re-export `InkAnnotDict` and `InkAnnotationBuilder` from the `zpdf` facade.
+- Add `TextSpan::glyphs` and public `TextGlyph` selection cells, UTF-8 cluster
+  ranges, origins and advance vectors, captured alongside rendering positions.
+  Search uses glyph bounds for unequal widths, spacing, transformed text and
+  vertical metrics; ligatures and `/ActualText` retain whole-cluster geometry.
+  `TextSpan::glyph_at` supports point selection against transformed cells.
+- Rebuild the browser WASM package and source fingerprint for the updated
+  text-extraction implementation.
+- **Source compatibility:** exhaustive `TextSpan` literals must add
+  `glyphs: Vec::new()` or use the new `..TextSpan::default()`. Empty glyph lists
+  retain the existing approximate search geometry.
+
 ## 0.20.0 — Shared stream storage and lower pipeline memory
 
 Released 2026-11-16.

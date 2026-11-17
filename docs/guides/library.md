@@ -154,8 +154,41 @@ let text = spans_to_text(spans, 2.0); // line-merge tolerance (pt-relative)
 println!("{text}");
 ```
 
-Each `TextSpan` carries the decoded text plus its position and size, so you can build
-your own layout/extraction logic instead of using `spans_to_text`.
+Each `TextSpan` carries the decoded text, position, size and a `glyphs` list.
+Keep the spans before consuming them with `spans_to_text` to implement selection
+or search:
+
+```rust
+// `point` is in PDF user space (y-up), after undoing the viewer's page transform.
+let point = zpdf::Point::new(100.0, 200.0);
+for span in &spans {
+    if let Some(glyph) = span.glyph_at(point) {
+        let selected = &span.text[glyph.text_range.clone()];
+        println!("{selected}: {:?}", glyph.quad);
+    }
+}
+let hits = zpdf::search_spans(&spans, "search text", false);
+```
+
+Each `TextGlyph` has a UTF-8 **byte range** into its span, a page-space origin,
+an advance vector, and a four-corner selection cell (`quad`). `bounds()` gives
+its axis-aligned rectangle; `contains(point)` tests the actual cell, including
+rotation, shear and reflection. Positions include character/word spacing,
+`TJ` adjustments, horizontal scaling, text rise and vertical-writing metrics.
+The advance vector excludes spacing. Cell widths come from the PDF glyph
+advances; heights use the font's ascent/descent (or an em-based fallback),
+not tight outline ink bounds. This also makes spaces selectable.
+
+Unicode characters are not always individual glyphs: a ligature's characters
+share one cell; an unmapped glyph has an empty range. `/ActualText` maps all
+replaced glyphs to the entire replacement string, since it does not specify
+individual character placement. `search_spans` uses these glyph/cluster bounds
+instead of dividing a span evenly. Its existing baseline-based line grouping
+and character offsets in `SearchHit` are unchanged.
+
+Glyph geometry is collected only with `with_text_sink`; ordinary rendering does
+not allocate it. For manually constructed spans, set `glyphs: Vec::new()` or use
+`..TextSpan::default()` to retain the approximate advance-based search behavior.
 
 ## Converting a document
 

@@ -1053,15 +1053,7 @@ impl LoadedFont {
                     let raw_code = bytes[start..i.min(bytes.len())]
                         .iter()
                         .fold(0u32, |value, &byte| (value << 8) | byte as u32);
-                    if let Some(s) = self
-                        .to_unicode
-                        .as_ref()
-                        .and_then(|tu| tu.lookup(raw_code).or_else(|| tu.lookup(code)))
-                    {
-                        out.push_str(s);
-                    } else if let Some(value) = cm.decode_text(code, len as u8) {
-                        value.push_to(&mut out);
-                    }
+                    self.append_decoded_code(code, len as u8, raw_code, &mut out);
                 }
                 return out;
             }
@@ -1077,35 +1069,52 @@ impl LoadedFont {
                 for &b in chunk {
                     code = (code << 8) | b as u32;
                 }
-                if let Some(tu) = &self.to_unicode {
-                    if let Some(s) = tu.lookup(code) {
-                        out.push_str(s);
-                    }
-                }
+                self.append_decoded_code(code, chunk.len() as u8, code, &mut out);
             }
         } else {
             for &b in bytes {
-                let code = b as u32;
-                if let Some(tu) = &self.to_unicode {
-                    if let Some(s) = tu.lookup(code) {
-                        out.push_str(s);
-                        continue;
-                    }
-                }
-                if let Some(enc) = &self.encoding {
-                    if let Some(name) = enc.glyph_name(b) {
-                        if let Some(s) = glyph_list::glyph_name_to_string(name) {
-                            out.push_str(&s);
-                            continue;
-                        }
-                    }
-                }
-                if b >= 0x20 && b != 0x7f {
-                    out.push(b as char);
-                }
+                self.append_decoded_code(b as u32, 1, b as u32, &mut out);
             }
         }
         out
+    }
+
+    /// Append the Unicode for one already-segmented PDF character code.
+    ///
+    /// `code` and `len` are the encoding CMap's decoded code and source byte
+    /// length. `raw_code` is the big-endian value of those source bytes (it
+    /// differs from `code` for UTF-16 surrogate pairs). Sharing this decoding
+    /// with the interpreter keeps a ligature's full Unicode string attached to
+    /// the glyph that actually drew it. Unmapped codes may append nothing.
+    pub fn append_decoded_code(&self, code: u32, len: u8, raw_code: u32, out: &mut String) {
+        if let Some(s) = self
+            .to_unicode
+            .as_ref()
+            .and_then(|tu| tu.lookup(raw_code).or_else(|| tu.lookup(code)))
+        {
+            out.push_str(s);
+            return;
+        }
+        if matches!(self.font_type, PdfFontType::Type0CidType2) {
+            if let Some(value) = self
+                .cid_cmap
+                .as_ref()
+                .and_then(|cm| cm.decode_text(code, len))
+            {
+                value.push_to(out);
+            }
+        } else if let Ok(b) = u8::try_from(code) {
+            if let Some(s) = self
+                .encoding
+                .as_ref()
+                .and_then(|enc| enc.glyph_name(b))
+                .and_then(glyph_list::glyph_name_to_string)
+            {
+                out.push_str(&s);
+            } else if b >= 0x20 && b != 0x7f {
+                out.push(b as char);
+            }
+        }
     }
 
     pub fn has_font_data(&self) -> bool {

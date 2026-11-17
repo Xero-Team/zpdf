@@ -1,14 +1,87 @@
 //! Extracted text spans, produced by running the interpreter with a text sink.
 //!
 //! Each span corresponds to one show-text operation (Tj/TJ element/'/"), carrying
-//! the decoded Unicode and the baseline origin in PDF user space (y-up).
+//! the decoded Unicode, baseline origin and positioned glyphs in PDF user
+//! space (y-up).
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 
+use zpdf_core::{Point, Rect};
 use zpdf_document::{StructElem, StructKid, StructTree};
 
-#[derive(Debug, Clone)]
+/// One positioned PDF glyph and its mapping into [`TextSpan::text`].
+///
+/// Geometry uses the same positions and advances as rendering. The selection
+/// cell uses the font's ascent/descent, not the outline's ink bounds, so spaces
+/// remain selectable. All coordinates are in PDF user space (y-up).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextGlyph {
+    /// UTF-8 byte range in the containing span (not a character index). A
+    /// ligature can cover several Unicode characters; an unmapped glyph has
+    /// an empty range. For `/ActualText`, every replaced glyph covers the
+    /// entire replacement range: that cluster cannot be split reliably.
+    pub text_range: Range<usize>,
+    /// Glyph's horizontal baseline origin, including text rise and vertical
+    /// writing's position vector.
+    pub origin: Point,
+    /// Glyph advance vector, excluding character/word spacing and TJ offsets.
+    /// Those offsets are already reflected in subsequent glyph origins.
+    pub advance: Point,
+    /// Selection cell corners: lower-left, lower-right, upper-right, upper-left
+    /// in text space, then transformed to page space. Retains rotation, shear
+    /// and reflection; use [`Self::bounds`] for an axis-aligned rectangle.
+    pub quad: [Point; 4],
+}
+
+impl TextGlyph {
+    /// Axis-aligned page-space bounds of the selection cell.
+    pub fn bounds(&self) -> Rect {
+        let mut bounds = Rect::new(
+            f64::INFINITY,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NEG_INFINITY,
+        );
+        for p in self.quad {
+            bounds.x0 = bounds.x0.min(p.x);
+            bounds.y0 = bounds.y0.min(p.y);
+            bounds.x1 = bounds.x1.max(p.x);
+            bounds.y1 = bounds.y1.max(p.y);
+        }
+        bounds
+    }
+
+    /// Test the transformed selection cell, including mirrored/sheared text.
+    /// Degenerate cells and non-finite points are not selectable.
+    pub fn contains(&self, point: Point) -> bool {
+        if !self.is_finite() || !point.x.is_finite() || !point.y.is_finite() {
+            return false;
+        }
+        let p = self.quad[0];
+        let u = Point::new(self.quad[1].x - p.x, self.quad[1].y - p.y);
+        let v = Point::new(self.quad[3].x - p.x, self.quad[3].y - p.y);
+        let det = u.x * v.y - u.y * v.x;
+        if det == 0.0 || !det.is_finite() {
+            return false;
+        }
+        let dx = point.x - p.x;
+        let dy = point.y - p.y;
+        let a = (dx * v.y - dy * v.x) / det;
+        let b = (u.x * dy - u.y * dx) / det;
+        (0.0..=1.0).contains(&a) && (0.0..=1.0).contains(&b)
+    }
+
+    pub(crate) fn is_finite(&self) -> bool {
+        self.quad
+            .iter()
+            .chain([&self.origin, &self.advance])
+            .all(|p| p.x.is_finite() && p.y.is_finite())
+    }
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct TextSpan {
     /// Decoded Unicode text for this show-text operation.
     pub text: String,
@@ -24,9 +97,24 @@ pub struct TextSpan {
     /// sequence, or `None` when this run is outside any (or carries none). Binds
     /// the run to a Tagged-PDF structure element (see [`struct_ordered_text`]).
     pub mcid: Option<i32>,
+    /// Positioned glyphs in source order, with ordered UTF-8 ranges into `text`.
+    /// Ranges are disjoint except for identical ranges in an ActualText cluster.
+    /// Collected only when a text sink is attached. Caller-constructed spans
+    /// may leave this empty; search then uses the legacy advance interpolation.
+    pub glyphs: Vec<TextGlyph>,
 }
 
 impl TextSpan {
+    /// First mapped glyph whose selection cell contains a page-space point.
+    /// Its `text_range` selects the whole Unicode cluster (including ligatures).
+    pub fn glyph_at(&self, point: Point) -> Option<&TextGlyph> {
+        self.glyphs.iter().find(|g| {
+            !g.text_range.is_empty()
+                && self.text.get(g.text_range.clone()).is_some()
+                && g.contains(point)
+        })
+    }
+
     /// Left/right x-bounds of the span (advance may be negative).
     pub(crate) fn x_bounds(&self) -> (f64, f64) {
         (
@@ -665,6 +753,7 @@ mod tests {
             size,
             advance: text.chars().count() as f64 * size as f64 * 0.5,
             mcid: None,
+            glyphs: Vec::new(),
         }
     }
 
@@ -744,6 +833,7 @@ mod tests {
                 size: 12.0,
                 advance: 30.0,
                 mcid: None,
+                glyphs: Vec::new(),
             },
         ];
         assert_eq!(spans_to_text(spans, 2.0), "Hello World");

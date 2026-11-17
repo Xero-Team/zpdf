@@ -2,9 +2,9 @@
 //!
 //! Spans are grouped into baseline lines (the same clustering the reading-order
 //! reconstruction uses), each line is flattened to a string with per-character
-//! x-extents interpolated from the span advances, and the query is matched
-//! against those line strings. Each hit carries the page-space quad(s) covering
-//! the matched characters, ready for viewer highlighting.
+//! geometry from the positioned glyphs, and the query is matched against those
+//! line strings. Spans without glyph data retain the legacy advance-based
+//! approximation. Each hit carries page-space rectangles ready for highlighting.
 
 use std::cmp::Ordering;
 
@@ -30,7 +30,7 @@ pub struct SearchHit {
 }
 
 impl SearchHit {
-    /// Bounding rectangle over all of the hit's quads.
+    /// Bounding rectangle over all of the hit's rectangles.
     pub fn bounds(&self) -> Rect {
         let mut r = Rect::new(
             f64::INFINITY,
@@ -48,15 +48,11 @@ impl SearchHit {
     }
 }
 
-/// A character on a line with its interpolated horizontal extent.
+/// A character on a line with its glyph's page-space bounds. Several Unicode
+/// characters may share the same glyph/cluster (e.g. a ToUnicode ligature).
 struct LineChar {
     ch: char,
-    x0: f64,
-    x1: f64,
-    /// Baseline y of the span this char came from.
-    y: f64,
-    /// Font size of the span this char came from (0 for synthetic gap spaces).
-    size: f32,
+    bounds: Rect,
     /// True for the space inserted at a word gap between spans (it has no
     /// glyph of its own; its extent is the gap).
     synthetic: bool,
@@ -168,41 +164,72 @@ fn build_lines(spans: &[TextSpan]) -> Vec<Vec<LineChar>> {
                     .unwrap_or(Ordering::Equal)
             });
             let mut chars: Vec<LineChar> = Vec::new();
+            let mut previous_end = None;
             for &i in &line {
                 let s = &spans[i];
                 let (sx0, sx1) = s.x_bounds();
                 // Word gap between spans → one synthetic space covering the gap.
-                if let Some(prev) = chars.last() {
-                    let gap = sx0 - prev.x1;
+                if let (Some(prev), Some(end)) = (chars.last(), previous_end) {
+                    let gap = sx0 - end;
                     if gap > s.size as f64 * 0.25
                         && !prev.ch.is_whitespace()
                         && !s.text.starts_with(char::is_whitespace)
                     {
                         chars.push(LineChar {
                             ch: ' ',
-                            x0: prev.x1,
-                            x1: sx0,
-                            y: s.y,
-                            size: 0.0,
+                            bounds: Rect::new(end, s.y, sx0, s.y),
                             synthetic: true,
                         });
                     }
                 }
-                // Distribute the span's extent evenly across its chars. Spans
-                // carry only a total advance, so per-glyph widths are
-                // approximated; adequate for highlight quads.
+                // Consecutive glyphs can share a range (ActualText). Union
+                // that cluster once, so mapping it to many Unicode characters
+                // is linear rather than glyph_count * character_count.
+                let mut clusters: Vec<(std::ops::Range<usize>, Rect)> = Vec::new();
+                for glyph in &s.glyphs {
+                    let range = &glyph.text_range;
+                    if range.is_empty() || !glyph.is_finite() || s.text.get(range.clone()).is_none()
+                    {
+                        continue;
+                    }
+                    let rect = glyph.bounds();
+                    if let Some((_, bounds)) = clusters.last_mut().filter(|(r, _)| r == range) {
+                        *bounds = union(*bounds, rect);
+                    } else {
+                        clusters.push((range.clone(), rect));
+                    }
+                }
+                let mut clusters = clusters.iter().peekable();
+                // Only callers without mapped glyph data need interpolation.
                 let n = s.text.chars().count();
-                let step = if n > 0 { (sx1 - sx0) / n as f64 } else { 0.0 };
-                for (k, ch) in s.text.chars().enumerate() {
+                let step = if n > 0 { s.advance / n as f64 } else { 0.0 };
+                for (k, (offset, ch)) in s.text.char_indices().enumerate() {
+                    while clusters
+                        .peek()
+                        .is_some_and(|(range, _)| range.end <= offset)
+                    {
+                        clusters.next();
+                    }
+                    let bounds = clusters
+                        .peek()
+                        .filter(|(range, _)| range.contains(&offset))
+                        .map(|(_, bounds)| *bounds)
+                        .unwrap_or_else(|| {
+                            Rect::new(
+                                s.x + step * k as f64,
+                                s.y - 0.2 * s.size as f64,
+                                s.x + step * (k + 1) as f64,
+                                s.y + 0.8 * s.size as f64,
+                            )
+                            .normalize()
+                        });
                     chars.push(LineChar {
                         ch,
-                        x0: sx0 + step * k as f64,
-                        x1: sx0 + step * (k + 1) as f64,
-                        y: s.y,
-                        size: s.size,
+                        bounds,
                         synthetic: false,
                     });
                 }
+                previous_end = Some(sx1);
             }
             chars
         })
@@ -214,23 +241,20 @@ fn build_lines(spans: &[TextSpan]) -> Vec<Vec<LineChar>> {
 fn hit_from(line: &[LineChar], start: usize, len: usize) -> SearchHit {
     let matched = &line[start..start + len];
 
-    // Vertical extent from the matched glyphs' baselines and sizes, using the
-    // same descender/ascender fractions as the layout heuristics (0.2/0.8).
-    // Synthetic gap spaces carry no size and are ignored for the y-extent.
+    // Synthetic gap spaces have no glyph and do not affect the y-extent.
     let (mut x0, mut x1) = (f64::INFINITY, f64::NEG_INFINITY);
     let (mut y0, mut y1) = (f64::INFINITY, f64::NEG_INFINITY);
     for c in matched {
-        x0 = x0.min(c.x0);
-        x1 = x1.max(c.x1);
+        x0 = x0.min(c.bounds.x0);
+        x1 = x1.max(c.bounds.x1);
         if !c.synthetic {
-            let sz = c.size as f64;
-            y0 = y0.min(c.y - 0.2 * sz);
-            y1 = y1.max(c.y + 0.8 * sz);
+            y0 = y0.min(c.bounds.y0);
+            y1 = y1.max(c.bounds.y1);
         }
     }
     if !y0.is_finite() {
         // Match consisted solely of synthetic spaces; fall back to baseline.
-        let y = matched.first().map(|c| c.y).unwrap_or(0.0);
+        let y = matched.first().map(|c| c.bounds.y0).unwrap_or(0.0);
         y0 = y;
         y1 = y;
     }
@@ -241,6 +265,15 @@ fn hit_from(line: &[LineChar], start: usize, len: usize) -> SearchHit {
         len,
         rects: vec![Rect::new(x0, y0, x1, y1)],
     }
+}
+
+fn union(a: Rect, b: Rect) -> Rect {
+    Rect::new(
+        a.x0.min(b.x0),
+        a.y0.min(b.y0),
+        a.x1.max(b.x1),
+        a.y1.max(b.y1),
+    )
 }
 
 #[cfg(test)]
@@ -271,6 +304,7 @@ mod tests {
             size,
             advance,
             mcid: None,
+            glyphs: Vec::new(),
         }
     }
 

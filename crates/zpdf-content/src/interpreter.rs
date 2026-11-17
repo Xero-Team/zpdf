@@ -10,7 +10,7 @@ use zpdf_parser::PdfFile;
 
 use crate::stats::InterpretStats;
 use crate::tables::RuleLine;
-use crate::text::TextSpan;
+use crate::text::{TextGlyph, TextSpan};
 use crate::tokenizer::{BorrowedContentToken as ContentToken, ContentTokenizer};
 
 /// Cached CMYK→RGB conversion entry
@@ -1017,8 +1017,9 @@ impl<'a> ContentInterpreter<'a> {
         self
     }
 
-    /// Collect decoded text spans (for the `text` command / extraction) in addition
-    /// to building the display list.
+    /// Collect decoded text spans and positioned glyph selection cells in
+    /// addition to building the display list. With no sink, no text geometry or
+    /// Unicode mapping is allocated.
     pub fn with_text_sink(mut self, sink: &'a mut Vec<TextSpan>) -> Self {
         self.text_sink = Some(sink);
         self
@@ -3080,6 +3081,7 @@ impl<'a> ContentInterpreter<'a> {
                 size: self.current.font_size * self.ctm_scale_factor(),
                 advance: 0.0,
                 mcid: mcid.or_else(|| self.current_mcid()),
+                glyphs: Vec::new(),
             },
             visible: !self.oc_suppressed(),
         })
@@ -3091,16 +3093,21 @@ impl<'a> ContentInterpreter<'a> {
         if let Some(actual) = self.mc_stack.pop().and_then(|frame| frame.actual) {
             if let Some(sink) = self.text_sink.as_mut() {
                 let start = actual.start.min(sink.len());
-                let mut span = sink
-                    .get(start)
-                    .cloned()
-                    .unwrap_or_else(|| actual.anchor.clone());
-                if let Some(last) = sink.last().filter(|_| start < sink.len()) {
-                    span.advance = last.x + last.advance - span.x;
+                let mcid = actual.anchor.mcid;
+                let mut replaced = sink.drain(start..);
+                let mut span = replaced.next().unwrap_or(actual.anchor);
+                for mut next in replaced {
+                    span.advance = next.x + next.advance - span.x;
+                    span.glyphs.append(&mut next.glyphs);
                 }
-                span.mcid = actual.anchor.mcid;
+                span.mcid = mcid;
                 span.text = actual.text.to_string();
-                sink.truncate(start);
+                // ActualText replaces a whole marked sequence, with no
+                // character-to-glyph correspondence. Retain all its geometry
+                // as one Unicode cluster rather than interpolating a mapping.
+                for glyph in &mut span.glyphs {
+                    glyph.text_range = 0..span.text.len();
+                }
                 if actual.visible && !span.text.is_empty() && span.is_finite() {
                     sink.push(span);
                 }
@@ -5625,15 +5632,59 @@ impl<'a> ContentInterpreter<'a> {
         // Decode the text and compute its user-space placement for extraction,
         // while the immutable font borrow is still live.
         let text_span = if want_text {
-            let decoded = font_and_id
-                .map(|(_, f)| f.decode_to_string(bytes))
-                .unwrap_or_else(|| {
-                    bytes
-                        .iter()
-                        .filter(|&&b| b >= 0x20 && b != 0x7f)
-                        .map(|&b| b as char)
-                        .collect()
-                });
+            let font = font_and_id.map(|(_, f)| f);
+            let cmap = font.and_then(|f| f.cid_cmap.as_ref());
+            let (descent, ascent) = font
+                .filter(|f| f.units_per_em.is_finite() && f.units_per_em > 0.0)
+                .map(|f| (f.descent / f.units_per_em, f.ascent / f.units_per_em))
+                .filter(|(d, a)| d.is_finite() && a.is_finite() && d < a)
+                .unwrap_or((-0.2, 0.8));
+            let mut decoded = String::new();
+            let mut text_glyphs = Vec::with_capacity(glyphs.len());
+            let mut offset = 0;
+            for glyph in &glyphs {
+                let Some((code, len, raw_code, end)) =
+                    next_text_code(cmap, is_two_byte, bytes, offset)
+                else {
+                    break;
+                };
+                offset = end;
+                let text_start = decoded.len();
+                if let Some(font) = font {
+                    font.append_decoded_code(code, len as u8, raw_code, &mut decoded);
+                } else if (0x20..=0xff).contains(&code) && code != 0x7f {
+                    decoded.push(char::from(code as u8));
+                }
+                let origin = Point::new(glyph.x as f64, glyph.y as f64).transform(&combined);
+                let (width, ax, ay) = if vertical {
+                    let cid = cmap.map(|c| c.code_to_cid(code, len as u8)).unwrap_or(code);
+                    let width = font
+                        .map(|f| f.glyph_advance(u16::try_from(cid).unwrap_or(0)))
+                        .unwrap_or(500.0) as f32
+                        * scale_factor
+                        * h_scale;
+                    (width, 0.0, glyph.advance as f64)
+                } else {
+                    (glyph.advance, glyph.advance as f64, 0.0)
+                };
+                let x0 = glyph.x as f64;
+                let x1 = x0 + width as f64;
+                let y0 = glyph.y as f64 + descent * font_size as f64;
+                let y1 = glyph.y as f64 + ascent * font_size as f64;
+                let extracted = TextGlyph {
+                    text_range: text_start..decoded.len(),
+                    origin,
+                    advance: Point::new(
+                        combined.a * ax + combined.c * ay,
+                        combined.b * ax + combined.d * ay,
+                    ),
+                    quad: [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+                        .map(|(x, y)| Point::new(x, y).transform(&combined)),
+                };
+                if extracted.is_finite() {
+                    text_glyphs.push(extracted);
+                }
+            }
             // The rise is already baked into `combined`.
             let start = Point::new(0.0, 0.0).transform(&combined);
             let (x, dx) = if vertical && column.0 <= column.1 {
@@ -5664,6 +5715,7 @@ impl<'a> ContentInterpreter<'a> {
                 advance: dx,
                 // The marked-content id binding this run to a structure element.
                 mcid: self.current_mcid(),
+                glyphs: text_glyphs,
             };
             // A degenerate text matrix (e.g. 1e300-scale Tm under a large CTM)
             // places the run nowhere.

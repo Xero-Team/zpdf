@@ -690,6 +690,7 @@ mod tests {
             size,
             advance: text.chars().count() as f64 * size as f64 * 0.5,
             mcid: None,
+            glyphs: Vec::new(),
         }
     }
 
@@ -776,6 +777,7 @@ mod tests {
                 size: 12.0,
                 advance: 195.0,
                 mcid: None,
+                glyphs: Vec::new(),
             });
             spans.push(TextSpan {
                 text: long_r.into(),
@@ -784,6 +786,7 @@ mod tests {
                 size: 12.0,
                 advance: 195.0,
                 mcid: None,
+                glyphs: Vec::new(),
             });
         }
         assert!(
@@ -879,6 +882,7 @@ mod tests {
             size,
             advance,
             mcid: None,
+            glyphs: Vec::new(),
         }
     }
 
@@ -1106,6 +1110,7 @@ mod tests {
                 size: 12.0,
                 advance: 195.0,
                 mcid: None,
+                glyphs: Vec::new(),
             });
             spans.push(TextSpan {
                 text: long_r.into(),
@@ -1114,6 +1119,7 @@ mod tests {
                 size: 12.0,
                 advance: 195.0,
                 mcid: None,
+                glyphs: Vec::new(),
             });
         }
         assert!(detect_tables(&spans).is_empty(), "prose without rules");
