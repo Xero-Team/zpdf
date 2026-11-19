@@ -294,6 +294,23 @@ fn search_keeps_text_but_only_highlights_selectable_cells() {
 }
 
 #[test]
+fn synthetic_gap_does_not_extend_a_mixed_highlight() {
+    let (_, spans) = extract(
+        font(),
+        b"BT /F1 10 Tf 10 50 Td 0 Tz (W) Tj
+        100 Tz 1 0 0 1 100 50 Tm (i) Tj ET",
+    );
+    let hit = &search_spans(&spans, "W i", true)[0];
+    assert_eq!(hit.line, "W i");
+    rect(hit.bounds(), spans[1].glyphs[0].bounds());
+    assert!(search_spans(&spans, "W ", true)[0].rects.is_empty());
+    rect(
+        search_spans(&spans, " ", true)[0].bounds(),
+        Rect::new(10.0, 50.0, 100.0, 50.0),
+    );
+}
+
+#[test]
 fn type0_to_unicode_fallback_maps_all_text_to_the_drawn_cells() {
     let mut font = font();
     font.font_type = PdfFontType::Type0CidType2;
@@ -377,25 +394,27 @@ fn page_geometry_budget_keeps_text_and_never_publishes_a_partial_cluster() {
     };
     let mut cache = FontCache::new();
     cache.insert("F1".into(), font());
-    let mut spans = Vec::new();
-    let (_, stats) = ContentInterpreter::new(Rect::new(0.0, 0.0, 300.0, 300.0))
-        .with_limits(&limits)
-        .with_fonts(&mut cache)
-        .with_text_sink(&mut spans)
-        .interpret_with_stats(
-            b"BT /F1 10 Tf (W) Tj /Span << /ActualText (A) >> BDC
-            (i) Tj (WW) Tj EMC (i) Tj ET",
+    for (source, last_glyphs) in [("(i) Tj (WW) Tj", 0), ("(WW) Tj (i) Tj", 1)] {
+        let content =
+            format!("BT /F1 10 Tf (W) Tj /Span << /ActualText (A) >> BDC {source} EMC (i) Tj ET");
+        let mut spans = Vec::new();
+        let (_, stats) = ContentInterpreter::new(Rect::new(0.0, 0.0, 300.0, 300.0))
+            .with_limits(&limits)
+            .with_fonts(&mut cache)
+            .with_text_sink(&mut spans)
+            .interpret_with_stats(content.as_bytes());
+        stats.diagnostics.ensure_complete().unwrap();
+        assert!(stats.text_geometry_omitted);
+        assert_eq!(
+            spans.iter().map(|s| s.text.as_str()).collect::<Vec<_>>(),
+            ["W", "A", "i"]
         );
-    assert!(stats.diagnostics.resource_limit_reached);
-    assert_eq!(
-        spans.iter().map(|s| s.text.as_str()).collect::<Vec<_>>(),
-        ["W", "A", "i"]
-    );
-    assert_eq!(
-        spans.iter().map(|s| s.glyphs.len()).collect::<Vec<_>>(),
-        [1, 0, 0]
-    );
-    near(search_spans(&spans, "A", true)[0].bounds().width(), 20.0);
+        assert_eq!(
+            spans.iter().map(|s| s.glyphs.len()).collect::<Vec<_>>(),
+            [1, 0, last_glyphs]
+        );
+        near(search_spans(&spans, "A", true)[0].bounds().width(), 20.0);
+    }
 }
 
 #[test]
@@ -429,18 +448,51 @@ fn unicode_expansion_and_replacements_share_the_page_text_byte_limit() {
         max_decoded_stream_bytes: 7,
         ..Default::default()
     };
+    let content = b"BT /F1 10 Tf (W) Tj /Span << /ActualText (X) >> BDC
+        (W) Tj EMC [(iii) (i)] TJ ET 0 0 10 10 re f";
+    let page = Rect::new(0.0, 0.0, 300.0, 300.0);
+    let expected = ContentInterpreter::new(page)
+        .with_limits(&limits)
+        .with_fonts(&mut cache)
+        .interpret(content);
     let mut spans = Vec::new();
-    let (_, stats) = ContentInterpreter::new(Rect::new(0.0, 0.0, 300.0, 300.0))
+    let (rendered, stats) = ContentInterpreter::new(page)
         .with_limits(&limits)
         .with_fonts(&mut cache)
         .with_text_sink(&mut spans)
-        .interpret_with_stats(
-            b"BT /F1 10 Tf (W) Tj /Span << /ActualText (X) >> BDC
-            (W) Tj EMC [(iii) (i)] TJ ET",
-        );
+        .interpret_with_stats(content);
     assert!(stats.diagnostics.resource_limit_reached);
+    assert!(stats.diagnostics.ensure_complete().is_err());
+    assert_eq!(
+        format!("{:?}", rendered.commands),
+        format!("{:?}", expected.commands)
+    );
     assert_eq!(
         spans.iter().map(|s| s.text.as_str()).collect::<Vec<_>>(),
         ["Word", "X"]
     );
+}
+
+#[test]
+fn an_over_budget_actual_text_keeps_painting_and_omits_subsequent_text() {
+    let page = Rect::new(0.0, 0.0, 300.0, 300.0);
+    let limits = ParseLimits {
+        max_decoded_stream_bytes: 6,
+        ..Default::default()
+    };
+    let mut cache = FontCache::new();
+    cache.insert("F1".into(), font());
+    for content in [
+        &b"BT /F1 10 Tf (A) Tj /Span << /ActualText (long label) >> BDC (W) Tj EMC (i) Tj ET 0 0 1 1 re f"[..],
+        b"BT /F1 10 Tf (AAAAAA) Tj /Span << /ActualText (X) >> BDC (W) Tj EMC (i) Tj ET 0 0 1 1 re f",
+    ] {
+        let expected = ContentInterpreter::new(page).with_limits(&limits).with_fonts(&mut cache).interpret(content);
+        let mut spans = Vec::new();
+        let (actual, stats) = ContentInterpreter::new(page).with_limits(&limits)
+            .with_fonts(&mut cache).with_text_sink(&mut spans).interpret_with_stats(content);
+        assert!(stats.diagnostics.resource_limit_reached);
+        assert_eq!(spans.len(), 1);
+        assert!(spans[0].text.chars().all(|ch| ch == 'A'));
+        assert_eq!(format!("{:?}", actual.commands), format!("{:?}", expected.commands));
+    }
 }

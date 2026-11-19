@@ -363,6 +363,7 @@ const INTERPRET_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
 /// budget lowers it as well. Text and rendering survive an omitted glyph run.
 const MAX_TEXT_GEOMETRY_BYTES: u64 = 16 << 20;
 
+/// One text operator can contain many glyphs or TJ elements.
 fn text_deadline_reached(index: usize, deadline: Option<zpdf_core::time::Instant>) -> bool {
     index.is_multiple_of(256) && deadline.is_some_and(|end| zpdf_core::time::Instant::now() >= end)
 }
@@ -3117,6 +3118,14 @@ impl<'a> ContentInterpreter<'a> {
         self.mc_stack.iter().rev().find_map(|frame| frame.mcid)
     }
 
+    /// A text-only limit leaves the completed spans with their caller. The
+    /// interpreter still paints this show and executes the rest of the page.
+    fn stop_text_extraction(&mut self) {
+        self.stats.diagnostics.resource_limit_reached = true;
+        self.text_sink = None;
+        self.active_actual_text = None;
+    }
+
     fn begin_actual_text(&mut self, props: &PdfObject, mcid: Option<i32>) -> Option<ActualText> {
         if self.text_sink.is_none() || self.active_actual_text.is_some() || self.oc_suppressed() {
             return None;
@@ -3132,14 +3141,14 @@ impl<'a> ContentInterpreter<'a> {
             .max_actual_text_bytes
             .saturating_sub(self.actual_text_bytes);
         if value.as_bytes().len() > remaining / 3 {
-            self.resource_limit_hit = true;
+            self.stop_text_extraction();
             return None;
         }
         let text = zpdf_core::decode_text_string(value.as_bytes());
         if text.len() as u64
             > self.parse_limits.max_decoded_stream_bytes - self.extracted_text_bytes
         {
-            self.resource_limit_hit = true;
+            self.stop_text_extraction();
             return None;
         }
         self.extracted_text_bytes += text.len() as u64;
@@ -5520,8 +5529,6 @@ impl<'a> ContentInterpreter<'a> {
             .map(|actual| actual.span.text.len());
         let want_text =
             self.text_sink.is_some() && !self.oc_suppressed() && replacement_len != Some(0);
-        // An entire show (or even a TJ array) counts as a single operator.
-        // Sample within both glyph passes and discard an unfinished show.
 
         let font_and_id = self.current_font_id.and_then(|fid| {
             self.font_cache
@@ -5706,7 +5713,10 @@ impl<'a> ContentInterpreter<'a> {
 
         // Decode the text and compute its user-space placement for extraction,
         // while the immutable font borrow is still live.
-        let text_span = if want_text {
+        let text_span = 'extract: {
+            if !want_text {
+                break 'extract None;
+            }
             let font = font_and_id.map(|(_, f)| f);
             let cmap = font.and_then(|f| f.cid_cmap.as_ref());
             // Without an encoding CMap, rendering uses two-byte Identity
@@ -5734,18 +5744,27 @@ impl<'a> ContentInterpreter<'a> {
                 .max_decoded_stream_bytes
                 .min(MAX_TEXT_GEOMETRY_BYTES);
             let glyph_limit = byte_limit as usize / size_of::<TextGlyph>();
-            let collect_geometry =
-                glyphs.len() <= glyph_limit.saturating_sub(self.text_glyphs_collected);
+            let cluster_keeps_geometry = self
+                .active_actual_text
+                .as_ref()
+                .is_none_or(|actual| !actual.has_source || !actual.span.glyphs.is_empty());
+            let collect_geometry = cluster_keeps_geometry
+                && glyphs.len() <= glyph_limit.saturating_sub(self.text_glyphs_collected);
             let mut text_glyphs = if collect_geometry {
                 self.text_glyphs_collected += glyphs.len();
                 Vec::with_capacity(glyphs.len())
             } else {
-                self.stats.diagnostics.resource_limit_reached = true;
+                self.stats.text_geometry_omitted = true;
                 Vec::new()
             };
             let mut offset = 0;
             let mut cluster_start = 0;
-            for (index, glyph) in glyphs.iter().enumerate() {
+            let source = if collect_geometry || replacement_len.is_none() {
+                glyphs.as_slice()
+            } else {
+                &[]
+            };
+            for (index, glyph) in source.iter().enumerate() {
                 if text_deadline_reached(index, self.deadline) {
                     self.timed_out = true;
                     return;
@@ -5774,8 +5793,8 @@ impl<'a> ContentInterpreter<'a> {
                     start..decoded.len()
                 };
                 if decoded.len() as u64 > remaining_text_bytes {
-                    self.resource_limit_hit = true;
-                    return;
+                    self.stop_text_extraction();
+                    break 'extract None;
                 }
                 offset = end;
                 if !collect_geometry {
@@ -5844,8 +5863,6 @@ impl<'a> ContentInterpreter<'a> {
             // A degenerate text matrix (e.g. 1e300-scale Tm under a large CTM)
             // places the run nowhere.
             span.is_finite().then_some(span)
-        } else {
-            None
         };
 
         // Preserve the ordinary solid-text path without entering fallback or

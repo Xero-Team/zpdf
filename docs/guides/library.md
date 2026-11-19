@@ -186,16 +186,19 @@ individual character placement. When a Type0 font lacks an encoding CMap, text
 uses the code width declared by ToUnicode. Characters sharing a drawn cell can
 be selected together. Search uses the bounds of the selectable cells in each
 match. A match with only collapsed or non-finite cells has an empty
-`SearchHit::rects` and still carries its text and character offsets.
+`SearchHit::rects` and still carries its text and character offsets. A
+query for an inserted word space alone returns the baseline extent of the gap.
 
 `with_text_sink` admits up to 16 MiB of glyph records per page, including its
 forms. A smaller `ParseLimits::max_decoded_stream_bytes` lowers that allowance.
 If a run exceeds the remaining allowance, extraction keeps its text and span
-metrics and reports `resource_limit_reached` in the interpreter diagnostics.
+metrics and sets `InterpretStats::text_geometry_omitted`. Strict text and
+search callers can still consume the complete text.
 Search interpolates the whole run, or the whole replacement for `/ActualText`.
 The decoded UTF-8 text has its own cumulative allowance of
-`max_decoded_stream_bytes` per page. Exceeding it stops interpretation before
-the unfinished text operation reaches the sink.
+`max_decoded_stream_bytes` per page. On overflow the sink keeps completed
+spans, the diagnostics report `resource_limit_reached`, and rendering
+continues through the rest of the page.
 For manually constructed spans, `glyphs: Vec::new()` or `..TextSpan::default()`
 selects the same approximate search behavior.
 

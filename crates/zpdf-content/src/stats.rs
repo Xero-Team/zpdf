@@ -43,6 +43,9 @@
 pub struct InterpretStats {
     /// Known omissions, malformed content and resource/time truncation.
     pub diagnostics: zpdf_core::ProcessingDiagnostics,
+    /// At least one run exceeded the optional glyph geometry allowance.
+    /// Its decoded text and span metrics are still available for search.
+    pub text_geometry_omitted: bool,
     /// Total operators executed, including nested content and one per inline
     /// image (`BI ... EI`). Collected even
     /// without work timing so callers replaying standalone child streams can

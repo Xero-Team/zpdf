@@ -237,34 +237,20 @@ fn build_lines(spans: &[TextSpan]) -> Vec<Vec<LineChar>> {
 fn hit_from(line: &[LineChar], start: usize, len: usize) -> SearchHit {
     let matched = &line[start..start + len];
 
-    // Synthetic gap spaces have no glyph and do not affect the y-extent.
-    let (mut x0, mut x1) = (f64::INFINITY, f64::NEG_INFINITY);
-    let (mut y0, mut y1) = (f64::INFINITY, f64::NEG_INFINITY);
-    let mut gap_y = 0.0;
-    for c in matched {
-        let Some(bounds) = c.bounds else { continue };
-        x0 = x0.min(bounds.x0);
-        x1 = x1.max(bounds.x1);
-        if c.synthetic {
-            gap_y = bounds.y0;
-        } else {
-            y0 = y0.min(bounds.y0);
-            y1 = y1.max(bounds.y1);
-        }
-    }
-    let rects = if !x0.is_finite() {
-        Vec::new()
-    } else if !y0.is_finite() {
-        vec![Rect::new(x0, gap_y, x1, gap_y)]
-    } else {
-        vec![Rect::new(x0, y0, x1, y1)]
-    };
+    // A search for just the inserted space can identify the gap itself.
+    // In a mixed match only the matched character cells determine the bounds.
+    let gaps_only = matched.iter().all(|c| c.synthetic);
+    let bounds = matched
+        .iter()
+        .filter(|c| gaps_only || !c.synthetic)
+        .filter_map(|c| c.bounds)
+        .reduce(union);
 
     SearchHit {
         line: String::new(),
         start,
         len,
-        rects,
+        rects: bounds.into_iter().collect(),
     }
 }
 
