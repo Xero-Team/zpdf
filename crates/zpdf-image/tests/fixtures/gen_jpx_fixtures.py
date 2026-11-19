@@ -68,6 +68,21 @@ rgb.save(OUT / "rgb_lossy.jp2", irreversible=True, quality_mode="rates", quality
 lossy_ref = Image.open(OUT / "rgb_lossy.jp2").convert("RGB")
 (OUT / "rgb_lossy_ref.raw").write_bytes(lossy_ref.tobytes())
 
-for name in ("rgb.jp2", "gray.j2k", "rgba.jp2", "rgb_lossy.jp2"):
+# Two colour channels in a raw codestream (no JP2 boxes): what a 2-colorant
+# DeviceN image carries. Pillow's "LA" mode is just two 8-bit components here.
+def two_channel_pattern():
+    img = Image.new("LA", (W, H))
+    px = img.load()
+    for y in range(H):
+        for x in range(W):
+            px[x, y] = ((x * 255) // (W - 1), (y * 255) // (H - 1))
+    return img
+
+
+two = two_channel_pattern()
+two.save(OUT / "two_channel.j2k", irreversible=False)
+(OUT / "two_channel_ref.raw").write_bytes(two.tobytes())
+
+for name in ("rgb.jp2", "gray.j2k", "rgba.jp2", "rgb_lossy.jp2", "two_channel.j2k"):
     data = (OUT / name).read_bytes()
     print(f"{name}: {len(data)} bytes, magic {data[:12].hex()}")

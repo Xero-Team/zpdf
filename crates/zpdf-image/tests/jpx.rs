@@ -3,7 +3,10 @@
 //! references dumped at generation time).
 
 use zpdf_core::{ParseLimits, PdfDict, PdfName, PdfObject, PdfString};
-use zpdf_image::{decode_image_xobject, decode_image_xobject_with_limits, DecodedImage};
+use zpdf_image::{
+    decode_image_xobject, decode_image_xobject_resolved, decode_image_xobject_with_limits,
+    DecodedImage, ResolvedColorSpace,
+};
 
 const W: u32 = 32;
 const H: u32 = 24;
@@ -16,6 +19,8 @@ const RGBA_JP2: &[u8] = include_bytes!("fixtures/rgba.jp2");
 const RGBA_REF: &[u8] = include_bytes!("fixtures/rgba_ref.raw");
 const RGB_LOSSY_JP2: &[u8] = include_bytes!("fixtures/rgb_lossy.jp2");
 const RGB_LOSSY_REF: &[u8] = include_bytes!("fixtures/rgb_lossy_ref.raw");
+const TWO_CHANNEL_J2K: &[u8] = include_bytes!("fixtures/two_channel.j2k");
+const TWO_CHANNEL_REF: &[u8] = include_bytes!("fixtures/two_channel_ref.raw");
 
 /// Image dict as a PDF would carry it: /Width and /Height are required keys,
 /// while /ColorSpace and /BitsPerComponent may be omitted for JPXDecode.
@@ -226,4 +231,39 @@ fn stencil_mask_starting_with_a_jpx_signature_stays_a_stencil() {
     let img = decode_image_xobject(b"\xFF\x4F\xFF\x51", &d).unwrap();
     assert!(img.is_image_mask);
     assert_eq!((img.width, img.height), (8, 4));
+}
+
+/// Two colour channels are a 2-colorant DeviceN image, not an error: the
+/// PDF /ColorSpace interprets them (GHOSTSCRIPT-691880-0's PANTONE duotone).
+#[test]
+fn two_channel_codestream_uses_devicen_colorspace() {
+    let tint = ResolvedColorSpace::Tint {
+        n: 2,
+        transform: None,
+        alternate: Box::new(ResolvedColorSpace::Gray),
+    };
+    let img = decode_image_xobject_resolved(
+        TWO_CHANNEL_J2K,
+        &jpx_dict(W as i64, H as i64),
+        [0, 0, 0],
+        Some(tint),
+    )
+    .unwrap();
+    assert_eq!((img.width, img.height), (W, H));
+    // Without a tint transform a tint renders as gray(1 - max tint).
+    for (i, s) in TWO_CHANNEL_REF.as_chunks::<2>().0.iter().enumerate() {
+        let want = 255 - s[0].max(s[1]);
+        let got = px(&img, i);
+        assert!(
+            got[..3].iter().all(|&c| c.abs_diff(want) <= 1) && got[3] == 255,
+            "pixel {i}: {got:?} vs {want}"
+        );
+    }
+}
+
+/// With no /ColorSpace to interpret them, two channels stay unsupported.
+#[test]
+fn two_channel_codestream_without_colorspace_errors() {
+    let err = decode_image_xobject(TWO_CHANNEL_J2K, &jpx_dict(W as i64, H as i64)).unwrap_err();
+    assert!(err.to_string().contains("2 colour channels"), "{err}");
 }

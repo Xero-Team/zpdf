@@ -960,13 +960,17 @@ fn decode_jpx_image(
         // Recovery can return a full-size buffer for truncated tile data without
         // exposing a completeness flag. Fail decoding so page diagnostics and
         // strict export frontends can report the missing image instead.
-        Image::new(
-            data,
-            &DecodeSettings {
-                strict: true,
-                ..DecodeSettings::default()
-            },
-        )
+        // A PDF /Indexed space looks the raw indices up itself (7.4.9); a
+        // JP2 palette resolved here would be applied twice.
+        let settings = DecodeSettings {
+            strict: true,
+            resolve_palette_indices: !matches!(
+                colorspace,
+                Some(ResolvedColorSpace::Indexed { .. })
+            ),
+            ..DecodeSettings::default()
+        };
+        Image::new(data, &settings)
     }))
     .map_err(|_| {
         Error::StreamDecode("JPXDecode: decoder panicked parsing codestream header".into())
@@ -997,12 +1001,11 @@ fn decode_jpx_image(
 
     // Colour channels per pixel (alpha excluded). An ICC profile embedded in
     // the JP2 codestream is captured here and compiled below (unless a
-    // PDF-level /ColorSpace overrides it per spec 7.4.9).
-    let supported_ncolor = |n: u8| -> Result<usize> {
-        match n {
-            1 => Ok(1),
-            3 => Ok(3),
-            4 => Ok(4),
+    // PDF-level /ColorSpace overrides it per spec 7.4.9). Counts other than
+    // 1/3/4 (e.g. a 2-colorant DeviceN) need that /ColorSpace; checked below.
+    let channel_count = |n: u8| -> Result<usize> {
+        match usize::from(n) {
+            n @ 1..=MAX_COMPONENTS => Ok(n),
             n => Err(Error::StreamDecode(format!(
                 "JPX image with unsupported channel count {n}"
             ))),
@@ -1017,11 +1020,11 @@ fn decode_jpx_image(
             profile,
             num_channels,
         } => {
-            let n = supported_ncolor(*num_channels)?;
+            let n = channel_count(*num_channels)?;
             codestream_icc = Some(profile.as_slice());
             n
         }
-        JpxColorSpace::Unknown { num_channels } => supported_ncolor(*num_channels)?,
+        JpxColorSpace::Unknown { num_channels } => channel_count(*num_channels)?,
     };
     let has_alpha = image.has_alpha();
     let channels = ncolor + usize::from(has_alpha);
@@ -1112,6 +1115,11 @@ fn decode_jpx_image(
         _ => None,
     };
     let effective_cs = override_cs.or(codestream_cs.as_ref());
+    if effective_cs.is_none() && !matches!(ncolor, 1 | 3 | 4) {
+        return Err(Error::StreamDecode(format!(
+            "JPX image with {ncolor} colour channels and no matching /ColorSpace"
+        )));
+    }
 
     let rgba_size = pixel_count
         .checked_mul(4)
