@@ -98,11 +98,13 @@ impl PdfFile {
         // Try the normal xref pipeline first. Fall back to tail-scan recovery if
         // it fails structurally OR yields a trailer whose /Root doesn't resolve.
         let normal = xref::parse_xref_and_trailer(&data, &limits);
+        let mut recovered = false;
         let (xref, trailer) = match normal {
             Ok((xref, trailer)) if root_resolves(&data, &xref, &trailer, &limits) => {
                 (xref, trailer)
             }
             other => {
+                recovered = true;
                 match &other {
                     Err(e) => {
                         tracing::warn!("xref parse failed ({e}); attempting tail-scan recovery")
@@ -148,7 +150,62 @@ impl PdfFile {
         // fetch the (never-encrypted) /Encrypt dict; `decryptor` is still `None`
         // at this point, so that resolve does not try to decrypt it.
         file.decryptor = file.build_decryptor(password)?;
+        if recovered && file.decryptor.is_some() {
+            let members = file.encrypted_objstm_members(&file.xref);
+            insert_compressed_members(&mut file.xref, members);
+        }
         Ok(file)
+    }
+
+    /// Recovery indexes `/ObjStm` members before the decryptor exists, so in an
+    /// encrypted file every compressed object (often the whole page tree) is
+    /// missing from a rebuilt table. List the members of `table`'s object
+    /// streams now that the containers decrypt, as `(member, container, index)`.
+    fn encrypted_objstm_members(&self, table: &XrefTable) -> Vec<(ObjectId, u32, u32)> {
+        let mut members = Vec::new();
+        for id in table.object_ids() {
+            // Object-stream containers are never generation > 0 (7.5.7).
+            let (0, Some(XrefEntry::InUse { offset, .. })) = (id.1, table.get(id)) else {
+                continue;
+            };
+            let Ok(container) = self.parse_container_at(*offset) else {
+                continue;
+            };
+            let Ok(stream) = container.as_stream() else {
+                continue;
+            };
+            if stream.dict.get_name("Type").unwrap_or("") != "ObjStm" {
+                continue;
+            }
+            let Ok(decoded) = self.decode_objstm_stream(id.0, stream) else {
+                continue;
+            };
+            for (index, (num, _)) in decoded.entries.iter().enumerate() {
+                members.push((ObjectId(*num, 0), id.0, index as u32));
+            }
+        }
+        members
+    }
+
+    /// Build the full-file repair-scan table; in an encrypted file, add the
+    /// members of object streams the scan could not decrypt.
+    fn build_repair_table(&self) -> Option<XrefTable> {
+        match recovery::scan_object_table(&self.data, &self.limits) {
+            Ok(mut table) => {
+                if self.decryptor.is_some() {
+                    let members = self.encrypted_objstm_members(&table);
+                    insert_compressed_members(&mut table, members);
+                }
+                // Containers that failed at their xref offset get one retry at
+                // the offset this scan found (see `decode_objstm`).
+                self.objstm_failed.borrow_mut().clear();
+                Some(table)
+            }
+            Err(e) => {
+                tracing::warn!("repair object scan failed: {e}");
+                None
+            }
+        }
     }
 
     /// True when this successfully opened document is encrypted.
@@ -420,15 +477,7 @@ impl PdfFile {
     fn repaired_object(&self, id: ObjectId) -> Option<PdfObject> {
         let table = self
             .repair_table
-            .get_or_init(
-                || match recovery::scan_object_table(&self.data, &self.limits) {
-                    Ok(table) => Some(table),
-                    Err(e) => {
-                        tracing::warn!("repair object scan failed: {e}");
-                        None
-                    }
-                },
-            )
+            .get_or_init(|| self.build_repair_table())
             .as_ref()?;
         match table.get(id)? {
             XrefEntry::InUse { offset, .. } => {
@@ -707,27 +756,72 @@ impl PdfFile {
 
     fn decode_objstm(&self, stream_obj_num: u32) -> Result<Arc<DecodedObjStm>> {
         let stream_id = zpdf_core::ObjectId(stream_obj_num, 0);
-        let stream_entry = self
-            .xref
-            .get(stream_id)
-            .ok_or(zpdf_core::Error::ObjectNotFound(stream_id))?;
-        let stream_obj = match stream_entry {
-            XrefEntry::InUse { offset, .. } => {
-                let resolve_length = |id| self.indirect_length(id);
-                let parser = ObjectParser::new_shared(&self.data, &self.limits)
-                    .with_length_resolver(&resolve_length);
-                let file_offset = usize::try_from(*offset).map_err(|_| {
-                    zpdf_core::Error::InvalidObject(
-                        *offset,
-                        "object-stream offset exceeds address space".into(),
-                    )
-                })?;
-                parser.parse_indirect_at(file_offset)?
-            }
-            _ => return Err(zpdf_core::Error::ObjectNotFound(stream_id)),
+        let offset = match self.xref.get(stream_id) {
+            Some(XrefEntry::InUse { offset, .. }) => Some(*offset),
+            _ => None,
         };
+        let decoded = match offset {
+            Some(offset) => self.decode_objstm_at(stream_obj_num, offset),
+            None => Err(zpdf_core::Error::ObjectNotFound(stream_id)),
+        };
+        // A damaged xref often points a container at stale bytes; an already
+        // built repair scan knows where the container really is.
+        let decoded = match decoded {
+            Err(e) => match self.repair_table.get().and_then(Option::as_ref) {
+                Some(table) => match table.get(stream_id) {
+                    Some(XrefEntry::InUse {
+                        offset: repaired, ..
+                    }) if Some(*repaired) != offset => {
+                        self.decode_objstm_at(stream_obj_num, *repaired)
+                    }
+                    _ => Err(e),
+                },
+                None => Err(e),
+            },
+            ok => ok,
+        }?;
 
-        let stream: &PdfStream = stream_obj.as_stream()?;
+        let decoded_arc = Arc::new(decoded);
+        let cost = estimate_objstm_bytes(&decoded_arc);
+        let used = self.objstm_cache_bytes.get();
+        if cost <= self.limits.max_objstm_cache_bytes.saturating_sub(used) {
+            self.objstm_cache
+                .borrow_mut()
+                .insert(stream_obj_num, Arc::clone(&decoded_arc));
+            self.objstm_cache_bytes.set(used.saturating_add(cost));
+        }
+        Ok(decoded_arc)
+    }
+
+    /// Decrypt, decode and index the object stream `stream_obj_num` whose
+    /// container object starts at `offset`. Uncached.
+    fn decode_objstm_at(&self, stream_obj_num: u32, offset: u64) -> Result<DecodedObjStm> {
+        let container = self.parse_container_at(offset)?;
+        self.decode_objstm_stream(stream_obj_num, container.as_stream()?)
+    }
+
+    /// Parse the indirect object at `offset` (an object-stream container),
+    /// resolving an indirect `/Length` through the xref.
+    fn parse_container_at(&self, offset: u64) -> Result<PdfObject> {
+        let resolve_length = |id| self.indirect_length(id);
+        let parser = ObjectParser::new_shared(&self.data, &self.limits)
+            .with_length_resolver(&resolve_length);
+        let file_offset = usize::try_from(offset).map_err(|_| {
+            zpdf_core::Error::InvalidObject(
+                offset,
+                "object-stream offset exceeds address space".into(),
+            )
+        })?;
+        parser.parse_indirect_at(file_offset)
+    }
+
+    /// Decrypt, decode and index the parsed object-stream container
+    /// `stream_obj_num`. Uncached.
+    fn decode_objstm_stream(
+        &self,
+        stream_obj_num: u32,
+        stream: &PdfStream,
+    ) -> Result<DecodedObjStm> {
         // Reject negative /N and /First (attacker-controlled): a negative i64 cast
         // straight to usize becomes a near-usize::MAX value that overflows the
         // offset arithmetic later.
@@ -746,7 +840,11 @@ impl PdfFile {
         // Identity exemption just like ordinary streams. Member strings are
         // already plaintext; do not decrypt them again under their object ids.
         let raw: std::borrow::Cow<[u8]> = match &self.decryptor {
-            Some(dec) => dec.decrypt_stream_with_dict(stream_id, &stream.dict, &stream.data),
+            Some(dec) => dec.decrypt_stream_with_dict(
+                zpdf_core::ObjectId(stream_obj_num, 0),
+                &stream.dict,
+                &stream.data,
+            ),
             None => std::borrow::Cow::Borrowed(&stream.data),
         };
         let decoded = filters::decode_stream_with_limits(&raw, &stream.dict, &self.limits)?;
@@ -783,20 +881,11 @@ impl PdfFile {
             );
         }
 
-        let decoded_arc = Arc::new(DecodedObjStm {
+        Ok(DecodedObjStm {
             data: Arc::<[u8]>::from(decoded),
             first,
             entries,
-        });
-        let cost = estimate_objstm_bytes(&decoded_arc);
-        let used = self.objstm_cache_bytes.get();
-        if cost <= self.limits.max_objstm_cache_bytes.saturating_sub(used) {
-            self.objstm_cache
-                .borrow_mut()
-                .insert(stream_obj_num, Arc::clone(&decoded_arc));
-            self.objstm_cache_bytes.set(used.saturating_add(cost));
-        }
-        Ok(decoded_arc)
+        })
     }
 
     pub fn data(&self) -> &[u8] {
@@ -813,15 +902,7 @@ impl PdfFile {
     /// repair uses, so the scan runs at most once per `PdfFile`.
     pub fn force_repair_scan(&self) -> Option<&XrefTable> {
         self.repair_table
-            .get_or_init(
-                || match recovery::scan_object_table(&self.data, &self.limits) {
-                    Ok(table) => Some(table),
-                    Err(e) => {
-                        tracing::warn!("repair object scan failed: {e}");
-                        None
-                    }
-                },
-            )
+            .get_or_init(|| self.build_repair_table())
             .as_ref()
     }
 
@@ -941,6 +1022,27 @@ fn estimate_objstm_bytes(stream: &DecodedObjStm) -> u64 {
         .saturating_add(std::mem::size_of::<DecodedObjStm>() as u64)
         .saturating_add(stream.data.len() as u64)
         .saturating_add((stream.entries.len() * std::mem::size_of::<(u32, usize)>()) as u64)
+}
+
+/// Add `(member, container, index)` object-stream entries to `table`. Direct
+/// objects the scan found keep precedence.
+fn insert_compressed_members(table: &mut XrefTable, members: Vec<(ObjectId, u32, u32)>) {
+    let mut added = 0usize;
+    for (id, stream_obj, index_in_stream) in members {
+        if table.get(id).is_none() {
+            table.insert_overwrite(
+                id,
+                XrefEntry::Compressed {
+                    stream_obj,
+                    index_in_stream,
+                },
+            );
+            added += 1;
+        }
+    }
+    if added > 0 {
+        tracing::debug!("recovery: indexed {added} members of encrypted object streams");
+    }
 }
 
 /// Best-effort check that the trailer's /Root points at a usable Catalog. Runs
