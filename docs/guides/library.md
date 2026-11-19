@@ -182,13 +182,22 @@ not tight outline ink bounds. This also makes spaces selectable.
 Unicode characters are not always individual glyphs: a ligature's characters
 share one cell; an unmapped glyph has an empty range. `/ActualText` maps all
 replaced glyphs to the entire replacement string, since it does not specify
-individual character placement. `search_spans` uses these glyph/cluster bounds
-instead of dividing a span evenly. Its existing baseline-based line grouping
-and character offsets in `SearchHit` are unchanged.
+individual character placement. When a Type0 font lacks an encoding CMap, text
+uses the code width declared by ToUnicode. Characters sharing a drawn cell can
+be selected together. Search uses the bounds of the selectable cells in each
+match. A match with only collapsed or non-finite cells has an empty
+`SearchHit::rects` and still carries its text and character offsets.
 
-Glyph geometry is collected only with `with_text_sink`; ordinary rendering does
-not allocate it. For manually constructed spans, set `glyphs: Vec::new()` or use
-`..TextSpan::default()` to retain the approximate advance-based search behavior.
+`with_text_sink` admits up to 16 MiB of glyph records per page, including its
+forms. A smaller `ParseLimits::max_decoded_stream_bytes` lowers that allowance.
+If a run exceeds the remaining allowance, extraction keeps its text and span
+metrics and reports `resource_limit_reached` in the interpreter diagnostics.
+Search interpolates the whole run, or the whole replacement for `/ActualText`.
+The decoded UTF-8 text has its own cumulative allowance of
+`max_decoded_stream_bytes` per page. Exceeding it stops interpretation before
+the unfinished text operation reaches the sink.
+For manually constructed spans, `glyphs: Vec::new()` or `..TextSpan::default()`
+selects the same approximate search behavior.
 
 ## Converting a document
 

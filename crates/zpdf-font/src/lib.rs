@@ -1055,21 +1055,8 @@ impl LoadedFont {
                         .fold(0u32, |value, &byte| (value << 8) | byte as u32);
                     self.append_decoded_code(code, len as u8, raw_code, &mut out);
                 }
-                return out;
-            }
-            let width = match &self.to_unicode {
-                Some(tu) => match tu.code_byte_lengths() {
-                    [n] if *n >= 1 => *n as usize,
-                    _ => 2,
-                },
-                None => 2,
-            };
-            for chunk in bytes.chunks(width) {
-                let mut code = 0u32;
-                for &b in chunk {
-                    code = (code << 8) | b as u32;
-                }
-                self.append_decoded_code(code, chunk.len() as u8, code, &mut out);
+            } else if let Some(map) = &self.to_unicode {
+                map.append_fixed_width(bytes, &mut out);
             }
         } else {
             for &b in bytes {

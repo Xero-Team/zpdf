@@ -1,7 +1,11 @@
 //! Glyph selection follows PDF advances and transforms, not Unicode length.
 
-use zpdf_content::{interpreter::ContentInterpreter, search::search_spans, text::TextSpan};
-use zpdf_core::{Point, Rect};
+use zpdf_content::{
+    interpreter::ContentInterpreter,
+    search::search_spans,
+    text::{TextGlyph, TextSpan},
+};
+use zpdf_core::{ParseLimits, Point, Rect};
 use zpdf_display_list::{DisplayList, RenderCommand};
 use zpdf_font::{
     cmap::{CidCMap, ToUnicodeMap},
@@ -270,4 +274,173 @@ fn missing_font_keeps_filtered_codes_aligned_and_degenerate_cells_do_not_hit() {
     point(spans[0].glyphs[1].origin, 6.0, 0.0);
     assert_eq!(spans[1].glyph_at(spans[1].glyphs[0].origin), None);
     assert!(!spans[0].glyphs[1].contains(Point::new(f64::NAN, 0.0)));
+}
+
+#[test]
+fn search_keeps_text_but_only_highlights_selectable_cells() {
+    let (_, spans) = extract(font(), b"BT /F1 10 Tf 1 1 1 1 20 50 Tm (W) Tj ET");
+    let hit = &search_spans(&spans, "W", true)[0];
+    assert_eq!((hit.start, hit.len), (0, 1));
+    assert!(hit.rects.is_empty());
+    assert_eq!(hit.bounds(), Rect::new(0.0, 0.0, 0.0, 0.0));
+
+    let (_, mut spans) = extract(font(), b"BT /F1 10 Tf (Wi) Tj ET");
+    spans[0].glyphs[0].quad[2].x = f64::NAN;
+    assert!(search_spans(&spans, "W", true)[0].rects.is_empty());
+    rect(
+        search_spans(&spans, "Wi", true)[0].bounds(),
+        spans[0].glyphs[1].bounds(),
+    );
+}
+
+#[test]
+fn type0_to_unicode_fallback_maps_all_text_to_the_drawn_cells() {
+    let mut font = font();
+    font.font_type = PdfFontType::Type0CidType2;
+    font.to_unicode = Some(ToUnicodeMap::parse(
+        b"
+        1 begincodespacerange <00> <FF> endcodespacerange
+        2 beginbfchar <57> <0057> <69> <4E2D> endbfchar",
+    ));
+    let expected = font.decode_to_string(b"WiW");
+    let (list, spans) = extract(font, b"BT /F1 10 Tf (WiW) Tj ET");
+    assert_eq!(expected, "W中W");
+    assert_eq!(spans[0].text, expected);
+    let glyphs = &spans[0].glyphs;
+    assert_eq!(glyphs.len(), 2);
+    assert_eq!(glyphs[0].text_range, 0..4);
+    assert_eq!(glyphs[1].text_range, 4..5);
+    rect(
+        search_spans(&spans, "中", true)[0].bounds(),
+        glyphs[0].bounds(),
+    );
+    assert!(list
+        .commands
+        .iter()
+        .any(|cmd| matches!(cmd, RenderCommand::DrawGlyphRun(run)
+        if run.glyphs.iter().map(|g| g.code).eq([0x5769, 0x57]))));
+}
+
+#[test]
+fn type0_three_byte_unicode_codes_share_intersecting_drawn_cells() {
+    let mut font = font();
+    font.font_type = PdfFontType::Type0CidType2;
+    font.to_unicode = Some(ToUnicodeMap::parse(
+        b"
+        1 begincodespacerange <000000> <FFFFFF> endcodespacerange
+        3 beginbfchar <010203> <0041> <040506> <0042> <0708> <0043> endbfchar",
+    ));
+    let (_, spans) = extract(font, b"BT /F1 10 Tf <0102030405060708> Tj ET");
+    assert_eq!(spans[0].text, "ABC");
+    assert_eq!(
+        spans[0]
+            .glyphs
+            .iter()
+            .map(|g| g.text_range.clone())
+            .collect::<Vec<_>>(),
+        [0..2, 0..2, 0..2, 2..3]
+    );
+}
+
+#[test]
+fn actual_text_keeps_unmapped_shows_and_cells_inside_empty_replacements() {
+    let (_, spans) = extract(
+        font(),
+        b"BT /F1 10 Tf 20 50 Td
+        /Span << /ActualText (A) >> BDC <01> Tj
+          /Span << /ActualText () >> BDC (i) Tj EMC
+        EMC <01> Tj /Span << /ActualText () >> BDC (W) Tj EMC ET",
+    );
+    assert_eq!(spans.len(), 1);
+    let span = &spans[0];
+    assert_eq!(span.text, "A");
+    assert_eq!(span.glyphs.len(), 2);
+    for glyph in &span.glyphs {
+        let b = glyph.bounds();
+        assert_eq!(
+            span.glyph_at(Point::new((b.x0 + b.x1) / 2.0, (b.y0 + b.y1) / 2.0))
+                .unwrap()
+                .text_range,
+            0..1
+        );
+    }
+    let highlight = search_spans(&spans, "A", true)[0].bounds();
+    near(highlight.x0, span.glyphs[0].bounds().x0);
+    near(highlight.x1, span.glyphs[1].bounds().x1);
+}
+
+#[test]
+fn page_geometry_budget_keeps_text_and_never_publishes_a_partial_cluster() {
+    let limits = ParseLimits {
+        max_decoded_stream_bytes: 2 * size_of::<TextGlyph>() as u64,
+        ..Default::default()
+    };
+    let mut cache = FontCache::new();
+    cache.insert("F1".into(), font());
+    let mut spans = Vec::new();
+    let (_, stats) = ContentInterpreter::new(Rect::new(0.0, 0.0, 300.0, 300.0))
+        .with_limits(&limits)
+        .with_fonts(&mut cache)
+        .with_text_sink(&mut spans)
+        .interpret_with_stats(
+            b"BT /F1 10 Tf (W) Tj /Span << /ActualText (A) >> BDC
+            (i) Tj (WW) Tj EMC (i) Tj ET",
+        );
+    assert!(stats.diagnostics.resource_limit_reached);
+    assert_eq!(
+        spans.iter().map(|s| s.text.as_str()).collect::<Vec<_>>(),
+        ["W", "A", "i"]
+    );
+    assert_eq!(
+        spans.iter().map(|s| s.glyphs.len()).collect::<Vec<_>>(),
+        [1, 0, 0]
+    );
+    near(search_spans(&spans, "A", true)[0].bounds().width(), 20.0);
+}
+
+#[test]
+fn expired_text_deadline_reports_timeout_without_publishing_a_partial_show() {
+    let mut cache = FontCache::new();
+    cache.insert("F1".into(), font());
+    for content in [
+        &b"BT /F1 10 Tf (Wi) Tj ET"[..],
+        b"BT /F1 10 Tf /Span << /ActualText (A) >> BDC [(Wi) (W)] TJ EMC ET",
+    ] {
+        let mut spans = Vec::new();
+        let (_, stats) = ContentInterpreter::new(Rect::new(0.0, 0.0, 300.0, 300.0))
+            .with_fonts(&mut cache)
+            .with_text_sink(&mut spans)
+            .with_deadline(zpdf_core::time::Instant::now())
+            .interpret_with_stats(content);
+        assert!(stats.diagnostics.time_limit_reached);
+        assert!(spans.is_empty());
+    }
+}
+
+#[test]
+fn unicode_expansion_and_replacements_share_the_page_text_byte_limit() {
+    let mut font = font();
+    font.to_unicode = Some(ToUnicodeMap::parse(
+        b"1 beginbfchar <57> <0057006F00720064> endbfchar",
+    ));
+    let mut cache = FontCache::new();
+    cache.insert("F1".into(), font);
+    let limits = ParseLimits {
+        max_decoded_stream_bytes: 7,
+        ..Default::default()
+    };
+    let mut spans = Vec::new();
+    let (_, stats) = ContentInterpreter::new(Rect::new(0.0, 0.0, 300.0, 300.0))
+        .with_limits(&limits)
+        .with_fonts(&mut cache)
+        .with_text_sink(&mut spans)
+        .interpret_with_stats(
+            b"BT /F1 10 Tf (W) Tj /Span << /ActualText (X) >> BDC
+            (W) Tj EMC [(iii) (i)] TJ ET",
+        );
+    assert!(stats.diagnostics.resource_limit_reached);
+    assert_eq!(
+        spans.iter().map(|s| s.text.as_str()).collect::<Vec<_>>(),
+        ["Word", "X"]
+    );
 }

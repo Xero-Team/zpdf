@@ -314,3 +314,16 @@ fn actual_text_scopes_do_not_leak_across_forms_or_hidden_layers() {
         "{text}"
     );
 }
+
+#[test]
+fn page_actual_text_selects_unmapped_cells_inside_a_form() {
+    let doc = actual_text_document(
+        b"/Span << /ActualText (form) >> BDC /X Do EMC",
+        b"BT /F0 12 Tf 10 100 Td <01> Tj /Span << /ActualText () >> BDC (i) Tj EMC ET",
+    );
+    let spans = extract_spans(&doc, 0);
+    assert_eq!(spans.len(), 1);
+    assert_eq!(spans[0].text, "form");
+    assert_eq!(spans[0].glyphs.len(), 2);
+    assert!(spans[0].glyphs.iter().all(|g| g.text_range == (0..4)));
+}

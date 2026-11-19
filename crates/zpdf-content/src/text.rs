@@ -56,16 +56,13 @@ impl TextGlyph {
     /// Test the transformed selection cell, including mirrored/sheared text.
     /// Degenerate cells and non-finite points are not selectable.
     pub fn contains(&self, point: Point) -> bool {
-        if !self.is_finite() || !point.x.is_finite() || !point.y.is_finite() {
+        if !point.x.is_finite() || !point.y.is_finite() {
             return false;
         }
+        let Some((u, v, det)) = self.selection_basis() else {
+            return false;
+        };
         let p = self.quad[0];
-        let u = Point::new(self.quad[1].x - p.x, self.quad[1].y - p.y);
-        let v = Point::new(self.quad[3].x - p.x, self.quad[3].y - p.y);
-        let det = u.x * v.y - u.y * v.x;
-        if det == 0.0 || !det.is_finite() {
-            return false;
-        }
         let dx = point.x - p.x;
         let dy = point.y - p.y;
         let a = (dx * v.y - dy * v.x) / det;
@@ -73,11 +70,24 @@ impl TextGlyph {
         (0.0..=1.0).contains(&a) && (0.0..=1.0).contains(&b)
     }
 
-    pub(crate) fn is_finite(&self) -> bool {
-        self.quad
+    pub(crate) fn selectable_bounds(&self) -> Option<Rect> {
+        self.selection_basis().map(|_| self.bounds())
+    }
+
+    fn selection_basis(&self) -> Option<(Point, Point, f64)> {
+        if !self
+            .quad
             .iter()
             .chain([&self.origin, &self.advance])
             .all(|p| p.x.is_finite() && p.y.is_finite())
+        {
+            return None;
+        }
+        let p = self.quad[0];
+        let u = Point::new(self.quad[1].x - p.x, self.quad[1].y - p.y);
+        let v = Point::new(self.quad[3].x - p.x, self.quad[3].y - p.y);
+        let det = u.x * v.y - u.y * v.x;
+        (det.is_finite() && det != 0.0).then_some((u, v, det))
     }
 }
 
@@ -98,9 +108,9 @@ pub struct TextSpan {
     /// the run to a Tagged-PDF structure element (see [`struct_ordered_text`]).
     pub mcid: Option<i32>,
     /// Positioned glyphs in source order, with ordered UTF-8 ranges into `text`.
-    /// Ranges are disjoint except for identical ranges in an ActualText cluster.
-    /// Collected only when a text sink is attached. Caller-constructed spans
-    /// may leave this empty; search then uses the legacy advance interpolation.
+    /// A cluster can share an identical range across multiple glyphs. The
+    /// list is empty for manually constructed spans or when the page's glyph
+    /// budget cannot cover the whole run. Search then interpolates its advance.
     pub glyphs: Vec<TextGlyph>,
 }
 

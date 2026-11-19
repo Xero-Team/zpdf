@@ -24,27 +24,19 @@ pub struct SearchHit {
     /// Length of the match in chars.
     pub len: usize,
     /// Page-space rectangles (PDF user space, y-up) covering the matched
-    /// characters. One rect per matched line for now; kept as a Vec so
-    /// cross-line matches can be represented later without an API break.
+    /// characters. Empty when the match has no selectable geometry.
     pub rects: Vec<Rect>,
 }
 
 impl SearchHit {
-    /// Bounding rectangle over all of the hit's rectangles.
+    /// Bounding rectangle over the hit's rectangles, or a zero rectangle at
+    /// the origin when the text has no highlight.
     pub fn bounds(&self) -> Rect {
-        let mut r = Rect::new(
-            f64::INFINITY,
-            f64::INFINITY,
-            f64::NEG_INFINITY,
-            f64::NEG_INFINITY,
-        );
-        for q in &self.rects {
-            r.x0 = r.x0.min(q.x0);
-            r.y0 = r.y0.min(q.y0);
-            r.x1 = r.x1.max(q.x1);
-            r.y1 = r.y1.max(q.y1);
-        }
-        r
+        self.rects
+            .iter()
+            .copied()
+            .reduce(union)
+            .unwrap_or(Rect::new(0.0, 0.0, 0.0, 0.0))
     }
 }
 
@@ -52,7 +44,7 @@ impl SearchHit {
 /// characters may share the same glyph/cluster (e.g. a ToUnicode ligature).
 struct LineChar {
     ch: char,
-    bounds: Rect,
+    bounds: Option<Rect>,
     /// True for the space inserted at a word gap between spans (it has no
     /// glyph of its own; its extent is the gap).
     synthetic: bool,
@@ -177,7 +169,7 @@ fn build_lines(spans: &[TextSpan]) -> Vec<Vec<LineChar>> {
                     {
                         chars.push(LineChar {
                             ch: ' ',
-                            bounds: Rect::new(end, s.y, sx0, s.y),
+                            bounds: Some(Rect::new(end, s.y, sx0, s.y)),
                             synthetic: true,
                         });
                     }
@@ -188,11 +180,12 @@ fn build_lines(spans: &[TextSpan]) -> Vec<Vec<LineChar>> {
                 let mut clusters: Vec<(std::ops::Range<usize>, Rect)> = Vec::new();
                 for glyph in &s.glyphs {
                     let range = &glyph.text_range;
-                    if range.is_empty() || !glyph.is_finite() || s.text.get(range.clone()).is_none()
-                    {
+                    if range.is_empty() || s.text.get(range.clone()).is_none() {
                         continue;
                     }
-                    let rect = glyph.bounds();
+                    let Some(rect) = glyph.selectable_bounds() else {
+                        continue;
+                    };
                     if let Some((_, bounds)) = clusters.last_mut().filter(|(r, _)| r == range) {
                         *bounds = union(*bounds, rect);
                     } else {
@@ -200,9 +193,10 @@ fn build_lines(spans: &[TextSpan]) -> Vec<Vec<LineChar>> {
                     }
                 }
                 let mut clusters = clusters.iter().peekable();
-                // Only callers without mapped glyph data need interpolation.
-                let n = s.text.chars().count();
-                let step = if n > 0 { s.advance / n as f64 } else { 0.0 };
+                let step = s
+                    .glyphs
+                    .is_empty()
+                    .then(|| (sx1 - sx0) / s.text.chars().count() as f64);
                 for (k, (offset, ch)) in s.text.char_indices().enumerate() {
                     while clusters
                         .peek()
@@ -214,14 +208,16 @@ fn build_lines(spans: &[TextSpan]) -> Vec<Vec<LineChar>> {
                         .peek()
                         .filter(|(range, _)| range.contains(&offset))
                         .map(|(_, bounds)| *bounds)
-                        .unwrap_or_else(|| {
-                            Rect::new(
-                                s.x + step * k as f64,
-                                s.y - 0.2 * s.size as f64,
-                                s.x + step * (k + 1) as f64,
-                                s.y + 0.8 * s.size as f64,
-                            )
-                            .normalize()
+                        .or_else(|| {
+                            step.map(|step| {
+                                Rect::new(
+                                    sx0 + step * k as f64,
+                                    s.y - 0.2 * s.size as f64,
+                                    sx0 + step * (k + 1) as f64,
+                                    s.y + 0.8 * s.size as f64,
+                                )
+                                .normalize()
+                            })
                         });
                     chars.push(LineChar {
                         ch,
@@ -244,26 +240,31 @@ fn hit_from(line: &[LineChar], start: usize, len: usize) -> SearchHit {
     // Synthetic gap spaces have no glyph and do not affect the y-extent.
     let (mut x0, mut x1) = (f64::INFINITY, f64::NEG_INFINITY);
     let (mut y0, mut y1) = (f64::INFINITY, f64::NEG_INFINITY);
+    let mut gap_y = 0.0;
     for c in matched {
-        x0 = x0.min(c.bounds.x0);
-        x1 = x1.max(c.bounds.x1);
-        if !c.synthetic {
-            y0 = y0.min(c.bounds.y0);
-            y1 = y1.max(c.bounds.y1);
+        let Some(bounds) = c.bounds else { continue };
+        x0 = x0.min(bounds.x0);
+        x1 = x1.max(bounds.x1);
+        if c.synthetic {
+            gap_y = bounds.y0;
+        } else {
+            y0 = y0.min(bounds.y0);
+            y1 = y1.max(bounds.y1);
         }
     }
-    if !y0.is_finite() {
-        // Match consisted solely of synthetic spaces; fall back to baseline.
-        let y = matched.first().map(|c| c.bounds.y0).unwrap_or(0.0);
-        y0 = y;
-        y1 = y;
-    }
+    let rects = if !x0.is_finite() {
+        Vec::new()
+    } else if !y0.is_finite() {
+        vec![Rect::new(x0, gap_y, x1, gap_y)]
+    } else {
+        vec![Rect::new(x0, y0, x1, y1)]
+    };
 
     SearchHit {
         line: String::new(),
         start,
         len,
-        rects: vec![Rect::new(x0, y0, x1, y1)],
+        rects,
     }
 }
 
@@ -322,6 +323,15 @@ mod tests {
         assert!((r.x1 - 76.0).abs() < 1e-6, "x1={}", r.x1);
         assert!((r.y0 - (700.0 - 2.4)).abs() < 1e-6);
         assert!((r.y1 - (700.0 + 9.6)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn legacy_interpolation_starts_at_the_left_edge_for_negative_advances() {
+        let spans = [span("ab", 30.0, 50.0, 10.0, -20.0)];
+        assert_eq!(
+            search_spans(&spans, "a", true)[0].bounds(),
+            Rect::new(10.0, 48.0, 20.0, 58.0)
+        );
     }
 
     #[test]

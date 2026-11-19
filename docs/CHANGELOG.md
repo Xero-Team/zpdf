@@ -8,6 +8,10 @@
   Search uses glyph bounds for unequal widths, spacing, transformed text and
   vertical metrics; ligatures and `/ActualText` retain whole-cluster geometry.
   `TextSpan::glyph_at` supports point selection against transformed cells.
+- Bound page text extraction by the decoded-byte limit and check the page
+  deadline inside text shows. Glyph records have a separate 16 MiB ceiling.
+  Over-budget runs retain approximate search bounds. Matches whose cells are
+  all degenerate or non-finite have an empty highlight.
 - Rebuild the browser WASM package and source fingerprint for the updated
   text-extraction implementation.
 - **Source compatibility:** exhaustive `TextSpan` literals must add

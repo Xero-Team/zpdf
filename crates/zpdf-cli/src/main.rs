@@ -1283,16 +1283,20 @@ fn cmd_search(args: &[String]) -> zpdf::Result<()> {
         }
 
         for hit in zpdf::search_spans(&spans, query, case_sensitive) {
-            let r = hit.bounds();
-            println!(
-                "p.{} [{:.1},{:.1} {:.1},{:.1}]  {}",
-                pi + 1,
-                r.x0,
-                r.y0,
-                r.x1,
-                r.y1,
-                hit.line.trim()
-            );
+            if hit.rects.is_empty() {
+                println!("p.{}  {}", pi + 1, hit.line.trim());
+            } else {
+                let r = hit.bounds();
+                println!(
+                    "p.{} [{:.1},{:.1} {:.1},{:.1}]  {}",
+                    pi + 1,
+                    r.x0,
+                    r.y0,
+                    r.x1,
+                    r.y1,
+                    hit.line.trim()
+                );
+            }
             total += 1;
         }
     }
