@@ -120,6 +120,10 @@ pub struct ContentInterpreter<'a> {
     /// innermost last. Lookups search these before the page resources.
     form_resources: Vec<ResourceDict>,
     form_depth: u32,
+    /// Object ids of the form XObjects currently being interpreted. A form
+    /// that draws itself (directly, or through a pattern cell) recurses
+    /// forever, so re-entry is refused instead of fanning out to the budget.
+    active_forms: Vec<ObjectId>,
     /// `Q` must never pop the state stack below this index — a form XObject
     /// raises it past its own saved state so an unbalanced `Q` inside the
     /// form cannot corrupt the page-level state.
@@ -770,6 +774,7 @@ impl<'a> ContentInterpreter<'a> {
             font_override: false,
             form_resources: Vec::new(),
             form_depth: 0,
+            active_forms: Vec::new(),
             state_floor: 0,
             text_sink: None,
             text_geometry: false,
@@ -4493,6 +4498,12 @@ impl<'a> ContentInterpreter<'a> {
             tracing::warn!("form XObject nesting exceeds {MAX_FORM_DEPTH}; skipping");
             return;
         }
+        if let Some(id) = xobj_id.filter(|id| self.active_forms.contains(id)) {
+            self.stats.diagnostics.malformed_content =
+                self.stats.diagnostics.malformed_content.saturating_add(1);
+            tracing::warn!("form XObject {id} draws itself; skipping the recursion");
+            return;
+        }
         // Stop descending once the page budget is spent — bounds exponential
         // form fanout (depth is capped but repetition is not).
         if self.over_budget() {
@@ -4639,6 +4650,7 @@ impl<'a> ContentInterpreter<'a> {
         }
 
         self.form_depth += 1;
+        self.active_forms.extend(xobj_id);
         // A pending `W` belongs to the stream that set it: the invoking
         // stream's waits for its own painting operator (a pattern fill runs
         // this form while painting), and one the form leaves unpainted ends
@@ -4669,6 +4681,9 @@ impl<'a> ContentInterpreter<'a> {
         self.close_marked_content();
         self.pending_clip = outer_clip;
         self.form_depth -= 1;
+        if xobj_id.is_some() {
+            self.active_forms.pop();
+        }
 
         // Balance: pop clips opened by any unbalanced q-levels left by the
         // form, then restore the state saved at entry.
