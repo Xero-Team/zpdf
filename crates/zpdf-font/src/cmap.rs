@@ -113,6 +113,21 @@ impl ToUnicodeMap {
         }
     }
 
+    /// Decode a composite string when no encoding CMap supplies its code
+    /// boundaries. A single declared width takes precedence over Identity's
+    /// two-byte convention, including for a short final code.
+    pub fn append_fixed_width(&self, bytes: &[u8], out: &mut String) {
+        let width = match self.code_byte_lengths() {
+            &[width] => usize::from(width),
+            _ => 2,
+        };
+        for code in bytes.chunks(width) {
+            if let Some(text) = self.lookup(bytes_to_code(code)) {
+                out.push_str(text);
+            }
+        }
+    }
+
     /// Source byte length of a mapped key written with leading zero bytes:
     /// `<0041>` is a two-byte code although its value fits in one byte.
     pub fn padded_length(&self, code: u32) -> Option<u8> {

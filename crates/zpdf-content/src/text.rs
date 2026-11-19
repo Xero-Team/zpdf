@@ -1,14 +1,97 @@
 //! Extracted text spans, produced by running the interpreter with a text sink.
 //!
 //! Each span corresponds to one show-text operation (Tj/TJ element/'/"), carrying
-//! the decoded Unicode and the baseline origin in PDF user space (y-up).
+//! the decoded Unicode, baseline origin and positioned glyphs in PDF user
+//! space (y-up).
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 
+use zpdf_core::{Point, Rect};
 use zpdf_document::{StructElem, StructKid, StructTree};
 
-#[derive(Debug, Clone)]
+/// One positioned PDF glyph and its mapping into [`TextSpan::text`].
+///
+/// Geometry uses the same positions and advances as rendering. The selection
+/// cell uses the font's ascent/descent, not the outline's ink bounds, so spaces
+/// remain selectable. All coordinates are in PDF user space (y-up).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextGlyph {
+    /// UTF-8 byte range in the containing span (not a character index). A
+    /// ligature can cover several Unicode characters; an unmapped glyph has
+    /// an empty range. For `/ActualText`, every replaced glyph covers the
+    /// entire replacement range: that cluster cannot be split reliably.
+    pub text_range: Range<usize>,
+    /// Glyph's horizontal baseline origin, including text rise and vertical
+    /// writing's position vector.
+    pub origin: Point,
+    /// Glyph advance vector, excluding character/word spacing and TJ offsets.
+    /// Those offsets are already reflected in subsequent glyph origins.
+    pub advance: Point,
+    /// Selection cell corners: lower-left, lower-right, upper-right, upper-left
+    /// in text space, then transformed to page space. Retains rotation, shear
+    /// and reflection; use [`Self::bounds`] for an axis-aligned rectangle.
+    pub quad: [Point; 4],
+}
+
+impl TextGlyph {
+    /// Axis-aligned page-space bounds of the selection cell.
+    pub fn bounds(&self) -> Rect {
+        let mut bounds = Rect::new(
+            f64::INFINITY,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NEG_INFINITY,
+        );
+        for p in self.quad {
+            bounds.x0 = bounds.x0.min(p.x);
+            bounds.y0 = bounds.y0.min(p.y);
+            bounds.x1 = bounds.x1.max(p.x);
+            bounds.y1 = bounds.y1.max(p.y);
+        }
+        bounds
+    }
+
+    /// Test the transformed selection cell, including mirrored/sheared text.
+    /// Degenerate cells and non-finite points are not selectable.
+    pub fn contains(&self, point: Point) -> bool {
+        if !point.x.is_finite() || !point.y.is_finite() {
+            return false;
+        }
+        let Some((u, v, det)) = self.selection_basis() else {
+            return false;
+        };
+        let p = self.quad[0];
+        let dx = point.x - p.x;
+        let dy = point.y - p.y;
+        let a = (dx * v.y - dy * v.x) / det;
+        let b = (u.x * dy - u.y * dx) / det;
+        (0.0..=1.0).contains(&a) && (0.0..=1.0).contains(&b)
+    }
+
+    pub(crate) fn selectable_bounds(&self) -> Option<Rect> {
+        self.selection_basis().map(|_| self.bounds())
+    }
+
+    fn selection_basis(&self) -> Option<(Point, Point, f64)> {
+        if !self
+            .quad
+            .iter()
+            .chain([&self.origin, &self.advance])
+            .all(|p| p.x.is_finite() && p.y.is_finite())
+        {
+            return None;
+        }
+        let p = self.quad[0];
+        let u = Point::new(self.quad[1].x - p.x, self.quad[1].y - p.y);
+        let v = Point::new(self.quad[3].x - p.x, self.quad[3].y - p.y);
+        let det = u.x * v.y - u.y * v.x;
+        (det.is_finite() && det != 0.0).then_some((u, v, det))
+    }
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct TextSpan {
     /// Decoded Unicode text for this show-text operation.
     pub text: String,
@@ -24,9 +107,25 @@ pub struct TextSpan {
     /// sequence, or `None` when this run is outside any (or carries none). Binds
     /// the run to a Tagged-PDF structure element (see [`struct_ordered_text`]).
     pub mcid: Option<i32>,
+    /// Positioned glyphs in source order, with ordered UTF-8 ranges into `text`.
+    /// A cluster can share an identical range across multiple glyphs. The
+    /// list is empty unless the interpreter ran `with_text_geometry(true)`, for
+    /// manually constructed spans, and when the page's glyph budget cannot
+    /// cover the whole run. Search then interpolates its advance.
+    pub glyphs: Vec<TextGlyph>,
 }
 
 impl TextSpan {
+    /// First mapped glyph whose selection cell contains a page-space point.
+    /// Its `text_range` selects the whole Unicode cluster (including ligatures).
+    pub fn glyph_at(&self, point: Point) -> Option<&TextGlyph> {
+        self.glyphs.iter().find(|g| {
+            !g.text_range.is_empty()
+                && self.text.get(g.text_range.clone()).is_some()
+                && g.contains(point)
+        })
+    }
+
     /// Left/right x-bounds of the span (advance may be negative).
     pub(crate) fn x_bounds(&self) -> (f64, f64) {
         (
@@ -58,22 +157,24 @@ impl TextSpan {
 /// `line_tol` is the minimum baseline tolerance for grouping spans onto one line
 /// (an adaptive `0.5 · font size` is also applied).
 pub fn spans_to_text(spans: Vec<TextSpan>, line_tol: f64) -> String {
-    let spans: Vec<TextSpan> = spans
-        .into_iter()
-        .filter(|s| !s.text.is_empty() && s.is_finite())
-        .collect();
-    if spans.is_empty() {
+    layout_text(&spans, (0..spans.len()).collect(), line_tol)
+}
+
+/// [`spans_to_text`] over the spans at `indices`. The layout reads text and
+/// metrics only, so the spans (and their glyph cells) are borrowed, not copied.
+fn layout_text(spans: &[TextSpan], mut indices: Vec<usize>, line_tol: f64) -> String {
+    indices.retain(|&i| !spans[i].text.is_empty() && spans[i].is_finite());
+    if indices.is_empty() {
         return String::new();
     }
-    let unit = median_size(&spans).max(1.0);
-    let indices: Vec<usize> = (0..spans.len()).collect();
+    let unit = median_size(&indices, spans).max(1.0);
 
     let mut blocks: Vec<Vec<usize>> = Vec::new();
-    xy_cut(&indices, &spans, unit, 0, true, &mut blocks);
+    xy_cut(&indices, spans, unit, 0, true, &mut blocks);
 
     let mut out = String::new();
     for block in &blocks {
-        let text = block_to_text(block, &spans, line_tol);
+        let text = block_to_text(block, spans, line_tol);
         if text.is_empty() {
             continue;
         }
@@ -202,10 +303,10 @@ fn group_rows(idx: &[usize], spans: &[TextSpan], unit: f64) -> Vec<Vec<usize>> {
     rows
 }
 
-fn median_size(spans: &[TextSpan]) -> f64 {
-    let mut sizes: Vec<f64> = spans
+fn median_size(idx: &[usize], spans: &[TextSpan]) -> f64 {
+    let mut sizes: Vec<f64> = idx
         .iter()
-        .map(|s| s.size as f64)
+        .map(|&i| spans[i].size as f64)
         .filter(|z| *z > 0.0)
         .collect();
     if sizes.is_empty() {
@@ -490,22 +591,18 @@ pub fn struct_ordered_text(spans: &[TextSpan], page_index: usize, tree: &StructT
     // Append any of this page's text the tree left unplaced (no MCID, or an MCID
     // no element referenced) in geometric order. This also covers a fully
     // untagged page (every span is leftover → the geometric reading order).
-    let leftover: Vec<TextSpan> = spans
-        .iter()
-        .filter(|s| match s.mcid {
+    let leftover: Vec<usize> = (0..spans.len())
+        .filter(|&i| match spans[i].mcid {
             Some(m) => !consumed.contains(&(m as i64)),
             None => true,
         })
-        .cloned()
         .collect();
-    if !leftover.is_empty() {
-        let extra = spans_to_text(leftover, 2.0);
-        if !extra.is_empty() {
-            if !result.is_empty() {
-                result.push('\n');
-            }
-            result.push_str(&extra);
+    let extra = layout_text(spans, leftover, 2.0);
+    if !extra.is_empty() {
+        if !result.is_empty() {
+            result.push('\n');
         }
+        result.push_str(&extra);
     }
     result
 }
@@ -665,6 +762,7 @@ mod tests {
             size,
             advance: text.chars().count() as f64 * size as f64 * 0.5,
             mcid: None,
+            glyphs: Vec::new(),
         }
     }
 
@@ -744,6 +842,7 @@ mod tests {
                 size: 12.0,
                 advance: 30.0,
                 mcid: None,
+                glyphs: Vec::new(),
             },
         ];
         assert_eq!(spans_to_text(spans, 2.0), "Hello World");

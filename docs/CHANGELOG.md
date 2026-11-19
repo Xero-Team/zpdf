@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+- Re-export `InkAnnotDict` and `InkAnnotationBuilder` from the `zpdf` facade.
+- Add `TextSpan::glyphs` and public `TextGlyph` selection cells, UTF-8 cluster
+  ranges, origins and advance vectors, captured alongside rendering positions.
+  Search uses glyph bounds for unequal widths, spacing, transformed text and
+  vertical metrics; ligatures and `/ActualText` retain whole-cluster geometry.
+  `TextSpan::glyph_at` supports point selection against transformed cells.
+- Glyph cells are collected on request, with the new
+  `ContentInterpreter::with_text_geometry(true)` next to `with_text_sink`.
+  Plain text extraction (`zpdf text`, `tables`, `convert_pdf`, WASM
+  `page_text`) allocates none, and `struct_ordered_text` no longer copies the
+  spans the structure tree leaves unplaced. `zpdf search` requests the cells.
+- Cell heights use the font's ascent and descent within 1 em above and half
+  an em below the baseline, so fonts that declare line metrics of several em
+  (math faces) or a positive descender cannot cover neighbouring lines.
+- Bound page text extraction by the decoded-byte limit and check the page
+  deadline inside long text shows and `TJ` arrays. Glyph records have a
+  separate 16 MiB ceiling that counts only records reaching a span.
+  Runs over the geometry ceiling retain searchable text and approximate bounds.
+  Exhausting the text byte allowance preserves completed spans and allows
+  rendering to finish. An `/ActualText` sequence interrupted by any time or
+  resource limit keeps its replacement text without glyph cells. Matches
+  whose cells are all degenerate or non-finite have an empty highlight.
+- Rebuild the browser WASM package and source fingerprint for the updated
+  text-extraction implementation.
+- **Source compatibility:** exhaustive `TextSpan` literals must add
+  `glyphs: Vec::new()` or use the new `..TextSpan::default()`. Empty glyph lists
+  retain the existing approximate search geometry. `SearchHit::bounds()` now
+  returns `Option<Rect>`: `None` for a match with no rectangle, instead of a
+  rectangle that could be mistaken for one at the page origin.
+
 ## 0.20.0 — Shared stream storage and lower pipeline memory
 
 Released 2026-11-16.
