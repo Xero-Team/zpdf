@@ -125,7 +125,10 @@ pub struct ContentInterpreter<'a> {
     /// form cannot corrupt the page-level state.
     state_floor: usize,
     text_sink: Option<&'a mut Vec<TextSpan>>,
-    /// Cumulative selection cells admitted across this page and its forms.
+    /// Whether collected spans also carry positioned glyph cells.
+    text_geometry: bool,
+    /// Selection cells held by the sink and the open replacement, across this
+    /// page and its forms. Cells of a run that is not kept are not counted.
     text_glyphs_collected: usize,
     /// UTF-8 produced by text decoding and marked-content replacements.
     extracted_text_bytes: u64,
@@ -256,8 +259,12 @@ struct ActualText {
 }
 
 impl ActualText {
-    fn add_source(&mut self, mut run: TextSpan) {
+    /// Add one show to the cluster. `retained` is the page's count of held
+    /// glyph cells: it grows with the cells kept here and gets back the ones
+    /// an approximate cluster gives up.
+    fn add_source(&mut self, mut run: TextSpan, retained: &mut usize) {
         if !self.has_source {
+            *retained += run.glyphs.len();
             run.text = std::mem::take(&mut self.span.text);
             run.mcid = self.span.mcid;
             self.span = run;
@@ -267,15 +274,31 @@ impl ActualText {
         self.span.advance = run.x + run.advance - self.span.x;
         if run.glyphs.is_empty() {
             // One omitted run makes the whole cluster approximate.
-            self.span.glyphs = Vec::new();
-            self.following_glyphs.clear();
+            *retained = retained.saturating_sub(self.release_glyphs());
         } else if !self.span.glyphs.is_empty() {
+            *retained += run.glyphs.len();
             self.following_glyphs.push(run.glyphs);
         }
     }
 
-    fn finish(mut self, sink: &mut Vec<TextSpan>) {
-        if self.span.text.is_empty() || !self.span.is_finite() {
+    /// Drop the cluster's cells and return how many it held.
+    fn release_glyphs(&mut self) -> usize {
+        let released =
+            self.span.glyphs.len() + self.following_glyphs.iter().map(Vec::len).sum::<usize>();
+        self.span.glyphs = Vec::new();
+        self.following_glyphs.clear();
+        released
+    }
+
+    /// Publish the replacement. A cluster that a page limit cut short keeps
+    /// its text, like the spans before it, but only a complete cluster keeps
+    /// its glyph cells.
+    fn finish(mut self, complete: bool, sink: &mut Vec<TextSpan>, retained: &mut usize) {
+        let publish = !self.span.text.is_empty() && self.span.is_finite();
+        if !(publish && complete) {
+            *retained = retained.saturating_sub(self.release_glyphs());
+        }
+        if !publish {
             return;
         }
         self.span
@@ -363,9 +386,13 @@ const INTERPRET_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
 /// budget lowers it as well. Text and rendering survive an omitted glyph run.
 const MAX_TEXT_GEOMETRY_BYTES: u64 = 16 << 20;
 
-/// One text operator can contain many glyphs or TJ elements.
+/// One text operator can contain many glyphs or TJ elements, so its loops check
+/// the deadline every 256 items. Index 0 is left out: an ordinary short show
+/// never reads the clock and relies on the operator loop's sampling.
 fn text_deadline_reached(index: usize, deadline: Option<zpdf_core::time::Instant>) -> bool {
-    index.is_multiple_of(256) && deadline.is_some_and(|end| zpdf_core::time::Instant::now() >= end)
+    index != 0
+        && index.is_multiple_of(256)
+        && deadline.is_some_and(|end| zpdf_core::time::Instant::now() >= end)
 }
 
 /// Default [`ContentInterpreter::max_commands`]. Real pages run to at most low
@@ -745,6 +772,7 @@ impl<'a> ContentInterpreter<'a> {
             form_depth: 0,
             state_floor: 0,
             text_sink: None,
+            text_geometry: false,
             text_glyphs_collected: 0,
             extracted_text_bytes: 0,
             rule_sink: None,
@@ -918,6 +946,15 @@ impl<'a> ContentInterpreter<'a> {
         self.timed_out
     }
 
+    /// Whether a limit has ended interpretation. Unlike [`Self::over_budget`]
+    /// this reads no clock and records nothing.
+    fn cut_short(&self) -> bool {
+        self.timed_out
+            || self.resource_limit_hit
+            || self.display_list.commands.len() >= self.max_commands
+            || self.ops_executed >= self.max_ops
+    }
+
     /// M3 Fix: Check operand stack depth before pushing. Returns true if the
     /// push would exceed the limit.
     fn operand_stack_full(&self) -> bool {
@@ -1069,11 +1106,22 @@ impl<'a> ContentInterpreter<'a> {
         self
     }
 
-    /// Collect decoded text spans and positioned glyph selection cells in
-    /// addition to building the display list. With no sink, no text geometry or
-    /// Unicode mapping is allocated.
+    /// Collect decoded text spans (for the `text` command / extraction) in
+    /// addition to building the display list. With no sink, no Unicode mapping
+    /// is allocated. Spans carry glyph selection cells only when
+    /// [`Self::with_text_geometry`] asks for them.
     pub fn with_text_sink(mut self, sink: &'a mut Vec<TextSpan>) -> Self {
         self.text_sink = Some(sink);
+        self
+    }
+
+    /// Also record a positioned selection cell for every glyph of the spans
+    /// the text sink collects ([`TextSpan::glyphs`]), for character selection
+    /// and glyph-accurate search highlights. Off by default: plain text
+    /// extraction reads only the decoded string and the span metrics, and each
+    /// cell takes about 100 bytes. Has no effect without a text sink.
+    pub fn with_text_geometry(mut self, enabled: bool) -> Self {
+        self.text_geometry = enabled;
         self
     }
 
@@ -1198,9 +1246,7 @@ impl<'a> ContentInterpreter<'a> {
         }
 
         self.stats.diagnostics.merge(tokenizer.diagnostics());
-        while !self.mc_stack.is_empty() {
-            self.end_marked_content();
-        }
+        self.close_marked_content();
         // Annotation appearances render independently of wherever the page
         // content stream left the graphics state (12.5.5): drop a `W` never
         // painted, rebalance any unclosed q-levels and top-level W clips, then
@@ -1832,7 +1878,7 @@ impl<'a> ContentInterpreter<'a> {
                     ends_actual_text,
                 });
             }
-            "EMC" => self.end_marked_content(),
+            "EMC" => self.end_marked_content(true),
             "MP" | "DP" => {}
             "BX" => self.compatibility_depth = self.compatibility_depth.saturating_add(1),
             "EX" => self.compatibility_depth = self.compatibility_depth.saturating_sub(1),
@@ -3169,17 +3215,26 @@ impl<'a> ContentInterpreter<'a> {
         })
     }
 
-    /// Publish the outer replacement once its source glyphs are complete.
-    fn end_marked_content(&mut self) {
+    /// Close the sequences a stream left open. Every limit that ends
+    /// interpretation is treated alike: a replacement it interrupted has not
+    /// seen all of its source glyphs.
+    fn close_marked_content(&mut self) {
+        let complete = !self.cut_short();
+        while !self.mc_stack.is_empty() {
+            self.end_marked_content(complete);
+        }
+    }
+
+    /// Publish the outer replacement. `complete` is false when a limit ended
+    /// the stream before the sequence's own `EMC`.
+    fn end_marked_content(&mut self, complete: bool) {
         let ends_actual_text = self
             .mc_stack
             .pop()
             .is_some_and(|frame| frame.ends_actual_text);
         if let Some(sink) = self.text_sink.as_mut().filter(|_| ends_actual_text) {
             if let Some(actual) = self.active_actual_text.take() {
-                if !self.timed_out && !self.resource_limit_hit {
-                    actual.finish(sink);
-                }
+                actual.finish(complete, sink, &mut self.text_glyphs_collected);
             }
         }
         if self.oc_hidden_from == Some(self.mc_depth) {
@@ -4594,9 +4649,7 @@ impl<'a> ContentInterpreter<'a> {
             }
         }
         self.stats.diagnostics.merge(tokenizer.diagnostics());
-        while !self.mc_stack.is_empty() {
-            self.end_marked_content();
-        }
+        self.close_marked_content();
         self.pending_clip = outer_clip;
         self.form_depth -= 1;
 
@@ -5713,6 +5766,7 @@ impl<'a> ContentInterpreter<'a> {
 
         // Decode the text and compute its user-space placement for extraction,
         // while the immutable font borrow is still live.
+        let mut geometry_omitted = false;
         let text_span = 'extract: {
             if !want_text {
                 break 'extract None;
@@ -5731,11 +5785,7 @@ impl<'a> ContentInterpreter<'a> {
                     [4] => Some((map, 4)),
                     _ => None,
                 });
-            let (descent, ascent) = font
-                .filter(|f| f.units_per_em.is_finite() && f.units_per_em > 0.0)
-                .map(|f| (f.descent / f.units_per_em, f.ascent / f.units_per_em))
-                .filter(|(d, a)| d.is_finite() && a.is_finite() && d < a)
-                .unwrap_or((-0.2, 0.8));
+            let (descent, ascent) = selection_cell_extent(font);
             let mut decoded = String::new();
             let remaining_text_bytes =
                 self.parse_limits.max_decoded_stream_bytes - self.extracted_text_bytes;
@@ -5748,13 +5798,16 @@ impl<'a> ContentInterpreter<'a> {
                 .active_actual_text
                 .as_ref()
                 .is_none_or(|actual| !actual.has_source || !actual.span.glyphs.is_empty());
-            let collect_geometry = cluster_keeps_geometry
-                && glyphs.len() <= glyph_limit.saturating_sub(self.text_glyphs_collected);
+            // The allowance is charged when the run is kept (below), so a run
+            // that decodes to nothing does not use it up.
+            let within_allowance =
+                glyphs.len() <= glyph_limit.saturating_sub(self.text_glyphs_collected);
+            let wants_geometry = self.text_geometry && cluster_keeps_geometry;
+            let collect_geometry = wants_geometry && within_allowance;
+            geometry_omitted = wants_geometry && !within_allowance;
             let mut text_glyphs = if collect_geometry {
-                self.text_glyphs_collected += glyphs.len();
                 Vec::with_capacity(glyphs.len())
             } else {
-                self.stats.text_geometry_omitted = true;
                 Vec::new()
             };
             let mut offset = 0;
@@ -5889,13 +5942,20 @@ impl<'a> ContentInterpreter<'a> {
         // Hidden optional-content layers also extract no text (emit_painted
         // already drops the glyph run; the matrix advance below still runs).
         if let (Some(span), Some(sink)) = (text_span, self.text_sink.as_mut()) {
-            if let Some(actual) = &mut self.active_actual_text {
+            let kept = if let Some(actual) = &mut self.active_actual_text {
                 if !bytes.is_empty() {
-                    actual.add_source(span);
+                    actual.add_source(span, &mut self.text_glyphs_collected);
                 }
+                !bytes.is_empty()
             } else if !span.text.is_empty() {
+                self.text_glyphs_collected += span.glyphs.len();
                 sink.push(span);
-            }
+                true
+            } else {
+                false
+            };
+            // A run that reaches no span has no geometry to miss.
+            self.stats.text_geometry_omitted |= kept && geometry_omitted;
         }
 
         // Advance the text matrix along the writing direction.
@@ -6342,6 +6402,26 @@ pub(crate) fn next_text_code(
     };
     let end = (offset + length.max(1)).min(bytes.len());
     Some((code, length, fold(&bytes[offset..end]), end))
+}
+
+/// Vertical extent of a selection cell in em, as `(descent, ascent)`.
+///
+/// A font's line metrics cannot be used unchecked: math and Nastaliq faces
+/// declare several em, and some store the descender as a positive number.
+/// The cell stays within 1 em above and half an em below the baseline, so it
+/// cannot cover the neighbouring lines. Missing or non-finite metrics give
+/// the conventional 0.8/−0.2 box.
+fn selection_cell_extent(font: Option<&zpdf_font::LoadedFont>) -> (f64, f64) {
+    const DEFAULT: (f64, f64) = (-0.2, 0.8);
+    let Some(font) = font.filter(|f| f.units_per_em.is_finite() && f.units_per_em > 0.0) else {
+        return DEFAULT;
+    };
+    let ascent = font.ascent / font.units_per_em;
+    let descent = font.descent / font.units_per_em;
+    if !(ascent.is_finite() && descent.is_finite() && ascent > 0.0) {
+        return DEFAULT;
+    }
+    (-descent.abs().min(0.5), ascent.clamp(0.5, 1.0))
 }
 
 /// Whether `build_glyph_clip_path` can read outlines from this font at all.

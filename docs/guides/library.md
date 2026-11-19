@@ -155,8 +155,11 @@ println!("{text}");
 ```
 
 Each `TextSpan` carries the decoded text, position, size and a `glyphs` list.
-Keep the spans before consuming them with `spans_to_text` to implement selection
-or search:
+The list is empty unless the interpreter is also asked for glyph geometry:
+plain text extraction reads only the string and the span metrics, and a glyph
+record takes about 100 bytes. To implement selection or search, add
+`.with_text_geometry(true)` after `.with_text_sink(&mut spans)` and keep the
+spans before consuming them with `spans_to_text`:
 
 ```rust
 // `point` is in PDF user space (y-up), after undoing the viewer's page transform.
@@ -167,7 +170,12 @@ for span in &spans {
         println!("{selected}: {:?}", glyph.quad);
     }
 }
-let hits = zpdf::search_spans(&spans, "search text", false);
+for hit in zpdf::search_spans(&spans, "search text", false) {
+    // `None`: the match has text but no rectangle to highlight or scroll to.
+    if let Some(bounds) = hit.bounds() {
+        println!("{}: {bounds:?}", hit.line);
+    }
+}
 ```
 
 Each `TextGlyph` has a UTF-8 **byte range** into its span, a page-space origin,
@@ -177,7 +185,10 @@ rotation, shear and reflection. Positions include character/word spacing,
 `TJ` adjustments, horizontal scaling, text rise and vertical-writing metrics.
 The advance vector excludes spacing. Cell widths come from the PDF glyph
 advances; heights use the font's ascent/descent (or an em-based fallback),
-not tight outline ink bounds. This also makes spaces selectable.
+not tight outline ink bounds. This also makes spaces selectable. A cell
+reaches at most 1 em above and half an em below the baseline: some fonts,
+math faces among them, declare line metrics of several em, which would
+otherwise cover the neighbouring lines.
 
 Unicode characters are not always individual glyphs: a ligature's characters
 share one cell; an unmapped glyph has an empty range. `/ActualText` maps all
@@ -186,19 +197,24 @@ individual character placement. When a Type0 font lacks an encoding CMap, text
 uses the code width declared by ToUnicode. Characters sharing a drawn cell can
 be selected together. Search uses the bounds of the selectable cells in each
 match. A match with only collapsed or non-finite cells has an empty
-`SearchHit::rects` and still carries its text and character offsets. A
-query for an inserted word space alone returns the baseline extent of the gap.
+`SearchHit::rects`, so `SearchHit::bounds()` is `None`; it still carries its
+text and character offsets. A query for an inserted word space alone returns
+the baseline extent of the gap.
 
-`with_text_sink` admits up to 16 MiB of glyph records per page, including its
-forms. A smaller `ParseLimits::max_decoded_stream_bytes` lowers that allowance.
-If a run exceeds the remaining allowance, extraction keeps its text and span
-metrics and sets `InterpretStats::text_geometry_omitted`. Strict text and
-search callers can still consume the complete text.
+`with_text_geometry` admits up to 16 MiB of glyph records per page, including
+its forms. A smaller `ParseLimits::max_decoded_stream_bytes` lowers that
+allowance. Only records that reach a span count against it. If a run exceeds
+the remaining allowance, extraction keeps its text and span metrics and sets
+`InterpretStats::text_geometry_omitted`. Strict text and search callers can
+still consume the complete text.
 Search interpolates the whole run, or the whole replacement for `/ActualText`.
 The decoded UTF-8 text has its own cumulative allowance of
 `max_decoded_stream_bytes` per page. On overflow the sink keeps completed
 spans, the diagnostics report `resource_limit_reached`, and rendering
 continues through the rest of the page.
+When a time or resource limit ends a page inside an `/ActualText` sequence,
+the replacement text is kept without glyph records, since its source glyphs
+are incomplete.
 For manually constructed spans, `glyphs: Vec::new()` or `..TextSpan::default()`
 selects the same approximate search behavior.
 

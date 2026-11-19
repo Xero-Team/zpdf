@@ -62,6 +62,11 @@ fn soft_mask_text_and_actual_text_are_paint_resources_only() {
 
 /// Run the interpreter over page `pi` with a text sink and return its spans.
 fn extract_spans(doc: &PdfDocument, pi: usize) -> Vec<TextSpan> {
+    extract_spans_with(doc, pi, false)
+}
+
+/// Like [`extract_spans`], optionally with glyph selection cells.
+fn extract_spans_with(doc: &PdfDocument, pi: usize, geometry: bool) -> Vec<TextSpan> {
     let page = doc.page(pi).expect("page");
     let mut fonts = doc.load_page_fonts(&page);
     let content = doc.page_content_bytes(&page).expect("content");
@@ -72,7 +77,8 @@ fn extract_spans(doc: &PdfDocument, pi: usize) -> Vec<TextSpan> {
             .with_fonts(&mut fonts)
             .with_document(doc.file(), &page.resources)
             .with_images(&mut images)
-            .with_text_sink(&mut spans);
+            .with_text_sink(&mut spans)
+            .with_text_geometry(geometry);
         let _ = interp.interpret(&content);
     }
     spans
@@ -321,7 +327,7 @@ fn page_actual_text_selects_unmapped_cells_inside_a_form() {
         b"/Span << /ActualText (form) >> BDC /X Do EMC",
         b"BT /F0 12 Tf 10 100 Td <01> Tj /Span << /ActualText () >> BDC (i) Tj EMC ET",
     );
-    let spans = extract_spans(&doc, 0);
+    let spans = extract_spans_with(&doc, 0, true);
     assert_eq!(spans.len(), 1);
     assert_eq!(spans[0].text, "form");
     assert_eq!(spans[0].glyphs.len(), 2);

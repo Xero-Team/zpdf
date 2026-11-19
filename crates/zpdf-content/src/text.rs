@@ -109,8 +109,9 @@ pub struct TextSpan {
     pub mcid: Option<i32>,
     /// Positioned glyphs in source order, with ordered UTF-8 ranges into `text`.
     /// A cluster can share an identical range across multiple glyphs. The
-    /// list is empty for manually constructed spans or when the page's glyph
-    /// budget cannot cover the whole run. Search then interpolates its advance.
+    /// list is empty unless the interpreter ran `with_text_geometry(true)`, for
+    /// manually constructed spans, and when the page's glyph budget cannot
+    /// cover the whole run. Search then interpolates its advance.
     pub glyphs: Vec<TextGlyph>,
 }
 
@@ -156,22 +157,24 @@ impl TextSpan {
 /// `line_tol` is the minimum baseline tolerance for grouping spans onto one line
 /// (an adaptive `0.5 · font size` is also applied).
 pub fn spans_to_text(spans: Vec<TextSpan>, line_tol: f64) -> String {
-    let spans: Vec<TextSpan> = spans
-        .into_iter()
-        .filter(|s| !s.text.is_empty() && s.is_finite())
-        .collect();
-    if spans.is_empty() {
+    layout_text(&spans, (0..spans.len()).collect(), line_tol)
+}
+
+/// [`spans_to_text`] over the spans at `indices`. The layout reads text and
+/// metrics only, so the spans (and their glyph cells) are borrowed, not copied.
+fn layout_text(spans: &[TextSpan], mut indices: Vec<usize>, line_tol: f64) -> String {
+    indices.retain(|&i| !spans[i].text.is_empty() && spans[i].is_finite());
+    if indices.is_empty() {
         return String::new();
     }
-    let unit = median_size(&spans).max(1.0);
-    let indices: Vec<usize> = (0..spans.len()).collect();
+    let unit = median_size(&indices, spans).max(1.0);
 
     let mut blocks: Vec<Vec<usize>> = Vec::new();
-    xy_cut(&indices, &spans, unit, 0, true, &mut blocks);
+    xy_cut(&indices, spans, unit, 0, true, &mut blocks);
 
     let mut out = String::new();
     for block in &blocks {
-        let text = block_to_text(block, &spans, line_tol);
+        let text = block_to_text(block, spans, line_tol);
         if text.is_empty() {
             continue;
         }
@@ -300,10 +303,10 @@ fn group_rows(idx: &[usize], spans: &[TextSpan], unit: f64) -> Vec<Vec<usize>> {
     rows
 }
 
-fn median_size(spans: &[TextSpan]) -> f64 {
-    let mut sizes: Vec<f64> = spans
+fn median_size(idx: &[usize], spans: &[TextSpan]) -> f64 {
+    let mut sizes: Vec<f64> = idx
         .iter()
-        .map(|s| s.size as f64)
+        .map(|&i| spans[i].size as f64)
         .filter(|z| *z > 0.0)
         .collect();
     if sizes.is_empty() {
@@ -588,22 +591,18 @@ pub fn struct_ordered_text(spans: &[TextSpan], page_index: usize, tree: &StructT
     // Append any of this page's text the tree left unplaced (no MCID, or an MCID
     // no element referenced) in geometric order. This also covers a fully
     // untagged page (every span is leftover → the geometric reading order).
-    let leftover: Vec<TextSpan> = spans
-        .iter()
-        .filter(|s| match s.mcid {
+    let leftover: Vec<usize> = (0..spans.len())
+        .filter(|&i| match spans[i].mcid {
             Some(m) => !consumed.contains(&(m as i64)),
             None => true,
         })
-        .cloned()
         .collect();
-    if !leftover.is_empty() {
-        let extra = spans_to_text(leftover, 2.0);
-        if !extra.is_empty() {
-            if !result.is_empty() {
-                result.push('\n');
-            }
-            result.push_str(&extra);
+    let extra = layout_text(spans, leftover, 2.0);
+    if !extra.is_empty() {
+        if !result.is_empty() {
+            result.push('\n');
         }
+        result.push_str(&extra);
     }
     result
 }

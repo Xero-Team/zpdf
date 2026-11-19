@@ -29,14 +29,11 @@ pub struct SearchHit {
 }
 
 impl SearchHit {
-    /// Bounding rectangle over the hit's rectangles, or a zero rectangle at
-    /// the origin when the text has no highlight.
-    pub fn bounds(&self) -> Rect {
-        self.rects
-            .iter()
-            .copied()
-            .reduce(union)
-            .unwrap_or(Rect::new(0.0, 0.0, 0.0, 0.0))
+    /// Bounding rectangle over the hit's rectangles. `None` when the match has
+    /// no selectable geometry, so a caller cannot mistake it for a rectangle
+    /// at the page origin.
+    pub fn bounds(&self) -> Option<Rect> {
+        self.rects.iter().copied().reduce(union)
     }
 }
 
@@ -303,7 +300,7 @@ mod tests {
         assert_eq!(hits[0].line, "Hello World");
         assert_eq!(hits[0].start, 6);
         assert_eq!(hits[0].len, 5);
-        let r = hits[0].bounds();
+        let r = hits[0].bounds().unwrap();
         // "World" is chars 6..11 of 11; each char is 6pt wide.
         assert!((r.x0 - 46.0).abs() < 1e-6, "x0={}", r.x0);
         assert!((r.x1 - 76.0).abs() < 1e-6, "x1={}", r.x1);
@@ -316,7 +313,7 @@ mod tests {
         let spans = [span("ab", 30.0, 50.0, 10.0, -20.0)];
         assert_eq!(
             search_spans(&spans, "a", true)[0].bounds(),
-            Rect::new(10.0, 48.0, 20.0, 58.0)
+            Some(Rect::new(10.0, 48.0, 20.0, 58.0))
         );
     }
 
@@ -360,7 +357,7 @@ mod tests {
         let hits = search_spans(&spans, "abc", true);
         assert_eq!(hits.len(), 3);
         // First hit from the higher line (y=700).
-        assert!(hits[0].bounds().y0 > hits[1].bounds().y0 - 1e-9);
+        assert!(hits[0].bounds().unwrap().y0 > hits[1].bounds().unwrap().y0 - 1e-9);
         // Non-overlapping matches within one line.
         assert!(hits[1].start != hits[2].start);
     }
