@@ -63,6 +63,10 @@ bitflags = "2"
 bytemuck = { version = "1", features = ["derive"] }
 winnow = "1.0"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+# The engine behind flate2's `rust_backend`, used directly by the parser's
+# FlateDecode so a bad Adler-32 or a mid-stream error keeps every decoded byte
+# (flate2's Read adapter drops the failing chunk and always checks Adler-32).
+miniz_oxide = "0.9"
 # Pure-Rust crypto (RustCrypto) for the Standard security handler's AES paths.
 # NB: aes 0.9 + cbc 0.2 both speak `cipher` 0.5 (the 0.8/0.1 pair spoke 0.4 and
 # cannot be mixed across the cut). Bump them together or not at all.

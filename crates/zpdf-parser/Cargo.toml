@@ -14,7 +14,7 @@ categories.workspace = true
 [dependencies]
 zpdf-core.workspace = true
 winnow.workspace = true
-flate2.workspace = true
+miniz_oxide.workspace = true
 zune-jpeg.workspace = true
 tracing.workspace = true
 aes.workspace = true
@@ -29,6 +29,8 @@ getrandom = "0.2"
 getrandom = { version = "0.2", features = ["js"] }
 
 [dev-dependencies]
+# Reference zlib/deflate encoder for the FlateDecode tests.
+flate2.workspace = true
 # Pure-Rust LZW codec (the backend used by the `tiff`/`gif` crates). Used ONLY
 # in tests as an independent, spec-conformant reference encoder so the LZW
 # decoder is validated against an external producer, not its own paired encoder.
