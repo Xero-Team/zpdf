@@ -67,6 +67,19 @@ fn mq_iteration_budget(payload_bytes: usize) -> usize {
         .clamp(1024, 64 * 1024 * 1024)
 }
 
+/// Budget for one immediate generic or refinement region: never less than one
+/// MQ decision per pixel plus one typical-prediction decision per row. A
+/// sparse 300-dpi page (one signature on a 2550x3300 region) codes to a few
+/// dozen bytes, far below its pixel count; the declared area is already
+/// bounded by the bitmap pixel limit, so it caps the work instead.
+fn region_iteration_budget(payload_bytes: usize, width: usize, height: usize) -> usize {
+    let area = width
+        .saturating_mul(height)
+        .saturating_add(height)
+        .min(MAX_BITMAP_PIXELS + MAX_BITMAP_PIXELS / 8);
+    mq_iteration_budget(payload_bytes).max(area)
+}
+
 /// Parsed `/DecodeParms` for a JBIG2Decode filter.
 pub struct Jbig2Params {
     /// Decoded bytes of the `/JBIG2Globals` stream, if any. The stream is an
@@ -2100,7 +2113,7 @@ impl<'a> Decoder<'a> {
             *slot = (r.i8()?, r.i8()?);
         }
         let payload = r.rest();
-        let budget = mq_iteration_budget(payload.len());
+        let budget = region_iteration_budget(payload.len(), info.width, info.height);
         let mut mq = MqDecoder::new(payload, budget);
         let mut cx = vec![0u8; 1 << 16];
         let bm = decode_generic(
@@ -2161,7 +2174,7 @@ impl<'a> Decoder<'a> {
             };
 
         let payload = r.rest();
-        let budget = mq_iteration_budget(payload.len());
+        let budget = region_iteration_budget(payload.len(), info.width, info.height);
         let mut mq = MqDecoder::new(payload, budget);
         let mut cx = vec![0u8; 1 << 13];
         let bm = decode_refinement(
@@ -4222,6 +4235,31 @@ mod tests {
                 "template {template} tpgdon {tpgdon}"
             );
         }
+    }
+
+    /// A sparse page codes to far fewer payload bytes than it has pixels; the
+    /// region budget must follow the declared area, not the payload size.
+    #[test]
+    fn sparse_generic_region_is_not_cut_off_by_payload_budget() {
+        let (w, h) = (1700usize, 1100usize);
+        let mut bm = Bitmap::new(w, h, 0).unwrap();
+        for y in 500..540 {
+            for x in 800..830 {
+                bm.set(x, y, 1);
+            }
+        }
+        let payload = generic_region_payload(&bm, 0, false);
+        assert!(
+            mq_iteration_budget(payload.len()) < w * h,
+            "fixture must be sparse"
+        );
+        let mut stream = segment(0, 48, &[], 1, &page_info_payload(w as u32, h as u32, 0));
+        stream.extend_from_slice(&segment(1, 38, &[], 1, &payload));
+        let out = decode_test(&stream, &Jbig2Params { globals: None }).unwrap();
+        let stride = w.div_ceil(8);
+        // Decoded output follows the DeviceGray convention: a set bit is white.
+        let ink = |x: usize, y: usize| out[y * stride + x / 8] & (0x80 >> (x % 8)) == 0;
+        assert!(ink(815, 520) && !ink(10, 10) && !ink(815, 600));
     }
 
     #[test]
