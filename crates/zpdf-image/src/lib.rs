@@ -2233,6 +2233,13 @@ fn fold_alpha_plane(image: &mut DecodedImage, alpha: &[u8], aw: u32, ah: u32) {
     if image.width == 0 || image.height == 0 || aw == 0 || ah == 0 {
         return;
     }
+    // A mask finer than its image on both axes (MRC scans: a low-res colour
+    // layer under a high-res text mask) keeps its own resolution; shrinking
+    // it to the image's would erase the text shapes. The upsampled image has
+    // the mask's dimensions, which already passed the decode pixel limit.
+    if aw >= image.width && ah >= image.height && (aw, ah) != (image.width, image.height) {
+        upsample_rgba(image, aw, ah);
+    }
     let resampled;
     let plane: &[u8] = if (aw, ah) == (image.width, image.height) {
         alpha
@@ -2245,6 +2252,54 @@ fn fold_alpha_plane(image: &mut DecodedImage, alpha: &[u8], aw: u32, ah: u32) {
     }
     image.has_alpha = true;
     image.premultiplied = true;
+}
+
+/// Bilinearly upsample `image` (RGBA, not yet premultiplied by a mask) to
+/// `dw`x`dh` with the pixel-centre mapping of [`resample_bilinear`], in one
+/// pass with 8-bit fixed-point weights (a 600 dpi mask is ~4.6 Mpx).
+fn upsample_rgba(image: &mut DecodedImage, dw: u32, dh: u32) {
+    let (sw, sh) = (image.width as usize, image.height as usize);
+    let Some(len) = (dw as usize)
+        .checked_mul(dh as usize)
+        .and_then(|n| n.checked_mul(4))
+    else {
+        return;
+    };
+    if image.data.len() < sw * sh * 4 {
+        return;
+    }
+    // Source sample pair and weight of the second (0..=256) per destination
+    // column or row.
+    let axis = |dst: u32, src: usize| -> Vec<(usize, usize, u32)> {
+        let scale = src as f64 / dst as f64;
+        (0..dst)
+            .map(|d| {
+                let f = ((d as f64 + 0.5) * scale - 0.5).clamp(0.0, (src - 1) as f64);
+                let i0 = f.floor() as usize;
+                (
+                    i0,
+                    (i0 + 1).min(src - 1),
+                    ((f - i0 as f64) * 256.0).round() as u32,
+                )
+            })
+            .collect()
+    };
+    let (cols, rows) = (axis(dw, sw), axis(dh, sh));
+    let row = |y: usize| &image.data[y * sw * 4..(y + 1) * sw * 4];
+    let mut out = Vec::with_capacity(len);
+    for &(y0, y1, wy) in &rows {
+        let (r0, r1) = (row(y0), row(y1));
+        for &(x0, x1, wx) in &cols {
+            for c in 0..4 {
+                let top = r0[x0 * 4 + c] as u32 * (256 - wx) + r0[x1 * 4 + c] as u32 * wx;
+                let bot = r1[x0 * 4 + c] as u32 * (256 - wx) + r1[x1 * 4 + c] as u32 * wx;
+                out.push(((top * (256 - wy) + bot * wy + (1 << 15)) >> 16) as u8);
+            }
+        }
+    }
+    image.data = out;
+    image.width = dw;
+    image.height = dh;
 }
 
 #[inline]
@@ -2851,6 +2906,28 @@ mod tests {
         apply_smask_image(&mut img, &mask);
         for i in 0..4 {
             assert_eq!(pixel(&img, i)[3], 100);
+        }
+    }
+
+    #[test]
+    fn finer_smask_keeps_its_resolution() {
+        // MRC layout: a 1x1 red colour layer under a 4x4 mask with a single
+        // opaque pixel. Shrinking the mask to 1x1 would paint the whole cell.
+        let dict = image_dict(1, 1, 8, Some("DeviceRGB"));
+        let mut img = decode_image_xobject(&[255, 0, 0], &dict).unwrap();
+        let mask_dict = image_dict(4, 4, 8, Some("DeviceGray"));
+        let mut alpha = [0u8; 16];
+        alpha[5] = 255;
+        let mask = decode_image_xobject(&alpha, &mask_dict).unwrap();
+        apply_smask_image(&mut img, &mask);
+        assert_eq!((img.width, img.height), (4, 4));
+        for i in 0..16 {
+            let want: &[u8] = if i == 5 {
+                &[255, 0, 0, 255]
+            } else {
+                &[0, 0, 0, 0]
+            };
+            assert_eq!(pixel(&img, i), want, "pixel {i}");
         }
     }
 
