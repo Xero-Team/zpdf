@@ -11,12 +11,16 @@ pub struct PageInterpretOptions {
     pub include_annotations: bool,
     /// Optional destination raster scale for decoded-image downsampling.
     pub image_downscale: Option<f32>,
+    /// Optional destination raster scale for scale-exact covering-rectangle
+    /// clip elision (pass `CpuRenderer::raster_scale`).
+    pub clip_elision_scale: Option<f32>,
 }
 impl Default for PageInterpretOptions {
     fn default() -> Self {
         Self {
             include_annotations: true,
             image_downscale: None,
+            clip_elision_scale: None,
         }
     }
 }
@@ -98,6 +102,9 @@ pub fn interpret_page_with_cache(
     }
     if let Some(scale) = options.image_downscale {
         interpreter = interpreter.with_image_downscale(scale);
+    }
+    if let Some(scale) = options.clip_elision_scale {
+        interpreter = interpreter.with_clip_elision_scale(scale);
     }
     let (display_list, mut stats) = interpreter.interpret_with_stats(&content);
     stats.diagnostics.merge(diagnostics);

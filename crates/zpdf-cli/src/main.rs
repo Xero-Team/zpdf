@@ -1493,6 +1493,7 @@ fn cmd_render(args: &[String]) -> zpdf::Result<()> {
     };
     let mut options = zpdf::PageInterpretOptions::default();
     options.image_downscale = image_downscale;
+    options.clip_elision_scale = image_downscale;
     let zpdf::InterpretedPage {
         stats: interpretation_stats,
         display_list,

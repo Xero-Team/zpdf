@@ -10,7 +10,7 @@ use zpdf::{ContentInterpreter, PdfDocument, RenderBackend};
 use zpdf_font::{CidWidths, LoadedFont, PdfFontType};
 use zpdf_writer::DocumentBuilder;
 
-use crate::pipeline::{interpret_page, PageSetup};
+use crate::pipeline::{interpret_page, interpret_page_for, InterpretTarget, PageSetup};
 
 pub const PRIMARY: &[u8] = include_bytes!("../../zpdf-font/tests/fixtures/coverage-primary.ttf");
 pub const FALLBACK: &[u8] = include_bytes!("../../zpdf-font/tests/fixtures/coverage-fallback.ttf");
@@ -83,6 +83,13 @@ pub fn make_pdf(text: &str, composite: bool, pages: usize) -> Arc<[u8]> {
 pub fn setup(doc: &PdfDocument, dpi: f32) -> PageSetup {
     let page = doc.page(0).expect("fixture page");
     interpret_page(doc, &page, page.effective_box(), dpi)
+        .expect("interpret fixture")
+        .0
+}
+
+pub fn setup_for(doc: &PdfDocument, dpi: f32, target: InterpretTarget) -> PageSetup {
+    let page = doc.page(0).expect("fixture page");
+    interpret_page_for(doc, &page, page.effective_box(), dpi, target)
         .expect("interpret fixture")
         .0
 }

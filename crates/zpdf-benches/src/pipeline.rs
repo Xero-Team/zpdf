@@ -91,18 +91,30 @@ pub fn parse(path: &Path, page_index: usize, dpi: f32) -> Result<ParsedPage, Str
     })
 }
 
+/// Consuming backend for which a display list is being interpreted.
+///
+/// Mirrors `zpdf-cli`: CPU rendering opts into scale-exact covering-rectangle
+/// clip elision (using `CpuRenderer::raster_scale`), while GPU rendering
+/// retains all clips so `WgpuRenderer` receives the production `--backend wgpu`
+/// command stream and enforces its own coordinate limits (`MAX_DEVICE_COORD`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterpretTarget {
+    Cpu,
+    Gpu,
+}
+
 /// Stage 2 — load page fonts, decode content, interpret into a `DisplayList`.
 ///
-/// Mirrors the CLI's interpreter construction exactly (annotations, optional
-/// content, output-intent CMYK). An earlier version of these benches omitted
-/// `.with_annotations`, which under-measured rendering by ~20x: annotation form
-/// fields and note text add many glyph runs. Don't drop these without
-/// re-checking against `zpdf-cli --stats`.
+/// Mirrors the CLI's CPU interpreter construction exactly (annotations, optional
+/// content, output-intent CMYK, and CPU clip-elision scale). An earlier version
+/// of these benches omitted `.with_annotations`, which under-measured rendering
+/// by ~20x: annotation form fields and note text add many glyph runs. Don't
+/// drop these without re-checking against `zpdf-cli --stats`.
 pub fn interpret(parsed: &ParsedPage) -> Result<PageSetup, String> {
     interpret_page(&parsed.doc, &parsed.page, parsed.page_box, parsed.dpi).map(|(setup, _)| setup)
 }
 
-/// Interpret one page of an already-parsed document.
+/// Interpret one page of an already-parsed document for the CPU backend.
 ///
 /// Separate from [`interpret`] so a whole-document run can parse once and then
 /// interpret every page (see `benches/longform.rs`) instead of re-parsing the
@@ -113,7 +125,19 @@ pub fn interpret_page(
     page_box: Rect,
     dpi: f32,
 ) -> Result<(PageSetup, zpdf::InterpretStats), String> {
-    interpret_page_impl(doc, page, page_box, dpi, false)
+    interpret_page_for(doc, page, page_box, dpi, InterpretTarget::Cpu)
+}
+
+/// Interpret one page of an already-parsed document using the clip-elision
+/// policy for `target` (CPU vs GPU, matching `zpdf-cli`).
+pub fn interpret_page_for(
+    doc: &PdfDocument,
+    page: &PdfPage,
+    page_box: Rect,
+    dpi: f32,
+    target: InterpretTarget,
+) -> Result<(PageSetup, zpdf::InterpretStats), String> {
+    interpret_page_impl(doc, page, page_box, dpi, false, target)
 }
 
 /// Interpret one page with the per-category work buckets enabled — the
@@ -125,7 +149,14 @@ pub fn interpret_page(
 pub fn interpret_instrumented(
     parsed: &ParsedPage,
 ) -> Result<(PageSetup, zpdf::InterpretStats), String> {
-    interpret_page_impl(&parsed.doc, &parsed.page, parsed.page_box, parsed.dpi, true)
+    interpret_page_impl(
+        &parsed.doc,
+        &parsed.page,
+        parsed.page_box,
+        parsed.dpi,
+        true,
+        InterpretTarget::Cpu,
+    )
 }
 
 fn interpret_page_impl(
@@ -134,6 +165,7 @@ fn interpret_page_impl(
     page_box: Rect,
     dpi: f32,
     work_timing: bool,
+    target: InterpretTarget,
 ) -> Result<(PageSetup, zpdf::InterpretStats), String> {
     let setup_started = std::time::Instant::now();
     let mut font_cache = doc.load_page_fonts(page);
@@ -153,6 +185,23 @@ fn interpret_page_impl(
         &mut icc_cache,
     );
 
+    let scale = dpi / 72.0;
+    let clip_elision_scale = match target {
+        InterpretTarget::Cpu => {
+            #[cfg(feature = "cpu-render")]
+            {
+                zpdf::cpu::CpuRenderer::new()
+                    .with_limits(doc.file().limits())
+                    .raster_scale(page_box, scale)
+            }
+            #[cfg(not(feature = "cpu-render"))]
+            {
+                None
+            }
+        }
+        InterpretTarget::Gpu => None,
+    };
+
     let mut interpreter = zpdf::ContentInterpreter::new(page_box)
         .with_page_rotation(page.rotate)
         .with_fonts(&mut font_cache)
@@ -162,6 +211,9 @@ fn interpret_page_impl(
         .with_annotations(&annotations)
         .with_work_timing(work_timing)
         .with_operand_stack_limit(doc.file().limits().max_operand_stack_depth as usize);
+    if let Some(clip_scale) = clip_elision_scale {
+        interpreter = interpreter.with_clip_elision_scale(clip_scale);
+    }
     if let Some(oc) = &oc_config {
         interpreter = interpreter.with_optional_content(oc);
     }
@@ -184,10 +236,28 @@ fn interpret_page_impl(
     ))
 }
 
-/// Parse + interpret, as one call — what the render-only benches need in setup.
+/// Parse + interpret for the CPU backend, as one call — what CPU render-only
+/// benches need in setup.
 pub fn load_page(path: &Path, page_index: usize, dpi: f32) -> Result<PageSetup, String> {
+    load_page_for(path, page_index, dpi, InterpretTarget::Cpu)
+}
+
+/// Parse + interpret for `target`, using that backend's CLI clip-elision policy.
+pub fn load_page_for(
+    path: &Path,
+    page_index: usize,
+    dpi: f32,
+    target: InterpretTarget,
+) -> Result<PageSetup, String> {
     let parsed = parse(path, page_index, dpi)?;
-    interpret(&parsed)
+    interpret_page_for(
+        &parsed.doc,
+        &parsed.page,
+        parsed.page_box,
+        parsed.dpi,
+        target,
+    )
+    .map(|(setup, _)| setup)
 }
 
 /// A rendered page, backend-agnostic: tight RGBA8, top-left origin,
@@ -266,4 +336,90 @@ pub fn interpret_with_stats(
     parsed: &ParsedPage,
 ) -> Result<(PageSetup, zpdf::InterpretStats), String> {
     interpret_page(&parsed.doc, &parsed.page, parsed.page_box, parsed.dpi)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zpdf_display_list::RenderCommand;
+
+    fn single_page_pdf(media_box: &str, content: &[u8]) -> Vec<u8> {
+        let objs = [
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [{media_box}] \
+                 /Contents 4 0 R /Resources << >> >>"
+            )
+            .into_bytes(),
+            {
+                let mut v = format!("<< /Length {} >>\nstream\n", content.len()).into_bytes();
+                v.extend_from_slice(content);
+                v.extend_from_slice(b"\nendstream");
+                v
+            },
+        ];
+        let mut out = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n".to_vec();
+        let mut offsets = Vec::with_capacity(objs.len());
+        for (i, body) in objs.iter().enumerate() {
+            offsets.push(out.len());
+            out.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+            out.extend_from_slice(body);
+            out.extend_from_slice(b"\nendobj\n");
+        }
+        let xref = out.len();
+        let n = objs.len() + 1;
+        out.extend_from_slice(format!("xref\n0 {n}\n0000000000 65535 f \n").as_bytes());
+        for off in offsets {
+            out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        out.extend_from_slice(
+            format!("trailer\n<< /Size {n} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+        );
+        out
+    }
+
+    #[test]
+    fn gpu_target_retains_clips_that_cpu_target_elides() {
+        // On a 16,000 × 100 px raster at 72 DPI (scale 1), CPU's coordinate
+        // limit is 16,000 * 64 = 1,024,000 so a covering rect reaching
+        // x = 1,010,000 elides for CPU, while wgpu's MAX_DEVICE_COORD is
+        // 1,000,000 and the shipping `--backend wgpu` CLI retains the clip.
+        let pdf = single_page_pdf(
+            "0 0 16000 100",
+            b"q 0 0 16000 100 re W n 0 0 1010000 100 re W n 1 0 0 rg 0 0 16000 100 re f Q",
+        );
+        let doc = PdfDocument::open(pdf).expect("open pdf");
+        let page = doc.page(0).expect("page 0");
+        let page_box = page.effective_box();
+
+        let (gpu_setup, _) =
+            interpret_page_for(&doc, &page, page_box, 72.0, InterpretTarget::Gpu).expect("gpu");
+        let gpu_clips = gpu_setup
+            .dl
+            .commands
+            .iter()
+            .filter(|c| matches!(c, RenderCommand::PushClip { .. }))
+            .count();
+        assert_eq!(
+            gpu_clips, 2,
+            "GPU bench display list must match --backend wgpu and retain all clips"
+        );
+
+        #[cfg(feature = "cpu-render")]
+        {
+            let (cpu_setup, _) =
+                interpret_page_for(&doc, &page, page_box, 72.0, InterpretTarget::Cpu).expect("cpu");
+            let cpu_clips = cpu_setup
+                .dl
+                .commands
+                .iter()
+                .filter(|c| matches!(c, RenderCommand::PushClip { .. }))
+                .count();
+            assert_eq!(
+                cpu_clips, 1,
+                "CPU bench display list elides covering nested rectangle"
+            );
+        }
+    }
 }
