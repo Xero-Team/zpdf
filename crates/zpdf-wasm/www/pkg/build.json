@@ -2,10 +2,10 @@
   "schema_version": 1,
   "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)",
   "wasm_bindgen": "wasm-bindgen 0.2.130",
-  "source_sha256": "2c3d03b5e1079fa0cfe29f2fb99bf99982ad3256809d0dec8174a037b74392d8",
+  "source_sha256": "52ee765346715a8c47671d68eea88cfa781e79f503f957b26d41e97c0383f1ef",
   "source_files": 153,
   "artifacts": {
     "zpdf_wasm.js": "4a6741df7a9b6959bd38d25e9fe3723f536b73b5c6fa8c3976f119f6cd18ccfd",
-    "zpdf_wasm_bg.wasm": "af3affec6c791dc6a2c54e8dbeb3ab9fc0485612565f56a7f7eaa0af191860a7"
+    "zpdf_wasm_bg.wasm": "8fc85057e41c8172b5ff06e50587f5831c1c721a1ecf0ec1a294964253a2b643"
   }
 }
