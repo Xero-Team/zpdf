@@ -259,6 +259,68 @@ fn gpu_matches_cpu_softmask_alpha_transfer() {
     );
 }
 
+/// A one-byte quantization difference must not choose the other side of /TR.
+/// Pin interior pixels exactly; the general fidelity tolerance hides this drift
+/// until a transfer function amplifies it into a fully visible/hidden object.
+#[test]
+fn gpu_matches_cpu_softmask_half_value_threshold() {
+    for kind in [SoftMaskKind::Alpha, SoftMaskKind::Luminosity] {
+        for value in [0.499, 0.5] {
+            let (color, alpha) = match kind {
+                SoftMaskKind::Alpha => (Color::white(), value),
+                SoftMaskKind::Luminosity => (Color::gray(value), 1.0),
+            };
+            let mut mask_dl = DisplayList::new(page());
+            mask_dl.push(fill(40.0, 40.0, 160.0, 160.0, color, alpha));
+            let mask = SoftMask {
+                kind,
+                commands: Arc::new(mask_dl),
+                offset: (0.0, 0.0),
+                backdrop_luma: 0.0,
+                transfer: Some(Arc::new(std::array::from_fn(|i| {
+                    if i >= 128 {
+                        255
+                    } else {
+                        0
+                    }
+                }))),
+            };
+            let group = masked_group(
+                fill(40.0, 40.0, 160.0, 160.0, Color::rgb(0.0, 0.0, 1.0), 1.0),
+                mask,
+            );
+            let dl = page_with(Color::rgb(1.0, 1.0, 0.0), group);
+            let gpu = match zpdf::gpu::WgpuRenderer::new().render_display_list(&dl, SCALE) {
+                Ok(page) => page,
+                Err(e) => {
+                    eprintln!("skipping GPU soft-mask threshold acceptance (no adapter?): {e}");
+                    return;
+                }
+            };
+            let cpu = zpdf::cpu::CpuRenderer::new()
+                .render_display_list(&dl, SCALE)
+                .expect("cpu render");
+            assert_eq!((cpu.width, cpu.height), (gpu.width, gpu.height));
+            let center = ((cpu.height / 2 * cpu.width + cpu.width / 2) * 4) as usize;
+            let expected = if value < 0.5 {
+                [255, 255, 0, 255]
+            } else {
+                [0, 0, 255, 255]
+            };
+            assert_eq!(
+                &cpu.data[center..center + 4],
+                &expected,
+                "CPU {kind:?} {value}"
+            );
+            assert_eq!(
+                &gpu.data[center..center + 4],
+                &expected,
+                "GPU {kind:?} {value}"
+            );
+        }
+    }
+}
+
 /// Colored luminosity mask + a steep /TR — a regression guard for the luminosity
 /// reduction weights. The mask group is *pure blue* (luma 0.114 → byte 29 under
 /// Rec.601), and the /TR is a step at 29, so the masked square is fully shown iff
