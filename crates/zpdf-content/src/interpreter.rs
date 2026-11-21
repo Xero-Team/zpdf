@@ -50,9 +50,11 @@ pub struct ContentInterpreter<'a> {
     /// merged into `self.stats.diagnostics` during this interpretation.
     reported_font_fallbacks: Vec<zpdf_font::FontId>,
     /// Font IDs whose embedded-program fallback failed to recover at least one
-    /// visible glyph, paired with whether a text-decoding failure was also
-    /// recorded for that font.
-    reported_font_fallback_misses: Vec<(zpdf_font::FontId, bool)>,
+    /// visible glyph outline and already recorded `missing_glyph_outlines`.
+    reported_font_outline_misses: Vec<zpdf_font::FontId>,
+    /// Font IDs whose embedded-program fallback already recorded a
+    /// `decode_failures` entry (either from load-time limits or undecodable text).
+    reported_font_text_misses: Vec<zpdf_font::FontId>,
     file: Option<&'a PdfFile>,
     resources: Option<&'a ResourceDict>,
     image_cache: Option<&'a mut ImageCache>,
@@ -756,7 +758,8 @@ impl<'a> ContentInterpreter<'a> {
             shared_font_doc: None,
             current_font_id: None,
             reported_font_fallbacks: Vec::new(),
-            reported_font_fallback_misses: Vec::new(),
+            reported_font_outline_misses: Vec::new(),
+            reported_font_text_misses: Vec::new(),
             file: None,
             resources: None,
             image_cache: None,
@@ -4826,7 +4829,7 @@ impl<'a> ContentInterpreter<'a> {
                 Option<zpdf_core::ProcessingDiagnostics>,
                 zpdf_core::Error,
             > {
-                let (font, diagnostics) = match obj {
+                let (font, diagnostics, companion) = match obj {
                     PdfObject::Ref(font_ref) => {
                         return load_font_ref(
                             shared_doc,
@@ -4838,7 +4841,7 @@ impl<'a> ContentInterpreter<'a> {
                         );
                     }
                     PdfObject::Dict(font_dict) => {
-                        zpdf_document::font_loader::load_single_font_dict_with_diagnostics(
+                        zpdf_document::font_loader::load_single_font_dict_with_fallback(
                             file,
                             font_dict,
                             fc.provider().map(|provider| provider.as_ref()),
@@ -4853,7 +4856,14 @@ impl<'a> ContentInterpreter<'a> {
                     None,
                     max_font_bytes,
                 ) {
-                    Ok(_) => Ok(None),
+                    Ok(fid) => {
+                        if let Some(companion) = companion {
+                            if fc.get(fid).is_some_and(|f| f.has_font_data()) {
+                                fc.record_embedded_companion(fid, std::sync::Arc::new(companion));
+                            }
+                        }
+                        Ok(None)
+                    }
                     Err(unadmitted) => Ok(Some(unadmitted)),
                 }
             };
@@ -5982,7 +5992,13 @@ impl<'a> ContentInterpreter<'a> {
         };
 
         // Preserve the ordinary solid-text path without entering fallback or
-        // clipping machinery when no application fonts have been registered.
+        // clipping machinery when no application fonts or retained embedded
+        // companions are active.
+        let has_companion = self.current_font_id.is_some_and(|fid| {
+            self.font_cache
+                .as_ref()
+                .is_some_and(|cache| cache.has_embedded_companion(fid))
+        });
         let ordinary = self.current.render_mode == 0
             && self.current.fill_pattern.is_none()
             && self
@@ -5991,16 +6007,24 @@ impl<'a> ContentInterpreter<'a> {
                 .and_then(|cache| cache.provider())
                 .is_none_or(|provider| provider.generation() == 0)
             && !cs_produces_no_marks(&self.current.fill_cs)
-            && !repair;
+            && !repair
+            && !has_companion;
         if ordinary {
             if let Some(font_id) = self.current_font_id {
                 if !glyphs.is_empty() {
-                    self.check_embedded_fallback_recovery(font_id, bytes, &glyphs, None);
+                    self.check_embedded_fallback_outlines(font_id, bytes, &glyphs, None);
                     self.emit_solid_glyph_run(font_id, font_size, glyphs, combined, h_scale);
                 }
             }
         } else {
             self.paint_positioned_text(bytes, glyphs, combined, font_size, h_scale, repair);
+        }
+
+        // Check fallback text-decoding completeness independently of outline
+        // recovery and render-mode visibility whenever this run contributes to
+        // extracted text (honoring any active /ActualText replacement).
+        if let Some(font_id) = self.current_font_id {
+            self.check_embedded_fallback_text(font_id, bytes);
         }
 
         // Hidden optional-content layers also extract no text (emit_painted
@@ -6031,13 +6055,34 @@ impl<'a> ContentInterpreter<'a> {
         self.text_matrix = self.text_matrix.concat(&advance);
     }
 
-    /// Record embedded-font fallback diagnostics once per used font and verify
-    /// that every shown visible glyph recovered through the substitute or
-    /// provider fallback. Unrecovered missing visible outlines increment
-    /// `missing_glyph_outlines` (rejecting visual exports while allowing
-    /// text-only exports when every code decoded); codes that also fail to
-    /// decode increment `decode_failures`.
-    fn check_embedded_fallback_recovery(
+    /// Merge load-time embedded-font fallback diagnostics once per `font_id`.
+    /// Load-time `decode_failures` (such as cache-budget limits) mark the text
+    /// failure tracker to prevent double counting, without suppressing outline
+    /// omission checks.
+    fn merge_embedded_fallback(
+        &mut self,
+        font_id: FontId,
+    ) -> Option<zpdf_core::ProcessingDiagnostics> {
+        let fallback_diag = self
+            .font_cache
+            .as_ref()
+            .and_then(|fc| fc.embedded_fallback(font_id))?;
+        if !self.reported_font_fallbacks.contains(&font_id) {
+            self.reported_font_fallbacks.push(font_id);
+            self.stats.diagnostics.merge(fallback_diag);
+            if fallback_diag.decode_failures > 0
+                && !self.reported_font_text_misses.contains(&font_id)
+            {
+                self.reported_font_text_misses.push(font_id);
+            }
+        }
+        Some(fallback_diag)
+    }
+
+    /// Record embedded-font fallback diagnostics for visible/clipped runs and
+    /// verify that every shown visible glyph has a drawable outline. Missing
+    /// outlines record `missing_glyph_outlines` independently of text decoding.
+    fn check_embedded_fallback_outlines(
         &mut self,
         font_id: FontId,
         bytes: &[u8],
@@ -6047,69 +6092,67 @@ impl<'a> ContentInterpreter<'a> {
         if bytes.is_empty() || self.oc_suppressed() {
             return;
         }
-        let Some(fallback_diag) = self
+        let Some(fallback_diag) = self.merge_embedded_fallback(font_id) else {
+            return;
+        };
+        if self.reported_font_outline_misses.contains(&font_id) {
+            return;
+        }
+        if !self.fallback_outlines_complete(font_id, bytes, glyphs, resolved_runs) {
+            self.reported_font_outline_misses.push(font_id);
+            self.stats
+                .diagnostics
+                .record_missing_glyph_outline(fallback_diag.first_failed_object);
+        }
+    }
+
+    /// Verify that a fallback text run contributing to the text sink decodes
+    /// every shown code (even when all outlines draw or render mode 3 makes the
+    /// run invisible). An active `/ActualText` replacement supplies the
+    /// extracted text directly and satisfies text completeness.
+    fn check_embedded_fallback_text(&mut self, font_id: FontId, bytes: &[u8]) {
+        if self.text_sink.is_none()
+            || bytes.is_empty()
+            || self.oc_suppressed()
+            || self.active_actual_text.is_some()
+            || self.reported_font_text_misses.contains(&font_id)
+        {
+            return;
+        }
+        let has_fallback = self
             .font_cache
             .as_ref()
             .and_then(|fc| fc.embedded_fallback(font_id))
-        else {
-            return;
-        };
-        if !self.reported_font_fallbacks.contains(&font_id) {
-            self.reported_font_fallbacks.push(font_id);
-            self.stats.diagnostics.merge(fallback_diag);
-            if fallback_diag.decode_failures > 0
-                && !self
-                    .reported_font_fallback_misses
-                    .iter()
-                    .any(|&(id, _)| id == font_id)
-            {
-                self.reported_font_fallback_misses.push((font_id, true));
-            }
-        }
-        let existing_miss = self
-            .reported_font_fallback_misses
-            .iter()
-            .position(|&(id, _)| id == font_id);
-        if existing_miss.is_some_and(|idx| self.reported_font_fallback_misses[idx].1) {
+            .is_some();
+        if !has_fallback {
             return;
         }
-        let (outlines_ok, text_ok) =
-            self.fallback_run_status(font_id, bytes, glyphs, resolved_runs);
-        if !outlines_ok {
-            match existing_miss {
-                None => {
-                    self.reported_font_fallback_misses.push((font_id, !text_ok));
-                    self.stats
-                        .diagnostics
-                        .record_missing_glyph_outline(fallback_diag.first_failed_object);
-                    if !text_ok {
-                        self.stats.diagnostics.decode_failures =
-                            self.stats.diagnostics.decode_failures.saturating_add(1);
-                    }
-                }
-                Some(idx) if !text_ok => {
-                    self.reported_font_fallback_misses[idx].1 = true;
+        if !self.fallback_text_decodable(font_id, bytes) {
+            if let Some(fallback_diag) = self.merge_embedded_fallback(font_id) {
+                if !self.reported_font_text_misses.contains(&font_id) {
+                    self.reported_font_text_misses.push(font_id);
                     self.stats.diagnostics.decode_failures =
                         self.stats.diagnostics.decode_failures.saturating_add(1);
+                    if let Some(id) = fallback_diag.first_failed_object {
+                        self.stats.diagnostics.first_failed_object.get_or_insert(id);
+                    }
                 }
-                Some(_) => {}
             }
         }
     }
 
-    /// Returns `(outlines_complete, text_decodable)` for a fallback text run.
-    fn fallback_run_status(
+    fn fallback_outlines_complete(
         &self,
         original_font_id: FontId,
         bytes: &[u8],
         glyphs: &[PositionedGlyph],
         resolved_runs: Option<&[(FontId, Vec<PositionedGlyph>)]>,
-    ) -> (bool, bool) {
+    ) -> bool {
         let Some(cache) = self.font_cache.as_deref() else {
-            return (false, false);
+            return false;
         };
         let Some(orig_font) = cache.get(original_font_id) else {
-            return (false, false);
+            return false;
         };
         let composite = matches!(orig_font.font_type, zpdf_font::PdfFontType::Type0CidType2);
         let cmap = orig_font.cid_cmap.as_ref();
@@ -6128,31 +6171,32 @@ impl<'a> ContentInterpreter<'a> {
                 }),
             )
         };
-        let outlines_ok = if let Some(runs) = resolved_runs {
+        if let Some(runs) = resolved_runs {
             runs.iter()
                 .all(|(run_font_id, run_glyphs)| check_slice(*run_font_id, run_glyphs))
         } else {
             check_slice(original_font_id, glyphs)
-        };
-        if outlines_ok {
-            return (true, true);
         }
-        let mut text_offset = 0usize;
-        let mut text_ok = true;
-        while text_offset < bytes.len() {
-            let Some((code, length, raw, end)) =
-                next_text_code(cmap, composite, bytes, text_offset)
+    }
+
+    fn fallback_text_decodable(&self, font_id: FontId, bytes: &[u8]) -> bool {
+        let Some(orig_font) = self.font_cache.as_deref().and_then(|fc| fc.get(font_id)) else {
+            return false;
+        };
+        let composite = matches!(orig_font.font_type, zpdf_font::PdfFontType::Type0CidType2);
+        let cmap = orig_font.cid_cmap.as_ref();
+        let mut offset = 0usize;
+        while offset < bytes.len() {
+            let Some((code, length, raw, end)) = next_text_code(cmap, composite, bytes, offset)
             else {
-                text_ok = false;
-                break;
+                return false;
             };
-            text_offset = end;
+            offset = end;
             if !orig_font.can_decode_code(code, length as u8, raw) {
-                text_ok = false;
-                break;
+                return false;
             }
         }
-        (false, text_ok)
+        true
     }
 
     /// Keep optional fallback and clipping state off the main decoding stack.
@@ -6198,7 +6242,7 @@ impl<'a> ContentInterpreter<'a> {
         let wants_clip = matches!(self.current.render_mode, 4..=7);
         if let Some(font_id) = self.current_font_id {
             if (!glyphs.is_empty() || resolved_runs.is_some()) && (!invisible || wants_clip) {
-                self.check_embedded_fallback_recovery(
+                self.check_embedded_fallback_outlines(
                     font_id,
                     bytes,
                     &glyphs,
@@ -6387,7 +6431,8 @@ impl<'a> ContentInterpreter<'a> {
         let provider = cache
             .provider()
             .is_some_and(|provider| provider.generation() != 0);
-        if !provider && !repair {
+        let has_companion = cache.has_embedded_companion(font_id);
+        if !provider && !repair && !has_companion {
             return None;
         }
         let composite = matches!(
@@ -6396,23 +6441,40 @@ impl<'a> ContentInterpreter<'a> {
         );
         let cmap = cache.get(font_id)?.cid_cmap.as_ref();
         let mut check_offset = 0usize;
-        if !repair
-            && cache.original_glyphs_usable(
-                font_id,
-                glyphs.iter().map(|glyph| {
-                    let (code, length, raw, end) = next_text_code(
-                        cmap,
-                        composite,
-                        bytes,
-                        check_offset,
+        if !repair {
+            let all_covered =
+                if has_companion {
+                    cache.get(font_id).is_some_and(|font| {
+                        font.fallback_glyphs_complete(
+                            font,
+                            glyphs.iter().map(|glyph| {
+                                let (code, length, raw, end) =
+                                    next_text_code(cmap, composite, bytes, check_offset)
+                                        .unwrap_or((0, 0, 0, bytes.len()));
+                                check_offset = end;
+                                (glyph.glyph_id, code, raw, length as u8)
+                            }),
+                        )
+                    })
+                } else {
+                    cache.original_glyphs_usable(
+                        font_id,
+                        glyphs.iter().map(|glyph| {
+                            let (code, length, raw, end) = next_text_code(
+                                cmap,
+                                composite,
+                                bytes,
+                                check_offset,
+                            )
+                            .unwrap_or((0, 0, 0, bytes.len()));
+                            check_offset = end;
+                            (glyph.glyph_id, code, raw, length as u8)
+                        }),
                     )
-                    .unwrap_or((0, 0, 0, bytes.len()));
-                    check_offset = end;
-                    (glyph.glyph_id, code, raw, length as u8)
-                }),
-            )
-        {
-            return None;
+                };
+            if all_covered {
+                return None;
+            }
         }
         let mut ids: Option<Vec<FontId>> = None;
         let mut offset = 0;
@@ -6439,14 +6501,30 @@ impl<'a> ContentInterpreter<'a> {
                     };
                     let drawing = match sibling {
                         Some(sibling) => sibling,
-                        None if provider => cache.resolve_drawing_glyph(
-                            original,
-                            code,
-                            raw,
-                            length as u8,
-                            max_bytes,
-                        ),
-                        None => original,
+                        None => {
+                            let embedded = if has_companion {
+                                cache.resolve_embedded_companion_glyph(
+                                    original,
+                                    code,
+                                    raw,
+                                    length as u8,
+                                    max_bytes,
+                                )
+                            } else {
+                                None
+                            };
+                            match embedded {
+                                Some(embedded) => embedded,
+                                None if provider => cache.resolve_drawing_glyph(
+                                    original,
+                                    code,
+                                    raw,
+                                    length as u8,
+                                    max_bytes,
+                                ),
+                                None => original,
+                            }
+                        }
                     };
                     previous = Some((key, drawing));
                     drawing
@@ -6911,16 +6989,20 @@ fn load_font_ref(
                 _ => false,
             }
     });
-    let (font, diagnostics) = match shared {
-        Some(doc) => doc.shared_font_with_diagnostics(font_ref)?,
+    let (font, diagnostics, companion) = match shared {
+        Some(doc) => doc.shared_font_with_fallback(font_ref)?,
         None => {
-            let (font, diagnostics) =
-                zpdf_document::font_loader::load_single_font_with_diagnostics(
+            let (font, diagnostics, companion) =
+                zpdf_document::font_loader::load_single_font_with_fallback(
                     file,
                     font_ref,
                     fc.provider().map(|provider| provider.as_ref()),
                 )?;
-            (std::sync::Arc::new(font), diagnostics)
+            (
+                std::sync::Arc::new(font),
+                diagnostics,
+                companion.map(std::sync::Arc::new),
+            )
         }
     };
     match fc.admit_with_diagnostics(
@@ -6930,7 +7012,14 @@ fn load_font_ref(
         Some(font_ref),
         max_bytes,
     ) {
-        Ok(_) => Ok(None),
+        Ok(fid) => {
+            if let Some(companion) = companion {
+                if fc.get(fid).is_some_and(|f| f.has_font_data()) {
+                    fc.record_embedded_companion(fid, companion);
+                }
+            }
+            Ok(None)
+        }
         Err(unadmitted) => Ok(Some(unadmitted)),
     }
 }

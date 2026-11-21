@@ -2286,6 +2286,11 @@ pub struct FontCache {
     /// parse and fell back to substitution or metrics-only mode. Empty maps
     /// allocate nothing, so normal pages pay zero overhead.
     embedded_fallbacks: HashMap<FontId, zpdf_core::ProcessingDiagnostics>,
+    /// Retained partially-readable embedded font programs paired with a
+    /// substituted `FontId`, lazily admitted into `fonts` only when an
+    /// uncovered glyph still draws from the embedded face. Empty maps allocate
+    /// nothing.
+    embedded_companions: HashMap<FontId, (Arc<LoadedFont>, Option<FontId>)>,
 }
 
 impl FontCache {
@@ -2304,7 +2309,23 @@ impl FontCache {
             provider: None,
             resolution: None,
             embedded_fallbacks: HashMap::new(),
+            embedded_companions: HashMap::new(),
         }
+    }
+
+    /// Pair a substituted font `id` with its partially readable embedded
+    /// original so glyphs uncovered by the substitute can still draw from the
+    /// surviving embedded outlines.
+    #[doc(hidden)]
+    pub fn record_embedded_companion(&mut self, id: FontId, embedded: Arc<LoadedFont>) {
+        self.embedded_companions.insert(id, (embedded, None));
+    }
+
+    /// Whether `id` has a retained embedded original available for uncovered
+    /// glyphs.
+    #[doc(hidden)]
+    pub fn has_embedded_companion(&self, id: FontId) -> bool {
+        !self.embedded_companions.is_empty() && self.embedded_companions.contains_key(&id)
     }
 
     /// Admit `font` under `name` within `max_bytes`, preserving logical PDF

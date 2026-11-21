@@ -319,7 +319,6 @@ fn corrupt_embedded_font_exports_succeed_when_recovered_and_fail_when_unrecovere
         let stderr = String::from_utf8_lossy(&res.stderr);
         assert!(
             stderr.contains("incomplete output")
-                && stderr.contains("decode_failures=1")
                 && stderr.contains("embedded_font_fallbacks=1")
                 && stderr.contains("missing_glyph_outlines=1"),
             "{command}: {stderr}"
@@ -327,6 +326,22 @@ fn corrupt_embedded_font_exports_succeed_when_recovered_and_fail_when_unrecovere
         assert_eq!(fs::read(&out).unwrap(), b"existing");
         fs::remove_file(&out).unwrap();
     }
+    let bad_text = Command::new(env!("CARGO_BIN_EXE_zpdf"))
+        .args(["text"])
+        .arg(&bad_input)
+        .output()
+        .unwrap();
+    assert!(
+        !bad_text.status.success(),
+        "text should reject unmappable CID font with no decoded text"
+    );
+    let bad_text_err = String::from_utf8_lossy(&bad_text.stderr);
+    assert!(
+        bad_text_err.contains("incomplete output")
+            && bad_text_err.contains("decode_failures=1")
+            && bad_text_err.contains("embedded_font_fallbacks=1"),
+        "{bad_text_err}"
+    );
     fs::remove_file(&bad_input).unwrap();
 
     // 3. Corrupt font whose characters all decode via /ToUnicode (e.g. private-use

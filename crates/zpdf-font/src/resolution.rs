@@ -1207,6 +1207,77 @@ impl FontCache {
         resolved
     }
 
+    /// If `original` is a substituted font that lacks a drawable outline for
+    /// this glyph and a partially readable embedded original was retained for
+    /// it, resolve the glyph from the surviving embedded face (lazily admitting
+    /// it into the cache within `max_bytes`).
+    #[doc(hidden)]
+    pub fn resolve_embedded_companion_glyph(
+        &mut self,
+        original: DrawingGlyph,
+        code: u32,
+        raw_code: u32,
+        length: u8,
+        max_bytes: u64,
+    ) -> Option<DrawingGlyph> {
+        if self.embedded_companions.is_empty()
+            || !self.embedded_companions.contains_key(&original.font_id)
+        {
+            return None;
+        }
+        let primary = self.fonts.get(&original.font_id)?;
+        let primary_state = match self.provider.as_ref() {
+            Some(provider) => provider.glyph_state(primary, original.glyph_id),
+            None => primary.glyph_state(original.glyph_id),
+        };
+        if primary_state == GlyphState::Drawn
+            || (primary_state == GlyphState::Blank
+                && primary.code_requires_no_ink(code, raw_code, length))
+        {
+            return None;
+        }
+
+        let (companion, existing_id) = {
+            let (companion, admitted_id) = self.embedded_companions.get(&original.font_id)?;
+            (Arc::clone(companion), *admitted_id)
+        };
+        let companion_gid = if matches!(companion.font_type, PdfFontType::Type0CidType2) {
+            if companion.unicode_coded() {
+                companion.composite_unicode_gid(code, raw_code, length)?
+            } else {
+                let cid = companion
+                    .cid_cmap
+                    .as_ref()
+                    .map(|c| c.code_to_cid(code, length))
+                    .unwrap_or(code);
+                u16::try_from(cid).ok()?
+            }
+        } else {
+            companion.code_to_gid(u16::try_from(code).ok()?)?
+        };
+        let companion_state = match self.provider.as_ref() {
+            Some(provider) => provider.glyph_state(&companion, companion_gid),
+            None => companion.glyph_state(companion_gid),
+        };
+        if companion_state != GlyphState::Drawn {
+            return None;
+        }
+        let font_id = match existing_id {
+            Some(id) => id,
+            None => {
+                let id = self.admit_drawing_font(companion, max_bytes)?;
+                if let Some((_, slot)) = self.embedded_companions.get_mut(&original.font_id) {
+                    *slot = Some(id);
+                }
+                id
+            }
+        };
+        Some(DrawingGlyph {
+            font_id,
+            glyph_id: companion_gid,
+        })
+    }
+
     fn admit_drawing_font(&mut self, font: Arc<LoadedFont>, max_bytes: u64) -> Option<FontId> {
         // Drawing faces have no PDF resource name, so hostile resource names
         // cannot collide with an internal alias or redirect an existing run.
