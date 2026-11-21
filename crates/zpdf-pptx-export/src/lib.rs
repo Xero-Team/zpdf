@@ -757,6 +757,24 @@ mod export_tests {
         assert_eq!(run_text(make_font(), 7, 0x010203), "A");
         assert_eq!(run_text(make_font(), 8, 0x41), "X");
 
+        // With `code_len = 0`, no `/ToUnicode`, and `/90ms-RKSJ-H`, `<41>` is a
+        // complete 1-byte code and must not be zero-padded to `<0041>` (which
+        // would decode `<00>` and drop `<41>`), while `<8141>` still infers
+        // 2 bytes and `/UniGB-UCS2-H` still infers 2 bytes for `<0041>`.
+        let rksj_font = || {
+            let mut font = LoadedFont::new_placeholder("Rksj".into());
+            font.font_type = zpdf_font::PdfFontType::Type0CidType2;
+            font.cid_cmap = zpdf_font::cmap::CidCMap::predefined("90ms-RKSJ-H");
+            font
+        };
+        assert_eq!(run_text(rksj_font(), 1, 0x41), "A");
+        assert_eq!(run_text(rksj_font(), 2, 0x8141), "\u{3001}");
+
+        let mut ucs2_font = LoadedFont::new_placeholder("Ucs2".into());
+        ucs2_font.font_type = zpdf_font::PdfFontType::Type0CidType2;
+        ucs2_font.cid_cmap = zpdf_font::cmap::CidCMap::predefined("UniGB-UCS2-H");
+        assert_eq!(run_text(ucs2_font, 1, 0x41), "A");
+
         // Fixed-width 1-byte recovery still splits a 2-byte unmapped chunk
         // when no exact `(raw_code, len)` entry exists.
         let mut one_byte_font = LoadedFont::new_placeholder("OneByteFallback".into());
@@ -1465,5 +1483,186 @@ mod export_tests {
                 "{label}: PPTX slide export must preserve both <41> and <0041> regardless of declaration order"
             );
         }
+    }
+
+    #[test]
+    fn unicode_cmap_xml_forbidden_control_char_serializes_valid_slide_xml() {
+        use quick_xml::events::Event;
+        use std::sync::Arc;
+        use zpdf_font::FontProvider;
+
+        const PRIMARY_TTF: &[u8] =
+            include_bytes!("../../zpdf-font/tests/fixtures/coverage-primary.ttf");
+
+        let stream = |dict: &str, bytes: &[u8]| -> Vec<u8> {
+            let mut out = format!("<< {dict} /Length {} >>\nstream\n", bytes.len()).into_bytes();
+            out.extend_from_slice(bytes);
+            out.extend_from_slice(b"\nendstream");
+            out
+        };
+        let assemble = |objects: &[Vec<u8>]| -> Vec<u8> {
+            let mut pdf = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n".to_vec();
+            let mut offsets = Vec::with_capacity(objects.len());
+            for (idx, body) in objects.iter().enumerate() {
+                offsets.push(pdf.len());
+                pdf.extend_from_slice(format!("{} 0 obj\n", idx + 1).as_bytes());
+                pdf.extend_from_slice(body);
+                pdf.extend_from_slice(b"\nendobj\n");
+            }
+            let xref = pdf.len();
+            let count = objects.len() + 1;
+            pdf.extend_from_slice(format!("xref\n0 {count}\n0000000000 65535 f \n").as_bytes());
+            for off in offsets {
+                pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+            }
+            pdf.extend_from_slice(
+                format!("trailer\n<< /Size {count} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n")
+                    .as_bytes(),
+            );
+            pdf
+        };
+
+        let provider = Arc::new(FontProvider::memory_only());
+        provider
+            .register_with_aliases(PRIMARY_TTF, 0, &["PptxXmlControlFace"])
+            .unwrap();
+
+        // `/UniGB-UCS2-H` with NO `/ToUnicode` decodes `<0041000B0042>` to
+        // `"A\u{000B}B"`. Serializing to PPTX must strip the XML-forbidden
+        // vertical tab while keeping a well-formed slide whose `<a:t>` holds
+        // both letters.
+        let pdf = assemble(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] \
+              /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
+                .to_vec(),
+            stream("", b"0 0 0 rg BT /F1 18 Tf 20 50 Td <0041000B0042> Tj ET"),
+            b"<< /Type /Font /Subtype /Type0 /BaseFont /ABCDEF+PptxXmlControlFace \
+              /Encoding /UniGB-UCS2-H /DescendantFonts [6 0 R] >>"
+                .to_vec(),
+            b"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /ABCDEF+PptxXmlControlFace \
+              /CIDSystemInfo << /Registry (Adobe) /Ordering (GB1) /Supplement 0 >> \
+              /CIDToGIDMap /Identity /FontDescriptor 7 0 R /DW 600 >>"
+                .to_vec(),
+            b"<< /Type /FontDescriptor /FontName /ABCDEF+PptxXmlControlFace /Flags 32 /FontFile2 8 0 R >>"
+                .to_vec(),
+            stream("", b"corrupt unparseable truetype bytes"),
+        ]);
+
+        let doc = zpdf_document::PdfDocument::open(pdf)
+            .unwrap()
+            .with_font_provider(Arc::clone(&provider));
+        let page = doc.page(0).unwrap();
+        let mut fonts = doc.load_page_fonts(&page);
+        let (content, _) = doc.page_content_with_diagnostics(&page).unwrap();
+        let mut images = ImageCache::new();
+        let interpreter = zpdf_content::interpreter::ContentInterpreter::new(page.effective_box())
+            .with_document(doc.file(), &page.resources)
+            .with_fonts(&mut fonts)
+            .with_shared_fonts(&doc)
+            .with_images(&mut images);
+        let (display_list, _) = interpreter.interpret_with_stats(&content);
+
+        let slide = display_list_to_slide(
+            &display_list,
+            0,
+            &fonts,
+            &images,
+            &ConversionOptions::default(),
+        )
+        .expect("slide export");
+        let raw_slide_text: String = slide
+            .elements
+            .iter()
+            .filter_map(|e| match e {
+                SlideElement::TextBox { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            raw_slide_text, "A\u{000B}B",
+            "test fixture must exercise U+000B decoded via /UniGB-UCS2-H"
+        );
+        let presentation = PptxPresentation {
+            slides: vec![slide],
+            width_emu: pt_to_emu(200.0),
+            height_emu: pt_to_emu(100.0),
+        };
+        let bytes = PptxWriter::new(presentation)
+            .write_to_bytes()
+            .expect("pptx bytes");
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("zip archive");
+        let xml = String::from_utf8(zip_entry(&mut archive, "ppt/slides/slide1.xml"))
+            .expect("utf-8 slide xml");
+
+        // Enforce XML 1.0 §2.2 Char range across the entire serialized slide.
+        for ch in xml.chars() {
+            assert!(
+                ooxml::is_valid_xml_char(ch),
+                "serialized slide XML contains XML 1.0 forbidden character U+{:04X}: {xml}",
+                ch as u32
+            );
+        }
+
+        // Parse the serialized slide with quick-xml and collect `<a:t>` text.
+        let mut reader = quick_xml::Reader::from_str(&xml);
+        let mut in_text = false;
+        let mut parsed_text = String::new();
+        loop {
+            match reader.read_event().expect("well-formed slide XML") {
+                Event::Start(e) => {
+                    for attr in e.attributes() {
+                        attr.expect("valid attribute");
+                    }
+                    if e.name().as_ref() == "a:t" {
+                        in_text = true;
+                    }
+                }
+                Event::Empty(e) => {
+                    for attr in e.attributes() {
+                        attr.expect("valid attribute");
+                    }
+                }
+                Event::End(e) => {
+                    if e.name().as_ref() == "a:t" {
+                        in_text = false;
+                    }
+                }
+                Event::Text(e) => {
+                    if in_text {
+                        parsed_text.push_str(&e.xml10_content());
+                    }
+                }
+                Event::GeneralRef(e) => {
+                    if let Some(ch) = e.resolve_char_ref().expect("valid char ref") {
+                        assert!(
+                            ooxml::is_valid_xml_char(ch),
+                            "serialized slide XML contains forbidden char ref U+{:04X}",
+                            ch as u32
+                        );
+                        if in_text {
+                            parsed_text.push(ch);
+                        }
+                    } else if in_text {
+                        let entity = match e.xml10_content().as_ref() {
+                            "amp" => "&",
+                            "lt" => "<",
+                            "gt" => ">",
+                            "quot" => "\"",
+                            "apos" => "'",
+                            other => panic!("unexpected XML entity &{other};"),
+                        };
+                        parsed_text.push_str(entity);
+                    }
+                }
+                Event::Eof => break,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            parsed_text, "AB",
+            "parsed slide XML must retain both 'A' and 'B' without XML-forbidden U+000B"
+        );
     }
 }

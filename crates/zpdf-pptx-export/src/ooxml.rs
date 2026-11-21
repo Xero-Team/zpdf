@@ -546,12 +546,38 @@ impl PptxWriter {
     }
 }
 
+/// Whether `ch` is allowed by XML 1.0 Fifth Edition §2.2 (`Char`).
+///
+/// Rust's `char` already excludes UTF-16 surrogates (`U+D800..=U+DFFF`) and
+/// values above `U+10FFFF`, leaving control characters other than TAB/LF/CR
+/// and the noncharacters `U+FFFE` and `U+FFFF` forbidden in XML 1.0 even as
+/// numeric character references.
+pub(crate) fn is_valid_xml_char(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{0009}'
+            | '\u{000A}'
+            | '\u{000D}'
+            | '\u{0020}'..='\u{D7FF}'
+            | '\u{E000}'..='\u{FFFD}'
+            | '\u{10000}'..='\u{10FFFF}'
+    )
+}
+
 fn escape_xml(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            c if is_valid_xml_char(c) => out.push(c),
+            _ => {}
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -561,6 +587,17 @@ mod tests {
     #[test]
     fn escapes_xml_entities() {
         assert_eq!(escape_xml("a<b&c>d"), "a&lt;b&amp;c&gt;d");
+    }
+
+    #[test]
+    fn strips_xml_1_0_forbidden_chars_while_keeping_valid_range() {
+        let input = "A\u{0000}\u{0008}\t\n\u{000B}\u{000C}\r\u{000E}\u{001F}B\u{D7FF}\u{E000}\u{FFFD}\u{FFFE}\u{FFFF}\u{10000}\u{20000}&<";
+        let escaped = escape_xml(input);
+        assert_eq!(
+            escaped,
+            "A\t\n\rB\u{D7FF}\u{E000}\u{FFFD}\u{10000}\u{20000}&amp;&lt;"
+        );
+        assert!(escaped.chars().all(is_valid_xml_char));
     }
 }
 

@@ -1793,23 +1793,51 @@ impl LoadedFont {
     /// CMap decoding.
     pub fn append_decoded_source_code(&self, raw_code: u32, code_len: u8, out: &mut String) {
         if matches!(self.font_type, PdfFontType::Type0CidType2) {
-            let len = if (1..=4).contains(&code_len) {
-                code_len
-            } else {
-                self.to_unicode
-                    .as_ref()
-                    .and_then(|map| map.source_length(raw_code))
-                    .unwrap_or_else(|| ((4 - raw_code.leading_zeros() / 8) as u8).max(2))
-            };
             let be = raw_code.to_be_bytes();
-            let slice = &be[4 - usize::from(len)..];
+            let natural = (4 - raw_code.leading_zeros() / 8).max(1) as u8;
             if let Some(cm) = &self.cid_cmap {
-                let (code, seg_len) = cm.next_code(slice);
-                self.append_decoded_code(code, seg_len as u8, raw_code, out);
+                let (code, seg_len) = if (1..=4).contains(&code_len) {
+                    let slice = &be[4 - usize::from(code_len)..];
+                    let (code, seg_len) = cm.next_code(slice);
+                    (code, seg_len as u8)
+                } else {
+                    let exact_for = |len: u8| -> Option<(u32, u8)> {
+                        if len < natural || len > 4 {
+                            return None;
+                        }
+                        let slice = &be[4 - usize::from(len)..];
+                        cm.exact_code(slice)
+                            .filter(|&(_, consumed)| consumed == usize::from(len))
+                            .map(|(code, consumed)| (code, consumed as u8))
+                    };
+                    self.to_unicode
+                        .as_ref()
+                        .and_then(|map| map.source_length(raw_code))
+                        .and_then(exact_for)
+                        .or_else(|| (natural..=4).find_map(exact_for))
+                        .unwrap_or_else(|| {
+                            let fallback_len = self
+                                .to_unicode
+                                .as_ref()
+                                .and_then(|map| map.source_length(raw_code))
+                                .unwrap_or(natural);
+                            let slice = &be[4 - usize::from(fallback_len)..];
+                            let (code, seg_len) = cm.next_code(slice);
+                            (code, seg_len as u8)
+                        })
+                };
+                self.append_decoded_code(code, seg_len, raw_code, out);
             } else if let Some(map) = &self.to_unicode {
+                let len = if (1..=4).contains(&code_len) {
+                    code_len
+                } else {
+                    map.source_length(raw_code)
+                        .unwrap_or_else(|| natural.max(2))
+                };
                 if let Some(text) = map.lookup_with_length(raw_code, len) {
                     out.push_str(text);
                 } else {
+                    let slice = &be[4 - usize::from(len)..];
                     map.append_fixed_width(slice, out);
                 }
             }
