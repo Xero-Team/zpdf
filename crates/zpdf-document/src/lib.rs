@@ -74,15 +74,15 @@ pub struct PdfDocument {
 
 /// One entry in [`SharedFonts`]: the parsed primary font, any load-time
 /// embedded-font fallback diagnostics, an optional paired companion
-/// (embedded original for a substitute primary, or descriptor substitute for a
-/// partially corrupt embedded primary), and the embedded `/FontFile*` object id
-/// when an embedded font program was kept as the primary face.
+/// (`EmbeddedOriginal` for a substitute primary), and an optional lightweight
+/// descriptor-substitute recipe when an embedded font program was kept as the
+/// primary face.
 #[doc(hidden)]
 pub type SharedFontEntry = (
     Arc<LoadedFont>,
     zpdf_core::ProcessingDiagnostics,
     Option<Arc<LoadedFont>>,
-    Option<ObjectId>,
+    Option<zpdf_font::DescriptorSubstituteSpec>,
 );
 
 /// Fonts parsed so far by one document, with the byte total the budget is
@@ -113,14 +113,14 @@ impl SharedFonts {
     }
     /// The font parsed for `id` by an earlier page of this document, if it was
     /// retained, together with any embedded-font fallback diagnostics, paired
-    /// companion, and embedded stream object id.
+    /// companion, and descriptor-substitute specification.
     pub(crate) fn get(&self, id: ObjectId) -> Option<SharedFontEntry> {
-        self.fonts.get(&id).map(|(font, diag, comp, emb_id)| {
+        self.fonts.get(&id).map(|(font, diag, comp, desc_spec)| {
             (
                 Arc::clone(font),
                 *diag,
                 comp.as_ref().map(Arc::clone),
-                *emb_id,
+                desc_spec.clone(),
             )
         })
     }
@@ -134,7 +134,7 @@ impl SharedFonts {
         font: LoadedFont,
         diagnostics: zpdf_core::ProcessingDiagnostics,
         embedded_companion: Option<LoadedFont>,
-        embedded_file_id: Option<ObjectId>,
+        descriptor_spec: Option<zpdf_font::DescriptorSubstituteSpec>,
         max_bytes: u64,
     ) -> SharedFontEntry {
         if let Some(existing) = self.get(id) {
@@ -155,19 +155,26 @@ impl SharedFonts {
                             Arc::clone(&font),
                             diagnostics,
                             Some(Arc::clone(comp)),
-                            embedded_file_id,
+                            descriptor_spec.clone(),
                         ),
                     );
                 }
             }
             None => {
                 if self.budget.try_admit(&font, max_bytes) {
-                    self.fonts
-                        .insert(id, (Arc::clone(&font), diagnostics, None, embedded_file_id));
+                    self.fonts.insert(
+                        id,
+                        (
+                            Arc::clone(&font),
+                            diagnostics,
+                            None,
+                            descriptor_spec.clone(),
+                        ),
+                    );
                 }
             }
         }
-        (font, diagnostics, companion, embedded_file_id)
+        (font, diagnostics, companion, descriptor_spec)
     }
 }
 

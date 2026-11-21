@@ -999,12 +999,14 @@ impl LoadedFont {
 
     /// Classify a batch of glyph IDs in an embedded font as having a corrupt /
     /// unreadable embedded outline record (`true`) vs drawn, valid blank, or
-    /// unmapped (`false`). Parses the embedded font program at most once per
-    /// batch.
+    /// unmapped (`false`), applying the same bounded `glyf` blank-record check
+    /// used by [`Self::probe_embedded_outlines`]. Parses the embedded font
+    /// program at most once per batch.
     #[doc(hidden)]
     pub fn classify_embedded_glyphs_unreadable(
         &self,
         glyph_ids: &[u16],
+        cmap_budget: &mut usize,
         mut record: impl FnMut(u16, bool),
     ) {
         if self.is_substitute || self.is_type3() || !self.has_font_data() {
@@ -1033,14 +1035,26 @@ impl LoadedFont {
         };
         self.apply_variations(&mut face);
         let num_glyphs = face.number_of_glyphs();
+        // When the font has an explicit GID mapping (`/CIDToGIDMap`, CFF
+        // charset, Unicode cmap, or simple-font `code_to_gid`), a resolved
+        // nonzero GID outside `num_glyphs` is an unreadable out-of-range
+        // mapping. Absent mappings (`None`) and `.notdef` (0) stay distinct.
+        let explicit_gid_map = self.cid_to_gid.is_some()
+            || !matches!(self.font_type, PdfFontType::Type0CidType2)
+            || self.unicode_coded();
         for &glyph_id in glyph_ids {
             let unreadable = if glyph_id == 0 {
                 false
             } else {
                 match self.drawing_gid_with_face(glyph_id, &face) {
-                    Some(gid) if gid != 0 && gid < num_glyphs => {
-                        resolution::physical_glyph_state(&face, gid)
-                            == resolution::GlyphState::Missing
+                    Some(gid) if gid != 0 && (gid < num_glyphs || explicit_gid_map) => {
+                        match resolution::physical_glyph_state(&face, gid) {
+                            resolution::GlyphState::Drawn => false,
+                            resolution::GlyphState::Missing => true,
+                            resolution::GlyphState::Blank => {
+                                resolution::glyf_blank_is_corrupt(&face, gid, cmap_budget)
+                            }
+                        }
                     }
                     _ => false,
                 }
@@ -1050,11 +1064,15 @@ impl LoadedFont {
     }
 
     /// Whether `glyph_id` resolves in this embedded font to a physical glyph
-    /// whose outline record is corrupt/unreadable.
+    /// whose outline record is corrupt/unreadable (including damaged
+    /// zero-contour `glyf` records).
     #[doc(hidden)]
     pub fn is_embedded_glyph_unreadable(&self, glyph_id: u16) -> bool {
         let mut unreadable = false;
-        self.classify_embedded_glyphs_unreadable(&[glyph_id], |_, u| unreadable = u);
+        let mut cmap_budget = resolution::CMAP_PROBE_BUDGET;
+        self.classify_embedded_glyphs_unreadable(&[glyph_id], &mut cmap_budget, |_, u| {
+            unreadable = u
+        });
         unreadable
     }
 
@@ -2386,6 +2404,10 @@ impl FontCacheBudget {
     }
 }
 
+/// Per-font `cmap` scan budget shared across bounded blank-record probes.
+#[doc(hidden)]
+pub const CMAP_PROBE_BUDGET: usize = resolution::CMAP_PROBE_BUDGET;
+
 /// Result of probing an embedded font program's glyph outlines at load time.
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2402,6 +2424,20 @@ pub enum EmbeddedOutlineProbe {
     Unusable,
 }
 
+/// Descriptor metadata retained for an embedded primary font so a
+/// descriptor-based substitute can be resolved lazily on demand — including
+/// when interpreting from a standalone [`FontCache`] without a `PdfFile`.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct DescriptorSubstituteSpec {
+    pub lookup_name: String,
+    pub hints: system::SubstituteHints,
+    pub ordering: Option<String>,
+    /// Object ID of the embedded `/FontFile*` stream for lazy fallback
+    /// diagnostics when an unreadable shown glyph triggers fallback.
+    pub font_file_id: Option<zpdf_core::ObjectId>,
+}
+
 /// Direction of a paired fallback companion in [`FontCache`].
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2415,7 +2451,7 @@ pub enum CompanionKind {
     DescriptorSubstitute {
         /// Object ID of the embedded `/FontFile*` stream for lazy fallback
         /// diagnostics when an unreadable shown glyph triggers fallback.
-        font_file_id: zpdf_core::ObjectId,
+        font_file_id: Option<zpdf_core::ObjectId>,
     },
 }
 
@@ -2459,6 +2495,9 @@ pub enum DeferredCompanionLoad {
 pub(crate) struct CompanionEntry {
     pub(crate) kind: CompanionKind,
     pub(crate) source: CompanionSource,
+    /// Lightweight descriptor metadata for lazy descriptor-based substitution
+    /// of unreadable embedded glyphs without requiring a `PdfFile`.
+    pub(crate) descriptor_spec: Option<Box<DescriptorSubstituteSpec>>,
     /// Optional in-memory standby copy of the companion face, strictly
     /// charged in `FontCache::standby_bytes` so `bytes_used() <= max_bytes`
     /// always holds, and reclaimed whenever a primary font, Form font, or
@@ -2470,6 +2509,13 @@ pub(crate) struct CompanionEntry {
     /// Highest remaining page-budget allowance for which loading or admitting
     /// this deferred companion already failed definitively.
     pub(crate) failed_budget: Option<u64>,
+    /// Number of unique shared programs in `self.budget.programs` when
+    /// `failed_budget` was recorded; if another font later admits a shared
+    /// program, a companion sharing it may now fit in incremental bytes.
+    pub(crate) failed_program_count: usize,
+    /// `FontProvider::generation()` observed for `descriptor_spec` caches so
+    /// newly registered faces clear stale failure/miss entries.
+    pub(crate) provider_generation: Option<u64>,
     /// Bounded set of `(code, raw_code, length)` misses observed on this page
     /// so repeated shows of a code neither face draws do not re-decode the
     /// deferred companion, while leaving other codes free to load it.
@@ -2629,14 +2675,42 @@ impl FontCache {
                 CompanionEntry {
                     kind,
                     source,
+                    descriptor_spec: None,
                     standby: retained_standby,
                     admitted: None,
                     failed_budget: None,
+                    failed_program_count: 0,
+                    provider_generation: self.provider.as_ref().map(|p| p.generation()),
                     missed_codes: HashSet::new(),
                 },
             );
         }
         retained
+    }
+
+    /// Record lightweight descriptor metadata for an embedded primary font so
+    /// unreadable shown glyphs can lazily resolve a descriptor-based substitute
+    /// without retaining uncharged font bytes or needing a `PdfFile`.
+    #[doc(hidden)]
+    pub fn record_descriptor_substitute(&mut self, id: FontId, spec: DescriptorSubstituteSpec) {
+        if !self.fonts.contains_key(&id) || self.embedded_companions.contains_key(&id) {
+            return;
+        }
+        let font_file_id = spec.font_file_id;
+        self.embedded_companions.insert(
+            id,
+            CompanionEntry {
+                kind: CompanionKind::DescriptorSubstitute { font_file_id },
+                source: CompanionSource::None,
+                descriptor_spec: Some(Box::new(spec)),
+                standby: None,
+                admitted: None,
+                failed_budget: None,
+                failed_program_count: 0,
+                provider_generation: self.provider.as_ref().map(|p| p.generation()),
+                missed_codes: HashSet::new(),
+            },
+        );
     }
 
     /// Pair a substituted font `id` with an indirect PDF font dictionary whose
@@ -2728,11 +2802,23 @@ impl FontCache {
         if entry.admitted.is_some() || entry.standby.is_some() {
             return true;
         }
-        if matches!(entry.source, CompanionSource::None) {
+        if entry.descriptor_spec.is_none() && matches!(entry.source, CompanionSource::None) {
             return false;
         }
         let remaining = max_bytes.saturating_sub(self.budget.bytes_used());
-        remaining > 0 && !entry.failed_budget.is_some_and(|limit| remaining <= limit)
+        if remaining == 0 {
+            return false;
+        }
+        if entry.descriptor_spec.is_some() {
+            let current_gen = self.provider.as_ref().map(|p| p.generation());
+            if entry.provider_generation != current_gen {
+                return true;
+            }
+            if entry.failed_program_count != self.budget.programs.len() {
+                return true;
+            }
+        }
+        !entry.failed_budget.is_some_and(|limit| remaining <= limit)
     }
 
     /// Whether `id` currently retains an in-memory embedded companion program

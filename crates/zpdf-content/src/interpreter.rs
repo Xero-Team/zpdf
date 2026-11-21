@@ -356,12 +356,24 @@ impl ActualText {
 
 /// Per-page cache of whether each shown glyph ID in an embedded font maps to a
 /// corrupt/unreadable outline record. Inline 256-bit bitsets keep simple fonts
-/// and small subsets allocation-free.
-#[derive(Default)]
+/// and small subsets allocation-free, and `cmap_budget` bounds blank-record
+/// `cmap` validation across the whole page for this font.
 struct EmbeddedGlyphHealth {
     checked_low: [u64; 4],
     unreadable_low: [u64; 4],
     high: HashMap<u16, bool>,
+    cmap_budget: usize,
+}
+
+impl Default for EmbeddedGlyphHealth {
+    fn default() -> Self {
+        Self {
+            checked_low: [0; 4],
+            unreadable_low: [0; 4],
+            high: HashMap::new(),
+            cmap_budget: zpdf_font::CMAP_PROBE_BUDGET,
+        }
+    }
 }
 
 impl EmbeddedGlyphHealth {
@@ -5016,7 +5028,7 @@ impl<'a> ContentInterpreter<'a> {
                             font_dict,
                             fc.provider().map(|provider| provider.as_ref()),
                         ) {
-                            Ok((font, diagnostics, companion, embedded_file_id)) => {
+                            Ok((font, diagnostics, companion, descriptor_spec)) => {
                                 match fc.admit_with_diagnostics(
                                     target.clone(),
                                     std::sync::Arc::new(font),
@@ -5026,26 +5038,18 @@ impl<'a> ContentInterpreter<'a> {
                                 ) {
                                     Ok(fid) => {
                                         if fc.get(fid).is_some_and(|f| f.has_font_data()) {
-                                            let source = match form_id {
-                                                Some(id) => {
-                                                    zpdf_font::CompanionSource::FormInlineFont {
-                                                        form_id: id,
-                                                        font_name: name.0.clone(),
-                                                    }
-                                                }
-                                                None => zpdf_font::CompanionSource::None,
-                                            };
-                                            if let Some(font_file_id) = embedded_file_id {
-                                                let _ = fc.record_companion(
-                                                    fid,
-                                                    zpdf_font::CompanionKind::DescriptorSubstitute {
-                                                        font_file_id,
-                                                    },
-                                                    source,
-                                                    companion.map(std::sync::Arc::new),
-                                                    max_font_bytes,
-                                                );
+                                            if let Some(spec) = descriptor_spec {
+                                                fc.record_descriptor_substitute(fid, spec);
                                             } else if companion.is_some() {
+                                                let source = match form_id {
+                                                    Some(id) => {
+                                                        zpdf_font::CompanionSource::FormInlineFont {
+                                                            form_id: id,
+                                                            font_name: name.0.clone(),
+                                                        }
+                                                    }
+                                                    None => zpdf_font::CompanionSource::None,
+                                                };
                                                 let _ = fc.record_companion(
                                                     fid,
                                                     zpdf_font::CompanionKind::EmbeddedOriginal,
@@ -6146,17 +6150,30 @@ impl<'a> ContentInterpreter<'a> {
                 cache.has_embedded_companion_for_budget(fid, self.max_font_cache_bytes)
             })
         });
-        let unreadable_embedded = self.current.render_mode != 3
+        let no_marks = match self.current.render_mode {
+            1 | 5 => cs_produces_no_marks(&self.current.stroke_cs),
+            2 | 6 => {
+                cs_produces_no_marks(&self.current.fill_cs)
+                    && cs_produces_no_marks(&self.current.stroke_cs)
+            }
+            _ => cs_produces_no_marks(&self.current.fill_cs),
+        };
+        let wants_clip = matches!(self.current.render_mode, 4..=7);
+        let paints_or_clips = wants_clip
+            || (!matches!(self.current.render_mode, 3 | 7) && !no_marks && !self.oc_suppressed());
+        let contributes_text = self.text_sink.is_some() && !self.oc_suppressed();
+        let unreadable_embedded = (paints_or_clips || contributes_text)
             && !glyphs.is_empty()
             && show_font_id.is_some_and(|fid| self.scan_unreadable_embedded_glyphs(fid, &glyphs));
         let ordinary = self.current.render_mode == 0
+            && !self.oc_suppressed()
             && self.current.fill_pattern.is_none()
             && self
                 .font_cache
                 .as_ref()
                 .and_then(|cache| cache.provider())
                 .is_none_or(|provider| provider.generation() == 0)
-            && !cs_produces_no_marks(&self.current.fill_cs)
+            && !no_marks
             && !repair
             && !has_companion
             && !unreadable_embedded;
@@ -6182,8 +6199,13 @@ impl<'a> ContentInterpreter<'a> {
         // Check fallback text-decoding completeness against the outer font that
         // decoded this show (even if patterned text replayed a tiling cell with
         // its own `Tf`), independently of outline recovery and render-mode
-        // visibility.
+        // visibility. An invisible (render-mode-3) show contributing to
+        // extraction still activates the lazy fallback check for unreadable
+        // embedded glyphs without recording a missing visual outline.
         if let Some(font_id) = show_font_id {
+            if unreadable_embedded && contributes_text {
+                self.ensure_lazy_embedded_fallback(font_id);
+            }
             self.check_embedded_fallback_text(font_id, bytes);
         }
 
@@ -6308,7 +6330,10 @@ impl<'a> ContentInterpreter<'a> {
             ids.sort_unstable();
             ids.dedup();
             let mut unreadable = false;
-            font.classify_embedded_glyphs_unreadable(&ids, |_, u| unreadable |= u);
+            let mut cmap_budget = zpdf_font::CMAP_PROBE_BUDGET;
+            font.classify_embedded_glyphs_unreadable(&ids, &mut cmap_budget, |_, u| {
+                unreadable |= u
+            });
             return unreadable;
         };
 
@@ -6330,10 +6355,12 @@ impl<'a> ContentInterpreter<'a> {
             uncached.sort_unstable();
             uncached.dedup();
             let health = &mut self.embedded_glyph_health[index].1;
-            font.classify_embedded_glyphs_unreadable(&uncached, |gid, u| {
+            let mut cmap_budget = health.cmap_budget;
+            font.classify_embedded_glyphs_unreadable(&uncached, &mut cmap_budget, |gid, u| {
                 health.set(gid, u);
                 any_unreadable |= u;
             });
+            health.cmap_budget = cmap_budget;
         }
         any_unreadable
     }
@@ -6352,9 +6379,7 @@ impl<'a> ContentInterpreter<'a> {
             return;
         }
         let first_failed_object = match fc.companion_kind(font_id) {
-            Some(zpdf_font::CompanionKind::DescriptorSubstitute { font_file_id }) => {
-                Some(font_file_id)
-            }
+            Some(zpdf_font::CompanionKind::DescriptorSubstitute { font_file_id }) => font_file_id,
             _ => None,
         };
         let mut diag = zpdf_core::ProcessingDiagnostics::default();
@@ -6477,10 +6502,6 @@ impl<'a> ContentInterpreter<'a> {
         repair: bool,
         unreadable_embedded: bool,
     ) {
-        let resolved_runs = self.current_font_id.and_then(|font_id| {
-            self.resolve_text_glyphs(font_id, bytes, &mut glyphs, repair, unreadable_embedded)
-        });
-
         // Only emit a glyph run when a font is actually active; with no font the
         // glyph IDs would be raw, unmappable codes aliased onto font 0.
         // Text render mode 3 (invisible, the OCR-layer case) and 7 (clip only)
@@ -6497,6 +6518,19 @@ impl<'a> ContentInterpreter<'a> {
             _ => cs_produces_no_marks(&self.current.fill_cs),
         };
         let invisible = matches!(self.current.render_mode, 3 | 7) || no_marks;
+        let wants_clip = matches!(self.current.render_mode, 4..=7);
+        let paints = !invisible && !self.oc_suppressed();
+        // Gate drawing-font resolution on whether the show actually paints or
+        // contributes a clip so disabled-OCG and `/None`-colorant shows never
+        // permanently consume page font-cache budget.
+        if !paints && !wants_clip {
+            return;
+        }
+
+        let resolved_runs = self.current_font_id.and_then(|font_id| {
+            self.resolve_text_glyphs(font_id, bytes, &mut glyphs, repair, unreadable_embedded)
+        });
+
         // Text render modes 4–7 also *add the glyph outlines to the clipping
         // path* (applied at ET). Accumulate them in page space now — regardless
         // of whether the run is also painted (4=fill+clip, 5=stroke+clip,
@@ -6506,9 +6540,8 @@ impl<'a> ContentInterpreter<'a> {
             1 | 5 => self.current.stroke_pattern.clone(),
             _ => self.current.fill_pattern.clone(),
         };
-        let wants_clip = matches!(self.current.render_mode, 4..=7);
         if let Some(font_id) = self.current_font_id {
-            if (!glyphs.is_empty() || resolved_runs.is_some()) && (!invisible || wants_clip) {
+            if !glyphs.is_empty() || resolved_runs.is_some() {
                 if unreadable_embedded {
                     self.ensure_lazy_embedded_fallback(font_id);
                 }
@@ -6579,7 +6612,7 @@ impl<'a> ContentInterpreter<'a> {
             }
         }
         if let Some(font_id) = self.current_font_id {
-            if (!glyphs.is_empty() || resolved_runs.is_some()) && !invisible {
+            if (!glyphs.is_empty() || resolved_runs.is_some()) && paints {
                 if matches!(self.current.render_mode, 1 | 2 | 5 | 6) {
                     if let Some(runs) = resolved_runs {
                         for (id, glyphs) in runs {
@@ -6708,7 +6741,6 @@ impl<'a> ContentInterpreter<'a> {
         let has_companion = cache.has_embedded_companion_for_budget(font_id, max_bytes)
             || (unreadable_embedded
                 && cache.has_descriptor_substitute_for_budget(font_id, max_bytes));
-        let companion_kind = cache.companion_kind(font_id);
         if !provider && !repair && !has_companion {
             return None;
         }
@@ -6796,10 +6828,6 @@ impl<'a> ContentInterpreter<'a> {
                                         let Some(file) = file else {
                                             return zpdf_font::DeferredCompanionLoad::Unavailable;
                                         };
-                                        let is_descriptor_sub = matches!(
-                                            companion_kind,
-                                            Some(zpdf_font::CompanionKind::DescriptorSubstitute { .. })
-                                        );
                                         let loaded = match source {
                                             zpdf_font::CompanionSource::Object(font_ref) => {
                                                 shared_doc
@@ -6820,41 +6848,20 @@ impl<'a> ContentInterpreter<'a> {
                                                         doc.cached_shared_font_companion(*font_ref)
                                                     })
                                                     .or_else(|| {
-                                                        if is_descriptor_sub {
-                                                            zpdf_document::font_loader::load_descriptor_substitute_ref(
-                                                                file,
-                                                                *font_ref,
-                                                                provider_arc.as_deref(),
-                                                                remaining,
-                                                            )
-                                                            .map(std::sync::Arc::new)
-                                                        } else {
-                                                            zpdf_document::font_loader::load_embedded_companion_ref(
-                                                                file, *font_ref, remaining,
-                                                            )
-                                                            .map(std::sync::Arc::new)
-                                                        }
+                                                        zpdf_document::font_loader::load_embedded_companion_ref(
+                                                            file, *font_ref, remaining,
+                                                        )
+                                                        .map(std::sync::Arc::new)
                                                     })
                                             }
                                             zpdf_font::CompanionSource::FormInlineFont {
                                                 form_id,
                                                 font_name,
                                             } => {
-                                                if is_descriptor_sub {
-                                                    zpdf_document::font_loader::load_descriptor_substitute_form_inline(
-                                                        file,
-                                                        *form_id,
-                                                        font_name,
-                                                        provider_arc.as_deref(),
-                                                        remaining,
-                                                    )
-                                                    .map(std::sync::Arc::new)
-                                                } else {
-                                                    zpdf_document::font_loader::load_embedded_companion_form_inline(
-                                                        file, *form_id, font_name, remaining,
-                                                    )
-                                                    .map(std::sync::Arc::new)
-                                                }
+                                                zpdf_document::font_loader::load_embedded_companion_form_inline(
+                                                    file, *form_id, font_name, remaining,
+                                                )
+                                                .map(std::sync::Arc::new)
                                             }
                                             zpdf_font::CompanionSource::None => None,
                                         };
@@ -7349,10 +7356,10 @@ fn load_font_ref(
                 _ => false,
             }
     });
-    let (font, diagnostics, companion, embedded_file_id) = match shared {
+    let (font, diagnostics, companion, descriptor_spec) = match shared {
         Some(doc) => doc.shared_font_with_fallback(font_ref)?,
         None => {
-            let (font, diagnostics, companion, embedded_file_id) =
+            let (font, diagnostics, companion, descriptor_spec) =
                 zpdf_document::font_loader::load_single_font_with_fallback(
                     file,
                     font_ref,
@@ -7362,7 +7369,7 @@ fn load_font_ref(
                 std::sync::Arc::new(font),
                 diagnostics,
                 companion.map(std::sync::Arc::new),
-                embedded_file_id,
+                descriptor_spec,
             )
         }
     };
@@ -7375,14 +7382,8 @@ fn load_font_ref(
     ) {
         Ok(fid) => {
             if fc.get(fid).is_some_and(|f| f.has_font_data()) {
-                if let Some(font_file_id) = embedded_file_id {
-                    let _ = fc.record_companion(
-                        fid,
-                        zpdf_font::CompanionKind::DescriptorSubstitute { font_file_id },
-                        zpdf_font::CompanionSource::Object(font_ref),
-                        companion,
-                        max_bytes,
-                    );
+                if let Some(spec) = descriptor_spec {
+                    fc.record_descriptor_substitute(fid, spec);
                 } else if companion.is_some() {
                     let _ = fc.record_companion(
                         fid,

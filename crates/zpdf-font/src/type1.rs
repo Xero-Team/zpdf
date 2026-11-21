@@ -182,6 +182,10 @@ impl Type1Font {
                     }
                 } else if !interp.cmds.is_empty() {
                     drawn += 1;
+                } else if crate::glyph_list::glyph_name_to_string(name)
+                    .is_some_and(|s| crate::resolution::is_visible_text(&s))
+                {
+                    failed += 1;
                 }
             }
             i += step;
@@ -195,28 +199,54 @@ impl Type1Font {
         }
     }
 
-    /// Whether `gid` maps to an embedded charstring whose execution fails
-    /// (malformed outline record, as opposed to an unmapped `.notdef` or valid
-    /// empty space charstring).
-    pub(crate) fn is_gid_unreadable(&self, gid: u16) -> bool {
+    /// Classify `gid`'s embedded charstring for drawing-font resolution:
+    /// drawable path (`Drawn`), valid no-ink charstring such as `/space`
+    /// (`Blank`), or missing / failing / damaged empty visible charstring
+    /// (`Missing`).
+    pub(crate) fn glyph_state_by_gid(&self, gid: u16) -> crate::resolution::GlyphState {
         let Some(name) = self.gid_to_name.get(gid as usize) else {
-            return false;
+            return crate::resolution::GlyphState::Missing;
         };
         if name.is_empty() || name == ".notdef" {
-            return false;
+            return crate::resolution::GlyphState::Missing;
         }
         let Some(cs) = self.char_strings.get(name) else {
-            return false;
+            return crate::resolution::GlyphState::Missing;
         };
         let mut interp = Interp::new();
         interp.run(cs, &self.subrs, 0);
         if interp.failed {
-            return true;
+            return crate::resolution::GlyphState::Missing;
         }
         if let Some(seac) = interp.seac {
-            return self.compose_seac(&interp, seac, 1).is_none();
+            return if self.compose_seac(&interp, seac, 1).is_some() {
+                crate::resolution::GlyphState::Drawn
+            } else {
+                crate::resolution::GlyphState::Missing
+            };
         }
-        false
+        if !interp.cmds.is_empty() {
+            crate::resolution::GlyphState::Drawn
+        } else if crate::glyph_list::glyph_name_to_string(name)
+            .is_some_and(|s| crate::resolution::is_visible_text(&s))
+        {
+            crate::resolution::GlyphState::Missing
+        } else {
+            crate::resolution::GlyphState::Blank
+        }
+    }
+
+    /// Whether `gid` maps to an embedded charstring whose execution fails or
+    /// emits no path for a known visible character name (as opposed to an
+    /// unmapped `.notdef`, a space / no-ink character, or an unknown name).
+    pub(crate) fn is_gid_unreadable(&self, gid: u16) -> bool {
+        let Some(name) = self.gid_to_name.get(gid as usize) else {
+            return false;
+        };
+        if name.is_empty() || name == ".notdef" || !self.char_strings.contains_key(name) {
+            return false;
+        }
+        self.glyph_state_by_gid(gid) == crate::resolution::GlyphState::Missing
     }
 
     /// Built-in encoding glyph name for a character code.

@@ -925,11 +925,14 @@ fn mark_consumed_with_streams(
 }
 
 fn skip_elem_streams(elem: &StructElem, cursor: &mut usize) {
-    for kid in &elem.kids {
-        match kid {
-            StructKid::Element(child) => skip_elem_streams(child, cursor),
-            StructKid::MarkedContent { .. } => *cursor += 1,
-            StructKid::Object { .. } => {}
+    let mut stack = vec![elem];
+    while let Some(node) = stack.pop() {
+        for kid in &node.kids {
+            match kid {
+                StructKid::Element(child) => stack.push(child),
+                StructKid::MarkedContent { .. } => *cursor += 1,
+                StructKid::Object { .. } => {}
+            }
         }
     }
 }
@@ -1279,6 +1282,37 @@ mod tests {
             children: vec![selem(StructRole::P, Some(0), vec![mc(0, 0), mc(0, 1)])],
         };
         assert_eq!(struct_ordered_text(&spans, 0, &tree), "Hello World");
+    }
+
+    #[test]
+    fn deep_struct_subtree_skips_kid_streams_iteratively_without_cursor_drift() {
+        // Build a caller-supplied StructTree much deeper than MAX_STRUCT_TEXT_DEPTH
+        // (64) so `skip_elem_streams` walks hundreds of nested elements without
+        // recursing on the call stack, while still advancing the kid-stream cursor
+        // accurately for a following sibling on a Form XObject stream.
+        let form_stream = zpdf_core::ObjectId(42, 0);
+        let mut deep = selem(StructRole::Span, Some(0), vec![mc(0, 99)]);
+        for _ in 0..300 {
+            deep = selem(StructRole::Div, Some(0), vec![StructKid::Element(deep)]);
+        }
+        let sibling = selem(StructRole::P, Some(0), vec![mc(0, 0)]);
+        let tree = StructTree {
+            marked: true,
+            children: vec![deep, sibling],
+        };
+        let spans = vec![
+            span_m("PageZero", 50.0, 700.0, 12.0, 0),
+            span_m("FormZero", 50.0, 680.0, 12.0, 0),
+        ];
+        let span_streams = [
+            SpanStreamBinding::Stream(None),
+            SpanStreamBinding::Stream(Some(form_stream)),
+        ];
+        // First MCID (inside the 300-deep subtree) binds to page stream; second
+        // MCID (in `sibling`) binds to `form_stream`.
+        let kid_streams = [Some(None), Some(Some(form_stream))];
+        let out = struct_ordered_text_with_streams(&spans, &span_streams, 0, &tree, &kid_streams);
+        assert_eq!(out, "FormZero\nPageZero");
     }
 }
 
