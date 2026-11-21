@@ -30,6 +30,9 @@ def api(path):
 
 
 def supported(name):
+    # The plain JIS X 0208 maps (ISO 32000-1 Table 118) have no prefix.
+    if name in ("H", "V"):
+        return True
     if not name.endswith(("-H", "-V")):
         return False
     if name.startswith(("UniGB", "UniCNS", "UniJIS", "UniKS", "UniAKR")):

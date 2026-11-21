@@ -42,6 +42,9 @@ See [docs/review/HAYRO_MINIPDF_GAP_ANALYSIS_2026_11_19.md](review/HAYRO_MINIPDF_
   encrypted object streams no longer render blank or fail to open.
 - Honour `/lenIV -1` in embedded Type 1 fonts (charstrings stored
   unencrypted) instead of scrambling every outline.
+- Bundle the predefined Adobe-Japan1 `H` and `V` CMaps (JIS X 0208 codes).
+  Type 0 fonts with `/Encoding /H` or `/V` no longer fall back to Identity
+  with wrong CIDs, and `V` keeps vertical writing mode. (#180)
 - JPEG 2000: keep raw indices for a PDF `/Indexed` space instead of applying
   the JP2 palette first; read an unlabelled extra channel as a colorant when
   the PDF `/ColorSpace` has a component for it; accept up to 32 colour

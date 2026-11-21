@@ -38,9 +38,9 @@ directories for three/four-byte codes. Large four-byte legacy directories also
 use a 257-boundary high-byte index to narrow searches. Descriptors select sparse or
 dense pages; Unicode-source pages store CIDs only. Canonical strings use a
 direct CID-indexed table and a deduplicated UTF-8 pool. Runtime data totals
-2,414,312 mapping bytes plus 18,550 text bytes.
+2,530,688 mapping bytes plus 18,550 text bytes.
 
 `test-oracle.rs` contains digests computed from normalized source ranges,
-independent of the packed page layout. Rust tests verify all 1,190,674 encoding
+independent of the packed page layout. Rust tests verify all 1,204,432 encoding
 entries and 113,496 canonical strings. Generated size alone is not evidence
 of faster lookup.
