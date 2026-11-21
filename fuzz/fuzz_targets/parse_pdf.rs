@@ -18,6 +18,7 @@ fuzz_target!(|data: &[u8]| {
     // allocate large buffers.
     let limits = ParseLimits {
         max_stream_bytes: 8 * 1024 * 1024,
+        max_decoded_stream_bytes: 8 * 1024 * 1024,
         max_image_pixels: 4_000_000,
         max_page_operators: 100_000,
         max_objects: 100_000,
@@ -33,9 +34,25 @@ fuzz_target!(|data: &[u8]| {
     // is where filter bugs, cyclic references, and decryption edge cases
     // surface. `all_object_ids` is already bounded by `max_objects`.
     for id in file.all_object_ids() {
+        // Alternate cold shared/owned resolution; then compare read results.
+        let shared = if id.0 % 2 == 0 {
+            file.resolve_shared(id).ok()
+        } else {
+            None
+        };
         if let Ok(obj) = file.resolve(id) {
+            let shared = shared.or_else(|| file.resolve_shared(id).ok());
+            if let Some(shared) = shared {
+                assert_eq!(obj, *shared);
+            }
             if matches!(obj, zpdf_core::PdfObject::Stream(_)) {
-                let _ = file.resolve_stream_data(id);
+                let shared = file.resolve_stream_data_shared(id);
+                let owned = file.resolve_stream_data(id);
+                match (shared, owned) {
+                    (Ok(a), Ok(b)) => assert_eq!(a.as_ref(), b),
+                    (Err(a), Err(b)) => assert_eq!(a.to_string(), b.to_string()),
+                    _ => panic!("shared and owned decode disagree"),
+                }
             }
         }
     }

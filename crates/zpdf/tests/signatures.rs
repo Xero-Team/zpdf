@@ -501,10 +501,10 @@ fn rsa_signer() -> (Vec<u8>, impl Fn(&[u8]) -> Vec<u8>) {
     use rsa::pkcs1::EncodeRsaPublicKey;
     use rsa::pkcs1v15::SigningKey;
     use rsa::signature::{SignatureEncoding, Signer};
-    use rsa::RsaPrivateKey;
+    use rsa::PrivateKey;
 
     let mut rng = ChaCha20Rng::from_seed([7u8; 32]);
-    let priv_key = RsaPrivateKey::new(&mut rng, 2048).expect("rsa keygen");
+    let priv_key = PrivateKey::new(&mut rng, 2048).expect("rsa keygen");
     let pub_der = priv_key
         .to_public_key()
         .to_pkcs1_der()
@@ -652,21 +652,21 @@ fn tampered_body_fails_both_checks() {
 }
 
 /// A deterministic RSA-2048 signer using **RSASSA-PSS with SHA-256 and a
-/// 32-byte salt** (MGF1-SHA256), plus its certificate. Returns the certificate
+/// configurable salt** (MGF1-SHA256), plus its certificate. Returns the certificate
 /// bytes, a signer closure, and the full `signatureAlgorithm` SEQUENCE bytes
 /// (carrying the `RSASSA-PSS-params`) for embedding in the CMS.
 #[allow(clippy::type_complexity)]
-fn rsa_pss_signer() -> (Vec<u8>, impl Fn(&[u8]) -> Vec<u8>, Vec<u8>) {
+fn rsa_pss_signer(salt_len: u8) -> (Vec<u8>, impl Fn(&[u8]) -> Vec<u8>, Vec<u8>) {
     use rand_chacha::rand_core::SeedableRng;
     use rand_chacha::ChaCha20Rng;
     use rsa::pkcs1::EncodeRsaPublicKey;
     use rsa::pss::SigningKey;
     use rsa::signature::{RandomizedSigner, SignatureEncoding};
-    use rsa::RsaPrivateKey;
+    use rsa::PrivateKey;
     use sha2::Sha256;
 
     let mut rng = ChaCha20Rng::from_seed([9u8; 32]);
-    let priv_key = RsaPrivateKey::new(&mut rng, 2048).expect("rsa keygen");
+    let priv_key = PrivateKey::new(&mut rng, 2048).expect("rsa keygen");
     let pub_der = priv_key
         .to_public_key()
         .to_pkcs1_der()
@@ -675,11 +675,11 @@ fn rsa_pss_signer() -> (Vec<u8>, impl Fn(&[u8]) -> Vec<u8>, Vec<u8>) {
         .to_vec();
     let cert = build_cert(&rsa_spki(&pub_der), "zpdf RSA-PSS Test");
 
-    // PSS signing key: SHA-256 digest, salt length = 32 (the digest size, the
-    // common `Pss::new::<Sha256>()` default). PSS is randomised, so the signer
+    // PSS signing key: SHA-256 digest with the declared salt length.
+    // PSS is randomised, so the signer
     // closure re-seeds a fresh deterministic RNG per call — the salt is
     // pseudo-random but reproducible, and the signature still verifies.
-    let signing_key = SigningKey::<Sha256>::new(priv_key);
+    let signing_key = SigningKey::<Sha256>::new_with_salt_len(priv_key, usize::from(salt_len));
     let sign = move |msg: &[u8]| {
         let mut r = ChaCha20Rng::from_seed([9u8; 32]);
         signing_key
@@ -706,9 +706,9 @@ fn rsa_pss_signer() -> (Vec<u8>, impl Fn(&[u8]) -> Vec<u8>, Vec<u8>) {
     let params = der(
         SEQ,
         &[
-            der(0xA0, &hash_alg), // [0] EXPLICIT
-            der(0xA1, &mgf1_alg), // [1] EXPLICIT
-            der(0x82, &[32u8]),   // [2] IMPLICIT INTEGER saltLength = 32
+            der(0xA0, &hash_alg),              // [0] EXPLICIT
+            der(0xA1, &mgf1_alg),              // [1] EXPLICIT
+            der(0xA2, &der(INT, &[salt_len])), // [2] EXPLICIT INTEGER saltLength
         ]
         .concat(),
     );
@@ -718,7 +718,7 @@ fn rsa_pss_signer() -> (Vec<u8>, impl Fn(&[u8]) -> Vec<u8>, Vec<u8>) {
 
 #[test]
 fn rsa_pss_signature_verifies() {
-    let (cert, sign, sig_alg) = rsa_pss_signer();
+    let (cert, sign, sig_alg) = rsa_pss_signer(32);
     let pdf = assemble_signed_pdf(|d| build_real_cms(d, &cert, &sig_alg, &sign));
 
     let doc = PdfDocument::open(pdf).expect("open");
@@ -735,8 +735,24 @@ fn rsa_pss_signature_verifies() {
 }
 
 #[test]
+fn rsa_pss_nondefault_salt_lengths_verify() {
+    // Migration to generic Pss<D> must retain the encoded salt length rather
+    // than silently reverting to SHA-256's 32-byte default.
+    for salt_len in [0, 20, 48] {
+        let (cert, sign, sig_alg) = rsa_pss_signer(salt_len);
+        let pdf = assemble_signed_pdf(|d| build_real_cms(d, &cert, &sig_alg, &sign));
+        let doc = PdfDocument::open(pdf).expect("open");
+        let signatures = doc.signatures();
+        assert!(
+            signatures[0].is_cryptographically_valid(),
+            "salt={salt_len}"
+        );
+    }
+}
+
+#[test]
 fn corrupted_rsa_pss_signature_is_invalid() {
-    let (cert, sign, sig_alg) = rsa_pss_signer();
+    let (cert, sign, sig_alg) = rsa_pss_signer(32);
     // Flip the last byte of the CMS signature value (inside the unsigned
     // /Contents gap): byte-range digest stays Verified, PSS crypto fails.
     let pdf = assemble_signed_pdf(|d| {
@@ -762,7 +778,7 @@ fn corrupted_rsa_pss_signature_is_invalid() {
 /// honoured, not silently coerced.
 #[test]
 fn rsa_pss_wrong_salt_length_is_invalid() {
-    let (cert, sign, sig_alg) = rsa_pss_signer();
+    let (cert, sign, sig_alg) = rsa_pss_signer(32);
     // Re-encode the PSS params with saltLength = 48 (wrong) and rebuild sig_alg.
     let pss_oid = [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0a];
     let sha256_oid = [0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01];

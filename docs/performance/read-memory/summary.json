@@ -1,0 +1,3013 @@
+{
+  "measure-1": [
+    {
+      "case": "png-up",
+      "pairs": 31,
+      "time_percent": -4.8,
+      "interval": [
+        -5.94,
+        -4.18
+      ],
+      "baseline_ns": 1298850,
+      "current_ns": 1241504,
+      "peak_bytes": [
+        12593673,
+        12587905
+      ],
+      "retained_bytes": [
+        4194304,
+        4194304
+      ],
+      "allocations": [
+        1055,
+        22
+      ],
+      "rss_kib": [
+        {
+          "median": 15484,
+          "min": 15468,
+          "max": 15484
+        },
+        {
+          "median": 15548,
+          "min": 15536,
+          "max": 15552
+        }
+      ],
+      "rss_peak_kib": [
+        {
+          "median": 15488,
+          "min": 15488,
+          "max": 15488
+        },
+        {
+          "median": 15548,
+          "min": 15536,
+          "max": 15552
+        }
+      ]
+    },
+    {
+      "case": "png-paeth",
+      "pairs": 31,
+      "time_percent": -0.47,
+      "interval": [
+        -0.66,
+        -0.22
+      ],
+      "baseline_ns": 15265572,
+      "current_ns": 15175784,
+      "peak_bytes": [
+        12593673,
+        12587905
+      ],
+      "retained_bytes": [
+        4194304,
+        4194304
+      ],
+      "allocations": [
+        1055,
+        22
+      ],
+      "rss_kib": [
+        {
+          "median": 15476,
+          "min": 15460,
+          "max": 15480
+        },
+        {
+          "median": 15544,
+          "min": 15532,
+          "max": 15548
+        }
+      ],
+      "rss_peak_kib": [
+        {
+          "median": 15488,
+          "min": 15488,
+          "max": 15488
+        },
+        {
+          "median": 15544,
+          "min": 15532,
+          "max": 15548
+        }
+      ]
+    },
+    {
+      "case": "png-tail",
+      "pairs": 31,
+      "time_percent": -6.68,
+      "interval": [
+        -7.85,
+        -5.85
+      ],
+      "baseline_ns": 1301994,
+      "current_ns": 1203190,
+      "peak_bytes": [
+        12593673,
+        12587905
+      ],
+      "retained_bytes": [
+        4194304,
+        4194304
+      ],
+      "allocations": [
+        1055,
+        22
+      ],
+      "rss_kib": [
+        {
+          "median": 15484,
+          "min": 15468,
+          "max": 15484
+        },
+        {
+          "median": 15548,
+          "min": 15532,
+          "max": 15552
+        }
+      ],
+      "rss_peak_kib": [
+        {
+          "median": 15488,
+          "min": 15488,
+          "max": 15488
+        },
+        {
+          "median": 15548,
+          "min": 15532,
+          "max": 15552
+        }
+      ]
+    },
+    {
+      "case": "flate",
+      "pairs": 31,
+      "time_percent": -0.3,
+      "interval": [
+        -1.7,
+        0.31
+      ],
+      "baseline_ns": 1029901,
+      "current_ns": 1011931,
+      "peak_bytes": [
+        8465570,
+        8464739
+      ],
+      "retained_bytes": [
+        8388608,
+        8388608
+      ],
+      "allocations": [
+        19,
+        15
+      ],
+      "rss_kib": [
+        {
+          "median": 11392,
+          "min": 11376,
+          "max": 11392
+        },
+        {
+          "median": 11456,
+          "min": 11440,
+          "max": 11460
+        }
+      ],
+      "rss_peak_kib": [
+        {
+          "median": 11392,
+          "min": 11392,
+          "max": 11392
+        },
+        {
+          "median": 11456,
+          "min": 11440,
+          "max": 11460
+        }
+      ]
+    },
+    {
+      "case": "raw-shared",
+      "pairs": 31,
+      "time_percent": -99.98,
+      "interval": [
+        -99.98,
+        -99.98
+      ],
+      "baseline_ns": 135538,
+      "current_ns": 24,
+      "peak_bytes": [
+        8389422,
+        0
+      ],
+      "retained_bytes": [
+        8388608,
+        0
+      ],
+      "allocations": [
+        3,
+        0
+      ],
+      "rss_kib": [
+        {
+          "median": 27420,
+          "min": 27400,
+          "max": 27420
+        },
+        {
+          "median": 19232,
+          "min": 19216,
+          "max": 19232
+        }
+      ],
+      "rss_peak_kib": [
+        {
+          "median": 27424,
+          "min": 27404,
+          "max": 27424
+        },
+        {
+          "median": 26880,
+          "min": 26752,
+          "max": 26880
+        }
+      ]
+    },
+    {
+      "case": "raw-small",
+      "pairs": 31,
+      "time_percent": -57.41,
+      "interval": [
+        -58.18,
+        -56.6
+      ],
+      "baseline_ns": 54,
+      "current_ns": 23,
+      "peak_bytes": [
+        851,
+        0
+      ],
+      "retained_bytes": [
+        37,
+        0
+      ],
+      "allocations": [
+        3,
+        0
+      ],
+      "rss_kib": [
+        {
+          "median": 2836,
+          "min": 2820,
+          "max": 2840
+        },
+        {
+          "median": 2844,
+          "min": 2832,
+          "max": 2844
+        }
+      ],
+      "rss_peak_kib": [
+        {
+          "median": 2840,
+          "min": 2824,
+          "max": 2844
+        },
+        {
+          "median": 2848,
+          "min": 2836,
+          "max": 2848
+        }
+      ]
+    },
+    {
+      "case": "jpx-shared",
+      "pairs": 31,
+      "time_percent": -99.96,
+      "interval": [
+        -99.96,
+        -99.96
+      ],
+      "baseline_ns": 135926,
+      "current_ns": 57,
+      "peak_bytes": [
+        8389502,
+        65
+      ],
+      "retained_bytes": [
+        8388608,
+        0
+      ],
+      "allocations": [
+        8,
+        3
+      ],
+      "rss_kib": [
+        {
+          "median": 27428,
+          "min": 27408,
+          "max": 27432
+        },
+        {
+          "median": 19232,
+          "min": 19212,
+          "max": 19232
+        }
+      ],
+      "rss_peak_kib": [
+        {
+          "median": 27432,
+          "min": 27412,
+          "max": 27436
+        },
+        {
+          "median": 26880,
+          "min": 26752,
+          "max": 26880
+        }
+      ]
+    },
+    {
+      "case": "decode-owned",
+      "pairs": 31,
+      "time_percent": -0.11,
+      "interval": [
+        -0.53,
+        0.14
+      ],
+      "baseline_ns": 136884,
+      "current_ns": 137006,
+      "peak_bytes": [
+        8389422,
+        8388608
+      ],
+      "retained_bytes": [
+        8388608,
+        8388608
+      ],
+      "allocations": [
+        3,
+        1
+      ],
+      "rss_kib": [
+        {
+          "median": 27420,
+          "min": 27404,
+          "max": 27420
+        },
+        {
+          "median": 27424,
+          "min": 27408,
+          "max": 27424
+        }
+      ],
+      "rss_peak_kib": [
+        {
+          "median": 27424,
+          "min": 27408,
+          "max": 27424
+        },
+        {
+          "median": 27428,
+          "min": 27412,
+          "max": 27428
+        }
+      ]
+    },
+    {
+      "case": "shared-cold",
+      "pairs": 31,
+      "time_percent": -19.26,
+      "interval": [
+        -20.44,
+        -15.4
+      ],
+      "baseline_ns": 316076,
+      "current_ns": 258356,
+      "peak_bytes": [
+        167045,
+        162128
+      ],
+      "retained_bytes": [
+        157600,
+        157600
+      ],
+      "allocations": [
+        2420,
+        2228
+      ],
+      "rss_kib": [
+        {
+          "median": 3484,
+          "min": 3468,
+          "max": 3488
+        },
+        {
+          "median": 3520,
+          "min": 3504,
+          "max": 3524
+        }
+      ],
+      "rss_peak_kib": [
+        {
+          "median": 3484,
+          "min": 3468,
+          "max": 3488
+        },
+        {
+          "median": 3520,
+          "min": 3504,
+          "max": 3524
+        }
+      ]
+    },
+    {
+      "case": "shared-warm",
+      "pairs": 31,
+      "time_percent": -2.27,
+      "interval": [
+        -10.0,
+        5.45
+      ],
+      "baseline_ns": 309,
+      "current_ns": 299,
+      "peak_bytes": [
+        256,
+        256
+      ],
+      "retained_bytes": [
+        256,
+        256
+      ],
+      "allocations": [
+        1,
+        1
+      ],
+      "rss_kib": [
+        {
+          "median": 3308,
+          "min": 3288,
+          "max": 3308
+        },
+        {
+          "median": 3332,
+          "min": 3320,
+          "max": 3336
+        }
+      ],
+      "rss_peak_kib": [
+        {
+          "median": 3308,
+          "min": 3288,
+          "max": 3308
+        },
+        {
+          "median": 3332,
+          "min": 3320,
+          "max": 3336
+        }
+      ]
+    },
+    {
+      "case": "owned-warm",
+      "pairs": 31,
+      "time_percent": -1.1,
+      "interval": [
+        -1.58,
+        -0.8
+      ],
+      "baseline_ns": 7299,
+      "current_ns": 7241,
+      "peak_bytes": [
+        156832,
+        156832
+      ],
+      "retained_bytes": [
+        156832,
+        156832
+      ],
+      "allocations": [
+        257,
+        257
+      ],
+      "rss_kib": [
+        {
+          "median": 3460,
+          "min": 3444,
+          "max": 3460
+        },
+        {
+          "median": 3488,
+          "min": 3476,
+          "max": 3488
+        }
+      ],
+      "rss_peak_kib": [
+        {
+          "median": 3460,
+          "min": 3444,
+          "max": 3460
+        },
+        {
+          "median": 3492,
+          "min": 3480,
+          "max": 3492
+        }
+      ]
+    },
+    {
+      "case": "operators",
+      "pairs": 31,
+      "time_percent": -23.03,
+      "interval": [
+        -23.39,
+        -21.73
+      ],
+      "baseline_ns": 534987,
+      "current_ns": 413904,
+      "peak_bytes": [
+        35529,
+        35528
+      ],
+      "retained_bytes": [
+        0,
+        0
+      ],
+      "allocations": [
+        12319,
+        29
+      ],
+      "rss_kib": [
+        {
+          "median": 3720,
+          "min": 3704,
+          "max": 3720
+        },
+        {
+          "median": 3788,
+          "min": 3768,
+          "max": 3788
+        }
+      ],
+      "rss_peak_kib": [
+        {
+          "median": 3720,
+          "min": 3704,
+          "max": 3720
+        },
+        {
+          "median": 3788,
+          "min": 3768,
+          "max": 3788
+        }
+      ]
+    },
+    {
+      "case": "resources",
+      "pairs": 31,
+      "time_percent": -44.66,
+      "interval": [
+        -44.99,
+        -44.08
+      ],
+      "baseline_ns": 359780,
+      "current_ns": 199405,
+      "peak_bytes": [
+        206185,
+        188490
+      ],
+      "retained_bytes": [
+        180224,
+        180224
+      ],
+      "allocations": [
+        11328,
+        4406
+      ],
+      "rss_kib": [
+        {
+          "median": 3952,
+          "min": 3932,
+          "max": 3952
+        },
+        {
+          "median": 3960,
+          "min": 3944,
+          "max": 3964
+        }
+      ],
+      "rss_peak_kib": [
+        {
+          "median": 3952,
+          "min": 3932,
+          "max": 3952
+        },
+        {
+          "median": 3960,
+          "min": 3944,
+          "max": 3964
+        }
+      ]
+    },
+    {
+      "case": "scan-rgb",
+      "pairs": 31,
+      "time_percent": -9.52,
+      "interval": [
+        -9.86,
+        -9.23
+      ],
+      "baseline_ns": 4780525,
+      "current_ns": 4300015,
+      "peak_bytes": [
+        22136209,
+        131312
+      ],
+      "retained_bytes": [
+        111340,
+        111340
+      ],
+      "allocations": [
+        91,
+        62
+      ],
+      "rss_kib": [
+        {
+          "median": 53076,
+          "min": 53056,
+          "max": 53076
+        },
+        {
+          "median": 31484,
+          "min": 31468,
+          "max": 31488
+        }
+      ],
+      "rss_peak_kib": [
+        {
+          "median": 53076,
+          "min": 53056,
+          "max": 53076
+        },
+        {
+          "median": 31484,
+          "min": 31468,
+          "max": 31488
+        }
+      ]
+    },
+    {
+      "case": "scan-gray",
+      "pairs": 31,
+      "time_percent": -22.2,
+      "interval": [
+        -22.4,
+        -22.1
+      ],
+      "baseline_ns": 3870959,
+      "current_ns": 2993107,
+      "peak_bytes": [
+        15844755,
+        130753
+      ],
+      "retained_bytes": [
+        111340,
+        111340
+      ],
+      "allocations": [
+        89,
+        60
+      ],
+      "rss_kib": [
+        {
+          "median": 28496,
+          "min": 28480,
+          "max": 28500
+        },
+        {
+          "median": 13048,
+          "min": 13032,
+          "max": 13052
+        }
+      ],
+      "rss_peak_kib": [
+        {
+          "median": 28496,
+          "min": 28480,
+          "max": 28500
+        },
+        {
+          "median": 13048,
+          "min": 13032,
+          "max": 13052
+        }
+      ]
+    },
+    {
+      "case": "scan-native",
+      "pairs": 31,
+      "time_percent": -5.78,
+      "interval": [
+        -5.88,
+        -5.57
+      ],
+      "baseline_ns": 3039063,
+      "current_ns": 2892199,
+      "peak_bytes": [
+        22026161,
+        12588092
+      ],
+      "retained_bytes": [
+        12583660,
+        12583660
+      ],
+      "allocations": [
+        90,
+        61
+      ],
+      "rss_kib": [
+        {
+          "median": 62072,
+          "min": 62060,
+          "max": 62076
+        },
+        {
+          "median": 43652,
+          "min": 43636,
+          "max": 43652
+        }
+      ],
+      "rss_peak_kib": [
+        {
+          "median": 62072,
+          "min": 62060,
+          "max": 62076
+        },
+        {
+          "median": 43652,
+          "min": 43636,
+          "max": 43652
+        }
+      ]
+    },
+    {
+      "case": "pipeline",
+      "pairs": 31,
+      "time_percent": -1.5,
+      "interval": [
+        -3.54,
+        0.01
+      ],
+      "baseline_ns": 130647,
+      "current_ns": 128318,
+      "peak_bytes": [
+        531200,
+        531200
+      ],
+      "retained_bytes": [
+        524288,
+        524288
+      ],
+      "allocations": [
+        325,
+        227
+      ],
+      "rss_kib": [
+        {
+          "median": 4348,
+          "min": 4332,
+          "max": 4348
+        },
+        {
+          "median": 4352,
+          "min": 4336,
+          "max": 4352
+        }
+      ],
+      "rss_peak_kib": [
+        {
+          "median": 4348,
+          "min": 4332,
+          "max": 4348
+        },
+        {
+          "median": 4352,
+          "min": 4336,
+          "max": 4352
+        }
+      ]
+    }
+  ],
+  "measure-2": [
+    {
+      "case": "png-up",
+      "pairs": 31,
+      "time_percent": -6.17,
+      "interval": [
+        -7.6,
+        -4.87
+      ],
+      "baseline_ns": 1341937,
+      "current_ns": 1257974,
+      "peak_bytes": [
+        12593673,
+        12587905
+      ],
+      "retained_bytes": [
+        4194304,
+        4194304
+      ],
+      "allocations": [
+        1055,
+        22
+      ],
+      "rss_kib": [
+        {
+          "median": 15416,
+          "min": 15404,
+          "max": 15420
+        },
+        {
+          "median": 15548,
+          "min": 15532,
+          "max": 15552
+        }
+      ],
+      "rss_peak_kib": [
+        {
+          "median": 15416,
+          "min": 15404,
+          "max": 15420
+        },
+        {
+          "median": 15548,
+          "min": 15532,
+          "max": 15552
+        }
+      ]
+    },
+    {
+      "case": "png-paeth",
+      "pairs": 31,
+      "time_percent": -0.99,
+      "interval": [
+        -1.35,
+        -0.79
+      ],
+      "baseline_ns": 15800229,
+      "current_ns": 15535060,
+      "peak_bytes": [
+        12593673,
+        12587905
+      ],
+      "retained_bytes": [
+        4194304,
+        4194304
+      ],
+      "allocations": [
+        1055,
+        22
+      ],
+      "rss_kib": [
+        {
+          "median": 15412,
+          "min": 15400,
+          "max": 15416
+        },
+        {
+          "median": 15544,
+          "min": 15532,
+          "max": 15548
+        }
+      ],
+      "rss_peak_kib": [
+        {
+          "median": 15412,
+          "min": 15400,
+          "max": 15416
+        },
+        {
+          "median": 15544,
+          "min": 15532,
+          "max": 15548
+        }
+      ]
+    },
+    {
+      "case": "png-tail",
+      "pairs": 31,
+      "time_percent": -7.79,
+      "interval": [
+        -8.63,
+        -5.2
+      ],
+      "baseline_ns": 1341149,
+      "current_ns": 1240723,
+      "peak_bytes": [
+        12593673,
+        12587905
+      ],
+      "retained_bytes": [
+        4194304,
+        4194304
+      ],
+      "allocations": [
+        1055,
+        22
+      ],
+      "rss_kib": [
+        {
+          "median": 15416,
+          "min": 15404,
+          "max": 15420
+        },
+        {
+          "median": 15548,
+          "min": 15532,
+          "max": 15552
+        }
+      ],
+      "rss_peak_kib": [
+        {
+          "median": 15416,
+          "min": 15404,
+          "max": 15420
+        },
+        {
+          "median": 15548,
+          "min": 15532,
+          "max": 15552
+        }
+      ]
+    },
+    {
+      "case": "flate",
+      "pairs": 31,
+      "time_percent": -0.6,
+      "interval": [
+        -1.14,
+        2.24
+      ],
+      "baseline_ns": 1043887,
+      "current_ns": 1045065,
+      "peak_bytes": [
+        8465570,
+        8464739
+      ],
+      "retained_bytes": [
+        8388608,
+        8388608
+      ],
+      "allocations": [
+        19,
+        15
+      ],
+      "rss_kib": [
+        {
+          "median": 11324,
+          "min": 11308,
+          "max": 11328
+        },
+        {
+          "median": 11456,
+          "min": 11440,
+          "max": 11460
+        }
+      ],
+      "rss_peak_kib": [
+        {
+          "median": 11324,
+          "min": 11308,
+          "max": 11328
+        },
+        {
+          "median": 11456,
+          "min": 11440,
+          "max": 11460
+        }
+      ]
+    },
+    {
+      "case": "raw-shared",
+      "pairs": 31,
+      "time_percent": -99.98,
+      "interval": [
+        -99.98,
+        -99.98
+      ],
+      "baseline_ns": 140185,
+      "current_ns": 25,
+      "peak_bytes": [
+        8389422,
+        0
+      ],
+      "retained_bytes": [
+        8388608,
+        0
+      ],
+      "allocations": [
+        3,
+        0
+      ],
+      "rss_kib": [
+        {
+          "median": 27352,
+          "min": 27336,
+          "max": 27356
+        },
+        {
+          "median": 19228,
+          "min": 19212,
+          "max": 19232
+        }
+      ],
+      "rss_peak_kib": [
+        {
+          "median": 27356,
+          "min": 27340,
+          "max": 27360
+        },
+        {
+          "median": 26880,
+          "min": 26752,
+          "max": 26880
+        }
+      ]
+    },
+    {
+      "case": "raw-small",
+      "pairs": 31,
+      "time_percent": -56.67,
+      "interval": [
+        -57.69,
+        -56.36
+      ],
+      "baseline_ns": 55,
+      "current_ns": 24,
+      "peak_bytes": [
+        851,
+        0
+      ],
+      "retained_bytes": [
+        37,
+        0
+      ],
+      "allocations": [
+        3,
+        0
+      ],
+      "rss_kib": [
+        {
+          "median": 2776,
+          "min": 2760,
+          "max": 2776
+        },
+        {
+          "median": 2840,
+          "min": 2824,
+          "max": 2844
+        }
+      ],
+      "rss_peak_kib": [
+        {
+          "median": 2780,
+          "min": 2764,
+          "max": 2780
+        },
+        {
+          "median": 2844,
+          "min": 2828,
+          "max": 2848
+        }
+      ]
+    },
+    {
+      "case": "jpx-shared",
+      "pairs": 31,
+      "time_percent": -99.96,
+      "interval": [
+        -99.96,
+        -99.96
+      ],
+      "baseline_ns": 141457,
+      "current_ns": 59,
+      "peak_bytes": [
+        8389502,
+        65
+      ],
+      "retained_bytes": [
+        8388608,
+        0
+      ],
+      "allocations": [
+        8,
+        3
+      ],
+      "rss_kib": [
+        {
+          "median": 27364,
+          "min": 27348,
+          "max": 27368
+        },
+        {
+          "median": 19232,
+          "min": 19212,
+          "max": 19232
+        }
+      ],
+      "rss_peak_kib": [
+        {
+          "median": 27368,
+          "min": 27352,
+          "max": 27372
+        },
+        {
+          "median": 26880,
+          "min": 26752,
+          "max": 26880
+        }
+      ]
+    },
+    {
+      "case": "decode-owned",
+      "pairs": 31,
+      "time_percent": -0.35,
+      "interval": [
+        -1.01,
+        0.27
+      ],
+      "baseline_ns": 141054,
+      "current_ns": 140233,
+      "peak_bytes": [
+        8389422,
+        8388608
+      ],
+      "retained_bytes": [
+        8388608,
+        8388608
+      ],
+      "allocations": [
+        3,
+        1
+      ],
+      "rss_kib": [
+        {
+          "median": 27352,
+          "min": 27340,
+          "max": 27356
+        },
+        {
+          "median": 27420,
+          "min": 27404,
+          "max": 27424
+        }
+      ],
+      "rss_peak_kib": [
+        {
+          "median": 27356,
+          "min": 27344,
+          "max": 27360
+        },
+        {
+          "median": 27424,
+          "min": 27408,
+          "max": 27428
+        }
+      ]
+    },
+    {
+      "case": "shared-cold",
+      "pairs": 31,
+      "time_percent": -20.01,
+      "interval": [
+        -21.27,
+        -18.04
+      ],
+      "baseline_ns": 323350,
+      "current_ns": 260113,
+      "peak_bytes": [
+        167045,
+        162192
+      ],
+      "retained_bytes": [
+        157600,
+        157600
+      ],
+      "allocations": [
+        2420,
+        2228
+      ],
+      "rss_kib": [
+        {
+          "median": 3420,
+          "min": 3408,
+          "max": 3424
+        },
+        {
+          "median": 3516,
+          "min": 3500,
+          "max": 3520
+        }
+      ],
+      "rss_peak_kib": [
+        {
+          "median": 3420,
+          "min": 3408,
+          "max": 3424
+        },
+        {
+          "median": 3520,
+          "min": 3504,
+          "max": 3524
+        }
+      ]
+    },
+    {
+      "case": "shared-warm",
+      "pairs": 31,
+      "time_percent": 0.34,
+      "interval": [
+        -2.36,
+        4.14
+      ],
+      "baseline_ns": 315,
+      "current_ns": 306,
+      "peak_bytes": [
+        256,
+        256
+      ],
+      "retained_bytes": [
+        256,
+        256
+      ],
+      "allocations": [
+        1,
+        1
+      ],
+      "rss_kib": [
+        {
+          "median": 3244,
+          "min": 3228,
+          "max": 3244
+        },
+        {
+          "median": 3328,
+          "min": 3312,
+          "max": 3328
+        }
+      ],
+      "rss_peak_kib": [
+        {
+          "median": 3244,
+          "min": 3228,
+          "max": 3244
+        },
+        {
+          "median": 3328,
+          "min": 3312,
+          "max": 3328
+        }
+      ]
+    },
+    {
+      "case": "owned-warm",
+      "pairs": 31,
+      "time_percent": -0.03,
+      "interval": [
+        -0.83,
+        0.35
+      ],
+      "baseline_ns": 7489,
+      "current_ns": 7442,
+      "peak_bytes": [
+        156832,
+        156832
+      ],
+      "retained_bytes": [
+        156832,
+        156832
+      ],
+      "allocations": [
+        257,
+        257
+      ],
+      "rss_kib": [
+        {
+          "median": 3396,
+          "min": 3380,
+          "max": 3396
+        },
+        {
+          "median": 3484,
+          "min": 3468,
+          "max": 3484
+        }
+      ],
+      "rss_peak_kib": [
+        {
+          "median": 3396,
+          "min": 3380,
+          "max": 3396
+        },
+        {
+          "median": 3484,
+          "min": 3468,
+          "max": 3484
+        }
+      ]
+    },
+    {
+      "case": "operators",
+      "pairs": 31,
+      "time_percent": -21.94,
+      "interval": [
+        -23.23,
+        -21.18
+      ],
+      "baseline_ns": 550939,
+      "current_ns": 431829,
+      "peak_bytes": [
+        35529,
+        35528
+      ],
+      "retained_bytes": [
+        0,
+        0
+      ],
+      "allocations": [
+        12319,
+        29
+      ],
+      "rss_kib": [
+        {
+          "median": 3720,
+          "min": 3700,
+          "max": 3720
+        },
+        {
+          "median": 3788,
+          "min": 3768,
+          "max": 3788
+        }
+      ],
+      "rss_peak_kib": [
+        {
+          "median": 3720,
+          "min": 3700,
+          "max": 3720
+        },
+        {
+          "median": 3788,
+          "min": 3768,
+          "max": 3788
+        }
+      ]
+    },
+    {
+      "case": "resources",
+      "pairs": 31,
+      "time_percent": -44.94,
+      "interval": [
+        -45.86,
+        -44.3
+      ],
+      "baseline_ns": 372552,
+      "current_ns": 204896,
+      "peak_bytes": [
+        206185,
+        188490
+      ],
+      "retained_bytes": [
+        180224,
+        180224
+      ],
+      "allocations": [
+        11328,
+        4406
+      ],
+      "rss_kib": [
+        {
+          "median": 3948,
+          "min": 3940,
+          "max": 3952
+        },
+        {
+          "median": 3960,
+          "min": 3944,
+          "max": 3964
+        }
+      ],
+      "rss_peak_kib": [
+        {
+          "median": 3948,
+          "min": 3940,
+          "max": 3952
+        },
+        {
+          "median": 3960,
+          "min": 3944,
+          "max": 3964
+        }
+      ]
+    },
+    {
+      "case": "scan-rgb",
+      "pairs": 31,
+      "time_percent": -9.6,
+      "interval": [
+        -10.09,
+        -9.34
+      ],
+      "baseline_ns": 4897676,
+      "current_ns": 4419188,
+      "peak_bytes": [
+        22136209,
+        131312
+      ],
+      "retained_bytes": [
+        111340,
+        111340
+      ],
+      "allocations": [
+        91,
+        62
+      ],
+      "rss_kib": [
+        {
+          "median": 53008,
+          "min": 53000,
+          "max": 53012
+        },
+        {
+          "median": 31548,
+          "min": 31532,
+          "max": 31552
+        }
+      ],
+      "rss_peak_kib": [
+        {
+          "median": 53008,
+          "min": 53000,
+          "max": 53012
+        },
+        {
+          "median": 31548,
+          "min": 31532,
+          "max": 31552
+        }
+      ]
+    },
+    {
+      "case": "scan-gray",
+      "pairs": 31,
+      "time_percent": -22.21,
+      "interval": [
+        -22.41,
+        -21.93
+      ],
+      "baseline_ns": 3958516,
+      "current_ns": 3100647,
+      "peak_bytes": [
+        15844755,
+        130753
+      ],
+      "retained_bytes": [
+        111340,
+        111340
+      ],
+      "allocations": [
+        89,
+        60
+      ],
+      "rss_kib": [
+        {
+          "median": 28432,
+          "min": 28416,
+          "max": 28436
+        },
+        {
+          "median": 13112,
+          "min": 13096,
+          "max": 13116
+        }
+      ],
+      "rss_peak_kib": [
+        {
+          "median": 28432,
+          "min": 28416,
+          "max": 28436
+        },
+        {
+          "median": 13112,
+          "min": 13096,
+          "max": 13116
+        }
+      ]
+    },
+    {
+      "case": "scan-native",
+      "pairs": 31,
+      "time_percent": -6.23,
+      "interval": [
+        -6.85,
+        -5.74
+      ],
+      "baseline_ns": 3129948,
+      "current_ns": 2947442,
+      "peak_bytes": [
+        22026161,
+        12588092
+      ],
+      "retained_bytes": [
+        12583660,
+        12583660
+      ],
+      "allocations": [
+        90,
+        61
+      ],
+      "rss_kib": [
+        {
+          "median": 62008,
+          "min": 61992,
+          "max": 62012
+        },
+        {
+          "median": 43648,
+          "min": 43636,
+          "max": 43652
+        }
+      ],
+      "rss_peak_kib": [
+        {
+          "median": 62008,
+          "min": 61992,
+          "max": 62012
+        },
+        {
+          "median": 43648,
+          "min": 43636,
+          "max": 43652
+        }
+      ]
+    },
+    {
+      "case": "pipeline",
+      "pairs": 31,
+      "time_percent": 4.67,
+      "interval": [
+        3.51,
+        7.3
+      ],
+      "baseline_ns": 133277,
+      "current_ns": 138799,
+      "peak_bytes": [
+        531200,
+        531200
+      ],
+      "retained_bytes": [
+        524288,
+        524288
+      ],
+      "allocations": [
+        325,
+        227
+      ],
+      "rss_kib": [
+        {
+          "median": 4348,
+          "min": 4328,
+          "max": 4348
+        },
+        {
+          "median": 4352,
+          "min": 4336,
+          "max": 4352
+        }
+      ],
+      "rss_peak_kib": [
+        {
+          "median": 4348,
+          "min": 4328,
+          "max": 4348
+        },
+        {
+          "median": 4352,
+          "min": 4336,
+          "max": 4352
+        }
+      ]
+    },
+    {
+      "case": "shared-uncached",
+      "pairs": 31,
+      "time_percent": -15.32,
+      "interval": [
+        -19.98,
+        -4.54
+      ],
+      "baseline_ns": 317340,
+      "current_ns": 271155,
+      "peak_bytes": [
+        194328,
+        194328
+      ],
+      "retained_bytes": [
+        191904,
+        191904
+      ],
+      "allocations": [
+        2159,
+        2159
+      ],
+      "rss_kib": [
+        {
+          "median": 3444,
+          "min": 3428,
+          "max": 3448
+        },
+        {
+          "median": 3528,
+          "min": 3512,
+          "max": 3532
+        }
+      ],
+      "rss_peak_kib": [
+        {
+          "median": 3448,
+          "min": 3432,
+          "max": 3452
+        },
+        {
+          "median": 3528,
+          "min": 3512,
+          "max": 3532
+        }
+      ]
+    }
+  ],
+  "probe-measure": [
+    {
+      "case": "pipeline-original",
+      "pairs": 31,
+      "time_percent": 3.08,
+      "interval": [
+        1.57,
+        4.13
+      ],
+      "baseline_ns": 133201,
+      "current_ns": 137275,
+      "peak_bytes": [
+        531200,
+        531200
+      ],
+      "retained_bytes": [
+        524288,
+        524288
+      ],
+      "allocations": [
+        325,
+        227
+      ],
+      "rss_kib": [
+        {
+          "median": 4348,
+          "min": 4336,
+          "max": 4348
+        },
+        {
+          "median": 4352,
+          "min": 4336,
+          "max": 4352
+        }
+      ],
+      "rss_peak_kib": [
+        {
+          "median": 4348,
+          "min": 4336,
+          "max": 4348
+        },
+        {
+          "median": 4352,
+          "min": 4336,
+          "max": 4352
+        }
+      ]
+    },
+    {
+      "case": "pipeline",
+      "pairs": 31,
+      "time_percent": -2.11,
+      "interval": [
+        -4.08,
+        -1.21
+      ],
+      "baseline_ns": 135211,
+      "current_ns": 132858,
+      "peak_bytes": [
+        531200,
+        531200
+      ],
+      "retained_bytes": [
+        524288,
+        524288
+      ],
+      "allocations": [
+        325,
+        227
+      ],
+      "rss_kib": [
+        {
+          "median": 4348,
+          "min": 4328,
+          "max": 4348
+        },
+        {
+          "median": 4352,
+          "min": 4336,
+          "max": 4352
+        }
+      ],
+      "rss_peak_kib": [
+        {
+          "median": 4348,
+          "min": 4328,
+          "max": 4348
+        },
+        {
+          "median": 4352,
+          "min": 4336,
+          "max": 4352
+        }
+      ]
+    },
+    {
+      "case": "pipeline-interpret",
+      "pairs": 31,
+      "time_percent": -10.59,
+      "interval": [
+        -11.32,
+        -9.07
+      ],
+      "baseline_ns": 8569,
+      "current_ns": 7717,
+      "peak_bytes": [
+        8025,
+        8024
+      ],
+      "retained_bytes": [
+        6912,
+        6912
+      ],
+      "allocations": [
+        163,
+        65
+      ],
+      "rss_kib": [
+        {
+          "median": 3696,
+          "min": 3680,
+          "max": 3700
+        },
+        {
+          "median": 3640,
+          "min": 3624,
+          "max": 3640
+        }
+      ],
+      "rss_peak_kib": [
+        {
+          "median": 3696,
+          "min": 3680,
+          "max": 3700
+        },
+        {
+          "median": 3640,
+          "min": 3624,
+          "max": 3640
+        }
+      ]
+    },
+    {
+      "case": "pipeline-render",
+      "pairs": 31,
+      "time_percent": 0.18,
+      "interval": [
+        -1.37,
+        0.88
+      ],
+      "baseline_ns": 124379,
+      "current_ns": 123899,
+      "peak_bytes": [
+        524288,
+        524288
+      ],
+      "retained_bytes": [
+        524288,
+        524288
+      ],
+      "allocations": [
+        162,
+        162
+      ],
+      "rss_kib": [
+        {
+          "median": 4096,
+          "min": 4080,
+          "max": 4100
+        },
+        {
+          "median": 4100,
+          "min": 4084,
+          "max": 4104
+        }
+      ],
+      "rss_peak_kib": [
+        {
+          "median": 4100,
+          "min": 4084,
+          "max": 4104
+        },
+        {
+          "median": 4104,
+          "min": 4088,
+          "max": 4108
+        }
+      ]
+    }
+  ],
+  "measure-3": [
+    {
+      "case": "png-up",
+      "pairs": 31,
+      "time_percent": -5.81,
+      "interval": [
+        -6.5,
+        -4.97
+      ],
+      "baseline_ns": 1329185,
+      "current_ns": 1253418,
+      "peak_bytes": [
+        12593673,
+        12587905
+      ],
+      "retained_bytes": [
+        4194304,
+        4194304
+      ],
+      "allocations": [
+        1055,
+        22
+      ],
+      "rss_kib": [
+        {
+          "median": 15484,
+          "min": 15468,
+          "max": 15484
+        },
+        {
+          "median": 15548,
+          "min": 15532,
+          "max": 15552
+        }
+      ],
+      "rss_peak_kib": [
+        {
+          "median": 15488,
+          "min": 15488,
+          "max": 15488
+        },
+        {
+          "median": 15548,
+          "min": 15532,
+          "max": 15552
+        }
+      ]
+    },
+    {
+      "case": "png-paeth",
+      "pairs": 31,
+      "time_percent": -0.62,
+      "interval": [
+        -0.81,
+        -0.54
+      ],
+      "baseline_ns": 15601441,
+      "current_ns": 15507588,
+      "peak_bytes": [
+        12593673,
+        12587905
+      ],
+      "retained_bytes": [
+        4194304,
+        4194304
+      ],
+      "allocations": [
+        1055,
+        22
+      ],
+      "rss_kib": [
+        {
+          "median": 15476,
+          "min": 15464,
+          "max": 15480
+        },
+        {
+          "median": 15544,
+          "min": 15532,
+          "max": 15548
+        }
+      ],
+      "rss_peak_kib": [
+        {
+          "median": 15488,
+          "min": 15488,
+          "max": 15488
+        },
+        {
+          "median": 15544,
+          "min": 15532,
+          "max": 15548
+        }
+      ]
+    },
+    {
+      "case": "png-tail",
+      "pairs": 31,
+      "time_percent": -6.14,
+      "interval": [
+        -6.7,
+        -5.53
+      ],
+      "baseline_ns": 1326433,
+      "current_ns": 1241370,
+      "peak_bytes": [
+        12593673,
+        12587905
+      ],
+      "retained_bytes": [
+        4194304,
+        4194304
+      ],
+      "allocations": [
+        1055,
+        22
+      ],
+      "rss_kib": [
+        {
+          "median": 15480,
+          "min": 15468,
+          "max": 15484
+        },
+        {
+          "median": 15548,
+          "min": 15532,
+          "max": 15552
+        }
+      ],
+      "rss_peak_kib": [
+        {
+          "median": 15488,
+          "min": 15488,
+          "max": 15488
+        },
+        {
+          "median": 15548,
+          "min": 15532,
+          "max": 15552
+        }
+      ]
+    },
+    {
+      "case": "flate",
+      "pairs": 31,
+      "time_percent": -1.02,
+      "interval": [
+        -3.03,
+        0.61
+      ],
+      "baseline_ns": 1053144,
+      "current_ns": 1036965,
+      "peak_bytes": [
+        8465570,
+        8464739
+      ],
+      "retained_bytes": [
+        8388608,
+        8388608
+      ],
+      "allocations": [
+        19,
+        15
+      ],
+      "rss_kib": [
+        {
+          "median": 11388,
+          "min": 11376,
+          "max": 11392
+        },
+        {
+          "median": 11460,
+          "min": 11448,
+          "max": 11460
+        }
+      ],
+      "rss_peak_kib": [
+        {
+          "median": 11392,
+          "min": 11392,
+          "max": 11392
+        },
+        {
+          "median": 11460,
+          "min": 11448,
+          "max": 11460
+        }
+      ]
+    },
+    {
+      "case": "raw-shared",
+      "pairs": 31,
+      "time_percent": -99.98,
+      "interval": [
+        -99.98,
+        -99.98
+      ],
+      "baseline_ns": 138677,
+      "current_ns": 24,
+      "peak_bytes": [
+        8389422,
+        0
+      ],
+      "retained_bytes": [
+        8388608,
+        0
+      ],
+      "allocations": [
+        3,
+        0
+      ],
+      "rss_kib": [
+        {
+          "median": 27420,
+          "min": 27404,
+          "max": 27420
+        },
+        {
+          "median": 19292,
+          "min": 19276,
+          "max": 19296
+        }
+      ],
+      "rss_peak_kib": [
+        {
+          "median": 27424,
+          "min": 27408,
+          "max": 27424
+        },
+        {
+          "median": 26752,
+          "min": 26624,
+          "max": 26752
+        }
+      ]
+    },
+    {
+      "case": "raw-small",
+      "pairs": 31,
+      "time_percent": -57.14,
+      "interval": [
+        -57.89,
+        -56.36
+      ],
+      "baseline_ns": 55,
+      "current_ns": 24,
+      "peak_bytes": [
+        851,
+        0
+      ],
+      "retained_bytes": [
+        37,
+        0
+      ],
+      "allocations": [
+        3,
+        0
+      ],
+      "rss_kib": [
+        {
+          "median": 2836,
+          "min": 2824,
+          "max": 2840
+        },
+        {
+          "median": 2908,
+          "min": 2896,
+          "max": 2908
+        }
+      ],
+      "rss_peak_kib": [
+        {
+          "median": 2840,
+          "min": 2828,
+          "max": 2844
+        },
+        {
+          "median": 2912,
+          "min": 2900,
+          "max": 2912
+        }
+      ]
+    },
+    {
+      "case": "jpx-shared",
+      "pairs": 31,
+      "time_percent": -99.96,
+      "interval": [
+        -99.96,
+        -99.96
+      ],
+      "baseline_ns": 138870,
+      "current_ns": 58,
+      "peak_bytes": [
+        8389502,
+        65
+      ],
+      "retained_bytes": [
+        8388608,
+        0
+      ],
+      "allocations": [
+        8,
+        3
+      ],
+      "rss_kib": [
+        {
+          "median": 27428,
+          "min": 27412,
+          "max": 27432
+        },
+        {
+          "median": 19296,
+          "min": 19276,
+          "max": 19296
+        }
+      ],
+      "rss_peak_kib": [
+        {
+          "median": 27432,
+          "min": 27416,
+          "max": 27436
+        },
+        {
+          "median": 26752,
+          "min": 26624,
+          "max": 26752
+        }
+      ]
+    },
+    {
+      "case": "decode-owned",
+      "pairs": 31,
+      "time_percent": 0.15,
+      "interval": [
+        -0.4,
+        0.34
+      ],
+      "baseline_ns": 138479,
+      "current_ns": 139251,
+      "peak_bytes": [
+        8389422,
+        8388608
+      ],
+      "retained_bytes": [
+        8388608,
+        8388608
+      ],
+      "allocations": [
+        3,
+        1
+      ],
+      "rss_kib": [
+        {
+          "median": 27420,
+          "min": 27400,
+          "max": 27420
+        },
+        {
+          "median": 27484,
+          "min": 27472,
+          "max": 27488
+        }
+      ],
+      "rss_peak_kib": [
+        {
+          "median": 27424,
+          "min": 27404,
+          "max": 27424
+        },
+        {
+          "median": 27488,
+          "min": 27476,
+          "max": 27492
+        }
+      ]
+    },
+    {
+      "case": "shared-cold",
+      "pairs": 31,
+      "time_percent": -20.24,
+      "interval": [
+        -21.02,
+        -18.09
+      ],
+      "baseline_ns": 319605,
+      "current_ns": 256517,
+      "peak_bytes": [
+        167045,
+        162192
+      ],
+      "retained_bytes": [
+        157600,
+        157600
+      ],
+      "allocations": [
+        2420,
+        2228
+      ],
+      "rss_kib": [
+        {
+          "median": 3484,
+          "min": 3468,
+          "max": 3488
+        },
+        {
+          "median": 3580,
+          "min": 3568,
+          "max": 3584
+        }
+      ],
+      "rss_peak_kib": [
+        {
+          "median": 3484,
+          "min": 3468,
+          "max": 3488
+        },
+        {
+          "median": 3584,
+          "min": 3572,
+          "max": 3588
+        }
+      ]
+    },
+    {
+      "case": "shared-warm",
+      "pairs": 31,
+      "time_percent": 2.77,
+      "interval": [
+        -3.56,
+        9.15
+      ],
+      "baseline_ns": 303,
+      "current_ns": 310,
+      "peak_bytes": [
+        256,
+        256
+      ],
+      "retained_bytes": [
+        256,
+        256
+      ],
+      "allocations": [
+        1,
+        1
+      ],
+      "rss_kib": [
+        {
+          "median": 3308,
+          "min": 3288,
+          "max": 3308
+        },
+        {
+          "median": 3392,
+          "min": 3376,
+          "max": 3392
+        }
+      ],
+      "rss_peak_kib": [
+        {
+          "median": 3308,
+          "min": 3288,
+          "max": 3308
+        },
+        {
+          "median": 3392,
+          "min": 3376,
+          "max": 3392
+        }
+      ]
+    },
+    {
+      "case": "owned-warm",
+      "pairs": 31,
+      "time_percent": 0.2,
+      "interval": [
+        -0.44,
+        0.42
+      ],
+      "baseline_ns": 7412,
+      "current_ns": 7432,
+      "peak_bytes": [
+        156832,
+        156832
+      ],
+      "retained_bytes": [
+        156832,
+        156832
+      ],
+      "allocations": [
+        257,
+        257
+      ],
+      "rss_kib": [
+        {
+          "median": 3456,
+          "min": 3440,
+          "max": 3460
+        },
+        {
+          "median": 3548,
+          "min": 3532,
+          "max": 3548
+        }
+      ],
+      "rss_peak_kib": [
+        {
+          "median": 3456,
+          "min": 3440,
+          "max": 3460
+        },
+        {
+          "median": 3548,
+          "min": 3532,
+          "max": 3548
+        }
+      ]
+    },
+    {
+      "case": "operators",
+      "pairs": 31,
+      "time_percent": -20.95,
+      "interval": [
+        -21.79,
+        -19.57
+      ],
+      "baseline_ns": 524956,
+      "current_ns": 416102,
+      "peak_bytes": [
+        35529,
+        35528
+      ],
+      "retained_bytes": [
+        0,
+        0
+      ],
+      "allocations": [
+        12319,
+        29
+      ],
+      "rss_kib": [
+        {
+          "median": 3784,
+          "min": 3768,
+          "max": 3784
+        },
+        {
+          "median": 3788,
+          "min": 3768,
+          "max": 3788
+        }
+      ],
+      "rss_peak_kib": [
+        {
+          "median": 3784,
+          "min": 3768,
+          "max": 3784
+        },
+        {
+          "median": 3788,
+          "min": 3768,
+          "max": 3788
+        }
+      ]
+    },
+    {
+      "case": "resources",
+      "pairs": 31,
+      "time_percent": -45.38,
+      "interval": [
+        -45.77,
+        -44.8
+      ],
+      "baseline_ns": 363838,
+      "current_ns": 200696,
+      "peak_bytes": [
+        206185,
+        188490
+      ],
+      "retained_bytes": [
+        180224,
+        180224
+      ],
+      "allocations": [
+        11328,
+        4406
+      ],
+      "rss_kib": [
+        {
+          "median": 4012,
+          "min": 4000,
+          "max": 4016
+        },
+        {
+          "median": 3960,
+          "min": 3944,
+          "max": 3964
+        }
+      ],
+      "rss_peak_kib": [
+        {
+          "median": 4012,
+          "min": 4000,
+          "max": 4016
+        },
+        {
+          "median": 3960,
+          "min": 3944,
+          "max": 3964
+        }
+      ]
+    },
+    {
+      "case": "scan-rgb",
+      "pairs": 31,
+      "time_percent": -9.28,
+      "interval": [
+        -9.58,
+        -9.0
+      ],
+      "baseline_ns": 4826619,
+      "current_ns": 4368143,
+      "peak_bytes": [
+        22136209,
+        131312
+      ],
+      "retained_bytes": [
+        111340,
+        111340
+      ],
+      "allocations": [
+        91,
+        62
+      ],
+      "rss_kib": [
+        {
+          "median": 53072,
+          "min": 53056,
+          "max": 53076
+        },
+        {
+          "median": 31484,
+          "min": 31468,
+          "max": 31488
+        }
+      ],
+      "rss_peak_kib": [
+        {
+          "median": 53072,
+          "min": 53056,
+          "max": 53076
+        },
+        {
+          "median": 31484,
+          "min": 31468,
+          "max": 31488
+        }
+      ]
+    },
+    {
+      "case": "scan-gray",
+      "pairs": 31,
+      "time_percent": -22.04,
+      "interval": [
+        -22.18,
+        -21.88
+      ],
+      "baseline_ns": 3928545,
+      "current_ns": 3052649,
+      "peak_bytes": [
+        15844755,
+        130753
+      ],
+      "retained_bytes": [
+        111340,
+        111340
+      ],
+      "allocations": [
+        89,
+        60
+      ],
+      "rss_kib": [
+        {
+          "median": 28496,
+          "min": 28480,
+          "max": 28500
+        },
+        {
+          "median": 13048,
+          "min": 13032,
+          "max": 13052
+        }
+      ],
+      "rss_peak_kib": [
+        {
+          "median": 28496,
+          "min": 28480,
+          "max": 28500
+        },
+        {
+          "median": 13048,
+          "min": 13032,
+          "max": 13052
+        }
+      ]
+    },
+    {
+      "case": "scan-native",
+      "pairs": 31,
+      "time_percent": -5.95,
+      "interval": [
+        -6.19,
+        -5.6
+      ],
+      "baseline_ns": 3115410,
+      "current_ns": 2938552,
+      "peak_bytes": [
+        22026161,
+        12588092
+      ],
+      "retained_bytes": [
+        12583660,
+        12583660
+      ],
+      "allocations": [
+        90,
+        61
+      ],
+      "rss_kib": [
+        {
+          "median": 62072,
+          "min": 62056,
+          "max": 62076
+        },
+        {
+          "median": 43648,
+          "min": 43636,
+          "max": 43652
+        }
+      ],
+      "rss_peak_kib": [
+        {
+          "median": 62072,
+          "min": 62056,
+          "max": 62076
+        },
+        {
+          "median": 43648,
+          "min": 43636,
+          "max": 43652
+        }
+      ]
+    },
+    {
+      "case": "pipeline",
+      "pairs": 31,
+      "time_percent": -0.34,
+      "interval": [
+        -1.71,
+        0.09
+      ],
+      "baseline_ns": 126437,
+      "current_ns": 125810,
+      "peak_bytes": [
+        274459,
+        274459
+      ],
+      "retained_bytes": [
+        262144,
+        262144
+      ],
+      "allocations": [
+        324,
+        226
+      ],
+      "rss_kib": [
+        {
+          "median": 4092,
+          "min": 4076,
+          "max": 4092
+        },
+        {
+          "median": 4096,
+          "min": 4080,
+          "max": 4096
+        }
+      ],
+      "rss_peak_kib": [
+        {
+          "median": 4092,
+          "min": 4076,
+          "max": 4092
+        },
+        {
+          "median": 4096,
+          "min": 4080,
+          "max": 4096
+        }
+      ]
+    },
+    {
+      "case": "shared-uncached",
+      "pairs": 31,
+      "time_percent": -20.04,
+      "interval": [
+        -20.42,
+        -9.05
+      ],
+      "baseline_ns": 311702,
+      "current_ns": 254429,
+      "peak_bytes": [
+        194328,
+        194328
+      ],
+      "retained_bytes": [
+        191904,
+        191904
+      ],
+      "allocations": [
+        2159,
+        2159
+      ],
+      "rss_kib": [
+        {
+          "median": 3508,
+          "min": 3492,
+          "max": 3512
+        },
+        {
+          "median": 3592,
+          "min": 3576,
+          "max": 3596
+        }
+      ],
+      "rss_peak_kib": [
+        {
+          "median": 3512,
+          "min": 3496,
+          "max": 3516
+        },
+        {
+          "median": 3592,
+          "min": 3576,
+          "max": 3596
+        }
+      ]
+    },
+    {
+      "case": "pipeline-interpret",
+      "pairs": 31,
+      "time_percent": -9.42,
+      "interval": [
+        -10.25,
+        -8.42
+      ],
+      "baseline_ns": 8444,
+      "current_ns": 7630,
+      "peak_bytes": [
+        8025,
+        8024
+      ],
+      "retained_bytes": [
+        6912,
+        6912
+      ],
+      "allocations": [
+        163,
+        65
+      ],
+      "rss_kib": [
+        {
+          "median": 3700,
+          "min": 3688,
+          "max": 3700
+        },
+        {
+          "median": 3640,
+          "min": 3620,
+          "max": 3640
+        }
+      ],
+      "rss_peak_kib": [
+        {
+          "median": 3700,
+          "min": 3688,
+          "max": 3700
+        },
+        {
+          "median": 3640,
+          "min": 3620,
+          "max": 3640
+        }
+      ]
+    },
+    {
+      "case": "pipeline-render",
+      "pairs": 31,
+      "time_percent": 0.52,
+      "interval": [
+        -0.15,
+        1.63
+      ],
+      "baseline_ns": 118389,
+      "current_ns": 119033,
+      "peak_bytes": [
+        267547,
+        267547
+      ],
+      "retained_bytes": [
+        262144,
+        262144
+      ],
+      "allocations": [
+        161,
+        161
+      ],
+      "rss_kib": [
+        {
+          "median": 4088,
+          "min": 4076,
+          "max": 4092
+        },
+        {
+          "median": 4092,
+          "min": 4080,
+          "max": 4096
+        }
+      ],
+      "rss_peak_kib": [
+        {
+          "median": 4092,
+          "min": 4080,
+          "max": 4096
+        },
+        {
+          "median": 4096,
+          "min": 4084,
+          "max": 4100
+        }
+      ]
+    }
+  ],
+  "measure-wasm-1": [
+    {
+      "case": "reader-large",
+      "pairs": 31,
+      "time_percent": -34.4,
+      "interval": [
+        -35.7,
+        -33.4
+      ],
+      "first_open_pages": [
+        [
+          [
+            [
+              "before",
+              63
+            ],
+            [
+              "after",
+              834
+            ],
+            [
+              "growth",
+              771
+            ]
+          ]
+        ],
+        [
+          [
+            [
+              "before",
+              63
+            ],
+            [
+              "after",
+              577
+            ],
+            [
+              "growth",
+              514
+            ]
+          ]
+        ]
+      ],
+      "rss_peak_kib": [
+        {
+          "median": 152216,
+          "min": 152080,
+          "max": 152476
+        },
+        {
+          "median": 135872,
+          "min": 135516,
+          "max": 136160
+        }
+      ],
+      "baseline_ns": 977247.375000001,
+      "current_ns": 640211.8750000021
+    },
+    {
+      "case": "editor-large",
+      "pairs": 31,
+      "time_percent": -1.24,
+      "interval": [
+        -1.79,
+        -0.87
+      ],
+      "first_open_pages": [
+        [
+          [
+            [
+              "before",
+              63
+            ],
+            [
+              "after",
+              834
+            ],
+            [
+              "growth",
+              771
+            ]
+          ]
+        ],
+        [
+          [
+            [
+              "before",
+              63
+            ],
+            [
+              "after",
+              577
+            ],
+            [
+              "growth",
+              514
+            ]
+          ]
+        ]
+      ],
+      "rss_peak_kib": [
+        {
+          "median": 158036,
+          "min": 157824,
+          "max": 158272
+        },
+        {
+          "median": 141736,
+          "min": 141404,
+          "max": 141980
+        }
+      ],
+      "baseline_ns": 20927717.25,
+      "current_ns": 20615463.750000004
+    },
+    {
+      "case": "reader-small",
+      "pairs": 31,
+      "time_percent": -1.8,
+      "interval": [
+        -3.21,
+        -1.26
+      ],
+      "first_open_pages": [
+        [
+          [
+            [
+              "before",
+              63
+            ],
+            [
+              "after",
+              64
+            ],
+            [
+              "growth",
+              1
+            ]
+          ]
+        ],
+        [
+          [
+            [
+              "before",
+              63
+            ],
+            [
+              "after",
+              64
+            ],
+            [
+              "growth",
+              1
+            ]
+          ]
+        ]
+      ],
+      "rss_peak_kib": [
+        {
+          "median": 76636,
+          "min": 76384,
+          "max": 76940
+        },
+        {
+          "median": 76672,
+          "min": 76464,
+          "max": 77064
+        }
+      ],
+      "baseline_ns": 4493.2578124999845,
+      "current_ns": 4366.39843750003
+    },
+    {
+      "case": "editor-small",
+      "pairs": 31,
+      "time_percent": -2.51,
+      "interval": [
+        -3.96,
+        -0.95
+      ],
+      "first_open_pages": [
+        [
+          [
+            [
+              "before",
+              63
+            ],
+            [
+              "after",
+              64
+            ],
+            [
+              "growth",
+              1
+            ]
+          ]
+        ],
+        [
+          [
+            [
+              "before",
+              63
+            ],
+            [
+              "after",
+              64
+            ],
+            [
+              "growth",
+              1
+            ]
+          ]
+        ]
+      ],
+      "rss_peak_kib": [
+        {
+          "median": 76696,
+          "min": 76328,
+          "max": 77172
+        },
+        {
+          "median": 76740,
+          "min": 76408,
+          "max": 77016
+        }
+      ],
+      "baseline_ns": 8009.765624999998,
+      "current_ns": 7796.265625000021
+    }
+  ]
+}

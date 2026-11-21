@@ -1276,6 +1276,8 @@ fn cmd_search(args: &[String]) -> zpdf::Result<()> {
                 .with_colors(&mut icc_cache)
                 .with_optional_content(&oc_config)
                 .with_text_sink(&mut spans)
+                // Hit rectangles follow the glyphs actually matched.
+                .with_text_geometry(true)
                 .with_operand_stack_limit(doc.file().limits().max_operand_stack_depth as usize);
             let (_, mut stats) = interpreter.interpret_with_stats(&content_bytes);
             stats.diagnostics.set_page(pi);
@@ -1283,16 +1285,18 @@ fn cmd_search(args: &[String]) -> zpdf::Result<()> {
         }
 
         for hit in zpdf::search_spans(&spans, query, case_sensitive) {
-            let r = hit.bounds();
-            println!(
-                "p.{} [{:.1},{:.1} {:.1},{:.1}]  {}",
-                pi + 1,
-                r.x0,
-                r.y0,
-                r.x1,
-                r.y1,
-                hit.line.trim()
-            );
+            match hit.bounds() {
+                Some(r) => println!(
+                    "p.{} [{:.1},{:.1} {:.1},{:.1}]  {}",
+                    pi + 1,
+                    r.x0,
+                    r.y0,
+                    r.x1,
+                    r.y1,
+                    hit.line.trim()
+                ),
+                None => println!("p.{}  {}", pi + 1, hit.line.trim()),
+            }
             total += 1;
         }
     }

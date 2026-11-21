@@ -1,0 +1,285 @@
+{
+  "native-plan-1.json": {
+    "pairs": 31,
+    "samples_per_process": 11,
+    "order": "AB/BA alternating per pair",
+    "iterations": {
+      "png-up": {
+        "baseline": 2,
+        "current": 2
+      },
+      "png-paeth": {
+        "baseline": 1,
+        "current": 1
+      },
+      "png-tail": {
+        "baseline": 2,
+        "current": 2
+      },
+      "flate": {
+        "baseline": 4,
+        "current": 4
+      },
+      "raw-shared": {
+        "baseline": 16,
+        "current": 65536
+      },
+      "raw-small": {
+        "baseline": 65536,
+        "current": 65536
+      },
+      "jpx-shared": {
+        "baseline": 16,
+        "current": 32768
+      },
+      "decode-owned": {
+        "baseline": 16,
+        "current": 16
+      },
+      "shared-cold": {
+        "baseline": 32,
+        "current": 32
+      },
+      "shared-warm": {
+        "baseline": 8192,
+        "current": 8192
+      },
+      "owned-warm": {
+        "baseline": 256,
+        "current": 256
+      },
+      "operators": {
+        "baseline": 16,
+        "current": 16
+      },
+      "resources": {
+        "baseline": 16,
+        "current": 16
+      },
+      "scan-rgb": {
+        "baseline": 2,
+        "current": 2
+      },
+      "scan-gray": {
+        "baseline": 2,
+        "current": 2
+      },
+      "scan-native": {
+        "baseline": 2,
+        "current": 2
+      },
+      "pipeline": {
+        "baseline": 32,
+        "current": 32
+      }
+    },
+    "analysis": "median of paired process-median ratios; 10000 bootstrap resamples, seed 148, percentile 95% interval; retain all pairs",
+    "baseline": "8945e3a0152bf40c568bf33fca38d1b359163876",
+    "purpose": "First fixed comparison after calibration; raw shared calls use more candidate iterations to keep their tiny operation above timer resolution."
+  },
+  "native-plan-2.json": {
+    "pairs": 31,
+    "samples_per_process": 11,
+    "order": "AB/BA alternating per pair",
+    "iterations": {
+      "png-up": {
+        "baseline": 2,
+        "current": 2
+      },
+      "png-paeth": {
+        "baseline": 1,
+        "current": 1
+      },
+      "png-tail": {
+        "baseline": 2,
+        "current": 2
+      },
+      "flate": {
+        "baseline": 4,
+        "current": 4
+      },
+      "raw-shared": {
+        "baseline": 16,
+        "current": 65536
+      },
+      "raw-small": {
+        "baseline": 65536,
+        "current": 65536
+      },
+      "jpx-shared": {
+        "baseline": 16,
+        "current": 32768
+      },
+      "decode-owned": {
+        "baseline": 16,
+        "current": 16
+      },
+      "shared-cold": {
+        "baseline": 32,
+        "current": 32
+      },
+      "shared-warm": {
+        "baseline": 8192,
+        "current": 8192
+      },
+      "owned-warm": {
+        "baseline": 256,
+        "current": 256
+      },
+      "operators": {
+        "baseline": 16,
+        "current": 16
+      },
+      "resources": {
+        "baseline": 16,
+        "current": 16
+      },
+      "scan-rgb": {
+        "baseline": 2,
+        "current": 2
+      },
+      "scan-gray": {
+        "baseline": 2,
+        "current": 2
+      },
+      "scan-native": {
+        "baseline": 2,
+        "current": 2
+      },
+      "pipeline": {
+        "baseline": 32,
+        "current": 32
+      },
+      "shared-uncached": {
+        "baseline": 32,
+        "current": 32
+      }
+    },
+    "analysis": "median of paired process-median ratios; 10000 bootstrap resamples, seed 148, percentile 95% interval; retain all pairs",
+    "baseline": "8945e3a0152bf40c568bf33fca38d1b359163876",
+    "purpose": "Final candidate after cache-admission-only compaction and formatting; adds a zero-cache control."
+  },
+  "native-plan-3.json": {
+    "pairs": 31,
+    "samples_per_process": 11,
+    "order": "AB/BA alternating per pair",
+    "iterations": {
+      "png-up": {
+        "baseline": 2,
+        "current": 2
+      },
+      "png-paeth": {
+        "baseline": 1,
+        "current": 1
+      },
+      "png-tail": {
+        "baseline": 2,
+        "current": 2
+      },
+      "flate": {
+        "baseline": 4,
+        "current": 4
+      },
+      "raw-shared": {
+        "baseline": 16,
+        "current": 65536
+      },
+      "raw-small": {
+        "baseline": 65536,
+        "current": 65536
+      },
+      "jpx-shared": {
+        "baseline": 16,
+        "current": 32768
+      },
+      "decode-owned": {
+        "baseline": 16,
+        "current": 16
+      },
+      "shared-cold": {
+        "baseline": 32,
+        "current": 32
+      },
+      "shared-warm": {
+        "baseline": 8192,
+        "current": 8192
+      },
+      "owned-warm": {
+        "baseline": 256,
+        "current": 256
+      },
+      "operators": {
+        "baseline": 16,
+        "current": 16
+      },
+      "resources": {
+        "baseline": 16,
+        "current": 16
+      },
+      "scan-rgb": {
+        "baseline": 2,
+        "current": 2
+      },
+      "scan-gray": {
+        "baseline": 2,
+        "current": 2
+      },
+      "scan-native": {
+        "baseline": 2,
+        "current": 2
+      },
+      "pipeline": {
+        "baseline": 256,
+        "current": 256
+      },
+      "shared-uncached": {
+        "baseline": 32,
+        "current": 32
+      },
+      "pipeline-interpret": {
+        "baseline": 256,
+        "current": 256
+      },
+      "pipeline-render": {
+        "baseline": 256,
+        "current": 256
+      }
+    },
+    "analysis": "median of paired process-median ratios; 10000 bootstrap resamples, seed 148, percentile 95% interval; retain all pairs",
+    "baseline": "8945e3a0152bf40c568bf33fca38d1b359163876",
+    "purpose": "Corrected final harness: verification metadata appended outside the timed/heap-tracked renderer; 256 iterations for stage controls."
+  },
+  "probe-plan.json": {
+    "pairs": 31,
+    "samples_per_process": 11,
+    "iterations": 256,
+    "order": "AB/BA alternating per pair",
+    "purpose": "Diagnose measure-2 pipeline regression; retain original binaries and compare new stage probes without production source changes.",
+    "cases": [
+      "pipeline-original",
+      "pipeline",
+      "pipeline-interpret",
+      "pipeline-render"
+    ],
+    "pipeline_original_producer": "archive/pipeline-original.json"
+  },
+  "wasm-plan.json": {
+    "pairs": 31,
+    "samples_per_process": 11,
+    "iterations": {
+      "large": 8,
+      "small": 256
+    },
+    "order": "AB/BA alternating per pair",
+    "cases": [
+      "reader-large",
+      "editor-large",
+      "reader-small",
+      "editor-small"
+    ],
+    "analysis": "median paired process-median ratio; 10000 bootstrap resamples, seed 148, percentile 95% interval",
+    "baseline": "8945e3a0152bf40c568bf33fca38d1b359163876",
+    "memory": "first-open WASM linear pages before verification rendering; whole-process maxRSS KiB",
+    "input": "synthetic one-page PDF; 16 MiB unused raw stream for large cases"
+  }
+}

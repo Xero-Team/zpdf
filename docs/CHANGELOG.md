@@ -2,23 +2,130 @@
 
 ## Unreleased
 
-- **Breaking, next 0.x minor:** replace `PdfStream.data: Arc<[u8]>` with
-  `PdfStreamData`. Parse raw streams as checked views of immutable file storage;
-  detach payloads at cross-document copy boundaries. See the
-  [migration guide](guides/shared-stream-migration.md) for conversions and source
-  lifetime rules. Keep conservative stream-cache admission charges. (#144)
+- Upgrade RSA signing and verification to RustCrypto RSA 0.10, with matching
+  SHA-1/SHA-2 digest APIs and explicit PKCS#1 v1.5 compatibility. Preserve
+  encoded PSS salt lengths (including RFC 4055 EXPLICIT fields) and return
+  RSA signing failures as errors. Malformed or duplicate salt-length fields
+  are rejected instead of falling back to the default.
+  `SigningKey::Rsa` now carries `rsa::PrivateKey` from RSA 0.10; callers
+  constructing that variant directly must upgrade their RSA dependency.
+  RSA public-key decoding follows upstream's 1024-bit minimum and 8192-bit maximum.
+
+- Re-export `InkAnnotDict` and `InkAnnotationBuilder` from the `zpdf` facade.
+- Add `TextSpan::glyphs` and public `TextGlyph` selection cells, UTF-8 cluster
+  ranges, origins and advance vectors, captured alongside rendering positions.
+  Search uses glyph bounds for unequal widths, spacing, transformed text and
+  vertical metrics; ligatures and `/ActualText` retain whole-cluster geometry.
+  `TextSpan::glyph_at` supports point selection against transformed cells.
+- Glyph cells are collected on request, with the new
+  `ContentInterpreter::with_text_geometry(true)` next to `with_text_sink`.
+  Plain text extraction (`zpdf text`, `tables`, `convert_pdf`, WASM
+  `page_text`) allocates none, and `struct_ordered_text` no longer copies the
+  spans the structure tree leaves unplaced. `zpdf search` requests the cells.
+- Cell heights use the font's ascent and descent within 1 em above and half
+  an em below the baseline, so fonts that declare line metrics of several em
+  (math faces) or a positive descender cannot cover neighbouring lines.
+- Bound page text extraction by the decoded-byte limit and check the page
+  deadline inside long text shows and `TJ` arrays. Glyph records have a
+  separate 16 MiB ceiling that counts only records reaching a span.
+  Runs over the geometry ceiling retain searchable text and approximate bounds.
+  Exhausting the text byte allowance preserves completed spans and allows
+  rendering to finish. An `/ActualText` sequence interrupted by any time or
+  resource limit keeps its replacement text without glyph cells. Matches
+  whose cells are all degenerate or non-finite have an empty highlight.
+- Rebuild the browser WASM package and source fingerprint for the updated
+  text-extraction implementation.
+- **Source compatibility:** exhaustive `TextSpan` literals must add
+  `glyphs: Vec::new()` or use the new `..TextSpan::default()`. Empty glyph lists
+  retain the existing approximate search geometry. `SearchHit::bounds()` now
+  returns `Option<Rect>`: `None` for a match with no rectangle, instead of a
+  rectangle that could be mistaken for one at the page origin.
+
+### Rendering fixes from a differential comparison with hayro
+
+See [docs/review/HAYRO_MINIPDF_GAP_ANALYSIS_2026_11_19.md](review/HAYRO_MINIPDF_GAP_ANALYSIS_2026_11_19.md).
+
+- Recover encrypted files with a damaged xref: object-stream members are
+  re-indexed once the decryptor exists, and a container with a stale xref
+  offset is decoded at the offset the repair scan found. Page trees stored in
+  encrypted object streams no longer render blank or fail to open.
+- Honour `/lenIV -1` in embedded Type 1 fonts (charstrings stored
+  unencrypted) instead of scrambling every outline.
+- Bundle the predefined Adobe-Japan1 `H` and `V` CMaps (JIS X 0208 codes).
+  Type 0 fonts with `/Encoding /H` or `/V` no longer fall back to Identity
+  with wrong CIDs, and `V` keeps vertical writing mode. (#180)
+- JPEG 2000: keep raw indices for a PDF `/Indexed` space instead of applying
+  the JP2 palette first; read an unlabelled extra channel as a colorant when
+  the PDF `/ColorSpace` has a component for it; accept up to 32 colour
+  channels for DeviceN.
+- FlateDecode ignores a bad Adler-32 checksum and keeps every byte decoded
+  before a mid-stream error (miniz_oxide used directly).
+- RunLengthDecode keeps the runs decoded before a truncated run.
+- DCTDecode honours `/DecodeParms /ColorTransform` when the JPEG has no Adobe
+  APP14 marker: `0` keeps a three-component JPEG's stored RGB instead of
+  converting it as if it were YCbCr, and `1` decodes four components as YCCK.
+  The marker, when present, still decides. (#175)
+- JBIG2 immediate generic and refinement regions are budgeted by their
+  declared area, so sparse 300 dpi pages are no longer left blank.
+- Content streams ignore a minus sign inside a number (`12.5-`), and path
+  operators short of operands are skipped instead of drawing to the origin.
+- A form XObject that draws itself (directly or through a tiling-pattern
+  cell) is refused on re-entry instead of expanding to the command budget.
+- A soft mask or stencil mask finer than its image keeps its own resolution
+  (MRC scans keep their text shapes).
+- Bound encrypted recovery by the total number of direct and unique compressed
+  objects, and prefer the latest container offset for duplicate members.
+- Refresh repair tables built while resolving `/Encrypt` after authentication,
+  so missing encrypted page-tree entries can be recovered on that path too.
+- Share a cumulative generic/refinement region-work budget across JBIG2 globals
+  and page segments; exhausted work budgets are decode errors.
+- Preserve low-bit-depth JPX palette indices and all Flate output produced before
+  corrupt blocks. Recovered stray minus signs now record malformed content.
+- Compute mask resize coordinates on demand and reject incomplete masks before
+  upsampling, avoiding large scratch allocations for extreme aspect ratios.
+- Apply the decoded-stream byte ceiling to JPX component samples before full
+  decompression, including multi-colorant images.
+
+## 0.20.0 — Shared stream storage and lower pipeline memory
+
+Released 2026-11-16.
+
+### Compatibility
+
+- **Breaking:** replace `PdfStream.data: Arc<[u8]>` with `PdfStreamData`.
+  Parse raw streams as checked views of immutable file storage; detach payloads
+  at cross-document copy boundaries. See the
+  [migration guide](https://github.com/Xero-Team/zpdf/blob/v0.20.0/docs/guides/shared-stream-migration.md)
+  for conversions and source lifetime rules. Keep conservative stream-cache
+  admission charges. (#144, #145)
+
+### Performance and APIs
+
+- Reduce read-path allocations: reconstruct PNG predictor rows in final output,
+  borrow content operators internally, reuse cached object trees on read paths,
+  and add shared decoded-stream access while retaining the owned APIs. (#148, #149)
+- Convert eligible opaque Gray/RGB scans by row when minifying to the requested
+  footprint, preserving exact box-filter pixels and existing cache budgets. (#148, #149)
+- Open WASM readers/editors without an intermediate Rust file buffer; add native
+  `IncrementalWriter::from_shared` constructors for existing `Arc<[u8]>` input. (#148, #149)
+- Reuse compact page-content buffers and reconstruct TIFF predictor samples in
+  place, reducing transient copies without changing output or decode limits. (#143)
+- Add `PageBitmap.into_rgba()` to transfer WASM raster pixels without cloning
+  them inside Rust; retain `rgba()` and update the browser demo and package. (#143)
+
+### Correctness and validation
+
 - Serialize stream replacements through the stream writer, including encryption,
   when using `IncrementalWriter::overwrite_object`. Honor explicit crypt filters,
-  attachment filters and unencrypted metadata/xref payloads on write. (#144)
+  attachment filters and unencrypted metadata/xref payloads on write. (#144, #145)
 - Honor object-stream containers' own crypt filters when reopening encrypted
   updates. Share ordinary-stream decryption policy, borrow Identity payloads and
-  avoid decrypting compressed member strings twice. (#144)
+  avoid decrypting compressed member strings twice. (#144, #145)
 - Reap completed macOS ACL test children before retrying a zombie-group signal;
   retain failures for live-process signal denials and always close output pipes.
-- Reuse compact page-content buffers and reconstruct TIFF predictor samples in
-  place, reducing transient copies without changing output or decode limits.
-- Add `PageBitmap.into_rgba()` to transfer WASM raster pixels without cloning
-  them inside Rust; retain `rgba()` and update the browser demo and package.
+- Preserve reproducible allocation and memory measurements, including the
+  archived historical pipeline probe and its build/run instructions. (#149)
+- Rebuild the shipped WASM/JS package and source/artifact fingerprint for 0.20.0.
 
 ## 0.19.0 — Redaction hardening and native save validation
 

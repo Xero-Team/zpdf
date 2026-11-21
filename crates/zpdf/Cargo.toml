@@ -36,10 +36,10 @@ zpdf-writer.workspace = true
 flate2.workspace = true
 # Pure-Rust SHA-256 for computing the signed byte-range digest in the digital
 # signature end-to-end tests.
-# RSA oracle tests use rsa 0.9's digest generation.
-sha2 = { version = "0.10", features = ["oid"] }
+# RSA oracle tests use the same digest generation as the verifier.
+sha2 = { workspace = true, features = ["oid"] }
 # Pure-Rust public-key crypto for *producing* real signed CMS blobs in the
 # digital-signature crypto-verification tests (mirrors the verify-side deps).
 rsa.workspace = true
 p256.workspace = true
-rand_chacha = "0.3"
+rand_chacha = "0.10"

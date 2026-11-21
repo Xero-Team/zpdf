@@ -38,6 +38,7 @@ const MAP_ORACLE: &[(&str, usize, u64)] = &[
     ("GBKp-EUC-V", 22118, 0xcf3c7ab47113b1bd),
     ("GBpc-EUC-H", 7706, 0x9d942faebe6f881a),
     ("GBpc-EUC-V", 7706, 0x64293b2e937d85e1),
+    ("H", 6879, 0x76531926a4bb3fa2),
     ("HKdla-B5-H", 14339, 0x8c4fdbcbd313f51f),
     ("HKdla-B5-V", 14339, 0x69742c241e5e6b2f),
     ("HKdlb-B5-H", 14220, 0xb74f85dc952e5dfb),
@@ -85,6 +86,7 @@ const MAP_ORACLE: &[(&str, usize, u64)] = &[
     ("UniKS-UCS2-V", 17326, 0x98b6e5d7196b7403),
     ("UniKS-UTF16-H", 17488, 0xf19afd16281539de),
     ("UniKS-UTF16-V", 17488, 0xf4805bdb5fe5566b),
+    ("V", 6879, 0x3fad709c52d90f87),
 ];
 #[rustfmt::skip]
 const COLLECTION_ORACLE: &[(&str, usize, u64)] = &[

@@ -81,7 +81,11 @@ fn repeated_document_imports_release_each_source_before_writing() {
 #[test]
 fn same_document_edits_share_views_and_preserve_original_bytes() {
     let original = page();
-    let mut writer = IncrementalWriter::new(original.clone()).unwrap();
+    let shared: Arc<[u8]> = original.clone().into();
+    let weak = Arc::downgrade(&shared);
+    let ptr = shared.as_ptr();
+    let mut writer = IncrementalWriter::from_shared(shared).unwrap();
+    assert_eq!(writer.document().file().data().as_ptr(), ptr);
     let id = writer.document().page(0).unwrap().contents[0];
     let object = writer.resolve_current(id).unwrap();
     let data = &object.as_stream().unwrap().data;
@@ -98,6 +102,9 @@ fn same_document_edits_share_views_and_preserve_original_bytes() {
     let result = PdfFile::parse(out.into_inner()).unwrap();
     assert_eq!(result.resolve(id).unwrap(), current);
     assert!(matches!(current, PdfObject::Stream(_)));
+    drop(current);
+    drop(writer);
+    assert!(weak.upgrade().is_none());
 }
 
 #[test]
@@ -111,9 +118,21 @@ fn overwritten_encrypted_stream_is_reencrypted_without_mutating_source() {
         },
     )
     .unwrap();
-    let mut writer = IncrementalWriter::new_with_password(encrypted.clone(), b"user").unwrap();
+    let shared: Arc<[u8]> = encrypted.clone().into();
+    let ptr = shared.as_ptr();
+    let mut writer = IncrementalWriter::from_shared_with_password(shared, b"user").unwrap();
+    assert_eq!(writer.document().file().data().as_ptr(), ptr);
     let id = writer.document().page(0).unwrap().contents[0];
     let expected = writer.document().file().resolve_stream_data(id).unwrap();
+    assert_eq!(
+        writer
+            .document()
+            .file()
+            .resolve_stream_data_shared(id)
+            .unwrap()
+            .as_ref(),
+        expected
+    );
     let object = writer.resolve_current(id).unwrap();
     writer.overwrite_object(id, object);
     let mut out = Cursor::new(Vec::new());

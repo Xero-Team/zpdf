@@ -1144,17 +1144,15 @@ mod cms {
         //   maskGenAlgorithm [1] MaskGenAlgorithm DEFAULT mgf1SHA1,
         //   saltLength       [2] INTEGER           DEFAULT 20,
         //   trailerField     [3] TrailerField      DEFAULT trailerFieldBC }
-        // RFC 4055 tags `hashAlgorithm`/`maskGenAlgorithm` EXPLICIT (their
-        // underlying type is a SEQUENCE, which EXPLICIT keeps intact), while
-        // `saltLength` is IMPLICIT (an INTEGER content under [2]). Real-world
-        // encoders (OpenSSL, Windows) emit EXPLICIT [0]/[1]; some emit IMPLICIT.
-        // Accept both: EXPLICIT = 0xA0/0xA1 wrapping a SEQUENCE; IMPLICIT =
-        // 0x80/0x81 carrying the AlgorithmIdentifier body directly.
+        // RFC 4055 §6 uses EXPLICIT TAGS for every field, including the
+        // saltLength INTEGER. Also accept the legacy IMPLICIT encodings
+        // supported by earlier zpdf versions.
         const EXPLICIT_0: u8 = 0xA0;
         const EXPLICIT_1: u8 = 0xA1;
         const IMPLICIT_0: u8 = 0x80;
         const IMPLICIT_1: u8 = 0x81;
         const IMPLICIT_2: u8 = 0x82;
+        const EXPLICIT_2: u8 = 0xA2;
         let fields = children(params, 8);
 
         /// Resolve a `[0]`/`[1]` field to the inner `AlgorithmIdentifier` body:
@@ -1195,17 +1193,60 @@ mod cms {
             })
             .unwrap_or(DigestAlg::Sha1);
 
-        let salt_len = fields
+        let mut salt_fields = fields
             .iter()
-            .find(|(t, _)| *t == IMPLICIT_2)
-            .and_then(|(_, body)| read_unsigned_integer(body))
-            .unwrap_or(20);
+            .filter(|(t, _)| *t == EXPLICIT_2 || *t == IMPLICIT_2);
+        let salt_len = match salt_fields.next() {
+            None => 20,
+            Some((tag, body)) => {
+                let integer = if *tag == EXPLICIT_2 {
+                    let (tag, integer, tail) = tlv(body)?;
+                    if tag != 0x02 || !tail.is_empty() {
+                        return None;
+                    }
+                    integer
+                } else {
+                    *body
+                };
+                // A malformed present field must not silently become the
+                // default salt length and potentially verify another scheme.
+                read_unsigned_integer(integer)?
+            }
+        };
+        if salt_fields.next().is_some() {
+            return None;
+        }
 
         Some(PssParams {
             hash,
             mgf_hash,
             salt_len,
         })
+    }
+
+    #[test]
+    fn pss_salt_length_der_and_legacy_encodings() {
+        // RFC 4055 AlgorithmIdentifier body: id-RSASSA-PSS + parameters.
+        let oid = [0x06, 9, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 1, 10];
+        let cases: &[(&[u8], Option<usize>)] = &[
+            (&[0x30, 0], Some(20)),
+            (&[0x30, 5, 0xa2, 3, 2, 1, 32], Some(32)),
+            (&[0x30, 5, 0xa2, 3, 2, 1, 0], Some(0)),
+            (&[0x30, 3, 0x82, 1, 48], Some(48)),
+            (&[0x30, 5, 0xa2, 3, 4, 1, 32], None), // wrong inner tag
+            (&[0x30, 5, 0xa2, 3, 2, 1, 0xff], None), // negative
+            (&[0x30, 4, 0xa2, 2, 2, 1], None),     // truncated INTEGER
+            (&[0x30, 7, 0xa2, 5, 2, 1, 32, 5, 0], None), // extra inner TLV
+            (&[0x30, 8, 0xa2, 3, 2, 1, 32, 0x82, 1, 32], None), // duplicate
+        ];
+        for &(params, expected) in cases {
+            let input = [oid.as_slice(), params].concat();
+            assert_eq!(
+                parse_pss_params(&input).map(|p| p.salt_len),
+                expected,
+                "{params:02x?}"
+            );
+        }
     }
 
     /// Read the digest algorithm from an `AlgorithmIdentifier` body (the full
@@ -1397,7 +1438,7 @@ mod cms {
 mod pk {
     use super::DigestAlg;
     use rsa::pkcs1::DecodeRsaPublicKey;
-    use rsa::{Pkcs1v15Sign, RsaPublicKey};
+    use rsa::{Pkcs1v15Sign, PublicKey};
     use sha1::Sha1;
     use sha2::{Sha256, Sha384, Sha512};
 
@@ -1410,7 +1451,7 @@ mod pk {
         hashed: &[u8],
         sig: &[u8],
     ) -> Option<bool> {
-        let key = RsaPublicKey::from_pkcs1_der(key_der).ok()?;
+        let key = PublicKey::from_pkcs1_der(key_der).ok()?;
         let scheme = match alg {
             DigestAlg::Sha1 => Pkcs1v15Sign::new::<Sha1>(),
             DigestAlg::Sha256 => Pkcs1v15Sign::new::<Sha256>(),
@@ -1452,29 +1493,29 @@ mod pk {
     ) -> Option<bool> {
         use rsa::pkcs1::DecodeRsaPublicKey;
         use rsa::pss::Pss;
-        use rsa::RsaPublicKey;
+        use rsa::PublicKey;
         use sha1::Sha1;
         use sha2::{Sha256, Sha384, Sha512};
 
-        let key = RsaPublicKey::from_pkcs1_der(key_der).ok()?;
-        // `Pss::new::<D>()` defaults the salt length to the digest size; the
+        let key = PublicKey::from_pkcs1_der(key_der).ok()?;
+        // `Pss::<D>::new()` defaults the salt length to the digest size; the
         // embedded `salt_len` (which may differ) is honoured via `new_with_salt`.
         // `SignatureScheme::verify` takes the prehash digest directly.
         let valid = match params.hash {
             DigestAlg::Sha1 => {
-                let scheme = Pss::new_with_salt::<Sha1>(params.salt_len);
+                let scheme = Pss::<Sha1>::new_with_salt(params.salt_len);
                 key.verify(scheme, hashed, sig).is_ok()
             }
             DigestAlg::Sha256 => {
-                let scheme = Pss::new_with_salt::<Sha256>(params.salt_len);
+                let scheme = Pss::<Sha256>::new_with_salt(params.salt_len);
                 key.verify(scheme, hashed, sig).is_ok()
             }
             DigestAlg::Sha384 => {
-                let scheme = Pss::new_with_salt::<Sha384>(params.salt_len);
+                let scheme = Pss::<Sha384>::new_with_salt(params.salt_len);
                 key.verify(scheme, hashed, sig).is_ok()
             }
             DigestAlg::Sha512 => {
-                let scheme = Pss::new_with_salt::<Sha512>(params.salt_len);
+                let scheme = Pss::<Sha512>::new_with_salt(params.salt_len);
                 key.verify(scheme, hashed, sig).is_ok()
             }
         };

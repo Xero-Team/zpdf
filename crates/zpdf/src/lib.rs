@@ -14,10 +14,11 @@ pub use zpdf_content::output_intent_cmyk_profile;
 pub use zpdf_content::search::{search_spans, SearchHit};
 pub use zpdf_content::stats::InterpretStats;
 pub use zpdf_content::tables::{detect_tables, detect_tables_with_rules, RuleLine, Table};
-pub use zpdf_content::text::{spans_to_text, struct_ordered_text, TextSpan};
+pub use zpdf_content::text::{spans_to_text, struct_ordered_text, TextGlyph, TextSpan};
 pub use zpdf_core::*;
 pub use zpdf_display_list as display_list;
 pub use zpdf_display_list::DisplayList;
+pub use zpdf_document::ink::{InkAnnotDict, InkAnnotationBuilder};
 pub use zpdf_document::pdfa;
 pub use zpdf_document::pdfua;
 pub use zpdf_document::pdfx;
@@ -34,7 +35,7 @@ pub use zpdf_font::{
     FontProviderLimits, RegisteredFontId, RegisteredFontPackId, RegisteredGlyph,
 };
 pub use zpdf_image::{DecodedImage, ImageCache};
-pub use zpdf_parser::PdfFile;
+pub use zpdf_parser::{DecodedStreamData, PdfFile};
 pub use zpdf_render::{RenderBackend, StageStats};
 pub use zpdf_writer::{
     copy_object_graph, extract_pages, rewrite_pdf, AnnotationSpec, FormFiller, IncrementalWriter,

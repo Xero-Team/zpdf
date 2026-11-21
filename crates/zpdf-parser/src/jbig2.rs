@@ -67,6 +67,19 @@ fn mq_iteration_budget(payload_bytes: usize) -> usize {
         .clamp(1024, 64 * 1024 * 1024)
 }
 
+/// Budget for one immediate generic or refinement region: never less than one
+/// MQ decision per pixel plus one typical-prediction decision per row. A
+/// sparse 300-dpi page (one signature on a 2550x3300 region) codes to a few
+/// dozen bytes, far below its pixel count; the declared area is already
+/// bounded by the bitmap pixel limit, so it caps the work instead.
+fn region_iteration_budget(payload_bytes: usize, width: usize, height: usize) -> usize {
+    let area = width
+        .saturating_mul(height)
+        .saturating_add(height)
+        .min(MAX_BITMAP_PIXELS + MAX_BITMAP_PIXELS / 8);
+    mq_iteration_budget(payload_bytes).max(area)
+}
+
 /// Parsed `/DecodeParms` for a JBIG2Decode filter.
 pub struct Jbig2Params {
     /// Decoded bytes of the `/JBIG2Globals` stream, if any. The stream is an
@@ -122,6 +135,11 @@ struct PixelLimits {
     /// Cap on any single bitmap or halftone grid: [`MAX_BITMAP_PIXELS`]
     /// tightened by `ParseLimits::max_image_pixels`.
     max_pixels: usize,
+    /// Generic/refinement pixel work across globals and all page segments.
+    /// Two bitmap passes cover one full-sized region plus row predictions;
+    /// unlike the per-region MQ allowance this is never replenished.
+    region_work: u64,
+    region_work_limit: u64,
     /// Pixels composited so far by the region drawing loops.
     drawn: u64,
     /// Ceiling for `drawn`: [`DRAW_BUDGET_FACTOR`] passes over the largest
@@ -149,6 +167,10 @@ impl PixelLimits {
             max_pixels: usize::try_from(max_image_pixels)
                 .unwrap_or(usize::MAX)
                 .min(MAX_BITMAP_PIXELS),
+            region_work: 0,
+            region_work_limit: max_image_pixels
+                .min(MAX_BITMAP_PIXELS as u64)
+                .saturating_mul(2),
             drawn: 0,
             draw_limit: DRAW_BUDGET_FLOOR,
             retained: 0,
@@ -168,6 +190,23 @@ impl PixelLimits {
                 self.max_pixels
             ))),
         }
+    }
+
+    /// Charge before allocation or pixel loops, even if decoding later fails.
+    fn charge_region(&mut self, width: usize, height: usize) -> Result<()> {
+        self.region_work = self.region_work.saturating_add(
+            (width as u64)
+                .saturating_mul(height as u64)
+                .saturating_add(height as u64),
+        );
+        self.check_region_work()
+    }
+
+    fn check_region_work(&self) -> Result<()> {
+        if self.region_work > self.region_work_limit {
+            return Err(err("cumulative region decoding exceeded pixel-work budget"));
+        }
+        Ok(())
     }
 
     /// Extend the drawing budget to cover a destination of `area` pixels.
@@ -1989,7 +2028,9 @@ impl<'a> Decoder<'a> {
             },
             other => warn!("JBIG2Decode: unknown segment type {other} ignored"),
         }
-        Ok(())
+        // Ordinary damaged regions remain salvageable; cumulative exhaustion
+        // is a hard failure, not a silently blank successful image.
+        self.pixels.check_region_work()
     }
 
     /// Page information segment (T.88 7.4.8).
@@ -2079,6 +2120,8 @@ impl<'a> Decoder<'a> {
         let template = (flags >> 1) & 3;
         let tpgdon = flags & 8 != 0;
 
+        self.pixels.charge_region(info.width, info.height)?;
+
         if mmr {
             // MMR is T.6 (Group 4) with 1 = black, exactly the CCITT decoder's
             // /BlackIs1 true packing; unpack its rows into the native bitmap.
@@ -2100,7 +2143,7 @@ impl<'a> Decoder<'a> {
             *slot = (r.i8()?, r.i8()?);
         }
         let payload = r.rest();
-        let budget = mq_iteration_budget(payload.len());
+        let budget = region_iteration_budget(payload.len(), info.width, info.height);
         let mut mq = MqDecoder::new(payload, budget);
         let mut cx = vec![0u8; 1 << 16];
         let bm = decode_generic(
@@ -2122,7 +2165,7 @@ impl<'a> Decoder<'a> {
     /// a referred intermediate region (if exactly one is referred) or the
     /// current page contents at the region's location.
     fn decode_refinement_region_segment(
-        &self,
+        &mut self,
         h: &SegmentHeader,
         data: &[u8],
     ) -> Result<(RegionInfo, Bitmap)> {
@@ -2131,6 +2174,8 @@ impl<'a> Decoder<'a> {
         let flags = r.u8()?;
         let template = flags & 1;
         let tpgron = flags & 2 != 0;
+
+        self.pixels.charge_region(info.width, info.height)?;
 
         let mut at = [(0i8, 0i8); 2];
         if template == 0 {
@@ -2161,7 +2206,7 @@ impl<'a> Decoder<'a> {
             };
 
         let payload = r.rest();
-        let budget = mq_iteration_budget(payload.len());
+        let budget = region_iteration_budget(payload.len(), info.width, info.height);
         let mut mq = MqDecoder::new(payload, budget);
         let mut cx = vec![0u8; 1 << 13];
         let bm = decode_refinement(
@@ -4222,6 +4267,85 @@ mod tests {
                 "template {template} tpgdon {tpgdon}"
             );
         }
+    }
+
+    /// A sparse page codes to far fewer payload bytes than it has pixels; the
+    /// region budget must follow the declared area, not the payload size.
+    #[test]
+    fn sparse_generic_region_is_not_cut_off_by_payload_budget() {
+        let (w, h) = (1700usize, 1100usize);
+        let mut bm = Bitmap::new(w, h, 0).unwrap();
+        for y in 500..540 {
+            for x in 800..830 {
+                bm.set(x, y, 1);
+            }
+        }
+        let payload = generic_region_payload(&bm, 0, false);
+        assert!(
+            mq_iteration_budget(payload.len()) < w * h,
+            "fixture must be sparse"
+        );
+        let mut stream = segment(0, 48, &[], 1, &page_info_payload(w as u32, h as u32, 0));
+        stream.extend_from_slice(&segment(1, 38, &[], 1, &payload));
+        let out = decode_test(&stream, &Jbig2Params { globals: None }).unwrap();
+        let stride = w.div_ceil(8);
+        // Decoded output follows the DeviceGray convention: a set bit is white.
+        let ink = |x: usize, y: usize| out[y * stride + x / 8] & (0x80 >> (x % 8)) == 0;
+        assert!(ink(815, 520) && !ink(10, 10) && !ink(815, 600));
+    }
+
+    #[test]
+    fn region_work_budget_is_shared_across_globals_and_page_segments() {
+        let bm = Bitmap::new(8, 8, 0).unwrap();
+        let region = generic_region_payload(&bm, 0, false);
+        let mut globals = segment(0, 48, &[], 1, &page_info_payload(1, 1, 0));
+        globals.extend_from_slice(&segment(1, 38, &[], 1, &region));
+        let mut page = segment(2, 48, &[], 1, &page_info_payload(1, 1, 0));
+        page.extend_from_slice(&segment(3, 38, &[], 1, &region));
+        let mut budget = DecodeBudget::new(u64::MAX);
+        assert!(decode(&globals, &Jbig2Params { globals: None }, 64, &mut budget).is_ok());
+        let mut budget = DecodeBudget::new(u64::MAX);
+        assert!(decode(&page, &Jbig2Params { globals: None }, 64, &mut budget).is_ok());
+        let mut budget = DecodeBudget::new(u64::MAX);
+        let result = decode(
+            &page,
+            &Jbig2Params {
+                globals: Some(globals),
+            },
+            64,
+            &mut budget,
+        );
+        assert!(
+            result.is_err(),
+            "each region must not receive a fresh area allowance"
+        );
+        page.extend_from_slice(&segment(4, 38, &[], 1, &region));
+        let mut budget = DecodeBudget::new(u64::MAX);
+        assert!(decode(&page, &Jbig2Params { globals: None }, 64, &mut budget).is_err());
+    }
+
+    #[test]
+    fn failed_refinement_keeps_its_region_work_charge() {
+        let mut budget = DecodeBudget::new(u64::MAX);
+        let mut dec = Decoder::new(&mut budget, 64);
+        // Valid dimensions and flags, but no page to use as the reference.
+        let mut data = Vec::new();
+        for value in [8u32, 8, 0, 0] {
+            data.extend_from_slice(&value.to_be_bytes());
+        }
+        data.extend_from_slice(&[0, 1]); // OR, refinement template 1
+        let bytes = segment(1, 42, &[], 1, &data);
+        let mut reader = Reader::new(&bytes);
+        let header = parse_segment_header(&mut reader).unwrap();
+        for _ in 0..8 {
+            assert!(dec
+                .decode_refinement_region_segment(&header, &data)
+                .is_err());
+        }
+        let bm = Bitmap::new(8, 8, 0).unwrap();
+        assert!(dec
+            .decode_generic_region_segment(&generic_region_payload(&bm, 0, false))
+            .is_err());
     }
 
     #[test]

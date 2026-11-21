@@ -4,6 +4,8 @@ use zpdf_core::{Error, ParseLimits, PdfDict, PdfObject, Result};
 
 mod footprint;
 pub use footprint::{box_downscale, box_downscale_rgba, box_filter_size};
+mod scan;
+pub use scan::{decode_scan_at_footprint, FootprintScan};
 
 pub type ImageId = u32;
 
@@ -395,7 +397,7 @@ pub fn decode_image_xobject_resolved_with_limits(
         if let Some(cs) = &cs {
             cs.validate(0)?;
         }
-        return decode_jpx_image(decoded_data, dict, cs.as_ref(), limits.max_image_pixels);
+        return decode_jpx_image(decoded_data, dict, cs.as_ref(), limits);
     }
 
     let width_value = dict.get_i64("Width")?;
@@ -466,8 +468,9 @@ pub fn decode_image_xobject_resolved_with_limits(
 /// Fold a decoded `/SMask` (luminosity soft mask) into `image` as alpha. The
 /// mask must come through the same full image-decode path as any image (so
 /// filters, predictors, sub-byte bpc and /Decode all apply); the decoded gray
-/// level is the alpha. A mask whose dimensions differ from the image is
-/// bilinearly resampled to the image size. RGB is premultiplied as the alpha
+/// level is the alpha. A mask finer on both axes keeps its resolution and the
+/// image is bilinearly enlarged; otherwise the mask is resampled to the image
+/// size. RGB is premultiplied as the alpha
 /// folds in, because both backends (tiny-skia `PixmapRef::from_bytes` and the
 /// wgpu `Rgba8Unorm` upload) treat the bytes as premultiplied RGBA.
 pub fn apply_smask_image(image: &mut DecodedImage, mask: &DecodedImage) {
@@ -945,7 +948,7 @@ fn decode_jpx_image(
     data: &[u8],
     dict: &PdfDict,
     colorspace: Option<&ResolvedColorSpace>,
-    max_image_pixels: u64,
+    limits: &ParseLimits,
 ) -> Result<DecodedImage> {
     use hayro_jpeg2000::{ColorSpace as JpxColorSpace, DecodeSettings, DecoderContext, Image};
     use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -958,13 +961,17 @@ fn decode_jpx_image(
         // Recovery can return a full-size buffer for truncated tile data without
         // exposing a completeness flag. Fail decoding so page diagnostics and
         // strict export frontends can report the missing image instead.
-        Image::new(
-            data,
-            &DecodeSettings {
-                strict: true,
-                ..DecodeSettings::default()
-            },
-        )
+        // A PDF /Indexed space looks the raw indices up itself (7.4.9); a
+        // JP2 palette resolved here would be applied twice.
+        let settings = DecodeSettings {
+            strict: true,
+            resolve_palette_indices: !matches!(
+                colorspace,
+                Some(ResolvedColorSpace::Indexed { .. })
+            ),
+            ..DecodeSettings::default()
+        };
+        Image::new(data, &settings)
     }))
     .map_err(|_| {
         Error::StreamDecode("JPXDecode: decoder panicked parsing codestream header".into())
@@ -978,6 +985,7 @@ fn decode_jpx_image(
     // Re-check the pixel limit against the *codestream* header dims, which
     // are authoritative and may differ from the dict's /Width × /Height.
     let (width, height) = (image.width(), image.height());
+    let max_image_pixels = limits.max_image_pixels;
     let pixel_count = (width as u64).saturating_mul(height as u64);
     if pixel_count == 0 || pixel_count > max_image_pixels {
         return Err(Error::StreamDecode(format!(
@@ -995,12 +1003,11 @@ fn decode_jpx_image(
 
     // Colour channels per pixel (alpha excluded). An ICC profile embedded in
     // the JP2 codestream is captured here and compiled below (unless a
-    // PDF-level /ColorSpace overrides it per spec 7.4.9).
-    let supported_ncolor = |n: u8| -> Result<usize> {
-        match n {
-            1 => Ok(1),
-            3 => Ok(3),
-            4 => Ok(4),
+    // PDF-level /ColorSpace overrides it per spec 7.4.9). Counts other than
+    // 1/3/4 (e.g. a 2-colorant DeviceN) need that /ColorSpace; checked below.
+    let channel_count = |n: u8| -> Result<usize> {
+        match usize::from(n) {
+            n @ 1..=MAX_COMPONENTS => Ok(n),
             n => Err(Error::StreamDecode(format!(
                 "JPX image with unsupported channel count {n}"
             ))),
@@ -1015,14 +1022,33 @@ fn decode_jpx_image(
             profile,
             num_channels,
         } => {
-            let n = supported_ncolor(*num_channels)?;
+            let n = channel_count(*num_channels)?;
             codestream_icc = Some(profile.as_slice());
             n
         }
-        JpxColorSpace::Unknown { num_channels } => supported_ncolor(*num_channels)?,
+        JpxColorSpace::Unknown { num_channels } => channel_count(*num_channels)?,
     };
     let has_alpha = image.has_alpha();
     let channels = ncolor + usize::from(has_alpha);
+    let indexed = ncolor == 1 && matches!(colorspace, Some(ResolvedColorSpace::Indexed { .. }));
+
+    // JPX bypasses decompression in the parser's filter pipeline, so enforce
+    // its decoded-byte ceiling here, before allocating component planes. A
+    // pixel-only check would multiply memory by up to 32 colour channels.
+    let sample_count = pixel_count
+        .checked_mul(channels as u64)
+        .ok_or_else(|| Error::StreamDecode("JPX decoded sample count overflow".into()))?;
+    if sample_count > limits.max_decoded_stream_bytes {
+        return Err(Error::StreamDecode(format!(
+            "JPX decoded samples exceed the {}-byte limit",
+            limits.max_decoded_stream_bytes
+        )));
+    }
+    let pixel_count = usize::try_from(pixel_count)
+        .map_err(|_| Error::StreamDecode("JPX pixel count does not fit memory size".into()))?;
+    let expected_samples = usize::try_from(sample_count).map_err(|_| {
+        Error::StreamDecode("JPX decoded sample count does not fit memory size".into())
+    })?;
 
     let samples = catch_unwind(AssertUnwindSafe(|| {
         // hayro-jpeg2000 0.4 split decoding into a reusable `DecoderContext`
@@ -1031,15 +1057,25 @@ fn decode_jpx_image(
         // `data_u8()` re-interleaves the components back into the same layout
         // 0.3.5 returned, so the downstream per-pixel chunking is unchanged.
         let mut ctx = DecoderContext::default();
-        image.decode(&mut ctx).map(|decoded| decoded.data_u8())
+        image.decode(&mut ctx).map(|decoded| {
+            let mut samples = decoded.data_u8();
+            if indexed {
+                // data_u8 normalizes even unresolved palette components to
+                // 0..255. PDF Indexed values are integer indices, not colour
+                // intensities (ISO 32000-1 7.4.9); preserve the raw component.
+                // Any alpha channel still uses its normal 8-bit conversion.
+                for (pixel, &index) in samples
+                    .chunks_exact_mut(channels)
+                    .zip(decoded.components()[0].samples())
+                {
+                    pixel[0] = index.round().clamp(0.0, 255.0) as u8;
+                }
+            }
+            samples
+        })
     }))
     .map_err(|_| Error::StreamDecode("JPXDecode: decoder panicked decoding codestream".into()))?
     .map_err(|e| Error::StreamDecode(format!("JPXDecode: {e}")))?;
-    let pixel_count = usize::try_from(pixel_count)
-        .map_err(|_| Error::StreamDecode("JPX pixel count does not fit memory size".into()))?;
-    let expected_samples = pixel_count
-        .checked_mul(channels)
-        .ok_or_else(|| Error::StreamDecode("JPX decoded sample count overflow".into()))?;
     if samples.len() < expected_samples {
         return Err(Error::StreamDecode(format!(
             "JPX decoded data too short: {} bytes for {width}x{height}x{channels}",
@@ -1110,6 +1146,11 @@ fn decode_jpx_image(
         _ => None,
     };
     let effective_cs = override_cs.or(codestream_cs.as_ref());
+    if effective_cs.is_none() && !matches!(ncolor, 1 | 3 | 4) {
+        return Err(Error::StreamDecode(format!(
+            "JPX image with {ncolor} colour channels and no matching /ColorSpace"
+        )));
+    }
 
     let rgba_size = pixel_count
         .checked_mul(4)
@@ -2223,6 +2264,18 @@ fn fold_alpha_plane(image: &mut DecodedImage, alpha: &[u8], aw: u32, ah: u32) {
     if image.width == 0 || image.height == 0 || aw == 0 || ah == 0 {
         return;
     }
+    // Public callers can supply an incomplete mask. Its declared dimensions
+    // alone must not authorize allocating a larger colour image.
+    if u64::from(aw) * u64::from(ah) > alpha.len() as u64 {
+        return;
+    }
+    // A mask finer than its image on both axes (MRC scans: a low-res colour
+    // layer under a high-res text mask) keeps its own resolution; shrinking
+    // it to the image's would erase the text shapes. The upsampled image has
+    // the mask's dimensions, which already passed the decode pixel limit.
+    if aw >= image.width && ah >= image.height && (aw, ah) != (image.width, image.height) {
+        upsample_rgba(image, aw, ah);
+    }
     let resampled;
     let plane: &[u8] = if (aw, ah) == (image.width, image.height) {
         alpha
@@ -2235,6 +2288,59 @@ fn fold_alpha_plane(image: &mut DecodedImage, alpha: &[u8], aw: u32, ah: u32) {
     }
     image.has_alpha = true;
     image.premultiplied = true;
+}
+
+/// Bilinearly upsample `image` (RGBA, not yet premultiplied by a mask) to
+/// `dw`x`dh` with the pixel-centre mapping of [`resample_bilinear`], in one
+/// pass with 8-bit fixed-point weights (a 600 dpi mask is ~4.6 Mpx).
+fn upsample_rgba(image: &mut DecodedImage, dw: u32, dh: u32) {
+    let (sw, sh) = (image.width as usize, image.height as usize);
+    if sw == 0 || sh == 0 || dw == 0 || dh == 0 {
+        return;
+    }
+    let Some(len) = (dw as usize)
+        .checked_mul(dh as usize)
+        .and_then(|n| n.checked_mul(4))
+    else {
+        return;
+    };
+    let Some(source_len) = sw.checked_mul(sh).and_then(|n| n.checked_mul(4)) else {
+        return;
+    };
+    if image.data.len() < source_len {
+        return;
+    }
+    // Source sample pair and weight of the second (0..=256) per destination
+    // column or row.
+    // Compute coordinates on demand: axis tables for a legal 1x100M mask
+    // otherwise consume gigabytes in addition to the bounded pixel buffers.
+    let axis = |d: u32, dst: u32, src: usize| -> (usize, usize, u32) {
+        let scale = src as f64 / dst as f64;
+        let f = ((d as f64 + 0.5) * scale - 0.5).clamp(0.0, (src - 1) as f64);
+        let i0 = f.floor() as usize;
+        (
+            i0,
+            (i0 + 1).min(src - 1),
+            ((f - i0 as f64) * 256.0).round() as u32,
+        )
+    };
+    let row = |y: usize| &image.data[y * sw * 4..(y + 1) * sw * 4];
+    let mut out = Vec::with_capacity(len);
+    for y in 0..dh {
+        let (y0, y1, wy) = axis(y, dh, sh);
+        let (r0, r1) = (row(y0), row(y1));
+        for x in 0..dw {
+            let (x0, x1, wx) = axis(x, dw, sw);
+            for c in 0..4 {
+                let top = r0[x0 * 4 + c] as u32 * (256 - wx) + r0[x1 * 4 + c] as u32 * wx;
+                let bot = r1[x0 * 4 + c] as u32 * (256 - wx) + r1[x1 * 4 + c] as u32 * wx;
+                out.push(((top * (256 - wy) + bot * wy + (1 << 15)) >> 16) as u8);
+            }
+        }
+    }
+    image.data = out;
+    image.width = dw;
+    image.height = dh;
 }
 
 #[inline]
@@ -2841,6 +2947,79 @@ mod tests {
         apply_smask_image(&mut img, &mask);
         for i in 0..4 {
             assert_eq!(pixel(&img, i)[3], 100);
+        }
+    }
+
+    #[test]
+    fn rgba_upsampling_matches_pixel_center_mapping() {
+        for (sw, sh, dw, dh) in [(2, 3, 7, 11), (1, 2, 1, 4096), (2, 1, 4096, 1)] {
+            let source: Vec<u8> = (0..sw * sh * 4).map(|i| (i * 19 % 256) as u8).collect();
+            let mut image = DecodedImage {
+                width: sw,
+                height: sh,
+                data: source.clone(),
+                has_alpha: false,
+                is_image_mask: false,
+                premultiplied: false,
+            };
+            upsample_rgba(&mut image, dw, dh);
+            assert_eq!((image.width, image.height), (dw, dh));
+            for c in 0..4 {
+                let plane: Vec<u8> = source.as_chunks::<4>().0.iter().map(|px| px[c]).collect();
+                let expected = resample_bilinear(&plane, sw, sh, dw, dh);
+                for (px, value) in image.data.as_chunks::<4>().0.iter().zip(expected) {
+                    assert!(
+                        px[c].abs_diff(value) <= 1,
+                        "fixed-point interpolation differs"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rgba_upsampling_rejects_incomplete_source_geometry() {
+        let mut image = DecodedImage {
+            width: u32::MAX,
+            height: u32::MAX,
+            data: vec![1, 2, 3, 255],
+            has_alpha: false,
+            is_image_mask: false,
+            premultiplied: false,
+        };
+        upsample_rgba(&mut image, 4, 4);
+        assert_eq!(image.data, [1, 2, 3, 255]);
+        assert_eq!(image.width, u32::MAX);
+    }
+
+    #[test]
+    fn incomplete_finer_mask_does_not_resize_image() {
+        let mut image =
+            decode_image_xobject(&[255, 0, 0], &image_dict(1, 1, 8, Some("DeviceRGB"))).unwrap();
+        fold_alpha_plane(&mut image, &[255], 4, 4);
+        assert_eq!((image.width, image.height), (1, 1));
+        assert_eq!(image.data, [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn finer_smask_keeps_its_resolution() {
+        // MRC layout: a 1x1 red colour layer under a 4x4 mask with a single
+        // opaque pixel. Shrinking the mask to 1x1 would paint the whole cell.
+        let dict = image_dict(1, 1, 8, Some("DeviceRGB"));
+        let mut img = decode_image_xobject(&[255, 0, 0], &dict).unwrap();
+        let mask_dict = image_dict(4, 4, 8, Some("DeviceGray"));
+        let mut alpha = [0u8; 16];
+        alpha[5] = 255;
+        let mask = decode_image_xobject(&alpha, &mask_dict).unwrap();
+        apply_smask_image(&mut img, &mask);
+        assert_eq!((img.width, img.height), (4, 4));
+        for i in 0..16 {
+            let want: &[u8] = if i == 5 {
+                &[255, 0, 0, 255]
+            } else {
+                &[0, 0, 0, 0]
+            };
+            assert_eq!(pixel(&img, i), want, "pixel {i}");
         }
     }
 

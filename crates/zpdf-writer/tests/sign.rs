@@ -138,7 +138,7 @@ fn rsa_sign_then_verify_roundtrip() {
     use rsa::pkcs1::{EncodeRsaPrivateKey, EncodeRsaPublicKey};
 
     let mut rng = ChaCha20Rng::from_seed([9u8; 32]);
-    let priv_key = rsa::RsaPrivateKey::new(&mut rng, 2048).expect("keygen");
+    let priv_key = rsa::PrivateKey::new(&mut rng, 2048).expect("keygen");
     let pub_der = priv_key
         .to_public_key()
         .to_pkcs1_der()

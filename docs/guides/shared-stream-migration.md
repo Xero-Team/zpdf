@@ -1,6 +1,7 @@
 # Migrating shared stream storage
 
-This change is intended for the next **0.x minor release**, not a 0.19.x patch.
+Starting with **0.20.0**, shared stream storage introduces a source compatibility
+change from 0.19.x.
 `PdfStream.data` changes from `Arc<[u8]>` to `PdfStreamData`, exported by both
 `zpdf_core` and `zpdf`. Exhaustive struct literals and Arc-specific operations
 need updating. The representation of `PdfStreamData` is private.
@@ -76,3 +77,27 @@ Cache admission continues to charge each stream's visible payload, plus view
 metadata, even when bytes are shared. Views are not free entries, and a zero
 cache budget still disables admission. Cache charges are conservative logical
 estimates, not a measure of total process RSS or the retained source file.
+
+## Shared reads and opening existing storage
+
+`PdfFile::resolve_shared(id)` returns `Arc<PdfObject>` for read-only access to a
+resolved object tree. It avoids the deep clone made by `resolve(id)`; the owned
+API still returns an independent editable object. Cache admission and reference
+chain limits apply to both paths.
+
+`resolve_stream_data_shared(id)` returns `DecodedStreamData`, also exported by
+the `zpdf` facade. Its `Shared(PdfStreamData)` variant reuses unchanged bytes
+(including raw, Crypt-only and JPX pass-through streams). `Owned(Vec<u8>)`
+retains a decoder's allocated output without an extra Arc conversion. Both
+variants implement `AsRef<[u8]>` and `Deref<Target = [u8]>`.
+
+Use `into_vec()` to obtain independent mutable bytes: it moves an owned decoder
+buffer, or copies the visible bytes of shared storage. Shared results can retain
+the source PDF after the parser is dropped. Existing `resolve_stream_data` and
+`resolve_stream_data_with_limit` still return `Vec<u8>`; the shared variant's
+`resolve_stream_data_shared_with_limit` can likewise tighten the cumulative
+filter-output budget. Sharing never bypasses that budget.
+
+`IncrementalWriter::from_shared(Arc<[u8]>)` and
+`from_shared_with_password(Arc<[u8]>, password)` reuse existing file storage.
+The original `new(Vec<u8>)` and `new_with_password` constructors remain available.
