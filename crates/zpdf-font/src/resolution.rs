@@ -1208,9 +1208,8 @@ impl FontCache {
     }
 
     /// If `original` is a substituted font that lacks a drawable outline for
-    /// this glyph and a partially readable embedded original was retained for
-    /// it, resolve the glyph from the surviving embedded face (lazily assigning
-    /// a drawing `FontId` when first used).
+    /// this glyph and an already-loaded embedded original was retained for it,
+    /// resolve the glyph from the surviving embedded face.
     #[doc(hidden)]
     pub fn resolve_embedded_companion_glyph(
         &mut self,
@@ -1219,6 +1218,31 @@ impl FontCache {
         raw_code: u32,
         length: u8,
         max_bytes: u64,
+    ) -> Option<DrawingGlyph> {
+        self.resolve_embedded_companion_glyph_with(
+            original,
+            code,
+            raw_code,
+            length,
+            max_bytes,
+            |_, _| None,
+        )
+    }
+
+    /// Like [`Self::resolve_embedded_companion_glyph`], invoking `load_deferred`
+    /// only when the primary substitute lacks a drawable outline for this glyph
+    /// and the paired companion is still an unloaded resource reference. The
+    /// loaded companion is admitted (and charged against `max_bytes`) only if
+    /// it actually draws this glyph.
+    #[doc(hidden)]
+    pub fn resolve_embedded_companion_glyph_with(
+        &mut self,
+        original: DrawingGlyph,
+        code: u32,
+        raw_code: u32,
+        length: u8,
+        max_bytes: u64,
+        mut load_deferred: impl FnMut(&crate::CompanionSource, u64) -> Option<Arc<LoadedFont>>,
     ) -> Option<DrawingGlyph> {
         if self.embedded_companions.is_empty()
             || !self.embedded_companions.contains_key(&original.font_id)
@@ -1237,9 +1261,24 @@ impl FontCache {
             return None;
         }
 
-        let (companion, existing_id) = {
-            let (companion, admitted_id) = self.embedded_companions.get(&original.font_id)?;
-            (Arc::clone(companion), *admitted_id)
+        let (companion, existing_id, was_deferred) = {
+            let (source, admitted_id) = self.embedded_companions.get(&original.font_id)?;
+            if let Some(id) = *admitted_id {
+                (Arc::clone(self.fonts.get(&id)?), Some(id), false)
+            } else {
+                match source {
+                    crate::CompanionSource::Loaded(comp) => (Arc::clone(comp), None, false),
+                    deferred @ (crate::CompanionSource::Object(_)
+                    | crate::CompanionSource::InlineDict(_)) => {
+                        let remaining = max_bytes.saturating_sub(self.budget.bytes_used());
+                        if remaining == 0 {
+                            return None;
+                        }
+                        let loaded = load_deferred(deferred, remaining)?;
+                        (loaded, None, true)
+                    }
+                }
+            }
         };
         let companion_gid = if matches!(companion.font_type, PdfFontType::Type0CidType2) {
             if companion.unicode_coded() {
@@ -1265,11 +1304,15 @@ impl FontCache {
         let font_id = match existing_id {
             Some(id) => id,
             None => {
-                // `companion` was already charged to `self.budget` when
-                // retained by `record_embedded_companion`; `admit_drawing_font`
-                // adds 0 bytes while still checking `max_bytes` in case the
-                // caller lowered the limit.
-                let id = self.admit_drawing_font(companion, max_bytes)?;
+                let Some(id) = self.admit_drawing_font(companion, max_bytes) else {
+                    if was_deferred {
+                        // `FontCacheBudget` is non-evicting, so a deferred
+                        // companion that exceeds `max_bytes` cannot fit later
+                        // on this page either.
+                        self.embedded_companions.remove(&original.font_id);
+                    }
+                    return None;
+                };
                 if let Some((_, slot)) = self.embedded_companions.get_mut(&original.font_id) {
                     *slot = Some(id);
                 }

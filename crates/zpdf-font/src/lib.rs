@@ -2310,6 +2310,21 @@ impl FontCacheBudget {
     }
 }
 
+/// Source of a partially readable embedded original paired with a substituted
+/// [`FontId`] in [`FontCache`]. Page and Form loaders record lightweight
+/// references (`Object` / `InlineDict`) so unused companions consume no
+/// [`FontCache`] budget until an uncovered glyph actually needs them.
+#[doc(hidden)]
+#[derive(Clone)]
+pub enum CompanionSource {
+    /// Indirect font dictionary object ID in the source PDF.
+    Object(zpdf_core::ObjectId),
+    /// Inline font dictionary (contains only metadata; font streams remain indirect).
+    InlineDict(Box<zpdf_core::PdfDict>),
+    /// Already-loaded companion explicitly attached and charged against `budget`.
+    Loaded(Arc<LoadedFont>),
+}
+
 /// Page/display-list font store keyed by [`FontId`].
 ///
 /// Entries are intentionally stable for the lifetime of the store: display
@@ -2327,11 +2342,12 @@ pub struct FontCache {
     /// parse and fell back to substitution or metrics-only mode. Empty maps
     /// allocate nothing, so normal pages pay zero overhead.
     embedded_fallbacks: HashMap<FontId, zpdf_core::ProcessingDiagnostics>,
-    /// Retained partially-readable embedded font programs paired with a
-    /// substituted `FontId`, charged against `budget` upon retention and
-    /// lazily assigned a drawing `FontId` only when an uncovered glyph draws
-    /// from the embedded face. Empty maps allocate nothing.
-    embedded_companions: HashMap<FontId, (Arc<LoadedFont>, Option<FontId>)>,
+    /// Partially-readable embedded originals paired with a substituted
+    /// `FontId`. Resource-backed companions stay lightweight until an uncovered
+    /// glyph actually draws from them, at which point they are loaded and
+    /// charged against `budget` via `admit_drawing_font`. Empty maps allocate
+    /// nothing.
+    embedded_companions: HashMap<FontId, (CompanionSource, Option<FontId>)>,
 }
 
 impl FontCache {
@@ -2354,10 +2370,35 @@ impl FontCache {
         }
     }
 
-    /// Pair a substituted font `id` with its partially readable embedded
-    /// original when `max_bytes` allows, charging the page cache budget before
-    /// retaining the `Arc`. Returns `false` and drops `embedded` if `id` is
-    /// absent or retaining `embedded` would exceed `max_bytes`.
+    /// Pair a substituted font `id` with an indirect PDF font dictionary whose
+    /// partially readable embedded original can be loaded on demand if an
+    /// uncovered glyph actually needs it. Retains no font program bytes and
+    /// charges zero cache budget until used.
+    #[doc(hidden)]
+    pub fn record_deferred_companion_ref(&mut self, id: FontId, font_ref: zpdf_core::ObjectId) {
+        if !self.fonts.contains_key(&id) || self.embedded_companions.contains_key(&id) {
+            return;
+        }
+        self.embedded_companions
+            .insert(id, (CompanionSource::Object(font_ref), None));
+    }
+
+    /// Pair a substituted font `id` with an inline PDF font dictionary whose
+    /// partially readable embedded original can be loaded on demand if an
+    /// uncovered glyph actually needs it.
+    #[doc(hidden)]
+    pub fn record_deferred_companion_dict(&mut self, id: FontId, font_dict: zpdf_core::PdfDict) {
+        if !self.fonts.contains_key(&id) || self.embedded_companions.contains_key(&id) {
+            return;
+        }
+        self.embedded_companions
+            .insert(id, (CompanionSource::InlineDict(Box::new(font_dict)), None));
+    }
+
+    /// Pair a substituted font `id` with an already-loaded embedded original
+    /// when `max_bytes` allows, charging the page cache budget before retaining
+    /// the `Arc`. Returns `false` and drops `embedded` if `id` is absent or
+    /// retaining `embedded` would exceed `max_bytes`.
     #[doc(hidden)]
     pub fn record_embedded_companion(
         &mut self,
@@ -2374,15 +2415,27 @@ impl FontCache {
         if !self.budget.try_admit(&embedded, max_bytes) {
             return false;
         }
-        self.embedded_companions.insert(id, (embedded, None));
+        self.embedded_companions
+            .insert(id, (CompanionSource::Loaded(embedded), None));
         true
     }
 
-    /// Whether `id` has a retained embedded original available for uncovered
-    /// glyphs.
+    /// Whether `id` has a paired embedded companion available (either deferred
+    /// or already retained) for uncovered glyphs.
     #[doc(hidden)]
     pub fn has_embedded_companion(&self, id: FontId) -> bool {
         !self.embedded_companions.is_empty() && self.embedded_companions.contains_key(&id)
+    }
+
+    /// Whether `id` currently retains an in-memory embedded companion program
+    /// in this page cache (as opposed to an unloaded deferred reference).
+    #[doc(hidden)]
+    pub fn has_retained_embedded_companion(&self, id: FontId) -> bool {
+        self.embedded_companions
+            .get(&id)
+            .is_some_and(|(source, admitted)| {
+                admitted.is_some() || matches!(source, CompanionSource::Loaded(_))
+            })
     }
 
     /// Admit `font` under `name` within `max_bytes`, preserving logical PDF

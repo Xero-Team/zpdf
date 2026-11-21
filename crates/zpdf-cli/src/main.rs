@@ -1157,7 +1157,14 @@ fn cmd_text(args: &[String]) -> zpdf::Result<()> {
 
     // The structure tree (whole document) drives `--struct` ordering; each page's
     // marked content is selected by page index inside `struct_ordered_text`.
-    let struct_tree = if use_struct { doc.struct_tree() } else { None };
+    let (struct_tree, struct_actual_text_mcids) = if use_struct {
+        match doc.struct_tree_with_actual_text() {
+            Some((tree, mcids)) => (Some(tree), mcids),
+            None => (None, std::collections::HashMap::new()),
+        }
+    } else {
+        (None, std::collections::HashMap::new())
+    };
     if use_struct && struct_tree.is_none() {
         eprintln!("(no structure tree; falling back to geometric reading order)");
     }
@@ -1191,8 +1198,8 @@ fn cmd_text(args: &[String]) -> zpdf::Result<()> {
                 .with_optional_content(&oc_config)
                 .with_text_sink(&mut spans)
                 .with_operand_stack_limit(doc.file().limits().max_operand_stack_depth as usize);
-            if let Some(tree) = &struct_tree {
-                interpreter = interpreter.with_struct_actual_text(pi, tree);
+            if let Some(mcids) = struct_actual_text_mcids.get(&pi) {
+                interpreter = interpreter.with_struct_actual_text_mcids(mcids.clone());
             }
             let (_, mut stats) = interpreter.interpret_with_stats(&content_bytes);
             stats.diagnostics.set_page(pi);

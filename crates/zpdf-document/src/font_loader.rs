@@ -24,13 +24,16 @@ pub(crate) fn load_page_fonts(
     }
     let max_bytes = file.limits().max_font_cache_bytes;
 
-    // Admit all primary page fonts before attaching optional embedded
-    // companions so a companion charged against `max_bytes` cannot starve a
-    // sibling primary font on the same page.
-    let mut pending_companions: Vec<(zpdf_font::FontId, std::sync::Arc<LoadedFont>)> = Vec::new();
+    // Admit primary page fonts without reserving budget for optional embedded
+    // companions: record only lightweight `ObjectId` references and drop
+    // uncached companions immediately so unused companions consume zero page
+    // budget and cannot displace sibling page or Form fonts. Companions are
+    // loaded and charged on demand only when an uncovered glyph needs them.
     for (name, &font_ref) in &page.resources.fonts {
         match shared_or_load(file, font_ref, shared, provider) {
             Ok((font, diagnostics, companion)) => {
+                let has_companion = companion.is_some();
+                drop(companion);
                 match cache.admit_with_diagnostics(
                     name.clone(),
                     font,
@@ -39,10 +42,8 @@ pub(crate) fn load_page_fonts(
                     max_bytes,
                 ) {
                     Ok(fid) => {
-                        if let Some(companion) = companion {
-                            if cache.get(fid).is_some_and(|f| f.has_font_data()) {
-                                pending_companions.push((fid, companion));
-                            }
+                        if has_companion && cache.get(fid).is_some_and(|f| f.has_font_data()) {
+                            cache.record_deferred_companion_ref(fid, font_ref);
                         }
                     }
                     Err(_) => {
@@ -57,9 +58,6 @@ pub(crate) fn load_page_fonts(
                 let _ = insert_placeholder(&mut cache, name, max_bytes);
             }
         }
-    }
-    for (fid, companion) in pending_companions {
-        let _ = cache.record_embedded_companion(fid, companion, max_bytes);
     }
 
     cache
@@ -252,6 +250,93 @@ pub fn load_single_font_dict_with_fallback(
         }
     }
     Ok((font, diagnostics, companion))
+}
+
+/// Reload only the parseable embedded companion font for an indirect font
+/// object when the embedded stream fits within `max_bytes`.
+#[doc(hidden)]
+pub fn load_embedded_companion_ref(
+    file: &PdfFile,
+    font_ref: ObjectId,
+    max_bytes: u64,
+) -> Option<LoadedFont> {
+    if max_bytes == 0 {
+        return None;
+    }
+    let obj = file.resolve(font_ref).ok()?;
+    let dict = obj.as_dict().ok()?;
+    load_embedded_companion_dict(file, dict, max_bytes)
+}
+
+/// Reload only the parseable embedded companion font for a font dictionary
+/// when its decoded font stream fits within `max_bytes`.
+#[doc(hidden)]
+pub fn load_embedded_companion_dict(
+    file: &PdfFile,
+    dict: &zpdf_core::PdfDict,
+    max_bytes: u64,
+) -> Option<LoadedFont> {
+    if max_bytes == 0 {
+        return None;
+    }
+    let subtype = dict.get_name("Subtype").unwrap_or("");
+    let base_font = dict.get_name("BaseFont").unwrap_or("Unknown").to_string();
+    let mut font = match subtype {
+        "Type0" => {
+            let descendants = resolve_array(file, dict, "DescendantFonts")?;
+            let desc_dict = descendant_cid_dict(file, &descendants)?;
+            let descriptor = resolve_dict(file, &desc_dict, "FontDescriptor")?;
+            let EmbeddedFontFile::Present { data, .. } =
+                extract_font_file_with_limit(file, &descriptor, Some(max_bytes))
+            else {
+                return None;
+            };
+            let mut cid_widths = parse_cid_widths(file, &desc_dict);
+            parse_cid_w2(file, &desc_dict, &mut cid_widths);
+            let mut font =
+                LoadedFont::new_with_data(PdfFontType::Type0CidType2, base_font, data, cid_widths);
+            if !font.has_font_data() {
+                return None;
+            }
+            if desc_dict.get_name("Subtype").unwrap_or("") == "CIDFontType2" {
+                if let Some(map) = parse_cid_to_gid_stream(file, &desc_dict) {
+                    font.cid_to_gid = Some(map);
+                }
+            }
+            let (cmap, _) = parse_type0_cmap_and_ordering(file, dict, &desc_dict);
+            font.cid_cmap = Some(cmap);
+            font.dw2 = parse_dw2(file, &desc_dict);
+            font.validate_cid_cmap();
+            apply_variations_from_descriptor(&descriptor, &mut font);
+            font
+        }
+        "TrueType" | "Type1" | "MMType1" => {
+            let font_type = if subtype == "TrueType" {
+                PdfFontType::TrueType
+            } else {
+                PdfFontType::Type1
+            };
+            let descriptor = resolve_dict(file, dict, "FontDescriptor")?;
+            let EmbeddedFontFile::Present { data, .. } =
+                extract_font_file_with_limit(file, &descriptor, Some(max_bytes))
+            else {
+                return None;
+            };
+            let cid_widths = parse_simple_widths(file, dict);
+            let font = LoadedFont::new_with_data(font_type, base_font, data, cid_widths);
+            if !font.has_font_data() {
+                return None;
+            }
+            font
+        }
+        _ => return None,
+    };
+    let to_unicode = parse_to_unicode(file, dict);
+    attach_text_mappings(file, dict, subtype, to_unicode, &mut font);
+    if subtype != "Type0" {
+        apply_descriptor_variations(file, dict, &mut font);
+    }
+    Some(font)
 }
 
 fn descriptor_hints(
@@ -649,6 +734,33 @@ fn parse_dw2(file: &PdfFile, desc_dict: &zpdf_core::PdfDict) -> (f64, f64) {
         .unwrap_or((880.0, -1000.0))
 }
 
+fn parse_type0_cmap_and_ordering(
+    file: &PdfFile,
+    dict: &zpdf_core::PdfDict,
+    desc_dict: &zpdf_core::PdfDict,
+) -> (zpdf_font::cmap::CidCMap, Option<String>) {
+    let mut cmap = parse_type0_encoding(file, dict);
+    let mut ordering = None;
+    if let Some(info) = resolve_dict(file, desc_dict, "CIDSystemInfo") {
+        ordering = match info.get("Ordering") {
+            Some(PdfObject::String(value)) => Some(value.to_string_lossy()),
+            Some(PdfObject::Name(value)) => Some(value.as_str().to_string()),
+            _ => None,
+        };
+        let adobe = match info.get("Registry") {
+            Some(PdfObject::String(value)) => value.0 == b"Adobe",
+            Some(PdfObject::Name(value)) => value.as_str() == "Adobe",
+            _ => false,
+        };
+        if adobe {
+            if let Some(ordering) = &ordering {
+                cmap.set_collection(ordering);
+            }
+        }
+    }
+    (cmap, ordering)
+}
+
 fn load_type0_font(
     file: &PdfFile,
     dict: &zpdf_core::PdfDict,
@@ -671,25 +783,7 @@ fn load_type0_font(
 
     let mut cid_widths = parse_cid_widths(file, desc_dict);
     parse_cid_w2(file, desc_dict, &mut cid_widths);
-    let mut cmap = parse_type0_encoding(file, dict);
-    let mut ordering = None;
-    if let Some(info) = resolve_dict(file, desc_dict, "CIDSystemInfo") {
-        ordering = match info.get("Ordering") {
-            Some(PdfObject::String(value)) => Some(value.to_string_lossy()),
-            Some(PdfObject::Name(value)) => Some(value.as_str().to_string()),
-            _ => None,
-        };
-        let adobe = match info.get("Registry") {
-            Some(PdfObject::String(value)) => value.0 == b"Adobe",
-            Some(PdfObject::Name(value)) => value.as_str() == "Adobe",
-            _ => false,
-        };
-        if adobe {
-            if let Some(ordering) = &ordering {
-                cmap.set_collection(ordering);
-            }
-        }
-    }
+    let (cmap, ordering) = parse_type0_cmap_and_ordering(file, dict, desc_dict);
     let dw2 = parse_dw2(file, desc_dict);
 
     // Reuse the descriptor for font bytes, substitution hints and variations.
@@ -1191,25 +1285,39 @@ enum EmbeddedFontFile {
 /// distinguishing absent streams (normal non-embedded fonts) from declared
 /// streams that failed to decode or were empty.
 fn extract_font_file(file: &PdfFile, fd_dict: &zpdf_core::PdfDict) -> EmbeddedFontFile {
+    extract_font_file_with_limit(file, fd_dict, None)
+}
+
+fn extract_font_file_with_limit(
+    file: &PdfFile,
+    fd_dict: &zpdf_core::PdfDict,
+    max_decoded_bytes: Option<u64>,
+) -> EmbeddedFontFile {
     let mut first_failure: Option<(Option<ObjectId>, Option<zpdf_core::Error>)> = None;
     // Try FontFile2 (TrueType), then FontFile3 (OpenType/CFF), then FontFile (Type1)
     for key in &["FontFile2", "FontFile3", "FontFile"] {
         match fd_dict.get(key) {
             None | Some(PdfObject::Null) => continue,
-            Some(PdfObject::Ref(ff_ref)) => match file.resolve_stream_data(*ff_ref) {
-                Ok(data) if !data.is_empty() => {
-                    return EmbeddedFontFile::Present {
-                        object_id: Some(*ff_ref),
-                        data,
-                    };
+            Some(PdfObject::Ref(ff_ref)) => {
+                let decoded = match max_decoded_bytes {
+                    Some(limit) => file.resolve_stream_data_with_limit(*ff_ref, limit),
+                    None => file.resolve_stream_data(*ff_ref),
+                };
+                match decoded {
+                    Ok(data) if !data.is_empty() => {
+                        return EmbeddedFontFile::Present {
+                            object_id: Some(*ff_ref),
+                            data,
+                        };
+                    }
+                    Ok(_) => {
+                        first_failure.get_or_insert((Some(*ff_ref), None));
+                    }
+                    Err(err) => {
+                        first_failure.get_or_insert((Some(*ff_ref), Some(err)));
+                    }
                 }
-                Ok(_) => {
-                    first_failure.get_or_insert((Some(*ff_ref), None));
-                }
-                Err(err) => {
-                    first_failure.get_or_insert((Some(*ff_ref), Some(err)));
-                }
-            },
+            }
             Some(_) => {
                 first_failure.get_or_insert((None, None));
             }

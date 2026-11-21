@@ -424,10 +424,27 @@ pub fn is_tagged(file: &PdfFile) -> bool {
     matches!(mark_info.get("Marked"), Some(PdfObject::Bool(true)))
 }
 
+/// Per-page set of `(owning_stream, mcid)` pairs subsumed by a structure
+/// element's `/ActualText` replacement (ISO 32000-1 §14.7.4.2). `None` denotes
+/// the page's own content stream; `Some(stm_id)` denotes a Form XObject stream
+/// referenced by `/MCR /Stm`.
+#[doc(hidden)]
+pub type ActualTextMcidMap = HashMap<usize, HashSet<(Option<ObjectId>, i64)>>;
+
 /// Parse the document's logical structure tree from the catalog's
 /// `/StructTreeRoot`. Returns `None` when the document declares no structure
 /// tree (i.e. is not tagged in the structural sense).
 pub fn parse_struct_tree(file: &PdfFile, catalog: &Catalog) -> Option<StructTree> {
+    Some(parse_struct_tree_with_actual_text(file, catalog)?.0)
+}
+
+/// Like [`parse_struct_tree`], also returning the stream-scoped `/ActualText`
+/// marked-content coverage per page in a single pass.
+#[doc(hidden)]
+pub fn parse_struct_tree_with_actual_text(
+    file: &PdfFile,
+    catalog: &Catalog,
+) -> Option<(StructTree, ActualTextMcidMap)> {
     let root = catalog_dict(file)?;
     let tree_root = resolve_dict(file, root.get("StructTreeRoot"))?;
 
@@ -447,6 +464,7 @@ pub fn parse_struct_tree(file: &PdfFile, catalog: &Catalog) -> Option<StructTree
         budget: MAX_STRUCT_ELEMENTS,
         text_budget: MAX_TREE_TEXT_BYTES,
         text_cache: HashMap::new(),
+        actual_text_mcids: HashMap::new(),
     };
 
     // The root's /K holds the top-level structure element(s). Its own /Pg (rare)
@@ -454,16 +472,19 @@ pub fn parse_struct_tree(file: &PdfFile, catalog: &Catalog) -> Option<StructTree
     let root_page = walk.page_of(&tree_root);
     let mut children = Vec::new();
     for kid in normalize_kids(file, &tree_root) {
-        if let Some(StructKid::Element(e)) = walk.parse_kid(&kid, root_page, 0) {
+        if let Some(StructKid::Element(e)) = walk.parse_kid(&kid, root_page, 0, None) {
             children.push(e);
         }
         // A bare MCID / OBJR directly under the root is non-conformant; drop it.
     }
 
-    Some(StructTree {
-        children,
-        marked: is_tagged(file),
-    })
+    Some((
+        StructTree {
+            children,
+            marked: is_tagged(file),
+        },
+        walk.actual_text_mcids,
+    ))
 }
 
 /// Shared state for one structure-tree traversal.
@@ -482,17 +503,24 @@ struct StructWalk<'a> {
     /// Capped text of indirect string objects, so one shared by many elements
     /// is resolved and decoded once.
     text_cache: HashMap<ObjectId, Option<Rc<str>>>,
+    /// Stream-scoped `(owning_stream, mcid)` coverage for `/ActualText`
+    /// elements, keyed by 0-based page index.
+    actual_text_mcids: ActualTextMcidMap,
 }
 
 impl StructWalk<'_> {
     /// Parse one `/K` entry into a [`StructKid`]. Spends one unit of the shared
     /// budget per entry examined (so a giant `/K` array can't be scanned for
     /// free), and bounds element recursion by depth and the visited set.
+    ///
+    /// `actual_text_page` is `Some(effective_page)` when an enclosing ancestor
+    /// carries `/ActualText`, mirroring `emit_struct_elem` + `mark_consumed`.
     fn parse_kid(
         &mut self,
         obj: &PdfObject,
         parent_page: Option<usize>,
         depth: usize,
+        actual_text_page: Option<Option<usize>>,
     ) -> Option<StructKid> {
         if self.budget == 0 {
             return None;
@@ -500,11 +528,22 @@ impl StructWalk<'_> {
         self.budget -= 1;
 
         match obj {
-            // A bare integer kid is an MCID into the parent's effective page.
-            PdfObject::Integer(mcid) => Some(StructKid::MarkedContent {
-                page: parent_page,
-                mcid: *mcid,
-            }),
+            // A bare integer kid is an MCID into the parent's effective page
+            // content stream (`owning_stream == None`).
+            PdfObject::Integer(mcid) => {
+                if let (Some(at_page), Some(page)) = (actual_text_page, parent_page) {
+                    if at_page.is_none_or(|ap| ap == page) {
+                        self.actual_text_mcids
+                            .entry(page)
+                            .or_default()
+                            .insert((None, *mcid));
+                    }
+                }
+                Some(StructKid::MarkedContent {
+                    page: parent_page,
+                    mcid: *mcid,
+                })
+            }
 
             // A reference: to a nested structure element, or (rarely) to an
             // MCR/OBJR dict.
@@ -512,14 +551,14 @@ impl StructWalk<'_> {
                 let resolved = self.file.resolve(*id).ok()?;
                 let dict = resolved.as_dict().ok()?;
                 match kid_dict_kind(dict) {
-                    KidKind::Mcr => self.marked_content(dict, parent_page),
+                    KidKind::Mcr => self.marked_content(dict, parent_page, actual_text_page),
                     KidKind::Objr => self.object_ref(dict, parent_page),
                     KidKind::Element => {
                         // Cycle / shared-subtree guard on element identity.
                         if !self.visited.insert(*id) {
                             return None;
                         }
-                        self.element(dict, parent_page, depth)
+                        self.element(dict, parent_page, depth, actual_text_page)
                             .map(StructKid::Element)
                     }
                 }
@@ -527,10 +566,10 @@ impl StructWalk<'_> {
 
             // An inline dict kid: an MCR, an OBJR, or a nested element.
             PdfObject::Dict(dict) => match kid_dict_kind(dict) {
-                KidKind::Mcr => self.marked_content(dict, parent_page),
+                KidKind::Mcr => self.marked_content(dict, parent_page, actual_text_page),
                 KidKind::Objr => self.object_ref(dict, parent_page),
                 KidKind::Element => self
-                    .element(dict, parent_page, depth)
+                    .element(dict, parent_page, depth, actual_text_page)
                     .map(StructKid::Element),
             },
 
@@ -544,6 +583,7 @@ impl StructWalk<'_> {
         dict: &PdfDict,
         parent_page: Option<usize>,
         depth: usize,
+        actual_text_page: Option<Option<usize>>,
     ) -> Option<StructElem> {
         if depth > MAX_STRUCT_DEPTH {
             return None;
@@ -561,9 +601,11 @@ impl StructWalk<'_> {
         let alt = self.capped_text(dict, "Alt");
         let actual_text = self.capped_text(dict, "ActualText");
         let expansion = self.capped_text(dict, "E");
+        let child_actual_text_page =
+            actual_text_page.or_else(|| actual_text.as_ref().map(|_| page));
         let kids = normalize_kids(self.file, dict)
             .iter()
-            .filter_map(|k| self.parse_kid(k, page, depth + 1))
+            .filter_map(|k| self.parse_kid(k, page, depth + 1, child_actual_text_page))
             .collect();
 
         Some(StructElem {
@@ -613,10 +655,28 @@ impl StructWalk<'_> {
 
     /// Build a [`StructKid::MarkedContent`] from a `/MCR` dict (or a kid dict
     /// treated as one). An MCR may carry its own `/Pg`, overriding the inherited
-    /// page; its `/MCID` is required.
-    fn marked_content(&self, dict: &PdfDict, parent_page: Option<usize>) -> Option<StructKid> {
+    /// page, and an optional `/Stm` referencing the owning Form XObject stream.
+    fn marked_content(
+        &mut self,
+        dict: &PdfDict,
+        parent_page: Option<usize>,
+        actual_text_page: Option<Option<usize>>,
+    ) -> Option<StructKid> {
         let mcid = int_value(dict.get("MCID"))?;
         let page = self.page_of(dict).or(parent_page);
+        let stream_key = match dict.get("Stm") {
+            None | Some(PdfObject::Null) => Some(None),
+            Some(PdfObject::Ref(id)) => Some(Some(*id)),
+            Some(_) => None,
+        };
+        if let (Some(at_page), Some(p), Some(stm)) = (actual_text_page, page, stream_key) {
+            if at_page.is_none_or(|ap| ap == p) {
+                self.actual_text_mcids
+                    .entry(p)
+                    .or_default()
+                    .insert((stm, mcid));
+            }
+        }
         Some(StructKid::MarkedContent { page, mcid })
     }
 

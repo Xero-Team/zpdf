@@ -345,6 +345,16 @@ impl PdfDocument {
         )
     }
 
+    /// Return a previously cached embedded companion for `font_ref`, if any,
+    /// without parsing.
+    #[doc(hidden)]
+    pub fn cached_shared_font_companion(&self, font_ref: ObjectId) -> Option<Arc<LoadedFont>> {
+        self.shared_fonts
+            .borrow()
+            .get(font_ref)
+            .and_then(|(_, _, companion)| companion)
+    }
+
     /// Parse a page's annotations into renderable form (/Rect, /F, the
     /// /AS-selected appearance stream, /OC membership). Widget annotations for
     /// interactive-form fields gain a generated appearance when the producer
@@ -501,6 +511,15 @@ impl PdfDocument {
     /// declares no structure tree. Read-only; runs only when called.
     pub fn struct_tree(&self) -> Option<StructTree> {
         structure::parse_struct_tree(&self.file, &self.catalog)
+    }
+
+    /// Like [`Self::struct_tree`], also returning stream-scoped `/ActualText`
+    /// MCID coverage per page for structured text completeness checks.
+    #[doc(hidden)]
+    pub fn struct_tree_with_actual_text(
+        &self,
+    ) -> Option<(StructTree, structure::ActualTextMcidMap)> {
+        structure::parse_struct_tree_with_actual_text(&self.file, &self.catalog)
     }
 
     /// Whether the document declares Tagged-PDF conformance via the catalog's

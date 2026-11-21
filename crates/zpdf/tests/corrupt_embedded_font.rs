@@ -1837,9 +1837,10 @@ fn embedded_companion_respects_page_font_cache_budget_even_when_unused() {
     let (f1_id, f1) = page0.fonts.get_by_name("F1").unwrap();
     assert!(f1.is_substitute && f1.has_font_data());
     assert!(
-        !page0.fonts.has_embedded_companion(f1_id),
+        !page0.fonts.has_retained_embedded_companion(f1_id),
         "unused companion exceeding page budget must not be retained"
     );
+    assert_eq!(page0.fonts.len(), 1);
     assert!(
         page0.fonts.bytes_used() <= tight_budget,
         "page cache bytes {} exceeded limit {}",
@@ -1865,19 +1866,19 @@ fn embedded_companion_respects_page_font_cache_budget_even_when_unused() {
             30,
             70
         ) > 10,
-        "substitute CID 1 must still render when unused companion is dropped for budget"
+        "substitute CID 1 must still render when unused companion is not retained"
     );
 
     // Page 1 (Form XObject font)
     let page1 = zpdf::interpret_page(&doc_tight, 1, Default::default()).unwrap();
     let (g1_id, g1) = page1.fonts.get_by_name("__font_6_0").unwrap();
     assert!(g1.is_substitute && g1.has_font_data());
-    assert!(!page1.fonts.has_embedded_companion(g1_id));
+    assert!(!page1.fonts.has_retained_embedded_companion(g1_id));
     assert!(page1.fonts.bytes_used() <= tight_budget);
     assert!(page1.is_complete());
 
-    // 2. Generous budget: companion IS retained and charged immediately in
-    //    `bytes_used()` even though page 0 draws only from the substitute.
+    // 2. Generous budget: an unused companion is STILL deferred (zero retained
+    //    companion bytes in the page FontCache) until an uncovered glyph needs it.
     let ample_budget = (PRIMARY_TTF.len() as u64) * 4 + BOLD_TTF.len() as u64;
     let doc_ample = PdfDocument::open_with_limits(
         pdf.clone(),
@@ -1890,18 +1891,20 @@ fn embedded_companion_respects_page_font_cache_budget_even_when_unused() {
     .with_font_provider(provider_with_alias("BudgetCompanion"));
     let page_ample = zpdf::interpret_page(&doc_ample, 0, Default::default()).unwrap();
     let (f1_ample_id, f1_ample) = page_ample.fonts.get_by_name("F1").unwrap();
+    let f1_cost = f1_ample.estimated_cache_bytes();
     assert!(page_ample.fonts.has_embedded_companion(f1_ample_id));
     assert!(
-        page_ample.fonts.bytes_used() >= (PRIMARY_TTF.len() as u64) * 2,
-        "retained companion must be charged against bytes_used() even when unused"
+        !page_ample
+            .fonts
+            .has_retained_embedded_companion(f1_ample_id),
+        "unused companion must stay deferred and consume zero page-cache budget"
     );
-    assert!(page_ample.fonts.bytes_used() <= ample_budget);
+    assert_eq!(page_ample.fonts.bytes_used(), f1_cost);
 
-    // 3. Two-pass admission: measure exact primary costs for /F1 and /F2; when
-    //    both primaries fit together (`f1_cost + f2_cost`) but /F1's companion
-    //    does not, neither primary font is starved regardless of map order.
+    // 3. Sibling primary font: when primary /F1 + valid /F2 fit together
+    //    (`f1_cost + f2_cost`) but /F1's companion does not, neither primary
+    //    font is starved.
     let page2_ample = zpdf::interpret_page(&doc_ample, 2, Default::default()).unwrap();
-    let f1_cost = f1_ample.estimated_cache_bytes();
     let f2_cost = page2_ample
         .fonts
         .get_by_name("F2")
@@ -1926,10 +1929,201 @@ fn embedded_companion_respects_page_font_cache_budget_even_when_unused() {
     let (f1_id2, f1_2) = page2.fonts.get_by_name("F1").unwrap();
     let (_, f2_2) = page2.fonts.get_by_name("F2").unwrap();
     assert!(f1_2.has_font_data() && f2_2.has_font_data());
-    assert!(!page2.fonts.has_embedded_companion(f1_id2));
+    assert!(!page2.fonts.has_retained_embedded_companion(f1_id2));
     assert!(page2.fonts.bytes_used() <= sibling_budget);
     assert!(!page2.stats.diagnostics.resource_limit_reached);
     assert!(page2.is_complete());
+
+    // 4. Multiple distinct corrupt fonts on the same page AND inside a Form
+    //    XObject (including an inline font dict) that share one substitute face
+    //    while each embedded companion exceeds the remaining budget: all
+    //    primaries fit, no companion is retained, and when an ample budget is
+    //    used an inline form font dict loads and draws its surviving CID on demand.
+    let multi_pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 180 100] /Resources << /Font << /F1 5 0 R /F2 9 0 R /F3 13 0 R >> >> /Contents 17 0 R >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 180 100] /Resources << /XObject << /Fm 18 0 R >> >> /Contents 19 0 R >>".to_vec(),
+        // Font 1 (objs 5..8)
+        b"<< /Type /Font /Subtype /Type0 /BaseFont /ABCDEF+BudgetCompanion /Encoding /Identity-H /DescendantFonts [6 0 R] /ToUnicode 20 0 R >>".to_vec(),
+        b"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /ABCDEF+BudgetCompanion /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /CIDToGIDMap 21 0 R /FontDescriptor 7 0 R /DW 1000 /W [1 [620 780 540]] >>".to_vec(),
+        b"<< /Type /FontDescriptor /FontName /ABCDEF+BudgetCompanion /Flags 32 /FontFile2 8 0 R >>".to_vec(),
+        stream("", &partial_ttf),
+        // Font 2 (objs 9..12)
+        b"<< /Type /Font /Subtype /Type0 /BaseFont /BCDEFG+BudgetCompanion /Encoding /Identity-H /DescendantFonts [10 0 R] /ToUnicode 20 0 R >>".to_vec(),
+        b"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /BCDEFG+BudgetCompanion /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /CIDToGIDMap 21 0 R /FontDescriptor 11 0 R /DW 1000 /W [1 [620 780 540]] >>".to_vec(),
+        b"<< /Type /FontDescriptor /FontName /BCDEFG+BudgetCompanion /Flags 32 /FontFile2 12 0 R >>".to_vec(),
+        stream("", &partial_ttf),
+        // Font 3 (objs 13..16)
+        b"<< /Type /Font /Subtype /Type0 /BaseFont /CDEFGH+BudgetCompanion /Encoding /Identity-H /DescendantFonts [14 0 R] /ToUnicode 20 0 R >>".to_vec(),
+        b"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /CDEFGH+BudgetCompanion /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /CIDToGIDMap 21 0 R /FontDescriptor 15 0 R /DW 1000 /W [1 [620 780 540]] >>".to_vec(),
+        b"<< /Type /FontDescriptor /FontName /CDEFGH+BudgetCompanion /Flags 32 /FontFile2 16 0 R >>".to_vec(),
+        stream("", &partial_ttf),
+        // Page 0 content (obj 17)
+        stream(
+            "",
+            b"0 0 0 rg BT /F1 24 Tf 15 40 Td <0001> Tj /F2 24 Tf 20 0 Td <0001> Tj /F3 24 Tf 20 0 Td <0001> Tj ET",
+        ),
+        // Form XObject with both indirect and inline font dicts (obj 18)
+        stream(
+            "/Type /XObject /Subtype /Form /BBox [0 0 180 100] /Resources << /Font << \
+              /G1 5 0 R /G2 9 0 R \
+              /GInline << /Type /Font /Subtype /Type0 /BaseFont /DEFGHI+BudgetCompanion /Encoding /Identity-H /DescendantFonts [14 0 R] /ToUnicode 20 0 R >> \
+            >> >>",
+            b"0 0 0 rg BT /G1 24 Tf 15 40 Td <0001> Tj /GInline 24 Tf 25 0 Td <00010003> Tj ET",
+        ),
+        // Page 1 content (obj 19)
+        stream("", b"/Fm Do"),
+        // Shared ToUnicode (obj 20) & CIDToGIDMap (obj 21)
+        stream("", partial_tounicode),
+        stream("", &cid_to_gid_bytes),
+    ]);
+
+    let multi_tight = PRIMARY_TTF.len() as u64 + 8192;
+    assert!(multi_tight < (PRIMARY_TTF.len() as u64) * 2);
+    let doc_multi_tight = PdfDocument::open_with_limits(
+        multi_pdf.clone(),
+        zpdf::ParseLimits {
+            max_font_cache_bytes: multi_tight,
+            ..Default::default()
+        },
+    )
+    .unwrap()
+    .with_font_provider(provider_with_alias("BudgetCompanion"));
+    let mp0 = zpdf::interpret_page(&doc_multi_tight, 0, Default::default()).unwrap();
+    for name in ["F1", "F2", "F3"] {
+        let (fid, f) = mp0.fonts.get_by_name(name).unwrap();
+        assert!(f.is_substitute && f.has_font_data());
+        assert!(!mp0.fonts.has_retained_embedded_companion(fid));
+    }
+    assert!(mp0.fonts.bytes_used() <= multi_tight);
+    assert!(mp0.is_complete());
+
+    // Form XObject on tight budget also stays within limit and never retains over-budget companions.
+    let mp1_tight = zpdf::interpret_page(&doc_multi_tight, 1, Default::default()).unwrap();
+    assert!(mp1_tight.fonts.bytes_used() <= multi_tight);
+    assert!(
+        !mp1_tight.is_complete(),
+        "CID 3 misses outline without companion"
+    );
+
+    // On an ample budget, the inline form font dict loads its surviving
+    // companion on demand and draws both CID 1 and CID 3 cleanly.
+    let doc_multi_ample = PdfDocument::open(multi_pdf)
+        .unwrap()
+        .with_font_provider(provider_with_alias("BudgetCompanion"));
+    let mp1_ample = zpdf::interpret_page(&doc_multi_ample, 1, Default::default()).unwrap();
+    assert!(
+        mp1_ample.is_complete(),
+        "inline form font dict must load its companion on demand and draw surviving CID 3"
+    );
+
+    // 5. Order-independent companion budget reservation: two corrupt fonts on a
+    //    page where budget fits both primaries + ONLY ONE companion. The font
+    //    fully covered by its substitute never reserves a companion slot, so
+    //    the font that actually draws an uncovered CID always gets it regardless
+    //    of resource-name ordering.
+    for (covered_name, needed_name) in [("F1", "F2"), ("Z1", "A2"), ("A1", "Z2")] {
+        let order_pdf = assemble(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 180 100] \
+                 /Resources << /Font << /{covered_name} 5 0 R /{needed_name} 9 0 R >> >> /Contents 4 0 R >>"
+            )
+            .into_bytes(),
+            stream(
+                "",
+                format!(
+                    "0 0 0 rg BT /{covered_name} 24 Tf 15 40 Td <0001> Tj \
+                     /{needed_name} 24 Tf 25 0 Td <00010003> Tj ET"
+                )
+                .as_bytes(),
+            ),
+            b"<< /Type /Font /Subtype /Type0 /BaseFont /ABCDEF+BudgetCompanion /Encoding /Identity-H /DescendantFonts [6 0 R] /ToUnicode 13 0 R >>".to_vec(),
+            b"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /ABCDEF+BudgetCompanion /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /CIDToGIDMap 14 0 R /FontDescriptor 7 0 R /DW 1000 /W [1 [620 780 540]] >>".to_vec(),
+            b"<< /Type /FontDescriptor /FontName /ABCDEF+BudgetCompanion /Flags 32 /FontFile2 8 0 R >>".to_vec(),
+            stream("", &partial_ttf),
+            b"<< /Type /Font /Subtype /Type0 /BaseFont /BCDEFG+BudgetCompanion /Encoding /Identity-H /DescendantFonts [10 0 R] /ToUnicode 13 0 R >>".to_vec(),
+            b"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /BCDEFG+BudgetCompanion /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /CIDToGIDMap 14 0 R /FontDescriptor 11 0 R /DW 1000 /W [1 [620 780 540]] >>".to_vec(),
+            b"<< /Type /FontDescriptor /FontName /BCDEFG+BudgetCompanion /Flags 32 /FontFile2 12 0 R >>".to_vec(),
+            stream("", &partial_ttf),
+            stream("", partial_tounicode),
+            stream("", &cid_to_gid_bytes),
+        ]);
+        // Budget fits both primaries (sharing PRIMARY_TTF) + ONE companion, NOT two companions.
+        let one_companion_budget = (PRIMARY_TTF.len() as u64) * 2 + 8192;
+        assert!(one_companion_budget < (PRIMARY_TTF.len() as u64) * 3);
+        let doc_order = PdfDocument::open_with_limits(
+            order_pdf,
+            zpdf::ParseLimits {
+                max_font_cache_bytes: one_companion_budget,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .with_font_provider(provider_with_alias("BudgetCompanion"));
+        let page = zpdf::interpret_page(&doc_order, 0, Default::default()).unwrap();
+        let (cov_id, _) = page.fonts.get_by_name(covered_name).unwrap();
+        let (need_id, _) = page.fonts.get_by_name(needed_name).unwrap();
+        assert!(
+            !page.fonts.has_retained_embedded_companion(cov_id),
+            "{covered_name}/{needed_name}: covered font must not take a companion slot"
+        );
+        assert!(
+            page.fonts.has_retained_embedded_companion(need_id),
+            "{covered_name}/{needed_name}: font needing CID 3 must retain its companion"
+        );
+        assert!(page.fonts.bytes_used() <= one_companion_budget);
+        assert!(
+            page.is_complete(),
+            "{covered_name}/{needed_name}: surviving CID 3 must draw deterministically"
+        );
+    }
+
+    // 6. Unused page companion never displaces a healthy font first loaded by a Form.
+    let form_healthy_pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 180 100] /Resources << /Font << /F1 5 0 R >> /XObject << /Fm 11 0 R >> >> /Contents 4 0 R >>".to_vec(),
+        stream("", b"0 0 0 rg BT /F1 24 Tf 15 40 Td <0001> Tj ET /Fm Do"),
+        b"<< /Type /Font /Subtype /Type0 /BaseFont /ABCDEF+BudgetCompanion /Encoding /Identity-H /DescendantFonts [6 0 R] /ToUnicode 9 0 R >>".to_vec(),
+        b"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /ABCDEF+BudgetCompanion /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /CIDToGIDMap 10 0 R /FontDescriptor 7 0 R /DW 1000 /W [1 [620 780 540]] >>".to_vec(),
+        b"<< /Type /FontDescriptor /FontName /ABCDEF+BudgetCompanion /Flags 32 /FontFile2 8 0 R >>".to_vec(),
+        stream("", &partial_ttf),
+        stream("", partial_tounicode),
+        stream("", &cid_to_gid_bytes),
+        stream(
+            "/Type /XObject /Subtype /Form /BBox [0 0 180 100] /Resources << /Font << /G1 12 0 R >> >>",
+            b"0 0 0 rg BT /G1 24 Tf 45 40 Td (B) Tj ET",
+        ),
+        b"<< /Type /Font /Subtype /TrueType /BaseFont /ABCDEF+HealthyFormFace /Encoding /WinAnsiEncoding /FirstChar 65 /LastChar 67 /Widths [620 780 540] /FontDescriptor 13 0 R >>".to_vec(),
+        b"<< /Type /FontDescriptor /FontName /ABCDEF+HealthyFormFace /Flags 32 /FontFile2 14 0 R >>".to_vec(),
+        stream("", BOLD_TTF),
+    ]);
+    let doc_form_healthy = PdfDocument::open_with_limits(
+        form_healthy_pdf,
+        zpdf::ParseLimits {
+            max_font_cache_bytes: sibling_budget,
+            ..Default::default()
+        },
+    )
+    .unwrap()
+    .with_font_provider(provider_with_alias("BudgetCompanion"));
+    let pf = zpdf::interpret_page(&doc_form_healthy, 0, Default::default()).unwrap();
+    let (pf1_id, _) = pf.fonts.get_by_name("F1").unwrap();
+    let (_, pg1) = pf.fonts.get_by_name("__font_12_0").unwrap();
+    assert!(
+        !pf.fonts.has_retained_embedded_companion(pf1_id),
+        "unused page companion must stay deferred"
+    );
+    assert!(
+        pg1.has_font_data(),
+        "healthy Form font must not be displaced by an unused page companion"
+    );
+    assert!(pf.fonts.bytes_used() <= sibling_budget);
+    assert!(!pf.stats.diagnostics.resource_limit_reached);
+    assert!(pf.is_complete());
 }
 
 #[test]
@@ -2002,7 +2196,7 @@ fn shared_font_repeat_render_keeps_surviving_companion_glyphs_consistent() {
         .1
         .estimated_cache_bytes();
     let pair_cost = p1_measure.fonts.bytes_used();
-    let budget = (filler_cost + primary_cost).max(pair_cost);
+    let budget = (filler_cost + primary_cost).max(pair_cost + 1024);
     assert!(
         budget < filler_cost + pair_cost,
         "budget {budget} must fit page 1 pair ({pair_cost}) and filler+primary ({}) without fitting filler+pair ({})",
@@ -2035,7 +2229,7 @@ fn shared_font_repeat_render_keeps_surviving_companion_glyphs_consistent() {
         );
         let (fid, _) = page.fonts.get_by_name("F1").unwrap();
         assert!(
-            page.fonts.has_embedded_companion(fid),
+            page.fonts.has_retained_embedded_companion(fid),
             "{label} render must retain companion"
         );
         let runs: Vec<_> = page
@@ -2188,4 +2382,135 @@ fn structure_element_actual_text_satisfies_structured_text_completeness() {
     assert_eq!(conv_partial.pages[0].diagnostics.decode_failures, 1);
     assert!(!conv_partial.is_complete());
     assert!(conv_partial.ensure_complete().is_err());
+
+    // 3. Owning-stream scoping for matching numeric MCIDs across page and Form:
+    //    Page sequence MCID 0 has `/ActualText (PageLabel)`, while Form `Fm`
+    //    (obj 11 0 R) invoked outside that sequence uses its OWN MCID 0 for an
+    //    undecodable fallback CID. Page `/ActualText` must NOT excuse the Form's
+    //    MCID 0, so structured extraction must fail with `decode_failures == 1`.
+    let page_vs_form_mcid0 = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 9 0 R /MarkInfo << /Marked true >> >>"
+            .to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 180 100] /Resources << /Font << /F1 5 0 R >> /XObject << /Fm 11 0 R >> >> /Contents 4 0 R >>".to_vec(),
+        stream(
+            "",
+            b"0 0 0 rg /Span << /MCID 0 >> BDC BT /F1 24 Tf 15 40 Td <0001> Tj ET EMC /Fm Do",
+        ),
+        b"<< /Type /Font /Subtype /Type0 /BaseFont /ABCDEF+TaggedUnmappedCID /Encoding /Identity-H /DescendantFonts [6 0 R] >>".to_vec(),
+        b"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /ABCDEF+TaggedUnmappedCID \
+          /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> \
+          /FontDescriptor 7 0 R /DW 1000 >>"
+            .to_vec(),
+        b"<< /Type /FontDescriptor /FontName /ABCDEF+TaggedUnmappedCID /Flags 32 /FontFile2 8 0 R >>"
+            .to_vec(),
+        stream("", b"corrupt tagged cid font"),
+        b"<< /Type /StructTreeRoot /K [10 0 R] >>".to_vec(),
+        b"<< /Type /StructElem /S /Span /Pg 3 0 R /ActualText (PageLabel) /K 0 >>".to_vec(),
+        stream(
+            "/Type /XObject /Subtype /Form /BBox [0 0 180 100] /Resources << /Font << /F1 5 0 R >> >>",
+            b"0 0 0 rg /Span << /MCID 0 >> BDC BT /F1 24 Tf 60 40 Td <0002> Tj ET EMC",
+        ),
+    ]);
+    let doc_pvf = PdfDocument::open(page_vs_form_mcid0)
+        .unwrap()
+        .with_font_provider(Arc::new(FontProvider::memory_only()));
+    let conv_pvf = zpdf::convert_pdf(
+        &doc_pvf,
+        &[0],
+        zpdf::ConversionOptions {
+            mode: zpdf::ConversionMode::TextOnly,
+            use_structure: true,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        conv_pvf.pages[0].diagnostics.decode_failures, 1,
+        "Form MCID 0 must not inherit page MCID 0's /ActualText"
+    );
+    assert!(!conv_pvf.is_complete());
+    assert!(conv_pvf.ensure_complete().is_err());
+
+    // 4. Conversely, an `/MCR` referencing the Form stream `/Stm 11 0 R /MCID 0`
+    //    under `/ActualText (FormLabel)` covers ONLY the Form's MCID 0 (succeeding
+    //    when the page has no uncovered fallback text, and still rejecting an
+    //    undecodable fallback CID in the page's own MCID 0).
+    let form_stm_covered = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 9 0 R /MarkInfo << /Marked true >> >>"
+            .to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 180 100] /Resources << /XObject << /Fm 11 0 R >> >> /Contents 4 0 R >>".to_vec(),
+        stream("", b"/Fm Do"),
+        b"<< /Type /Font /Subtype /Type0 /BaseFont /ABCDEF+TaggedUnmappedCID /Encoding /Identity-H /DescendantFonts [6 0 R] >>".to_vec(),
+        b"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /ABCDEF+TaggedUnmappedCID \
+          /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> \
+          /FontDescriptor 7 0 R /DW 1000 >>"
+            .to_vec(),
+        b"<< /Type /FontDescriptor /FontName /ABCDEF+TaggedUnmappedCID /Flags 32 /FontFile2 8 0 R >>"
+            .to_vec(),
+        stream("", b"corrupt tagged cid font"),
+        b"<< /Type /StructTreeRoot /K [10 0 R] >>".to_vec(),
+        b"<< /Type /StructElem /S /Span /Pg 3 0 R /ActualText (FormLabel) /K << /Type /MCR /Pg 3 0 R /Stm 11 0 R /MCID 0 >> >>".to_vec(),
+        stream(
+            "/Type /XObject /Subtype /Form /BBox [0 0 180 100] /Resources << /Font << /F1 5 0 R >> >>",
+            b"0 0 0 rg /Span << /MCID 0 >> BDC BT /F1 24 Tf 60 40 Td <0002> Tj ET EMC",
+        ),
+    ]);
+    let doc_fsc = PdfDocument::open(form_stm_covered)
+        .unwrap()
+        .with_font_provider(Arc::new(FontProvider::memory_only()));
+    let conv_fsc = zpdf::convert_pdf(
+        &doc_fsc,
+        &[0],
+        zpdf::ConversionOptions {
+            mode: zpdf::ConversionMode::TextOnly,
+            use_structure: true,
+        },
+    )
+    .unwrap();
+    assert_eq!(conv_fsc.pages[0].text.trim(), "FormLabel");
+    assert_eq!(conv_fsc.pages[0].diagnostics.decode_failures, 0);
+    assert!(conv_fsc.is_complete());
+
+    let form_stm_vs_page_mcid0 = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 9 0 R /MarkInfo << /Marked true >> >>"
+            .to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 180 100] /Resources << /Font << /F1 5 0 R >> /XObject << /Fm 11 0 R >> >> /Contents 4 0 R >>".to_vec(),
+        stream(
+            "",
+            b"0 0 0 rg /Span << /MCID 0 >> BDC BT /F1 24 Tf 15 40 Td <0001> Tj ET EMC /Fm Do",
+        ),
+        b"<< /Type /Font /Subtype /Type0 /BaseFont /ABCDEF+TaggedUnmappedCID /Encoding /Identity-H /DescendantFonts [6 0 R] >>".to_vec(),
+        b"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /ABCDEF+TaggedUnmappedCID \
+          /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> \
+          /FontDescriptor 7 0 R /DW 1000 >>"
+            .to_vec(),
+        b"<< /Type /FontDescriptor /FontName /ABCDEF+TaggedUnmappedCID /Flags 32 /FontFile2 8 0 R >>"
+            .to_vec(),
+        stream("", b"corrupt tagged cid font"),
+        b"<< /Type /StructTreeRoot /K [10 0 R] >>".to_vec(),
+        b"<< /Type /StructElem /S /Span /Pg 3 0 R /ActualText (FormLabel) /K << /Type /MCR /Pg 3 0 R /Stm 11 0 R /MCID 0 >> >>".to_vec(),
+        stream(
+            "/Type /XObject /Subtype /Form /BBox [0 0 180 100] /Resources << /Font << /F1 5 0 R >> >>",
+            b"0 0 0 rg /Span << /MCID 0 >> BDC BT /F1 24 Tf 60 40 Td <0002> Tj ET EMC",
+        ),
+    ]);
+    let doc_fvp = PdfDocument::open(form_stm_vs_page_mcid0)
+        .unwrap()
+        .with_font_provider(Arc::new(FontProvider::memory_only()));
+    let conv_fvp = zpdf::convert_pdf(
+        &doc_fvp,
+        &[0],
+        zpdf::ConversionOptions {
+            mode: zpdf::ConversionMode::TextOnly,
+            use_structure: true,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        conv_fvp.pages[0].diagnostics.decode_failures, 1,
+        "Form /MCR /Stm MCID 0 must not excuse Page MCID 0"
+    );
+    assert!(!conv_fvp.is_complete());
 }

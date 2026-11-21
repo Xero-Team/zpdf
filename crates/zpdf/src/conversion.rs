@@ -12,7 +12,7 @@ use zpdf_content::interpreter::ContentInterpreter;
 use zpdf_content::output_intent_cmyk_profile;
 use zpdf_core::{Matrix, Result};
 use zpdf_display_list::RenderCommand;
-use zpdf_document::{DocInfo, PdfDocument, StructTree, XmpMetadata};
+use zpdf_document::{DocInfo, PdfDocument, XmpMetadata};
 use zpdf_image::{DecodedImage, ImageCache};
 
 /// Content retained by [`convert_pdf`].
@@ -114,10 +114,13 @@ pub fn convert_pdf(
     options: ConversionOptions,
 ) -> Result<ConvertedDocument> {
     let rich = options.mode == ConversionMode::Rich;
-    let struct_tree: Option<StructTree> = if options.use_structure {
-        doc.struct_tree()
+    let (struct_tree, struct_actual_text_mcids) = if options.use_structure {
+        match doc.struct_tree_with_actual_text() {
+            Some((tree, mcids)) => (Some(tree), mcids),
+            None => (None, HashMap::new()),
+        }
     } else {
-        None
+        (None, HashMap::new())
     };
     let page_labels = rich.then(|| doc.page_labels()).flatten();
     let oc_config = doc.oc_config();
@@ -170,8 +173,8 @@ pub fn convert_pdf(
         if let Some(oc) = &oc_config {
             interpreter = interpreter.with_optional_content(oc);
         }
-        if let Some(tree) = &struct_tree {
-            interpreter = interpreter.with_struct_actual_text(page_index, tree);
+        if let Some(mcids) = struct_actual_text_mcids.get(&page_index) {
+            interpreter = interpreter.with_struct_actual_text_mcids(mcids.clone());
         }
         if let Some(profile) = output_intent {
             interpreter = interpreter.with_output_intent_cmyk(profile);

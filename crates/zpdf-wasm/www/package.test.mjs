@@ -249,6 +249,43 @@ test("packaged reader recovers corrupt embedded font with a substitute and rejec
       /incomplete output.*decode_failures=1.*embedded_font_fallbacks=1/,
     );
   } finally { taggedUncovered.free(); }
+
+  // Page MCID 0 carries /ActualText while a Form invoked outside it uses its
+  // own MCID 0 for an undecodable CID: page_text(0) must reject it.
+  {
+    const pageStream = "0 0 0 rg /Span << /MCID 0 >> BDC BT /F1 24 Tf 15 40 Td <0001> Tj ET EMC /Fm Do";
+    const formStream = "0 0 0 rg /Span << /MCID 0 >> BDC BT /F1 24 Tf 60 40 Td <0002> Tj ET EMC";
+    const objs = [
+      "<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 9 0 R /MarkInfo << /Marked true >> >>",
+      "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+      "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 180 100] /Resources << /Font << /F1 5 0 R >> /XObject << /Fm 11 0 R >> >> /Contents 4 0 R >>",
+      `<< /Length ${pageStream.length} >>\nstream\n${pageStream}\nendstream`,
+      "<< /Type /Font /Subtype /Type0 /BaseFont /ABCDEF+TaggedCID /Encoding /Identity-H /DescendantFonts [6 0 R] >>",
+      "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /ABCDEF+TaggedCID /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor 7 0 R /DW 1000 >>",
+      "<< /Type /FontDescriptor /FontName /ABCDEF+TaggedCID /Flags 32 /FontFile2 8 0 R >>",
+      `<< /Length ${corruptFont.length} >>\nstream\n${corruptFont}\nendstream`,
+      "<< /Type /StructTreeRoot /K [10 0 R] >>",
+      "<< /Type /StructElem /S /Span /Pg 3 0 R /ActualText (PageLabel) /K 0 >>",
+      `<< /Type /XObject /Subtype /Form /BBox [0 0 180 100] /Resources << /Font << /F1 5 0 R >> >> /Length ${formStream.length} >>\nstream\n${formStream}\nendstream`,
+    ];
+    let raw = "%PDF-1.7\n";
+    const offs = [];
+    for (const [i, body] of objs.entries()) {
+      offs.push(Buffer.byteLength(raw));
+      raw += `${i + 1} 0 obj\n${body}\nendobj\n`;
+    }
+    const xrefOff = Buffer.byteLength(raw);
+    raw += `xref\n0 ${objs.length + 1}\n0000000000 65535 f \n`;
+    for (const off of offs) raw += `${String(off).padStart(10, "0")} 00000 n \n`;
+    raw += `trailer\n<< /Size ${objs.length + 1} /Root 1 0 R >>\nstartxref\n${xrefOff}\n%%EOF\n`;
+    const formMismatch = bindings.Pdf.open(Buffer.from(raw));
+    try {
+      assert.throws(
+        () => formMismatch.page_text(0),
+        /incomplete output.*decode_failures=1.*embedded_font_fallbacks=1/,
+      );
+    } finally { formMismatch.free(); }
+  }
 });
 
 test("packaged editor saves Unicode, page edits, extraction and optimization", () => {
