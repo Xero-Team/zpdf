@@ -724,9 +724,24 @@ fn decode_generic(
     p: &GenericParams,
     budget: usize,
 ) -> Result<Bitmap> {
-    // Without TPGDON every pixel costs one iteration, so a region larger than
-    // the budget is bound to fail; fail before allocating it.
-    if !p.tpgdon && width.saturating_mul(height) > budget {
+    decode_generic_with_skip(mq, cx, width, height, p, None, budget)
+}
+
+/// Generic region decoder with an optional `SKIP` bitmap (T.88 6.2.5.7 step
+/// 3a / Annex C.5 Table C.4). Pixels where `skip` is non-zero stay 0 without
+/// consuming an MQ decision.
+fn decode_generic_with_skip(
+    mq: &mut MqDecoder,
+    cx: &mut [u8],
+    width: usize,
+    height: usize,
+    p: &GenericParams,
+    skip: Option<&Bitmap>,
+    budget: usize,
+) -> Result<Bitmap> {
+    // Without TPGDON or SKIP every pixel costs one iteration, so a region
+    // larger than the budget is bound to fail; fail before allocating it.
+    if !p.tpgdon && skip.is_none() && width.saturating_mul(height) > budget {
         return Err(err("generic region MQ decode exceeded iteration budget"));
     }
     let mut bm = Bitmap::new(width, height, 0)?;
@@ -753,6 +768,9 @@ fn decode_generic(
             }
         }
         for x in 0..width {
+            if skip.is_some_and(|s| s.get(x as i64, y as i64) != 0) {
+                continue;
+            }
             iterations += 1;
             if iterations > budget {
                 return Err(err("generic region MQ decode exceeded iteration budget"));
@@ -1646,6 +1664,10 @@ fn read_symbol_id_huff_table(br: &mut BitReader, n_syms: usize) -> Result<HuffTa
         }
     }
 
+    // T.88 7.4.3.1.7 step 6: skip remaining padding bits so the text region
+    // data begins on a byte boundary.
+    br.byte_align();
+
     let lines: Vec<HuffLine> = code_lengths
         .iter()
         .enumerate()
@@ -2183,11 +2205,16 @@ impl<'a> Decoder<'a> {
             at[1] = (r.i8()?, r.i8()?);
         }
 
-        // Locate the reference: a referred region segment, else the page.
-        let refr: Bitmap =
+        // Locate the reference: a referred region segment (with its page offset
+        // delta per T.88 7.4.7.5 step 4), else the page area at (info.x, info.y).
+        let (refr, ref_dx, ref_dy): (Bitmap, i32, i32) =
             if let Some(num) = h.referred.iter().find(|n| self.regions.contains_key(n)) {
-                let (_rinfo, rbm) = &self.regions[num];
-                rbm.clone()
+                let (rinfo, rbm) = &self.regions[num];
+                let dx = i32::try_from(rinfo.x as i64 - info.x as i64)
+                    .map_err(|_| err("refinement reference x offset overflow"))?;
+                let dy = i32::try_from(rinfo.y as i64 - info.y as i64)
+                    .map_err(|_| err("refinement reference y offset overflow"))?;
+                (rbm.clone(), dx, dy)
             } else {
                 let page = self
                     .page
@@ -2202,7 +2229,7 @@ impl<'a> Decoder<'a> {
                         }
                     }
                 }
-                refr
+                (refr, 0, 0)
             };
 
         let payload = r.rest();
@@ -2219,8 +2246,8 @@ impl<'a> Decoder<'a> {
                 template,
                 tpgron,
                 at,
-                dx: 0,
-                dy: 0,
+                dx: ref_dx,
+                dy: ref_dy,
             },
             budget,
         )?;
@@ -2355,7 +2382,9 @@ impl<'a> Decoder<'a> {
         };
 
         let total_input_plus_new = input.len() + num_new;
-        let sym_code_len = ceil_log2(total_input_plus_new.max(1)).max(1);
+        // T.88 6.5.8.2.3 / A.3: arithmetic IAID uses ceil(log2(n)) bits (0 when
+        // there is a single symbol); only Huffman coding clamps to >= 1.
+        let sym_code_len = ceil_log2(total_input_plus_new.max(1));
 
         // Plausibility check for arithmetic symbol dictionaries: similar to pattern
         // dicts, reject when declared symbol count vastly exceeds the payload size.
@@ -2674,37 +2703,42 @@ impl<'a> Decoder<'a> {
             if totwidth <= 0 {
                 continue;
             }
-            // BMSIZE: 0 → MMR collective bitmap consuming the remainder of the
-            // height class; >0 → exactly that many bytes (T.88 6.5.9).
+            // BMSIZE (T.88 6.5.9): 0 → uncompressed byte-aligned rows of
+            // `ch * ceil(cw / 8)` bytes; >0 → MMR-coded in `bmsize` bytes.
             let bmsize = bmsize_tab
                 .table()
                 .decode(&mut br)
                 .ok_or_else(|| err("unexpected OOB in Huffman BMSIZE"))?;
+            let bmsize =
+                usize::try_from(bmsize).map_err(|_| err("negative or invalid Huffman BMSIZE"))?;
             br.byte_align();
             let cw = totwidth as usize;
             let ch = hc_height as usize;
             let start = br.byte_pos();
-            let mmr_data = if bmsize == 0 {
-                &payload[start.min(payload.len())..]
+            let (collective, consumed) = if bmsize == 0 {
+                let raw_len = cw
+                    .div_ceil(8)
+                    .checked_mul(ch)
+                    .ok_or_else(|| err("collective bitmap size overflow"))?;
+                let end = start
+                    .checked_add(raw_len)
+                    .filter(|&e| e <= payload.len())
+                    .ok_or_else(|| err("truncated uncompressed collective bitmap"))?;
+                (unpack_rows(&payload[start..end], cw, ch)?, raw_len)
             } else {
-                let end = start.saturating_add(bmsize as usize).min(payload.len());
-                &payload[start.min(payload.len())..end]
+                let end = start.saturating_add(bmsize).min(payload.len());
+                let mmr_data = &payload[start.min(payload.len())..end];
+                let params = crate::ccitt::CcittParams {
+                    k: -1,
+                    columns: cw.max(1),
+                    rows: ch,
+                    black_is_1: true,
+                    byte_align: false,
+                };
+                let packed = crate::ccitt::decode(mmr_data, &params, self.budget)?;
+                (unpack_rows(&packed, cw, ch)?, bmsize)
             };
-            let params = crate::ccitt::CcittParams {
-                k: -1,
-                columns: cw.max(1),
-                rows: ch,
-                black_is_1: true,
-                byte_align: false,
-            };
-            let packed = crate::ccitt::decode(mmr_data, &params, self.budget)?;
-            let collective = unpack_rows(&packed, cw, ch)?;
-            let consumed = if bmsize == 0 {
-                payload.len().saturating_sub(start)
-            } else {
-                bmsize as usize
-            };
-            br.pos = (start + consumed) * 8;
+            br.pos = start.saturating_add(consumed).saturating_mul(8);
             let mut x0 = 0usize;
             for &w in &widths {
                 let mut sym = Bitmap::new(w, ch, 0)?;
@@ -2806,8 +2840,9 @@ impl<'a> Decoder<'a> {
             return Err(err("text region refers to no usable symbols"));
         }
         // The import admission check also bounds the IAID context allocation.
-        // T.88 (as amended) and shipping encoders use max(1, ceil(log2 n)).
-        let sym_code_len = ceil_log2(symbols.len()).max(1);
+        // T.88 7.4.3.1 / A.3: arithmetic IAID uses ceil(log2(SBNUMSYMS)) bits
+        // (0 bits when SBNUMSYMS == 1, returning symbol 0 without reading MQ).
+        let sym_code_len = ceil_log2(symbols.len());
 
         let geom = TextRegionGeom {
             log_strips,
@@ -2958,6 +2993,13 @@ impl<'a> Decoder<'a> {
         let mut bm = Bitmap::new(info.width, info.height, geom.def_pixel)?;
         self.pixels.cover(bm.data.len());
         let strips = geom.strips;
+        // T.88 6.4.11: refinement arithmetic contexts persist across all
+        // refined instances in the same Huffman text region.
+        let mut cx_gr = if geom.sb_refine {
+            vec![0u8; 1 << 13]
+        } else {
+            Vec::new()
+        };
 
         let mut stript = -dt_tab
             .table()
@@ -3025,10 +3067,12 @@ impl<'a> Decoder<'a> {
                             .table()
                             .decode(&mut br)
                             .ok_or_else(|| err("unexpected OOB in Huffman RDY"))?;
-                        let _rsize = rsize_tab
+                        let rsize = rsize_tab
                             .table()
                             .decode(&mut br)
                             .ok_or_else(|| err("unexpected OOB in Huffman RSIZE"))?;
+                        let rsize = usize::try_from(rsize)
+                            .map_err(|_| err("negative or invalid Huffman RSIZE"))?;
                         br.byte_align();
                         let nw = sym.width as i64 + rdw;
                         let nh = sym.height as i64 + rdh;
@@ -3043,13 +3087,17 @@ impl<'a> Decoder<'a> {
                             .check(nw as usize, nh as usize, "refined symbol")?;
                         let dx = (rdw >> 1) + rdx;
                         let dy = (rdh >> 1) + rdy;
-                        let refine_payload = &payload[br.byte_pos().min(payload.len())..];
+                        let start = br.byte_pos();
+                        let end = start
+                            .checked_add(rsize)
+                            .filter(|&e| e <= payload.len())
+                            .ok_or_else(|| err("truncated Huffman refinement payload"))?;
+                        let refine_payload = &payload[start..end];
                         let refine_budget = mq_iteration_budget(refine_payload.len());
                         let mut mq = MqDecoder::new(refine_payload, refine_budget);
-                        let mut cx = vec![0u8; 1 << 13];
                         let refined = decode_refinement(
                             &mut mq,
-                            &mut cx,
+                            &mut cx_gr,
                             nw as usize,
                             nh as usize,
                             &sym,
@@ -3063,7 +3111,7 @@ impl<'a> Decoder<'a> {
                             refine_budget,
                         )?;
                         // Advance past the refinement MQ data using RSIZE.
-                        br.pos = (br.byte_pos() + _rsize.max(0) as usize) * 8;
+                        br.pos = end.saturating_mul(8);
                         Some(refined)
                     } else {
                         None
@@ -3304,7 +3352,7 @@ impl<'a> Decoder<'a> {
         let mmr_data = payload;
         for j in (0..hbpp).rev() {
             let plane = if let Some(mqd) = mq.as_mut() {
-                decode_generic(
+                decode_generic_with_skip(
                     mqd,
                     &mut cx,
                     hgw,
@@ -3314,6 +3362,7 @@ impl<'a> Decoder<'a> {
                         tpgdon: false,
                         at,
                     },
+                    skip.as_ref(),
                     budget,
                 )?
             } else {
@@ -3941,7 +3990,7 @@ mod tests {
         p.extend_from_slice(&(1u16 << 4).to_be_bytes()); // flags: REFCORNER = TOPLEFT
         p.extend_from_slice(&(placements.len() as u32).to_be_bytes());
 
-        let code_len = ceil_log2(num_syms).max(1);
+        let code_len = ceil_log2(num_syms);
         let mut enc = MqEncoder::new();
         let mut iadt = vec![0u8; INT_CTX_SIZE];
         let mut iafs = vec![0u8; INT_CTX_SIZE];
@@ -4984,7 +5033,7 @@ mod tests {
         // SBRTEMPLATE = 1 → no refinement AT pixels in the header.
         p.extend_from_slice(&1u32.to_be_bytes()); // SBNUMINSTANCES
 
-        let code_len = ceil_log2(1).max(1);
+        let code_len = ceil_log2(1);
         let mut enc = MqEncoder::new();
         let mut iadt = vec![0u8; INT_CTX_SIZE];
         let mut iafs = vec![0u8; INT_CTX_SIZE];

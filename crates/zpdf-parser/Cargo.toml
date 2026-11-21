@@ -35,3 +35,8 @@ flate2.workspace = true
 # in tests as an independent, spec-conformant reference encoder so the LZW
 # decoder is validated against an external producer, not its own paired encoder.
 weezl = "0.2"
+# Pure-Rust JBIG2 decoder (Apache-2.0 OR MIT, #![forbid(unsafe_code)]) from
+# the hayro PDF renderer family. Used ONLY in tests as an independent
+# differential oracle so zpdf retains its ParseLimits budgets and per-region
+# failure isolation while catching decoding divergences early (#173).
+hayro-jbig2 = { version = "0.4", default-features = false }

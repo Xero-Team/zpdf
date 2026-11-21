@@ -18,6 +18,23 @@
   128 rather than 127), and round CPU clip and soft-mask products and Type 3
   image-mask tints to avoid darkening colours and eroding mask edges. (#183)
 
+### Testing and JBIG2 decoding
+
+- Add `hayro-jbig2` (pure Rust, `default-features = false`) as a test-only
+  dev-dependency and differential oracle suite (`zpdf-parser/tests/jbig2_oracle.rs`)
+  covering generic/MMR/refinement/text/halftone regions, symbol/pattern
+  dictionaries, `/JBIG2Globals`, checked-in corpus/fuzz seeds, `ParseLimits`
+  budgets, and per-region fault isolation. (#173)
+- Fix six ITU-T T.88 JBIG2 decoding bugs uncovered by the differential oracle:
+  byte-align after Huffman text-region symbol-ID tables (§7.4.3.1.7), skip MQ
+  decoding on `HSKIP` cells in halftone bitplanes (Annex C.5), use
+  `ceil(log2(SBNUMSYMS))` (`0` for 1-symbol dictionaries) for arithmetic `IAID`
+  (§7.4.3.1 / Annex A.3), decode `BMSIZE == 0` Huffman symbol-dictionary
+  collective bitmaps as uncompressed rows (§6.5.9), apply referred intermediate
+  region origin offsets in refinement regions (§7.4.7.5), and slice Huffman
+  text-region refinement payloads to `RSIZE` while reusing refinement contexts
+  across instances (§6.4.11). (#173)
+
 ## 0.21.0 — Glyph-level selection and rendering compatibility
 
 Released 2026-11-21.

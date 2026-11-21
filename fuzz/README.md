@@ -82,7 +82,7 @@ These are hand-written minimal PDFs, token streams, and filter payloads that giv
 - `seeds/object_parser/` — minimal indirect objects (catalog, stream, ref body)
 - `seeds/lexer/` — token-shaped snippets (dict, string, numbers)
 - `seeds/content_tokenizer/` — content-stream operators + inline image
-- `seeds/filters/` — config-header + payload for ASCIIHex / ASCII85 / RunLength / Flate-with-predictor
+- `seeds/filters/` — config-header + payload for ASCIIHex / ASCII85 / RunLength / Flate-with-predictor / JBIG2
 
 ## Windows (MSVC) limitation
 
