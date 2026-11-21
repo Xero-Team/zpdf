@@ -1065,15 +1065,26 @@ impl LoadedFont {
 
     /// Whether `glyph_id` resolves in this embedded font to a physical glyph
     /// whose outline record is corrupt/unreadable (including damaged
+    /// zero-contour `glyf` records), charging any blank-record `cmap` scan
+    /// against `cmap_budget`.
+    #[doc(hidden)]
+    pub fn is_embedded_glyph_unreadable_with_budget(
+        &self,
+        glyph_id: u16,
+        cmap_budget: &mut usize,
+    ) -> bool {
+        let mut unreadable = false;
+        self.classify_embedded_glyphs_unreadable(&[glyph_id], cmap_budget, |_, u| unreadable = u);
+        unreadable
+    }
+
+    /// Whether `glyph_id` resolves in this embedded font to a physical glyph
+    /// whose outline record is corrupt/unreadable (including damaged
     /// zero-contour `glyf` records).
     #[doc(hidden)]
     pub fn is_embedded_glyph_unreadable(&self, glyph_id: u16) -> bool {
-        let mut unreadable = false;
         let mut cmap_budget = resolution::CMAP_PROBE_BUDGET;
-        self.classify_embedded_glyphs_unreadable(&[glyph_id], &mut cmap_budget, |_, u| {
-            unreadable = u
-        });
-        unreadable
+        self.is_embedded_glyph_unreadable_with_budget(glyph_id, &mut cmap_budget)
     }
 
     /// Get glyph advance width.
@@ -1116,6 +1127,50 @@ impl LoadedFont {
             PdfFontType::Type0CidType2 => 1000.0,
             PdfFontType::Type3 { .. } => self.units_per_em,
             _ => self.units_per_em,
+        }
+    }
+
+    /// Effective glyph name for a 1-byte simple-font character code, following
+    /// the same PDF `/Encoding` → Type 1 built-in `/Encoding` precedence as
+    /// [`Self::code_to_gid`].
+    pub(crate) fn simple_glyph_name(&self, code: u8) -> Option<&str> {
+        if let Some(t1) = &self.type1 {
+            if let Some(enc) = &self.encoding {
+                if let Some(name) = enc.glyph_name(code) {
+                    if t1.gid_for_name(name).is_some()
+                        || glyph_list::glyph_name_to_char(name).is_some()
+                    {
+                        return Some(name);
+                    }
+                }
+            }
+            if let Some(name) = t1.builtin_name(code) {
+                return Some(name);
+            }
+        }
+        self.encoding.as_ref().and_then(|enc| enc.glyph_name(code))
+    }
+
+    /// Copy an embedded Type 1 font's effective code → glyph-name mapping
+    /// (PDF `/Encoding` overlaid onto the Type 1 program's built-in `/Encoding`)
+    /// onto a substitute face that carries no `Type1Font` program.
+    #[doc(hidden)]
+    pub fn inherit_type1_encoding_from(&mut self, primary: &LoadedFont) {
+        if primary.type1.is_none() {
+            return;
+        }
+        let mut merged = encoding::Encoding::empty();
+        let mut any = false;
+        for code in 0u8..=255 {
+            if let Some(name) = primary.simple_glyph_name(code) {
+                if name != ".notdef" {
+                    merged.apply_difference(code, name);
+                    any = true;
+                }
+            }
+        }
+        if any {
+            self.encoding = Some(merged);
         }
     }
 
@@ -1193,22 +1248,32 @@ impl LoadedFont {
         }
 
         // 3. Built-in cmap subtables — common for symbolic embedded fonts.
+        //    When a substitute carries an explicit encoding (including a Type 1
+        //    program's built-in encoding), never fall through to raw-byte
+        //    MacRoman/PUA/Latin-1 slots that could map a remapped byte (e.g.
+        //    65 -> `/B`) onto an unrelated glyph (`/A`).
+        let substitute_has_explicit_encoding = self.is_substitute && self.encoding.is_some();
         if let Some(cmap) = face.tables().cmap {
             // (3,0) Windows Symbol: try the 0xF000 PUA offset then the raw code.
-            for st in cmap.subtables {
-                if st.platform_id == ttf_parser::PlatformId::Windows && st.encoding_id == 0 {
-                    if let Some(g) = st
-                        .glyph_index(0xF000 | code as u32)
-                        .or_else(|| st.glyph_index(code as u32))
-                    {
-                        return Some(g.0);
+            let allow_symbol_subtable = !substitute_has_explicit_encoding
+                || self.encoding.as_ref().and_then(|e| e.glyph_name(code8))
+                    == encoding::SYMBOL_ENCODING[code8 as usize];
+            if allow_symbol_subtable {
+                for st in cmap.subtables {
+                    if st.platform_id == ttf_parser::PlatformId::Windows && st.encoding_id == 0 {
+                        if let Some(g) = st
+                            .glyph_index(0xF000 | code as u32)
+                            .or_else(|| st.glyph_index(code as u32))
+                        {
+                            return Some(g.0);
+                        }
                     }
                 }
             }
             // (3,1) Windows Unicode at the 0xF000 PUA offset: symbolic fonts
             // often park their glyphs in the PUA but ship only a Unicode
             // subtable (the raw code is retried as Latin-1 in step 4).
-            if self.symbolic {
+            if self.symbolic && !substitute_has_explicit_encoding {
                 for st in cmap.subtables {
                     if st.platform_id == ttf_parser::PlatformId::Windows && st.encoding_id == 1 {
                         if let Some(g) = st.glyph_index(0xF000 | code as u32) {
@@ -1231,7 +1296,9 @@ impl LoadedFont {
                             return Some(g.0);
                         }
                     }
-                    if self.encoding.is_none() || self.symbolic {
+                    if !substitute_has_explicit_encoding
+                        && (self.encoding.is_none() || self.symbolic)
+                    {
                         if let Some(g) = st.glyph_index(code as u32) {
                             return Some(g.0);
                         }
@@ -1249,7 +1316,7 @@ impl LoadedFont {
 
         // 4. Only an unspecified encoding permits the Latin-1 fallback. A
         // declared missing glyph must not turn into a different encoded letter.
-        if self.encoding.is_some() && !self.symbolic {
+        if self.encoding.is_some() && (!self.symbolic || self.is_substitute) {
             return None;
         }
         if let Some(g) = face.glyph_index(code8 as char) {
@@ -2327,9 +2394,33 @@ pub struct FontCacheBudget {
     bytes: u64,
     fonts: HashSet<usize>,
     programs: HashSet<usize>,
+    specs: HashSet<usize>,
 }
 
 impl FontCacheBudget {
+    /// Account for any extra lookup-name bytes retained by `spec` once per
+    /// unique `Arc` (deduplicated across resource aliases).
+    pub fn try_admit_descriptor_spec(
+        &mut self,
+        spec: &Arc<DescriptorSubstituteSpec>,
+        max_bytes: u64,
+    ) -> bool {
+        let extra = spec.extra_bytes();
+        if extra == 0 {
+            return true;
+        }
+        let key = Arc::as_ptr(spec) as usize;
+        if self.specs.contains(&key) {
+            return true;
+        }
+        let Some(total) = self.bytes.checked_add(extra).filter(|&t| t <= max_bytes) else {
+            return false;
+        };
+        self.specs.insert(key);
+        self.bytes = total;
+        true
+    }
+
     fn admission_total(&self, font: &Arc<LoadedFont>, max_bytes: u64) -> Option<u64> {
         let mut added = 0u64;
         if !self.fonts.contains(&(Arc::as_ptr(font) as usize)) {
@@ -2430,12 +2521,38 @@ pub enum EmbeddedOutlineProbe {
 #[doc(hidden)]
 #[derive(Debug, Clone)]
 pub struct DescriptorSubstituteSpec {
-    pub lookup_name: String,
+    /// Override font name from `/FontDescriptor /FontName` only when it differs
+    /// from `primary.base_font` (e.g. when `/BaseFont` was absent). Shared via
+    /// `Arc<DescriptorSubstituteSpec>` across aliases and pages and charged
+    /// once in [`FontCacheBudget`].
+    pub lookup_name: Option<Arc<str>>,
     pub hints: system::SubstituteHints,
-    pub ordering: Option<String>,
+    /// Recognized CJK CID ordering (`"GB1"`, `"CNS1"`, `"Japan1"`, `"Korea1"`,
+    /// `"KR"`), never retaining arbitrary unbounded PDF strings.
+    pub ordering: Option<&'static str>,
     /// Object ID of the embedded `/FontFile*` stream for lazy fallback
     /// diagnostics when an unreadable shown glyph triggers fallback.
     pub font_file_id: Option<zpdf_core::ObjectId>,
+}
+
+impl DescriptorSubstituteSpec {
+    pub(crate) fn extra_bytes(&self) -> u64 {
+        self.lookup_name
+            .as_ref()
+            .map_or(0, |name| name.len() as u64)
+    }
+
+    /// Copy without the optional `lookup_name` override so zero-byte descriptor
+    /// metadata (hints, ordering, stream object ID) can still be retained when
+    /// an oversized `/FontDescriptor /FontName` does not fit within budget.
+    pub fn without_lookup_name(&self) -> Self {
+        Self {
+            lookup_name: None,
+            hints: self.hints,
+            ordering: self.ordering,
+            font_file_id: self.font_file_id,
+        }
+    }
 }
 
 /// Direction of a paired fallback companion in [`FontCache`].
@@ -2497,7 +2614,7 @@ pub(crate) struct CompanionEntry {
     pub(crate) source: CompanionSource,
     /// Lightweight descriptor metadata for lazy descriptor-based substitution
     /// of unreadable embedded glyphs without requiring a `PdfFile`.
-    pub(crate) descriptor_spec: Option<Box<DescriptorSubstituteSpec>>,
+    pub(crate) descriptor_spec: Option<Arc<DescriptorSubstituteSpec>>,
     /// Optional in-memory standby copy of the companion face, strictly
     /// charged in `FontCache::standby_bytes` so `bytes_used() <= max_bytes`
     /// always holds, and reclaimed whenever a primary font, Form font, or
@@ -2691,18 +2808,32 @@ impl FontCache {
     /// Record lightweight descriptor metadata for an embedded primary font so
     /// unreadable shown glyphs can lazily resolve a descriptor-based substitute
     /// without retaining uncharged font bytes or needing a `PdfFile`.
+    /// Any optional `lookup_name` override is shared by `Arc` and charged
+    /// against `max_bytes` once per unique spec; if it would exceed `max_bytes`,
+    /// the override is stripped while retaining zero-byte hints/ordering/ID.
     #[doc(hidden)]
-    pub fn record_descriptor_substitute(&mut self, id: FontId, spec: DescriptorSubstituteSpec) {
+    pub fn record_descriptor_substitute(
+        &mut self,
+        id: FontId,
+        spec: Arc<DescriptorSubstituteSpec>,
+        max_bytes: u64,
+    ) {
         if !self.fonts.contains_key(&id) || self.embedded_companions.contains_key(&id) {
             return;
         }
+        let spec = if self.budget.try_admit_descriptor_spec(&spec, max_bytes) {
+            self.reclaim_standby_for(self.budget.bytes_used(), max_bytes);
+            spec
+        } else {
+            Arc::new(spec.without_lookup_name())
+        };
         let font_file_id = spec.font_file_id;
         self.embedded_companions.insert(
             id,
             CompanionEntry {
                 kind: CompanionKind::DescriptorSubstitute { font_file_id },
                 source: CompanionSource::None,
-                descriptor_spec: Some(Box::new(spec)),
+                descriptor_spec: Some(spec),
                 standby: None,
                 admitted: None,
                 failed_budget: None,
@@ -2806,9 +2937,6 @@ impl FontCache {
             return false;
         }
         let remaining = max_bytes.saturating_sub(self.budget.bytes_used());
-        if remaining == 0 {
-            return false;
-        }
         if entry.descriptor_spec.is_some() {
             let current_gen = self.provider.as_ref().map(|p| p.generation());
             if entry.provider_generation != current_gen {
@@ -2817,6 +2945,13 @@ impl FontCache {
             if entry.failed_program_count != self.budget.programs.len() {
                 return true;
             }
+            // A descriptor substitute sharing an already-admitted program with
+            // zero owned mapping bytes can still fit when `remaining == 0`;
+            // let `admission_total` decide unless it already failed here.
+            return !entry.failed_budget.is_some_and(|limit| remaining <= limit);
+        }
+        if remaining == 0 {
+            return false;
         }
         !entry.failed_budget.is_some_and(|limit| remaining <= limit)
     }
@@ -4095,5 +4230,141 @@ mod tests {
         assert_eq!(miss_load_calls, 2);
         assert!(cache_miss.has_retained_embedded_companion(fid_miss));
         assert_eq!(cache_miss.bytes_used(), ample);
+    }
+
+    #[test]
+    fn descriptor_substitute_reuses_glyph_classification_and_run_candidate_across_misses() {
+        let primary_bytes = include_bytes!("../tests/fixtures/coverage-primary.ttf");
+        let bold_bytes = include_bytes!("../tests/fixtures/coverage-bold.ttf");
+        // BOLD_TTF contains only 'A' (not 'B' or 'C').
+        let provider = Arc::new(FontProvider::memory_only());
+        provider
+            .register_with_aliases(bold_bytes.as_slice(), 0, &["ReuseRunCandidate"])
+            .unwrap();
+
+        let mut primary = LoadedFont::new_with_data(
+            PdfFontType::TrueType,
+            "ABCDEF+ReuseRunCandidate".into(),
+            primary_bytes.to_vec(),
+            CidWidths::new(1000.0),
+        );
+        primary.encoding = Some(encoding::Encoding::win_ansi());
+        let gid_a = primary.code_to_gid(b'A' as u16).unwrap();
+        let gid_b = primary.code_to_gid(b'B' as u16).unwrap();
+        let gid_c = primary.code_to_gid(b'C' as u16).unwrap();
+        let primary = Arc::new(primary);
+
+        let mut cache = FontCache::new().with_provider(provider);
+        let max_bytes = 4 * 1024 * 1024;
+        let fid = cache
+            .try_insert_shared_with_limit("F1".into(), primary, max_bytes)
+            .unwrap();
+        cache.record_descriptor_substitute(
+            fid,
+            Arc::new(DescriptorSubstituteSpec {
+                lookup_name: None,
+                hints: system::SubstituteHints::default(),
+                ordering: None,
+                font_file_id: None,
+            }),
+            max_bytes,
+        );
+
+        let mut run_candidate: Option<Arc<LoadedFont>> = None;
+
+        // 1. Passing cached `original_unreadable = Some(false)` short-circuits
+        //    before building or admitting any substitute.
+        assert!(cache
+            .resolve_embedded_companion_glyph_in_run(
+                DrawingGlyph {
+                    font_id: fid,
+                    glyph_id: gid_a,
+                },
+                b'A' as u32,
+                b'A' as u32,
+                1,
+                max_bytes,
+                Some(false),
+                None,
+                Some(&mut run_candidate),
+                |_, _| DeferredCompanionLoad::Unavailable,
+            )
+            .is_none());
+        assert!(run_candidate.is_none());
+        assert!(!cache.has_admitted_embedded_companion(fid));
+
+        // 2. First distinct miss ('B', absent from BOLD_TTF) builds the
+        //    descriptor substitute once into `run_candidate` without admitting.
+        assert!(cache
+            .resolve_embedded_companion_glyph_in_run(
+                DrawingGlyph {
+                    font_id: fid,
+                    glyph_id: gid_b,
+                },
+                b'B' as u32,
+                b'B' as u32,
+                1,
+                max_bytes,
+                Some(true),
+                None,
+                Some(&mut run_candidate),
+                |_, _| DeferredCompanionLoad::Unavailable,
+            )
+            .is_none());
+        assert!(!cache.has_admitted_embedded_companion(fid));
+        let candidate_ptr = Arc::as_ptr(
+            run_candidate
+                .as_ref()
+                .expect("descriptor substitute cached for current run"),
+        );
+
+        // 3. Second distinct miss ('C', also absent from BOLD_TTF) reuses the
+        //    exact same `Arc<LoadedFont>` without rebuilding or admitting.
+        assert!(cache
+            .resolve_embedded_companion_glyph_in_run(
+                DrawingGlyph {
+                    font_id: fid,
+                    glyph_id: gid_c,
+                },
+                b'C' as u32,
+                b'C' as u32,
+                1,
+                max_bytes,
+                Some(true),
+                None,
+                Some(&mut run_candidate),
+                |_, _| DeferredCompanionLoad::Unavailable,
+            )
+            .is_none());
+        assert!(!cache.has_admitted_embedded_companion(fid));
+        assert_eq!(
+            Arc::as_ptr(run_candidate.as_ref().unwrap()),
+            candidate_ptr,
+            "second distinct miss must reuse the same constructed substitute"
+        );
+
+        // 4. First covered glyph ('A') permanently admits that exact candidate.
+        let drawn = cache
+            .resolve_embedded_companion_glyph_in_run(
+                DrawingGlyph {
+                    font_id: fid,
+                    glyph_id: gid_a,
+                },
+                b'A' as u32,
+                b'A' as u32,
+                1,
+                max_bytes,
+                Some(true),
+                None,
+                Some(&mut run_candidate),
+                |_, _| DeferredCompanionLoad::Unavailable,
+            )
+            .expect("covered glyph 'A' must draw from reused substitute");
+        assert!(cache.has_admitted_embedded_companion(fid));
+        assert_eq!(
+            cache.get(drawn.font_id).unwrap() as *const LoadedFont,
+            candidate_ptr,
+            "admitted drawing font must be the reused run candidate"
+        );
     }
 }

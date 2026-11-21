@@ -5039,7 +5039,11 @@ impl<'a> ContentInterpreter<'a> {
                                     Ok(fid) => {
                                         if fc.get(fid).is_some_and(|f| f.has_font_data()) {
                                             if let Some(spec) = descriptor_spec {
-                                                fc.record_descriptor_substitute(fid, spec);
+                                                fc.record_descriptor_substitute(
+                                                    fid,
+                                                    spec,
+                                                    max_font_bytes,
+                                                );
                                             } else if companion.is_some() {
                                                 let source = match form_id {
                                                     Some(id) => {
@@ -6733,6 +6737,12 @@ impl<'a> ContentInterpreter<'a> {
             forms: &self.form_font_overrides,
         };
         let repairs = &mut self.font_repair;
+        let mut fallback_cmap_budget = zpdf_font::CMAP_PROBE_BUDGET;
+        let mut glyph_health = self
+            .embedded_glyph_health
+            .iter_mut()
+            .find(|(id, _)| *id == font_id)
+            .map(|(_, health)| health);
         let cache = self.font_cache.as_deref_mut()?;
         let provider_arc = cache.provider().cloned();
         let provider = provider_arc
@@ -6813,18 +6823,25 @@ impl<'a> ContentInterpreter<'a> {
                         Some(sibling) => sibling,
                         None => {
                             let embedded = if has_companion {
-                                cache.resolve_embedded_companion_glyph_with(
+                                let (original_unreadable, cmap_budget) = if !unreadable_embedded
+                                    || original.glyph_id == 0
+                                {
+                                    (Some(false), None)
+                                } else if let Some(health) = glyph_health.as_deref_mut() {
+                                    (health.get(original.glyph_id), Some(&mut health.cmap_budget))
+                                } else {
+                                    (None, Some(&mut fallback_cmap_budget))
+                                };
+                                cache.resolve_embedded_companion_glyph_in_run(
                                     original,
                                     code,
                                     raw,
                                     length as u8,
                                     max_bytes,
+                                    original_unreadable,
+                                    cmap_budget,
+                                    Some(&mut run_loaded_companion),
                                     |source, remaining| {
-                                        if let Some(cached) = run_loaded_companion.as_ref() {
-                                            return zpdf_font::DeferredCompanionLoad::Loaded(
-                                                std::sync::Arc::clone(cached),
-                                            );
-                                        }
                                         let Some(file) = file else {
                                             return zpdf_font::DeferredCompanionLoad::Unavailable;
                                         };
@@ -6867,8 +6884,6 @@ impl<'a> ContentInterpreter<'a> {
                                         };
                                         match loaded {
                                             Some(comp) => {
-                                                run_loaded_companion =
-                                                    Some(std::sync::Arc::clone(&comp));
                                                 zpdf_font::DeferredCompanionLoad::Loaded(comp)
                                             }
                                             None => {
@@ -7383,7 +7398,7 @@ fn load_font_ref(
         Ok(fid) => {
             if fc.get(fid).is_some_and(|f| f.has_font_data()) {
                 if let Some(spec) = descriptor_spec {
-                    fc.record_descriptor_substitute(fid, spec);
+                    fc.record_descriptor_substitute(fid, spec, max_bytes);
                 } else if companion.is_some() {
                     let _ = fc.record_companion(
                         fid,

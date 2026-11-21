@@ -45,7 +45,7 @@ pub(crate) fn load_page_fonts(
                     Ok(fid) => {
                         if cache.get(fid).is_some_and(|f| f.has_font_data()) {
                             if let Some(spec) = descriptor_spec {
-                                cache.record_descriptor_substitute(fid, spec);
+                                cache.record_descriptor_substitute(fid, spec, max_bytes);
                             } else if companion.is_some() {
                                 let _ = cache.record_companion(
                                     fid,
@@ -164,7 +164,7 @@ pub type LoadedFontFallback = (
     LoadedFont,
     zpdf_core::ProcessingDiagnostics,
     Option<LoadedFont>,
-    Option<zpdf_font::DescriptorSubstituteSpec>,
+    Option<std::sync::Arc<zpdf_font::DescriptorSubstituteSpec>>,
 );
 
 /// Like [`load_single_font_with_diagnostics`], also returning any paired
@@ -264,6 +264,9 @@ pub fn load_single_font_dict_with_fallback(
     }
     if let Some(ref mut comp) = companion {
         attach_text_mappings(file, dict, subtype, companion_to_unicode, comp);
+        if font.is_substitute && comp.type1.is_some() {
+            font.inherit_type1_encoding_from(comp);
+        }
         if comp.is_substitute && comp.cid_to_gid.is_none() {
             comp.build_substitute_cid_to_gid();
         }
@@ -896,7 +899,7 @@ fn load_type0_font(
 
     let mut diagnostics = zpdf_core::ProcessingDiagnostics::default();
     let mut companion: Option<LoadedFont> = None;
-    let mut descriptor_spec: Option<zpdf_font::DescriptorSubstituteSpec> = None;
+    let mut descriptor_spec: Option<std::sync::Arc<zpdf_font::DescriptorSubstituteSpec>> = None;
     let mut font = match font_file {
         EmbeddedFontFile::Present { object_id, data } => {
             let mut font = LoadedFont::new_with_data(
@@ -945,12 +948,16 @@ fn load_type0_font(
                 }
                 zpdf_font::EmbeddedOutlineProbe::PartiallyCorrupt
                 | zpdf_font::EmbeddedOutlineProbe::Healthy => {
-                    descriptor_spec = Some(zpdf_font::DescriptorSubstituteSpec {
-                        lookup_name: lookup_name.to_string(),
-                        hints,
-                        ordering: ordering.clone(),
-                        font_file_id: object_id,
-                    });
+                    descriptor_spec =
+                        Some(std::sync::Arc::new(zpdf_font::DescriptorSubstituteSpec {
+                            lookup_name: (lookup_name != font.base_font)
+                                .then(|| std::sync::Arc::<str>::from(lookup_name)),
+                            hints,
+                            ordering: ordering
+                                .as_deref()
+                                .and_then(zpdf_font::system::canonical_cid_ordering),
+                            font_file_id: object_id,
+                        }));
                     font
                 }
             }
@@ -1091,13 +1098,14 @@ fn load_simple_font(
             match font.probe_embedded_outlines() {
                 zpdf_font::EmbeddedOutlineProbe::Healthy
                 | zpdf_font::EmbeddedOutlineProbe::PartiallyCorrupt => {
-                    let spec = zpdf_font::DescriptorSubstituteSpec {
-                        lookup_name: substitute_font_name(&base_font, descriptor.as_ref())
-                            .to_string(),
+                    let lookup_name = substitute_font_name(&base_font, descriptor.as_ref());
+                    let spec = std::sync::Arc::new(zpdf_font::DescriptorSubstituteSpec {
+                        lookup_name: (lookup_name != font.base_font)
+                            .then(|| std::sync::Arc::<str>::from(lookup_name)),
                         hints: descriptor_hints(file, descriptor.as_ref()),
                         ordering: None,
                         font_file_id: object_id,
-                    };
+                    });
                     Ok((
                         font,
                         zpdf_core::ProcessingDiagnostics::default(),

@@ -82,7 +82,7 @@ pub type SharedFontEntry = (
     Arc<LoadedFont>,
     zpdf_core::ProcessingDiagnostics,
     Option<Arc<LoadedFont>>,
-    Option<zpdf_font::DescriptorSubstituteSpec>,
+    Option<Arc<zpdf_font::DescriptorSubstituteSpec>>,
 );
 
 /// Fonts parsed so far by one document, with the byte total the budget is
@@ -105,8 +105,12 @@ impl SharedFonts {
                 !font.is_substitute && font.has_font_data() && diag.is_empty() && comp.is_none()
             });
             let mut budget = FontCacheBudget::default();
-            self.fonts
-                .retain(|_, (font, _, _, _)| budget.try_admit(font, u64::MAX));
+            self.fonts.retain(|_, (font, _, _, spec)| {
+                budget.try_admit(font, u64::MAX)
+                    && spec
+                        .as_ref()
+                        .is_none_or(|s| budget.try_admit_descriptor_spec(s, u64::MAX))
+            });
             self.budget = budget;
             self.generation = generation;
         }
@@ -120,7 +124,7 @@ impl SharedFonts {
                 Arc::clone(font),
                 *diag,
                 comp.as_ref().map(Arc::clone),
-                desc_spec.clone(),
+                desc_spec.as_ref().map(Arc::clone),
             )
         })
     }
@@ -134,7 +138,7 @@ impl SharedFonts {
         font: LoadedFont,
         diagnostics: zpdf_core::ProcessingDiagnostics,
         embedded_companion: Option<LoadedFont>,
-        descriptor_spec: Option<zpdf_font::DescriptorSubstituteSpec>,
+        descriptor_spec: Option<Arc<zpdf_font::DescriptorSubstituteSpec>>,
         max_bytes: u64,
     ) -> SharedFontEntry {
         if let Some(existing) = self.get(id) {
@@ -142,6 +146,7 @@ impl SharedFonts {
         }
         let font = Arc::new(font);
         let companion = embedded_companion.map(Arc::new);
+        let mut cached_spec = descriptor_spec;
         match &companion {
             Some(comp) => {
                 // Keep shared lookups consistent across renders: only cache a
@@ -149,32 +154,42 @@ impl SharedFonts {
                 // Caching a primary-only entry would cause later renders on
                 // fresh page caches to lose surviving companion glyphs.
                 if self.budget.try_admit_pair(&font, comp, max_bytes) {
+                    if let Some(spec) = &cached_spec {
+                        if !self.budget.try_admit_descriptor_spec(spec, max_bytes) {
+                            cached_spec = Some(Arc::new(spec.without_lookup_name()));
+                        }
+                    }
                     self.fonts.insert(
                         id,
                         (
                             Arc::clone(&font),
                             diagnostics,
                             Some(Arc::clone(comp)),
-                            descriptor_spec.clone(),
+                            cached_spec.as_ref().map(Arc::clone),
                         ),
                     );
                 }
             }
             None => {
                 if self.budget.try_admit(&font, max_bytes) {
+                    if let Some(spec) = &cached_spec {
+                        if !self.budget.try_admit_descriptor_spec(spec, max_bytes) {
+                            cached_spec = Some(Arc::new(spec.without_lookup_name()));
+                        }
+                    }
                     self.fonts.insert(
                         id,
                         (
                             Arc::clone(&font),
                             diagnostics,
                             None,
-                            descriptor_spec.clone(),
+                            cached_spec.as_ref().map(Arc::clone),
                         ),
                     );
                 }
             }
         }
-        (font, diagnostics, companion, descriptor_spec)
+        (font, diagnostics, companion, cached_spec)
     }
 }
 

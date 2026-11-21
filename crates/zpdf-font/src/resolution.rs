@@ -301,11 +301,7 @@ impl LoadedFont {
         } else if matches!(self.font_type, PdfFontType::Type0CidType2) {
             let cmap = self.cid_cmap.as_ref()?;
             cmap.decode_text(code, length)?.font_character()?
-        } else if let Some(name) = self
-            .encoding
-            .as_ref()
-            .and_then(|encoding| encoding.glyph_name(code as u8))
-        {
+        } else if let Some(name) = self.simple_glyph_name(code as u8) {
             FontCharacter::from_text(&crate::glyph_list::glyph_name_to_string(name)?)?
         } else if text.is_none()
             && !self.symbolic
@@ -1244,6 +1240,38 @@ impl FontCache {
         raw_code: u32,
         length: u8,
         max_bytes: u64,
+        load_deferred: impl FnMut(&crate::CompanionSource, u64) -> crate::DeferredCompanionLoad,
+    ) -> Option<DrawingGlyph> {
+        self.resolve_embedded_companion_glyph_in_run(
+            original,
+            code,
+            raw_code,
+            length,
+            max_bytes,
+            None,
+            None,
+            None,
+            load_deferred,
+        )
+    }
+
+    /// Per-show companion resolver that reuses the text show's cached
+    /// embedded-glyph classification (preserving the per-font `cmap` budget)
+    /// and caches a constructed deferred candidate in `run_candidate` across
+    /// multiple distinct glyph misses within one text operation without
+    /// permanently admitting it until it draws a glyph.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn resolve_embedded_companion_glyph_in_run(
+        &mut self,
+        original: DrawingGlyph,
+        code: u32,
+        raw_code: u32,
+        length: u8,
+        max_bytes: u64,
+        original_unreadable: Option<bool>,
+        cmap_budget: Option<&mut usize>,
+        run_candidate: Option<&mut Option<Arc<LoadedFont>>>,
         mut load_deferred: impl FnMut(&crate::CompanionSource, u64) -> crate::DeferredCompanionLoad,
     ) -> Option<DrawingGlyph> {
         if self.embedded_companions.is_empty() {
@@ -1265,9 +1293,20 @@ impl FontCache {
                 }
             }
             crate::CompanionKind::DescriptorSubstitute { .. } => {
-                if original.glyph_id == 0
-                    || !primary.is_embedded_glyph_unreadable(original.glyph_id)
-                {
+                let is_unreadable = match original_unreadable {
+                    Some(known) => known,
+                    None => {
+                        original.glyph_id != 0
+                            && match cmap_budget {
+                                Some(budget) => primary.is_embedded_glyph_unreadable_with_budget(
+                                    original.glyph_id,
+                                    budget,
+                                ),
+                                None => primary.is_embedded_glyph_unreadable(original.glyph_id),
+                            }
+                    }
+                };
+                if !is_unreadable {
                     return None;
                 }
             }
@@ -1298,38 +1337,48 @@ impl FontCache {
                     return None;
                 }
                 if let Some(spec) = entry.descriptor_spec.as_deref() {
-                    if remaining == 0
-                        || (entry.failed_budget.is_some_and(|limit| remaining <= limit)
-                            && entry.failed_program_count == program_count)
-                    {
-                        return None;
-                    }
-                    let primary = self.fonts.get(&original.font_id)?;
-                    match build_descriptor_substitute(primary, spec, self.provider.as_deref()) {
-                        Some(sub) => {
-                            let loaded = Arc::new(sub);
-                            if self.budget.admission_total(&loaded, max_bytes).is_none() {
+                    if let Some(cached) = run_candidate.as_deref().and_then(|slot| slot.as_ref()) {
+                        (Arc::clone(cached), None, false, true)
+                    } else {
+                        // Do not short-circuit on `remaining == 0`: a substitute
+                        // that shares an already-admitted system program with
+                        // zero owned mapping bytes still fits at `max_bytes`.
+                        if entry.failed_budget.is_some_and(|limit| remaining <= limit)
+                            && entry.failed_program_count == program_count
+                        {
+                            return None;
+                        }
+                        let primary = self.fonts.get(&original.font_id)?;
+                        match build_descriptor_substitute(primary, spec, self.provider.as_deref()) {
+                            Some(sub) => {
+                                let loaded = Arc::new(sub);
+                                if self.budget.admission_total(&loaded, max_bytes).is_none() {
+                                    if let Some(entry) =
+                                        self.embedded_companions.get_mut(&original.font_id)
+                                    {
+                                        entry.failed_budget = Some(
+                                            entry
+                                                .failed_budget
+                                                .map_or(remaining, |prev| prev.max(remaining)),
+                                        );
+                                        entry.failed_program_count = program_count;
+                                    }
+                                    return None;
+                                }
+                                if let Some(slot) = run_candidate {
+                                    *slot = Some(Arc::clone(&loaded));
+                                }
+                                (loaded, None, false, true)
+                            }
+                            None => {
                                 if let Some(entry) =
                                     self.embedded_companions.get_mut(&original.font_id)
                                 {
-                                    entry.failed_budget = Some(
-                                        entry
-                                            .failed_budget
-                                            .map_or(remaining, |prev| prev.max(remaining)),
-                                    );
+                                    entry.failed_budget = Some(u64::MAX);
                                     entry.failed_program_count = program_count;
                                 }
                                 return None;
                             }
-                            (loaded, None, false, true)
-                        }
-                        None => {
-                            if let Some(entry) = self.embedded_companions.get_mut(&original.font_id)
-                            {
-                                entry.failed_budget = Some(u64::MAX);
-                                entry.failed_program_count = program_count;
-                            }
-                            return None;
                         }
                     }
                 } else {
@@ -1337,19 +1386,44 @@ impl FontCache {
                         crate::CompanionSource::None => return None,
                         deferred @ (crate::CompanionSource::Object(_)
                         | crate::CompanionSource::FormInlineFont { .. }) => {
-                            if remaining == 0
-                                || entry.failed_budget.is_some_and(|limit| remaining <= limit)
+                            if let Some(cached) =
+                                run_candidate.as_deref().and_then(|slot| slot.as_ref())
                             {
-                                return None;
-                            }
-                            match load_deferred(deferred, remaining) {
-                                crate::DeferredCompanionLoad::Loaded(loaded) => {
-                                    if self.budget.admission_total(&loaded, max_bytes).is_none() {
-                                        // The loaded companion's full cache footprint
-                                        // exceeds `remaining` even before checking
-                                        // individual glyphs; remember the budget
-                                        // failure so later missing glyphs do not
-                                        // re-decode the stream repeatedly.
+                                (Arc::clone(cached), None, false, true)
+                            } else {
+                                if remaining == 0
+                                    || entry.failed_budget.is_some_and(|limit| remaining <= limit)
+                                {
+                                    return None;
+                                }
+                                match load_deferred(deferred, remaining) {
+                                    crate::DeferredCompanionLoad::Loaded(loaded) => {
+                                        if self.budget.admission_total(&loaded, max_bytes).is_none()
+                                        {
+                                            // The loaded companion's full cache footprint
+                                            // exceeds `remaining` even before checking
+                                            // individual glyphs; remember the budget
+                                            // failure so later missing glyphs do not
+                                            // re-decode the stream repeatedly.
+                                            if let Some(entry) =
+                                                self.embedded_companions.get_mut(&original.font_id)
+                                            {
+                                                entry.failed_budget = Some(
+                                                    entry.failed_budget.map_or(remaining, |prev| {
+                                                        prev.max(remaining)
+                                                    }),
+                                                );
+                                                entry.failed_program_count = program_count;
+                                            }
+                                            return None;
+                                        }
+                                        if let Some(slot) = run_candidate {
+                                            *slot = Some(Arc::clone(&loaded));
+                                        }
+                                        (loaded, None, false, true)
+                                    }
+                                    crate::DeferredCompanionLoad::Unavailable => return None,
+                                    crate::DeferredCompanionLoad::FailedForBudget => {
                                         if let Some(entry) =
                                             self.embedded_companions.get_mut(&original.font_id)
                                         {
@@ -1362,21 +1436,6 @@ impl FontCache {
                                         }
                                         return None;
                                     }
-                                    (loaded, None, false, true)
-                                }
-                                crate::DeferredCompanionLoad::Unavailable => return None,
-                                crate::DeferredCompanionLoad::FailedForBudget => {
-                                    if let Some(entry) =
-                                        self.embedded_companions.get_mut(&original.font_id)
-                                    {
-                                        entry.failed_budget = Some(
-                                            entry
-                                                .failed_budget
-                                                .map_or(remaining, |prev| prev.max(remaining)),
-                                        );
-                                        entry.failed_program_count = program_count;
-                                    }
-                                    return None;
                                 }
                             }
                         }
@@ -1475,6 +1534,7 @@ fn build_descriptor_substitute(
     spec: &crate::DescriptorSubstituteSpec,
     provider: Option<&FontProvider>,
 ) -> Option<LoadedFont> {
+    let lookup_name = spec.lookup_name.as_deref().unwrap_or(&primary.base_font);
     if matches!(primary.font_type, PdfFontType::Type0CidType2) {
         let can_substitute = primary.cid_cmap.as_ref().is_some_and(|cmap| {
             cmap.codes_are_unicode || cmap.is_legacy() || cmap.collection().is_some()
@@ -1483,12 +1543,8 @@ fn build_descriptor_substitute(
             return None;
         }
         let matched = match provider {
-            Some(p) => p.find_font(&spec.lookup_name, spec.hints, spec.ordering.as_deref()),
-            None => crate::system::find_system_font(
-                &spec.lookup_name,
-                spec.hints,
-                spec.ordering.as_deref(),
-            ),
+            Some(p) => p.find_font(lookup_name, spec.hints, spec.ordering),
+            None => crate::system::find_system_font(lookup_name, spec.hints, spec.ordering),
         }?;
         let mut sub = LoadedFont::new_substitute(
             PdfFontType::Type0CidType2,
@@ -1513,12 +1569,12 @@ fn build_descriptor_substitute(
         has_mapping.then_some(sub)
     } else {
         let matched = match provider {
-            Some(p) => p.find_font(&spec.lookup_name, spec.hints, None),
-            None => crate::system::find_system_font(&spec.lookup_name, spec.hints, None),
+            Some(p) => p.find_font(lookup_name, spec.hints, None),
+            None => crate::system::find_system_font(lookup_name, spec.hints, None),
         }?;
         let mut cid_widths = primary.cid_widths.clone();
         if cid_widths.is_empty() && !cid_widths.has_authoritative_default() {
-            if let Some(metrics) = crate::standard_fonts::lookup(&spec.lookup_name) {
+            if let Some(metrics) = crate::standard_fonts::lookup(lookup_name) {
                 for (code, &w) in metrics.widths.iter().enumerate() {
                     if w > 0 {
                         cid_widths.set(code as u16, w as f64);
@@ -1537,6 +1593,7 @@ fn build_descriptor_substitute(
         sub.to_unicode = primary.to_unicode.clone();
         sub.symbolic = primary.symbolic;
         sub.variations = primary.variations.clone();
+        sub.inherit_type1_encoding_from(primary);
         Some(sub)
     }
 }
