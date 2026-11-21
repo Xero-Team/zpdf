@@ -2,14 +2,31 @@
 
 ## Unreleased
 
+## 0.21.0 — Glyph-level selection and rendering compatibility
+
+Released 2026-11-21.
+
+### Compatibility
+
+- **Breaking:** exhaustive `TextSpan` literals must add `glyphs: Vec::new()`
+  or use the new `..TextSpan::default()`. Empty glyph lists retain the existing
+  approximate search geometry. `SearchHit::bounds()` now returns `Option<Rect>`:
+  `None` for a match with no rectangle, instead of a rectangle that could be
+  mistaken for one at the page origin. (#152)
+- **Breaking:** `SigningKey::Rsa` now carries `rsa::PrivateKey` from RSA 0.10;
+  callers constructing that variant directly must upgrade their RSA dependency.
+  RSA public-key decoding follows upstream's 1024-bit minimum and 8192-bit
+  maximum. (#147)
+
+### Signature correctness
+
 - Upgrade RSA signing and verification to RustCrypto RSA 0.10, with matching
   SHA-1/SHA-2 digest APIs and explicit PKCS#1 v1.5 compatibility. Preserve
   encoded PSS salt lengths (including RFC 4055 EXPLICIT fields) and return
   RSA signing failures as errors. Malformed or duplicate salt-length fields
-  are rejected instead of falling back to the default.
-  `SigningKey::Rsa` now carries `rsa::PrivateKey` from RSA 0.10; callers
-  constructing that variant directly must upgrade their RSA dependency.
-  RSA public-key decoding follows upstream's 1024-bit minimum and 8192-bit maximum.
+  are rejected instead of falling back to the default. (#147)
+
+### Text selection and APIs
 
 - Re-export `InkAnnotDict` and `InkAnnotationBuilder` from the `zpdf` facade.
 - Add `TextSpan::glyphs` and public `TextGlyph` selection cells, UTF-8 cluster
@@ -33,17 +50,11 @@
   rendering to finish. An `/ActualText` sequence interrupted by any time or
   resource limit keeps its replacement text without glyph cells. Matches
   whose cells are all degenerate or non-finite have an empty highlight.
-- Rebuild the browser WASM package and source fingerprint for the updated
-  text-extraction implementation.
-- **Source compatibility:** exhaustive `TextSpan` literals must add
-  `glyphs: Vec::new()` or use the new `..TextSpan::default()`. Empty glyph lists
-  retain the existing approximate search geometry. `SearchHit::bounds()` now
-  returns `Option<Rect>`: `None` for a match with no rectangle, instead of a
-  rectangle that could be mistaken for one at the page origin.
 
 ### Rendering fixes from a differential comparison with hayro
 
-See [docs/review/HAYRO_MINIPDF_GAP_ANALYSIS_2026_11_19.md](review/HAYRO_MINIPDF_GAP_ANALYSIS_2026_11_19.md).
+See the [differential review](https://github.com/Xero-Team/zpdf/blob/v0.21.0/docs/review/HAYRO_MINIPDF_GAP_ANALYSIS_2026_11_19.md)
+for the corpus, measurements and remaining gaps. (#154, #187, #188)
 
 - Recover encrypted files with a damaged xref: object-stream members are
   re-indexed once the decryptor exists, and a container with a stale xref
@@ -85,6 +96,13 @@ See [docs/review/HAYRO_MINIPDF_GAP_ANALYSIS_2026_11_19.md](review/HAYRO_MINIPDF_
   upsampling, avoiding large scratch allocations for extreme aspect ratios.
 - Apply the decoded-stream byte ceiling to JPX component samples before full
   decompression, including multi-colorant images.
+
+### Dependencies and distribution
+
+- Update the SVG export test oracle to resvg 0.50. (#146)
+- Update the fuzz tool installer and FreeBSD VM action. (#189)
+- Rebuild the shipped browser WASM/JS package and source/artifact fingerprint
+  for version 0.21.0 and the updated library dependencies.
 
 ## 0.20.0 — Shared stream storage and lower pipeline memory
 
