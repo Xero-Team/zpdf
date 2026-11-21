@@ -466,6 +466,14 @@ impl LoadedFont {
     /// subset) would be misread as GIDs of the substitute. Call after
     /// /ToUnicode is attached.
     pub fn build_substitute_cid_to_gid(&mut self) {
+        self.build_substitute_cid_to_gid_from(None);
+    }
+
+    /// Like [`Self::build_substitute_cid_to_gid`], borrowing an external
+    /// `/ToUnicode` map when provided so callers can probe substitute coverage
+    /// without cloning the map into `self.to_unicode` first.
+    #[doc(hidden)]
+    pub fn build_substitute_cid_to_gid_from(&mut self, to_unicode: Option<&cmap::ToUnicodeMap>) {
         if !self.is_substitute || !matches!(self.font_type, PdfFontType::Type0CidType2) {
             return;
         }
@@ -480,17 +488,13 @@ impl LoadedFont {
         let Ok(face) = ttf_parser::Face::parse(data, self.face_index) else {
             return;
         };
-        let mut map = HashMap::with_capacity(
-            self.to_unicode
-                .as_ref()
-                .map_or(0, |mapping| mapping.iter().len()),
-        );
+        let to_unicode = to_unicode.or(self.to_unicode.as_ref());
+        let mut map = HashMap::with_capacity(to_unicode.map_or(0, |mapping| mapping.iter().len()));
         let has_collection = self
             .cid_cmap
             .as_ref()
             .and_then(|cm| cm.collection())
             .is_some();
-        let to_unicode = self.to_unicode.as_ref();
         for (code, s) in to_unicode.iter().flat_map(|tu| tu.iter()) {
             // glyph_outline receives CIDs, so key the map by CID — under a
             // non-Identity encoding CMap, or an Identity base with explicit
@@ -2264,6 +2268,43 @@ impl FontCacheBudget {
         true
     }
 
+    /// Atomically admit two fonts together when both fit within `max_bytes`,
+    /// leaving the budget untouched if the pair would exceed the limit.
+    pub fn try_admit_pair(
+        &mut self,
+        first: &Arc<LoadedFont>,
+        second: &Arc<LoadedFont>,
+        max_bytes: u64,
+    ) -> bool {
+        let mut added = 0u64;
+        let mut seen_fonts = HashSet::new();
+        let mut seen_programs = HashSet::new();
+        for font in [first, second] {
+            let font_key = Arc::as_ptr(font) as usize;
+            if !self.fonts.contains(&font_key) && seen_fonts.insert(font_key) {
+                let Some(next) = added.checked_add(font.estimated_owned_cache_bytes()) else {
+                    return false;
+                };
+                added = next;
+                for data in font.shared_programs() {
+                    let key = data.as_ptr() as usize;
+                    if !self.programs.contains(&key) && seen_programs.insert(key) {
+                        let Some(next) = added.checked_add(data.len() as u64) else {
+                            return false;
+                        };
+                        added = next;
+                    }
+                }
+            }
+        }
+        let Some(total) = self.bytes.checked_add(added).filter(|&t| t <= max_bytes) else {
+            return false;
+        };
+        self.record(first, total);
+        self.record(second, total);
+        true
+    }
+
     pub fn bytes_used(&self) -> u64 {
         self.bytes
     }
@@ -2287,9 +2328,9 @@ pub struct FontCache {
     /// allocate nothing, so normal pages pay zero overhead.
     embedded_fallbacks: HashMap<FontId, zpdf_core::ProcessingDiagnostics>,
     /// Retained partially-readable embedded font programs paired with a
-    /// substituted `FontId`, lazily admitted into `fonts` only when an
-    /// uncovered glyph still draws from the embedded face. Empty maps allocate
-    /// nothing.
+    /// substituted `FontId`, charged against `budget` upon retention and
+    /// lazily assigned a drawing `FontId` only when an uncovered glyph draws
+    /// from the embedded face. Empty maps allocate nothing.
     embedded_companions: HashMap<FontId, (Arc<LoadedFont>, Option<FontId>)>,
 }
 
@@ -2314,11 +2355,27 @@ impl FontCache {
     }
 
     /// Pair a substituted font `id` with its partially readable embedded
-    /// original so glyphs uncovered by the substitute can still draw from the
-    /// surviving embedded outlines.
+    /// original when `max_bytes` allows, charging the page cache budget before
+    /// retaining the `Arc`. Returns `false` and drops `embedded` if `id` is
+    /// absent or retaining `embedded` would exceed `max_bytes`.
     #[doc(hidden)]
-    pub fn record_embedded_companion(&mut self, id: FontId, embedded: Arc<LoadedFont>) {
+    pub fn record_embedded_companion(
+        &mut self,
+        id: FontId,
+        embedded: Arc<LoadedFont>,
+        max_bytes: u64,
+    ) -> bool {
+        if !self.fonts.contains_key(&id) {
+            return false;
+        }
+        if self.embedded_companions.contains_key(&id) {
+            return true;
+        }
+        if !self.budget.try_admit(&embedded, max_bytes) {
+            return false;
+        }
         self.embedded_companions.insert(id, (embedded, None));
+        true
     }
 
     /// Whether `id` has a retained embedded original available for uncovered
@@ -3316,6 +3373,81 @@ mod tests {
         assert!(
             font_budget.has_usable_embedded_outlines(),
             "exhausted cmap probe budget must leave the blank check inconclusive"
+        );
+    }
+
+    #[test]
+    fn embedded_companion_is_charged_against_page_budget_on_retention() {
+        let primary_bytes = include_bytes!("../tests/fixtures/coverage-primary.ttf");
+        let primary = Arc::new(
+            LoadedFont::new_substitute(
+                PdfFontType::TrueType,
+                "PrimarySub".into(),
+                Arc::from(primary_bytes.as_slice()),
+                0,
+                CidWidths::new(1000.0),
+            )
+            .unwrap(),
+        );
+        let companion = Arc::new(LoadedFont::new_with_data(
+            PdfFontType::TrueType,
+            "EmbeddedOriginal".into(),
+            primary_bytes.to_vec(),
+            CidWidths::new(1000.0),
+        ));
+        let primary_cost = primary.estimated_cache_bytes();
+        let companion_cost = companion.estimated_cache_bytes();
+        let combined_cost = primary_cost + companion_cost;
+
+        // 1. Budget fits primary, rejects unused companion: no strong Arc retained.
+        let mut tight = FontCache::new();
+        let fid = tight
+            .try_insert_shared_with_limit("F1".into(), Arc::clone(&primary), combined_cost - 1)
+            .expect("primary fits");
+        let weak_font = Arc::downgrade(&companion);
+        let weak_data = Arc::downgrade(companion.font_data.as_ref().unwrap());
+        assert!(!tight.record_embedded_companion(fid, Arc::clone(&companion), combined_cost - 1));
+        assert!(!tight.has_embedded_companion(fid));
+        assert_eq!(tight.bytes_used(), primary_cost);
+        drop(companion);
+        assert!(
+            weak_font.upgrade().is_none() && weak_data.upgrade().is_none(),
+            "rejected companion must not be retained by FontCache"
+        );
+
+        // 2. Budget fits both: companion is charged immediately upon retention,
+        //    and lazy drawing admission does not double-charge it.
+        let companion = Arc::new(LoadedFont::new_with_data(
+            PdfFontType::TrueType,
+            "EmbeddedOriginal".into(),
+            primary_bytes.to_vec(),
+            CidWidths::new(1000.0),
+        ));
+        let mut ample = FontCache::new();
+        let fid = ample
+            .try_insert_shared_with_limit("F1".into(), primary, combined_cost)
+            .expect("primary fits");
+        assert!(ample.record_embedded_companion(fid, companion, combined_cost));
+        assert!(ample.has_embedded_companion(fid));
+        assert_eq!(ample.bytes_used(), combined_cost);
+
+        let resolved = ample
+            .resolve_embedded_companion_glyph(
+                DrawingGlyph {
+                    font_id: fid,
+                    glyph_id: 0,
+                },
+                b'A' as u32,
+                b'A' as u32,
+                1,
+                combined_cost,
+            )
+            .expect("uncovered glyph resolves from retained companion");
+        assert_ne!(resolved.font_id, fid);
+        assert_eq!(
+            ample.bytes_used(),
+            combined_cost,
+            "drawing admission must not double-charge an already-budgeted companion"
         );
     }
 }

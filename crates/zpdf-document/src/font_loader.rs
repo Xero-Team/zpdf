@@ -24,6 +24,10 @@ pub(crate) fn load_page_fonts(
     }
     let max_bytes = file.limits().max_font_cache_bytes;
 
+    // Admit all primary page fonts before attaching optional embedded
+    // companions so a companion charged against `max_bytes` cannot starve a
+    // sibling primary font on the same page.
+    let mut pending_companions: Vec<(zpdf_font::FontId, std::sync::Arc<LoadedFont>)> = Vec::new();
     for (name, &font_ref) in &page.resources.fonts {
         match shared_or_load(file, font_ref, shared, provider) {
             Ok((font, diagnostics, companion)) => {
@@ -37,7 +41,7 @@ pub(crate) fn load_page_fonts(
                     Ok(fid) => {
                         if let Some(companion) = companion {
                             if cache.get(fid).is_some_and(|f| f.has_font_data()) {
-                                cache.record_embedded_companion(fid, companion);
+                                pending_companions.push((fid, companion));
                             }
                         }
                     }
@@ -53,6 +57,9 @@ pub(crate) fn load_page_fonts(
                 let _ = insert_placeholder(&mut cache, name, max_bytes);
             }
         }
+    }
+    for (fid, companion) in pending_companions {
+        let _ = cache.record_embedded_companion(fid, companion, max_bytes);
     }
 
     cache
@@ -204,7 +211,7 @@ pub fn load_single_font_dict_with_fallback(
 
     let to_unicode = parse_to_unicode(file, dict);
     let (mut font, diagnostics, mut companion) = match subtype {
-        "Type0" => load_type0_font(file, dict, base_font, provider, to_unicode.clone())?,
+        "Type0" => load_type0_font(file, dict, base_font, provider, to_unicode.as_ref())?,
         "TrueType" => load_simple_font(file, dict, base_font, PdfFontType::TrueType, provider)?,
         "Type3" => (
             load_type3_font(file, dict, base_font)?,
@@ -221,7 +228,14 @@ pub fn load_single_font_dict_with_fallback(
         ),
     };
 
-    attach_text_mappings(file, dict, subtype, to_unicode.clone(), &mut font);
+    // Only clone /ToUnicode when a partially readable embedded companion is
+    // retained alongside a substitute; healthy font loads move it once.
+    let companion_to_unicode = if companion.is_some() {
+        to_unicode.clone()
+    } else {
+        None
+    };
+    attach_text_mappings(file, dict, subtype, to_unicode, &mut font);
     // A substituted composite font needs /ToUnicode (attached just above) to
     // route CIDs through the system face's Unicode cmap.
     if font.cid_to_gid.is_none() {
@@ -232,7 +246,7 @@ pub fn load_single_font_dict_with_fallback(
         apply_descriptor_variations(file, dict, &mut font);
     }
     if let Some(ref mut emb) = companion {
-        attach_text_mappings(file, dict, subtype, to_unicode, emb);
+        attach_text_mappings(file, dict, subtype, companion_to_unicode, emb);
         if subtype != "Type0" {
             apply_descriptor_variations(file, dict, emb);
         }
@@ -640,7 +654,7 @@ fn load_type0_font(
     dict: &zpdf_core::PdfDict,
     base_font: String,
     provider: Option<&FontProvider>,
-    to_unicode: Option<zpdf_font::cmap::ToUnicodeMap>,
+    to_unicode: Option<&zpdf_font::cmap::ToUnicodeMap>,
 ) -> Result<(
     LoadedFont,
     zpdf_core::ProcessingDiagnostics,
@@ -730,9 +744,8 @@ fn load_type0_font(
             hints,
         )?;
         sub.cid_cmap = Some(cmap.clone());
-        sub.to_unicode = to_unicode.clone();
         sub.validate_cid_cmap();
-        sub.build_substitute_cid_to_gid();
+        sub.build_substitute_cid_to_gid_from(to_unicode);
         let has_mapping = sub.unicode_coded()
             || sub.legacy_substitute()
             || sub.cid_cmap.as_ref().and_then(|c| c.collection()).is_some()

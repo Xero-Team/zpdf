@@ -401,5 +401,95 @@ fn corrupt_embedded_font_exports_succeed_when_recovered_and_fail_when_unrecovere
         "{pua_stderr}"
     );
     fs::remove_file(&pua_input).unwrap();
+
+    // 4. Tagged PDF whose parent structure element supplies `/ActualText (Label)`
+    //    for an unmapped fallback CID: `zpdf text --struct` succeeds with "Label",
+    //    plain `zpdf text` rejects, and an additional uncovered MCID fails `--struct`.
+    let tagged_covered_pdf = assemble_raw(&[
+        b"<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 9 0 R /MarkInfo << /Marked true >> >>"
+            .to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 180 100] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>".to_vec(),
+        raw_stream(
+            "",
+            b"0 0 0 rg /Span << /MCID 0 >> BDC BT /F1 24 Tf 15 40 Td <0001> Tj ET EMC",
+        ),
+        b"<< /Type /Font /Subtype /Type0 /BaseFont /ABCDEF+TaggedStructCID /Encoding /Identity-H /DescendantFonts [6 0 R] >>".to_vec(),
+        b"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /ABCDEF+TaggedStructCID \
+          /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> \
+          /FontDescriptor 7 0 R /DW 1000 >>"
+            .to_vec(),
+        b"<< /Type /FontDescriptor /FontName /ABCDEF+TaggedStructCID /Flags 32 /FontFile2 8 0 R >>"
+            .to_vec(),
+        raw_stream("", b"corrupt tagged struct cid font"),
+        b"<< /Type /StructTreeRoot /K [10 0 R] >>".to_vec(),
+        b"<< /Type /StructElem /S /Span /Pg 3 0 R /ActualText (Label) /K 0 >>".to_vec(),
+    ]);
+    let tagged_input = dir.join("tagged_actual_text.pdf");
+    fs::write(&tagged_input, tagged_covered_pdf).unwrap();
+
+    let struct_text_res = Command::new(env!("CARGO_BIN_EXE_zpdf"))
+        .arg("text")
+        .arg(&tagged_input)
+        .arg("--struct")
+        .output()
+        .unwrap();
+    assert!(
+        struct_text_res.status.success(),
+        "text --struct should succeed when parent structure element supplies /ActualText: {}",
+        String::from_utf8_lossy(&struct_text_res.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&struct_text_res.stdout).trim(),
+        "Label"
+    );
+
+    let geom_text_res = Command::new(env!("CARGO_BIN_EXE_zpdf"))
+        .args(["text"])
+        .arg(&tagged_input)
+        .output()
+        .unwrap();
+    assert!(
+        !geom_text_res.status.success(),
+        "unstructured text should still reject unmapped fallback CID"
+    );
+    fs::remove_file(&tagged_input).unwrap();
+
+    let tagged_uncovered_pdf = assemble_raw(&[
+        b"<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 9 0 R /MarkInfo << /Marked true >> >>"
+            .to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 180 100] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>".to_vec(),
+        raw_stream(
+            "",
+            b"0 0 0 rg /Span << /MCID 0 >> BDC BT /F1 24 Tf 15 40 Td <0001> Tj ET EMC \
+              /Span << /MCID 1 >> BDC BT /F1 24 Tf 60 40 Td <0002> Tj ET EMC",
+        ),
+        b"<< /Type /Font /Subtype /Type0 /BaseFont /ABCDEF+TaggedStructCID /Encoding /Identity-H /DescendantFonts [6 0 R] >>".to_vec(),
+        b"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /ABCDEF+TaggedStructCID \
+          /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> \
+          /FontDescriptor 7 0 R /DW 1000 >>"
+            .to_vec(),
+        b"<< /Type /FontDescriptor /FontName /ABCDEF+TaggedStructCID /Flags 32 /FontFile2 8 0 R >>"
+            .to_vec(),
+        raw_stream("", b"corrupt tagged struct cid font"),
+        b"<< /Type /StructTreeRoot /K [10 0 R 11 0 R] >>".to_vec(),
+        b"<< /Type /StructElem /S /Span /Pg 3 0 R /ActualText (Label) /K 0 >>".to_vec(),
+        b"<< /Type /StructElem /S /Span /Pg 3 0 R /K 1 >>".to_vec(),
+    ]);
+    let uncovered_input = dir.join("tagged_uncovered.pdf");
+    fs::write(&uncovered_input, tagged_uncovered_pdf).unwrap();
+
+    let uncovered_res = Command::new(env!("CARGO_BIN_EXE_zpdf"))
+        .arg("text")
+        .arg(&uncovered_input)
+        .arg("--struct")
+        .output()
+        .unwrap();
+    assert!(
+        !uncovered_res.status.success(),
+        "text --struct must still reject uncovered unmapped fallback text"
+    );
+    fs::remove_file(&uncovered_input).unwrap();
     fs::remove_dir(dir).unwrap();
 }

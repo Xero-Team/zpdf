@@ -170,6 +170,9 @@ pub fn convert_pdf(
         if let Some(oc) = &oc_config {
             interpreter = interpreter.with_optional_content(oc);
         }
+        if let Some(tree) = &struct_tree {
+            interpreter = interpreter.with_struct_actual_text(page_index, tree);
+        }
         if let Some(profile) = output_intent {
             interpreter = interpreter.with_output_intent_cmyk(profile);
         }

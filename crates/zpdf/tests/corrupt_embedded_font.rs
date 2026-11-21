@@ -1751,3 +1751,441 @@ fn corrupt_simple_font_with_custom_encoding_recovers_via_tounicode_and_cid_colle
     assert_eq!(page.stats.diagnostics.decode_failures, 0);
     assert!(page.is_complete());
 }
+
+#[test]
+fn embedded_companion_respects_page_font_cache_budget_even_when_unused() {
+    let probe = zpdf_font::LoadedFont::new_with_data(
+        zpdf_font::PdfFontType::TrueType,
+        "Probe".into(),
+        PRIMARY_TTF.to_vec(),
+        zpdf_font::CidWidths::new(1000.0),
+    );
+    let gid_a = probe.unicode_glyph('A' as u32).unwrap().0;
+    let gid_b = probe.unicode_glyph('B' as u32).unwrap().0;
+    let gid_c = probe.unicode_glyph('C' as u32).unwrap().0;
+    let maxp = sfnt_table_range(PRIMARY_TTF, b"maxp");
+    let num_glyphs = u16::from_be_bytes([PRIMARY_TTF[maxp.start + 4], PRIMARY_TTF[maxp.start + 5]]);
+    let corrupt_gids: Vec<u16> = (1..num_glyphs).filter(|&g| g != gid_c).collect();
+    let partial_ttf = corrupt_selected_gids(PRIMARY_TTF, &corrupt_gids);
+    let cid_to_gid_bytes: Vec<u8> = [0u16, gid_a, gid_b, gid_c]
+        .into_iter()
+        .flat_map(|g| g.to_be_bytes())
+        .collect();
+    let partial_tounicode = b"/CIDInit /ProcSet findresource begin 12 dict begin begincmap \
+        1 begincodespacerange <0000> <FFFF> endcodespacerange \
+        1 beginbfchar <0001> <0041> endbfchar \
+        endcmap CMapName currentdict /CMap defineresource pop end end";
+
+    // Page 0 draws only CID 1 (covered by the primary substitute; companion is unused).
+    // Page 1 draws CID 1 through a Form XObject referencing the same font.
+    // Page 2 has both /F1 (partially corrupt + companion) and /F2 (valid embedded BOLD_TTF).
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 180 100] /Resources << /Font << /F1 6 0 R >> >> /Contents 12 0 R >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 180 100] /Resources << /XObject << /Fm 13 0 R >> >> /Contents 14 0 R >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 180 100] /Resources << /Font << /F1 6 0 R /F2 15 0 R >> >> /Contents 18 0 R >>".to_vec(),
+        b"<< /Type /Font /Subtype /Type0 /BaseFont /ABCDEF+BudgetCompanion /Encoding /Identity-H \
+          /DescendantFonts [7 0 R] /ToUnicode 10 0 R >>"
+            .to_vec(),
+        b"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /ABCDEF+BudgetCompanion \
+          /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> \
+          /CIDToGIDMap 11 0 R /FontDescriptor 8 0 R /DW 1000 /W [1 [620 780 540]] >>"
+            .to_vec(),
+        b"<< /Type /FontDescriptor /FontName /ABCDEF+BudgetCompanion /Flags 32 /FontFile2 9 0 R >>"
+            .to_vec(),
+        stream("", &partial_ttf),
+        stream("", partial_tounicode),
+        stream("", &cid_to_gid_bytes),
+        stream("", b"0 0 0 rg BT /F1 24 Tf 15 40 Td <0001> Tj ET"),
+        stream(
+            "/Type /XObject /Subtype /Form /BBox [0 0 180 100] /Resources << /Font << /G1 6 0 R >> >>",
+            b"0 0 0 rg BT /G1 24 Tf 15 40 Td <0001> Tj ET",
+        ),
+        stream("", b"/Fm Do"),
+        b"<< /Type /Font /Subtype /TrueType /BaseFont /ABCDEF+SiblingValid /Encoding /WinAnsiEncoding \
+          /FirstChar 65 /LastChar 67 /Widths [620 780 540] /FontDescriptor 16 0 R >>"
+            .to_vec(),
+        b"<< /Type /FontDescriptor /FontName /ABCDEF+SiblingValid /Flags 32 /FontFile2 17 0 R >>"
+            .to_vec(),
+        stream("", BOLD_TTF),
+        stream(
+            "",
+            b"0 0 0 rg BT /F1 24 Tf 15 40 Td <0001> Tj /F2 24 Tf 20 0 Td (B) Tj ET",
+        ),
+    ]);
+
+    // 1. Primary fits, unused companion exceeds max_font_cache_bytes:
+    //    companion is not retained and page cache stays within budget.
+    let tight_budget = PRIMARY_TTF.len() as u64 + 4096;
+    assert!(
+        tight_budget < (PRIMARY_TTF.len() as u64) * 2,
+        "tight budget must fit primary but not primary + companion"
+    );
+    let doc_tight = PdfDocument::open_with_limits(
+        pdf.clone(),
+        zpdf::ParseLimits {
+            max_font_cache_bytes: tight_budget,
+            ..Default::default()
+        },
+    )
+    .unwrap()
+    .with_font_provider(provider_with_alias("BudgetCompanion"));
+
+    // Page 0 (direct page font)
+    let page0 = zpdf::interpret_page(&doc_tight, 0, Default::default()).unwrap();
+    let (f1_id, f1) = page0.fonts.get_by_name("F1").unwrap();
+    assert!(f1.is_substitute && f1.has_font_data());
+    assert!(
+        !page0.fonts.has_embedded_companion(f1_id),
+        "unused companion exceeding page budget must not be retained"
+    );
+    assert!(
+        page0.fonts.bytes_used() <= tight_budget,
+        "page cache bytes {} exceeded limit {}",
+        page0.fonts.bytes_used(),
+        tight_budget
+    );
+    assert_eq!(page0.stats.diagnostics.embedded_font_fallbacks, 1);
+    assert_eq!(page0.stats.diagnostics.missing_glyph_outlines, 0);
+    assert_eq!(page0.stats.diagnostics.decode_failures, 0);
+    assert!(!page0.stats.diagnostics.resource_limit_reached);
+    assert!(page0.is_complete());
+    let cpu0 = zpdf::cpu::CpuRenderer::new()
+        .with_fonts(&page0.fonts)
+        .render_display_list(&page0.display_list, 1.0)
+        .unwrap();
+    assert!(
+        dark_pixels_in_rect(
+            &cpu0.data,
+            cpu0.width as usize,
+            cpu0.height as usize,
+            15,
+            35,
+            30,
+            70
+        ) > 10,
+        "substitute CID 1 must still render when unused companion is dropped for budget"
+    );
+
+    // Page 1 (Form XObject font)
+    let page1 = zpdf::interpret_page(&doc_tight, 1, Default::default()).unwrap();
+    let (g1_id, g1) = page1.fonts.get_by_name("__font_6_0").unwrap();
+    assert!(g1.is_substitute && g1.has_font_data());
+    assert!(!page1.fonts.has_embedded_companion(g1_id));
+    assert!(page1.fonts.bytes_used() <= tight_budget);
+    assert!(page1.is_complete());
+
+    // 2. Generous budget: companion IS retained and charged immediately in
+    //    `bytes_used()` even though page 0 draws only from the substitute.
+    let ample_budget = (PRIMARY_TTF.len() as u64) * 4 + BOLD_TTF.len() as u64;
+    let doc_ample = PdfDocument::open_with_limits(
+        pdf.clone(),
+        zpdf::ParseLimits {
+            max_font_cache_bytes: ample_budget,
+            ..Default::default()
+        },
+    )
+    .unwrap()
+    .with_font_provider(provider_with_alias("BudgetCompanion"));
+    let page_ample = zpdf::interpret_page(&doc_ample, 0, Default::default()).unwrap();
+    let (f1_ample_id, f1_ample) = page_ample.fonts.get_by_name("F1").unwrap();
+    assert!(page_ample.fonts.has_embedded_companion(f1_ample_id));
+    assert!(
+        page_ample.fonts.bytes_used() >= (PRIMARY_TTF.len() as u64) * 2,
+        "retained companion must be charged against bytes_used() even when unused"
+    );
+    assert!(page_ample.fonts.bytes_used() <= ample_budget);
+
+    // 3. Two-pass admission: measure exact primary costs for /F1 and /F2; when
+    //    both primaries fit together (`f1_cost + f2_cost`) but /F1's companion
+    //    does not, neither primary font is starved regardless of map order.
+    let page2_ample = zpdf::interpret_page(&doc_ample, 2, Default::default()).unwrap();
+    let f1_cost = f1_ample.estimated_cache_bytes();
+    let f2_cost = page2_ample
+        .fonts
+        .get_by_name("F2")
+        .unwrap()
+        .1
+        .estimated_cache_bytes();
+    let sibling_budget = f1_cost + f2_cost;
+    assert!(
+        sibling_budget < f1_cost + f2_cost + PRIMARY_TTF.len() as u64,
+        "sibling budget must fit F1 primary + F2 but not F1 companion as well"
+    );
+    let doc_sibling = PdfDocument::open_with_limits(
+        pdf,
+        zpdf::ParseLimits {
+            max_font_cache_bytes: sibling_budget,
+            ..Default::default()
+        },
+    )
+    .unwrap()
+    .with_font_provider(provider_with_alias("BudgetCompanion"));
+    let page2 = zpdf::interpret_page(&doc_sibling, 2, Default::default()).unwrap();
+    let (f1_id2, f1_2) = page2.fonts.get_by_name("F1").unwrap();
+    let (_, f2_2) = page2.fonts.get_by_name("F2").unwrap();
+    assert!(f1_2.has_font_data() && f2_2.has_font_data());
+    assert!(!page2.fonts.has_embedded_companion(f1_id2));
+    assert!(page2.fonts.bytes_used() <= sibling_budget);
+    assert!(!page2.stats.diagnostics.resource_limit_reached);
+    assert!(page2.is_complete());
+}
+
+#[test]
+fn shared_font_repeat_render_keeps_surviving_companion_glyphs_consistent() {
+    let probe = zpdf_font::LoadedFont::new_with_data(
+        zpdf_font::PdfFontType::TrueType,
+        "Probe".into(),
+        PRIMARY_TTF.to_vec(),
+        zpdf_font::CidWidths::new(1000.0),
+    );
+    let gid_a = probe.unicode_glyph('A' as u32).unwrap().0;
+    let gid_b = probe.unicode_glyph('B' as u32).unwrap().0;
+    let gid_c = probe.unicode_glyph('C' as u32).unwrap().0;
+    let maxp = sfnt_table_range(PRIMARY_TTF, b"maxp");
+    let num_glyphs = u16::from_be_bytes([PRIMARY_TTF[maxp.start + 4], PRIMARY_TTF[maxp.start + 5]]);
+    let corrupt_gids: Vec<u16> = (1..num_glyphs).filter(|&g| g != gid_c).collect();
+    let partial_ttf = corrupt_selected_gids(PRIMARY_TTF, &corrupt_gids);
+    let cid_to_gid_bytes: Vec<u8> = [0u16, gid_a, gid_b, gid_c]
+        .into_iter()
+        .flat_map(|g| g.to_be_bytes())
+        .collect();
+    let partial_tounicode = b"/CIDInit /ProcSet findresource begin 12 dict begin begincmap \
+        1 begincodespacerange <0000> <FFFF> endcodespacerange \
+        1 beginbfchar <0001> <0041> endbfchar \
+        endcmap CMapName currentdict /CMap defineresource pop end end";
+
+    // Page 0 loads valid embedded BOLD_TTF (partially filling SharedFonts).
+    // Page 1 uses the partially readable Identity-H font drawing <00010003>
+    // (CID 1 via substitute + CID 3 via surviving embedded companion).
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 180 100] /Resources << /Font << /F0 5 0 R >> >> /Contents 8 0 R >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 180 100] /Resources << /Font << /F1 9 0 R >> >> /Contents 15 0 R >>".to_vec(),
+        b"<< /Type /Font /Subtype /TrueType /BaseFont /ABCDEF+FillerBold /Encoding /WinAnsiEncoding \
+          /FirstChar 65 /LastChar 67 /Widths [620 780 540] /FontDescriptor 6 0 R >>"
+            .to_vec(),
+        b"<< /Type /FontDescriptor /FontName /ABCDEF+FillerBold /Flags 32 /FontFile2 7 0 R >>"
+            .to_vec(),
+        stream("", BOLD_TTF),
+        stream("", b"0 0 0 rg BT /F0 24 Tf 15 40 Td (A) Tj ET"),
+        b"<< /Type /Font /Subtype /Type0 /BaseFont /ABCDEF+RepeatMixedCID /Encoding /Identity-H \
+          /DescendantFonts [10 0 R] /ToUnicode 13 0 R >>"
+            .to_vec(),
+        b"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /ABCDEF+RepeatMixedCID \
+          /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> \
+          /CIDToGIDMap 14 0 R /FontDescriptor 11 0 R /DW 1000 /W [1 [620 780 540]] >>"
+            .to_vec(),
+        b"<< /Type /FontDescriptor /FontName /ABCDEF+RepeatMixedCID /Flags 32 /FontFile2 12 0 R >>"
+            .to_vec(),
+        stream("", &partial_ttf),
+        stream("", partial_tounicode),
+        stream("", &cid_to_gid_bytes),
+        stream("", b"0 0 0 rg BT /F1 24 Tf 15 40 Td <00010003> Tj ET"),
+    ]);
+
+    // Measure exact costs first so we can pick a budget where:
+    //   filler + primary <= budget < filler + primary + companion
+    // AND a fresh page 1 cache fits primary + companion (`primary + companion <= budget`).
+    let doc_measure = PdfDocument::open(pdf.clone())
+        .unwrap()
+        .with_font_provider(provider_with_alias("RepeatMixedCID"));
+    let p0_measure = zpdf::interpret_page(&doc_measure, 0, Default::default()).unwrap();
+    let p1_measure = zpdf::interpret_page(&doc_measure, 1, Default::default()).unwrap();
+    let filler_cost = p0_measure.fonts.bytes_used();
+    let primary_cost = p1_measure
+        .fonts
+        .get_by_name("F1")
+        .unwrap()
+        .1
+        .estimated_cache_bytes();
+    let pair_cost = p1_measure.fonts.bytes_used();
+    let budget = (filler_cost + primary_cost).max(pair_cost);
+    assert!(
+        budget < filler_cost + pair_cost,
+        "budget {budget} must fit page 1 pair ({pair_cost}) and filler+primary ({}) without fitting filler+pair ({})",
+        filler_cost + primary_cost,
+        filler_cost + pair_cost
+    );
+
+    let doc = PdfDocument::open_with_limits(
+        pdf,
+        zpdf::ParseLimits {
+            max_font_cache_bytes: budget,
+            ..Default::default()
+        },
+    )
+    .unwrap()
+    .with_font_provider(provider_with_alias("RepeatMixedCID"));
+
+    // Page 0 fills part of SharedFonts.
+    let p0 = zpdf::interpret_page(&doc, 0, Default::default()).unwrap();
+    assert!(p0.is_complete());
+
+    // Render Page 1 TWICE: both renders must draw CID 1 (substitute) and CID 3
+    // (surviving embedded companion) identically.
+    let first = zpdf::interpret_page(&doc, 1, Default::default()).unwrap();
+    let second = zpdf::interpret_page(&doc, 1, Default::default()).unwrap();
+    for (label, page) in [("first", &first), ("second", &second)] {
+        assert!(
+            page.is_complete(),
+            "{label} render must recover both CIDs cleanly"
+        );
+        let (fid, _) = page.fonts.get_by_name("F1").unwrap();
+        assert!(
+            page.fonts.has_embedded_companion(fid),
+            "{label} render must retain companion"
+        );
+        let runs: Vec<_> = page
+            .display_list
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                RenderCommand::DrawGlyphRun(r) => Some(r),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            runs.len(),
+            2,
+            "{label} render must emit substitute + companion runs"
+        );
+    }
+
+    let cpu_first = zpdf::cpu::CpuRenderer::new()
+        .with_fonts(&first.fonts)
+        .render_display_list(&first.display_list, 1.0)
+        .unwrap();
+    let cpu_second = zpdf::cpu::CpuRenderer::new()
+        .with_fonts(&second.fonts)
+        .render_display_list(&second.display_list, 1.0)
+        .unwrap();
+    assert_eq!(
+        cpu_first.data, cpu_second.data,
+        "repeat render with partially filled SharedFonts must produce identical pixels"
+    );
+    let cid1_adv = 620.0_f32 * 24.0 / 1000.0;
+    let cid3_adv = 540.0_f32 * 24.0 / 1000.0;
+    let px0 = (15.0 + cid1_adv).floor() as usize;
+    let px1 = (15.0 + cid1_adv + cid3_adv).ceil() as usize;
+    assert!(
+        dark_pixels_in_rect(
+            &cpu_second.data,
+            cpu_second.width as usize,
+            cpu_second.height as usize,
+            px0,
+            px1,
+            30,
+            70,
+        ) > 10,
+        "surviving CID 3 must remain visible on the second render"
+    );
+}
+
+#[test]
+fn structure_element_actual_text_satisfies_structured_text_completeness() {
+    let build_tagged_pdf = |content: &[u8], extra_mcid_kid: bool| {
+        let kids = if extra_mcid_kid {
+            "[10 0 R 11 0 R]"
+        } else {
+            "[10 0 R]"
+        };
+        let mut objs = vec![
+            b"<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 9 0 R /MarkInfo << /Marked true >> >>"
+                .to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 180 100] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
+                .to_vec(),
+            stream("", content),
+            b"<< /Type /Font /Subtype /Type0 /BaseFont /ABCDEF+TaggedUnmappedCID /Encoding /Identity-H /DescendantFonts [6 0 R] >>"
+                .to_vec(),
+            b"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /ABCDEF+TaggedUnmappedCID \
+              /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> \
+              /FontDescriptor 7 0 R /DW 1000 >>"
+                .to_vec(),
+            b"<< /Type /FontDescriptor /FontName /ABCDEF+TaggedUnmappedCID /Flags 32 /FontFile2 8 0 R >>"
+                .to_vec(),
+            stream("", b"corrupt tagged cid font"),
+            format!("<< /Type /StructTreeRoot /K {kids} >>").into_bytes(),
+            b"<< /Type /StructElem /S /Span /Pg 3 0 R /ActualText (Label) /K 0 >>".to_vec(),
+        ];
+        if extra_mcid_kid {
+            objs.push(b"<< /Type /StructElem /S /Span /Pg 3 0 R /K 1 >>".to_vec());
+        }
+        assemble(&objs)
+    };
+
+    // 1. Every unmapped fallback CID lives inside MCID 0, whose parent
+    //    structure element provides `/ActualText (Label)`:
+    //    - structured conversion succeeds with "Label" and decode_failures == 0
+    //    - unstructured (geometric) conversion still rejects (decode_failures == 1)
+    //    - visual interpretation still rejects missing outlines
+    let covered_pdf = build_tagged_pdf(
+        b"0 0 0 rg /Span << /MCID 0 >> BDC BT /F1 24 Tf 15 40 Td <0001> Tj ET EMC",
+        false,
+    );
+    let doc_covered = PdfDocument::open(covered_pdf)
+        .unwrap()
+        .with_font_provider(Arc::new(FontProvider::memory_only()));
+
+    let conv_struct = zpdf::convert_pdf(
+        &doc_covered,
+        &[0],
+        zpdf::ConversionOptions {
+            mode: zpdf::ConversionMode::TextOnly,
+            use_structure: true,
+        },
+    )
+    .unwrap();
+    assert!(conv_struct.structure_order_used);
+    assert_eq!(conv_struct.pages[0].text.trim(), "Label");
+    assert_eq!(conv_struct.pages[0].diagnostics.embedded_font_fallbacks, 1);
+    assert_eq!(conv_struct.pages[0].diagnostics.missing_glyph_outlines, 1);
+    assert_eq!(conv_struct.pages[0].diagnostics.decode_failures, 0);
+    assert!(conv_struct.is_complete());
+    conv_struct
+        .ensure_complete()
+        .expect("structure-element /ActualText satisfies structured text completeness");
+
+    let conv_geom = zpdf::convert_pdf(
+        &doc_covered,
+        &[0],
+        zpdf::ConversionOptions {
+            mode: zpdf::ConversionMode::TextOnly,
+            use_structure: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(conv_geom.pages[0].diagnostics.decode_failures, 1);
+    assert!(!conv_geom.is_complete());
+    assert!(conv_geom.ensure_complete().is_err());
+
+    let page_visual = zpdf::interpret_page(&doc_covered, 0, Default::default()).unwrap();
+    assert_eq!(page_visual.stats.diagnostics.missing_glyph_outlines, 1);
+    assert!(!page_visual.is_complete());
+
+    // 2. Adding an uncovered MCID 1 (no `/ActualText`) with an unmapped CID
+    //    must still fail structured text completeness.
+    let partial_pdf = build_tagged_pdf(
+        b"0 0 0 rg /Span << /MCID 0 >> BDC BT /F1 24 Tf 15 40 Td <0001> Tj ET EMC \
+          /Span << /MCID 1 >> BDC BT /F1 24 Tf 60 40 Td <0002> Tj ET EMC",
+        true,
+    );
+    let doc_partial = PdfDocument::open(partial_pdf)
+        .unwrap()
+        .with_font_provider(Arc::new(FontProvider::memory_only()));
+    let conv_partial = zpdf::convert_pdf(
+        &doc_partial,
+        &[0],
+        zpdf::ConversionOptions {
+            mode: zpdf::ConversionMode::TextOnly,
+            use_structure: true,
+        },
+    )
+    .unwrap();
+    assert_eq!(conv_partial.pages[0].diagnostics.decode_failures, 1);
+    assert!(!conv_partial.is_complete());
+    assert!(conv_partial.ensure_complete().is_err());
+}

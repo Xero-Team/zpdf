@@ -1182,7 +1182,7 @@ fn cmd_text(args: &[String]) -> zpdf::Result<()> {
         let mut spans: Vec<zpdf::TextSpan> = Vec::new();
         {
             let oc_config = doc.oc_config().unwrap_or_default();
-            let interpreter = zpdf::ContentInterpreter::new(page.effective_box())
+            let mut interpreter = zpdf::ContentInterpreter::new(page.effective_box())
                 .with_page_user_unit(page.user_unit)
                 .with_fonts(&mut font_cache)
                 .with_document(doc.file(), &page.resources)
@@ -1191,6 +1191,9 @@ fn cmd_text(args: &[String]) -> zpdf::Result<()> {
                 .with_optional_content(&oc_config)
                 .with_text_sink(&mut spans)
                 .with_operand_stack_limit(doc.file().limits().max_operand_stack_depth as usize);
+            if let Some(tree) = &struct_tree {
+                interpreter = interpreter.with_struct_actual_text(pi, tree);
+            }
             let (_, mut stats) = interpreter.interpret_with_stats(&content_bytes);
             stats.diagnostics.set_page(pi);
             stats.diagnostics.ensure_text_complete()?;

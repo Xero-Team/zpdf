@@ -750,6 +750,40 @@ fn mark_consumed(elem: &StructElem, page: usize, depth: usize, consumed: &mut Ha
     }
 }
 
+/// Collect every `/MCID` on `page_index` whose content is subsumed by a
+/// structure element's `/ActualText` replacement in [`struct_ordered_text`].
+#[doc(hidden)]
+pub fn struct_actual_text_mcids(page_index: usize, tree: &StructTree) -> HashSet<i64> {
+    let mut covered = HashSet::new();
+    for elem in &tree.children {
+        collect_actual_text_mcids(elem, page_index, 0, &mut covered);
+    }
+    covered
+}
+
+fn collect_actual_text_mcids(
+    elem: &StructElem,
+    page: usize,
+    depth: usize,
+    covered: &mut HashSet<i64>,
+) {
+    if depth > MAX_STRUCT_TEXT_DEPTH {
+        return;
+    }
+    let on_this_page = elem.page.is_none_or(|p| p == page);
+    if elem.actual_text.is_some() {
+        if on_this_page {
+            mark_consumed(elem, page, 0, covered);
+        }
+        return;
+    }
+    for kid in &elem.kids {
+        if let StructKid::Element(child) = kid {
+            collect_actual_text_mcids(child, page, depth + 1, covered);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

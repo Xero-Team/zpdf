@@ -132,13 +132,23 @@ impl SharedFonts {
         }
         let font = Arc::new(font);
         let companion = embedded_companion.map(Arc::new);
-        if self.budget.try_admit(&font, max_bytes) {
-            let stored_companion = companion
-                .as_ref()
-                .filter(|c| self.budget.try_admit(c, max_bytes))
-                .map(Arc::clone);
-            self.fonts
-                .insert(id, (Arc::clone(&font), diagnostics, stored_companion));
+        match &companion {
+            Some(comp) => {
+                // Keep shared lookups consistent across renders: only cache a
+                // substituted font with its embedded companion when BOTH faces
+                // fit together. Caching a primary-only entry would cause later
+                // renders on fresh page caches to lose surviving embedded CIDs.
+                if self.budget.try_admit_pair(&font, comp, max_bytes) {
+                    self.fonts
+                        .insert(id, (Arc::clone(&font), diagnostics, Some(Arc::clone(comp))));
+                }
+            }
+            None => {
+                if self.budget.try_admit(&font, max_bytes) {
+                    self.fonts
+                        .insert(id, (Arc::clone(&font), diagnostics, None));
+                }
+            }
         }
         (font, diagnostics, companion)
     }
@@ -546,6 +556,59 @@ mod tests {
         shared.refresh_provider(Some(1));
         assert_eq!(shared.fonts.len(), 2);
         assert_eq!(shared.budget.bytes_used(), total);
+    }
+
+    #[test]
+    fn shared_fonts_caches_primary_and_companion_atomically() {
+        let make_font = |name: &str, bytes: &[u8]| {
+            let mut font = LoadedFont::new_placeholder(name.into());
+            font.font_data = Some(Arc::from(bytes));
+            font
+        };
+        let filler = make_font("Filler", &[1u8; 16]);
+        let primary = make_font("Primary", &[2u8; 16]);
+        let companion = make_font("Companion", &[3u8; 16]);
+        let filler_cost = filler.estimated_cache_bytes();
+        let primary_cost = primary.estimated_cache_bytes();
+        let companion_cost = companion.estimated_cache_bytes();
+
+        let mut shared = SharedFonts::default();
+        let clean = zpdf_core::ProcessingDiagnostics::default();
+        let mut fallback = zpdf_core::ProcessingDiagnostics::default();
+        fallback.record_embedded_font_fallback(Some(ObjectId(2, 0)));
+
+        // Partially fill the shared cache so primary alone fits, but primary + companion does not.
+        let budget = filler_cost + primary_cost + companion_cost - 1;
+        shared.admit(ObjectId(1, 0), filler, clean, None, budget);
+        assert_eq!(shared.budget.bytes_used(), filler_cost);
+
+        let (_, _, returned_comp) = shared.admit(
+            ObjectId(2, 0),
+            make_font("Primary", &[2u8; 16]),
+            fallback,
+            Some(make_font("Companion", &[3u8; 16])),
+            budget,
+        );
+        assert!(returned_comp.is_some());
+        assert!(
+            shared.get(ObjectId(2, 0)).is_none(),
+            "must not cache a primary-only truncated entry when companion does not fit"
+        );
+        assert_eq!(shared.budget.bytes_used(), filler_cost);
+
+        // When both fit together, the pair is cached atomically.
+        let full_budget = filler_cost + primary_cost + companion_cost;
+        let (p, _, c) = shared.admit(
+            ObjectId(2, 0),
+            primary,
+            fallback,
+            Some(companion),
+            full_budget,
+        );
+        let cached = shared.get(ObjectId(2, 0)).expect("pair cached");
+        assert!(Arc::ptr_eq(&p, &cached.0));
+        assert!(Arc::ptr_eq(c.as_ref().unwrap(), cached.2.as_ref().unwrap()));
+        assert_eq!(shared.budget.bytes_used(), full_budget);
     }
 
     #[test]

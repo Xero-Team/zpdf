@@ -196,6 +196,59 @@ test("packaged reader recovers corrupt embedded font with a substitute and rejec
     assert.match(svg, /<path/);
     assert.match(pdf.page_text(0), /ABC/);
   } finally { pdf.free(); }
+
+  // Tagged PDF whose parent structure element supplies /ActualText (Label) over
+  // an unmapped fallback CID: page_text(0) returns "Label" while page_svg(0)
+  // still rejects missing ink; an uncovered unmapped MCID fails page_text(0).
+  const assembleTagged = (streamBody, extraKid) => {
+    const kids = extraKid ? "[10 0 R 11 0 R]" : "[10 0 R]";
+    const objs = [
+      "<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 9 0 R /MarkInfo << /Marked true >> >>",
+      "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+      "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 180 100] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+      `<< /Length ${streamBody.length} >>\nstream\n${streamBody}\nendstream`,
+      "<< /Type /Font /Subtype /Type0 /BaseFont /ABCDEF+TaggedCID /Encoding /Identity-H /DescendantFonts [6 0 R] >>",
+      "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /ABCDEF+TaggedCID /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor 7 0 R /DW 1000 >>",
+      "<< /Type /FontDescriptor /FontName /ABCDEF+TaggedCID /Flags 32 /FontFile2 8 0 R >>",
+      `<< /Length ${corruptFont.length} >>\nstream\n${corruptFont}\nendstream`,
+      `<< /Type /StructTreeRoot /K ${kids} >>`,
+      "<< /Type /StructElem /S /Span /Pg 3 0 R /ActualText (Label) /K 0 >>",
+    ];
+    if (extraKid) objs.push("<< /Type /StructElem /S /Span /Pg 3 0 R /K 1 >>");
+    let raw = "%PDF-1.7\n";
+    const offs = [];
+    for (const [i, body] of objs.entries()) {
+      offs.push(Buffer.byteLength(raw));
+      raw += `${i + 1} 0 obj\n${body}\nendobj\n`;
+    }
+    const xrefOff = Buffer.byteLength(raw);
+    raw += `xref\n0 ${objs.length + 1}\n0000000000 65535 f \n`;
+    for (const off of offs) raw += `${String(off).padStart(10, "0")} 00000 n \n`;
+    raw += `trailer\n<< /Size ${objs.length + 1} /Root 1 0 R >>\nstartxref\n${xrefOff}\n%%EOF\n`;
+    return Buffer.from(raw);
+  };
+  const taggedCovered = bindings.Pdf.open(
+    assembleTagged("0 0 0 rg /Span << /MCID 0 >> BDC BT /F1 24 Tf 15 40 Td <0001> Tj ET EMC", false),
+  );
+  try {
+    assert.equal(taggedCovered.page_text(0).trim(), "Label");
+    assert.throws(
+      () => taggedCovered.page_svg(0),
+      /incomplete output.*embedded_font_fallbacks=1.*missing_glyph_outlines=1/,
+    );
+  } finally { taggedCovered.free(); }
+  const taggedUncovered = bindings.Pdf.open(
+    assembleTagged(
+      "0 0 0 rg /Span << /MCID 0 >> BDC BT /F1 24 Tf 15 40 Td <0001> Tj ET EMC /Span << /MCID 1 >> BDC BT /F1 24 Tf 60 40 Td <0002> Tj ET EMC",
+      true,
+    ),
+  );
+  try {
+    assert.throws(
+      () => taggedUncovered.page_text(0),
+      /incomplete output.*decode_failures=1.*embedded_font_fallbacks=1/,
+    );
+  } finally { taggedUncovered.free(); }
 });
 
 test("packaged editor saves Unicode, page edits, extraction and optimization", () => {

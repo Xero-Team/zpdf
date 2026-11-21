@@ -1209,8 +1209,8 @@ impl FontCache {
 
     /// If `original` is a substituted font that lacks a drawable outline for
     /// this glyph and a partially readable embedded original was retained for
-    /// it, resolve the glyph from the surviving embedded face (lazily admitting
-    /// it into the cache within `max_bytes`).
+    /// it, resolve the glyph from the surviving embedded face (lazily assigning
+    /// a drawing `FontId` when first used).
     #[doc(hidden)]
     pub fn resolve_embedded_companion_glyph(
         &mut self,
@@ -1265,6 +1265,10 @@ impl FontCache {
         let font_id = match existing_id {
             Some(id) => id,
             None => {
+                // `companion` was already charged to `self.budget` when
+                // retained by `record_embedded_companion`; `admit_drawing_font`
+                // adds 0 bytes while still checking `max_bytes` in case the
+                // caller lowered the limit.
                 let id = self.admit_drawing_font(companion, max_bytes)?;
                 if let Some((_, slot)) = self.embedded_companions.get_mut(&original.font_id) {
                     *slot = Some(id);

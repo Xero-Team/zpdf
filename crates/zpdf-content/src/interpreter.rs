@@ -170,6 +170,9 @@ pub struct ContentInterpreter<'a> {
     /// Only the outer replacement reaches the text sink. It also covers
     /// glyphs shown by forms, whose marked-content stacks are independent.
     active_actual_text: Option<ActualText>,
+    /// `/MCID`s on this page subsumed by a structure element's `/ActualText`
+    /// during structured text extraction. Empty outside structured mode.
+    struct_actual_text_mcids: std::collections::HashSet<i64>,
     actual_text_bytes: usize,
     max_actual_text_bytes: usize,
     /// Depth at which a hidden `BDC /OC` block began; painting is suppressed
@@ -801,6 +804,7 @@ impl<'a> ContentInterpreter<'a> {
             compatibility_depth: 0,
             mc_stack: Vec::new(),
             active_actual_text: None,
+            struct_actual_text_mcids: std::collections::HashSet::new(),
             actual_text_bytes: 0,
             max_actual_text_bytes: 16 << 20,
             oc_hidden_from: None,
@@ -902,6 +906,19 @@ impl<'a> ContentInterpreter<'a> {
     /// Override the marked-content (BMC/BDC) nesting limit.
     pub fn with_marked_content_limit(mut self, max_depth: usize) -> Self {
         self.max_marked_content_depth = max_depth;
+        self
+    }
+
+    /// Supply the Tagged-PDF structure tree for `page_index` in structured
+    /// text mode so structure-element `/ActualText` replacements satisfy
+    /// text-decoding completeness for the MCIDs they subsume.
+    #[doc(hidden)]
+    pub fn with_struct_actual_text(
+        mut self,
+        page_index: usize,
+        tree: &zpdf_document::StructTree,
+    ) -> Self {
+        self.struct_actual_text_mcids = crate::text::struct_actual_text_mcids(page_index, tree);
         self
     }
 
@@ -4747,7 +4764,15 @@ impl<'a> ContentInterpreter<'a> {
         };
         if fc.get_by_name(&name).is_none() {
             let max_bytes = self.max_font_cache_bytes;
-            match load_font_ref(self.shared_font_doc, file, fc, font_ref, &name, max_bytes) {
+            match load_font_ref(
+                self.shared_font_doc,
+                file,
+                fc,
+                font_ref,
+                &name,
+                max_bytes,
+                None,
+            ) {
                 Ok(Some(diag)) => self.stats.diagnostics.merge(diag),
                 Ok(None) => {}
                 Err(e) => {
@@ -4820,11 +4845,17 @@ impl<'a> ContentInterpreter<'a> {
         // Page resources are capped by MAX_RESOURCE_ENTRIES; a form's raw
         // /Font dictionary bypasses that parser, so bound it here too.
         const MAX_FORM_FONT_ENTRIES: usize = 65_536;
+        let mut pending_companions: Vec<(FontId, std::sync::Arc<zpdf_font::LoadedFont>)> =
+            Vec::new();
         for (name, obj) in fonts.0.iter().take(MAX_FORM_FONT_ENTRIES) {
             // A font entry is normally an indirect reference; a synthesized
             // form-field appearance may instead carry an inline font dict.
             let load_into = |fc: &mut FontCache,
-                             target: &str|
+                             target: &str,
+                             pending_companions: &mut Vec<(
+                FontId,
+                std::sync::Arc<zpdf_font::LoadedFont>,
+            )>|
              -> Result<
                 Option<zpdf_core::ProcessingDiagnostics>,
                 zpdf_core::Error,
@@ -4838,6 +4869,7 @@ impl<'a> ContentInterpreter<'a> {
                             *font_ref,
                             target,
                             max_font_bytes,
+                            Some(pending_companions),
                         );
                     }
                     PdfObject::Dict(font_dict) => {
@@ -4859,7 +4891,7 @@ impl<'a> ContentInterpreter<'a> {
                     Ok(fid) => {
                         if let Some(companion) = companion {
                             if fc.get(fid).is_some_and(|f| f.has_font_data()) {
-                                fc.record_embedded_companion(fid, std::sync::Arc::new(companion));
+                                pending_companions.push((fid, std::sync::Arc::new(companion)));
                             }
                         }
                         Ok(None)
@@ -4891,7 +4923,7 @@ impl<'a> ContentInterpreter<'a> {
                     // reused).
                     let unique_name = format!("__font_{}_{}", font_ref.0, font_ref.1);
                     if fc.get_by_name(&unique_name).is_none() {
-                        match load_into(fc, &unique_name) {
+                        match load_into(fc, &unique_name, &mut pending_companions) {
                             Ok(Some(diag)) => self.stats.diagnostics.merge(diag),
                             Ok(None) => {}
                             Err(e) => {
@@ -4916,7 +4948,7 @@ impl<'a> ContentInterpreter<'a> {
                     let target = format!("__inline_font_{:016x}", inline_font_key(font_dict));
                     overrides.insert(name.0.clone(), target.clone());
                     if fc.get_by_name(&target).is_none() {
-                        match load_into(fc, &target) {
+                        match load_into(fc, &target, &mut pending_companions) {
                             Ok(Some(diag)) => self.stats.diagnostics.merge(diag),
                             Ok(None) => {}
                             Err(e) => {
@@ -4932,6 +4964,9 @@ impl<'a> ContentInterpreter<'a> {
                 }
                 _ => {}
             }
+        }
+        for (fid, companion) in pending_companions {
+            let _ = fc.record_embedded_companion(fid, companion, max_font_bytes);
         }
 
         if !overrides.is_empty() {
@@ -6108,13 +6143,20 @@ impl<'a> ContentInterpreter<'a> {
 
     /// Verify that a fallback text run contributing to the text sink decodes
     /// every shown code (even when all outlines draw or render mode 3 makes the
-    /// run invisible). An active `/ActualText` replacement supplies the
-    /// extracted text directly and satisfies text completeness.
+    /// run invisible). An active content-stream `/ActualText` replacement, or a
+    /// structure-element `/ActualText` covering this run's `/MCID` in
+    /// structured mode, supplies the extracted text directly and satisfies text
+    /// completeness.
     fn check_embedded_fallback_text(&mut self, font_id: FontId, bytes: &[u8]) {
+        let struct_actual_text_covers = !self.struct_actual_text_mcids.is_empty()
+            && self
+                .current_mcid()
+                .is_some_and(|mcid| self.struct_actual_text_mcids.contains(&(mcid as i64)));
         if self.text_sink.is_none()
             || bytes.is_empty()
             || self.oc_suppressed()
             || self.active_actual_text.is_some()
+            || struct_actual_text_covers
             || self.reported_font_text_misses.contains(&font_id)
         {
             return;
@@ -6980,6 +7022,7 @@ fn load_font_ref(
     font_ref: ObjectId,
     name: &str,
     max_bytes: u64,
+    pending_companions: Option<&mut Vec<(FontId, std::sync::Arc<zpdf_font::LoadedFont>)>>,
 ) -> Result<Option<zpdf_core::ProcessingDiagnostics>, zpdf_core::Error> {
     let shared = doc.filter(|doc| {
         std::ptr::eq(doc.file(), file)
@@ -7015,7 +7058,11 @@ fn load_font_ref(
         Ok(fid) => {
             if let Some(companion) = companion {
                 if fc.get(fid).is_some_and(|f| f.has_font_data()) {
-                    fc.record_embedded_companion(fid, companion);
+                    if let Some(pending) = pending_companions {
+                        pending.push((fid, companion));
+                    } else {
+                        let _ = fc.record_embedded_companion(fid, companion, max_bytes);
+                    }
                 }
             }
             Ok(None)
