@@ -49,6 +49,10 @@ See [docs/review/HAYRO_MINIPDF_GAP_ANALYSIS_2026_11_19.md](review/HAYRO_MINIPDF_
 - FlateDecode ignores a bad Adler-32 checksum and keeps every byte decoded
   before a mid-stream error (miniz_oxide used directly).
 - RunLengthDecode keeps the runs decoded before a truncated run.
+- DCTDecode honours `/DecodeParms /ColorTransform` when the JPEG has no Adobe
+  APP14 marker: `0` keeps a three-component JPEG's stored RGB instead of
+  converting it as if it were YCbCr, and `1` decodes four components as YCCK.
+  The marker, when present, still decides. (#175)
 - JBIG2 immediate generic and refinement regions are budgeted by their
   declared area, so sparse 300 dpi pages are no longer left blank.
 - Content streams ignore a minus sign inside a number (`12.5-`), and path
