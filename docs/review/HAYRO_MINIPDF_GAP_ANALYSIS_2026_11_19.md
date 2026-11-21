@@ -9,6 +9,73 @@
 | Compared | hayro 0.9.0 family (hayro, -syntax, -interpret, -font, -cmap, -jbig2, -jpeg2000, -ccitt, -svg, -write, -postscript); minipdf 0.7.0 |
 | Status | Nine gaps fixed in the working tree (see CHANGELOG "Unreleased"); the rest ranked below |
 
+### Rebase and audit follow-up (2026-11-21)
+
+PR #154 is rebased onto `cc26be6` (the merged glyph-selection work in #152).
+The corpus measurements below are historical results from the original PR;
+they have not been remeasured for this audit. The remaining-gap inventory also
+describes the original comparison, rather than a fresh inventory of main.
+
+The follow-up corrects the reviewed resource and fidelity problems:
+
+- Encrypted recovery counts direct plus unique compressed objects before
+  collecting new entries. Open-time exhaustion returns an error; lazy repair
+  memoizes the failed scan. Duplicate compressed members use the later container
+  offset, with direct objects retaining precedence.
+- If resolving a missing `/Encrypt` reference built the lazy scan before
+  authentication, upgrade that cached scan once the decryptor exists. A
+  synthetic stale-xref test previously returned null for the encrypted page
+  tree and now resolves it correctly.
+- JBIG2 generic/refinement regions share a work ceiling of twice the configured
+  per-image pixel cap (itself bounded by the internal bitmap cap), charged as
+  area plus row count before allocation. Globals, page-info resets and failed
+  regions do not renew that allowance. Exceeding it fails the decode; legitimate
+  sparse regions retain their area-based MQ allowance.
+- Mask upsampling computes coordinates on demand, with constant auxiliary
+  mapping storage. It checks source arithmetic and incomplete alpha planes
+  before allocating the enlarged image. Existing pixel-centre interpolation
+  and high-resolution mask behaviour remain covered.
+- JPX Indexed decoding reads original component samples, preserving 2-, 4-
+  and 8-bit indices even when a JP2 palette is present. Synthetic fixtures and
+  their generator are included.
+- JPX also checks decoded component bytes against `max_decoded_stream_bytes`
+  before allocating decoder planes. This bounds the memory amplification of
+  the newly accepted multi-colorant streams; pixel count alone was insufficient.
+  A two-channel regression fails one byte below the required count and succeeds
+  exactly at it. The limit applies to all JPX component counts.
+- Flate uses the inflater's full 32 KiB dictionary-sized output buffer, retaining
+  bytes produced immediately before a corrupt block fails. Output reservations
+  remain mandatory; corruption does not bypass the decode budget.
+- Recovering embedded minus signs retains the numeric value and records known
+  malformed content for strict callers.
+
+Regression tests reproduce the original aggregate-object, revision-selection,
+Flate-prefix, tokenizer-diagnostic and cumulative-JBIG2 failures. The follow-up
+also checks exact-limit success, memoized failures, byte-exact JPX palette
+selection, skinny masks and malformed image geometry. Public APIs and the
+pure-Rust runtime dependency policy are unchanged.
+
+Final validation on macOS arm64 with Rust 1.100.0:
+
+| Check | Result |
+|---|---|
+| `cargo +1.100.0 fmt --all --check` and `git diff --check` | Passed |
+| `cargo +1.100.0 clippy --workspace --all-targets --offline -- -D warnings` | Passed; existing Cargo manifest and third-party future-compatibility notices remain |
+| `cargo +1.100.0 test --workspace --offline --no-fail-fast` | 1,816 passed, 0 failed, 2 ignored |
+| `build-web.sh` with Rust 1.100.0 and wasm-bindgen 0.2.129 | Release WASM rebuilt; all 9 package/fingerprint checks passed |
+| Font fixtures and Adobe CMap regeneration checks | Passed |
+| Font/CMap Python helper tests and browser font-pack tests | 14 Python tests and 5 Node tests passed |
+| New indexed JP2 fixture regeneration | All three files reproduced byte-for-byte |
+
+The final diff was reviewed again after the fixes; no additional blocking
+findings remain in the reviewed changes. Inverse regression runs confirmed
+that removing the palette and malformed-mask fixes makes their tests fail.
+This is an agent audit, not a human approval or an exhaustive security proof.
+The 506-file comparison and Linux/Windows-specific checks were not rerun locally.
+Keeping full mask resolution still costs more than shrinking it. Valid but
+unusually large JPX images or repeated JBIG2 regions can now hit the configured
+resource limits; callers can raise their limits when appropriate.
+
 ## 1. What the two projects are
 
 **hayro** (LaurenzV, MIT/Apache-2.0, ~74k lines across 11 crates) is a pure-Rust

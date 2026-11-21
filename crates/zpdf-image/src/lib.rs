@@ -397,7 +397,7 @@ pub fn decode_image_xobject_resolved_with_limits(
         if let Some(cs) = &cs {
             cs.validate(0)?;
         }
-        return decode_jpx_image(decoded_data, dict, cs.as_ref(), limits.max_image_pixels);
+        return decode_jpx_image(decoded_data, dict, cs.as_ref(), limits);
     }
 
     let width_value = dict.get_i64("Width")?;
@@ -468,8 +468,9 @@ pub fn decode_image_xobject_resolved_with_limits(
 /// Fold a decoded `/SMask` (luminosity soft mask) into `image` as alpha. The
 /// mask must come through the same full image-decode path as any image (so
 /// filters, predictors, sub-byte bpc and /Decode all apply); the decoded gray
-/// level is the alpha. A mask whose dimensions differ from the image is
-/// bilinearly resampled to the image size. RGB is premultiplied as the alpha
+/// level is the alpha. A mask finer on both axes keeps its resolution and the
+/// image is bilinearly enlarged; otherwise the mask is resampled to the image
+/// size. RGB is premultiplied as the alpha
 /// folds in, because both backends (tiny-skia `PixmapRef::from_bytes` and the
 /// wgpu `Rgba8Unorm` upload) treat the bytes as premultiplied RGBA.
 pub fn apply_smask_image(image: &mut DecodedImage, mask: &DecodedImage) {
@@ -947,7 +948,7 @@ fn decode_jpx_image(
     data: &[u8],
     dict: &PdfDict,
     colorspace: Option<&ResolvedColorSpace>,
-    max_image_pixels: u64,
+    limits: &ParseLimits,
 ) -> Result<DecodedImage> {
     use hayro_jpeg2000::{ColorSpace as JpxColorSpace, DecodeSettings, DecoderContext, Image};
     use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -984,6 +985,7 @@ fn decode_jpx_image(
     // Re-check the pixel limit against the *codestream* header dims, which
     // are authoritative and may differ from the dict's /Width × /Height.
     let (width, height) = (image.width(), image.height());
+    let max_image_pixels = limits.max_image_pixels;
     let pixel_count = (width as u64).saturating_mul(height as u64);
     if pixel_count == 0 || pixel_count > max_image_pixels {
         return Err(Error::StreamDecode(format!(
@@ -1028,6 +1030,25 @@ fn decode_jpx_image(
     };
     let has_alpha = image.has_alpha();
     let channels = ncolor + usize::from(has_alpha);
+    let indexed = ncolor == 1 && matches!(colorspace, Some(ResolvedColorSpace::Indexed { .. }));
+
+    // JPX bypasses decompression in the parser's filter pipeline, so enforce
+    // its decoded-byte ceiling here, before allocating component planes. A
+    // pixel-only check would multiply memory by up to 32 colour channels.
+    let sample_count = pixel_count
+        .checked_mul(channels as u64)
+        .ok_or_else(|| Error::StreamDecode("JPX decoded sample count overflow".into()))?;
+    if sample_count > limits.max_decoded_stream_bytes {
+        return Err(Error::StreamDecode(format!(
+            "JPX decoded samples exceed the {}-byte limit",
+            limits.max_decoded_stream_bytes
+        )));
+    }
+    let pixel_count = usize::try_from(pixel_count)
+        .map_err(|_| Error::StreamDecode("JPX pixel count does not fit memory size".into()))?;
+    let expected_samples = usize::try_from(sample_count).map_err(|_| {
+        Error::StreamDecode("JPX decoded sample count does not fit memory size".into())
+    })?;
 
     let samples = catch_unwind(AssertUnwindSafe(|| {
         // hayro-jpeg2000 0.4 split decoding into a reusable `DecoderContext`
@@ -1036,15 +1057,25 @@ fn decode_jpx_image(
         // `data_u8()` re-interleaves the components back into the same layout
         // 0.3.5 returned, so the downstream per-pixel chunking is unchanged.
         let mut ctx = DecoderContext::default();
-        image.decode(&mut ctx).map(|decoded| decoded.data_u8())
+        image.decode(&mut ctx).map(|decoded| {
+            let mut samples = decoded.data_u8();
+            if indexed {
+                // data_u8 normalizes even unresolved palette components to
+                // 0..255. PDF Indexed values are integer indices, not colour
+                // intensities (ISO 32000-1 7.4.9); preserve the raw component.
+                // Any alpha channel still uses its normal 8-bit conversion.
+                for (pixel, &index) in samples
+                    .chunks_exact_mut(channels)
+                    .zip(decoded.components()[0].samples())
+                {
+                    pixel[0] = index.round().clamp(0.0, 255.0) as u8;
+                }
+            }
+            samples
+        })
     }))
     .map_err(|_| Error::StreamDecode("JPXDecode: decoder panicked decoding codestream".into()))?
     .map_err(|e| Error::StreamDecode(format!("JPXDecode: {e}")))?;
-    let pixel_count = usize::try_from(pixel_count)
-        .map_err(|_| Error::StreamDecode("JPX pixel count does not fit memory size".into()))?;
-    let expected_samples = pixel_count
-        .checked_mul(channels)
-        .ok_or_else(|| Error::StreamDecode("JPX decoded sample count overflow".into()))?;
     if samples.len() < expected_samples {
         return Err(Error::StreamDecode(format!(
             "JPX decoded data too short: {} bytes for {width}x{height}x{channels}",
@@ -2233,6 +2264,11 @@ fn fold_alpha_plane(image: &mut DecodedImage, alpha: &[u8], aw: u32, ah: u32) {
     if image.width == 0 || image.height == 0 || aw == 0 || ah == 0 {
         return;
     }
+    // Public callers can supply an incomplete mask. Its declared dimensions
+    // alone must not authorize allocating a larger colour image.
+    if u64::from(aw) * u64::from(ah) > alpha.len() as u64 {
+        return;
+    }
     // A mask finer than its image on both axes (MRC scans: a low-res colour
     // layer under a high-res text mask) keeps its own resolution; shrinking
     // it to the image's would erase the text shapes. The upsampled image has
@@ -2259,37 +2295,42 @@ fn fold_alpha_plane(image: &mut DecodedImage, alpha: &[u8], aw: u32, ah: u32) {
 /// pass with 8-bit fixed-point weights (a 600 dpi mask is ~4.6 Mpx).
 fn upsample_rgba(image: &mut DecodedImage, dw: u32, dh: u32) {
     let (sw, sh) = (image.width as usize, image.height as usize);
+    if sw == 0 || sh == 0 || dw == 0 || dh == 0 {
+        return;
+    }
     let Some(len) = (dw as usize)
         .checked_mul(dh as usize)
         .and_then(|n| n.checked_mul(4))
     else {
         return;
     };
-    if image.data.len() < sw * sh * 4 {
+    let Some(source_len) = sw.checked_mul(sh).and_then(|n| n.checked_mul(4)) else {
+        return;
+    };
+    if image.data.len() < source_len {
         return;
     }
     // Source sample pair and weight of the second (0..=256) per destination
     // column or row.
-    let axis = |dst: u32, src: usize| -> Vec<(usize, usize, u32)> {
+    // Compute coordinates on demand: axis tables for a legal 1x100M mask
+    // otherwise consume gigabytes in addition to the bounded pixel buffers.
+    let axis = |d: u32, dst: u32, src: usize| -> (usize, usize, u32) {
         let scale = src as f64 / dst as f64;
-        (0..dst)
-            .map(|d| {
-                let f = ((d as f64 + 0.5) * scale - 0.5).clamp(0.0, (src - 1) as f64);
-                let i0 = f.floor() as usize;
-                (
-                    i0,
-                    (i0 + 1).min(src - 1),
-                    ((f - i0 as f64) * 256.0).round() as u32,
-                )
-            })
-            .collect()
+        let f = ((d as f64 + 0.5) * scale - 0.5).clamp(0.0, (src - 1) as f64);
+        let i0 = f.floor() as usize;
+        (
+            i0,
+            (i0 + 1).min(src - 1),
+            ((f - i0 as f64) * 256.0).round() as u32,
+        )
     };
-    let (cols, rows) = (axis(dw, sw), axis(dh, sh));
     let row = |y: usize| &image.data[y * sw * 4..(y + 1) * sw * 4];
     let mut out = Vec::with_capacity(len);
-    for &(y0, y1, wy) in &rows {
+    for y in 0..dh {
+        let (y0, y1, wy) = axis(y, dh, sh);
         let (r0, r1) = (row(y0), row(y1));
-        for &(x0, x1, wx) in &cols {
+        for x in 0..dw {
+            let (x0, x1, wx) = axis(x, dw, sw);
             for c in 0..4 {
                 let top = r0[x0 * 4 + c] as u32 * (256 - wx) + r0[x1 * 4 + c] as u32 * wx;
                 let bot = r1[x0 * 4 + c] as u32 * (256 - wx) + r1[x1 * 4 + c] as u32 * wx;
@@ -2907,6 +2948,57 @@ mod tests {
         for i in 0..4 {
             assert_eq!(pixel(&img, i)[3], 100);
         }
+    }
+
+    #[test]
+    fn rgba_upsampling_matches_pixel_center_mapping() {
+        for (sw, sh, dw, dh) in [(2, 3, 7, 11), (1, 2, 1, 4096), (2, 1, 4096, 1)] {
+            let source: Vec<u8> = (0..sw * sh * 4).map(|i| (i * 19 % 256) as u8).collect();
+            let mut image = DecodedImage {
+                width: sw,
+                height: sh,
+                data: source.clone(),
+                has_alpha: false,
+                is_image_mask: false,
+                premultiplied: false,
+            };
+            upsample_rgba(&mut image, dw, dh);
+            assert_eq!((image.width, image.height), (dw, dh));
+            for c in 0..4 {
+                let plane: Vec<u8> = source.as_chunks::<4>().0.iter().map(|px| px[c]).collect();
+                let expected = resample_bilinear(&plane, sw, sh, dw, dh);
+                for (px, value) in image.data.as_chunks::<4>().0.iter().zip(expected) {
+                    assert!(
+                        px[c].abs_diff(value) <= 1,
+                        "fixed-point interpolation differs"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rgba_upsampling_rejects_incomplete_source_geometry() {
+        let mut image = DecodedImage {
+            width: u32::MAX,
+            height: u32::MAX,
+            data: vec![1, 2, 3, 255],
+            has_alpha: false,
+            is_image_mask: false,
+            premultiplied: false,
+        };
+        upsample_rgba(&mut image, 4, 4);
+        assert_eq!(image.data, [1, 2, 3, 255]);
+        assert_eq!(image.width, u32::MAX);
+    }
+
+    #[test]
+    fn incomplete_finer_mask_does_not_resize_image() {
+        let mut image =
+            decode_image_xobject(&[255, 0, 0], &image_dict(1, 1, 8, Some("DeviceRGB"))).unwrap();
+        fold_alpha_plane(&mut image, &[255], 4, 4);
+        assert_eq!((image.width, image.height), (1, 1));
+        assert_eq!(image.data, [255, 0, 0, 255]);
     }
 
     #[test]

@@ -4,8 +4,8 @@
 
 use zpdf_core::{ParseLimits, PdfDict, PdfName, PdfObject, PdfString};
 use zpdf_image::{
-    decode_image_xobject, decode_image_xobject_resolved, decode_image_xobject_with_limits,
-    DecodedImage, ResolvedColorSpace,
+    decode_image_xobject, decode_image_xobject_resolved, decode_image_xobject_resolved_with_limits,
+    decode_image_xobject_with_limits, DecodedImage, ResolvedColorSpace,
 };
 
 const W: u32 = 32;
@@ -221,6 +221,39 @@ fn dict_colorspace_overrides_codestream_without_caller_colorspace() {
 }
 
 #[test]
+fn indexed_jp2_preserves_low_bit_depth_indices() {
+    for (bits, bytes) in [
+        (2, include_bytes!("fixtures/indexed_2bit.jp2").as_slice()),
+        (4, include_bytes!("fixtures/indexed_4bit.jp2").as_slice()),
+        (8, include_bytes!("fixtures/indexed_8bit.jp2").as_slice()),
+    ] {
+        let count = 1usize << bits;
+        let mut dict = jpx_dict(count as i64, 1);
+        let lookup: Vec<u8> = (0..count)
+            .flat_map(|i| [i as u8, 0, 255 - i as u8])
+            .collect();
+        dict.insert(
+            PdfName::new("ColorSpace"),
+            PdfObject::Array(vec![
+                PdfObject::Name(PdfName::new("Indexed")),
+                PdfObject::Name(PdfName::new("DeviceRGB")),
+                PdfObject::Integer(count as i64 - 1),
+                PdfObject::String(PdfString(lookup)),
+            ]),
+        );
+        let img = decode_image_xobject(bytes, &dict).unwrap();
+        assert_eq!((img.width, img.height), (count as u32, 1));
+        for i in 0..count {
+            assert_eq!(
+                px(&img, i),
+                &[i as u8, 0, 255 - i as u8, 255],
+                "{bits}-bit index {i}"
+            );
+        }
+    }
+}
+
+#[test]
 fn stencil_mask_starting_with_a_jpx_signature_stays_a_stencil() {
     // 1-bit stencil rows that happen to begin with SOC+SIZ, no /Filter: the
     // signature sniff must not reroute an image mask to the JPX decoder.
@@ -262,6 +295,45 @@ fn two_channel_codestream_uses_devicen_colorspace() {
 }
 
 /// With no /ColorSpace to interpret them, two channels stay unsupported.
+#[test]
+fn jpx_component_samples_obey_decoded_byte_limit() {
+    let tint = ResolvedColorSpace::Tint {
+        n: 2,
+        transform: None,
+        alternate: Box::new(ResolvedColorSpace::Gray),
+    };
+    let required = u64::from(W) * u64::from(H) * 2;
+    let limits = ParseLimits {
+        max_decoded_stream_bytes: required - 1,
+        ..Default::default()
+    };
+    let result = decode_image_xobject_resolved_with_limits(
+        TWO_CHANNEL_J2K,
+        &jpx_dict(W as i64, H as i64),
+        [0, 0, 0],
+        Some(tint.clone()),
+        &limits,
+    );
+    assert!(
+        result.is_err(),
+        "JPX components must share the decoded byte ceiling"
+    );
+    let error = result.unwrap_err().to_string();
+    assert!(error.contains("decoded sample"), "{error}");
+    let limits = ParseLimits {
+        max_decoded_stream_bytes: required,
+        ..limits
+    };
+    assert!(decode_image_xobject_resolved_with_limits(
+        TWO_CHANNEL_J2K,
+        &jpx_dict(W as i64, H as i64),
+        [0, 0, 0],
+        Some(tint),
+        &limits,
+    )
+    .is_ok());
+}
+
 #[test]
 fn two_channel_codestream_without_colorspace_errors() {
     let err = decode_image_xobject(TWO_CHANNEL_J2K, &jpx_dict(W as i64, H as i64)).unwrap_err();

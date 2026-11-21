@@ -615,7 +615,9 @@ fn inflate_chunked(
 
     let mut state = InflateState::new_boxed(format);
     let mut out = Vec::new();
-    let mut buf = [0u8; 16 * 1024];
+    // A Data error makes the streaming adapter undrainable. Accommodate its
+    // entire dictionary so bytes already decoded before that error survive.
+    let mut buf = [0u8; miniz_oxide::inflate::core::TINFL_LZ_DICT_SIZE];
     let mut input = data;
     loop {
         let res = inflate(&mut state, input, &mut buf, MZFlush::None);
@@ -1127,14 +1129,14 @@ mod tests {
     }
 
     /// Only the Adler-32 trailer is wrong: every byte must still decode, at
-    /// sizes below, at and well above the 16 KiB inflate chunk.
+    /// sizes below, at and well above the 32 KiB inflate chunk.
     #[test]
     fn flate_ignores_bad_adler32() {
         use flate2::write::ZlibEncoder;
         use flate2::Compression;
         use std::io::Write;
 
-        for len in [2_010usize, 16 * 1024, 100_032] {
+        for len in [2_010usize, 32 * 1024, 100_032] {
             let original: Vec<u8> = (0..len).map(|i| (i * 7 % 251) as u8).collect();
             let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
             encoder.write_all(&original).unwrap();
@@ -1149,6 +1151,30 @@ mod tests {
                 original,
                 "len {len}"
             );
+        }
+    }
+
+    #[test]
+    fn flate_keeps_all_output_before_corrupt_block() {
+        // RFC 1951: a nonfinal stored block followed by reserved BTYPE=3.
+        // The inflater can produce its whole 32 KiB dictionary before it
+        // returns Data, so a smaller caller buffer loses the undrained tail.
+        for len in [20_000u16, 32_768, 50_000] {
+            let original: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            let mut data = vec![0x78, 0x01, 0x00];
+            data.extend_from_slice(&len.to_le_bytes());
+            data.extend_from_slice(&(!len).to_le_bytes());
+            data.extend_from_slice(&original);
+            data.push(0x07);
+            let mut budget = DecodeBudget::new(u64::from(len));
+            let decoded = decode_flate(&data, &mut budget).unwrap();
+            assert!(
+                decoded == original,
+                "decoded {} of {len} bytes",
+                decoded.len()
+            );
+            let mut short = DecodeBudget::new(u64::from(len) - 1);
+            assert!(decode_flate(&data, &mut short).is_err());
         }
     }
 

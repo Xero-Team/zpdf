@@ -57,6 +57,18 @@ See [docs/review/HAYRO_MINIPDF_GAP_ANALYSIS_2026_11_19.md](review/HAYRO_MINIPDF_
   cell) is refused on re-entry instead of expanding to the command budget.
 - A soft mask or stencil mask finer than its image keeps its own resolution
   (MRC scans keep their text shapes).
+- Bound encrypted recovery by the total number of direct and unique compressed
+  objects, and prefer the latest container offset for duplicate members.
+- Refresh repair tables built while resolving `/Encrypt` after authentication,
+  so missing encrypted page-tree entries can be recovered on that path too.
+- Share a cumulative generic/refinement region-work budget across JBIG2 globals
+  and page segments; exhausted work budgets are decode errors.
+- Preserve low-bit-depth JPX palette indices and all Flate output produced before
+  corrupt blocks. Recovered stray minus signs now record malformed content.
+- Compute mask resize coordinates on demand and reject incomplete masks before
+  upsampling, avoiding large scratch allocations for extreme aspect ratios.
+- Apply the decoded-stream byte ceiling to JPX component samples before full
+  decompression, including multi-colorant images.
 
 ## 0.20.0 — Shared stream storage and lower pipeline memory
 

@@ -231,6 +231,7 @@ impl<'a> ContentTokenizer<'a> {
         }
         let raw = &self.data[start..self.pos];
         let raw: std::borrow::Cow<[u8]> = if stray_minus {
+            self.malformed();
             let (sign, digits) = raw.split_at(1);
             let digits = digits.iter().filter(|&&b| b != b'-');
             sign.iter()
@@ -774,7 +775,9 @@ mod tests {
 
     #[test]
     fn minus_inside_a_number_is_ignored() {
-        let tokens: Vec<_> = ContentTokenizer::new(b"12.5- 30 4-2 m").collect();
+        let mut tokenizer = ContentTokenizer::new(b"12.5- 30 4-2 m");
+        let tokens: Vec<_> = tokenizer.by_ref().collect();
+        assert_eq!(tokenizer.diagnostics().malformed_content, 2);
         assert!(matches!(&tokens[0], ContentToken::Operand(PdfObject::Real(n)) if *n == 12.5));
         assert!(matches!(
             &tokens[1],

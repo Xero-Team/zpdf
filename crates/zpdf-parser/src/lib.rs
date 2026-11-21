@@ -104,7 +104,6 @@ impl PdfFile {
                 (xref, trailer)
             }
             other => {
-                recovered = true;
                 match &other {
                     Err(e) => {
                         tracing::warn!("xref parse failed ({e}); attempting tail-scan recovery")
@@ -114,7 +113,10 @@ impl PdfFile {
                     }
                 }
                 match recovery::scan_all_objects(&data, &limits) {
-                    Ok(recovered) => recovered,
+                    Ok(result) => {
+                        recovered = true;
+                        result
+                    }
                     // Recovery failed: fall back to the normal parse if it at
                     // least produced a table, else surface the most useful error.
                     // For a file that never carried a `%PDF` marker, NotAPdf is
@@ -150,9 +152,26 @@ impl PdfFile {
         // fetch the (never-encrypted) /Encrypt dict; `decryptor` is still `None`
         // at this point, so that resolve does not try to decrypt it.
         file.decryptor = file.build_decryptor(password)?;
-        if recovered && file.decryptor.is_some() {
-            let members = file.encrypted_objstm_members(&file.xref);
-            insert_compressed_members(&mut file.xref, members);
+        if file.decryptor.is_some() {
+            if recovered {
+                let members = file.encrypted_objstm_members(&file.xref)?;
+                insert_compressed_members(&mut file.xref, members);
+            }
+            // Resolving a missing/stale /Encrypt reference can build the lazy
+            // repair scan before authentication. Upgrade that existing table
+            // now too, or missing encrypted members stay invisible forever.
+            // Preserve a memoized failed scan rather than retrying it.
+            if let Some(repair) = file.repair_table.take() {
+                let repair = repair
+                    .map(|mut table| -> Result<XrefTable> {
+                        let members = file.encrypted_objstm_members(&table)?;
+                        insert_compressed_members(&mut table, members);
+                        file.objstm_failed.borrow_mut().clear();
+                        Ok(table)
+                    })
+                    .transpose()?;
+                file.repair_table = OnceCell::from(repair);
+            }
         }
         Ok(file)
     }
@@ -161,8 +180,15 @@ impl PdfFile {
     /// encrypted file every compressed object (often the whole page tree) is
     /// missing from a rebuilt table. List the members of `table`'s object
     /// streams now that the containers decrypt, as `(member, container, index)`.
-    fn encrypted_objstm_members(&self, table: &XrefTable) -> Vec<(ObjectId, u32, u32)> {
-        let mut members = Vec::new();
+    fn encrypted_objstm_members(&self, table: &XrefTable) -> Result<Vec<(ObjectId, u32, u32)>> {
+        // Keep only one candidate per object, bounded before insertion. The
+        // file offset, not HashMap order or object number, decides which
+        // compressed revision wins; scanned direct objects keep precedence.
+        let mut members: HashMap<ObjectId, (u64, u32, u32)> = HashMap::new();
+        let mut total = table.len();
+        if total > self.limits.max_objects as usize {
+            return Err(zpdf_core::Error::InvalidXref(0));
+        }
         for id in table.object_ids() {
             // Object-stream containers are never generation > 0 (7.5.7).
             let (0, Some(XrefEntry::InUse { offset, .. })) = (id.1, table.get(id)) else {
@@ -181,21 +207,49 @@ impl PdfFile {
                 continue;
             };
             for (index, (num, _)) in decoded.entries.iter().enumerate() {
-                members.push((ObjectId(*num, 0), id.0, index as u32));
+                let member = ObjectId(*num, 0);
+                match table.get(member) {
+                    Some(XrefEntry::Compressed { stream_obj, .. }) => {
+                        if matches!(table.get(ObjectId(*stream_obj, 0)),
+                            Some(XrefEntry::InUse { offset: old, .. }) if old >= offset)
+                        {
+                            continue;
+                        }
+                    }
+                    Some(_) => continue,
+                    None => {}
+                }
+                if let Some((old, _, _)) = members.get(&member) {
+                    if old >= offset {
+                        continue;
+                    }
+                } else if table.get(member).is_none() {
+                    if total >= self.limits.max_objects as usize {
+                        return Err(zpdf_core::Error::InvalidXref(0));
+                    }
+                    total += 1;
+                }
+                members.insert(member, (*offset, id.0, index as u32));
             }
         }
-        members
+        Ok(members
+            .into_iter()
+            .map(|(id, (_, stream, index))| (id, stream, index))
+            .collect())
     }
 
     /// Build the full-file repair-scan table; in an encrypted file, add the
     /// members of object streams the scan could not decrypt.
     fn build_repair_table(&self) -> Option<XrefTable> {
-        match recovery::scan_object_table(&self.data, &self.limits) {
-            Ok(mut table) => {
-                if self.decryptor.is_some() {
-                    let members = self.encrypted_objstm_members(&table);
-                    insert_compressed_members(&mut table, members);
-                }
+        let result = recovery::scan_object_table(&self.data, &self.limits).and_then(|mut table| {
+            if self.decryptor.is_some() {
+                let members = self.encrypted_objstm_members(&table)?;
+                insert_compressed_members(&mut table, members);
+            }
+            Ok(table)
+        });
+        match result {
+            Ok(table) => {
                 // Containers that failed at their xref offset get one retry at
                 // the offset this scan found (see `decode_objstm`).
                 self.objstm_failed.borrow_mut().clear();
@@ -1029,7 +1083,10 @@ fn estimate_objstm_bytes(stream: &DecodedObjStm) -> u64 {
 fn insert_compressed_members(table: &mut XrefTable, members: Vec<(ObjectId, u32, u32)>) {
     let mut added = 0usize;
     for (id, stream_obj, index_in_stream) in members {
-        if table.get(id).is_none() {
+        if !matches!(
+            table.get(id),
+            Some(XrefEntry::InUse { .. } | XrefEntry::Free { .. })
+        ) {
             table.insert_overwrite(
                 id,
                 XrefEntry::Compressed {
