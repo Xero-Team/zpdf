@@ -32,6 +32,44 @@
   returns `Option<Rect>`: `None` for a match with no rectangle, instead of a
   rectangle that could be mistaken for one at the page origin.
 
+### Rendering fixes from a differential comparison with hayro
+
+See [docs/review/HAYRO_MINIPDF_GAP_ANALYSIS_2026_11_19.md](review/HAYRO_MINIPDF_GAP_ANALYSIS_2026_11_19.md).
+
+- Recover encrypted files with a damaged xref: object-stream members are
+  re-indexed once the decryptor exists, and a container with a stale xref
+  offset is decoded at the offset the repair scan found. Page trees stored in
+  encrypted object streams no longer render blank or fail to open.
+- Honour `/lenIV -1` in embedded Type 1 fonts (charstrings stored
+  unencrypted) instead of scrambling every outline.
+- JPEG 2000: keep raw indices for a PDF `/Indexed` space instead of applying
+  the JP2 palette first; read an unlabelled extra channel as a colorant when
+  the PDF `/ColorSpace` has a component for it; accept up to 32 colour
+  channels for DeviceN.
+- FlateDecode ignores a bad Adler-32 checksum and keeps every byte decoded
+  before a mid-stream error (miniz_oxide used directly).
+- RunLengthDecode keeps the runs decoded before a truncated run.
+- JBIG2 immediate generic and refinement regions are budgeted by their
+  declared area, so sparse 300 dpi pages are no longer left blank.
+- Content streams ignore a minus sign inside a number (`12.5-`), and path
+  operators short of operands are skipped instead of drawing to the origin.
+- A form XObject that draws itself (directly or through a tiling-pattern
+  cell) is refused on re-entry instead of expanding to the command budget.
+- A soft mask or stencil mask finer than its image keeps its own resolution
+  (MRC scans keep their text shapes).
+- Bound encrypted recovery by the total number of direct and unique compressed
+  objects, and prefer the latest container offset for duplicate members.
+- Refresh repair tables built while resolving `/Encrypt` after authentication,
+  so missing encrypted page-tree entries can be recovered on that path too.
+- Share a cumulative generic/refinement region-work budget across JBIG2 globals
+  and page segments; exhausted work budgets are decode errors.
+- Preserve low-bit-depth JPX palette indices and all Flate output produced before
+  corrupt blocks. Recovered stray minus signs now record malformed content.
+- Compute mask resize coordinates on demand and reject incomplete masks before
+  upsampling, avoiding large scratch allocations for extreme aspect ratios.
+- Apply the decoded-stream byte ceiling to JPX component samples before full
+  decompression, including multi-colorant images.
+
 ## 0.20.0 — Shared stream storage and lower pipeline memory
 
 Released 2026-11-16.

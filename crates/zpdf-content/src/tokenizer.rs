@@ -209,6 +209,7 @@ impl<'a> ContentTokenizer<'a> {
     fn read_number(&mut self) -> PdfObject {
         let start = self.pos;
         let mut has_dot = false;
+        let mut stray_minus = false;
         if matches!(self.peek(), Some(b'+' | b'-')) {
             self.pos += 1;
         }
@@ -219,10 +220,29 @@ impl<'a> ContentTokenizer<'a> {
                     has_dot = true;
                     self.pos += 1;
                 }
+                // A minus sign inside a number (`12.5-`) is ignored, as Adobe
+                // Reader and pdf.js do, rather than starting a new operand.
+                b'-' => {
+                    stray_minus = true;
+                    self.pos += 1;
+                }
                 _ => break,
             }
         }
-        let s = std::str::from_utf8(&self.data[start..self.pos]).unwrap_or("0");
+        let raw = &self.data[start..self.pos];
+        let raw: std::borrow::Cow<[u8]> = if stray_minus {
+            self.malformed();
+            let (sign, digits) = raw.split_at(1);
+            let digits = digits.iter().filter(|&&b| b != b'-');
+            sign.iter()
+                .chain(digits)
+                .copied()
+                .collect::<Vec<u8>>()
+                .into()
+        } else {
+            raw.into()
+        };
+        let s = std::str::from_utf8(&raw).unwrap_or("0");
         if has_dot {
             PdfObject::Real(
                 s.parse::<f64>()
@@ -751,6 +771,23 @@ mod tests {
             ContentToken::Operand(PdfObject::Integer(12))
         ));
         assert!(matches!(&tokens[3], ContentToken::Operator(s) if s == "Tf"));
+    }
+
+    #[test]
+    fn minus_inside_a_number_is_ignored() {
+        let mut tokenizer = ContentTokenizer::new(b"12.5- 30 4-2 m");
+        let tokens: Vec<_> = tokenizer.by_ref().collect();
+        assert_eq!(tokenizer.diagnostics().malformed_content, 2);
+        assert!(matches!(&tokens[0], ContentToken::Operand(PdfObject::Real(n)) if *n == 12.5));
+        assert!(matches!(
+            &tokens[1],
+            ContentToken::Operand(PdfObject::Integer(30))
+        ));
+        assert!(matches!(
+            &tokens[2],
+            ContentToken::Operand(PdfObject::Integer(42))
+        ));
+        assert!(matches!(&tokens[3], ContentToken::Operator(s) if s == "m"));
     }
 
     #[test]

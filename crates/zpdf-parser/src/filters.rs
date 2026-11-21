@@ -600,24 +600,48 @@ enum InflateOutcome {
     Failed(Vec<u8>, String),
 }
 
-/// Drive `reader` to completion in fixed-size chunks so that a mid-stream
-/// error still yields the bytes decoded before it. Output is capped by the
-/// budget; hitting the cap is a hard error (a decompression bomb is not salvageable data).
+/// Inflate `data` in fixed-size output chunks so that a mid-stream error still
+/// yields every byte decoded before it (pdf.js and hayro do the same). The
+/// zlib Adler-32 trailer is not verified: a stream whose only fault is a bad
+/// checksum decodes in full. Output is capped by the budget; hitting the cap
+/// is a hard error (a decompression bomb is not salvageable data).
 fn inflate_chunked(
-    mut reader: impl std::io::Read,
+    data: &[u8],
+    format: miniz_oxide::DataFormat,
     budget: &mut DecodeBudget,
 ) -> Result<InflateOutcome> {
+    use miniz_oxide::inflate::stream::{inflate, InflateState};
+    use miniz_oxide::{MZError, MZFlush, MZStatus};
+
+    let mut state = InflateState::new_boxed(format);
     let mut out = Vec::new();
-    let mut buf = [0u8; 16 * 1024];
+    // A Data error makes the streaming adapter undrainable. Accommodate its
+    // entire dictionary so bytes already decoded before that error survive.
+    let mut buf = [0u8; miniz_oxide::inflate::core::TINFL_LZ_DICT_SIZE];
+    let mut input = data;
     loop {
-        match reader.read(&mut buf) {
-            Ok(0) => return Ok(InflateOutcome::Complete(out)),
-            Ok(n) => {
-                // H1 Fix: Reserve budget before extending output
-                budget.reserve(n as u64)?;
-                out.extend_from_slice(&buf[..n]);
+        let res = inflate(&mut state, input, &mut buf, MZFlush::None);
+        input = &input[res.bytes_consumed..];
+        if res.bytes_written > 0 {
+            budget.reserve(res.bytes_written as u64)?;
+            out.extend_from_slice(&buf[..res.bytes_written]);
+        }
+        match res.status {
+            Ok(MZStatus::StreamEnd) => return Ok(InflateOutcome::Complete(out)),
+            Ok(MZStatus::Ok) if res.bytes_consumed > 0 || res.bytes_written > 0 => {}
+            Ok(MZStatus::Ok) | Err(MZError::Buf) => {
+                return Ok(InflateOutcome::Failed(
+                    out,
+                    "incomplete deflate stream".into(),
+                ))
             }
-            Err(e) => return Ok(InflateOutcome::Failed(out, e.to_string())),
+            Ok(MZStatus::NeedDict) => {
+                return Ok(InflateOutcome::Failed(
+                    out,
+                    "deflate stream needs a preset dictionary".into(),
+                ))
+            }
+            Err(_) => return Ok(InflateOutcome::Failed(out, "corrupt deflate stream".into())),
         }
     }
 }
@@ -626,7 +650,7 @@ fn inflate_chunked(
 /// truncated/corrupt zlib streams, retries headerless data as raw deflate,
 /// and skips a bounded run of leading garbage before a plausible zlib header.
 fn decode_flate(data: &[u8], budget: &mut DecodeBudget) -> Result<Vec<u8>> {
-    use flate2::read::{DeflateDecoder, ZlibDecoder};
+    use miniz_oxide::DataFormat;
 
     // Lenient: an empty stream decodes to nothing.
     if data.is_empty() {
@@ -643,7 +667,7 @@ fn decode_flate(data: &[u8], budget: &mut DecodeBudget) -> Result<Vec<u8>> {
 
     let mut zlib_err: Option<String> = None;
     if plausible_zlib(0) {
-        match inflate_chunked(ZlibDecoder::new(data), budget)? {
+        match inflate_chunked(data, DataFormat::ZLibIgnoreChecksum, budget)? {
             InflateOutcome::Complete(out) => return Ok(out),
             InflateOutcome::Failed(partial, err) if !partial.is_empty() => {
                 tracing::warn!(
@@ -660,7 +684,7 @@ fn decode_flate(data: &[u8], budget: &mut DecodeBudget) -> Result<Vec<u8>> {
     // CMF/FLG pair after a bounded garbage/whitespace prefix.
     const MAX_HEADER_SCAN: usize = 64;
     if let Some(k) = (1..data.len().min(MAX_HEADER_SCAN)).find(|&k| plausible_zlib(k)) {
-        match inflate_chunked(ZlibDecoder::new(&data[k..]), budget)? {
+        match inflate_chunked(&data[k..], DataFormat::ZLibIgnoreChecksum, budget)? {
             InflateOutcome::Complete(out) => {
                 tracing::warn!("FlateDecode: skipped {k} bytes of leading garbage");
                 return Ok(out);
@@ -677,7 +701,7 @@ fn decode_flate(data: &[u8], budget: &mut DecodeBudget) -> Result<Vec<u8>> {
     }
 
     // Last resort: some writers emit raw deflate with no zlib wrapper.
-    match inflate_chunked(DeflateDecoder::new(data), budget)? {
+    match inflate_chunked(data, DataFormat::Raw, budget)? {
         InflateOutcome::Complete(out) => {
             tracing::warn!("FlateDecode: decoded as raw deflate (missing zlib header)");
             Ok(out)
@@ -933,7 +957,7 @@ fn decode_run_length(data: &[u8], budget: &mut DecodeBudget) -> Result<Vec<u8>> 
             // Copy next (length_byte + 1) bytes literally
             let count = length_byte as usize + 1;
             if i + count > data.len() {
-                return Err(Error::StreamDecode("RunLengthDecode: truncated".into()));
+                return run_length_truncated(output);
             }
             // H1 Fix: Reserve budget before extending
             budget.reserve(count as u64)?;
@@ -943,7 +967,7 @@ fn decode_run_length(data: &[u8], budget: &mut DecodeBudget) -> Result<Vec<u8>> 
             // Repeat next byte (257 - length_byte) times
             let count = 257 - length_byte as usize;
             if i >= data.len() {
-                return Err(Error::StreamDecode("RunLengthDecode: truncated".into()));
+                return run_length_truncated(output);
             }
             // H1 Fix: Reserve budget before resizing
             budget.reserve(count as u64)?;
@@ -953,6 +977,19 @@ fn decode_run_length(data: &[u8], budget: &mut DecodeBudget) -> Result<Vec<u8>> 
         }
     }
 
+    Ok(output)
+}
+
+/// A run cut off by the end of the data: keep the runs decoded before it
+/// (as pdf.js and hayro do, PDFBOX-3990), unless there are none.
+fn run_length_truncated(output: Vec<u8>) -> Result<Vec<u8>> {
+    if output.is_empty() {
+        return Err(Error::StreamDecode("RunLengthDecode: truncated".into()));
+    }
+    tracing::warn!(
+        "RunLengthDecode: truncated run; keeping {} decoded bytes",
+        output.len()
+    );
     Ok(output)
 }
 
@@ -1089,6 +1126,56 @@ mod tests {
             decode_flate(&compressed, &mut budget).unwrap()
         };
         assert_eq!(decoded, original);
+    }
+
+    /// Only the Adler-32 trailer is wrong: every byte must still decode, at
+    /// sizes below, at and well above the 32 KiB inflate chunk.
+    #[test]
+    fn flate_ignores_bad_adler32() {
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        for len in [2_010usize, 32 * 1024, 100_032] {
+            let original: Vec<u8> = (0..len).map(|i| (i * 7 % 251) as u8).collect();
+            let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+            encoder.write_all(&original).unwrap();
+            let mut compressed = encoder.finish().unwrap();
+            let n = compressed.len();
+            for b in &mut compressed[n - 4..] {
+                *b ^= 0xff;
+            }
+            let mut budget = DecodeBudget::new(ParseLimits::default().max_decoded_stream_bytes);
+            assert_eq!(
+                decode_flate(&compressed, &mut budget).unwrap(),
+                original,
+                "len {len}"
+            );
+        }
+    }
+
+    #[test]
+    fn flate_keeps_all_output_before_corrupt_block() {
+        // RFC 1951: a nonfinal stored block followed by reserved BTYPE=3.
+        // The inflater can produce its whole 32 KiB dictionary before it
+        // returns Data, so a smaller caller buffer loses the undrained tail.
+        for len in [20_000u16, 32_768, 50_000] {
+            let original: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            let mut data = vec![0x78, 0x01, 0x00];
+            data.extend_from_slice(&len.to_le_bytes());
+            data.extend_from_slice(&(!len).to_le_bytes());
+            data.extend_from_slice(&original);
+            data.push(0x07);
+            let mut budget = DecodeBudget::new(u64::from(len));
+            let decoded = decode_flate(&data, &mut budget).unwrap();
+            assert!(
+                decoded == original,
+                "decoded {} of {len} bytes",
+                decoded.len()
+            );
+            let mut short = DecodeBudget::new(u64::from(len) - 1);
+            assert!(decode_flate(&data, &mut short).is_err());
+        }
     }
 
     #[test]
@@ -1332,6 +1419,23 @@ mod tests {
             decode_run_length(&data, &mut budget).unwrap()
         };
         assert_eq!(decoded, vec![0x41, 0x42, 0x43, 0x43, 0x43]);
+    }
+
+    #[test]
+    fn run_length_truncated_keeps_decoded_prefix() {
+        let mut budget = DecodeBudget::new(ParseLimits::default().max_decoded_stream_bytes);
+        // A whole literal run, then a literal run promising 5 bytes but holding 2.
+        assert_eq!(
+            decode_run_length(&[1, 0x41, 0x42, 4, 0x43, 0x44], &mut budget).unwrap(),
+            vec![0x41, 0x42]
+        );
+        // A repeat run with its byte missing.
+        assert_eq!(
+            decode_run_length(&[254, 0x43, 254], &mut budget).unwrap(),
+            vec![0x43; 3]
+        );
+        // Nothing decodable at all is still an error.
+        assert!(decode_run_length(&[4, 0x41], &mut budget).is_err());
     }
 
     #[test]

@@ -120,6 +120,10 @@ pub struct ContentInterpreter<'a> {
     /// innermost last. Lookups search these before the page resources.
     form_resources: Vec<ResourceDict>,
     form_depth: u32,
+    /// Object ids of the form XObjects currently being interpreted. A form
+    /// that draws itself (directly, or through a pattern cell) recurses
+    /// forever, so re-entry is refused instead of fanning out to the budget.
+    active_forms: Vec<ObjectId>,
     /// `Q` must never pop the state stack below this index — a form XObject
     /// raises it past its own saved state so an unbalanced `Q` inside the
     /// form cannot corrupt the page-level state.
@@ -770,6 +774,7 @@ impl<'a> ContentInterpreter<'a> {
             font_override: false,
             form_resources: Vec::new(),
             form_depth: 0,
+            active_forms: Vec::new(),
             state_floor: 0,
             text_sink: None,
             text_geometry: false,
@@ -1300,6 +1305,33 @@ impl<'a> ContentInterpreter<'a> {
             })
     }
 
+    /// The top `N` operands of a path operator, in order. With fewer than
+    /// `N` finite numbers the operator is malformed and is skipped (as pdf.js
+    /// and hayro do); padding with zeros would draw segments to the origin.
+    fn path_operands<const N: usize>(&mut self) -> Option<[f64; N]> {
+        let len = self.operand_stack.len();
+        let values = (len >= N)
+            .then(|| &self.operand_stack[len - N..])
+            .and_then(|top| {
+                let mut out = [0.0; N];
+                for (slot, operand) in out.iter_mut().zip(top) {
+                    *slot = operand.as_f64().ok().filter(|n| n.is_finite())?;
+                }
+                Some(out)
+            });
+        match values {
+            Some(values) => {
+                self.operand_stack.truncate(len - N);
+                Some(values)
+            }
+            None => {
+                self.stats.diagnostics.malformed_content =
+                    self.stats.diagnostics.malformed_content.saturating_add(1);
+                None
+            }
+        }
+    }
+
     fn pop_name(&mut self) -> String {
         self.operand_stack
             .pop()
@@ -1451,59 +1483,49 @@ impl<'a> ContentInterpreter<'a> {
 
             // -- Path construction --
             "m" => {
-                let y = self.pop_f64();
-                let x = self.pop_f64();
-                self.current_path.move_to(Point::new(x, y));
+                if let Some([x, y]) = self.path_operands() {
+                    self.current_path.move_to(Point::new(x, y));
+                }
             }
             "l" => {
-                let y = self.pop_f64();
-                let x = self.pop_f64();
-                self.current_path.line_to(Point::new(x, y));
+                if let Some([x, y]) = self.path_operands() {
+                    self.current_path.line_to(Point::new(x, y));
+                }
             }
             "c" => {
-                let y3 = self.pop_f64();
-                let x3 = self.pop_f64();
-                let y2 = self.pop_f64();
-                let x2 = self.pop_f64();
-                let y1 = self.pop_f64();
-                let x1 = self.pop_f64();
-                self.current_path.curve_to(
-                    Point::new(x1, y1),
-                    Point::new(x2, y2),
-                    Point::new(x3, y3),
-                );
+                if let Some([x1, y1, x2, y2, x3, y3]) = self.path_operands() {
+                    self.current_path.curve_to(
+                        Point::new(x1, y1),
+                        Point::new(x2, y2),
+                        Point::new(x3, y3),
+                    );
+                }
             }
             "v" => {
-                let y3 = self.pop_f64();
-                let x3 = self.pop_f64();
-                let y2 = self.pop_f64();
-                let x2 = self.pop_f64();
-                // v: current point is first control point
-                self.current_path.curve_to(
-                    self.current_point(),
-                    Point::new(x2, y2),
-                    Point::new(x3, y3),
-                );
+                if let Some([x2, y2, x3, y3]) = self.path_operands() {
+                    // v: current point is first control point
+                    self.current_path.curve_to(
+                        self.current_point(),
+                        Point::new(x2, y2),
+                        Point::new(x3, y3),
+                    );
+                }
             }
             "y" => {
-                let y3 = self.pop_f64();
-                let x3 = self.pop_f64();
-                let y1 = self.pop_f64();
-                let x1 = self.pop_f64();
-                // y: end point is second control point
-                self.current_path.curve_to(
-                    Point::new(x1, y1),
-                    Point::new(x3, y3),
-                    Point::new(x3, y3),
-                );
+                if let Some([x1, y1, x3, y3]) = self.path_operands() {
+                    // y: end point is second control point
+                    self.current_path.curve_to(
+                        Point::new(x1, y1),
+                        Point::new(x3, y3),
+                        Point::new(x3, y3),
+                    );
+                }
             }
             "h" => self.current_path.close(),
             "re" => {
-                let h = self.pop_f64();
-                let w = self.pop_f64();
-                let y = self.pop_f64();
-                let x = self.pop_f64();
-                self.current_path.rect(Rect::new(x, y, x + w, y + h));
+                if let Some([x, y, w, h]) = self.path_operands() {
+                    self.current_path.rect(Rect::new(x, y, x + w, y + h));
+                }
             }
 
             // -- Path painting -- (each then applies a pending `W` clip)
@@ -4476,6 +4498,12 @@ impl<'a> ContentInterpreter<'a> {
             tracing::warn!("form XObject nesting exceeds {MAX_FORM_DEPTH}; skipping");
             return;
         }
+        if let Some(id) = xobj_id.filter(|id| self.active_forms.contains(id)) {
+            self.stats.diagnostics.malformed_content =
+                self.stats.diagnostics.malformed_content.saturating_add(1);
+            tracing::warn!("form XObject {id} draws itself; skipping the recursion");
+            return;
+        }
         // Stop descending once the page budget is spent — bounds exponential
         // form fanout (depth is capped but repetition is not).
         if self.over_budget() {
@@ -4622,6 +4650,7 @@ impl<'a> ContentInterpreter<'a> {
         }
 
         self.form_depth += 1;
+        self.active_forms.extend(xobj_id);
         // A pending `W` belongs to the stream that set it: the invoking
         // stream's waits for its own painting operator (a pattern fill runs
         // this form while painting), and one the form leaves unpainted ends
@@ -4652,6 +4681,9 @@ impl<'a> ContentInterpreter<'a> {
         self.close_marked_content();
         self.pending_clip = outer_clip;
         self.form_depth -= 1;
+        if xobj_id.is_some() {
+            self.active_forms.pop();
+        }
 
         // Balance: pop clips opened by any unbalanced q-levels left by the
         // form, then restore the state saved at entry.
@@ -7184,6 +7216,19 @@ mod tests {
         let dl = ContentInterpreter::new(page_rect).interpret(content);
         assert_eq!(dl.commands.len(), 1);
         assert!(matches!(&dl.commands[0], RenderCommand::FillPath { .. }));
+    }
+
+    /// A path operator short of operands is skipped, not padded with zeros:
+    /// padding drew strokes to the page origin.
+    #[test]
+    fn underfilled_path_operator_does_not_reach_the_origin() {
+        let page_rect = Rect::new(0.0, 0.0, 612.0, 792.0);
+        let dl = ContentInterpreter::new(page_rect).interpret(b"100 100 m 50 l 200 200 l S");
+        let RenderCommand::StrokePath { path, .. } = &dl.commands[0] else {
+            panic!("expected stroke");
+        };
+        let points: Vec<(f64, f64)> = path.points().iter().map(|p| (p.x, p.y)).collect();
+        assert_eq!(points, vec![(100.0, 100.0), (200.0, 200.0)]);
     }
 
     #[test]

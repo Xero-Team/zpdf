@@ -799,6 +799,15 @@ fn parse_builtin_encoding(clear: &[u8]) -> Vec<Option<String>> {
 
 // ----- decrypted private parsing (lenIV, Subrs, CharStrings) -----
 
+/// A `/lenIV` of -1 means the charstrings are stored unencrypted (Type 1 Font
+/// Format §7.2); otherwise decrypt and drop the `lenIV` leading bytes.
+fn decrypt_charstring(data: &[u8], len_iv: i32) -> Vec<u8> {
+    match usize::try_from(len_iv) {
+        Ok(skip) => decrypt(data, CHARSTRING_R, skip),
+        Err(_) => data.to_vec(),
+    }
+}
+
 fn parse_len_iv(private: &[u8]) -> Option<i32> {
     let pos = find(private, b"/lenIV")?;
     let (v, _) = read_int(private, pos + 6)?;
@@ -863,11 +872,7 @@ fn parse_subrs(private: &[u8], len_iv: i32) -> Vec<Vec<u8>> {
         if len > private.len() || end > private.len() {
             break;
         }
-        let cs = decrypt(
-            &private[data_start..end],
-            CHARSTRING_R,
-            len_iv.max(0) as usize,
-        );
+        let cs = decrypt_charstring(&private[data_start..end], len_iv);
         if idx >= 0 {
             let idx = idx as usize;
             if idx >= MAX_TYPE1_SUBRS {
@@ -941,11 +946,7 @@ fn parse_charstrings(private: &[u8], len_iv: i32) -> HashMap<String, Vec<u8>> {
         if end > private.len() {
             break;
         }
-        let cs = decrypt(
-            &private[data_start..end],
-            CHARSTRING_R,
-            len_iv.max(0) as usize,
-        );
+        let cs = decrypt_charstring(&private[data_start..end], len_iv);
         out.insert(name, cs);
         i = end;
     }
@@ -1047,6 +1048,25 @@ mod tests {
         }
         let dec = decrypt(&enc, EEXEC_R, 4);
         assert_eq!(&dec, b"hello type1");
+    }
+
+    #[test]
+    fn negative_len_iv_keeps_charstrings_unencrypted() {
+        // Founder "FzBookMaker" subsets declare `/lenIV -1` and store plain
+        // charstrings; decrypting them anyway scrambles every outline.
+        let plain: &[u8] = &[0x8B, 0xF8, 0x88, 0x0D, 0x0E];
+        let private = [
+            b"/lenIV -1 def /Subrs 1 array dup 0 5 RD ".as_slice(),
+            plain,
+            b" NP ND /CharStrings 1 dict dup begin /a 5 RD ".as_slice(),
+            plain,
+            b" ND end".as_slice(),
+        ]
+        .concat();
+        let len_iv = parse_len_iv(&private).unwrap();
+        assert_eq!(len_iv, -1);
+        assert_eq!(parse_subrs(&private, len_iv), vec![plain.to_vec()]);
+        assert_eq!(parse_charstrings(&private, len_iv)["a"], plain);
     }
 
     #[test]
