@@ -4,7 +4,7 @@
 #   python -m http.server -d crates/zpdf-wasm/www 8080
 #
 # Requires: rustup target add wasm32-unknown-unknown
-#           cargo install wasm-bindgen-cli --version <wasm-bindgen version in Cargo.lock>
+#           cargo install wasm-bindgen-cli --version 0.2.130 --locked  # matches crates/zpdf-wasm/Cargo.toml
 #           Node.js (package fingerprint and runtime smoke tests)
 set -euo pipefail
 cd "$(dirname "$0")/../.."

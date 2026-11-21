@@ -21,6 +21,14 @@ pub struct ProcessingDiagnostics {
     pub first_failed_object: Option<crate::ObjectId>,
 }
 impl ProcessingDiagnostics {
+    /// Whether processing produced complete output without known missing content.
+    ///
+    /// A recovered embedded font fallback (`embedded_font_fallbacks > 0` with
+    /// all failure counters zero) still leaves `is_complete()` true while
+    /// preserving the fallback diagnostic. When a fallback cannot draw every
+    /// shown visible glyph, `decode_failures` is incremented as well so
+    /// `is_complete()` becomes false and [`ensure_complete`](Self::ensure_complete)
+    /// rejects the incomplete output.
     pub fn is_complete(&self) -> bool {
         !self.resource_limit_reached
             && !self.time_limit_reached
@@ -28,7 +36,10 @@ impl ProcessingDiagnostics {
             && self.missing_resources == 0
             && self.unsupported_features == 0
             && self.malformed_content == 0
-            && self.embedded_font_fallbacks == 0
+    }
+    /// Whether no failure, limit, or embedded-font fallback has been recorded.
+    pub fn is_empty(&self) -> bool {
+        self.is_complete() && self.embedded_font_fallbacks == 0
     }
     pub fn ensure_complete(&self) -> Result<()> {
         if self.is_complete() {
@@ -77,7 +88,7 @@ impl ProcessingDiagnostics {
         }
     }
     pub fn set_page(&mut self, index: usize) {
-        if !self.is_complete() {
+        if !self.is_empty() {
             self.first_affected_page.get_or_insert(index);
         }
     }

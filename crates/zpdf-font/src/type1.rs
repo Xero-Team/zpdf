@@ -168,7 +168,13 @@ impl Type1Font {
                 interp.run(cs, &self.subrs, 0);
                 if interp.failed {
                     failed += 1;
-                } else if interp.seac.is_some() || !interp.cmds.is_empty() {
+                } else if let Some(seac) = interp.seac {
+                    if self.compose_seac(&interp, seac, 1).is_some() {
+                        drawn += 1;
+                    } else {
+                        failed += 1;
+                    }
+                } else if !interp.cmds.is_empty() {
                     drawn += 1;
                 }
             }
@@ -1218,6 +1224,7 @@ mod tests {
         font.char_strings
             .insert("A".to_string(), vec![139, 139, 139, 204, 204, 12, 6]);
         assert!(font.glyph_outline_by_name("A").is_none());
+        assert!(!font.has_usable_outlines());
     }
 
     #[test]
@@ -1236,6 +1243,21 @@ mod tests {
             2 * base.commands.len(),
             "base and accent outlines"
         );
+
+        // A composite-only font with valid base/accent is usable; once a
+        // referenced component is missing, it is no longer usable.
+        let mut composite_only = font_with_matrix([0.001, 0.0, 0.0, 0.001, 0.0, 0.0]);
+        let simple_a = composite_only.char_strings["A"].clone();
+        composite_only
+            .char_strings
+            .insert("grave".to_string(), simple_a);
+        composite_only
+            .char_strings
+            .insert("Agrave".to_string(), agrave.clone());
+        composite_only.gid_to_name = vec![".notdef".to_string(), "Agrave".to_string()];
+        assert!(composite_only.has_usable_outlines());
+        composite_only.char_strings.remove("A");
+        assert!(!composite_only.has_usable_outlines());
 
         // A composite whose base is itself a composite is malformed.
         font.char_strings.insert("A".to_string(), agrave);

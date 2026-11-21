@@ -13,6 +13,7 @@ use zpdf::display_list::RenderCommand;
 use zpdf::{FontProvider, PdfDocument, ProcessingDiagnostics, RenderBackend};
 
 const PRIMARY_TTF: &[u8] = include_bytes!("../../zpdf-font/tests/fixtures/coverage-primary.ttf");
+const FALLBACK_TTF: &[u8] = include_bytes!("../../zpdf-font/tests/fixtures/coverage-fallback.ttf");
 const BOLD_TTF: &[u8] = include_bytes!("../../zpdf-font/tests/fixtures/coverage-bold.ttf");
 const TYPE1_PFA: &[u8] = include_bytes!("../../zpdf-font/tests/fixtures/coverage-type1.pfa");
 const CID_OTF: &[u8] = include_bytes!("../../zpdf-font/tests/fixtures/coverage-cid.otf");
@@ -339,21 +340,23 @@ fn damaged_glyf_and_corrupt_truetype_fall_back_with_pdf_placement_and_diagnostic
             page.stats.diagnostics.embedded_font_fallbacks, 1,
             "{label}: fallback must be recorded"
         );
+        assert_eq!(
+            page.stats.diagnostics.decode_failures, 0,
+            "{label}: recovered fallback must not report missing output"
+        );
         assert_eq!(page.stats.diagnostics.first_affected_page, Some(0));
         assert_eq!(
             page.stats.diagnostics.first_failed_object,
             Some(zpdf::ObjectId(7, 0))
         );
         assert!(
-            !page.is_complete(),
-            "{label}: fallback marks page incomplete"
+            page.is_complete(),
+            "{label}: complete substitute recovery keeps page complete"
         );
-        assert!(page.ensure_complete().is_err());
-        assert!(page
-            .stats
-            .diagnostics
-            .to_json()
-            .contains("\"embedded_font_fallbacks\":1"));
+        page.ensure_complete().expect("recovered page is complete");
+        let json = page.stats.diagnostics.to_json();
+        assert!(json.contains("\"complete\":true"), "{json}");
+        assert!(json.contains("\"embedded_font_fallbacks\":1"), "{json}");
     }
 }
 
@@ -365,7 +368,6 @@ fn corrupt_type1_cff_and_undecodable_font_streams_fall_back_and_record_diagnosti
         key: &'static str,
         stream_dict: &'static str,
         bytes: Vec<u8>,
-        expected_decode_failures: u32,
     }
     let cases = [
         Case {
@@ -374,7 +376,6 @@ fn corrupt_type1_cff_and_undecodable_font_streams_fall_back_and_record_diagnosti
             key: "FontFile",
             stream_dict: "",
             bytes: b"%!PS-AdobeFont-1.0: Broken\ncurrentfile eexec\n00000000".to_vec(),
-            expected_decode_failures: 0,
         },
         Case {
             label: "corrupt raw CFF FontFile3",
@@ -382,7 +383,6 @@ fn corrupt_type1_cff_and_undecodable_font_streams_fall_back_and_record_diagnosti
             key: "FontFile3",
             stream_dict: "/Subtype /Type1C",
             bytes: vec![0x01, 0x00, 0x04, 0x04, 0xFF, 0xFF, 0xFF, 0xFF],
-            expected_decode_failures: 0,
         },
         Case {
             label: "corrupt OTF FontFile3",
@@ -390,7 +390,6 @@ fn corrupt_type1_cff_and_undecodable_font_streams_fall_back_and_record_diagnosti
             key: "FontFile3",
             stream_dict: "/Subtype /OpenType",
             bytes: b"OTTO\x00\x01truncated".to_vec(),
-            expected_decode_failures: 0,
         },
         Case {
             label: "undecodable FontFile2 filter",
@@ -398,7 +397,6 @@ fn corrupt_type1_cff_and_undecodable_font_streams_fall_back_and_record_diagnosti
             key: "FontFile2",
             stream_dict: "/Filter /UnsupportedDecode",
             bytes: b"corrupt compressed bytes".to_vec(),
-            expected_decode_failures: 1,
         },
     ];
     let expected_adv = [
@@ -433,10 +431,16 @@ fn corrupt_type1_cff_and_undecodable_font_streams_fall_back_and_record_diagnosti
             case.label
         );
         assert_eq!(
-            page.stats.diagnostics.decode_failures, case.expected_decode_failures,
-            "{}: decode_failures",
+            page.stats.diagnostics.decode_failures, 0,
+            "{}: complete substitute recovery should leave decode_failures=0",
             case.label
         );
+        assert!(
+            page.is_complete(),
+            "{}: complete substitute recovery should pass ensure_complete",
+            case.label
+        );
+        page.ensure_complete().expect("recovered page is complete");
     }
 }
 
@@ -475,7 +479,10 @@ fn corrupt_type0_cid_fonts_fall_back_preserving_widths_text_and_rendering() {
         assert!(font.is_substitute, "{label}: expected substitute");
         assert_rendered_cells_have_ink(&page, &expected_x, &expected_adv, label);
         assert_eq!(page.stats.diagnostics.embedded_font_fallbacks, 1, "{label}");
-        assert!(!page.is_complete(), "{label}");
+        assert_eq!(page.stats.diagnostics.decode_failures, 0, "{label}");
+        assert!(page.is_complete(), "{label}");
+        page.ensure_complete()
+            .expect("recovered Type0 page is complete");
 
         let converted = zpdf::convert_pdf(&doc, &[0], Default::default()).expect("convert");
         assert_eq!(
@@ -484,6 +491,10 @@ fn corrupt_type0_cid_fonts_fall_back_preserving_widths_text_and_rendering() {
             "{label}: text extraction"
         );
         assert_eq!(converted.pages[0].diagnostics.embedded_font_fallbacks, 1);
+        assert!(converted.is_complete(), "{label}");
+        converted
+            .ensure_complete()
+            .expect("recovered conversion is complete");
     }
 }
 
@@ -595,6 +606,8 @@ fn descriptor_weight_selects_bold_substitute_when_embedded_program_fails() {
         "/FontWeight 700 should select the bold substitute face"
     );
     assert_eq!(page.stats.diagnostics.embedded_font_fallbacks, 1);
+    assert_eq!(page.stats.diagnostics.decode_failures, 0);
+    assert!(page.is_complete());
 }
 
 #[test]
@@ -631,15 +644,19 @@ fn form_xobjects_multipage_shared_fonts_and_hidden_layers_report_diagnostics_acc
         .unwrap()
         .with_font_provider(provider_with_alias("SharedCorrupt"));
 
-    // Page 0: two Tj calls with the same corrupt font -> counted once.
+    // Page 0: two Tj calls with the same corrupt font -> counted once and complete.
     let p0 = zpdf::interpret_page(&doc, 0, Default::default()).unwrap();
     assert_eq!(p0.stats.diagnostics.embedded_font_fallbacks, 1);
+    assert_eq!(p0.stats.diagnostics.decode_failures, 0);
     assert_eq!(p0.stats.diagnostics.first_affected_page, Some(0));
+    assert!(p0.is_complete());
 
     // Page 1: shared font reused via Form XObject -> still draws visibly and reports fallback.
     let p1 = zpdf::interpret_page(&doc, 1, Default::default()).unwrap();
     assert_eq!(p1.stats.diagnostics.embedded_font_fallbacks, 1);
+    assert_eq!(p1.stats.diagnostics.decode_failures, 0);
     assert_eq!(p1.stats.diagnostics.first_affected_page, Some(1));
+    assert!(p1.is_complete());
     let cpu1 = zpdf::cpu::CpuRenderer::new()
         .with_fonts(&p1.fonts)
         .render_display_list(&p1.display_list, 1.0)
@@ -677,7 +694,7 @@ fn corrupt_embedded_font_without_any_substitute_never_panics_and_preserves_place
         "/Flags 32",
         Some("FontFile2"),
         "",
-        &corrupt_glyf_in_place(PRIMARY_TTF, 0xFF),
+        b"not a parseable sfnt at all",
     );
     let doc = PdfDocument::open(pdf)
         .unwrap()
@@ -686,6 +703,13 @@ fn corrupt_embedded_font_without_any_substitute_never_panics_and_preserves_place
     let font = page.fonts.get_by_name("F1").unwrap().1;
     assert!(!font.has_font_data());
     assert_eq!(page.stats.diagnostics.embedded_font_fallbacks, 1);
+    assert_eq!(page.stats.diagnostics.decode_failures, 1);
+    assert_eq!(
+        page.stats.diagnostics.first_failed_object,
+        Some(zpdf::ObjectId(7, 0))
+    );
+    assert!(!page.is_complete());
+    assert!(page.ensure_complete().is_err());
 
     let RenderCommand::DrawGlyphRun(run) = &page.display_list.commands[0] else {
         panic!("expected glyph run");
@@ -697,6 +721,465 @@ fn corrupt_embedded_font_without_any_substitute_never_panics_and_preserves_place
     let converted = zpdf::convert_pdf(&doc, &[0], Default::default()).unwrap();
     assert_eq!(converted.pages[0].text.trim(), "ABC");
     assert_eq!(converted.pages[0].diagnostics.embedded_font_fallbacks, 1);
+    assert_eq!(converted.pages[0].diagnostics.decode_failures, 1);
+    assert!(!converted.is_complete());
+    assert!(converted.ensure_complete().is_err());
+}
+
+/// Corrupt only the `glyf` records for the specified glyph IDs in `ttf` (leaving
+/// other glyphs intact) so a subset has a majority of unreadable outlines plus a
+/// surviving drawable outline.
+fn corrupt_selected_gids(ttf: &[u8], corrupt_gids: &[u16]) -> Vec<u8> {
+    let mut out = ttf.to_vec();
+    let head = sfnt_table_range(&out, b"head");
+    let loca = sfnt_table_range(&out, b"loca");
+    let glyf = sfnt_table_range(&out, b"glyf");
+    let long = out[head.start + 50..head.start + 52] == [0, 1];
+    let offset = |buf: &[u8], gid: usize| -> usize {
+        if long {
+            u32::from_be_bytes(
+                buf[loca.start + gid * 4..loca.start + gid * 4 + 4]
+                    .try_into()
+                    .unwrap(),
+            ) as usize
+        } else {
+            u16::from_be_bytes(
+                buf[loca.start + gid * 2..loca.start + gid * 2 + 2]
+                    .try_into()
+                    .unwrap(),
+            ) as usize
+                * 2
+        }
+    };
+    for &gid in corrupt_gids {
+        let start = offset(&out, gid as usize);
+        let end = offset(&out, gid as usize + 1);
+        if start < end {
+            out[glyf.start + start..glyf.start + end].fill(0xFF);
+        }
+    }
+    out
+}
+
+#[test]
+fn surviving_outlines_are_preserved_when_no_substitute_is_available() {
+    // Corrupt every non-zero glyph in PRIMARY_TTF except 'C' so >50% fail
+    // `has_usable_embedded_outlines()` while 'C' remains drawable.
+    let probe = zpdf_font::LoadedFont::new_with_data(
+        zpdf_font::PdfFontType::TrueType,
+        "Probe".into(),
+        PRIMARY_TTF.to_vec(),
+        zpdf_font::CidWidths::new(1000.0),
+    );
+    let gid_a = probe.unicode_glyph('A' as u32).unwrap().0;
+    let gid_b = probe.unicode_glyph('B' as u32).unwrap().0;
+    let gid_c = probe.unicode_glyph('C' as u32).unwrap().0;
+    let maxp = sfnt_table_range(PRIMARY_TTF, b"maxp");
+    let num_glyphs = u16::from_be_bytes([PRIMARY_TTF[maxp.start + 4], PRIMARY_TTF[maxp.start + 5]]);
+    let corrupt_gids: Vec<u16> = (1..num_glyphs).filter(|&g| g != gid_c).collect();
+    let partial_ttf = corrupt_selected_gids(PRIMARY_TTF, &corrupt_gids);
+
+    // 1. Simple TrueType with empty memory-only provider: 'C' still renders.
+    let simple_pdf = simple_font_pdf(
+        "TrueType",
+        "ABCDEF+SurvivingSimple",
+        "/Flags 32",
+        Some("FontFile2"),
+        "",
+        &partial_ttf,
+    );
+    let doc = PdfDocument::open(simple_pdf)
+        .unwrap()
+        .with_font_provider(Arc::new(FontProvider::memory_only()));
+    let page = zpdf::interpret_page(&doc, 0, Default::default()).unwrap();
+    let font = page.fonts.get_by_name("F1").unwrap().1;
+    assert!(!font.is_substitute, "original font must be kept");
+    assert!(font.has_font_data(), "original program must survive");
+    assert_eq!(page.stats.diagnostics.embedded_font_fallbacks, 1);
+    assert_eq!(page.stats.diagnostics.decode_failures, 1);
+    assert!(!page.is_complete());
+    let cpu = zpdf::cpu::CpuRenderer::new()
+        .with_fonts(&page.fonts)
+        .render_display_list(&page.display_list, 1.0)
+        .unwrap();
+    let c_x0 = (15.0_f32 + (620.0 + 780.0) * 24.0 / 1000.0).floor() as usize;
+    let c_x1 = (15.0_f32 + (620.0 + 780.0 + 540.0) * 24.0 / 1000.0).ceil() as usize;
+    assert!(
+        dark_pixels_in_rect(
+            &cpu.data,
+            cpu.width as usize,
+            cpu.height as usize,
+            c_x0,
+            c_x1,
+            30,
+            70
+        ) > 10,
+        "surviving simple-font glyph 'C' must still render when no substitute exists"
+    );
+
+    // 2. Type0 CID font with /ToUnicode and 3 mapped CIDs (2 corrupt, 1 surviving)
+    //    under an empty memory-only provider: the surviving CID still renders.
+    let cid_to_gid_bytes: Vec<u8> = [0u16, gid_a, gid_b, gid_c]
+        .into_iter()
+        .flat_map(|g| g.to_be_bytes())
+        .collect();
+    let to_unicode = b"/CIDInit /ProcSet findresource begin 12 dict begin begincmap \
+        1 begincodespacerange <0000> <FFFF> endcodespacerange \
+        3 beginbfchar <0001> <0041> <0002> <0042> <0003> <0043> endbfchar \
+        endcmap CMapName currentdict /CMap defineresource pop end end";
+    let type0_pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 180 100] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>".to_vec(),
+        stream("", b"0 0 0 rg BT /F1 24 Tf 15 40 Td <000100020003> Tj ET"),
+        b"<< /Type /Font /Subtype /Type0 /BaseFont /ABCDEF+SurvivingCID /Encoding /Identity-H \
+          /DescendantFonts [6 0 R] /ToUnicode 9 0 R >>"
+            .to_vec(),
+        b"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /ABCDEF+SurvivingCID \
+          /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> \
+          /CIDToGIDMap 10 0 R /FontDescriptor 7 0 R /DW 1000 /W [1 [620 780 540]] >>"
+            .to_vec(),
+        b"<< /Type /FontDescriptor /FontName /ABCDEF+SurvivingCID /Flags 32 /FontFile2 8 0 R >>"
+            .to_vec(),
+        stream("", &partial_ttf),
+        stream("", to_unicode),
+        stream("", &cid_to_gid_bytes),
+    ]);
+    let doc0 = PdfDocument::open(type0_pdf)
+        .unwrap()
+        .with_font_provider(Arc::new(FontProvider::memory_only()));
+    let page0 = zpdf::interpret_page(&doc0, 0, Default::default()).unwrap();
+    assert!(!page0.fonts.get_by_name("F1").unwrap().1.is_substitute);
+    assert_eq!(page0.stats.diagnostics.embedded_font_fallbacks, 1);
+    assert_eq!(page0.stats.diagnostics.decode_failures, 1);
+    assert!(!page0.is_complete());
+    let cpu0 = zpdf::cpu::CpuRenderer::new()
+        .with_fonts(&page0.fonts)
+        .render_display_list(&page0.display_list, 1.0)
+        .unwrap();
+    assert!(
+        dark_pixels_in_rect(
+            &cpu0.data,
+            cpu0.width as usize,
+            cpu0.height as usize,
+            c_x0,
+            c_x1,
+            30,
+            70
+        ) > 10,
+        "surviving Type0 glyph 'C' must still render when no substitute exists"
+    );
+}
+
+#[test]
+fn simple_font_substitution_honors_missing_width_for_out_of_range_codes() {
+    // /Widths covers only 'A' (65 => 620); descriptor sets /MissingWidth 333.
+    // After substitution, 'B' (66) must advance by 333 (not the substitute's 1000 hmtx),
+    // placing 'C' at (620 + 333) * 24 / 1000.
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 180 100] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>".to_vec(),
+        stream("", b"0 0 0 rg BT /F1 24 Tf 15 40 Td (ABC) Tj ET"),
+        b"<< /Type /Font /Subtype /TrueType /BaseFont /ABCDEF+MissingWidthFace /Encoding /WinAnsiEncoding \
+          /FirstChar 65 /LastChar 65 /Widths [620] /FontDescriptor 6 0 R >>"
+            .to_vec(),
+        b"<< /Type /FontDescriptor /FontName /ABCDEF+MissingWidthFace /Flags 32 /MissingWidth 333 /FontFile2 7 0 R >>"
+            .to_vec(),
+        stream("", b"not a valid truetype font"),
+    ]);
+    let doc = PdfDocument::open(pdf)
+        .unwrap()
+        .with_font_provider(provider_with_alias("MissingWidthFace"));
+    let page = zpdf::interpret_page(&doc, 0, Default::default()).unwrap();
+    assert!(page.fonts.get_by_name("F1").unwrap().1.is_substitute);
+    assert!(page.is_complete());
+    assert_eq!(page.stats.diagnostics.embedded_font_fallbacks, 1);
+
+    let RenderCommand::DrawGlyphRun(run) = &page.display_list.commands[0] else {
+        panic!("expected glyph run");
+    };
+    let expected_a = 620.0 * 24.0 / 1000.0;
+    let expected_b = 333.0 * 24.0 / 1000.0;
+    assert!((run.glyphs[0].advance - expected_a).abs() < 0.01);
+    assert!((run.glyphs[1].advance - expected_b).abs() < 0.01);
+    assert!(
+        (run.glyphs[2].x - (expected_a + expected_b)).abs() < 0.01,
+        "next glyph 'C' x={} expected {}",
+        run.glyphs[2].x,
+        expected_a + expected_b
+    );
+}
+
+#[test]
+fn cache_budget_exceeded_preserves_type0_mappings_and_form_diagnostics() {
+    let to_unicode = b"/CIDInit /ProcSet findresource begin 12 dict begin begincmap \
+        1 begincodespacerange <0000> <FFFF> endcodespacerange \
+        2 beginbfchar <0001> <0041> <0002> <0042> endbfchar \
+        endcmap CMapName currentdict /CMap defineresource pop end end";
+    // Page 0 draws the corrupt Type0 font directly; Page 1 draws it inside a Form XObject.
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 180 100] /Resources << /Font << /F1 5 0 R >> >> /Contents 10 0 R >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 180 100] /Resources << /XObject << /Fm 11 0 R >> >> /Contents 12 0 R >>".to_vec(),
+        b"<< /Type /Font /Subtype /Type0 /BaseFont /ABCDEF+BudgetCID /Encoding /Identity-H \
+          /DescendantFonts [6 0 R] /ToUnicode 9 0 R >>"
+            .to_vec(),
+        b"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /ABCDEF+BudgetCID \
+          /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> \
+          /FontDescriptor 7 0 R /DW 1000 /W [1 [650 820]] /DW2 [900 -1200] >>"
+            .to_vec(),
+        b"<< /Type /FontDescriptor /FontName /ABCDEF+BudgetCID /Flags 32 /FontFile2 8 0 R >>"
+            .to_vec(),
+        stream("", b"corrupt cid font"),
+        stream("", to_unicode),
+        stream("", b"0 0 0 rg BT /F1 24 Tf 15 40 Td <00010002> Tj ET"),
+        stream(
+            "/Type /XObject /Subtype /Form /BBox [0 0 180 100] /Resources << /Font << /G1 5 0 R >> >>",
+            b"0 0 0 rg BT /G1 24 Tf 15 40 Td <00010002> Tj ET",
+        ),
+        stream("", b"/Fm Do"),
+    ]);
+
+    // Budget fits the logical Type0 metrics/CMap/ToUnicode (~hundreds of bytes)
+    // but cannot fit the 21 KiB PRIMARY_TTF substitute program.
+    let limits = zpdf::ParseLimits {
+        max_font_cache_bytes: 2048,
+        ..Default::default()
+    };
+    let doc = PdfDocument::open_with_limits(pdf, limits)
+        .unwrap()
+        .with_font_provider(provider_with_alias("BudgetCID"));
+
+    for page_idx in [0, 1] {
+        let page = zpdf::interpret_page(&doc, page_idx, Default::default()).unwrap();
+        assert!(
+            page.stats.diagnostics.resource_limit_reached,
+            "page {page_idx}: budget exceeded must set resource_limit_reached"
+        );
+        assert_eq!(page.stats.diagnostics.embedded_font_fallbacks, 1);
+        assert_eq!(page.stats.diagnostics.decode_failures, 1);
+        assert!(!page.is_complete());
+        assert!(page.ensure_complete().is_err());
+
+        let runs: Vec<_> = page
+            .display_list
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                RenderCommand::DrawGlyphRun(r) => Some(r),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(
+            runs[0].glyphs.len(),
+            2,
+            "page {page_idx}: Type0 2-byte segmentation must survive budget fallback"
+        );
+        assert!((runs[0].glyphs[0].advance - 650.0 * 24.0 / 1000.0).abs() < 0.01);
+        assert!((runs[0].glyphs[1].advance - 820.0 * 24.0 / 1000.0).abs() < 0.01);
+        if page_idx == 0 {
+            let font = page.fonts.get_by_name("F1").unwrap().1;
+            assert_eq!(font.dw2, (900.0, -1200.0));
+        }
+
+        let converted = zpdf::convert_pdf(&doc, &[page_idx], Default::default()).unwrap();
+        assert_eq!(
+            converted.pages[0].text.trim(),
+            "AB",
+            "page {page_idx}: /ToUnicode extraction must survive budget fallback"
+        );
+        assert!(converted.pages[0].diagnostics.resource_limit_reached);
+        assert!(!converted.is_complete());
+    }
+}
+
+#[test]
+fn no_marks_separation_none_suppresses_fallback_diagnostic_while_clip_mode_keeps_it() {
+    let sep_none_pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 180 100] /Resources << /ColorSpace << /CS0 [/Separation /None /DeviceGray 8 0 R] >> /Font << /F1 5 0 R >> >> /Contents 9 0 R >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 180 100] /Resources << /Font << /F1 5 0 R >> >> /Contents 10 0 R >>".to_vec(),
+        b"<< /Type /Font /Subtype /TrueType /BaseFont /ABCDEF+NoMarksFace /Encoding /WinAnsiEncoding /FirstChar 65 /LastChar 67 /Widths [620 780 540] /FontDescriptor 6 0 R >>".to_vec(),
+        b"<< /Type /FontDescriptor /FontName /ABCDEF+NoMarksFace /Flags 32 /FontFile2 7 0 R >>".to_vec(),
+        stream("", b"corrupt truetype bytes"),
+        b"<< /FunctionType 2 /Domain [0 1] /C0 [1] /C1 [0] /N 1 >>".to_vec(),
+        stream("", b"/CS0 cs 1 scn BT /F1 24 Tf 15 40 Td (ABC) Tj ET"),
+        stream("", b"q BT /F1 24 Tf 7 Tr 15 40 Td (ABC) Tj ET 0 0 0 rg 0 0 180 100 re f Q"),
+    ]);
+
+    // Even with NO substitute (empty memory-only provider), mode-0 /Separation /None
+    // produces no marks and no clip -> clean complete page.
+    let doc = PdfDocument::open(sep_none_pdf)
+        .unwrap()
+        .with_font_provider(Arc::new(FontProvider::memory_only()));
+    let page_none = zpdf::interpret_page(&doc, 0, Default::default()).unwrap();
+    assert_eq!(
+        page_none.stats.diagnostics,
+        ProcessingDiagnostics::default()
+    );
+    assert!(page_none.is_complete());
+
+    // Render mode 7 (clip-only) needs glyph outlines -> reports fallback and missing output.
+    let page_clip = zpdf::interpret_page(&doc, 1, Default::default()).unwrap();
+    assert_eq!(page_clip.stats.diagnostics.embedded_font_fallbacks, 1);
+    assert_eq!(page_clip.stats.diagnostics.decode_failures, 1);
+    assert!(!page_clip.is_complete());
+}
+
+#[test]
+fn partial_substitute_recovery_distinguishes_missing_glyphs_from_complete_recovery() {
+    // 1. Corrupt Type0 font showing 'A', space, and U+4F00 (present in FALLBACK_TTF
+    //    but absent from PRIMARY_TTF).
+    let to_unicode = b"/CIDInit /ProcSet findresource begin 12 dict begin begincmap \
+        1 begincodespacerange <0000> <FFFF> endcodespacerange \
+        3 beginbfchar <0001> <0041> <0002> <0020> <0003> <4F00> endbfchar \
+        endcmap CMapName currentdict /CMap defineresource pop end end";
+    let partial_pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 180 100] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>".to_vec(),
+        stream("", b"0 0 0 rg BT /F1 24 Tf 15 40 Td <000100020003> Tj ET"),
+        b"<< /Type /Font /Subtype /Type0 /BaseFont /ABCDEF+PartialFace /Encoding /Identity-H \
+          /DescendantFonts [6 0 R] /ToUnicode 9 0 R >>"
+            .to_vec(),
+        b"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /ABCDEF+PartialFace \
+          /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> \
+          /FontDescriptor 7 0 R /DW 1000 /W [1 [650 350 820]] >>"
+            .to_vec(),
+        b"<< /Type /FontDescriptor /FontName /ABCDEF+PartialFace /Flags 32 /FontFile2 8 0 R >>"
+            .to_vec(),
+        stream("", &corrupt_glyf_in_place(PRIMARY_TTF, 0xFF)),
+        stream("", to_unicode),
+    ]);
+
+    // Only PRIMARY_TTF registered: U+4F00 cannot draw -> incomplete output.
+    let doc_partial = PdfDocument::open(partial_pdf.clone())
+        .unwrap()
+        .with_font_provider(provider_with_alias("PartialFace"));
+    let page_partial = zpdf::interpret_page(&doc_partial, 0, Default::default()).unwrap();
+    assert_eq!(page_partial.stats.diagnostics.embedded_font_fallbacks, 1);
+    assert_eq!(page_partial.stats.diagnostics.decode_failures, 1);
+    assert!(!page_partial.is_complete());
+    assert!(page_partial.ensure_complete().is_err());
+
+    // Add FALLBACK_TTF to the provider: coverage fallback draws U+4F00, and the
+    // blank space glyph is recognized as whitespace -> complete with fallback recorded.
+    let provider_complete = provider_with_alias("PartialFace");
+    provider_complete
+        .register_with_aliases(FALLBACK_TTF, 0, &[])
+        .unwrap();
+    let doc_complete = PdfDocument::open(partial_pdf)
+        .unwrap()
+        .with_font_provider(provider_complete);
+    let page_complete = zpdf::interpret_page(&doc_complete, 0, Default::default()).unwrap();
+    assert_eq!(page_complete.stats.diagnostics.embedded_font_fallbacks, 1);
+    assert_eq!(page_complete.stats.diagnostics.decode_failures, 0);
+    assert!(page_complete.is_complete());
+    page_complete
+        .ensure_complete()
+        .expect("cross-face recovery completes");
+    let runs: Vec<_> = page_complete
+        .display_list
+        .commands
+        .iter()
+        .filter_map(|cmd| match cmd {
+            RenderCommand::DrawGlyphRun(run) => Some(run),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        runs.len(),
+        2,
+        "cross-face provider fallback should split into primary + fallback runs"
+    );
+    assert_eq!(runs[0].glyphs.len(), 2);
+    assert_eq!(runs[1].glyphs.len(), 1);
+    let expected_third_x = (650.0 + 350.0) * 24.0 / 1000.0;
+    assert!((runs[1].glyphs[0].x - expected_third_x).abs() < 0.01);
+    assert!((runs[1].glyphs[0].advance - 820.0 * 24.0 / 1000.0).abs() < 0.01);
+    let cpu = zpdf::cpu::CpuRenderer::new()
+        .with_fonts(&page_complete.fonts)
+        .with_images(&page_complete.images)
+        .render_display_list(&page_complete.display_list, 1.0)
+        .expect("cpu render");
+    for (idx, (gx, adv)) in [
+        (0.0f32, 650.0 * 24.0 / 1000.0),
+        (expected_third_x, 820.0 * 24.0 / 1000.0),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let px0 = (15.0 + gx).floor().max(0.0) as usize;
+        let px1 = (15.0 + gx + adv).ceil() as usize;
+        let ink = dark_pixels_in_rect(
+            &cpu.data,
+            cpu.width as usize,
+            cpu.height as usize,
+            px0,
+            px1,
+            30,
+            70,
+        );
+        assert!(
+            ink > 10,
+            "cross-face provider fallback glyph {idx} cell x={px0}..{px1} rendered blank ({ink} dark px)"
+        );
+    }
+
+    // 2. Corrupt Type0 Identity-H without /ToUnicode or a CJK collection cannot
+    //    be mapped to a substitute -> must remain incomplete.
+    let unmappable_pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 180 100] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>".to_vec(),
+        stream("", b"0 0 0 rg BT /F1 24 Tf 15 40 Td <00010002> Tj ET"),
+        b"<< /Type /Font /Subtype /Type0 /BaseFont /ABCDEF+UnmappableCID /Encoding /Identity-H \
+          /DescendantFonts [6 0 R] >>"
+            .to_vec(),
+        b"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /ABCDEF+UnmappableCID \
+          /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> \
+          /FontDescriptor 7 0 R /DW 1000 >>"
+            .to_vec(),
+        b"<< /Type /FontDescriptor /FontName /ABCDEF+UnmappableCID /Flags 32 /FontFile2 8 0 R >>"
+            .to_vec(),
+        stream("", &corrupt_glyf_in_place(PRIMARY_TTF, 0xFF)),
+    ]);
+    let doc_unmappable = PdfDocument::open(unmappable_pdf)
+        .unwrap()
+        .with_font_provider(provider_with_alias("UnmappableCID"));
+    let page_unmappable = zpdf::interpret_page(&doc_unmappable, 0, Default::default()).unwrap();
+    assert_eq!(page_unmappable.stats.diagnostics.embedded_font_fallbacks, 1);
+    assert_eq!(page_unmappable.stats.diagnostics.decode_failures, 1);
+    assert!(!page_unmappable.is_complete());
+    assert!(page_unmappable.ensure_complete().is_err());
+
+    // 3. Embedded font stream hitting ParseLimits::max_decoded_stream_bytes stays
+    //    incomplete (resource_limit_reached) even when a substitute is registered.
+    let oversized_pdf = simple_font_pdf(
+        "TrueType",
+        "ABCDEF+LimitedFace",
+        "/Flags 32",
+        Some("FontFile2"),
+        "",
+        PRIMARY_TTF,
+    );
+    let limits = zpdf::ParseLimits {
+        max_decoded_stream_bytes: 4096,
+        ..Default::default()
+    };
+    let doc_limited = PdfDocument::open_with_limits(oversized_pdf, limits)
+        .unwrap()
+        .with_font_provider(provider_with_alias("LimitedFace"));
+    let page_limited = zpdf::interpret_page(&doc_limited, 0, Default::default()).unwrap();
+    assert_eq!(page_limited.stats.diagnostics.embedded_font_fallbacks, 1);
+    assert!(page_limited.stats.diagnostics.resource_limit_reached);
+    assert_eq!(page_limited.stats.diagnostics.decode_failures, 1);
+    assert!(!page_limited.is_complete());
+    assert!(page_limited.ensure_complete().is_err());
 }
 
 #[test]
@@ -719,6 +1202,10 @@ fn default_system_font_substitution_renders_corrupt_embedded_font() {
     assert!(font.is_substitute);
     assert!(font.has_font_data());
     assert_eq!(page.stats.diagnostics.embedded_font_fallbacks, 1);
+    assert_eq!(page.stats.diagnostics.decode_failures, 0);
+    assert!(page.is_complete());
+    page.ensure_complete()
+        .expect("system Helvetica recovery is complete");
 
     let expected_adv = [
         620.0 * 24.0 / 1000.0,
@@ -771,6 +1258,8 @@ fn corrupt_simple_font_with_custom_encoding_recovers_via_tounicode_and_cid_colle
         "custom-encoding simple ToUnicode fallback",
     );
     assert_eq!(page.stats.diagnostics.embedded_font_fallbacks, 1);
+    assert_eq!(page.stats.diagnostics.decode_failures, 0);
+    assert!(page.is_complete());
 
     // 2. Type0 Adobe-GB1 font without /ToUnicode whose embedded FontFile2 is
     //    corrupt: ordering/collection selects the substitute and resolves CID 34
@@ -807,4 +1296,6 @@ fn corrupt_simple_font_with_custom_encoding_recovers_via_tounicode_and_cid_colle
         "Adobe-GB1 CID collection fallback",
     );
     assert_eq!(page.stats.diagnostics.embedded_font_fallbacks, 1);
+    assert_eq!(page.stats.diagnostics.decode_failures, 0);
+    assert!(page.is_complete());
 }

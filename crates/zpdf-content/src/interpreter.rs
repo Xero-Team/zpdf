@@ -49,6 +49,9 @@ pub struct ContentInterpreter<'a> {
     /// Font IDs whose embedded-program fallback diagnostics have already been
     /// merged into `self.stats.diagnostics` during this interpretation.
     reported_font_fallbacks: Vec<zpdf_font::FontId>,
+    /// Font IDs whose embedded-program fallback failed to recover at least one
+    /// visible glyph and already recorded a `decode_failures` entry.
+    reported_font_fallback_misses: Vec<zpdf_font::FontId>,
     file: Option<&'a PdfFile>,
     resources: Option<&'a ResourceDict>,
     image_cache: Option<&'a mut ImageCache>,
@@ -752,6 +755,7 @@ impl<'a> ContentInterpreter<'a> {
             shared_font_doc: None,
             current_font_id: None,
             reported_font_fallbacks: Vec::new(),
+            reported_font_fallback_misses: Vec::new(),
             file: None,
             resources: None,
             image_cache: None,
@@ -4739,15 +4743,17 @@ impl<'a> ContentInterpreter<'a> {
         };
         if fc.get_by_name(&name).is_none() {
             let max_bytes = self.max_font_cache_bytes;
-            if let Err(e) =
-                load_font_ref(self.shared_font_doc, file, fc, font_ref, &name, max_bytes)
-            {
-                tracing::debug!("ExtGState font {font_ref}: {e}");
-                let _ = fc.try_insert_with_limit(
-                    name.clone(),
-                    zpdf_font::LoadedFont::new_placeholder(name.clone()),
-                    max_bytes,
-                );
+            match load_font_ref(self.shared_font_doc, file, fc, font_ref, &name, max_bytes) {
+                Ok(Some(diag)) => self.stats.diagnostics.merge(diag),
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::debug!("ExtGState font {font_ref}: {e}");
+                    let _ = fc.try_insert_with_limit(
+                        name.clone(),
+                        zpdf_font::LoadedFont::new_placeholder(name.clone()),
+                        max_bytes,
+                    );
+                }
             }
         }
         self.current_font_id = fc.get_by_name(&name).map(|(fid, _)| fid);
@@ -4813,7 +4819,12 @@ impl<'a> ContentInterpreter<'a> {
         for (name, obj) in fonts.0.iter().take(MAX_FORM_FONT_ENTRIES) {
             // A font entry is normally an indirect reference; a synthesized
             // form-field appearance may instead carry an inline font dict.
-            let load_into = |fc: &mut FontCache, target: &str| -> Result<(), zpdf_core::Error> {
+            let load_into = |fc: &mut FontCache,
+                             target: &str|
+             -> Result<
+                Option<zpdf_core::ProcessingDiagnostics>,
+                zpdf_core::Error,
+            > {
                 let (font, diagnostics) = match obj {
                     PdfObject::Ref(font_ref) => {
                         return load_font_ref(
@@ -4832,15 +4843,18 @@ impl<'a> ContentInterpreter<'a> {
                             fc.provider().map(|provider| provider.as_ref()),
                         )?
                     }
-                    _ => return Ok(()),
+                    _ => return Ok(None),
                 };
-                let fid = fc
-                    .try_insert_with_limit(target.to_string(), font, max_font_bytes)
-                    .ok_or_else(|| font_cache_full(max_font_bytes))?;
-                if !diagnostics.is_complete() {
-                    fc.record_embedded_fallback(fid, diagnostics);
+                match fc.admit_with_diagnostics(
+                    target.to_string(),
+                    std::sync::Arc::new(font),
+                    diagnostics,
+                    None,
+                    max_font_bytes,
+                ) {
+                    Ok(_) => Ok(None),
+                    Err(unadmitted) => Ok(Some(unadmitted)),
                 }
-                Ok(())
             };
 
             match obj {
@@ -4866,13 +4880,17 @@ impl<'a> ContentInterpreter<'a> {
                     // reused).
                     let unique_name = format!("__font_{}_{}", font_ref.0, font_ref.1);
                     if fc.get_by_name(&unique_name).is_none() {
-                        if let Err(e) = load_into(fc, &unique_name) {
-                            tracing::debug!("form font {}: {e}", name.0);
-                            let _ = fc.try_insert_with_limit(
-                                unique_name.clone(),
-                                zpdf_font::LoadedFont::new_placeholder(name.0.clone()),
-                                max_font_bytes,
-                            );
+                        match load_into(fc, &unique_name) {
+                            Ok(Some(diag)) => self.stats.diagnostics.merge(diag),
+                            Ok(None) => {}
+                            Err(e) => {
+                                tracing::debug!("form font {}: {e}", name.0);
+                                let _ = fc.try_insert_with_limit(
+                                    unique_name.clone(),
+                                    zpdf_font::LoadedFont::new_placeholder(name.0.clone()),
+                                    max_font_bytes,
+                                );
+                            }
                         }
                     }
                     overrides.insert(name.0.clone(), unique_name);
@@ -4887,13 +4905,17 @@ impl<'a> ContentInterpreter<'a> {
                     let target = format!("__inline_font_{:016x}", inline_font_key(font_dict));
                     overrides.insert(name.0.clone(), target.clone());
                     if fc.get_by_name(&target).is_none() {
-                        if let Err(e) = load_into(fc, &target) {
-                            tracing::debug!("form inline font {}: {e}", name.0);
-                            let _ = fc.try_insert_with_limit(
-                                target,
-                                zpdf_font::LoadedFont::new_placeholder(name.0.clone()),
-                                max_font_bytes,
-                            );
+                        match load_into(fc, &target) {
+                            Ok(Some(diag)) => self.stats.diagnostics.merge(diag),
+                            Ok(None) => {}
+                            Err(e) => {
+                                tracing::debug!("form inline font {}: {e}", name.0);
+                                let _ = fc.try_insert_with_limit(
+                                    target,
+                                    zpdf_font::LoadedFont::new_placeholder(name.0.clone()),
+                                    max_font_bytes,
+                                );
+                            }
                         }
                     }
                 }
@@ -5601,24 +5623,9 @@ impl<'a> ContentInterpreter<'a> {
     }
 
     fn show_text(&mut self, bytes: &[u8]) {
-        if !bytes.is_empty() && !self.oc_suppressed() {
-            if let Some(fid) = self.current_font_id {
-                if self.current.render_mode != 3 {
-                    if let Some(diag) = self
-                        .font_cache
-                        .as_ref()
-                        .and_then(|fc| fc.embedded_fallback(fid))
-                    {
-                        if !self.reported_font_fallbacks.contains(&fid) {
-                            self.reported_font_fallbacks.push(fid);
-                            self.stats.diagnostics.merge(diag);
-                        }
-                    }
-                }
-            } else {
-                self.stats.diagnostics.missing_resources =
-                    self.stats.diagnostics.missing_resources.saturating_add(1);
-            }
+        if !bytes.is_empty() && !self.oc_suppressed() && self.current_font_id.is_none() {
+            self.stats.diagnostics.missing_resources =
+                self.stats.diagnostics.missing_resources.saturating_add(1);
         }
         let tm = self.text_matrix;
         let ctm = self.current.ctm;
@@ -5987,6 +5994,7 @@ impl<'a> ContentInterpreter<'a> {
         if ordinary {
             if let Some(font_id) = self.current_font_id {
                 if !glyphs.is_empty() {
+                    self.check_embedded_fallback_recovery(font_id, bytes, &glyphs, None);
                     self.emit_solid_glyph_run(font_id, font_size, glyphs, combined, h_scale);
                 }
             }
@@ -6020,6 +6028,87 @@ impl<'a> ContentInterpreter<'a> {
             Matrix::translate(x_offset as f64, 0.0)
         };
         self.text_matrix = self.text_matrix.concat(&advance);
+    }
+
+    /// Record embedded-font fallback diagnostics once per used font and verify
+    /// that every shown visible glyph recovered through the substitute or
+    /// provider fallback. Unrecovered missing visible glyphs increment
+    /// `decode_failures` so strict exports reject incomplete output while
+    /// successfully recovered pages stay complete.
+    fn check_embedded_fallback_recovery(
+        &mut self,
+        font_id: FontId,
+        bytes: &[u8],
+        glyphs: &[PositionedGlyph],
+        resolved_runs: Option<&[(FontId, Vec<PositionedGlyph>)]>,
+    ) {
+        if bytes.is_empty() || self.oc_suppressed() {
+            return;
+        }
+        let Some(fallback_diag) = self
+            .font_cache
+            .as_ref()
+            .and_then(|fc| fc.embedded_fallback(font_id))
+        else {
+            return;
+        };
+        if !self.reported_font_fallbacks.contains(&font_id) {
+            self.reported_font_fallbacks.push(font_id);
+            self.stats.diagnostics.merge(fallback_diag);
+            if fallback_diag.decode_failures > 0
+                && !self.reported_font_fallback_misses.contains(&font_id)
+            {
+                self.reported_font_fallback_misses.push(font_id);
+            }
+        }
+        if !self.reported_font_fallback_misses.contains(&font_id)
+            && !self.fallback_run_complete(font_id, bytes, glyphs, resolved_runs)
+        {
+            self.reported_font_fallback_misses.push(font_id);
+            self.stats.diagnostics.decode_failures =
+                self.stats.diagnostics.decode_failures.saturating_add(1);
+            if let Some(id) = fallback_diag.first_failed_object {
+                self.stats.diagnostics.first_failed_object.get_or_insert(id);
+            }
+        }
+    }
+
+    fn fallback_run_complete(
+        &self,
+        original_font_id: FontId,
+        bytes: &[u8],
+        glyphs: &[PositionedGlyph],
+        resolved_runs: Option<&[(FontId, Vec<PositionedGlyph>)]>,
+    ) -> bool {
+        let Some(cache) = self.font_cache.as_deref() else {
+            return false;
+        };
+        let Some(orig_font) = cache.get(original_font_id) else {
+            return false;
+        };
+        let composite = matches!(orig_font.font_type, zpdf_font::PdfFontType::Type0CidType2);
+        let cmap = orig_font.cid_cmap.as_ref();
+        let mut offset = 0usize;
+        let mut check_slice = |drawing_font_id: FontId, slice: &[PositionedGlyph]| -> bool {
+            let Some(drawing_font) = cache.get(drawing_font_id) else {
+                return false;
+            };
+            drawing_font.fallback_glyphs_complete(
+                orig_font,
+                slice.iter().map(|glyph| {
+                    let (code, length, raw, end) = next_text_code(cmap, composite, bytes, offset)
+                        .unwrap_or((0, 0, 0, bytes.len()));
+                    offset = end;
+                    (glyph.glyph_id, code, raw, length as u8)
+                }),
+            )
+        };
+        if let Some(runs) = resolved_runs {
+            runs.iter()
+                .all(|(run_font_id, run_glyphs)| check_slice(*run_font_id, run_glyphs))
+        } else {
+            check_slice(original_font_id, glyphs)
+        }
     }
 
     /// Keep optional fallback and clipping state off the main decoding stack.
@@ -6063,6 +6152,16 @@ impl<'a> ContentInterpreter<'a> {
             _ => self.current.fill_pattern.clone(),
         };
         let wants_clip = matches!(self.current.render_mode, 4..=7);
+        if let Some(font_id) = self.current_font_id {
+            if (!glyphs.is_empty() || resolved_runs.is_some()) && (!invisible || wants_clip) {
+                self.check_embedded_fallback_recovery(
+                    font_id,
+                    bytes,
+                    &glyphs,
+                    resolved_runs.as_deref(),
+                );
+            }
+        }
         // No font at all leaves the shown codes without any outline source.
         let mut outlines_unavailable = self.current_font_id.is_none();
         // Per resolved run: true when its font has no outlines to clip with.
@@ -6759,7 +6858,7 @@ fn load_font_ref(
     font_ref: ObjectId,
     name: &str,
     max_bytes: u64,
-) -> Result<(), zpdf_core::Error> {
+) -> Result<Option<zpdf_core::ProcessingDiagnostics>, zpdf_core::Error> {
     let shared = doc.filter(|doc| {
         std::ptr::eq(doc.file(), file)
             && match (doc.font_provider(), fc.provider()) {
@@ -6768,14 +6867,8 @@ fn load_font_ref(
                 _ => false,
             }
     });
-    let (inserted, diagnostics) = match shared {
-        Some(doc) => {
-            let (font, diagnostics) = doc.shared_font_with_diagnostics(font_ref)?;
-            (
-                fc.try_insert_shared_with_limit(name.to_string(), font, max_bytes),
-                diagnostics,
-            )
-        }
+    let (font, diagnostics) = match shared {
+        Some(doc) => doc.shared_font_with_diagnostics(font_ref)?,
         None => {
             let (font, diagnostics) =
                 zpdf_document::font_loader::load_single_font_with_diagnostics(
@@ -6783,17 +6876,19 @@ fn load_font_ref(
                     font_ref,
                     fc.provider().map(|provider| provider.as_ref()),
                 )?;
-            (
-                fc.try_insert_with_limit(name.to_string(), font, max_bytes),
-                diagnostics,
-            )
+            (std::sync::Arc::new(font), diagnostics)
         }
     };
-    let fid = inserted.ok_or_else(|| font_cache_full(max_bytes))?;
-    if !diagnostics.is_complete() {
-        fc.record_embedded_fallback(fid, diagnostics);
+    match fc.admit_with_diagnostics(
+        name.to_string(),
+        font,
+        diagnostics,
+        Some(font_ref),
+        max_bytes,
+    ) {
+        Ok(_) => Ok(None),
+        Err(unadmitted) => Ok(Some(unadmitted)),
     }
-    Ok(())
 }
 
 /// Content key for an inline font dictionary: the same dictionary always
@@ -6803,12 +6898,6 @@ fn inline_font_key(font_dict: &zpdf_core::PdfDict) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     format!("{font_dict:?}").hash(&mut hasher);
     hasher.finish()
-}
-
-fn font_cache_full(max_bytes: u64) -> zpdf_core::Error {
-    zpdf_core::Error::StreamDecode(format!(
-        "font cache byte limit ({max_bytes}) or ID capacity reached"
-    ))
 }
 
 /// Build the tiling pattern `obj` (object `pat_id`, resource `name`), with its

@@ -5,13 +5,20 @@
 ### Rendering and font recovery
 
 - Fall back to the descriptor-based substitute font path when an embedded font
-  program (`FontFile`, `FontFile2`, or `FontFile3`, simple or Type 0 / CID)
-  fails to decode, fails to parse, or has unreadable glyph outlines, keeping
-  PDF glyph placement (`/Widths`, `/W`, `/DW`, `/W2`, `/DW2`) instead of
-  rendering invisible text. Honour `/FontWeight` and `/ItalicAngle` alongside
-  `/Flags` and `/StemV` when selecting substitutes, and record fallbacks in
+  program (`FontFile`, `FontFile2`, or `FontFile3`) fails to decode, fails to
+  parse, or has unreadable glyph outlines — for simple fonts and for Type 0 /
+  CID fonts with a usable Unicode or legacy CMap, known CJK collection, or
+  `/ToUnicode` mapping — keeping PDF glyph placement (`/Widths`,
+  `/MissingWidth`, `/W`, `/DW`, `/W2`, `/DW2`) instead of rendering invisible
+  text. Unmapped composite fonts without such a mapping keep their original or
+  metrics-only entry and may still render invisible text while recording the
+  failure. Honour `/FontWeight` and `/ItalicAngle` alongside `/Flags` and
+  `/StemV` when selecting substitutes, and record fallbacks in
   `ProcessingDiagnostics::embedded_font_fallbacks` (leaving valid embedded and
-  normal non-embedded fonts unaffected). (#157)
+  normal non-embedded fonts unaffected). Successfully recovered pages stay
+  `is_complete()` while retaining `embedded_font_fallbacks`; unrecovered missing
+  visible glyphs also increment `decode_failures` so strict exports reject
+  incomplete output. (#157)
 
 ## 0.21.0 — Glyph-level selection and rendering compatibility
 

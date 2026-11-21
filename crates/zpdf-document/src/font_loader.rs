@@ -27,11 +27,19 @@ pub(crate) fn load_page_fonts(
     for (name, &font_ref) in &page.resources.fonts {
         match shared_or_load(file, font_ref, shared, provider) {
             Ok((font, diagnostics)) => {
-                let fid = cache
-                    .try_insert_shared_with_limit(name.clone(), font, max_bytes)
-                    .or_else(|| insert_placeholder(&mut cache, name, max_bytes));
-                if let (Some(fid), false) = (fid, diagnostics.is_complete()) {
-                    cache.record_embedded_fallback(fid, diagnostics);
+                if cache
+                    .admit_with_diagnostics(
+                        name.clone(),
+                        font,
+                        diagnostics,
+                        Some(font_ref),
+                        max_bytes,
+                    )
+                    .is_err()
+                {
+                    tracing::warn!(
+                        "font cache byte limit ({max_bytes}) or ID capacity reached; could not admit {name}"
+                    );
                 }
             }
             Err(e) => {
@@ -123,7 +131,7 @@ pub fn load_single_font_with_diagnostics(
     let obj = file.resolve(font_ref)?;
     let dict = obj.as_dict()?;
     let (font, mut diagnostics) = load_single_font_dict_with_diagnostics(file, dict, provider)?;
-    if !diagnostics.is_complete() {
+    if !diagnostics.is_empty() {
         diagnostics.first_failed_object.get_or_insert(font_ref);
     }
     Ok((font, diagnostics))
@@ -251,7 +259,7 @@ fn try_system_substitute_simple(
         Some(provider) => provider.find_font(lookup_name, hints, None),
         None => zpdf_font::system::find_system_font(lookup_name, hints, None),
     }?;
-    if cid_widths.is_empty() {
+    if cid_widths.is_empty() && !cid_widths.has_authoritative_default() {
         if let Some(metrics) = zpdf_font::standard_fonts::lookup(lookup_name) {
             for (code, &w) in metrics.widths.iter().enumerate() {
                 if w > 0 {
@@ -309,11 +317,22 @@ fn embedded_fallback_diagnostics(
 ) -> zpdf_core::ProcessingDiagnostics {
     let mut diagnostics = zpdf_core::ProcessingDiagnostics::default();
     diagnostics.record_embedded_font_fallback(object_id);
+    // Resource limits on an embedded font stream must remain visible as
+    // incomplete output even if a substitute face is available. Ordinary
+    // stream-decode errors defer `decode_failures` to the interpreter so a
+    // substitute that draws every visible glyph can still complete cleanly.
     if let Some(err) = error {
-        if let Some(id) = object_id {
-            diagnostics.record_object_failure(id, err);
-        } else {
-            diagnostics.record_decode_failure(err);
+        if matches!(
+            err,
+            zpdf_core::Error::RecursionLimit(_)
+                | zpdf_core::Error::StreamSizeLimit(_)
+                | zpdf_core::Error::StringLengthLimit(_)
+        ) {
+            if let Some(id) = object_id {
+                diagnostics.record_object_failure(id, err);
+            } else {
+                diagnostics.record_decode_failure(err);
+            }
         }
     }
     diagnostics
@@ -671,7 +690,15 @@ fn load_type0_font(
                 );
                 diagnostics = embedded_fallback_diagnostics(object_id, None);
                 if can_substitute {
-                    fallback_type0(cid_widths)
+                    substitute_type0_font(
+                        lookup_name,
+                        &base_font,
+                        cid_widths,
+                        provider,
+                        ordering.as_deref(),
+                        hints,
+                    )
+                    .unwrap_or(font)
                 } else {
                     font
                 }
@@ -829,14 +856,15 @@ fn load_simple_font(
                 tracing::warn!(
                     "font {base_font}: embedded program failed to parse; falling back to substitute"
                 );
-                let fallback = fallback_simple_font(
+                let fallback = try_system_substitute_simple(
                     file,
                     descriptor.as_ref(),
-                    base_font,
+                    &base_font,
                     font_type,
                     cid_widths,
                     provider,
-                );
+                )
+                .unwrap_or(font);
                 Ok((fallback, embedded_fallback_diagnostics(object_id, None)))
             }
         }
@@ -1282,11 +1310,13 @@ fn parse_simple_widths(file: &PdfFile, dict: &zpdf_core::PdfDict) -> CidWidths {
     // /MissingWidth, which defaults to 0 (Table 122). Fonts without /Widths or
     // without a descriptor (the standard 14 among them) keep the 1000
     // fallback; their advances come from built-in metrics or the program.
-    let default_width = match (&widths_array, resolve_dict(file, dict, "FontDescriptor")) {
-        (Some(_), Some(fd)) => missing_width(file, &fd),
-        _ => 1000.0,
-    };
+    let (default_width, authoritative_default) =
+        match (&widths_array, resolve_dict(file, dict, "FontDescriptor")) {
+            (Some(_), Some(fd)) => (missing_width(file, &fd), true),
+            _ => (1000.0, false),
+        };
     let mut widths = CidWidths::new(default_width);
+    widths.set_authoritative_default(authoritative_default);
 
     if let Some(arr) = widths_array {
         for (j, obj) in arr.iter().take(256).enumerate() {

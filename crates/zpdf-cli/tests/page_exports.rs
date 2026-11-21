@@ -132,3 +132,200 @@ fn cli_exports_keep_annotations_and_hide_disabled_layers() {
     fs::remove_file(input).unwrap();
     fs::remove_dir(dir).unwrap();
 }
+
+fn assemble_raw(objects: &[Vec<u8>]) -> Vec<u8> {
+    let mut pdf = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n".to_vec();
+    let mut offsets = Vec::with_capacity(objects.len());
+    for (i, body) in objects.iter().enumerate() {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+        pdf.extend_from_slice(body);
+        pdf.extend_from_slice(b"\nendobj\n");
+    }
+    let xref = pdf.len();
+    pdf.extend_from_slice(
+        format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+    );
+    for offset in offsets {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Root 1 0 R /Size {} >>\nstartxref\n{xref}\n%%EOF\n",
+            objects.len() + 1
+        )
+        .as_bytes(),
+    );
+    pdf
+}
+
+fn raw_stream(attrs: &str, bytes: &[u8]) -> Vec<u8> {
+    let mut out = format!("<< {attrs} /Length {} >>\nstream\n", bytes.len()).into_bytes();
+    out.extend_from_slice(bytes);
+    out.extend_from_slice(b"\nendstream");
+    out
+}
+
+#[test]
+fn corrupt_embedded_font_exports_succeed_when_recovered_and_fail_when_unrecovered() {
+    let dir = std::env::temp_dir().join(format!(
+        "zpdf-corrupt-font-exports-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir(&dir).unwrap();
+
+    // 1. Corrupt embedded TrueType referencing Helvetica: when a system substitute
+    //    exists, public CLI exports (`render`, `export-svg`, `text`, `convert`)
+    //    must recover and succeed rather than failing ensure_complete().
+    let recovered_pdf = assemble_raw(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 180 100] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>".to_vec(),
+        raw_stream("", b"0 0 0 rg BT /F1 24 Tf 15 40 Td (ABC) Tj ET"),
+        b"<< /Type /Font /Subtype /TrueType /BaseFont /ABCDEF+Helvetica /Encoding /WinAnsiEncoding \
+          /FirstChar 65 /LastChar 67 /Widths [620 780 540] /FontDescriptor 6 0 R >>"
+            .to_vec(),
+        b"<< /Type /FontDescriptor /FontName /ABCDEF+Helvetica /Flags 32 /FontFile2 7 0 R >>"
+            .to_vec(),
+        raw_stream("", b"not a valid truetype font"),
+    ]);
+    let has_system_helvetica = zpdf::PdfDocument::open(recovered_pdf.clone())
+        .ok()
+        .and_then(|doc| {
+            let page = doc.page(0).ok()?;
+            let fonts = doc.load_page_fonts(&page);
+            Some(fonts.get_by_name("F1")?.1.has_font_data())
+        })
+        .unwrap_or(false);
+    if has_system_helvetica {
+        let input = dir.join("recovered.pdf");
+        fs::write(&input, recovered_pdf).unwrap();
+
+        let svg_out = dir.join("recovered.svg");
+        let svg_res = Command::new(env!("CARGO_BIN_EXE_zpdf"))
+            .args(["export-svg"])
+            .arg(&input)
+            .args(["-o"])
+            .arg(&svg_out)
+            .output()
+            .unwrap();
+        assert!(
+            svg_res.status.success(),
+            "export-svg failed: {}",
+            String::from_utf8_lossy(&svg_res.stderr)
+        );
+        let svg = fs::read_to_string(&svg_out).unwrap();
+        assert!(svg.contains("<svg") && svg.contains("<path"), "{svg}");
+        fs::remove_file(&svg_out).unwrap();
+
+        let text_res = Command::new(env!("CARGO_BIN_EXE_zpdf"))
+            .args(["text"])
+            .arg(&input)
+            .output()
+            .unwrap();
+        assert!(
+            text_res.status.success(),
+            "text failed: {}",
+            String::from_utf8_lossy(&text_res.stderr)
+        );
+        assert!(String::from_utf8_lossy(&text_res.stdout).contains("ABC"));
+
+        let txt_out = dir.join("recovered.txt");
+        let conv_res = Command::new(env!("CARGO_BIN_EXE_zpdf"))
+            .args(["convert"])
+            .arg(&input)
+            .args(["-o"])
+            .arg(&txt_out)
+            .output()
+            .unwrap();
+        assert!(
+            conv_res.status.success(),
+            "convert failed: {}",
+            String::from_utf8_lossy(&conv_res.stderr)
+        );
+        assert!(fs::read_to_string(&txt_out).unwrap().contains("ABC"));
+        fs::remove_file(&txt_out).unwrap();
+
+        #[cfg(feature = "cpu")]
+        {
+            let png_out = dir.join("recovered.png");
+            let render_res = Command::new(env!("CARGO_BIN_EXE_zpdf"))
+                .args(["render"])
+                .arg(&input)
+                .args(["--dpi", "72", "-o"])
+                .arg(&png_out)
+                .output()
+                .unwrap();
+            assert!(
+                render_res.status.success(),
+                "render failed: {}",
+                String::from_utf8_lossy(&render_res.stderr)
+            );
+            let bitmap = image::open(&png_out).unwrap().to_rgba8();
+            let dark_pixels = bitmap
+                .pixels()
+                .filter(|p| p.0[0] < 200 || p.0[1] < 200 || p.0[2] < 200)
+                .count();
+            assert!(
+                dark_pixels > 50,
+                "expected rendered fallback ink, got {dark_pixels}"
+            );
+            fs::remove_file(&png_out).unwrap();
+        }
+        fs::remove_file(&input).unwrap();
+    }
+
+    // 2. Corrupt Type0 Identity-H without /ToUnicode or CJK collection cannot
+    //    recover visible glyphs -> strict exports must fail without overwriting.
+    let unrecovered_pdf = assemble_raw(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 180 100] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>".to_vec(),
+        raw_stream("", b"0 0 0 rg BT /F1 24 Tf 15 40 Td <00010002> Tj ET"),
+        b"<< /Type /Font /Subtype /Type0 /BaseFont /ABCDEF+UnrecoverableCID /Encoding /Identity-H /DescendantFonts [6 0 R] >>".to_vec(),
+        b"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /ABCDEF+UnrecoverableCID \
+          /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> \
+          /FontDescriptor 7 0 R /DW 1000 >>"
+            .to_vec(),
+        b"<< /Type /FontDescriptor /FontName /ABCDEF+UnrecoverableCID /Flags 32 /FontFile2 8 0 R >>"
+            .to_vec(),
+        raw_stream("", b"corrupt unrecoverable cid font"),
+    ]);
+    let bad_input = dir.join("unrecovered.pdf");
+    fs::write(&bad_input, unrecovered_pdf).unwrap();
+
+    for (command, ext) in [("export-svg", "svg"), ("render", "png")] {
+        #[cfg(not(feature = "cpu"))]
+        if command == "render" {
+            continue;
+        }
+        let out = dir.join(format!("unrecovered.{ext}"));
+        fs::write(&out, b"existing").unwrap();
+        let res = Command::new(env!("CARGO_BIN_EXE_zpdf"))
+            .arg(command)
+            .arg(&bad_input)
+            .args(["-o"])
+            .arg(&out)
+            .output()
+            .unwrap();
+        assert!(
+            !res.status.success(),
+            "{command} should reject unrecovered output"
+        );
+        let stderr = String::from_utf8_lossy(&res.stderr);
+        assert!(
+            stderr.contains("incomplete output")
+                && stderr.contains("decode_failures=1")
+                && stderr.contains("embedded_font_fallbacks=1"),
+            "{command}: {stderr}"
+        );
+        assert_eq!(fs::read(&out).unwrap(), b"existing");
+        fs::remove_file(&out).unwrap();
+    }
+    fs::remove_file(&bad_input).unwrap();
+    fs::remove_dir(dir).unwrap();
+}

@@ -214,6 +214,40 @@ impl LoadedFont {
             })
     }
 
+    /// Whether every `(glyph id, code, raw code, code length)` draws a visible
+    /// outline from `self` or represents known whitespace/invisible text in
+    /// `meaning_font` (the logical PDF font carrying `/ToUnicode`, CMap, and
+    /// `/Encoding`). Used to distinguish complete embedded-font recovery from
+    /// missing visible output. Parses `self`'s face at most once per call.
+    #[doc(hidden)]
+    pub fn fallback_glyphs_complete(
+        &self,
+        meaning_font: &LoadedFont,
+        glyphs: impl IntoIterator<Item = (u16, u32, u32, u8)>,
+    ) -> bool {
+        let face = if self.is_type3() || self.type1.is_some() {
+            None
+        } else {
+            parsed_face(self)
+        };
+        glyphs
+            .into_iter()
+            .all(|(glyph_id, code, raw_code, length)| {
+                let state = match &face {
+                    Some(face) if glyph_id != 0 => self.face_glyph_state(glyph_id, face),
+                    Some(_) => GlyphState::Missing,
+                    None if self.is_type3() || self.type1.is_some() => self.glyph_state(glyph_id),
+                    None => GlyphState::Missing,
+                };
+                match state {
+                    GlyphState::Drawn => true,
+                    GlyphState::Blank | GlyphState::Missing => {
+                        meaning_font.blank_is_space(code, raw_code, length)
+                    }
+                }
+            })
+    }
+
     /// A blank glyph is right for this code: the font's meaning for it is
     /// known and is whitespace or invisible.
     fn blank_is_space(&self, code: u32, raw_code: u32, length: u8) -> bool {
@@ -324,38 +358,40 @@ pub(crate) fn physical_glyph_state(face: &ttf_parser::Face<'_>, gid: u16) -> Gly
     }
 }
 
+fn is_visible_char(character: char) -> bool {
+    !character.is_whitespace()
+        && !character.is_control()
+        && !matches!(
+            character as u32,
+            0xAD | 0x34F
+                | 0x61C
+                | 0x115F..=0x1160
+                | 0x17B4..=0x17B5
+                | 0x180B..=0x180F
+                | 0x200B..=0x200F
+                | 0x202A..=0x202E
+                | 0x2060..=0x206F
+                | 0x2800
+                | 0x3164
+                | 0xFE00..=0xFE0F
+                | 0xFEFF
+                | 0xFFA0
+                | 0xFFF0..=0xFFF8
+                | 0x1BCA0..=0x1BCA3
+                | 0x1D173..=0x1D17A
+                | 0xE0000..=0xE0FFF
+                | 0xE000..=0xF8FF
+                | 0xF0000..=0xFFFFD
+                | 0x100000..=0x10FFFD
+        )
+}
+
 /// Whether text names something visible: at least one character that is not
 /// whitespace, a control or format character, a default-ignorable code point,
 /// or private use (whose meaning belongs to one font).
 #[doc(hidden)]
 pub fn is_visible_text(text: &str) -> bool {
-    text.chars().any(|character| {
-        !character.is_whitespace()
-            && !character.is_control()
-            && !matches!(
-                character as u32,
-                0xAD | 0x34F
-                    | 0x61C
-                    | 0x115F..=0x1160
-                    | 0x17B4..=0x17B5
-                    | 0x180B..=0x180F
-                    | 0x200B..=0x200F
-                    | 0x202A..=0x202E
-                    | 0x2060..=0x206F
-                    | 0x2800
-                    | 0x3164
-                    | 0xFE00..=0xFE0F
-                    | 0xFEFF
-                    | 0xFFA0
-                    | 0xFFF0..=0xFFF8
-                    | 0x1BCA0..=0x1BCA3
-                    | 0x1D173..=0x1D17A
-                    | 0xE0000..=0xE0FFF
-                    | 0xE000..=0xF8FF
-                    | 0xF0000..=0xFFFFD
-                    | 0x100000..=0x10FFFD
-            )
-    })
+    text.chars().any(is_visible_char)
 }
 
 /// The glyph exists and its outline, possibly empty, is well formed.
@@ -413,6 +449,88 @@ pub(crate) fn readable_glyph(face: &ttf_parser::Face<'_>, gid: u16) -> bool {
         return false;
     }
     start == end || (end - start >= 10 && glyf.get(start..start + 2) == Some(&[0, 0]))
+}
+
+/// Whether a `GlyphState::Blank` glyph in a `glyf` face shows evidence of
+/// corruption (malformed header, oversized zeroed-out contour payload, or a
+/// zero-contour record hiding a visible character in the face's Unicode cmap).
+///
+/// Zero-length `loca` entries (`start == end`) and valid 10–12 byte zero-contour
+/// space headers return `false`.
+pub(crate) fn glyf_blank_is_corrupt(
+    face: &ttf_parser::Face<'_>,
+    gid: u16,
+    visible_gids: &mut Option<std::collections::HashSet<u16>>,
+) -> bool {
+    if face.tables().glyf.is_none() {
+        return false;
+    }
+    let raw = face.raw_face();
+    let Some(head) = raw.table(ttf_parser::Tag::from_bytes(b"head")) else {
+        return true;
+    };
+    let Some(loca) = raw.table(ttf_parser::Tag::from_bytes(b"loca")) else {
+        return true;
+    };
+    let Some(glyf) = raw.table(ttf_parser::Tag::from_bytes(b"glyf")) else {
+        return true;
+    };
+    let long = head.get(50..52) == Some(&[0, 1]);
+    let offset = |index: usize| -> Option<usize> {
+        if long {
+            Some(u32::from_be_bytes(loca.get(index * 4..index * 4 + 4)?.try_into().ok()?) as usize)
+        } else {
+            Some(
+                u16::from_be_bytes(loca.get(index * 2..index * 2 + 2)?.try_into().ok()?) as usize
+                    * 2,
+            )
+        }
+    };
+    let (Some(start), Some(end)) = (offset(gid as usize), offset(gid as usize + 1)) else {
+        return true;
+    };
+    if start > end || end > glyf.len() {
+        return true;
+    }
+    if start == end {
+        return false;
+    }
+    let len = end - start;
+    if len < 10 || glyf.get(start..start + 2) != Some(&[0, 0]) {
+        return true;
+    }
+    let x_min = i16::from_be_bytes([glyf[start + 2], glyf[start + 3]]);
+    let y_min = i16::from_be_bytes([glyf[start + 4], glyf[start + 5]]);
+    let x_max = i16::from_be_bytes([glyf[start + 6], glyf[start + 7]]);
+    let y_max = i16::from_be_bytes([glyf[start + 8], glyf[start + 9]]);
+    if x_min > x_max || y_min > y_max {
+        return true;
+    }
+    // A valid empty glyph record holds only the 10-byte glyph header (at most
+    // 12 bytes with 4-byte `loca` alignment padding or a 2-byte zero
+    // instructionLength). Larger all-zero records indicate a wiped contour
+    // payload.
+    if len > 12 {
+        return true;
+    }
+    let set = visible_gids.get_or_insert_with(|| {
+        let mut gids = std::collections::HashSet::new();
+        if let Some(cmap) = face.tables().cmap {
+            for st in cmap.subtables {
+                if st.is_unicode() {
+                    st.codepoints(|cp| {
+                        if char::from_u32(cp).is_some_and(is_visible_char) {
+                            if let Some(g) = st.glyph_index(cp) {
+                                gids.insert(g.0);
+                            }
+                        }
+                    });
+                }
+            }
+        }
+        gids
+    });
+    set.contains(&gid)
 }
 
 /// Whether `gid` has a non-zero or malformed `loca` slice in a `glyf` face
