@@ -422,6 +422,42 @@ fn gpu_clear_matches_cpu_and_matching_fill_exactly() {
             );
         }
     }
+
+    // Blank-page translucent clears premultiply clamped RGB by clamped alpha
+    // in floating point before rounding once to bytes, matching CPU Pixmap::fill.
+    for (color, expected) in [
+        (Color::rgba(0.1, 0.0, 0.0, 254.0 / 255.0), [25, 0, 0, 254]),
+        (Color::rgba(1.0, 0.5, 0.0, 0.5), [128, 64, 0, 128]),
+        (Color::rgba(1.0, 0.5, 0.25, 0.0), [0, 0, 0, 0]),
+    ] {
+        let info = PageRenderInfo {
+            page_rect: Rect::new(0.0, 0.0, 4.0, 2.0),
+            scale: 1.0,
+            background: color,
+        };
+        let mut cpu = zpdf::cpu::CpuRenderer::new();
+        cpu.begin_page(&info).expect("CPU begin page");
+        let cpu = cpu.end_page().expect("CPU end page");
+        renderer.begin_page(&info).expect("GPU begin page");
+        let gpu = renderer.end_page().expect("GPU end page");
+        assert_eq!((cpu.width, cpu.height), (4, 2));
+        assert_eq!((gpu.width, gpu.height), (4, 2));
+        assert_eq!(cpu.data.len(), 4 * 2 * 4);
+        assert_eq!(gpu.data.len(), 4 * 2 * 4);
+        for px in 0..(4 * 2) {
+            let offset = px * 4;
+            assert_eq!(
+                &cpu.data[offset..offset + 4],
+                &expected,
+                "CPU translucent clear {color:?} px={px}"
+            );
+            assert_eq!(
+                &gpu.data[offset..offset + 4],
+                &expected,
+                "GPU translucent clear {color:?} px={px}"
+            );
+        }
+    }
 }
 
 #[test]

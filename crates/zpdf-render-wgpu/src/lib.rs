@@ -123,6 +123,23 @@ fn unit(v: f32) -> f32 {
     }
 }
 
+/// Premultiply and round a straight background colour for `wgpu::LoadOp::Clear`.
+///
+/// Matches CPU `Pixmap::fill` (tiny-skia): clamp RGB and alpha to `[0.0, 1.0]`,
+/// multiply each clamped RGB channel by the clamped alpha in floating point,
+/// then round once to an 8-bit UNORM value. Opaque clears (`a == 1.0`) match
+/// opaque solid GPU fills of the same colour.
+fn quantize_clear_color(bg: &Color) -> wgpu::Color {
+    let a = bg.a.clamp(0.0, 1.0);
+    let q = |v: f32| ((v * 255.0).round() as u8) as f64 / 255.0;
+    wgpu::Color {
+        r: q(bg.r.clamp(0.0, 1.0) * a),
+        g: q(bg.g.clamp(0.0, 1.0) * a),
+        b: q(bg.b.clamp(0.0, 1.0) * a),
+        a: q(a),
+    }
+}
+
 /// Result of a submission-only render — see
 /// [`WgpuRenderer::render_display_list_submitted`].
 ///
@@ -345,16 +362,9 @@ impl<'a> RenderBackend for WgpuRenderer<'a> {
             )));
         }
 
-        // Round the background channels so an opaque clear matches an opaque
-        // GPU fill of the same colour and the CPU's background bytes.
-        let bg = &info.background;
-        let q = |v: f32| ((v.clamp(0.0, 1.0) * 255.0).round() as u8) as f64 / 255.0;
-        let clear = wgpu::Color {
-            r: q(bg.r),
-            g: q(bg.g),
-            b: q(bg.b),
-            a: q(bg.a),
-        };
+        // Premultiply and round the background channels so both opaque and
+        // translucent clears match CPU `Pixmap::fill` and opaque solid fills.
+        let clear = quantize_clear_color(&info.background);
 
         let map = PageMap::new(info.page_rect, scale);
         let uniform = PageUniform {
@@ -1643,6 +1653,45 @@ mod resource_tests {
         assert!(matches!(err, WgpuRenderError::Unsupported(_)));
         assert!(renderer.ctx.is_none());
         assert!(renderer.page.is_none());
+    }
+
+    #[test]
+    fn quantize_clear_color_premultiplies_and_rounds() {
+        let expect = |r: u8, g: u8, b: u8, a: u8| wgpu::Color {
+            r: r as f64 / 255.0,
+            g: g as f64 / 255.0,
+            b: b as f64 / 255.0,
+            a: a as f64 / 255.0,
+        };
+        assert_eq!(
+            quantize_clear_color(&Color::gray(0.5)),
+            expect(128, 128, 128, 255)
+        );
+        assert_eq!(
+            quantize_clear_color(&Color::rgba(0.1, 0.0, 0.0, 254.0 / 255.0)),
+            expect(25, 0, 0, 254)
+        );
+        assert_eq!(
+            quantize_clear_color(&Color::rgba(1.0, 0.5, 0.0, 0.5)),
+            expect(128, 64, 0, 128)
+        );
+        assert_eq!(
+            quantize_clear_color(&Color::rgba(1.0, 0.5, 0.25, 0.0)),
+            expect(0, 0, 0, 0)
+        );
+        // Clamp RGB and alpha independently before premultiplying.
+        assert_eq!(
+            quantize_clear_color(&Color::rgba(2.0, -1.0, 0.5, 0.5)),
+            expect(128, 0, 64, 128)
+        );
+        assert_eq!(
+            quantize_clear_color(&Color::rgba(0.5, 0.5, 0.5, 2.0)),
+            expect(128, 128, 128, 255)
+        );
+        assert_eq!(
+            quantize_clear_color(&Color::rgba(f32::NAN, 0.5, f32::INFINITY, 1.0)),
+            expect(0, 128, 255, 255)
+        );
     }
 }
 
