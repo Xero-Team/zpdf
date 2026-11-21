@@ -1417,7 +1417,12 @@ impl<'a> ContentInterpreter<'a> {
                 } else {
                     // Unbalanced Q at this nesting level (page bottom or a
                     // form's own saved state): keep the current state, but the
-                    // clips counted above are gone.
+                    // clips counted above are gone. Clear clip_bounds if any
+                    // clip was just popped so later clips cannot be elided
+                    // against a stale tighter bound.
+                    if self.current.clip_depth > 0 {
+                        self.current.clip_bounds = None;
+                    }
                     self.current.clip_depth = 0;
                 }
             }
@@ -2995,22 +3000,135 @@ impl<'a> ContentInterpreter<'a> {
         })
     }
 
+    /// Normalize `r` and return `Some` only when all four coordinates are finite.
+    fn finite_rect(r: Rect) -> Option<Rect> {
+        let r = r.normalize();
+        (r.x0.is_finite() && r.y0.is_finite() && r.x1.is_finite() && r.y1.is_finite()).then_some(r)
+    }
+
+    /// If `path` is a single simple, non-degenerate, axis-aligned rectangle in
+    /// page space, return its normalized bounding [`Rect`].
+    ///
+    /// Both `FillRule::NonZero` and `FillRule::EvenOdd` fill such a path
+    /// identically over the entire rectangle with no holes or uncovered corners.
+    /// Rotated/skewed quads, bowties, curves, degenerate/empty rects, non-finite
+    /// coordinates, and multi-subpath paths all return `None`.
+    fn axis_aligned_rect(path: &Path) -> Option<Rect> {
+        let mut iter = path.iter();
+        let PathElement::MoveTo(p0) = iter.next()? else {
+            return None;
+        };
+        let PathElement::LineTo(p1) = iter.next()? else {
+            return None;
+        };
+        let PathElement::LineTo(p2) = iter.next()? else {
+            return None;
+        };
+        let PathElement::LineTo(p3) = iter.next()? else {
+            return None;
+        };
+        match iter.next() {
+            // 5-element closed rect (`re` or `m l l l h`).
+            Some(PathElement::Close) => {
+                if iter.next().is_some() {
+                    return None;
+                }
+            }
+            // Explicit return to the start vertex (`m l l l l h` or `m l l l l`).
+            Some(PathElement::LineTo(p4)) if p4 == p0 => match iter.next() {
+                None => {}
+                Some(PathElement::Close) if iter.next().is_none() => {}
+                _ => return None,
+            },
+            // 4-element unclosed rect (`m l l l`); PDF clipping implicitly closes subpaths.
+            None => {}
+            _ => return None,
+        }
+
+        if ![p0, p1, p2, p3]
+            .iter()
+            .all(|p| p.x.is_finite() && p.y.is_finite())
+        {
+            return None;
+        }
+
+        // Consecutive edges must strictly alternate horizontal and vertical
+        // with non-zero span on both axes (rejects rotations, skews, bowties,
+        // and zero-area rects, while allowing 0/90/180/270-degree transforms).
+        let horiz_first = p0.y == p1.y
+            && p1.x == p2.x
+            && p2.y == p3.y
+            && p3.x == p0.x
+            && p0.x != p1.x
+            && p1.y != p2.y;
+        let vert_first = p0.x == p1.x
+            && p1.y == p2.y
+            && p2.x == p3.x
+            && p3.y == p0.y
+            && p0.y != p1.y
+            && p1.x != p2.x;
+        if !horiz_first && !vert_first {
+            return None;
+        }
+
+        let x0 = p0.x.min(p2.x);
+        let x1 = p0.x.max(p2.x);
+        let y0 = p0.y.min(p2.y);
+        let y1 = p0.y.max(p2.y);
+        (x1 > x0 && y1 > y0).then(|| Rect::new(x0, y0, x1, y1))
+    }
+
+    /// Current page-space clip bounding box: the intersection of active clips
+    /// (when any have been pushed) with the finite page rect.
+    ///
+    /// Returns `None` when no valid finite, non-empty bound is available (for
+    /// example an unbounded/degenerate `page_rect` with no active clip, or an
+    /// already-empty visible intersection), preventing speculative elision.
+    fn effective_clip_bounds(&self) -> Option<Rect> {
+        let page =
+            Self::finite_rect(self.display_list.page_rect).filter(|r| r.x1 > r.x0 && r.y1 > r.y0);
+        match (self.current.clip_bounds.and_then(Self::finite_rect), page) {
+            (Some(c), Some(p)) => {
+                let x0 = c.x0.max(p.x0);
+                let y0 = c.y0.max(p.y0);
+                let x1 = c.x1.min(p.x1);
+                let y1 = c.y1.min(p.y1);
+                (x1 > x0 && y1 > y0).then(|| Rect::new(x0, y0, x1, y1))
+            }
+            (Some(c), None) => (c.x1 > c.x0 && c.y1 > c.y0).then_some(c),
+            (None, Some(p)) => Some(p),
+            (None, None) => None,
+        }
+    }
+
+    /// True when `path` is a single page-space axis-aligned rectangle that
+    /// completely covers the current effective clip bounds (exact no-op clip
+    /// elision, after the approach in `hayro-interpret/src/context.rs`).
+    fn clip_path_covers_current_bounds(&self, path: &Path) -> bool {
+        let (Some(rect), Some(bounds)) =
+            (Self::axis_aligned_rect(path), self.effective_clip_bounds())
+        else {
+            return false;
+        };
+        rect.x0 <= bounds.x0 && rect.y0 <= bounds.y0 && rect.x1 >= bounds.x1 && rect.y1 >= bounds.y1
+    }
+
     /// Intersect the running clip-bounds with a new clip path's page-space bbox.
     fn intersect_clip_bounds(&mut self, new: Option<Rect>) {
-        let Some(n) = new.map(|r| r.normalize()) else {
+        let Some(n) = new.and_then(Self::finite_rect) else {
             return;
         };
-        self.current.clip_bounds = Some(match self.current.clip_bounds {
-            Some(c) => {
-                let c = c.normalize();
-                let (x0, y0) = (c.x0.max(n.x0), c.y0.max(n.y0));
-                // Disjoint clips leave an empty region. Keep it empty (zero
-                // area at its corner): an inverted rect would `normalize()`
-                // back into a non-empty one at the next intersection.
-                Rect::new(x0, y0, c.x1.min(n.x1).max(x0), c.y1.min(n.y1).max(y0))
-            }
-            None => n,
-        });
+        self.current.clip_bounds =
+            Some(match self.current.clip_bounds.and_then(Self::finite_rect) {
+                Some(c) => {
+                    let (x0, y0) = (c.x0.max(n.x0), c.y0.max(n.y0));
+                    // Disjoint clips leave an empty region. Keep it empty (zero
+                    // area at its corner): an inverted rect would `normalize()`
+                    // back into a non-empty one at the next intersection.
+                    Rect::new(x0, y0, c.x1.min(n.x1).max(x0), c.y1.min(n.y1).max(y0))
+                }
+                None => n,
+            });
     }
 
     /// Page-space region a full-page paint (`sh`) actually needs to cover: the
@@ -3139,15 +3257,24 @@ impl<'a> ContentInterpreter<'a> {
     fn path_bounds(path: &Path) -> Option<Rect> {
         let mut min = Point::new(f64::INFINITY, f64::INFINITY);
         let mut max = Point::new(f64::NEG_INFINITY, f64::NEG_INFINITY);
-        let mut acc = |p: &Point| {
+        // Every point, including curve control points. Reject any path carrying
+        // a non-finite coordinate so clip_bounds never narrows on a path the
+        // backend will skip.
+        for p in path.points() {
+            if !p.x.is_finite() || !p.y.is_finite() {
+                return None;
+            }
             min.x = min.x.min(p.x);
             min.y = min.y.min(p.y);
             max.x = max.x.max(p.x);
             max.y = max.y.max(p.y);
-        };
-        // Every point, including curve control points.
-        path.points().iter().for_each(&mut acc);
-        (min.x.is_finite() && min.y.is_finite() && max.x > min.x && max.y > min.y)
+        }
+        (min.x.is_finite()
+            && min.y.is_finite()
+            && max.x.is_finite()
+            && max.y.is_finite()
+            && max.x > min.x
+            && max.y > min.y)
             .then(|| Rect::new(min.x, min.y, max.x, max.y))
     }
 
@@ -3805,6 +3932,10 @@ impl<'a> ContentInterpreter<'a> {
         self.current.blend_mode = BlendMode::Normal;
         self.current.fill_alpha = 1.0;
         self.current.stroke_alpha = 1.0;
+        // The detached mask display list starts unclipped; clear inherited
+        // clip_bounds so clips inside /G are never elided against the outer
+        // page's clip (which is not pushed onto mask_dl).
+        self.current.clip_bounds = None;
         // A soft mask's /G group *is* a form, drawn into a detached command
         // list — attributed as form work, which is where a mask-heavy page's
         // interpret time will show up.
@@ -4615,12 +4746,14 @@ impl<'a> ContentInterpreter<'a> {
                     bbox_path.rect(Rect::new(x0, y0, x1, y1));
                     let page_path = self.transform_path_to_page_space(&bbox_path);
                     bbox_bounds = Self::path_bounds(&page_path);
-                    self.intersect_clip_bounds(bbox_bounds);
-                    self.display_list.push(RenderCommand::PushClip {
-                        path: page_path,
-                        rule: FillRule::NonZero,
-                    });
-                    bbox_clip = true;
+                    if !self.clip_path_covers_current_bounds(&page_path) {
+                        self.intersect_clip_bounds(bbox_bounds);
+                        self.display_list.push(RenderCommand::PushClip {
+                            path: page_path,
+                            rule: FillRule::NonZero,
+                        });
+                        bbox_clip = true;
+                    }
                 }
             }
         }
@@ -4902,6 +5035,9 @@ impl<'a> ContentInterpreter<'a> {
     /// Install the clip a `W`/`W*` left pending (see `pending_clip`).
     fn flush_pending_clip(&mut self) {
         if let Some((path, rule)) = self.pending_clip.take() {
+            if self.clip_path_covers_current_bounds(&path) {
+                return;
+            }
             self.intersect_clip_bounds(Self::path_bounds(&path));
             self.display_list
                 .push(RenderCommand::PushClip { path, rule });
@@ -5240,12 +5376,20 @@ impl<'a> ContentInterpreter<'a> {
         }
         if let Some(pat) = self.current.fill_pattern.clone() {
             if let Some(bounds) = Self::path_bounds(&page_path) {
-                self.display_list.push(RenderCommand::PushClip {
-                    path: page_path.clone(),
-                    rule,
-                });
+                let push_clip = !self.clip_path_covers_current_bounds(&page_path);
+                let saved_clip_bounds = self.current.clip_bounds;
+                if push_clip {
+                    self.intersect_clip_bounds(Some(bounds));
+                    self.display_list.push(RenderCommand::PushClip {
+                        path: page_path.clone(),
+                        rule,
+                    });
+                }
                 let painted = self.paint_pattern_in_region(&pat, bounds);
-                self.display_list.push(RenderCommand::PopClip);
+                if push_clip {
+                    self.display_list.push(RenderCommand::PopClip);
+                    self.current.clip_bounds = saved_clip_bounds;
+                }
                 if painted {
                     return;
                 }
@@ -5457,10 +5601,14 @@ impl<'a> ContentInterpreter<'a> {
                 let mut bbox_path = Path::new();
                 bbox_path.rect(def.bbox);
                 let page_bbox = self.transform_path_to_page_space(&bbox_path);
-                self.display_list.push(RenderCommand::PushClip {
-                    path: page_bbox,
-                    rule: FillRule::NonZero,
-                });
+                let cell_clip = !self.clip_path_covers_current_bounds(&page_bbox);
+                if cell_clip {
+                    self.intersect_clip_bounds(Self::path_bounds(&page_bbox));
+                    self.display_list.push(RenderCommand::PushClip {
+                        path: page_bbox,
+                        rule: FillRule::NonZero,
+                    });
+                }
 
                 // The `W` of the fill painting this pattern stays pending for
                 // it; one the cell leaves unpainted ends with the cell.
@@ -5504,7 +5652,9 @@ impl<'a> ContentInterpreter<'a> {
                 if let Some(state) = self.state_stack.pop() {
                     self.current = state;
                 }
-                self.display_list.push(RenderCommand::PopClip);
+                if cell_clip {
+                    self.display_list.push(RenderCommand::PopClip);
+                }
                 self.state_floor = saved_floor;
                 self.suppress_color_ops = saved_suppress;
                 self.mc_depth = saved_mc_depth;
@@ -9487,5 +9637,292 @@ mod tests {
             interp.stats.shading_ns > 0,
             "shading time must be attributed"
         );
+    }
+
+    fn clip_counts_and_balance(dl: &DisplayList) -> (usize, usize, i32) {
+        let mut pushes = 0usize;
+        let mut pops = 0usize;
+        let mut depth = 0i32;
+        let mut min_depth = 0i32;
+        for cmd in &dl.commands {
+            match cmd {
+                RenderCommand::PushClip { .. } | RenderCommand::PushClipStroke { .. } => {
+                    pushes += 1;
+                    depth += 1;
+                }
+                RenderCommand::PopClip => {
+                    pops += 1;
+                    depth -= 1;
+                    min_depth = min_depth.min(depth);
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(depth, 0, "unbalanced PushClip/PopClip: {dl:?}");
+        assert!(min_depth >= 0, "PopClip underflow: {dl:?}");
+        (pushes, pops, min_depth)
+    }
+
+    #[test]
+    fn covering_rectangle_clip_is_elided_and_smaller_is_kept() {
+        let page = Rect::new(0.0, 0.0, 200.0, 200.0);
+
+        // Exact page rect, oversized rect, negative-extent rect, and manually
+        // constructed rects (both W and W*) are all elided.
+        for content in [
+            &b"q 0 0 200 200 re W n 10 10 20 20 re f Q"[..],
+            &b"q -10 -10 220 220 re W* n 10 10 20 20 re f Q"[..],
+            &b"q 200 200 -200 -200 re W n 10 10 20 20 re f Q"[..],
+            &b"q 0 0 m 200 0 l 200 200 l 0 200 l h W n 10 10 20 20 re f Q"[..],
+            &b"q 0 0 m 200 0 l 200 200 l 0 200 l 0 0 l h W* n 10 10 20 20 re f Q"[..],
+            &b"q 0 0 m 0 200 l 200 200 l 200 0 l W n 10 10 20 20 re f Q"[..],
+        ] {
+            let dl = ContentInterpreter::new(page).interpret(content);
+            let (pushes, pops, _) = clip_counts_and_balance(&dl);
+            assert_eq!(
+                (pushes, pops),
+                (0, 0),
+                "expected covering clip elided for {:?}",
+                String::from_utf8_lossy(content)
+            );
+            assert_eq!(
+                dl.commands
+                    .iter()
+                    .filter(|c| matches!(c, RenderCommand::FillPath { .. }))
+                    .count(),
+                1
+            );
+        }
+
+        // Smaller on any single edge (left, bottom, right, top) must be kept.
+        for content in [
+            &b"q 0.5 0 199.5 200 re W n 0 0 200 200 re f Q"[..],
+            &b"q 0 0.5 200 199.5 re W n 0 0 200 200 re f Q"[..],
+            &b"q 0 0 199.5 200 re W n 0 0 200 200 re f Q"[..],
+            &b"q 0 0 200 199.5 re W* n 0 0 200 200 re f Q"[..],
+            &b"q 10 10 180 180 re W n 0 0 200 200 re f Q"[..],
+        ] {
+            let dl = ContentInterpreter::new(page).interpret(content);
+            let (pushes, pops, _) = clip_counts_and_balance(&dl);
+            assert_eq!(
+                (pushes, pops),
+                (1, 1),
+                "expected narrower clip kept for {:?}",
+                String::from_utf8_lossy(content)
+            );
+        }
+
+        // Non-zero page origin: clip must cover [50, 100, 250, 400].
+        let shifted = Rect::new(50.0, 100.0, 250.0, 400.0);
+        let dl_elided = ContentInterpreter::new(shifted)
+            .interpret(b"q 50 100 200 300 re W n 60 110 10 10 re f Q");
+        assert_eq!(clip_counts_and_balance(&dl_elided), (0, 0, 0));
+        let dl_kept =
+            ContentInterpreter::new(shifted).interpret(b"q 0 0 200 300 re W n 60 110 10 10 re f Q");
+        assert_eq!(clip_counts_and_balance(&dl_kept), (1, 1, 0));
+    }
+
+    #[test]
+    fn nested_clip_covering_narrowed_bounds_is_elided() {
+        let page = Rect::new(0.0, 0.0, 200.0, 200.0);
+        // First clip narrows to [40, 40, 140, 140] (kept).
+        // Second [20, 20, 160, 160] and third [40, 40, 140, 140] cover it (elided).
+        // Fourth [50, 50, 130, 130] narrows further (kept).
+        let dl = ContentInterpreter::new(page).interpret(
+            b"q 40 40 100 100 re W n \
+              q 20 20 140 140 re W n \
+              q 40 40 100 100 re W* n \
+              q 50 50 80 80 re W n \
+              0 0 200 200 re f \
+              Q Q Q Q",
+        );
+        assert_eq!(clip_counts_and_balance(&dl), (2, 2, 0));
+
+        // A non-rectangular clip (triangle inside [40, 40, 140, 140]) also
+        // narrows clip_bounds, so a subsequent covering rect is elided.
+        let dl_tri = ContentInterpreter::new(page).interpret(
+            b"q 40 40 m 140 40 l 90 140 l h W n \
+              30 30 120 120 re W n \
+              0 0 200 200 re f Q",
+        );
+        assert_eq!(clip_counts_and_balance(&dl_tri), (1, 1, 0));
+    }
+
+    #[test]
+    fn rotated_skewed_and_bowtie_clips_are_not_falsely_elided() {
+        let page = Rect::new(0.0, 0.0, 200.0, 200.0);
+
+        for content in [
+            // 45-degree rotated oversized rectangle.
+            &b"q 0.7071 0.7071 -0.7071 0.7071 100 -50 cm 0 0 300 300 re W n 0 0 200 200 re f Q"[..],
+            // Slight (~1 deg) rotation.
+            &b"q 0.9998 0.0175 -0.0175 0.9998 0 0 cm -50 -50 300 300 re W n 0 0 200 200 re f Q"[..],
+            // Skewed parallelogram.
+            &b"q 1 0.1 0 1 0 0 cm -50 -50 300 300 re W n 0 0 200 200 re f Q"[..],
+            // Self-intersecting bowtie touching all four page corners.
+            &b"q 0 0 m 200 200 l 200 0 l 0 200 l h W n 0 0 200 200 re f Q"[..],
+        ] {
+            let dl = ContentInterpreter::new(page).interpret(content);
+            assert_eq!(
+                clip_counts_and_balance(&dl),
+                (1, 1, 0),
+                "non-axis-aligned clip must not be elided: {:?}",
+                String::from_utf8_lossy(content)
+            );
+        }
+
+        // Exact 90-degree page rotation maps [0, 0, 200, 100] cleanly onto the
+        // rotated [0, 0, 100, 200] page_rect, so a full-page rect is elided
+        // while a half-page rect is kept.
+        let rect = Rect::new(0.0, 0.0, 200.0, 100.0);
+        let dl_rot_cover = ContentInterpreter::new(rect)
+            .with_page_rotation(90)
+            .interpret(b"q 0 0 200 100 re W n 0 0 10 10 re f Q");
+        assert_eq!(clip_counts_and_balance(&dl_rot_cover), (0, 0, 0));
+
+        let dl_rot_small = ContentInterpreter::new(rect)
+            .with_page_rotation(90)
+            .interpret(b"q 0 0 100 100 re W n 0 0 10 10 re f Q");
+        assert_eq!(clip_counts_and_balance(&dl_rot_small), (1, 1, 0));
+    }
+
+    #[test]
+    fn multi_subpath_degenerate_nonfinite_and_unbounded_clips_are_kept() {
+        let page = Rect::new(0.0, 0.0, 200.0, 200.0);
+
+        for content in [
+            // Outer covering rect with an inner hole punched by W* (even-odd).
+            &b"q 0 0 200 200 re 50 50 100 100 re W* n 0 0 200 200 re f Q"[..],
+            // Duplicate covering rect with W* cancels to an empty clip.
+            &b"q 0 0 200 200 re 0 0 200 200 re W* n 0 0 200 200 re f Q"[..],
+            // Empty clip path hides all subsequent drawing.
+            &b"q W n 0 0 200 200 re f Q"[..],
+            // Zero-width and zero-height degenerate rects hide all drawing.
+            &b"q 0 0 0 200 re W n 0 0 200 200 re f Q"[..],
+            &b"q 0 0 200 0 re W n 0 0 200 200 re f Q"[..],
+        ] {
+            let dl = ContentInterpreter::new(page).interpret(content);
+            assert_eq!(
+                clip_counts_and_balance(&dl),
+                (1, 1, 0),
+                "clip must not be elided: {:?}",
+                String::from_utf8_lossy(content)
+            );
+        }
+
+        // Non-finite coordinates never qualify as an axis-aligned rect or finite bounds.
+        let mut nan_path = Path::new();
+        nan_path.rect(Rect::new(0.0, 0.0, f64::NAN, 200.0));
+        assert_eq!(ContentInterpreter::axis_aligned_rect(&nan_path), None);
+        assert_eq!(ContentInterpreter::path_bounds(&nan_path), None);
+
+        let mut inf_path = Path::new();
+        inf_path.rect(Rect::new(0.0, 0.0, f64::INFINITY, 200.0));
+        assert_eq!(ContentInterpreter::axis_aligned_rect(&inf_path), None);
+        assert_eq!(ContentInterpreter::path_bounds(&inf_path), None);
+
+        // Unbounded or degenerate initial page_rect prevents elision until a
+        // finite clip establishes known bounds.
+        for bad_page in [
+            Rect::new(0.0, 0.0, f64::INFINITY, 200.0),
+            Rect::new(0.0, 0.0, 0.0, 0.0),
+        ] {
+            let dl = ContentInterpreter::new(bad_page)
+                .interpret(b"q 0 0 200 200 re W n 0 0 200 200 re f Q");
+            assert_eq!(clip_counts_and_balance(&dl), (1, 1, 0));
+        }
+    }
+
+    #[test]
+    fn q_restore_clip_depth_stays_balanced_with_mixed_elided_and_kept_clips() {
+        let page = Rect::new(0.0, 0.0, 200.0, 200.0);
+
+        // Mix elided and kept clips across sibling/nested q..Q scopes and
+        // unclosed q levels at EOF.
+        let dl = ContentInterpreter::new(page).interpret(
+            b"q 0 0 200 200 re W n 10 10 100 100 re W n 0 0 200 200 re W n \
+              q 5 5 120 120 re W n 20 20 50 50 re W n 15 15 60 60 re W n \
+              0 0 200 200 re f Q \
+              0 0 200 200 re f Q \
+              q 0 0 200 200 re W n 0 0 200 200 re f Q \
+              q 30 30 40 40 re W n 0 0 200 200 re W n 0 0 200 200 re f",
+        );
+        // Kept clips: [10,10,110,110], [20,20,70,70], and unclosed [30,30,70,70].
+        assert_eq!(clip_counts_and_balance(&dl), (3, 3, 0));
+
+        // Unbalanced Q at page bottom pops the active clip and clears
+        // clip_bounds so a later [20,20,140,140] clip (which covered the
+        // popped [50,50,100,100] clip, but not the page) is NOT falsely elided.
+        let dl_unbalanced = ContentInterpreter::new(page)
+            .interpret(b"50 50 50 50 re W n Q 20 20 120 120 re W n 0 0 200 200 re f");
+        assert_eq!(clip_counts_and_balance(&dl_unbalanced), (2, 2, 0));
+    }
+
+    #[test]
+    fn form_bbox_elision_and_soft_mask_clip_isolation() {
+        let page = Rect::new(0.0, 0.0, 200.0, 200.0);
+
+        // Full-page Form /BBox [0 0 200 200] is elided under identity CTM,
+        // kept under a 45-degree CTM.
+        let full_form = single_object_file(
+            "<< /Type /XObject /Subtype /Form /BBox [0 0 200 200] /Length 15 >>\n\
+             stream\n10 10 20 20 re f\nendstream",
+        );
+        let mut resources = ResourceDict::default();
+        resources.xobjects.insert("FmFull".into(), ObjectId(1, 0));
+        let dl_full = ContentInterpreter::new(page)
+            .with_document(&full_form, &resources)
+            .interpret(b"/FmFull Do");
+        assert_eq!(clip_counts_and_balance(&dl_full), (0, 0, 0));
+
+        let dl_rot = ContentInterpreter::new(page)
+            .with_document(&full_form, &resources)
+            .interpret(b"q 0.7071 0.7071 -0.7071 0.7071 0 0 cm /FmFull Do Q");
+        assert_eq!(clip_counts_and_balance(&dl_rot), (1, 1, 0));
+
+        // Smaller Form /BBox [20 20 120 120] is kept.
+        let small_form = single_object_file(
+            "<< /Type /XObject /Subtype /Form /BBox [20 20 120 120] /Length 15 >>\n\
+             stream\n30 30 20 20 re f\nendstream",
+        );
+        let dl_small = ContentInterpreter::new(page)
+            .with_document(&small_form, &resources)
+            .interpret(b"/FmFull Do");
+        assert_eq!(clip_counts_and_balance(&dl_small), (1, 1, 0));
+
+        // Soft mask /G is interpreted into a detached DisplayList that starts
+        // unclipped: an outer [10, 10, 20, 20] clip on the page must not cause
+        // a [0, 0, 100, 100] clip inside /G to be elided.
+        let smask_form = single_object_file(
+            "<< /Type /XObject /Subtype /Form /BBox [0 0 200 200] \
+             /Group << /S /Transparency /CS /DeviceGray >> /Length 36 >>\n\
+             stream\n0 0 100 100 re W n 1 g 0 0 200 200 re f\nendstream",
+        );
+        let mut gs = PdfDict::new();
+        let mut sm = PdfDict::new();
+        sm.insert(
+            zpdf_core::PdfName::new("S"),
+            PdfObject::Name(zpdf_core::PdfName::new("Luminosity")),
+        );
+        sm.insert(zpdf_core::PdfName::new("G"), PdfObject::Ref(ObjectId(1, 0)));
+        gs.insert(zpdf_core::PdfName::new("SMask"), PdfObject::Dict(sm));
+        let mut sm_res = ResourceDict::default();
+        sm_res.ext_g_state_inline.insert("GS0".into(), gs);
+        let dl_sm = ContentInterpreter::new(page)
+            .with_document(&smask_form, &sm_res)
+            .interpret(b"q 10 10 10 10 re W n /GS0 gs 0 0 200 200 re f Q");
+        let mask_dl = dl_sm
+            .commands
+            .iter()
+            .find_map(|c| match c {
+                RenderCommand::PushBlendGroup {
+                    mask: Some(mask), ..
+                } => Some(&mask.commands),
+                _ => None,
+            })
+            .expect("soft mask emitted");
+        // Inside mask_dl, Form /BBox [0 0 200 200] was elided, while the
+        // [0 0 100 100] W clip was NOT falsely elided against outer [10 10 20 20].
+        assert_eq!(clip_counts_and_balance(mask_dl), (1, 1, 0));
     }
 }

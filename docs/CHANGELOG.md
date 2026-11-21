@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Performance
+
+- Elide axis-aligned rectangle clips (`W`/`W*`, Form XObject `/BBox`, and
+  pattern clips) in `zpdf-content` when the page-space rectangle already covers
+  the current clip bounds, avoiding redundant `PushClip`/`PopClip` pairs and
+  backend clip-mask allocations without changing rendered output. (#166)
+
 ## 0.21.0 — Glyph-level selection and rendering compatibility
 
 Released 2026-11-21.
