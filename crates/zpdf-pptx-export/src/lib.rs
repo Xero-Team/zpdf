@@ -690,6 +690,121 @@ mod export_tests {
     }
 
     #[test]
+    fn composite_font_mixed_one_and_three_byte_to_unicode_exports_three_byte_code() {
+        let make_font = || {
+            let mut font = LoadedFont::new_placeholder("MixedThreeByte".into());
+            font.font_type = zpdf_font::PdfFontType::Type0CidType2;
+            font.to_unicode = Some(ToUnicodeMap::parse(
+                b"begincmap 2 begincodespacerange <00> <FF> <000000> <FFFFFF> endcodespacerange \
+                  2 beginbfchar <41> <0058> <010203> <0041> endbfchar endcmap",
+            ));
+            font
+        };
+
+        // Explicit source byte length (`code_len = 3` and `code_len = 1`) must
+        // match `(raw_code, len)` directly before fixed-width 2-byte recovery
+        // splits `<010203>` into `<0102>` and `<03>`.
+        let mut fonts = FontCache::new();
+        let font_id = fonts.insert("F1".into(), make_font());
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 612.0, 792.0));
+        dl.push(RenderCommand::DrawGlyphRun(GlyphRun {
+            font_id,
+            font_size: 12.0,
+            glyphs: vec![
+                PositionedGlyph {
+                    glyph_id: 7,
+                    code_len: 3,
+                    code: 0x010203,
+                    x: 100.0,
+                    y: 100.0,
+                    advance: 6.0,
+                },
+                PositionedGlyph {
+                    glyph_id: 8,
+                    code_len: 1,
+                    code: 0x41,
+                    x: 106.0,
+                    y: 100.0,
+                    advance: 6.0,
+                },
+            ],
+            paint: Paint::Solid(Color::black()),
+            alpha: 1.0,
+            overprint: None,
+            transform: Matrix::identity(),
+            h_scale: 1.0,
+        }));
+        let slide = display_list_to_slide(
+            &dl,
+            0,
+            &fonts,
+            &ImageCache::new(),
+            &ConversionOptions::default(),
+        )
+        .expect("slide");
+        let explicit_text: String = slide
+            .elements
+            .iter()
+            .filter_map(|e| match e {
+                SlideElement::TextBox { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(explicit_text, "AX");
+
+        // Inferred-width path (`code_len = 0` via `run_text`) must also emit
+        // `"A"` for `<010203>` and `"X"` for `<41>`.
+        assert_eq!(run_text(make_font(), 7, 0x010203), "A");
+        assert_eq!(run_text(make_font(), 8, 0x41), "X");
+
+        // Fixed-width 1-byte recovery still splits a 2-byte unmapped chunk
+        // when no exact `(raw_code, len)` entry exists.
+        let mut one_byte_font = LoadedFont::new_placeholder("OneByteFallback".into());
+        one_byte_font.font_type = zpdf_font::PdfFontType::Type0CidType2;
+        one_byte_font.to_unicode = Some(ToUnicodeMap::parse(
+            b"begincmap 1 begincodespacerange <00> <FF> endcodespacerange \
+              2 beginbfchar <57> <0057> <69> <4E2D> endbfchar endcmap",
+        ));
+        let mut fonts = FontCache::new();
+        let font_id = fonts.insert("F1".into(), one_byte_font);
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 612.0, 792.0));
+        dl.push(RenderCommand::DrawGlyphRun(GlyphRun {
+            font_id,
+            font_size: 12.0,
+            glyphs: vec![PositionedGlyph {
+                glyph_id: 1,
+                code_len: 2,
+                code: 0x5769,
+                x: 100.0,
+                y: 100.0,
+                advance: 6.0,
+            }],
+            paint: Paint::Solid(Color::black()),
+            alpha: 1.0,
+            overprint: None,
+            transform: Matrix::identity(),
+            h_scale: 1.0,
+        }));
+        let slide = display_list_to_slide(
+            &dl,
+            0,
+            &fonts,
+            &ImageCache::new(),
+            &ConversionOptions::default(),
+        )
+        .expect("slide");
+        let fixed_text: String = slide
+            .elements
+            .iter()
+            .filter_map(|e| match e {
+                SlideElement::TextBox { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(fixed_text, "W中");
+    }
+
+    #[test]
     fn to_unicode_is_keyed_by_character_code_not_glyph_id() {
         let mut font = LoadedFont::new_placeholder("Simple".into());
         // Map code 0x41 to a non-ASCII character, so falling back to the code

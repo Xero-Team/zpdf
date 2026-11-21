@@ -1799,7 +1799,7 @@ impl LoadedFont {
                 self.to_unicode
                     .as_ref()
                     .and_then(|map| map.source_length(raw_code))
-                    .unwrap_or(2)
+                    .unwrap_or_else(|| ((4 - raw_code.leading_zeros() / 8) as u8).max(2))
             };
             let be = raw_code.to_be_bytes();
             let slice = &be[4 - usize::from(len)..];
@@ -1807,7 +1807,11 @@ impl LoadedFont {
                 let (code, seg_len) = cm.next_code(slice);
                 self.append_decoded_code(code, seg_len as u8, raw_code, out);
             } else if let Some(map) = &self.to_unicode {
-                map.append_fixed_width(slice, out);
+                if let Some(text) = map.lookup_with_length(raw_code, len) {
+                    out.push_str(text);
+                } else {
+                    map.append_fixed_width(slice, out);
+                }
             }
         } else if let Ok(byte) = u8::try_from(raw_code) {
             self.append_decoded_code(byte as u32, 1, byte as u32, out);
