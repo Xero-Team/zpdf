@@ -635,8 +635,9 @@ struct GraphicsState {
     /// cover the whole page — notably `sh` shading rasterization.
     clip_bounds: Option<Rect>,
     /// Device-pixel footprint of enforced clip masks currently on the display
-    /// list (`None` = no enforced clip mask active yet, so the full raster
-    /// `[0..pw) × [0..ph)` may be painted). Used solely for clip elision.
+    /// list (`None` = no enforced clip mask is active yet). Used solely for
+    /// clip elision; elision requires `Some(_)` so removing a redundant clip
+    /// never turns a masked draw into an unmasked one.
     clip_elision_bounds: Option<DeviceClipBounds>,
     fill_cs: ActiveColorSpace,
     stroke_cs: ActiveColorSpace,
@@ -1134,13 +1135,15 @@ impl<'a> ContentInterpreter<'a> {
     }
 
     /// Elide axis-aligned rectangle clips that cover every affected device
-    /// pixel at `render_scale` (matching `CpuRenderer::raster_scale`).
+    /// pixel of an already-active clip mask at `render_scale` (matching
+    /// `CpuRenderer::raster_scale`).
     ///
-    /// A covering clip is dropped only when it fully covers the active
-    /// rasterized clip footprint (or the entire `ceil(w * scale) × ceil(h *
-    /// scale)` raster when unclipped), preserving fractional page edges and
-    /// antialiased shared clip edges bit-for-bit. Default `0.0` disables
-    /// elision so scale-independent display lists retain every clip.
+    /// A covering clip is dropped only when an enforced clip mask is already
+    /// active and the new rectangle encloses every affected device pixel of
+    /// that mask, preserving fractional page edges, antialiased shared clip
+    /// edges, and `tiny-skia`'s masked `SourceOver` paint rounding bit-for-bit.
+    /// Default `0.0` disables elision so scale-independent display lists retain
+    /// every clip.
     pub fn with_clip_elision_scale(mut self, render_scale: f32) -> Self {
         self.clip_elision_scale = if render_scale.is_finite() && render_scale > 0.0 {
             render_scale
@@ -3161,13 +3164,26 @@ impl<'a> ContentInterpreter<'a> {
     }
 
     /// True when `path` is a single page-space axis-aligned rectangle that
-    /// completely covers every affected device pixel of the active clip mask
-    /// (or the entire `ceil(w * scale) × ceil(h * scale)` raster when
-    /// unclipped), inspired by `hayro-interpret/src/context.rs`.
+    /// completely covers every affected device pixel of an already-active
+    /// enforced clip mask, inspired by `hayro-interpret/src/context.rs`.
+    ///
+    /// Never elides when no enforced clip mask is active yet
+    /// (`clip_elision_bounds == None`): in `tiny-skia`, `RasterPipelineBlitter`
+    /// strength-reduces opaque `SourceOver` to `Source` only when
+    /// `mask.is_none()`, which changes antialiased edge rounding (single lerp
+    /// rounding vs separate source/destination rounding). Keeping the first
+    /// mask preserves masked compositing arithmetic while still eliding every
+    /// redundant covering rectangle nested beneath it.
     fn clip_path_covers_current_bounds(&self, path: &Path) -> bool {
-        let Some((scale, rect_x0, rect_y1, pw, ph, limit)) = self.clip_elision_raster() else {
+        let Some((scale, rect_x0, rect_y1, _pw, _ph, limit)) = self.clip_elision_raster() else {
             return false;
         };
+        let Some(need) = self.current.clip_elision_bounds else {
+            return false;
+        };
+        if need.x1 <= need.x0 || need.y1 <= need.y0 {
+            return false;
+        }
         let Some(rect) = Self::axis_aligned_rect(path) else {
             return false;
         };
@@ -3186,18 +3202,6 @@ impl<'a> ContentInterpreter<'a> {
             && r_top.abs() <= limit
             && r_bottom.abs() <= limit)
         {
-            return false;
-        }
-        let need = self
-            .current
-            .clip_elision_bounds
-            .unwrap_or(DeviceClipBounds {
-                x0: 0,
-                y0: 0,
-                x1: pw,
-                y1: ph,
-            });
-        if need.x1 <= need.x0 || need.y1 <= need.y0 {
             return false;
         }
         r_left <= need.x0 as f32
@@ -9830,30 +9834,40 @@ mod tests {
         let page = Rect::new(0.0, 0.0, 200.0, 200.0);
 
         // Without a render scale, scale-independent display lists retain clips.
-        let dl_no_scale =
-            ContentInterpreter::new(page).interpret(b"q 0 0 200 200 re W n 10 10 20 20 re f Q");
-        assert_eq!(clip_counts_and_balance(&dl_no_scale), (1, 1, 0));
+        let dl_no_scale = ContentInterpreter::new(page)
+            .interpret(b"q 0 0 200 200 re W n 0 0 200 200 re W n 10 10 20 20 re f Q");
+        assert_eq!(clip_counts_and_balance(&dl_no_scale), (2, 2, 0));
 
-        // Exact page rect, oversized rect, negative-extent rect, and manually
-        // constructed rects (both W and W*) are all elided at scale 1.0 where
-        // the raster is exactly 200x200.
-        for content in [
-            &b"q 0 0 200 200 re W n 10 10 20 20 re f Q"[..],
-            &b"q -10 -10 220 220 re W* n 10 10 20 20 re f Q"[..],
-            &b"q 200 200 -200 -200 re W n 10 10 20 20 re f Q"[..],
-            &b"q 0 0 m 200 0 l 200 200 l 0 200 l h W n 10 10 20 20 re f Q"[..],
-            &b"q 0 0 m 200 0 l 200 200 l 0 200 l 0 0 l h W* n 10 10 20 20 re f Q"[..],
-            &b"q 0 0 m 0 200 l 200 200 l 200 0 l W n 10 10 20 20 re f Q"[..],
+        // The first (only) clip on an unclipped page is kept so tiny-skia stays
+        // on its masked SourceOver compositing arithmetic.
+        let dl_only_mask = ContentInterpreter::new(page)
+            .with_clip_elision_scale(1.0)
+            .interpret(b"q 0 0 200 200 re W n 10 10 20 20 re f Q");
+        assert_eq!(clip_counts_and_balance(&dl_only_mask), (1, 1, 0));
+
+        // Under an active outer mask, exact page rect, oversized rect,
+        // negative-extent rect, and manually constructed rects (both W and W*)
+        // are all elided at scale 1.0 where the raster is exactly 200x200.
+        for inner in [
+            &b"0 0 200 200 re W n"[..],
+            &b"-10 -10 220 220 re W* n"[..],
+            &b"200 200 -200 -200 re W n"[..],
+            &b"0 0 m 200 0 l 200 200 l 0 200 l h W n"[..],
+            &b"0 0 m 200 0 l 200 200 l 0 200 l 0 0 l h W* n"[..],
+            &b"0 0 m 0 200 l 200 200 l 200 0 l W n"[..],
         ] {
+            let mut content = b"q 0 0 200 200 re W n ".to_vec();
+            content.extend_from_slice(inner);
+            content.extend_from_slice(b" 10 10 20 20 re f Q");
             let dl = ContentInterpreter::new(page)
                 .with_clip_elision_scale(1.0)
-                .interpret(content);
+                .interpret(&content);
             let (pushes, pops, _) = clip_counts_and_balance(&dl);
             assert_eq!(
                 (pushes, pops),
-                (0, 0),
-                "expected covering clip elided for {:?}",
-                String::from_utf8_lossy(content)
+                (1, 1),
+                "expected nested covering clip elided for {:?}",
+                String::from_utf8_lossy(inner)
             );
             assert_eq!(
                 dl.commands
@@ -9865,57 +9879,61 @@ mod tests {
         }
 
         // Smaller on any single edge (left, bottom, right, top) must be kept.
-        for content in [
-            &b"q 0.5 0 199.5 200 re W n 0 0 200 200 re f Q"[..],
-            &b"q 0 0.5 200 199.5 re W n 0 0 200 200 re f Q"[..],
-            &b"q 0 0 199.5 200 re W n 0 0 200 200 re f Q"[..],
-            &b"q 0 0 200 199.5 re W* n 0 0 200 200 re f Q"[..],
-            &b"q 10 10 180 180 re W n 0 0 200 200 re f Q"[..],
+        for inner in [
+            &b"0.5 0 199.5 200 re W n"[..],
+            &b"0 0.5 200 199.5 re W n"[..],
+            &b"0 0 199.5 200 re W n"[..],
+            &b"0 0 200 199.5 re W* n"[..],
+            &b"10 10 180 180 re W n"[..],
         ] {
+            let mut content = b"q 0 0 200 200 re W n ".to_vec();
+            content.extend_from_slice(inner);
+            content.extend_from_slice(b" 0 0 200 200 re f Q");
             let dl = ContentInterpreter::new(page)
                 .with_clip_elision_scale(1.0)
-                .interpret(content);
+                .interpret(&content);
             let (pushes, pops, _) = clip_counts_and_balance(&dl);
             assert_eq!(
                 (pushes, pops),
-                (1, 1),
+                (2, 2),
                 "expected narrower clip kept for {:?}",
-                String::from_utf8_lossy(content)
+                String::from_utf8_lossy(inner)
             );
         }
 
         // Fractional page edge (100.5 pt -> 101 columns at scale 1) and
         // fractional zoom (200 pt * 150/72 = 416.67 -> 417 columns) keep a
-        // page-sized clip, while a clip covering the full ceil raster elides.
+        // nested page-sized clip, while a nested clip covering the full ceil
+        // raster elides.
         let frac_page = Rect::new(0.0, 0.0, 100.5, 100.0);
         let dl_frac_kept = ContentInterpreter::new(frac_page)
             .with_clip_elision_scale(1.0)
-            .interpret(b"q 0 0 100.5 100 re W n 0 0 120 100 re f Q");
-        assert_eq!(clip_counts_and_balance(&dl_frac_kept), (1, 1, 0));
+            .interpret(b"q 0 0 101 100 re W n 0 0 100.5 100 re W n 0 0 120 100 re f Q");
+        assert_eq!(clip_counts_and_balance(&dl_frac_kept), (2, 2, 0));
         let dl_frac_elided = ContentInterpreter::new(frac_page)
             .with_clip_elision_scale(1.0)
-            .interpret(b"q 0 0 101 100 re W n 0 0 120 100 re f Q");
-        assert_eq!(clip_counts_and_balance(&dl_frac_elided), (0, 0, 0));
+            .interpret(b"q 0 0 101 100 re W n 0 0 101 100 re W n 0 0 120 100 re f Q");
+        assert_eq!(clip_counts_and_balance(&dl_frac_elided), (1, 1, 0));
 
         let dl_zoom_kept = ContentInterpreter::new(page)
             .with_clip_elision_scale(150.0 / 72.0)
-            .interpret(b"q 0 0 200 200 re W n -10 -10 220 220 re f Q");
-        assert_eq!(clip_counts_and_balance(&dl_zoom_kept), (1, 1, 0));
+            .interpret(b"q -10 -10 220 220 re W n 0 0 200 200 re W n -10 -10 220 220 re f Q");
+        assert_eq!(clip_counts_and_balance(&dl_zoom_kept), (2, 2, 0));
         let dl_zoom_elided = ContentInterpreter::new(page)
             .with_clip_elision_scale(150.0 / 72.0)
-            .interpret(b"q -10 -10 220 220 re W n -10 -10 220 220 re f Q");
-        assert_eq!(clip_counts_and_balance(&dl_zoom_elided), (0, 0, 0));
+            .interpret(b"q -10 -10 220 220 re W n -10 -10 220 220 re W n -10 -10 220 220 re f Q");
+        assert_eq!(clip_counts_and_balance(&dl_zoom_elided), (1, 1, 0));
 
-        // Non-zero page origin: clip must cover [50, 100, 250, 400].
+        // Non-zero page origin: nested clip must cover [50, 100, 250, 400].
         let shifted = Rect::new(50.0, 100.0, 250.0, 400.0);
         let dl_elided = ContentInterpreter::new(shifted)
             .with_clip_elision_scale(1.0)
-            .interpret(b"q 50 100 200 300 re W n 60 110 10 10 re f Q");
-        assert_eq!(clip_counts_and_balance(&dl_elided), (0, 0, 0));
+            .interpret(b"q 50 100 200 300 re W n 50 100 200 300 re W n 60 110 10 10 re f Q");
+        assert_eq!(clip_counts_and_balance(&dl_elided), (1, 1, 0));
         let dl_kept = ContentInterpreter::new(shifted)
             .with_clip_elision_scale(1.0)
-            .interpret(b"q 0 0 200 300 re W n 60 110 10 10 re f Q");
-        assert_eq!(clip_counts_and_balance(&dl_kept), (1, 1, 0));
+            .interpret(b"q 50 100 200 300 re W n 0 0 200 300 re W n 60 110 10 10 re f Q");
+        assert_eq!(clip_counts_and_balance(&dl_kept), (2, 2, 0));
     }
 
     #[test]
@@ -9972,41 +9990,41 @@ mod tests {
         let page = Rect::new(0.0, 0.0, 200.0, 200.0);
 
         for content in [
-            // 45-degree rotated oversized rectangle.
-            &b"q 0.7071 0.7071 -0.7071 0.7071 100 -50 cm 0 0 300 300 re W n 0 0 200 200 re f Q"[..],
+            // 45-degree rotated oversized rectangle under an active clip.
+            &b"q 0 0 200 200 re W n 0.7071 0.7071 -0.7071 0.7071 100 -50 cm 0 0 300 300 re W n 0 0 200 200 re f Q"[..],
             // Slight (~1 deg) rotation.
-            &b"q 0.9998 0.0175 -0.0175 0.9998 0 0 cm -50 -50 300 300 re W n 0 0 200 200 re f Q"[..],
+            &b"q 0 0 200 200 re W n 0.9998 0.0175 -0.0175 0.9998 0 0 cm -50 -50 300 300 re W n 0 0 200 200 re f Q"[..],
             // Skewed parallelogram.
-            &b"q 1 0.1 0 1 0 0 cm -50 -50 300 300 re W n 0 0 200 200 re f Q"[..],
+            &b"q 0 0 200 200 re W n 1 0.1 0 1 0 0 cm -50 -50 300 300 re W n 0 0 200 200 re f Q"[..],
             // Self-intersecting bowtie touching all four page corners.
-            &b"q 0 0 m 200 200 l 200 0 l 0 200 l h W n 0 0 200 200 re f Q"[..],
+            &b"q 0 0 200 200 re W n 0 0 m 200 200 l 200 0 l 0 200 l h W n 0 0 200 200 re f Q"[..],
         ] {
             let dl = ContentInterpreter::new(page)
                 .with_clip_elision_scale(1.0)
                 .interpret(content);
             assert_eq!(
                 clip_counts_and_balance(&dl),
-                (1, 1, 0),
+                (2, 2, 0),
                 "non-axis-aligned clip must not be elided: {:?}",
                 String::from_utf8_lossy(content)
             );
         }
 
         // Exact 90-degree page rotation maps [0, 0, 200, 100] cleanly onto the
-        // rotated [0, 0, 100, 200] page_rect, so a full-page rect is elided
-        // while a half-page rect is kept.
+        // rotated [0, 0, 100, 200] page_rect, so a nested full-page rect is
+        // elided while a half-page rect is kept.
         let rect = Rect::new(0.0, 0.0, 200.0, 100.0);
         let dl_rot_cover = ContentInterpreter::new(rect)
             .with_clip_elision_scale(1.0)
             .with_page_rotation(90)
-            .interpret(b"q 0 0 200 100 re W n 0 0 10 10 re f Q");
-        assert_eq!(clip_counts_and_balance(&dl_rot_cover), (0, 0, 0));
+            .interpret(b"q 0 0 200 100 re W n 0 0 200 100 re W n 0 0 10 10 re f Q");
+        assert_eq!(clip_counts_and_balance(&dl_rot_cover), (1, 1, 0));
 
         let dl_rot_small = ContentInterpreter::new(rect)
             .with_clip_elision_scale(1.0)
             .with_page_rotation(90)
-            .interpret(b"q 0 0 100 100 re W n 0 0 10 10 re f Q");
-        assert_eq!(clip_counts_and_balance(&dl_rot_small), (1, 1, 0));
+            .interpret(b"q 0 0 200 100 re W n 0 0 100 100 re W n 0 0 10 10 re f Q");
+        assert_eq!(clip_counts_and_balance(&dl_rot_small), (2, 2, 0));
     }
 
     #[test]
@@ -10015,21 +10033,21 @@ mod tests {
 
         for content in [
             // Outer covering rect with an inner hole punched by W* (even-odd).
-            &b"q 0 0 200 200 re 50 50 100 100 re W* n 0 0 200 200 re f Q"[..],
+            &b"q 0 0 200 200 re W n 0 0 200 200 re 50 50 100 100 re W* n 0 0 200 200 re f Q"[..],
             // Duplicate covering rect with W* cancels to an empty clip.
-            &b"q 0 0 200 200 re 0 0 200 200 re W* n 0 0 200 200 re f Q"[..],
+            &b"q 0 0 200 200 re W n 0 0 200 200 re 0 0 200 200 re W* n 0 0 200 200 re f Q"[..],
             // Empty clip path hides all subsequent drawing.
-            &b"q W n 0 0 200 200 re f Q"[..],
+            &b"q 0 0 200 200 re W n W n 0 0 200 200 re f Q"[..],
             // Zero-width and zero-height degenerate rects hide all drawing.
-            &b"q 0 0 0 200 re W n 0 0 200 200 re f Q"[..],
-            &b"q 0 0 200 0 re W n 0 0 200 200 re f Q"[..],
+            &b"q 0 0 200 200 re W n 0 0 0 200 re W n 0 0 200 200 re f Q"[..],
+            &b"q 0 0 200 200 re W n 0 0 200 0 re W n 0 0 200 200 re f Q"[..],
         ] {
             let dl = ContentInterpreter::new(page)
                 .with_clip_elision_scale(1.0)
                 .interpret(content);
             assert_eq!(
                 clip_counts_and_balance(&dl),
-                (1, 1, 0),
+                (2, 2, 0),
                 "clip must not be elided: {:?}",
                 String::from_utf8_lossy(content)
             );
@@ -10053,8 +10071,8 @@ mod tests {
         ] {
             let dl = ContentInterpreter::new(bad_page)
                 .with_clip_elision_scale(1.0)
-                .interpret(b"q 0 0 200 200 re W n 0 0 200 200 re f Q");
-            assert_eq!(clip_counts_and_balance(&dl), (1, 1, 0));
+                .interpret(b"q 0 0 200 200 re W n 0 0 200 200 re W n 0 0 200 200 re f Q");
+            assert_eq!(clip_counts_and_balance(&dl), (2, 2, 0));
         }
     }
 
@@ -10071,15 +10089,17 @@ mod tests {
                   q 5 5 120 120 re W n 20 20 50 50 re W n 15 15 60 60 re W n \
                   0 0 200 200 re f Q \
                   0 0 200 200 re f Q \
-                  q 0 0 200 200 re W n 0 0 200 200 re f Q \
+                  q 0 0 200 200 re W n 0 0 200 200 re W n 0 0 200 200 re f Q \
                   q 30 30 40 40 re W n 0 0 200 200 re W n 0 0 200 200 re f",
             );
-        // Kept clips: [10,10,110,110], [20,20,70,70], and unclosed [30,30,70,70].
-        assert_eq!(clip_counts_and_balance(&dl), (3, 3, 0));
+        // Kept clips: scope 1 initial [0,0,200,200] + [10,10,110,110] + nested
+        // [20,20,70,70], scope 2 initial [0,0,200,200], and unclosed
+        // [30,30,70,70]. Five nested covering clips are elided.
+        assert_eq!(clip_counts_and_balance(&dl), (5, 5, 0));
 
         // Unbalanced Q at page bottom pops the active clip and clears
         // clip_elision_bounds so a later [20,20,140,140] clip (which covered the
-        // popped [50,50,100,100] clip, but not the page) is NOT falsely elided.
+        // popped [50,50,100,100] clip) is NOT falsely elided.
         let dl_unbalanced = ContentInterpreter::new(page)
             .with_clip_elision_scale(1.0)
             .interpret(b"50 50 50 50 re W n Q 20 20 120 120 re W n 0 0 200 200 re f");
@@ -10090,27 +10110,33 @@ mod tests {
     fn form_bbox_elision_and_soft_mask_clip_isolation() {
         let page = Rect::new(0.0, 0.0, 200.0, 200.0);
 
-        // Full-page Form /BBox [0 0 200 200] is elided under identity CTM,
-        // kept under a 45-degree CTM.
+        // Full-page Form /BBox [0 0 200 200] keeps its only clip when unclipped,
+        // elides under an active page clip, and is kept under a 45-degree CTM.
         let full_form = single_object_file(
             "<< /Type /XObject /Subtype /Form /BBox [0 0 200 200] /Length 15 >>\n\
              stream\n10 10 20 20 re f\nendstream",
         );
         let mut resources = ResourceDict::default();
         resources.xobjects.insert("FmFull".into(), ObjectId(1, 0));
-        let dl_full = ContentInterpreter::new(page)
+        let dl_unclipped = ContentInterpreter::new(page)
             .with_clip_elision_scale(1.0)
             .with_document(&full_form, &resources)
             .interpret(b"/FmFull Do");
-        assert_eq!(clip_counts_and_balance(&dl_full), (0, 0, 0));
+        assert_eq!(clip_counts_and_balance(&dl_unclipped), (1, 1, 0));
+
+        let dl_full = ContentInterpreter::new(page)
+            .with_clip_elision_scale(1.0)
+            .with_document(&full_form, &resources)
+            .interpret(b"q 0 0 200 200 re W n /FmFull Do Q");
+        assert_eq!(clip_counts_and_balance(&dl_full), (1, 1, 0));
 
         let dl_rot = ContentInterpreter::new(page)
             .with_clip_elision_scale(1.0)
             .with_document(&full_form, &resources)
-            .interpret(b"q 0.7071 0.7071 -0.7071 0.7071 0 0 cm /FmFull Do Q");
-        assert_eq!(clip_counts_and_balance(&dl_rot), (1, 1, 0));
+            .interpret(b"q 0 0 200 200 re W n 0.7071 0.7071 -0.7071 0.7071 0 0 cm /FmFull Do Q");
+        assert_eq!(clip_counts_and_balance(&dl_rot), (2, 2, 0));
 
-        // Smaller Form /BBox [20 20 120 120] is kept.
+        // Smaller Form /BBox [20 20 120 120] is kept even under an active page clip.
         let small_form = single_object_file(
             "<< /Type /XObject /Subtype /Form /BBox [20 20 120 120] /Length 15 >>\n\
              stream\n30 30 20 20 re f\nendstream",
@@ -10118,8 +10144,8 @@ mod tests {
         let dl_small = ContentInterpreter::new(page)
             .with_clip_elision_scale(1.0)
             .with_document(&small_form, &resources)
-            .interpret(b"/FmFull Do");
-        assert_eq!(clip_counts_and_balance(&dl_small), (1, 1, 0));
+            .interpret(b"q 0 0 200 200 re W n /FmFull Do Q");
+        assert_eq!(clip_counts_and_balance(&dl_small), (2, 2, 0));
 
         // Soft mask /G is interpreted into a detached DisplayList that starts
         // unclipped: an outer [10, 10, 20, 20] clip on the page must not cause
@@ -10153,9 +10179,10 @@ mod tests {
                 _ => None,
             })
             .expect("soft mask emitted");
-        // Inside mask_dl, Form /BBox [0 0 200 200] was elided, while the
-        // [0 0 100 100] W clip was NOT falsely elided against outer [10 10 20 20].
-        assert_eq!(clip_counts_and_balance(mask_dl), (1, 1, 0));
+        // Inside mask_dl, Form /BBox [0 0 200 200] is the detached mask's first
+        // clip (kept) and [0 0 100 100] narrows it (NOT falsely elided against
+        // the outer page's [10 10 20 20] clip).
+        assert_eq!(clip_counts_and_balance(mask_dl), (2, 2, 0));
     }
 
     #[test]

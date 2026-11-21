@@ -1,7 +1,7 @@
 //! Covering-rectangle clip elision acceptance tests (CPU backend).
 //!
 //! Verifies pixel-for-pixel equivalence against an unelided display list across
-//! all four subtle rasterization invariants:
+//! five subtle rasterization invariants:
 //! 1. An out-of-range earlier clip skipped by `CpuRenderer::finish_within_limits`
 //!    does not cause a later narrower rectangle clip to be dropped.
 //! 2. Fractional page dimensions and fractional zooms preserve partial coverage
@@ -10,6 +10,8 @@
 //!    preserve multiplied mask coverage.
 //! 4. `sh` shadings inside a tiling pattern cell keep their original sampling
 //!    grid.
+//! 5. Eliding never removes the only active clip mask, preserving `tiny-skia`'s
+//!    masked `SourceOver` paint rounding on opaque antialiased draws.
 #![cfg(feature = "cpu-render")]
 
 use zpdf::display_list::RenderCommand;
@@ -130,17 +132,17 @@ fn cpu_preserves_later_rectangle_clip_when_earlier_clip_exceeds_backend_limit() 
 
 #[test]
 fn cpu_preserves_partial_coverage_at_fractional_page_edge_and_zoom() {
-    // 100.5 pt wide page at scale 1 -> 101 columns. An explicit page-sized
-    // clip [0, 0, 100.5, 100] partially covers column 100 when a fill extends
-    // past the page; it must NOT be elided.
+    // 100.5 pt wide page at scale 1 -> 101 columns. Even under an active
+    // full-raster outer clip [0, 0, 101, 100], a nested page-sized clip
+    // [0, 0, 100.5, 100] partially covers column 100 and must NOT be elided.
     let frac_page_pdf = page_pdf(
         "0 0 100.5 100",
-        b"q 0 0 100.5 100 re W n 1 0 0 rg 0 0 120 100 re f Q",
+        b"q 0 0 101 100 re W n 0 0 100.5 100 re W n 1 0 0 rg 0 0 120 100 re f Q",
     );
     let (elided_clips, elided, _) = render_case(&frac_page_pdf, 1.0, true);
     let (retained_clips, retained, _) = render_case(&frac_page_pdf, 1.0, false);
-    assert_eq!(retained_clips, 1);
-    assert_eq!(elided_clips, 1, "fractional page-edge clip must be kept");
+    assert_eq!(retained_clips, 2);
+    assert_eq!(elided_clips, 2, "fractional page-edge clip must be kept");
     assert_eq!(elided.width, 101);
     assert_eq!(elided.data, retained.data);
     // Column 100 should have partial red over white (not full [255, 0, 0]).
@@ -150,48 +152,49 @@ fn cpu_preserves_partial_coverage_at_fractional_page_edge_and_zoom() {
         "expected ~50% coverage on last column, got {edge:?}"
     );
 
-    // An oversized clip [0, 0, 101, 100] DOES cover all 101 raster columns and
-    // is elided with bit-identical pixels.
+    // A nested clip [0, 0, 101, 100] DOES cover all 101 raster columns of the
+    // active outer clip and is elided with bit-identical pixels.
     let covering_pdf = page_pdf(
         "0 0 100.5 100",
-        b"q 0 0 101 100 re W n 1 0 0 rg 0 0 120 100 re f Q",
+        b"q 0 0 101 100 re W n 0 0 101 100 re W n 1 0 0 rg 0 0 120 100 re f Q",
     );
     let (cov_elided_clips, cov_elided, _) = render_case(&covering_pdf, 1.0, true);
     let (cov_retained_clips, cov_retained, _) = render_case(&covering_pdf, 1.0, false);
-    assert_eq!(cov_retained_clips, 1);
+    assert_eq!(cov_retained_clips, 2);
     assert_eq!(
-        cov_elided_clips, 0,
-        "clip covering full 101px raster elides"
+        cov_elided_clips, 1,
+        "nested clip covering full 101px raster elides"
     );
     assert_eq!(cov_elided.data, cov_retained.data);
 
     // Fractional zoom on an integer 100×100 pt page: at 150 DPI (scale 150/72),
-    // 100 * 150/72 = 208.333 -> 209 columns. A page-sized clip [0, 0, 100, 100]
-    // gives partial coverage on column 208 and row 208 and must be kept.
+    // 100 * 150/72 = 208.333 -> 209 columns. Under an active full-raster clip,
+    // a nested page-sized clip [0, 0, 100, 100] gives partial coverage on
+    // column 208 and row 208 and must be kept.
     let zoom = 150.0 / 72.0;
     let zoom_pdf = page_pdf(
         "0 0 100 100",
-        b"q 0 0 100 100 re W n 1 0 0 rg -10 -10 120 120 re f Q",
+        b"q -2 -2 104 104 re W n 0 0 100 100 re W n 1 0 0 rg -10 -10 120 120 re f Q",
     );
     let (zoom_elided_clips, zoom_elided, _) = render_case(&zoom_pdf, zoom, true);
     let (zoom_retained_clips, zoom_retained, _) = render_case(&zoom_pdf, zoom, false);
-    assert_eq!(zoom_retained_clips, 1);
+    assert_eq!(zoom_retained_clips, 2);
     assert_eq!(
-        zoom_elided_clips, 1,
+        zoom_elided_clips, 2,
         "page-sized clip at fractional zoom must be kept"
     );
     assert_eq!(zoom_elided.width, 209);
     assert_eq!(zoom_elided.data, zoom_retained.data);
 
-    // Oversized clip covering all 209×209 device pixels at 150 DPI elides.
+    // Nested oversized clip covering all 209×209 device pixels at 150 DPI elides.
     let zoom_cover_pdf = page_pdf(
         "0 0 100 100",
-        b"q -2 -2 104 104 re W n 1 0 0 rg -10 -10 120 120 re f Q",
+        b"q -2 -2 104 104 re W n -2 -2 104 104 re W n 1 0 0 rg -10 -10 120 120 re f Q",
     );
     let (zc_elided_clips, zc_elided, _) = render_case(&zoom_cover_pdf, zoom, true);
     let (zc_retained_clips, zc_retained, _) = render_case(&zoom_cover_pdf, zoom, false);
-    assert_eq!(zc_retained_clips, 1);
-    assert_eq!(zc_elided_clips, 0);
+    assert_eq!(zc_retained_clips, 2);
+    assert_eq!(zc_elided_clips, 1);
     assert_eq!(zc_elided.data, zc_retained.data);
 }
 
@@ -284,4 +287,53 @@ fn cpu_preserves_shading_sampling_grid_inside_tiling_cell() {
         "shading inside tiling cell must preserve its original sample grid"
     );
     assert_eq!((elided_sh.width, elided_sh.height), (768, 768));
+}
+
+#[test]
+fn cpu_preserves_masked_paint_rounding_when_only_clip_is_page_sized() {
+    // In tiny-skia, RasterPipelineBlitter strength-reduces opaque SourceOver to
+    // Source when mask.is_none() (rounding the lerp once -> 127), whereas with
+    // even a full-coverage mask it stays on SourceOver (rounding source and
+    // destination separately -> 128). Keeping the only mask preserves exact
+    // byte-for-byte output against the retained clip.
+    let single_clip_pdf = page_pdf(
+        "0 0 100 100",
+        b"0.5 g 0 0 100 100 re f q 0 0 100 100 re W n 10.5 10 20 20 re f Q",
+    );
+    let (elided_clips, elided, _) = render_case(&single_clip_pdf, 1.0, true);
+    let (retained_clips, retained, _) = render_case(&single_clip_pdf, 1.0, false);
+
+    assert_eq!(retained_clips, 1);
+    assert_eq!(
+        elided_clips, 1,
+        "only mask must be retained to preserve masked SourceOver rounding"
+    );
+    assert_eq!(elided.data, retained.data);
+    assert_eq!(px(&elided, 10, 20), [128, 128, 128]);
+
+    // Contrast: without any clip, tiny-skia uses Source lerp and produces 127.
+    let unclipped_pdf = page_pdf(
+        "0 0 100 100",
+        b"0.5 g 0 0 100 100 re f q 10.5 10 20 20 re f Q",
+    );
+    let (unclipped_clips, unclipped, _) = render_case(&unclipped_pdf, 1.0, false);
+    assert_eq!(unclipped_clips, 0);
+    assert_eq!(px(&unclipped, 10, 20), [127, 127, 127]);
+
+    // Once a clip mask is already installed, a nested full-coverage rectangle
+    // clip IS elided while keeping the exact same masked SourceOver output.
+    let nested_clip_pdf = page_pdf(
+        "0 0 100 100",
+        b"0.5 g 0 0 100 100 re f q 0 0 100 100 re W n 0 0 100 100 re W n 10.5 10 20 20 re f Q",
+    );
+    let (nested_elided_clips, nested_elided, _) = render_case(&nested_clip_pdf, 1.0, true);
+    let (nested_retained_clips, nested_retained, _) = render_case(&nested_clip_pdf, 1.0, false);
+
+    assert_eq!(nested_retained_clips, 2);
+    assert_eq!(
+        nested_elided_clips, 1,
+        "nested covering rectangle under an active mask must elide"
+    );
+    assert_eq!(nested_elided.data, nested_retained.data);
+    assert_eq!(px(&nested_elided, 10, 20), [128, 128, 128]);
 }

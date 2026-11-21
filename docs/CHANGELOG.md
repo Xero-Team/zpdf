@@ -8,7 +8,7 @@
   `PageInterpretOptions::clip_elision_scale` (wired into CPU rendering in
   `zpdf-cli`, `zpdf-wasm`, and `zpdf-benches`) to elide axis-aligned rectangle
   clips (`W`/`W*`, Form XObject `/BBox`, and pattern clips) that cover every
-  affected device pixel of the active clip or raster, avoiding redundant
+  affected device pixel of an active clip mask, avoiding redundant
   `PushClip`/`PopClip` pairs and CPU clip-mask allocations without changing
   rendered pixels. (#166)
 

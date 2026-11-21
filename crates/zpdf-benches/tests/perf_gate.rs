@@ -194,19 +194,21 @@ fn stream_obj(dict: &str, content: &[u8]) -> Vec<u8> {
     v
 }
 
-/// Covering rectangle clips (page-covering `W`/`W*`, nested clips covering
-/// narrowed bounds, and full-page Form `/BBox`) are elided in the interpreter,
-/// reducing display-list `PushClip` commands and CPU backend mask builds with
-/// zero pixel difference.
+/// Covering rectangle clips nested under an active clip (repeated page-covering
+/// `W`/`W*`, nested clips covering narrowed bounds, and full-page Form `/BBox`)
+/// are elided in the interpreter, reducing display-list `PushClip` commands and
+/// CPU backend mask builds with zero pixel difference against the retained-clip
+/// render.
 #[test]
 fn covering_rectangle_clips_reduce_push_clip_count() {
-    let mut content_with_covering = String::new();
-    let mut content_minimal = String::new();
+    let mut content_with_covering = String::from("0.5 g 0 0 200 200 re f\nq 0 0 200 200 re W n\n");
+    let mut content_minimal = String::from("0.5 g 0 0 200 200 re f\nq 0 0 200 200 re W n\n");
 
-    // 12 repeated page-covering clips wrapping distinct fills.
+    // 12 repeated page-covering clips wrapping distinct fills (including a
+    // half-pixel antialiased edge over gray 0.5 to guard masked rounding).
     for i in 0..12 {
-        let x = 10 + i * 14;
-        let fill = format!("0.2 0.4 0.8 rg {x} 10 10 20 re f\n");
+        let x = 10.25 + (i * 14) as f32;
+        let fill = format!("0.5 g {x} 10 10 20 re f\n");
         content_with_covering.push_str(&format!("q 0 0 200 200 re W n {fill}Q\n"));
         content_minimal.push_str(&format!("q {fill}Q\n"));
     }
@@ -230,8 +232,8 @@ fn covering_rectangle_clips_reduce_push_clip_count() {
     );
 
     // 1 Form XObject whose /BBox covers the whole page.
-    content_with_covering.push_str("/Fm0 Do\n");
-    content_minimal.push_str("0.1 0.1 0.1 rg 150 150 30 30 re f\n");
+    content_with_covering.push_str("/Fm0 Do\nQ\n");
+    content_minimal.push_str("0.1 0.1 0.1 rg 150 150 30 30 re f\nQ\n");
 
     let build = |content: &[u8]| {
         assemble_pdf(&[
@@ -248,15 +250,17 @@ fn covering_rectangle_clips_reduce_push_clip_count() {
         ])
     };
 
-    let interpret_and_render = |pdf: Vec<u8>| {
+    let interpret_and_render = |pdf: Vec<u8>, elide: bool| {
         let doc = zpdf::PdfDocument::open(pdf).expect("open synthetic pdf");
         let page = doc.page(0).expect("page 0");
         let content = doc.page_content_bytes(&page).expect("content bytes");
         let scale = 2.0;
-        let dl = zpdf::ContentInterpreter::new(page.effective_box())
-            .with_clip_elision_scale(scale)
-            .with_document(doc.file(), &page.resources)
-            .interpret(&content);
+        let mut interp = zpdf::ContentInterpreter::new(page.effective_box())
+            .with_document(doc.file(), &page.resources);
+        if elide {
+            interp = interp.with_clip_elision_scale(scale);
+        }
+        let dl = interp.interpret(&content);
         let comp = Composition::of(&dl, scale);
         let mut renderer = zpdf::cpu::CpuRenderer::new().with_stage_timing(true);
         let rendered = renderer
@@ -266,29 +270,38 @@ fn covering_rectangle_clips_reduce_push_clip_count() {
         (comp, stats, rendered)
     };
 
-    let (comp, stats, rendered) = interpret_and_render(build(content_with_covering.as_bytes()));
-    let (ref_comp, ref_stats, reference) = interpret_and_render(build(content_minimal.as_bytes()));
+    let covering_pdf = build(content_with_covering.as_bytes());
+    let (comp, stats, rendered) = interpret_and_render(covering_pdf.clone(), true);
+    let (retained_comp, retained_stats, retained) = interpret_and_render(covering_pdf, false);
+    let (ref_comp, ref_stats, reference) =
+        interpret_and_render(build(content_minimal.as_bytes()), true);
 
-    // 17 clip operations in the content/form stream collapse to only the 2
-    // genuine narrowing clips (matching the reference with covering clips removed).
+    // 18 clip operations in the content/form stream collapse to 3 PushClips
+    // (1 outer page mask + 2 genuine narrowing clips; 15 covering clips elided).
+    assert_eq!(retained_comp.clips, 18);
+    assert_eq!(retained_stats.clips_pushed, 18);
     assert_eq!(
         comp.clips,
-        2,
+        3,
         "expected 15 covering clips elided: {}",
         comp.summary()
     );
-    assert_eq!(comp.fills, 16, "{}", comp.summary());
+    assert_eq!(comp.fills, 17, "{}", comp.summary());
     assert_eq!(
         comp.commands,
-        20,
-        "16 fills + 2 PushClip + 2 PopClip: {}",
+        23,
+        "17 fills + 3 PushClip + 3 PopClip: {}",
         comp.summary()
     );
     assert_eq!(comp.clips, ref_comp.clips);
-    assert_eq!(stats.clips_pushed, 2);
+    assert_eq!(stats.clips_pushed, 3);
     assert_eq!(stats.clips_pushed, ref_stats.clips_pushed);
     assert_eq!(
+        rendered.data, retained.data,
+        "eliding covering rectangle clips must match the retained-clip render byte-for-byte"
+    );
+    assert_eq!(
         rendered.data, reference.data,
-        "eliding covering rectangle clips must not change rendered pixels"
+        "eliding covering rectangle clips must match the minimal reference byte-for-byte"
     );
 }

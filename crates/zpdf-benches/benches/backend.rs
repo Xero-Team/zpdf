@@ -325,7 +325,13 @@ fn gpu(c: &mut Criterion) {
     // must not be charged to a page.
     let mut renderer = WgpuRenderer::new();
     for page_ref in zpdf_benches::latency_corpus() {
-        let setup = load_page(&page_ref.path, page_ref.page, DPI as f32).expect("load_page");
+        let setup = zpdf_benches::load_page_for(
+            &page_ref.path,
+            page_ref.page,
+            DPI as f32,
+            zpdf_benches::InterpretTarget::Gpu,
+        )
+        .expect("load_page_for(Gpu)");
         // Probe once. An adapter that cannot render this page at all (OOM,
         // unsupported size) must skip the case with a note, not panic the whole
         // target — a run that dies at case 40 of 54 wastes everything before it.
@@ -359,7 +365,13 @@ fn gpu(c: &mut Criterion) {
     apply_cost_budget(&mut group, std::time::Duration::from_millis(300));
     let mut renderer = WgpuRenderer::new();
     for page_ref in zpdf_benches::latency_corpus() {
-        let setup = load_page(&page_ref.path, page_ref.page, DPI as f32).expect("load_page");
+        let setup = zpdf_benches::load_page_for(
+            &page_ref.path,
+            page_ref.page,
+            DPI as f32,
+            zpdf_benches::InterpretTarget::Gpu,
+        )
+        .expect("load_page_for(Gpu)");
         // Probe once — see the readback group above.
         if let Err(e) = renderer.render_display_list_submitted(&setup.dl, setup.scale) {
             eprintln!(

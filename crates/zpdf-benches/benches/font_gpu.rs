@@ -5,7 +5,7 @@ use criterion::{criterion_group, criterion_main, Criterion};
 use std::hint::black_box;
 use std::time::Duration;
 use zpdf::RenderBackend;
-use zpdf_benches::{font_fallback_workloads, font_workloads, PageSetup};
+use zpdf_benches::{font_fallback_workloads, font_workloads, InterpretTarget, PageSetup};
 
 fn validate(setup: &PageSetup, renderer: &mut zpdf::gpu::WgpuRenderer<'_>) {
     let cpu = zpdf::cpu::CpuRenderer::new()
@@ -48,14 +48,20 @@ fn gpu_fonts(c: &mut Criterion) {
     for (name, text, composite) in cases {
         let doc = zpdf::PdfDocument::open(font_workloads::make_pdf(&text, composite, 1)).unwrap();
         font_workloads::assert_text_case(&doc, &text, 144.0);
-        setups.push((name, font_workloads::setup(&doc, 144.0)));
+        setups.push((
+            name,
+            font_workloads::setup_for(&doc, 144.0, InterpretTarget::Gpu),
+        ));
     }
     let vertical = font_fallback_workloads::document(true, 0, false, 8);
-    setups.push(("vertical_mixed", font_workloads::setup(&vertical, 144.0)));
+    setups.push((
+        "vertical_mixed",
+        font_workloads::setup_for(&vertical, 144.0, InterpretTarget::Gpu),
+    ));
     let repeated_pdf = font_workloads::make_pdf(&"A".repeat(256), false, 1);
     let doc = zpdf::PdfDocument::open(repeated_pdf).unwrap();
-    let mut shear = font_workloads::setup(&doc, 144.0);
-    let mut mirror = font_workloads::setup(&doc, 144.0);
+    let mut shear = font_workloads::setup_for(&doc, 144.0, InterpretTarget::Gpu);
+    let mut mirror = font_workloads::setup_for(&doc, 144.0, InterpretTarget::Gpu);
     for (setup, mirrored) in [(&mut shear, false), (&mut mirror, true)] {
         for command in &mut setup.dl.commands {
             if let zpdf::display_list::RenderCommand::DrawGlyphRun(run) = command {
