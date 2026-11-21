@@ -253,9 +253,10 @@ pub fn load_single_font_dict_with_fallback(
         None
     };
     attach_text_mappings(file, dict, subtype, to_unicode, &mut font);
-    // A substituted composite font needs /ToUnicode (attached just above) to
-    // route CIDs through the system face's Unicode cmap.
-    if font.cid_to_gid.is_none() {
+    // A substituted composite font that does not use direct per-source-code
+    // GID resolution needs /ToUnicode (attached just above) to route CIDs
+    // through the system face's Unicode cmap.
+    if font.cid_to_gid.is_none() && !font.uses_direct_composite_gids() {
         font.build_substitute_cid_to_gid();
     }
     // FontDescriptor weight/width/slant → variation axes (variable fonts only).
@@ -267,7 +268,7 @@ pub fn load_single_font_dict_with_fallback(
         if font.is_substitute && comp.type1.is_some() {
             font.inherit_type1_encoding_from(comp);
         }
-        if comp.is_substitute && comp.cid_to_gid.is_none() {
+        if comp.is_substitute && comp.cid_to_gid.is_none() && !comp.uses_direct_composite_gids() {
             comp.build_substitute_cid_to_gid();
         }
         if subtype != "Type0" {
@@ -844,10 +845,15 @@ fn load_type0_font(
         .map(|fd| extract_font_file(file, fd))
         .unwrap_or(EmbeddedFontFile::Absent);
 
+    // When the CMap is non-identity or carries explicit CID overrides, multiple
+    // source codes can share one CID; resolve physical drawing GIDs per source
+    // code instead of a CID-keyed `cid_to_gid` table (while pure Identity-H/V
+    // maps are 1-to-1 and keep `cid_to_gid` for direct CID lookups).
+    let needs_direct_gids = !cmap.identity || cmap.has_explicit_cids();
+
     let fallback_type0 = |cid_widths: CidWidths| {
         // Non-embedded or unloadable embedded composite font: substitute a
-        // matching face. CIDs are remapped through /ToUnicode once it is
-        // attached (see build_substitute_cid_to_gid in load_single_font).
+        // matching face while keeping original PDF CID advances.
         substitute_type0_font(
             lookup_name,
             &base_font,
@@ -856,6 +862,12 @@ fn load_type0_font(
             ordering.as_deref(),
             hints,
         )
+        .map(|mut sub| {
+            if needs_direct_gids {
+                sub.enable_direct_composite_gids();
+            }
+            sub
+        })
         .unwrap_or_else(|| {
             let mut font = LoadedFont::new_placeholder(base_font.clone());
             // Missing outlines do not change the PDF's composite code
@@ -886,15 +898,20 @@ fn load_type0_font(
         )?;
         sub.cid_cmap = Some(cmap.clone());
         sub.validate_cid_cmap();
-        sub.build_substitute_cid_to_gid_from(to_unicode);
-        let has_mapping = sub.unicode_coded()
-            || sub.legacy_substitute()
-            || sub.cid_cmap.as_ref().and_then(|c| c.collection()).is_some()
-            || sub
-                .cid_to_gid
-                .as_ref()
-                .is_some_and(|m| m.values().any(|&g| g != 0));
-        has_mapping.then_some(sub)
+        if needs_direct_gids {
+            sub.enable_direct_composite_gids();
+            sub.has_direct_composite_mapping(to_unicode).then_some(sub)
+        } else {
+            sub.build_substitute_cid_to_gid_from(to_unicode);
+            let has_mapping = sub.unicode_coded()
+                || sub.legacy_substitute()
+                || sub.cid_cmap.as_ref().and_then(|c| c.collection()).is_some()
+                || sub
+                    .cid_to_gid
+                    .as_ref()
+                    .is_some_and(|m| m.values().any(|&g| g != 0));
+            has_mapping.then_some(sub)
+        }
     };
 
     let mut diagnostics = zpdf_core::ProcessingDiagnostics::default();
@@ -1304,6 +1321,7 @@ fn load_type3_font(
         font_data: None,
         face_index: 0,
         is_substitute: false,
+        direct_composite_gids: false,
         cid_widths: CidWidths::new(default_width),
         units_per_em: 1000.0,
         ascent: 880.0,

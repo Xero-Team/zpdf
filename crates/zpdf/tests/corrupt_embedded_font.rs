@@ -6399,3 +6399,137 @@ fn admitting_shared_alias_under_lower_limit_reclaims_standby_descriptor_name() {
     cache.record_descriptor_substitute(fid2, shared_spec, base_bytes);
     assert_eq!(cache.bytes_used(), base_bytes);
 }
+
+#[test]
+fn type0_primary_substitute_shared_cid_resolves_distinct_source_codes_and_preserves_advances() {
+    let probe = zpdf_font::LoadedFont::new_with_data(
+        zpdf_font::PdfFontType::TrueType,
+        "Probe".into(),
+        PRIMARY_TTF.to_vec(),
+        zpdf_font::CidWidths::new(1000.0),
+    );
+    let gid_a = probe.unicode_glyph('A' as u32).unwrap().0;
+    let gid_b = probe.unicode_glyph('B' as u32).unwrap().0;
+    let gid_c = probe.unicode_glyph('C' as u32).unwrap().0;
+    assert_ne!(gid_a, gid_b);
+
+    // Custom CMap maps TWO source codes `<0001>` and `<0002>` to the SAME CID
+    // (`gid_a`), and `<0003>` to `gid_c`.
+    let cmap = format!(
+        "/CIDInit /ProcSet findresource begin 12 dict begin begincmap \
+         /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> def \
+         /CMapName /TwoCodesOneCidPrimarySub def /CMapType 1 def \
+         1 begincodespacerange <0000> <FFFF> endcodespacerange \
+         3 begincidchar <0001> {gid_a} <0002> {gid_a} <0003> {gid_c} endcidchar \
+         endcmap CMapName currentdict /CMap defineresource pop end end"
+    );
+    // `/ToUnicode` maps `<0001>` -> 'A', `<0002>` -> 'B', `<0003>` -> 'C'.
+    let to_unicode = b"/CIDInit /ProcSet findresource begin 12 dict begin begincmap \
+        1 begincodespacerange <0000> <FFFF> endcodespacerange \
+        3 beginbfchar <0001> <0041> <0002> <0042> <0003> <0043> endbfchar \
+        endcmap CMapName currentdict /CMap defineresource pop end end";
+
+    let provider = Arc::new(FontProvider::memory_only());
+    provider
+        .register_with_aliases(PRIMARY_TTF, 0, &["SharedCidPrimarySubFace"])
+        .unwrap();
+
+    // Test BOTH load-time primary substitute paths:
+    // 1. `EmbeddedFontFile::Present` with entirely unparseable `FontFile2` bytes
+    //    (`try_mapped_substitute`).
+    // 2. `EmbeddedFontFile::Unreadable` with a `/FlateDecode` stream that fails
+    //    to decode (`fallback_type0`).
+    for (label, font_file_obj) in [
+        (
+            "unparseable-fontfile2",
+            stream("", b"corrupt unparseable truetype bytes"),
+        ),
+        (
+            "undecodable-flatedecode-stream",
+            stream("/Filter /FlateDecode", b"not valid zlib compressed data"),
+        ),
+    ] {
+        let pdf = assemble(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 180 100] \
+              /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
+                .to_vec(),
+            stream("", b"0 0 0 rg BT /F1 10 Tf 10 50 Td <000100020003> Tj ET"),
+            b"<< /Type /Font /Subtype /Type0 /BaseFont /ABCDEF+SharedCidPrimarySubFace \
+              /Encoding 9 0 R /DescendantFonts [6 0 R] /ToUnicode 10 0 R >>"
+                .to_vec(),
+            format!(
+                "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /ABCDEF+SharedCidPrimarySubFace \
+                  /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> \
+                  /CIDToGIDMap /Identity /FontDescriptor 7 0 R /DW 500 /W [{gid_a} [920]] >>"
+            )
+            .into_bytes(),
+            b"<< /Type /FontDescriptor /FontName /ABCDEF+SharedCidPrimarySubFace /Flags 32 /FontFile2 8 0 R >>"
+                .to_vec(),
+            font_file_obj,
+            stream("", cmap.as_bytes()),
+            stream("", to_unicode),
+        ]);
+
+        let doc = PdfDocument::open(pdf)
+            .unwrap()
+            .with_font_provider(Arc::clone(&provider));
+        let page = zpdf::interpret_page(&doc, 0, Default::default()).unwrap();
+        let (fid, f) = page.fonts.get_by_name("F1").unwrap();
+        assert!(
+            f.is_substitute,
+            "{label}: loader must select primary substitute"
+        );
+        assert!(
+            f.uses_direct_composite_gids(),
+            "{label}: primary Type 0 substitute must resolve physical GIDs per source code"
+        );
+        assert_eq!(page.stats.diagnostics.embedded_font_fallbacks, 1, "{label}");
+        assert_eq!(page.stats.diagnostics.missing_glyph_outlines, 0, "{label}");
+        assert!(page.is_complete(), "{label}");
+
+        let runs: Vec<_> = page
+            .display_list
+            .commands
+            .iter()
+            .filter_map(|cmd| match cmd {
+                RenderCommand::DrawGlyphRun(run) => Some(run),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            runs.len(),
+            1,
+            "{label}: expected one run on primary substitute"
+        );
+        assert_eq!(runs[0].font_id, fid, "{label}");
+        assert_eq!(runs[0].glyphs.len(), 3, "{label}");
+        assert_eq!(
+            runs[0].glyphs[0].glyph_id, gid_a,
+            "{label}: <0001> must draw physical GID for 'A'"
+        );
+        assert_eq!(
+            runs[0].glyphs[1].glyph_id, gid_b,
+            "{label}: <0002> must draw physical GID for 'B', not overwrite or collide on shared CID"
+        );
+        assert_eq!(
+            runs[0].glyphs[2].glyph_id, gid_c,
+            "{label}: <0003> must draw physical GID for 'C'"
+        );
+        assert!(
+            (runs[0].glyphs[0].advance - 9.2).abs() < 0.01
+                && (runs[0].glyphs[1].advance - 9.2).abs() < 0.01
+                && (runs[0].glyphs[2].advance - 5.0).abs() < 0.01,
+            "{label}: PDF /W and /DW advances on original CIDs must be preserved"
+        );
+        assert!(runs[0].glyphs[0].x.abs() < 0.01, "{label}");
+        assert!((runs[0].glyphs[1].x - 9.2).abs() < 0.01, "{label}");
+        assert!((runs[0].glyphs[2].x - 18.4).abs() < 0.01, "{label}");
+
+        let conv = zpdf::convert_pdf(&doc, &[0], Default::default()).unwrap();
+        assert_eq!(conv.pages[0].text.trim(), "ABC", "{label}");
+        assert_eq!(conv.pages[0].diagnostics.decode_failures, 0, "{label}");
+        assert!(conv.is_complete(), "{label}");
+    }
+}

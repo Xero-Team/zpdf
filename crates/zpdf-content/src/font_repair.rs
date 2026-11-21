@@ -518,17 +518,25 @@ fn undecodable<'b>(font: &LoadedFont, strings: impl Iterator<Item = &'b [u8]>) -
                 return true;
             }
             codes += 1;
-            drawable = drawable || direct || {
-                let cid = cmap.map_or(code, |cmap| cmap.code_to_cid(code, length as u8));
-                u16::try_from(cid)
-                    .ok()
-                    .filter(|&cid| cid != 0)
-                    .is_some_and(|cid| {
-                        font.cid_to_gid
-                            .as_ref()
-                            .is_none_or(|map| map.get(&cid).is_some_and(|&gid| gid != 0))
-                    })
-            };
+            drawable = drawable
+                || direct
+                || if font.uses_direct_composite_gids() {
+                    let raw_code = rest[..length.max(1).min(rest.len())]
+                        .iter()
+                        .fold(0u32, |value, &byte| (value << 8) | byte as u32);
+                    font.composite_direct_gid(code, raw_code, length as u8)
+                        .is_some()
+                } else {
+                    let cid = cmap.map_or(code, |cmap| cmap.code_to_cid(code, length as u8));
+                    u16::try_from(cid)
+                        .ok()
+                        .filter(|&cid| cid != 0)
+                        .is_some_and(|cid| {
+                            font.cid_to_gid
+                                .as_ref()
+                                .is_none_or(|map| map.get(&cid).is_some_and(|&gid| gid != 0))
+                        })
+                };
             rest = &rest[length.max(1)..];
         }
     }
@@ -652,8 +660,8 @@ fn code_glyph(font: &LoadedFont, code: u32, length: u8, raw_code: u32) -> Option
             .as_ref()
             .map_or(code, |cmap| cmap.code_to_cid(code, length));
         let cid = u16::try_from(cid).ok()?;
-        let glyph_id = if font.unicode_coded() || font.legacy_substitute() {
-            font.composite_unicode_gid(code, raw_code, length)?
+        let glyph_id = if font.uses_direct_composite_gids() {
+            font.composite_direct_gid(code, raw_code, length)?
         } else {
             cid
         };

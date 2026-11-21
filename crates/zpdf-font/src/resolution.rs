@@ -1321,7 +1321,8 @@ impl FontCache {
                             CidWidths::new(1000.0),
                         )?;
                         loaded.variations.clone_from(&font.variations);
-                        let id = self.admit_drawing_font(Arc::new(loaded), max_bytes)?;
+                        let id =
+                            self.admit_drawing_font(Arc::new(loaded), original.font_id, max_bytes)?;
                         self.resolution
                             .as_mut()?
                             .faces
@@ -1588,8 +1589,8 @@ impl FontCache {
         {
             companion.resolve_composite_substitute_gid(primary, code, raw_code, length)
         } else if matches!(companion.font_type, PdfFontType::Type0CidType2) {
-            if companion.unicode_coded() || companion.legacy_substitute() {
-                companion.composite_unicode_gid(code, raw_code, length)
+            if companion.uses_direct_composite_gids() {
+                companion.composite_direct_gid(code, raw_code, length)
             } else {
                 let cid = companion
                     .cid_cmap
@@ -1650,7 +1651,8 @@ impl FontCache {
                 {
                     self.recompute_standby_bytes();
                 }
-                let Some(id) = self.admit_drawing_font(companion, max_bytes) else {
+                let Some(id) = self.admit_drawing_font(companion, original.font_id, max_bytes)
+                else {
                     if let Some((spec, had_extra)) = released_spec {
                         if let Some(entry) = self.embedded_companions.get_mut(&original.font_id) {
                             entry.descriptor_spec = Some(spec);
@@ -1682,13 +1684,24 @@ impl FontCache {
         })
     }
 
-    fn admit_drawing_font(&mut self, font: Arc<LoadedFont>, max_bytes: u64) -> Option<FontId> {
+    fn admit_drawing_font(
+        &mut self,
+        font: Arc<LoadedFont>,
+        original_font_id: FontId,
+        max_bytes: u64,
+    ) -> Option<FontId> {
         // Drawing faces have no PDF resource name, so hostile resource names
         // cannot collide with an internal alias or redirect an existing run.
         let total = self.budget.admission_total(&font, max_bytes)?;
         let id = self.next_free_id()?;
         self.budget.record(&font, total);
         self.fonts.insert(id, font);
+        let root_id = self
+            .drawing_font_originals
+            .get(&original_font_id)
+            .copied()
+            .unwrap_or(original_font_id);
+        self.drawing_font_originals.insert(id, root_id);
         self.reclaim_standby_for(total, max_bytes);
         Some(id)
     }

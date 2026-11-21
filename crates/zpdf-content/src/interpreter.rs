@@ -5897,8 +5897,7 @@ impl<'a> ContentInterpreter<'a> {
             // (Identity-H semantics when absent) and map code → CID → glyph.
             let cmap = font_and_id.and_then(|(_, f)| f.cid_cmap.as_ref());
             vertical = cmap.map(|c| c.wmode == 1).unwrap_or(false);
-            let direct_gid = font_and_id
-                .is_some_and(|(_, font)| font.unicode_coded() || font.legacy_substitute());
+            let direct_gid = font_and_id.is_some_and(|(_, font)| font.uses_direct_composite_gids());
             let dw2 = font_and_id.map(|(_, f)| f.dw2).unwrap_or((880.0, -1000.0));
             let mut evidence = font_and_id
                 .filter(|_| !self.font_override)
@@ -5936,7 +5935,7 @@ impl<'a> ContentInterpreter<'a> {
                         let raw_code = bytes[start..i.min(bytes.len())]
                             .iter()
                             .fold(0u32, |value, &byte| (value << 8) | byte as u32);
-                        font.composite_unicode_gid(code, raw_code, len as u8)
+                        font.composite_direct_gid(code, raw_code, len as u8)
                             .unwrap_or(0)
                     } else {
                         cid

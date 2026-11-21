@@ -149,6 +149,12 @@ pub struct LoadedFont {
     /// True when `font_data` is a substituted system font rather than the
     /// PDF-embedded program. PDF metrics (/Widths, /W) stay authoritative.
     pub is_substitute: bool,
+    /// True when this substituted Type 0 font resolves physical drawing GIDs
+    /// per source code (via `/ToUnicode` and `/Encoding` CMap) rather than
+    /// routing `glyph_id` through a CID → GID table. Preserves original CID
+    /// advances while avoiding hash-order collisions when multiple source codes
+    /// share one CID.
+    pub direct_composite_gids: bool,
     pub cid_widths: CidWidths,
     pub units_per_em: f64,
     pub ascent: f64,
@@ -340,6 +346,7 @@ impl LoadedFont {
                 font_data: Some(Arc::from(font_data)),
                 face_index: 0,
                 is_substitute: false,
+                direct_composite_gids: false,
                 cid_widths,
                 units_per_em,
                 ascent,
@@ -379,6 +386,7 @@ impl LoadedFont {
                 font_data: None,
                 face_index: 0,
                 is_substitute: false,
+                direct_composite_gids: false,
                 cid_widths,
                 units_per_em,
                 ascent: units_per_em * 0.8,
@@ -404,6 +412,7 @@ impl LoadedFont {
                 font_data: None,
                 face_index: 0,
                 is_substitute: false,
+                direct_composite_gids: false,
                 cid_widths,
                 units_per_em: 1000.0,
                 ascent: 800.0,
@@ -443,6 +452,7 @@ impl LoadedFont {
             font_data: Some(data),
             face_index,
             is_substitute: true,
+            direct_composite_gids: false,
             cid_widths,
             units_per_em,
             ascent,
@@ -477,8 +487,9 @@ impl LoadedFont {
         if !self.is_substitute || !matches!(self.font_type, PdfFontType::Type0CidType2) {
             return;
         }
-        // Unicode-coded CMaps resolve straight to GIDs — no CID table needed.
-        if self.unicode_coded() || self.legacy_substitute() {
+        // Unicode-coded, legacy, and direct per-source-code substitutes resolve
+        // straight to physical GIDs — no CID table needed.
+        if self.uses_direct_composite_gids() {
             return;
         }
         // An absent or empty mapping must not mean CID == substitute GID.
@@ -545,6 +556,7 @@ impl LoadedFont {
             font_data: None,
             face_index: 0,
             is_substitute: false,
+            direct_composite_gids: false,
             cid_widths,
             units_per_em: 1000.0,
             ascent: metrics.ascent,
@@ -569,6 +581,7 @@ impl LoadedFont {
             font_data: None,
             face_index: 0,
             is_substitute: false,
+            direct_composite_gids: false,
             cid_widths: CidWidths::new(500.0),
             units_per_em: 1000.0,
             ascent: 800.0,
@@ -615,6 +628,7 @@ impl LoadedFont {
             font_data: None,
             face_index: 0,
             is_substitute: self.is_substitute,
+            direct_composite_gids: self.direct_composite_gids,
             cid_widths: self.cid_widths.clone(),
             units_per_em: self.units_per_em,
             ascent: self.ascent,
@@ -653,6 +667,67 @@ impl LoadedFont {
                 .as_ref()
                 .map(|c| c.is_legacy())
                 .unwrap_or(false)
+    }
+
+    /// True when this Type 0 font resolves physical drawing GIDs directly per
+    /// source code in `show_text` (Unicode CMap, legacy substitute, or a
+    /// loader-selected primary Type 0 substitute) while keeping PDF advances on
+    /// the original CID.
+    pub fn uses_direct_composite_gids(&self) -> bool {
+        self.unicode_coded()
+            || self.legacy_substitute()
+            || (self.is_substitute
+                && self.direct_composite_gids
+                && matches!(self.font_type, PdfFontType::Type0CidType2))
+    }
+
+    /// Opt this substituted Type 0 font into per-source-code physical drawing
+    /// GID resolution instead of synthesizing a CID-keyed `cid_to_gid` map.
+    #[doc(hidden)]
+    pub fn enable_direct_composite_gids(&mut self) {
+        if self.is_substitute && matches!(self.font_type, PdfFontType::Type0CidType2) {
+            self.direct_composite_gids = true;
+        }
+    }
+
+    /// Whether this direct composite substitute can resolve at least one
+    /// non-`.notdef` glyph via a Unicode/legacy CMap, canonical CJK collection,
+    /// or `/ToUnicode` entry mapping a non-zero CID to a glyph in this face.
+    #[doc(hidden)]
+    pub fn has_direct_composite_mapping(&self, to_unicode: Option<&cmap::ToUnicodeMap>) -> bool {
+        if !self.is_substitute || !matches!(self.font_type, PdfFontType::Type0CidType2) {
+            return false;
+        }
+        if self.unicode_coded()
+            || self.legacy_substitute()
+            || self
+                .cid_cmap
+                .as_ref()
+                .and_then(|c| c.collection())
+                .is_some()
+        {
+            return true;
+        }
+        let Some(data) = &self.font_data else {
+            return false;
+        };
+        let Ok(face) = ttf_parser::Face::parse(data, self.face_index) else {
+            return false;
+        };
+        let to_unicode = to_unicode.or(self.to_unicode.as_ref());
+        to_unicode.iter().flat_map(|tu| tu.iter()).any(|(code, s)| {
+            let cid = match &self.cid_cmap {
+                Some(cm) if !cm.identity || cm.has_explicit_cids() => {
+                    cm.source_key_to_cid(code, to_unicode.and_then(|tu| tu.padded_length(code)))
+                }
+                _ => code,
+            };
+            cid != 0
+                && cid <= u16::MAX as u32
+                && FontCharacter::from_text(s)
+                    .and_then(|ch| ch.mapped_glyph_index(&face))
+                    .is_some_and(|gid| gid != 0)
+        })
     }
 
     /// Downgrade a Unicode-coded CMap to Identity when the font program has
@@ -710,6 +785,14 @@ impl LoadedFont {
             })
     }
 
+    /// Resolve a composite PDF source code to a physical GID on this direct
+    /// composite substitute using its own `/ToUnicode` and `/Encoding` CMap.
+    /// PDF advances must be obtained separately from the original CID.
+    #[doc(hidden)]
+    pub fn composite_direct_gid(&self, code: u32, raw_code: u32, length: u8) -> Option<u16> {
+        self.resolve_composite_substitute_gid(self, code, raw_code, length)
+    }
+
     /// Resolve a composite PDF source code to a physical GID in this direct
     /// drawing substitute using `primary`'s `/ToUnicode` and `/Encoding` CMap.
     ///
@@ -723,11 +806,13 @@ impl LoadedFont {
         raw_code: u32,
         length: u8,
     ) -> Option<u16> {
-        if let Some(text) = primary
-            .to_unicode
-            .as_ref()
-            .and_then(|map| map.lookup(raw_code).or_else(|| map.lookup(code)))
-        {
+        if let Some(text) = primary.to_unicode.as_ref().and_then(|map| {
+            let lookup = |key: u32| {
+                map.lookup(key)
+                    .filter(|_| map.padded_length(key).is_none_or(|padded| padded == length))
+            };
+            lookup(raw_code).or_else(|| (code != raw_code).then(|| lookup(code)).flatten())
+        }) {
             if let Some(gid) =
                 FontCharacter::from_text(text).and_then(|character| self.character_gid(character))
             {
@@ -850,6 +935,9 @@ impl LoadedFont {
     ) -> Option<u16> {
         if self.unicode_coded() || self.legacy_substitute() {
             return Some(glyph_id);
+        }
+        if self.is_substitute && self.direct_composite_gids {
+            return (glyph_id != 0).then_some(glyph_id);
         }
         let Some(map) = &self.cid_to_gid else {
             return Some(glyph_id);
@@ -2944,6 +3032,11 @@ pub struct FontCache {
     /// Partially-readable embedded originals paired with a substituted
     /// `FontId`. Empty maps allocate nothing.
     embedded_companions: HashMap<FontId, CompanionEntry>,
+    /// Maps each admitted drawing-only companion/fallback `FontId` back to the
+    /// logical PDF `FontId` whose `/ToUnicode`, `/Encoding`, `cid_cmap`, and
+    /// `font_type` govern text decoding (e.g. for PPTX export). Empty maps
+    /// allocate nothing.
+    drawing_font_originals: HashMap<FontId, FontId>,
 }
 
 impl FontCache {
@@ -2966,6 +3059,7 @@ impl FontCache {
             resolution: None,
             embedded_fallbacks: HashMap::new(),
             embedded_companions: HashMap::new(),
+            drawing_font_originals: HashMap::new(),
         }
     }
 
@@ -3500,6 +3594,15 @@ impl FontCache {
 
     pub fn get(&self, id: FontId) -> Option<&LoadedFont> {
         self.fonts.get(&id).map(|font| font.as_ref())
+    }
+
+    /// Return the logical PDF font whose text mappings (`/ToUnicode`,
+    /// `/Encoding`, `cid_cmap`, `font_type`, and `base_font`) govern `id`,
+    /// following any admitted drawing-only companion/fallback face back to its
+    /// original PDF font.
+    pub fn logical_font(&self, id: FontId) -> Option<&LoadedFont> {
+        let logical_id = self.drawing_font_originals.get(&id).copied().unwrap_or(id);
+        self.fonts.get(&logical_id).map(|font| font.as_ref())
     }
 
     pub fn get_by_name(&self, name: &str) -> Option<(FontId, &LoadedFont)> {

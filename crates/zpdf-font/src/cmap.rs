@@ -863,7 +863,8 @@ impl CidCMap {
 
     /// Whether `cidchar`/`cidrange` entries can override the base mapping,
     /// e.g. an embedded CMap that `usecmap`s Identity and remaps some codes.
-    pub(crate) fn has_explicit_cids(&self) -> bool {
+    #[doc(hidden)]
+    pub fn has_explicit_cids(&self) -> bool {
         !self.cid_chars.is_empty() || !self.cid_ranges.is_empty()
     }
 
