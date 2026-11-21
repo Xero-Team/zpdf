@@ -512,7 +512,7 @@ impl LoadedFont {
             // overrides, the code is not the CID.
             let cid = match &self.cid_cmap {
                 Some(cm) if !cm.identity || cm.has_explicit_cids() => {
-                    cm.source_key_to_cid(code, to_unicode.and_then(|tu| tu.padded_length(code)))
+                    cm.source_key_to_cid(code, to_unicode.and_then(|tu| tu.source_length(code)))
                 }
                 _ => code,
             };
@@ -718,7 +718,7 @@ impl LoadedFont {
         to_unicode.iter().flat_map(|tu| tu.iter()).any(|(code, s)| {
             let cid = match &self.cid_cmap {
                 Some(cm) if !cm.identity || cm.has_explicit_cids() => {
-                    cm.source_key_to_cid(code, to_unicode.and_then(|tu| tu.padded_length(code)))
+                    cm.source_key_to_cid(code, to_unicode.and_then(|tu| tu.source_length(code)))
                 }
                 _ => code,
             };
@@ -764,15 +764,29 @@ impl LoadedFont {
         unicode_lookup::lookup::<true>(self, code)
     }
 
+    /// Look up `/ToUnicode` for a segmented PDF character code `(code, raw_code,
+    /// length)`. For composite fonts with an encoding CMap, match the entry's
+    /// actual source byte width in both directions (`<41>` only matches 1-byte
+    /// codes and `<0041>` only matches 2-byte codes), while allowing UTF-16
+    /// surrogate pairs (`code != raw_code`) to fall back to a scalar key.
+    #[doc(hidden)]
+    pub fn lookup_to_unicode(&self, code: u32, raw_code: u32, length: u8) -> Option<&str> {
+        let map = self.to_unicode.as_ref()?;
+        if matches!(self.font_type, PdfFontType::Type0CidType2) && self.cid_cmap.is_some() {
+            map.lookup_with_length(raw_code, length)
+                .or_else(|| (code != raw_code).then(|| map.lookup(code)).flatten())
+        } else {
+            map.lookup(raw_code).or_else(|| map.lookup(code))
+        }
+    }
+
     /// Resolve a Unicode/legacy substitute code to a physical GID. ToUnicode
     /// has priority, including raw UTF-16 source keys and variation sequences.
     /// When it names no single character (`fi`) or one this face lacks, the
     /// CMap's own Unicode for the code still selects the glyph. PDF advances
     /// must be obtained separately from the original CID.
     pub fn composite_unicode_gid(&self, code: u32, raw_code: u32, length: u8) -> Option<u16> {
-        self.to_unicode
-            .as_ref()
-            .and_then(|map| map.lookup(raw_code).or_else(|| map.lookup(code)))
+        self.lookup_to_unicode(code, raw_code, length)
             .and_then(FontCharacter::from_text)
             .and_then(|character| self.character_gid(character))
             .or_else(|| {
@@ -806,13 +820,7 @@ impl LoadedFont {
         raw_code: u32,
         length: u8,
     ) -> Option<u16> {
-        if let Some(text) = primary.to_unicode.as_ref().and_then(|map| {
-            let lookup = |key: u32| {
-                map.lookup(key)
-                    .filter(|_| map.padded_length(key).is_none_or(|padded| padded == length))
-            };
-            lookup(raw_code).or_else(|| (code != raw_code).then(|| lookup(code)).flatten())
-        }) {
+        if let Some(text) = primary.lookup_to_unicode(code, raw_code, length) {
             if let Some(gid) =
                 FontCharacter::from_text(text).and_then(|character| self.character_gid(character))
             {
@@ -1736,11 +1744,7 @@ impl LoadedFont {
     /// with the interpreter keeps a ligature's full Unicode string attached to
     /// the glyph that actually drew it. Unmapped codes may append nothing.
     pub fn append_decoded_code(&self, code: u32, len: u8, raw_code: u32, out: &mut String) {
-        if let Some(s) = self
-            .to_unicode
-            .as_ref()
-            .and_then(|tu| tu.lookup(raw_code).or_else(|| tu.lookup(code)))
-        {
+        if let Some(s) = self.lookup_to_unicode(code, raw_code, len) {
             out.push_str(s);
             return;
         }
@@ -1764,15 +1768,44 @@ impl LoadedFont {
         }
     }
 
+    /// Append the Unicode text for one PDF character code represented by its
+    /// packed big-endian source bytes `raw_code` and byte width `code_len`
+    /// (1–4, or 0 when unspecified by a synthetic caller).
+    ///
+    /// For composite fonts with an encoding CMap, re-segments the exact source
+    /// bytes through `cid_cmap.next_code` so UTF-16 surrogate pairs recover
+    /// both their decoded scalar and packed raw bytes for `/ToUnicode` and
+    /// CMap decoding.
+    pub fn append_decoded_source_code(&self, raw_code: u32, code_len: u8, out: &mut String) {
+        if matches!(self.font_type, PdfFontType::Type0CidType2) {
+            let len = if (1..=4).contains(&code_len) {
+                code_len
+            } else {
+                self.to_unicode
+                    .as_ref()
+                    .and_then(|map| map.source_length(raw_code))
+                    .unwrap_or(2)
+            };
+            let be = raw_code.to_be_bytes();
+            let slice = &be[4 - usize::from(len)..];
+            if let Some(cm) = &self.cid_cmap {
+                let (code, seg_len) = cm.next_code(slice);
+                self.append_decoded_code(code, seg_len as u8, raw_code, out);
+            } else if let Some(map) = &self.to_unicode {
+                map.append_fixed_width(slice, out);
+            }
+        } else if let Ok(byte) = u8::try_from(raw_code) {
+            self.append_decoded_code(byte as u32, 1, byte as u32, out);
+        }
+    }
+
     /// Whether this code decodes to Unicode text through `/ToUnicode`, CMap,
     /// `/Encoding`, Type 1 built-in encoding, or non-symbolic single-byte
     /// fallback.
     #[doc(hidden)]
     pub fn can_decode_code(&self, code: u32, len: u8, raw_code: u32) -> bool {
         if self
-            .to_unicode
-            .as_ref()
-            .and_then(|tu| tu.lookup(raw_code).or_else(|| tu.lookup(code)))
+            .lookup_to_unicode(code, raw_code, len)
             .is_some_and(|s| !s.is_empty())
         {
             return true;

@@ -6533,3 +6533,144 @@ fn type0_primary_substitute_shared_cid_resolves_distinct_source_codes_and_preser
         assert!(conv.is_complete(), "{label}");
     }
 }
+
+#[test]
+fn type0_mixed_width_cmap_matches_tounicode_by_source_width_in_both_directions() {
+    let probe = zpdf_font::LoadedFont::new_with_data(
+        zpdf_font::PdfFontType::TrueType,
+        "Probe".into(),
+        PRIMARY_TTF.to_vec(),
+        zpdf_font::CidWidths::new(1000.0),
+    );
+    let gid_a = probe.unicode_glyph('A' as u32).unwrap().0;
+    let gid_b = probe.unicode_glyph('B' as u32).unwrap().0;
+    let gid_c = probe.unicode_glyph('C' as u32).unwrap().0;
+    // Adobe-GB1 canonical CIDs: 34 = 'A', 35 = 'B', 36 = 'C'.
+    assert_eq!(
+        zpdf_font::cmap::CharacterCollection::Gb1
+            .unicode(35)
+            .and_then(|u| u.scalar()),
+        Some('B' as u32)
+    );
+    assert_eq!(
+        zpdf_font::cmap::CharacterCollection::Gb1
+            .unicode(36)
+            .and_then(|u| u.scalar()),
+        Some('C' as u32)
+    );
+
+    // Prefix-free mixed-width CMap with Adobe-GB1 collection:
+    // - 1-byte `<41>` selects CID 36 (canonical 'C', width 700),
+    // - 2-byte `<0041>` selects CID 35 (canonical 'B', width 920).
+    let mixed_cmap = b"/CIDInit /ProcSet findresource begin 12 dict begin begincmap \
+        /CIDSystemInfo << /Registry (Adobe) /Ordering (GB1) /Supplement 0 >> def \
+        /CMapName /MixedWidthSourceLen def /CMapType 1 def \
+        2 begincodespacerange <20> <7E> <0000> <1FFF> endcodespacerange \
+        2 begincidchar <41> 36 <0041> 35 endcidchar \
+        endcmap CMapName currentdict /CMap defineresource pop end end";
+
+    let provider = Arc::new(FontProvider::memory_only());
+    provider
+        .register_with_aliases(PRIMARY_TTF, 0, &["MixedWidthPrimarySubFace"])
+        .unwrap();
+
+    // Cover BOTH directions of `/ToUnicode` width matching:
+    // 1. Short-only `<41> -> 'A'`: 1-byte `<41>` draws/extracts 'A', while
+    //    2-byte `<0041>` must NOT match `<41>` and resolves via CID 35 -> 'B'.
+    // 2. Long-only `<0041> -> 'A'`: 1-byte `<41>` must NOT match `<0041>` and
+    //    resolves via CID 36 -> 'C', while 2-byte `<0041>` draws/extracts 'A'.
+    for (dir_label, to_unicode, expected_gids, expected_text) in [
+        (
+            "short-only",
+            b"/CIDInit /ProcSet findresource begin 12 dict begin begincmap \
+              1 begincodespacerange <00> <FF> endcodespacerange \
+              1 beginbfchar <41> <0041> endbfchar \
+              endcmap CMapName currentdict /CMap defineresource pop end end"
+                .as_slice(),
+            [gid_a, gid_b],
+            "AB",
+        ),
+        (
+            "long-only",
+            b"/CIDInit /ProcSet findresource begin 12 dict begin begincmap \
+              1 begincodespacerange <0000> <FFFF> endcodespacerange \
+              1 beginbfchar <0041> <0041> endbfchar \
+              endcmap CMapName currentdict /CMap defineresource pop end end"
+                .as_slice(),
+            [gid_c, gid_a],
+            "CA",
+        ),
+    ] {
+        for (src_label, font_file_obj) in [
+            (
+                "unparseable-fontfile2",
+                stream("", b"corrupt unparseable truetype bytes"),
+            ),
+            (
+                "undecodable-flatedecode",
+                stream("/Filter /FlateDecode", b"not valid zlib compressed data"),
+            ),
+        ] {
+            let label = format!("{dir_label}/{src_label}");
+            let pdf = assemble(&[
+                b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+                b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 180 100] \
+                  /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
+                    .to_vec(),
+                stream("", b"0 0 0 rg BT /F1 10 Tf 10 50 Td <410041> Tj ET"),
+                b"<< /Type /Font /Subtype /Type0 /BaseFont /ABCDEF+MixedWidthPrimarySubFace \
+                  /Encoding 9 0 R /DescendantFonts [6 0 R] /ToUnicode 10 0 R >>"
+                    .to_vec(),
+                b"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /ABCDEF+MixedWidthPrimarySubFace \
+                  /CIDSystemInfo << /Registry (Adobe) /Ordering (GB1) /Supplement 0 >> \
+                  /CIDToGIDMap /Identity /FontDescriptor 7 0 R /DW 500 /W [35 [920] 36 [700]] >>"
+                    .to_vec(),
+                b"<< /Type /FontDescriptor /FontName /ABCDEF+MixedWidthPrimarySubFace /Flags 32 /FontFile2 8 0 R >>"
+                    .to_vec(),
+                font_file_obj,
+                stream("", mixed_cmap),
+                stream("", to_unicode),
+            ]);
+
+            let doc = PdfDocument::open(pdf)
+                .unwrap()
+                .with_font_provider(Arc::clone(&provider));
+            let page = zpdf::interpret_page(&doc, 0, Default::default()).unwrap();
+            let (fid, f) = page.fonts.get_by_name("F1").unwrap();
+            assert!(f.is_substitute, "{label}: primary substitute expected");
+            assert!(f.uses_direct_composite_gids(), "{label}");
+            assert_eq!(page.stats.diagnostics.embedded_font_fallbacks, 1, "{label}");
+            assert_eq!(page.stats.diagnostics.missing_glyph_outlines, 0, "{label}");
+            assert!(page.is_complete(), "{label}");
+
+            let runs: Vec<_> = page
+                .display_list
+                .commands
+                .iter()
+                .filter_map(|cmd| match cmd {
+                    RenderCommand::DrawGlyphRun(run) => Some(run),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(runs.len(), 1, "{label}");
+            assert_eq!(runs[0].font_id, fid, "{label}");
+            assert_eq!(runs[0].glyphs.len(), 2, "{label}");
+            assert_eq!(
+                [runs[0].glyphs[0].glyph_id, runs[0].glyphs[1].glyph_id],
+                expected_gids,
+                "{label}: <41> and <0041> must match /ToUnicode strictly by source width"
+            );
+            assert!(
+                (runs[0].glyphs[0].advance - 7.0).abs() < 0.01
+                    && (runs[0].glyphs[1].advance - 9.2).abs() < 0.01,
+                "{label}: CID 36 (7.0pt) and CID 35 (9.2pt) PDF advances must be preserved"
+            );
+
+            let conv = zpdf::convert_pdf(&doc, &[0], Default::default()).unwrap();
+            assert_eq!(conv.pages[0].text.trim(), expected_text, "{label}");
+            assert_eq!(conv.pages[0].diagnostics.decode_failures, 0, "{label}");
+            assert!(conv.is_complete(), "{label}");
+        }
+    }
+}

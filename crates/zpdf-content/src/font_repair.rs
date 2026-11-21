@@ -233,13 +233,14 @@ impl FontRepair {
         let cmap = font.cid_cmap.as_ref();
         let mut offset = 0;
         for glyph in glyphs {
-            let Some((code, _, raw, end)) = next_text_code(cmap, composite, bytes, offset) else {
+            let Some((code, length, raw, end)) = next_text_code(cmap, composite, bytes, offset)
+            else {
                 break;
             };
             offset = end;
             // Every glyph still unknown is blank (see above).
             if blanks.known(glyph.glyph_id).is_none() {
-                let suspicious = font.blank_hides_text(code, raw);
+                let suspicious = font.blank_hides_text_with_length(code, raw, length as u8);
                 blanks.record(glyph.glyph_id, suspicious);
                 found |= suspicious;
             }
@@ -276,7 +277,7 @@ impl FontRepair {
             return None;
         }
         let font = cache.get(font_id)?;
-        let text = to_unicode(font, code, raw_code)?;
+        let text = to_unicode(font, code, raw_code, length)?;
         let original = code_glyph(font, code, length, raw_code)?;
         let mut found = None;
         for index in 0..self.scope.len() {
@@ -295,7 +296,7 @@ impl FontRepair {
                 || !sibling.has_font_data()
                 || sibling.is_type3()
                 || is_composite(sibling) != is_composite(font)
-                || to_unicode(sibling, code, raw_code) != Some(text)
+                || to_unicode(sibling, code, raw_code, length) != Some(text)
             {
                 continue;
             }
@@ -706,9 +707,8 @@ fn decode_exactly<'b>(
     Some(codes)
 }
 
-fn to_unicode(font: &LoadedFont, code: u32, raw_code: u32) -> Option<&str> {
-    let map = font.to_unicode.as_ref()?;
-    map.lookup(raw_code).or_else(|| map.lookup(code))
+fn to_unicode(font: &LoadedFont, code: u32, raw_code: u32, length: u8) -> Option<&str> {
+    font.lookup_to_unicode(code, raw_code, length)
 }
 
 fn is_composite(font: &LoadedFont) -> bool {

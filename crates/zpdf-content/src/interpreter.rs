@@ -5922,6 +5922,11 @@ impl<'a> ContentInterpreter<'a> {
                     }
                 };
                 i += len.max(1);
+                let raw_end = i.min(bytes.len());
+                let raw_len = (raw_end - start) as u8;
+                let raw_code = bytes[start..raw_end]
+                    .iter()
+                    .fold(0u32, |value, &byte| (value << 8) | byte as u32);
                 if let Some(evidence) = evidence.as_deref_mut() {
                     evidence.insert(code);
                 }
@@ -5932,9 +5937,6 @@ impl<'a> ContentInterpreter<'a> {
                     let cid = cmap.map(|c| c.code_to_cid(code, len as u8)).unwrap_or(code);
                     let cid = u16::try_from(cid).unwrap_or(0);
                     let glyph_id = if direct_gid {
-                        let raw_code = bytes[start..i.min(bytes.len())]
-                            .iter()
-                            .fold(0u32, |value, &byte| (value << 8) | byte as u32);
                         font.composite_direct_gid(code, raw_code, len as u8)
                             .unwrap_or(0)
                     } else {
@@ -5967,7 +5969,8 @@ impl<'a> ContentInterpreter<'a> {
                     column = (column.0.min(-vx), column.1.max(-vx + width));
                     glyphs.push(PositionedGlyph {
                         glyph_id,
-                        code,
+                        code_len: raw_len,
+                        code: raw_code,
                         x: -vx,
                         y: x_offset - vy,
                         advance,
@@ -5980,7 +5983,8 @@ impl<'a> ContentInterpreter<'a> {
                     let advance = adv_units as f32 * scale_factor * h_scale;
                     glyphs.push(PositionedGlyph {
                         glyph_id,
-                        code,
+                        code_len: raw_len,
+                        code: raw_code,
                         x: x_offset,
                         y: 0.0,
                         advance,
@@ -6029,6 +6033,7 @@ impl<'a> ContentInterpreter<'a> {
                 previous = Some((byte, (glyph_id, advance)));
                 glyphs.push(PositionedGlyph {
                     glyph_id,
+                    code_len: 1,
                     code: code as u32,
                     x: x_offset,
                     y: 0.0,
@@ -9059,6 +9064,7 @@ mod tests {
         let glyphs = vec![
             PositionedGlyph {
                 glyph_id: 26,
+                code_len: 0,
                 code: 0,
                 x: 0.0,
                 y: 0.0,
@@ -9066,6 +9072,7 @@ mod tests {
             },
             PositionedGlyph {
                 glyph_id: 42,
+                code_len: 0,
                 code: 0,
                 x: 50.0,
                 y: 0.0,

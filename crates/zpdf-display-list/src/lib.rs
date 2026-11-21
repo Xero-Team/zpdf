@@ -264,9 +264,14 @@ pub struct GlyphRun {
 #[derive(Debug, Clone, Copy)]
 pub struct PositionedGlyph {
     pub glyph_id: u16,
-    /// Source character code from the PDF string (before CID/CMap mapping).
-    /// `/ToUnicode` CMaps are keyed by this, not by the glyph id; exporters
-    /// that only need outlines can ignore it.
+    /// Source byte length of `code` in the PDF text string (1–4, or 0 when
+    /// unspecified by a synthetic caller). Fits in the alignment padding after
+    /// `glyph_id` without increasing struct size.
+    pub code_len: u8,
+    /// Raw big-endian source character code bytes from the PDF string (before
+    /// CID/CMap mapping). `/ToUnicode` CMaps are keyed by these packed source
+    /// bytes, not by the glyph id; exporters that only need outlines can ignore
+    /// it.
     pub code: u32,
     pub x: f32,
     pub y: f32,

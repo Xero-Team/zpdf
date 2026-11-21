@@ -134,6 +134,24 @@ impl ToUnicodeMap {
         self.padded_lengths.get(&code).copied()
     }
 
+    /// Actual source byte length of a mapped key in this `/ToUnicode` table:
+    /// `padded_length(code)` when written with leading zero bytes (`<0041>` → 2),
+    /// otherwise the code's natural non-zero byte width (`<41>` → 1, `<4E2D>` → 2).
+    pub fn source_length(&self, code: u32) -> Option<u8> {
+        if !self.map.contains_key(&code) {
+            return None;
+        }
+        let natural = (4 - code.leading_zeros() / 8).max(1) as u8;
+        Some(self.padded_lengths.get(&code).copied().unwrap_or(natural))
+    }
+
+    /// Look up the Unicode string mapped to `code` only when its `/ToUnicode`
+    /// source key has exact byte width `length`.
+    pub fn lookup_with_length(&self, code: u32, length: u8) -> Option<&str> {
+        self.lookup(code)
+            .filter(|_| self.source_length(code) == Some(length))
+    }
+
     fn record_code_length(&mut self, len: u8) {
         if (1..=4).contains(&len) && !self.code_lengths.contains(&len) {
             self.code_lengths.push(len);

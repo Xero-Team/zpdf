@@ -56,11 +56,11 @@ pub(crate) enum GlyphState {
 }
 
 impl GlyphState {
-    fn usable(self, font: &LoadedFont, code: u32, raw_code: u32) -> bool {
+    fn usable(self, font: &LoadedFont, code: u32, raw_code: u32, length: u8) -> bool {
         match self {
             GlyphState::Missing => false,
             GlyphState::Drawn => true,
-            GlyphState::Blank => !font.blank_hides_text(code, raw_code),
+            GlyphState::Blank => !font.blank_hides_text_with_length(code, raw_code, length),
         }
     }
 }
@@ -183,6 +183,16 @@ impl LoadedFont {
                 .is_some_and(is_visible_text)
     }
 
+    /// Source-width-aware [`Self::blank_hides_text`], matching composite
+    /// `/ToUnicode` keys by their actual byte length.
+    #[doc(hidden)]
+    pub fn blank_hides_text_with_length(&self, code: u32, raw_code: u32, length: u8) -> bool {
+        !self.is_substitute
+            && self
+                .lookup_to_unicode(code, raw_code, length)
+                .is_some_and(is_visible_text)
+    }
+
     /// Whether every `(glyph id, code, raw code, code length)` draws what the
     /// code means: a glyph with an outline, or a blank glyph only where the
     /// font's own meaning for the code (`/ToUnicode`, else its CMap or
@@ -296,10 +306,7 @@ impl LoadedFont {
     /// [`blank_is_space`], private-use characters (such as icon-font symbols)
     /// are NOT excused when their outline is missing.
     fn code_requires_no_ink(&self, code: u32, raw_code: u32, length: u8) -> bool {
-        let text = self
-            .to_unicode
-            .as_ref()
-            .and_then(|map| map.lookup(raw_code).or_else(|| map.lookup(code)));
+        let text = self.lookup_to_unicode(code, raw_code, length);
         match text {
             Some(text) => !text.is_empty() && text.chars().all(is_no_ink_char),
             None => self
@@ -318,11 +325,7 @@ impl LoadedFont {
         raw_code: u32,
         length: u8,
     ) -> Option<bool> {
-        if let Some(text) = self
-            .to_unicode
-            .as_ref()
-            .and_then(|map| map.lookup(raw_code).or_else(|| map.lookup(code)))
-        {
+        if let Some(text) = self.lookup_to_unicode(code, raw_code, length) {
             if !text.is_empty() {
                 return Some(is_visible_text(text));
             }
@@ -382,10 +385,7 @@ impl LoadedFont {
     }
 
     fn fallback_character(&self, code: u32, raw_code: u32, length: u8) -> Option<FontCharacter> {
-        let text = self
-            .to_unicode
-            .as_ref()
-            .and_then(|mapping| mapping.lookup(raw_code).or_else(|| mapping.lookup(code)));
+        let text = self.lookup_to_unicode(code, raw_code, length);
         // A ToUnicode string that is not one character (`fi`) still leaves the
         // font's own identity for the code; it is never cut to its first scalar.
         let character = if let Some(character) = text.and_then(FontCharacter::from_text) {
@@ -1126,7 +1126,7 @@ impl FontCache {
                         .glyphs
                         .binary_search_by_key(&glyph, |(gid, _)| *gid)
                         .ok()?;
-                    Some(entry.glyphs[index].1.usable(font, code, raw_code))
+                    Some(entry.glyphs[index].1.usable(font, code, raw_code, length))
                 });
                 match known {
                     Some(false) => return Err(()),
@@ -1189,7 +1189,7 @@ impl FontCache {
                     state
                 }
             };
-            if !state.usable(font, code, raw_code) {
+            if !state.usable(font, code, raw_code, length) {
                 usable_all = false;
                 break;
             }
@@ -1261,7 +1261,7 @@ impl FontCache {
         };
         if provider
             .glyph_state(font, original.glyph_id)
-            .usable(font, code, raw_code)
+            .usable(font, code, raw_code, length)
         {
             let character = font
                 .is_substitute

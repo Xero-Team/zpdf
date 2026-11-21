@@ -1365,6 +1365,7 @@ mod tests {
             font_size: 12.0,
             glyphs: vec![PositionedGlyph {
                 glyph_id: 1,
+                code_len: 1,
                 code: 65,
                 x: 0.0,
                 y: 0.0,
@@ -1814,6 +1815,7 @@ mod tests {
             font_size: 12.0,
             glyphs: vec![PositionedGlyph {
                 glyph_id: 1,
+                code_len: 0,
                 code: 0,
                 x: 0.0,
                 y: 0.0,
