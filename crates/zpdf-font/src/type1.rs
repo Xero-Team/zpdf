@@ -145,6 +145,38 @@ impl Type1Font {
         self.name_to_gid.get(name).copied()
     }
 
+    /// Whether sampled non-space charstrings decode into usable outlines rather
+    /// than failing or producing empty output across the whole font.
+    pub fn has_usable_outlines(&self) -> bool {
+        let non_blank: Vec<&str> = self
+            .gid_to_name
+            .iter()
+            .map(String::as_str)
+            .filter(|name| !matches!(*name, "" | ".notdef" | "space" | "nbspace" | "uni00A0"))
+            .collect();
+        if non_blank.is_empty() {
+            return true;
+        }
+        let step = (non_blank.len() / 32).max(1);
+        let mut drawn = 0u32;
+        let mut failed = 0u32;
+        let mut i = 0;
+        while i < non_blank.len() {
+            let name = non_blank[i];
+            if let Some(cs) = self.char_strings.get(name) {
+                let mut interp = Interp::new();
+                interp.run(cs, &self.subrs, 0);
+                if interp.failed {
+                    failed += 1;
+                } else if interp.seac.is_some() || !interp.cmds.is_empty() {
+                    drawn += 1;
+                }
+            }
+            i += step;
+        }
+        drawn > 0 && failed <= drawn
+    }
+
     /// Built-in encoding glyph name for a character code.
     pub fn builtin_name(&self, code: u8) -> Option<&str> {
         self.builtin_encoding

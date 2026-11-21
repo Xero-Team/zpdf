@@ -46,6 +46,9 @@ pub struct ContentInterpreter<'a> {
     /// (see [`Self::with_shared_fonts`]).
     shared_font_doc: Option<&'a zpdf_document::PdfDocument>,
     current_font_id: Option<zpdf_font::FontId>,
+    /// Font IDs whose embedded-program fallback diagnostics have already been
+    /// merged into `self.stats.diagnostics` during this interpretation.
+    reported_font_fallbacks: Vec<zpdf_font::FontId>,
     file: Option<&'a PdfFile>,
     resources: Option<&'a ResourceDict>,
     image_cache: Option<&'a mut ImageCache>,
@@ -748,6 +751,7 @@ impl<'a> ContentInterpreter<'a> {
             font_cache: None,
             shared_font_doc: None,
             current_font_id: None,
+            reported_font_fallbacks: Vec::new(),
             file: None,
             resources: None,
             image_cache: None,
@@ -4810,7 +4814,7 @@ impl<'a> ContentInterpreter<'a> {
             // A font entry is normally an indirect reference; a synthesized
             // form-field appearance may instead carry an inline font dict.
             let load_into = |fc: &mut FontCache, target: &str| -> Result<(), zpdf_core::Error> {
-                let font = match obj {
+                let (font, diagnostics) = match obj {
                     PdfObject::Ref(font_ref) => {
                         return load_font_ref(
                             shared_doc,
@@ -4822,7 +4826,7 @@ impl<'a> ContentInterpreter<'a> {
                         );
                     }
                     PdfObject::Dict(font_dict) => {
-                        zpdf_document::font_loader::load_single_font_dict_with_provider(
+                        zpdf_document::font_loader::load_single_font_dict_with_diagnostics(
                             file,
                             font_dict,
                             fc.provider().map(|provider| provider.as_ref()),
@@ -4830,9 +4834,13 @@ impl<'a> ContentInterpreter<'a> {
                     }
                     _ => return Ok(()),
                 };
-                fc.try_insert_with_limit(target.to_string(), font, max_font_bytes)
-                    .map(|_| ())
-                    .ok_or_else(|| font_cache_full(max_font_bytes))
+                let fid = fc
+                    .try_insert_with_limit(target.to_string(), font, max_font_bytes)
+                    .ok_or_else(|| font_cache_full(max_font_bytes))?;
+                if !diagnostics.is_complete() {
+                    fc.record_embedded_fallback(fid, diagnostics);
+                }
+                Ok(())
             };
 
             match obj {
@@ -5593,9 +5601,24 @@ impl<'a> ContentInterpreter<'a> {
     }
 
     fn show_text(&mut self, bytes: &[u8]) {
-        if !bytes.is_empty() && self.current_font_id.is_none() && !self.oc_suppressed() {
-            self.stats.diagnostics.missing_resources =
-                self.stats.diagnostics.missing_resources.saturating_add(1);
+        if !bytes.is_empty() && !self.oc_suppressed() {
+            if let Some(fid) = self.current_font_id {
+                if self.current.render_mode != 3 {
+                    if let Some(diag) = self
+                        .font_cache
+                        .as_ref()
+                        .and_then(|fc| fc.embedded_fallback(fid))
+                    {
+                        if !self.reported_font_fallbacks.contains(&fid) {
+                            self.reported_font_fallbacks.push(fid);
+                            self.stats.diagnostics.merge(diag);
+                        }
+                    }
+                }
+            } else {
+                self.stats.diagnostics.missing_resources =
+                    self.stats.diagnostics.missing_resources.saturating_add(1);
+            }
         }
         let tm = self.text_matrix;
         let ctm = self.current.ctm;
@@ -6745,23 +6768,32 @@ fn load_font_ref(
                 _ => false,
             }
     });
-    let inserted = match shared {
+    let (inserted, diagnostics) = match shared {
         Some(doc) => {
-            let font = doc.shared_font(font_ref)?;
-            fc.try_insert_shared_with_limit(name.to_string(), font, max_bytes)
+            let (font, diagnostics) = doc.shared_font_with_diagnostics(font_ref)?;
+            (
+                fc.try_insert_shared_with_limit(name.to_string(), font, max_bytes),
+                diagnostics,
+            )
         }
         None => {
-            let font = zpdf_document::font_loader::load_single_font_with_provider(
-                file,
-                font_ref,
-                fc.provider().map(|provider| provider.as_ref()),
-            )?;
-            fc.try_insert_with_limit(name.to_string(), font, max_bytes)
+            let (font, diagnostics) =
+                zpdf_document::font_loader::load_single_font_with_diagnostics(
+                    file,
+                    font_ref,
+                    fc.provider().map(|provider| provider.as_ref()),
+                )?;
+            (
+                fc.try_insert_with_limit(name.to_string(), font, max_bytes),
+                diagnostics,
+            )
         }
     };
-    inserted
-        .map(|_| ())
-        .ok_or_else(|| font_cache_full(max_bytes))
+    let fid = inserted.ok_or_else(|| font_cache_full(max_bytes))?;
+    if !diagnostics.is_complete() {
+        fc.record_embedded_fallback(fid, diagnostics);
+    }
+    Ok(())
 }
 
 /// Content key for an inline font dictionary: the same dictionary always

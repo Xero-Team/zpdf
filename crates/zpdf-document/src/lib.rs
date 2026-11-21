@@ -76,7 +76,7 @@ pub struct PdfDocument {
 /// checked against.
 #[derive(Default)]
 pub(crate) struct SharedFonts {
-    fonts: HashMap<ObjectId, Arc<LoadedFont>>,
+    fonts: HashMap<ObjectId, (Arc<LoadedFont>, zpdf_core::ProcessingDiagnostics)>,
     budget: FontCacheBudget,
     generation: Option<u64>,
 }
@@ -88,18 +88,23 @@ impl SharedFonts {
     pub(crate) fn refresh_provider(&mut self, generation: Option<u64>) {
         if self.generation != generation {
             self.fonts
-                .retain(|_, font| !font.is_substitute && font.has_font_data());
+                .retain(|_, (font, _)| !font.is_substitute && font.has_font_data());
             let mut budget = FontCacheBudget::default();
             self.fonts
-                .retain(|_, font| budget.try_admit(font, u64::MAX));
+                .retain(|_, (font, _)| budget.try_admit(font, u64::MAX));
             self.budget = budget;
             self.generation = generation;
         }
     }
     /// The font parsed for `id` by an earlier page of this document, if it was
-    /// retained.
-    pub(crate) fn get(&self, id: ObjectId) -> Option<Arc<LoadedFont>> {
-        self.fonts.get(&id).map(Arc::clone)
+    /// retained, together with any embedded-font fallback diagnostics.
+    pub(crate) fn get(
+        &self,
+        id: ObjectId,
+    ) -> Option<(Arc<LoadedFont>, zpdf_core::ProcessingDiagnostics)> {
+        self.fonts
+            .get(&id)
+            .map(|(font, diag)| (Arc::clone(font), *diag))
     }
 
     /// Retain `font` for the rest of the document when the shared budget allows,
@@ -109,16 +114,17 @@ impl SharedFonts {
         &mut self,
         id: ObjectId,
         font: LoadedFont,
+        diagnostics: zpdf_core::ProcessingDiagnostics,
         max_bytes: u64,
-    ) -> Arc<LoadedFont> {
+    ) -> (Arc<LoadedFont>, zpdf_core::ProcessingDiagnostics) {
         if let Some(existing) = self.get(id) {
             return existing;
         }
         let font = Arc::new(font);
         if self.budget.try_admit(&font, max_bytes) {
-            self.fonts.insert(id, Arc::clone(&font));
+            self.fonts.insert(id, (Arc::clone(&font), diagnostics));
         }
-        font
+        (font, diagnostics)
     }
 }
 
@@ -281,6 +287,15 @@ impl PdfDocument {
     /// Uses this document's font provider, which is also the provider
     /// [`Self::load_page_fonts`] attaches to the page caches it builds.
     pub fn shared_font(&self, font_ref: ObjectId) -> Result<Arc<LoadedFont>> {
+        Ok(self.shared_font_with_diagnostics(font_ref)?.0)
+    }
+
+    /// Like [`Self::shared_font`], also returning any embedded-font fallback
+    /// diagnostics associated with `font_ref`.
+    pub fn shared_font_with_diagnostics(
+        &self,
+        font_ref: ObjectId,
+    ) -> Result<(Arc<LoadedFont>, zpdf_core::ProcessingDiagnostics)> {
         font_loader::load_shared_font(
             &self.file,
             font_ref,
@@ -488,13 +503,14 @@ mod tests {
         let first_cost = make_font().estimated_cache_bytes();
         let total = first_cost * 2 - data.len() as u64;
         let mut shared = SharedFonts::default();
-        shared.admit(ObjectId(1, 0), make_font(), first_cost - 1);
+        let clean = zpdf_core::ProcessingDiagnostics::default();
+        shared.admit(ObjectId(1, 0), make_font(), clean, first_cost - 1);
         assert!(shared.get(ObjectId(1, 0)).is_none());
-        let first = shared.admit(ObjectId(1, 0), make_font(), first_cost);
-        assert!(Arc::ptr_eq(&first, &shared.get(ObjectId(1, 0)).unwrap()));
-        shared.admit(ObjectId(2, 0), make_font(), total - 1);
+        let (first, _) = shared.admit(ObjectId(1, 0), make_font(), clean, first_cost);
+        assert!(Arc::ptr_eq(&first, &shared.get(ObjectId(1, 0)).unwrap().0));
+        shared.admit(ObjectId(2, 0), make_font(), clean, total - 1);
         assert!(shared.get(ObjectId(2, 0)).is_none());
-        shared.admit(ObjectId(2, 0), make_font(), total);
+        shared.admit(ObjectId(2, 0), make_font(), clean, total);
         assert_eq!(shared.budget.bytes_used(), total);
         shared.refresh_provider(Some(1));
         assert_eq!(shared.fonts.len(), 2);

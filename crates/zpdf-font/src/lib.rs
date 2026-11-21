@@ -811,6 +811,115 @@ impl LoadedFont {
         fail as f32 / total as f32
     }
 
+    /// Whether an embedded font program parsed into usable outline tables.
+    ///
+    /// Returns `false` when neither `ttf-parser` nor the Type 1 parser accepted
+    /// the bytes, when an sfnt/OTF program carries no parseable outline table
+    /// (`glyf`, `CFF `, or `CFF2`), or when more than half of non-blank sampled
+    /// glyphs fail to outline due to corrupt glyph data. Valid empty glyphs
+    /// (such as space or zero-length CAD `loca` entries) are treated as usable.
+    pub fn has_usable_embedded_outlines(&self) -> bool {
+        if self.is_type3() || self.is_substitute {
+            return true;
+        }
+        if let Some(t1) = &self.type1 {
+            return t1.has_usable_outlines();
+        }
+        let Some(data) = &self.font_data else {
+            return false;
+        };
+        let Ok(mut face) = ttf_parser::Face::parse(data, self.face_index) else {
+            return false;
+        };
+        self.apply_variations(&mut face);
+        if face.tables().glyf.is_none()
+            && face.tables().cff.is_none()
+            && face.tables().cff2.is_none()
+        {
+            return false;
+        }
+
+        let (mut drawn, mut unreadable) = (0u32, 0u32);
+        let probe = |gid: u16, drawn: &mut u32, unreadable: &mut u32| {
+            match resolution::physical_glyph_state(&face, gid) {
+                resolution::GlyphState::Drawn => *drawn += 1,
+                resolution::GlyphState::Missing => *unreadable += 1,
+                resolution::GlyphState::Blank => {}
+            }
+        };
+
+        let mapped_gids: Vec<u16> = self
+            .cid_to_gid
+            .as_ref()
+            .map(|map| {
+                let mut gids: Vec<u16> = map.values().copied().filter(|&g| g != 0).collect();
+                gids.sort_unstable();
+                gids.dedup();
+                gids
+            })
+            .unwrap_or_default();
+
+        if !mapped_gids.is_empty() {
+            let step = (mapped_gids.len() / 64).max(1);
+            let mut non_empty_records = 0u32;
+            let mut i = 0;
+            while i < mapped_gids.len() {
+                let g = mapped_gids[i];
+                if face.tables().glyf.is_some() && resolution::glyf_has_non_empty_record(&face, g) {
+                    non_empty_records += 1;
+                }
+                probe(g, &mut drawn, &mut unreadable);
+                i += step;
+            }
+            if drawn == 0 && non_empty_records > 0 {
+                return false;
+            }
+        } else {
+            let num_glyphs = face
+                .tables()
+                .cff
+                .as_ref()
+                .map(|cff| cff.number_of_glyphs())
+                .unwrap_or_else(|| face.number_of_glyphs());
+            if num_glyphs <= 1 {
+                let mut builder = OutlineBuilder::new();
+                if face
+                    .outline_glyph(ttf_parser::GlyphId(0), &mut builder)
+                    .is_some()
+                {
+                    return true;
+                }
+                return resolution::readable_glyph(&face, 0);
+            }
+            let count = (num_glyphs as usize) - 1;
+            let step = (count / 64).max(1);
+            let mut gid = 1usize;
+            while gid < num_glyphs as usize {
+                probe(gid as u16, &mut drawn, &mut unreadable);
+                gid += step;
+            }
+            if drawn == 0 && unreadable == 0 && face.tables().glyf.is_some() {
+                let mut non_empty_records = 0u32;
+                let mut found = 0usize;
+                for g in 1..num_glyphs {
+                    if resolution::glyf_has_non_empty_record(&face, g) {
+                        non_empty_records += 1;
+                        probe(g, &mut drawn, &mut unreadable);
+                        found += 1;
+                        if found >= 64 {
+                            break;
+                        }
+                    }
+                }
+                if non_empty_records > 0 && drawn == 0 {
+                    return false;
+                }
+            }
+        }
+
+        !(unreadable > 0 && unreadable > drawn)
+    }
+
     /// Get glyph advance width.
     ///
     /// Returns width in the font's native unit system:
@@ -964,6 +1073,21 @@ impl LoadedFont {
         // face's glyph ids are unrelated to PDF codes, so it never does this.
         if face.tables().cmap.is_none() && face.tables().glyf.is_some() && !self.is_substitute {
             return (code < face.number_of_glyphs()).then_some(code);
+        }
+
+        // For a substituted simple font whose /Encoding used custom subset glyph
+        // names (or was absent on a symbolic subset), recover the glyph through
+        // /ToUnicode against the substitute face's Unicode cmap.
+        if self.is_substitute {
+            if let Some(gid) = self
+                .to_unicode
+                .as_ref()
+                .and_then(|map| map.lookup(code as u32))
+                .and_then(FontCharacter::from_text)
+                .and_then(|ch| ch.mapped_glyph_index(&face))
+            {
+                return Some(gid);
+            }
         }
 
         // 4. Only an unspecified encoding permits the Latin-1 fallback. A
@@ -2065,6 +2189,10 @@ pub struct FontCache {
     budget: FontCacheBudget,
     provider: Option<Arc<FontProvider>>,
     resolution: Option<Box<resolution::ResolutionCache>>,
+    /// Per-font diagnostics for embedded font programs that failed to decode or
+    /// parse and fell back to substitution or metrics-only mode. Empty maps
+    /// allocate nothing, so normal pages pay zero overhead.
+    embedded_fallbacks: HashMap<FontId, zpdf_core::ProcessingDiagnostics>,
 }
 
 impl FontCache {
@@ -2082,7 +2210,49 @@ impl FontCache {
             budget: FontCacheBudget::default(),
             provider: None,
             resolution: None,
+            embedded_fallbacks: HashMap::new(),
         }
+    }
+
+    /// Record fallback diagnostics associated with `id` when its embedded font
+    /// program failed to decode or parse.
+    pub fn record_embedded_fallback(
+        &mut self,
+        id: FontId,
+        diagnostics: zpdf_core::ProcessingDiagnostics,
+    ) {
+        if diagnostics.is_complete() {
+            return;
+        }
+        self.embedded_fallbacks
+            .entry(id)
+            .and_modify(|existing| existing.merge(diagnostics))
+            .or_insert(diagnostics);
+    }
+
+    /// Diagnostics recorded for `id` when its embedded font program failed and
+    /// fell back, or `None` for valid embedded and normal non-embedded fonts.
+    pub fn embedded_fallback(&self, id: FontId) -> Option<zpdf_core::ProcessingDiagnostics> {
+        if self.embedded_fallbacks.is_empty() {
+            return None;
+        }
+        self.embedded_fallbacks.get(&id).copied()
+    }
+
+    /// Aggregate diagnostics across all fonts in this cache whose embedded
+    /// programs failed to decode or parse.
+    pub fn diagnostics(&self) -> zpdf_core::ProcessingDiagnostics {
+        let mut all = zpdf_core::ProcessingDiagnostics::default();
+        if !self.embedded_fallbacks.is_empty() {
+            let mut ids: Vec<FontId> = self.embedded_fallbacks.keys().copied().collect();
+            ids.sort_unstable();
+            for id in ids {
+                if let Some(&diag) = self.embedded_fallbacks.get(&id) {
+                    all.merge(diag);
+                }
+            }
+        }
+        all
     }
 
     /// Carry the document's provider into nested Form XObject font loading.

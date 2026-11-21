@@ -12,6 +12,9 @@ pub struct ProcessingDiagnostics {
     pub missing_resources: u32,
     pub unsupported_features: u32,
     pub malformed_content: u32,
+    /// Embedded font programs that failed to decode or parse and fell back to a
+    /// substitute (or metrics-only fallback). Normal non-embedded fonts are not counted.
+    pub embedded_font_fallbacks: u32,
     /// Zero-based first affected page, populated by high-level APIs.
     pub first_affected_page: Option<usize>,
     /// First failed indirect object, when the failing operation has one.
@@ -25,6 +28,7 @@ impl ProcessingDiagnostics {
             && self.missing_resources == 0
             && self.unsupported_features == 0
             && self.malformed_content == 0
+            && self.embedded_font_fallbacks == 0
     }
     pub fn ensure_complete(&self) -> Result<()> {
         if self.is_complete() {
@@ -48,6 +52,9 @@ impl ProcessingDiagnostics {
         self.malformed_content = self
             .malformed_content
             .saturating_add(other.malformed_content);
+        self.embedded_font_fallbacks = self
+            .embedded_font_fallbacks
+            .saturating_add(other.embedded_font_fallbacks);
     }
     pub fn record_decode_failure(&mut self, error: &Error) {
         self.decode_failures = self.decode_failures.saturating_add(1);
@@ -63,6 +70,12 @@ impl ProcessingDiagnostics {
         self.record_decode_failure(error);
         self.first_failed_object.get_or_insert(id);
     }
+    pub fn record_embedded_font_fallback(&mut self, id: Option<crate::ObjectId>) {
+        self.embedded_font_fallbacks = self.embedded_font_fallbacks.saturating_add(1);
+        if let Some(id) = id {
+            self.first_failed_object.get_or_insert(id);
+        }
+    }
     pub fn set_page(&mut self, index: usize) {
         if !self.is_complete() {
             self.first_affected_page.get_or_insert(index);
@@ -77,15 +90,16 @@ impl ProcessingDiagnostics {
         let object = self
             .first_failed_object
             .map_or_else(|| "null".into(), |id| format!("[{},{}]", id.0, id.1));
-        format!("{{\"complete\":{},\"resource_limit_reached\":{},\"time_limit_reached\":{},\"decode_failures\":{},\"missing_resources\":{},\"unsupported_features\":{},\"malformed_content\":{},\"first_affected_page\":{page},\"first_failed_object\":{object}}}",
+        format!("{{\"complete\":{},\"resource_limit_reached\":{},\"time_limit_reached\":{},\"decode_failures\":{},\"missing_resources\":{},\"unsupported_features\":{},\"malformed_content\":{},\"embedded_font_fallbacks\":{},\"first_affected_page\":{page},\"first_failed_object\":{object}}}",
             self.is_complete(), self.resource_limit_reached, self.time_limit_reached, self.decode_failures,
-            self.missing_resources, self.unsupported_features, self.malformed_content)
+            self.missing_resources, self.unsupported_features, self.malformed_content, self.embedded_font_fallbacks)
     }
 }
 impl std::fmt::Display for ProcessingDiagnostics {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "resource_limit={} time_limit={} decode_failures={} missing_resources={} unsupported_features={} malformed_content={} first_page={:?} first_object={:?}",
+        write!(f, "resource_limit={} time_limit={} decode_failures={} missing_resources={} unsupported_features={} malformed_content={} embedded_font_fallbacks={} first_page={:?} first_object={:?}",
             self.resource_limit_reached, self.time_limit_reached, self.decode_failures,
-            self.missing_resources, self.unsupported_features, self.malformed_content, self.first_affected_page, self.first_failed_object)
+            self.missing_resources, self.unsupported_features, self.malformed_content,
+            self.embedded_font_fallbacks, self.first_affected_page, self.first_failed_object)
     }
 }

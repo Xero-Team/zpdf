@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Rendering and font recovery
+
+- Fall back to the descriptor-based substitute font path when an embedded font
+  program (`FontFile`, `FontFile2`, or `FontFile3`, simple or Type 0 / CID)
+  fails to decode, fails to parse, or has unreadable glyph outlines, keeping
+  PDF glyph placement (`/Widths`, `/W`, `/DW`, `/W2`, `/DW2`) instead of
+  rendering invisible text. Honour `/FontWeight` and `/ItalicAngle` alongside
+  `/Flags` and `/StemV` when selecting substitutes, and record fallbacks in
+  `ProcessingDiagnostics::embedded_font_fallbacks` (leaving valid embedded and
+  normal non-embedded fonts unaffected). (#157)
+
 ## 0.21.0 — Glyph-level selection and rendering compatibility
 
 Released 2026-11-21.
