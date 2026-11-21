@@ -345,10 +345,10 @@ impl<'a> RenderBackend for WgpuRenderer<'a> {
             )));
         }
 
-        // Pre-quantize the background channel-wise so the cleared bytes equal the
-        // CPU's `(c * 255) as u8` background fill byte-for-byte.
+        // Round the background channels so an opaque clear matches an opaque
+        // GPU fill of the same colour and the CPU's background bytes.
         let bg = &info.background;
-        let q = |v: f32| (((v.clamp(0.0, 1.0) * 255.0) as u8) as f64) / 255.0;
+        let q = |v: f32| ((v.clamp(0.0, 1.0) * 255.0).round() as u8) as f64 / 255.0;
         let clear = wgpu::Color {
             r: q(bg.r),
             g: q(bg.g),
