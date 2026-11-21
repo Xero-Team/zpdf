@@ -12,7 +12,7 @@ use zpdf_content::interpreter::ContentInterpreter;
 use zpdf_content::output_intent_cmyk_profile;
 use zpdf_core::{Matrix, Result};
 use zpdf_display_list::RenderCommand;
-use zpdf_document::{DocInfo, PdfDocument, StructTree, XmpMetadata};
+use zpdf_document::{DocInfo, PdfDocument, XmpMetadata};
 use zpdf_image::{DecodedImage, ImageCache};
 
 /// Content retained by [`convert_pdf`].
@@ -90,10 +90,10 @@ impl ConvertedDocument {
         all
     }
     pub fn is_complete(&self) -> bool {
-        self.diagnostics().is_complete()
+        self.diagnostics().is_text_complete()
     }
     pub fn ensure_complete(&self) -> Result<()> {
-        self.diagnostics().ensure_complete()
+        self.diagnostics().ensure_text_complete()
     }
 }
 
@@ -114,10 +114,13 @@ pub fn convert_pdf(
     options: ConversionOptions,
 ) -> Result<ConvertedDocument> {
     let rich = options.mode == ConversionMode::Rich;
-    let struct_tree: Option<StructTree> = if options.use_structure {
-        doc.struct_tree()
+    let (struct_tree, struct_streams) = if options.use_structure {
+        match doc.struct_tree_with_streams() {
+            Some((tree, streams)) => (Some(tree), streams),
+            None => (None, zpdf_document::structure::StructTreeStreams::default()),
+        }
     } else {
-        None
+        (None, zpdf_document::structure::StructTreeStreams::default())
     };
     let page_labels = rich.then(|| doc.page_labels()).flatten();
     let oc_config = doc.oc_config();
@@ -138,6 +141,7 @@ pub fn convert_pdf(
         let mut fonts = doc.load_page_fonts(&page);
         let (content, mut diagnostics) = doc.page_content_with_diagnostics(&page)?;
         let mut spans = Vec::new();
+        let mut span_streams = Vec::new();
         let mut images = ImageCache::new();
 
         let output_intent = if rich {
@@ -170,6 +174,12 @@ pub fn convert_pdf(
         if let Some(oc) = &oc_config {
             interpreter = interpreter.with_optional_content(oc);
         }
+        if struct_tree.is_some() {
+            interpreter = interpreter.with_span_streams(&mut span_streams);
+        }
+        if let Some(mcids) = struct_streams.actual_text_mcids.get(&page_index) {
+            interpreter = interpreter.with_struct_actual_text_mcids(mcids.clone());
+        }
         if let Some(profile) = output_intent {
             interpreter = interpreter.with_output_intent_cmyk(profile);
         }
@@ -178,7 +188,13 @@ pub fn convert_pdf(
         diagnostics.set_page(page_index);
 
         let text = match &struct_tree {
-            Some(tree) => zpdf_content::text::struct_ordered_text(&spans, page_index, tree),
+            Some(tree) => zpdf_content::text::struct_ordered_text_with_streams(
+                &spans,
+                &span_streams,
+                page_index,
+                tree,
+                &struct_streams.kid_streams,
+            ),
             None => zpdf_content::text::spans_to_text(spans, 2.0),
         };
         retained_text_bytes = retained_text_bytes

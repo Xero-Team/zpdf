@@ -214,6 +214,57 @@ impl LoadedFont {
             })
     }
 
+    /// Whether every `(glyph id, code, raw code, code length)` draws a visible
+    /// outline from `self` or represents known whitespace/invisible text in
+    /// `meaning_font` (the logical PDF font carrying `/ToUnicode`, CMap, and
+    /// `/Encoding`). Used to distinguish complete embedded-font recovery from
+    /// missing visible output. Parses `self`'s face at most once per call.
+    #[doc(hidden)]
+    pub fn fallback_glyphs_complete(
+        &self,
+        meaning_font: &LoadedFont,
+        glyphs: impl IntoIterator<Item = (u16, u32, u32, u8)>,
+    ) -> bool {
+        let face = if self.is_type3() || self.type1.is_some() {
+            None
+        } else {
+            parsed_face(self)
+        };
+        glyphs
+            .into_iter()
+            .all(|(glyph_id, code, raw_code, length)| {
+                let state = match &face {
+                    Some(face) if glyph_id != 0 => self.face_glyph_state(glyph_id, face),
+                    Some(_) => GlyphState::Missing,
+                    None if self.is_type3() || self.type1.is_some() => self.glyph_state(glyph_id),
+                    None => GlyphState::Missing,
+                };
+                match state {
+                    GlyphState::Drawn => true,
+                    GlyphState::Blank | GlyphState::Missing => {
+                        meaning_font.code_requires_no_ink(code, raw_code, length)
+                    }
+                }
+            })
+    }
+
+    /// Whether this code is known to require no visible ink (whitespace,
+    /// control, format, or default-ignorable characters). Unlike
+    /// [`blank_is_space`], private-use characters (such as icon-font symbols)
+    /// are NOT excused when their outline is missing.
+    fn code_requires_no_ink(&self, code: u32, raw_code: u32, length: u8) -> bool {
+        let text = self
+            .to_unicode
+            .as_ref()
+            .and_then(|map| map.lookup(raw_code).or_else(|| map.lookup(code)));
+        match text {
+            Some(text) => !text.is_empty() && text.chars().all(is_no_ink_char),
+            None => self
+                .fallback_character(code, raw_code, length)
+                .is_some_and(|character| is_no_ink_char(character.character)),
+        }
+    }
+
     /// A blank glyph is right for this code: the font's meaning for it is
     /// known and is whitespace or invisible.
     fn blank_is_space(&self, code: u32, raw_code: u32, length: u8) -> bool {
@@ -309,7 +360,7 @@ pub(crate) fn usable_glyph(face: &ttf_parser::Face<'_>, gid: u16) -> bool {
     gid != 0 && readable_glyph(face, gid)
 }
 
-fn physical_glyph_state(face: &ttf_parser::Face<'_>, gid: u16) -> GlyphState {
+pub(crate) fn physical_glyph_state(face: &ttf_parser::Face<'_>, gid: u16) -> GlyphState {
     if gid == 0 || gid >= face.number_of_glyphs() {
         GlyphState::Missing
     } else if face
@@ -324,42 +375,52 @@ fn physical_glyph_state(face: &ttf_parser::Face<'_>, gid: u16) -> GlyphState {
     }
 }
 
+/// Characters known to require no visible ink: whitespace, controls, format
+/// characters, and default-ignorable code points. Excludes private-use scalars,
+/// which icon fonts routinely map to visible symbols.
+fn is_no_ink_char(character: char) -> bool {
+    character.is_whitespace()
+        || character.is_control()
+        || matches!(
+            character as u32,
+            0xAD | 0x34F
+                | 0x61C
+                | 0x115F..=0x1160
+                | 0x17B4..=0x17B5
+                | 0x180B..=0x180F
+                | 0x200B..=0x200F
+                | 0x202A..=0x202E
+                | 0x2060..=0x206F
+                | 0x2800
+                | 0x3164
+                | 0xFE00..=0xFE0F
+                | 0xFEFF
+                | 0xFFA0
+                | 0xFFF0..=0xFFF8
+                | 0x1BCA0..=0x1BCA3
+                | 0x1D173..=0x1D17A
+                | 0xE0000..=0xE0FFF
+        )
+}
+
+fn is_visible_char(character: char) -> bool {
+    !is_no_ink_char(character)
+        && !matches!(
+            character as u32,
+            0xE000..=0xF8FF | 0xF0000..=0xFFFFD | 0x100000..=0x10FFFD
+        )
+}
+
 /// Whether text names something visible: at least one character that is not
 /// whitespace, a control or format character, a default-ignorable code point,
 /// or private use (whose meaning belongs to one font).
 #[doc(hidden)]
 pub fn is_visible_text(text: &str) -> bool {
-    text.chars().any(|character| {
-        !character.is_whitespace()
-            && !character.is_control()
-            && !matches!(
-                character as u32,
-                0xAD | 0x34F
-                    | 0x61C
-                    | 0x115F..=0x1160
-                    | 0x17B4..=0x17B5
-                    | 0x180B..=0x180F
-                    | 0x200B..=0x200F
-                    | 0x202A..=0x202E
-                    | 0x2060..=0x206F
-                    | 0x2800
-                    | 0x3164
-                    | 0xFE00..=0xFE0F
-                    | 0xFEFF
-                    | 0xFFA0
-                    | 0xFFF0..=0xFFF8
-                    | 0x1BCA0..=0x1BCA3
-                    | 0x1D173..=0x1D17A
-                    | 0xE0000..=0xE0FFF
-                    | 0xE000..=0xF8FF
-                    | 0xF0000..=0xFFFFD
-                    | 0x100000..=0x10FFFD
-            )
-    })
+    text.chars().any(is_visible_char)
 }
 
 /// The glyph exists and its outline, possibly empty, is well formed.
-fn readable_glyph(face: &ttf_parser::Face<'_>, gid: u16) -> bool {
+pub(crate) fn readable_glyph(face: &ttf_parser::Face<'_>, gid: u16) -> bool {
     if gid >= face.number_of_glyphs() {
         return false;
     }
@@ -413,6 +474,386 @@ fn readable_glyph(face: &ttf_parser::Face<'_>, gid: u16) -> bool {
         return false;
     }
     start == end || (end - start >= 10 && glyf.get(start..start + 2) == Some(&[0, 0]))
+}
+
+/// Maximum work units spent scanning a font's `cmap` subtables across one
+/// `has_usable_embedded_outlines` probe. Exhausting the budget stops early and
+/// leaves the blank-glyph probe inconclusive rather than stalling page load.
+pub(crate) const CMAP_PROBE_BUDGET: usize = 4096;
+
+fn is_visible_scalar(cp: u32) -> bool {
+    char::from_u32(cp).is_some_and(is_visible_char)
+}
+
+fn spend_budget(budget: &mut usize) -> Result<(), ()> {
+    if *budget == 0 {
+        return Err(());
+    }
+    *budget -= 1;
+    Ok(())
+}
+
+fn read_u16_be(data: &[u8], offset: usize) -> Option<u16> {
+    Some(u16::from_be_bytes(
+        data.get(offset..offset + 2)?.try_into().ok()?,
+    ))
+}
+
+fn read_u32_be(data: &[u8], offset: usize) -> Option<u32> {
+    Some(u32::from_be_bytes(
+        data.get(offset..offset + 4)?.try_into().ok()?,
+    ))
+}
+
+/// Whether `[start..=end]` contains at least one visible Unicode scalar. Wide
+/// non-visible/invalid blocks are jumped in O(1) so even `[0..=u32::MAX]`
+/// completes within a few budget units.
+fn range_has_visible_scalar(start: u32, end: u32, budget: &mut usize) -> Result<bool, ()> {
+    let mut cp = start;
+    let hi = end.min(0x10_FFFF);
+    while cp <= hi {
+        spend_budget(budget)?;
+        cp = match cp {
+            0x0000..=0x0020 => 0x0021,
+            0x007F..=0x00A0 => 0x00A1,
+            0xD800..=0xF8FF => 0xF900,
+            0xE0000..=0xE0FFF => 0xE1000,
+            0xF0000..=0x10FFFD => 0x10FFFE,
+            _ => {
+                if is_visible_scalar(cp) {
+                    return Ok(true);
+                }
+                cp + 1
+            }
+        };
+    }
+    Ok(false)
+}
+
+/// Range-aware, budgeted check for whether any Unicode `cmap` subtable maps a
+/// visible scalar to `target_gid`. Returns `Err(())` when `budget` is exhausted
+/// (inconclusive), avoiding `ttf-parser`'s unbounded `Subtable::codepoints`
+/// range expansion.
+fn cmap_maps_visible_to_gid(
+    face: &ttf_parser::Face<'_>,
+    target_gid: u16,
+    budget: &mut usize,
+) -> Result<bool, ()> {
+    if target_gid == 0 {
+        return Ok(false);
+    }
+    let Some(cmap) = face.raw_face().table(ttf_parser::Tag::from_bytes(b"cmap")) else {
+        return Ok(false);
+    };
+    let Some(num_tables) = read_u16_be(cmap, 2) else {
+        return Ok(false);
+    };
+    for table_idx in 0..usize::from(num_tables) {
+        spend_budget(budget)?;
+        let rec = 4 + table_idx * 8;
+        let (Some(platform_id), Some(encoding_id), Some(offset)) = (
+            read_u16_be(cmap, rec),
+            read_u16_be(cmap, rec + 2),
+            read_u32_be(cmap, rec + 4),
+        ) else {
+            break;
+        };
+        let Some(subtable) = cmap.get(offset as usize..) else {
+            continue;
+        };
+        let Some(format) = read_u16_be(subtable, 0) else {
+            continue;
+        };
+        let is_unicode = match platform_id {
+            0 => true,
+            3 if encoding_id == 1 => true,
+            3 if encoding_id == 10 && matches!(format, 12 | 13) => true,
+            _ => false,
+        };
+        if !is_unicode {
+            continue;
+        }
+        match format {
+            0 => {
+                let Some(glyphs) = subtable.get(6..262) else {
+                    continue;
+                };
+                for (cp, &gid) in glyphs.iter().enumerate() {
+                    spend_budget(budget)?;
+                    if u16::from(gid) == target_gid && is_visible_scalar(cp as u32) {
+                        return Ok(true);
+                    }
+                }
+            }
+            4 => {
+                let Some(seg_count_x2) = read_u16_be(subtable, 6) else {
+                    continue;
+                };
+                if seg_count_x2 < 2 || seg_count_x2 % 2 != 0 {
+                    continue;
+                }
+                let seg_count = usize::from(seg_count_x2 / 2);
+                let end_base = 14usize;
+                let start_base = end_base + seg_count * 2 + 2;
+                let delta_base = start_base + seg_count * 2;
+                let iro_base = delta_base + seg_count * 2;
+                if subtable.len() < iro_base + seg_count * 2 {
+                    continue;
+                }
+                for seg in 0..seg_count {
+                    spend_budget(budget)?;
+                    let (Some(end), Some(start), Some(delta_u16), Some(iro)) = (
+                        read_u16_be(subtable, end_base + seg * 2),
+                        read_u16_be(subtable, start_base + seg * 2),
+                        read_u16_be(subtable, delta_base + seg * 2),
+                        read_u16_be(subtable, iro_base + seg * 2),
+                    ) else {
+                        break;
+                    };
+                    if start == 0xFFFF && end == 0xFFFF {
+                        break;
+                    }
+                    if start > end {
+                        continue;
+                    }
+                    if iro == 0 {
+                        let cp = target_gid.wrapping_sub(delta_u16);
+                        if cp >= start && cp <= end && is_visible_scalar(u32::from(cp)) {
+                            return Ok(true);
+                        }
+                    } else if iro != 0xFFFF {
+                        let delta_i16 = delta_u16 as i16;
+                        let iro_pos = (iro_base + seg * 2) as u16;
+                        for cp in start..=end {
+                            spend_budget(budget)?;
+                            let offset_bytes = (cp - start).wrapping_mul(2);
+                            let pos =
+                                usize::from(iro_pos.wrapping_add(offset_bytes).wrapping_add(iro));
+                            let Some(glyph_val) = read_u16_be(subtable, pos) else {
+                                break;
+                            };
+                            if glyph_val == 0 {
+                                continue;
+                            }
+                            let mapped = u16::try_from((glyph_val as i16).wrapping_add(delta_i16));
+                            if mapped == Ok(target_gid) && is_visible_scalar(u32::from(cp)) {
+                                return Ok(true);
+                            }
+                        }
+                    }
+                }
+            }
+            6 => {
+                let (Some(first_code), Some(entry_count)) =
+                    (read_u16_be(subtable, 6), read_u16_be(subtable, 8))
+                else {
+                    continue;
+                };
+                let count = usize::from(entry_count).min(subtable.len().saturating_sub(10) / 2);
+                for idx in 0..count {
+                    spend_budget(budget)?;
+                    let Some(gid) = read_u16_be(subtable, 10 + idx * 2) else {
+                        break;
+                    };
+                    if gid == target_gid && is_visible_scalar(u32::from(first_code) + idx as u32) {
+                        return Ok(true);
+                    }
+                }
+            }
+            10 => {
+                let (Some(start_cp), Some(num_chars)) =
+                    (read_u32_be(subtable, 12), read_u32_be(subtable, 16))
+                else {
+                    continue;
+                };
+                let count = (num_chars as usize).min(subtable.len().saturating_sub(20) / 2);
+                for idx in 0..count {
+                    spend_budget(budget)?;
+                    let Some(gid) = read_u16_be(subtable, 20 + idx * 2) else {
+                        break;
+                    };
+                    if gid == target_gid
+                        && start_cp
+                            .checked_add(idx as u32)
+                            .is_some_and(is_visible_scalar)
+                    {
+                        return Ok(true);
+                    }
+                }
+            }
+            12 => {
+                let Some(num_groups) = read_u32_be(subtable, 12) else {
+                    continue;
+                };
+                let count = (num_groups as usize).min(subtable.len().saturating_sub(16) / 12);
+                let target = u32::from(target_gid);
+                for g in 0..count {
+                    spend_budget(budget)?;
+                    let base = 16 + g * 12;
+                    let (Some(start_cp), Some(end_cp), Some(start_gid)) = (
+                        read_u32_be(subtable, base),
+                        read_u32_be(subtable, base + 4),
+                        read_u32_be(subtable, base + 8),
+                    ) else {
+                        break;
+                    };
+                    if start_cp > end_cp {
+                        continue;
+                    }
+                    if let Some(cp) = target
+                        .checked_sub(start_gid)
+                        .and_then(|delta| start_cp.checked_add(delta))
+                        .filter(|&cp| cp <= end_cp)
+                    {
+                        if is_visible_scalar(cp) {
+                            return Ok(true);
+                        }
+                    }
+                }
+            }
+            13 => {
+                let Some(num_groups) = read_u32_be(subtable, 12) else {
+                    continue;
+                };
+                let count = (num_groups as usize).min(subtable.len().saturating_sub(16) / 12);
+                let target = u32::from(target_gid);
+                for g in 0..count {
+                    spend_budget(budget)?;
+                    let base = 16 + g * 12;
+                    let (Some(start_cp), Some(end_cp), Some(glyph_id)) = (
+                        read_u32_be(subtable, base),
+                        read_u32_be(subtable, base + 4),
+                        read_u32_be(subtable, base + 8),
+                    ) else {
+                        break;
+                    };
+                    if start_cp > end_cp || glyph_id != target {
+                        continue;
+                    }
+                    if range_has_visible_scalar(start_cp, end_cp, budget)? {
+                        return Ok(true);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(false)
+}
+
+/// Whether a `GlyphState::Blank` glyph in a `glyf` face shows evidence of
+/// corruption (malformed header, oversized zeroed-out contour payload, or a
+/// zero-contour record hiding a visible character in the face's Unicode cmap).
+///
+/// Zero-length `loca` entries (`start == end`) and valid 10–12 byte zero-contour
+/// space headers return `false`. When `cmap_budget` is exhausted, the probe
+/// stops early and returns `false` (inconclusive).
+pub(crate) fn glyf_blank_is_corrupt(
+    face: &ttf_parser::Face<'_>,
+    gid: u16,
+    cmap_budget: &mut usize,
+) -> bool {
+    if face.tables().glyf.is_none() {
+        return false;
+    }
+    let raw = face.raw_face();
+    let Some(head) = raw.table(ttf_parser::Tag::from_bytes(b"head")) else {
+        return true;
+    };
+    let Some(loca) = raw.table(ttf_parser::Tag::from_bytes(b"loca")) else {
+        return true;
+    };
+    let Some(glyf) = raw.table(ttf_parser::Tag::from_bytes(b"glyf")) else {
+        return true;
+    };
+    let long = head.get(50..52) == Some(&[0, 1]);
+    let offset = |index: usize| -> Option<usize> {
+        if long {
+            Some(u32::from_be_bytes(loca.get(index * 4..index * 4 + 4)?.try_into().ok()?) as usize)
+        } else {
+            Some(
+                u16::from_be_bytes(loca.get(index * 2..index * 2 + 2)?.try_into().ok()?) as usize
+                    * 2,
+            )
+        }
+    };
+    let (Some(start), Some(end)) = (offset(gid as usize), offset(gid as usize + 1)) else {
+        return true;
+    };
+    if start > end || end > glyf.len() {
+        return true;
+    }
+    if start == end {
+        return false;
+    }
+    let len = end - start;
+    if len < 10 || glyf.get(start..start + 2) != Some(&[0, 0]) {
+        return true;
+    }
+    let x_min = i16::from_be_bytes([glyf[start + 2], glyf[start + 3]]);
+    let y_min = i16::from_be_bytes([glyf[start + 4], glyf[start + 5]]);
+    let x_max = i16::from_be_bytes([glyf[start + 6], glyf[start + 7]]);
+    let y_max = i16::from_be_bytes([glyf[start + 8], glyf[start + 9]]);
+    if x_min > x_max || y_min > y_max {
+        return true;
+    }
+    // OpenType simple glyph description with `numberOfContours == 0`:
+    // 10-byte glyph header, optionally followed by `uint16 instructionLength`,
+    // `instructionLength` bytes of hinting instructions (e.g. phantom-point
+    // hints on a space glyph), and up to 4-byte `loca` zero padding.
+    // A wiped contour record has `instructionLength == 0` with extra trailing
+    // bytes beyond the 12-byte padded header, or an out-of-bounds length.
+    if len == 11 {
+        if glyf[start + 10] != 0 {
+            return true;
+        }
+    } else if len >= 12 {
+        let instr_len = u16::from_be_bytes([glyf[start + 10], glyf[start + 11]]) as usize;
+        let body_len = 12 + instr_len;
+        if body_len > len {
+            return true;
+        }
+        let max_pad = if instr_len == 0 {
+            0
+        } else {
+            (4 - (body_len % 4)) % 4
+        };
+        let trailing = len - body_len;
+        if trailing > max_pad || !glyf[start + body_len..end].iter().all(|&byte| byte == 0) {
+            return true;
+        }
+    }
+    cmap_maps_visible_to_gid(face, gid, cmap_budget).unwrap_or(false)
+}
+
+/// Whether `gid` has a non-zero or malformed `loca` slice in a `glyf` face
+/// (as opposed to a valid zero-length `start == end` blank entry).
+pub(crate) fn glyf_has_non_empty_record(face: &ttf_parser::Face<'_>, gid: u16) -> bool {
+    let raw = face.raw_face();
+    let Some(head) = raw.table(ttf_parser::Tag::from_bytes(b"head")) else {
+        return true;
+    };
+    let Some(loca) = raw.table(ttf_parser::Tag::from_bytes(b"loca")) else {
+        return true;
+    };
+    let Some(glyf) = raw.table(ttf_parser::Tag::from_bytes(b"glyf")) else {
+        return true;
+    };
+    let long = head.get(50..52) == Some(&[0, 1]);
+    let offset = |index: usize| -> Option<usize> {
+        if long {
+            Some(u32::from_be_bytes(loca.get(index * 4..index * 4 + 4)?.try_into().ok()?) as usize)
+        } else {
+            Some(
+                u16::from_be_bytes(loca.get(index * 2..index * 2 + 2)?.try_into().ok()?) as usize
+                    * 2,
+            )
+        }
+    };
+    let (Some(start), Some(end)) = (offset(gid as usize), offset(gid as usize + 1)) else {
+        return true;
+    };
+    start != end || end > glyf.len()
 }
 
 /// Constant-time blank-glyph checks read straight from an embedded TrueType
@@ -766,6 +1207,204 @@ impl FontCache {
         resolved
     }
 
+    /// If `original` is a substituted font that lacks a drawable outline for
+    /// this glyph and an already-loaded embedded original was retained for it,
+    /// resolve the glyph from the surviving embedded face.
+    #[doc(hidden)]
+    pub fn resolve_embedded_companion_glyph(
+        &mut self,
+        original: DrawingGlyph,
+        code: u32,
+        raw_code: u32,
+        length: u8,
+        max_bytes: u64,
+    ) -> Option<DrawingGlyph> {
+        self.resolve_embedded_companion_glyph_with(
+            original,
+            code,
+            raw_code,
+            length,
+            max_bytes,
+            |_, _| crate::DeferredCompanionLoad::Unavailable,
+        )
+    }
+
+    /// Like [`Self::resolve_embedded_companion_glyph`], invoking `load_deferred`
+    /// only when the primary substitute lacks a drawable outline for this glyph
+    /// and the paired companion is still an unloaded resource reference. The
+    /// loaded companion is admitted (and charged against `max_bytes`) only if
+    /// it actually draws this glyph. Definitive load or budget failures are
+    /// remembered per `FontId` so subsequent missing glyphs at the same or
+    /// smaller remaining budget do not re-decode the stream.
+    #[doc(hidden)]
+    pub fn resolve_embedded_companion_glyph_with(
+        &mut self,
+        original: DrawingGlyph,
+        code: u32,
+        raw_code: u32,
+        length: u8,
+        max_bytes: u64,
+        mut load_deferred: impl FnMut(&crate::CompanionSource, u64) -> crate::DeferredCompanionLoad,
+    ) -> Option<DrawingGlyph> {
+        if self.embedded_companions.is_empty() {
+            return None;
+        }
+        let kind = self.embedded_companions.get(&original.font_id)?.kind;
+        let primary = self.fonts.get(&original.font_id)?;
+        match kind {
+            crate::CompanionKind::EmbeddedOriginal => {
+                let primary_state = match self.provider.as_ref() {
+                    Some(provider) => provider.glyph_state(primary, original.glyph_id),
+                    None => primary.glyph_state(original.glyph_id),
+                };
+                if primary_state == GlyphState::Drawn
+                    || (primary_state == GlyphState::Blank
+                        && primary.code_requires_no_ink(code, raw_code, length))
+                {
+                    return None;
+                }
+            }
+            crate::CompanionKind::DescriptorSubstitute { .. } => {
+                if original.glyph_id == 0
+                    || !primary.is_embedded_glyph_unreadable(original.glyph_id)
+                {
+                    return None;
+                }
+            }
+        }
+
+        // Reclaimable standby companions held by other fonts do not count
+        // against the budget available to a glyph that actually needs its
+        // companion: `admit_drawing_font` reclaims unused standby if needed.
+        let miss_key = (code, raw_code, length);
+        let remaining = max_bytes.saturating_sub(self.budget.bytes_used());
+        let (companion, existing_id, from_standby, was_deferred) = {
+            let entry = self.embedded_companions.get(&original.font_id)?;
+            if let Some(id) = entry.admitted {
+                (Arc::clone(self.fonts.get(&id)?), Some(id), false, false)
+            } else if let Some(comp) = &entry.standby {
+                (Arc::clone(comp), None, true, false)
+            } else {
+                if entry.missed_codes.contains(&miss_key) {
+                    return None;
+                }
+                match &entry.source {
+                    crate::CompanionSource::None => return None,
+                    deferred @ (crate::CompanionSource::Object(_)
+                    | crate::CompanionSource::FormInlineFont { .. }) => {
+                        if remaining == 0
+                            || entry.failed_budget.is_some_and(|limit| remaining <= limit)
+                        {
+                            return None;
+                        }
+                        match load_deferred(deferred, remaining) {
+                            crate::DeferredCompanionLoad::Loaded(loaded) => {
+                                if self.budget.admission_total(&loaded, max_bytes).is_none() {
+                                    // The loaded companion's full cache footprint
+                                    // exceeds `remaining` even before checking
+                                    // individual glyphs; remember the budget
+                                    // failure so later missing glyphs do not
+                                    // re-decode the stream repeatedly.
+                                    if let Some(entry) =
+                                        self.embedded_companions.get_mut(&original.font_id)
+                                    {
+                                        entry.failed_budget = Some(
+                                            entry
+                                                .failed_budget
+                                                .map_or(remaining, |prev| prev.max(remaining)),
+                                        );
+                                    }
+                                    return None;
+                                }
+                                (loaded, None, false, true)
+                            }
+                            crate::DeferredCompanionLoad::Unavailable => return None,
+                            crate::DeferredCompanionLoad::FailedForBudget => {
+                                if let Some(entry) =
+                                    self.embedded_companions.get_mut(&original.font_id)
+                                {
+                                    entry.failed_budget = Some(
+                                        entry
+                                            .failed_budget
+                                            .map_or(remaining, |prev| prev.max(remaining)),
+                                    );
+                                }
+                                return None;
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        let companion_gid = if matches!(companion.font_type, PdfFontType::Type0CidType2) {
+            if companion.unicode_coded() || companion.legacy_substitute() {
+                companion.composite_unicode_gid(code, raw_code, length)
+            } else {
+                let cid = companion
+                    .cid_cmap
+                    .as_ref()
+                    .map(|c| c.code_to_cid(code, length))
+                    .unwrap_or(code);
+                u16::try_from(cid).ok()
+            }
+        } else {
+            u16::try_from(code)
+                .ok()
+                .and_then(|c| companion.code_to_gid(c))
+        };
+        let Some(companion_gid) = companion_gid.filter(|&gid| {
+            let state = match self.provider.as_ref() {
+                Some(provider) => provider.glyph_state(&companion, gid),
+                None => companion.glyph_state(gid),
+            };
+            state == GlyphState::Drawn
+        }) else {
+            if was_deferred {
+                if let Some(entry) = self.embedded_companions.get_mut(&original.font_id) {
+                    if entry.missed_codes.len() < crate::MAX_COMPANION_MISS_CACHE {
+                        entry.missed_codes.insert(miss_key);
+                    }
+                }
+            }
+            return None;
+        };
+        let font_id = match existing_id {
+            Some(id) => id,
+            None => {
+                if from_standby {
+                    self.budget.admission_total(&companion, max_bytes)?;
+                    if let Some(entry) = self.embedded_companions.get_mut(&original.font_id) {
+                        entry.standby = None;
+                    }
+                    self.recompute_standby_bytes();
+                }
+                let Some(id) = self.admit_drawing_font(companion, max_bytes) else {
+                    if was_deferred {
+                        // `FontCacheBudget` is non-evicting, so a deferred
+                        // companion that exceeded `remaining` cannot fit later
+                        // at the same or smaller remaining budget either.
+                        if let Some(entry) = self.embedded_companions.get_mut(&original.font_id) {
+                            entry.failed_budget = Some(
+                                entry
+                                    .failed_budget
+                                    .map_or(remaining, |prev| prev.max(remaining)),
+                            );
+                        }
+                    }
+                    return None;
+                };
+                if let Some(entry) = self.embedded_companions.get_mut(&original.font_id) {
+                    entry.admitted = Some(id);
+                }
+                id
+            }
+        };
+        Some(DrawingGlyph {
+            font_id,
+            glyph_id: companion_gid,
+        })
+    }
+
     fn admit_drawing_font(&mut self, font: Arc<LoadedFont>, max_bytes: u64) -> Option<FontId> {
         // Drawing faces have no PDF resource name, so hostile resource names
         // cannot collide with an internal alias or redirect an existing run.
@@ -773,6 +1412,7 @@ impl FontCache {
         let id = self.next_free_id()?;
         self.budget.record(&font, total);
         self.fonts.insert(id, font);
+        self.reclaim_standby_for(total, max_bytes);
         Some(id)
     }
 }

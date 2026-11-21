@@ -145,6 +145,80 @@ impl Type1Font {
         self.name_to_gid.get(name).copied()
     }
 
+    /// Whether sampled non-space charstrings decode into usable outlines rather
+    /// than failing or producing empty output across the whole font.
+    pub fn has_usable_outlines(&self) -> bool {
+        self.probe_outlines() != crate::EmbeddedOutlineProbe::Unusable
+    }
+
+    /// Classify sampled non-space charstrings as completely healthy, partially
+    /// corrupt (usable as primary, with failing charstrings), or unusable.
+    pub(crate) fn probe_outlines(&self) -> crate::EmbeddedOutlineProbe {
+        let non_blank: Vec<&str> = self
+            .gid_to_name
+            .iter()
+            .map(String::as_str)
+            .filter(|name| !matches!(*name, "" | ".notdef" | "space" | "nbspace" | "uni00A0"))
+            .collect();
+        if non_blank.is_empty() {
+            return crate::EmbeddedOutlineProbe::Healthy;
+        }
+        let step = (non_blank.len() / 32).max(1);
+        let mut drawn = 0u32;
+        let mut failed = 0u32;
+        let mut i = 0;
+        while i < non_blank.len() {
+            let name = non_blank[i];
+            if let Some(cs) = self.char_strings.get(name) {
+                let mut interp = Interp::new();
+                interp.run(cs, &self.subrs, 0);
+                if interp.failed {
+                    failed += 1;
+                } else if let Some(seac) = interp.seac {
+                    if self.compose_seac(&interp, seac, 1).is_some() {
+                        drawn += 1;
+                    } else {
+                        failed += 1;
+                    }
+                } else if !interp.cmds.is_empty() {
+                    drawn += 1;
+                }
+            }
+            i += step;
+        }
+        if drawn == 0 || failed > drawn {
+            crate::EmbeddedOutlineProbe::Unusable
+        } else if failed > 0 {
+            crate::EmbeddedOutlineProbe::PartiallyCorrupt
+        } else {
+            crate::EmbeddedOutlineProbe::Healthy
+        }
+    }
+
+    /// Whether `gid` maps to an embedded charstring whose execution fails
+    /// (malformed outline record, as opposed to an unmapped `.notdef` or valid
+    /// empty space charstring).
+    pub(crate) fn is_gid_unreadable(&self, gid: u16) -> bool {
+        let Some(name) = self.gid_to_name.get(gid as usize) else {
+            return false;
+        };
+        if name.is_empty() || name == ".notdef" {
+            return false;
+        }
+        let Some(cs) = self.char_strings.get(name) else {
+            return false;
+        };
+        let mut interp = Interp::new();
+        interp.run(cs, &self.subrs, 0);
+        if interp.failed {
+            return true;
+        }
+        if let Some(seac) = interp.seac {
+            return self.compose_seac(&interp, seac, 1).is_none();
+        }
+        false
+    }
+
     /// Built-in encoding glyph name for a character code.
     pub fn builtin_name(&self, code: u8) -> Option<&str> {
         self.builtin_encoding
@@ -1186,6 +1260,7 @@ mod tests {
         font.char_strings
             .insert("A".to_string(), vec![139, 139, 139, 204, 204, 12, 6]);
         assert!(font.glyph_outline_by_name("A").is_none());
+        assert!(!font.has_usable_outlines());
     }
 
     #[test]
@@ -1204,6 +1279,21 @@ mod tests {
             2 * base.commands.len(),
             "base and accent outlines"
         );
+
+        // A composite-only font with valid base/accent is usable; once a
+        // referenced component is missing, it is no longer usable.
+        let mut composite_only = font_with_matrix([0.001, 0.0, 0.0, 0.001, 0.0, 0.0]);
+        let simple_a = composite_only.char_strings["A"].clone();
+        composite_only
+            .char_strings
+            .insert("grave".to_string(), simple_a);
+        composite_only
+            .char_strings
+            .insert("Agrave".to_string(), agrave.clone());
+        composite_only.gid_to_name = vec![".notdef".to_string(), "Agrave".to_string()];
+        assert!(composite_only.has_usable_outlines());
+        composite_only.char_strings.remove("A");
+        assert!(!composite_only.has_usable_outlines());
 
         // A composite whose base is itself a composite is malformed.
         font.char_strings.insert("A".to_string(), agrave);

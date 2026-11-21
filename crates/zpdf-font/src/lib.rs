@@ -61,6 +61,11 @@ pub enum OutlineCommand {
 pub struct CidWidths {
     widths: HashMap<u16, f64>,
     default_width: f64,
+    /// True when `default_width` comes from an explicit PDF `/Widths` +
+    /// `/FontDescriptor` (`/MissingWidth`) specification, so a substituted
+    /// simple font must honor it for out-of-range codes instead of reading
+    /// the substitute face's `hmtx`.
+    authoritative_default: bool,
     /// /W2 per-CID vertical metrics: cid → (w1y, vx, vy) in 1/1000 glyph-space
     /// units. `w1y` is the vertical displacement (advance); `(vx, vy)` is the
     /// position vector of the glyph's vertical-mode origin relative to its
@@ -77,8 +82,17 @@ impl CidWidths {
             } else {
                 1000.0
             },
+            authoritative_default: false,
             v_metrics: HashMap::new(),
         }
+    }
+
+    pub fn set_authoritative_default(&mut self, authoritative: bool) {
+        self.authoritative_default = authoritative;
+    }
+
+    pub fn has_authoritative_default(&self) -> bool {
+        self.authoritative_default
     }
 
     pub fn set(&mut self, cid: u16, width: f64) {
@@ -452,6 +466,14 @@ impl LoadedFont {
     /// subset) would be misread as GIDs of the substitute. Call after
     /// /ToUnicode is attached.
     pub fn build_substitute_cid_to_gid(&mut self) {
+        self.build_substitute_cid_to_gid_from(None);
+    }
+
+    /// Like [`Self::build_substitute_cid_to_gid`], borrowing an external
+    /// `/ToUnicode` map when provided so callers can probe substitute coverage
+    /// without cloning the map into `self.to_unicode` first.
+    #[doc(hidden)]
+    pub fn build_substitute_cid_to_gid_from(&mut self, to_unicode: Option<&cmap::ToUnicodeMap>) {
         if !self.is_substitute || !matches!(self.font_type, PdfFontType::Type0CidType2) {
             return;
         }
@@ -466,17 +488,13 @@ impl LoadedFont {
         let Ok(face) = ttf_parser::Face::parse(data, self.face_index) else {
             return;
         };
-        let mut map = HashMap::with_capacity(
-            self.to_unicode
-                .as_ref()
-                .map_or(0, |mapping| mapping.iter().len()),
-        );
+        let to_unicode = to_unicode.or(self.to_unicode.as_ref());
+        let mut map = HashMap::with_capacity(to_unicode.map_or(0, |mapping| mapping.iter().len()));
         let has_collection = self
             .cid_cmap
             .as_ref()
             .and_then(|cm| cm.collection())
             .is_some();
-        let to_unicode = self.to_unicode.as_ref();
         for (code, s) in to_unicode.iter().flat_map(|tu| tu.iter()) {
             // glyph_outline receives CIDs, so key the map by CID — under a
             // non-Identity encoding CMap, or an Identity base with explicit
@@ -565,6 +583,52 @@ impl LoadedFont {
             cid_cmap: None,
             dw2: (880.0, -1000.0),
             variations: Vec::new(),
+        }
+    }
+
+    /// Return a metrics-only copy of this logical font with its outline program
+    /// bytes removed (`font_data`, `type1`, Type 3 `char_procs`, and GID maps).
+    ///
+    /// Preserves `font_type`, `/W`/`/DW2`/`/Widths`/`/MissingWidth`, `/Encoding`,
+    /// `/ToUnicode`, and composite `cid_cmap` when the full program exceeds the
+    /// font cache budget.
+    pub fn without_font_program(&self) -> Self {
+        let font_type = match &self.font_type {
+            PdfFontType::Type3 {
+                font_matrix,
+                encoding,
+                widths,
+                first_char,
+                ..
+            } => PdfFontType::Type3 {
+                font_matrix: *font_matrix,
+                char_procs: HashMap::new(),
+                encoding: encoding.clone(),
+                widths: widths.clone(),
+                first_char: *first_char,
+            },
+            other => other.clone(),
+        };
+        Self {
+            font_type,
+            base_font: self.base_font.clone(),
+            font_data: None,
+            face_index: 0,
+            is_substitute: self.is_substitute,
+            cid_widths: self.cid_widths.clone(),
+            units_per_em: self.units_per_em,
+            ascent: self.ascent,
+            descent: self.descent,
+            cid_to_gid: None,
+            builtin_encoding_gids: None,
+            orphan_gids: Vec::new(),
+            encoding: self.encoding.clone(),
+            to_unicode: self.to_unicode.clone(),
+            symbolic: self.symbolic,
+            type1: None,
+            cid_cmap: self.cid_cmap.clone(),
+            dw2: self.dw2,
+            variations: self.variations.clone(),
         }
     }
 
@@ -793,22 +857,205 @@ impl LoadedFont {
             return 0.0;
         }
         // Sample evenly across the (sorted) CID range so several CFF FDs are
-        // exercised, not just one. A glyph with no outline at all (e.g. space)
-        // returns None too, but at the >0.5 trip point a handful cannot matter.
+        // exercised, not just one. Valid blank glyphs (spaces, zero-length
+        // `loca` entries) are excluded; only genuinely missing/unreadable
+        // outlines count as failures.
         cids.sort_unstable();
         let step = (cids.len() / 64).max(1);
         let (mut total, mut fail) = (0u32, 0u32);
         let mut i = 0;
         while i < cids.len() {
-            let gid = ttf_parser::GlyphId(map[&cids[i]]);
-            let mut builder = OutlineBuilder::new();
+            let gid = map[&cids[i]];
             total += 1;
-            if face.outline_glyph(gid, &mut builder).is_none() {
+            if resolution::physical_glyph_state(&face, gid) == resolution::GlyphState::Missing {
                 fail += 1;
             }
             i += step;
         }
         fail as f32 / total as f32
+    }
+
+    /// Whether an embedded font program parsed into usable outline tables.
+    ///
+    /// Returns `false` when neither `ttf-parser` nor the Type 1 parser accepted
+    /// the bytes, when an sfnt/OTF program carries no parseable outline table
+    /// (`glyf`, `CFF `, or `CFF2`), or when more than half of non-blank sampled
+    /// glyphs fail to outline due to corrupt glyph data. Valid empty glyphs
+    /// (such as space, valid zero-contour space records, or zero-length CAD
+    /// `loca` entries) are treated as usable.
+    pub fn has_usable_embedded_outlines(&self) -> bool {
+        self.probe_embedded_outlines() != EmbeddedOutlineProbe::Unusable
+    }
+
+    /// Classify an embedded font program as completely healthy, partially
+    /// corrupt (usable as primary face, but with at least one sampled
+    /// unreadable glyph), or unusable (majority/all sampled glyphs unreadable).
+    #[doc(hidden)]
+    pub fn probe_embedded_outlines(&self) -> EmbeddedOutlineProbe {
+        if self.is_type3() || self.is_substitute {
+            return EmbeddedOutlineProbe::Healthy;
+        }
+        if let Some(t1) = &self.type1 {
+            return t1.probe_outlines();
+        }
+        let Some(data) = &self.font_data else {
+            return EmbeddedOutlineProbe::Unusable;
+        };
+        let Ok(mut face) = ttf_parser::Face::parse(data, self.face_index) else {
+            return EmbeddedOutlineProbe::Unusable;
+        };
+        self.apply_variations(&mut face);
+        if face.tables().glyf.is_none()
+            && face.tables().cff.is_none()
+            && face.tables().cff2.is_none()
+        {
+            return EmbeddedOutlineProbe::Unusable;
+        }
+
+        let (mut drawn, mut unreadable) = (0u32, 0u32);
+        let mut cmap_budget = resolution::CMAP_PROBE_BUDGET;
+        let probe = |gid: u16, drawn: &mut u32, unreadable: &mut u32, cmap_budget: &mut usize| {
+            match resolution::physical_glyph_state(&face, gid) {
+                resolution::GlyphState::Drawn => *drawn += 1,
+                resolution::GlyphState::Missing => *unreadable += 1,
+                resolution::GlyphState::Blank => {
+                    if resolution::glyf_blank_is_corrupt(&face, gid, cmap_budget) {
+                        *unreadable += 1;
+                    }
+                }
+            }
+        };
+
+        let mapped_gids: Vec<u16> = self
+            .cid_to_gid
+            .as_ref()
+            .map(|map| {
+                let mut gids: Vec<u16> = map.values().copied().filter(|&g| g != 0).collect();
+                gids.sort_unstable();
+                gids.dedup();
+                gids
+            })
+            .unwrap_or_default();
+
+        if !mapped_gids.is_empty() {
+            let step = (mapped_gids.len() / 64).max(1);
+            let mut i = 0;
+            while i < mapped_gids.len() {
+                probe(
+                    mapped_gids[i],
+                    &mut drawn,
+                    &mut unreadable,
+                    &mut cmap_budget,
+                );
+                i += step;
+            }
+        } else {
+            let num_glyphs = face
+                .tables()
+                .cff
+                .as_ref()
+                .map(|cff| cff.number_of_glyphs())
+                .unwrap_or_else(|| face.number_of_glyphs());
+            if num_glyphs <= 1 {
+                let mut builder = OutlineBuilder::new();
+                if face
+                    .outline_glyph(ttf_parser::GlyphId(0), &mut builder)
+                    .is_some()
+                    || resolution::readable_glyph(&face, 0)
+                {
+                    return EmbeddedOutlineProbe::Healthy;
+                }
+                return EmbeddedOutlineProbe::Unusable;
+            }
+            let count = (num_glyphs as usize) - 1;
+            let step = (count / 64).max(1);
+            let mut gid = 1usize;
+            while gid < num_glyphs as usize {
+                probe(gid as u16, &mut drawn, &mut unreadable, &mut cmap_budget);
+                gid += step;
+            }
+            if drawn == 0 && unreadable == 0 && face.tables().glyf.is_some() {
+                let mut found = 0usize;
+                for g in 1..num_glyphs {
+                    if resolution::glyf_has_non_empty_record(&face, g) {
+                        probe(g, &mut drawn, &mut unreadable, &mut cmap_budget);
+                        found += 1;
+                        if found >= 64 {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if unreadable > 0 && unreadable > drawn {
+            EmbeddedOutlineProbe::Unusable
+        } else if unreadable > 0 {
+            EmbeddedOutlineProbe::PartiallyCorrupt
+        } else {
+            EmbeddedOutlineProbe::Healthy
+        }
+    }
+
+    /// Classify a batch of glyph IDs in an embedded font as having a corrupt /
+    /// unreadable embedded outline record (`true`) vs drawn, valid blank, or
+    /// unmapped (`false`). Parses the embedded font program at most once per
+    /// batch.
+    #[doc(hidden)]
+    pub fn classify_embedded_glyphs_unreadable(
+        &self,
+        glyph_ids: &[u16],
+        mut record: impl FnMut(u16, bool),
+    ) {
+        if self.is_substitute || self.is_type3() || !self.has_font_data() {
+            for &gid in glyph_ids {
+                record(gid, false);
+            }
+            return;
+        }
+        if let Some(t1) = &self.type1 {
+            for &gid in glyph_ids {
+                record(gid, gid != 0 && t1.is_gid_unreadable(gid));
+            }
+            return;
+        }
+        let Some(data) = &self.font_data else {
+            for &gid in glyph_ids {
+                record(gid, false);
+            }
+            return;
+        };
+        let Ok(mut face) = ttf_parser::Face::parse(data, self.face_index) else {
+            for &gid in glyph_ids {
+                record(gid, gid != 0);
+            }
+            return;
+        };
+        self.apply_variations(&mut face);
+        let num_glyphs = face.number_of_glyphs();
+        for &glyph_id in glyph_ids {
+            let unreadable = if glyph_id == 0 {
+                false
+            } else {
+                match self.drawing_gid_with_face(glyph_id, &face) {
+                    Some(gid) if gid != 0 && gid < num_glyphs => {
+                        resolution::physical_glyph_state(&face, gid)
+                            == resolution::GlyphState::Missing
+                    }
+                    _ => false,
+                }
+            };
+            record(glyph_id, unreadable);
+        }
+    }
+
+    /// Whether `glyph_id` resolves in this embedded font to a physical glyph
+    /// whose outline record is corrupt/unreadable.
+    #[doc(hidden)]
+    pub fn is_embedded_glyph_unreadable(&self, glyph_id: u16) -> bool {
+        let mut unreadable = false;
+        self.classify_embedded_glyphs_unreadable(&[glyph_id], |_, u| unreadable = u);
+        unreadable
     }
 
     /// Get glyph advance width.
@@ -899,6 +1146,22 @@ impl LoadedFont {
                         return Some(g.0);
                     }
                 }
+            }
+        }
+
+        // 1b. For a substituted simple font whose /Encoding did not resolve the
+        //     code (custom subset glyph names, or absent on a symbolic subset),
+        //     consult /ToUnicode against the substitute face's Unicode cmap
+        //     before guessing from raw-byte Symbol/MacRoman/Latin-1 cmap slots.
+        if self.is_substitute {
+            if let Some(gid) = self
+                .to_unicode
+                .as_ref()
+                .and_then(|map| map.lookup(code as u32))
+                .and_then(FontCharacter::from_text)
+                .and_then(|ch| ch.mapped_glyph_index(&face))
+            {
+                return Some(gid);
             }
         }
 
@@ -1023,6 +1286,12 @@ impl LoadedFont {
         if let Some(w) = self.cid_widths.get_opt(code) {
             return w / 1000.0 * self.units_per_em;
         }
+        // When a substituted simple font supplied PDF /Widths with a descriptor,
+        // codes outside /Widths advance by /MissingWidth rather than the
+        // substitute face's unrelated hmtx.
+        if self.is_substitute && self.cid_widths.has_authoritative_default() {
+            return self.cid_widths.default_width() / 1000.0 * self.units_per_em;
+        }
         if let Some(data) = &self.font_data {
             if let Ok(mut face) = ttf_parser::Face::parse(data, self.face_index) {
                 // Match the varied outline: a variable font's hmtx advance must
@@ -1102,6 +1371,34 @@ impl LoadedFont {
                 out.push(b as char);
             }
         }
+    }
+
+    /// Whether this code decodes to Unicode text through `/ToUnicode`, CMap,
+    /// `/Encoding`, or non-symbolic single-byte fallback.
+    #[doc(hidden)]
+    pub fn can_decode_code(&self, code: u32, len: u8, raw_code: u32) -> bool {
+        if self
+            .to_unicode
+            .as_ref()
+            .and_then(|tu| tu.lookup(raw_code).or_else(|| tu.lookup(code)))
+            .is_some_and(|s| !s.is_empty())
+        {
+            return true;
+        }
+        if matches!(self.font_type, PdfFontType::Type0CidType2) {
+            return self
+                .cid_cmap
+                .as_ref()
+                .and_then(|cm| cm.decode_text(code, len))
+                .is_some();
+        }
+        if let Ok(b) = u8::try_from(code) {
+            if let Some(name) = self.encoding.as_ref().and_then(|enc| enc.glyph_name(b)) {
+                return glyph_list::glyph_name_to_string(name).is_some();
+            }
+            return !self.symbolic && b >= 0x20 && b != 0x7f;
+        }
+        false
     }
 
     pub fn has_font_data(&self) -> bool {
@@ -2047,9 +2344,136 @@ impl FontCacheBudget {
         true
     }
 
+    /// Atomically admit two fonts together when both fit within `max_bytes`,
+    /// leaving the budget untouched if the pair would exceed the limit.
+    pub fn try_admit_pair(
+        &mut self,
+        first: &Arc<LoadedFont>,
+        second: &Arc<LoadedFont>,
+        max_bytes: u64,
+    ) -> bool {
+        let mut added = 0u64;
+        let mut seen_fonts = HashSet::new();
+        let mut seen_programs = HashSet::new();
+        for font in [first, second] {
+            let font_key = Arc::as_ptr(font) as usize;
+            if !self.fonts.contains(&font_key) && seen_fonts.insert(font_key) {
+                let Some(next) = added.checked_add(font.estimated_owned_cache_bytes()) else {
+                    return false;
+                };
+                added = next;
+                for data in font.shared_programs() {
+                    let key = data.as_ptr() as usize;
+                    if !self.programs.contains(&key) && seen_programs.insert(key) {
+                        let Some(next) = added.checked_add(data.len() as u64) else {
+                            return false;
+                        };
+                        added = next;
+                    }
+                }
+            }
+        }
+        let Some(total) = self.bytes.checked_add(added).filter(|&t| t <= max_bytes) else {
+            return false;
+        };
+        self.record(first, total);
+        self.record(second, total);
+        true
+    }
+
     pub fn bytes_used(&self) -> u64 {
         self.bytes
     }
+}
+
+/// Result of probing an embedded font program's glyph outlines at load time.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbeddedOutlineProbe {
+    /// No sampled glyph failed to outline.
+    Healthy,
+    /// Majority of sampled glyphs drew cleanly, but at least one sampled glyph
+    /// was unreadable; keep the embedded face as primary and allow per-glyph
+    /// descriptor substitution for unreadable shown glyphs.
+    PartiallyCorrupt,
+    /// Program failed to parse or majority of sampled glyphs were unreadable;
+    /// switch primary face to a substitute and retain the embedded face as a
+    /// companion for surviving glyphs.
+    Unusable,
+}
+
+/// Direction of a paired fallback companion in [`FontCache`].
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompanionKind {
+    /// Primary is a substitute face; companion is the partially readable
+    /// embedded original used to draw surviving embedded glyphs.
+    EmbeddedOriginal,
+    /// Primary is an embedded face; companion is a descriptor-based substitute
+    /// used only when a shown embedded glyph's outline record proves
+    /// unreadable.
+    DescriptorSubstitute {
+        /// Object ID of the embedded `/FontFile*` stream for lazy fallback
+        /// diagnostics when an unreadable shown glyph triggers fallback.
+        font_file_id: zpdf_core::ObjectId,
+    },
+}
+
+/// Maximum distinct missed `(code, raw_code, length)` tuples remembered per
+/// logical font on a page so repeated shows of an uncovered code do not
+/// repeatedly reload and re-parse a deferred companion.
+pub(crate) const MAX_COMPANION_MISS_CACHE: usize = 512;
+
+/// Reload source for a fallback companion paired with a [`FontId`] in
+/// [`FontCache`]. Stores only lightweight references (never cloned PDF font
+/// dictionaries or uncharged font streams).
+#[doc(hidden)]
+#[derive(Clone)]
+pub enum CompanionSource {
+    /// Indirect font dictionary object ID in the source PDF.
+    Object(zpdf_core::ObjectId),
+    /// Inline font dictionary inside an indirect Form XObject's `/Resources /Font`.
+    FormInlineFont {
+        form_id: zpdf_core::ObjectId,
+        font_name: String,
+    },
+    /// No external reload source (e.g. direct `FontCache` caller or inline Form).
+    None,
+}
+
+/// Outcome of attempting to load a deferred companion on demand.
+#[doc(hidden)]
+pub enum DeferredCompanionLoad {
+    /// Companion loaded cleanly and can be probed or admitted.
+    Loaded(Arc<LoadedFont>),
+    /// No loader/document was available for this call (transient; do not mark
+    /// the deferred source as failed).
+    Unavailable,
+    /// Definitive load or budget failure at the supplied remaining byte budget
+    /// (e.g. stream exceeded remaining budget or failed to parse). Because
+    /// [`FontCacheBudget`] is non-evicting, retrying at the same or smaller
+    /// remaining budget cannot succeed.
+    FailedForBudget,
+}
+
+pub(crate) struct CompanionEntry {
+    pub(crate) kind: CompanionKind,
+    pub(crate) source: CompanionSource,
+    /// Optional in-memory standby copy of the companion face, strictly
+    /// charged in `FontCache::standby_bytes` so `bytes_used() <= max_bytes`
+    /// always holds, and reclaimed whenever a primary font, Form font, or
+    /// drawn companion needs the space.
+    pub(crate) standby: Option<Arc<LoadedFont>>,
+    /// Permanent drawing `FontId` admitted into `self.fonts` once a glyph
+    /// actually draws from this companion.
+    pub(crate) admitted: Option<FontId>,
+    /// Highest remaining page-budget allowance for which loading or admitting
+    /// this deferred companion already failed definitively.
+    pub(crate) failed_budget: Option<u64>,
+    /// Bounded set of `(code, raw_code, length)` misses observed on this page
+    /// so repeated shows of a code neither face draws do not re-decode the
+    /// deferred companion, while leaving other codes free to load it.
+    pub(crate) missed_codes: HashSet<(u32, u32, u8)>,
 }
 
 /// Page/display-list font store keyed by [`FontId`].
@@ -2063,8 +2487,19 @@ pub struct FontCache {
     name_to_id: HashMap<String, FontId>,
     next_id: FontId,
     budget: FontCacheBudget,
+    /// Bytes currently charged to reclaimable unadmitted `standby` companions.
+    /// Included in [`Self::bytes_used`], and reclaimed before rejecting any
+    /// primary, Form, or drawn-companion admission.
+    standby_bytes: u64,
     provider: Option<Arc<FontProvider>>,
     resolution: Option<Box<resolution::ResolutionCache>>,
+    /// Per-font diagnostics for embedded font programs that failed to decode or
+    /// parse and fell back to substitution or metrics-only mode. Empty maps
+    /// allocate nothing, so normal pages pay zero overhead.
+    embedded_fallbacks: HashMap<FontId, zpdf_core::ProcessingDiagnostics>,
+    /// Partially-readable embedded originals paired with a substituted
+    /// `FontId`. Empty maps allocate nothing.
+    embedded_companions: HashMap<FontId, CompanionEntry>,
 }
 
 impl FontCache {
@@ -2080,9 +2515,335 @@ impl FontCache {
             name_to_id: HashMap::with_capacity(capacity),
             next_id: 0,
             budget: FontCacheBudget::default(),
+            standby_bytes: 0,
             provider: None,
             resolution: None,
+            embedded_fallbacks: HashMap::new(),
+            embedded_companions: HashMap::new(),
         }
+    }
+
+    fn standby_extra_bytes(&self, candidate: Option<&Arc<LoadedFont>>) -> Option<u64> {
+        if self.embedded_companions.is_empty() && candidate.is_none() {
+            return Some(0);
+        }
+        let mut added = 0u64;
+        let mut seen_fonts = HashSet::new();
+        let mut seen_programs = HashSet::new();
+        let standby_iter = self
+            .embedded_companions
+            .values()
+            .filter_map(|entry| entry.standby.as_ref());
+        for font in standby_iter.chain(candidate) {
+            let font_key = Arc::as_ptr(font) as usize;
+            if !self.budget.fonts.contains(&font_key) && seen_fonts.insert(font_key) {
+                added = added.checked_add(font.estimated_owned_cache_bytes())?;
+                for data in font.shared_programs() {
+                    let key = data.as_ptr() as usize;
+                    if !self.budget.programs.contains(&key) && seen_programs.insert(key) {
+                        added = added.checked_add(data.len() as u64)?;
+                    }
+                }
+            }
+        }
+        Some(added)
+    }
+
+    pub(crate) fn recompute_standby_bytes(&mut self) {
+        self.standby_bytes = self.standby_extra_bytes(None).unwrap_or(u64::MAX);
+    }
+
+    /// Reclaim unadmitted standby companions until `permanent_total +
+    /// self.standby_bytes <= max_bytes`, preserving each entry's lightweight
+    /// reload `source` so it can still be reloaded on demand if needed.
+    pub(crate) fn reclaim_standby_for(&mut self, permanent_total: u64, max_bytes: u64) {
+        if self.standby_bytes == 0 {
+            return;
+        }
+        self.recompute_standby_bytes();
+        if permanent_total.saturating_add(self.standby_bytes) <= max_bytes {
+            return;
+        }
+        let mut standby_ids: Vec<FontId> = self
+            .embedded_companions
+            .iter()
+            .filter_map(|(&id, entry)| entry.standby.is_some().then_some(id))
+            .collect();
+        standby_ids.sort_unstable();
+        for id in standby_ids {
+            if let Some(entry) = self.embedded_companions.get_mut(&id) {
+                entry.standby = None;
+            }
+            self.recompute_standby_bytes();
+            if permanent_total.saturating_add(self.standby_bytes) <= max_bytes {
+                break;
+            }
+        }
+    }
+
+    /// Pair a substituted font `id` with an optional reload `source` and an
+    /// optional in-memory `standby` embedded original within `max_bytes`.
+    ///
+    /// When `standby` fits within `max_bytes` alongside existing permanent and
+    /// standby fonts, it is retained as a budget-charged, reclaimable standby
+    /// copy (so callers invoking `ContentInterpreter::with_fonts` without a
+    /// `PdfFile` can still recover surviving embedded glyphs). When `standby`
+    /// exceeds `max_bytes`, it is dropped immediately and only the lightweight
+    /// `source` reference (if any) is recorded. Returns `true` when `standby`
+    /// was retained.
+    #[doc(hidden)]
+    pub fn record_companion(
+        &mut self,
+        id: FontId,
+        kind: CompanionKind,
+        source: CompanionSource,
+        standby: Option<Arc<LoadedFont>>,
+        max_bytes: u64,
+    ) -> bool {
+        if !self.fonts.contains_key(&id) {
+            return false;
+        }
+        if let Some(existing) = self.embedded_companions.get(&id) {
+            return existing.admitted.is_some() || existing.standby.is_some();
+        }
+        let retained_standby = match standby {
+            Some(comp) => match self
+                .standby_extra_bytes(Some(&comp))
+                .and_then(|sb| self.budget.bytes_used().checked_add(sb))
+            {
+                Some(total) if total <= max_bytes => {
+                    self.standby_bytes = total - self.budget.bytes_used();
+                    Some(comp)
+                }
+                _ => None,
+            },
+            None => None,
+        };
+        let retained = retained_standby.is_some();
+        if retained
+            || !matches!(source, CompanionSource::None)
+            || matches!(kind, CompanionKind::DescriptorSubstitute { .. })
+        {
+            self.embedded_companions.insert(
+                id,
+                CompanionEntry {
+                    kind,
+                    source,
+                    standby: retained_standby,
+                    admitted: None,
+                    failed_budget: None,
+                    missed_codes: HashSet::new(),
+                },
+            );
+        }
+        retained
+    }
+
+    /// Pair a substituted font `id` with an indirect PDF font dictionary whose
+    /// partially readable embedded original can be loaded on demand if an
+    /// uncovered glyph actually needs it. Retains no font program bytes and
+    /// charges zero cache budget until used.
+    #[doc(hidden)]
+    pub fn record_deferred_companion_ref(&mut self, id: FontId, font_ref: zpdf_core::ObjectId) {
+        let _ = self.record_companion(
+            id,
+            CompanionKind::EmbeddedOriginal,
+            CompanionSource::Object(font_ref),
+            None,
+            u64::MAX,
+        );
+    }
+
+    /// Pair a substituted font `id` with an already-loaded embedded original
+    /// when `max_bytes` allows, charging the page cache budget before retaining
+    /// the `Arc`. Returns `false` and drops `embedded` if `id` is absent or
+    /// retaining `embedded` would exceed `max_bytes`.
+    #[doc(hidden)]
+    pub fn record_embedded_companion(
+        &mut self,
+        id: FontId,
+        embedded: Arc<LoadedFont>,
+        max_bytes: u64,
+    ) -> bool {
+        self.record_companion(
+            id,
+            CompanionKind::EmbeddedOriginal,
+            CompanionSource::None,
+            Some(embedded),
+            max_bytes,
+        )
+    }
+
+    /// Companion kind registered for `id`, if any.
+    #[doc(hidden)]
+    pub fn companion_kind(&self, id: FontId) -> Option<CompanionKind> {
+        self.embedded_companions.get(&id).map(|entry| entry.kind)
+    }
+
+    /// Whether `id` has a paired embedded-original companion available (either
+    /// deferred, standby, or already admitted) for uncovered substitute glyphs.
+    #[doc(hidden)]
+    pub fn has_embedded_companion(&self, id: FontId) -> bool {
+        self.embedded_companions
+            .get(&id)
+            .is_some_and(|entry| matches!(entry.kind, CompanionKind::EmbeddedOriginal))
+    }
+
+    /// Whether `id` has a paired embedded-original companion that can still be
+    /// probed within `max_bytes` (admitted, standby, or an unfailed deferred
+    /// source). Descriptor-substitute companions on healthy embedded fonts are
+    /// excluded so normal text shows stay on the ordinary fast path unless a
+    /// shown glyph actually proves unreadable.
+    #[doc(hidden)]
+    pub fn has_embedded_companion_for_budget(&self, id: FontId, max_bytes: u64) -> bool {
+        if self.embedded_companions.is_empty() {
+            return false;
+        }
+        let Some(entry) = self.embedded_companions.get(&id) else {
+            return false;
+        };
+        if !matches!(entry.kind, CompanionKind::EmbeddedOriginal) {
+            return false;
+        }
+        self.companion_entry_probeable(entry, max_bytes)
+    }
+
+    /// Whether `id` has a paired descriptor-substitute companion that can still
+    /// be probed within `max_bytes` for an unreadable shown embedded glyph.
+    #[doc(hidden)]
+    pub fn has_descriptor_substitute_for_budget(&self, id: FontId, max_bytes: u64) -> bool {
+        if self.embedded_companions.is_empty() {
+            return false;
+        }
+        let Some(entry) = self.embedded_companions.get(&id) else {
+            return false;
+        };
+        if !matches!(entry.kind, CompanionKind::DescriptorSubstitute { .. }) {
+            return false;
+        }
+        self.companion_entry_probeable(entry, max_bytes)
+    }
+
+    fn companion_entry_probeable(&self, entry: &CompanionEntry, max_bytes: u64) -> bool {
+        if entry.admitted.is_some() || entry.standby.is_some() {
+            return true;
+        }
+        if matches!(entry.source, CompanionSource::None) {
+            return false;
+        }
+        let remaining = max_bytes.saturating_sub(self.budget.bytes_used());
+        remaining > 0 && !entry.failed_budget.is_some_and(|limit| remaining <= limit)
+    }
+
+    /// Whether `id` currently retains an in-memory embedded companion program
+    /// in this page cache (either admitted or in reclaimable standby).
+    #[doc(hidden)]
+    pub fn has_retained_embedded_companion(&self, id: FontId) -> bool {
+        self.embedded_companions
+            .get(&id)
+            .is_some_and(|entry| entry.admitted.is_some() || entry.standby.is_some())
+    }
+
+    /// Whether `id`'s embedded companion has been permanently admitted as a
+    /// drawing face for glyphs that actually used it.
+    #[doc(hidden)]
+    pub fn has_admitted_embedded_companion(&self, id: FontId) -> bool {
+        self.embedded_companions
+            .get(&id)
+            .is_some_and(|entry| entry.admitted.is_some())
+    }
+
+    /// Admit `font` under `name` within `max_bytes`, preserving logical PDF
+    /// metrics/mappings and attaching diagnostics if the program exceeds the
+    /// cache budget.
+    ///
+    /// When the full font program exceeds `max_bytes`, this records a
+    /// `StreamSizeLimit` resource-limit diagnostic, retries admission with
+    /// [`LoadedFont::without_font_program`] (keeping composite segmentation,
+    /// `/W`, `/DW2`, `/Widths`, `/Encoding`, and `/ToUnicode`), and falls back
+    /// to a zero-byte placeholder only if even the logical font does not fit.
+    /// Returns `Err(diagnostics)` only when no entry (not even a placeholder)
+    /// could be admitted.
+    pub fn admit_with_diagnostics(
+        &mut self,
+        name: String,
+        font: Arc<LoadedFont>,
+        mut diagnostics: zpdf_core::ProcessingDiagnostics,
+        object_id: Option<zpdf_core::ObjectId>,
+        max_bytes: u64,
+    ) -> Result<FontId, zpdf_core::ProcessingDiagnostics> {
+        if let Some(fid) =
+            self.try_insert_shared_with_limit(name.clone(), Arc::clone(&font), max_bytes)
+        {
+            if !diagnostics.is_empty() {
+                self.record_embedded_fallback(fid, diagnostics);
+            }
+            return Ok(fid);
+        }
+        let limit_err = zpdf_core::Error::StreamSizeLimit(max_bytes);
+        if let Some(id) = object_id {
+            diagnostics.record_object_failure(id, &limit_err);
+        } else {
+            diagnostics.record_decode_failure(&limit_err);
+        }
+        let metrics_only = font.without_font_program();
+        let fid = self
+            .try_insert_with_limit(name.clone(), metrics_only, max_bytes)
+            .or_else(|| {
+                self.try_insert_with_limit(
+                    name,
+                    LoadedFont::new_placeholder(font.base_font.clone()),
+                    max_bytes,
+                )
+            });
+        match fid {
+            Some(fid) => {
+                self.record_embedded_fallback(fid, diagnostics);
+                Ok(fid)
+            }
+            None => Err(diagnostics),
+        }
+    }
+
+    /// Record fallback diagnostics associated with `id` when its embedded font
+    /// program failed to decode or parse.
+    pub fn record_embedded_fallback(
+        &mut self,
+        id: FontId,
+        diagnostics: zpdf_core::ProcessingDiagnostics,
+    ) {
+        if diagnostics.is_empty() {
+            return;
+        }
+        self.embedded_fallbacks
+            .entry(id)
+            .and_modify(|existing| existing.merge(diagnostics))
+            .or_insert(diagnostics);
+    }
+
+    /// Diagnostics recorded for `id` when its embedded font program failed and
+    /// fell back, or `None` for valid embedded and normal non-embedded fonts.
+    pub fn embedded_fallback(&self, id: FontId) -> Option<zpdf_core::ProcessingDiagnostics> {
+        if self.embedded_fallbacks.is_empty() {
+            return None;
+        }
+        self.embedded_fallbacks.get(&id).copied()
+    }
+
+    /// Aggregate diagnostics across all fonts in this cache whose embedded
+    /// programs failed to decode or parse.
+    pub fn diagnostics(&self) -> zpdf_core::ProcessingDiagnostics {
+        let mut all = zpdf_core::ProcessingDiagnostics::default();
+        if !self.embedded_fallbacks.is_empty() {
+            let mut ids: Vec<FontId> = self.embedded_fallbacks.keys().copied().collect();
+            ids.sort_unstable();
+            for id in ids {
+                if let Some(&diag) = self.embedded_fallbacks.get(&id) {
+                    all.merge(diag);
+                }
+            }
+        }
+        all
     }
 
     /// Carry the document's provider into nested Form XObject font loading.
@@ -2163,6 +2924,7 @@ impl FontCache {
         self.budget.record(&font, new_total);
         self.name_to_id.insert(name, id);
         self.fonts.insert(id, font);
+        self.reclaim_standby_for(new_total, max_bytes);
         Some(id)
     }
 
@@ -2188,9 +2950,10 @@ impl FontCache {
         self.fonts.is_empty()
     }
 
-    /// Estimated retained programs and mappings, accounting for shared ownership.
+    /// Estimated retained programs and mappings, accounting for shared ownership
+    /// and any retained reclaimable standby companions.
     pub fn bytes_used(&self) -> u64 {
-        self.budget.bytes_used()
+        self.budget.bytes_used().saturating_add(self.standby_bytes)
     }
 }
 
@@ -2641,5 +3404,610 @@ mod tests {
             cache.try_insert_with_limit("D".into(), LoadedFont::new_placeholder("D".into()), 8),
             Some(2)
         );
+    }
+
+    /// Build a minimal TrueType sfnt with custom per-glyph `glyf` records and an
+    /// optional Unicode format-4 + MacRoman format-0 `cmap`.
+    fn build_glyf_sfnt(
+        glyph_records: &[Vec<u8>],
+        cmap_entries: &[(u16, u16)],
+        mac_roman: bool,
+    ) -> Vec<u8> {
+        let num_glyphs = glyph_records.len() as u16;
+        let mut head = head_table();
+        head[50..52].copy_from_slice(&1u16.to_be_bytes()); // long loca
+
+        let mut glyf = Vec::new();
+        let mut loca = Vec::with_capacity((glyph_records.len() + 1) * 4);
+        for rec in glyph_records {
+            loca.extend_from_slice(&(glyf.len() as u32).to_be_bytes());
+            glyf.extend_from_slice(rec);
+            while !glyf.len().is_multiple_of(4) {
+                glyf.push(0);
+            }
+        }
+        loca.extend_from_slice(&(glyf.len() as u32).to_be_bytes());
+
+        let mut tables: Vec<([u8; 4], Vec<u8>)> = Vec::new();
+        if !cmap_entries.is_empty() || mac_roman {
+            // Build cmap with optional (1,0) MacRoman format 0 and (3,1) Unicode format 4.
+            let mut subtables: Vec<(u16, u16, Vec<u8>)> = Vec::new();
+            if mac_roman {
+                let mut f0 = vec![0u8; 262];
+                f0[0..2].copy_from_slice(&0u16.to_be_bytes());
+                f0[2..4].copy_from_slice(&262u16.to_be_bytes());
+                for &(cp, gid) in cmap_entries {
+                    if cp < 256 {
+                        f0[6 + cp as usize] = gid as u8;
+                    }
+                }
+                subtables.push((1, 0, f0));
+            }
+            if !cmap_entries.is_empty() {
+                let mut sorted = cmap_entries.to_vec();
+                sorted.sort_by_key(|&(cp, _)| cp);
+                let seg_count = sorted.len() + 1;
+                let seg_count_x2 = (seg_count * 2) as u16;
+                let mut f4 = Vec::new();
+                f4.extend_from_slice(&4u16.to_be_bytes()); // format
+                let len_pos = f4.len();
+                f4.extend_from_slice(&0u16.to_be_bytes()); // length placeholder
+                f4.extend_from_slice(&0u16.to_be_bytes()); // language
+                f4.extend_from_slice(&seg_count_x2.to_be_bytes());
+                let search_range = 2 * (1u16 << (seg_count as u16).ilog2());
+                f4.extend_from_slice(&search_range.to_be_bytes());
+                f4.extend_from_slice(&((seg_count as u16).ilog2() as u16).to_be_bytes());
+                f4.extend_from_slice(&(seg_count_x2 - search_range).to_be_bytes());
+                for &(cp, _) in &sorted {
+                    f4.extend_from_slice(&cp.to_be_bytes());
+                }
+                f4.extend_from_slice(&0xFFFFu16.to_be_bytes());
+                f4.extend_from_slice(&0u16.to_be_bytes()); // reservedPad
+                for &(cp, _) in &sorted {
+                    f4.extend_from_slice(&cp.to_be_bytes());
+                }
+                f4.extend_from_slice(&0xFFFFu16.to_be_bytes());
+                for &(cp, gid) in &sorted {
+                    let delta = gid.wrapping_sub(cp) as i16;
+                    f4.extend_from_slice(&delta.to_be_bytes());
+                }
+                f4.extend_from_slice(&1i16.to_be_bytes());
+                for _ in 0..seg_count {
+                    f4.extend_from_slice(&0u16.to_be_bytes());
+                }
+                let f4_len = f4.len() as u16;
+                f4[len_pos..len_pos + 2].copy_from_slice(&f4_len.to_be_bytes());
+                subtables.push((3, 1, f4));
+            }
+            let header_len = 4 + subtables.len() * 8;
+            let mut cmap = Vec::new();
+            cmap.extend_from_slice(&0u16.to_be_bytes());
+            cmap.extend_from_slice(&(subtables.len() as u16).to_be_bytes());
+            let mut off = header_len as u32;
+            for (pid, eid, data) in &subtables {
+                cmap.extend_from_slice(&pid.to_be_bytes());
+                cmap.extend_from_slice(&eid.to_be_bytes());
+                cmap.extend_from_slice(&off.to_be_bytes());
+                off += data.len() as u32;
+            }
+            for (_, _, data) in subtables {
+                cmap.extend_from_slice(&data);
+            }
+            tables.push((*b"cmap", cmap));
+        }
+        tables.push((*b"glyf", glyf));
+        tables.push((*b"head", head));
+        tables.push((*b"hhea", hhea_table()));
+        tables.push((*b"loca", loca));
+        tables.push((*b"maxp", maxp_table(num_glyphs)));
+        build_sfnt(&tables)
+    }
+
+    fn simple_rect_glyf() -> Vec<u8> {
+        let mut g = Vec::new();
+        g.extend_from_slice(&1i16.to_be_bytes()); // numberOfContours = 1
+        g.extend_from_slice(&0i16.to_be_bytes()); // xMin
+        g.extend_from_slice(&0i16.to_be_bytes()); // yMin
+        g.extend_from_slice(&500i16.to_be_bytes()); // xMax
+        g.extend_from_slice(&700i16.to_be_bytes()); // yMax
+        g.extend_from_slice(&3u16.to_be_bytes()); // endPtsOfContours[0] = 3
+        g.extend_from_slice(&0u16.to_be_bytes()); // instructionLength = 0
+        g.extend_from_slice(&[1, 1, 1, 1]); // 4 on-curve points, 16-bit deltas
+        for dx in [0i16, 500, 0, -500] {
+            g.extend_from_slice(&dx.to_be_bytes());
+        }
+        for dy in [0i16, 0, 700, 0] {
+            g.extend_from_slice(&dy.to_be_bytes());
+        }
+        g
+    }
+
+    #[test]
+    fn substitute_consults_tounicode_before_macroman_cmap_slots() {
+        let sfnt = build_glyf_sfnt(
+            &[vec![], simple_rect_glyf(), simple_rect_glyf()],
+            &[(0x41, 1), (0x42, 2)],
+            true,
+        );
+        let mut font = LoadedFont::new_substitute(
+            PdfFontType::TrueType,
+            "SubMac".into(),
+            Arc::from(sfnt),
+            0,
+            CidWidths::new(500.0),
+        )
+        .expect("substitute");
+        font.symbolic = true;
+        font.encoding = None;
+        font.to_unicode = Some(cmap::ToUnicodeMap::parse(
+            b"1 beginbfchar <41> <0042> endbfchar",
+        ));
+
+        // 0x41 maps to 'B' (GID 2) via /ToUnicode, NOT 'A' (GID 1) via MacRoman cmap.
+        assert_eq!(font.code_to_gid(0x41), Some(2));
+        // Codes absent from /ToUnicode still fall back to raw cmap slots.
+        assert_eq!(font.code_to_gid(0x42), Some(2));
+    }
+
+    #[test]
+    fn zero_contour_space_glyph_is_usable_while_zeroed_visible_glyf_is_rejected() {
+        // Valid 10-byte zero-contour header (numberOfContours = 0, bbox = 0).
+        let zero_contour_10 = vec![0u8; 10];
+
+        // 1. Space-only /CIDToGIDMap mapping GID 1 with a 10-byte zero-contour header.
+        let space_cid_sfnt = build_glyf_sfnt(&[vec![], zero_contour_10.clone()], &[], false);
+        let mut cid_font = LoadedFont::new_with_data(
+            PdfFontType::Type0CidType2,
+            "SpaceOnlyCID".into(),
+            space_cid_sfnt,
+            CidWidths::new(500.0),
+        );
+        cid_font.cid_to_gid = Some(HashMap::from([(1u16, 1u16)]));
+        assert!(
+            cid_font.has_usable_embedded_outlines(),
+            "valid 10-byte zero-contour space glyph must be accepted"
+        );
+
+        // 2. Simple space-only subset mapping U+0020 -> GID 1 (10-byte zero-contour header).
+        let space_simple_sfnt =
+            build_glyf_sfnt(&[vec![], zero_contour_10.clone()], &[(0x20, 1)], false);
+        let space_simple = LoadedFont::new_with_data(
+            PdfFontType::TrueType,
+            "SpaceOnlySimple".into(),
+            space_simple_sfnt,
+            CidWidths::new(500.0),
+        );
+        assert!(space_simple.has_usable_embedded_outlines());
+
+        // 3. Zero-contour 10-byte header mapped to visible 'A' in cmap -> rejected.
+        let hidden_a_sfnt = build_glyf_sfnt(&[vec![], zero_contour_10], &[(0x41, 1)], false);
+        let hidden_a = LoadedFont::new_with_data(
+            PdfFontType::TrueType,
+            "HiddenVisibleA".into(),
+            hidden_a_sfnt,
+            CidWidths::new(500.0),
+        );
+        assert!(!hidden_a.has_usable_embedded_outlines());
+
+        // 4. Wiped 32-byte all-zero glyf payload -> rejected even without cmap.
+        let wiped_sfnt = build_glyf_sfnt(&[vec![], vec![0u8; 32]], &[], false);
+        let mut wiped = LoadedFont::new_with_data(
+            PdfFontType::Type0CidType2,
+            "WipedGlyf".into(),
+            wiped_sfnt,
+            CidWidths::new(500.0),
+        );
+        wiped.cid_to_gid = Some(HashMap::from([(1u16, 1u16)]));
+        assert!(!wiped.has_usable_embedded_outlines());
+
+        // 5. Valid zero-contour space with phantom-point hinting instructions
+        //    (10-byte header + instructionLength=6 + 6 instruction bytes,
+        //    4-byte aligned to 20 bytes) -> accepted.
+        let mut hinted_space = vec![0u8; 10];
+        hinted_space.extend_from_slice(&6u16.to_be_bytes());
+        hinted_space.extend_from_slice(&[0xB0, 0x00, 0xB0, 0x01, 0x20, 0x00]);
+        let hinted_sfnt = build_glyf_sfnt(&[vec![], hinted_space], &[], false);
+        let mut hinted = LoadedFont::new_with_data(
+            PdfFontType::Type0CidType2,
+            "HintedSpaceCID".into(),
+            hinted_sfnt,
+            CidWidths::new(500.0),
+        );
+        hinted.cid_to_gid = Some(HashMap::from([(1u16, 1u16)]));
+        assert!(
+            hinted.has_usable_embedded_outlines(),
+            "zero-contour space glyph with valid hinting instructions must be accepted"
+        );
+
+        // 6. Zero-contour glyph with truncated instructionLength past slice bounds -> rejected.
+        let mut truncated_instr = vec![0u8; 10];
+        truncated_instr.extend_from_slice(&40u16.to_be_bytes());
+        truncated_instr.extend_from_slice(&[0xB0, 0x00, 0x00, 0x00]);
+        let truncated_sfnt = build_glyf_sfnt(&[vec![], truncated_instr], &[], false);
+        let mut truncated = LoadedFont::new_with_data(
+            PdfFontType::Type0CidType2,
+            "TruncatedInstrCID".into(),
+            truncated_sfnt,
+            CidWidths::new(500.0),
+        );
+        truncated.cid_to_gid = Some(HashMap::from([(1u16, 1u16)]));
+        assert!(!truncated.has_usable_embedded_outlines());
+    }
+
+    #[test]
+    fn embedded_outline_failure_rate_excludes_valid_blank_glyphs() {
+        // 1 drawn glyph (GID 1) + 2 valid zero-length loca blank glyphs (GIDs 2, 3).
+        let sfnt = build_glyf_sfnt(&[vec![], simple_rect_glyf(), vec![], vec![]], &[], false);
+        let mut font = LoadedFont::new_with_data(
+            PdfFontType::Type0CidType2,
+            "ValidCJKWithBlanks".into(),
+            sfnt,
+            CidWidths::new(1000.0),
+        );
+        font.cid_to_gid = Some(HashMap::from([(1, 1), (2, 2), (3, 3)]));
+        assert!(font.has_usable_embedded_outlines());
+        assert_eq!(font.embedded_outline_failure_rate(), 0.0);
+    }
+
+    #[test]
+    fn cmap_blank_probe_is_range_aware_and_strictly_bounded() {
+        let build_with_cmap_groups = |format: u16, groups: &[(u32, u32, u32)]| -> Vec<u8> {
+            let mut head = head_table();
+            head[50..52].copy_from_slice(&1u16.to_be_bytes()); // long loca
+            let zero_contour = vec![0u8; 10];
+            let mut glyf = Vec::new();
+            let mut loca = Vec::new();
+            // GID 0 = empty, GID 1 = 10-byte zero-contour header
+            loca.extend_from_slice(&0u32.to_be_bytes());
+            loca.extend_from_slice(&0u32.to_be_bytes());
+            glyf.extend_from_slice(&zero_contour);
+            glyf.extend_from_slice(&[0, 0]); // 4-byte align
+            loca.extend_from_slice(&(glyf.len() as u32).to_be_bytes());
+
+            let subtable_len = (16 + groups.len() * 12) as u32;
+            let mut subtable = Vec::with_capacity(subtable_len as usize);
+            subtable.extend_from_slice(&format.to_be_bytes());
+            subtable.extend_from_slice(&0u16.to_be_bytes()); // reserved
+            subtable.extend_from_slice(&subtable_len.to_be_bytes());
+            subtable.extend_from_slice(&0u32.to_be_bytes()); // language
+            subtable.extend_from_slice(&(groups.len() as u32).to_be_bytes());
+            for &(s, e, g) in groups {
+                subtable.extend_from_slice(&s.to_be_bytes());
+                subtable.extend_from_slice(&e.to_be_bytes());
+                subtable.extend_from_slice(&g.to_be_bytes());
+            }
+            let mut cmap = Vec::new();
+            cmap.extend_from_slice(&0u16.to_be_bytes()); // version
+            cmap.extend_from_slice(&1u16.to_be_bytes()); // numTables
+            cmap.extend_from_slice(&3u16.to_be_bytes()); // Windows
+            cmap.extend_from_slice(&10u16.to_be_bytes()); // Unicode full repertoire
+            cmap.extend_from_slice(&12u32.to_be_bytes()); // offset
+            cmap.extend_from_slice(&subtable);
+
+            build_sfnt(&[
+                (*b"cmap", cmap),
+                (*b"glyf", glyf),
+                (*b"head", head),
+                (*b"hhea", hhea_table()),
+                (*b"loca", loca),
+                (*b"maxp", maxp_table(2)),
+            ])
+        };
+
+        // 1. Adversarial Format 12 spanning the full u32 space: 0x41 -> GID 1
+        //    must finish in O(1) without expanding 4.29B codepoints, and reject.
+        let huge_f12 = build_with_cmap_groups(12, &[(0x41, u32::MAX, 1)]);
+        let font_f12 = LoadedFont::new_with_data(
+            PdfFontType::TrueType,
+            "HugeFormat12".into(),
+            huge_f12,
+            CidWidths::new(500.0),
+        );
+        assert!(!font_f12.has_usable_embedded_outlines());
+
+        // 2. Adversarial Format 13 mapping [0..=u32::MAX] -> GID 1 must finish
+        //    in O(1) and detect visible scalars in the range.
+        let huge_f13 = build_with_cmap_groups(13, &[(0, u32::MAX, 1)]);
+        let font_f13 = LoadedFont::new_with_data(
+            PdfFontType::TrueType,
+            "HugeFormat13".into(),
+            huge_f13,
+            CidWidths::new(500.0),
+        );
+        assert!(!font_f13.has_usable_embedded_outlines());
+
+        // 3. Adversarial Format 13 covering only surrogates/PUA (non-visible)
+        //    leaves the zero-contour blank glyph accepted in O(1).
+        let pua_f13 = build_with_cmap_groups(13, &[(0xD800, 0xF8FF, 1)]);
+        let font_pua = LoadedFont::new_with_data(
+            PdfFontType::TrueType,
+            "PuaFormat13".into(),
+            pua_f13,
+            CidWidths::new(500.0),
+        );
+        assert!(font_pua.has_usable_embedded_outlines());
+
+        // 4. Oversized group count past CMAP_PROBE_BUDGET stops early and
+        //    leaves the probe inconclusive rather than stalling font load.
+        let mut many_groups: Vec<(u32, u32, u32)> = (0..resolution::CMAP_PROBE_BUDGET as u32 + 128)
+            .map(|i| (0x1000 + i, 0x1000 + i, 2))
+            .collect();
+        many_groups.push((0x0041, 0x0041, 1));
+        let huge_groups = build_with_cmap_groups(12, &many_groups);
+        let font_budget = LoadedFont::new_with_data(
+            PdfFontType::TrueType,
+            "BudgetExhaustedCmap".into(),
+            huge_groups,
+            CidWidths::new(500.0),
+        );
+        assert!(
+            font_budget.has_usable_embedded_outlines(),
+            "exhausted cmap probe budget must leave the blank check inconclusive"
+        );
+    }
+
+    #[test]
+    fn embedded_companion_is_charged_against_page_budget_on_retention() {
+        let primary_bytes = include_bytes!("../tests/fixtures/coverage-primary.ttf");
+        let primary = Arc::new(
+            LoadedFont::new_substitute(
+                PdfFontType::TrueType,
+                "PrimarySub".into(),
+                Arc::from(primary_bytes.as_slice()),
+                0,
+                CidWidths::new(1000.0),
+            )
+            .unwrap(),
+        );
+        let companion = Arc::new(LoadedFont::new_with_data(
+            PdfFontType::TrueType,
+            "EmbeddedOriginal".into(),
+            primary_bytes.to_vec(),
+            CidWidths::new(1000.0),
+        ));
+        let primary_cost = primary.estimated_cache_bytes();
+        let companion_cost = companion.estimated_cache_bytes();
+        let combined_cost = primary_cost + companion_cost;
+
+        // 1. Budget fits primary, rejects unused companion: no strong Arc retained.
+        let mut tight = FontCache::new();
+        let fid = tight
+            .try_insert_shared_with_limit("F1".into(), Arc::clone(&primary), combined_cost - 1)
+            .expect("primary fits");
+        let weak_font = Arc::downgrade(&companion);
+        let weak_data = Arc::downgrade(companion.font_data.as_ref().unwrap());
+        assert!(!tight.record_embedded_companion(fid, Arc::clone(&companion), combined_cost - 1));
+        assert!(!tight.has_embedded_companion(fid));
+        assert_eq!(tight.bytes_used(), primary_cost);
+        drop(companion);
+        assert!(
+            weak_font.upgrade().is_none() && weak_data.upgrade().is_none(),
+            "rejected companion must not be retained by FontCache"
+        );
+
+        // 2. Budget fits both: companion is charged immediately upon retention,
+        //    and lazy drawing admission does not double-charge it.
+        let companion = Arc::new(LoadedFont::new_with_data(
+            PdfFontType::TrueType,
+            "EmbeddedOriginal".into(),
+            primary_bytes.to_vec(),
+            CidWidths::new(1000.0),
+        ));
+        let mut ample = FontCache::new();
+        let fid = ample
+            .try_insert_shared_with_limit("F1".into(), primary, combined_cost)
+            .expect("primary fits");
+        assert!(ample.record_embedded_companion(fid, companion, combined_cost));
+        assert!(ample.has_embedded_companion(fid));
+        assert_eq!(ample.bytes_used(), combined_cost);
+
+        let resolved = ample
+            .resolve_embedded_companion_glyph(
+                DrawingGlyph {
+                    font_id: fid,
+                    glyph_id: 0,
+                },
+                b'A' as u32,
+                b'A' as u32,
+                1,
+                combined_cost,
+            )
+            .expect("uncovered glyph resolves from retained companion");
+        assert_ne!(resolved.font_id, fid);
+        assert_eq!(
+            ample.bytes_used(),
+            combined_cost,
+            "drawing admission must not double-charge an already-budgeted companion"
+        );
+    }
+
+    #[test]
+    fn deferred_companion_remembers_budget_failures_without_poisoning_glyph_misses() {
+        let primary_bytes = include_bytes!("../tests/fixtures/coverage-primary.ttf");
+        let primary = Arc::new(
+            LoadedFont::new_substitute(
+                PdfFontType::TrueType,
+                "PrimarySub".into(),
+                Arc::from(primary_bytes.as_slice()),
+                0,
+                CidWidths::new(1000.0),
+            )
+            .unwrap(),
+        );
+        let companion = Arc::new(LoadedFont::new_with_data(
+            PdfFontType::TrueType,
+            "EmbeddedOriginal".into(),
+            primary_bytes.to_vec(),
+            CidWidths::new(1000.0),
+        ));
+        let primary_cost = primary.estimated_cache_bytes();
+        let companion_cost = companion.estimated_cache_bytes();
+        let tight = primary_cost + companion_cost / 2;
+        let ample = primary_cost + companion_cost;
+
+        // 1. Definitive FailedForBudget: never retried at same or smaller budget
+        //    across distinct missing glyphs, but retries if budget is raised.
+        let mut cache = FontCache::new();
+        let fid = cache
+            .try_insert_shared_with_limit("F1".into(), Arc::clone(&primary), tight)
+            .unwrap();
+        cache.record_deferred_companion_ref(fid, zpdf_core::ObjectId(10, 0));
+        let mut load_calls = 0usize;
+        for ch in *b"ABC" {
+            let res = cache.resolve_embedded_companion_glyph_with(
+                DrawingGlyph {
+                    font_id: fid,
+                    glyph_id: 0,
+                },
+                ch as u32,
+                ch as u32,
+                1,
+                tight,
+                |_, _| {
+                    load_calls += 1;
+                    DeferredCompanionLoad::FailedForBudget
+                },
+            );
+            assert!(res.is_none());
+        }
+        assert_eq!(
+            load_calls, 1,
+            "definitive load/budget failure must not retry subsequent missing glyphs"
+        );
+        assert!(!cache.has_embedded_companion_for_budget(fid, tight));
+        // Smaller budget also short-circuits without calling load_deferred.
+        assert!(cache
+            .resolve_embedded_companion_glyph_with(
+                DrawingGlyph {
+                    font_id: fid,
+                    glyph_id: 0,
+                },
+                b'D' as u32,
+                b'D' as u32,
+                1,
+                tight - 1,
+                |_, _| {
+                    load_calls += 1;
+                    DeferredCompanionLoad::FailedForBudget
+                },
+            )
+            .is_none());
+        assert_eq!(load_calls, 1);
+        // Raising max_bytes past the failed watermark allows a retry that succeeds.
+        assert!(cache.has_embedded_companion_for_budget(fid, ample));
+        let resolved = cache.resolve_embedded_companion_glyph_with(
+            DrawingGlyph {
+                font_id: fid,
+                glyph_id: 0,
+            },
+            b'A' as u32,
+            b'A' as u32,
+            1,
+            ample,
+            |_, _| {
+                load_calls += 1;
+                DeferredCompanionLoad::Loaded(Arc::clone(&companion))
+            },
+        );
+        assert!(resolved.is_some());
+        assert_eq!(load_calls, 2);
+
+        // 2. Post-load admission failure (Loaded exceeds max_bytes) also records
+        //    the failed watermark and stops retrying at the same budget.
+        let mut cache_admit = FontCache::new();
+        let fid_admit = cache_admit
+            .try_insert_shared_with_limit("F1".into(), Arc::clone(&primary), ample - 1)
+            .unwrap();
+        cache_admit.record_deferred_companion_ref(fid_admit, zpdf_core::ObjectId(11, 0));
+        let mut admit_calls = 0usize;
+        for ch in *b"AB" {
+            assert!(cache_admit
+                .resolve_embedded_companion_glyph_with(
+                    DrawingGlyph {
+                        font_id: fid_admit,
+                        glyph_id: 0,
+                    },
+                    ch as u32,
+                    ch as u32,
+                    1,
+                    ample - 1,
+                    |_, _| {
+                        admit_calls += 1;
+                        DeferredCompanionLoad::Loaded(Arc::clone(&companion))
+                    },
+                )
+                .is_none());
+        }
+        assert_eq!(admit_calls, 1);
+
+        // 3. Glyph-specific miss and transient Unavailable do NOT poison the budget.
+        let mut cache_miss = FontCache::new();
+        let fid_miss = cache_miss
+            .try_insert_shared_with_limit("F1".into(), primary, ample)
+            .unwrap();
+        cache_miss.record_deferred_companion_ref(fid_miss, zpdf_core::ObjectId(12, 0));
+        // Transient Unavailable leaves companion retryable at the same budget.
+        assert!(cache_miss
+            .resolve_embedded_companion_glyph(
+                DrawingGlyph {
+                    font_id: fid_miss,
+                    glyph_id: 0,
+                },
+                b'A' as u32,
+                b'A' as u32,
+                1,
+                ample,
+            )
+            .is_none());
+        assert!(cache_miss.has_embedded_companion_for_budget(fid_miss, ample));
+        // Glyph-specific miss (code 0x1F600 absent from coverage-primary.ttf)
+        // must not admit the companion OR poison subsequent glyphs at the same
+        // budget, AND repeated misses for the same code must hit the bounded
+        // page-local miss cache without reloading the deferred companion again.
+        let mut miss_load_calls = 0usize;
+        for _ in 0..5 {
+            assert!(cache_miss
+                .resolve_embedded_companion_glyph_with(
+                    DrawingGlyph {
+                        font_id: fid_miss,
+                        glyph_id: 0,
+                    },
+                    0x1F600,
+                    0x1F600,
+                    2,
+                    ample,
+                    |_, _| {
+                        miss_load_calls += 1;
+                        DeferredCompanionLoad::Loaded(Arc::clone(&companion))
+                    },
+                )
+                .is_none());
+        }
+        assert_eq!(
+            miss_load_calls, 1,
+            "repeated misses for the same code must not reload the deferred companion"
+        );
+        assert!(!cache_miss.has_retained_embedded_companion(fid_miss));
+        assert_eq!(cache_miss.bytes_used(), primary_cost);
+        assert!(cache_miss.has_embedded_companion_for_budget(fid_miss, ample));
+        // Subsequent drawable glyph 'A' still succeeds and admits the companion.
+        let ok = cache_miss.resolve_embedded_companion_glyph_with(
+            DrawingGlyph {
+                font_id: fid_miss,
+                glyph_id: 0,
+            },
+            b'A' as u32,
+            b'A' as u32,
+            1,
+            ample,
+            |_, _| {
+                miss_load_calls += 1;
+                DeferredCompanionLoad::Loaded(Arc::clone(&companion))
+            },
+        );
+        assert!(ok.is_some());
+        assert_eq!(miss_load_calls, 2);
+        assert!(cache_miss.has_retained_embedded_companion(fid_miss));
+        assert_eq!(cache_miss.bytes_used(), ample);
     }
 }

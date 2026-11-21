@@ -1157,7 +1157,14 @@ fn cmd_text(args: &[String]) -> zpdf::Result<()> {
 
     // The structure tree (whole document) drives `--struct` ordering; each page's
     // marked content is selected by page index inside `struct_ordered_text`.
-    let struct_tree = if use_struct { doc.struct_tree() } else { None };
+    let (struct_tree, struct_streams) = if use_struct {
+        match doc.struct_tree_with_streams() {
+            Some((tree, streams)) => (Some(tree), streams),
+            None => (None, zpdf::StructTreeStreams::default()),
+        }
+    } else {
+        (None, zpdf::StructTreeStreams::default())
+    };
     if use_struct && struct_tree.is_none() {
         eprintln!("(no structure tree; falling back to geometric reading order)");
     }
@@ -1180,9 +1187,10 @@ fn cmd_text(args: &[String]) -> zpdf::Result<()> {
         let content_bytes = doc.page_content_bytes(&page)?;
 
         let mut spans: Vec<zpdf::TextSpan> = Vec::new();
+        let mut span_streams: Vec<zpdf::SpanStreamBinding> = Vec::new();
         {
             let oc_config = doc.oc_config().unwrap_or_default();
-            let interpreter = zpdf::ContentInterpreter::new(page.effective_box())
+            let mut interpreter = zpdf::ContentInterpreter::new(page.effective_box())
                 .with_page_user_unit(page.user_unit)
                 .with_fonts(&mut font_cache)
                 .with_document(doc.file(), &page.resources)
@@ -1191,16 +1199,28 @@ fn cmd_text(args: &[String]) -> zpdf::Result<()> {
                 .with_optional_content(&oc_config)
                 .with_text_sink(&mut spans)
                 .with_operand_stack_limit(doc.file().limits().max_operand_stack_depth as usize);
+            if struct_tree.is_some() {
+                interpreter = interpreter.with_span_streams(&mut span_streams);
+            }
+            if let Some(mcids) = struct_streams.actual_text_mcids.get(&pi) {
+                interpreter = interpreter.with_struct_actual_text_mcids(mcids.clone());
+            }
             let (_, mut stats) = interpreter.interpret_with_stats(&content_bytes);
             stats.diagnostics.set_page(pi);
-            stats.diagnostics.ensure_complete()?;
+            stats.diagnostics.ensure_text_complete()?;
         }
 
         if all {
             println!("===== Page {} =====", pi + 1);
         }
         let text = match &struct_tree {
-            Some(tree) => zpdf::struct_ordered_text(&spans, pi, tree),
+            Some(tree) => zpdf::struct_ordered_text_with_streams(
+                &spans,
+                &span_streams,
+                pi,
+                tree,
+                &struct_streams.kid_streams,
+            ),
             None => zpdf::spans_to_text(spans, 2.0),
         };
         println!("{text}");
@@ -1281,7 +1301,7 @@ fn cmd_search(args: &[String]) -> zpdf::Result<()> {
                 .with_operand_stack_limit(doc.file().limits().max_operand_stack_depth as usize);
             let (_, mut stats) = interpreter.interpret_with_stats(&content_bytes);
             stats.diagnostics.set_page(pi);
-            stats.diagnostics.ensure_complete()?;
+            stats.diagnostics.ensure_text_complete()?;
         }
 
         for hit in zpdf::search_spans(&spans, query, case_sensitive) {
@@ -1375,7 +1395,7 @@ fn cmd_tables(args: &[String]) -> zpdf::Result<()> {
                 .with_operand_stack_limit(doc.file().limits().max_operand_stack_depth as usize);
             let (_, mut stats) = interpreter.interpret_with_stats(&content_bytes);
             stats.diagnostics.set_page(pi);
-            stats.diagnostics.ensure_complete()?;
+            stats.diagnostics.ensure_text_complete()?;
         }
 
         let tables = zpdf::detect_tables_with_rules(&spans, &rules);

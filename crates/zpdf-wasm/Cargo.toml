@@ -21,7 +21,7 @@ zpdf-svg-export.workspace = true
 # dep (ureq, RFC 3161 timestamp) is behind the off-by-default `timestamp` feature.
 zpdf-writer = { workspace = true }
 
-wasm-bindgen = "0.2"
+wasm-bindgen = "=0.2.130"
 # Surfaces Rust panics as readable JS console errors in the demo.
 console_error_panic_hook = "0.1"
 

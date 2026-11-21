@@ -15,6 +15,8 @@ pub use zpdf_content::search::{search_spans, SearchHit};
 pub use zpdf_content::stats::InterpretStats;
 pub use zpdf_content::tables::{detect_tables, detect_tables_with_rules, RuleLine, Table};
 pub use zpdf_content::text::{spans_to_text, struct_ordered_text, TextGlyph, TextSpan};
+#[doc(hidden)]
+pub use zpdf_content::text::{struct_ordered_text_with_streams, SpanStreamBinding};
 pub use zpdf_core::*;
 pub use zpdf_display_list as display_list;
 pub use zpdf_display_list::DisplayList;
@@ -22,6 +24,8 @@ pub use zpdf_document::ink::{InkAnnotDict, InkAnnotationBuilder};
 pub use zpdf_document::pdfa;
 pub use zpdf_document::pdfua;
 pub use zpdf_document::pdfx;
+#[doc(hidden)]
+pub use zpdf_document::structure::StructTreeStreams;
 pub use zpdf_document::trust;
 pub use zpdf_document::{
     AcroForm, Annotation, ByteRangeCoverage, CryptoStatus, DestView, Destination, DigestStatus,

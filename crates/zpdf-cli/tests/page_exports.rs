@@ -132,3 +132,471 @@ fn cli_exports_keep_annotations_and_hide_disabled_layers() {
     fs::remove_file(input).unwrap();
     fs::remove_dir(dir).unwrap();
 }
+
+fn assemble_raw(objects: &[Vec<u8>]) -> Vec<u8> {
+    let mut pdf = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n".to_vec();
+    let mut offsets = Vec::with_capacity(objects.len());
+    for (i, body) in objects.iter().enumerate() {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+        pdf.extend_from_slice(body);
+        pdf.extend_from_slice(b"\nendobj\n");
+    }
+    let xref = pdf.len();
+    pdf.extend_from_slice(
+        format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+    );
+    for offset in offsets {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Root 1 0 R /Size {} >>\nstartxref\n{xref}\n%%EOF\n",
+            objects.len() + 1
+        )
+        .as_bytes(),
+    );
+    pdf
+}
+
+fn raw_stream(attrs: &str, bytes: &[u8]) -> Vec<u8> {
+    let mut out = format!("<< {attrs} /Length {} >>\nstream\n", bytes.len()).into_bytes();
+    out.extend_from_slice(bytes);
+    out.extend_from_slice(b"\nendstream");
+    out
+}
+
+#[test]
+fn corrupt_embedded_font_exports_succeed_when_recovered_and_fail_when_unrecovered() {
+    let dir = std::env::temp_dir().join(format!(
+        "zpdf-corrupt-font-exports-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir(&dir).unwrap();
+
+    // 1. Corrupt embedded TrueType referencing Helvetica: when a system substitute
+    //    exists, public CLI exports (`render`, `export-svg`, `text`, `convert`)
+    //    must recover and succeed rather than failing ensure_complete().
+    let recovered_pdf = assemble_raw(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 180 100] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>".to_vec(),
+        raw_stream("", b"0 0 0 rg BT /F1 24 Tf 15 40 Td (ABC) Tj ET"),
+        b"<< /Type /Font /Subtype /TrueType /BaseFont /ABCDEF+Helvetica /Encoding /WinAnsiEncoding \
+          /FirstChar 65 /LastChar 67 /Widths [620 780 540] /FontDescriptor 6 0 R >>"
+            .to_vec(),
+        b"<< /Type /FontDescriptor /FontName /ABCDEF+Helvetica /Flags 32 /FontFile2 7 0 R >>"
+            .to_vec(),
+        raw_stream("", b"not a valid truetype font"),
+    ]);
+    let has_system_helvetica = zpdf::PdfDocument::open(recovered_pdf.clone())
+        .ok()
+        .and_then(|doc| {
+            let page = doc.page(0).ok()?;
+            let fonts = doc.load_page_fonts(&page);
+            Some(fonts.get_by_name("F1")?.1.has_font_data())
+        })
+        .unwrap_or(false);
+    if has_system_helvetica {
+        let input = dir.join("recovered.pdf");
+        fs::write(&input, recovered_pdf).unwrap();
+
+        let svg_out = dir.join("recovered.svg");
+        let svg_res = Command::new(env!("CARGO_BIN_EXE_zpdf"))
+            .args(["export-svg"])
+            .arg(&input)
+            .args(["-o"])
+            .arg(&svg_out)
+            .output()
+            .unwrap();
+        assert!(
+            svg_res.status.success(),
+            "export-svg failed: {}",
+            String::from_utf8_lossy(&svg_res.stderr)
+        );
+        let svg = fs::read_to_string(&svg_out).unwrap();
+        assert!(svg.contains("<svg") && svg.contains("<path"), "{svg}");
+        fs::remove_file(&svg_out).unwrap();
+
+        let text_res = Command::new(env!("CARGO_BIN_EXE_zpdf"))
+            .args(["text"])
+            .arg(&input)
+            .output()
+            .unwrap();
+        assert!(
+            text_res.status.success(),
+            "text failed: {}",
+            String::from_utf8_lossy(&text_res.stderr)
+        );
+        assert!(String::from_utf8_lossy(&text_res.stdout).contains("ABC"));
+
+        let txt_out = dir.join("recovered.txt");
+        let conv_res = Command::new(env!("CARGO_BIN_EXE_zpdf"))
+            .args(["convert"])
+            .arg(&input)
+            .args(["-o"])
+            .arg(&txt_out)
+            .output()
+            .unwrap();
+        assert!(
+            conv_res.status.success(),
+            "convert failed: {}",
+            String::from_utf8_lossy(&conv_res.stderr)
+        );
+        assert!(fs::read_to_string(&txt_out).unwrap().contains("ABC"));
+        fs::remove_file(&txt_out).unwrap();
+
+        #[cfg(feature = "cpu")]
+        {
+            let png_out = dir.join("recovered.png");
+            let render_res = Command::new(env!("CARGO_BIN_EXE_zpdf"))
+                .args(["render"])
+                .arg(&input)
+                .args(["--dpi", "72", "-o"])
+                .arg(&png_out)
+                .output()
+                .unwrap();
+            assert!(
+                render_res.status.success(),
+                "render failed: {}",
+                String::from_utf8_lossy(&render_res.stderr)
+            );
+            let bitmap = image::open(&png_out).unwrap().to_rgba8();
+            let dark_pixels = bitmap
+                .pixels()
+                .filter(|p| p.0[0] < 200 || p.0[1] < 200 || p.0[2] < 200)
+                .count();
+            assert!(
+                dark_pixels > 50,
+                "expected rendered fallback ink, got {dark_pixels}"
+            );
+            fs::remove_file(&png_out).unwrap();
+        }
+        fs::remove_file(&input).unwrap();
+    }
+
+    // 2. Corrupt Type0 Identity-H without /ToUnicode or CJK collection cannot
+    //    recover visible glyphs -> strict exports must fail without overwriting.
+    let unrecovered_pdf = assemble_raw(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 180 100] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>".to_vec(),
+        raw_stream("", b"0 0 0 rg BT /F1 24 Tf 15 40 Td <00010002> Tj ET"),
+        b"<< /Type /Font /Subtype /Type0 /BaseFont /ABCDEF+UnrecoverableCID /Encoding /Identity-H /DescendantFonts [6 0 R] >>".to_vec(),
+        b"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /ABCDEF+UnrecoverableCID \
+          /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> \
+          /FontDescriptor 7 0 R /DW 1000 >>"
+            .to_vec(),
+        b"<< /Type /FontDescriptor /FontName /ABCDEF+UnrecoverableCID /Flags 32 /FontFile2 8 0 R >>"
+            .to_vec(),
+        raw_stream("", b"corrupt unrecoverable cid font"),
+    ]);
+    let bad_input = dir.join("unrecovered.pdf");
+    fs::write(&bad_input, unrecovered_pdf).unwrap();
+
+    for (command, ext) in [("export-svg", "svg"), ("render", "png")] {
+        #[cfg(not(feature = "cpu"))]
+        if command == "render" {
+            continue;
+        }
+        let out = dir.join(format!("unrecovered.{ext}"));
+        fs::write(&out, b"existing").unwrap();
+        let res = Command::new(env!("CARGO_BIN_EXE_zpdf"))
+            .arg(command)
+            .arg(&bad_input)
+            .args(["-o"])
+            .arg(&out)
+            .output()
+            .unwrap();
+        assert!(
+            !res.status.success(),
+            "{command} should reject unrecovered output"
+        );
+        let stderr = String::from_utf8_lossy(&res.stderr);
+        assert!(
+            stderr.contains("incomplete output")
+                && stderr.contains("embedded_font_fallbacks=1")
+                && stderr.contains("missing_glyph_outlines=1"),
+            "{command}: {stderr}"
+        );
+        assert_eq!(fs::read(&out).unwrap(), b"existing");
+        fs::remove_file(&out).unwrap();
+    }
+    let bad_text = Command::new(env!("CARGO_BIN_EXE_zpdf"))
+        .args(["text"])
+        .arg(&bad_input)
+        .output()
+        .unwrap();
+    assert!(
+        !bad_text.status.success(),
+        "text should reject unmappable CID font with no decoded text"
+    );
+    let bad_text_err = String::from_utf8_lossy(&bad_text.stderr);
+    assert!(
+        bad_text_err.contains("incomplete output")
+            && bad_text_err.contains("decode_failures=1")
+            && bad_text_err.contains("embedded_font_fallbacks=1"),
+        "{bad_text_err}"
+    );
+    fs::remove_file(&bad_input).unwrap();
+
+    // 3. Corrupt font whose characters all decode via /ToUnicode (e.g. private-use
+    //    icon U+E001 absent from system fonts): `text` and `convert` succeed with
+    //    the decoded text while `export-svg` and `render` reject missing ink.
+    let pua_tounicode = b"/CIDInit /ProcSet findresource begin 12 dict begin begincmap \
+        1 begincodespacerange <0000> <FFFF> endcodespacerange \
+        1 beginbfchar <0001> <E001> endbfchar \
+        endcmap CMapName currentdict /CMap defineresource pop end end";
+    let decodable_missing_ink_pdf = assemble_raw(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 180 100] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>".to_vec(),
+        raw_stream("", b"0 0 0 rg BT /F1 24 Tf 15 40 Td <0001> Tj ET"),
+        b"<< /Type /Font /Subtype /Type0 /BaseFont /ABCDEF+UninstalledIconFace /Encoding /Identity-H /DescendantFonts [6 0 R] /ToUnicode 9 0 R >>".to_vec(),
+        b"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /ABCDEF+UninstalledIconFace \
+          /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> \
+          /FontDescriptor 7 0 R /DW 1000 >>"
+            .to_vec(),
+        b"<< /Type /FontDescriptor /FontName /ABCDEF+UninstalledIconFace /Flags 32 /FontFile2 8 0 R >>"
+            .to_vec(),
+        raw_stream("", b"corrupt icon font"),
+        raw_stream("", pua_tounicode),
+    ]);
+    let pua_input = dir.join("decodable_missing_ink.pdf");
+    fs::write(&pua_input, decodable_missing_ink_pdf).unwrap();
+
+    let pua_text = Command::new(env!("CARGO_BIN_EXE_zpdf"))
+        .args(["text"])
+        .arg(&pua_input)
+        .output()
+        .unwrap();
+    assert!(
+        pua_text.status.success(),
+        "text should succeed when all codes decode: {}",
+        String::from_utf8_lossy(&pua_text.stderr)
+    );
+    assert!(String::from_utf8_lossy(&pua_text.stdout).contains('\u{E001}'));
+
+    let pua_svg = dir.join("pua.svg");
+    let pua_svg_res = Command::new(env!("CARGO_BIN_EXE_zpdf"))
+        .args(["export-svg"])
+        .arg(&pua_input)
+        .args(["-o"])
+        .arg(&pua_svg)
+        .output()
+        .unwrap();
+    assert!(
+        !pua_svg_res.status.success(),
+        "export-svg must reject missing ink"
+    );
+    let pua_stderr = String::from_utf8_lossy(&pua_svg_res.stderr);
+    assert!(
+        pua_stderr.contains("incomplete output")
+            && pua_stderr.contains("missing_glyph_outlines=1")
+            && pua_stderr.contains("embedded_font_fallbacks=1"),
+        "{pua_stderr}"
+    );
+    fs::remove_file(&pua_input).unwrap();
+
+    // 4. Tagged PDF whose parent structure element supplies `/ActualText (Label)`
+    //    for an unmapped fallback CID: `zpdf text --struct` succeeds with "Label",
+    //    plain `zpdf text` rejects, and an additional uncovered MCID fails `--struct`.
+    let tagged_covered_pdf = assemble_raw(&[
+        b"<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 9 0 R /MarkInfo << /Marked true >> >>"
+            .to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 180 100] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>".to_vec(),
+        raw_stream(
+            "",
+            b"0 0 0 rg /Span << /MCID 0 >> BDC BT /F1 24 Tf 15 40 Td <0001> Tj ET EMC",
+        ),
+        b"<< /Type /Font /Subtype /Type0 /BaseFont /ABCDEF+TaggedStructCID /Encoding /Identity-H /DescendantFonts [6 0 R] >>".to_vec(),
+        b"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /ABCDEF+TaggedStructCID \
+          /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> \
+          /FontDescriptor 7 0 R /DW 1000 >>"
+            .to_vec(),
+        b"<< /Type /FontDescriptor /FontName /ABCDEF+TaggedStructCID /Flags 32 /FontFile2 8 0 R >>"
+            .to_vec(),
+        raw_stream("", b"corrupt tagged struct cid font"),
+        b"<< /Type /StructTreeRoot /K [10 0 R] >>".to_vec(),
+        b"<< /Type /StructElem /S /Span /Pg 3 0 R /ActualText (Label) /K 0 >>".to_vec(),
+    ]);
+    let tagged_input = dir.join("tagged_actual_text.pdf");
+    fs::write(&tagged_input, tagged_covered_pdf).unwrap();
+
+    let struct_text_res = Command::new(env!("CARGO_BIN_EXE_zpdf"))
+        .arg("text")
+        .arg(&tagged_input)
+        .arg("--struct")
+        .output()
+        .unwrap();
+    assert!(
+        struct_text_res.status.success(),
+        "text --struct should succeed when parent structure element supplies /ActualText: {}",
+        String::from_utf8_lossy(&struct_text_res.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&struct_text_res.stdout).trim(),
+        "Label"
+    );
+
+    let geom_text_res = Command::new(env!("CARGO_BIN_EXE_zpdf"))
+        .args(["text"])
+        .arg(&tagged_input)
+        .output()
+        .unwrap();
+    assert!(
+        !geom_text_res.status.success(),
+        "unstructured text should still reject unmapped fallback CID"
+    );
+    let geom_stderr = String::from_utf8_lossy(&geom_text_res.stderr);
+    assert!(
+        geom_stderr.contains("incomplete output")
+            && geom_stderr.contains("decode_failures=1")
+            && geom_stderr.contains("embedded_font_fallbacks=1"),
+        "expected incomplete-output decode failure on stderr, got: {geom_stderr}"
+    );
+    fs::remove_file(&tagged_input).unwrap();
+
+    let tagged_uncovered_pdf = assemble_raw(&[
+        b"<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 9 0 R /MarkInfo << /Marked true >> >>"
+            .to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 180 100] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>".to_vec(),
+        raw_stream(
+            "",
+            b"0 0 0 rg /Span << /MCID 0 >> BDC BT /F1 24 Tf 15 40 Td <0001> Tj ET EMC \
+              /Span << /MCID 1 >> BDC BT /F1 24 Tf 60 40 Td <0002> Tj ET EMC",
+        ),
+        b"<< /Type /Font /Subtype /Type0 /BaseFont /ABCDEF+TaggedStructCID /Encoding /Identity-H /DescendantFonts [6 0 R] >>".to_vec(),
+        b"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /ABCDEF+TaggedStructCID \
+          /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> \
+          /FontDescriptor 7 0 R /DW 1000 >>"
+            .to_vec(),
+        b"<< /Type /FontDescriptor /FontName /ABCDEF+TaggedStructCID /Flags 32 /FontFile2 8 0 R >>"
+            .to_vec(),
+        raw_stream("", b"corrupt tagged struct cid font"),
+        b"<< /Type /StructTreeRoot /K [10 0 R 11 0 R] >>".to_vec(),
+        b"<< /Type /StructElem /S /Span /Pg 3 0 R /ActualText (Label) /K 0 >>".to_vec(),
+        b"<< /Type /StructElem /S /Span /Pg 3 0 R /K 1 >>".to_vec(),
+    ]);
+    let uncovered_input = dir.join("tagged_uncovered.pdf");
+    fs::write(&uncovered_input, tagged_uncovered_pdf).unwrap();
+
+    let uncovered_res = Command::new(env!("CARGO_BIN_EXE_zpdf"))
+        .arg("text")
+        .arg(&uncovered_input)
+        .arg("--struct")
+        .output()
+        .unwrap();
+    assert!(
+        !uncovered_res.status.success(),
+        "text --struct must still reject uncovered unmapped fallback text"
+    );
+    let uncovered_stderr = String::from_utf8_lossy(&uncovered_res.stderr);
+    assert!(
+        uncovered_stderr.contains("incomplete output")
+            && uncovered_stderr.contains("decode_failures=1")
+            && uncovered_stderr.contains("embedded_font_fallbacks=1"),
+        "expected incomplete-output decode failure on stderr, got: {uncovered_stderr}"
+    );
+    fs::remove_file(&uncovered_input).unwrap();
+
+    // 5. Form `/MCR /Stm` MCID 0 replacement preserves an unrelated readable
+    //    page span that also uses MCID 0.
+    let form_stm_page_mcid0_pdf = assemble_raw(&[
+        b"<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 9 0 R /MarkInfo << /Marked true >> >>"
+            .to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 180 100] \
+          /Resources << /Font << /F0 12 0 R /F1 5 0 R >> /XObject << /Fm 11 0 R >> >> /Contents 4 0 R >>"
+            .to_vec(),
+        raw_stream(
+            "",
+            b"0 0 0 rg /Span << /MCID 0 >> BDC BT /F0 12 Tf 15 80 Td (PageText) Tj ET EMC /Fm Do",
+        ),
+        b"<< /Type /Font /Subtype /Type0 /BaseFont /ABCDEF+TaggedStructCID /Encoding /Identity-H /DescendantFonts [6 0 R] >>".to_vec(),
+        b"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /ABCDEF+TaggedStructCID \
+          /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> \
+          /FontDescriptor 7 0 R /DW 1000 >>"
+            .to_vec(),
+        b"<< /Type /FontDescriptor /FontName /ABCDEF+TaggedStructCID /Flags 32 /FontFile2 8 0 R >>"
+            .to_vec(),
+        raw_stream("", b"corrupt tagged struct cid font"),
+        b"<< /Type /StructTreeRoot /K [10 0 R] >>".to_vec(),
+        b"<< /Type /StructElem /S /Span /Pg 3 0 R /ActualText (FormLabel) /K << /Type /MCR /Pg 3 0 R /Stm 11 0 R /MCID 0 >> >>".to_vec(),
+        raw_stream(
+            "/Type /XObject /Subtype /Form /BBox [0 0 180 100] /Resources << /Font << /F1 5 0 R >> >>",
+            b"0 0 0 rg /Span << /MCID 0 >> BDC BT /F1 24 Tf 60 40 Td <0002> Tj ET EMC",
+        ),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
+            .to_vec(),
+    ]);
+    let form_stm_input = dir.join("form_stm_page_mcid0.pdf");
+    fs::write(&form_stm_input, form_stm_page_mcid0_pdf).unwrap();
+    let form_stm_res = Command::new(env!("CARGO_BIN_EXE_zpdf"))
+        .arg("text")
+        .arg(&form_stm_input)
+        .arg("--struct")
+        .output()
+        .unwrap();
+    assert!(
+        form_stm_res.status.success(),
+        "text --struct should succeed for Form /Stm replacement + page MCID 0: {}",
+        String::from_utf8_lossy(&form_stm_res.stderr)
+    );
+    let form_stm_stdout = String::from_utf8_lossy(&form_stm_res.stdout);
+    assert!(
+        form_stm_stdout.contains("FormLabel") && form_stm_stdout.contains("PageText"),
+        "expected both FormLabel and PageText, got {form_stm_stdout:?}"
+    );
+    fs::remove_file(&form_stm_input).unwrap();
+
+    // 6. Enclosing page `/MCID 0` `/ActualText (Label)` wrapping an untagged
+    //    Form invocation covers unmapped fallback glyphs inside that Form.
+    let enclosing_form_pdf = assemble_raw(&[
+        b"<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 9 0 R /MarkInfo << /Marked true >> >>"
+            .to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 180 100] /Resources << /XObject << /Fm 11 0 R >> >> /Contents 4 0 R >>".to_vec(),
+        raw_stream("", b"0 0 0 rg /Span << /MCID 0 >> BDC /Fm Do EMC"),
+        b"<< /Type /Font /Subtype /Type0 /BaseFont /ABCDEF+TaggedStructCID /Encoding /Identity-H /DescendantFonts [6 0 R] >>".to_vec(),
+        b"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /ABCDEF+TaggedStructCID \
+          /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> \
+          /FontDescriptor 7 0 R /DW 1000 >>"
+            .to_vec(),
+        b"<< /Type /FontDescriptor /FontName /ABCDEF+TaggedStructCID /Flags 32 /FontFile2 8 0 R >>"
+            .to_vec(),
+        raw_stream("", b"corrupt tagged struct cid font"),
+        b"<< /Type /StructTreeRoot /K [10 0 R] >>".to_vec(),
+        b"<< /Type /StructElem /S /Span /Pg 3 0 R /ActualText (Label) /K 0 >>".to_vec(),
+        raw_stream(
+            "/Type /XObject /Subtype /Form /BBox [0 0 180 100] /Resources << /Font << /F1 5 0 R >> >>",
+            b"0 0 0 rg BT /F1 24 Tf 15 40 Td <0001> Tj ET",
+        ),
+    ]);
+    let enclosing_input = dir.join("enclosing_form_actual_text.pdf");
+    fs::write(&enclosing_input, enclosing_form_pdf).unwrap();
+    let enclosing_res = Command::new(env!("CARGO_BIN_EXE_zpdf"))
+        .arg("text")
+        .arg(&enclosing_input)
+        .arg("--struct")
+        .output()
+        .unwrap();
+    assert!(
+        enclosing_res.status.success(),
+        "text --struct should succeed when enclosing /MCID 0 /ActualText wraps untagged Form: {}",
+        String::from_utf8_lossy(&enclosing_res.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&enclosing_res.stdout).trim(),
+        "Label"
+    );
+    fs::remove_file(&enclosing_input).unwrap();
+
+    fs::remove_dir(dir).unwrap();
+}

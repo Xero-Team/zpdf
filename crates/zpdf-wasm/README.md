@@ -12,17 +12,17 @@ Pure Rust with zero C dependencies — no pdfium, no MuPDF, no `poppler` — mak
 
 ## Build
 
-Requires `wasm32-unknown-unknown` target and `wasm-bindgen-cli` at the version matching `Cargo.lock`:
+Requires `wasm32-unknown-unknown` target and `wasm-bindgen-cli` matching the pinned `wasm-bindgen` dependency (`0.2.130`) in `crates/zpdf-wasm/Cargo.toml`:
 
 ```bash
 rustup target add wasm32-unknown-unknown
-cargo install wasm-bindgen-cli --version 0.2.129 --locked
+cargo install wasm-bindgen-cli --version 0.2.130 --locked
 bash crates/zpdf-wasm/build-web.sh
 ```
 
-The checked-in package records `wasm-bindgen 0.2.129` in `www/pkg/build.json`.
-If dependency resolution changes the `wasm-bindgen` version in your local
-`Cargo.lock`, install that exact CLI version before rebuilding the bindings.
+`crates/zpdf-wasm/Cargo.toml` pins `wasm-bindgen = "=0.2.130"`, matching the
+checked-in `www/pkg/build.json`. When bumping that pinned version, install the
+matching `wasm-bindgen-cli` release before rebuilding the bindings.
 
 This compiles for wasm32 and generates ES-module bindings into `www/pkg/`.
 Node.js is also required: the build records source/artifact fingerprints in
