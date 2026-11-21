@@ -147,7 +147,7 @@ export class Pdf {
     }
     /**
      * Open a PDF from bytes (empty-password encrypted files open too).
-     * @param {Uint8Array} data
+     * @param {Uint8Array | number[]} data
      * @returns {Pdf}
      */
     static open(data) {
@@ -161,15 +161,22 @@ export class Pdf {
     }
     /**
      * Open an encrypted PDF with a user or owner password.
-     * @param {Uint8Array} data
+     * @param {Uint8Array | number[]} data
      * @param {string} password
      * @returns {Pdf}
      */
     static open_with_password(data, password) {
-        const ptr0 = passArray8ToWasm0(data, wasm.__wbindgen_malloc);
-        const len0 = WASM_VECTOR_LEN;
-        const ptr1 = passStringToWasm0(password, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-        const len1 = WASM_VECTOR_LEN;
+        let ptr0, len0, ptr1, len1;
+        try {
+            ptr0 = passArray8ToWasm0(data, wasm.__wbindgen_malloc);
+            len0 = WASM_VECTOR_LEN;
+            ptr1 = passStringToWasm0(password, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            len1 = WASM_VECTOR_LEN;
+        } catch (e) {
+            if (ptr1) { wasm.__wbindgen_free(ptr1, len1 * 1, 1); }
+            if (ptr0) { wasm.__wbindgen_free(ptr0, len0 * 1, 1); }
+            throw e;
+        }
         const ret = wasm.pdf_open_with_password(ptr0, len0, ptr1, len1);
         if (ret[2]) {
             throw takeFromExternrefTable0(ret[1]);
@@ -247,17 +254,25 @@ export class Pdf {
     }
     /**
      * Supply a raw TTF/OTF/TTC face; rebuild a page to use newly registered fonts.
-     * @param {Uint8Array} data
+     * @param {Uint8Array | number[]} data
      * @param {number} face_index
      * @param {string} alias
      * @returns {number}
      */
     register_font(data, face_index, alias) {
-        const ptr0 = passArray8ToWasm0(data, wasm.__wbindgen_malloc);
-        const len0 = WASM_VECTOR_LEN;
-        const ptr1 = passStringToWasm0(alias, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-        const len1 = WASM_VECTOR_LEN;
-        const ret = wasm.pdf_register_font(this.__wbg_ptr, ptr0, len0, face_index, ptr1, len1);
+        const val3 = +face_index;
+        let ptr0, len0, ptr1, len1;
+        try {
+            ptr0 = passArray8ToWasm0(data, wasm.__wbindgen_malloc);
+            len0 = WASM_VECTOR_LEN;
+            ptr1 = passStringToWasm0(alias, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            len1 = WASM_VECTOR_LEN;
+        } catch (e) {
+            if (ptr1) { wasm.__wbindgen_free(ptr1, len1 * 1, 1); }
+            if (ptr0) { wasm.__wbindgen_free(ptr0, len0 * 1, 1); }
+            throw e;
+        }
+        const ret = wasm.pdf_register_font(this.__wbg_ptr, ptr0, len0, val3, ptr1, len1);
         if (ret[2]) {
             throw takeFromExternrefTable0(ret[1]);
         }
@@ -266,18 +281,27 @@ export class Pdf {
     /**
      * Register compressed bytes without decoding until the named face is needed.
      * The host performs fetch/cache operations before calling this method.
-     * @param {Uint8Array} data
+     * @param {Uint8Array | number[]} data
      * @param {number} face_index
      * @param {string} alias
      * @param {number} decoded_limit
      * @returns {number}
      */
     register_zlib_font(data, face_index, alias, decoded_limit) {
-        const ptr0 = passArray8ToWasm0(data, wasm.__wbindgen_malloc);
-        const len0 = WASM_VECTOR_LEN;
-        const ptr1 = passStringToWasm0(alias, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-        const len1 = WASM_VECTOR_LEN;
-        const ret = wasm.pdf_register_zlib_font(this.__wbg_ptr, ptr0, len0, face_index, ptr1, len1, decoded_limit);
+        const val3 = +face_index;
+        const val4 = +decoded_limit;
+        let ptr0, len0, ptr1, len1;
+        try {
+            ptr0 = passArray8ToWasm0(data, wasm.__wbindgen_malloc);
+            len0 = WASM_VECTOR_LEN;
+            ptr1 = passStringToWasm0(alias, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            len1 = WASM_VECTOR_LEN;
+        } catch (e) {
+            if (ptr1) { wasm.__wbindgen_free(ptr1, len1 * 1, 1); }
+            if (ptr0) { wasm.__wbindgen_free(ptr0, len0 * 1, 1); }
+            throw e;
+        }
+        const ret = wasm.pdf_register_zlib_font(this.__wbg_ptr, ptr0, len0, val3, ptr1, len1, val4);
         if (ret[2]) {
             throw takeFromExternrefTable0(ret[1]);
         }
@@ -374,9 +398,18 @@ export class PdfEditor {
      * @param {number | null} [b]
      */
     add_freetext(page, x0, y0, x1, y1, contents, size, r, g, b) {
+        const val2 = +page;
+        const val3 = +x0;
+        const val4 = +y0;
+        const val5 = +x1;
+        const val6 = +y1;
+        const val7 = +(isLikeNone(size) ? 0 : size);
+        const val8 = +(isLikeNone(r) ? 0 : r);
+        const val9 = +(isLikeNone(g) ? 0 : g);
+        const val10 = +(isLikeNone(b) ? 0 : b);
         const ptr0 = passStringToWasm0(contents, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         const len0 = WASM_VECTOR_LEN;
-        const ret = wasm.pdfeditor_add_freetext(this.__wbg_ptr, page, x0, y0, x1, y1, ptr0, len0, !isLikeNone(size), isLikeNone(size) ? 0 : size, !isLikeNone(r), isLikeNone(r) ? 0 : r, !isLikeNone(g), isLikeNone(g) ? 0 : g, !isLikeNone(b), isLikeNone(b) ? 0 : b);
+        const ret = wasm.pdfeditor_add_freetext(this.__wbg_ptr, val2, val3, val4, val5, val6, ptr0, len0, !isLikeNone(size), val7, !isLikeNone(r), val8, !isLikeNone(g), val9, !isLikeNone(b), val10);
         if (ret[1]) {
             throw takeFromExternrefTable0(ret[0]);
         }
@@ -425,11 +458,24 @@ export class PdfEditor {
      * @param {string | null} [icon]
      */
     add_note(page, x, y, contents, r, g, b, icon) {
-        const ptr0 = passStringToWasm0(contents, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-        const len0 = WASM_VECTOR_LEN;
-        var ptr1 = isLikeNone(icon) ? 0 : passStringToWasm0(icon, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-        var len1 = WASM_VECTOR_LEN;
-        const ret = wasm.pdfeditor_add_note(this.__wbg_ptr, page, x, y, ptr0, len0, !isLikeNone(r), isLikeNone(r) ? 0 : r, !isLikeNone(g), isLikeNone(g) ? 0 : g, !isLikeNone(b), isLikeNone(b) ? 0 : b, ptr1, len1);
+        const val3 = +page;
+        const val4 = +x;
+        const val5 = +y;
+        const val6 = +(isLikeNone(r) ? 0 : r);
+        const val7 = +(isLikeNone(g) ? 0 : g);
+        const val8 = +(isLikeNone(b) ? 0 : b);
+        let ptr0, len0, ptr1, len1;
+        try {
+            ptr0 = passStringToWasm0(contents, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            len0 = WASM_VECTOR_LEN;
+            ptr1 = isLikeNone(icon) ? 0 : passStringToWasm0(icon, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            len1 = WASM_VECTOR_LEN;
+        } catch (e) {
+            if (ptr1) { wasm.__wbindgen_free(ptr1, len1 * 1, 1); }
+            if (ptr0) { wasm.__wbindgen_free(ptr0, len0 * 1, 1); }
+            throw e;
+        }
+        const ret = wasm.pdfeditor_add_note(this.__wbg_ptr, val3, val4, val5, ptr0, len0, !isLikeNone(r), val6, !isLikeNone(g), val7, !isLikeNone(b), val8, ptr1, len1);
         if (ret[1]) {
             throw takeFromExternrefTable0(ret[0]);
         }
@@ -504,7 +550,7 @@ export class PdfEditor {
     }
     /**
      * Delete the given (0-based) pages. Deleting every page is an error.
-     * @param {Uint32Array} pages
+     * @param {Uint32Array | number[]} pages
      */
     delete_pages(pages) {
         const ptr0 = passArray32ToWasm0(pages, wasm.__wbindgen_malloc);
@@ -522,10 +568,17 @@ export class PdfEditor {
      * @param {string[]} values
      */
     fill_fields(names, values) {
-        const ptr0 = passArrayJsValueToWasm0(names, wasm.__wbindgen_malloc);
-        const len0 = WASM_VECTOR_LEN;
-        const ptr1 = passArrayJsValueToWasm0(values, wasm.__wbindgen_malloc);
-        const len1 = WASM_VECTOR_LEN;
+        let ptr0, len0, ptr1, len1;
+        try {
+            ptr0 = passArrayJsValueToWasm0(names, wasm.__wbindgen_malloc);
+            len0 = WASM_VECTOR_LEN;
+            ptr1 = passArrayJsValueToWasm0(values, wasm.__wbindgen_malloc);
+            len1 = WASM_VECTOR_LEN;
+        } catch (e) {
+            if (ptr1) { wasm.__externref_drop_slice(ptr1, len1); wasm.__wbindgen_free(ptr1, len1 * 4, 4); }
+            if (ptr0) { wasm.__externref_drop_slice(ptr0, len0); wasm.__wbindgen_free(ptr0, len0 * 4, 4); }
+            throw e;
+        }
         const ret = wasm.pdfeditor_fill_fields(this.__wbg_ptr, ptr0, len0, ptr1, len1);
         if (ret[1]) {
             throw takeFromExternrefTable0(ret[0]);
@@ -534,7 +587,7 @@ export class PdfEditor {
     /**
      * Append all pages of `other` to this document. Returns the number of
      * pages appended. Call `save()` to materialize.
-     * @param {Uint8Array} other
+     * @param {Uint8Array | number[]} other
      * @returns {number}
      */
     merge(other) {
@@ -548,7 +601,7 @@ export class PdfEditor {
     }
     /**
      * Open a PDF for editing (empty-password encrypted files open too).
-     * @param {Uint8Array} data
+     * @param {Uint8Array | number[]} data
      * @returns {PdfEditor}
      */
     static open(data) {
@@ -562,15 +615,22 @@ export class PdfEditor {
     }
     /**
      * Open an encrypted PDF with a user or owner password.
-     * @param {Uint8Array} data
+     * @param {Uint8Array | number[]} data
      * @param {string} password
      * @returns {PdfEditor}
      */
     static open_with_password(data, password) {
-        const ptr0 = passArray8ToWasm0(data, wasm.__wbindgen_malloc);
-        const len0 = WASM_VECTOR_LEN;
-        const ptr1 = passStringToWasm0(password, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-        const len1 = WASM_VECTOR_LEN;
+        let ptr0, len0, ptr1, len1;
+        try {
+            ptr0 = passArray8ToWasm0(data, wasm.__wbindgen_malloc);
+            len0 = WASM_VECTOR_LEN;
+            ptr1 = passStringToWasm0(password, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            len1 = WASM_VECTOR_LEN;
+        } catch (e) {
+            if (ptr1) { wasm.__wbindgen_free(ptr1, len1 * 1, 1); }
+            if (ptr0) { wasm.__wbindgen_free(ptr0, len0 * 1, 1); }
+            throw e;
+        }
         const ret = wasm.pdfeditor_open_with_password(ptr0, len0, ptr1, len1);
         if (ret[2]) {
             throw takeFromExternrefTable0(ret[1]);
@@ -591,29 +651,38 @@ export class PdfEditor {
      * document. Encrypted inputs are rejected because this API cannot select
      * an output-encryption policy.
      * @param {number} page
-     * @param {Float64Array} rects
-     * @param {Float64Array | null} [fill]
+     * @param {Float64Array | number[]} rects
+     * @param {Float64Array | number[] | null} [fill]
      */
     redact(page, rects, fill) {
-        const ptr0 = passArrayF64ToWasm0(rects, wasm.__wbindgen_malloc);
-        const len0 = WASM_VECTOR_LEN;
-        var ptr1 = isLikeNone(fill) ? 0 : passArrayF64ToWasm0(fill, wasm.__wbindgen_malloc);
-        var len1 = WASM_VECTOR_LEN;
-        const ret = wasm.pdfeditor_redact(this.__wbg_ptr, page, ptr0, len0, ptr1, len1);
+        const val3 = +page;
+        let ptr0, len0, ptr1, len1;
+        try {
+            ptr0 = passArrayF64ToWasm0(rects, wasm.__wbindgen_malloc);
+            len0 = WASM_VECTOR_LEN;
+            ptr1 = isLikeNone(fill) ? 0 : passArrayF64ToWasm0(fill, wasm.__wbindgen_malloc);
+            len1 = WASM_VECTOR_LEN;
+        } catch (e) {
+            if (ptr1) { wasm.__wbindgen_free(ptr1, len1 * 8, 8); }
+            if (ptr0) { wasm.__wbindgen_free(ptr0, len0 * 8, 8); }
+            throw e;
+        }
+        const ret = wasm.pdfeditor_redact(this.__wbg_ptr, val3, ptr0, len0, ptr1, len1);
         if (ret[1]) {
             throw takeFromExternrefTable0(ret[0]);
         }
     }
     /**
      * Register an authoring font for Unicode form values and text stamps.
-     * @param {Uint8Array} bytes
+     * @param {Uint8Array | number[]} bytes
      * @param {number} face_index
      * @returns {number}
      */
     register_font(bytes, face_index) {
+        const val2 = +face_index;
         const ptr0 = passArray8ToWasm0(bytes, wasm.__wbindgen_malloc);
         const len0 = WASM_VECTOR_LEN;
-        const ret = wasm.pdfeditor_register_font(this.__wbg_ptr, ptr0, len0, face_index);
+        const ret = wasm.pdfeditor_register_font(this.__wbg_ptr, ptr0, len0, val2);
         if (ret[2]) {
             throw takeFromExternrefTable0(ret[1]);
         }
@@ -622,7 +691,7 @@ export class PdfEditor {
     /**
      * Reorder pages: `order[i]` is the current position of the page that becomes
      * new page `i` (a full permutation of `0..page_count`).
-     * @param {Uint32Array} order
+     * @param {Uint32Array | number[]} order
      */
     reorder_pages(order) {
         const ptr0 = passArray32ToWasm0(order, wasm.__wbindgen_malloc);
@@ -727,7 +796,7 @@ export class PdfEditor {
      * Stamp a raw RGBA8 image on a page. `pixels` is tightly packed
      * `width*height*4` bytes; the alpha channel becomes a `/SMask`.
      * @param {number} page
-     * @param {Uint8Array} pixels
+     * @param {Uint8Array | number[]} pixels
      * @param {number} width
      * @param {number} height
      * @param {number} x
@@ -736,9 +805,16 @@ export class PdfEditor {
      * @param {number} h
      */
     stamp_image_rgba(page, pixels, width, height, x, y, w, h) {
+        const val2 = +page;
+        const val3 = +width;
+        const val4 = +height;
+        const val5 = +x;
+        const val6 = +y;
+        const val7 = +w;
+        const val8 = +h;
         const ptr0 = passArray8ToWasm0(pixels, wasm.__wbindgen_malloc);
         const len0 = WASM_VECTOR_LEN;
-        const ret = wasm.pdfeditor_stamp_image_rgba(this.__wbg_ptr, page, ptr0, len0, width, height, x, y, w, h);
+        const ret = wasm.pdfeditor_stamp_image_rgba(this.__wbg_ptr, val2, ptr0, len0, val3, val4, val5, val6, val7, val8);
         if (ret[1]) {
             throw takeFromExternrefTable0(ret[0]);
         }
@@ -757,11 +833,25 @@ export class PdfEditor {
      * @param {number} b
      */
     stamp_text(page, text, x, y, font, size, r, g, b) {
-        const ptr0 = passStringToWasm0(text, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-        const len0 = WASM_VECTOR_LEN;
-        const ptr1 = passStringToWasm0(font, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-        const len1 = WASM_VECTOR_LEN;
-        const ret = wasm.pdfeditor_stamp_text(this.__wbg_ptr, page, ptr0, len0, x, y, ptr1, len1, size, r, g, b);
+        const val3 = +page;
+        const val4 = +x;
+        const val5 = +y;
+        const val6 = +size;
+        const val7 = +r;
+        const val8 = +g;
+        const val9 = +b;
+        let ptr0, len0, ptr1, len1;
+        try {
+            ptr0 = passStringToWasm0(text, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            len0 = WASM_VECTOR_LEN;
+            ptr1 = passStringToWasm0(font, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            len1 = WASM_VECTOR_LEN;
+        } catch (e) {
+            if (ptr1) { wasm.__wbindgen_free(ptr1, len1 * 1, 1); }
+            if (ptr0) { wasm.__wbindgen_free(ptr0, len0 * 1, 1); }
+            throw e;
+        }
+        const ret = wasm.pdfeditor_stamp_text(this.__wbg_ptr, val3, ptr0, len0, val4, val5, ptr1, len1, val6, val7, val8, val9);
         if (ret[1]) {
             throw takeFromExternrefTable0(ret[0]);
         }
@@ -773,15 +863,22 @@ if (Symbol.dispose) PdfEditor.prototype[Symbol.dispose] = PdfEditor.prototype.fr
  * Garbage-collect / recompress / downsample a PDF, or linearize it for fast
  * web view. (Encryption and PDF/A conversion are not exposed to wasm in this
  * round — they need more option types; use the native facade for those.)
- * @param {Uint8Array} data
+ * @param {Uint8Array | number[]} data
  * @param {OptimizeOptions} opts
  * @returns {Uint8Array}
  */
 export function optimize(data, opts) {
-    const ptr0 = passArray8ToWasm0(data, wasm.__wbindgen_malloc);
-    const len0 = WASM_VECTOR_LEN;
-    _assertClass(opts, OptimizeOptions);
-    var ptr1 = opts.__destroy_into_raw();
+    let ptr0, len0, ptr1;
+    try {
+        ptr0 = passArray8ToWasm0(data, wasm.__wbindgen_malloc);
+        len0 = WASM_VECTOR_LEN;
+        _assertClass(opts, OptimizeOptions);
+        ptr1 = opts.__destroy_into_raw();
+    } catch (e) {
+        if (ptr1) wasm.__wbg_optimizeoptions_free(ptr1, 1);
+        if (ptr0) { wasm.__wbindgen_free(ptr0, len0 * 1, 1); }
+        throw e;
+    }
     const ret = wasm.optimize(ptr0, len0, ptr1);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
@@ -793,15 +890,22 @@ export function optimize(data, opts) {
 
 /**
  * Extract selected (0-based) pages into a fresh self-contained PDF.
- * @param {Uint8Array} data
- * @param {Uint32Array} pages
+ * @param {Uint8Array | number[]} data
+ * @param {Uint32Array | number[]} pages
  * @returns {Uint8Array}
  */
 export function split_pages(data, pages) {
-    const ptr0 = passArray8ToWasm0(data, wasm.__wbindgen_malloc);
-    const len0 = WASM_VECTOR_LEN;
-    const ptr1 = passArray32ToWasm0(pages, wasm.__wbindgen_malloc);
-    const len1 = WASM_VECTOR_LEN;
+    let ptr0, len0, ptr1, len1;
+    try {
+        ptr0 = passArray8ToWasm0(data, wasm.__wbindgen_malloc);
+        len0 = WASM_VECTOR_LEN;
+        ptr1 = passArray32ToWasm0(pages, wasm.__wbindgen_malloc);
+        len1 = WASM_VECTOR_LEN;
+    } catch (e) {
+        if (ptr1) { wasm.__wbindgen_free(ptr1, len1 * 4, 4); }
+        if (ptr0) { wasm.__wbindgen_free(ptr0, len0 * 1, 1); }
+        throw e;
+    }
     const ret = wasm.split_pages(ptr0, len0, ptr1, len1);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
@@ -820,43 +924,43 @@ export function start() {
 function __wbg_get_imports() {
     const import0 = {
         __proto__: null,
-        __wbg_Error_30c8987f7c2ed4e2: function(arg0, arg1) {
+        __wbg_Error_208446807d0d1e30: function(arg0, arg1) {
             const ret = Error(getStringFromWasm0(arg0, arg1));
             return ret;
         },
-        __wbg___wbindgen_is_function_1f9d30630b8b1d3d: function(arg0) {
+        __wbg___wbindgen_is_function_741ff2bb612836f5: function(arg0) {
             const ret = typeof(arg0) === 'function';
             return ret;
         },
-        __wbg___wbindgen_is_object_3c45d4f2dde4e749: function(arg0) {
+        __wbg___wbindgen_is_object_8b968c3ab8e96595: function(arg0) {
             const val = arg0;
             const ret = typeof(val) === 'object' && val !== null;
             return ret;
         },
-        __wbg___wbindgen_is_string_90b56bc79aad6f6c: function(arg0) {
+        __wbg___wbindgen_is_string_fc456fee5d3317de: function(arg0) {
             const ret = typeof(arg0) === 'string';
             return ret;
         },
-        __wbg___wbindgen_is_undefined_8865fb403f8fe9d8: function(arg0) {
+        __wbg___wbindgen_is_undefined_be5b34249ff1fc15: function(arg0) {
             const ret = arg0 === undefined;
             return ret;
         },
-        __wbg___wbindgen_string_get_0380ccaa2f57f0d9: function(arg0, arg1) {
+        __wbg___wbindgen_string_get_7ce8eee7fd327545: function(arg0, arg1) {
             const obj = arg1;
             const ret = typeof(obj) === 'string' ? obj : undefined;
             var ptr1 = isLikeNone(ret) ? 0 : passStringToWasm0(ret, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
             var len1 = WASM_VECTOR_LEN;
-            getDataViewMemory0().setInt32(arg0 + 4 * 1, len1, true);
-            getDataViewMemory0().setInt32(arg0 + 4 * 0, ptr1, true);
+            getDataViewMemory0().setInt32((arg0 >>> 0) + 4 * 1, len1, true);
+            getDataViewMemory0().setInt32((arg0 >>> 0) + 4 * 0, ptr1, true);
         },
-        __wbg___wbindgen_throw_41e9ee4f547fc59a: function(arg0, arg1) {
+        __wbg___wbindgen_throw_4c88d8bf264fd984: function(arg0, arg1) {
             throw new Error(getStringFromWasm0(arg0, arg1));
         },
-        __wbg_call_187d372bd5fdd4aa: function() { return handleError(function (arg0, arg1, arg2) {
+        __wbg_call_a410eb4b59ed5965: function() { return handleError(function (arg0, arg1, arg2) {
             const ret = arg0.call(arg1, arg2);
             return ret;
         }, arguments); },
-        __wbg_crypto_38df2bab126b63dc: function(arg0) {
+        __wbg_crypto_23f565a907d30078: function(arg0) {
             const ret = arg0.crypto;
             return ret;
         },
@@ -871,71 +975,71 @@ function __wbg_get_imports() {
                 wasm.__wbindgen_free(deferred0_0, deferred0_1, 1);
             }
         },
-        __wbg_getRandomValues_c44a50d8cfdaebeb: function() { return handleError(function (arg0, arg1) {
+        __wbg_getRandomValues_d2908e0b99612b91: function() { return handleError(function (arg0, arg1) {
             arg0.getRandomValues(arg1);
         }, arguments); },
-        __wbg_length_7f3c00c40364105e: function(arg0) {
+        __wbg_length_186163212ffe79c3: function(arg0) {
             const ret = arg0.length;
             return ret;
         },
-        __wbg_msCrypto_bd5a034af96bcba6: function(arg0) {
+        __wbg_msCrypto_d5f06fad6bf1409b: function(arg0) {
             const ret = arg0.msCrypto;
             return ret;
         },
-        __wbg_new_227d7c05414eb861: function() {
+        __wbg_new_bb74001155cb8ca8: function() {
             const ret = new Error();
             return ret;
         },
-        __wbg_new_with_length_3da0ad195f6f63ba: function(arg0) {
+        __wbg_new_with_length_01b143a7e5dd5a3e: function(arg0) {
             const ret = new Uint8Array(arg0 >>> 0);
             return ret;
         },
-        __wbg_node_84ea875411254db1: function(arg0) {
+        __wbg_node_86166ff8ce1f2002: function(arg0) {
             const ret = arg0.node;
             return ret;
         },
-        __wbg_process_44c7a14e11e9f69e: function(arg0) {
+        __wbg_process_91f425a63f58e399: function(arg0) {
             const ret = arg0.process;
             return ret;
         },
-        __wbg_prototypesetcall_bc27214492979395: function(arg0, arg1, arg2) {
+        __wbg_prototypesetcall_13162965d1fe7aa3: function(arg0, arg1, arg2) {
             Uint8Array.prototype.set.call(getArrayU8FromWasm0(arg0, arg1), arg2);
         },
-        __wbg_randomFillSync_6c25eac9869eb53c: function() { return handleError(function (arg0, arg1) {
+        __wbg_randomFillSync_34b023059e3363de: function() { return handleError(function (arg0, arg1) {
             arg0.randomFillSync(arg1);
         }, arguments); },
-        __wbg_require_b4edbdcf3e2a1ef0: function() { return handleError(function () {
+        __wbg_require_9a7d8cc2e1d275c0: function() { return handleError(function () {
             const ret = module.require;
             return ret;
         }, arguments); },
-        __wbg_stack_3b0d974bbf31e44f: function(arg0, arg1) {
+        __wbg_stack_575c4e0918581b9c: function(arg0, arg1) {
             const ret = arg1.stack;
             const ptr1 = passStringToWasm0(ret, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
             const len1 = WASM_VECTOR_LEN;
-            getDataViewMemory0().setInt32(arg0 + 4 * 1, len1, true);
-            getDataViewMemory0().setInt32(arg0 + 4 * 0, ptr1, true);
+            getDataViewMemory0().setInt32((arg0 >>> 0) + 4 * 1, len1, true);
+            getDataViewMemory0().setInt32((arg0 >>> 0) + 4 * 0, ptr1, true);
         },
-        __wbg_static_accessor_GLOBAL_266715b9d96ba635: function() {
-            const ret = typeof global === 'undefined' ? null : global;
+        __wbg_static_accessor_GLOBAL_THIS_003ee833af9699fc: function() {
+            const ret = typeof globalThis === 'undefined' ? undefined : globalThis;
             return isLikeNone(ret) ? 0 : addToExternrefTable0(ret);
         },
-        __wbg_static_accessor_GLOBAL_THIS_10fb7dc1ae063179: function() {
-            const ret = typeof globalThis === 'undefined' ? null : globalThis;
+        __wbg_static_accessor_GLOBAL_e4293fb22cbe77da: function() {
+            const ret = typeof global === 'undefined' ? undefined : global;
             return isLikeNone(ret) ? 0 : addToExternrefTable0(ret);
         },
-        __wbg_static_accessor_SELF_0b583911f537483a: function() {
-            const ret = typeof self === 'undefined' ? null : self;
+        __wbg_static_accessor_SELF_53bb20457401453d: function() {
+            const ret = typeof self === 'undefined' ? undefined : self;
             return isLikeNone(ret) ? 0 : addToExternrefTable0(ret);
         },
-        __wbg_static_accessor_WINDOW_d7f903d1508cbdc4: function() {
-            const ret = typeof window === 'undefined' ? null : window;
+        __wbg_static_accessor_WINDOW_b5e0810bfecb7feb: function() {
+            const ret = typeof window === 'undefined' ? undefined : window;
             return isLikeNone(ret) ? 0 : addToExternrefTable0(ret);
         },
-        __wbg_subarray_002b94d5e13d1411: function(arg0, arg1, arg2) {
+        __wbg_subarray_58f388a9247ac0bb: function(arg0, arg1, arg2) {
             const ret = arg0.subarray(arg1 >>> 0, arg2 >>> 0);
             return ret;
         },
-        __wbg_versions_276b2795b1c6a219: function(arg0) {
+        __wbg_versions_6e128a981b0df859: function(arg0) {
             const ret = arg0.versions;
             return ret;
         },
@@ -951,12 +1055,11 @@ function __wbg_get_imports() {
         },
         __wbindgen_init_externref_table: function() {
             const table = wasm.__wbindgen_externrefs;
-            const offset = table.grow(4);
             table.set(0, undefined);
-            table.set(offset + 0, undefined);
-            table.set(offset + 1, null);
-            table.set(offset + 2, true);
-            table.set(offset + 3, false);
+            table.set(1024, undefined);
+            table.set(1025, null);
+            table.set(1026, true);
+            table.set(1027, false);
         },
     };
     return {
@@ -1017,7 +1120,8 @@ function getFloat64ArrayMemory0() {
 }
 
 function getStringFromWasm0(ptr, len) {
-    return decodeText(ptr >>> 0, len);
+    ptr = ptr >>> 0;
+    return decodeText(getUint8ArrayMemory0().subarray(ptr, ptr + len));
 }
 
 let cachedUint32ArrayMemory0 = null;
@@ -1123,18 +1227,18 @@ function takeFromExternrefTable0(idx) {
     return value;
 }
 
-let cachedTextDecoder = new TextDecoder('utf-8', { ignoreBOM: true, fatal: true });
+let cachedTextDecoder = new TextDecoder('utf-8', { ignoreBOM: true });
 cachedTextDecoder.decode();
 const MAX_SAFARI_DECODE_BYTES = 2146435072;
 let numBytesDecoded = 0;
-function decodeText(ptr, len) {
-    numBytesDecoded += len;
+function decodeText(bytes) {
+    numBytesDecoded += bytes.length;
     if (numBytesDecoded >= MAX_SAFARI_DECODE_BYTES) {
-        cachedTextDecoder = new TextDecoder('utf-8', { ignoreBOM: true, fatal: true });
+        cachedTextDecoder = new TextDecoder('utf-8', { ignoreBOM: true });
         cachedTextDecoder.decode();
-        numBytesDecoded = len;
+        numBytesDecoded = bytes.length;
     }
-    return cachedTextDecoder.decode(getUint8ArrayMemory0().subarray(ptr, ptr + len));
+    return cachedTextDecoder.decode(bytes);
 }
 
 const cachedTextEncoder = new TextEncoder();
@@ -1224,9 +1328,17 @@ function initSync(module) {
     return __wbg_finalize_init(instance, module);
 }
 
+let __wbg_init_promise;
 async function __wbg_init(module_or_path) {
     if (wasm !== undefined) return wasm;
+    if (__wbg_init_promise === undefined) {
+        __wbg_init_promise = __wbg_init_once(module_or_path);
+        __wbg_init_promise.catch(() => { __wbg_init_promise = undefined; });
+    }
+    return __wbg_init_promise;
+}
 
+async function __wbg_init_once(module_or_path) {
 
     if (module_or_path !== undefined) {
         if (Object.getPrototypeOf(module_or_path) === Object.prototype) {
