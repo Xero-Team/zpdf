@@ -2000,4 +2000,261 @@ mod tests {
             BuildResult::Degrade
         ));
     }
+
+    // ------------------------------------------------------------------
+    // Damaged xref + encrypted object streams (hayro-style two-pass repair)
+    // ------------------------------------------------------------------
+
+    /// RC4-40 PDF whose /Pages and /Page dicts live in encrypted object
+    /// stream 6. `stale_container` writes an xref stream whose entry for 6
+    /// points at the wrong bytes; otherwise `startxref` points at garbage so
+    /// the whole xref must be rebuilt by recovery.
+    fn build_rc4_objstm_pdf(content_plain: &[u8], stale_container: bool) -> Vec<u8> {
+        let okey = md5(&PAD);
+        let o = rc4(&okey[..5], &PAD);
+        let id0: Vec<u8> = (0u8..16).collect();
+        let p: i32 = -1;
+        let key = compute_key_rc4(b"", &o, p, &id0, 2, 40, true);
+        let u = rc4(&key, &PAD);
+        let enc = Decryptor {
+            key,
+            stm_algo: Algo::Rc4,
+            str_algo: Algo::Rc4,
+            eff_algo: Algo::Rc4,
+            crypt_filters: Vec::new(),
+            encrypt_id: None,
+            encrypt_metadata: true,
+        };
+        let stream = |id: u32, extra: &str, plain: &[u8]| {
+            let data = enc.decrypt_stream_bytes(ObjectId(id, 0), plain);
+            let mut obj = format!("<< {extra}/Length {} >>\nstream\n", data.len()).into_bytes();
+            obj.extend_from_slice(&data);
+            obj.extend_from_slice(b"\nendstream");
+            obj
+        };
+        let pages = b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>";
+        let page = b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 5 0 R >>";
+        let header = format!("2 0 3 {} ", pages.len() + 1);
+        let mut members = header.clone().into_bytes();
+        members.extend_from_slice(pages);
+        members.push(b' ');
+        members.extend_from_slice(page);
+        let objstm = stream(
+            6,
+            &format!("/Type /ObjStm /N 2 /First {} ", header.len()),
+            &members,
+        );
+
+        let mut out: Vec<u8> = b"%PDF-1.5\n".to_vec();
+        let mut offsets = std::collections::BTreeMap::new();
+        for (num, body) in [
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+            (5, stream(5, "", content_plain)),
+            (6, objstm),
+        ] {
+            offsets.insert(num, out.len());
+            out.extend_from_slice(format!("{num} 0 obj\n").as_bytes());
+            out.extend_from_slice(&body);
+            out.extend_from_slice(b"\nendobj\n");
+        }
+        let encrypt = format!(
+            "/ID [<{id}> <{id}>] /Encrypt << /Filter /Standard /V 1 /R 2 /Length 40 \
+             /O <{o}> /U <{u}> /P {p} >>",
+            id = hexstr(&id0),
+            o = hexstr(&o),
+            u = hexstr(&u),
+        );
+        if !stale_container {
+            out.extend_from_slice(
+                format!("trailer\n<< /Size 7 /Root 1 0 R {encrypt} >>\nstartxref\n9\n%%EOF\n")
+                    .as_bytes(),
+            );
+            return out;
+        }
+        // Xref stream (never encrypted): /W [1 4 2]. Entry 6 is stale — it
+        // points at the catalog, so the container only decodes at the offset
+        // the repair scan finds.
+        let xref_pos = out.len();
+        let mut rows = Vec::new();
+        let mut row = |kind: u8, field2: usize, field3: u16| {
+            rows.push(kind);
+            rows.extend_from_slice(&(field2 as u32).to_be_bytes());
+            rows.extend_from_slice(&field3.to_be_bytes());
+        };
+        row(0, 0, 65535);
+        row(1, offsets[&1], 0);
+        row(2, 6, 0);
+        row(2, 6, 1);
+        row(0, 0, 0);
+        row(1, offsets[&5], 0);
+        row(1, offsets[&1], 0);
+        row(1, xref_pos, 0);
+        out.extend_from_slice(
+            format!(
+                "7 0 obj\n<< /Type /XRef /Size 8 /W [1 4 2] /Root 1 0 R {encrypt} /Length {} >>\nstream\n",
+                rows.len()
+            )
+            .as_bytes(),
+        );
+        out.extend_from_slice(&rows);
+        out.extend_from_slice(
+            format!("\nendstream\nendobj\nstartxref\n{xref_pos}\n%%EOF\n").as_bytes(),
+        );
+        out
+    }
+
+    /// Recovery rebuilds the xref before the decryptor exists; the page tree
+    /// inside the encrypted object stream must still be found.
+    #[test]
+    fn recovery_indexes_encrypted_object_streams() {
+        let plain = b"BT /F1 12 Tf (recovered objstm) Tj ET";
+        let pdf = build_rc4_objstm_pdf(plain, false);
+        let file = crate::PdfFile::parse(pdf).expect("recover encrypted PDF");
+        assert_eq!(content_stream_bytes(&file), plain);
+    }
+
+    /// A stale xref offset for an encrypted container falls back to the
+    /// offset the lazy repair scan finds.
+    #[test]
+    fn lazy_repair_decodes_encrypted_container_at_scanned_offset() {
+        let plain = b"BT /F1 12 Tf (stale container) Tj ET";
+        let pdf = build_rc4_objstm_pdf(plain, true);
+        let file = crate::PdfFile::parse(pdf).expect("parse encrypted PDF");
+        assert_eq!(content_stream_bytes(&file), plain);
+    }
+
+    /// Append synthetic RC4 containers to exercise the second recovery pass.
+    fn append_recovery_container(pdf: &mut Vec<u8>, id: u32, members: &[(u32, &[u8])]) {
+        let file = crate::PdfFile::parse(pdf.clone()).unwrap();
+        let mut header = String::new();
+        let mut bodies = Vec::new();
+        for (num, body) in members {
+            header.push_str(&format!("{num} {} ", bodies.len()));
+            bodies.extend_from_slice(body);
+            bodies.push(b' ');
+        }
+        let data = file
+            .decryptor()
+            .unwrap()
+            .decrypt_stream_bytes(ObjectId(id, 0), &[header.as_bytes(), &bodies].concat());
+        pdf.extend_from_slice(
+            format!(
+                "{id} 0 obj\n<< /Type /ObjStm /N {} /First {} /Length {} >>\nstream\n",
+                members.len(),
+                header.len(),
+                data.len()
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(&data);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+    }
+
+    #[test]
+    fn encrypted_recovery_refreshes_scan_built_while_resolving_encrypt() {
+        let plain = b"BT /F1 12 Tf (early repair scan) Tj ET";
+        let mut pdf = build_rc4_objstm_pdf(plain, true);
+        let marker = b"/Encrypt ";
+        let start = pdf.windows(marker.len()).position(|w| w == marker).unwrap();
+        let dict_start = start + marker.len();
+        let dict_end = dict_start
+            + pdf[dict_start..]
+                .windows(2)
+                .position(|w| w == b">>")
+                .unwrap()
+            + 2;
+        let encrypt = pdf[dict_start..dict_end].to_vec();
+        // /Encrypt points to an unindexed direct object, so authentication
+        // itself builds the lazy scan, before the decryptor is available.
+        pdf.splice(dict_start..dict_end, b"8 0 R".iter().copied());
+        let xref = pdf.windows(11).position(|w| w == b"/Type /XRef").unwrap();
+        let data = xref
+            + pdf[xref..]
+                .windows(8)
+                .position(|w| w == b"\nstream\n")
+                .unwrap()
+            + 8;
+        // The damaged xref has also lost both compressed page-tree entries.
+        pdf[data + 2 * 7] = 0;
+        pdf[data + 3 * 7] = 0;
+        pdf.extend_from_slice(b"8 0 obj\n");
+        pdf.extend_from_slice(&encrypt);
+        pdf.extend_from_slice(b"\nendobj\n");
+        let file = crate::PdfFile::parse(pdf).unwrap();
+        assert_eq!(content_stream_bytes(&file), plain);
+    }
+
+    #[test]
+    fn encrypted_recovery_enforces_aggregate_object_limit() {
+        for lazy in [false, true] {
+            let mut pdf = build_rc4_objstm_pdf(b"", lazy);
+            for (id, first) in [(8, 20), (9, 24), (10, 28)] {
+                append_recovery_container(
+                    &mut pdf,
+                    id,
+                    &[
+                        (first, b"null"),
+                        (first + 1, b"null"),
+                        (first + 2, b"null"),
+                        (first + 3, b"null"),
+                    ],
+                );
+            }
+            let limits = crate::ParseLimits {
+                max_objects: 10,
+                ..Default::default()
+            };
+            let result = crate::PdfFile::parse_with_limits(pdf.clone(), limits);
+            if lazy {
+                let file = result.unwrap();
+                assert!(file.force_repair_scan().is_none());
+                assert!(
+                    file.force_repair_scan().is_none(),
+                    "failed scan is memoized"
+                );
+            } else {
+                assert!(result.is_err(), "encrypted members exceeded max_objects");
+            }
+            let total = if lazy { 21 } else { 20 };
+            let file = crate::PdfFile::parse_with_limits(
+                pdf,
+                crate::ParseLimits {
+                    max_objects: total,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let table = file.force_repair_scan().unwrap();
+            assert_eq!(table.len(), total as usize);
+            for num in 20..32 {
+                assert!(matches!(
+                    table.get(ObjectId(num, 0)),
+                    Some(crate::XrefEntry::Compressed { .. })
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn encrypted_recovery_uses_latest_container_and_preserves_direct_objects() {
+        for lazy in [false, true] {
+            let mut pdf = build_rc4_objstm_pdf(b"", lazy);
+            append_recovery_container(&mut pdf, 9, &[(20, b"10"), (21, b"11")]);
+            // A lower object number at a later file offset is the newer version.
+            append_recovery_container(&mut pdf, 8, &[(20, b"20"), (21, b"21")]);
+            pdf.extend_from_slice(b"21 0 obj\n99\nendobj\n");
+            for _ in 0..16 {
+                let file = crate::PdfFile::parse_with_limits(
+                    pdf.clone(),
+                    crate::ParseLimits {
+                        max_objects: if lazy { 10 } else { 9 },
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(file.resolve(ObjectId(20, 0)).unwrap().as_i64().unwrap(), 20);
+                assert_eq!(file.resolve(ObjectId(21, 0)).unwrap().as_i64().unwrap(), 99);
+            }
+        }
+    }
 }

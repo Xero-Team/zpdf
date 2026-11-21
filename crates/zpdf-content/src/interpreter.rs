@@ -10,8 +10,8 @@ use zpdf_parser::PdfFile;
 
 use crate::stats::InterpretStats;
 use crate::tables::RuleLine;
-use crate::text::TextSpan;
-use crate::tokenizer::{ContentToken, ContentTokenizer};
+use crate::text::{TextGlyph, TextSpan};
+use crate::tokenizer::{BorrowedContentToken as ContentToken, ContentTokenizer};
 
 /// Cached CMYK→RGB conversion entry
 type CmykCacheEntry = ([f64; 4], (f64, f64, f64));
@@ -120,11 +120,22 @@ pub struct ContentInterpreter<'a> {
     /// innermost last. Lookups search these before the page resources.
     form_resources: Vec<ResourceDict>,
     form_depth: u32,
+    /// Object ids of the form XObjects currently being interpreted. A form
+    /// that draws itself (directly, or through a pattern cell) recurses
+    /// forever, so re-entry is refused instead of fanning out to the budget.
+    active_forms: Vec<ObjectId>,
     /// `Q` must never pop the state stack below this index — a form XObject
     /// raises it past its own saved state so an unbalanced `Q` inside the
     /// form cannot corrupt the page-level state.
     state_floor: usize,
     text_sink: Option<&'a mut Vec<TextSpan>>,
+    /// Whether collected spans also carry positioned glyph cells.
+    text_geometry: bool,
+    /// Selection cells held by the sink and the open replacement, across this
+    /// page and its forms. Cells of a run that is not kept are not counted.
+    text_glyphs_collected: usize,
+    /// UTF-8 produced by text decoding and marked-content replacements.
+    extracted_text_bytes: u64,
     /// Collect drawn ruled lines (thin axis-aligned strokes/rect fills) for
     /// table detection. Like `text_sink`, only meaningful during extraction —
     /// installing it never changes the emitted display list.
@@ -147,6 +158,9 @@ pub struct ContentInterpreter<'a> {
     /// Lets the text sink tag each span with the marked-content id that binds it
     /// to a Tagged-PDF structure element. Only meaningful during text extraction.
     mc_stack: Vec<MarkedContent>,
+    /// Only the outer replacement reaches the text sink. It also covers
+    /// glyphs shown by forms, whose marked-content stacks are independent.
+    active_actual_text: Option<ActualText>,
     actual_text_bytes: usize,
     max_actual_text_bytes: usize,
     /// Depth at which a hidden `BDC /OC` block began; painting is suppressed
@@ -238,15 +252,67 @@ struct ImageSource {
 #[derive(Clone, Default)]
 struct MarkedContent {
     mcid: Option<i32>,
-    actual: Option<ActualText>,
+    ends_actual_text: bool,
 }
 
-#[derive(Clone)]
 struct ActualText {
-    text: std::sync::Arc<str>,
-    start: usize,
-    anchor: TextSpan,
-    visible: bool,
+    span: TextSpan,
+    has_source: bool,
+    /// Keep admitted buffers until EMC so the final cluster allocates once.
+    following_glyphs: Vec<Vec<TextGlyph>>,
+}
+
+impl ActualText {
+    /// Add one show to the cluster. `retained` is the page's count of held
+    /// glyph cells: it grows with the cells kept here and gets back the ones
+    /// an approximate cluster gives up.
+    fn add_source(&mut self, mut run: TextSpan, retained: &mut usize) {
+        if !self.has_source {
+            *retained += run.glyphs.len();
+            run.text = std::mem::take(&mut self.span.text);
+            run.mcid = self.span.mcid;
+            self.span = run;
+            self.has_source = true;
+            return;
+        }
+        self.span.advance = run.x + run.advance - self.span.x;
+        if run.glyphs.is_empty() {
+            // One omitted run makes the whole cluster approximate.
+            *retained = retained.saturating_sub(self.release_glyphs());
+        } else if !self.span.glyphs.is_empty() {
+            *retained += run.glyphs.len();
+            self.following_glyphs.push(run.glyphs);
+        }
+    }
+
+    /// Drop the cluster's cells and return how many it held.
+    fn release_glyphs(&mut self) -> usize {
+        let released =
+            self.span.glyphs.len() + self.following_glyphs.iter().map(Vec::len).sum::<usize>();
+        self.span.glyphs = Vec::new();
+        self.following_glyphs.clear();
+        released
+    }
+
+    /// Publish the replacement. A cluster that a page limit cut short keeps
+    /// its text, like the spans before it, but only a complete cluster keeps
+    /// its glyph cells.
+    fn finish(mut self, complete: bool, sink: &mut Vec<TextSpan>, retained: &mut usize) {
+        let publish = !self.span.text.is_empty() && self.span.is_finite();
+        if !(publish && complete) {
+            *retained = retained.saturating_sub(self.release_glyphs());
+        }
+        if !publish {
+            return;
+        }
+        self.span
+            .glyphs
+            .reserve_exact(self.following_glyphs.iter().map(Vec::len).sum());
+        for run in self.following_glyphs {
+            self.span.glyphs.extend(run);
+        }
+        sink.push(self.span);
+    }
 }
 
 /// Outcome of storing a draw of a known image XObject without decoding.
@@ -319,6 +385,19 @@ struct SoftMaskReuseEntry {
 /// for any real page (which interpret in well under a second); bounds
 /// adversarial shading/pattern blowups.
 const INTERPRET_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// Page-wide allowance for optional selection cells. A tighter decoded-stream
+/// budget lowers it as well. Text and rendering survive an omitted glyph run.
+const MAX_TEXT_GEOMETRY_BYTES: u64 = 16 << 20;
+
+/// One text operator can contain many glyphs or TJ elements, so its loops check
+/// the deadline every 256 items. Index 0 is left out: an ordinary short show
+/// never reads the clock and relies on the operator loop's sampling.
+fn text_deadline_reached(index: usize, deadline: Option<zpdf_core::time::Instant>) -> bool {
+    index != 0
+        && index.is_multiple_of(256)
+        && deadline.is_some_and(|end| zpdf_core::time::Instant::now() >= end)
+}
 
 /// Default [`ContentInterpreter::max_commands`]. Real pages run to at most low
 /// hundreds of thousands of commands, so this is a generous headroom while still
@@ -695,8 +774,12 @@ impl<'a> ContentInterpreter<'a> {
             font_override: false,
             form_resources: Vec::new(),
             form_depth: 0,
+            active_forms: Vec::new(),
             state_floor: 0,
             text_sink: None,
+            text_geometry: false,
+            text_glyphs_collected: 0,
+            extracted_text_bytes: 0,
             rule_sink: None,
             base_ctm: Matrix::identity(),
             suppress_color_ops: false,
@@ -705,6 +788,7 @@ impl<'a> ContentInterpreter<'a> {
             mc_depth: 0,
             compatibility_depth: 0,
             mc_stack: Vec::new(),
+            active_actual_text: None,
             actual_text_bytes: 0,
             max_actual_text_bytes: 16 << 20,
             oc_hidden_from: None,
@@ -843,7 +927,8 @@ impl<'a> ContentInterpreter<'a> {
     /// loop and the recursive form/tiling emitters so a runaway page is
     /// truncated rather than hanging — whether it explodes in emitted commands,
     /// raw call fanout, or per-call time (e.g. per-cell shading rasterization).
-    /// The clock is sampled at most once per 256 operators to keep it cheap.
+    /// The operator loop samples the clock every 16 operators. Long text
+    /// operations also check it while processing their glyphs.
     fn over_budget(&mut self) -> bool {
         if self.resource_limit_hit
             || self.display_list.commands.len() >= self.max_commands
@@ -864,6 +949,15 @@ impl<'a> ContentInterpreter<'a> {
             }
         }
         self.timed_out
+    }
+
+    /// Whether a limit has ended interpretation. Unlike [`Self::over_budget`]
+    /// this reads no clock and records nothing.
+    fn cut_short(&self) -> bool {
+        self.timed_out
+            || self.resource_limit_hit
+            || self.display_list.commands.len() >= self.max_commands
+            || self.ops_executed >= self.max_ops
     }
 
     /// M3 Fix: Check operand stack depth before pushing. Returns true if the
@@ -1017,10 +1111,22 @@ impl<'a> ContentInterpreter<'a> {
         self
     }
 
-    /// Collect decoded text spans (for the `text` command / extraction) in addition
-    /// to building the display list.
+    /// Collect decoded text spans (for the `text` command / extraction) in
+    /// addition to building the display list. With no sink, no Unicode mapping
+    /// is allocated. Spans carry glyph selection cells only when
+    /// [`Self::with_text_geometry`] asks for them.
     pub fn with_text_sink(mut self, sink: &'a mut Vec<TextSpan>) -> Self {
         self.text_sink = Some(sink);
+        self
+    }
+
+    /// Also record a positioned selection cell for every glyph of the spans
+    /// the text sink collects ([`TextSpan::glyphs`]), for character selection
+    /// and glyph-accurate search highlights. Off by default: plain text
+    /// extraction reads only the decoded string and the span metrics, and each
+    /// cell takes about 100 bytes. Has no effect without a text sink.
+    pub fn with_text_geometry(mut self, enabled: bool) -> Self {
+        self.text_geometry = enabled;
         self
     }
 
@@ -1110,7 +1216,7 @@ impl<'a> ContentInterpreter<'a> {
         }
         let mut tokenizer = ContentTokenizer::new(content);
 
-        for token in tokenizer.by_ref() {
+        while let Some(token) = tokenizer.next_borrowed_recovering() {
             if self.over_budget() {
                 tracing::warn!(
                     "content exceeded {} display commands; truncating page",
@@ -1145,9 +1251,7 @@ impl<'a> ContentInterpreter<'a> {
         }
 
         self.stats.diagnostics.merge(tokenizer.diagnostics());
-        while !self.mc_stack.is_empty() {
-            self.end_marked_content();
-        }
+        self.close_marked_content();
         // Annotation appearances render independently of wherever the page
         // content stream left the graphics state (12.5.5): drop a `W` never
         // painted, rebalance any unclosed q-levels and top-level W clips, then
@@ -1199,6 +1303,33 @@ impl<'a> ContentInterpreter<'a> {
                     self.stats.diagnostics.malformed_content.saturating_add(1);
                 0.0
             })
+    }
+
+    /// The top `N` operands of a path operator, in order. With fewer than
+    /// `N` finite numbers the operator is malformed and is skipped (as pdf.js
+    /// and hayro do); padding with zeros would draw segments to the origin.
+    fn path_operands<const N: usize>(&mut self) -> Option<[f64; N]> {
+        let len = self.operand_stack.len();
+        let values = (len >= N)
+            .then(|| &self.operand_stack[len - N..])
+            .and_then(|top| {
+                let mut out = [0.0; N];
+                for (slot, operand) in out.iter_mut().zip(top) {
+                    *slot = operand.as_f64().ok().filter(|n| n.is_finite())?;
+                }
+                Some(out)
+            });
+        match values {
+            Some(values) => {
+                self.operand_stack.truncate(len - N);
+                Some(values)
+            }
+            None => {
+                self.stats.diagnostics.malformed_content =
+                    self.stats.diagnostics.malformed_content.saturating_add(1);
+                None
+            }
+        }
     }
 
     fn pop_name(&mut self) -> String {
@@ -1352,59 +1483,49 @@ impl<'a> ContentInterpreter<'a> {
 
             // -- Path construction --
             "m" => {
-                let y = self.pop_f64();
-                let x = self.pop_f64();
-                self.current_path.move_to(Point::new(x, y));
+                if let Some([x, y]) = self.path_operands() {
+                    self.current_path.move_to(Point::new(x, y));
+                }
             }
             "l" => {
-                let y = self.pop_f64();
-                let x = self.pop_f64();
-                self.current_path.line_to(Point::new(x, y));
+                if let Some([x, y]) = self.path_operands() {
+                    self.current_path.line_to(Point::new(x, y));
+                }
             }
             "c" => {
-                let y3 = self.pop_f64();
-                let x3 = self.pop_f64();
-                let y2 = self.pop_f64();
-                let x2 = self.pop_f64();
-                let y1 = self.pop_f64();
-                let x1 = self.pop_f64();
-                self.current_path.curve_to(
-                    Point::new(x1, y1),
-                    Point::new(x2, y2),
-                    Point::new(x3, y3),
-                );
+                if let Some([x1, y1, x2, y2, x3, y3]) = self.path_operands() {
+                    self.current_path.curve_to(
+                        Point::new(x1, y1),
+                        Point::new(x2, y2),
+                        Point::new(x3, y3),
+                    );
+                }
             }
             "v" => {
-                let y3 = self.pop_f64();
-                let x3 = self.pop_f64();
-                let y2 = self.pop_f64();
-                let x2 = self.pop_f64();
-                // v: current point is first control point
-                self.current_path.curve_to(
-                    self.current_point(),
-                    Point::new(x2, y2),
-                    Point::new(x3, y3),
-                );
+                if let Some([x2, y2, x3, y3]) = self.path_operands() {
+                    // v: current point is first control point
+                    self.current_path.curve_to(
+                        self.current_point(),
+                        Point::new(x2, y2),
+                        Point::new(x3, y3),
+                    );
+                }
             }
             "y" => {
-                let y3 = self.pop_f64();
-                let x3 = self.pop_f64();
-                let y1 = self.pop_f64();
-                let x1 = self.pop_f64();
-                // y: end point is second control point
-                self.current_path.curve_to(
-                    Point::new(x1, y1),
-                    Point::new(x3, y3),
-                    Point::new(x3, y3),
-                );
+                if let Some([x1, y1, x3, y3]) = self.path_operands() {
+                    // y: end point is second control point
+                    self.current_path.curve_to(
+                        Point::new(x1, y1),
+                        Point::new(x3, y3),
+                        Point::new(x3, y3),
+                    );
+                }
             }
             "h" => self.current_path.close(),
             "re" => {
-                let h = self.pop_f64();
-                let w = self.pop_f64();
-                let y = self.pop_f64();
-                let x = self.pop_f64();
-                self.current_path.rect(Rect::new(x, y, x + w, y + h));
+                if let Some([x, y, w, h]) = self.path_operands() {
+                    self.current_path.rect(Rect::new(x, y, x + w, y + h));
+                }
             }
 
             // -- Path painting -- (each then applies a pending `W` clip)
@@ -1665,7 +1786,14 @@ impl<'a> ContentInterpreter<'a> {
                             _ => None,
                         })
                     });
-                    for item in arr {
+                    for (index, item) in arr.into_iter().enumerate() {
+                        if self.timed_out || self.resource_limit_hit {
+                            break;
+                        }
+                        if text_deadline_reached(index, self.deadline) {
+                            self.timed_out = true;
+                            break;
+                        }
                         match item {
                             PdfObject::String(s) => self.show_text(&s.0),
                             PdfObject::Integer(n) => {
@@ -1763,9 +1891,16 @@ impl<'a> ContentInterpreter<'a> {
                     }
                 }
                 let actual = props.as_ref().and_then(|p| self.begin_actual_text(p, mcid));
-                self.mc_stack.push(MarkedContent { mcid, actual });
+                let ends_actual_text = actual.is_some();
+                if let Some(actual) = actual {
+                    self.active_actual_text = Some(actual);
+                }
+                self.mc_stack.push(MarkedContent {
+                    mcid,
+                    ends_actual_text,
+                });
             }
-            "EMC" => self.end_marked_content(),
+            "EMC" => self.end_marked_content(true),
             "MP" | "DP" => {}
             "BX" => self.compatibility_depth = self.compatibility_depth.saturating_add(1),
             "EX" => self.compatibility_depth = self.compatibility_depth.saturating_sub(1),
@@ -3051,8 +3186,18 @@ impl<'a> ContentInterpreter<'a> {
         self.mc_stack.iter().rev().find_map(|frame| frame.mcid)
     }
 
+    /// A text-only limit leaves the completed spans with their caller. The
+    /// interpreter still paints this show and executes the rest of the page.
+    fn stop_text_extraction(&mut self) {
+        self.stats.diagnostics.resource_limit_reached = true;
+        self.text_sink = None;
+        self.active_actual_text = None;
+    }
+
     fn begin_actual_text(&mut self, props: &PdfObject, mcid: Option<i32>) -> Option<ActualText> {
-        let start = self.text_sink.as_ref()?.len();
+        if self.text_sink.is_none() || self.active_actual_text.is_some() || self.oc_suppressed() {
+            return None;
+        }
         let dict = self.resolve_property_dict(props)?;
         let value = self.resolve_plain(dict.get("ActualText")?);
         let PdfObject::String(value) = value else {
@@ -3064,46 +3209,54 @@ impl<'a> ContentInterpreter<'a> {
             .max_actual_text_bytes
             .saturating_sub(self.actual_text_bytes);
         if value.as_bytes().len() > remaining / 3 {
-            self.resource_limit_hit = true;
+            self.stop_text_extraction();
             return None;
         }
         let text = zpdf_core::decode_text_string(value.as_bytes());
+        if text.len() as u64
+            > self.parse_limits.max_decoded_stream_bytes - self.extracted_text_bytes
+        {
+            self.stop_text_extraction();
+            return None;
+        }
+        self.extracted_text_bytes += text.len() as u64;
         self.actual_text_bytes += text.len();
         let tm = self.current.ctm.concat(&self.text_matrix);
         Some(ActualText {
-            text: text.into(),
-            start,
-            anchor: TextSpan {
-                text: String::new(),
+            span: TextSpan {
+                text,
                 x: tm.e,
                 y: tm.f,
                 size: self.current.font_size * self.ctm_scale_factor(),
                 advance: 0.0,
                 mcid: mcid.or_else(|| self.current_mcid()),
+                glyphs: Vec::new(),
             },
-            visible: !self.oc_suppressed(),
+            has_source: false,
+            following_glyphs: Vec::new(),
         })
     }
 
-    /// Replace the entire marked sequence once. Closing an outer replacement
-    /// also consumes any inner replacement, so nested ActualText never doubles.
-    fn end_marked_content(&mut self) {
-        if let Some(actual) = self.mc_stack.pop().and_then(|frame| frame.actual) {
-            if let Some(sink) = self.text_sink.as_mut() {
-                let start = actual.start.min(sink.len());
-                let mut span = sink
-                    .get(start)
-                    .cloned()
-                    .unwrap_or_else(|| actual.anchor.clone());
-                if let Some(last) = sink.last().filter(|_| start < sink.len()) {
-                    span.advance = last.x + last.advance - span.x;
-                }
-                span.mcid = actual.anchor.mcid;
-                span.text = actual.text.to_string();
-                sink.truncate(start);
-                if actual.visible && !span.text.is_empty() && span.is_finite() {
-                    sink.push(span);
-                }
+    /// Close the sequences a stream left open. Every limit that ends
+    /// interpretation is treated alike: a replacement it interrupted has not
+    /// seen all of its source glyphs.
+    fn close_marked_content(&mut self) {
+        let complete = !self.cut_short();
+        while !self.mc_stack.is_empty() {
+            self.end_marked_content(complete);
+        }
+    }
+
+    /// Publish the outer replacement. `complete` is false when a limit ended
+    /// the stream before the sequence's own `EMC`.
+    fn end_marked_content(&mut self, complete: bool) {
+        let ends_actual_text = self
+            .mc_stack
+            .pop()
+            .is_some_and(|frame| frame.ends_actual_text);
+        if let Some(sink) = self.text_sink.as_mut().filter(|_| ends_actual_text) {
+            if let Some(actual) = self.active_actual_text.take() {
+                actual.finish(complete, sink, &mut self.text_glyphs_collected);
             }
         }
         if self.oc_hidden_from == Some(self.mc_depth) {
@@ -3366,7 +3519,7 @@ impl<'a> ContentInterpreter<'a> {
             }
         };
 
-        let obj = match file.resolve(gs_id) {
+        let obj = match file.resolve_shared(gs_id) {
             Ok(o) => o,
             Err(e) => {
                 self.stats.diagnostics.record_decode_failure(&e);
@@ -3375,8 +3528,7 @@ impl<'a> ContentInterpreter<'a> {
         };
 
         if let Ok(dict) = obj.as_dict() {
-            let dict = dict.clone();
-            self.apply_ext_gstate_dict(&dict, Some(gs_id));
+            self.apply_ext_gstate_dict(dict, Some(gs_id));
         }
     }
 
@@ -3726,7 +3878,7 @@ impl<'a> ContentInterpreter<'a> {
             }
         };
 
-        let obj = match file.resolve(xobj_id) {
+        let obj = match file.resolve_shared(xobj_id) {
             Ok(o) => o,
             Err(e) => {
                 self.stats.diagnostics.record_object_failure(xobj_id, &e);
@@ -3824,7 +3976,7 @@ impl<'a> ContentInterpreter<'a> {
             None => return,
         };
 
-        let decoded_data = match file.resolve_stream_data(obj_id) {
+        let decoded_data = match file.resolve_stream_data_shared(obj_id) {
             Ok(d) => d,
             Err(e) => {
                 self.stats.diagnostics.record_object_failure(obj_id, &e);
@@ -3863,6 +4015,50 @@ impl<'a> ContentInterpreter<'a> {
         );
         let colorspace = self.colormanage_cmyk_image(colorspace);
         let smask_ref = stream.dict.get_ref("SMask").ok();
+        // On the first minified draw, opaque Gray/RGB scans need only one
+        // converted source row, not a full-resolution RGBA allocation. Later
+        // sizes retain the existing two-decode/source-retention policy.
+        if self.image_downscale_scale > 0.0 && !self.image_sources.contains_key(&obj_id) {
+            match zpdf_image::decode_scan_at_footprint(
+                &decoded_data,
+                &image_dict,
+                colorspace.as_ref(),
+                &transform,
+                self.image_downscale_scale,
+                &self.parse_limits,
+            ) {
+                Ok(Some(scan)) => {
+                    let size = (scan.image.width, scan.image.height);
+                    self.image_sources.insert(
+                        obj_id,
+                        ImageSource {
+                            width: scan.source_width,
+                            height: scan.source_height,
+                            bytes: rgba_bytes((scan.source_width, scan.source_height)),
+                            intent,
+                            decodes: 1,
+                            filtered_bytes: 0,
+                            unfiltered: false,
+                            retained: None,
+                        },
+                    );
+                    let bytes = scan.image.data.capacity() as u64;
+                    if let Some(image_id) = self.cache_filtered(obj_id, size, scan.image) {
+                        self.emit_image_draw(image_id, transform, false);
+                    } else {
+                        self.warn_image_dropped(bytes);
+                        self.rejected_image_objects.insert(obj_id);
+                    }
+                    return;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    self.stats.diagnostics.record_object_failure(obj_id, &e);
+                    tracing::warn!("failed to decode scan: {e}");
+                    return;
+                }
+            }
+        }
         // A soft mask's `/Matte` is a colour in this space.
         let matte_colorspace = smask_ref.and_then(|_| colorspace.clone());
         let mut image = match zpdf_image::decode_image_xobject_resolved_with_limits(
@@ -4183,16 +4379,18 @@ impl<'a> ContentInterpreter<'a> {
         {
             return;
         }
-        let decoded =
-            match zpdf_parser::filters::decode_stream_with_limits(&data, &norm, &self.parse_limits)
-            {
-                Ok(d) => d,
-                Err(e) => {
-                    self.stats.diagnostics.record_decode_failure(&e);
-                    tracing::warn!("inline image: filter decode failed: {e}");
-                    return;
-                }
-            };
+        let decoded = match zpdf_parser::filters::decode_stream_borrowed_with_limits(
+            &data,
+            &norm,
+            &self.parse_limits,
+        ) {
+            Ok(d) => d,
+            Err(e) => {
+                self.stats.diagnostics.record_decode_failure(&e);
+                tracing::warn!("inline image: filter decode failed: {e}");
+                return;
+            }
+        };
         // An inline-image /CS naming a non-device space refers to a
         // /ColorSpace resource; substitute the resolved object.
         if let Some(PdfObject::Name(n)) = norm.get("ColorSpace") {
@@ -4298,6 +4496,12 @@ impl<'a> ContentInterpreter<'a> {
         if self.form_depth >= MAX_FORM_DEPTH {
             self.stats.diagnostics.resource_limit_reached = true;
             tracing::warn!("form XObject nesting exceeds {MAX_FORM_DEPTH}; skipping");
+            return;
+        }
+        if let Some(id) = xobj_id.filter(|id| self.active_forms.contains(id)) {
+            self.stats.diagnostics.malformed_content =
+                self.stats.diagnostics.malformed_content.saturating_add(1);
+            tracing::warn!("form XObject {id} draws itself; skipping the recursion");
             return;
         }
         // Stop descending once the page budget is spent — bounds exponential
@@ -4446,13 +4650,14 @@ impl<'a> ContentInterpreter<'a> {
         }
 
         self.form_depth += 1;
+        self.active_forms.extend(xobj_id);
         // A pending `W` belongs to the stream that set it: the invoking
         // stream's waits for its own painting operator (a pattern fill runs
         // this form while painting), and one the form leaves unpainted ends
         // with the form.
         let outer_clip = self.pending_clip.take();
         let mut tokenizer = ContentTokenizer::new(&decoded);
-        for token in tokenizer.by_ref() {
+        while let Some(token) = tokenizer.next_borrowed_recovering() {
             if self.over_budget() {
                 break;
             }
@@ -4473,11 +4678,12 @@ impl<'a> ContentInterpreter<'a> {
             }
         }
         self.stats.diagnostics.merge(tokenizer.diagnostics());
-        while !self.mc_stack.is_empty() {
-            self.end_marked_content();
-        }
+        self.close_marked_content();
         self.pending_clip = outer_clip;
         self.form_depth -= 1;
+        if xobj_id.is_some() {
+            self.active_forms.pop();
+        }
 
         // Balance: pop clips opened by any unbalanced q-levels left by the
         // form, then restore the state saved at entry.
@@ -5260,7 +5466,7 @@ impl<'a> ContentInterpreter<'a> {
                 // it; one the cell leaves unpainted ends with the cell.
                 let outer_clip = self.pending_clip.take();
                 let mut tokenizer = ContentTokenizer::new(&def.content);
-                for token in tokenizer.by_ref() {
+                while let Some(token) = tokenizer.next_borrowed_recovering() {
                     if self.over_budget() {
                         break;
                     }
@@ -5402,7 +5608,12 @@ impl<'a> ContentInterpreter<'a> {
         let h_scale = self.current.h_scaling / 100.0;
         let char_spacing = self.current.char_spacing;
         let word_spacing = self.current.word_spacing;
-        let want_text = self.text_sink.is_some();
+        let replacement_len = self
+            .active_actual_text
+            .as_ref()
+            .map(|actual| actual.span.text.len());
+        let want_text =
+            self.text_sink.is_some() && !self.oc_suppressed() && replacement_len != Some(0);
 
         let font_and_id = self.current_font_id.and_then(|fid| {
             self.font_cache
@@ -5441,6 +5652,10 @@ impl<'a> ContentInterpreter<'a> {
 
             let mut i = 0usize;
             while i < bytes.len() {
+                if text_deadline_reached(glyphs.len(), self.deadline) {
+                    self.timed_out = true;
+                    return;
+                }
                 let start = i;
                 let (code, len) = match cmap {
                     Some(c) => c.next_code(&bytes[i..]),
@@ -5532,7 +5747,11 @@ impl<'a> ContentInterpreter<'a> {
                 self.font_repair.note_simple(fid);
             }
             let mut codes = font_and_id.and_then(|(fid, _)| self.font_repair.simple_codes(fid));
-            for &byte in bytes {
+            for (index, &byte) in bytes.iter().enumerate() {
+                if text_deadline_reached(index, self.deadline) {
+                    self.timed_out = true;
+                    return;
+                }
                 let code = byte as u16;
                 // Type3 CharProcs are addressed by character code. Other fonts
                 // require an actual glyph mapping; an unmapped code is .notdef.
@@ -5579,16 +5798,120 @@ impl<'a> ContentInterpreter<'a> {
 
         // Decode the text and compute its user-space placement for extraction,
         // while the immutable font borrow is still live.
-        let text_span = if want_text {
-            let decoded = font_and_id
-                .map(|(_, f)| f.decode_to_string(bytes))
-                .unwrap_or_else(|| {
-                    bytes
-                        .iter()
-                        .filter(|&&b| b >= 0x20 && b != 0x7f)
-                        .map(|&b| b as char)
-                        .collect()
+        let mut geometry_omitted = false;
+        let text_span = 'extract: {
+            if !want_text {
+                break 'extract None;
+            }
+            let font = font_and_id.map(|(_, f)| f);
+            let cmap = font.and_then(|f| f.cid_cmap.as_ref());
+            // Without an encoding CMap, rendering uses two-byte Identity
+            // codes. Decode through ToUnicode at boundaries shared by the
+            // drawn glyphs and the declared text width (including the tail).
+            let fallback_cluster = font
+                .filter(|_| is_two_byte && cmap.is_none())
+                .and_then(|f| f.to_unicode.as_ref())
+                .and_then(|map| match map.code_byte_lengths() {
+                    [1] => Some((map, 2)),
+                    [3] => Some((map, 6)),
+                    [4] => Some((map, 4)),
+                    _ => None,
                 });
+            let (descent, ascent) = selection_cell_extent(font);
+            let mut decoded = String::new();
+            let remaining_text_bytes =
+                self.parse_limits.max_decoded_stream_bytes - self.extracted_text_bytes;
+            let byte_limit = self
+                .parse_limits
+                .max_decoded_stream_bytes
+                .min(MAX_TEXT_GEOMETRY_BYTES);
+            let glyph_limit = byte_limit as usize / size_of::<TextGlyph>();
+            let cluster_keeps_geometry = self
+                .active_actual_text
+                .as_ref()
+                .is_none_or(|actual| !actual.has_source || !actual.span.glyphs.is_empty());
+            // The allowance is charged when the run is kept (below), so a run
+            // that decodes to nothing does not use it up.
+            let within_allowance =
+                glyphs.len() <= glyph_limit.saturating_sub(self.text_glyphs_collected);
+            let wants_geometry = self.text_geometry && cluster_keeps_geometry;
+            let collect_geometry = wants_geometry && within_allowance;
+            geometry_omitted = wants_geometry && !within_allowance;
+            let mut text_glyphs = if collect_geometry {
+                Vec::with_capacity(glyphs.len())
+            } else {
+                Vec::new()
+            };
+            let mut offset = 0;
+            let mut cluster_start = 0;
+            let source = if collect_geometry || replacement_len.is_none() {
+                glyphs.as_slice()
+            } else {
+                &[]
+            };
+            for (index, glyph) in source.iter().enumerate() {
+                if text_deadline_reached(index, self.deadline) {
+                    self.timed_out = true;
+                    return;
+                }
+                let Some((code, len, raw_code, end)) =
+                    next_text_code(cmap, is_two_byte, bytes, offset)
+                else {
+                    break;
+                };
+                let text_range = if let Some(len) = replacement_len {
+                    0..len
+                } else if let Some((map, cluster_bytes)) = fallback_cluster {
+                    if offset.is_multiple_of(cluster_bytes) {
+                        cluster_start = decoded.len();
+                        let cluster_end = (offset + cluster_bytes).min(bytes.len());
+                        map.append_fixed_width(&bytes[offset..cluster_end], &mut decoded);
+                    }
+                    cluster_start..decoded.len()
+                } else {
+                    let start = decoded.len();
+                    if let Some(font) = font {
+                        font.append_decoded_code(code, len as u8, raw_code, &mut decoded);
+                    } else if (0x20..=0xff).contains(&code) && code != 0x7f {
+                        decoded.push(char::from(code as u8));
+                    }
+                    start..decoded.len()
+                };
+                if decoded.len() as u64 > remaining_text_bytes {
+                    self.stop_text_extraction();
+                    break 'extract None;
+                }
+                offset = end;
+                if !collect_geometry {
+                    continue;
+                }
+                let origin = Point::new(glyph.x as f64, glyph.y as f64).transform(&combined);
+                let (width, ax, ay) = if vertical {
+                    let cid = cmap.map(|c| c.code_to_cid(code, len as u8)).unwrap_or(code);
+                    let width = font
+                        .map(|f| f.glyph_advance(u16::try_from(cid).unwrap_or(0)))
+                        .unwrap_or(500.0) as f32
+                        * scale_factor
+                        * h_scale;
+                    (width, 0.0, glyph.advance as f64)
+                } else {
+                    (glyph.advance, glyph.advance as f64, 0.0)
+                };
+                let x0 = glyph.x as f64;
+                let x1 = x0 + width as f64;
+                let y0 = glyph.y as f64 + descent * font_size as f64;
+                let y1 = glyph.y as f64 + ascent * font_size as f64;
+                text_glyphs.push(TextGlyph {
+                    text_range,
+                    origin,
+                    advance: Point::new(
+                        combined.a * ax + combined.c * ay,
+                        combined.b * ax + combined.d * ay,
+                    ),
+                    quad: [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+                        .map(|(x, y)| Point::new(x, y).transform(&combined)),
+                });
+            }
             // The rise is already baked into `combined`.
             let start = Point::new(0.0, 0.0).transform(&combined);
             let (x, dx) = if vertical && column.0 <= column.1 {
@@ -5619,12 +5942,12 @@ impl<'a> ContentInterpreter<'a> {
                 advance: dx,
                 // The marked-content id binding this run to a structure element.
                 mcid: self.current_mcid(),
+                glyphs: text_glyphs,
             };
+            self.extracted_text_bytes += span.text.len() as u64;
             // A degenerate text matrix (e.g. 1e300-scale Tm under a large CTM)
             // places the run nowhere.
             span.is_finite().then_some(span)
-        } else {
-            None
         };
 
         // Preserve the ordinary solid-text path without entering fallback or
@@ -5650,12 +5973,21 @@ impl<'a> ContentInterpreter<'a> {
 
         // Hidden optional-content layers also extract no text (emit_painted
         // already drops the glyph run; the matrix advance below still runs).
-        if !self.oc_suppressed() {
-            if let (Some(span), Some(sink)) = (text_span, self.text_sink.as_mut()) {
-                if !span.text.is_empty() {
-                    sink.push(span);
+        if let (Some(span), Some(sink)) = (text_span, self.text_sink.as_mut()) {
+            let kept = if let Some(actual) = &mut self.active_actual_text {
+                if !bytes.is_empty() {
+                    actual.add_source(span, &mut self.text_glyphs_collected);
                 }
-            }
+                !bytes.is_empty()
+            } else if !span.text.is_empty() {
+                self.text_glyphs_collected += span.glyphs.len();
+                sink.push(span);
+                true
+            } else {
+                false
+            };
+            // A run that reaches no span has no geometry to miss.
+            self.stats.text_geometry_omitted |= kept && geometry_omitted;
         }
 
         // Advance the text matrix along the writing direction.
@@ -6102,6 +6434,26 @@ pub(crate) fn next_text_code(
     };
     let end = (offset + length.max(1)).min(bytes.len());
     Some((code, length, fold(&bytes[offset..end]), end))
+}
+
+/// Vertical extent of a selection cell in em, as `(descent, ascent)`.
+///
+/// A font's line metrics cannot be used unchecked: math and Nastaliq faces
+/// declare several em, and some store the descender as a positive number.
+/// The cell stays within 1 em above and half an em below the baseline, so it
+/// cannot cover the neighbouring lines. Missing or non-finite metrics give
+/// the conventional 0.8/−0.2 box.
+fn selection_cell_extent(font: Option<&zpdf_font::LoadedFont>) -> (f64, f64) {
+    const DEFAULT: (f64, f64) = (-0.2, 0.8);
+    let Some(font) = font.filter(|f| f.units_per_em.is_finite() && f.units_per_em > 0.0) else {
+        return DEFAULT;
+    };
+    let ascent = font.ascent / font.units_per_em;
+    let descent = font.descent / font.units_per_em;
+    if !(ascent.is_finite() && descent.is_finite() && ascent > 0.0) {
+        return DEFAULT;
+    }
+    (-descent.abs().min(0.5), ascent.clamp(0.5, 1.0))
 }
 
 /// Whether `build_glyph_clip_path` can read outlines from this font at all.
@@ -6707,7 +7059,7 @@ fn fold_soft_mask(
     limits: &ParseLimits,
     diagnostics: &mut zpdf_core::ProcessingDiagnostics,
 ) {
-    let obj = match file.resolve(smask_ref) {
+    let obj = match file.resolve_shared(smask_ref) {
         Ok(o) => o,
         Err(e) => {
             diagnostics.record_decode_failure(&e);
@@ -6721,7 +7073,7 @@ fn fold_soft_mask(
             return;
         }
     };
-    let data = match file.resolve_stream_data(smask_ref) {
+    let data = match file.resolve_stream_data_shared(smask_ref) {
         Ok(d) => d,
         Err(e) => {
             diagnostics.record_decode_failure(&e);
@@ -6762,7 +7114,7 @@ fn fold_stencil_mask(
     limits: &ParseLimits,
     diagnostics: &mut zpdf_core::ProcessingDiagnostics,
 ) {
-    let obj = match file.resolve(mask_ref) {
+    let obj = match file.resolve_shared(mask_ref) {
         Ok(o) => o,
         Err(e) => {
             diagnostics.record_decode_failure(&e);
@@ -6771,13 +7123,13 @@ fn fold_stencil_mask(
     };
     let stream = match obj.as_stream() {
         Ok(s) => s,
-        Err(_) if matches!(obj, PdfObject::Array(_)) => return,
+        Err(_) if matches!(*obj, PdfObject::Array(_)) => return,
         Err(e) => {
             diagnostics.record_decode_failure(&e);
             return;
         }
     };
-    let data = match file.resolve_stream_data(mask_ref) {
+    let data = match file.resolve_stream_data_shared(mask_ref) {
         Ok(d) => d,
         Err(e) => {
             diagnostics.record_decode_failure(&e);
@@ -6864,6 +7216,19 @@ mod tests {
         let dl = ContentInterpreter::new(page_rect).interpret(content);
         assert_eq!(dl.commands.len(), 1);
         assert!(matches!(&dl.commands[0], RenderCommand::FillPath { .. }));
+    }
+
+    /// A path operator short of operands is skipped, not padded with zeros:
+    /// padding drew strokes to the page origin.
+    #[test]
+    fn underfilled_path_operator_does_not_reach_the_origin() {
+        let page_rect = Rect::new(0.0, 0.0, 612.0, 792.0);
+        let dl = ContentInterpreter::new(page_rect).interpret(b"100 100 m 50 l 200 200 l S");
+        let RenderCommand::StrokePath { path, .. } = &dl.commands[0] else {
+            panic!("expected stroke");
+        };
+        let points: Vec<(f64, f64)> = path.points().iter().map(|p| (p.x, p.y)).collect();
+        assert_eq!(points, vec![(100.0, 100.0), (200.0, 200.0)]);
     }
 
     #[test]

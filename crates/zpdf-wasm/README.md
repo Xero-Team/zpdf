@@ -48,6 +48,11 @@ Open `http://localhost:8080` and drop a PDF. Arrow keys flip pages; Extract text
 
 ## API
 
+Opening keeps one Rust-owned copy of the input PDF. The JS-to-WASM transfer and
+the copy into persistent shared storage remain; opening no longer creates an
+intermediate whole-file Rust `Vec`. The caller may reuse or mutate its original
+`Uint8Array` after `open` returns. Release readers/editors with `free()` when done.
+
 ```js
 import init, { Pdf } from "./pkg/zpdf_wasm.js";
 await init();  // load the wasm

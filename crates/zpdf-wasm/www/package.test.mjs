@@ -73,6 +73,24 @@ test("packaged reader renders and loads raw/compressed fonts", () => {
   } finally { pdf.free(); }
 });
 
+test("packaged reader/editor own input after the caller reuses its buffer", () => {
+  for (const passwordEntry of [false, true]) {
+    const input = fixture();
+    const pdf = passwordEntry ? bindings.Pdf.open_with_password(input, "") : bindings.Pdf.open(input);
+    const editor = passwordEntry ? bindings.PdfEditor.open_with_password(input, "") : bindings.PdfEditor.open(input);
+    input.fill(0);
+    try {
+      assert.match(pdf.page_text(0), /HELLO/);
+      editor.rotate_page(0, 90);
+      const reopened = bindings.Pdf.open(editor.save());
+      try {
+        assert.deepEqual(Array.from(reopened.page_size(0)), [80, 120]);
+        assert.match(reopened.page_text(0), /HELLO/);
+      } finally { reopened.free(); }
+    } finally { editor.free(); pdf.free(); }
+  }
+});
+
 test("packaged bitmap transfers pixels while the copy API stays independent", () => {
   const pdf = bindings.Pdf.open(fixture());
   try {

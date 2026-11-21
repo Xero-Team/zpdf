@@ -456,6 +456,14 @@
       "sha256": "8a84926990144b043f2e5ebda194bf3560cc5f29096cafab8a6079a9d86e2d6b",
       "size": 3481
     },
+    "cmap-resources/Adobe-Japan1-7/CMap/H": {
+      "git_blob": "f8efc4ed68400d9de0ab017c977b9ff15597fdf1",
+      "path": "Adobe-Japan1-7/CMap/H",
+      "repository": "adobe-type-tools/cmap-resources",
+      "revision": "f5cf3bca7fdfeaceb77aa82847e974f2306c20b4",
+      "sha256": "f90323c3fd16e107b02c888167739f210af7144beba1bda83949069535db3346",
+      "size": 4941
+    },
     "cmap-resources/Adobe-Japan1-7/CMap/RKSJ-H": {
       "git_blob": "46fd6237fd77d10bdf6925654253e4ab3e4b3950",
       "path": "Adobe-Japan1-7/CMap/RKSJ-H",
@@ -551,6 +559,14 @@
       "revision": "f5cf3bca7fdfeaceb77aa82847e974f2306c20b4",
       "sha256": "21ad45929c300cfbb97e3d133ec8ea8f1e1bbed64ea32133e9dcae2c8dcfba64",
       "size": 6618
+    },
+    "cmap-resources/Adobe-Japan1-7/CMap/V": {
+      "git_blob": "e508e19ecf70faf17b5da0bfeec5b49b6dd38cbf",
+      "path": "Adobe-Japan1-7/CMap/V",
+      "repository": "adobe-type-tools/cmap-resources",
+      "revision": "f5cf3bca7fdfeaceb77aa82847e974f2306c20b4",
+      "sha256": "1ccdbf3451794ddb929a9e2e43f562b20a8d9de5ec44174317c8a149ab498aa1",
+      "size": 3199
     },
     "cmap-resources/Adobe-KR-9/CMap/UniAKR-UTF16-H": {
       "git_blob": "7f0904446ce2b16855e08f8bfe5752470923550e",
