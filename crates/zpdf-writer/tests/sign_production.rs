@@ -190,7 +190,7 @@ fn pem_key_loading_signs_and_verifies() {
     use rsa::pkcs1::{EncodeRsaPrivateKey, EncodeRsaPublicKey};
 
     let mut rng = ChaCha20Rng::from_seed([9u8; 32]);
-    let priv_key = rsa::RsaPrivateKey::new(&mut rng, 2048).expect("keygen");
+    let priv_key = rsa::PrivateKey::new(&mut rng, 2048).expect("keygen");
     let pub_der = priv_key
         .to_public_key()
         .to_pkcs1_der()
@@ -203,13 +203,34 @@ fn pem_key_loading_signs_and_verifies() {
         "-----BEGIN RSA PRIVATE KEY-----\n{}\n-----END RSA PRIVATE KEY-----",
         base64_encode(priv_der.as_bytes())
     );
-    let key = SigningKey::rsa_from_pkcs1_pem(pem.as_bytes()).expect("pem key");
+    use rsa::pkcs8::EncodePrivateKey;
+    let pkcs8 = priv_key.to_pkcs8_der().expect("PKCS#8 DER");
+    for key in [
+        SigningKey::rsa_from_pkcs1_pem(pem.as_bytes()).expect("pem key"),
+        SigningKey::from_pkcs8_der(pkcs8.as_bytes()).expect("PKCS#8 key"),
+    ] {
+        let signed = IncrementalWriter::new(minimal_pdf())
+            .expect("writer")
+            .sign(&cert, &key, &SignatureOptions::default())
+            .expect("sign");
+        let s = one_sig(&signed);
+        assert_eq!(s.crypto, CryptoStatus::Valid, "loaded RSA key signs");
+    }
+}
+
+#[test]
+fn pkcs8_p256_key_loading_signs_and_verifies() {
+    use p256::pkcs8::EncodePrivateKey;
+    let (cert, _) = ecdsa_material();
+    let scalar = p256::SecretKey::from_slice(&[0x42u8; 32]).expect("scalar");
+    let der = scalar.to_pkcs8_der().expect("PKCS#8 DER");
+    let key = SigningKey::from_pkcs8_der(der.as_bytes()).expect("P-256 fallback");
     let signed = IncrementalWriter::new(minimal_pdf())
         .expect("writer")
         .sign(&cert, &key, &SignatureOptions::default())
         .expect("sign");
-    let s = one_sig(&signed);
-    assert_eq!(s.crypto, CryptoStatus::Valid, "PEM-loaded RSA key signs");
+    assert_eq!(one_sig(&signed).crypto, CryptoStatus::Valid);
+    assert!(SigningKey::from_pkcs8_der(&[0x30, 0x00]).is_err());
 }
 
 #[test]

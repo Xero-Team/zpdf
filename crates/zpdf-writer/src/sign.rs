@@ -35,7 +35,7 @@ pub enum SigningKey {
     /// ECDSA over NIST P-256 (signature algorithm `ecdsa-with-SHA256`).
     EcdsaP256(Box<p256::ecdsa::SigningKey>),
     /// RSA PKCS#1 v1.5 with SHA-256 (`sha256WithRSAEncryption`).
-    Rsa(Box<rsa::RsaPrivateKey>),
+    Rsa(Box<rsa::PrivateKey>),
 }
 
 impl SigningKey {
@@ -49,7 +49,7 @@ impl SigningKey {
     /// An RSA private key from PKCS#1 DER (`RSAPrivateKey`).
     pub fn rsa_from_pkcs1_der(der: &[u8]) -> Result<Self> {
         use rsa::pkcs1::DecodeRsaPrivateKey;
-        let key = rsa::RsaPrivateKey::from_pkcs1_der(der)
+        let key = rsa::PrivateKey::from_pkcs1_der(der)
             .map_err(|_| invalid_data("invalid PKCS#1 RSA private key"))?;
         Ok(SigningKey::Rsa(Box::new(key)))
     }
@@ -57,14 +57,9 @@ impl SigningKey {
     /// An RSA or EC private key from PKCS#8 DER (`PrivateKeyInfo`), tried in
     /// that order.
     pub fn from_pkcs8_der(der: &[u8]) -> Result<Self> {
-        // rsa 0.9 re-exports pkcs8 0.10 while p256 0.14 re-exports pkcs8 0.11 —
-        // the two `DecodePrivateKey` traits are now distinct crate versions,
-        // so import each from its own crate to resolve the right
-        // `from_pkcs8_der` per key type (the pkcs8 duplication is harmless and
-        // already present on main via p384 0.14).
-        use p256::pkcs8::DecodePrivateKey as _;
+        // RSA and P-256 now share the pkcs8 0.11 decoding trait.
         use rsa::pkcs8::DecodePrivateKey as _;
-        if let Ok(key) = rsa::RsaPrivateKey::from_pkcs8_der(der) {
+        if let Ok(key) = rsa::PrivateKey::from_pkcs8_der(der) {
             return Ok(SigningKey::Rsa(Box::new(key)));
         }
         if let Ok(key) = p256::ecdsa::SigningKey::from_pkcs8_der(der) {
@@ -89,7 +84,10 @@ impl SigningKey {
                 use rsa::pkcs1v15::SigningKey as RsaSigningKey;
                 use rsa::signature::{SignatureEncoding, Signer};
                 let signing_key = RsaSigningKey::<Sha256>::new((**key).clone());
-                Ok(signing_key.sign(msg).to_vec())
+                let signature = signing_key
+                    .try_sign(msg)
+                    .map_err(|_| invalid_data("RSA signing failed"))?;
+                Ok(signature.to_vec())
             }
         }
     }

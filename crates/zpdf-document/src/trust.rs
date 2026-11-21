@@ -624,8 +624,8 @@ fn verify_cert_signature(child: &CertInfo, issuer: &CertInfo) -> Option<bool> {
 
 fn rsa_verify(alg: HashAlg, key_der: &[u8], hashed: &[u8], sig: &[u8]) -> Option<bool> {
     use rsa::pkcs1::DecodeRsaPublicKey;
-    use rsa::{Pkcs1v15Sign, RsaPublicKey};
-    let key = RsaPublicKey::from_pkcs1_der(key_der).ok()?;
+    use rsa::{Pkcs1v15Sign, PublicKey};
+    let key = PublicKey::from_pkcs1_der(key_der).ok()?;
     let scheme = match alg {
         HashAlg::Sha1 => Pkcs1v15Sign::new::<sha1::Sha1>(),
         HashAlg::Sha256 => Pkcs1v15Sign::new::<sha2::Sha256>(),

@@ -72,12 +72,12 @@ miniz_oxide = "0.9"
 # cannot be mixed across the cut). Bump them together or not at all.
 aes = "0.9"
 cbc = "0.2"
-sha1 = "0.10"
+sha1 = "0.11"
 sha2 = "0.11"
 # Pure-Rust public-key verification (RustCrypto) for CMS/PKCS#7 digital
 # signatures: RSA PKCS#1 v1.5 and ECDSA over the NIST P-256/P-384 curves.
 # The `oid` feature on the digests supplies the DigestInfo prefixes RSA needs.
-rsa = "0.9"
+rsa = { version = "0.10", features = ["pkcs1v15"] }
 p256 = { version = "0.14", default-features = false, features = ["ecdsa", "std"] }
 p384 = { version = "0.14", default-features = false, features = ["ecdsa", "std"] }
 # Pure-Rust HTTP for the optional RFC 3161 timestamp requester (behind the

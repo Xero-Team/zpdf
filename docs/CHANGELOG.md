@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Upgrade RSA signing and verification to RustCrypto RSA 0.10, with matching
+  SHA-1/SHA-2 digest APIs and explicit PKCS#1 v1.5 compatibility. Preserve
+  encoded PSS salt lengths (including RFC 4055 EXPLICIT fields) and return
+  RSA signing failures as errors. Malformed or duplicate salt-length fields
+  are rejected instead of falling back to the default.
+  `SigningKey::Rsa` now carries `rsa::PrivateKey` from RSA 0.10; callers
+  constructing that variant directly must upgrade their RSA dependency.
+  RSA public-key decoding follows upstream's 1024-bit minimum and 8192-bit maximum.
+
 - Re-export `InkAnnotDict` and `InkAnnotationBuilder` from the `zpdf` facade.
 - Add `TextSpan::glyphs` and public `TextGlyph` selection cells, UTF-8 cluster
   ranges, origins and advance vectors, captured alongside rendering positions.
