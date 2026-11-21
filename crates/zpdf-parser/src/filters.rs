@@ -414,7 +414,7 @@ fn apply_filter(
         "ASCIIHexDecode" | "AHx" => decode_ascii_hex(data, budget),
         "ASCII85Decode" | "A85" => decode_ascii85(data, budget),
         "RunLengthDecode" | "RL" => decode_run_length(data, budget),
-        "DCTDecode" | "DCT" => decode_dct(data, limits.max_image_pixels, budget),
+        "DCTDecode" | "DCT" => decode_dct(data, params, limits.max_image_pixels, budget),
         "CCITTFaxDecode" | "CCF" => {
             let ccitt_params = crate::ccitt::CcittParams::from_dict(params);
             // M1 Fix: Thread budget through to prevent decompression bombs
@@ -869,7 +869,12 @@ fn validate_jpeg_dimensions(
     Ok(())
 }
 
-fn decode_dct(data: &[u8], max_image_pixels: u64, budget: &mut DecodeBudget) -> Result<Vec<u8>> {
+fn decode_dct(
+    data: &[u8],
+    params: Option<&PdfDict>,
+    max_image_pixels: u64,
+    budget: &mut DecodeBudget,
+) -> Result<Vec<u8>> {
     use zune_jpeg::zune_core::colorspace::ColorSpace;
     use zune_jpeg::zune_core::options::DecoderOptions;
     use zune_jpeg::JpegDecoder;
@@ -880,6 +885,7 @@ fn decode_dct(data: &[u8], max_image_pixels: u64, budget: &mut DecodeBudget) -> 
     decoder
         .decode_headers()
         .map_err(|e| Error::StreamDecode(format!("DCTDecode header parse failed: {e}")))?;
+    let components = decoder.info().map_or(0, |info| info.components);
     if let Some(info) = decoder.info() {
         validate_jpeg_dimensions(
             info.width,
@@ -890,29 +896,56 @@ fn decode_dct(data: &[u8], max_image_pixels: u64, budget: &mut DecodeBudget) -> 
         )?;
     }
 
-    // Four-component JPEGs (plain CMYK, or Adobe YCCK — APP14 transform 2)
-    // are emitted as raw CMYK, 4 bytes/pixel, never colour-converted here:
-    // zune-jpeg's CMYK/YCCK→RGB is the naïve `C·K/255` product (with a
-    // spurious inversion on YCCK), which would bypass the DeviceCMYK
-    // conversion — SWOP polynomial, ICCBased profile or output intent — and a
-    // 4-component /Decode that the image decoder applies to CMYK samples. The
-    // samples keep their stored polarity, as libjpeg delivers them: in PDF an
-    // Adobe-inverted CMYK JPEG carries `/Decode [1 0 1 0 1 0 1 0]` (the
-    // pdf.js/MuPDF convention).
-    if let Some(cs @ (ColorSpace::CMYK | ColorSpace::YCCK)) = decoder.input_colorspace() {
+    // ISO 32000-1 §7.4.8, Table 13: an Adobe APP14 marker records the
+    // transform the encoder applied and overrides `/ColorTransform`, so the
+    // entry only matters for a JPEG without one. Only the two defined values
+    // change the default (pdf.js does the same).
+    let color_transform = match adobe_color_transform(data) {
+        Some(_) => None,
+        None => params.and_then(|p| p.get_i64("ColorTransform").ok()),
+    };
+
+    // The components to emit untouched instead of zune-jpeg's RGB output,
+    // and whether they are YCCK still to be turned into CMYK.
+    let raw = match (components, decoder.input_colorspace()) {
+        // Four-component JPEGs (plain CMYK, or YCCK — Adobe APP14 transform 2
+        // or, without a marker, `/ColorTransform 1`) are emitted as raw CMYK,
+        // 4 bytes/pixel, never colour-converted here: zune-jpeg's
+        // CMYK/YCCK→RGB is the naïve `C·K/255` product (with a spurious
+        // inversion on YCCK), which would bypass the DeviceCMYK conversion —
+        // SWOP polynomial, ICCBased profile or output intent — and a
+        // 4-component /Decode that the image decoder applies to CMYK samples.
+        // The samples keep their stored polarity, as libjpeg delivers them: in
+        // PDF an Adobe-inverted CMYK JPEG carries `/Decode [1 0 1 0 1 0 1 0]`
+        // (the pdf.js/MuPDF convention).
+        (4, Some(ColorSpace::YCCK)) => Some((ColorSpace::YCCK, true)),
+        (4, Some(ColorSpace::CMYK)) => Some((ColorSpace::CMYK, color_transform == Some(1))),
+        // `/ColorTransform 0` on a three-component JPEG without an Adobe
+        // marker: the components were stored as RGB, not converted to YCbCr,
+        // so they must not be converted back (zune-jpeg would, as it does for
+        // any unmarked three-component JPEG not labelled R, G, B).
+        // (Adobe APP14 transform 0 on three components needs nothing here:
+        // zune-jpeg itself decodes those as stored RGB.)
+        (3, Some(ColorSpace::YCbCr)) if color_transform == Some(0) => {
+            Some((ColorSpace::YCbCr, false))
+        }
+        _ => None,
+    };
+    if let Some((cs, ycck)) = raw {
         let opts = DecoderOptions::default().jpeg_set_out_colorspace(cs);
         let mut raw = JpegDecoder::new_with_options(std::io::Cursor::new(data), opts);
         match raw.decode() {
             Ok(mut samples)
-                if raw.output_colorspace() == Some(cs) && samples.len().is_multiple_of(4) =>
+                if raw.output_colorspace() == Some(cs)
+                    && samples.len().is_multiple_of(components as usize) =>
             {
-                if cs == ColorSpace::YCCK {
+                if ycck {
                     ycck_to_cmyk(&mut samples);
                 }
                 return Ok(samples);
             }
-            // Unexpected (e.g. not actually 4-component): fall back to the
-            // default decode rather than mangle the data.
+            // Unexpected output: fall back to the default decode rather than
+            // mangle the data.
             Ok(_) => tracing::warn!("DCTDecode: unexpected raw {cs:?} output; decoding as RGB"),
             Err(e) => tracing::warn!("DCTDecode: raw {cs:?} decode failed ({e}); decoding as RGB"),
         }
@@ -921,6 +954,49 @@ fn decode_dct(data: &[u8], max_image_pixels: u64, budget: &mut DecodeBudget) -> 
     decoder
         .decode()
         .map_err(|e| Error::StreamDecode(format!("DCTDecode: {e}")))
+}
+
+/// The colour transform recorded by a JPEG's Adobe APP14 marker
+/// (0 = none, 1 = YCbCr, 2 = YCCK), if it carries one before its first scan.
+///
+/// Walks the marker segments the way zune-jpeg reads them (the last APP14
+/// wins). Every step advances by at least one byte, so the scan is linear in
+/// the header length and stops at a truncated segment.
+fn adobe_color_transform(data: &[u8]) -> Option<u8> {
+    if !data.starts_with(&[0xFF, 0xD8]) {
+        return None;
+    }
+    let mut transform = None;
+    let mut i = 2;
+    while i + 1 < data.len() {
+        if data[i] != 0xFF {
+            i += 1;
+            continue;
+        }
+        match data[i + 1] {
+            // Fill bytes before a marker.
+            0xFF => i += 1,
+            // Start of scan or end of image: the header is over.
+            0xDA | 0xD9 => break,
+            // Markers without a length field.
+            0x00 | 0x01 | 0xD0..=0xD8 => i += 2,
+            marker => {
+                let (Some(&hi), Some(&lo)) = (data.get(i + 2), data.get(i + 3)) else {
+                    break;
+                };
+                let len = usize::from(u16::from_be_bytes([hi, lo])).max(2);
+                let Some(segment) = data.get(i + 4..i + 2 + len) else {
+                    break;
+                };
+                // "Adobe", version (2), flags0 (2), flags1 (2), transform (1).
+                if marker == 0xEE && segment.len() >= 12 && segment.starts_with(b"Adobe") {
+                    transform = Some(segment[11]);
+                }
+                i += 2 + len;
+            }
+        }
+    }
+    transform
 }
 
 /// Convert raw upsampled Adobe YCCK samples (`Y, Cb, Cr, K` per pixel) to
@@ -1095,7 +1171,7 @@ mod tests {
         // per pixel, no naïve CMYK→RGB product and no inversion.
         for transform in [None, Some(0)] {
             let jpeg = tiny_four_component_jpeg(transform);
-            let out = decode_dct(&jpeg, u64::MAX, &mut DecodeBudget::new(1 << 20)).unwrap();
+            let out = decode_dct(&jpeg, None, u64::MAX, &mut DecodeBudget::new(1 << 20)).unwrap();
             assert_eq!(out.len(), 8 * 8 * 4, "{transform:?}");
             assert!(
                 out.iter().all(|&v| v == 128),
@@ -1105,9 +1181,162 @@ mod tests {
         }
         // Adobe YCCK: neutral chroma at Y=128 → C=M=Y=127, K unchanged.
         let jpeg = tiny_four_component_jpeg(Some(2));
-        let out = decode_dct(&jpeg, u64::MAX, &mut DecodeBudget::new(1 << 20)).unwrap();
+        let out = decode_dct(&jpeg, None, u64::MAX, &mut DecodeBudget::new(1 << 20)).unwrap();
         assert_eq!(out.len(), 8 * 8 * 4);
         assert_eq!(&out[..4], &[127, 127, 127, 128]);
+    }
+
+    /// An 8x8 three-component baseline JPEG (component ids 1, 2, 3, so not
+    /// labelled R, G, B) whose stored samples are flat [`RAW_RGB`]: each
+    /// component has only a DC coefficient of ±1 scaled by its own
+    /// quantisation table. Optionally tagged with an Adobe APP14 marker.
+    fn tiny_three_component_jpeg(adobe_transform: Option<u8>) -> Vec<u8> {
+        let mut j = vec![0xFF, 0xD8];
+        if let Some(transform) = adobe_transform {
+            j.extend_from_slice(&[0xFF, 0xEE, 0x00, 0x0E]);
+            j.extend_from_slice(b"Adobe");
+            j.extend_from_slice(&[0x00, 0x64, 0x00, 0x00, 0x00, 0x00, transform]);
+        }
+        // DQT: tables 0–2, DC steps 240, 240, 80, every AC step 1.
+        j.extend_from_slice(&[0xFF, 0xDB, 0x00, 0xC5]);
+        for (table, dc_step) in [(0, 240), (1, 240), (2, 80)] {
+            j.push(table);
+            j.push(dc_step);
+            j.extend_from_slice(&[1; 63]);
+        }
+        // SOF0: 8-bit, 8x8, 3 components, 1x1 sampling, one table each.
+        j.extend_from_slice(&[0xFF, 0xC0, 0x00, 0x11, 0x08, 0x00, 0x08, 0x00, 0x08, 0x03]);
+        j.extend_from_slice(&[1, 0x11, 0, 2, 0x11, 1, 3, 0x11, 2]);
+        // DHT DC table 0: a single 1-bit code for category 1 (a diff of ±1).
+        j.extend_from_slice(&[0xFF, 0xC4, 0x00, 0x14, 0x00, 1]);
+        j.extend_from_slice(&[0; 15]);
+        j.push(1);
+        // DHT AC table 0: a single 1-bit code for EOB (0x00).
+        j.extend_from_slice(&[0xFF, 0xC4, 0x00, 0x14, 0x10, 1]);
+        j.extend_from_slice(&[0; 15]);
+        j.push(0);
+        // SOS over the three components. Per component: DC code "0", the
+        // diff bit (1 → +1, 0 → −1), AC EOB "0". DC +1, −1, +1 gives
+        // 010 000 010, padded with 1s: 0100_0001 0111_1111.
+        j.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x0C, 0x03]);
+        j.extend_from_slice(&[1, 0x00, 2, 0x00, 3, 0x00, 0x00, 0x3F, 0x00]);
+        j.extend_from_slice(&[0x41, 0x7F]);
+        j.extend_from_slice(&[0xFF, 0xD9]);
+        j
+    }
+
+    /// The stored samples of [`tiny_three_component_jpeg`]: 128 + DC/8.
+    const RAW_RGB: [u8; 3] = [158, 98, 138];
+
+    /// Decode `jpeg` as a `/DCTDecode` stream with optional `/ColorTransform`.
+    fn decode_dct_stream(jpeg: &[u8], color_transform: Option<i64>) -> Vec<u8> {
+        let mut dict = PdfDict::new();
+        dict.insert(
+            PdfName::new("Filter"),
+            PdfObject::Name(PdfName::new("DCTDecode")),
+        );
+        if let Some(value) = color_transform {
+            let mut parms = PdfDict::new();
+            parms.insert(PdfName::new("ColorTransform"), PdfObject::Integer(value));
+            dict.insert(PdfName::new("DecodeParms"), PdfObject::Dict(parms));
+        }
+        decode_stream(jpeg, &dict).unwrap()
+    }
+
+    fn assert_flat(out: &[u8], components: usize, expected: &[u8], what: &str) {
+        assert_eq!(out.len(), 8 * 8 * components, "{what}");
+        for px in out.chunks_exact(components) {
+            assert_eq!(px, expected, "{what}");
+        }
+    }
+
+    /// JFIF YCbCr → RGB of [`RAW_RGB`] read as Y, Cb, Cr: what a decoder
+    /// that ignores `/ColorTransform 0` produces.
+    fn converted_raw_rgb() -> [u8; 3] {
+        let [y, cb, cr] = RAW_RGB.map(f64::from);
+        [
+            y + 1.402 * (cr - 128.0),
+            y - 0.344_136 * (cb - 128.0) - 0.714_136 * (cr - 128.0),
+            y + 1.772 * (cb - 128.0),
+        ]
+        .map(|v| v.round().clamp(0.0, 255.0) as u8)
+    }
+
+    fn assert_converted(out: &[u8], what: &str) {
+        assert_eq!(out.len(), 8 * 8 * 3, "{what}");
+        let expected = converted_raw_rgb();
+        for px in out.as_chunks::<3>().0 {
+            for (a, e) in px.iter().zip(expected) {
+                assert!(a.abs_diff(e) <= 2, "{what}: {px:?} vs {expected:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn color_transform_0_keeps_stored_rgb() {
+        // ISO 32000-1 Table 13: no YCbCr→RGB conversion, so the raw RGB
+        // samples come out as stored rather than converted a second time.
+        let out = decode_dct_stream(&tiny_three_component_jpeg(None), Some(0));
+        assert_flat(&out, 3, &RAW_RGB, "/ColorTransform 0");
+    }
+
+    #[test]
+    fn three_component_jpeg_converts_by_default() {
+        // Default for three components is 1: YCbCr→RGB.
+        let jpeg = tiny_three_component_jpeg(None);
+        assert_converted(&decode_dct_stream(&jpeg, None), "no /ColorTransform");
+        assert_converted(&decode_dct_stream(&jpeg, Some(1)), "/ColorTransform 1");
+    }
+
+    #[test]
+    fn adobe_marker_overrides_color_transform() {
+        // The marker records what the encoder did; /ColorTransform loses.
+        let ycbcr = tiny_three_component_jpeg(Some(1));
+        assert_converted(&decode_dct_stream(&ycbcr, Some(0)), "Adobe 1, /CT 0");
+        let rgb = tiny_three_component_jpeg(Some(0));
+        assert_flat(&decode_dct_stream(&rgb, None), 3, &RAW_RGB, "Adobe 0");
+        assert_flat(
+            &decode_dct_stream(&rgb, Some(1)),
+            3,
+            &RAW_RGB,
+            "Adobe 0, /CT 1",
+        );
+
+        let cmyk = tiny_four_component_jpeg(Some(0));
+        assert_flat(
+            &decode_dct_stream(&cmyk, Some(1)),
+            4,
+            &[128; 4],
+            "Adobe 0, /CT 1",
+        );
+    }
+
+    #[test]
+    fn color_transform_1_marks_unmarked_four_components_as_ycck() {
+        // Without an Adobe marker four components default to plain CMYK; an
+        // explicit /ColorTransform 1 says they were stored as YCCK.
+        let jpeg = tiny_four_component_jpeg(None);
+        assert_flat(&decode_dct_stream(&jpeg, None), 4, &[128; 4], "no /CT");
+        assert_flat(&decode_dct_stream(&jpeg, Some(0)), 4, &[128; 4], "/CT 0");
+        let ycck = [127, 127, 127, 128];
+        assert_flat(&decode_dct_stream(&jpeg, Some(1)), 4, &ycck, "/CT 1");
+    }
+
+    #[test]
+    fn adobe_transform_scan_handles_malformed_headers() {
+        let marked = tiny_three_component_jpeg(Some(1));
+        assert_eq!(adobe_color_transform(&marked), Some(1));
+        assert_eq!(
+            adobe_color_transform(&tiny_three_component_jpeg(None)),
+            None
+        );
+        // Every truncation, a zero segment length and a missing SOI end the
+        // scan without panicking.
+        for end in 0..marked.len() {
+            let _ = adobe_color_transform(&marked[..end]);
+        }
+        assert_eq!(adobe_color_transform(&[0xFF, 0xD8, 0xFF, 0xE0, 0, 0]), None);
+        assert_eq!(adobe_color_transform(&marked[2..]), None);
     }
 
     #[test]
