@@ -148,6 +148,12 @@ impl Type1Font {
     /// Whether sampled non-space charstrings decode into usable outlines rather
     /// than failing or producing empty output across the whole font.
     pub fn has_usable_outlines(&self) -> bool {
+        self.probe_outlines() != crate::EmbeddedOutlineProbe::Unusable
+    }
+
+    /// Classify sampled non-space charstrings as completely healthy, partially
+    /// corrupt (usable as primary, with failing charstrings), or unusable.
+    pub(crate) fn probe_outlines(&self) -> crate::EmbeddedOutlineProbe {
         let non_blank: Vec<&str> = self
             .gid_to_name
             .iter()
@@ -155,7 +161,7 @@ impl Type1Font {
             .filter(|name| !matches!(*name, "" | ".notdef" | "space" | "nbspace" | "uni00A0"))
             .collect();
         if non_blank.is_empty() {
-            return true;
+            return crate::EmbeddedOutlineProbe::Healthy;
         }
         let step = (non_blank.len() / 32).max(1);
         let mut drawn = 0u32;
@@ -180,7 +186,37 @@ impl Type1Font {
             }
             i += step;
         }
-        drawn > 0 && failed <= drawn
+        if drawn == 0 || failed > drawn {
+            crate::EmbeddedOutlineProbe::Unusable
+        } else if failed > 0 {
+            crate::EmbeddedOutlineProbe::PartiallyCorrupt
+        } else {
+            crate::EmbeddedOutlineProbe::Healthy
+        }
+    }
+
+    /// Whether `gid` maps to an embedded charstring whose execution fails
+    /// (malformed outline record, as opposed to an unmapped `.notdef` or valid
+    /// empty space charstring).
+    pub(crate) fn is_gid_unreadable(&self, gid: u16) -> bool {
+        let Some(name) = self.gid_to_name.get(gid as usize) else {
+            return false;
+        };
+        if name.is_empty() || name == ".notdef" {
+            return false;
+        }
+        let Some(cs) = self.char_strings.get(name) else {
+            return false;
+        };
+        let mut interp = Interp::new();
+        interp.run(cs, &self.subrs, 0);
+        if interp.failed {
+            return true;
+        }
+        if let Some(seac) = interp.seac {
+            return self.compose_seac(&interp, seac, 1).is_none();
+        }
+        false
     }
 
     /// Built-in encoding glyph name for a character code.

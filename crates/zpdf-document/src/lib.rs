@@ -72,13 +72,17 @@ pub struct PdfDocument {
     font_provider: Option<Arc<zpdf_font::FontProvider>>,
 }
 
-/// One entry in [`SharedFonts`]: the parsed primary font, any embedded-font
-/// fallback diagnostics, and an optional partially readable embedded original
-/// retained for glyphs uncovered by a substitute.
-pub(crate) type SharedFontEntry = (
+/// One entry in [`SharedFonts`]: the parsed primary font, any load-time
+/// embedded-font fallback diagnostics, an optional paired companion
+/// (embedded original for a substitute primary, or descriptor substitute for a
+/// partially corrupt embedded primary), and the embedded `/FontFile*` object id
+/// when an embedded font program was kept as the primary face.
+#[doc(hidden)]
+pub type SharedFontEntry = (
     Arc<LoadedFont>,
     zpdf_core::ProcessingDiagnostics,
     Option<Arc<LoadedFont>>,
+    Option<ObjectId>,
 );
 
 /// Fonts parsed so far by one document, with the byte total the budget is
@@ -97,23 +101,28 @@ impl SharedFonts {
     /// valid snapshots.
     pub(crate) fn refresh_provider(&mut self, generation: Option<u64>) {
         if self.generation != generation {
-            self.fonts.retain(|_, (font, diag, _)| {
-                !font.is_substitute && font.has_font_data() && diag.is_empty()
+            self.fonts.retain(|_, (font, diag, comp, _)| {
+                !font.is_substitute && font.has_font_data() && diag.is_empty() && comp.is_none()
             });
             let mut budget = FontCacheBudget::default();
             self.fonts
-                .retain(|_, (font, _, _)| budget.try_admit(font, u64::MAX));
+                .retain(|_, (font, _, _, _)| budget.try_admit(font, u64::MAX));
             self.budget = budget;
             self.generation = generation;
         }
     }
     /// The font parsed for `id` by an earlier page of this document, if it was
-    /// retained, together with any embedded-font fallback diagnostics and
-    /// retained embedded companion.
+    /// retained, together with any embedded-font fallback diagnostics, paired
+    /// companion, and embedded stream object id.
     pub(crate) fn get(&self, id: ObjectId) -> Option<SharedFontEntry> {
-        self.fonts
-            .get(&id)
-            .map(|(font, diag, comp)| (Arc::clone(font), *diag, comp.as_ref().map(Arc::clone)))
+        self.fonts.get(&id).map(|(font, diag, comp, emb_id)| {
+            (
+                Arc::clone(font),
+                *diag,
+                comp.as_ref().map(Arc::clone),
+                *emb_id,
+            )
+        })
     }
 
     /// Retain `font` for the rest of the document when the shared budget allows,
@@ -125,6 +134,7 @@ impl SharedFonts {
         font: LoadedFont,
         diagnostics: zpdf_core::ProcessingDiagnostics,
         embedded_companion: Option<LoadedFont>,
+        embedded_file_id: Option<ObjectId>,
         max_bytes: u64,
     ) -> SharedFontEntry {
         if let Some(existing) = self.get(id) {
@@ -135,22 +145,29 @@ impl SharedFonts {
         match &companion {
             Some(comp) => {
                 // Keep shared lookups consistent across renders: only cache a
-                // substituted font with its embedded companion when BOTH faces
-                // fit together. Caching a primary-only entry would cause later
-                // renders on fresh page caches to lose surviving embedded CIDs.
+                // font with its paired companion when BOTH faces fit together.
+                // Caching a primary-only entry would cause later renders on
+                // fresh page caches to lose surviving companion glyphs.
                 if self.budget.try_admit_pair(&font, comp, max_bytes) {
-                    self.fonts
-                        .insert(id, (Arc::clone(&font), diagnostics, Some(Arc::clone(comp))));
+                    self.fonts.insert(
+                        id,
+                        (
+                            Arc::clone(&font),
+                            diagnostics,
+                            Some(Arc::clone(comp)),
+                            embedded_file_id,
+                        ),
+                    );
                 }
             }
             None => {
                 if self.budget.try_admit(&font, max_bytes) {
                     self.fonts
-                        .insert(id, (Arc::clone(&font), diagnostics, None));
+                        .insert(id, (Arc::clone(&font), diagnostics, None, embedded_file_id));
                 }
             }
         }
-        (font, diagnostics, companion)
+        (font, diagnostics, companion, embedded_file_id)
     }
 }
 
@@ -322,21 +339,15 @@ impl PdfDocument {
         &self,
         font_ref: ObjectId,
     ) -> Result<(Arc<LoadedFont>, zpdf_core::ProcessingDiagnostics)> {
-        let (font, diag, _) = self.shared_font_with_fallback(font_ref)?;
+        let (font, diag, _, _) = self.shared_font_with_fallback(font_ref)?;
         Ok((font, diag))
     }
 
-    /// Like [`Self::shared_font_with_diagnostics`], also returning any retained
-    /// partially-readable embedded original paired with a substitute.
+    /// Like [`Self::shared_font_with_diagnostics`], also returning any paired
+    /// fallback companion and the embedded `/FontFile*` object id when an
+    /// embedded program was kept as primary.
     #[doc(hidden)]
-    pub fn shared_font_with_fallback(
-        &self,
-        font_ref: ObjectId,
-    ) -> Result<(
-        Arc<LoadedFont>,
-        zpdf_core::ProcessingDiagnostics,
-        Option<Arc<LoadedFont>>,
-    )> {
+    pub fn shared_font_with_fallback(&self, font_ref: ObjectId) -> Result<SharedFontEntry> {
         font_loader::load_shared_font(
             &self.file,
             font_ref,
@@ -345,14 +356,14 @@ impl PdfDocument {
         )
     }
 
-    /// Return a previously cached embedded companion for `font_ref`, if any,
-    /// without parsing.
+    /// Return a previously cached companion for `font_ref`, if any, without
+    /// parsing.
     #[doc(hidden)]
     pub fn cached_shared_font_companion(&self, font_ref: ObjectId) -> Option<Arc<LoadedFont>> {
         self.shared_fonts
             .borrow()
             .get(font_ref)
-            .and_then(|(_, _, companion)| companion)
+            .and_then(|(_, _, companion, _)| companion)
     }
 
     /// Parse a page's annotations into renderable form (/Rect, /F, the
@@ -514,12 +525,11 @@ impl PdfDocument {
     }
 
     /// Like [`Self::struct_tree`], also returning stream-scoped `/ActualText`
-    /// MCID coverage per page for structured text completeness checks.
+    /// MCID coverage and per-kid stream ownership for structured text assembly
+    /// and completeness checks.
     #[doc(hidden)]
-    pub fn struct_tree_with_actual_text(
-        &self,
-    ) -> Option<(StructTree, structure::ActualTextMcidMap)> {
-        structure::parse_struct_tree_with_actual_text(&self.file, &self.catalog)
+    pub fn struct_tree_with_streams(&self) -> Option<(StructTree, structure::StructTreeStreams)> {
+        structure::parse_struct_tree_with_streams(&self.file, &self.catalog)
     }
 
     /// Whether the document declares Tagged-PDF conformance via the catalog's
@@ -564,13 +574,21 @@ mod tests {
         let total = first_cost * 2 - data.len() as u64;
         let mut shared = SharedFonts::default();
         let clean = zpdf_core::ProcessingDiagnostics::default();
-        shared.admit(ObjectId(1, 0), make_font(), clean, None, first_cost - 1);
+        shared.admit(
+            ObjectId(1, 0),
+            make_font(),
+            clean,
+            None,
+            None,
+            first_cost - 1,
+        );
         assert!(shared.get(ObjectId(1, 0)).is_none());
-        let (first, _, _) = shared.admit(ObjectId(1, 0), make_font(), clean, None, first_cost);
+        let (first, _, _, _) =
+            shared.admit(ObjectId(1, 0), make_font(), clean, None, None, first_cost);
         assert!(Arc::ptr_eq(&first, &shared.get(ObjectId(1, 0)).unwrap().0));
-        shared.admit(ObjectId(2, 0), make_font(), clean, None, total - 1);
+        shared.admit(ObjectId(2, 0), make_font(), clean, None, None, total - 1);
         assert!(shared.get(ObjectId(2, 0)).is_none());
-        shared.admit(ObjectId(2, 0), make_font(), clean, None, total);
+        shared.admit(ObjectId(2, 0), make_font(), clean, None, None, total);
         assert_eq!(shared.budget.bytes_used(), total);
         shared.refresh_provider(Some(1));
         assert_eq!(shared.fonts.len(), 2);
@@ -598,14 +616,15 @@ mod tests {
 
         // Partially fill the shared cache so primary alone fits, but primary + companion does not.
         let budget = filler_cost + primary_cost + companion_cost - 1;
-        shared.admit(ObjectId(1, 0), filler, clean, None, budget);
+        shared.admit(ObjectId(1, 0), filler, clean, None, None, budget);
         assert_eq!(shared.budget.bytes_used(), filler_cost);
 
-        let (_, _, returned_comp) = shared.admit(
+        let (_, _, returned_comp, _) = shared.admit(
             ObjectId(2, 0),
             make_font("Primary", &[2u8; 16]),
             fallback,
             Some(make_font("Companion", &[3u8; 16])),
+            None,
             budget,
         );
         assert!(returned_comp.is_some());
@@ -617,11 +636,12 @@ mod tests {
 
         // When both fit together, the pair is cached atomically.
         let full_budget = filler_cost + primary_cost + companion_cost;
-        let (p, _, c) = shared.admit(
+        let (p, _, c, _) = shared.admit(
             ObjectId(2, 0),
             primary,
             fallback,
             Some(companion),
+            None,
             full_budget,
         );
         let cached = shared.get(ObjectId(2, 0)).expect("pair cached");

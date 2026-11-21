@@ -1225,7 +1225,7 @@ impl FontCache {
             raw_code,
             length,
             max_bytes,
-            |_, _| None,
+            |_, _| crate::DeferredCompanionLoad::Unavailable,
         )
     }
 
@@ -1233,7 +1233,9 @@ impl FontCache {
     /// only when the primary substitute lacks a drawable outline for this glyph
     /// and the paired companion is still an unloaded resource reference. The
     /// loaded companion is admitted (and charged against `max_bytes`) only if
-    /// it actually draws this glyph.
+    /// it actually draws this glyph. Definitive load or budget failures are
+    /// remembered per `FontId` so subsequent missing glyphs at the same or
+    /// smaller remaining budget do not re-decode the stream.
     #[doc(hidden)]
     pub fn resolve_embedded_companion_glyph_with(
         &mut self,
@@ -1242,79 +1244,157 @@ impl FontCache {
         raw_code: u32,
         length: u8,
         max_bytes: u64,
-        mut load_deferred: impl FnMut(&crate::CompanionSource, u64) -> Option<Arc<LoadedFont>>,
+        mut load_deferred: impl FnMut(&crate::CompanionSource, u64) -> crate::DeferredCompanionLoad,
     ) -> Option<DrawingGlyph> {
-        if self.embedded_companions.is_empty()
-            || !self.embedded_companions.contains_key(&original.font_id)
-        {
+        if self.embedded_companions.is_empty() {
             return None;
         }
+        let kind = self.embedded_companions.get(&original.font_id)?.kind;
         let primary = self.fonts.get(&original.font_id)?;
-        let primary_state = match self.provider.as_ref() {
-            Some(provider) => provider.glyph_state(primary, original.glyph_id),
-            None => primary.glyph_state(original.glyph_id),
-        };
-        if primary_state == GlyphState::Drawn
-            || (primary_state == GlyphState::Blank
-                && primary.code_requires_no_ink(code, raw_code, length))
-        {
-            return None;
+        match kind {
+            crate::CompanionKind::EmbeddedOriginal => {
+                let primary_state = match self.provider.as_ref() {
+                    Some(provider) => provider.glyph_state(primary, original.glyph_id),
+                    None => primary.glyph_state(original.glyph_id),
+                };
+                if primary_state == GlyphState::Drawn
+                    || (primary_state == GlyphState::Blank
+                        && primary.code_requires_no_ink(code, raw_code, length))
+                {
+                    return None;
+                }
+            }
+            crate::CompanionKind::DescriptorSubstitute { .. } => {
+                if original.glyph_id == 0
+                    || !primary.is_embedded_glyph_unreadable(original.glyph_id)
+                {
+                    return None;
+                }
+            }
         }
 
-        let (companion, existing_id, was_deferred) = {
-            let (source, admitted_id) = self.embedded_companions.get(&original.font_id)?;
-            if let Some(id) = *admitted_id {
-                (Arc::clone(self.fonts.get(&id)?), Some(id), false)
+        // Reclaimable standby companions held by other fonts do not count
+        // against the budget available to a glyph that actually needs its
+        // companion: `admit_drawing_font` reclaims unused standby if needed.
+        let miss_key = (code, raw_code, length);
+        let remaining = max_bytes.saturating_sub(self.budget.bytes_used());
+        let (companion, existing_id, from_standby, was_deferred) = {
+            let entry = self.embedded_companions.get(&original.font_id)?;
+            if let Some(id) = entry.admitted {
+                (Arc::clone(self.fonts.get(&id)?), Some(id), false, false)
+            } else if let Some(comp) = &entry.standby {
+                (Arc::clone(comp), None, true, false)
             } else {
-                match source {
-                    crate::CompanionSource::Loaded(comp) => (Arc::clone(comp), None, false),
+                if entry.missed_codes.contains(&miss_key) {
+                    return None;
+                }
+                match &entry.source {
+                    crate::CompanionSource::None => return None,
                     deferred @ (crate::CompanionSource::Object(_)
-                    | crate::CompanionSource::InlineDict(_)) => {
-                        let remaining = max_bytes.saturating_sub(self.budget.bytes_used());
-                        if remaining == 0 {
+                    | crate::CompanionSource::FormInlineFont { .. }) => {
+                        if remaining == 0
+                            || entry.failed_budget.is_some_and(|limit| remaining <= limit)
+                        {
                             return None;
                         }
-                        let loaded = load_deferred(deferred, remaining)?;
-                        (loaded, None, true)
+                        match load_deferred(deferred, remaining) {
+                            crate::DeferredCompanionLoad::Loaded(loaded) => {
+                                if self.budget.admission_total(&loaded, max_bytes).is_none() {
+                                    // The loaded companion's full cache footprint
+                                    // exceeds `remaining` even before checking
+                                    // individual glyphs; remember the budget
+                                    // failure so later missing glyphs do not
+                                    // re-decode the stream repeatedly.
+                                    if let Some(entry) =
+                                        self.embedded_companions.get_mut(&original.font_id)
+                                    {
+                                        entry.failed_budget = Some(
+                                            entry
+                                                .failed_budget
+                                                .map_or(remaining, |prev| prev.max(remaining)),
+                                        );
+                                    }
+                                    return None;
+                                }
+                                (loaded, None, false, true)
+                            }
+                            crate::DeferredCompanionLoad::Unavailable => return None,
+                            crate::DeferredCompanionLoad::FailedForBudget => {
+                                if let Some(entry) =
+                                    self.embedded_companions.get_mut(&original.font_id)
+                                {
+                                    entry.failed_budget = Some(
+                                        entry
+                                            .failed_budget
+                                            .map_or(remaining, |prev| prev.max(remaining)),
+                                    );
+                                }
+                                return None;
+                            }
+                        }
                     }
                 }
             }
         };
         let companion_gid = if matches!(companion.font_type, PdfFontType::Type0CidType2) {
-            if companion.unicode_coded() {
-                companion.composite_unicode_gid(code, raw_code, length)?
+            if companion.unicode_coded() || companion.legacy_substitute() {
+                companion.composite_unicode_gid(code, raw_code, length)
             } else {
                 let cid = companion
                     .cid_cmap
                     .as_ref()
                     .map(|c| c.code_to_cid(code, length))
                     .unwrap_or(code);
-                u16::try_from(cid).ok()?
+                u16::try_from(cid).ok()
             }
         } else {
-            companion.code_to_gid(u16::try_from(code).ok()?)?
+            u16::try_from(code)
+                .ok()
+                .and_then(|c| companion.code_to_gid(c))
         };
-        let companion_state = match self.provider.as_ref() {
-            Some(provider) => provider.glyph_state(&companion, companion_gid),
-            None => companion.glyph_state(companion_gid),
-        };
-        if companion_state != GlyphState::Drawn {
+        let Some(companion_gid) = companion_gid.filter(|&gid| {
+            let state = match self.provider.as_ref() {
+                Some(provider) => provider.glyph_state(&companion, gid),
+                None => companion.glyph_state(gid),
+            };
+            state == GlyphState::Drawn
+        }) else {
+            if was_deferred {
+                if let Some(entry) = self.embedded_companions.get_mut(&original.font_id) {
+                    if entry.missed_codes.len() < crate::MAX_COMPANION_MISS_CACHE {
+                        entry.missed_codes.insert(miss_key);
+                    }
+                }
+            }
             return None;
-        }
+        };
         let font_id = match existing_id {
             Some(id) => id,
             None => {
+                if from_standby {
+                    self.budget.admission_total(&companion, max_bytes)?;
+                    if let Some(entry) = self.embedded_companions.get_mut(&original.font_id) {
+                        entry.standby = None;
+                    }
+                    self.recompute_standby_bytes();
+                }
                 let Some(id) = self.admit_drawing_font(companion, max_bytes) else {
                     if was_deferred {
                         // `FontCacheBudget` is non-evicting, so a deferred
-                        // companion that exceeds `max_bytes` cannot fit later
-                        // on this page either.
-                        self.embedded_companions.remove(&original.font_id);
+                        // companion that exceeded `remaining` cannot fit later
+                        // at the same or smaller remaining budget either.
+                        if let Some(entry) = self.embedded_companions.get_mut(&original.font_id) {
+                            entry.failed_budget = Some(
+                                entry
+                                    .failed_budget
+                                    .map_or(remaining, |prev| prev.max(remaining)),
+                            );
+                        }
                     }
                     return None;
                 };
-                if let Some((_, slot)) = self.embedded_companions.get_mut(&original.font_id) {
-                    *slot = Some(id);
+                if let Some(entry) = self.embedded_companions.get_mut(&original.font_id) {
+                    entry.admitted = Some(id);
                 }
                 id
             }
@@ -1332,6 +1412,7 @@ impl FontCache {
         let id = self.next_free_id()?;
         self.budget.record(&font, total);
         self.fonts.insert(id, font);
+        self.reclaim_standby_for(total, max_bytes);
         Some(id)
     }
 }

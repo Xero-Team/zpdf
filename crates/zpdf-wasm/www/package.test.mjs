@@ -286,6 +286,77 @@ test("packaged reader recovers corrupt embedded font with a substitute and rejec
       );
     } finally { formMismatch.free(); }
   }
+
+  // Form /MCR /Stm MCID 0 /ActualText replacement must NOT drop an unrelated
+  // readable page span that also uses MCID 0.
+  {
+    const pageStream = "0 0 0 rg /Span << /MCID 0 >> BDC BT /F0 12 Tf 15 80 Td (PageText) Tj ET EMC /Fm Do";
+    const formStream = "0 0 0 rg /Span << /MCID 0 >> BDC BT /F1 24 Tf 60 40 Td <0002> Tj ET EMC";
+    const objs = [
+      "<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 9 0 R /MarkInfo << /Marked true >> >>",
+      "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+      "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 180 100] /Resources << /Font << /F0 12 0 R /F1 5 0 R >> /XObject << /Fm 11 0 R >> >> /Contents 4 0 R >>",
+      `<< /Length ${pageStream.length} >>\nstream\n${pageStream}\nendstream`,
+      "<< /Type /Font /Subtype /Type0 /BaseFont /ABCDEF+TaggedCID /Encoding /Identity-H /DescendantFonts [6 0 R] >>",
+      "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /ABCDEF+TaggedCID /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor 7 0 R /DW 1000 >>",
+      "<< /Type /FontDescriptor /FontName /ABCDEF+TaggedCID /Flags 32 /FontFile2 8 0 R >>",
+      `<< /Length ${corruptFont.length} >>\nstream\n${corruptFont}\nendstream`,
+      "<< /Type /StructTreeRoot /K [10 0 R] >>",
+      "<< /Type /StructElem /S /Span /Pg 3 0 R /ActualText (FormLabel) /K << /Type /MCR /Pg 3 0 R /Stm 11 0 R /MCID 0 >> >>",
+      `<< /Type /XObject /Subtype /Form /BBox [0 0 180 100] /Resources << /Font << /F1 5 0 R >> >> /Length ${formStream.length} >>\nstream\n${formStream}\nendstream`,
+      "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+    ];
+    let raw = "%PDF-1.7\n";
+    const offs = [];
+    for (const [i, body] of objs.entries()) {
+      offs.push(Buffer.byteLength(raw));
+      raw += `${i + 1} 0 obj\n${body}\nendobj\n`;
+    }
+    const xrefOff = Buffer.byteLength(raw);
+    raw += `xref\n0 ${objs.length + 1}\n0000000000 65535 f \n`;
+    for (const off of offs) raw += `${String(off).padStart(10, "0")} 00000 n \n`;
+    raw += `trailer\n<< /Size ${objs.length + 1} /Root 1 0 R >>\nstartxref\n${xrefOff}\n%%EOF\n`;
+    const formPreservesPage = bindings.Pdf.open(Buffer.from(raw));
+    try {
+      const text = formPreservesPage.page_text(0);
+      assert.match(text, /FormLabel/);
+      assert.match(text, /PageText/);
+    } finally { formPreservesPage.free(); }
+  }
+
+  // Enclosing page /MCID 0 /ActualText wrapping an untagged Form covers an
+  // unmapped fallback glyph inside the Form.
+  {
+    const pageStream = "0 0 0 rg /Span << /MCID 0 >> BDC /Fm Do EMC";
+    const formStream = "0 0 0 rg BT /F1 24 Tf 15 40 Td <0001> Tj ET";
+    const objs = [
+      "<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 9 0 R /MarkInfo << /Marked true >> >>",
+      "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+      "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 180 100] /Resources << /XObject << /Fm 11 0 R >> >> /Contents 4 0 R >>",
+      `<< /Length ${pageStream.length} >>\nstream\n${pageStream}\nendstream`,
+      "<< /Type /Font /Subtype /Type0 /BaseFont /ABCDEF+TaggedCID /Encoding /Identity-H /DescendantFonts [6 0 R] >>",
+      "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /ABCDEF+TaggedCID /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor 7 0 R /DW 1000 >>",
+      "<< /Type /FontDescriptor /FontName /ABCDEF+TaggedCID /Flags 32 /FontFile2 8 0 R >>",
+      `<< /Length ${corruptFont.length} >>\nstream\n${corruptFont}\nendstream`,
+      "<< /Type /StructTreeRoot /K [10 0 R] >>",
+      "<< /Type /StructElem /S /Span /Pg 3 0 R /ActualText (Label) /K 0 >>",
+      `<< /Type /XObject /Subtype /Form /BBox [0 0 180 100] /Resources << /Font << /F1 5 0 R >> >> /Length ${formStream.length} >>\nstream\n${formStream}\nendstream`,
+    ];
+    let raw = "%PDF-1.7\n";
+    const offs = [];
+    for (const [i, body] of objs.entries()) {
+      offs.push(Buffer.byteLength(raw));
+      raw += `${i + 1} 0 obj\n${body}\nendobj\n`;
+    }
+    const xrefOff = Buffer.byteLength(raw);
+    raw += `xref\n0 ${objs.length + 1}\n0000000000 65535 f \n`;
+    for (const off of offs) raw += `${String(off).padStart(10, "0")} 00000 n \n`;
+    raw += `trailer\n<< /Size ${objs.length + 1} /Root 1 0 R >>\nstartxref\n${xrefOff}\n%%EOF\n`;
+    const enclosingForm = bindings.Pdf.open(Buffer.from(raw));
+    try {
+      assert.equal(enclosingForm.page_text(0).trim(), "Label");
+    } finally { enclosingForm.free(); }
+  }
 });
 
 test("packaged editor saves Unicode, page edits, extraction and optimization", () => {

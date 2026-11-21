@@ -431,20 +431,35 @@ pub fn is_tagged(file: &PdfFile) -> bool {
 #[doc(hidden)]
 pub type ActualTextMcidMap = HashMap<usize, HashSet<(Option<ObjectId>, i64)>>;
 
+/// Stream-scoping sidecar collected alongside [`StructTree`] in a single walk.
+///
+/// `actual_text_mcids` tracks `(owning_stream, mcid)` pairs covered by an
+/// ancestor structure element's `/ActualText`. `kid_streams` records the
+/// optional owning stream (`Some(None)` = page content stream, `Some(Some(id))`
+/// = Form XObject `/Stm`, `None` = invalid `/Stm`) for each
+/// [`StructKid::MarkedContent`] in pre-order traversal of [`StructTree`].
+#[doc(hidden)]
+#[derive(Debug, Clone, Default)]
+pub struct StructTreeStreams {
+    pub actual_text_mcids: ActualTextMcidMap,
+    pub kid_streams: Vec<Option<Option<ObjectId>>>,
+}
+
 /// Parse the document's logical structure tree from the catalog's
 /// `/StructTreeRoot`. Returns `None` when the document declares no structure
 /// tree (i.e. is not tagged in the structural sense).
 pub fn parse_struct_tree(file: &PdfFile, catalog: &Catalog) -> Option<StructTree> {
-    Some(parse_struct_tree_with_actual_text(file, catalog)?.0)
+    Some(parse_struct_tree_with_streams(file, catalog)?.0)
 }
 
-/// Like [`parse_struct_tree`], also returning the stream-scoped `/ActualText`
-/// marked-content coverage per page in a single pass.
+/// Like [`parse_struct_tree`], also returning stream-scoping metadata for
+/// `/MCR /Stm` marked-content references and `/ActualText` coverage in a single
+/// pass.
 #[doc(hidden)]
-pub fn parse_struct_tree_with_actual_text(
+pub fn parse_struct_tree_with_streams(
     file: &PdfFile,
     catalog: &Catalog,
-) -> Option<(StructTree, ActualTextMcidMap)> {
+) -> Option<(StructTree, StructTreeStreams)> {
     let root = catalog_dict(file)?;
     let tree_root = resolve_dict(file, root.get("StructTreeRoot"))?;
 
@@ -465,6 +480,7 @@ pub fn parse_struct_tree_with_actual_text(
         text_budget: MAX_TREE_TEXT_BYTES,
         text_cache: HashMap::new(),
         actual_text_mcids: HashMap::new(),
+        kid_streams: Vec::new(),
     };
 
     // The root's /K holds the top-level structure element(s). Its own /Pg (rare)
@@ -483,7 +499,10 @@ pub fn parse_struct_tree_with_actual_text(
             children,
             marked: is_tagged(file),
         },
-        walk.actual_text_mcids,
+        StructTreeStreams {
+            actual_text_mcids: walk.actual_text_mcids,
+            kid_streams: walk.kid_streams,
+        },
     ))
 }
 
@@ -506,6 +525,8 @@ struct StructWalk<'a> {
     /// Stream-scoped `(owning_stream, mcid)` coverage for `/ActualText`
     /// elements, keyed by 0-based page index.
     actual_text_mcids: ActualTextMcidMap,
+    /// Owning stream per retained [`StructKid::MarkedContent`] in pre-order.
+    kid_streams: Vec<Option<Option<ObjectId>>>,
 }
 
 impl StructWalk<'_> {
@@ -531,12 +552,15 @@ impl StructWalk<'_> {
             // A bare integer kid is an MCID into the parent's effective page
             // content stream (`owning_stream == None`).
             PdfObject::Integer(mcid) => {
-                if let (Some(at_page), Some(page)) = (actual_text_page, parent_page) {
-                    if at_page.is_none_or(|ap| ap == page) {
-                        self.actual_text_mcids
-                            .entry(page)
-                            .or_default()
-                            .insert((None, *mcid));
+                if depth > 0 {
+                    self.kid_streams.push(Some(None));
+                    if let (Some(at_page), Some(page)) = (actual_text_page, parent_page) {
+                        if at_page.is_none_or(|ap| ap == page) {
+                            self.actual_text_mcids
+                                .entry(page)
+                                .or_default()
+                                .insert((None, *mcid));
+                        }
                     }
                 }
                 Some(StructKid::MarkedContent {
@@ -551,7 +575,7 @@ impl StructWalk<'_> {
                 let resolved = self.file.resolve(*id).ok()?;
                 let dict = resolved.as_dict().ok()?;
                 match kid_dict_kind(dict) {
-                    KidKind::Mcr => self.marked_content(dict, parent_page, actual_text_page),
+                    KidKind::Mcr => self.marked_content(dict, parent_page, depth, actual_text_page),
                     KidKind::Objr => self.object_ref(dict, parent_page),
                     KidKind::Element => {
                         // Cycle / shared-subtree guard on element identity.
@@ -566,7 +590,7 @@ impl StructWalk<'_> {
 
             // An inline dict kid: an MCR, an OBJR, or a nested element.
             PdfObject::Dict(dict) => match kid_dict_kind(dict) {
-                KidKind::Mcr => self.marked_content(dict, parent_page, actual_text_page),
+                KidKind::Mcr => self.marked_content(dict, parent_page, depth, actual_text_page),
                 KidKind::Objr => self.object_ref(dict, parent_page),
                 KidKind::Element => self
                     .element(dict, parent_page, depth, actual_text_page)
@@ -660,6 +684,7 @@ impl StructWalk<'_> {
         &mut self,
         dict: &PdfDict,
         parent_page: Option<usize>,
+        depth: usize,
         actual_text_page: Option<Option<usize>>,
     ) -> Option<StructKid> {
         let mcid = int_value(dict.get("MCID"))?;
@@ -669,12 +694,15 @@ impl StructWalk<'_> {
             Some(PdfObject::Ref(id)) => Some(Some(*id)),
             Some(_) => None,
         };
-        if let (Some(at_page), Some(p), Some(stm)) = (actual_text_page, page, stream_key) {
-            if at_page.is_none_or(|ap| ap == p) {
-                self.actual_text_mcids
-                    .entry(p)
-                    .or_default()
-                    .insert((stm, mcid));
+        if depth > 0 {
+            self.kid_streams.push(stream_key);
+            if let (Some(at_page), Some(p), Some(stm)) = (actual_text_page, page, stream_key) {
+                if at_page.is_none_or(|ap| ap == p) {
+                    self.actual_text_mcids
+                        .entry(p)
+                        .or_default()
+                        .insert((stm, mcid));
+                }
             }
         }
         Some(StructKid::MarkedContent { page, mcid })

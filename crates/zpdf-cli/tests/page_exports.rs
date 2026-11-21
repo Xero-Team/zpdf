@@ -453,6 +453,13 @@ fn corrupt_embedded_font_exports_succeed_when_recovered_and_fail_when_unrecovere
         !geom_text_res.status.success(),
         "unstructured text should still reject unmapped fallback CID"
     );
+    let geom_stderr = String::from_utf8_lossy(&geom_text_res.stderr);
+    assert!(
+        geom_stderr.contains("incomplete output")
+            && geom_stderr.contains("decode_failures=1")
+            && geom_stderr.contains("embedded_font_fallbacks=1"),
+        "expected incomplete-output decode failure on stderr, got: {geom_stderr}"
+    );
     fs::remove_file(&tagged_input).unwrap();
 
     let tagged_uncovered_pdf = assemble_raw(&[
@@ -490,6 +497,106 @@ fn corrupt_embedded_font_exports_succeed_when_recovered_and_fail_when_unrecovere
         !uncovered_res.status.success(),
         "text --struct must still reject uncovered unmapped fallback text"
     );
+    let uncovered_stderr = String::from_utf8_lossy(&uncovered_res.stderr);
+    assert!(
+        uncovered_stderr.contains("incomplete output")
+            && uncovered_stderr.contains("decode_failures=1")
+            && uncovered_stderr.contains("embedded_font_fallbacks=1"),
+        "expected incomplete-output decode failure on stderr, got: {uncovered_stderr}"
+    );
     fs::remove_file(&uncovered_input).unwrap();
+
+    // 5. Form `/MCR /Stm` MCID 0 replacement preserves an unrelated readable
+    //    page span that also uses MCID 0.
+    let form_stm_page_mcid0_pdf = assemble_raw(&[
+        b"<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 9 0 R /MarkInfo << /Marked true >> >>"
+            .to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 180 100] \
+          /Resources << /Font << /F0 12 0 R /F1 5 0 R >> /XObject << /Fm 11 0 R >> >> /Contents 4 0 R >>"
+            .to_vec(),
+        raw_stream(
+            "",
+            b"0 0 0 rg /Span << /MCID 0 >> BDC BT /F0 12 Tf 15 80 Td (PageText) Tj ET EMC /Fm Do",
+        ),
+        b"<< /Type /Font /Subtype /Type0 /BaseFont /ABCDEF+TaggedStructCID /Encoding /Identity-H /DescendantFonts [6 0 R] >>".to_vec(),
+        b"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /ABCDEF+TaggedStructCID \
+          /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> \
+          /FontDescriptor 7 0 R /DW 1000 >>"
+            .to_vec(),
+        b"<< /Type /FontDescriptor /FontName /ABCDEF+TaggedStructCID /Flags 32 /FontFile2 8 0 R >>"
+            .to_vec(),
+        raw_stream("", b"corrupt tagged struct cid font"),
+        b"<< /Type /StructTreeRoot /K [10 0 R] >>".to_vec(),
+        b"<< /Type /StructElem /S /Span /Pg 3 0 R /ActualText (FormLabel) /K << /Type /MCR /Pg 3 0 R /Stm 11 0 R /MCID 0 >> >>".to_vec(),
+        raw_stream(
+            "/Type /XObject /Subtype /Form /BBox [0 0 180 100] /Resources << /Font << /F1 5 0 R >> >>",
+            b"0 0 0 rg /Span << /MCID 0 >> BDC BT /F1 24 Tf 60 40 Td <0002> Tj ET EMC",
+        ),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
+            .to_vec(),
+    ]);
+    let form_stm_input = dir.join("form_stm_page_mcid0.pdf");
+    fs::write(&form_stm_input, form_stm_page_mcid0_pdf).unwrap();
+    let form_stm_res = Command::new(env!("CARGO_BIN_EXE_zpdf"))
+        .arg("text")
+        .arg(&form_stm_input)
+        .arg("--struct")
+        .output()
+        .unwrap();
+    assert!(
+        form_stm_res.status.success(),
+        "text --struct should succeed for Form /Stm replacement + page MCID 0: {}",
+        String::from_utf8_lossy(&form_stm_res.stderr)
+    );
+    let form_stm_stdout = String::from_utf8_lossy(&form_stm_res.stdout);
+    assert!(
+        form_stm_stdout.contains("FormLabel") && form_stm_stdout.contains("PageText"),
+        "expected both FormLabel and PageText, got {form_stm_stdout:?}"
+    );
+    fs::remove_file(&form_stm_input).unwrap();
+
+    // 6. Enclosing page `/MCID 0` `/ActualText (Label)` wrapping an untagged
+    //    Form invocation covers unmapped fallback glyphs inside that Form.
+    let enclosing_form_pdf = assemble_raw(&[
+        b"<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 9 0 R /MarkInfo << /Marked true >> >>"
+            .to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 180 100] /Resources << /XObject << /Fm 11 0 R >> >> /Contents 4 0 R >>".to_vec(),
+        raw_stream("", b"0 0 0 rg /Span << /MCID 0 >> BDC /Fm Do EMC"),
+        b"<< /Type /Font /Subtype /Type0 /BaseFont /ABCDEF+TaggedStructCID /Encoding /Identity-H /DescendantFonts [6 0 R] >>".to_vec(),
+        b"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /ABCDEF+TaggedStructCID \
+          /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> \
+          /FontDescriptor 7 0 R /DW 1000 >>"
+            .to_vec(),
+        b"<< /Type /FontDescriptor /FontName /ABCDEF+TaggedStructCID /Flags 32 /FontFile2 8 0 R >>"
+            .to_vec(),
+        raw_stream("", b"corrupt tagged struct cid font"),
+        b"<< /Type /StructTreeRoot /K [10 0 R] >>".to_vec(),
+        b"<< /Type /StructElem /S /Span /Pg 3 0 R /ActualText (Label) /K 0 >>".to_vec(),
+        raw_stream(
+            "/Type /XObject /Subtype /Form /BBox [0 0 180 100] /Resources << /Font << /F1 5 0 R >> >>",
+            b"0 0 0 rg BT /F1 24 Tf 15 40 Td <0001> Tj ET",
+        ),
+    ]);
+    let enclosing_input = dir.join("enclosing_form_actual_text.pdf");
+    fs::write(&enclosing_input, enclosing_form_pdf).unwrap();
+    let enclosing_res = Command::new(env!("CARGO_BIN_EXE_zpdf"))
+        .arg("text")
+        .arg(&enclosing_input)
+        .arg("--struct")
+        .output()
+        .unwrap();
+    assert!(
+        enclosing_res.status.success(),
+        "text --struct should succeed when enclosing /MCID 0 /ActualText wraps untagged Form: {}",
+        String::from_utf8_lossy(&enclosing_res.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&enclosing_res.stdout).trim(),
+        "Label"
+    );
+    fs::remove_file(&enclosing_input).unwrap();
+
     fs::remove_dir(dir).unwrap();
 }
