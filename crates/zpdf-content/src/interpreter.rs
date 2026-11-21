@@ -3191,16 +3191,27 @@ impl<'a> ContentInterpreter<'a> {
         let r_right = (rect.x1 as f32 - rect_x0) * scale;
         let r_top = (rect_y1 - rect.y1 as f32) * scale;
         let r_bottom = (rect_y1 - rect.y0 as f32) * scale;
+        // tiny-skia 0.12's AA scan converter (`scan::path_aa::fill_path` ->
+        // `scan::path::fill_path_impl`) shifts unclamped `IntRect` `top`/`bottom`
+        // left by `SUPERSAMPLE_SHIFT = 2` in signed `i32` before clamping to
+        // the tile, so coordinates outside `[-(1 << 29), (1 << 29) - 1]` wrap
+        // and leave the mask empty. `DrawTiler` also translates by up to
+        // `-(dim - 1)` per tile (with `f32` round-trip drift above `2^24`).
+        // Capping every edge at half the supersampled `i32` range (`±2^28`)
+        // leaves >15x headroom over `MAX_EXACT_F32_PX` (`2^24`) for tile
+        // offsets and guarantees `IntRect::round_out` and `<< 2` never overflow.
+        const MAX_TINY_SKIA_AA_COORD: f32 = (1u32 << 28) as f32;
+        let max_coord = limit.min(MAX_TINY_SKIA_AA_COORD);
         if !(r_left.is_finite()
             && r_right.is_finite()
             && r_top.is_finite()
             && r_bottom.is_finite()
             && r_left < r_right
             && r_top < r_bottom
-            && r_left.abs() <= limit
-            && r_right.abs() <= limit
-            && r_top.abs() <= limit
-            && r_bottom.abs() <= limit)
+            && r_left.abs() <= max_coord
+            && r_right.abs() <= max_coord
+            && r_top.abs() <= max_coord
+            && r_bottom.abs() <= max_coord)
         {
             return false;
         }
@@ -10217,5 +10228,31 @@ mod tests {
             .with_clip_elision_scale(1.0)
             .interpret(b"q 10 10 80 10 re W n 0 0 100 30 re W n 0 0 100 100 re f Q");
         assert_eq!(clip_counts_and_balance(&dl_bounded), (1, 1, 0));
+    }
+
+    #[test]
+    fn clip_exceeding_tiny_skia_supersampled_scanline_range_is_kept() {
+        // On an 8,388,608 × 1 raster at scale 1, CpuRenderer's coordinate limit
+        // is 536,870,912 (1 << 29), but tiny-skia's AA scan converter shifts
+        // unclamped `IntRect` top/bottom left by 2 bits in `i32` before
+        // clamping. A clip with device bounds `[0, 0, 2, 536_870_912]` wraps
+        // negative in tiny-skia and yields an empty mask, so it must be kept.
+        let wide_page = Rect::new(0.0, 0.0, 8_388_608.0, 1.0);
+        let dl_overflow = ContentInterpreter::new(wide_page)
+            .with_clip_elision_scale(1.0)
+            .interpret(b"q 0 0 2 1 re W n 0 -536870912 2 536870913 re W n 0 0 2 1 re f Q");
+        assert_eq!(clip_counts_and_balance(&dl_overflow), (2, 2, 0));
+
+        // Negative top exceeding the safe supersampled range is also kept.
+        let dl_neg_overflow = ContentInterpreter::new(wide_page)
+            .with_clip_elision_scale(1.0)
+            .interpret(b"q 0 0 2 1 re W n 0 0 2 536870913 re W n 0 0 2 1 re f Q");
+        assert_eq!(clip_counts_and_balance(&dl_neg_overflow), (2, 2, 0));
+
+        // Contrast: a covering rectangle within the safe ±2^28 AA range elides.
+        let dl_safe = ContentInterpreter::new(wide_page)
+            .with_clip_elision_scale(1.0)
+            .interpret(b"q 0 0 2 1 re W n 0 -268435000 2 268435001 re W n 0 0 2 1 re f Q");
+        assert_eq!(clip_counts_and_balance(&dl_safe), (1, 1, 0));
     }
 }

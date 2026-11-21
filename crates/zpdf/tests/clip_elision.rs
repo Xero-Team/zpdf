@@ -12,6 +12,8 @@
 //!    grid.
 //! 5. Eliding never removes the only active clip mask, preserving `tiny-skia`'s
 //!    masked `SourceOver` paint rounding on opaque antialiased draws.
+//! 6. Clips whose device bounds exceed `tiny-skia`'s supersampled `i32` AA
+//!    scanline range are kept so scan-converter wraparound cannot diverge.
 #![cfg(feature = "cpu-render")]
 
 use zpdf::display_list::RenderCommand;
@@ -336,4 +338,54 @@ fn cpu_preserves_masked_paint_rounding_when_only_clip_is_page_sized() {
     );
     assert_eq!(nested_elided.data, nested_retained.data);
     assert_eq!(px(&nested_elided, 10, 20), [128, 128, 128]);
+}
+
+#[test]
+fn cpu_keeps_clip_exceeding_tiny_skia_supersampled_scanline_range() {
+    // On an 8,388,608 × 1 raster at scale 1, CpuRenderer::finish_within_limits
+    // allows coordinates up to 536,870,912 (1 << 29). A clip with device bounds
+    // [0, 0, 2, 536_870_912] overflows tiny-skia 0.12's `stop_y <<= 2` in i32
+    // before tile clamping, leaving the clip mask empty. Eliding it would make
+    // the red fill paint pixels (0, 0) and (1, 0) instead of keeping them white.
+    let overflow_pdf = page_pdf(
+        "0 0 8388608 1",
+        b"q 0 0 2 1 re W n 0 -536870912 2 536870913 re W n 1 0 0 rg 0 0 2 1 re f Q",
+    );
+    let (elided_clips, elided, _) = render_case(&overflow_pdf, 1.0, true);
+    let (retained_clips, retained, _) = render_case(&overflow_pdf, 1.0, false);
+
+    assert_eq!(retained_clips, 2);
+    assert_eq!(
+        elided_clips, 2,
+        "clip overflowing tiny-skia supersampled scanline range must be kept"
+    );
+    assert_eq!((elided.width, elided.height), (8_388_608, 1));
+    assert!(
+        elided.data == retained.data,
+        "elided render must match retained clip byte-for-byte"
+    );
+    // tiny-skia's wrapped scanline bound leaves the mask empty -> pixels stay white.
+    assert_eq!(px(&elided, 0, 0), [255, 255, 255]);
+    assert_eq!(px(&elided, 1, 0), [255, 255, 255]);
+
+    // Contrast: within tiny-skia's safe ±2^28 AA range on the same wide raster,
+    // the covering clip IS elided and both pixels match the retained red fill.
+    let safe_pdf = page_pdf(
+        "0 0 8388608 1",
+        b"q 0 0 2 1 re W n 0 -268435000 2 268435001 re W n 1 0 0 rg 0 0 2 1 re f Q",
+    );
+    let (safe_elided_clips, safe_elided, _) = render_case(&safe_pdf, 1.0, true);
+    let (safe_retained_clips, safe_retained, _) = render_case(&safe_pdf, 1.0, false);
+
+    assert_eq!(safe_retained_clips, 2);
+    assert_eq!(
+        safe_elided_clips, 1,
+        "covering clip inside safe supersampled AA range should elide"
+    );
+    assert!(
+        safe_elided.data == safe_retained.data,
+        "elided safe-range render must match retained clip byte-for-byte"
+    );
+    assert_eq!(px(&safe_elided, 0, 0), [255, 0, 0]);
+    assert_eq!(px(&safe_elided, 1, 0), [255, 0, 0]);
 }
