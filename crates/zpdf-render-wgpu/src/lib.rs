@@ -1426,16 +1426,9 @@ fn apply_soft_mask(
     //    group may itself contain nested transparency groups, so it goes through
     //    the layered compositor rather than a single replay pass.
     let mask_base = pool.acquire(device)?;
+    let backdrop = quantize_clear_color(&Color::gray(unit(mask.backdrop_luma)));
     let clear = match mask.kind {
-        SoftMaskKind::Luminosity => {
-            let l = unit(mask.backdrop_luma) as f64;
-            wgpu::Color {
-                r: l,
-                g: l,
-                b: l,
-                a: 1.0,
-            }
-        }
+        SoftMaskKind::Luminosity => backdrop,
         SoftMaskKind::Alpha => wgpu::Color::TRANSPARENT,
     };
     {
@@ -1467,7 +1460,7 @@ fn apply_soft_mask(
             dx: mask.dx,
             dy: mask.dy,
             _pad0: 0,
-            backdrop_luma: unit(mask.backdrop_luma),
+            backdrop_luma: backdrop.r as f32,
             _pad1: [0.0; 3],
             lut: pack_transfer_lut(mask.transfer.as_ref()),
         }),
@@ -1666,6 +1659,10 @@ mod resource_tests {
         assert_eq!(
             quantize_clear_color(&Color::gray(0.5)),
             expect(128, 128, 128, 255)
+        );
+        assert_eq!(
+            quantize_clear_color(&Color::gray(0.7)),
+            expect(179, 179, 179, 255)
         );
         assert_eq!(
             quantize_clear_color(&Color::rgba(0.1, 0.0, 0.0, 254.0 / 255.0)),
