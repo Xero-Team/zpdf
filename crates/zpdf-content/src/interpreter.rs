@@ -354,22 +354,42 @@ impl ActualText {
     }
 }
 
+/// Per-GID cached classification for an embedded font program. Exhausted
+/// reverse-`cmap` probes are intentionally left uncached (`None`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CachedGlyphHealth {
+    /// Confirmed readable (drawn outline, zero-length `loca` blank handled by
+    /// CAD repair, or confirmed non-visible blank).
+    Readable,
+    /// Physically unreadable outline record (missing, malformed header, failed
+    /// or empty visible Type 1 charstring, out-of-range GID, or cmap-proven
+    /// visible blank).
+    Unreadable,
+    /// Physically blank record whose readability depends on the shown PDF code
+    /// (Type 1 blank with `/ToUnicode` or TrueType valid-header nonempty
+    /// zero-contour record). Re-evaluated per shown code without caching as
+    /// readable by GID alone.
+    CodeDependentBlank,
+}
+
 /// Per-page cache of whether each shown glyph ID in an embedded font maps to a
 /// corrupt/unreadable outline record. Inline 256-bit bitsets keep simple fonts
 /// and small subsets allocation-free, and `cmap_budget` bounds blank-record
 /// `cmap` validation across the whole page for this font.
 struct EmbeddedGlyphHealth {
-    checked_low: [u64; 4],
+    known_low: [u64; 4],
     unreadable_low: [u64; 4],
-    high: HashMap<u16, bool>,
+    code_dep_low: [u64; 4],
+    high: HashMap<u16, CachedGlyphHealth>,
     cmap_budget: usize,
 }
 
 impl Default for EmbeddedGlyphHealth {
     fn default() -> Self {
         Self {
-            checked_low: [0; 4],
+            known_low: [0; 4],
             unreadable_low: [0; 4],
+            code_dep_low: [0; 4],
             high: HashMap::new(),
             cmap_budget: zpdf_font::CMAP_PROBE_BUDGET,
         }
@@ -377,26 +397,46 @@ impl Default for EmbeddedGlyphHealth {
 }
 
 impl EmbeddedGlyphHealth {
-    fn get(&self, gid: u16) -> Option<bool> {
+    fn get(&self, gid: u16) -> Option<CachedGlyphHealth> {
         if gid < 256 {
             let word = (gid >> 6) as usize;
             let bit = 1u64 << (gid & 63);
-            ((self.checked_low[word] & bit) != 0).then_some((self.unreadable_low[word] & bit) != 0)
+            if (self.known_low[word] & bit) == 0 {
+                return None;
+            }
+            if (self.code_dep_low[word] & bit) != 0 {
+                Some(CachedGlyphHealth::CodeDependentBlank)
+            } else if (self.unreadable_low[word] & bit) != 0 {
+                Some(CachedGlyphHealth::Unreadable)
+            } else {
+                Some(CachedGlyphHealth::Readable)
+            }
         } else {
             self.high.get(&gid).copied()
         }
     }
 
-    fn set(&mut self, gid: u16, unreadable: bool) {
+    fn set(&mut self, gid: u16, health: CachedGlyphHealth) {
         if gid < 256 {
             let word = (gid >> 6) as usize;
             let bit = 1u64 << (gid & 63);
-            self.checked_low[word] |= bit;
-            if unreadable {
-                self.unreadable_low[word] |= bit;
+            self.known_low[word] |= bit;
+            match health {
+                CachedGlyphHealth::Readable => {
+                    self.unreadable_low[word] &= !bit;
+                    self.code_dep_low[word] &= !bit;
+                }
+                CachedGlyphHealth::Unreadable => {
+                    self.unreadable_low[word] |= bit;
+                    self.code_dep_low[word] &= !bit;
+                }
+                CachedGlyphHealth::CodeDependentBlank => {
+                    self.unreadable_low[word] &= !bit;
+                    self.code_dep_low[word] |= bit;
+                }
             }
         } else if self.high.len() < 4096 || self.high.contains_key(&gid) {
-            self.high.insert(gid, unreadable);
+            self.high.insert(gid, health);
         }
     }
 }
@@ -6168,7 +6208,8 @@ impl<'a> ContentInterpreter<'a> {
         let contributes_text = self.text_sink.is_some() && !self.oc_suppressed();
         let unreadable_embedded = (paints_or_clips || contributes_text)
             && !glyphs.is_empty()
-            && show_font_id.is_some_and(|fid| self.scan_unreadable_embedded_glyphs(fid, &glyphs));
+            && show_font_id
+                .is_some_and(|fid| self.scan_unreadable_embedded_glyphs(fid, bytes, &glyphs));
         let ordinary = self.current.render_mode == 0
             && !self.oc_suppressed()
             && self.current.fill_pattern.is_none()
@@ -6303,6 +6344,7 @@ impl<'a> ContentInterpreter<'a> {
     fn scan_unreadable_embedded_glyphs(
         &mut self,
         font_id: FontId,
+        bytes: &[u8],
         glyphs: &[PositionedGlyph],
     ) -> bool {
         let Some(font) = self.font_cache.as_deref().and_then(|fc| fc.get(font_id)) else {
@@ -6325,46 +6367,87 @@ impl<'a> ContentInterpreter<'a> {
             }
             None => None,
         };
-        let Some(index) = slot else {
-            let mut ids: Vec<u16> = glyphs
-                .iter()
-                .map(|g| g.glyph_id)
-                .filter(|&gid| gid != 0)
-                .collect();
-            ids.sort_unstable();
-            ids.dedup();
-            let mut unreadable = false;
-            let mut cmap_budget = zpdf_font::CMAP_PROBE_BUDGET;
-            font.classify_embedded_glyphs_unreadable(&ids, &mut cmap_budget, |_, u| {
-                unreadable |= u
-            });
-            return unreadable;
-        };
+        let composite = matches!(font.font_type, zpdf_font::PdfFontType::Type0CidType2);
+        let cmap = font.cid_cmap.as_ref();
 
-        let mut any_unreadable = false;
-        let mut uncached: Vec<u16> = Vec::new();
-        {
+        // Fast path: when every nonzero glyph in this run is already cached as
+        // `Readable`, skip code segmentation altogether.
+        if let Some(index) = slot {
             let health = &self.embedded_glyph_health[index].1;
-            for g in glyphs {
-                if g.glyph_id == 0 {
-                    continue;
-                }
-                match health.get(g.glyph_id) {
-                    Some(u) => any_unreadable |= u,
-                    None => uncached.push(g.glyph_id),
-                }
+            if glyphs.iter().all(|g| {
+                g.glyph_id == 0 || health.get(g.glyph_id) == Some(CachedGlyphHealth::Readable)
+            }) {
+                return false;
             }
         }
-        if !uncached.is_empty() {
-            uncached.sort_unstable();
-            uncached.dedup();
-            let health = &mut self.embedded_glyph_health[index].1;
-            let mut cmap_budget = health.cmap_budget;
-            font.classify_embedded_glyphs_unreadable(&uncached, &mut cmap_budget, |gid, u| {
-                health.set(gid, u);
-                any_unreadable |= u;
-            });
-            health.cmap_budget = cmap_budget;
+
+        let mut any_unreadable = false;
+        let mut to_probe: Vec<(u16, u32, u32, u8)> = Vec::new();
+        let mut offset = 0usize;
+        for g in glyphs {
+            let (code, length, raw, end) =
+                next_text_code(cmap, composite, bytes, offset).unwrap_or((0, 0, 0, bytes.len()));
+            offset = end;
+            if g.glyph_id == 0 {
+                continue;
+            }
+            match slot.and_then(|index| self.embedded_glyph_health[index].1.get(g.glyph_id)) {
+                Some(CachedGlyphHealth::Readable) => {}
+                Some(CachedGlyphHealth::Unreadable) => any_unreadable = true,
+                Some(CachedGlyphHealth::CodeDependentBlank) => {
+                    if let Some(u) =
+                        font.code_dependent_blank_is_unreadable(code, raw, length as u8)
+                    {
+                        any_unreadable |= u;
+                    } else {
+                        to_probe.push((g.glyph_id, code, raw, length as u8));
+                    }
+                }
+                None => to_probe.push((g.glyph_id, code, raw, length as u8)),
+            }
+        }
+        if !to_probe.is_empty() {
+            to_probe.sort_unstable();
+            to_probe.dedup();
+            if let Some(index) = slot {
+                let health = &mut self.embedded_glyph_health[index].1;
+                let mut cmap_budget = health.cmap_budget;
+                font.classify_embedded_glyphs_with_codes(
+                    &to_probe,
+                    &mut cmap_budget,
+                    |gid, out| {
+                        match out {
+                            zpdf_font::EmbeddedGlyphHealthOutcome::Readable => {
+                                health.set(gid, CachedGlyphHealth::Readable);
+                            }
+                            zpdf_font::EmbeddedGlyphHealthOutcome::Unreadable => {
+                                health.set(gid, CachedGlyphHealth::Unreadable);
+                                any_unreadable = true;
+                            }
+                            zpdf_font::EmbeddedGlyphHealthOutcome::CodeDependent { unreadable } => {
+                                health.set(gid, CachedGlyphHealth::CodeDependentBlank);
+                                any_unreadable |= unreadable;
+                            }
+                            // Exhausted probes remain uncached so they never mark
+                            // later visible glyphs as confirmed readable.
+                            zpdf_font::EmbeddedGlyphHealthOutcome::Exhausted => {}
+                        }
+                    },
+                );
+                health.cmap_budget = cmap_budget;
+            } else {
+                let mut cmap_budget = zpdf_font::CMAP_PROBE_BUDGET;
+                font.classify_embedded_glyphs_with_codes(&to_probe, &mut cmap_budget, |_, out| {
+                    match out {
+                        zpdf_font::EmbeddedGlyphHealthOutcome::Unreadable => any_unreadable = true,
+                        zpdf_font::EmbeddedGlyphHealthOutcome::CodeDependent { unreadable } => {
+                            any_unreadable |= unreadable;
+                        }
+                        zpdf_font::EmbeddedGlyphHealthOutcome::Readable
+                        | zpdf_font::EmbeddedGlyphHealthOutcome::Exhausted => {}
+                    }
+                });
+            }
         }
         any_unreadable
     }
@@ -6823,15 +6906,28 @@ impl<'a> ContentInterpreter<'a> {
                         Some(sibling) => sibling,
                         None => {
                             let embedded = if has_companion {
-                                let (original_unreadable, cmap_budget) = if !unreadable_embedded
-                                    || original.glyph_id == 0
-                                {
-                                    (Some(false), None)
-                                } else if let Some(health) = glyph_health.as_deref_mut() {
-                                    (health.get(original.glyph_id), Some(&mut health.cmap_budget))
-                                } else {
-                                    (None, Some(&mut fallback_cmap_budget))
-                                };
+                                let (original_unreadable, cmap_budget) =
+                                    if !unreadable_embedded || original.glyph_id == 0 {
+                                        (Some(false), None)
+                                    } else if let Some(health) = glyph_health.as_deref_mut() {
+                                        let known = match health.get(original.glyph_id) {
+                                            Some(CachedGlyphHealth::Readable) => Some(false),
+                                            Some(CachedGlyphHealth::Unreadable) => Some(true),
+                                            Some(CachedGlyphHealth::CodeDependentBlank) => {
+                                                cache.get(font_id).and_then(|f| {
+                                                    f.code_dependent_blank_is_unreadable(
+                                                        code,
+                                                        raw,
+                                                        length as u8,
+                                                    )
+                                                })
+                                            }
+                                            None => None,
+                                        };
+                                        (known, Some(&mut health.cmap_budget))
+                                    } else {
+                                        (None, Some(&mut fallback_cmap_budget))
+                                    };
                                 cache.resolve_embedded_companion_glyph_in_run(
                                     original,
                                     code,

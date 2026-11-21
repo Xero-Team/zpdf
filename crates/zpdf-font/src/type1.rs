@@ -236,6 +236,19 @@ impl Type1Font {
         }
     }
 
+    /// Whether `gid` maps to a present non-`.notdef` charstring whose outline
+    /// is physically blank (no drawing commands and not a known visible glyph
+    /// name), such as `/space` or a custom subset glyph name `/g3`.
+    pub(crate) fn is_blank_gid(&self, gid: u16) -> bool {
+        let Some(name) = self.gid_to_name.get(gid as usize) else {
+            return false;
+        };
+        if name.is_empty() || name == ".notdef" || !self.char_strings.contains_key(name) {
+            return false;
+        }
+        self.glyph_state_by_gid(gid) == crate::resolution::GlyphState::Blank
+    }
+
     /// Whether `gid` maps to an embedded charstring whose execution fails or
     /// emits no path for a known visible character name (as opposed to an
     /// unmapped `.notdef`, a space / no-ink character, or an unknown name).

@@ -3768,14 +3768,15 @@ fn cjk_partially_corrupt_subset_with_duplicate_bad_cids_keeps_embedded_primary()
     );
     let gid_a = probe.unicode_glyph('A' as u32).unwrap().0;
     let gid_b = probe.unicode_glyph('B' as u32).unwrap().0;
-    let gid_c = probe.unicode_glyph('C' as u32).unwrap().0;
-    // Corrupt gid_c (sampled -> probe_embedded_outlines() == PartiallyCorrupt)
-    // and gid_a (unsampled), while keeping almost all glyphs readable.
-    let partial_ttf = corrupt_selected_gids(PRIMARY_TTF, &[gid_a, gid_c]);
+    // Corrupt only `gid_a`. Because the explicit `/CIDToGIDMap` maps only two
+    // distinct nonzero GIDs (`gid_b` drawable and `gid_a` unreadable), the
+    // load-time probe inspects those two GIDs and classifies the font as
+    // `PartiallyCorrupt` (1 of 2), even though 3 of the 5 CIDs point to `gid_a`
+    // (`embedded_outline_failure_rate() == 3/5 == 0.6 > 0.5`).
+    let partial_ttf = corrupt_selected_gids(PRIMARY_TTF, &[gid_a]);
 
-    // Map 5 nonzero CIDs: 2 point to healthy gid_b, and 3 duplicates point to
-    // corrupt gid_a -> embedded_outline_failure_rate() == 3/5 == 0.6 > 0.5,
-    // yet probe_embedded_outlines() is PartiallyCorrupt (not Unusable).
+    // Map 5 nonzero CIDs: 2 point to healthy `gid_b`, and 3 duplicates point to
+    // corrupt `gid_a`.
     let mut cid_to_gid = Vec::new();
     for gid in [0u16, gid_b, gid_b, gid_a, gid_a, gid_a] {
         cid_to_gid.extend_from_slice(&gid.to_be_bytes());
@@ -4307,6 +4308,16 @@ fn symbolic_type1_remapped_builtin_encoding_recovers_mapped_glyph_not_raw_byte()
     );
     assert_eq!(runs_ok[1].font_id, fid_ok);
 
+    // Text extraction & completeness on the same partially corrupt symbolic
+    // Type 1 must decode bytes 65, 66 through its built-in encoding to "BC"
+    // with zero decode failures.
+    let conv_ok = zpdf::convert_pdf(&doc_ok, &[0], Default::default()).unwrap();
+    assert_eq!(conv_ok.pages[0].text.trim(), "BC");
+    assert_eq!(conv_ok.pages[0].diagnostics.embedded_font_fallbacks, 1);
+    assert_eq!(conv_ok.pages[0].diagnostics.decode_failures, 0);
+    assert!(conv_ok.is_complete());
+    assert!(conv_ok.ensure_complete().is_ok());
+
     // 2. Same partially corrupt symbolic Type 1 with BOLD_TTF (which has 'A'
     //    but lacks 'B'): must NOT substitute raw byte 65 with 'A' or report
     //    successful recovery.
@@ -4322,6 +4333,10 @@ fn symbolic_type1_remapped_builtin_encoding_recovers_mapped_glyph_not_raw_byte()
     assert_eq!(page_miss.stats.diagnostics.embedded_font_fallbacks, 1);
     assert_eq!(page_miss.stats.diagnostics.missing_glyph_outlines, 1);
     assert!(!page_miss.is_complete());
+    let conv_miss = zpdf::convert_pdf(&doc_miss, &[0], Default::default()).unwrap();
+    assert_eq!(conv_miss.pages[0].text.trim(), "BC");
+    assert_eq!(conv_miss.pages[0].diagnostics.decode_failures, 0);
+    assert!(conv_miss.is_complete());
 
     // 3. Load-time Unusable symbolic Type 1 (all charstrings empty, built-in
     //    encoding still intact): primary substitute likewise inherits `65 -> /B`,
@@ -4351,6 +4366,10 @@ fn symbolic_type1_remapped_builtin_encoding_recovers_mapped_glyph_not_raw_byte()
         .collect();
     assert_eq!(uok_runs.len(), 1);
     assert_eq!(uok_runs[0].glyphs[0].glyph_id, gid_b);
+    let conv_unusable_ok = zpdf::convert_pdf(&doc_unusable_ok, &[0], Default::default()).unwrap();
+    assert_eq!(conv_unusable_ok.pages[0].text.trim(), "B");
+    assert_eq!(conv_unusable_ok.pages[0].diagnostics.decode_failures, 0);
+    assert!(conv_unusable_ok.is_complete());
 
     let doc_unusable_miss = PdfDocument::open(unusable_pdf)
         .unwrap()
@@ -4554,4 +4573,644 @@ fn zero_incremental_cost_descriptor_substitute_admits_in_exactly_full_cache() {
         ) > 10,
         "/F2's recovered CID 34 ('A') must draw ink even when the cache started exactly full"
     );
+}
+
+/// Build a TrueType variant of `PRIMARY_TTF` whose `cmap` contains ONLY a
+/// Windows `(3, 1)` Unicode format-4 subtable mapping `U+F041` (PUA Alpha) to
+/// `target_gid` (with NO `U+0391` mapping and a format-3.0 `post` table with
+/// NO glyph names).
+fn build_windows_unicode_pua_only_ttf(ttf: &[u8], target_gid: u16) -> Vec<u8> {
+    // Format-4 subtable with 2 segments: [0xF041..=0xF041 -> target_gid] and
+    // sentinel [0xFFFF..=0xFFFF -> 0].
+    let seg_count: u16 = 2;
+    let id_delta: u16 = target_gid.wrapping_sub(0xF041);
+    let mut subtable = Vec::new();
+    subtable.extend_from_slice(&4u16.to_be_bytes()); // format
+    subtable.extend_from_slice(&32u16.to_be_bytes()); // length
+    subtable.extend_from_slice(&0u16.to_be_bytes()); // language
+    subtable.extend_from_slice(&(seg_count * 2).to_be_bytes()); // segCountX2
+    subtable.extend_from_slice(&4u16.to_be_bytes()); // searchRange
+    subtable.extend_from_slice(&1u16.to_be_bytes()); // entrySelector
+    subtable.extend_from_slice(&0u16.to_be_bytes()); // rangeShift
+    subtable.extend_from_slice(&0xF041u16.to_be_bytes()); // endCode[0]
+    subtable.extend_from_slice(&0xFFFFu16.to_be_bytes()); // endCode[1]
+    subtable.extend_from_slice(&0u16.to_be_bytes()); // reservedPad
+    subtable.extend_from_slice(&0xF041u16.to_be_bytes()); // startCode[0]
+    subtable.extend_from_slice(&0xFFFFu16.to_be_bytes()); // startCode[1]
+    subtable.extend_from_slice(&id_delta.to_be_bytes()); // idDelta[0]
+    subtable.extend_from_slice(&1u16.to_be_bytes()); // idDelta[1]
+    subtable.extend_from_slice(&0u16.to_be_bytes()); // idRangeOffset[0]
+    subtable.extend_from_slice(&0u16.to_be_bytes()); // idRangeOffset[1]
+    assert_eq!(subtable.len(), 32);
+
+    let mut new_cmap = Vec::new();
+    new_cmap.extend_from_slice(&0u16.to_be_bytes()); // version
+    new_cmap.extend_from_slice(&1u16.to_be_bytes()); // numTables
+    new_cmap.extend_from_slice(&3u16.to_be_bytes()); // platformID = Windows
+    new_cmap.extend_from_slice(&1u16.to_be_bytes()); // encodingID = Unicode BMP
+    new_cmap.extend_from_slice(&12u32.to_be_bytes()); // offset
+    new_cmap.extend_from_slice(&subtable);
+
+    // post format 3.0 (32 bytes): explicitly carries NO glyph names.
+    let mut new_post = [0u8; 32];
+    new_post[..4].copy_from_slice(&0x0003_0000u32.to_be_bytes());
+
+    let num_tables = u16::from_be_bytes([ttf[4], ttf[5]]) as usize;
+    let mut out = Vec::with_capacity(ttf.len());
+    out.extend_from_slice(&ttf[..12 + num_tables * 16]);
+    for i in 0..num_tables {
+        let rec = 12 + i * 16;
+        let tag = &ttf[rec..rec + 4];
+        let old_off = u32::from_be_bytes(ttf[rec + 8..rec + 12].try_into().unwrap()) as usize;
+        let old_len = u32::from_be_bytes(ttf[rec + 12..rec + 16].try_into().unwrap()) as usize;
+        let table_bytes: &[u8] = if tag == b"cmap" {
+            &new_cmap
+        } else if tag == b"post" {
+            &new_post
+        } else {
+            &ttf[old_off..old_off + old_len]
+        };
+        while !out.len().is_multiple_of(4) {
+            out.push(0);
+        }
+        let new_off = out.len() as u32;
+        let new_len = table_bytes.len() as u32;
+        out[rec + 8..rec + 12].copy_from_slice(&new_off.to_be_bytes());
+        out[rec + 12..rec + 16].copy_from_slice(&new_len.to_be_bytes());
+        out.extend_from_slice(table_bytes);
+    }
+    out
+}
+
+#[test]
+fn canonical_symbol_substitute_uses_windows_unicode_pua_while_remapped_type1_does_not() {
+    let probe = zpdf_font::LoadedFont::new_with_data(
+        zpdf_font::PdfFontType::TrueType,
+        "Probe".into(),
+        PRIMARY_TTF.to_vec(),
+        zpdf_font::CidWidths::new(1000.0),
+    );
+    let gid_a = probe.unicode_glyph('A' as u32).unwrap().0;
+    let pua_ttf = build_windows_unicode_pua_only_ttf(PRIMARY_TTF, gid_a);
+
+    // 1. Symbolic `/Symbol` font (receives canonical `SYMBOL_ENCODING` where
+    //    byte 65 = `/Alpha`) substituting onto a face that maps Alpha ONLY at
+    //    Windows `(3,1)` `U+F041` (no `U+0391` and no `post` glyph names):
+    //    byte 65 must still resolve to `gid_a` and render cleanly.
+    let sym_provider = Arc::new(FontProvider::memory_only());
+    sym_provider
+        .register_with_aliases(pua_ttf.clone(), 0, &["Symbol", "RemappedSymT1"])
+        .unwrap();
+    let sym_pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 180 100] \
+          /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
+            .to_vec(),
+        stream("", b"0 0 0 rg BT /F1 24 Tf 15 40 Td (A) Tj ET"),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Symbol /FontDescriptor 6 0 R >>".to_vec(),
+        b"<< /Type /FontDescriptor /FontName /Symbol /Flags 4 /FontFile 7 0 R >>".to_vec(),
+        stream("", b"corrupt symbol font"),
+    ]);
+    let sym_doc = PdfDocument::open(sym_pdf)
+        .unwrap()
+        .with_font_provider(Arc::clone(&sym_provider));
+    let sym_page = zpdf::interpret_page(&sym_doc, 0, Default::default()).unwrap();
+    let (_, sym_font) = sym_page.fonts.get_by_name("F1").unwrap();
+    assert!(sym_font.is_substitute && sym_font.symbolic && sym_font.encoding.is_some());
+    assert_eq!(sym_font.code_to_gid(65), Some(gid_a));
+    assert_eq!(sym_page.stats.diagnostics.embedded_font_fallbacks, 1);
+    assert_eq!(sym_page.stats.diagnostics.missing_glyph_outlines, 0);
+    assert!(sym_page.is_complete());
+
+    // 2. Remapped symbolic Type 1 (`65 -> /B`, not canonical Symbol `/Alpha`)
+    //    substituting onto the same PUA-only face must NOT match `U+F041`!
+    let remapped_pfa = build_remapped_symbolic_type1_pfa(false);
+    let remapped_pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 180 100] \
+          /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
+            .to_vec(),
+        stream("", b"0 0 0 rg BT /F1 24 Tf 15 40 Td (A) Tj ET"),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /ABCDEF+RemappedSymT1 \
+          /FirstChar 65 /LastChar 67 /Widths [780 540 540] /FontDescriptor 6 0 R >>"
+            .to_vec(),
+        b"<< /Type /FontDescriptor /FontName /ABCDEF+RemappedSymT1 /Flags 4 /FontFile 7 0 R >>"
+            .to_vec(),
+        stream("", &remapped_pfa),
+    ]);
+    let remapped_doc = PdfDocument::open(remapped_pdf)
+        .unwrap()
+        .with_font_provider(sym_provider);
+    let remapped_page = zpdf::interpret_page(&remapped_doc, 0, Default::default()).unwrap();
+    let (rfid, _) = remapped_page.fonts.get_by_name("F1").unwrap();
+    assert!(!remapped_page.fonts.has_admitted_embedded_companion(rfid));
+    assert_eq!(remapped_page.stats.diagnostics.embedded_font_fallbacks, 1);
+    assert_eq!(remapped_page.stats.diagnostics.missing_glyph_outlines, 1);
+    assert!(!remapped_page.is_complete());
+}
+
+#[test]
+fn shared_cache_shortfall_preserves_descriptor_lookup_name_for_later_pages() {
+    let probe = zpdf_font::LoadedFont::new_with_data(
+        zpdf_font::PdfFontType::TrueType,
+        "Probe".into(),
+        PRIMARY_TTF.to_vec(),
+        zpdf_font::CidWidths::new(1000.0),
+    );
+    let gid_a = probe.unicode_glyph('A' as u32).unwrap().0;
+    let partial_ttf = corrupt_selected_gids(PRIMARY_TTF, &[gid_a]);
+
+    // Font `/F2` omits `/BaseFont` and carries a `/FontDescriptor /FontName`
+    // that selects registered `BOLD_TTF` (while `"Unknown"` matches nothing).
+    let desc_lookup_name = "DescOnlyFaceName";
+    let provider = Arc::new(FontProvider::memory_only());
+    provider
+        .register_with_aliases(BOLD_TTF, 0, &[desc_lookup_name])
+        .unwrap();
+
+    // Page 0 references `/Filler` (fills part of `SharedFonts`) AND `/F2` (shows
+    // only healthy 'B'). Page 1 references ONLY `/F2` and shows damaged 'A'.
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 180 100] \
+          /Resources << /Font << /Filler 7 0 R /F2 10 0 R >> >> /Contents 5 0 R >>"
+            .to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 180 100] \
+          /Resources << /Font << /F2 10 0 R >> >> /Contents 6 0 R >>"
+            .to_vec(),
+        stream(
+            "",
+            b"0 0 0 rg BT /Filler 24 Tf 15 40 Td (B) Tj /F2 24 Tf 35 0 Td (B) Tj ET",
+        ),
+        stream("", b"0 0 0 rg BT /F2 24 Tf 15 40 Td (A) Tj ET"),
+        b"<< /Type /Font /Subtype /TrueType /BaseFont /ABCDEF+FillerFace \
+          /Encoding /WinAnsiEncoding /FirstChar 65 /LastChar 67 /Widths [620 780 540] \
+          /FontDescriptor 8 0 R >>"
+            .to_vec(),
+        b"<< /Type /FontDescriptor /FontName /ABCDEF+FillerFace /Flags 32 /FontFile2 9 0 R >>"
+            .to_vec(),
+        stream("", PRIMARY_TTF),
+        b"<< /Type /Font /Subtype /TrueType \
+          /Encoding /WinAnsiEncoding /FirstChar 65 /LastChar 67 /Widths [620 780 540] \
+          /FontDescriptor 11 0 R >>"
+            .to_vec(),
+        format!(
+            "<< /Type /FontDescriptor /FontName /{desc_lookup_name} /Flags 32 /FontFile2 12 0 R >>"
+        )
+        .into_bytes(),
+        stream("", &partial_ttf),
+    ]);
+
+    // Pick a budget that fits BOTH primaries together in `SharedFonts` alone
+    // (leaving less than `desc_lookup_name.len()` bytes free on Page 0), while
+    // Page 1 alone has plenty of room for F2 + `desc_lookup_name` + BOLD_TTF.
+    let probe_doc = PdfDocument::open(pdf.clone()).unwrap();
+    let p0_probe = probe_doc.page(0).unwrap();
+    let p0_fonts = probe_doc.load_page_fonts(&p0_probe);
+    let (_, filler_f) = p0_fonts.get_by_name("Filler").unwrap();
+    let (_, f2_f) = p0_fonts.get_by_name("F2").unwrap();
+    let two_primaries = filler_f.estimated_cache_bytes() + f2_f.estimated_cache_bytes();
+    let budget = two_primaries + 4;
+    assert!(
+        budget < two_primaries + desc_lookup_name.len() as u64,
+        "Page 0 shared cache must fit both primaries alone, not both + descriptor lookup name"
+    );
+    assert!(
+        budget
+            > f2_f.estimated_cache_bytes()
+                + desc_lookup_name.len() as u64
+                + BOLD_TTF.len() as u64
+                + 8192,
+        "Page 1 alone must have plenty of room for F2 + descriptor lookup name + BOLD_TTF"
+    );
+
+    let doc = PdfDocument::open_with_limits(
+        pdf,
+        zpdf::ParseLimits {
+            max_font_cache_bytes: budget,
+            ..Default::default()
+        },
+    )
+    .unwrap()
+    .with_font_provider(provider);
+    let page0 = zpdf::interpret_page(&doc, 0, Default::default()).unwrap();
+    assert!(page0.is_complete());
+
+    // Page 1 must NOT hit a degraded SharedFonts entry that stripped `/FontName`;
+    // it must preserve the full `/FontName` and recover 'A' via BOLD_TTF!
+    let page1 = zpdf::interpret_page(&doc, 1, Default::default()).unwrap();
+    let (fid2, _) = page1.fonts.get_by_name("F2").unwrap();
+    assert!(
+        page1.fonts.has_admitted_embedded_companion(fid2),
+        "Page 1 must retain full descriptor /FontName and admit BOLD_TTF"
+    );
+    assert_eq!(page1.stats.diagnostics.embedded_font_fallbacks, 1);
+    assert_eq!(page1.stats.diagnostics.missing_glyph_outlines, 0);
+    assert!(page1.is_complete());
+}
+
+#[test]
+fn primary_font_programs_take_priority_over_optional_descriptor_lookup_names_in_either_order() {
+    // Two distinct embedded primary fonts on one page:
+    // - `unused` has omitted `/BaseFont` and a 16 KB `/FontDescriptor /FontName`
+    // - `visible` is a normal healthy embedded primary font actually drawn on the page.
+    // Under a budget that fits BOTH primary programs together, but NOT both
+    // primaries + the 16 KB optional lookup name, BOTH admission orders
+    // (`unused` first, then `visible`; AND `visible` first, then `unused`) must
+    // keep `visible` fully drawable (never downgraded to metrics-only).
+    let long_name = format!("UnusedOverride{}", "Q".repeat(16_384));
+    let unused_primary = Arc::new(zpdf_font::LoadedFont::new_with_data(
+        zpdf_font::PdfFontType::TrueType,
+        "Unknown".into(),
+        PRIMARY_TTF.to_vec(),
+        zpdf_font::CidWidths::new(1000.0),
+    ));
+    let visible_primary = Arc::new(zpdf_font::LoadedFont::new_with_data(
+        zpdf_font::PdfFontType::TrueType,
+        "VisiblePrimary".into(),
+        PRIMARY_TTF.to_vec(),
+        zpdf_font::CidWidths::new(1000.0),
+    ));
+    let spec = Arc::new(zpdf_font::DescriptorSubstituteSpec {
+        lookup_name: Some(Arc::<str>::from(long_name.as_str())),
+        hints: zpdf_font::system::SubstituteHints::default(),
+        ordering: None,
+        font_file_id: None,
+    });
+
+    let two_primaries =
+        unused_primary.estimated_cache_bytes() + visible_primary.estimated_cache_bytes();
+    let budget = two_primaries + 1024;
+    assert!(budget < two_primaries + long_name.len() as u64);
+
+    for unused_first in [true, false] {
+        let mut cache = zpdf::FontCache::new();
+        if unused_first {
+            let ufid = cache
+                .admit_with_diagnostics(
+                    "FUnused".into(),
+                    Arc::clone(&unused_primary),
+                    Default::default(),
+                    None,
+                    budget,
+                )
+                .unwrap();
+            cache.record_descriptor_substitute(ufid, Arc::clone(&spec), budget);
+            let _ = cache
+                .admit_with_diagnostics(
+                    "FVisible".into(),
+                    Arc::clone(&visible_primary),
+                    Default::default(),
+                    None,
+                    budget,
+                )
+                .unwrap();
+        } else {
+            let _ = cache
+                .admit_with_diagnostics(
+                    "FVisible".into(),
+                    Arc::clone(&visible_primary),
+                    Default::default(),
+                    None,
+                    budget,
+                )
+                .unwrap();
+            let ufid = cache
+                .admit_with_diagnostics(
+                    "FUnused".into(),
+                    Arc::clone(&unused_primary),
+                    Default::default(),
+                    None,
+                    budget,
+                )
+                .unwrap();
+            cache.record_descriptor_substitute(ufid, Arc::clone(&spec), budget);
+        }
+
+        let (_, vis) = cache.get_by_name("FVisible").unwrap();
+        let (_, un) = cache.get_by_name("FUnused").unwrap();
+        assert!(
+            vis.has_font_data(),
+            "unused_first={unused_first}: visible primary must never be downgraded to metrics-only"
+        );
+        assert!(
+            un.has_font_data(),
+            "unused_first={unused_first}: unused primary must also stay intact"
+        );
+        assert!(
+            cache.bytes_used() <= budget,
+            "unused_first={unused_first}: cache bytes {} must stay within budget {budget}",
+            cache.bytes_used()
+        );
+        assert!(
+            cache.diagnostics().is_empty(),
+            "unused_first={unused_first}: no resource-limit fallback diagnostic expected"
+        );
+    }
+}
+
+/// Build a TrueType variant of `PRIMARY_TTF` with 12-byte valid-header
+/// zero-contour records for `gid_space` and `gid_a`, and a large 5,000-group
+/// format-12 Unicode `cmap` (larger than `CMAP_PROBE_BUDGET = 4096`) where
+/// `' '` (`U+0020 -> gid_space`) and `'A'` (`U+0041 -> gid_a`) sit near the
+/// start of the subtable.
+fn build_large_format12_zero_contour_ttf(
+    ttf: &[u8],
+    gid_space: u16,
+    gid_a: u16,
+    gid_b: u16,
+) -> Vec<u8> {
+    let base = valid_header_zero_contour_mixed_ttf(ttf, gid_space, gid_a);
+    let mut groups: Vec<(u32, u32, u32)> = Vec::with_capacity(5004);
+    groups.push((0x0020, 0x0020, gid_space as u32));
+    groups.push((0x0041, 0x0041, gid_a as u32));
+    groups.push((0x0042, 0x0042, gid_b as u32));
+    // Add 5,000 extra distinct non-contiguous groups mapping to gid_b so a full
+    // reverse scan for `gid_space` exceeds `CMAP_PROBE_BUDGET` (4096).
+    for i in 0..5000u32 {
+        let cp = 0x10000 + i * 2;
+        groups.push((cp, cp, gid_b as u32));
+    }
+    let sub_len = (16 + groups.len() * 12) as u32;
+    let mut subtable = Vec::with_capacity(sub_len as usize);
+    subtable.extend_from_slice(&12u16.to_be_bytes()); // format 12
+    subtable.extend_from_slice(&0u16.to_be_bytes()); // reserved
+    subtable.extend_from_slice(&sub_len.to_be_bytes()); // length
+    subtable.extend_from_slice(&0u32.to_be_bytes()); // language
+    subtable.extend_from_slice(&(groups.len() as u32).to_be_bytes());
+    for (start_cp, end_cp, start_gid) in groups {
+        subtable.extend_from_slice(&start_cp.to_be_bytes());
+        subtable.extend_from_slice(&end_cp.to_be_bytes());
+        subtable.extend_from_slice(&start_gid.to_be_bytes());
+    }
+
+    let mut new_cmap = Vec::with_capacity(12 + subtable.len());
+    new_cmap.extend_from_slice(&0u16.to_be_bytes()); // version
+    new_cmap.extend_from_slice(&1u16.to_be_bytes()); // numTables
+    new_cmap.extend_from_slice(&3u16.to_be_bytes()); // platformID = Windows
+    new_cmap.extend_from_slice(&10u16.to_be_bytes()); // encodingID = Unicode full repertoire
+    new_cmap.extend_from_slice(&12u32.to_be_bytes()); // offset
+    new_cmap.extend_from_slice(&subtable);
+
+    let num_tables = u16::from_be_bytes([base[4], base[5]]) as usize;
+    let mut out = Vec::with_capacity(base.len() + new_cmap.len());
+    out.extend_from_slice(&base[..12 + num_tables * 16]);
+    for i in 0..num_tables {
+        let rec = 12 + i * 16;
+        let tag = &base[rec..rec + 4];
+        let old_off = u32::from_be_bytes(base[rec + 8..rec + 12].try_into().unwrap()) as usize;
+        let old_len = u32::from_be_bytes(base[rec + 12..rec + 16].try_into().unwrap()) as usize;
+        let table_bytes: &[u8] = if tag == b"cmap" {
+            &new_cmap
+        } else {
+            &base[old_off..old_off + old_len]
+        };
+        while !out.len().is_multiple_of(4) {
+            out.push(0);
+        }
+        let new_off = out.len() as u32;
+        let new_len = table_bytes.len() as u32;
+        out[rec + 8..rec + 12].copy_from_slice(&new_off.to_be_bytes());
+        out[rec + 12..rec + 16].copy_from_slice(&new_len.to_be_bytes());
+        out.extend_from_slice(table_bytes);
+    }
+    out
+}
+
+#[test]
+fn zero_contour_space_in_large_format12_cmap_does_not_exhaust_recovery_for_later_letter() {
+    let probe = zpdf_font::LoadedFont::new_with_data(
+        zpdf_font::PdfFontType::TrueType,
+        "Probe".into(),
+        PRIMARY_TTF.to_vec(),
+        zpdf_font::CidWidths::new(1000.0),
+    );
+    let gid_space = probe.unicode_glyph(' ' as u32).unwrap().0;
+    let gid_a = probe.unicode_glyph('A' as u32).unwrap().0;
+    let gid_b = probe.unicode_glyph('B' as u32).unwrap().0;
+    let large_cmap_ttf =
+        build_large_format12_zero_contour_ttf(PRIMARY_TTF, gid_space, gid_a, gid_b);
+
+    let provider = Arc::new(FontProvider::memory_only());
+    provider
+        .register_with_aliases(BOLD_TTF, 0, &["LargeFmt12Face"])
+        .unwrap();
+
+    // 1. Simple WinAnsi font: showing space FIRST in a 5,000-group format-12
+    //    cmap must use direct evidence (spending zero reverse-cmap budget) and
+    //    never prevent later 'A' from recovering via BOLD_TTF.
+    let mut widths = [500u16; 36];
+    widths[0] = 300;
+    widths[65 - 32] = 620;
+    widths[66 - 32] = 780;
+    let widths_str: String = widths
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let winansi_pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 180 100] \
+          /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
+            .to_vec(),
+        stream(
+            "",
+            b"0 0 0 rg BT /F1 24 Tf 15 40 Td ( ) Tj (A) Tj (B) Tj ET",
+        ),
+        format!(
+            "<< /Type /Font /Subtype /TrueType /BaseFont /ABCDEF+LargeFmt12Face \
+             /Encoding /WinAnsiEncoding /FirstChar 32 /LastChar 67 /Widths [{widths_str}] \
+             /FontDescriptor 6 0 R >>"
+        )
+        .into_bytes(),
+        b"<< /Type /FontDescriptor /FontName /ABCDEF+LargeFmt12Face /Flags 32 /FontFile2 7 0 R >>"
+            .to_vec(),
+        stream("", &large_cmap_ttf),
+    ]);
+    let win_doc = PdfDocument::open(winansi_pdf)
+        .unwrap()
+        .with_font_provider(Arc::clone(&provider));
+    let win_page = zpdf::interpret_page(&win_doc, 0, Default::default()).unwrap();
+    let (wfid, wf) = win_page.fonts.get_by_name("F1").unwrap();
+    assert!(!wf.is_substitute);
+    assert!(win_page.fonts.has_admitted_embedded_companion(wfid));
+    assert_eq!(win_page.stats.diagnostics.embedded_font_fallbacks, 1);
+    assert_eq!(win_page.stats.diagnostics.missing_glyph_outlines, 0);
+    assert!(win_page.is_complete());
+
+    // 2. Identity-H Type 0 WITHOUT `/ToUnicode`: showing unmapped space
+    //    `<0001>` FIRST must NOT exhaust `cmap_budget` for later damaged
+    //    zero-contour `<0022>` ('A', near the start of the 5,000-group cmap)
+    //    and must report fallback + missing outline instead of silently blanking 'A'.
+    let cid_pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 180 100] \
+          /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
+            .to_vec(),
+        stream(
+            "",
+            format!(
+                "0 0 0 rg BT /F1 24 Tf 15 40 Td <{gid_space:04X}> Tj <{gid_a:04X}> Tj <{gid_b:04X}> Tj ET"
+            )
+            .as_bytes(),
+        ),
+        b"<< /Type /Font /Subtype /Type0 /BaseFont /ABCDEF+LargeFmt12Face /Encoding /Identity-H \
+          /DescendantFonts [6 0 R] >>"
+            .to_vec(),
+        b"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /ABCDEF+LargeFmt12Face \
+          /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> \
+          /CIDToGIDMap /Identity /FontDescriptor 7 0 R /DW 700 >>"
+            .to_vec(),
+        b"<< /Type /FontDescriptor /FontName /ABCDEF+LargeFmt12Face /Flags 32 /FontFile2 8 0 R >>"
+            .to_vec(),
+        stream("", &large_cmap_ttf),
+    ]);
+    let cid_doc = PdfDocument::open(cid_pdf)
+        .unwrap()
+        .with_font_provider(Arc::new(FontProvider::memory_only()));
+    let cid_page = zpdf::interpret_page(&cid_doc, 0, Default::default()).unwrap();
+    assert_eq!(
+        cid_page.stats.diagnostics.embedded_font_fallbacks, 1,
+        "showing unmapped space first must not suppress fallback detection for later 'A'"
+    );
+    assert_eq!(cid_page.stats.diagnostics.missing_glyph_outlines, 1);
+    assert!(!cid_page.is_complete());
+}
+
+/// Build a Type 1 PFA with drawable `/B` and `/C`, genuine `/space`, and an
+/// empty charstring under custom glyph name `/g3`.
+fn build_type1_empty_custom_g3_pfa() -> Vec<u8> {
+    let mut private = Vec::new();
+    private.extend_from_slice(
+        b"dup /Private 4 dict dup begin /lenIV -1 def /CharStrings 5 dict dup begin\n",
+    );
+    let entries: &[(&str, &[u8])] = &[
+        (".notdef", &[139, 248, 136, 13, 14]),
+        ("space", &[139, 247, 192, 13, 14]),
+        ("g3", &[139, 249, 0, 13, 14]), // empty custom glyph name
+        (
+            "B",
+            &[
+                139, 249, 160, 13, 189, 139, 21, 139, 249, 80, 5, 248, 136, 139, 5, 139, 253, 80,
+                5, 9, 14,
+            ],
+        ),
+        (
+            "C",
+            &[
+                139, 248, 176, 13, 189, 139, 21, 139, 249, 80, 5, 248, 36, 139, 5, 139, 253, 80, 5,
+                9, 14,
+            ],
+        ),
+    ];
+    for (name, cs) in entries {
+        private.extend_from_slice(format!("/{name} {} RD ", cs.len()).as_bytes());
+        private.extend_from_slice(cs);
+        private.extend_from_slice(b" ND\n");
+    }
+    private.extend_from_slice(b"end end readonly def\n");
+
+    let mut r: u16 = 55665;
+    let mut hex = String::with_capacity((private.len() + 4) * 2);
+    for &p in [0u8, 0, 0, 0].iter().chain(private.iter()) {
+        let c = p ^ (r >> 8) as u8;
+        r = (c as u16)
+            .wrapping_add(r)
+            .wrapping_mul(52845)
+            .wrapping_add(22719);
+        use std::fmt::Write;
+        let _ = write!(&mut hex, "{c:02X}");
+    }
+
+    let mut pfa = Vec::new();
+    pfa.extend_from_slice(
+        b"%!PS-AdobeFont-1.0: CustomG3Type1 1.0\n\
+          8 dict begin\n\
+          /FontName /CustomG3Type1 def /FontType 1 def /PaintType 0 def\n\
+          /FontMatrix [0.001 0 0 0.001 0 0] readonly def\n\
+          /FontBBox [0 0 1000 900] readonly def /Encoding StandardEncoding def\n\
+          currentdict end currentfile eexec\n",
+    );
+    pfa.extend_from_slice(hex.as_bytes());
+    pfa.push(b'\n');
+    pfa
+}
+
+#[test]
+fn type1_empty_custom_glyph_name_uses_tounicode_without_caching_by_gid_alone() {
+    let pfa = build_type1_empty_custom_g3_pfa();
+    // Both code 1 and code 2 map via `/Differences` to the SAME empty custom
+    // glyph `/g3`. `/ToUnicode` maps code 1 -> 'A' (visible!) and code 2 -> ' '
+    // (genuine space!).
+    let to_unicode = b"/CIDInit /ProcSet findresource begin 12 dict begin begincmap \
+        1 begincodespacerange <00> <FF> endcodespacerange \
+        4 beginbfchar <01> <0041> <02> <0020> <42> <0042> <43> <0043> endbfchar \
+        endcmap CMapName currentdict /CMap defineresource pop end end";
+    let make_pdf = |content: &[u8]| {
+        assemble(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 180 100] \
+              /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
+                .to_vec(),
+            stream("", content),
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /ABCDEF+CustomG3Type1 \
+              /Encoding << /Type /Encoding /BaseEncoding /WinAnsiEncoding /Differences [1 /g3 /g3] >> \
+              /ToUnicode 8 0 R /FontDescriptor 6 0 R >>"
+                .to_vec(),
+            b"<< /Type /FontDescriptor /FontName /ABCDEF+CustomG3Type1 /Flags 32 /FontFile 7 0 R >>"
+                .to_vec(),
+            stream("", &pfa),
+            stream("", to_unicode),
+        ])
+    };
+
+    // 1. Showing ONLY code 2 (/g3 -> ' ') and 'B' keeps the embedded Type 1
+    //    primary with zero fallbacks.
+    let space_only_doc =
+        PdfDocument::open(make_pdf(b"0 0 0 rg BT /F1 24 Tf 15 40 Td <0242> Tj ET"))
+            .unwrap()
+            .with_font_provider(Arc::new(FontProvider::memory_only()));
+    let space_page = zpdf::interpret_page(&space_only_doc, 0, Default::default()).unwrap();
+    let (sfid, sf) = space_page.fonts.get_by_name("F1").unwrap();
+    assert!(!sf.is_substitute);
+    assert!(!space_page.fonts.has_admitted_embedded_companion(sfid));
+    assert_eq!(space_page.stats.diagnostics.embedded_font_fallbacks, 0);
+    assert_eq!(space_page.stats.diagnostics.missing_glyph_outlines, 0);
+    assert!(space_page.is_complete());
+
+    // 2. Showing code 2 (/g3 -> ' ') FIRST followed by code 1 (/g3 -> 'A') on
+    //    the SAME page must NOT cache /g3 as readable by GID alone: code 1 must
+    //    recover via descriptor substitute (BOLD_TTF via /ToUnicode 'A') while
+    //    code 2 and 'B' stay on the embedded Type 1 face.
+    let mixed_pdf = make_pdf(b"0 0 0 rg BT /F1 24 Tf 15 40 Td <02> Tj <01> Tj (B) Tj ET");
+    let provider = Arc::new(FontProvider::memory_only());
+    provider
+        .register_with_aliases(BOLD_TTF, 0, &["CustomG3Type1"])
+        .unwrap();
+    let sub_doc = PdfDocument::open(mixed_pdf.clone())
+        .unwrap()
+        .with_font_provider(provider);
+    let sub_page = zpdf::interpret_page(&sub_doc, 0, Default::default()).unwrap();
+    let (fid, f) = sub_page.fonts.get_by_name("F1").unwrap();
+    assert!(!f.is_substitute);
+    assert!(sub_page.fonts.has_admitted_embedded_companion(fid));
+    assert_eq!(sub_page.stats.diagnostics.embedded_font_fallbacks, 1);
+    assert_eq!(sub_page.stats.diagnostics.missing_glyph_outlines, 0);
+    assert!(sub_page.is_complete());
+
+    // 3. Without any substitute (memory_only), showing code 2 then code 1 must
+    //    still flag embedded_font_fallbacks=1 and missing_glyph_outlines=1.
+    let no_sub_doc = PdfDocument::open(mixed_pdf)
+        .unwrap()
+        .with_font_provider(Arc::new(FontProvider::memory_only()));
+    let no_sub_page = zpdf::interpret_page(&no_sub_doc, 0, Default::default()).unwrap();
+    assert_eq!(no_sub_page.stats.diagnostics.embedded_font_fallbacks, 1);
+    assert_eq!(no_sub_page.stats.diagnostics.missing_glyph_outlines, 1);
+    assert!(!no_sub_page.is_complete());
 }

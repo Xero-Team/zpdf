@@ -106,10 +106,7 @@ impl SharedFonts {
             });
             let mut budget = FontCacheBudget::default();
             self.fonts.retain(|_, (font, _, _, spec)| {
-                budget.try_admit(font, u64::MAX)
-                    && spec
-                        .as_ref()
-                        .is_none_or(|s| budget.try_admit_descriptor_spec(s, u64::MAX))
+                budget.try_admit_with_spec(&[font], spec.as_ref(), u64::MAX)
             });
             self.budget = budget;
             self.generation = generation;
@@ -146,50 +143,32 @@ impl SharedFonts {
         }
         let font = Arc::new(font);
         let companion = embedded_companion.map(Arc::new);
-        let mut cached_spec = descriptor_spec;
-        match &companion {
+        // Keep shared lookups consistent across pages: only cache an entry when
+        // its paired companion and full descriptor lookup metadata fit together
+        // in `max_bytes`. Never store a stripped descriptor spec in `SharedFonts`
+        // or return a reduced spec to the caller — a page with room still gets
+        // the complete descriptor name.
+        let admitted = match &companion {
             Some(comp) => {
-                // Keep shared lookups consistent across renders: only cache a
-                // font with its paired companion when BOTH faces fit together.
-                // Caching a primary-only entry would cause later renders on
-                // fresh page caches to lose surviving companion glyphs.
-                if self.budget.try_admit_pair(&font, comp, max_bytes) {
-                    if let Some(spec) = &cached_spec {
-                        if !self.budget.try_admit_descriptor_spec(spec, max_bytes) {
-                            cached_spec = Some(Arc::new(spec.without_lookup_name()));
-                        }
-                    }
-                    self.fonts.insert(
-                        id,
-                        (
-                            Arc::clone(&font),
-                            diagnostics,
-                            Some(Arc::clone(comp)),
-                            cached_spec.as_ref().map(Arc::clone),
-                        ),
-                    );
-                }
+                self.budget
+                    .try_admit_with_spec(&[&font, comp], descriptor_spec.as_ref(), max_bytes)
             }
-            None => {
-                if self.budget.try_admit(&font, max_bytes) {
-                    if let Some(spec) = &cached_spec {
-                        if !self.budget.try_admit_descriptor_spec(spec, max_bytes) {
-                            cached_spec = Some(Arc::new(spec.without_lookup_name()));
-                        }
-                    }
-                    self.fonts.insert(
-                        id,
-                        (
-                            Arc::clone(&font),
-                            diagnostics,
-                            None,
-                            cached_spec.as_ref().map(Arc::clone),
-                        ),
-                    );
-                }
-            }
+            None => self
+                .budget
+                .try_admit_with_spec(&[&font], descriptor_spec.as_ref(), max_bytes),
+        };
+        if admitted {
+            self.fonts.insert(
+                id,
+                (
+                    Arc::clone(&font),
+                    diagnostics,
+                    companion.as_ref().map(Arc::clone),
+                    descriptor_spec.as_ref().map(Arc::clone),
+                ),
+            );
         }
-        (font, diagnostics, companion, cached_spec)
+        (font, diagnostics, companion, descriptor_spec)
     }
 }
 

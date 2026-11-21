@@ -265,7 +265,56 @@ impl LoadedFont {
         }
     }
 
-    /// A blank glyph is right for this code: the font's meaning for it is
+    /// Direct evidence from the PDF font's own text mappings (`/ToUnicode`,
+    /// CMap, `/Encoding`, Type 1 built-in encoding, or non-symbolic ASCII) for
+    /// whether a shown code represents visible text (`Some(true)`), known
+    /// no-ink/whitespace (`Some(false)`), or unknown (`None`).
+    pub(crate) fn direct_code_visibility(
+        &self,
+        code: u32,
+        raw_code: u32,
+        length: u8,
+    ) -> Option<bool> {
+        if let Some(text) = self
+            .to_unicode
+            .as_ref()
+            .and_then(|map| map.lookup(raw_code).or_else(|| map.lookup(code)))
+        {
+            if !text.is_empty() {
+                return Some(is_visible_text(text));
+            }
+        }
+        if matches!(self.font_type, PdfFontType::Type0CidType2) {
+            if let Some(decoded) = self
+                .cid_cmap
+                .as_ref()
+                .and_then(|cm| cm.decode_text(code, length))
+            {
+                let mut buf = String::new();
+                decoded.push_to(&mut buf);
+                if !buf.is_empty() {
+                    return Some(is_visible_text(&buf));
+                }
+            }
+            return None;
+        }
+        if let Ok(b) = u8::try_from(code) {
+            if let Some(name) = self.simple_glyph_name(b) {
+                if let Some(s) = crate::glyph_list::glyph_name_to_string(name) {
+                    if !s.is_empty() {
+                        return Some(is_visible_text(&s));
+                    }
+                }
+            } else if !self.symbolic && (32..=255).contains(&code) && code != 0x7f {
+                let ch = char::from_u32(code)?;
+                let mut buf = [0u8; 4];
+                return Some(is_visible_text(ch.encode_utf8(&mut buf)));
+            }
+        }
+        None
+    }
+
+    /// Whether a blank glyph is right for this code: the font's meaning for it is
     /// known and is whitespace or invisible.
     fn blank_is_space(&self, code: u32, raw_code: u32, length: u8) -> bool {
         let text = self
@@ -473,9 +522,15 @@ pub(crate) fn readable_glyph(face: &ttf_parser::Face<'_>, gid: u16) -> bool {
 }
 
 /// Maximum work units spent scanning a font's `cmap` subtables across one
-/// `has_usable_embedded_outlines` probe. Exhausting the budget stops early and
-/// leaves the blank-glyph probe inconclusive rather than stalling page load.
+/// `has_usable_embedded_outlines` probe or across one page for a single font.
+/// Exhausting the budget stops early and leaves the blank-glyph probe
+/// inconclusive rather than stalling page load.
 pub(crate) const CMAP_PROBE_BUDGET: usize = 4096;
+
+/// Maximum reverse-`cmap` work units any single unmapped blank glyph may spend
+/// from the per-font [`CMAP_PROBE_BUDGET`], so a blank space in a large
+/// format-12 `cmap` cannot exhaust recovery for later visible glyphs.
+const PER_GLYPH_CMAP_BUDGET: usize = 256;
 
 fn is_visible_scalar(cp: u32) -> bool {
     char::from_u32(cp).is_some_and(is_visible_char)
@@ -737,30 +792,35 @@ fn cmap_maps_visible_to_gid(
     Ok(false)
 }
 
-/// Whether a `GlyphState::Blank` glyph in a `glyf` face shows evidence of
-/// corruption (malformed header, oversized zeroed-out contour payload, or a
-/// zero-contour record hiding a visible character in the face's Unicode cmap).
-///
-/// Zero-length `loca` entries (`start == end`) and valid 10–12 byte zero-contour
-/// space headers return `false`. When `cmap_budget` is exhausted, the probe
-/// stops early and returns `false` (inconclusive).
-pub(crate) fn glyf_blank_is_corrupt(
-    face: &ttf_parser::Face<'_>,
-    gid: u16,
-    cmap_budget: &mut usize,
-) -> bool {
+/// Structural classification of a `GlyphState::Blank` record in a `glyf` face
+/// before consulting any character-to-glyph mapping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GlyfBlankHeader {
+    /// Zero-length `loca` entry (`start == end`) or non-`glyf` face: preserve
+    /// existing CAD repair path and never spend `cmap` budget.
+    ZeroLength,
+    /// Structurally malformed `glyf`/`loca` header or wiped non-zero-padded
+    /// contour payload: definitively corrupt regardless of character code.
+    Corrupt,
+    /// Well-formed nonempty zero-contour header (e.g. 10–12 byte space header
+    /// or zero-contour visible letter): check direct PDF character evidence
+    /// first, falling back to a bounded reverse `cmap` probe only if needed.
+    ValidNonEmpty,
+}
+
+pub(crate) fn glyf_blank_header(face: &ttf_parser::Face<'_>, gid: u16) -> GlyfBlankHeader {
     if face.tables().glyf.is_none() {
-        return false;
+        return GlyfBlankHeader::ZeroLength;
     }
     let raw = face.raw_face();
     let Some(head) = raw.table(ttf_parser::Tag::from_bytes(b"head")) else {
-        return true;
+        return GlyfBlankHeader::Corrupt;
     };
     let Some(loca) = raw.table(ttf_parser::Tag::from_bytes(b"loca")) else {
-        return true;
+        return GlyfBlankHeader::Corrupt;
     };
     let Some(glyf) = raw.table(ttf_parser::Tag::from_bytes(b"glyf")) else {
-        return true;
+        return GlyfBlankHeader::Corrupt;
     };
     let long = head.get(50..52) == Some(&[0, 1]);
     let offset = |index: usize| -> Option<usize> {
@@ -774,24 +834,24 @@ pub(crate) fn glyf_blank_is_corrupt(
         }
     };
     let (Some(start), Some(end)) = (offset(gid as usize), offset(gid as usize + 1)) else {
-        return true;
+        return GlyfBlankHeader::Corrupt;
     };
     if start > end || end > glyf.len() {
-        return true;
+        return GlyfBlankHeader::Corrupt;
     }
     if start == end {
-        return false;
+        return GlyfBlankHeader::ZeroLength;
     }
     let len = end - start;
     if len < 10 || glyf.get(start..start + 2) != Some(&[0, 0]) {
-        return true;
+        return GlyfBlankHeader::Corrupt;
     }
     let x_min = i16::from_be_bytes([glyf[start + 2], glyf[start + 3]]);
     let y_min = i16::from_be_bytes([glyf[start + 4], glyf[start + 5]]);
     let x_max = i16::from_be_bytes([glyf[start + 6], glyf[start + 7]]);
     let y_max = i16::from_be_bytes([glyf[start + 8], glyf[start + 9]]);
     if x_min > x_max || y_min > y_max {
-        return true;
+        return GlyfBlankHeader::Corrupt;
     }
     // OpenType simple glyph description with `numberOfContours == 0`:
     // 10-byte glyph header, optionally followed by `uint16 instructionLength`,
@@ -801,13 +861,13 @@ pub(crate) fn glyf_blank_is_corrupt(
     // bytes beyond the 12-byte padded header, or an out-of-bounds length.
     if len == 11 {
         if glyf[start + 10] != 0 {
-            return true;
+            return GlyfBlankHeader::Corrupt;
         }
     } else if len >= 12 {
         let instr_len = u16::from_be_bytes([glyf[start + 10], glyf[start + 11]]) as usize;
         let body_len = 12 + instr_len;
         if body_len > len {
-            return true;
+            return GlyfBlankHeader::Corrupt;
         }
         let max_pad = if instr_len == 0 {
             0
@@ -816,10 +876,47 @@ pub(crate) fn glyf_blank_is_corrupt(
         };
         let trailing = len - body_len;
         if trailing > max_pad || !glyf[start + body_len..end].iter().all(|&byte| byte == 0) {
-            return true;
+            return GlyfBlankHeader::Corrupt;
         }
     }
-    cmap_maps_visible_to_gid(face, gid, cmap_budget).unwrap_or(false)
+    GlyfBlankHeader::ValidNonEmpty
+}
+
+/// Bounded reverse-`cmap` check for a [`GlyfBlankHeader::ValidNonEmpty`] glyph.
+/// Caps per-glyph work at [`PER_GLYPH_CMAP_BUDGET`] deducted from `page_budget`
+/// and returns `None` when either budget is exhausted (distinct from confirmed
+/// `Some(false)`).
+pub(crate) fn glyf_blank_cmap_probe(
+    face: &ttf_parser::Face<'_>,
+    gid: u16,
+    page_budget: &mut usize,
+) -> Option<bool> {
+    let start = (*page_budget).min(PER_GLYPH_CMAP_BUDGET);
+    let mut local = start;
+    let res = cmap_maps_visible_to_gid(face, gid, &mut local);
+    *page_budget = page_budget.saturating_sub(start - local);
+    res.ok()
+}
+
+/// Whether a `GlyphState::Blank` glyph in a `glyf` face shows evidence of
+/// corruption (malformed header, oversized zeroed-out contour payload, or a
+/// zero-contour record hiding a visible character in the face's Unicode cmap).
+///
+/// Zero-length `loca` entries (`start == end`) and valid 10–12 byte zero-contour
+/// space headers return `false`. When `cmap_budget` is exhausted, the probe
+/// stops early and returns `false` (inconclusive).
+pub(crate) fn glyf_blank_is_corrupt(
+    face: &ttf_parser::Face<'_>,
+    gid: u16,
+    cmap_budget: &mut usize,
+) -> bool {
+    match glyf_blank_header(face, gid) {
+        GlyfBlankHeader::ZeroLength => false,
+        GlyfBlankHeader::Corrupt => true,
+        GlyfBlankHeader::ValidNonEmpty => {
+            cmap_maps_visible_to_gid(face, gid, cmap_budget).unwrap_or(false)
+        }
+    }
 }
 
 /// Whether `gid` has a non-zero or malformed `loca` slice in a `glyf` face
@@ -1356,12 +1453,7 @@ impl FontCache {
                                     if let Some(entry) =
                                         self.embedded_companions.get_mut(&original.font_id)
                                     {
-                                        entry.failed_budget = Some(
-                                            entry
-                                                .failed_budget
-                                                .map_or(remaining, |prev| prev.max(remaining)),
-                                        );
-                                        entry.failed_program_count = program_count;
+                                        entry.record_budget_failure(remaining, program_count);
                                     }
                                     return None;
                                 }
@@ -1374,8 +1466,7 @@ impl FontCache {
                                 if let Some(entry) =
                                     self.embedded_companions.get_mut(&original.font_id)
                                 {
-                                    entry.failed_budget = Some(u64::MAX);
-                                    entry.failed_program_count = program_count;
+                                    entry.record_budget_failure(u64::MAX, program_count);
                                 }
                                 return None;
                             }
@@ -1408,12 +1499,10 @@ impl FontCache {
                                             if let Some(entry) =
                                                 self.embedded_companions.get_mut(&original.font_id)
                                             {
-                                                entry.failed_budget = Some(
-                                                    entry.failed_budget.map_or(remaining, |prev| {
-                                                        prev.max(remaining)
-                                                    }),
+                                                entry.record_budget_failure(
+                                                    remaining,
+                                                    program_count,
                                                 );
-                                                entry.failed_program_count = program_count;
                                             }
                                             return None;
                                         }
@@ -1427,12 +1516,7 @@ impl FontCache {
                                         if let Some(entry) =
                                             self.embedded_companions.get_mut(&original.font_id)
                                         {
-                                            entry.failed_budget = Some(
-                                                entry
-                                                    .failed_budget
-                                                    .map_or(remaining, |prev| prev.max(remaining)),
-                                            );
-                                            entry.failed_program_count = program_count;
+                                            entry.record_budget_failure(remaining, program_count);
                                         }
                                         return None;
                                     }
@@ -1489,21 +1573,19 @@ impl FontCache {
                     if was_deferred {
                         // `FontCacheBudget` is non-evicting, so a deferred
                         // companion that exceeded `remaining` cannot fit later
-                        // at the same or smaller remaining budget either.
+                        // at the same or smaller remaining budget for this
+                        // shared-program set either.
                         if let Some(entry) = self.embedded_companions.get_mut(&original.font_id) {
-                            entry.failed_budget = Some(
-                                entry
-                                    .failed_budget
-                                    .map_or(remaining, |prev| prev.max(remaining)),
-                            );
-                            entry.failed_program_count = program_count;
+                            entry.record_budget_failure(remaining, program_count);
                         }
                     }
                     return None;
                 };
                 if let Some(entry) = self.embedded_companions.get_mut(&original.font_id) {
                     entry.admitted = Some(id);
+                    entry.descriptor_spec = None;
                 }
+                self.recompute_standby_bytes();
                 id
             }
         };
