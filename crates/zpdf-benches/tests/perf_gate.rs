@@ -252,10 +252,11 @@ fn covering_rectangle_clips_reduce_push_clip_count() {
         let doc = zpdf::PdfDocument::open(pdf).expect("open synthetic pdf");
         let page = doc.page(0).expect("page 0");
         let content = doc.page_content_bytes(&page).expect("content bytes");
+        let scale = 2.0;
         let dl = zpdf::ContentInterpreter::new(page.effective_box())
+            .with_clip_elision_scale(scale)
             .with_document(doc.file(), &page.resources)
             .interpret(&content);
-        let scale = 2.0;
         let comp = Composition::of(&dl, scale);
         let mut renderer = zpdf::cpu::CpuRenderer::new().with_stage_timing(true);
         let rendered = renderer

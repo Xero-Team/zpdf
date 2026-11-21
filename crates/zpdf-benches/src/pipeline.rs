@@ -153,6 +153,14 @@ fn interpret_page_impl(
         &mut icc_cache,
     );
 
+    let scale = dpi / 72.0;
+    #[cfg(feature = "cpu-render")]
+    let clip_elision_scale = zpdf::cpu::CpuRenderer::new()
+        .with_limits(doc.file().limits())
+        .raster_scale(page_box, scale);
+    #[cfg(not(feature = "cpu-render"))]
+    let clip_elision_scale = Some(scale);
+
     let mut interpreter = zpdf::ContentInterpreter::new(page_box)
         .with_page_rotation(page.rotate)
         .with_fonts(&mut font_cache)
@@ -162,6 +170,9 @@ fn interpret_page_impl(
         .with_annotations(&annotations)
         .with_work_timing(work_timing)
         .with_operand_stack_limit(doc.file().limits().max_operand_stack_depth as usize);
+    if let Some(clip_scale) = clip_elision_scale {
+        interpreter = interpreter.with_clip_elision_scale(clip_scale);
+    }
     if let Some(oc) = &oc_config {
         interpreter = interpreter.with_optional_content(oc);
     }
