@@ -710,6 +710,50 @@ impl LoadedFont {
             })
     }
 
+    /// Resolve a composite PDF source code to a physical GID in this direct
+    /// drawing substitute using `primary`'s `/ToUnicode` and `/Encoding` CMap.
+    ///
+    /// Resolving per source code avoids collapsing multiple source codes that
+    /// share a damaged CID into a single `cid_to_gid` slot, while leaving all
+    /// PDF advances on `primary`'s original CID.
+    pub(crate) fn resolve_composite_substitute_gid(
+        &self,
+        primary: &LoadedFont,
+        code: u32,
+        raw_code: u32,
+        length: u8,
+    ) -> Option<u16> {
+        if let Some(text) = primary
+            .to_unicode
+            .as_ref()
+            .and_then(|map| map.lookup(raw_code).or_else(|| map.lookup(code)))
+        {
+            if let Some(gid) =
+                FontCharacter::from_text(text).and_then(|character| self.character_gid(character))
+            {
+                return Some(gid);
+            }
+            // Match `composite_unicode_gid` for Unicode/legacy CMaps (where the
+            // CMap's own Unicode can still recover a multi-glyph or unmapped
+            // `/ToUnicode`), while matching `build_substitute_cid_to_gid_from`
+            // for canonical CJK collections (never letting the collection
+            // override an explicit `/ToUnicode` miss).
+            let fallback_to_cmap = primary
+                .cid_cmap
+                .as_ref()
+                .is_some_and(|cm| cm.codes_are_unicode || cm.is_legacy());
+            if !fallback_to_cmap {
+                return None;
+            }
+        }
+        let character = primary
+            .cid_cmap
+            .as_ref()?
+            .decode_text(code, length)?
+            .font_character()?;
+        self.character_gid(character)
+    }
+
     fn character_gid(&self, character: FontCharacter) -> Option<u16> {
         if character.variation_selector.is_none() {
             return unicode_lookup::lookup::<false>(self, character.character as u32)
@@ -1158,11 +1202,10 @@ impl LoadedFont {
                                                 gid,
                                                 cmap_budget,
                                             ) {
-                                                Some(true) => {
-                                                    EmbeddedGlyphHealthOutcome::Unreadable
-                                                }
-                                                Some(false) => {
-                                                    EmbeddedGlyphHealthOutcome::CodeDependentFallbackReadable
+                                                Some(unreadable) => {
+                                                    EmbeddedGlyphHealthOutcome::CodeDependentFallback {
+                                                        unreadable,
+                                                    }
                                                 }
                                                 None => EmbeddedGlyphHealthOutcome::Exhausted,
                                             }
@@ -1217,6 +1260,7 @@ impl LoadedFont {
                     out,
                     EmbeddedGlyphHealthOutcome::Unreadable
                         | EmbeddedGlyphHealthOutcome::CodeDependent { unreadable: true }
+                        | EmbeddedGlyphHealthOutcome::CodeDependentFallback { unreadable: true }
                 );
             },
         );
@@ -2690,19 +2734,21 @@ pub enum EmbeddedGlyphHealthOutcome {
     /// CAD repair, or confirmed non-visible blank). Safe to cache by GID.
     Readable,
     /// Physically unreadable outline record (missing, malformed header, failed
-    /// or empty visible Type 1 charstring, out-of-range GID, or cmap-proven
-    /// visible blank). Safe to cache by GID.
+    /// or empty visible Type 1 charstring, or out-of-range GID). Safe to cache
+    /// by GID.
     Unreadable,
     /// Physically blank record whose readability depends on the shown PDF code
     /// (Type 1 blank with `/ToUnicode` or TrueType valid-header nonempty
-    /// zero-contour record). Must not be cached as readable by GID alone.
+    /// zero-contour record resolved via direct PDF evidence). Must not be
+    /// cached as readable or unreadable by GID alone.
     CodeDependent { unreadable: bool },
     /// Nonempty zero-contour blank record whose reverse `cmap` probe confirmed
-    /// no visible Unicode mapping in the font's own `cmap`. Cached as a
-    /// readable fallback only for shown codes without direct PDF evidence, so
-    /// another source code sharing the same CID/GID with a `/ToUnicode`
-    /// mapping to visible text still triggers recovery.
-    CodeDependentFallbackReadable,
+    /// whether the font's own `cmap` maps a visible scalar (`unreadable: true`)
+    /// or only non-visible/absent scalars (`unreadable: false`) to this GID.
+    /// Cached only as a fallback for shown codes without direct PDF evidence,
+    /// so another source code sharing the same GID with an explicit `/ToUnicode`
+    /// mapping (either visible text or whitespace) still wins.
+    CodeDependentFallback { unreadable: bool },
     /// Reverse `cmap` probe exhausted its work budget before finding a mapping.
     /// Distinct from confirmed `Readable` and must not be cached.
     Exhausted,
@@ -3510,7 +3556,10 @@ impl FontCache {
         self.budget.record(&font, new_total);
         self.name_to_id.insert(name, id);
         self.fonts.insert(id, font);
-        if new_total != prev_total || self.budget.programs.len() != prev_programs {
+        if new_total != prev_total
+            || self.budget.programs.len() != prev_programs
+            || new_total.saturating_add(self.standby_bytes) > max_bytes
+        {
             self.reclaim_standby_for(new_total, max_bytes);
         }
         Some(id)

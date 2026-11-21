@@ -362,16 +362,16 @@ enum CachedGlyphHealth {
     /// by CAD repair).
     Readable,
     /// Physically unreadable outline record (missing, malformed header, failed
-    /// or empty visible Type 1 charstring, out-of-range GID, or cmap-proven
-    /// visible blank).
+    /// or empty visible Type 1 charstring, or out-of-range GID).
     Unreadable,
     /// Physically blank record whose readability depends on the shown PDF code
     /// (Type 1 blank with `/ToUnicode` or TrueType valid-header nonempty
-    /// zero-contour record). When `fallback_readable` is true, a reverse `cmap`
-    /// probe already confirmed no visible mapping in the font's own `cmap`, so
-    /// codes without direct PDF evidence resolve to readable without re-probing
-    /// while codes with direct `/ToUnicode` evidence still evaluate cleanly.
-    CodeDependentBlank { fallback_readable: bool },
+    /// zero-contour record). When `fallback` is `Some(unreadable)`, a reverse
+    /// `cmap` probe already determined whether the font's own `cmap` maps a
+    /// visible scalar to this GID, so codes without direct PDF evidence reuse
+    /// that fallback without re-probing while codes with direct `/ToUnicode`
+    /// evidence (visible text or explicit whitespace) still win.
+    CodeDependentBlank { fallback: Option<bool> },
 }
 
 /// Per-page cache of whether each shown glyph ID in an embedded font maps to a
@@ -382,6 +382,7 @@ struct EmbeddedGlyphHealth {
     known_low: [u64; 4],
     unreadable_low: [u64; 4],
     code_dep_low: [u64; 4],
+    fallback_known_low: [u64; 4],
     high: HashMap<u16, CachedGlyphHealth>,
     cmap_budget: usize,
 }
@@ -392,6 +393,7 @@ impl Default for EmbeddedGlyphHealth {
             known_low: [0; 4],
             unreadable_low: [0; 4],
             code_dep_low: [0; 4],
+            fallback_known_low: [0; 4],
             high: HashMap::new(),
             cmap_budget: zpdf_font::CMAP_PROBE_BUDGET,
         }
@@ -407,9 +409,9 @@ impl EmbeddedGlyphHealth {
                 return None;
             }
             if (self.code_dep_low[word] & bit) != 0 {
-                Some(CachedGlyphHealth::CodeDependentBlank {
-                    fallback_readable: (self.unreadable_low[word] & bit) != 0,
-                })
+                let fallback = ((self.fallback_known_low[word] & bit) != 0)
+                    .then_some((self.unreadable_low[word] & bit) != 0);
+                Some(CachedGlyphHealth::CodeDependentBlank { fallback })
             } else if (self.unreadable_low[word] & bit) != 0 {
                 Some(CachedGlyphHealth::Unreadable)
             } else {
@@ -429,18 +431,29 @@ impl EmbeddedGlyphHealth {
                 CachedGlyphHealth::Readable => {
                     self.unreadable_low[word] &= !bit;
                     self.code_dep_low[word] &= !bit;
+                    self.fallback_known_low[word] &= !bit;
                 }
                 CachedGlyphHealth::Unreadable => {
                     self.unreadable_low[word] |= bit;
                     self.code_dep_low[word] &= !bit;
+                    self.fallback_known_low[word] &= !bit;
                 }
-                CachedGlyphHealth::CodeDependentBlank { fallback_readable } => {
-                    if fallback_readable {
-                        self.unreadable_low[word] |= bit;
-                    } else {
-                        self.unreadable_low[word] &= !bit;
-                    }
+                CachedGlyphHealth::CodeDependentBlank { fallback } => {
                     self.code_dep_low[word] |= bit;
+                    match fallback {
+                        Some(unreadable) => {
+                            self.fallback_known_low[word] |= bit;
+                            if unreadable {
+                                self.unreadable_low[word] |= bit;
+                            } else {
+                                self.unreadable_low[word] &= !bit;
+                            }
+                        }
+                        None => {
+                            self.fallback_known_low[word] &= !bit;
+                            self.unreadable_low[word] &= !bit;
+                        }
+                    }
                 }
             }
         } else if self.high.len() < 4096 || self.high.contains_key(&gid) {
@@ -6402,12 +6415,14 @@ impl<'a> ContentInterpreter<'a> {
             match slot.and_then(|index| self.embedded_glyph_health[index].1.get(g.glyph_id)) {
                 Some(CachedGlyphHealth::Readable) => {}
                 Some(CachedGlyphHealth::Unreadable) => any_unreadable = true,
-                Some(CachedGlyphHealth::CodeDependentBlank { fallback_readable }) => {
+                Some(CachedGlyphHealth::CodeDependentBlank { fallback }) => {
                     if let Some(u) =
                         font.code_dependent_blank_is_unreadable(code, raw, length as u8)
                     {
                         any_unreadable |= u;
-                    } else if !fallback_readable {
+                    } else if let Some(u) = fallback {
+                        any_unreadable |= u;
+                    } else {
                         to_probe.push((g.glyph_id, code, raw, length as u8));
                     }
                 }
@@ -6432,25 +6447,25 @@ impl<'a> ContentInterpreter<'a> {
                             any_unreadable = true;
                         }
                         zpdf_font::EmbeddedGlyphHealthOutcome::CodeDependent { unreadable } => {
-                            let fallback_readable = matches!(
-                                health.get(gid),
-                                Some(CachedGlyphHealth::CodeDependentBlank {
-                                    fallback_readable: true
-                                })
-                            );
-                            health.set(
-                                gid,
-                                CachedGlyphHealth::CodeDependentBlank { fallback_readable },
-                            );
+                            let fallback = match health.get(gid) {
+                                Some(CachedGlyphHealth::CodeDependentBlank { fallback }) => {
+                                    fallback
+                                }
+                                _ => None,
+                            };
+                            health.set(gid, CachedGlyphHealth::CodeDependentBlank { fallback });
                             any_unreadable |= unreadable;
                         }
-                        zpdf_font::EmbeddedGlyphHealthOutcome::CodeDependentFallbackReadable => {
+                        zpdf_font::EmbeddedGlyphHealthOutcome::CodeDependentFallback {
+                            unreadable,
+                        } => {
                             health.set(
                                 gid,
                                 CachedGlyphHealth::CodeDependentBlank {
-                                    fallback_readable: true,
+                                    fallback: Some(unreadable),
                                 },
                             );
+                            any_unreadable |= unreadable;
                         }
                         // Exhausted probes remain uncached so they never mark
                         // later visible glyphs as confirmed readable.
@@ -6463,11 +6478,13 @@ impl<'a> ContentInterpreter<'a> {
                 font.classify_embedded_glyphs_with_codes(&to_probe, &mut cmap_budget, |_, out| {
                     match out {
                         zpdf_font::EmbeddedGlyphHealthOutcome::Unreadable => any_unreadable = true,
-                        zpdf_font::EmbeddedGlyphHealthOutcome::CodeDependent { unreadable } => {
+                        zpdf_font::EmbeddedGlyphHealthOutcome::CodeDependent { unreadable }
+                        | zpdf_font::EmbeddedGlyphHealthOutcome::CodeDependentFallback {
+                            unreadable,
+                        } => {
                             any_unreadable |= unreadable;
                         }
                         zpdf_font::EmbeddedGlyphHealthOutcome::Readable
-                        | zpdf_font::EmbeddedGlyphHealthOutcome::CodeDependentFallbackReadable
                         | zpdf_font::EmbeddedGlyphHealthOutcome::Exhausted => {}
                     }
                 });
@@ -6938,7 +6955,7 @@ impl<'a> ContentInterpreter<'a> {
                                             Some(CachedGlyphHealth::Readable) => Some(false),
                                             Some(CachedGlyphHealth::Unreadable) => Some(true),
                                             Some(CachedGlyphHealth::CodeDependentBlank {
-                                                fallback_readable,
+                                                fallback,
                                             }) => cache
                                                 .get(font_id)
                                                 .and_then(|f| {
@@ -6948,7 +6965,7 @@ impl<'a> ContentInterpreter<'a> {
                                                         length as u8,
                                                     )
                                                 })
-                                                .or_else(|| fallback_readable.then_some(false)),
+                                                .or(fallback),
                                             None => None,
                                         };
                                         (known, Some(&mut health.cmap_budget))

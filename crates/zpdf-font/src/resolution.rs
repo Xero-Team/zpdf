@@ -231,7 +231,7 @@ impl LoadedFont {
             parsed_face(self)
         };
         let mut cmap_budget = CMAP_PROBE_BUDGET;
-        let mut confirmed_blank_gid: Option<u16> = None;
+        let mut confirmed_blank_gids: crate::HashSet<u16> = crate::HashSet::new();
         glyphs
             .into_iter()
             .all(|(glyph_id, code, raw_code, length)| {
@@ -259,7 +259,7 @@ impl LoadedFont {
                         {
                             if let Some(face) = &face {
                                 if let Some(gid) = self.drawing_gid_with_face(glyph_id, face) {
-                                    if confirmed_blank_gid == Some(gid) {
+                                    if confirmed_blank_gids.contains(&gid) {
                                         return true;
                                     }
                                     if matches!(
@@ -269,7 +269,7 @@ impl LoadedFont {
                                     ) && cmap_maps_visible_to_gid(face, gid, &mut cmap_budget)
                                         == Ok(false)
                                     {
-                                        confirmed_blank_gid = Some(gid);
+                                        confirmed_blank_gids.insert(gid);
                                         return true;
                                     }
                                 }
@@ -1582,7 +1582,12 @@ impl FontCache {
                 }
             }
         };
-        let companion_gid = if matches!(companion.font_type, PdfFontType::Type0CidType2) {
+        let primary = self.fonts.get(&original.font_id)?;
+        let companion_gid = if matches!(primary.font_type, PdfFontType::Type0CidType2)
+            && matches!(kind, crate::CompanionKind::DescriptorSubstitute { .. })
+        {
+            companion.resolve_composite_substitute_gid(primary, code, raw_code, length)
+        } else if matches!(companion.font_type, PdfFontType::Type0CidType2) {
             if companion.unicode_coded() || companion.legacy_substitute() {
                 companion.composite_unicode_gid(code, raw_code, length)
             } else {
@@ -1710,27 +1715,20 @@ fn build_descriptor_substitute(
             Some(p) => p.find_font(lookup_name, spec.hints, spec.ordering),
             None => crate::system::find_system_font(lookup_name, spec.hints, spec.ordering),
         }?;
+        // Descriptor substitutes for Type 0 fonts are drawing-only faces whose
+        // physical GIDs are resolved per source code against `primary`'s
+        // `/ToUnicode` and `/Encoding` CMap (preserving original CID advances
+        // and avoiding hash-order collisions when multiple source codes share
+        // one damaged CID).
         let mut sub = LoadedFont::new_substitute(
-            PdfFontType::Type0CidType2,
+            PdfFontType::TrueType,
             primary.base_font.clone(),
             matched.data,
             matched.face_index,
-            primary.cid_widths.clone(),
+            CidWidths::new(1000.0),
         )?;
-        sub.cid_cmap = primary.cid_cmap.clone();
-        sub.dw2 = primary.dw2;
-        sub.to_unicode = primary.to_unicode.clone();
         sub.variations = primary.variations.clone();
-        sub.validate_cid_cmap();
-        sub.build_substitute_cid_to_gid();
-        let has_mapping = sub.unicode_coded()
-            || sub.legacy_substitute()
-            || sub.cid_cmap.as_ref().and_then(|c| c.collection()).is_some()
-            || sub
-                .cid_to_gid
-                .as_ref()
-                .is_some_and(|m| m.values().any(|&g| g != 0));
-        has_mapping.then_some(sub)
+        Some(sub)
     } else {
         let matched = match provider {
             Some(p) => p.find_font(lookup_name, spec.hints, None),
