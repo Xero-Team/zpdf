@@ -26,6 +26,45 @@ fn authoritative_lengths_four_byte_codes_and_vertical_overrides() {
 }
 
 #[test]
+fn plain_jis_h_and_v_resolve_through_adobe_japan1() {
+    // ISO 32000-1 Table 118: H and V take two-byte JIS X 0208 codes
+    // (<2121>–<7E7E>). They used to fall back to Identity.
+    let h = CidCMap::predefined("H").unwrap();
+    let v = CidCMap::predefined("V").unwrap();
+    assert!(h.is_authoritative() && v.is_authoritative());
+    assert_eq!(h.collection(), Some(CharacterCollection::Japan1));
+    assert_eq!(v.collection(), Some(CharacterCollection::Japan1));
+    assert_eq!((h.wmode, v.wmode), (0, 1));
+    assert_eq!(h.next_code(&[0x30, 0x21, 0x41]), (0x3021, 2));
+    // Ideographic space, あ and 亜.
+    assert_eq!(h.code_to_cid(0x2121, 2), 633);
+    assert_eq!(h.code_to_cid(0x2422, 2), 843);
+    assert_eq!(h.decode_to_unicode(0x2422, 2), Some(0x3042));
+    assert_eq!(h.code_to_cid(0x3021, 2), 1125);
+    assert_eq!(h.decode_to_unicode(0x3021, 2), Some(0x4E9C));
+    // V swaps in vertical forms, e.g. for the ideographic comma 、.
+    assert_eq!(h.code_to_cid(0x2122, 2), 634);
+    assert_eq!(v.code_to_cid(0x2122, 2), 7887);
+    assert_eq!(v.code_to_cid(0x3021, 2), 1125);
+    // Substituted fonts draw them through Unicode like the other legacy maps.
+    assert!(h.is_legacy() && v.is_legacy());
+
+    // Independent cross-check: H and V are the two-byte codes of EUC-H and
+    // EUC-V with the high bit of each byte cleared.
+    for (plain, euc) in [(&h, "EUC-H"), (&v, "EUC-V")] {
+        let euc = CidCMap::predefined(euc).unwrap();
+        let mut mapped = 0;
+        for code in (0x21..=0x7E).flat_map(|lead| (0x21..=0x7E).map(move |trail| lead << 8 | trail))
+        {
+            let cid = plain.code_to_cid(code, 2);
+            assert_eq!(cid, euc.code_to_cid(code | 0x8080, 2), "{code:#06x}");
+            mapped += usize::from(cid != 0);
+        }
+        assert_eq!(mapped, 6879);
+    }
+}
+
+#[test]
 fn inherited_resources_preserve_lengths_and_declaration_order() {
     let map = CidCMap::parse(
         b"/GBK2K-V usecmap /WMode 0 def
