@@ -30,15 +30,15 @@ const MAX_CMAP_HEX_BYTES: usize = 512;
 const MAX_CMAP_RANGE_CODES: usize = MAX_CMAP_ENTRIES * 4;
 const MAX_CMAP_WORD_BYTES: usize = 256;
 
-/// A parsed `/ToUnicode` CMap: maps a character code to its Unicode string.
+/// A parsed `/ToUnicode` CMap: maps a `(character_code, source_byte_len)` key
+/// to its Unicode string.
 #[derive(Debug, Clone, Default)]
 pub struct ToUnicodeMap {
-    map: HashMap<u32, String>,
+    /// Mappings keyed by `(source_value, source_byte_len)` so `<41>` (`(0x41, 1)`)
+    /// and `<0041>` (`(0x41, 2)`) coexist independently in mixed-width CMaps.
+    map: HashMap<(u32, u8), String>,
     /// Distinct source-code byte lengths declared in codespacerange.
     code_lengths: Vec<u8>,
-    /// Byte lengths of source keys written with leading zero bytes (`<0041>`),
-    /// which the numeric key alone would read as shorter codes.
-    padded_lengths: HashMap<u32, u8>,
     /// Codes assigned by `bfrange` so far (see [`MAX_CMAP_RANGE_CODES`]).
     range_codes: usize,
 }
@@ -46,7 +46,6 @@ pub struct ToUnicodeMap {
 impl ToUnicodeMap {
     pub(crate) fn estimated_cache_bytes(&self) -> u64 {
         let bytes = crate::estimated_map_bytes(&self.map)
-            .saturating_add(crate::estimated_map_bytes(&self.padded_lengths))
             .saturating_add(self.code_lengths.capacity() as u64);
         self.map.values().fold(bytes, |sum, text| {
             sum.saturating_add(text.capacity() as u64)
@@ -86,9 +85,12 @@ impl ToUnicodeMap {
         result
     }
 
-    /// Look up the Unicode string mapped to a character code.
+    /// Look up the Unicode string mapped to a character code without filtering
+    /// by source width, probing shortest-to-longest valid byte width
+    /// deterministically.
     pub fn lookup(&self, code: u32) -> Option<&str> {
-        self.map.get(&code).map(|s| s.as_str())
+        let natural = (4 - code.leading_zeros() / 8).max(1) as u8;
+        (natural..=4).find_map(|len| self.map.get(&(code, len)).map(String::as_str))
     }
 
     /// Returns true if no code mappings were parsed.
@@ -96,9 +98,16 @@ impl ToUnicodeMap {
         self.map.is_empty()
     }
 
-    /// Iterate over all (code, unicode string) mappings.
+    /// Iterate over all `(code, unicode string)` mappings.
     pub fn iter(&self) -> impl ExactSizeIterator<Item = (u32, &str)> {
-        self.map.iter().map(|(&code, s)| (code, s.as_str()))
+        self.map.iter().map(|(&(code, _), s)| (code, s.as_str()))
+    }
+
+    /// Iterate over all `(code, source_byte_len, unicode string)` mappings.
+    pub fn iter_with_lengths(&self) -> impl ExactSizeIterator<Item = (u32, u8, &str)> {
+        self.map
+            .iter()
+            .map(|(&(code, len), s)| (code, len, s.as_str()))
     }
 
     /// Distinct source-code byte lengths seen in `codespacerange` (e.g. `[2]`).
@@ -121,8 +130,12 @@ impl ToUnicodeMap {
             &[width] => usize::from(width),
             _ => 2,
         };
-        for code in bytes.chunks(width) {
-            if let Some(text) = self.lookup(bytes_to_code(code)) {
+        for chunk in bytes.chunks(width) {
+            let code = bytes_to_code(chunk);
+            if let Some(text) = self
+                .lookup_with_length(code, chunk.len() as u8)
+                .or_else(|| self.lookup(code))
+            {
                 out.push_str(text);
             }
         }
@@ -131,25 +144,21 @@ impl ToUnicodeMap {
     /// Source byte length of a mapped key written with leading zero bytes:
     /// `<0041>` is a two-byte code although its value fits in one byte.
     pub fn padded_length(&self, code: u32) -> Option<u8> {
-        self.padded_lengths.get(&code).copied()
-    }
-
-    /// Actual source byte length of a mapped key in this `/ToUnicode` table:
-    /// `padded_length(code)` when written with leading zero bytes (`<0041>` → 2),
-    /// otherwise the code's natural non-zero byte width (`<41>` → 1, `<4E2D>` → 2).
-    pub fn source_length(&self, code: u32) -> Option<u8> {
-        if !self.map.contains_key(&code) {
-            return None;
-        }
         let natural = (4 - code.leading_zeros() / 8).max(1) as u8;
-        Some(self.padded_lengths.get(&code).copied().unwrap_or(natural))
+        (natural + 1..=4).find(|&len| self.map.contains_key(&(code, len)))
     }
 
-    /// Look up the Unicode string mapped to `code` only when its `/ToUnicode`
-    /// source key has exact byte width `length`.
+    /// Shortest source byte length recorded for `code` in this `/ToUnicode`
+    /// table (`<41>` → 1, `<0041>` → 2, `<4E2D>` → 2).
+    pub fn source_length(&self, code: u32) -> Option<u8> {
+        let natural = (4 - code.leading_zeros() / 8).max(1) as u8;
+        (natural..=4).find(|&len| self.map.contains_key(&(code, len)))
+    }
+
+    /// Look up the Unicode string mapped to `(code, length)` (exact source
+    /// value and source byte width).
     pub fn lookup_with_length(&self, code: u32, length: u8) -> Option<&str> {
-        self.lookup(code)
-            .filter(|_| self.source_length(code) == Some(length))
+        self.map.get(&(code, length)).map(String::as_str)
     }
 
     fn record_code_length(&mut self, len: u8) {
@@ -159,14 +168,9 @@ impl ToUnicodeMap {
     }
 
     fn insert_mapping(&mut self, code: u32, len: u8, value: String) -> bool {
-        if self.map.len() < MAX_CMAP_ENTRIES || self.map.contains_key(&code) {
-            self.map.insert(code, value);
-            let width = (4 - code.leading_zeros() / 8).max(1) as u8;
-            if len > width {
-                self.padded_lengths.insert(code, len);
-            } else if !self.padded_lengths.is_empty() {
-                self.padded_lengths.remove(&code);
-            }
+        let key = (code, len);
+        if self.map.len() < MAX_CMAP_ENTRIES || self.map.contains_key(&key) {
+            self.map.insert(key, value);
             true
         } else {
             false
@@ -1514,8 +1518,46 @@ mod tests {
             map.insert_mapping(code, 4, "A".to_string());
         }
         assert_eq!(map.map.len(), MAX_CMAP_ENTRIES);
-        assert_eq!(map.padded_lengths.len(), MAX_CMAP_ENTRIES);
+        assert_eq!(map.lookup_with_length(0, 4), Some("A"));
+        assert_eq!(map.lookup_with_length(0, 1), None);
         assert!(map.lookup(MAX_CMAP_ENTRIES as u32).is_none());
+    }
+
+    #[test]
+    fn mixed_width_same_numeric_value_coexists_in_both_orders() {
+        let cases = [
+            (
+                "bfchar-short-then-long",
+                b"2 begincodespacerange <00> <FF> <0000> <FFFF> endcodespacerange\n\
+                  2 beginbfchar <41> <0041> <0041> <0042> endbfchar"
+                    .as_slice(),
+            ),
+            (
+                "bfchar-long-then-short",
+                b"2 begincodespacerange <00> <FF> <0000> <FFFF> endcodespacerange\n\
+                  2 beginbfchar <0041> <0042> <41> <0041> endbfchar"
+                    .as_slice(),
+            ),
+            (
+                "bfrange-short-then-long",
+                b"2 begincodespacerange <00> <FF> <0000> <FFFF> endcodespacerange\n\
+                  2 beginbfrange <41> <41> <0041> <0041> <0041> <0042> endbfrange"
+                    .as_slice(),
+            ),
+            (
+                "bfrange-long-then-short",
+                b"2 begincodespacerange <00> <FF> <0000> <FFFF> endcodespacerange\n\
+                  2 beginbfrange <0041> <0041> <0042> <41> <41> <0041> endbfrange"
+                    .as_slice(),
+            ),
+        ];
+        for (label, raw) in cases {
+            let map = ToUnicodeMap::parse(raw);
+            assert_eq!(map.lookup_with_length(0x41, 1), Some("A"), "{label}");
+            assert_eq!(map.lookup_with_length(0x41, 2), Some("B"), "{label}");
+            assert_eq!(map.lookup_with_length(0x41, 3), None, "{label}");
+            assert_eq!(map.padded_length(0x41), Some(2), "{label}");
+        }
     }
 
     #[test]

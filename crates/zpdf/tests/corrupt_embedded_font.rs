@@ -6574,11 +6574,14 @@ fn type0_mixed_width_cmap_matches_tounicode_by_source_width_in_both_directions()
         .register_with_aliases(PRIMARY_TTF, 0, &["MixedWidthPrimarySubFace"])
         .unwrap();
 
-    // Cover BOTH directions of `/ToUnicode` width matching:
+    // Cover BOTH directions AND both widths present in one `/ToUnicode` CMap
+    // in either declaration order:
     // 1. Short-only `<41> -> 'A'`: 1-byte `<41>` draws/extracts 'A', while
     //    2-byte `<0041>` must NOT match `<41>` and resolves via CID 35 -> 'B'.
     // 2. Long-only `<0041> -> 'A'`: 1-byte `<41>` must NOT match `<0041>` and
     //    resolves via CID 36 -> 'C', while 2-byte `<0041>` draws/extracts 'A'.
+    // 3. Both `<41> -> 'A'` and `<0041> -> 'B'` declared in the same CMap
+    //    (short-then-long AND long-then-short): neither overwrites the other.
     for (dir_label, to_unicode, expected_gids, expected_text) in [
         (
             "short-only",
@@ -6599,6 +6602,26 @@ fn type0_mixed_width_cmap_matches_tounicode_by_source_width_in_both_directions()
                 .as_slice(),
             [gid_c, gid_a],
             "CA",
+        ),
+        (
+            "both-short-then-long",
+            b"/CIDInit /ProcSet findresource begin 12 dict begin begincmap \
+              2 begincodespacerange <00> <FF> <0000> <FFFF> endcodespacerange \
+              2 beginbfchar <41> <0041> <0041> <0042> endbfchar \
+              endcmap CMapName currentdict /CMap defineresource pop end end"
+                .as_slice(),
+            [gid_a, gid_b],
+            "AB",
+        ),
+        (
+            "both-long-then-short",
+            b"/CIDInit /ProcSet findresource begin 12 dict begin begincmap \
+              2 begincodespacerange <00> <FF> <0000> <FFFF> endcodespacerange \
+              2 beginbfchar <0041> <0042> <41> <0041> endbfchar \
+              endcmap CMapName currentdict /CMap defineresource pop end end"
+                .as_slice(),
+            [gid_a, gid_b],
+            "AB",
         ),
     ] {
         for (src_label, font_file_obj) in [

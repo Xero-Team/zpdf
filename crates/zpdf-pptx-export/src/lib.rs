@@ -1188,4 +1188,167 @@ mod export_tests {
             );
         }
     }
+
+    #[test]
+    fn mixed_width_tounicode_with_both_widths_exports_same_text_in_both_orders() {
+        use std::sync::Arc;
+        use zpdf_font::{CidWidths, FontProvider, LoadedFont, PdfFontType};
+
+        const PRIMARY_TTF: &[u8] =
+            include_bytes!("../../zpdf-font/tests/fixtures/coverage-primary.ttf");
+
+        let probe = LoadedFont::new_with_data(
+            PdfFontType::TrueType,
+            "Probe".into(),
+            PRIMARY_TTF.to_vec(),
+            CidWidths::new(1000.0),
+        );
+        let gid_a = probe.unicode_glyph('A' as u32).unwrap().0;
+        let gid_b = probe.unicode_glyph('B' as u32).unwrap().0;
+        assert_ne!(gid_a, gid_b);
+
+        let stream = |dict: &str, bytes: &[u8]| -> Vec<u8> {
+            let mut out = format!("<< {dict} /Length {} >>\nstream\n", bytes.len()).into_bytes();
+            out.extend_from_slice(bytes);
+            out.extend_from_slice(b"\nendstream");
+            out
+        };
+        let assemble = |objects: &[Vec<u8>]| -> Vec<u8> {
+            let mut pdf = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n".to_vec();
+            let mut offsets = Vec::with_capacity(objects.len());
+            for (idx, body) in objects.iter().enumerate() {
+                offsets.push(pdf.len());
+                pdf.extend_from_slice(format!("{} 0 obj\n", idx + 1).as_bytes());
+                pdf.extend_from_slice(body);
+                pdf.extend_from_slice(b"\nendobj\n");
+            }
+            let xref = pdf.len();
+            let count = objects.len() + 1;
+            pdf.extend_from_slice(format!("xref\n0 {count}\n0000000000 65535 f \n").as_bytes());
+            for off in offsets {
+                pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+            }
+            pdf.extend_from_slice(
+                format!("trailer\n<< /Size {count} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n")
+                    .as_bytes(),
+            );
+            pdf
+        };
+
+        let mixed_cmap = b"/CIDInit /ProcSet findresource begin 12 dict begin begincmap \
+            /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> def \
+            /CMapName /PptxMixedWidth def /CMapType 1 def \
+            2 begincodespacerange <20> <7E> <0000> <1FFF> endcodespacerange \
+            2 begincidchar <41> 1 <0041> 2 endcidchar \
+            endcmap CMapName currentdict /CMap defineresource pop end end";
+
+        let provider = Arc::new(FontProvider::memory_only());
+        provider
+            .register_with_aliases(PRIMARY_TTF, 0, &["PptxMixedWidthFace"])
+            .unwrap();
+
+        for (label, to_unicode) in [
+            (
+                "short-then-long",
+                b"/CIDInit /ProcSet findresource begin 12 dict begin begincmap \
+                  2 begincodespacerange <00> <FF> <0000> <FFFF> endcodespacerange \
+                  2 beginbfchar <41> <0041> <0041> <0042> endbfchar \
+                  endcmap CMapName currentdict /CMap defineresource pop end end"
+                    .as_slice(),
+            ),
+            (
+                "long-then-short",
+                b"/CIDInit /ProcSet findresource begin 12 dict begin begincmap \
+                  2 begincodespacerange <00> <FF> <0000> <FFFF> endcodespacerange \
+                  2 beginbfchar <0041> <0042> <41> <0041> endbfchar \
+                  endcmap CMapName currentdict /CMap defineresource pop end end"
+                    .as_slice(),
+            ),
+        ] {
+            let pdf = assemble(&[
+                b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+                b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] \
+                  /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
+                    .to_vec(),
+                stream("", b"0 0 0 rg BT /F1 18 Tf 20 50 Td <410041> Tj ET"),
+                b"<< /Type /Font /Subtype /Type0 /BaseFont /ABCDEF+PptxMixedWidthFace \
+                  /Encoding 9 0 R /DescendantFonts [6 0 R] /ToUnicode 10 0 R >>"
+                    .to_vec(),
+                b"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /ABCDEF+PptxMixedWidthFace \
+                  /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> \
+                  /CIDToGIDMap /Identity /FontDescriptor 7 0 R /DW 600 >>"
+                    .to_vec(),
+                b"<< /Type /FontDescriptor /FontName /ABCDEF+PptxMixedWidthFace /Flags 32 /FontFile2 8 0 R >>"
+                    .to_vec(),
+                stream("", b"corrupt unparseable truetype bytes"),
+                stream("", mixed_cmap),
+                stream("", to_unicode),
+            ]);
+
+            let doc = zpdf_document::PdfDocument::open(pdf)
+                .unwrap()
+                .with_font_provider(Arc::clone(&provider));
+            let page = doc.page(0).unwrap();
+            let mut fonts = doc.load_page_fonts(&page);
+            let (content, _) = doc.page_content_with_diagnostics(&page).unwrap();
+            let mut images = ImageCache::new();
+            let mut extracted = Vec::new();
+            let interpreter =
+                zpdf_content::interpreter::ContentInterpreter::new(page.effective_box())
+                    .with_document(doc.file(), &page.resources)
+                    .with_fonts(&mut fonts)
+                    .with_shared_fonts(&doc)
+                    .with_images(&mut images)
+                    .with_text_sink(&mut extracted);
+            let (display_list, _) = interpreter.interpret_with_stats(&content);
+
+            let extracted_text: String = extracted.iter().map(|s| s.text.as_str()).collect();
+            assert_eq!(
+                extracted_text, "AB",
+                "{label}: text extraction must preserve both <41> and <0041> in one /ToUnicode"
+            );
+
+            let runs: Vec<_> = display_list
+                .commands
+                .iter()
+                .filter_map(|cmd| match cmd {
+                    RenderCommand::DrawGlyphRun(run) => Some(run),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(runs.len(), 1, "{label}");
+            assert_eq!(
+                [runs[0].glyphs[0].glyph_id, runs[0].glyphs[1].glyph_id],
+                [gid_a, gid_b],
+                "{label}: physical glyphs must follow <41>->A and <0041>->B regardless of order"
+            );
+            assert_eq!(
+                [runs[0].glyphs[0].code_len, runs[0].glyphs[1].code_len],
+                [1, 2],
+                "{label}"
+            );
+
+            let slide = display_list_to_slide(
+                &display_list,
+                0,
+                &fonts,
+                &images,
+                &ConversionOptions::default(),
+            )
+            .expect("slide export");
+            let slide_text: String = slide
+                .elements
+                .iter()
+                .filter_map(|e| match e {
+                    SlideElement::TextBox { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                slide_text, "AB",
+                "{label}: PPTX slide export must preserve both <41> and <0041> regardless of declaration order"
+            );
+        }
+    }
 }

@@ -6603,7 +6603,9 @@ impl<'a> ContentInterpreter<'a> {
                 };
                 return bytes.chunks(width).all(|chunk| {
                     let code = chunk.iter().fold(0u32, |v, &b| (v << 8) | b as u32);
-                    map.lookup(code).is_some_and(|s| !s.is_empty())
+                    map.lookup_with_length(code, chunk.len() as u8)
+                        .or_else(|| map.lookup(code))
+                        .is_some_and(|s| !s.is_empty())
                 });
             }
         }
@@ -6938,7 +6940,10 @@ impl<'a> ContentInterpreter<'a> {
             let key = (code, raw, length, original.glyph_id);
             // Adjacent repeats share a resolution within this positioned text
             // operation. Later operations still observe provider generation.
-            let suspicious = repair && repairs.is_suspicious(font_id, original.glyph_id);
+            let suspicious = repair
+                && cache.get(font_id).is_some_and(|font| {
+                    repairs.is_suspicious(font_id, font, original.glyph_id, code, raw, length as u8)
+                });
             let drawing = match previous {
                 Some((previous_key, drawing)) if previous_key == key => drawing,
                 _ => {

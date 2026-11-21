@@ -363,10 +363,7 @@ impl LoadedFont {
     /// Whether a blank glyph is right for this code: the font's meaning for it is
     /// known and is whitespace or invisible.
     fn blank_is_space(&self, code: u32, raw_code: u32, length: u8) -> bool {
-        let text = self
-            .to_unicode
-            .as_ref()
-            .and_then(|map| map.lookup(raw_code).or_else(|| map.lookup(code)));
+        let text = self.lookup_to_unicode(code, raw_code, length);
         match text {
             Some(text) => !is_visible_text(text),
             None => self

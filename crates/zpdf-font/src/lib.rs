@@ -506,15 +506,22 @@ impl LoadedFont {
             .as_ref()
             .and_then(|cm| cm.collection())
             .is_some();
-        for (code, s) in to_unicode.iter().flat_map(|tu| tu.iter()) {
+        for (code, len, s) in to_unicode.iter().flat_map(|tu| tu.iter_with_lengths()) {
             // glyph_outline receives CIDs, so key the map by CID — under a
             // non-Identity encoding CMap, or an Identity base with explicit
             // overrides, the code is not the CID.
             let cid = match &self.cid_cmap {
                 Some(cm) if !cm.identity || cm.has_explicit_cids() => {
-                    cm.source_key_to_cid(code, to_unicode.and_then(|tu| tu.source_length(code)))
+                    cm.source_key_to_cid(code, Some(len))
                 }
-                _ => code,
+                _ => {
+                    if len != 2
+                        && to_unicode.is_some_and(|tu| tu.lookup_with_length(code, 2).is_some())
+                    {
+                        continue;
+                    }
+                    code
+                }
             };
             if cid == 0 || cid > u16::MAX as u32 {
                 continue;
@@ -715,19 +722,22 @@ impl LoadedFont {
             return false;
         };
         let to_unicode = to_unicode.or(self.to_unicode.as_ref());
-        to_unicode.iter().flat_map(|tu| tu.iter()).any(|(code, s)| {
-            let cid = match &self.cid_cmap {
-                Some(cm) if !cm.identity || cm.has_explicit_cids() => {
-                    cm.source_key_to_cid(code, to_unicode.and_then(|tu| tu.source_length(code)))
-                }
-                _ => code,
-            };
-            cid != 0
-                && cid <= u16::MAX as u32
-                && FontCharacter::from_text(s)
-                    .and_then(|ch| ch.mapped_glyph_index(&face))
-                    .is_some_and(|gid| gid != 0)
-        })
+        to_unicode
+            .iter()
+            .flat_map(|tu| tu.iter_with_lengths())
+            .any(|(code, len, s)| {
+                let cid = match &self.cid_cmap {
+                    Some(cm) if !cm.identity || cm.has_explicit_cids() => {
+                        cm.source_key_to_cid(code, Some(len))
+                    }
+                    _ => code,
+                };
+                cid != 0
+                    && cid <= u16::MAX as u32
+                    && FontCharacter::from_text(s)
+                        .and_then(|ch| ch.mapped_glyph_index(&face))
+                        .is_some_and(|gid| gid != 0)
+            })
     }
 
     /// Downgrade a Unicode-coded CMap to Identity when the font program has
@@ -776,7 +786,9 @@ impl LoadedFont {
             map.lookup_with_length(raw_code, length)
                 .or_else(|| (code != raw_code).then(|| map.lookup(code)).flatten())
         } else {
-            map.lookup(raw_code).or_else(|| map.lookup(code))
+            map.lookup_with_length(raw_code, length)
+                .or_else(|| map.lookup(raw_code))
+                .or_else(|| (code != raw_code).then(|| map.lookup(code)).flatten())
         }
     }
 
@@ -1530,7 +1542,10 @@ impl LoadedFont {
             if let Some(gid) = self
                 .to_unicode
                 .as_ref()
-                .and_then(|map| map.lookup(code as u32))
+                .and_then(|map| {
+                    map.lookup_with_length(code as u32, 1)
+                        .or_else(|| map.lookup(code as u32))
+                })
                 .and_then(FontCharacter::from_text)
                 .and_then(|ch| ch.mapped_glyph_index(&face))
             {
