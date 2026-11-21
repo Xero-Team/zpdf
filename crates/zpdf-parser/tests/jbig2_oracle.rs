@@ -1050,14 +1050,26 @@ fn segment(number: u32, seg_type: u8, referred: &[u32], page: u8, payload: &[u8]
     out
 }
 
-fn page_info_payload(width: u32, height: u32, flags: u8) -> Vec<u8> {
+// Page information flags (T.88 7.4.8.5) and striping flag (T.88 7.4.8.6).
+const PAGE_EVENTUALLY_LOSSLESS: u8 = 1 << 0;
+const PAGE_MIGHT_CONTAIN_REFINEMENTS: u8 = 1 << 1;
+const PAGE_DEFAULT_BLACK: u8 = 1 << 2;
+const PAGE_REQUIRES_AUX_BUFFERS: u8 = 1 << 5;
+const PAGE_COMB_OP_OVERRIDDEN: u8 = 1 << 6;
+const PAGE_STRIPED: u16 = 1 << 15;
+
+fn page_info_payload_striped(width: u32, height: u32, flags: u8, striping: u16) -> Vec<u8> {
     let mut p = Vec::new();
     p.extend_from_slice(&width.to_be_bytes());
     p.extend_from_slice(&height.to_be_bytes());
     p.extend_from_slice(&[0; 8]);
     p.push(flags);
-    p.extend_from_slice(&[0, 0]);
+    p.extend_from_slice(&striping.to_be_bytes());
     p
+}
+
+fn page_info_payload(width: u32, height: u32, flags: u8) -> Vec<u8> {
+    page_info_payload_striped(width, height, flags, 0)
 }
 
 fn region_info(w: u32, h: u32, x: u32, y: u32, op: u8) -> Vec<u8> {
@@ -1249,7 +1261,7 @@ fn oracle_polarity_and_non_byte_aligned_widths() {
                     }
                 }
             }
-            let page_flags = default_pixel << 2;
+            let page_flags = (default_pixel << 2) | PAGE_COMB_OP_OVERRIDDEN;
             let mut stream = segment(
                 0,
                 48,
@@ -1326,12 +1338,17 @@ fn oracle_generic_regions_all_templates_tpgdon_and_custom_at() {
     for template in 0..4u8 {
         for tpgdon in [false, true] {
             for seg_type in [38u8, 39u8] {
+                let page_flags = if seg_type == 39 {
+                    PAGE_EVENTUALLY_LOSSLESS
+                } else {
+                    0
+                };
                 let mut stream = segment(
                     0,
                     48,
                     &[],
                     1,
-                    &page_info_payload(bm.width as u32, bm.height as u32, 0),
+                    &page_info_payload(bm.width as u32, bm.height as u32, page_flags),
                 );
                 stream.extend_from_slice(&segment(
                     1,
@@ -1410,7 +1427,13 @@ fn oracle_mmr_generic_region() {
     let mut offset_payload = region_info(8, 2, 3, 1, 2); // XOR at (3, 1)
     offset_payload.push(0x01);
     offset_payload.extend_from_slice(&[0x31, 0xF8]);
-    let mut stream = segment(0, 48, &[], 1, &page_info_payload(13, 4, 0x04));
+    let mut stream = segment(
+        0,
+        48,
+        &[],
+        1,
+        &page_info_payload(13, 4, PAGE_DEFAULT_BLACK | PAGE_COMB_OP_OVERRIDDEN),
+    );
     stream.extend_from_slice(&segment(1, 38, &[], 1, &offset_payload));
     assert_oracle_match("mmr offset xor on black bg", &stream, None);
 }
@@ -1429,7 +1452,8 @@ fn oracle_multi_region_combination_operators_and_clipping() {
 
     for default_pixel in [0u8, 1u8] {
         for op in 0..=4u8 {
-            let mut stream = segment(0, 48, &[], 1, &page_info_payload(12, 6, default_pixel << 2));
+            let page_flags = (default_pixel << 2) | PAGE_COMB_OP_OVERRIDDEN;
+            let mut stream = segment(0, 48, &[], 1, &page_info_payload(12, 6, page_flags));
             stream.extend_from_slice(&segment(
                 1,
                 38,
@@ -1459,7 +1483,14 @@ fn oracle_multi_region_combination_operators_and_clipping() {
 fn oracle_striped_auto_height_page_with_end_of_stripe() {
     let top = Bitmap::from_art(&["#..#..#.", ".##..##."]);
     let bottom = Bitmap::from_art(&["########", "........", "..####.."]);
-    let mut stream = segment(0, 48, &[], 1, &page_info_payload(8, 0xFFFF_FFFF, 0));
+    // T.88 7.4.8.6: mark the page striped with maximum stripe size 3 rows.
+    let mut stream = segment(
+        0,
+        48,
+        &[],
+        1,
+        &page_info_payload_striped(8, 0xFFFF_FFFF, 0, PAGE_STRIPED | 3),
+    );
     stream.extend_from_slice(&segment(
         1,
         38,
@@ -1560,7 +1591,11 @@ fn oracle_refinement_regions_templates_tpgron_and_intermediate() {
                 48,
                 &[],
                 1,
-                &page_info_payload(initial.width as u32, initial.height as u32, 0),
+                &page_info_payload(
+                    initial.width as u32,
+                    initial.height as u32,
+                    PAGE_MIGHT_CONTAIN_REFINEMENTS | PAGE_COMB_OP_OVERRIDDEN,
+                ),
             );
             stream.extend_from_slice(&segment(
                 1,
@@ -1578,19 +1613,27 @@ fn oracle_refinement_regions_templates_tpgron_and_intermediate() {
             assert_eq!(img.pixels, target.data);
 
             // (b) Refine a referred intermediate generic region (seg 36 -> seg 42).
+            // T.88 7.4.7.5: the referred intermediate region and refinement
+            // region share dimensions, location, and external operator.
             let mut stream = segment(
                 0,
                 48,
                 &[],
                 1,
-                &page_info_payload(initial.width as u32, initial.height as u32, 0),
+                &page_info_payload(
+                    initial.width as u32,
+                    initial.height as u32,
+                    PAGE_MIGHT_CONTAIN_REFINEMENTS
+                        | PAGE_REQUIRES_AUX_BUFFERS
+                        | PAGE_COMB_OP_OVERRIDDEN,
+                ),
             );
             stream.extend_from_slice(&segment(
                 1,
                 36, // intermediate generic region
                 &[],
                 1,
-                &generic_region_payload(&initial, 0, 0, 0, 0, false),
+                &generic_region_payload(&initial, 0, 0, 4, 0, false),
             ));
             stream.extend_from_slice(&segment(2, 42, &[1], 1, &ref_payload));
             let img = assert_oracle_match_strict(
@@ -1602,20 +1645,19 @@ fn oracle_refinement_regions_templates_tpgron_and_intermediate() {
         }
     }
 
-    // (c) Non-zero reference offset between referred intermediate region at
-    // (1, 1) and refinement region at (3, 2) with custom template-0 AT pixels
-    // and external XOR operator onto a pre-populated page.
+    // (c) Referred intermediate region and immediate refinement region at a
+    // non-zero page location (3, 2) with matching dimensions, origin, and
+    // external XOR operator per T.88 7.4.7.5 / Table 38 (dx=0, dy=0), using
+    // custom template-0 AT pixels onto a pre-populated page.
     let custom_at = [(-2i8, 0i8), (1i8, -1i8)];
+    let sub_initial = Bitmap::from_art(&[".###.", ".###.", ".###.", "....."]);
     let sub_target = Bitmap::from_art(&["#####", "#.#.#", "###.#", "..###"]);
-    let (inter_x, inter_y) = (1u32, 1u32);
-    let (ref_x, ref_y) = (3u32, 2u32);
-    let dx = inter_x as i32 - ref_x as i32; // -2
-    let dy = inter_y as i32 - ref_y as i32; // -1
+    let (reg_x, reg_y) = (3u32, 2u32);
     let mut ref_payload = region_info(
         sub_target.width as u32,
         sub_target.height as u32,
-        ref_x,
-        ref_y,
+        reg_x,
+        reg_y,
         2, // XOR onto page
     );
     ref_payload.push(0x00); // template 0, TPGRON = 0
@@ -1629,24 +1671,34 @@ fn oracle_refinement_regions_templates_tpgron_and_intermediate() {
         &mut enc,
         &mut cx,
         &sub_target,
-        &initial,
+        &sub_initial,
         0,
         false,
         &custom_at,
-        dx,
-        dy,
+        0,
+        0,
     );
     ref_payload.extend_from_slice(&enc.finish());
 
-    let mut stream = segment(0, 48, &[], 1, &page_info_payload(12, 9, 0));
+    let mut stream = segment(
+        0,
+        48,
+        &[],
+        1,
+        &page_info_payload(
+            12,
+            9,
+            PAGE_MIGHT_CONTAIN_REFINEMENTS | PAGE_REQUIRES_AUX_BUFFERS | PAGE_COMB_OP_OVERRIDDEN,
+        ),
+    );
     stream.extend_from_slice(&segment(
         1,
         36,
         &[],
         1,
-        &generic_region_payload(&initial, inter_x, inter_y, 0, 0, false),
+        &generic_region_payload(&sub_initial, reg_x, reg_y, 2, 0, false),
     ));
-    // Paint a checkerboard on the page so XOR composition is observable.
+    // Paint background ink on the page so XOR composition is observable.
     stream.extend_from_slice(&segment(
         2,
         38,
@@ -1656,7 +1708,7 @@ fn oracle_refinement_regions_templates_tpgron_and_intermediate() {
     ));
     stream.extend_from_slice(&segment(3, 42, &[1], 1, &ref_payload));
     assert_oracle_match_strict(
-        "refine-intermediate non-zero offset + custom AT + XOR",
+        "refine-intermediate matching origin (3,2) + custom AT + XOR",
         &stream,
         None,
     );
@@ -1873,7 +1925,13 @@ fn oracle_symbol_dict_refagg_and_text_per_instance_refinement() {
 
     let mut globals = segment(1, 0, &[], 0, &symbol_dict_payload(&[&base], 0));
     globals.extend_from_slice(&segment(2, 0, &[1], 0, &sd));
-    let mut page = segment(3, 48, &[], 1, &page_info_payload(16, 6, 0));
+    let mut page = segment(
+        3,
+        48,
+        &[],
+        1,
+        &page_info_payload(16, 6, PAGE_MIGHT_CONTAIN_REFINEMENTS),
+    );
     page.extend_from_slice(&segment(4, 6, &[2], 1, &tr));
 
     assert_oracle_match_strict(
@@ -2036,7 +2094,13 @@ fn oracle_huffman_symbol_dict_mmr_and_uncompressed_and_huffman_text_refinement()
     let mut globals = segment(1, 0, &[], 0, &sd_mmr);
     globals.extend_from_slice(&segment(2, 0, &[], 0, &sd_raw));
     globals.extend_from_slice(&segment(3, 53, &[], 0, &custom_tab));
-    let mut page = segment(4, 48, &[], 1, &page_info_payload(16, 8, 0));
+    let mut page = segment(
+        4,
+        48,
+        &[],
+        1,
+        &page_info_payload(16, 8, PAGE_MIGHT_CONTAIN_REFINEMENTS),
+    );
     page.extend_from_slice(&segment(5, 6, &[1, 2, 3], 1, &tr));
 
     assert_oracle_match(
@@ -2166,6 +2230,62 @@ fn oracle_pattern_dict_and_halftone_regions() {
         &page,
         Some(&globals),
     );
+
+    // Clipped arithmetic halftone grid with ENABLE_SKIP = 1 whose full
+    // `grid_cells * hbpp` (256 * 256 * 2 = 131_072) exceeds `mq_iteration_budget`
+    // for the tiny MQ payload, while its 4 coded (unskipped) cells fit easily.
+    // Must decode identically to hayro-jbig2 rather than failing blank.
+    let (big_hgw, big_hgh) = (256usize, 256usize);
+    let mut clipped_ht = region_info(4, 4, 0, 0, 0);
+    clipped_ht.push(0x08); // MMR=0, template=0, ENABLE_SKIP=1, OR, def_pixel=0
+    clipped_ht.extend_from_slice(&(big_hgw as u32).to_be_bytes());
+    clipped_ht.extend_from_slice(&(big_hgh as u32).to_be_bytes());
+    clipped_ht.extend_from_slice(&0u32.to_be_bytes()); // HGX = 0
+    clipped_ht.extend_from_slice(&0u32.to_be_bytes()); // HGY = 0
+    clipped_ht.extend_from_slice(&(2u16 << 8).to_be_bytes()); // HRX = 2.0
+    clipped_ht.extend_from_slice(&0u16.to_be_bytes()); // HRY = 0
+
+    let mut skip = Bitmap::new(big_hgw, big_hgh, 1);
+    for m in 0..2 {
+        for n in 0..2 {
+            skip.set(n, m, 0);
+        }
+    }
+    let visible_gray = [[1u32, 2], [3, 0]];
+    let mut enc = MqEncoder::new();
+    let mut cx = vec![0u8; 1 << 16];
+    let at = [(3i8, -1i8), (-3, -1), (2, -2), (-2, -2)];
+    for j in (0..2usize).rev() {
+        let mut plane = Bitmap::new(big_hgw, big_hgh, 0);
+        for (m, row) in visible_gray.iter().enumerate() {
+            for (n, &v) in row.iter().enumerate() {
+                let g = v ^ (v >> 1);
+                if (g >> j) & 1 == 1 {
+                    plane.set(n, m, 1);
+                }
+            }
+        }
+        encode_generic_with_skip(&mut enc, &mut cx, &plane, 0, false, &at, Some(&skip));
+    }
+    let mq_bytes = enc.finish();
+    assert!(
+        mq_bytes.len() * 8 * 1024 < big_hgw * big_hgh * 2,
+        "fixture must exceed naive grid_cells * hbpp MQ budget ({} bytes)",
+        mq_bytes.len()
+    );
+    clipped_ht.extend_from_slice(&mq_bytes);
+
+    let globals = segment(1, 16, &[], 0, &pd);
+    let mut page = segment(2, 48, &[], 1, &page_info_payload(4, 4, 0));
+    page.extend_from_slice(&segment(3, 22, &[1], 1, &clipped_ht));
+    let img = assert_oracle_match_strict(
+        "clipped halftone grid coded-cells MQ budget",
+        &page,
+        Some(&globals),
+    );
+    // Non-blank verification: cells (0,0)=p1, (1,0)=p2, (0,1)=p3, (1,1)=p0.
+    let expected = Bitmap::from_art(&["#.#.", "...#", "##..", "##.."]);
+    assert_eq!(img.pixels, expected.data);
 }
 
 // ---------------------------------------------------------------------------
@@ -2320,6 +2440,28 @@ fn extract_jbig2_inputs(file: &PdfFile, id: ObjectId) -> Option<(Vec<u8>, Option
     };
     let jbig2_idx = filters.iter().position(|f| f == "JBIG2Decode")?;
 
+    // Resolve positional /DecodeParms (falling back to /DP only when
+    // /DecodeParms is absent, matching zpdf_parser::filters).
+    let parms_raw = stream
+        .dict
+        .get("DecodeParms")
+        .or_else(|| stream.dict.get("DP"))
+        .and_then(|o| resolve_dict_entry(file, o));
+    let mut resolved_parms: Vec<Option<PdfDict>> = vec![None; filters.len()];
+    match parms_raw {
+        Some(PdfObject::Dict(d)) if !resolved_parms.is_empty() => {
+            resolved_parms[0] = Some(d);
+        }
+        Some(PdfObject::Array(arr)) => {
+            for (slot, entry) in resolved_parms.iter_mut().zip(arr.iter()) {
+                if let Some(PdfObject::Dict(d)) = resolve_dict_entry(file, entry) {
+                    *slot = Some(d);
+                }
+            }
+        }
+        _ => {}
+    }
+
     let raw_jbig2 = if jbig2_idx == 0 {
         stream.data.to_vec()
     } else {
@@ -2333,25 +2475,24 @@ fn extract_jbig2_inputs(file: &PdfFile, id: ObjectId) -> Option<(Vec<u8>, Option
                     .collect(),
             ),
         );
+        if resolved_parms[..jbig2_idx].iter().any(Option::is_some) {
+            prefix_dict.insert(
+                PdfName::new("DecodeParms"),
+                PdfObject::Array(
+                    resolved_parms[..jbig2_idx]
+                        .iter()
+                        .map(|p| match p {
+                            Some(d) => PdfObject::Dict(d.clone()),
+                            None => PdfObject::Null,
+                        })
+                        .collect(),
+                ),
+            );
+        }
         decode_stream_with_limits(&stream.data, &prefix_dict, &ParseLimits::default()).ok()?
     };
 
-    let parms_obj = stream
-        .dict
-        .get("DecodeParms")
-        .or_else(|| stream.dict.get("DP"))
-        .and_then(|o| resolve_dict_entry(file, o));
-    let jbig2_parms = match parms_obj {
-        Some(PdfObject::Dict(d)) if jbig2_idx == 0 => Some(d),
-        Some(PdfObject::Array(arr)) => arr
-            .get(jbig2_idx)
-            .and_then(|o| resolve_dict_entry(file, o))
-            .and_then(|o| match o {
-                PdfObject::Dict(d) => Some(d),
-                _ => None,
-            }),
-        _ => None,
-    };
+    let jbig2_parms = resolved_parms.get(jbig2_idx).and_then(|p| p.as_ref());
     let globals = jbig2_parms.and_then(|d| match d.get("JBIG2Globals") {
         Some(PdfObject::Ref(r)) => file.resolve_stream_data(*r).ok(),
         Some(PdfObject::String(s)) => Some(s.0.clone()),
@@ -2360,6 +2501,111 @@ fn extract_jbig2_inputs(file: &PdfFile, id: ObjectId) -> Option<(Vec<u8>, Option
     });
 
     Some((raw_jbig2, globals))
+}
+
+#[test]
+fn oracle_extract_jbig2_inputs_preserves_prefix_decode_parms() {
+    // Build a valid 72-byte (9 x 8) JBIG2 stream + globals, encode the JBIG2
+    // bytes with PNG Up predictor (Predictor=12, Columns=8) + FlateDecode, and
+    // wrap in a PDF with `/Filter [/FlateDecode /JBIG2Decode]` and indirect
+    // positional `/DecodeParms [4 0 R 5 0 R]`.
+    let sym = Bitmap::from_art(&["#.#", ".#.", "#.#"]);
+    let globals = segment(1, 0, &[], 0, &symbol_dict_payload(&[&sym], 0));
+    let mut page = segment(2, 48, &[], 1, &page_info_payload(8, 3, 0));
+    page.extend_from_slice(&segment(
+        3,
+        6,
+        &[1],
+        1,
+        &text_region_arith_payload(
+            8,
+            3,
+            0,
+            0,
+            0,
+            1,
+            0,
+            1,
+            false,
+            0,
+            0,
+            0,
+            &[(0, 2, vec![(0, 0, 0)])],
+        ),
+    ));
+    page.extend_from_slice(&segment(4, 49, &[], 1, &[])); // EndOfPage
+                                                          // Choose a column count dividing `page.len()` cleanly (or 1 -> exact length).
+    let cols = [8usize, 4, 2, 1]
+        .into_iter()
+        .find(|&c| page.len().is_multiple_of(c))
+        .unwrap();
+    let mut predicted = Vec::with_capacity(page.len() + page.len() / cols);
+    let mut prev = vec![0u8; cols];
+    for row in page.chunks_exact(cols) {
+        predicted.push(2u8); // PNG Up filter
+        for (i, &b) in row.iter().enumerate() {
+            predicted.push(b.wrapping_sub(prev[i]));
+        }
+        prev.copy_from_slice(row);
+    }
+    let mut zenc = ZlibEncoder::new(Vec::new(), Compression::default());
+    zenc.write_all(&predicted).unwrap();
+    let flate_predicted = zenc.finish().unwrap();
+
+    let make_stream = |entries: &str, bytes: &[u8]| {
+        let mut obj = format!("<< /Length {} {entries} >>\nstream\n", bytes.len()).into_bytes();
+        obj.extend_from_slice(bytes);
+        obj.extend_from_slice(b"\nendstream");
+        obj
+    };
+    let objects = [
+        (1, b"<< /Type /Catalog >>".to_vec()),
+        (
+            2,
+            make_stream(
+                "/Type /XObject /Subtype /Image /Width 8 /Height 3 /ColorSpace /DeviceGray /BitsPerComponent 1 /Filter [/FlateDecode /JBIG2Decode] /DecodeParms [4 0 R 5 0 R]",
+                &flate_predicted,
+            ),
+        ),
+        (3, make_stream("", &globals)),
+        (4, format!("<< /Predictor 12 /Columns {cols} >>").into_bytes()),
+        (5, b"<< /JBIG2Globals 3 0 R >>".to_vec()),
+    ];
+    let mut pdf = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::new();
+    for (num, body) in objects {
+        offsets.push((num, pdf.len()));
+        pdf.extend_from_slice(format!("{num} 0 obj\n").as_bytes());
+        pdf.extend_from_slice(&body);
+        pdf.extend_from_slice(b"\nendobj\n");
+    }
+    let xref = pdf.len();
+    pdf.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+    for (_, off) in offsets {
+        pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+    );
+
+    let file = PdfFile::parse(pdf).expect("parse chained-filter PDF");
+    let (extracted_page, extracted_globals) =
+        extract_jbig2_inputs(&file, ObjectId(2, 0)).expect("extract chained JBIG2 stream");
+    assert_eq!(
+        extracted_page, page,
+        "prefix predictor DecodeParms must be applied"
+    );
+    assert_eq!(extracted_globals.as_deref(), Some(globals.as_slice()));
+
+    let img = assert_oracle_match_strict(
+        "chained Flate+PNG-Up + JBIG2Decode",
+        &extracted_page,
+        extracted_globals.as_deref(),
+    );
+    let direct = file
+        .resolve_stream_data(ObjectId(2, 0))
+        .expect("PdfFile chained decode");
+    assert_eq!(direct, img.packed_pdf);
 }
 
 #[test]
@@ -2562,7 +2808,42 @@ fn zpdf_preserves_parse_limits_budgets_and_per_region_isolation() {
         "zpdf must reject cumulative region work exceeding 2 * max_image_pixels"
     );
 
-    // (e) Documented tracked gap (#153): unknown segment data length 0xFFFFFFFF
+    // (e) Oversized positive BMSIZE in a Huffman symbol dictionary (extending
+    // past the segment payload, including a value large enough to overflow a
+    // 32-bit/WASM bit offset): hayro-jbig2 rejects the page, while zpdf rejects
+    // the dictionary cleanly and isolates the failure from valid page regions.
+    let mut bad_huff_sd = Vec::new();
+    bad_huff_sd.extend_from_slice(&0x0001u16.to_be_bytes());
+    bad_huff_sd.extend_from_slice(&1u32.to_be_bytes());
+    bad_huff_sd.extend_from_slice(&1u32.to_be_bytes());
+    let mut bw = BitWriter::new();
+    huff_encode(&mut bw, &std_huff_lines(4), Some(2));
+    huff_encode(&mut bw, &std_huff_lines(2), Some(8));
+    huff_encode(&mut bw, &std_huff_lines(2), None);
+    huff_encode(&mut bw, &std_huff_lines(1), Some(0x2000_0000));
+    bw.write_bytes(&[0x31, 0xF8]);
+    bad_huff_sd.extend_from_slice(&bw.finish());
+    let mut oversized_bmsize = segment(0, 48, &[], 1, &page_info_payload(8, 5, 0));
+    oversized_bmsize.extend_from_slice(&segment(1, 0, &[], 1, &bad_huff_sd));
+    oversized_bmsize.extend_from_slice(&segment(
+        2,
+        38,
+        &[],
+        1,
+        &generic_region_payload(&valid_bm, 0, 0, 0, 0, false),
+    ));
+    assert!(
+        decode_hayro(&oversized_bmsize, None, DecodeSettings { strict: false }).is_err(),
+        "hayro-jbig2 must reject truncated BMSIZE collective bitmap"
+    );
+    let zpdf_bmsize = decode_zpdf(&oversized_bmsize, None, &ParseLimits::default())
+        .expect("zpdf isolates truncated BMSIZE dictionary and preserves valid region");
+    assert_eq!(
+        unpack_pdf_to_native(&zpdf_bmsize, 8, 5, "oversized-bmsize").unwrap(),
+        valid_bm.data
+    );
+
+    // (f) Documented tracked gap (#153): unknown segment data length 0xFFFFFFFF
     // on an immediate generic region fails cleanly in zpdf (no panic).
     let mut unknown_len = segment(0, 48, &[], 1, &page_info_payload(8, 2, 0));
     let mut bad_seg = segment(1, 38, &[], 1, &[]);
@@ -2574,7 +2855,7 @@ fn zpdf_preserves_parse_limits_budgets_and_per_region_isolation() {
         "unknown segment data length (0xFFFFFFFF) is tracked in #153 and must return Err"
     );
 
-    // (f) Malformed/adversarial inputs never panic in either decoder.
+    // (g) Malformed/adversarial inputs never panic in either decoder.
     let malformed_cases: &[&[u8]] = &[
         &[],
         &[0x00, 0x01, 0x02],

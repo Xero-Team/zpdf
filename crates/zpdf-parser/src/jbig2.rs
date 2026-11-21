@@ -2205,16 +2205,13 @@ impl<'a> Decoder<'a> {
             at[1] = (r.i8()?, r.i8()?);
         }
 
-        // Locate the reference: a referred region segment (with its page offset
-        // delta per T.88 7.4.7.5 step 4), else the page area at (info.x, info.y).
-        let (refr, ref_dx, ref_dy): (Bitmap, i32, i32) =
+        // Locate the reference: a referred region segment, else the page.
+        // Per T.88 7.4.7.5 and Table 38, standalone generic refinement region
+        // segments share their referred region's origin and use zero offsets.
+        let refr: Bitmap =
             if let Some(num) = h.referred.iter().find(|n| self.regions.contains_key(n)) {
-                let (rinfo, rbm) = &self.regions[num];
-                let dx = i32::try_from(rinfo.x as i64 - info.x as i64)
-                    .map_err(|_| err("refinement reference x offset overflow"))?;
-                let dy = i32::try_from(rinfo.y as i64 - info.y as i64)
-                    .map_err(|_| err("refinement reference y offset overflow"))?;
-                (rbm.clone(), dx, dy)
+                let (_rinfo, rbm) = &self.regions[num];
+                rbm.clone()
             } else {
                 let page = self
                     .page
@@ -2229,7 +2226,7 @@ impl<'a> Decoder<'a> {
                         }
                     }
                 }
-                (refr, 0, 0)
+                refr
             };
 
         let payload = r.rest();
@@ -2246,8 +2243,8 @@ impl<'a> Decoder<'a> {
                 template,
                 tpgron,
                 at,
-                dx: ref_dx,
-                dy: ref_dy,
+                dx: 0,
+                dy: 0,
             },
             budget,
         )?;
@@ -2715,7 +2712,7 @@ impl<'a> Decoder<'a> {
             let cw = totwidth as usize;
             let ch = hc_height as usize;
             let start = br.byte_pos();
-            let (collective, consumed) = if bmsize == 0 {
+            let (collective, end) = if bmsize == 0 {
                 let raw_len = cw
                     .div_ceil(8)
                     .checked_mul(ch)
@@ -2724,10 +2721,14 @@ impl<'a> Decoder<'a> {
                     .checked_add(raw_len)
                     .filter(|&e| e <= payload.len())
                     .ok_or_else(|| err("truncated uncompressed collective bitmap"))?;
-                (unpack_rows(&payload[start..end], cw, ch)?, raw_len)
+                self.budget.reserve(raw_len as u64)?;
+                (unpack_rows(&payload[start..end], cw, ch)?, end)
             } else {
-                let end = start.saturating_add(bmsize).min(payload.len());
-                let mmr_data = &payload[start.min(payload.len())..end];
+                let end = start
+                    .checked_add(bmsize)
+                    .filter(|&e| e <= payload.len())
+                    .ok_or_else(|| err("truncated MMR collective bitmap"))?;
+                let mmr_data = &payload[start..end];
                 let params = crate::ccitt::CcittParams {
                     k: -1,
                     columns: cw.max(1),
@@ -2736,9 +2737,11 @@ impl<'a> Decoder<'a> {
                     byte_align: false,
                 };
                 let packed = crate::ccitt::decode(mmr_data, &params, self.budget)?;
-                (unpack_rows(&packed, cw, ch)?, bmsize)
+                (unpack_rows(&packed, cw, ch)?, end)
             };
-            br.pos = start.saturating_add(consumed).saturating_mul(8);
+            br.pos = end
+                .checked_mul(8)
+                .ok_or_else(|| err("Huffman collective bitmap bit offset overflow"))?;
             let mut x0 = 0usize;
             for &w in &widths {
                 let mut sym = Bitmap::new(w, ch, 0)?;
@@ -3111,7 +3114,9 @@ impl<'a> Decoder<'a> {
                             refine_budget,
                         )?;
                         // Advance past the refinement MQ data using RSIZE.
-                        br.pos = end.saturating_mul(8);
+                        br.pos = end
+                            .checked_mul(8)
+                            .ok_or_else(|| err("Huffman refinement bit offset overflow"))?;
                         Some(refined)
                     } else {
                         None
@@ -3297,21 +3302,12 @@ impl<'a> Decoder<'a> {
             hgh,
             "halftone grayscale image",
         )?;
-        let payload = r.rest();
-        let budget = mq_iteration_budget(payload.len());
-        // Arithmetic bitplanes cost one MQ decode per cell per plane, all off
-        // one budget: reject a grid that cannot fit before allocating it.
-        if !mmr && grid_cells.saturating_mul(hbpp) > budget {
-            return Err(err("halftone grid exceeds the MQ iteration budget"));
-        }
-
-        let mut bm = Bitmap::new(info.width, info.height, def_pixel)?;
-        self.pixels.cover(bm.data.len());
-
         // Optional skip bitmap (T.88 6.6.5.1): a cell is skipped when its
-        // pattern would fall entirely outside the region.
-        let skip = if enable_skip {
+        // pattern would fall entirely outside the region. Full-grid traversal
+        // is already bounded by `self.pixels.check` above.
+        let (skip, coded_cells) = if enable_skip {
             let mut s = Bitmap::new(hgw, hgh, 0)?;
+            let mut coded = 0usize;
             for m in 0..hgh {
                 for n in 0..hgw {
                     let (x, y) = cell_origin(m, n);
@@ -3321,13 +3317,26 @@ impl<'a> Decoder<'a> {
                         || y >= info.height as i64
                     {
                         s.set(n, m, 1);
+                    } else {
+                        coded += 1;
                     }
                 }
             }
-            Some(s)
+            (Some(s), coded)
         } else {
-            None
+            (None, grid_cells)
         };
+
+        let payload = r.rest();
+        let budget = mq_iteration_budget(payload.len());
+        // Arithmetic bitplanes cost one MQ decode per coded (unskipped) cell
+        // per plane, all off one budget: reject before allocating output/gray.
+        if !mmr && coded_cells.saturating_mul(hbpp) > budget {
+            return Err(err("halftone grid exceeds the MQ iteration budget"));
+        }
+
+        let mut bm = Bitmap::new(info.width, info.height, def_pixel)?;
+        self.pixels.cover(bm.data.len());
 
         // Decode the grayscale image: HBPP bitplanes, MSB first, Gray-coded
         // (T.88 Annex C.5). Each plane is a generic region of size HGW×HGH.
@@ -5239,6 +5248,129 @@ mod tests {
         let out = decode_test(&stream, &Jbig2Params { globals: None }).unwrap();
         // The symbol is WWWBBWWW on both rows (black at cols 3-4).
         assert_eq!(out, packed_from(&["...##...", "...##..."]));
+    }
+
+    #[test]
+    fn huff_symbol_dict_rejects_bmsize_past_segment_end() {
+        // Positive BMSIZE values extending past the segment payload — including
+        // values large enough to saturate `usize::MAX` on 32-bit/WASM targets
+        // when converted to bit offsets — must fail cleanly before decoding.
+        let dh_tab = standard_huff_table(4);
+        let dw_tab = standard_huff_table(2);
+        let bm_tab = standard_huff_table(1);
+        for declared_bmsize in [3i64, 0x2000_0000i64, i64::from(u32::MAX)] {
+            let mut p = Vec::new();
+            p.extend_from_slice(&0x0001u16.to_be_bytes()); // SDHUFF=1
+            p.extend_from_slice(&1u32.to_be_bytes()); // SDNUMEXSYMS
+            p.extend_from_slice(&1u32.to_be_bytes()); // SDNUMNEWSYMS
+            let mut bw = BitWriter::new();
+            huff_encode(&mut bw, &dh_tab, Some(2));
+            huff_encode(&mut bw, &dw_tab, Some(8));
+            huff_encode(&mut bw, &dw_tab, None);
+            huff_encode(&mut bw, &bm_tab, Some(declared_bmsize));
+            bw.byte_align();
+            p.extend_from_slice(&bw.finish());
+            p.extend_from_slice(&[0x31, 0xF8]); // only 2 bytes present
+
+            let mut budget = crate::filters::DecodeBudget::new(u64::MAX);
+            let mut dec = Decoder::new(&mut budget, u64::MAX);
+            let h = SegmentHeader {
+                number: 1,
+                seg_type: 0,
+                referred: Vec::new(),
+                page: 1,
+                data_length: p.len() as u32,
+            };
+            let err = match dec.decode_symbol_dict(&h, &p) {
+                Err(e) => e,
+                Ok(_) => panic!("bmsize={declared_bmsize}: BMSIZE past segment end must fail"),
+            };
+            assert!(
+                err.to_string().contains("truncated MMR collective bitmap"),
+                "bmsize={declared_bmsize}: unexpected error {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn huff_symbol_dict_uncompressed_charges_decode_budget() {
+        // 16x16 uncompressed collective bitmap (BMSIZE == 0, raw_len = 32 bytes)
+        // placed onto a 16x16 page (packed output = 32 bytes; combined = 64).
+        // A budget that fits either output alone (63) must fail; exact sum (64)
+        // must succeed and reproduce the symbol.
+        let dh_tab = standard_huff_table(4);
+        let dw_tab = standard_huff_table(2);
+        let bm_tab = standard_huff_table(1);
+        let mut raw_rows = Vec::with_capacity(32);
+        for row in 0..16u8 {
+            raw_rows.push(if row % 2 == 0 { 0xAA } else { 0x55 });
+            raw_rows.push(0x0F);
+        }
+        let mut dict = Vec::new();
+        dict.extend_from_slice(&0x0001u16.to_be_bytes()); // SDHUFF=1
+        dict.extend_from_slice(&1u32.to_be_bytes()); // SDNUMEXSYMS
+        dict.extend_from_slice(&1u32.to_be_bytes()); // SDNUMNEWSYMS
+        let mut bw = BitWriter::new();
+        huff_encode(&mut bw, &dh_tab, Some(16));
+        huff_encode(&mut bw, &dw_tab, Some(16));
+        huff_encode(&mut bw, &dw_tab, None);
+        huff_encode(&mut bw, &bm_tab, Some(0)); // BMSIZE == 0 (uncompressed)
+        bw.byte_align();
+        dict.extend_from_slice(&bw.finish());
+        dict.extend_from_slice(&raw_rows);
+        let mut bw_ex = BitWriter::new();
+        huff_encode(&mut bw_ex, &bm_tab, Some(0));
+        huff_encode(&mut bw_ex, &bm_tab, Some(1));
+        dict.extend_from_slice(&bw_ex.finish());
+
+        let mut stream = segment(0, 48, &[], 1, &page_info_payload(16, 16, 0));
+        stream.extend_from_slice(&segment(1, 0, &[], 1, &dict));
+        stream.extend_from_slice(&segment(
+            2,
+            6,
+            &[1],
+            1,
+            &text_region_payload(16, 16, 1, &[(0, 0)]),
+        ));
+
+        let expected_pdf: Vec<u8> = raw_rows.iter().map(|&b| !b).collect();
+        // Combined packed bytes = 32 (raw dict) + 32 (page) = 64.
+        let mut exact = DecodeBudget::new(64);
+        assert_eq!(
+            decode(
+                &stream,
+                &Jbig2Params { globals: None },
+                u64::MAX,
+                &mut exact
+            )
+            .unwrap(),
+            expected_pdf
+        );
+
+        // 63 fits the dictionary (32) and page (32) individually, not both.
+        let mut tight = DecodeBudget::new(63);
+        assert!(
+            decode(
+                &stream,
+                &Jbig2Params { globals: None },
+                u64::MAX,
+                &mut tight
+            )
+            .is_err(),
+            "combined uncompressed collective bitmap + page must exceed 63-byte budget"
+        );
+
+        // Direct check: below raw_len (31) rejects before unpacking the dict.
+        let mut below_dict = DecodeBudget::new(31);
+        let mut dec = Decoder::new(&mut below_dict, u64::MAX);
+        let h = SegmentHeader {
+            number: 1,
+            seg_type: 0,
+            referred: Vec::new(),
+            page: 1,
+            data_length: dict.len() as u32,
+        };
+        assert!(dec.decode_symbol_dict(&h, &dict).is_err());
     }
 
     #[test]
