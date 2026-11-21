@@ -264,6 +264,15 @@ fn gpu_matches_cpu_softmask_alpha_transfer() {
 /// until a transfer function amplifies it into a fully visible/hidden object.
 #[test]
 fn gpu_matches_cpu_softmask_half_value_threshold() {
+    let mut renderer = zpdf::gpu::WgpuRenderer::new();
+    match renderer.adapter_identity() {
+        Ok(_) => {}
+        Err(zpdf::gpu::WgpuRenderError::NoAdapter) => {
+            eprintln!("skipping GPU soft-mask threshold acceptance (no adapter)");
+            return;
+        }
+        Err(e) => panic!("initialize GPU soft-mask threshold acceptance: {e}"),
+    }
     for kind in [SoftMaskKind::Alpha, SoftMaskKind::Luminosity] {
         for value in [0.499, 0.5] {
             let (color, alpha) = match kind {
@@ -290,13 +299,9 @@ fn gpu_matches_cpu_softmask_half_value_threshold() {
                 mask,
             );
             let dl = page_with(Color::rgb(1.0, 1.0, 0.0), group);
-            let gpu = match zpdf::gpu::WgpuRenderer::new().render_display_list(&dl, SCALE) {
-                Ok(page) => page,
-                Err(e) => {
-                    eprintln!("skipping GPU soft-mask threshold acceptance (no adapter?): {e}");
-                    return;
-                }
-            };
+            let gpu = renderer
+                .render_display_list(&dl, SCALE)
+                .expect("GPU soft-mask threshold render on an available adapter");
             let cpu = zpdf::cpu::CpuRenderer::new()
                 .render_display_list(&dl, SCALE)
                 .expect("cpu render");
