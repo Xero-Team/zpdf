@@ -242,10 +242,27 @@ impl LoadedFont {
                 match state {
                     GlyphState::Drawn => true,
                     GlyphState::Blank | GlyphState::Missing => {
-                        meaning_font.blank_is_space(code, raw_code, length)
+                        meaning_font.code_requires_no_ink(code, raw_code, length)
                     }
                 }
             })
+    }
+
+    /// Whether this code is known to require no visible ink (whitespace,
+    /// control, format, or default-ignorable characters). Unlike
+    /// [`blank_is_space`], private-use characters (such as icon-font symbols)
+    /// are NOT excused when their outline is missing.
+    fn code_requires_no_ink(&self, code: u32, raw_code: u32, length: u8) -> bool {
+        let text = self
+            .to_unicode
+            .as_ref()
+            .and_then(|map| map.lookup(raw_code).or_else(|| map.lookup(code)));
+        match text {
+            Some(text) => !text.is_empty() && text.chars().all(is_no_ink_char),
+            None => self
+                .fallback_character(code, raw_code, length)
+                .is_some_and(|character| is_no_ink_char(character.character)),
+        }
     }
 
     /// A blank glyph is right for this code: the font's meaning for it is
@@ -358,10 +375,13 @@ pub(crate) fn physical_glyph_state(face: &ttf_parser::Face<'_>, gid: u16) -> Gly
     }
 }
 
-fn is_visible_char(character: char) -> bool {
-    !character.is_whitespace()
-        && !character.is_control()
-        && !matches!(
+/// Characters known to require no visible ink: whitespace, controls, format
+/// characters, and default-ignorable code points. Excludes private-use scalars,
+/// which icon fonts routinely map to visible symbols.
+fn is_no_ink_char(character: char) -> bool {
+    character.is_whitespace()
+        || character.is_control()
+        || matches!(
             character as u32,
             0xAD | 0x34F
                 | 0x61C
@@ -380,9 +400,14 @@ fn is_visible_char(character: char) -> bool {
                 | 0x1BCA0..=0x1BCA3
                 | 0x1D173..=0x1D17A
                 | 0xE0000..=0xE0FFF
-                | 0xE000..=0xF8FF
-                | 0xF0000..=0xFFFFD
-                | 0x100000..=0x10FFFD
+        )
+}
+
+fn is_visible_char(character: char) -> bool {
+    !is_no_ink_char(character)
+        && !matches!(
+            character as u32,
+            0xE000..=0xF8FF | 0xF0000..=0xFFFFD | 0x100000..=0x10FFFD
         )
 }
 
@@ -451,16 +476,282 @@ pub(crate) fn readable_glyph(face: &ttf_parser::Face<'_>, gid: u16) -> bool {
     start == end || (end - start >= 10 && glyf.get(start..start + 2) == Some(&[0, 0]))
 }
 
+/// Maximum work units spent scanning a font's `cmap` subtables across one
+/// `has_usable_embedded_outlines` probe. Exhausting the budget stops early and
+/// leaves the blank-glyph probe inconclusive rather than stalling page load.
+pub(crate) const CMAP_PROBE_BUDGET: usize = 4096;
+
+fn is_visible_scalar(cp: u32) -> bool {
+    char::from_u32(cp).is_some_and(is_visible_char)
+}
+
+fn spend_budget(budget: &mut usize) -> Result<(), ()> {
+    if *budget == 0 {
+        return Err(());
+    }
+    *budget -= 1;
+    Ok(())
+}
+
+fn read_u16_be(data: &[u8], offset: usize) -> Option<u16> {
+    Some(u16::from_be_bytes(
+        data.get(offset..offset + 2)?.try_into().ok()?,
+    ))
+}
+
+fn read_u32_be(data: &[u8], offset: usize) -> Option<u32> {
+    Some(u32::from_be_bytes(
+        data.get(offset..offset + 4)?.try_into().ok()?,
+    ))
+}
+
+/// Whether `[start..=end]` contains at least one visible Unicode scalar. Wide
+/// non-visible/invalid blocks are jumped in O(1) so even `[0..=u32::MAX]`
+/// completes within a few budget units.
+fn range_has_visible_scalar(start: u32, end: u32, budget: &mut usize) -> Result<bool, ()> {
+    let mut cp = start;
+    let hi = end.min(0x10_FFFF);
+    while cp <= hi {
+        spend_budget(budget)?;
+        cp = match cp {
+            0x0000..=0x0020 => 0x0021,
+            0x007F..=0x00A0 => 0x00A1,
+            0xD800..=0xF8FF => 0xF900,
+            0xE0000..=0xE0FFF => 0xE1000,
+            0xF0000..=0x10FFFD => 0x10FFFE,
+            _ => {
+                if is_visible_scalar(cp) {
+                    return Ok(true);
+                }
+                cp + 1
+            }
+        };
+    }
+    Ok(false)
+}
+
+/// Range-aware, budgeted check for whether any Unicode `cmap` subtable maps a
+/// visible scalar to `target_gid`. Returns `Err(())` when `budget` is exhausted
+/// (inconclusive), avoiding `ttf-parser`'s unbounded `Subtable::codepoints`
+/// range expansion.
+fn cmap_maps_visible_to_gid(
+    face: &ttf_parser::Face<'_>,
+    target_gid: u16,
+    budget: &mut usize,
+) -> Result<bool, ()> {
+    if target_gid == 0 {
+        return Ok(false);
+    }
+    let Some(cmap) = face.raw_face().table(ttf_parser::Tag::from_bytes(b"cmap")) else {
+        return Ok(false);
+    };
+    let Some(num_tables) = read_u16_be(cmap, 2) else {
+        return Ok(false);
+    };
+    for table_idx in 0..usize::from(num_tables) {
+        spend_budget(budget)?;
+        let rec = 4 + table_idx * 8;
+        let (Some(platform_id), Some(encoding_id), Some(offset)) = (
+            read_u16_be(cmap, rec),
+            read_u16_be(cmap, rec + 2),
+            read_u32_be(cmap, rec + 4),
+        ) else {
+            break;
+        };
+        let Some(subtable) = cmap.get(offset as usize..) else {
+            continue;
+        };
+        let Some(format) = read_u16_be(subtable, 0) else {
+            continue;
+        };
+        let is_unicode = match platform_id {
+            0 => true,
+            3 if encoding_id == 1 => true,
+            3 if encoding_id == 10 && matches!(format, 12 | 13) => true,
+            _ => false,
+        };
+        if !is_unicode {
+            continue;
+        }
+        match format {
+            0 => {
+                let Some(glyphs) = subtable.get(6..262) else {
+                    continue;
+                };
+                for (cp, &gid) in glyphs.iter().enumerate() {
+                    spend_budget(budget)?;
+                    if u16::from(gid) == target_gid && is_visible_scalar(cp as u32) {
+                        return Ok(true);
+                    }
+                }
+            }
+            4 => {
+                let Some(seg_count_x2) = read_u16_be(subtable, 6) else {
+                    continue;
+                };
+                if seg_count_x2 < 2 || seg_count_x2 % 2 != 0 {
+                    continue;
+                }
+                let seg_count = usize::from(seg_count_x2 / 2);
+                let end_base = 14usize;
+                let start_base = end_base + seg_count * 2 + 2;
+                let delta_base = start_base + seg_count * 2;
+                let iro_base = delta_base + seg_count * 2;
+                if subtable.len() < iro_base + seg_count * 2 {
+                    continue;
+                }
+                for seg in 0..seg_count {
+                    spend_budget(budget)?;
+                    let (Some(end), Some(start), Some(delta_u16), Some(iro)) = (
+                        read_u16_be(subtable, end_base + seg * 2),
+                        read_u16_be(subtable, start_base + seg * 2),
+                        read_u16_be(subtable, delta_base + seg * 2),
+                        read_u16_be(subtable, iro_base + seg * 2),
+                    ) else {
+                        break;
+                    };
+                    if start == 0xFFFF && end == 0xFFFF {
+                        break;
+                    }
+                    if start > end {
+                        continue;
+                    }
+                    if iro == 0 {
+                        let cp = target_gid.wrapping_sub(delta_u16);
+                        if cp >= start && cp <= end && is_visible_scalar(u32::from(cp)) {
+                            return Ok(true);
+                        }
+                    } else if iro != 0xFFFF {
+                        let delta_i16 = delta_u16 as i16;
+                        let iro_pos = (iro_base + seg * 2) as u16;
+                        for cp in start..=end {
+                            spend_budget(budget)?;
+                            let offset_bytes = (cp - start).wrapping_mul(2);
+                            let pos =
+                                usize::from(iro_pos.wrapping_add(offset_bytes).wrapping_add(iro));
+                            let Some(glyph_val) = read_u16_be(subtable, pos) else {
+                                break;
+                            };
+                            if glyph_val == 0 {
+                                continue;
+                            }
+                            let mapped = u16::try_from((glyph_val as i16).wrapping_add(delta_i16));
+                            if mapped == Ok(target_gid) && is_visible_scalar(u32::from(cp)) {
+                                return Ok(true);
+                            }
+                        }
+                    }
+                }
+            }
+            6 => {
+                let (Some(first_code), Some(entry_count)) =
+                    (read_u16_be(subtable, 6), read_u16_be(subtable, 8))
+                else {
+                    continue;
+                };
+                let count = usize::from(entry_count).min(subtable.len().saturating_sub(10) / 2);
+                for idx in 0..count {
+                    spend_budget(budget)?;
+                    let Some(gid) = read_u16_be(subtable, 10 + idx * 2) else {
+                        break;
+                    };
+                    if gid == target_gid && is_visible_scalar(u32::from(first_code) + idx as u32) {
+                        return Ok(true);
+                    }
+                }
+            }
+            10 => {
+                let (Some(start_cp), Some(num_chars)) =
+                    (read_u32_be(subtable, 12), read_u32_be(subtable, 16))
+                else {
+                    continue;
+                };
+                let count = (num_chars as usize).min(subtable.len().saturating_sub(20) / 2);
+                for idx in 0..count {
+                    spend_budget(budget)?;
+                    let Some(gid) = read_u16_be(subtable, 20 + idx * 2) else {
+                        break;
+                    };
+                    if gid == target_gid
+                        && start_cp
+                            .checked_add(idx as u32)
+                            .is_some_and(is_visible_scalar)
+                    {
+                        return Ok(true);
+                    }
+                }
+            }
+            12 => {
+                let Some(num_groups) = read_u32_be(subtable, 12) else {
+                    continue;
+                };
+                let count = (num_groups as usize).min(subtable.len().saturating_sub(16) / 12);
+                let target = u32::from(target_gid);
+                for g in 0..count {
+                    spend_budget(budget)?;
+                    let base = 16 + g * 12;
+                    let (Some(start_cp), Some(end_cp), Some(start_gid)) = (
+                        read_u32_be(subtable, base),
+                        read_u32_be(subtable, base + 4),
+                        read_u32_be(subtable, base + 8),
+                    ) else {
+                        break;
+                    };
+                    if start_cp > end_cp {
+                        continue;
+                    }
+                    if let Some(cp) = target
+                        .checked_sub(start_gid)
+                        .and_then(|delta| start_cp.checked_add(delta))
+                        .filter(|&cp| cp <= end_cp)
+                    {
+                        if is_visible_scalar(cp) {
+                            return Ok(true);
+                        }
+                    }
+                }
+            }
+            13 => {
+                let Some(num_groups) = read_u32_be(subtable, 12) else {
+                    continue;
+                };
+                let count = (num_groups as usize).min(subtable.len().saturating_sub(16) / 12);
+                let target = u32::from(target_gid);
+                for g in 0..count {
+                    spend_budget(budget)?;
+                    let base = 16 + g * 12;
+                    let (Some(start_cp), Some(end_cp), Some(glyph_id)) = (
+                        read_u32_be(subtable, base),
+                        read_u32_be(subtable, base + 4),
+                        read_u32_be(subtable, base + 8),
+                    ) else {
+                        break;
+                    };
+                    if start_cp > end_cp || glyph_id != target {
+                        continue;
+                    }
+                    if range_has_visible_scalar(start_cp, end_cp, budget)? {
+                        return Ok(true);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(false)
+}
+
 /// Whether a `GlyphState::Blank` glyph in a `glyf` face shows evidence of
 /// corruption (malformed header, oversized zeroed-out contour payload, or a
 /// zero-contour record hiding a visible character in the face's Unicode cmap).
 ///
 /// Zero-length `loca` entries (`start == end`) and valid 10–12 byte zero-contour
-/// space headers return `false`.
+/// space headers return `false`. When `cmap_budget` is exhausted, the probe
+/// stops early and returns `false` (inconclusive).
 pub(crate) fn glyf_blank_is_corrupt(
     face: &ttf_parser::Face<'_>,
     gid: u16,
-    visible_gids: &mut Option<std::collections::HashSet<u16>>,
+    cmap_budget: &mut usize,
 ) -> bool {
     if face.tables().glyf.is_none() {
         return false;
@@ -506,31 +797,33 @@ pub(crate) fn glyf_blank_is_corrupt(
     if x_min > x_max || y_min > y_max {
         return true;
     }
-    // A valid empty glyph record holds only the 10-byte glyph header (at most
-    // 12 bytes with 4-byte `loca` alignment padding or a 2-byte zero
-    // instructionLength). Larger all-zero records indicate a wiped contour
-    // payload.
-    if len > 12 {
-        return true;
-    }
-    let set = visible_gids.get_or_insert_with(|| {
-        let mut gids = std::collections::HashSet::new();
-        if let Some(cmap) = face.tables().cmap {
-            for st in cmap.subtables {
-                if st.is_unicode() {
-                    st.codepoints(|cp| {
-                        if char::from_u32(cp).is_some_and(is_visible_char) {
-                            if let Some(g) = st.glyph_index(cp) {
-                                gids.insert(g.0);
-                            }
-                        }
-                    });
-                }
-            }
+    // OpenType simple glyph description with `numberOfContours == 0`:
+    // 10-byte glyph header, optionally followed by `uint16 instructionLength`,
+    // `instructionLength` bytes of hinting instructions (e.g. phantom-point
+    // hints on a space glyph), and up to 4-byte `loca` zero padding.
+    // A wiped contour record has `instructionLength == 0` with extra trailing
+    // bytes beyond the 12-byte padded header, or an out-of-bounds length.
+    if len == 11 {
+        if glyf[start + 10] != 0 {
+            return true;
         }
-        gids
-    });
-    set.contains(&gid)
+    } else if len >= 12 {
+        let instr_len = u16::from_be_bytes([glyf[start + 10], glyf[start + 11]]) as usize;
+        let body_len = 12 + instr_len;
+        if body_len > len {
+            return true;
+        }
+        let max_pad = if instr_len == 0 {
+            0
+        } else {
+            (4 - (body_len % 4)) % 4
+        };
+        let trailing = len - body_len;
+        if trailing > max_pad || !glyf[start + body_len..end].iter().all(|&byte| byte == 0) {
+            return true;
+        }
+    }
+    cmap_maps_visible_to_gid(face, gid, cmap_budget).unwrap_or(false)
 }
 
 /// Whether `gid` has a non-zero or malformed `loca` slice in a `glyf` face

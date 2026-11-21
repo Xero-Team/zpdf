@@ -82,13 +82,15 @@ pub(crate) struct SharedFonts {
 }
 
 impl SharedFonts {
-    /// Keep embedded programs while allowing newly registered substitutes to
-    /// replace previous matches or placeholders. Existing page caches keep
-    /// their own Arc references and remain valid snapshots.
+    /// Keep clean embedded programs while allowing newly registered substitutes
+    /// to replace previous matches, placeholders, or partially readable fallback
+    /// entries. Existing page caches keep their own Arc references and remain
+    /// valid snapshots.
     pub(crate) fn refresh_provider(&mut self, generation: Option<u64>) {
         if self.generation != generation {
-            self.fonts
-                .retain(|_, (font, _)| !font.is_substitute && font.has_font_data());
+            self.fonts.retain(|_, (font, diag)| {
+                !font.is_substitute && font.has_font_data() && diag.is_empty()
+            });
             let mut budget = FontCacheBudget::default();
             self.fonts
                 .retain(|_, (font, _)| budget.try_admit(font, u64::MAX));

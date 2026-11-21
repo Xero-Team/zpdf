@@ -1193,7 +1193,7 @@ fn cmd_text(args: &[String]) -> zpdf::Result<()> {
                 .with_operand_stack_limit(doc.file().limits().max_operand_stack_depth as usize);
             let (_, mut stats) = interpreter.interpret_with_stats(&content_bytes);
             stats.diagnostics.set_page(pi);
-            stats.diagnostics.ensure_complete()?;
+            stats.diagnostics.ensure_text_complete()?;
         }
 
         if all {
@@ -1281,7 +1281,7 @@ fn cmd_search(args: &[String]) -> zpdf::Result<()> {
                 .with_operand_stack_limit(doc.file().limits().max_operand_stack_depth as usize);
             let (_, mut stats) = interpreter.interpret_with_stats(&content_bytes);
             stats.diagnostics.set_page(pi);
-            stats.diagnostics.ensure_complete()?;
+            stats.diagnostics.ensure_text_complete()?;
         }
 
         for hit in zpdf::search_spans(&spans, query, case_sensitive) {
@@ -1375,7 +1375,7 @@ fn cmd_tables(args: &[String]) -> zpdf::Result<()> {
                 .with_operand_stack_limit(doc.file().limits().max_operand_stack_depth as usize);
             let (_, mut stats) = interpreter.interpret_with_stats(&content_bytes);
             stats.diagnostics.set_page(pi);
-            stats.diagnostics.ensure_complete()?;
+            stats.diagnostics.ensure_text_complete()?;
         }
 
         let tables = zpdf::detect_tables_with_rules(&spans, &rules);

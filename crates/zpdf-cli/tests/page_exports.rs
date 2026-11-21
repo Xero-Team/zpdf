@@ -320,12 +320,71 @@ fn corrupt_embedded_font_exports_succeed_when_recovered_and_fail_when_unrecovere
         assert!(
             stderr.contains("incomplete output")
                 && stderr.contains("decode_failures=1")
-                && stderr.contains("embedded_font_fallbacks=1"),
+                && stderr.contains("embedded_font_fallbacks=1")
+                && stderr.contains("missing_glyph_outlines=1"),
             "{command}: {stderr}"
         );
         assert_eq!(fs::read(&out).unwrap(), b"existing");
         fs::remove_file(&out).unwrap();
     }
     fs::remove_file(&bad_input).unwrap();
+
+    // 3. Corrupt font whose characters all decode via /ToUnicode (e.g. private-use
+    //    icon U+E001 absent from system fonts): `text` and `convert` succeed with
+    //    the decoded text while `export-svg` and `render` reject missing ink.
+    let pua_tounicode = b"/CIDInit /ProcSet findresource begin 12 dict begin begincmap \
+        1 begincodespacerange <0000> <FFFF> endcodespacerange \
+        1 beginbfchar <0001> <E001> endbfchar \
+        endcmap CMapName currentdict /CMap defineresource pop end end";
+    let decodable_missing_ink_pdf = assemble_raw(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 180 100] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>".to_vec(),
+        raw_stream("", b"0 0 0 rg BT /F1 24 Tf 15 40 Td <0001> Tj ET"),
+        b"<< /Type /Font /Subtype /Type0 /BaseFont /ABCDEF+UninstalledIconFace /Encoding /Identity-H /DescendantFonts [6 0 R] /ToUnicode 9 0 R >>".to_vec(),
+        b"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /ABCDEF+UninstalledIconFace \
+          /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> \
+          /FontDescriptor 7 0 R /DW 1000 >>"
+            .to_vec(),
+        b"<< /Type /FontDescriptor /FontName /ABCDEF+UninstalledIconFace /Flags 32 /FontFile2 8 0 R >>"
+            .to_vec(),
+        raw_stream("", b"corrupt icon font"),
+        raw_stream("", pua_tounicode),
+    ]);
+    let pua_input = dir.join("decodable_missing_ink.pdf");
+    fs::write(&pua_input, decodable_missing_ink_pdf).unwrap();
+
+    let pua_text = Command::new(env!("CARGO_BIN_EXE_zpdf"))
+        .args(["text"])
+        .arg(&pua_input)
+        .output()
+        .unwrap();
+    assert!(
+        pua_text.status.success(),
+        "text should succeed when all codes decode: {}",
+        String::from_utf8_lossy(&pua_text.stderr)
+    );
+    assert!(String::from_utf8_lossy(&pua_text.stdout).contains('\u{E001}'));
+
+    let pua_svg = dir.join("pua.svg");
+    let pua_svg_res = Command::new(env!("CARGO_BIN_EXE_zpdf"))
+        .args(["export-svg"])
+        .arg(&pua_input)
+        .args(["-o"])
+        .arg(&pua_svg)
+        .output()
+        .unwrap();
+    assert!(
+        !pua_svg_res.status.success(),
+        "export-svg must reject missing ink"
+    );
+    let pua_stderr = String::from_utf8_lossy(&pua_svg_res.stderr);
+    assert!(
+        pua_stderr.contains("incomplete output")
+            && pua_stderr.contains("missing_glyph_outlines=1")
+            && pua_stderr.contains("embedded_font_fallbacks=1"),
+        "{pua_stderr}"
+    );
+    fs::remove_file(&pua_input).unwrap();
     fs::remove_dir(dir).unwrap();
 }

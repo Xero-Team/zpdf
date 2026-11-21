@@ -174,10 +174,11 @@ test("packaged reader recovers corrupt embedded font with a substitute and rejec
   out += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`;
   const pdf = bindings.Pdf.open(Buffer.from(out));
   try {
-    // Without a substitute font, visible glyphs cannot draw -> rejected as incomplete.
-    assert.throws(() => pdf.render_page(0, 1), /incomplete output.*decode_failures=1.*embedded_font_fallbacks=1/);
-    assert.throws(() => pdf.page_svg(0), /incomplete output.*decode_failures=1.*embedded_font_fallbacks=1/);
-    assert.throws(() => pdf.page_text(0), /incomplete output.*decode_failures=1.*embedded_font_fallbacks=1/);
+    // Without a substitute font, raster/SVG reject missing ink while text extraction
+    // still returns the cleanly decoded characters.
+    assert.throws(() => pdf.render_page(0, 1), /incomplete output.*embedded_font_fallbacks=1.*missing_glyph_outlines=1/);
+    assert.throws(() => pdf.page_svg(0), /incomplete output.*embedded_font_fallbacks=1.*missing_glyph_outlines=1/);
+    assert.match(pdf.page_text(0), /ABC/);
 
     // Registering a substitute recovers every glyph -> render_page, page_svg, and page_text succeed.
     pdf.register_font(font, 0, "BrokenTTF");

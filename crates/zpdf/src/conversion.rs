@@ -90,10 +90,10 @@ impl ConvertedDocument {
         all
     }
     pub fn is_complete(&self) -> bool {
-        self.diagnostics().is_complete()
+        self.diagnostics().is_text_complete()
     }
     pub fn ensure_complete(&self) -> Result<()> {
-        self.diagnostics().ensure_complete()
+        self.diagnostics().ensure_text_complete()
     }
 }
 

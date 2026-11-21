@@ -162,8 +162,9 @@ pub fn load_single_font_dict_with_diagnostics(
     let subtype = dict.get_name("Subtype").unwrap_or("");
     let base_font = dict.get_name("BaseFont").unwrap_or("Unknown").to_string();
 
+    let to_unicode = parse_to_unicode(file, dict);
     let (mut font, diagnostics) = match subtype {
-        "Type0" => load_type0_font(file, dict, base_font, provider)?,
+        "Type0" => load_type0_font(file, dict, base_font, provider, to_unicode.clone())?,
         "TrueType" => load_simple_font(file, dict, base_font, PdfFontType::TrueType, provider)?,
         "Type3" => (
             load_type3_font(file, dict, base_font)?,
@@ -178,10 +179,12 @@ pub fn load_single_font_dict_with_diagnostics(
         ),
     };
 
-    attach_text_mappings(file, dict, subtype, &mut font);
+    attach_text_mappings(file, dict, subtype, to_unicode, &mut font);
     // A substituted composite font needs /ToUnicode (attached just above) to
     // route CIDs through the system face's Unicode cmap.
-    font.build_substitute_cid_to_gid();
+    if font.cid_to_gid.is_none() {
+        font.build_substitute_cid_to_gid();
+    }
     // FontDescriptor weight/width/slant → variation axes (variable fonts only).
     if subtype != "Type0" {
         apply_descriptor_variations(file, dict, &mut font);
@@ -338,22 +341,28 @@ fn embedded_fallback_diagnostics(
     diagnostics
 }
 
+fn parse_to_unicode(
+    file: &PdfFile,
+    dict: &zpdf_core::PdfDict,
+) -> Option<zpdf_font::cmap::ToUnicodeMap> {
+    let tu_ref = dict.get_ref("ToUnicode").ok()?;
+    let data = file.resolve_stream_data(tu_ref).ok()?;
+    let map = zpdf_font::cmap::ToUnicodeMap::parse(&data);
+    (!map.is_empty()).then_some(map)
+}
+
 /// Attach the simple-font /Encoding, the symbolic flag, and /ToUnicode (for
 /// text extraction) to a freshly-loaded font.
 fn attach_text_mappings(
     file: &PdfFile,
     dict: &zpdf_core::PdfDict,
     subtype: &str,
+    to_unicode: Option<zpdf_font::cmap::ToUnicodeMap>,
     font: &mut LoadedFont,
 ) {
     // /ToUnicode lives at the top-level font dict for both simple and Type0 fonts.
-    if let Ok(tu_ref) = dict.get_ref("ToUnicode") {
-        if let Ok(data) = file.resolve_stream_data(tu_ref) {
-            let map = zpdf_font::cmap::ToUnicodeMap::parse(&data);
-            if !map.is_empty() {
-                font.to_unicode = Some(map);
-            }
-        }
+    if font.to_unicode.is_none() {
+        font.to_unicode = to_unicode;
     }
 
     // /Encoding and the symbolic flag apply only to simple (non-composite) fonts.
@@ -583,6 +592,7 @@ fn load_type0_font(
     dict: &zpdf_core::PdfDict,
     base_font: String,
     provider: Option<&FontProvider>,
+    to_unicode: Option<zpdf_font::cmap::ToUnicodeMap>,
 ) -> Result<(LoadedFont, zpdf_core::ProcessingDiagnostics)> {
     // /DescendantFonts is commonly an indirect reference to the array.
     let descendants = resolve_array(file, dict, "DescendantFonts")
@@ -651,12 +661,35 @@ fn load_type0_font(
 
     // A substituted composite font can only resolve glyphs when codes or CIDs
     // map to Unicode (via a Unicode/legacy CMap, a known Adobe CJK collection,
-    // or /ToUnicode). Without any of those, substituting would drop every glyph
-    // and discard the PDF's /CIDToGIDMap.
+    // or a parsed non-empty /ToUnicode). Without any of those, substituting
+    // would drop every glyph and discard the PDF's /CIDToGIDMap.
     let can_substitute = cmap.codes_are_unicode
         || cmap.is_legacy()
         || cmap.collection().is_some()
-        || matches!(dict.get("ToUnicode"), Some(obj) if !matches!(obj, PdfObject::Null));
+        || to_unicode.is_some();
+
+    let try_mapped_substitute = |cid_widths: CidWidths| -> Option<LoadedFont> {
+        let mut sub = substitute_type0_font(
+            lookup_name,
+            &base_font,
+            cid_widths,
+            provider,
+            ordering.as_deref(),
+            hints,
+        )?;
+        sub.cid_cmap = Some(cmap.clone());
+        sub.to_unicode = to_unicode.clone();
+        sub.validate_cid_cmap();
+        sub.build_substitute_cid_to_gid();
+        let has_mapping = sub.unicode_coded()
+            || sub.legacy_substitute()
+            || sub.cid_cmap.as_ref().and_then(|c| c.collection()).is_some()
+            || sub
+                .cid_to_gid
+                .as_ref()
+                .is_some_and(|m| m.values().any(|&g| g != 0));
+        has_mapping.then_some(sub)
+    };
 
     let mut diagnostics = zpdf_core::ProcessingDiagnostics::default();
     let mut font = match font_file {
@@ -681,7 +714,8 @@ fn load_type0_font(
             // outlined (unparseable per-FD Private DICTs strand the local subrs),
             // so most glyphs render blank. When the embedded program fails to
             // parse or lacks usable outlines, fall back to a substitute face
-            // (glyphs then route CID→Unicode→GID via /ToUnicode or collection).
+            // only if the replacement can actually map CIDs (otherwise keep the
+            // original so any surviving embedded glyph still renders).
             let cjk = is_cjk_ordering(ordering.as_deref())
                 || zpdf_font::system::cjk_ordering_for(lookup_name).is_some();
             if !font.has_usable_embedded_outlines() {
@@ -690,29 +724,18 @@ fn load_type0_font(
                 );
                 diagnostics = embedded_fallback_diagnostics(object_id, None);
                 if can_substitute {
-                    substitute_type0_font(
-                        lookup_name,
-                        &base_font,
-                        cid_widths,
-                        provider,
-                        ordering.as_deref(),
-                        hints,
-                    )
-                    .unwrap_or(font)
+                    try_mapped_substitute(cid_widths).unwrap_or(font)
                 } else {
                     font
                 }
             } else if cjk && font.embedded_outline_failure_rate() > 0.5 {
-                if let Some(sub) = substitute_type0_font(
-                    lookup_name,
-                    &base_font,
-                    cid_widths,
-                    provider,
-                    ordering.as_deref(),
-                    hints,
-                ) {
-                    diagnostics = embedded_fallback_diagnostics(object_id, None);
-                    sub
+                if can_substitute {
+                    if let Some(sub) = try_mapped_substitute(cid_widths) {
+                        diagnostics = embedded_fallback_diagnostics(object_id, None);
+                        sub
+                    } else {
+                        font
+                    }
                 } else {
                     font
                 }

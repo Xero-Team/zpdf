@@ -901,16 +901,13 @@ impl LoadedFont {
         }
 
         let (mut drawn, mut unreadable) = (0u32, 0u32);
-        let mut visible_gids: Option<HashSet<u16>> = None;
-        let probe = |gid: u16,
-                     drawn: &mut u32,
-                     unreadable: &mut u32,
-                     visible_gids: &mut Option<HashSet<u16>>| {
+        let mut cmap_budget = resolution::CMAP_PROBE_BUDGET;
+        let probe = |gid: u16, drawn: &mut u32, unreadable: &mut u32, cmap_budget: &mut usize| {
             match resolution::physical_glyph_state(&face, gid) {
                 resolution::GlyphState::Drawn => *drawn += 1,
                 resolution::GlyphState::Missing => *unreadable += 1,
                 resolution::GlyphState::Blank => {
-                    if resolution::glyf_blank_is_corrupt(&face, gid, visible_gids) {
+                    if resolution::glyf_blank_is_corrupt(&face, gid, cmap_budget) {
                         *unreadable += 1;
                     }
                 }
@@ -936,7 +933,7 @@ impl LoadedFont {
                     mapped_gids[i],
                     &mut drawn,
                     &mut unreadable,
-                    &mut visible_gids,
+                    &mut cmap_budget,
                 );
                 i += step;
             }
@@ -961,14 +958,14 @@ impl LoadedFont {
             let step = (count / 64).max(1);
             let mut gid = 1usize;
             while gid < num_glyphs as usize {
-                probe(gid as u16, &mut drawn, &mut unreadable, &mut visible_gids);
+                probe(gid as u16, &mut drawn, &mut unreadable, &mut cmap_budget);
                 gid += step;
             }
             if drawn == 0 && unreadable == 0 && face.tables().glyf.is_some() {
                 let mut found = 0usize;
                 for g in 1..num_glyphs {
                     if resolution::glyf_has_non_empty_record(&face, g) {
-                        probe(g, &mut drawn, &mut unreadable, &mut visible_gids);
+                        probe(g, &mut drawn, &mut unreadable, &mut cmap_budget);
                         found += 1;
                         if found >= 64 {
                             break;
@@ -1294,6 +1291,34 @@ impl LoadedFont {
                 out.push(b as char);
             }
         }
+    }
+
+    /// Whether this code decodes to Unicode text through `/ToUnicode`, CMap,
+    /// `/Encoding`, or non-symbolic single-byte fallback.
+    #[doc(hidden)]
+    pub fn can_decode_code(&self, code: u32, len: u8, raw_code: u32) -> bool {
+        if self
+            .to_unicode
+            .as_ref()
+            .and_then(|tu| tu.lookup(raw_code).or_else(|| tu.lookup(code)))
+            .is_some_and(|s| !s.is_empty())
+        {
+            return true;
+        }
+        if matches!(self.font_type, PdfFontType::Type0CidType2) {
+            return self
+                .cid_cmap
+                .as_ref()
+                .and_then(|cm| cm.decode_text(code, len))
+                .is_some();
+        }
+        if let Ok(b) = u8::try_from(code) {
+            if let Some(name) = self.encoding.as_ref().and_then(|enc| enc.glyph_name(b)) {
+                return glyph_list::glyph_name_to_string(name).is_some();
+            }
+            return !self.symbolic && b >= 0x20 && b != 0x7f;
+        }
+        false
     }
 
     pub fn has_font_data(&self) -> bool {
@@ -3126,6 +3151,39 @@ mod tests {
         );
         wiped.cid_to_gid = Some(HashMap::from([(1u16, 1u16)]));
         assert!(!wiped.has_usable_embedded_outlines());
+
+        // 5. Valid zero-contour space with phantom-point hinting instructions
+        //    (10-byte header + instructionLength=6 + 6 instruction bytes,
+        //    4-byte aligned to 20 bytes) -> accepted.
+        let mut hinted_space = vec![0u8; 10];
+        hinted_space.extend_from_slice(&6u16.to_be_bytes());
+        hinted_space.extend_from_slice(&[0xB0, 0x00, 0xB0, 0x01, 0x20, 0x00]);
+        let hinted_sfnt = build_glyf_sfnt(&[vec![], hinted_space], &[], false);
+        let mut hinted = LoadedFont::new_with_data(
+            PdfFontType::Type0CidType2,
+            "HintedSpaceCID".into(),
+            hinted_sfnt,
+            CidWidths::new(500.0),
+        );
+        hinted.cid_to_gid = Some(HashMap::from([(1u16, 1u16)]));
+        assert!(
+            hinted.has_usable_embedded_outlines(),
+            "zero-contour space glyph with valid hinting instructions must be accepted"
+        );
+
+        // 6. Zero-contour glyph with truncated instructionLength past slice bounds -> rejected.
+        let mut truncated_instr = vec![0u8; 10];
+        truncated_instr.extend_from_slice(&40u16.to_be_bytes());
+        truncated_instr.extend_from_slice(&[0xB0, 0x00, 0x00, 0x00]);
+        let truncated_sfnt = build_glyf_sfnt(&[vec![], truncated_instr], &[], false);
+        let mut truncated = LoadedFont::new_with_data(
+            PdfFontType::Type0CidType2,
+            "TruncatedInstrCID".into(),
+            truncated_sfnt,
+            CidWidths::new(500.0),
+        );
+        truncated.cid_to_gid = Some(HashMap::from([(1u16, 1u16)]));
+        assert!(!truncated.has_usable_embedded_outlines());
     }
 
     #[test]
@@ -3141,5 +3199,102 @@ mod tests {
         font.cid_to_gid = Some(HashMap::from([(1, 1), (2, 2), (3, 3)]));
         assert!(font.has_usable_embedded_outlines());
         assert_eq!(font.embedded_outline_failure_rate(), 0.0);
+    }
+
+    #[test]
+    fn cmap_blank_probe_is_range_aware_and_strictly_bounded() {
+        let build_with_cmap_groups = |format: u16, groups: &[(u32, u32, u32)]| -> Vec<u8> {
+            let mut head = head_table();
+            head[50..52].copy_from_slice(&1u16.to_be_bytes()); // long loca
+            let zero_contour = vec![0u8; 10];
+            let mut glyf = Vec::new();
+            let mut loca = Vec::new();
+            // GID 0 = empty, GID 1 = 10-byte zero-contour header
+            loca.extend_from_slice(&0u32.to_be_bytes());
+            loca.extend_from_slice(&0u32.to_be_bytes());
+            glyf.extend_from_slice(&zero_contour);
+            glyf.extend_from_slice(&[0, 0]); // 4-byte align
+            loca.extend_from_slice(&(glyf.len() as u32).to_be_bytes());
+
+            let subtable_len = (16 + groups.len() * 12) as u32;
+            let mut subtable = Vec::with_capacity(subtable_len as usize);
+            subtable.extend_from_slice(&format.to_be_bytes());
+            subtable.extend_from_slice(&0u16.to_be_bytes()); // reserved
+            subtable.extend_from_slice(&subtable_len.to_be_bytes());
+            subtable.extend_from_slice(&0u32.to_be_bytes()); // language
+            subtable.extend_from_slice(&(groups.len() as u32).to_be_bytes());
+            for &(s, e, g) in groups {
+                subtable.extend_from_slice(&s.to_be_bytes());
+                subtable.extend_from_slice(&e.to_be_bytes());
+                subtable.extend_from_slice(&g.to_be_bytes());
+            }
+            let mut cmap = Vec::new();
+            cmap.extend_from_slice(&0u16.to_be_bytes()); // version
+            cmap.extend_from_slice(&1u16.to_be_bytes()); // numTables
+            cmap.extend_from_slice(&3u16.to_be_bytes()); // Windows
+            cmap.extend_from_slice(&10u16.to_be_bytes()); // Unicode full repertoire
+            cmap.extend_from_slice(&12u32.to_be_bytes()); // offset
+            cmap.extend_from_slice(&subtable);
+
+            build_sfnt(&[
+                (*b"cmap", cmap),
+                (*b"glyf", glyf),
+                (*b"head", head),
+                (*b"hhea", hhea_table()),
+                (*b"loca", loca),
+                (*b"maxp", maxp_table(2)),
+            ])
+        };
+
+        // 1. Adversarial Format 12 spanning the full u32 space: 0x41 -> GID 1
+        //    must finish in O(1) without expanding 4.29B codepoints, and reject.
+        let huge_f12 = build_with_cmap_groups(12, &[(0x41, u32::MAX, 1)]);
+        let font_f12 = LoadedFont::new_with_data(
+            PdfFontType::TrueType,
+            "HugeFormat12".into(),
+            huge_f12,
+            CidWidths::new(500.0),
+        );
+        assert!(!font_f12.has_usable_embedded_outlines());
+
+        // 2. Adversarial Format 13 mapping [0..=u32::MAX] -> GID 1 must finish
+        //    in O(1) and detect visible scalars in the range.
+        let huge_f13 = build_with_cmap_groups(13, &[(0, u32::MAX, 1)]);
+        let font_f13 = LoadedFont::new_with_data(
+            PdfFontType::TrueType,
+            "HugeFormat13".into(),
+            huge_f13,
+            CidWidths::new(500.0),
+        );
+        assert!(!font_f13.has_usable_embedded_outlines());
+
+        // 3. Adversarial Format 13 covering only surrogates/PUA (non-visible)
+        //    leaves the zero-contour blank glyph accepted in O(1).
+        let pua_f13 = build_with_cmap_groups(13, &[(0xD800, 0xF8FF, 1)]);
+        let font_pua = LoadedFont::new_with_data(
+            PdfFontType::TrueType,
+            "PuaFormat13".into(),
+            pua_f13,
+            CidWidths::new(500.0),
+        );
+        assert!(font_pua.has_usable_embedded_outlines());
+
+        // 4. Oversized group count past CMAP_PROBE_BUDGET stops early and
+        //    leaves the probe inconclusive rather than stalling font load.
+        let mut many_groups: Vec<(u32, u32, u32)> = (0..resolution::CMAP_PROBE_BUDGET as u32 + 128)
+            .map(|i| (0x1000 + i, 0x1000 + i, 2))
+            .collect();
+        many_groups.push((0x0041, 0x0041, 1));
+        let huge_groups = build_with_cmap_groups(12, &many_groups);
+        let font_budget = LoadedFont::new_with_data(
+            PdfFontType::TrueType,
+            "BudgetExhaustedCmap".into(),
+            huge_groups,
+            CidWidths::new(500.0),
+        );
+        assert!(
+            font_budget.has_usable_embedded_outlines(),
+            "exhausted cmap probe budget must leave the blank check inconclusive"
+        );
     }
 }

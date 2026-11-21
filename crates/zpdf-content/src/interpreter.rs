@@ -50,8 +50,9 @@ pub struct ContentInterpreter<'a> {
     /// merged into `self.stats.diagnostics` during this interpretation.
     reported_font_fallbacks: Vec<zpdf_font::FontId>,
     /// Font IDs whose embedded-program fallback failed to recover at least one
-    /// visible glyph and already recorded a `decode_failures` entry.
-    reported_font_fallback_misses: Vec<zpdf_font::FontId>,
+    /// visible glyph, paired with whether a text-decoding failure was also
+    /// recorded for that font.
+    reported_font_fallback_misses: Vec<(zpdf_font::FontId, bool)>,
     file: Option<&'a PdfFile>,
     resources: Option<&'a ResourceDict>,
     image_cache: Option<&'a mut ImageCache>,
@@ -6032,9 +6033,10 @@ impl<'a> ContentInterpreter<'a> {
 
     /// Record embedded-font fallback diagnostics once per used font and verify
     /// that every shown visible glyph recovered through the substitute or
-    /// provider fallback. Unrecovered missing visible glyphs increment
-    /// `decode_failures` so strict exports reject incomplete output while
-    /// successfully recovered pages stay complete.
+    /// provider fallback. Unrecovered missing visible outlines increment
+    /// `missing_glyph_outlines` (rejecting visual exports while allowing
+    /// text-only exports when every code decoded); codes that also fail to
+    /// decode increment `decode_failures`.
     fn check_embedded_fallback_recovery(
         &mut self,
         font_id: FontId,
@@ -6056,35 +6058,58 @@ impl<'a> ContentInterpreter<'a> {
             self.reported_font_fallbacks.push(font_id);
             self.stats.diagnostics.merge(fallback_diag);
             if fallback_diag.decode_failures > 0
-                && !self.reported_font_fallback_misses.contains(&font_id)
+                && !self
+                    .reported_font_fallback_misses
+                    .iter()
+                    .any(|&(id, _)| id == font_id)
             {
-                self.reported_font_fallback_misses.push(font_id);
+                self.reported_font_fallback_misses.push((font_id, true));
             }
         }
-        if !self.reported_font_fallback_misses.contains(&font_id)
-            && !self.fallback_run_complete(font_id, bytes, glyphs, resolved_runs)
-        {
-            self.reported_font_fallback_misses.push(font_id);
-            self.stats.diagnostics.decode_failures =
-                self.stats.diagnostics.decode_failures.saturating_add(1);
-            if let Some(id) = fallback_diag.first_failed_object {
-                self.stats.diagnostics.first_failed_object.get_or_insert(id);
+        let existing_miss = self
+            .reported_font_fallback_misses
+            .iter()
+            .position(|&(id, _)| id == font_id);
+        if existing_miss.is_some_and(|idx| self.reported_font_fallback_misses[idx].1) {
+            return;
+        }
+        let (outlines_ok, text_ok) =
+            self.fallback_run_status(font_id, bytes, glyphs, resolved_runs);
+        if !outlines_ok {
+            match existing_miss {
+                None => {
+                    self.reported_font_fallback_misses.push((font_id, !text_ok));
+                    self.stats
+                        .diagnostics
+                        .record_missing_glyph_outline(fallback_diag.first_failed_object);
+                    if !text_ok {
+                        self.stats.diagnostics.decode_failures =
+                            self.stats.diagnostics.decode_failures.saturating_add(1);
+                    }
+                }
+                Some(idx) if !text_ok => {
+                    self.reported_font_fallback_misses[idx].1 = true;
+                    self.stats.diagnostics.decode_failures =
+                        self.stats.diagnostics.decode_failures.saturating_add(1);
+                }
+                Some(_) => {}
             }
         }
     }
 
-    fn fallback_run_complete(
+    /// Returns `(outlines_complete, text_decodable)` for a fallback text run.
+    fn fallback_run_status(
         &self,
         original_font_id: FontId,
         bytes: &[u8],
         glyphs: &[PositionedGlyph],
         resolved_runs: Option<&[(FontId, Vec<PositionedGlyph>)]>,
-    ) -> bool {
+    ) -> (bool, bool) {
         let Some(cache) = self.font_cache.as_deref() else {
-            return false;
+            return (false, false);
         };
         let Some(orig_font) = cache.get(original_font_id) else {
-            return false;
+            return (false, false);
         };
         let composite = matches!(orig_font.font_type, zpdf_font::PdfFontType::Type0CidType2);
         let cmap = orig_font.cid_cmap.as_ref();
@@ -6103,12 +6128,31 @@ impl<'a> ContentInterpreter<'a> {
                 }),
             )
         };
-        if let Some(runs) = resolved_runs {
+        let outlines_ok = if let Some(runs) = resolved_runs {
             runs.iter()
                 .all(|(run_font_id, run_glyphs)| check_slice(*run_font_id, run_glyphs))
         } else {
             check_slice(original_font_id, glyphs)
+        };
+        if outlines_ok {
+            return (true, true);
         }
+        let mut text_offset = 0usize;
+        let mut text_ok = true;
+        while text_offset < bytes.len() {
+            let Some((code, length, raw, end)) =
+                next_text_code(cmap, composite, bytes, text_offset)
+            else {
+                text_ok = false;
+                break;
+            };
+            text_offset = end;
+            if !orig_font.can_decode_code(code, length as u8, raw) {
+                text_ok = false;
+                break;
+            }
+        }
+        (false, text_ok)
     }
 
     /// Keep optional fallback and clipping state off the main decoding stack.

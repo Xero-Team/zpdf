@@ -17,8 +17,9 @@
   `ProcessingDiagnostics::embedded_font_fallbacks` (leaving valid embedded and
   normal non-embedded fonts unaffected). Successfully recovered pages stay
   `is_complete()` while retaining `embedded_font_fallbacks`; unrecovered missing
-  visible glyphs also increment `decode_failures` so strict exports reject
-  incomplete output. (#157)
+  visible glyphs record `missing_glyph_outlines` (rejecting visual exports while
+  allowing text-only exports when every character decoded, and incrementing
+  `decode_failures` if decoding also failed). (#157)
 
 ## 0.21.0 — Glyph-level selection and rendering compatibility
 
