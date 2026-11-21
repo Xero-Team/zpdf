@@ -1161,7 +1161,9 @@ impl LoadedFont {
                                                 Some(true) => {
                                                     EmbeddedGlyphHealthOutcome::Unreadable
                                                 }
-                                                Some(false) => EmbeddedGlyphHealthOutcome::Readable,
+                                                Some(false) => {
+                                                    EmbeddedGlyphHealthOutcome::CodeDependentFallbackReadable
+                                                }
                                                 None => EmbeddedGlyphHealthOutcome::Exhausted,
                                             }
                                         }
@@ -1191,6 +1193,34 @@ impl LoadedFont {
             return Some(self.blank_hides_text(code, raw_code));
         }
         self.direct_code_visibility(code, raw_code, length)
+    }
+
+    /// Whether a single shown `(glyph_id, code, raw_code, length)` in this
+    /// embedded font is unreadable, using the same code-aware classification
+    /// as [`Self::classify_embedded_glyphs_with_codes`] (so cache misses after
+    /// `MAX_TRACKED_FONTS` still honor `/ToUnicode` and direct code evidence).
+    #[doc(hidden)]
+    pub fn is_shown_embedded_glyph_unreadable(
+        &self,
+        glyph_id: u16,
+        code: u32,
+        raw_code: u32,
+        length: u8,
+        cmap_budget: &mut usize,
+    ) -> bool {
+        let mut unreadable = false;
+        self.classify_embedded_glyphs_with_codes(
+            &[(glyph_id, code, raw_code, length)],
+            cmap_budget,
+            |_, out| {
+                unreadable = matches!(
+                    out,
+                    EmbeddedGlyphHealthOutcome::Unreadable
+                        | EmbeddedGlyphHealthOutcome::CodeDependent { unreadable: true }
+                );
+            },
+        );
+        unreadable
     }
 
     /// Whether `glyph_id` resolves in this embedded font to a physical glyph
@@ -1385,11 +1415,22 @@ impl LoadedFont {
         //    Windows Symbol / PUA `0xF000 | code` lookup for codes whose
         //    declared glyph name matches their canonical Symbol slot.
         let substitute_has_explicit_encoding = self.is_substitute && self.encoding.is_some();
-        let canonical_symbol_code = self
-            .encoding
-            .as_ref()
-            .and_then(|e| e.glyph_name(code8))
-            .is_some_and(|name| encoding::SYMBOL_ENCODING[code8 as usize] == Some(name));
+        let canonical_symbol_code = self.encoding.as_ref().is_some_and(|enc| {
+            enc.is_canonical_symbol_code(code8) || {
+                let base = self.base_font.rsplit('+').next().unwrap_or(&self.base_font);
+                let table = if base.contains("ZapfDingbats") || base.contains("Dingbats") {
+                    Some(&encoding::ZAPF_DINGBATS_ENCODING)
+                } else if base.contains("Symbol") {
+                    Some(&encoding::SYMBOL_ENCODING)
+                } else {
+                    None
+                };
+                table.is_some_and(|t| {
+                    let expected = t[code8 as usize];
+                    expected.is_some() && enc.glyph_name(code8) == expected
+                })
+            }
+        });
         let allow_symbol_pua = !substitute_has_explicit_encoding || canonical_symbol_code;
         if let Some(cmap) = face.tables().cmap {
             // (3,0) Windows Symbol: try the 0xF000 PUA offset then the raw code.
@@ -2656,6 +2697,12 @@ pub enum EmbeddedGlyphHealthOutcome {
     /// (Type 1 blank with `/ToUnicode` or TrueType valid-header nonempty
     /// zero-contour record). Must not be cached as readable by GID alone.
     CodeDependent { unreadable: bool },
+    /// Nonempty zero-contour blank record whose reverse `cmap` probe confirmed
+    /// no visible Unicode mapping in the font's own `cmap`. Cached as a
+    /// readable fallback only for shown codes without direct PDF evidence, so
+    /// another source code sharing the same CID/GID with a `/ToUnicode`
+    /// mapping to visible text still triggers recovery.
+    CodeDependentFallbackReadable,
     /// Reverse `cmap` probe exhausted its work budget before finding a mapping.
     /// Distinct from confirmed `Readable` and must not be cached.
     Exhausted,
@@ -2831,10 +2878,17 @@ pub struct FontCache {
     name_to_id: HashMap<String, FontId>,
     next_id: FontId,
     budget: FontCacheBudget,
-    /// Bytes currently charged to reclaimable unadmitted `standby` companions.
-    /// Included in [`Self::bytes_used`], and reclaimed before rejecting any
-    /// primary, Form, or drawn-companion admission.
+    /// Bytes currently charged to reclaimable unadmitted `standby` companions
+    /// and optional descriptor lookup-name overrides. Included in
+    /// [`Self::bytes_used`], and reclaimed before rejecting any primary, Form,
+    /// or drawn-companion admission.
     standby_bytes: u64,
+    /// Unique `Arc<DescriptorSubstituteSpec>` pointers currently charged in
+    /// `standby_bytes`, allowing O(1) accounting across shared resource aliases.
+    standby_specs: HashSet<usize>,
+    /// Whether any companion entry currently retains an in-memory `standby`
+    /// face (whose shared programs might deduplicate with later primary loads).
+    has_standby_companions: bool,
     provider: Option<Arc<FontProvider>>,
     resolution: Option<Box<resolution::ResolutionCache>>,
     /// Per-font diagnostics for embedded font programs that failed to decode or
@@ -2860,6 +2914,8 @@ impl FontCache {
             next_id: 0,
             budget: FontCacheBudget::default(),
             standby_bytes: 0,
+            standby_specs: HashSet::new(),
+            has_standby_companions: false,
             provider: None,
             resolution: None,
             embedded_fallbacks: HashMap::new(),
@@ -2915,7 +2971,39 @@ impl FontCache {
     }
 
     pub(crate) fn recompute_standby_bytes(&mut self) {
-        self.standby_bytes = self.standby_extra_bytes(None, None).unwrap_or(u64::MAX);
+        self.standby_specs.clear();
+        self.has_standby_companions = false;
+        if self.embedded_companions.is_empty() {
+            self.standby_bytes = 0;
+            return;
+        }
+        let mut added = 0u64;
+        let mut seen_fonts = HashSet::new();
+        let mut seen_programs = HashSet::new();
+        for entry in self.embedded_companions.values() {
+            if let Some(font) = entry.standby.as_ref() {
+                self.has_standby_companions = true;
+                let font_key = Arc::as_ptr(font) as usize;
+                if !self.budget.fonts.contains(&font_key) && seen_fonts.insert(font_key) {
+                    added = added.saturating_add(font.estimated_owned_cache_bytes());
+                    for data in font.shared_programs() {
+                        let key = data.as_ptr() as usize;
+                        if !self.budget.programs.contains(&key) && seen_programs.insert(key) {
+                            added = added.saturating_add(data.len() as u64);
+                        }
+                    }
+                }
+            }
+            if entry.admitted.is_none() {
+                if let Some(spec) = entry.descriptor_spec.as_ref() {
+                    let extra = spec.extra_bytes();
+                    if extra > 0 && self.standby_specs.insert(Arc::as_ptr(spec) as usize) {
+                        added = added.saturating_add(extra);
+                    }
+                }
+            }
+        }
+        self.standby_bytes = added;
     }
 
     /// Reclaim optional descriptor lookup-name overrides and unadmitted standby
@@ -2926,40 +3014,59 @@ impl FontCache {
         if self.standby_bytes == 0 {
             return;
         }
+        // Fast path: when no standby companion faces could have deduplicated
+        // against a newly added program and total bytes already fit, avoid
+        // scanning `embedded_companions` (keeps loading N aliases O(N)).
+        if !self.has_standby_companions
+            && permanent_total.saturating_add(self.standby_bytes) <= max_bytes
+        {
+            return;
+        }
         self.recompute_standby_bytes();
         if permanent_total.saturating_add(self.standby_bytes) <= max_bytes {
             return;
         }
         // Reclaim optional `/FontDescriptor /FontName` lookup-name overrides
         // first (grouping aliases that share one `Arc<DescriptorSubstituteSpec>`
-        // so stripping frees the shared bytes immediately), keeping zero-byte
-        // hints/ordering/ID intact.
-        let mut spec_entries: Vec<(FontId, usize)> = self
-            .embedded_companions
-            .iter()
-            .filter_map(|(&id, entry)| {
-                let spec = entry.descriptor_spec.as_ref()?;
-                (entry.admitted.is_none() && spec.extra_bytes() > 0)
-                    .then_some((id, Arc::as_ptr(spec) as usize))
-            })
-            .collect();
-        spec_entries.sort_unstable_by_key(|&(id, _)| id);
-        let mut stripped_ptrs = HashSet::new();
-        for (_, ptr) in spec_entries {
-            if !stripped_ptrs.insert(ptr) {
-                continue;
-            }
-            let mut stripped_replacement: Option<Arc<DescriptorSubstituteSpec>> = None;
-            for entry in self.embedded_companions.values_mut() {
+        // so stripping frees the shared bytes immediately in O(N) total work),
+        // keeping zero-byte hints/ordering/ID intact.
+        let mut spec_groups: HashMap<usize, (FontId, u64, Vec<FontId>)> = HashMap::new();
+        for (&id, entry) in &self.embedded_companions {
+            if entry.admitted.is_none() {
                 if let Some(spec) = entry.descriptor_spec.as_ref() {
-                    if Arc::as_ptr(spec) as usize == ptr {
+                    let extra = spec.extra_bytes();
+                    if extra > 0 {
+                        let ptr = Arc::as_ptr(spec) as usize;
+                        spec_groups
+                            .entry(ptr)
+                            .and_modify(|(min_id, _, ids)| {
+                                *min_id = (*min_id).min(id);
+                                ids.push(id);
+                            })
+                            .or_insert_with(|| (id, extra, vec![id]));
+                    }
+                }
+            }
+        }
+        let mut ordered_groups: Vec<(FontId, usize, u64, Vec<FontId>)> = spec_groups
+            .into_iter()
+            .map(|(ptr, (min_id, extra, ids))| (min_id, ptr, extra, ids))
+            .collect();
+        ordered_groups.sort_unstable_by_key(|&(min_id, _, _, _)| min_id);
+        for (_, ptr, extra, ids) in ordered_groups {
+            let mut stripped_replacement: Option<Arc<DescriptorSubstituteSpec>> = None;
+            for id in ids {
+                if let Some(entry) = self.embedded_companions.get_mut(&id) {
+                    if let Some(spec) = entry.descriptor_spec.as_ref() {
                         let repl = stripped_replacement
                             .get_or_insert_with(|| Arc::new(spec.without_lookup_name()));
                         entry.descriptor_spec = Some(Arc::clone(repl));
                     }
                 }
             }
-            self.recompute_standby_bytes();
+            if self.standby_specs.remove(&ptr) {
+                self.standby_bytes = self.standby_bytes.saturating_sub(extra);
+            }
             if permanent_total.saturating_add(self.standby_bytes) <= max_bytes {
                 return;
             }
@@ -3013,6 +3120,7 @@ impl FontCache {
             {
                 Some(total) if total <= max_bytes => {
                     self.standby_bytes = total - self.budget.bytes_used();
+                    self.has_standby_companions = true;
                     Some(comp)
                 }
                 _ => None,
@@ -3045,9 +3153,10 @@ impl FontCache {
     /// Record lightweight descriptor metadata for an embedded primary font so
     /// unreadable shown glyphs can lazily resolve a descriptor-based substitute
     /// without retaining uncharged font bytes or needing a `PdfFile`.
-    /// Any optional `lookup_name` override is shared by `Arc` and charged in
-    /// reclaimable standby bytes so primary font programs always take priority
-    /// over optional descriptor names regardless of resource iteration order.
+    /// Any optional `lookup_name` override is shared by `Arc` and charged
+    /// incrementally in reclaimable standby bytes so primary font programs
+    /// always take priority over optional descriptor names and loading many
+    /// shared resource aliases stays O(N).
     #[doc(hidden)]
     pub fn record_descriptor_substitute(
         &mut self,
@@ -3058,18 +3167,27 @@ impl FontCache {
         if !self.fonts.contains_key(&id) || self.embedded_companions.contains_key(&id) {
             return;
         }
-        let spec = if spec.extra_bytes() == 0 {
+        let extra = spec.extra_bytes();
+        let spec = if extra == 0 {
             spec
         } else {
-            match self
-                .standby_extra_bytes(None, Some(&spec))
-                .and_then(|sb| self.budget.bytes_used().checked_add(sb))
-            {
-                Some(total) if total <= max_bytes => {
-                    self.standby_bytes = total - self.budget.bytes_used();
-                    spec
+            let key = Arc::as_ptr(&spec) as usize;
+            if self.standby_specs.contains(&key) {
+                spec
+            } else {
+                match self
+                    .budget
+                    .bytes_used()
+                    .checked_add(self.standby_bytes)
+                    .and_then(|used| used.checked_add(extra))
+                {
+                    Some(total) if total <= max_bytes => {
+                        self.standby_specs.insert(key);
+                        self.standby_bytes += extra;
+                        spec
+                    }
+                    _ => Arc::new(spec.without_lookup_name()),
                 }
-                _ => Arc::new(spec.without_lookup_name()),
             }
         };
         let font_file_id = spec.font_file_id;
@@ -3385,12 +3503,16 @@ impl FontCache {
             return Some(existing_id);
         }
 
+        let prev_total = self.budget.bytes_used();
+        let prev_programs = self.budget.programs.len();
         let new_total = self.budget.admission_total(&font, max_bytes)?;
         let id = self.next_free_id()?;
         self.budget.record(&font, new_total);
         self.name_to_id.insert(name, id);
         self.fonts.insert(id, font);
-        self.reclaim_standby_for(new_total, max_bytes);
+        if new_total != prev_total || self.budget.programs.len() != prev_programs {
+            self.reclaim_standby_for(new_total, max_bytes);
+        }
         Some(id)
     }
 

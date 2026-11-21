@@ -230,6 +230,8 @@ impl LoadedFont {
         } else {
             parsed_face(self)
         };
+        let mut cmap_budget = CMAP_PROBE_BUDGET;
+        let mut confirmed_blank_gid: Option<u16> = None;
         glyphs
             .into_iter()
             .all(|(glyph_id, code, raw_code, length)| {
@@ -241,7 +243,48 @@ impl LoadedFont {
                 };
                 match state {
                     GlyphState::Drawn => true,
-                    GlyphState::Blank | GlyphState::Missing => {
+                    GlyphState::Blank => {
+                        if meaning_font.code_requires_no_ink(code, raw_code, length) {
+                            return true;
+                        }
+                        // An embedded face that stayed primary can hold genuine
+                        // non-visible blank glyphs (e.g. an unmapped space CID
+                        // whose own `cmap` maps only to whitespace) alongside
+                        // another source code on the same CID that triggered
+                        // substitution via `/ToUnicode`.
+                        if !self.is_substitute
+                            && meaning_font
+                                .direct_code_visibility(code, raw_code, length)
+                                .is_none()
+                        {
+                            if let Some(face) = &face {
+                                if let Some(gid) = self.drawing_gid_with_face(glyph_id, face) {
+                                    if confirmed_blank_gid == Some(gid) {
+                                        return true;
+                                    }
+                                    if matches!(
+                                        glyf_blank_header(face, gid),
+                                        GlyfBlankHeader::ZeroLength
+                                            | GlyfBlankHeader::ValidNonEmpty
+                                    ) && cmap_maps_visible_to_gid(face, gid, &mut cmap_budget)
+                                        == Ok(false)
+                                    {
+                                        confirmed_blank_gid = Some(gid);
+                                        return true;
+                                    }
+                                }
+                            } else if let Some(t1) = &self.type1 {
+                                if glyph_id != 0
+                                    && !t1.is_gid_unreadable(glyph_id)
+                                    && t1.is_blank_gid(glyph_id)
+                                {
+                                    return true;
+                                }
+                            }
+                        }
+                        false
+                    }
+                    GlyphState::Missing => {
                         meaning_font.code_requires_no_ink(code, raw_code, length)
                     }
                 }
@@ -1395,11 +1438,23 @@ impl FontCache {
                     None => {
                         original.glyph_id != 0
                             && match cmap_budget {
-                                Some(budget) => primary.is_embedded_glyph_unreadable_with_budget(
+                                Some(budget) => primary.is_shown_embedded_glyph_unreadable(
                                     original.glyph_id,
+                                    code,
+                                    raw_code,
+                                    length,
                                     budget,
                                 ),
-                                None => primary.is_embedded_glyph_unreadable(original.glyph_id),
+                                None => {
+                                    let mut budget = CMAP_PROBE_BUDGET;
+                                    primary.is_shown_embedded_glyph_unreadable(
+                                        original.glyph_id,
+                                        code,
+                                        raw_code,
+                                        length,
+                                        &mut budget,
+                                    )
+                                }
                             }
                     }
                 };
@@ -1569,7 +1624,36 @@ impl FontCache {
                     }
                     self.recompute_standby_bytes();
                 }
+                // Release this entry's own optional lookup-name override before
+                // `admit_drawing_font` runs standby reclamation so admitting
+                // this companion does not strip a lower-ID font's lookup name
+                // when releasing its own name already frees enough space.
+                // Restore the original spec intact if admission fails.
+                let released_spec = self
+                    .embedded_companions
+                    .get_mut(&original.font_id)
+                    .and_then(|entry| {
+                        let had_extra = entry
+                            .descriptor_spec
+                            .as_ref()
+                            .is_some_and(|spec| spec.extra_bytes() > 0);
+                        entry.descriptor_spec.take().map(|spec| (spec, had_extra))
+                    });
+                if released_spec
+                    .as_ref()
+                    .is_some_and(|(_, had_extra)| *had_extra)
+                {
+                    self.recompute_standby_bytes();
+                }
                 let Some(id) = self.admit_drawing_font(companion, max_bytes) else {
+                    if let Some((spec, had_extra)) = released_spec {
+                        if let Some(entry) = self.embedded_companions.get_mut(&original.font_id) {
+                            entry.descriptor_spec = Some(spec);
+                        }
+                        if had_extra {
+                            self.recompute_standby_bytes();
+                        }
+                    }
                     if was_deferred {
                         // `FontCacheBudget` is non-evicting, so a deferred
                         // companion that exceeded `remaining` cannot fit later
@@ -1583,9 +1667,7 @@ impl FontCache {
                 };
                 if let Some(entry) = self.embedded_companions.get_mut(&original.font_id) {
                     entry.admitted = Some(id);
-                    entry.descriptor_spec = None;
                 }
-                self.recompute_standby_bytes();
                 id
             }
         };
