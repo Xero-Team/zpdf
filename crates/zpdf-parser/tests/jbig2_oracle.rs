@@ -2286,6 +2286,37 @@ fn oracle_pattern_dict_and_halftone_regions() {
     // Non-blank verification: cells (0,0)=p1, (1,0)=p2, (0,1)=p3, (1,1)=p0.
     let expected = Bitmap::from_art(&["#.#.", "...#", "##..", "##.."]);
     assert_eq!(img.pixels, expected.data);
+
+    // Under a tight shared pixel-work allowance (`max_image_pixels = 262_144`,
+    // `region_work_limit = 524_288`), one clipped 256x256 halftone (262,144
+    // traversal work) still renders and matches hayro-jbig2 bit-for-bit, while
+    // repeated clipped halftones stop on cumulative pixel-work exhaustion.
+    let tight_limits = ParseLimits {
+        max_image_pixels: (big_hgw * big_hgh * 4) as u64,
+        ..ParseLimits::default()
+    };
+    let z_one = decode_zpdf(&page, Some(&globals), &tight_limits)
+        .expect("one clipped halftone fits the tight shared pixel-work allowance");
+    assert_eq!(z_one, img.packed_pdf);
+
+    let mut repeated_clipped = page.clone();
+    repeated_clipped.extend_from_slice(&segment(4, 22, &[1], 1, &clipped_ht));
+    repeated_clipped.extend_from_slice(&segment(5, 22, &[1], 1, &clipped_ht));
+    assert!(
+        decode_hayro(
+            &repeated_clipped,
+            Some(&globals),
+            DecodeSettings { strict: false },
+        )
+        .is_ok(),
+        "hayro-jbig2 decodes repeated clipped halftones unconditionally"
+    );
+    let err = decode_zpdf(&repeated_clipped, Some(&globals), &tight_limits)
+        .expect_err("zpdf must stop repeated clipped halftone full-grid scans");
+    assert!(
+        err.to_string().contains("pixel-work budget"),
+        "expected cumulative pixel-work budget error, got {err}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2505,10 +2536,11 @@ fn extract_jbig2_inputs(file: &PdfFile, id: ObjectId) -> Option<(Vec<u8>, Option
 
 #[test]
 fn oracle_extract_jbig2_inputs_preserves_prefix_decode_parms() {
-    // Build a valid 72-byte (9 x 8) JBIG2 stream + globals, encode the JBIG2
-    // bytes with PNG Up predictor (Predictor=12, Columns=8) + FlateDecode, and
-    // wrap in a PDF with `/Filter [/FlateDecode /JBIG2Decode]` and indirect
-    // positional `/DecodeParms [4 0 R 5 0 R]`.
+    // Build a valid PDF-embedded JBIG2 stream + globals (no EndOfPage/EndOfFile
+    // per ISO 32000-1 §7.4.7), encode the JBIG2 bytes with PNG Up predictor
+    // (Predictor=12) + FlateDecode, and wrap in a PDF with
+    // `/Filter [/FlateDecode /JBIG2Decode]` and indirect positional
+    // `/DecodeParms [4 0 R 5 0 R]`.
     let sym = Bitmap::from_art(&["#.#", ".#.", "#.#"]);
     let globals = segment(1, 0, &[], 0, &symbol_dict_payload(&[&sym], 0));
     let mut page = segment(2, 48, &[], 1, &page_info_payload(8, 3, 0));
@@ -2533,8 +2565,7 @@ fn oracle_extract_jbig2_inputs_preserves_prefix_decode_parms() {
             &[(0, 2, vec![(0, 0, 0)])],
         ),
     ));
-    page.extend_from_slice(&segment(4, 49, &[], 1, &[])); // EndOfPage
-                                                          // Choose a column count dividing `page.len()` cleanly (or 1 -> exact length).
+    // Choose a column count dividing `page.len()` cleanly (or 1 -> exact length).
     let cols = [8usize, 4, 2, 1]
         .into_iter()
         .find(|&c| page.len().is_multiple_of(c))

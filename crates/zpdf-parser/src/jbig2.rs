@@ -135,9 +135,10 @@ struct PixelLimits {
     /// Cap on any single bitmap or halftone grid: [`MAX_BITMAP_PIXELS`]
     /// tightened by `ParseLimits::max_image_pixels`.
     max_pixels: usize,
-    /// Generic/refinement pixel work across globals and all page segments.
-    /// Two bitmap passes cover one full-sized region plus row predictions;
-    /// unlike the per-region MQ allowance this is never replenished.
+    /// Generic, refinement, and halftone pixel work across globals and all page
+    /// segments. Two bitmap passes cover one full-sized region (or one
+    /// max-sized halftone grid) plus row predictions; unlike the per-region MQ
+    /// allowance this is never replenished.
     region_work: u64,
     region_work_limit: u64,
     /// Pixels composited so far by the region drawing loops.
@@ -199,6 +200,29 @@ impl PixelLimits {
                 .saturating_mul(height as u64)
                 .saturating_add(height as u64),
         );
+        self.check_region_work()
+    }
+
+    /// Charge halftone full-grid traversal — optional `HSKIP` construction,
+    /// `hbpp` grayscale bitplane scans (decode + Gray-code combine), and final
+    /// grid placement — or the output region area if larger, before allocating
+    /// the skip bitmap.
+    fn charge_halftone_grid(
+        &mut self,
+        hgw: usize,
+        hgh: usize,
+        hbpp: usize,
+        enable_skip: bool,
+        region_width: usize,
+        region_height: usize,
+    ) -> Result<()> {
+        let grid_cells = (hgw as u64).saturating_mul(hgh as u64);
+        let grid_passes = u64::from(enable_skip)
+            .saturating_add(hbpp as u64)
+            .saturating_add(1);
+        let grid_work = grid_cells.saturating_mul(grid_passes);
+        let region_area = (region_width as u64).saturating_mul(region_height as u64);
+        self.region_work = self.region_work.saturating_add(grid_work.max(region_area));
         self.check_region_work()
     }
 
@@ -3302,9 +3326,13 @@ impl<'a> Decoder<'a> {
             hgh,
             "halftone grayscale image",
         )?;
+        // Charge cumulative full-grid traversal (optional HSKIP build, per-plane
+        // scans, and placement) before allocating `skip`, so repeated heavily
+        // clipped halftone segments cannot bypass MQ/draw budgets.
+        self.pixels
+            .charge_halftone_grid(hgw, hgh, hbpp, enable_skip, info.width, info.height)?;
         // Optional skip bitmap (T.88 6.6.5.1): a cell is skipped when its
-        // pattern would fall entirely outside the region. Full-grid traversal
-        // is already bounded by `self.pixels.check` above.
+        // pattern would fall entirely outside the region.
         let (skip, coded_cells) = if enable_skip {
             let mut s = Bitmap::new(hgw, hgh, 0)?;
             let mut coded = 0usize;
@@ -3337,6 +3365,9 @@ impl<'a> Decoder<'a> {
 
         let mut bm = Bitmap::new(info.width, info.height, def_pixel)?;
         self.pixels.cover(bm.data.len());
+        if !mmr && coded_cells == 0 {
+            return Ok((info, bm));
+        }
 
         // Decode the grayscale image: HBPP bitplanes, MSB first, Gray-coded
         // (T.88 Annex C.5). Each plane is a generic region of size HGW×HGH.
@@ -3667,6 +3698,17 @@ mod tests {
     /// already-coded pixels, so encoding straight off the full bitmap matches
     /// the decoder's progressive reconstruction.
     fn encode_generic(enc: &mut MqEncoder, cx: &mut [u8], bm: &Bitmap, p: &GenericParams) {
+        encode_generic_with_skip(enc, cx, bm, p, None);
+    }
+
+    /// Encoder mirror of [`decode_generic_with_skip`].
+    fn encode_generic_with_skip(
+        enc: &mut MqEncoder,
+        cx: &mut [u8],
+        bm: &Bitmap,
+        p: &GenericParams,
+        skip: Option<&Bitmap>,
+    ) {
         let ctx_at = context_fn(p.template);
         let tpgd_cx = tpgd_context(p.template);
         let row_eq_prev = |y: usize| {
@@ -3688,6 +3730,9 @@ mod tests {
                 }
             }
             for x in 0..bm.width {
+                if skip.is_some_and(|s| s.get(x as i64, y as i64) != 0) {
+                    continue;
+                }
                 let ctx = ctx_at(bm, x as i64, y as i64, &p.at);
                 enc.encode(cx, ctx, bm.get(x as i64, y as i64));
             }
@@ -5716,6 +5761,140 @@ mod tests {
             decode_with_draw_floor(&halftone_stream((64, 64), &pd, &ht), DRAW_BUDGET_FLOOR);
         assert_eq!(out.unwrap(), vec![0xFF; 512], "region blank, page kept");
         assert!(drawn > limit && drawn <= limit + 4096);
+    }
+
+    /// Heavily clipped halftone grids with `ENABLE_SKIP = 1` barely touch the
+    /// MQ counter or `draw_clipped`, yet still scan the full grid for `HSKIP`,
+    /// per-plane bitplanes, and placement. Charging full-grid traversal to the
+    /// shared `region_work` allowance lets one clipped region render while
+    /// stopping repeated scans before allocating `HSKIP`.
+    #[test]
+    fn halftone_clipped_grid_traversal_is_charged_cumulatively() {
+        let p0 = bitmap_from(&["..", ".."]);
+        let p1 = bitmap_from(&["#.", ".."]);
+        let p2 = bitmap_from(&["#.", ".#"]);
+        let p3 = bitmap_from(&["##", "##"]);
+        let pd = pattern_dict_payload(&[&p0, &p1, &p2, &p3]);
+
+        // 64x64 grid (4,096 cells, hbpp = 2, ENABLE_SKIP = 1) clipped to a 4x4
+        // region: only 4 cells overlap the region (16 drawn pixels).
+        let (hgw, hgh) = (64usize, 64usize);
+        let mut ht = region_info(4, 4, 0, 0, 0);
+        ht.push(0x08); // MMR=0, template=0, ENABLE_SKIP=1, OR, def_pixel=0
+        ht.extend_from_slice(&(hgw as u32).to_be_bytes());
+        ht.extend_from_slice(&(hgh as u32).to_be_bytes());
+        ht.extend_from_slice(&0u32.to_be_bytes()); // HGX
+        ht.extend_from_slice(&0u32.to_be_bytes()); // HGY
+        ht.extend_from_slice(&(2u16 << 8).to_be_bytes()); // HRX = 2.0
+        ht.extend_from_slice(&0u16.to_be_bytes()); // HRY = 0
+
+        let mut skip = Bitmap::new(hgw, hgh, 1).unwrap();
+        for m in 0..2 {
+            for n in 0..2 {
+                skip.set(n, m, 0);
+            }
+        }
+        let visible_gray = [[1u32, 2], [0, 3]];
+        let mut enc = MqEncoder::new();
+        let mut cx = vec![0u8; 1 << 16];
+        let at = [(3i8, -1i8), (-3, -1), (2, -2), (-2, -2)];
+        for j in (0..2usize).rev() {
+            let mut plane = Bitmap::new(hgw, hgh, 0).unwrap();
+            for (m, row) in visible_gray.iter().enumerate() {
+                for (n, &v) in row.iter().enumerate() {
+                    let g = v ^ (v >> 1);
+                    if (g >> j) & 1 == 1 {
+                        plane.set(n, m, 1);
+                    }
+                }
+            }
+            encode_generic_with_skip(
+                &mut enc,
+                &mut cx,
+                &plane,
+                &GenericParams {
+                    template: 0,
+                    tpgdon: false,
+                    at,
+                },
+                Some(&skip),
+            );
+        }
+        ht.extend_from_slice(&enc.finish());
+
+        let expected = packed_from(&["#.#.", "...#", "..##", "..##"]);
+        // Charge per segment: (1 skip + 2 bitplanes + 1 placement) * 4,096 = 16,384.
+        let single_charge = (1 + 2 + 1) * (hgw * hgh) as u64;
+
+        // With a shared allowance sized for one clipped halftone, a single
+        // region renders cleanly while repeated scans stop on the second one.
+        let one_region = halftone_stream((4, 4), &pd, &ht);
+        let mut budget = DecodeBudget::new(u64::MAX);
+        let mut dec = Decoder::new(&mut budget, single_charge);
+        dec.pixels.region_work_limit = single_charge;
+        dec.process_segments(&one_region).unwrap();
+        assert_eq!(dec.pixels.region_work, single_charge);
+        assert_eq!(dec.pixels.drawn, 16);
+        assert_eq!(dec.into_packed_output().unwrap(), expected);
+
+        let mut repeated = one_region.clone();
+        for seg_num in 3..12u32 {
+            repeated.extend_from_slice(&segment(seg_num, 22, &[1], 1, &ht));
+        }
+        let mut budget = DecodeBudget::new(u64::MAX);
+        let mut dec = Decoder::new(&mut budget, single_charge);
+        dec.pixels.region_work_limit = single_charge;
+        let err = dec.process_segments(&repeated).unwrap_err();
+        assert!(err.to_string().contains("pixel-work budget"), "{err}");
+        assert_eq!(
+            dec.pixels.region_work,
+            2 * single_charge,
+            "repeated scans must halt immediately on the second segment"
+        );
+
+        // Through the public `decode()` entry point (`region_work_limit = 2 * max_image_pixels`),
+        // one region renders while 3 repeated regions — or regions split across
+        // globals and the page — exceed the shared budget.
+        let mut budget = DecodeBudget::new(u64::MAX);
+        assert_eq!(
+            decode(
+                &one_region,
+                &Jbig2Params { globals: None },
+                single_charge,
+                &mut budget,
+            )
+            .unwrap(),
+            expected
+        );
+        let mut three_regions = one_region;
+        three_regions.extend_from_slice(&segment(3, 22, &[1], 1, &ht));
+        three_regions.extend_from_slice(&segment(4, 22, &[1], 1, &ht));
+        let mut budget = DecodeBudget::new(u64::MAX);
+        let err = decode(
+            &three_regions,
+            &Jbig2Params { globals: None },
+            single_charge,
+            &mut budget,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("pixel-work budget"), "{err}");
+
+        let mut globals = segment(1, 16, &[], 0, &pd);
+        globals.extend_from_slice(&segment(2, 20, &[1], 0, &ht));
+        let mut page = segment(3, 48, &[], 1, &page_info_payload(4, 4, 0));
+        page.extend_from_slice(&segment(4, 22, &[1], 1, &ht));
+        page.extend_from_slice(&segment(5, 22, &[1], 1, &ht));
+        let mut budget = DecodeBudget::new(u64::MAX);
+        let err = decode(
+            &page,
+            &Jbig2Params {
+                globals: Some(globals),
+            },
+            single_charge,
+            &mut budget,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("pixel-work budget"), "{err}");
     }
 
     /// The text-region placement loop shares the budget: with no floor it is

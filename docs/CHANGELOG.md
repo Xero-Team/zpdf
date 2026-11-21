@@ -27,13 +27,15 @@
   budgets, and per-region fault isolation. (#173)
 - Fix five ITU-T T.88 JBIG2 decoding bugs uncovered by the differential oracle:
   byte-align after Huffman text-region symbol-ID tables (§7.4.3.1.7), skip MQ
-  decoding on `HSKIP` cells in halftone bitplanes and budget only coded cells
-  (Annex C.5), use `ceil(log2(SBNUMSYMS))` (`0` for 1-symbol dictionaries) for
-  arithmetic `IAID` (§7.4.3.1 / Annex A.3), decode `BMSIZE == 0` Huffman
-  symbol-dictionary collective bitmaps as uncompressed rows charged to
-  `DecodeBudget` while rejecting positive `BMSIZE` extending past the segment
-  (§6.5.9), and slice Huffman text-region refinement payloads to `RSIZE` while
-  reusing refinement contexts across instances (§6.4.11). (#173)
+  decoding on `HSKIP` cells in halftone bitplanes while budgeting coded cells
+  for MQ and charging full-grid traversal to the shared region pixel-work
+  allowance (Annex C.5), use `ceil(log2(SBNUMSYMS))` (`0` for 1-symbol
+  dictionaries) for arithmetic `IAID` (§7.4.3.1 / Annex A.3), decode
+  `BMSIZE == 0` Huffman symbol-dictionary collective bitmaps as uncompressed
+  rows charged to `DecodeBudget` while rejecting positive `BMSIZE` extending
+  past the segment (§6.5.9), and slice Huffman text-region refinement payloads
+  to `RSIZE` while reusing refinement contexts across instances (§6.4.11).
+  (#173)
 
 ## 0.21.0 — Glyph-level selection and rendering compatibility
 
