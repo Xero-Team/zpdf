@@ -16,6 +16,12 @@ Released 2026-11-23.
   alongside packed big-endian source bytes in `code`. Struct size stays 20 bytes
   (reusing padding after `glyph_id`); under pre-1.0 semver this ships in the
   `0.22.0` minor release. (#157, #193)
+- **Breaking:** exhaustive `zpdf_font::LoadedFont` literals must add
+  `direct_composite_gids: false` (matching the font constructors and preserving
+  previous glyph mapping behavior). Setting `direct_composite_gids: true` (via
+  `LoadedFont::enable_direct_composite_gids`) resolves drawing GIDs per source
+  code on substituted Type 0 fonts via `/ToUnicode` and `/Encoding` CMaps while
+  keeping original CID advances. (#157, #193)
 
 ### Rendering and font recovery
 
