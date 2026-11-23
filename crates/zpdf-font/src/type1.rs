@@ -905,41 +905,67 @@ fn parse_font_matrix(clear: &[u8]) -> Option<[f64; 6]> {
 
 fn parse_builtin_encoding(clear: &[u8]) -> Vec<Option<String>> {
     let mut enc: Vec<Option<String>> = vec![None; 256];
-    if let Some(pos) = find(clear, b"/Encoding") {
-        let region = &clear[pos..];
-        if find_token(region, b"StandardEncoding").is_some() {
-            for (i, slot) in enc.iter_mut().enumerate() {
-                *slot = STANDARD_ENCODING[i].map(|s| s.to_string());
-            }
-            return enc;
+    let mut p = 0;
+    // Locate the `/Encoding` literal name token, skipping `%` comments and
+    // string literals such as `/Notice (/Encoding StandardEncoding)`.
+    let mut found_encoding = false;
+    while let Some((tok, next_p)) = next_ps_token(clear, p) {
+        p = next_p;
+        if tok == b"/Encoding" {
+            found_encoding = true;
+            break;
         }
-        // Custom: a sequence of `dup <code> /<name> put`.
-        let mut i = 0;
-        while let Some(pos) = find_token_in(region, i, region.len(), b"dup") {
-            let mut p = pos + 3;
-            let (code, np) = match read_uint(region, p) {
-                Some(v) => v,
-                None => {
-                    i = p;
-                    continue;
-                }
-            };
-            p = np;
-            while p < region.len() && is_ws(region[p]) {
-                p += 1;
+    }
+    if !found_encoding {
+        return enc;
+    }
+
+    // Read only `/Encoding`'s own declaration (stopping at its closing `def`
+    // at brace depth 0) so later metadata such as `/Notice (StandardEncoding)`
+    // in `FontInfo` cannot overwrite a custom encoding.
+    let Some((first_tok, next_p)) = next_ps_token(clear, p) else {
+        return enc;
+    };
+    if first_tok == b"StandardEncoding" {
+        for (i, slot) in enc.iter_mut().enumerate() {
+            *slot = STANDARD_ENCODING[i].map(|s| s.to_string());
+        }
+        p = next_p;
+    }
+
+    let mut brace_depth = 0usize;
+    while let Some((tok, next_p)) = next_ps_token(clear, p) {
+        p = next_p;
+        match tok {
+            b"{" => {
+                brace_depth += 1;
+                continue;
             }
-            if p < region.len() && region[p] == b'/' {
-                p += 1;
-                let start = p;
-                while p < region.len() && !is_ws(region[p]) && !is_delim(region[p]) {
-                    p += 1;
-                }
-                if code < 256 && p - start <= MAX_GLYPH_NAME_LEN {
-                    let name = String::from_utf8_lossy(&region[start..p]).into_owned();
-                    enc[code] = Some(name);
-                }
+            b"}" => {
+                brace_depth = brace_depth.saturating_sub(1);
+                continue;
             }
-            i = p;
+            b"def" if brace_depth == 0 => break,
+            b"dup" if brace_depth == 0 => {}
+            _ => continue,
+        }
+        let Some((code_tok, p1)) = next_ps_token(clear, p) else {
+            break;
+        };
+        let Some(code) = parse_ps_int(code_tok).and_then(|v| usize::try_from(v).ok()) else {
+            // Re-inspect `code_tok` on the next iteration (e.g. `def` or `dup`).
+            continue;
+        };
+        let Some((name_tok, p2)) = next_ps_token(clear, p1) else {
+            break;
+        };
+        if let Some(name_bytes) = name_tok.strip_prefix(b"/") {
+            if code < 256 && name_bytes.len() <= MAX_GLYPH_NAME_LEN {
+                enc[code] = Some(String::from_utf8_lossy(name_bytes).into_owned());
+            }
+            p = p2;
+        } else {
+            p = p1;
         }
     }
     enc
@@ -957,148 +983,170 @@ fn decrypt_charstring(data: &[u8], len_iv: i32) -> Vec<u8> {
 }
 
 fn parse_len_iv(private: &[u8]) -> Option<i32> {
-    let pos = find(private, b"/lenIV")?;
-    let (v, _) = read_int(private, pos + 6)?;
+    let pos = find_private_name(private, b"/lenIV")?;
+    let (tok, _) = next_ps_token(private, pos)?;
+    let v = parse_ps_int(tok)?;
     i32::try_from(v).ok()
 }
 
 fn parse_subrs(private: &[u8], len_iv: i32) -> Vec<Vec<u8>> {
     let mut subrs: Vec<Vec<u8>> = Vec::new();
-    let start = match find(private, b"/Subrs") {
-        Some(s) => s,
-        None => return subrs,
+    let Some(start) = find_private_name(private, b"/Subrs") else {
+        return subrs;
     };
-    // Optional count to pre-size.
-    if let Some((count, _)) = read_int(private, start + 6) {
-        if (0..MAX_TYPE1_SUBRS as i64).contains(&count) {
-            subrs.resize(count as usize, Vec::new());
+    let mut p = start;
+    // Optional count to pre-size: `/Subrs <count> array`.
+    if let Some((tok, _)) = next_ps_token(private, p) {
+        if let Some(count) = parse_ps_int(tok) {
+            if (0..MAX_TYPE1_SUBRS as i64).contains(&count) {
+                subrs.resize(count as usize, Vec::new());
+            }
         }
     }
-    let mut i = start + 6;
-    // Stop scanning at CharStrings (the next section).
-    let end = find(&private[start..], b"/CharStrings")
-        .map(|rel| start + rel)
-        .unwrap_or(private.len());
-    while i < end {
-        let pos = match find_token_in(private, i, end, b"dup") {
-            Some(p) => p,
-            None => break,
-        };
-        let mut p = pos + 3;
-        let idx = match read_int(private, p) {
-            Some((v, np)) => {
-                p = np;
-                v
-            }
-            None => {
-                i = p;
+
+    // Scan PostScript tokens from `/Subrs` until the real `/CharStrings`
+    // literal name, skipping `%` comments, literal strings, and every
+    // length-delimited `RD`/`-|` binary payload.
+    let mut prev_int: Option<i64> = None;
+    while let Some((tok, next_p)) = next_ps_token(private, p) {
+        p = next_p;
+        if tok == b"/CharStrings" {
+            break;
+        }
+        if tok == b"dup" {
+            prev_int = None;
+            let Some((idx_tok, p1)) = next_ps_token(private, p) else {
+                break;
+            };
+            let Some(idx) = parse_ps_int(idx_tok) else {
+                // Re-inspect `idx_tok` on the next iteration so tokens such as
+                // `/CharStrings` or a nested `dup` are not skipped.
+                continue;
+            };
+            let Some((len_tok, p2)) = next_ps_token(private, p1) else {
+                break;
+            };
+            let Some(len) = parse_ps_int(len_tok) else {
+                prev_int = Some(idx);
+                p = p1;
+                continue;
+            };
+            let Some((rd_tok, p3)) = next_ps_token(private, p2) else {
+                break;
+            };
+            if rd_tok != b"RD" && rd_tok != b"-|" {
+                prev_int = Some(len);
+                p = p2;
                 continue;
             }
-        };
-        let len = match read_int(private, p) {
-            Some((v, np)) => {
-                p = np;
-                v
-            }
-            None => {
-                i = p;
+            let Some(data_start) = p3.checked_add(1) else {
+                break;
+            }; // single separator byte
+            let Ok(len_usize) = usize::try_from(len) else {
+                p = p3;
                 continue;
+            };
+            let Some(data_end) = data_start.checked_add(len_usize) else {
+                break;
+            };
+            if data_end > private.len() {
+                break;
             }
-        };
-        // Binary token: RD or -|
-        let (tok, np) = read_token(private, p);
-        p = np;
-        if tok != b"RD" && tok != b"-|" {
-            i = p;
+            let cs = decrypt_charstring(&private[data_start..data_end], len_iv);
+            if idx >= 0 {
+                let idx = idx as usize;
+                if idx < MAX_TYPE1_SUBRS {
+                    if idx >= subrs.len() {
+                        subrs.resize(idx + 1, Vec::new());
+                    }
+                    subrs[idx] = cs;
+                }
+            }
+            p = data_end;
             continue;
         }
-        let Some(data_start) = p.checked_add(1) else {
-            break;
-        }; // single separator space
-        let len = len.max(0) as usize;
-        let Some(end) = data_start.checked_add(len) else {
-            break;
-        };
-        if len > private.len() || end > private.len() {
-            break;
-        }
-        let cs = decrypt_charstring(&private[data_start..end], len_iv);
-        if idx >= 0 {
-            let idx = idx as usize;
-            if idx >= MAX_TYPE1_SUBRS {
-                i = end;
-                continue;
+        // Skip any other length-delimited `RD`/`-|` payload so raw binary bytes
+        // cannot be mistaken for `dup` or `/CharStrings`.
+        if (tok == b"RD" || tok == b"-|") && prev_int.is_some_and(|n| n >= 0) {
+            let len_usize = prev_int.unwrap() as usize;
+            prev_int = None;
+            let Some(data_start) = p.checked_add(1) else {
+                break;
+            };
+            let Some(data_end) = data_start.checked_add(len_usize) else {
+                break;
+            };
+            if data_end > private.len() {
+                break;
             }
-            if idx >= subrs.len() {
-                subrs.resize(idx + 1, Vec::new());
-            }
-            subrs[idx] = cs;
+            p = data_end;
+            continue;
         }
-        i = end;
+        prev_int = parse_ps_int(tok);
     }
     subrs
 }
 
 fn parse_charstrings(private: &[u8], len_iv: i32) -> HashMap<String, Vec<u8>> {
     let mut out = HashMap::new();
-    let start = match find(private, b"/CharStrings") {
-        Some(s) => s,
-        None => return out,
+    let Some(start) = find_private_name(private, b"/CharStrings") else {
+        return out;
     };
-    // Skip to the dictionary body (after "begin").
-    let mut i = match find(&private[start..], b"begin") {
-        Some(b) => start + b + 5,
-        None => start + 12,
-    };
-    while i < private.len() {
+    // Skip to the dictionary body (after `begin`), falling back to `start` if
+    // a malformed font omits `begin` before the first `/<name>` entry.
+    let mut scan = start;
+    let mut p = start;
+    while let Some((tok, next_p)) = next_ps_token(private, scan) {
+        scan = next_p;
+        if tok == b"begin" {
+            p = next_p;
+            break;
+        }
+        if tok.starts_with(b"/") {
+            break;
+        }
+    }
+    while let Some((tok, next_p)) = next_ps_token(private, p) {
         if out.len() >= MAX_TYPE1_GLYPHS {
             break;
         }
-        // Next glyph entry starts with '/'.
-        let rel = match private[i..].iter().position(|&b| b == b'/') {
-            Some(r) => r,
-            None => break,
-        };
-        let mut p = i + rel + 1;
-        let name_start = p;
-        while p < private.len() && !is_ws(private[p]) && !is_delim(private[p]) {
-            p += 1;
+        p = next_p;
+        if tok == b"end" {
+            break;
         }
-        if p - name_start > MAX_GLYPH_NAME_LEN {
-            i = p;
+        let Some(name_bytes) = tok.strip_prefix(b"/") else {
+            continue;
+        };
+        if name_bytes.len() > MAX_GLYPH_NAME_LEN {
             continue;
         }
-        let name = String::from_utf8_lossy(&private[name_start..p]).into_owned();
-
-        let len = match read_int(private, p) {
-            Some((v, np)) => {
-                p = np;
-                v
-            }
-            None => {
-                i = p;
-                continue;
-            }
+        let Some((len_tok, p1)) = next_ps_token(private, p) else {
+            break;
         };
-        let (tok, np) = read_token(private, p);
-        p = np;
-        if tok != b"RD" && tok != b"-|" {
-            // Not a charstring entry (e.g. reached "end"); stop.
+        let Some(len) = parse_ps_int(len_tok) else {
+            continue;
+        };
+        let Some((rd_tok, p2)) = next_ps_token(private, p1) else {
+            break;
+        };
+        if rd_tok != b"RD" && rd_tok != b"-|" {
+            // Not a charstring entry; stop.
             break;
         }
-        let Some(data_start) = p.checked_add(1) else {
+        let Some(data_start) = p2.checked_add(1) else {
             break;
-        }; // single separator space
+        }; // single separator byte
         let len = len.max(0) as usize;
-        let Some(end) = data_start.checked_add(len) else {
+        let Some(data_end) = data_start.checked_add(len) else {
             break;
         };
-        if end > private.len() {
+        if data_end > private.len() {
             break;
         }
-        let cs = decrypt_charstring(&private[data_start..end], len_iv);
+        let name = String::from_utf8_lossy(name_bytes).into_owned();
+        let cs = decrypt_charstring(&private[data_start..data_end], len_iv);
         out.insert(name, cs);
-        i = end;
+        p = data_end;
     }
     out
 }
@@ -1123,83 +1171,93 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
-/// Find a needle only when it stands as a whole PostScript token.
-fn find_token(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    find_token_in(haystack, 0, haystack.len(), needle)
-}
-
-/// Find `needle` as a whole PostScript token within `data[start..end]`,
-/// skipping `%` comments forward from `start` and inspecting boundary bytes in
-/// the full `data` slice so sliced searches do not treat mid-identifier offsets
-/// as token boundaries.
-fn find_token_in(data: &[u8], start: usize, end: usize, needle: &[u8]) -> Option<usize> {
-    let end = end.min(data.len());
-    if needle.is_empty() || start >= end {
-        return None;
-    }
-    let mut p = start;
-    while p < end {
-        if data[p] == b'%' {
-            while p < end && data[p] != b'\n' && data[p] != b'\r' {
+/// Read the next PostScript token starting at or after `pos`, skipping leading
+/// whitespace and `%` comments. Literal strings `(...)` are consumed as a
+/// single token so comments or names inside them are not misinterpreted.
+fn next_ps_token(data: &[u8], mut p: usize) -> Option<(&[u8], usize)> {
+    while p < data.len() {
+        if is_ws(data[p]) {
+            p += 1;
+        } else if data[p] == b'%' {
+            while p < data.len() && data[p] != b'\n' && data[p] != b'\r' {
                 p += 1;
             }
-            continue;
+        } else {
+            break;
         }
-        if p + needle.len() <= end && &data[p..p + needle.len()] == needle {
-            // PostScript tokens are bounded by whitespace or delimiters, except
-            // `/` starts a literal name (`/dup`) rather than an executable token.
-            let before_ok =
-                p == 0 || is_ws(data[p - 1]) || (is_delim(data[p - 1]) && data[p - 1] != b'/');
-            let after = p + needle.len();
-            let after_ok = after >= data.len() || is_ws(data[after]) || is_delim(data[after]);
-            if before_ok && after_ok {
-                return Some(p);
-            }
-        }
-        p += 1;
     }
-    None
-}
-
-/// Read a signed integer starting at/after `pos` (skipping leading whitespace).
-fn read_int(data: &[u8], mut pos: usize) -> Option<(i64, usize)> {
-    while pos < data.len() && is_ws(data[pos]) {
-        pos += 1;
-    }
-    let start = pos;
-    if pos < data.len() && (data[pos] == b'-' || data[pos] == b'+') {
-        pos += 1;
-    }
-    let digit_start = pos;
-    while pos < data.len() && data[pos].is_ascii_digit() {
-        pos += 1;
-    }
-    if pos == digit_start {
+    if p >= data.len() {
         return None;
     }
-    let v: i64 = std::str::from_utf8(&data[start..pos]).ok()?.parse().ok()?;
-    Some((v, pos))
-}
-
-fn read_uint(data: &[u8], pos: usize) -> Option<(usize, usize)> {
-    let (v, np) = read_int(data, pos)?;
-    if v < 0 {
-        None
-    } else {
-        Some((v as usize, np))
+    let start = p;
+    match data[p] {
+        b'(' => {
+            p += 1;
+            let mut depth = 1usize;
+            while p < data.len() && depth > 0 {
+                match data[p] {
+                    b'\\' => {
+                        p = (p + 2).min(data.len());
+                        continue;
+                    }
+                    b'(' => depth += 1,
+                    b')' => depth -= 1,
+                    _ => {}
+                }
+                p += 1;
+            }
+            Some((&data[start..p], p))
+        }
+        b'/' => {
+            p += 1;
+            if p < data.len() && data[p] == b'/' {
+                p += 1;
+            }
+            while p < data.len() && !is_ws(data[p]) && !is_delim(data[p]) {
+                p += 1;
+            }
+            Some((&data[start..p], p))
+        }
+        b if is_delim(b) => Some((&data[start..start + 1], start + 1)),
+        _ => {
+            while p < data.len() && !is_ws(data[p]) && !is_delim(data[p]) {
+                p += 1;
+            }
+            Some((&data[start..p], p))
+        }
     }
 }
 
-/// Read a whitespace-delimited token (skipping leading whitespace).
-fn read_token(data: &[u8], mut pos: usize) -> (&[u8], usize) {
-    while pos < data.len() && is_ws(data[pos]) {
-        pos += 1;
+fn parse_ps_int(tok: &[u8]) -> Option<i64> {
+    std::str::from_utf8(tok).ok()?.parse::<i64>().ok()
+}
+
+/// Find the byte offset immediately after a PostScript literal name (such as
+/// `/Subrs`, `/CharStrings`, or `/lenIV`) in the decrypted private section,
+/// skipping `%` comments, string literals, and length-delimited `RD`/`-|`
+/// binary payloads.
+fn find_private_name(private: &[u8], name: &[u8]) -> Option<usize> {
+    let mut p = 0;
+    let mut prev_int: Option<i64> = None;
+    while let Some((tok, next_p)) = next_ps_token(private, p) {
+        p = next_p;
+        if tok == name {
+            return Some(p);
+        }
+        if (tok == b"RD" || tok == b"-|") && prev_int.is_some_and(|n| n >= 0) {
+            let len = prev_int.unwrap() as usize;
+            prev_int = None;
+            let data_start = p.checked_add(1)?;
+            let data_end = data_start.checked_add(len)?;
+            if data_end > private.len() {
+                return None;
+            }
+            p = data_end;
+            continue;
+        }
+        prev_int = parse_ps_int(tok);
     }
-    let start = pos;
-    while pos < data.len() && !is_ws(data[pos]) {
-        pos += 1;
-    }
-    (&data[start..pos], pos)
+    None
 }
 
 #[cfg(test)]
@@ -1258,17 +1316,39 @@ mod tests {
     }
 
     #[test]
-    fn find_token_is_whole_word() {
-        let hay = b"/Encoding StandardEncoding def";
-        assert!(find_token(hay, b"StandardEncoding").is_some());
-        assert!(find_token(b"xStandardEncodingy", b"StandardEncoding").is_none());
-        assert!(find_token(b"\tdup\n0", b"dup").is_some());
-        assert!(find_token(b"]dup\t0", b"dup").is_some());
-        assert!(find_token(b"/dup 0", b"dup").is_none());
-        assert!(find_token(b"%dup 0", b"dup").is_none());
-        assert!(find_token(b"% dup 0", b"dup").is_none());
-        assert!(find_token(b"mydup 0", b"dup").is_none());
-        assert!(find_token(b"dup0 0", b"dup").is_none());
+    fn parse_builtin_encoding_reads_its_own_declaration_and_ignores_fontinfo_strings() {
+        // Custom encoding mapping 65 -> /B followed by FontInfo metadata whose
+        // string contains `StandardEncoding` must preserve the custom mapping.
+        let custom_with_fontinfo = b"%!PS-AdobeFont-1.0\n\
+            8 dict begin\n\
+            /Encoding 256 array\n\
+            0 1 255 {1 index exch /.notdef put} for\n\
+            dup 65 /B put\n\
+            dup 66 /A put\n\
+            readonly def\n\
+            /FontInfo 1 dict dup begin\n\
+            /Notice (StandardEncoding) def\n\
+            end readonly def\n";
+        let enc = parse_builtin_encoding(custom_with_fontinfo);
+        assert_eq!(enc[65].as_deref(), Some("B"));
+        assert_eq!(enc[66].as_deref(), Some("A"));
+        assert_eq!(enc[67], None);
+
+        // A preceding FontInfo string mentioning `/Encoding StandardEncoding`
+        // must also be skipped as a string token.
+        let fontinfo_first = b"/FontInfo 1 dict dup begin\n\
+            /Notice (/Encoding StandardEncoding def) def\n\
+            end readonly def\n\
+            /Encoding 256 array dup 65 /B put readonly def\n";
+        let enc_first = parse_builtin_encoding(fontinfo_first);
+        assert_eq!(enc_first[65].as_deref(), Some("B"));
+        assert_eq!(enc_first[66], None);
+
+        // Actual `/Encoding StandardEncoding def` (even with an inline comment)
+        // still installs StandardEncoding.
+        let std_enc = parse_builtin_encoding(b"/Encoding % built-in\n StandardEncoding def");
+        assert_eq!(std_enc[65].as_deref(), Some("A"));
+        assert_eq!(std_enc[66].as_deref(), Some("B"));
     }
 
     #[test]
@@ -1309,6 +1389,42 @@ mod tests {
         let enc = parse_builtin_encoding(clear);
         assert_eq!(enc[65].as_deref(), Some("A"));
         assert_eq!(enc[66].as_deref(), Some("B"));
+    }
+
+    #[test]
+    fn parse_subrs_and_charstrings_ignore_comments_and_rd_payloads_mentioning_charstrings() {
+        let ret: &[u8] = &[11];
+        let payload_with_name: &[u8] = b"/CharStrings 0";
+        let glyph_a: &[u8] = &[139, 248, 236, 13, 139, 10, 14];
+        let mut private = b"dup /Private 5 dict dup begin\n\
+            % /lenIV 4 /Subrs /CharStrings mentioned in header comment\n\
+            /lenIV -1 def\n\
+            /Subrs 3 array\n\
+            % helpers used by /CharStrings\n"
+            .to_vec();
+        // Slot 0 has raw `RD` payload bytes literally containing `/CharStrings`;
+        // slot 1 follows after that payload with a tab after `dup`;
+        // slot 2 has comments separating `dup`, index, length, and `RD`.
+        private.extend_from_slice(format!("dup 0 {} RD ", payload_with_name.len()).as_bytes());
+        private.extend_from_slice(payload_with_name);
+        private.extend_from_slice(b" NP\n% another /CharStrings comment\ndup\t1 1 RD ");
+        private.extend_from_slice(ret);
+        private.extend_from_slice(
+            b" NP\ndup % hint subroutine\n2 % byte length\n1 % binary read\nRD ",
+        );
+        private.extend_from_slice(ret);
+        private.extend_from_slice(b" NP\nND\n/CharStrings 1 dict dup begin\n/A ");
+        private.extend_from_slice(format!("{} RD ", glyph_a.len()).as_bytes());
+        private.extend_from_slice(glyph_a);
+        private.extend_from_slice(b" ND\nend end readonly def\n");
+
+        assert_eq!(parse_len_iv(&private), Some(-1));
+        assert_eq!(
+            parse_subrs(&private, -1),
+            vec![payload_with_name.to_vec(), ret.to_vec(), ret.to_vec()]
+        );
+        let cs = parse_charstrings(&private, -1);
+        assert_eq!(cs.get("A").map(Vec::as_slice), Some(glyph_a));
     }
 
     #[test]
