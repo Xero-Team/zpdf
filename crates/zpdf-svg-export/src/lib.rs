@@ -1175,13 +1175,13 @@ fn push_opacity(out: &mut String, attr: &str, opacity: f32) {
     }
 }
 
-/// Same quantization as the CPU backend's `color_to_paint` (truncating cast).
+/// Round to the nearest byte, like the CPU backend's `color_to_paint`.
 fn hex_color(c: &Color) -> String {
     format!(
         "#{:02x}{:02x}{:02x}",
-        (c.r.clamp(0.0, 1.0) * 255.0) as u8,
-        (c.g.clamp(0.0, 1.0) * 255.0) as u8,
-        (c.b.clamp(0.0, 1.0) * 255.0) as u8,
+        (c.r.clamp(0.0, 1.0) * 255.0).round() as u8,
+        (c.g.clamp(0.0, 1.0) * 255.0).round() as u8,
+        (c.b.clamp(0.0, 1.0) * 255.0).round() as u8,
     )
 }
 
@@ -1342,6 +1342,29 @@ mod tests {
 
     fn empty_caches() -> (FontCache, ImageCache) {
         (FontCache::new(), ImageCache::new())
+    }
+
+    #[test]
+    fn hex_color_rounds_to_nearest_byte() {
+        assert_eq!(hex_color(&Color::rgb(0.0, 0.5, 1.0)), "#0080ff");
+        assert_eq!(hex_color(&Color::rgb(0.25, 0.5, 0.75)), "#4080bf");
+        assert_eq!(
+            hex_color(&Color::rgb(0.49 / 255.0, 0.5 / 255.0, 0.499)),
+            "#00017f"
+        );
+        assert_eq!(
+            hex_color(&Color::rgb(254.49 / 255.0, 254.5 / 255.0, 1.0)),
+            "#feffff"
+        );
+    }
+
+    #[test]
+    fn hex_color_preserves_saturation_at_boundaries() {
+        assert_eq!(hex_color(&Color::rgb(-1.0, 0.0, 2.0)), "#0000ff");
+        assert_eq!(
+            hex_color(&Color::rgb(f32::NAN, f32::NEG_INFINITY, f32::INFINITY)),
+            "#0000ff"
+        );
     }
 
     fn page() -> DisplayList {
@@ -1766,8 +1789,8 @@ mod tests {
             "{svg}"
         );
         assert!(svg.contains("mask=\"url(#m1)\""), "{svg}");
-        // Backdrop luma 0.25 → gray(0.25) = #3f3f3f (truncating cast).
-        assert!(svg.contains("fill=\"#3f3f3f\""), "{svg}");
+        // Backdrop luma 0.25 → gray(0.25) = #404040 (round to nearest).
+        assert!(svg.contains("fill=\"#404040\""), "{svg}");
         // Page-space offset (5,7) → svg translate(5 -7).
         assert!(svg.contains("translate(5 -7)"), "{svg}");
         assert!(!svg.contains("mask-type:alpha"), "{svg}");

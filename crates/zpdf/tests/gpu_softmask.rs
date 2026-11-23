@@ -259,6 +259,144 @@ fn gpu_matches_cpu_softmask_alpha_transfer() {
     );
 }
 
+/// A one-byte quantization difference must not choose the other side of /TR.
+/// Pin interior pixels exactly; the general fidelity tolerance hides this drift
+/// until a transfer function amplifies it into a fully visible/hidden object.
+#[test]
+fn gpu_matches_cpu_softmask_half_value_threshold() {
+    let mut renderer = zpdf::gpu::WgpuRenderer::new();
+    match renderer.adapter_identity() {
+        Ok(_) => {}
+        Err(zpdf::gpu::WgpuRenderError::NoAdapter) => {
+            eprintln!("skipping GPU soft-mask threshold acceptance (no adapter)");
+            return;
+        }
+        Err(e) => panic!("initialize GPU soft-mask threshold acceptance: {e}"),
+    }
+    for kind in [SoftMaskKind::Alpha, SoftMaskKind::Luminosity] {
+        for value in [0.499, 0.5] {
+            let (color, alpha) = match kind {
+                SoftMaskKind::Alpha => (Color::white(), value),
+                SoftMaskKind::Luminosity => (Color::gray(value), 1.0),
+            };
+            let mut mask_dl = DisplayList::new(page());
+            mask_dl.push(fill(40.0, 40.0, 160.0, 160.0, color, alpha));
+            let mask = SoftMask {
+                kind,
+                commands: Arc::new(mask_dl),
+                offset: (0.0, 0.0),
+                backdrop_luma: 0.0,
+                transfer: Some(Arc::new(std::array::from_fn(|i| {
+                    if i >= 128 {
+                        255
+                    } else {
+                        0
+                    }
+                }))),
+            };
+            let group = masked_group(
+                fill(40.0, 40.0, 160.0, 160.0, Color::rgb(0.0, 0.0, 1.0), 1.0),
+                mask,
+            );
+            let dl = page_with(Color::rgb(1.0, 1.0, 0.0), group);
+            let gpu = renderer
+                .render_display_list(&dl, SCALE)
+                .expect("GPU soft-mask threshold render on an available adapter");
+            let cpu = zpdf::cpu::CpuRenderer::new()
+                .render_display_list(&dl, SCALE)
+                .expect("cpu render");
+            assert_eq!((cpu.width, cpu.height), (gpu.width, gpu.height));
+            let center = ((cpu.height / 2 * cpu.width + cpu.width / 2) * 4) as usize;
+            let expected = if value < 0.5 {
+                [255, 255, 0, 255]
+            } else {
+                [0, 0, 255, 255]
+            };
+            assert_eq!(
+                &cpu.data[center..center + 4],
+                &expected,
+                "CPU {kind:?} {value}"
+            );
+            assert_eq!(
+                &gpu.data[center..center + 4],
+                &expected,
+                "GPU {kind:?} {value}"
+            );
+        }
+    }
+}
+
+/// Luminosity `/BC` backdrop clears must round to the same 8-bit grey as an
+/// opaque fill of the same value so a `/TR` step never splits painted and
+/// unpainted halves of the mask on the GPU.
+#[test]
+fn gpu_matches_cpu_softmask_backdrop_threshold() {
+    let mut renderer = zpdf::gpu::WgpuRenderer::new();
+    match renderer.adapter_identity() {
+        Ok(_) => {}
+        Err(zpdf::gpu::WgpuRenderError::NoAdapter) => {
+            eprintln!("skipping GPU soft-mask backdrop threshold acceptance (no adapter)");
+            return;
+        }
+        Err(e) => panic!("initialize GPU soft-mask backdrop threshold acceptance: {e}"),
+    }
+    for (value, threshold, expect_visible) in [
+        (0.699_f32, 179usize, false),
+        (0.7_f32, 179usize, true),
+        (0.499_f32, 128usize, false),
+        (0.5_f32, 128usize, true),
+    ] {
+        // Paint the left half of the mask at `value`; leave the right half
+        // unpainted so it comes solely from the `/BC` clear.
+        let mut mask_dl = DisplayList::new(page());
+        mask_dl.push(fill(0.0, 0.0, 100.0, 200.0, Color::gray(value), 1.0));
+        let mask = SoftMask {
+            kind: SoftMaskKind::Luminosity,
+            commands: Arc::new(mask_dl),
+            offset: (0.0, 0.0),
+            backdrop_luma: value,
+            transfer: Some(Arc::new(std::array::from_fn(|i| {
+                if i >= threshold {
+                    255
+                } else {
+                    0
+                }
+            }))),
+        };
+        let group = masked_group(
+            fill(0.0, 0.0, 200.0, 200.0, Color::rgb(0.0, 0.0, 1.0), 1.0),
+            mask,
+        );
+        let dl = page_with(Color::rgb(1.0, 1.0, 0.0), group);
+        let gpu = renderer
+            .render_display_list(&dl, SCALE)
+            .expect("GPU soft-mask backdrop threshold render on an available adapter");
+        let cpu = zpdf::cpu::CpuRenderer::new()
+            .render_display_list(&dl, SCALE)
+            .expect("cpu render");
+        assert_eq!((cpu.width, cpu.height), (gpu.width, gpu.height));
+        let expected = if expect_visible {
+            [0, 0, 255, 255]
+        } else {
+            [255, 255, 0, 255]
+        };
+        let y = cpu.height / 2;
+        for (region, x) in [("painted", cpu.width / 4), ("backdrop", cpu.width * 3 / 4)] {
+            let offset = ((y * cpu.width + x) * 4) as usize;
+            assert_eq!(
+                &cpu.data[offset..offset + 4],
+                &expected,
+                "CPU {region} value={value} threshold={threshold}"
+            );
+            assert_eq!(
+                &gpu.data[offset..offset + 4],
+                &expected,
+                "GPU {region} value={value} threshold={threshold}"
+            );
+        }
+    }
+}
+
 /// Colored luminosity mask + a steep /TR — a regression guard for the luminosity
 /// reduction weights. The mask group is *pure blue* (luma 0.114 → byte 29 under
 /// Rec.601), and the /TR is a step at 29, so the masked square is fully shown iff
