@@ -12,7 +12,7 @@ Pure Rust with zero C dependencies — no pdfium, no MuPDF, no `poppler` — mak
 
 ## Build
 
-Requires `wasm32-unknown-unknown` target and `wasm-bindgen-cli` matching the pinned `wasm-bindgen` dependency (`0.2.130`) in `crates/zpdf-wasm/Cargo.toml`:
+Requires the `wasm32-unknown-unknown` target and `wasm-bindgen-cli` matching the pinned `wasm-bindgen` dependency (`0.2.130`) in `crates/zpdf-wasm/Cargo.toml`:
 
 ```bash
 rustup target add wasm32-unknown-unknown
