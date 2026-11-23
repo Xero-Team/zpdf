@@ -7319,15 +7319,23 @@ fn type1_subrs_dup_with_tab_or_newline_draws_embedded_glyph_without_fallback() {
     let notdef: &[u8] = &[139, 248, 136, 13, 14];
     let return_only_subr: &[u8] = &[11];
 
-    for (label, subr_header, dup_sep, call_subr_idx, include_charstrings_payload) in [
-        ("subrs-dup-tab", "", "\t", 0u8, false),
-        ("subrs-dup-newline", "", "\n", 0u8, false),
-        ("subrs-dup-crlf", "", "\r\n", 0u8, false),
+    for (
+        label,
+        subr_header,
+        dup_sep,
+        call_subr_idx,
+        include_charstrings_payload,
+        include_overlong_glyph_before_a,
+    ) in [
+        ("subrs-dup-tab", "", "\t", 0u8, false, false),
+        ("subrs-dup-newline", "", "\n", 0u8, false, false),
+        ("subrs-dup-crlf", "", "\r\n", 0u8, false, false),
         (
             "subrs-comment-mentioning-charstrings",
             "% helpers used by /CharStrings\n",
             "\t",
             0u8,
+            false,
             false,
         ),
         (
@@ -7336,12 +7344,30 @@ fn type1_subrs_dup_with_tab_or_newline_draws_embedded_glyph_without_fallback() {
             " % hint subroutine\n",
             0u8,
             false,
+            false,
+        ),
+        (
+            "subrs-comment-terminated-by-form-feed",
+            "% comment terminated by form feed\x0c",
+            " ",
+            0u8,
+            false,
+            false,
         ),
         (
             "subrs-rd-payload-mentioning-charstrings",
             "% helpers used by /CharStrings\n",
             "\n",
             1u8,
+            true,
+            false,
+        ),
+        (
+            "overlong-glyph-name-with-paren-payload-before-a",
+            "",
+            " ",
+            0u8,
+            false,
             true,
         ),
     ] {
@@ -7360,11 +7386,25 @@ fn type1_subrs_dup_with_tab_or_newline_draws_embedded_glyph_without_fallback() {
             format!("dup{dup_sep}{call_subr_idx} {} RD ", return_only_subr.len()).as_bytes(),
         );
         private.extend_from_slice(return_only_subr);
-        private.extend_from_slice(b" NP\nND\n/CharStrings 2 dict dup begin\n");
+        let charstring_count = if include_overlong_glyph_before_a {
+            3
+        } else {
+            2
+        };
+        private.extend_from_slice(
+            format!(" NP\nND\n/CharStrings {charstring_count} dict dup begin\n").as_bytes(),
+        );
         let mut caller_for_idx = caller_a.to_vec();
         // Byte 4 is the operand pushed before `10` (`callsubr`): 139 + subr index.
         caller_for_idx[4] = 139 + call_subr_idx;
-        for (name, cs) in [(".notdef", notdef), ("A", caller_for_idx.as_slice())] {
+        let long_name = "g".repeat(140);
+        let long_payload: &[u8] = b"(unclosed string inside skipped glyph";
+        let mut entries: Vec<(&str, &[u8])> = vec![(".notdef", notdef)];
+        if include_overlong_glyph_before_a {
+            entries.push((long_name.as_str(), long_payload));
+        }
+        entries.push(("A", caller_for_idx.as_slice()));
+        for (name, cs) in entries {
             private.extend_from_slice(format!("/{name} {} RD ", cs.len()).as_bytes());
             private.extend_from_slice(cs);
             private.extend_from_slice(b" ND\n");
@@ -7468,81 +7508,92 @@ fn type1_custom_encoding_ignores_standard_encoding_in_fontinfo_notice() {
         use std::fmt::Write;
         let _ = write!(&mut hex, "{c:02X}");
     }
-    let mut pfa = b"%!PS-AdobeFont-1.0: CustomEncType1 1.0\n\
-        8 dict begin\n\
-        /FontName /CustomEncType1 def /FontType 1 def /PaintType 0 def\n\
-        /FontMatrix [0.001 0 0 0.001 0 0] readonly def\n\
-        /FontBBox [0 0 1000 900] readonly def\n\
-        /Encoding 256 array\n\
-        0 1 255 {1 index exch /.notdef put} for\n\
-        dup 65 /B put\n\
-        dup 66 /A put\n\
-        readonly def\n\
-        /FontInfo 1 dict dup begin\n\
-        /Notice (StandardEncoding) def\n\
-        end readonly def\n\
-        currentdict end currentfile eexec\n"
-        .to_vec();
-    pfa.extend_from_slice(hex.as_bytes());
-    pfa.push(b'\n');
+    for (label, helper_prefix) in [
+        ("fontinfo-notice-standard-encoding", ""),
+        (
+            "helper-proc-before-encoding",
+            "/ReadEncoding { /Encoding get } bind def\n",
+        ),
+    ] {
+        let mut pfa = format!(
+            "%!PS-AdobeFont-1.0: CustomEncType1 1.0\n\
+            8 dict begin\n\
+            /FontName /CustomEncType1 def /FontType 1 def /PaintType 0 def\n\
+            /FontMatrix [0.001 0 0 0.001 0 0] readonly def\n\
+            /FontBBox [0 0 1000 900] readonly def\n\
+            {helper_prefix}\
+            /Encoding 256 array\n\
+            0 1 255 {{1 index exch /.notdef put}} for\n\
+            dup 65 /B put\n\
+            dup 66 /A put\n\
+            readonly def\n\
+            /FontInfo 1 dict dup begin\n\
+            /Notice (StandardEncoding) def\n\
+            end readonly def\n\
+            currentdict end currentfile eexec\n"
+        )
+        .into_bytes();
+        pfa.extend_from_slice(hex.as_bytes());
+        pfa.push(b'\n');
 
-    let pdf = assemble(&[
-        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
-        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
-        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 180 100] \
-          /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
-            .to_vec(),
-        stream("", b"0 0 0 rg BT /F1 40 Tf 20 30 Td <41> Tj ET"),
-        b"<< /Type /Font /Subtype /Type1 /BaseFont /ABCDEF+CustomEncType1 \
-          /FirstChar 65 /LastChar 66 /Widths [1000 1000] \
-          /FontDescriptor 6 0 R >>"
-            .to_vec(),
-        b"<< /Type /FontDescriptor /FontName /ABCDEF+CustomEncType1 /Flags 4 /FontFile 7 0 R >>"
-            .to_vec(),
-        stream("", &pfa),
-    ]);
+        let pdf = assemble(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 180 100] \
+              /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
+                .to_vec(),
+            stream("", b"0 0 0 rg BT /F1 40 Tf 20 30 Td <41> Tj ET"),
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /ABCDEF+CustomEncType1 \
+              /FirstChar 65 /LastChar 66 /Widths [1000 1000] \
+              /FontDescriptor 6 0 R >>"
+                .to_vec(),
+            b"<< /Type /FontDescriptor /FontName /ABCDEF+CustomEncType1 /Flags 4 /FontFile 7 0 R >>"
+                .to_vec(),
+            stream("", &pfa),
+        ]);
 
-    let doc = PdfDocument::open(pdf)
-        .unwrap()
-        .with_font_provider(Arc::new(FontProvider::memory_only()));
-    let page = zpdf::interpret_page(&doc, 0, Default::default()).unwrap();
-    let (_, font) = page.fonts.get_by_name("F1").unwrap();
-    assert!(!font.is_substitute);
-    assert_eq!(page.stats.diagnostics.embedded_font_fallbacks, 0);
-    assert_eq!(page.stats.diagnostics.missing_glyph_outlines, 0);
-    assert!(page.is_complete());
+        let doc = PdfDocument::open(pdf)
+            .unwrap()
+            .with_font_provider(Arc::new(FontProvider::memory_only()));
+        let page = zpdf::interpret_page(&doc, 0, Default::default()).unwrap();
+        let (_, font) = page.fonts.get_by_name("F1").unwrap();
+        assert!(!font.is_substitute, "{label}");
+        assert_eq!(page.stats.diagnostics.embedded_font_fallbacks, 0, "{label}");
+        assert_eq!(page.stats.diagnostics.missing_glyph_outlines, 0, "{label}");
+        assert!(page.is_complete(), "{label}");
 
-    // At 40pt from x=20: `/A` (x=50..200) occupies page x=22..28, whereas `/B`
-    // (x=700..850) occupies page x=48..54. Byte 65 must draw `/B`, not `/A`.
-    let cpu = zpdf::cpu::CpuRenderer::new()
-        .with_fonts(&page.fonts)
-        .with_images(&page.images)
-        .render_display_list(&page.display_list, 1.0)
-        .expect("cpu render");
-    let left_a_ink = dark_pixels_in_rect(
-        &cpu.data,
-        cpu.width as usize,
-        cpu.height as usize,
-        20,
-        34,
-        35,
-        75,
-    );
-    let right_b_ink = dark_pixels_in_rect(
-        &cpu.data,
-        cpu.width as usize,
-        cpu.height as usize,
-        45,
-        58,
-        35,
-        75,
-    );
-    assert_eq!(
-        left_a_ink, 0,
-        "byte 65 must not draw /A from StandardEncoding (got {left_a_ink} dark px on left)"
-    );
-    assert!(
-        right_b_ink > 20,
-        "byte 65 must draw /B from custom /Encoding (got only {right_b_ink} dark px on right)"
-    );
+        // At 40pt from x=20: `/A` (x=50..200) occupies page x=22..28, whereas `/B`
+        // (x=700..850) occupies page x=48..54. Byte 65 must draw `/B`, not `/A`.
+        let cpu = zpdf::cpu::CpuRenderer::new()
+            .with_fonts(&page.fonts)
+            .with_images(&page.images)
+            .render_display_list(&page.display_list, 1.0)
+            .expect("cpu render");
+        let left_a_ink = dark_pixels_in_rect(
+            &cpu.data,
+            cpu.width as usize,
+            cpu.height as usize,
+            20,
+            34,
+            35,
+            75,
+        );
+        let right_b_ink = dark_pixels_in_rect(
+            &cpu.data,
+            cpu.width as usize,
+            cpu.height as usize,
+            45,
+            58,
+            35,
+            75,
+        );
+        assert_eq!(
+            left_a_ink, 0,
+            "{label}: byte 65 must not draw /A from StandardEncoding (got {left_a_ink} dark px on left)"
+        );
+        assert!(
+            right_b_ink > 20,
+            "{label}: byte 65 must draw /B from custom /Encoding (got only {right_b_ink} dark px on right)"
+        );
+    }
 }

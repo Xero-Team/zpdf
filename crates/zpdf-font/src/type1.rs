@@ -906,14 +906,21 @@ fn parse_font_matrix(clear: &[u8]) -> Option<[f64; 6]> {
 fn parse_builtin_encoding(clear: &[u8]) -> Vec<Option<String>> {
     let mut enc: Vec<Option<String>> = vec![None; 256];
     let mut p = 0;
-    // Locate the `/Encoding` literal name token, skipping `%` comments and
-    // string literals such as `/Notice (/Encoding StandardEncoding)`.
+    // Locate the top-level `/Encoding` declaration, skipping `%` comments,
+    // string literals such as `/Notice (/Encoding StandardEncoding)`, and
+    // `{ ... }` procedure bodies such as `/ReadEncoding { /Encoding get } bind def`.
+    let mut brace_depth = 0usize;
     let mut found_encoding = false;
     while let Some((tok, next_p)) = next_ps_token(clear, p) {
         p = next_p;
-        if tok == b"/Encoding" {
-            found_encoding = true;
-            break;
+        match tok {
+            b"{" => brace_depth += 1,
+            b"}" => brace_depth = brace_depth.saturating_sub(1),
+            b"/Encoding" if brace_depth == 0 => {
+                found_encoding = true;
+                break;
+            }
+            _ => {}
         }
     }
     if !found_encoding {
@@ -1005,11 +1012,26 @@ fn parse_subrs(private: &[u8], len_iv: i32) -> Vec<Vec<u8>> {
     }
 
     // Scan PostScript tokens from `/Subrs` until the real `/CharStrings`
-    // literal name, skipping `%` comments, literal strings, and every
-    // length-delimited `RD`/`-|` binary payload.
+    // literal name, skipping `%` comments, literal strings, `{ ... }`
+    // procedure bodies, and every length-delimited `RD`/`-|` binary payload.
+    let mut brace_depth = 0usize;
     let mut prev_int: Option<i64> = None;
     while let Some((tok, next_p)) = next_ps_token(private, p) {
         p = next_p;
+        match tok {
+            b"{" => {
+                brace_depth += 1;
+                prev_int = None;
+                continue;
+            }
+            b"}" => {
+                brace_depth = brace_depth.saturating_sub(1);
+                prev_int = None;
+                continue;
+            }
+            _ if brace_depth > 0 => continue,
+            _ => {}
+        }
         if tok == b"/CharStrings" {
             break;
         }
@@ -1096,8 +1118,21 @@ fn parse_charstrings(private: &[u8], len_iv: i32) -> HashMap<String, Vec<u8>> {
     // a malformed font omits `begin` before the first `/<name>` entry.
     let mut scan = start;
     let mut p = start;
+    let mut brace_depth = 0usize;
     while let Some((tok, next_p)) = next_ps_token(private, scan) {
         scan = next_p;
+        match tok {
+            b"{" => {
+                brace_depth += 1;
+                continue;
+            }
+            b"}" => {
+                brace_depth = brace_depth.saturating_sub(1);
+                continue;
+            }
+            _ if brace_depth > 0 => continue,
+            _ => {}
+        }
         if tok == b"begin" {
             p = next_p;
             break;
@@ -1106,20 +1141,30 @@ fn parse_charstrings(private: &[u8], len_iv: i32) -> HashMap<String, Vec<u8>> {
             break;
         }
     }
+    brace_depth = 0;
     while let Some((tok, next_p)) = next_ps_token(private, p) {
         if out.len() >= MAX_TYPE1_GLYPHS {
             break;
         }
         p = next_p;
+        match tok {
+            b"{" => {
+                brace_depth += 1;
+                continue;
+            }
+            b"}" => {
+                brace_depth = brace_depth.saturating_sub(1);
+                continue;
+            }
+            _ if brace_depth > 0 => continue,
+            _ => {}
+        }
         if tok == b"end" {
             break;
         }
         let Some(name_bytes) = tok.strip_prefix(b"/") else {
             continue;
         };
-        if name_bytes.len() > MAX_GLYPH_NAME_LEN {
-            continue;
-        }
         let Some((len_tok, p1)) = next_ps_token(private, p) else {
             break;
         };
@@ -1136,17 +1181,25 @@ fn parse_charstrings(private: &[u8], len_iv: i32) -> HashMap<String, Vec<u8>> {
         let Some(data_start) = p2.checked_add(1) else {
             break;
         }; // single separator byte
-        let len = len.max(0) as usize;
+        let Ok(len) = usize::try_from(len) else {
+            p = p2;
+            continue;
+        };
         let Some(data_end) = data_start.checked_add(len) else {
             break;
         };
         if data_end > private.len() {
             break;
         }
-        let name = String::from_utf8_lossy(name_bytes).into_owned();
-        let cs = decrypt_charstring(&private[data_start..data_end], len_iv);
-        out.insert(name, cs);
         p = data_end;
+        // Consume the length-delimited payload before enforcing the glyph name
+        // length limit so binary bytes (e.g. `(`) from a skipped entry are
+        // never fed back into the PostScript tokenizer.
+        if name_bytes.len() <= MAX_GLYPH_NAME_LEN {
+            let name = String::from_utf8_lossy(name_bytes).into_owned();
+            let cs = decrypt_charstring(&private[data_start..data_end], len_iv);
+            out.insert(name, cs);
+        }
     }
     out
 }
@@ -1179,7 +1232,9 @@ fn next_ps_token(data: &[u8], mut p: usize) -> Option<(&[u8], usize)> {
         if is_ws(data[p]) {
             p += 1;
         } else if data[p] == b'%' {
-            while p < data.len() && data[p] != b'\n' && data[p] != b'\r' {
+            // PostScript Language Reference §3.2: comments terminate on CR, LF,
+            // form feed (0x0C), or EOF.
+            while p < data.len() && !matches!(data[p], b'\n' | b'\r' | b'\x0c') {
                 p += 1;
             }
         } else {
@@ -1232,15 +1287,30 @@ fn parse_ps_int(tok: &[u8]) -> Option<i64> {
     std::str::from_utf8(tok).ok()?.parse::<i64>().ok()
 }
 
-/// Find the byte offset immediately after a PostScript literal name (such as
-/// `/Subrs`, `/CharStrings`, or `/lenIV`) in the decrypted private section,
-/// skipping `%` comments, string literals, and length-delimited `RD`/`-|`
-/// binary payloads.
+/// Find the byte offset immediately after a top-level PostScript literal name
+/// (such as `/Subrs`, `/CharStrings`, or `/lenIV`) in the decrypted private
+/// section, skipping `%` comments, string literals, `{ ... }` procedure
+/// bodies, and length-delimited `RD`/`-|` binary payloads.
 fn find_private_name(private: &[u8], name: &[u8]) -> Option<usize> {
     let mut p = 0;
+    let mut brace_depth = 0usize;
     let mut prev_int: Option<i64> = None;
     while let Some((tok, next_p)) = next_ps_token(private, p) {
         p = next_p;
+        match tok {
+            b"{" => {
+                brace_depth += 1;
+                prev_int = None;
+                continue;
+            }
+            b"}" => {
+                brace_depth = brace_depth.saturating_sub(1);
+                prev_int = None;
+                continue;
+            }
+            _ if brace_depth > 0 => continue,
+            _ => {}
+        }
         if tok == name {
             return Some(p);
         }
@@ -1344,6 +1414,22 @@ mod tests {
         assert_eq!(enc_first[65].as_deref(), Some("B"));
         assert_eq!(enc_first[66], None);
 
+        // A helper procedure referencing `/Encoding` before the real encoding
+        // declaration must be skipped rather than terminating at the helper's `def`.
+        let helper_before_encoding = b"%!PS-AdobeFont-1.0\n\
+            8 dict begin\n\
+            /ReadEncoding { /Encoding get } bind def\n\
+            /NestedHelper { { /Encoding StandardEncoding } pop } bind def\n\
+            /Encoding 256 array\n\
+            0 1 255 {1 index exch /.notdef put} for\n\
+            dup 65 /B put\n\
+            dup 66 /A put\n\
+            readonly def\n";
+        let enc_helper = parse_builtin_encoding(helper_before_encoding);
+        assert_eq!(enc_helper[65].as_deref(), Some("B"));
+        assert_eq!(enc_helper[66].as_deref(), Some("A"));
+        assert_eq!(enc_helper[67], None);
+
         // Actual `/Encoding StandardEncoding def` (even with an inline comment)
         // still installs StandardEncoding.
         let std_enc = parse_builtin_encoding(b"/Encoding % built-in\n StandardEncoding def");
@@ -1396,15 +1482,20 @@ mod tests {
         let ret: &[u8] = &[11];
         let payload_with_name: &[u8] = b"/CharStrings 0";
         let glyph_a: &[u8] = &[139, 248, 236, 13, 139, 10, 14];
+        let long_name = "x".repeat(MAX_GLYPH_NAME_LEN + 10);
+        let long_payload: &[u8] = b"(unclosed string /end";
         let mut private = b"dup /Private 5 dict dup begin\n\
             % /lenIV 4 /Subrs /CharStrings mentioned in header comment\n\
+            /Helper { /lenIV get /Subrs get /CharStrings get } bind def\n\
             /lenIV -1 def\n\
-            /Subrs 3 array\n\
+            /Subrs 4 array\n\
+            /SubrHelper { /CharStrings get } bind def\n\
             % helpers used by /CharStrings\n"
             .to_vec();
         // Slot 0 has raw `RD` payload bytes literally containing `/CharStrings`;
         // slot 1 follows after that payload with a tab after `dup`;
-        // slot 2 has comments separating `dup`, index, length, and `RD`.
+        // slot 2 has comments separating `dup`, index, length, and `RD`;
+        // slot 3 follows a `%` comment terminated by form feed (`0x0C`).
         private.extend_from_slice(format!("dup 0 {} RD ", payload_with_name.len()).as_bytes());
         private.extend_from_slice(payload_with_name);
         private.extend_from_slice(b" NP\n% another /CharStrings comment\ndup\t1 1 RD ");
@@ -1413,7 +1504,15 @@ mod tests {
             b" NP\ndup % hint subroutine\n2 % byte length\n1 % binary read\nRD ",
         );
         private.extend_from_slice(ret);
-        private.extend_from_slice(b" NP\nND\n/CharStrings 1 dict dup begin\n/A ");
+        private.extend_from_slice(b" NP\n% form-feed terminated comment\x0cdup 3 1 RD ");
+        private.extend_from_slice(ret);
+        // Place an over-long glyph name whose binary payload starts with `(`
+        // right before `/A`: its payload must be consumed so `/A` survives.
+        private.extend_from_slice(b" NP\nND\n/CharStrings 2 dict dup begin\n/");
+        private.extend_from_slice(long_name.as_bytes());
+        private.extend_from_slice(format!(" {} RD ", long_payload.len()).as_bytes());
+        private.extend_from_slice(long_payload);
+        private.extend_from_slice(b" ND\n/A ");
         private.extend_from_slice(format!("{} RD ", glyph_a.len()).as_bytes());
         private.extend_from_slice(glyph_a);
         private.extend_from_slice(b" ND\nend end readonly def\n");
@@ -1421,9 +1520,15 @@ mod tests {
         assert_eq!(parse_len_iv(&private), Some(-1));
         assert_eq!(
             parse_subrs(&private, -1),
-            vec![payload_with_name.to_vec(), ret.to_vec(), ret.to_vec()]
+            vec![
+                payload_with_name.to_vec(),
+                ret.to_vec(),
+                ret.to_vec(),
+                ret.to_vec(),
+            ]
         );
         let cs = parse_charstrings(&private, -1);
+        assert!(!cs.contains_key(&long_name));
         assert_eq!(cs.get("A").map(Vec::as_slice), Some(glyph_a));
     }
 
