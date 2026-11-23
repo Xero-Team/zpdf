@@ -479,6 +479,17 @@ fn try_system_substitute_simple(
     )
 }
 
+/// Standard-14 metrics fallback for simple fonts when no system/provider face
+/// is available and no parsed embedded program remains. Preserves any explicit
+/// PDF `/Widths` or authoritative `/MissingWidth` default.
+fn standard_simple_font(base_font: String, cid_widths: CidWidths) -> Option<LoadedFont> {
+    let mut standard = LoadedFont::new_standard(base_font)?;
+    if !cid_widths.is_empty() || cid_widths.has_authoritative_default() {
+        standard.cid_widths = cid_widths;
+    }
+    Some(standard)
+}
+
 /// Substitute path shared by non-embedded simple fonts and simple fonts whose
 /// embedded program failed to decode or parse. Preserves PDF `/Widths` even
 /// when no system or provider face is available.
@@ -498,13 +509,7 @@ fn fallback_simple_font(
         cid_widths.clone(),
         provider,
     )
-    .or_else(|| {
-        let mut standard = LoadedFont::new_standard(base_font.clone())?;
-        if !cid_widths.is_empty() || cid_widths.has_authoritative_default() {
-            standard.cid_widths = cid_widths.clone();
-        }
-        Some(standard)
-    })
+    .or_else(|| standard_simple_font(base_font.clone(), cid_widths.clone()))
     .unwrap_or_else(|| {
         let mut font = LoadedFont::new_placeholder(base_font);
         font.font_type = font_type;
@@ -1139,10 +1144,14 @@ fn load_simple_font(
                         descriptor.as_ref(),
                         &base_font,
                         font_type,
-                        cid_widths,
+                        cid_widths.clone(),
                         provider,
                     ) {
                         Some(sub) => (sub, font.has_font_data().then_some(font)),
+                        None if !font.has_font_data() => (
+                            standard_simple_font(base_font, cid_widths).unwrap_or(font),
+                            None,
+                        ),
                         None => (font, None),
                     };
                     Ok((

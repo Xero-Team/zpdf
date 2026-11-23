@@ -6700,69 +6700,152 @@ fn type0_mixed_width_cmap_matches_tounicode_by_source_width_in_both_directions()
 
 #[test]
 fn standard_font_without_substitute_honors_missing_width_when_widths_empty() {
-    // Standard-14 font (/Helvetica) with an unparseable embedded FontFile,
-    // empty `/Widths []`, and `/FontDescriptor /MissingWidth 333`. When no
-    // substitute face is available, `fallback_simple_font` falls back to
-    // `LoadedFont::new_standard`, which must preserve the PDF's authoritative
-    // `/MissingWidth 333` instead of Helvetica's built-in 667 width for 'A'/'B'.
-    let pdf = assemble(&[
-        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
-        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
-        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 180 100] \
-          /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
-            .to_vec(),
-        stream("", b"0 0 0 rg BT /F1 24 Tf 15 40 Td (AB) Tj ET"),
-        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding \
-          /FirstChar 65 /LastChar 64 /Widths [] /FontDescriptor 6 0 R >>"
-            .to_vec(),
-        b"<< /Type /FontDescriptor /FontName /Helvetica /Flags 32 /MissingWidth 333 /FontFile 7 0 R >>"
-            .to_vec(),
-        stream("", b"not a valid type1 font program"),
-    ]);
-
-    let doc = PdfDocument::open(pdf)
-        .unwrap()
-        .with_font_provider(Arc::new(FontProvider::memory_only()));
-    let page = zpdf::interpret_page(&doc, 0, Default::default()).unwrap();
-    let (_, font) = page.fonts.get_by_name("F1").unwrap();
-    assert!(!font.has_font_data(), "no substitute face available");
-    assert_eq!(page.stats.diagnostics.embedded_font_fallbacks, 1);
-
-    let RenderCommand::DrawGlyphRun(run) = &page.display_list.commands[0] else {
-        panic!("expected glyph run");
+    // Standard-14 font (/Helvetica) without a substitute face:
+    // 1. With empty `/Widths []` and `/FontDescriptor /MissingWidth 333`, all
+    //    three failure modes (`Unreadable` via bad /FlateDecode or empty
+    //    stream, and `Present` with unparseable bytes) must preserve the PDF's
+    //    authoritative `/MissingWidth 333` instead of Helvetica's 667 width.
+    // 2. Without `/Widths` or `/MissingWidth`, both `Unreadable` and `Present`
+    //    unparseable streams must use Helvetica's built-in 667-unit advance for
+    //    'A' (rather than generic 1000 on the unparseable path).
+    let failure_streams = || {
+        [
+            (
+                "undecodable-flatedecode",
+                stream("/Filter /FlateDecode", b"not valid zlib compressed data"),
+            ),
+            ("empty-fontfile", stream("", b"")),
+            (
+                "unparseable-fontfile",
+                stream("", b"not a valid type1 font program"),
+            ),
+        ]
     };
-    let expected = 333.0 * 24.0 / 1000.0;
-    assert!(
-        (run.glyphs[0].advance - expected).abs() < 0.01
-            && (run.glyphs[1].advance - expected).abs() < 0.01
-            && (run.glyphs[1].x - expected).abs() < 0.01,
-        "standard-font fallback without substitute must use /MissingWidth 333 (got adv0={}, adv1={}, x1={}, expected={})",
-        run.glyphs[0].advance,
-        run.glyphs[1].advance,
-        run.glyphs[1].x,
-        expected
-    );
 
-    // Extracted glyph cells must also reflect `/MissingWidth 333`.
-    let pdf_page = doc.page(0).unwrap();
-    let mut fonts = doc.load_page_fonts(&pdf_page);
-    let (content, _) = doc.page_content_with_diagnostics(&pdf_page).unwrap();
-    let mut spans = Vec::new();
-    zpdf_content::interpreter::ContentInterpreter::new(pdf_page.effective_box())
-        .with_document(doc.file(), &pdf_page.resources)
-        .with_fonts(&mut fonts)
-        .with_text_sink(&mut spans)
-        .with_text_geometry(true)
-        .interpret(&content);
-    assert_eq!(spans.len(), 1);
-    assert_eq!(spans[0].text, "AB");
-    assert_eq!(spans[0].glyphs.len(), 2);
-    assert!(
-        (spans[0].glyphs[1].origin.x - (15.0 + expected as f64)).abs() < 0.05,
-        "extracted glyph 'B' origin.x={} expected {}",
-        spans[0].glyphs[1].origin.x,
-        15.0 + expected as f64
-    );
+    for (mode, font_file_obj) in failure_streams() {
+        let pdf = assemble(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 180 100] \
+              /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
+                .to_vec(),
+            stream("", b"0 0 0 rg BT /F1 24 Tf 15 40 Td (AB) Tj ET"),
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding \
+              /FirstChar 65 /LastChar 64 /Widths [] /FontDescriptor 6 0 R >>"
+                .to_vec(),
+            b"<< /Type /FontDescriptor /FontName /Helvetica /Flags 32 /MissingWidth 333 /FontFile 7 0 R >>"
+                .to_vec(),
+            font_file_obj,
+        ]);
+
+        let doc = PdfDocument::open(pdf)
+            .unwrap()
+            .with_font_provider(Arc::new(FontProvider::memory_only()));
+        let page = zpdf::interpret_page(&doc, 0, Default::default()).unwrap();
+        let (_, font) = page.fonts.get_by_name("F1").unwrap();
+        assert!(
+            !font.has_font_data(),
+            "{mode}: no substitute face available"
+        );
+        assert_eq!(page.stats.diagnostics.embedded_font_fallbacks, 1, "{mode}");
+
+        let RenderCommand::DrawGlyphRun(run) = &page.display_list.commands[0] else {
+            panic!("{mode}: expected glyph run");
+        };
+        let expected = 333.0 * 24.0 / 1000.0;
+        assert!(
+            (run.glyphs[0].advance - expected).abs() < 0.01
+                && (run.glyphs[1].advance - expected).abs() < 0.01
+                && (run.glyphs[1].x - expected).abs() < 0.01,
+            "{mode}: standard-font fallback without substitute must use /MissingWidth 333 (got adv0={}, adv1={}, x1={}, expected={})",
+            run.glyphs[0].advance,
+            run.glyphs[1].advance,
+            run.glyphs[1].x,
+            expected
+        );
+
+        let pdf_page = doc.page(0).unwrap();
+        let mut fonts = doc.load_page_fonts(&pdf_page);
+        let (content, _) = doc.page_content_with_diagnostics(&pdf_page).unwrap();
+        let mut spans = Vec::new();
+        zpdf_content::interpreter::ContentInterpreter::new(pdf_page.effective_box())
+            .with_document(doc.file(), &pdf_page.resources)
+            .with_fonts(&mut fonts)
+            .with_text_sink(&mut spans)
+            .with_text_geometry(true)
+            .interpret(&content);
+        assert_eq!(spans.len(), 1, "{mode}");
+        assert_eq!(spans[0].text, "AB", "{mode}");
+        assert_eq!(spans[0].glyphs.len(), 2, "{mode}");
+        assert!(
+            (spans[0].glyphs[1].origin.x - (15.0 + expected as f64)).abs() < 0.05,
+            "{mode}: extracted glyph 'B' origin.x={} expected {}",
+            spans[0].glyphs[1].origin.x,
+            15.0 + expected as f64
+        );
+    }
+
+    // Without `/Widths` or `/MissingWidth`, both decode failure and parse
+    // failure must yield Helvetica's built-in 667-unit advance for 'A' (not
+    // generic 1000) so advances and extracted selection geometry stay consistent.
+    for (mode, font_file_obj) in failure_streams() {
+        let pdf = assemble(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 180 100] \
+              /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
+                .to_vec(),
+            stream("", b"0 0 0 rg BT /F1 24 Tf 15 40 Td (AB) Tj ET"),
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding \
+              /FontDescriptor 6 0 R >>"
+                .to_vec(),
+            b"<< /Type /FontDescriptor /FontName /Helvetica /Flags 32 /FontFile 7 0 R >>".to_vec(),
+            font_file_obj,
+        ]);
+
+        let doc = PdfDocument::open(pdf)
+            .unwrap()
+            .with_font_provider(Arc::new(FontProvider::memory_only()));
+        let page = zpdf::interpret_page(&doc, 0, Default::default()).unwrap();
+        let (_, font) = page.fonts.get_by_name("F1").unwrap();
+        assert!(
+            !font.has_font_data(),
+            "{mode}: no substitute face available"
+        );
+        assert_eq!(page.stats.diagnostics.embedded_font_fallbacks, 1, "{mode}");
+
+        let RenderCommand::DrawGlyphRun(run) = &page.display_list.commands[0] else {
+            panic!("{mode}: expected glyph run");
+        };
+        let expected_a = 667.0 * 24.0 / 1000.0;
+        assert!(
+            (run.glyphs[0].advance - expected_a).abs() < 0.01
+                && (run.glyphs[1].x - expected_a).abs() < 0.01,
+            "{mode}: /Helvetica without /Widths must use 667-unit advance (got adv0={}, x1={}, expected={})",
+            run.glyphs[0].advance,
+            run.glyphs[1].x,
+            expected_a
+        );
+
+        let pdf_page = doc.page(0).unwrap();
+        let mut fonts = doc.load_page_fonts(&pdf_page);
+        let (content, _) = doc.page_content_with_diagnostics(&pdf_page).unwrap();
+        let mut spans = Vec::new();
+        zpdf_content::interpreter::ContentInterpreter::new(pdf_page.effective_box())
+            .with_document(doc.file(), &pdf_page.resources)
+            .with_fonts(&mut fonts)
+            .with_text_sink(&mut spans)
+            .with_text_geometry(true)
+            .interpret(&content);
+        assert_eq!(spans.len(), 1, "{mode}");
+        assert_eq!(spans[0].text, "AB", "{mode}");
+        assert!(
+            (spans[0].glyphs[1].origin.x - (15.0 + expected_a as f64)).abs() < 0.05,
+            "{mode}: extracted glyph 'B' origin.x={} expected {}",
+            spans[0].glyphs[1].origin.x,
+            15.0 + expected_a as f64
+        );
+    }
 }
 
 #[test]
@@ -6834,4 +6917,149 @@ fn type1_subset_with_only_uni0020_stays_embedded_without_fallback() {
     assert_eq!(page.stats.diagnostics.embedded_font_fallbacks, 0);
     assert_eq!(page.stats.diagnostics.missing_glyph_outlines, 0);
     assert!(page.is_complete());
+}
+
+#[test]
+fn type1_truncated_unknown_glyph_charstring_is_unreadable_without_tounicode() {
+    let build_pfa = |font_name: &str, entries: &[(&str, &[u8])]| -> Vec<u8> {
+        let mut private = format!(
+            "dup /Private 4 dict dup begin /lenIV -1 def /CharStrings {} dict dup begin\n",
+            entries.len()
+        )
+        .into_bytes();
+        for (name, cs) in entries {
+            private.extend_from_slice(format!("/{name} {} RD ", cs.len()).as_bytes());
+            private.extend_from_slice(cs);
+            private.extend_from_slice(b" ND\n");
+        }
+        private.extend_from_slice(b"end end readonly def\n");
+
+        let mut r: u16 = 55665;
+        let mut hex = String::with_capacity((private.len() + 4) * 2);
+        for &p in [0u8, 0, 0, 0].iter().chain(private.iter()) {
+            let c = p ^ (r >> 8) as u8;
+            r = (c as u16)
+                .wrapping_add(r)
+                .wrapping_mul(52845)
+                .wrapping_add(22719);
+            use std::fmt::Write;
+            let _ = write!(&mut hex, "{c:02X}");
+        }
+        let mut pfa = format!(
+            "%!PS-AdobeFont-1.0: {font_name} 1.0\n\
+             8 dict begin\n\
+             /FontName /{font_name} def /FontType 1 def /PaintType 0 def\n\
+             /FontMatrix [0.001 0 0 0.001 0 0] readonly def\n\
+             /FontBBox [0 0 1000 900] readonly def /Encoding StandardEncoding def\n\
+             currentdict end currentfile eexec\n"
+        )
+        .into_bytes();
+        pfa.extend_from_slice(hex.as_bytes());
+        pfa.push(b'\n');
+        pfa
+    };
+
+    let drawn_box: &[u8] = &[
+        139, 249, 160, 13, 189, 139, 21, 139, 249, 80, 5, 248, 136, 139, 5, 139, 253, 80, 5, 9, 14,
+    ];
+    let valid_space: &[u8] = &[139, 247, 192, 13, 14];
+    // Ends halfway through a 2-byte positive numeric operand (`247` missing 2nd byte).
+    let truncated_g1: &[u8] = &[139, 247];
+
+    // 1. Subset with only `.notdef` and truncated `/g1` (no `/ToUnicode`, no
+    //    substitute): must NOT be classified as Healthy/Blank or report complete.
+    let only_truncated_pfa = build_pfa(
+        "TruncatedOnly",
+        &[(".notdef", &[139, 248, 136, 13, 14]), ("g1", truncated_g1)],
+    );
+    let only_truncated_pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 180 100] \
+          /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
+            .to_vec(),
+        stream("", b"0 0 0 rg BT /F1 24 Tf 15 40 Td <41> Tj ET"),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /ABCDEF+TruncatedOnly \
+          /Encoding << /Type /Encoding /Differences [65 /g1] >> \
+          /FirstChar 65 /LastChar 65 /Widths [600] /FontDescriptor 6 0 R >>"
+            .to_vec(),
+        b"<< /Type /FontDescriptor /FontName /ABCDEF+TruncatedOnly /Flags 32 /FontFile 7 0 R >>"
+            .to_vec(),
+        stream("", &only_truncated_pfa),
+    ]);
+    let doc1 = PdfDocument::open(only_truncated_pdf)
+        .unwrap()
+        .with_font_provider(Arc::new(FontProvider::memory_only()));
+    let page1 = zpdf::interpret_page(&doc1, 0, Default::default()).unwrap();
+    assert_eq!(page1.stats.diagnostics.embedded_font_fallbacks, 1);
+    assert_eq!(page1.stats.diagnostics.missing_glyph_outlines, 1);
+    assert!(
+        !page1.is_complete(),
+        "truncated /g1 without /ToUnicode must not report complete with missing ink"
+    );
+
+    // 2. Partially corrupt subset with drawn `/A`, `/B`, valid width-only
+    //    `/uni0020`, and truncated `/g1` (no `/ToUnicode`): showing valid
+    //    `/A`, `/B`, `/uni0020` stays embedded and complete, while showing `/g1`
+    //    flags the per-glyph failure and reports incomplete.
+    let mixed_pfa = build_pfa(
+        "MixedTruncatedG1",
+        &[
+            (".notdef", &[139, 248, 136, 13, 14]),
+            ("A", drawn_box),
+            ("B", drawn_box),
+            ("uni0020", valid_space),
+            ("g1", truncated_g1),
+        ],
+    );
+    let make_mixed_pdf = |content: &[u8]| {
+        assemble(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 180 100] \
+              /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
+                .to_vec(),
+            stream("", content),
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /ABCDEF+MixedTruncatedG1 \
+              /Encoding << /Type /Encoding /Differences [32 /uni0020 65 /A 66 /B 67 /g1] >> \
+              /FirstChar 32 /LastChar 67 /Widths [300 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 600 600 600] \
+              /FontDescriptor 6 0 R >>"
+                .to_vec(),
+            b"<< /Type /FontDescriptor /FontName /ABCDEF+MixedTruncatedG1 /Flags 32 /FontFile 7 0 R >>"
+                .to_vec(),
+            stream("", &mixed_pfa),
+        ])
+    };
+
+    let healthy_doc = PdfDocument::open(make_mixed_pdf(
+        b"0 0 0 rg BT /F1 24 Tf 15 40 Td (A B) Tj ET",
+    ))
+    .unwrap()
+    .with_font_provider(Arc::new(FontProvider::memory_only()));
+    let healthy_page = zpdf::interpret_page(&healthy_doc, 0, Default::default()).unwrap();
+    assert!(
+        !healthy_page
+            .fonts
+            .get_by_name("F1")
+            .unwrap()
+            .1
+            .is_substitute
+    );
+    assert_eq!(healthy_page.stats.diagnostics.embedded_font_fallbacks, 0);
+    assert_eq!(healthy_page.stats.diagnostics.missing_glyph_outlines, 0);
+    assert!(healthy_page.is_complete());
+
+    let broken_doc = PdfDocument::open(make_mixed_pdf(
+        b"0 0 0 rg BT /F1 24 Tf 15 40 Td (A C) Tj ET",
+    ))
+    .unwrap()
+    .with_font_provider(Arc::new(FontProvider::memory_only()));
+    let broken_page = zpdf::interpret_page(&broken_doc, 0, Default::default()).unwrap();
+    assert!(!broken_page.fonts.get_by_name("F1").unwrap().1.is_substitute);
+    assert_eq!(broken_page.stats.diagnostics.embedded_font_fallbacks, 1);
+    assert_eq!(broken_page.stats.diagnostics.missing_glyph_outlines, 1);
+    assert!(
+        !broken_page.is_complete(),
+        "per-glyph check must treat truncated /g1 as unreadable rather than Blank"
+    );
 }

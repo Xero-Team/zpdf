@@ -172,7 +172,7 @@ impl Type1Font {
             if let Some(cs) = self.char_strings.get(name) {
                 let mut interp = Interp::new();
                 interp.run(cs, &self.subrs, 0);
-                if interp.failed {
+                if interp.failed || !interp.done {
                     failed += 1;
                 } else if let Some(seac) = interp.seac {
                     if self.compose_seac(&interp, seac, 1).is_some() {
@@ -215,7 +215,7 @@ impl Type1Font {
         };
         let mut interp = Interp::new();
         interp.run(cs, &self.subrs, 0);
-        if interp.failed {
+        if interp.failed || !interp.done {
             return crate::resolution::GlyphState::Missing;
         }
         if let Some(seac) = interp.seac {
@@ -298,7 +298,7 @@ impl Type1Font {
         let mut interp = Interp::new();
         interp.run(cs, &self.subrs, 0);
 
-        if interp.failed {
+        if interp.failed || !interp.done {
             return None;
         }
 
@@ -509,7 +509,8 @@ impl Interp {
                 32..=246 => self.stack.push(b as f64 - 139.0),
                 247..=250 => {
                     if i >= cs.len() {
-                        break;
+                        self.failed = true;
+                        return;
                     }
                     let w = cs[i] as f64;
                     i += 1;
@@ -517,7 +518,8 @@ impl Interp {
                 }
                 251..=254 => {
                     if i >= cs.len() {
-                        break;
+                        self.failed = true;
+                        return;
                     }
                     let w = cs[i] as f64;
                     i += 1;
@@ -525,7 +527,8 @@ impl Interp {
                 }
                 255 => {
                     if i + 4 > cs.len() {
-                        break;
+                        self.failed = true;
+                        return;
                     }
                     let v = i32::from_be_bytes([cs[i], cs[i + 1], cs[i + 2], cs[i + 3]]);
                     i += 4;
@@ -631,7 +634,12 @@ impl Interp {
                         }
                     }
                 }
-                11 => return, // return
+                11 => {
+                    if depth == 0 {
+                        self.failed = true;
+                    }
+                    return; // return
+                }
                 14 => {
                     // endchar
                     self.close();
@@ -640,7 +648,8 @@ impl Interp {
                 }
                 12 => {
                     if i >= cs.len() {
-                        break;
+                        self.failed = true;
+                        return;
                     }
                     let b2 = cs[i];
                     i += 1;
@@ -658,6 +667,9 @@ impl Interp {
                 self.failed = true;
                 return;
             }
+        }
+        if depth == 0 && !self.done {
+            self.failed = true;
         }
     }
 
@@ -1387,6 +1399,12 @@ mod tests {
             crate::EmbeddedOutlineProbe::Healthy
         );
         assert!(no_ink.has_usable_outlines());
+        assert_eq!(
+            no_ink.glyph_state_by_gid(1),
+            crate::resolution::GlyphState::Blank
+        );
+        assert!(!no_ink.is_gid_unreadable(1));
+        assert!(no_ink.is_blank_gid(1));
 
         // An empty charstring for a known visible glyph name (/A) still counts
         // as failed and classifies the font as unusable.
@@ -1395,7 +1413,9 @@ mod tests {
         empty_visible
             .char_strings
             .insert(".notdef".into(), empty_cs.clone());
-        empty_visible.char_strings.insert("A".into(), empty_cs);
+        empty_visible
+            .char_strings
+            .insert("A".into(), empty_cs.clone());
         empty_visible.gid_to_name = vec![".notdef".into(), "A".into()];
         empty_visible.name_to_gid = HashMap::from([(".notdef".into(), 0), ("A".into(), 1)]);
         assert_eq!(
@@ -1403,5 +1423,42 @@ mod tests {
             crate::EmbeddedOutlineProbe::Unusable
         );
         assert!(!empty_visible.has_usable_outlines());
+
+        // Truncated charstrings on an unknown glyph name (/g1) — ending
+        // mid-operand, mid-escape, or without endchar — must be classified as
+        // unreadable in both `probe_outlines` and per-glyph checks (never
+        // accepted as Healthy/Blank).
+        for (label, truncated_cs) in [
+            ("mid-2byte-pos-operand", vec![139u8, 247]),
+            ("mid-2byte-neg-operand", vec![139, 251]),
+            ("mid-5byte-operand", vec![255, 0, 1]),
+            ("mid-escape-op", vec![139, 12]),
+            ("missing-endchar", vec![139, 247, 142, 13]),
+            ("top-level-return", vec![139, 11]),
+            ("empty-bytes", vec![]),
+        ] {
+            let mut truncated = font_with_matrix([0.001, 0.0, 0.0, 0.001, 0.0, 0.0]);
+            truncated.char_strings.clear();
+            truncated
+                .char_strings
+                .insert(".notdef".into(), empty_cs.clone());
+            truncated.char_strings.insert("g1".into(), truncated_cs);
+            truncated.gid_to_name = vec![".notdef".into(), "g1".into()];
+            truncated.name_to_gid = HashMap::from([(".notdef".into(), 0), ("g1".into(), 1)]);
+            assert_eq!(
+                truncated.probe_outlines(),
+                crate::EmbeddedOutlineProbe::Unusable,
+                "{label}: truncated /g1 subset must be unusable"
+            );
+            assert!(!truncated.has_usable_outlines(), "{label}");
+            assert_eq!(
+                truncated.glyph_state_by_gid(1),
+                crate::resolution::GlyphState::Missing,
+                "{label}: truncated /g1 must not be classified as Blank"
+            );
+            assert!(truncated.is_gid_unreadable(1), "{label}");
+            assert!(!truncated.is_blank_gid(1), "{label}");
+            assert!(truncated.glyph_outline_by_gid(1).is_none(), "{label}");
+        }
     }
 }
