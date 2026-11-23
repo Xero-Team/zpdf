@@ -149,6 +149,12 @@ fn unit(v: f32) -> f32 {
     }
 }
 
+/// `round(v * a / 255)` for two 8-bit factors, matching zpdf-image.
+#[inline]
+fn mul255(v: u8, a: u8) -> u8 {
+    ((v as u32 * a as u32 + 127) / 255) as u8
+}
+
 /// Coverage where the mask group painted nothing — what a fresh raster
 /// produces outside the group, used to fill strips vacated by a plane shift.
 fn unpainted_value(mask: &SoftMask) -> u8 {
@@ -791,10 +797,10 @@ impl<'a> CpuRenderer<'a> {
     fn color_to_paint(color: &Color, alpha: f32) -> tiny_skia::Paint<'static> {
         let mut paint = tiny_skia::Paint::default();
         paint.set_color_rgba8(
-            (color.r * 255.0) as u8,
-            (color.g * 255.0) as u8,
-            (color.b * 255.0) as u8,
-            (color.a * alpha * 255.0) as u8,
+            (color.r * 255.0).round() as u8,
+            (color.g * 255.0).round() as u8,
+            (color.b * 255.0).round() as u8,
+            (color.a * alpha * 255.0).round() as u8,
         );
         paint.anti_alias = true;
         paint
@@ -1024,7 +1030,7 @@ impl<'a> CpuRenderer<'a> {
                 let row = y * w;
                 for x in x0..x1 {
                     let i = row + x;
-                    mask_data[i] = ((mask_data[i] as u16 * current_data[i] as u16) / 255) as u8;
+                    mask_data[i] = mul255(mask_data[i], current_data[i]);
                 }
             }
         }
@@ -1249,7 +1255,7 @@ impl<'a> CpuRenderer<'a> {
                 let i = row + x;
                 let coverage = pixels[i].alpha();
                 mask_data[i] = match current_data {
-                    Some(current) => ((coverage as u16 * current[i] as u16) / 255) as u8,
+                    Some(current) => mul255(coverage, current[i]),
                     None => coverage,
                 };
             }
@@ -1442,11 +1448,10 @@ impl<'a> CpuRenderer<'a> {
                     if m == 255 {
                         continue;
                     }
-                    let m = m as u16;
-                    px[0] = ((px[0] as u16 * m) / 255) as u8;
-                    px[1] = ((px[1] as u16 * m) / 255) as u8;
-                    px[2] = ((px[2] as u16 * m) / 255) as u8;
-                    px[3] = ((px[3] as u16 * m) / 255) as u8;
+                    px[0] = mul255(px[0], m);
+                    px[1] = mul255(px[1], m);
+                    px[2] = mul255(px[2], m);
+                    px[3] = mul255(px[3], m);
                 }
             }
             self.tock(t_fold, |s| &mut s.mask_fold_ns);
@@ -2484,16 +2489,16 @@ impl<'a> CpuRenderer<'a> {
         let mut tinted = source.clone();
         let (pixels, _) = tinted.data.as_chunks_mut::<4>();
         for pixel in pixels {
-            let pixel_alpha = pixel[3] as u16;
+            let pixel_alpha = pixel[3];
             if pixel_alpha == 0 {
                 continue;
             }
             // ImageCache pixels are premultiplied RGBA. Type 3 masks currently
             // have binary alpha, but multiplying here also keeps this correct
             // for anti-aliased mask decoders.
-            pixel[0] = (tint.red() * 255.0 * pixel_alpha as f32 / 255.0) as u8;
-            pixel[1] = (tint.green() * 255.0 * pixel_alpha as f32 / 255.0) as u8;
-            pixel[2] = (tint.blue() * 255.0 * pixel_alpha as f32 / 255.0) as u8;
+            pixel[0] = (tint.red() * pixel_alpha as f32).round() as u8;
+            pixel[1] = (tint.green() * pixel_alpha as f32).round() as u8;
+            pixel[2] = (tint.blue() * pixel_alpha as f32).round() as u8;
         }
 
         let mut tinted_cache = ImageCache::new();
@@ -3028,6 +3033,176 @@ mod tests {
         p.move_to(Point::new(x0, y0));
         p.line_to(Point::new(x1, y1));
         p
+    }
+
+    #[test]
+    fn paint_rounds_colour_and_alpha_to_nearest_byte() {
+        for (value, expected) in [
+            (-1.0, 0),
+            (0.0, 0),
+            (0.49 / 255.0, 0),
+            (0.5 / 255.0, 1),
+            (0.499, 127),
+            (0.5, 128),
+            (254.49 / 255.0, 254),
+            (254.5 / 255.0, 255),
+            (1.0, 255),
+            (2.0, 255),
+            (f32::NAN, 0),
+            (f32::NEG_INFINITY, 0),
+            (f32::INFINITY, 255),
+        ] {
+            let paint = CpuRenderer::color_to_paint(&Color::rgba(value, value, value, value), 1.0);
+            let tiny_skia::Shader::SolidColor(color) = paint.shader else {
+                panic!("expected solid paint");
+            };
+            assert_eq!(
+                color.to_color_u8(),
+                tiny_skia::ColorU8::from_rgba(expected, expected, expected, expected),
+                "component {value}"
+            );
+        }
+        let paint = CpuRenderer::color_to_paint(&Color::rgba(0.0, 0.5, 1.0, 0.5), 0.5);
+        let tiny_skia::Shader::SolidColor(color) = paint.shader else {
+            panic!("expected solid paint");
+        };
+        assert_eq!(
+            color.to_color_u8(),
+            tiny_skia::ColorU8::from_rgba(0, 128, 255, 64)
+        );
+    }
+
+    #[test]
+    fn half_gray_pdf_fill_rounds_to_128() {
+        let list =
+            zpdf_content::interpreter::ContentInterpreter::new(Rect::new(0.0, 0.0, 2.0, 2.0))
+                .interpret(b"0.5 g 0 0 2 2 re f");
+        let page = CpuRenderer::new().render_display_list(&list, 1.0).unwrap();
+        assert!(page
+            .data
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|p| *p == [128, 128, 128, 255]));
+    }
+
+    #[test]
+    fn mask_products_round_for_every_byte_pair() {
+        for v in 0..=255 {
+            for a in 0..=255 {
+                let expected = (f64::from(v) * f64::from(a) / 255.0).round() as u8;
+                assert_eq!(mul255(v, a), expected, "{v} * {a} / 255");
+            }
+        }
+    }
+
+    #[test]
+    fn clip_intersections_round_mask_products() {
+        for stroked in [false, true] {
+            let coverage = |current: u8| {
+                let mut renderer = CpuRenderer::new();
+                renderer
+                    .begin_page(&PageRenderInfo {
+                        page_rect: Rect::new(0.0, 0.0, 3.0, 3.0),
+                        scale: 1.0,
+                        background: Color::white(),
+                    })
+                    .unwrap();
+                renderer.push_clip(&rect_path(0.0, 0.0, 3.0, 3.0), &FillRule::NonZero);
+                renderer
+                    .current_clip
+                    .as_mut()
+                    .unwrap()
+                    .data_mut()
+                    .fill(current);
+                if stroked {
+                    renderer
+                        .push_clip_stroke(&line_path(0.5, 1.5, 2.5, 1.5), &StrokeStyle::default());
+                } else {
+                    renderer.push_clip(&rect_path(0.5, 0.5, 2.5, 2.5), &FillRule::NonZero);
+                }
+                renderer.current_clip.unwrap().data().to_vec()
+            };
+            let unmasked = coverage(255);
+            assert!(unmasked.iter().any(|&v| v > 0 && v < 255));
+            for current in [0, 1, 127, 128, 254, 255] {
+                let expected: Vec<u8> = unmasked
+                    .iter()
+                    .map(|&v| (f64::from(v) * f64::from(current) / 255.0).round() as u8)
+                    .collect();
+                assert_eq!(
+                    coverage(current),
+                    expected,
+                    "stroked={stroked}, current={current}"
+                );
+            }
+        }
+    }
+
+    fn transparent_pixel_renderer() -> CpuRenderer<'static> {
+        let mut renderer = CpuRenderer::new();
+        renderer
+            .begin_page(&PageRenderInfo {
+                page_rect: Rect::new(0.0, 0.0, 1.0, 1.0),
+                scale: 1.0,
+                background: Color::rgba(0.0, 0.0, 0.0, 0.0),
+            })
+            .unwrap();
+        renderer
+    }
+
+    #[test]
+    fn soft_mask_rounds_premultiplied_colour_and_alpha_products() {
+        for (coverage, expected) in [(0, 0), (127, 64), (128, 65), (255, 129)] {
+            let mask = SoftMask {
+                kind: SoftMaskKind::Alpha,
+                commands: Arc::new(DisplayList::new(Rect::new(0.0, 0.0, 1.0, 1.0))),
+                offset: (0.0, 0.0),
+                backdrop_luma: 0.0,
+                transfer: Some(Arc::new([coverage; 256])),
+            };
+            let mut renderer = transparent_pixel_renderer();
+            renderer.push_blend_group(BlendMode::Normal, true, false, 1.0, Some(&mask));
+            renderer
+                .execute(&solid_rect(
+                    Color::rgba(1.0, 1.0, 1.0, 129.0 / 255.0),
+                    0.0,
+                    0.0,
+                    1.0,
+                    1.0,
+                ))
+                .unwrap();
+            renderer.pop_blend_group();
+            assert_eq!(
+                px(&renderer.end_page().unwrap(), 0, 0),
+                [expected; 4],
+                "coverage {coverage}"
+            );
+        }
+    }
+
+    #[test]
+    fn type3_image_mask_rounds_tinted_channels() {
+        let mut images = ImageCache::new();
+        let image_id = images.insert(DecodedImage {
+            width: 1,
+            height: 1,
+            data: vec![0, 0, 0, 128],
+            has_alpha: true,
+            is_image_mask: true,
+            premultiplied: true,
+        });
+        let draw = ImageDraw {
+            image_id,
+            transform: Matrix::identity(),
+            alpha: 1.0,
+            is_image_mask: true,
+        };
+        let mut paint = tiny_skia::Paint::default();
+        paint.set_color_rgba8(1, 127, 254, 255);
+        let mut renderer = transparent_pixel_renderer();
+        renderer.render_type3_image(&images, &draw, &paint, 1.0);
+        assert_eq!(px(&renderer.end_page().unwrap(), 0, 0), [1, 64, 127, 128]);
     }
 
     #[test]

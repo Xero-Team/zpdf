@@ -15,6 +15,9 @@
 
 ### Rendering and font recovery
 
+- Round CPU, GPU and SVG 8-bit colours to the nearest value (`0.5 g` now gives
+  128 rather than 127), and round CPU clip and soft-mask products and Type 3
+  image-mask tints to avoid darkening colours and eroding mask edges. (#183)
 - Fall back to the descriptor-based substitute font path when an embedded font
   program (`FontFile`, `FontFile2`, or `FontFile3`) fails to decode, fails to
   parse, or has unreadable glyph outlines — for simple fonts and for Type 0 /

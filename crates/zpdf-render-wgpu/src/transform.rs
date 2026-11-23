@@ -79,15 +79,16 @@ impl PageMap {
 }
 
 /// Quantize a straight color then premultiply, reproducing tiny-skia's pipeline:
-/// the CPU passes straight 8-bit `(c*255) as u8` to tiny-skia, which premultiplies
-/// internally with integer fixed-point `(channel*alpha + 127) / 255`. Matching that
-/// here (rather than f32 `c*a`) avoids LSB drift on translucent draws. For opaque
-/// draws this reduces to the straight quantized color.
+/// the CPU rounds straight channels and combined alpha to 8-bit values before
+/// passing them to tiny-skia, which premultiplies with integer fixed-point
+/// `(channel*alpha + 127) / 255`. Matching that here (rather than f32 `c*a`)
+/// avoids LSB drift on translucent draws. For opaque draws this reduces to the
+/// straight quantized color.
 pub fn quantize_premul(c: &Color, alpha: f32) -> [f32; 4] {
-    let cr = (c.r * 255.0) as u8;
-    let cg = (c.g * 255.0) as u8;
-    let cb = (c.b * 255.0) as u8;
-    let ca = (c.a * alpha * 255.0) as u8;
+    let cr = (c.r * 255.0).round() as u8;
+    let cg = (c.g * 255.0).round() as u8;
+    let cb = (c.b * 255.0).round() as u8;
+    let ca = (c.a * alpha * 255.0).round() as u8;
     let premul = |ch: u8| -> f32 {
         let p = ((ch as u32 * ca as u32 + 127) / 255) as u8;
         p as f32 / 255.0
@@ -104,17 +105,53 @@ mod tests {
         // ca == 255 -> premultiply is a no-op; channels are the straight 8-bit values.
         let q = quantize_premul(&Color::rgba(1.0, 0.5, 0.0, 1.0), 1.0);
         assert_eq!(q[3], 1.0);
-        assert_eq!(q[0], 1.0); // (1.0*255) as u8 = 255
-        assert_eq!(q[1], 127.0 / 255.0); // (0.5*255) as u8 = 127
+        assert_eq!(q[0], 1.0); // round(1.0 * 255) = 255
+        assert_eq!(q[1], 128.0 / 255.0); // round(0.5 * 255) = 128
         assert_eq!(q[2], 0.0);
     }
 
     #[test]
     fn translucent_uses_integer_premultiply() {
-        // alpha 0.5 -> ca = 127; premul(255) = (255*127 + 127)/255 = 127.
+        // alpha 0.5 -> ca = 128; premul(255) = (255*128 + 127)/255 = 128.
         let q = quantize_premul(&Color::rgba(1.0, 1.0, 1.0, 1.0), 0.5);
-        assert_eq!(q[3], 127.0 / 255.0);
-        assert_eq!(q[0], 127.0 / 255.0);
+        assert_eq!(q, [128.0 / 255.0; 4]);
+    }
+
+    #[test]
+    fn combined_alpha_rounds_before_integer_premultiply() {
+        let q = quantize_premul(&Color::rgba(1.0, 0.5, 0.0, 0.5), 0.5);
+        assert_eq!(q, [64.0 / 255.0, 32.0 / 255.0, 0.0, 64.0 / 255.0]);
+    }
+
+    #[test]
+    fn quantization_rounds_boundaries_and_preserves_saturation() {
+        for (value, expected) in [
+            (-1.0, 0),
+            (0.0, 0),
+            (0.49 / 255.0, 0),
+            (0.5 / 255.0, 1),
+            (0.499, 127),
+            (0.5, 128),
+            (254.49 / 255.0, 254),
+            (254.5 / 255.0, 255),
+            (1.0, 255),
+            (2.0, 255),
+            (f32::NAN, 0),
+            (f32::NEG_INFINITY, 0),
+            (f32::INFINITY, 255),
+        ] {
+            let expected = expected as f32 / 255.0;
+            assert_eq!(
+                quantize_premul(&Color::gray(value), 1.0),
+                [expected, expected, expected, 1.0],
+                "colour {value}"
+            );
+            assert_eq!(
+                quantize_premul(&Color::rgba(1.0, 1.0, 1.0, value), 1.0),
+                [expected; 4],
+                "alpha {value}"
+            );
+        }
     }
 
     #[test]
