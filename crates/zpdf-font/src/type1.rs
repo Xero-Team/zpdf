@@ -190,7 +190,7 @@ impl Type1Font {
             }
             i += step;
         }
-        if drawn == 0 || failed > drawn {
+        if failed > 0 && failed > drawn {
             crate::EmbeddedOutlineProbe::Unusable
         } else if failed > 0 {
             crate::EmbeddedOutlineProbe::PartiallyCorrupt
@@ -1358,5 +1358,50 @@ mod tests {
     fn sparse_huge_subr_index_does_not_resize_the_table() {
         let private = b"/Subrs 0 array dup 999999 1 RD x /CharStrings";
         assert!(parse_subrs(private, 0).is_empty());
+    }
+
+    #[test]
+    fn no_ink_only_type1_subset_stays_healthy_while_empty_visible_is_unusable() {
+        // hsbw(0, 250) + endchar (14): valid empty charstring.
+        let empty_cs = vec![139, 247, 142, 13, 14];
+
+        let mut no_ink = font_with_matrix([0.001, 0.0, 0.0, 0.001, 0.0, 0.0]);
+        no_ink.char_strings.clear();
+        no_ink
+            .char_strings
+            .insert(".notdef".into(), empty_cs.clone());
+        no_ink
+            .char_strings
+            .insert("uni0020".into(), empty_cs.clone());
+        no_ink
+            .char_strings
+            .insert("uni200B".into(), empty_cs.clone());
+        no_ink.gid_to_name = vec![".notdef".into(), "uni0020".into(), "uni200B".into()];
+        no_ink.name_to_gid = HashMap::from([
+            (".notdef".into(), 0),
+            ("uni0020".into(), 1),
+            ("uni200B".into(), 2),
+        ]);
+        assert_eq!(
+            no_ink.probe_outlines(),
+            crate::EmbeddedOutlineProbe::Healthy
+        );
+        assert!(no_ink.has_usable_outlines());
+
+        // An empty charstring for a known visible glyph name (/A) still counts
+        // as failed and classifies the font as unusable.
+        let mut empty_visible = font_with_matrix([0.001, 0.0, 0.0, 0.001, 0.0, 0.0]);
+        empty_visible.char_strings.clear();
+        empty_visible
+            .char_strings
+            .insert(".notdef".into(), empty_cs.clone());
+        empty_visible.char_strings.insert("A".into(), empty_cs);
+        empty_visible.gid_to_name = vec![".notdef".into(), "A".into()];
+        empty_visible.name_to_gid = HashMap::from([(".notdef".into(), 0), ("A".into(), 1)]);
+        assert_eq!(
+            empty_visible.probe_outlines(),
+            crate::EmbeddedOutlineProbe::Unusable
+        );
+        assert!(!empty_visible.has_usable_outlines());
     }
 }

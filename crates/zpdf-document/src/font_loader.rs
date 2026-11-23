@@ -500,7 +500,7 @@ fn fallback_simple_font(
     )
     .or_else(|| {
         let mut standard = LoadedFont::new_standard(base_font.clone())?;
-        if !cid_widths.is_empty() {
+        if !cid_widths.is_empty() || cid_widths.has_authoritative_default() {
             standard.cid_widths = cid_widths.clone();
         }
         Some(standard)

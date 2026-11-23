@@ -6697,3 +6697,141 @@ fn type0_mixed_width_cmap_matches_tounicode_by_source_width_in_both_directions()
         }
     }
 }
+
+#[test]
+fn standard_font_without_substitute_honors_missing_width_when_widths_empty() {
+    // Standard-14 font (/Helvetica) with an unparseable embedded FontFile,
+    // empty `/Widths []`, and `/FontDescriptor /MissingWidth 333`. When no
+    // substitute face is available, `fallback_simple_font` falls back to
+    // `LoadedFont::new_standard`, which must preserve the PDF's authoritative
+    // `/MissingWidth 333` instead of Helvetica's built-in 667 width for 'A'/'B'.
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 180 100] \
+          /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
+            .to_vec(),
+        stream("", b"0 0 0 rg BT /F1 24 Tf 15 40 Td (AB) Tj ET"),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding \
+          /FirstChar 65 /LastChar 64 /Widths [] /FontDescriptor 6 0 R >>"
+            .to_vec(),
+        b"<< /Type /FontDescriptor /FontName /Helvetica /Flags 32 /MissingWidth 333 /FontFile 7 0 R >>"
+            .to_vec(),
+        stream("", b"not a valid type1 font program"),
+    ]);
+
+    let doc = PdfDocument::open(pdf)
+        .unwrap()
+        .with_font_provider(Arc::new(FontProvider::memory_only()));
+    let page = zpdf::interpret_page(&doc, 0, Default::default()).unwrap();
+    let (_, font) = page.fonts.get_by_name("F1").unwrap();
+    assert!(!font.has_font_data(), "no substitute face available");
+    assert_eq!(page.stats.diagnostics.embedded_font_fallbacks, 1);
+
+    let RenderCommand::DrawGlyphRun(run) = &page.display_list.commands[0] else {
+        panic!("expected glyph run");
+    };
+    let expected = 333.0 * 24.0 / 1000.0;
+    assert!(
+        (run.glyphs[0].advance - expected).abs() < 0.01
+            && (run.glyphs[1].advance - expected).abs() < 0.01
+            && (run.glyphs[1].x - expected).abs() < 0.01,
+        "standard-font fallback without substitute must use /MissingWidth 333 (got adv0={}, adv1={}, x1={}, expected={})",
+        run.glyphs[0].advance,
+        run.glyphs[1].advance,
+        run.glyphs[1].x,
+        expected
+    );
+
+    // Extracted glyph cells must also reflect `/MissingWidth 333`.
+    let pdf_page = doc.page(0).unwrap();
+    let mut fonts = doc.load_page_fonts(&pdf_page);
+    let (content, _) = doc.page_content_with_diagnostics(&pdf_page).unwrap();
+    let mut spans = Vec::new();
+    zpdf_content::interpreter::ContentInterpreter::new(pdf_page.effective_box())
+        .with_document(doc.file(), &pdf_page.resources)
+        .with_fonts(&mut fonts)
+        .with_text_sink(&mut spans)
+        .with_text_geometry(true)
+        .interpret(&content);
+    assert_eq!(spans.len(), 1);
+    assert_eq!(spans[0].text, "AB");
+    assert_eq!(spans[0].glyphs.len(), 2);
+    assert!(
+        (spans[0].glyphs[1].origin.x - (15.0 + expected as f64)).abs() < 0.05,
+        "extracted glyph 'B' origin.x={} expected {}",
+        spans[0].glyphs[1].origin.x,
+        15.0 + expected as f64
+    );
+}
+
+#[test]
+fn type1_subset_with_only_uni0020_stays_embedded_without_fallback() {
+    // Valid Type 1 subset containing only `/.notdef` and `/uni0020` (width-only
+    // space charstring): must stay healthy and embedded with zero fallbacks.
+    let mut private = Vec::new();
+    private.extend_from_slice(
+        b"dup /Private 4 dict dup begin /lenIV -1 def /CharStrings 2 dict dup begin\n",
+    );
+    let entries: &[(&str, &[u8])] = &[
+        (".notdef", &[139, 248, 136, 13, 14]),
+        ("uni0020", &[139, 247, 192, 13, 14]),
+    ];
+    for (name, cs) in entries {
+        private.extend_from_slice(format!("/{name} {} RD ", cs.len()).as_bytes());
+        private.extend_from_slice(cs);
+        private.extend_from_slice(b" ND\n");
+    }
+    private.extend_from_slice(b"end end readonly def\n");
+
+    let mut r: u16 = 55665;
+    let mut hex = String::with_capacity((private.len() + 4) * 2);
+    for &p in [0u8, 0, 0, 0].iter().chain(private.iter()) {
+        let c = p ^ (r >> 8) as u8;
+        r = (c as u16)
+            .wrapping_add(r)
+            .wrapping_mul(52845)
+            .wrapping_add(22719);
+        use std::fmt::Write;
+        let _ = write!(&mut hex, "{c:02X}");
+    }
+    let mut pfa = b"%!PS-AdobeFont-1.0: UniSpaceOnly 1.0\n\
+        8 dict begin\n\
+        /FontName /UniSpaceOnly def /FontType 1 def /PaintType 0 def\n\
+        /FontMatrix [0.001 0 0 0.001 0 0] readonly def\n\
+        /FontBBox [0 0 1000 900] readonly def /Encoding StandardEncoding def\n\
+        currentdict end currentfile eexec\n"
+        .to_vec();
+    pfa.extend_from_slice(hex.as_bytes());
+    pfa.push(b'\n');
+
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 180 100] \
+          /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
+            .to_vec(),
+        stream("", b"0 0 0 rg BT /F1 24 Tf 15 40 Td ( ) Tj ET"),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /ABCDEF+UniSpaceOnly \
+          /Encoding << /Type /Encoding /Differences [32 /uni0020] >> \
+          /FirstChar 32 /LastChar 32 /Widths [300] /FontDescriptor 6 0 R >>"
+            .to_vec(),
+        b"<< /Type /FontDescriptor /FontName /ABCDEF+UniSpaceOnly /Flags 32 /FontFile 7 0 R >>"
+            .to_vec(),
+        stream("", &pfa),
+    ]);
+
+    let doc = PdfDocument::open(pdf)
+        .unwrap()
+        .with_font_provider(provider_with_alias("UniSpaceOnly"));
+    let page = zpdf::interpret_page(&doc, 0, Default::default()).unwrap();
+    let (fid, font) = page.fonts.get_by_name("F1").unwrap();
+    assert!(
+        !font.is_substitute,
+        "uni0020-only Type 1 subset must stay embedded"
+    );
+    assert!(!page.fonts.has_admitted_embedded_companion(fid));
+    assert_eq!(page.stats.diagnostics.embedded_font_fallbacks, 0);
+    assert_eq!(page.stats.diagnostics.missing_glyph_outlines, 0);
+    assert!(page.is_complete());
+}

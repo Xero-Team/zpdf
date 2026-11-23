@@ -238,6 +238,20 @@ mod tests {
         assert!(!op.paints(4));
         assert!(!op.paints(usize::MAX));
     }
+
+    #[test]
+    fn positioned_glyph_default_has_unspecified_code_len() {
+        let glyph = PositionedGlyph {
+            glyph_id: 7,
+            code: 0x0102,
+            x: 10.0,
+            y: 20.0,
+            advance: 6.0,
+            ..PositionedGlyph::default()
+        };
+        assert_eq!(glyph.code_len, 0);
+        assert_eq!(std::mem::size_of::<PositionedGlyph>(), 20);
+    }
 }
 
 // -- Text --
@@ -261,12 +275,14 @@ pub struct GlyphRun {
     pub h_scale: f32,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct PositionedGlyph {
     pub glyph_id: u16,
-    /// Source byte length of `code` in the PDF text string (1–4, or 0 when
-    /// unspecified by a synthetic caller). Fits in the alignment padding after
-    /// `glyph_id` without increasing struct size.
+    /// Source byte length of `code` in the PDF text string (`1..=4`), or `0`
+    /// when unspecified by a synthetic caller (or via `..PositionedGlyph::default()`),
+    /// in which case exporters infer the byte width from the logical font's
+    /// CMap or `/ToUnicode` table. Fits in the alignment padding after
+    /// `glyph_id` without increasing struct size (20 bytes).
     pub code_len: u8,
     /// Raw big-endian source character code bytes from the PDF string (before
     /// CID/CMap mapping). `/ToUnicode` CMaps are keyed by these packed source

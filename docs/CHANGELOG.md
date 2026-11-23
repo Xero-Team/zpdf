@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Compatibility
+
+- **Breaking:** exhaustive `PositionedGlyph` literals must add `code_len: 0`
+  (or an explicit PDF source byte width `1..=4`) or use the new
+  `..PositionedGlyph::default()`. Setting `code_len: 0` on synthetic glyphs
+  infers the width from the logical font's encoding CMap or `/ToUnicode` table,
+  while `ContentInterpreter` records the exact source byte width (`1..=4`)
+  alongside packed big-endian source bytes in `code`. Struct size stays 20 bytes
+  (reusing padding after `glyph_id`); under pre-1.0 semver this ships in the
+  next `0.22.0` minor release. (#157)
+
 ### Rendering and font recovery
 
 - Fall back to the descriptor-based substitute font path when an embedded font
