@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.22.0 — Embedded font recovery, rendering precision, and JBIG2 oracle
+
+Released 2026-11-23.
+
 ### Compatibility
 
 - **Breaking:** exhaustive `PositionedGlyph` literals must add `code_len: 0`
@@ -11,23 +15,21 @@
   while `ContentInterpreter` records the exact source byte width (`1..=4`)
   alongside packed big-endian source bytes in `code`. Struct size stays 20 bytes
   (reusing padding after `glyph_id`); under pre-1.0 semver this ships in the
-  next `0.22.0` minor release. (#157)
-
-### Performance
-
-- Add `ContentInterpreter::with_clip_elision_scale` and
-  `PageInterpretOptions::clip_elision_scale` (wired into CPU rendering in
-  `zpdf-cli`, `zpdf-wasm`, and `zpdf-benches`) to elide axis-aligned rectangle
-  clips (`W`/`W*`, Form XObject `/BBox`, and pattern clips) that cover every
-  affected device pixel of an active clip mask, avoiding redundant
-  `PushClip`/`PopClip` pairs and CPU clip-mask allocations while keeping
-  rendered pixels identical within CPU clip budgets. (#166)
+  `0.22.0` minor release. (#157, #193)
+- **Breaking:** exhaustive `zpdf_font::LoadedFont` literals must add
+  `direct_composite_gids: false` (matching the font constructors and preserving
+  previous glyph mapping behavior). Setting `direct_composite_gids: true` (via
+  `LoadedFont::enable_direct_composite_gids`) resolves drawing GIDs per source
+  code on substituted Type 0 fonts via `/ToUnicode` and `/Encoding` CMaps while
+  keeping original CID advances. (#157, #193)
 
 ### Rendering and font recovery
 
 - Round CPU, GPU and SVG 8-bit colours to the nearest value (`0.5 g` now gives
-  128 rather than 127), and round CPU clip and soft-mask products and Type 3
-  image-mask tints to avoid darkening colours and eroding mask edges. (#183)
+  128 rather than 127), including GPU page-clear colours and luminosity
+  soft-mask `/BC` backdrop clears, and round CPU clip and soft-mask products
+  and Type 3 image-mask tints to avoid darkening colours and eroding mask edges.
+  (#183, #191)
 - Fall back to the descriptor-based substitute font path when an embedded font
   program (`FontFile`, `FontFile2`, or `FontFile3`) fails to decode, fails to
   parse, or has unreadable glyph outlines — for simple fonts and for Type 0 /
@@ -43,15 +45,25 @@
   `is_complete()` while retaining `embedded_font_fallbacks`; unrecovered missing
   visible glyphs record `missing_glyph_outlines` (rejecting visual exports while
   allowing text-only exports when every character decoded, and incrementing
-  `decode_failures` if decoding also failed). (#157)
+  `decode_failures` if decoding also failed). (#157, #193)
 
-### Testing and JBIG2 decoding
+### Performance
+
+- Add `ContentInterpreter::with_clip_elision_scale` and
+  `PageInterpretOptions::clip_elision_scale` (wired into CPU rendering in
+  `zpdf-cli`, `zpdf-wasm`, and `zpdf-benches`) to elide axis-aligned rectangle
+  clips (`W`/`W*`, Form XObject `/BBox`, and pattern clips) that cover every
+  affected device pixel of an active clip mask, avoiding redundant
+  `PushClip`/`PopClip` pairs and CPU clip-mask allocations while keeping
+  rendered pixels identical within CPU clip budgets. (#166, #192)
+
+### Testing and JBIG2 conformance
 
 - Add `hayro-jbig2` (pure Rust, `default-features = false`) as a test-only
   dev-dependency and differential oracle suite (`zpdf-parser/tests/jbig2_oracle.rs`)
   covering generic/MMR/refinement/text/halftone regions, symbol/pattern
   dictionaries, `/JBIG2Globals`, checked-in corpus/fuzz seeds, `ParseLimits`
-  budgets, and per-region fault isolation. (#173)
+  budgets, and per-region fault isolation. (#173, #194)
 - Fix five ITU-T T.88 JBIG2 decoding bugs uncovered by the differential oracle:
   byte-align after Huffman text-region symbol-ID tables (§7.4.3.1.7), skip MQ
   decoding on `HSKIP` cells in halftone bitplanes while budgeting coded cells
@@ -62,7 +74,15 @@
   rows charged to `DecodeBudget` while rejecting positive `BMSIZE` extending
   past the segment (§6.5.9), and slice Huffman text-region refinement payloads
   to `RSIZE` while reusing refinement contexts across instances (§6.4.11).
-  (#173)
+  (#173, #194)
+
+### Dependencies and distribution
+
+- Pin `wasm-bindgen` to `=0.2.130` in `crates/zpdf-wasm/Cargo.toml` and align
+  `crates/zpdf-wasm/README.md` and `build-web.sh` with the shipped package
+  toolchain. (#191, #193)
+- Rebuild the shipped browser WASM/JS package and source/artifact fingerprint
+  for version 0.22.0.
 
 ## 0.21.0 — Glyph-level selection and rendering compatibility
 
