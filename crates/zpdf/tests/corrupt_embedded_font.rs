@@ -7062,4 +7062,247 @@ fn type1_truncated_unknown_glyph_charstring_is_unreadable_without_tounicode() {
         !broken_page.is_complete(),
         "per-glyph check must treat truncated /g1 as unreadable rather than Blank"
     );
+
+    // 3. `/g1` delegates its strokes to `/Subrs[0]` then runs `endchar`
+    //    (without `/ToUnicode`): an empty `/Subrs[0]` hits unexpected EOF and
+    //    must trigger fallback/incomplete output, whereas a `/Subrs[0]` ending
+    //    with explicit `return` (11) stays embedded and complete.
+    let build_subr_pfa = |font_name: &str, subr0: &[u8]| -> Vec<u8> {
+        let mut private = b"dup /Private 5 dict dup begin /lenIV -1 def\n\
+            /Subrs 1 array\n"
+            .to_vec();
+        private.extend_from_slice(format!("dup 0 {} RD ", subr0.len()).as_bytes());
+        private.extend_from_slice(subr0);
+        private.extend_from_slice(b" NP\nND\n/CharStrings 2 dict dup begin\n");
+        let caller: &[u8] = &[139, 248, 136, 13, 139, 10, 14];
+        for (name, cs) in [(".notdef", &[139u8, 248, 136, 13, 14][..]), ("g1", caller)] {
+            private.extend_from_slice(format!("/{name} {} RD ", cs.len()).as_bytes());
+            private.extend_from_slice(cs);
+            private.extend_from_slice(b" ND\n");
+        }
+        private.extend_from_slice(b"end end readonly def\n");
+
+        let mut r: u16 = 55665;
+        let mut hex = String::with_capacity((private.len() + 4) * 2);
+        for &p in [0u8, 0, 0, 0].iter().chain(private.iter()) {
+            let c = p ^ (r >> 8) as u8;
+            r = (c as u16)
+                .wrapping_add(r)
+                .wrapping_mul(52845)
+                .wrapping_add(22719);
+            use std::fmt::Write;
+            let _ = write!(&mut hex, "{c:02X}");
+        }
+        let mut pfa = format!(
+            "%!PS-AdobeFont-1.0: {font_name} 1.0\n\
+             8 dict begin\n\
+             /FontName /{font_name} def /FontType 1 def /PaintType 0 def\n\
+             /FontMatrix [0.001 0 0 0.001 0 0] readonly def\n\
+             /FontBBox [0 0 1000 900] readonly def /Encoding StandardEncoding def\n\
+             currentdict end currentfile eexec\n"
+        )
+        .into_bytes();
+        pfa.extend_from_slice(hex.as_bytes());
+        pfa.push(b'\n');
+        pfa
+    };
+
+    let make_subr_pdf = |font_name: &str, pfa: &[u8]| {
+        assemble(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 180 100] \
+              /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
+                .to_vec(),
+            stream("", b"0 0 0 rg BT /F1 24 Tf 15 40 Td <41> Tj ET"),
+            format!(
+                "<< /Type /Font /Subtype /Type1 /BaseFont /ABCDEF+{font_name} \
+                 /Encoding << /Type /Encoding /Differences [65 /g1] >> \
+                 /FirstChar 65 /LastChar 65 /Widths [600] /FontDescriptor 6 0 R >>"
+            )
+            .into_bytes(),
+            format!(
+                "<< /Type /FontDescriptor /FontName /ABCDEF+{font_name} /Flags 32 /FontFile 7 0 R >>"
+            )
+            .into_bytes(),
+            stream("", pfa),
+        ])
+    };
+
+    let empty_subr_pfa = build_subr_pfa("EmptySubrG1", &[]);
+    let empty_subr_doc = PdfDocument::open(make_subr_pdf("EmptySubrG1", &empty_subr_pfa))
+        .unwrap()
+        .with_font_provider(Arc::new(FontProvider::memory_only()));
+    let empty_subr_page = zpdf::interpret_page(&empty_subr_doc, 0, Default::default()).unwrap();
+    assert_eq!(empty_subr_page.stats.diagnostics.embedded_font_fallbacks, 1);
+    assert_eq!(empty_subr_page.stats.diagnostics.missing_glyph_outlines, 1);
+    assert!(
+        !empty_subr_page.is_complete(),
+        "empty /Subrs[0] EOF must fail and not pass /g1 as a valid blank"
+    );
+
+    let mut valid_subr = vec![
+        189, 139, 21, 139, 249, 80, 5, 248, 136, 139, 5, 139, 253, 80, 5, 9,
+    ];
+    valid_subr.push(11); // explicit `return`
+    let valid_subr_pfa = build_subr_pfa("ValidSubrG1", &valid_subr);
+    let valid_subr_doc = PdfDocument::open(make_subr_pdf("ValidSubrG1", &valid_subr_pfa))
+        .unwrap()
+        .with_font_provider(Arc::new(FontProvider::memory_only()));
+    let valid_subr_page = zpdf::interpret_page(&valid_subr_doc, 0, Default::default()).unwrap();
+    assert!(
+        !valid_subr_page
+            .fonts
+            .get_by_name("F1")
+            .unwrap()
+            .1
+            .is_substitute
+    );
+    assert_eq!(valid_subr_page.stats.diagnostics.embedded_font_fallbacks, 0);
+    assert_eq!(valid_subr_page.stats.diagnostics.missing_glyph_outlines, 0);
+    assert!(valid_subr_page.is_complete());
+}
+
+#[test]
+fn type1_move_only_visible_charstring_recovers_via_substitute_and_reports_incomplete_without_one() {
+    // Build a valid Type 1 PFA with drawable `/B` and `/C`, a genuine
+    // width-only `/space`, and a terminated move-only `/A` (`hsbw`, `rmoveto`,
+    // `endchar` — leaves only `MoveTo` + `Close` and paints nothing).
+    let mut private = Vec::new();
+    private.extend_from_slice(
+        b"dup /Private 4 dict dup begin /lenIV -1 def /CharStrings 5 dict dup begin\n",
+    );
+    let entries: &[(&str, &[u8])] = &[
+        (".notdef", &[139, 248, 136, 13, 14]),
+        ("space", &[139, 247, 192, 13, 14]),
+        // hsbw(0, 620), rmoveto(50, 0), endchar
+        ("A", &[139, 249, 0, 13, 189, 139, 21, 14]),
+        (
+            "B",
+            &[
+                139, 249, 160, 13, 189, 139, 21, 139, 249, 80, 5, 248, 136, 139, 5, 139, 253, 80,
+                5, 9, 14,
+            ],
+        ),
+        (
+            "C",
+            &[
+                139, 248, 176, 13, 189, 139, 21, 139, 249, 80, 5, 248, 36, 139, 5, 139, 253, 80, 5,
+                9, 14,
+            ],
+        ),
+    ];
+    for (name, cs) in entries {
+        private.extend_from_slice(format!("/{name} {} RD ", cs.len()).as_bytes());
+        private.extend_from_slice(cs);
+        private.extend_from_slice(b" ND\n");
+    }
+    private.extend_from_slice(b"end end readonly def\n");
+
+    let mut r: u16 = 55665;
+    let mut hex = String::with_capacity((private.len() + 4) * 2);
+    for &p in [0u8, 0, 0, 0].iter().chain(private.iter()) {
+        let c = p ^ (r >> 8) as u8;
+        r = (c as u16)
+            .wrapping_add(r)
+            .wrapping_mul(52845)
+            .wrapping_add(22719);
+        use std::fmt::Write;
+        let _ = write!(&mut hex, "{c:02X}");
+    }
+    let mut pfa = b"%!PS-AdobeFont-1.0: MoveOnlyAType1 1.0\n\
+        8 dict begin\n\
+        /FontName /MoveOnlyAType1 def /FontType 1 def /PaintType 0 def\n\
+        /FontMatrix [0.001 0 0 0.001 0 0] readonly def\n\
+        /FontBBox [0 0 1000 900] readonly def /Encoding StandardEncoding def\n\
+        currentdict end currentfile eexec\n"
+        .to_vec();
+    pfa.extend_from_slice(hex.as_bytes());
+    pfa.push(b'\n');
+
+    let mut widths = [500u16; 36];
+    widths[0] = 300;
+    widths[65 - 32] = 620;
+    widths[66 - 32] = 780;
+    widths[67 - 32] = 540;
+    let widths_str: String = widths
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let make_pdf = |content: &[u8]| {
+        assemble(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 180 100] \
+              /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
+                .to_vec(),
+            stream("", content),
+            format!(
+                "<< /Type /Font /Subtype /Type1 /BaseFont /ABCDEF+MoveOnlyAType1 \
+                 /Encoding /WinAnsiEncoding /FirstChar 32 /LastChar 67 /Widths [{widths_str}] \
+                 /FontDescriptor 6 0 R >>"
+            )
+            .into_bytes(),
+            b"<< /Type /FontDescriptor /FontName /ABCDEF+MoveOnlyAType1 /Flags 32 /FontFile 7 0 R >>"
+                .to_vec(),
+            stream("", &pfa),
+        ])
+    };
+
+    // 1. Healthy letters + genuine space ("B C"): stays embedded with zero fallbacks.
+    let bc_doc = PdfDocument::open(make_pdf(b"0 0 0 rg BT /F1 24 Tf 15 40 Td (B C) Tj ET"))
+        .unwrap()
+        .with_font_provider(Arc::new(FontProvider::memory_only()));
+    let bc_page = zpdf::interpret_page(&bc_doc, 0, Default::default()).unwrap();
+    let (fid_bc, f_bc) = bc_page.fonts.get_by_name("F1").unwrap();
+    assert!(!f_bc.is_substitute);
+    assert!(!bc_page.fonts.has_admitted_embedded_companion(fid_bc));
+    assert_eq!(bc_page.stats.diagnostics.embedded_font_fallbacks, 0);
+    assert_eq!(bc_page.stats.diagnostics.missing_glyph_outlines, 0);
+    assert!(bc_page.is_complete());
+
+    // 2. Move-only `/A` + space + healthy `/B` ("A B") with substitute:
+    //    only 'A' moves to the substitute face while ' ' and 'B' stay embedded.
+    let ab_pdf = make_pdf(b"0 0 0 rg BT /F1 24 Tf 15 40 Td (A B) Tj ET");
+    let provider = Arc::new(FontProvider::memory_only());
+    provider
+        .register_with_aliases(BOLD_TTF, 0, &["MoveOnlyAType1"])
+        .unwrap();
+    let sub_doc = PdfDocument::open(ab_pdf.clone())
+        .unwrap()
+        .with_font_provider(provider);
+    let sub_page = zpdf::interpret_page(&sub_doc, 0, Default::default()).unwrap();
+    let (fid_ab, f_ab) = sub_page.fonts.get_by_name("F1").unwrap();
+    assert!(!f_ab.is_substitute);
+    assert!(sub_page.fonts.has_admitted_embedded_companion(fid_ab));
+    assert_eq!(sub_page.stats.diagnostics.embedded_font_fallbacks, 1);
+    assert_eq!(sub_page.stats.diagnostics.missing_glyph_outlines, 0);
+    assert!(sub_page.is_complete());
+    let runs: Vec<_> = sub_page
+        .display_list
+        .commands
+        .iter()
+        .filter_map(|cmd| match cmd {
+            RenderCommand::DrawGlyphRun(run) => Some(run),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(runs.len(), 2, "substitute 'A' + embedded ' B'");
+    assert_ne!(runs[0].font_id, fid_ab, "'A' must use substitute face");
+    assert_eq!(runs[1].font_id, fid_ab, "' B' must stay on embedded Type 1");
+
+    // 3. Move-only `/A` without any substitute: must report incomplete output
+    //    rather than claiming complete with an invisible 'A'.
+    let nosub_doc = PdfDocument::open(ab_pdf)
+        .unwrap()
+        .with_font_provider(Arc::new(FontProvider::memory_only()));
+    let nosub_page = zpdf::interpret_page(&nosub_doc, 0, Default::default()).unwrap();
+    assert_eq!(nosub_page.stats.diagnostics.embedded_font_fallbacks, 1);
+    assert_eq!(nosub_page.stats.diagnostics.missing_glyph_outlines, 1);
+    assert!(
+        !nosub_page.is_complete(),
+        "move-only /A without substitute must not report complete"
+    );
 }

@@ -180,7 +180,7 @@ impl Type1Font {
                     } else {
                         failed += 1;
                     }
-                } else if !interp.cmds.is_empty() {
+                } else if has_drawable_segment(&interp.cmds) {
                     drawn += 1;
                 } else if crate::glyph_list::glyph_name_to_string(name)
                     .is_some_and(|s| crate::resolution::is_visible_text(&s))
@@ -225,7 +225,7 @@ impl Type1Font {
                 crate::resolution::GlyphState::Missing
             };
         }
-        if !interp.cmds.is_empty() {
+        if has_drawable_segment(&interp.cmds) {
             crate::resolution::GlyphState::Drawn
         } else if crate::glyph_list::glyph_name_to_string(name)
             .is_some_and(|s| crate::resolution::is_visible_text(&s))
@@ -305,7 +305,7 @@ impl Type1Font {
         if let Some(seac) = interp.seac {
             return self.compose_seac(&interp, seac, depth + 1);
         }
-        if interp.cmds.is_empty() {
+        if !has_drawable_segment(&interp.cmds) {
             return None;
         }
         Some(GlyphOutline {
@@ -381,6 +381,15 @@ impl Type1Font {
             advance_width: interp.width,
         })
     }
+}
+
+fn has_drawable_segment(cmds: &[OutlineCommand]) -> bool {
+    cmds.iter().any(|cmd| {
+        matches!(
+            cmd,
+            OutlineCommand::LineTo(..) | OutlineCommand::QuadTo(..) | OutlineCommand::CurveTo(..)
+        )
+    })
 }
 
 fn translate_cmd(c: OutlineCommand, dx: f64, dy: f64) -> OutlineCommand {
@@ -631,7 +640,13 @@ impl Interp {
                         let idx = idx as i64;
                         if idx >= 0 && (idx as usize) < subrs.len() {
                             self.run(&subrs[idx as usize], subrs, depth + 1);
+                        } else {
+                            self.failed = true;
+                            return;
                         }
+                    } else {
+                        self.failed = true;
+                        return;
                     }
                 }
                 11 => {
@@ -668,7 +683,11 @@ impl Interp {
                 return;
             }
         }
-        if depth == 0 && !self.done {
+        // Adobe Type 1 Font Format §8: a top-level charstring must finish with
+        // `endchar` or `seac`, and a subroutine must finish with `return`
+        // (exiting early above) or `endchar`/`seac`. Reaching EOF with `!done`
+        // at any depth is a truncated charstring or subroutine.
+        if !self.done {
             self.failed = true;
         }
     }
@@ -1406,23 +1425,57 @@ mod tests {
         assert!(!no_ink.is_gid_unreadable(1));
         assert!(no_ink.is_blank_gid(1));
 
-        // An empty charstring for a known visible glyph name (/A) still counts
-        // as failed and classifies the font as unusable.
-        let mut empty_visible = font_with_matrix([0.001, 0.0, 0.0, 0.001, 0.0, 0.0]);
-        empty_visible.char_strings.clear();
-        empty_visible
+        // An empty or terminated move-only (`hsbw`, `rmoveto`, `endchar`)
+        // charstring for a known visible glyph name (/A) has no drawable path
+        // segments, so it must count as failed / Missing rather than Drawn.
+        let move_only_cs = vec![139, 248, 136, 13, 189, 139, 21, 14];
+        for (label, cs) in [
+            ("empty-visible-A", empty_cs.clone()),
+            ("move-only-visible-A", move_only_cs.clone()),
+        ] {
+            let mut bad_visible = font_with_matrix([0.001, 0.0, 0.0, 0.001, 0.0, 0.0]);
+            bad_visible.char_strings.clear();
+            bad_visible
+                .char_strings
+                .insert(".notdef".into(), empty_cs.clone());
+            bad_visible.char_strings.insert("A".into(), cs);
+            bad_visible.gid_to_name = vec![".notdef".into(), "A".into()];
+            bad_visible.name_to_gid = HashMap::from([(".notdef".into(), 0), ("A".into(), 1)]);
+            assert_eq!(
+                bad_visible.probe_outlines(),
+                crate::EmbeddedOutlineProbe::Unusable,
+                "{label}"
+            );
+            assert!(!bad_visible.has_usable_outlines(), "{label}");
+            assert_eq!(
+                bad_visible.glyph_state_by_gid(1),
+                crate::resolution::GlyphState::Missing,
+                "{label}"
+            );
+            assert!(bad_visible.is_gid_unreadable(1), "{label}");
+            assert!(bad_visible.glyph_outline_by_gid(1).is_none(), "{label}");
+        }
+
+        // A terminated move-only space stays Healthy / Blank.
+        let mut move_only_space = font_with_matrix([0.001, 0.0, 0.0, 0.001, 0.0, 0.0]);
+        move_only_space.char_strings.clear();
+        move_only_space
             .char_strings
             .insert(".notdef".into(), empty_cs.clone());
-        empty_visible
+        move_only_space
             .char_strings
-            .insert("A".into(), empty_cs.clone());
-        empty_visible.gid_to_name = vec![".notdef".into(), "A".into()];
-        empty_visible.name_to_gid = HashMap::from([(".notdef".into(), 0), ("A".into(), 1)]);
+            .insert("uni0020".into(), move_only_cs);
+        move_only_space.gid_to_name = vec![".notdef".into(), "uni0020".into()];
+        move_only_space.name_to_gid = HashMap::from([(".notdef".into(), 0), ("uni0020".into(), 1)]);
         assert_eq!(
-            empty_visible.probe_outlines(),
-            crate::EmbeddedOutlineProbe::Unusable
+            move_only_space.probe_outlines(),
+            crate::EmbeddedOutlineProbe::Healthy
         );
-        assert!(!empty_visible.has_usable_outlines());
+        assert_eq!(
+            move_only_space.glyph_state_by_gid(1),
+            crate::resolution::GlyphState::Blank
+        );
+        assert!(!move_only_space.is_gid_unreadable(1));
 
         // Truncated charstrings on an unknown glyph name (/g1) — ending
         // mid-operand, mid-escape, or without endchar — must be classified as
@@ -1459,6 +1512,89 @@ mod tests {
             assert!(truncated.is_gid_unreadable(1), "{label}");
             assert!(!truncated.is_blank_gid(1), "{label}");
             assert!(truncated.glyph_outline_by_gid(1).is_none(), "{label}");
+        }
+    }
+
+    #[test]
+    fn subroutine_unexpected_eof_fails_while_explicit_return_succeeds() {
+        let empty_cs = vec![139, 247, 142, 13, 14];
+        // /g1 delegates its strokes to subr 0 and then executes endchar:
+        // hsbw(0, 500), 0 callsubr, endchar.
+        let caller_cs = vec![139, 248, 136, 13, 139, 10, 14];
+        let make_font = |subrs: Vec<Vec<u8>>| {
+            let mut font = font_with_matrix([0.001, 0.0, 0.0, 0.001, 0.0, 0.0]);
+            font.char_strings.clear();
+            font.char_strings.insert(".notdef".into(), empty_cs.clone());
+            font.char_strings.insert("g1".into(), caller_cs.clone());
+            font.gid_to_name = vec![".notdef".into(), "g1".into()];
+            font.name_to_gid = HashMap::from([(".notdef".into(), 0), ("g1".into(), 1)]);
+            font.subrs = subrs;
+            font
+        };
+
+        // Unexpected EOF inside a subroutine (empty /Subrs[0], strokes without
+        // `return`, or missing /Subrs entry) must fail even though the caller
+        // has a trailing `endchar`.
+        for (label, subrs) in [
+            ("empty-subr-eof", vec![vec![]]),
+            (
+                "strokes-without-return",
+                vec![vec![139, 239, 21, 239, 139, 5]],
+            ),
+            ("missing-subr-index", vec![]),
+        ] {
+            let font = make_font(subrs);
+            assert_eq!(
+                font.probe_outlines(),
+                crate::EmbeddedOutlineProbe::Unusable,
+                "{label}"
+            );
+            assert!(!font.has_usable_outlines(), "{label}");
+            assert_eq!(
+                font.glyph_state_by_gid(1),
+                crate::resolution::GlyphState::Missing,
+                "{label}"
+            );
+            assert!(font.is_gid_unreadable(1), "{label}");
+            assert!(!font.is_blank_gid(1), "{label}");
+            assert!(font.glyph_outline_by_gid(1).is_none(), "{label}");
+        }
+
+        // Explicit `return` (11) exits cleanly and lets the caller's `endchar`
+        // complete: both a no-ink `return` and a stroked `return` (or `endchar`
+        // inside the subr) remain healthy.
+        let blank_ret = make_font(vec![vec![11]]);
+        assert_eq!(
+            blank_ret.probe_outlines(),
+            crate::EmbeddedOutlineProbe::Healthy
+        );
+        assert_eq!(
+            blank_ret.glyph_state_by_gid(1),
+            crate::resolution::GlyphState::Blank
+        );
+        assert!(!blank_ret.is_gid_unreadable(1));
+        assert!(blank_ret.is_blank_gid(1));
+
+        for (label, subr) in [
+            (
+                "explicit-return-strokes",
+                vec![139, 239, 21, 239, 139, 5, 11],
+            ),
+            ("subr-endchar-strokes", vec![139, 239, 21, 239, 139, 5, 14]),
+        ] {
+            let font = make_font(vec![subr]);
+            assert_eq!(
+                font.probe_outlines(),
+                crate::EmbeddedOutlineProbe::Healthy,
+                "{label}"
+            );
+            assert_eq!(
+                font.glyph_state_by_gid(1),
+                crate::resolution::GlyphState::Drawn,
+                "{label}"
+            );
+            assert!(!font.is_gid_unreadable(1), "{label}");
+            assert!(font.glyph_outline_by_gid(1).is_some(), "{label}");
         }
     }
 }
