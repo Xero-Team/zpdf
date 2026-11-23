@@ -19,6 +19,8 @@ zpdf-parser.workspace = true
 zpdf-document.workspace = true
 # Content-stream tokenizer for redaction.
 zpdf-content.workspace = true
+# Standard PDF BlendMode enum for DocumentBuilder graphics state options.
+zpdf-display-list.workspace = true
 thiserror.workspace = true
 flate2.workspace = true
 tracing.workspace = true
