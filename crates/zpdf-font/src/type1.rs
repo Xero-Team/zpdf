@@ -915,8 +915,8 @@ fn parse_builtin_encoding(clear: &[u8]) -> Vec<Option<String>> {
         }
         // Custom: a sequence of `dup <code> /<name> put`.
         let mut i = 0;
-        while let Some(rel) = find(&region[i..], b"dup ") {
-            let mut p = i + rel + 4;
+        while let Some(pos) = find_token_in(region, i, region.len(), b"dup") {
+            let mut p = pos + 3;
             let (code, np) = match read_uint(region, p) {
                 Some(v) => v,
                 None => {
@@ -974,22 +974,24 @@ fn parse_subrs(private: &[u8], len_iv: i32) -> Vec<Vec<u8>> {
             subrs.resize(count as usize, Vec::new());
         }
     }
-    let mut i = start;
+    let mut i = start + 6;
     // Stop scanning at CharStrings (the next section).
-    let end = find(private, b"/CharStrings").unwrap_or(private.len());
+    let end = find(&private[start..], b"/CharStrings")
+        .map(|rel| start + rel)
+        .unwrap_or(private.len());
     while i < end {
-        let rel = match find(&private[i..end], b"dup ") {
-            Some(r) => r,
+        let pos = match find_token_in(private, i, end, b"dup") {
+            Some(p) => p,
             None => break,
         };
-        let mut p = i + rel + 4;
+        let mut p = pos + 3;
         let idx = match read_int(private, p) {
             Some((v, np)) => {
                 p = np;
                 v
             }
             None => {
-                i = i + rel + 4;
+                i = p;
                 continue;
             }
         };
@@ -1121,19 +1123,40 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
-/// Find a needle only when it stands as a whole token (delimited by whitespace).
+/// Find a needle only when it stands as a whole PostScript token.
 fn find_token(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    let mut from = 0;
-    while let Some(rel) = find(&haystack[from..], needle) {
-        let pos = from + rel;
-        let before_ok = pos == 0 || is_ws(haystack[pos - 1]);
-        let after = pos + needle.len();
-        let after_ok =
-            after >= haystack.len() || is_ws(haystack[after]) || is_delim(haystack[after]);
-        if before_ok && after_ok {
-            return Some(pos);
+    find_token_in(haystack, 0, haystack.len(), needle)
+}
+
+/// Find `needle` as a whole PostScript token within `data[start..end]`,
+/// skipping `%` comments forward from `start` and inspecting boundary bytes in
+/// the full `data` slice so sliced searches do not treat mid-identifier offsets
+/// as token boundaries.
+fn find_token_in(data: &[u8], start: usize, end: usize, needle: &[u8]) -> Option<usize> {
+    let end = end.min(data.len());
+    if needle.is_empty() || start >= end {
+        return None;
+    }
+    let mut p = start;
+    while p < end {
+        if data[p] == b'%' {
+            while p < end && data[p] != b'\n' && data[p] != b'\r' {
+                p += 1;
+            }
+            continue;
         }
-        from = pos + 1;
+        if p + needle.len() <= end && &data[p..p + needle.len()] == needle {
+            // PostScript tokens are bounded by whitespace or delimiters, except
+            // `/` starts a literal name (`/dup`) rather than an executable token.
+            let before_ok =
+                p == 0 || is_ws(data[p - 1]) || (is_delim(data[p - 1]) && data[p - 1] != b'/');
+            let after = p + needle.len();
+            let after_ok = after >= data.len() || is_ws(data[after]) || is_delim(data[after]);
+            if before_ok && after_ok {
+                return Some(p);
+            }
+        }
+        p += 1;
     }
     None
 }
@@ -1239,6 +1262,53 @@ mod tests {
         let hay = b"/Encoding StandardEncoding def";
         assert!(find_token(hay, b"StandardEncoding").is_some());
         assert!(find_token(b"xStandardEncodingy", b"StandardEncoding").is_none());
+        assert!(find_token(b"\tdup\n0", b"dup").is_some());
+        assert!(find_token(b"]dup\t0", b"dup").is_some());
+        assert!(find_token(b"/dup 0", b"dup").is_none());
+        assert!(find_token(b"%dup 0", b"dup").is_none());
+        assert!(find_token(b"% dup 0", b"dup").is_none());
+        assert!(find_token(b"mydup 0", b"dup").is_none());
+        assert!(find_token(b"dup0 0", b"dup").is_none());
+    }
+
+    #[test]
+    fn parse_subrs_recognizes_dup_token_with_any_postscript_whitespace() {
+        let ret: &[u8] = &[11];
+        let decoy: &[u8] = &[14];
+        let mut private = b"/lenIV -1 def\n/Subrs 4 array\n".to_vec();
+        // Decoy literal name `/dup`, comments (`%dup` / `% dup`), and suffix
+        // `mydup` must not match.
+        private.extend_from_slice(b"/dup 0 1 RD ");
+        private.extend_from_slice(decoy);
+        private.extend_from_slice(b" NP\n%dup 0 1 RD ");
+        private.extend_from_slice(decoy);
+        private.extend_from_slice(b" NP\n% dup 0 1 RD ");
+        private.extend_from_slice(decoy);
+        private.extend_from_slice(b" NP\nmydup 0 1 RD ");
+        private.extend_from_slice(decoy);
+        private.extend_from_slice(b" NP\n");
+        // Valid entries separated by tab, LF, CRLF, and delimiter + form-feed.
+        for (prefix, idx) in [
+            (&b"dup\t"[..], 0),
+            (&b"dup\n"[..], 1),
+            (&b"dup\r\n"[..], 2),
+            (&b"]dup\x0c"[..], 3),
+        ] {
+            private.extend_from_slice(prefix);
+            private.extend_from_slice(format!("{idx} 1 RD ").as_bytes());
+            private.extend_from_slice(ret);
+            private.extend_from_slice(b" NP\n");
+        }
+        private.extend_from_slice(b"ND\n/CharStrings 1 dict dup begin end");
+
+        let subrs = parse_subrs(&private, -1);
+        assert_eq!(subrs, vec![vec![11], vec![11], vec![11], vec![11]]);
+
+        // Custom /Encoding also recognizes `dup` separated by tab or newline.
+        let clear = b"/Encoding 256 array\ndup\t65 /A put\ndup\n66 /B put\nreadonly def";
+        let enc = parse_builtin_encoding(clear);
+        assert_eq!(enc[65].as_deref(), Some("A"));
+        assert_eq!(enc[66].as_deref(), Some("B"));
     }
 
     #[test]

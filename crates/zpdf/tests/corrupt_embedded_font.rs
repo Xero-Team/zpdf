@@ -7306,3 +7306,88 @@ fn type1_move_only_visible_charstring_recovers_via_substitute_and_reports_incomp
         "move-only /A without substitute must not report complete"
     );
 }
+
+#[test]
+fn type1_subrs_dup_with_tab_or_newline_draws_embedded_glyph_without_fallback() {
+    // `/A` calls a return-only `/Subrs[0]` and then draws a solid box outline:
+    // hsbw(0, 600), 0 callsubr, rmoveto(50, 0), rlineto(0, 700),
+    // rlineto(500, 0), rlineto(0, -700), closepath, endchar.
+    let caller_a: &[u8] = &[
+        139, 248, 236, 13, 139, 10, 189, 139, 21, 139, 249, 80, 5, 248, 136, 139, 5, 139, 253, 80,
+        5, 9, 14,
+    ];
+    let notdef: &[u8] = &[139, 248, 136, 13, 14];
+    let return_only_subr: &[u8] = &[11];
+
+    for (label, dup_sep) in [
+        ("subrs-dup-tab", "\t"),
+        ("subrs-dup-newline", "\n"),
+        ("subrs-dup-crlf", "\r\n"),
+    ] {
+        let mut private = b"dup /Private 5 dict dup begin /lenIV -1 def\n/Subrs 1 array\n".to_vec();
+        private
+            .extend_from_slice(format!("dup{dup_sep}0 {} RD ", return_only_subr.len()).as_bytes());
+        private.extend_from_slice(return_only_subr);
+        private.extend_from_slice(b" NP\nND\n/CharStrings 2 dict dup begin\n");
+        for (name, cs) in [(".notdef", notdef), ("A", caller_a)] {
+            private.extend_from_slice(format!("/{name} {} RD ", cs.len()).as_bytes());
+            private.extend_from_slice(cs);
+            private.extend_from_slice(b" ND\n");
+        }
+        private.extend_from_slice(b"end end readonly def\n");
+
+        let mut r: u16 = 55665;
+        let mut hex = String::with_capacity((private.len() + 4) * 2);
+        for &p in [0u8, 0, 0, 0].iter().chain(private.iter()) {
+            let c = p ^ (r >> 8) as u8;
+            r = (c as u16)
+                .wrapping_add(r)
+                .wrapping_mul(52845)
+                .wrapping_add(22719);
+            use std::fmt::Write;
+            let _ = write!(&mut hex, "{c:02X}");
+        }
+        let mut pfa = b"%!PS-AdobeFont-1.0: SubrWsType1 1.0\n\
+            8 dict begin\n\
+            /FontName /SubrWsType1 def /FontType 1 def /PaintType 0 def\n\
+            /FontMatrix [0.001 0 0 0.001 0 0] readonly def\n\
+            /FontBBox [0 0 1000 900] readonly def /Encoding StandardEncoding def\n\
+            currentdict end currentfile eexec\n"
+            .to_vec();
+        pfa.extend_from_slice(hex.as_bytes());
+        pfa.push(b'\n');
+
+        let pdf = assemble(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 180 100] \
+              /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
+                .to_vec(),
+            stream("", b"0 0 0 rg BT /F1 24 Tf 15 40 Td (A) Tj ET"),
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /ABCDEF+SubrWsType1 \
+              /Encoding /WinAnsiEncoding /FirstChar 65 /LastChar 65 /Widths [600] \
+              /FontDescriptor 6 0 R >>"
+                .to_vec(),
+            b"<< /Type /FontDescriptor /FontName /ABCDEF+SubrWsType1 /Flags 32 /FontFile 7 0 R >>"
+                .to_vec(),
+            stream("", &pfa),
+        ]);
+
+        // No substitute registered: the embedded Type 1 glyph must still draw
+        // cleanly with zero fallbacks and zero missing outlines.
+        let doc = PdfDocument::open(pdf)
+            .unwrap()
+            .with_font_provider(Arc::new(FontProvider::memory_only()));
+        let page = zpdf::interpret_page(&doc, 0, Default::default()).unwrap();
+        let (fid, font) = page.fonts.get_by_name("F1").unwrap();
+        assert!(!font.is_substitute, "{label}: should stay embedded");
+        assert!(
+            !page.fonts.has_admitted_embedded_companion(fid),
+            "{label}: should not admit a companion substitute"
+        );
+        assert_eq!(page.stats.diagnostics.embedded_font_fallbacks, 0, "{label}");
+        assert_eq!(page.stats.diagnostics.missing_glyph_outlines, 0, "{label}");
+        assert!(page.is_complete(), "{label}");
+        assert_rendered_cells_have_ink(&page, &[0.0], &[14.4], label);
+    }
+}
