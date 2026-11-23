@@ -2087,8 +2087,6 @@ const CFF_OP_ROS: u16 = 256 + 30;
 const CFF_OP_FD_ARRAY: u16 = 256 + 36;
 /// CFF Top DICT operator `12 37` (`/FDSelect`) — offset to glyph → FD mapping.
 const CFF_OP_FD_SELECT: u16 = 256 + 37;
-/// Default Top DICT `FontMatrix` per Adobe TN #5176 Table 9.
-const DEFAULT_CFF_TOP_MATRIX: [f64; 6] = [0.001, 0.0, 0.0, 0.001, 0.0, 0.0];
 
 /// Whether a CFF table is CID-keyed (its Top DICT carries a /ROS operator).
 fn cff_is_cid_keyed(cff: &[u8]) -> bool {
@@ -3136,14 +3134,16 @@ fn cff_effective_font_matrix(
         None
     };
 
-    if info.font_matrix.is_none() && fd_matrix.is_none() {
-        return None;
-    }
-
-    let top = info.font_matrix.unwrap_or(DEFAULT_CFF_TOP_MATRIX);
-    let effective = match fd_matrix {
-        Some(fd) => concat_cff_font_matrix(fd, top),
-        None => top,
+    // Per FreeType (`src/cff/cffobjs.c`) and `read-fonts`: only concatenate the
+    // FD matrix with the Top DICT matrix when the Top DICT explicitly specifies
+    // a `FontMatrix`; otherwise use the FD matrix directly so a CID font with
+    // omitted Top `FontMatrix` and an FD `[0.001 0 0 0.001 0 0]` is not
+    // double-scaled by 0.001.
+    let effective = match (info.font_matrix, fd_matrix) {
+        (Some(top), Some(fd)) => concat_cff_font_matrix(fd, top),
+        (Some(top), None) => top,
+        (None, Some(fd)) => fd,
+        (None, None) => return None,
     };
     effective.iter().all(|v| v.is_finite()).then_some(effective)
 }
@@ -3205,14 +3205,16 @@ fn cff2_effective_font_matrix(
         None
     };
 
-    if info.font_matrix.is_none() && fd_matrix.is_none() {
-        return None;
-    }
-
-    let top = info.font_matrix.unwrap_or(DEFAULT_CFF_TOP_MATRIX);
-    let effective = match fd_matrix {
-        Some(fd) => concat_cff_font_matrix(fd, top),
-        None => top,
+    // Per FreeType (`src/cff/cffobjs.c`) and `read-fonts`: only concatenate the
+    // FD matrix with the Top DICT matrix when the Top DICT explicitly specifies
+    // a `FontMatrix`; otherwise use the FD matrix directly so a CID font with
+    // omitted Top `FontMatrix` and an FD `[0.001 0 0 0.001 0 0]` is not
+    // double-scaled by 0.001.
+    let effective = match (info.font_matrix, fd_matrix) {
+        (Some(top), Some(fd)) => concat_cff_font_matrix(fd, top),
+        (Some(top), None) => top,
+        (None, Some(fd)) => fd,
+        (None, None) => return None,
     };
     effective.iter().all(|v| v.is_finite()).then_some(effective)
 }
@@ -4998,6 +5000,39 @@ mod tests {
             (b2.1 - 250.0).abs() < 1e-6 && (b2.3 - 450.0).abs() < 1e-6,
             "{b2:?}"
         );
+
+        // Omitted Top DICT FontMatrix + present FD FontMatrix: must use the FD
+        // matrix directly without double-scaling by default 0.001.
+        let cff_omitted_top = build_synthetic_cid_cff(
+            None,
+            Some(["0.001", "0", "0", "0.001", "0", "0"]),
+            Some(["0.0005", "0", "0", "0.0005", "0", "0"]),
+            true,
+        );
+        let font_omitted_top = LoadedFont::new_with_data(
+            PdfFontType::Type0CidType2,
+            "CidOmittedTop".into(),
+            cff_omitted_top,
+            CidWidths::new(1000.0),
+        );
+        let b1 = outline_bbox(&font_omitted_top.glyph_outline(1).expect("cid 1"));
+        assert!(
+            (b1.0 - 100.0).abs() < 1e-6 && (b1.2 - 300.0).abs() < 1e-6,
+            "{b1:?}"
+        );
+        assert!(
+            (b1.1 - 100.0).abs() < 1e-6 && (b1.3 - 500.0).abs() < 1e-6,
+            "{b1:?}"
+        );
+        let b2 = outline_bbox(&font_omitted_top.glyph_outline(2).expect("cid 2"));
+        assert!(
+            (b2.0 - 50.0).abs() < 1e-6 && (b2.2 - 150.0).abs() < 1e-6,
+            "{b2:?}"
+        );
+        assert!(
+            (b2.1 - 50.0).abs() < 1e-6 && (b2.3 - 250.0).abs() < 1e-6,
+            "{b2:?}"
+        );
     }
 
     #[test]
@@ -5075,49 +5110,56 @@ mod tests {
         encode_cff_matrix(&mut fd1, &["0.0005", "0", "0", "0.0005", "0", "0"]);
         let fd_array = encode_cff2_index(&[&fd0, &fd1]);
 
-        let build_top = |fd_arr_off: usize, fd_sel_off: usize| -> Vec<u8> {
-            let mut d = Vec::new();
-            encode_cff_matrix(&mut d, &["1", "0", "0", "1", "0", "0"]);
-            encode_cff_int(&mut d, fd_arr_off as i32);
-            d.extend_from_slice(&[12, 36]);
-            encode_cff_int(&mut d, fd_sel_off as i32);
-            d.extend_from_slice(&[12, 37]);
-            d
+        let wrap_cff2_sfnt = |include_top_matrix: bool| -> Vec<u8> {
+            let build_top = |fd_arr_off: usize, fd_sel_off: usize| -> Vec<u8> {
+                let mut d = Vec::new();
+                if include_top_matrix {
+                    encode_cff_matrix(&mut d, &["1", "0", "0", "1", "0", "0"]);
+                }
+                encode_cff_int(&mut d, fd_arr_off as i32);
+                d.extend_from_slice(&[12, 36]);
+                encode_cff_int(&mut d, fd_sel_off as i32);
+                d.extend_from_slice(&[12, 37]);
+                d
+            };
+            let top_len = build_top(0, 0).len();
+            let fd_sel_off = 5 + top_len;
+            let fd_arr_off = fd_sel_off + fd_select.len();
+            let top = build_top(fd_arr_off, fd_sel_off);
+            assert_eq!(top.len(), top_len);
+
+            let mut cff2 = vec![2u8, 0, 5];
+            cff2.extend_from_slice(&(top.len() as u16).to_be_bytes());
+            cff2.extend_from_slice(&top);
+            cff2.extend_from_slice(&fd_select);
+            cff2.extend_from_slice(&fd_array);
+
+            let mut sfnt = Vec::new();
+            sfnt.extend_from_slice(b"OTTO");
+            sfnt.extend_from_slice(&1u16.to_be_bytes());
+            sfnt.extend_from_slice(&16u16.to_be_bytes());
+            sfnt.extend_from_slice(&0u16.to_be_bytes());
+            sfnt.extend_from_slice(&0u16.to_be_bytes());
+            sfnt.extend_from_slice(b"CFF2");
+            sfnt.extend_from_slice(&0u32.to_be_bytes());
+            sfnt.extend_from_slice(&28u32.to_be_bytes());
+            sfnt.extend_from_slice(&(cff2.len() as u32).to_be_bytes());
+            sfnt.extend_from_slice(&cff2);
+            sfnt
         };
-        let top_len = build_top(0, 0).len();
-        let fd_sel_off = 5 + top_len;
-        let fd_arr_off = fd_sel_off + fd_select.len();
-        let top = build_top(fd_arr_off, fd_sel_off);
-        assert_eq!(top.len(), top_len);
 
-        let mut cff2 = vec![2u8, 0, 5];
-        cff2.extend_from_slice(&(top.len() as u16).to_be_bytes());
-        cff2.extend_from_slice(&top);
-        cff2.extend_from_slice(&fd_select);
-        cff2.extend_from_slice(&fd_array);
-
-        // Wrap the CFF2 table in a minimal 1-table OTTO sfnt container.
-        let mut sfnt = Vec::new();
-        sfnt.extend_from_slice(b"OTTO");
-        sfnt.extend_from_slice(&1u16.to_be_bytes()); // numTables
-        sfnt.extend_from_slice(&16u16.to_be_bytes());
-        sfnt.extend_from_slice(&0u16.to_be_bytes());
-        sfnt.extend_from_slice(&0u16.to_be_bytes());
-        sfnt.extend_from_slice(b"CFF2");
-        sfnt.extend_from_slice(&0u32.to_be_bytes()); // checksum
-        sfnt.extend_from_slice(&28u32.to_be_bytes()); // offset
-        sfnt.extend_from_slice(&(cff2.len() as u32).to_be_bytes());
-        sfnt.extend_from_slice(&cff2);
-
-        assert_eq!(
-            cff2_effective_font_matrix(&sfnt, 0, 1, 4),
-            Some([0.001, 0.0, 0.0, 0.001, 0.0, 0.0])
-        );
-        assert_eq!(
-            cff2_effective_font_matrix(&sfnt, 0, 2, 4),
-            Some([0.0005, 0.0, 0.0, 0.0005, 0.0, 0.0])
-        );
-        assert_eq!(cff2_effective_font_matrix(&sfnt, 0, 4, 4), None);
+        for include_top_matrix in [true, false] {
+            let sfnt = wrap_cff2_sfnt(include_top_matrix);
+            assert_eq!(
+                cff2_effective_font_matrix(&sfnt, 0, 1, 4),
+                Some([0.001, 0.0, 0.0, 0.001, 0.0, 0.0])
+            );
+            assert_eq!(
+                cff2_effective_font_matrix(&sfnt, 0, 2, 4),
+                Some([0.0005, 0.0, 0.0, 0.0005, 0.0, 0.0])
+            );
+            assert_eq!(cff2_effective_font_matrix(&sfnt, 0, 4, 4), None);
+        }
     }
 
     #[test]
