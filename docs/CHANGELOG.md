@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Fonts (`zpdf-font`)
+
+- Honour CFF top-level and CID-keyed per-FD `FontMatrix` entries (including
+  nibble-encoded real operands and `FDSelect` formats 0, 3, and 4) when
+  extracting CFF glyph outlines, transforming coordinates by the concatenated
+  `FD × Top` matrix normalized into `units_per_em` space so non-0.001,
+  anisotropic, and sheared CFF/CIDFontType0C fonts render at the correct scale
+  and slant. (#160)
+
 ## 0.22.0 — Embedded font recovery, rendering precision, and JBIG2 oracle
 
 Released 2026-11-23.

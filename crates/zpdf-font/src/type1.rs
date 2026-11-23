@@ -321,36 +321,11 @@ impl Type1Font {
     /// `p' = M(p) * units_per_em`. The advance is unchanged — its horizontal
     /// component under M is `a*w`, and `a * units_per_em == 1`.
     fn apply_font_matrix(&self, mut outline: GlyphOutline) -> GlyphOutline {
-        let [a, b, c, d, e, f] = self.font_matrix;
-        if b == 0.0 && c == 0.0 && e == 0.0 && f == 0.0 && a == d && a > 0.0 {
-            return outline;
-        }
-        let s = self.units_per_em;
-        let tx = |x: f64, y: f64| ((a * x + c * y + e) * s, (b * x + d * y + f) * s);
-        for cmd in &mut outline.commands {
-            *cmd = match *cmd {
-                OutlineCommand::MoveTo(x, y) => {
-                    let (x, y) = tx(x, y);
-                    OutlineCommand::MoveTo(x, y)
-                }
-                OutlineCommand::LineTo(x, y) => {
-                    let (x, y) = tx(x, y);
-                    OutlineCommand::LineTo(x, y)
-                }
-                OutlineCommand::QuadTo(x1, y1, x, y) => {
-                    let (x1, y1) = tx(x1, y1);
-                    let (x, y) = tx(x, y);
-                    OutlineCommand::QuadTo(x1, y1, x, y)
-                }
-                OutlineCommand::CurveTo(x1, y1, x2, y2, x, y) => {
-                    let (x1, y1) = tx(x1, y1);
-                    let (x2, y2) = tx(x2, y2);
-                    let (x, y) = tx(x, y);
-                    OutlineCommand::CurveTo(x1, y1, x2, y2, x, y)
-                }
-                OutlineCommand::Close => OutlineCommand::Close,
-            };
-        }
+        crate::apply_font_matrix_commands(
+            &mut outline.commands,
+            self.font_matrix,
+            self.units_per_em,
+        );
         outline
     }
 
