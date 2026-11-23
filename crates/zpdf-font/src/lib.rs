@@ -937,14 +937,24 @@ impl LoadedFont {
         let mut builder = OutlineBuilder::new();
         face.outline_glyph(gid, &mut builder)?;
 
-        if let Some(cff) = face.tables().cff {
-            if let Some(matrix) =
-                cff_effective_font_matrix(data, self.face_index, actual_gid, cff.number_of_glyphs())
-            {
-                apply_font_matrix_commands(&mut builder.commands, matrix, self.units_per_em);
-            }
+        let effective_cff_matrix = if let Some(cff) = face.tables().cff {
+            cff_effective_font_matrix(data, self.face_index, actual_gid, cff.number_of_glyphs())
+        } else if face.tables().cff2.is_some() {
+            cff2_effective_font_matrix(data, self.face_index, actual_gid, face.number_of_glyphs())
+        } else {
+            None
+        };
+        if let Some(matrix) = effective_cff_matrix {
+            apply_font_matrix_commands(&mut builder.commands, matrix, self.units_per_em);
         }
 
+        // `Face::glyph_hor_advance` reads exclusively from OpenType `hmtx`
+        // (already in post-FontMatrix `head.unitsPerEm` design units), and bare
+        // CFF streams wrapped via `wrap_cff_in_otf` omit `hmtx` and fall back
+        // to PDF `/Widths`/`/W` (`cid_widths`), which are already in post-
+        // FontMatrix 1/1000 em (= `units_per_em`) units. Outlines above are
+        // normalized into the exact same `units_per_em` coordinate system, so
+        // `advance` must not be scaled a second time.
         let advance = face
             .glyph_hor_advance(gid)
             .map(|a| a as f64)
@@ -1987,7 +1997,9 @@ fn build_cff_cid_to_gid_map(otf_data: &[u8]) -> Option<HashMap<u16, u16>> {
 /// `units_per_em` space: `p' = M(p) * units_per_em`.
 ///
 /// Leaves commands bit-exact when `M * units_per_em` is already the identity
-/// matrix (e.g., standard `[0.001, 0, 0, 0.001, 0, 0]` with `units_per_em == 1000`).
+/// matrix (e.g., standard `[0.001, 0, 0, 0.001, 0, 0]` with `units_per_em == 1000`),
+/// and leaves commands unmodified if any transformed coordinate would overflow
+/// to a non-finite `f64` or `f32` value.
 pub(crate) fn apply_font_matrix_commands(
     commands: &mut [OutlineCommand],
     font_matrix: [f64; 6],
@@ -2000,43 +2012,67 @@ pub(crate) fn apply_font_matrix_commands(
         return;
     }
     let [a, b, c, d, e, f] = font_matrix;
-    let sx = a * units_per_em;
-    let sy = d * units_per_em;
-    if b == 0.0
-        && c == 0.0
-        && e == 0.0
-        && f == 0.0
-        && (sx - 1.0).abs() <= 1e-6
-        && (sy - 1.0).abs() <= 1e-6
+    let [sa, sb, sc, sd, se, sf] = [
+        a * units_per_em,
+        b * units_per_em,
+        c * units_per_em,
+        d * units_per_em,
+        e * units_per_em,
+        f * units_per_em,
+    ];
+    if ![sa, sb, sc, sd, se, sf].iter().all(|v| v.is_finite()) {
+        return;
+    }
+    if sb == 0.0
+        && sc == 0.0
+        && se == 0.0
+        && sf == 0.0
+        && (sa - 1.0).abs() <= 1e-6
+        && (sd - 1.0).abs() <= 1e-6
     {
         return;
     }
-    let tx = |x: f64, y: f64| {
-        (
-            (a * x + c * y + e) * units_per_em,
-            (b * x + d * y + f) * units_per_em,
-        )
+    let tx = |x: f64, y: f64| -> Option<(f64, f64)> {
+        let nx = sa * x + sc * y + se;
+        let ny = sb * x + sd * y + sf;
+        (nx.is_finite() && ny.is_finite() && (nx as f32).is_finite() && (ny as f32).is_finite())
+            .then_some((nx, ny))
     };
+    // Validate every transformed coordinate before mutating so extreme finite
+    // matrices/coordinates never leave partial or non-finite outline commands.
+    for cmd in commands.iter() {
+        let ok = match *cmd {
+            OutlineCommand::MoveTo(x, y) | OutlineCommand::LineTo(x, y) => tx(x, y).is_some(),
+            OutlineCommand::QuadTo(x1, y1, x, y) => tx(x1, y1).is_some() && tx(x, y).is_some(),
+            OutlineCommand::CurveTo(x1, y1, x2, y2, x, y) => {
+                tx(x1, y1).is_some() && tx(x2, y2).is_some() && tx(x, y).is_some()
+            }
+            OutlineCommand::Close => true,
+        };
+        if !ok {
+            return;
+        }
+    }
     for cmd in commands {
         *cmd = match *cmd {
             OutlineCommand::MoveTo(x, y) => {
-                let (x, y) = tx(x, y);
-                OutlineCommand::MoveTo(x, y)
+                let (nx, ny) = tx(x, y).expect("validated finite");
+                OutlineCommand::MoveTo(nx, ny)
             }
             OutlineCommand::LineTo(x, y) => {
-                let (x, y) = tx(x, y);
-                OutlineCommand::LineTo(x, y)
+                let (nx, ny) = tx(x, y).expect("validated finite");
+                OutlineCommand::LineTo(nx, ny)
             }
             OutlineCommand::QuadTo(x1, y1, x, y) => {
-                let (x1, y1) = tx(x1, y1);
-                let (x, y) = tx(x, y);
-                OutlineCommand::QuadTo(x1, y1, x, y)
+                let (nx1, ny1) = tx(x1, y1).expect("validated finite");
+                let (nx, ny) = tx(x, y).expect("validated finite");
+                OutlineCommand::QuadTo(nx1, ny1, nx, ny)
             }
             OutlineCommand::CurveTo(x1, y1, x2, y2, x, y) => {
-                let (x1, y1) = tx(x1, y1);
-                let (x2, y2) = tx(x2, y2);
-                let (x, y) = tx(x, y);
-                OutlineCommand::CurveTo(x1, y1, x2, y2, x, y)
+                let (nx1, ny1) = tx(x1, y1).expect("validated finite");
+                let (nx2, ny2) = tx(x2, y2).expect("validated finite");
+                let (nx, ny) = tx(x, y).expect("validated finite");
+                OutlineCommand::CurveTo(nx1, ny1, nx2, ny2, nx, ny)
             }
             OutlineCommand::Close => OutlineCommand::Close,
         };
@@ -2399,11 +2435,16 @@ fn standard_encoding() -> [u16; 256] {
 }
 
 fn find_cff_table(data: &[u8]) -> Option<&[u8]> {
-    find_cff_table_for_face(data, 0)
+    find_sfnt_table_for_face(data, 0, b"CFF ")
 }
 
-/// Locate the `CFF ` table inside an sfnt (`OTTO`) or OpenType Collection (`ttcf`).
-fn find_cff_table_for_face(data: &[u8], face_index: u32) -> Option<&[u8]> {
+/// Locate an sfnt table (e.g. `b"CFF "` or `b"CFF2"`) inside an sfnt (`OTTO`)
+/// or OpenType Collection (`ttcf`).
+fn find_sfnt_table_for_face<'a>(
+    data: &'a [u8],
+    face_index: u32,
+    tag: &[u8; 4],
+) -> Option<&'a [u8]> {
     let dir_offset = if data.starts_with(b"ttcf") {
         let num_fonts = u32::from_be_bytes(*data.get(8..12)?.first_chunk::<4>()?);
         if face_index >= num_fonts {
@@ -2422,7 +2463,7 @@ fn find_cff_table_for_face(data: &[u8], face_index: u32) -> Option<&[u8]> {
     for i in 0..num_tables {
         let rec = records_start.checked_add(i.checked_mul(16)?)?;
         let entry = data.get(rec..rec.checked_add(16)?)?;
-        if &entry[0..4] == b"CFF " {
+        if &entry[0..4] == tag {
             let offset = u32::from_be_bytes([entry[8], entry[9], entry[10], entry[11]]) as usize;
             let length = u32::from_be_bytes([entry[12], entry[13], entry[14], entry[15]]) as usize;
             if let Some(table) = offset
@@ -2890,7 +2931,10 @@ fn walk_cff_dict(dict_data: &[u8], mut on_op: impl FnMut(u16, &[CffDictOperand])
                 operands.push(CffDictOperand::Int(val));
                 pos += 2;
             }
-            // Reserved bytes (22..=27, 31, 255): stop to avoid losing alignment.
+            // Reserved DICT bytes (22..=27, 31, 255) per Adobe TN #5176
+            // Appendix H and OpenType CFF2 Table 3 (byte 255 is 16.16 fixed-
+            // point only in Type 2/CFF2 charstrings, never in CFF DICTs): stop
+            // to avoid losing alignment.
             _ => break,
         }
         if operands.len() > 48 {
@@ -3069,7 +3113,7 @@ fn concat_cff_font_matrix(fd: [f64; 6], top: [f64; 6]) -> [f64; 6] {
     ]
 }
 
-/// Compute the effective CFF `FontMatrix` (top-level × per-FD) for `gid`, or
+/// Compute the effective CFF 1.0 `FontMatrix` (top-level × per-FD) for `gid`, or
 /// `None` when neither the Top DICT nor the glyph's FD DICT specifies an
 /// explicit `FontMatrix`.
 fn cff_effective_font_matrix(
@@ -3078,7 +3122,7 @@ fn cff_effective_font_matrix(
     gid: u16,
     num_glyphs: u16,
 ) -> Option<[f64; 6]> {
-    let cff = find_cff_table_for_face(font_data, face_index)?;
+    let cff = find_sfnt_table_for_face(font_data, face_index, b"CFF ")?;
     let top_dict = cff_top_dict(cff)?;
     let info = parse_cff_top_dict_matrix_info(top_dict);
 
@@ -3088,6 +3132,75 @@ fn cff_effective_font_matrix(
         let fd_index = parse_cff_fd_select(cff, fd_select_offset, gid, num_glyphs)?;
         let fd_dict = cff_index_entry(cff, fd_array_offset, fd_index)?;
         parse_cff_dict_font_matrix(fd_dict)
+    } else {
+        None
+    };
+
+    if info.font_matrix.is_none() && fd_matrix.is_none() {
+        return None;
+    }
+
+    let top = info.font_matrix.unwrap_or(DEFAULT_CFF_TOP_MATRIX);
+    let effective = match fd_matrix {
+        Some(fd) => concat_cff_font_matrix(fd, top),
+        None => top,
+    };
+    effective.iter().all(|v| v.is_finite()).then_some(effective)
+}
+
+/// Entry `entry` from a CFF2 INDEX (4-byte `count: u32` per OpenType CFF2 §5).
+fn cff2_index_entry(cff2: &[u8], pos: usize, entry: usize) -> Option<&[u8]> {
+    let count_bytes = cff2.get(pos..pos.checked_add(4)?)?;
+    let count = u32::from_be_bytes([
+        count_bytes[0],
+        count_bytes[1],
+        count_bytes[2],
+        count_bytes[3],
+    ]) as usize;
+    if entry >= count {
+        return None;
+    }
+    let off_size = *cff2.get(pos.checked_add(4)?)? as usize;
+    if !(1..=4).contains(&off_size) {
+        return None;
+    }
+    let offsets_start = pos.checked_add(5)?;
+    let start_pos = offsets_start.checked_add(entry.checked_mul(off_size)?)?;
+    let end_pos = start_pos.checked_add(off_size)?;
+    let start = read_cff_offset(cff2, start_pos, off_size)?.checked_sub(1)?;
+    let end = read_cff_offset(cff2, end_pos, off_size)?.checked_sub(1)?;
+    if end < start {
+        return None;
+    }
+    let data_start = offsets_start.checked_add(count.checked_add(1)?.checked_mul(off_size)?)?;
+    let range_start = data_start.checked_add(start)?;
+    let range_end = data_start.checked_add(end)?;
+    cff2.get(range_start..range_end)
+}
+
+/// Compute the effective CFF2 `FontMatrix` (Top DICT × optional per-FD via
+/// `FDArray` and `FDSelect` formats 0, 3, or 4) for `gid`.
+fn cff2_effective_font_matrix(
+    font_data: &[u8],
+    face_index: u32,
+    gid: u16,
+    num_glyphs: u16,
+) -> Option<[f64; 6]> {
+    let cff2 = find_sfnt_table_for_face(font_data, face_index, b"CFF2")?;
+    if cff2.len() < 5 || cff2[0] != 2 {
+        return None;
+    }
+    let header_size = cff2[2] as usize;
+    let top_dict_len = u16::from_be_bytes([cff2[3], cff2[4]]) as usize;
+    let top_dict = cff2.get(header_size..header_size.checked_add(top_dict_len)?)?;
+    let info = parse_cff_top_dict_matrix_info(top_dict);
+
+    let fd_matrix = if let Some(fd_array_offset) = info.fd_array_offset {
+        let fd_index = match info.fd_select_offset {
+            Some(fd_select_offset) => parse_cff_fd_select(cff2, fd_select_offset, gid, num_glyphs)?,
+            None => 0,
+        };
+        cff2_index_entry(cff2, fd_array_offset, fd_index).and_then(parse_cff_dict_font_matrix)
     } else {
         None
     };
@@ -4902,6 +5015,109 @@ mod tests {
         let mut pos = 0;
         assert_eq!(parse_cff_real(&[0x1b, 0x99, 0x9f], &mut pos), None);
         assert_eq!(pos, 3);
+    }
+
+    #[test]
+    fn overflowing_font_matrix_leaves_outline_finite_and_unmodified() {
+        // Finite CFF matrices that overflow f64 or f32 when multiplied by
+        // units_per_em / coordinates must not inject non-finite outline points.
+        for extreme in [
+            ["1E307", "0", "0", "1E307", "0", "0"],
+            ["1E36", "0", "0", "1E36", "0", "0"],
+        ] {
+            let cff = build_synthetic_simple_cff(Some(extreme));
+            let font = LoadedFont::new_with_data(
+                PdfFontType::Type1,
+                "ExtremeMatrix".into(),
+                cff,
+                CidWidths::new(1000.0),
+            );
+            let outline = font.glyph_outline(1).expect("gid 1 outline remains usable");
+            let (x0, y0, x1, y1) = outline_bbox(&outline);
+            assert!((x0 - 100.0).abs() < 1e-6 && (x1 - 300.0).abs() < 1e-6);
+            assert!((y0 - 100.0).abs() < 1e-6 && (y1 - 500.0).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn cff2_effective_font_matrix_handles_top_dict_and_fdselect_format4() {
+        fn encode_cff2_index(items: &[&[u8]]) -> Vec<u8> {
+            let mut out = Vec::new();
+            out.extend_from_slice(&(items.len() as u32).to_be_bytes());
+            if items.is_empty() {
+                return out;
+            }
+            out.push(2);
+            let mut offset = 1u16;
+            out.extend_from_slice(&offset.to_be_bytes());
+            for item in items {
+                offset = offset.checked_add(item.len() as u16).unwrap();
+                out.extend_from_slice(&offset.to_be_bytes());
+            }
+            for item in items {
+                out.extend_from_slice(item);
+            }
+            out
+        }
+
+        // Format 4 FDSelect: nRanges=2 (u32), [0..2)->FD 0, [2..4)->FD 1, sentinel=4 (u32).
+        let mut fd_select = vec![4u8];
+        fd_select.extend_from_slice(&2u32.to_be_bytes());
+        fd_select.extend_from_slice(&0u32.to_be_bytes());
+        fd_select.extend_from_slice(&0u16.to_be_bytes());
+        fd_select.extend_from_slice(&2u32.to_be_bytes());
+        fd_select.extend_from_slice(&1u16.to_be_bytes());
+        fd_select.extend_from_slice(&4u32.to_be_bytes());
+
+        let mut fd0 = Vec::new();
+        encode_cff_matrix(&mut fd0, &["0.001", "0", "0", "0.001", "0", "0"]);
+        let mut fd1 = Vec::new();
+        encode_cff_matrix(&mut fd1, &["0.0005", "0", "0", "0.0005", "0", "0"]);
+        let fd_array = encode_cff2_index(&[&fd0, &fd1]);
+
+        let build_top = |fd_arr_off: usize, fd_sel_off: usize| -> Vec<u8> {
+            let mut d = Vec::new();
+            encode_cff_matrix(&mut d, &["1", "0", "0", "1", "0", "0"]);
+            encode_cff_int(&mut d, fd_arr_off as i32);
+            d.extend_from_slice(&[12, 36]);
+            encode_cff_int(&mut d, fd_sel_off as i32);
+            d.extend_from_slice(&[12, 37]);
+            d
+        };
+        let top_len = build_top(0, 0).len();
+        let fd_sel_off = 5 + top_len;
+        let fd_arr_off = fd_sel_off + fd_select.len();
+        let top = build_top(fd_arr_off, fd_sel_off);
+        assert_eq!(top.len(), top_len);
+
+        let mut cff2 = vec![2u8, 0, 5];
+        cff2.extend_from_slice(&(top.len() as u16).to_be_bytes());
+        cff2.extend_from_slice(&top);
+        cff2.extend_from_slice(&fd_select);
+        cff2.extend_from_slice(&fd_array);
+
+        // Wrap the CFF2 table in a minimal 1-table OTTO sfnt container.
+        let mut sfnt = Vec::new();
+        sfnt.extend_from_slice(b"OTTO");
+        sfnt.extend_from_slice(&1u16.to_be_bytes()); // numTables
+        sfnt.extend_from_slice(&16u16.to_be_bytes());
+        sfnt.extend_from_slice(&0u16.to_be_bytes());
+        sfnt.extend_from_slice(&0u16.to_be_bytes());
+        sfnt.extend_from_slice(b"CFF2");
+        sfnt.extend_from_slice(&0u32.to_be_bytes()); // checksum
+        sfnt.extend_from_slice(&28u32.to_be_bytes()); // offset
+        sfnt.extend_from_slice(&(cff2.len() as u32).to_be_bytes());
+        sfnt.extend_from_slice(&cff2);
+
+        assert_eq!(
+            cff2_effective_font_matrix(&sfnt, 0, 1, 4),
+            Some([0.001, 0.0, 0.0, 0.001, 0.0, 0.0])
+        );
+        assert_eq!(
+            cff2_effective_font_matrix(&sfnt, 0, 2, 4),
+            Some([0.0005, 0.0, 0.0, 0.0005, 0.0, 0.0])
+        );
+        assert_eq!(cff2_effective_font_matrix(&sfnt, 0, 4, 4), None);
     }
 
     #[test]
