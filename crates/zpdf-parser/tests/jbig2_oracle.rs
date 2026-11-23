@@ -2874,7 +2874,188 @@ fn zpdf_preserves_parse_limits_budgets_and_per_region_isolation() {
         valid_bm.data
     );
 
-    // (f) Documented tracked gap (#153): unknown segment data length 0xFFFFFFFF
+    // (f) Invalid RSIZE values in a Huffman text region with SBREFINE = 1:
+    // both positive RSIZE extending past the segment payload (small overrun
+    // and 32-bit/WASM-overflowing 0x2000_0000) and a negative RSIZE decoded
+    // from a custom type-53 Huffman table must reject the text region cleanly
+    // while isolating the failure so a subsequent valid generic region renders.
+    let solid_sym = Bitmap::from_art(&["###", "###", "###"]);
+    let alt_sym = Bitmap::from_art(&["#.#", ".#.", "#.#"]);
+    let rsize_sd = symbol_dict_payload(&[&solid_sym, &alt_sym], 0);
+    let mut rsize_cx = vec![0u8; 1 << 13];
+    let mut rsize_enc = MqEncoder::new();
+    encode_refinement(
+        &mut rsize_enc,
+        &mut rsize_cx,
+        &solid_sym,
+        &alt_sym,
+        1,
+        false,
+        &[(-1, -1), (-1, -1)],
+        0,
+        0,
+    );
+    let valid_r_bytes = rsize_enc.finish();
+    assert!(
+        valid_r_bytes.len() <= 23,
+        "valid 3x3 refinement payload must fit in custom table [-8, 24)"
+    );
+
+    // Custom type-53 table for SBHUFFRSIZE: LOW = -8, HIGH = 24, four complete
+    // 2-bit-prefix lines with range_len = 3 covering [-8,-1], [0,7], [8,15],
+    // [16,23] (supports both negative RSIZE and the valid control length).
+    let mut custom_rsize_tab = Vec::new();
+    custom_rsize_tab.push((3u8 << 1) | (2u8 << 4)); // oob=0, prefix_size=4, range_size=3
+    custom_rsize_tab.extend_from_slice(&(-8i32).to_be_bytes());
+    custom_rsize_tab.extend_from_slice(&24i32.to_be_bytes());
+    let mut cbw = BitWriter::new();
+    for _ in 0..4 {
+        cbw.write_bits(2, 4);
+        cbw.write_bits(3, 3);
+    }
+    cbw.write_bits(0, 4); // lower unused
+    cbw.write_bits(0, 4); // upper unused
+    custom_rsize_tab.extend_from_slice(&cbw.finish());
+    let custom_rsize_lines = vec![
+        HuffLine::normal(2, 3, -8),
+        HuffLine::normal(2, 3, 0),
+        HuffLine::normal(2, 3, 8),
+        HuffLine::normal(2, 3, 16),
+    ];
+
+    let fs_lines = std_huff_lines(6);
+    let ds_lines = std_huff_lines(8);
+    let dt_lines = std_huff_lines(11);
+    let rd_lines = std_huff_lines(14);
+    let b1_lines = std_huff_lines(1);
+
+    // Builds an 8x5 Huffman text region (SBHUFF=1, SBREFINE=1, TOPLEFT,
+    // SBRTEMPLATE=1) with 2 instances: instance 0 places `solid_sym` unrefined
+    // at (0, 0) (which would paint (0, 0) black, unlike `valid_bm`), and
+    // instance 1 refines `alt_sym` with the supplied RSIZE table/value/tail.
+    let build_huff_rsize_tr = |use_custom_rsize: bool, rsize_val: i64, refine_tail: &[u8]| {
+        let mut tr = region_info(8, 5, 0, 0, 0);
+        let tr_flags: u16 = 0x0001 | 0x0002 | (1 << 4) | (1 << 15);
+        tr.extend_from_slice(&tr_flags.to_be_bytes());
+        let huff_flags: u16 = if use_custom_rsize { 1 << 14 } else { 0 };
+        tr.extend_from_slice(&huff_flags.to_be_bytes());
+        tr.extend_from_slice(&2u32.to_be_bytes()); // SBNUMINSTANCES = 2
+
+        let mut tbw = BitWriter::new();
+        for rc in 0..35 {
+            tbw.write_bits(if rc == 1 { 1 } else { 0 }, 4);
+        }
+        tbw.write_bit(0); // sym 0: code len 1 (code 0)
+        tbw.write_bit(0); // sym 1: code len 1 (code 1)
+        tbw.byte_align();
+
+        huff_encode(&mut tbw, &dt_lines, Some(1)); // initial STRIPT = -1
+        huff_encode(&mut tbw, &dt_lines, Some(1)); // strip y = -1 + 1 = 0
+        huff_encode(&mut tbw, &fs_lines, Some(0)); // x = 0
+        tbw.write_bit(0); // sym 0 (solid_sym)
+        tbw.write_bit(0); // RI = 0 (unrefined)
+        huff_encode(&mut tbw, &ds_lines, Some(1)); // DS = 1
+        tbw.write_bit(1); // sym 1 (alt_sym)
+        tbw.write_bit(1); // RI = 1 (refined)
+        huff_encode(&mut tbw, &rd_lines, Some(0)); // RDW
+        huff_encode(&mut tbw, &rd_lines, Some(0)); // RDH
+        huff_encode(&mut tbw, &rd_lines, Some(0)); // RDX
+        huff_encode(&mut tbw, &rd_lines, Some(0)); // RDY
+        let rsize_table = if use_custom_rsize {
+            &custom_rsize_lines
+        } else {
+            &b1_lines
+        };
+        huff_encode(&mut tbw, rsize_table, Some(rsize_val));
+        tbw.write_bytes(refine_tail);
+        huff_encode(&mut tbw, &ds_lines, None); // OOB ends strip
+        tr.extend_from_slice(&tbw.finish());
+        tr
+    };
+
+    let build_rsize_page = |use_custom_rsize: bool, tr: &[u8], with_valid_generic: bool| {
+        let mut page = segment(
+            0,
+            48,
+            &[],
+            1,
+            &page_info_payload(8, 5, PAGE_MIGHT_CONTAIN_REFINEMENTS),
+        );
+        page.extend_from_slice(&segment(1, 0, &[], 1, &rsize_sd));
+        let mut refs = vec![1u32];
+        if use_custom_rsize {
+            page.extend_from_slice(&segment(2, 53, &[], 1, &custom_rsize_tab));
+            refs.push(2);
+        }
+        page.extend_from_slice(&segment(3, 6, &refs, 1, tr));
+        if with_valid_generic {
+            page.extend_from_slice(&segment(
+                4,
+                38,
+                &[],
+                1,
+                &generic_region_payload(&valid_bm, 0, 0, 0, 0, false),
+            ));
+        }
+        page
+    };
+
+    // Control: both standard B.1 and custom RSIZE tables succeed with the
+    // exact refinement payload length and paint (0, 0) black, proving the
+    // malformed cases below reach the RSIZE validation path itself.
+    for use_custom in [false, true] {
+        let valid_tr = build_huff_rsize_tr(use_custom, valid_r_bytes.len() as i64, &valid_r_bytes);
+        let control = build_rsize_page(use_custom, &valid_tr, false);
+        let img = assert_oracle_match(
+            &format!("huffman text RSIZE control custom={use_custom}"),
+            &control,
+            None,
+        );
+        assert_eq!(img.pixels[0], 1, "control text region must paint (0, 0)");
+    }
+
+    // Malformed RSIZE cases (identical to the passing controls above except for
+    // the decoded RSIZE value): positive overrun past segment end, 32-bit/WASM
+    // bit-offset overflow candidate, and negative RSIZE from the custom table.
+    let overrun_rsize = valid_r_bytes.len() as i64 + 16;
+    let bad_rsize_cases: &[(&str, bool, i64)] = &[
+        ("rsize past segment end", false, overrun_rsize),
+        ("rsize 32-bit bit-offset overflow", false, 0x2000_0000),
+        ("negative custom-table rsize", true, -2),
+    ];
+    let blank_8x5 = vec![0u8; 8 * 5];
+    for &(label, use_custom, bad_rsize) in bad_rsize_cases {
+        let bad_tr = build_huff_rsize_tr(use_custom, bad_rsize, &valid_r_bytes);
+
+        let tr_only = build_rsize_page(use_custom, &bad_tr, false);
+        assert!(
+            std::panic::catch_unwind(|| {
+                decode_hayro(&tr_only, None, DecodeSettings { strict: false })
+            })
+            .is_ok(),
+            "{label}: hayro-jbig2 must not panic"
+        );
+        let z_only = decode_zpdf(&tr_only, None, &ParseLimits::default())
+            .unwrap_or_else(|e| panic!("{label}: zpdf must isolate bad text region, got {e}"));
+        assert_eq!(
+            unpack_pdf_to_native(&z_only, 8, 5, label).unwrap(),
+            blank_8x5,
+            "{label}: bad Huffman text region must be rejected blank"
+        );
+
+        let with_generic = build_rsize_page(use_custom, &bad_tr, true);
+        let z_isolated =
+            decode_zpdf(&with_generic, None, &ParseLimits::default()).unwrap_or_else(|e| {
+                panic!("{label}: zpdf must preserve subsequent valid generic region, got {e}")
+            });
+        assert_eq!(
+            unpack_pdf_to_native(&z_isolated, 8, 5, label).unwrap(),
+            valid_bm.data,
+            "{label}: subsequent valid generic region must render untouched"
+        );
+    }
+
+    // (g) Documented tracked gap (#153): unknown segment data length 0xFFFFFFFF
     // on an immediate generic region fails cleanly in zpdf (no panic).
     let mut unknown_len = segment(0, 48, &[], 1, &page_info_payload(8, 2, 0));
     let mut bad_seg = segment(1, 38, &[], 1, &[]);
@@ -2886,7 +3067,7 @@ fn zpdf_preserves_parse_limits_budgets_and_per_region_isolation() {
         "unknown segment data length (0xFFFFFFFF) is tracked in #153 and must return Err"
     );
 
-    // (g) Malformed/adversarial inputs never panic in either decoder.
+    // (h) Malformed/adversarial inputs never panic in either decoder.
     let malformed_cases: &[&[u8]] = &[
         &[],
         &[0x00, 0x01, 0x02],
