@@ -990,6 +990,7 @@ impl DocumentBuilder {
         options: PathPaintOptions,
         tag: TagSpec,
     ) -> Result<()> {
+        validate_tag_role(&tag)?;
         self.add_path_with_options(page, segments, style, options)?;
         if let Some(page_state) = self.pages.get_mut(page.0 as usize) {
             if let Some(PageItem::Path { tag: slot, .. }) = page_state.items.last_mut() {
@@ -2059,9 +2060,7 @@ impl DocumentBuilder {
                         let mcid = next_mcid;
                         next_mcid += 1;
                         tagged.push((mcid, spec.clone()));
-                        ops.extend_from_slice(
-                            format!("/{} <</MCID {}>> BDC\n", spec.role.as_str(), mcid).as_bytes(),
-                        );
+                        write_bdc(&mut ops, spec.role.as_str(), mcid)?;
                     }
 
                     // Emit text ops
@@ -2123,9 +2122,7 @@ impl DocumentBuilder {
                         let mcid = next_mcid;
                         next_mcid += 1;
                         tagged.push((mcid, spec.clone()));
-                        ops.extend_from_slice(
-                            format!("/{} <</MCID {}>> BDC\n", spec.role.as_str(), mcid).as_bytes(),
-                        );
+                        write_bdc(&mut ops, spec.role.as_str(), mcid)?;
                     }
                     ops.extend_from_slice(
                         format!("{} 0 0 {} {} {} cm\n", width, height, x, y).as_bytes(),
@@ -2164,9 +2161,7 @@ impl DocumentBuilder {
                         let mcid = next_mcid;
                         next_mcid += 1;
                         tagged.push((mcid, spec.clone()));
-                        ops.extend_from_slice(
-                            format!("/{} <</MCID {}>> BDC\n", spec.role.as_str(), mcid).as_bytes(),
-                        );
+                        write_bdc(&mut ops, spec.role.as_str(), mcid)?;
                     }
                     if let Some((r, g, b)) = style.stroke {
                         ops.extend_from_slice(format!("{} {} {} RG\n", r, g, b).as_bytes());
@@ -2238,6 +2233,34 @@ struct BuiltPageContent {
     image_refs: Vec<u32>,
     ext_gstates: Vec<ExtGStateKey>,
     tagged: Vec<(i32, TagSpec)>,
+}
+
+/// Validate a marked-content structure role name (ISO 32000-1 §7.3.5 forbids
+/// NUL bytes in PDF name objects, and an empty tag name is invalid).
+fn validate_tag_role(tag: &TagSpec) -> Result<()> {
+    let role = tag.role.as_str();
+    if role.is_empty() || role.as_bytes().contains(&0) {
+        return Err(zpdf_core::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "structure tag role must be non-empty and contain no NUL bytes",
+        )));
+    }
+    Ok(())
+}
+
+/// Emit `/Role <</MCID N>> BDC\n` with `role` encoded as a valid PDF Name token
+/// (`#XX`-escaped per ISO 32000-1 §7.3.5) so untrusted `StructRole::Other`
+/// values cannot inject content-stream operators.
+fn write_bdc(ops: &mut Vec<u8>, role: &str, mcid: i32) -> Result<()> {
+    if role.is_empty() || role.as_bytes().contains(&0) {
+        return Err(zpdf_core::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "structure tag role must be non-empty and contain no NUL bytes",
+        )));
+    }
+    crate::serialize::serialize_name(ops, role).map_err(zpdf_core::Error::Io)?;
+    ops.extend_from_slice(format!(" <</MCID {mcid}>> BDC\n").as_bytes());
+    Ok(())
 }
 
 impl Default for DocumentBuilder {

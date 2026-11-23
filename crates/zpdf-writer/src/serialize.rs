@@ -119,7 +119,7 @@ fn serialize_direct_object<W: Write>(buf: &mut W, obj: &PdfObject) -> io::Result
 }
 
 /// Serialize a name token (`/Name`), escaping special characters as `#XX`.
-fn serialize_name<W: Write>(buf: &mut W, name: &str) -> io::Result<()> {
+pub(crate) fn serialize_name<W: Write>(buf: &mut W, name: &str) -> io::Result<()> {
     buf.write_all(b"/")?;
     for &b in name.as_bytes() {
         if b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.' {

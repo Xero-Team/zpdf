@@ -493,3 +493,75 @@ fn tagged_path_with_options_preserves_ext_gstate_and_structure() {
     assert_eq!(tree.children.len(), 1);
     assert_eq!(tree.children[0].alt.as_deref(), Some("Highlight"));
 }
+
+#[test]
+fn tagged_path_escapes_custom_role_name_and_rejects_empty_or_nul() {
+    let mut builder = DocumentBuilder::new();
+    let p = builder.add_page(200.0, 200.0);
+
+    // Empty and NUL-containing custom roles are rejected without mutating state.
+    for bad_role in ["", "Role\0Injected"] {
+        let err = builder.add_tagged_path_with_options(
+            p,
+            vec![PathSegment::Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 10.0,
+                height: 10.0,
+            }],
+            PathStyle::default(),
+            PathPaintOptions::new().with_fill_opacity(0.5),
+            TagSpec {
+                role: StructRole::Other(bad_role.into()),
+                alt: None,
+                actual_text: None,
+            },
+        );
+        assert!(err.is_err(), "role {bad_role:?} should be rejected");
+    }
+
+    // Custom role containing PDF delimiters, spaces, and operators must be
+    // encoded as a single `#XX`-escaped PDF name token.
+    let hostile = "Fig <</MCID 99>> BDC\n1 0 0 rg /Evil";
+    builder
+        .add_tagged_path_with_options(
+            p,
+            vec![PathSegment::Rect {
+                x: 10.0,
+                y: 10.0,
+                width: 40.0,
+                height: 20.0,
+            }],
+            PathStyle {
+                fill: Some((0.0, 0.0, 1.0)),
+                stroke: None,
+                line_width: 1.0,
+            },
+            PathPaintOptions::new().with_fill_opacity(0.5),
+            TagSpec {
+                role: StructRole::Other(hostile.into()),
+                alt: None,
+                actual_text: None,
+            },
+        )
+        .unwrap();
+
+    let bytes = builder.build().unwrap();
+    let doc = PdfDocument::open(bytes).unwrap();
+    let page = doc.page(0).unwrap();
+    let content = doc.file().resolve_stream_data(page.contents[0]).unwrap();
+    let text = String::from_utf8_lossy(&content);
+    assert!(
+        !text.contains("1 0 0 rg"),
+        "raw operator from custom role must not appear in content stream: {text}"
+    );
+    assert!(
+        text.contains(
+            "/Fig#20#3C#3C#2FMCID#2099#3E#3E#20BDC#0A1#200#200#20rg#20#2FEvil <</MCID 0>> BDC\n"
+        ),
+        "expected escaped PDF name token in BDC: {text}"
+    );
+    let tree = doc.struct_tree().expect("struct tree present");
+    assert_eq!(tree.children.len(), 1);
+    assert_eq!(tree.children[0].role.as_str(), hostile);
+}
