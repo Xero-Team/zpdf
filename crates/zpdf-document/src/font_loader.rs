@@ -1198,8 +1198,23 @@ fn load_simple_font(
     }
 }
 
-fn type3_differences(diffs: &[PdfObject]) -> Vec<String> {
-    let mut encoding = Vec::new();
+fn type3_base_encoding(name: &str) -> Vec<String> {
+    let Some(table) = zpdf_font::encoding::base_encoding_by_name(name) else {
+        return Vec::new();
+    };
+    let mut encoding = vec![String::new(); 256];
+    let mut last_non_empty = 0usize;
+    for (code, slot) in encoding.iter_mut().enumerate() {
+        if let Some(glyph_name) = table[code] {
+            *slot = glyph_name.to_string();
+            last_non_empty = code + 1;
+        }
+    }
+    encoding.truncate(last_non_empty);
+    encoding
+}
+
+fn apply_type3_differences(encoding: &mut Vec<String>, diffs: &[PdfObject]) {
     let mut current = Some(0usize);
     for obj in diffs {
         match obj {
@@ -1218,6 +1233,12 @@ fn type3_differences(diffs: &[PdfObject]) -> Vec<String> {
             _ => {}
         }
     }
+}
+
+#[cfg(test)]
+fn type3_differences(diffs: &[PdfObject]) -> Vec<String> {
+    let mut encoding = Vec::new();
+    apply_type3_differences(&mut encoding, diffs);
     encoding
 }
 
@@ -1244,11 +1265,26 @@ fn load_type3_font(
         m
     };
 
-    // Encoding/Differences → glyph name list
+    // Encoding: name or dict (/BaseEncoding + /Differences) → glyph name list.
     let mut encoding = Vec::new();
-    if let Some(enc_dict) = resolve_dict(file, dict, "Encoding") {
-        if let Some(diffs) = resolve_array(file, &enc_dict, "Differences") {
-            encoding = type3_differences(&diffs);
+    if let Some(enc_obj) = dict.get("Encoding") {
+        let resolved = match enc_obj {
+            PdfObject::Ref(r) => file.resolve(*r).ok(),
+            other => Some(other.clone()),
+        };
+        match resolved {
+            Some(PdfObject::Name(name)) => {
+                encoding = type3_base_encoding(name.as_str());
+            }
+            Some(PdfObject::Dict(enc_dict)) => {
+                if let Ok(base_name) = enc_dict.get_name("BaseEncoding") {
+                    encoding = type3_base_encoding(base_name);
+                }
+                if let Some(diffs) = resolve_array(file, &enc_dict, "Differences") {
+                    apply_type3_differences(&mut encoding, &diffs);
+                }
+            }
+            _ => {}
         }
     }
 

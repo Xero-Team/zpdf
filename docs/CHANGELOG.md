@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Rendering and Type 3 fonts (`zpdf-content`, `zpdf-font`, `zpdf-document`)
+
+- Interpret Type 3 CharProc content streams directly in `ContentInterpreter`
+  with full resource resolution ordered glyph → font → parent (Form/Image
+  XObjects, ExtGState, shadings, patterns, colour spaces, and nested fonts),
+  honour `d0` (coloured glyph) vs `d1` (uncoloured glyph locking colours to the
+  enclosing text paint per ISO 32000-1 §9.6.5.4), emit the complete command set
+  (including clips, blend groups, shadings, and nested text) across all
+  backends, deduplicate repeated Type 3 inline bitmap images, and support
+  `/BaseEncoding` / named `/Encoding` on Type 3 fonts. (#156)
+
 ## 0.22.0 — Embedded font recovery, rendering precision, and JBIG2 oracle
 
 Released 2026-11-23.

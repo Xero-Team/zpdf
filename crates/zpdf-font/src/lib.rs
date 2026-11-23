@@ -1903,6 +1903,28 @@ impl LoadedFont {
         }
     }
 
+    /// For Type3 fonts: get the glyph name, shared content stream bytes, and
+    /// `FontMatrix` for a given character code.
+    #[doc(hidden)]
+    pub fn type3_glyph_entry(&self, char_code: u16) -> Option<(String, Arc<[u8]>, [f64; 6])> {
+        match &self.font_type {
+            PdfFontType::Type3 {
+                font_matrix,
+                char_procs,
+                encoding,
+                ..
+            } => {
+                let glyph_name = encoding.get(char_code as usize)?;
+                if glyph_name == "g0" || glyph_name.is_empty() {
+                    return None;
+                }
+                let stream = char_procs.get(glyph_name)?;
+                Some((glyph_name.clone(), Arc::clone(stream), *font_matrix))
+            }
+            _ => None,
+        }
+    }
+
     /// For Type3 fonts: get glyph width from the Widths array. Codes outside
     /// `/FirstChar` .. `/FirstChar + len` take the font's default width, on
     /// either side of the range (a code below `/FirstChar` must not borrow the
@@ -3081,6 +3103,19 @@ impl CompanionEntry {
     }
 }
 
+/// Source dictionary location for an admitted Type 3 font so the content
+/// interpreter can resolve font-level and per-CharProc `/Resources` in
+/// glyph → font → parent order without embedding uncharged PDF dictionaries
+/// into [`LoadedFont`].
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub enum Type3Source {
+    /// Indirect Type 3 font dictionary object in the PDF file.
+    Object(zpdf_core::ObjectId),
+    /// Inline Type 3 font dictionary (e.g. inside a Form XObject `/Resources`).
+    Inline(Arc<zpdf_core::PdfDict>),
+}
+
 /// Page/display-list font store keyed by [`FontId`].
 ///
 /// Entries are intentionally stable for the lifetime of the store: display
@@ -3117,6 +3152,9 @@ pub struct FontCache {
     /// `font_type` govern text decoding (e.g. for PPTX export). Empty maps
     /// allocate nothing.
     drawing_font_originals: HashMap<FontId, FontId>,
+    /// Source dictionary location for admitted Type 3 fonts. Empty maps
+    /// allocate nothing.
+    type3_sources: HashMap<FontId, Type3Source>,
 }
 
 impl FontCache {
@@ -3140,7 +3178,20 @@ impl FontCache {
             embedded_fallbacks: HashMap::new(),
             embedded_companions: HashMap::new(),
             drawing_font_originals: HashMap::new(),
+            type3_sources: HashMap::new(),
         }
+    }
+
+    /// Record an inline Type 3 font dictionary for `id`.
+    #[doc(hidden)]
+    pub fn record_type3_inline_source(&mut self, id: FontId, dict: Arc<zpdf_core::PdfDict>) {
+        self.type3_sources.insert(id, Type3Source::Inline(dict));
+    }
+
+    /// Look up the source PDF dictionary location for Type 3 font `id`.
+    #[doc(hidden)]
+    pub fn type3_source(&self, id: FontId) -> Option<&Type3Source> {
+        self.type3_sources.get(&id)
     }
 
     fn standby_extra_bytes(
@@ -3579,6 +3630,11 @@ impl FontCache {
         if let Some(fid) =
             self.try_insert_shared_with_limit(name.clone(), Arc::clone(&font), max_bytes)
         {
+            if font.is_type3() {
+                if let Some(id) = object_id {
+                    self.type3_sources.insert(fid, Type3Source::Object(id));
+                }
+            }
             if !diagnostics.is_empty() {
                 self.record_embedded_fallback(fid, diagnostics);
             }
