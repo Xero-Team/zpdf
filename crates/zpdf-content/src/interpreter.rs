@@ -46,6 +46,19 @@ pub struct ContentInterpreter<'a> {
     /// (see [`Self::with_shared_fonts`]).
     shared_font_doc: Option<&'a zpdf_document::PdfDocument>,
     current_font_id: Option<zpdf_font::FontId>,
+    /// Font IDs whose embedded-program fallback diagnostics have already been
+    /// merged into `self.stats.diagnostics` during this interpretation.
+    reported_font_fallbacks: Vec<zpdf_font::FontId>,
+    /// Font IDs whose embedded-program fallback failed to recover at least one
+    /// visible glyph outline and already recorded `missing_glyph_outlines`.
+    reported_font_outline_misses: Vec<zpdf_font::FontId>,
+    /// Font IDs whose embedded-program fallback already recorded a
+    /// `decode_failures` entry (either from load-time limits or undecodable text).
+    reported_font_text_misses: Vec<zpdf_font::FontId>,
+    /// Per-page cache classifying shown glyph IDs in embedded fonts as healthy
+    /// vs corrupt/unreadable so healthy PDFs avoid repeated face parsing while
+    /// partially corrupt subsets trigger per-glyph descriptor substitution.
+    embedded_glyph_health: Vec<(zpdf_font::FontId, EmbeddedGlyphHealth)>,
     file: Option<&'a PdfFile>,
     resources: Option<&'a ResourceDict>,
     image_cache: Option<&'a mut ImageCache>,
@@ -132,6 +145,9 @@ pub struct ContentInterpreter<'a> {
     /// form cannot corrupt the page-level state.
     state_floor: usize,
     text_sink: Option<&'a mut Vec<TextSpan>>,
+    /// Parallel owning-stream bindings for spans pushed into `text_sink` when
+    /// running in structured text mode.
+    span_streams: Option<&'a mut Vec<crate::text::SpanStreamBinding>>,
     /// Whether collected spans also carry positioned glyph cells.
     text_geometry: bool,
     /// Selection cells held by the sink and the open replacement, across this
@@ -164,6 +180,19 @@ pub struct ContentInterpreter<'a> {
     /// Only the outer replacement reaches the text sink. It also covers
     /// glyphs shown by forms, whose marked-content stacks are independent.
     active_actual_text: Option<ActualText>,
+    /// Stream-scoped `(owning_stream, mcid)` pairs on this page subsumed by a
+    /// structure element's `/ActualText` during structured text extraction
+    /// (`None` = page content stream; `Some(id)` = Form XObject stream `/Stm`).
+    /// Empty outside structured mode.
+    struct_actual_text_mcids: std::collections::HashSet<(Option<ObjectId>, i64)>,
+    /// Content stream that owns the current `mc_stack`: `Some(None)` on the
+    /// page content stream, `Some(Some(id))` inside an indirect Form XObject
+    /// `id`, and `None` inside inline forms or tiling patterns.
+    current_mc_stream: Option<Option<ObjectId>>,
+    /// True when the current Form XObject was invoked inside an enclosing
+    /// marked-content sequence already covered by a structure element's
+    /// `/ActualText` replacement.
+    enclosing_struct_actual_text: bool,
     actual_text_bytes: usize,
     max_actual_text_bytes: usize,
     /// Depth at which a hidden `BDC /OC` block began; painting is suppressed
@@ -260,6 +289,7 @@ struct MarkedContent {
 
 struct ActualText {
     span: TextSpan,
+    stream_binding: crate::text::SpanStreamBinding,
     has_source: bool,
     /// Keep admitted buffers until EMC so the final cluster allocates once.
     following_glyphs: Vec<Vec<TextGlyph>>,
@@ -300,7 +330,13 @@ impl ActualText {
     /// Publish the replacement. A cluster that a page limit cut short keeps
     /// its text, like the spans before it, but only a complete cluster keeps
     /// its glyph cells.
-    fn finish(mut self, complete: bool, sink: &mut Vec<TextSpan>, retained: &mut usize) {
+    fn finish(
+        mut self,
+        complete: bool,
+        sink: &mut Vec<TextSpan>,
+        span_streams: Option<&mut Vec<crate::text::SpanStreamBinding>>,
+        retained: &mut usize,
+    ) {
         let publish = !self.span.text.is_empty() && self.span.is_finite();
         if !(publish && complete) {
             *retained = retained.saturating_sub(self.release_glyphs());
@@ -315,6 +351,117 @@ impl ActualText {
             self.span.glyphs.extend(run);
         }
         sink.push(self.span);
+        if let Some(streams) = span_streams {
+            streams.push(self.stream_binding);
+        }
+    }
+}
+
+/// Per-GID cached classification for an embedded font program. Exhausted
+/// reverse-`cmap` probes are intentionally left uncached (`None`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CachedGlyphHealth {
+    /// Confirmed readable (drawn outline or zero-length `loca` blank handled
+    /// by CAD repair).
+    Readable,
+    /// Physically unreadable outline record (missing, malformed header, failed
+    /// or empty visible Type 1 charstring, or out-of-range GID).
+    Unreadable,
+    /// Physically blank record whose readability depends on the shown PDF code
+    /// (Type 1 blank with `/ToUnicode` or TrueType valid-header nonempty
+    /// zero-contour record). When `fallback` is `Some(unreadable)`, a reverse
+    /// `cmap` probe already determined whether the font's own `cmap` maps a
+    /// visible scalar to this GID, so codes without direct PDF evidence reuse
+    /// that fallback without re-probing while codes with direct `/ToUnicode`
+    /// evidence (visible text or explicit whitespace) still win.
+    CodeDependentBlank { fallback: Option<bool> },
+}
+
+/// Per-page cache of whether each shown glyph ID in an embedded font maps to a
+/// corrupt/unreadable outline record. Inline 256-bit bitsets keep simple fonts
+/// and small subsets allocation-free, and `cmap_budget` bounds blank-record
+/// `cmap` validation across the whole page for this font.
+struct EmbeddedGlyphHealth {
+    known_low: [u64; 4],
+    unreadable_low: [u64; 4],
+    code_dep_low: [u64; 4],
+    fallback_known_low: [u64; 4],
+    high: HashMap<u16, CachedGlyphHealth>,
+    cmap_budget: usize,
+}
+
+impl Default for EmbeddedGlyphHealth {
+    fn default() -> Self {
+        Self {
+            known_low: [0; 4],
+            unreadable_low: [0; 4],
+            code_dep_low: [0; 4],
+            fallback_known_low: [0; 4],
+            high: HashMap::new(),
+            cmap_budget: zpdf_font::CMAP_PROBE_BUDGET,
+        }
+    }
+}
+
+impl EmbeddedGlyphHealth {
+    fn get(&self, gid: u16) -> Option<CachedGlyphHealth> {
+        if gid < 256 {
+            let word = (gid >> 6) as usize;
+            let bit = 1u64 << (gid & 63);
+            if (self.known_low[word] & bit) == 0 {
+                return None;
+            }
+            if (self.code_dep_low[word] & bit) != 0 {
+                let fallback = ((self.fallback_known_low[word] & bit) != 0)
+                    .then_some((self.unreadable_low[word] & bit) != 0);
+                Some(CachedGlyphHealth::CodeDependentBlank { fallback })
+            } else if (self.unreadable_low[word] & bit) != 0 {
+                Some(CachedGlyphHealth::Unreadable)
+            } else {
+                Some(CachedGlyphHealth::Readable)
+            }
+        } else {
+            self.high.get(&gid).copied()
+        }
+    }
+
+    fn set(&mut self, gid: u16, health: CachedGlyphHealth) {
+        if gid < 256 {
+            let word = (gid >> 6) as usize;
+            let bit = 1u64 << (gid & 63);
+            self.known_low[word] |= bit;
+            match health {
+                CachedGlyphHealth::Readable => {
+                    self.unreadable_low[word] &= !bit;
+                    self.code_dep_low[word] &= !bit;
+                    self.fallback_known_low[word] &= !bit;
+                }
+                CachedGlyphHealth::Unreadable => {
+                    self.unreadable_low[word] |= bit;
+                    self.code_dep_low[word] &= !bit;
+                    self.fallback_known_low[word] &= !bit;
+                }
+                CachedGlyphHealth::CodeDependentBlank { fallback } => {
+                    self.code_dep_low[word] |= bit;
+                    match fallback {
+                        Some(unreadable) => {
+                            self.fallback_known_low[word] |= bit;
+                            if unreadable {
+                                self.unreadable_low[word] |= bit;
+                            } else {
+                                self.unreadable_low[word] &= !bit;
+                            }
+                        }
+                        None => {
+                            self.fallback_known_low[word] &= !bit;
+                            self.unreadable_low[word] &= !bit;
+                        }
+                    }
+                }
+            }
+        } else if self.high.len() < 4096 || self.high.contains_key(&gid) {
+            self.high.insert(gid, health);
+        }
     }
 }
 
@@ -770,6 +917,10 @@ impl<'a> ContentInterpreter<'a> {
             font_cache: None,
             shared_font_doc: None,
             current_font_id: None,
+            reported_font_fallbacks: Vec::new(),
+            reported_font_outline_misses: Vec::new(),
+            reported_font_text_misses: Vec::new(),
+            embedded_glyph_health: Vec::new(),
             file: None,
             resources: None,
             image_cache: None,
@@ -800,6 +951,7 @@ impl<'a> ContentInterpreter<'a> {
             active_forms: Vec::new(),
             state_floor: 0,
             text_sink: None,
+            span_streams: None,
             text_geometry: false,
             text_glyphs_collected: 0,
             extracted_text_bytes: 0,
@@ -812,6 +964,9 @@ impl<'a> ContentInterpreter<'a> {
             compatibility_depth: 0,
             mc_stack: Vec::new(),
             active_actual_text: None,
+            struct_actual_text_mcids: std::collections::HashSet::new(),
+            current_mc_stream: Some(None),
+            enclosing_struct_actual_text: false,
             actual_text_bytes: 0,
             max_actual_text_bytes: 16 << 20,
             oc_hidden_from: None,
@@ -913,6 +1068,19 @@ impl<'a> ContentInterpreter<'a> {
     /// Override the marked-content (BMC/BDC) nesting limit.
     pub fn with_marked_content_limit(mut self, max_depth: usize) -> Self {
         self.max_marked_content_depth = max_depth;
+        self
+    }
+
+    /// Supply stream-scoped `(owning_stream, mcid)` pairs subsumed by
+    /// structure-element `/ActualText` replacements on this page (`None` for
+    /// the page stream; `Some(id)` for a Form XObject stream referenced by
+    /// `/MCR /Stm`).
+    #[doc(hidden)]
+    pub fn with_struct_actual_text_mcids(
+        mut self,
+        mcids: std::collections::HashSet<(Option<ObjectId>, i64)>,
+    ) -> Self {
+        self.struct_actual_text_mcids = mcids;
         self
     }
 
@@ -1170,6 +1338,14 @@ impl<'a> ContentInterpreter<'a> {
     /// [`Self::with_text_geometry`] asks for them.
     pub fn with_text_sink(mut self, sink: &'a mut Vec<TextSpan>) -> Self {
         self.text_sink = Some(sink);
+        self
+    }
+
+    /// Collect parallel owning-stream bindings for spans pushed into
+    /// [`Self::with_text_sink`], used by structured text assembly.
+    #[doc(hidden)]
+    pub fn with_span_streams(mut self, sink: &'a mut Vec<crate::text::SpanStreamBinding>) -> Self {
+        self.span_streams = Some(sink);
         self
     }
 
@@ -3497,7 +3673,29 @@ impl<'a> ContentInterpreter<'a> {
     fn stop_text_extraction(&mut self) {
         self.stats.diagnostics.resource_limit_reached = true;
         self.text_sink = None;
+        self.span_streams = None;
         self.active_actual_text = None;
+    }
+
+    fn current_struct_actual_text_covers(&self) -> bool {
+        self.enclosing_struct_actual_text
+            || (!self.struct_actual_text_mcids.is_empty()
+                && self.current_mc_stream.is_some_and(|stream| {
+                    self.current_mcid().is_some_and(|mcid| {
+                        self.struct_actual_text_mcids
+                            .contains(&(stream, mcid as i64))
+                    })
+                }))
+    }
+
+    fn current_span_stream_binding(&self) -> crate::text::SpanStreamBinding {
+        if self.enclosing_struct_actual_text {
+            crate::text::SpanStreamBinding::Subsumed
+        } else if let Some(stream) = self.current_mc_stream {
+            crate::text::SpanStreamBinding::Stream(stream)
+        } else {
+            crate::text::SpanStreamBinding::Unbound
+        }
     }
 
     fn begin_actual_text(&mut self, props: &PdfObject, mcid: Option<i32>) -> Option<ActualText> {
@@ -3538,6 +3736,7 @@ impl<'a> ContentInterpreter<'a> {
                 mcid: mcid.or_else(|| self.current_mcid()),
                 glyphs: Vec::new(),
             },
+            stream_binding: self.current_span_stream_binding(),
             has_source: false,
             following_glyphs: Vec::new(),
         })
@@ -3562,7 +3761,12 @@ impl<'a> ContentInterpreter<'a> {
             .is_some_and(|frame| frame.ends_actual_text);
         if let Some(sink) = self.text_sink.as_mut().filter(|_| ends_actual_text) {
             if let Some(actual) = self.active_actual_text.take() {
-                actual.finish(complete, sink, &mut self.text_glyphs_collected);
+                actual.finish(
+                    complete,
+                    sink,
+                    self.span_streams.as_deref_mut(),
+                    &mut self.text_glyphs_collected,
+                );
             }
         }
         if self.oc_hidden_from == Some(self.mc_depth) {
@@ -4106,6 +4310,7 @@ impl<'a> ContentInterpreter<'a> {
         // Mask glyphs and rules define opacity, not logical page content.
         // Keep /ActualText in those painting resources out of extraction too.
         let saved_text_sink = self.text_sink.take();
+        let saved_span_streams = self.span_streams.take();
         let saved_rule_sink = self.rule_sink.take();
         self.current.soft_mask = None;
         self.current.blend_mode = BlendMode::Normal;
@@ -4124,6 +4329,7 @@ impl<'a> ContentInterpreter<'a> {
         self.current = saved_state;
         self.oc_hidden_from = saved_oc_hidden;
         self.text_sink = saved_text_sink;
+        self.span_streams = saved_span_streams;
         self.rule_sink = saved_rule_sink;
         let mask_dl = std::mem::replace(&mut self.display_list, saved_dl);
 
@@ -4868,7 +5074,7 @@ impl<'a> ContentInterpreter<'a> {
         };
 
         // Load fonts from the form's own Resources into the FontCache
-        self.load_form_fonts(&stream.dict, file);
+        self.load_form_fonts(&stream.dict, xobj_id, file);
 
         // The form's full /Resources (xobjects, gstates, colorspaces,
         // patterns, shadings) shadow the page's for the duration of the form.
@@ -4900,7 +5106,10 @@ impl<'a> ContentInterpreter<'a> {
         // bleed into (or be polluted by) the page's enclosing sequence.
         let saved_compatibility = std::mem::replace(&mut self.compatibility_depth, 0);
         let saved_mc_depth = self.mc_depth;
+        let saved_enclosing_struct_actual_text = self.enclosing_struct_actual_text;
+        self.enclosing_struct_actual_text = self.current_struct_actual_text_covers();
         let saved_mc_stack = std::mem::take(&mut self.mc_stack);
+        let saved_mc_stream = std::mem::replace(&mut self.current_mc_stream, xobj_id.map(Some));
         let saved_oc_hidden = self.oc_hidden_from;
 
         self.current.ctm = self.current.ctm.concat(&form_matrix);
@@ -5028,6 +5237,8 @@ impl<'a> ContentInterpreter<'a> {
         self.operand_stack = saved_operand_stack;
         self.mc_depth = saved_mc_depth;
         self.mc_stack = saved_mc_stack;
+        self.current_mc_stream = saved_mc_stream;
+        self.enclosing_struct_actual_text = saved_enclosing_struct_actual_text;
         self.compatibility_depth = saved_compatibility;
         self.oc_hidden_from = saved_oc_hidden;
         self.base_ctm = saved_base_ctm;
@@ -5050,15 +5261,17 @@ impl<'a> ContentInterpreter<'a> {
         };
         if fc.get_by_name(&name).is_none() {
             let max_bytes = self.max_font_cache_bytes;
-            if let Err(e) =
-                load_font_ref(self.shared_font_doc, file, fc, font_ref, &name, max_bytes)
-            {
-                tracing::debug!("ExtGState font {font_ref}: {e}");
-                let _ = fc.try_insert_with_limit(
-                    name.clone(),
-                    zpdf_font::LoadedFont::new_placeholder(name.clone()),
-                    max_bytes,
-                );
+            match load_font_ref(self.shared_font_doc, file, fc, font_ref, &name, max_bytes) {
+                Ok(Some(diag)) => self.stats.diagnostics.merge(diag),
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::debug!("ExtGState font {font_ref}: {e}");
+                    let _ = fc.try_insert_with_limit(
+                        name.clone(),
+                        zpdf_font::LoadedFont::new_placeholder(name.clone()),
+                        max_bytes,
+                    );
+                }
             }
         }
         self.current_font_id = fc.get_by_name(&name).map(|(fid, _)| fid);
@@ -5073,7 +5286,12 @@ impl<'a> ContentInterpreter<'a> {
         name.to_string()
     }
 
-    fn load_form_fonts(&mut self, form_dict: &zpdf_core::PdfDict, file: &PdfFile) {
+    fn load_form_fonts(
+        &mut self,
+        form_dict: &zpdf_core::PdfDict,
+        form_id: Option<ObjectId>,
+        file: &PdfFile,
+    ) {
         // Either level may be an indirect reference.
         let fonts_of = |res: &zpdf_core::PdfDict| match res.get("Font") {
             Some(PdfObject::Dict(f)) => Some(f.clone()),
@@ -5120,36 +5338,12 @@ impl<'a> ContentInterpreter<'a> {
 
         // Page resources are capped by MAX_RESOURCE_ENTRIES; a form's raw
         // /Font dictionary bypasses that parser, so bound it here too.
+        // Optional embedded companions are stored as lightweight reload
+        // references (`Object` / `FormInlineFont`) plus a budget-charged,
+        // reclaimable standby copy when it fits, so unused companions never
+        // exceed `max_font_bytes` or displace sibling fonts.
         const MAX_FORM_FONT_ENTRIES: usize = 65_536;
         for (name, obj) in fonts.0.iter().take(MAX_FORM_FONT_ENTRIES) {
-            // A font entry is normally an indirect reference; a synthesized
-            // form-field appearance may instead carry an inline font dict.
-            let load_into = |fc: &mut FontCache, target: &str| -> Result<(), zpdf_core::Error> {
-                let font = match obj {
-                    PdfObject::Ref(font_ref) => {
-                        return load_font_ref(
-                            shared_doc,
-                            file,
-                            fc,
-                            *font_ref,
-                            target,
-                            max_font_bytes,
-                        );
-                    }
-                    PdfObject::Dict(font_dict) => {
-                        zpdf_document::font_loader::load_single_font_dict_with_provider(
-                            file,
-                            font_dict,
-                            fc.provider().map(|provider| provider.as_ref()),
-                        )?
-                    }
-                    _ => return Ok(()),
-                };
-                fc.try_insert_with_limit(target.to_string(), font, max_font_bytes)
-                    .map(|_| ())
-                    .ok_or_else(|| font_cache_full(max_font_bytes))
-            };
-
             match obj {
                 PdfObject::Ref(font_ref) => {
                     // If the page already caches this exact font under this same
@@ -5173,13 +5367,24 @@ impl<'a> ContentInterpreter<'a> {
                     // reused).
                     let unique_name = format!("__font_{}_{}", font_ref.0, font_ref.1);
                     if fc.get_by_name(&unique_name).is_none() {
-                        if let Err(e) = load_into(fc, &unique_name) {
-                            tracing::debug!("form font {}: {e}", name.0);
-                            let _ = fc.try_insert_with_limit(
-                                unique_name.clone(),
-                                zpdf_font::LoadedFont::new_placeholder(name.0.clone()),
-                                max_font_bytes,
-                            );
+                        match load_font_ref(
+                            shared_doc,
+                            file,
+                            fc,
+                            *font_ref,
+                            &unique_name,
+                            max_font_bytes,
+                        ) {
+                            Ok(Some(diag)) => self.stats.diagnostics.merge(diag),
+                            Ok(None) => {}
+                            Err(e) => {
+                                tracing::debug!("form font {}: {e}", name.0);
+                                let _ = fc.try_insert_with_limit(
+                                    unique_name.clone(),
+                                    zpdf_font::LoadedFont::new_placeholder(name.0.clone()),
+                                    max_font_bytes,
+                                );
+                            }
                         }
                     }
                     overrides.insert(name.0.clone(), unique_name);
@@ -5194,13 +5399,58 @@ impl<'a> ContentInterpreter<'a> {
                     let target = format!("__inline_font_{:016x}", inline_font_key(font_dict));
                     overrides.insert(name.0.clone(), target.clone());
                     if fc.get_by_name(&target).is_none() {
-                        if let Err(e) = load_into(fc, &target) {
-                            tracing::debug!("form inline font {}: {e}", name.0);
-                            let _ = fc.try_insert_with_limit(
-                                target,
-                                zpdf_font::LoadedFont::new_placeholder(name.0.clone()),
-                                max_font_bytes,
-                            );
+                        match zpdf_document::font_loader::load_single_font_dict_with_fallback(
+                            file,
+                            font_dict,
+                            fc.provider().map(|provider| provider.as_ref()),
+                        ) {
+                            Ok((font, diagnostics, companion, descriptor_spec)) => {
+                                match fc.admit_with_diagnostics(
+                                    target.clone(),
+                                    std::sync::Arc::new(font),
+                                    diagnostics,
+                                    None,
+                                    max_font_bytes,
+                                ) {
+                                    Ok(fid) => {
+                                        if fc.get(fid).is_some_and(|f| f.has_font_data()) {
+                                            if let Some(spec) = descriptor_spec {
+                                                fc.record_descriptor_substitute(
+                                                    fid,
+                                                    spec,
+                                                    max_font_bytes,
+                                                );
+                                            } else if companion.is_some() {
+                                                let source = match form_id {
+                                                    Some(id) => {
+                                                        zpdf_font::CompanionSource::FormInlineFont {
+                                                            form_id: id,
+                                                            font_name: name.0.clone(),
+                                                        }
+                                                    }
+                                                    None => zpdf_font::CompanionSource::None,
+                                                };
+                                                let _ = fc.record_companion(
+                                                    fid,
+                                                    zpdf_font::CompanionKind::EmbeddedOriginal,
+                                                    source,
+                                                    companion.map(std::sync::Arc::new),
+                                                    max_font_bytes,
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Err(diag) => self.stats.diagnostics.merge(diag),
+                                }
+                            }
+                            Err(e) => {
+                                tracing::debug!("form inline font {}: {e}", name.0);
+                                let _ = fc.try_insert_with_limit(
+                                    target,
+                                    zpdf_font::LoadedFont::new_placeholder(name.0.clone()),
+                                    max_font_bytes,
+                                );
+                            }
                         }
                     }
                 }
@@ -5683,7 +5933,7 @@ impl<'a> ContentInterpreter<'a> {
 
         // Pattern /Resources and fonts shadow the page's for the cell body,
         // exactly like a form XObject's.
-        self.load_form_fonts(&def.dict, file);
+        self.load_form_fonts(&def.dict, None, file);
         let own_resources = def
             .dict
             .get("Resources")
@@ -5701,6 +5951,7 @@ impl<'a> ContentInterpreter<'a> {
         // Pattern-cell glyphs are painting resources, not logical page text;
         // their EMC operators must never edit the surrounding extraction sink.
         let saved_text_sink = self.text_sink.take();
+        let saved_span_streams = self.span_streams.take();
         // Unbalanced BDC/EMC inside a cell must not leak marked-content state
         // into later tiles or the rest of the page; like `mc_depth`, the cell's
         // /MCID stack is saved before the tile loop and restored per tile.
@@ -5728,6 +5979,7 @@ impl<'a> ContentInterpreter<'a> {
             cur_delta: (0.0, 0.0),
         });
         let saved_tile_op_index = self.tile_op_index;
+        let saved_mc_stream = self.current_mc_stream.take();
 
         self.form_depth += 1;
         'tiles: for j in j0..=j1 {
@@ -5852,9 +6104,11 @@ impl<'a> ContentInterpreter<'a> {
             }
         }
         self.form_depth -= 1;
+        self.current_mc_stream = saved_mc_stream;
         self.soft_mask_reuse = saved_mask_reuse;
         self.tile_op_index = saved_tile_op_index;
         self.text_sink = saved_text_sink;
+        self.span_streams = saved_span_streams;
 
         self.text_matrix = saved_text_matrix;
         self.text_line_matrix = saved_text_line_matrix;
@@ -5930,7 +6184,7 @@ impl<'a> ContentInterpreter<'a> {
     }
 
     fn show_text(&mut self, bytes: &[u8]) {
-        if !bytes.is_empty() && self.current_font_id.is_none() && !self.oc_suppressed() {
+        if !bytes.is_empty() && !self.oc_suppressed() && self.current_font_id.is_none() {
             self.stats.diagnostics.missing_resources =
                 self.stats.diagnostics.missing_resources.saturating_add(1);
         }
@@ -5980,8 +6234,7 @@ impl<'a> ContentInterpreter<'a> {
             // (Identity-H semantics when absent) and map code → CID → glyph.
             let cmap = font_and_id.and_then(|(_, f)| f.cid_cmap.as_ref());
             vertical = cmap.map(|c| c.wmode == 1).unwrap_or(false);
-            let direct_gid = font_and_id
-                .is_some_and(|(_, font)| font.unicode_coded() || font.legacy_substitute());
+            let direct_gid = font_and_id.is_some_and(|(_, font)| font.uses_direct_composite_gids());
             let dw2 = font_and_id.map(|(_, f)| f.dw2).unwrap_or((880.0, -1000.0));
             let mut evidence = font_and_id
                 .filter(|_| !self.font_override)
@@ -6006,6 +6259,11 @@ impl<'a> ContentInterpreter<'a> {
                     }
                 };
                 i += len.max(1);
+                let raw_end = i.min(bytes.len());
+                let raw_len = (raw_end - start) as u8;
+                let raw_code = bytes[start..raw_end]
+                    .iter()
+                    .fold(0u32, |value, &byte| (value << 8) | byte as u32);
                 if let Some(evidence) = evidence.as_deref_mut() {
                     evidence.insert(code);
                 }
@@ -6016,10 +6274,7 @@ impl<'a> ContentInterpreter<'a> {
                     let cid = cmap.map(|c| c.code_to_cid(code, len as u8)).unwrap_or(code);
                     let cid = u16::try_from(cid).unwrap_or(0);
                     let glyph_id = if direct_gid {
-                        let raw_code = bytes[start..i.min(bytes.len())]
-                            .iter()
-                            .fold(0u32, |value, &byte| (value << 8) | byte as u32);
-                        font.composite_unicode_gid(code, raw_code, len as u8)
+                        font.composite_direct_gid(code, raw_code, len as u8)
                             .unwrap_or(0)
                     } else {
                         cid
@@ -6051,7 +6306,8 @@ impl<'a> ContentInterpreter<'a> {
                     column = (column.0.min(-vx), column.1.max(-vx + width));
                     glyphs.push(PositionedGlyph {
                         glyph_id,
-                        code,
+                        code_len: raw_len,
+                        code: raw_code,
                         x: -vx,
                         y: x_offset - vy,
                         advance,
@@ -6064,7 +6320,8 @@ impl<'a> ContentInterpreter<'a> {
                     let advance = adv_units as f32 * scale_factor * h_scale;
                     glyphs.push(PositionedGlyph {
                         glyph_id,
-                        code,
+                        code_len: raw_len,
+                        code: raw_code,
                         x: x_offset,
                         y: 0.0,
                         advance,
@@ -6113,6 +6370,7 @@ impl<'a> ContentInterpreter<'a> {
                 previous = Some((byte, (glyph_id, advance)));
                 glyphs.push(PositionedGlyph {
                     glyph_id,
+                    code_len: 1,
                     code: code as u32,
                     x: x_offset,
                     y: 0.0,
@@ -6288,28 +6546,79 @@ impl<'a> ContentInterpreter<'a> {
         };
 
         // Preserve the ordinary solid-text path without entering fallback or
-        // clipping machinery when no application fonts have been registered.
+        // clipping machinery when no application fonts, retained embedded
+        // companions, or unreadable embedded glyphs are active. Capture the
+        // outer font ID before painting because tiling-pattern replay can
+        // change `self.current_font_id` with `Tf`.
+        let show_font_id = self.current_font_id;
+        let has_companion = show_font_id.is_some_and(|fid| {
+            self.font_cache.as_ref().is_some_and(|cache| {
+                cache.has_embedded_companion_for_budget(fid, self.max_font_cache_bytes)
+            })
+        });
+        let no_marks = match self.current.render_mode {
+            1 | 5 => cs_produces_no_marks(&self.current.stroke_cs),
+            2 | 6 => {
+                cs_produces_no_marks(&self.current.fill_cs)
+                    && cs_produces_no_marks(&self.current.stroke_cs)
+            }
+            _ => cs_produces_no_marks(&self.current.fill_cs),
+        };
+        let wants_clip = matches!(self.current.render_mode, 4..=7);
+        let paints_or_clips = wants_clip
+            || (!matches!(self.current.render_mode, 3 | 7) && !no_marks && !self.oc_suppressed());
+        let contributes_text = self.text_sink.is_some() && !self.oc_suppressed();
+        let unreadable_embedded = (paints_or_clips || contributes_text)
+            && !glyphs.is_empty()
+            && show_font_id
+                .is_some_and(|fid| self.scan_unreadable_embedded_glyphs(fid, bytes, &glyphs));
         let ordinary = self.current.render_mode == 0
+            && !self.oc_suppressed()
             && self.current.fill_pattern.is_none()
             && self
                 .font_cache
                 .as_ref()
                 .and_then(|cache| cache.provider())
                 .is_none_or(|provider| provider.generation() == 0)
-            && !cs_produces_no_marks(&self.current.fill_cs)
-            && !repair;
+            && !no_marks
+            && !repair
+            && !has_companion
+            && !unreadable_embedded;
         if ordinary {
-            if let Some(font_id) = self.current_font_id {
+            if let Some(font_id) = show_font_id {
                 if !glyphs.is_empty() {
+                    self.check_embedded_fallback_outlines(font_id, bytes, &glyphs, None);
                     self.emit_solid_glyph_run(font_id, font_size, glyphs, combined, h_scale);
                 }
             }
         } else {
-            self.paint_positioned_text(bytes, glyphs, combined, font_size, h_scale, repair);
+            self.paint_positioned_text(
+                bytes,
+                glyphs,
+                combined,
+                font_size,
+                h_scale,
+                repair,
+                unreadable_embedded,
+            );
+        }
+
+        // Check fallback text-decoding completeness against the outer font that
+        // decoded this show (even if patterned text replayed a tiling cell with
+        // its own `Tf`), independently of outline recovery and render-mode
+        // visibility. An invisible (render-mode-3) show contributing to
+        // extraction still activates the lazy fallback check for unreadable
+        // embedded glyphs without recording a missing visual outline.
+        if let Some(font_id) = show_font_id {
+            if unreadable_embedded && contributes_text {
+                self.ensure_lazy_embedded_fallback(font_id);
+            }
+            self.check_embedded_fallback_text(font_id, bytes);
         }
 
         // Hidden optional-content layers also extract no text (emit_painted
         // already drops the glyph run; the matrix advance below still runs).
+        let span_stream_binding = self.current_span_stream_binding();
         if let (Some(span), Some(sink)) = (text_span, self.text_sink.as_mut()) {
             let kept = if let Some(actual) = &mut self.active_actual_text {
                 if !bytes.is_empty() {
@@ -6319,6 +6628,9 @@ impl<'a> ContentInterpreter<'a> {
             } else if !span.text.is_empty() {
                 self.text_glyphs_collected += span.glyphs.len();
                 sink.push(span);
+                if let Some(streams) = self.span_streams.as_deref_mut() {
+                    streams.push(span_stream_binding);
+                }
                 true
             } else {
                 false
@@ -6336,8 +6648,321 @@ impl<'a> ContentInterpreter<'a> {
         self.text_matrix = self.text_matrix.concat(&advance);
     }
 
+    /// Merge load-time embedded-font fallback diagnostics once per `font_id`.
+    /// Load-time `decode_failures` (such as cache-budget limits) mark the text
+    /// failure tracker to prevent double counting, without suppressing outline
+    /// omission checks.
+    fn merge_embedded_fallback(
+        &mut self,
+        font_id: FontId,
+    ) -> Option<zpdf_core::ProcessingDiagnostics> {
+        let fallback_diag = self
+            .font_cache
+            .as_ref()
+            .and_then(|fc| fc.embedded_fallback(font_id))?;
+        if !self.reported_font_fallbacks.contains(&font_id) {
+            self.reported_font_fallbacks.push(font_id);
+            self.stats.diagnostics.merge(fallback_diag);
+            if fallback_diag.decode_failures > 0
+                && !self.reported_font_text_misses.contains(&font_id)
+            {
+                self.reported_font_text_misses.push(font_id);
+            }
+        }
+        Some(fallback_diag)
+    }
+
+    /// Record embedded-font fallback diagnostics for visible/clipped runs and
+    /// verify that every shown visible glyph has a drawable outline. Missing
+    /// outlines record `missing_glyph_outlines` independently of text decoding.
+    fn check_embedded_fallback_outlines(
+        &mut self,
+        font_id: FontId,
+        bytes: &[u8],
+        glyphs: &[PositionedGlyph],
+        resolved_runs: Option<&[(FontId, Vec<PositionedGlyph>)]>,
+    ) {
+        if bytes.is_empty() || self.oc_suppressed() {
+            return;
+        }
+        let Some(fallback_diag) = self.merge_embedded_fallback(font_id) else {
+            return;
+        };
+        if self.reported_font_outline_misses.contains(&font_id) {
+            return;
+        }
+        if !self.fallback_outlines_complete(font_id, bytes, glyphs, resolved_runs) {
+            self.reported_font_outline_misses.push(font_id);
+            self.stats
+                .diagnostics
+                .record_missing_glyph_outline(fallback_diag.first_failed_object);
+        }
+    }
+
+    /// Whether any shown glyph in `glyphs` resolves to a corrupt/unreadable
+    /// embedded outline record in `font_id`. Results are cached per `(font_id,
+    /// glyph_id)` on this page so healthy fonts pay only a bitset lookup after
+    /// their first show of each glyph ID.
+    fn scan_unreadable_embedded_glyphs(
+        &mut self,
+        font_id: FontId,
+        bytes: &[u8],
+        glyphs: &[PositionedGlyph],
+    ) -> bool {
+        let Some(font) = self.font_cache.as_deref().and_then(|fc| fc.get(font_id)) else {
+            return false;
+        };
+        if font.is_substitute || font.is_type3() || !font.has_font_data() {
+            return false;
+        }
+        const MAX_TRACKED_FONTS: usize = 256;
+        let slot = match self
+            .embedded_glyph_health
+            .iter()
+            .position(|(id, _)| *id == font_id)
+        {
+            Some(index) => Some(index),
+            None if self.embedded_glyph_health.len() < MAX_TRACKED_FONTS => {
+                self.embedded_glyph_health
+                    .push((font_id, EmbeddedGlyphHealth::default()));
+                Some(self.embedded_glyph_health.len() - 1)
+            }
+            None => None,
+        };
+        let composite = matches!(font.font_type, zpdf_font::PdfFontType::Type0CidType2);
+        let cmap = font.cid_cmap.as_ref();
+
+        // Fast path: when every nonzero glyph in this run is already cached as
+        // `Readable`, skip code segmentation altogether.
+        if let Some(index) = slot {
+            let health = &self.embedded_glyph_health[index].1;
+            if glyphs.iter().all(|g| {
+                g.glyph_id == 0 || health.get(g.glyph_id) == Some(CachedGlyphHealth::Readable)
+            }) {
+                return false;
+            }
+        }
+
+        let mut any_unreadable = false;
+        let mut to_probe: Vec<(u16, u32, u32, u8)> = Vec::new();
+        let mut offset = 0usize;
+        for g in glyphs {
+            let (code, length, raw, end) =
+                next_text_code(cmap, composite, bytes, offset).unwrap_or((0, 0, 0, bytes.len()));
+            offset = end;
+            if g.glyph_id == 0 {
+                continue;
+            }
+            match slot.and_then(|index| self.embedded_glyph_health[index].1.get(g.glyph_id)) {
+                Some(CachedGlyphHealth::Readable) => {}
+                Some(CachedGlyphHealth::Unreadable) => any_unreadable = true,
+                Some(CachedGlyphHealth::CodeDependentBlank { fallback }) => {
+                    if let Some(u) =
+                        font.code_dependent_blank_is_unreadable(code, raw, length as u8)
+                    {
+                        any_unreadable |= u;
+                    } else if let Some(u) = fallback {
+                        any_unreadable |= u;
+                    } else {
+                        to_probe.push((g.glyph_id, code, raw, length as u8));
+                    }
+                }
+                None => to_probe.push((g.glyph_id, code, raw, length as u8)),
+            }
+        }
+        if !to_probe.is_empty() {
+            to_probe.sort_unstable();
+            to_probe.dedup();
+            if let Some(index) = slot {
+                let health = &mut self.embedded_glyph_health[index].1;
+                let mut cmap_budget = health.cmap_budget;
+                font.classify_embedded_glyphs_with_codes(
+                    &to_probe,
+                    &mut cmap_budget,
+                    |gid, out| match out {
+                        zpdf_font::EmbeddedGlyphHealthOutcome::Readable => {
+                            health.set(gid, CachedGlyphHealth::Readable);
+                        }
+                        zpdf_font::EmbeddedGlyphHealthOutcome::Unreadable => {
+                            health.set(gid, CachedGlyphHealth::Unreadable);
+                            any_unreadable = true;
+                        }
+                        zpdf_font::EmbeddedGlyphHealthOutcome::CodeDependent { unreadable } => {
+                            let fallback = match health.get(gid) {
+                                Some(CachedGlyphHealth::CodeDependentBlank { fallback }) => {
+                                    fallback
+                                }
+                                _ => None,
+                            };
+                            health.set(gid, CachedGlyphHealth::CodeDependentBlank { fallback });
+                            any_unreadable |= unreadable;
+                        }
+                        zpdf_font::EmbeddedGlyphHealthOutcome::CodeDependentFallback {
+                            unreadable,
+                        } => {
+                            health.set(
+                                gid,
+                                CachedGlyphHealth::CodeDependentBlank {
+                                    fallback: Some(unreadable),
+                                },
+                            );
+                            any_unreadable |= unreadable;
+                        }
+                        // Exhausted probes remain uncached so they never mark
+                        // later visible glyphs as confirmed readable.
+                        zpdf_font::EmbeddedGlyphHealthOutcome::Exhausted => {}
+                    },
+                );
+                health.cmap_budget = cmap_budget;
+            } else {
+                let mut cmap_budget = zpdf_font::CMAP_PROBE_BUDGET;
+                font.classify_embedded_glyphs_with_codes(&to_probe, &mut cmap_budget, |_, out| {
+                    match out {
+                        zpdf_font::EmbeddedGlyphHealthOutcome::Unreadable => any_unreadable = true,
+                        zpdf_font::EmbeddedGlyphHealthOutcome::CodeDependent { unreadable }
+                        | zpdf_font::EmbeddedGlyphHealthOutcome::CodeDependentFallback {
+                            unreadable,
+                        } => {
+                            any_unreadable |= unreadable;
+                        }
+                        zpdf_font::EmbeddedGlyphHealthOutcome::Readable
+                        | zpdf_font::EmbeddedGlyphHealthOutcome::Exhausted => {}
+                    }
+                });
+            }
+        }
+        any_unreadable
+    }
+
+    /// Record a lazy embedded-font fallback diagnostic when a visible/clipped
+    /// show encounters an unreadable embedded glyph on a font whose font-wide
+    /// probe initially accepted the embedded program as primary.
+    fn ensure_lazy_embedded_fallback(&mut self, font_id: FontId) {
+        if self.oc_suppressed() {
+            return;
+        }
+        let Some(fc) = self.font_cache.as_deref_mut() else {
+            return;
+        };
+        if fc.embedded_fallback(font_id).is_some() {
+            return;
+        }
+        let first_failed_object = match fc.companion_kind(font_id) {
+            Some(zpdf_font::CompanionKind::DescriptorSubstitute { font_file_id }) => font_file_id,
+            _ => None,
+        };
+        let mut diag = zpdf_core::ProcessingDiagnostics::default();
+        diag.record_embedded_font_fallback(first_failed_object);
+        fc.record_embedded_fallback(font_id, diag);
+    }
+
+    /// Verify that a fallback text run contributing to the text sink decodes
+    /// every shown code (even when all outlines draw or render mode 3 makes the
+    /// run invisible). Load-time limit diagnostics are always merged once the
+    /// show contributes to extraction, while `/ActualText` exemptions remain
+    /// scoped to the per-code decodability check.
+    fn check_embedded_fallback_text(&mut self, font_id: FontId, bytes: &[u8]) {
+        if self.text_sink.is_none() || bytes.is_empty() || self.oc_suppressed() {
+            return;
+        }
+        let Some(fallback_diag) = self.merge_embedded_fallback(font_id) else {
+            return;
+        };
+        if self.active_actual_text.is_some()
+            || self.current_struct_actual_text_covers()
+            || self.reported_font_text_misses.contains(&font_id)
+        {
+            return;
+        }
+        if !self.fallback_text_decodable(font_id, bytes) {
+            self.reported_font_text_misses.push(font_id);
+            self.stats.diagnostics.decode_failures =
+                self.stats.diagnostics.decode_failures.saturating_add(1);
+            if let Some(id) = fallback_diag.first_failed_object {
+                self.stats.diagnostics.first_failed_object.get_or_insert(id);
+            }
+        }
+    }
+
+    fn fallback_outlines_complete(
+        &self,
+        original_font_id: FontId,
+        bytes: &[u8],
+        glyphs: &[PositionedGlyph],
+        resolved_runs: Option<&[(FontId, Vec<PositionedGlyph>)]>,
+    ) -> bool {
+        let Some(cache) = self.font_cache.as_deref() else {
+            return false;
+        };
+        let Some(orig_font) = cache.get(original_font_id) else {
+            return false;
+        };
+        let composite = matches!(orig_font.font_type, zpdf_font::PdfFontType::Type0CidType2);
+        let cmap = orig_font.cid_cmap.as_ref();
+        let mut offset = 0usize;
+        let mut check_slice = |drawing_font_id: FontId, slice: &[PositionedGlyph]| -> bool {
+            let Some(drawing_font) = cache.get(drawing_font_id) else {
+                return false;
+            };
+            drawing_font.fallback_glyphs_complete(
+                orig_font,
+                slice.iter().map(|glyph| {
+                    let (code, length, raw, end) = next_text_code(cmap, composite, bytes, offset)
+                        .unwrap_or((0, 0, 0, bytes.len()));
+                    offset = end;
+                    (glyph.glyph_id, code, raw, length as u8)
+                }),
+            )
+        };
+        if let Some(runs) = resolved_runs {
+            runs.iter()
+                .all(|(run_font_id, run_glyphs)| check_slice(*run_font_id, run_glyphs))
+        } else {
+            check_slice(original_font_id, glyphs)
+        }
+    }
+
+    fn fallback_text_decodable(&self, font_id: FontId, bytes: &[u8]) -> bool {
+        let Some(orig_font) = self.font_cache.as_deref().and_then(|fc| fc.get(font_id)) else {
+            return false;
+        };
+        let composite = matches!(orig_font.font_type, zpdf_font::PdfFontType::Type0CidType2);
+        let cmap = orig_font.cid_cmap.as_ref();
+        // Match extraction (`ToUnicodeMap::append_fixed_width`) when a Type0
+        // fallback font carries no encoding CMap and declares a single fixed
+        // `/ToUnicode` code width (e.g. 1-byte codes). Keep the encoding CMap
+        // as the first choice whenever present.
+        if composite && cmap.is_none() {
+            if let Some(map) = orig_font.to_unicode.as_ref() {
+                let width = match map.code_byte_lengths() {
+                    &[width] => usize::from(width),
+                    _ => 2,
+                };
+                return bytes.chunks(width).all(|chunk| {
+                    let code = chunk.iter().fold(0u32, |v, &b| (v << 8) | b as u32);
+                    map.lookup_with_length(code, chunk.len() as u8)
+                        .or_else(|| map.lookup(code))
+                        .is_some_and(|s| !s.is_empty())
+                });
+            }
+        }
+        let mut offset = 0usize;
+        while offset < bytes.len() {
+            let Some((code, length, raw, end)) = next_text_code(cmap, composite, bytes, offset)
+            else {
+                return false;
+            };
+            offset = end;
+            if !orig_font.can_decode_code(code, length as u8, raw) {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Keep optional fallback and clipping state off the main decoding stack.
     #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
     fn paint_positioned_text(
         &mut self,
         bytes: &[u8],
@@ -6346,11 +6971,8 @@ impl<'a> ContentInterpreter<'a> {
         font_size: f32,
         h_scale: f32,
         repair: bool,
+        unreadable_embedded: bool,
     ) {
-        let resolved_runs = self
-            .current_font_id
-            .and_then(|font_id| self.resolve_text_glyphs(font_id, bytes, &mut glyphs, repair));
-
         // Only emit a glyph run when a font is actually active; with no font the
         // glyph IDs would be raw, unmappable codes aliased onto font 0.
         // Text render mode 3 (invisible, the OCR-layer case) and 7 (clip only)
@@ -6367,6 +6989,19 @@ impl<'a> ContentInterpreter<'a> {
             _ => cs_produces_no_marks(&self.current.fill_cs),
         };
         let invisible = matches!(self.current.render_mode, 3 | 7) || no_marks;
+        let wants_clip = matches!(self.current.render_mode, 4..=7);
+        let paints = !invisible && !self.oc_suppressed();
+        // Gate drawing-font resolution on whether the show actually paints or
+        // contributes a clip so disabled-OCG and `/None`-colorant shows never
+        // permanently consume page font-cache budget.
+        if !paints && !wants_clip {
+            return;
+        }
+
+        let resolved_runs = self.current_font_id.and_then(|font_id| {
+            self.resolve_text_glyphs(font_id, bytes, &mut glyphs, repair, unreadable_embedded)
+        });
+
         // Text render modes 4–7 also *add the glyph outlines to the clipping
         // path* (applied at ET). Accumulate them in page space now — regardless
         // of whether the run is also painted (4=fill+clip, 5=stroke+clip,
@@ -6376,7 +7011,19 @@ impl<'a> ContentInterpreter<'a> {
             1 | 5 => self.current.stroke_pattern.clone(),
             _ => self.current.fill_pattern.clone(),
         };
-        let wants_clip = matches!(self.current.render_mode, 4..=7);
+        if let Some(font_id) = self.current_font_id {
+            if !glyphs.is_empty() || resolved_runs.is_some() {
+                if unreadable_embedded {
+                    self.ensure_lazy_embedded_fallback(font_id);
+                }
+                self.check_embedded_fallback_outlines(
+                    font_id,
+                    bytes,
+                    &glyphs,
+                    resolved_runs.as_deref(),
+                );
+            }
+        }
         // No font at all leaves the shown codes without any outline source.
         let mut outlines_unavailable = self.current_font_id.is_none();
         // Per resolved run: true when its font has no outlines to clip with.
@@ -6436,7 +7083,7 @@ impl<'a> ContentInterpreter<'a> {
             }
         }
         if let Some(font_id) = self.current_font_id {
-            if (!glyphs.is_empty() || resolved_runs.is_some()) && !invisible {
+            if (!glyphs.is_empty() || resolved_runs.is_some()) && paints {
                 if matches!(self.current.render_mode, 1 | 2 | 5 | 6) {
                     if let Some(runs) = resolved_runs {
                         for (id, glyphs) in runs {
@@ -6544,21 +7191,34 @@ impl<'a> ContentInterpreter<'a> {
         bytes: &[u8],
         glyphs: &mut Vec<PositionedGlyph>,
         repair: bool,
+        unreadable_embedded: bool,
     ) -> Option<Vec<(FontId, Vec<PositionedGlyph>)>> {
         if self.current.render_mode == 3 || glyphs.is_empty() {
             return None;
         }
         let max_bytes = self.max_font_cache_bytes;
+        let file = self.file;
+        let shared_doc = self.shared_font_doc;
         let scope = crate::font_repair::RepairScope {
             page: self.resources,
             forms: &self.form_font_overrides,
         };
         let repairs = &mut self.font_repair;
+        let mut fallback_cmap_budget = zpdf_font::CMAP_PROBE_BUDGET;
+        let mut glyph_health = self
+            .embedded_glyph_health
+            .iter_mut()
+            .find(|(id, _)| *id == font_id)
+            .map(|(_, health)| health);
         let cache = self.font_cache.as_deref_mut()?;
-        let provider = cache
-            .provider()
+        let provider_arc = cache.provider().cloned();
+        let provider = provider_arc
+            .as_ref()
             .is_some_and(|provider| provider.generation() != 0);
-        if !provider && !repair {
+        let has_companion = cache.has_embedded_companion_for_budget(font_id, max_bytes)
+            || (unreadable_embedded
+                && cache.has_descriptor_substitute_for_budget(font_id, max_bytes));
+        if !provider && !repair && !has_companion {
             return None;
         }
         let composite = matches!(
@@ -6567,27 +7227,45 @@ impl<'a> ContentInterpreter<'a> {
         );
         let cmap = cache.get(font_id)?.cid_cmap.as_ref();
         let mut check_offset = 0usize;
-        if !repair
-            && cache.original_glyphs_usable(
-                font_id,
-                glyphs.iter().map(|glyph| {
-                    let (code, length, raw, end) = next_text_code(
-                        cmap,
-                        composite,
-                        bytes,
-                        check_offset,
+        if !repair && !unreadable_embedded {
+            let all_covered =
+                if has_companion {
+                    cache.get(font_id).is_some_and(|font| {
+                        font.fallback_glyphs_complete(
+                            font,
+                            glyphs.iter().map(|glyph| {
+                                let (code, length, raw, end) =
+                                    next_text_code(cmap, composite, bytes, check_offset)
+                                        .unwrap_or((0, 0, 0, bytes.len()));
+                                check_offset = end;
+                                (glyph.glyph_id, code, raw, length as u8)
+                            }),
+                        )
+                    })
+                } else {
+                    cache.original_glyphs_usable(
+                        font_id,
+                        glyphs.iter().map(|glyph| {
+                            let (code, length, raw, end) = next_text_code(
+                                cmap,
+                                composite,
+                                bytes,
+                                check_offset,
+                            )
+                            .unwrap_or((0, 0, 0, bytes.len()));
+                            check_offset = end;
+                            (glyph.glyph_id, code, raw, length as u8)
+                        }),
                     )
-                    .unwrap_or((0, 0, 0, bytes.len()));
-                    check_offset = end;
-                    (glyph.glyph_id, code, raw, length as u8)
-                }),
-            )
-        {
-            return None;
+                };
+            if all_covered {
+                return None;
+            }
         }
         let mut ids: Option<Vec<FontId>> = None;
         let mut offset = 0;
         let mut previous = None;
+        let mut run_loaded_companion: Option<std::sync::Arc<zpdf_font::LoadedFont>> = None;
         for (index, glyph) in glyphs.iter_mut().enumerate() {
             let cmap = cache.get(font_id)?.cid_cmap.as_ref();
             let (code, length, raw, end) = next_text_code(cmap, composite, bytes, offset)?;
@@ -6599,7 +7277,10 @@ impl<'a> ContentInterpreter<'a> {
             let key = (code, raw, length, original.glyph_id);
             // Adjacent repeats share a resolution within this positioned text
             // operation. Later operations still observe provider generation.
-            let suspicious = repair && repairs.is_suspicious(font_id, original.glyph_id);
+            let suspicious = repair
+                && cache.get(font_id).is_some_and(|font| {
+                    repairs.is_suspicious(font_id, font, original.glyph_id, code, raw, length as u8)
+                });
             let drawing = match previous {
                 Some((previous_key, drawing)) if previous_key == key => drawing,
                 _ => {
@@ -6610,14 +7291,108 @@ impl<'a> ContentInterpreter<'a> {
                     };
                     let drawing = match sibling {
                         Some(sibling) => sibling,
-                        None if provider => cache.resolve_drawing_glyph(
-                            original,
-                            code,
-                            raw,
-                            length as u8,
-                            max_bytes,
-                        ),
-                        None => original,
+                        None => {
+                            let embedded = if has_companion {
+                                let (original_unreadable, cmap_budget) =
+                                    if !unreadable_embedded || original.glyph_id == 0 {
+                                        (Some(false), None)
+                                    } else if let Some(health) = glyph_health.as_deref_mut() {
+                                        let known = match health.get(original.glyph_id) {
+                                            Some(CachedGlyphHealth::Readable) => Some(false),
+                                            Some(CachedGlyphHealth::Unreadable) => Some(true),
+                                            Some(CachedGlyphHealth::CodeDependentBlank {
+                                                fallback,
+                                            }) => cache
+                                                .get(font_id)
+                                                .and_then(|f| {
+                                                    f.code_dependent_blank_is_unreadable(
+                                                        code,
+                                                        raw,
+                                                        length as u8,
+                                                    )
+                                                })
+                                                .or(fallback),
+                                            None => None,
+                                        };
+                                        (known, Some(&mut health.cmap_budget))
+                                    } else {
+                                        (None, Some(&mut fallback_cmap_budget))
+                                    };
+                                cache.resolve_embedded_companion_glyph_in_run(
+                                    original,
+                                    code,
+                                    raw,
+                                    length as u8,
+                                    max_bytes,
+                                    original_unreadable,
+                                    cmap_budget,
+                                    Some(&mut run_loaded_companion),
+                                    |source, remaining| {
+                                        let Some(file) = file else {
+                                            return zpdf_font::DeferredCompanionLoad::Unavailable;
+                                        };
+                                        let loaded = match source {
+                                            zpdf_font::CompanionSource::Object(font_ref) => {
+                                                shared_doc
+                                                    .filter(|doc| {
+                                                        std::ptr::eq(doc.file(), file)
+                                                            && match (
+                                                                doc.font_provider(),
+                                                                provider_arc.as_ref(),
+                                                            ) {
+                                                                (None, None) => true,
+                                                                (Some(a), Some(b)) => {
+                                                                    std::sync::Arc::ptr_eq(a, b)
+                                                                }
+                                                                _ => false,
+                                                            }
+                                                    })
+                                                    .and_then(|doc| {
+                                                        doc.cached_shared_font_companion(*font_ref)
+                                                    })
+                                                    .or_else(|| {
+                                                        zpdf_document::font_loader::load_embedded_companion_ref(
+                                                            file, *font_ref, remaining,
+                                                        )
+                                                        .map(std::sync::Arc::new)
+                                                    })
+                                            }
+                                            zpdf_font::CompanionSource::FormInlineFont {
+                                                form_id,
+                                                font_name,
+                                            } => {
+                                                zpdf_document::font_loader::load_embedded_companion_form_inline(
+                                                    file, *form_id, font_name, remaining,
+                                                )
+                                                .map(std::sync::Arc::new)
+                                            }
+                                            zpdf_font::CompanionSource::None => None,
+                                        };
+                                        match loaded {
+                                            Some(comp) => {
+                                                zpdf_font::DeferredCompanionLoad::Loaded(comp)
+                                            }
+                                            None => {
+                                                zpdf_font::DeferredCompanionLoad::FailedForBudget
+                                            }
+                                        }
+                                    },
+                                )
+                            } else {
+                                None
+                            };
+                            match embedded {
+                                Some(embedded) => embedded,
+                                None if provider => cache.resolve_drawing_glyph(
+                                    original,
+                                    code,
+                                    raw,
+                                    length as u8,
+                                    max_bytes,
+                                ),
+                                None => original,
+                            }
+                        }
                     };
                     previous = Some((key, drawing));
                     drawing
@@ -7074,7 +7849,7 @@ fn load_font_ref(
     font_ref: ObjectId,
     name: &str,
     max_bytes: u64,
-) -> Result<(), zpdf_core::Error> {
+) -> Result<Option<zpdf_core::ProcessingDiagnostics>, zpdf_core::Error> {
     let shared = doc.filter(|doc| {
         std::ptr::eq(doc.file(), file)
             && match (doc.font_provider(), fc.provider()) {
@@ -7083,23 +7858,48 @@ fn load_font_ref(
                 _ => false,
             }
     });
-    let inserted = match shared {
-        Some(doc) => {
-            let font = doc.shared_font(font_ref)?;
-            fc.try_insert_shared_with_limit(name.to_string(), font, max_bytes)
-        }
+    let (font, diagnostics, companion, descriptor_spec) = match shared {
+        Some(doc) => doc.shared_font_with_fallback(font_ref)?,
         None => {
-            let font = zpdf_document::font_loader::load_single_font_with_provider(
-                file,
-                font_ref,
-                fc.provider().map(|provider| provider.as_ref()),
-            )?;
-            fc.try_insert_with_limit(name.to_string(), font, max_bytes)
+            let (font, diagnostics, companion, descriptor_spec) =
+                zpdf_document::font_loader::load_single_font_with_fallback(
+                    file,
+                    font_ref,
+                    fc.provider().map(|provider| provider.as_ref()),
+                )?;
+            (
+                std::sync::Arc::new(font),
+                diagnostics,
+                companion.map(std::sync::Arc::new),
+                descriptor_spec,
+            )
         }
     };
-    inserted
-        .map(|_| ())
-        .ok_or_else(|| font_cache_full(max_bytes))
+    match fc.admit_with_diagnostics(
+        name.to_string(),
+        font,
+        diagnostics,
+        Some(font_ref),
+        max_bytes,
+    ) {
+        Ok(fid) => {
+            if fc.get(fid).is_some_and(|f| f.has_font_data()) {
+                if let Some(spec) = descriptor_spec {
+                    fc.record_descriptor_substitute(fid, spec, max_bytes);
+                } else if companion.is_some() {
+                    let _ = fc.record_companion(
+                        fid,
+                        zpdf_font::CompanionKind::EmbeddedOriginal,
+                        zpdf_font::CompanionSource::Object(font_ref),
+                        companion,
+                        max_bytes,
+                    );
+                }
+            }
+            Ok(None)
+        }
+        Err(unadmitted) => Ok(Some(unadmitted)),
+    }
 }
 
 /// Content key for an inline font dictionary: the same dictionary always
@@ -7109,12 +7909,6 @@ fn inline_font_key(font_dict: &zpdf_core::PdfDict) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     format!("{font_dict:?}").hash(&mut hasher);
     hasher.finish()
-}
-
-fn font_cache_full(max_bytes: u64) -> zpdf_core::Error {
-    zpdf_core::Error::StreamDecode(format!(
-        "font cache byte limit ({max_bytes}) or ID capacity reached"
-    ))
 }
 
 /// Build the tiling pattern `obj` (object `pat_id`, resource `name`), with its
@@ -8613,6 +9407,7 @@ mod tests {
         let glyphs = vec![
             PositionedGlyph {
                 glyph_id: 26,
+                code_len: 0,
                 code: 0,
                 x: 0.0,
                 y: 0.0,
@@ -8620,6 +9415,7 @@ mod tests {
             },
             PositionedGlyph {
                 glyph_id: 42,
+                code_len: 0,
                 code: 0,
                 x: 50.0,
                 y: 0.0,

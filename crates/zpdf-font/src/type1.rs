@@ -145,6 +145,123 @@ impl Type1Font {
         self.name_to_gid.get(name).copied()
     }
 
+    /// Whether sampled non-space charstrings decode into usable outlines rather
+    /// than failing or producing empty output across the whole font.
+    pub fn has_usable_outlines(&self) -> bool {
+        self.probe_outlines() != crate::EmbeddedOutlineProbe::Unusable
+    }
+
+    /// Classify sampled non-space charstrings as completely healthy, partially
+    /// corrupt (usable as primary, with failing charstrings), or unusable.
+    pub(crate) fn probe_outlines(&self) -> crate::EmbeddedOutlineProbe {
+        let non_blank: Vec<&str> = self
+            .gid_to_name
+            .iter()
+            .map(String::as_str)
+            .filter(|name| !matches!(*name, "" | ".notdef" | "space" | "nbspace" | "uni00A0"))
+            .collect();
+        if non_blank.is_empty() {
+            return crate::EmbeddedOutlineProbe::Healthy;
+        }
+        let step = (non_blank.len() / 32).max(1);
+        let mut drawn = 0u32;
+        let mut failed = 0u32;
+        let mut i = 0;
+        while i < non_blank.len() {
+            let name = non_blank[i];
+            if let Some(cs) = self.char_strings.get(name) {
+                let mut interp = Interp::new();
+                interp.run(cs, &self.subrs, 0);
+                if interp.failed || !interp.done {
+                    failed += 1;
+                } else if let Some(seac) = interp.seac {
+                    if self.compose_seac(&interp, seac, 1).is_some() {
+                        drawn += 1;
+                    } else {
+                        failed += 1;
+                    }
+                } else if has_drawable_segment(&interp.cmds) {
+                    drawn += 1;
+                } else if crate::glyph_list::glyph_name_to_string(name)
+                    .is_some_and(|s| crate::resolution::is_visible_text(&s))
+                {
+                    failed += 1;
+                }
+            }
+            i += step;
+        }
+        if failed > 0 && failed > drawn {
+            crate::EmbeddedOutlineProbe::Unusable
+        } else if failed > 0 {
+            crate::EmbeddedOutlineProbe::PartiallyCorrupt
+        } else {
+            crate::EmbeddedOutlineProbe::Healthy
+        }
+    }
+
+    /// Classify `gid`'s embedded charstring for drawing-font resolution:
+    /// drawable path (`Drawn`), valid no-ink charstring such as `/space`
+    /// (`Blank`), or missing / failing / damaged empty visible charstring
+    /// (`Missing`).
+    pub(crate) fn glyph_state_by_gid(&self, gid: u16) -> crate::resolution::GlyphState {
+        let Some(name) = self.gid_to_name.get(gid as usize) else {
+            return crate::resolution::GlyphState::Missing;
+        };
+        if name.is_empty() || name == ".notdef" {
+            return crate::resolution::GlyphState::Missing;
+        }
+        let Some(cs) = self.char_strings.get(name) else {
+            return crate::resolution::GlyphState::Missing;
+        };
+        let mut interp = Interp::new();
+        interp.run(cs, &self.subrs, 0);
+        if interp.failed || !interp.done {
+            return crate::resolution::GlyphState::Missing;
+        }
+        if let Some(seac) = interp.seac {
+            return if self.compose_seac(&interp, seac, 1).is_some() {
+                crate::resolution::GlyphState::Drawn
+            } else {
+                crate::resolution::GlyphState::Missing
+            };
+        }
+        if has_drawable_segment(&interp.cmds) {
+            crate::resolution::GlyphState::Drawn
+        } else if crate::glyph_list::glyph_name_to_string(name)
+            .is_some_and(|s| crate::resolution::is_visible_text(&s))
+        {
+            crate::resolution::GlyphState::Missing
+        } else {
+            crate::resolution::GlyphState::Blank
+        }
+    }
+
+    /// Whether `gid` maps to a present non-`.notdef` charstring whose outline
+    /// is physically blank (no drawing commands and not a known visible glyph
+    /// name), such as `/space` or a custom subset glyph name `/g3`.
+    pub(crate) fn is_blank_gid(&self, gid: u16) -> bool {
+        let Some(name) = self.gid_to_name.get(gid as usize) else {
+            return false;
+        };
+        if name.is_empty() || name == ".notdef" || !self.char_strings.contains_key(name) {
+            return false;
+        }
+        self.glyph_state_by_gid(gid) == crate::resolution::GlyphState::Blank
+    }
+
+    /// Whether `gid` maps to an embedded charstring whose execution fails or
+    /// emits no path for a known visible character name (as opposed to an
+    /// unmapped `.notdef`, a space / no-ink character, or an unknown name).
+    pub(crate) fn is_gid_unreadable(&self, gid: u16) -> bool {
+        let Some(name) = self.gid_to_name.get(gid as usize) else {
+            return false;
+        };
+        if name.is_empty() || name == ".notdef" || !self.char_strings.contains_key(name) {
+            return false;
+        }
+        self.glyph_state_by_gid(gid) == crate::resolution::GlyphState::Missing
+    }
+
     /// Built-in encoding glyph name for a character code.
     pub fn builtin_name(&self, code: u8) -> Option<&str> {
         self.builtin_encoding
@@ -181,14 +298,14 @@ impl Type1Font {
         let mut interp = Interp::new();
         interp.run(cs, &self.subrs, 0);
 
-        if interp.failed {
+        if interp.failed || !interp.done {
             return None;
         }
 
         if let Some(seac) = interp.seac {
             return self.compose_seac(&interp, seac, depth + 1);
         }
-        if interp.cmds.is_empty() {
+        if !has_drawable_segment(&interp.cmds) {
             return None;
         }
         Some(GlyphOutline {
@@ -264,6 +381,15 @@ impl Type1Font {
             advance_width: interp.width,
         })
     }
+}
+
+fn has_drawable_segment(cmds: &[OutlineCommand]) -> bool {
+    cmds.iter().any(|cmd| {
+        matches!(
+            cmd,
+            OutlineCommand::LineTo(..) | OutlineCommand::QuadTo(..) | OutlineCommand::CurveTo(..)
+        )
+    })
 }
 
 fn translate_cmd(c: OutlineCommand, dx: f64, dy: f64) -> OutlineCommand {
@@ -392,7 +518,8 @@ impl Interp {
                 32..=246 => self.stack.push(b as f64 - 139.0),
                 247..=250 => {
                     if i >= cs.len() {
-                        break;
+                        self.failed = true;
+                        return;
                     }
                     let w = cs[i] as f64;
                     i += 1;
@@ -400,7 +527,8 @@ impl Interp {
                 }
                 251..=254 => {
                     if i >= cs.len() {
-                        break;
+                        self.failed = true;
+                        return;
                     }
                     let w = cs[i] as f64;
                     i += 1;
@@ -408,7 +536,8 @@ impl Interp {
                 }
                 255 => {
                     if i + 4 > cs.len() {
-                        break;
+                        self.failed = true;
+                        return;
                     }
                     let v = i32::from_be_bytes([cs[i], cs[i + 1], cs[i + 2], cs[i + 3]]);
                     i += 4;
@@ -511,10 +640,21 @@ impl Interp {
                         let idx = idx as i64;
                         if idx >= 0 && (idx as usize) < subrs.len() {
                             self.run(&subrs[idx as usize], subrs, depth + 1);
+                        } else {
+                            self.failed = true;
+                            return;
                         }
+                    } else {
+                        self.failed = true;
+                        return;
                     }
                 }
-                11 => return, // return
+                11 => {
+                    if depth == 0 {
+                        self.failed = true;
+                    }
+                    return; // return
+                }
                 14 => {
                     // endchar
                     self.close();
@@ -523,7 +663,8 @@ impl Interp {
                 }
                 12 => {
                     if i >= cs.len() {
-                        break;
+                        self.failed = true;
+                        return;
                     }
                     let b2 = cs[i];
                     i += 1;
@@ -541,6 +682,13 @@ impl Interp {
                 self.failed = true;
                 return;
             }
+        }
+        // Adobe Type 1 Font Format §8: a top-level charstring must finish with
+        // `endchar` or `seac`, and a subroutine must finish with `return`
+        // (exiting early above) or `endchar`/`seac`. Reaching EOF with `!done`
+        // at any depth is a truncated charstring or subroutine.
+        if !self.done {
+            self.failed = true;
         }
     }
 
@@ -757,41 +905,74 @@ fn parse_font_matrix(clear: &[u8]) -> Option<[f64; 6]> {
 
 fn parse_builtin_encoding(clear: &[u8]) -> Vec<Option<String>> {
     let mut enc: Vec<Option<String>> = vec![None; 256];
-    if let Some(pos) = find(clear, b"/Encoding") {
-        let region = &clear[pos..];
-        if find_token(region, b"StandardEncoding").is_some() {
-            for (i, slot) in enc.iter_mut().enumerate() {
-                *slot = STANDARD_ENCODING[i].map(|s| s.to_string());
+    let mut p = 0;
+    // Locate the top-level `/Encoding` declaration, skipping `%` comments,
+    // string literals such as `/Notice (/Encoding StandardEncoding)`, and
+    // `{ ... }` procedure bodies such as `/ReadEncoding { /Encoding get } bind def`.
+    let mut brace_depth = 0usize;
+    let mut found_encoding = false;
+    while let Some((tok, next_p)) = next_ps_token(clear, p) {
+        p = next_p;
+        match tok {
+            b"{" => brace_depth += 1,
+            b"}" => brace_depth = brace_depth.saturating_sub(1),
+            b"/Encoding" if brace_depth == 0 => {
+                found_encoding = true;
+                break;
             }
-            return enc;
+            _ => {}
         }
-        // Custom: a sequence of `dup <code> /<name> put`.
-        let mut i = 0;
-        while let Some(rel) = find(&region[i..], b"dup ") {
-            let mut p = i + rel + 4;
-            let (code, np) = match read_uint(region, p) {
-                Some(v) => v,
-                None => {
-                    i = p;
-                    continue;
-                }
-            };
-            p = np;
-            while p < region.len() && is_ws(region[p]) {
-                p += 1;
+    }
+    if !found_encoding {
+        return enc;
+    }
+
+    // Read only `/Encoding`'s own declaration (stopping at its closing `def`
+    // at brace depth 0) so later metadata such as `/Notice (StandardEncoding)`
+    // in `FontInfo` cannot overwrite a custom encoding.
+    let Some((first_tok, next_p)) = next_ps_token(clear, p) else {
+        return enc;
+    };
+    if first_tok == b"StandardEncoding" {
+        for (i, slot) in enc.iter_mut().enumerate() {
+            *slot = STANDARD_ENCODING[i].map(|s| s.to_string());
+        }
+        p = next_p;
+    }
+
+    let mut brace_depth = 0usize;
+    while let Some((tok, next_p)) = next_ps_token(clear, p) {
+        p = next_p;
+        match tok {
+            b"{" => {
+                brace_depth += 1;
+                continue;
             }
-            if p < region.len() && region[p] == b'/' {
-                p += 1;
-                let start = p;
-                while p < region.len() && !is_ws(region[p]) && !is_delim(region[p]) {
-                    p += 1;
-                }
-                if code < 256 && p - start <= MAX_GLYPH_NAME_LEN {
-                    let name = String::from_utf8_lossy(&region[start..p]).into_owned();
-                    enc[code] = Some(name);
-                }
+            b"}" => {
+                brace_depth = brace_depth.saturating_sub(1);
+                continue;
             }
-            i = p;
+            b"def" if brace_depth == 0 => break,
+            b"dup" if brace_depth == 0 => {}
+            _ => continue,
+        }
+        let Some((code_tok, p1)) = next_ps_token(clear, p) else {
+            break;
+        };
+        let Some(code) = parse_ps_int(code_tok).and_then(|v| usize::try_from(v).ok()) else {
+            // Re-inspect `code_tok` on the next iteration (e.g. `def` or `dup`).
+            continue;
+        };
+        let Some((name_tok, p2)) = next_ps_token(clear, p1) else {
+            break;
+        };
+        if let Some(name_bytes) = name_tok.strip_prefix(b"/") {
+            if code < 256 && name_bytes.len() <= MAX_GLYPH_NAME_LEN {
+                enc[code] = Some(String::from_utf8_lossy(name_bytes).into_owned());
+            }
+            p = p2;
+        } else {
+            p = p1;
         }
     }
     enc
@@ -809,146 +990,216 @@ fn decrypt_charstring(data: &[u8], len_iv: i32) -> Vec<u8> {
 }
 
 fn parse_len_iv(private: &[u8]) -> Option<i32> {
-    let pos = find(private, b"/lenIV")?;
-    let (v, _) = read_int(private, pos + 6)?;
+    let pos = find_private_name(private, b"/lenIV")?;
+    let (tok, _) = next_ps_token(private, pos)?;
+    let v = parse_ps_int(tok)?;
     i32::try_from(v).ok()
 }
 
 fn parse_subrs(private: &[u8], len_iv: i32) -> Vec<Vec<u8>> {
     let mut subrs: Vec<Vec<u8>> = Vec::new();
-    let start = match find(private, b"/Subrs") {
-        Some(s) => s,
-        None => return subrs,
+    let Some(start) = find_private_name(private, b"/Subrs") else {
+        return subrs;
     };
-    // Optional count to pre-size.
-    if let Some((count, _)) = read_int(private, start + 6) {
-        if (0..MAX_TYPE1_SUBRS as i64).contains(&count) {
-            subrs.resize(count as usize, Vec::new());
+    let mut p = start;
+    // Optional count to pre-size: `/Subrs <count> array`.
+    if let Some((tok, _)) = next_ps_token(private, p) {
+        if let Some(count) = parse_ps_int(tok) {
+            if (0..MAX_TYPE1_SUBRS as i64).contains(&count) {
+                subrs.resize(count as usize, Vec::new());
+            }
         }
     }
-    let mut i = start;
-    // Stop scanning at CharStrings (the next section).
-    let end = find(private, b"/CharStrings").unwrap_or(private.len());
-    while i < end {
-        let rel = match find(&private[i..end], b"dup ") {
-            Some(r) => r,
-            None => break,
-        };
-        let mut p = i + rel + 4;
-        let idx = match read_int(private, p) {
-            Some((v, np)) => {
-                p = np;
-                v
-            }
-            None => {
-                i = i + rel + 4;
+
+    // Scan PostScript tokens from `/Subrs` until the real `/CharStrings`
+    // literal name, skipping `%` comments, literal strings, `{ ... }`
+    // procedure bodies, and every length-delimited `RD`/`-|` binary payload.
+    let mut brace_depth = 0usize;
+    let mut prev_int: Option<i64> = None;
+    while let Some((tok, next_p)) = next_ps_token(private, p) {
+        p = next_p;
+        match tok {
+            b"{" => {
+                brace_depth += 1;
+                prev_int = None;
                 continue;
             }
-        };
-        let len = match read_int(private, p) {
-            Some((v, np)) => {
-                p = np;
-                v
-            }
-            None => {
-                i = p;
+            b"}" => {
+                brace_depth = brace_depth.saturating_sub(1);
+                prev_int = None;
                 continue;
             }
-        };
-        // Binary token: RD or -|
-        let (tok, np) = read_token(private, p);
-        p = np;
-        if tok != b"RD" && tok != b"-|" {
-            i = p;
+            _ if brace_depth > 0 => continue,
+            _ => {}
+        }
+        if tok == b"/CharStrings" {
+            break;
+        }
+        if tok == b"dup" {
+            prev_int = None;
+            let Some((idx_tok, p1)) = next_ps_token(private, p) else {
+                break;
+            };
+            let Some(idx) = parse_ps_int(idx_tok) else {
+                // Re-inspect `idx_tok` on the next iteration so tokens such as
+                // `/CharStrings` or a nested `dup` are not skipped.
+                continue;
+            };
+            let Some((len_tok, p2)) = next_ps_token(private, p1) else {
+                break;
+            };
+            let Some(len) = parse_ps_int(len_tok) else {
+                prev_int = Some(idx);
+                p = p1;
+                continue;
+            };
+            let Some((rd_tok, p3)) = next_ps_token(private, p2) else {
+                break;
+            };
+            if rd_tok != b"RD" && rd_tok != b"-|" {
+                prev_int = Some(len);
+                p = p2;
+                continue;
+            }
+            let Some(data_start) = p3.checked_add(1) else {
+                break;
+            }; // single separator byte
+            let Ok(len_usize) = usize::try_from(len) else {
+                p = p3;
+                continue;
+            };
+            let Some(data_end) = data_start.checked_add(len_usize) else {
+                break;
+            };
+            if data_end > private.len() {
+                break;
+            }
+            let cs = decrypt_charstring(&private[data_start..data_end], len_iv);
+            if idx >= 0 {
+                let idx = idx as usize;
+                if idx < MAX_TYPE1_SUBRS {
+                    if idx >= subrs.len() {
+                        subrs.resize(idx + 1, Vec::new());
+                    }
+                    subrs[idx] = cs;
+                }
+            }
+            p = data_end;
             continue;
         }
-        let Some(data_start) = p.checked_add(1) else {
-            break;
-        }; // single separator space
-        let len = len.max(0) as usize;
-        let Some(end) = data_start.checked_add(len) else {
-            break;
-        };
-        if len > private.len() || end > private.len() {
-            break;
-        }
-        let cs = decrypt_charstring(&private[data_start..end], len_iv);
-        if idx >= 0 {
-            let idx = idx as usize;
-            if idx >= MAX_TYPE1_SUBRS {
-                i = end;
-                continue;
+        // Skip any other length-delimited `RD`/`-|` payload so raw binary bytes
+        // cannot be mistaken for `dup` or `/CharStrings`.
+        if (tok == b"RD" || tok == b"-|") && prev_int.is_some_and(|n| n >= 0) {
+            let len_usize = prev_int.unwrap() as usize;
+            prev_int = None;
+            let Some(data_start) = p.checked_add(1) else {
+                break;
+            };
+            let Some(data_end) = data_start.checked_add(len_usize) else {
+                break;
+            };
+            if data_end > private.len() {
+                break;
             }
-            if idx >= subrs.len() {
-                subrs.resize(idx + 1, Vec::new());
-            }
-            subrs[idx] = cs;
+            p = data_end;
+            continue;
         }
-        i = end;
+        prev_int = parse_ps_int(tok);
     }
     subrs
 }
 
 fn parse_charstrings(private: &[u8], len_iv: i32) -> HashMap<String, Vec<u8>> {
     let mut out = HashMap::new();
-    let start = match find(private, b"/CharStrings") {
-        Some(s) => s,
-        None => return out,
+    let Some(start) = find_private_name(private, b"/CharStrings") else {
+        return out;
     };
-    // Skip to the dictionary body (after "begin").
-    let mut i = match find(&private[start..], b"begin") {
-        Some(b) => start + b + 5,
-        None => start + 12,
-    };
-    while i < private.len() {
+    // Skip to the dictionary body (after `begin`), falling back to `start` if
+    // a malformed font omits `begin` before the first `/<name>` entry.
+    let mut scan = start;
+    let mut p = start;
+    let mut brace_depth = 0usize;
+    while let Some((tok, next_p)) = next_ps_token(private, scan) {
+        scan = next_p;
+        match tok {
+            b"{" => {
+                brace_depth += 1;
+                continue;
+            }
+            b"}" => {
+                brace_depth = brace_depth.saturating_sub(1);
+                continue;
+            }
+            _ if brace_depth > 0 => continue,
+            _ => {}
+        }
+        if tok == b"begin" {
+            p = next_p;
+            break;
+        }
+        if tok.starts_with(b"/") {
+            break;
+        }
+    }
+    brace_depth = 0;
+    while let Some((tok, next_p)) = next_ps_token(private, p) {
         if out.len() >= MAX_TYPE1_GLYPHS {
             break;
         }
-        // Next glyph entry starts with '/'.
-        let rel = match private[i..].iter().position(|&b| b == b'/') {
-            Some(r) => r,
-            None => break,
-        };
-        let mut p = i + rel + 1;
-        let name_start = p;
-        while p < private.len() && !is_ws(private[p]) && !is_delim(private[p]) {
-            p += 1;
-        }
-        if p - name_start > MAX_GLYPH_NAME_LEN {
-            i = p;
-            continue;
-        }
-        let name = String::from_utf8_lossy(&private[name_start..p]).into_owned();
-
-        let len = match read_int(private, p) {
-            Some((v, np)) => {
-                p = np;
-                v
-            }
-            None => {
-                i = p;
+        p = next_p;
+        match tok {
+            b"{" => {
+                brace_depth += 1;
                 continue;
             }
-        };
-        let (tok, np) = read_token(private, p);
-        p = np;
-        if tok != b"RD" && tok != b"-|" {
-            // Not a charstring entry (e.g. reached "end"); stop.
+            b"}" => {
+                brace_depth = brace_depth.saturating_sub(1);
+                continue;
+            }
+            _ if brace_depth > 0 => continue,
+            _ => {}
+        }
+        if tok == b"end" {
             break;
         }
-        let Some(data_start) = p.checked_add(1) else {
-            break;
-        }; // single separator space
-        let len = len.max(0) as usize;
-        let Some(end) = data_start.checked_add(len) else {
+        let Some(name_bytes) = tok.strip_prefix(b"/") else {
+            continue;
+        };
+        let Some((len_tok, p1)) = next_ps_token(private, p) else {
             break;
         };
-        if end > private.len() {
+        let Some(len) = parse_ps_int(len_tok) else {
+            continue;
+        };
+        let Some((rd_tok, p2)) = next_ps_token(private, p1) else {
+            break;
+        };
+        if rd_tok != b"RD" && rd_tok != b"-|" {
+            // Not a charstring entry; stop.
             break;
         }
-        let cs = decrypt_charstring(&private[data_start..end], len_iv);
-        out.insert(name, cs);
-        i = end;
+        let Some(data_start) = p2.checked_add(1) else {
+            break;
+        }; // single separator byte
+        let Ok(len) = usize::try_from(len) else {
+            p = p2;
+            continue;
+        };
+        let Some(data_end) = data_start.checked_add(len) else {
+            break;
+        };
+        if data_end > private.len() {
+            break;
+        }
+        p = data_end;
+        // Consume the length-delimited payload before enforcing the glyph name
+        // length limit so binary bytes (e.g. `(`) from a skipped entry are
+        // never fed back into the PostScript tokenizer.
+        if name_bytes.len() <= MAX_GLYPH_NAME_LEN {
+            let name = String::from_utf8_lossy(name_bytes).into_owned();
+            let cs = decrypt_charstring(&private[data_start..data_end], len_iv);
+            out.insert(name, cs);
+        }
     }
     out
 }
@@ -973,62 +1224,110 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
-/// Find a needle only when it stands as a whole token (delimited by whitespace).
-fn find_token(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    let mut from = 0;
-    while let Some(rel) = find(&haystack[from..], needle) {
-        let pos = from + rel;
-        let before_ok = pos == 0 || is_ws(haystack[pos - 1]);
-        let after = pos + needle.len();
-        let after_ok =
-            after >= haystack.len() || is_ws(haystack[after]) || is_delim(haystack[after]);
-        if before_ok && after_ok {
-            return Some(pos);
+/// Read the next PostScript token starting at or after `pos`, skipping leading
+/// whitespace and `%` comments. Literal strings `(...)` are consumed as a
+/// single token so comments or names inside them are not misinterpreted.
+fn next_ps_token(data: &[u8], mut p: usize) -> Option<(&[u8], usize)> {
+    while p < data.len() {
+        if is_ws(data[p]) {
+            p += 1;
+        } else if data[p] == b'%' {
+            // PostScript Language Reference §3.2: comments terminate on CR, LF,
+            // form feed (0x0C), or EOF.
+            while p < data.len() && !matches!(data[p], b'\n' | b'\r' | b'\x0c') {
+                p += 1;
+            }
+        } else {
+            break;
         }
-        from = pos + 1;
     }
-    None
-}
-
-/// Read a signed integer starting at/after `pos` (skipping leading whitespace).
-fn read_int(data: &[u8], mut pos: usize) -> Option<(i64, usize)> {
-    while pos < data.len() && is_ws(data[pos]) {
-        pos += 1;
-    }
-    let start = pos;
-    if pos < data.len() && (data[pos] == b'-' || data[pos] == b'+') {
-        pos += 1;
-    }
-    let digit_start = pos;
-    while pos < data.len() && data[pos].is_ascii_digit() {
-        pos += 1;
-    }
-    if pos == digit_start {
+    if p >= data.len() {
         return None;
     }
-    let v: i64 = std::str::from_utf8(&data[start..pos]).ok()?.parse().ok()?;
-    Some((v, pos))
-}
-
-fn read_uint(data: &[u8], pos: usize) -> Option<(usize, usize)> {
-    let (v, np) = read_int(data, pos)?;
-    if v < 0 {
-        None
-    } else {
-        Some((v as usize, np))
+    let start = p;
+    match data[p] {
+        b'(' => {
+            p += 1;
+            let mut depth = 1usize;
+            while p < data.len() && depth > 0 {
+                match data[p] {
+                    b'\\' => {
+                        p = (p + 2).min(data.len());
+                        continue;
+                    }
+                    b'(' => depth += 1,
+                    b')' => depth -= 1,
+                    _ => {}
+                }
+                p += 1;
+            }
+            Some((&data[start..p], p))
+        }
+        b'/' => {
+            p += 1;
+            if p < data.len() && data[p] == b'/' {
+                p += 1;
+            }
+            while p < data.len() && !is_ws(data[p]) && !is_delim(data[p]) {
+                p += 1;
+            }
+            Some((&data[start..p], p))
+        }
+        b if is_delim(b) => Some((&data[start..start + 1], start + 1)),
+        _ => {
+            while p < data.len() && !is_ws(data[p]) && !is_delim(data[p]) {
+                p += 1;
+            }
+            Some((&data[start..p], p))
+        }
     }
 }
 
-/// Read a whitespace-delimited token (skipping leading whitespace).
-fn read_token(data: &[u8], mut pos: usize) -> (&[u8], usize) {
-    while pos < data.len() && is_ws(data[pos]) {
-        pos += 1;
+fn parse_ps_int(tok: &[u8]) -> Option<i64> {
+    std::str::from_utf8(tok).ok()?.parse::<i64>().ok()
+}
+
+/// Find the byte offset immediately after a top-level PostScript literal name
+/// (such as `/Subrs`, `/CharStrings`, or `/lenIV`) in the decrypted private
+/// section, skipping `%` comments, string literals, `{ ... }` procedure
+/// bodies, and length-delimited `RD`/`-|` binary payloads.
+fn find_private_name(private: &[u8], name: &[u8]) -> Option<usize> {
+    let mut p = 0;
+    let mut brace_depth = 0usize;
+    let mut prev_int: Option<i64> = None;
+    while let Some((tok, next_p)) = next_ps_token(private, p) {
+        p = next_p;
+        match tok {
+            b"{" => {
+                brace_depth += 1;
+                prev_int = None;
+                continue;
+            }
+            b"}" => {
+                brace_depth = brace_depth.saturating_sub(1);
+                prev_int = None;
+                continue;
+            }
+            _ if brace_depth > 0 => continue,
+            _ => {}
+        }
+        if tok == name {
+            return Some(p);
+        }
+        if (tok == b"RD" || tok == b"-|") && prev_int.is_some_and(|n| n >= 0) {
+            let len = prev_int.unwrap() as usize;
+            prev_int = None;
+            let data_start = p.checked_add(1)?;
+            let data_end = data_start.checked_add(len)?;
+            if data_end > private.len() {
+                return None;
+            }
+            p = data_end;
+            continue;
+        }
+        prev_int = parse_ps_int(tok);
     }
-    let start = pos;
-    while pos < data.len() && !is_ws(data[pos]) {
-        pos += 1;
-    }
-    (&data[start..pos], pos)
+    None
 }
 
 #[cfg(test)]
@@ -1087,10 +1386,150 @@ mod tests {
     }
 
     #[test]
-    fn find_token_is_whole_word() {
-        let hay = b"/Encoding StandardEncoding def";
-        assert!(find_token(hay, b"StandardEncoding").is_some());
-        assert!(find_token(b"xStandardEncodingy", b"StandardEncoding").is_none());
+    fn parse_builtin_encoding_reads_its_own_declaration_and_ignores_fontinfo_strings() {
+        // Custom encoding mapping 65 -> /B followed by FontInfo metadata whose
+        // string contains `StandardEncoding` must preserve the custom mapping.
+        let custom_with_fontinfo = b"%!PS-AdobeFont-1.0\n\
+            8 dict begin\n\
+            /Encoding 256 array\n\
+            0 1 255 {1 index exch /.notdef put} for\n\
+            dup 65 /B put\n\
+            dup 66 /A put\n\
+            readonly def\n\
+            /FontInfo 1 dict dup begin\n\
+            /Notice (StandardEncoding) def\n\
+            end readonly def\n";
+        let enc = parse_builtin_encoding(custom_with_fontinfo);
+        assert_eq!(enc[65].as_deref(), Some("B"));
+        assert_eq!(enc[66].as_deref(), Some("A"));
+        assert_eq!(enc[67], None);
+
+        // A preceding FontInfo string mentioning `/Encoding StandardEncoding`
+        // must also be skipped as a string token.
+        let fontinfo_first = b"/FontInfo 1 dict dup begin\n\
+            /Notice (/Encoding StandardEncoding def) def\n\
+            end readonly def\n\
+            /Encoding 256 array dup 65 /B put readonly def\n";
+        let enc_first = parse_builtin_encoding(fontinfo_first);
+        assert_eq!(enc_first[65].as_deref(), Some("B"));
+        assert_eq!(enc_first[66], None);
+
+        // A helper procedure referencing `/Encoding` before the real encoding
+        // declaration must be skipped rather than terminating at the helper's `def`.
+        let helper_before_encoding = b"%!PS-AdobeFont-1.0\n\
+            8 dict begin\n\
+            /ReadEncoding { /Encoding get } bind def\n\
+            /NestedHelper { { /Encoding StandardEncoding } pop } bind def\n\
+            /Encoding 256 array\n\
+            0 1 255 {1 index exch /.notdef put} for\n\
+            dup 65 /B put\n\
+            dup 66 /A put\n\
+            readonly def\n";
+        let enc_helper = parse_builtin_encoding(helper_before_encoding);
+        assert_eq!(enc_helper[65].as_deref(), Some("B"));
+        assert_eq!(enc_helper[66].as_deref(), Some("A"));
+        assert_eq!(enc_helper[67], None);
+
+        // Actual `/Encoding StandardEncoding def` (even with an inline comment)
+        // still installs StandardEncoding.
+        let std_enc = parse_builtin_encoding(b"/Encoding % built-in\n StandardEncoding def");
+        assert_eq!(std_enc[65].as_deref(), Some("A"));
+        assert_eq!(std_enc[66].as_deref(), Some("B"));
+    }
+
+    #[test]
+    fn parse_subrs_recognizes_dup_token_with_any_postscript_whitespace() {
+        let ret: &[u8] = &[11];
+        let decoy: &[u8] = &[14];
+        let mut private = b"/lenIV -1 def\n/Subrs 4 array\n".to_vec();
+        // Decoy literal name `/dup`, comments (`%dup` / `% dup`), and suffix
+        // `mydup` must not match.
+        private.extend_from_slice(b"/dup 0 1 RD ");
+        private.extend_from_slice(decoy);
+        private.extend_from_slice(b" NP\n%dup 0 1 RD ");
+        private.extend_from_slice(decoy);
+        private.extend_from_slice(b" NP\n% dup 0 1 RD ");
+        private.extend_from_slice(decoy);
+        private.extend_from_slice(b" NP\nmydup 0 1 RD ");
+        private.extend_from_slice(decoy);
+        private.extend_from_slice(b" NP\n");
+        // Valid entries separated by tab, LF, CRLF, and delimiter + form-feed.
+        for (prefix, idx) in [
+            (&b"dup\t"[..], 0),
+            (&b"dup\n"[..], 1),
+            (&b"dup\r\n"[..], 2),
+            (&b"]dup\x0c"[..], 3),
+        ] {
+            private.extend_from_slice(prefix);
+            private.extend_from_slice(format!("{idx} 1 RD ").as_bytes());
+            private.extend_from_slice(ret);
+            private.extend_from_slice(b" NP\n");
+        }
+        private.extend_from_slice(b"ND\n/CharStrings 1 dict dup begin end");
+
+        let subrs = parse_subrs(&private, -1);
+        assert_eq!(subrs, vec![vec![11], vec![11], vec![11], vec![11]]);
+
+        // Custom /Encoding also recognizes `dup` separated by tab or newline.
+        let clear = b"/Encoding 256 array\ndup\t65 /A put\ndup\n66 /B put\nreadonly def";
+        let enc = parse_builtin_encoding(clear);
+        assert_eq!(enc[65].as_deref(), Some("A"));
+        assert_eq!(enc[66].as_deref(), Some("B"));
+    }
+
+    #[test]
+    fn parse_subrs_and_charstrings_ignore_comments_and_rd_payloads_mentioning_charstrings() {
+        let ret: &[u8] = &[11];
+        let payload_with_name: &[u8] = b"/CharStrings 0";
+        let glyph_a: &[u8] = &[139, 248, 236, 13, 139, 10, 14];
+        let long_name = "x".repeat(MAX_GLYPH_NAME_LEN + 10);
+        let long_payload: &[u8] = b"(unclosed string /end";
+        let mut private = b"dup /Private 5 dict dup begin\n\
+            % /lenIV 4 /Subrs /CharStrings mentioned in header comment\n\
+            /Helper { /lenIV get /Subrs get /CharStrings get } bind def\n\
+            /lenIV -1 def\n\
+            /Subrs 4 array\n\
+            /SubrHelper { /CharStrings get } bind def\n\
+            % helpers used by /CharStrings\n"
+            .to_vec();
+        // Slot 0 has raw `RD` payload bytes literally containing `/CharStrings`;
+        // slot 1 follows after that payload with a tab after `dup`;
+        // slot 2 has comments separating `dup`, index, length, and `RD`;
+        // slot 3 follows a `%` comment terminated by form feed (`0x0C`).
+        private.extend_from_slice(format!("dup 0 {} RD ", payload_with_name.len()).as_bytes());
+        private.extend_from_slice(payload_with_name);
+        private.extend_from_slice(b" NP\n% another /CharStrings comment\ndup\t1 1 RD ");
+        private.extend_from_slice(ret);
+        private.extend_from_slice(
+            b" NP\ndup % hint subroutine\n2 % byte length\n1 % binary read\nRD ",
+        );
+        private.extend_from_slice(ret);
+        private.extend_from_slice(b" NP\n% form-feed terminated comment\x0cdup 3 1 RD ");
+        private.extend_from_slice(ret);
+        // Place an over-long glyph name whose binary payload starts with `(`
+        // right before `/A`: its payload must be consumed so `/A` survives.
+        private.extend_from_slice(b" NP\nND\n/CharStrings 2 dict dup begin\n/");
+        private.extend_from_slice(long_name.as_bytes());
+        private.extend_from_slice(format!(" {} RD ", long_payload.len()).as_bytes());
+        private.extend_from_slice(long_payload);
+        private.extend_from_slice(b" ND\n/A ");
+        private.extend_from_slice(format!("{} RD ", glyph_a.len()).as_bytes());
+        private.extend_from_slice(glyph_a);
+        private.extend_from_slice(b" ND\nend end readonly def\n");
+
+        assert_eq!(parse_len_iv(&private), Some(-1));
+        assert_eq!(
+            parse_subrs(&private, -1),
+            vec![
+                payload_with_name.to_vec(),
+                ret.to_vec(),
+                ret.to_vec(),
+                ret.to_vec(),
+            ]
+        );
+        let cs = parse_charstrings(&private, -1);
+        assert!(!cs.contains_key(&long_name));
+        assert_eq!(cs.get("A").map(Vec::as_slice), Some(glyph_a));
     }
 
     #[test]
@@ -1186,6 +1625,7 @@ mod tests {
         font.char_strings
             .insert("A".to_string(), vec![139, 139, 139, 204, 204, 12, 6]);
         assert!(font.glyph_outline_by_name("A").is_none());
+        assert!(!font.has_usable_outlines());
     }
 
     #[test]
@@ -1204,6 +1644,21 @@ mod tests {
             2 * base.commands.len(),
             "base and accent outlines"
         );
+
+        // A composite-only font with valid base/accent is usable; once a
+        // referenced component is missing, it is no longer usable.
+        let mut composite_only = font_with_matrix([0.001, 0.0, 0.0, 0.001, 0.0, 0.0]);
+        let simple_a = composite_only.char_strings["A"].clone();
+        composite_only
+            .char_strings
+            .insert("grave".to_string(), simple_a);
+        composite_only
+            .char_strings
+            .insert("Agrave".to_string(), agrave.clone());
+        composite_only.gid_to_name = vec![".notdef".to_string(), "Agrave".to_string()];
+        assert!(composite_only.has_usable_outlines());
+        composite_only.char_strings.remove("A");
+        assert!(!composite_only.has_usable_outlines());
 
         // A composite whose base is itself a composite is malformed.
         font.char_strings.insert("A".to_string(), agrave);
@@ -1225,5 +1680,212 @@ mod tests {
     fn sparse_huge_subr_index_does_not_resize_the_table() {
         let private = b"/Subrs 0 array dup 999999 1 RD x /CharStrings";
         assert!(parse_subrs(private, 0).is_empty());
+    }
+
+    #[test]
+    fn no_ink_only_type1_subset_stays_healthy_while_empty_visible_is_unusable() {
+        // hsbw(0, 250) + endchar (14): valid empty charstring.
+        let empty_cs = vec![139, 247, 142, 13, 14];
+
+        let mut no_ink = font_with_matrix([0.001, 0.0, 0.0, 0.001, 0.0, 0.0]);
+        no_ink.char_strings.clear();
+        no_ink
+            .char_strings
+            .insert(".notdef".into(), empty_cs.clone());
+        no_ink
+            .char_strings
+            .insert("uni0020".into(), empty_cs.clone());
+        no_ink
+            .char_strings
+            .insert("uni200B".into(), empty_cs.clone());
+        no_ink.gid_to_name = vec![".notdef".into(), "uni0020".into(), "uni200B".into()];
+        no_ink.name_to_gid = HashMap::from([
+            (".notdef".into(), 0),
+            ("uni0020".into(), 1),
+            ("uni200B".into(), 2),
+        ]);
+        assert_eq!(
+            no_ink.probe_outlines(),
+            crate::EmbeddedOutlineProbe::Healthy
+        );
+        assert!(no_ink.has_usable_outlines());
+        assert_eq!(
+            no_ink.glyph_state_by_gid(1),
+            crate::resolution::GlyphState::Blank
+        );
+        assert!(!no_ink.is_gid_unreadable(1));
+        assert!(no_ink.is_blank_gid(1));
+
+        // An empty or terminated move-only (`hsbw`, `rmoveto`, `endchar`)
+        // charstring for a known visible glyph name (/A) has no drawable path
+        // segments, so it must count as failed / Missing rather than Drawn.
+        let move_only_cs = vec![139, 248, 136, 13, 189, 139, 21, 14];
+        for (label, cs) in [
+            ("empty-visible-A", empty_cs.clone()),
+            ("move-only-visible-A", move_only_cs.clone()),
+        ] {
+            let mut bad_visible = font_with_matrix([0.001, 0.0, 0.0, 0.001, 0.0, 0.0]);
+            bad_visible.char_strings.clear();
+            bad_visible
+                .char_strings
+                .insert(".notdef".into(), empty_cs.clone());
+            bad_visible.char_strings.insert("A".into(), cs);
+            bad_visible.gid_to_name = vec![".notdef".into(), "A".into()];
+            bad_visible.name_to_gid = HashMap::from([(".notdef".into(), 0), ("A".into(), 1)]);
+            assert_eq!(
+                bad_visible.probe_outlines(),
+                crate::EmbeddedOutlineProbe::Unusable,
+                "{label}"
+            );
+            assert!(!bad_visible.has_usable_outlines(), "{label}");
+            assert_eq!(
+                bad_visible.glyph_state_by_gid(1),
+                crate::resolution::GlyphState::Missing,
+                "{label}"
+            );
+            assert!(bad_visible.is_gid_unreadable(1), "{label}");
+            assert!(bad_visible.glyph_outline_by_gid(1).is_none(), "{label}");
+        }
+
+        // A terminated move-only space stays Healthy / Blank.
+        let mut move_only_space = font_with_matrix([0.001, 0.0, 0.0, 0.001, 0.0, 0.0]);
+        move_only_space.char_strings.clear();
+        move_only_space
+            .char_strings
+            .insert(".notdef".into(), empty_cs.clone());
+        move_only_space
+            .char_strings
+            .insert("uni0020".into(), move_only_cs);
+        move_only_space.gid_to_name = vec![".notdef".into(), "uni0020".into()];
+        move_only_space.name_to_gid = HashMap::from([(".notdef".into(), 0), ("uni0020".into(), 1)]);
+        assert_eq!(
+            move_only_space.probe_outlines(),
+            crate::EmbeddedOutlineProbe::Healthy
+        );
+        assert_eq!(
+            move_only_space.glyph_state_by_gid(1),
+            crate::resolution::GlyphState::Blank
+        );
+        assert!(!move_only_space.is_gid_unreadable(1));
+
+        // Truncated charstrings on an unknown glyph name (/g1) — ending
+        // mid-operand, mid-escape, or without endchar — must be classified as
+        // unreadable in both `probe_outlines` and per-glyph checks (never
+        // accepted as Healthy/Blank).
+        for (label, truncated_cs) in [
+            ("mid-2byte-pos-operand", vec![139u8, 247]),
+            ("mid-2byte-neg-operand", vec![139, 251]),
+            ("mid-5byte-operand", vec![255, 0, 1]),
+            ("mid-escape-op", vec![139, 12]),
+            ("missing-endchar", vec![139, 247, 142, 13]),
+            ("top-level-return", vec![139, 11]),
+            ("empty-bytes", vec![]),
+        ] {
+            let mut truncated = font_with_matrix([0.001, 0.0, 0.0, 0.001, 0.0, 0.0]);
+            truncated.char_strings.clear();
+            truncated
+                .char_strings
+                .insert(".notdef".into(), empty_cs.clone());
+            truncated.char_strings.insert("g1".into(), truncated_cs);
+            truncated.gid_to_name = vec![".notdef".into(), "g1".into()];
+            truncated.name_to_gid = HashMap::from([(".notdef".into(), 0), ("g1".into(), 1)]);
+            assert_eq!(
+                truncated.probe_outlines(),
+                crate::EmbeddedOutlineProbe::Unusable,
+                "{label}: truncated /g1 subset must be unusable"
+            );
+            assert!(!truncated.has_usable_outlines(), "{label}");
+            assert_eq!(
+                truncated.glyph_state_by_gid(1),
+                crate::resolution::GlyphState::Missing,
+                "{label}: truncated /g1 must not be classified as Blank"
+            );
+            assert!(truncated.is_gid_unreadable(1), "{label}");
+            assert!(!truncated.is_blank_gid(1), "{label}");
+            assert!(truncated.glyph_outline_by_gid(1).is_none(), "{label}");
+        }
+    }
+
+    #[test]
+    fn subroutine_unexpected_eof_fails_while_explicit_return_succeeds() {
+        let empty_cs = vec![139, 247, 142, 13, 14];
+        // /g1 delegates its strokes to subr 0 and then executes endchar:
+        // hsbw(0, 500), 0 callsubr, endchar.
+        let caller_cs = vec![139, 248, 136, 13, 139, 10, 14];
+        let make_font = |subrs: Vec<Vec<u8>>| {
+            let mut font = font_with_matrix([0.001, 0.0, 0.0, 0.001, 0.0, 0.0]);
+            font.char_strings.clear();
+            font.char_strings.insert(".notdef".into(), empty_cs.clone());
+            font.char_strings.insert("g1".into(), caller_cs.clone());
+            font.gid_to_name = vec![".notdef".into(), "g1".into()];
+            font.name_to_gid = HashMap::from([(".notdef".into(), 0), ("g1".into(), 1)]);
+            font.subrs = subrs;
+            font
+        };
+
+        // Unexpected EOF inside a subroutine (empty /Subrs[0], strokes without
+        // `return`, or missing /Subrs entry) must fail even though the caller
+        // has a trailing `endchar`.
+        for (label, subrs) in [
+            ("empty-subr-eof", vec![vec![]]),
+            (
+                "strokes-without-return",
+                vec![vec![139, 239, 21, 239, 139, 5]],
+            ),
+            ("missing-subr-index", vec![]),
+        ] {
+            let font = make_font(subrs);
+            assert_eq!(
+                font.probe_outlines(),
+                crate::EmbeddedOutlineProbe::Unusable,
+                "{label}"
+            );
+            assert!(!font.has_usable_outlines(), "{label}");
+            assert_eq!(
+                font.glyph_state_by_gid(1),
+                crate::resolution::GlyphState::Missing,
+                "{label}"
+            );
+            assert!(font.is_gid_unreadable(1), "{label}");
+            assert!(!font.is_blank_gid(1), "{label}");
+            assert!(font.glyph_outline_by_gid(1).is_none(), "{label}");
+        }
+
+        // Explicit `return` (11) exits cleanly and lets the caller's `endchar`
+        // complete: both a no-ink `return` and a stroked `return` (or `endchar`
+        // inside the subr) remain healthy.
+        let blank_ret = make_font(vec![vec![11]]);
+        assert_eq!(
+            blank_ret.probe_outlines(),
+            crate::EmbeddedOutlineProbe::Healthy
+        );
+        assert_eq!(
+            blank_ret.glyph_state_by_gid(1),
+            crate::resolution::GlyphState::Blank
+        );
+        assert!(!blank_ret.is_gid_unreadable(1));
+        assert!(blank_ret.is_blank_gid(1));
+
+        for (label, subr) in [
+            (
+                "explicit-return-strokes",
+                vec![139, 239, 21, 239, 139, 5, 11],
+            ),
+            ("subr-endchar-strokes", vec![139, 239, 21, 239, 139, 5, 14]),
+        ] {
+            let font = make_font(vec![subr]);
+            assert_eq!(
+                font.probe_outlines(),
+                crate::EmbeddedOutlineProbe::Healthy,
+                "{label}"
+            );
+            assert_eq!(
+                font.glyph_state_by_gid(1),
+                crate::resolution::GlyphState::Drawn,
+                "{label}"
+            );
+            assert!(!font.is_gid_unreadable(1), "{label}");
+            assert!(font.glyph_outline_by_gid(1).is_some(), "{label}");
+        }
     }
 }

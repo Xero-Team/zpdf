@@ -729,6 +729,214 @@ fn emit_struct_elem(
     }
 }
 
+/// Owning content-stream binding captured alongside each [`TextSpan`] in
+/// structured text mode so [`struct_ordered_text_with_streams`] matches and
+/// consumes spans by `(owning_stream, mcid)` rather than numeric MCID alone.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpanStreamBinding {
+    /// The span's `mcid` belongs to `None` (the page's own content stream) or
+    /// `Some(id)` (Form XObject stream `id`).
+    Stream(Option<zpdf_core::ObjectId>),
+    /// The span was emitted inside a Form invocation wrapped by an enclosing
+    /// structure element's `/ActualText` replacement and is already subsumed.
+    Subsumed,
+    /// The span was emitted in an unaddressable stream (e.g. inline Form) and
+    /// cannot bind to a structure kid.
+    Unbound,
+}
+
+/// Like [`struct_ordered_text`], scoping MCID matching and consumption by the
+/// owning content stream (`None` = page stream, `Some(id)` = Form XObject `/Stm`)
+/// so a Form replacement consuming MCID `k` never drops an unrelated page span
+/// with the same numeric MCID `k` (and vice versa).
+#[doc(hidden)]
+pub fn struct_ordered_text_with_streams(
+    spans: &[TextSpan],
+    span_streams: &[SpanStreamBinding],
+    page_index: usize,
+    tree: &StructTree,
+    kid_streams: &[Option<Option<zpdf_core::ObjectId>>],
+) -> String {
+    let mut by_key: HashMap<(Option<zpdf_core::ObjectId>, i64), Vec<&TextSpan>> = HashMap::new();
+    for (i, s) in spans.iter().enumerate() {
+        let binding = span_streams
+            .get(i)
+            .copied()
+            .unwrap_or(SpanStreamBinding::Stream(None));
+        if let (Some(m), SpanStreamBinding::Stream(stream)) = (s.mcid, binding) {
+            by_key.entry((stream, m as i64)).or_default().push(s);
+        }
+    }
+
+    let mut b = ReadingOrder::default();
+    let mut consumed: HashSet<(Option<zpdf_core::ObjectId>, i64)> = HashSet::new();
+    let mut cursor = 0usize;
+    for elem in &tree.children {
+        emit_struct_elem_with_streams(
+            elem,
+            page_index,
+            &by_key,
+            &mut consumed,
+            kid_streams,
+            &mut cursor,
+            0,
+            &mut b,
+        );
+    }
+    debug_assert_eq!(cursor, kid_streams.len());
+    let mut result = b.out.trim().to_string();
+
+    let leftover: Vec<usize> = (0..spans.len())
+        .filter(|&i| {
+            let binding = span_streams
+                .get(i)
+                .copied()
+                .unwrap_or(SpanStreamBinding::Stream(None));
+            match (spans[i].mcid, binding) {
+                (_, SpanStreamBinding::Subsumed) => false,
+                (Some(m), SpanStreamBinding::Stream(stream)) => {
+                    !consumed.contains(&(stream, m as i64))
+                }
+                _ => true,
+            }
+        })
+        .collect();
+    let extra = layout_text(spans, leftover, 2.0);
+    if !extra.is_empty() {
+        if !result.is_empty() {
+            result.push('\n');
+        }
+        result.push_str(&extra);
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_struct_elem_with_streams(
+    elem: &StructElem,
+    page: usize,
+    by_key: &HashMap<(Option<zpdf_core::ObjectId>, i64), Vec<&TextSpan>>,
+    consumed: &mut HashSet<(Option<zpdf_core::ObjectId>, i64)>,
+    kid_streams: &[Option<Option<zpdf_core::ObjectId>>],
+    cursor: &mut usize,
+    depth: usize,
+    b: &mut ReadingOrder,
+) {
+    if depth > MAX_STRUCT_TEXT_DEPTH {
+        skip_elem_streams(elem, cursor);
+        return;
+    }
+    let on_this_page = elem.page.is_none_or(|p| p == page);
+
+    let block = elem.role.is_block_level();
+    if block {
+        b.block_break();
+    }
+    if let Some(actual) = &elem.actual_text {
+        if on_this_page {
+            b.push_replacement(actual);
+            mark_consumed_with_streams(elem, page, 0, consumed, kid_streams, cursor);
+        } else {
+            skip_elem_streams(elem, cursor);
+        }
+        if block {
+            b.block_break();
+        }
+        return;
+    }
+
+    let before = b.out.len();
+    for kid in &elem.kids {
+        match kid {
+            StructKid::Element(child) => emit_struct_elem_with_streams(
+                child,
+                page,
+                by_key,
+                consumed,
+                kid_streams,
+                cursor,
+                depth + 1,
+                b,
+            ),
+            StructKid::MarkedContent {
+                page: kid_page,
+                mcid,
+            } => {
+                let stream = kid_streams.get(*cursor).copied().flatten();
+                *cursor += 1;
+                if *kid_page == Some(page) {
+                    if let Some(stream) = stream {
+                        if let Some(list) = by_key.get(&(stream, *mcid)) {
+                            consumed.insert((stream, *mcid));
+                            for s in list {
+                                b.push_span(s);
+                            }
+                        }
+                    }
+                }
+            }
+            StructKid::Object { .. } => {}
+        }
+    }
+    if on_this_page && b.out[before..].trim().is_empty() {
+        if let Some(alt) = &elem.alt {
+            b.push_replacement(alt);
+        }
+    }
+
+    if block {
+        b.block_break();
+    }
+}
+
+fn mark_consumed_with_streams(
+    elem: &StructElem,
+    page: usize,
+    depth: usize,
+    consumed: &mut HashSet<(Option<zpdf_core::ObjectId>, i64)>,
+    kid_streams: &[Option<Option<zpdf_core::ObjectId>>],
+    cursor: &mut usize,
+) {
+    if depth > MAX_STRUCT_TEXT_DEPTH {
+        skip_elem_streams(elem, cursor);
+        return;
+    }
+    for kid in &elem.kids {
+        match kid {
+            StructKid::Element(child) => {
+                mark_consumed_with_streams(child, page, depth + 1, consumed, kid_streams, cursor);
+            }
+            StructKid::MarkedContent {
+                page: kid_page,
+                mcid,
+            } => {
+                let stream = kid_streams.get(*cursor).copied().flatten();
+                *cursor += 1;
+                if *kid_page == Some(page) {
+                    if let Some(stream) = stream {
+                        consumed.insert((stream, *mcid));
+                    }
+                }
+            }
+            StructKid::Object { .. } => {}
+        }
+    }
+}
+
+fn skip_elem_streams(elem: &StructElem, cursor: &mut usize) {
+    let mut stack = vec![elem];
+    while let Some(node) = stack.pop() {
+        for kid in &node.kids {
+            match kid {
+                StructKid::Element(child) => stack.push(child),
+                StructKid::MarkedContent { .. } => *cursor += 1,
+                StructKid::Object { .. } => {}
+            }
+        }
+    }
+}
+
 /// Mark every marked-content id in `elem`'s subtree (on `page`) as consumed,
 /// without emitting — used when an `/ActualText` replaces the subtree, so the
 /// leftover pass does not re-emit the glyphs it stood in for.
@@ -1074,6 +1282,37 @@ mod tests {
             children: vec![selem(StructRole::P, Some(0), vec![mc(0, 0), mc(0, 1)])],
         };
         assert_eq!(struct_ordered_text(&spans, 0, &tree), "Hello World");
+    }
+
+    #[test]
+    fn deep_struct_subtree_skips_kid_streams_iteratively_without_cursor_drift() {
+        // Build a caller-supplied StructTree much deeper than MAX_STRUCT_TEXT_DEPTH
+        // (64) so `skip_elem_streams` walks hundreds of nested elements without
+        // recursing on the call stack, while still advancing the kid-stream cursor
+        // accurately for a following sibling on a Form XObject stream.
+        let form_stream = zpdf_core::ObjectId(42, 0);
+        let mut deep = selem(StructRole::Span, Some(0), vec![mc(0, 99)]);
+        for _ in 0..300 {
+            deep = selem(StructRole::Div, Some(0), vec![StructKid::Element(deep)]);
+        }
+        let sibling = selem(StructRole::P, Some(0), vec![mc(0, 0)]);
+        let tree = StructTree {
+            marked: true,
+            children: vec![deep, sibling],
+        };
+        let spans = vec![
+            span_m("PageZero", 50.0, 700.0, 12.0, 0),
+            span_m("FormZero", 50.0, 680.0, 12.0, 0),
+        ];
+        let span_streams = [
+            SpanStreamBinding::Stream(None),
+            SpanStreamBinding::Stream(Some(form_stream)),
+        ];
+        // First MCID (inside the 300-deep subtree) binds to page stream; second
+        // MCID (in `sibling`) binds to `form_stream`.
+        let kid_streams = [Some(None), Some(Some(form_stream))];
+        let out = struct_ordered_text_with_streams(&spans, &span_streams, 0, &tree, &kid_streams);
+        assert_eq!(out, "FormZero\nPageZero");
     }
 }
 

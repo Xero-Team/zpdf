@@ -209,8 +209,18 @@ fn substitute_honors_zero_padded_to_unicode_key_lengths() {
         "one-byte <41> must not take <0041>'s glyph"
     );
     assert_eq!(mapping.get(&35), Some(&2));
-    let overwritten = ToUnicodeMap::parse(b"2 beginbfchar <0041> <4E2D> <41> <0041> endbfchar");
-    assert_eq!(overwritten.padded_length(0x41), None);
+    for both_raw in [
+        b"2 beginbfchar <0041> <4E2D> <41> <0041> endbfchar".as_slice(),
+        b"2 beginbfchar <41> <0041> <0041> <4E2D> endbfchar".as_slice(),
+    ] {
+        let both = ToUnicodeMap::parse(both_raw);
+        assert_eq!(both.padded_length(0x41), Some(2));
+        assert_eq!(both.lookup_with_length(0x41, 1), Some("A"));
+        assert_eq!(both.lookup_with_length(0x41, 2), Some("中"));
+        font.to_unicode = Some(both);
+        assert_eq!(font.decode_to_string(&[0x41, 0x00, 0x41]), "A中");
+        assert_eq!(font.decode_to_string(&[0x00, 0x41, 0x41]), "中A");
+    }
 }
 
 #[test]

@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Compatibility
+
+- **Breaking:** exhaustive `PositionedGlyph` literals must add `code_len: 0`
+  (or an explicit PDF source byte width `1..=4`) or use the new
+  `..PositionedGlyph::default()`. Setting `code_len: 0` on synthetic glyphs
+  infers the width from the logical font's encoding CMap or `/ToUnicode` table,
+  while `ContentInterpreter` records the exact source byte width (`1..=4`)
+  alongside packed big-endian source bytes in `code`. Struct size stays 20 bytes
+  (reusing padding after `glyph_id`); under pre-1.0 semver this ships in the
+  next `0.22.0` minor release. (#157)
+
 ### Performance
 
 - Add `ContentInterpreter::with_clip_elision_scale` and
@@ -12,11 +23,27 @@
   `PushClip`/`PopClip` pairs and CPU clip-mask allocations while keeping
   rendered pixels identical within CPU clip budgets. (#166)
 
-### Rendering
+### Rendering and font recovery
 
 - Round CPU, GPU and SVG 8-bit colours to the nearest value (`0.5 g` now gives
   128 rather than 127), and round CPU clip and soft-mask products and Type 3
   image-mask tints to avoid darkening colours and eroding mask edges. (#183)
+- Fall back to the descriptor-based substitute font path when an embedded font
+  program (`FontFile`, `FontFile2`, or `FontFile3`) fails to decode, fails to
+  parse, or has unreadable glyph outlines — for simple fonts and for Type 0 /
+  CID fonts with a usable Unicode or legacy CMap, known CJK collection, or
+  `/ToUnicode` mapping — keeping PDF glyph placement (`/Widths`,
+  `/MissingWidth`, `/W`, `/DW`, `/W2`, `/DW2`) instead of rendering invisible
+  text. Unmapped composite fonts without such a mapping keep their original or
+  metrics-only entry and may still render invisible text while recording the
+  failure. Honour `/FontWeight` and `/ItalicAngle` alongside `/Flags` and
+  `/StemV` when selecting substitutes, and record fallbacks in
+  `ProcessingDiagnostics::embedded_font_fallbacks` (leaving valid embedded and
+  normal non-embedded fonts unaffected). Successfully recovered pages stay
+  `is_complete()` while retaining `embedded_font_fallbacks`; unrecovered missing
+  visible glyphs record `missing_glyph_outlines` (rejecting visual exports while
+  allowing text-only exports when every character decoded, and incrementing
+  `decode_failures` if decoding also failed). (#157)
 
 ### Testing and JBIG2 decoding
 

@@ -269,6 +269,19 @@ pub fn cjk_ordering_for(base_font: &str) -> Option<&'static str> {
     None
 }
 
+/// Return the static canonical CJK CID ordering recognized by system-font
+/// fallback, discarding arbitrary or unrecognized PDF `/Ordering` strings.
+pub fn canonical_cid_ordering(ordering: &str) -> Option<&'static str> {
+    match ordering {
+        "GB1" => Some("GB1"),
+        "CNS1" => Some("CNS1"),
+        "Japan1" => Some("Japan1"),
+        "Korea1" => Some("Korea1"),
+        "KR" => Some("KR"),
+        _ => None,
+    }
+}
+
 /// Default CJK families for a composite font's CID ordering.
 fn ordering_defaults(ordering: Option<&str>) -> &'static [&'static str] {
     match ordering {

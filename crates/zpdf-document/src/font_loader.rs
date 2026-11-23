@@ -24,19 +24,49 @@ pub(crate) fn load_page_fonts(
     }
     let max_bytes = file.limits().max_font_cache_bytes;
 
+    // Admit primary page fonts and park any fitting embedded companion as a
+    // budget-charged, reclaimable standby copy alongside its lightweight
+    // `ObjectId` reload source. If the companion exceeds `max_bytes` it is
+    // dropped immediately; if a later primary page font, Form font, or drawn
+    // companion needs the space, `FontCache` reclaims unused standby copies
+    // automatically. Keeping fitting companions in reclaimable standby also
+    // preserves mixed-CID recovery for callers that pass only `load_page_fonts`
+    // to `ContentInterpreter::with_fonts` without a `PdfFile`.
     for (name, &font_ref) in &page.resources.fonts {
         match shared_or_load(file, font_ref, shared, provider) {
-            Ok(font) => {
-                if cache
-                    .try_insert_shared_with_limit(name.clone(), font, max_bytes)
-                    .is_none()
-                {
-                    insert_placeholder(&mut cache, name, max_bytes);
+            Ok((font, diagnostics, companion, descriptor_spec)) => {
+                match cache.admit_with_diagnostics(
+                    name.clone(),
+                    font,
+                    diagnostics,
+                    Some(font_ref),
+                    max_bytes,
+                ) {
+                    Ok(fid) => {
+                        if cache.get(fid).is_some_and(|f| f.has_font_data()) {
+                            if let Some(spec) = descriptor_spec {
+                                cache.record_descriptor_substitute(fid, spec, max_bytes);
+                            } else if companion.is_some() {
+                                let _ = cache.record_companion(
+                                    fid,
+                                    zpdf_font::CompanionKind::EmbeddedOriginal,
+                                    zpdf_font::CompanionSource::Object(font_ref),
+                                    companion,
+                                    max_bytes,
+                                );
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            "font cache byte limit ({max_bytes}) or ID capacity reached; could not admit {name}"
+                        );
+                    }
                 }
             }
             Err(e) => {
                 tracing::debug!("font {name} ({font_ref}): fallback - {e}");
-                insert_placeholder(&mut cache, name, max_bytes);
+                let _ = insert_placeholder(&mut cache, name, max_bytes);
             }
         }
     }
@@ -53,7 +83,7 @@ pub(crate) fn load_shared_font(
     font_ref: ObjectId,
     shared: &mut SharedFonts,
     provider: Option<&std::sync::Arc<FontProvider>>,
-) -> Result<std::sync::Arc<LoadedFont>> {
+) -> Result<crate::SharedFontEntry> {
     shared.refresh_provider(provider.map(|provider| provider.generation()));
     shared_or_load(file, font_ref, shared, provider)
 }
@@ -68,28 +98,39 @@ fn shared_or_load(
     font_ref: ObjectId,
     shared: &mut SharedFonts,
     provider: Option<&std::sync::Arc<FontProvider>>,
-) -> Result<std::sync::Arc<LoadedFont>> {
+) -> Result<crate::SharedFontEntry> {
     if let Some(font) = shared.get(font_ref) {
         return Ok(font);
     }
-    let font = load_single_font_with_provider(file, font_ref, provider.map(|p| p.as_ref()))?;
-    Ok(shared.admit(font_ref, font, file.limits().max_font_cache_bytes))
+    let (font, diagnostics, companion, embedded_file_id) =
+        load_single_font_with_fallback(file, font_ref, provider.map(|p| p.as_ref()))?;
+    Ok(shared.admit(
+        font_ref,
+        font,
+        diagnostics,
+        companion,
+        embedded_file_id,
+        file.limits().max_font_cache_bytes,
+    ))
 }
 
 /// Cache a placeholder under `name`, warning when even that does not fit.
-fn insert_placeholder(cache: &mut FontCache, name: &str, max_bytes: u64) {
-    if cache
-        .try_insert_with_limit(
-            name.to_string(),
-            LoadedFont::new_placeholder(name.to_string()),
-            max_bytes,
-        )
-        .is_none()
-    {
+fn insert_placeholder(
+    cache: &mut FontCache,
+    name: &str,
+    max_bytes: u64,
+) -> Option<zpdf_font::FontId> {
+    let inserted = cache.try_insert_with_limit(
+        name.to_string(),
+        LoadedFont::new_placeholder(name.to_string()),
+        max_bytes,
+    );
+    if inserted.is_none() {
         tracing::warn!(
             "font cache byte limit ({max_bytes}) or ID capacity reached; using placeholder for {name}"
         );
     }
+    inserted
 }
 
 pub fn load_single_font(file: &PdfFile, font_ref: ObjectId) -> Result<LoadedFont> {
@@ -101,9 +142,48 @@ pub fn load_single_font_with_provider(
     font_ref: ObjectId,
     provider: Option<&FontProvider>,
 ) -> Result<LoadedFont> {
+    Ok(load_single_font_with_diagnostics(file, font_ref, provider)?.0)
+}
+
+/// Like [`load_single_font_with_provider`], also reporting diagnostics when an
+/// embedded font program fails to decode or parse and falls back.
+pub fn load_single_font_with_diagnostics(
+    file: &PdfFile,
+    font_ref: ObjectId,
+    provider: Option<&FontProvider>,
+) -> Result<(LoadedFont, zpdf_core::ProcessingDiagnostics)> {
+    let (font, diagnostics, _, _) = load_single_font_with_fallback(file, font_ref, provider)?;
+    Ok((font, diagnostics))
+}
+
+/// Parsed primary font, load-time fallback diagnostics, optional paired
+/// embedded-original companion face, and optional descriptor metadata for lazy
+/// per-glyph substitution when an embedded program was kept as primary.
+#[doc(hidden)]
+pub type LoadedFontFallback = (
+    LoadedFont,
+    zpdf_core::ProcessingDiagnostics,
+    Option<LoadedFont>,
+    Option<std::sync::Arc<zpdf_font::DescriptorSubstituteSpec>>,
+);
+
+/// Like [`load_single_font_with_diagnostics`], also returning any paired
+/// companion face and the embedded `/FontFile*` object id when an embedded
+/// program was kept as primary.
+#[doc(hidden)]
+pub fn load_single_font_with_fallback(
+    file: &PdfFile,
+    font_ref: ObjectId,
+    provider: Option<&FontProvider>,
+) -> Result<LoadedFontFallback> {
     let obj = file.resolve(font_ref)?;
     let dict = obj.as_dict()?;
-    load_single_font_dict_with_provider(file, dict, provider)
+    let (font, mut diagnostics, companion, embedded_file_id) =
+        load_single_font_dict_with_fallback(file, dict, provider)?;
+    if !diagnostics.is_empty() {
+        diagnostics.first_failed_object.get_or_insert(font_ref);
+    }
+    Ok((font, diagnostics, companion, embedded_file_id))
 }
 
 /// Load a font from its (already-resolved) font dictionary. Used both by
@@ -118,37 +198,203 @@ pub fn load_single_font_dict_with_provider(
     dict: &zpdf_core::PdfDict,
     provider: Option<&FontProvider>,
 ) -> Result<LoadedFont> {
+    Ok(load_single_font_dict_with_diagnostics(file, dict, provider)?.0)
+}
+
+/// Like [`load_single_font_dict_with_provider`], also reporting diagnostics
+/// when an embedded font program fails to decode or parse and falls back.
+pub fn load_single_font_dict_with_diagnostics(
+    file: &PdfFile,
+    dict: &zpdf_core::PdfDict,
+    provider: Option<&FontProvider>,
+) -> Result<(LoadedFont, zpdf_core::ProcessingDiagnostics)> {
+    let (font, diagnostics, _, _) = load_single_font_dict_with_fallback(file, dict, provider)?;
+    Ok((font, diagnostics))
+}
+
+/// Like [`load_single_font_dict_with_diagnostics`], also returning any paired
+/// companion face and the embedded `/FontFile*` object id when an embedded
+/// program was kept as primary.
+#[doc(hidden)]
+pub fn load_single_font_dict_with_fallback(
+    file: &PdfFile,
+    dict: &zpdf_core::PdfDict,
+    provider: Option<&FontProvider>,
+) -> Result<LoadedFontFallback> {
     let subtype = dict.get_name("Subtype").unwrap_or("");
     let base_font = dict.get_name("BaseFont").unwrap_or("Unknown").to_string();
 
-    let mut font = match subtype {
-        "Type0" => load_type0_font(file, dict, base_font, provider)?,
-        "TrueType" => load_truetype_font(file, dict, base_font, provider)?,
-        "Type3" => load_type3_font(file, dict, base_font)?,
-        "Type1" | "MMType1" => load_type1_font(file, dict, base_font, provider)?,
-        _ => LoadedFont::new_placeholder(base_font),
+    let to_unicode = parse_to_unicode(file, dict);
+    let (mut font, diagnostics, mut companion, embedded_file_id) = match subtype {
+        "Type0" => load_type0_font(file, dict, base_font, provider, to_unicode.as_ref())?,
+        "TrueType" => load_simple_font(file, dict, base_font, PdfFontType::TrueType, provider)?,
+        "Type3" => (
+            load_type3_font(file, dict, base_font)?,
+            zpdf_core::ProcessingDiagnostics::default(),
+            None,
+            None,
+        ),
+        "Type1" | "MMType1" => {
+            load_simple_font(file, dict, base_font, PdfFontType::Type1, provider)?
+        }
+        _ => (
+            LoadedFont::new_placeholder(base_font),
+            zpdf_core::ProcessingDiagnostics::default(),
+            None,
+            None,
+        ),
     };
 
-    attach_text_mappings(file, dict, subtype, &mut font);
-    // A substituted composite font needs /ToUnicode (attached just above) to
-    // route CIDs through the system face's Unicode cmap.
-    font.build_substitute_cid_to_gid();
+    // Only clone /ToUnicode when a companion is paired alongside the primary;
+    // healthy font loads move it once.
+    let companion_to_unicode = if companion.is_some() {
+        to_unicode.clone()
+    } else {
+        None
+    };
+    attach_text_mappings(file, dict, subtype, to_unicode, &mut font);
+    // A substituted composite font that does not use direct per-source-code
+    // GID resolution needs /ToUnicode (attached just above) to route CIDs
+    // through the system face's Unicode cmap.
+    if font.cid_to_gid.is_none() && !font.uses_direct_composite_gids() {
+        font.build_substitute_cid_to_gid();
+    }
     // FontDescriptor weight/width/slant → variation axes (variable fonts only).
     if subtype != "Type0" {
         apply_descriptor_variations(file, dict, &mut font);
     }
-    Ok(font)
+    if let Some(ref mut comp) = companion {
+        attach_text_mappings(file, dict, subtype, companion_to_unicode, comp);
+        if font.is_substitute && comp.type1.is_some() {
+            font.inherit_type1_encoding_from(comp);
+        }
+        if comp.is_substitute && comp.cid_to_gid.is_none() && !comp.uses_direct_composite_gids() {
+            comp.build_substitute_cid_to_gid();
+        }
+        if subtype != "Type0" {
+            apply_descriptor_variations(file, dict, comp);
+        }
+    }
+    Ok((font, diagnostics, companion, embedded_file_id))
 }
 
-/// FontDescriptor-derived hints for system-font substitution.
-fn substitute_hints(
+/// Reload only the parseable embedded companion font for an indirect font
+/// object when the embedded stream fits within `max_bytes`.
+#[doc(hidden)]
+pub fn load_embedded_companion_ref(
+    file: &PdfFile,
+    font_ref: ObjectId,
+    max_bytes: u64,
+) -> Option<LoadedFont> {
+    if max_bytes == 0 {
+        return None;
+    }
+    let obj = file.resolve(font_ref).ok()?;
+    let dict = obj.as_dict().ok()?;
+    load_embedded_companion_dict(file, dict, max_bytes)
+}
+
+/// Reload only the parseable embedded companion font for an inline font
+/// dictionary stored under an indirect Form XObject's `/Resources /Font`.
+#[doc(hidden)]
+pub fn load_embedded_companion_form_inline(
+    file: &PdfFile,
+    form_id: ObjectId,
+    font_name: &str,
+    max_bytes: u64,
+) -> Option<LoadedFont> {
+    if max_bytes == 0 {
+        return None;
+    }
+    let form_obj = file.resolve(form_id).ok()?;
+    let form_dict = match &form_obj {
+        PdfObject::Stream(stream) => &stream.dict,
+        PdfObject::Dict(dict) => dict,
+        _ => return None,
+    };
+    let resources = resolve_dict(file, form_dict, "Resources")?;
+    let fonts = resolve_dict(file, &resources, "Font")?;
+    let PdfObject::Dict(font_dict) = fonts.get(font_name)? else {
+        return None;
+    };
+    load_embedded_companion_dict(file, font_dict, max_bytes)
+}
+
+/// Reload only the parseable embedded companion font for a font dictionary
+/// when its decoded font stream fits within `max_bytes`.
+#[doc(hidden)]
+pub fn load_embedded_companion_dict(
     file: &PdfFile,
     dict: &zpdf_core::PdfDict,
-) -> zpdf_font::system::SubstituteHints {
-    descriptor_hints(resolve_dict(file, dict, "FontDescriptor").as_ref())
+    max_bytes: u64,
+) -> Option<LoadedFont> {
+    if max_bytes == 0 {
+        return None;
+    }
+    let subtype = dict.get_name("Subtype").unwrap_or("");
+    let base_font = dict.get_name("BaseFont").unwrap_or("Unknown").to_string();
+    let mut font = match subtype {
+        "Type0" => {
+            let descendants = resolve_array(file, dict, "DescendantFonts")?;
+            let desc_dict = descendant_cid_dict(file, &descendants)?;
+            let descriptor = resolve_dict(file, &desc_dict, "FontDescriptor")?;
+            let EmbeddedFontFile::Present { data, .. } =
+                extract_font_file_with_limit(file, &descriptor, Some(max_bytes))
+            else {
+                return None;
+            };
+            let mut cid_widths = parse_cid_widths(file, &desc_dict);
+            parse_cid_w2(file, &desc_dict, &mut cid_widths);
+            let mut font =
+                LoadedFont::new_with_data(PdfFontType::Type0CidType2, base_font, data, cid_widths);
+            if !font.has_font_data() {
+                return None;
+            }
+            if desc_dict.get_name("Subtype").unwrap_or("") == "CIDFontType2" {
+                if let Some(map) = parse_cid_to_gid_stream(file, &desc_dict) {
+                    font.cid_to_gid = Some(map);
+                }
+            }
+            let (cmap, _) = parse_type0_cmap_and_ordering(file, dict, &desc_dict);
+            font.cid_cmap = Some(cmap);
+            font.dw2 = parse_dw2(file, &desc_dict);
+            font.validate_cid_cmap();
+            apply_variations_from_descriptor(&descriptor, &mut font);
+            font
+        }
+        "TrueType" | "Type1" | "MMType1" => {
+            let font_type = if subtype == "TrueType" {
+                PdfFontType::TrueType
+            } else {
+                PdfFontType::Type1
+            };
+            let descriptor = resolve_dict(file, dict, "FontDescriptor")?;
+            let EmbeddedFontFile::Present { data, .. } =
+                extract_font_file_with_limit(file, &descriptor, Some(max_bytes))
+            else {
+                return None;
+            };
+            let cid_widths = parse_simple_widths(file, dict);
+            let font = LoadedFont::new_with_data(font_type, base_font, data, cid_widths);
+            if !font.has_font_data() {
+                return None;
+            }
+            font
+        }
+        _ => return None,
+    };
+    let to_unicode = parse_to_unicode(file, dict);
+    attach_text_mappings(file, dict, subtype, to_unicode, &mut font);
+    if subtype != "Type0" {
+        apply_descriptor_variations(file, dict, &mut font);
+    }
+    Some(font)
 }
 
-fn descriptor_hints(descriptor: Option<&zpdf_core::PdfDict>) -> zpdf_font::system::SubstituteHints {
+fn descriptor_hints(
+    file: &PdfFile,
+    descriptor: Option<&zpdf_core::PdfDict>,
+) -> zpdf_font::system::SubstituteHints {
     let mut hints = zpdf_font::system::SubstituteHints::default();
     // /FontDescriptor must be indirect per spec, but AutoCAD and other producers
     // inline it; resolve_dict accepts both forms.
@@ -159,31 +405,64 @@ fn descriptor_hints(descriptor: Option<&zpdf_core::PdfDict>) -> zpdf_font::syste
             hints.italic = flags & 64 != 0;
             hints.bold = flags & (1 << 18) != 0; // ForceBold
         }
-        if let Ok(w) = fd.get_f64("StemV") {
+        if let Some(w) = resolve_f64(file, fd, "StemV") {
             hints.bold |= w >= 160.0;
+        }
+        // ISO 32000-1 Table 122: /FontWeight 400 is normal, 700 is bold
+        // (600+ covers SemiBold/Bold/ExtraBold/Black).
+        if let Some(weight) = resolve_f64(file, fd, "FontWeight") {
+            hints.bold |= weight >= 600.0;
+        }
+        if let Some(angle) = resolve_f64(file, fd, "ItalicAngle") {
+            hints.italic |= angle != 0.0;
         }
     }
     hints
 }
 
-/// Try to substitute an installed system font for a non-embedded simple font.
-/// The PDF /Widths stay authoritative for advances when present; otherwise the
-/// standard-14 metrics (if the name matches one) seed the widths.
+fn resolve_f64(file: &PdfFile, dict: &zpdf_core::PdfDict, key: &str) -> Option<f64> {
+    match dict.get(key) {
+        Some(PdfObject::Ref(id)) => file.resolve(*id).ok().and_then(|o| o.as_f64().ok()),
+        Some(other) => other.as_f64().ok(),
+        None => None,
+    }
+    .filter(|v| v.is_finite())
+}
+
+/// Prefer `/BaseFont` for substitution lookups; fall back to the descriptor's
+/// `/FontName` when `/BaseFont` was omitted.
+fn substitute_font_name<'a>(
+    base_font: &'a str,
+    descriptor: Option<&'a zpdf_core::PdfDict>,
+) -> &'a str {
+    if base_font != "Unknown" {
+        return base_font;
+    }
+    descriptor
+        .and_then(|fd| fd.get_name("FontName").ok())
+        .unwrap_or(base_font)
+}
+
+/// Try to substitute an installed system font for a simple font whose embedded
+/// program is absent or unusable. The PDF /Widths stay authoritative for
+/// advances when present; otherwise the standard-14 metrics (if the name
+/// matches one) seed the widths.
 fn try_system_substitute_simple(
     file: &PdfFile,
-    dict: &zpdf_core::PdfDict,
+    descriptor: Option<&zpdf_core::PdfDict>,
     base_font: &str,
     font_type: PdfFontType,
     mut cid_widths: CidWidths,
     provider: Option<&FontProvider>,
 ) -> Option<LoadedFont> {
-    let hints = substitute_hints(file, dict);
+    let hints = descriptor_hints(file, descriptor);
+    let lookup_name = substitute_font_name(base_font, descriptor);
     let m = match provider {
-        Some(provider) => provider.find_font(base_font, hints, None),
-        None => zpdf_font::system::find_system_font(base_font, hints, None),
+        Some(provider) => provider.find_font(lookup_name, hints, None),
+        None => zpdf_font::system::find_system_font(lookup_name, hints, None),
     }?;
-    if cid_widths.is_empty() {
-        if let Some(metrics) = zpdf_font::standard_fonts::lookup(base_font) {
+    if cid_widths.is_empty() && !cid_widths.has_authoritative_default() {
+        if let Some(metrics) = zpdf_font::standard_fonts::lookup(lookup_name) {
             for (code, &w) in metrics.widths.iter().enumerate() {
                 if w > 0 {
                     cid_widths.set(code as u16, w as f64);
@@ -200,22 +479,94 @@ fn try_system_substitute_simple(
     )
 }
 
+/// Standard-14 metrics fallback for simple fonts when no system/provider face
+/// is available and no parsed embedded program remains. Preserves any explicit
+/// PDF `/Widths` or authoritative `/MissingWidth` default.
+fn standard_simple_font(base_font: String, cid_widths: CidWidths) -> Option<LoadedFont> {
+    let mut standard = LoadedFont::new_standard(base_font)?;
+    if !cid_widths.is_empty() || cid_widths.has_authoritative_default() {
+        standard.cid_widths = cid_widths;
+    }
+    Some(standard)
+}
+
+/// Substitute path shared by non-embedded simple fonts and simple fonts whose
+/// embedded program failed to decode or parse. Preserves PDF `/Widths` even
+/// when no system or provider face is available.
+fn fallback_simple_font(
+    file: &PdfFile,
+    descriptor: Option<&zpdf_core::PdfDict>,
+    base_font: String,
+    font_type: PdfFontType,
+    cid_widths: CidWidths,
+    provider: Option<&FontProvider>,
+) -> LoadedFont {
+    try_system_substitute_simple(
+        file,
+        descriptor,
+        &base_font,
+        font_type.clone(),
+        cid_widths.clone(),
+        provider,
+    )
+    .or_else(|| standard_simple_font(base_font.clone(), cid_widths.clone()))
+    .unwrap_or_else(|| {
+        let mut font = LoadedFont::new_placeholder(base_font);
+        font.font_type = font_type;
+        font.cid_widths = cid_widths;
+        font
+    })
+}
+
+fn embedded_fallback_diagnostics(
+    object_id: Option<ObjectId>,
+    error: Option<&zpdf_core::Error>,
+) -> zpdf_core::ProcessingDiagnostics {
+    let mut diagnostics = zpdf_core::ProcessingDiagnostics::default();
+    diagnostics.record_embedded_font_fallback(object_id);
+    // Resource limits on an embedded font stream must remain visible as
+    // incomplete output even if a substitute face is available. Ordinary
+    // stream-decode errors defer `decode_failures` to the interpreter so a
+    // substitute that draws every visible glyph can still complete cleanly.
+    if let Some(err) = error {
+        if matches!(
+            err,
+            zpdf_core::Error::RecursionLimit(_)
+                | zpdf_core::Error::StreamSizeLimit(_)
+                | zpdf_core::Error::StringLengthLimit(_)
+        ) {
+            if let Some(id) = object_id {
+                diagnostics.record_object_failure(id, err);
+            } else {
+                diagnostics.record_decode_failure(err);
+            }
+        }
+    }
+    diagnostics
+}
+
+fn parse_to_unicode(
+    file: &PdfFile,
+    dict: &zpdf_core::PdfDict,
+) -> Option<zpdf_font::cmap::ToUnicodeMap> {
+    let tu_ref = dict.get_ref("ToUnicode").ok()?;
+    let data = file.resolve_stream_data(tu_ref).ok()?;
+    let map = zpdf_font::cmap::ToUnicodeMap::parse(&data);
+    (!map.is_empty()).then_some(map)
+}
+
 /// Attach the simple-font /Encoding, the symbolic flag, and /ToUnicode (for
 /// text extraction) to a freshly-loaded font.
 fn attach_text_mappings(
     file: &PdfFile,
     dict: &zpdf_core::PdfDict,
     subtype: &str,
+    to_unicode: Option<zpdf_font::cmap::ToUnicodeMap>,
     font: &mut LoadedFont,
 ) {
     // /ToUnicode lives at the top-level font dict for both simple and Type0 fonts.
-    if let Ok(tu_ref) = dict.get_ref("ToUnicode") {
-        if let Ok(data) = file.resolve_stream_data(tu_ref) {
-            let map = zpdf_font::cmap::ToUnicodeMap::parse(&data);
-            if !map.is_empty() {
-                font.to_unicode = Some(map);
-            }
-        }
+    if font.to_unicode.is_none() {
+        font.to_unicode = to_unicode;
     }
 
     // /Encoding and the symbolic flag apply only to simple (non-composite) fonts.
@@ -440,23 +791,11 @@ fn parse_dw2(file: &PdfFile, desc_dict: &zpdf_core::PdfDict) -> (f64, f64) {
         .unwrap_or((880.0, -1000.0))
 }
 
-fn load_type0_font(
+fn parse_type0_cmap_and_ordering(
     file: &PdfFile,
     dict: &zpdf_core::PdfDict,
-    base_font: String,
-    provider: Option<&FontProvider>,
-) -> Result<LoadedFont> {
-    // /DescendantFonts is commonly an indirect reference to the array.
-    let descendants = resolve_array(file, dict, "DescendantFonts")
-        .ok_or_else(|| zpdf_core::Error::MissingKey("DescendantFonts".into()))?;
-    // /DescendantFonts is commonly an indirect reference to the array; the
-    // CIDFont entry itself may also be inlined (AutoCAD) instead of a ref.
-    let desc_dict = descendant_cid_dict(file, &descendants)
-        .ok_or_else(|| zpdf_core::Error::MissingKey("DescendantFonts[0]".into()))?;
-    let desc_dict = &desc_dict;
-
-    let mut cid_widths = parse_cid_widths(file, desc_dict);
-    parse_cid_w2(file, desc_dict, &mut cid_widths);
+    desc_dict: &zpdf_core::PdfDict,
+) -> (zpdf_font::cmap::CidCMap, Option<String>) {
     let mut cmap = parse_type0_encoding(file, dict);
     let mut ordering = None;
     if let Some(info) = resolve_dict(file, desc_dict, "CIDSystemInfo") {
@@ -476,19 +815,115 @@ fn load_type0_font(
             }
         }
     }
+    (cmap, ordering)
+}
+
+fn load_type0_font(
+    file: &PdfFile,
+    dict: &zpdf_core::PdfDict,
+    base_font: String,
+    provider: Option<&FontProvider>,
+    to_unicode: Option<&zpdf_font::cmap::ToUnicodeMap>,
+) -> Result<LoadedFontFallback> {
+    // /DescendantFonts is commonly an indirect reference to the array.
+    let descendants = resolve_array(file, dict, "DescendantFonts")
+        .ok_or_else(|| zpdf_core::Error::MissingKey("DescendantFonts".into()))?;
+    // /DescendantFonts is commonly an indirect reference to the array; the
+    // CIDFont entry itself may also be inlined (AutoCAD) instead of a ref.
+    let desc_dict = descendant_cid_dict(file, &descendants)
+        .ok_or_else(|| zpdf_core::Error::MissingKey("DescendantFonts[0]".into()))?;
+    let desc_dict = &desc_dict;
+
+    let mut cid_widths = parse_cid_widths(file, desc_dict);
+    parse_cid_w2(file, desc_dict, &mut cid_widths);
+    let (cmap, ordering) = parse_type0_cmap_and_ordering(file, dict, desc_dict);
     let dw2 = parse_dw2(file, desc_dict);
 
     // Reuse the descriptor for font bytes, substitution hints and variations.
     // Resolving the same indirect dictionaries for each stage needlessly
     // reparses and clones them on cold composite-font loading.
     let descriptor = resolve_dict(file, desc_dict, "FontDescriptor");
-    let hints = descriptor_hints(descriptor.as_ref());
-    let font_data = descriptor
+    let hints = descriptor_hints(file, descriptor.as_ref());
+    let lookup_name = substitute_font_name(&base_font, descriptor.as_ref());
+    let font_file = descriptor
         .as_ref()
-        .and_then(|fd| extract_font_file(file, fd));
+        .map(|fd| extract_font_file(file, fd))
+        .unwrap_or(EmbeddedFontFile::Absent);
 
-    let mut font = match font_data {
-        Some(data) => {
+    // When the CMap is non-identity or carries explicit CID overrides, multiple
+    // source codes can share one CID; resolve physical drawing GIDs per source
+    // code instead of a CID-keyed `cid_to_gid` table (while pure Identity-H/V
+    // maps are 1-to-1 and keep `cid_to_gid` for direct CID lookups).
+    let needs_direct_gids = !cmap.identity || cmap.has_explicit_cids();
+
+    let fallback_type0 = |cid_widths: CidWidths| {
+        // Non-embedded or unloadable embedded composite font: substitute a
+        // matching face while keeping original PDF CID advances.
+        substitute_type0_font(
+            lookup_name,
+            &base_font,
+            cid_widths.clone(),
+            provider,
+            ordering.as_deref(),
+            hints,
+        )
+        .map(|mut sub| {
+            if needs_direct_gids {
+                sub.enable_direct_composite_gids();
+            }
+            sub
+        })
+        .unwrap_or_else(|| {
+            let mut font = LoadedFont::new_placeholder(base_font.clone());
+            // Missing outlines do not change the PDF's composite code
+            // segmentation, CID widths or vertical positioning.
+            font.font_type = PdfFontType::Type0CidType2;
+            font.cid_widths = cid_widths;
+            font
+        })
+    };
+
+    // A substituted composite font can only resolve glyphs when codes or CIDs
+    // map to Unicode (via a Unicode/legacy CMap, a known Adobe CJK collection,
+    // or a parsed non-empty /ToUnicode). Without any of those, substituting
+    // would drop every glyph and discard the PDF's /CIDToGIDMap.
+    let can_substitute = cmap.codes_are_unicode
+        || cmap.is_legacy()
+        || cmap.collection().is_some()
+        || to_unicode.is_some();
+
+    let try_mapped_substitute = |cid_widths: CidWidths| -> Option<LoadedFont> {
+        let mut sub = substitute_type0_font(
+            lookup_name,
+            &base_font,
+            cid_widths,
+            provider,
+            ordering.as_deref(),
+            hints,
+        )?;
+        sub.cid_cmap = Some(cmap.clone());
+        sub.validate_cid_cmap();
+        if needs_direct_gids {
+            sub.enable_direct_composite_gids();
+            sub.has_direct_composite_mapping(to_unicode).then_some(sub)
+        } else {
+            sub.build_substitute_cid_to_gid_from(to_unicode);
+            let has_mapping = sub.unicode_coded()
+                || sub.legacy_substitute()
+                || sub.cid_cmap.as_ref().and_then(|c| c.collection()).is_some()
+                || sub
+                    .cid_to_gid
+                    .as_ref()
+                    .is_some_and(|m| m.values().any(|&g| g != 0));
+            has_mapping.then_some(sub)
+        }
+    };
+
+    let mut diagnostics = zpdf_core::ProcessingDiagnostics::default();
+    let mut companion: Option<LoadedFont> = None;
+    let mut descriptor_spec: Option<std::sync::Arc<zpdf_font::DescriptorSubstituteSpec>> = None;
+    let mut font = match font_file {
+        EmbeddedFontFile::Present { object_id, data } => {
             let mut font = LoadedFont::new_with_data(
                 PdfFontType::Type0CidType2,
                 base_font.clone(),
@@ -505,48 +940,79 @@ fn load_type0_font(
                     font.cid_to_gid = Some(map);
                 }
             }
-            // Some embedded CID-keyed CFF subsets are defective and cannot be
-            // outlined (unparseable per-FD Private DICTs strand the local subrs),
-            // so most glyphs render blank. When the font is identifiably CJK and
-            // the embedded program fails to outline most sampled glyphs, fall
-            // back to a system CJK face (glyphs then route CID→Unicode→GID via
-            // /ToUnicode, attached later in load_single_font).
-            let cjk = is_cjk_ordering(ordering.as_deref())
-                || zpdf_font::system::cjk_ordering_for(&base_font).is_some();
-            if cjk && font.embedded_outline_failure_rate() > 0.5 {
-                if let Some(sub) = substitute_type0_font(
-                    &base_font,
-                    cid_widths,
-                    provider,
-                    ordering.as_deref(),
-                    hints,
-                ) {
-                    font = sub;
+            // Use one consistent sampling policy (`probe_embedded_outlines`) for
+            // choosing the primary face: switch primary to a mapped substitute
+            // only when the embedded program is `Unusable` (keeping the
+            // parseable embedded face as a companion for surviving CIDs). For
+            // `PartiallyCorrupt` and `Healthy`, keep the embedded face primary
+            // and retain lightweight descriptor metadata so any unreadable
+            // shown glyph substitutes lazily without replacing healthy embedded
+            // outlines.
+            match font.probe_embedded_outlines() {
+                zpdf_font::EmbeddedOutlineProbe::Unusable => {
+                    tracing::warn!(
+                        "font {base_font}: embedded composite program failed to parse; falling back to substitute"
+                    );
+                    diagnostics = embedded_fallback_diagnostics(object_id, None);
+                    if can_substitute {
+                        match try_mapped_substitute(cid_widths) {
+                            Some(sub) => {
+                                if font.has_font_data() {
+                                    companion = Some(font);
+                                }
+                                sub
+                            }
+                            None => font,
+                        }
+                    } else {
+                        font
+                    }
+                }
+                zpdf_font::EmbeddedOutlineProbe::PartiallyCorrupt
+                | zpdf_font::EmbeddedOutlineProbe::Healthy => {
+                    descriptor_spec =
+                        Some(std::sync::Arc::new(zpdf_font::DescriptorSubstituteSpec {
+                            lookup_name: (lookup_name != font.base_font)
+                                .then(|| std::sync::Arc::<str>::from(lookup_name)),
+                            hints,
+                            ordering: ordering
+                                .as_deref()
+                                .and_then(zpdf_font::system::canonical_cid_ordering),
+                            font_file_id: object_id,
+                        }));
+                    font
                 }
             }
-            font
         }
-        None => {
-            // Non-embedded composite font (typically CJK): substitute a system
-            // face. CIDs are remapped through /ToUnicode once it is attached
-            // (see build_substitute_cid_to_gid in load_single_font).
-            substitute_type0_font(
-                &base_font,
-                cid_widths.clone(),
-                provider,
-                ordering.as_deref(),
-                hints,
-            )
-            .unwrap_or_else(|| {
+        EmbeddedFontFile::Unreadable { object_id, error } => {
+            tracing::warn!(
+                "font {base_font}: embedded composite font stream unreadable; falling back to substitute"
+            );
+            diagnostics = embedded_fallback_diagnostics(object_id, error.as_ref());
+            if can_substitute {
+                fallback_type0(cid_widths)
+            } else {
                 let mut font = LoadedFont::new_placeholder(base_font);
-                // Missing outlines do not change the PDF's composite code
-                // segmentation, CID widths or vertical positioning.
                 font.font_type = PdfFontType::Type0CidType2;
                 font.cid_widths = cid_widths;
+                if let Some(map) = parse_cid_to_gid_stream(file, desc_dict) {
+                    if desc_dict.get_name("Subtype").unwrap_or("") == "CIDFontType2" {
+                        font.cid_to_gid = Some(map);
+                    }
+                }
                 font
-            })
+            }
         }
+        EmbeddedFontFile::Absent => fallback_type0(cid_widths),
     };
+    if let Some(ref mut emb) = companion {
+        emb.cid_cmap = Some(cmap.clone());
+        emb.dw2 = dw2;
+        emb.validate_cid_cmap();
+        if let Some(descriptor) = descriptor.as_ref() {
+            apply_variations_from_descriptor(descriptor, emb);
+        }
+    }
     font.cid_cmap = Some(cmap);
     font.dw2 = dw2;
     // A Unicode-coded CMap is only usable when the font program can resolve
@@ -555,18 +1021,14 @@ fn load_type0_font(
     if let Some(descriptor) = descriptor.as_ref() {
         apply_variations_from_descriptor(descriptor, &mut font);
     }
-    Ok(font)
-}
-
-/// A registered CJK character-collection ordering (not Adobe-Identity).
-fn is_cjk_ordering(ordering: Option<&str>) -> bool {
-    matches!(ordering, Some("GB1" | "CNS1" | "Japan1" | "Korea1" | "KR"))
+    Ok((font, diagnostics, companion, descriptor_spec))
 }
 
 /// Build a system-font substitute for a composite (Type0) font, carrying over
 /// the PDF's authoritative /W advances. Returns `None` when no installed face
 /// matches (caller keeps the embedded font or a placeholder).
 fn substitute_type0_font(
+    lookup_name: &str,
     base_font: &str,
     cid_widths: CidWidths,
     provider: Option<&FontProvider>,
@@ -574,8 +1036,8 @@ fn substitute_type0_font(
     hints: zpdf_font::system::SubstituteHints,
 ) -> Option<LoadedFont> {
     let matched = match provider {
-        Some(provider) => provider.find_font(base_font, hints, ordering),
-        None => zpdf_font::system::find_system_font(base_font, hints, ordering),
+        Some(provider) => provider.find_font(lookup_name, hints, ordering),
+        None => zpdf_font::system::find_system_font(lookup_name, hints, ordering),
     };
     matched.and_then(|m| {
         LoadedFont::new_substitute(
@@ -633,32 +1095,106 @@ fn parse_cid_to_gid_stream(
     Some(map)
 }
 
-fn load_truetype_font(
+fn load_simple_font(
     file: &PdfFile,
     dict: &zpdf_core::PdfDict,
     base_font: String,
+    font_type: PdfFontType,
     provider: Option<&FontProvider>,
-) -> Result<LoadedFont> {
+) -> Result<LoadedFontFallback> {
     let cid_widths = parse_simple_widths(file, dict);
-    let font_data = extract_font_file_from_descriptor(file, dict);
+    let descriptor = resolve_dict(file, dict, "FontDescriptor");
+    let font_file = descriptor
+        .as_ref()
+        .map(|fd| extract_font_file(file, fd))
+        .unwrap_or(EmbeddedFontFile::Absent);
 
-    match font_data {
-        Some(data) => Ok(LoadedFont::new_with_data(
-            PdfFontType::TrueType,
-            base_font,
-            data,
-            cid_widths,
+    match font_file {
+        EmbeddedFontFile::Present { object_id, data } => {
+            let font = LoadedFont::new_with_data(
+                font_type.clone(),
+                base_font.clone(),
+                data,
+                cid_widths.clone(),
+            );
+            match font.probe_embedded_outlines() {
+                zpdf_font::EmbeddedOutlineProbe::Healthy
+                | zpdf_font::EmbeddedOutlineProbe::PartiallyCorrupt => {
+                    let lookup_name = substitute_font_name(&base_font, descriptor.as_ref());
+                    let spec = std::sync::Arc::new(zpdf_font::DescriptorSubstituteSpec {
+                        lookup_name: (lookup_name != font.base_font)
+                            .then(|| std::sync::Arc::<str>::from(lookup_name)),
+                        hints: descriptor_hints(file, descriptor.as_ref()),
+                        ordering: None,
+                        font_file_id: object_id,
+                    });
+                    Ok((
+                        font,
+                        zpdf_core::ProcessingDiagnostics::default(),
+                        None,
+                        Some(spec),
+                    ))
+                }
+                zpdf_font::EmbeddedOutlineProbe::Unusable => {
+                    tracing::warn!(
+                        "font {base_font}: embedded program failed to parse; falling back to substitute"
+                    );
+                    let (fallback, companion) = match try_system_substitute_simple(
+                        file,
+                        descriptor.as_ref(),
+                        &base_font,
+                        font_type,
+                        cid_widths.clone(),
+                        provider,
+                    ) {
+                        Some(sub) => (sub, font.has_font_data().then_some(font)),
+                        None if !font.has_font_data() => (
+                            standard_simple_font(base_font, cid_widths).unwrap_or(font),
+                            None,
+                        ),
+                        None => (font, None),
+                    };
+                    Ok((
+                        fallback,
+                        embedded_fallback_diagnostics(object_id, None),
+                        companion,
+                        None,
+                    ))
+                }
+            }
+        }
+        EmbeddedFontFile::Unreadable { object_id, error } => {
+            tracing::warn!(
+                "font {base_font}: embedded font stream unreadable; falling back to substitute"
+            );
+            let fallback = fallback_simple_font(
+                file,
+                descriptor.as_ref(),
+                base_font,
+                font_type,
+                cid_widths,
+                provider,
+            );
+            Ok((
+                fallback,
+                embedded_fallback_diagnostics(object_id, error.as_ref()),
+                None,
+                None,
+            ))
+        }
+        EmbeddedFontFile::Absent => Ok((
+            fallback_simple_font(
+                file,
+                descriptor.as_ref(),
+                base_font,
+                font_type,
+                cid_widths,
+                provider,
+            ),
+            zpdf_core::ProcessingDiagnostics::default(),
+            None,
+            None,
         )),
-        None => Ok(try_system_substitute_simple(
-            file,
-            dict,
-            &base_font,
-            PdfFontType::TrueType,
-            cid_widths,
-            provider,
-        )
-        .or_else(|| LoadedFont::new_standard(base_font.clone()))
-        .unwrap_or_else(|| LoadedFont::new_placeholder(base_font))),
     }
 }
 
@@ -794,6 +1330,7 @@ fn load_type3_font(
         font_data: None,
         face_index: 0,
         is_substitute: false,
+        direct_composite_gids: false,
         cid_widths: CidWidths::new(default_width),
         units_per_em: 1000.0,
         ascent: 880.0,
@@ -813,66 +1350,68 @@ fn load_type3_font(
     Ok(font)
 }
 
-fn load_type1_font(
-    file: &PdfFile,
-    dict: &zpdf_core::PdfDict,
-    base_font: String,
-    provider: Option<&FontProvider>,
-) -> Result<LoadedFont> {
-    let cid_widths = parse_simple_widths(file, dict);
-    let font_data = extract_font_file_from_descriptor(file, dict);
-
-    match font_data {
-        Some(data) => Ok(LoadedFont::new_with_data(
-            PdfFontType::Type1,
-            base_font,
-            data,
-            cid_widths,
-        )),
-        None => Ok(try_system_substitute_simple(
-            file,
-            dict,
-            &base_font,
-            PdfFontType::Type1,
-            cid_widths,
-            provider,
-        )
-        .or_else(|| LoadedFont::new_standard(base_font.clone()))
-        .unwrap_or_else(|| LoadedFont::new_placeholder(base_font))),
-    }
+enum EmbeddedFontFile {
+    /// Descriptor declares no `/FontFile`, `/FontFile2`, or `/FontFile3`.
+    Absent,
+    /// Embedded program decoded to non-empty bytes.
+    Present {
+        object_id: Option<ObjectId>,
+        data: Vec<u8>,
+    },
+    /// Descriptor declares an embedded font stream, but resolving/decoding it
+    /// failed or produced an empty/non-stream object.
+    Unreadable {
+        object_id: Option<ObjectId>,
+        error: Option<zpdf_core::Error>,
+    },
 }
 
-/// Extract the embedded program using an already resolved FontDescriptor.
-fn extract_font_file(file: &PdfFile, fd_dict: &zpdf_core::PdfDict) -> Option<Vec<u8>> {
+/// Extract the embedded program using an already resolved FontDescriptor,
+/// distinguishing absent streams (normal non-embedded fonts) from declared
+/// streams that failed to decode or were empty.
+fn extract_font_file(file: &PdfFile, fd_dict: &zpdf_core::PdfDict) -> EmbeddedFontFile {
+    extract_font_file_with_limit(file, fd_dict, None)
+}
+
+fn extract_font_file_with_limit(
+    file: &PdfFile,
+    fd_dict: &zpdf_core::PdfDict,
+    max_decoded_bytes: Option<u64>,
+) -> EmbeddedFontFile {
+    let mut first_failure: Option<(Option<ObjectId>, Option<zpdf_core::Error>)> = None;
     // Try FontFile2 (TrueType), then FontFile3 (OpenType/CFF), then FontFile (Type1)
     for key in &["FontFile2", "FontFile3", "FontFile"] {
-        if let Ok(ff_ref) = fd_dict.get_ref(key) {
-            if let Ok(data) = file.resolve_stream_data(ff_ref) {
-                if !data.is_empty() {
-                    return Some(data);
+        match fd_dict.get(key) {
+            None | Some(PdfObject::Null) => continue,
+            Some(PdfObject::Ref(ff_ref)) => {
+                let decoded = match max_decoded_bytes {
+                    Some(limit) => file.resolve_stream_data_with_limit(*ff_ref, limit),
+                    None => file.resolve_stream_data(*ff_ref),
+                };
+                match decoded {
+                    Ok(data) if !data.is_empty() => {
+                        return EmbeddedFontFile::Present {
+                            object_id: Some(*ff_ref),
+                            data,
+                        };
+                    }
+                    Ok(_) => {
+                        first_failure.get_or_insert((Some(*ff_ref), None));
+                    }
+                    Err(err) => {
+                        first_failure.get_or_insert((Some(*ff_ref), Some(err)));
+                    }
                 }
+            }
+            Some(_) => {
+                first_failure.get_or_insert((None, None));
             }
         }
     }
-    None
-}
-
-fn extract_font_file_from_descriptor(
-    file: &PdfFile,
-    font_dict: &zpdf_core::PdfDict,
-) -> Option<Vec<u8>> {
-    let fd_dict = resolve_dict(file, font_dict, "FontDescriptor")?;
-
-    for key in &["FontFile2", "FontFile3", "FontFile"] {
-        if let Ok(ff_ref) = fd_dict.get_ref(key) {
-            if let Ok(data) = file.resolve_stream_data(ff_ref) {
-                if !data.is_empty() {
-                    return Some(data);
-                }
-            }
-        }
+    match first_failure {
+        Some((object_id, error)) => EmbeddedFontFile::Unreadable { object_id, error },
+        None => EmbeddedFontFile::Absent,
     }
-    None
 }
 
 /// Fetch an array value, resolving one level of indirect reference. pdftex (and
@@ -1085,11 +1624,13 @@ fn parse_simple_widths(file: &PdfFile, dict: &zpdf_core::PdfDict) -> CidWidths {
     // /MissingWidth, which defaults to 0 (Table 122). Fonts without /Widths or
     // without a descriptor (the standard 14 among them) keep the 1000
     // fallback; their advances come from built-in metrics or the program.
-    let default_width = match (&widths_array, resolve_dict(file, dict, "FontDescriptor")) {
-        (Some(_), Some(fd)) => missing_width(file, &fd),
-        _ => 1000.0,
-    };
+    let (default_width, authoritative_default) =
+        match (&widths_array, resolve_dict(file, dict, "FontDescriptor")) {
+            (Some(_), Some(fd)) => (missing_width(file, &fd), true),
+            _ => (1000.0, false),
+        };
     let mut widths = CidWidths::new(default_width);
+    widths.set_authoritative_default(authoritative_default);
 
     if let Some(arr) = widths_array {
         for (j, obj) in arr.iter().take(256).enumerate() {
@@ -1324,5 +1865,32 @@ mod tests {
         assert_eq!(font(true, Some(3)).get(67), 0.0, "spec default");
         assert_eq!(font(true, None).get(67), 1000.0);
         assert_eq!(font(false, Some(2)).get(67), 1000.0);
+    }
+
+    #[test]
+    fn descriptor_hints_read_flags_stemv_weight_and_italic_angle() {
+        let file = PdfFile::parse(crate::test_util::build_pdf(&[
+            "<< /Type /Catalog >>",
+            "<< /Type /FontDescriptor /Flags 3 /FontWeight 700 /ItalicAngle -12 >>",
+            "<< /Type /FontDescriptor /Flags 32 /FontWeight 400 /ItalicAngle 0 /StemV 80 >>",
+            "<< /Type /FontDescriptor /Flags 32 /FontWeight 5 0 R >>",
+            "600",
+        ]))
+        .expect("parse");
+
+        let d1 = file.resolve(ObjectId(2, 0)).unwrap();
+        let h1 = descriptor_hints(&file, Some(d1.as_dict().unwrap()));
+        assert!(h1.fixed_pitch);
+        assert!(h1.serif);
+        assert!(h1.bold);
+        assert!(h1.italic);
+
+        let d2 = file.resolve(ObjectId(3, 0)).unwrap();
+        let h2 = descriptor_hints(&file, Some(d2.as_dict().unwrap()));
+        assert!(!h2.fixed_pitch && !h2.serif && !h2.bold && !h2.italic);
+
+        let d3 = file.resolve(ObjectId(4, 0)).unwrap();
+        let h3 = descriptor_hints(&file, Some(d3.as_dict().unwrap()));
+        assert!(h3.bold, "indirect /FontWeight 600 should set bold hint");
     }
 }

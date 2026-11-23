@@ -1110,12 +1110,23 @@ pub fn base_encoding_by_name(name: &str) -> Option<&'static EncodingTable> {
 // Effective per-font Encoding (base + /Differences)
 // ---------------------------------------------------------------------------
 
+/// Whether an [`Encoding`] was built from the canonical PDF Symbol or
+/// ZapfDingbats table (so canonical codes can still match Windows Symbol /
+/// PUA `0xF000 | code` cmap slots on name-less substitute faces).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CanonicalSymbolBase {
+    None,
+    Symbol,
+    ZapfDingbats,
+}
+
 /// An effective per-font encoding: a base table with optional `/Differences`
 /// overrides applied. Entries borrow from a static base where possible and
 /// own (heap-allocate) only the glyph names introduced by `/Differences`.
 #[derive(Debug, Clone)]
 pub struct Encoding {
     table: Box<[Option<Cow<'static, str>>; 256]>,
+    canonical_symbol: CanonicalSymbolBase,
 }
 
 impl Encoding {
@@ -1133,8 +1144,16 @@ impl Encoding {
     pub fn from_base(table: &'static EncodingTable) -> Self {
         let arr: [Option<Cow<'static, str>>; 256] =
             std::array::from_fn(|i| table[i].map(Cow::Borrowed));
+        let canonical_symbol = if std::ptr::eq(table, &SYMBOL_ENCODING) {
+            CanonicalSymbolBase::Symbol
+        } else if std::ptr::eq(table, &ZAPF_DINGBATS_ENCODING) {
+            CanonicalSymbolBase::ZapfDingbats
+        } else {
+            CanonicalSymbolBase::None
+        };
         Encoding {
             table: Box::new(arr),
+            canonical_symbol,
         }
     }
 
@@ -1153,6 +1172,7 @@ impl Encoding {
         let arr: [Option<Cow<'static, str>>; 256] = std::array::from_fn(|_| None);
         Encoding {
             table: Box::new(arr),
+            canonical_symbol: CanonicalSymbolBase::None,
         }
     }
 
@@ -1165,6 +1185,17 @@ impl Encoding {
     /// Return the glyph name mapped to `code`, or `None` if undefined.
     pub fn glyph_name(&self, code: u8) -> Option<&str> {
         self.table[code as usize].as_deref()
+    }
+
+    /// Whether `code` still maps to its canonical Symbol or ZapfDingbats glyph
+    /// name in an encoding derived from that standard symbolic table.
+    pub(crate) fn is_canonical_symbol_code(&self, code: u8) -> bool {
+        let expected = match self.canonical_symbol {
+            CanonicalSymbolBase::Symbol => SYMBOL_ENCODING[code as usize],
+            CanonicalSymbolBase::ZapfDingbats => ZAPF_DINGBATS_ENCODING[code as usize],
+            CanonicalSymbolBase::None => return false,
+        };
+        expected.is_some() && self.glyph_name(code) == expected
     }
 }
 

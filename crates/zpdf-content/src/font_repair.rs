@@ -185,11 +185,14 @@ impl FontRepair {
         self.evidence.last_mut().map(|(_, codes)| codes)
     }
 
-    /// Whether a shown glyph is blank although its code names visible text.
-    /// Classified once per glyph id and page. A font whose first
-    /// `SAMPLE_GLYPHS` distinct glyphs on the page include no such blank is
-    /// treated as healthy for the rest of the page, so healthy text pays one
-    /// lookup per show; a provider still checks every glyph itself.
+    /// Whether any shown glyph is physically blank while its source code and
+    /// width name visible text. Physical blankness is cached once per glyph id
+    /// and page, while `/ToUnicode` evidence is evaluated per `(code, raw_code,
+    /// length)` so two source codes sharing one zero-length glyph cannot mask
+    /// each other. A font whose first `SAMPLE_GLYPHS` distinct glyphs on the
+    /// page include no such blank is treated as healthy for the rest of the
+    /// page, so healthy text pays one lookup per show; a provider still checks
+    /// every glyph itself.
     pub(crate) fn scan_blanks(
         &mut self,
         font_id: FontId,
@@ -215,43 +218,57 @@ impl FontRepair {
         if !blanks.broken && blanks.classified >= SAMPLE_GLYPHS {
             return false;
         }
-        // Glyphs with outlines are settled from `loca` alone; only a new blank
-        // glyph needs its code decoded and looked up.
-        let mut found = false;
-        let mut blank = false;
+        // Glyphs with outlines are settled from `loca` alone; only physically
+        // blank glyphs need their `(code, raw_code, length)` checked against
+        // `/ToUnicode`.
+        let mut any_blank = false;
         for glyph in glyphs {
-            match blanks.known(glyph.glyph_id) {
-                Some(suspicious) => found |= suspicious,
-                None if blanks.table.is_blank(font, glyph.glyph_id) => blank = true,
-                None => blanks.record(glyph.glyph_id, false),
-            }
+            let is_blank = match blanks.is_blank(glyph.glyph_id) {
+                Some(is_blank) => is_blank,
+                None => {
+                    let is_blank = blanks.table.is_blank(font, glyph.glyph_id);
+                    blanks.record_physical(glyph.glyph_id, is_blank);
+                    is_blank
+                }
+            };
+            any_blank |= is_blank;
         }
-        if !blank {
-            return found;
+        if !any_blank {
+            return false;
         }
         let composite = is_composite(font);
         let cmap = font.cid_cmap.as_ref();
         let mut offset = 0;
+        let mut found = false;
         for glyph in glyphs {
-            let Some((code, _, raw, end)) = next_text_code(cmap, composite, bytes, offset) else {
+            let Some((code, length, raw, end)) = next_text_code(cmap, composite, bytes, offset)
+            else {
                 break;
             };
             offset = end;
-            // Every glyph still unknown is blank (see above).
-            if blanks.known(glyph.glyph_id).is_none() {
-                let suspicious = font.blank_hides_text(code, raw);
-                blanks.record(glyph.glyph_id, suspicious);
-                found |= suspicious;
+            if blanks.is_blank(glyph.glyph_id) == Some(true)
+                && font.blank_hides_text_with_length(code, raw, length as u8)
+            {
+                blanks.broken = true;
+                found = true;
             }
         }
         found
     }
 
-    pub(crate) fn is_suspicious(&self, font_id: FontId, glyph_id: u16) -> bool {
+    pub(crate) fn is_suspicious(
+        &self,
+        font_id: FontId,
+        font: &LoadedFont,
+        glyph_id: u16,
+        code: u32,
+        raw_code: u32,
+        length: u8,
+    ) -> bool {
         self.blanks.iter().any(|(id, blanks)| {
             *id == font_id
-                && blanks.as_ref().and_then(|blanks| blanks.known(glyph_id)) == Some(true)
-        })
+                && blanks.as_ref().and_then(|blanks| blanks.is_blank(glyph_id)) == Some(true)
+        }) && font.blank_hides_text_with_length(code, raw_code, length)
     }
 
     /// A validated glyph from another font for a blank glyph shown for visible
@@ -268,7 +285,7 @@ impl FontRepair {
         if !self.current_scope(cache, scope) {
             return None;
         }
-        let key = (font_id, code, length);
+        let key = (font_id, raw_code, length);
         if let Some(decision) = self.decisions.get(&key) {
             return *decision;
         }
@@ -276,7 +293,7 @@ impl FontRepair {
             return None;
         }
         let font = cache.get(font_id)?;
-        let text = to_unicode(font, code, raw_code)?;
+        let text = to_unicode(font, code, raw_code, length)?;
         let original = code_glyph(font, code, length, raw_code)?;
         let mut found = None;
         for index in 0..self.scope.len() {
@@ -295,7 +312,7 @@ impl FontRepair {
                 || !sibling.has_font_data()
                 || sibling.is_type3()
                 || is_composite(sibling) != is_composite(font)
-                || to_unicode(sibling, code, raw_code) != Some(text)
+                || to_unicode(sibling, code, raw_code, length) != Some(text)
             {
                 continue;
             }
@@ -518,17 +535,25 @@ fn undecodable<'b>(font: &LoadedFont, strings: impl Iterator<Item = &'b [u8]>) -
                 return true;
             }
             codes += 1;
-            drawable = drawable || direct || {
-                let cid = cmap.map_or(code, |cmap| cmap.code_to_cid(code, length as u8));
-                u16::try_from(cid)
-                    .ok()
-                    .filter(|&cid| cid != 0)
-                    .is_some_and(|cid| {
-                        font.cid_to_gid
-                            .as_ref()
-                            .is_none_or(|map| map.get(&cid).is_some_and(|&gid| gid != 0))
-                    })
-            };
+            drawable = drawable
+                || direct
+                || if font.uses_direct_composite_gids() {
+                    let raw_code = rest[..length.max(1).min(rest.len())]
+                        .iter()
+                        .fold(0u32, |value, &byte| (value << 8) | byte as u32);
+                    font.composite_direct_gid(code, raw_code, length as u8)
+                        .is_some()
+                } else {
+                    let cid = cmap.map_or(code, |cmap| cmap.code_to_cid(code, length as u8));
+                    u16::try_from(cid)
+                        .ok()
+                        .filter(|&cid| cid != 0)
+                        .is_some_and(|cid| {
+                            font.cid_to_gid
+                                .as_ref()
+                                .is_none_or(|map| map.get(&cid).is_some_and(|&gid| gid != 0))
+                        })
+                };
             rest = &rest[length.max(1)..];
         }
     }
@@ -573,15 +598,16 @@ impl CodeSet {
     }
 }
 
-/// Blank-glyph classification for one embedded font: whether a shown blank
-/// hides visible text, memoized per glyph id for the page.
+/// Physical blank-glyph classification for one embedded font, memoized per
+/// glyph id for the page. Whether a physically blank glyph hides visible text
+/// is evaluated per source code and byte width.
 struct BlankGlyphs {
     table: BlankGlyphTable,
     known: Vec<u64>,
-    suspicious: Vec<u64>,
+    blank: Vec<u64>,
     /// Distinct glyph ids classified on this page.
     classified: usize,
-    /// Some shown blank glyph hides visible text.
+    /// Some shown blank glyph hid visible text.
     broken: bool,
 }
 
@@ -593,22 +619,23 @@ impl BlankGlyphs {
         Some(Self {
             table: font.blank_glyph_table()?,
             known: Vec::new(),
-            suspicious: Vec::new(),
+            blank: Vec::new(),
             classified: 0,
             broken: false,
         })
     }
 
-    fn known(&self, glyph_id: u16) -> Option<bool> {
-        bit(&self.known, glyph_id).then(|| bit(&self.suspicious, glyph_id))
+    fn is_blank(&self, glyph_id: u16) -> Option<bool> {
+        bit(&self.known, glyph_id).then(|| bit(&self.blank, glyph_id))
     }
 
-    fn record(&mut self, glyph_id: u16, suspicious: bool) {
-        set_bit(&mut self.known, glyph_id);
-        self.classified += 1;
-        if suspicious {
-            set_bit(&mut self.suspicious, glyph_id);
-            self.broken = true;
+    fn record_physical(&mut self, glyph_id: u16, is_blank: bool) {
+        if !bit(&self.known, glyph_id) {
+            set_bit(&mut self.known, glyph_id);
+            self.classified += 1;
+            if is_blank {
+                set_bit(&mut self.blank, glyph_id);
+            }
         }
     }
 }
@@ -652,8 +679,8 @@ fn code_glyph(font: &LoadedFont, code: u32, length: u8, raw_code: u32) -> Option
             .as_ref()
             .map_or(code, |cmap| cmap.code_to_cid(code, length));
         let cid = u16::try_from(cid).ok()?;
-        let glyph_id = if font.unicode_coded() || font.legacy_substitute() {
-            font.composite_unicode_gid(code, raw_code, length)?
+        let glyph_id = if font.uses_direct_composite_gids() {
+            font.composite_direct_gid(code, raw_code, length)?
         } else {
             cid
         };
@@ -698,9 +725,8 @@ fn decode_exactly<'b>(
     Some(codes)
 }
 
-fn to_unicode(font: &LoadedFont, code: u32, raw_code: u32) -> Option<&str> {
-    let map = font.to_unicode.as_ref()?;
-    map.lookup(raw_code).or_else(|| map.lookup(code))
+fn to_unicode(font: &LoadedFont, code: u32, raw_code: u32, length: u8) -> Option<&str> {
+    font.lookup_to_unicode(code, raw_code, length)
 }
 
 fn is_composite(font: &LoadedFont) -> bool {

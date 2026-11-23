@@ -700,6 +700,79 @@ fn a_type0_show_with_no_drawable_code_is_still_leaked_simple_text() {
     assert_eq!(spans[2].text, "AB");
 }
 
+#[test]
+fn shared_zero_length_glyph_evaluates_blank_unicode_evidence_per_code_width_in_both_orders() {
+    // Prefix-free mixed-width CMap where both 1-byte `<41>` and 2-byte `<0041>`
+    // select CID 2 (zero-length in `CAD_BROKEN`, drawn 'A' in `CAD`), while
+    // `/ToUnicode` maps only `<0041>` to 'A' (or `<41>` to space and `<0041>`
+    // to 'A'). Showing `<41>` first must not cache the shared glyph ID as
+    // permanently non-suspicious and skip sibling repair for `<0041>`, and
+    // showing `<0041>` first must not repair `<41>`.
+    let mixed_cmap = b"2 begincodespacerange <20> <7E> <0000> <1FFF> endcodespacerange\n\
+        2 begincidchar <41> 2 <0041> 2 endcidchar";
+    for (tu_label, to_unicode, expected_short_then_long_text, expected_long_then_short_text) in [
+        (
+            "long-only",
+            b"1 beginbfchar <0041> <0041> endbfchar".as_slice(),
+            "A",
+            "A",
+        ),
+        (
+            "short-space-long-visible",
+            b"2 beginbfchar <41> <0020> <0041> <0041> endbfchar".as_slice(),
+            " A",
+            "A ",
+        ),
+    ] {
+        for (order_label, content, expect_broken_first, expected_text) in [
+            (
+                "separate-short-then-long",
+                b"BT /Broken 10 Tf <41> Tj <0041> Tj ET".as_slice(),
+                true,
+                expected_short_then_long_text,
+            ),
+            (
+                "separate-long-then-short",
+                b"BT /Broken 10 Tf <0041> Tj <41> Tj ET".as_slice(),
+                false,
+                expected_long_then_short_text,
+            ),
+            (
+                "combined-short-then-long",
+                b"BT /Broken 10 Tf <410041> Tj ET".as_slice(),
+                true,
+                expected_short_then_long_text,
+            ),
+            (
+                "combined-long-then-short",
+                b"BT /Broken 10 Tf <004141> Tj ET".as_slice(),
+                false,
+                expected_long_then_short_text,
+            ),
+        ] {
+            let label = format!("{tu_label}/{order_label}");
+            let mut broken_font = type0(CAD_BROKEN, "ABCDEF+MixedBroken", to_unicode);
+            broken_font.cid_cmap = Some(CidCMap::parse(mixed_cmap));
+            let mut good_font = type0(CAD, "GHIJKL+MixedGood", to_unicode);
+            good_font.cid_cmap = Some(CidCMap::parse(mixed_cmap));
+
+            let mut page = new_page(vec![("Broken", broken_font), ("Good", good_font)]);
+            let (broken, good) = (page.ids[0], page.ids[1]);
+            let (list, stats, spans) = page.run(content);
+
+            let expected_runs = if expect_broken_first {
+                vec![(broken, vec![2]), (good, vec![2])]
+            } else {
+                vec![(good, vec![2]), (broken, vec![2])]
+            };
+            assert_eq!(fonts_and_glyphs(&list), expected_runs, "{label}");
+            assert_eq!(stats.font_repairs, 1, "{label}");
+            let extracted: String = spans.iter().map(|s| s.text.as_str()).collect();
+            assert_eq!(extracted, expected_text, "{label}");
+        }
+    }
+}
+
 /// A realistic page with a system CJK font: Chinese text in a full
 /// Identity-H font and English lines with tabs in a simple font. Opt-in,
 /// since it needs a font from macOS.

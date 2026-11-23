@@ -219,10 +219,12 @@ impl<'a> SlideConverter<'a> {
     fn convert_glyph_run(&mut self, glyph_run: &zpdf_display_list::GlyphRun) -> Result<()> {
         use zpdf_display_list::Paint;
 
-        // Extract text from glyphs
+        // Extract text from glyphs using the logical PDF font (following any
+        // admitted drawing-only companion/fallback face back to its original
+        // Type 0 / simple PDF font so `/ToUnicode` and `/Encoding` stay intact).
         let font = self
             .font_cache
-            .get(glyph_run.font_id)
+            .logical_font(glyph_run.font_id)
             .ok_or_else(|| zpdf_core::Error::StreamDecode("Font not found".into()))?;
 
         let mut text = String::new();
@@ -232,26 +234,10 @@ impl<'a> SlideConverter<'a> {
         let mut max_y = f32::NEG_INFINITY;
 
         for glyph in &glyph_run.glyphs {
-            // /ToUnicode is keyed by the source character code, not the glyph
-            // id. A simple font's one-byte code decodes exactly as in text
-            // extraction (/ToUnicode, then the encoding's glyph names); a
-            // composite font's code means nothing without /ToUnicode.
-            match font.font_type {
-                zpdf_font::PdfFontType::Type0CidType2 => {
-                    if let Some(unicode) = font
-                        .to_unicode
-                        .as_ref()
-                        .and_then(|to_unicode| to_unicode.lookup(glyph.code))
-                    {
-                        text.push_str(unicode);
-                    }
-                }
-                _ => {
-                    if let Ok(byte) = u8::try_from(glyph.code) {
-                        text.push_str(&font.decode_to_string(&[byte]));
-                    }
-                }
-            }
+            // Decode each glyph's packed source bytes and byte width through
+            // the logical PDF font's own text decoder (`/ToUnicode`, then
+            // composite `/Encoding` CMap or simple encoding / glyph names).
+            font.append_decoded_source_code(glyph.code, glyph.code_len, &mut text);
 
             // Track bounding box
             min_x = min_x.min(glyph.x);
@@ -566,6 +552,7 @@ mod export_tests {
                 font_size: 12.0,
                 glyphs: vec![PositionedGlyph {
                     glyph_id: 1,
+                    code_len: 1,
                     code: 65,
                     x: 0.0,
                     y: 0.0,
@@ -654,6 +641,7 @@ mod export_tests {
             font_size: 12.0,
             glyphs: vec![PositionedGlyph {
                 glyph_id,
+                code_len: 0,
                 code,
                 x: 100.0,
                 y: 100.0,
@@ -702,6 +690,139 @@ mod export_tests {
     }
 
     #[test]
+    fn composite_font_mixed_one_and_three_byte_to_unicode_exports_three_byte_code() {
+        let make_font = || {
+            let mut font = LoadedFont::new_placeholder("MixedThreeByte".into());
+            font.font_type = zpdf_font::PdfFontType::Type0CidType2;
+            font.to_unicode = Some(ToUnicodeMap::parse(
+                b"begincmap 2 begincodespacerange <00> <FF> <000000> <FFFFFF> endcodespacerange \
+                  2 beginbfchar <41> <0058> <010203> <0041> endbfchar endcmap",
+            ));
+            font
+        };
+
+        // Explicit source byte length (`code_len = 3` and `code_len = 1`) must
+        // match `(raw_code, len)` directly before fixed-width 2-byte recovery
+        // splits `<010203>` into `<0102>` and `<03>`.
+        let mut fonts = FontCache::new();
+        let font_id = fonts.insert("F1".into(), make_font());
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 612.0, 792.0));
+        dl.push(RenderCommand::DrawGlyphRun(GlyphRun {
+            font_id,
+            font_size: 12.0,
+            glyphs: vec![
+                PositionedGlyph {
+                    glyph_id: 7,
+                    code_len: 3,
+                    code: 0x010203,
+                    x: 100.0,
+                    y: 100.0,
+                    advance: 6.0,
+                },
+                PositionedGlyph {
+                    glyph_id: 8,
+                    code_len: 1,
+                    code: 0x41,
+                    x: 106.0,
+                    y: 100.0,
+                    advance: 6.0,
+                },
+            ],
+            paint: Paint::Solid(Color::black()),
+            alpha: 1.0,
+            overprint: None,
+            transform: Matrix::identity(),
+            h_scale: 1.0,
+        }));
+        let slide = display_list_to_slide(
+            &dl,
+            0,
+            &fonts,
+            &ImageCache::new(),
+            &ConversionOptions::default(),
+        )
+        .expect("slide");
+        let explicit_text: String = slide
+            .elements
+            .iter()
+            .filter_map(|e| match e {
+                SlideElement::TextBox { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(explicit_text, "AX");
+
+        // Inferred-width path (`code_len = 0` via `run_text`) must also emit
+        // `"A"` for `<010203>` and `"X"` for `<41>`.
+        assert_eq!(run_text(make_font(), 7, 0x010203), "A");
+        assert_eq!(run_text(make_font(), 8, 0x41), "X");
+
+        // With `code_len = 0`, no `/ToUnicode`, and `/90ms-RKSJ-H`, `<41>` is a
+        // complete 1-byte code and must not be zero-padded to `<0041>` (which
+        // would decode `<00>` and drop `<41>`), while `<8141>` still infers
+        // 2 bytes and `/UniGB-UCS2-H` still infers 2 bytes for `<0041>`.
+        let rksj_font = || {
+            let mut font = LoadedFont::new_placeholder("Rksj".into());
+            font.font_type = zpdf_font::PdfFontType::Type0CidType2;
+            font.cid_cmap = zpdf_font::cmap::CidCMap::predefined("90ms-RKSJ-H");
+            font
+        };
+        assert_eq!(run_text(rksj_font(), 1, 0x41), "A");
+        assert_eq!(run_text(rksj_font(), 2, 0x8141), "\u{3001}");
+
+        let mut ucs2_font = LoadedFont::new_placeholder("Ucs2".into());
+        ucs2_font.font_type = zpdf_font::PdfFontType::Type0CidType2;
+        ucs2_font.cid_cmap = zpdf_font::cmap::CidCMap::predefined("UniGB-UCS2-H");
+        assert_eq!(run_text(ucs2_font, 1, 0x41), "A");
+
+        // Fixed-width 1-byte recovery still splits a 2-byte unmapped chunk
+        // when no exact `(raw_code, len)` entry exists.
+        let mut one_byte_font = LoadedFont::new_placeholder("OneByteFallback".into());
+        one_byte_font.font_type = zpdf_font::PdfFontType::Type0CidType2;
+        one_byte_font.to_unicode = Some(ToUnicodeMap::parse(
+            b"begincmap 1 begincodespacerange <00> <FF> endcodespacerange \
+              2 beginbfchar <57> <0057> <69> <4E2D> endbfchar endcmap",
+        ));
+        let mut fonts = FontCache::new();
+        let font_id = fonts.insert("F1".into(), one_byte_font);
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 612.0, 792.0));
+        dl.push(RenderCommand::DrawGlyphRun(GlyphRun {
+            font_id,
+            font_size: 12.0,
+            glyphs: vec![PositionedGlyph {
+                glyph_id: 1,
+                code_len: 2,
+                code: 0x5769,
+                x: 100.0,
+                y: 100.0,
+                advance: 6.0,
+            }],
+            paint: Paint::Solid(Color::black()),
+            alpha: 1.0,
+            overprint: None,
+            transform: Matrix::identity(),
+            h_scale: 1.0,
+        }));
+        let slide = display_list_to_slide(
+            &dl,
+            0,
+            &fonts,
+            &ImageCache::new(),
+            &ConversionOptions::default(),
+        )
+        .expect("slide");
+        let fixed_text: String = slide
+            .elements
+            .iter()
+            .filter_map(|e| match e {
+                SlideElement::TextBox { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(fixed_text, "W中");
+    }
+
+    #[test]
     fn to_unicode_is_keyed_by_character_code_not_glyph_id() {
         let mut font = LoadedFont::new_placeholder("Simple".into());
         // Map code 0x41 to a non-ASCII character, so falling back to the code
@@ -719,6 +840,7 @@ mod export_tests {
             font_size: 12.0,
             glyphs: vec![PositionedGlyph {
                 glyph_id: 99,
+                code_len: 1,
                 code: 0x41,
                 x: 100.0,
                 y: 100.0,
@@ -857,5 +979,690 @@ mod export_tests {
         // A zero-width PDF stroke is a hairline, not an invisible outline.
         assert!(!xml.contains("<a:ln><a:noFill/></a:ln>"), "{xml}");
         assert!(xml.contains("<a:ln w=\"3175\">"), "{xml}");
+    }
+
+    #[test]
+    fn recovered_type0_two_byte_code_exports_slide_text_via_logical_font() {
+        use std::sync::Arc;
+        use zpdf_font::{CidWidths, FontProvider, LoadedFont, PdfFontType};
+
+        const PRIMARY_TTF: &[u8] =
+            include_bytes!("../../zpdf-font/tests/fixtures/coverage-primary.ttf");
+
+        let probe = LoadedFont::new_with_data(
+            PdfFontType::TrueType,
+            "Probe".into(),
+            PRIMARY_TTF.to_vec(),
+            CidWidths::new(1000.0),
+        );
+        let gid_a = probe.unicode_glyph('A' as u32).unwrap().0;
+        let gid_b = probe.unicode_glyph('B' as u32).unwrap().0;
+
+        // Corrupt only `gid_a` in `PRIMARY_TTF` (invalid `loca` start > end) so
+        // the embedded Type 0 face stays primary and lazily admits a simple
+        // TrueType descriptor-substitute drawing face for `<0102>` ('A').
+        let mut partial_ttf = PRIMARY_TTF.to_vec();
+        let num_tables = u16::from_be_bytes([partial_ttf[4], partial_ttf[5]]) as usize;
+        let mut loca_off = None;
+        for i in 0..num_tables {
+            let rec = 12 + i * 16;
+            if &partial_ttf[rec..rec + 4] == b"loca" {
+                loca_off = Some(u32::from_be_bytes(
+                    partial_ttf[rec + 8..rec + 12].try_into().unwrap(),
+                ) as usize);
+                break;
+            }
+        }
+        let loca_off = loca_off.expect("loca table");
+        let entry = loca_off + gid_a as usize * 4;
+        partial_ttf[entry..entry + 4].copy_from_slice(&0xFFFF_FF00u32.to_be_bytes());
+
+        let cmap = format!(
+            "/CIDInit /ProcSet findresource begin 12 dict begin begincmap \
+             /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> def \
+             /CMapName /TwoByteRecovered def /CMapType 1 def \
+             1 begincodespacerange <0000> <FFFF> endcodespacerange \
+             2 begincidchar <0102> {gid_a} <0103> {gid_b} endcidchar \
+             endcmap CMapName currentdict /CMap defineresource pop end end"
+        );
+        let to_unicode = b"/CIDInit /ProcSet findresource begin 12 dict begin begincmap \
+            1 begincodespacerange <0000> <FFFF> endcodespacerange \
+            2 beginbfchar <0102> <0041> <0103> <0042> endbfchar \
+            endcmap CMapName currentdict /CMap defineresource pop end end";
+
+        let stream = |dict: &str, bytes: &[u8]| -> Vec<u8> {
+            let mut out = format!("<< {dict} /Length {} >>\nstream\n", bytes.len()).into_bytes();
+            out.extend_from_slice(bytes);
+            out.extend_from_slice(b"\nendstream");
+            out
+        };
+        let objects: Vec<Vec<u8>> = vec![
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] \
+              /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
+                .to_vec(),
+            stream("", b"0 0 0 rg BT /F1 18 Tf 20 50 Td <01020103> Tj ET"),
+            b"<< /Type /Font /Subtype /Type0 /BaseFont /ABCDEF+PptxRecoveredCid \
+              /Encoding 9 0 R /DescendantFonts [6 0 R] /ToUnicode 10 0 R >>"
+                .to_vec(),
+            b"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /ABCDEF+PptxRecoveredCid \
+              /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> \
+              /CIDToGIDMap /Identity /FontDescriptor 7 0 R /DW 600 >>"
+                .to_vec(),
+            b"<< /Type /FontDescriptor /FontName /ABCDEF+PptxRecoveredCid /Flags 32 /FontFile2 8 0 R >>"
+                .to_vec(),
+            stream("", &partial_ttf),
+            stream("", cmap.as_bytes()),
+            stream("", to_unicode),
+        ];
+        let mut pdf = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n".to_vec();
+        let mut offsets = Vec::with_capacity(objects.len());
+        for (idx, body) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.extend_from_slice(format!("{} 0 obj\n", idx + 1).as_bytes());
+            pdf.extend_from_slice(body);
+            pdf.extend_from_slice(b"\nendobj\n");
+        }
+        let xref = pdf.len();
+        let count = objects.len() + 1;
+        pdf.extend_from_slice(format!("xref\n0 {count}\n0000000000 65535 f \n").as_bytes());
+        for off in offsets {
+            pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size {count} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n")
+                .as_bytes(),
+        );
+
+        let provider = Arc::new(FontProvider::memory_only());
+        provider
+            .register_with_aliases(PRIMARY_TTF, 0, &["PptxRecoveredCid"])
+            .unwrap();
+        let doc = zpdf_document::PdfDocument::open(pdf)
+            .unwrap()
+            .with_font_provider(provider);
+        let page = doc.page(0).unwrap();
+        let mut fonts = doc.load_page_fonts(&page);
+        let (content, _) = doc.page_content_with_diagnostics(&page).unwrap();
+        let mut images = ImageCache::new();
+        let interpreter = zpdf_content::interpreter::ContentInterpreter::new(page.effective_box())
+            .with_document(doc.file(), &page.resources)
+            .with_fonts(&mut fonts)
+            .with_shared_fonts(&doc)
+            .with_images(&mut images);
+        let (display_list, _) = interpreter.interpret_with_stats(&content);
+
+        let (fid_primary, primary) = fonts.get_by_name("F1").unwrap();
+        assert!(!primary.is_substitute, "embedded Type 0 face stays primary");
+        let runs: Vec<_> = display_list
+            .commands
+            .iter()
+            .filter_map(|cmd| match cmd {
+                RenderCommand::DrawGlyphRun(run) => Some(run),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(runs.len(), 2, "recovered <0102> + embedded <0103>");
+        assert_ne!(
+            runs[0].font_id, fid_primary,
+            "<0102> must draw on the admitted descriptor substitute drawing face"
+        );
+        assert!(matches!(
+            fonts.get(runs[0].font_id).unwrap().font_type,
+            PdfFontType::TrueType
+        ));
+        assert_eq!(runs[0].glyphs[0].code, 0x0102);
+
+        let slide = display_list_to_slide(
+            &display_list,
+            0,
+            &fonts,
+            &images,
+            &ConversionOptions::default(),
+        )
+        .expect("slide export");
+        let slide_text: String = slide
+            .elements
+            .iter()
+            .filter_map(|e| match e {
+                SlideElement::TextBox { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            slide_text, "AB",
+            "PPTX slide export must recover 'A' for two-byte code <0102> through logical_font"
+        );
+    }
+
+    #[test]
+    fn recovered_type0_unicode_cmap_and_utf16_surrogate_export_slide_text() {
+        use std::sync::Arc;
+        use zpdf_font::{CidWidths, FontProvider, LoadedFont, PdfFontType};
+
+        const PRIMARY_TTF: &[u8] =
+            include_bytes!("../../zpdf-font/tests/fixtures/coverage-primary.ttf");
+
+        let probe = LoadedFont::new_with_data(
+            PdfFontType::TrueType,
+            "Probe".into(),
+            PRIMARY_TTF.to_vec(),
+            CidWidths::new(1000.0),
+        );
+        let gid_a = probe.unicode_glyph('A' as u32).unwrap().0;
+
+        // Corrupt only `gid_a` so the embedded Type 0 font stays primary and
+        // lazily admits a drawing-only descriptor substitute for the damaged
+        // glyph while keeping 'B' on the embedded face.
+        let mut partial_ttf = PRIMARY_TTF.to_vec();
+        let num_tables = u16::from_be_bytes([partial_ttf[4], partial_ttf[5]]) as usize;
+        let mut loca_off = None;
+        for i in 0..num_tables {
+            let rec = 12 + i * 16;
+            if &partial_ttf[rec..rec + 4] == b"loca" {
+                loca_off = Some(u32::from_be_bytes(
+                    partial_ttf[rec + 8..rec + 12].try_into().unwrap(),
+                ) as usize);
+                break;
+            }
+        }
+        let loca_off = loca_off.expect("loca table");
+        let entry = loca_off + gid_a as usize * 4;
+        partial_ttf[entry..entry + 4].copy_from_slice(&0xFFFF_FF00u32.to_be_bytes());
+
+        let stream = |dict: &str, bytes: &[u8]| -> Vec<u8> {
+            let mut out = format!("<< {dict} /Length {} >>\nstream\n", bytes.len()).into_bytes();
+            out.extend_from_slice(bytes);
+            out.extend_from_slice(b"\nendstream");
+            out
+        };
+        let assemble = |objects: &[Vec<u8>]| -> Vec<u8> {
+            let mut pdf = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n".to_vec();
+            let mut offsets = Vec::with_capacity(objects.len());
+            for (idx, body) in objects.iter().enumerate() {
+                offsets.push(pdf.len());
+                pdf.extend_from_slice(format!("{} 0 obj\n", idx + 1).as_bytes());
+                pdf.extend_from_slice(body);
+                pdf.extend_from_slice(b"\nendobj\n");
+            }
+            let xref = pdf.len();
+            let count = objects.len() + 1;
+            pdf.extend_from_slice(format!("xref\n0 {count}\n0000000000 65535 f \n").as_bytes());
+            for off in offsets {
+                pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+            }
+            pdf.extend_from_slice(
+                format!("trailer\n<< /Size {count} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n")
+                    .as_bytes(),
+            );
+            pdf
+        };
+
+        let provider = Arc::new(FontProvider::memory_only());
+        provider
+            .register_with_aliases(PRIMARY_TTF, 0, &["PptxUnicodeCmapFace"])
+            .unwrap();
+
+        // 1. `/UniGB-UCS2-H` WITHOUT `/ToUnicode`: recovered `<0041>` draws via
+        //    descriptor substitute and must export slide text "AB" via the
+        //    logical font's CMap decoder.
+        let ucs2_pdf = assemble(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] \
+              /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
+                .to_vec(),
+            stream("", b"0 0 0 rg BT /F1 18 Tf 20 50 Td <00410042> Tj ET"),
+            b"<< /Type /Font /Subtype /Type0 /BaseFont /ABCDEF+PptxUnicodeCmapFace \
+              /Encoding /UniGB-UCS2-H /DescendantFonts [6 0 R] >>"
+                .to_vec(),
+            b"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /ABCDEF+PptxUnicodeCmapFace \
+              /CIDSystemInfo << /Registry (Adobe) /Ordering (GB1) /Supplement 0 >> \
+              /CIDToGIDMap /Identity /FontDescriptor 7 0 R /DW 600 >>"
+                .to_vec(),
+            b"<< /Type /FontDescriptor /FontName /ABCDEF+PptxUnicodeCmapFace /Flags 32 /FontFile2 8 0 R >>"
+                .to_vec(),
+            stream("", &partial_ttf),
+        ]);
+
+        // 2. `/UniGB-UTF16-H` with an explicit 4-byte UTF-16 surrogate
+        //    `/ToUnicode` mapping `<D840DC00> -> <0041>` ('A'): the display
+        //    list must keep the packed source bytes `0xD840DC00` + `code_len=4`
+        //    so PPTX export resolves the explicit `/ToUnicode` entry ('A')
+        //    instead of dropping it or emitting U+20000, while `<0042>` without
+        //    `/ToUnicode` still decodes as 'B' through the CMap.
+        let utf16_to_unicode = b"/CIDInit /ProcSet findresource begin 12 dict begin begincmap \
+            1 begincodespacerange <0000> <FFFF> endcodespacerange \
+            1 beginbfchar <D840DC00> <0041> endbfchar \
+            endcmap CMapName currentdict /CMap defineresource pop end end";
+        let utf16_pdf = assemble(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] \
+              /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
+                .to_vec(),
+            stream("", b"0 0 0 rg BT /F1 18 Tf 20 50 Td <D840DC000042> Tj ET"),
+            b"<< /Type /Font /Subtype /Type0 /BaseFont /ABCDEF+PptxUnicodeCmapFace \
+              /Encoding /UniGB-UTF16-H /DescendantFonts [6 0 R] /ToUnicode 9 0 R >>"
+                .to_vec(),
+            b"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /ABCDEF+PptxUnicodeCmapFace \
+              /CIDSystemInfo << /Registry (Adobe) /Ordering (GB1) /Supplement 0 >> \
+              /CIDToGIDMap /Identity /FontDescriptor 7 0 R /DW 600 >>"
+                .to_vec(),
+            b"<< /Type /FontDescriptor /FontName /ABCDEF+PptxUnicodeCmapFace /Flags 32 /FontFile2 8 0 R >>"
+                .to_vec(),
+            stream("", &partial_ttf),
+            stream("", utf16_to_unicode),
+        ]);
+
+        for (label, pdf, expected_code, expected_len) in [
+            ("unigb-ucs2-no-tounicode", ucs2_pdf, 0x0041u32, 2u8),
+            (
+                "unigb-utf16-surrogate-tounicode",
+                utf16_pdf,
+                0xD840_DC00u32,
+                4u8,
+            ),
+        ] {
+            let doc = zpdf_document::PdfDocument::open(pdf)
+                .unwrap()
+                .with_font_provider(Arc::clone(&provider));
+            let page = doc.page(0).unwrap();
+            let mut fonts = doc.load_page_fonts(&page);
+            let (content, _) = doc.page_content_with_diagnostics(&page).unwrap();
+            let mut images = ImageCache::new();
+            let interpreter =
+                zpdf_content::interpreter::ContentInterpreter::new(page.effective_box())
+                    .with_document(doc.file(), &page.resources)
+                    .with_fonts(&mut fonts)
+                    .with_shared_fonts(&doc)
+                    .with_images(&mut images);
+            let (display_list, _) = interpreter.interpret_with_stats(&content);
+
+            let (fid_primary, primary) = fonts.get_by_name("F1").unwrap();
+            assert!(!primary.is_substitute, "{label}");
+            let runs: Vec<_> = display_list
+                .commands
+                .iter()
+                .filter_map(|cmd| match cmd {
+                    RenderCommand::DrawGlyphRun(run) => Some(run),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                runs.len(),
+                2,
+                "{label}: recovered first glyph + embedded 'B'"
+            );
+            assert_ne!(runs[0].font_id, fid_primary, "{label}");
+            assert_eq!(runs[0].glyphs[0].code, expected_code, "{label}");
+            assert_eq!(runs[0].glyphs[0].code_len, expected_len, "{label}");
+
+            let slide = display_list_to_slide(
+                &display_list,
+                0,
+                &fonts,
+                &images,
+                &ConversionOptions::default(),
+            )
+            .expect("slide export");
+            let slide_text: String = slide
+                .elements
+                .iter()
+                .filter_map(|e| match e {
+                    SlideElement::TextBox { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                slide_text, "AB",
+                "{label}: PPTX slide export must decode recovered Type 0 text through logical font decoder"
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_width_tounicode_with_both_widths_exports_same_text_in_both_orders() {
+        use std::sync::Arc;
+        use zpdf_font::{CidWidths, FontProvider, LoadedFont, PdfFontType};
+
+        const PRIMARY_TTF: &[u8] =
+            include_bytes!("../../zpdf-font/tests/fixtures/coverage-primary.ttf");
+
+        let probe = LoadedFont::new_with_data(
+            PdfFontType::TrueType,
+            "Probe".into(),
+            PRIMARY_TTF.to_vec(),
+            CidWidths::new(1000.0),
+        );
+        let gid_a = probe.unicode_glyph('A' as u32).unwrap().0;
+        let gid_b = probe.unicode_glyph('B' as u32).unwrap().0;
+        assert_ne!(gid_a, gid_b);
+
+        let stream = |dict: &str, bytes: &[u8]| -> Vec<u8> {
+            let mut out = format!("<< {dict} /Length {} >>\nstream\n", bytes.len()).into_bytes();
+            out.extend_from_slice(bytes);
+            out.extend_from_slice(b"\nendstream");
+            out
+        };
+        let assemble = |objects: &[Vec<u8>]| -> Vec<u8> {
+            let mut pdf = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n".to_vec();
+            let mut offsets = Vec::with_capacity(objects.len());
+            for (idx, body) in objects.iter().enumerate() {
+                offsets.push(pdf.len());
+                pdf.extend_from_slice(format!("{} 0 obj\n", idx + 1).as_bytes());
+                pdf.extend_from_slice(body);
+                pdf.extend_from_slice(b"\nendobj\n");
+            }
+            let xref = pdf.len();
+            let count = objects.len() + 1;
+            pdf.extend_from_slice(format!("xref\n0 {count}\n0000000000 65535 f \n").as_bytes());
+            for off in offsets {
+                pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+            }
+            pdf.extend_from_slice(
+                format!("trailer\n<< /Size {count} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n")
+                    .as_bytes(),
+            );
+            pdf
+        };
+
+        let mixed_cmap = b"/CIDInit /ProcSet findresource begin 12 dict begin begincmap \
+            /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> def \
+            /CMapName /PptxMixedWidth def /CMapType 1 def \
+            2 begincodespacerange <20> <7E> <0000> <1FFF> endcodespacerange \
+            2 begincidchar <41> 1 <0041> 2 endcidchar \
+            endcmap CMapName currentdict /CMap defineresource pop end end";
+
+        let provider = Arc::new(FontProvider::memory_only());
+        provider
+            .register_with_aliases(PRIMARY_TTF, 0, &["PptxMixedWidthFace"])
+            .unwrap();
+
+        for (label, to_unicode) in [
+            (
+                "short-then-long",
+                b"/CIDInit /ProcSet findresource begin 12 dict begin begincmap \
+                  2 begincodespacerange <00> <FF> <0000> <FFFF> endcodespacerange \
+                  2 beginbfchar <41> <0041> <0041> <0042> endbfchar \
+                  endcmap CMapName currentdict /CMap defineresource pop end end"
+                    .as_slice(),
+            ),
+            (
+                "long-then-short",
+                b"/CIDInit /ProcSet findresource begin 12 dict begin begincmap \
+                  2 begincodespacerange <00> <FF> <0000> <FFFF> endcodespacerange \
+                  2 beginbfchar <0041> <0042> <41> <0041> endbfchar \
+                  endcmap CMapName currentdict /CMap defineresource pop end end"
+                    .as_slice(),
+            ),
+        ] {
+            let pdf = assemble(&[
+                b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+                b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] \
+                  /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
+                    .to_vec(),
+                stream("", b"0 0 0 rg BT /F1 18 Tf 20 50 Td <410041> Tj ET"),
+                b"<< /Type /Font /Subtype /Type0 /BaseFont /ABCDEF+PptxMixedWidthFace \
+                  /Encoding 9 0 R /DescendantFonts [6 0 R] /ToUnicode 10 0 R >>"
+                    .to_vec(),
+                b"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /ABCDEF+PptxMixedWidthFace \
+                  /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> \
+                  /CIDToGIDMap /Identity /FontDescriptor 7 0 R /DW 600 >>"
+                    .to_vec(),
+                b"<< /Type /FontDescriptor /FontName /ABCDEF+PptxMixedWidthFace /Flags 32 /FontFile2 8 0 R >>"
+                    .to_vec(),
+                stream("", b"corrupt unparseable truetype bytes"),
+                stream("", mixed_cmap),
+                stream("", to_unicode),
+            ]);
+
+            let doc = zpdf_document::PdfDocument::open(pdf)
+                .unwrap()
+                .with_font_provider(Arc::clone(&provider));
+            let page = doc.page(0).unwrap();
+            let mut fonts = doc.load_page_fonts(&page);
+            let (content, _) = doc.page_content_with_diagnostics(&page).unwrap();
+            let mut images = ImageCache::new();
+            let mut extracted = Vec::new();
+            let interpreter =
+                zpdf_content::interpreter::ContentInterpreter::new(page.effective_box())
+                    .with_document(doc.file(), &page.resources)
+                    .with_fonts(&mut fonts)
+                    .with_shared_fonts(&doc)
+                    .with_images(&mut images)
+                    .with_text_sink(&mut extracted);
+            let (display_list, _) = interpreter.interpret_with_stats(&content);
+
+            let extracted_text: String = extracted.iter().map(|s| s.text.as_str()).collect();
+            assert_eq!(
+                extracted_text, "AB",
+                "{label}: text extraction must preserve both <41> and <0041> in one /ToUnicode"
+            );
+
+            let runs: Vec<_> = display_list
+                .commands
+                .iter()
+                .filter_map(|cmd| match cmd {
+                    RenderCommand::DrawGlyphRun(run) => Some(run),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(runs.len(), 1, "{label}");
+            assert_eq!(
+                [runs[0].glyphs[0].glyph_id, runs[0].glyphs[1].glyph_id],
+                [gid_a, gid_b],
+                "{label}: physical glyphs must follow <41>->A and <0041>->B regardless of order"
+            );
+            assert_eq!(
+                [runs[0].glyphs[0].code_len, runs[0].glyphs[1].code_len],
+                [1, 2],
+                "{label}"
+            );
+
+            let slide = display_list_to_slide(
+                &display_list,
+                0,
+                &fonts,
+                &images,
+                &ConversionOptions::default(),
+            )
+            .expect("slide export");
+            let slide_text: String = slide
+                .elements
+                .iter()
+                .filter_map(|e| match e {
+                    SlideElement::TextBox { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                slide_text, "AB",
+                "{label}: PPTX slide export must preserve both <41> and <0041> regardless of declaration order"
+            );
+        }
+    }
+
+    #[test]
+    fn unicode_cmap_xml_forbidden_control_char_serializes_valid_slide_xml() {
+        use quick_xml::events::Event;
+        use std::sync::Arc;
+        use zpdf_font::FontProvider;
+
+        const PRIMARY_TTF: &[u8] =
+            include_bytes!("../../zpdf-font/tests/fixtures/coverage-primary.ttf");
+
+        let stream = |dict: &str, bytes: &[u8]| -> Vec<u8> {
+            let mut out = format!("<< {dict} /Length {} >>\nstream\n", bytes.len()).into_bytes();
+            out.extend_from_slice(bytes);
+            out.extend_from_slice(b"\nendstream");
+            out
+        };
+        let assemble = |objects: &[Vec<u8>]| -> Vec<u8> {
+            let mut pdf = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n".to_vec();
+            let mut offsets = Vec::with_capacity(objects.len());
+            for (idx, body) in objects.iter().enumerate() {
+                offsets.push(pdf.len());
+                pdf.extend_from_slice(format!("{} 0 obj\n", idx + 1).as_bytes());
+                pdf.extend_from_slice(body);
+                pdf.extend_from_slice(b"\nendobj\n");
+            }
+            let xref = pdf.len();
+            let count = objects.len() + 1;
+            pdf.extend_from_slice(format!("xref\n0 {count}\n0000000000 65535 f \n").as_bytes());
+            for off in offsets {
+                pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+            }
+            pdf.extend_from_slice(
+                format!("trailer\n<< /Size {count} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n")
+                    .as_bytes(),
+            );
+            pdf
+        };
+
+        let provider = Arc::new(FontProvider::memory_only());
+        provider
+            .register_with_aliases(PRIMARY_TTF, 0, &["PptxXmlControlFace"])
+            .unwrap();
+
+        // `/UniGB-UCS2-H` with NO `/ToUnicode` decodes `<0041000B0042>` to
+        // `"A\u{000B}B"`. Serializing to PPTX must strip the XML-forbidden
+        // vertical tab while keeping a well-formed slide whose `<a:t>` holds
+        // both letters.
+        let pdf = assemble(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] \
+              /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
+                .to_vec(),
+            stream("", b"0 0 0 rg BT /F1 18 Tf 20 50 Td <0041000B0042> Tj ET"),
+            b"<< /Type /Font /Subtype /Type0 /BaseFont /ABCDEF+PptxXmlControlFace \
+              /Encoding /UniGB-UCS2-H /DescendantFonts [6 0 R] >>"
+                .to_vec(),
+            b"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /ABCDEF+PptxXmlControlFace \
+              /CIDSystemInfo << /Registry (Adobe) /Ordering (GB1) /Supplement 0 >> \
+              /CIDToGIDMap /Identity /FontDescriptor 7 0 R /DW 600 >>"
+                .to_vec(),
+            b"<< /Type /FontDescriptor /FontName /ABCDEF+PptxXmlControlFace /Flags 32 /FontFile2 8 0 R >>"
+                .to_vec(),
+            stream("", b"corrupt unparseable truetype bytes"),
+        ]);
+
+        let doc = zpdf_document::PdfDocument::open(pdf)
+            .unwrap()
+            .with_font_provider(Arc::clone(&provider));
+        let page = doc.page(0).unwrap();
+        let mut fonts = doc.load_page_fonts(&page);
+        let (content, _) = doc.page_content_with_diagnostics(&page).unwrap();
+        let mut images = ImageCache::new();
+        let interpreter = zpdf_content::interpreter::ContentInterpreter::new(page.effective_box())
+            .with_document(doc.file(), &page.resources)
+            .with_fonts(&mut fonts)
+            .with_shared_fonts(&doc)
+            .with_images(&mut images);
+        let (display_list, _) = interpreter.interpret_with_stats(&content);
+
+        let slide = display_list_to_slide(
+            &display_list,
+            0,
+            &fonts,
+            &images,
+            &ConversionOptions::default(),
+        )
+        .expect("slide export");
+        let raw_slide_text: String = slide
+            .elements
+            .iter()
+            .filter_map(|e| match e {
+                SlideElement::TextBox { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            raw_slide_text, "A\u{000B}B",
+            "test fixture must exercise U+000B decoded via /UniGB-UCS2-H"
+        );
+        let presentation = PptxPresentation {
+            slides: vec![slide],
+            width_emu: pt_to_emu(200.0),
+            height_emu: pt_to_emu(100.0),
+        };
+        let bytes = PptxWriter::new(presentation)
+            .write_to_bytes()
+            .expect("pptx bytes");
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("zip archive");
+        let xml = String::from_utf8(zip_entry(&mut archive, "ppt/slides/slide1.xml"))
+            .expect("utf-8 slide xml");
+
+        // Enforce XML 1.0 §2.2 Char range across the entire serialized slide.
+        for ch in xml.chars() {
+            assert!(
+                ooxml::is_valid_xml_char(ch),
+                "serialized slide XML contains XML 1.0 forbidden character U+{:04X}: {xml}",
+                ch as u32
+            );
+        }
+
+        // Parse the serialized slide with quick-xml and collect `<a:t>` text.
+        let mut reader = quick_xml::Reader::from_str(&xml);
+        let mut in_text = false;
+        let mut parsed_text = String::new();
+        loop {
+            match reader.read_event().expect("well-formed slide XML") {
+                Event::Start(e) => {
+                    for attr in e.attributes() {
+                        attr.expect("valid attribute");
+                    }
+                    if e.name().as_ref() == "a:t" {
+                        in_text = true;
+                    }
+                }
+                Event::Empty(e) => {
+                    for attr in e.attributes() {
+                        attr.expect("valid attribute");
+                    }
+                }
+                Event::End(e) => {
+                    if e.name().as_ref() == "a:t" {
+                        in_text = false;
+                    }
+                }
+                Event::Text(e) => {
+                    if in_text {
+                        parsed_text.push_str(&e.xml10_content());
+                    }
+                }
+                Event::GeneralRef(e) => {
+                    if let Some(ch) = e.resolve_char_ref().expect("valid char ref") {
+                        assert!(
+                            ooxml::is_valid_xml_char(ch),
+                            "serialized slide XML contains forbidden char ref U+{:04X}",
+                            ch as u32
+                        );
+                        if in_text {
+                            parsed_text.push(ch);
+                        }
+                    } else if in_text {
+                        let entity = match e.xml10_content().as_ref() {
+                            "amp" => "&",
+                            "lt" => "<",
+                            "gt" => ">",
+                            "quot" => "\"",
+                            "apos" => "'",
+                            other => panic!("unexpected XML entity &{other};"),
+                        };
+                        parsed_text.push_str(entity);
+                    }
+                }
+                Event::Eof => break,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            parsed_text, "AB",
+            "parsed slide XML must retain both 'A' and 'B' without XML-forbidden U+000B"
+        );
     }
 }

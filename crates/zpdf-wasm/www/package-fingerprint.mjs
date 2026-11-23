@@ -49,10 +49,18 @@ export function artifactFingerprints() {
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   if (process.argv[2] !== "--write") throw new Error("Use --write only after building and running wasm-bindgen");
+  const wasmCargoToml = readFileSync(resolve(root, "crates/zpdf-wasm/Cargo.toml"), "utf8");
+  const pinnedBindgen = wasmCargoToml.match(/^wasm-bindgen\s*=\s*"=([^"]+)"/m)?.[1];
+  const wasmBindgen = execFileSync("wasm-bindgen", ["--version"], { encoding: "utf8" }).trim();
+  if (pinnedBindgen && wasmBindgen !== `wasm-bindgen ${pinnedBindgen}`) {
+    throw new Error(
+      `wasm-bindgen CLI version mismatch: Cargo.toml pins ${pinnedBindgen}, PATH has "${wasmBindgen}"`
+    );
+  }
   const manifest = {
     schema_version: 1,
     rustc: execFileSync("rustc", ["--version"], { encoding: "utf8" }).trim(),
-    wasm_bindgen: execFileSync("wasm-bindgen", ["--version"], { encoding: "utf8" }).trim(),
+    wasm_bindgen: wasmBindgen,
     ...sourceFingerprint(),
     artifacts: artifactFingerprints(),
   };
