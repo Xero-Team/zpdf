@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Performance
+
+- Add `ContentInterpreter::with_clip_elision_scale` and
+  `PageInterpretOptions::clip_elision_scale` (wired into CPU rendering in
+  `zpdf-cli`, `zpdf-wasm`, and `zpdf-benches`) to elide axis-aligned rectangle
+  clips (`W`/`W*`, Form XObject `/BBox`, and pattern clips) that cover every
+  affected device pixel of an active clip mask, avoiding redundant
+  `PushClip`/`PopClip` pairs and CPU clip-mask allocations while keeping
+  rendered pixels identical within CPU clip budgets. (#166)
+
 ### Rendering
 
 - Round CPU, GPU and SVG 8-bit colours to the nearest value (`0.5 g` now gives

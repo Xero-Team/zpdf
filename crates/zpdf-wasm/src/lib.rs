@@ -174,9 +174,11 @@ impl Pdf {
         };
         let page = self.doc.page(index).map_err(js_err)?;
         let mut options = zpdf::PageInterpretOptions::default();
-        options.image_downscale = zpdf::cpu::CpuRenderer::new()
+        let raster_scale = zpdf::cpu::CpuRenderer::new()
             .with_limits(self.doc.file().limits())
             .raster_scale(page.effective_box_points(), scale);
+        options.image_downscale = raster_scale;
+        options.clip_elision_scale = raster_scale;
         let zpdf::InterpretedPage {
             stats,
             display_list: dl,

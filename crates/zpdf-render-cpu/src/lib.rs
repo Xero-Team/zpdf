@@ -3488,6 +3488,130 @@ mod tests {
         ));
     }
 
+    fn render_with_clip_budget(
+        dl: &DisplayList,
+        scale: f32,
+        initial_clip_mask_bytes: u64,
+        initial_clip_pixel_spent: u64,
+    ) -> RenderedPage {
+        let mut renderer = CpuRenderer::new();
+        renderer
+            .begin_page(&PageRenderInfo {
+                page_rect: dl.page_rect,
+                scale,
+                background: Color::white(),
+            })
+            .expect("begin_page");
+        renderer.clip_mask_bytes = initial_clip_mask_bytes;
+        renderer.clip_pixel_spent = initial_clip_pixel_spent;
+        for cmd in &dl.commands {
+            renderer.execute(cmd).expect("execute");
+        }
+        renderer.end_page().expect("end_page")
+    }
+
+    #[test]
+    fn clip_elision_preserves_clip_memory_and_pixel_work_budgets_for_later_clips() {
+        use zpdf_content::interpreter::ContentInterpreter;
+
+        let page = Rect::new(0.0, 0.0, 100.0, 100.0);
+        // Outer full-page clip + redundant covering full-page clip + genuine
+        // half-page clip (x = 0..50) + full-page red fill.
+        let content =
+            b"q 0 0 100 100 re W n 0 0 100 100 re W n 0 0 50 100 re W n 1 0 0 rg 0 0 100 100 re f Q";
+        let retained_dl = ContentInterpreter::new(page).interpret(content);
+        let elided_dl = ContentInterpreter::new(page)
+            .with_clip_elision_scale(1.0)
+            .interpret(content);
+
+        let retained_clips = retained_dl
+            .commands
+            .iter()
+            .filter(|c| matches!(c, RenderCommand::PushClip { .. }))
+            .count();
+        let elided_clips = elided_dl
+            .commands
+            .iter()
+            .filter(|c| matches!(c, RenderCommand::PushClip { .. }))
+            .count();
+        assert_eq!(retained_clips, 3);
+        assert_eq!(elided_clips, 2);
+
+        // Within full budgets, retained and elided renders are byte-identical
+        // and both enforce the half-page clip (left red, right white).
+        let unconstrained_retained = render_with_clip_budget(&retained_dl, 1.0, 0, 0);
+        let unconstrained_elided = render_with_clip_budget(&elided_dl, 1.0, 0, 0);
+        assert_eq!(unconstrained_elided.data, unconstrained_retained.data);
+        assert_eq!(px(&unconstrained_elided, 25, 50), [255, 0, 0, 255]);
+        assert_eq!(px(&unconstrained_elided, 75, 50), [255, 255, 255, 255]);
+
+        // Mask-memory budget boundary (analogous to 8000x8000 where 2 live
+        // masks fit in MAX_CLIP_MASK_BYTES and a 3rd does not): 100x100 =
+        // 10_000 bytes/mask, so leaving 20_000 bytes lets 2 live masks succeed.
+        // Retained spends both on clips 1 & 2 and skips clip 3 (overdrawing
+        // the right half); elided avoids allocating clip 2, enforces clip 3,
+        // and matches the unconstrained PDF-spec render byte-for-byte.
+        let mask_bytes = 100 * 100;
+        let mem_retained =
+            render_with_clip_budget(&retained_dl, 1.0, MAX_CLIP_MASK_BYTES - 2 * mask_bytes, 0);
+        let mem_elided =
+            render_with_clip_budget(&elided_dl, 1.0, MAX_CLIP_MASK_BYTES - 2 * mask_bytes, 0);
+        assert_eq!(px(&mem_retained, 75, 50), [255, 0, 0, 255]);
+        assert_eq!(px(&mem_elided, 25, 50), [255, 0, 0, 255]);
+        assert_eq!(px(&mem_elided, 75, 50), [255, 255, 255, 255]);
+        assert_eq!(mem_elided.data, unconstrained_retained.data);
+
+        // Cumulative pixel-work budget boundary: each new full-page clip
+        // charges 10_000 (mask zero/alloc) + 10_000 (fill extent) = 20_000 px.
+        // Leaving 40_000 px exhausts MAX_CLIP_PIXEL_WORK after clips 1 & 2 in
+        // the retained stream so clip 3 is skipped, while eliding clip 2 leaves
+        // room for clip 3 and matches the unconstrained render byte-for-byte.
+        let full_clip_work = 2 * mask_bytes;
+        let work_retained = render_with_clip_budget(
+            &retained_dl,
+            1.0,
+            0,
+            MAX_CLIP_PIXEL_WORK - 2 * full_clip_work,
+        );
+        let work_elided =
+            render_with_clip_budget(&elided_dl, 1.0, 0, MAX_CLIP_PIXEL_WORK - 2 * full_clip_work);
+        assert_eq!(px(&work_retained, 75, 50), [255, 0, 0, 255]);
+        assert_eq!(px(&work_elided, 25, 50), [255, 0, 0, 255]);
+        assert_eq!(px(&work_elided, 75, 50), [255, 255, 255, 255]);
+        assert_eq!(work_elided.data, unconstrained_retained.data);
+
+        // Once the elided stream itself exhausts either budget on clip 2
+        // (`0 0 50 100`), a later nested clip covering clip 2 (`0 0 60 100`)
+        // would also be skipped in the retained stream, so both streams stay
+        // byte-identical (elision never drops a clip that retained enforces).
+        let post_budget_content =
+            b"q 0 0 100 100 re W n 0 0 50 100 re W n 0 0 60 100 re W n 1 0 0 rg 0 0 100 100 re f Q";
+        let post_retained_dl = ContentInterpreter::new(page).interpret(post_budget_content);
+        let post_elided_dl = ContentInterpreter::new(page)
+            .with_clip_elision_scale(1.0)
+            .interpret(post_budget_content);
+
+        let post_mem_retained =
+            render_with_clip_budget(&post_retained_dl, 1.0, MAX_CLIP_MASK_BYTES - mask_bytes, 0);
+        let post_mem_elided =
+            render_with_clip_budget(&post_elided_dl, 1.0, MAX_CLIP_MASK_BYTES - mask_bytes, 0);
+        assert_eq!(post_mem_elided.data, post_mem_retained.data);
+
+        let post_work_retained = render_with_clip_budget(
+            &post_retained_dl,
+            1.0,
+            0,
+            MAX_CLIP_PIXEL_WORK - full_clip_work,
+        );
+        let post_work_elided = render_with_clip_budget(
+            &post_elided_dl,
+            1.0,
+            0,
+            MAX_CLIP_PIXEL_WORK - full_clip_work,
+        );
+        assert_eq!(post_work_elided.data, post_work_retained.data);
+    }
+
     #[test]
     fn budgeted_renderer_still_unwinds_an_open_blend_group() {
         let mut renderer = CpuRenderer::new();
