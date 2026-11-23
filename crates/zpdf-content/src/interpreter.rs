@@ -113,6 +113,11 @@ pub struct ContentInterpreter<'a> {
     /// Tiling patterns built at `scn` by object id, `None` for an unusable
     /// pattern, so reselecting a pattern does not decode its cell again.
     tiling_pattern_cache: HashMap<ObjectId, Option<std::sync::Arc<TilingPatternDef>>>,
+    /// Pre-interpreted single-cell display lists for tiling patterns, keyed by
+    /// `(pattern object id, uncolored scn tint)`. Lets repeated fills with the
+    /// same pattern share one `Arc<DisplayList>` (and lets backends cache one
+    /// rasterized tile pixmap across every shape).
+    tiling_cell_cache: HashMap<TilingCellKey, std::sync::Arc<DisplayList>>,
     /// Shading patterns built at `scn`, by pattern object and the `base_ctm`
     /// bits they were built under (`None` for an unusable pattern). Content
     /// that reselects one pattern per path reuses one evaluated shading (and
@@ -140,6 +145,9 @@ pub struct ContentInterpreter<'a> {
     /// that draws itself (directly, or through a pattern cell) recurses
     /// forever, so re-entry is refused instead of fanning out to the budget.
     active_forms: Vec<ObjectId>,
+    /// Object ids of tiling patterns whose cell is currently being interpreted,
+    /// breaking self-referential pattern cycles immediately.
+    active_tiling_patterns: Vec<ObjectId>,
     /// `Q` must never pop the state stack below this index — a form XObject
     /// raises it past its own saved state so an unbalanced `Q` inside the
     /// form cannot corrupt the page-level state.
@@ -222,17 +230,6 @@ pub struct ContentInterpreter<'a> {
     timed_out: bool,
     /// `ops_executed` at the last clock sample (throttles `Instant::now`).
     last_clock_op: u64,
-    /// Tiling-pattern-scoped soft-mask reuse, installed by
-    /// `paint_tiling_pattern` for the duration of its tile loop (`None`
-    /// elsewhere). Tiles replay identical content under CTMs that differ only
-    /// by translation, so a mask built once at the canonical tile position is
-    /// exact on every tile — see `build_or_reuse_soft_mask`.
-    soft_mask_reuse: Option<TileMaskReuse>,
-    /// Operator counter within the current tile replay, reset at each tile
-    /// start. Part of the reuse key: the same count identifies the same `gs`
-    /// site (hence identical inherited state) across tiles, and two distinct
-    /// sites within one cell can never collide.
-    tile_op_index: u64,
     /// Cache last CMYK→RGB conversion to avoid redundant transforms.
     /// Technical drawings often paint hundreds of shapes in the same black/cyan color.
     /// Uses RefCell for interior mutability since cmyk_to_display is called from &self methods.
@@ -479,20 +476,6 @@ fn rgba_bytes(size: (u32, u32)) -> u64 {
     size.0 as u64 * size.1 as u64 * 4
 }
 
-/// State for soft-mask reuse across the tiles of one `paint_tiling_pattern`
-/// loop. Masks are built as if at the *canonical* tile — the middle of the
-/// tile index range, whose cell lies inside the page window — and reused
-/// everywhere else via [`SoftMask::offset`]. Backends shift the rasterized
-/// plane by that page-space offset; samples are only ever taken inside the
-/// painting tile's cell, whose pre-image is the canonical cell, which the
-/// page-rect raster window covers.
-struct TileMaskReuse {
-    masks: HashMap<SoftMaskReuseKey, SoftMaskReuseEntry>,
-    /// Page-space offset of the tile currently being replayed, relative to
-    /// the canonical tile: `to_page_linear · ((i−ic)·XStep, (j−jc)·YStep)`.
-    cur_delta: (f64, f64),
-}
-
 /// What a soft mask built at a `gs` depends on: the ExtGState object, and the
 /// graphics state the mask group starts from — its CTM (and the pattern
 /// anchor), the clip bounds its `/BBox` and shadings are cut to, the inherited
@@ -511,25 +494,18 @@ struct SoftMaskCacheKey {
 /// for every use.
 const MAX_CACHED_SOFT_MASKS: usize = 256;
 
-/// Key for tiling-pattern soft-mask reuse: a `gs` site (operator index within
-/// the tile replay + ExtGState object) plus the CTM's linear part. A hit
-/// means the cached mask differs from the needed one only by the CTM
-/// translation delta, which maps 1:1 to a page-space offset.
+/// Cache key for pre-interpreted tiling-pattern cells. Coloured (`/PaintType 1`)
+/// cells depend only on the pattern object; uncoloured (`/PaintType 2`) cells
+/// also bake in the `scn`/`SCN` paint colour.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct SoftMaskReuseKey {
-    op_index: u64,
-    gs_id: ObjectId,
-    ctm_linear: [u64; 4],
+struct TilingCellKey {
+    pat_id: ObjectId,
+    uncolored_color: Option<[u32; 4]>,
+    image_downscale: u32,
 }
 
-#[derive(Debug, Clone)]
-struct SoftMaskReuseEntry {
-    mask: SoftMask,
-    /// CTM translation of the canonical-position build; reuse offsets are
-    /// relative to this.
-    build_e: f64,
-    build_f: f64,
-}
+/// Pre-interpreted tiling-pattern cells [`ContentInterpreter`] keeps per page.
+const MAX_CACHED_TILING_CELLS: usize = 256;
 
 /// Wall-clock budget for interpreting a single page (see `deadline`). Generous
 /// for any real page (which interpret in well under a second); bounds
@@ -689,6 +665,8 @@ enum PatternPaint {
 /// cell-by-cell at fill time.
 #[derive(Debug)]
 struct TilingPatternDef {
+    /// Indirect object ID of the pattern stream (for caching & cycle checks).
+    pat_id: ObjectId,
     /// Decoded cell content stream.
     content: Vec<u8>,
     /// The pattern's raw stream dict (fonts/resources are loaded at paint time).
@@ -701,6 +679,8 @@ struct TilingPatternDef {
     /// 1 = colored, 2 = uncolored (cell ignores color operators and paints
     /// with the color given alongside the pattern name in `scn`).
     paint_type: i64,
+    /// 1 = constant spacing, 2 = no distortion, 3 = constant spacing and faster tiling.
+    tiling_type: u8,
 }
 
 /// The CMYK colorant projection of the current fill/stroke colour, kept so the
@@ -940,6 +920,7 @@ impl<'a> ContentInterpreter<'a> {
             shading_cache: HashMap::new(),
             form_content_cache: HashMap::new(),
             tiling_pattern_cache: HashMap::new(),
+            tiling_cell_cache: HashMap::new(),
             shading_pattern_cache: HashMap::new(),
             content_cache_bytes: 0,
             soft_mask_cache: HashMap::new(),
@@ -949,6 +930,7 @@ impl<'a> ContentInterpreter<'a> {
             form_resources: Vec::new(),
             form_depth: 0,
             active_forms: Vec::new(),
+            active_tiling_patterns: Vec::new(),
             state_floor: 0,
             text_sink: None,
             span_streams: None,
@@ -976,8 +958,6 @@ impl<'a> ContentInterpreter<'a> {
             deadline: None,
             timed_out: false,
             last_clock_op: 0,
-            soft_mask_reuse: None,
-            tile_op_index: 0,
             cmyk_cache: RefCell::new(None),
             cs_cache: RefCell::new(HashMap::new()),
             max_operand_stack_depth: 10_000, // M3: Match ParseLimits::default()
@@ -1603,13 +1583,6 @@ impl<'a> ContentInterpreter<'a> {
             self.flush_pending_clip();
         }
 
-        // Position counter for tiling-pattern soft-mask reuse: the n-th
-        // operator of tile k is the n-th operator of every other tile, so the
-        // count identifies a `gs` site across tiles (including operators in
-        // nested form XObjects, which replay identically per tile).
-        if self.soft_mask_reuse.is_some() {
-            self.tile_op_index += 1;
-        }
         // Uncolored (PaintType 2) pattern cells paint exclusively with the
         // color given at `scn` time; their own color operators are ignored.
         if self.suppress_color_ops
@@ -4158,129 +4131,55 @@ impl<'a> ContentInterpreter<'a> {
         }
     }
 
-    /// Build a soft mask, going through the tiling-pattern reuse cache when
-    /// one is installed. Within one tile loop, the same `gs` site recurs once
-    /// per tile under CTMs sharing the linear part, and the mask group's
-    /// commands come out identical up to a page-space translation, which the
-    /// backends apply via [`SoftMask::offset`]. The first build is rebased to
-    /// the loop's canonical tile (interior to the page, so the page-rect
-    /// raster window covers its whole cell); every use — the building tile
-    /// included — then samples the mask only inside its own cell, whose
-    /// pre-image under the shift is inside that covered window. Outside tile
-    /// loops (`soft_mask_reuse` is None) every mask is built fresh, as before.
+    /// Resolve an ExtGState `/SMask`, reusing a cached [`SoftMask`] when the
+    /// same ExtGState object is applied under identical graphics state.
     fn build_or_reuse_soft_mask(
         &mut self,
         sm: &zpdf_core::PdfDict,
         gs_id: Option<ObjectId>,
     ) -> Option<SoftMask> {
-        let key = match (gs_id, self.soft_mask_reuse.is_some()) {
-            (Some(id), true) => Some(SoftMaskReuseKey {
-                op_index: self.tile_op_index,
-                gs_id: id,
-                ctm_linear: [
-                    self.current.ctm.a.to_bits(),
-                    self.current.ctm.b.to_bits(),
-                    self.current.ctm.c.to_bits(),
-                    self.current.ctm.d.to_bits(),
-                ],
-            }),
-            _ => None,
+        let Some(gs_id) = gs_id else {
+            return self.build_soft_mask(sm);
         };
-        let Some(key) = key else {
-            let Some(gs_id) = gs_id else {
-                return self.build_soft_mask(sm);
-            };
-            let (ctm, base, fill, stroke) = (
-                &self.current.ctm,
-                &self.base_ctm,
-                &self.current.fill_color,
-                &self.current.stroke_color,
-            );
-            let key = SoftMaskCacheKey {
-                gs_id,
-                matrices: [
-                    ctm.a, ctm.b, ctm.c, ctm.d, ctm.e, ctm.f, base.a, base.b, base.c, base.d,
-                    base.e, base.f,
-                ]
-                .map(f64::to_bits),
-                clip: self
-                    .current
-                    .clip_bounds
-                    .map(|r| [r.x0, r.y0, r.x1, r.y1].map(f64::to_bits)),
-                paint: [
-                    fill.r,
-                    fill.g,
-                    fill.b,
-                    fill.a,
-                    stroke.r,
-                    stroke.g,
-                    stroke.b,
-                    stroke.a,
-                    self.current.line_width,
-                ]
-                .map(f32::to_bits),
-                resource_depth: self.form_resources.len(),
-            };
-            if let Some(mask) = self.soft_mask_cache.get(&key) {
-                return mask.clone();
-            }
-            let mask = self.build_soft_mask(sm);
-            if self.soft_mask_cache.len() < MAX_CACHED_SOFT_MASKS {
-                self.soft_mask_cache.insert(key, mask.clone());
-            }
-            return mask;
-        };
-
-        if !self
-            .soft_mask_reuse
-            .as_ref()
-            .is_some_and(|r| r.masks.contains_key(&key))
-        {
-            // Miss: build at the canonical tile position. A page-space
-            // translation left-multiplies the CTM, i.e. only shifts (e, f),
-            // so adding the current→canonical delta is exact whatever `cm`s
-            // the cell applied on top of the tile CTM.
-            //
-            // The reuse context is taken out for the duration of the build:
-            // a `gs` inside the mask group itself must build fresh, not
-            // insert group-context entries whose op indices could collide
-            // with later cell sites (this also freezes the tile op counter,
-            // keeping site numbering identical between build- and hit-tiles).
-            let reuse = self.soft_mask_reuse.take()?;
-            let delta = reuse.cur_delta;
-            let saved_ctm_ef = (self.current.ctm.e, self.current.ctm.f);
-            let saved_base_ef = (self.base_ctm.e, self.base_ctm.f);
-            self.current.ctm.e += delta.0;
-            self.current.ctm.f += delta.1;
-            self.base_ctm.e += delta.0;
-            self.base_ctm.f += delta.1;
-            let built = self.build_soft_mask(sm);
-            let (build_e, build_f) = (self.current.ctm.e, self.current.ctm.f);
-            (self.current.ctm.e, self.current.ctm.f) = saved_ctm_ef;
-            (self.base_ctm.e, self.base_ctm.f) = saved_base_ef;
-            self.soft_mask_reuse = Some(reuse);
-            let mask = built?;
-            if let Some(reuse) = self.soft_mask_reuse.as_mut() {
-                reuse.masks.insert(
-                    key,
-                    SoftMaskReuseEntry {
-                        mask,
-                        build_e,
-                        build_f,
-                    },
-                );
-            }
-        }
-
-        let entry = self.soft_mask_reuse.as_ref()?.masks.get(&key)?;
-        let mut mask = entry.mask.clone();
-        // Equal linear parts ⇒ the page-space delta of any point is exactly
-        // the CTM translation delta.
-        mask.offset = (
-            (self.current.ctm.e - entry.build_e) as f32,
-            (self.current.ctm.f - entry.build_f) as f32,
+        let (ctm, base, fill, stroke) = (
+            &self.current.ctm,
+            &self.base_ctm,
+            &self.current.fill_color,
+            &self.current.stroke_color,
         );
-        Some(mask)
+        let key = SoftMaskCacheKey {
+            gs_id,
+            matrices: [
+                ctm.a, ctm.b, ctm.c, ctm.d, ctm.e, ctm.f, base.a, base.b, base.c, base.d, base.e,
+                base.f,
+            ]
+            .map(f64::to_bits),
+            clip: self
+                .current
+                .clip_bounds
+                .map(|r| [r.x0, r.y0, r.x1, r.y1].map(f64::to_bits)),
+            paint: [
+                fill.r,
+                fill.g,
+                fill.b,
+                fill.a,
+                stroke.r,
+                stroke.g,
+                stroke.b,
+                stroke.a,
+                self.current.line_width,
+            ]
+            .map(f32::to_bits),
+            resource_depth: self.form_resources.len(),
+        };
+        if let Some(mask) = self.soft_mask_cache.get(&key) {
+            return mask.clone();
+        }
+        let mask = self.build_soft_mask(sm);
+        if self.soft_mask_cache.len() < MAX_CACHED_SOFT_MASKS {
+            self.soft_mask_cache.insert(key, mask.clone());
+        }
+        mask
     }
 
     /// Build a [`SoftMask`] from an ExtGState /SMask dict: interpret the /G
@@ -5525,11 +5424,7 @@ impl<'a> ContentInterpreter<'a> {
     /// whose ruled art would flood the sink with per-tile duplicates).
     fn rules_active(&self) -> bool {
         match &self.rule_sink {
-            Some(sink) => {
-                sink.len() < Self::RULE_MAX_COUNT
-                    && !self.oc_suppressed()
-                    && self.soft_mask_reuse.is_none()
-            }
+            Some(sink) => sink.len() < Self::RULE_MAX_COUNT && !self.oc_suppressed(),
             None => false,
         }
     }
@@ -5737,21 +5632,39 @@ impl<'a> ContentInterpreter<'a> {
         }
         let style = self.stroke_style();
         if let Some(pat) = self.current.stroke_pattern.clone() {
-            // The stroke region is the centerline extent grown by the stroke
-            // width. Unlike `path_bounds`, a flat path (a horizontal/vertical
-            // line) is fine here — growing makes the region two-dimensional.
-            if let Some(bounds) = Self::stroke_region_bounds(&page_path, &style) {
-                self.display_list.push(RenderCommand::PushClipStroke {
-                    path: page_path.clone(),
-                    style: style.clone(),
-                });
-                let painted = self.paint_pattern_in_region(&pat, bounds);
-                self.display_list.push(RenderCommand::PopClip);
-                if painted {
-                    return;
+            match pat {
+                PatternPaint::Tiling(def) => {
+                    if self.oc_suppressed() {
+                        return;
+                    }
+                    if let Some(tiling) =
+                        self.build_tiling_pattern_paint(&def, self.current.stroke_color)
+                    {
+                        let cmd = RenderCommand::StrokePath {
+                            path: page_path,
+                            style,
+                            paint: Paint::Tiling(tiling),
+                            alpha: self.current.stroke_alpha,
+                            overprint: None,
+                        };
+                        self.emit_painted(cmd);
+                        return;
+                    }
                 }
-                // Tiling failed to replicate: fall through to a solid stroke
-                // (the clip pair above is balanced and painted nothing).
+                PatternPaint::Shading(def) => {
+                    // The stroke region is the centerline extent grown by the stroke
+                    // width. Unlike `path_bounds`, a flat path (a horizontal/vertical
+                    // line) is fine here — growing makes the region two-dimensional.
+                    if let Some(bounds) = Self::stroke_region_bounds(&page_path, &style) {
+                        self.display_list.push(RenderCommand::PushClipStroke {
+                            path: page_path.clone(),
+                            style: style.clone(),
+                        });
+                        self.emit_shading_image(&def, bounds);
+                        self.display_list.push(RenderCommand::PopClip);
+                        return;
+                    }
+                }
             }
         }
         let cmd = RenderCommand::StrokePath {
@@ -5808,28 +5721,46 @@ impl<'a> ContentInterpreter<'a> {
             return;
         }
         if let Some(pat) = self.current.fill_pattern.clone() {
-            if let Some(bounds) = Self::path_bounds(&page_path) {
-                let push_clip = !self.clip_path_covers_current_bounds(&page_path);
-                let saved_elision_bounds = self.current.clip_elision_bounds;
-                if push_clip {
-                    self.intersect_clip_elision_bounds(
-                        self.clip_path_enforced_device_bounds(&page_path),
-                    );
-                    self.display_list.push(RenderCommand::PushClip {
-                        path: page_path.clone(),
-                        rule,
-                    });
+            match pat {
+                PatternPaint::Tiling(def) => {
+                    if self.oc_suppressed() {
+                        return;
+                    }
+                    if let Some(tiling) =
+                        self.build_tiling_pattern_paint(&def, self.current.fill_color)
+                    {
+                        let cmd = RenderCommand::FillPath {
+                            path: page_path,
+                            rule,
+                            paint: Paint::Tiling(tiling),
+                            alpha: self.current.fill_alpha,
+                            overprint: None,
+                        };
+                        self.emit_painted(cmd);
+                        return;
+                    }
                 }
-                let painted = self.paint_pattern_in_region(&pat, bounds);
-                if push_clip {
-                    self.display_list.push(RenderCommand::PopClip);
-                    self.current.clip_elision_bounds = saved_elision_bounds;
+                PatternPaint::Shading(def) => {
+                    if let Some(bounds) = Self::path_bounds(&page_path) {
+                        let push_clip = !self.clip_path_covers_current_bounds(&page_path);
+                        let saved_elision_bounds = self.current.clip_elision_bounds;
+                        if push_clip {
+                            self.intersect_clip_elision_bounds(
+                                self.clip_path_enforced_device_bounds(&page_path),
+                            );
+                            self.display_list.push(RenderCommand::PushClip {
+                                path: page_path.clone(),
+                                rule,
+                            });
+                        }
+                        self.emit_shading_image(&def, bounds);
+                        if push_clip {
+                            self.display_list.push(RenderCommand::PopClip);
+                            self.current.clip_elision_bounds = saved_elision_bounds;
+                        }
+                        return;
+                    }
                 }
-                if painted {
-                    return;
-                }
-                // Fall through: solid approximation (the clip pair above is
-                // balanced and harmless).
             }
         }
         let cmd = RenderCommand::FillPath {
@@ -5843,93 +5774,110 @@ impl<'a> ContentInterpreter<'a> {
         self.emit_painted(cmd);
     }
 
-    /// Paint a pattern (tiling or shading) across `bounds`. The caller must
-    /// already have installed the clip region (a path/stroke/glyph clip).
-    /// Returns false when a tiling pattern could not be replicated, so the
-    /// caller can fall back to a solid approximation.
-    fn paint_pattern_in_region(&mut self, pattern: &PatternPaint, bounds: Rect) -> bool {
-        match pattern {
-            PatternPaint::Shading(def) => {
-                self.emit_shading_image(def, bounds);
-                true
-            }
-            PatternPaint::Tiling(def) => self.paint_tiling_pattern(def, bounds),
-        }
-    }
-
-    /// Replicate a tiling-pattern cell across the page-space `bounds` of a
-    /// fill. Returns false when the pattern is degenerate or the tile count
-    /// explodes, in which case the caller falls back to a solid fill.
-    fn paint_tiling_pattern(&mut self, def: &TilingPatternDef, bounds: Rect) -> bool {
+    /// Pre-interpret a tiling pattern's single cell in pattern space into a
+    /// reusable [`TilingPattern`] paint (ISO 32000-1 §8.7.3). Returns `None`
+    /// when the pattern transform is singular, cyclic, or exceeds nesting depth,
+    /// in which case callers fall back to a solid approximation.
+    fn build_tiling_pattern_paint(
+        &mut self,
+        def: &TilingPatternDef,
+        pattern_color: Color,
+    ) -> Option<std::sync::Arc<TilingPattern>> {
         const MAX_FORM_DEPTH: u32 = 16;
-        const MAX_TILES: i64 = 4096;
-        if self.oc_suppressed() {
-            // Hidden layer: skip the tile replication work entirely (the
-            // surrounding clip pair is balanced and paints nothing).
-            return true;
-        }
         if self.form_depth >= MAX_FORM_DEPTH {
             self.stats.diagnostics.resource_limit_reached = true;
             tracing::warn!("tiling pattern nesting exceeds {MAX_FORM_DEPTH}; skipping");
-            return false;
+            return None;
         }
-        // Pattern space is anchored to the page's default user space, not the
-        // CTM at fill time.
-        let to_page = self.base_ctm.concat(&def.matrix);
-        let Some(from_page) = to_page.inverse() else {
-            return false;
-        };
-
-        // Pattern-space bbox of the fill region: map all four page-space
-        // corners (the matrix may rotate/skew).
-        let corners = [
-            Point::new(bounds.x0, bounds.y0),
-            Point::new(bounds.x1, bounds.y0),
-            Point::new(bounds.x0, bounds.y1),
-            Point::new(bounds.x1, bounds.y1),
-        ];
-        let (mut px0, mut py0) = (f64::INFINITY, f64::INFINITY);
-        let (mut px1, mut py1) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
-        for c in &corners {
-            let p = c.transform(&from_page);
-            px0 = px0.min(p.x);
-            py0 = py0.min(p.y);
-            px1 = px1.max(p.x);
-            py1 = py1.max(p.y);
-        }
-        if !(px0.is_finite() && py0.is_finite() && px1.is_finite() && py1.is_finite()) {
-            return false;
-        }
-
-        // Tile (i, j) covers bbox translated by (i·XStep, j·YStep). Conservative
-        // index ranges from the two extreme offsets (steps may be negative).
-        let range = |lo: f64, hi: f64, cell_lo: f64, cell_hi: f64, step: f64| {
-            let t0 = (lo - cell_hi) / step;
-            let t1 = (hi - cell_lo) / step;
-            let (a, b) = if t0 <= t1 { (t0, t1) } else { (t1, t0) };
-            (a.floor() as i64, b.ceil() as i64)
-        };
-        let (i0, i1) = range(px0, px1, def.bbox.x0, def.bbox.x1, def.x_step);
-        let (j0, j1) = range(py0, py1, def.bbox.y0, def.bbox.y1, def.y_step);
-        // Saturating: pathologically small steps push the f64→i64 casts to
-        // the integer extremes, and the raw subtraction would overflow.
-        let nx = i1.saturating_sub(i0).saturating_add(1);
-        let ny = j1.saturating_sub(j0).saturating_add(1);
-        if nx <= 0 || ny <= 0 {
-            return false;
-        }
-        if nx.saturating_mul(ny) > MAX_TILES {
-            self.stats.diagnostics.resource_limit_reached = true;
+        if self.active_tiling_patterns.contains(&def.pat_id) {
+            self.stats.diagnostics.malformed_content =
+                self.stats.diagnostics.malformed_content.saturating_add(1);
             tracing::warn!(
-                "tiling pattern: {nx}x{ny} tiles exceeds {MAX_TILES}; using solid approximation"
+                "tiling pattern {:?} references itself; skipping recursion",
+                def.pat_id
             );
-            return false;
+            return None;
+        }
+        // Pattern space is anchored to the stream's default user space, not the
+        // CTM at fill/stroke time.
+        let to_page = self.base_ctm.concat(&def.matrix);
+        if ![
+            to_page.a, to_page.b, to_page.c, to_page.d, to_page.e, to_page.f,
+        ]
+        .iter()
+        .all(|v| v.is_finite())
+            || to_page.inverse().is_none()
+        {
+            return None;
         }
 
-        let file = match self.file {
-            Some(f) => f,
-            None => return false,
+        // Compute the effective device scale the CPU backend will use when
+        // rasterizing this cell so image downscaling matches `CpuRenderer`
+        // even when `to_page` scales/rotates/shears pattern space.
+        let cell_downscale_scale = if self.image_downscale_scale > 0.0 {
+            let s = self.image_downscale_scale as f64;
+            let abs_x = def.x_step.abs();
+            let abs_y = def.y_step.abs();
+            let len_x = (s * to_page.a * abs_x).hypot(s * to_page.b * abs_x);
+            let len_y = (s * to_page.c * abs_y).hypot(s * to_page.d * abs_y);
+            if len_x.is_finite() && len_y.is_finite() && len_x > 0.0 && len_y > 0.0 {
+                let mut tw = len_x.round().max(1.0);
+                let mut th = len_y.round().max(1.0);
+                const MAX_TILE_DIM: f64 = 4096.0;
+                const MAX_TILE_PIXELS: f64 = 4_194_304.0;
+                let max_dim = tw.max(th);
+                if max_dim > MAX_TILE_DIM {
+                    let k = MAX_TILE_DIM / max_dim;
+                    tw = (tw * k).floor().max(1.0);
+                    th = (th * k).floor().max(1.0);
+                }
+                if tw * th > MAX_TILE_PIXELS {
+                    let k = (MAX_TILE_PIXELS / (tw * th)).sqrt();
+                    tw = (tw * k).floor().max(1.0);
+                    th = (th * k).floor().max(1.0);
+                }
+                let eff = ((tw / abs_x) as f32).max((th / abs_y) as f32);
+                if eff.is_finite() && eff > 0.0 {
+                    eff
+                } else {
+                    0.0
+                }
+            } else {
+                0.0
+            }
+        } else {
+            0.0
         };
+
+        let uncolored = def.paint_type == 2;
+        let cache_key = TilingCellKey {
+            pat_id: def.pat_id,
+            uncolored_color: uncolored.then(|| {
+                [
+                    pattern_color.r,
+                    pattern_color.g,
+                    pattern_color.b,
+                    pattern_color.a,
+                ]
+                .map(f32::to_bits)
+            }),
+            image_downscale: cell_downscale_scale.to_bits(),
+        };
+        let can_cache = self.form_resources.is_empty() || def.dict.get("Resources").is_some();
+        if can_cache {
+            if let Some(commands) = self.tiling_cell_cache.get(&cache_key) {
+                return Some(std::sync::Arc::new(TilingPattern {
+                    commands: std::sync::Arc::clone(commands),
+                    bbox: def.bbox,
+                    x_step: def.x_step,
+                    y_step: def.y_step,
+                    matrix: to_page,
+                    tiling_type: def.tiling_type,
+                }));
+            }
+        }
+
+        let file = self.file?;
 
         // Pattern /Resources and fonts shadow the page's for the cell body,
         // exactly like a form XObject's.
@@ -5944,180 +5892,158 @@ impl<'a> ContentInterpreter<'a> {
             self.form_resources.push(res);
         }
 
+        // Interpret the cell once in pattern space into a detached display list
+        // bounded by `/BBox`, mirroring `build_soft_mask`.
+        let saved_dl = std::mem::replace(&mut self.display_list, DisplayList::new(def.bbox));
+        let depth_floor = self.state_stack.len();
+        self.state_stack.push(self.current.clone());
+        let saved_floor = self.state_floor;
+        self.state_floor = depth_floor + 1;
         let saved_text_matrix = self.text_matrix;
         let saved_text_line_matrix = self.text_line_matrix;
+        let saved_current_font_id = self.current_font_id;
         let saved_operand_stack = std::mem::take(&mut self.operand_stack);
+        let saved_current_path = std::mem::take(&mut self.current_path);
+        let saved_pending_clip = self.pending_clip.take();
         let saved_suppress = self.suppress_color_ops;
-        // Pattern-cell glyphs are painting resources, not logical page text;
-        // their EMC operators must never edit the surrounding extraction sink.
+        // Pattern-cell glyphs and geometry are painting resources, never logical
+        // page text or table rules.
         let saved_text_sink = self.text_sink.take();
         let saved_span_streams = self.span_streams.take();
-        // Unbalanced BDC/EMC inside a cell must not leak marked-content state
-        // into later tiles or the rest of the page; like `mc_depth`, the cell's
-        // /MCID stack is saved before the tile loop and restored per tile.
+        let saved_rule_sink = self.rule_sink.take();
+        let saved_active_actual_text = self.active_actual_text.take();
         let saved_mc_depth = self.mc_depth;
-        let saved_mc_stack = self.mc_stack.clone();
-        let saved_compatibility = self.compatibility_depth;
-        let saved_oc_hidden = self.oc_hidden_from;
-        // Patterns selected inside the cell anchor to the cell's space.
-        let saved_base_ctm = self.base_ctm;
-        let uncolored = def.paint_type == 2;
-        // The scn-time color paints an uncolored cell.
-        let pattern_color = self.current.fill_color;
-        let cell_alpha = self.current.fill_alpha;
-        // Soft-mask reuse across tiles (see build_or_reuse_soft_mask): masks
-        // are built as if at the middle tile of the range, whose cell sits in
-        // the page interior. Saved and restored so nested pattern loops don't
-        // share each other's keys. (Overflow-safe midpoint: i0/i1 can sit at
-        // the i64 extremes for pathological steps.)
-        let canonical_ctm = to_page.concat(&Matrix::translate(
-            (i0 + (i1 - i0) / 2) as f64 * def.x_step,
-            (j0 + (j1 - j0) / 2) as f64 * def.y_step,
-        ));
-        let saved_mask_reuse = self.soft_mask_reuse.replace(TileMaskReuse {
-            masks: HashMap::new(),
-            cur_delta: (0.0, 0.0),
-        });
-        let saved_tile_op_index = self.tile_op_index;
+        let saved_mc_stack = std::mem::take(&mut self.mc_stack);
         let saved_mc_stream = self.current_mc_stream.take();
+        let saved_enclosing_struct_actual_text = self.enclosing_struct_actual_text;
+        let saved_compatibility = std::mem::replace(&mut self.compatibility_depth, 0);
+        let saved_oc_hidden = self.oc_hidden_from.take();
+        let saved_base_ctm = self.base_ctm;
+        // Soft masks built inside the cell live in pattern-cell space (`def.bbox`),
+        // separate from the outer page's soft-mask cache.
+        let saved_soft_mask_cache = std::mem::take(&mut self.soft_mask_cache);
+        let saved_image_downscale_scale =
+            std::mem::replace(&mut self.image_downscale_scale, cell_downscale_scale);
+
+        // Clean pattern-cell initial graphics state (ISO 32000-1 §8.7.3.1).
+        self.current = GraphicsState::default();
+        self.text_matrix = Matrix::identity();
+        self.text_line_matrix = Matrix::identity();
+        self.base_ctm = Matrix::identity();
+        if uncolored {
+            self.current.fill_color = pattern_color;
+            self.current.stroke_color = pattern_color;
+            // Uncolored cell colour is the pattern's base-space tint, not
+            // tracked as a colorant; overprint is off inside the cell.
+            self.current.fill_colorant = None;
+            self.current.stroke_colorant = None;
+            self.suppress_color_ops = true;
+        } else {
+            self.suppress_color_ops = false;
+        }
+
+        // Clip the cell to its /BBox.
+        let mut bbox_path = Path::new();
+        bbox_path.rect(def.bbox);
+        self.display_list.push(RenderCommand::PushClip {
+            path: bbox_path,
+            rule: FillRule::NonZero,
+        });
 
         self.form_depth += 1;
-        'tiles: for j in j0..=j1 {
-            for i in i0..=i1 {
-                // A pathological /XStep,/YStep vs clip can imply millions of
-                // tiles; stop replicating once the page hits the command budget.
-                if self.over_budget() {
-                    tracing::warn!("tiling pattern exceeded command budget; truncating");
-                    break 'tiles;
-                }
-                let tile_offset = Matrix::translate(i as f64 * def.x_step, j as f64 * def.y_step);
-                let tile_ctm = to_page.concat(&tile_offset);
-                // Restart the per-tile operator count so `gs` sites line up
-                // across tiles, and point mask builds at the canonical tile.
-                self.tile_op_index = 0;
-                if let Some(reuse) = self.soft_mask_reuse.as_mut() {
-                    reuse.cur_delta = (canonical_ctm.e - tile_ctm.e, canonical_ctm.f - tile_ctm.f);
-                }
-
-                // Per-tile state: cells start from a clean color state (and
-                // must not re-enter the active pattern), inherit alpha.
-                let depth_floor = self.state_stack.len();
-                self.state_stack.push(self.current.clone());
-                let saved_floor = self.state_floor;
-                self.state_floor = depth_floor + 1;
-                self.current.ctm = tile_ctm;
-                self.compatibility_depth = 0;
-                self.current.clip_depth = 0;
-                self.current.fill_pattern = None;
-                self.current.stroke_pattern = None;
-                self.current.fill_cs = ActiveColorSpace::DeviceGray;
-                self.current.stroke_cs = ActiveColorSpace::DeviceGray;
-                self.current.fill_alpha = cell_alpha;
-                self.current.stroke_alpha = cell_alpha;
-                if uncolored {
-                    self.current.fill_color = pattern_color;
-                    self.current.stroke_color = pattern_color;
-                    // Uncolored cell colour is the pattern's base-space tint, not
-                    // tracked as a colorant; overprint is off inside the cell.
-                    self.current.fill_colorant = None;
-                    self.current.stroke_colorant = None;
-                    self.suppress_color_ops = true;
-                } else {
-                    self.current.fill_color = Color::black();
-                    self.current.stroke_color = Color::black();
-                    // Match the reset-to-black colour so an overprint before any
-                    // colour op in the cell uses black's colorant, not a stale one.
-                    self.current.fill_colorant = Some(gray_colorant(0.0));
-                    self.current.stroke_colorant = Some(gray_colorant(0.0));
-                }
-                self.text_matrix = Matrix::identity();
-                self.text_line_matrix = Matrix::identity();
-                self.base_ctm = tile_ctm;
-
-                // Clip the cell to its /BBox.
-                let mut bbox_path = Path::new();
-                bbox_path.rect(def.bbox);
-                let page_bbox = self.transform_path_to_page_space(&bbox_path);
-                let cell_clip = !self.clip_path_covers_current_bounds(&page_bbox);
-                if cell_clip {
-                    self.intersect_clip_elision_bounds(
-                        self.clip_path_enforced_device_bounds(&page_bbox),
-                    );
-                    self.display_list.push(RenderCommand::PushClip {
-                        path: page_bbox,
-                        rule: FillRule::NonZero,
-                    });
-                }
-
-                // The `W` of the fill painting this pattern stays pending for
-                // it; one the cell leaves unpainted ends with the cell.
-                let outer_clip = self.pending_clip.take();
-                let mut tokenizer = ContentTokenizer::new(&def.content);
-                while let Some(token) = tokenizer.next_borrowed_recovering() {
-                    if self.over_budget() {
+        self.active_tiling_patterns.push(def.pat_id);
+        let mut truncated = false;
+        let mut tokenizer = ContentTokenizer::new(&def.content);
+        while let Some(token) = tokenizer.next_borrowed_recovering() {
+            if self.over_budget() {
+                truncated = true;
+                break;
+            }
+            match token {
+                ContentToken::Operand(obj) => {
+                    if !self.push_operand(obj) {
+                        truncated = true;
                         break;
                     }
-                    match token {
-                        ContentToken::Operand(obj) => {
-                            if !self.push_operand(obj) {
-                                break;
-                            }
-                        }
-                        ContentToken::Operator(op) => {
-                            self.execute_operator(&op);
-                            self.operand_stack.clear();
-                        }
-                        ContentToken::InlineImage { dict, data } => {
-                            self.do_inline_image(dict, data);
-                            self.operand_stack.clear();
-                        }
-                    }
                 }
-                self.stats.diagnostics.merge(tokenizer.diagnostics());
-                self.pending_clip = outer_clip;
-
-                // Rebalance clips/state left open by the cell body.
-                while self.state_stack.len() > depth_floor + 1 {
-                    for _ in 0..self.current.clip_depth {
-                        self.display_list.push(RenderCommand::PopClip);
-                    }
-                    if let Some(state) = self.state_stack.pop() {
-                        self.current = state;
-                    }
+                ContentToken::Operator(op) => {
+                    self.execute_operator(&op);
+                    self.operand_stack.clear();
                 }
-                for _ in 0..self.current.clip_depth {
-                    self.display_list.push(RenderCommand::PopClip);
+                ContentToken::InlineImage { dict, data } => {
+                    self.do_inline_image(dict, data);
+                    self.operand_stack.clear();
                 }
-                if let Some(state) = self.state_stack.pop() {
-                    self.current = state;
-                }
-                if cell_clip {
-                    self.display_list.push(RenderCommand::PopClip);
-                }
-                self.state_floor = saved_floor;
-                self.suppress_color_ops = saved_suppress;
-                self.mc_depth = saved_mc_depth;
-                self.mc_stack.clone_from(&saved_mc_stack);
-                self.compatibility_depth = saved_compatibility;
-                self.oc_hidden_from = saved_oc_hidden;
-                self.base_ctm = saved_base_ctm;
             }
         }
+        self.stats.diagnostics.merge(tokenizer.diagnostics());
+        self.close_marked_content();
+        self.active_tiling_patterns.pop();
         self.form_depth -= 1;
-        self.current_mc_stream = saved_mc_stream;
-        self.soft_mask_reuse = saved_mask_reuse;
-        self.tile_op_index = saved_tile_op_index;
-        self.text_sink = saved_text_sink;
-        self.span_streams = saved_span_streams;
 
+        // Rebalance clips/state left open by the cell body.
+        while self.state_stack.len() > depth_floor + 1 {
+            for _ in 0..self.current.clip_depth {
+                self.display_list.push(RenderCommand::PopClip);
+            }
+            if let Some(state) = self.state_stack.pop() {
+                self.current = state;
+            }
+        }
+        for _ in 0..self.current.clip_depth {
+            self.display_list.push(RenderCommand::PopClip);
+        }
+        if let Some(state) = self.state_stack.pop() {
+            self.current = state;
+        }
+        if self.display_list.commands.len() <= 1 {
+            // Cell painted nothing (e.g. empty stream or hidden OC layer):
+            // drop the no-op bbox clip so backends can fast-skip it.
+            self.display_list.commands.clear();
+        } else {
+            self.display_list.push(RenderCommand::PopClip);
+        }
+
+        let cell_dl = std::mem::replace(&mut self.display_list, saved_dl);
+        self.state_floor = saved_floor;
         self.text_matrix = saved_text_matrix;
         self.text_line_matrix = saved_text_line_matrix;
+        self.current_font_id = saved_current_font_id;
         self.operand_stack = saved_operand_stack;
+        self.current_path = saved_current_path;
+        self.pending_clip = saved_pending_clip;
+        self.suppress_color_ops = saved_suppress;
+        self.text_sink = saved_text_sink;
+        self.span_streams = saved_span_streams;
+        self.rule_sink = saved_rule_sink;
+        self.active_actual_text = saved_active_actual_text;
+        self.mc_depth = saved_mc_depth;
+        self.mc_stack = saved_mc_stack;
+        self.current_mc_stream = saved_mc_stream;
+        self.enclosing_struct_actual_text = saved_enclosing_struct_actual_text;
+        self.compatibility_depth = saved_compatibility;
+        self.oc_hidden_from = saved_oc_hidden;
+        self.base_ctm = saved_base_ctm;
+        self.soft_mask_cache = saved_soft_mask_cache;
+        self.image_downscale_scale = saved_image_downscale_scale;
         self.pop_form_fonts();
         if pushed_resources {
             self.form_resources.pop();
         }
-        true
+
+        let commands = std::sync::Arc::new(cell_dl);
+        if can_cache && !truncated && self.tiling_cell_cache.len() < MAX_CACHED_TILING_CELLS {
+            self.tiling_cell_cache
+                .insert(cache_key, std::sync::Arc::clone(&commands));
+        }
+        Some(std::sync::Arc::new(TilingPattern {
+            commands,
+            bbox: def.bbox,
+            x_step: def.x_step,
+            y_step: def.y_step,
+            matrix: to_page,
+            tiling_type: def.tiling_type,
+        }))
     }
 
     /// Emit a solid-colour glyph run (the non-pattern path, and the fallback
@@ -7098,14 +7024,48 @@ impl<'a> ContentInterpreter<'a> {
                 // 0/2/4/6, stroke for 1/5) clips the pattern to the glyph
                 // outlines instead of painting a solid run.
                 let painted = match (text_pattern, glyph_clip) {
-                    (Some(pat), Some((clip_path, bounds))) => {
+                    (Some(PatternPaint::Shading(def)), Some((clip_path, bounds))) => {
                         self.display_list.push(RenderCommand::PushClip {
                             path: clip_path,
                             rule: FillRule::NonZero,
                         });
-                        let painted = self.paint_pattern_in_region(&pat, bounds);
+                        self.emit_shading_image(&def, bounds);
                         self.display_list.push(RenderCommand::PopClip);
-                        painted
+                        true
+                    }
+                    (Some(PatternPaint::Tiling(def)), Some((clip_path, bounds))) => {
+                        if self.oc_suppressed() {
+                            true
+                        } else if let Some(tiling) =
+                            self.build_tiling_pattern_paint(&def, self.current.fill_color)
+                        {
+                            // Pad to integer coordinates outside `bounds` so the
+                            // clipped fill has 100% coverage on every anti-aliased
+                            // glyph boundary pixel (no double-AA attenuation).
+                            let mut rect_path = Path::new();
+                            rect_path.rect(Rect::new(
+                                bounds.x0.floor() - 1.0,
+                                bounds.y0.floor() - 1.0,
+                                bounds.x1.ceil() + 1.0,
+                                bounds.y1.ceil() + 1.0,
+                            ));
+                            self.display_list.push(RenderCommand::PushClip {
+                                path: clip_path,
+                                rule: FillRule::NonZero,
+                            });
+                            let cmd = RenderCommand::FillPath {
+                                path: rect_path,
+                                rule: FillRule::NonZero,
+                                paint: Paint::Tiling(tiling),
+                                alpha: self.current.fill_alpha,
+                                overprint: None,
+                            };
+                            self.emit_painted(cmd);
+                            self.display_list.push(RenderCommand::PopClip);
+                            true
+                        } else {
+                            false
+                        }
                     }
                     _ => false,
                 };
@@ -7960,7 +7920,14 @@ fn build_tiling_pattern(
         return None;
     }
     let paint_type = dict.get_i64("PaintType").unwrap_or(1);
+    let tiling_type = dict
+        .get_i64("TilingType")
+        .ok()
+        .and_then(|v| u8::try_from(v).ok())
+        .filter(|&v| (1..=3).contains(&v))
+        .unwrap_or(1);
     Some(std::sync::Arc::new(TilingPatternDef {
+        pat_id,
         content,
         dict: dict.clone(),
         bbox,
@@ -7968,6 +7935,7 @@ fn build_tiling_pattern(
         y_step,
         matrix,
         paint_type,
+        tiling_type,
     }))
 }
 
@@ -10456,18 +10424,32 @@ mod tests {
                 .with_images(&mut cache)
                 .with_limits(&limits)
                 .interpret_with_stats(b"/Pattern cs /P0 scn 0 0 1 1 re f");
-            let images = dl
+            let images: usize = dl
                 .commands
                 .iter()
-                .filter(|cmd| matches!(cmd, RenderCommand::DrawImage(_)))
-                .count();
-            // cs, scn, re, f plus every image in every replicated cell.
+                .map(|cmd| match cmd {
+                    RenderCommand::FillPath {
+                        paint: Paint::Tiling(tiling),
+                        ..
+                    } => tiling
+                        .commands
+                        .commands
+                        .iter()
+                        .filter(|c| matches!(c, RenderCommand::DrawImage(_)))
+                        .count(),
+                    _ => 0,
+                })
+                .sum();
+            // cs, scn, re, f plus every inline image inside the single pre-interpreted cell.
             assert_eq!(stats.operators_executed, 4 + images as u64);
             if max_ops == 5 {
                 assert_eq!(images, 1);
                 assert!(stats.diagnostics.resource_limit_reached);
             } else {
-                assert!(images > 2, "the pattern must execute more than one cell");
+                assert_eq!(
+                    images, 2,
+                    "the pattern cell must execute both inline images"
+                );
                 assert!(stats.diagnostics.is_complete());
             }
         }

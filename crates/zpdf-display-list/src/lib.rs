@@ -181,11 +181,35 @@ impl Color {
     }
 }
 
+/// A PDF tiling pattern (ISO 32000-1 §8.7.3): the single cell's content
+/// pre-interpreted in pattern space into a detached [`DisplayList`], repeated
+/// across the `(x_step, y_step)` grid and mapped to page space by `matrix`.
+#[derive(Debug, Clone)]
+pub struct TilingPattern {
+    /// The cell's interpreted commands in pattern space (clipped to `bbox`).
+    /// Font and image IDs refer to the same caches as the surrounding display
+    /// list.
+    pub commands: std::sync::Arc<DisplayList>,
+    /// Pattern-space cell bounding box (`/BBox`, normalized so `x0 < x1`,
+    /// `y0 < y1`).
+    pub bbox: Rect,
+    /// Pattern-space horizontal spacing (`/XStep`, non-zero; may be negative).
+    pub x_step: f64,
+    /// Pattern-space vertical spacing (`/YStep`, non-zero; may be negative).
+    pub y_step: f64,
+    /// Pattern space → page space transform (`base_ctm · /Matrix`).
+    pub matrix: Matrix,
+    /// `/TilingType` (1 = constant spacing, 2 = no distortion, 3 = constant
+    /// spacing and faster tiling).
+    pub tiling_type: u8,
+}
+
 #[derive(Debug, Clone)]
 pub enum Paint {
     Solid(Color),
     Pattern(u32),
     Shading(u32),
+    Tiling(std::sync::Arc<TilingPattern>),
 }
 
 /// Overprint descriptor (PDF 8.6.7) for a painted primitive whose source colour

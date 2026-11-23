@@ -262,3 +262,252 @@ fn tiling_pattern_matrix_offsets_grid() {
     // Page (5, 5) = pattern (-5, -5) = cell-space (15, 15) → empty.
     assert_rgbish(px(&page, 5.0, 5.0), [255, 255, 255], "offset cell gap");
 }
+
+/// Helper returning the display list, interpret stats, and rendered page at
+/// custom page dimensions and scale.
+fn render_with_stats(
+    pdf: Vec<u8>,
+    scale: f32,
+) -> (
+    zpdf::DisplayList,
+    zpdf::InterpretStats,
+    zpdf::cpu::RenderedPage,
+) {
+    let doc = PdfDocument::open(pdf).expect("open pdf");
+    let page = doc.page(0).expect("page 0");
+    let mut fonts = doc.load_page_fonts(&page);
+    let content = doc.page_content_bytes(&page).expect("content bytes");
+    let mut images = ImageCache::new();
+    let (dl, stats) = ContentInterpreter::new(page.media_box)
+        .with_fonts(&mut fonts)
+        .with_document(doc.file(), &page.resources)
+        .with_images(&mut images)
+        .interpret_with_stats(&content);
+    let rendered = zpdf::cpu::CpuRenderer::new()
+        .with_fonts(&fonts)
+        .with_images(&images)
+        .render_display_list(&dl, scale)
+        .expect("cpu render");
+    (dl, stats, rendered)
+}
+
+fn px_on(page: &zpdf::cpu::RenderedPage, page_h: f64, scale: f32, x: f64, y: f64) -> [u8; 3] {
+    let ix = (x * scale as f64) as u32;
+    let iy = ((page_h - y) * scale as f64) as u32;
+    let off = ((iy * page.width + ix) * 4) as usize;
+    [page.data[off], page.data[off + 1], page.data[off + 2]]
+}
+
+/// Regression for #155: tiling patterns covering > 4,096 tiles (100×100 =
+/// 10,000 tiles each) must emit compact `Paint::Tiling` commands without
+/// falling back to a solid colour or hitting the command budget — for both
+/// coloured (`/PaintType 1`) and uncoloured (`/PaintType 2`) patterns.
+#[test]
+fn over_4096_tiles_renders_pattern_without_solid_fallback() {
+    // 600×600 pt page with 6×6 pt cells = 10,000 tiles per half (50×100 = 5,000
+    // on each side; 100×100 across the whole page).
+    let colored_cell: &[u8] = b"1 0 0 rg 0 0 3 3 re f\n0 0 1 rg 3 3 3 3 re f";
+    let colored_pat = "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+                       /BBox [0 0 6 6] /XStep 6 /YStep 6 /Resources << >>";
+    let uncolored_cell: &[u8] = b"0 0 3 3 re f";
+    let uncolored_pat = "/Type /Pattern /PatternType 1 /PaintType 2 /TilingType 3 \
+                         /BBox [0 0 6 6] /XStep 6 /YStep 6 /Resources << >>";
+    // Full 600×600 coloured fill (10,000 tiles), then right half (300..600)
+    // cleared white and filled with uncoloured green pattern (5,000 tiles).
+    let content: &[u8] = b"/Pattern cs /P1 scn 0 0 600 600 re f\n\
+                           1 1 1 rg 300 0 300 600 re f\n\
+                           /CS0 cs 0 1 0 /P2 scn 300 0 300 600 re f";
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 600] /Contents 4 0 R \
+          /Resources << /Pattern << /P1 5 0 R /P2 6 0 R >> /ColorSpace << /CS0 7 0 R >> >> >>"
+            .to_vec(),
+        stream_obj("", content),
+        stream_obj(colored_pat, colored_cell),
+        stream_obj(uncolored_pat, uncolored_cell),
+        b"[/Pattern /DeviceRGB]".to_vec(),
+    ]);
+
+    let (dl, stats, page) = render_with_stats(pdf, 1.0);
+    assert!(
+        stats.diagnostics.is_complete(),
+        "must not hit resource/tile cap: {:?}",
+        stats.diagnostics
+    );
+    assert_eq!(
+        dl.commands.len(),
+        3,
+        "display list stays O(1) in tile count, got {} commands",
+        dl.commands.len()
+    );
+
+    // Coloured pattern (> 4,096 tiles): sample near bottom-left and near top-center.
+    assert_rgbish(
+        px_on(&page, 600.0, 1.0, 1.5, 1.5),
+        [255, 0, 0],
+        "colored tile (0,0) red",
+    );
+    assert_rgbish(
+        px_on(&page, 600.0, 1.0, 295.5, 595.5),
+        [255, 0, 0],
+        "colored tile (49,99) red",
+    );
+    assert_rgbish(
+        px_on(&page, 600.0, 1.0, 298.5, 598.5),
+        [0, 0, 255],
+        "colored tile (49,99) blue",
+    );
+    assert_rgbish(
+        px_on(&page, 600.0, 1.0, 298.5, 595.5),
+        [255, 255, 255],
+        "colored tile (49,99) white gap",
+    );
+
+    // Uncoloured pattern (5,000 tiles): sample near far top-right corner.
+    assert_rgbish(
+        px_on(&page, 600.0, 1.0, 595.5, 595.5),
+        [0, 255, 0],
+        "uncolored tile (99,99) green",
+    );
+    assert_rgbish(
+        px_on(&page, 600.0, 1.0, 598.5, 598.5),
+        [255, 255, 255],
+        "uncolored tile (99,99) white gap",
+    );
+}
+
+/// Negative `/YStep` with fractional non-zero `/BBox` origin (as emitted by
+/// Adobe Illustrator in PDFBOX-1094-5) must repeat cleanly across many tiles
+/// without phase drift.
+#[test]
+fn negative_ystep_and_fractional_step_keep_exact_phase() {
+    // 8.5pt step with negative YStep = -8.5 and bbox shifted by -0.5 in Y,
+    // compensated by /Matrix [1 0 0 1 0 0.5].
+    let cell: &[u8] = b"1 0 0 rg 1 0.5 3 3 re f";
+    let pat = "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 2 \
+               /BBox [0 -0.5 8.5 8.0] /XStep 8.5 /YStep -8.5 \
+               /Matrix [1 0 0 1 0 0.5] /Resources << >>";
+    let content: &[u8] = b"/Pattern cs /P0 scn 0 0 425 425 re f";
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 425 425] /Contents 4 0 R \
+          /Resources << /Pattern << /P0 5 0 R >> >> >>"
+            .to_vec(),
+        stream_obj("", content),
+        stream_obj(pat, cell),
+    ]);
+
+    let (_dl, stats, page) = render_with_stats(pdf, 2.0);
+    assert!(stats.diagnostics.is_complete());
+    // In tile (0, 0), red rect sits at page [1..4] × [1..4].
+    // After 45 tiles (+382.5 pt in both axes), tile (45, 45) sits at
+    // [383.5..386.5] × [383.5..386.5]; center (385.0, 385.0) must still be red,
+    // and (389.0, 389.0) must be white gap (proving zero cumulative drift).
+    assert_rgbish(
+        px_on(&page, 425.0, 2.0, 2.5, 2.5),
+        [255, 0, 0],
+        "tile (0,0) red center",
+    );
+    assert_rgbish(
+        px_on(&page, 425.0, 2.0, 385.0, 385.0),
+        [255, 0, 0],
+        "tile (45,45) red center without phase drift",
+    );
+    assert_rgbish(
+        px_on(&page, 425.0, 2.0, 389.0, 389.0),
+        [255, 255, 255],
+        "tile (45,45) gap",
+    );
+}
+
+/// Overlapping cells (`/BBox` larger than `/XStep`, `/YStep`, as in
+/// MOZILLA-1244729-0) must wrap their protruding region seamlessly into the
+/// start of the next period.
+#[test]
+fn overlapping_bbox_larger_than_step_wraps_into_neighbor_period() {
+    // Cell bbox is 12×12 while XStep = YStep = 10. A red strip at x=[10.5..11.8]
+    // protrudes past XStep=10 and must appear at x=[0.5..1.8] of every period.
+    let cell: &[u8] = b"1 0 0 rg 10.5 2 1.3 6 re f";
+    let pat = "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 3 \
+               /BBox [0 0 12 12] /XStep 10 /YStep 10 /Resources << >>";
+    let content: &[u8] = b"/Pattern cs /P0 scn 0 0 200 200 re f";
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R \
+          /Resources << /Pattern << /P0 5 0 R >> >> >>"
+            .to_vec(),
+        stream_obj("", content),
+        stream_obj(pat, cell),
+    ]);
+    let page = render(pdf);
+    // Page (21.1, 25.0) = period-offset (1.1, 5.0), painted by tile (1, 2)'s protrusion.
+    assert_rgbish(
+        px(&page, 21.1, 25.0),
+        [255, 0, 0],
+        "wrapped protrusion from neighbor tile",
+    );
+    // Page (25.0, 25.0) = period-offset (5.0, 5.0), unpainted gap.
+    assert_rgbish(px(&page, 25.0, 25.0), [255, 255, 255], "interior gap");
+}
+
+/// Rotated pattern `/Matrix` and translucent `ca = 0.5` apply cleanly to
+/// `Paint::Tiling`.
+#[test]
+fn rotated_and_translucent_tiling_pattern_renders() {
+    // Solid red left half of a 20×20 cell, rotated 90° CCW via /Matrix [0 1 -1 0 0 0]
+    // so cell +x maps to page +y (bottom half red, top half empty in every 20×20 tile),
+    // painted at 50% fill alpha.
+    let cell: &[u8] = b"1 0 0 rg 0 0 10 20 re f";
+    let pat = "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+               /BBox [0 0 20 20] /XStep 20 /YStep 20 \
+               /Matrix [0 1 -1 0 0 0] /Resources << >>";
+    let content: &[u8] = b"/GS1 gs /Pattern cs /P0 scn 0 0 200 200 re f";
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R \
+          /Resources << /Pattern << /P0 5 0 R >> /ExtGState << /GS1 6 0 R >> >> >>"
+            .to_vec(),
+        stream_obj("", content),
+        stream_obj(pat, cell),
+        b"<< /Type /ExtGState /ca 0.5 >>".to_vec(),
+    ]);
+    let page = render(pdf);
+    // Under 90° CCW rotation, cell x∈[0,10] maps to page y mod 20 ∈ [0,10].
+    // Red at ca=0.5 over white gives ~[255, 128, 128].
+    let tinted = px(&page, 45.0, 25.0);
+    assert!(
+        tinted[0] > 240 && (110..=150).contains(&tinted[1]) && (110..=150).contains(&tinted[2]),
+        "expected translucent red band at rotated y mod 20 = 5, got {tinted:?}"
+    );
+    // y mod 20 = 15 falls in the empty half of the rotated cell → white.
+    assert_rgbish(px(&page, 45.0, 35.0), [255, 255, 255], "rotated empty band");
+}
+
+/// Self-referential tiling pattern terminates immediately without recursing
+/// into a stack overflow or hanging.
+#[test]
+fn self_referential_tiling_pattern_terminates_safely() {
+    let cell: &[u8] = b"/Pattern cs /P0 scn 0 0 10 10 re f";
+    let pat = "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+               /BBox [0 0 10 10] /XStep 10 /YStep 10 \
+               /Resources << /Pattern << /P0 5 0 R >> >>";
+    let content: &[u8] = b"/Pattern cs /P0 scn 0 0 100 100 re f";
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R \
+          /Resources << /Pattern << /P0 5 0 R >> >> >>"
+            .to_vec(),
+        stream_obj("", content),
+        stream_obj(pat, cell),
+    ]);
+    let (_dl, stats, _page) = render_with_stats(pdf, 1.0);
+    assert!(
+        stats.diagnostics.malformed_content > 0,
+        "self-referential tiling pattern must be flagged as malformed_content"
+    );
+}

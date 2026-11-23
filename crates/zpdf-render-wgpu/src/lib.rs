@@ -416,6 +416,28 @@ impl<'a> RenderBackend for WgpuRenderer<'a> {
                     None => page.recorder.add_fill(path, *rule, color, &page.map),
                 }
             }
+            RenderCommand::FillPath {
+                path,
+                rule,
+                paint: Paint::Tiling(tiling),
+                alpha,
+                ..
+            } => {
+                if let Some(bounds) = path_bounds(path) {
+                    page.recorder.push_clip(path, *rule, &page.map);
+                    record_tiling_pattern(
+                        &mut page.recorder,
+                        tiling,
+                        bounds,
+                        *alpha,
+                        fonts,
+                        images,
+                        &page.map,
+                        0,
+                    );
+                    page.recorder.pop_clip();
+                }
+            }
             RenderCommand::StrokePath {
                 path,
                 style,
@@ -432,6 +454,28 @@ impl<'a> RenderBackend for WgpuRenderer<'a> {
                     }
                     Some(_) => {}
                     None => page.recorder.add_stroke(path, style, color, &page.map),
+                }
+            }
+            RenderCommand::StrokePath {
+                path,
+                style,
+                paint: Paint::Tiling(tiling),
+                alpha,
+                ..
+            } => {
+                if let Some(bounds) = stroke_bounds(path, style) {
+                    page.recorder.push_clip_stroke(path, style, &page.map);
+                    record_tiling_pattern(
+                        &mut page.recorder,
+                        tiling,
+                        bounds,
+                        *alpha,
+                        fonts,
+                        images,
+                        &page.map,
+                        0,
+                    );
+                    page.recorder.pop_clip();
                 }
             }
             RenderCommand::PushClip { path, rule } => {
@@ -993,8 +1037,33 @@ fn record_dl_commands(
             RenderCommand::PushClip { path, rule } => rec.push_clip(path, *rule, map),
             RenderCommand::PushClipStroke { path, style } => rec.push_clip_stroke(path, style, map),
             RenderCommand::PopClip => rec.pop_clip(),
-            // Pattern fills (non-solid paint) are already expanded to clip+fill
-            // by the interpreter, so a non-solid paint here is a rare no-op.
+            RenderCommand::FillPath {
+                path,
+                rule,
+                paint: Paint::Tiling(tiling),
+                alpha,
+                ..
+            } => {
+                if let Some(bounds) = path_bounds(path) {
+                    rec.push_clip(path, *rule, map);
+                    record_tiling_pattern(rec, tiling, bounds, *alpha, fonts, images, map, 0);
+                    rec.pop_clip();
+                }
+            }
+            RenderCommand::StrokePath {
+                path,
+                style,
+                paint: Paint::Tiling(tiling),
+                alpha,
+                ..
+            } => {
+                if let Some(bounds) = stroke_bounds(path, style) {
+                    rec.push_clip_stroke(path, style, map);
+                    record_tiling_pattern(rec, tiling, bounds, *alpha, fonts, images, map, 0);
+                    rec.pop_clip();
+                }
+            }
+            // Non-solid paints other than tiling are rasterized upstream.
             RenderCommand::FillPath { .. } | RenderCommand::StrokePath { .. } => {}
             // A transparency group nested inside the mask: build its sub-mask and
             // record a blend group, recursively (sub-masks compose to any depth).
@@ -1013,6 +1082,286 @@ fn record_dl_commands(
                 rec.push_blend(*blend_mode, *alpha, sub);
             }
             RenderCommand::PopBlendGroup => rec.pop_blend(),
+        }
+    }
+}
+
+fn path_bounds(path: &zpdf_display_list::Path) -> Option<zpdf_core::Rect> {
+    let (mut x0, mut y0, mut x1, mut y1) = (
+        f64::INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NEG_INFINITY,
+    );
+    for p in path.points() {
+        if !p.x.is_finite() || !p.y.is_finite() {
+            return None;
+        }
+        x0 = x0.min(p.x);
+        y0 = y0.min(p.y);
+        x1 = x1.max(p.x);
+        y1 = y1.max(p.y);
+    }
+    (x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite())
+        .then(|| zpdf_core::Rect::new(x0, y0, x1, y1))
+}
+
+fn stroke_bounds(
+    path: &zpdf_display_list::Path,
+    style: &zpdf_display_list::StrokeStyle,
+) -> Option<zpdf_core::Rect> {
+    let b = path_bounds(path)?;
+    let reach = match style.join {
+        zpdf_display_list::LineJoin::Miter => style.miter_limit.clamp(1.0, 100.0),
+        _ => std::f32::consts::SQRT_2,
+    };
+    let grow =
+        (style.width.max(1.0) as f64 * 0.5 * reach.max(std::f32::consts::SQRT_2) as f64).max(0.5);
+    Some(zpdf_core::Rect::new(
+        b.x0 - grow,
+        b.y0 - grow,
+        b.x1 + grow,
+        b.y1 + grow,
+    ))
+}
+
+/// Fallback per-tile replay for [`zpdf_display_list::TilingPattern`] on the
+/// wgpu backend (transforms cell commands into page space per visible tile,
+/// bounded to 4,096 tiles and nesting depth 8).
+#[allow(clippy::too_many_arguments)]
+fn record_tiling_pattern(
+    rec: &mut PageRecorder,
+    tiling: &zpdf_display_list::TilingPattern,
+    bounds: zpdf_core::Rect,
+    alpha: f32,
+    fonts: Option<&zpdf_font::FontCache>,
+    images: Option<&zpdf_image::ImageCache>,
+    map: &PageMap,
+    depth: u8,
+) {
+    const MAX_GPU_TILES: i64 = 4096;
+    const MAX_TILING_DEPTH: u8 = 8;
+    if depth >= MAX_TILING_DEPTH || tiling.commands.commands.is_empty() || !rec.can_record() {
+        return;
+    }
+    let Some(from_page) = tiling.matrix.inverse() else {
+        return;
+    };
+    let corners = [
+        zpdf_core::Point::new(bounds.x0, bounds.y0),
+        zpdf_core::Point::new(bounds.x1, bounds.y0),
+        zpdf_core::Point::new(bounds.x0, bounds.y1),
+        zpdf_core::Point::new(bounds.x1, bounds.y1),
+    ];
+    let (mut px0, mut py0) = (f64::INFINITY, f64::INFINITY);
+    let (mut px1, mut py1) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for c in &corners {
+        let p = c.transform(&from_page);
+        px0 = px0.min(p.x);
+        py0 = py0.min(p.y);
+        px1 = px1.max(p.x);
+        py1 = py1.max(p.y);
+    }
+    if ![px0, py0, px1, py1].iter().all(|v| v.is_finite()) {
+        return;
+    }
+    let range = |lo: f64, hi: f64, cell_lo: f64, cell_hi: f64, step: f64| {
+        let t0 = (lo - cell_hi) / step;
+        let t1 = (hi - cell_lo) / step;
+        let (a, b) = if t0 <= t1 { (t0, t1) } else { (t1, t0) };
+        (a.floor() as i64, b.ceil() as i64)
+    };
+    let bbox = tiling.bbox.normalize();
+    let (i0, i1) = range(px0, px1, bbox.x0, bbox.x1, tiling.x_step);
+    let (j0, j1) = range(py0, py1, bbox.y0, bbox.y1, tiling.y_step);
+    let nx = i1.saturating_sub(i0).saturating_add(1);
+    let ny = j1.saturating_sub(j0).saturating_add(1);
+    if nx <= 0 || ny <= 0 || nx.saturating_mul(ny) > MAX_GPU_TILES {
+        tracing::warn!("wgpu tiling pattern: {nx}x{ny} tiles exceeds fallback cap; skipping");
+        return;
+    }
+    let wrap_alpha = alpha.is_finite() && alpha < 1.0 && rec.can_push_blend();
+    if wrap_alpha {
+        rec.push_blend(zpdf_display_list::BlendMode::Normal, alpha.max(0.0), None);
+    }
+    'tiles: for j in j0..=j1 {
+        for i in i0..=i1 {
+            if !rec.can_record() {
+                break 'tiles;
+            }
+            let tile_ctm = tiling.matrix.concat(&zpdf_core::Matrix::translate(
+                i as f64 * tiling.x_step,
+                j as f64 * tiling.y_step,
+            ));
+            let stroke_scale = (tile_ctm.a * tile_ctm.d - tile_ctm.b * tile_ctm.c)
+                .abs()
+                .sqrt() as f32;
+            let transformed = transform_display_list(&tiling.commands, &tile_ctm, stroke_scale);
+            record_display_list_at_depth(rec, &transformed, fonts, images, map, depth + 1);
+        }
+    }
+    if wrap_alpha {
+        rec.pop_blend();
+    }
+}
+
+fn transform_stroke_style(
+    style: &zpdf_display_list::StrokeStyle,
+    stroke_scale: f32,
+) -> zpdf_display_list::StrokeStyle {
+    let mut out = style.clone();
+    if stroke_scale.is_finite() && stroke_scale > 0.0 {
+        out.width *= stroke_scale;
+        if let Some(dash) = &mut out.dash {
+            for v in &mut dash.array {
+                *v *= stroke_scale;
+            }
+            dash.phase *= stroke_scale;
+        }
+    }
+    out
+}
+
+fn transform_display_list(
+    dl: &zpdf_display_list::DisplayList,
+    ctm: &zpdf_core::Matrix,
+    stroke_scale: f32,
+) -> zpdf_display_list::DisplayList {
+    let mut out = zpdf_display_list::DisplayList::new(dl.page_rect);
+    out.commands.reserve(dl.commands.len());
+    for cmd in &dl.commands {
+        let mapped = match cmd {
+            RenderCommand::FillPath {
+                path,
+                rule,
+                paint,
+                alpha,
+                overprint,
+            } => RenderCommand::FillPath {
+                path: path.map_points(|p| p.transform(ctm)),
+                rule: *rule,
+                paint: match paint {
+                    zpdf_display_list::Paint::Tiling(inner) => {
+                        let mut nested = (**inner).clone();
+                        nested.matrix = ctm.concat(&nested.matrix);
+                        zpdf_display_list::Paint::Tiling(std::sync::Arc::new(nested))
+                    }
+                    other => other.clone(),
+                },
+                alpha: *alpha,
+                overprint: *overprint,
+            },
+            RenderCommand::StrokePath {
+                path,
+                style,
+                paint,
+                alpha,
+                overprint,
+            } => RenderCommand::StrokePath {
+                path: path.map_points(|p| p.transform(ctm)),
+                style: transform_stroke_style(style, stroke_scale),
+                paint: match paint {
+                    zpdf_display_list::Paint::Tiling(inner) => {
+                        let mut nested = (**inner).clone();
+                        nested.matrix = ctm.concat(&nested.matrix);
+                        zpdf_display_list::Paint::Tiling(std::sync::Arc::new(nested))
+                    }
+                    other => other.clone(),
+                },
+                alpha: *alpha,
+                overprint: *overprint,
+            },
+            RenderCommand::DrawGlyphRun(run) => {
+                let mut cloned = run.clone();
+                cloned.transform = ctm.concat(&cloned.transform);
+                RenderCommand::DrawGlyphRun(cloned)
+            }
+            RenderCommand::DrawImage(draw) => {
+                let mut cloned = draw.clone();
+                cloned.transform = ctm.concat(&cloned.transform);
+                RenderCommand::DrawImage(cloned)
+            }
+            RenderCommand::PushClip { path, rule } => RenderCommand::PushClip {
+                path: path.map_points(|p| p.transform(ctm)),
+                rule: *rule,
+            },
+            RenderCommand::PushClipStroke { path, style } => RenderCommand::PushClipStroke {
+                path: path.map_points(|p| p.transform(ctm)),
+                style: transform_stroke_style(style, stroke_scale),
+            },
+            RenderCommand::PopClip => RenderCommand::PopClip,
+            RenderCommand::PushBlendGroup {
+                blend_mode,
+                isolated,
+                knockout,
+                bounds,
+                alpha,
+                mask,
+            } => RenderCommand::PushBlendGroup {
+                blend_mode: *blend_mode,
+                isolated: *isolated,
+                knockout: *knockout,
+                bounds: *bounds,
+                alpha: *alpha,
+                mask: mask.as_ref().map(|m| {
+                    let mut mm = m.clone();
+                    mm.commands =
+                        std::sync::Arc::new(transform_display_list(&m.commands, ctm, stroke_scale));
+                    mm
+                }),
+            },
+            RenderCommand::PopBlendGroup => RenderCommand::PopBlendGroup,
+        };
+        out.commands.push(mapped);
+    }
+    out
+}
+
+fn record_display_list_at_depth(
+    rec: &mut PageRecorder,
+    dl: &zpdf_display_list::DisplayList,
+    fonts: Option<&zpdf_font::FontCache>,
+    images: Option<&zpdf_image::ImageCache>,
+    map: &PageMap,
+    depth: u8,
+) {
+    use zpdf_display_list::Paint;
+    for cmd in &dl.commands {
+        if !rec.can_record() {
+            return;
+        }
+        match cmd {
+            RenderCommand::FillPath {
+                path,
+                rule,
+                paint: Paint::Tiling(tiling),
+                alpha,
+                ..
+            } => {
+                if let Some(bounds) = path_bounds(path) {
+                    rec.push_clip(path, *rule, map);
+                    record_tiling_pattern(rec, tiling, bounds, *alpha, fonts, images, map, depth);
+                    rec.pop_clip();
+                }
+            }
+            RenderCommand::StrokePath {
+                path,
+                style,
+                paint: Paint::Tiling(tiling),
+                alpha,
+                ..
+            } => {
+                if let Some(bounds) = stroke_bounds(path, style) {
+                    rec.push_clip_stroke(path, style, map);
+                    record_tiling_pattern(rec, tiling, bounds, *alpha, fonts, images, map, depth);
+                    rec.pop_clip();
+                }
+            }
+            other => {
+                let mut single = zpdf_display_list::DisplayList::new(dl.page_rect);
+                single.commands.push(other.clone());
+                record_dl_commands(rec, &single, fonts, images, map);
+            }
         }
     }
 }

@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+### Compatibility
+
+- **Additive enum variant:** `zpdf_display_list::Paint` adds
+  `Paint::Tiling(Arc<TilingPattern>)` alongside the new `TilingPattern` struct
+  carrying a single pre-interpreted cell `DisplayList`, `/BBox`, `/XStep`,
+  `/YStep`, pattern-to-page matrix, and `/TilingType`. Downstream exhaustive
+  matches on `Paint` must handle `Paint::Tiling`. (#155)
+
+### Rendering and performance
+
+- Represent PDF tiling patterns (both coloured `/PaintType 1` and uncoloured
+  `/PaintType 2`) as `Paint::Tiling` instead of expanding per-tile geometry
+  into the flat display list, removing the 4,096-tile solid fallback and
+  command-budget truncation on pattern-heavy pages (e.g. `MOZILLA-1244729-0.pdf`,
+  `PDFBOX-1094-5.pdf`). The CPU backend rasterizes each unique cell once into a
+  bounded per-page tile cache and paints via `tiny_skia::Pattern` with
+  `SpreadMode::Repeat`, handling negative steps, overlapping `/BBox > step`,
+  and arbitrary pattern matrices; SVG export emits deduplicated `<pattern>`
+  definitions and wgpu replays tiles as a fallback. (#155)
+
 ## 0.22.0 — Embedded font recovery, rendering precision, and JBIG2 oracle
 
 Released 2026-11-23.

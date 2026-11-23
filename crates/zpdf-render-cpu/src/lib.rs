@@ -17,6 +17,9 @@ pub struct CpuRenderer<'a> {
     /// composite and mask fold to the part of the page the group used.
     dirty: Option<PaintedBounds>,
     scale: f32,
+    /// Vertical device scale; matches `scale` on page surfaces and allows
+    /// anisotropic tile-pixel snapping when rasterizing a [`TilingPattern`] cell.
+    scale_y: f32,
     /// Page rect bounds (supports CropBox / nonzero MediaBox origins):
     /// device x = (x - rect_x0) * scale, device y = (rect_y1 - y) * scale.
     rect_x0: f32,
@@ -89,6 +92,14 @@ pub struct CpuRenderer<'a> {
     soft_mask_cache_bytes: u64,
     /// Current recursive soft-mask depth (guards malicious/cyclic mask graphs).
     soft_mask_depth: usize,
+    /// Rasterized [`TilingPattern`] cell pixmaps reused across fills/strokes
+    /// sharing the same pattern cell and tile pixel dimensions. Stores the cell
+    /// `Arc<DisplayList>` alongside the pixmap so the pointer key stays unique
+    /// for as long as the entry lives. Cleared per page.
+    tiling_cache: HashMap<TilingCacheKey, (Arc<DisplayList>, Arc<tiny_skia::Pixmap>)>,
+    tiling_cache_bytes: u64,
+    /// Current recursive tiling-pattern rasterization depth.
+    tiling_depth: usize,
     /// Box-filtered image variants reused by repeated draws at the same device
     /// footprint (common for patterns and repeated XObjects).
     downscaled_images: HashMap<(ImageId, u32, u32), Arc<[u8]>>,
@@ -140,6 +151,39 @@ impl SoftMaskPlaneKey {
         }
     }
 }
+
+/// Identity of a rasterized [`TilingPattern`] cell pixmap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct TilingCacheKey {
+    commands: usize,
+    bbox: [u64; 4],
+    steps: [u64; 2],
+    tile_w: u32,
+    tile_h: u32,
+}
+
+impl TilingCacheKey {
+    fn new(tiling: &TilingPattern, tile_w: u32, tile_h: u32) -> Self {
+        Self {
+            commands: Arc::as_ptr(&tiling.commands) as *const () as usize,
+            bbox: [
+                tiling.bbox.x0.to_bits(),
+                tiling.bbox.y0.to_bits(),
+                tiling.bbox.x1.to_bits(),
+                tiling.bbox.y1.to_bits(),
+            ],
+            steps: [tiling.x_step.to_bits(), tiling.y_step.to_bits()],
+            tile_w,
+            tile_h,
+        }
+    }
+}
+
+/// Guard limits for [`TilingPattern`] cell rasterization in the CPU backend.
+const MAX_TILING_DEPTH: usize = 8;
+const MAX_TILING_TILE_DIM: u32 = 4096;
+const MAX_TILING_TILE_PIXELS: u64 = 4_194_304; // 2048×2048 = 16 MiB RGBA
+const MAX_TILING_CACHE_BYTES: u64 = 32 * 1024 * 1024;
 
 fn unit(v: f32) -> f32 {
     if v.is_finite() {
@@ -487,6 +531,7 @@ impl<'a> CpuRenderer<'a> {
             pixmap: None,
             dirty: None,
             scale: 1.0,
+            scale_y: 1.0,
             rect_x0: 0.0,
             rect_y0: 0.0,
             rect_y1: 0.0,
@@ -513,6 +558,9 @@ impl<'a> CpuRenderer<'a> {
             soft_mask_planes: HashMap::new(),
             soft_mask_cache_bytes: 0,
             soft_mask_depth: 0,
+            tiling_cache: HashMap::new(),
+            tiling_cache_bytes: 0,
+            tiling_depth: 0,
             downscaled_images: HashMap::new(),
             glyph_outlines: HashMap::new(),
             glyph_outline_commands: 0,
@@ -638,11 +686,19 @@ impl<'a> CpuRenderer<'a> {
     /// Convert PDF Y coordinate (origin bottom-left) to pixel Y (origin top-left),
     /// relative to the page rect's top edge.
     fn flip_y(&self, y: f32) -> f32 {
-        (self.rect_y1 - y) * self.scale
+        (self.rect_y1 - y) * self.scale_y
     }
 
     fn to_pixel_x(&self, x: f32) -> f32 {
         (x - self.rect_x0) * self.scale
+    }
+
+    fn stroke_scale(&self) -> f32 {
+        if self.scale == self.scale_y {
+            self.scale
+        } else {
+            (self.scale * self.scale_y).sqrt()
+        }
     }
 
     /// Finish a built path, rejecting it (caller then skips the draw) when its
@@ -813,24 +869,286 @@ impl<'a> CpuRenderer<'a> {
         }
     }
 
+    /// Rasterize (or look up in `tiling_cache`) the single cell of `tiling`
+    /// into a tile pixmap snapped to whole device pixels, and return the
+    /// pattern shader parameters (`pixmap`, `transform`, `quality`, `opacity`).
+    fn prepare_tiling_paint(
+        &mut self,
+        tiling: &TilingPattern,
+        alpha: f32,
+    ) -> Option<(
+        Arc<tiny_skia::Pixmap>,
+        tiny_skia::Transform,
+        tiny_skia::FilterQuality,
+        f32,
+    )> {
+        if self.tiling_depth >= MAX_TILING_DEPTH || tiling.commands.commands.is_empty() {
+            return None;
+        }
+        let opacity = unit(alpha);
+        if opacity <= 0.0 {
+            return None;
+        }
+        let bbox = tiling.bbox.normalize();
+        let (bx0, by0) = (bbox.x0, bbox.y0);
+        let (bw, bh) = (bbox.width(), bbox.height());
+        let (x_step, y_step) = (tiling.x_step, tiling.y_step);
+        if ![bx0, by0, bw, bh, x_step, y_step]
+            .iter()
+            .all(|v| v.is_finite())
+            || bw <= 0.0
+            || bh <= 0.0
+            || x_step == 0.0
+            || y_step == 0.0
+        {
+            return None;
+        }
+        let abs_x = x_step.abs();
+        let abs_y = y_step.abs();
+
+        // Compose page→device (PDF Y-up → device Y-down) with pattern→page.
+        let page_to_dev = zpdf_core::Matrix::new(
+            self.scale as f64,
+            0.0,
+            0.0,
+            -(self.scale_y as f64),
+            -(self.rect_x0 as f64) * self.scale as f64,
+            (self.rect_y1 as f64) * self.scale_y as f64,
+        );
+        let pat_to_dev = page_to_dev.concat(&tiling.matrix);
+        if ![
+            pat_to_dev.a,
+            pat_to_dev.b,
+            pat_to_dev.c,
+            pat_to_dev.d,
+            pat_to_dev.e,
+            pat_to_dev.f,
+        ]
+        .iter()
+        .all(|v| v.is_finite())
+        {
+            return None;
+        }
+        let det = pat_to_dev.a * pat_to_dev.d - pat_to_dev.b * pat_to_dev.c;
+        if !det.is_finite() || det.abs() < 1e-12 {
+            return None;
+        }
+
+        let len_x = (pat_to_dev.a * abs_x).hypot(pat_to_dev.b * abs_x);
+        let len_y = (pat_to_dev.c * abs_y).hypot(pat_to_dev.d * abs_y);
+        if !len_x.is_finite() || !len_y.is_finite() || len_x <= 0.0 || len_y <= 0.0 {
+            return None;
+        }
+
+        // Snap the repeating period to whole device pixels within safety caps.
+        let mut tw_f = len_x.round().max(1.0);
+        let mut th_f = len_y.round().max(1.0);
+        let max_dim = tw_f.max(th_f);
+        if max_dim > MAX_TILING_TILE_DIM as f64 {
+            let s = MAX_TILING_TILE_DIM as f64 / max_dim;
+            tw_f = (tw_f * s).floor().max(1.0);
+            th_f = (th_f * s).floor().max(1.0);
+        }
+        if tw_f * th_f > MAX_TILING_TILE_PIXELS as f64 {
+            let s = (MAX_TILING_TILE_PIXELS as f64 / (tw_f * th_f)).sqrt();
+            tw_f = (tw_f * s).floor().max(1.0);
+            th_f = (th_f * s).floor().max(1.0);
+        }
+        let tile_w = tw_f as u32;
+        let tile_h = th_f as u32;
+
+        // Map tile-pixel space [0, tile_w] × [0, tile_h] back to the fundamental
+        // pattern-space period [bx0, bx0 + abs_x] × [by0, by0 + abs_y], then to
+        // device pixels. Keeps the exact PDF repeat period across huge pages
+        // (zero cumulative phase drift) while filling the snapped tile edge-to-edge.
+        let tile_to_pat = zpdf_core::Matrix::new(
+            abs_x / tile_w as f64,
+            0.0,
+            0.0,
+            -abs_y / tile_h as f64,
+            bx0,
+            by0 + abs_y,
+        );
+        let m = pat_to_dev.concat(&tile_to_pat);
+        let transform = tiny_skia::Transform::from_row(
+            m.a as f32, m.b as f32, m.c as f32, m.d as f32, m.e as f32, m.f as f32,
+        );
+        if !transform.is_finite() || transform.invert().is_none() {
+            return None;
+        }
+        let exact_1to1 = (m.a - 1.0).abs() < 1e-4
+            && m.b.abs() < 1e-4
+            && m.c.abs() < 1e-4
+            && (m.d - 1.0).abs() < 1e-4
+            && (m.e - m.e.round()).abs() < 1e-4
+            && (m.f - m.f.round()).abs() < 1e-4;
+        let quality = if exact_1to1 {
+            tiny_skia::FilterQuality::Nearest
+        } else {
+            tiny_skia::FilterQuality::Bilinear
+        };
+
+        let key = TilingCacheKey::new(tiling, tile_w, tile_h);
+        let tile_pixmap = if let Some((_, cached)) = self.tiling_cache.get(&key) {
+            Arc::clone(cached)
+        } else {
+            let tile_bytes = tile_w as u64 * tile_h as u64 * 4;
+            if !self.surface_room(tile_bytes) {
+                tracing::warn!("tiling pattern cell {tile_w}x{tile_h} exceeds memory budget");
+                return None;
+            }
+            let target = tiny_skia::Pixmap::new(tile_w, tile_h)?;
+            let cell_scale_x = (tile_w as f64 / abs_x) as f32;
+            let cell_scale_y = (tile_h as f64 / abs_y) as f32;
+            if !cell_scale_x.is_finite()
+                || !cell_scale_y.is_finite()
+                || cell_scale_x <= 0.0
+                || cell_scale_y <= 0.0
+            {
+                return None;
+            }
+
+            // When `/BBox` exceeds `|XStep|` or `|YStep|`, draw the neighbor
+            // copies whose bbox overlaps the fundamental period so wrap-around
+            // overlap stays seamless (capped to 4×4 draws for adversarial steps).
+            let overlap_range = |span: f64, step: f64| -> std::ops::RangeInclusive<i32> {
+                let abs_s = step.abs();
+                if span <= abs_s + 1e-6 {
+                    return 0..=0;
+                }
+                let extra = ((span / abs_s).ceil() as i32 - 1).clamp(0, 3);
+                if step > 0.0 {
+                    -extra..=0
+                } else {
+                    0..=extra
+                }
+            };
+            let di_range = overlap_range(bw, x_step);
+            let dj_range = overlap_range(bh, y_step);
+
+            let mut sub = CpuRenderer {
+                pixmap: Some(target),
+                dirty: None,
+                scale: cell_scale_x,
+                scale_y: cell_scale_y,
+                rect_x0: bx0 as f32,
+                rect_y0: by0 as f32,
+                rect_y1: (by0 + abs_y) as f32,
+                font_cache: self.font_cache,
+                image_cache: self.image_cache,
+                max_page_pixels: self.max_page_pixels,
+                max_blend_group_depth: self.max_blend_group_depth,
+                max_soft_mask_cache_bytes: self.max_soft_mask_cache_bytes,
+                parse_limits: self.parse_limits.clone(),
+                clip_stack: Vec::new(),
+                current_clip: None,
+                clip_bounds: None,
+                clip_pixel_spent: 0,
+                clip_mask_bytes: 0,
+                mask_pool: Vec::new(),
+                blend_stack: Vec::new(),
+                blend_surface_bytes: self
+                    .blend_surface_bytes
+                    .saturating_add(self.pooled_surface_bytes)
+                    .saturating_add(tile_bytes),
+                surface_pool: Vec::new(),
+                pooled_surface_bytes: 0,
+                skipped_blend_depth: 0,
+                render_budget: self.render_budget,
+                deadline: self.deadline,
+                over_budget: self.over_budget,
+                soft_mask_planes: HashMap::new(),
+                soft_mask_cache_bytes: 0,
+                soft_mask_depth: self.soft_mask_depth.saturating_add(self.blend_stack.len()),
+                tiling_cache: HashMap::new(),
+                tiling_cache_bytes: 0,
+                tiling_depth: self.tiling_depth.saturating_add(1),
+                downscaled_images: HashMap::new(),
+                glyph_outlines: HashMap::new(),
+                glyph_outline_commands: 0,
+                type3_glyphs: HashMap::new(),
+                type3_glyph_commands: 0,
+                type3_glyph_image_bytes: 0,
+                stage_stats: None,
+                page_start: None,
+            };
+
+            for dj in dj_range {
+                for di in di_range.clone() {
+                    if sub.over_budget {
+                        break;
+                    }
+                    sub.rect_x0 = (bx0 - di as f64 * x_step) as f32;
+                    sub.rect_y0 = (by0 - dj as f64 * y_step) as f32;
+                    sub.rect_y1 = (by0 + abs_y - dj as f64 * y_step) as f32;
+                    for cmd in &tiling.commands.commands {
+                        let _ = sub.execute(cmd);
+                    }
+                    while !sub.blend_stack.is_empty() {
+                        sub.pop_blend_group();
+                    }
+                    while !sub.clip_stack.is_empty() {
+                        sub.pop_clip();
+                    }
+                }
+            }
+            if sub.over_budget {
+                self.over_budget = true;
+            }
+            let rendered = Arc::new(sub.pixmap.take()?);
+            if !sub.over_budget && tile_bytes <= MAX_TILING_CACHE_BYTES {
+                if self.tiling_cache_bytes.saturating_add(tile_bytes) > MAX_TILING_CACHE_BYTES {
+                    self.tiling_cache.clear();
+                    self.tiling_cache_bytes = 0;
+                }
+                self.tiling_cache
+                    .insert(key, (Arc::clone(&tiling.commands), Arc::clone(&rendered)));
+                self.tiling_cache_bytes = self.tiling_cache_bytes.saturating_add(tile_bytes);
+            }
+            rendered
+        };
+
+        Some((tile_pixmap, transform, quality, opacity))
+    }
+
     fn render_fill(&mut self, path: &Path, rule: &FillRule, paint_spec: &Paint, alpha: f32) {
         let t = self.tick();
         let Some(skia_path) = self.build_skia_path(path) else {
             return self.tock(t, |s| &mut s.fill_ns);
         };
-        let paint = match paint_spec {
-            Paint::Solid(c) => Self::color_to_paint(c, alpha),
-            // Non-solid paints are resolved by the interpreter into images
-            // before they reach a backend, so Pattern/Shading here paints
-            // nothing (see `StageStats`: shading is an interpret-stage cost).
-            _ => return self.tock(t, |s| &mut s.fill_ns),
-        };
-        let fill_rule = Self::fill_rule_to_skia(rule);
         // One device pixel of slack: a pixel the path only clips the corner of
-        // still receives anti-aliased coverage.
+        // still receives anti-aliased coverage. Check reachability before
+        // rasterizing any tiling cell.
         if !self.reaches_target(skia_path.bounds(), 1.0) {
             return self.tock(t, |s| &mut s.fill_ns);
         }
+        let tile_guard: Arc<tiny_skia::Pixmap>;
+        let paint = match paint_spec {
+            Paint::Solid(c) => Self::color_to_paint(c, alpha),
+            Paint::Tiling(tiling) => {
+                let Some((pixmap, transform, quality, opacity)) =
+                    self.prepare_tiling_paint(tiling, alpha)
+                else {
+                    return self.tock(t, |s| &mut s.fill_ns);
+                };
+                tile_guard = pixmap;
+                tiny_skia::Paint {
+                    shader: tiny_skia::Pattern::new(
+                        (*tile_guard).as_ref(),
+                        tiny_skia::SpreadMode::Repeat,
+                        quality,
+                        opacity,
+                        transform,
+                    ),
+                    anti_alias: true,
+                    ..Default::default()
+                }
+            }
+            // Shadings are rasterized by the interpreter into images before
+            // reaching a backend.
+            _ => return self.tock(t, |s| &mut s.fill_ns),
+        };
+        let fill_rule = Self::fill_rule_to_skia(rule);
         let mut painted = false;
         if let Some(ref mut pixmap) = self.pixmap {
             pixmap.fill_path(
@@ -854,10 +1172,6 @@ impl<'a> CpuRenderer<'a> {
         let Some(skia_path) = self.build_skia_path(path) else {
             return self.tock(t, |s| &mut s.stroke_ns);
         };
-        let paint = match paint_spec {
-            Paint::Solid(c) => Self::color_to_paint(c, alpha),
-            _ => return self.tock(t, |s| &mut s.stroke_ns),
-        };
         let stroke = self.build_skia_stroke(style);
         // The *centerline's* bounds say nothing about how far the ink reaches:
         // joins, caps and miters all extend past it.
@@ -865,6 +1179,30 @@ impl<'a> CpuRenderer<'a> {
         if !self.reaches_target(skia_path.bounds(), grow) {
             return self.tock(t, |s| &mut s.stroke_ns);
         }
+        let tile_guard: Arc<tiny_skia::Pixmap>;
+        let paint = match paint_spec {
+            Paint::Solid(c) => Self::color_to_paint(c, alpha),
+            Paint::Tiling(tiling) => {
+                let Some((pixmap, transform, quality, opacity)) =
+                    self.prepare_tiling_paint(tiling, alpha)
+                else {
+                    return self.tock(t, |s| &mut s.stroke_ns);
+                };
+                tile_guard = pixmap;
+                tiny_skia::Paint {
+                    shader: tiny_skia::Pattern::new(
+                        (*tile_guard).as_ref(),
+                        tiny_skia::SpreadMode::Repeat,
+                        quality,
+                        opacity,
+                        transform,
+                    ),
+                    anti_alias: true,
+                    ..Default::default()
+                }
+            }
+            _ => return self.tock(t, |s| &mut s.stroke_ns),
+        };
         let mut painted = false;
         if let Some(ref mut pixmap) = self.pixmap {
             pixmap.stroke_path(
@@ -888,7 +1226,7 @@ impl<'a> CpuRenderer<'a> {
         // Hairline boost: never let a stroke fall below one device pixel
         // (matches pdfium; keeps thin diagram strokes legible at low DPI, and
         // renders PDF zero-width strokes as 1px hairlines).
-        Self::skia_stroke(style, self.scale, 1.0)
+        Self::skia_stroke(style, self.stroke_scale(), 1.0)
     }
 
     /// tiny-skia stroke parameters for `style` with lengths scaled by `scale`
@@ -946,8 +1284,28 @@ impl<'a> CpuRenderer<'a> {
             return;
         }
 
+        let tile_guard: Arc<tiny_skia::Pixmap>;
         let paint = match &run.paint {
             Paint::Solid(c) => Self::color_to_paint(c, alpha_override),
+            Paint::Tiling(tiling) => {
+                let Some((pixmap, transform, quality, opacity)) =
+                    self.prepare_tiling_paint(tiling, alpha_override)
+                else {
+                    return;
+                };
+                tile_guard = pixmap;
+                tiny_skia::Paint {
+                    shader: tiny_skia::Pattern::new(
+                        (*tile_guard).as_ref(),
+                        tiny_skia::SpreadMode::Repeat,
+                        quality,
+                        opacity,
+                        transform,
+                    ),
+                    anti_alias: true,
+                    ..Default::default()
+                }
+            }
             _ => return,
         };
 
@@ -1722,7 +2080,7 @@ impl<'a> CpuRenderer<'a> {
 
         // Page-space offset → device pixels (device y grows downward).
         let dx = (mask.offset.0 * self.scale).round() as i64;
-        let dy = (-mask.offset.1 * self.scale).round() as i64;
+        let dy = (-mask.offset.1 * self.scale_y).round() as i64;
 
         let key = SoftMaskPlaneKey::new(mask);
         if let Some(base) = self.soft_mask_planes.get(&key) {
@@ -1799,6 +2157,7 @@ impl<'a> CpuRenderer<'a> {
             // matter — and those start empty.
             dirty: None,
             scale: self.scale,
+            scale_y: self.scale_y,
             rect_x0: self.rect_x0,
             rect_y0: self.rect_y0,
             rect_y1: self.rect_y1,
@@ -1840,6 +2199,9 @@ impl<'a> CpuRenderer<'a> {
                 .soft_mask_depth
                 .saturating_add(self.blend_stack.len())
                 .saturating_add(1),
+            tiling_cache: HashMap::new(),
+            tiling_cache_bytes: 0,
+            tiling_depth: self.tiling_depth,
             downscaled_images: HashMap::new(),
             glyph_outlines: HashMap::new(),
             glyph_outline_commands: 0,
@@ -2015,7 +2377,8 @@ impl<'a> CpuRenderer<'a> {
         //   screen_x = (a*s/iw)*ix + (-c*s/ih)*iy + (c + e - x0)*s
         //   screen_y = (-b*s/iw)*ix + (d*s/ih)*iy + (y1 - d - f)*s
         let tm = &draw.transform;
-        let s = self.scale;
+        let sx = self.scale;
+        let sy = self.scale_y;
         let (a, b, c, d, e, f) = (
             tm.a as f32,
             tm.b as f32,
@@ -2032,7 +2395,7 @@ impl<'a> CpuRenderer<'a> {
         // applied the same rule, so its images arrive at their target size.
         let mut downscaled: Option<(Arc<[u8]>, u32, u32)> = None;
         if let Some((tw, th)) =
-            zpdf_image::box_filter_size(&draw.transform, s, image.width, image.height)
+            zpdf_image::box_filter_size(&draw.transform, sx.max(sy), image.width, image.height)
         {
             let key = (draw.image_id, tw, th);
             let data = if cache_downscaled {
@@ -2083,12 +2446,12 @@ impl<'a> CpuRenderer<'a> {
         // tiny-skia `Transform::from_row(sx, ky, kx, sy, tx, ty)` maps
         // (x,y) → (sx*x + kx*y + tx, ky*x + sy*y + ty).
         let transform = tiny_skia::Transform::from_row(
-            a * s / iw,                 // sx: screen_x per ix
-            -b * s / iw,                // ky: screen_y per ix
-            -c * s / ih,                // kx: screen_x per iy
-            d * s / ih,                 // sy: screen_y per iy
-            (c + e - self.rect_x0) * s, // tx
-            (self.rect_y1 - d - f) * s, // ty
+            a * sx / iw,                 // sx: screen_x per ix
+            -b * sy / iw,                // ky: screen_y per ix
+            -c * sx / ih,                // kx: screen_x per iy
+            d * sy / ih,                 // sy: screen_y per iy
+            (c + e - self.rect_x0) * sx, // tx
+            (self.rect_y1 - d - f) * sy, // ty
         );
 
         let paint = tiny_skia::PixmapPaint {
@@ -2274,7 +2637,7 @@ impl<'a> CpuRenderer<'a> {
         // negative `d`) is honored as ordinary geometry, then the one fixed page
         // Y-flip is applied — the same affine used for paths and images.
         let px = (page_x as f32 - self.rect_x0) * self.scale;
-        let py = (self.rect_y1 - page_y as f32) * self.scale;
+        let py = (self.rect_y1 - page_y as f32) * self.scale_y;
         (px, py)
     }
 
@@ -2328,7 +2691,7 @@ impl<'a> CpuRenderer<'a> {
                 - glyph_to_page.b * glyph_to_page.c)
                 .abs()
                 .sqrt()
-                * self.scale as f64) as f32;
+                * self.stroke_scale() as f64) as f32;
 
             // Build the full transform: glyph_space → page_space → pixel_space
             // FontMatrix transforms glyph coords to text space (typically 0.001 scale)
@@ -2617,7 +2980,7 @@ impl<'a> CpuRenderer<'a> {
         // Step 5: page space → pixel space. The CTM's orientation is ordinary
         // geometry; the one fixed page Y-flip then maps to device pixels.
         let px = (page_x as f32 - self.rect_x0) * self.scale;
-        let py = (self.rect_y1 - page_y as f32) * self.scale;
+        let py = (self.rect_y1 - page_y as f32) * self.scale_y;
 
         (px, py)
     }
@@ -2838,6 +3201,9 @@ impl<'a> RenderBackend for CpuRenderer<'a> {
         self.soft_mask_depth = 0;
         self.soft_mask_planes.clear();
         self.soft_mask_cache_bytes = 0;
+        self.tiling_depth = 0;
+        self.tiling_cache.clear();
+        self.tiling_cache_bytes = 0;
         self.downscaled_images.clear();
         self.glyph_outlines.clear();
         self.glyph_outline_commands = 0;
@@ -2858,6 +3224,7 @@ impl<'a> RenderBackend for CpuRenderer<'a> {
             );
         }
         self.scale = scale;
+        self.scale_y = scale;
 
         let mut pixmap = tiny_skia::Pixmap::new(w, h).ok_or(CpuRenderError::PixmapCreation)?;
 

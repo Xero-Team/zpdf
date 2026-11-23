@@ -171,6 +171,8 @@ struct SvgWriter<'a> {
     /// (one `gs` applied to many objects shares one mask list) is written
     /// once and referenced by every group it masks.
     mask_defs: HashMap<MaskDefKey, u32>,
+    /// Tiling-pattern `<pattern>` defs already written, deduplicated per page.
+    pattern_defs: HashMap<PatternDefKey, u32>,
     /// Outlines of the page's glyphs, extracted once each
     /// (`MAX_CACHED_OUTLINE_COMMANDS`).
     glyph_outlines: HashMap<(FontId, u16), Option<Rc<GlyphOutline>>>,
@@ -204,6 +206,16 @@ struct MaskDefKey {
     kind: SoftMaskKind,
     offset: [u32; 2],
     backdrop_luma: u32,
+    depth: u8,
+}
+
+/// Identity of a tiling-pattern `<pattern>` def.
+#[derive(PartialEq, Eq, Hash)]
+struct PatternDefKey {
+    commands: *const DisplayList,
+    bbox: [u64; 4],
+    steps: [u64; 2],
+    matrix: [u64; 6],
     depth: u8,
 }
 
@@ -243,6 +255,7 @@ impl<'a> SvgWriter<'a> {
             warned_transfer: false,
             image_defs: HashMap::new(),
             mask_defs: HashMap::new(),
+            pattern_defs: HashMap::new(),
             glyph_outlines: HashMap::new(),
             glyph_outline_commands: 0,
             type3_glyphs: HashMap::new(),
@@ -297,7 +310,7 @@ impl<'a> SvgWriter<'a> {
                     if overprint.is_some() {
                         self.warn_overprint();
                     }
-                    self.emit_fill(path, rule, paint, *alpha);
+                    self.emit_fill(path, rule, paint, *alpha, depth);
                 }
                 RenderCommand::StrokePath {
                     path,
@@ -309,7 +322,7 @@ impl<'a> SvgWriter<'a> {
                     if overprint.is_some() {
                         self.warn_overprint();
                     }
-                    self.emit_stroke(path, style, paint, *alpha);
+                    self.emit_stroke(path, style, paint, *alpha, depth);
                 }
                 RenderCommand::DrawGlyphRun(run) => self.emit_glyph_run(run),
                 RenderCommand::DrawImage(draw) => self.emit_image(draw),
@@ -400,12 +413,137 @@ impl<'a> SvgWriter<'a> {
 
     // -- fills / strokes --
 
-    fn emit_fill(&mut self, path: &Path, rule: &FillRule, paint: &Paint, alpha: f32) {
-        let Paint::Solid(color) = paint else {
-            tracing::debug!("skipping non-solid fill paint (rasterized upstream)");
-            return;
+    /// Emit a [`TilingPattern`] as an SVG `<pattern>` def and return its id.
+    fn emit_tiling_pattern_def(
+        &mut self,
+        tiling: &zpdf_display_list::TilingPattern,
+        depth: u8,
+    ) -> Option<u32> {
+        if depth >= MAX_MASK_DEPTH || tiling.commands.commands.is_empty() {
+            return None;
+        }
+        let bbox = tiling.bbox.normalize();
+        let (bx0, by0) = (bbox.x0, bbox.y0);
+        let (bw, bh) = (bbox.width(), bbox.height());
+        let (x_step, y_step) = (tiling.x_step, tiling.y_step);
+        if ![bx0, by0, bw, bh, x_step, y_step]
+            .iter()
+            .all(|v| v.is_finite())
+            || bw <= 0.0
+            || bh <= 0.0
+            || x_step == 0.0
+            || y_step == 0.0
+        {
+            return None;
+        }
+        let abs_x = x_step.abs();
+        let abs_y = y_step.abs();
+
+        let pat_svg_to_pat_pdf = zpdf_core::Matrix::new(1.0, 0.0, 0.0, -1.0, bx0, by0 + abs_y);
+        let page_pdf_to_page_svg = zpdf_core::Matrix::new(1.0, 0.0, 0.0, -1.0, -self.x0, self.y1);
+        let m = page_pdf_to_page_svg
+            .concat(&tiling.matrix)
+            .concat(&pat_svg_to_pat_pdf);
+        if ![m.a, m.b, m.c, m.d, m.e, m.f].iter().all(|v| v.is_finite()) {
+            return None;
+        }
+
+        let key = PatternDefKey {
+            commands: std::sync::Arc::as_ptr(&tiling.commands),
+            bbox: [bx0, by0, bbox.x1, bbox.y1].map(f64::to_bits),
+            steps: [x_step, y_step].map(f64::to_bits),
+            matrix: [m.a, m.b, m.c, m.d, m.e, m.f].map(f64::to_bits),
+            depth,
         };
-        let opacity = (color.a * alpha).clamp(0.0, 1.0);
+        if let Some(&id) = self.pattern_defs.get(&key) {
+            return Some(id);
+        }
+        let id = self.fresh_id();
+        self.pattern_defs.insert(key, id);
+
+        let _ = write!(
+            self.out,
+            "<pattern id=\"p{id}\" patternUnits=\"userSpaceOnUse\" x=\"0\" y=\"0\" width=\""
+        );
+        push_num(&mut self.out, abs_x);
+        self.out.push_str("\" height=\"");
+        push_num(&mut self.out, abs_y);
+        self.out.push_str("\" patternTransform=\"matrix(");
+        push_num(&mut self.out, m.a);
+        self.out.push(' ');
+        push_num(&mut self.out, m.b);
+        self.out.push(' ');
+        push_num(&mut self.out, m.c);
+        self.out.push(' ');
+        push_num(&mut self.out, m.d);
+        self.out.push(' ');
+        push_num(&mut self.out, m.e);
+        self.out.push(' ');
+        push_num(&mut self.out, m.f);
+        self.out.push_str(")\">\n");
+
+        let saved_x0 = self.x0;
+        let saved_y1 = self.y1;
+        let saved_w = self.page_width;
+        let saved_h = self.page_height;
+        let (saved_clip, saved_mask) = (self.clip.take(), self.stroke_mask.take());
+        self.page_width = abs_x;
+        self.page_height = abs_y;
+
+        let overlap_range = |span: f64, step: f64| -> std::ops::RangeInclusive<i32> {
+            let abs_s = step.abs();
+            if span <= abs_s + 1e-6 {
+                return 0..=0;
+            }
+            let extra = ((span / abs_s).ceil() as i32 - 1).clamp(0, 3);
+            if step > 0.0 {
+                -extra..=0
+            } else {
+                0..=extra
+            }
+        };
+        let di_range = overlap_range(bw, x_step);
+        let dj_range = overlap_range(bh, y_step);
+        for dj in dj_range {
+            for di in di_range.clone() {
+                self.x0 = bx0 - di as f64 * x_step;
+                self.y1 = by0 + abs_y - dj as f64 * y_step;
+                self.emit_commands(&tiling.commands.commands, depth + 1);
+            }
+        }
+
+        self.x0 = saved_x0;
+        self.y1 = saved_y1;
+        self.page_width = saved_w;
+        self.page_height = saved_h;
+        self.clip = saved_clip;
+        self.stroke_mask = saved_mask;
+        self.out.push_str("</pattern>\n");
+        Some(id)
+    }
+
+    fn emit_fill(&mut self, path: &Path, rule: &FillRule, paint: &Paint, alpha: f32, depth: u8) {
+        let (fill_attr, opacity) = match paint {
+            Paint::Solid(color) => (hex_color(color), (color.a * alpha).clamp(0.0, 1.0)),
+            Paint::Tiling(tiling) => {
+                let opacity = if alpha.is_finite() {
+                    alpha.clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                if opacity <= 0.0 {
+                    return;
+                }
+                let Some(id) = self.emit_tiling_pattern_def(tiling, depth) else {
+                    return;
+                };
+                (format!("url(#p{id})"), opacity)
+            }
+            _ => {
+                tracing::debug!("skipping non-solid fill paint (rasterized upstream)");
+                return;
+            }
+        };
         if opacity <= 0.0 {
             return;
         }
@@ -415,7 +553,7 @@ impl<'a> SvgWriter<'a> {
         self.out.push_str("<path d=\"");
         self.out.push_str(&d);
         self.out.push_str("\" fill=\"");
-        self.out.push_str(&hex_color(color));
+        self.out.push_str(&fill_attr);
         self.out.push('"');
         if *rule == FillRule::EvenOdd {
             self.out.push_str(" fill-rule=\"evenodd\"");
@@ -426,12 +564,35 @@ impl<'a> SvgWriter<'a> {
         self.out.push_str("/>\n");
     }
 
-    fn emit_stroke(&mut self, path: &Path, style: &StrokeStyle, paint: &Paint, alpha: f32) {
-        let Paint::Solid(color) = paint else {
-            tracing::debug!("skipping non-solid stroke paint (rasterized upstream)");
-            return;
+    fn emit_stroke(
+        &mut self,
+        path: &Path,
+        style: &StrokeStyle,
+        paint: &Paint,
+        alpha: f32,
+        depth: u8,
+    ) {
+        let (stroke_attr, opacity) = match paint {
+            Paint::Solid(color) => (hex_color(color), (color.a * alpha).clamp(0.0, 1.0)),
+            Paint::Tiling(tiling) => {
+                let opacity = if alpha.is_finite() {
+                    alpha.clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                if opacity <= 0.0 {
+                    return;
+                }
+                let Some(id) = self.emit_tiling_pattern_def(tiling, depth) else {
+                    return;
+                };
+                (format!("url(#p{id})"), opacity)
+            }
+            _ => {
+                tracing::debug!("skipping non-solid stroke paint (rasterized upstream)");
+                return;
+            }
         };
-        let opacity = (color.a * alpha).clamp(0.0, 1.0);
         if opacity <= 0.0 {
             return;
         }
@@ -441,7 +602,7 @@ impl<'a> SvgWriter<'a> {
         self.out.push_str("<path d=\"");
         self.out.push_str(&d);
         self.out.push_str("\" fill=\"none\" stroke=\"");
-        self.out.push_str(&hex_color(color));
+        self.out.push_str(&stroke_attr);
         self.out.push('"');
         push_opacity(&mut self.out, "stroke-opacity", opacity);
         push_stroke_attrs(&mut self.out, style);
@@ -1940,5 +2101,55 @@ mod tests {
         s.push(' ');
         push_num(&mut s, -0.5);
         assert_eq!(s, "1 1.25 1.234 -0.5");
+    }
+
+    #[test]
+    fn tiling_pattern_emits_deduplicated_svg_pattern_def() {
+        let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 20.0, 20.0));
+        let mut sq = Path::new();
+        sq.rect(Rect::new(2.0, 2.0, 9.0, 9.0));
+        cell.push(RenderCommand::FillPath {
+            path: sq,
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(1.0, 0.0, 0.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let tiling = std::sync::Arc::new(zpdf_display_list::TilingPattern {
+            commands: std::sync::Arc::new(cell),
+            bbox: Rect::new(0.0, 0.0, 20.0, 20.0),
+            x_step: 20.0,
+            y_step: 20.0,
+            matrix: zpdf_core::Matrix::identity(),
+            tiling_type: 1,
+        });
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 100.0));
+        for x in [0.0, 50.0] {
+            let mut r = Path::new();
+            r.rect(Rect::new(x, 0.0, x + 40.0, 40.0));
+            dl.push(RenderCommand::FillPath {
+                path: r,
+                rule: FillRule::NonZero,
+                paint: Paint::Tiling(std::sync::Arc::clone(&tiling)),
+                alpha: 1.0,
+                overprint: None,
+            });
+        }
+        let svg = display_list_to_svg(
+            &dl,
+            &FontCache::new(),
+            &ImageCache::new(),
+            &SvgOptions::default(),
+        );
+        assert_eq!(
+            svg.matches("<pattern ").count(),
+            1,
+            "shared tiling pattern must be defined once: {svg}"
+        );
+        assert_eq!(
+            svg.matches("fill=\"url(#p1)\"").count(),
+            2,
+            "both fills must reference the pattern def: {svg}"
+        );
     }
 }

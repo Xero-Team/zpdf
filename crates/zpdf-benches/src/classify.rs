@@ -68,10 +68,10 @@ pub struct Composition {
     /// said nothing about it.
     pub image_device_px: u64,
 
-    /// Fills/strokes whose paint is not a solid colour. Both render backends
-    /// paint only `Paint::Solid`, so anything counted here is a paint the
-    /// backends will silently drop — a fidelity bug, not a metric. Expected to
-    /// stay at zero; `summary()` flags it loudly.
+    /// Fills/strokes whose paint is neither solid nor a tiling pattern. Backends
+    /// paint `Paint::Solid` and `Paint::Tiling`, so anything counted here
+    /// (`Paint::Pattern` / `Paint::Shading`) is silently dropped — a fidelity
+    /// bug, not a metric. Expected to stay at zero; `summary()` flags it loudly.
     pub non_solid_paints: u64,
 }
 
@@ -86,14 +86,14 @@ impl Composition {
                 RenderCommand::FillPath { path, paint, .. } => {
                     c.fills += 1;
                     c.vector_device_px += path_area_device(path, s2);
-                    if !matches!(paint, Paint::Solid(_)) {
+                    if !matches!(paint, Paint::Solid(_) | Paint::Tiling(_)) {
                         c.non_solid_paints += 1;
                     }
                 }
                 RenderCommand::StrokePath { path, paint, .. } => {
                     c.strokes += 1;
                     c.vector_device_px += path_area_device(path, s2);
-                    if !matches!(paint, Paint::Solid(_)) {
+                    if !matches!(paint, Paint::Solid(_) | Paint::Tiling(_)) {
                         c.non_solid_paints += 1;
                     }
                 }
@@ -178,7 +178,7 @@ impl Composition {
         );
         if self.non_solid_paints > 0 {
             s.push_str(&format!(
-                "  !! {} non-solid paints — backends paint only Paint::Solid and will drop these",
+                "  !! {} non-solid paints — backends only paint Paint::Solid/Tiling and will drop these",
                 self.non_solid_paints
             ));
         }
