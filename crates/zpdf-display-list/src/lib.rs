@@ -181,6 +181,25 @@ impl Color {
     }
 }
 
+/// Maximum shifted cell copies backends draw when an overlapping tiling
+/// pattern's `/BBox` is larger than `(|XStep|, |YStep|)`. Real-world patterns
+/// rarely exceed a few copies; this bounds adversarial huge-bbox/tiny-step
+/// inputs while allowing wide sparse or moderately dense overlaps to render
+/// completely.
+pub const MAX_TILING_OVERLAP_COPIES: u64 = 256;
+
+/// Integer tile-grid shift ranges `(di, dj)` whose shifted cell ink overlaps
+/// a [`TilingPattern`]'s fundamental period `[bbox.x0, bbox.x0 + |x_step|] ×
+/// [bbox.y0, bbox.y0 + |y_step|]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TilingOverlapRanges {
+    pub di: std::ops::RangeInclusive<i64>,
+    pub dj: std::ops::RangeInclusive<i64>,
+    /// True when the cell's ink overlaps more than [`MAX_TILING_OVERLAP_COPIES`]
+    /// shifted copies and the returned ranges were clamped to stay bounded.
+    pub truncated: bool,
+}
+
 /// A PDF tiling pattern (ISO 32000-1 §8.7.3): the single cell's content
 /// pre-interpreted in pattern space into a detached [`DisplayList`], repeated
 /// across the `(x_step, y_step)` grid and mapped to page space by `matrix`.
@@ -202,6 +221,220 @@ pub struct TilingPattern {
     /// `/TilingType` (1 = constant spacing, 2 = no distortion, 3 = constant
     /// spacing and faster tiling).
     pub tiling_type: u8,
+}
+
+impl TilingPattern {
+    /// Conservative pattern-space bounding box of painted primitives inside
+    /// `self.commands`, intersected with `self.bbox`. Returns `None` when no
+    /// primitive paints inside `bbox`, or falls back to `bbox` when any
+    /// command's bounds require external font metrics (e.g. `DrawGlyphRun`).
+    pub fn ink_bounds(&self) -> Option<Rect> {
+        let bbox = self.bbox.normalize();
+        if ![bbox.x0, bbox.y0, bbox.x1, bbox.y1]
+            .iter()
+            .all(|v| v.is_finite())
+            || bbox.width() <= 0.0
+            || bbox.height() <= 0.0
+        {
+            return None;
+        }
+        let mut has_ink = false;
+        let (mut x0, mut y0) = (f64::INFINITY, f64::INFINITY);
+        let (mut x1, mut y1) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+
+        let mut include_rect = |rx0: f64, ry0: f64, rx1: f64, ry1: f64| -> bool {
+            if ![rx0, ry0, rx1, ry1].iter().all(|v| v.is_finite()) {
+                return false;
+            }
+            has_ink = true;
+            x0 = x0.min(rx0);
+            y0 = y0.min(ry0);
+            x1 = x1.max(rx1);
+            y1 = y1.max(ry1);
+            true
+        };
+
+        let path_rect = |path: &Path| -> Option<(f64, f64, f64, f64)> {
+            let mut any = false;
+            let (mut px0, mut py0) = (f64::INFINITY, f64::INFINITY);
+            let (mut px1, mut py1) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+            let mut add = |p: zpdf_core::Point| {
+                any = true;
+                px0 = px0.min(p.x);
+                py0 = py0.min(p.y);
+                px1 = px1.max(p.x);
+                py1 = py1.max(p.y);
+            };
+            for elem in path {
+                match elem {
+                    PathElement::MoveTo(p) | PathElement::LineTo(p) => add(p),
+                    PathElement::CurveTo(c1, c2, end) => {
+                        add(c1);
+                        add(c2);
+                        add(end);
+                    }
+                    PathElement::Close => {}
+                }
+            }
+            any.then_some((px0, py0, px1, py1))
+        };
+
+        for cmd in &self.commands.commands {
+            match cmd {
+                RenderCommand::FillPath { path, .. } => {
+                    if let Some((px0, py0, px1, py1)) = path_rect(path) {
+                        if !include_rect(px0, py0, px1, py1) {
+                            return Some(bbox);
+                        }
+                    }
+                }
+                RenderCommand::StrokePath { path, style, .. } => {
+                    if let Some((px0, py0, px1, py1)) = path_rect(path) {
+                        let pad = if style.width.is_finite() && style.width > 0.0 {
+                            let w = style.width as f64;
+                            let miter = if style.miter_limit.is_finite() {
+                                (style.miter_limit as f64).clamp(1.0, 100.0)
+                            } else {
+                                10.0
+                            };
+                            (w * 0.5 * miter).max(w)
+                        } else {
+                            // Hairline stroke: pad conservatively.
+                            1.0
+                        };
+                        if !include_rect(px0 - pad, py0 - pad, px1 + pad, py1 + pad) {
+                            return Some(bbox);
+                        }
+                    }
+                }
+                RenderCommand::DrawImage(draw) => {
+                    let corners = [
+                        zpdf_core::Point::new(0.0, 0.0),
+                        zpdf_core::Point::new(1.0, 0.0),
+                        zpdf_core::Point::new(0.0, 1.0),
+                        zpdf_core::Point::new(1.0, 1.0),
+                    ];
+                    let (mut ix0, mut iy0) = (f64::INFINITY, f64::INFINITY);
+                    let (mut ix1, mut iy1) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+                    for c in &corners {
+                        let p = c.transform(&draw.transform);
+                        ix0 = ix0.min(p.x);
+                        iy0 = iy0.min(p.y);
+                        ix1 = ix1.max(p.x);
+                        iy1 = iy1.max(p.y);
+                    }
+                    if !include_rect(ix0, iy0, ix1, iy1) {
+                        return Some(bbox);
+                    }
+                }
+                // Glyph extents depend on font outlines not stored in DisplayList.
+                RenderCommand::DrawGlyphRun(_) => return Some(bbox),
+                RenderCommand::PushClip { .. }
+                | RenderCommand::PushClipStroke { .. }
+                | RenderCommand::PopClip
+                | RenderCommand::PushBlendGroup { .. }
+                | RenderCommand::PopBlendGroup => {}
+            }
+        }
+
+        if !has_ink {
+            return None;
+        }
+        let ix0 = x0.max(bbox.x0);
+        let iy0 = y0.max(bbox.y0);
+        let ix1 = x1.min(bbox.x1);
+        let iy1 = y1.min(bbox.y1);
+        if ix1 <= ix0 || iy1 <= iy0 {
+            return None;
+        }
+        Some(Rect::new(ix0, iy0, ix1, iy1))
+    }
+
+    /// Compute the integer shift ranges `(di, dj)` whose shifted cell copies
+    /// overlap the fundamental tile period `[bbox.x0, bbox.x0 + |x_step|] ×
+    /// [bbox.y0, bbox.y0 + |y_step|]`.
+    pub fn overlap_copy_ranges(&self) -> TilingOverlapRanges {
+        let empty = || TilingOverlapRanges {
+            di: std::ops::RangeInclusive::new(1, 0),
+            dj: std::ops::RangeInclusive::new(1, 0),
+            truncated: false,
+        };
+        let bbox = self.bbox.normalize();
+        let (bw, bh) = (bbox.width(), bbox.height());
+        let (x_step, y_step) = (self.x_step, self.y_step);
+        if ![bbox.x0, bbox.y0, bw, bh, x_step, y_step]
+            .iter()
+            .all(|v| v.is_finite())
+            || bw <= 0.0
+            || bh <= 0.0
+            || x_step == 0.0
+            || y_step == 0.0
+        {
+            return empty();
+        }
+        let abs_x = x_step.abs();
+        let abs_y = y_step.abs();
+
+        // Fast path: non-overlapping cell (`/BBox` fits within one step on both axes).
+        if bw <= abs_x + 1e-9 && bh <= abs_y + 1e-9 {
+            return TilingOverlapRanges {
+                di: 0..=0,
+                dj: 0..=0,
+                truncated: false,
+            };
+        }
+
+        let Some(ink) = self.ink_bounds() else {
+            return empty();
+        };
+
+        // Shifts `d` such that shifted ink `[ink_lo + d*step, ink_hi + d*step]`
+        // has strict positive-length intersection with `[period_lo, period_lo + |step|]`.
+        let axis_range = |period_lo: f64, ink_lo: f64, ink_hi: f64, step: f64| -> (i64, i64) {
+            let abs_s = step.abs();
+            let t0 = (period_lo - ink_hi) / step;
+            let t1 = ((period_lo - ink_lo) + abs_s) / step;
+            let (lo, hi) = if step > 0.0 { (t0, t1) } else { (t1, t0) };
+            if !lo.is_finite() || !hi.is_finite() {
+                return (1, 0);
+            }
+            let min_d = (lo.floor() as i64).saturating_add(1);
+            let max_d = (hi.ceil() as i64).saturating_sub(1);
+            (min_d, max_d)
+        };
+
+        let (i0, mut i1) = axis_range(bbox.x0, ink.x0, ink.x1, x_step);
+        let (j0, mut j1) = axis_range(bbox.y0, ink.y0, ink.y1, y_step);
+        if i0 > i1 || j0 > j1 {
+            return empty();
+        }
+
+        let nx = i1.abs_diff(i0).saturating_add(1);
+        let ny = j1.abs_diff(j0).saturating_add(1);
+        let mut truncated = false;
+        if nx.saturating_mul(ny) > MAX_TILING_OVERLAP_COPIES {
+            truncated = true;
+            let (cap_x, cap_y) = if ny <= 16 {
+                (MAX_TILING_OVERLAP_COPIES / ny.max(1), ny)
+            } else if nx <= 16 {
+                (nx, MAX_TILING_OVERLAP_COPIES / nx.max(1))
+            } else {
+                (16, 16)
+            };
+            if nx > cap_x {
+                i1 = i0.saturating_add((cap_x - 1) as i64);
+            }
+            if ny > cap_y {
+                j1 = j0.saturating_add((cap_y - 1) as i64);
+            }
+        }
+
+        TilingOverlapRanges {
+            di: i0..=i1,
+            dj: j0..=j1,
+            truncated,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -275,6 +508,78 @@ mod tests {
         };
         assert_eq!(glyph.code_len, 0);
         assert_eq!(std::mem::size_of::<PositionedGlyph>(), 20);
+    }
+
+    #[test]
+    fn tiling_overlap_copy_ranges_handles_wide_sparse_negative_and_capped() {
+        let make = |bbox: Rect, x_step: f64, y_step: f64, ink: Rect| {
+            let mut dl = DisplayList::new(bbox);
+            let mut p = Path::new();
+            p.rect(ink);
+            dl.push(RenderCommand::FillPath {
+                path: p,
+                rule: FillRule::NonZero,
+                paint: Paint::Solid(Color::black()),
+                alpha: 1.0,
+                overprint: None,
+            });
+            TilingPattern {
+                commands: std::sync::Arc::new(dl),
+                bbox,
+                x_step,
+                y_step,
+                matrix: Matrix::identity(),
+                tiling_type: 1,
+            }
+        };
+
+        // Sparse ink far past 4 steps (di = -4 and di = -9).
+        let r1 = make(
+            Rect::new(0.0, 0.0, 50.0, 10.0),
+            10.0,
+            10.0,
+            Rect::new(45.0, 2.0, 47.0, 8.0),
+        )
+        .overlap_copy_ranges();
+        assert_eq!(r1.di, -4..=-4);
+        assert_eq!(r1.dj, 0..=0);
+        assert!(!r1.truncated);
+
+        let r2 = make(
+            Rect::new(0.0, 0.0, 100.0, 10.0),
+            10.0,
+            10.0,
+            Rect::new(90.0, 2.0, 99.0, 8.0),
+        )
+        .overlap_copy_ranges();
+        assert_eq!(r2.di, -9..=-9);
+        assert_eq!(r2.dj, 0..=0);
+        assert!(!r2.truncated);
+
+        // Negative step wraps in the opposite index direction.
+        let r3 = make(
+            Rect::new(0.0, 0.0, 50.0, 10.0),
+            -10.0,
+            10.0,
+            Rect::new(45.0, 2.0, 47.0, 8.0),
+        )
+        .overlap_copy_ranges();
+        assert_eq!(r3.di, 4..=4);
+        assert_eq!(r3.dj, 0..=0);
+        assert!(!r3.truncated);
+
+        // Pathological dense overlap exceeds MAX_TILING_OVERLAP_COPIES and flags truncation.
+        let r4 = make(
+            Rect::new(0.0, 0.0, 5000.0, 5000.0),
+            10.0,
+            10.0,
+            Rect::new(0.0, 0.0, 5000.0, 5000.0),
+        )
+        .overlap_copy_ranges();
+        assert!(r4.truncated);
+        let nx = r4.di.end().abs_diff(*r4.di.start()) + 1;
+        let ny = r4.dj.end().abs_diff(*r4.dj.start()) + 1;
+        assert!(nx * ny <= MAX_TILING_OVERLAP_COPIES);
     }
 }
 

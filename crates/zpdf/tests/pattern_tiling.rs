@@ -511,3 +511,439 @@ fn self_referential_tiling_pattern_terminates_safely() {
         "self-referential tiling pattern must be flagged as malformed_content"
     );
 }
+
+/// Regression: two sibling Form XObjects inside one tiling pattern cell that
+/// apply the same indirect `/ExtGState` (whose `/SMask /G` form inherits `/Im`
+/// from its enclosing form's `/Resources`) must NOT share a cached soft mask
+/// when the two sibling forms bind `/Im` to different images.
+#[test]
+fn sibling_forms_in_tiling_cell_do_not_alias_inherited_soft_mask_resources() {
+    // 1x1 DeviceGray image: white (255 -> luma 1.0, fully visible).
+    let img_white = stream_obj(
+        "/Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8",
+        &[255],
+    );
+    // 1x1 DeviceGray image: black (0 -> luma 0.0, fully masked out).
+    let img_black = stream_obj(
+        "/Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8",
+        &[0],
+    );
+    // Soft-mask transparency group /G with NO /Resources of its own; it draws
+    // /Im inherited from whichever sibling form invoked /GS1 gs.
+    let mask_group = stream_obj(
+        "/Type /XObject /Subtype /Form /BBox [0 0 20 20] \
+         /Group << /Type /Group /S /Transparency /CS /DeviceGray >>",
+        b"20 0 0 20 0 0 cm /Im Do",
+    );
+    // Shared indirect ExtGState referencing mask_group (obj 10).
+    let gs_shared =
+        b"<< /Type /ExtGState /SMask << /Type /Mask /S /Luminosity /G 10 0 R >> >>".to_vec();
+    // Sibling Form 1 binds /Im -> img_white (obj 8), applies /GS1 gs, paints red on left half [0..10].
+    let form1 = stream_obj(
+        "/Type /XObject /Subtype /Form /BBox [0 0 20 20] \
+         /Resources << /XObject << /Im 8 0 R >> /ExtGState << /GS1 11 0 R >> >>",
+        b"/GS1 gs 1 0 0 rg 0 0 10 20 re f",
+    );
+    // Sibling Form 2 binds /Im -> img_black (obj 9), applies the SAME /GS1 gs
+    // under the exact same CTM/clip/paint/depth, and tries to paint blue on right half [10..20].
+    let form2 = stream_obj(
+        "/Type /XObject /Subtype /Form /BBox [0 0 20 20] \
+         /Resources << /XObject << /Im 9 0 R >> /ExtGState << /GS1 11 0 R >> >>",
+        b"/GS1 gs 0 0 1 rg 10 0 10 20 re f",
+    );
+    let cell = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 20 20] /XStep 20 /YStep 20 \
+         /Resources << /XObject << /Fm1 6 0 R /Fm2 7 0 R >> >>",
+        b"/Fm1 Do /Fm2 Do",
+    );
+    let content = stream_obj("", b"/Pattern cs /P0 scn 0 0 200 200 re f");
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R \
+          /Resources << /Pattern << /P0 5 0 R >> >> >>"
+            .to_vec(), // 3
+        content,                                       // 4
+        cell,                                          // 5
+        form1,                                         // 6
+        form2,                                         // 7
+        img_white,                                     // 8
+        img_black,                                     // 9
+        mask_group,                                    // 10
+        gs_shared,                                     // 11
+    ]);
+
+    let page = render(pdf);
+    // Left half of tile (cell-x = 5): masked by white image -> red must paint.
+    assert_rgbish(
+        px(&page, 25.0, 25.0),
+        [255, 0, 0],
+        "Fm1 left half visible through white mask",
+    );
+    // Right half of tile (cell-x = 15): masked by black image -> blue must be fully masked out (white bg).
+    assert_rgbish(
+        px(&page, 35.0, 25.0),
+        [255, 255, 255],
+        "Fm2 right half masked out by black mask (must not alias Fm1's cached mask)",
+    );
+}
+
+/// Regression: two sibling Form XObjects with distinct `/Im` bindings that both
+/// paint using the SAME tiling pattern (whose own `/Resources` dict is present
+/// but omits `/Im`, falling back to the enclosing form's `/Resources`) must NOT
+/// alias each other's pre-interpreted tiling cell in `tiling_cell_cache`.
+#[test]
+fn sibling_forms_do_not_alias_tiling_cell_cache_on_inherited_resources() {
+    let img_red = stream_obj(
+        "/Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8",
+        &[255, 0, 0],
+    );
+    let img_blue = stream_obj(
+        "/Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8",
+        &[0, 0, 255],
+    );
+    // Pattern has an explicit (empty) `/Resources << >>`, so `/Im` falls back
+    // to whichever enclosing Form XObject invoked the pattern.
+    let pat = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 20 20] /XStep 20 /YStep 20 /Resources << >>",
+        b"20 0 0 20 0 0 cm /Im Do",
+    );
+    let form1 = stream_obj(
+        "/Type /XObject /Subtype /Form /BBox [0 0 200 200] \
+         /Resources << /XObject << /Im 8 0 R >> /Pattern << /P0 5 0 R >> >>",
+        b"/Pattern cs /P0 scn 0 0 100 200 re f",
+    );
+    let form2 = stream_obj(
+        "/Type /XObject /Subtype /Form /BBox [0 0 200 200] \
+         /Resources << /XObject << /Im 9 0 R >> /Pattern << /P0 5 0 R >> >>",
+        b"/Pattern cs /P0 scn 100 0 100 200 re f",
+    );
+    let content = stream_obj("", b"/Fm1 Do /Fm2 Do");
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R \
+          /Resources << /XObject << /Fm1 6 0 R /Fm2 7 0 R >> >> >>"
+            .to_vec(), // 3
+        content,                                       // 4
+        pat,                                           // 5
+        form1,                                         // 6
+        form2,                                         // 7
+        img_red,                                       // 8
+        img_blue,                                      // 9
+    ]);
+
+    let page = render(pdf);
+    assert_rgbish(
+        px(&page, 50.0, 100.0),
+        [255, 0, 0],
+        "Fm1 left half paints red inherited /Im",
+    );
+    assert_rgbish(
+        px(&page, 150.0, 100.0),
+        [0, 0, 255],
+        "Fm2 right half paints blue inherited /Im (must not alias Fm1 cell cache)",
+    );
+}
+
+/// Regression: commands retained inside distinct detached tiling-pattern cells
+/// must count toward `with_command_limit(...)` so multiple cells cannot bypass
+/// the page command budget.
+#[test]
+fn detached_tiling_cell_commands_count_toward_command_limit() {
+    let mut cell_body = Vec::new();
+    for i in 0..60 {
+        cell_body.extend_from_slice(format!("1 0 0 rg {i} 0 1 1 re f\n").as_bytes());
+    }
+    let pat1 = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 100 10] /XStep 100 /YStep 10 /Resources << >>",
+        &cell_body,
+    );
+    let pat2 = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 100 10] /XStep 100 /YStep 10 /Resources << >>",
+        &cell_body,
+    );
+    let content = stream_obj(
+        "",
+        b"/Pattern cs /P1 scn 0 0 100 100 re f\n/P2 scn 100 0 100 100 re f",
+    );
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R \
+          /Resources << /Pattern << /P1 5 0 R /P2 6 0 R >> >> >>"
+            .to_vec(),
+        content,
+        pat1,
+        pat2,
+    ]);
+    let doc = PdfDocument::open(pdf).expect("open pdf");
+    let page = doc.page(0).expect("page 0");
+    let mut fonts = doc.load_page_fonts(&page);
+    let content_bytes = doc.page_content_bytes(&page).expect("content");
+    let mut images = ImageCache::new();
+    let (_dl, stats) = ContentInterpreter::new(page.media_box)
+        .with_command_limit(100)
+        .with_fonts(&mut fonts)
+        .with_document(doc.file(), &page.resources)
+        .with_images(&mut images)
+        .interpret_with_stats(&content_bytes);
+    assert!(
+        stats.diagnostics.resource_limit_reached,
+        "two distinct 60-command tiling cells must exceed max_commands=100"
+    );
+}
+
+/// Regression: a tiling pattern cell that executes its own `BT ... ET` block
+/// while being built for a text-clipping render mode (`4 Tr`) must not corrupt
+/// or clear the outer text block's `text_clip_accum` / `text_active` state.
+#[test]
+fn tiling_pattern_cell_text_block_preserves_outer_text_clip() {
+    // Cell runs its own `BT ... ET` before painting a red square.
+    let cell = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 20 20] /XStep 20 /YStep 20 \
+         /Resources << /Font << /F1 6 0 R >> >>",
+        b"BT /F1 8 Tf 2 2 Td (x) Tj ET\n1 0 0 rg 0 0 20 20 re f",
+    );
+    // Outer page uses mode 4 (fill + add to clip) painted with `/P0`, then
+    // fills the entire page with blue after `ET`. Because the outer text clip
+    // must remain intact, pixels outside the glyph outline stay white.
+    let content = stream_obj(
+        "",
+        b"q\nBT /F1 120 Tf 4 Tr /Pattern cs /P0 scn 20 40 Td (I) Tj ET\n\
+          0 0 1 rg 0 0 200 200 re f\nQ",
+    );
+    let font = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec();
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R \
+          /Resources << /Pattern << /P0 5 0 R >> /Font << /F1 6 0 R >> >> >>"
+            .to_vec(),
+        content,
+        cell,
+        font,
+    ]);
+    let (dl, _stats, page) = render_with_stats(pdf, SCALE);
+    let has_push_clip = dl
+        .commands
+        .iter()
+        .any(|c| matches!(c, zpdf::display_list::RenderCommand::PushClip { .. }));
+    assert!(
+        has_push_clip,
+        "outer mode-4 text block must still install its glyph PushClip after ET"
+    );
+    // Far right side (x=180, y=100) is outside the 'I' glyph clip, so the
+    // subsequent full-page blue fill must NOT leak there.
+    assert_rgbish(
+        px(&page, 180.0, 100.0),
+        [255, 255, 255],
+        "pixels outside outer glyph clip must stay white",
+    );
+}
+
+/// Regression: interpreting a nested tiling pattern `P_outer` (which paints
+/// `P_inner`) near `MAX_FORM_DEPTH` so `P_inner` hits the nesting limit must
+/// NOT poison `tiling_cell_cache` for a later shallow page-level draw of
+/// `P_outer`.
+#[test]
+fn deep_nested_tiling_pattern_hit_does_not_poison_shallow_cache() {
+    // Object layout:
+    //  1: Catalog
+    //  2: Pages
+    //  3: Page (draws /F1 at depth 0, then fills right half with /POuter at depth 0)
+    //  4: Page content
+    //  5: PInner (solid green 20x20 cell)
+    //  6: POuter (fills 20x20 cell with PInner; solid fallback would be black)
+    //  7..=21: 15 nested Form XObjects F1 -> F2 -> ... -> F15, where F15 (at
+    //          form_depth=15) paints left half with /POuter (so POuter enters
+    //          at form_depth=15 -> increments to 16 -> PInner hits MAX_FORM_DEPTH=16).
+    let p_inner = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 20 20] /XStep 20 /YStep 20 /Resources << >>",
+        b"0 1 0 rg 0 0 20 20 re f",
+    );
+    let p_outer = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 20 20] /XStep 20 /YStep 20 \
+         /Resources << /Pattern << /PInner 5 0 R >> >>",
+        b"/Pattern cs /PInner scn 0 0 20 20 re f",
+    );
+    let content = stream_obj("", b"/F1 Do\n/Pattern cs /POuter scn 100 0 100 200 re f");
+    let mut objs = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R \
+          /Resources << /XObject << /F1 7 0 R >> /Pattern << /POuter 6 0 R >> >> >>"
+            .to_vec(),
+        content,
+        p_inner,
+        p_outer,
+    ];
+    for level in 1..=15usize {
+        let obj_id = 6 + level;
+        if level < 15 {
+            let next_id = obj_id + 1;
+            objs.push(stream_obj(
+                &format!(
+                    "/Type /XObject /Subtype /Form /BBox [0 0 200 200] \
+                     /Resources << /XObject << /FNext {next_id} 0 R >> >>"
+                ),
+                b"/FNext Do",
+            ));
+        } else {
+            objs.push(stream_obj(
+                "/Type /XObject /Subtype /Form /BBox [0 0 200 200] \
+                 /Resources << /Pattern << /POuter 6 0 R >> >>",
+                b"/Pattern cs /POuter scn 0 0 100 200 re f",
+            ));
+        }
+    }
+
+    let page = render(assemble(&objs));
+    // Right half is drawn at page depth 0: POuter must render PInner's green
+    // (not the degraded depth-15 fallback cached from inside F15).
+    assert_rgbish(
+        px(&page, 150.0, 100.0),
+        [0, 255, 0],
+        "shallow page-level POuter draw must render inner green pattern",
+    );
+}
+
+/// Regression: an anisotropic pattern `/Matrix [4 0 0 1 0 0]` must scale a 1pt
+/// vertical stroke to 4px wide and a 1pt horizontal stroke to 1px tall (not
+/// an isotropic geometric-mean 2px for both).
+#[test]
+fn anisotropic_tiling_matrix_preserves_directional_stroke_widths() {
+    // 10x10 pattern space mapped by [4 0 0 1 0 0] -> 40x10 device pixels at scale=1.
+    // Red 1pt vertical stroke at cell x=5 -> x in [18..22] (4px wide).
+    // Blue 1pt horizontal stroke at cell y=5 -> y in [4.5..5.5] (1px tall).
+    let cell = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 10 10] /XStep 10 /YStep 10 \
+         /Matrix [4 0 0 1 0 0] /Resources << >>",
+        b"1 w\n1 0 0 RG 5 0 m 5 10 l S\n0 0 1 RG 0 5 m 10 5 l S",
+    );
+    let content = stream_obj("", b"/Pattern cs /P0 scn 0 0 80 40 re f");
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 80 40] /Contents 4 0 R \
+          /Resources << /Pattern << /P0 5 0 R >> >> >>"
+            .to_vec(),
+        content,
+        cell,
+    ]);
+    let (_dl, _stats, page) = render_with_stats(pdf, 1.0);
+    // Integrate red ink thickness across one 40px tile row at y=2 (away from
+    // the blue horizontal line at y=5): a 1pt stroke scaled by sx=4 integrates
+    // to ~4.0 device pixels (vs ~2.0 under the old geometric-mean bug).
+    let mut red_ink_px = 0.0f64;
+    for x in 0..40 {
+        let c = px_on(&page, 40.0, 1.0, x as f64 + 0.5, 2.5);
+        red_ink_px += (255 - c[1]) as f64 / 255.0;
+    }
+    // Integrate blue ink thickness down one 10px tile column at x=5 (away from
+    // the red vertical line at x=20): a 1pt stroke scaled by sy=1 integrates
+    // to ~1.0 device pixel regardless of subpixel alignment (vs ~2.0 under the
+    // old geometric-mean bug).
+    let mut blue_ink_px = 0.0f64;
+    for y in 0..10 {
+        let c = px_on(&page, 40.0, 1.0, 5.5, y as f64 + 0.5);
+        blue_ink_px += (255 - c[0]) as f64 / 255.0;
+    }
+    assert!(
+        (3.5..=4.5).contains(&red_ink_px),
+        "anisotropic vertical stroke should integrate to ~4px wide, measured {red_ink_px:.2}px"
+    );
+    assert!(
+        (0.8..=1.2).contains(&blue_ink_px),
+        "anisotropic horizontal stroke should integrate to ~1px tall, measured {blue_ink_px:.2}px"
+    );
+}
+
+/// Regression: an overlapping cell whose painted ink sits more than 3 steps
+/// past the fundamental period (`/BBox [0 0 50 10]`, `/XStep 10`, ink at
+/// `x = 45..47`) must wrap copy `di = -4` into `[5..7]` instead of dropping it.
+#[test]
+fn wide_sparse_overlapping_bbox_beyond_four_steps_renders() {
+    let cell = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 50 10] /XStep 10 /YStep 10 /Resources << >>",
+        b"1 0 0 rg 45 2 2 6 re f",
+    );
+    let content = stream_obj("", b"/Pattern cs /P0 scn 0 0 200 200 re f");
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R \
+          /Resources << /Pattern << /P0 5 0 R >> >> >>"
+            .to_vec(),
+        content,
+        cell,
+    ]);
+    let page = render(pdf);
+    // Period offset (6.0, 5.0) comes from copy di=-4 (x=45..47 shifted by -40).
+    assert_rgbish(
+        px(&page, 26.0, 25.0),
+        [255, 0, 0],
+        "wrapped ink from di=-4 must paint at period x=6",
+    );
+    assert_rgbish(
+        px(&page, 22.0, 25.0),
+        [255, 255, 255],
+        "gap outside wrapped ink must stay white",
+    );
+}
+
+/// Regression: when an overlapping tiling cell (`/BBox [0 0 20 10]`, `/XStep 10`)
+/// uses a soft mask, each shifted overlap copy `(di, dj)` changes the sub-renderer
+/// origin and must NOT reuse a cached soft-mask plane rasterized at a previous
+/// copy's origin.
+#[test]
+fn overlapping_tiling_cell_soft_mask_rebuilds_per_shifted_origin() {
+    // Mask group paints white ONLY in x=[11..14] (outside [0..10] for di=0,
+    // shifted into [1..4] for di=-1!).
+    let mask_group = stream_obj(
+        "/Type /XObject /Subtype /Form /BBox [0 0 20 10] \
+         /Group << /Type /Group /S /Transparency /CS /DeviceGray >>",
+        b"1 g 11 0 3 10 re f",
+    );
+    let gs = b"<< /Type /ExtGState /SMask << /Type /Mask /S /Luminosity /G 6 0 R >> >>".to_vec();
+    let cell = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 20 10] /XStep 10 /YStep 10 \
+         /Resources << /ExtGState << /GS1 7 0 R >> >>",
+        b"/GS1 gs 1 0 0 rg 0 0 20 10 re f",
+    );
+    let content = stream_obj("", b"/Pattern cs /P0 scn 0 0 200 200 re f");
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R \
+          /Resources << /Pattern << /P0 5 0 R >> >> >>"
+            .to_vec(), // 3
+        content,                                       // 4
+        cell,                                          // 5
+        mask_group,                                    // 6
+        gs,                                            // 7
+    ]);
+    let page = render(pdf);
+    // Period offset x=2.5 (from di=-1 shifting [11..14] to [1..4]) must be red.
+    assert_rgbish(
+        px(&page, 22.5, 25.0),
+        [255, 0, 0],
+        "shifted overlap copy soft mask must reveal red at period x=2.5",
+    );
+    // Period offset x=7.5 is outside the mask in both di=-1 and di=0 -> white.
+    assert_rgbish(
+        px(&page, 27.5, 25.0),
+        [255, 255, 255],
+        "unmasked region at period x=7.5 must stay white",
+    );
+}

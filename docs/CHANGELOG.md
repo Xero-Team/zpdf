@@ -16,11 +16,12 @@
   `/PaintType 2`) as `Paint::Tiling` instead of expanding per-tile geometry
   into the flat display list, removing the 4,096-tile solid fallback and
   command-budget truncation on pattern-heavy pages (e.g. `MOZILLA-1244729-0.pdf`,
-  `PDFBOX-1094-5.pdf`). The CPU backend rasterizes each unique cell once into a
-  bounded per-page tile cache and paints via `tiny_skia::Pattern` with
-  `SpreadMode::Repeat`, handling negative steps, overlapping `/BBox > step`,
-  and arbitrary pattern matrices; SVG export emits deduplicated `<pattern>`
-  definitions and wgpu replays tiles as a fallback. (#155)
+  `PDFBOX-1094-5.pdf`). The CPU backend reuses each rasterized cell while it
+  remains in the bounded per-page tile cache and paints via
+  `tiny_skia::Pattern` with `SpreadMode::Repeat`, handling negative steps,
+  overlapping `/BBox > step`, and arbitrary pattern matrices; SVG export emits
+  deduplicated `<pattern>` definitions and wgpu replays tiles as a fallback.
+  (#155)
 
 ## 0.22.0 — Embedded font recovery, rendering precision, and JBIG2 oracle
 

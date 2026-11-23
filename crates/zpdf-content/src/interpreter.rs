@@ -114,10 +114,22 @@ pub struct ContentInterpreter<'a> {
     /// pattern, so reselecting a pattern does not decode its cell again.
     tiling_pattern_cache: HashMap<ObjectId, Option<std::sync::Arc<TilingPatternDef>>>,
     /// Pre-interpreted single-cell display lists for tiling patterns, keyed by
-    /// `(pattern object id, uncolored scn tint)`. Lets repeated fills with the
-    /// same pattern share one `Arc<DisplayList>` (and lets backends cache one
+    /// `(pattern object id, uncolored scn tint, effective cell downscale,
+    /// enclosing resource scopes)`. Lets repeated fills in the same resource
+    /// scope share one `Arc<DisplayList>` (and lets backends cache one
     /// rasterized tile pixmap across every shape).
-    tiling_cell_cache: HashMap<TilingCellKey, std::sync::Arc<DisplayList>>,
+    tiling_cell_cache: HashMap<TilingCellKey, CachedTilingCell>,
+    /// Commands retained in detached display lists (currently active outer
+    /// display lists plus unique pre-interpreted tiling cells) that count
+    /// against `max_commands` alongside `self.display_list.commands.len()`.
+    retained_detached_commands: usize,
+    /// Set when any nested form XObject or tiling pattern hits `MAX_FORM_DEPTH`
+    /// or a cycle guard; prevents a degraded cell built near the nesting ceiling
+    /// from poisoning `tiling_cell_cache` for shallower draws.
+    nesting_limit_hit: bool,
+    /// Deepest `form_depth` reached during the current form/pattern subtree,
+    /// used to compute each cached tiling cell's `subtree_depth`.
+    max_depth_reached: u32,
     /// Shading patterns built at `scn`, by pattern object and the `base_ctm`
     /// bits they were built under (`None` for an unusable pattern). Content
     /// that reselects one pattern per path reuses one evaluated shading (and
@@ -140,6 +152,12 @@ pub struct ContentInterpreter<'a> {
     /// Owned /Resources of the form XObjects currently being interpreted,
     /// innermost last. Lookups search these before the page resources.
     form_resources: Vec<ResourceDict>,
+    /// Stable identity for each pushed entry in `form_resources`, used to key
+    /// `soft_mask_cache` so sibling forms with distinct resource bindings never
+    /// alias each other's inherited soft-mask `/G` resources.
+    form_resource_scopes: Vec<ResourceScopeId>,
+    /// Monotonic counter for anonymous inline resource scopes.
+    next_resource_scope_id: u64,
     form_depth: u32,
     /// Object ids of the form XObjects currently being interpreted. A form
     /// that draws itself (directly, or through a pattern cell) recurses
@@ -476,18 +494,31 @@ fn rgba_bytes(size: (u32, u32)) -> u64 {
     size.0 as u64 * size.1 as u64 * 4
 }
 
+/// Stable identity of one pushed `/Resources` scope on `form_resources`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ResourceScopeId {
+    /// Indirect `/Resources` dictionary object shared by one or more streams.
+    ResourcesObject(ObjectId),
+    /// Inline `/Resources` dictionary owned by an indirect Form XObject or
+    /// tiling pattern stream.
+    OwnerObject(ObjectId),
+    /// Anonymous inline `/Resources` dictionary with no indirect owner; each
+    /// push receives a distinct monotonic ID so sibling scopes never alias.
+    Unique(u64),
+}
+
 /// What a soft mask built at a `gs` depends on: the ExtGState object, and the
 /// graphics state the mask group starts from — its CTM (and the pattern
 /// anchor), the clip bounds its `/BBox` and shadings are cut to, the inherited
-/// colours and line width the group may paint with unset, and the resource
-/// scope it falls back to.
+/// colours and line width the group may paint with unset, and the full stack
+/// of enclosing resource scopes it falls back to.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct SoftMaskCacheKey {
     gs_id: ObjectId,
     matrices: [u64; 12],
     clip: Option<[u64; 4]>,
     paint: [u32; 9],
-    resource_depth: usize,
+    resource_scopes: Vec<ResourceScopeId>,
 }
 
 /// Soft masks [`ContentInterpreter`] keeps per page; later masks are built
@@ -495,13 +526,23 @@ struct SoftMaskCacheKey {
 const MAX_CACHED_SOFT_MASKS: usize = 256;
 
 /// Cache key for pre-interpreted tiling-pattern cells. Coloured (`/PaintType 1`)
-/// cells depend only on the pattern object; uncoloured (`/PaintType 2`) cells
-/// also bake in the `scn`/`SCN` paint colour.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// cells depend on the pattern object, effective cell downscale, and enclosing
+/// resource scopes (since `lookup_res` falls back through enclosing forms);
+/// uncoloured (`/PaintType 2`) cells also bake in the `scn`/`SCN` paint colour.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct TilingCellKey {
     pat_id: ObjectId,
     uncolored_color: Option<[u32; 4]>,
     image_downscale: u32,
+    resource_scopes: Vec<ResourceScopeId>,
+}
+
+/// Cached tiling-pattern cell along with the nesting depth its subtree consumed
+/// (at least 1 for the cell itself) so shallow draws never reuse a depth-capped
+/// fallback and deep draws never bypass `MAX_FORM_DEPTH`.
+struct CachedTilingCell {
+    commands: std::sync::Arc<DisplayList>,
+    subtree_depth: u32,
 }
 
 /// Pre-interpreted tiling-pattern cells [`ContentInterpreter`] keeps per page.
@@ -921,6 +962,9 @@ impl<'a> ContentInterpreter<'a> {
             form_content_cache: HashMap::new(),
             tiling_pattern_cache: HashMap::new(),
             tiling_cell_cache: HashMap::new(),
+            retained_detached_commands: 0,
+            nesting_limit_hit: false,
+            max_depth_reached: 0,
             shading_pattern_cache: HashMap::new(),
             content_cache_bytes: 0,
             soft_mask_cache: HashMap::new(),
@@ -928,6 +972,8 @@ impl<'a> ContentInterpreter<'a> {
             font_repair: Default::default(),
             font_override: false,
             form_resources: Vec::new(),
+            form_resource_scopes: Vec::new(),
+            next_resource_scope_id: 0,
             form_depth: 0,
             active_forms: Vec::new(),
             active_tiling_patterns: Vec::new(),
@@ -1102,7 +1148,10 @@ impl<'a> ContentInterpreter<'a> {
     /// operations also check it while processing their glyphs.
     fn over_budget(&mut self) -> bool {
         if self.resource_limit_hit
-            || self.display_list.commands.len() >= self.max_commands
+            || self
+                .retained_detached_commands
+                .saturating_add(self.display_list.commands.len())
+                >= self.max_commands
             || self.ops_executed >= self.max_ops
         {
             self.stats.diagnostics.resource_limit_reached = true;
@@ -1127,7 +1176,10 @@ impl<'a> ContentInterpreter<'a> {
     fn cut_short(&self) -> bool {
         self.timed_out
             || self.resource_limit_hit
-            || self.display_list.commands.len() >= self.max_commands
+            || self
+                .retained_detached_commands
+                .saturating_add(self.display_list.commands.len())
+                >= self.max_commands
             || self.ops_executed >= self.max_ops
     }
 
@@ -4170,7 +4222,7 @@ impl<'a> ContentInterpreter<'a> {
                 self.current.line_width,
             ]
             .map(f32::to_bits),
-            resource_depth: self.form_resources.len(),
+            resource_scopes: self.form_resource_scopes.clone(),
         };
         if let Some(mask) = self.soft_mask_cache.get(&key) {
             return mask.clone();
@@ -4180,6 +4232,22 @@ impl<'a> ContentInterpreter<'a> {
             self.soft_mask_cache.insert(key, mask.clone());
         }
         mask
+    }
+
+    fn resource_scope_id(
+        &mut self,
+        res_obj: &PdfObject,
+        owner_id: Option<ObjectId>,
+    ) -> ResourceScopeId {
+        if let PdfObject::Ref(id) = res_obj {
+            ResourceScopeId::ResourcesObject(*id)
+        } else if let Some(id) = owner_id {
+            ResourceScopeId::OwnerObject(id)
+        } else {
+            let id = self.next_resource_scope_id;
+            self.next_resource_scope_id = self.next_resource_scope_id.wrapping_add(1);
+            ResourceScopeId::Unique(id)
+        }
     }
 
     /// Build a [`SoftMask`] from an ExtGState /SMask dict: interpret the /G
@@ -4909,11 +4977,13 @@ impl<'a> ContentInterpreter<'a> {
     ) {
         const MAX_FORM_DEPTH: u32 = 16;
         if self.form_depth >= MAX_FORM_DEPTH {
+            self.nesting_limit_hit = true;
             self.stats.diagnostics.resource_limit_reached = true;
             tracing::warn!("form XObject nesting exceeds {MAX_FORM_DEPTH}; skipping");
             return;
         }
         if let Some(id) = xobj_id.filter(|id| self.active_forms.contains(id)) {
+            self.nesting_limit_hit = true;
             self.stats.diagnostics.malformed_content =
                 self.stats.diagnostics.malformed_content.saturating_add(1);
             tracing::warn!("form XObject {id} draws itself; skipping the recursion");
@@ -4980,13 +5050,16 @@ impl<'a> ContentInterpreter<'a> {
         let own_resources = match stream.dict.get("Resources") {
             Some(res_obj) => {
                 let resolved = self.resolve_dict_of(res_obj);
-                resolved.and_then(|d| zpdf_document::page::parse_resource_dict(&d, file).ok())
+                resolved
+                    .and_then(|d| zpdf_document::page::parse_resource_dict(&d, file).ok())
+                    .map(|res| (res, self.resource_scope_id(res_obj, xobj_id)))
             }
             None => None,
         };
         let pushed_resources = own_resources.is_some();
-        if let Some(res) = own_resources {
+        if let Some((res, scope_id)) = own_resources {
             self.form_resources.push(res);
+            self.form_resource_scopes.push(scope_id);
         }
 
         // Save full state including text matrices
@@ -5073,6 +5146,7 @@ impl<'a> ContentInterpreter<'a> {
         }
 
         self.form_depth += 1;
+        self.max_depth_reached = self.max_depth_reached.max(self.form_depth);
         self.active_forms.extend(xobj_id);
         // A pending `W` belongs to the stream that set it: the invoking
         // stream's waits for its own painting operator (a pattern fill runs
@@ -5144,6 +5218,7 @@ impl<'a> ContentInterpreter<'a> {
         self.pop_form_fonts();
         if pushed_resources {
             self.form_resources.pop();
+            self.form_resource_scopes.pop();
         }
     }
 
@@ -5785,11 +5860,13 @@ impl<'a> ContentInterpreter<'a> {
     ) -> Option<std::sync::Arc<TilingPattern>> {
         const MAX_FORM_DEPTH: u32 = 16;
         if self.form_depth >= MAX_FORM_DEPTH {
+            self.nesting_limit_hit = true;
             self.stats.diagnostics.resource_limit_reached = true;
             tracing::warn!("tiling pattern nesting exceeds {MAX_FORM_DEPTH}; skipping");
             return None;
         }
         if self.active_tiling_patterns.contains(&def.pat_id) {
+            self.nesting_limit_hit = true;
             self.stats.diagnostics.malformed_content =
                 self.stats.diagnostics.malformed_content.saturating_add(1);
             tracing::warn!(
@@ -5862,18 +5939,25 @@ impl<'a> ContentInterpreter<'a> {
                 .map(f32::to_bits)
             }),
             image_downscale: cell_downscale_scale.to_bits(),
+            resource_scopes: self.form_resource_scopes.clone(),
         };
-        let can_cache = self.form_resources.is_empty() || def.dict.get("Resources").is_some();
-        if can_cache {
-            if let Some(commands) = self.tiling_cell_cache.get(&cache_key) {
-                return Some(std::sync::Arc::new(TilingPattern {
-                    commands: std::sync::Arc::clone(commands),
+        if let Some(cached) = self.tiling_cell_cache.get(&cache_key) {
+            if self.form_depth.saturating_add(cached.subtree_depth) <= MAX_FORM_DEPTH {
+                self.max_depth_reached = self
+                    .max_depth_reached
+                    .max(self.form_depth.saturating_add(cached.subtree_depth));
+                let pattern = TilingPattern {
+                    commands: std::sync::Arc::clone(&cached.commands),
                     bbox: def.bbox,
                     x_step: def.x_step,
                     y_step: def.y_step,
                     matrix: to_page,
                     tiling_type: def.tiling_type,
-                }));
+                };
+                if pattern.overlap_copy_ranges().truncated {
+                    self.stats.diagnostics.resource_limit_reached = true;
+                }
+                return Some(std::sync::Arc::new(pattern));
             }
         }
 
@@ -5882,25 +5966,36 @@ impl<'a> ContentInterpreter<'a> {
         // Pattern /Resources and fonts shadow the page's for the cell body,
         // exactly like a form XObject's.
         self.load_form_fonts(&def.dict, None, file);
-        let own_resources = def
-            .dict
-            .get("Resources")
-            .and_then(|res_obj| self.resolve_dict_of(res_obj))
-            .and_then(|d| zpdf_document::page::parse_resource_dict(&d, file).ok());
+        let own_resources = def.dict.get("Resources").and_then(|res_obj| {
+            self.resolve_dict_of(res_obj)
+                .and_then(|d| zpdf_document::page::parse_resource_dict(&d, file).ok())
+                .map(|res| (res, self.resource_scope_id(res_obj, Some(def.pat_id))))
+        });
         let pushed_resources = own_resources.is_some();
-        if let Some(res) = own_resources {
+        if let Some((res, scope_id)) = own_resources {
             self.form_resources.push(res);
+            self.form_resource_scopes.push(scope_id);
         }
 
         // Interpret the cell once in pattern space into a detached display list
-        // bounded by `/BBox`, mirroring `build_soft_mask`.
+        // bounded by `/BBox`, mirroring `build_soft_mask`. Charge outer commands
+        // to `retained_detached_commands` while the cell runs so `over_budget()`
+        // enforces `max_commands` across both outer and retained detached cells.
         let saved_dl = std::mem::replace(&mut self.display_list, DisplayList::new(def.bbox));
+        let outer_cmd_count = saved_dl.commands.len();
+        self.retained_detached_commands = self
+            .retained_detached_commands
+            .saturating_add(outer_cmd_count);
         let depth_floor = self.state_stack.len();
         self.state_stack.push(self.current.clone());
         let saved_floor = self.state_floor;
         self.state_floor = depth_floor + 1;
+        let saved_text_active = std::mem::replace(&mut self.text_active, false);
         let saved_text_matrix = self.text_matrix;
         let saved_text_line_matrix = self.text_line_matrix;
+        let saved_text_clip_accum = self.text_clip_accum.take();
+        let saved_text_clip_requested = std::mem::replace(&mut self.text_clip_requested, false);
+        let saved_text_clip_unavailable = std::mem::replace(&mut self.text_clip_unavailable, false);
         let saved_current_font_id = self.current_font_id;
         let saved_operand_stack = std::mem::take(&mut self.operand_stack);
         let saved_current_path = std::mem::take(&mut self.current_path);
@@ -5924,6 +6019,9 @@ impl<'a> ContentInterpreter<'a> {
         let saved_soft_mask_cache = std::mem::take(&mut self.soft_mask_cache);
         let saved_image_downscale_scale =
             std::mem::replace(&mut self.image_downscale_scale, cell_downscale_scale);
+        let entry_depth = self.form_depth;
+        let saved_nesting_limit_hit = std::mem::replace(&mut self.nesting_limit_hit, false);
+        let saved_max_depth_reached = std::mem::replace(&mut self.max_depth_reached, entry_depth);
 
         // Clean pattern-cell initial graphics state (ISO 32000-1 §8.7.3.1).
         self.current = GraphicsState::default();
@@ -5951,6 +6049,7 @@ impl<'a> ContentInterpreter<'a> {
         });
 
         self.form_depth += 1;
+        self.max_depth_reached = self.max_depth_reached.max(self.form_depth);
         self.active_tiling_patterns.push(def.pat_id);
         let mut truncated = false;
         let mut tokenizer = ContentTokenizer::new(&def.content);
@@ -5981,6 +6080,11 @@ impl<'a> ContentInterpreter<'a> {
         self.active_tiling_patterns.pop();
         self.form_depth -= 1;
 
+        let descendant_nesting_hit = self.nesting_limit_hit;
+        let subtree_depth = self.max_depth_reached.saturating_sub(entry_depth).max(1);
+        self.nesting_limit_hit = saved_nesting_limit_hit || descendant_nesting_hit;
+        self.max_depth_reached = saved_max_depth_reached.max(self.max_depth_reached);
+
         // Rebalance clips/state left open by the cell body.
         while self.state_stack.len() > depth_floor + 1 {
             for _ in 0..self.current.clip_depth {
@@ -6005,9 +6109,17 @@ impl<'a> ContentInterpreter<'a> {
         }
 
         let cell_dl = std::mem::replace(&mut self.display_list, saved_dl);
+        self.retained_detached_commands = self
+            .retained_detached_commands
+            .saturating_sub(outer_cmd_count)
+            .saturating_add(cell_dl.commands.len());
         self.state_floor = saved_floor;
+        self.text_active = saved_text_active;
         self.text_matrix = saved_text_matrix;
         self.text_line_matrix = saved_text_line_matrix;
+        self.text_clip_accum = saved_text_clip_accum;
+        self.text_clip_requested = saved_text_clip_requested;
+        self.text_clip_unavailable = saved_text_clip_unavailable;
         self.current_font_id = saved_current_font_id;
         self.operand_stack = saved_operand_stack;
         self.current_path = saved_current_path;
@@ -6029,21 +6141,39 @@ impl<'a> ContentInterpreter<'a> {
         self.pop_form_fonts();
         if pushed_resources {
             self.form_resources.pop();
+            self.form_resource_scopes.pop();
         }
 
         let commands = std::sync::Arc::new(cell_dl);
-        if can_cache && !truncated && self.tiling_cell_cache.len() < MAX_CACHED_TILING_CELLS {
-            self.tiling_cell_cache
-                .insert(cache_key, std::sync::Arc::clone(&commands));
+        if !truncated
+            && !descendant_nesting_hit
+            && self.tiling_cell_cache.len() < MAX_CACHED_TILING_CELLS
+        {
+            self.tiling_cell_cache.insert(
+                cache_key,
+                CachedTilingCell {
+                    commands: std::sync::Arc::clone(&commands),
+                    subtree_depth,
+                },
+            );
         }
-        Some(std::sync::Arc::new(TilingPattern {
+        let pattern = TilingPattern {
             commands,
             bbox: def.bbox,
             x_step: def.x_step,
             y_step: def.y_step,
             matrix: to_page,
             tiling_type: def.tiling_type,
-        }))
+        };
+        if pattern.overlap_copy_ranges().truncated {
+            self.stats.diagnostics.resource_limit_reached = true;
+            tracing::warn!(
+                "tiling pattern {:?} overlapping cell copies exceed {}; clamping",
+                def.pat_id,
+                zpdf_display_list::MAX_TILING_OVERLAP_COPIES
+            );
+        }
+        Some(std::sync::Arc::new(pattern))
     }
 
     /// Emit a solid-colour glyph run (the non-pattern path, and the fallback

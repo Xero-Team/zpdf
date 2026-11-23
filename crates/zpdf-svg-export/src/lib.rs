@@ -146,6 +146,11 @@ struct SvgWriter<'a> {
     out: String,
     x0: f64,
     y1: f64,
+    /// Uniform coordinate scale from current PDF space (page or pattern cell)
+    /// into SVG user units. Defaults to `1.0` on the page; scaled inside
+    /// `<pattern>` defs whose pattern space uses tiny units with a large
+    /// `/Matrix` so 3-decimal SVG formatting preserves geometry precision.
+    scale: f64,
     page_width: f64,
     page_height: f64,
     fonts: &'a FontCache,
@@ -206,6 +211,7 @@ struct MaskDefKey {
     kind: SoftMaskKind,
     offset: [u32; 2],
     backdrop_luma: u32,
+    origin_scale: [u64; 3],
     depth: u8,
 }
 
@@ -215,6 +221,7 @@ struct PatternDefKey {
     commands: *const DisplayList,
     bbox: [u64; 4],
     steps: [u64; 2],
+    tile_dims: [u64; 2],
     matrix: [u64; 6],
     depth: u8,
 }
@@ -240,6 +247,7 @@ impl<'a> SvgWriter<'a> {
             out: String::new(),
             x0: rect.x0,
             y1: rect.y1,
+            scale: 1.0,
             page_width: width,
             page_height: height,
             fonts,
@@ -269,9 +277,9 @@ impl<'a> SvgWriter<'a> {
         self.next_id
     }
 
-    /// Page space → SVG space: the fixed page Y-flip at scale 1 (points).
+    /// Current PDF space → SVG space: Y-flip with uniform coordinate `scale`.
     fn map(&self, x: f64, y: f64) -> (f64, f64) {
-        (x - self.x0, self.y1 - y)
+        ((x - self.x0) * self.scale, (self.y1 - y) * self.scale)
     }
 
     /// True once the export's wall-clock budget is spent. Latches; reads the
@@ -439,11 +447,53 @@ impl<'a> SvgWriter<'a> {
         let abs_x = x_step.abs();
         let abs_y = y_step.abs();
 
-        let pat_svg_to_pat_pdf = zpdf_core::Matrix::new(1.0, 0.0, 0.0, -1.0, bx0, by0 + abs_y);
-        let page_pdf_to_page_svg = zpdf_core::Matrix::new(1.0, 0.0, 0.0, -1.0, -self.x0, self.y1);
-        let m = page_pdf_to_page_svg
-            .concat(&tiling.matrix)
-            .concat(&pat_svg_to_pat_pdf);
+        // Map current PDF space (page or enclosing pattern) to current SVG space,
+        // compose with `tiling.matrix`, and choose a uniform `cell_scale` so
+        // pattern-SVG units stay in a well-conditioned range for 3-decimal
+        // `push_num` formatting even when pattern space uses tiny units with a
+        // large `/Matrix`. Uniform scaling preserves anisotropic stroke widths
+        // and circular caps/joins under `patternTransform`.
+        let outer_pdf_to_outer_svg = zpdf_core::Matrix::new(
+            self.scale,
+            0.0,
+            0.0,
+            -self.scale,
+            -self.x0 * self.scale,
+            self.y1 * self.scale,
+        );
+        let pat_pdf_to_outer_svg = outer_pdf_to_outer_svg.concat(&tiling.matrix);
+        let len_x = (pat_pdf_to_outer_svg.a * abs_x).hypot(pat_pdf_to_outer_svg.b * abs_x);
+        let len_y = (pat_pdf_to_outer_svg.c * abs_y).hypot(pat_pdf_to_outer_svg.d * abs_y);
+        if !len_x.is_finite() || !len_y.is_finite() || len_x <= 0.0 || len_y <= 0.0 {
+            return None;
+        }
+        let mut cell_scale = (len_x / abs_x).max(len_y / abs_y);
+        let min_step = abs_x.min(abs_y);
+        let max_extent = bw.max(bh).max(abs_x).max(abs_y);
+        if min_step * cell_scale < 1.0 {
+            cell_scale = 1.0 / min_step;
+        }
+        if max_extent * cell_scale > 5e5 {
+            cell_scale = 5e5 / max_extent;
+        }
+        if !cell_scale.is_finite() || cell_scale <= 0.0 {
+            return None;
+        }
+        let tile_w = abs_x * cell_scale;
+        let tile_h = abs_y * cell_scale;
+        if !coord_ok(tile_w) || !coord_ok(tile_h) || tile_w <= 0.0 || tile_h <= 0.0 {
+            return None;
+        }
+
+        let pat_svg_to_pat_pdf = zpdf_core::Matrix::new(
+            1.0 / cell_scale,
+            0.0,
+            0.0,
+            -1.0 / cell_scale,
+            bx0,
+            by0 + abs_y,
+        );
+        let m = pat_pdf_to_outer_svg.concat(&pat_svg_to_pat_pdf);
         if ![m.a, m.b, m.c, m.d, m.e, m.f].iter().all(|v| v.is_finite()) {
             return None;
         }
@@ -452,6 +502,7 @@ impl<'a> SvgWriter<'a> {
             commands: std::sync::Arc::as_ptr(&tiling.commands),
             bbox: [bx0, by0, bbox.x1, bbox.y1].map(f64::to_bits),
             steps: [x_step, y_step].map(f64::to_bits),
+            tile_dims: [tile_w, tile_h].map(f64::to_bits),
             matrix: [m.a, m.b, m.c, m.d, m.e, m.f].map(f64::to_bits),
             depth,
         };
@@ -465,9 +516,9 @@ impl<'a> SvgWriter<'a> {
             self.out,
             "<pattern id=\"p{id}\" patternUnits=\"userSpaceOnUse\" x=\"0\" y=\"0\" width=\""
         );
-        push_num(&mut self.out, abs_x);
+        push_num(&mut self.out, tile_w);
         self.out.push_str("\" height=\"");
-        push_num(&mut self.out, abs_y);
+        push_num(&mut self.out, tile_h);
         self.out.push_str("\" patternTransform=\"matrix(");
         push_num(&mut self.out, m.a);
         self.out.push(' ');
@@ -484,28 +535,23 @@ impl<'a> SvgWriter<'a> {
 
         let saved_x0 = self.x0;
         let saved_y1 = self.y1;
+        let saved_scale = self.scale;
         let saved_w = self.page_width;
         let saved_h = self.page_height;
         let (saved_clip, saved_mask) = (self.clip.take(), self.stroke_mask.take());
-        self.page_width = abs_x;
-        self.page_height = abs_y;
+        self.scale = cell_scale;
+        self.page_width = tile_w;
+        self.page_height = tile_h;
 
-        let overlap_range = |span: f64, step: f64| -> std::ops::RangeInclusive<i32> {
-            let abs_s = step.abs();
-            if span <= abs_s + 1e-6 {
-                return 0..=0;
-            }
-            let extra = ((span / abs_s).ceil() as i32 - 1).clamp(0, 3);
-            if step > 0.0 {
-                -extra..=0
-            } else {
-                0..=extra
-            }
-        };
-        let di_range = overlap_range(bw, x_step);
-        let dj_range = overlap_range(bh, y_step);
-        for dj in dj_range {
-            for di in di_range.clone() {
+        let overlap = tiling.overlap_copy_ranges();
+        if overlap.truncated {
+            tracing::warn!(
+                "svg tiling pattern overlapping cell copies exceed {}; clamping",
+                zpdf_display_list::MAX_TILING_OVERLAP_COPIES
+            );
+        }
+        for dj in overlap.dj.clone() {
+            for di in overlap.di.clone() {
                 self.x0 = bx0 - di as f64 * x_step;
                 self.y1 = by0 + abs_y - dj as f64 * y_step;
                 self.emit_commands(&tiling.commands.commands, depth + 1);
@@ -514,6 +560,7 @@ impl<'a> SvgWriter<'a> {
 
         self.x0 = saved_x0;
         self.y1 = saved_y1;
+        self.scale = saved_scale;
         self.page_width = saved_w;
         self.page_height = saved_h;
         self.clip = saved_clip;
@@ -605,7 +652,7 @@ impl<'a> SvgWriter<'a> {
         self.out.push_str(&stroke_attr);
         self.out.push('"');
         push_opacity(&mut self.out, "stroke-opacity", opacity);
-        push_stroke_attrs(&mut self.out, style);
+        push_stroke_attrs(&mut self.out, style, self.scale);
         let placement = self.placement_attrs();
         self.out.push_str(&placement);
         self.out.push_str("/>\n");
@@ -651,7 +698,7 @@ impl<'a> SvgWriter<'a> {
             let _ = write!(self.out, "<g mask=\"url(#m{outer})\">");
         }
         let _ = write!(self.out, "<path d=\"{d}\" fill=\"none\" stroke=\"#ffffff\"");
-        push_stroke_attrs(&mut self.out, style);
+        push_stroke_attrs(&mut self.out, style, self.scale);
         if let Some(c) = self.clip {
             let _ = write!(self.out, " clip-path=\"url(#c{c})\"");
         }
@@ -718,6 +765,7 @@ impl<'a> SvgWriter<'a> {
             kind: mask.kind,
             offset: [mask.offset.0.to_bits(), mask.offset.1.to_bits()],
             backdrop_luma: mask.backdrop_luma.to_bits(),
+            origin_scale: [self.x0.to_bits(), self.y1.to_bits(), self.scale.to_bits()],
             depth,
         };
         if let Some(&id) = self.mask_defs.get(&key) {
@@ -746,7 +794,10 @@ impl<'a> SvgWriter<'a> {
             self.out.push_str(&hex_color(&luma));
             self.out.push_str("\"/>\n");
         }
-        let (dx, dy) = (mask.offset.0 as f64, mask.offset.1 as f64);
+        let (dx, dy) = (
+            mask.offset.0 as f64 * self.scale,
+            mask.offset.1 as f64 * self.scale,
+        );
         let translated = dx != 0.0 || dy != 0.0;
         if translated {
             // Page-space translation; the Y-flip negates the vertical part.
@@ -1023,7 +1074,7 @@ impl<'a> SvgWriter<'a> {
                         let Some(d) = self.type3_path_data(path, &font_matrix, run, glyph.x) else {
                             continue;
                         };
-                        let width = (style.width as f64 * stroke_scale).max(0.05);
+                        let width = (style.width as f64 * stroke_scale * self.scale).max(0.05);
                         if !width.is_finite() {
                             continue;
                         }
@@ -1085,7 +1136,7 @@ impl<'a> SvgWriter<'a> {
         run: &GlyphRun,
         glyph_x_offset: f32,
     ) -> Option<String> {
-        let (x0, y1) = (self.x0, self.y1);
+        let (x0, y1, scale) = (self.x0, self.y1, self.scale);
         let map = |gx: f64, gy: f64| -> Option<(f64, f64)> {
             // FontMatrix → text space, scale by size (x also carries Th),
             // advance offset, then Tm/CTM, then the fixed page flip.
@@ -1096,7 +1147,7 @@ impl<'a> SvgWriter<'a> {
             let tm = &run.transform;
             let px = tm.a * tx + tm.c * ty + tm.e;
             let py = tm.b * tx + tm.d * ty + tm.f;
-            let (sx, sy) = (px - x0, y1 - py);
+            let (sx, sy) = ((px - x0) * scale, (y1 - py) * scale);
             (coord_ok(sx) && coord_ok(sy)).then_some((sx, sy))
         };
         self.path_data_with(path, map)
@@ -1152,13 +1203,14 @@ impl<'a> SvgWriter<'a> {
         let tm = transform;
         let iw = image.width as f64;
         let ih = image.height as f64;
+        let s = self.scale;
         let m = [
-            tm.a / iw,
-            -tm.b / iw,
-            -tm.c / ih,
-            tm.d / ih,
-            tm.c + tm.e - self.x0,
-            self.y1 - tm.d - tm.f,
+            tm.a * s / iw,
+            -tm.b * s / iw,
+            -tm.c * s / ih,
+            tm.d * s / ih,
+            (tm.c + tm.e - self.x0) * s,
+            (self.y1 - tm.d - tm.f) * s,
         ];
         if m.iter().any(|v| !v.is_finite() || v.abs() > MAX_COORD) {
             tracing::warn!("skipping image with corrupt transform");
@@ -1225,9 +1277,9 @@ impl<'a> SvgWriter<'a> {
     // -- path serialization --
 
     fn path_data(&mut self, path: &Path) -> Option<String> {
-        let (x0, y1) = (self.x0, self.y1);
+        let (x0, y1, scale) = (self.x0, self.y1, self.scale);
         let map = |x: f64, y: f64| -> Option<(f64, f64)> {
-            let (sx, sy) = (x - x0, y1 - y);
+            let (sx, sy) = ((x - x0) * scale, (y1 - y) * scale);
             (coord_ok(sx) && coord_ok(sy)).then_some((sx, sy))
         };
         self.path_data_with(path, map)
@@ -1367,10 +1419,10 @@ fn blend_css(mode: BlendMode) -> Option<&'static str> {
     })
 }
 
-fn push_stroke_attrs(out: &mut String, style: &StrokeStyle) {
+fn push_stroke_attrs(out: &mut String, style: &StrokeStyle, scale: f64) {
     // PDF width 0 means "thinnest device line"; SVG width 0 renders nothing.
     let width = if style.width.is_finite() && style.width > 0.0 {
-        style.width as f64
+        style.width as f64 * scale
     } else {
         0.1
     };
@@ -1402,12 +1454,12 @@ fn push_stroke_attrs(out: &mut String, style: &StrokeStyle) {
                 if i > 0 {
                     out.push(' ');
                 }
-                push_num(out, *v as f64);
+                push_num(out, *v as f64 * scale);
             }
             out.push('"');
             if dash.phase != 0.0 {
                 out.push_str(" stroke-dashoffset=\"");
-                push_num(out, dash.phase as f64);
+                push_num(out, dash.phase as f64 * scale);
                 out.push('"');
             }
         }
@@ -2150,6 +2202,95 @@ mod tests {
             svg.matches("fill=\"url(#p1)\"").count(),
             2,
             "both fills must reference the pattern def: {svg}"
+        );
+    }
+
+    #[test]
+    fn tiling_pattern_tiny_units_with_large_matrix_preserves_precision() {
+        let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 0.0004, 0.0004));
+        let mut sq = Path::new();
+        sq.rect(Rect::new(0.0001, 0.0001, 0.0003, 0.0003));
+        cell.push(RenderCommand::FillPath {
+            path: sq,
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(1.0, 0.0, 0.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let tiling = std::sync::Arc::new(zpdf_display_list::TilingPattern {
+            commands: std::sync::Arc::new(cell),
+            bbox: Rect::new(0.0, 0.0, 0.0004, 0.0004),
+            x_step: 0.0004,
+            y_step: 0.0004,
+            matrix: zpdf_core::Matrix::scale(25_000.0, 25_000.0),
+            tiling_type: 1,
+        });
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 100.0));
+        let mut r = Path::new();
+        r.rect(Rect::new(0.0, 0.0, 100.0, 100.0));
+        dl.push(RenderCommand::FillPath {
+            path: r,
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(tiling),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let svg = display_list_to_svg(
+            &dl,
+            &FontCache::new(),
+            &ImageCache::new(),
+            &SvgOptions::default(),
+        );
+        assert!(
+            svg.contains("width=\"10\" height=\"10\""),
+            "tiny pattern units scaled by 25000 must normalize to 10x10 pattern viewport: {svg}"
+        );
+        assert!(
+            svg.contains("M2.5 7.5L7.5 7.5L7.5 2.5L2.5 2.5Z"),
+            "cell geometry must preserve full coordinates instead of rounding to 0: {svg}"
+        );
+    }
+
+    #[test]
+    fn tiling_pattern_overlapping_bbox_beyond_four_steps_emits_visible_copy() {
+        let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 10.0));
+        let mut sq = Path::new();
+        sq.rect(Rect::new(90.0, 2.0, 99.0, 8.0));
+        cell.push(RenderCommand::FillPath {
+            path: sq,
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(0.0, 0.5, 1.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let tiling = std::sync::Arc::new(zpdf_display_list::TilingPattern {
+            commands: std::sync::Arc::new(cell),
+            bbox: Rect::new(0.0, 0.0, 100.0, 10.0),
+            x_step: 10.0,
+            y_step: 10.0,
+            matrix: zpdf_core::Matrix::identity(),
+            tiling_type: 1,
+        });
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 100.0));
+        let mut r = Path::new();
+        r.rect(Rect::new(0.0, 0.0, 100.0, 100.0));
+        dl.push(RenderCommand::FillPath {
+            path: r,
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(tiling),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let svg = display_list_to_svg(
+            &dl,
+            &FontCache::new(),
+            &ImageCache::new(),
+            &SvgOptions::default(),
+        );
+        // Copy di=-9 shifts [90..99] by -90 into [0..9] inside the 10x10 pattern viewport.
+        assert!(
+            svg.contains("M0 8L9 8L9 2L0 2Z"),
+            "overlapping copy di=-9 must be emitted inside the 10x10 pattern: {svg}"
         );
     }
 }

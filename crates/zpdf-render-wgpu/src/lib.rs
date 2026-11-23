@@ -421,22 +421,20 @@ impl<'a> RenderBackend for WgpuRenderer<'a> {
                 rule,
                 paint: Paint::Tiling(tiling),
                 alpha,
-                ..
+                overprint,
             } => {
-                if let Some(bounds) = path_bounds(path) {
-                    page.recorder.push_clip(path, *rule, &page.map);
-                    record_tiling_pattern(
-                        &mut page.recorder,
-                        tiling,
-                        bounds,
-                        *alpha,
-                        fonts,
-                        images,
-                        &page.map,
-                        0,
-                    );
-                    page.recorder.pop_clip();
-                }
+                record_tiling_fill(
+                    &mut page.recorder,
+                    path,
+                    *rule,
+                    tiling,
+                    *alpha,
+                    *overprint,
+                    fonts,
+                    images,
+                    &page.map,
+                    0,
+                );
             }
             RenderCommand::StrokePath {
                 path,
@@ -461,22 +459,20 @@ impl<'a> RenderBackend for WgpuRenderer<'a> {
                 style,
                 paint: Paint::Tiling(tiling),
                 alpha,
-                ..
+                overprint,
             } => {
-                if let Some(bounds) = stroke_bounds(path, style) {
-                    page.recorder.push_clip_stroke(path, style, &page.map);
-                    record_tiling_pattern(
-                        &mut page.recorder,
-                        tiling,
-                        bounds,
-                        *alpha,
-                        fonts,
-                        images,
-                        &page.map,
-                        0,
-                    );
-                    page.recorder.pop_clip();
-                }
+                record_tiling_stroke(
+                    &mut page.recorder,
+                    path,
+                    style,
+                    tiling,
+                    *alpha,
+                    *overprint,
+                    fonts,
+                    images,
+                    &page.map,
+                    0,
+                );
             }
             RenderCommand::PushClip { path, rule } => {
                 page.recorder.push_clip(path, *rule, &page.map);
@@ -1042,26 +1038,22 @@ fn record_dl_commands(
                 rule,
                 paint: Paint::Tiling(tiling),
                 alpha,
-                ..
+                overprint,
             } => {
-                if let Some(bounds) = path_bounds(path) {
-                    rec.push_clip(path, *rule, map);
-                    record_tiling_pattern(rec, tiling, bounds, *alpha, fonts, images, map, 0);
-                    rec.pop_clip();
-                }
+                record_tiling_fill(
+                    rec, path, *rule, tiling, *alpha, *overprint, fonts, images, map, 0,
+                );
             }
             RenderCommand::StrokePath {
                 path,
                 style,
                 paint: Paint::Tiling(tiling),
                 alpha,
-                ..
+                overprint,
             } => {
-                if let Some(bounds) = stroke_bounds(path, style) {
-                    rec.push_clip_stroke(path, style, map);
-                    record_tiling_pattern(rec, tiling, bounds, *alpha, fonts, images, map, 0);
-                    rec.pop_clip();
-                }
+                record_tiling_stroke(
+                    rec, path, style, tiling, *alpha, *overprint, fonts, images, map, 0,
+                );
             }
             // Non-solid paints other than tiling are rasterized upstream.
             RenderCommand::FillPath { .. } | RenderCommand::StrokePath { .. } => {}
@@ -1165,19 +1157,42 @@ fn record_tiling_pattern(
     if ![px0, py0, px1, py1].iter().all(|v| v.is_finite()) {
         return;
     }
-    let range = |lo: f64, hi: f64, cell_lo: f64, cell_hi: f64, step: f64| {
+    let bbox = tiling.bbox.normalize();
+    if ![
+        bbox.x0,
+        bbox.y0,
+        bbox.x1,
+        bbox.y1,
+        tiling.x_step,
+        tiling.y_step,
+    ]
+    .iter()
+    .all(|v| v.is_finite())
+        || tiling.x_step == 0.0
+        || tiling.y_step == 0.0
+    {
+        return;
+    }
+    // Strict positive-area overlap: tiles touching only on a shared boundary
+    // line (`lo == cell_hi + i*step` or `hi == cell_lo + i*step`) paint nothing
+    // inside `bounds` and must not inflate the tile count against MAX_GPU_TILES.
+    let range = |lo: f64, hi: f64, cell_lo: f64, cell_hi: f64, step: f64| -> (i64, i64) {
         let t0 = (lo - cell_hi) / step;
         let t1 = (hi - cell_lo) / step;
         let (a, b) = if t0 <= t1 { (t0, t1) } else { (t1, t0) };
-        (a.floor() as i64, b.ceil() as i64)
+        (
+            (a.floor() as i64).saturating_add(1),
+            (b.ceil() as i64).saturating_sub(1),
+        )
     };
-    let bbox = tiling.bbox.normalize();
     let (i0, i1) = range(px0, px1, bbox.x0, bbox.x1, tiling.x_step);
     let (j0, j1) = range(py0, py1, bbox.y0, bbox.y1, tiling.y_step);
     let nx = i1.saturating_sub(i0).saturating_add(1);
     let ny = j1.saturating_sub(j0).saturating_add(1);
     if nx <= 0 || ny <= 0 || nx.saturating_mul(ny) > MAX_GPU_TILES {
-        tracing::warn!("wgpu tiling pattern: {nx}x{ny} tiles exceeds fallback cap; skipping");
+        if nx > 0 && ny > 0 {
+            tracing::warn!("wgpu tiling pattern: {nx}x{ny} tiles exceeds fallback cap; skipping");
+        }
         return;
     }
     let wrap_alpha = alpha.is_finite() && alpha < 1.0 && rec.can_push_blend();
@@ -1305,6 +1320,11 @@ fn transform_display_list(
                 alpha: *alpha,
                 mask: mask.as_ref().map(|m| {
                     let mut mm = m.clone();
+                    let (ox, oy) = (m.offset.0 as f64, m.offset.1 as f64);
+                    mm.offset = (
+                        (ctm.a * ox + ctm.c * oy) as f32,
+                        (ctm.b * ox + ctm.d * oy) as f32,
+                    );
                     mm.commands =
                         std::sync::Arc::new(transform_display_list(&m.commands, ctm, stroke_scale));
                     mm
@@ -1315,6 +1335,72 @@ fn transform_display_list(
         out.commands.push(mapped);
     }
     out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_tiling_fill(
+    rec: &mut PageRecorder,
+    path: &zpdf_display_list::Path,
+    rule: zpdf_display_list::FillRule,
+    tiling: &zpdf_display_list::TilingPattern,
+    alpha: f32,
+    overprint: Option<zpdf_display_list::Overprint>,
+    fonts: Option<&zpdf_font::FontCache>,
+    images: Option<&zpdf_image::ImageCache>,
+    map: &PageMap,
+    depth: u8,
+) {
+    let Some(bounds) = path_bounds(path) else {
+        return;
+    };
+    match overprint {
+        Some(op) if op.active != 0 => {
+            rec.push_overprint(op);
+            rec.push_clip(path, rule, map);
+            record_tiling_pattern(rec, tiling, bounds, alpha, fonts, images, map, depth);
+            rec.pop_clip();
+            rec.pop_blend();
+        }
+        Some(_) => {}
+        None => {
+            rec.push_clip(path, rule, map);
+            record_tiling_pattern(rec, tiling, bounds, alpha, fonts, images, map, depth);
+            rec.pop_clip();
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_tiling_stroke(
+    rec: &mut PageRecorder,
+    path: &zpdf_display_list::Path,
+    style: &zpdf_display_list::StrokeStyle,
+    tiling: &zpdf_display_list::TilingPattern,
+    alpha: f32,
+    overprint: Option<zpdf_display_list::Overprint>,
+    fonts: Option<&zpdf_font::FontCache>,
+    images: Option<&zpdf_image::ImageCache>,
+    map: &PageMap,
+    depth: u8,
+) {
+    let Some(bounds) = stroke_bounds(path, style) else {
+        return;
+    };
+    match overprint {
+        Some(op) if op.active != 0 => {
+            rec.push_overprint(op);
+            rec.push_clip_stroke(path, style, map);
+            record_tiling_pattern(rec, tiling, bounds, alpha, fonts, images, map, depth);
+            rec.pop_clip();
+            rec.pop_blend();
+        }
+        Some(_) => {}
+        None => {
+            rec.push_clip_stroke(path, style, map);
+            record_tiling_pattern(rec, tiling, bounds, alpha, fonts, images, map, depth);
+            rec.pop_clip();
+        }
+    }
 }
 
 fn record_display_list_at_depth(
@@ -1336,26 +1422,22 @@ fn record_display_list_at_depth(
                 rule,
                 paint: Paint::Tiling(tiling),
                 alpha,
-                ..
+                overprint,
             } => {
-                if let Some(bounds) = path_bounds(path) {
-                    rec.push_clip(path, *rule, map);
-                    record_tiling_pattern(rec, tiling, bounds, *alpha, fonts, images, map, depth);
-                    rec.pop_clip();
-                }
+                record_tiling_fill(
+                    rec, path, *rule, tiling, *alpha, *overprint, fonts, images, map, depth,
+                );
             }
             RenderCommand::StrokePath {
                 path,
                 style,
                 paint: Paint::Tiling(tiling),
                 alpha,
-                ..
+                overprint,
             } => {
-                if let Some(bounds) = stroke_bounds(path, style) {
-                    rec.push_clip_stroke(path, style, map);
-                    record_tiling_pattern(rec, tiling, bounds, *alpha, fonts, images, map, depth);
-                    rec.pop_clip();
-                }
+                record_tiling_stroke(
+                    rec, path, style, tiling, *alpha, *overprint, fonts, images, map, depth,
+                );
             }
             other => {
                 let mut single = zpdf_display_list::DisplayList::new(dl.page_rect);
@@ -2038,6 +2120,154 @@ mod resource_tests {
             quantize_clear_color(&Color::rgba(f32::NAN, 0.5, f32::INFINITY, 1.0)),
             expect(0, 128, 255, 255)
         );
+    }
+
+    #[test]
+    fn tiling_overprint_wraps_active_and_skips_inactive() {
+        let mut cell = zpdf_display_list::DisplayList::new(Rect::new(0.0, 0.0, 10.0, 10.0));
+        let mut sq = zpdf_display_list::Path::new();
+        sq.rect(Rect::new(0.0, 0.0, 5.0, 5.0));
+        cell.push(RenderCommand::FillPath {
+            path: sq,
+            rule: zpdf_display_list::FillRule::NonZero,
+            paint: Paint::Solid(Color::black()),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let tiling = zpdf_display_list::TilingPattern {
+            commands: std::sync::Arc::new(cell),
+            bbox: Rect::new(0.0, 0.0, 10.0, 10.0),
+            x_step: 10.0,
+            y_step: 10.0,
+            matrix: zpdf_core::Matrix::identity(),
+            tiling_type: 1,
+        };
+        let mut fill_rect = zpdf_display_list::Path::new();
+        fill_rect.rect(Rect::new(0.0, 0.0, 20.0, 20.0));
+        let map = PageMap::new(Rect::new(0.0, 0.0, 20.0, 20.0), 1.0);
+
+        // Active overprint must push/pop an overprint blend around the replay.
+        let mut rec_active = PageRecorder::default();
+        let active_op = zpdf_display_list::Overprint {
+            cmyk: [0.0, 0.0, 0.0, 1.0],
+            active: zpdf_display_list::Overprint::K,
+        };
+        record_tiling_fill(
+            &mut rec_active,
+            &fill_rect,
+            zpdf_display_list::FillRule::NonZero,
+            &tiling,
+            1.0,
+            Some(active_op),
+            None,
+            None,
+            &map,
+            0,
+        );
+        assert!(rec_active.ops.iter().any(|op| matches!(
+            op,
+            PageOp::PushBlend {
+                overprint: Some(p),
+                ..
+            } if *p == active_op
+        )));
+        assert!(rec_active
+            .ops
+            .iter()
+            .any(|op| matches!(op, PageOp::PopBlend)));
+
+        // Inactive overprint (active == 0) paints no colorants -> no-op.
+        let mut rec_inactive = PageRecorder::default();
+        let inactive_op = zpdf_display_list::Overprint {
+            cmyk: [0.0; 4],
+            active: 0,
+        };
+        record_tiling_fill(
+            &mut rec_inactive,
+            &fill_rect,
+            zpdf_display_list::FillRule::NonZero,
+            &tiling,
+            1.0,
+            Some(inactive_op),
+            None,
+            None,
+            &map,
+            0,
+        );
+        assert!(rec_inactive.ops.is_empty());
+    }
+
+    #[test]
+    fn tiling_pattern_strict_overlap_excludes_boundary_only_tiles() {
+        let mut cell = zpdf_display_list::DisplayList::new(Rect::new(0.0, 0.0, 1.0, 1.0));
+        let mut sq = zpdf_display_list::Path::new();
+        sq.rect(Rect::new(0.0, 0.0, 1.0, 1.0));
+        cell.push(RenderCommand::FillPath {
+            path: sq,
+            rule: zpdf_display_list::FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(1.0, 0.0, 0.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let tiling = zpdf_display_list::TilingPattern {
+            commands: std::sync::Arc::new(cell),
+            bbox: Rect::new(0.0, 0.0, 1.0, 1.0),
+            x_step: 1.0,
+            y_step: 1.0,
+            matrix: zpdf_core::Matrix::identity(),
+            tiling_type: 1,
+        };
+        // 63×63 = 3,969 strictly overlapping tiles (<= MAX_GPU_TILES = 4,096).
+        // Inclusive floor..=ceil would count 65×65 = 4,225 and drop the pattern.
+        let mut rec = PageRecorder::default();
+        let map = PageMap::new(Rect::new(0.0, 0.0, 63.0, 63.0), 1.0);
+        record_tiling_pattern(
+            &mut rec,
+            &tiling,
+            Rect::new(0.0, 0.0, 63.0, 63.0),
+            1.0,
+            None,
+            None,
+            &map,
+            0,
+        );
+        assert!(
+            !rec.ops.is_empty(),
+            "63x63 strictly overlapping tiles must not be rejected by MAX_GPU_TILES"
+        );
+    }
+
+    #[test]
+    fn transform_display_list_applies_linear_ctm_to_soft_mask_offset() {
+        let mut dl = zpdf_display_list::DisplayList::new(Rect::new(0.0, 0.0, 10.0, 10.0));
+        let mask_dl = std::sync::Arc::new(zpdf_display_list::DisplayList::new(Rect::new(
+            0.0, 0.0, 10.0, 10.0,
+        )));
+        dl.push(RenderCommand::PushBlendGroup {
+            blend_mode: zpdf_display_list::BlendMode::Normal,
+            isolated: true,
+            knockout: false,
+            bounds: Rect::new(0.0, 0.0, 10.0, 10.0),
+            alpha: 1.0,
+            mask: Some(zpdf_display_list::SoftMask {
+                kind: zpdf_display_list::SoftMaskKind::Luminosity,
+                commands: mask_dl,
+                offset: (2.0, 3.0),
+                backdrop_luma: 0.0,
+                transfer: None,
+            }),
+        });
+        let ctm = zpdf_core::Matrix::new(0.0, 2.0, -3.0, 0.0, 100.0, 200.0);
+        let transformed = transform_display_list(&dl, &ctm, 1.0);
+        match &transformed.commands[0] {
+            RenderCommand::PushBlendGroup {
+                mask: Some(mask), ..
+            } => {
+                // Linear part of ctm applied to (2, 3): (0*2 + -3*3, 2*2 + 0*3) = (-9, 4).
+                assert_eq!(mask.offset, (-9.0, 4.0));
+            }
+            other => panic!("expected PushBlendGroup with SoftMask, got {other:?}"),
+        }
     }
 }
 

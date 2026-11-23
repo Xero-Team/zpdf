@@ -160,10 +160,11 @@ struct TilingCacheKey {
     steps: [u64; 2],
     tile_w: u32,
     tile_h: u32,
+    blend_depth: usize,
 }
 
 impl TilingCacheKey {
-    fn new(tiling: &TilingPattern, tile_w: u32, tile_h: u32) -> Self {
+    fn new(tiling: &TilingPattern, tile_w: u32, tile_h: u32, blend_depth: usize) -> Self {
         Self {
             commands: Arc::as_ptr(&tiling.commands) as *const () as usize,
             bbox: [
@@ -175,6 +176,7 @@ impl TilingCacheKey {
             steps: [tiling.x_step.to_bits(), tiling.y_step.to_bits()],
             tile_w,
             tile_h,
+            blend_depth,
         }
     }
 }
@@ -710,6 +712,10 @@ impl<'a> CpuRenderer<'a> {
     /// off-page-but-clipped content while dropping only crash-inducing extents.
     fn finish_within_limits(&self, pb: tiny_skia::PathBuilder) -> Option<tiny_skia::Path> {
         let path = pb.finish()?;
+        self.check_path_limits(path)
+    }
+
+    fn check_path_limits(&self, path: tiny_skia::Path) -> Option<tiny_skia::Path> {
         let b = path.bounds();
         let vals = [b.left(), b.top(), b.right(), b.bottom()];
         if vals.iter().any(|v| !v.is_finite()) {
@@ -727,6 +733,87 @@ impl<'a> CpuRenderer<'a> {
             return None;
         }
         Some(path)
+    }
+
+    /// Build a path in unscaled Y-down cell space (`(x - rect_x0, rect_y1 - y)`),
+    /// used when `self.scale != self.scale_y` so stroke expansion and dashing
+    /// happen in isotropic user space before applying the anisotropic scale.
+    fn build_unscaled_skia_path(&self, path: &Path) -> Option<tiny_skia::Path> {
+        let mut pb = tiny_skia::PathBuilder::new();
+        for elem in path {
+            match elem {
+                PathElement::MoveTo(p) => {
+                    pb.move_to(p.x as f32 - self.rect_x0, self.rect_y1 - p.y as f32);
+                }
+                PathElement::LineTo(p) => {
+                    pb.line_to(p.x as f32 - self.rect_x0, self.rect_y1 - p.y as f32);
+                }
+                PathElement::CurveTo(c1, c2, end) => {
+                    pb.cubic_to(
+                        c1.x as f32 - self.rect_x0,
+                        self.rect_y1 - c1.y as f32,
+                        c2.x as f32 - self.rect_x0,
+                        self.rect_y1 - c2.y as f32,
+                        end.x as f32 - self.rect_x0,
+                        self.rect_y1 - end.y as f32,
+                    );
+                }
+                PathElement::Close => pb.close(),
+            }
+        }
+        let built = pb.finish()?;
+        let b = built.bounds();
+        if ![b.left(), b.top(), b.right(), b.bottom()]
+            .iter()
+            .all(|v| v.is_finite())
+        {
+            return None;
+        }
+        Some(built)
+    }
+
+    /// Expand a positive-width stroke in unscaled user space and transform the
+    /// resulting filled outline by `(self.scale, self.scale_y)` so anisotropic
+    /// pattern-cell transforms produce exact axis-dependent stroke widths and
+    /// elliptical caps/joins without perturbing pattern paint shaders.
+    fn build_anisotropic_stroke_outline(
+        &self,
+        path: &Path,
+        style: &StrokeStyle,
+    ) -> Option<tiny_skia::Path> {
+        let unscaled = self.build_unscaled_skia_path(path)?;
+        let max_scale = self.scale.max(self.scale_y);
+        let res_scale = max_scale.clamp(0.01, 1024.0);
+        let unscaled_stroke = Self::skia_stroke(style, 1.0, 1.0 / max_scale);
+        let dashed;
+        let source = if let Some(ref dash) = unscaled_stroke.dash {
+            dashed = unscaled.dash(dash, res_scale)?;
+            &dashed
+        } else {
+            &unscaled
+        };
+        let stroked = source.stroke(&unscaled_stroke, res_scale)?;
+        let scale_xf = tiny_skia::Transform::from_scale(self.scale, self.scale_y);
+        let device = stroked.transform(scale_xf)?;
+        self.check_path_limits(device)
+    }
+
+    /// Dash a 0-width hairline in unscaled user space when `self.scale != self.scale_y`,
+    /// then transform the centerline to device space for a 1px device hairline.
+    fn build_anisotropic_hairline_path(
+        &self,
+        path: &Path,
+        style: &StrokeStyle,
+    ) -> Option<tiny_skia::Path> {
+        let Some(dash) = Self::stroke_dash(style, 1.0) else {
+            return self.build_skia_path(path);
+        };
+        let unscaled = self.build_unscaled_skia_path(path)?;
+        let res_scale = self.scale.max(self.scale_y).clamp(0.01, 1024.0);
+        let dashed = unscaled.dash(&dash, res_scale)?;
+        let scale_xf = tiny_skia::Transform::from_scale(self.scale, self.scale_y);
+        let device = dashed.transform(scale_xf)?;
+        self.check_path_limits(device)
     }
 
     /// Record that the current target surface may have been painted inside
@@ -988,7 +1075,8 @@ impl<'a> CpuRenderer<'a> {
             tiny_skia::FilterQuality::Bilinear
         };
 
-        let key = TilingCacheKey::new(tiling, tile_w, tile_h);
+        let blend_depth = self.soft_mask_depth.saturating_add(self.blend_stack.len());
+        let key = TilingCacheKey::new(tiling, tile_w, tile_h, blend_depth);
         let tile_pixmap = if let Some((_, cached)) = self.tiling_cache.get(&key) {
             Arc::clone(cached)
         } else {
@@ -1008,23 +1096,16 @@ impl<'a> CpuRenderer<'a> {
                 return None;
             }
 
-            // When `/BBox` exceeds `|XStep|` or `|YStep|`, draw the neighbor
-            // copies whose bbox overlaps the fundamental period so wrap-around
-            // overlap stays seamless (capped to 4×4 draws for adversarial steps).
-            let overlap_range = |span: f64, step: f64| -> std::ops::RangeInclusive<i32> {
-                let abs_s = step.abs();
-                if span <= abs_s + 1e-6 {
-                    return 0..=0;
-                }
-                let extra = ((span / abs_s).ceil() as i32 - 1).clamp(0, 3);
-                if step > 0.0 {
-                    -extra..=0
-                } else {
-                    0..=extra
-                }
-            };
-            let di_range = overlap_range(bw, x_step);
-            let dj_range = overlap_range(bh, y_step);
+            // When `/BBox` exceeds `|XStep|` or `|YStep|`, draw every neighbor
+            // copy whose painted ink overlaps the fundamental period so
+            // wrap-around overlap stays seamless.
+            let overlap = tiling.overlap_copy_ranges();
+            if overlap.truncated {
+                tracing::warn!(
+                    "tiling pattern overlapping cell copies exceed {}; clamping",
+                    zpdf_display_list::MAX_TILING_OVERLAP_COPIES
+                );
+            }
 
             let mut sub = CpuRenderer {
                 pixmap: Some(target),
@@ -1059,7 +1140,7 @@ impl<'a> CpuRenderer<'a> {
                 over_budget: self.over_budget,
                 soft_mask_planes: HashMap::new(),
                 soft_mask_cache_bytes: 0,
-                soft_mask_depth: self.soft_mask_depth.saturating_add(self.blend_stack.len()),
+                soft_mask_depth: blend_depth,
                 tiling_cache: HashMap::new(),
                 tiling_cache_bytes: 0,
                 tiling_depth: self.tiling_depth.saturating_add(1),
@@ -1073,10 +1154,16 @@ impl<'a> CpuRenderer<'a> {
                 page_start: None,
             };
 
-            for dj in dj_range {
-                for di in di_range.clone() {
+            for dj in overlap.dj.clone() {
+                for di in overlap.di.clone() {
                     if sub.over_budget {
                         break;
+                    }
+                    // Soft-mask planes are rasterized in `sub`'s device coordinates
+                    // (`rect_x0`, `rect_y1`); invalidate before shifting the origin.
+                    if !sub.soft_mask_planes.is_empty() {
+                        sub.soft_mask_planes.clear();
+                        sub.soft_mask_cache_bytes = 0;
                     }
                     sub.rect_x0 = (bx0 - di as f64 * x_step) as f32;
                     sub.rect_y0 = (by0 - dj as f64 * y_step) as f32;
@@ -1172,13 +1259,35 @@ impl<'a> CpuRenderer<'a> {
         let Some(skia_path) = self.build_skia_path(path) else {
             return self.tock(t, |s| &mut s.stroke_ns);
         };
-        let stroke = self.build_skia_stroke(style);
+        let anisotropic = self.scale != self.scale_y;
+        let stroke = if anisotropic {
+            // Conservative upper-bound stroke width for reachability culling.
+            Self::skia_stroke(style, self.scale.max(self.scale_y), 1.0)
+        } else {
+            self.build_skia_stroke(style)
+        };
         // The *centerline's* bounds say nothing about how far the ink reaches:
         // joins, caps and miters all extend past it.
         let grow = stroke_overshoot(stroke.width, stroke.miter_limit);
         if !self.reaches_target(skia_path.bounds(), grow) {
             return self.tock(t, |s| &mut s.stroke_ns);
         }
+        let anisotropic_outline = if anisotropic && style.width.is_finite() && style.width > 0.0 {
+            let Some(outline) = self.build_anisotropic_stroke_outline(path, style) else {
+                return self.tock(t, |s| &mut s.stroke_ns);
+            };
+            Some(outline)
+        } else {
+            None
+        };
+        let anisotropic_hairline = if anisotropic && anisotropic_outline.is_none() {
+            let Some(hairline) = self.build_anisotropic_hairline_path(path, style) else {
+                return self.tock(t, |s| &mut s.stroke_ns);
+            };
+            Some(hairline)
+        } else {
+            None
+        };
         let tile_guard: Arc<tiny_skia::Pixmap>;
         let paint = match paint_spec {
             Paint::Solid(c) => Self::color_to_paint(c, alpha),
@@ -1205,17 +1314,41 @@ impl<'a> CpuRenderer<'a> {
         };
         let mut painted = false;
         if let Some(ref mut pixmap) = self.pixmap {
-            pixmap.stroke_path(
-                &skia_path,
-                &paint,
-                &stroke,
-                tiny_skia::Transform::identity(),
-                self.current_clip.as_ref(),
-            );
+            if let Some(ref outline) = anisotropic_outline {
+                pixmap.fill_path(
+                    outline,
+                    &paint,
+                    tiny_skia::FillRule::Winding,
+                    tiny_skia::Transform::identity(),
+                    self.current_clip.as_ref(),
+                );
+            } else if let Some(ref hairline) = anisotropic_hairline {
+                let mut hairline_stroke = Self::skia_stroke(style, 1.0, 1.0);
+                hairline_stroke.dash = None;
+                pixmap.stroke_path(
+                    hairline,
+                    &paint,
+                    &hairline_stroke,
+                    tiny_skia::Transform::identity(),
+                    self.current_clip.as_ref(),
+                );
+            } else {
+                pixmap.stroke_path(
+                    &skia_path,
+                    &paint,
+                    &stroke,
+                    tiny_skia::Transform::identity(),
+                    self.current_clip.as_ref(),
+                );
+            }
             painted = true;
         }
         if painted {
-            self.mark_painted(skia_path.bounds(), grow);
+            if let Some(ref outline) = anisotropic_outline {
+                self.mark_painted(outline.bounds(), 1.0);
+            } else {
+                self.mark_painted(skia_path.bounds(), grow);
+            }
         }
         self.tock(t, |s| &mut s.stroke_ns);
         self.count(painted as u64, |s| &mut s.strokes);
@@ -1562,11 +1695,38 @@ impl<'a> CpuRenderer<'a> {
             self.clip_stack.push(ClipFrame::Skipped);
             return;
         };
-        let stroke = self.build_skia_stroke(style);
+        let anisotropic = self.scale != self.scale_y;
+        let anisotropic_outline = if anisotropic && style.width.is_finite() && style.width > 0.0 {
+            let Some(outline) = self.build_anisotropic_stroke_outline(path, style) else {
+                self.clip_stack.push(ClipFrame::Skipped);
+                return;
+            };
+            Some(outline)
+        } else {
+            None
+        };
+        let anisotropic_hairline = if anisotropic && anisotropic_outline.is_none() {
+            let Some(hairline) = self.build_anisotropic_hairline_path(path, style) else {
+                self.clip_stack.push(ClipFrame::Skipped);
+                return;
+            };
+            Some(hairline)
+        } else {
+            None
+        };
+        let stroke = if anisotropic {
+            Self::skia_stroke(style, self.scale.max(self.scale_y), 1.0)
+        } else {
+            self.build_skia_stroke(style)
+        };
         // Where the stroked outline can reach: the centerline bbox says nothing
         // about joins, caps and miters (see `stroke_overshoot`).
-        let grow = stroke_overshoot(stroke.width, stroke.miter_limit);
-        let extent = Self::drawn_extent(skia_path.bounds(), grow, pw, ph);
+        let extent = if let Some(ref outline) = anisotropic_outline {
+            Self::drawn_extent(outline.bounds(), 1.0, pw, ph)
+        } else {
+            let grow = stroke_overshoot(stroke.width, stroke.miter_limit);
+            Self::drawn_extent(skia_path.bounds(), grow, pw, ph)
+        };
         let scratch_bytes = pw as u64 * ph as u64 * 4;
         if !self
             .surface_pool
@@ -1591,13 +1751,33 @@ impl<'a> CpuRenderer<'a> {
         let mut paint = tiny_skia::Paint::default();
         paint.set_color(tiny_skia::Color::WHITE);
         paint.anti_alias = true;
-        scratch.stroke_path(
-            &skia_path,
-            &paint,
-            &stroke,
-            tiny_skia::Transform::identity(),
-            None,
-        );
+        if let Some(ref outline) = anisotropic_outline {
+            scratch.fill_path(
+                outline,
+                &paint,
+                tiny_skia::FillRule::Winding,
+                tiny_skia::Transform::identity(),
+                None,
+            );
+        } else if let Some(ref hairline) = anisotropic_hairline {
+            let mut hairline_stroke = Self::skia_stroke(style, 1.0, 1.0);
+            hairline_stroke.dash = None;
+            scratch.stroke_path(
+                hairline,
+                &paint,
+                &hairline_stroke,
+                tiny_skia::Transform::identity(),
+                None,
+            );
+        } else {
+            scratch.stroke_path(
+                &skia_path,
+                &paint,
+                &stroke,
+                tiny_skia::Transform::identity(),
+                None,
+            );
+        }
 
         // Lift the stroke's coverage into the mask, intersected with the
         // active clip, over the stroke's extent. Outside it the stroke covers
