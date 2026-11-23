@@ -193,37 +193,20 @@ impl PixelLimits {
         }
     }
 
-    /// Charge before allocation or pixel loops, even if decoding later fails.
-    fn charge_region(&mut self, width: usize, height: usize) -> Result<()> {
-        self.region_work = self.region_work.saturating_add(
-            (width as u64)
-                .saturating_mul(height as u64)
-                .saturating_add(height as u64),
-        );
+    /// Charge cumulative pixel work before allocation or traversal loops, even
+    /// if decoding later fails.
+    fn charge_region_work(&mut self, work: u64) -> Result<()> {
+        self.region_work = self.region_work.saturating_add(work);
         self.check_region_work()
     }
 
-    /// Charge halftone full-grid traversal — optional `HSKIP` construction,
-    /// `hbpp` grayscale bitplane scans (decode + Gray-code combine), and final
-    /// grid placement — or the output region area if larger, before allocating
-    /// the skip bitmap.
-    fn charge_halftone_grid(
-        &mut self,
-        hgw: usize,
-        hgh: usize,
-        hbpp: usize,
-        enable_skip: bool,
-        region_width: usize,
-        region_height: usize,
-    ) -> Result<()> {
-        let grid_cells = (hgw as u64).saturating_mul(hgh as u64);
-        let grid_passes = u64::from(enable_skip)
-            .saturating_add(hbpp as u64)
-            .saturating_add(1);
-        let grid_work = grid_cells.saturating_mul(grid_passes);
-        let region_area = (region_width as u64).saturating_mul(region_height as u64);
-        self.region_work = self.region_work.saturating_add(grid_work.max(region_area));
-        self.check_region_work()
+    /// Charge before allocation or pixel loops, even if decoding later fails.
+    fn charge_region(&mut self, width: usize, height: usize) -> Result<()> {
+        self.charge_region_work(
+            (width as u64)
+                .saturating_mul(height as u64)
+                .saturating_add(height as u64),
+        )
     }
 
     fn check_region_work(&self) -> Result<()> {
@@ -3333,11 +3316,16 @@ impl<'a> Decoder<'a> {
         if !enable_skip && !mmr && grid_cells.saturating_mul(hbpp) > budget {
             return Err(err("halftone grid exceeds the MQ iteration budget"));
         }
-        // Charge cumulative full-grid traversal (optional HSKIP build, per-plane
-        // scans, and placement) before allocating `skip`, `bm`, or `gray`, so
-        // repeated heavily clipped halftone segments cannot bypass budgets.
-        self.pixels
-            .charge_halftone_grid(hgw, hgh, hbpp, enable_skip, info.width, info.height)?;
+        // Charge only the skip-map grid scan before allocating `skip`, keeping
+        // the output/bitplane/placement charge after the post-skip MQ check so
+        // a rejected skip-enabled region pays only for the skip scan that ran.
+        let grid_cells_u64 = grid_cells as u64;
+        let skip_charge = if enable_skip {
+            self.pixels.charge_region_work(grid_cells_u64)?;
+            grid_cells_u64
+        } else {
+            0
+        };
         // Optional skip bitmap (T.88 6.6.5.1): a cell is skipped when its
         // pattern would fall entirely outside the region.
         let (skip, coded_cells) = if enable_skip {
@@ -3363,10 +3351,27 @@ impl<'a> Decoder<'a> {
         };
 
         // Arithmetic bitplanes cost one MQ decode per coded (unskipped) cell
-        // per plane, all off one budget: reject before allocating output/gray.
+        // per plane, all off one budget: reject before charging or allocating
+        // the output bitmap and grayscale bitplanes.
         if enable_skip && !mmr && coded_cells.saturating_mul(hbpp) > budget {
             return Err(err("halftone grid exceeds the MQ iteration budget"));
         }
+
+        // Charge the remaining output/bitplane/placement work before
+        // allocating `bm` or `gray`.
+        let decode_grid_work = if !mmr && coded_cells == 0 {
+            skip_charge
+        } else {
+            let grid_passes = u64::from(enable_skip)
+                .saturating_add(hbpp as u64)
+                .saturating_add(1);
+            grid_cells_u64.saturating_mul(grid_passes)
+        };
+        let region_area = (info.width as u64).saturating_mul(info.height as u64);
+        let remaining_work = decode_grid_work
+            .max(region_area)
+            .saturating_sub(skip_charge);
+        self.pixels.charge_region_work(remaining_work)?;
 
         let mut bm = Bitmap::new(info.width, info.height, def_pixel)?;
         self.pixels.cover(bm.data.len());
@@ -5853,8 +5858,8 @@ mod tests {
         assert!(err.to_string().contains("pixel-work budget"), "{err}");
         assert_eq!(
             dec.pixels.region_work,
-            2 * single_charge,
-            "repeated scans must halt immediately on the second segment"
+            single_charge + (hgw * hgh) as u64,
+            "repeated scans must halt on the second segment's skip-map charge before allocating HSKIP"
         );
 
         // Through the public `decode()` entry point (`region_work_limit = 2 * max_image_pixels`),
@@ -5973,6 +5978,101 @@ mod tests {
         assert_eq!(
             out,
             decode_test(&want, &Jbig2Params { globals: None }).unwrap()
+        );
+    }
+
+    /// With `ENABLE_SKIP = 1`, a region rejected by the post-skip MQ budget
+    /// check only built the skip map: it must charge the skip scan (`hgw*hgh`)
+    /// without debiting the unallocated output area or bitplanes, so repeated
+    /// rejected small-grid / large-region halftones still isolate a following
+    /// valid region while many repeated skip scans still exhaust the shared
+    /// `region_work` allowance.
+    #[test]
+    fn halftone_skip_mq_rejection_charges_only_skip_scan() {
+        let p0 = bitmap_from(&["..", ".."]);
+        let p1 = bitmap_from(&["#.", ".."]);
+        let p2 = bitmap_from(&["#.", ".#"]);
+        let p3 = bitmap_from(&["##", "##"]);
+        let pd = pattern_dict_payload(&[&p0, &p1, &p2, &p3]);
+
+        // Output area = 128x128 = 16,384 (equals `max_pixels`), while the grid
+        // is only 64x32 = 2,048 cells (all visible inside 128x128 at HRX=2.0).
+        // With hbpp = 2 and empty MQ payload (budget = 1,024), coded_cells*hbpp
+        // = 4,096 > 1,024 fails the post-skip MQ check.
+        let grid_cells = 64u64 * 32;
+        let max_pixels = 128u64 * 128; // region_work_limit = 32,768 = 16 * 2,048
+        let mut rejected_ht = region_info(128, 128, 0, 0, 0);
+        rejected_ht.push(0x08); // MMR=0, template=0, ENABLE_SKIP=1, OR, def_pixel=0
+        rejected_ht.extend_from_slice(&64u32.to_be_bytes()); // HGW
+        rejected_ht.extend_from_slice(&32u32.to_be_bytes()); // HGH
+        rejected_ht.extend_from_slice(&0u32.to_be_bytes()); // HGX
+        rejected_ht.extend_from_slice(&0u32.to_be_bytes()); // HGY
+        rejected_ht.extend_from_slice(&(2u16 << 8).to_be_bytes()); // HRX = 2.0
+        rejected_ht.extend_from_slice(&0u16.to_be_bytes()); // HRY = 0
+
+        // Two rejected skip-enabled regions charge exactly 2 * 2,048 = 4,096
+        // (skip scans only, NOT 2 * 16,384 = 32,768 output area).
+        let mut two_rejected = segment(0, 48, &[], 1, &page_info_payload(128, 128, 0));
+        two_rejected.extend_from_slice(&segment(1, 16, &[], 1, &pd));
+        two_rejected.extend_from_slice(&segment(2, 22, &[1], 1, &rejected_ht));
+        two_rejected.extend_from_slice(&segment(3, 22, &[1], 1, &rejected_ht));
+        let mut budget = DecodeBudget::new(u64::MAX);
+        let mut dec = Decoder::new(&mut budget, max_pixels);
+        dec.process_segments(&two_rejected).unwrap();
+        assert_eq!(
+            dec.pixels.region_work,
+            2 * grid_cells,
+            "rejected skip-enabled halftones must charge only their skip scans"
+        );
+
+        // Following valid 32x32 generic region renders cleanly instead of
+        // failing with cumulative budget exhaustion.
+        let valid_bm = checker_bitmap(32, 32);
+        let mut with_valid = two_rejected;
+        with_valid.extend_from_slice(&segment(
+            4,
+            38,
+            &[],
+            1,
+            &generic_region_payload(&valid_bm, 0, false),
+        ));
+        let mut budget = DecodeBudget::new(u64::MAX);
+        let out = decode(
+            &with_valid,
+            &Jbig2Params { globals: None },
+            max_pixels,
+            &mut budget,
+        )
+        .expect("two rejected skip-enabled halftones must leave budget for a valid region");
+        let mut want = segment(0, 48, &[], 1, &page_info_payload(128, 128, 0));
+        want.extend_from_slice(&segment(
+            1,
+            38,
+            &[],
+            1,
+            &generic_region_payload(&valid_bm, 0, false),
+        ));
+        assert_eq!(
+            out,
+            decode_test(&want, &Jbig2Params { globals: None }).unwrap()
+        );
+
+        // Skip scans still count cumulatively: 16 * 2,048 == 32,768 fits, while
+        // the 17th halts immediately on cumulative pixel-work budget exhaustion
+        // without scanning segments 18..30.
+        let mut many_rejected = segment(0, 48, &[], 1, &page_info_payload(128, 128, 0));
+        many_rejected.extend_from_slice(&segment(1, 16, &[], 1, &pd));
+        for seg_num in 2..32u32 {
+            many_rejected.extend_from_slice(&segment(seg_num, 22, &[1], 1, &rejected_ht));
+        }
+        let mut budget = DecodeBudget::new(u64::MAX);
+        let mut dec = Decoder::new(&mut budget, max_pixels);
+        let err = dec.process_segments(&many_rejected).unwrap_err();
+        assert!(err.to_string().contains("pixel-work budget"), "{err}");
+        assert_eq!(
+            dec.pixels.region_work,
+            17 * grid_cells,
+            "repeated rejected skip scans must still count and halt at segment 17"
         );
     }
 
