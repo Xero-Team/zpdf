@@ -251,6 +251,7 @@ const MAX_TILING_IMAGE_DEPTH: u8 = 8;
 const MAX_TILING_IMAGE_PLACEMENTS: usize = 4096;
 const MAX_TILING_IMAGE_VISITS: usize = 4096;
 const MAX_TILING_IMAGE_SCAN_COMMANDS: usize = 65_536;
+const MAX_TILING_IMAGE_REPLAY_COMMANDS: usize = 65_536;
 
 struct ImageCollector<'a> {
     cache: &'a mut ImageCache,
@@ -259,6 +260,7 @@ struct ImageCollector<'a> {
     remaining_tiling_placements: usize,
     remaining_tiling_visits: usize,
     remaining_image_scan_cmds: usize,
+    remaining_tiling_replay_cmds: usize,
     image_scan_exhausted: bool,
     /// Memoized `dl_contains_images` results keyed by `(Arc::as_ptr, depth)`
     /// so shared image-free child cells in a nested DAG are scanned at most
@@ -459,6 +461,12 @@ fn collect_tiling_images(
     depth: u8,
     collector: &mut ImageCollector<'_>,
 ) {
+    let Some(clip_rect) = clip else {
+        return;
+    };
+    let Some(bounds) = intersect_rect(shape_page_bounds, clip_rect) else {
+        return;
+    };
     if !dl_contains_images(&tiling.commands, depth + 1, collector) {
         return;
     }
@@ -466,12 +474,6 @@ fn collect_tiling_images(
         collector.truncated = true;
         return;
     }
-    let Some(clip_rect) = clip else {
-        return;
-    };
-    let Some(bounds) = intersect_rect(shape_page_bounds, clip_rect) else {
-        return;
-    };
     let pat_to_page = ctm.concat(&tiling.matrix);
     let Some(from_page) = pat_to_page.inverse() else {
         return;
@@ -526,7 +528,9 @@ fn collect_tiling_images(
 
     'tiles: for j in j0..=j1 {
         for i in i0..=i1 {
-            if collector.remaining_tiling_placements == 0 || collector.remaining_tiling_visits == 0
+            if collector.remaining_tiling_placements == 0
+                || collector.remaining_tiling_visits == 0
+                || collector.remaining_tiling_replay_cmds == 0
             {
                 collector.truncated = true;
                 break 'tiles;
@@ -564,6 +568,13 @@ fn collect_images_recursive(
     let mut clip_stack: Vec<Option<Rect>> = vec![initial_clip];
 
     for command in commands {
+        if depth > 0 {
+            if collector.remaining_tiling_replay_cmds == 0 {
+                collector.truncated = true;
+                break;
+            }
+            collector.remaining_tiling_replay_cmds -= 1;
+        }
         let active_clip = *clip_stack.last().unwrap_or(&initial_clip);
         match command {
             RenderCommand::PushClip { path, .. } => {
@@ -702,6 +713,7 @@ fn take_display_list_images(
         remaining_tiling_placements: MAX_TILING_IMAGE_PLACEMENTS,
         remaining_tiling_visits: MAX_TILING_IMAGE_VISITS,
         remaining_image_scan_cmds: MAX_TILING_IMAGE_SCAN_COMMANDS,
+        remaining_tiling_replay_cmds: MAX_TILING_IMAGE_REPLAY_COMMANDS,
         image_scan_exhausted: false,
         tiling_has_images: HashMap::new(),
         truncated: false,
@@ -824,6 +836,7 @@ mod tiling_image_scan_tests {
             remaining_tiling_placements: MAX_TILING_IMAGE_PLACEMENTS,
             remaining_tiling_visits: MAX_TILING_IMAGE_VISITS,
             remaining_image_scan_cmds: 10,
+            remaining_tiling_replay_cmds: MAX_TILING_IMAGE_REPLAY_COMMANDS,
             image_scan_exhausted: false,
             tiling_has_images: HashMap::new(),
             truncated: false,
@@ -880,6 +893,7 @@ mod tiling_image_scan_tests {
             remaining_tiling_visits: MAX_TILING_IMAGE_VISITS,
             // Exactly enough to visit parent[0] and child[0], leaving 0 for parent[1].
             remaining_image_scan_cmds: 2,
+            remaining_tiling_replay_cmds: MAX_TILING_IMAGE_REPLAY_COMMANDS,
             image_scan_exhausted: false,
             tiling_has_images: HashMap::new(),
             truncated: false,
@@ -888,6 +902,133 @@ mod tiling_image_scan_tests {
         assert!(
             collector.truncated,
             "trailing sibling command after exact child budget consumption must flag truncation"
+        );
+    }
+
+    #[test]
+    fn clipped_out_tiling_skips_image_presence_scan() {
+        let mut cell_dl = DisplayList::new(Rect::new(0.0, 0.0, 10.0, 10.0));
+        let mut sq = Path::new();
+        sq.rect(Rect::new(0.0, 0.0, 1.0, 1.0));
+        for _ in 0..500 {
+            cell_dl.push(RenderCommand::FillPath {
+                path: sq.clone(),
+                rule: FillRule::NonZero,
+                paint: Paint::Solid(Color::black()),
+                alpha: 1.0,
+                overprint: None,
+            });
+        }
+        let tiling = Arc::new(TilingPattern {
+            commands: Arc::new(cell_dl),
+            bbox: Rect::new(0.0, 0.0, 10.0, 10.0),
+            x_step: 10.0,
+            y_step: 10.0,
+            matrix: Matrix::identity(),
+            tiling_type: 1,
+        });
+        let mut cache = ImageCache::new();
+        let mut collector = ImageCollector {
+            cache: &mut cache,
+            images: Vec::new(),
+            positions: HashMap::new(),
+            remaining_tiling_placements: MAX_TILING_IMAGE_PLACEMENTS,
+            remaining_tiling_visits: MAX_TILING_IMAGE_VISITS,
+            remaining_image_scan_cmds: 100,
+            remaining_tiling_replay_cmds: MAX_TILING_IMAGE_REPLAY_COMMANDS,
+            image_scan_exhausted: false,
+            tiling_has_images: HashMap::new(),
+            truncated: false,
+        };
+        // Shape [200..300] is disjoint from clip [0..100].
+        collect_tiling_images(
+            &tiling,
+            Rect::new(200.0, 200.0, 300.0, 300.0),
+            &Matrix::identity(),
+            Some(Rect::new(0.0, 0.0, 100.0, 100.0)),
+            1.0,
+            0,
+            &mut collector,
+        );
+        assert_eq!(
+            collector.remaining_image_scan_cmds, 100,
+            "disjoint clip must skip dl_contains_images without spending scan budget"
+        );
+        assert!(!collector.truncated);
+    }
+
+    #[test]
+    fn dense_large_cell_tile_replay_is_bounded_and_preserves_later_page_images() {
+        let mut cache = ImageCache::new();
+        let make_img = |r: u8| zpdf_image::DecodedImage {
+            width: 1,
+            height: 1,
+            data: vec![r, 0, 0, 255],
+            has_alpha: false,
+            is_image_mask: false,
+            premultiplied: false,
+        };
+        let cell_img_id = cache.insert(make_img(255));
+        let page_img_id = cache.insert(make_img(42));
+
+        // Cell with 30,000 ordinary fills + 1 image draw.
+        let mut cell_dl = DisplayList::new(Rect::new(0.0, 0.0, 2.0, 2.0));
+        let mut sq = Path::new();
+        sq.rect(Rect::new(0.0, 0.0, 1.0, 1.0));
+        for _ in 0..30_000 {
+            cell_dl.push(RenderCommand::FillPath {
+                path: sq.clone(),
+                rule: FillRule::NonZero,
+                paint: Paint::Solid(Color::black()),
+                alpha: 1.0,
+                overprint: None,
+            });
+        }
+        cell_dl.push(RenderCommand::DrawImage(zpdf_display_list::ImageDraw {
+            image_id: cell_img_id,
+            transform: Matrix::scale(1.0, 1.0),
+            alpha: 1.0,
+            is_image_mask: false,
+        }));
+        let tiling = Arc::new(TilingPattern {
+            commands: Arc::new(cell_dl),
+            bbox: Rect::new(0.0, 0.0, 2.0, 2.0),
+            x_step: 2.0,
+            y_step: 2.0,
+            matrix: Matrix::identity(),
+            tiling_type: 1,
+        });
+
+        // 64×64 = 4,096 tiles (fits inside MAX_TILING_IMAGE_VISITS), followed by
+        // a direct page image that must still be extracted after tiled replay caps out.
+        let mut page_dl = DisplayList::new(Rect::new(0.0, 0.0, 128.0, 128.0));
+        let mut fill = Path::new();
+        fill.rect(Rect::new(0.0, 0.0, 128.0, 128.0));
+        page_dl.push(RenderCommand::FillPath {
+            path: fill,
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(tiling),
+            alpha: 1.0,
+            overprint: None,
+        });
+        page_dl.push(RenderCommand::DrawImage(zpdf_display_list::ImageDraw {
+            image_id: page_img_id,
+            transform: Matrix::new(10.0, 0.0, 0.0, 10.0, 50.0, 50.0),
+            alpha: 1.0,
+            is_image_mask: false,
+        }));
+
+        let mut diagnostics = zpdf_core::ProcessingDiagnostics::default();
+        let images = take_display_list_images(&page_dl, &mut cache, &mut diagnostics);
+        assert!(
+            diagnostics.resource_limit_reached,
+            "exhausting nested tile-replay command budget must report resource_limit_reached"
+        );
+        assert!(
+            images
+                .iter()
+                .any(|img| img.image.data.first().copied() == Some(42)),
+            "later direct page images must still be extracted after tiled replay stops"
         );
     }
 }

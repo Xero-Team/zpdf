@@ -1511,3 +1511,49 @@ fn dense_nested_multiply_tiling_pattern_above_4096_tiles_preserves_backdrop() {
         "dense nested magenta Multiply stroke over blue stays blue",
     );
 }
+
+/// Regression: when overlapping tiles mix `Normal` and `Multiply` marks
+/// (`XStep = 4`, Normal red at `x = 0.5..2.0`, Multiply cyan at `x = 4.5..6.0`),
+/// at period offset `x = 1.0` the previous copy paints Multiply cyan *before*
+/// the current copy paints Normal red, leaving red — both below and above the
+/// 4,096 tile cap (applying all Normal copies before all Multiply copies would
+/// turn the pixel black).
+#[test]
+fn overlapping_mixed_normal_and_multiply_preserves_copy_order_above_cap() {
+    let gs_norm = b"<< /Type /ExtGState /BM /Normal >>".to_vec();
+    let gs_mul = b"<< /Type /ExtGState /BM /Multiply >>".to_vec();
+    let cell = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 8 4] /XStep 4 /YStep 4 \
+         /Resources << /ExtGState << /GN 6 0 R /GM 7 0 R >> >>",
+        b"/GN gs 1 0 0 rg 0.5 0 1.5 4 re f\n/GM gs 0 1 1 rg 4.5 0 1.5 4 re f",
+    );
+    // Left fill [0..40]×[0..40] = 10×10 = 100 tiles (below cap).
+    // Right fill [60..320]×[0..260] = 65×65 = 4,225 tiles (above cap).
+    let content = stream_obj("", b"/Pattern cs /P0 scn 0 0 40 40 re f\n60 0 260 260 re f");
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 320 260] /Contents 4 0 R \
+          /Resources << /Pattern << /P0 5 0 R >> >> >>"
+            .to_vec(), // 3
+        content,                                       // 4
+        cell,                                          // 5
+        gs_norm,                                       // 6
+        gs_mul,                                        // 7
+    ]);
+    let (_dl, _stats, page) = render_with_stats(pdf, 2.0);
+
+    // At period offset x = 1.25 (inside x = 0.5..2.0 of current copy and x = 4.5..6.0
+    // of previous copy), both below cap (x = 21.25) and above cap (x = 181.25) must be RED.
+    assert_rgbish(
+        px_on(&page, 260.0, 2.0, 21.25, 22.0),
+        [255, 0, 0],
+        "below-cap overlapping Normal-over-Multiply copy order must yield red",
+    );
+    assert_rgbish(
+        px_on(&page, 260.0, 2.0, 181.25, 130.0),
+        [255, 0, 0],
+        "above-cap overlapping Normal-over-Multiply copy order must yield red (not black)",
+    );
+}

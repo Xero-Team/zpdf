@@ -478,8 +478,7 @@ impl TilingPattern {
         memo: &mut std::collections::HashMap<(usize, u8), bool>,
     ) -> Option<Vec<TilingBlendSegment>> {
         const MAX_SEGMENTS: usize = 64;
-        const MAX_NESTING_DEPTH: u8 = 8;
-        if depth > MAX_NESTING_DEPTH {
+        if depth > MAX_TILING_BACKDROP_SCAN_DEPTH {
             return None;
         }
         let cmds = &self.commands.commands;
@@ -799,13 +798,19 @@ fn find_matching_pop_blend(cmds: &[RenderCommand], push_idx: usize) -> Option<us
     None
 }
 
+/// Matches the interpreter's tiling/form nesting depth cap (`MAX_FORM_DEPTH = 16`).
+/// Subtrees nested beyond this depth are conservatively classified as
+/// backdrop-dependent so uninspected subtrees are never treated as proven
+/// backdrop-independent.
+const MAX_TILING_BACKDROP_SCAN_DEPTH: u8 = 16;
+
 fn dl_is_backdrop_dependent_memo(
     dl: &std::sync::Arc<DisplayList>,
     depth: u8,
     memo: &mut std::collections::HashMap<(usize, u8), bool>,
 ) -> bool {
-    if depth > 8 {
-        return false;
+    if depth > MAX_TILING_BACKDROP_SCAN_DEPTH {
+        return true;
     }
     let key = (std::sync::Arc::as_ptr(dl) as *const () as usize, depth);
     if let Some(&cached) = memo.get(&key) {
@@ -821,8 +826,8 @@ fn slice_is_backdrop_dependent_memo(
     depth: u8,
     memo: &mut std::collections::HashMap<(usize, u8), bool>,
 ) -> bool {
-    if depth > 8 {
-        return false;
+    if depth > MAX_TILING_BACKDROP_SCAN_DEPTH {
+        return true;
     }
     let mut isolated_depth = 0usize;
     for cmd in cmds {
@@ -1270,8 +1275,8 @@ mod tiling_backdrop_tests {
 
     #[test]
     fn is_backdrop_dependent_memoizes_shared_dag_without_exponential_blowup() {
-        // 8-level diamond DAG where each level paints 16 references to the same
-        // child Arc<DisplayList> (16^8 = 4.3 billion naive paths), all Normal.
+        // 16-level diamond DAG where each level paints 16 references to the same
+        // child Arc<DisplayList> (16^16 naive paths), all Normal.
         let mut child_arc = Arc::new(DisplayList::new(Rect::new(0.0, 0.0, 10.0, 10.0)));
         Arc::make_mut(&mut child_arc).push(RenderCommand::FillPath {
             path: rect_path(0.0, 0.0, 10.0, 10.0),
@@ -1280,7 +1285,7 @@ mod tiling_backdrop_tests {
             alpha: 1.0,
             overprint: None,
         });
-        for _ in 0..8 {
+        for _ in 0..16 {
             let child = Arc::new(TilingPattern {
                 commands: Arc::clone(&child_arc),
                 bbox: Rect::new(0.0, 0.0, 10.0, 10.0),
@@ -1310,6 +1315,116 @@ mod tiling_backdrop_tests {
             tiling_type: 1,
         };
         assert!(!root.is_backdrop_dependent());
+    }
+
+    #[test]
+    fn is_backdrop_dependent_detects_multiply_at_depth_nine() {
+        let mut child_arc = Arc::new(DisplayList::new(Rect::new(0.0, 0.0, 10.0, 10.0)));
+        {
+            let dl = Arc::make_mut(&mut child_arc);
+            dl.push(RenderCommand::PushBlendGroup {
+                blend_mode: BlendMode::Multiply,
+                isolated: true,
+                knockout: false,
+                bounds: Rect::new(0.0, 0.0, 10.0, 10.0),
+                alpha: 1.0,
+                mask: None,
+            });
+            dl.push(RenderCommand::FillPath {
+                path: rect_path(0.0, 0.0, 10.0, 10.0),
+                rule: FillRule::NonZero,
+                paint: Paint::Solid(Color::white()),
+                alpha: 1.0,
+                overprint: None,
+            });
+            dl.push(RenderCommand::PopBlendGroup);
+        }
+        for _ in 0..9 {
+            let child = Arc::new(TilingPattern {
+                commands: Arc::clone(&child_arc),
+                bbox: Rect::new(0.0, 0.0, 10.0, 10.0),
+                x_step: 10.0,
+                y_step: 10.0,
+                matrix: Matrix::identity(),
+                tiling_type: 1,
+            });
+            let mut parent = DisplayList::new(Rect::new(0.0, 0.0, 10.0, 10.0));
+            parent.push(RenderCommand::FillPath {
+                path: rect_path(0.0, 0.0, 10.0, 10.0),
+                rule: FillRule::NonZero,
+                paint: Paint::Tiling(child),
+                alpha: 1.0,
+                overprint: None,
+            });
+            child_arc = Arc::new(parent);
+        }
+        let root = TilingPattern {
+            commands: child_arc,
+            bbox: Rect::new(0.0, 0.0, 10.0, 10.0),
+            x_step: 10.0,
+            y_step: 10.0,
+            matrix: Matrix::identity(),
+            tiling_type: 1,
+        };
+        assert!(
+            root.is_backdrop_dependent(),
+            "Multiply mark 9 levels deep (within interpreter limit of 16) must be detected"
+        );
+        let segs = root
+            .blend_segments()
+            .expect("9-level nested non-overlapping Multiply should lift cleanly");
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].blend_mode, BlendMode::Multiply);
+    }
+
+    #[test]
+    fn is_backdrop_dependent_is_conservative_past_scan_depth_cutoff() {
+        // 18 nested levels (> MAX_TILING_BACKDROP_SCAN_DEPTH = 16) with only Normal
+        // marks cannot be completely inspected, so it must conservatively report
+        // backdrop-dependent rather than claiming proven backdrop-independence.
+        let mut child_arc = Arc::new(DisplayList::new(Rect::new(0.0, 0.0, 10.0, 10.0)));
+        Arc::make_mut(&mut child_arc).push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 10.0, 10.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::black()),
+            alpha: 1.0,
+            overprint: None,
+        });
+        for _ in 0..18 {
+            let child = Arc::new(TilingPattern {
+                commands: Arc::clone(&child_arc),
+                bbox: Rect::new(0.0, 0.0, 10.0, 10.0),
+                x_step: 10.0,
+                y_step: 10.0,
+                matrix: Matrix::identity(),
+                tiling_type: 1,
+            });
+            let mut parent = DisplayList::new(Rect::new(0.0, 0.0, 10.0, 10.0));
+            parent.push(RenderCommand::FillPath {
+                path: rect_path(0.0, 0.0, 10.0, 10.0),
+                rule: FillRule::NonZero,
+                paint: Paint::Tiling(child),
+                alpha: 1.0,
+                overprint: None,
+            });
+            child_arc = Arc::new(parent);
+        }
+        let root = TilingPattern {
+            commands: child_arc,
+            bbox: Rect::new(0.0, 0.0, 10.0, 10.0),
+            x_step: 10.0,
+            y_step: 10.0,
+            matrix: Matrix::identity(),
+            tiling_type: 1,
+        };
+        assert!(
+            root.is_backdrop_dependent(),
+            "uninspected subtree past depth cap must not be classified as backdrop-independent"
+        );
+        assert!(
+            root.blend_segments().is_none(),
+            "uninspected subtree past depth cap must decline segmentation and take fallback"
+        );
     }
 
     #[test]
