@@ -139,6 +139,7 @@ enum Frame {
     Clip {
         prev_clip: Option<u32>,
         prev_mask: Option<u32>,
+        prev_bounds: Option<SvgRect>,
     },
     Blend {
         open: bool,
@@ -166,6 +167,10 @@ struct SvgWriter<'a> {
     isolated_depth: usize,
     non_isolated_filter_depth: usize,
     backdrop_snapshots: usize,
+    /// Cumulative multiplicative fan-out across backdrop `<use>` snapshots that
+    /// reference the prior page more than once; capped by [`MAX_BACKDROP_FANOUT`]
+    /// so sequential dense patterns cannot trigger exponential `<use>` expansion.
+    backdrop_fanout: usize,
     /// Open batch of pairwise-disjoint translucent multi-pass tiling items
     /// sharing one base backdrop `<g id="b{bg_id}">` snapshot, flushed as a
     /// single premultiplied `R * w + B * (1 - w)` SVG filter composition.
@@ -186,6 +191,9 @@ struct SvgWriter<'a> {
     clip: Option<u32>,
     /// Innermost active stroke-clip `<mask>` def id (from `PushClipStroke`).
     stroke_mask: Option<u32>,
+    /// Conservative SVG-space bounding box of the active clip chain (used to
+    /// scope dense SVG `<filter>` subregions to the affected area).
+    clip_bounds: Option<SvgRect>,
     /// Wall-clock deadline for the whole export (shared by mask recursion).
     deadline: Option<zpdf_core::time::Instant>,
     /// Latches once `deadline` passes so the clock is read only occasionally.
@@ -272,12 +280,102 @@ const MAX_SVG_NON_AFFINE_TOTAL_PASSES: usize = 65_536;
 /// (`p_trans`, `f(0)`, `f(1)`), matching the `MAX_TILING_OVERLAP_COPIES × MAX_SEGMENTS` budget.
 const MAX_AFFINE_TILE_PASSES: usize = 65_536;
 /// Cap on sequential page-backdrop `<g id="b...">` snapshots when filter
-/// batches reach [`MAX_BACKDROP_FILTER_PASSES`]. Normal draws and blend groups
-/// fold directly into the open filter batch as `Overlay` / `BlendOverlay` steps,
-/// keeping almost all pages at a single depth-1 snapshot.
+/// batches reach [`MAX_BACKDROP_FILTER_PASSES`] or [`MAX_FILTER_INTERMEDIATE_PIXELS`].
 const MAX_BACKDROP_SNAPSHOTS: usize = 64;
-/// Cap on total filter steps batched inside a single SVG `<filter>` chain.
+/// Cap on total filter primitives batched inside a single SVG `<filter>` chain.
 const MAX_BACKDROP_FILTER_PASSES: usize = 8192;
+/// Peak intermediate pixel budget for one SVG `<filter>` element at 1× SVG
+/// user units (72 dpi): 16M RGBA pixels = 64 MiB. Renderers such as `resvg`
+/// retain every primitive result in a `<filter>` until it completes, so filter
+/// batches and chunks enforce `primitives * region_pixels <= MAX_FILTER_INTERMEDIATE_PIXELS`.
+const MAX_FILTER_INTERMEDIATE_PIXELS: u64 = 16 * 1024 * 1024;
+/// Cap on multiplicative `<use>` fan-out for multi-reference backdrop snapshots
+/// (scoped filters / in-place blended groups), preventing exponential expansion.
+const MAX_BACKDROP_FANOUT: usize = 32;
+/// Flat (non-`OpacityGroup`) multi-pass tiling plans above this op count are
+/// evaluated in-place via sibling `mix-blend-mode` rects (0 filter primitives
+/// on opaque backdrops, 5 on translucent backdrops) instead of retaining one
+/// `<feImage>` buffer per pass inside an SVG `<filter>`.
+const FLAT_BLEND_GROUP_OP_THRESHOLD: usize = 64;
+
+/// Integer-snapped SVG user-space bounding box clamped to the page viewport.
+#[derive(Clone, Copy, Debug)]
+struct SvgRect {
+    x0: f64,
+    y0: f64,
+    x1: f64,
+    y1: f64,
+}
+
+impl SvgRect {
+    fn full_page(w: f64, h: f64) -> Self {
+        Self {
+            x0: 0.0,
+            y0: 0.0,
+            x1: w.max(1.0),
+            y1: h.max(1.0),
+        }
+    }
+
+    fn from_bounds_clamped(
+        x0: f64,
+        y0: f64,
+        x1: f64,
+        y1: f64,
+        pad: f64,
+        page_w: f64,
+        page_h: f64,
+    ) -> Option<Self> {
+        if ![x0, y0, x1, y1, pad].iter().all(|v| v.is_finite()) {
+            return None;
+        }
+        let nx0 = (x0 - pad).floor().clamp(0.0, page_w);
+        let ny0 = (y0 - pad).floor().clamp(0.0, page_h);
+        let nx1 = (x1 + pad).ceil().clamp(0.0, page_w);
+        let ny1 = (y1 + pad).ceil().clamp(0.0, page_h);
+        (nx1 > nx0 && ny1 > ny0).then_some(Self {
+            x0: nx0,
+            y0: ny0,
+            x1: nx1,
+            y1: ny1,
+        })
+    }
+
+    fn width(self) -> f64 {
+        (self.x1 - self.x0).max(0.0)
+    }
+
+    fn height(self) -> f64 {
+        (self.y1 - self.y0).max(0.0)
+    }
+
+    fn pixels(self) -> u64 {
+        let rw = self.width().ceil().max(1.0) as u64;
+        let rh = self.height().ceil().max(1.0) as u64;
+        rw.saturating_mul(rh).max(1)
+    }
+
+    fn intersect(self, other: Self) -> Option<Self> {
+        let x0 = self.x0.max(other.x0);
+        let y0 = self.y0.max(other.y0);
+        let x1 = self.x1.min(other.x1);
+        let y1 = self.y1.min(other.y1);
+        (x1 > x0 && y1 > y0).then_some(Self { x0, y0, x1, y1 })
+    }
+
+    fn union(self, other: Self) -> Self {
+        Self {
+            x0: self.x0.min(other.x0),
+            y0: self.y0.min(other.y0),
+            x1: self.x1.max(other.x1),
+            y1: self.y1.max(other.y1),
+        }
+    }
+
+    fn is_strict_subregion(self, page_w: f64, page_h: f64) -> bool {
+        self.width() * self.height() < page_w * page_h * 0.9
+    }
+}
 
 /// One operation inside an SVG backdrop-dependent tiling pattern plan.
 #[derive(Clone)]
@@ -339,7 +437,8 @@ enum BackdropStep {
 struct PendingBackdrop {
     bg_id: u32,
     steps: Vec<BackdropStep>,
-    total_passes: usize,
+    total_primitives: usize,
+    region: SvgRect,
 }
 
 struct TilingPatternGeometry {
@@ -381,6 +480,7 @@ impl<'a> SvgWriter<'a> {
             isolated_depth: 0,
             non_isolated_filter_depth: 0,
             backdrop_snapshots: 0,
+            backdrop_fanout: 1,
             pending_backdrop: None,
             x0: rect.x0,
             y1: rect.y1,
@@ -392,6 +492,7 @@ impl<'a> SvgWriter<'a> {
             next_id: 0,
             clip: None,
             stroke_mask: None,
+            clip_bounds: None,
             deadline: options.budget.map(|b| zpdf_core::time::Instant::now() + b),
             over_budget: false,
             budget_checks: 0,
@@ -480,6 +581,7 @@ impl<'a> SvgWriter<'a> {
                     let frame = Frame::Clip {
                         prev_clip: self.clip,
                         prev_mask: self.stroke_mask,
+                        prev_bounds: self.clip_bounds,
                     };
                     self.push_clip(path, rule);
                     frames.push(frame);
@@ -488,6 +590,7 @@ impl<'a> SvgWriter<'a> {
                     let frame = Frame::Clip {
                         prev_clip: self.clip,
                         prev_mask: self.stroke_mask,
+                        prev_bounds: self.clip_bounds,
                     };
                     self.push_clip_stroke(path, style);
                     frames.push(frame);
@@ -496,9 +599,11 @@ impl<'a> SvgWriter<'a> {
                     Some(Frame::Clip {
                         prev_clip,
                         prev_mask,
+                        prev_bounds,
                     }) => {
                         self.clip = *prev_clip;
                         self.stroke_mask = *prev_mask;
+                        self.clip_bounds = *prev_bounds;
                         frames.pop();
                     }
                     _ => tracing::warn!("unbalanced PopClip ignored"),
@@ -534,7 +639,12 @@ impl<'a> SvgWriter<'a> {
                             BackdropStep::PushNonIsolatedGroup {
                                 blend_mode: *blend_mode,
                             },
-                            1,
+                            if *blend_mode != BlendMode::Normal {
+                                6
+                            } else {
+                                4
+                            },
+                            None,
                             false,
                         )
                     {
@@ -663,9 +773,11 @@ impl<'a> SvgWriter<'a> {
                 Frame::Clip {
                     prev_clip,
                     prev_mask,
+                    prev_bounds,
                 } => {
                     self.clip = prev_clip;
                     self.stroke_mask = prev_mask;
+                    self.clip_bounds = prev_bounds;
                 }
             }
         }
@@ -900,7 +1012,11 @@ impl<'a> SvgWriter<'a> {
         let saved_h = self.page_height;
         let saved_blend_depth = std::mem::replace(&mut self.blend_depth, 0);
         let saved_isolated_depth = std::mem::replace(&mut self.isolated_depth, 0);
-        let (saved_clip, saved_mask) = (self.clip.take(), self.stroke_mask.take());
+        let (saved_clip, saved_mask, saved_clip_bounds) = (
+            self.clip.take(),
+            self.stroke_mask.take(),
+            self.clip_bounds.take(),
+        );
         self.scale = g.cell_scale;
         self.page_width = g.tile_w;
         self.page_height = g.tile_h;
@@ -949,6 +1065,7 @@ impl<'a> SvgWriter<'a> {
         self.isolated_depth = saved_isolated_depth;
         self.clip = saved_clip;
         self.stroke_mask = saved_mask;
+        self.clip_bounds = saved_clip_bounds;
         self.write_pattern_def(id, &g, &body);
         Some(id)
     }
@@ -1081,7 +1198,11 @@ impl<'a> SvgWriter<'a> {
         let saved_h = self.page_height;
         let saved_blend_depth = std::mem::replace(&mut self.blend_depth, 0);
         let saved_isolated_depth = std::mem::replace(&mut self.isolated_depth, 0);
-        let (saved_clip, saved_mask) = (self.clip.take(), self.stroke_mask.take());
+        let (saved_clip, saved_mask, saved_clip_bounds) = (
+            self.clip.take(),
+            self.stroke_mask.take(),
+            self.clip_bounds.take(),
+        );
         self.scale = g.cell_scale;
         self.page_width = g.tile_w;
         self.page_height = g.tile_h;
@@ -1117,6 +1238,7 @@ impl<'a> SvgWriter<'a> {
         self.isolated_depth = saved_isolated_depth;
         self.clip = saved_clip;
         self.stroke_mask = saved_mask;
+        self.clip_bounds = saved_clip_bounds;
         self.write_pattern_def(id, &g, &body);
         Some(id)
     }
@@ -1236,7 +1358,11 @@ impl<'a> SvgWriter<'a> {
         let saved_h = self.page_height;
         let saved_blend_depth = std::mem::replace(&mut self.blend_depth, 0);
         let saved_isolated_depth = std::mem::replace(&mut self.isolated_depth, 0);
-        let (saved_clip, saved_mask) = (self.clip.take(), self.stroke_mask.take());
+        let (saved_clip, saved_mask, saved_clip_bounds) = (
+            self.clip.take(),
+            self.stroke_mask.take(),
+            self.clip_bounds.take(),
+        );
         self.scale = g.cell_scale;
         self.page_width = g.tile_w;
         self.page_height = g.tile_h;
@@ -1278,6 +1404,7 @@ impl<'a> SvgWriter<'a> {
         self.isolated_depth = saved_isolated_depth;
         self.clip = saved_clip;
         self.stroke_mask = saved_mask;
+        self.clip_bounds = saved_clip_bounds;
 
         if exhausted || self.over_budget {
             tracing::warn!(
@@ -1775,20 +1902,374 @@ impl<'a> SvgWriter<'a> {
         (acc, acc_a)
     }
 
-    /// Evaluate a dense non-affine / opacity-grouped tiling op stream exceeding
-    /// [`MAX_BACKDROP_FILTER_PASSES`] in bounded sequential `<filter>` chunks
-    /// (splitting only at top-level `OpacityGroup` depth 0) while applying
-    /// `shape_id` (coverage + object opacity) ONCE on the final chunk against
-    /// the original pre-fill backdrop snapshot.
-    fn emit_chunked_tiling_ops(&mut self, ops: &[TilingPlanOp], shape_id: u32) -> bool {
+    fn full_page_rect(&self) -> SvgRect {
+        SvgRect::full_page(self.page_width, self.page_height)
+    }
+
+    /// Conservative SVG-space bounding box of `path` expanded by `pad` user
+    /// units and intersected with the active clip chain and page viewport.
+    fn path_svg_bounds(&self, path: &Path, pad: f64) -> Option<SvgRect> {
+        let (mut min_x, mut min_y) = (f64::INFINITY, f64::INFINITY);
+        let (mut max_x, mut max_y) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+        let mut touch = |px: f64, py: f64| {
+            let (sx, sy) = self.map(px, py);
+            if coord_ok(sx) && coord_ok(sy) {
+                min_x = min_x.min(sx);
+                min_y = min_y.min(sy);
+                max_x = max_x.max(sx);
+                max_y = max_y.max(sy);
+            }
+        };
+        for el in path {
+            match el {
+                PathElement::MoveTo(p) | PathElement::LineTo(p) => touch(p.x, p.y),
+                PathElement::CurveTo(c1, c2, p) => {
+                    touch(c1.x, c1.y);
+                    touch(c2.x, c2.y);
+                    touch(p.x, p.y);
+                }
+                PathElement::Close => {}
+            }
+        }
+        if !(min_x.is_finite() && min_y.is_finite() && max_x.is_finite() && max_y.is_finite()) {
+            return None;
+        }
+        let rect = SvgRect::from_bounds_clamped(
+            min_x,
+            min_y,
+            max_x,
+            max_y,
+            pad,
+            self.page_width,
+            self.page_height,
+        )?;
+        match self.clip_bounds {
+            Some(cb) => rect.intersect(cb),
+            None => Some(rect),
+        }
+    }
+
+    fn stroke_svg_pad(&self, style: &StrokeStyle) -> f64 {
+        let width = (style.width as f64 * self.scale).max(0.05);
+        let half = width * 0.5;
+        let miter = match style.join {
+            LineJoin::Miter => (style.miter_limit as f64).clamp(1.0, 20.0),
+            LineJoin::Round | LineJoin::Bevel => 1.5,
+        };
+        (half * miter + 2.0).min(self.page_width.max(self.page_height))
+    }
+
+    fn tiling_op_filter_primitives(op: &TilingPlanOp, track_alpha: bool) -> usize {
+        match op {
+            TilingPlanOp::Pattern { .. } => {
+                if track_alpha {
+                    3
+                } else {
+                    2
+                }
+            }
+            TilingPlanOp::PushOpacityGroup => 0,
+            TilingPlanOp::PopOpacityGroup {
+                mask_pat_id: None, ..
+            } => {
+                if track_alpha {
+                    2
+                } else {
+                    1
+                }
+            }
+            TilingPlanOp::PopOpacityGroup {
+                mask_pat_id: Some(_),
+                ..
+            } => {
+                if track_alpha {
+                    8
+                } else {
+                    5
+                }
+            }
+        }
+    }
+
+    fn tiling_ops_filter_primitives(ops: &[TilingPlanOp], track_alpha: bool) -> usize {
+        ops.iter()
+            .map(|op| Self::tiling_op_filter_primitives(op, track_alpha))
+            .sum()
+    }
+
+    /// Maximum filter primitive count allowed in one `<filter>` covering
+    /// `region` without exceeding [`MAX_FILTER_INTERMEDIATE_PIXELS`].
+    fn max_filter_primitives_for_region(region: SvgRect) -> usize {
+        ((MAX_FILTER_INTERMEDIATE_PIXELS / region.pixels()) as usize)
+            .min(MAX_BACKDROP_FILTER_PASSES * 2)
+    }
+
+    fn write_filter_open_tag(defs: &mut String, fid: u32, region: SvgRect) {
+        let _ = write!(
+            defs,
+            "<filter id=\"f{fid}\" filterUnits=\"userSpaceOnUse\" x=\""
+        );
+        push_num(defs, region.x0);
+        defs.push_str("\" y=\"");
+        push_num(defs, region.y0);
+        defs.push_str("\" width=\"");
+        push_num(defs, region.width());
+        defs.push_str("\" height=\"");
+        push_num(defs, region.height());
+        defs.push_str("\" color-interpolation-filters=\"sRGB\">\n");
+    }
+
+    /// Emit the unmodified background outside a scoped filter subregion `region`:
+    /// on opaque pages draw `#b{bg_id}` directly underneath (zero seam at any
+    /// fractional scale); on translucent pages clip `#b{bg_id}` to the exact
+    /// complement of `region` so translucent pixels outside aren't doubled.
+    fn emit_scoped_bg_restore(&mut self, bg_id: u32, region: SvgRect) {
+        if self.has_opaque_background && self.isolated_depth == 0 {
+            let _ = writeln!(self.out, "<use href=\"#b{bg_id}\"/>");
+        } else {
+            let out_clip = self.fresh_id();
+            let _ = write!(self.defs, "<clipPath id=\"c{out_clip}\"><path d=\"M0 0H");
+            push_num(&mut self.defs, self.page_width);
+            self.defs.push('V');
+            push_num(&mut self.defs, self.page_height);
+            self.defs.push_str("H0ZM");
+            push_pair(&mut self.defs, region.x0, region.y0);
+            self.defs.push('H');
+            push_num(&mut self.defs, region.x1);
+            self.defs.push('V');
+            push_num(&mut self.defs, region.y1);
+            self.defs.push('H');
+            push_num(&mut self.defs, region.x0);
+            self.defs
+                .push_str("Z\" clip-rule=\"evenodd\"/></clipPath>\n");
+            let _ = writeln!(
+                self.out,
+                "<use href=\"#b{bg_id}\" clip-path=\"url(#c{out_clip})\"/>"
+            );
+        }
+    }
+
+    /// Evaluate a dense flat (non-`OpacityGroup`) multi-pass tiling plan in
+    /// O(1) peak raster memory by blending sibling `<rect style="mix-blend-mode:..."/>`
+    /// elements in-place onto a single copy of the backdrop, then masking ONCE
+    /// with `shape_body`:
+    /// - Opaque backdrop: `<g mask="url(#m...)">` with ZERO `<filter>` primitives.
+    /// - Translucent backdrop: one 5-primitive `<filter>` scoped to `affected`.
+    fn emit_flat_blend_group_tiling_ops(
+        &mut self,
+        ops: &[TilingPlanOp],
+        shape_body: &str,
+        affected: SvgRect,
+    ) -> bool {
+        if self.non_isolated_filter_depth > 0 || ops.is_empty() || Self::ops_has_opacity_group(ops)
+        {
+            return false;
+        }
+        let w = self.page_width;
+        let h = self.page_height;
+        let opaque = self.has_opaque_background && self.isolated_depth == 0;
+        let mut scoped = affected.is_strict_subregion(w, h);
+        let refs = if opaque {
+            2
+        } else if scoped {
+            if self.backdrop_fanout.saturating_mul(3) <= MAX_BACKDROP_FANOUT {
+                3
+            } else {
+                scoped = false;
+                2
+            }
+        } else {
+            2
+        };
+        if self.backdrop_fanout.saturating_mul(refs) > MAX_BACKDROP_FANOUT {
+            return false;
+        }
+        let reg = if scoped {
+            affected
+        } else {
+            self.full_page_rect()
+        };
+        if !opaque && Self::max_filter_primitives_for_region(reg) < 5 {
+            return false;
+        }
+        self.flush_pending_backdrop();
+        if self.backdrop_snapshots >= MAX_BACKDROP_SNAPSHOTS {
+            return false;
+        }
+        let Some(orig_bg_id) = self.snapshot_page_backdrop(true) else {
+            return false;
+        };
+        self.backdrop_fanout = self.backdrop_fanout.saturating_mul(refs);
+
+        let reg_clip = if scoped {
+            let cid = self.fresh_id();
+            let _ = write!(self.defs, "<clipPath id=\"c{cid}\"><rect x=\"");
+            push_num(&mut self.defs, reg.x0);
+            self.defs.push_str("\" y=\"");
+            push_num(&mut self.defs, reg.y0);
+            self.defs.push_str("\" width=\"");
+            push_num(&mut self.defs, reg.width());
+            self.defs.push_str("\" height=\"");
+            push_num(&mut self.defs, reg.height());
+            self.defs.push_str("\"/></clipPath>\n");
+            Some(cid)
+        } else {
+            None
+        };
+
+        let write_blend_rects = |dst: &mut String, ops: &[TilingPlanOp], reg: SvgRect| {
+            for op in ops {
+                if let TilingPlanOp::Pattern { pat_id, blend_mode } = op {
+                    dst.push_str("<rect x=\"");
+                    push_num(dst, reg.x0);
+                    dst.push_str("\" y=\"");
+                    push_num(dst, reg.y0);
+                    dst.push_str("\" width=\"");
+                    push_num(dst, reg.width());
+                    dst.push_str("\" height=\"");
+                    push_num(dst, reg.height());
+                    let _ = write!(dst, "\" fill=\"url(#p{pat_id})\"");
+                    if let Some(name) = blend_css(*blend_mode) {
+                        let _ = write!(dst, " style=\"mix-blend-mode:{name};\"");
+                    }
+                    dst.push_str("/>\n");
+                }
+            }
+        };
+
+        if opaque {
+            let mask_id = self.fresh_id();
+            let _ = write!(
+                self.defs,
+                "<mask id=\"m{mask_id}\" maskUnits=\"userSpaceOnUse\" style=\"mask-type:alpha\" x=\""
+            );
+            push_num(&mut self.defs, reg.x0);
+            self.defs.push_str("\" y=\"");
+            push_num(&mut self.defs, reg.y0);
+            self.defs.push_str("\" width=\"");
+            push_num(&mut self.defs, reg.width());
+            self.defs.push_str("\" height=\"");
+            push_num(&mut self.defs, reg.height());
+            let _ = write!(self.defs, "\">\n{shape_body}</mask>\n");
+
+            let _ = writeln!(self.out, "<use href=\"#b{orig_bg_id}\"/>");
+            let _ = writeln!(self.out, "<g mask=\"url(#m{mask_id})\">");
+            if let Some(cid) = reg_clip {
+                let _ = writeln!(
+                    self.out,
+                    "<use href=\"#b{orig_bg_id}\" clip-path=\"url(#c{cid})\"/>"
+                );
+            } else {
+                let _ = writeln!(self.out, "<use href=\"#b{orig_bg_id}\"/>");
+            }
+            write_blend_rects(&mut self.out, ops, reg);
+            self.out.push_str("</g>\n");
+            return true;
+        }
+
+        // Translucent backdrop: evaluate all passes in-place into `<g id="b{eval_id}">`,
+        // then run ONE 5-primitive filter scoped to `reg` to compute exact
+        // `eval * w + orig * (1 - w)`.
+        let shape_id = self.fresh_id();
+        let _ = write!(self.defs, "<g id=\"s{shape_id}\">\n{shape_body}</g>\n");
+        let eval_id = self.fresh_id();
+        let _ = writeln!(self.defs, "<g id=\"b{eval_id}\">");
+        if let Some(cid) = reg_clip {
+            let _ = writeln!(
+                self.defs,
+                "<use href=\"#b{orig_bg_id}\" clip-path=\"url(#c{cid})\"/>"
+            );
+        } else {
+            let _ = writeln!(self.defs, "<use href=\"#b{orig_bg_id}\"/>");
+        }
+        write_blend_rects(&mut self.defs, ops, reg);
+        self.defs.push_str("</g>\n");
+
+        let fid = self.fresh_id();
+        Self::write_filter_open_tag(&mut self.defs, fid, reg);
+        let _ = write!(
+            self.defs,
+            "<feImage href=\"#b{orig_bg_id}\" x=\"0\" y=\"0\" width=\""
+        );
+        push_num(&mut self.defs, w);
+        self.defs.push_str("\" height=\"");
+        push_num(&mut self.defs, h);
+        self.defs.push_str("\" result=\"orig\"/>\n");
+        let _ = write!(
+            self.defs,
+            "<feImage href=\"#s{shape_id}\" x=\"0\" y=\"0\" width=\""
+        );
+        push_num(&mut self.defs, w);
+        self.defs.push_str("\" height=\"");
+        push_num(&mut self.defs, h);
+        self.defs.push_str("\" result=\"wt\"/>\n");
+        self.defs.push_str(
+            "<feComposite in=\"SourceGraphic\" in2=\"wt\" operator=\"in\" result=\"rw\"/>\n\
+             <feComposite in=\"orig\" in2=\"wt\" operator=\"out\" result=\"bw\"/>\n\
+             <feComposite in=\"rw\" in2=\"bw\" operator=\"arithmetic\" k1=\"0\" k2=\"1\" k3=\"1\" k4=\"0\"/>\n\
+             </filter>\n",
+        );
+
+        if scoped {
+            self.emit_scoped_bg_restore(orig_bg_id, reg);
+        }
+        let _ = writeln!(
+            self.out,
+            "<use href=\"#b{eval_id}\" filter=\"url(#f{fid})\"/>"
+        );
+        true
+    }
+
+    /// Evaluate a dense opacity-grouped tiling op stream exceeding one filter's
+    /// intermediate-pixel budget in bounded sequential `<filter>` chunks scoped
+    /// to `affected` (splitting only at top-level `OpacityGroup` depth 0) while
+    /// applying `shape_id` (coverage + object opacity) ONCE on the final chunk
+    /// against the original pre-fill backdrop snapshot.
+    fn emit_chunked_tiling_ops(
+        &mut self,
+        ops: &[TilingPlanOp],
+        shape_id: u32,
+        affected: SvgRect,
+    ) -> bool {
         if self.non_isolated_filter_depth > 0 || ops.is_empty() {
             return false;
         }
+        let w = self.page_width;
+        let h = self.page_height;
+        let mut scoped = affected.is_strict_subregion(w, h);
+        let refs = if scoped {
+            if self.backdrop_fanout.saturating_mul(3) <= MAX_BACKDROP_FANOUT {
+                3
+            } else {
+                scoped = false;
+                2
+            }
+        } else {
+            2
+        };
+        if self.backdrop_fanout.saturating_mul(refs) > MAX_BACKDROP_FANOUT {
+            return false;
+        }
+        let reg = if scoped {
+            affected
+        } else {
+            self.full_page_rect()
+        };
+        // Reserve 5 primitives for the final `orig`/`wt`/`in`/`out`/`arithmetic` mix.
+        let max_chunk_prims = Self::max_filter_primitives_for_region(reg).saturating_sub(5);
+        if max_chunk_prims < 2 {
+            return false;
+        }
+
         let mut chunks: Vec<&[TilingPlanOp]> = Vec::new();
         let mut chunk_start = 0usize;
+        let mut chunk_prims = 0usize;
         let mut group_depth = 0usize;
         let mut last_top_boundary = 0usize;
+        let mut prims_at_last_boundary = 0usize;
         for (i, op) in ops.iter().enumerate() {
+            let op_prims = Self::tiling_op_filter_primitives(op, false);
+            chunk_prims = chunk_prims.saturating_add(op_prims);
             match op {
                 TilingPlanOp::PushOpacityGroup => group_depth += 1,
                 TilingPlanOp::PopOpacityGroup { .. } => {
@@ -1798,21 +2279,23 @@ impl<'a> SvgWriter<'a> {
             }
             if group_depth == 0 {
                 let end = i + 1;
-                if end - chunk_start > MAX_BACKDROP_FILTER_PASSES {
+                if chunk_prims > max_chunk_prims {
                     if last_top_boundary > chunk_start {
                         chunks.push(&ops[chunk_start..last_top_boundary]);
                         chunk_start = last_top_boundary;
+                        chunk_prims = chunk_prims.saturating_sub(prims_at_last_boundary);
                     }
-                    if end - chunk_start > MAX_BACKDROP_FILTER_PASSES {
-                        // One indivisible top-level OpacityGroup exceeds the per-filter cap.
+                    if chunk_prims > max_chunk_prims {
+                        // One indivisible top-level OpacityGroup exceeds the pixel budget.
                         return false;
                     }
                 }
                 last_top_boundary = end;
+                prims_at_last_boundary = chunk_prims;
             }
         }
         if chunk_start < ops.len() {
-            if ops.len() - chunk_start > MAX_BACKDROP_FILTER_PASSES {
+            if chunk_prims > max_chunk_prims {
                 return false;
             }
             chunks.push(&ops[chunk_start..]);
@@ -1820,17 +2303,37 @@ impl<'a> SvgWriter<'a> {
         if chunks.is_empty() {
             return false;
         }
+        // Each nested chunk holds one `SourceGraphic` buffer of `reg` on the
+        // filter call stack while the innermost chunk executes; bound both
+        // snapshot count and total peak intermediate pixels across the chain.
+        let peak_chain_px = (chunks
+            .len()
+            .saturating_add(max_chunk_prims)
+            .saturating_add(5) as u64)
+            .saturating_mul(reg.pixels());
+        if peak_chain_px > MAX_FILTER_INTERMEDIATE_PIXELS.saturating_mul(2) {
+            tracing::warn!(
+                chunks = chunks.len(),
+                region_px = reg.pixels(),
+                "svg chunked tiling filter chain exceeds peak pixel budget; falling back to isolated group"
+            );
+            return false;
+        }
 
         self.flush_pending_backdrop();
         if self.backdrop_snapshots.saturating_add(chunks.len()) > MAX_BACKDROP_SNAPSHOTS {
+            tracing::warn!(
+                chunks = chunks.len(),
+                region_px = reg.pixels(),
+                "svg chunked tiling filter exceeds intermediate-pixel snapshot budget; falling back to isolated group"
+            );
             return false;
         }
         let Some(orig_bg_id) = self.snapshot_page_backdrop(true) else {
             return false;
         };
+        self.backdrop_fanout = self.backdrop_fanout.saturating_mul(refs);
 
-        let w = self.page_width;
-        let h = self.page_height;
         let mut pat_rects: HashMap<u32, u32> = HashMap::new();
         for op in ops {
             let pat_id = match op {
@@ -1856,15 +2359,7 @@ impl<'a> SvgWriter<'a> {
         for (chunk_idx, chunk) in chunks.iter().enumerate() {
             let is_last = chunk_idx + 1 == chunks.len();
             let fid = self.fresh_id();
-            let _ = write!(
-                self.defs,
-                "<filter id=\"f{fid}\" filterUnits=\"userSpaceOnUse\" x=\"0\" y=\"0\" width=\""
-            );
-            push_num(&mut self.defs, w);
-            self.defs.push_str("\" height=\"");
-            push_num(&mut self.defs, h);
-            self.defs
-                .push_str("\" color-interpolation-filters=\"sRGB\">\n");
+            Self::write_filter_open_tag(&mut self.defs, fid, reg);
             let (acc, _) = Self::emit_filter_tiling_ops(
                 &mut self.defs,
                 w,
@@ -1906,6 +2401,9 @@ impl<'a> SvgWriter<'a> {
             }
             self.defs.push_str("</filter>\n");
             if is_last {
+                if scoped {
+                    self.emit_scoped_bg_restore(orig_bg_id, reg);
+                }
                 let _ = writeln!(
                     self.out,
                     "<use href=\"#b{prev_g}\" filter=\"url(#f{fid})\"/>"
@@ -2031,16 +2529,17 @@ impl<'a> SvgWriter<'a> {
             }
         }
 
+        let scoped = pending.region.is_strict_subregion(w, h)
+            && self.backdrop_fanout.saturating_mul(2) <= MAX_BACKDROP_FANOUT;
+        let filter_region = if scoped {
+            self.backdrop_fanout = self.backdrop_fanout.saturating_mul(2);
+            pending.region
+        } else {
+            self.full_page_rect()
+        };
+
         let fid = self.fresh_id();
-        let _ = write!(
-            self.defs,
-            "<filter id=\"f{fid}\" filterUnits=\"userSpaceOnUse\" x=\"0\" y=\"0\" width=\""
-        );
-        push_num(&mut self.defs, w);
-        self.defs.push_str("\" height=\"");
-        push_num(&mut self.defs, h);
-        self.defs
-            .push_str("\" color-interpolation-filters=\"sRGB\">\n");
+        Self::write_filter_open_tag(&mut self.defs, fid, filter_region);
 
         let mut cur = String::from("SourceGraphic");
         let mut ga: Option<String> = None;
@@ -2410,6 +2909,9 @@ impl<'a> SvgWriter<'a> {
         }
 
         self.defs.push_str("</filter>\n");
+        if scoped {
+            self.emit_scoped_bg_restore(pending.bg_id, filter_region);
+        }
         let _ = writeln!(
             self.out,
             "<use href=\"#b{}\" filter=\"url(#f{fid})\"/>",
@@ -2452,38 +2954,54 @@ impl<'a> SvgWriter<'a> {
             let mid = std::mem::take(&mut self.out);
             let ov_id = self.fresh_id();
             let _ = write!(self.defs, "<g id=\"ov{ov_id}\">\n{mid}</g>\n");
+            let full = self.full_page_rect();
             if let Some(ref mut p) = self.pending_backdrop {
                 p.steps.push(BackdropStep::Overlay(ov_id));
-                p.total_passes = p.total_passes.saturating_add(1);
+                p.total_primitives = p.total_primitives.saturating_add(3);
+                p.region = full;
             }
         }
     }
 
     /// Enqueue one backdrop-dependent filter step onto the active linear
     /// `<filter>` chain, absorbing intervening normal draws as `Overlay` steps
-    /// and starting a new snapshot only when needed within
-    /// [`MAX_BACKDROP_SNAPSHOTS`].
+    /// and enforcing [`MAX_FILTER_INTERMEDIATE_PIXELS`] on the batch's
+    /// `(total_primitives × region_pixels)` before starting a new snapshot.
     fn enqueue_backdrop_step(
         &mut self,
         step: BackdropStep,
-        step_cost: usize,
+        step_primitives: usize,
+        region: Option<SvgRect>,
         allow_empty: bool,
     ) -> bool {
-        let batch_limit = if self.non_isolated_filter_depth > 0 {
-            MAX_SVG_NON_AFFINE_TOTAL_PASSES
-        } else {
-            MAX_BACKDROP_FILTER_PASSES
-        };
+        let full = self.full_page_rect();
+        let step_region = region.unwrap_or(full);
         if let Some(ref p) = self.pending_backdrop {
-            let extra = usize::from(!self.out.is_empty());
-            if p.total_passes
-                .saturating_add(extra)
-                .saturating_add(step_cost)
-                <= batch_limit
+            let has_out = !self.out.is_empty();
+            let extra_prims = if has_out { 3 } else { 0 };
+            let candidate_region = if has_out || self.non_isolated_filter_depth > 0 {
+                full
+            } else {
+                p.region.union(step_region)
+            };
+            let effective_region = if candidate_region
+                .is_strict_subregion(self.page_width, self.page_height)
+                && self.backdrop_fanout.saturating_mul(2) <= MAX_BACKDROP_FANOUT
+            {
+                candidate_region
+            } else {
+                full
+            };
+            let prim_limit = Self::max_filter_primitives_for_region(effective_region);
+            if p.total_primitives
+                .saturating_add(extra_prims)
+                .saturating_add(step_primitives)
+                <= prim_limit
             {
                 self.absorb_out_into_pending();
                 if let Some(ref mut p) = self.pending_backdrop {
-                    p.total_passes = p.total_passes.saturating_add(step_cost);
+                    p.total_primitives = p.total_primitives.saturating_add(step_primitives);
+                    p.region = candidate_region;
                     p.steps.push(step);
                 }
                 return true;
@@ -2493,18 +3011,91 @@ impl<'a> SvgWriter<'a> {
             }
             self.flush_pending_backdrop();
         }
+        let init_region = if self.non_isolated_filter_depth > 0 {
+            full
+        } else {
+            step_region
+        };
+        let effective_region = if init_region.is_strict_subregion(self.page_width, self.page_height)
+            && self.backdrop_fanout.saturating_mul(2) <= MAX_BACKDROP_FANOUT
+        {
+            init_region
+        } else {
+            full
+        };
+        let prim_limit = Self::max_filter_primitives_for_region(effective_region);
         if (allow_empty || !self.out.is_empty())
             && self.backdrop_snapshots < MAX_BACKDROP_SNAPSHOTS
-            && step_cost <= batch_limit
+            && step_primitives <= prim_limit
         {
             if let Some(bg_id) = self.snapshot_page_backdrop(allow_empty) {
                 self.pending_backdrop = Some(PendingBackdrop {
                     bg_id,
                     steps: vec![step],
-                    total_passes: step_cost,
+                    total_primitives: step_primitives,
+                    region: init_region,
                 });
                 return true;
             }
+        }
+        false
+    }
+
+    /// Dispatch a backdrop-dependent multi-pass tiling op stream (for fills,
+    /// strokes, or Type 3 runs) using bounded raster memory:
+    /// - Dense flat plans evaluate in-place via sibling `mix-blend-mode` rects
+    ///   (0 filter primitives on opaque pages, 5 scoped primitives on translucent pages).
+    /// - Small/medium plans batch into the active `<filter>` scoped to `affected`.
+    /// - Oversized `OpacityGroup` plans split into pixel-budgeted scoped chunks,
+    ///   returning `false` to the isolated single-opacity fallback if over budget.
+    fn emit_tiling_multi_pass_backdrop(
+        &mut self,
+        ops: &[TilingPlanOp],
+        shape_body: &str,
+        affected: SvgRect,
+    ) -> bool {
+        let has_opacity_group = Self::ops_has_opacity_group(ops);
+        if !(self.pending_backdrop.is_some() || !self.out.is_empty() || has_opacity_group) {
+            return false;
+        }
+        let track_alpha = self.non_isolated_filter_depth > 0;
+        let step_prims = Self::tiling_ops_filter_primitives(ops, track_alpha)
+            .saturating_add(if track_alpha { 8 } else { 5 });
+        let effective_region = if !track_alpha
+            && affected.is_strict_subregion(self.page_width, self.page_height)
+            && self.backdrop_fanout.saturating_mul(2) <= MAX_BACKDROP_FANOUT
+        {
+            affected
+        } else {
+            self.full_page_rect()
+        };
+        let prim_limit = Self::max_filter_primitives_for_region(effective_region);
+
+        if !has_opacity_group
+            && self.non_isolated_filter_depth == 0
+            && (ops.len() > FLAT_BLEND_GROUP_OP_THRESHOLD || step_prims > prim_limit)
+            && self.emit_flat_blend_group_tiling_ops(ops, shape_body, affected)
+        {
+            return true;
+        }
+
+        let shape_id = self.fresh_id();
+        let _ = writeln!(self.defs, "<g id=\"s{shape_id}\">{shape_body}</g>");
+        if self.enqueue_backdrop_step(
+            BackdropStep::MultiPass {
+                ops: ops.to_vec(),
+                shape_id,
+            },
+            step_prims,
+            Some(affected),
+            has_opacity_group,
+        ) {
+            return true;
+        }
+        if self.non_isolated_filter_depth == 0
+            && self.emit_chunked_tiling_ops(ops, shape_id, affected)
+        {
+            return true;
         }
         false
     }
@@ -2515,6 +3106,7 @@ impl<'a> SvgWriter<'a> {
         rule: &FillRule,
         tiling: &zpdf_display_list::TilingPattern,
         opacity: f32,
+        affected: SvgRect,
         depth: u8,
     ) {
         let plan = self.emit_tiling_plan(tiling, depth);
@@ -2540,7 +3132,8 @@ impl<'a> SvgWriter<'a> {
                             mk_id,
                             shape_id,
                         },
-                        4,
+                        14,
+                        Some(affected),
                         true,
                     ) {
                         return;
@@ -2565,42 +3158,18 @@ impl<'a> SvgWriter<'a> {
                     _ => None,
                 };
                 if single_pattern.is_none() {
-                    let has_opacity_group = Self::ops_has_opacity_group(&ops);
-                    if depth == 0
-                        && (self.pending_backdrop.is_some()
-                            || !self.out.is_empty()
-                            || has_opacity_group)
-                    {
-                        let shape_id = self.fresh_id();
+                    if depth == 0 {
                         let placement = self.placement_attrs();
-                        let _ = write!(
-                            self.defs,
-                            "<g id=\"s{shape_id}\"><path d=\"{d}\" fill=\"#ffffff\""
-                        );
+                        let mut shape_body = String::with_capacity(d.len() + placement.len() + 64);
+                        let _ = write!(shape_body, "<path d=\"{d}\" fill=\"#ffffff\"");
                         if *rule == FillRule::EvenOdd {
-                            self.defs.push_str(" fill-rule=\"evenodd\"");
+                            shape_body.push_str(" fill-rule=\"evenodd\"");
                         }
-                        push_opacity(&mut self.defs, "fill-opacity", opacity);
-                        self.defs.push_str(&placement);
-                        self.defs.push_str("/></g>\n");
-                        if ops.len() > MAX_BACKDROP_FILTER_PASSES
-                            && self.non_isolated_filter_depth == 0
-                        {
-                            if self.emit_chunked_tiling_ops(&ops, shape_id) {
-                                return;
-                            }
-                        } else {
-                            let pass_count = ops.len();
-                            if self.enqueue_backdrop_step(
-                                BackdropStep::MultiPass {
-                                    ops: ops.clone(),
-                                    shape_id,
-                                },
-                                pass_count,
-                                has_opacity_group,
-                            ) {
-                                return;
-                            }
+                        push_opacity(&mut shape_body, "fill-opacity", opacity);
+                        shape_body.push_str(&placement);
+                        shape_body.push_str("/>");
+                        if self.emit_tiling_multi_pass_backdrop(&ops, &shape_body, affected) {
+                            return;
                         }
                     }
 
@@ -2654,7 +3223,8 @@ impl<'a> SvgWriter<'a> {
                     self.defs.push_str("/></g>\n");
                     if self.enqueue_backdrop_step(
                         BackdropStep::BlendOverlay { ov_id, blend_mode },
-                        1,
+                        3,
+                        Some(affected),
                         false,
                     ) {
                         return;
@@ -2711,7 +3281,10 @@ impl<'a> SvgWriter<'a> {
                 let Some(d) = self.path_data(path) else {
                     return;
                 };
-                self.emit_tiling_fill_path_data(&d, rule, tiling, opacity, depth);
+                let affected = self
+                    .path_svg_bounds(path, 2.0)
+                    .unwrap_or_else(|| self.clip_bounds.unwrap_or_else(|| self.full_page_rect()));
+                self.emit_tiling_fill_path_data(&d, rule, tiling, opacity, affected, depth);
             }
             _ => {
                 tracing::debug!("skipping non-solid fill paint (rasterized upstream)");
@@ -2759,6 +3332,10 @@ impl<'a> SvgWriter<'a> {
                 let Some(d) = self.path_data(path) else {
                     return;
                 };
+                let pad = self.stroke_svg_pad(style);
+                let affected = self
+                    .path_svg_bounds(path, pad)
+                    .unwrap_or_else(|| self.clip_bounds.unwrap_or_else(|| self.full_page_rect()));
                 let plan = self.emit_tiling_plan(tiling, depth);
                 match plan {
                     TilingPassPlan::Affine { t_id, k_id, mk_id } => {
@@ -2780,7 +3357,8 @@ impl<'a> SvgWriter<'a> {
                                     mk_id,
                                     shape_id,
                                 },
-                                4,
+                                14,
+                                Some(affected),
                                 true,
                             ) {
                                 return;
@@ -2808,40 +3386,21 @@ impl<'a> SvgWriter<'a> {
                             _ => None,
                         };
                         if single_pattern.is_none() {
-                            let has_opacity_group = Self::ops_has_opacity_group(&ops);
-                            if depth == 0
-                                && (self.pending_backdrop.is_some()
-                                    || !self.out.is_empty()
-                                    || has_opacity_group)
-                            {
-                                let shape_id = self.fresh_id();
+                            if depth == 0 {
                                 let placement = self.placement_attrs();
+                                let mut shape_body =
+                                    String::with_capacity(d.len() + placement.len() + 96);
                                 let _ = write!(
-                                    self.defs,
-                                    "<g id=\"s{shape_id}\"><path d=\"{d}\" fill=\"none\" stroke=\"#ffffff\""
+                                    shape_body,
+                                    "<path d=\"{d}\" fill=\"none\" stroke=\"#ffffff\""
                                 );
-                                push_opacity(&mut self.defs, "stroke-opacity", opacity);
-                                push_stroke_attrs(&mut self.defs, style, self.scale);
-                                self.defs.push_str(&placement);
-                                self.defs.push_str("/></g>\n");
-                                if ops.len() > MAX_BACKDROP_FILTER_PASSES
-                                    && self.non_isolated_filter_depth == 0
+                                push_opacity(&mut shape_body, "stroke-opacity", opacity);
+                                push_stroke_attrs(&mut shape_body, style, self.scale);
+                                shape_body.push_str(&placement);
+                                shape_body.push_str("/>");
+                                if self.emit_tiling_multi_pass_backdrop(&ops, &shape_body, affected)
                                 {
-                                    if self.emit_chunked_tiling_ops(&ops, shape_id) {
-                                        return;
-                                    }
-                                } else {
-                                    let pass_count = ops.len();
-                                    if self.enqueue_backdrop_step(
-                                        BackdropStep::MultiPass {
-                                            ops: ops.clone(),
-                                            shape_id,
-                                        },
-                                        pass_count,
-                                        has_opacity_group,
-                                    ) {
-                                        return;
-                                    }
+                                    return;
                                 }
                             }
 
@@ -2900,7 +3459,8 @@ impl<'a> SvgWriter<'a> {
                             self.defs.push_str("/></g>\n");
                             if self.enqueue_backdrop_step(
                                 BackdropStep::BlendOverlay { ov_id, blend_mode },
-                                1,
+                                3,
+                                Some(affected),
                                 false,
                             ) {
                                 return;
@@ -2953,6 +3513,9 @@ impl<'a> SvgWriter<'a> {
         }
         self.defs.push_str("/></clipPath>\n");
         self.clip = Some(id);
+        if let Some(cb) = self.path_svg_bounds(path, 2.0) {
+            self.clip_bounds = Some(cb);
+        }
     }
 
     /// A stroked clip has no SVG `<clipPath>` equivalent; a luminance mask with
@@ -2962,6 +3525,8 @@ impl<'a> SvgWriter<'a> {
         let Some(d) = self.path_data(path) else {
             return;
         };
+        let pad = self.stroke_svg_pad(style);
+        let next_bounds = self.path_svg_bounds(path, pad);
         let id = self.fresh_id();
         let _ = write!(
             self.defs,
@@ -2984,6 +3549,9 @@ impl<'a> SvgWriter<'a> {
         }
         self.defs.push_str("</mask>\n");
         self.stroke_mask = Some(id);
+        if let Some(cb) = next_bounds {
+            self.clip_bounds = Some(cb);
+        }
     }
 
     // -- transparency groups --
@@ -3054,7 +3622,7 @@ impl<'a> SvgWriter<'a> {
                 blend_mode,
                 weight_id,
             });
-            p.total_passes = p.total_passes.saturating_add(1);
+            p.total_primitives = p.total_primitives.saturating_add(6);
         }
     }
 
@@ -3099,7 +3667,8 @@ impl<'a> SvgWriter<'a> {
             self.defs.push_str("</g>\n");
             if self.enqueue_backdrop_step(
                 BackdropStep::BlendOverlay { ov_id, blend_mode },
-                1,
+                3,
+                None,
                 false,
             ) {
                 return;
@@ -3141,7 +3710,11 @@ impl<'a> SvgWriter<'a> {
         let saved_isolated_depth = std::mem::replace(&mut self.isolated_depth, 0);
         // Mask content is self-contained (geometry fixed at `gs` time); it must
         // not inherit the page's active clip chain.
-        let (saved_clip, saved_mask) = (self.clip.take(), self.stroke_mask.take());
+        let (saved_clip, saved_mask, saved_clip_bounds) = (
+            self.clip.take(),
+            self.stroke_mask.take(),
+            self.clip_bounds.take(),
+        );
         // /BC backdrop: areas the mask group leaves unpainted read as this
         // luminosity. SVG masks default to black (fully masked), so only a
         // non-zero backdrop needs painting.
@@ -3180,6 +3753,7 @@ impl<'a> SvgWriter<'a> {
         self.isolated_depth = saved_isolated_depth;
         self.clip = saved_clip;
         self.stroke_mask = saved_mask;
+        self.clip_bounds = saved_clip_bounds;
 
         let _ = write!(self.defs, "<mask id=\"m{id}\" maskUnits=\"userSpaceOnUse\"");
         if mask.kind == SoftMaskKind::Alpha {
@@ -3227,8 +3801,21 @@ impl<'a> SvgWriter<'a> {
                 }
                 if font.is_type3() {
                     self.emit_tiling_type3_run(run, font, tiling, opacity, depth);
-                } else if let Some(d) = self.outline_run_path_data(run, font) {
-                    self.emit_tiling_fill_path_data(&d, &FillRule::NonZero, tiling, opacity, depth);
+                } else if let Some((d, glyph_bounds)) = self.outline_run_path_data(run, font) {
+                    let affected = match (glyph_bounds, self.clip_bounds) {
+                        (Some(gb), Some(cb)) => gb.intersect(cb).unwrap_or(gb),
+                        (Some(gb), None) => gb,
+                        (None, Some(cb)) => cb,
+                        (None, None) => self.full_page_rect(),
+                    };
+                    self.emit_tiling_fill_path_data(
+                        &d,
+                        &FillRule::NonZero,
+                        tiling,
+                        opacity,
+                        affected,
+                        depth,
+                    );
                 }
             }
             _ => {
@@ -3237,13 +3824,37 @@ impl<'a> SvgWriter<'a> {
         }
     }
 
-    /// Outline fonts: build one merged SVG path string for all glyphs of `run`.
-    fn outline_run_path_data(&mut self, run: &GlyphRun, font: &LoadedFont) -> Option<String> {
+    /// Outline fonts: build one merged SVG path string and its conservative
+    /// SVG-space bounding box for all glyphs of `run`.
+    fn outline_run_path_data(
+        &mut self,
+        run: &GlyphRun,
+        font: &LoadedFont,
+    ) -> Option<(String, Option<SvgRect>)> {
         let upem = font.units_per_em;
         if !(upem.is_finite() && upem > 0.0) {
             return None;
         }
         let mut d = String::new();
+        let (x0, y1, scale) = (self.x0, self.y1, self.scale);
+        let (mut min_x, mut min_y) = (f64::INFINITY, f64::INFINITY);
+        let (mut max_x, mut max_y) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+        let mut record_bounds = |pts: &[(f64, f64)], off: (f32, f32)| {
+            let tm = &run.transform;
+            for &(gx, gy) in pts {
+                let tx = gx / upem * run.font_size as f64 * run.h_scale as f64 + off.0 as f64;
+                let ty = gy / upem * run.font_size as f64 + off.1 as f64;
+                let px = tm.a * tx + tm.c * ty + tm.e;
+                let py = tm.b * tx + tm.d * ty + tm.f;
+                let (sx, sy) = ((px - x0) * scale, (y1 - py) * scale);
+                if coord_ok(sx) && coord_ok(sy) {
+                    min_x = min_x.min(sx);
+                    min_y = min_y.min(sy);
+                    max_x = max_x.max(sx);
+                    max_y = max_y.max(sy);
+                }
+            }
+        };
         'glyphs: for glyph in &run.glyphs {
             if self.check_over_budget() {
                 break;
@@ -3262,9 +3873,11 @@ impl<'a> SvgWriter<'a> {
                 match *cmd {
                     OutlineCommand::MoveTo(x, y) => {
                         ok &= self.push_glyph_point(&mut part, 'M', &[(x, y)], upem, run, off);
+                        record_bounds(&[(x, y)], off);
                     }
                     OutlineCommand::LineTo(x, y) => {
                         ok &= self.push_glyph_point(&mut part, 'L', &[(x, y)], upem, run, off);
+                        record_bounds(&[(x, y)], off);
                     }
                     OutlineCommand::QuadTo(x1, y1, x, y) => {
                         ok &= self.push_glyph_point(
@@ -3275,6 +3888,7 @@ impl<'a> SvgWriter<'a> {
                             run,
                             off,
                         );
+                        record_bounds(&[(x1, y1), (x, y)], off);
                     }
                     OutlineCommand::CurveTo(x1, y1, x2, y2, x, y) => {
                         ok &= self.push_glyph_point(
@@ -3285,6 +3899,7 @@ impl<'a> SvgWriter<'a> {
                             run,
                             off,
                         );
+                        record_bounds(&[(x1, y1), (x2, y2), (x, y)], off);
                     }
                     OutlineCommand::Close => part.push('Z'),
                 }
@@ -3296,12 +3911,24 @@ impl<'a> SvgWriter<'a> {
                 d.push_str(&part);
             }
         }
-        (!d.is_empty()).then_some(d)
+        if d.is_empty() {
+            return None;
+        }
+        let bounds = SvgRect::from_bounds_clamped(
+            min_x,
+            min_y,
+            max_x,
+            max_y,
+            2.0,
+            self.page_width,
+            self.page_height,
+        );
+        Some((d, bounds))
     }
 
     /// Outline fonts: all glyphs of the run merge into one nonzero-filled path.
     fn emit_outline_run(&mut self, run: &GlyphRun, font: &LoadedFont, color: &Color, opacity: f32) {
-        let Some(d) = self.outline_run_path_data(run, font) else {
+        let Some((d, _)) = self.outline_run_path_data(run, font) else {
             return;
         };
         self.out.push_str("<path d=\"");
@@ -3336,6 +3963,7 @@ impl<'a> SvgWriter<'a> {
         if shape_body.is_empty() {
             return;
         }
+        let affected = self.clip_bounds.unwrap_or_else(|| self.full_page_rect());
         let plan = self.emit_tiling_plan(tiling, depth);
         match plan {
             TilingPassPlan::Affine { t_id, k_id, mk_id } => {
@@ -3353,7 +3981,8 @@ impl<'a> SvgWriter<'a> {
                             mk_id,
                             shape_id,
                         },
-                        4,
+                        14,
+                        Some(affected),
                         true,
                     ) {
                         return;
@@ -3384,39 +4013,19 @@ impl<'a> SvgWriter<'a> {
                     [TilingPlanOp::Pattern { pat_id, blend_mode }] => Some((*pat_id, *blend_mode)),
                     _ => None,
                 };
-                let has_opacity_group = Self::ops_has_opacity_group(&ops);
                 if depth == 0
                     && (single_pattern.is_none()
                         || (self.pending_backdrop.is_some()
                             && single_pattern.is_some_and(|(_, m)| m != BlendMode::Normal)))
                 {
-                    if self.pending_backdrop.is_some() || !self.out.is_empty() || has_opacity_group
-                    {
-                        let shape_id = self.fresh_id();
-                        let _ = write!(self.defs, "<g id=\"s{shape_id}\"");
-                        push_opacity(&mut self.defs, "opacity", opacity);
-                        self.defs.push_str(">\n");
-                        self.defs.push_str(&shape_body);
-                        self.defs.push_str("</g>\n");
-                        if ops.len() > MAX_BACKDROP_FILTER_PASSES
-                            && self.non_isolated_filter_depth == 0
-                        {
-                            if self.emit_chunked_tiling_ops(&ops, shape_id) {
-                                return;
-                            }
-                        } else {
-                            let pass_count = ops.len();
-                            if self.enqueue_backdrop_step(
-                                BackdropStep::MultiPass {
-                                    ops: ops.clone(),
-                                    shape_id,
-                                },
-                                pass_count,
-                                has_opacity_group,
-                            ) {
-                                return;
-                            }
-                        }
+                    let mut wrapped_shape = String::with_capacity(shape_body.len() + 48);
+                    wrapped_shape.push_str("<g");
+                    push_opacity(&mut wrapped_shape, "opacity", opacity);
+                    wrapped_shape.push_str(">\n");
+                    wrapped_shape.push_str(&shape_body);
+                    wrapped_shape.push_str("</g>\n");
+                    if self.emit_tiling_multi_pass_backdrop(&ops, &wrapped_shape, affected) {
+                        return;
                     }
                     self.flush_pending_backdrop();
                 }
@@ -6777,6 +7386,356 @@ mod tests {
         assert!(
             hb_rgb.iter().all(|&c| (122..=134).contains(&c)),
             "SVG 65th-copy black detail at 50% object opacity across chunks must be ~128, got {hb_rgb:?}"
+        );
+    }
+
+    #[test]
+    fn dense_non_affine_65_copies_on_letter_page_bounds_filter_memory_in_svg() {
+        // 65 overlapping copies × 128 spanning Darken/Lighten gray segments plus
+        // a copy-65 black detail painted into a small 20×20 box on a full
+        // 612×792 Letter page must NOT emit an 8,192-feImage full-page `<filter>`
+        // (which would allocate ~15+ GiB in resvg). It evaluates in-place with
+        // O(1) raster memory and renders accurately through resvg.
+        let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 130.0, 2.0));
+        for k in 0..128 {
+            let (mode, gray) = if k % 2 == 0 {
+                (BlendMode::Darken, 0.6)
+            } else {
+                (BlendMode::Lighten, 0.4)
+            };
+            cell.push(RenderCommand::PushBlendGroup {
+                blend_mode: mode,
+                isolated: true,
+                knockout: false,
+                bounds: Rect::new(0.0, 0.0, 130.0, 2.0),
+                alpha: 1.0,
+                mask: None,
+            });
+            cell.push(RenderCommand::FillPath {
+                path: rect_path(0.0, 0.0, 130.0, 2.0),
+                rule: FillRule::NonZero,
+                paint: Paint::Solid(Color::gray(gray)),
+                alpha: 1.0,
+                overprint: None,
+            });
+            cell.push(RenderCommand::PopBlendGroup);
+        }
+        cell.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Darken,
+            isolated: true,
+            knockout: false,
+            bounds: Rect::new(0.0, 0.0, 1.0, 2.0),
+            alpha: 1.0,
+            mask: None,
+        });
+        cell.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 1.0, 2.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::black()),
+            alpha: 1.0,
+            overprint: None,
+        });
+        cell.push(RenderCommand::PopBlendGroup);
+
+        let tiling = std::sync::Arc::new(zpdf_display_list::TilingPattern {
+            commands: std::sync::Arc::new(cell),
+            bbox: Rect::new(0.0, 0.0, 130.0, 2.0),
+            x_step: 2.0,
+            y_step: 2.0,
+            matrix: zpdf_core::Matrix::identity(),
+            tiling_type: 1,
+        });
+
+        let page_rect = Rect::new(0.0, 0.0, 612.0, 792.0);
+        let mut dl = DisplayList::new(page_rect);
+        // Small 8×8 box at (100, 100) at 50% opacity on a white 612×792 Letter page.
+        dl.push(RenderCommand::FillPath {
+            path: rect_path(100.0, 100.0, 108.0, 108.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(std::sync::Arc::clone(&tiling)),
+            alpha: 0.5,
+            overprint: None,
+        });
+
+        let svg = display_list_to_svg(
+            &dl,
+            &FontCache::new(),
+            &ImageCache::new(),
+            &SvgOptions {
+                background: Some(Color::white()),
+                ..SvgOptions::default()
+            },
+        );
+        // Flat dense pattern on an opaque Letter page must not emit any `<feImage>`
+        // filter buffers (evaluates in-place in O(1) memory).
+        assert_eq!(
+            svg.matches("<feImage").count(),
+            0,
+            "flat dense non-affine pattern on opaque Letter page must evaluate in-place with 0 <feImage> filter buffers"
+        );
+
+        let tree = resvg::usvg::Tree::from_data(svg.as_bytes(), &resvg::usvg::Options::default())
+            .expect("valid Letter SVG");
+        let mut pixmap = resvg::tiny_skia::Pixmap::new(612, 792).expect("pixmap");
+        let sx = 612.0 / tree.size().width();
+        let sy = 792.0 / tree.size().height();
+        resvg::render(
+            &tree,
+            resvg::tiny_skia::Transform::from_scale(sx, sy),
+            &mut pixmap.as_mut(),
+        );
+
+        // PDF y=104 maps to SVG y = 792 - 104 = 688.
+        // x=104 (even -> copy-65 black detail at 50% opacity over white): ~128.
+        let black_50 = pixmap.pixel(104, 688).expect("in bounds");
+        let b_rgb = [black_50.red(), black_50.green(), black_50.blue()];
+        assert!(
+            b_rgb.iter().all(|&c| (122..=134).contains(&c)),
+            "Letter-page 8×8 copy-65 black detail at 50% opacity must be ~128, got {b_rgb:?}"
+        );
+        // x=105 (odd -> Darken(0.6)/Lighten(0.4) = 0.6 at 50% over white -> 0.8 = ~204).
+        let gray_50 = pixmap.pixel(105, 688).expect("in bounds");
+        let g_rgb = [gray_50.red(), gray_50.green(), gray_50.blue()];
+        assert!(
+            g_rgb.iter().all(|&c| (198..=210).contains(&c)),
+            "Letter-page 8×8 Darken(0.6) strip at 50% opacity over white must be ~204, got {g_rgb:?}"
+        );
+        // Outside box must stay pure white.
+        let outside = pixmap.pixel(50, 50).expect("in bounds");
+        assert_eq!(
+            [outside.red(), outside.green(), outside.blue()],
+            [255, 255, 255],
+            "pixels outside 8×8 box on Letter page must stay untouched white"
+        );
+
+        // Also verify the translucent-page path (background: None with a semi-transparent
+        // backdrop rect): emits at most 2 `<feImage>` primitives inside ONE tightly
+        // scoped 12×12 `<filter>` rather than 8,320 full-page `<feImage>` buffers.
+        let mut dl_trans = DisplayList::new(page_rect);
+        dl_trans.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 612.0, 792.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgba(1.0, 1.0, 1.0, 0.5)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        dl_trans.push(RenderCommand::FillPath {
+            path: rect_path(100.0, 100.0, 108.0, 108.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(std::sync::Arc::clone(&tiling)),
+            alpha: 0.5,
+            overprint: None,
+        });
+        let svg_trans = display_list_to_svg(
+            &dl_trans,
+            &FontCache::new(),
+            &ImageCache::new(),
+            &SvgOptions {
+                background: None,
+                ..SvgOptions::default()
+            },
+        );
+        assert!(
+            svg_trans.matches("<feImage").count() <= 2,
+            "translucent Letter-page flat dense pattern must use <= 2 <feImage> primitives, got {}",
+            svg_trans.matches("<feImage").count()
+        );
+        assert!(
+            svg_trans.contains("width=\"12\" height=\"12\" color-interpolation-filters"),
+            "translucent Letter-page 8×8 box filter must be scoped to 12×12"
+        );
+        let tree_t =
+            resvg::usvg::Tree::from_data(svg_trans.as_bytes(), &resvg::usvg::Options::default())
+                .expect("valid translucent Letter SVG");
+        let mut pixmap_t = resvg::tiny_skia::Pixmap::new(612, 792).expect("pixmap");
+        let sx_t = 612.0 / tree_t.size().width();
+        let sy_t = 792.0 / tree_t.size().height();
+        resvg::render(
+            &tree_t,
+            resvg::tiny_skia::Transform::from_scale(sx_t, sy_t),
+            &mut pixmap_t.as_mut(),
+        );
+        // Outside box must keep the untouched 50%-alpha white backdrop (~128 premultiplied).
+        let out_t = pixmap_t.pixel(50, 50).expect("in bounds");
+        assert!(
+            (122..=134).contains(&out_t.alpha()),
+            "translucent backdrop outside 8×8 box must stay ~128 alpha, got {}",
+            out_t.alpha()
+        );
+        // Inside box at x=104 (copy-65 opaque black Darken over 50%-white, blended at 50% fill alpha):
+        // eval has premul (0, 0, 0, 1); orig has premul (0.5, 0.5, 0.5, 0.5);
+        // 0.5 * eval + 0.5 * orig = premul (0.25, 0.25, 0.25, 0.75) => alpha ~191, rgb ~64.
+        let in_t = pixmap_t.pixel(104, 688).expect("in bounds");
+        assert!(
+            (184..=198).contains(&in_t.alpha()) && (58..=70).contains(&in_t.red()),
+            "translucent copy-65 black detail at 50% must have premul ~64/191, got {:?}",
+            [in_t.red(), in_t.green(), in_t.blue(), in_t.alpha()]
+        );
+    }
+
+    #[test]
+    fn dense_opacity_group_on_letter_page_scopes_filter_to_affected_bounds_in_svg() {
+        // A small 20×20 box on a 612×792 Letter page painted with an `OpacityGroup`
+        // (which requires `<filter>` evaluation rather than flat `<rect>` blending)
+        // must scope its `<filter>` region tightly to the affected box instead of
+        // allocating full 612×792 intermediate buffers.
+        let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 20.0, 2.0));
+        cell.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Normal,
+            isolated: false,
+            knockout: false,
+            bounds: Rect::new(0.0, 0.0, 20.0, 2.0),
+            alpha: 0.5,
+            mask: None,
+        });
+        for _ in 0..8 {
+            cell.push(RenderCommand::PushBlendGroup {
+                blend_mode: BlendMode::Darken,
+                isolated: true,
+                knockout: false,
+                bounds: Rect::new(0.0, 0.0, 20.0, 2.0),
+                alpha: 1.0,
+                mask: None,
+            });
+            cell.push(RenderCommand::FillPath {
+                path: rect_path(0.0, 0.0, 20.0, 2.0),
+                rule: FillRule::NonZero,
+                paint: Paint::Solid(Color::gray(0.5)),
+                alpha: 1.0,
+                overprint: None,
+            });
+            cell.push(RenderCommand::PopBlendGroup);
+        }
+        cell.push(RenderCommand::PopBlendGroup);
+        let tiling = std::sync::Arc::new(zpdf_display_list::TilingPattern {
+            commands: std::sync::Arc::new(cell),
+            bbox: Rect::new(0.0, 0.0, 20.0, 2.0),
+            x_step: 2.0,
+            y_step: 2.0,
+            matrix: zpdf_core::Matrix::identity(),
+            tiling_type: 1,
+        });
+
+        let page_rect = Rect::new(0.0, 0.0, 612.0, 792.0);
+        let mut dl = DisplayList::new(page_rect);
+        dl.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 612.0, 792.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::gray(0.25)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        dl.push(RenderCommand::FillPath {
+            path: rect_path(100.0, 100.0, 120.0, 120.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(std::sync::Arc::clone(&tiling)),
+            alpha: 1.0,
+            overprint: None,
+        });
+
+        let svg = display_list_to_svg(
+            &dl,
+            &FontCache::new(),
+            &ImageCache::new(),
+            &SvgOptions::default(),
+        );
+        // Filter must be scoped tightly to the 20×20 box (+2pt AA pad => 24×24),
+        // NOT the full 612×792 Letter page.
+        assert!(
+            svg.contains("width=\"24\" height=\"24\""),
+            "expected `<filter>` scoped to 24×24 affected bounds on 612×792 page"
+        );
+        assert!(
+            !svg.contains("<filter id=\"f")
+                || !svg.contains("width=\"612\" height=\"792\" color-interpolation-filters"),
+            "must not emit a full-page 612×792 <filter> for a 20×20 patterned box"
+        );
+
+        let tree = resvg::usvg::Tree::from_data(svg.as_bytes(), &resvg::usvg::Options::default())
+            .expect("valid scoped Letter SVG");
+        let mut pixmap = resvg::tiny_skia::Pixmap::new(612, 792).expect("pixmap");
+        let sx = 612.0 / tree.size().width();
+        let sy = 792.0 / tree.size().height();
+        resvg::render(
+            &tree,
+            resvg::tiny_skia::Transform::from_scale(sx, sy),
+            &mut pixmap.as_mut(),
+        );
+
+        // Inside 20×20 box (PDF y=110 -> SVG y=682): Darken(0.5, 0.25) = 0.25 (~64).
+        let inside = pixmap.pixel(110, 682).expect("in bounds");
+        let in_rgb = [inside.red(), inside.green(), inside.blue()];
+        assert!(
+            in_rgb.iter().all(|&c| (60..=68).contains(&c)),
+            "scoped OpacityGroup around Darken(0.5) over 25% gray must stay ~64, got {in_rgb:?}"
+        );
+        // Outside box must keep the 25% gray page background (~64).
+        let outside = pixmap.pixel(50, 50).expect("in bounds");
+        let out_rgb = [outside.red(), outside.green(), outside.blue()];
+        assert!(
+            out_rgb.iter().all(|&c| (60..=68).contains(&c)),
+            "background outside scoped filter region must remain ~64, got {out_rgb:?}"
+        );
+
+        // Also verify a full-page 612×792 box with the same OpacityGroup cell:
+        // must split into bounded chunks where every `<filter>` stays within the
+        // intermediate-pixel budget (<= 34 primitives per full-page filter).
+        let mut dl_full = DisplayList::new(page_rect);
+        dl_full.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 612.0, 792.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::gray(0.25)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        dl_full.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 612.0, 792.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(tiling),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let svg_full = display_list_to_svg(
+            &dl_full,
+            &FontCache::new(),
+            &ImageCache::new(),
+            &SvgOptions::default(),
+        );
+        let filter_count = svg_full.matches("<filter ").count();
+        assert!(
+            filter_count >= 2,
+            "full-page 612×792 OpacityGroup exceeding 34 primitives must split into bounded chunks, got {filter_count}"
+        );
+        for chunk in svg_full.split("<filter ").skip(1) {
+            let body = chunk.split("</filter>").next().unwrap_or("");
+            let prims = body.matches("<feImage").count()
+                + body.matches("<feBlend").count()
+                + body.matches("<feComposite").count()
+                + body.matches("<feComponentTransfer").count()
+                + body.matches("<feFlood").count();
+            assert!(
+                prims <= 34,
+                "full-page 612×792 <filter> exceeded intermediate-pixel primitive budget (34): got {prims}"
+            );
+        }
+        let tree_f =
+            resvg::usvg::Tree::from_data(svg_full.as_bytes(), &resvg::usvg::Options::default())
+                .expect("valid full-page chunked Letter SVG");
+        // Render at 1/4 scale (153×198) so debug-mode resvg completes in <1s while
+        // still exercising the full multi-chunk `<filter>` chain end-to-end.
+        let mut pixmap_f = resvg::tiny_skia::Pixmap::new(153, 198).expect("pixmap");
+        let sx_f = 153.0 / tree_f.size().width();
+        let sy_f = 198.0 / tree_f.size().height();
+        resvg::render(
+            &tree_f,
+            resvg::tiny_skia::Transform::from_scale(sx_f, sy_f),
+            &mut pixmap_f.as_mut(),
+        );
+        let px_f = pixmap_f.pixel(76, 100).expect("in bounds");
+        let f_rgb = [px_f.red(), px_f.green(), px_f.blue()];
+        assert!(
+            f_rgb.iter().all(|&c| (60..=68).contains(&c)),
+            "full-page chunked OpacityGroup on Letter page must stay ~64, got {f_rgb:?}"
         );
     }
 }
