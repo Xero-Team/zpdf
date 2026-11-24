@@ -4982,8 +4982,10 @@ mod tests {
             out
         }
 
-        // CFF2 charstring for gid 1: rectangle (200, 200) -> (600, 1000) in
-        // 2000-UPEM design units (no width operand and no `endchar` in CFF2).
+        // CFF2 variable charstring for gid 1 in 2000-UPEM design units:
+        // default master (wght=400) draws rectangle (200, 200) -> (600, 1000);
+        // bold master (wght=900, region 0 scalar=1.0) widens right edge by +200
+        // via CFF2 `blend` (op 16) to (200, 200) -> (800, 1000).
         fn encode_cs_int(out: &mut Vec<u8>, v: i32) {
             if (-107..=107).contains(&v) {
                 out.push((v + 139) as u8);
@@ -5002,53 +5004,67 @@ mod tests {
         let mut rect_cs = Vec::new();
         encode_cs_int(&mut rect_cs, 200);
         encode_cs_int(&mut rect_cs, 200);
-        rect_cs.push(21); // rmoveto
+        rect_cs.push(21); // rmoveto -> (200, 200)
         encode_cs_int(&mut rect_cs, 400);
+        encode_cs_int(&mut rect_cs, 200);
+        encode_cs_int(&mut rect_cs, 1);
+        rect_cs.push(16); // blend (n=1, k=1): dx = 400 + 200 * scalar
         encode_cs_int(&mut rect_cs, 0);
-        rect_cs.push(5); // rlineto -> (600, 200)
+        rect_cs.push(5); // rlineto -> (600 + 200*scalar, 200)
         encode_cs_int(&mut rect_cs, 0);
         encode_cs_int(&mut rect_cs, 800);
-        rect_cs.push(5); // rlineto -> (600, 1000)
+        rect_cs.push(5); // rlineto -> (600 + 200*scalar, 1000)
         encode_cs_int(&mut rect_cs, -400);
+        encode_cs_int(&mut rect_cs, -200);
+        encode_cs_int(&mut rect_cs, 1);
+        rect_cs.push(16); // blend (n=1, k=1): dx = -400 - 200 * scalar
         encode_cs_int(&mut rect_cs, 0);
         rect_cs.push(5); // rlineto -> (200, 1000)
 
         let char_strings = encode_cff2_index(&[&[], &rect_cs]);
         let global_subrs = encode_cff2_index(&[]);
-        // Minimal CFF2 VariationStore (required by ttf-parser's CFF2 outliner
-        // to resolve default scalars at vsindex 0): 2-byte length + format-1
-        // ItemVariationStore with 0 axes, 0 regions, and 1 empty data subtable.
+
+        // Conforming CFF2 VariationStore paired with `fvar` (`wght` 400..900):
+        // 1 axis, 1 region [start=0.0, peak=1.0, end=1.0] in F2DOT14, and 1
+        // ItemVariationData subtable referencing region 0.
         let mut vstore = Vec::new();
-        vstore.extend_from_slice(&22u16.to_be_bytes()); // length
+        vstore.extend_from_slice(&30u16.to_be_bytes()); // length = 30
         vstore.extend_from_slice(&1u16.to_be_bytes()); // format = 1
         vstore.extend_from_slice(&12u32.to_be_bytes()); // variationRegionListOffset = 12
         vstore.extend_from_slice(&1u16.to_be_bytes()); // itemVariationDataCount = 1
-        vstore.extend_from_slice(&16u32.to_be_bytes()); // itemVariationDataOffsets[0] = 16
-        vstore.extend_from_slice(&0u16.to_be_bytes()); // axisCount = 0
-        vstore.extend_from_slice(&0u16.to_be_bytes()); // regionCount = 0
-        vstore.extend_from_slice(&0u16.to_be_bytes()); // itemCount = 0
+        vstore.extend_from_slice(&22u32.to_be_bytes()); // itemVariationDataOffsets[0] = 22
+                                                        // VariationRegionList (offset 12, 10 bytes):
+        vstore.extend_from_slice(&1u16.to_be_bytes()); // axisCount = 1
+        vstore.extend_from_slice(&1u16.to_be_bytes()); // regionCount = 1
+        vstore.extend_from_slice(&0i16.to_be_bytes()); // startCoord = 0.0
+        vstore.extend_from_slice(&0x4000i16.to_be_bytes()); // peakCoord = 1.0 (F2DOT14)
+        vstore.extend_from_slice(&0x4000i16.to_be_bytes()); // endCoord = 1.0 (F2DOT14)
+                                                            // ItemVariationData[0] (offset 22, 8 bytes):
+        vstore.extend_from_slice(&0u16.to_be_bytes()); // itemCount = 0 (deltas inline in charstrings)
         vstore.extend_from_slice(&0u16.to_be_bytes()); // wordDeltaCount = 0
-        vstore.extend_from_slice(&0u16.to_be_bytes()); // regionIndexCount = 0
+        vstore.extend_from_slice(&1u16.to_be_bytes()); // regionIndexCount = 1
+        vstore.extend_from_slice(&0u16.to_be_bytes()); // regionIndexes[0] = 0
 
         let build_cff2_sfnt = |include_unsupported_fd_matrix: bool| -> Vec<u8> {
-            // Fixed-width 5-byte DICT integers (`29 <i32>`) keep Top/Font DICT
-            // byte lengths invariant when plugging in final table offsets.
+            // Fixed-width 5-byte DICT integers (`29 <i32>`) keep Top DICT byte
+            // length invariant when plugging in final table offsets.
             let push_i32 = |out: &mut Vec<u8>, v: i32| {
                 out.push(29);
                 out.extend_from_slice(&v.to_be_bytes());
             };
-            let build_fd = |priv_off: usize| -> Vec<u8> {
-                let mut fd = Vec::new();
-                if include_unsupported_fd_matrix {
-                    // Unsupported in CFF2 FontDICT (OpenType CFF2 allows only
-                    // PrivateDICTOffset); must NOT rescale gid 1.
-                    encode_cff_matrix(&mut fd, &["0.002", "0", "0", "0.002", "0", "0"]);
-                }
-                push_i32(&mut fd, 0); // Private DICT size = 0
-                push_i32(&mut fd, priv_off as i32);
-                fd.push(18); // Private
-                fd
-            };
+            let mut fd = Vec::new();
+            if include_unsupported_fd_matrix {
+                // Unsupported in CFF2 FontDICT (OpenType CFF2 allows only
+                // PrivateDICTOffset); must NOT rescale gid 1.
+                encode_cff_matrix(&mut fd, &["0.002", "0", "0", "0.002", "0", "0"]);
+            }
+            // Per OpenType CFF2 FontDICT spec, an empty Private DICT encodes
+            // both size and offset as `0 0`.
+            push_i32(&mut fd, 0); // Private DICT size = 0
+            push_i32(&mut fd, 0); // Private DICT offset = 0
+            fd.push(18); // Private
+            let fd_array = encode_cff2_index(&[&fd]);
+
             let build_top = |cs_off: usize, fd_arr_off: usize, vstore_off: usize| -> Vec<u8> {
                 let mut d = Vec::new();
                 // Conforming 2000-UPEM Top DICT FontMatrix = 1 / 2000.
@@ -5065,15 +5081,9 @@ mod tests {
             let top_len = build_top(0, 0, 0).len();
             let cs_off = 5 + top_len + global_subrs.len();
             let fd_arr_off = cs_off + char_strings.len();
-            let dummy_fd = build_fd(0);
-            let dummy_fd_array = encode_cff2_index(&[&dummy_fd]);
-            let vstore_off = fd_arr_off + dummy_fd_array.len();
-            let priv_off = vstore_off + vstore.len();
-            let fd = build_fd(priv_off);
-            let fd_array = encode_cff2_index(&[&fd]);
+            let vstore_off = fd_arr_off + fd_array.len();
             let top = build_top(cs_off, fd_arr_off, vstore_off);
             assert_eq!(top.len(), top_len);
-            assert_eq!(fd_array.len(), dummy_fd_array.len());
 
             let mut cff2 = vec![2u8, 0, 5];
             cff2.extend_from_slice(&(top.len() as u16).to_be_bytes());
@@ -5083,9 +5093,25 @@ mod tests {
             cff2.extend_from_slice(&fd_array);
             cff2.extend_from_slice(&vstore);
 
-            // Minimal conforming OpenType sfnt (`OTTO`) with `head` (UPEM=2000),
-            // `hhea`, `hmtx` (gid 1 advance=1200), `maxp` (v0.5, numGlyphs=2),
-            // and `CFF2`.
+            // Conforming `fvar` table declaring one `wght` axis [400, 400, 900].
+            let mut fvar = Vec::new();
+            fvar.extend_from_slice(&0x0001_0000u32.to_be_bytes()); // majorVersion=1, minorVersion=0
+            fvar.extend_from_slice(&16u16.to_be_bytes()); // axesArrayOffset = 16
+            fvar.extend_from_slice(&2u16.to_be_bytes()); // reserved = 2
+            fvar.extend_from_slice(&1u16.to_be_bytes()); // axisCount = 1
+            fvar.extend_from_slice(&20u16.to_be_bytes()); // axisSize = 20
+            fvar.extend_from_slice(&0u16.to_be_bytes()); // instanceCount = 0
+            fvar.extend_from_slice(&8u16.to_be_bytes()); // instanceSize = axisCount * 4 + 4
+            fvar.extend_from_slice(b"wght");
+            fvar.extend_from_slice(&(400i32 << 16).to_be_bytes()); // minValue = 400.0
+            fvar.extend_from_slice(&(400i32 << 16).to_be_bytes()); // defaultValue = 400.0
+            fvar.extend_from_slice(&(900i32 << 16).to_be_bytes()); // maxValue = 900.0
+            fvar.extend_from_slice(&0u16.to_be_bytes()); // flags = 0
+            fvar.extend_from_slice(&256u16.to_be_bytes()); // axisNameID
+
+            // Conforming OpenType variable sfnt (`OTTO`) with `CFF2`, `fvar`,
+            // `head` (UPEM=2000), `hhea`, `hmtx` (gid 1 advance=1200), and
+            // `maxp` (v0.5, numGlyphs=2).
             let mut head = vec![0u8; 54];
             head[0..4].copy_from_slice(&0x0001_0000u32.to_be_bytes());
             head[12..16].copy_from_slice(&0x5F0F_3CF5u32.to_be_bytes());
@@ -5109,8 +5135,9 @@ mod tests {
             maxp.extend_from_slice(&0x0000_5000u32.to_be_bytes()); // CFF/CFF2 version 0.5
             maxp.extend_from_slice(&2u16.to_be_bytes()); // numGlyphs = 2
 
-            let tables: [(&[u8; 4], &[u8]); 5] = [
+            let tables: [(&[u8; 4], &[u8]); 6] = [
                 (b"CFF2", &cff2),
+                (b"fvar", &fvar),
                 (b"head", &head),
                 (b"hhea", &hhea),
                 (b"hmtx", &hmtx),
@@ -5142,13 +5169,15 @@ mod tests {
 
         for include_unsupported_fd_matrix in [false, true] {
             let sfnt = build_cff2_sfnt(include_unsupported_fd_matrix);
-            let font = LoadedFont::new_with_data(
+            let mut font = LoadedFont::new_with_data(
                 PdfFontType::TrueType,
                 "SyntheticCFF2".into(),
                 sfnt,
                 CidWidths::new(1000.0),
             );
             assert_eq!(font.units_per_em, 2000.0);
+
+            // Default master (wght=400): outline stays in 2000-UPEM design units.
             let outline = font
                 .glyph_outline(1)
                 .expect("gid 1 CFF2 outline must extract through LoadedFont::glyph_outline");
@@ -5156,11 +5185,27 @@ mod tests {
             let (x0, y0, x1, y1) = outline_bbox(&outline);
             assert!(
                 (x0 - 200.0).abs() < 1e-6 && (x1 - 600.0).abs() < 1e-6,
-                "CFF2 x bbox must stay in 2000-UPEM design units (fd_matrix={include_unsupported_fd_matrix}): got ({x0}, {x1})"
+                "CFF2 default x bbox must stay in 2000-UPEM design units (fd_matrix={include_unsupported_fd_matrix}): got ({x0}, {x1})"
             );
             assert!(
                 (y0 - 200.0).abs() < 1e-6 && (y1 - 1000.0).abs() < 1e-6,
-                "CFF2 y bbox must stay in 2000-UPEM design units (fd_matrix={include_unsupported_fd_matrix}): got ({y0}, {y1})"
+                "CFF2 default y bbox must stay in 2000-UPEM design units (fd_matrix={include_unsupported_fd_matrix}): got ({y0}, {y1})"
+            );
+
+            // Bold master (wght=900): real CFF2 `blend` delta widens x1 from 600 to 800
+            // while remaining in 2000-UPEM design units and ignoring FD FontMatrix.
+            font.set_variations(Some(900.0), None, None, false);
+            let bold_outline = font
+                .glyph_outline(1)
+                .expect("varied gid 1 CFF2 outline must extract");
+            let (bx0, by0, bx1, by1) = outline_bbox(&bold_outline);
+            assert!(
+                (bx0 - 200.0).abs() < 1e-6 && (bx1 - 800.0).abs() < 1e-6,
+                "CFF2 varied x bbox must widen to (200, 800) in 2000-UPEM units (fd_matrix={include_unsupported_fd_matrix}): got ({bx0}, {bx1})"
+            );
+            assert!(
+                (by0 - 200.0).abs() < 1e-6 && (by1 - 1000.0).abs() < 1e-6,
+                "CFF2 varied y bbox must stay (200, 1000) in 2000-UPEM units (fd_matrix={include_unsupported_fd_matrix}): got ({by0}, {by1})"
             );
         }
     }

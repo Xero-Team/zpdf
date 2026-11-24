@@ -18,6 +18,7 @@
 use std::collections::{HashMap, HashSet};
 
 use zpdf_core::{ObjectId, PdfDict, PdfName, PdfObject, Result};
+pub use zpdf_display_list::BlendMode;
 use zpdf_document::escape_text;
 
 use crate::metadata::encode_text_string;
@@ -90,6 +91,7 @@ enum PageItem {
     Path {
         segments: Vec<PathSegment>,
         style: PathStyle,
+        options: PathPaintOptions,
         tag: Option<TagSpec>,
     },
 }
@@ -139,6 +141,173 @@ impl Default for PathStyle {
             fill: None,
             line_width: 1.0,
         }
+    }
+}
+
+/// Graphics-state paint options for a vector path (ISO 32000-1 §8.4.5,
+/// §11.3.5, §11.6).
+///
+/// Each path painted with [`DocumentBuilder::add_path_with_options`] runs
+/// inside its own isolated `q … Q` graphics-state scope, so opacity and blend
+/// mode never leak into subsequent text, images, or paths.
+///
+/// **Per-path opacity vs. transparency-group opacity:** `fill_opacity` (`/ca`)
+/// and `stroke_opacity` (`/CA`) apply individually to each painted path, not
+/// as a shared transparency group across multiple paths. Overlapping
+/// translucent paths therefore composite on top of each other in drawing
+/// order (matching individual ink or highlighter strokes).
+///
+/// # Example
+/// ```no_run
+/// use zpdf_writer::{BlendMode, DocumentBuilder, PathPaintOptions, PathSegment, PathStyle};
+///
+/// let mut builder = DocumentBuilder::new();
+/// let page = builder.add_page(300.0, 200.0);
+///
+/// // 1. Normal opaque text underneath.
+/// builder.add_text(page, "Highlighted text", 40.0, 120.0, "Helvetica", 18.0, (0.0, 0.0, 0.0))?;
+///
+/// // 2. Translucent ink path (normal blend, 50% fill opacity).
+/// builder.add_path_with_options(
+///     page,
+///     vec![PathSegment::Rect { x: 30.0, y: 40.0, width: 120.0, height: 30.0 }],
+///     PathStyle { fill: Some((0.1, 0.4, 0.9)), stroke: None, line_width: 1.0 },
+///     PathPaintOptions::new().with_fill_opacity(0.5),
+/// )?;
+///
+/// // 3. Highlighter stroke over text using Multiply blend mode.
+/// builder.add_path_with_options(
+///     page,
+///     vec![PathSegment::Rect { x: 36.0, y: 114.0, width: 150.0, height: 24.0 }],
+///     PathStyle { fill: Some((1.0, 0.95, 0.2)), stroke: None, line_width: 1.0 },
+///     PathPaintOptions::new()
+///         .with_fill_opacity(0.45)
+///         .with_blend_mode(BlendMode::Multiply),
+/// )?;
+///
+/// // 4. Subsequent content automatically renders opaque with Normal blending.
+/// builder.add_path(
+///     page,
+///     vec![PathSegment::Rect { x: 200.0, y: 40.0, width: 60.0, height: 30.0 }],
+///     PathStyle { fill: Some((0.0, 0.0, 0.0)), stroke: None, line_width: 1.0 },
+/// )?;
+/// let _pdf = builder.build()?;
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PathPaintOptions {
+    /// Non-stroking (fill) constant opacity (`/ca`), finite and in `[0.0, 1.0]`.
+    pub fill_opacity: f64,
+    /// Stroking constant opacity (`/CA`), finite and in `[0.0, 1.0]`.
+    pub stroke_opacity: f64,
+    /// Blend mode (`/BM`). Defaults to [`BlendMode::Normal`].
+    pub blend_mode: BlendMode,
+}
+
+impl Default for PathPaintOptions {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PathPaintOptions {
+    /// Default opaque, normal-blend options (`fill_opacity = 1.0`,
+    /// `stroke_opacity = 1.0`, `blend_mode = BlendMode::Normal`).
+    pub const fn new() -> Self {
+        Self {
+            fill_opacity: 1.0,
+            stroke_opacity: 1.0,
+            blend_mode: BlendMode::Normal,
+        }
+    }
+
+    /// Set both `fill_opacity` (`/ca`) and `stroke_opacity` (`/CA`).
+    pub const fn with_opacity(mut self, opacity: f64) -> Self {
+        self.fill_opacity = opacity;
+        self.stroke_opacity = opacity;
+        self
+    }
+
+    /// Set the non-stroking (fill) opacity (`/ca`).
+    pub const fn with_fill_opacity(mut self, opacity: f64) -> Self {
+        self.fill_opacity = opacity;
+        self
+    }
+
+    /// Set the stroking opacity (`/CA`).
+    pub const fn with_stroke_opacity(mut self, opacity: f64) -> Self {
+        self.stroke_opacity = opacity;
+        self
+    }
+
+    /// Set the blend mode (`/BM`).
+    pub const fn with_blend_mode(mut self, blend_mode: BlendMode) -> Self {
+        self.blend_mode = blend_mode;
+        self
+    }
+
+    fn normalized(self) -> Result<Self> {
+        let norm = |value: f64, label: &str| -> Result<f64> {
+            if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                return Err(zpdf_core::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("{label} must be finite and within [0.0, 1.0]"),
+                )));
+            }
+            // Canonicalize -0.0 to +0.0 so dedup keys and PDF reals are consistent.
+            Ok(if value == 0.0 { 0.0 } else { value })
+        };
+        Ok(Self {
+            fill_opacity: norm(self.fill_opacity, "fill_opacity")?,
+            stroke_opacity: norm(self.stroke_opacity, "stroke_opacity")?,
+            blend_mode: self.blend_mode,
+        })
+    }
+
+    fn ext_gstate_key(self) -> Option<ExtGStateKey> {
+        if self.fill_opacity == 1.0
+            && self.stroke_opacity == 1.0
+            && self.blend_mode == BlendMode::Normal
+        {
+            None
+        } else {
+            Some(ExtGStateKey {
+                fill_opacity_bits: self.fill_opacity.to_bits(),
+                stroke_opacity_bits: self.stroke_opacity.to_bits(),
+                blend_mode: self.blend_mode,
+            })
+        }
+    }
+}
+
+/// Canonical deduplication key for an `/ExtGState` resource dictionary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ExtGStateKey {
+    fill_opacity_bits: u64,
+    stroke_opacity_bits: u64,
+    blend_mode: BlendMode,
+}
+
+impl ExtGStateKey {
+    fn to_pdf_dict(self) -> PdfDict {
+        let mut dict = PdfDict::new();
+        dict.insert(
+            PdfName::new("Type"),
+            PdfObject::Name(PdfName::new("ExtGState")),
+        );
+        dict.insert(
+            PdfName::new("ca"),
+            PdfObject::Real(f64::from_bits(self.fill_opacity_bits)),
+        );
+        dict.insert(
+            PdfName::new("CA"),
+            PdfObject::Real(f64::from_bits(self.stroke_opacity_bits)),
+        );
+        dict.insert(
+            PdfName::new("BM"),
+            PdfObject::Name(PdfName::new(self.blend_mode.pdf_name())),
+        );
+        dict
     }
 }
 
@@ -646,12 +815,28 @@ impl DocumentBuilder {
         }
     }
 
-    /// Add a vector path to a page.
+    /// Add a vector path to a page with default opaque, normal-blend paint options.
     pub fn add_path(
         &mut self,
         page: PageHandle,
         segments: Vec<PathSegment>,
         style: PathStyle,
+    ) -> Result<()> {
+        self.add_path_with_options(page, segments, style, PathPaintOptions::default())
+    }
+
+    /// Add a vector path to a page with explicit opacity and blend-mode options.
+    ///
+    /// Opacity values must be finite and within `[0.0, 1.0]`; invalid values
+    /// return an error without modifying builder state. Each path is isolated
+    /// in its own `q … Q` scope so its graphics state cannot leak to subsequent
+    /// items.
+    pub fn add_path_with_options(
+        &mut self,
+        page: PageHandle,
+        segments: Vec<PathSegment>,
+        style: PathStyle,
+        options: PathPaintOptions,
     ) -> Result<()> {
         let all_finite = segments.iter().all(|seg| match *seg {
             PathSegment::MoveTo { x, y } | PathSegment::LineTo { x, y } => {
@@ -679,10 +864,12 @@ impl DocumentBuilder {
                 "path coordinates and line width must be finite",
             )));
         }
+        let options = options.normalized()?;
         if let Some(page_state) = self.pages.get_mut(page.0 as usize) {
             page_state.items.push(PageItem::Path {
                 segments,
                 style,
+                options,
                 tag: None,
             });
             Ok(())
@@ -710,6 +897,7 @@ impl DocumentBuilder {
         color: (f64, f64, f64),
         tag: TagSpec,
     ) -> Result<()> {
+        validate_tag_role(&tag)?;
         if font.0 as usize >= self.embedded_fonts.len() {
             return Err(zpdf_core::Error::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -750,6 +938,7 @@ impl DocumentBuilder {
         color: (f64, f64, f64),
         tag: TagSpec,
     ) -> Result<()> {
+        validate_tag_role(&tag)?;
         // Reuse the standard-14 validation in add_text by calling it, then
         // patch in the tag.
         self.add_text(page, text, x, y, font_name, size, color)?;
@@ -773,6 +962,7 @@ impl DocumentBuilder {
         height: f64,
         tag: TagSpec,
     ) -> Result<()> {
+        validate_tag_role(&tag)?;
         self.add_image(page, image, x, y, width, height)?;
         if let Some(page_state) = self.pages.get_mut(page.0 as usize) {
             if let Some(PageItem::Image { tag: slot, .. }) = page_state.items.last_mut() {
@@ -790,7 +980,21 @@ impl DocumentBuilder {
         style: PathStyle,
         tag: TagSpec,
     ) -> Result<()> {
-        self.add_path(page, segments, style)?;
+        self.add_tagged_path_with_options(page, segments, style, PathPaintOptions::default(), tag)
+    }
+
+    /// Add a tagged vector path with explicit opacity and blend-mode options.
+    /// See [`Self::add_path_with_options`] and [`Self::add_tagged_text_embedded`].
+    pub fn add_tagged_path_with_options(
+        &mut self,
+        page: PageHandle,
+        segments: Vec<PathSegment>,
+        style: PathStyle,
+        options: PathPaintOptions,
+        tag: TagSpec,
+    ) -> Result<()> {
+        validate_tag_role(&tag)?;
+        self.add_path_with_options(page, segments, style, options)?;
         if let Some(page_state) = self.pages.get_mut(page.0 as usize) {
             if let Some(PageItem::Path { tag: slot, .. }) = page_state.items.last_mut() {
                 *slot = Some(tag);
@@ -820,7 +1024,7 @@ impl DocumentBuilder {
             .collect();
 
         // Build page content streams and track image objects
-        let mut page_contents = Vec::new();
+        let mut page_contents: Vec<BuiltPageContent> = Vec::new();
         let mut image_objects: Vec<(u32, ImageData)> = Vec::new();
         let mut image_counter = 0usize;
 
@@ -831,12 +1035,13 @@ impl DocumentBuilder {
         let composite_glyph_maps = self.build_composite_glyph_maps();
 
         for (page_idx, page_state) in self.pages.iter().enumerate() {
-            let (content_bytes, font_names, image_refs, tagged) = self.build_page_content(
-                page_state,
-                &mut image_counter,
-                &mut obj_num,
-                &composite_glyph_maps,
-            )?;
+            let (content_bytes, font_names, image_refs, ext_gstates, tagged) = self
+                .build_page_content(
+                    page_state,
+                    &mut image_counter,
+                    &mut obj_num,
+                    &composite_glyph_maps,
+                )?;
 
             // Record image data for the allocated object numbers.
             let mut ref_iter = image_refs.iter();
@@ -851,24 +1056,42 @@ impl DocumentBuilder {
             let content_obj = obj_num;
             obj_num += 1;
 
-            page_contents.push((
-                page_obj_nums[page_idx],
-                content_obj,
+            page_contents.push(BuiltPageContent {
+                page_num: page_obj_nums[page_idx],
+                content_num: content_obj,
                 content_bytes,
                 font_names,
                 image_refs,
+                ext_gstates,
                 tagged,
-            ));
+            });
         }
 
         // Font dicts are emitted as indirect objects (many parsers, including
         // zpdf's own resource loader, only follow /Font entries that are
         // references). Dedup per document by BaseFont name.
         let mut font_obj_by_name: HashMap<String, u32> = HashMap::new();
-        for (_, _, _, font_names, _, _) in &page_contents {
-            for name in font_names {
+        for page_data in &page_contents {
+            for name in &page_data.font_names {
                 if !font_obj_by_name.contains_key(name) {
                     font_obj_by_name.insert(name.clone(), obj_num);
+                    obj_num += 1;
+                }
+            }
+        }
+
+        // ExtGState dicts are deduplicated per document in first-seen order
+        // across all pages so repeated opacity/blend configurations share a
+        // single indirect object.
+        let mut ext_gstate_obj_by_key: HashMap<ExtGStateKey, u32> = HashMap::new();
+        let mut ext_gstate_objects: Vec<(ExtGStateKey, u32)> = Vec::new();
+        for page_data in &page_contents {
+            for &key in &page_data.ext_gstates {
+                if let std::collections::hash_map::Entry::Vacant(entry) =
+                    ext_gstate_obj_by_key.entry(key)
+                {
+                    entry.insert(obj_num);
+                    ext_gstate_objects.push((key, obj_num));
                     obj_num += 1;
                 }
             }
@@ -877,6 +1100,10 @@ impl DocumentBuilder {
         // Build all objects
         let mut objects = Vec::new();
         let mut streams = Vec::new();
+
+        for &(key, num) in &ext_gstate_objects {
+            objects.push((num, PdfObject::Dict(key.to_pdf_dict())));
+        }
 
         for (name, num) in &font_obj_by_name {
             // Embedded fonts use the reserved "\0EMB<idx>" marker; everything
@@ -1364,7 +1591,7 @@ impl DocumentBuilder {
         // MCID order), so the read side can resolve MCID → element.
         let any_tagged = page_contents
             .iter()
-            .any(|(_, _, _, _, _, tagged)| !tagged.is_empty());
+            .any(|page_data| !page_data.tagged.is_empty());
         let tree_root_num: Option<u32> = if any_tagged {
             // Reserve the StructTreeRoot number first so every /StructElem's
             // /P can point back at it.
@@ -1373,12 +1600,12 @@ impl DocumentBuilder {
 
             let mut top_level_elems: Vec<PdfObject> = Vec::new();
             let mut parent_nums: Vec<PdfObject> = Vec::new();
-            for (page_idx, (page_num, _, _, _, _, tagged)) in page_contents.iter().enumerate() {
-                if tagged.is_empty() {
+            for (page_idx, page_data) in page_contents.iter().enumerate() {
+                if page_data.tagged.is_empty() {
                     continue;
                 }
-                let mut elem_refs: Vec<PdfObject> = Vec::with_capacity(tagged.len());
-                for (mcid, spec) in tagged {
+                let mut elem_refs: Vec<PdfObject> = Vec::with_capacity(page_data.tagged.len());
+                for (mcid, spec) in &page_data.tagged {
                     let elem_num = obj_num;
                     obj_num += 1;
                     elem_refs.push(PdfObject::Ref(ObjectId(elem_num, 0)));
@@ -1395,7 +1622,10 @@ impl DocumentBuilder {
                         PdfName::new("P"),
                         PdfObject::Ref(ObjectId(tree_root_num, 0)),
                     );
-                    elem.insert(PdfName::new("Pg"), PdfObject::Ref(ObjectId(*page_num, 0)));
+                    elem.insert(
+                        PdfName::new("Pg"),
+                        PdfObject::Ref(ObjectId(page_data.page_num, 0)),
+                    );
                     elem.insert(PdfName::new("K"), PdfObject::Integer(*mcid as i64));
                     if let Some(alt) = &spec.alt {
                         elem.insert(
@@ -1485,10 +1715,9 @@ impl DocumentBuilder {
         objects.push((2u32, PdfObject::Dict(pages_tree)));
 
         // Pages and their content streams
-        for (page_num, content_num, content_bytes, font_names, image_refs, tagged) in &page_contents
-        {
-            let page_num = *page_num;
-            let content_num = *content_num;
+        for page_data in &page_contents {
+            let page_num = page_data.page_num;
+            let content_num = page_data.content_num;
             let page_state = &self.pages[(page_num - 3) as usize];
 
             // Page dict
@@ -1508,7 +1737,7 @@ impl DocumentBuilder {
                 PdfName::new("Contents"),
                 PdfObject::Ref(ObjectId(content_num, 0)),
             );
-            if !tagged.is_empty() {
+            if !page_data.tagged.is_empty() {
                 // The page's key into the /ParentTree /Nums is its 0-based index.
                 page.insert(
                     PdfName::new("StructParents"),
@@ -1517,12 +1746,15 @@ impl DocumentBuilder {
             }
 
             // Resources dict
-            if !font_names.is_empty() || !image_refs.is_empty() {
+            if !page_data.font_names.is_empty()
+                || !page_data.image_refs.is_empty()
+                || !page_data.ext_gstates.is_empty()
+            {
                 let mut resources = PdfDict::new();
 
-                if !font_names.is_empty() {
+                if !page_data.font_names.is_empty() {
                     let mut fonts = PdfDict::new();
-                    for (i, font_name) in font_names.iter().enumerate() {
+                    for (i, font_name) in page_data.font_names.iter().enumerate() {
                         let font_num = font_obj_by_name[font_name];
                         fonts.insert(
                             PdfName::new(format!("F{}", i + 1)),
@@ -1532,15 +1764,27 @@ impl DocumentBuilder {
                     resources.insert(PdfName::new("Font"), PdfObject::Dict(fonts));
                 }
 
-                if !image_refs.is_empty() {
+                if !page_data.image_refs.is_empty() {
                     let mut xobjects = PdfDict::new();
-                    for (i, img_ref) in image_refs.iter().enumerate() {
+                    for (i, img_ref) in page_data.image_refs.iter().enumerate() {
                         xobjects.insert(
                             PdfName::new(format!("Im{}", i + 1)),
                             PdfObject::Ref(ObjectId(*img_ref, 0)),
                         );
                     }
                     resources.insert(PdfName::new("XObject"), PdfObject::Dict(xobjects));
+                }
+
+                if !page_data.ext_gstates.is_empty() {
+                    let mut gs_dict = PdfDict::new();
+                    for (i, key) in page_data.ext_gstates.iter().enumerate() {
+                        let gs_num = ext_gstate_obj_by_key[key];
+                        gs_dict.insert(
+                            PdfName::new(format!("GS{}", i + 1)),
+                            PdfObject::Ref(ObjectId(gs_num, 0)),
+                        );
+                    }
+                    resources.insert(PdfName::new("ExtGState"), PdfObject::Dict(gs_dict));
                 }
 
                 page.insert(PdfName::new("Resources"), PdfObject::Dict(resources));
@@ -1554,7 +1798,7 @@ impl DocumentBuilder {
                 PdfName::new("Filter"),
                 PdfObject::Name(PdfName::new("FlateDecode")),
             );
-            let compressed = flate_compress(content_bytes)?;
+            let compressed = flate_compress(&page_data.content_bytes)?;
             streams.push((content_num, content_dict, compressed));
         }
 
@@ -1770,12 +2014,20 @@ impl DocumentBuilder {
         image_counter: &mut usize,
         next_obj: &mut u32,
         composite_glyph_maps: &HashMap<u32, (HashMap<char, u16>, bool)>,
-    ) -> Result<(Vec<u8>, Vec<String>, Vec<u32>, Vec<(i32, TagSpec)>)> {
+    ) -> Result<(
+        Vec<u8>,
+        Vec<String>,
+        Vec<u32>,
+        Vec<ExtGStateKey>,
+        Vec<(i32, TagSpec)>,
+    )> {
         let mut ops = Vec::new();
         let mut font_names = Vec::new();
         let mut image_refs = Vec::new();
+        let mut ext_gstates = Vec::new();
         let mut used_fonts = HashMap::new();
         let mut used_images = HashMap::new();
+        let mut used_ext_gstates = HashMap::new();
         // Per-page marked-content identifiers for tagged items, assigned in
         // item order (0, 1, 2, …). The /StructTreeRoot's /ParentTree maps each
         // page's /StructParents key to an array of /StructElem refs indexed by
@@ -1811,9 +2063,7 @@ impl DocumentBuilder {
                         let mcid = next_mcid;
                         next_mcid += 1;
                         tagged.push((mcid, spec.clone()));
-                        ops.extend_from_slice(
-                            format!("/{} <</MCID {}>> BDC\n", spec.role.as_str(), mcid).as_bytes(),
-                        );
+                        write_bdc(&mut ops, spec.role.as_str(), mcid)?;
                     }
 
                     // Emit text ops
@@ -1875,9 +2125,7 @@ impl DocumentBuilder {
                         let mcid = next_mcid;
                         next_mcid += 1;
                         tagged.push((mcid, spec.clone()));
-                        ops.extend_from_slice(
-                            format!("/{} <</MCID {}>> BDC\n", spec.role.as_str(), mcid).as_bytes(),
-                        );
+                        write_bdc(&mut ops, spec.role.as_str(), mcid)?;
                     }
                     ops.extend_from_slice(
                         format!("{} 0 0 {} {} {} cm\n", width, height, x, y).as_bytes(),
@@ -1894,17 +2142,29 @@ impl DocumentBuilder {
                 PageItem::Path {
                     segments,
                     style,
+                    options,
                     tag,
                 } => {
-                    // Paths are painted outside the text block.
+                    // Paths are painted outside the text block inside an isolated
+                    // q … Q scope so colors, line width, opacity, and blend mode
+                    // never leak into subsequent text, images, or paths.
                     ops.extend_from_slice(b"ET\nq\n");
+                    if let Some(key) = options.ext_gstate_key() {
+                        let gs_idx = if let Some(&idx) = used_ext_gstates.get(&key) {
+                            idx
+                        } else {
+                            let idx = used_ext_gstates.len() + 1;
+                            used_ext_gstates.insert(key, idx);
+                            ext_gstates.push(key);
+                            idx
+                        };
+                        ops.extend_from_slice(format!("/GS{gs_idx} gs\n").as_bytes());
+                    }
                     if let Some(spec) = tag {
                         let mcid = next_mcid;
                         next_mcid += 1;
                         tagged.push((mcid, spec.clone()));
-                        ops.extend_from_slice(
-                            format!("/{} <</MCID {}>> BDC\n", spec.role.as_str(), mcid).as_bytes(),
-                        );
+                        write_bdc(&mut ops, spec.role.as_str(), mcid)?;
                     }
                     if let Some((r, g, b)) = style.stroke {
                         ops.extend_from_slice(format!("{} {} {} RG\n", r, g, b).as_bytes());
@@ -1964,8 +2224,46 @@ impl DocumentBuilder {
 
         ops.extend_from_slice(b"ET\n");
 
-        Ok((ops, font_names, image_refs, tagged))
+        Ok((ops, font_names, image_refs, ext_gstates, tagged))
     }
+}
+
+struct BuiltPageContent {
+    page_num: u32,
+    content_num: u32,
+    content_bytes: Vec<u8>,
+    font_names: Vec<String>,
+    image_refs: Vec<u32>,
+    ext_gstates: Vec<ExtGStateKey>,
+    tagged: Vec<(i32, TagSpec)>,
+}
+
+/// Validate a marked-content structure role name (ISO 32000-1 §7.3.5 forbids
+/// NUL bytes in PDF name objects, and an empty tag name is invalid).
+fn validate_tag_role(tag: &TagSpec) -> Result<()> {
+    let role = tag.role.as_str();
+    if role.is_empty() || role.as_bytes().contains(&0) {
+        return Err(zpdf_core::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "structure tag role must be non-empty and contain no NUL bytes",
+        )));
+    }
+    Ok(())
+}
+
+/// Emit `/Role <</MCID N>> BDC\n` with `role` encoded as a valid PDF Name token
+/// (`#XX`-escaped per ISO 32000-1 §7.3.5) so untrusted `StructRole::Other`
+/// values cannot inject content-stream operators.
+fn write_bdc(ops: &mut Vec<u8>, role: &str, mcid: i32) -> Result<()> {
+    if role.is_empty() || role.as_bytes().contains(&0) {
+        return Err(zpdf_core::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "structure tag role must be non-empty and contain no NUL bytes",
+        )));
+    }
+    crate::serialize::serialize_name(ops, role).map_err(zpdf_core::Error::Io)?;
+    ops.extend_from_slice(format!(" <</MCID {mcid}>> BDC\n").as_bytes());
+    Ok(())
 }
 
 impl Default for DocumentBuilder {

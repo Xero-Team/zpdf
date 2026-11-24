@@ -12,6 +12,15 @@
   overflow) so non-0.001, anisotropic, and sheared CFF/`CIDFontType0C` fonts
   render at the correct scale and slant. (#160)
 
+### Authoring (`zpdf-writer`)
+
+- Add `PathPaintOptions`, re-exported `BlendMode`, `DocumentBuilder::add_path_with_options`,
+  and `DocumentBuilder::add_tagged_path_with_options` to support per-path fill
+  opacity (`/ca`), stroke opacity (`/CA`), and standard PDF blend modes (`/BM`,
+  including `BlendMode::Multiply`) via deduplicated `/ExtGState` resources
+  isolated inside per-path `q … Q` scopes, while keeping `PathStyle` and
+  `add_path` fully backward-compatible. (#196)
+
 ## 0.22.0 — Embedded font recovery, rendering precision, and JBIG2 oracle
 
 Released 2026-11-23.
