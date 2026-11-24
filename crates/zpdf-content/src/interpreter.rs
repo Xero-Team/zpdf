@@ -190,6 +190,12 @@ pub struct ContentInterpreter<'a> {
     /// Base CTM of the stream currently being interpreted (page default user
     /// space, or identity inside a tiling cell's pattern space).
     base_ctm: Matrix,
+    /// Graphics state captured at entry to the enclosing stream (page default
+    /// state at page start, or the invoking graphics state on Form XObject
+    /// entry) so tiling pattern cells inherit it per ISO 32000-1 §8.7.3.1.
+    base_state: GraphicsState,
+    /// Active font ID captured alongside `base_state` at stream entry.
+    base_font_id: Option<zpdf_font::FontId>,
     /// Cumulative transform from the current display list's coordinate space to
     /// page space (`Matrix::identity()` at page level, `to_page` inside a tiling
     /// pattern cell). Used to size shading rasters from their transformed
@@ -514,17 +520,133 @@ enum ResourceScopeId {
     Unique(u64),
 }
 
+/// Cacheable snapshot of the inherited graphics state that affects both
+/// soft-mask `/G` forms and tiling pattern cells (stroke width/cap/join/miter/
+/// dash, fill/stroke colours, overprint, colour space, rendering intent, and
+/// text state). Returns `None` for exotic colour spaces or active patterns so
+/// callers bypass caching rather than risk false aliasing.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct InheritedGraphicsStateKey {
+    fill_color: [u32; 4],
+    stroke_color: [u32; 4],
+    line_width: u32,
+    line_cap: u8,
+    line_join: u8,
+    miter_limit: u32,
+    dash: Option<(Vec<u32>, u32)>,
+    fill_cs: u8,
+    stroke_cs: u8,
+    rendering_intent: u8,
+    fill_overprint: bool,
+    stroke_overprint: bool,
+    overprint_mode: u8,
+    fill_colorant: Option<([u32; 4], bool)>,
+    stroke_colorant: Option<([u32; 4], bool)>,
+    font_id: Option<zpdf_font::FontId>,
+    font_name: String,
+    text_scalars: [u32; 6],
+    render_mode: u8,
+}
+
+impl InheritedGraphicsStateKey {
+    fn cs_tag(cs: &ActiveColorSpace) -> Option<u8> {
+        match cs {
+            ActiveColorSpace::DeviceGray => Some(0),
+            ActiveColorSpace::DeviceRGB => Some(1),
+            ActiveColorSpace::DeviceCMYK => Some(2),
+            ActiveColorSpace::ICCBased(n) => Some(3u8.saturating_add(*n)),
+            _ => None,
+        }
+    }
+
+    fn intent_tag(ri: zpdf_color::RenderIntent) -> u8 {
+        match ri {
+            zpdf_color::RenderIntent::AbsoluteColorimetric => 0,
+            zpdf_color::RenderIntent::RelativeColorimetric => 1,
+            zpdf_color::RenderIntent::Saturation => 2,
+            zpdf_color::RenderIntent::Perceptual => 3,
+        }
+    }
+
+    fn from_state(state: &GraphicsState, font_id: Option<zpdf_font::FontId>) -> Option<Self> {
+        if state.fill_pattern.is_some() || state.stroke_pattern.is_some() {
+            return None;
+        }
+        let fill_cs = Self::cs_tag(&state.fill_cs)?;
+        let stroke_cs = Self::cs_tag(&state.stroke_cs)?;
+        let line_cap = match state.line_cap {
+            LineCap::Butt => 0,
+            LineCap::Round => 1,
+            LineCap::Square => 2,
+        };
+        let line_join = match state.line_join {
+            LineJoin::Miter => 0,
+            LineJoin::Round => 1,
+            LineJoin::Bevel => 2,
+        };
+        let dash = state.dash.as_ref().map(|d| {
+            (
+                d.array.iter().map(|v| v.to_bits()).collect(),
+                d.phase.to_bits(),
+            )
+        });
+        let colorant_bits =
+            |c: Option<Colorant>| c.map(|col| (col.cmyk.map(f32::to_bits), col.cmyk_device));
+        Some(Self {
+            fill_color: [
+                state.fill_color.r,
+                state.fill_color.g,
+                state.fill_color.b,
+                state.fill_color.a,
+            ]
+            .map(f32::to_bits),
+            stroke_color: [
+                state.stroke_color.r,
+                state.stroke_color.g,
+                state.stroke_color.b,
+                state.stroke_color.a,
+            ]
+            .map(f32::to_bits),
+            line_width: state.line_width.to_bits(),
+            line_cap,
+            line_join,
+            miter_limit: state.miter_limit.to_bits(),
+            dash,
+            fill_cs,
+            stroke_cs,
+            rendering_intent: Self::intent_tag(state.rendering_intent),
+            fill_overprint: state.fill_overprint,
+            stroke_overprint: state.stroke_overprint,
+            overprint_mode: state.overprint_mode,
+            fill_colorant: colorant_bits(state.fill_colorant),
+            stroke_colorant: colorant_bits(state.stroke_colorant),
+            font_id,
+            font_name: state.font_name.clone(),
+            text_scalars: [
+                state.font_size,
+                state.char_spacing,
+                state.word_spacing,
+                state.h_scaling,
+                state.leading,
+                state.rise,
+            ]
+            .map(f32::to_bits),
+            render_mode: state.render_mode,
+        })
+    }
+}
+
 /// What a soft mask built at a `gs` depends on: the ExtGState object, and the
 /// graphics state the mask group starts from — its CTM (and the pattern
-/// anchor), the clip bounds its `/BBox` and shadings are cut to, the inherited
-/// colours and line width the group may paint with unset, and the full stack
-/// of enclosing resource scopes it falls back to.
+/// anchor), the clip bounds its `/BBox` and shadings are cut to, the full
+/// inherited graphics state (colours, line width/cap/join/miter/dash, text,
+/// overprint, colour space), and the stack of enclosing resource scopes.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct SoftMaskCacheKey {
     gs_id: ObjectId,
     matrices: [u64; 12],
     clip: Option<[u64; 4]>,
-    paint: [u32; 9],
+    inherited: InheritedGraphicsStateKey,
     resource_scopes: Vec<ResourceScopeId>,
 }
 
@@ -533,9 +655,10 @@ struct SoftMaskCacheKey {
 const MAX_CACHED_SOFT_MASKS: usize = 256;
 
 /// Cache key for pre-interpreted tiling-pattern cells. Coloured (`/PaintType 1`)
-/// cells depend on the pattern object, effective cell downscale, and enclosing
-/// resource scopes (since `lookup_res` falls back through enclosing forms);
-/// uncoloured (`/PaintType 2`) cells also bake in the `scn`/`SCN` paint colour.
+/// cells depend on the pattern object, effective cell downscale, page-space
+/// shading scale, parent-stream entry state, and enclosing resource scopes
+/// (since `lookup_res` falls back through enclosing forms); uncoloured
+/// (`/PaintType 2`) cells also bake in the `scn`/`SCN` paint colour.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct TilingCellKey {
     pat_id: ObjectId,
@@ -544,6 +667,7 @@ struct TilingCellKey {
     /// Page-space axis scales of the cell's transform, so enlarged and shrunk
     /// instances of the same pattern never alias each other's shading rasters.
     shading_scale: [u32; 2],
+    inherited: InheritedGraphicsStateKey,
     resource_scopes: Vec<ResourceScopeId>,
 }
 
@@ -995,6 +1119,8 @@ impl<'a> ContentInterpreter<'a> {
             extracted_text_bytes: 0,
             rule_sink: None,
             base_ctm: Matrix::identity(),
+            base_state: GraphicsState::default(),
+            base_font_id: None,
             shading_space_to_page: Matrix::identity(),
             suppress_color_ops: false,
             oc_config: None,
@@ -4207,7 +4333,8 @@ impl<'a> ContentInterpreter<'a> {
     }
 
     /// Resolve an ExtGState `/SMask`, reusing a cached [`SoftMask`] when the
-    /// same ExtGState object is applied under identical graphics state.
+    /// same ExtGState object is applied under identical inherited graphics
+    /// state and resource scopes.
     fn build_or_reuse_soft_mask(
         &mut self,
         sm: &zpdf_core::PdfDict,
@@ -4216,12 +4343,12 @@ impl<'a> ContentInterpreter<'a> {
         let Some(gs_id) = gs_id else {
             return self.build_soft_mask(sm);
         };
-        let (ctm, base, fill, stroke) = (
-            &self.current.ctm,
-            &self.base_ctm,
-            &self.current.fill_color,
-            &self.current.stroke_color,
-        );
+        let Some(inherited) =
+            InheritedGraphicsStateKey::from_state(&self.current, self.current_font_id)
+        else {
+            return self.build_soft_mask(sm);
+        };
+        let (ctm, base) = (&self.current.ctm, &self.base_ctm);
         let key = SoftMaskCacheKey {
             gs_id,
             matrices: [
@@ -4233,18 +4360,7 @@ impl<'a> ContentInterpreter<'a> {
                 .current
                 .clip_bounds
                 .map(|r| [r.x0, r.y0, r.x1, r.y1].map(f64::to_bits)),
-            paint: [
-                fill.r,
-                fill.g,
-                fill.b,
-                fill.a,
-                stroke.r,
-                stroke.g,
-                stroke.b,
-                stroke.a,
-                self.current.line_width,
-            ]
-            .map(f32::to_bits),
+            inherited,
             resource_scopes: self.form_resource_scopes.clone(),
         };
         if let Some(mask) = self.soft_mask_cache.get(&key) {
@@ -5109,9 +5225,14 @@ impl<'a> ContentInterpreter<'a> {
 
         self.current.ctm = self.current.ctm.concat(&form_matrix);
         // Pattern space inside the form anchors to the form's default space
-        // (the CTM established by Do + the form /Matrix), not the page's.
+        // (the CTM established by Do + the form /Matrix), and tiling cells
+        // defined in this form inherit its entry graphics state (§8.7.3.1).
         let saved_base_ctm = self.base_ctm;
+        let saved_base_state = self.base_state.clone();
+        let saved_base_font_id = self.base_font_id;
         self.base_ctm = self.current.ctm;
+        self.base_state = self.current.clone();
+        self.base_font_id = self.current_font_id;
         self.text_matrix = Matrix::identity();
         self.text_line_matrix = Matrix::identity();
         self.current.clip_depth = 0;
@@ -5238,6 +5359,8 @@ impl<'a> ContentInterpreter<'a> {
         self.compatibility_depth = saved_compatibility;
         self.oc_hidden_from = saved_oc_hidden;
         self.base_ctm = saved_base_ctm;
+        self.base_state = saved_base_state;
+        self.base_font_id = saved_base_font_id;
         self.pop_form_fonts();
         if pushed_resources {
             self.form_resources.pop();
@@ -5956,22 +6079,62 @@ impl<'a> ContentInterpreter<'a> {
         ];
 
         let uncolored = def.paint_type == 2;
-        let cache_key = TilingCellKey {
-            pat_id: def.pat_id,
-            uncolored_color: uncolored.then(|| {
-                [
-                    pattern_color.r,
-                    pattern_color.g,
-                    pattern_color.b,
-                    pattern_color.a,
-                ]
-                .map(f32::to_bits)
-            }),
-            image_downscale: cell_downscale_scale.to_bits(),
-            shading_scale,
-            resource_scopes: self.form_resource_scopes.clone(),
-        };
-        if let Some(cached) = self.tiling_cell_cache.get(&cache_key) {
+
+        // Pattern-cell initial graphics state inherits the parent stream's
+        // entry state (ISO 32000-1 §8.7.3.1), with CTM in pattern space, fresh
+        // clip state, and transparency/pattern-paint fields reset (§11.6.7).
+        let mut cell_state = self.base_state.clone();
+        cell_state.ctm = Matrix::identity();
+        cell_state.clip_depth = 0;
+        cell_state.clip_bounds = None;
+        cell_state.clip_elision_bounds = None;
+        cell_state.blend_mode = BlendMode::Normal;
+        cell_state.fill_alpha = 1.0;
+        cell_state.stroke_alpha = 1.0;
+        cell_state.soft_mask = None;
+        cell_state.fill_pattern = None;
+        cell_state.stroke_pattern = None;
+        if matches!(cell_state.fill_cs, ActiveColorSpace::Pattern { .. }) {
+            cell_state.fill_cs = ActiveColorSpace::DeviceGray;
+        }
+        if matches!(cell_state.stroke_cs, ActiveColorSpace::Pattern { .. }) {
+            cell_state.stroke_cs = ActiveColorSpace::DeviceGray;
+        }
+        if uncolored {
+            cell_state.fill_color = pattern_color;
+            cell_state.stroke_color = pattern_color;
+            cell_state.fill_cs = ActiveColorSpace::DeviceGray;
+            cell_state.stroke_cs = ActiveColorSpace::DeviceGray;
+            // Uncolored cell colour is the pattern's base-space tint, not
+            // tracked as a colorant; overprint is off inside the cell.
+            cell_state.fill_colorant = None;
+            cell_state.stroke_colorant = None;
+        }
+        let cell_font_id = self.base_font_id;
+
+        let cache_key =
+            InheritedGraphicsStateKey::from_state(&cell_state, cell_font_id).map(|inherited| {
+                TilingCellKey {
+                    pat_id: def.pat_id,
+                    uncolored_color: uncolored.then(|| {
+                        [
+                            pattern_color.r,
+                            pattern_color.g,
+                            pattern_color.b,
+                            pattern_color.a,
+                        ]
+                        .map(f32::to_bits)
+                    }),
+                    image_downscale: cell_downscale_scale.to_bits(),
+                    shading_scale,
+                    inherited,
+                    resource_scopes: self.form_resource_scopes.clone(),
+                }
+            });
+        if let Some(cached) = cache_key
+            .as_ref()
+            .and_then(|key| self.tiling_cell_cache.get(key))
+        {
             if self.form_depth.saturating_add(cached.subtree_depth) <= MAX_FORM_DEPTH {
                 self.max_depth_reached = self
                     .max_depth_reached
@@ -6044,6 +6207,8 @@ impl<'a> ContentInterpreter<'a> {
         let saved_compatibility = std::mem::replace(&mut self.compatibility_depth, 0);
         let saved_oc_hidden = self.oc_hidden_from.take();
         let saved_base_ctm = self.base_ctm;
+        let saved_base_state = self.base_state.clone();
+        let saved_base_font_id = self.base_font_id;
         let saved_shading_space_to_page =
             std::mem::replace(&mut self.shading_space_to_page, cell_to_page);
         // Soft masks built inside the cell live in pattern-cell space (`def.bbox`),
@@ -6055,22 +6220,15 @@ impl<'a> ContentInterpreter<'a> {
         let saved_nesting_limit_hit = std::mem::replace(&mut self.nesting_limit_hit, false);
         let saved_max_depth_reached = std::mem::replace(&mut self.max_depth_reached, entry_depth);
 
-        // Clean pattern-cell initial graphics state (ISO 32000-1 §8.7.3.1).
-        self.current = GraphicsState::default();
+        // Pattern-cell initial graphics state inherited from parent stream entry.
+        self.current = cell_state.clone();
+        self.base_state = cell_state;
+        self.base_font_id = cell_font_id;
+        self.current_font_id = cell_font_id;
         self.text_matrix = Matrix::identity();
         self.text_line_matrix = Matrix::identity();
         self.base_ctm = Matrix::identity();
-        if uncolored {
-            self.current.fill_color = pattern_color;
-            self.current.stroke_color = pattern_color;
-            // Uncolored cell colour is the pattern's base-space tint, not
-            // tracked as a colorant; overprint is off inside the cell.
-            self.current.fill_colorant = None;
-            self.current.stroke_colorant = None;
-            self.suppress_color_ops = true;
-        } else {
-            self.suppress_color_ops = false;
-        }
+        self.suppress_color_ops = uncolored;
 
         // Clip the cell to its /BBox.
         let mut bbox_path = Path::new();
@@ -6168,6 +6326,8 @@ impl<'a> ContentInterpreter<'a> {
         self.compatibility_depth = saved_compatibility;
         self.oc_hidden_from = saved_oc_hidden;
         self.base_ctm = saved_base_ctm;
+        self.base_state = saved_base_state;
+        self.base_font_id = saved_base_font_id;
         self.shading_space_to_page = saved_shading_space_to_page;
         self.soft_mask_cache = saved_soft_mask_cache;
         self.image_downscale_scale = saved_image_downscale_scale;
@@ -6178,17 +6338,19 @@ impl<'a> ContentInterpreter<'a> {
         }
 
         let commands = std::sync::Arc::new(cell_dl);
-        if !truncated
-            && !descendant_nesting_hit
-            && self.tiling_cell_cache.len() < MAX_CACHED_TILING_CELLS
-        {
-            self.tiling_cell_cache.insert(
-                cache_key,
-                CachedTilingCell {
-                    commands: std::sync::Arc::clone(&commands),
-                    subtree_depth,
-                },
-            );
+        if let Some(cache_key) = cache_key {
+            if !truncated
+                && !descendant_nesting_hit
+                && self.tiling_cell_cache.len() < MAX_CACHED_TILING_CELLS
+            {
+                self.tiling_cell_cache.insert(
+                    cache_key,
+                    CachedTilingCell {
+                        commands: std::sync::Arc::clone(&commands),
+                        subtree_depth,
+                    },
+                );
+            }
         }
         let pattern = TilingPattern {
             commands,

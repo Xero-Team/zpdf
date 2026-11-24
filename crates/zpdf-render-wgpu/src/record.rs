@@ -7,7 +7,7 @@
 //! (inside the intersection of all active clips).
 
 use crate::glyph_atlas::GlyphAtlas;
-use crate::path::{fill_mesh, stroke_mesh, Mesh};
+use crate::path::{fill_mesh, fill_mesh_transformed, stroke_mesh, stroke_mesh_transformed, Mesh};
 use crate::transform::{PageMap, SolidVertex, TexturedVertex};
 use zpdf_core::{time::Instant, ParseLimits};
 use zpdf_display_list::{
@@ -132,6 +132,7 @@ fn arena_fits_u32(current: usize, additional: usize) -> bool {
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SyntheticTileKey {
     commands: usize,
+    segment_index: usize,
     bbox: [u64; 4],
     steps: [u64; 2],
     width: u32,
@@ -143,6 +144,7 @@ pub struct SyntheticTileKey {
 impl SyntheticTileKey {
     pub fn new(
         tiling: &zpdf_display_list::TilingPattern,
+        segment_index: usize,
         width: u32,
         height: u32,
         nearest: bool,
@@ -150,6 +152,7 @@ impl SyntheticTileKey {
     ) -> Self {
         Self {
             commands: std::sync::Arc::as_ptr(&tiling.commands) as *const () as usize,
+            segment_index,
             bbox: [
                 tiling.bbox.x0.to_bits(),
                 tiling.bbox.y0.to_bits(),
@@ -535,6 +538,22 @@ impl PageRecorder {
         }
     }
 
+    pub fn add_fill_transformed(
+        &mut self,
+        path: &DlPath,
+        rule: FillRule,
+        color: [f32; 4],
+        ctm: &zpdf_core::Matrix,
+        map: &PageMap,
+    ) {
+        if !self.can_record() {
+            return;
+        }
+        if let Some(mesh) = fill_mesh_transformed(path, rule, color, ctm, map) {
+            self.add_mesh(mesh);
+        }
+    }
+
     pub fn add_stroke(
         &mut self,
         path: &DlPath,
@@ -546,6 +565,22 @@ impl PageRecorder {
             return;
         }
         if let Some(mesh) = stroke_mesh(path, style, color, map) {
+            self.add_mesh(mesh);
+        }
+    }
+
+    pub fn add_stroke_transformed(
+        &mut self,
+        path: &DlPath,
+        style: &StrokeStyle,
+        color: [f32; 4],
+        ctm: &zpdf_core::Matrix,
+        map: &PageMap,
+    ) {
+        if !self.can_record() {
+            return;
+        }
+        if let Some(mesh) = stroke_mesh_transformed(path, style, color, ctm, map) {
             self.add_mesh(mesh);
         }
     }
@@ -562,12 +597,42 @@ impl PageRecorder {
         self.push_clip_range(range);
     }
 
+    pub fn push_clip_transformed(
+        &mut self,
+        path: &DlPath,
+        rule: FillRule,
+        ctm: &zpdf_core::Matrix,
+        map: &PageMap,
+    ) {
+        if !self.can_record() {
+            return;
+        }
+        let range =
+            fill_mesh_transformed(path, rule, [0.0; 4], ctm, map).and_then(|m| self.append(m));
+        self.push_clip_range(range);
+    }
+
     /// Push a clip to a *stroked* path's outline (tessellated as a stroke mesh).
     pub fn push_clip_stroke(&mut self, path: &DlPath, style: &StrokeStyle, map: &PageMap) {
         if !self.can_record() {
             return;
         }
         let range = stroke_mesh(path, style, [0.0; 4], map).and_then(|m| self.append(m));
+        self.push_clip_range(range);
+    }
+
+    pub fn push_clip_stroke_transformed(
+        &mut self,
+        path: &DlPath,
+        style: &StrokeStyle,
+        ctm: &zpdf_core::Matrix,
+        map: &PageMap,
+    ) {
+        if !self.can_record() {
+            return;
+        }
+        let range =
+            stroke_mesh_transformed(path, style, [0.0; 4], ctm, map).and_then(|m| self.append(m));
         self.push_clip_range(range);
     }
 

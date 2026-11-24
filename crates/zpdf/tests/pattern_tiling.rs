@@ -1035,3 +1035,188 @@ fn magnified_tiling_cell_preserves_axial_gradient_resolution() {
         "shared magnified cell right end blue",
     );
 }
+
+/// Regression (ISO 32000-1 §11.6.7): blend modes inside a tiling pattern cell
+/// (such as `/BM /Multiply`) must composite against the live destination page
+/// backdrop rather than a transparent cached tile. Paints the exact same cell
+/// across both a blue left background and a yellow right background.
+#[test]
+fn tiling_cell_multiply_preserves_page_backdrop_across_backgrounds() {
+    // Cell (20×20) paints two marks under `/BM /Multiply`:
+    //  - left half [0..10]: opaque white (1 1 1 rg) -> Multiply identity (preserves backdrop!)
+    //  - right half [10..20]: opaque cyan (0 1 1 rg) -> blue*cyan=blue, yellow*cyan=green.
+    let gs_mul = b"<< /Type /ExtGState /BM /Multiply >>".to_vec();
+    let cell = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 20 20] /XStep 20 /YStep 20 \
+         /Resources << /ExtGState << /GM 6 0 R >> >>",
+        b"/GM gs 1 1 1 rg 0 0 10 20 re f\n0 1 1 rg 10 0 10 20 re f",
+    );
+    // Blue left background [0..100], yellow right background [100..200], then
+    // paint the same tiling pattern over the full 200×200 page.
+    let content = stream_obj(
+        "",
+        b"0 0 1 rg 0 0 100 200 re f\n\
+          1 1 0 rg 100 0 100 200 re f\n\
+          /Pattern cs /P0 scn 0 0 200 200 re f",
+    );
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R \
+          /Resources << /Pattern << /P0 5 0 R >> >> >>"
+            .to_vec(), // 3
+        content,                                       // 4
+        cell,                                          // 5
+        gs_mul,                                        // 6
+    ]);
+    let page = render(pdf);
+
+    // Blue left half (x=25 -> cell-x=5, white Multiply): must stay blue, NOT turn white.
+    assert_rgbish(
+        px(&page, 25.0, 100.0),
+        [0, 0, 255],
+        "white Multiply cell over blue background must stay blue",
+    );
+    // Yellow right half (x=125 -> cell-x=5, white Multiply): must stay yellow, NOT turn white.
+    assert_rgbish(
+        px(&page, 125.0, 100.0),
+        [255, 255, 0],
+        "white Multiply cell over yellow background must stay yellow",
+    );
+    // Blue left half (x=35 -> cell-x=15, cyan Multiply): (0,0,1)*(0,1,1) = blue.
+    assert_rgbish(
+        px(&page, 35.0, 100.0),
+        [0, 0, 255],
+        "cyan Multiply cell over blue background stays blue",
+    );
+    // Yellow right half (x=135 -> cell-x=15, cyan Multiply): (1,1,0)*(0,1,1) = green.
+    assert_rgbish(
+        px(&page, 135.0, 100.0),
+        [0, 255, 0],
+        "cyan Multiply cell over yellow background turns green",
+    );
+}
+
+/// Regression (ISO 32000-1 §8.7.3.1): a tiling pattern defined/used inside a
+/// Form XObject inherits its parent stream's entry graphics state (e.g. a 6 pt
+/// line width set before invoking the form), and `tiling_cell_cache` must
+/// distinguish invocations of the same form under different entry line widths.
+#[test]
+fn tiling_pattern_in_form_inherits_form_entry_line_width_and_cache_key() {
+    // Pattern cell strokes a vertical red line at cell x=10 WITHOUT setting `w`.
+    let pat = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 20 20] /XStep 20 /YStep 20 /Resources << >>",
+        b"1 0 0 RG 10 0 m 10 20 l S",
+    );
+    // Form paints a 100×200 strip using /P0 (and even sets `2 w` locally after
+    // entry to verify the pattern inherits the form's ENTRY state, not current).
+    let form = stream_obj(
+        "/Type /XObject /Subtype /Form /BBox [0 0 100 200] \
+         /Resources << /Pattern << /P0 5 0 R >> >>",
+        b"2 w /Pattern cs /P0 scn 0 0 100 200 re f",
+    );
+    // Invoke the SAME form twice: left half under 6 w, right half under 1 w.
+    let content = stream_obj(
+        "",
+        b"q 6 w /Fm1 Do Q\n\
+          q 1 0 0 1 100 0 cm 1 w /Fm1 Do Q",
+    );
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R \
+          /Resources << /XObject << /Fm1 6 0 R >> >> >>"
+            .to_vec(), // 3
+        content,                                       // 4
+        pat,                                           // 5
+        form,                                          // 6
+    ]);
+
+    let (_dl, _stats, page) = render_with_stats(pdf, 1.0);
+    // Integrate red ink thickness across one 20px tile on the left (6 w) vs right (1 w).
+    let mut left_ink_px = 0.0f64;
+    for x in 20..40 {
+        let c = px_on(&page, 200.0, 1.0, x as f64 + 0.5, 100.5);
+        left_ink_px += (255 - c[1]) as f64 / 255.0;
+    }
+    let mut right_ink_px = 0.0f64;
+    for x in 120..140 {
+        let c = px_on(&page, 200.0, 1.0, x as f64 + 0.5, 100.5);
+        right_ink_px += (255 - c[1]) as f64 / 255.0;
+    }
+    assert!(
+        (5.4..=6.6).contains(&left_ink_px),
+        "form invoked under 6 w must produce ~6px strokes in cell, measured {left_ink_px:.2}px"
+    );
+    assert!(
+        (0.8..=1.3).contains(&right_ink_px),
+        "same form invoked under 1 w must produce ~1px strokes (no cache aliasing), measured {right_ink_px:.2}px"
+    );
+}
+
+/// Regression: two `gs` calls inside a tiling cell that apply the same indirect
+/// `/SMask` in the same resource scope and CTM with only the line dash pattern
+/// changed must NOT alias the cached soft mask (a `/G` form that strokes a line
+/// inherits the active dash state, so a dashed second mask must leave gaps).
+#[test]
+fn tiling_cell_soft_mask_cache_distinguishes_line_dash_state() {
+    // Soft-mask `/G` form strokes two horizontal white lines (y=10 and y=30)
+    // WITHOUT setting `d`, so both inherit the caller's active dash pattern.
+    let mask_group = stream_obj(
+        "/Type /XObject /Subtype /Form /BBox [0 0 40 40] \
+         /Group << /Type /Group /S /Transparency /CS /DeviceGray >>",
+        b"1 G 8 w 0 10 m 40 10 l S\n0 30 m 40 30 l S",
+    );
+    let gs_mask =
+        b"<< /Type /ExtGState /SMask << /Type /Mask /S /Luminosity /G 6 0 R >> >>".to_vec();
+    // Inside one cell and one resource scope, apply the SAME `/GS1` twice under
+    // the exact same CTM/clip: first with solid line (`[] 0 d`) masking a red
+    // bottom strip (y in [0..20]), then with dashed `[8 8] 0 d` masking a blue
+    // top strip (y in [20..40]).
+    let cell = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 40 40] /XStep 40 /YStep 40 \
+         /Resources << /ExtGState << /GS1 7 0 R >> >>",
+        b"q [] 0 d /GS1 gs 1 0 0 rg 0 0 40 20 re f Q\n\
+          q [8 8] 0 d /GS1 gs 0 0 1 rg 0 20 40 20 re f Q",
+    );
+    let content = stream_obj("", b"/Pattern cs /P0 scn 0 0 200 200 re f");
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R \
+          /Resources << /Pattern << /P0 5 0 R >> >> >>"
+            .to_vec(), // 3
+        content,                                       // 4
+        cell,                                          // 5
+        mask_group,                                    // 6
+        gs_mask,                                       // 7
+    ]);
+    let page = render(pdf);
+
+    // Bottom red strip (y=10, solid mask): visible at both x=4 and x=12.
+    assert_rgbish(
+        px(&page, 44.0, 50.0),
+        [255, 0, 0],
+        "solid soft mask reveals red at x=4",
+    );
+    assert_rgbish(
+        px(&page, 52.0, 50.0),
+        [255, 0, 0],
+        "solid soft mask reveals red at x=12",
+    );
+    // Top blue strip (y=30, [8 8] dashed mask): visible at x=4 (on-dash [0..8]),
+    // masked out to white at x=12 (off-gap [8..16]).
+    assert_rgbish(
+        px(&page, 44.0, 70.0),
+        [0, 0, 255],
+        "dashed soft mask reveals blue inside on-dash [0..8]",
+    );
+    assert_rgbish(
+        px(&page, 52.0, 70.0),
+        [255, 255, 255],
+        "dashed soft mask must NOT reuse solid mask or leak blue ink in off-gap [8..16]",
+    );
+}

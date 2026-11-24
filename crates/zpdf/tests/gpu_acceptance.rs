@@ -698,3 +698,232 @@ fn gpu_dense_tiling_pattern_above_4096_tiles_matches_cpu() {
         "dense 65x65 tiling GPU vs CPU {pct:.3}% exceeds {MAX_DIFF_PCT}%"
     );
 }
+
+/// Regression: anisotropic tiling pattern `/Matrix [4 0 0 1 0 0]` at 72 DPI
+/// must transform stroked outlines (and stroke clips) in pattern space on wgpu,
+/// producing a 4px-wide vertical stroke and a 1px-tall horizontal stroke
+/// (matching CPU, rather than scaling both widths by sqrt(det)=2px).
+#[test]
+fn gpu_anisotropic_tiling_stroke_and_clip_preserve_directional_widths() {
+    // 10×10 cell mapped by [4 0 0 1 0 0] -> 40×10 px per tile at scale=1.0:
+    //  - Red 1pt vertical stroke at x=5 -> 4px wide on screen
+    //  - Blue 1pt horizontal stroke at y=5 -> 1px tall on screen
+    //  - Green nested-pattern 1pt vertical stroke at x=2 -> tests PushClipStroke
+    //    transformed in pattern space (4px wide).
+    let inner_green = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 10 10] /XStep 10 /YStep 10 /Resources << >>",
+        b"0 1 0 rg 0 0 10 10 re f",
+    );
+    let cell = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 10 10] /XStep 10 /YStep 10 \
+         /Matrix [4 0 0 1 0 0] \
+         /Resources << /Pattern << /PG 6 0 R >> >>",
+        b"1 w\n\
+          1 0 0 RG 5 0 m 5 10 l S\n\
+          0 0 1 RG 0 5 m 10 5 l S\n\
+          /Pattern CS /PG SCN 2 0 m 2 10 l S",
+    );
+    let content = stream_obj("", b"/Pattern cs /P0 scn 0 0 80 40 re f");
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 80 40] /Contents 4 0 R \
+          /Resources << /Pattern << /P0 5 0 R >> >> >>"
+            .to_vec(), // 3
+        content,                                       // 4
+        cell,                                          // 5
+        inner_green,                                   // 6
+    ]);
+
+    let doc = PdfDocument::open(pdf).expect("open pdf");
+    let page = doc.page(0).expect("page 0");
+    let mut fonts = doc.load_page_fonts(&page);
+    let content_bytes = doc.page_content_bytes(&page).expect("content bytes");
+    let mut images = ImageCache::new();
+    let dl = ContentInterpreter::new(page.media_box)
+        .with_fonts(&mut fonts)
+        .with_document(doc.file(), &page.resources)
+        .with_images(&mut images)
+        .interpret(&content_bytes);
+
+    let gpu = match zpdf::gpu::WgpuRenderer::new()
+        .with_fonts(&fonts)
+        .with_images(&images)
+        .render_display_list(&dl, 1.0)
+    {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("skipping GPU anisotropic stroke test (no adapter?): {e}");
+            return;
+        }
+    };
+    let cpu = zpdf::cpu::CpuRenderer::new()
+        .with_fonts(&fonts)
+        .with_images(&images)
+        .render_display_list(&dl, 1.0)
+        .expect("cpu render");
+
+    assert_eq!((cpu.width, cpu.height), (gpu.width, gpu.height));
+    let px = |data: &[u8], x: u32, y_pdf: u32| -> [u8; 3] {
+        let iy = 39 - y_pdf;
+        let off = ((iy * gpu.width + x) * 4) as usize;
+        [data[off], data[off + 1], data[off + 2]]
+    };
+
+    // Integrate red vertical stroke across x in [14..26] at y=2 (away from blue y=5).
+    let mut red_ink_px = 0.0f64;
+    for x in 14..26 {
+        let c = px(&gpu.data, x, 2);
+        red_ink_px += (255 - c[1]) as f64 / 255.0;
+    }
+    // Integrate green stroke-clipped vertical stroke across x in [2..14] at y=2.
+    let mut green_ink_px = 0.0f64;
+    for x in 2..14 {
+        let c = px(&gpu.data, x, 2);
+        green_ink_px += (255 - c[0]) as f64 / 255.0;
+    }
+    // Integrate blue horizontal stroke down y in [0..10] at x=32 (away from vertical strokes).
+    let mut blue_ink_px = 0.0f64;
+    for y in 0..10 {
+        let c = px(&gpu.data, 32, y);
+        blue_ink_px += (255 - c[0]) as f64 / 255.0;
+    }
+    assert!(
+        (3.5..=4.5).contains(&red_ink_px),
+        "GPU anisotropic vertical stroke must integrate to ~4px wide, measured {red_ink_px:.2}px"
+    );
+    assert!(
+        (3.5..=4.5).contains(&green_ink_px),
+        "GPU anisotropic vertical stroke clip must integrate to ~4px wide, measured {green_ink_px:.2}px"
+    );
+    assert!(
+        (0.8..=1.2).contains(&blue_ink_px),
+        "GPU anisotropic horizontal stroke must integrate to ~1px tall, measured {blue_ink_px:.2}px"
+    );
+
+    let total = (cpu.width * cpu.height) as u64;
+    let mut diff = 0u64;
+    for i in 0..total as usize {
+        let b = i * 4;
+        let dr = (gpu.data[b] as i32 - cpu.data[b] as i32).unsigned_abs();
+        let dg = (gpu.data[b + 1] as i32 - cpu.data[b + 1] as i32).unsigned_abs();
+        let db = (gpu.data[b + 2] as i32 - cpu.data[b + 2] as i32).unsigned_abs();
+        if dr.max(dg).max(db) > THRESHOLD as u32 {
+            diff += 1;
+        }
+    }
+    let pct = diff as f64 / total as f64 * 100.0;
+    println!("  anisotropic_tiling_stroke: {pct:.3}% differing");
+    assert!(
+        pct < MAX_DIFF_PCT,
+        "anisotropic tiling stroke GPU vs CPU {pct:.3}% exceeds {MAX_DIFF_PCT}%"
+    );
+}
+
+/// Regression (ISO 32000-1 §11.6.7): a dense (> 4,096 tiles, synthetic-tile GPU
+/// path) tiling pattern whose cell paints an opaque white mark and a cyan mark
+/// with `/BM /Multiply` must composite against the live page backdrop across
+/// distinct background colors (blue left, yellow right) instead of baking white
+/// into an opaque tile texture.
+#[test]
+fn gpu_dense_tiling_multiply_preserves_backdrop_across_backgrounds() {
+    let gs_mul = b"<< /Type /ExtGState /BM /Multiply >>".to_vec();
+    // 4×4 cell tiled across 260×260 -> 65×65 = 4,225 tiles (> MAX_GPU_TILES = 4,096).
+    let cell = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 4 4] /XStep 4 /YStep 4 \
+         /Resources << /ExtGState << /GM 6 0 R >> >>",
+        b"/GM gs 1 1 1 rg 0 0 2 4 re f\n0 1 1 rg 2 0 2 4 re f",
+    );
+    let content = stream_obj(
+        "",
+        b"0 0 1 rg 0 0 130 260 re f\n\
+          1 1 0 rg 130 0 130 260 re f\n\
+          /Pattern cs /P0 scn 0 0 260 260 re f",
+    );
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 260 260] /Contents 4 0 R \
+          /Resources << /Pattern << /P0 5 0 R >> >> >>"
+            .to_vec(), // 3
+        content,                                       // 4
+        cell,                                          // 5
+        gs_mul,                                        // 6
+    ]);
+
+    let doc = PdfDocument::open(pdf).expect("open pdf");
+    let page = doc.page(0).expect("page 0");
+    let mut fonts = doc.load_page_fonts(&page);
+    let content_bytes = doc.page_content_bytes(&page).expect("content bytes");
+    let mut images = ImageCache::new();
+    let dl = ContentInterpreter::new(page.media_box)
+        .with_fonts(&mut fonts)
+        .with_document(doc.file(), &page.resources)
+        .with_images(&mut images)
+        .interpret(&content_bytes);
+
+    let gpu = match zpdf::gpu::WgpuRenderer::new()
+        .with_fonts(&fonts)
+        .with_images(&images)
+        .render_display_list(&dl, SCALE)
+    {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("skipping GPU dense Multiply tiling test (no adapter?): {e}");
+            return;
+        }
+    };
+    let cpu = zpdf::cpu::CpuRenderer::new()
+        .with_fonts(&fonts)
+        .with_images(&images)
+        .render_display_list(&dl, SCALE)
+        .expect("cpu render");
+
+    assert_eq!((cpu.width, cpu.height), (gpu.width, gpu.height));
+    let px = |data: &[u8], x: f64, y: f64| -> [u8; 3] {
+        let ix = (x * SCALE as f64) as u32;
+        let iy = ((260.0 - y) * SCALE as f64) as u32;
+        let off = ((iy * gpu.width + ix) * 4) as usize;
+        [data[off], data[off + 1], data[off + 2]]
+    };
+
+    // Blue left background: white Multiply (x=21 -> cell-x=1) stays blue.
+    let blue_white = px(&gpu.data, 21.0, 130.0);
+    assert!(
+        blue_white[0] < 30 && blue_white[1] < 30 && blue_white[2] > 220,
+        "GPU dense white Multiply over blue must stay blue, got {blue_white:?}"
+    );
+    // Yellow right background: white Multiply (x=141 -> cell-x=1) stays yellow.
+    let yellow_white = px(&gpu.data, 141.0, 130.0);
+    assert!(
+        yellow_white[0] > 220 && yellow_white[1] > 220 && yellow_white[2] < 30,
+        "GPU dense white Multiply over yellow must stay yellow, got {yellow_white:?}"
+    );
+    // Yellow right background: cyan Multiply (x=143 -> cell-x=3) becomes green.
+    let yellow_cyan = px(&gpu.data, 143.0, 130.0);
+    assert!(
+        yellow_cyan[0] < 30 && yellow_cyan[1] > 220 && yellow_cyan[2] < 30,
+        "GPU dense cyan Multiply over yellow must turn green, got {yellow_cyan:?}"
+    );
+
+    let total = (cpu.width * cpu.height) as u64;
+    let mut diff = 0u64;
+    for i in 0..total as usize {
+        let b = i * 4;
+        let dr = (gpu.data[b] as i32 - cpu.data[b] as i32).unsigned_abs();
+        let dg = (gpu.data[b + 1] as i32 - cpu.data[b + 1] as i32).unsigned_abs();
+        let db = (gpu.data[b + 2] as i32 - cpu.data[b + 2] as i32).unsigned_abs();
+        if dr.max(dg).max(db) > THRESHOLD as u32 {
+            diff += 1;
+        }
+    }
+    let pct = diff as f64 / total as f64 * 100.0;
+    println!("  dense_tiling_multiply_65x65: {pct:.3}% differing");
+    assert!(
+        pct < MAX_DIFF_PCT,
+        "dense Multiply tiling GPU vs CPU {pct:.3}% exceeds {MAX_DIFF_PCT}%"
+    );
+}

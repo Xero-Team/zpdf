@@ -200,6 +200,16 @@ pub struct TilingOverlapRanges {
     pub truncated: bool,
 }
 
+/// One top-level blend-mode slice extracted from a backdrop-dependent
+/// [`TilingPattern`] cell so backends can rasterize each slice onto a
+/// transparent tile and composite it onto the live destination with its
+/// [`BlendMode`].
+#[derive(Debug, Clone)]
+pub struct TilingBlendSegment {
+    pub blend_mode: BlendMode,
+    pub commands: std::sync::Arc<DisplayList>,
+}
+
 /// A PDF tiling pattern (ISO 32000-1 §8.7.3): the single cell's content
 /// pre-interpreted in pattern space into a detached [`DisplayList`], repeated
 /// across the `(x_step, y_step)` grid and mapped to page space by `matrix`.
@@ -435,6 +445,267 @@ impl TilingPattern {
             truncated,
         }
     }
+
+    /// True when any mark inside the cell reads the destination page backdrop
+    /// (a top-level non-`Normal` [`BlendMode`], active [`Overprint`], or a
+    /// nested backdrop-dependent [`TilingPattern`]). Such cells cannot be
+    /// pre-baked onto a single transparent tile and composited with `Normal`
+    /// source-over (ISO 32000-1 §11.6.7).
+    pub fn is_backdrop_dependent(&self) -> bool {
+        dl_is_backdrop_dependent(&self.commands, 0)
+    }
+
+    /// Split a backdrop-dependent cell into sequential top-level blend-mode
+    /// slices when every mark can be rasterized into a tile pixmap and
+    /// composited onto the destination with its own [`BlendMode`]. Returns
+    /// `None` when the cell uses active overprint, non-passthrough nested
+    /// backdrop-dependent groups, nested backdrop-dependent tiling patterns,
+    /// or exceeds the segment cap.
+    pub fn blend_segments(&self) -> Option<Vec<TilingBlendSegment>> {
+        const MAX_SEGMENTS: usize = 64;
+        let cmds = &self.commands.commands;
+        let page_rect = self.commands.page_rect;
+        let mut segments: Vec<TilingBlendSegment> = Vec::new();
+        let mut clip_stack: Vec<RenderCommand> = Vec::new();
+        let mut cur_normal: Vec<RenderCommand> = Vec::new();
+        let mut passthrough_pops: Vec<usize> = Vec::new();
+
+        let flush_normal = |cur_normal: &mut Vec<RenderCommand>,
+                            clip_stack: &[RenderCommand],
+                            segments: &mut Vec<TilingBlendSegment>|
+         -> Option<()> {
+            if cur_normal.is_empty() {
+                return Some(());
+            }
+            if segments.len() >= MAX_SEGMENTS {
+                return None;
+            }
+            for _ in 0..clip_stack.len() {
+                cur_normal.push(RenderCommand::PopClip);
+            }
+            let mut dl = DisplayList::new(page_rect);
+            dl.commands = std::mem::take(cur_normal);
+            segments.push(TilingBlendSegment {
+                blend_mode: BlendMode::Normal,
+                commands: std::sync::Arc::new(dl),
+            });
+            Some(())
+        };
+
+        let mut idx = 0usize;
+        while idx < cmds.len() {
+            if passthrough_pops.last().copied() == Some(idx) {
+                passthrough_pops.pop();
+                idx += 1;
+                continue;
+            }
+            match &cmds[idx] {
+                RenderCommand::PushClip { .. } | RenderCommand::PushClipStroke { .. } => {
+                    if !cur_normal.is_empty() {
+                        cur_normal.push(cmds[idx].clone());
+                    }
+                    clip_stack.push(cmds[idx].clone());
+                    idx += 1;
+                }
+                RenderCommand::PopClip => {
+                    if !cur_normal.is_empty() {
+                        cur_normal.push(RenderCommand::PopClip);
+                    }
+                    clip_stack.pop();
+                    idx += 1;
+                }
+                RenderCommand::FillPath {
+                    paint, overprint, ..
+                }
+                | RenderCommand::StrokePath {
+                    paint, overprint, ..
+                } => {
+                    if overprint.is_some_and(|op| op.active != 0) {
+                        return None;
+                    }
+                    if let Paint::Tiling(inner) = paint {
+                        if inner.is_backdrop_dependent() {
+                            return None;
+                        }
+                    }
+                    if cur_normal.is_empty() {
+                        cur_normal.extend(clip_stack.iter().cloned());
+                    }
+                    cur_normal.push(cmds[idx].clone());
+                    idx += 1;
+                }
+                RenderCommand::DrawGlyphRun(run) => {
+                    if run.overprint.is_some_and(|op| op.active != 0) {
+                        return None;
+                    }
+                    if let Paint::Tiling(inner) = &run.paint {
+                        if inner.is_backdrop_dependent() {
+                            return None;
+                        }
+                    }
+                    if cur_normal.is_empty() {
+                        cur_normal.extend(clip_stack.iter().cloned());
+                    }
+                    cur_normal.push(cmds[idx].clone());
+                    idx += 1;
+                }
+                RenderCommand::DrawImage(_) => {
+                    if cur_normal.is_empty() {
+                        cur_normal.extend(clip_stack.iter().cloned());
+                    }
+                    cur_normal.push(cmds[idx].clone());
+                    idx += 1;
+                }
+                RenderCommand::PushBlendGroup {
+                    blend_mode,
+                    isolated,
+                    knockout,
+                    bounds,
+                    alpha,
+                    mask,
+                } => {
+                    let end = find_matching_pop_blend(cmds, idx)?;
+                    let inner = &cmds[idx + 1..end];
+                    let inner_backdrop = slice_is_backdrop_dependent(inner, 0);
+                    if *blend_mode == BlendMode::Normal {
+                        if *isolated || !inner_backdrop {
+                            if cur_normal.is_empty() {
+                                cur_normal.extend(clip_stack.iter().cloned());
+                            }
+                            cur_normal.extend(cmds[idx..=end].iter().cloned());
+                            idx = end + 1;
+                        } else if !*knockout && *alpha >= 1.0 && mask.is_none() {
+                            // Passthrough non-isolated group: flatten into outer stream.
+                            passthrough_pops.push(end);
+                            idx += 1;
+                        } else {
+                            return None;
+                        }
+                    } else {
+                        if !*isolated && inner_backdrop {
+                            return None;
+                        }
+                        flush_normal(&mut cur_normal, &clip_stack, &mut segments)?;
+                        if segments.len() >= MAX_SEGMENTS {
+                            return None;
+                        }
+                        let mut seg_cmds =
+                            Vec::with_capacity(clip_stack.len() * 2 + inner.len() + 2);
+                        seg_cmds.extend(clip_stack.iter().cloned());
+                        let needs_wrapper = *alpha < 1.0 || mask.is_some() || *knockout;
+                        if needs_wrapper {
+                            seg_cmds.push(RenderCommand::PushBlendGroup {
+                                blend_mode: BlendMode::Normal,
+                                isolated: true,
+                                knockout: *knockout,
+                                bounds: *bounds,
+                                alpha: *alpha,
+                                mask: mask.clone(),
+                            });
+                        }
+                        seg_cmds.extend(inner.iter().cloned());
+                        if needs_wrapper {
+                            seg_cmds.push(RenderCommand::PopBlendGroup);
+                        }
+                        for _ in 0..clip_stack.len() {
+                            seg_cmds.push(RenderCommand::PopClip);
+                        }
+                        let mut dl = DisplayList::new(page_rect);
+                        dl.commands = seg_cmds;
+                        segments.push(TilingBlendSegment {
+                            blend_mode: *blend_mode,
+                            commands: std::sync::Arc::new(dl),
+                        });
+                        idx = end + 1;
+                    }
+                }
+                RenderCommand::PopBlendGroup => {
+                    idx += 1;
+                }
+            }
+        }
+        flush_normal(&mut cur_normal, &clip_stack, &mut segments)?;
+        Some(segments)
+    }
+}
+
+fn find_matching_pop_blend(cmds: &[RenderCommand], push_idx: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (i, cmd) in cmds.iter().enumerate().skip(push_idx) {
+        match cmd {
+            RenderCommand::PushBlendGroup { .. } => depth += 1,
+            RenderCommand::PopBlendGroup => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn dl_is_backdrop_dependent(dl: &DisplayList, depth: u8) -> bool {
+    slice_is_backdrop_dependent(&dl.commands, depth)
+}
+
+fn slice_is_backdrop_dependent(cmds: &[RenderCommand], depth: u8) -> bool {
+    if depth > 8 {
+        return false;
+    }
+    let mut isolated_depth = 0usize;
+    for cmd in cmds {
+        if isolated_depth == 0 {
+            match cmd {
+                RenderCommand::PushBlendGroup {
+                    blend_mode,
+                    isolated,
+                    ..
+                } => {
+                    if *blend_mode != BlendMode::Normal {
+                        return true;
+                    }
+                    if *isolated {
+                        isolated_depth += 1;
+                    }
+                }
+                RenderCommand::FillPath {
+                    paint, overprint, ..
+                }
+                | RenderCommand::StrokePath {
+                    paint, overprint, ..
+                } => {
+                    if overprint.is_some_and(|op| op.active != 0) {
+                        return true;
+                    }
+                    if let Paint::Tiling(inner) = paint {
+                        if dl_is_backdrop_dependent(&inner.commands, depth + 1) {
+                            return true;
+                        }
+                    }
+                }
+                RenderCommand::DrawGlyphRun(run) => {
+                    if run.overprint.is_some_and(|op| op.active != 0) {
+                        return true;
+                    }
+                    if let Paint::Tiling(inner) = &run.paint {
+                        if dl_is_backdrop_dependent(&inner.commands, depth + 1) {
+                            return true;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        } else {
+            match cmd {
+                RenderCommand::PushBlendGroup { .. } => isolated_depth += 1,
+                RenderCommand::PopBlendGroup => isolated_depth -= 1,
+                _ => {}
+            }
+        }
+    }
+    false
 }
 
 #[derive(Debug, Clone)]
@@ -677,6 +948,153 @@ impl BlendMode {
             Self::Saturation => "Saturation",
             Self::Color => "Color",
             Self::Luminosity => "Luminosity",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tiling_backdrop_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn rect_path(x0: f64, y0: f64, x1: f64, y1: f64) -> Path {
+        let mut p = Path::new();
+        p.rect(Rect::new(x0, y0, x1, y1));
+        p
+    }
+
+    fn tiling_with(commands: Vec<RenderCommand>) -> TilingPattern {
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 10.0, 10.0));
+        dl.commands = commands;
+        TilingPattern {
+            commands: Arc::new(dl),
+            bbox: Rect::new(0.0, 0.0, 10.0, 10.0),
+            x_step: 10.0,
+            y_step: 10.0,
+            matrix: Matrix::identity(),
+            tiling_type: 1,
+        }
+    }
+
+    #[test]
+    fn backdrop_dependence_distinguishes_normal_isolated_multiply_and_overprint() {
+        let normal = tiling_with(vec![RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 5.0, 5.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(1.0, 0.0, 0.0)),
+            alpha: 1.0,
+            overprint: None,
+        }]);
+        assert!(!normal.is_backdrop_dependent());
+
+        // Multiply inside an isolated Normal group only reads the group's own backdrop.
+        let isolated_mul = tiling_with(vec![
+            RenderCommand::PushBlendGroup {
+                blend_mode: BlendMode::Normal,
+                isolated: true,
+                knockout: false,
+                bounds: Rect::new(0.0, 0.0, 10.0, 10.0),
+                alpha: 1.0,
+                mask: None,
+            },
+            RenderCommand::PushBlendGroup {
+                blend_mode: BlendMode::Multiply,
+                isolated: true,
+                knockout: false,
+                bounds: Rect::new(0.0, 0.0, 10.0, 10.0),
+                alpha: 1.0,
+                mask: None,
+            },
+            RenderCommand::FillPath {
+                path: rect_path(0.0, 0.0, 5.0, 5.0),
+                rule: FillRule::NonZero,
+                paint: Paint::Solid(Color::white()),
+                alpha: 1.0,
+                overprint: None,
+            },
+            RenderCommand::PopBlendGroup,
+            RenderCommand::PopBlendGroup,
+        ]);
+        assert!(!isolated_mul.is_backdrop_dependent());
+
+        // Active overprint reads the destination backdrop and cannot be split into blend segments.
+        let overprint = tiling_with(vec![RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 5.0, 5.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::black()),
+            alpha: 1.0,
+            overprint: Some(Overprint {
+                cmyk: [0.0, 0.0, 0.0, 1.0],
+                active: Overprint::K,
+            }),
+        }]);
+        assert!(overprint.is_backdrop_dependent());
+        assert!(overprint.blend_segments().is_none());
+    }
+
+    #[test]
+    fn blend_segments_splits_normal_and_multiply_preserving_clips() {
+        let tiling = tiling_with(vec![
+            RenderCommand::PushClip {
+                path: rect_path(0.0, 0.0, 10.0, 10.0),
+                rule: FillRule::NonZero,
+            },
+            RenderCommand::FillPath {
+                path: rect_path(0.0, 0.0, 5.0, 10.0),
+                rule: FillRule::NonZero,
+                paint: Paint::Solid(Color::rgb(1.0, 0.0, 0.0)),
+                alpha: 1.0,
+                overprint: None,
+            },
+            RenderCommand::PushBlendGroup {
+                blend_mode: BlendMode::Multiply,
+                isolated: true,
+                knockout: false,
+                bounds: Rect::new(0.0, 0.0, 10.0, 10.0),
+                alpha: 1.0,
+                mask: None,
+            },
+            RenderCommand::FillPath {
+                path: rect_path(5.0, 0.0, 10.0, 10.0),
+                rule: FillRule::NonZero,
+                paint: Paint::Solid(Color::white()),
+                alpha: 1.0,
+                overprint: None,
+            },
+            RenderCommand::PopBlendGroup,
+            RenderCommand::FillPath {
+                path: rect_path(0.0, 0.0, 2.0, 2.0),
+                rule: FillRule::NonZero,
+                paint: Paint::Solid(Color::rgb(0.0, 1.0, 0.0)),
+                alpha: 1.0,
+                overprint: None,
+            },
+            RenderCommand::PopClip,
+        ]);
+        assert!(tiling.is_backdrop_dependent());
+        let segs = tiling
+            .blend_segments()
+            .expect("normal+multiply+normal should split cleanly");
+        assert_eq!(segs.len(), 3);
+        assert_eq!(segs[0].blend_mode, BlendMode::Normal);
+        assert_eq!(segs[1].blend_mode, BlendMode::Multiply);
+        assert_eq!(segs[2].blend_mode, BlendMode::Normal);
+        // Each segment carries balanced PushClip/PopClip around its draw.
+        for seg in &segs {
+            let pushes = seg
+                .commands
+                .commands
+                .iter()
+                .filter(|c| matches!(c, RenderCommand::PushClip { .. }))
+                .count();
+            let pops = seg
+                .commands
+                .commands
+                .iter()
+                .filter(|c| matches!(c, RenderCommand::PopClip))
+                .count();
+            assert_eq!(pushes, 1);
+            assert_eq!(pops, 1);
         }
     }
 }

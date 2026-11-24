@@ -34,6 +34,33 @@ struct GlyphXform {
 /// every early-return here corresponds to a CPU no-op, so the GPU emits the same
 /// set of glyphs (a missing guard would add/drop pixels and fail `compare`).
 pub fn render_glyph_run(rec: &mut PageRecorder, fonts: &FontCache, map: &PageMap, run: &GlyphRun) {
+    render_glyph_run_with_tm(rec, fonts, map, run, &run.transform);
+}
+
+/// Render one glyph run transformed by an outer `ctm` (e.g. a tiling cell's
+/// pattern-to-page matrix) without cloning the run's glyph list.
+pub fn render_glyph_run_transformed(
+    rec: &mut PageRecorder,
+    fonts: &FontCache,
+    map: &PageMap,
+    run: &GlyphRun,
+    ctm: &Matrix,
+) {
+    if *ctm == Matrix::identity() {
+        render_glyph_run_with_tm(rec, fonts, map, run, &run.transform);
+    } else {
+        let tm = ctm.concat(&run.transform);
+        render_glyph_run_with_tm(rec, fonts, map, run, &tm);
+    }
+}
+
+fn render_glyph_run_with_tm(
+    rec: &mut PageRecorder,
+    fonts: &FontCache,
+    map: &PageMap,
+    run: &GlyphRun,
+    tm: &Matrix,
+) {
     let Some(font) = fonts.get(run.font_id) else {
         return;
     };
@@ -48,10 +75,8 @@ pub fn render_glyph_run(rec: &mut PageRecorder, fonts: &FontCache, map: &PageMap
         return; // fully transparent — contributes nothing (CPU draws invisibly)
     }
 
-    let tm = &run.transform;
-
     if font.is_type3() {
-        render_type3(rec, font, run, color, map, run.h_scale);
+        render_type3(rec, font, run, tm, color, map, run.h_scale);
         return;
     }
 
@@ -248,11 +273,11 @@ fn render_type3(
     rec: &mut PageRecorder,
     font: &LoadedFont,
     run: &GlyphRun,
+    tm: &Matrix,
     color: [f32; 4],
     map: &PageMap,
     h_scale: f32,
 ) {
-    let tm = &run.transform;
     let font_size = run.font_size;
 
     for g in &run.glyphs {
