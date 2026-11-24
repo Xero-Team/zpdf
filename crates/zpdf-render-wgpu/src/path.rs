@@ -100,7 +100,20 @@ pub fn stroke_mesh_transformed(
     ctm: &zpdf_core::Matrix,
     map: &PageMap,
 ) -> Option<Mesh> {
-    if *ctm == zpdf_core::Matrix::identity() {
+    stroke_mesh_transformed_with_min_width(path, style, color, ctm, map, 1.0)
+}
+
+/// Like [`stroke_mesh_transformed`], with a configurable device-pixel minimum
+/// width floor (`1.0` for regular paths, `0.5` for Type 3 glyph strokes).
+pub(crate) fn stroke_mesh_transformed_with_min_width(
+    path: &DlPath,
+    style: &StrokeStyle,
+    color: [f32; 4],
+    ctm: &zpdf_core::Matrix,
+    map: &PageMap,
+    min_width: f32,
+) -> Option<Mesh> {
+    if *ctm == zpdf_core::Matrix::identity() && min_width == 1.0 {
         return stroke_mesh(path, style, color, map);
     }
     if ![ctm.a, ctm.b, ctm.c, ctm.d, ctm.e, ctm.f]
@@ -116,7 +129,7 @@ pub fn stroke_mesh_transformed(
     let pat_tol = (TOLERANCE / max_scale).clamp(1e-5, TOLERANCE);
 
     if !style.width.is_finite() || style.width <= 0.0 {
-        // PDF zero-width hairline: 1 device pixel regardless of anisotropic CTM.
+        // PDF zero-width hairline: `min_width` device pixels regardless of anisotropic CTM.
         let device_path = match &style.dash {
             Some(dash) if !zpdf_render::dash::is_degenerate(&dash.array) => {
                 let raw = build_raw_lyon_path(path, ctm, map)?;
@@ -126,7 +139,7 @@ pub fn stroke_mesh_transformed(
             _ => build_lyon_path_transformed(path, ctm, map)?,
         };
         let opts = StrokeOptions::tolerance(TOLERANCE)
-            .with_line_width(1.0)
+            .with_line_width(min_width)
             .with_start_cap(map_cap(style.cap))
             .with_end_cap(map_cap(style.cap))
             .with_line_join(map_join(style.join))
@@ -140,9 +153,9 @@ pub fn stroke_mesh_transformed(
             pat_path = dash_lyon_path(&pat_path, &dash.array, dash.phase, 1.0, pat_tol)?;
         }
     }
-    // Pattern-space width with a 1-device-pixel floor along the maximally
-    // stretched axis (mirrors CpuRenderer::build_anisotropic_stroke_outline).
-    let pat_width = style.width.max(1.0 / max_scale);
+    // Pattern/glyph-space width with a `min_width` device-pixel floor along
+    // the maximally stretched axis.
+    let pat_width = style.width.max(min_width / max_scale);
     let opts = StrokeOptions::tolerance(pat_tol)
         .with_line_width(pat_width)
         .with_start_cap(map_cap(style.cap))
@@ -254,42 +267,6 @@ pub fn fill_lyon_path(path: &LyonPath, rule: FillRule, color: [f32; 4]) -> Optio
         return None;
     }
     (!mesh.indices.is_empty()).then_some(mesh)
-}
-
-/// Tessellate an already-built device-pixel lyon path as a stroke using a
-/// display-list [`StrokeStyle`] scaled by `stroke_scale` (matching CPU
-/// `skia_stroke(style, stroke_scale, min_width)` for Type 3 glyphs).
-pub(crate) fn stroke_lyon_path_styled(
-    path: &LyonPath,
-    style: &StrokeStyle,
-    stroke_scale: f32,
-    min_width: f32,
-    color: [f32; 4],
-) -> Option<Mesh> {
-    if !style.width.is_finite() || !stroke_scale.is_finite() {
-        return None;
-    }
-    let width = (style.width.max(0.0) * stroke_scale.max(0.0)).max(min_width);
-    let mut dashed = None;
-    if let Some(dash) = &style.dash {
-        if !zpdf_render::dash::is_degenerate(&dash.array) && stroke_scale > 0.0 {
-            dashed = Some(dash_lyon_path(
-                path,
-                &dash.array,
-                dash.phase,
-                stroke_scale,
-                TOLERANCE,
-            )?);
-        }
-    }
-    let target = dashed.as_ref().unwrap_or(path);
-    let opts = StrokeOptions::tolerance(TOLERANCE)
-        .with_line_width(width)
-        .with_start_cap(map_cap(style.cap))
-        .with_end_cap(map_cap(style.cap))
-        .with_line_join(map_join(style.join))
-        .with_miter_limit(style.miter_limit.max(1.0));
-    stroke_lyon_path(target, &opts, color)
 }
 
 /// Tessellate an already-built lyon path as a stroke with the given options.

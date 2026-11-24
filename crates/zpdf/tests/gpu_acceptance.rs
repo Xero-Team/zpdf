@@ -3496,3 +3496,229 @@ fn gpu_and_cpu_type3_scaled_rotated_stroke_matches_cpu() {
         );
     }
 }
+
+#[test]
+fn pdf_type3_named_resource_stencil_do_renders_cpu_and_gpu() {
+    let stream = |dict: &str, bytes: &[u8]| -> Vec<u8> {
+        let mut out = format!("<< {dict} /Length {} >>\nstream\n", bytes.len()).into_bytes();
+        out.extend_from_slice(bytes);
+        out.extend_from_slice(b"\nendstream");
+        out
+    };
+    // Glyph 'A': inline `/IM true` 8×8 stencil (all 0x00 = opaque ink).
+    let inline_charproc =
+        b"1 0 0 0 1 1 d1 BI /W 8 /H 8 /BPC 1 /IM true ID \x00\x00\x00\x00\x00\x00\x00\x00 EI";
+    // Glyph 'B': named `/Ink Do` stencil referencing the Type 3 font's `/Resources`.
+    let named_charproc = b"1 0 0 0 1 1 d1 /Ink Do";
+    let ink_mask_bytes = [0u8; 8];
+    let pat_content = b"0 0 1 rg 0 0 8 8 re f";
+    let page_content = b"/Pattern cs /P1 scn BT /F1 20 Tf 8 10 Td (AB) Tj ET";
+
+    let objects: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 60 40] \
+          /Resources << /Font << /F1 5 0 R >> /Pattern << /P1 9 0 R >> >> \
+          /Contents 4 0 R >>"
+            .to_vec(),
+        stream("", page_content),
+        b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1 1] \
+          /FontMatrix [1 0 0 1 0 0] \
+          /Resources << /XObject << /Ink 8 0 R >> >> \
+          /CharProcs << /A 6 0 R /B 7 0 R >> \
+          /Encoding << /Type /Encoding /Differences [65 /A /B] >> \
+          /FirstChar 65 /LastChar 66 /Widths [1 1] >>"
+            .to_vec(),
+        stream("", inline_charproc),
+        stream("", named_charproc),
+        stream(
+            "/Type /XObject /Subtype /Image /Width 8 /Height 8 /BitsPerComponent 1 /ImageMask true",
+            &ink_mask_bytes,
+        ),
+        stream(
+            "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 8 8] /XStep 8 /YStep 8",
+            pat_content,
+        ),
+    ];
+
+    let mut pdf = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n".to_vec();
+    let mut offsets = Vec::with_capacity(objects.len());
+    for (idx, body) in objects.iter().enumerate() {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{} 0 obj\n", idx + 1).as_bytes());
+        pdf.extend_from_slice(body);
+        pdf.extend_from_slice(b"\nendobj\n");
+    }
+    let xref = pdf.len();
+    let count = objects.len() + 1;
+    pdf.extend_from_slice(format!("xref\n0 {count}\n0000000000 65535 f \n").as_bytes());
+    for off in offsets {
+        pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!("trailer\n<< /Size {count} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+    );
+
+    let doc = zpdf::PdfDocument::open(pdf).expect("open pdf");
+    let page = doc.page(0).expect("page 0");
+    let mut fonts = doc.load_page_fonts(&page);
+    let (content, _) = doc.page_content_with_diagnostics(&page).expect("content");
+    let mut images = zpdf_image::ImageCache::new();
+    let interpreter = zpdf_content::interpreter::ContentInterpreter::new(page.effective_box())
+        .with_document(doc.file(), &page.resources)
+        .with_fonts(&mut fonts)
+        .with_images(&mut images);
+    let (dl, _) = interpreter.interpret_with_stats(&content);
+
+    let px = |data: &[u8], w: u32, x: u32, y: u32| -> [u8; 3] {
+        let off = ((y * w + x) * 4) as usize;
+        [data[off], data[off + 1], data[off + 2]]
+    };
+    let check = |backend: &str, data: &[u8], w: u32| {
+        // Inline 'A' spans x=[8..28], y=[10..30] -> (18, 20).
+        // Named `/Ink Do` 'B' spans x=[28..48], y=[10..30] -> (38, 20).
+        // Outside background at (4, 20) stays white.
+        let a = px(data, w, 18, 20);
+        let b = px(data, w, 38, 20);
+        let bg = px(data, w, 4, 20);
+        assert!(
+            a[0] < 15 && a[1] < 15 && a[2] > 240,
+            "{backend} inline stencil Type 3 glyph 'A' must be blue, got {a:?}"
+        );
+        assert!(
+            b[0] < 15 && b[1] < 15 && b[2] > 240,
+            "{backend} named `/Ink Do` stencil Type 3 glyph 'B' must be blue, got {b:?}"
+        );
+        assert_eq!(bg, [255, 255, 255], "{backend} margin must stay white");
+    };
+
+    let cpu = zpdf_render_cpu::CpuRenderer::new()
+        .with_fonts(&fonts)
+        .with_images(&images)
+        .render_display_list(&dl, 1.0)
+        .expect("cpu render");
+    check("CPU", &cpu.data, cpu.width);
+
+    match render_gpu_shared(&dl, Some(&fonts), Some(&images), 1.0) {
+        Ok(gpu) => check("GPU", &gpu.data, gpu.width),
+        Err(zpdf::gpu::WgpuRenderError::NoAdapter) => {
+            eprintln!("skipping GPU named Type 3 `/Ink Do` test (no adapter)");
+        }
+        Err(e) => panic!("GPU named Type 3 `/Ink Do` test failed: {e}"),
+    }
+}
+
+#[test]
+fn gpu_and_cpu_type3_nonuniform_4x1_stroke_preserves_anisotropic_widths() {
+    use std::sync::Arc;
+    use zpdf::display_list::{
+        Color, DisplayList, FillRule, GlyphRun, Paint, Path, PositionedGlyph, RenderCommand,
+        TilingPattern,
+    };
+    use zpdf_core::{Matrix, Rect};
+    use zpdf_font::{CidWidths, FontCache, LoadedFont, PdfFontType};
+
+    // Glyph-space pen width 2 under 4× horizontal, 1× vertical text scaling:
+    // - Vertical segment at glyph x=4, y=[2..38] -> page x=24, y=[10..46]: 8 px wide horizontally.
+    // - Horizontal segment at glyph x=[12..22], y=20 -> page x=[56..96], y=28: 2 px tall vertically.
+    let charproc = b"30 0 0 0 30 40 d1 2 w 4 2 m 4 38 l S 12 20 m 22 20 l S";
+    let font = LoadedFont::new_with_data(
+        PdfFontType::Type3 {
+            font_matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            char_procs: std::collections::HashMap::from([(
+                "A".into(),
+                Arc::<[u8]>::from(&charproc[..]),
+            )]),
+            encoding: vec!["A".into()],
+            widths: vec![30.0],
+            first_char: 0,
+        },
+        "Type3AnisotropicStroke".into(),
+        Vec::new(),
+        CidWidths::new(30.0),
+    );
+    let mut fonts = FontCache::new();
+    let font_id = fonts.insert("F1".into(), font);
+
+    let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 8.0, 8.0));
+    let mut r = Path::new();
+    r.rect(Rect::new(0.0, 0.0, 8.0, 8.0));
+    cell.push(RenderCommand::FillPath {
+        path: r,
+        rule: FillRule::NonZero,
+        paint: Paint::Solid(Color::rgb(1.0, 0.0, 0.0)),
+        alpha: 1.0,
+        overprint: None,
+    });
+    let tiling = Arc::new(TilingPattern {
+        commands: Arc::new(cell),
+        bbox: Rect::new(0.0, 0.0, 8.0, 8.0),
+        x_step: 8.0,
+        y_step: 8.0,
+        matrix: Matrix::identity(),
+        tiling_type: 1,
+    });
+
+    for (label, paint) in [
+        ("solid", Paint::Solid(Color::rgb(1.0, 0.0, 0.0))),
+        ("tiling", Paint::Tiling(tiling)),
+    ] {
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 110.0, 56.0));
+        dl.push(RenderCommand::DrawGlyphRun(GlyphRun {
+            font_id,
+            font_size: 1.0,
+            glyphs: vec![PositionedGlyph {
+                glyph_id: 0,
+                code_len: 1,
+                code: b'A' as u32,
+                x: 0.0,
+                y: 0.0,
+                advance: 30.0,
+            }],
+            paint,
+            alpha: 1.0,
+            overprint: None,
+            transform: Matrix::new(4.0, 0.0, 0.0, 1.0, 8.0, 8.0),
+            h_scale: 1.0,
+        }));
+
+        let check = |backend: &str, data: &[u8], w: u32, h: u32| {
+            // Vertical stroke crosses pixel row y = 28 near x = 24; expect ~8 px wide.
+            let vert_width = (10..40)
+                .filter(|&x| {
+                    let off = ((28 * w + x) * 4) as usize;
+                    data[off] > 200 && data[off + 1] < 80 && data[off + 2] < 80
+                })
+                .count();
+            // Horizontal stroke crosses pixel col x = 76 near y = 28; expect ~2 px tall.
+            let horiz_height = (0..h)
+                .filter(|&y| {
+                    let off = ((y * w + 76) * 4) as usize;
+                    data[off] > 200 && data[off + 1] < 80 && data[off + 2] < 80
+                })
+                .count();
+            assert!(
+                (7..=9).contains(&vert_width),
+                "{backend} ({label}) 4x1 scaled vertical stroke (glyph w=2) must be ~8px wide, got {vert_width}px"
+            );
+            assert!(
+                (1..=3).contains(&horiz_height),
+                "{backend} ({label}) 4x1 scaled horizontal stroke (glyph w=2) must be ~2px tall, got {horiz_height}px"
+            );
+        };
+
+        let cpu = zpdf_render_cpu::CpuRenderer::new()
+            .with_fonts(&fonts)
+            .render_display_list(&dl, 1.0)
+            .expect("cpu render");
+        check("CPU", &cpu.data, cpu.width, cpu.height);
+
+        match render_gpu_shared(&dl, Some(&fonts), None, 1.0) {
+            Ok(gpu) => check("GPU", &gpu.data, gpu.width, gpu.height),
+            Err(zpdf::gpu::WgpuRenderError::NoAdapter) => {
+                eprintln!("skipping GPU 4x1 anisotropic Type 3 stroke test ({label}, no adapter)");
+            }
+            Err(e) => panic!("GPU 4x1 anisotropic Type 3 stroke test ({label}) failed: {e}"),
+        }
+    }
+}

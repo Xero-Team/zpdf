@@ -16,7 +16,7 @@ use zpdf_display_list::{FillRule, GlyphRun, Paint, Path as DlPath, PathElement, 
 use zpdf_font::{FontCache, GlyphOutline, LoadedFont, OutlineCommand};
 
 use crate::glyph_atlas::{self, GlyphKey};
-use crate::path::{fill_lyon_path, stroke_lyon_path_styled};
+use crate::path::{fill_lyon_path, stroke_mesh_transformed_with_min_width};
 use crate::record::{PageOp, PageRecorder, Type3ImageKey};
 use crate::transform::{quantize_premul, PageMap};
 
@@ -369,13 +369,6 @@ fn type3_glyph_to_page(
     ))
 }
 
-fn type3_stroke_scale(glyph_to_page: &Matrix, map_scale: f32) -> f32 {
-    ((glyph_to_page.a * glyph_to_page.d - glyph_to_page.b * glyph_to_page.c)
-        .abs()
-        .sqrt()
-        * map_scale as f64) as f32
-}
-
 fn scale_premul_color(color: [f32; 4], alpha: f32) -> [f32; 4] {
     if alpha >= 1.0 {
         color
@@ -415,11 +408,12 @@ fn render_type3(
         let Some((stream, font_matrix)) = font.type3_glyph_stream(g.glyph_id) else {
             continue;
         };
-        let Some((glyph_dl, glyph_images)) = rec.interpret_type3_stream(stream) else {
+        let Some((glyph_dl, glyph_images)) =
+            rec.interpret_type3_stream(stream, font.type3_resources())
+        else {
             return;
         };
         let glyph_to_page = type3_glyph_to_page(tm, (g.x, g.y), font_size, h_scale, &font_matrix);
-        let stroke_scale = type3_stroke_scale(&glyph_to_page, map.scale);
         let mut glyph_clip_depth = 0usize;
 
         for cmd in &glyph_dl.commands {
@@ -501,20 +495,15 @@ fn render_type3(
                     if draw_color[3] <= 0.0 {
                         continue;
                     }
-                    if let Some(p) = build_type3_path(
+                    if let Some(mesh) = stroke_mesh_transformed_with_min_width(
                         path,
-                        &font_matrix,
-                        font_size,
-                        h_scale,
-                        tm,
-                        (g.x, g.y),
+                        style,
+                        draw_color,
+                        &glyph_to_page,
                         map,
+                        0.5,
                     ) {
-                        if let Some(mesh) =
-                            stroke_lyon_path_styled(&p, style, stroke_scale, 0.5, draw_color)
-                        {
-                            rec.add_mesh(mesh);
-                        }
+                        rec.add_mesh(mesh);
                     }
                 }
                 RenderCommand::DrawImage(draw) => {
@@ -682,11 +671,12 @@ pub fn render_type3_tiling_transformed(
         let Some((stream, font_matrix)) = font.type3_glyph_stream(g.glyph_id) else {
             continue;
         };
-        let Some((glyph_dl, glyph_images)) = rec.interpret_type3_stream(stream) else {
+        let Some((glyph_dl, glyph_images)) =
+            rec.interpret_type3_stream(stream, font.type3_resources())
+        else {
             return;
         };
         let glyph_to_page = type3_glyph_to_page(&tm, (g.x, g.y), font_size, h_scale, &font_matrix);
-        let stroke_scale = type3_stroke_scale(&glyph_to_page, map.scale);
         let mut glyph_clip_depth = 0usize;
 
         for cmd in &glyph_dl.commands {
@@ -815,57 +805,39 @@ pub fn render_type3_tiling_transformed(
                             if draw_color[3] <= 0.0 {
                                 continue;
                             }
-                            if let Some(p) = build_type3_path(
+                            if let Some(mesh) = stroke_mesh_transformed_with_min_width(
                                 path,
-                                &font_matrix,
-                                font_size,
-                                h_scale,
-                                &tm,
-                                (g.x, g.y),
+                                style,
+                                draw_color,
+                                &glyph_to_page,
                                 map,
+                                0.5,
                             ) {
-                                if let Some(mesh) = stroke_lyon_path_styled(
-                                    &p,
-                                    style,
-                                    stroke_scale,
-                                    0.5,
-                                    draw_color,
-                                ) {
-                                    rec.add_mesh(mesh);
-                                }
+                                rec.add_mesh(mesh);
                             }
                         }
                         Paint::Inherited => {
                             let mask_color = [cmd_alpha; 4];
-                            if let Some(p) = build_type3_path(
+                            if let Some(mesh) = stroke_mesh_transformed_with_min_width(
                                 path,
-                                &font_matrix,
-                                font_size,
-                                h_scale,
-                                &tm,
-                                (g.x, g.y),
+                                style,
+                                mask_color,
+                                &glyph_to_page,
                                 map,
+                                0.5,
                             ) {
-                                if let Some(mesh) = stroke_lyon_path_styled(
-                                    &p,
-                                    style,
-                                    stroke_scale,
-                                    0.5,
-                                    mask_color,
-                                ) {
-                                    for v in &mesh.vertices {
-                                        if v.pos[0].is_finite() && v.pos[1].is_finite() {
-                                            min_px = min_px.min(v.pos[0]);
-                                            min_py = min_py.min(v.pos[1]);
-                                            max_px = max_px.max(v.pos[0]);
-                                            max_py = max_py.max(v.pos[1]);
-                                        }
+                                for v in &mesh.vertices {
+                                    if v.pos[0].is_finite() && v.pos[1].is_finite() {
+                                        min_px = min_px.min(v.pos[0]);
+                                        min_py = min_py.min(v.pos[1]);
+                                        max_px = max_px.max(v.pos[0]);
+                                        max_py = max_py.max(v.pos[1]);
                                     }
-                                    if rec.record_subops_clipped_into(&mut mask_ops, |r| {
-                                        r.add_mesh(mesh)
-                                    }) {
-                                        mask_has_draws = true;
-                                    }
+                                }
+                                if rec
+                                    .record_subops_clipped_into(&mut mask_ops, |r| r.add_mesh(mesh))
+                                {
+                                    mask_has_draws = true;
                                 }
                             }
                         }

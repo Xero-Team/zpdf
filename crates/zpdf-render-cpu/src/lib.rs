@@ -6067,6 +6067,161 @@ impl<'a> CpuRenderer<'a> {
         out
     }
 
+    fn build_raw_skia_path(path: &Path) -> Option<tiny_skia::Path> {
+        let mut pb = tiny_skia::PathBuilder::new();
+        for elem in path {
+            match elem {
+                PathElement::MoveTo(p) => {
+                    if !p.x.is_finite() || !p.y.is_finite() {
+                        return None;
+                    }
+                    pb.move_to(p.x as f32, p.y as f32);
+                }
+                PathElement::LineTo(p) => {
+                    if !p.x.is_finite() || !p.y.is_finite() {
+                        return None;
+                    }
+                    pb.line_to(p.x as f32, p.y as f32);
+                }
+                PathElement::CurveTo(c1, c2, end) => {
+                    if ![c1.x, c1.y, c2.x, c2.y, end.x, end.y]
+                        .iter()
+                        .all(|v| v.is_finite())
+                    {
+                        return None;
+                    }
+                    pb.cubic_to(
+                        c1.x as f32,
+                        c1.y as f32,
+                        c2.x as f32,
+                        c2.y as f32,
+                        end.x as f32,
+                        end.y as f32,
+                    );
+                }
+                PathElement::Close => pb.close(),
+            }
+        }
+        pb.finish()
+    }
+
+    fn max_linear_scale_2x2(a: f64, b: f64, c: f64, d: f64) -> f64 {
+        let sum_sq = a * a + b * b + c * c + d * d;
+        let det = a * d - b * c;
+        let disc = (sum_sq * sum_sq - 4.0 * det * det).max(0.0).sqrt();
+        (0.5 * (sum_sq + disc)).sqrt()
+    }
+
+    fn type3_glyph_to_device(
+        &self,
+        glyph_to_page: &zpdf_core::Matrix,
+    ) -> Option<tiny_skia::Transform> {
+        let sx = self.scale as f64;
+        let sy = self.scale_y as f64;
+        let a = glyph_to_page.a * sx;
+        let ky = -glyph_to_page.b * sy;
+        let kx = glyph_to_page.c * sx;
+        let d = -glyph_to_page.d * sy;
+        let tx = (glyph_to_page.e - self.rect_x0 as f64) * sx - self.dev_origin_x as f64;
+        let ty = (self.rect_y1 as f64 - glyph_to_page.f) * sy - self.dev_origin_y as f64;
+        if ![a, ky, kx, d, tx, ty].iter().all(|v| v.is_finite()) {
+            return None;
+        }
+        Some(tiny_skia::Transform::from_row(
+            a as f32, ky as f32, kx as f32, d as f32, tx as f32, ty as f32,
+        ))
+    }
+
+    /// Expand a Type 3 glyph stroke in glyph space and map its filled outline
+    /// through `glyph_to_page` + device scaling so nonuniform text transforms
+    /// preserve directional stroke widths, elliptical caps/joins, and dashes.
+    /// Returns `(device_path, true)` for positive-width filled stroke outlines
+    /// or `(device_centerline, false)` for 0-width PDF hairlines.
+    fn build_type3_stroke_geometry(
+        &self,
+        path: &Path,
+        style: &StrokeStyle,
+        glyph_to_page: &zpdf_core::Matrix,
+    ) -> Option<(tiny_skia::Path, bool)> {
+        let dev_xf = self.type3_glyph_to_device(glyph_to_page)?;
+        let max_scale = Self::max_linear_scale_2x2(
+            dev_xf.sx as f64,
+            dev_xf.ky as f64,
+            dev_xf.kx as f64,
+            dev_xf.sy as f64,
+        ) as f32;
+        if !max_scale.is_finite() || max_scale <= 1e-9 {
+            return None;
+        }
+        let unscaled = Self::build_raw_skia_path(path)?;
+        let res_scale = max_scale.clamp(0.01, 1024.0);
+        if style.width.is_finite() && style.width > 0.0 {
+            let glyph_stroke = Self::skia_stroke(style, 1.0, 0.5 / max_scale);
+            let dashed;
+            let source = if let Some(ref dash) = glyph_stroke.dash {
+                dashed = unscaled.dash(dash, res_scale)?;
+                &dashed
+            } else {
+                &unscaled
+            };
+            let stroked = source.stroke(&glyph_stroke, res_scale)?;
+            let device = stroked.transform(dev_xf)?;
+            self.check_path_limits(device).map(|p| (p, true))
+        } else {
+            let source = if let Some(dash) = Self::stroke_dash(style, 1.0) {
+                unscaled.dash(&dash, res_scale)?
+            } else {
+                unscaled
+            };
+            let device = source.transform(dev_xf)?;
+            self.check_path_limits(device).map(|p| (p, false))
+        }
+    }
+
+    fn push_type3_clip_stroke(
+        &mut self,
+        path: &Path,
+        style: &StrokeStyle,
+        glyph_to_page: &zpdf_core::Matrix,
+    ) {
+        let page_max_scale = Self::max_linear_scale_2x2(
+            glyph_to_page.a,
+            glyph_to_page.b,
+            glyph_to_page.c,
+            glyph_to_page.d,
+        ) as f32;
+        let dev_max_scale = page_max_scale * self.scale.max(self.scale_y);
+        if style.width.is_finite()
+            && style.width > 0.0
+            && dev_max_scale.is_finite()
+            && dev_max_scale > 1e-9
+        {
+            if let Some(unscaled) = Self::build_raw_skia_path(path) {
+                let res_scale = dev_max_scale.clamp(0.01, 1024.0);
+                let glyph_stroke = Self::skia_stroke(style, 1.0, 0.5 / dev_max_scale);
+                let dashed = glyph_stroke
+                    .dash
+                    .as_ref()
+                    .and_then(|d| unscaled.dash(d, res_scale));
+                let source = match (&glyph_stroke.dash, &dashed) {
+                    (Some(_), Some(d)) => Some(d),
+                    (Some(_), None) => None,
+                    (None, _) => Some(&unscaled),
+                };
+                if let Some(stroked) = source.and_then(|s| s.stroke(&glyph_stroke, res_scale)) {
+                    let page_outline = skia_path_to_dl_transformed(&stroked, glyph_to_page);
+                    self.push_clip(&page_outline, &FillRule::NonZero);
+                    return;
+                }
+                self.push_clip(&Path::new(), &FillRule::NonZero);
+                return;
+            }
+        }
+        let page_path = Self::type3_path_to_page(path, glyph_to_page);
+        let scaled = Self::scale_type3_stroke_style(style, page_max_scale);
+        self.push_clip_stroke(&page_path, &scaled);
+    }
+
     fn scale_type3_stroke_style(style: &StrokeStyle, scale: f32) -> StrokeStyle {
         let s = if scale.is_finite() && scale >= 0.0 {
             scale
@@ -6158,10 +6313,6 @@ impl<'a> CpuRenderer<'a> {
                 run.h_scale,
                 &program.font_matrix,
             );
-            let page_stroke_scale = (glyph_to_page.a * glyph_to_page.d
-                - glyph_to_page.b * glyph_to_page.c)
-                .abs()
-                .sqrt() as f32;
             let mut seg_start = 0usize;
             let mut glyph_clip_depth = 0usize;
             let flush_inherited = |r: &mut Self, start: usize, end: usize| {
@@ -6197,9 +6348,7 @@ impl<'a> CpuRenderer<'a> {
                     }
                     RenderCommand::PushClipStroke { path, style } => {
                         flush_inherited(self, seg_start, i);
-                        let page_path = Self::type3_path_to_page(path, &glyph_to_page);
-                        let scaled = Self::scale_type3_stroke_style(style, page_stroke_scale);
-                        self.push_clip_stroke(&page_path, &scaled);
+                        self.push_type3_clip_stroke(path, style, &glyph_to_page);
                         glyph_clip_depth += 1;
                         seg_start = i + 1;
                     }
@@ -6251,11 +6400,6 @@ impl<'a> CpuRenderer<'a> {
         let font_matrix = program.font_matrix;
         let glyph_images = &program.images;
         let glyph_to_page = Self::type3_glyph_to_page(tm, glyph, font_size, h_scale, &font_matrix);
-        let page_stroke_scale = (glyph_to_page.a * glyph_to_page.d
-            - glyph_to_page.b * glyph_to_page.c)
-            .abs()
-            .sqrt() as f32;
-        let stroke_scale = (page_stroke_scale as f64 * self.stroke_scale() as f64) as f32;
         let mut glyph_clip_depth = 0usize;
 
         for cmd in commands {
@@ -6266,9 +6410,7 @@ impl<'a> CpuRenderer<'a> {
                     glyph_clip_depth += 1;
                 }
                 RenderCommand::PushClipStroke { path, style } => {
-                    let page_path = Self::type3_path_to_page(path, &glyph_to_page);
-                    let scaled = Self::scale_type3_stroke_style(style, page_stroke_scale);
-                    self.push_clip_stroke(&page_path, &scaled);
+                    self.push_type3_clip_stroke(path, style, &glyph_to_page);
                     glyph_clip_depth += 1;
                 }
                 RenderCommand::PopClip => {
@@ -6375,26 +6517,35 @@ impl<'a> CpuRenderer<'a> {
                         }
                         _ => continue,
                     };
-                    if let Some(skia_path) = self.build_type3_transformed_path(
-                        path,
-                        &font_matrix,
-                        font_size,
-                        h_scale,
-                        tm,
-                        (glyph.x, glyph.y),
-                    ) {
-                        let stroke = Self::skia_stroke(style, stroke_scale, 0.5);
-                        if let Some(ref mut pixmap) = self.pixmap {
-                            pixmap.stroke_path(
-                                &skia_path,
-                                draw_paint,
-                                &stroke,
-                                tiny_skia::Transform::identity(),
-                                self.current_clip.as_ref(),
-                            );
+                    if let Some((skia_path, is_filled_outline)) =
+                        self.build_type3_stroke_geometry(path, style, &glyph_to_page)
+                    {
+                        if is_filled_outline {
+                            if let Some(ref mut pixmap) = self.pixmap {
+                                pixmap.fill_path(
+                                    &skia_path,
+                                    draw_paint,
+                                    tiny_skia::FillRule::Winding,
+                                    tiny_skia::Transform::identity(),
+                                    self.current_clip.as_ref(),
+                                );
+                            }
+                            self.mark_painted(skia_path.bounds(), 1.0);
+                        } else {
+                            let mut hairline = Self::skia_stroke(style, 0.0, 0.5);
+                            hairline.dash = None;
+                            if let Some(ref mut pixmap) = self.pixmap {
+                                pixmap.stroke_path(
+                                    &skia_path,
+                                    draw_paint,
+                                    &hairline,
+                                    tiny_skia::Transform::identity(),
+                                    self.current_clip.as_ref(),
+                                );
+                            }
+                            let grow = stroke_overshoot(hairline.width, hairline.miter_limit);
+                            self.mark_painted(skia_path.bounds(), grow);
                         }
-                        let grow = stroke_overshoot(stroke.width, stroke.miter_limit);
-                        self.mark_painted(skia_path.bounds(), grow);
                     }
                 }
                 RenderCommand::DrawImage(draw) => {
@@ -6467,6 +6618,7 @@ impl<'a> CpuRenderer<'a> {
                 let mut images = ImageCache::new();
                 let mut interp = ContentInterpreter::new(glyph_rect)
                     .for_type3_glyph()
+                    .with_type3_resources(font.type3_resources())
                     .with_images(&mut images)
                     .with_limits(&self.parse_limits);
                 if let Some(deadline) = self.deadline {

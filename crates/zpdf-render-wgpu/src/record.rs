@@ -491,6 +491,7 @@ impl PageRecorder {
     pub fn interpret_type3_stream(
         &mut self,
         stream: &[u8],
+        resources: Option<&zpdf_font::Type3Resources>,
     ) -> Option<(zpdf_display_list::DisplayList, zpdf_image::ImageCache)> {
         if !self.can_record() {
             return None;
@@ -510,6 +511,7 @@ impl PageRecorder {
         let mut images = zpdf_image::ImageCache::new();
         let (dl, stats) = zpdf_content::interpreter::ContentInterpreter::new(rect)
             .for_type3_glyph()
+            .with_type3_resources(resources)
             .with_images(&mut images)
             .with_limits(&limits)
             .with_deadline(deadline)
@@ -1344,19 +1346,19 @@ mod tests {
         let mut r = PageRecorder::default().with_limits(&limits);
         let deadline = r.deadline;
         let stream = b"0 0 1 1 re f"; // two operators, one visible command
-        let (first, _) = r.interpret_type3_stream(stream).unwrap();
+        let (first, _) = r.interpret_type3_stream(stream, None).unwrap();
         assert_eq!(first.commands.len(), 1);
         let sub = r.record_subops(|nested| {
-            let (second, _) = nested.interpret_type3_stream(stream).unwrap();
+            let (second, _) = nested.interpret_type3_stream(stream, None).unwrap();
             assert_eq!(second.commands.len(), 1);
         });
         assert!(sub.is_empty());
         assert_eq!(r.type3_work_used, 4);
         assert_eq!(r.deadline, deadline);
-        assert!(r.interpret_type3_stream(stream).is_none());
+        assert!(r.interpret_type3_stream(stream, None).is_none());
         assert_eq!(r.type3_work_used, 5);
         assert!(r.ensure_within_budget().is_err());
-        assert!(r.interpret_type3_stream(b"q Q").is_none());
+        assert!(r.interpret_type3_stream(b"q Q", None).is_none());
         assert_eq!(r.type3_work_used, 5, "failure stops later work");
     }
 
@@ -1368,7 +1370,7 @@ mod tests {
             ..ParseLimits::default()
         };
         let mut r = PageRecorder::default().with_limits(&limits);
-        assert!(r.interpret_type3_stream(stream).is_none());
+        assert!(r.interpret_type3_stream(stream, None).is_none());
         assert_eq!(r.type3_work_used, 1);
         assert!(r.ensure_within_budget().is_err());
         assert!(r.vertices.is_empty());
@@ -1379,7 +1381,7 @@ mod tests {
             ..ParseLimits::default()
         };
         let mut r = PageRecorder::default().with_limits(&limits);
-        assert!(r.interpret_type3_stream(stream).is_some());
+        assert!(r.interpret_type3_stream(stream, None).is_some());
         assert_eq!(r.type3_work_used, 2);
         assert!(r.ensure_within_budget().is_ok());
     }
@@ -1392,15 +1394,15 @@ mod tests {
             ..ParseLimits::default()
         };
         let mut r = PageRecorder::default().with_limits(&limits);
-        assert!(r.interpret_type3_stream(stream).is_some());
+        assert!(r.interpret_type3_stream(stream, None).is_some());
         assert_eq!(r.type3_work_used, 2);
         let sub = r.record_subops(|nested| {
-            assert!(nested.interpret_type3_stream(stream).is_none());
+            assert!(nested.interpret_type3_stream(stream, None).is_none());
         });
         assert!(sub.is_empty());
         assert_eq!(r.type3_work_used, 3);
         assert!(r.ensure_within_budget().is_err());
-        assert!(r.interpret_type3_stream(stream).is_none());
+        assert!(r.interpret_type3_stream(stream, None).is_none());
         assert_eq!(r.type3_work_used, 3, "failure stops later work");
         assert!(r.vertices.is_empty());
         assert!(r.ops.is_empty());
@@ -1413,10 +1415,10 @@ mod tests {
             ..ParseLimits::default()
         };
         let mut r = PageRecorder::default().with_limits(&limits);
-        assert!(r.interpret_type3_stream(b"").is_some());
-        assert!(r.interpret_type3_stream(b"1").is_some());
+        assert!(r.interpret_type3_stream(b"", None).is_some());
+        assert!(r.interpret_type3_stream(b"1", None).is_some());
         assert_eq!(r.type3_work_used, 2);
-        assert!(r.interpret_type3_stream(b"").is_none());
+        assert!(r.interpret_type3_stream(b"", None).is_none());
         assert_eq!(r.type3_work_used, 2);
         assert!(r.ensure_within_budget().is_err());
     }
@@ -1455,7 +1457,7 @@ mod tests {
         ];
         for (limits, stream) in cases {
             let mut r = PageRecorder::default().with_limits(&limits);
-            assert!(r.interpret_type3_stream(stream).is_none());
+            assert!(r.interpret_type3_stream(stream, None).is_none());
             assert!(r.ensure_within_budget().is_err());
             assert!(r.vertices.is_empty());
             assert!(r.ops.is_empty());
@@ -1468,7 +1470,9 @@ mod tests {
         r.deadline = Some(Instant::now()); // deterministic expiry, no sleep
         let deadline = r.deadline;
         let sub = r.record_subops(|nested| {
-            assert!(nested.interpret_type3_stream(b"0 0 1 1 re f").is_none());
+            assert!(nested
+                .interpret_type3_stream(b"0 0 1 1 re f", None)
+                .is_none());
         });
         assert!(sub.is_empty());
         assert_eq!(r.deadline, deadline);

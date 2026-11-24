@@ -1296,6 +1296,25 @@ fn load_type3_font(
         }
     }
 
+    // Resolve the Type 3 font's own `/Resources` (XObjects, ColorSpaces,
+    // ExtGStates) within the remaining font cache budget so CharProcs using
+    // `/Name Do`, `/GS gs`, or named color spaces replay without a live PdfFile.
+    let type3_resources = resolve_dict(file, dict, "Resources").and_then(|res_dict| {
+        let mut seen_images = std::collections::HashMap::new();
+        let mut seen_forms = std::collections::HashMap::new();
+        let mut active_forms = std::collections::HashSet::new();
+        let resolved = resolve_type3_resources(
+            file,
+            &res_dict,
+            &mut remaining,
+            &mut seen_images,
+            &mut seen_forms,
+            &mut active_forms,
+            0,
+        );
+        (!resolved.is_empty()).then(|| Arc::new(resolved))
+    });
+
     // Widths
     let first_char = dict
         .get_i64("FirstChar")
@@ -1345,9 +1364,253 @@ fn load_type3_font(
         cid_cmap: None,
         dw2: (880.0, -1000.0),
         variations: Vec::new(),
+        type3_resources,
     };
 
     Ok(font)
+}
+
+fn resolve_pdf_obj_shallow(file: &PdfFile, obj: &PdfObject, depth: u8) -> PdfObject {
+    if depth >= 4 {
+        return obj.clone();
+    }
+    match obj {
+        PdfObject::Ref(id) => match file.resolve(*id) {
+            Ok(resolved) => resolve_pdf_obj_shallow(file, &resolved, depth + 1),
+            Err(_) => obj.clone(),
+        },
+        PdfObject::Array(arr) => PdfObject::Array(
+            arr.iter()
+                .map(|item| resolve_pdf_obj_shallow(file, item, depth + 1))
+                .collect(),
+        ),
+        PdfObject::Dict(d) => {
+            let mut out = zpdf_core::PdfDict::new();
+            for (k, v) in &d.0 {
+                out.insert(k.clone(), resolve_pdf_obj_shallow(file, v, depth + 1));
+            }
+            PdfObject::Dict(out)
+        }
+        other => other.clone(),
+    }
+}
+
+fn resolve_type3_image_metadata(file: &PdfFile, dict: &zpdf_core::PdfDict) -> zpdf_core::PdfDict {
+    let mut out = dict.clone();
+    for key in [
+        "Width",
+        "Height",
+        "BitsPerComponent",
+        "ImageMask",
+        "Decode",
+        "ColorSpace",
+        "Filter",
+        "Intent",
+        "Interpolate",
+        "Matte",
+    ] {
+        if let Some(v) = dict.get(key) {
+            let resolved = resolve_pdf_obj_shallow(file, v, 0);
+            out.insert(zpdf_core::PdfName::new(key), resolved);
+        }
+    }
+    if let Some(mask) = dict.get("Mask") {
+        let resolved = match mask {
+            PdfObject::Ref(id) => file.resolve(*id).ok(),
+            other => Some(other.clone()),
+        };
+        if let Some(PdfObject::Array(arr)) = resolved {
+            let inlined = arr
+                .iter()
+                .map(|o| resolve_pdf_obj_shallow(file, o, 0))
+                .collect();
+            out.insert(zpdf_core::PdfName::new("Mask"), PdfObject::Array(inlined));
+        }
+    }
+    out
+}
+
+fn resolve_type3_image(
+    file: &PdfFile,
+    obj_id: ObjectId,
+    stream: &zpdf_core::PdfStream,
+    remaining: &mut u64,
+    seen_images: &mut std::collections::HashMap<
+        ObjectId,
+        std::sync::Arc<zpdf_font::Type3ImageXObject>,
+    >,
+    depth: u8,
+) -> Option<std::sync::Arc<zpdf_font::Type3ImageXObject>> {
+    use std::sync::Arc;
+    if depth > 4 {
+        return None;
+    }
+    if let Some(cached) = seen_images.get(&obj_id) {
+        return Some(Arc::clone(cached));
+    }
+    let data = match file.resolve_stream_data_with_limit(obj_id, *remaining) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::debug!("Type3 image XObject {obj_id}: skipped - {e}");
+            return None;
+        }
+    };
+    *remaining = remaining.checked_sub(data.len() as u64)?;
+    let dict = resolve_type3_image_metadata(file, &stream.dict);
+
+    let smask = stream.dict.get_ref("SMask").ok().and_then(|sm_id| {
+        let sm_obj = file.resolve_shared(sm_id).ok()?;
+        let sm_stream = sm_obj.as_stream().ok()?;
+        resolve_type3_image(file, sm_id, sm_stream, remaining, seen_images, depth + 1)
+            .map(|img| Box::new((*img).clone()))
+    });
+    let mask_stream = if smask.is_none() {
+        stream.dict.get_ref("Mask").ok().and_then(|m_id| {
+            let m_obj = file.resolve_shared(m_id).ok()?;
+            let m_stream = m_obj.as_stream().ok()?;
+            resolve_type3_image(file, m_id, m_stream, remaining, seen_images, depth + 1)
+                .map(|img| Box::new((*img).clone()))
+        })
+    } else {
+        None
+    };
+
+    let resolved = Arc::new(zpdf_font::Type3ImageXObject {
+        dict,
+        data: Arc::from(data),
+        smask,
+        mask_stream,
+    });
+    seen_images.insert(obj_id, Arc::clone(&resolved));
+    Some(resolved)
+}
+
+fn resolve_type3_resources(
+    file: &PdfFile,
+    res_dict: &zpdf_core::PdfDict,
+    remaining: &mut u64,
+    seen_images: &mut std::collections::HashMap<
+        ObjectId,
+        std::sync::Arc<zpdf_font::Type3ImageXObject>,
+    >,
+    seen_forms: &mut std::collections::HashMap<
+        ObjectId,
+        std::sync::Arc<zpdf_font::Type3FormXObject>,
+    >,
+    active_forms: &mut std::collections::HashSet<ObjectId>,
+    depth: u8,
+) -> zpdf_font::Type3Resources {
+    use std::sync::Arc;
+    if depth > 8 {
+        return zpdf_font::Type3Resources::default();
+    }
+    let mut out = zpdf_font::Type3Resources::default();
+
+    if let Some(xobj_dict) = resolve_dict(file, res_dict, "XObject") {
+        for (name, obj) in &xobj_dict.0 {
+            let PdfObject::Ref(id) = obj else {
+                continue;
+            };
+            let Ok(resolved_obj) = file.resolve_shared(*id) else {
+                continue;
+            };
+            let Ok(stream) = resolved_obj.as_stream() else {
+                continue;
+            };
+            match stream.dict.get_name("Subtype").unwrap_or_default() {
+                "Image" => {
+                    if let Some(img) =
+                        resolve_type3_image(file, *id, stream, remaining, seen_images, 0)
+                    {
+                        out.xobjects
+                            .insert(name.0.clone(), zpdf_font::Type3XObject::Image(img));
+                    }
+                }
+                "Form" => {
+                    if let Some(cached) = seen_forms.get(id) {
+                        out.xobjects.insert(
+                            name.0.clone(),
+                            zpdf_font::Type3XObject::Form(Arc::clone(cached)),
+                        );
+                        continue;
+                    }
+                    if !active_forms.insert(*id) {
+                        continue;
+                    }
+                    let decoded = file.resolve_stream_data_with_limit(*id, *remaining);
+                    if let Ok(data) = decoded {
+                        if let Some(next_rem) = remaining.checked_sub(data.len() as u64) {
+                            *remaining = next_rem;
+                            let mut form_dict = zpdf_core::PdfDict::new();
+                            for key in ["BBox", "Matrix", "Group"] {
+                                if let Some(v) = stream.dict.get(key) {
+                                    form_dict.insert(
+                                        zpdf_core::PdfName::new(key),
+                                        resolve_pdf_obj_shallow(file, v, 0),
+                                    );
+                                }
+                            }
+                            let form_res =
+                                resolve_dict(file, &stream.dict, "Resources").and_then(|rd| {
+                                    let r = resolve_type3_resources(
+                                        file,
+                                        &rd,
+                                        remaining,
+                                        seen_images,
+                                        seen_forms,
+                                        active_forms,
+                                        depth + 1,
+                                    );
+                                    (!r.is_empty()).then(|| Arc::new(r))
+                                });
+                            let form = Arc::new(zpdf_font::Type3FormXObject {
+                                dict: form_dict,
+                                data: Arc::from(data),
+                                resources: form_res,
+                            });
+                            seen_forms.insert(*id, Arc::clone(&form));
+                            out.xobjects
+                                .insert(name.0.clone(), zpdf_font::Type3XObject::Form(form));
+                        }
+                    }
+                    active_forms.remove(id);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if let Some(cs_dict) = resolve_dict(file, res_dict, "ColorSpace") {
+        for (name, obj) in &cs_dict.0 {
+            out.color_spaces
+                .insert(name.0.clone(), resolve_pdf_obj_shallow(file, obj, 0));
+        }
+    }
+
+    if let Some(gs_dict) = resolve_dict(file, res_dict, "ExtGState") {
+        for (name, obj) in &gs_dict.0 {
+            let resolved = match obj {
+                PdfObject::Ref(id) => file.resolve(*id).ok(),
+                other => Some(other.clone()),
+            };
+            if let Some(PdfObject::Dict(d)) = resolved {
+                let mut inlined = zpdf_core::PdfDict::new();
+                for key in [
+                    "ca", "CA", "BM", "LW", "LC", "LJ", "ML", "D", "OP", "op", "OPM", "RI",
+                ] {
+                    if let Some(v) = d.get(key) {
+                        inlined.insert(
+                            zpdf_core::PdfName::new(key),
+                            resolve_pdf_obj_shallow(file, v, 0),
+                        );
+                    }
+                }
+                out.ext_g_states.insert(name.0.clone(), inlined);
+            }
+        }
+    }
+
+    out
 }
 
 enum EmbeddedFontFile {

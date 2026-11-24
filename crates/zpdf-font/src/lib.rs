@@ -194,6 +194,105 @@ pub struct LoadedFont {
     ///
     /// [`set_variations`]: LoadedFont::set_variations
     pub variations: Vec<([u8; 4], f32)>,
+    /// Pre-resolved named resources (`/XObject`, `/ColorSpace`, `/ExtGState`)
+    /// from a Type 3 font's `/Resources` dictionary so CharProcs can execute
+    /// `/Name Do`, `/GS gs`, and named color spaces without a live `PdfFile`.
+    pub type3_resources: Option<Arc<Type3Resources>>,
+}
+
+/// Pre-resolved image XObject referenced by a Type 3 font's `/Resources`.
+#[derive(Debug, Clone)]
+pub struct Type3ImageXObject {
+    /// Image dictionary with indirect metadata keys resolved to direct objects.
+    pub dict: zpdf_core::PdfDict,
+    /// Decoded image stream bytes.
+    pub data: Arc<[u8]>,
+    /// Optional resolved `/SMask` image stream.
+    pub smask: Option<Box<Type3ImageXObject>>,
+    /// Optional resolved `/Mask` 1-bpc stencil stream.
+    pub mask_stream: Option<Box<Type3ImageXObject>>,
+}
+
+/// Pre-resolved Form XObject referenced by a Type 3 font's `/Resources`.
+#[derive(Debug, Clone)]
+pub struct Type3FormXObject {
+    pub dict: zpdf_core::PdfDict,
+    pub data: Arc<[u8]>,
+    pub resources: Option<Arc<Type3Resources>>,
+}
+
+/// Pre-resolved XObject resource entry for Type 3 CharProc replay.
+#[derive(Debug, Clone)]
+pub enum Type3XObject {
+    Image(Arc<Type3ImageXObject>),
+    Form(Arc<Type3FormXObject>),
+}
+
+/// Resolved named resources carried by a Type 3 [`LoadedFont`] so CharProcs
+/// can resolve `/Name Do`, `/GS gs`, and named `/ColorSpace` entries during
+/// standalone replay across CPU, GPU, SVG, and PPTX backends.
+#[derive(Debug, Clone, Default)]
+pub struct Type3Resources {
+    pub xobjects: HashMap<String, Type3XObject>,
+    pub color_spaces: HashMap<String, zpdf_core::PdfObject>,
+    pub ext_g_states: HashMap<String, zpdf_core::PdfDict>,
+}
+
+impl Type3Resources {
+    pub fn is_empty(&self) -> bool {
+        self.xobjects.is_empty() && self.color_spaces.is_empty() && self.ext_g_states.is_empty()
+    }
+
+    pub fn estimated_cache_bytes(&self) -> u64 {
+        let mut seen = HashSet::new();
+        self.estimated_cache_bytes_inner(&mut seen, 0)
+    }
+
+    fn estimated_cache_bytes_inner(&self, seen: &mut HashSet<usize>, depth: u8) -> u64 {
+        if depth > 8 {
+            return 0;
+        }
+        let mut bytes = estimated_map_bytes(&self.xobjects)
+            .saturating_add(estimated_map_bytes(&self.color_spaces))
+            .saturating_add(estimated_map_bytes(&self.ext_g_states));
+        for (name, xobj) in &self.xobjects {
+            bytes = bytes.saturating_add(name.capacity() as u64);
+            match xobj {
+                Type3XObject::Image(img) => {
+                    bytes = bytes.saturating_add(img.estimated_bytes(seen));
+                }
+                Type3XObject::Form(form) => {
+                    if seen.insert(form.data.as_ptr() as usize) {
+                        bytes = bytes.saturating_add(form.data.len() as u64);
+                    }
+                    if let Some(res) = &form.resources {
+                        bytes =
+                            bytes.saturating_add(res.estimated_cache_bytes_inner(seen, depth + 1));
+                    }
+                }
+            }
+        }
+        for name in self.color_spaces.keys().chain(self.ext_g_states.keys()) {
+            bytes = bytes.saturating_add(name.capacity() as u64);
+        }
+        bytes
+    }
+}
+
+impl Type3ImageXObject {
+    fn estimated_bytes(&self, seen: &mut HashSet<usize>) -> u64 {
+        let mut bytes = 0u64;
+        if seen.insert(self.data.as_ptr() as usize) {
+            bytes = bytes.saturating_add(self.data.len() as u64);
+        }
+        if let Some(sm) = &self.smask {
+            bytes = bytes.saturating_add(sm.estimated_bytes(seen));
+        }
+        if let Some(m) = &self.mask_stream {
+            bytes = bytes.saturating_add(m.estimated_bytes(seen));
+        }
+        bytes
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -287,6 +386,9 @@ impl LoadedFont {
                 bytes = bytes.saturating_add(name.capacity() as u64);
             }
         }
+        if let Some(res) = &self.type3_resources {
+            bytes = bytes.saturating_add(res.estimated_cache_bytes());
+        }
         bytes
     }
 
@@ -361,6 +463,7 @@ impl LoadedFont {
                 cid_cmap: None,
                 dw2: (880.0, -1000.0),
                 variations: Vec::new(),
+                type3_resources: None,
             }
         } else {
             Self::new_legacy_data(font_type, base_font, font_data, cid_widths)
@@ -401,6 +504,7 @@ impl LoadedFont {
                 cid_cmap: None,
                 dw2: (880.0, -1000.0),
                 variations: Vec::new(),
+                type3_resources: None,
             }
         } else {
             tracing::debug!(
@@ -427,6 +531,7 @@ impl LoadedFont {
                 cid_cmap: None,
                 dw2: (880.0, -1000.0),
                 variations: Vec::new(),
+                type3_resources: None,
             }
         }
     }
@@ -467,6 +572,7 @@ impl LoadedFont {
             cid_cmap: None,
             dw2: (880.0, -1000.0),
             variations: Vec::new(),
+            type3_resources: None,
         })
     }
 
@@ -578,6 +684,7 @@ impl LoadedFont {
             cid_cmap: None,
             dw2: (880.0, -1000.0),
             variations: Vec::new(),
+            type3_resources: None,
         })
     }
 
@@ -603,6 +710,7 @@ impl LoadedFont {
             cid_cmap: None,
             dw2: (880.0, -1000.0),
             variations: Vec::new(),
+            type3_resources: None,
         }
     }
 
@@ -650,6 +758,7 @@ impl LoadedFont {
             cid_cmap: self.cid_cmap.clone(),
             dw2: self.dw2,
             variations: self.variations.clone(),
+            type3_resources: None,
         }
     }
 
@@ -1901,6 +2010,15 @@ impl LoadedFont {
 
     pub fn is_type3(&self) -> bool {
         matches!(self.font_type, PdfFontType::Type3 { .. })
+    }
+
+    pub fn type3_resources(&self) -> Option<&Type3Resources> {
+        self.type3_resources.as_deref()
+    }
+
+    pub fn with_type3_resources(mut self, resources: Arc<Type3Resources>) -> Self {
+        self.type3_resources = (!resources.is_empty()).then_some(resources);
+        self
     }
 
     /// For Type3 fonts: get the content stream bytes for a given char code.

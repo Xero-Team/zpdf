@@ -210,6 +210,13 @@ pub struct ContentInterpreter<'a> {
     /// the enclosing text paint while preserving explicit `d0` fill/stroke
     /// colors and stencils.
     type3_glyph: bool,
+    /// Pre-resolved named resources from the Type 3 font's `/Resources` dict so
+    /// CharProcs can invoke `/Name Do`, `/GS gs`, and named `/ColorSpace` entries
+    /// during standalone replay without a live `PdfFile`.
+    type3_resources: Option<&'a zpdf_font::Type3Resources>,
+    /// Nested `/Resources` pushed while replaying Form XObjects inside
+    /// `type3_resources`.
+    type3_resource_stack: Vec<std::sync::Arc<zpdf_font::Type3Resources>>,
     /// Default optional-content configuration; `None` renders everything.
     oc_config: Option<&'a zpdf_document::OcConfig>,
     /// Annotations painted after the page content (appearance streams).
@@ -1139,6 +1146,8 @@ impl<'a> ContentInterpreter<'a> {
             shading_space_to_page: Matrix::identity(),
             suppress_color_ops: false,
             type3_glyph: false,
+            type3_resources: None,
+            type3_resource_stack: Vec::new(),
             oc_config: None,
             annotations: None,
             mc_depth: 0,
@@ -1189,6 +1198,47 @@ impl<'a> ContentInterpreter<'a> {
     pub fn for_type3_glyph(mut self) -> Self {
         self.type3_glyph = true;
         self
+    }
+
+    /// Attach pre-resolved Type 3 font `/Resources` so standalone CharProc
+    /// replay can resolve named XObjects (`/Name Do`), color spaces, and
+    /// ExtGStates without a live `PdfFile`.
+    pub fn with_type3_resources(
+        mut self,
+        resources: Option<&'a zpdf_font::Type3Resources>,
+    ) -> Self {
+        self.type3_resources = resources;
+        self
+    }
+
+    fn lookup_type3_xobject(&self, name: &str) -> Option<zpdf_font::Type3XObject> {
+        for res in self.type3_resource_stack.iter().rev() {
+            if let Some(xobj) = res.xobjects.get(name) {
+                return Some(xobj.clone());
+            }
+        }
+        self.type3_resources
+            .and_then(|res| res.xobjects.get(name).cloned())
+    }
+
+    fn lookup_type3_colorspace(&self, name: &str) -> Option<PdfObject> {
+        for res in self.type3_resource_stack.iter().rev() {
+            if let Some(cs) = res.color_spaces.get(name) {
+                return Some(cs.clone());
+            }
+        }
+        self.type3_resources
+            .and_then(|res| res.color_spaces.get(name).cloned())
+    }
+
+    fn lookup_type3_ext_gstate(&self, name: &str) -> Option<zpdf_core::PdfDict> {
+        for res in self.type3_resource_stack.iter().rev() {
+            if let Some(gs) = res.ext_g_states.get(name) {
+                return Some(gs.clone());
+            }
+        }
+        self.type3_resources
+            .and_then(|res| res.ext_g_states.get(name).cloned())
     }
 
     /// Start a stopwatch for one step of interpret work, or `None` when it is
@@ -2373,17 +2423,17 @@ impl<'a> ContentInterpreter<'a> {
             "DeviceCMYK" | "CMYK" => ActiveColorSpace::DeviceCMYK,
             "Pattern" => ActiveColorSpace::Pattern { base: None },
             _ => {
-                // Resource lookup: direct (inline) values first, then refs.
+                // Resource lookup: direct (inline) values first, then refs, then Type 3 resources.
                 if let Some(obj) = self.lookup_res(|r| r.color_spaces_inline.get(name).cloned()) {
                     return self.resolve_color_space_obj(&obj, depth);
                 }
-                let cs_id = match self.lookup_res(|r| r.color_spaces.get(name).copied()) {
-                    Some(id) => id,
-                    None => return ActiveColorSpace::DeviceGray,
-                };
-                // Pass the reference itself so the space is built once per
-                // object (`cs_cache`), not on every `cs`/`CS`/`sh` naming it.
-                self.resolve_color_space_obj(&PdfObject::Ref(cs_id), depth)
+                if let Some(cs_id) = self.lookup_res(|r| r.color_spaces.get(name).copied()) {
+                    return self.resolve_color_space_obj(&PdfObject::Ref(cs_id), depth);
+                }
+                if let Some(obj) = self.lookup_type3_colorspace(name) {
+                    return self.resolve_color_space_obj(&obj, depth);
+                }
+                ActiveColorSpace::DeviceGray
             }
         }
     }
@@ -4255,6 +4305,12 @@ impl<'a> ContentInterpreter<'a> {
             self.apply_ext_gstate_dict(&dict, None);
             return;
         }
+        if self.file.is_none() {
+            if let Some(dict) = self.lookup_type3_ext_gstate(name) {
+                self.apply_ext_gstate_dict(&dict, None);
+                return;
+            }
+        }
 
         let file = match self.file {
             Some(f) => f,
@@ -4551,6 +4607,23 @@ impl<'a> ContentInterpreter<'a> {
         // invisible layers must not reject otherwise complete visible output.
         if self.oc_suppressed() {
             return;
+        }
+        if self.file.is_none() {
+            if let Some(xobj) = self.lookup_type3_xobject(name) {
+                match xobj {
+                    zpdf_font::Type3XObject::Image(img) => {
+                        let work = self.start_work(Some(Work::Image));
+                        self.do_type3_image_xobject(&img);
+                        self.tock_work(work);
+                    }
+                    zpdf_font::Type3XObject::Form(form) => {
+                        let work = self.start_work(Some(Work::Form));
+                        self.do_type3_form_xobject(&form);
+                        self.tock_work(work);
+                    }
+                }
+                return;
+            }
         }
         let file = match self.file {
             Some(f) => f,
@@ -5093,7 +5166,8 @@ impl<'a> ContentInterpreter<'a> {
                     .or_else(|| {
                         self.lookup_res(|r| r.color_spaces.get(&cs_name).copied())
                             .map(PdfObject::Ref)
-                    });
+                    })
+                    .or_else(|| self.lookup_type3_colorspace(&cs_name));
                 if let Some(obj) = from_res {
                     norm.0.insert(zpdf_core::PdfName("ColorSpace".into()), obj);
                 }
@@ -5132,6 +5206,217 @@ impl<'a> ContentInterpreter<'a> {
         let c = self.current.fill_color;
         let to_u8 = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
         [to_u8(c.r), to_u8(c.g), to_u8(c.b)]
+    }
+
+    fn do_type3_image_xobject(&mut self, img: &zpdf_font::Type3ImageXObject) {
+        if self.image_cache.is_none() || self.oc_suppressed() {
+            return;
+        }
+        if cs_produces_no_marks(&self.current.fill_cs)
+            && matches!(img.dict.get("ImageMask"), Some(PdfObject::Bool(true)))
+        {
+            return;
+        }
+        let mut owned_dict = None;
+        if let Some(PdfObject::Name(n)) = img.dict.get("ColorSpace") {
+            let cs_name = n.0.as_str();
+            if !matches!(
+                cs_name,
+                "DeviceGray" | "G" | "DeviceRGB" | "RGB" | "DeviceCMYK" | "CMYK"
+            ) {
+                if let Some(obj) = self.lookup_type3_colorspace(cs_name) {
+                    let mut d = img.dict.clone();
+                    d.0.insert(zpdf_core::PdfName("ColorSpace".into()), obj);
+                    owned_dict = Some(d);
+                }
+            }
+        }
+        let dict = owned_dict.as_ref().unwrap_or(&img.dict);
+        let intent = dict
+            .get_name("Intent")
+            .ok()
+            .map(zpdf_color::RenderIntent::from_pdf_name)
+            .unwrap_or(self.current.rendering_intent);
+        let colorspace = resolve_image_colorspace(
+            None,
+            self.icc_cache.as_deref_mut(),
+            dict.get("ColorSpace"),
+            0,
+            intent,
+        );
+        let colorspace = self.colormanage_cmyk_image(colorspace);
+        let matte_colorspace = img.smask.as_ref().and_then(|_| colorspace.clone());
+        let mut decoded = match zpdf_image::decode_image_xobject_resolved_with_limits(
+            &img.data,
+            dict,
+            self.fill_rgb_u8(),
+            colorspace,
+            &self.parse_limits,
+        ) {
+            Ok(decoded) => decoded,
+            Err(e) => {
+                self.stats.diagnostics.record_decode_failure(&e);
+                tracing::warn!("Type3 image XObject decode failed: {e}");
+                return;
+            }
+        };
+        if let Some(sm) = &img.smask {
+            if let Ok(mask) = zpdf_image::decode_image_xobject_resolved_with_limits(
+                &sm.data,
+                &sm.dict,
+                [0, 0, 0],
+                Some(zpdf_image::ResolvedColorSpace::Gray),
+                &self.parse_limits,
+            ) {
+                zpdf_image::apply_smask_image_with_matte(
+                    &mut decoded,
+                    &mask,
+                    zpdf_image::smask_matte(&sm.dict).as_deref(),
+                    matte_colorspace.as_ref(),
+                );
+            }
+        } else if let Some(ms) = &img.mask_stream {
+            let width = ms.dict.get_i64("Width").unwrap_or(0) as u32;
+            let height = ms.dict.get_i64("Height").unwrap_or(0) as u32;
+            if width > 0
+                && height > 0
+                && u64::from(width) * u64::from(height) <= self.parse_limits.max_image_pixels
+            {
+                let invert = zpdf_image::mask_decode_inverts(&ms.dict);
+                zpdf_image::apply_stencil_mask_with_limits(
+                    &mut decoded,
+                    &ms.data,
+                    width,
+                    height,
+                    invert,
+                    &self.parse_limits,
+                );
+            }
+        }
+        self.emit_draw_image(decoded);
+    }
+
+    fn do_type3_form_xobject(&mut self, form: &zpdf_font::Type3FormXObject) {
+        const MAX_FORM_DEPTH: u32 = 16;
+        if self.form_depth >= MAX_FORM_DEPTH || self.over_budget() {
+            return;
+        }
+        let form_matrix = if let Ok(arr) = form.dict.get_array("Matrix") {
+            let vals: Vec<f64> = arr.iter().filter_map(|o| o.as_f64().ok()).collect();
+            if vals.len() == 6 {
+                Matrix::new(vals[0], vals[1], vals[2], vals[3], vals[4], vals[5])
+            } else {
+                Matrix::identity()
+            }
+        } else {
+            Matrix::identity()
+        };
+        let pushed_res = if let Some(res) = &form.resources {
+            self.type3_resource_stack.push(std::sync::Arc::clone(res));
+            true
+        } else {
+            false
+        };
+        let depth_floor = self.state_stack.len();
+        self.state_stack.push(self.current.clone());
+        let saved_floor = self.state_floor;
+        self.state_floor = depth_floor + 1;
+        let saved_operand_stack = std::mem::take(&mut self.operand_stack);
+        self.current.ctm = self.current.ctm.concat(&form_matrix);
+        self.current.clip_depth = 0;
+
+        let mut bbox_clip = false;
+        let mut bbox_bounds: Option<Rect> = None;
+        if let Ok(arr) = form.dict.get_array("BBox") {
+            let v: Vec<f64> = arr.iter().filter_map(|o| o.as_f64().ok()).collect();
+            if v.len() == 4 {
+                let (x0, y0) = (v[0].min(v[2]), v[1].min(v[3]));
+                let (x1, y1) = (v[0].max(v[2]), v[1].max(v[3]));
+                if x1 > x0 && y1 > y0 {
+                    let mut bbox_path = Path::new();
+                    bbox_path.rect(Rect::new(x0, y0, x1, y1));
+                    let page_path = self.transform_path_to_page_space(&bbox_path);
+                    bbox_bounds = Self::path_bounds(&page_path);
+                    self.display_list.push(RenderCommand::PushClip {
+                        path: page_path,
+                        rule: FillRule::NonZero,
+                    });
+                    bbox_clip = true;
+                }
+            }
+        }
+        let group = form
+            .dict
+            .get("Group")
+            .and_then(|o| o.as_dict().ok())
+            .filter(|g| matches!(g.get_name("S"), Ok("Transparency")));
+        let in_group = group.is_some();
+        if let Some(g) = group {
+            let flag = |key| matches!(g.get(key), Some(PdfObject::Bool(true)));
+            self.display_list.push(RenderCommand::PushBlendGroup {
+                blend_mode: self.current.blend_mode,
+                isolated: flag("I"),
+                knockout: flag("K"),
+                bounds: bbox_bounds.unwrap_or(self.display_list.page_rect),
+                alpha: self.current.fill_alpha,
+                mask: self.current.soft_mask.take(),
+            });
+            self.current.blend_mode = BlendMode::Normal;
+            self.current.fill_alpha = 1.0;
+            self.current.stroke_alpha = 1.0;
+        }
+
+        self.form_depth += 1;
+        let outer_clip = self.pending_clip.take();
+        let mut tokenizer = ContentTokenizer::new(&form.data);
+        while let Some(token) = tokenizer.next_borrowed_recovering() {
+            if self.over_budget() {
+                break;
+            }
+            match token {
+                ContentToken::Operand(obj) => {
+                    if !self.push_operand(obj) {
+                        break;
+                    }
+                }
+                ContentToken::Operator(op) => {
+                    self.execute_operator(&op);
+                    self.operand_stack.clear();
+                }
+                ContentToken::InlineImage { dict, data } => {
+                    self.do_inline_image(dict, data);
+                    self.operand_stack.clear();
+                }
+            }
+        }
+        self.pending_clip = outer_clip;
+        self.form_depth -= 1;
+
+        while self.state_stack.len() > depth_floor + 1 {
+            for _ in 0..self.current.clip_depth {
+                self.display_list.push(RenderCommand::PopClip);
+            }
+            if let Some(state) = self.state_stack.pop() {
+                self.current = state;
+            }
+        }
+        for _ in 0..self.current.clip_depth {
+            self.display_list.push(RenderCommand::PopClip);
+        }
+        if let Some(state) = self.state_stack.pop() {
+            self.current = state;
+        }
+        if in_group {
+            self.display_list.push(RenderCommand::PopBlendGroup);
+        }
+        if bbox_clip {
+            self.display_list.push(RenderCommand::PopClip);
+        }
+        self.state_floor = saved_floor;
+        self.operand_stack = saved_operand_stack;
+        if pushed_res {
+            self.type3_resource_stack.pop();
+        }
     }
 
     fn emit_draw_image(&mut self, image: zpdf_image::DecodedImage) {
