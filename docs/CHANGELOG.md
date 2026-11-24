@@ -8,6 +8,12 @@
   glyph runs in a private field accessed via `DisplayList::expanded_glyph_runs`
   and `DisplayList::push_expanded_glyph_run`; construct display lists with
   `DisplayList::new` rather than struct literals. (#156)
+- **Breaking:** `zpdf_pptx_export::SlideElement` adds the `Opacity { element, alpha }`
+  wrapper variant (alongside `Transformed`) to preserve paint opacity on native
+  editable shapes and text via DrawingML `<a:alpha val="..."/>`. Exhaustive
+  matches on `SlideElement` must handle `SlideElement::Opacity` (unwrapping
+  `element` and multiplying its `alpha` onto inner paints); existing opaque
+  variant constructors are unchanged. (#156)
 
 ### Rendering and Type 3 fonts (`zpdf-content`, `zpdf-display-list`, `zpdf-pptx-export`, `zpdf-font`, `zpdf-document`)
 

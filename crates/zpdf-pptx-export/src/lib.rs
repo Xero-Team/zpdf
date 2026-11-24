@@ -749,6 +749,12 @@ impl<'a> SlideConverter<'a> {
         let commands = &display_list.commands;
         let expanded = display_list.expanded_glyph_runs();
         let isolated_inner_blends = compute_isolated_inner_non_normal_blends(commands);
+        let later_non_normal_blends = NonNormalBlendIndex::build(
+            commands,
+            self.page_rect,
+            self.font_cache,
+            !expanded.is_empty(),
+        );
         let mut exp_idx = 0usize;
         let mut cmd_idx = 0usize;
         let mut fallback_artwork_end = 0usize;
@@ -765,21 +771,23 @@ impl<'a> SlideConverter<'a> {
                         if end > cmd_idx {
                             skipped_to = Some(skipped_to.map_or(end, |prev| prev.max(end)));
                         }
-                    } else if effective_alpha >= 1.0 - 1e-3
-                        && !self.clip_stack_constrains_rect(expanded_run_bounds(
-                            entry,
-                            commands,
-                            self.font_cache,
-                        ))
-                        && self.convert_glyph_run(&entry.run, true)?
-                    {
-                        let end = entry.cmd_end.min(commands.len());
-                        if end > cmd_idx {
-                            skipped_to = Some(skipped_to.map_or(end, |prev| prev.max(end)));
-                        }
                     } else {
-                        let end = entry.cmd_end.min(commands.len());
-                        fallback_artwork_end = fallback_artwork_end.max(end);
+                        let run_bounds = expanded_run_bounds(entry, commands, self.font_cache);
+                        let overlapped_by_later_blend =
+                            later_non_normal_blends.overlaps_at_or_after(entry.cmd_end, run_bounds);
+                        if effective_alpha >= 1.0 - 1e-3
+                            && !overlapped_by_later_blend
+                            && !self.clip_stack_constrains_rect(run_bounds)
+                            && self.convert_glyph_run(&entry.run, true)?
+                        {
+                            let end = entry.cmd_end.min(commands.len());
+                            if end > cmd_idx {
+                                skipped_to = Some(skipped_to.map_or(end, |prev| prev.max(end)));
+                            }
+                        } else {
+                            let end = entry.cmd_end.min(commands.len());
+                            fallback_artwork_end = fallback_artwork_end.max(end);
+                        }
                     }
                 }
             }
@@ -1236,10 +1244,22 @@ impl<'a> SlideConverter<'a> {
                 first,
                 RenderCommand::PushClip { .. } | RenderCommand::PushClipStroke { .. }
             ) {
-                let Some(tightened) = tighten_rect_to_clip(raw_bounds, first) else {
-                    return Ok(());
-                };
-                raw_bounds = tightened;
+                // Only tighten the crop to a leading local clip if its matching
+                // PopClip occurs after all paint commands in `group_cmds`; if
+                // paint follows the pop, keep the caller-tightened bounds and
+                // let CpuRenderer replay the local clip and its pop.
+                let covers_all_paint =
+                    Self::find_matching_pop_clip(group_cmds, 0).is_some_and(|pop_idx| {
+                        !group_cmds[pop_idx + 1..]
+                            .iter()
+                            .any(is_paint_render_command)
+                    });
+                if covers_all_paint {
+                    let Some(tightened) = tighten_rect_to_clip(raw_bounds, first) else {
+                        return Ok(());
+                    };
+                    raw_bounds = tightened;
+                }
             }
         }
         let Some(crop_rect) = intersect_rect(raw_bounds, self.page_rect) else {
@@ -1616,9 +1636,15 @@ impl<'a> SlideConverter<'a> {
                 if effective_alpha <= 0.0 {
                     return Ok(());
                 }
+                let has_dash = style
+                    .dash
+                    .as_ref()
+                    .is_some_and(|d| !d.array.is_empty() && d.array.iter().any(|&v| v > 0.0));
                 let clipped_artwork = in_artwork_range
                     && self.clip_stack_constrains_commands(std::slice::from_ref(cmd));
-                if clipped_artwork || (in_artwork_range && effective_alpha < 1.0 - 1e-3) {
+                if clipped_artwork
+                    || (in_artwork_range && (effective_alpha < 1.0 - 1e-3 || has_dash))
+                {
                     self.flatten_commands_group(
                         std::slice::from_ref(cmd),
                         None,
@@ -2464,6 +2490,213 @@ fn compute_isolated_inner_non_normal_blends(commands: &[RenderCommand]) -> Vec<b
         }
     }
     flags
+}
+
+fn is_paint_render_command(cmd: &RenderCommand) -> bool {
+    matches!(
+        cmd,
+        RenderCommand::FillPath { .. }
+            | RenderCommand::StrokePath { .. }
+            | RenderCommand::DrawGlyphRun(_)
+            | RenderCommand::DrawImage(_)
+            | RenderCommand::DrawInlineImage(_)
+    )
+}
+
+/// Spatial index of top-level backdrop-sampling non-Normal blend groups on a
+/// page, used so expanded Type 3 glyph runs overlapped by a later non-Normal
+/// blend keep consistent CharProc artwork instead of mixing editable text with
+/// CharProc pixels in the blend patch.
+struct NonNormalBlendIndex {
+    origin_x: f64,
+    origin_y: f64,
+    /// Largest start command index of any unbounded/large backdrop-sampling blend group.
+    max_global_start: Option<usize>,
+    /// Bounded backdrop-sampling blend groups bucketed onto the 512pt grid.
+    buckets: std::collections::HashMap<(i32, i32), Vec<(usize, Rect)>>,
+}
+
+impl NonNormalBlendIndex {
+    fn empty(page_rect: Rect) -> Self {
+        Self {
+            origin_x: page_rect.x0,
+            origin_y: page_rect.y0,
+            max_global_start: None,
+            buckets: std::collections::HashMap::new(),
+        }
+    }
+
+    fn build(
+        commands: &[RenderCommand],
+        page_rect: Rect,
+        font_cache: &FontCache,
+        enabled: bool,
+    ) -> Self {
+        use zpdf_display_list::SoftMaskKind;
+
+        let mut index = Self::empty(page_rect);
+        if !enabled {
+            return index;
+        }
+        let mut isolated_normal_depth = 0usize;
+        let mut idx = 0usize;
+        while idx < commands.len() {
+            match &commands[idx] {
+                RenderCommand::PushBlendGroup {
+                    blend_mode,
+                    isolated,
+                    knockout,
+                    alpha,
+                    mask,
+                    bounds,
+                } => {
+                    let group_alpha = if alpha.is_finite() {
+                        alpha.clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    if isolated_normal_depth == 0 {
+                        if *blend_mode != zpdf_display_list::BlendMode::Normal {
+                            if let Some(end_idx) =
+                                SlideConverter::find_matching_pop_blend(commands, idx)
+                            {
+                                if group_alpha > 0.0 {
+                                    let group_slice = &commands[idx..=end_idx];
+                                    let fallback =
+                                        intersect_rect(*bounds, page_rect).unwrap_or(page_rect);
+                                    let draw_rect = match compute_commands_bounds(
+                                        group_slice,
+                                        (0.0, 0.0),
+                                        font_cache,
+                                    ) {
+                                        CommandBounds::Empty => None,
+                                        CommandBounds::Known(r) => Some(Rect::new(
+                                            r.x0 - 1.0,
+                                            r.y0 - 1.0,
+                                            r.x1 + 1.0,
+                                            r.y1 + 1.0,
+                                        )),
+                                        CommandBounds::Unknown => Some(fallback),
+                                    };
+                                    let effective = draw_rect.and_then(|dr| match mask {
+                                        Some(m)
+                                            if m.kind == SoftMaskKind::Alpha
+                                                && m.transfer.is_none() =>
+                                        {
+                                            match compute_commands_bounds(
+                                                &m.commands.commands,
+                                                m.offset,
+                                                font_cache,
+                                            ) {
+                                                CommandBounds::Empty => None,
+                                                CommandBounds::Known(mr) => {
+                                                    let padded = Rect::new(
+                                                        mr.x0 - 1.0,
+                                                        mr.y0 - 1.0,
+                                                        mr.x1 + 1.0,
+                                                        mr.y1 + 1.0,
+                                                    );
+                                                    intersect_rect(dr, padded)
+                                                }
+                                                CommandBounds::Unknown => Some(dr),
+                                            }
+                                        }
+                                        _ => Some(dr),
+                                    });
+                                    if let Some(rect) =
+                                        effective.and_then(|r| intersect_rect(r, page_rect))
+                                    {
+                                        index.insert(idx, rect);
+                                    }
+                                }
+                                idx = end_idx + 1;
+                                continue;
+                            } else if group_alpha > 0.0 {
+                                index.max_global_start =
+                                    Some(index.max_global_start.map_or(idx, |prev| prev.max(idx)));
+                            }
+                        } else if *isolated || *knockout || group_alpha < 1.0 || mask.is_some() {
+                            isolated_normal_depth = 1;
+                        }
+                    } else {
+                        isolated_normal_depth += 1;
+                    }
+                }
+                RenderCommand::PopBlendGroup => {
+                    isolated_normal_depth = isolated_normal_depth.saturating_sub(1);
+                }
+                _ => {}
+            }
+            idx += 1;
+        }
+        index
+    }
+
+    fn insert(&mut self, start_idx: usize, rect: Rect) {
+        if let Some((tx0, tx1, ty0, ty1)) =
+            BackdropIndex::cell_range(self.origin_x, self.origin_y, rect)
+        {
+            let cols = tx1 as i64 - tx0 as i64 + 1;
+            let rows = ty1 as i64 - ty0 as i64 + 1;
+            if cols > 0 && rows > 0 && cols.saturating_mul(rows) <= 16 {
+                for ty in ty0..=ty1 {
+                    for tx in tx0..=tx1 {
+                        self.buckets
+                            .entry((tx, ty))
+                            .or_default()
+                            .push((start_idx, rect));
+                    }
+                }
+                return;
+            }
+        }
+        self.max_global_start = Some(
+            self.max_global_start
+                .map_or(start_idx, |prev| prev.max(start_idx)),
+        );
+    }
+
+    fn overlaps_at_or_after(&self, min_start: usize, bounds: Option<Rect>) -> bool {
+        if self.max_global_start.is_none() && self.buckets.is_empty() {
+            return false;
+        }
+        if self.max_global_start.is_some_and(|s| s >= min_start) {
+            return true;
+        }
+        let Some(rect) = bounds else {
+            return self
+                .buckets
+                .values()
+                .any(|entries| entries.iter().any(|&(s, _)| s >= min_start));
+        };
+        let Some((tx0, tx1, ty0, ty1)) =
+            BackdropIndex::cell_range(self.origin_x, self.origin_y, rect)
+        else {
+            return true;
+        };
+        let cols = tx1 as i64 - tx0 as i64 + 1;
+        let rows = ty1 as i64 - ty0 as i64 + 1;
+        if cols <= 0 || rows <= 0 || cols.saturating_mul(rows) > 16 {
+            return self.buckets.values().any(|entries| {
+                entries
+                    .iter()
+                    .any(|&(s, b)| s >= min_start && intersect_rect(b, rect).is_some())
+            });
+        }
+        for ty in ty0..=ty1 {
+            for tx in tx0..=tx1 {
+                if let Some(entries) = self.buckets.get(&(tx, ty)) {
+                    if entries
+                        .iter()
+                        .any(|&(s, b)| s >= min_start && intersect_rect(b, rect).is_some())
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
 }
 
 /// Whether flattening `cmds` depends on the already-painted page backdrop
@@ -8942,5 +9175,301 @@ mod export_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn clipped_type3_glyph_with_leading_local_clip_keeps_paint_after_pop_clip() {
+        let stream = |dict: &str, data: &[u8]| -> Vec<u8> {
+            let mut out = format!("<< {dict} /Length {} >>\nstream\n", data.len()).into_bytes();
+            out.extend_from_slice(data);
+            out.extend_from_slice(b"\nendstream");
+            out
+        };
+        let assemble = |objects: &[Vec<u8>]| -> Vec<u8> {
+            let mut pdf = b"%PDF-1.4\n".to_vec();
+            let mut offsets = Vec::with_capacity(objects.len());
+            for (i, body) in objects.iter().enumerate() {
+                offsets.push(pdf.len());
+                pdf.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+                pdf.extend_from_slice(body);
+                pdf.extend_from_slice(b"\nendobj\n");
+            }
+            let xref = pdf.len();
+            pdf.extend_from_slice(
+                format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+            );
+            for off in offsets {
+                pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+            }
+            pdf.extend_from_slice(
+                format!(
+                    "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                    objects.len() + 1
+                )
+                .as_bytes(),
+            );
+            pdf
+        };
+
+        // CharProc pushes a local clip [0..200], draws a red rect inside [0..200],
+        // pops the local clip, then draws a blue rect at [500..900] OUTSIDE the local clip!
+        // Page installs a caller clip [0..60] cutting across [0..90] (so both red at [10..26]
+        // and part of blue at [50..60] are inside the caller clip).
+        let pdf = assemble(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 120 100] /Contents 4 0 R \
+              /Resources << /Font << /F1 5 0 R >> >> >>"
+                .to_vec(), // 3
+            stream("", b"q 0 0 60 100 re W n BT /F1 80 Tf 10 10 Td (A) Tj ET Q"), // 4
+            b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] \
+              /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs 6 0 R /Encoding 7 0 R \
+              /FirstChar 65 /LastChar 65 /Widths [1000] /Resources << >> >>"
+                .to_vec(), // 5
+            b"<< /logo 8 0 R >>".to_vec(),                 // 6
+            b"<< /Type /Encoding /Differences [65 /logo] >>".to_vec(), // 7
+            stream(
+                "",
+                b"1000 0 d0 q 0 0 200 1000 re W n 1 0 0 rg 0 0 200 800 re f Q \
+                  0 0 1 rg 500 0 400 800 re f",
+            ), // 8
+        ]);
+
+        let doc = zpdf_document::PdfDocument::open(pdf).expect("open pdf");
+        let page = doc.page(0).expect("page 0");
+        let mut fonts = doc.load_page_fonts(&page);
+        let (content_bytes, _) = doc.page_content_with_diagnostics(&page).expect("content");
+        let mut images = ImageCache::new();
+        let (dl, _) = zpdf_content::interpreter::ContentInterpreter::new(page.effective_box())
+            .with_document(doc.file(), &page.resources)
+            .with_fonts(&mut fonts)
+            .with_images(&mut images)
+            .interpret_with_stats(&content_bytes);
+
+        let slide = display_list_to_slide(&dl, 0, &fonts, &images, &ConversionOptions::default())
+            .expect("slide export");
+        assert_eq!(slide.elements.len(), 1);
+        let SlideElement::Image { image_data, .. } = &slide.elements[0] else {
+            panic!("expected SlideElement::Image, got {:?}", slide.elements[0]);
+        };
+        let rgba = image::load_from_memory(image_data)
+            .expect("decode PNG")
+            .to_rgba8();
+        let has_red = rgba
+            .pixels()
+            .any(|p| p.0[3] > 200 && p.0[0] > 200 && p.0[2] < 40);
+        let has_blue = rgba
+            .pixels()
+            .any(|p| p.0[3] > 200 && p.0[2] > 200 && p.0[0] < 40);
+        assert!(has_red, "red fill inside leading local clip must survive");
+        assert!(
+            has_blue,
+            "blue fill AFTER PopClip must NOT be cropped away by the leading local clip"
+        );
+    }
+
+    #[test]
+    fn type3_opaque_dashed_stroke_preserves_dash_gaps_in_pptx() {
+        let stream = |dict: &str, data: &[u8]| -> Vec<u8> {
+            let mut out = format!("<< {dict} /Length {} >>\nstream\n", data.len()).into_bytes();
+            out.extend_from_slice(data);
+            out.extend_from_slice(b"\nendstream");
+            out
+        };
+        let assemble = |objects: &[Vec<u8>]| -> Vec<u8> {
+            let mut pdf = b"%PDF-1.4\n".to_vec();
+            let mut offsets = Vec::with_capacity(objects.len());
+            for (i, body) in objects.iter().enumerate() {
+                offsets.push(pdf.len());
+                pdf.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+                pdf.extend_from_slice(body);
+                pdf.extend_from_slice(b"\nendobj\n");
+            }
+            let xref = pdf.len();
+            pdf.extend_from_slice(
+                format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+            );
+            for off in offsets {
+                pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+            }
+            pdf.extend_from_slice(
+                format!(
+                    "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                    objects.len() + 1
+                )
+                .as_bytes(),
+            );
+            pdf
+        };
+
+        // /dash_icon draws an opaque dashed line (`[200 200] 0 d`);
+        // /solid_icon draws an opaque solid line (stays native editable Line).
+        let pdf = assemble(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 240 100] /Contents 4 0 R \
+              /Resources << /Font << /F1 5 0 R >> >> >>"
+                .to_vec(), // 3
+            stream("", b"0 0 1 RG BT /F1 100 Tf 10 40 Td (AB) Tj ET"), // 4
+            b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] \
+              /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs 6 0 R /Encoding 7 0 R \
+              /FirstChar 65 /LastChar 66 /Widths [1000 1000] /Resources << >> >>"
+                .to_vec(), // 5
+            b"<< /dash_icon 8 0 R /solid_icon 9 0 R >>".to_vec(), // 6
+            b"<< /Type /Encoding /Differences [65 /dash_icon /solid_icon] >>".to_vec(), // 7
+            stream("", b"1000 0 d0 80 w [200 200] 0 d 0 100 m 800 100 l S"), // 8
+            stream("", b"1000 0 d0 80 w 0 100 m 800 100 l S"), // 9
+        ]);
+
+        let doc = zpdf_document::PdfDocument::open(pdf).expect("open pdf");
+        let page = doc.page(0).expect("page 0");
+        let mut fonts = doc.load_page_fonts(&page);
+        let (content_bytes, _) = doc.page_content_with_diagnostics(&page).expect("content");
+        let mut images = ImageCache::new();
+        let (dl, _) = zpdf_content::interpreter::ContentInterpreter::new(page.effective_box())
+            .with_document(doc.file(), &page.resources)
+            .with_fonts(&mut fonts)
+            .with_images(&mut images)
+            .interpret_with_stats(&content_bytes);
+
+        let slide = display_list_to_slide(&dl, 0, &fonts, &images, &ConversionOptions::default())
+            .expect("slide export");
+        assert_eq!(slide.elements.len(), 2);
+        let SlideElement::Image { image_data, .. } = &slide.elements[0] else {
+            panic!(
+                "dashed Type 3 artwork stroke must rasterize to preserve dash gaps, got {:?}",
+                slide.elements[0]
+            );
+        };
+        let rgba = image::load_from_memory(image_data)
+            .expect("decode PNG")
+            .to_rgba8();
+        let (w, h) = rgba.dimensions();
+        let mid_y = h / 2;
+        let on_px = (0..w)
+            .filter(|&x| rgba.get_pixel(x, mid_y).0[3] > 200)
+            .count();
+        let off_px = (0..w)
+            .filter(|&x| rgba.get_pixel(x, mid_y).0[3] == 0)
+            .count();
+        assert!(
+            on_px > 10 && off_px > 10,
+            "dashed stroke centerline must contain both opaque dashes ({on_px}) and transparent gaps ({off_px})"
+        );
+        assert!(
+            matches!(slide.elements[1], SlideElement::Line { .. }),
+            "solid Type 3 stroke must stay native editable Line, got {:?}",
+            slide.elements[1]
+        );
+    }
+
+    #[test]
+    fn type3_word_overlapped_by_multiply_blend_keeps_consistent_artwork_while_unoverlapped_stays_editable(
+    ) {
+        let stream = |dict: &str, data: &[u8]| -> Vec<u8> {
+            let mut out = format!("<< {dict} /Length {} >>\nstream\n", data.len()).into_bytes();
+            out.extend_from_slice(data);
+            out.extend_from_slice(b"\nendstream");
+            out
+        };
+        let assemble = |objects: &[Vec<u8>]| -> Vec<u8> {
+            let mut pdf = b"%PDF-1.4\n".to_vec();
+            let mut offsets = Vec::with_capacity(objects.len());
+            for (i, body) in objects.iter().enumerate() {
+                offsets.push(pdf.len());
+                pdf.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+                pdf.extend_from_slice(body);
+                pdf.extend_from_slice(b"\nendobj\n");
+            }
+            let xref = pdf.len();
+            pdf.extend_from_slice(
+                format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+            );
+            for off in offsets {
+                pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+            }
+            pdf.extend_from_slice(
+                format!(
+                    "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                    objects.len() + 1
+                )
+                .as_bytes(),
+            );
+            pdf
+        };
+
+        // Light gray page backdrop, blue Type 3 letter (A) at [20..44]x[40..64],
+        // blue Type 3 letter (B) at [120..144]x[40..64], then a white Multiply group
+        // covering the right half of (A) ([32..56]x[40..64]) without touching (B).
+        let pdf = assemble(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Contents 4 0 R \
+              /Resources << /Font << /F1 5 0 R >> /ExtGState << /GSMul 9 0 R >> >> >>"
+                .to_vec(), // 3
+            stream(
+                "",
+                b"0.9 0.9 0.9 rg 5 5 190 90 re f \
+                  0 0 1 rg BT /F1 24 Tf 20 40 Td (A) Tj ET \
+                  0 0 1 rg BT /F1 24 Tf 120 40 Td (B) Tj ET \
+                  q /GSMul gs 1 1 1 rg 32 40 24 24 re f Q",
+            ), // 4
+            b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] \
+              /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs 6 0 R /Encoding 7 0 R \
+              /FirstChar 65 /LastChar 66 /Widths [1000 1000] /Resources << >> >>"
+                .to_vec(), // 5
+            b"<< /A 8 0 R /B 8 0 R >>".to_vec(),           // 6
+            b"<< /Type /Encoding /Differences [65 /A /B] >>".to_vec(), // 7
+            stream("", b"1000 0 d0 0 0 800 800 re f"),     // 8
+            b"<< /Type /ExtGState /BM /Multiply >>".to_vec(), // 9
+        ]);
+
+        let doc = zpdf_document::PdfDocument::open(pdf).expect("open pdf");
+        let page = doc.page(0).expect("page 0");
+        let mut fonts = doc.load_page_fonts(&page);
+        let (content_bytes, _) = doc.page_content_with_diagnostics(&page).expect("content");
+        let mut images = ImageCache::new();
+        let mut spans = Vec::new();
+        let (dl, _) = zpdf_content::interpreter::ContentInterpreter::new(page.effective_box())
+            .with_document(doc.file(), &page.resources)
+            .with_fonts(&mut fonts)
+            .with_images(&mut images)
+            .with_text_sink(&mut spans)
+            .interpret_with_stats(&content_bytes);
+
+        let extracted: String = spans.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(extracted, "AB");
+
+        let slide = display_list_to_slide(&dl, 0, &fonts, &images, &ConversionOptions::default())
+            .expect("slide export");
+
+        // (A) is overlapped by the later Multiply group -> falls back to CharProc Rectangle
+        // so both uncovered and Multiply-covered halves render identical blue artwork (no
+        // half-TextBox / half-Rectangle seam). (B) is untouched -> stays editable TextBox("B").
+        let texts: Vec<&str> = slide
+            .elements
+            .iter()
+            .filter_map(|e| match e.base() {
+                SlideElement::TextBox { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            vec!["B"],
+            "overlapped Type 3 glyph (A) must use consistent artwork while untouched (B) stays editable TextBox: {:?}",
+            slide.elements
+        );
+        assert!(
+            slide.elements.iter().any(|e| matches!(
+                e.base(),
+                SlideElement::Rectangle {
+                    fill_rgb: Some((0, 0, 255)),
+                    ..
+                }
+            )),
+            "overlapped Type 3 glyph (A) must export its blue CharProc rectangle: {:?}",
+            slide.elements
+        );
     }
 }
