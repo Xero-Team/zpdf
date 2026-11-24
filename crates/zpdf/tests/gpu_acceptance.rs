@@ -1969,3 +1969,194 @@ fn gpu_dense_overlapping_cell_exceeding_pass_budget_preserves_trailing_detail() 
         "GPU Cell B white Multiply/Darken marks in fallback must preserve blue backdrop, got {bg_b:?}"
     );
 }
+
+/// Regression (ISO 32000-1 §11.4.5): deeply nested non-isolated groups with
+/// non-`Normal` outer blend modes must stay linear in depth (no `2^depth`
+/// recursive encoding blowup in `end_page`) and match CPU pixels exactly.
+#[test]
+fn gpu_deeply_nested_non_isolated_groups_stay_linear_and_match_cpu() {
+    use zpdf_core::Rect;
+    use zpdf_display_list::{
+        BlendMode, Color, DisplayList, FillRule, Paint, Path, RenderCommand, SoftMask, SoftMaskKind,
+    };
+    let page_rect = Rect::new(0.0, 0.0, 96.0, 64.0);
+    let mut dl = DisplayList::new(page_rect);
+
+    // Left half [0..48]: 15 nested non-isolated Screen groups + 1 inner
+    // Multiply white fill over opaque blue (hits full default blend depth 16).
+    let mut left = Path::new();
+    left.rect(Rect::new(0.0, 0.0, 48.0, 64.0));
+    dl.push(RenderCommand::FillPath {
+        path: left.clone(),
+        rule: FillRule::NonZero,
+        paint: Paint::Solid(Color::rgb(0.0, 0.0, 1.0)),
+        alpha: 1.0,
+        overprint: None,
+    });
+    for _ in 0..15 {
+        dl.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Screen,
+            isolated: false,
+            knockout: false,
+            bounds: Rect::new(0.0, 0.0, 48.0, 64.0),
+            alpha: 1.0,
+            mask: None,
+        });
+    }
+    dl.push(RenderCommand::PushBlendGroup {
+        blend_mode: BlendMode::Multiply,
+        isolated: true,
+        knockout: false,
+        bounds: Rect::new(0.0, 0.0, 48.0, 64.0),
+        alpha: 1.0,
+        mask: None,
+    });
+    dl.push(RenderCommand::FillPath {
+        path: left,
+        rule: FillRule::NonZero,
+        paint: Paint::Solid(Color::white()),
+        alpha: 1.0,
+        overprint: None,
+    });
+    dl.push(RenderCommand::PopBlendGroup);
+    for _ in 0..15 {
+        dl.push(RenderCommand::PopBlendGroup);
+    }
+
+    // Right half [48..96]: opaque gray (0.5, 0.5, 0.5) backdrop with outer
+    // non-isolated Multiply (alpha 1.0) wrapping:
+    //   - top [48..96, 32..64]: inner non-isolated Screen (alpha 0.5) with red
+    //     -> analytical ISO §11.4.5 result ~(128, 96, 96).
+    //   - bottom [48..96, 0..32]: inner non-isolated Normal group with a 50%
+    //     alpha soft mask painting opaque red -> evaluates red over gray,
+    //     blends at 0.5 into outer group (c_n = (0.75,0.25,0.25), α_g = 0.5),
+    //     backdrop removal recovers c_g = (1,0,0), outer Multiply onto gray ->
+    //     0.5*(0.5,0.5,0.5) + 0.5*(0.5,0,0) = (0.5, 0.25, 0.25) ≈ (128, 64, 64).
+    let mut right = Path::new();
+    right.rect(Rect::new(48.0, 0.0, 96.0, 64.0));
+    dl.push(RenderCommand::FillPath {
+        path: right,
+        rule: FillRule::NonZero,
+        paint: Paint::Solid(Color::rgb(0.5, 0.5, 0.5)),
+        alpha: 1.0,
+        overprint: None,
+    });
+    dl.push(RenderCommand::PushBlendGroup {
+        blend_mode: BlendMode::Multiply,
+        isolated: false,
+        knockout: false,
+        bounds: Rect::new(48.0, 0.0, 96.0, 64.0),
+        alpha: 1.0,
+        mask: None,
+    });
+
+    // Top-right: nested non-isolated Screen (0.5)
+    let mut top_right = Path::new();
+    top_right.rect(Rect::new(48.0, 32.0, 96.0, 64.0));
+    dl.push(RenderCommand::PushBlendGroup {
+        blend_mode: BlendMode::Screen,
+        isolated: false,
+        knockout: false,
+        bounds: Rect::new(48.0, 32.0, 96.0, 64.0),
+        alpha: 0.5,
+        mask: None,
+    });
+    dl.push(RenderCommand::FillPath {
+        path: top_right,
+        rule: FillRule::NonZero,
+        paint: Paint::Solid(Color::rgb(1.0, 0.0, 0.0)),
+        alpha: 1.0,
+        overprint: None,
+    });
+    dl.push(RenderCommand::PopBlendGroup);
+
+    // Bottom-right: nested non-isolated Normal with 50% alpha soft mask
+    let mut bot_right = Path::new();
+    bot_right.rect(Rect::new(48.0, 0.0, 96.0, 32.0));
+    let mut mask_dl = DisplayList::new(page_rect);
+    mask_dl.push(RenderCommand::FillPath {
+        path: bot_right.clone(),
+        rule: FillRule::NonZero,
+        paint: Paint::Solid(Color::white()),
+        alpha: 0.5,
+        overprint: None,
+    });
+    dl.push(RenderCommand::PushBlendGroup {
+        blend_mode: BlendMode::Normal,
+        isolated: false,
+        knockout: false,
+        bounds: Rect::new(48.0, 0.0, 96.0, 32.0),
+        alpha: 1.0,
+        mask: Some(SoftMask {
+            kind: SoftMaskKind::Alpha,
+            commands: std::sync::Arc::new(mask_dl),
+            backdrop_luma: 0.0,
+            offset: (0.0, 0.0),
+            transfer: None,
+        }),
+    });
+    dl.push(RenderCommand::FillPath {
+        path: bot_right,
+        rule: FillRule::NonZero,
+        paint: Paint::Solid(Color::rgb(1.0, 0.0, 0.0)),
+        alpha: 1.0,
+        overprint: None,
+    });
+    dl.push(RenderCommand::PopBlendGroup);
+    dl.push(RenderCommand::PopBlendGroup);
+
+    let gpu = match zpdf::gpu::WgpuRenderer::new().render_display_list(&dl, 1.0) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("skipping GPU nested non-isolated groups test (no adapter?): {e}");
+            return;
+        }
+    };
+    let cpu = zpdf::cpu::CpuRenderer::new()
+        .render_display_list(&dl, 1.0)
+        .expect("cpu render");
+
+    let px = |data: &[u8], x: u32, y_pdf: u32| -> [u8; 3] {
+        let iy = 63 - y_pdf;
+        let off = ((iy * gpu.width + x) * 4) as usize;
+        [data[off], data[off + 1], data[off + 2]]
+    };
+
+    let left_gpu = px(&gpu.data, 24, 32);
+    assert!(
+        left_gpu[0] < 10 && left_gpu[1] < 10 && left_gpu[2] > 245,
+        "GPU 15-deep nested non-isolated Screen groups over blue must stay blue, got {left_gpu:?}"
+    );
+    let tr_gpu = px(&gpu.data, 72, 48);
+    assert!(
+        (tr_gpu[0] as i32 - 128).abs() <= 2
+            && (tr_gpu[1] as i32 - 96).abs() <= 2
+            && (tr_gpu[2] as i32 - 96).abs() <= 2,
+        "GPU nested non-isolated Multiply(Screen(0.5, red)) must be ~(128, 96, 96), got {tr_gpu:?}"
+    );
+    let br_gpu = px(&gpu.data, 72, 16);
+    assert!(
+        (br_gpu[0] as i32 - 128).abs() <= 2
+            && (br_gpu[1] as i32 - 64).abs() <= 2
+            && (br_gpu[2] as i32 - 64).abs() <= 2,
+        "GPU nested non-isolated Multiply(Normal(mask=0.5, red)) must be ~(128, 64, 64), got {br_gpu:?}"
+    );
+
+    let total = (cpu.width * cpu.height) as u64;
+    let mut diff = 0u64;
+    for i in 0..total as usize {
+        let b = i * 4;
+        let dr = (gpu.data[b] as i32 - cpu.data[b] as i32).unsigned_abs();
+        let dg = (gpu.data[b + 1] as i32 - cpu.data[b + 1] as i32).unsigned_abs();
+        let db = (gpu.data[b + 2] as i32 - cpu.data[b + 2] as i32).unsigned_abs();
+        if dr.max(dg).max(db) > THRESHOLD as u32 {
+            diff += 1;
+        }
+    }
+    let pct = diff as f64 / total as f64 * 100.0;
+    println!("  nested_non_isolated_groups: {pct:.3}% differing");
+    assert!(
+        pct < MAX_DIFF_PCT,
+        "GPU and CPU must match on nested non-isolated groups, got {pct:.3}% differing"
+    );
+}

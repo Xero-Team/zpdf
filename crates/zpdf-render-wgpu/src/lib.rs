@@ -184,6 +184,50 @@ pub struct WgpuRenderer<'a> {
     /// Timestamp readback adds buffers, a map, and a second blocking poll. Keep
     /// it opt-in so normal rendering pays no telemetry cost.
     gpu_timing_enabled: bool,
+    /// Shared ceiling on GPU render passes encoded per page across nested
+    /// transparency groups, soft masks, and synthetic tiles.
+    max_encode_passes: usize,
+    #[cfg(test)]
+    last_encode_passes: usize,
+}
+
+/// Default ceiling on GPU render passes encoded for a single page (ample for
+/// complex dense tiling plans and deep blend stacks while bounding retained
+/// per-pass bind groups and uniform buffers before submission).
+const DEFAULT_MAX_ENCODE_PASSES: usize = 32_768;
+
+/// Shared encoding budget threaded through `end_page`, `composite_into`, and
+/// soft-mask / synthetic-tile passes. Caps total encoded render passes and
+/// replayed ops so a small recorded page cannot amplify into unbounded GPU
+/// passes, bind groups, or uniform buffers before `queue.submit`.
+#[derive(Debug, Clone, Copy)]
+struct EncodeBudget {
+    remaining_passes: usize,
+    remaining_ops: usize,
+    passes_used: usize,
+}
+
+impl EncodeBudget {
+    fn new(max_passes: usize, max_ops: usize) -> Self {
+        Self {
+            remaining_passes: max_passes,
+            remaining_ops: max_ops,
+            passes_used: 0,
+        }
+    }
+
+    fn charge_pass(&mut self, ops: usize) -> Result<(), WgpuRenderError> {
+        let op_cost = ops.max(1);
+        if self.remaining_passes == 0 || self.remaining_ops < op_cost {
+            return Err(WgpuRenderError::Unsupported(
+                "GPU render pass encoding budget exceeded".into(),
+            ));
+        }
+        self.remaining_passes -= 1;
+        self.remaining_ops -= op_cost;
+        self.passes_used = self.passes_used.saturating_add(1);
+        Ok(())
+    }
 }
 
 impl<'a> WgpuRenderer<'a> {
@@ -199,6 +243,9 @@ impl<'a> WgpuRenderer<'a> {
             page: None,
             last_gpu_time_ns: None,
             gpu_timing_enabled: false,
+            max_encode_passes: DEFAULT_MAX_ENCODE_PASSES,
+            #[cfg(test)]
+            last_encode_passes: 0,
         }
     }
 
@@ -839,6 +886,10 @@ impl<'a> WgpuRenderer<'a> {
         let mut keep_bgs: Vec<wgpu::BindGroup> = Vec::new();
         let mut keep_bufs: Vec<wgpu::Buffer> = Vec::new();
         let mut remaining_layer_budget = layer_budget;
+        let max_encode_ops = (self.parse_limits.max_page_operators as usize)
+            .saturating_mul(4)
+            .max(65_536);
+        let mut encode_budget = EncodeBudget::new(self.max_encode_passes, max_encode_ops);
         for (idx, tile) in synthetic_tiles.iter().enumerate() {
             let tile_uniform = PageUniform {
                 w_px: tile.width as f32,
@@ -885,6 +936,7 @@ impl<'a> WgpuRenderer<'a> {
                     tile_layer_bytes.saturating_add(remaining_layer_budget),
                 );
                 let base = pool.acquire(device)?;
+                encode_budget.charge_pass(1)?;
                 {
                     let pass = begin_layer_pass(
                         &mut encoder,
@@ -903,6 +955,7 @@ impl<'a> WgpuRenderer<'a> {
                     &tile_res,
                     &mut keep_bgs,
                     &mut keep_bufs,
+                    &mut encode_budget,
                 )?;
                 let extra_layers = pool.allocated().saturating_sub(1) as u64;
                 remaining_layer_budget = remaining_layer_budget
@@ -926,6 +979,7 @@ impl<'a> WgpuRenderer<'a> {
                 tile_pools.push(pool);
                 bg
             } else {
+                encode_budget.charge_pass(tile.ops.len())?;
                 let layer =
                     blend::RenderLayer::new(device, tile.width, tile.height, ctx.sample_count);
                 {
@@ -981,6 +1035,7 @@ impl<'a> WgpuRenderer<'a> {
                 remaining_layer_budget,
             );
             let base = pool.acquire(device)?;
+            encode_budget.charge_pass(1)?;
             {
                 let pass = begin_layer_pass(
                     &mut encoder,
@@ -999,6 +1054,7 @@ impl<'a> WgpuRenderer<'a> {
                 &res,
                 &mut keep_bgs,
                 &mut keep_bufs,
+                &mut encode_budget,
             )?;
             timer.write_end(&mut encoder);
             timer.record_resolve(&mut encoder);
@@ -1007,6 +1063,7 @@ impl<'a> WgpuRenderer<'a> {
             }
             _page_pool = Some(pool);
         } else {
+            encode_budget.charge_pass(batched_ops.len())?;
             // Single-pass path (no blend groups): one render pass into the page target.
             {
                 let color_att = target.color_attachment(page.clear);
@@ -1028,6 +1085,10 @@ impl<'a> WgpuRenderer<'a> {
             if readback {
                 target.record_copy(&mut encoder);
             }
+        }
+        #[cfg(test)]
+        {
+            self.last_encode_passes = encode_budget.passes_used;
         }
         ctx.queue.submit(Some(encoder.finish()));
         drop(tile_layers);
@@ -2219,7 +2280,9 @@ fn init_layer(
     clear: wgpu::Color,
     clips: &[record::ClipStamp],
     res: &ReplayRes,
-) {
+    budget: &mut EncodeBudget,
+) -> Result<(), WgpuRenderError> {
+    budget.charge_pass(clips.len().max(1))?;
     let mut pass = begin_layer_pass(
         encoder,
         layer,
@@ -2228,6 +2291,7 @@ fn init_layer(
     );
     pass.set_bind_group(0, Some(res.bind_group), &[]);
     stamp_clips(&mut pass, clips, res);
+    Ok(())
 }
 
 /// Initialize a non-isolated layer by copying `parent`'s current resolved
@@ -2242,9 +2306,11 @@ fn init_layer_from_base(
     res: &ReplayRes,
     keep_bgs: &mut Vec<wgpu::BindGroup>,
     keep_bufs: &mut Vec<wgpu::Buffer>,
-) {
+    budget: &mut EncodeBudget,
+) -> Result<(), WgpuRenderError> {
     use wgpu::util::DeviceExt;
     const COPY_BASE_MODE: u32 = 101;
+    budget.charge_pass(clips.len().max(1))?;
     let device = &ctx.device;
     let mode_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("zpdf-copy-base-mode"),
@@ -2302,6 +2368,89 @@ fn init_layer_from_base(
     }
     keep_bgs.push(copy_bg);
     keep_bufs.push(mode_buf);
+    Ok(())
+}
+
+/// Composite `src` onto `dst` into a newly acquired scratch layer using the
+/// composite shader mode `mode_id`, re-stamping `clips` afterwards.
+#[allow(clippy::too_many_arguments)]
+fn composite_layer(
+    ctx: &GpuContext,
+    encoder: &mut wgpu::CommandEncoder,
+    pool: &mut blend::LayerPool,
+    dst: usize,
+    src: usize,
+    mode_id: u32,
+    alpha: f32,
+    op_active: u32,
+    cmyk: [f32; 4],
+    clips: &[record::ClipStamp],
+    res: &ReplayRes,
+    keep_bgs: &mut Vec<wgpu::BindGroup>,
+    keep_bufs: &mut Vec<wgpu::Buffer>,
+    budget: &mut EncodeBudget,
+) -> Result<usize, WgpuRenderError> {
+    use wgpu::util::DeviceExt;
+    budget.charge_pass(clips.len().max(1))?;
+    let device = &ctx.device;
+    let scratch = pool.acquire(device)?;
+    let mode_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("zpdf-blend-mode"),
+        contents: bytemuck::cast_slice(&[
+            mode_id,
+            alpha.to_bits(),
+            op_active,
+            0u32,
+            cmyk[0].to_bits(),
+            cmyk[1].to_bits(),
+            cmyk[2].to_bits(),
+            cmyk[3].to_bits(),
+        ]),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let comp_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("zpdf-composite-bg"),
+        layout: &ctx.pipelines.composite_bgl,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(pool.get(dst).sampleable_view()),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(pool.get(src).sampleable_view()),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: mode_buf.as_entire_binding(),
+            },
+        ],
+    });
+    {
+        let mut pass = begin_layer_pass(
+            encoder,
+            pool.get(scratch),
+            wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+            wgpu::LoadOp::Clear(0),
+        );
+        pass.set_bind_group(0, Some(res.bind_group), &[]);
+        if let (Some(fs), Some((svb, sib))) = (res.fs_range, res.solid) {
+            pass.set_pipeline(&ctx.pipelines.composite);
+            pass.set_bind_group(1, Some(&comp_bg), &[]);
+            pass.set_vertex_buffer(0, svb.slice(..));
+            pass.set_index_buffer(sib.slice(..), wgpu::IndexFormat::Uint32);
+            pass.set_stencil_reference(0);
+            pass.draw_indexed(
+                fs.first_index..fs.first_index + fs.index_count,
+                fs.base_vertex,
+                0..1,
+            );
+        }
+        stamp_clips(&mut pass, clips, res);
+    }
+    keep_bgs.push(comp_bg);
+    keep_bufs.push(mode_buf);
+    Ok(scratch)
 }
 
 /// Composite an op list (which may contain `PushBlend`/`PopBlend`) onto `base`,
@@ -2310,12 +2459,16 @@ fn init_layer_from_base(
 ///
 /// Shared by the page render (base = the page background) and a soft mask's group
 /// (base = the /BC backdrop) so a transparency group nested inside a mask is
-/// composited identically to one on the page. Recurses through [`apply_soft_mask`]
-/// for sub-masks; `pool`, `encoder`, and the `keep_*` lifetimes are threaded
-/// through so every layer/bind-group outlives the single submit.
+/// composited identically to one on the page. Recurses only through
+/// [`render_soft_mask_layer`] for a mask's disjoint `mask.ops`; nested
+/// non-isolated groups with non-`Normal` outer blend modes track a paired
+/// accumulated-alpha layer on the active stack so every child op and soft mask
+/// is encoded linearly in one flat scan (never `2^depth` recursive replays),
+/// and every encoded pass is charged against the shared `budget`.
+///
 /// One open transparency/overprint group on the composite stack: its blend
 /// mode, group alpha, optional soft mask, inherited clips, optional overprint
-/// descriptor, and non-isolated opacity flag.
+/// descriptor, and non-isolated flag.
 type BlendFrame<'a> = (
     zpdf_display_list::BlendMode,
     f32,
@@ -2335,10 +2488,18 @@ fn composite_into(
     res: &ReplayRes,
     keep_bgs: &mut Vec<wgpu::BindGroup>,
     keep_bufs: &mut Vec<wgpu::Buffer>,
+    budget: &mut EncodeBudget,
 ) -> Result<usize, WgpuRenderError> {
-    use wgpu::util::DeviceExt;
+    const OVERPRINT_MODE: u32 = 100;
+    const LERP_ALPHA_MODE: u32 = 102;
     let device = &ctx.device;
-    let mut active: Vec<usize> = vec![base];
+    // Each stack entry holds `(color_layer, alpha_layer)`. `alpha_layer` is
+    // `Some(a)` inside any non-isolated non-`Normal` group (and any nested
+    // non-isolated `Normal` group beneath it), tracking the exact Porter-Duff
+    // accumulated group alpha `α_g` from the nearest enclosing non-isolated
+    // non-`Normal` group's transparent start. Isolated groups start transparent
+    // so their color layer's alpha already IS `α_g` (`alpha_layer = None`).
+    let mut active: Vec<(usize, Option<usize>)> = vec![(base, None)];
     let mut blend_info: Vec<BlendFrame> = Vec::new();
 
     let mut i = 0;
@@ -2348,15 +2509,24 @@ fn composite_into(
             i += 1;
         }
         if start < i {
-            let cur = *active.last().unwrap();
-            let mut pass = begin_layer_pass(
-                encoder,
-                pool.get(cur),
-                wgpu::LoadOp::Load,
-                wgpu::LoadOp::Load,
-            );
-            replay_ops(&mut pass, &ops[start..i], res);
-            drop(pass);
+            let chunk = &ops[start..i];
+            let (cur_c, cur_a) = *active.last().unwrap();
+            budget.charge_pass(chunk.len())?;
+            {
+                let mut pass = begin_layer_pass(
+                    encoder,
+                    pool.get(cur_c),
+                    wgpu::LoadOp::Load,
+                    wgpu::LoadOp::Load,
+                );
+                replay_ops(&mut pass, chunk, res);
+            }
+            if let Some(a) = cur_a {
+                budget.charge_pass(chunk.len())?;
+                let mut pass =
+                    begin_layer_pass(encoder, pool.get(a), wgpu::LoadOp::Load, wgpu::LoadOp::Load);
+                replay_ops(&mut pass, chunk, res);
+            }
         }
         if i >= ops.len() {
             break;
@@ -2371,186 +2541,70 @@ fn composite_into(
                 non_isolated,
                 unclipped_group,
             } => {
-                // Non-isolated group with a non-Normal outer blend mode (ISO
-                // 32000-1 §11.4.5 / §11.6.7): evaluate the inner ops against
-                // the live parent backdrop (color) and against transparent
-                // (accumulated group alpha α_g), remove the initial backdrop's
-                // contribution via `mask_apply` (`non_isolated = 2u`), apply
-                // any outer soft mask, and composite onto `parent` with `mode`.
-                if *non_isolated
-                    && *mode != zpdf_display_list::BlendMode::Normal
-                    && overprint.is_none()
-                {
-                    let mut depth = 1usize;
-                    let mut end_i = i + 1;
-                    while end_i < ops.len() && depth > 0 {
-                        match ops[end_i] {
-                            PageOp::PushBlend { .. } => depth += 1,
-                            PageOp::PopBlend => depth -= 1,
-                            _ => {}
-                        }
-                        if depth > 0 {
-                            end_i += 1;
-                        }
-                    }
-                    let inner_ops = &ops[i + 1..end_i.min(ops.len())];
-                    let parent = *active.last().unwrap_or(&base);
-                    let group_clips: &[record::ClipStamp] =
-                        if *unclipped_group { &[] } else { clips };
-
-                    let g_color_base = pool.acquire(device)?;
-                    init_layer_from_base(
-                        ctx,
-                        encoder,
-                        pool.get(g_color_base),
-                        pool.get(parent),
-                        group_clips,
-                        res,
-                        keep_bgs,
-                        keep_bufs,
-                    );
-                    let g_color = composite_into(
-                        ctx,
-                        encoder,
-                        pool,
-                        g_color_base,
-                        inner_ops,
-                        res,
-                        keep_bgs,
-                        keep_bufs,
-                    )?;
-                    if g_color != g_color_base {
-                        pool.recycle(g_color_base);
-                    }
-
-                    let g_alpha_base = pool.acquire(device)?;
-                    init_layer(
-                        encoder,
-                        pool.get(g_alpha_base),
-                        wgpu::Color::TRANSPARENT,
-                        group_clips,
-                        res,
-                    );
-                    let g_alpha = composite_into(
-                        ctx,
-                        encoder,
-                        pool,
-                        g_alpha_base,
-                        inner_ops,
-                        res,
-                        keep_bgs,
-                        keep_bufs,
-                    )?;
-                    if g_alpha != g_alpha_base {
-                        pool.recycle(g_alpha_base);
-                    }
-
-                    let g_removed = remove_non_isolated_backdrop(
-                        ctx, encoder, pool, g_color, g_alpha, parent, res, keep_bgs, keep_bufs,
-                    )?;
-                    let group = if let Some(m) = mask.as_ref() {
-                        apply_soft_mask(
-                            ctx, encoder, pool, g_removed, m, None, res, keep_bgs, keep_bufs,
-                        )?
-                    } else {
-                        g_removed
-                    };
-
-                    let scratch = pool.acquire(device)?;
-                    let mode_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("zpdf-blend-mode"),
-                        contents: bytemuck::cast_slice(&[
-                            blend::blend_index(*mode),
-                            unit(*alpha).to_bits(),
-                            0u32,
-                            0u32,
-                            0.0f32.to_bits(),
-                            0.0f32.to_bits(),
-                            0.0f32.to_bits(),
-                            0.0f32.to_bits(),
-                        ]),
-                        usage: wgpu::BufferUsages::UNIFORM,
-                    });
-                    let comp_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some("zpdf-composite-bg"),
-                        layout: &ctx.pipelines.composite_bgl,
-                        entries: &[
-                            wgpu::BindGroupEntry {
-                                binding: 0,
-                                resource: wgpu::BindingResource::TextureView(
-                                    pool.get(parent).sampleable_view(),
-                                ),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 1,
-                                resource: wgpu::BindingResource::TextureView(
-                                    pool.get(group).sampleable_view(),
-                                ),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 2,
-                                resource: mode_buf.as_entire_binding(),
-                            },
-                        ],
-                    });
-                    {
-                        let mut pass = begin_layer_pass(
-                            encoder,
-                            pool.get(scratch),
-                            wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                            wgpu::LoadOp::Clear(0),
-                        );
-                        pass.set_bind_group(0, Some(res.bind_group), &[]);
-                        if let (Some(fs), Some((svb, sib))) = (res.fs_range, res.solid) {
-                            pass.set_pipeline(&ctx.pipelines.composite);
-                            pass.set_bind_group(1, Some(&comp_bg), &[]);
-                            pass.set_vertex_buffer(0, svb.slice(..));
-                            pass.set_index_buffer(sib.slice(..), wgpu::IndexFormat::Uint32);
-                            pass.set_stencil_reference(0);
-                            pass.draw_indexed(
-                                fs.first_index..fs.first_index + fs.index_count,
-                                fs.base_vertex,
-                                0..1,
-                            );
-                        }
-                        stamp_clips(&mut pass, clips, res);
-                    }
-                    keep_bgs.push(comp_bg);
-                    keep_bufs.push(mode_buf);
-                    pool.recycle(group);
-                    active.pop();
-                    if parent != base {
-                        pool.recycle(parent);
-                    }
-                    active.push(scratch);
-                    i = end_i.saturating_add(1);
-                    continue;
-                }
-
-                let g = pool.acquire(device)?;
+                let (parent_c, parent_a) = *active.last().unwrap_or(&(base, None));
                 let group_clips: &[record::ClipStamp] = if *unclipped_group { &[] } else { clips };
-                if *non_isolated {
-                    let parent = *active.last().unwrap_or(&base);
+                let g_c = pool.acquire(device)?;
+                let g_a = if *non_isolated {
                     init_layer_from_base(
                         ctx,
                         encoder,
-                        pool.get(g),
-                        pool.get(parent),
+                        pool.get(g_c),
+                        pool.get(parent_c),
                         group_clips,
                         res,
                         keep_bgs,
                         keep_bufs,
-                    );
+                        budget,
+                    )?;
+                    if *mode != zpdf_display_list::BlendMode::Normal && overprint.is_none() {
+                        // Start this group's own accumulated-alpha surface from
+                        // transparent so ISO 32000-1 §11.4.5 backdrop removal
+                        // reads exact α_g at PopBlend without replaying inner ops.
+                        let a = pool.acquire(device)?;
+                        init_layer(
+                            encoder,
+                            pool.get(a),
+                            wgpu::Color::TRANSPARENT,
+                            group_clips,
+                            res,
+                            budget,
+                        )?;
+                        Some(a)
+                    } else if let Some(pa) = parent_a {
+                        // Non-isolated Normal group inside a non-isolated
+                        // non-Normal ancestor: mirror the ancestor's alpha
+                        // layer so `mix(pa, ga, w)` yields exact Porter-Duff
+                        // alpha `α_0 + w * α_K * (1 - α_0)` at PopBlend.
+                        let a = pool.acquire(device)?;
+                        init_layer_from_base(
+                            ctx,
+                            encoder,
+                            pool.get(a),
+                            pool.get(pa),
+                            group_clips,
+                            res,
+                            keep_bgs,
+                            keep_bufs,
+                            budget,
+                        )?;
+                        Some(a)
+                    } else {
+                        None
+                    }
                 } else {
+                    // Isolated (or overprint) group starts from transparent, so
+                    // its own color layer already carries exact α_g (`g_a = None`).
                     init_layer(
                         encoder,
-                        pool.get(g),
+                        pool.get(g_c),
                         wgpu::Color::TRANSPARENT,
                         group_clips,
                         res,
-                    );
-                }
-                active.push(g);
+                        budget,
+                    )?;
+                    None
+                };
+                active.push((g_c, g_a));
                 blend_info.push((
                     *mode,
                     *alpha,
@@ -2561,7 +2615,11 @@ fn composite_into(
                 ));
             }
             PageOp::PopBlend => {
-                let group = active.pop().unwrap_or(base);
+                if active.len() <= 1 {
+                    i += 1;
+                    continue;
+                }
+                let (group_c, group_a) = active.pop().unwrap();
                 let (mode, alpha, mask, clips, overprint, non_isolated) =
                     blend_info.pop().unwrap_or((
                         zpdf_display_list::BlendMode::Normal,
@@ -2571,146 +2629,258 @@ fn composite_into(
                         None,
                         false,
                     ));
-                let parent = *active.last().unwrap_or(&base);
+                let (parent_c, parent_a) = *active.last().unwrap_or(&(base, None));
 
-                // Non-isolated group with a soft mask: evaluate `mix(parent, group, alpha * cov)`
-                // directly into `scratch` (preserving live backdrop while applying mask and
-                // object opacity once), re-stamp parent clips, and replace `parent`.
-                if non_isolated {
-                    if let Some(m) = mask {
-                        let scratch = apply_soft_mask(
+                if non_isolated
+                    && mode != zpdf_display_list::BlendMode::Normal
+                    && overprint.is_none()
+                {
+                    // ISO 32000-1 §11.4.5 / §11.6.7 backdrop removal using the
+                    // paired `group_a` layer computed in the same flat pass.
+                    let g_removed = if let Some(g_a) = group_a {
+                        remove_non_isolated_backdrop(
+                            ctx, encoder, pool, group_c, g_a, parent_c, res, keep_bgs, keep_bufs,
+                            budget,
+                        )?
+                    } else {
+                        group_c
+                    };
+                    let g_final = if let Some(m) = mask {
+                        apply_soft_mask(
+                            ctx, encoder, pool, g_removed, m, None, res, keep_bgs, keep_bufs,
+                            budget,
+                        )?
+                    } else {
+                        g_removed
+                    };
+                    let new_parent_c = composite_layer(
+                        ctx,
+                        encoder,
+                        pool,
+                        parent_c,
+                        g_final,
+                        blend::blend_index(mode),
+                        unit(alpha),
+                        0,
+                        [0.0; 4],
+                        &clips,
+                        res,
+                        keep_bgs,
+                        keep_bufs,
+                        budget,
+                    )?;
+                    // Reuse `g_final` (whose alpha IS `α_g * mask`) to update
+                    // any enclosing non-isolated ancestor's alpha layer in one
+                    // Normal composite pass — zero child replay.
+                    let new_parent_a = if let Some(pa) = parent_a {
+                        let new_pa = composite_layer(
                             ctx,
                             encoder,
                             pool,
-                            group,
-                            m,
-                            Some((parent, unit(alpha), &clips)),
+                            pa,
+                            g_final,
+                            blend::blend_index(zpdf_display_list::BlendMode::Normal),
+                            unit(alpha),
+                            0,
+                            [0.0; 4],
+                            &clips,
                             res,
                             keep_bgs,
                             keep_bufs,
+                            budget,
                         )?;
-                        active.pop();
-                        if parent != base {
-                            pool.recycle(parent);
+                        pool.recycle(pa);
+                        Some(new_pa)
+                    } else {
+                        None
+                    };
+                    pool.recycle(g_final);
+                    active.pop();
+                    if parent_c != base {
+                        pool.recycle(parent_c);
+                    }
+                    active.push((new_parent_c, new_parent_a));
+                    i += 1;
+                    continue;
+                }
+
+                if non_isolated {
+                    if let Some(m) = mask {
+                        // Render the soft mask ONCE and apply it to both
+                        // `group_c` and (when active) `group_a`.
+                        let (mask_layer, mask_base) = render_soft_mask_layer(
+                            ctx, encoder, pool, m, res, keep_bgs, keep_bufs, budget,
+                        )?;
+                        let new_parent_c = apply_rendered_soft_mask(
+                            ctx,
+                            encoder,
+                            pool,
+                            group_c,
+                            mask_layer,
+                            m,
+                            Some((parent_c, unit(alpha), &clips)),
+                            res,
+                            keep_bgs,
+                            keep_bufs,
+                            budget,
+                        )?;
+                        let new_parent_a = match (parent_a, group_a) {
+                            (Some(pa), Some(ga)) => {
+                                let new_pa = apply_rendered_soft_mask(
+                                    ctx,
+                                    encoder,
+                                    pool,
+                                    ga,
+                                    mask_layer,
+                                    m,
+                                    Some((pa, unit(alpha), &clips)),
+                                    res,
+                                    keep_bgs,
+                                    keep_bufs,
+                                    budget,
+                                )?;
+                                pool.recycle(pa);
+                                Some(new_pa)
+                            }
+                            (pa, ga) => {
+                                if let Some(ga) = ga {
+                                    pool.recycle(ga);
+                                }
+                                pa
+                            }
+                        };
+                        pool.recycle(mask_layer);
+                        if mask_base != mask_layer {
+                            pool.recycle(mask_base);
                         }
-                        active.push(scratch);
+                        active.pop();
+                        if parent_c != base {
+                            pool.recycle(parent_c);
+                        }
+                        active.push((new_parent_c, new_parent_a));
                         i += 1;
                         continue;
                     }
-                }
 
-                // A soft mask pre-multiplies the group layer by per-pixel
-                // coverage: render the mask into its own layer, then an
-                // apply-mask pass writes (group × coverage) into a fresh layer
-                // that takes the group's place as the composite source. The
-                // original group + coverage layers are recycled inside.
-                let group = if let Some(m) = mask {
-                    apply_soft_mask(ctx, encoder, pool, group, m, None, res, keep_bgs, keep_bufs)?
-                } else {
-                    group
-                };
-
-                let scratch = pool.acquire(device)?;
-
-                // Composite uniform (ModeU, 32 bytes): blend id + group alpha,
-                // overprint sentinel + colorants, or non-isolated opacity lerp.
-                const OVERPRINT_MODE: u32 = 100;
-                const LERP_ALPHA_MODE: u32 = 102;
-                let (id, alpha_bits, op_active, cmyk) = match (overprint, non_isolated) {
-                    (Some(op), _) => (
-                        OVERPRINT_MODE,
-                        1.0f32.to_bits(),
-                        op.active as u32,
-                        op.cmyk.map(unit),
-                    ),
-                    (None, true) => (LERP_ALPHA_MODE, unit(alpha).to_bits(), 0u32, [0.0; 4]),
-                    (None, false) => (
-                        blend::blend_index(mode),
-                        unit(alpha).to_bits(),
-                        0u32,
-                        [0.0; 4],
-                    ),
-                };
-                let mode_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("zpdf-blend-mode"),
-                    contents: bytemuck::cast_slice(&[
-                        id,
-                        alpha_bits,
-                        op_active,
-                        0u32,
-                        cmyk[0].to_bits(),
-                        cmyk[1].to_bits(),
-                        cmyk[2].to_bits(),
-                        cmyk[3].to_bits(),
-                    ]),
-                    usage: wgpu::BufferUsages::UNIFORM,
-                });
-                let comp_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("zpdf-composite-bg"),
-                    layout: &ctx.pipelines.composite_bgl,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::TextureView(
-                                pool.get(parent).sampleable_view(),
-                            ),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::TextureView(
-                                pool.get(group).sampleable_view(),
-                            ),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: mode_buf.as_entire_binding(),
-                        },
-                    ],
-                });
-
-                // Composite pass into the scratch layer, then re-stamp the parent clips.
-                {
-                    let mut pass = begin_layer_pass(
+                    let new_parent_c = composite_layer(
+                        ctx,
                         encoder,
-                        pool.get(scratch),
-                        wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        wgpu::LoadOp::Clear(0),
-                    );
-                    pass.set_bind_group(0, Some(res.bind_group), &[]);
-                    if let (Some(fs), Some((svb, sib))) = (res.fs_range, res.solid) {
-                        pass.set_pipeline(&ctx.pipelines.composite);
-                        pass.set_bind_group(1, Some(&comp_bg), &[]);
-                        pass.set_vertex_buffer(0, svb.slice(..));
-                        pass.set_index_buffer(sib.slice(..), wgpu::IndexFormat::Uint32);
-                        pass.set_stencil_reference(0);
-                        pass.draw_indexed(
-                            fs.first_index..fs.first_index + fs.index_count,
-                            fs.base_vertex,
-                            0..1,
-                        );
+                        pool,
+                        parent_c,
+                        group_c,
+                        LERP_ALPHA_MODE,
+                        unit(alpha),
+                        0,
+                        [0.0; 4],
+                        &clips,
+                        res,
+                        keep_bgs,
+                        keep_bufs,
+                        budget,
+                    )?;
+                    pool.recycle(group_c);
+                    let new_parent_a = match (parent_a, group_a) {
+                        (Some(pa), Some(ga)) => {
+                            let new_pa = composite_layer(
+                                ctx,
+                                encoder,
+                                pool,
+                                pa,
+                                ga,
+                                LERP_ALPHA_MODE,
+                                unit(alpha),
+                                0,
+                                [0.0; 4],
+                                &clips,
+                                res,
+                                keep_bgs,
+                                keep_bufs,
+                                budget,
+                            )?;
+                            pool.recycle(ga);
+                            pool.recycle(pa);
+                            Some(new_pa)
+                        }
+                        (pa, ga) => {
+                            if let Some(ga) = ga {
+                                pool.recycle(ga);
+                            }
+                            pa
+                        }
+                    };
+                    active.pop();
+                    if parent_c != base {
+                        pool.recycle(parent_c);
                     }
-                    stamp_clips(&mut pass, &clips, res);
+                    active.push((new_parent_c, new_parent_a));
+                    i += 1;
+                    continue;
                 }
 
-                keep_bgs.push(comp_bg);
-                keep_bufs.push(mode_buf);
-
-                // The group and the now-superseded parent are dead: their reads
-                // are recorded, so recycle them for reuse (textures live until
-                // submit). The scratch takes the parent's slot in the stack.
+                // Isolated or overprint group (`group_a` is `None`).
+                if let Some(ga) = group_a {
+                    pool.recycle(ga);
+                }
+                let group = if let Some(m) = mask {
+                    apply_soft_mask(
+                        ctx, encoder, pool, group_c, m, None, res, keep_bgs, keep_bufs, budget,
+                    )?
+                } else {
+                    group_c
+                };
+                let (id, comp_alpha, op_active, cmyk) = match overprint {
+                    Some(op) => (OVERPRINT_MODE, 1.0f32, op.active as u32, op.cmyk.map(unit)),
+                    None => (blend::blend_index(mode), unit(alpha), 0u32, [0.0; 4]),
+                };
+                let new_parent_c = composite_layer(
+                    ctx, encoder, pool, parent_c, group, id, comp_alpha, op_active, cmyk, &clips,
+                    res, keep_bgs, keep_bufs, budget,
+                )?;
+                let new_parent_a = if let Some(pa) = parent_a {
+                    let new_pa = composite_layer(
+                        ctx,
+                        encoder,
+                        pool,
+                        pa,
+                        group,
+                        blend::blend_index(zpdf_display_list::BlendMode::Normal),
+                        comp_alpha,
+                        0,
+                        [0.0; 4],
+                        &clips,
+                        res,
+                        keep_bgs,
+                        keep_bufs,
+                        budget,
+                    )?;
+                    pool.recycle(pa);
+                    Some(new_pa)
+                } else {
+                    None
+                };
                 pool.recycle(group);
                 active.pop();
-                if parent != base {
-                    pool.recycle(parent);
+                if parent_c != base {
+                    pool.recycle(parent_c);
                 }
-                active.push(scratch);
+                active.push((new_parent_c, new_parent_a));
             }
             _ => unreachable!(),
         }
         i += 1;
     }
 
-    Ok(*active.first().unwrap_or(&base))
+    while active.len() > 1 {
+        if let Some((c, a)) = active.pop() {
+            if c != base {
+                pool.recycle(c);
+            }
+            if let Some(a) = a {
+                pool.recycle(a);
+            }
+        }
+    }
+    Ok(active.first().map_or(base, |&(c, _)| c))
 }
 
 /// Uniform for the mask-apply pass. Mirrors `MaskU` in `mask_apply.wgsl`: the
@@ -2764,8 +2934,10 @@ fn remove_non_isolated_backdrop(
     res: &ReplayRes,
     keep_bgs: &mut Vec<wgpu::BindGroup>,
     keep_bufs: &mut Vec<wgpu::Buffer>,
+    budget: &mut EncodeBudget,
 ) -> Result<usize, WgpuRenderError> {
     use wgpu::util::DeviceExt;
+    budget.charge_pass(1)?;
     let device = &ctx.device;
     let out = pool.acquire(device)?;
     let mask_u = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -2833,38 +3005,29 @@ fn remove_non_isolated_backdrop(
     Ok(out)
 }
 
-/// Apply a group's soft mask: composite the mask group into its own layer, then a
-/// fullscreen pass pre-multiplies the group layer by the mask's per-pixel coverage
-/// (luminosity over the /BC backdrop, or the mask group's alpha), honoring the
-/// tiling-pattern reuse offset and the /TR transfer function. Returns the index of
-/// the masked layer that takes the group's place as the composite source. New bind
-/// groups/buffers are parked in `keep_*` so they outlive the encoder submission.
+/// Composite a soft mask's group into its own layer, returning
+/// `(mask_layer, mask_base)` so the caller can apply the rendered coverage once
+/// or twice (for paired color/alpha layers) before recycling both.
 #[allow(clippy::too_many_arguments)]
-fn apply_soft_mask(
+fn render_soft_mask_layer(
     ctx: &GpuContext,
     encoder: &mut wgpu::CommandEncoder,
     pool: &mut blend::LayerPool,
-    group: usize,
     mask: &record::MaskOps,
-    non_isolated: Option<(usize, f32, &[record::ClipStamp])>,
     res: &ReplayRes,
     keep_bgs: &mut Vec<wgpu::BindGroup>,
     keep_bufs: &mut Vec<wgpu::Buffer>,
-) -> Result<usize, WgpuRenderError> {
-    use wgpu::util::DeviceExt;
+    budget: &mut EncodeBudget,
+) -> Result<(usize, usize), WgpuRenderError> {
     use zpdf_display_list::SoftMaskKind;
     let device = &ctx.device;
-
-    // 1. Composite the mask group into its own layer. Luminosity masks start from
-    //    the /BC backdrop luminosity (opaque); alpha masks from transparent. The
-    //    group may itself contain nested transparency groups, so it goes through
-    //    the layered compositor rather than a single replay pass.
     let mask_base = pool.acquire(device)?;
     let backdrop = quantize_clear_color(&Color::gray(unit(mask.backdrop_luma)));
     let clear = match mask.kind {
         SoftMaskKind::Luminosity => backdrop,
         SoftMaskKind::Alpha => wgpu::Color::TRANSPARENT,
     };
+    budget.charge_pass(1)?;
     {
         let pass = begin_layer_pass(
             encoder,
@@ -2875,20 +3038,40 @@ fn apply_soft_mask(
         drop(pass);
     }
     let mask_layer = composite_into(
-        ctx, encoder, pool, mask_base, &mask.ops, res, keep_bgs, keep_bufs,
+        ctx, encoder, pool, mask_base, &mask.ops, res, keep_bgs, keep_bufs, budget,
     )?;
+    Ok((mask_layer, mask_base))
+}
 
-    // 2. Pre-multiply the group layer by the mask coverage into a fresh layer
-    //    (isolated), or blend `mix(parent, group, group_alpha * coverage)`
-    //    directly into the fresh layer (non-isolated).
+/// Apply an already-rendered `mask_layer` to `group`, recycling `group` (but
+/// NOT `mask_layer`, which the caller recycles after all uses complete).
+#[allow(clippy::too_many_arguments)]
+fn apply_rendered_soft_mask(
+    ctx: &GpuContext,
+    encoder: &mut wgpu::CommandEncoder,
+    pool: &mut blend::LayerPool,
+    group: usize,
+    mask_layer: usize,
+    mask: &record::MaskOps,
+    non_isolated: Option<(usize, f32, &[record::ClipStamp])>,
+    res: &ReplayRes,
+    keep_bgs: &mut Vec<wgpu::BindGroup>,
+    keep_bufs: &mut Vec<wgpu::Buffer>,
+    budget: &mut EncodeBudget,
+) -> Result<usize, WgpuRenderError> {
+    use wgpu::util::DeviceExt;
+    use zpdf_display_list::SoftMaskKind;
+    let device = &ctx.device;
+    let backdrop = quantize_clear_color(&Color::gray(unit(mask.backdrop_luma)));
+    let (ni_flag, group_alpha, base_layer, restamp_clips) = match non_isolated {
+        Some((parent, ga, clips)) => (1u32, ga, parent, Some(clips)),
+        None => (0u32, 1.0f32, group, None),
+    };
+    budget.charge_pass(restamp_clips.map_or(1, |c| c.len().max(1)))?;
     let masked = pool.acquire(device)?;
     let kind_id: u32 = match mask.kind {
         SoftMaskKind::Luminosity => 1,
         SoftMaskKind::Alpha => 2,
-    };
-    let (ni_flag, group_alpha, base_layer, restamp_clips) = match non_isolated {
-        Some((parent, ga, clips)) => (1u32, ga, parent, Some(clips)),
-        None => (0u32, 1.0f32, group, None),
     };
     let mask_u = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("zpdf-mask-uniform"),
@@ -2957,13 +3140,44 @@ fn apply_soft_mask(
     }
     keep_bgs.push(mask_bg);
     keep_bufs.push(mask_u);
-
-    // The original group and the mask's layers have been consumed into `masked`
-    // (their reads are recorded); recycle them for reuse. `mask_base` differs from
-    // `mask_layer` only when the mask group itself contained nested groups (the
-    // composite produced a fresh scratch); recycle it too so deep nesting doesn't
-    // leak a layer per level.
     pool.recycle(group);
+    Ok(masked)
+}
+
+/// Apply a group's soft mask: composite the mask group into its own layer, then a
+/// fullscreen pass pre-multiplies the group layer by the mask's per-pixel coverage
+/// (luminosity over the /BC backdrop, or the mask group's alpha), honoring the
+/// tiling-pattern reuse offset and the /TR transfer function. Returns the index of
+/// the masked layer that takes the group's place as the composite source. New bind
+/// groups/buffers are parked in `keep_*` so they outlive the encoder submission.
+#[allow(clippy::too_many_arguments)]
+fn apply_soft_mask(
+    ctx: &GpuContext,
+    encoder: &mut wgpu::CommandEncoder,
+    pool: &mut blend::LayerPool,
+    group: usize,
+    mask: &record::MaskOps,
+    non_isolated: Option<(usize, f32, &[record::ClipStamp])>,
+    res: &ReplayRes,
+    keep_bgs: &mut Vec<wgpu::BindGroup>,
+    keep_bufs: &mut Vec<wgpu::Buffer>,
+    budget: &mut EncodeBudget,
+) -> Result<usize, WgpuRenderError> {
+    let (mask_layer, mask_base) =
+        render_soft_mask_layer(ctx, encoder, pool, mask, res, keep_bgs, keep_bufs, budget)?;
+    let masked = apply_rendered_soft_mask(
+        ctx,
+        encoder,
+        pool,
+        group,
+        mask_layer,
+        mask,
+        non_isolated,
+        res,
+        keep_bgs,
+        keep_bufs,
+        budget,
+    )?;
     pool.recycle(mask_layer);
     if mask_base != mask_layer {
         pool.recycle(mask_base);
@@ -3604,6 +3818,108 @@ mod resource_tests {
                 })
                 .collect();
         assert_eq!(seg_alphas, vec![1.0, 1.0]);
+    }
+
+    #[test]
+    fn encode_budget_enforces_pass_and_op_limits() {
+        let mut b = EncodeBudget::new(2, 5);
+        assert!(b.charge_pass(2).is_ok());
+        assert_eq!(b.passes_used, 1);
+        assert!(b.charge_pass(3).is_ok());
+        assert_eq!(b.passes_used, 2);
+        assert!(matches!(
+            b.charge_pass(1),
+            Err(WgpuRenderError::Unsupported(_))
+        ));
+
+        let mut op_limited = EncodeBudget::new(10, 4);
+        assert!(op_limited.charge_pass(3).is_ok());
+        assert!(matches!(
+            op_limited.charge_pass(2),
+            Err(WgpuRenderError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn nested_non_isolated_groups_encode_linearly_and_enforce_encode_budget() {
+        // 15 nested non-isolated Screen groups plus 1 inner Multiply group
+        // (= the full default max_blend_group_depth = 16): recursive
+        // color+alpha replay would encode 2^15 = 32,768 child subtrees; paired
+        // alpha-layer tracking encodes linearly (< 160 passes total) and still
+        // obeys `max_encode_passes`.
+        let page_rect = Rect::new(0.0, 0.0, 32.0, 32.0);
+        let mut dl = DisplayList::new(page_rect);
+        let mut full = zpdf_display_list::Path::new();
+        full.rect(page_rect);
+        dl.push(RenderCommand::FillPath {
+            path: full.clone(),
+            rule: zpdf_display_list::FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(0.0, 0.0, 1.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        const DEPTH: usize = 15;
+        for _ in 0..DEPTH {
+            dl.push(RenderCommand::PushBlendGroup {
+                blend_mode: zpdf_display_list::BlendMode::Screen,
+                isolated: false,
+                knockout: false,
+                bounds: page_rect,
+                alpha: 1.0,
+                mask: None,
+            });
+        }
+        // White Multiply fill inside the innermost non-isolated group evaluates
+        // against the blue backdrop -> blue, screened 16 times onto blue -> blue.
+        dl.push(RenderCommand::PushBlendGroup {
+            blend_mode: zpdf_display_list::BlendMode::Multiply,
+            isolated: true,
+            knockout: false,
+            bounds: page_rect,
+            alpha: 1.0,
+            mask: None,
+        });
+        dl.push(RenderCommand::FillPath {
+            path: full,
+            rule: zpdf_display_list::FillRule::NonZero,
+            paint: Paint::Solid(Color::white()),
+            alpha: 1.0,
+            overprint: None,
+        });
+        dl.push(RenderCommand::PopBlendGroup);
+        for _ in 0..DEPTH {
+            dl.push(RenderCommand::PopBlendGroup);
+        }
+
+        let mut renderer = WgpuRenderer::new();
+        let tex = match renderer.render_display_list(&dl, 1.0) {
+            Ok(t) => t,
+            Err(WgpuRenderError::NoAdapter) => return,
+            Err(e) => panic!("unexpected GPU error: {e}"),
+        };
+        assert!(
+            renderer.last_encode_passes > 0 && renderer.last_encode_passes < 160,
+            "16 nested non-isolated groups must encode linearly (< 160 passes), got {}",
+            renderer.last_encode_passes
+        );
+        let off = ((16 * tex.width + 16) * 4) as usize;
+        let px = &tex.data[off..off + 4];
+        assert!(
+            px[0] < 10 && px[1] < 10 && px[2] > 245 && px[3] > 245,
+            "16 nested non-isolated Screen groups over blue with white Multiply must stay blue, got {px:?}"
+        );
+
+        // Tightening the shared pass budget must return a clean render error
+        // from `end_page` rather than submitting unbounded passes.
+        renderer.max_encode_passes = 8;
+        let err = renderer
+            .render_display_list(&dl, 1.0)
+            .err()
+            .expect("expected encoding-budget error");
+        assert!(
+            matches!(err, WgpuRenderError::Unsupported(_)),
+            "expected Unsupported budget error, got {err:?}"
+        );
     }
 }
 

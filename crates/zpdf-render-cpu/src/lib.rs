@@ -70,6 +70,15 @@ pub struct CpuRenderer<'a> {
     /// ISO 32000-1 §11.4.5 backdrop removal before compositing with its outer
     /// blend mode.
     recording_non_isolated: Option<RecordedNonIsolatedGroup>,
+    /// Number of enclosing recorded non-isolated non-`Normal` groups currently
+    /// being replayed (counted against `max_blend_group_depth`).
+    non_isolated_depth: usize,
+    /// True while replaying Pass 2 of a recorded non-isolated non-`Normal`
+    /// group over a transparent surface to compute accumulated group alpha
+    /// `α_g`. In this mode, nested non-isolated non-`Normal` groups contribute
+    /// identical Porter-Duff alpha when evaluated as single-pass isolated
+    /// `Normal` groups, avoiding `2^depth` recursive replays.
+    alpha_only_pass: bool,
     /// Bytes retained by the live page/group pixmap plus parked blend parents.
     blend_surface_bytes: u64,
     /// Transparent page-sized surfaces left by finished blend groups and
@@ -602,6 +611,8 @@ impl<'a> CpuRenderer<'a> {
             mask_pool: Vec::new(),
             blend_stack: Vec::new(),
             recording_non_isolated: None,
+            non_isolated_depth: 0,
+            alpha_only_pass: false,
             blend_surface_bytes: 0,
             surface_pool: Vec::new(),
             pooled_surface_bytes: 0,
@@ -1180,7 +1191,10 @@ impl<'a> CpuRenderer<'a> {
             tiny_skia::FilterQuality::Bilinear
         };
 
-        let blend_depth = self.soft_mask_depth.saturating_add(self.blend_stack.len());
+        let blend_depth = self
+            .soft_mask_depth
+            .saturating_add(self.blend_stack.len())
+            .saturating_add(self.non_isolated_depth);
         let key = TilingCacheKey::new(
             tiling,
             segment_index,
@@ -1249,6 +1263,8 @@ impl<'a> CpuRenderer<'a> {
                 mask_pool: Vec::new(),
                 blend_stack: Vec::new(),
                 recording_non_isolated: None,
+                non_isolated_depth: 0,
+                alpha_only_pass: false,
                 blend_surface_bytes: self
                     .blend_surface_bytes
                     .saturating_add(self.pooled_surface_bytes)
@@ -3127,7 +3143,10 @@ impl<'a> CpuRenderer<'a> {
             self.skipped_blend_depth = self.skipped_blend_depth.saturating_add(1);
             return;
         }
-        let depth = self.soft_mask_depth.saturating_add(self.blend_stack.len());
+        let depth = self
+            .soft_mask_depth
+            .saturating_add(self.blend_stack.len())
+            .saturating_add(self.non_isolated_depth);
         if depth >= self.max_blend_group_depth {
             self.skipped_blend_depth = 1;
             tracing::warn!(
@@ -3139,6 +3158,19 @@ impl<'a> CpuRenderer<'a> {
 
         // Rasterize the soft mask before parking the base pixmap (needs dims).
         let mask_plane = mask.and_then(|m| self.soft_mask_plane(m));
+
+        // During Pass 2 of an enclosing non-isolated non-`Normal` group we only
+        // need accumulated Porter-Duff alpha `α_g` over transparent. Because
+        // every PDF blend mode shares `α_out = α_b + α_s * (1 - α_b)`, a nested
+        // non-isolated non-`Normal` group contributes the exact same alpha when
+        // evaluated in a single pass as an isolated `Normal` group — avoiding
+        // exponential `2^depth` recursive replays.
+        let (blend_mode, isolated) =
+            if self.alpha_only_pass && !isolated && !knockout && blend_mode != BlendMode::Normal {
+                (BlendMode::Normal, true)
+            } else {
+                (blend_mode, isolated)
+            };
 
         // A non-isolated group with no group-as-a-unit operation (Normal blend,
         // full alpha, no soft mask, not knockout) is exactly equivalent to
@@ -3327,11 +3359,16 @@ impl<'a> CpuRenderer<'a> {
         };
 
         // Pass 1: evaluate commands over a copy of the live backdrop -> (C_n, α_n).
+        self.non_isolated_depth = self.non_isolated_depth.saturating_add(1);
         group_color.data_mut().copy_from_slice(backdrop.data());
         let (group_color, _color_dirty) = run_pass(self, group_color);
 
-        // Pass 2: evaluate the same commands over transparent -> exact α_g.
+        // Pass 2: evaluate the same commands over transparent -> exact α_g
+        // (in `alpha_only_pass` mode so nested non-isolated groups never fork).
+        let prev_alpha_only = std::mem::replace(&mut self.alpha_only_pass, true);
         let (group_alpha, alpha_dirty) = run_pass(self, group_alpha);
+        self.alpha_only_pass = prev_alpha_only;
+        self.non_isolated_depth = self.non_isolated_depth.saturating_sub(1);
 
         self.blend_surface_bytes = self
             .blend_surface_bytes
@@ -3918,6 +3955,8 @@ impl<'a> CpuRenderer<'a> {
             mask_pool: Vec::new(),
             blend_stack: Vec::new(),
             recording_non_isolated: None,
+            non_isolated_depth: 0,
+            alpha_only_pass: false,
             // Everything the page holds stays allocated while the mask group
             // renders, so its groups share the page's budget rather than
             // starting a fresh one per nesting level.
@@ -3942,6 +3981,7 @@ impl<'a> CpuRenderer<'a> {
             soft_mask_depth: self
                 .soft_mask_depth
                 .saturating_add(self.blend_stack.len())
+                .saturating_add(self.non_isolated_depth)
                 .saturating_add(1),
             tiling_cache: HashMap::new(),
             tiling_cache_bytes: 0,
@@ -5254,6 +5294,8 @@ impl<'a> RenderBackend for CpuRenderer<'a> {
         self.clip_bounds = None;
         self.blend_stack.clear();
         self.recording_non_isolated = None;
+        self.non_isolated_depth = 0;
+        self.alpha_only_pass = false;
         self.blend_surface_bytes = 0;
         self.surface_pool.clear();
         self.pooled_surface_bytes = 0;
@@ -5331,18 +5373,26 @@ impl<'a> RenderBackend for CpuRenderer<'a> {
             match cmd {
                 RenderCommand::PushBlendGroup { .. } => {
                     rec.nesting += 1;
-                    rec.cmds.push(cmd.clone());
+                    if !self.over_budget {
+                        rec.cmds.push(cmd.clone());
+                    }
                 }
                 RenderCommand::PopBlendGroup if rec.nesting > 0 => {
                     rec.nesting -= 1;
-                    rec.cmds.push(cmd.clone());
+                    if !self.over_budget {
+                        rec.cmds.push(cmd.clone());
+                    }
                 }
                 RenderCommand::PopBlendGroup => {
                     if let Some(finished) = self.recording_non_isolated.take() {
                         self.finish_recorded_non_isolated_group(finished);
                     }
                 }
-                _ => rec.cmds.push(cmd.clone()),
+                _ => {
+                    if !self.over_budget {
+                        rec.cmds.push(cmd.clone());
+                    }
+                }
             }
             return Ok(());
         }
@@ -5428,6 +5478,8 @@ impl<'a> RenderBackend for CpuRenderer<'a> {
         // Gracefully close a malformed/truncated display list. This also restores
         // the real page target if the deadline fired inside an open blend group.
         self.recording_non_isolated = None;
+        self.non_isolated_depth = 0;
+        self.alpha_only_pass = false;
         while !self.blend_stack.is_empty() {
             self.pop_blend_group();
         }
@@ -7753,5 +7805,118 @@ mod tests {
         // Confirm the pattern actually modified pixels inside the clipped region.
         let sample = ((32 * 64 + 32) * 4) as usize;
         assert_ne!(&single[sample..sample + 3], &[230, 179, 128]);
+    }
+
+    #[test]
+    fn nested_non_isolated_blend_groups_avoid_exponential_replay_and_match_spec() {
+        // 15 nested non-isolated Screen groups + 1 inner Multiply white fill
+        // over opaque blue must complete quickly (no 2^15 replay blowup) and
+        // preserve exact blue.
+        let page_rect = Rect::new(0.0, 0.0, 32.0, 32.0);
+        let mut dl = DisplayList::new(page_rect);
+        let mut full = Path::new();
+        full.rect(page_rect);
+        dl.push(RenderCommand::FillPath {
+            path: full.clone(),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(0.0, 0.0, 1.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        for _ in 0..15 {
+            dl.push(RenderCommand::PushBlendGroup {
+                blend_mode: BlendMode::Screen,
+                isolated: false,
+                knockout: false,
+                bounds: page_rect,
+                alpha: 1.0,
+                mask: None,
+            });
+        }
+        dl.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Multiply,
+            isolated: true,
+            knockout: false,
+            bounds: page_rect,
+            alpha: 1.0,
+            mask: None,
+        });
+        dl.push(RenderCommand::FillPath {
+            path: full.clone(),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::white()),
+            alpha: 1.0,
+            overprint: None,
+        });
+        dl.push(RenderCommand::PopBlendGroup);
+        for _ in 0..15 {
+            dl.push(RenderCommand::PopBlendGroup);
+        }
+
+        let mut renderer = CpuRenderer::new();
+        let page = renderer.render_display_list(&dl, 1.0).expect("cpu render");
+        assert!(
+            !renderer.over_budget,
+            "nested non-isolated groups must not hit time budget"
+        );
+        let off = ((16 * page.width + 16) * 4) as usize;
+        let px = &page.data[off..off + 4];
+        assert!(
+            px[0] < 10 && px[1] < 10 && px[2] > 245 && px[3] > 245,
+            "15 nested non-isolated Screen groups over blue with white Multiply must stay blue, got {px:?}"
+        );
+
+        // Analytical ISO 32000-1 §11.4.5 check:
+        // Backdrop = opaque gray (0.5, 0.5, 0.5).
+        // Outer non-isolated Multiply (alpha 1.0) wraps inner non-isolated
+        // Screen (alpha 0.5) containing opaque red (1, 0, 0).
+        // Inner Screen onto gray at 0.5 -> (0.75, 0.5, 0.5), α_g = 0.5.
+        // Backdrop removal of outer against gray -> c_g = (1.0, 0.5, 0.5), α_g = 0.5.
+        // Outer Multiply onto gray -> 0.5*(0.5,0.5,0.5) + 0.5*(0.5,0.25,0.25)
+        //                           = (0.5, 0.375, 0.375) ≈ (128, 96, 96).
+        let mut dl2 = DisplayList::new(page_rect);
+        dl2.push(RenderCommand::FillPath {
+            path: full.clone(),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(0.5, 0.5, 0.5)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        dl2.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Multiply,
+            isolated: false,
+            knockout: false,
+            bounds: page_rect,
+            alpha: 1.0,
+            mask: None,
+        });
+        dl2.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Screen,
+            isolated: false,
+            knockout: false,
+            bounds: page_rect,
+            alpha: 0.5,
+            mask: None,
+        });
+        dl2.push(RenderCommand::FillPath {
+            path: full,
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(1.0, 0.0, 0.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        dl2.push(RenderCommand::PopBlendGroup);
+        dl2.push(RenderCommand::PopBlendGroup);
+
+        let page2 = renderer
+            .render_display_list(&dl2, 1.0)
+            .expect("cpu render 2");
+        let px2 = &page2.data[off..off + 3];
+        assert!(
+            (px2[0] as i32 - 128).abs() <= 2
+                && (px2[1] as i32 - 96).abs() <= 2
+                && (px2[2] as i32 - 96).abs() <= 2,
+            "nested non-isolated Multiply(Screen(0.5, red)) over gray must be ~(128, 96, 96), got {px2:?}"
+        );
     }
 }
