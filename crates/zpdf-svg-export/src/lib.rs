@@ -27,6 +27,8 @@ use zpdf_display_list::{
 };
 use zpdf_font::{FontCache, FontId, GlyphOutline, LoadedFont, OutlineCommand};
 use zpdf_image::{DecodedImage, ImageCache, ImageId};
+use zpdf_render::{PageRenderInfo, RenderBackend};
+use zpdf_render_cpu::CpuRenderer;
 
 /// Options for SVG export.
 #[derive(Debug, Clone)]
@@ -89,7 +91,15 @@ pub fn display_list_to_svg(
         height = 1.0;
     }
 
-    let mut writer = SvgWriter::new(rect, width, height, fonts, images, options);
+    let mut writer = SvgWriter::new(
+        rect,
+        width,
+        height,
+        &display_list.commands,
+        fonts,
+        images,
+        options,
+    );
 
     if let Some(bg) = &options.background {
         writer.out.push_str("<rect width=\"");
@@ -160,10 +170,28 @@ enum Frame {
     },
 }
 
+/// Lazily initialized running CPU backdrop used as a bounded O(1)-memory
+/// raster fallback when overlapping dense patterns exhaust `MAX_BACKDROP_FANOUT`
+/// or the SVG `<filter>` intermediate-pixel budget.
+struct SvgBackdropCpu<'a> {
+    renderer: CpuRenderer<'a>,
+    cursor: usize,
+    scale: f64,
+    width: u32,
+    height: u32,
+    exhausted: bool,
+}
+
 struct SvgWriter<'a> {
     defs: String,
     out: String,
     has_opaque_background: bool,
+    page_rect: zpdf_core::Rect,
+    page_commands: &'a [RenderCommand],
+    page_background: Color,
+    current_page_cmd_idx: Option<usize>,
+    svg_backdrop_diverged_depth: usize,
+    backdrop_cpu: Option<SvgBackdropCpu<'a>>,
     blend_depth: usize,
     isolated_depth: usize,
     non_isolated_filter_depth: usize,
@@ -271,13 +299,6 @@ struct PatternDefKey {
     tile_dims: [u64; 2],
     matrix: [u64; 6],
     depth: u8,
-}
-
-/// Geometry target for [`SvgEmitter::emit_live_backdrop_direct_tiling_ops`].
-enum DirectTilingTarget<'a> {
-    Fill { d: &'a str, rule: &'a FillRule },
-    Stroke { d: &'a str, style: &'a StrokeStyle },
-    Type3Mask { shape_mask_id: u32 },
 }
 
 /// Cap on separate `(overlap_copy × blend_segment)` SVG passes for one
@@ -494,6 +515,7 @@ impl<'a> SvgWriter<'a> {
         rect: zpdf_core::Rect,
         width: f64,
         height: f64,
+        page_commands: &'a [RenderCommand],
         fonts: &'a FontCache,
         images: &'a ImageCache,
         options: &SvgOptions,
@@ -502,6 +524,14 @@ impl<'a> SvgWriter<'a> {
             defs: String::new(),
             out: String::new(),
             has_opaque_background: options.background.is_some_and(|c| c.a >= 1.0),
+            page_rect: rect,
+            page_commands,
+            page_background: options
+                .background
+                .unwrap_or(Color::rgba(0.0, 0.0, 0.0, 0.0)),
+            current_page_cmd_idx: None,
+            svg_backdrop_diverged_depth: 0,
+            backdrop_cpu: None,
             blend_depth: 0,
             isolated_depth: 0,
             non_isolated_filter_depth: 0,
@@ -569,7 +599,10 @@ impl<'a> SvgWriter<'a> {
 
     fn emit_commands(&mut self, commands: &[RenderCommand], depth: u8) {
         let mut frames: Vec<Frame> = Vec::new();
-        for cmd in commands {
+        for (idx, cmd) in commands.iter().enumerate() {
+            if depth == 0 {
+                self.current_page_cmd_idx = Some(idx);
+            }
             if self.check_over_budget() {
                 break;
             }
@@ -709,6 +742,9 @@ impl<'a> SvgWriter<'a> {
                             std::mem::replace(&mut self.non_isolated_filter_depth, 0);
                         self.blend_depth += 1;
                         self.isolated_depth += 1;
+                        if !*isolated {
+                            self.svg_backdrop_diverged_depth += 1;
+                        }
                         frames.push(Frame::Blend {
                             open: true,
                             isolates: true,
@@ -808,6 +844,9 @@ impl<'a> SvgWriter<'a> {
                     self.clip_bounds = prev_bounds;
                 }
             }
+        }
+        if depth == 0 {
+            self.current_page_cmd_idx = None;
         }
     }
 
@@ -1504,18 +1543,6 @@ impl<'a> SvgWriter<'a> {
             matches!(
                 op,
                 TilingPlanOp::PushOpacityGroup | TilingPlanOp::PopOpacityGroup { .. }
-            )
-        })
-    }
-
-    fn ops_has_normal(ops: &[TilingPlanOp]) -> bool {
-        ops.iter().any(|op| {
-            matches!(
-                op,
-                TilingPlanOp::Pattern {
-                    blend_mode: BlendMode::Normal,
-                    ..
-                }
             )
         })
     }
@@ -2627,151 +2654,199 @@ impl<'a> SvgWriter<'a> {
         }
     }
 
-    /// Backdrop-aware O(1)-memory fallback used when `MAX_BACKDROP_FANOUT` or
-    /// the filter/snapshot budget is exhausted on a page with a live backdrop:
-    /// flushes any pending/disjoint backdrop and emits direct sibling leaf
-    /// elements with `mix-blend-mode` directly into `self.out` (no
-    /// `isolation:isolate`, no new `<use>` fan-out, and no `<filter>` buffers),
-    /// so every pass continues reading the live page backdrop.
-    fn emit_live_backdrop_direct_tiling_ops(
-        &mut self,
-        ops: &[TilingPlanOp],
-        target: DirectTilingTarget<'_>,
-        opacity: f32,
-    ) {
-        self.flush_pending_backdrop();
-        self.flush_disjoint_backdrop();
+    /// Backdrop-aware bounded raster overlay fallback used when overlapping
+    /// dense patterns exhaust `MAX_BACKDROP_FANOUT` or the SVG `<filter>`
+    /// intermediate-pixel budget:
+    /// - Advances a single running `CpuRenderer` monotonically across page
+    ///   commands in O(N) total work.
+    /// - Preserves the live backdrop and applies object opacity, soft masks,
+    ///   `OpacityGroup`s, and antialiased edges ONCE to the completed blend.
+    /// - Emits a single PNG `<image>` covering `affected` with exact incremental
+    ///   alpha (never duplicating path geometry per pass, zero `<use>` fan-out,
+    ///   and O(1) raster memory).
+    fn emit_raster_backdrop_tiling_fallback(&mut self, affected: SvgRect) -> bool {
+        const MAX_RASTER_DIM: f64 = 1024.0;
+        const MAX_RASTER_PIXELS: f64 = 1_048_576.0;
 
-        // Pre-match each `PushOpacityGroup` to its `PopOpacityGroup` so leaf
-        // elements inherit the enclosing group's alpha and soft mask without
-        // wrapping in an isolating `<g>`.
-        let mut push_info: HashMap<usize, (f32, Option<u32>)> = HashMap::new();
-        let mut open_pushes: Vec<usize> = Vec::new();
-        for (i, op) in ops.iter().enumerate() {
-            match op {
-                TilingPlanOp::PushOpacityGroup => open_pushes.push(i),
-                TilingPlanOp::PopOpacityGroup { alpha, mask_pat_id } => {
-                    if let Some(p) = open_pushes.pop() {
-                        push_info.insert(p, (*alpha, *mask_pat_id));
-                    }
-                }
-                TilingPlanOp::Pattern { .. } => {}
-            }
+        if self.non_isolated_filter_depth > 0 || self.svg_backdrop_diverged_depth > 0 {
+            return false;
         }
-
-        let base_mask = match target {
-            DirectTilingTarget::Fill { .. } | DirectTilingTarget::Stroke { .. } => self.stroke_mask,
-            DirectTilingTarget::Type3Mask { shape_mask_id } => Some(shape_mask_id),
+        let Some(cmd_idx) = self.current_page_cmd_idx else {
+            return false;
         };
-        let mut group_stack: Vec<(f32, Option<u32>)> = Vec::new();
-        let mut combined_masks: HashMap<Vec<u32>, u32> = HashMap::new();
+        if cmd_idx >= self.page_commands.len() {
+            return false;
+        }
 
-        for (idx, op) in ops.iter().enumerate() {
-            match op {
-                TilingPlanOp::PushOpacityGroup => {
-                    let info = push_info.get(&idx).copied().unwrap_or((1.0, None));
-                    group_stack.push(info);
-                }
-                TilingPlanOp::PopOpacityGroup { .. } => {
-                    group_stack.pop();
-                }
-                TilingPlanOp::Pattern { pat_id, blend_mode } => {
-                    let eff_alpha = group_stack
-                        .iter()
-                        .fold(opacity, |acc, (a, _)| acc * a.clamp(0.0, 1.0));
-                    if eff_alpha <= 0.0 {
-                        continue;
-                    }
-                    let pat_masks: Vec<u32> = group_stack.iter().filter_map(|(_, m)| *m).collect();
-                    let leaf_mask = if pat_masks.is_empty() {
-                        base_mask
-                    } else if let Some(&cached) = combined_masks.get(&pat_masks) {
-                        Some(cached)
-                    } else {
-                        // Chain each pattern alpha mask (starting from any base
-                        // luminance mask) so the leaf element carries one `<mask>`.
-                        let mut cur_mask = base_mask;
-                        for &m_pat_id in &pat_masks {
-                            let mid = self.fresh_id();
-                            let _ = write!(
-                                self.defs,
-                                "<mask id=\"m{mid}\" maskUnits=\"userSpaceOnUse\" style=\"mask-type:alpha\">"
-                            );
-                            if let Some(prev) = cur_mask {
-                                let _ = write!(self.defs, "<g mask=\"url(#m{prev})\">");
-                            }
-                            self.defs.push_str("<rect x=\"0\" y=\"0\" width=\"");
-                            push_num(&mut self.defs, self.page_width);
-                            self.defs.push_str("\" height=\"");
-                            push_num(&mut self.defs, self.page_height);
-                            let _ = write!(self.defs, "\" fill=\"url(#p{m_pat_id})\"/>");
-                            if cur_mask.is_some() {
-                                self.defs.push_str("</g>");
-                            }
-                            self.defs.push_str("</mask>\n");
-                            cur_mask = Some(mid);
-                        }
-                        if let Some(mid) = cur_mask {
-                            combined_masks.insert(pat_masks, mid);
-                        }
-                        cur_mask
-                    };
+        if self.backdrop_cpu.is_none() {
+            let page = self.page_rect.normalize();
+            if !(page.x0.is_finite()
+                && page.y0.is_finite()
+                && page.x1.is_finite()
+                && page.y1.is_finite()
+                && page.width() > 0.0
+                && page.height() > 0.0)
+            {
+                return false;
+            }
+            let scale = svg_clamp_raster_scale(
+                page.width(),
+                page.height(),
+                MAX_RASTER_DIM,
+                MAX_RASTER_PIXELS,
+            );
+            let mut renderer = CpuRenderer::new()
+                .with_fonts(self.fonts)
+                .with_images(self.images);
+            if let Some(deadline) = self.deadline {
+                let now = zpdf_core::time::Instant::now();
+                let remaining = if deadline > now {
+                    deadline.duration_since(now)
+                } else {
+                    std::time::Duration::ZERO
+                };
+                renderer = renderer.with_render_budget(Some(remaining));
+            } else {
+                renderer = renderer.with_render_budget(None);
+            }
+            let info = PageRenderInfo {
+                page_rect: page,
+                scale,
+                background: self.page_background,
+            };
+            if renderer.begin_page(&info).is_err() {
+                return false;
+            }
+            let Some((width, height)) = renderer.pixmap_dimensions() else {
+                return false;
+            };
+            let actual_scale = renderer.actual_scale() as f64;
+            if !actual_scale.is_finite() || actual_scale <= 0.0 {
+                return false;
+            }
+            self.backdrop_cpu = Some(SvgBackdropCpu {
+                renderer,
+                cursor: 0,
+                scale: actual_scale,
+                width,
+                height,
+                exhausted: false,
+            });
+        }
 
-                    match target {
-                        DirectTilingTarget::Fill { d, rule } => {
-                            let _ = write!(self.out, "<path d=\"{d}\" fill=\"url(#p{pat_id})\"");
-                            if *rule == FillRule::EvenOdd {
-                                self.out.push_str(" fill-rule=\"evenodd\"");
-                            }
-                            push_opacity(&mut self.out, "fill-opacity", eff_alpha);
-                            if let Some(name) = blend_css(*blend_mode) {
-                                let _ = write!(self.out, " style=\"mix-blend-mode:{name};\"");
-                            }
-                            if let Some(c) = self.clip {
-                                let _ = write!(self.out, " clip-path=\"url(#c{c})\"");
-                            }
-                            if let Some(m) = leaf_mask {
-                                let _ = write!(self.out, " mask=\"url(#m{m})\"");
-                            }
-                            self.out.push_str("/>\n");
-                        }
-                        DirectTilingTarget::Stroke { d, style } => {
-                            let _ = write!(
-                                self.out,
-                                "<path d=\"{d}\" fill=\"none\" stroke=\"url(#p{pat_id})\""
-                            );
-                            push_opacity(&mut self.out, "stroke-opacity", eff_alpha);
-                            if let Some(name) = blend_css(*blend_mode) {
-                                let _ = write!(self.out, " style=\"mix-blend-mode:{name};\"");
-                            }
-                            push_stroke_attrs(&mut self.out, style, self.scale);
-                            if let Some(c) = self.clip {
-                                let _ = write!(self.out, " clip-path=\"url(#c{c})\"");
-                            }
-                            if let Some(m) = leaf_mask {
-                                let _ = write!(self.out, " mask=\"url(#m{m})\"");
-                            }
-                            self.out.push_str("/>\n");
-                        }
-                        DirectTilingTarget::Type3Mask { .. } => {
-                            self.out.push_str("<rect x=\"0\" y=\"0\" width=\"");
-                            push_num(&mut self.out, self.page_width);
-                            self.out.push_str("\" height=\"");
-                            push_num(&mut self.out, self.page_height);
-                            let _ = write!(self.out, "\" fill=\"url(#p{pat_id})\"");
-                            if let Some(m) = leaf_mask {
-                                let _ = write!(self.out, " mask=\"url(#m{m})\"");
-                            }
-                            push_opacity(&mut self.out, "fill-opacity", eff_alpha);
-                            if let Some(name) = blend_css(*blend_mode) {
-                                let _ = write!(self.out, " style=\"mix-blend-mode:{name};\"");
-                            }
-                            self.out.push_str("/>\n");
-                        }
-                    }
+        let (before, after, ix0, iy0, rw, rh, bs, covers_whole_page) = {
+            let Some(state) = self.backdrop_cpu.as_mut() else {
+                return false;
+            };
+            if state.exhausted || state.renderer.is_over_budget() {
+                state.exhausted = true;
+                self.over_budget = true;
+                return true;
+            }
+            if state.cursor > cmd_idx {
+                return false;
+            }
+            while state.cursor < cmd_idx {
+                let _ = state.renderer.execute(&self.page_commands[state.cursor]);
+                state.cursor += 1;
+                if state.renderer.is_over_budget() {
+                    state.exhausted = true;
+                    self.over_budget = true;
+                    return true;
                 }
             }
+            let bs = state.scale;
+            let ix0 = (affected.x0 * bs).floor().clamp(0.0, state.width as f64) as u32;
+            let ix1 = (affected.x1 * bs).ceil().clamp(0.0, state.width as f64) as u32;
+            let iy0 = (affected.y0 * bs).floor().clamp(0.0, state.height as f64) as u32;
+            let iy1 = (affected.y1 * bs).ceil().clamp(0.0, state.height as f64) as u32;
+            if ix1 <= ix0 || iy1 <= iy0 {
+                let _ = state.renderer.execute(&self.page_commands[cmd_idx]);
+                state.cursor = cmd_idx + 1;
+                return true;
+            }
+            let rw = ix1 - ix0;
+            let rh = iy1 - iy0;
+            let covers_whole_page = ix0 == 0 && iy0 == 0 && rw == state.width && rh == state.height;
+            let Some(before) = state.renderer.copy_subrect(ix0, iy0, rw, rh) else {
+                return false;
+            };
+            let _ = state.renderer.execute(&self.page_commands[cmd_idx]);
+            state.cursor = cmd_idx + 1;
+            if state.renderer.is_over_budget() {
+                state.exhausted = true;
+                self.over_budget = true;
+                return true;
+            }
+            let Some(after) = state.renderer.copy_subrect(ix0, iy0, rw, rh) else {
+                return false;
+            };
+            (before, after, ix0, iy0, rw, rh, bs, covers_whole_page)
+        };
+
+        // When at top level on an opaque page and the fallback covers the entire
+        // page with opaque pixels, replacing the occluded prior `<use>` tree with
+        // this single leaf `<image>` resets `backdrop_fanout` to 1 and prevents
+        // redundant evaluation of the occluded snapshots beneath it.
+        let replace_whole_page = covers_whole_page
+            && self.blend_depth == 0
+            && self.has_opaque_background
+            && after.as_chunks::<4>().0.iter().all(|px| px[3] == 255);
+        let rgba_data = if replace_whole_page {
+            after
+        } else {
+            let overlay = svg_compute_incremental_overlay(&before, &after);
+            if !overlay.as_chunks::<4>().0.iter().any(|px| px[3] > 0) {
+                return true;
+            }
+            overlay
+        };
+        let img = DecodedImage {
+            width: rw,
+            height: rh,
+            data: rgba_data,
+            has_alpha: !replace_whole_page,
+            is_image_mask: false,
+            premultiplied: false,
+        };
+        let Some(png) = encode_png(&img) else {
+            return false;
+        };
+
+        if replace_whole_page {
+            self.pending_backdrop = None;
+            self.disjoint_backdrop = None;
+            self.out.clear();
+            self.backdrop_fanout = 1;
+        } else {
+            self.flush_pending_backdrop();
+            self.flush_disjoint_backdrop();
         }
+        let x = ix0 as f64 / bs;
+        let y = iy0 as f64 / bs;
+        let w = if replace_whole_page {
+            self.page_width
+        } else {
+            rw as f64 / bs
+        };
+        let h = if replace_whole_page {
+            self.page_height
+        } else {
+            rh as f64 / bs
+        };
+        self.out.push_str("<image x=\"");
+        push_num(&mut self.out, x);
+        self.out.push_str("\" y=\"");
+        push_num(&mut self.out, y);
+        self.out.push_str("\" width=\"");
+        push_num(&mut self.out, w);
+        self.out.push_str("\" height=\"");
+        push_num(&mut self.out, h);
+        self.out
+            .push_str("\" preserveAspectRatio=\"none\" href=\"data:image/png;base64,");
+        push_base64(&mut self.out, &png);
+        self.out.push_str("\"/>\n");
+        true
     }
 
     /// Flush any open batch of backdrop-dependent filter steps into `self.out`
@@ -3494,15 +3569,9 @@ impl<'a> SvgWriter<'a> {
                         ) {
                             return;
                         }
-                        if self.non_isolated_filter_depth == 0
-                            && (self.pending_backdrop.is_some() || !self.out.is_empty())
-                            && (opacity >= 1.0 || !Self::ops_has_normal(&ops))
+                        if (self.pending_backdrop.is_some() || !self.out.is_empty())
+                            && self.emit_raster_backdrop_tiling_fallback(affected)
                         {
-                            self.emit_live_backdrop_direct_tiling_ops(
-                                &ops,
-                                DirectTilingTarget::Fill { d, rule },
-                                opacity,
-                            );
                             return;
                         }
                     }
@@ -3749,15 +3818,9 @@ impl<'a> SvgWriter<'a> {
                                 ) {
                                     return;
                                 }
-                                if self.non_isolated_filter_depth == 0
-                                    && (self.pending_backdrop.is_some() || !self.out.is_empty())
-                                    && (opacity >= 1.0 || !Self::ops_has_normal(&ops))
+                                if (self.pending_backdrop.is_some() || !self.out.is_empty())
+                                    && self.emit_raster_backdrop_tiling_fallback(affected)
                                 {
-                                    self.emit_live_backdrop_direct_tiling_ops(
-                                        &ops,
-                                        DirectTilingTarget::Stroke { d: &d, style },
-                                        opacity,
-                                    );
                                     return;
                                 }
                             }
@@ -4009,6 +4072,9 @@ impl<'a> SvgWriter<'a> {
         self.blend_depth = self.blend_depth.saturating_sub(1);
         if isolates {
             self.isolated_depth = self.isolated_depth.saturating_sub(1);
+        }
+        if !isolated {
+            self.svg_backdrop_diverged_depth = self.svg_backdrop_diverged_depth.saturating_sub(1);
         }
         if depth == 0 && blend_css(blend_mode).is_some() && self.pending_backdrop.is_some() {
             let ov_id = self.fresh_id();
@@ -4400,22 +4466,9 @@ impl<'a> SvgWriter<'a> {
                         return;
                     }
                     if single_pattern.is_none()
-                        && self.non_isolated_filter_depth == 0
                         && (self.pending_backdrop.is_some() || !self.out.is_empty())
-                        && (opacity >= 1.0 || !Self::ops_has_normal(&ops))
+                        && self.emit_raster_backdrop_tiling_fallback(affected)
                     {
-                        let mask_id = self.fresh_id();
-                        let _ = write!(
-                            self.defs,
-                            "<mask id=\"m{mask_id}\" maskUnits=\"userSpaceOnUse\">\n{shape_body}</mask>\n"
-                        );
-                        self.emit_live_backdrop_direct_tiling_ops(
-                            &ops,
-                            DirectTilingTarget::Type3Mask {
-                                shape_mask_id: mask_id,
-                            },
-                            opacity,
-                        );
                         return;
                     }
                     self.flush_pending_backdrop();
@@ -5022,6 +5075,94 @@ fn tinted(image: &DecodedImage, color: &Color) -> DecodedImage {
     out
 }
 
+fn svg_clamp_raster_scale(width_pt: f64, height_pt: f64, max_dim: f64, max_pixels: f64) -> f32 {
+    let mut scale = 1.0_f64;
+    let max_side = (width_pt * scale).max(height_pt * scale);
+    if max_side > max_dim {
+        scale *= max_dim / max_side;
+    }
+    let pixels = (width_pt * scale) * (height_pt * scale);
+    if pixels > max_pixels {
+        scale *= (max_pixels / pixels).sqrt();
+    }
+    (scale as f32).max(1e-4)
+}
+
+/// Solve for the straight RGBA8 overlay pixel `X` such that Porter-Duff
+/// `SourceOver(X, B) == F` (premultiplied `before`/`after`), leaving unchanged
+/// pixels transparent so surrounding SVG vector content stays untouched.
+fn svg_compute_incremental_overlay(before_premul: &[u8], after_premul: &[u8]) -> Vec<u8> {
+    let mut out = vec![0u8; before_premul.len()];
+    for ((b, f), dst) in before_premul
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(after_premul.as_chunks::<4>().0.iter())
+        .zip(out.as_chunks_mut::<4>().0.iter_mut())
+    {
+        if f == b {
+            continue;
+        }
+        let ba = b[3];
+        let fa = f[3];
+        if ba == 0 {
+            if fa == 0 {
+                continue;
+            }
+            if fa == 255 {
+                *dst = *f;
+            } else {
+                let a = fa as u32;
+                *dst = [
+                    ((f[0] as u32 * 255 + a / 2) / a).min(255) as u8,
+                    ((f[1] as u32 * 255 + a / 2) / a).min(255) as u8,
+                    ((f[2] as u32 * 255 + a / 2) / a).min(255) as u8,
+                    fa,
+                ];
+            }
+            continue;
+        }
+        if ba == 255 && fa == 255 {
+            *dst = *f;
+            continue;
+        }
+        if fa > ba {
+            let bf = ba as f32 / 255.0;
+            let ff = fa as f32 / 255.0;
+            let ax = ((ff - bf) / (1.0 - bf)).clamp(0.0, 1.0);
+            let inv_ax = 1.0 - ax;
+            let mut straight = [0u8; 3];
+            let mut valid = ax > 0.0;
+            const EPS: f32 = 2.0 / 255.0;
+            for c in 0..3 {
+                let bp = b[c] as f32 / 255.0;
+                let fp = f[c] as f32 / 255.0;
+                let px = fp - inv_ax * bp;
+                if px < -EPS || px > ax + EPS {
+                    valid = false;
+                    break;
+                }
+                let sc = (px.clamp(0.0, ax) / ax).clamp(0.0, 1.0);
+                straight[c] = (sc * 255.0 + 0.5).floor().min(255.0) as u8;
+            }
+            if valid {
+                let ax_u8 = (ax * 255.0 + 0.5).floor().clamp(1.0, 255.0) as u8;
+                *dst = [straight[0], straight[1], straight[2], ax_u8];
+                continue;
+            }
+        }
+        // Fallback when `F != B` cannot be expressed as SourceOver (e.g. alpha reduction).
+        let inv_fa = 255u32 - fa as u32;
+        *dst = [
+            (f[0] as u32 + inv_fa).min(255) as u8,
+            (f[1] as u32 + inv_fa).min(255) as u8,
+            (f[2] as u32 + inv_fa).min(255) as u8,
+            255,
+        ];
+    }
+    out
+}
+
 fn encode_png(image: &DecodedImage) -> Option<Vec<u8>> {
     let expected = (image.width as usize)
         .checked_mul(image.height as usize)?
@@ -5164,8 +5305,15 @@ mod tests {
                 background: None,
                 budget,
             };
-            let mut writer =
-                SvgWriter::new(page().page_rect, 100.0, 200.0, &fonts, &images, &options);
+            let mut writer = SvgWriter::new(
+                page().page_rect,
+                100.0,
+                200.0,
+                &[],
+                &fonts,
+                &images,
+                &options,
+            );
             writer.glyph_outlines.insert(
                 (0, 1),
                 Some(Rc::new(GlyphOutline {
@@ -5183,8 +5331,15 @@ mod tests {
             assert_eq!(writer.over_budget, budget.is_some());
             assert_eq!(writer.out.contains("<path"), budget.is_none());
 
-            let mut writer =
-                SvgWriter::new(page().page_rect, 100.0, 200.0, &fonts, &images, &options);
+            let mut writer = SvgWriter::new(
+                page().page_rect,
+                100.0,
+                200.0,
+                &[],
+                &fonts,
+                &images,
+                &options,
+            );
             let mut list = page();
             list.push(RenderCommand::FillPath {
                 path: rect_path(0.0, 0.0, 1.0, 1.0),
@@ -5215,7 +5370,15 @@ mod tests {
             background: None,
             budget: Some(std::time::Duration::ZERO),
         };
-        let mut writer = SvgWriter::new(page().page_rect, 100.0, 200.0, &fonts, &images, &options);
+        let mut writer = SvgWriter::new(
+            page().page_rect,
+            100.0,
+            200.0,
+            &[],
+            &fonts,
+            &images,
+            &options,
+        );
         writer.budget_checks = 63;
         assert!(writer.path_data(&rect_path(0.0, 0.0, 1.0, 1.0)).is_none());
         assert!(writer.over_budget);
@@ -8416,7 +8579,7 @@ mod tests {
         // must keep the resource cap AND preserve the live backdrop instead of
         // falling back to an isolated group (which would blend Darken(0.6)
         // against transparent -> 0.6 and jump from 0.4 (~102) to 0.6 (~153)).
-        let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 12.0, 12.0));
+        let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 150.0, 150.0));
         // 36 alternating Darken(0.6) + Lighten(0.4) pairs = 72 passes (> 64 flat
         // threshold and > full-page Letter filter primitive budget of 138 prims).
         for _ in 0..36 {
@@ -8424,12 +8587,12 @@ mod tests {
                 blend_mode: BlendMode::Darken,
                 isolated: true,
                 knockout: false,
-                bounds: Rect::new(0.0, 0.0, 12.0, 12.0),
+                bounds: Rect::new(0.0, 0.0, 150.0, 150.0),
                 alpha: 1.0,
                 mask: None,
             });
             cell.push(RenderCommand::FillPath {
-                path: rect_path(0.0, 0.0, 12.0, 12.0),
+                path: rect_path(0.0, 0.0, 150.0, 150.0),
                 rule: FillRule::NonZero,
                 paint: Paint::Solid(Color::rgb(0.6, 0.6, 0.6)),
                 alpha: 1.0,
@@ -8441,12 +8604,12 @@ mod tests {
                 blend_mode: BlendMode::Lighten,
                 isolated: true,
                 knockout: false,
-                bounds: Rect::new(0.0, 0.0, 12.0, 12.0),
+                bounds: Rect::new(0.0, 0.0, 150.0, 150.0),
                 alpha: 1.0,
                 mask: None,
             });
             cell.push(RenderCommand::FillPath {
-                path: rect_path(0.0, 0.0, 12.0, 12.0),
+                path: rect_path(0.0, 0.0, 150.0, 150.0),
                 rule: FillRule::NonZero,
                 paint: Paint::Solid(Color::rgb(0.4, 0.4, 0.4)),
                 alpha: 1.0,
@@ -8461,12 +8624,12 @@ mod tests {
             blend_mode: BlendMode::Darken,
             isolated: true,
             knockout: false,
-            bounds: Rect::new(0.0, 0.0, 12.0, 12.0),
+            bounds: Rect::new(0.0, 0.0, 150.0, 150.0),
             alpha: 1.0,
             mask: None,
         });
         cell.push(RenderCommand::FillPath {
-            path: rect_path(0.0, 0.0, 12.0, 12.0),
+            path: rect_path(0.0, 0.0, 150.0, 150.0),
             rule: FillRule::NonZero,
             paint: Paint::Solid(Color::rgb(0.6, 0.6, 0.6)),
             alpha: 1.0,
@@ -8476,9 +8639,9 @@ mod tests {
 
         let tiling = std::sync::Arc::new(zpdf_display_list::TilingPattern {
             commands: std::sync::Arc::new(cell),
-            bbox: Rect::new(0.0, 0.0, 12.0, 12.0),
-            x_step: 12.0,
-            y_step: 12.0,
+            bbox: Rect::new(0.0, 0.0, 150.0, 150.0),
+            x_step: 150.0,
+            y_step: 150.0,
             matrix: zpdf_core::Matrix::identity(),
             tiling_type: 1,
         });
@@ -8537,6 +8700,191 @@ mod tests {
         assert!(
             rgb.iter().all(|&c| (96..=108).contains(&c)),
             "6th overlapping dense full-page fill must stay at ~0.4 (~102), NOT jump to isolated 0.6 (~153), got {rgb:?}"
+        );
+    }
+
+    #[test]
+    fn dense_fallback_applies_fractional_opacity_once_and_does_not_duplicate_path() {
+        // On a white Letter page (612×792), 5 overlapping dense full-page fills
+        // exhaust `MAX_BACKDROP_FANOUT = 32`. The 6th fill is a 50%-opaque fill
+        // whose cell alternates 36 pairs of Darken(black) + Lighten(black) (72 passes)
+        // over a detailed 500-vertex boundary path.
+        // 6th fill: 50%-opaque fill with 70 alternating Darken(black) + Lighten(0.01)
+        // pairs = 140 non-identity passes (> full-page filter budget of 138 prims)
+        // over a detailed 500-vertex boundary path.
+        // - Per-pass opacity compounding would turn white into near-black (0.5^70 ≈ 0).
+        // - Applying opacity ONCE to the completed blend must yield ~50% gray (~128).
+        // - The detailed path must NOT be duplicated across the 140 passes.
+        let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 150.0, 150.0));
+        for _ in 0..70 {
+            cell.push(RenderCommand::PushBlendGroup {
+                blend_mode: BlendMode::Darken,
+                isolated: true,
+                knockout: false,
+                bounds: Rect::new(0.0, 0.0, 150.0, 150.0),
+                alpha: 1.0,
+                mask: None,
+            });
+            cell.push(RenderCommand::FillPath {
+                path: rect_path(0.0, 0.0, 150.0, 150.0),
+                rule: FillRule::NonZero,
+                paint: Paint::Solid(Color::black()),
+                alpha: 1.0,
+                overprint: None,
+            });
+            cell.push(RenderCommand::PopBlendGroup);
+
+            cell.push(RenderCommand::PushBlendGroup {
+                blend_mode: BlendMode::Lighten,
+                isolated: true,
+                knockout: false,
+                bounds: Rect::new(0.0, 0.0, 150.0, 150.0),
+                alpha: 1.0,
+                mask: None,
+            });
+            cell.push(RenderCommand::FillPath {
+                path: rect_path(0.0, 0.0, 150.0, 150.0),
+                rule: FillRule::NonZero,
+                paint: Paint::Solid(Color::rgb(0.01, 0.01, 0.01)),
+                alpha: 1.0,
+                overprint: None,
+            });
+            cell.push(RenderCommand::PopBlendGroup);
+        }
+        let dark_light_black = std::sync::Arc::new(zpdf_display_list::TilingPattern {
+            commands: std::sync::Arc::new(cell),
+            bbox: Rect::new(0.0, 0.0, 150.0, 150.0),
+            x_step: 150.0,
+            y_step: 150.0,
+            matrix: zpdf_core::Matrix::identity(),
+            tiling_type: 1,
+        });
+
+        // 72 non-identity near-white Darken(0.99)/Lighten(1.0) passes to genuinely
+        // exhaust MAX_BACKDROP_FANOUT = 32 across 5 overlapping full-page fills while
+        // leaving the Letter page white before the 6th fill.
+        let mut white_cell = DisplayList::new(Rect::new(0.0, 0.0, 150.0, 150.0));
+        for _ in 0..36 {
+            white_cell.push(RenderCommand::PushBlendGroup {
+                blend_mode: BlendMode::Darken,
+                isolated: true,
+                knockout: false,
+                bounds: Rect::new(0.0, 0.0, 150.0, 150.0),
+                alpha: 1.0,
+                mask: None,
+            });
+            white_cell.push(RenderCommand::FillPath {
+                path: rect_path(0.0, 0.0, 150.0, 150.0),
+                rule: FillRule::NonZero,
+                paint: Paint::Solid(Color::rgb(0.99, 0.99, 0.99)),
+                alpha: 1.0,
+                overprint: None,
+            });
+            white_cell.push(RenderCommand::PopBlendGroup);
+
+            white_cell.push(RenderCommand::PushBlendGroup {
+                blend_mode: BlendMode::Lighten,
+                isolated: true,
+                knockout: false,
+                bounds: Rect::new(0.0, 0.0, 150.0, 150.0),
+                alpha: 1.0,
+                mask: None,
+            });
+            white_cell.push(RenderCommand::FillPath {
+                path: rect_path(0.0, 0.0, 150.0, 150.0),
+                rule: FillRule::NonZero,
+                paint: Paint::Solid(Color::white()),
+                alpha: 1.0,
+                overprint: None,
+            });
+            white_cell.push(RenderCommand::PopBlendGroup);
+        }
+        let white_dense = std::sync::Arc::new(zpdf_display_list::TilingPattern {
+            commands: std::sync::Arc::new(white_cell),
+            bbox: Rect::new(0.0, 0.0, 150.0, 150.0),
+            x_step: 150.0,
+            y_step: 150.0,
+            matrix: zpdf_core::Matrix::identity(),
+            tiling_type: 1,
+        });
+
+        // Build a detailed 500-vertex boundary covering the interior of the page.
+        let mut detailed = Path::new();
+        detailed.move_to(Point::new(20.0, 20.0));
+        for i in 1..=250 {
+            let x = 20.0 + (i as f64 / 250.0) * 572.0;
+            let y = 20.0 + if i % 2 == 0 { 0.0 } else { 2.0 };
+            detailed.line_to(Point::new(x, y));
+        }
+        for i in (0..=250).rev() {
+            let x = 20.0 + (i as f64 / 250.0) * 572.0;
+            let y = 772.0 - if i % 2 == 0 { 0.0 } else { 2.0 };
+            detailed.line_to(Point::new(x, y));
+        }
+        detailed.close();
+
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 612.0, 792.0));
+        // 5 overlapping dense fills in [20..80]×[20..80] exhaust MAX_BACKDROP_FANOUT = 32.
+        for _ in 0..5 {
+            dl.push(RenderCommand::FillPath {
+                path: rect_path(20.0, 20.0, 80.0, 80.0),
+                rule: FillRule::NonZero,
+                paint: Paint::Tiling(std::sync::Arc::clone(&white_dense)),
+                alpha: 1.0,
+                overprint: None,
+            });
+        }
+        dl.push(RenderCommand::FillPath {
+            path: detailed,
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(dark_light_black),
+            alpha: 0.5,
+            overprint: None,
+        });
+
+        let svg = display_list_to_svg(
+            &dl,
+            &FontCache::new(),
+            &ImageCache::new(),
+            &SvgOptions::default(),
+        );
+        // Must hit the bounded raster overlay fallback (not repeat the 500-vertex path 140 times).
+        assert!(
+            svg.contains("href=\"data:image/png;base64,"),
+            "6th overlapping dense fill past MAX_BACKDROP_FANOUT must emit bounded raster overlay"
+        );
+        assert!(
+            svg.len() < 150_000,
+            "dense fallback must not duplicate detailed path across 140 passes (svg len = {})",
+            svg.len()
+        );
+        assert!(
+            !svg.contains("isolation:isolate"),
+            "fallback must not isolate against transparent"
+        );
+
+        let tree = resvg::usvg::Tree::from_data(svg.as_bytes(), &resvg::usvg::Options::default())
+            .expect("valid SVG");
+        let mut pixmap = resvg::tiny_skia::Pixmap::new(61, 79).expect("pixmap");
+        let sx = 61.0 / tree.size().width();
+        let sy = 79.0 / tree.size().height();
+        resvg::render(
+            &tree,
+            resvg::tiny_skia::Transform::from_scale(sx, sy),
+            &mut pixmap.as_mut(),
+        );
+        let mid = pixmap.pixel(30, 40).expect("in bounds");
+        let rgb = [mid.red(), mid.green(), mid.blue()];
+        assert!(
+            rgb.iter().all(|&c| (120..=136).contains(&c)),
+            "50%-opaque alternating Darken(black)/Lighten(black) over white must produce ~50% gray (~128), not compounded black, got {rgb:?}"
+        );
+        // Margin outside the detailed path (x=5, y=5) must stay pure white.
+        let margin = pixmap.pixel(1, 1).expect("in bounds");
+        assert!(
+            margin.red() > 245 && margin.green() > 245 && margin.blue() > 245,
+            "margin outside detailed path must stay white, got {:?}",
+            [margin.red(), margin.green(), margin.blue()]
         );
     }
 }

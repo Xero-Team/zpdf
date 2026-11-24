@@ -6391,6 +6391,61 @@ impl<'a> ContentInterpreter<'a> {
         Some(std::sync::Arc::new(pattern))
     }
 
+    /// Emit a glyph run with an explicit paint (solid colour or `Paint::Tiling`
+    /// for outline-less Type 3 glyphs).
+    fn emit_glyph_run_with_paint(
+        &mut self,
+        font_id: FontId,
+        font_size: f32,
+        glyphs: Vec<PositionedGlyph>,
+        transform: Matrix,
+        h_scale: f32,
+        paint: Paint,
+    ) {
+        let overprint =
+            self.overprint_descriptor(self.current.fill_overprint, self.current.fill_colorant);
+        let cmd = RenderCommand::DrawGlyphRun(GlyphRun {
+            font_id,
+            font_size,
+            glyphs,
+            paint,
+            alpha: self.current.fill_alpha,
+            overprint,
+            transform,
+            h_scale,
+        });
+        self.emit_painted(cmd);
+    }
+
+    /// Emit a glyph run using the active nonstroking paint, passing through a
+    /// tiling pattern when active (for Type 3 fonts that cannot clip via outlines).
+    fn emit_glyph_run_with_fill_paint(
+        &mut self,
+        font_id: FontId,
+        font_size: f32,
+        glyphs: Vec<PositionedGlyph>,
+        transform: Matrix,
+        h_scale: f32,
+    ) {
+        if let Some(PatternPaint::Tiling(def)) = self.current.fill_pattern.clone() {
+            if self.oc_suppressed() {
+                return;
+            }
+            if let Some(tiling) = self.build_tiling_pattern_paint(&def, self.current.fill_color) {
+                self.emit_glyph_run_with_paint(
+                    font_id,
+                    font_size,
+                    glyphs,
+                    transform,
+                    h_scale,
+                    Paint::Tiling(tiling),
+                );
+                return;
+            }
+        }
+        self.emit_solid_glyph_run(font_id, font_size, glyphs, transform, h_scale);
+    }
+
     /// Emit a solid-colour glyph run (the non-pattern path, and the fallback
     /// when a tiling text pattern cannot be replicated).
     fn emit_solid_glyph_run(
@@ -6404,19 +6459,14 @@ impl<'a> ContentInterpreter<'a> {
         // GlyphRun is a fill operation. Stroke modes use actual outline paths;
         // Type3 CharProcs retain their ordinary nonstroking paint.
         let paint_color = self.current.fill_color;
-        let overprint =
-            self.overprint_descriptor(self.current.fill_overprint, self.current.fill_colorant);
-        let cmd = RenderCommand::DrawGlyphRun(GlyphRun {
+        self.emit_glyph_run_with_paint(
             font_id,
             font_size,
             glyphs,
-            paint: Paint::Solid(paint_color),
-            alpha: self.current.fill_alpha,
-            overprint,
             transform,
             h_scale,
-        });
-        self.emit_painted(cmd);
+            Paint::Solid(paint_color),
+        );
     }
 
     /// CAD output can show text under a font leaked from another text block.
@@ -7367,7 +7417,10 @@ impl<'a> ContentInterpreter<'a> {
                 }
                 // A Pattern colour space on the active paint (fill for modes
                 // 0/2/4/6, stroke for 1/5) clips the pattern to the glyph
-                // outlines instead of painting a solid run.
+                // outlines instead of painting a solid run, or passes
+                // `Paint::Tiling` directly on `DrawGlyphRun` for outline-less
+                // Type 3 fonts.
+                let mut tiling_paint: Option<std::sync::Arc<TilingPattern>> = None;
                 let painted = match (text_pattern, glyph_clip) {
                     (Some(PatternPaint::Shading(def)), Some((clip_path, bounds))) => {
                         self.display_list.push(RenderCommand::PushClip {
@@ -7384,6 +7437,7 @@ impl<'a> ContentInterpreter<'a> {
                         } else if let Some(tiling) =
                             self.build_tiling_pattern_paint(&def, self.current.fill_color)
                         {
+                            tiling_paint = Some(std::sync::Arc::clone(&tiling));
                             // Pad to integer coordinates outside `bounds` so the
                             // clipped fill has 100% coverage on every anti-aliased
                             // glyph boundary pixel (no double-AA attenuation).
@@ -7412,6 +7466,64 @@ impl<'a> ContentInterpreter<'a> {
                             false
                         }
                     }
+                    (Some(PatternPaint::Tiling(def)), None) => {
+                        if self.oc_suppressed() {
+                            return;
+                        }
+                        let has_type3 = if let Some(runs) = &resolved_runs {
+                            runs.iter().any(|(id, _)| {
+                                self.font_cache
+                                    .as_ref()
+                                    .and_then(|c| c.get(*id))
+                                    .is_some_and(|f| f.is_type3())
+                            })
+                        } else {
+                            self.font_cache
+                                .as_ref()
+                                .and_then(|c| c.get(font_id))
+                                .is_some_and(|f| f.is_type3())
+                        };
+                        if has_type3 {
+                            if let Some(tiling) =
+                                self.build_tiling_pattern_paint(&def, self.current.fill_color)
+                            {
+                                if let Some(runs) = resolved_runs {
+                                    for (id, run_glyphs) in runs {
+                                        let is_type3 = self
+                                            .font_cache
+                                            .as_ref()
+                                            .and_then(|c| c.get(id))
+                                            .is_some_and(|f| f.is_type3());
+                                        if is_type3 {
+                                            self.emit_glyph_run_with_paint(
+                                                id,
+                                                font_size,
+                                                run_glyphs,
+                                                combined,
+                                                h_scale,
+                                                Paint::Tiling(std::sync::Arc::clone(&tiling)),
+                                            );
+                                        } else {
+                                            self.emit_solid_glyph_run(
+                                                id, font_size, run_glyphs, combined, h_scale,
+                                            );
+                                        }
+                                    }
+                                } else {
+                                    self.emit_glyph_run_with_paint(
+                                        font_id,
+                                        font_size,
+                                        glyphs,
+                                        combined,
+                                        h_scale,
+                                        Paint::Tiling(tiling),
+                                    );
+                                }
+                                return;
+                            }
+                        }
+                        false
+                    }
                     _ => false,
                 };
                 if !painted {
@@ -7424,13 +7536,30 @@ impl<'a> ContentInterpreter<'a> {
                     }
                 } else if let Some(runs) = resolved_runs {
                     // Runs without outlines (Type3 CharProcs) lie outside the
-                    // pattern clip; paint them solid, as a Type3-only run is.
+                    // pattern clip; pass any selected tiling paint through to
+                    // Type 3 runs so bitmap/vector CharProcs receive the pattern.
                     for ((id, glyphs), _) in runs
                         .into_iter()
                         .zip(outline_less_runs)
                         .filter(|(_, outline_less)| *outline_less)
                     {
-                        self.emit_solid_glyph_run(id, font_size, glyphs, combined, h_scale);
+                        let is_type3 = self
+                            .font_cache
+                            .as_ref()
+                            .and_then(|c| c.get(id))
+                            .is_some_and(|f| f.is_type3());
+                        if let Some(tiling) = tiling_paint.as_ref().filter(|_| is_type3) {
+                            self.emit_glyph_run_with_paint(
+                                id,
+                                font_size,
+                                glyphs,
+                                combined,
+                                h_scale,
+                                Paint::Tiling(std::sync::Arc::clone(tiling)),
+                            );
+                        } else {
+                            self.emit_solid_glyph_run(id, font_size, glyphs, combined, h_scale);
+                        }
                     }
                 }
             }
@@ -7453,7 +7582,7 @@ impl<'a> ContentInterpreter<'a> {
             .and_then(|c| c.get(font_id))
             .is_some_and(|font| font.is_type3());
         if type3 {
-            self.emit_solid_glyph_run(font_id, font_size, glyphs, transform, h_scale);
+            self.emit_glyph_run_with_fill_paint(font_id, font_size, glyphs, transform, h_scale);
             return;
         }
         let fill = matches!(self.current.render_mode, 2 | 6);
@@ -11388,5 +11517,63 @@ mod tests {
             .with_clip_elision_scale(1.0)
             .interpret(b"q 0 0 2 1 re W n 0 -268435000 2 268435001 re W n 0 0 2 1 re f Q");
         assert_eq!(clip_counts_and_balance(&dl_safe), (1, 1, 0));
+    }
+
+    #[test]
+    fn type3_bitmap_glyph_with_tiling_pattern_emits_tiling_glyph_run() {
+        use std::sync::Arc;
+        use zpdf_font::{CidWidths, FontCache, LoadedFont, PdfFontType};
+
+        // Colored 8×8 tiling pattern painting red left half and blue right half.
+        let pat_stream = b"1 0 0 rg 0 0 4 8 re f 0 0 1 rg 4 0 4 8 re f";
+        let pat_obj = format!(
+            "<< /Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+             /BBox [0 0 8 8] /XStep 8 /YStep 8 /Length {} >>\nstream\n{}\nendstream",
+            pat_stream.len(),
+            std::str::from_utf8(pat_stream).unwrap(),
+        );
+        let file = single_object_file(&pat_obj);
+        let mut resources = ResourceDict::default();
+        resources.patterns.insert("P1".into(), ObjectId(1, 0));
+
+        // Type 3 bitmap font with 8×8 `/ImageMask true` stencil (top 4 rows ink).
+        let glyph_stream =
+            b"1 0 0 0 1 1 d1 BI /W 8 /H 8 /BPC 1 /IM true ID \x00\x00\x00\x00\xff\xff\xff\xff EI";
+        let mut fonts = FontCache::new();
+        fonts.insert(
+            "F1".into(),
+            LoadedFont::new_with_data(
+                PdfFontType::Type3 {
+                    font_matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                    char_procs: std::collections::HashMap::from([(
+                        "A".into(),
+                        Arc::<[u8]>::from(&glyph_stream[..]),
+                    )]),
+                    encoding: vec!["A".into()],
+                    widths: vec![1.0],
+                    first_char: b'A' as u16,
+                },
+                "Type3BitmapPat".into(),
+                Vec::new(),
+                CidWidths::new(1.0),
+            ),
+        );
+
+        let dl = ContentInterpreter::new(Rect::new(0.0, 0.0, 40.0, 40.0))
+            .with_document(&file, &resources)
+            .with_fonts(&mut fonts)
+            .interpret(b"/Pattern cs /P1 scn BT /F1 24 Tf 8 8 Td (A) Tj ET");
+
+        let has_tiling_run = dl.commands.iter().any(|cmd| {
+            matches!(
+                cmd,
+                RenderCommand::DrawGlyphRun(run) if matches!(run.paint, Paint::Tiling(_))
+            )
+        });
+        assert!(
+            has_tiling_run,
+            "Type 3 bitmap glyph shown under /Pattern cs /P1 scn must emit DrawGlyphRun with Paint::Tiling, got {:?}",
+            dl.commands
+        );
     }
 }

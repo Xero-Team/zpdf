@@ -2395,6 +2395,55 @@ impl<'a> CpuRenderer<'a> {
                     else {
                         continue;
                     };
+                    let uniform_opaque = (opacity >= 1.0)
+                        .then(|| {
+                            let (pxs, _) = pixmap.data().as_chunks::<4>();
+                            let first = *pxs.first()?;
+                            (first[3] == 255 && pxs.iter().all(|&p| p == first)).then_some(first)
+                        })
+                        .flatten();
+                    if let (Some(c), Some(ref mut target)) = (uniform_opaque, self.pixmap.as_mut())
+                    {
+                        if region_opaque
+                            && matches!(seg.blend_mode, BlendMode::Darken | BlendMode::Lighten)
+                        {
+                            let stride = target.width() as usize;
+                            let data = target.data_mut();
+                            let x0 = region.x0 as usize;
+                            let x1 = region.x1 as usize;
+                            let is_darken = seg.blend_mode == BlendMode::Darken;
+                            for y in region.y0 as usize..region.y1 as usize {
+                                let row = &mut data[(y * stride + x0) * 4..(y * stride + x1) * 4];
+                                let (dst_pxs, _) = row.as_chunks_mut::<4>();
+                                if is_darken {
+                                    for p in dst_pxs {
+                                        p[0] = p[0].min(c[0]);
+                                        p[1] = p[1].min(c[1]);
+                                        p[2] = p[2].min(c[2]);
+                                    }
+                                } else {
+                                    for p in dst_pxs {
+                                        p[0] = p[0].max(c[0]);
+                                        p[1] = p[1].max(c[1]);
+                                        p[2] = p[2].max(c[2]);
+                                    }
+                                }
+                            }
+                            painted = true;
+                            continue;
+                        }
+                        let solid = tiny_skia::Paint {
+                            shader: tiny_skia::Shader::SolidColor(tiny_skia::Color::from_rgba8(
+                                c[0], c[1], c[2], 255,
+                            )),
+                            blend_mode: Self::blend_mode_to_skia(seg.blend_mode),
+                            anti_alias: false,
+                            ..Default::default()
+                        };
+                        target.fill_rect(rect, &solid, tiny_skia::Transform::identity(), None);
+                        painted = true;
+                        continue;
+                    }
                     let paint = tiny_skia::Paint {
                         shader: tiny_skia::Pattern::new(
                             (*pixmap).as_ref(),
@@ -2528,7 +2577,11 @@ impl<'a> CpuRenderer<'a> {
             .saturating_add(1)
             .max(0) as usize;
         let overlap_count = overlap_nx.saturating_mul(overlap_ny);
-        let mut remaining_passes = MAX_DENSE_TILING_BLEND_PASSES;
+        let mut remaining_passes = if overlap_count > 1 {
+            MAX_DENSE_TILING_BLEND_PASSES
+        } else {
+            65_536
+        };
         let separate_copies = if overlap_count > 1 {
             let mut total_passes = 0usize;
             'count: for dj in overlap.dj.clone() {

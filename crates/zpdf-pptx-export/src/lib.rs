@@ -9,7 +9,7 @@ mod shape_recognizer;
 mod text_grouper;
 
 use image::ImageEncoder;
-use zpdf_core::{Rect, Result};
+use zpdf_core::{ProcessingDiagnostics, Rect, Result};
 use zpdf_display_list::{
     BlendMode, Color, DisplayList, FillRule, LineJoin, Overprint, Paint, Path, RenderCommand,
     StrokeStyle, TilingPattern,
@@ -193,7 +193,7 @@ fn display_list_to_slide_inner(
         options,
         elements: Vec::new(),
         image_counter: 0,
-        state_stack: Vec::new(),
+        clip_stack: Vec::new(),
         backdrop: None,
         render_budget,
     };
@@ -206,23 +206,9 @@ fn display_list_to_slide_inner(
     })
 }
 
-enum StateFrame {
-    Clip {
-        cmd_idx: usize,
-        cmd: RenderCommand,
-        bounds: Option<Rect>,
-    },
-    Blend {
-        cmd_idx: usize,
-        cmd: RenderCommand,
-        blend_mode: BlendMode,
-        knockout: bool,
-    },
-}
-
 /// Running full-page backdrop renderer advanced monotonically across slide
-/// commands so multiple backdrop-dependent patterns stay O(N) instead of
-/// replaying the entire prefix per pattern.
+/// commands on opaque white slide paper so page-level blend modes evaluate
+/// against the slide paper and multiple backdrop-dependent patterns stay O(N).
 struct BackdropState<'a> {
     renderer: CpuRenderer<'a>,
     cursor: usize,
@@ -234,28 +220,95 @@ struct BackdropState<'a> {
 
 struct SlideConverter<'a> {
     page_rect: Rect,
-    #[allow(dead_code)]
     page_index: usize,
     font_cache: &'a FontCache,
     image_cache: &'a ImageCache,
     options: &'a ConversionOptions,
     elements: Vec<SlideElement>,
     image_counter: usize,
-    /// Active clips and enclosing blend groups in exact nesting order, replayed
-    /// when rasterizing `Paint::Tiling` commands.
-    state_stack: Vec<StateFrame>,
-    /// Lazily initialized running slide backdrop for backdrop-dependent patterns.
+    /// Active top-level clip stack replayed when rasterizing `Paint::Tiling`
+    /// commands or pattern-containing blend groups.
+    clip_stack: Vec<(RenderCommand, Option<Rect>)>,
+    /// Lazily initialized running slide backdrop (on white slide paper) for
+    /// page-level backdrop-dependent patterns and non-isolated/blended groups.
     backdrop: Option<BackdropState<'a>>,
-    /// Optional render budget override (used by tests to verify over-budget rejection).
+    /// Optional render budget override (used by tests to verify timeout propagation).
     render_budget: Option<std::time::Duration>,
 }
 
 impl<'a> SlideConverter<'a> {
+    fn timeout_error(&self) -> zpdf_core::Error {
+        let mut diag = ProcessingDiagnostics::default();
+        diag.time_limit_reached = true;
+        diag.first_affected_page = Some(self.page_index);
+        zpdf_core::Error::IncompleteOutput(diag)
+    }
+
+    fn apply_clip_command(&mut self, cmd: &RenderCommand) {
+        match cmd {
+            RenderCommand::PushClip { path, .. } => {
+                let bounds = if path.is_empty() {
+                    Some(Rect::new(0.0, 0.0, 0.0, 0.0))
+                } else {
+                    path_bounds(path)
+                };
+                self.clip_stack.push((cmd.clone(), bounds));
+            }
+            RenderCommand::PushClipStroke { path, style } => {
+                let bounds = if path.is_empty() {
+                    Some(Rect::new(0.0, 0.0, 0.0, 0.0))
+                } else {
+                    stroke_bounds(path, style)
+                };
+                self.clip_stack.push((cmd.clone(), bounds));
+            }
+            RenderCommand::PopClip => {
+                self.clip_stack.pop();
+            }
+            _ => {}
+        }
+    }
+
     fn convert_commands(&mut self, commands: &[RenderCommand]) -> Result<()> {
-        for (idx, cmd) in commands.iter().enumerate() {
+        let mut idx = 0usize;
+        while idx < commands.len() {
+            let cmd = &commands[idx];
             match cmd {
+                RenderCommand::PushBlendGroup {
+                    blend_mode,
+                    isolated,
+                    knockout,
+                    alpha,
+                    mask,
+                    ..
+                } => {
+                    let end_idx = find_matching_pop_blend(commands, idx);
+                    let eff_alpha = if alpha.is_finite() {
+                        alpha.clamp(0.0, 1.0)
+                    } else {
+                        1.0
+                    };
+                    let is_passthrough = !*isolated
+                        && *blend_mode == BlendMode::Normal
+                        && eff_alpha >= 1.0
+                        && mask.is_none()
+                        && !*knockout;
+                    if !is_passthrough && slice_has_tiling(&commands[idx..=end_idx]) {
+                        self.rasterize_blend_group_as_unit(commands, idx, end_idx)?;
+                        for inner in &commands[idx..=end_idx] {
+                            self.apply_clip_command(inner);
+                        }
+                        idx = end_idx + 1;
+                        continue;
+                    }
+                    idx += 1;
+                }
+                RenderCommand::PopBlendGroup => {
+                    idx += 1;
+                }
                 RenderCommand::DrawGlyphRun(glyph_run) => {
                     self.convert_glyph_run(glyph_run)?;
+                    idx += 1;
                 }
                 RenderCommand::FillPath {
                     path,
@@ -265,6 +318,7 @@ impl<'a> SlideConverter<'a> {
                     overprint,
                 } => {
                     self.convert_fill_path(path, *rule, paint, *alpha, *overprint, commands, idx)?;
+                    idx += 1;
                 }
                 RenderCommand::StrokePath {
                     path,
@@ -276,63 +330,17 @@ impl<'a> SlideConverter<'a> {
                     self.convert_stroke_path(
                         path, style, paint, *alpha, *overprint, commands, idx,
                     )?;
+                    idx += 1;
                 }
                 RenderCommand::DrawImage(image_draw) => {
                     self.convert_image(image_draw)?;
+                    idx += 1;
                 }
-                RenderCommand::PushClip { path, .. } => {
-                    let bounds = if path.is_empty() {
-                        Some(Rect::new(0.0, 0.0, 0.0, 0.0))
-                    } else {
-                        path_bounds(path)
-                    };
-                    self.state_stack.push(StateFrame::Clip {
-                        cmd_idx: idx,
-                        cmd: cmd.clone(),
-                        bounds,
-                    });
-                }
-                RenderCommand::PushClipStroke { path, style } => {
-                    let bounds = if path.is_empty() {
-                        Some(Rect::new(0.0, 0.0, 0.0, 0.0))
-                    } else {
-                        stroke_bounds(path, style)
-                    };
-                    self.state_stack.push(StateFrame::Clip {
-                        cmd_idx: idx,
-                        cmd: cmd.clone(),
-                        bounds,
-                    });
-                }
-                RenderCommand::PopClip => {
-                    if let Some(pos) = self
-                        .state_stack
-                        .iter()
-                        .rposition(|f| matches!(f, StateFrame::Clip { .. }))
-                    {
-                        self.state_stack.remove(pos);
-                    }
-                }
-                RenderCommand::PushBlendGroup {
-                    blend_mode,
-                    knockout,
-                    ..
-                } => {
-                    self.state_stack.push(StateFrame::Blend {
-                        cmd_idx: idx,
-                        cmd: cmd.clone(),
-                        blend_mode: *blend_mode,
-                        knockout: *knockout,
-                    });
-                }
-                RenderCommand::PopBlendGroup => {
-                    if let Some(pos) = self
-                        .state_stack
-                        .iter()
-                        .rposition(|f| matches!(f, StateFrame::Blend { .. }))
-                    {
-                        self.state_stack.remove(pos);
-                    }
+                RenderCommand::PushClip { .. }
+                | RenderCommand::PushClipStroke { .. }
+                | RenderCommand::PopClip => {
+                    self.apply_clip_command(cmd);
+                    idx += 1;
                 }
             }
         }
@@ -593,22 +601,9 @@ impl<'a> SlideConverter<'a> {
         }
     }
 
-    fn pattern_needs_backdrop(&self, tiling: &TilingPattern) -> bool {
-        tiling.is_backdrop_dependent()
-            || self.state_stack.iter().any(|frame| {
-                matches!(
-                    frame,
-                    StateFrame::Blend {
-                        blend_mode,
-                        knockout,
-                        ..
-                    } if *blend_mode != BlendMode::Normal || *knockout
-                )
-            })
-    }
-
-    /// Lazily initialize the running full-page backdrop renderer at a bounded
-    /// pixel budget so multiple backdrop-dependent patterns stay O(N).
+    /// Lazily initialize the running full-page backdrop renderer on opaque white
+    /// slide paper at a bounded pixel budget so page-level blend modes match
+    /// PDF white paper and multiple backdrop-dependent patterns stay O(N).
     fn ensure_backdrop(&mut self) -> Option<&mut BackdropState<'a>> {
         const MAX_BACKDROP_DIM: f64 = 2048.0;
         const MAX_BACKDROP_PIXELS: f64 = 4_194_304.0;
@@ -634,7 +629,7 @@ impl<'a> SlideConverter<'a> {
             let info = PageRenderInfo {
                 page_rect: page,
                 scale,
-                background: Color::rgba(0.0, 0.0, 0.0, 0.0),
+                background: Color::white(),
             };
             if renderer.begin_page(&info).is_err() {
                 return None;
@@ -657,28 +652,49 @@ impl<'a> SlideConverter<'a> {
     }
 
     /// Advance the running backdrop renderer monotonically up to `target_idx`.
-    /// Returns `false` if the renderer ran out of time budget (caller rejects
-    /// partial rasters).
-    fn advance_backdrop_to(&mut self, commands: &[RenderCommand], target_idx: usize) -> bool {
+    /// Propagates [`zpdf_core::Error::IncompleteOutput`] if the renderer exceeds
+    /// its render time budget so timed-out slides are never reported complete.
+    fn advance_backdrop_to(
+        &mut self,
+        commands: &[RenderCommand],
+        target_idx: usize,
+    ) -> Result<bool> {
+        let timeout_err = self.timeout_error();
         let Some(state) = self.ensure_backdrop() else {
-            return false;
+            return Ok(false);
         };
         if state.exhausted || state.renderer.is_over_budget() {
             state.exhausted = true;
-            return false;
+            return Err(timeout_err);
         }
         if state.cursor > target_idx {
-            return false;
+            return Ok(false);
         }
         while state.cursor < target_idx {
             let _ = state.renderer.execute(&commands[state.cursor]);
             state.cursor += 1;
             if state.renderer.is_over_budget() {
                 state.exhausted = true;
-                return false;
+                return Err(timeout_err);
             }
         }
-        true
+        Ok(true)
+    }
+
+    fn clip_bounds_to_page(&self, raw_bounds: Rect) -> Option<Rect> {
+        let mut bounds = intersect_rect(raw_bounds, self.page_rect)?;
+        for (_, clip_bounds) in &self.clip_stack {
+            if let Some(cb) = clip_bounds {
+                bounds = intersect_rect(bounds, *cb)?;
+            }
+        }
+        (bounds.x0.is_finite()
+            && bounds.y0.is_finite()
+            && bounds.x1.is_finite()
+            && bounds.y1.is_finite()
+            && bounds.width() > 0.0
+            && bounds.height() > 0.0)
+            .then_some(bounds)
     }
 
     fn emit_pattern_png(
@@ -709,62 +725,41 @@ impl<'a> SlideConverter<'a> {
         Ok(())
     }
 
-    /// Rasterize a clipped `Paint::Tiling` fill or stroke into a PNG
-    /// `SlideElement::Image` positioned at pixel-grid-aligned page bounds.
-    ///
-    /// - Carries enclosing `PushBlendGroup` state (soft masks, opacity, blend
-    ///   modes) alongside clips in exact nesting order.
-    /// - For backdrop-dependent patterns or enclosing non-Normal/knockout blend
-    ///   groups, advances a single running slide backdrop in O(N) total work,
-    ///   rejects over-budget partial rasters, and solves for the exact
-    ///   incremental SourceOver overlay so translucent backdrops underneath
-    ///   (including unpainted hatch gaps) are composited only once.
-    fn rasterize_pattern_command(
+    /// Rasterize a top-level `PushBlendGroup` `[start_idx..=end_idx]` containing
+    /// one or more `Paint::Tiling` commands as a single composited unit:
+    /// - Isolated Normal non-knockout groups render on a transparent buffer so
+    ///   all sibling marks accumulate together before applying group opacity/mask
+    ///   once (regardless of group length) while preserving group transparency.
+    /// - Non-isolated, non-Normal, or knockout groups execute once on the O(N)
+    ///   running white-paper slide backdrop and emit the exact incremental
+    ///   delta overlay so untouched translucent slide content is composited once.
+    fn rasterize_blend_group_as_unit(
         &mut self,
-        cmd: &RenderCommand,
-        raw_bounds: Rect,
-        tiling: &TilingPattern,
         commands: &[RenderCommand],
-        cmd_idx: usize,
+        start_idx: usize,
+        end_idx: usize,
     ) -> Result<()> {
         const MAX_PATTERN_DIM: f64 = 2048.0;
         const MAX_PATTERN_PIXELS: f64 = 4_194_304.0;
-        const MAX_INLINE_GROUP_REPLAY: usize = 32;
 
-        let mut bounds = match intersect_rect(raw_bounds, self.page_rect) {
-            Some(b) => b,
-            None => return Ok(()),
+        let (isolated, blend_mode, knockout) = match &commands[start_idx] {
+            RenderCommand::PushBlendGroup {
+                isolated,
+                blend_mode,
+                knockout,
+                ..
+            } => (*isolated, *blend_mode, *knockout),
+            _ => return Ok(()),
         };
-        for frame in &self.state_stack {
-            if let StateFrame::Clip {
-                bounds: Some(cb), ..
-            } = frame
-            {
-                match intersect_rect(bounds, *cb) {
-                    Some(b) => bounds = b,
-                    None => return Ok(()),
-                }
-            }
-        }
-        if !bounds.x0.is_finite()
-            || !bounds.y0.is_finite()
-            || !bounds.x1.is_finite()
-            || !bounds.y1.is_finite()
-            || bounds.width() <= 0.0
-            || bounds.height() <= 0.0
-        {
+        let Some(raw_bounds) = slice_draw_bounds(&commands[start_idx..=end_idx], self.page_rect)
+        else {
             return Ok(());
-        }
+        };
+        let Some(bounds) = self.clip_bounds_to_page(raw_bounds) else {
+            return Ok(());
+        };
 
-        let needs_backdrop = self.pattern_needs_backdrop(tiling);
-        let outer_blend_idx = self.state_stack.iter().find_map(|frame| match frame {
-            StateFrame::Blend { cmd_idx, .. } => Some(*cmd_idx),
-            StateFrame::Clip { .. } => None,
-        });
-
-        // Path A: pattern and enclosing groups do not depend on the slide backdrop
-        // (includes Normal tiles inside isolated/Normal soft-mask or opacity groups).
-        if !needs_backdrop {
+        if isolated && blend_mode == BlendMode::Normal && !knockout {
             let scale = clamp_raster_scale(
                 bounds.width(),
                 bounds.height(),
@@ -797,26 +792,29 @@ impl<'a> SlideConverter<'a> {
             if renderer.begin_page(&info).is_err() {
                 return Ok(());
             }
-            for frame in &self.state_stack {
-                match frame {
-                    StateFrame::Clip { cmd: c, .. } | StateFrame::Blend { cmd: c, .. } => {
-                        let _ = renderer.execute(c);
-                    }
+            for (clip_cmd, _) in &self.clip_stack {
+                let _ = renderer.execute(clip_cmd);
+            }
+            let mut open_blends = 0usize;
+            for cmd in &commands[start_idx..=end_idx] {
+                match cmd {
+                    RenderCommand::PushBlendGroup { .. } => open_blends += 1,
+                    RenderCommand::PopBlendGroup => open_blends = open_blends.saturating_sub(1),
+                    _ => {}
+                }
+                let _ = renderer.execute(cmd);
+                if renderer.is_over_budget() {
+                    return Err(self.timeout_error());
                 }
             }
-            let _ = renderer.execute(cmd);
-            for frame in self.state_stack.iter().rev() {
-                match frame {
-                    StateFrame::Clip { .. } => {
-                        let _ = renderer.execute(&RenderCommand::PopClip);
-                    }
-                    StateFrame::Blend { .. } => {
-                        let _ = renderer.execute(&RenderCommand::PopBlendGroup);
-                    }
-                }
+            for _ in 0..open_blends {
+                let _ = renderer.execute(&RenderCommand::PopBlendGroup);
+            }
+            for _ in &self.clip_stack {
+                let _ = renderer.execute(&RenderCommand::PopClip);
             }
             if renderer.is_over_budget() {
-                return Ok(());
+                return Err(self.timeout_error());
             }
             let Ok(mut rendered) = renderer.end_page() else {
                 return Ok(());
@@ -831,61 +829,16 @@ impl<'a> SlideConverter<'a> {
             );
         }
 
-        // Path B: top-level backdrop-dependent pattern — advance the running
-        // full-page backdrop renderer monotonically in O(N) total work.
-        let Some(outer_blend_idx) = outer_blend_idx else {
-            if !self.advance_backdrop_to(commands, cmd_idx) {
-                return Ok(());
-            }
-            let (ix0, iy0, rw, rh, placed_rect, bs) = {
-                let Some(state) = self.backdrop.as_ref() else {
-                    return Ok(());
-                };
-                let Some((ix0, iy0, rw, rh, placed_rect, _)) = snap_to_backdrop_grid(
-                    bounds,
-                    self.page_rect,
-                    state.scale,
-                    state.width,
-                    state.height,
-                ) else {
-                    return Ok(());
-                };
-                (ix0, iy0, rw, rh, placed_rect, state.scale)
-            };
-            let (before, after) = {
-                let Some(state) = self.backdrop.as_mut() else {
-                    return Ok(());
-                };
-                let Some(before) = state.renderer.copy_subrect(ix0, iy0, rw, rh) else {
-                    return Ok(());
-                };
-                let _ = state.renderer.execute(cmd);
-                state.cursor = cmd_idx + 1;
-                if state.renderer.is_over_budget() {
-                    state.exhausted = true;
-                    return Ok(());
-                }
-                let Some(after) = state.renderer.copy_subrect(ix0, iy0, rw, rh) else {
-                    return Ok(());
-                };
-                (before, after)
-            };
-            let overlay = compute_incremental_overlay(&before, &after);
-            return self.emit_pattern_png(&overlay, rw, rh, placed_rect, bs);
-        };
-
-        // Path C: backdrop-dependent pattern inside one or more enclosing
-        // `PushBlendGroup`s. Advance the running backdrop to `outer_blend_idx`
-        // (top-level), snapshot `base_before`, and evaluate the enclosing blend
-        // stack on a small seeded `snapped` raster.
-        if !self.advance_backdrop_to(commands, outer_blend_idx) {
+        // Non-isolated, non-Normal, or knockout group: execute once in the
+        // running white-paper slide backdrop (no command-count cutoff).
+        if !self.advance_backdrop_to(commands, start_idx)? {
             return Ok(());
         }
-        let (rw, rh, placed_rect, seed_page_rect, bs, base_before) = {
+        let (ix0, iy0, rw, rh, placed_rect, bs) = {
             let Some(state) = self.backdrop.as_ref() else {
                 return Ok(());
             };
-            let Some((ix0, iy0, rw, rh, placed_rect, seed_page_rect)) = snap_to_backdrop_grid(
+            let Some((ix0, iy0, rw, rh, placed_rect, _)) = snap_to_backdrop_grid(
                 bounds,
                 self.page_rect,
                 state.scale,
@@ -894,127 +847,164 @@ impl<'a> SlideConverter<'a> {
             ) else {
                 return Ok(());
             };
-            let Some(base_before) = state.renderer.copy_subrect(ix0, iy0, rw, rh) else {
+            (ix0, iy0, rw, rh, placed_rect, state.scale)
+        };
+        let timeout_err = self.timeout_error();
+        let (before, after) = {
+            let Some(state) = self.backdrop.as_mut() else {
                 return Ok(());
             };
-            (
-                rw,
-                rh,
-                placed_rect,
-                seed_page_rect,
-                state.scale,
-                base_before,
-            )
+            let Some(before) = state.renderer.copy_subrect(ix0, iy0, rw, rh) else {
+                return Ok(());
+            };
+            let mut open_blends = 0usize;
+            for cmd in &commands[start_idx..=end_idx] {
+                match cmd {
+                    RenderCommand::PushBlendGroup { .. } => open_blends += 1,
+                    RenderCommand::PopBlendGroup => open_blends = open_blends.saturating_sub(1),
+                    _ => {}
+                }
+                let _ = state.renderer.execute(cmd);
+                state.cursor += 1;
+                if state.renderer.is_over_budget() {
+                    state.exhausted = true;
+                    return Err(timeout_err);
+                }
+            }
+            for _ in 0..open_blends {
+                let _ = state.renderer.execute(&RenderCommand::PopBlendGroup);
+            }
+            if state.renderer.is_over_budget() {
+                state.exhausted = true;
+                return Err(timeout_err);
+            }
+            let Some(after) = state.renderer.copy_subrect(ix0, iy0, rw, rh) else {
+                return Ok(());
+            };
+            (before, after)
+        };
+        let overlay = compute_incremental_overlay(&before, &after);
+        self.emit_pattern_png(&overlay, rw, rh, placed_rect, bs)
+    }
+
+    /// Rasterize a top-level clipped `Paint::Tiling` fill or stroke into a PNG
+    /// `SlideElement::Image` positioned at pixel-grid-aligned page bounds.
+    ///
+    /// - Non-backdrop-dependent patterns render on a transparent snapped buffer
+    ///   to preserve exact straight alpha on antialiased edges.
+    /// - Backdrop-dependent patterns advance the single running white-paper
+    ///   slide backdrop monotonically in O(N) total work, propagate budget
+    ///   timeouts as `IncompleteOutput`, and emit only pixels modified by `cmd`
+    ///   so untouched translucent slide content (e.g. unpainted hatch gaps) is
+    ///   composited only once.
+    fn rasterize_pattern_command(
+        &mut self,
+        cmd: &RenderCommand,
+        raw_bounds: Rect,
+        tiling: &TilingPattern,
+        commands: &[RenderCommand],
+        cmd_idx: usize,
+    ) -> Result<()> {
+        const MAX_PATTERN_DIM: f64 = 2048.0;
+        const MAX_PATTERN_PIXELS: f64 = 4_194_304.0;
+
+        let Some(bounds) = self.clip_bounds_to_page(raw_bounds) else {
+            return Ok(());
         };
 
-        let group_slice = &commands[outer_blend_idx..cmd_idx];
-        let replay_full_group = group_slice.len() <= MAX_INLINE_GROUP_REPLAY
-            && group_slice.iter().any(|c| {
-                !matches!(
-                    c,
-                    RenderCommand::PushClip { .. }
-                        | RenderCommand::PushClipStroke { .. }
-                        | RenderCommand::PopClip
-                        | RenderCommand::PushBlendGroup { .. }
-                        | RenderCommand::PopBlendGroup
-                )
-            });
+        if !tiling.is_backdrop_dependent() {
+            let scale = clamp_raster_scale(
+                bounds.width(),
+                bounds.height(),
+                MAX_PATTERN_DIM,
+                MAX_PATTERN_PIXELS,
+            );
+            let s = scale as f64;
+            let px_w = (bounds.width() * s).ceil().max(1.0);
+            let px_h = (bounds.height() * s).ceil().max(1.0);
+            let snapped_w = px_w / s;
+            let snapped_h = px_h / s;
+            let x0 = if bounds.x0 + snapped_w <= self.page_rect.x1 {
+                bounds.x0
+            } else {
+                (self.page_rect.x1 - snapped_w).max(self.page_rect.x0)
+            };
+            let y1 = if bounds.y1 - snapped_h >= self.page_rect.y0 {
+                bounds.y1
+            } else {
+                (self.page_rect.y0 + snapped_h).min(self.page_rect.y1)
+            };
+            let snapped = Rect::new(x0, y1 - snapped_h, x0 + snapped_w, y1);
 
-        let eval_seeded = |include_cmd: bool| -> Option<Vec<u8>> {
             let mut renderer = self.make_renderer();
             let info = PageRenderInfo {
-                page_rect: seed_page_rect,
-                scale: bs as f32,
+                page_rect: snapped,
+                scale,
                 background: Color::rgba(0.0, 0.0, 0.0, 0.0),
             };
-            renderer.begin_page(&info).ok()?;
-            if !renderer.seed_pixmap(rw, rh, &base_before) {
-                return None;
+            if renderer.begin_page(&info).is_err() {
+                return Ok(());
             }
-            let mut open_frames: Vec<bool> = Vec::new(); // true = Blend, false = Clip
-            if replay_full_group {
-                for frame in &self.state_stack {
-                    if let StateFrame::Clip {
-                        cmd_idx: ci,
-                        cmd: c,
-                        ..
-                    } = frame
-                    {
-                        if *ci < outer_blend_idx {
-                            let _ = renderer.execute(c);
-                            open_frames.push(false);
-                        }
-                    }
-                }
-                for c in group_slice {
-                    match c {
-                        RenderCommand::PushClip { .. } | RenderCommand::PushClipStroke { .. } => {
-                            open_frames.push(false);
-                        }
-                        RenderCommand::PopClip => {
-                            if let Some(pos) = open_frames.iter().rposition(|&b| !b) {
-                                open_frames.remove(pos);
-                            }
-                        }
-                        RenderCommand::PushBlendGroup { .. } => {
-                            open_frames.push(true);
-                        }
-                        RenderCommand::PopBlendGroup => {
-                            if let Some(pos) = open_frames.iter().rposition(|&b| b) {
-                                open_frames.remove(pos);
-                            }
-                        }
-                        _ => {}
-                    }
-                    let _ = renderer.execute(c);
-                    if renderer.is_over_budget() {
-                        return None;
-                    }
-                }
-            } else {
-                for frame in &self.state_stack {
-                    match frame {
-                        StateFrame::Clip { cmd: c, .. } => {
-                            let _ = renderer.execute(c);
-                            open_frames.push(false);
-                        }
-                        StateFrame::Blend { cmd: c, .. } => {
-                            let _ = renderer.execute(c);
-                            open_frames.push(true);
-                        }
-                    }
-                }
+            for (clip_cmd, _) in &self.clip_stack {
+                let _ = renderer.execute(clip_cmd);
             }
-            if include_cmd {
-                let _ = renderer.execute(cmd);
-            }
-            for &is_blend in open_frames.iter().rev() {
-                if is_blend {
-                    let _ = renderer.execute(&RenderCommand::PopBlendGroup);
-                } else {
-                    let _ = renderer.execute(&RenderCommand::PopClip);
-                }
+            let _ = renderer.execute(cmd);
+            for _ in &self.clip_stack {
+                let _ = renderer.execute(&RenderCommand::PopClip);
             }
             if renderer.is_over_budget() {
-                return None;
+                return Err(self.timeout_error());
             }
-            renderer.end_page().ok().map(|p| p.data)
-        };
-
-        let before = if replay_full_group {
-            let Some(b) = eval_seeded(false) else {
+            let Ok(mut rendered) = renderer.end_page() else {
                 return Ok(());
             };
-            b
-        } else {
-            base_before.clone()
-        };
-        let Some(after) = eval_seeded(true) else {
-            return Ok(());
-        };
-        if before.len() != after.len() {
+            unpremultiply_rgba_in_place(&mut rendered.data);
+            return self.emit_pattern_png(
+                &rendered.data,
+                rendered.width,
+                rendered.height,
+                snapped,
+                s,
+            );
+        }
+
+        if !self.advance_backdrop_to(commands, cmd_idx)? {
             return Ok(());
         }
+        let (ix0, iy0, rw, rh, placed_rect, bs) = {
+            let Some(state) = self.backdrop.as_ref() else {
+                return Ok(());
+            };
+            let Some((ix0, iy0, rw, rh, placed_rect, _)) = snap_to_backdrop_grid(
+                bounds,
+                self.page_rect,
+                state.scale,
+                state.width,
+                state.height,
+            ) else {
+                return Ok(());
+            };
+            (ix0, iy0, rw, rh, placed_rect, state.scale)
+        };
+        let timeout_err = self.timeout_error();
+        let (before, after) = {
+            let Some(state) = self.backdrop.as_mut() else {
+                return Ok(());
+            };
+            let Some(before) = state.renderer.copy_subrect(ix0, iy0, rw, rh) else {
+                return Ok(());
+            };
+            let _ = state.renderer.execute(cmd);
+            state.cursor = cmd_idx + 1;
+            if state.renderer.is_over_budget() {
+                state.exhausted = true;
+                return Err(timeout_err);
+            }
+            let Some(after) = state.renderer.copy_subrect(ix0, iy0, rw, rh) else {
+                return Ok(());
+            };
+            (before, after)
+        };
         let overlay = compute_incremental_overlay(&before, &after);
         self.emit_pattern_png(&overlay, rw, rh, placed_rect, bs)
     }
@@ -1138,6 +1128,100 @@ fn path_bounds(path: &Path) -> Option<Rect> {
     }
     (x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite())
         .then(|| Rect::new(x0, y0, x1, y1))
+}
+
+fn find_matching_pop_blend(commands: &[RenderCommand], start_idx: usize) -> usize {
+    let mut depth = 0usize;
+    for (i, cmd) in commands.iter().enumerate().skip(start_idx) {
+        match cmd {
+            RenderCommand::PushBlendGroup { .. } => depth += 1,
+            RenderCommand::PopBlendGroup => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return i;
+                }
+            }
+            _ => {}
+        }
+    }
+    commands.len().saturating_sub(1)
+}
+
+fn slice_has_tiling(commands: &[RenderCommand]) -> bool {
+    commands.iter().any(|cmd| {
+        matches!(
+            cmd,
+            RenderCommand::FillPath {
+                paint: Paint::Tiling(_),
+                ..
+            } | RenderCommand::StrokePath {
+                paint: Paint::Tiling(_),
+                ..
+            } | RenderCommand::DrawGlyphRun(zpdf_display_list::GlyphRun {
+                paint: Paint::Tiling(_),
+                ..
+            })
+        )
+    })
+}
+
+fn union_rect(acc: Option<Rect>, r: Rect) -> Option<Rect> {
+    let r = r.normalize();
+    if !(r.x0.is_finite() && r.y0.is_finite() && r.x1.is_finite() && r.y1.is_finite()) {
+        return acc;
+    }
+    Some(match acc {
+        Some(a) => Rect::new(
+            a.x0.min(r.x0),
+            a.y0.min(r.y0),
+            a.x1.max(r.x1),
+            a.y1.max(r.y1),
+        ),
+        None => r,
+    })
+}
+
+fn slice_draw_bounds(commands: &[RenderCommand], page_rect: Rect) -> Option<Rect> {
+    let mut acc: Option<Rect> = None;
+    for cmd in commands {
+        match cmd {
+            RenderCommand::FillPath { path, .. } => {
+                if let Some(b) = path_bounds(path) {
+                    acc = union_rect(acc, b);
+                }
+            }
+            RenderCommand::StrokePath { path, style, .. } => {
+                if path_bounds(path).is_some() {
+                    let b = stroke_bounds(path, style).unwrap_or(page_rect);
+                    acc = union_rect(acc, b);
+                }
+            }
+            RenderCommand::DrawImage(img) => {
+                if img.transform.is_finite() {
+                    let corners = [
+                        zpdf_core::Point::new(0.0, 0.0).transform(&img.transform),
+                        zpdf_core::Point::new(1.0, 0.0).transform(&img.transform),
+                        zpdf_core::Point::new(0.0, 1.0).transform(&img.transform),
+                        zpdf_core::Point::new(1.0, 1.0).transform(&img.transform),
+                    ];
+                    let (mut x0, mut y0) = (f64::INFINITY, f64::INFINITY);
+                    let (mut x1, mut y1) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+                    for p in corners {
+                        x0 = x0.min(p.x);
+                        y0 = y0.min(p.y);
+                        x1 = x1.max(p.x);
+                        y1 = y1.max(p.y);
+                    }
+                    acc = union_rect(acc, Rect::new(x0, y0, x1, y1));
+                }
+            }
+            RenderCommand::DrawGlyphRun(_) => {
+                acc = union_rect(acc, page_rect);
+            }
+            _ => {}
+        }
+    }
+    acc
 }
 
 fn clamp_raster_scale(width_pt: f64, height_pt: f64, max_dim: f64, max_pixels: f64) -> f32 {
@@ -3220,8 +3304,9 @@ mod export_tests {
         );
 
         // 2) Zero render budget forces CpuRenderer over-budget immediately:
-        //    exporter must reject over-budget partial rasters (0 pattern PNGs).
-        let over_budget_slide = display_list_to_slide_inner(
+        //    exporter must surface IncompleteOutput (time_limit_reached) to the
+        //    caller instead of silently returning an incomplete slide.
+        let over_budget_err = display_list_to_slide_inner(
             &dl,
             0,
             &FontCache::new(),
@@ -3229,15 +3314,288 @@ mod export_tests {
             &ConversionOptions::default(),
             Some(std::time::Duration::ZERO),
         )
-        .expect("slide export with zero budget");
-        let over_budget_imgs = over_budget_slide
-            .elements
-            .iter()
-            .filter(|e| matches!(e.base(), SlideElement::Image { .. }))
-            .count();
-        assert_eq!(
-            over_budget_imgs, 0,
-            "over-budget partial rasters must be rejected, got {over_budget_imgs}"
+        .err();
+        assert!(
+            matches!(
+                over_budget_err,
+                Some(zpdf_core::Error::IncompleteOutput(ref d)) if d.time_limit_reached
+            ),
+            "over-budget timeout must surface IncompleteOutput to caller, got {over_budget_err:?}"
+        );
+    }
+
+    #[test]
+    fn overlapping_pattern_siblings_in_isolated_opacity_group_apply_opacity_once() {
+        use std::sync::Arc;
+        use zpdf_display_list::{BlendMode, FillRule, Path, TilingPattern};
+
+        // Opaque black 10×10 tile.
+        let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 10.0, 10.0));
+        let mut sq = Path::new();
+        sq.rect(Rect::new(0.0, 0.0, 10.0, 10.0));
+        cell.push(RenderCommand::FillPath {
+            path: sq,
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::black()),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let black_tile = Arc::new(TilingPattern {
+            commands: Arc::new(cell),
+            bbox: Rect::new(0.0, 0.0, 10.0, 10.0),
+            x_step: 10.0,
+            y_step: 10.0,
+            matrix: Matrix::identity(),
+            tiling_type: 1,
+        });
+
+        // Isolated Normal group at 50% opacity containing two overlapping
+        // opaque black patterned fills: [10..70]×[20..80] and [30..90]×[20..80].
+        // Overlap [30..70] must composite to 50% black (~128), NOT 75% black (~64).
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 100.0));
+        dl.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Normal,
+            isolated: true,
+            knockout: false,
+            bounds: Rect::new(0.0, 0.0, 100.0, 100.0),
+            alpha: 0.5,
+            mask: None,
+        });
+        let mut left = Path::new();
+        left.rect(Rect::new(10.0, 20.0, 70.0, 80.0));
+        dl.push(RenderCommand::FillPath {
+            path: left,
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(Arc::clone(&black_tile)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let mut right = Path::new();
+        right.rect(Rect::new(30.0, 20.0, 90.0, 80.0));
+        dl.push(RenderCommand::FillPath {
+            path: right,
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(black_tile),
+            alpha: 1.0,
+            overprint: None,
+        });
+        dl.push(RenderCommand::PopBlendGroup);
+
+        let slide = display_list_to_slide(
+            &dl,
+            0,
+            &FontCache::new(),
+            &ImageCache::new(),
+            &ConversionOptions::default(),
+        )
+        .expect("slide export");
+        let comp = composite_slide_over_white(&slide, 100.0, 100.0, 2.0);
+        // Non-overlapping left (x=20 -> px=40), overlap center (x=50 -> px=100),
+        // non-overlapping right (x=80 -> px=160), all at y=50 -> px=100.
+        for (label, px) in [
+            ("left-only", comp.get_pixel(40, 100)),
+            ("overlap", comp.get_pixel(100, 100)),
+            ("right-only", comp.get_pixel(160, 100)),
+        ] {
+            assert!(
+                (120..=136).contains(&px[0])
+                    && (120..=136).contains(&px[1])
+                    && (120..=136).contains(&px[2]),
+                "{label} inside isolated 50% group must be 50% black (~128), not 75% (~64), got {px:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn long_blend_group_preserves_painted_backdrop_past_32_commands() {
+        use std::sync::Arc;
+        use zpdf_display_list::{BlendMode, FillRule, Path, TilingPattern};
+
+        let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 10.0, 10.0));
+        cell.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Multiply,
+            isolated: true,
+            knockout: false,
+            bounds: Rect::new(0.0, 0.0, 10.0, 10.0),
+            alpha: 1.0,
+            mask: None,
+        });
+        let mut sq = Path::new();
+        sq.rect(Rect::new(0.0, 0.0, 10.0, 10.0));
+        cell.push(RenderCommand::FillPath {
+            path: sq,
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(0.5, 0.5, 0.5)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        cell.push(RenderCommand::PopBlendGroup);
+        let gray_mul = Arc::new(TilingPattern {
+            commands: Arc::new(cell),
+            bbox: Rect::new(0.0, 0.0, 10.0, 10.0),
+            x_step: 10.0,
+            y_step: 10.0,
+            matrix: Matrix::identity(),
+            tiling_type: 1,
+        });
+
+        for isolated in [true, false] {
+            let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 100.0));
+            dl.push(RenderCommand::PushBlendGroup {
+                blend_mode: BlendMode::Normal,
+                isolated,
+                knockout: false,
+                bounds: Rect::new(0.0, 0.0, 100.0, 100.0),
+                alpha: if isolated { 1.0 } else { 0.99 },
+                mask: None,
+            });
+            // Opaque blue background inside the group.
+            let mut bg = Path::new();
+            bg.rect(Rect::new(0.0, 0.0, 100.0, 100.0));
+            dl.push(RenderCommand::FillPath {
+                path: bg,
+                rule: FillRule::NonZero,
+                paint: Paint::Solid(Color::rgb(0.0, 0.0, 1.0)),
+                alpha: 1.0,
+                overprint: None,
+            });
+            // 50 detail marks elsewhere (well past the old 32-command cutoff).
+            for i in 0..50 {
+                let mut dot = Path::new();
+                let x = (i % 10) as f64 * 2.0;
+                let y = (i / 10) as f64 * 2.0;
+                dot.rect(Rect::new(x, y, x + 1.0, y + 1.0));
+                dl.push(RenderCommand::FillPath {
+                    path: dot,
+                    rule: FillRule::NonZero,
+                    paint: Paint::Solid(Color::rgb(0.0, 1.0, 0.0)),
+                    alpha: 1.0,
+                    overprint: None,
+                });
+            }
+            // Gray Multiply tile over the blue region [40..80]×[40..80].
+            let mut fg = Path::new();
+            fg.rect(Rect::new(40.0, 40.0, 80.0, 80.0));
+            dl.push(RenderCommand::FillPath {
+                path: fg,
+                rule: FillRule::NonZero,
+                paint: Paint::Tiling(Arc::clone(&gray_mul)),
+                alpha: 1.0,
+                overprint: None,
+            });
+            dl.push(RenderCommand::PopBlendGroup);
+
+            let slide = display_list_to_slide(
+                &dl,
+                0,
+                &FontCache::new(),
+                &ImageCache::new(),
+                &ConversionOptions::default(),
+            )
+            .expect("slide export");
+            let comp = composite_slide_over_white(&slide, 100.0, 100.0, 2.0);
+            let center = comp.get_pixel(120, 80); // PDF (60, 60) -> px (120, 80)
+            assert!(
+                center[0] < 12 && center[1] < 12 && (120..=138).contains(&center[2]),
+                "isolated={isolated}: gray Multiply after 50+ commands over blue inside group must be dark blue [0,0,~128], not gray, got {center:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn page_level_screen_pattern_uses_white_paper_while_isolated_group_stays_transparent() {
+        use std::sync::Arc;
+        use zpdf_display_list::{BlendMode, FillRule, Path, TilingPattern};
+
+        // Opaque black Screen cell: over white slide paper Screen(1, 0) = white;
+        // inside an isolated child group (transparent backdrop), opaque black
+        // Screen renders opaque black.
+        let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 20.0, 20.0));
+        cell.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Screen,
+            isolated: true,
+            knockout: false,
+            bounds: Rect::new(0.0, 0.0, 20.0, 20.0),
+            alpha: 1.0,
+            mask: None,
+        });
+        let mut sq = Path::new();
+        sq.rect(Rect::new(0.0, 0.0, 20.0, 20.0));
+        cell.push(RenderCommand::FillPath {
+            path: sq,
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::black()),
+            alpha: 1.0,
+            overprint: None,
+        });
+        cell.push(RenderCommand::PopBlendGroup);
+        let black_screen = Arc::new(TilingPattern {
+            commands: Arc::new(cell),
+            bbox: Rect::new(0.0, 0.0, 20.0, 20.0),
+            x_step: 20.0,
+            y_step: 20.0,
+            matrix: Matrix::identity(),
+            tiling_type: 1,
+        });
+
+        // 1) Page-level opaque black Screen on an empty white slide must stay white.
+        let mut dl_page = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 100.0));
+        let mut r = Path::new();
+        r.rect(Rect::new(20.0, 20.0, 80.0, 80.0));
+        dl_page.push(RenderCommand::FillPath {
+            path: r.clone(),
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(Arc::clone(&black_screen)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let slide_page = display_list_to_slide(
+            &dl_page,
+            0,
+            &FontCache::new(),
+            &ImageCache::new(),
+            &ConversionOptions::default(),
+        )
+        .expect("slide export");
+        let comp_page = composite_slide_over_white(&slide_page, 100.0, 100.0, 2.0);
+        let px_page = comp_page.get_pixel(100, 100);
+        assert!(
+            px_page[0] > 245 && px_page[1] > 245 && px_page[2] > 245,
+            "page-level opaque black Screen on empty white slide must stay white, got {px_page:?}"
+        );
+
+        // 2) Same opaque black Screen inside an isolated Normal child group
+        //    must see transparent group backdrop and paint opaque black.
+        let mut dl_iso = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 100.0));
+        dl_iso.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Normal,
+            isolated: true,
+            knockout: false,
+            bounds: Rect::new(0.0, 0.0, 100.0, 100.0),
+            alpha: 1.0,
+            mask: None,
+        });
+        dl_iso.push(RenderCommand::FillPath {
+            path: r,
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(black_screen),
+            alpha: 1.0,
+            overprint: None,
+        });
+        dl_iso.push(RenderCommand::PopBlendGroup);
+        let slide_iso = display_list_to_slide(
+            &dl_iso,
+            0,
+            &FontCache::new(),
+            &ImageCache::new(),
+            &ConversionOptions::default(),
+        )
+        .expect("slide export");
+        let comp_iso = composite_slide_over_white(&slide_iso, 100.0, 100.0, 2.0);
+        let px_iso = comp_iso.get_pixel(100, 100);
+        assert!(
+            px_iso[0] < 10 && px_iso[1] < 10 && px_iso[2] < 10,
+            "opaque black Screen inside isolated child group must render opaque black, got {px_iso:?}"
         );
     }
 
