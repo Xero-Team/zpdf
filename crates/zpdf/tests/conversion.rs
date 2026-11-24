@@ -282,3 +282,55 @@ fn rich_conversion_bounds_dense_tiling_image_placements() {
         "truncating dense tiling placements must set resource_limit_reached"
     );
 }
+
+#[test]
+fn rich_conversion_bounds_dense_tiling_when_cell_image_is_clipped_out() {
+    // 10,000×10,000 = 100,000,000 cells whose image sits behind disjoint clips:
+    // `dl_contains_images` is true while every tile visit skips the image, so
+    // candidate visits themselves must be charged against the shared traversal
+    // budget and report `resource_limit_reached` instead of walking the grid.
+    let cell = stream(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 0.02 0.02] /XStep 0.02 /YStep 0.02 \
+         /Resources << /XObject << /Im1 6 0 R >> >>",
+        b"0 0 0.005 0.005 re W n \
+          0.01 0.01 0.005 0.005 re W n \
+          q 0.02 0 0 0.02 0 0 cm /Im1 Do Q",
+    );
+    let img = stream(
+        "/Type /XObject /Subtype /Image /Width 1 /Height 1 \
+         /ColorSpace /DeviceRGB /BitsPerComponent 8",
+        &[240, 20, 10],
+    );
+    let content = stream("", b"/Pattern cs /P0 scn 0 0 200 200 re f");
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
+          /Resources << /Pattern << /P0 5 0 R >> >> /Contents 4 0 R >>"
+            .to_vec(),
+        content,
+        cell,
+        img,
+    ]);
+
+    let doc = PdfDocument::open(pdf).expect("open pdf");
+    let rich = convert_pdf(
+        &doc,
+        &[0],
+        ConversionOptions {
+            mode: ConversionMode::Rich,
+            use_structure: false,
+        },
+    )
+    .expect("rich mode");
+    let page = &rich.pages[0];
+    assert!(
+        page.images.is_empty(),
+        "image behind disjoint clips must not yield placements"
+    );
+    assert!(
+        page.diagnostics.resource_limit_reached,
+        "exhausting tile visit budget on clipped dense pattern must set resource_limit_reached"
+    );
+}

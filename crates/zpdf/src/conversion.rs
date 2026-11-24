@@ -249,12 +249,14 @@ pub fn convert_pdf(
 
 const MAX_TILING_IMAGE_DEPTH: u8 = 8;
 const MAX_TILING_IMAGE_PLACEMENTS: usize = 4096;
+const MAX_TILING_IMAGE_VISITS: usize = 4096;
 
 struct ImageCollector<'a> {
     cache: &'a mut ImageCache,
     images: Vec<ConvertedImage>,
     positions: HashMap<u32, usize>,
     remaining_tiling_placements: usize,
+    remaining_tiling_visits: usize,
     truncated: bool,
 }
 
@@ -490,10 +492,12 @@ fn collect_tiling_images(
 
     'tiles: for j in j0..=j1 {
         for i in i0..=i1 {
-            if collector.remaining_tiling_placements == 0 {
+            if collector.remaining_tiling_placements == 0 || collector.remaining_tiling_visits == 0
+            {
                 collector.truncated = true;
                 break 'tiles;
             }
+            collector.remaining_tiling_visits -= 1;
             let tile_ctm = pat_to_page.concat(&Matrix::translate(
                 i as f64 * tiling.x_step,
                 j as f64 * tiling.y_step,
@@ -662,6 +666,7 @@ fn take_display_list_images(
         images: Vec::new(),
         positions: HashMap::new(),
         remaining_tiling_placements: MAX_TILING_IMAGE_PLACEMENTS,
+        remaining_tiling_visits: MAX_TILING_IMAGE_VISITS,
         truncated: false,
     };
     let page_rect = display_list.page_rect.normalize();
