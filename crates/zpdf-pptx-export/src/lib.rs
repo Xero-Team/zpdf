@@ -3292,7 +3292,9 @@ impl SoftMaskRebaser {
         let dy = mask.offset.1 as f64 + extra_dy;
         if self.is_unit_scale() {
             if dx == 0.0 && dy == 0.0 && !self.has_offset_in_list(&mask.commands) {
-                return (mask.clone(), true);
+                let mut reused = mask.clone();
+                reused.offset = (0.0, 0.0);
+                return (reused, true);
             }
             // Reuse CpuRenderer's native shared mask plane only when every
             // shift (outer and nested) is an exact whole device pixel so
@@ -10399,5 +10401,196 @@ mod export_tests {
             "wrappers past the child byte cap must not be cached, got {} entries",
             rebaser_b.translated_cache.len()
         );
+    }
+
+    #[test]
+    fn canceling_nested_soft_mask_offsets_match_zero_offset_rendering() {
+        let page_rect = Rect::new(0.0, 0.0, 100.0, 100.0);
+
+        let build_scene = |outer_offset: (f32, f32),
+                           inner_offset: (f32, f32),
+                           outer_fill_rect: Rect|
+         -> DisplayList {
+            let mut inner_dl = DisplayList::new(page_rect);
+            let mut inner_path = zpdf_display_list::Path::new();
+            inner_path.rect(Rect::new(20.0, 20.0, 60.0, 60.0));
+            inner_dl.push(RenderCommand::FillPath {
+                path: inner_path,
+                rule: zpdf_display_list::FillRule::NonZero,
+                paint: Paint::Solid(Color::white()),
+                alpha: 1.0,
+                overprint: None,
+            });
+
+            let mut outer_dl = DisplayList::new(page_rect);
+            outer_dl.push(RenderCommand::PushBlendGroup {
+                blend_mode: zpdf_display_list::BlendMode::Normal,
+                isolated: true,
+                knockout: false,
+                bounds: page_rect,
+                alpha: 1.0,
+                mask: Some(zpdf_display_list::SoftMask {
+                    kind: zpdf_display_list::SoftMaskKind::Alpha,
+                    commands: std::sync::Arc::new(inner_dl),
+                    offset: inner_offset,
+                    backdrop_luma: 0.0,
+                    transfer: None,
+                }),
+            });
+            let mut outer_path = zpdf_display_list::Path::new();
+            outer_path.rect(outer_fill_rect);
+            outer_dl.push(RenderCommand::FillPath {
+                path: outer_path,
+                rule: zpdf_display_list::FillRule::NonZero,
+                paint: Paint::Solid(Color::white()),
+                alpha: 1.0,
+                overprint: None,
+            });
+            outer_dl.push(RenderCommand::PopBlendGroup);
+
+            let mut dl = DisplayList::new(page_rect);
+            dl.push(RenderCommand::PushBlendGroup {
+                blend_mode: zpdf_display_list::BlendMode::Normal,
+                isolated: true,
+                knockout: false,
+                bounds: Rect::new(10.0, 10.0, 80.0, 80.0),
+                alpha: 1.0,
+                mask: Some(zpdf_display_list::SoftMask {
+                    kind: zpdf_display_list::SoftMaskKind::Alpha,
+                    commands: std::sync::Arc::new(outer_dl),
+                    offset: outer_offset,
+                    backdrop_luma: 0.0,
+                    transfer: None,
+                }),
+            });
+            let mut red = zpdf_display_list::Path::new();
+            red.rect(Rect::new(10.0, 10.0, 80.0, 80.0));
+            dl.push(RenderCommand::FillPath {
+                path: red,
+                rule: zpdf_display_list::FillRule::NonZero,
+                paint: Paint::Solid(Color::rgb(1.0, 0.0, 0.0)),
+                alpha: 1.0,
+                overprint: None,
+            });
+            dl.push(RenderCommand::PopBlendGroup);
+
+            // Trailing white Multiply patch covering [15..65]^2 to test the backdrop path too.
+            let mul_rect = Rect::new(15.0, 15.0, 65.0, 65.0);
+            dl.push(RenderCommand::PushBlendGroup {
+                blend_mode: zpdf_display_list::BlendMode::Multiply,
+                isolated: true,
+                knockout: false,
+                bounds: mul_rect,
+                alpha: 1.0,
+                mask: None,
+            });
+            let mut patch = zpdf_display_list::Path::new();
+            patch.rect(mul_rect);
+            dl.push(RenderCommand::FillPath {
+                path: patch,
+                rule: zpdf_display_list::FillRule::NonZero,
+                paint: Paint::Solid(Color::white()),
+                alpha: 1.0,
+                overprint: None,
+            });
+            dl.push(RenderCommand::PopBlendGroup);
+            dl
+        };
+
+        // Outer +8.25pt and inner -8.25pt cancel to net 0.0 on the inner mask [20..60]^2,
+        // while outer fill [10..70] shifts to [18.25..78.25] (covering [20..60]).
+        let dl_canceling =
+            build_scene((8.25, 0.0), (-8.25, 0.0), Rect::new(10.0, 10.0, 70.0, 70.0));
+        let dl_reference = build_scene((0.0, 0.0), (0.0, 0.0), Rect::new(18.25, 10.0, 78.25, 70.0));
+
+        let slide_canceling = display_list_to_slide(
+            &dl_canceling,
+            0,
+            &FontCache::new(),
+            &ImageCache::new(),
+            &ConversionOptions::default(),
+        )
+        .expect("canceling offset export");
+        let slide_reference = display_list_to_slide(
+            &dl_reference,
+            0,
+            &FontCache::new(),
+            &ImageCache::new(),
+            &ConversionOptions::default(),
+        )
+        .expect("reference zero-offset export");
+
+        assert_eq!(slide_canceling.elements.len(), 2);
+        assert_eq!(slide_reference.elements.len(), 2);
+
+        for (idx, pass_name) in [(0, "standalone"), (1, "backdrop")] {
+            let (
+                SlideElement::Image {
+                    x_emu: cx,
+                    y_emu: cy,
+                    width_emu: cw,
+                    height_emu: ch,
+                    image_data: c_png,
+                    ..
+                },
+                SlideElement::Image {
+                    x_emu: rx,
+                    y_emu: ry,
+                    width_emu: rw,
+                    height_emu: rh,
+                    image_data: r_png,
+                    ..
+                },
+            ) = (
+                &slide_canceling.elements[idx],
+                &slide_reference.elements[idx],
+            )
+            else {
+                panic!("{pass_name}: expected SlideElement::Image");
+            };
+            assert_eq!(
+                (*cx, *cy, *cw, *ch),
+                (*rx, *ry, *rw, *rh),
+                "{pass_name}: image placement must match zero-offset reference"
+            );
+            let c_rgba = image::load_from_memory(c_png).expect("decode").to_rgba8();
+            let r_rgba = image::load_from_memory(r_png).expect("decode").to_rgba8();
+            assert_eq!(c_rgba.dimensions(), r_rgba.dimensions());
+            assert_eq!(
+                c_rgba.as_raw(),
+                r_rgba.as_raw(),
+                "{pass_name}: canceling +8.25/-8.25 nested mask must render identically to zero-offset reference"
+            );
+            // Spot-check [54..58] (would be erased if stale -8.25 offset remained) and [18.5..19.5]
+            // (would be leaked if stale -8.25 offset remained).
+            let x_pt = *cx as f64 / 12700.0;
+            let y_pt = *cy as f64 / 12700.0;
+            let inside_px = c_rgba
+                .get_pixel(
+                    ((56.0 - x_pt) * 2.0).round() as u32,
+                    ((60.0 - y_pt) * 2.0).round() as u32,
+                )
+                .0;
+            assert_eq!(
+                inside_px,
+                [255, 0, 0, 255],
+                "{pass_name}: x=56 inside [20..60] must remain opaque red"
+            );
+            let outside_px = c_rgba
+                .get_pixel(
+                    ((19.0 - x_pt) * 2.0).round() as u32,
+                    ((60.0 - y_pt) * 2.0).round() as u32,
+                )
+                .0;
+            let expected_outside = if idx == 0 {
+                [0, 0, 0, 0]
+            } else {
+                [255, 255, 255, 255]
+            };
+            assert_eq!(
+                outside_px, expected_outside,
+                "{pass_name}: x=19 outside [20..60] must remain unmasked ({expected_outside:?})"
+            );
+        }
     }
 }
