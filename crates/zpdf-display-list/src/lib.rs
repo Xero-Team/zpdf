@@ -7,11 +7,14 @@ pub struct DisplayList {
     pub page_rect: Rect,
     /// Visual commands executed in order by render backends.
     ///
-    /// Callers that also retain [`Self::expanded_glyph_runs`] must treat
+    /// Callers that retain [`Self::expanded_glyph_runs`],
+    /// [`Self::pattern_ranges`], or [`Self::type3_glyph_ranges`] must treat
     /// `commands` as append-only while those ranges are live (do not insert,
     /// remove, or reorder entries before a recorded range). Call
-    /// [`Self::clear_expanded_glyph_runs`] before mutating `commands` in-place
-    /// so recorded ranges cannot silently refer to different commands.
+    /// [`Self::clear_command_ranges`] (or all three of
+    /// [`Self::clear_expanded_glyph_runs`], [`Self::clear_pattern_ranges`],
+    /// and [`Self::clear_type3_glyph_ranges`]) before mutating `commands`
+    /// in-place so recorded ranges cannot silently refer to different commands.
     pub commands: Vec<RenderCommand>,
     expanded_glyph_runs: Vec<ExpandedGlyphRun>,
     pattern_ranges: Vec<(usize, usize)>,
@@ -84,8 +87,19 @@ impl DisplayList {
         });
     }
 
-    /// Discard all recorded expanded glyph runs. Call before removing,
-    /// inserting, or reordering entries in `self.commands` in-place.
+    /// Discard all command-index-keyed ranges (`expanded_glyph_runs`,
+    /// `pattern_ranges`, and `type3_glyph_ranges`). Call before removing,
+    /// inserting, or reordering entries in `self.commands` in-place so
+    /// recorded ranges cannot silently refer to different commands.
+    pub fn clear_command_ranges(&mut self) {
+        self.expanded_glyph_runs.clear();
+        self.pattern_ranges.clear();
+        self.type3_glyph_ranges.clear();
+    }
+
+    /// Discard all recorded expanded glyph runs. When mutating `self.commands`
+    /// in-place, prefer [`Self::clear_command_ranges`] so pattern and Type 3
+    /// glyph ranges are invalidated as well.
     pub fn clear_expanded_glyph_runs(&mut self) {
         self.expanded_glyph_runs.clear();
     }
@@ -465,6 +479,26 @@ mod tests {
 
         dl.clear_expanded_glyph_runs();
         assert!(dl.expanded_glyph_runs().is_empty());
+    }
+
+    #[test]
+    fn clear_command_ranges_invalidates_all_indexed_ranges_for_in_place_edits() {
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 100.0));
+        for _ in 0..4 {
+            dl.push(RenderCommand::PopClip);
+        }
+        dl.push_expanded_glyph_run(0, 1, sample_glyph_run(1));
+        dl.push_type3_glyph_range(0, 1);
+        dl.push_pattern_range(2, 4);
+
+        dl.clear_command_ranges();
+        dl.commands.remove(0);
+
+        assert!(dl.expanded_glyph_runs().is_empty());
+        assert!(dl.type3_glyph_ranges().is_empty());
+        assert!(dl.pattern_ranges().is_empty());
+        assert!(!dl.is_in_type3_glyph_range(0));
+        assert!(!dl.is_in_pattern_range(2));
     }
 
     #[test]

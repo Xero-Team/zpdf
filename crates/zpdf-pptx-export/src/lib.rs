@@ -238,6 +238,7 @@ fn display_list_to_slide_internal<'a>(
         elements: Vec::new(),
         removed_element_slots: Vec::new(),
         native_only_texts: Vec::new(),
+        isolated_scope_stack: Vec::new(),
         image_counter: 0,
         clip_stack: Vec::new(),
         shared_clip_stack: None,
@@ -407,7 +408,9 @@ struct PendingTiledSnapshot<'a> {
 
 struct NativeOnlyTextRecord {
     element_idx: usize,
+    cmd_idx: usize,
     bounds: Option<Rect>,
+    resolved_rgb: (u8, u8, u8),
     is_opaque_black: bool,
     is_opaque_white: bool,
     occluded: bool,
@@ -720,6 +723,8 @@ struct SlideConverter<'a> {
     elements: Vec<SlideElement>,
     removed_element_slots: Vec<usize>,
     native_only_texts: Vec<NativeOnlyTextRecord>,
+    /// Active unflattened isolated Normal groups: `(body_start_idx, pop_idx, clip_stack_len_before_push)`.
+    isolated_scope_stack: Vec<(usize, usize, usize)>,
     image_counter: usize,
     clip_stack: Vec<&'a RenderCommand>,
     shared_clip_stack: Option<std::rc::Rc<[&'a RenderCommand]>>,
@@ -773,7 +778,7 @@ impl<'a> SlideConverter<'a> {
                         let range_has_overprint = entry.run.overprint.is_some()
                             || commands[entry.cmd_start.min(end)..end]
                                 .iter()
-                                .any(|c| command_overprint(c).is_some());
+                                .any(command_has_visible_overprint);
                         let run_bounds = expanded_run_bounds(entry, commands, self.font_cache);
                         let overlapped_by_later_blend =
                             later_non_normal_blends.overlaps_at_or_after(entry.cmd_end, run_bounds);
@@ -799,8 +804,17 @@ impl<'a> SlideConverter<'a> {
                 }
             }
             if let Some(end) = skipped_to {
-                for cmd in &commands[cmd_idx..end] {
+                for (offset, cmd) in commands[cmd_idx..end].iter().enumerate() {
                     self.track_clip(cmd);
+                    let idx = cmd_idx + offset;
+                    if matches!(cmd, RenderCommand::PopBlendGroup)
+                        && self
+                            .isolated_scope_stack
+                            .last()
+                            .is_some_and(|&(_, pop_idx, _)| pop_idx == idx)
+                    {
+                        self.isolated_scope_stack.pop();
+                    }
                 }
                 cmd_idx = end;
                 continue;
@@ -861,10 +875,17 @@ impl<'a> SlideConverter<'a> {
                         let uses_backdrop = group_uses_page_backdrop(group_slice, self.font_cache);
                         let backdrop =
                             uses_backdrop.then_some((commands.as_slice(), cmd_idx, end_idx));
+                        let group_clip_len = self.clip_stack.len();
                         self.flatten_commands_group(group_slice, mask.as_ref(), *bounds, backdrop)?;
                         for rel_idx in surviving_native_texts {
                             if let RenderCommand::DrawGlyphRun(run) = &group_slice[rel_idx] {
-                                self.emit_native_only_glyph_run(run)?;
+                                self.emit_native_only_glyph_run(
+                                    commands,
+                                    cmd_idx + 1,
+                                    group_clip_len,
+                                    cmd_idx + rel_idx,
+                                    run,
+                                )?;
                             }
                         }
                         for cmd in group_slice {
@@ -876,7 +897,22 @@ impl<'a> SlideConverter<'a> {
                         cmd_idx = end_idx + 1;
                         continue;
                     }
+                } else if *isolated {
+                    if let Some(end_idx) = Self::find_matching_pop_blend(commands, cmd_idx) {
+                        self.isolated_scope_stack.push((
+                            cmd_idx + 1,
+                            end_idx,
+                            self.clip_stack.len(),
+                        ));
+                    }
                 }
+            } else if matches!(commands[cmd_idx], RenderCommand::PopBlendGroup)
+                && self
+                    .isolated_scope_stack
+                    .last()
+                    .is_some_and(|&(_, pop_idx, _)| pop_idx == cmd_idx)
+            {
+                self.isolated_scope_stack.pop();
             }
             if !self.clip_stack.is_empty() {
                 if let Some(g_end) = type3_glyph_range_starting_at(display_list, cmd_idx) {
@@ -952,19 +988,240 @@ impl<'a> SlideConverter<'a> {
         CommandBounds::Known(r)
     }
 
+    /// Resolve the final opaque `(r, g, b)` color of an overprinting outline-less
+    /// (`!has_font_data()`) glyph run against the active isolation scope's
+    /// backdrop. Succeeds when the overprint produces one uniform color across
+    /// the glyph run's bounds (including backdrop-independent opaque `K = 1`
+    /// black and uniform-color backgrounds such as cyan + `0.5 g` → dark cyan);
+    /// returns `Err` when the text spans a backdrop that would yield multiple
+    /// resolved colors.
+    fn resolve_native_only_overprint_paint(
+        &mut self,
+        all_commands: &[RenderCommand],
+        backdrop_start_idx: usize,
+        initial_clip_len: usize,
+        cmd_idx: usize,
+        glyph_run: &zpdf_display_list::GlyphRun,
+        op: zpdf_display_list::Overprint,
+    ) -> Result<((u8, u8, u8), f32)> {
+        use zpdf_render::{PageRenderInfo, RenderBackend};
+
+        let effective_alpha = effective_paint_alpha(&glyph_run.paint, glyph_run.alpha);
+        // Backdrop-independent fast path: opaque K=1 (or all 4 process colorants)
+        // resolves identically on every possible backdrop without rasterization.
+        if effective_alpha >= 1.0 - 1e-3
+            && ((op.paints(3) && op.cmyk[3] >= 1.0 - 1e-3) || op.active == 0b1111)
+        {
+            let rgb = resolve_overprint_color_on_rgb((255, 255, 255), &op, 1.0);
+            return Ok((rgb, 1.0));
+        }
+
+        let Some(bounds) = native_text_ink_bounds(glyph_run) else {
+            return Err(zpdf_core::Error::StreamDecode(
+                "PPTX overprinting native-only text has non-finite bounds and cannot resolve backdrop color".into(),
+            ));
+        };
+        let mut target_rect = match intersect_rect(bounds, self.page_rect) {
+            Some(r) => r,
+            None => {
+                // Off-page text: resolve against paper white.
+                let rgb = resolve_overprint_color_on_rgb((255, 255, 255), &op, effective_alpha);
+                return Ok((rgb, 1.0));
+            }
+        };
+        if let Some(tightened) = tighten_rect_to_clips(target_rect, &self.clip_stack) {
+            target_rect = tightened;
+        }
+
+        let uniform_resolved = if cmd_idx <= backdrop_start_idx {
+            resolve_overprint_color_on_rgb((255, 255, 255), &op, effective_alpha)
+        } else {
+            let max_dim = target_rect.width().max(target_rect.height());
+            let Some(scale) = fit_scale_to_max_dim(max_dim) else {
+                let rgb = resolve_overprint_color_on_rgb((255, 255, 255), &op, effective_alpha);
+                return Ok((rgb, 1.0));
+            };
+            let mut renderer = zpdf_render_cpu::CpuRenderer::new()
+                .with_fonts(self.font_cache)
+                .with_images(self.image_cache)
+                .with_render_budget(self.render_budget);
+            renderer
+                .begin_page(&PageRenderInfo {
+                    page_rect: target_rect,
+                    scale,
+                    background: zpdf_display_list::Color::white(),
+                })
+                .map_err(|e| {
+                    zpdf_core::Error::StreamDecode(format!("PPTX overprint backdrop resolve: {e}"))
+                })?;
+            let actual_scale = renderer.current_scale();
+            let mut rebaser =
+                SoftMaskRebaser::new(target_rect.x0, target_rect.y1, 1.0, 1.0, actual_scale)
+                    .with_target_rect(target_rect);
+
+            let clip_prefix_len = initial_clip_len.min(self.clip_stack.len());
+            for &clip in &self.clip_stack[..clip_prefix_len] {
+                let prepared = rebaser.prepare_command(clip);
+                let exec_res = renderer.execute(prepared.as_ref()).map_err(|e| {
+                    zpdf_core::Error::StreamDecode(format!("PPTX overprint backdrop resolve: {e}"))
+                });
+                if rebaser.take_needs_cpu_mask_cache_invalidation() {
+                    renderer.clear_soft_mask_cache();
+                }
+                drop(prepared);
+                exec_res?;
+            }
+
+            let mut non_passthrough_stack: Vec<bool> = Vec::new();
+            for prev_cmd in &all_commands[backdrop_start_idx..cmd_idx] {
+                match prev_cmd {
+                    RenderCommand::PushBlendGroup {
+                        blend_mode,
+                        isolated,
+                        knockout,
+                        alpha,
+                        mask,
+                        ..
+                    } => {
+                        let group_alpha = if alpha.is_finite() {
+                            alpha.clamp(0.0, 1.0)
+                        } else {
+                            0.0
+                        };
+                        let passthrough = !*isolated
+                            && !*knockout
+                            && *blend_mode == zpdf_display_list::BlendMode::Normal
+                            && group_alpha >= 1.0
+                            && mask.is_none();
+                        non_passthrough_stack.push(!passthrough);
+                    }
+                    RenderCommand::PopBlendGroup => {
+                        non_passthrough_stack.pop();
+                    }
+                    _ => {}
+                }
+                let prepared = rebaser.prepare_command(prev_cmd);
+                let exec_res = renderer.execute(prepared.as_ref()).map_err(|e| {
+                    zpdf_core::Error::StreamDecode(format!("PPTX overprint backdrop resolve: {e}"))
+                });
+                if rebaser.take_needs_cpu_mask_cache_invalidation() {
+                    renderer.clear_soft_mask_cache();
+                }
+                drop(prepared);
+                exec_res?;
+                if renderer.is_over_budget() {
+                    return Err(zpdf_core::Error::StreamDecode(
+                        "PPTX overprint backdrop resolve exceeded time budget".into(),
+                    ));
+                }
+            }
+            if non_passthrough_stack.iter().any(|&np| np) {
+                return Err(zpdf_core::Error::StreamDecode(
+                    "PPTX overprinting native-only text sits inside an unclosed non-passthrough group".into(),
+                ));
+            }
+            let Some((_, _, data)) = renderer.current_surface() else {
+                return Err(zpdf_core::Error::StreamDecode(
+                    "PPTX overprint backdrop surface unavailable".into(),
+                ));
+            };
+            let mut last_raw: Option<(u8, u8, u8)> = None;
+            let mut resolved_first: Option<(u8, u8, u8)> = None;
+            for px in data.as_chunks::<4>().0 {
+                if px[3] != 255 {
+                    return Err(zpdf_core::Error::StreamDecode(
+                        "PPTX overprinting native-only text without font outlines spans a translucent backdrop and cannot be rendered faithfully".into(),
+                    ));
+                }
+                let raw = (px[0], px[1], px[2]);
+                if last_raw == Some(raw) {
+                    continue;
+                }
+                last_raw = Some(raw);
+                let resolved = resolve_overprint_color_on_rgb(raw, &op, effective_alpha);
+                if let Some(first) = resolved_first {
+                    if resolved != first {
+                        return Err(zpdf_core::Error::StreamDecode(
+                            "PPTX overprinting native-only text without font outlines spans a non-uniform backdrop and cannot be rendered faithfully".into(),
+                        ));
+                    }
+                } else {
+                    resolved_first = Some(resolved);
+                }
+            }
+            resolved_first.unwrap_or_else(|| {
+                resolve_overprint_color_on_rgb((255, 255, 255), &op, effective_alpha)
+            })
+        };
+
+        // `CpuRenderer` skips earlier native-only `TextBox` elements in the same
+        // isolation scope; verify none of them would yield a different resolved
+        // overprint color inside `target_rect`.
+        for rec in &self.native_only_texts {
+            if rec.cmd_idx < backdrop_start_idx {
+                continue;
+            }
+            let overlaps = rec
+                .bounds
+                .is_none_or(|b| intersect_rect(b, target_rect).is_some());
+            if overlaps {
+                let over_text =
+                    resolve_overprint_color_on_rgb(rec.resolved_rgb, &op, effective_alpha);
+                if over_text != uniform_resolved {
+                    return Err(zpdf_core::Error::StreamDecode(
+                        "PPTX overprinting native-only text overlaps earlier native-only text with a different resolved color".into(),
+                    ));
+                }
+            }
+        }
+
+        Ok((uniform_resolved, 1.0))
+    }
+
     fn emit_native_only_glyph_run(
         &mut self,
+        all_commands: &[RenderCommand],
+        backdrop_start_idx: usize,
+        initial_clip_len: usize,
+        cmd_idx: usize,
         glyph_run: &zpdf_display_list::GlyphRun,
     ) -> Result<()> {
         let bounds = native_text_ink_bounds(glyph_run);
-        let is_opaque_black = glyph_run_is_opaque_black(glyph_run);
-        let is_opaque_white = glyph_run_is_opaque_white(glyph_run);
+        let (paint_override, resolved_rgb, is_opaque_black, is_opaque_white) = if let Some(op) =
+            glyph_run.overprint.filter(|op| op.active != 0)
+        {
+            let (rgb, alpha) = self.resolve_native_only_overprint_paint(
+                all_commands,
+                backdrop_start_idx,
+                initial_clip_len,
+                cmd_idx,
+                glyph_run,
+                op,
+            )?;
+            let is_black =
+                alpha >= 1.0 - 1e-3 && rgb == (0, 0, 0) && op.paints(3) && op.cmyk[3] >= 1.0 - 1e-3;
+            let is_white = alpha >= 1.0 - 1e-3 && rgb == (255, 255, 255);
+            (Some((rgb, alpha)), rgb, is_black, is_white)
+        } else {
+            let rgb = match &glyph_run.paint {
+                zpdf_display_list::Paint::Solid(c) => color_to_rgb_u8(c),
+                _ => (0, 0, 0),
+            };
+            (
+                None,
+                rgb,
+                glyph_run_is_opaque_black(glyph_run),
+                glyph_run_is_opaque_white(glyph_run),
+            )
+        };
         self.note_paint_over_native_texts(bounds, None, is_opaque_black, is_opaque_white);
-        if self.convert_glyph_run(glyph_run, false)? {
+        if self.convert_glyph_run_with_paint(glyph_run, false, paint_override)? {
             let element_idx = self.elements.len() - 1;
             self.native_only_texts.push(NativeOnlyTextRecord {
                 element_idx,
+                cmd_idx,
                 bounds,
+                resolved_rgb,
                 is_opaque_black,
                 is_opaque_white,
                 occluded: false,
@@ -2221,7 +2478,18 @@ impl<'a> SlideConverter<'a> {
                         backdrop,
                     )?;
                 } else if !has_outlines {
-                    self.emit_native_only_glyph_run(glyph_run)?;
+                    let (backdrop_start_idx, initial_clip_len) = self
+                        .isolated_scope_stack
+                        .last()
+                        .map(|&(start, _, clip_len)| (start, clip_len))
+                        .unwrap_or((0, 0));
+                    self.emit_native_only_glyph_run(
+                        all_commands,
+                        backdrop_start_idx,
+                        initial_clip_len,
+                        cmd_idx,
+                        glyph_run,
+                    )?;
                 } else {
                     if !self.native_only_texts.is_empty() {
                         let bounds = match self.clipped_command_bounds(cmd) {
@@ -2429,6 +2697,7 @@ impl<'a> SlideConverter<'a> {
         &self,
         glyph_run: &zpdf_display_list::GlyphRun,
         require_verified_all: bool,
+        resolved_paint_override: Option<((u8, u8, u8), f32)>,
     ) -> Result<Option<SlideElement>> {
         use zpdf_display_list::Paint;
 
@@ -2443,7 +2712,9 @@ impl<'a> SlideConverter<'a> {
         if glyph_run.glyphs.is_empty() {
             return Ok(None);
         }
-        let effective_alpha = effective_paint_alpha(&glyph_run.paint, glyph_run.alpha);
+        let effective_alpha = resolved_paint_override
+            .map(|(_, a)| a)
+            .unwrap_or_else(|| effective_paint_alpha(&glyph_run.paint, glyph_run.alpha));
         if effective_alpha <= 0.0
             || (require_verified_all
                 && (effective_alpha < 1.0 - 1e-3 || glyph_run.overprint.is_some()))
@@ -2493,11 +2764,15 @@ impl<'a> SlideConverter<'a> {
             return Ok(None);
         }
 
-        // Extract color from paint
-        let color_rgb = match &glyph_run.paint {
-            Paint::Solid(c) => color_to_rgb_u8(c),
-            _ => (0, 0, 0), // Default to black for patterns/shadings
-        };
+        // Extract color from paint (or resolved overprint override)
+        let color_rgb = resolved_paint_override
+            .map(|(rgb, _)| rgb)
+            .unwrap_or_else(|| {
+                match &glyph_run.paint {
+                    Paint::Solid(c) => color_to_rgb_u8(c),
+                    _ => (0, 0, 0), // Default to black for patterns/shadings
+                }
+            });
 
         // Convert PDF coordinates (bottom-left origin) to PowerPoint (top-left origin)
         let matrix = &glyph_run.transform;
@@ -2556,7 +2831,18 @@ impl<'a> SlideConverter<'a> {
         glyph_run: &zpdf_display_list::GlyphRun,
         require_verified_all: bool,
     ) -> Result<bool> {
-        let Some(element) = self.prepare_glyph_run(glyph_run, require_verified_all)? else {
+        self.convert_glyph_run_with_paint(glyph_run, require_verified_all, None)
+    }
+
+    fn convert_glyph_run_with_paint(
+        &mut self,
+        glyph_run: &zpdf_display_list::GlyphRun,
+        require_verified_all: bool,
+        resolved_paint_override: Option<((u8, u8, u8), f32)>,
+    ) -> Result<bool> {
+        let Some(element) =
+            self.prepare_glyph_run(glyph_run, require_verified_all, resolved_paint_override)?
+        else {
             return Ok(false);
         };
         self.elements.push(element);
@@ -3182,20 +3468,36 @@ fn compute_isolated_inner_non_normal_blends(
     if !commands.iter().any(|c| {
         matches!(
             c,
-            RenderCommand::PushBlendGroup { blend_mode, .. }
-                if *blend_mode != zpdf_display_list::BlendMode::Normal
+            RenderCommand::PushBlendGroup {
+                blend_mode,
+                alpha,
+                ..
+            } if *blend_mode != zpdf_display_list::BlendMode::Normal
+                && alpha.is_finite()
+                && *alpha > 0.0
         ) || command_has_renderable_overprint(c, font_cache)
     }) {
         return flags;
     }
     let mut stack: Vec<(usize, bool, bool)> = Vec::new();
+    let mut zero_alpha_depth = 0usize;
     for (idx, cmd) in commands.iter().enumerate() {
         match cmd {
             RenderCommand::PushBlendGroup {
                 blend_mode,
                 isolated,
+                alpha,
                 ..
             } => {
+                let group_alpha = if alpha.is_finite() {
+                    alpha.clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                if zero_alpha_depth > 0 || group_alpha <= 0.0 {
+                    zero_alpha_depth += 1;
+                    continue;
+                }
                 let non_normal = *blend_mode != zpdf_display_list::BlendMode::Normal;
                 if non_normal {
                     if let Some((_, _, has_inner)) = stack.last_mut() {
@@ -3209,6 +3511,10 @@ fn compute_isolated_inner_non_normal_blends(
                 stack.push((idx, isolates_inner, false));
             }
             RenderCommand::PopBlendGroup => {
+                if zero_alpha_depth > 0 {
+                    zero_alpha_depth -= 1;
+                    continue;
+                }
                 if let Some((push_idx, isolates_inner, has_inner)) = stack.pop() {
                     flags[push_idx] = has_inner;
                     if has_inner && !isolates_inner {
@@ -3218,7 +3524,9 @@ fn compute_isolated_inner_non_normal_blends(
                     }
                 }
             }
-            other if command_has_renderable_overprint(other, font_cache) => {
+            other
+                if zero_alpha_depth == 0 && command_has_renderable_overprint(other, font_cache) =>
+            {
                 if let Some((_, _, has_inner)) = stack.last_mut() {
                     *has_inner = true;
                 }
@@ -3568,26 +3876,53 @@ impl NonNormalBlendIndex {
     }
 }
 
-fn command_overprint(cmd: &RenderCommand) -> Option<zpdf_display_list::Overprint> {
+fn command_has_visible_overprint(cmd: &RenderCommand) -> bool {
     match cmd {
-        RenderCommand::FillPath { overprint, .. } | RenderCommand::StrokePath { overprint, .. } => {
-            *overprint
+        RenderCommand::FillPath {
+            paint,
+            alpha,
+            overprint,
+            ..
         }
-        RenderCommand::DrawGlyphRun(run) => run.overprint,
-        _ => None,
+        | RenderCommand::StrokePath {
+            paint,
+            alpha,
+            overprint,
+            ..
+        } => effective_paint_alpha(paint, *alpha) > 0.0 && overprint.is_some(),
+        RenderCommand::DrawGlyphRun(run) => {
+            !run.glyphs.is_empty()
+                && effective_paint_alpha(&run.paint, run.alpha) > 0.0
+                && run.overprint.is_some()
+        }
+        _ => false,
     }
 }
 
-/// Whether `cmd` carries a partial-colorant overprint that `CpuRenderer` can
-/// actually rasterize. Metrics-only fonts without outline data (`!has_font_data()`)
-/// cannot be rasterized by `CpuRenderer` and must stay native `TextBox` elements.
+/// Whether `cmd` carries a visible partial-colorant overprint that `CpuRenderer`
+/// can actually rasterize. Fully transparent paint (`effective_paint_alpha <= 0`)
+/// and outline-less metrics-only fonts (`!has_font_data()`) do not contribute
+/// raster overprint pixels and must not force group flattening or artwork fallback.
 fn command_has_renderable_overprint(cmd: &RenderCommand, font_cache: &FontCache) -> bool {
     match cmd {
-        RenderCommand::FillPath { overprint, .. } | RenderCommand::StrokePath { overprint, .. } => {
-            overprint.is_some_and(|op| op.active != 0)
+        RenderCommand::FillPath {
+            paint,
+            alpha,
+            overprint,
+            ..
+        }
+        | RenderCommand::StrokePath {
+            paint,
+            alpha,
+            overprint,
+            ..
+        } => {
+            effective_paint_alpha(paint, *alpha) > 0.0 && overprint.is_some_and(|op| op.active != 0)
         }
         RenderCommand::DrawGlyphRun(run) => {
-            run.overprint.is_some_and(|op| op.active != 0)
+            !run.glyphs.is_empty()
+                && effective_paint_alpha(&run.paint, run.alpha) > 0.0
+                && run.overprint.is_some_and(|op| op.active != 0)
                 && font_cache
                     .get(run.font_id)
                     .is_some_and(|f| f.has_font_data())
@@ -3596,9 +3931,43 @@ fn command_has_renderable_overprint(cmd: &RenderCommand, font_cache: &FontCache)
     }
 }
 
+fn resolve_overprint_color_on_rgb(
+    bg_rgb: (u8, u8, u8),
+    op: &zpdf_display_list::Overprint,
+    alpha: f32,
+) -> (u8, u8, u8) {
+    let a = if alpha.is_finite() {
+        alpha.clamp(0.0, 1.0) as f64
+    } else {
+        0.0
+    };
+    let (bc, bm, by, bk) = zpdf_core::rgb_to_cmyk_naive(
+        bg_rgb.0 as f64 / 255.0,
+        bg_rgb.1 as f64 / 255.0,
+        bg_rgb.2 as f64 / 255.0,
+    );
+    let bd = [bc, bm, by, bk];
+    let mut res = [0.0f64; 4];
+    for i in 0..4 {
+        let tgt = if op.paints(i) {
+            if op.cmyk[i].is_finite() {
+                op.cmyk[i].clamp(0.0, 1.0) as f64
+            } else {
+                0.0
+            }
+        } else {
+            bd[i]
+        };
+        res[i] = bd[i] + a * (tgt - bd[i]);
+    }
+    let (rr, rg, rb) = zpdf_core::cmyk_to_rgb_naive(res[0], res[1], res[2], res[3]);
+    let enc = |v: f64| (v * 255.0).round().clamp(0.0, 255.0) as u8;
+    (enc(rr), enc(rg), enc(rb))
+}
+
 /// Whether flattening `cmds` depends on the already-painted page backdrop
-/// (a non-Normal blend group or renderable partial-colorant overprint not
-/// shielded by an enclosing isolated Normal group).
+/// (a visible non-Normal blend group or renderable partial-colorant overprint
+/// not shielded by an enclosing isolated Normal group).
 fn group_uses_page_backdrop(cmds: &[RenderCommand], font_cache: &FontCache) -> bool {
     let mut isolated_normal_depth = 0usize;
     for cmd in cmds {
@@ -3612,15 +3981,16 @@ fn group_uses_page_backdrop(cmds: &[RenderCommand], font_cache: &FontCache) -> b
                 ..
             } => {
                 if isolated_normal_depth == 0 {
-                    if *blend_mode != zpdf_display_list::BlendMode::Normal {
-                        return true;
-                    }
                     let group_alpha = if alpha.is_finite() {
                         alpha.clamp(0.0, 1.0)
                     } else {
                         0.0
                     };
-                    if *isolated || *knockout || group_alpha < 1.0 || mask.is_some() {
+                    if group_alpha <= 0.0 {
+                        isolated_normal_depth = 1;
+                    } else if *blend_mode != zpdf_display_list::BlendMode::Normal {
+                        return true;
+                    } else if *isolated || *knockout || group_alpha < 1.0 || mask.is_some() {
                         isolated_normal_depth = 1;
                     }
                 } else {
@@ -13924,6 +14294,281 @@ mod export_tests {
             full_cover_ok.is_ok(),
             "fully covered metrics-only text beneath opaque background wipe must succeed: {:?}",
             full_cover_ok.err()
+        );
+    }
+
+    #[test]
+    fn overprinting_metrics_only_helvetica_resolves_uniform_backdrop_and_rejects_non_uniform() {
+        let stream = |dict: &str, data: &[u8]| -> Vec<u8> {
+            let mut out = format!("<< {dict} /Length {} >>\nstream\n", data.len()).into_bytes();
+            out.extend_from_slice(data);
+            out.extend_from_slice(b"\nendstream");
+            out
+        };
+        let assemble = |objects: &[Vec<u8>]| -> Vec<u8> {
+            let mut pdf = b"%PDF-1.4\n".to_vec();
+            let mut offsets = Vec::with_capacity(objects.len());
+            for (i, body) in objects.iter().enumerate() {
+                offsets.push(pdf.len());
+                pdf.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+                pdf.extend_from_slice(body);
+                pdf.extend_from_slice(b"\nendobj\n");
+            }
+            let xref = pdf.len();
+            pdf.extend_from_slice(
+                format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+            );
+            for off in offsets {
+                pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+            }
+            pdf.extend_from_slice(
+                format!(
+                    "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                    objects.len() + 1
+                )
+                .as_bytes(),
+            );
+            pdf
+        };
+
+        let run_case = |page_ops: &[u8], form_ops: Option<&[u8]>| {
+            let pdf = assemble(&[
+                b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+                b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 320 120] /Contents 4 0 R \
+                  /Resources << /Font << /FH 5 0 R >> /ExtGState << /GSop 6 0 R >> \
+                  /XObject << /Fm1 7 0 R >> >> >>"
+                    .to_vec(), // 3
+                stream("", page_ops),                          // 4
+                b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(), // 5
+                b"<< /Type /ExtGState /op true /OPM 1 >>".to_vec(), // 6
+                stream(
+                    "/Type /XObject /Subtype /Form /BBox [0 0 320 120] \
+                     /Group << /Type /Group /S /Transparency /I true /K false >> \
+                     /Resources << /Font << /FH 5 0 R >> /ExtGState << /GSop 6 0 R >> >>",
+                    form_ops.unwrap_or(b""),
+                ), // 7
+            ]);
+            let provider = std::sync::Arc::new(zpdf_font::FontProvider::memory_only());
+            let doc = zpdf_document::PdfDocument::open(pdf)
+                .expect("open pdf")
+                .with_font_provider(provider);
+            let page = doc.page(0).expect("page 0");
+            let mut fonts = doc.load_page_fonts(&page);
+            let (content_bytes, _) = doc.page_content_with_diagnostics(&page).expect("content");
+            let mut images = ImageCache::new();
+            let (dl, _) = zpdf_content::interpreter::ContentInterpreter::new(page.effective_box())
+                .with_document(doc.file(), &page.resources)
+                .with_fonts(&mut fonts)
+                .with_images(&mut images)
+                .interpret_with_stats(&content_bytes);
+            display_list_to_slide(&dl, 0, &fonts, &images, &ConversionOptions::default())
+        };
+
+        // 1. Uniform opaque cyan backdrop + 0.5 g /op true Helvetica -> dark cyan (0, 128, 128).
+        let cyan_slide = run_case(
+            b"0 1 1 rg 0 0 320 120 re f \
+              q /GSop gs 0.5 g BT /FH 24 Tf 20 50 Td (Hello) Tj ET Q",
+            None,
+        )
+        .expect("uniform cyan backdrop overprint");
+        let text_colors: Vec<(&str, (u8, u8, u8))> = cyan_slide
+            .elements
+            .iter()
+            .filter_map(|e| match e.base() {
+                SlideElement::TextBox {
+                    text, color_rgb, ..
+                } => Some((text.as_str(), *color_rgb)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            text_colors,
+            vec![("Hello", (0, 128, 128))],
+            "0.5 g overprint Helvetica over cyan must resolve to dark cyan (0, 128, 128), not source gray"
+        );
+
+        // 2. Inside an isolated Normal Form over a magenta outer page:
+        //    - Over transparent Form backdrop -> resolves against white paper -> (128, 128, 128).
+        //    - Over a cyan rectangle inside the Form -> resolves to dark cyan (0, 128, 128).
+        let iso_white = run_case(
+            b"1 0 1 rg 0 0 320 120 re f /Fm1 Do",
+            Some(b"q /GSop gs 0.5 g BT /FH 24 Tf 20 50 Td (IsoWhite) Tj ET Q"),
+        )
+        .expect("isolated Form overprint on empty Form backdrop");
+        let iso_white_colors: Vec<(&str, (u8, u8, u8))> = iso_white
+            .elements
+            .iter()
+            .filter_map(|e| match e.base() {
+                SlideElement::TextBox {
+                    text, color_rgb, ..
+                } => Some((text.as_str(), *color_rgb)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(iso_white_colors, vec![("IsoWhite", (128, 128, 128))]);
+
+        let iso_cyan = run_case(
+            b"1 0 1 rg 0 0 320 120 re f /Fm1 Do",
+            Some(
+                b"0 1 1 rg 0 0 320 120 re f \
+                  q /GSop gs 0.5 g BT /FH 24 Tf 20 50 Td (IsoCyan) Tj ET Q",
+            ),
+        )
+        .expect("isolated Form overprint on Form cyan backdrop");
+        let iso_cyan_colors: Vec<(&str, (u8, u8, u8))> = iso_cyan
+            .elements
+            .iter()
+            .filter_map(|e| match e.base() {
+                SlideElement::TextBox {
+                    text, color_rgb, ..
+                } => Some((text.as_str(), *color_rgb)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(iso_cyan_colors, vec![("IsoCyan", (0, 128, 128))]);
+
+        // 3. Split cyan/white backdrop under 0.5 g /op true Helvetica -> non-uniform -> Err.
+        let split_err = run_case(
+            b"0 1 1 rg 0 0 50 120 re f \
+              q /GSop gs 0.5 g BT /FH 24 Tf 20 50 Td (SplitWord) Tj ET Q",
+            None,
+        );
+        assert!(
+            split_err.is_err(),
+            "0.5 g overprint Helvetica straddling cyan and white must report non-uniform backdrop error"
+        );
+
+        // 4. Opaque 0 g /op true (K=1) over the same split cyan/white backdrop resolves
+        //    uniformly to pure black (0, 0, 0) regardless of backdrop -> Ok.
+        let split_black = run_case(
+            b"0 1 1 rg 0 0 50 120 re f \
+              q /GSop gs 0 g BT /FH 24 Tf 20 50 Td (BlackSplit) Tj ET Q",
+            None,
+        )
+        .expect("opaque K=1 overprint over split backdrop is backdrop-independent black");
+        let black_colors: Vec<(&str, (u8, u8, u8))> = split_black
+            .elements
+            .iter()
+            .filter_map(|e| match e.base() {
+                SlideElement::TextBox {
+                    text, color_rgb, ..
+                } => Some((text.as_str(), *color_rgb)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(black_colors, vec![("BlackSplit", (0, 0, 0))]);
+    }
+
+    #[test]
+    fn transparent_overprint_fill_does_not_flatten_isolated_form_or_editable_type3_run() {
+        let stream = |dict: &str, data: &[u8]| -> Vec<u8> {
+            let mut out = format!("<< {dict} /Length {} >>\nstream\n", data.len()).into_bytes();
+            out.extend_from_slice(data);
+            out.extend_from_slice(b"\nendstream");
+            out
+        };
+        let assemble = |objects: &[Vec<u8>]| -> Vec<u8> {
+            let mut pdf = b"%PDF-1.4\n".to_vec();
+            let mut offsets = Vec::with_capacity(objects.len());
+            for (i, body) in objects.iter().enumerate() {
+                offsets.push(pdf.len());
+                pdf.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+                pdf.extend_from_slice(body);
+                pdf.extend_from_slice(b"\nendobj\n");
+            }
+            let xref = pdf.len();
+            pdf.extend_from_slice(
+                format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+            );
+            for off in offsets {
+                pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+            }
+            pdf.extend_from_slice(
+                format!(
+                    "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                    objects.len() + 1
+                )
+                .as_bytes(),
+            );
+            pdf
+        };
+
+        // 1. Opaque isolated Normal Form (/Fm1) containing:
+        //    - metrics-only Helvetica heading "(Heading)", and
+        //    - a fully transparent (`/ca 0`) yellow overprint fill (`/op true /OPM 1`, `0 0 1 0 k`).
+        //    Because effective paint alpha is 0, the Form must NOT flatten and "(Heading)"
+        //    must survive as an editable TextBox with zero raster images.
+        // 2. Page-level mapped Type 3 word "(A)" followed by an overlapping `/ca 0` yellow
+        //    overprint fill: "(A)" must remain an editable TextBox (not forced to artwork).
+        let pdf = assemble(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 320 140] /Contents 4 0 R \
+              /Resources << /Font << /FH 5 0 R /FT3 7 0 R >> \
+              /ExtGState << /GSzero 6 0 R >> /XObject << /Fm1 11 0 R >> >> >>"
+                .to_vec(), // 3
+            stream(
+                "",
+                b"/Fm1 Do \
+                  0 1 1 rg BT /FT3 40 Tf 20 20 Td (A) Tj ET \
+                  q /GSzero gs 0 0 1 0 k 10 10 100 80 re f Q",
+            ), // 4
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(), // 5
+            b"<< /Type /ExtGState /ca 0 /op true /OPM 1 >>".to_vec(), // 6
+            b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] \
+              /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs 8 0 R /Encoding 9 0 R \
+              /FirstChar 65 /LastChar 65 /Widths [1000] /Resources << >> >>"
+                .to_vec(), // 7
+            b"<< /A 10 0 R >>".to_vec(),                   // 8
+            b"<< /Type /Encoding /Differences [65 /A] >>".to_vec(), // 9
+            stream("", b"1000 0 d1 0 0 800 800 0 0 800 800 re f"), // 10
+            stream(
+                "/Type /XObject /Subtype /Form /BBox [0 0 320 140] \
+                 /Group << /Type /Group /S /Transparency /I true /K false >> \
+                 /Resources << /Font << /FH 5 0 R >> /ExtGState << /GSzero 6 0 R >> >>",
+                b"0 g BT /FH 24 Tf 20 90 Td (Heading) Tj ET \
+                  q /GSzero gs 0 0 1 0 k 0 0 320 140 re f Q",
+            ), // 11
+        ]);
+
+        let provider = std::sync::Arc::new(zpdf_font::FontProvider::memory_only());
+        let doc = zpdf_document::PdfDocument::open(pdf)
+            .expect("open pdf")
+            .with_font_provider(provider);
+        let page = doc.page(0).expect("page 0");
+        let mut fonts = doc.load_page_fonts(&page);
+        let (content_bytes, _) = doc.page_content_with_diagnostics(&page).expect("content");
+        let mut images = ImageCache::new();
+        let (dl, _) = zpdf_content::interpreter::ContentInterpreter::new(page.effective_box())
+            .with_document(doc.file(), &page.resources)
+            .with_fonts(&mut fonts)
+            .with_images(&mut images)
+            .interpret_with_stats(&content_bytes);
+
+        let slide = display_list_to_slide(&dl, 0, &fonts, &images, &ConversionOptions::default())
+            .expect("transparent overprint export");
+        assert!(
+            !slide
+                .elements
+                .iter()
+                .any(|e| matches!(e.base(), SlideElement::Image { .. })),
+            "fully transparent (/ca 0) overprint fill must not produce raster images: {:?}",
+            slide.elements
+        );
+        let texts: Vec<&str> = slide
+            .elements
+            .iter()
+            .filter_map(|e| match e.base() {
+                SlideElement::TextBox { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            vec!["Heading", "A"],
+            "isolated Form heading and overlapped mapped Type 3 letter must both remain editable TextBoxes: {:?}",
+            slide.elements
         );
     }
 }
