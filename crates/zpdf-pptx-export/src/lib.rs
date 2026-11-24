@@ -2104,6 +2104,103 @@ mod export_tests {
     }
 
     #[test]
+    fn type3_oc_hidden_glyph_next_to_visible_letter_omitted_from_slide_text() {
+        let stream = |dict: &str, bytes: &[u8]| -> Vec<u8> {
+            let mut out = format!("<< {dict} /Length {} >>\nstream\n", bytes.len()).into_bytes();
+            out.extend_from_slice(bytes);
+            out.extend_from_slice(b"\nendstream");
+            out
+        };
+        let assemble = |objects: &[Vec<u8>]| -> Vec<u8> {
+            let mut pdf = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n".to_vec();
+            let mut offsets = Vec::with_capacity(objects.len());
+            for (idx, body) in objects.iter().enumerate() {
+                offsets.push(pdf.len());
+                pdf.extend_from_slice(format!("{} 0 obj\n", idx + 1).as_bytes());
+                pdf.extend_from_slice(body);
+                pdf.extend_from_slice(b"\nendobj\n");
+            }
+            let xref = pdf.len();
+            let count = objects.len() + 1;
+            pdf.extend_from_slice(format!("xref\n0 {count}\n0000000000 65535 f \n").as_bytes());
+            for off in offsets {
+                pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+            }
+            pdf.extend_from_slice(
+                format!("trailer\n<< /Size {count} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n")
+                    .as_bytes(),
+            );
+            pdf
+        };
+
+        // /A and /C draw visible rectangles; /B wraps its only mark inside a
+        // disabled optional-content group (/LayerOff -> OCG 10).
+        let glyph_visible = stream("", b"1000 0 d0 0 0 800 800 re f");
+        let glyph_hidden = stream("", b"1000 0 d0 /OC /LayerOff BDC 0 0 800 800 re f EMC");
+        let pdf = assemble(&[
+            b"<< /Type /Catalog /Pages 2 0 R \
+              /OCProperties << /OCGs [10 0 R] /D << /BaseState /ON /OFF [10 0 R] >> >> >>"
+                .to_vec(), // 1
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Contents 4 0 R \
+              /Resources << /Font << /F1 5 0 R >> /Properties << /LayerOff 10 0 R >> >> >>"
+                .to_vec(), // 3
+            stream("", b"0 0 0 rg BT /F1 30 Tf 10 30 Td (ABC) Tj ET"), // 4
+            b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] \
+              /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs 6 0 R /Encoding 7 0 R \
+              /FirstChar 65 /LastChar 67 /Widths [1000 1000 1000] /Resources << >> >>"
+                .to_vec(), // 5
+            b"<< /A 8 0 R /B 9 0 R /C 8 0 R >>".to_vec(),          // 6
+            b"<< /Type /Encoding /Differences [65 /A /B /C] >>".to_vec(), // 7
+            glyph_visible,                                         // 8
+            glyph_hidden,                                          // 9
+            b"<< /Type /OCG /Name (Hidden) >>".to_vec(),           // 10
+        ]);
+
+        let doc = zpdf_document::PdfDocument::open(pdf).expect("open pdf");
+        let page = doc.page(0).expect("page 0");
+        let mut fonts = doc.load_page_fonts(&page);
+        let (content_bytes, _) = doc.page_content_with_diagnostics(&page).expect("content");
+        let mut images = ImageCache::new();
+        let oc = doc.oc_config().expect("oc config");
+        let interpreter = zpdf_content::interpreter::ContentInterpreter::new(page.effective_box())
+            .with_document(doc.file(), &page.resources)
+            .with_fonts(&mut fonts)
+            .with_images(&mut images)
+            .with_optional_content(&oc);
+        let (display_list, _) = interpreter.interpret_with_stats(&content_bytes);
+
+        let slide = display_list_to_slide(
+            &display_list,
+            0,
+            &fonts,
+            &images,
+            &ConversionOptions::default(),
+        )
+        .expect("slide export");
+
+        let texts: Vec<&str> = slide
+            .elements
+            .iter()
+            .filter_map(|el| match el {
+                SlideElement::TextBox { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            vec!["A", "C"],
+            "hidden glyph 'B' must not appear in exported PowerPoint text; got {:?}",
+            slide.elements
+        );
+        assert_eq!(
+            slide.elements.len(),
+            2,
+            "no extra drawing shapes should be emitted for visible or hidden letters"
+        );
+    }
+
+    #[test]
     fn synthetic_partially_mapped_expanded_run_falls_back_to_drawings() {
         let mut char_procs = std::collections::HashMap::new();
         char_procs.insert(

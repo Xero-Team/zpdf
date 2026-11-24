@@ -3631,39 +3631,75 @@ impl CompanionEntry {
     }
 }
 
-/// Estimate retained memory bytes for an inline PDF object tree (with a depth
-/// cap so adversarial nesting cannot overflow the stack).
-fn estimate_pdf_object_bytes(obj: &zpdf_core::PdfObject, depth: u8) -> u64 {
-    const MAX_DEPTH: u8 = 16;
-    if depth >= MAX_DEPTH {
-        return 64;
+/// Iteratively measure the retained byte size of an inline PDF dictionary,
+/// returning `None` if the size exceeds `max_bytes` (or overflows). Iterative
+/// traversal accounts for the entire subtree at any nesting depth without
+/// risking stack overflow or truncating deep objects.
+fn estimate_pdf_dict_bytes_within(dict: &zpdf_core::PdfDict, max_bytes: u64) -> Option<u64> {
+    enum Node<'a> {
+        Dict(&'a zpdf_core::PdfDict),
+        Obj(&'a zpdf_core::PdfObject),
     }
-    match obj {
-        zpdf_core::PdfObject::Null
-        | zpdf_core::PdfObject::Bool(_)
-        | zpdf_core::PdfObject::Integer(_)
-        | zpdf_core::PdfObject::Real(_)
-        | zpdf_core::PdfObject::Ref(_) => 24,
-        zpdf_core::PdfObject::Name(n) => 32u64.saturating_add(n.0.len() as u64),
-        zpdf_core::PdfObject::String(s) => 32u64.saturating_add(s.as_bytes().len() as u64),
-        zpdf_core::PdfObject::Array(items) => items.iter().fold(32u64, |acc, item| {
-            acc.saturating_add(estimate_pdf_object_bytes(item, depth + 1))
-        }),
-        zpdf_core::PdfObject::Dict(dict) => estimate_pdf_dict_bytes_depth(dict, depth + 1),
-        zpdf_core::PdfObject::Stream(stream) => {
-            estimate_pdf_dict_bytes_depth(&stream.dict, depth + 1)
-                .saturating_add(stream.data.len() as u64)
-                .saturating_add(64)
+
+    let mut total = 0u64;
+    let mut stack = vec![Node::Dict(dict)];
+    while let Some(node) = stack.pop() {
+        match node {
+            Node::Dict(d) => {
+                total = total.checked_add(64)?;
+                for (k, v) in &d.0 {
+                    total = total.checked_add(32)?.checked_add(k.0.len() as u64)?;
+                    stack.push(Node::Obj(v));
+                    let min_pending = (stack.len() as u64).checked_mul(24)?;
+                    if total.checked_add(min_pending)? > max_bytes {
+                        return None;
+                    }
+                }
+            }
+            Node::Obj(obj) => match obj {
+                zpdf_core::PdfObject::Null
+                | zpdf_core::PdfObject::Bool(_)
+                | zpdf_core::PdfObject::Integer(_)
+                | zpdf_core::PdfObject::Real(_)
+                | zpdf_core::PdfObject::Ref(_) => {
+                    total = total.checked_add(24)?;
+                }
+                zpdf_core::PdfObject::Name(n) => {
+                    total = total.checked_add(32)?.checked_add(n.0.len() as u64)?;
+                }
+                zpdf_core::PdfObject::String(s) => {
+                    total = total
+                        .checked_add(32)?
+                        .checked_add(s.as_bytes().len() as u64)?;
+                }
+                zpdf_core::PdfObject::Array(items) => {
+                    total = total.checked_add(32)?;
+                    let min_items = (items.len() as u64).checked_mul(24)?;
+                    let min_pending = (stack.len() as u64).checked_mul(24)?;
+                    if total.checked_add(min_pending)?.checked_add(min_items)? > max_bytes {
+                        return None;
+                    }
+                    for item in items {
+                        stack.push(Node::Obj(item));
+                    }
+                }
+                zpdf_core::PdfObject::Dict(d) => {
+                    stack.push(Node::Dict(d));
+                }
+                zpdf_core::PdfObject::Stream(stream) => {
+                    total = total
+                        .checked_add(64)?
+                        .checked_add(stream.data.len() as u64)?;
+                    stack.push(Node::Dict(&stream.dict));
+                }
+            },
+        }
+        let min_pending = (stack.len() as u64).checked_mul(24)?;
+        if total.checked_add(min_pending)? > max_bytes {
+            return None;
         }
     }
-}
-
-fn estimate_pdf_dict_bytes_depth(dict: &zpdf_core::PdfDict, depth: u8) -> u64 {
-    dict.0.iter().fold(64u64, |acc, (k, v)| {
-        acc.saturating_add(32)
-            .saturating_add(k.0.len() as u64)
-            .saturating_add(estimate_pdf_object_bytes(v, depth))
-    })
+    Some(total)
 }
 
 /// Source dictionary location for an admitted Type 3 font so the content
@@ -3760,10 +3796,16 @@ impl FontCache {
         }
     }
 
-    fn permanent_bytes(&self) -> u64 {
+    pub(crate) fn permanent_bytes(&self) -> u64 {
         self.budget
             .bytes_used()
             .saturating_add(self.type3_inline_bytes)
+    }
+
+    /// Maximum bytes available for `self.budget` (font programs and owned
+    /// tables) after deducting retained inline Type 3 source dictionaries.
+    pub(crate) fn font_budget_limit(&self, max_bytes: u64) -> u64 {
+        max_bytes.saturating_sub(self.type3_inline_bytes)
     }
 
     /// Record a lightweight reload reference for an inline Type 3 font located
@@ -3810,14 +3852,14 @@ impl FontCache {
         if !self.fonts.get(&id).is_some_and(|f| f.has_type3_programs()) {
             return false;
         }
-        let dict_bytes = estimate_pdf_dict_bytes_depth(&dict, 0);
-        let Some(new_permanent) = self
-            .permanent_bytes()
-            .checked_add(dict_bytes)
-            .filter(|&total| total <= max_bytes)
-        else {
+        let permanent = self.permanent_bytes();
+        let Some(remaining) = max_bytes.checked_sub(permanent) else {
             return false;
         };
+        let Some(dict_bytes) = estimate_pdf_dict_bytes_within(&dict, remaining) else {
+            return false;
+        };
+        let new_permanent = permanent + dict_bytes;
         self.type3_inline_bytes = self.type3_inline_bytes.saturating_add(dict_bytes);
         self.type3_sources.insert(id, Type3Source::Inline(dict));
         if new_permanent.saturating_add(self.standby_bytes) > max_bytes {
@@ -4088,8 +4130,7 @@ impl FontCache {
                 spec
             } else {
                 match self
-                    .budget
-                    .bytes_used()
+                    .permanent_bytes()
                     .checked_add(self.standby_bytes)
                     .and_then(|used| used.checked_add(extra))
                 {
@@ -4432,7 +4473,7 @@ impl FontCache {
 
         let prev_total = self.budget.bytes_used();
         let prev_programs = self.budget.programs.len();
-        let font_limit = max_bytes.saturating_sub(self.type3_inline_bytes);
+        let font_limit = self.font_budget_limit(max_bytes);
         let new_total = self.budget.admission_total(&font, font_limit)?;
         let id = self.next_free_id()?;
         self.budget.record(&font, new_total);
@@ -6645,5 +6686,162 @@ mod tests {
         out.clear();
         assert!(mapped_logo.append_verified_type3_unicode(65, 1, &mut out));
         assert_eq!(out, "X");
+    }
+
+    #[test]
+    fn type3_inline_source_accounts_deeply_nested_dictionaries() {
+        // Nest an 8 KiB string 24 levels deep (past the old depth-16 cap) to
+        // verify the entire subtree is accounted against `max_bytes`.
+        let mut inner = zpdf_core::PdfObject::String(zpdf_core::PdfString::new(vec![b'z'; 8192]));
+        for _ in 0..24 {
+            let mut d = zpdf_core::PdfDict::new();
+            d.insert(zpdf_core::PdfName::new("Nested"), inner);
+            inner = zpdf_core::PdfObject::Dict(d);
+        }
+        let zpdf_core::PdfObject::Dict(deep_dict) = inner else {
+            unreachable!();
+        };
+        let deep_arc = Arc::new(deep_dict);
+
+        let mut cache = FontCache::new();
+        let font = Arc::new(sample_type3_font("A", 65));
+        let base_cost = font.estimated_cache_bytes();
+        let tight_budget = base_cost + 4096;
+        let fid = cache
+            .admit_with_diagnostics(
+                "FDeep".into(),
+                font,
+                zpdf_core::ProcessingDiagnostics::default(),
+                None,
+                tight_budget,
+            )
+            .expect("font fits tight budget");
+        assert!(
+            !cache.record_type3_inline_source_with_limit(fid, Arc::clone(&deep_arc), tight_budget),
+            "deeply nested 8 KiB string past depth 16 must not bypass the byte limit"
+        );
+        assert!(cache.type3_source(fid).is_none());
+        assert!(cache.bytes_used() <= tight_budget);
+
+        let ample_budget = base_cost + 32_768;
+        assert!(cache.record_type3_inline_source_with_limit(fid, deep_arc, ample_budget));
+        assert!(
+            cache.bytes_used() >= base_cost + 8192,
+            "retained deep dictionary must charge its full subtree ({} vs base {})",
+            cache.bytes_used(),
+            base_cost
+        );
+    }
+
+    #[test]
+    fn type3_inline_bytes_bound_provider_fallback_and_descriptor_substitute() {
+        let fallback_ttf = include_bytes!("../tests/fixtures/coverage-bold.ttf");
+        let provider = Arc::new(FontProvider::memory_only());
+        provider
+            .register_with_aliases(fallback_ttf.as_slice(), 0, &["FallbackFace"])
+            .expect("register fallback");
+
+        let mut cache = FontCache::new().with_provider(provider);
+
+        // Measure the exact incremental cost of the fallback face (`fallback_ttf`).
+        let fallback_probe = LoadedFont::new_substitute(
+            PdfFontType::TrueType,
+            "FallbackFace".into(),
+            Arc::<[u8]>::from(fallback_ttf.as_slice()),
+            0,
+            CidWidths::new(1000.0),
+        )
+        .expect("probe fallback");
+        let fallback_cost = fallback_probe.estimated_cache_bytes();
+
+        // Admit a Type 3 font plus a large inline dictionary so `type3_inline_bytes`
+        // exceeds `fallback_cost` and consumes most of the budget.
+        let t3_font = Arc::new(sample_type3_font("A", 65));
+        let t3_id = cache
+            .admit_with_diagnostics(
+                "FT3".into(),
+                t3_font,
+                zpdf_core::ProcessingDiagnostics::default(),
+                None,
+                u64::MAX,
+            )
+            .expect("admit Type 3");
+        let mut dict = zpdf_core::PdfDict::new();
+        dict.insert(
+            zpdf_core::PdfName::new("Pad"),
+            zpdf_core::PdfObject::String(zpdf_core::PdfString::new(vec![
+                b'p';
+                (fallback_cost as usize)
+                    + 4096
+            ])),
+        );
+        assert!(cache.record_type3_inline_source_with_limit(t3_id, Arc::new(dict), u64::MAX));
+
+        // Admit a primary placeholder font that needs provider fallback for 'A'.
+        let mut primary = LoadedFont::new_placeholder("FallbackFace".into());
+        primary.encoding = Some(encoding::Encoding::win_ansi());
+        let primary_id = cache
+            .try_insert_shared_with_limit("F1".into(), Arc::new(primary), u64::MAX)
+            .expect("admit primary");
+
+        // Set `max_bytes` strictly between `budget.bytes_used() + fallback_cost`
+        // and `permanent_bytes() + fallback_cost`: without deducting
+        // `type3_inline_bytes`, both `record_descriptor_substitute` and
+        // `admit_drawing_font` would exceed `max_bytes`.
+        let permanent = cache.permanent_bytes();
+        let tight_max = permanent + fallback_cost.saturating_sub(1);
+        assert!(
+            cache.budget.bytes_used() + fallback_cost <= tight_max,
+            "test setup requires fallback to fit `budget.bytes_used()` alone"
+        );
+
+        // 1. `record_descriptor_substitute` must strip an oversized lookup_name
+        //    rather than taking `bytes_used()` above `tight_max`.
+        let long_name = "X".repeat((fallback_cost as usize) + 512);
+        cache.record_descriptor_substitute(
+            primary_id,
+            Arc::new(DescriptorSubstituteSpec {
+                lookup_name: Some(long_name.into()),
+                hints: system::SubstituteHints::default(),
+                ordering: None,
+                font_file_id: None,
+            }),
+            tight_max,
+        );
+        assert!(
+            cache.bytes_used() <= tight_max,
+            "descriptor substitute standby bytes ({}) must not exceed tight_max ({tight_max})",
+            cache.bytes_used()
+        );
+
+        // 2. Provider fallback admission (`admit_drawing_font`) must refuse when
+        //    `permanent_bytes() + fallback_cost > tight_max`.
+        let original = DrawingGlyph {
+            font_id: primary_id,
+            glyph_id: 0,
+        };
+        let resolved =
+            cache.resolve_drawing_glyph(original, b'A' as u32, b'A' as u32, 1, tight_max);
+        assert_eq!(
+            resolved.font_id, primary_id,
+            "provider fallback must not admit past max_bytes once type3_inline_bytes is charged"
+        );
+        assert!(
+            cache.bytes_used() <= tight_max,
+            "bytes_used() ({}) exceeded tight_max ({tight_max})",
+            cache.bytes_used()
+        );
+
+        // 3. Raising the limit to cover `permanent_bytes() + fallback_cost`
+        //    lets a fresh resolution admit the fallback cleanly within budget.
+        let generous_max = permanent + fallback_cost + 1024;
+        cache.resolution = None;
+        let resolved_ok =
+            cache.resolve_drawing_glyph(original, b'A' as u32, b'A' as u32, 1, generous_max);
+        assert_ne!(
+            resolved_ok.font_id, primary_id,
+            "provider fallback should succeed once max_bytes covers permanent_bytes + fallback_cost"
+        );
+        assert!(cache.bytes_used() <= generous_max);
     }
 }

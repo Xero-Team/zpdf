@@ -1103,6 +1103,120 @@ fn type3_d1_glyph_preserves_colored_tiling_pattern_fill() {
 }
 
 #[test]
+fn type3_d1_bitmap_stencil_paints_with_colored_tiling_pattern() {
+    // Colored (PaintType 1) tiling pattern: 40x40 cell, red left half [0..20],
+    // blue right half [20..40].
+    let pattern = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 40 40] /XStep 40 /YStep 40 /Resources << >>",
+        b"1 0 0 rg 0 0 20 40 re f\n0 0 1 rg 20 0 20 40 re f",
+    );
+    // 4x2 1-bpc /ImageMask true stencil (bit 0 = painted, bit 1 = transparent):
+    //   Row 0 (top half, pdf_y in [40..80]):    0 0 0 0 -> 0x00 (all 4 columns painted)
+    //   Row 1 (bottom half, pdf_y in [0..40]):  0 1 1 0 -> 0x60 (outer columns painted, middle transparent)
+    let mut glyph_bytes = b"1000 0 0 0 1000 1000 d1\n\
+        1000 0 0 1000 0 0 cm\n\
+        BI /IM true /W 4 /H 2 /BPC 1 ID "
+        .to_vec();
+    glyph_bytes.extend_from_slice(&[0x00, 0x60]);
+    glyph_bytes.extend_from_slice(b"\nEI");
+
+    let content = b"/Pattern cs /P1 scn\nBT /F1 80 Tf 0 0 Td (A) Tj ET";
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 80 80] /Contents 4 0 R \
+          /Resources << /Font << /F1 5 0 R >> /Pattern << /P1 9 0 R >> >> >>"
+            .to_vec(), // 3
+        stream_obj("", content),                       // 4
+        b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] \
+          /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs 6 0 R /Encoding 7 0 R \
+          /FirstChar 65 /LastChar 65 /Widths [1000] /Resources << >> >>"
+            .to_vec(), // 5
+        b"<< /A 8 0 R >>".to_vec(),                    // 6
+        b"<< /Type /Encoding /Differences [65 /A] >>".to_vec(), // 7
+        stream_obj("", &glyph_bytes),                  // 8
+        pattern,                                       // 9
+    ]);
+
+    // Check both with an external ImageCache and without one (DrawInlineImage).
+    for use_image_cache in [true, false] {
+        let doc = PdfDocument::open(pdf.clone()).expect("open pdf");
+        let page = doc.page(0).expect("page 0");
+        let mut fonts = doc.load_page_fonts(&page);
+        let content_bytes = doc.page_content_bytes(&page).expect("content bytes");
+        let mut images = ImageCache::new();
+        let dl = if use_image_cache {
+            ContentInterpreter::new(page.media_box)
+                .with_fonts(&mut fonts)
+                .with_document(doc.file(), &page.resources)
+                .with_images(&mut images)
+                .interpret(&content_bytes)
+        } else {
+            ContentInterpreter::new(page.media_box)
+                .with_fonts(&mut fonts)
+                .with_document(doc.file(), &page.resources)
+                .interpret(&content_bytes)
+        };
+        let rendered = if use_image_cache {
+            zpdf::cpu::CpuRenderer::new()
+                .with_fonts(&fonts)
+                .with_images(&images)
+                .render_display_list(&dl, 1.0)
+                .expect("cpu render")
+        } else {
+            zpdf::cpu::CpuRenderer::new()
+                .with_fonts(&fonts)
+                .render_display_list(&dl, 1.0)
+                .expect("cpu render")
+        };
+
+        // Sample interior texels away from bilinear boundaries between painted
+        // and transparent stencil samples.
+        assert_eq!(
+            px(&rendered, 5, 70),
+            [255, 0, 0],
+            "top-left stencil pixel must paint red pattern stripe (cache={use_image_cache})"
+        );
+        assert_eq!(
+            px(&rendered, 30, 70),
+            [0, 0, 255],
+            "top-mid-left stencil pixel must paint blue pattern stripe (cache={use_image_cache})"
+        );
+        assert_eq!(
+            px(&rendered, 50, 70),
+            [255, 0, 0],
+            "top-mid-right stencil pixel must paint red pattern stripe (cache={use_image_cache})"
+        );
+        assert_eq!(
+            px(&rendered, 75, 70),
+            [0, 0, 255],
+            "top-right stencil pixel must paint blue pattern stripe (cache={use_image_cache})"
+        );
+        assert_eq!(
+            px(&rendered, 5, 10),
+            [255, 0, 0],
+            "bottom-left stencil pixel must paint red pattern stripe (cache={use_image_cache})"
+        );
+        assert_eq!(
+            px(&rendered, 35, 10),
+            [255, 255, 255],
+            "transparent bottom-mid-left stencil pixel must leave background white (cache={use_image_cache})"
+        );
+        assert_eq!(
+            px(&rendered, 45, 10),
+            [255, 255, 255],
+            "transparent bottom-mid-right stencil pixel must leave background white (cache={use_image_cache})"
+        );
+        assert_eq!(
+            px(&rendered, 75, 10),
+            [0, 0, 255],
+            "bottom-right stencil pixel must paint blue pattern stripe (cache={use_image_cache})"
+        );
+    }
+}
+
+#[test]
 fn type3_inline_font_in_form_reloads_from_container_under_small_budget() {
     // Indirect Form XObject contains an INLINE Type 3 font dictionary with a
     // large padding entry and a `/Resources << /XObject << /FmInner 7 0 R >> >>`.

@@ -145,11 +145,24 @@ pub struct ContentInterpreter<'a> {
     active_type3_glyphs: Vec<(FontId, u16)>,
     /// Cached parsed `/Resources`, pre-loaded font bindings, and `/CharProcs`
     /// stream IDs for Type 3 fonts interpreted on this page (parsed once per
-    /// Type 3 font).
+    /// Type 3 font within `max_type3_resource_cache_bytes`).
     type3_font_resources: HashMap<FontId, std::sync::Arc<CachedType3FontResources>>,
-    /// Cached parsed per-CharProc `/Resources` and font bindings keyed by
-    /// CharProc stream object ID (parsed once per unique CharProc stream).
-    type3_glyph_resources: HashMap<ObjectId, std::sync::Arc<CachedType3GlyphResources>>,
+    /// Shared parsed `/Resources` scopes keyed by indirect `/Resources` object
+    /// ID so distinct CharProc streams (or a Type 3 font and its CharProcs)
+    /// referencing the same indirect resource dictionary reuse one `Arc`.
+    type3_shared_resources: HashMap<ObjectId, std::sync::Arc<CachedType3ResourceScope>>,
+    /// Cached per-CharProc `/Resources` lookup keyed by CharProc stream object
+    /// ID (`None` when the CharProc carries no `/Resources`).
+    type3_glyph_resources: HashMap<ObjectId, Option<std::sync::Arc<CachedType3ResourceScope>>>,
+    /// Estimated bytes retained across `type3_font_resources`,
+    /// `type3_shared_resources`, and `type3_glyph_resources`.
+    type3_resource_cache_bytes: usize,
+    /// Hard cap on retained Type 3 resource scopes for this page; scopes beyond
+    /// the cap are still parsed for the current glyph and dropped afterward.
+    max_type3_resource_cache_bytes: usize,
+    /// Set when any painting operation inside the active Type 3 glyph is
+    /// suppressed by an inactive optional-content group (`oc_suppressed()`).
+    type3_oc_suppressed_mark: bool,
     /// Active Type 3 glyph context `(font_id, glyph_id, inline_image_ordinal)`
     /// used to deduplicate repeated inline bitmap images (e.g. TeX Type 3
     /// glyphs) into a single `ImageId` per `(glyph, colour, footprint)`.
@@ -599,6 +612,10 @@ const DEFAULT_MAX_OPS: u64 = 4_000_000;
 /// content is decoded per use again.
 const MAX_CONTENT_CACHE_BYTES: usize = 32 << 20;
 
+/// Maximum retained bytes for cached Type 3 font/CharProc `/Resources` scopes
+/// per page; distinct scopes past this cap are parsed per use and dropped.
+const MAX_TYPE3_RESOURCE_CACHE_BYTES: usize = 4 << 20;
+
 #[derive(Debug, Clone)]
 enum ActiveColorSpace {
     DeviceGray,
@@ -808,16 +825,131 @@ enum CachedFontBinding {
 }
 
 #[derive(Debug, Default)]
-struct CachedType3FontResources {
+struct CachedType3ResourceScope {
     parsed_resources: Option<std::sync::Arc<ResourceDict>>,
     font_bindings: Vec<CachedFontBinding>,
-    char_proc_ids: HashMap<String, ObjectId>,
 }
 
 #[derive(Debug, Default)]
-struct CachedType3GlyphResources {
-    parsed_resources: Option<std::sync::Arc<ResourceDict>>,
-    font_bindings: Vec<CachedFontBinding>,
+struct CachedType3FontResources {
+    scope: Option<std::sync::Arc<CachedType3ResourceScope>>,
+    char_proc_ids: HashMap<String, ObjectId>,
+}
+
+/// Iteratively estimate retained heap bytes for an inline PDF object tree inside
+/// a cached `ResourceDict` (no recursion, so deep dicts cannot overflow stack).
+fn estimate_pdf_object_bytes_iter(root: &PdfObject) -> usize {
+    enum Node<'a> {
+        Dict(&'a PdfDict),
+        Obj(&'a PdfObject),
+    }
+
+    let mut total = 0usize;
+    let mut stack = vec![Node::Obj(root)];
+    while let Some(node) = stack.pop() {
+        match node {
+            Node::Dict(d) => {
+                total = total.saturating_add(64);
+                for (k, v) in &d.0 {
+                    total = total.saturating_add(32).saturating_add(k.0.len());
+                    stack.push(Node::Obj(v));
+                }
+            }
+            Node::Obj(obj) => match obj {
+                PdfObject::Null
+                | PdfObject::Bool(_)
+                | PdfObject::Integer(_)
+                | PdfObject::Real(_)
+                | PdfObject::Ref(_) => {
+                    total = total.saturating_add(24);
+                }
+                PdfObject::Name(n) => {
+                    total = total.saturating_add(32).saturating_add(n.0.len());
+                }
+                PdfObject::String(s) => {
+                    total = total.saturating_add(32).saturating_add(s.as_bytes().len());
+                }
+                PdfObject::Array(items) => {
+                    total = total.saturating_add(32);
+                    for item in items {
+                        stack.push(Node::Obj(item));
+                    }
+                }
+                PdfObject::Dict(d) => stack.push(Node::Dict(d)),
+                PdfObject::Stream(stream) => {
+                    total = total.saturating_add(64).saturating_add(stream.data.len());
+                    stack.push(Node::Dict(&stream.dict));
+                }
+            },
+        }
+    }
+    total
+}
+
+fn estimate_pdf_dict_bytes_iter(dict: &PdfDict) -> usize {
+    dict.0.iter().fold(64usize, |acc, (k, v)| {
+        acc.saturating_add(32)
+            .saturating_add(k.0.len())
+            .saturating_add(estimate_pdf_object_bytes_iter(v))
+    })
+}
+
+fn estimate_type3_resource_scope_bytes(scope: &CachedType3ResourceScope) -> usize {
+    let mut total = 64usize;
+    if let Some(res) = scope.parsed_resources.as_ref() {
+        total = total.saturating_add(256);
+        let map_entries = |m: &HashMap<String, ObjectId>| -> usize {
+            m.keys().fold(0usize, |acc, k| {
+                acc.saturating_add(48).saturating_add(k.len())
+            })
+        };
+        total = total
+            .saturating_add(map_entries(&res.fonts))
+            .saturating_add(map_entries(&res.xobjects))
+            .saturating_add(map_entries(&res.ext_g_state))
+            .saturating_add(map_entries(&res.color_spaces))
+            .saturating_add(map_entries(&res.patterns))
+            .saturating_add(map_entries(&res.shadings))
+            .saturating_add(map_entries(&res.properties));
+        for (k, d) in &res.ext_g_state_inline {
+            total = total
+                .saturating_add(48)
+                .saturating_add(k.len())
+                .saturating_add(estimate_pdf_dict_bytes_iter(d));
+        }
+        for (k, o) in &res.color_spaces_inline {
+            total = total
+                .saturating_add(48)
+                .saturating_add(k.len())
+                .saturating_add(estimate_pdf_object_bytes_iter(o));
+        }
+        for (k, o) in &res.shadings_inline {
+            total = total
+                .saturating_add(48)
+                .saturating_add(k.len())
+                .saturating_add(estimate_pdf_object_bytes_iter(o));
+        }
+        for (k, d) in &res.properties_inline {
+            total = total
+                .saturating_add(48)
+                .saturating_add(k.len())
+                .saturating_add(estimate_pdf_dict_bytes_iter(d));
+        }
+    }
+    for binding in &scope.font_bindings {
+        match binding {
+            CachedFontBinding::PageSlot(name) => {
+                total = total.saturating_add(32).saturating_add(name.len());
+            }
+            CachedFontBinding::CacheSlot(name, slot) => {
+                total = total
+                    .saturating_add(64)
+                    .saturating_add(name.len())
+                    .saturating_add(slot.len());
+            }
+        }
+    }
+    total
 }
 
 /// Colour-resolution qualifier for reusing decoded pixels of an inline image
@@ -1032,7 +1164,11 @@ impl<'a> ContentInterpreter<'a> {
             active_forms: Vec::new(),
             active_type3_glyphs: Vec::new(),
             type3_font_resources: HashMap::new(),
+            type3_shared_resources: HashMap::new(),
             type3_glyph_resources: HashMap::new(),
+            type3_resource_cache_bytes: 0,
+            max_type3_resource_cache_bytes: MAX_TYPE3_RESOURCE_CACHE_BYTES,
+            type3_oc_suppressed_mark: false,
             type3_inline_ctx: None,
             type3_inline_image_cache: HashMap::new(),
             type3_inline_fallback_cache: HashMap::new(),
@@ -3662,6 +3798,10 @@ impl<'a> ContentInterpreter<'a> {
     /// whole page — that rasterizes a full-page gradient per call, which a map
     /// with hundreds of small `sh` markers makes pathologically slow).
     fn paint_shading_op(&mut self, name: &str) {
+        if self.oc_suppressed() {
+            self.type3_oc_suppressed_mark = true;
+            return;
+        }
         // Shadings are represented by decoded images in the display list. Text
         // and table extraction intentionally omit an image cache, so avoid all
         // function parsing, mesh construction, and raster work when there is no
@@ -4136,6 +4276,7 @@ impl<'a> ContentInterpreter<'a> {
     /// that mode/mask).
     fn emit_painted(&mut self, cmd: RenderCommand) {
         if self.oc_suppressed() {
+            self.type3_oc_suppressed_mark = true;
             return;
         }
         if self.current.blend_mode != BlendMode::Normal || self.current.soft_mask.is_some() {
@@ -4541,6 +4682,7 @@ impl<'a> ContentInterpreter<'a> {
         // A hidden draw does not need a resource. In strict mode, failures in
         // invisible layers must not reject otherwise complete visible output.
         if self.oc_suppressed() {
+            self.type3_oc_suppressed_mark = true;
             return;
         }
         let file = match self.file {
@@ -5029,12 +5171,115 @@ impl<'a> ContentInterpreter<'a> {
             <= self.max_image_cache_bytes
     }
 
+    /// Paint an `/ImageMask true` stencil with the active fill pattern by
+    /// rendering `pat` inside a blend group modulated by a `SoftMaskKind::Alpha`
+    /// carrying the stencil coverage. Returns `false` if the stencil transform
+    /// is degenerate or tiling replication cannot proceed (caller falls back to
+    /// the solid fill approximation).
+    fn emit_patterned_image_mask(
+        &mut self,
+        mask_cmd: RenderCommand,
+        transform: Matrix,
+        pat: &PatternPaint,
+    ) -> bool {
+        if self.oc_suppressed() {
+            self.type3_oc_suppressed_mark = true;
+            return true;
+        }
+        let corners = [
+            Point::new(0.0, 0.0).transform(&transform),
+            Point::new(1.0, 0.0).transform(&transform),
+            Point::new(0.0, 1.0).transform(&transform),
+            Point::new(1.0, 1.0).transform(&transform),
+        ];
+        let (mut x0, mut y0) = (f64::INFINITY, f64::INFINITY);
+        let (mut x1, mut y1) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+        for c in &corners {
+            x0 = x0.min(c.x);
+            y0 = y0.min(c.y);
+            x1 = x1.max(c.x);
+            y1 = y1.max(c.y);
+        }
+        if !(x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite())
+            || x1 <= x0
+            || y1 <= y0
+        {
+            return false;
+        }
+        let bounds = Rect::new(x0, y0, x1, y1);
+        let mut mask_dl = DisplayList::new(self.display_list.page_rect);
+        mask_dl.push(mask_cmd);
+        let stencil_mask = SoftMask {
+            kind: SoftMaskKind::Alpha,
+            commands: std::sync::Arc::new(mask_dl),
+            offset: (0.0, 0.0),
+            backdrop_luma: 0.0,
+            transfer: None,
+        };
+
+        let cmd_mark = self.display_list.commands.len();
+        let has_outer_group =
+            self.current.blend_mode != BlendMode::Normal || self.current.soft_mask.is_some();
+        if has_outer_group {
+            self.display_list.push(RenderCommand::PushBlendGroup {
+                blend_mode: self.current.blend_mode,
+                isolated: true,
+                knockout: false,
+                bounds: self.display_list.page_rect,
+                alpha: 1.0,
+                mask: self.current.soft_mask.clone(),
+            });
+        }
+        self.display_list.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Normal,
+            isolated: true,
+            knockout: false,
+            bounds: self.display_list.page_rect,
+            alpha: self.current.fill_alpha,
+            mask: Some(stencil_mask),
+        });
+
+        let saved_blend = std::mem::replace(&mut self.current.blend_mode, BlendMode::Normal);
+        let saved_soft_mask = self.current.soft_mask.take();
+        let saved_fill_alpha = std::mem::replace(&mut self.current.fill_alpha, 1.0);
+        let saved_stroke_alpha = std::mem::replace(&mut self.current.stroke_alpha, 1.0);
+        let painted = self.paint_pattern_in_region(pat, bounds);
+        self.current.blend_mode = saved_blend;
+        self.current.soft_mask = saved_soft_mask;
+        self.current.fill_alpha = saved_fill_alpha;
+        self.current.stroke_alpha = saved_stroke_alpha;
+
+        if painted {
+            self.display_list.push(RenderCommand::PopBlendGroup);
+            if has_outer_group {
+                self.display_list.push(RenderCommand::PopBlendGroup);
+            }
+            true
+        } else {
+            self.display_list.commands.truncate(cmd_mark);
+            false
+        }
+    }
+
     fn emit_image_draw(
         &mut self,
         image_id: zpdf_image::ImageId,
         transform: Matrix,
         is_image_mask: bool,
     ) {
+        if is_image_mask {
+            if let Some(pat) = self.current.fill_pattern.clone() {
+                let mask_cmd = RenderCommand::DrawImage(ImageDraw {
+                    image_id,
+                    transform,
+                    alpha: 1.0,
+                    is_image_mask: true,
+                });
+                if self.emit_patterned_image_mask(mask_cmd, transform, &pat) {
+                    return;
+                }
+            }
+        }
         self.emit_painted(RenderCommand::DrawImage(ImageDraw {
             image_id,
             transform,
@@ -5048,6 +5293,18 @@ impl<'a> ContentInterpreter<'a> {
         image: std::sync::Arc<zpdf_display_list::InlineImage>,
         transform: Matrix,
     ) {
+        if image.is_image_mask {
+            if let Some(pat) = self.current.fill_pattern.clone() {
+                let mask_cmd = RenderCommand::DrawInlineImage(zpdf_display_list::InlineImageDraw {
+                    image: std::sync::Arc::clone(&image),
+                    transform,
+                    alpha: 1.0,
+                });
+                if self.emit_patterned_image_mask(mask_cmd, transform, &pat) {
+                    return;
+                }
+            }
+        }
         self.emit_painted(RenderCommand::DrawInlineImage(
             zpdf_display_list::InlineImageDraw {
                 image,
@@ -5075,6 +5332,7 @@ impl<'a> ContentInterpreter<'a> {
                 (*font_id, *glyph_id, idx)
             });
         if self.oc_suppressed() {
+            self.type3_oc_suppressed_mark = true;
             return;
         }
         let mut norm = normalize_inline_image_dict(&dict);
@@ -6221,6 +6479,7 @@ impl<'a> ContentInterpreter<'a> {
         if self.oc_suppressed() {
             // Hidden layer: skip the tile replication work entirely (the
             // surrounding clip pair is balanced and paints nothing).
+            self.type3_oc_suppressed_mark = true;
             return true;
         }
         if self.form_depth >= MAX_FORM_DEPTH {
@@ -6532,7 +6791,8 @@ impl<'a> ContentInterpreter<'a> {
     }
 
     /// Resolve an inline Type 3 font dictionary stored under `/Resources /Font`
-    /// of an indirect container object (`owner_id`).
+    /// of an indirect container object (`owner_id`), or directly under `/Font`
+    /// when `owner_id` itself is an indirect `/Resources` dictionary.
     fn resolve_container_inline_font_dict(
         &self,
         file: &PdfFile,
@@ -6545,13 +6805,73 @@ impl<'a> ContentInterpreter<'a> {
             PdfObject::Stream(s) => &s.dict,
             _ => return None,
         };
-        let res_dict = self.resolve_dict_of(owner_dict.get("Resources")?)?;
+        let res_dict = match owner_dict.get("Resources") {
+            Some(res_obj) => self.resolve_dict_of(res_obj)?,
+            None => owner_dict.clone(),
+        };
         let fonts_dict = self.resolve_dict_of(res_dict.get("Font")?)?;
         match fonts_dict.get(font_name)? {
             PdfObject::Dict(d) => Some(d.clone()),
             PdfObject::Ref(r) => file.resolve(*r).ok()?.as_dict().ok().cloned(),
             _ => None,
         }
+    }
+
+    fn reserve_type3_resource_cache(&mut self, bytes: usize) -> bool {
+        let total = self.type3_resource_cache_bytes.saturating_add(bytes);
+        if total > self.max_type3_resource_cache_bytes {
+            return false;
+        }
+        self.type3_resource_cache_bytes = total;
+        true
+    }
+
+    /// Parse a `/Resources` object for a Type 3 font or CharProc, sharing a
+    /// single parsed `Arc<CachedType3ResourceScope>` across all callers that
+    /// reference the same indirect `/Resources` object ID and bounding retained
+    /// bytes for distinct scopes.
+    fn load_type3_resource_scope(
+        &mut self,
+        res_obj: &PdfObject,
+        container_owner_id: Option<ObjectId>,
+        file: &PdfFile,
+    ) -> Option<(std::sync::Arc<CachedType3ResourceScope>, bool)> {
+        if let PdfObject::Ref(res_id) = res_obj {
+            if let Some(shared) = self.type3_shared_resources.get(res_id) {
+                return Some((std::sync::Arc::clone(shared), true));
+            }
+            let res_dict = self.resolve_dict_of(res_obj)?;
+            let parsed_resources = zpdf_document::page::parse_resource_dict(&res_dict, file)
+                .ok()
+                .map(std::sync::Arc::new);
+            let font_bindings = self.prepare_font_bindings(&res_dict, Some(*res_id), file);
+            let scope = std::sync::Arc::new(CachedType3ResourceScope {
+                parsed_resources,
+                font_bindings,
+            });
+            let cost = estimate_type3_resource_scope_bytes(&scope).saturating_add(64);
+            let cached = if self.reserve_type3_resource_cache(cost) {
+                self.type3_shared_resources
+                    .insert(*res_id, std::sync::Arc::clone(&scope));
+                true
+            } else {
+                false
+            };
+            return Some((scope, cached));
+        }
+
+        let res_dict = self.resolve_dict_of(res_obj)?;
+        let parsed_resources = zpdf_document::page::parse_resource_dict(&res_dict, file)
+            .ok()
+            .map(std::sync::Arc::new);
+        let font_bindings = self.prepare_font_bindings(&res_dict, container_owner_id, file);
+        let scope = std::sync::Arc::new(CachedType3ResourceScope {
+            parsed_resources,
+            font_bindings,
+        });
+        let cost = estimate_type3_resource_scope_bytes(&scope);
+        let cached = self.reserve_type3_resource_cache(cost);
+        Some((scope, cached))
     }
 
     /// Parse and cache the font-level `/Resources` scope, pre-loaded font
@@ -6565,6 +6885,7 @@ impl<'a> ContentInterpreter<'a> {
             return std::sync::Arc::clone(cached);
         }
         let mut info = CachedType3FontResources::default();
+        let mut cache_scope = true;
         if let Some(file) = self.file {
             let source = self
                 .font_cache
@@ -6590,13 +6911,11 @@ impl<'a> ContentInterpreter<'a> {
             };
             if let Some(dict) = font_dict {
                 if let Some(res_obj) = dict.get("Resources") {
-                    if let Some(res_dict) = self.resolve_dict_of(res_obj) {
-                        if let Ok(parsed) =
-                            zpdf_document::page::parse_resource_dict(&res_dict, file)
-                        {
-                            info.parsed_resources = Some(std::sync::Arc::new(parsed));
-                        }
-                        info.font_bindings = self.prepare_font_bindings(&res_dict, owner_id, file);
+                    if let Some((scope, cached)) =
+                        self.load_type3_resource_scope(res_obj, owner_id, file)
+                    {
+                        info.scope = Some(scope);
+                        cache_scope = cached;
                     }
                 }
                 if let Some(cp_obj) = dict.get("CharProcs") {
@@ -6610,43 +6929,51 @@ impl<'a> ContentInterpreter<'a> {
                 }
             }
         }
+        let map_cost = info.char_proc_ids.keys().fold(64usize, |acc, k| {
+            acc.saturating_add(48).saturating_add(k.len())
+        });
         let arc = std::sync::Arc::new(info);
-        self.type3_font_resources
-            .insert(font_id, std::sync::Arc::clone(&arc));
+        if cache_scope && self.reserve_type3_resource_cache(map_cost) {
+            self.type3_font_resources
+                .insert(font_id, std::sync::Arc::clone(&arc));
+        }
         arc
     }
 
     /// Parse and cache a CharProc stream's optional `/Resources` scope and
-    /// font bindings once per unique CharProc stream object ID on this page.
+    /// font bindings, sharing parsed indirect `/Resources` scopes across
+    /// CharProc streams and bounding retention for distinct scopes.
     fn cached_type3_glyph_resources(
         &mut self,
         cp_id: ObjectId,
-    ) -> std::sync::Arc<CachedType3GlyphResources> {
+    ) -> Option<std::sync::Arc<CachedType3ResourceScope>> {
         if let Some(cached) = self.type3_glyph_resources.get(&cp_id) {
-            return std::sync::Arc::clone(cached);
+            return cached.as_ref().map(std::sync::Arc::clone);
         }
-        let mut info = CachedType3GlyphResources::default();
-        if let Some(file) = self.file {
-            if let Ok(obj) = file.resolve_shared(cp_id) {
-                if let Ok(stream) = obj.as_stream() {
-                    if let Some(res_obj) = stream.dict.get("Resources") {
-                        if let Some(res_dict) = self.resolve_dict_of(res_obj) {
-                            if let Ok(parsed) =
-                                zpdf_document::page::parse_resource_dict(&res_dict, file)
-                            {
-                                info.parsed_resources = Some(std::sync::Arc::new(parsed));
-                            }
-                            info.font_bindings =
-                                self.prepare_font_bindings(&res_dict, Some(cp_id), file);
-                        }
-                    }
-                }
+        let file = self.file?;
+        let res_obj = file.resolve_shared(cp_id).ok().and_then(|obj| {
+            obj.as_stream()
+                .ok()
+                .and_then(|s| s.dict.get("Resources").cloned())
+        });
+        let Some(res_obj) = res_obj else {
+            if self.reserve_type3_resource_cache(48) {
+                self.type3_glyph_resources.insert(cp_id, None);
             }
+            return None;
+        };
+        let Some((scope, can_cache)) = self.load_type3_resource_scope(&res_obj, Some(cp_id), file)
+        else {
+            if self.reserve_type3_resource_cache(48) {
+                self.type3_glyph_resources.insert(cp_id, None);
+            }
+            return None;
+        };
+        if can_cache && self.reserve_type3_resource_cache(48) {
+            self.type3_glyph_resources
+                .insert(cp_id, Some(std::sync::Arc::clone(&scope)));
         }
-        let arc = std::sync::Arc::new(info);
-        self.type3_glyph_resources
-            .insert(cp_id, std::sync::Arc::clone(&arc));
-        arc
+        Some(scope)
     }
 
     /// Interpret each Type 3 glyph's CharProc content stream directly in
@@ -6669,6 +6996,10 @@ impl<'a> ContentInterpreter<'a> {
         if glyphs.is_empty() || self.over_budget() {
             return;
         }
+        if self.oc_suppressed() {
+            self.type3_oc_suppressed_mark = true;
+            return;
+        }
         if self.form_depth >= MAX_TYPE3_DEPTH {
             self.stats.diagnostics.resource_limit_reached = true;
             tracing::warn!("Type 3 glyph nesting exceeds {MAX_TYPE3_DEPTH}; skipping");
@@ -6679,13 +7010,15 @@ impl<'a> ContentInterpreter<'a> {
         let font_meta = self.cached_type3_font_resources(font_id);
         let mut pushed_font_res = false;
         let mut pushed_font_overrides = false;
-        if let Some(res) = font_meta.parsed_resources.as_ref() {
-            self.form_resources.push(std::sync::Arc::clone(res));
-            pushed_font_res = true;
-        }
-        if !font_meta.font_bindings.is_empty() {
-            self.push_cached_font_bindings(&font_meta.font_bindings);
-            pushed_font_overrides = true;
+        if let Some(scope) = font_meta.scope.as_ref() {
+            if let Some(res) = scope.parsed_resources.as_ref() {
+                self.form_resources.push(std::sync::Arc::clone(res));
+                pushed_font_res = true;
+            }
+            if !scope.font_bindings.is_empty() {
+                self.push_cached_font_bindings(&scope.font_bindings);
+                pushed_font_overrides = true;
+            }
         }
 
         let mut completed = true;
@@ -6783,14 +7116,15 @@ impl<'a> ContentInterpreter<'a> {
             let mut pushed_glyph_res = false;
             let mut pushed_glyph_overrides = false;
             if let Some(&cp_id) = font_meta.char_proc_ids.get(&glyph_name) {
-                let glyph_meta = self.cached_type3_glyph_resources(cp_id);
-                if let Some(res) = glyph_meta.parsed_resources.as_ref() {
-                    self.form_resources.push(std::sync::Arc::clone(res));
-                    pushed_glyph_res = true;
-                }
-                if !glyph_meta.font_bindings.is_empty() {
-                    self.push_cached_font_bindings(&glyph_meta.font_bindings);
-                    pushed_glyph_overrides = true;
+                if let Some(glyph_meta) = self.cached_type3_glyph_resources(cp_id) {
+                    if let Some(res) = glyph_meta.parsed_resources.as_ref() {
+                        self.form_resources.push(std::sync::Arc::clone(res));
+                        pushed_glyph_res = true;
+                    }
+                    if !glyph_meta.font_bindings.is_empty() {
+                        self.push_cached_font_bindings(&glyph_meta.font_bindings);
+                        pushed_glyph_overrides = true;
+                    }
                 }
             }
 
@@ -6824,6 +7158,8 @@ impl<'a> ContentInterpreter<'a> {
             let saved_suppress_color_ops = self.suppress_color_ops;
             let saved_type3_inline_ctx =
                 self.type3_inline_ctx.replace((font_id, glyph.glyph_id, 0));
+            let saved_type3_oc_suppressed =
+                std::mem::replace(&mut self.type3_oc_suppressed_mark, false);
 
             self.current.ctm = glyph_ctm;
             self.base_ctm = glyph_ctm;
@@ -6907,6 +7243,10 @@ impl<'a> ContentInterpreter<'a> {
             self.base_ctm = saved_base_ctm;
             self.suppress_color_ops = saved_suppress_color_ops;
             self.type3_inline_ctx = saved_type3_inline_ctx;
+            let glyph_oc_suppressed = std::mem::replace(
+                &mut self.type3_oc_suppressed_mark,
+                saved_type3_oc_suppressed,
+            );
 
             if pushed_glyph_overrides {
                 self.pop_form_fonts();
@@ -6915,8 +7255,13 @@ impl<'a> ContentInterpreter<'a> {
                 self.form_resources.pop();
             }
 
-            if completed && glyph_verified {
-                let glyph_cmd_end = self.display_list.commands.len();
+            let glyph_cmd_end = self.display_list.commands.len();
+            let fully_hidden_by_oc = glyph_oc_suppressed && glyph_cmd_end == glyph_cmd_start;
+            if fully_hidden_by_oc {
+                // Propagate OC suppression to any enclosing Type 3 glyph.
+                self.type3_oc_suppressed_mark = true;
+            }
+            if completed && glyph_verified && !fully_hidden_by_oc {
                 match active_verified.as_mut() {
                     Some((_, end, seg_glyphs)) if *end == glyph_cmd_start => {
                         *end = glyph_cmd_end;
@@ -7811,6 +8156,9 @@ impl<'a> ContentInterpreter<'a> {
         let invisible = matches!(self.current.render_mode, 3 | 7) || no_marks;
         let wants_clip = matches!(self.current.render_mode, 4..=7);
         let paints = !invisible && !self.oc_suppressed();
+        if !invisible && self.oc_suppressed() {
+            self.type3_oc_suppressed_mark = true;
+        }
         // Gate drawing-font resolution on whether the show actually paints or
         // contributes a clip so disabled-OCG and `/None`-colorant shows never
         // permanently consume page font-cache budget.
@@ -12105,6 +12453,174 @@ mod tests {
         assert!(
             stats.diagnostics.resource_limit_reached,
             "dropping an over-budget inline image must report resource_limit_reached"
+        );
+    }
+
+    #[test]
+    fn type3_inline_image_stopped_by_operator_budget_preserves_cutoff() {
+        // CharProc paints an inline stencil, then a vector rectangle. Under an
+        // operator budget that expires right after the inline image (with no
+        // ImageCache), the interpreter must preserve the stopping point: emit
+        // only the pre-cutoff DrawInlineImage, never emit a DrawGlyphRun that
+        // would replay the post-cutoff FillPath, and omit ExpandedGlyphRun.
+        let mut glyph_bytes = b"1000 0 d0\n\
+            800 0 0 800 0 0 cm\n\
+            BI /IM true /W 1 /H 1 /BPC 1 ID "
+            .to_vec();
+        glyph_bytes.push(0x00);
+        glyph_bytes.extend_from_slice(b"\nEI\n0 1 0 rg 0 0 500 500 re f");
+
+        let mut char_procs = HashMap::new();
+        char_procs.insert(
+            "A".to_string(),
+            std::sync::Arc::<[u8]>::from(glyph_bytes.as_slice()),
+        );
+        let mut encoding = vec![String::new(); 66];
+        encoding[65] = "A".to_string();
+        let font = zpdf_font::LoadedFont::new_with_data(
+            zpdf_font::PdfFontType::Type3 {
+                font_matrix: [0.001, 0.0, 0.0, 0.001, 0.0, 0.0],
+                char_procs,
+                encoding,
+                widths: vec![1000.0],
+                first_char: 65,
+            },
+            "Type3OpCutoff".into(),
+            Vec::new(),
+            zpdf_font::CidWidths::new(1000.0),
+        );
+        let mut fonts = FontCache::new();
+        fonts.insert("F1".into(), font);
+
+        // Page ops: BT (1), Tf (2), Td (3), Tj (4) -> inside CharProc: d0 (5),
+        // cm (6), BI/EI (7). Cap at 7 operators so `0 1 0 rg 0 0 500 500 re f`
+        // is cut off immediately after the inline image.
+        let limits = zpdf_core::ParseLimits {
+            max_page_operators: 7,
+            ..zpdf_core::ParseLimits::default()
+        };
+        let dl = ContentInterpreter::new(Rect::new(0.0, 0.0, 100.0, 100.0))
+            .with_fonts(&mut fonts)
+            .with_limits(&limits)
+            .interpret(b"BT /F1 40 Tf 10 20 Td (A) Tj ET");
+
+        assert_eq!(
+            dl.commands.len(),
+            1,
+            "only the pre-cutoff inline image must be emitted"
+        );
+        assert!(matches!(dl.commands[0], RenderCommand::DrawInlineImage(_)));
+        assert!(
+            !dl.commands.iter().any(|c| matches!(
+                c,
+                RenderCommand::DrawGlyphRun(_) | RenderCommand::FillPath { .. }
+            )),
+            "cutoff after inline image must not emit DrawGlyphRun or post-cutoff FillPath"
+        );
+        assert!(
+            dl.expanded_glyph_runs().is_empty(),
+            "interrupted glyph must not publish an ExpandedGlyphRun"
+        );
+    }
+
+    #[test]
+    fn type3_glyph_resources_share_indirect_scope_and_bound_distinct_scopes() {
+        let stream_obj = |dict: &str, bytes: &[u8]| -> Vec<u8> {
+            let mut out = format!("<< {dict} /Length {} >>\nstream\n", bytes.len()).into_bytes();
+            out.extend_from_slice(bytes);
+            out.extend_from_slice(b"\nendstream");
+            out
+        };
+        let assemble = |objs: &[Vec<u8>]| -> Vec<u8> {
+            let mut out = b"%PDF-1.7\n".to_vec();
+            let mut offs = Vec::with_capacity(objs.len());
+            for (i, body) in objs.iter().enumerate() {
+                offs.push(out.len());
+                out.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+                out.extend_from_slice(body);
+                out.extend_from_slice(b"\nendobj\n");
+            }
+            let xref = out.len();
+            let n = objs.len() + 1;
+            out.extend_from_slice(format!("xref\n0 {n}\n0000000000 65535 f \n").as_bytes());
+            for off in offs {
+                out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+            }
+            out.extend_from_slice(
+                format!("trailer\n<< /Size {n} >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+            );
+            out
+        };
+
+        // 1. Two distinct CharProcs (obj 1 and obj 2) share one indirect
+        //    `/Resources 3 0 R` carrying a large inline ExtGState payload.
+        // 2. Two other CharProcs (obj 4 and obj 5) each carry distinct inline
+        //    `/Resources` dictionaries with large inline payloads.
+        let shared_payload = "s".repeat(2048);
+        let inline_payload = "i".repeat(2048);
+        let shared_res =
+            format!("<< /ExtGState << /GS1 << /ca 0.5 /Pad ({shared_payload}) >> >> >>");
+        let inline_res =
+            format!("/Resources << /ExtGState << /GS1 << /ca 0.5 /Pad ({inline_payload}) >> >> >>");
+        let pdf = assemble(&[
+            stream_obj("/Resources 3 0 R", b"1000 0 d0 /GS1 gs 0 0 500 500 re f"), // 1
+            stream_obj("/Resources 3 0 R", b"1000 0 d0 /GS1 gs 0 0 500 500 re f"), // 2
+            shared_res.into_bytes(),                                               // 3
+            stream_obj(&inline_res, b"1000 0 d0 /GS1 gs 0 0 500 500 re f"),        // 4
+            stream_obj(&inline_res, b"1000 0 d0 /GS1 gs 0 0 500 500 re f"),        // 5
+        ]);
+        let file = zpdf_parser::PdfFile::parse(pdf).expect("parse pdf");
+        let page_res = ResourceDict::default();
+        let mut interp = ContentInterpreter::new(Rect::new(0.0, 0.0, 100.0, 100.0))
+            .with_document(&file, &page_res);
+        interp.max_type3_resource_cache_bytes = 4096;
+
+        let s1 = interp
+            .cached_type3_glyph_resources(ObjectId(1, 0))
+            .expect("cp 1 scope");
+        let bytes_after_first = interp.type3_resource_cache_bytes;
+        let s2 = interp
+            .cached_type3_glyph_resources(ObjectId(2, 0))
+            .expect("cp 2 scope");
+        assert!(
+            std::sync::Arc::ptr_eq(&s1, &s2),
+            "distinct CharProcs pointing to the same indirect /Resources must share one Arc"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(
+                s1.parsed_resources.as_ref().expect("parsed"),
+                s2.parsed_resources.as_ref().expect("parsed"),
+            ),
+            "parsed ResourceDict must be shared, not cloned per CharProc"
+        );
+        assert!(
+            interp.type3_resource_cache_bytes <= bytes_after_first + 48,
+            "second CharProc sharing an indirect /Resources must not multiply retained bytes"
+        );
+
+        // Distinct inline scopes past `max_type3_resource_cache_bytes` still
+        // parse and return usable scopes, but are not retained past the cap.
+        let s4 = interp
+            .cached_type3_glyph_resources(ObjectId(4, 0))
+            .expect("cp 4 scope still returned");
+        let s5 = interp
+            .cached_type3_glyph_resources(ObjectId(5, 0))
+            .expect("cp 5 scope still returned");
+        assert!(s4.parsed_resources.is_some());
+        assert!(s5.parsed_resources.is_some());
+        assert!(
+            interp.type3_resource_cache_bytes <= interp.max_type3_resource_cache_bytes,
+            "retained Type 3 resource cache bytes ({}) must stay within cap ({})",
+            interp.type3_resource_cache_bytes,
+            interp.max_type3_resource_cache_bytes
+        );
+        assert!(
+            !interp.type3_glyph_resources.contains_key(&ObjectId(4, 0)),
+            "over-budget distinct inline glyph scope must not be retained"
+        );
+        assert!(
+            !interp.type3_glyph_resources.contains_key(&ObjectId(5, 0)),
+            "over-budget distinct inline glyph scope must not be retained"
         );
     }
 }
