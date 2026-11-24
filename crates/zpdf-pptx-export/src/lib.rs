@@ -2685,9 +2685,10 @@ fn type3_glyph_range_starting_at(display_list: &DisplayList, cmd_idx: usize) -> 
 }
 
 /// Linear O(N) pre-pass marking each `PushBlendGroup` index that contains a
-/// nested non-Normal `PushBlendGroup`. Used so an isolated Normal group
-/// containing an inner non-Normal blend flattens as one isolated unit rather
-/// than blending against the outer page backdrop.
+/// nested backdrop-sampling operation (non-Normal `PushBlendGroup` or
+/// partial-colorant `Overprint`). Used so an isolated Normal group containing
+/// such an operation flattens as one isolated unit rather than losing its
+/// inner backdrop when `current_surface()` is unavailable inside the group.
 fn compute_isolated_inner_non_normal_blends(commands: &[RenderCommand]) -> Vec<bool> {
     let mut flags = vec![false; commands.len()];
     if !commands.iter().any(|c| {
@@ -2695,7 +2696,7 @@ fn compute_isolated_inner_non_normal_blends(commands: &[RenderCommand]) -> Vec<b
             c,
             RenderCommand::PushBlendGroup { blend_mode, .. }
                 if *blend_mode != zpdf_display_list::BlendMode::Normal
-        )
+        ) || command_overprint(c).is_some_and(|op| op.active != 0)
     }) {
         return flags;
     }
@@ -2719,6 +2720,11 @@ fn compute_isolated_inner_non_normal_blends(commands: &[RenderCommand]) -> Vec<b
                             *parent_inner = true;
                         }
                     }
+                }
+            }
+            other if command_overprint(other).is_some_and(|op| op.active != 0) => {
+                if let Some((_, has_inner)) = stack.last_mut() {
+                    *has_inner = true;
                 }
             }
             _ => {}
@@ -11961,6 +11967,129 @@ mod export_tests {
             sample_elem_pdf(4, 460.0, 78.0, "/low_miter_v")[3],
             0,
             "low miter limit (1.2) must bevel the sharp corner instead of projecting to y=78"
+        );
+    }
+
+    #[test]
+    fn isolated_normal_form_with_overprinting_type3_glyph_composites_against_form_backdrop() {
+        let stream = |dict: &str, data: &[u8]| -> Vec<u8> {
+            let mut out = format!("<< {dict} /Length {} >>\nstream\n", data.len()).into_bytes();
+            out.extend_from_slice(data);
+            out.extend_from_slice(b"\nendstream");
+            out
+        };
+        let assemble = |objects: &[Vec<u8>]| -> Vec<u8> {
+            let mut pdf = b"%PDF-1.4\n".to_vec();
+            let mut offsets = Vec::with_capacity(objects.len());
+            for (i, body) in objects.iter().enumerate() {
+                offsets.push(pdf.len());
+                pdf.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+                pdf.extend_from_slice(body);
+                pdf.extend_from_slice(b"\nendobj\n");
+            }
+            let xref = pdf.len();
+            pdf.extend_from_slice(
+                format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+            );
+            for off in offsets {
+                pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+            }
+            pdf.extend_from_slice(
+                format!(
+                    "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                    objects.len() + 1
+                )
+                .as_bytes(),
+            );
+            pdf
+        };
+
+        // 400x200 page with a magenta outer backdrop (`1 0 1 rg`) and an opaque
+        // isolated Normal Form XObject (/Fm1) that paints a cyan rectangle [20..220]x[20..140]
+        // and then a yellow-only overprinting Type 3 `d0` glyph at [60..124]x[40..104].
+        // Flattening the isolated Form as a unit produces green (cyan + yellow overprint)
+        // in the overlap without knocking out cyan or mixing with the outer magenta page.
+        let pdf = assemble(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 200] /Contents 4 0 R \
+              /Resources << /XObject << /Fm1 5 0 R >> >> >>"
+                .to_vec(), // 3
+            stream("", b"1 0 1 rg 0 0 400 200 re f /Fm1 Do"), // 4
+            stream(
+                "/Type /XObject /Subtype /Form /BBox [20 20 220 140] \
+                 /Group << /Type /Group /S /Transparency /I true /K false >> \
+                 /Resources << /Font << /F1 6 0 R >> >>",
+                b"0 1 1 rg 20 20 200 120 re f BT /F1 80 Tf 60 40 Td (A) Tj ET",
+            ), // 5
+            b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] \
+              /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs 7 0 R /Encoding 8 0 R \
+              /FirstChar 65 /LastChar 65 /Widths [1000] \
+              /Resources << /ExtGState << /GSop 10 0 R >> >> >>"
+                .to_vec(), // 6
+            b"<< /ovp 9 0 R >>".to_vec(),                  // 7
+            b"<< /Type /Encoding /Differences [65 /ovp] >>".to_vec(), // 8
+            stream("", b"1000 0 d0 /GSop gs 0 0 1 0 k 0 0 800 800 re f"), // 9
+            b"<< /Type /ExtGState /op true /OPM 1 >>".to_vec(), // 10
+        ]);
+
+        let doc = zpdf_document::PdfDocument::open(pdf).expect("open pdf");
+        let page = doc.page(0).expect("page 0");
+        let mut fonts = doc.load_page_fonts(&page);
+        let (content_bytes, _) = doc.page_content_with_diagnostics(&page).expect("content");
+        let mut images = ImageCache::new();
+        let (dl, _) = zpdf_content::interpreter::ContentInterpreter::new(page.effective_box())
+            .with_document(doc.file(), &page.resources)
+            .with_fonts(&mut fonts)
+            .with_images(&mut images)
+            .interpret_with_stats(&content_bytes);
+
+        let slide = display_list_to_slide(&dl, 0, &fonts, &images, &ConversionOptions::default())
+            .expect("isolated form overprint export");
+        assert_eq!(
+            slide.elements.len(),
+            2,
+            "outer magenta backdrop + one flattened isolated Form image expected: {:?}",
+            slide.elements
+        );
+        let SlideElement::Image {
+            x_emu,
+            y_emu,
+            image_data,
+            ..
+        } = &slide.elements[1]
+        else {
+            panic!(
+                "isolated Normal Form with inner partial-colorant overprint must flatten as SlideElement::Image, got {:?}",
+                slide.elements[1]
+            );
+        };
+        let rgba = image::load_from_memory(image_data)
+            .expect("decode Form PNG")
+            .to_rgba8();
+        let x_pt = *x_emu as f64 / 12700.0;
+        let y_pt = *y_emu as f64 / 12700.0;
+        let sample_pdf = |pdf_x: f64, pdf_y: f64| -> [u8; 4] {
+            let ppt_y = 200.0 - pdf_y;
+            let px = ((pdf_x - x_pt) * 2.0).round() as u32;
+            let py = ((ppt_y - y_pt) * 2.0).round() as u32;
+            rgba.get_pixel(px, py).0
+        };
+
+        // Inside the overlap [60..124]x[40..104] -> green (C=1 from Form's cyan + Y=1 from glyph).
+        let overlap_px = sample_pdf(90.0, 70.0);
+        assert!(
+            overlap_px[3] == 255
+                && overlap_px[0] < 15
+                && overlap_px[1] > 240
+                && overlap_px[2] < 15,
+            "yellow overprint Type 3 glyph over cyan inside isolated Form must render green, got {overlap_px:?}"
+        );
+        // Inside the Form outside the glyph [20..60] -> pure cyan.
+        let cyan_px = sample_pdf(35.0, 70.0);
+        assert!(
+            cyan_px[3] == 255 && cyan_px[0] < 15 && cyan_px[1] > 240 && cyan_px[2] > 240,
+            "uncovered portion of isolated Form must remain cyan, got {cyan_px:?}"
         );
     }
 }
