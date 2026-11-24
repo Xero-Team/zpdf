@@ -339,9 +339,9 @@ fn build_outline_path(
 }
 
 /// Render Type3 glyphs: each glyph is a content stream. Interpret it to a
-/// sub-display-list (same glyph_rect as the CPU), then route only its fills and
-/// strokes through the solid pipeline, transformed by FontMatrix. Mirrors
-/// `CpuRenderer::render_type3_glyphs`.
+/// sub-display-list (same glyph_rect as the CPU), routing fills, strokes, and
+/// inline image masks (bitmap Type 3 stencils) transformed by FontMatrix.
+/// Mirrors `CpuRenderer::render_type3_glyphs`.
 fn render_type3(
     rec: &mut PageRecorder,
     font: &LoadedFont,
@@ -360,7 +360,7 @@ fn render_type3(
         let Some((stream, font_matrix)) = font.type3_glyph_stream(g.glyph_id) else {
             continue;
         };
-        let Some(glyph_dl) = rec.interpret_type3_stream(stream) else {
+        let Some((glyph_dl, glyph_images)) = rec.interpret_type3_stream(stream) else {
             return;
         };
 
@@ -402,6 +402,67 @@ fn render_type3(
                         if let Some(mesh) = stroke_lyon_path(&p, &opts, color) {
                             rec.add_mesh(mesh);
                         }
+                    }
+                }
+                RenderCommand::DrawImage(draw) => {
+                    let Some(src_img) = glyph_images.get(draw.image_id) else {
+                        continue;
+                    };
+                    if !crate::image::is_valid_decoded_image(src_img) {
+                        continue;
+                    }
+                    let glyph_to_page = tm
+                        .concat(&Matrix::translate(g.x as f64, g.y as f64))
+                        .concat(&Matrix::scale(
+                            font_size as f64 * h_scale as f64,
+                            font_size as f64,
+                        ))
+                        .concat(&Matrix::new(
+                            font_matrix[0],
+                            font_matrix[1],
+                            font_matrix[2],
+                            font_matrix[3],
+                            font_matrix[4],
+                            font_matrix[5],
+                        ))
+                        .concat(&draw.transform);
+                    let (upload_img, eff_alpha) = if draw.is_image_mask {
+                        let a_scale = color[3].clamp(0.0, 1.0);
+                        if a_scale <= 0.0 {
+                            continue;
+                        }
+                        let (r_s, g_s, b_s) = (
+                            (color[0] / a_scale).clamp(0.0, 1.0),
+                            (color[1] / a_scale).clamp(0.0, 1.0),
+                            (color[2] / a_scale).clamp(0.0, 1.0),
+                        );
+                        let mut tinted = src_img.clone();
+                        for px in tinted.data.as_chunks_mut::<4>().0 {
+                            let pa = px[3];
+                            if pa == 0 {
+                                px[0] = 0;
+                                px[1] = 0;
+                                px[2] = 0;
+                                continue;
+                            }
+                            let paf = pa as f32;
+                            px[0] = (r_s * paf).round() as u8;
+                            px[1] = (g_s * paf).round() as u8;
+                            px[2] = (b_s * paf).round() as u8;
+                        }
+                        (tinted, draw.alpha * a_scale)
+                    } else {
+                        (src_img.clone(), draw.alpha)
+                    };
+                    let quad = crate::image::image_quad(
+                        upload_img.width as f32,
+                        upload_img.height as f32,
+                        &glyph_to_page,
+                        map,
+                        eff_alpha,
+                    );
+                    if crate::image::is_safe_quad(&quad) {
+                        rec.add_type3_image(quad, upload_img);
                     }
                 }
                 _ => {}

@@ -2830,3 +2830,108 @@ fn gpu_clipped_normal_tiling_glyph_applies_inherited_clip_once() {
         "clipped Normal tiling glyph edge must match clipped solid glyph ({edge_solid:?}) rather than double-clipping to ~191, got {edge_tiling:?}"
     );
 }
+
+#[test]
+fn gpu_type3_bitmap_glyph_tiling_preserves_silhouette() {
+    use std::sync::Arc;
+    use zpdf::display_list::{
+        Color, DisplayList, FillRule, GlyphRun, Paint, Path, PositionedGlyph, RenderCommand,
+        TilingPattern,
+    };
+    use zpdf_core::{Matrix, Rect};
+    use zpdf_font::{CidWidths, FontCache, LoadedFont, PdfFontType};
+
+    // 8×8 1-bit `/ImageMask true` CharProc: top 4 rows opaque ink (0x00),
+    // bottom 4 rows transparent (0xFF).
+    let glyph_stream = b"BI /W 8 /H 8 /BPC 1 /IM true ID \x00\x00\x00\x00\xff\xff\xff\xff EI";
+    let font = LoadedFont::new_with_data(
+        PdfFontType::Type3 {
+            font_matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            char_procs: std::collections::HashMap::from([(
+                "A".into(),
+                Arc::<[u8]>::from(&glyph_stream[..]),
+            )]),
+            encoding: vec!["A".into()],
+            widths: vec![1.0],
+            first_char: 0,
+        },
+        "Type3BitmapGpu".into(),
+        Vec::new(),
+        CidWidths::new(1.0),
+    );
+    let mut fonts = FontCache::new();
+    let font_id = fonts.insert("F1".into(), font);
+
+    let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 8.0, 8.0));
+    let mut sq = Path::new();
+    sq.rect(Rect::new(0.0, 0.0, 8.0, 8.0));
+    cell.push(RenderCommand::FillPath {
+        path: sq,
+        rule: FillRule::NonZero,
+        paint: Paint::Solid(Color::rgb(1.0, 0.0, 0.0)),
+        alpha: 1.0,
+        overprint: None,
+    });
+    let tiling = Arc::new(TilingPattern {
+        commands: Arc::new(cell),
+        bbox: Rect::new(0.0, 0.0, 8.0, 8.0),
+        x_step: 8.0,
+        y_step: 8.0,
+        matrix: Matrix::identity(),
+        tiling_type: 1,
+    });
+
+    let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 40.0, 40.0));
+    dl.push(RenderCommand::DrawGlyphRun(GlyphRun {
+        font_id,
+        font_size: 24.0,
+        glyphs: vec![PositionedGlyph {
+            glyph_id: 0,
+            code_len: 1,
+            code: b'A' as u32,
+            x: 0.0,
+            y: 0.0,
+            advance: 24.0,
+        }],
+        paint: Paint::Tiling(tiling),
+        alpha: 1.0,
+        overprint: None,
+        transform: Matrix::translate(8.0, 8.0),
+        h_scale: 1.0,
+    }));
+
+    let cpu = zpdf_render_cpu::CpuRenderer::new()
+        .with_fonts(&fonts)
+        .render_display_list(&dl, 1.0)
+        .expect("cpu render");
+    let gpu = match render_gpu_shared(&dl, Some(&fonts), None, 1.0) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("skipping GPU Type 3 bitmap glyph test (no adapter?): {e}");
+            return;
+        }
+    };
+
+    // Glyph spans PDF [8..32]×[8..32] -> pixel [8..32]×[8..32].
+    // Top half (pixel y=14) must be opaque red; bottom half (pixel y=26) must stay white.
+    let px = |data: &[u8], w: u32, x: u32, y: u32| -> [u8; 3] {
+        let off = ((y * w + x) * 4) as usize;
+        [data[off], data[off + 1], data[off + 2]]
+    };
+    let cpu_top = px(&cpu.data, cpu.width, 20, 14);
+    let gpu_top = px(&gpu.data, gpu.width, 20, 14);
+    let gpu_bot = px(&gpu.data, gpu.width, 20, 26);
+    assert!(
+        cpu_top[0] > 245 && cpu_top[1] < 10 && cpu_top[2] < 10,
+        "CPU Type 3 bitmap glyph top half must be red, got {cpu_top:?}"
+    );
+    assert!(
+        gpu_top[0] > 245 && gpu_top[1] < 10 && gpu_top[2] < 10,
+        "GPU Type 3 bitmap glyph top half must be red, got {gpu_top:?}"
+    );
+    assert_eq!(
+        gpu_bot,
+        [255, 255, 255],
+        "GPU Type 3 bitmap glyph transparent bottom half must remain white"
+    );
+}

@@ -6008,7 +6008,8 @@ impl<'a> CpuRenderer<'a> {
     /// Type 3 glyphs in Beamer PDFs commonly use `/ImageMask true` inline
     /// images as glyph stencils. The nested interpreter decodes those images
     /// with its default black fill colour, so recolour their opaque samples
-    /// with the text paint before sending them through the normal image path.
+    /// with the text paint (or mask a tiling pattern shader through the
+    /// stencil's alpha coverage) before compositing onto the page.
     fn render_type3_image(
         &mut self,
         image_cache: &ImageCache,
@@ -6016,45 +6017,187 @@ impl<'a> CpuRenderer<'a> {
         paint: &tiny_skia::Paint<'_>,
         alpha: f32,
     ) {
-        let Some(tint) = (match &paint.shader {
-            tiny_skia::Shader::SolidColor(color) => Some(*color),
-            _ => None,
-        }) else {
-            return;
-        };
         let Some(source) = image_cache.get(draw.image_id) else {
             return;
         };
-        let alpha = alpha * draw.alpha;
+        let eff_alpha = alpha * draw.alpha;
         if !draw.is_image_mask {
-            self.render_image_from_cache(image_cache, draw, alpha, false);
+            self.render_image_from_cache(image_cache, draw, eff_alpha, false);
             return;
         }
 
-        let mut tinted = source.clone();
-        let (pixels, _) = tinted.data.as_chunks_mut::<4>();
-        for pixel in pixels {
-            let pixel_alpha = pixel[3];
-            if pixel_alpha == 0 {
-                continue;
-            }
-            // ImageCache pixels are premultiplied RGBA. Type 3 masks currently
-            // have binary alpha, but multiplying here also keeps this correct
-            // for anti-aliased mask decoders.
-            pixel[0] = (tint.red() * pixel_alpha as f32).round() as u8;
-            pixel[1] = (tint.green() * pixel_alpha as f32).round() as u8;
-            pixel[2] = (tint.blue() * pixel_alpha as f32).round() as u8;
-        }
+        match &paint.shader {
+            tiny_skia::Shader::SolidColor(tint) => {
+                let mut tinted = source.clone();
+                let (pixels, _) = tinted.data.as_chunks_mut::<4>();
+                for pixel in pixels {
+                    let pixel_alpha = pixel[3];
+                    if pixel_alpha == 0 {
+                        continue;
+                    }
+                    // ImageCache pixels are premultiplied RGBA. Type 3 masks currently
+                    // have binary alpha, but multiplying here also keeps this correct
+                    // for anti-aliased mask decoders.
+                    pixel[0] = (tint.red() * pixel_alpha as f32).round() as u8;
+                    pixel[1] = (tint.green() * pixel_alpha as f32).round() as u8;
+                    pixel[2] = (tint.blue() * pixel_alpha as f32).round() as u8;
+                }
 
-        let mut tinted_cache = ImageCache::new();
-        let image_id = tinted_cache.insert(tinted);
-        let draw = ImageDraw {
-            image_id,
-            transform: draw.transform,
-            alpha: draw.alpha,
-            is_image_mask: true,
-        };
-        self.render_image_from_cache(&tinted_cache, &draw, alpha, false);
+                let mut tinted_cache = ImageCache::new();
+                let image_id = tinted_cache.insert(tinted);
+                let draw = ImageDraw {
+                    image_id,
+                    transform: draw.transform,
+                    alpha: draw.alpha,
+                    is_image_mask: true,
+                };
+                self.render_image_from_cache(&tinted_cache, &draw, eff_alpha, false);
+            }
+            tiny_skia::Shader::Pattern(_) => {
+                let Some(expected_len) = (source.width as usize)
+                    .checked_mul(source.height as usize)
+                    .and_then(|n| n.checked_mul(4))
+                else {
+                    return;
+                };
+                if source.width == 0 || source.height == 0 || source.data.len() != expected_len {
+                    return;
+                }
+                let Some((pw, ph)) = self.pixmap.as_ref().map(|p| (p.width(), p.height())) else {
+                    return;
+                };
+                let Some(src_ref) =
+                    tiny_skia::PixmapRef::from_bytes(&source.data, source.width, source.height)
+                else {
+                    return;
+                };
+
+                let tm = &draw.transform;
+                let sx = self.scale;
+                let sy = self.scale_y;
+                let iw = source.width as f32;
+                let ih = source.height as f32;
+                let (a, b, c, d, e, f) = (
+                    tm.a as f32,
+                    tm.b as f32,
+                    tm.c as f32,
+                    tm.d as f32,
+                    tm.e as f32,
+                    tm.f as f32,
+                );
+                let transform = tiny_skia::Transform::from_row(
+                    a * sx / iw,
+                    -b * sy / iw,
+                    -c * sx / ih,
+                    d * sy / ih,
+                    (c + e - self.rect_x0) * sx - self.dev_origin_x as f32,
+                    (self.rect_y1 - d - f) * sy - self.dev_origin_y as f32,
+                );
+                let Some(footprint) = tiny_skia::Rect::from_ltrb(0.0, 0.0, iw, ih)
+                    .and_then(|unit_r| unit_r.transform(transform))
+                else {
+                    return;
+                };
+                let rx0 = (footprint.left().floor().max(0.0) as u32).min(pw);
+                let ry0 = (footprint.top().floor().max(0.0) as u32).min(ph);
+                let rx1 = (footprint.right().ceil().max(0.0) as u32).min(pw);
+                let ry1 = (footprint.bottom().ceil().max(0.0) as u32).min(ph);
+                if rx1 <= rx0 || ry1 <= ry0 {
+                    return;
+                }
+                let rw = rx1 - rx0;
+                let rh = ry1 - ry0;
+                // Bound scratch surface allocation to the blend surface budget.
+                let needed = (rw as u64).saturating_mul(rh as u64).saturating_mul(8);
+                if needed > MAX_BLEND_SURFACE_BYTES {
+                    return;
+                }
+                let (Some(mut mask_pix), Some(mut pat_pix)) = (
+                    tiny_skia::Pixmap::new(rw, rh),
+                    tiny_skia::Pixmap::new(rw, rh),
+                ) else {
+                    return;
+                };
+                // Rasterize stencil coverage into `mask_pix` shifted by (-rx0, -ry0).
+                // Note: `paint.shader` (Pattern) already carries `alpha_override`,
+                // so only `draw.alpha` modulates the stencil here.
+                let stencil_alpha = if draw.alpha.is_finite() {
+                    draw.alpha.clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                if stencil_alpha <= 0.0 {
+                    return;
+                }
+                let shift = tiny_skia::Transform::from_translate(-(rx0 as f32), -(ry0 as f32));
+                mask_pix.draw_pixmap(
+                    0,
+                    0,
+                    src_ref,
+                    &tiny_skia::PixmapPaint {
+                        opacity: stencil_alpha,
+                        quality: tiny_skia::FilterQuality::Bilinear,
+                        ..Default::default()
+                    },
+                    transform.post_concat(shift),
+                    None,
+                );
+
+                // Sample the pattern shader across [rx0..rx1]×[ry0..ry1].
+                let mut src_paint = paint.clone();
+                src_paint.blend_mode = tiny_skia::BlendMode::Source;
+                src_paint.anti_alias = false;
+                if let Some(fill_rect) =
+                    tiny_skia::Rect::from_ltrb(rx0 as f32, ry0 as f32, rx1 as f32, ry1 as f32)
+                {
+                    pat_pix.fill_rect(fill_rect, &src_paint, shift, None);
+                }
+
+                // Modulate premultiplied pattern samples by stencil alpha (and active clip).
+                let clip_ref = self.current_clip.as_ref();
+                let clip_data = clip_ref.map(|m| m.data());
+                let pw_usize = pw as usize;
+                let rw_usize = rw as usize;
+                let (pat_px, _) = pat_pix.data_mut().as_chunks_mut::<4>();
+                let (mask_px, _) = mask_pix.data().as_chunks::<4>();
+                for y in 0..rh as usize {
+                    let row_off = y * rw_usize;
+                    let clip_row = (ry0 as usize + y) * pw_usize + rx0 as usize;
+                    for x in 0..rw_usize {
+                        let i = row_off + x;
+                        let mut cov = mask_px[i][3];
+                        if let Some(cd) = clip_data {
+                            cov = mul255(cov, cd[clip_row + x]);
+                        }
+                        if cov == 0 {
+                            pat_px[i] = [0, 0, 0, 0];
+                        } else if cov < 255 {
+                            pat_px[i][0] = mul255(pat_px[i][0], cov);
+                            pat_px[i][1] = mul255(pat_px[i][1], cov);
+                            pat_px[i][2] = mul255(pat_px[i][2], cov);
+                            pat_px[i][3] = mul255(pat_px[i][3], cov);
+                        }
+                    }
+                }
+
+                if let Some(pixmap) = self.pixmap.as_mut() {
+                    pixmap.draw_pixmap(
+                        rx0 as i32,
+                        ry0 as i32,
+                        pat_pix.as_ref(),
+                        &tiny_skia::PixmapPaint {
+                            opacity: 1.0,
+                            blend_mode: paint.blend_mode,
+                            quality: tiny_skia::FilterQuality::Nearest,
+                        },
+                        tiny_skia::Transform::identity(),
+                        None,
+                    );
+                }
+                self.mark_painted(footprint, 1.0);
+            }
+            _ => {}
+        }
     }
 
     /// Transform a Type3 glyph path through: FontMatrix → text position → CTM → pixels.
@@ -8164,6 +8307,124 @@ mod tests {
         assert!(
             remainder.is_empty() && pixels.iter().all(|pixel| *pixel == [255, 255, 255, 255]),
             "the nested Type3 image must honor max_image_pixels"
+        );
+    }
+
+    #[test]
+    fn type3_bitmap_glyph_renders_under_normal_and_multiply_tiling_patterns() {
+        // 8×8 checkerboard/solid 1-bit `/ImageMask true` glyph: top 4 rows ink (0x00 in
+        // 1-bit image mask means painted sample; 0xFF means transparent), bottom 4 rows empty.
+        let glyph_stream =
+            b"q 1000 0 0 1000 0 0 cm BI /W 8 /H 8 /BPC 1 /IM true ID \x00\x00\x00\x00\xff\xff\xff\xff EI Q";
+        let (fonts, font_id) = type3_image_fonts(glyph_stream);
+
+        let make_tiling = |color: Color, mode: BlendMode| {
+            let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 4.0, 4.0));
+            let mut sq = Path::new();
+            sq.rect(Rect::new(0.0, 0.0, 4.0, 4.0));
+            if mode != BlendMode::Normal {
+                cell.push(RenderCommand::PushBlendGroup {
+                    blend_mode: mode,
+                    isolated: true,
+                    knockout: false,
+                    bounds: Rect::new(0.0, 0.0, 4.0, 4.0),
+                    alpha: 1.0,
+                    mask: None,
+                });
+            }
+            cell.push(RenderCommand::FillPath {
+                path: sq,
+                rule: FillRule::NonZero,
+                paint: Paint::Solid(color),
+                alpha: 1.0,
+                overprint: None,
+            });
+            if mode != BlendMode::Normal {
+                cell.push(RenderCommand::PopBlendGroup);
+            }
+            Arc::new(TilingPattern {
+                commands: Arc::new(cell),
+                bbox: Rect::new(0.0, 0.0, 4.0, 4.0),
+                x_step: 4.0,
+                y_step: 4.0,
+                matrix: Matrix::identity(),
+                tiling_type: 1,
+            })
+        };
+
+        // 1) Single-segment black Multiply tile at full opacity (fast single-pass path).
+        let mul_tile = make_tiling(Color::black(), BlendMode::Multiply);
+        let mut dl_mul = DisplayList::new(Rect::new(0.0, 0.0, 20.0, 20.0));
+        dl_mul.push(RenderCommand::DrawGlyphRun(GlyphRun {
+            font_id,
+            font_size: 12.0,
+            glyphs: vec![PositionedGlyph {
+                glyph_id: 1,
+                code_len: 1,
+                code: b'A' as u32,
+                x: 0.0,
+                y: 0.0,
+                advance: 12.0,
+            }],
+            paint: Paint::Tiling(mul_tile),
+            alpha: 1.0,
+            overprint: None,
+            transform: Matrix::new(1.0, 0.0, 0.0, 1.0, 2.0, 2.0),
+            h_scale: 1.0,
+        }));
+        let mul_page = CpuRenderer::new()
+            .with_fonts(&fonts)
+            .render_display_list(&dl_mul, 1.0)
+            .expect("render multiply bitmap Type3");
+        // Glyph spans PDF x=[2..14], y=[2..14] -> pixel x=[2..14], y=[6..18].
+        // Top half of the 8×8 mask (pixel y=[6..12]) must be painted black;
+        // bottom half (pixel y=[13..18]) must stay white.
+        let top_mul = px(&mul_page, 8, 8);
+        let bot_mul = px(&mul_page, 8, 15);
+        assert!(
+            top_mul[0] < 10 && top_mul[1] < 10 && top_mul[2] < 10,
+            "full-opacity Multiply tiling on bitmap Type 3 glyph must paint black silhouette, got {top_mul:?}"
+        );
+        assert_eq!(
+            bot_mul,
+            [255, 255, 255, 255],
+            "unmasked bottom half of bitmap Type 3 glyph must remain white"
+        );
+
+        // 2) Plain Normal red tile at full opacity (regular pattern shader path).
+        let norm_tile = make_tiling(Color::rgb(1.0, 0.0, 0.0), BlendMode::Normal);
+        let mut dl_norm = DisplayList::new(Rect::new(0.0, 0.0, 20.0, 20.0));
+        dl_norm.push(RenderCommand::DrawGlyphRun(GlyphRun {
+            font_id,
+            font_size: 12.0,
+            glyphs: vec![PositionedGlyph {
+                glyph_id: 1,
+                code_len: 1,
+                code: b'A' as u32,
+                x: 0.0,
+                y: 0.0,
+                advance: 12.0,
+            }],
+            paint: Paint::Tiling(norm_tile),
+            alpha: 1.0,
+            overprint: None,
+            transform: Matrix::new(1.0, 0.0, 0.0, 1.0, 2.0, 2.0),
+            h_scale: 1.0,
+        }));
+        let norm_page = CpuRenderer::new()
+            .with_fonts(&fonts)
+            .render_display_list(&dl_norm, 1.0)
+            .expect("render normal bitmap Type3");
+        let top_norm = px(&norm_page, 8, 8);
+        let bot_norm = px(&norm_page, 8, 15);
+        assert!(
+            top_norm[0] > 245 && top_norm[1] < 10 && top_norm[2] < 10,
+            "Normal red tiling on bitmap Type 3 glyph must paint red silhouette, got {top_norm:?}"
+        );
+        assert_eq!(
+            bot_norm,
+            [255, 255, 255, 255],
+            "unmasked bottom half under Normal tiling must remain white"
         );
     }
 

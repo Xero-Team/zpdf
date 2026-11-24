@@ -103,6 +103,7 @@ pub fn display_list_to_svg(
 
     writer.emit_commands(&display_list.commands, 0);
     writer.flush_pending_backdrop();
+    writer.flush_disjoint_backdrop();
 
     let mut svg = String::with_capacity(writer.defs.len() + writer.out.len() + 192);
     svg.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
@@ -175,6 +176,10 @@ struct SvgWriter<'a> {
     /// sharing one base backdrop `<g id="b{bg_id}">` snapshot, flushed as a
     /// single premultiplied `R * w + B * (1 - w)` SVG filter composition.
     pending_backdrop: Option<PendingBackdrop>,
+    /// Shared pre-run backdrop snapshot reused across consecutive pairwise-
+    /// disjoint dense/chunked tiling fills so repeated fills never wrap or
+    /// re-evaluate earlier dense fills.
+    disjoint_backdrop: Option<DisjointBackdropBase>,
     x0: f64,
     y1: f64,
     /// Uniform coordinate scale from current PDF space (page or pattern cell)
@@ -441,6 +446,20 @@ struct PendingBackdrop {
     region: SvgRect,
 }
 
+struct DisjointBackdropBase {
+    bg_id: u32,
+    opaque: bool,
+    /// For translucent scoped runs, the `<clipPath id="c{id}">` referenced by
+    /// the base `<use href="#b{bg_id}" clip-path="url(#c{id})"/>` in `self.out`,
+    /// materialized into `self.defs` on flush with `evenodd` holes for every
+    /// `painted_regions` rect.
+    comp_clip_id: Option<u32>,
+    /// Byte length of `self.out` right after the last disjoint dense overlay.
+    /// Any intervening append into `self.out` invalidates reuse.
+    out_len: usize,
+    painted_regions: Vec<SvgRect>,
+}
+
 struct TilingPatternGeometry {
     bx0: f64,
     by0: f64,
@@ -482,6 +501,7 @@ impl<'a> SvgWriter<'a> {
             backdrop_snapshots: 0,
             backdrop_fanout: 1,
             pending_backdrop: None,
+            disjoint_backdrop: None,
             x0: rect.x0,
             y1: rect.y1,
             scale: 1.0,
@@ -675,6 +695,7 @@ impl<'a> SvgWriter<'a> {
                             prev_non_isolated_depth: 0,
                         });
                     } else {
+                        self.flush_disjoint_backdrop();
                         let prev_out = std::mem::take(&mut self.out);
                         let prev_pending = self.pending_backdrop.take();
                         let prev_non_isolated_depth =
@@ -1004,6 +1025,7 @@ impl<'a> SvgWriter<'a> {
 
         let saved_out = std::mem::take(&mut self.out);
         let saved_pending = self.pending_backdrop.take();
+        let saved_disjoint = self.disjoint_backdrop.take();
         let saved_non_isolated = std::mem::replace(&mut self.non_isolated_filter_depth, 0);
         let saved_x0 = self.x0;
         let saved_y1 = self.y1;
@@ -1053,8 +1075,10 @@ impl<'a> SvgWriter<'a> {
         }
 
         self.flush_pending_backdrop();
+        self.flush_disjoint_backdrop();
         let body = std::mem::replace(&mut self.out, saved_out);
         self.pending_backdrop = saved_pending;
+        self.disjoint_backdrop = saved_disjoint;
         self.non_isolated_filter_depth = saved_non_isolated;
         self.x0 = saved_x0;
         self.y1 = saved_y1;
@@ -1190,6 +1214,7 @@ impl<'a> SvgWriter<'a> {
 
         let saved_out = std::mem::take(&mut self.out);
         let saved_pending = self.pending_backdrop.take();
+        let saved_disjoint = self.disjoint_backdrop.take();
         let saved_non_isolated = std::mem::replace(&mut self.non_isolated_filter_depth, 0);
         let saved_x0 = self.x0;
         let saved_y1 = self.y1;
@@ -1226,8 +1251,10 @@ impl<'a> SvgWriter<'a> {
         }
 
         self.flush_pending_backdrop();
+        self.flush_disjoint_backdrop();
         let body = std::mem::replace(&mut self.out, saved_out);
         self.pending_backdrop = saved_pending;
+        self.disjoint_backdrop = saved_disjoint;
         self.non_isolated_filter_depth = saved_non_isolated;
         self.x0 = saved_x0;
         self.y1 = saved_y1;
@@ -1350,6 +1377,7 @@ impl<'a> SvgWriter<'a> {
         let overlap = tiling.overlap_copy_ranges();
         let saved_out = std::mem::take(&mut self.out);
         let saved_pending = self.pending_backdrop.take();
+        let saved_disjoint = self.disjoint_backdrop.take();
         let saved_non_isolated = std::mem::replace(&mut self.non_isolated_filter_depth, 0);
         let saved_x0 = self.x0;
         let saved_y1 = self.y1;
@@ -1392,8 +1420,10 @@ impl<'a> SvgWriter<'a> {
             }
         }
         self.flush_pending_backdrop();
+        self.flush_disjoint_backdrop();
         let blended_steps = std::mem::replace(&mut self.out, saved_out);
         self.pending_backdrop = saved_pending;
+        self.disjoint_backdrop = saved_disjoint;
         self.non_isolated_filter_depth = saved_non_isolated;
         self.x0 = saved_x0;
         self.y1 = saved_y1;
@@ -1952,11 +1982,18 @@ impl<'a> SvgWriter<'a> {
     fn stroke_svg_pad(&self, style: &StrokeStyle) -> f64 {
         let width = (style.width as f64 * self.scale).max(0.05);
         let half = width * 0.5;
+        let max_pad = self.page_width.max(self.page_height);
         let miter = match style.join {
-            LineJoin::Miter => (style.miter_limit as f64).clamp(1.0, 20.0),
+            LineJoin::Miter => {
+                if style.miter_limit.is_finite() {
+                    (style.miter_limit as f64).max(1.0)
+                } else {
+                    max_pad
+                }
+            }
             LineJoin::Round | LineJoin::Bevel => 1.5,
         };
-        (half * miter + 2.0).min(self.page_width.max(self.page_height))
+        (half * miter + 2.0).min(max_pad)
     }
 
     fn tiling_op_filter_primitives(op: &TilingPlanOp, track_alpha: bool) -> usize {
@@ -2049,6 +2086,96 @@ impl<'a> SvgWriter<'a> {
         }
     }
 
+    /// Finalize any open [`DisjointBackdropBase`] by emitting its deferred
+    /// complement `<clipPath>` (with `evenodd` holes for every overlaid region
+    /// on translucent backdrops).
+    fn flush_disjoint_backdrop(&mut self) {
+        let Some(base) = self.disjoint_backdrop.take() else {
+            return;
+        };
+        if let Some(cid) = base.comp_clip_id {
+            let _ = write!(self.defs, "<clipPath id=\"c{cid}\"><path d=\"M0 0H");
+            push_num(&mut self.defs, self.page_width);
+            self.defs.push('V');
+            push_num(&mut self.defs, self.page_height);
+            self.defs.push_str("H0Z");
+            for r in &base.painted_regions {
+                self.defs.push('M');
+                push_pair(&mut self.defs, r.x0, r.y0);
+                self.defs.push('H');
+                push_num(&mut self.defs, r.x1);
+                self.defs.push('V');
+                push_num(&mut self.defs, r.y1);
+                self.defs.push('H');
+                push_num(&mut self.defs, r.x0);
+                self.defs.push('Z');
+            }
+            self.defs
+                .push_str("\" clip-rule=\"evenodd\"/></clipPath>\n");
+        }
+    }
+
+    /// Reuse the active pre-run backdrop snapshot when `check_rect` is disjoint
+    /// from every fill already overlaid on it (avoiding wrapping or re-rendering
+    /// earlier dense fills), or snapshot `self.out` once and start a fresh run.
+    fn acquire_disjoint_or_new_backdrop(
+        &mut self,
+        check_rect: SvgRect,
+        opaque: bool,
+        scoped: bool,
+        new_fanout_refs: usize,
+    ) -> Option<u32> {
+        if self.pending_backdrop.is_none() {
+            if let Some(ref mut base) = self.disjoint_backdrop {
+                if base.out_len == self.out.len()
+                    && base.opaque == opaque
+                    && (opaque || (scoped && base.comp_clip_id.is_some()))
+                    && base
+                        .painted_regions
+                        .iter()
+                        .all(|r| r.intersect(check_rect).is_none())
+                {
+                    base.painted_regions.push(check_rect);
+                    return Some(base.bg_id);
+                }
+            }
+        }
+        if self.backdrop_fanout.saturating_mul(new_fanout_refs) > MAX_BACKDROP_FANOUT {
+            return None;
+        }
+        self.flush_pending_backdrop();
+        self.flush_disjoint_backdrop();
+        if self.backdrop_snapshots >= MAX_BACKDROP_SNAPSHOTS {
+            return None;
+        }
+        let orig_bg_id = self.snapshot_page_backdrop(true)?;
+        self.backdrop_fanout = self.backdrop_fanout.saturating_mul(new_fanout_refs);
+        if opaque {
+            let _ = writeln!(self.out, "<use href=\"#b{orig_bg_id}\"/>");
+            self.disjoint_backdrop = Some(DisjointBackdropBase {
+                bg_id: orig_bg_id,
+                opaque: true,
+                comp_clip_id: None,
+                out_len: self.out.len(),
+                painted_regions: vec![check_rect],
+            });
+        } else if scoped {
+            let cid = self.fresh_id();
+            let _ = writeln!(
+                self.out,
+                "<use href=\"#b{orig_bg_id}\" clip-path=\"url(#c{cid})\"/>"
+            );
+            self.disjoint_backdrop = Some(DisjointBackdropBase {
+                bg_id: orig_bg_id,
+                opaque: false,
+                comp_clip_id: Some(cid),
+                out_len: self.out.len(),
+                painted_regions: vec![check_rect],
+            });
+        }
+        Some(orig_bg_id)
+    }
+
     /// Evaluate a dense flat (non-`OpacityGroup`) multi-pass tiling plan in
     /// O(1) peak raster memory by blending sibling `<rect style="mix-blend-mode:..."/>`
     /// elements in-place onto a single copy of the backdrop, then masking ONCE
@@ -2060,6 +2187,7 @@ impl<'a> SvgWriter<'a> {
         ops: &[TilingPlanOp],
         shape_body: &str,
         affected: SvgRect,
+        disjoint_rect: SvgRect,
     ) -> bool {
         if self.non_isolated_filter_depth > 0 || ops.is_empty() || Self::ops_has_opacity_group(ops)
         {
@@ -2081,9 +2209,6 @@ impl<'a> SvgWriter<'a> {
         } else {
             2
         };
-        if self.backdrop_fanout.saturating_mul(refs) > MAX_BACKDROP_FANOUT {
-            return false;
-        }
         let reg = if scoped {
             affected
         } else {
@@ -2092,14 +2217,12 @@ impl<'a> SvgWriter<'a> {
         if !opaque && Self::max_filter_primitives_for_region(reg) < 5 {
             return false;
         }
-        self.flush_pending_backdrop();
-        if self.backdrop_snapshots >= MAX_BACKDROP_SNAPSHOTS {
-            return false;
-        }
-        let Some(orig_bg_id) = self.snapshot_page_backdrop(true) else {
+        let check_rect = if opaque { disjoint_rect } else { reg };
+        let Some(orig_bg_id) =
+            self.acquire_disjoint_or_new_backdrop(check_rect, opaque, scoped, refs)
+        else {
             return false;
         };
-        self.backdrop_fanout = self.backdrop_fanout.saturating_mul(refs);
 
         let reg_clip = if scoped {
             let cid = self.fresh_id();
@@ -2152,7 +2275,6 @@ impl<'a> SvgWriter<'a> {
             push_num(&mut self.defs, reg.height());
             let _ = write!(self.defs, "\">\n{shape_body}</mask>\n");
 
-            let _ = writeln!(self.out, "<use href=\"#b{orig_bg_id}\"/>");
             let _ = writeln!(self.out, "<g mask=\"url(#m{mask_id})\">");
             if let Some(cid) = reg_clip {
                 let _ = writeln!(
@@ -2164,6 +2286,9 @@ impl<'a> SvgWriter<'a> {
             }
             write_blend_rects(&mut self.out, ops, reg);
             self.out.push_str("</g>\n");
+            if let Some(ref mut base) = self.disjoint_backdrop {
+                base.out_len = self.out.len();
+            }
             return true;
         }
 
@@ -2210,34 +2335,40 @@ impl<'a> SvgWriter<'a> {
              </filter>\n",
         );
 
-        if scoped {
-            self.emit_scoped_bg_restore(orig_bg_id, reg);
-        }
         let _ = writeln!(
             self.out,
             "<use href=\"#b{eval_id}\" filter=\"url(#f{fid})\"/>"
         );
+        if let Some(ref mut base) = self.disjoint_backdrop {
+            base.out_len = self.out.len();
+        }
         true
     }
 
     /// Evaluate a dense opacity-grouped tiling op stream exceeding one filter's
-    /// intermediate-pixel budget in bounded sequential `<filter>` chunks scoped
-    /// to `affected` (splitting only at top-level `OpacityGroup` depth 0) while
-    /// applying `shape_id` (coverage + object opacity) ONCE on the final chunk
-    /// against the original pre-fill backdrop snapshot.
+    /// intermediate-pixel budget as a space-separated filter chain
+    /// (`filter="url(#f0) url(#f1) ..."`) scoped to `affected` (splitting only
+    /// at top-level `OpacityGroup` depth 0). Each filter applies in-place so
+    /// peak raster memory stays bounded to one chunk, and pairwise-disjoint
+    /// fills share the pre-run backdrop snapshot so earlier fills are never
+    /// re-rendered.
     fn emit_chunked_tiling_ops(
         &mut self,
         ops: &[TilingPlanOp],
-        shape_id: u32,
+        shape_body: &str,
         affected: SvgRect,
+        disjoint_rect: SvgRect,
     ) -> bool {
         if self.non_isolated_filter_depth > 0 || ops.is_empty() {
             return false;
         }
         let w = self.page_width;
         let h = self.page_height;
+        let opaque = self.has_opaque_background && self.isolated_depth == 0;
         let mut scoped = affected.is_strict_subregion(w, h);
-        let refs = if scoped {
+        let refs = if opaque {
+            2
+        } else if scoped {
             if self.backdrop_fanout.saturating_mul(3) <= MAX_BACKDROP_FANOUT {
                 3
             } else {
@@ -2247,16 +2378,17 @@ impl<'a> SvgWriter<'a> {
         } else {
             2
         };
-        if self.backdrop_fanout.saturating_mul(refs) > MAX_BACKDROP_FANOUT {
-            return false;
-        }
         let reg = if scoped {
             affected
         } else {
             self.full_page_rect()
         };
-        // Reserve 5 primitives for the final `orig`/`wt`/`in`/`out`/`arithmetic` mix.
-        let max_chunk_prims = Self::max_filter_primitives_for_region(reg).saturating_sub(5);
+        // On opaque backdrops, shape masking happens via `<g mask="url(#m...)">`
+        // outside the filter chain (0 extra filter primitives and 0 `<feImage>`
+        // re-renders of `#b{orig_bg_id}`). On translucent backdrops, reserve 5
+        // primitives on the final chunk for the `orig`/`wt`/`in`/`out`/`arithmetic` mix.
+        let reserve = if opaque { 0 } else { 5 };
+        let max_chunk_prims = Self::max_filter_primitives_for_region(reg).saturating_sub(reserve);
         if max_chunk_prims < 2 {
             return false;
         }
@@ -2300,39 +2432,16 @@ impl<'a> SvgWriter<'a> {
             }
             chunks.push(&ops[chunk_start..]);
         }
-        if chunks.is_empty() {
-            return false;
-        }
-        // Each nested chunk holds one `SourceGraphic` buffer of `reg` on the
-        // filter call stack while the innermost chunk executes; bound both
-        // snapshot count and total peak intermediate pixels across the chain.
-        let peak_chain_px = (chunks
-            .len()
-            .saturating_add(max_chunk_prims)
-            .saturating_add(5) as u64)
-            .saturating_mul(reg.pixels());
-        if peak_chain_px > MAX_FILTER_INTERMEDIATE_PIXELS.saturating_mul(2) {
-            tracing::warn!(
-                chunks = chunks.len(),
-                region_px = reg.pixels(),
-                "svg chunked tiling filter chain exceeds peak pixel budget; falling back to isolated group"
-            );
+        if chunks.is_empty() || chunks.len() > MAX_BACKDROP_SNAPSHOTS {
             return false;
         }
 
-        self.flush_pending_backdrop();
-        if self.backdrop_snapshots.saturating_add(chunks.len()) > MAX_BACKDROP_SNAPSHOTS {
-            tracing::warn!(
-                chunks = chunks.len(),
-                region_px = reg.pixels(),
-                "svg chunked tiling filter exceeds intermediate-pixel snapshot budget; falling back to isolated group"
-            );
-            return false;
-        }
-        let Some(orig_bg_id) = self.snapshot_page_backdrop(true) else {
+        let check_rect = if opaque { disjoint_rect } else { reg };
+        let Some(orig_bg_id) =
+            self.acquire_disjoint_or_new_backdrop(check_rect, opaque, scoped, refs)
+        else {
             return false;
         };
-        self.backdrop_fanout = self.backdrop_fanout.saturating_mul(refs);
 
         let mut pat_rects: HashMap<u32, u32> = HashMap::new();
         for op in ops {
@@ -2355,10 +2464,22 @@ impl<'a> SvgWriter<'a> {
             }
         }
 
-        let mut prev_g = orig_bg_id;
+        let shape_id = if opaque {
+            None
+        } else {
+            let sid = self.fresh_id();
+            let _ = writeln!(self.defs, "<g id=\"s{sid}\">{shape_body}</g>");
+            Some(sid)
+        };
+
+        let mut filter_urls = String::new();
         for (chunk_idx, chunk) in chunks.iter().enumerate() {
             let is_last = chunk_idx + 1 == chunks.len();
             let fid = self.fresh_id();
+            if !filter_urls.is_empty() {
+                filter_urls.push(' ');
+            }
+            let _ = write!(filter_urls, "url(#f{fid})");
             Self::write_filter_open_tag(&mut self.defs, fid, reg);
             let (acc, _) = Self::emit_filter_tiling_ops(
                 &mut self.defs,
@@ -2371,52 +2492,65 @@ impl<'a> SvgWriter<'a> {
                 None,
             );
             if is_last {
-                let _ = write!(
-                    self.defs,
-                    "<feImage href=\"#b{orig_bg_id}\" x=\"0\" y=\"0\" width=\""
-                );
-                push_num(&mut self.defs, w);
-                self.defs.push_str("\" height=\"");
-                push_num(&mut self.defs, h);
-                self.defs.push_str("\" result=\"orig\"/>\n");
-                let _ = write!(
-                    self.defs,
-                    "<feImage href=\"#s{shape_id}\" x=\"0\" y=\"0\" width=\""
-                );
-                push_num(&mut self.defs, w);
-                self.defs.push_str("\" height=\"");
-                push_num(&mut self.defs, h);
-                self.defs.push_str("\" result=\"wt\"/>\n");
-                let _ = writeln!(
-                    self.defs,
-                    "<feComposite in=\"{acc}\" in2=\"wt\" operator=\"in\" result=\"rw\"/>"
-                );
-                let _ = writeln!(
-                    self.defs,
-                    "<feComposite in=\"orig\" in2=\"wt\" operator=\"out\" result=\"bw\"/>"
-                );
-                self.defs.push_str(
-                    "<feComposite in=\"rw\" in2=\"bw\" operator=\"arithmetic\" k1=\"0\" k2=\"1\" k3=\"1\" k4=\"0\"/>\n",
-                );
+                if let Some(sid) = shape_id {
+                    let _ = write!(
+                        self.defs,
+                        "<feImage href=\"#b{orig_bg_id}\" x=\"0\" y=\"0\" width=\""
+                    );
+                    push_num(&mut self.defs, w);
+                    self.defs.push_str("\" height=\"");
+                    push_num(&mut self.defs, h);
+                    self.defs.push_str("\" result=\"orig\"/>\n");
+                    let _ = write!(
+                        self.defs,
+                        "<feImage href=\"#s{sid}\" x=\"0\" y=\"0\" width=\""
+                    );
+                    push_num(&mut self.defs, w);
+                    self.defs.push_str("\" height=\"");
+                    push_num(&mut self.defs, h);
+                    self.defs.push_str("\" result=\"wt\"/>\n");
+                    let _ = writeln!(
+                        self.defs,
+                        "<feComposite in=\"{acc}\" in2=\"wt\" operator=\"in\" result=\"rw\"/>"
+                    );
+                    let _ = writeln!(
+                        self.defs,
+                        "<feComposite in=\"orig\" in2=\"wt\" operator=\"out\" result=\"bw\"/>"
+                    );
+                    self.defs.push_str(
+                        "<feComposite in=\"rw\" in2=\"bw\" operator=\"arithmetic\" k1=\"0\" k2=\"1\" k3=\"1\" k4=\"0\"/>\n",
+                    );
+                }
             }
             self.defs.push_str("</filter>\n");
-            if is_last {
-                if scoped {
-                    self.emit_scoped_bg_restore(orig_bg_id, reg);
-                }
-                let _ = writeln!(
-                    self.out,
-                    "<use href=\"#b{prev_g}\" filter=\"url(#f{fid})\"/>"
-                );
-            } else {
-                let next_g = self.fresh_id();
-                self.backdrop_snapshots += 1;
-                let _ = writeln!(
-                    self.defs,
-                    "<g id=\"b{next_g}\"><use href=\"#b{prev_g}\" filter=\"url(#f{fid})\"/></g>"
-                );
-                prev_g = next_g;
-            }
+        }
+
+        if opaque {
+            let mask_id = self.fresh_id();
+            let _ = write!(
+                self.defs,
+                "<mask id=\"m{mask_id}\" maskUnits=\"userSpaceOnUse\" style=\"mask-type:alpha\" x=\""
+            );
+            push_num(&mut self.defs, reg.x0);
+            self.defs.push_str("\" y=\"");
+            push_num(&mut self.defs, reg.y0);
+            self.defs.push_str("\" width=\"");
+            push_num(&mut self.defs, reg.width());
+            self.defs.push_str("\" height=\"");
+            push_num(&mut self.defs, reg.height());
+            let _ = write!(self.defs, "\">\n{shape_body}</mask>\n");
+            let _ = writeln!(
+                self.out,
+                "<g mask=\"url(#m{mask_id})\"><use href=\"#b{orig_bg_id}\" filter=\"{filter_urls}\"/></g>"
+            );
+        } else {
+            let _ = writeln!(
+                self.out,
+                "<use href=\"#b{orig_bg_id}\" filter=\"{filter_urls}\"/>"
+            );
+        }
+        if let Some(ref mut base) = self.disjoint_backdrop {
+            base.out_len = self.out.len();
         }
         true
     }
@@ -2426,9 +2560,9 @@ impl<'a> SvgWriter<'a> {
     fn emit_isolated_tiling_ops(&mut self, ops: &[TilingPlanOp]) {
         let mut stack: Vec<String> = Vec::new();
         for op in ops {
-            let target = stack.last_mut().unwrap_or(&mut self.out);
             match op {
                 TilingPlanOp::Pattern { pat_id, blend_mode } => {
+                    let target = stack.last_mut().unwrap_or(&mut self.out);
                     target.push_str("<rect x=\"0\" y=\"0\" width=\"");
                     push_num(target, self.page_width);
                     target.push_str("\" height=\"");
@@ -2442,11 +2576,26 @@ impl<'a> SvgWriter<'a> {
                 TilingPlanOp::PushOpacityGroup => {
                     stack.push(String::new());
                 }
-                TilingPlanOp::PopOpacityGroup { alpha, .. } => {
+                TilingPlanOp::PopOpacityGroup { alpha, mask_pat_id } => {
                     if let Some(inner) = stack.pop() {
+                        let mask_id = mask_pat_id.map(|m_pat_id| {
+                            let mid = self.fresh_id();
+                            let _ = write!(
+                                self.defs,
+                                "<mask id=\"m{mid}\" maskUnits=\"userSpaceOnUse\" style=\"mask-type:alpha\"><rect x=\"0\" y=\"0\" width=\""
+                            );
+                            push_num(&mut self.defs, self.page_width);
+                            self.defs.push_str("\" height=\"");
+                            push_num(&mut self.defs, self.page_height);
+                            let _ = writeln!(self.defs, "\" fill=\"url(#p{m_pat_id})\"/></mask>");
+                            mid
+                        });
                         let parent = stack.last_mut().unwrap_or(&mut self.out);
                         parent.push_str("<g");
                         push_opacity(parent, "opacity", *alpha);
+                        if let Some(mid) = mask_id {
+                            let _ = write!(parent, " mask=\"url(#m{mid})\"");
+                        }
                         parent.push_str(">\n");
                         parent.push_str(&inner);
                         parent.push_str("</g>\n");
@@ -2470,6 +2619,7 @@ impl<'a> SvgWriter<'a> {
         let Some(pending) = self.pending_backdrop.take() else {
             return;
         };
+        self.flush_disjoint_backdrop();
         let trailing = std::mem::take(&mut self.out);
         if pending.steps.is_empty() {
             let _ = writeln!(self.out, "<use href=\"#b{}\"/>", pending.bg_id);
@@ -2924,6 +3074,7 @@ impl<'a> SvgWriter<'a> {
     /// without re-emitting `<use>` into `self.out` (the caller's filter composition
     /// emits the sole `<use href="#b{id}" filter="..."/>` when flushed).
     fn snapshot_page_backdrop(&mut self, allow_empty: bool) -> Option<u32> {
+        self.flush_disjoint_backdrop();
         if self.out.is_empty() && !allow_empty {
             return None;
         }
@@ -3053,6 +3204,7 @@ impl<'a> SvgWriter<'a> {
         ops: &[TilingPlanOp],
         shape_body: &str,
         affected: SvgRect,
+        disjoint_rect: SvgRect,
     ) -> bool {
         let has_opacity_group = Self::ops_has_opacity_group(ops);
         if !(self.pending_backdrop.is_some() || !self.out.is_empty() || has_opacity_group) {
@@ -3074,32 +3226,35 @@ impl<'a> SvgWriter<'a> {
         if !has_opacity_group
             && self.non_isolated_filter_depth == 0
             && (ops.len() > FLAT_BLEND_GROUP_OP_THRESHOLD || step_prims > prim_limit)
-            && self.emit_flat_blend_group_tiling_ops(ops, shape_body, affected)
+            && self.emit_flat_blend_group_tiling_ops(ops, shape_body, affected, disjoint_rect)
         {
             return true;
         }
 
-        let shape_id = self.fresh_id();
-        let _ = writeln!(self.defs, "<g id=\"s{shape_id}\">{shape_body}</g>");
-        if self.enqueue_backdrop_step(
-            BackdropStep::MultiPass {
-                ops: ops.to_vec(),
-                shape_id,
-            },
-            step_prims,
-            Some(affected),
-            has_opacity_group,
-        ) {
-            return true;
+        if step_prims <= prim_limit || self.non_isolated_filter_depth > 0 {
+            let shape_id = self.fresh_id();
+            let _ = writeln!(self.defs, "<g id=\"s{shape_id}\">{shape_body}</g>");
+            if self.enqueue_backdrop_step(
+                BackdropStep::MultiPass {
+                    ops: ops.to_vec(),
+                    shape_id,
+                },
+                step_prims,
+                Some(affected),
+                has_opacity_group,
+            ) {
+                return true;
+            }
         }
         if self.non_isolated_filter_depth == 0
-            && self.emit_chunked_tiling_ops(ops, shape_id, affected)
+            && self.emit_chunked_tiling_ops(ops, shape_body, affected, disjoint_rect)
         {
             return true;
         }
         false
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn emit_tiling_fill_path_data(
         &mut self,
         d: &str,
@@ -3107,6 +3262,7 @@ impl<'a> SvgWriter<'a> {
         tiling: &zpdf_display_list::TilingPattern,
         opacity: f32,
         affected: SvgRect,
+        disjoint_rect: SvgRect,
         depth: u8,
     ) {
         let plan = self.emit_tiling_plan(tiling, depth);
@@ -3168,7 +3324,12 @@ impl<'a> SvgWriter<'a> {
                         push_opacity(&mut shape_body, "fill-opacity", opacity);
                         shape_body.push_str(&placement);
                         shape_body.push_str("/>");
-                        if self.emit_tiling_multi_pass_backdrop(&ops, &shape_body, affected) {
+                        if self.emit_tiling_multi_pass_backdrop(
+                            &ops,
+                            &shape_body,
+                            affected,
+                            disjoint_rect,
+                        ) {
                             return;
                         }
                     }
@@ -3284,7 +3445,16 @@ impl<'a> SvgWriter<'a> {
                 let affected = self
                     .path_svg_bounds(path, 2.0)
                     .unwrap_or_else(|| self.clip_bounds.unwrap_or_else(|| self.full_page_rect()));
-                self.emit_tiling_fill_path_data(&d, rule, tiling, opacity, affected, depth);
+                let disjoint_rect = self.path_svg_bounds(path, 0.0).unwrap_or(affected);
+                self.emit_tiling_fill_path_data(
+                    &d,
+                    rule,
+                    tiling,
+                    opacity,
+                    affected,
+                    disjoint_rect,
+                    depth,
+                );
             }
             _ => {
                 tracing::debug!("skipping non-solid fill paint (rasterized upstream)");
@@ -3398,8 +3568,12 @@ impl<'a> SvgWriter<'a> {
                                 push_stroke_attrs(&mut shape_body, style, self.scale);
                                 shape_body.push_str(&placement);
                                 shape_body.push_str("/>");
-                                if self.emit_tiling_multi_pass_backdrop(&ops, &shape_body, affected)
-                                {
+                                if self.emit_tiling_multi_pass_backdrop(
+                                    &ops,
+                                    &shape_body,
+                                    affected,
+                                    affected,
+                                ) {
                                     return;
                                 }
                             }
@@ -3644,6 +3818,7 @@ impl<'a> SvgWriter<'a> {
             return;
         }
         self.flush_pending_backdrop();
+        self.flush_disjoint_backdrop();
         let inner_body = std::mem::replace(&mut self.out, prev_out);
         self.pending_backdrop = prev_pending;
         self.non_isolated_filter_depth = prev_non_isolated_depth;
@@ -3705,6 +3880,7 @@ impl<'a> SvgWriter<'a> {
 
         let saved_out = std::mem::take(&mut self.out);
         let saved_pending = self.pending_backdrop.take();
+        let saved_disjoint = self.disjoint_backdrop.take();
         let saved_non_isolated = std::mem::replace(&mut self.non_isolated_filter_depth, 0);
         let saved_blend_depth = std::mem::replace(&mut self.blend_depth, 0);
         let saved_isolated_depth = std::mem::replace(&mut self.isolated_depth, 0);
@@ -3743,11 +3919,13 @@ impl<'a> SvgWriter<'a> {
         }
         self.emit_commands(&mask.commands.commands, depth + 1);
         self.flush_pending_backdrop();
+        self.flush_disjoint_backdrop();
         if translated {
             self.out.push_str("</g>\n");
         }
         let body = std::mem::replace(&mut self.out, saved_out);
         self.pending_backdrop = saved_pending;
+        self.disjoint_backdrop = saved_disjoint;
         self.non_isolated_filter_depth = saved_non_isolated;
         self.blend_depth = saved_blend_depth;
         self.isolated_depth = saved_isolated_depth;
@@ -3813,6 +3991,7 @@ impl<'a> SvgWriter<'a> {
                         &FillRule::NonZero,
                         tiling,
                         opacity,
+                        affected,
                         affected,
                         depth,
                     );
@@ -3955,10 +4134,14 @@ impl<'a> SvgWriter<'a> {
     ) {
         let saved_out = std::mem::take(&mut self.out);
         let saved_pending = self.pending_backdrop.take();
+        let saved_disjoint = self.disjoint_backdrop.take();
         let saved_non_isolated = std::mem::replace(&mut self.non_isolated_filter_depth, 0);
         self.emit_type3_run(run, font, &Color::white(), 1.0);
+        self.flush_pending_backdrop();
+        self.flush_disjoint_backdrop();
         let shape_body = std::mem::replace(&mut self.out, saved_out);
         self.pending_backdrop = saved_pending;
+        self.disjoint_backdrop = saved_disjoint;
         self.non_isolated_filter_depth = saved_non_isolated;
         if shape_body.is_empty() {
             return;
@@ -4024,7 +4207,12 @@ impl<'a> SvgWriter<'a> {
                     wrapped_shape.push_str(">\n");
                     wrapped_shape.push_str(&shape_body);
                     wrapped_shape.push_str("</g>\n");
-                    if self.emit_tiling_multi_pass_backdrop(&ops, &wrapped_shape, affected) {
+                    if self.emit_tiling_multi_pass_backdrop(
+                        &ops,
+                        &wrapped_shape,
+                        affected,
+                        affected,
+                    ) {
                         return;
                     }
                     self.flush_pending_backdrop();
@@ -7736,6 +7924,284 @@ mod tests {
         assert!(
             f_rgb.iter().all(|&c| (60..=68).contains(&c)),
             "full-page chunked OpacityGroup on Letter page must stay ~64, got {f_rgb:?}"
+        );
+    }
+
+    #[test]
+    fn repeated_dense_chunked_fills_evaluate_prior_scene_once_per_fill_in_svg() {
+        // Five repeated disjoint dense fills on a Letter page must reuse the
+        // pre-run backdrop snapshot rather than nesting each fill inside the
+        // next snapshot (which would double earlier fills on every repeat) or
+        // referencing `#b...` a second time through `<feImage>` on opaque pages.
+        let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 20.0, 2.0));
+        cell.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Normal,
+            isolated: false,
+            knockout: false,
+            bounds: Rect::new(0.0, 0.0, 20.0, 2.0),
+            alpha: 0.5,
+            mask: None,
+        });
+        for _ in 0..8 {
+            cell.push(RenderCommand::PushBlendGroup {
+                blend_mode: BlendMode::Darken,
+                isolated: true,
+                knockout: false,
+                bounds: Rect::new(0.0, 0.0, 20.0, 2.0),
+                alpha: 1.0,
+                mask: None,
+            });
+            cell.push(RenderCommand::FillPath {
+                path: rect_path(0.0, 0.0, 20.0, 2.0),
+                rule: FillRule::NonZero,
+                paint: Paint::Solid(Color::gray(0.5)),
+                alpha: 1.0,
+                overprint: None,
+            });
+            cell.push(RenderCommand::PopBlendGroup);
+        }
+        cell.push(RenderCommand::PopBlendGroup);
+        let tiling = std::sync::Arc::new(zpdf_display_list::TilingPattern {
+            commands: std::sync::Arc::new(cell),
+            bbox: Rect::new(0.0, 0.0, 20.0, 2.0),
+            x_step: 2.0,
+            y_step: 2.0,
+            matrix: zpdf_core::Matrix::identity(),
+            tiling_type: 1,
+        });
+
+        // Use five wide bands (each 612×120 = 73,440 px -> max ~228 prims per
+        // filter; make each cell take > 250 prims by putting 16 copies of 8
+        // marks so EVERY band triggers chunking!).
+        let mut big_cell = DisplayList::new(Rect::new(0.0, 0.0, 32.0, 2.0));
+        big_cell.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Normal,
+            isolated: false,
+            knockout: false,
+            bounds: Rect::new(0.0, 0.0, 32.0, 2.0),
+            alpha: 0.5,
+            mask: None,
+        });
+        for _ in 0..8 {
+            big_cell.push(RenderCommand::PushBlendGroup {
+                blend_mode: BlendMode::Darken,
+                isolated: true,
+                knockout: false,
+                bounds: Rect::new(0.0, 0.0, 32.0, 2.0),
+                alpha: 1.0,
+                mask: None,
+            });
+            big_cell.push(RenderCommand::FillPath {
+                path: rect_path(0.0, 0.0, 32.0, 2.0),
+                rule: FillRule::NonZero,
+                paint: Paint::Solid(Color::gray(0.5)),
+                alpha: 1.0,
+                overprint: None,
+            });
+            big_cell.push(RenderCommand::PopBlendGroup);
+        }
+        big_cell.push(RenderCommand::PopBlendGroup);
+        let chunked_tiling = std::sync::Arc::new(zpdf_display_list::TilingPattern {
+            commands: std::sync::Arc::new(big_cell),
+            bbox: Rect::new(0.0, 0.0, 32.0, 2.0),
+            x_step: 2.0,
+            y_step: 2.0,
+            matrix: zpdf_core::Matrix::identity(),
+            tiling_type: 1,
+        });
+
+        let _ = tiling; // keep cell builder reference clear
+        let page_rect = Rect::new(0.0, 0.0, 612.0, 792.0);
+        let mut dl = DisplayList::new(page_rect);
+        dl.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 612.0, 792.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::gray(0.8)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        for i in 0..5 {
+            let y0 = 20.0 + i as f64 * 150.0;
+            dl.push(RenderCommand::FillPath {
+                path: rect_path(0.0, y0, 612.0, y0 + 120.0),
+                rule: FillRule::NonZero,
+                paint: Paint::Tiling(std::sync::Arc::clone(&chunked_tiling)),
+                alpha: 0.5,
+                overprint: None,
+            });
+        }
+
+        let svg = display_list_to_svg(
+            &dl,
+            &FontCache::new(),
+            &ImageCache::new(),
+            &SvgOptions::default(),
+        );
+        // Only ONE backdrop `<g id="b...">` snapshot may exist (shared by all 5
+        // disjoint chunked fills), and ZERO `<feImage href="#b` re-renders.
+        assert_eq!(
+            svg.matches("<g id=\"b").count(),
+            1,
+            "five disjoint chunked fills must share 1 pre-run backdrop snapshot, got {}",
+            svg.matches("<g id=\"b").count()
+        );
+        assert_eq!(
+            svg.matches("<feImage href=\"#b").count(),
+            0,
+            "chunked fills on opaque pages must not re-render prior scene via <feImage href=\"#b...\">"
+        );
+        // Must have emitted multi-filter chains (`url(#f...) url(#f...)`) for the chunked bands.
+        assert!(
+            svg.contains(") url(#f"),
+            "expected space-separated multi-filter chunks on 612×120 bands"
+        );
+
+        let tree = resvg::usvg::Tree::from_data(svg.as_bytes(), &resvg::usvg::Options::default())
+            .expect("valid repeated chunked SVG");
+        // Render at 1/4 scale (153×198) to exercise all 5 chunked bands quickly.
+        let mut pixmap = resvg::tiny_skia::Pixmap::new(153, 198).expect("pixmap");
+        let sx = 153.0 / tree.size().width();
+        let sy = 198.0 / tree.size().height();
+        resvg::render(
+            &tree,
+            resvg::tiny_skia::Transform::from_scale(sx, sy),
+            &mut pixmap.as_mut(),
+        );
+        // Inside band 0 (PDF y=80 -> SVG y=712 -> scaled y=178) and band 4 (PDF y=680 -> SVG y=112 -> scaled y=28):
+        // Over 0.8 gray, 16 nested 50%-opacity Darken(0.5) groups converge to ~0.5;
+        // at 50% fill alpha over 0.8 gray -> 0.5 * 0.5 + 0.5 * 0.8 = 0.65 (~166).
+        for (label, sy_px) in [("band 0", 178u32), ("band 4", 28u32)] {
+            let px = pixmap.pixel(76, sy_px).expect("in bounds");
+            let rgb = [px.red(), px.green(), px.blue()];
+            assert!(
+                rgb.iter().all(|&c| (158..=174).contains(&c)),
+                "{label} must blend to ~166 across chunked bands, got {rgb:?}"
+            );
+        }
+        // Gap between bands (PDF y=155 -> SVG y=637 -> scaled y=159): stays 0.8 gray (~204).
+        let gap = pixmap.pixel(76, 159).expect("in bounds");
+        let gap_rgb = [gap.red(), gap.green(), gap.blue()];
+        assert!(
+            gap_rgb.iter().all(|&c| (198..=210).contains(&c)),
+            "gap between repeated chunked fills must remain 0.8 gray (~204), got {gap_rgb:?}"
+        );
+    }
+
+    #[test]
+    fn nested_soft_mask_tiling_opacity_group_preserves_shape_mask_in_svg() {
+        // An Alpha soft mask containing a tiling pattern whose cell paints a
+        // TRIANGLE with a two-segment inner pattern produces a nested
+        // `PopOpacityGroup { mask_pat_id: Some(...) }` routed through
+        // `emit_isolated_tiling_ops` (depth == 1). Pixels inside the triangle
+        // must pass through the mask; pixels inside the triangle's bounding box
+        // but outside the triangle itself must be masked out.
+        let mut inner_cell = DisplayList::new(Rect::new(0.0, 0.0, 40.0, 40.0));
+        inner_cell.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 40.0, 40.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::white()),
+            alpha: 1.0,
+            overprint: None,
+        });
+        inner_cell.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Multiply,
+            isolated: true,
+            knockout: false,
+            bounds: Rect::new(0.0, 0.0, 40.0, 40.0),
+            alpha: 1.0,
+            mask: None,
+        });
+        inner_cell.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 40.0, 40.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::white()),
+            alpha: 1.0,
+            overprint: None,
+        });
+        inner_cell.push(RenderCommand::PopBlendGroup);
+        let inner_tiling = std::sync::Arc::new(zpdf_display_list::TilingPattern {
+            commands: std::sync::Arc::new(inner_cell),
+            bbox: Rect::new(0.0, 0.0, 40.0, 40.0),
+            x_step: 40.0,
+            y_step: 40.0,
+            matrix: zpdf_core::Matrix::identity(),
+            tiling_type: 1,
+        });
+
+        // Outer cell: lower-left triangle (0,0)-(40,0)-(0,40) painted with the
+        // two-segment inner pattern at 100% alpha.
+        let mut tri = Path::new();
+        tri.move_to(zpdf_core::Point::new(0.0, 0.0));
+        tri.line_to(zpdf_core::Point::new(40.0, 0.0));
+        tri.line_to(zpdf_core::Point::new(0.0, 40.0));
+        tri.close();
+
+        let mut outer_cell = DisplayList::new(Rect::new(0.0, 0.0, 40.0, 40.0));
+        outer_cell.push(RenderCommand::FillPath {
+            path: tri,
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(inner_tiling),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let outer_tiling = std::sync::Arc::new(zpdf_display_list::TilingPattern {
+            commands: std::sync::Arc::new(outer_cell),
+            bbox: Rect::new(0.0, 0.0, 40.0, 40.0),
+            x_step: 40.0,
+            y_step: 40.0,
+            matrix: zpdf_core::Matrix::identity(),
+            tiling_type: 1,
+        });
+
+        let mut mask_dl = DisplayList::new(Rect::new(0.0, 0.0, 40.0, 40.0));
+        mask_dl.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 40.0, 40.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(outer_tiling),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let soft_mask = SoftMask {
+            commands: std::sync::Arc::new(mask_dl),
+            kind: SoftMaskKind::Alpha,
+            offset: (0.0, 0.0),
+            backdrop_luma: 0.0,
+            transfer: None,
+        };
+
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 40.0, 40.0));
+        dl.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Normal,
+            isolated: true,
+            knockout: false,
+            bounds: Rect::new(0.0, 0.0, 40.0, 40.0),
+            alpha: 1.0,
+            mask: Some(soft_mask),
+        });
+        dl.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 40.0, 40.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(1.0, 0.0, 0.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        dl.push(RenderCommand::PopBlendGroup);
+
+        let pixmap = render_svg_resvg(&dl, &SvgOptions::default(), 40, 40);
+        // PDF (8, 8) -> SVG (8, 32): strictly INSIDE triangle (x + y = 16 < 40) -> red!
+        let inside = pixmap.pixel(8, 32).expect("in bounds");
+        assert!(
+            inside.red() > 240 && inside.green() < 15 && inside.blue() < 15,
+            "pixel inside nested soft-mask triangle must be red, got {:?}",
+            [inside.red(), inside.green(), inside.blue()]
+        );
+        // PDF (32, 32) -> SVG (32, 8): inside [0..40]×[0..40] bbox but OUTSIDE
+        // triangle (x + y = 64 > 40) -> must stay pure white, NOT exposed red!
+        let outside = pixmap.pixel(32, 8).expect("in bounds");
+        assert!(
+            outside.red() > 245 && outside.green() > 245 && outside.blue() > 245,
+            "pixel inside triangle bbox but outside triangle must stay masked white, got {:?}",
+            [outside.red(), outside.green(), outside.blue()]
         );
     }
 }

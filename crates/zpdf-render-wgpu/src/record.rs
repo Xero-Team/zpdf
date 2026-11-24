@@ -259,6 +259,10 @@ pub struct PageRecorder {
     pub synthetic_tiles: Vec<SyntheticTile>,
     synthetic_tile_cache: std::collections::HashMap<SyntheticTileKey, u32>,
     synthetic_tile_bytes: u64,
+    /// Inline decoded images produced while interpreting Type 3 glyph CharProcs
+    /// (e.g. `/ImageMask true` bitmap stencils), indexed via `TYPE3_IMAGE_ID_BASE`.
+    pub type3_images: Vec<zpdf_image::DecodedImage>,
+    type3_image_bytes: u64,
     /// Per-page memo of `TilingPattern::is_backdrop_dependent()`, retaining
     /// each cell `Arc<DisplayList>` so pointer keys never alias freed memory.
     tiling_backdrop_cache:
@@ -295,6 +299,10 @@ pub struct PageRecorder {
     /// lets sub-list recording unwind its state before the renderer drops it.
     recording_error: Option<&'static str>,
 }
+
+/// Base image ID reserved for inline images decoded inside Type 3 CharProcs
+/// (`PageRecorder::type3_images`), disjoint from page `ImageCache` IDs.
+pub const TYPE3_IMAGE_ID_BASE: u32 = 0x8000_0000;
 
 impl PageRecorder {
     pub fn with_limits(mut self, limits: &ParseLimits) -> Self {
@@ -409,6 +417,38 @@ impl PageRecorder {
         }
     }
 
+    pub fn get_type3_image(&self, image_id: u32) -> Option<&zpdf_image::DecodedImage> {
+        let idx = image_id.checked_sub(TYPE3_IMAGE_ID_BASE)? as usize;
+        self.type3_images.get(idx)
+    }
+
+    /// Store a decoded inline Type 3 glyph image (honoring `max_gpu_texture_bytes`)
+    /// and record an image quad referencing it.
+    pub fn add_type3_image(&mut self, quad: [TexturedVertex; 4], img: zpdf_image::DecodedImage) {
+        if !self.can_record() {
+            return;
+        }
+        let img_bytes = (img.width as u64)
+            .saturating_mul(img.height as u64)
+            .saturating_mul(4);
+        let next_bytes = self.type3_image_bytes.saturating_add(img_bytes);
+        if next_bytes > self.limits.max_gpu_texture_bytes {
+            self.recording_error = Some("GPU Type3 inline images exceed max_gpu_texture_bytes");
+            return;
+        }
+        let Ok(idx) = u32::try_from(self.type3_images.len()) else {
+            self.recording_error = Some("GPU Type3 inline image count exceeded u32");
+            return;
+        };
+        let Some(image_id) = TYPE3_IMAGE_ID_BASE.checked_add(idx) else {
+            self.recording_error = Some("GPU Type3 inline image count exceeded ID space");
+            return;
+        };
+        self.type3_image_bytes = next_bytes;
+        self.type3_images.push(img);
+        self.add_image(quad, image_id);
+    }
+
     /// Interpret a Type3 occurrence with the document's content policy and
     /// debit max(1, operators executed) from one render-page allowance. The
     /// minimum charge bounds children with no operators as well.
@@ -416,7 +456,7 @@ impl PageRecorder {
     pub fn interpret_type3_stream(
         &mut self,
         stream: &[u8],
-    ) -> Option<zpdf_display_list::DisplayList> {
+    ) -> Option<(zpdf_display_list::DisplayList, zpdf_image::ImageCache)> {
         if !self.can_record() {
             return None;
         }
@@ -432,7 +472,9 @@ impl PageRecorder {
             .deadline
             .get_or_insert_with(|| Instant::now() + RECORD_BUDGET);
         let rect = zpdf_core::Rect::new(0.0, -1000.0, 1000.0, 1000.0);
+        let mut images = zpdf_image::ImageCache::new();
         let (dl, stats) = zpdf_content::interpreter::ContentInterpreter::new(rect)
+            .with_images(&mut images)
             .with_limits(&limits)
             .with_deadline(deadline)
             .interpret_with_stats(stream);
@@ -450,7 +492,7 @@ impl PageRecorder {
         if !self.can_record() {
             return None;
         }
-        Some(dl)
+        Some((dl, images))
     }
 
     fn reserve_geometry<V>(
@@ -1210,10 +1252,10 @@ mod tests {
         let mut r = PageRecorder::default().with_limits(&limits);
         let deadline = r.deadline;
         let stream = b"0 0 1 1 re f"; // two operators, one visible command
-        let first = r.interpret_type3_stream(stream).unwrap();
+        let (first, _) = r.interpret_type3_stream(stream).unwrap();
         assert_eq!(first.commands.len(), 1);
         let sub = r.record_subops(|nested| {
-            let second = nested.interpret_type3_stream(stream).unwrap();
+            let (second, _) = nested.interpret_type3_stream(stream).unwrap();
             assert_eq!(second.commands.len(), 1);
         });
         assert!(sub.is_empty());

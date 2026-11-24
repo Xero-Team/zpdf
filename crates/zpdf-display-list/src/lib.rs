@@ -1393,12 +1393,21 @@ fn commands_ink_bounds(cmds: &[RenderCommand], bbox: Rect) -> Option<Rect> {
                 if let Some((px0, py0, px1, py1)) = path_rect(path) {
                     let pad = if style.width.is_finite() && style.width > 0.0 {
                         let w = style.width as f64;
-                        let miter = if style.miter_limit.is_finite() {
-                            (style.miter_limit as f64).clamp(1.0, 100.0)
-                        } else {
-                            10.0
+                        let factor = match style.join {
+                            LineJoin::Miter => {
+                                if style.miter_limit.is_finite() {
+                                    (style.miter_limit as f64).max(1.0)
+                                } else {
+                                    return Some(bbox);
+                                }
+                            }
+                            LineJoin::Round | LineJoin::Bevel => 1.0,
                         };
-                        (w * 0.5 * miter).max(w)
+                        let p = (w * 0.5 * factor).max(w);
+                        if !p.is_finite() {
+                            return Some(bbox);
+                        }
+                        p
                     } else {
                         1.0
                     };
@@ -2352,5 +2361,61 @@ mod tiling_backdrop_tests {
                 "{non_affine:?} must NOT be classified as affine in backdrop"
             );
         }
+    }
+
+    #[test]
+    fn stroke_ink_bounds_honor_large_finite_miter_limit() {
+        // A width-2 stroke with miter_limit 200 can project a miter tip ~150
+        // units beyond its vertex; clamping at 100 would drop neighboring copies
+        // at 25-unit steps (e.g. di = -6).
+        let mut sharp = Path::new();
+        sharp.move_to(zpdf_core::Point::new(10.0, 0.0));
+        sharp.line_to(zpdf_core::Point::new(0.0, 0.0));
+        sharp.line_to(zpdf_core::Point::new(10.0, 0.13));
+
+        let mut dl = DisplayList::new(Rect::new(-200.0, -20.0, 25.0, 25.0));
+        dl.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Multiply,
+            isolated: true,
+            knockout: false,
+            bounds: Rect::new(-200.0, -20.0, 25.0, 25.0),
+            alpha: 1.0,
+            mask: None,
+        });
+        dl.push(RenderCommand::StrokePath {
+            path: sharp,
+            style: StrokeStyle {
+                width: 2.0,
+                join: LineJoin::Miter,
+                miter_limit: 200.0,
+                ..StrokeStyle::default()
+            },
+            paint: Paint::Solid(Color::black()),
+            alpha: 1.0,
+            overprint: None,
+        });
+        dl.push(RenderCommand::PopBlendGroup);
+
+        let pat = TilingPattern {
+            commands: Arc::new(dl),
+            bbox: Rect::new(-200.0, -20.0, 25.0, 25.0),
+            x_step: 25.0,
+            y_step: 25.0,
+            matrix: Matrix::identity(),
+            tiling_type: 1,
+        };
+        let segs = pat.blend_segments().expect("segments");
+        assert_eq!(segs.len(), 1);
+        let bounds = segs[0].bounds.expect("stroke ink bounds");
+        assert!(
+            bounds.x0 <= -150.0,
+            "miter_limit=200 stroke bound must reach <= -150, got {bounds:?}"
+        );
+        // Copy shifted +150 (+6 steps) still intersects period [-200..-175] or [0..25]
+        // via its miter tip at x = -150.
+        assert!(
+            segs[0].intersects_period(&pat, -1, 0),
+            "copy reaching miter tip must intersect period"
+        );
     }
 }

@@ -730,28 +730,30 @@ impl<'a> WgpuRenderer<'a> {
         // dynamically enforced transparency-layer pool budget.
         let rec = &page.recorder;
         let referenced_images = referenced_image_ids(&batched_ops, &synthetic_tiles);
+        let lookup_image = |image_id: u32| -> Option<&zpdf_image::DecodedImage> {
+            rec.get_type3_image(image_id)
+                .or_else(|| self.image_cache.and_then(|images| images.get(image_id)))
+        };
         let mut uploadable_images = Vec::new();
         let mut image_texture_bytes = 0u64;
-        if let Some(images) = self.image_cache {
-            for image_id in referenced_images {
-                let Some(img) = images.get(image_id) else {
-                    continue;
-                };
-                if !image::is_valid_decoded_image(img)
-                    || img.width > ctx.max_texture_dim
-                    || img.height > ctx.max_texture_dim
-                {
-                    tracing::warn!(
-                        "image {image_id} {}x{} skipped (exceeds limits)",
-                        img.width,
-                        img.height
-                    );
-                    continue;
-                }
-                image_texture_bytes =
-                    image_texture_bytes.saturating_add(img.width as u64 * img.height as u64 * 4);
-                uploadable_images.push(image_id);
+        for image_id in referenced_images {
+            let Some(img) = lookup_image(image_id) else {
+                continue;
+            };
+            if !image::is_valid_decoded_image(img)
+                || img.width > ctx.max_texture_dim
+                || img.height > ctx.max_texture_dim
+            {
+                tracing::warn!(
+                    "image {image_id} {}x{} skipped (exceeds limits)",
+                    img.width,
+                    img.height
+                );
+                continue;
             }
+            image_texture_bytes =
+                image_texture_bytes.saturating_add(img.width as u64 * img.height as u64 * 4);
+            uploadable_images.push(image_id);
         }
         let mut tile_texture_bytes = 0u64;
         for tile in &synthetic_tiles {
@@ -878,11 +880,9 @@ impl<'a> WgpuRenderer<'a> {
 
         let mut tex_bgs: std::collections::HashMap<u32, wgpu::BindGroup> =
             std::collections::HashMap::new();
-        if let Some(images) = self.image_cache {
-            for image_id in uploadable_images {
-                if let Some(img) = images.get(image_id) {
-                    tex_bgs.insert(image_id, image::upload_image_bind_group(ctx, img));
-                }
+        for image_id in uploadable_images {
+            if let Some(img) = lookup_image(image_id) {
+                tex_bgs.insert(image_id, image::upload_image_bind_group(ctx, img));
             }
         }
 
@@ -4665,6 +4665,97 @@ mod resource_tests {
         assert!(
             rec.ensure_within_budget().is_err(),
             "expired run must latch budget error"
+        );
+    }
+
+    #[test]
+    fn type3_bitmap_glyph_records_inline_image_mask_in_tiling_coverage_pass() {
+        let glyph_stream = b"BI /W 8 /H 8 /BPC 1 /IM true ID \x00\x00\x00\x00\xff\xff\xff\xff EI";
+        let font = zpdf_font::LoadedFont::new_with_data(
+            zpdf_font::PdfFontType::Type3 {
+                font_matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                char_procs: std::collections::HashMap::from([(
+                    "A".into(),
+                    std::sync::Arc::<[u8]>::from(&glyph_stream[..]),
+                )]),
+                encoding: vec!["A".into()],
+                widths: vec![1.0],
+                first_char: 0,
+            },
+            "Type3BitmapTest".into(),
+            Vec::new(),
+            zpdf_font::CidWidths::new(1.0),
+        );
+        let mut fonts = zpdf_font::FontCache::new();
+        let font_id = fonts.insert("F1".into(), font);
+
+        let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 4.0, 4.0));
+        let mut sq = zpdf_display_list::Path::new();
+        sq.rect(Rect::new(0.0, 0.0, 4.0, 4.0));
+        cell.push(RenderCommand::FillPath {
+            path: sq,
+            rule: zpdf_display_list::FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(1.0, 0.0, 0.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let tiling = std::sync::Arc::new(zpdf_display_list::TilingPattern {
+            commands: std::sync::Arc::new(cell),
+            bbox: Rect::new(0.0, 0.0, 4.0, 4.0),
+            x_step: 4.0,
+            y_step: 4.0,
+            matrix: zpdf_core::Matrix::identity(),
+            tiling_type: 1,
+        });
+
+        let run = zpdf_display_list::GlyphRun {
+            font_id,
+            font_size: 12.0,
+            transform: zpdf_core::Matrix::translate(2.0, 2.0),
+            glyphs: vec![zpdf_display_list::PositionedGlyph {
+                glyph_id: 0,
+                x: 0.0,
+                y: 0.0,
+                code: b'A' as u32,
+                code_len: 1,
+                advance: 12.0,
+            }],
+            paint: Paint::Tiling(std::sync::Arc::clone(&tiling)),
+            alpha: 1.0,
+            h_scale: 1.0,
+            overprint: None,
+        };
+
+        let page_rect = Rect::new(0.0, 0.0, 20.0, 20.0);
+        let map = PageMap::new(page_rect, 1.0);
+        let mut rec = PageRecorder::default()
+            .with_limits(&zpdf_core::ParseLimits::default())
+            .with_page_rect(page_rect);
+        record_tiling_glyph_run(
+            &mut rec,
+            &run,
+            &tiling,
+            &zpdf_core::Matrix::identity(),
+            &fonts,
+            None,
+            &map,
+            0,
+        );
+        assert!(rec.ensure_within_budget().is_ok());
+        assert_eq!(
+            rec.type3_images.len(),
+            1,
+            "bitmap Type 3 glyph must preserve its decoded inline image mask"
+        );
+        let img = &rec.type3_images[0];
+        assert_eq!((img.width, img.height), (8, 8));
+        // Top half painted white (alpha=255), bottom half transparent (alpha=0).
+        assert_eq!(&img.data[0..4], &[255, 255, 255, 255]);
+        assert_eq!(&img.data[img.data.len() - 4..], &[0, 0, 0, 0]);
+        let ref_ids = referenced_image_ids(&rec.ops, &rec.synthetic_tiles);
+        assert!(
+            ref_ids.contains(&record::TYPE3_IMAGE_ID_BASE),
+            "mask ops must reference the recorded Type 3 stencil image id, got {ref_ids:?}"
         );
     }
 }
