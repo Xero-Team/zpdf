@@ -172,7 +172,7 @@ pub fn display_list_to_slide(
         image_counter: 0,
     };
 
-    converter.convert_commands(&display_list.commands)?;
+    converter.convert_display_list(display_list)?;
 
     Ok(PptxSlide {
         page_index,
@@ -192,31 +192,60 @@ struct SlideConverter<'a> {
 }
 
 impl<'a> SlideConverter<'a> {
-    fn convert_commands(&mut self, commands: &[RenderCommand]) -> Result<()> {
-        for cmd in commands {
-            match cmd {
-                RenderCommand::DrawGlyphRun(glyph_run) => {
-                    self.convert_glyph_run(glyph_run)?;
+    fn convert_display_list(&mut self, display_list: &DisplayList) -> Result<()> {
+        let commands = &display_list.commands;
+        let expanded = display_list.expanded_glyph_runs();
+        let mut exp_idx = 0usize;
+        let mut cmd_idx = 0usize;
+
+        while cmd_idx < commands.len() || exp_idx < expanded.len() {
+            let mut skipped_to: Option<usize> = None;
+            while exp_idx < expanded.len() && expanded[exp_idx].cmd_start <= cmd_idx {
+                let entry = &expanded[exp_idx];
+                exp_idx += 1;
+                if self.convert_glyph_run(&entry.run)? {
+                    let end = entry.cmd_end.min(commands.len());
+                    if end > cmd_idx {
+                        skipped_to = Some(skipped_to.map_or(end, |prev| prev.max(end)));
+                    }
                 }
-                RenderCommand::FillPath { path, paint, .. } => {
-                    self.convert_fill_path(path, paint)?;
-                }
-                RenderCommand::StrokePath {
-                    path, style, paint, ..
-                } => {
-                    self.convert_stroke_path(path, style, paint)?;
-                }
-                RenderCommand::DrawImage(image_draw) => {
-                    self.convert_image(image_draw)?;
-                }
-                // Skip clip/blend commands - we're extracting content only
-                _ => {}
             }
+            if let Some(end) = skipped_to {
+                cmd_idx = end;
+                continue;
+            }
+            if cmd_idx >= commands.len() {
+                break;
+            }
+            self.convert_command(&commands[cmd_idx])?;
+            cmd_idx += 1;
         }
         Ok(())
     }
 
-    fn convert_glyph_run(&mut self, glyph_run: &zpdf_display_list::GlyphRun) -> Result<()> {
+    fn convert_command(&mut self, cmd: &RenderCommand) -> Result<()> {
+        match cmd {
+            RenderCommand::DrawGlyphRun(glyph_run) => {
+                self.convert_glyph_run(glyph_run)?;
+            }
+            RenderCommand::FillPath { path, paint, .. } => {
+                self.convert_fill_path(path, paint)?;
+            }
+            RenderCommand::StrokePath {
+                path, style, paint, ..
+            } => {
+                self.convert_stroke_path(path, style, paint)?;
+            }
+            RenderCommand::DrawImage(image_draw) => {
+                self.convert_image(image_draw)?;
+            }
+            // Skip clip/blend commands - we're extracting content only
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn convert_glyph_run(&mut self, glyph_run: &zpdf_display_list::GlyphRun) -> Result<bool> {
         use zpdf_display_list::Paint;
 
         // Extract text from glyphs using the logical PDF font (following any
@@ -248,7 +277,7 @@ impl<'a> SlideConverter<'a> {
 
         if text.is_empty() {
             // If we couldn't extract text, skip this glyph run
-            return Ok(());
+            return Ok(false);
         }
 
         // Extract color from paint
@@ -271,7 +300,7 @@ impl<'a> SlideConverter<'a> {
         let scale_x = matrix.a.hypot(matrix.b);
         let scale_y = matrix.c.hypot(matrix.d);
         if scale_x == 0.0 || scale_y == 0.0 {
-            return Ok(());
+            return Ok(false);
         }
         let center = zpdf_core::Point::new(
             (min_x as f64 + max_x as f64) / 2.0,
@@ -309,7 +338,7 @@ impl<'a> SlideConverter<'a> {
         };
         self.elements.push(transformed_element(element, matrix));
 
-        Ok(())
+        Ok(true)
     }
 
     fn convert_fill_path(
@@ -1664,5 +1693,211 @@ mod export_tests {
             parsed_text, "AB",
             "parsed slide XML must retain both 'A' and 'B' without XML-forbidden U+000B"
         );
+    }
+
+    #[test]
+    fn type3_word_with_to_unicode_exports_editable_text_box_without_charproc_shapes() {
+        let stream = |dict: &str, bytes: &[u8]| -> Vec<u8> {
+            let mut out = format!("<< {dict} /Length {} >>\nstream\n", bytes.len()).into_bytes();
+            out.extend_from_slice(bytes);
+            out.extend_from_slice(b"\nendstream");
+            out
+        };
+        let assemble = |objects: &[Vec<u8>]| -> Vec<u8> {
+            let mut pdf = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n".to_vec();
+            let mut offsets = Vec::with_capacity(objects.len());
+            for (idx, body) in objects.iter().enumerate() {
+                offsets.push(pdf.len());
+                pdf.extend_from_slice(format!("{} 0 obj\n", idx + 1).as_bytes());
+                pdf.extend_from_slice(body);
+                pdf.extend_from_slice(b"\nendobj\n");
+            }
+            let xref = pdf.len();
+            let count = objects.len() + 1;
+            pdf.extend_from_slice(format!("xref\n0 {count}\n0000000000 65535 f \n").as_bytes());
+            for off in offsets {
+                pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+            }
+            pdf.extend_from_slice(
+                format!("trailer\n<< /Size {count} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n")
+                    .as_bytes(),
+            );
+            pdf
+        };
+
+        let to_unicode = b"/CIDInit /ProcSet findresource begin\n\
+            12 dict begin begincmap\n\
+            1 begincodespacerange <01> <03> endcodespacerange\n\
+            3 beginbfchar\n\
+            <01> <0043>\n\
+            <02> <0061>\n\
+            <03> <0074>\n\
+            endbfchar\n\
+            endcmap CMapName currentdict /CMap defineresource pop end end";
+        let glyph_rect = b"1000 0 d0 0 0 800 800 re f";
+        let content = b"0.9 0.9 0.9 rg 5 5 190 90 re f\n\
+                        0 0 1 rg BT /F1 24 Tf 20 40 Td <010203> Tj ET\n\
+                        1 0 0 rg 5 96 50 3 re f";
+
+        let pdf = assemble(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Contents 4 0 R \
+              /Resources << /Font << /F1 5 0 R >> >> >>"
+                .to_vec(),
+            stream("", content),
+            b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] \
+              /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs 6 0 R /Encoding 7 0 R \
+              /ToUnicode 8 0 R /FirstChar 1 /LastChar 3 /Widths [600 500 400] \
+              /Resources << >> >>"
+                .to_vec(),
+            b"<< /g1 9 0 R /g2 9 0 R /g3 9 0 R >>".to_vec(),
+            b"<< /Type /Encoding /Differences [1 /g1 /g2 /g3] >>".to_vec(),
+            stream("", to_unicode),
+            stream("", glyph_rect),
+        ]);
+
+        let doc = zpdf_document::PdfDocument::open(pdf).expect("open pdf");
+        let page = doc.page(0).expect("page 0");
+        let mut fonts = doc.load_page_fonts(&page);
+        let (content_bytes, _) = doc.page_content_with_diagnostics(&page).expect("content");
+        let mut images = ImageCache::new();
+        let interpreter = zpdf_content::interpreter::ContentInterpreter::new(page.effective_box())
+            .with_document(doc.file(), &page.resources)
+            .with_fonts(&mut fonts)
+            .with_images(&mut images);
+        let (display_list, _) = interpreter.interpret_with_stats(&content_bytes);
+
+        // Visual commands contain only the expanded fills (no DrawGlyphRun so
+        // renderers paint each CharProc once), while the semantic run is kept.
+        assert!(
+            !display_list
+                .commands
+                .iter()
+                .any(|c| matches!(c, RenderCommand::DrawGlyphRun(_))),
+            "Type 3 runs must not emit a duplicate DrawGlyphRun visual command"
+        );
+        assert_eq!(display_list.expanded_glyph_runs().len(), 1);
+
+        let slide = display_list_to_slide(
+            &display_list,
+            0,
+            &fonts,
+            &images,
+            &ConversionOptions::default(),
+        )
+        .expect("slide export");
+
+        // Expect [background Rectangle, TextBox("Cat"), foreground Rectangle] —
+        // no extra drawing objects from the 3 Type 3 CharProc fills.
+        assert_eq!(
+            slide.elements.len(),
+            3,
+            "unexpected slide elements: {:?}",
+            slide.elements
+        );
+        assert!(matches!(slide.elements[0], SlideElement::Rectangle { .. }));
+        match &slide.elements[1] {
+            SlideElement::TextBox {
+                text,
+                color_rgb,
+                font_size_pt,
+                ..
+            } => {
+                assert_eq!(text, "Cat");
+                assert_eq!(*color_rgb, (0, 0, 255));
+                assert!((*font_size_pt - 24.0).abs() < 1e-6);
+            }
+            other => panic!("expected TextBox for Type 3 word, got {other:?}"),
+        }
+        assert!(matches!(slide.elements[2], SlideElement::Rectangle { .. }));
+
+        let presentation = PptxPresentation {
+            slides: vec![slide],
+            width_emu: pt_to_emu(200.0),
+            height_emu: pt_to_emu(100.0),
+        };
+        let bytes = PptxWriter::new(presentation)
+            .write_to_bytes()
+            .expect("pptx bytes");
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("zip archive");
+        let xml = String::from_utf8(zip_entry(&mut archive, "ppt/slides/slide1.xml"))
+            .expect("utf-8 slide xml");
+        assert!(
+            xml.contains("<a:t>Cat</a:t>"),
+            "serialized slide XML must contain editable Type 3 text: {xml}"
+        );
+    }
+
+    #[test]
+    fn type3_unmapped_icon_without_text_falls_back_to_drawing_objects() {
+        let stream = |dict: &str, bytes: &[u8]| -> Vec<u8> {
+            let mut out = format!("<< {dict} /Length {} >>\nstream\n", bytes.len()).into_bytes();
+            out.extend_from_slice(bytes);
+            out.extend_from_slice(b"\nendstream");
+            out
+        };
+        let assemble = |objects: &[Vec<u8>]| -> Vec<u8> {
+            let mut pdf = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n".to_vec();
+            let mut offsets = Vec::with_capacity(objects.len());
+            for (idx, body) in objects.iter().enumerate() {
+                offsets.push(pdf.len());
+                pdf.extend_from_slice(format!("{} 0 obj\n", idx + 1).as_bytes());
+                pdf.extend_from_slice(body);
+                pdf.extend_from_slice(b"\nendobj\n");
+            }
+            let xref = pdf.len();
+            let count = objects.len() + 1;
+            pdf.extend_from_slice(format!("xref\n0 {count}\n0000000000 65535 f \n").as_bytes());
+            for off in offsets {
+                pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+            }
+            pdf.extend_from_slice(
+                format!("trailer\n<< /Size {count} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n")
+                    .as_bytes(),
+            );
+            pdf
+        };
+
+        // Code 0x01 has custom glyph name /logo and no /ToUnicode, so it
+        // decodes to empty text and should fall back to exporting its shape.
+        let pdf = assemble(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R \
+              /Resources << /Font << /F1 5 0 R >> >> >>"
+                .to_vec(),
+            stream("", b"1 0 0 rg BT /F1 40 Tf 10 10 Td <01> Tj ET"),
+            b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] \
+              /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs 6 0 R /Encoding 7 0 R \
+              /FirstChar 1 /LastChar 1 /Widths [1000] /Resources << >> >>"
+                .to_vec(),
+            b"<< /logo 8 0 R >>".to_vec(),
+            b"<< /Type /Encoding /Differences [1 /logo] >>".to_vec(),
+            stream("", b"1000 0 d0 0 0 1000 1000 re f"),
+        ]);
+
+        let doc = zpdf_document::PdfDocument::open(pdf).expect("open pdf");
+        let page = doc.page(0).expect("page 0");
+        let mut fonts = doc.load_page_fonts(&page);
+        let (content_bytes, _) = doc.page_content_with_diagnostics(&page).expect("content");
+        let mut images = ImageCache::new();
+        let interpreter = zpdf_content::interpreter::ContentInterpreter::new(page.effective_box())
+            .with_document(doc.file(), &page.resources)
+            .with_fonts(&mut fonts)
+            .with_images(&mut images);
+        let (display_list, _) = interpreter.interpret_with_stats(&content_bytes);
+
+        let slide = display_list_to_slide(
+            &display_list,
+            0,
+            &fonts,
+            &images,
+            &ConversionOptions::default(),
+        )
+        .expect("slide export");
+
+        assert_eq!(slide.elements.len(), 1);
+        assert!(matches!(slide.elements[0], SlideElement::Rectangle { .. }));
     }
 }

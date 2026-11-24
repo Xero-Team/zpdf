@@ -2,15 +2,27 @@
 
 ## Unreleased
 
-### Rendering and Type 3 fonts (`zpdf-content`, `zpdf-font`, `zpdf-document`)
+### Compatibility
+
+- **Breaking:** `zpdf_display_list::DisplayList` now stores expanded semantic
+  glyph runs in a private field accessed via `DisplayList::expanded_glyph_runs`
+  and `DisplayList::push_expanded_glyph_run`; construct display lists with
+  `DisplayList::new` rather than struct literals. (#156)
+
+### Rendering and Type 3 fonts (`zpdf-content`, `zpdf-display-list`, `zpdf-pptx-export`, `zpdf-font`, `zpdf-document`)
 
 - Interpret Type 3 CharProc content streams directly in `ContentInterpreter`
-  with full resource resolution ordered glyph → font → parent (Form/Image
-  XObjects, ExtGState, shadings, patterns, colour spaces, and nested fonts),
-  honour `d0` (coloured glyph) vs `d1` (uncoloured glyph locking colours to the
-  enclosing text paint per ISO 32000-1 §9.6.5.4), emit the complete command set
-  (including clips, blend groups, shadings, and nested text) across all
-  backends, deduplicate repeated Type 3 inline bitmap images, and support
+  with full resource resolution ordered glyph → font → parent (checking both
+  direct and indirect entries within each scope before advancing to parents,
+  preserving explicit inner font rebindings back to page fonts, and resolving
+  Form/Image XObjects, ExtGState, shadings, patterns, colour spaces,
+  properties, and nested fonts), honour `d0` (coloured glyph) vs `d1`
+  (uncoloured glyph locking colours to the enclosing text paint per ISO 32000-1
+  §9.6.5.4), emit the complete command set (including clips, blend groups,
+  shadings, and nested text) across all backends, deduplicate repeated Type 3
+  inline images keyed by colour/resource/intent/footprint, suspend table rule
+  capture during CharProcs, preserve semantic Type 3 runs on `DisplayList` so
+  `zpdf-pptx-export` keeps editable text without double-painting, and support
   `/BaseEncoding` / named `/Encoding` on Type 3 fonts. (#156)
 
 ## 0.22.0 — Embedded font recovery, rendering precision, and JBIG2 oracle

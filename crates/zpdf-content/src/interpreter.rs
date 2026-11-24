@@ -153,7 +153,7 @@ pub struct ContentInterpreter<'a> {
     /// Deduplication cache for inline images decoded inside Type 3 glyphs.
     #[allow(clippy::type_complexity)]
     type3_inline_image_cache: HashMap<
-        (FontId, u16, u32, Option<[u8; 3]>, (u32, u32)),
+        (FontId, u16, u32, Type3InlineColorKey, (u32, u32)),
         (zpdf_display_list::ImageId, bool),
     >,
     /// `Q` must never pop the state stack below this index — a form XObject
@@ -778,6 +778,23 @@ struct CachedType3FontResources {
     char_proc_ids: HashMap<String, ObjectId>,
 }
 
+/// Colour-resolution qualifier for reusing decoded pixels of an inline image
+/// inside a Type 3 glyph. Images whose `/ColorSpace` comes from an inline
+/// resource entry are not cached because distinct enclosing scopes can bind
+/// the same resource name to different inline palettes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Type3InlineColorKey {
+    /// `/ImageMask true` stencil tinted with the active fill RGB.
+    Mask([u8; 3]),
+    /// Non-mask inline image with a self-contained `/ColorSpace` (`cs_ref: None`)
+    /// or an indirect `/ColorSpace` resource (`cs_ref: Some(id)`), qualified by
+    /// the effective rendering intent.
+    Color {
+        cs_ref: Option<ObjectId>,
+        intent: zpdf_color::RenderIntent,
+    },
+}
+
 #[derive(Debug, Clone)]
 struct GraphicsState {
     ctm: Matrix,
@@ -1205,6 +1222,29 @@ impl<'a> ContentInterpreter<'a> {
             }
         }
         self.resources.and_then(get)
+    }
+
+    /// Resolve a `/ColorSpace` resource by name, checking both direct (inline)
+    /// and indirect entries within each scope before advancing to its parent.
+    fn lookup_color_space_resource(&self, name: &str) -> Option<PdfObject> {
+        self.lookup_res(|r| {
+            r.color_spaces_inline
+                .get(name)
+                .cloned()
+                .or_else(|| r.color_spaces.get(name).copied().map(PdfObject::Ref))
+        })
+    }
+
+    /// Resolve a `/Properties` resource by name, checking both direct (inline)
+    /// and indirect entries within each scope before advancing to its parent.
+    fn lookup_property_resource(&self, name: &str) -> Option<PdfObject> {
+        self.lookup_res(|r| {
+            r.properties_inline
+                .get(name)
+                .cloned()
+                .map(PdfObject::Dict)
+                .or_else(|| r.properties.get(name).copied().map(PdfObject::Ref))
+        })
     }
 
     /// Apply the page `/Rotate` entry (clockwise degrees, normalized to
@@ -2222,17 +2262,13 @@ impl<'a> ContentInterpreter<'a> {
             "DeviceCMYK" | "CMYK" => ActiveColorSpace::DeviceCMYK,
             "Pattern" => ActiveColorSpace::Pattern { base: None },
             _ => {
-                // Resource lookup: direct (inline) values first, then refs.
-                if let Some(obj) = self.lookup_res(|r| r.color_spaces_inline.get(name).cloned()) {
-                    return self.resolve_color_space_obj(&obj, depth);
-                }
-                let cs_id = match self.lookup_res(|r| r.color_spaces.get(name).copied()) {
-                    Some(id) => id,
-                    None => return ActiveColorSpace::DeviceGray,
+                // Check both direct and indirect entries within each scope
+                // before advancing to its parent; indirect refs pass through as
+                // `PdfObject::Ref` so `cs_cache` builds each space once.
+                let Some(obj) = self.lookup_color_space_resource(name) else {
+                    return ActiveColorSpace::DeviceGray;
                 };
-                // Pass the reference itself so the space is built once per
-                // object (`cs_cache`), not on every `cs`/`CS`/`sh` naming it.
-                self.resolve_color_space_obj(&PdfObject::Ref(cs_id), depth)
+                self.resolve_color_space_obj(&obj, depth)
             }
         }
     }
@@ -3574,17 +3610,25 @@ impl<'a> ContentInterpreter<'a> {
         if self.image_cache.is_none() {
             return;
         }
-        let (sh_obj, cache_id) = match self.lookup_res(|r| r.shadings_inline.get(name).cloned()) {
-            Some(o) => (o, None),
-            None => match self.lookup_res(|r| r.shadings.get(name).copied()) {
-                Some(id) => (PdfObject::Ref(id), Some(id)),
-                None => {
-                    self.stats.diagnostics.missing_resources =
-                        self.stats.diagnostics.missing_resources.saturating_add(1);
-                    tracing::debug!("shading {name} not found in resources");
-                    return;
-                }
-            },
+        let (sh_obj, cache_id) = match self.lookup_res(|r| {
+            r.shadings_inline
+                .get(name)
+                .cloned()
+                .map(|o| (o, None))
+                .or_else(|| {
+                    r.shadings
+                        .get(name)
+                        .copied()
+                        .map(|id| (PdfObject::Ref(id), Some(id)))
+                })
+        }) {
+            Some(found) => found,
+            None => {
+                self.stats.diagnostics.missing_resources =
+                    self.stats.diagnostics.missing_resources.saturating_add(1);
+                tracing::debug!("shading {name} not found in resources");
+                return;
+            }
         };
 
         // Only rasterize what the clip actually exposes.
@@ -3700,19 +3744,10 @@ impl<'a> ContentInterpreter<'a> {
     /// looked up in the /Properties resource.
     fn oc_properties_visible(&self, props: &PdfObject) -> bool {
         match props {
-            PdfObject::Name(n) => {
-                let obj = self
-                    .lookup_res(|r| r.properties_inline.get(n.as_str()).cloned())
-                    .map(PdfObject::Dict)
-                    .or_else(|| {
-                        self.lookup_res(|r| r.properties.get(n.as_str()).copied())
-                            .map(PdfObject::Ref)
-                    });
-                match obj {
-                    Some(o) => self.oc_object_visible(&o, 0),
-                    None => true,
-                }
-            }
+            PdfObject::Name(n) => match self.lookup_property_resource(n.as_str()) {
+                Some(o) => self.oc_object_visible(&o, 0),
+                None => true,
+            },
             other => self.oc_object_visible(other, 0),
         }
     }
@@ -3850,13 +3885,11 @@ impl<'a> ContentInterpreter<'a> {
     fn resolve_property_dict(&self, props: &PdfObject) -> Option<PdfDict> {
         match props {
             PdfObject::Dict(d) => Some(d.clone()),
-            PdfObject::Name(n) => {
-                if let Some(d) = self.lookup_res(|r| r.properties_inline.get(n.as_str()).cloned()) {
-                    return Some(d);
-                }
-                let id = self.lookup_res(|r| r.properties.get(n.as_str()).copied())?;
-                self.file?.resolve(id).ok()?.as_dict().ok().cloned()
-            }
+            PdfObject::Name(n) => match self.lookup_property_resource(n.as_str())? {
+                PdfObject::Dict(d) => Some(d),
+                PdfObject::Ref(id) => self.file?.resolve(id).ok()?.as_dict().ok().cloned(),
+                _ => None,
+            },
             PdfObject::Ref(r) => self.file?.resolve(*r).ok()?.as_dict().ok().cloned(),
             _ => None,
         }
@@ -4067,36 +4100,45 @@ impl<'a> ContentInterpreter<'a> {
     }
 
     fn apply_ext_gstate(&mut self, name: &str) {
-        // Try inline dict first (common in TikZ/PGF-generated PDFs)
-        if let Some(dict) = self.lookup_res(|r| r.ext_g_state_inline.get(name).cloned()) {
-            self.apply_ext_gstate_dict(&dict, None);
-            return;
+        enum LookedUpGs {
+            Inline(PdfDict),
+            Ref(ObjectId),
         }
 
-        let file = match self.file {
-            Some(f) => f,
-            None => return,
-        };
-
-        let gs_id = match self.lookup_res(|r| r.ext_g_state.get(name).copied()) {
-            Some(id) => id,
+        // Check both inline and indirect entries within each scope before
+        // advancing to its parent so an outer inline /GS never shadows an
+        // inner indirect /GS.
+        match self.lookup_res(|r| {
+            r.ext_g_state_inline
+                .get(name)
+                .cloned()
+                .map(LookedUpGs::Inline)
+                .or_else(|| r.ext_g_state.get(name).copied().map(LookedUpGs::Ref))
+        }) {
+            Some(LookedUpGs::Inline(dict)) => {
+                self.apply_ext_gstate_dict(&dict, None);
+            }
+            Some(LookedUpGs::Ref(gs_id)) => {
+                let Some(file) = self.file else {
+                    return;
+                };
+                let obj = match file.resolve_shared(gs_id) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        self.stats.diagnostics.record_decode_failure(&e);
+                        return;
+                    }
+                };
+                if let Ok(dict) = obj.as_dict() {
+                    self.apply_ext_gstate_dict(dict, Some(gs_id));
+                }
+            }
             None => {
-                self.stats.diagnostics.missing_resources =
-                    self.stats.diagnostics.missing_resources.saturating_add(1);
-                return;
+                if self.file.is_some() {
+                    self.stats.diagnostics.missing_resources =
+                        self.stats.diagnostics.missing_resources.saturating_add(1);
+                }
             }
-        };
-
-        let obj = match file.resolve_shared(gs_id) {
-            Ok(o) => o,
-            Err(e) => {
-                self.stats.diagnostics.record_decode_failure(&e);
-                return;
-            }
-        };
-
-        if let Ok(dict) = obj.as_dict() {
-            self.apply_ext_gstate_dict(dict, Some(gs_id));
         }
     }
 
@@ -4950,6 +4992,14 @@ impl<'a> ContentInterpreter<'a> {
         if self.image_cache.is_none() || self.oc_suppressed() {
             return;
         }
+        let type3_slot = self
+            .type3_inline_ctx
+            .as_mut()
+            .map(|(font_id, glyph_id, ordinal)| {
+                let idx = *ordinal;
+                *ordinal = ordinal.saturating_add(1);
+                (*font_id, *glyph_id, idx)
+            });
         let mut norm = normalize_inline_image_dict(&dict);
         let is_mask = matches!(norm.get("ImageMask"), Some(PdfObject::Bool(true)));
         // An inline /ImageMask stencil paints in the current fill colour, so a
@@ -4957,10 +5007,57 @@ impl<'a> ContentInterpreter<'a> {
         if cs_produces_no_marks(&self.current.fill_cs) && is_mask {
             return;
         }
+        let intent = norm
+            .get_name("Intent")
+            .ok()
+            .map(zpdf_color::RenderIntent::from_pdf_name)
+            .unwrap_or(self.current.rendering_intent);
+        // Resolve any named non-device `/ColorSpace` resource BEFORE checking
+        // the Type 3 inline-image cache so placements inheriting different
+        // colour spaces or rendering intents never alias each other's pixels.
+        let mut resolved_named_cs: Option<Option<ObjectId>> = None;
+        if !is_mask {
+            if let Some(PdfObject::Name(n)) = norm.get("ColorSpace") {
+                let cs_name = n.0.clone();
+                if !matches!(
+                    cs_name.as_str(),
+                    "DeviceGray" | "G" | "DeviceRGB" | "RGB" | "DeviceCMYK" | "CMYK"
+                ) {
+                    if let Some(obj) = self.lookup_color_space_resource(&cs_name) {
+                        let ref_id = match &obj {
+                            PdfObject::Ref(id) => Some(*id),
+                            _ => None,
+                        };
+                        norm.0.insert(zpdf_core::PdfName("ColorSpace".into()), obj);
+                        resolved_named_cs = Some(ref_id);
+                    } else {
+                        resolved_named_cs = Some(None);
+                    }
+                }
+            }
+        }
+        let color_key = if is_mask {
+            Some(Type3InlineColorKey::Mask(self.fill_rgb_u8()))
+        } else {
+            match resolved_named_cs {
+                // Named resource resolved to a concrete indirect object id.
+                Some(Some(cs_id)) => Some(Type3InlineColorKey::Color {
+                    cs_ref: Some(cs_id),
+                    intent,
+                }),
+                // Named resource resolved to an inline object or was missing:
+                // skip cross-placement pixel reuse because enclosing scopes can
+                // bind different inline palettes under the same resource name.
+                Some(None) => None,
+                // Self-contained device/array/absent `/ColorSpace`.
+                None => Some(Type3InlineColorKey::Color {
+                    cs_ref: None,
+                    intent,
+                }),
+            }
+        };
         let type3_cache_key =
-            if let Some((font_id, glyph_id, ref mut ordinal)) = self.type3_inline_ctx {
-                let idx = *ordinal;
-                *ordinal = ordinal.saturating_add(1);
+            if let (Some((font_id, glyph_id, idx)), Some(color_key)) = (type3_slot, color_key) {
                 let w = norm
                     .get_i64("Width")
                     .ok()
@@ -4972,13 +5069,7 @@ impl<'a> ContentInterpreter<'a> {
                     .and_then(|v| u32::try_from(v).ok())
                     .unwrap_or(0);
                 let footprint = self.image_footprint(&self.current.ctm, w, h);
-                let key = (
-                    font_id,
-                    glyph_id,
-                    idx,
-                    is_mask.then(|| self.fill_rgb_u8()),
-                    footprint,
-                );
+                let key = (font_id, glyph_id, idx, color_key, footprint);
                 if let Some(&(image_id, cached_is_mask)) = self.type3_inline_image_cache.get(&key) {
                     self.emit_image_draw(image_id, self.current.ctm, cached_is_mask);
                     return;
@@ -4999,30 +5090,6 @@ impl<'a> ContentInterpreter<'a> {
                 return;
             }
         };
-        // An inline-image /CS naming a non-device space refers to a
-        // /ColorSpace resource; substitute the resolved object.
-        if let Some(PdfObject::Name(n)) = norm.get("ColorSpace") {
-            let cs_name = n.0.clone();
-            if !matches!(
-                cs_name.as_str(),
-                "DeviceGray" | "G" | "DeviceRGB" | "RGB" | "DeviceCMYK" | "CMYK"
-            ) {
-                let from_res = self
-                    .lookup_res(|r| r.color_spaces_inline.get(&cs_name).cloned())
-                    .or_else(|| {
-                        self.lookup_res(|r| r.color_spaces.get(&cs_name).copied())
-                            .map(PdfObject::Ref)
-                    });
-                if let Some(obj) = from_res {
-                    norm.0.insert(zpdf_core::PdfName("ColorSpace".into()), obj);
-                }
-            }
-        }
-        let intent = norm
-            .get_name("Intent")
-            .ok()
-            .map(zpdf_color::RenderIntent::from_pdf_name)
-            .unwrap_or(self.current.rendering_intent);
         let colorspace = resolve_image_colorspace(
             self.file,
             self.icc_cache.as_deref_mut(),
@@ -5458,12 +5525,23 @@ impl<'a> ContentInterpreter<'a> {
             match obj {
                 PdfObject::Ref(font_ref) => {
                     // If the page already caches this exact font under this same
-                    // name, the plain name already resolves to it — no override.
+                    // name, reuse the page's cache slot. When an enclosing scope
+                    // (e.g. a Type 3 font or outer Form) shadowed this name, still
+                    // record an explicit rebinding back to the page slot so
+                    // `resolve_font_name` stops here instead of finding the middle
+                    // scope's override.
                     let page_same_obj = page_font_ids
                         .get(&name.0)
                         .map(|id| *id == *font_ref)
                         .unwrap_or(false);
                     if page_same_obj {
+                        if self
+                            .form_font_overrides
+                            .iter()
+                            .any(|m| m.contains_key(&name.0))
+                        {
+                            overrides.insert(name.0.clone(), name.0.clone());
+                        }
                         continue;
                     }
 
@@ -6255,7 +6333,34 @@ impl<'a> ContentInterpreter<'a> {
             .and_then(|fc| fc.get(font_id))
             .is_some_and(|font| font.is_type3());
         if is_type3 {
-            self.paint_type3_glyph_run(font_id, font_size, &glyphs, transform, h_scale);
+            let cmd_start = self.display_list.commands.len();
+            let paint_color = self.current.fill_color;
+            let alpha = self.current.fill_alpha;
+            let overprint =
+                self.overprint_descriptor(self.current.fill_overprint, self.current.fill_colorant);
+            let painted =
+                self.paint_type3_glyph_run(font_id, font_size, &glyphs, transform, h_scale);
+            let cmd_end = self.display_list.commands.len();
+            if painted
+                && self.active_type3_glyphs.is_empty()
+                && self.soft_mask_reuse.is_none()
+                && !glyphs.is_empty()
+            {
+                self.display_list.push_expanded_glyph_run(
+                    cmd_start,
+                    cmd_end,
+                    GlyphRun {
+                        font_id,
+                        font_size,
+                        glyphs,
+                        paint: Paint::Solid(paint_color),
+                        alpha,
+                        overprint,
+                        transform,
+                        h_scale,
+                    },
+                );
+            }
             return;
         }
         // GlyphRun is a fill operation. Stroke modes use actual outline paths.
@@ -6326,15 +6431,15 @@ impl<'a> ContentInterpreter<'a> {
         glyphs: &[PositionedGlyph],
         transform: Matrix,
         h_scale: f32,
-    ) {
+    ) -> bool {
         const MAX_TYPE3_DEPTH: u32 = 16;
         if glyphs.is_empty() || self.over_budget() {
-            return;
+            return false;
         }
         if self.form_depth >= MAX_TYPE3_DEPTH {
             self.stats.diagnostics.resource_limit_reached = true;
             tracing::warn!("Type 3 glyph nesting exceeds {MAX_TYPE3_DEPTH}; skipping");
-            return;
+            return false;
         }
 
         let font_meta = self.cached_type3_font_resources(font_id);
@@ -6450,6 +6555,7 @@ impl<'a> ContentInterpreter<'a> {
             let saved_oc_hidden = self.oc_hidden_from;
             let saved_text_sink = self.text_sink.take();
             let saved_span_streams = self.span_streams.take();
+            let saved_rule_sink = self.rule_sink.take();
             let saved_active_actual_text = self.active_actual_text.take();
             let saved_base_ctm = self.base_ctm;
             let saved_suppress_color_ops = self.suppress_color_ops;
@@ -6528,6 +6634,7 @@ impl<'a> ContentInterpreter<'a> {
             self.oc_hidden_from = saved_oc_hidden;
             self.text_sink = saved_text_sink;
             self.span_streams = saved_span_streams;
+            self.rule_sink = saved_rule_sink;
             self.active_actual_text = saved_active_actual_text;
             self.base_ctm = saved_base_ctm;
             self.suppress_color_ops = saved_suppress_color_ops;
@@ -6547,6 +6654,7 @@ impl<'a> ContentInterpreter<'a> {
         if pushed_font_res {
             self.form_resources.pop();
         }
+        true
     }
 
     /// CAD output can show text under a font leaked from another text block.
@@ -11462,5 +11570,117 @@ mod tests {
             .with_clip_elision_scale(1.0)
             .interpret(b"q 0 0 2 1 re W n 0 -268435000 2 268435001 re W n 0 0 2 1 re f Q");
         assert_eq!(clip_counts_and_balance(&dl_safe), (1, 1, 0));
+    }
+
+    #[test]
+    fn type3_inline_image_cache_distinguishes_rendering_intent() {
+        let mut char_procs = HashMap::new();
+        let mut glyph_bytes =
+            b"1000 0 d0 1000 0 0 1000 0 0 cm BI /W 1 /H 1 /BPC 8 /CS /RGB ID ".to_vec();
+        glyph_bytes.extend_from_slice(&[255, 0, 0]);
+        glyph_bytes.extend_from_slice(b" EI");
+        char_procs.insert("A".to_string(), std::sync::Arc::from(glyph_bytes));
+        let mut encoding = vec![String::new(); 66];
+        encoding[65] = "A".to_string();
+        let font = zpdf_font::LoadedFont::new_with_data(
+            zpdf_font::PdfFontType::Type3 {
+                font_matrix: [0.001, 0.0, 0.0, 0.001, 0.0, 0.0],
+                char_procs,
+                encoding,
+                widths: vec![1000.0],
+                first_char: 65,
+            },
+            "Type3Intent".into(),
+            Vec::new(),
+            zpdf_font::CidWidths::new(1000.0),
+        );
+        let mut fonts = FontCache::new();
+        fonts.insert("F1".into(), font);
+        let mut images = zpdf_image::ImageCache::new();
+        let page = Rect::new(0.0, 0.0, 200.0, 80.0);
+
+        // First two draws share /Perceptual (must deduplicate to 1 entry);
+        // third draw switches to /AbsoluteColorimetric (must miss and create a 2nd entry).
+        let dl = ContentInterpreter::new(page)
+            .with_fonts(&mut fonts)
+            .with_images(&mut images)
+            .interpret(
+                b"/Perceptual ri BT /F1 40 Tf 10 20 Td (AA) Tj ET \
+                  /AbsoluteColorimetric ri BT /F1 40 Tf 110 20 Td (A) Tj ET",
+            );
+        let draw_ids: Vec<zpdf_image::ImageId> = dl
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                RenderCommand::DrawImage(d) => Some(d.image_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(draw_ids.len(), 3);
+        assert_eq!(
+            draw_ids[0], draw_ids[1],
+            "same intent must reuse cached image"
+        );
+        assert_ne!(
+            draw_ids[0], draw_ids[2],
+            "distinct rendering intent must not reuse cached image"
+        );
+        assert_eq!(images.len(), 2);
+    }
+
+    #[test]
+    fn inner_indirect_properties_shadow_outer_inline_properties() {
+        // Object 1: Form XObject with indirect /Properties << /P1 2 0 R >> (MCID 7).
+        // Object 2: << /MCID 7 >>.
+        // Page has inline /Properties << /P1 << /MCID 99 >> >>.
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let off1 = pdf.len();
+        let form_body = b"/Span /P1 BDC BT /F1 12 Tf 10 10 Td (A) Tj ET EMC";
+        pdf.extend_from_slice(
+            format!(
+                "1 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+                 /Resources << /Properties << /P1 2 0 R >> >> /Length {} >>\nstream\n",
+                form_body.len()
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(form_body);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+        let off2 = pdf.len();
+        pdf.extend_from_slice(b"2 0 obj\n<< /MCID 7 >>\nendobj\n");
+        let xref = pdf.len();
+        pdf.extend_from_slice(
+            format!(
+                "xref\n0 3\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n\
+                 trailer\n<< /Size 3 >>\nstartxref\n{xref}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        let file = zpdf_parser::PdfFile::parse(pdf).expect("open pdf");
+
+        let mut resources = ResourceDict::default();
+        resources.xobjects.insert("Fm1".into(), ObjectId(1, 0));
+        let mut outer_prop = PdfDict::new();
+        outer_prop.insert(zpdf_core::PdfName::new("MCID"), PdfObject::Integer(99));
+        resources.properties_inline.insert("P1".into(), outer_prop);
+
+        let mut fonts = FontCache::new();
+        fonts.insert(
+            "F1".into(),
+            zpdf_font::LoadedFont::new_placeholder("Helvetica".into()),
+        );
+        let mut spans = Vec::new();
+        let _dl = ContentInterpreter::new(Rect::new(0.0, 0.0, 100.0, 100.0))
+            .with_document(&file, &resources)
+            .with_fonts(&mut fonts)
+            .with_text_sink(&mut spans)
+            .interpret(b"/Fm1 Do");
+
+        assert_eq!(spans.len(), 1);
+        assert_eq!(
+            spans[0].mcid,
+            Some(7),
+            "inner indirect /Properties /P1 (MCID 7) must shadow page inline /P1 (MCID 99)"
+        );
     }
 }
