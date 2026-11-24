@@ -3147,25 +3147,28 @@ fn pdf_type3_colored_d0_image_preserves_rgb_under_tiling_pattern() {
     // Uncolored `d1` glyph 'B': 8×8 stencil (`/IM true`), all opaque ink.
     let d1_charproc =
         b"1 0 0 0 1 1 d1 BI /W 8 /H 8 /BPC 1 /IM true ID \x00\x00\x00\x00\x00\x00\x00\x00 EI";
+    // Colored `d0` vector glyph 'C': explicit red fill (`1 0 0 rg`) + explicit green stroke (`0 1 0 RG`).
+    let d0_vec_charproc = b"1 0 d0 1 0 0 rg 0 0 0.5 1 re f 0 1 0 RG 0.3 w 0.75 0.1 m 0.75 0.9 l S";
     // 8×8 opaque blue tiling pattern.
     let pat_content = b"0 0 1 rg 0 0 8 8 re f";
-    let page_content = b"/Pattern cs /P1 scn BT /F1 20 Tf 8 10 Td (AB) Tj ET";
+    let page_content = b"/Pattern cs /P1 scn BT /F1 20 Tf 8 10 Td (ABC) Tj ET";
 
     let objects: Vec<Vec<u8>> = vec![
         b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
         b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
-        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 60 40] \
-          /Resources << /Font << /F1 5 0 R >> /Pattern << /P1 8 0 R >> >> \
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 80 40] \
+          /Resources << /Font << /F1 5 0 R >> /Pattern << /P1 9 0 R >> >> \
           /Contents 4 0 R >>"
             .to_vec(),
         stream("", page_content),
         b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1 1] \
-          /FontMatrix [1 0 0 1 0 0] /CharProcs << /A 6 0 R /B 7 0 R >> \
-          /Encoding << /Type /Encoding /Differences [65 /A /B] >> \
-          /FirstChar 65 /LastChar 66 /Widths [1 1] >>"
+          /FontMatrix [1 0 0 1 0 0] /CharProcs << /A 6 0 R /B 7 0 R /C 8 0 R >> \
+          /Encoding << /Type /Encoding /Differences [65 /A /B /C] >> \
+          /FirstChar 65 /LastChar 67 /Widths [1 1 1] >>"
             .to_vec(),
         stream("", d0_charproc),
         stream("", d1_charproc),
+        stream("", d0_vec_charproc),
         stream(
             "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 8 8] /XStep 8 /YStep 8",
             pat_content,
@@ -3212,8 +3215,11 @@ fn pdf_type3_colored_d0_image_preserves_rgb_under_tiling_pattern() {
     };
     // Glyph 'A' (d0 red RGB image) spans PDF x=[8..28], y=[10..30] -> pixel (18, 20).
     // Glyph 'B' (d1 stencil) spans PDF x=[28..48], y=[10..30] -> pixel (38, 20).
+    // Glyph 'C' (d0 red vector fill x=[48..58], green stroke x=[63]) -> pixels (53, 20) and (63, 20).
     let cpu_a = px(&cpu.data, cpu.width, 18, 20);
     let cpu_b = px(&cpu.data, cpu.width, 38, 20);
+    let cpu_c_fill = px(&cpu.data, cpu.width, 53, 20);
+    let cpu_c_stroke = px(&cpu.data, cpu.width, 63, 20);
     assert!(
         cpu_a[0] > 240 && cpu_a[1] < 15 && cpu_a[2] < 15,
         "CPU colored d0 Type 3 RGB image must stay red under blue tiling pattern, got {cpu_a:?}"
@@ -3221,6 +3227,14 @@ fn pdf_type3_colored_d0_image_preserves_rgb_under_tiling_pattern() {
     assert!(
         cpu_b[0] < 15 && cpu_b[1] < 15 && cpu_b[2] > 240,
         "CPU uncolored d1 Type 3 stencil must inherit blue tiling pattern, got {cpu_b:?}"
+    );
+    assert!(
+        cpu_c_fill[0] > 240 && cpu_c_fill[1] < 15 && cpu_c_fill[2] < 15,
+        "CPU colored d0 Type 3 vector fill must stay red under blue tiling pattern, got {cpu_c_fill:?}"
+    );
+    assert!(
+        cpu_c_stroke[0] < 15 && cpu_c_stroke[1] > 240 && cpu_c_stroke[2] < 15,
+        "CPU colored d0 Type 3 vector stroke must stay green under blue tiling pattern, got {cpu_c_stroke:?}"
     );
 
     let gpu = match render_gpu_shared(&dl, Some(&fonts), Some(&images), 1.0) {
@@ -3233,6 +3247,8 @@ fn pdf_type3_colored_d0_image_preserves_rgb_under_tiling_pattern() {
     };
     let gpu_a = px(&gpu.data, gpu.width, 18, 20);
     let gpu_b = px(&gpu.data, gpu.width, 38, 20);
+    let gpu_c_fill = px(&gpu.data, gpu.width, 53, 20);
+    let gpu_c_stroke = px(&gpu.data, gpu.width, 63, 20);
     assert!(
         gpu_a[0] > 240 && gpu_a[1] < 15 && gpu_a[2] < 15,
         "GPU colored d0 Type 3 RGB image must preserve red RGB under blue tiling pattern, got {gpu_a:?}"
@@ -3241,4 +3257,242 @@ fn pdf_type3_colored_d0_image_preserves_rgb_under_tiling_pattern() {
         gpu_b[0] < 15 && gpu_b[1] < 15 && gpu_b[2] > 240,
         "GPU uncolored d1 Type 3 stencil must inherit blue tiling pattern, got {gpu_b:?}"
     );
+    assert!(
+        gpu_c_fill[0] > 240 && gpu_c_fill[1] < 15 && gpu_c_fill[2] < 15,
+        "GPU colored d0 Type 3 vector fill must preserve red under blue tiling pattern, got {gpu_c_fill:?}"
+    );
+    assert!(
+        gpu_c_stroke[0] < 15 && gpu_c_stroke[1] > 240 && gpu_c_stroke[2] < 15,
+        "GPU colored d0 Type 3 vector stroke must preserve green under blue tiling pattern, got {gpu_c_stroke:?}"
+    );
+}
+
+#[test]
+fn gpu_and_cpu_type3_glyph_local_clip_restores_before_second_draw() {
+    use std::sync::Arc;
+    use zpdf::display_list::{
+        Color, DisplayList, FillRule, GlyphRun, Paint, Path, PositionedGlyph, RenderCommand,
+        TilingPattern,
+    };
+    use zpdf_core::{Matrix, Rect};
+    use zpdf_font::{CidWidths, FontCache, LoadedFont, PdfFontType};
+
+    // `d1` glyph 'A': clips a full-width `/IM true` image mask to the left 40% (`[0..0.4]`),
+    // pops the clip with `Q`, then fills `[0.7..1.0]` — verifying that:
+    //  1. the glyph-local clip cuts the mask to `[0..0.4]` (leaving `[0.4..0.7]` white), and
+    //  2. `Q` restores the clip before the second draw (`[0.7..1.0]` is painted).
+    let clip_charproc = b"1 0 0 0 1 1 d1 \
+        q 0 0 0.4 1 re W n \
+        BI /W 8 /H 8 /BPC 1 /IM true ID \x00\x00\x00\x00\x00\x00\x00\x00 EI \
+        Q \
+        0.7 0 0.3 1 re f";
+    let font = LoadedFont::new_with_data(
+        PdfFontType::Type3 {
+            font_matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            char_procs: std::collections::HashMap::from([(
+                "A".into(),
+                Arc::<[u8]>::from(&clip_charproc[..]),
+            )]),
+            encoding: vec!["A".into()],
+            widths: vec![1.0],
+            first_char: 0,
+        },
+        "Type3ClipRestore".into(),
+        Vec::new(),
+        CidWidths::new(1.0),
+    );
+    let mut fonts = FontCache::new();
+    let font_id = fonts.insert("F1".into(), font);
+
+    let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 8.0, 8.0));
+    let mut r = Path::new();
+    r.rect(Rect::new(0.0, 0.0, 8.0, 8.0));
+    cell.push(RenderCommand::FillPath {
+        path: r,
+        rule: FillRule::NonZero,
+        paint: Paint::Solid(Color::rgb(0.0, 0.0, 1.0)),
+        alpha: 1.0,
+        overprint: None,
+    });
+    let tiling = Arc::new(TilingPattern {
+        commands: Arc::new(cell),
+        bbox: Rect::new(0.0, 0.0, 8.0, 8.0),
+        x_step: 8.0,
+        y_step: 8.0,
+        matrix: Matrix::identity(),
+        tiling_type: 1,
+    });
+
+    for (label, paint) in [
+        ("solid", Paint::Solid(Color::rgb(0.0, 0.0, 1.0))),
+        ("tiling", Paint::Tiling(tiling)),
+    ] {
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 60.0, 40.0));
+        dl.push(RenderCommand::DrawGlyphRun(GlyphRun {
+            font_id,
+            font_size: 40.0,
+            glyphs: vec![PositionedGlyph {
+                glyph_id: 0,
+                code_len: 1,
+                code: b'A' as u32,
+                x: 0.0,
+                y: 0.0,
+                advance: 40.0,
+            }],
+            paint,
+            alpha: 1.0,
+            overprint: None,
+            transform: Matrix::translate(10.0, 0.0),
+            h_scale: 1.0,
+        }));
+
+        let cpu = zpdf_render_cpu::CpuRenderer::new()
+            .with_fonts(&fonts)
+            .render_display_list(&dl, 1.0)
+            .expect("cpu render");
+        let px = |data: &[u8], w: u32, x: u32, y: u32| -> [u8; 3] {
+            let off = ((y * w + x) * 4) as usize;
+            [data[off], data[off + 1], data[off + 2]]
+        };
+        // Glyph spans x=[10..50]: clipped left mask=[10..26], gap=[26..38], restored second draw=[38..50].
+        let check = |backend: &str, data: &[u8], w: u32| {
+            let left = px(data, w, 18, 20);
+            let gap = px(data, w, 32, 20);
+            let right = px(data, w, 44, 20);
+            assert!(
+                left[0] < 15 && left[1] < 15 && left[2] > 240,
+                "{backend} ({label}) clipped left half must be blue, got {left:?}"
+            );
+            assert_eq!(
+                gap,
+                [255, 255, 255],
+                "{backend} ({label}) clipped-out middle gap must remain white, got {gap:?}"
+            );
+            assert!(
+                right[0] < 15 && right[1] < 15 && right[2] > 240,
+                "{backend} ({label}) second draw after Q must be blue, got {right:?}"
+            );
+        };
+        check("CPU", &cpu.data, cpu.width);
+
+        match render_gpu_shared(&dl, Some(&fonts), None, 1.0) {
+            Ok(gpu) => check("GPU", &gpu.data, gpu.width),
+            Err(zpdf::gpu::WgpuRenderError::NoAdapter) => {
+                eprintln!("skipping GPU Type 3 clip test ({label}, no adapter)");
+            }
+            Err(e) => panic!("GPU Type 3 clip test ({label}) failed: {e}"),
+        }
+    }
+}
+
+#[test]
+fn gpu_and_cpu_type3_scaled_rotated_stroke_matches_cpu() {
+    use std::sync::Arc;
+    use zpdf::display_list::{
+        Color, DisplayList, FillRule, GlyphRun, Paint, Path, PositionedGlyph, RenderCommand,
+        TilingPattern,
+    };
+    use zpdf_core::{Matrix, Rect};
+    use zpdf_font::{CidWidths, FontCache, LoadedFont, PdfFontType};
+
+    // 90°-rotated FontMatrix (`font_matrix[0] == 0.0`): maps (x, y) -> (-y, x) scaled by 0.01.
+    // CharProc draws a horizontal line from (10, 0) to (90, 0) with width 10 in glyph space.
+    // With font_size = 10 and run.transform = 4× scale, total stroke_scale = 0.01 * 10 * 4 = 0.4,
+    // so the stroked vertical line at page x = 40 spans y = [14..46] with width = 4.0 px.
+    let stroke_charproc = b"100 0 0 0 100 100 d1 10 w 10 0 m 90 0 l S";
+    let font = LoadedFont::new_with_data(
+        PdfFontType::Type3 {
+            font_matrix: [0.0, 0.01, -0.01, 0.0, 0.0, 0.0],
+            char_procs: std::collections::HashMap::from([(
+                "A".into(),
+                Arc::<[u8]>::from(&stroke_charproc[..]),
+            )]),
+            encoding: vec!["A".into()],
+            widths: vec![1.0],
+            first_char: 0,
+        },
+        "Type3RotatedStroke".into(),
+        Vec::new(),
+        CidWidths::new(1.0),
+    );
+    let mut fonts = FontCache::new();
+    let font_id = fonts.insert("F1".into(), font);
+
+    let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 8.0, 8.0));
+    let mut r = Path::new();
+    r.rect(Rect::new(0.0, 0.0, 8.0, 8.0));
+    cell.push(RenderCommand::FillPath {
+        path: r,
+        rule: FillRule::NonZero,
+        paint: Paint::Solid(Color::rgb(1.0, 0.0, 0.0)),
+        alpha: 1.0,
+        overprint: None,
+    });
+    let tiling = Arc::new(TilingPattern {
+        commands: Arc::new(cell),
+        bbox: Rect::new(0.0, 0.0, 8.0, 8.0),
+        x_step: 8.0,
+        y_step: 8.0,
+        matrix: Matrix::identity(),
+        tiling_type: 1,
+    });
+
+    for (label, paint) in [
+        ("solid", Paint::Solid(Color::rgb(1.0, 0.0, 0.0))),
+        ("tiling", Paint::Tiling(tiling)),
+    ] {
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 80.0, 60.0));
+        dl.push(RenderCommand::DrawGlyphRun(GlyphRun {
+            font_id,
+            font_size: 10.0,
+            glyphs: vec![PositionedGlyph {
+                glyph_id: 0,
+                code_len: 1,
+                code: b'A' as u32,
+                x: 0.0,
+                y: 0.0,
+                advance: 10.0,
+            }],
+            paint,
+            alpha: 1.0,
+            overprint: None,
+            transform: Matrix::new(4.0, 0.0, 0.0, 4.0, 40.0, 10.0),
+            h_scale: 1.0,
+        }));
+
+        let cpu = zpdf_render_cpu::CpuRenderer::new()
+            .with_fonts(&fonts)
+            .render_display_list(&dl, 1.0)
+            .expect("cpu render");
+        let gpu = match render_gpu_shared(&dl, Some(&fonts), None, 1.0) {
+            Ok(p) => p,
+            Err(zpdf::gpu::WgpuRenderError::NoAdapter) => {
+                eprintln!("skipping GPU Type 3 rotated stroke test ({label}, no adapter)");
+                return;
+            }
+            Err(e) => panic!("GPU Type 3 rotated stroke test ({label}) failed: {e}"),
+        };
+
+        // Count strongly red pixels on the horizontal midline (pixel y = 30).
+        // A 4.0 px stroke produces 4 strongly red pixels (x = 38, 39, 40, 41);
+        // the old `font_matrix[0]` bug collapsed this to a 0.5 px hairline (<= 1 pixel).
+        let red_width = |data: &[u8], w: u32| -> usize {
+            (0..w)
+                .filter(|&x| {
+                    let off = ((30 * w + x) * 4) as usize;
+                    data[off] > 200 && data[off + 1] < 80 && data[off + 2] < 80
+                })
+                .count()
+        };
+        let cpu_w = red_width(&cpu.data, cpu.width);
+        let gpu_w = red_width(&gpu.data, gpu.width);
+        assert!(
+            cpu_w >= 4,
+            "CPU ({label}) 4x-scaled 90deg-rotated Type 3 stroke should span >= 4px, got {cpu_w}"
+        );
+        assert_eq!(
+            gpu_w, cpu_w,
+            "GPU ({label}) 4x-scaled 90deg-rotated Type 3 stroke width ({gpu_w}px) must match CPU ({cpu_w}px)"
+        );
+    }
 }

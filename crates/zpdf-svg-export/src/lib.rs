@@ -448,6 +448,7 @@ enum TilingPassPlan {
     Affine { t_id: u32, k_id: u32, mk_id: u32 },
 }
 
+#[derive(Clone)]
 enum BackdropStep {
     /// Intervening Normal-blended content wrapped in `<g id="ov{id}">` and
     /// composited with Porter-Duff `over` onto the running filter backdrop.
@@ -484,6 +485,7 @@ enum BackdropStep {
     },
 }
 
+#[derive(Clone)]
 struct PendingBackdrop {
     bg_id: u32,
     steps: Vec<BackdropStep>,
@@ -491,6 +493,7 @@ struct PendingBackdrop {
     region: SvgRect,
 }
 
+#[derive(Clone)]
 struct DisjointBackdropBase {
     bg_id: u32,
     opaque: bool,
@@ -4746,10 +4749,70 @@ impl<'a> SvgWriter<'a> {
         self.out.push_str("/>\n");
     }
 
-    /// Type 3 glyph runs painted with a [`TilingPattern`]: keep intrinsic
-    /// colored (`d0`) non-mask images in their own RGB colors while rendering
+    fn type3_glyph_to_page(
+        run: &GlyphRun,
+        glyph: &zpdf_display_list::PositionedGlyph,
+        font_matrix: &[f64; 6],
+    ) -> zpdf_core::Matrix {
+        run.transform
+            .concat(&zpdf_core::Matrix::translate(
+                glyph.x as f64,
+                glyph.y as f64,
+            ))
+            .concat(&zpdf_core::Matrix::scale(
+                run.font_size as f64 * run.h_scale as f64,
+                run.font_size as f64,
+            ))
+            .concat(&zpdf_core::Matrix::new(
+                font_matrix[0],
+                font_matrix[1],
+                font_matrix[2],
+                font_matrix[3],
+                font_matrix[4],
+                font_matrix[5],
+            ))
+    }
+
+    fn type3_path_to_page(path: &Path, glyph_to_page: &zpdf_core::Matrix) -> Path {
+        let mut out = Path::new();
+        for elem in path {
+            match elem {
+                PathElement::MoveTo(p) => out.move_to(p.transform(glyph_to_page)),
+                PathElement::LineTo(p) => out.line_to(p.transform(glyph_to_page)),
+                PathElement::CurveTo(c1, c2, end) => out.curve_to(
+                    c1.transform(glyph_to_page),
+                    c2.transform(glyph_to_page),
+                    end.transform(glyph_to_page),
+                ),
+                PathElement::Close => out.close(),
+            }
+        }
+        out
+    }
+
+    fn scale_type3_stroke_style(style: &StrokeStyle, scale: f64) -> StrokeStyle {
+        let s = if scale.is_finite() && scale >= 0.0 {
+            scale as f32
+        } else {
+            0.0
+        };
+        StrokeStyle {
+            width: style.width * s,
+            cap: style.cap,
+            join: style.join,
+            miter_limit: style.miter_limit,
+            dash: style.dash.as_ref().map(|d| zpdf_display_list::DashPattern {
+                array: d.array.iter().map(|v| v * s).collect(),
+                phase: d.phase * s,
+            }),
+        }
+    }
+
+    /// Type 3 glyph runs painted with a [`TilingPattern`]: keep explicit (`d0`)
+    /// colored vectors and non-mask images in their own colors while rendering
     /// inherited fills, strokes, and `/ImageMask true` stencils as opaque white
-    /// masks composited with `tiling` in exact painter's order.
+    /// masks composited with `tiling` in exact painter's order, honoring
+    /// glyph-local clips.
     fn emit_tiling_type3_run(
         &mut self,
         run: &GlyphRun,
@@ -4769,6 +4832,13 @@ impl<'a> SvgWriter<'a> {
                 image_id: ImageId,
                 transform: zpdf_core::Matrix,
                 alpha: f32,
+                clip: Option<u32>,
+                stroke_mask: Option<u32>,
+                bounds: Option<SvgRect>,
+            },
+            ColoredVector {
+                body: String,
+                bounds: Option<SvgRect>,
             },
         }
 
@@ -4826,21 +4896,7 @@ impl<'a> SvgWriter<'a> {
                 continue;
             };
             let font_matrix = program.font_matrix;
-            let glyph_to_page = run
-                .transform
-                .concat(&zpdf_core::Matrix::translate(glyph.x as f64, 0.0))
-                .concat(&zpdf_core::Matrix::scale(
-                    run.font_size as f64 * run.h_scale as f64,
-                    run.font_size as f64,
-                ))
-                .concat(&zpdf_core::Matrix::new(
-                    font_matrix[0],
-                    font_matrix[1],
-                    font_matrix[2],
-                    font_matrix[3],
-                    font_matrix[4],
-                    font_matrix[5],
-                ));
+            let glyph_to_page = Self::type3_glyph_to_page(run, glyph, &font_matrix);
             let stroke_scale = (glyph_to_page.a * glyph_to_page.d
                 - glyph_to_page.b * glyph_to_page.c)
                 .abs()
@@ -4848,70 +4904,213 @@ impl<'a> SvgWriter<'a> {
 
             let (x0, y1, scale) = (self.x0, self.y1, self.scale);
             let map_glyph_pt = |gx: f64, gy: f64| -> Option<(f64, f64)> {
-                let tx = font_matrix[0] * gx + font_matrix[2] * gy + font_matrix[4];
-                let ty = font_matrix[1] * gx + font_matrix[3] * gy + font_matrix[5];
-                let tx = tx * run.font_size as f64 * run.h_scale as f64 + glyph.x as f64;
-                let ty = ty * run.font_size as f64;
-                let tm = &run.transform;
-                let px = tm.a * tx + tm.c * ty + tm.e;
-                let py = tm.b * tx + tm.d * ty + tm.f;
-                let (sx, sy) = ((px - x0) * scale, (y1 - py) * scale);
+                let p = zpdf_core::Point::new(gx, gy).transform(&glyph_to_page);
+                let (sx, sy) = ((p.x - x0) * scale, (y1 - p.y) * scale);
                 (coord_ok(sx) && coord_ok(sy)).then_some((sx, sy))
             };
+            let mut glyph_clips: Vec<(Option<u32>, Option<u32>, Option<SvgRect>)> = Vec::new();
 
             for cmd in &program.list.commands {
                 if self.check_over_budget() {
                     break;
                 }
                 match cmd {
-                    RenderCommand::FillPath { path, rule, .. } => {
-                        let Some(d) = self.type3_path_data(path, &font_matrix, run, glyph.x) else {
+                    RenderCommand::PushClip { path, rule } => {
+                        let prev = (self.clip, self.stroke_mask, self.clip_bounds);
+                        glyph_clips.push(prev);
+                        let page_path = Self::type3_path_to_page(path, &glyph_to_page);
+                        self.push_clip(&page_path, rule);
+                        if let (Some(outer_b), Some(new_b)) = (prev.2, self.clip_bounds) {
+                            self.clip_bounds = outer_b.intersect(new_b).or(Some(new_b));
+                        }
+                    }
+                    RenderCommand::PushClipStroke { path, style } => {
+                        let prev = (self.clip, self.stroke_mask, self.clip_bounds);
+                        glyph_clips.push(prev);
+                        let page_path = Self::type3_path_to_page(path, &glyph_to_page);
+                        let scaled = Self::scale_type3_stroke_style(style, stroke_scale);
+                        self.push_clip_stroke(&page_path, &scaled);
+                        if let (Some(outer_b), Some(new_b)) = (prev.2, self.clip_bounds) {
+                            self.clip_bounds = outer_b.intersect(new_b).or(Some(new_b));
+                        }
+                    }
+                    RenderCommand::PopClip => {
+                        if let Some((clip, stroke_mask, clip_bounds)) = glyph_clips.pop() {
+                            self.clip = clip;
+                            self.stroke_mask = stroke_mask;
+                            self.clip_bounds = clip_bounds;
+                        }
+                    }
+                    RenderCommand::FillPath {
+                        path,
+                        rule,
+                        paint,
+                        alpha,
+                        ..
+                    } => {
+                        let cmd_alpha = if alpha.is_finite() {
+                            alpha.clamp(0.0, 1.0)
+                        } else {
+                            0.0
+                        };
+                        if cmd_alpha <= 0.0 {
+                            continue;
+                        }
+                        let Some(d) = self.type3_path_data(path, &glyph_to_page) else {
                             continue;
                         };
+                        let (mut px0, mut py0) = (f64::INFINITY, f64::INFINITY);
+                        let (mut px1, mut py1) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
                         for p in path.points() {
                             if let Some((sx, sy)) = map_glyph_pt(p.x, p.y) {
-                                min_x = min_x.min(sx);
-                                min_y = min_y.min(sy);
-                                max_x = max_x.max(sx);
-                                max_y = max_y.max(sy);
+                                px0 = px0.min(sx);
+                                py0 = py0.min(sy);
+                                px1 = px1.max(sx);
+                                py1 = py1.max(sy);
                             }
                         }
-                        self.out.push_str("<path d=\"");
-                        self.out.push_str(&d);
-                        self.out.push_str("\" fill=\"#ffffff\"");
-                        if *rule == FillRule::EvenOdd {
-                            self.out.push_str(" fill-rule=\"evenodd\"");
+                        match paint {
+                            Paint::Solid(c) => {
+                                flush_shape(
+                                    self,
+                                    &mut parts,
+                                    &mut cur_body,
+                                    &mut min_x,
+                                    &mut min_y,
+                                    &mut max_x,
+                                    &mut max_y,
+                                    &mut cur_pad,
+                                );
+                                let mut elem = String::with_capacity(d.len() + 64);
+                                elem.push_str("<path d=\"");
+                                elem.push_str(&d);
+                                elem.push_str("\" fill=\"");
+                                elem.push_str(&hex_color(c));
+                                elem.push('"');
+                                if *rule == FillRule::EvenOdd {
+                                    elem.push_str(" fill-rule=\"evenodd\"");
+                                }
+                                push_opacity(&mut elem, "fill-opacity", opacity * cmd_alpha);
+                                let placement = self.placement_attrs();
+                                elem.push_str(&placement);
+                                elem.push_str("/>\n");
+                                let bounds = SvgRect::from_bounds_clamped(
+                                    px0,
+                                    py0,
+                                    px1,
+                                    py1,
+                                    2.0,
+                                    self.page_width,
+                                    self.page_height,
+                                );
+                                parts.push(Type3TilingPart::ColoredVector { body: elem, bounds });
+                            }
+                            Paint::Inherited => {
+                                min_x = min_x.min(px0);
+                                min_y = min_y.min(py0);
+                                max_x = max_x.max(px1);
+                                max_y = max_y.max(py1);
+                                self.out.push_str("<path d=\"");
+                                self.out.push_str(&d);
+                                self.out.push_str("\" fill=\"#ffffff\"");
+                                if *rule == FillRule::EvenOdd {
+                                    self.out.push_str(" fill-rule=\"evenodd\"");
+                                }
+                                push_opacity(&mut self.out, "fill-opacity", cmd_alpha);
+                                let placement = self.placement_attrs();
+                                self.out.push_str(&placement);
+                                self.out.push_str("/>\n");
+                            }
+                            _ => {}
                         }
-                        let placement = self.placement_attrs();
-                        self.out.push_str(&placement);
-                        self.out.push_str("/>\n");
                     }
-                    RenderCommand::StrokePath { path, style, .. } => {
-                        let Some(d) = self.type3_path_data(path, &font_matrix, run, glyph.x) else {
+                    RenderCommand::StrokePath {
+                        path,
+                        style,
+                        paint,
+                        alpha,
+                        ..
+                    } => {
+                        let cmd_alpha = if alpha.is_finite() {
+                            alpha.clamp(0.0, 1.0)
+                        } else {
+                            0.0
+                        };
+                        if cmd_alpha <= 0.0 {
+                            continue;
+                        }
+                        let Some(d) = self.type3_path_data(path, &glyph_to_page) else {
                             continue;
                         };
                         let width = (style.width as f64 * stroke_scale * self.scale).max(0.05);
                         if !width.is_finite() {
                             continue;
                         }
-                        cur_pad = cur_pad.max(width + 2.0);
+                        let (mut px0, mut py0) = (f64::INFINITY, f64::INFINITY);
+                        let (mut px1, mut py1) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
                         for p in path.points() {
                             if let Some((sx, sy)) = map_glyph_pt(p.x, p.y) {
-                                min_x = min_x.min(sx);
-                                min_y = min_y.min(sy);
-                                max_x = max_x.max(sx);
-                                max_y = max_y.max(sy);
+                                px0 = px0.min(sx);
+                                py0 = py0.min(sy);
+                                px1 = px1.max(sx);
+                                py1 = py1.max(sy);
                             }
                         }
-                        self.out.push_str("<path d=\"");
-                        self.out.push_str(&d);
-                        self.out
-                            .push_str("\" fill=\"none\" stroke=\"#ffffff\" stroke-width=\"");
-                        push_num(&mut self.out, width);
-                        self.out.push('"');
-                        let placement = self.placement_attrs();
-                        self.out.push_str(&placement);
-                        self.out.push_str("/>\n");
+                        match paint {
+                            Paint::Solid(c) => {
+                                flush_shape(
+                                    self,
+                                    &mut parts,
+                                    &mut cur_body,
+                                    &mut min_x,
+                                    &mut min_y,
+                                    &mut max_x,
+                                    &mut max_y,
+                                    &mut cur_pad,
+                                );
+                                let mut elem = String::with_capacity(d.len() + 80);
+                                elem.push_str("<path d=\"");
+                                elem.push_str(&d);
+                                elem.push_str("\" fill=\"none\" stroke=\"");
+                                elem.push_str(&hex_color(c));
+                                elem.push_str("\" stroke-width=\"");
+                                push_num(&mut elem, width);
+                                elem.push('"');
+                                push_opacity(&mut elem, "stroke-opacity", opacity * cmd_alpha);
+                                let placement = self.placement_attrs();
+                                elem.push_str(&placement);
+                                elem.push_str("/>\n");
+                                let bounds = SvgRect::from_bounds_clamped(
+                                    px0,
+                                    py0,
+                                    px1,
+                                    py1,
+                                    width + 2.0,
+                                    self.page_width,
+                                    self.page_height,
+                                );
+                                parts.push(Type3TilingPart::ColoredVector { body: elem, bounds });
+                            }
+                            Paint::Inherited => {
+                                cur_pad = cur_pad.max(width + 2.0);
+                                min_x = min_x.min(px0);
+                                min_y = min_y.min(py0);
+                                max_x = max_x.max(px1);
+                                max_y = max_y.max(py1);
+                                self.out.push_str("<path d=\"");
+                                self.out.push_str(&d);
+                                self.out.push_str(
+                                    "\" fill=\"none\" stroke=\"#ffffff\" stroke-width=\"",
+                                );
+                                push_num(&mut self.out, width);
+                                self.out.push('"');
+                                push_opacity(&mut self.out, "stroke-opacity", cmd_alpha);
+                                let placement = self.placement_attrs();
+                                self.out.push_str(&placement);
+                                self.out.push_str("/>\n");
+                            }
+                            _ => {}
+                        }
                     }
                     RenderCommand::DrawImage(draw) => {
                         let Some(image) = program.images.get(draw.image_id) else {
@@ -4926,17 +5125,23 @@ impl<'a> SvgWriter<'a> {
                         if alpha <= 0.0 {
                             continue;
                         }
-                        if draw.is_image_mask {
-                            for &(ux, uy) in &[(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)] {
-                                let p = zpdf_core::Point::new(ux, uy).transform(&transform);
-                                let (sx, sy) = ((p.x - x0) * scale, (y1 - p.y) * scale);
-                                if coord_ok(sx) && coord_ok(sy) {
-                                    min_x = min_x.min(sx);
-                                    min_y = min_y.min(sy);
-                                    max_x = max_x.max(sx);
-                                    max_y = max_y.max(sy);
-                                }
+                        let (mut ix0, mut iy0) = (f64::INFINITY, f64::INFINITY);
+                        let (mut ix1, mut iy1) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+                        for &(ux, uy) in &[(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)] {
+                            let p = zpdf_core::Point::new(ux, uy).transform(&transform);
+                            let (sx, sy) = ((p.x - x0) * scale, (y1 - p.y) * scale);
+                            if coord_ok(sx) && coord_ok(sy) {
+                                ix0 = ix0.min(sx);
+                                iy0 = iy0.min(sy);
+                                ix1 = ix1.max(sx);
+                                iy1 = iy1.max(sy);
                             }
+                        }
+                        if draw.is_image_mask {
+                            min_x = min_x.min(ix0);
+                            min_y = min_y.min(iy0);
+                            max_x = max_x.max(ix1);
+                            max_y = max_y.max(iy1);
                             let tint = [white.r, white.g, white.b, white.a].map(f32::to_bits);
                             let key = ImageDefKey::Type3Stencil {
                                 font: run.font_id,
@@ -4962,17 +5167,34 @@ impl<'a> SvgWriter<'a> {
                                 image: draw.image_id,
                                 tint: [u32::MAX; 4],
                             };
+                            let bounds = SvgRect::from_bounds_clamped(
+                                ix0,
+                                iy0,
+                                ix1,
+                                iy1,
+                                2.0,
+                                self.page_width,
+                                self.page_height,
+                            );
                             parts.push(Type3TilingPart::ColoredImage {
                                 key,
                                 program: Rc::clone(&program),
                                 image_id: draw.image_id,
                                 transform,
                                 alpha,
+                                clip: self.clip,
+                                stroke_mask: self.stroke_mask,
+                                bounds,
                             });
                         }
                     }
                     _ => {}
                 }
+            }
+            while let Some((clip, stroke_mask, clip_bounds)) = glyph_clips.pop() {
+                self.clip = clip;
+                self.stroke_mask = stroke_mask;
+                self.clip_bounds = clip_bounds;
             }
         }
         flush_shape(
@@ -4998,176 +5220,250 @@ impl<'a> SvgWriter<'a> {
             .iter()
             .any(|p| matches!(p, Type3TilingPart::InheritedShape { .. }));
         if !has_inherited {
-            for part in parts {
-                if let Type3TilingPart::ColoredImage {
-                    key,
-                    program,
-                    image_id,
-                    transform,
-                    alpha,
-                } = part
-                {
-                    if let Some(image) = program.images.get(image_id) {
-                        self.place_image(key, image, None, &transform, alpha * opacity);
+            for part in &parts {
+                match part {
+                    Type3TilingPart::ColoredImage {
+                        key,
+                        program,
+                        image_id,
+                        transform,
+                        alpha,
+                        clip,
+                        stroke_mask,
+                        ..
+                    } => {
+                        if let Some(image) = program.images.get(*image_id) {
+                            let prev_clip = self.clip;
+                            let prev_mask = self.stroke_mask;
+                            self.clip = *clip;
+                            self.stroke_mask = *stroke_mask;
+                            self.place_image(*key, image, None, transform, *alpha * opacity);
+                            self.clip = prev_clip;
+                            self.stroke_mask = prev_mask;
+                        }
                     }
+                    Type3TilingPart::ColoredVector { body, .. } => {
+                        self.out.push_str(body);
+                    }
+                    Type3TilingPart::InheritedShape { .. } => {}
                 }
             }
             return;
         }
-        let has_colored = parts
-            .iter()
-            .any(|p| matches!(p, Type3TilingPart::ColoredImage { .. }));
-        let plan = self.emit_tiling_plan(tiling, depth);
-        let allow_raster = !has_colored;
+        let mut run_union: Option<SvgRect> = None;
+        for part in &parts {
+            let b = match part {
+                Type3TilingPart::InheritedShape { bounds, .. }
+                | Type3TilingPart::ColoredImage { bounds, .. }
+                | Type3TilingPart::ColoredVector { bounds, .. } => *bounds,
+            };
+            if let Some(r) = b {
+                run_union = Some(match run_union {
+                    Some(acc) => acc.union(r),
+                    None => r,
+                });
+            }
+        }
+        let run_affected = match (run_union, self.clip_bounds) {
+            (Some(gb), Some(cb)) => gb.intersect(cb).unwrap_or(gb),
+            (Some(gb), None) => gb,
+            (None, Some(cb)) => cb,
+            (None, None) => self.full_page_rect(),
+        };
 
-        for part in parts {
-            match part {
-                Type3TilingPart::ColoredImage {
-                    key,
-                    program,
-                    image_id,
-                    transform,
-                    alpha,
-                } => {
-                    if let Some(image) = program.images.get(image_id) {
-                        self.place_image(key, image, None, &transform, alpha * opacity);
-                    }
-                }
-                Type3TilingPart::InheritedShape {
-                    body: shape_body,
-                    bounds,
-                } => {
-                    let affected = match (bounds, self.clip_bounds) {
-                        (Some(gb), Some(cb)) => gb.intersect(cb).unwrap_or(gb),
-                        (Some(gb), None) => gb,
-                        (None, Some(cb)) => cb,
-                        (None, None) => self.full_page_rect(),
-                    };
-                    match &plan {
-                        TilingPassPlan::Affine { t_id, k_id, mk_id } => {
-                            let (t_id, k_id, mk_id) = (*t_id, *k_id, *mk_id);
-                            if depth == 0 {
-                                let shape_id = self.fresh_id();
-                                let _ = write!(self.defs, "<g id=\"s{shape_id}\"");
-                                push_opacity(&mut self.defs, "opacity", opacity);
-                                self.defs.push_str(">\n");
-                                self.defs.push_str(&shape_body);
-                                self.defs.push_str("</g>\n");
-                                let affine_prims = if self.non_isolated_ga_depth > 0 {
-                                    18
-                                } else {
-                                    14
-                                };
-                                if self.enqueue_backdrop_step(
-                                    BackdropStep::Affine {
-                                        t_id,
-                                        k_id,
-                                        mk_id,
-                                        shape_id,
-                                    },
-                                    affine_prims,
-                                    Some(affected),
-                                    true,
-                                ) {
-                                    continue;
-                                }
-                                if allow_raster
-                                    && (self.pending_backdrop.is_some() || !self.out.is_empty())
-                                    && self.emit_raster_backdrop_tiling_fallback(affected)
-                                {
-                                    continue;
-                                }
-                                self.flush_pending_backdrop();
-                            }
-                            let mask_id = self.fresh_id();
-                            let _ = write!(
-                                self.defs,
-                                "<mask id=\"m{mask_id}\" maskUnits=\"userSpaceOnUse\">\n{shape_body}</mask>\n"
-                            );
-                            self.out.push_str("<rect x=\"0\" y=\"0\" width=\"");
-                            push_num(&mut self.out, self.page_width);
-                            self.out.push_str("\" height=\"");
-                            push_num(&mut self.out, self.page_height);
-                            let _ = write!(
-                                self.out,
-                                "\" fill=\"url(#p{t_id})\" mask=\"url(#m{mask_id})\""
-                            );
-                            push_opacity(&mut self.out, "fill-opacity", opacity);
-                            self.out.push_str("/>\n");
+        let plan = self.emit_tiling_plan(tiling, depth);
+        let mut checkpoint = (depth == 0).then(|| {
+            (
+                self.out.clone(),
+                self.pending_backdrop.clone(),
+                self.disjoint_backdrop.clone(),
+                self.backdrop_fanout,
+                self.backdrop_snapshots,
+            )
+        });
+
+        'emit_parts: loop {
+            for part in &parts {
+                match part {
+                    Type3TilingPart::ColoredImage {
+                        key,
+                        program,
+                        image_id,
+                        transform,
+                        alpha,
+                        clip,
+                        stroke_mask,
+                        ..
+                    } => {
+                        if let Some(image) = program.images.get(*image_id) {
+                            let prev_clip = self.clip;
+                            let prev_mask = self.stroke_mask;
+                            self.clip = *clip;
+                            self.stroke_mask = *stroke_mask;
+                            self.place_image(*key, image, None, transform, *alpha * opacity);
+                            self.clip = prev_clip;
+                            self.stroke_mask = prev_mask;
                         }
-                        TilingPassPlan::Ops(ops) => {
-                            if ops.is_empty() {
-                                continue;
-                            }
-                            let single_pattern = match ops.as_slice() {
-                                [TilingPlanOp::Pattern { pat_id, blend_mode }] => {
-                                    Some((*pat_id, *blend_mode))
+                    }
+                    Type3TilingPart::ColoredVector { body, .. } => {
+                        self.out.push_str(body);
+                    }
+                    Type3TilingPart::InheritedShape {
+                        body: shape_body,
+                        bounds,
+                    } => {
+                        let affected = match (*bounds, self.clip_bounds) {
+                            (Some(gb), Some(cb)) => gb.intersect(cb).unwrap_or(gb),
+                            (Some(gb), None) => gb,
+                            (None, Some(cb)) => cb,
+                            (None, None) => self.full_page_rect(),
+                        };
+                        match &plan {
+                            TilingPassPlan::Affine { t_id, k_id, mk_id } => {
+                                let (t_id, k_id, mk_id) = (*t_id, *k_id, *mk_id);
+                                if depth == 0 {
+                                    let shape_id = self.fresh_id();
+                                    let _ = write!(self.defs, "<g id=\"s{shape_id}\"");
+                                    push_opacity(&mut self.defs, "opacity", opacity);
+                                    self.defs.push_str(">\n");
+                                    self.defs.push_str(shape_body);
+                                    self.defs.push_str("</g>\n");
+                                    let affine_prims = if self.non_isolated_ga_depth > 0 {
+                                        18
+                                    } else {
+                                        14
+                                    };
+                                    if self.enqueue_backdrop_step(
+                                        BackdropStep::Affine {
+                                            t_id,
+                                            k_id,
+                                            mk_id,
+                                            shape_id,
+                                        },
+                                        affine_prims,
+                                        Some(affected),
+                                        true,
+                                    ) {
+                                        continue;
+                                    }
+                                    if (self.pending_backdrop.is_some() || !self.out.is_empty())
+                                        && checkpoint.is_some()
+                                    {
+                                        let (out, pending, disjoint, fanout, snaps) =
+                                            checkpoint.take().unwrap();
+                                        self.out = out;
+                                        self.pending_backdrop = pending;
+                                        self.disjoint_backdrop = disjoint;
+                                        self.backdrop_fanout = fanout;
+                                        self.backdrop_snapshots = snaps;
+                                        if self.emit_raster_backdrop_tiling_fallback(run_affected) {
+                                            return;
+                                        }
+                                        continue 'emit_parts;
+                                    }
+                                    self.flush_pending_backdrop();
                                 }
-                                _ => None,
-                            };
-                            if depth == 0
-                                && (single_pattern.is_none()
-                                    || (self.pending_backdrop.is_some()
-                                        && single_pattern
-                                            .is_some_and(|(_, m)| m != BlendMode::Normal)))
-                            {
-                                let mut wrapped_shape =
-                                    String::with_capacity(shape_body.len() + 48);
-                                wrapped_shape.push_str("<g");
-                                push_opacity(&mut wrapped_shape, "opacity", opacity);
-                                wrapped_shape.push_str(">\n");
-                                wrapped_shape.push_str(&shape_body);
-                                wrapped_shape.push_str("</g>\n");
-                                if self.emit_tiling_multi_pass_backdrop(
-                                    ops,
-                                    &wrapped_shape,
-                                    affected,
-                                    affected,
-                                ) {
-                                    continue;
-                                }
-                                if allow_raster
-                                    && single_pattern.is_none()
-                                    && (self.pending_backdrop.is_some() || !self.out.is_empty())
-                                    && self.emit_raster_backdrop_tiling_fallback(affected)
-                                {
-                                    continue;
-                                }
-                                self.flush_pending_backdrop();
-                            }
-                            let mask_id = self.fresh_id();
-                            let _ = write!(
-                                self.defs,
-                                "<mask id=\"m{mask_id}\" maskUnits=\"userSpaceOnUse\">\n{shape_body}</mask>\n"
-                            );
-                            if let Some((id, blend_mode)) = single_pattern {
+                                let mask_id = self.fresh_id();
+                                let _ = write!(
+                                    self.defs,
+                                    "<mask id=\"m{mask_id}\" maskUnits=\"userSpaceOnUse\">\n{shape_body}</mask>\n"
+                                );
                                 self.out.push_str("<rect x=\"0\" y=\"0\" width=\"");
                                 push_num(&mut self.out, self.page_width);
                                 self.out.push_str("\" height=\"");
                                 push_num(&mut self.out, self.page_height);
                                 let _ = write!(
                                     self.out,
-                                    "\" fill=\"url(#p{id})\" mask=\"url(#m{mask_id})\""
+                                    "\" fill=\"url(#p{t_id})\" mask=\"url(#m{mask_id})\""
                                 );
                                 push_opacity(&mut self.out, "fill-opacity", opacity);
-                                if let Some(name) = blend_css(blend_mode) {
-                                    let _ = write!(self.out, " style=\"mix-blend-mode:{name};\"");
-                                }
                                 self.out.push_str("/>\n");
-                            } else {
-                                self.out.push_str("<g");
-                                push_opacity(&mut self.out, "opacity", opacity);
-                                let _ = writeln!(
-                                    self.out,
-                                    " style=\"isolation:isolate;\" mask=\"url(#m{mask_id})\">"
+                            }
+                            TilingPassPlan::Ops(ops) => {
+                                if ops.is_empty() {
+                                    continue;
+                                }
+                                let single_pattern = match ops.as_slice() {
+                                    [TilingPlanOp::Pattern { pat_id, blend_mode }] => {
+                                        Some((*pat_id, *blend_mode))
+                                    }
+                                    _ => None,
+                                };
+                                if depth == 0
+                                    && (single_pattern.is_none()
+                                        || (self.pending_backdrop.is_some()
+                                            && single_pattern
+                                                .is_some_and(|(_, m)| m != BlendMode::Normal)))
+                                {
+                                    let mut wrapped_shape =
+                                        String::with_capacity(shape_body.len() + 48);
+                                    wrapped_shape.push_str("<g");
+                                    push_opacity(&mut wrapped_shape, "opacity", opacity);
+                                    wrapped_shape.push_str(">\n");
+                                    wrapped_shape.push_str(shape_body);
+                                    wrapped_shape.push_str("</g>\n");
+                                    if self.emit_tiling_multi_pass_backdrop(
+                                        ops,
+                                        &wrapped_shape,
+                                        affected,
+                                        affected,
+                                    ) {
+                                        continue;
+                                    }
+                                    if single_pattern.is_none()
+                                        && (self.pending_backdrop.is_some() || !self.out.is_empty())
+                                        && checkpoint.is_some()
+                                    {
+                                        let (out, pending, disjoint, fanout, snaps) =
+                                            checkpoint.take().unwrap();
+                                        self.out = out;
+                                        self.pending_backdrop = pending;
+                                        self.disjoint_backdrop = disjoint;
+                                        self.backdrop_fanout = fanout;
+                                        self.backdrop_snapshots = snaps;
+                                        if self.emit_raster_backdrop_tiling_fallback(run_affected) {
+                                            return;
+                                        }
+                                        continue 'emit_parts;
+                                    }
+                                    self.flush_pending_backdrop();
+                                }
+                                let mask_id = self.fresh_id();
+                                let _ = write!(
+                                    self.defs,
+                                    "<mask id=\"m{mask_id}\" maskUnits=\"userSpaceOnUse\">\n{shape_body}</mask>\n"
                                 );
-                                self.emit_isolated_tiling_ops(ops);
-                                self.out.push_str("</g>\n");
+                                if let Some((id, blend_mode)) = single_pattern {
+                                    self.out.push_str("<rect x=\"0\" y=\"0\" width=\"");
+                                    push_num(&mut self.out, self.page_width);
+                                    self.out.push_str("\" height=\"");
+                                    push_num(&mut self.out, self.page_height);
+                                    let _ = write!(
+                                        self.out,
+                                        "\" fill=\"url(#p{id})\" mask=\"url(#m{mask_id})\""
+                                    );
+                                    push_opacity(&mut self.out, "fill-opacity", opacity);
+                                    if let Some(name) = blend_css(blend_mode) {
+                                        let _ =
+                                            write!(self.out, " style=\"mix-blend-mode:{name};\"");
+                                    }
+                                    self.out.push_str("/>\n");
+                                } else {
+                                    self.out.push_str("<g");
+                                    push_opacity(&mut self.out, "opacity", opacity);
+                                    let _ = writeln!(
+                                        self.out,
+                                        " style=\"isolation:isolate;\" mask=\"url(#m{mask_id})\">"
+                                    );
+                                    self.emit_isolated_tiling_ops(ops);
+                                    self.out.push_str("</g>\n");
+                                }
                             }
                         }
                     }
                 }
             }
+            break;
         }
     }
 
@@ -5242,7 +5538,9 @@ impl<'a> SvgWriter<'a> {
             .map(|(stream, font_matrix)| {
                 let glyph_rect = zpdf_core::Rect::new(0.0, -1000.0, 1000.0, 1000.0);
                 let mut images = ImageCache::new();
-                let mut interp = ContentInterpreter::new(glyph_rect).with_images(&mut images);
+                let mut interp = ContentInterpreter::new(glyph_rect)
+                    .for_type3_glyph()
+                    .with_images(&mut images);
                 if let Some(deadline) = self.deadline {
                     interp = interp.with_deadline(deadline);
                 }
@@ -5269,8 +5567,8 @@ impl<'a> SvgWriter<'a> {
     }
 
     /// Type3 glyphs: interpret the glyph's content stream (as the CPU backend
-    /// does) and emit its fills, strokes and images through the Type3
-    /// transform chain.
+    /// does) and emit its fills, strokes, glyph-local clips, and images through
+    /// the Type3 transform chain.
     fn emit_type3_run(&mut self, run: &GlyphRun, font: &LoadedFont, color: &Color, opacity: f32) {
         for glyph in &run.glyphs {
             if self.check_over_budget() {
@@ -5280,22 +5578,7 @@ impl<'a> SvgWriter<'a> {
                 continue;
             };
             let font_matrix = program.font_matrix;
-            // Glyph space → page space (SVG units are page points).
-            let glyph_to_page = run
-                .transform
-                .concat(&zpdf_core::Matrix::translate(glyph.x as f64, 0.0))
-                .concat(&zpdf_core::Matrix::scale(
-                    run.font_size as f64 * run.h_scale as f64,
-                    run.font_size as f64,
-                ))
-                .concat(&zpdf_core::Matrix::new(
-                    font_matrix[0],
-                    font_matrix[1],
-                    font_matrix[2],
-                    font_matrix[3],
-                    font_matrix[4],
-                    font_matrix[5],
-                ));
+            let glyph_to_page = Self::type3_glyph_to_page(run, glyph, &font_matrix);
             // Stroke widths are in glyph space; scale them by the whole
             // glyph-to-page transform (its mean axis scale), as the CPU
             // backend does.
@@ -5303,31 +5586,96 @@ impl<'a> SvgWriter<'a> {
                 - glyph_to_page.b * glyph_to_page.c)
                 .abs()
                 .sqrt();
+            let mut glyph_clips: Vec<(Option<u32>, Option<u32>, Option<SvgRect>)> = Vec::new();
 
             for cmd in &program.list.commands {
                 if self.check_over_budget() {
                     break;
                 }
                 match cmd {
-                    RenderCommand::FillPath { path, rule, .. } => {
-                        let Some(d) = self.type3_path_data(path, &font_matrix, run, glyph.x) else {
+                    RenderCommand::PushClip { path, rule } => {
+                        let prev = (self.clip, self.stroke_mask, self.clip_bounds);
+                        glyph_clips.push(prev);
+                        let page_path = Self::type3_path_to_page(path, &glyph_to_page);
+                        self.push_clip(&page_path, rule);
+                        if let (Some(outer_b), Some(new_b)) = (prev.2, self.clip_bounds) {
+                            self.clip_bounds = outer_b.intersect(new_b).or(Some(new_b));
+                        }
+                    }
+                    RenderCommand::PushClipStroke { path, style } => {
+                        let prev = (self.clip, self.stroke_mask, self.clip_bounds);
+                        glyph_clips.push(prev);
+                        let page_path = Self::type3_path_to_page(path, &glyph_to_page);
+                        let scaled = Self::scale_type3_stroke_style(style, stroke_scale);
+                        self.push_clip_stroke(&page_path, &scaled);
+                        if let (Some(outer_b), Some(new_b)) = (prev.2, self.clip_bounds) {
+                            self.clip_bounds = outer_b.intersect(new_b).or(Some(new_b));
+                        }
+                    }
+                    RenderCommand::PopClip => {
+                        if let Some((clip, stroke_mask, clip_bounds)) = glyph_clips.pop() {
+                            self.clip = clip;
+                            self.stroke_mask = stroke_mask;
+                            self.clip_bounds = clip_bounds;
+                        }
+                    }
+                    RenderCommand::FillPath {
+                        path,
+                        rule,
+                        paint,
+                        alpha,
+                        ..
+                    } => {
+                        let cmd_alpha = if alpha.is_finite() {
+                            alpha.clamp(0.0, 1.0)
+                        } else {
+                            0.0
+                        };
+                        if cmd_alpha <= 0.0 {
+                            continue;
+                        }
+                        let draw_color = match paint {
+                            Paint::Solid(c) => c,
+                            Paint::Inherited => color,
+                            _ => continue,
+                        };
+                        let Some(d) = self.type3_path_data(path, &glyph_to_page) else {
                             continue;
                         };
                         self.out.push_str("<path d=\"");
                         self.out.push_str(&d);
                         self.out.push_str("\" fill=\"");
-                        self.out.push_str(&hex_color(color));
+                        self.out.push_str(&hex_color(draw_color));
                         self.out.push('"');
                         if *rule == FillRule::EvenOdd {
                             self.out.push_str(" fill-rule=\"evenodd\"");
                         }
-                        push_opacity(&mut self.out, "fill-opacity", opacity);
+                        push_opacity(&mut self.out, "fill-opacity", opacity * cmd_alpha);
                         let placement = self.placement_attrs();
                         self.out.push_str(&placement);
                         self.out.push_str("/>\n");
                     }
-                    RenderCommand::StrokePath { path, style, .. } => {
-                        let Some(d) = self.type3_path_data(path, &font_matrix, run, glyph.x) else {
+                    RenderCommand::StrokePath {
+                        path,
+                        style,
+                        paint,
+                        alpha,
+                        ..
+                    } => {
+                        let cmd_alpha = if alpha.is_finite() {
+                            alpha.clamp(0.0, 1.0)
+                        } else {
+                            0.0
+                        };
+                        if cmd_alpha <= 0.0 {
+                            continue;
+                        }
+                        let draw_color = match paint {
+                            Paint::Solid(c) => c,
+                            Paint::Inherited => color,
+                            _ => continue,
+                        };
+                        let Some(d) = self.type3_path_data(path, &glyph_to_page) else {
                             continue;
                         };
                         let width = (style.width as f64 * stroke_scale * self.scale).max(0.05);
@@ -5337,11 +5685,11 @@ impl<'a> SvgWriter<'a> {
                         self.out.push_str("<path d=\"");
                         self.out.push_str(&d);
                         self.out.push_str("\" fill=\"none\" stroke=\"");
-                        self.out.push_str(&hex_color(color));
+                        self.out.push_str(&hex_color(draw_color));
                         self.out.push_str("\" stroke-width=\"");
                         push_num(&mut self.out, width);
                         self.out.push('"');
-                        push_opacity(&mut self.out, "stroke-opacity", opacity);
+                        push_opacity(&mut self.out, "stroke-opacity", opacity * cmd_alpha);
                         let placement = self.placement_attrs();
                         self.out.push_str(&placement);
                         self.out.push_str("/>\n");
@@ -5382,28 +5730,23 @@ impl<'a> SvgWriter<'a> {
                     _ => {}
                 }
             }
+            while let Some((clip, stroke_mask, clip_bounds)) = glyph_clips.pop() {
+                self.clip = clip;
+                self.stroke_mask = stroke_mask;
+                self.clip_bounds = clip_bounds;
+            }
         }
     }
 
     fn type3_path_data(
         &mut self,
         path: &Path,
-        font_matrix: &[f64; 6],
-        run: &GlyphRun,
-        glyph_x_offset: f32,
+        glyph_to_page: &zpdf_core::Matrix,
     ) -> Option<String> {
         let (x0, y1, scale) = (self.x0, self.y1, self.scale);
         let map = |gx: f64, gy: f64| -> Option<(f64, f64)> {
-            // FontMatrix → text space, scale by size (x also carries Th),
-            // advance offset, then Tm/CTM, then the fixed page flip.
-            let tx = font_matrix[0] * gx + font_matrix[2] * gy + font_matrix[4];
-            let ty = font_matrix[1] * gx + font_matrix[3] * gy + font_matrix[5];
-            let tx = tx * run.font_size as f64 * run.h_scale as f64 + glyph_x_offset as f64;
-            let ty = ty * run.font_size as f64;
-            let tm = &run.transform;
-            let px = tm.a * tx + tm.c * ty + tm.e;
-            let py = tm.b * tx + tm.d * ty + tm.f;
-            let (sx, sy) = ((px - x0) * scale, (y1 - py) * scale);
+            let p = zpdf_core::Point::new(gx, gy).transform(glyph_to_page);
+            let (sx, sy) = ((p.x - x0) * scale, (y1 - p.y) * scale);
             (coord_ok(sx) && coord_ok(sy)).then_some((sx, sy))
         };
         self.path_data_with(path, map)
@@ -10203,15 +10546,18 @@ mod tests {
             b"1 0 d0 BI /W 2 /H 2 /CS /RGB /BPC 8 ID \xff\x00\x00\xff\x00\x00\xff\x00\x00\xff\x00\x00 EI";
         let d1_stream =
             b"1 0 0 0 1 1 d1 BI /W 8 /H 8 /BPC 1 /IM true ID \x00\x00\x00\x00\x00\x00\x00\x00 EI";
+        let d0_vec_stream =
+            b"1 0 d0 1 0 0 rg 0 0 0.5 1 re f 0 1 0 RG 0.3 w 0.75 0.1 m 0.75 0.9 l S";
         let font = LoadedFont::new_with_data(
             zpdf_font::PdfFontType::Type3 {
                 font_matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
                 char_procs: HashMap::from([
                     ("A".into(), std::sync::Arc::<[u8]>::from(&d0_stream[..])),
                     ("B".into(), std::sync::Arc::<[u8]>::from(&d1_stream[..])),
+                    ("C".into(), std::sync::Arc::<[u8]>::from(&d0_vec_stream[..])),
                 ]),
-                encoding: vec!["A".into(), "B".into()],
-                widths: vec![1.0, 1.0],
+                encoding: vec!["A".into(), "B".into(), "C".into()],
+                widths: vec![1.0, 1.0, 1.0],
                 first_char: 0,
             },
             "Type3MixedSvg".into(),
@@ -10240,7 +10586,7 @@ mod tests {
             tiling_type: 1,
         });
 
-        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 60.0, 40.0));
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 80.0, 40.0));
         dl.push(RenderCommand::DrawGlyphRun(GlyphRun {
             font_id,
             font_size: 20.0,
@@ -10261,6 +10607,14 @@ mod tests {
                     y: 0.0,
                     advance: 20.0,
                 },
+                PositionedGlyph {
+                    glyph_id: 2,
+                    code_len: 1,
+                    code: b'C' as u32,
+                    x: 40.0,
+                    y: 0.0,
+                    advance: 20.0,
+                },
             ],
             paint: Paint::Tiling(tiling),
             alpha: 1.0,
@@ -10272,14 +10626,18 @@ mod tests {
         let svg = display_list_to_svg(&dl, &fonts, &ImageCache::new(), &SvgOptions::default());
         let tree = resvg::usvg::Tree::from_data(svg.as_bytes(), &resvg::usvg::Options::default())
             .expect("valid SVG");
-        let mut pixmap = resvg::tiny_skia::Pixmap::new(60, 40).expect("pixmap");
+        let mut pixmap = resvg::tiny_skia::Pixmap::new(80, 40).expect("pixmap");
+        let sx = 80.0 / tree.size().width();
+        let sy = 40.0 / tree.size().height();
         resvg::render(
             &tree,
-            resvg::tiny_skia::Transform::identity(),
+            resvg::tiny_skia::Transform::from_scale(sx, sy),
             &mut pixmap.as_mut(),
         );
         let a = pixmap.pixel(18, 20).expect("in bounds");
         let b = pixmap.pixel(38, 20).expect("in bounds");
+        let c_fill = pixmap.pixel(53, 20).expect("in bounds");
+        let c_stroke = pixmap.pixel(63, 20).expect("in bounds");
         assert!(
             a.red() > 240 && a.green() < 15 && a.blue() < 15,
             "SVG d0 colored RGB Type 3 image must stay red under blue tiling pattern, got {:?}",
@@ -10289,6 +10647,250 @@ mod tests {
             b.red() < 15 && b.green() < 15 && b.blue() > 240,
             "SVG d1 stencil Type 3 glyph must inherit blue tiling pattern, got {:?}",
             [b.red(), b.green(), b.blue()]
+        );
+        assert!(
+            c_fill.red() > 240 && c_fill.green() < 15 && c_fill.blue() < 15,
+            "SVG d0 explicit red vector fill must stay red under blue tiling pattern, got {:?}",
+            [c_fill.red(), c_fill.green(), c_fill.blue()]
+        );
+        assert!(
+            c_stroke.red() < 15 && c_stroke.green() > 240 && c_stroke.blue() < 15,
+            "SVG d0 explicit green vector stroke must stay green under blue tiling pattern, got {:?}",
+            [c_stroke.red(), c_stroke.green(), c_stroke.blue()]
+        );
+    }
+
+    #[test]
+    fn svg_type3_glyph_local_clip_restores_before_second_draw() {
+        let clip_stream = b"1 0 0 0 1 1 d1 \
+            q 0 0 0.4 1 re W n \
+            BI /W 8 /H 8 /BPC 1 /IM true ID \x00\x00\x00\x00\x00\x00\x00\x00 EI \
+            Q 0.7 0 0.3 1 re f";
+        let font = LoadedFont::new_with_data(
+            zpdf_font::PdfFontType::Type3 {
+                font_matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                char_procs: HashMap::from([(
+                    "A".into(),
+                    std::sync::Arc::<[u8]>::from(&clip_stream[..]),
+                )]),
+                encoding: vec!["A".into()],
+                widths: vec![1.0],
+                first_char: 0,
+            },
+            "Type3ClipSvg".into(),
+            Vec::new(),
+            zpdf_font::CidWidths::new(1.0),
+        );
+        let mut fonts = FontCache::new();
+        let font_id = fonts.insert("F1".into(), font);
+
+        let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 8.0, 8.0));
+        let mut r = Path::new();
+        r.rect(Rect::new(0.0, 0.0, 8.0, 8.0));
+        cell.push(RenderCommand::FillPath {
+            path: r,
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(0.0, 0.0, 1.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let tiling = std::sync::Arc::new(zpdf_display_list::TilingPattern {
+            commands: std::sync::Arc::new(cell),
+            bbox: Rect::new(0.0, 0.0, 8.0, 8.0),
+            x_step: 8.0,
+            y_step: 8.0,
+            matrix: zpdf_core::Matrix::identity(),
+            tiling_type: 1,
+        });
+
+        for (label, paint) in [
+            ("solid", Paint::Solid(Color::rgb(0.0, 0.0, 1.0))),
+            ("tiling", Paint::Tiling(tiling)),
+        ] {
+            let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 60.0, 40.0));
+            dl.push(RenderCommand::DrawGlyphRun(GlyphRun {
+                font_id,
+                font_size: 40.0,
+                glyphs: vec![PositionedGlyph {
+                    glyph_id: 0,
+                    code_len: 1,
+                    code: b'A' as u32,
+                    x: 0.0,
+                    y: 0.0,
+                    advance: 40.0,
+                }],
+                paint,
+                alpha: 1.0,
+                overprint: None,
+                transform: zpdf_core::Matrix::translate(10.0, 0.0),
+                h_scale: 1.0,
+            }));
+            let svg = display_list_to_svg(&dl, &fonts, &ImageCache::new(), &SvgOptions::default());
+            let tree =
+                resvg::usvg::Tree::from_data(svg.as_bytes(), &resvg::usvg::Options::default())
+                    .expect("valid SVG");
+            let mut pixmap = resvg::tiny_skia::Pixmap::new(60, 40).expect("pixmap");
+            let sx = 60.0 / tree.size().width();
+            let sy = 40.0 / tree.size().height();
+            resvg::render(
+                &tree,
+                resvg::tiny_skia::Transform::from_scale(sx, sy),
+                &mut pixmap.as_mut(),
+            );
+            let left = pixmap.pixel(18, 20).expect("in bounds");
+            let gap = pixmap.pixel(32, 20).expect("in bounds");
+            let right = pixmap.pixel(44, 20).expect("in bounds");
+            assert!(
+                left.red() < 15 && left.green() < 15 && left.blue() > 240,
+                "SVG ({label}) clipped left half must be blue, got {:?}",
+                [left.red(), left.green(), left.blue()]
+            );
+            assert_eq!(
+                [gap.red(), gap.green(), gap.blue()],
+                [255, 255, 255],
+                "SVG ({label}) clipped-out middle gap must stay white"
+            );
+            assert!(
+                right.red() < 15 && right.green() < 15 && right.blue() > 240,
+                "SVG ({label}) second draw after Q must be blue, got {:?}",
+                [right.red(), right.green(), right.blue()]
+            );
+        }
+    }
+
+    #[test]
+    fn svg_mixed_type3_run_over_budget_affine_uses_live_backdrop() {
+        let rect_path = |x0, y0, x1, y1| {
+            let mut p = Path::new();
+            p.rect(Rect::new(x0, y0, x1, y1));
+            p
+        };
+        // Same over-budget 3-seed affine tiling pattern on a 1200×1200 opaque blue page:
+        // alternating white Multiply + black Screen is an exact identity on opaque blue.
+        let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 60.0, 10.0));
+        for _ in 0..88 {
+            cell.push(RenderCommand::PushBlendGroup {
+                blend_mode: BlendMode::Multiply,
+                isolated: false,
+                knockout: false,
+                bounds: Rect::new(0.0, 0.0, 60.0, 10.0),
+                alpha: 1.0,
+                mask: None,
+            });
+            cell.push(RenderCommand::FillPath {
+                path: rect_path(0.0, 0.0, 60.0, 10.0),
+                rule: FillRule::NonZero,
+                paint: Paint::Solid(Color::white()),
+                alpha: 1.0,
+                overprint: None,
+            });
+            cell.push(RenderCommand::PopBlendGroup);
+            cell.push(RenderCommand::PushBlendGroup {
+                blend_mode: BlendMode::Screen,
+                isolated: false,
+                knockout: false,
+                bounds: Rect::new(0.0, 0.0, 60.0, 10.0),
+                alpha: 1.0,
+                mask: None,
+            });
+            cell.push(RenderCommand::FillPath {
+                path: rect_path(0.0, 0.0, 60.0, 10.0),
+                rule: FillRule::NonZero,
+                paint: Paint::Solid(Color::black()),
+                alpha: 1.0,
+                overprint: None,
+            });
+            cell.push(RenderCommand::PopBlendGroup);
+        }
+        let tiling = std::sync::Arc::new(zpdf_display_list::TilingPattern {
+            commands: std::sync::Arc::new(cell),
+            bbox: Rect::new(0.0, 0.0, 60.0, 10.0),
+            x_step: 10.0,
+            y_step: 10.0,
+            matrix: zpdf_core::Matrix::identity(),
+            tiling_type: 1,
+        });
+
+        // Mixed Type 3 run: 'A' is a `d0` red RGB image on the left [0..0.25],
+        // 'B' is a `d1` full-page inherited shape [0.25..1.0].
+        let d0_img =
+            b"1 0 d0 0.25 0 0 1 0 0 cm BI /W 2 /H 2 /CS /RGB /BPC 8 ID \xff\x00\x00\xff\x00\x00\xff\x00\x00\xff\x00\x00 EI";
+        let d1_box = b"1 0 0 0 1 1 d1 0.25 0 0.75 1 re f";
+        let font = LoadedFont::new_with_data(
+            zpdf_font::PdfFontType::Type3 {
+                font_matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                char_procs: HashMap::from([
+                    ("A".into(), std::sync::Arc::<[u8]>::from(&d0_img[..])),
+                    ("B".into(), std::sync::Arc::<[u8]>::from(&d1_box[..])),
+                ]),
+                encoding: vec!["A".into(), "B".into()],
+                widths: vec![1.0, 1.0],
+                first_char: 0,
+            },
+            "Type3MixedAffineLiveBackdrop".into(),
+            Vec::new(),
+            zpdf_font::CidWidths::new(1.0),
+        );
+        let mut fonts = FontCache::new();
+        let font_id = fonts.insert("F1".into(), font);
+
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 1200.0, 1200.0));
+        dl.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 1200.0, 1200.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(0.0, 0.0, 1.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        dl.push(RenderCommand::DrawGlyphRun(GlyphRun {
+            font_id,
+            font_size: 1200.0,
+            glyphs: vec![
+                PositionedGlyph {
+                    glyph_id: 0,
+                    code_len: 1,
+                    code: b'A' as u32,
+                    x: 0.0,
+                    y: 0.0,
+                    advance: 0.0,
+                },
+                PositionedGlyph {
+                    glyph_id: 1,
+                    code_len: 1,
+                    code: b'B' as u32,
+                    x: 0.0,
+                    y: 0.0,
+                    advance: 0.0,
+                },
+            ],
+            paint: Paint::Tiling(tiling),
+            alpha: 1.0,
+            overprint: None,
+            transform: zpdf_core::Matrix::identity(),
+            h_scale: 1.0,
+        }));
+
+        let svg = display_list_to_svg(&dl, &fonts, &ImageCache::new(), &SvgOptions::default());
+        let tree = resvg::usvg::Tree::from_data(svg.as_bytes(), &resvg::usvg::Options::default())
+            .expect("valid SVG");
+        let mut pixmap = resvg::tiny_skia::Pixmap::new(60, 60).expect("pixmap");
+        let s = 60.0 / tree.size().width();
+        resvg::render(
+            &tree,
+            resvg::tiny_skia::Transform::from_scale(s, s),
+            &mut pixmap.as_mut(),
+        );
+        let red_img = pixmap.pixel(7, 30).expect("in bounds");
+        let blue_pat = pixmap.pixel(40, 30).expect("in bounds");
+        assert!(
+            red_img.red() > 240 && red_img.green() < 15 && red_img.blue() < 15,
+            "mixed Type 3 run fallback must preserve d0 red RGB image, got {:?}",
+            [red_img.red(), red_img.green(), red_img.blue()]
+        );
+        assert!(
+            blue_pat.red() < 15 && blue_pat.green() < 15 && blue_pat.blue() > 240,
+            "mixed Type 3 run over-budget affine glyph must keep live blue backdrop instead of transparent white seed, got {:?}",
+            [blue_pat.red(), blue_pat.green(), blue_pat.blue()]
         );
     }
 }

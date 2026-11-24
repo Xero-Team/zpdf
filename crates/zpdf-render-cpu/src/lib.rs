@@ -3537,8 +3537,13 @@ impl<'a> CpuRenderer<'a> {
                         return;
                     }
                     self.count(run.glyphs.len() as u64, |s| &mut s.glyphs);
-                    // Fast path: single non-overlapping segment at full opacity.
-                    if opacity >= 1.0 && Self::tiling_is_non_overlapping(tiling) {
+                    // Fast path: single non-overlapping segment at full opacity
+                    // for outline glyphs. Type 3 glyphs route through
+                    // `render_type3_backdrop_tiling` so explicit `d0` colors,
+                    // overlapping sub-shapes, and glyph-local clips composite
+                    // in exact painter's order.
+                    if !font.is_type3() && opacity >= 1.0 && Self::tiling_is_non_overlapping(tiling)
+                    {
                         if let [TilingBlendStep::Segment(seg)] = steps.as_slice() {
                             if let Some((pixmap, transform, quality, tile_opacity, _)) = self
                                 .prepare_tiling_paint_for(
@@ -3563,13 +3568,7 @@ impl<'a> CpuRenderer<'a> {
                                     anti_alias: true,
                                     ..Default::default()
                                 };
-                                if font.is_type3() {
-                                    let t = self.tick();
-                                    self.render_type3_glyphs(run, font, &paint, 1.0);
-                                    self.tock(t, |s| &mut s.glyph_raster_ns);
-                                } else {
-                                    self.render_outline_glyphs(run, font, &paint);
-                                }
+                                self.render_outline_glyphs(run, font, &paint);
                                 return;
                             }
                         }
@@ -6010,10 +6009,86 @@ impl<'a> CpuRenderer<'a> {
         (px, py)
     }
 
+    /// True when a Type 3 CharProc command paints an explicit (`d0`) color or
+    /// RGB image rather than inheriting the enclosing text paint.
+    fn is_type3_explicit_colored(cmd: &RenderCommand) -> bool {
+        matches!(cmd, RenderCommand::DrawImage(d) if !d.is_image_mask)
+            || matches!(
+                cmd,
+                RenderCommand::FillPath {
+                    paint: Paint::Solid(_),
+                    ..
+                } | RenderCommand::StrokePath {
+                    paint: Paint::Solid(_),
+                    ..
+                }
+            )
+    }
+
+    fn type3_glyph_to_page(
+        tm: &zpdf_core::Matrix,
+        glyph: &PositionedGlyph,
+        font_size: f32,
+        h_scale: f32,
+        font_matrix: &[f64; 6],
+    ) -> zpdf_core::Matrix {
+        tm.concat(&zpdf_core::Matrix::translate(
+            glyph.x as f64,
+            glyph.y as f64,
+        ))
+        .concat(&zpdf_core::Matrix::scale(
+            font_size as f64 * h_scale as f64,
+            font_size as f64,
+        ))
+        .concat(&zpdf_core::Matrix::new(
+            font_matrix[0],
+            font_matrix[1],
+            font_matrix[2],
+            font_matrix[3],
+            font_matrix[4],
+            font_matrix[5],
+        ))
+    }
+
+    fn type3_path_to_page(path: &Path, glyph_to_page: &zpdf_core::Matrix) -> Path {
+        let mut out = Path::new();
+        for elem in path {
+            match elem {
+                PathElement::MoveTo(p) => out.move_to(p.transform(glyph_to_page)),
+                PathElement::LineTo(p) => out.line_to(p.transform(glyph_to_page)),
+                PathElement::CurveTo(c1, c2, end) => out.curve_to(
+                    c1.transform(glyph_to_page),
+                    c2.transform(glyph_to_page),
+                    end.transform(glyph_to_page),
+                ),
+                PathElement::Close => out.close(),
+            }
+        }
+        out
+    }
+
+    fn scale_type3_stroke_style(style: &StrokeStyle, scale: f32) -> StrokeStyle {
+        let s = if scale.is_finite() && scale >= 0.0 {
+            scale
+        } else {
+            0.0
+        };
+        StrokeStyle {
+            width: style.width * s,
+            cap: style.cap,
+            join: style.join,
+            miter_limit: style.miter_limit,
+            dash: style.dash.as_ref().map(|d| zpdf_display_list::DashPattern {
+                array: d.array.iter().map(|v| v * s).collect(),
+                phase: d.phase * s,
+            }),
+        }
+    }
+
     /// Render a Type 3 glyph run with a backdrop-dependent tiling pattern,
-    /// keeping intrinsic colored (`d0`) non-mask images in their own RGB colors
-    /// while compositing inherited fills, strokes, and `/ImageMask true`
-    /// stencils through `tiling`.
+    /// keeping explicit (`d0`) colored vectors and non-mask images in their own
+    /// colors while compositing inherited fills, strokes, and `/ImageMask true`
+    /// stencils through `tiling`, honoring glyph-local clips in painter's order.
     fn render_type3_backdrop_tiling(
         &mut self,
         run: &GlyphRun,
@@ -6022,22 +6097,22 @@ impl<'a> CpuRenderer<'a> {
         steps: &[TilingBlendStep],
         opacity: f32,
     ) {
-        let mut has_colored_image = false;
+        let mut has_explicit_colored = false;
         for glyph in &run.glyphs {
             if let Some(program) = self.type3_glyph(run.font_id, font, glyph.glyph_id) {
                 if program
                     .list
                     .commands
                     .iter()
-                    .any(|c| matches!(c, RenderCommand::DrawImage(d) if !d.is_image_mask))
+                    .any(Self::is_type3_explicit_colored)
                 {
-                    has_colored_image = true;
+                    has_explicit_colored = true;
                     break;
                 }
             }
         }
         let white = Self::color_to_paint(&Color::white(), 1.0);
-        if !has_colored_image {
+        if !has_explicit_colored {
             self.with_backdrop_shape_coverage(
                 opacity,
                 None,
@@ -6062,7 +6137,33 @@ impl<'a> CpuRenderer<'a> {
                 continue;
             };
             let cmds = &program.list.commands;
+            if !cmds.iter().any(Self::is_type3_explicit_colored) {
+                self.with_backdrop_shape_coverage(
+                    opacity,
+                    None,
+                    |renderer, _band_offset| {
+                        let t = renderer.tick();
+                        renderer
+                            .render_type3_glyph_commands(glyph, &program, cmds, run, &white, 1.0);
+                        renderer.tock(t, |s| &mut s.glyph_raster_ns);
+                    },
+                    |renderer, region| renderer.paint_tiling_plan_in_region(tiling, steps, region),
+                );
+                continue;
+            }
+            let glyph_to_page = Self::type3_glyph_to_page(
+                &run.transform,
+                glyph,
+                run.font_size,
+                run.h_scale,
+                &program.font_matrix,
+            );
+            let page_stroke_scale = (glyph_to_page.a * glyph_to_page.d
+                - glyph_to_page.b * glyph_to_page.c)
+                .abs()
+                .sqrt() as f32;
             let mut seg_start = 0usize;
+            let mut glyph_clip_depth = 0usize;
             let flush_inherited = |r: &mut Self, start: usize, end: usize| {
                 if start >= end {
                     return;
@@ -6086,22 +6187,52 @@ impl<'a> CpuRenderer<'a> {
                 );
             };
             for (i, cmd) in cmds.iter().enumerate() {
-                if matches!(cmd, RenderCommand::DrawImage(d) if !d.is_image_mask) {
-                    flush_inherited(self, seg_start, i);
-                    let t = self.tick();
-                    self.render_type3_glyph_commands(
-                        glyph,
-                        &program,
-                        &cmds[i..=i],
-                        run,
-                        &white,
-                        opacity,
-                    );
-                    self.tock(t, |s| &mut s.glyph_raster_ns);
-                    seg_start = i + 1;
+                match cmd {
+                    RenderCommand::PushClip { path, rule } => {
+                        flush_inherited(self, seg_start, i);
+                        let page_path = Self::type3_path_to_page(path, &glyph_to_page);
+                        self.push_clip(&page_path, rule);
+                        glyph_clip_depth += 1;
+                        seg_start = i + 1;
+                    }
+                    RenderCommand::PushClipStroke { path, style } => {
+                        flush_inherited(self, seg_start, i);
+                        let page_path = Self::type3_path_to_page(path, &glyph_to_page);
+                        let scaled = Self::scale_type3_stroke_style(style, page_stroke_scale);
+                        self.push_clip_stroke(&page_path, &scaled);
+                        glyph_clip_depth += 1;
+                        seg_start = i + 1;
+                    }
+                    RenderCommand::PopClip => {
+                        flush_inherited(self, seg_start, i);
+                        if glyph_clip_depth > 0 {
+                            self.pop_clip();
+                            glyph_clip_depth -= 1;
+                        }
+                        seg_start = i + 1;
+                    }
+                    _ if Self::is_type3_explicit_colored(cmd) => {
+                        flush_inherited(self, seg_start, i);
+                        let t = self.tick();
+                        self.render_type3_glyph_commands(
+                            glyph,
+                            &program,
+                            &cmds[i..=i],
+                            run,
+                            &white,
+                            opacity,
+                        );
+                        self.tock(t, |s| &mut s.glyph_raster_ns);
+                        seg_start = i + 1;
+                    }
+                    _ => {}
                 }
             }
             flush_inherited(self, seg_start, cmds.len());
+            while glyph_clip_depth > 0 {
+                self.pop_clip();
+                glyph_clip_depth -= 1;
+            }
         }
     }
 
@@ -6119,40 +6250,84 @@ impl<'a> CpuRenderer<'a> {
         let h_scale = run.h_scale;
         let font_matrix = program.font_matrix;
         let glyph_images = &program.images;
-        // Glyph space → device pixels, for scaling stroke widths.
-        let glyph_to_page = tm
-            .concat(&zpdf_core::Matrix::scale(
-                font_size as f64 * h_scale as f64,
-                font_size as f64,
-            ))
-            .concat(&zpdf_core::Matrix::new(
-                font_matrix[0],
-                font_matrix[1],
-                font_matrix[2],
-                font_matrix[3],
-                font_matrix[4],
-                font_matrix[5],
-            ));
-        let stroke_scale = ((glyph_to_page.a * glyph_to_page.d - glyph_to_page.b * glyph_to_page.c)
+        let glyph_to_page = Self::type3_glyph_to_page(tm, glyph, font_size, h_scale, &font_matrix);
+        let page_stroke_scale = (glyph_to_page.a * glyph_to_page.d
+            - glyph_to_page.b * glyph_to_page.c)
             .abs()
-            .sqrt()
-            * self.stroke_scale() as f64) as f32;
+            .sqrt() as f32;
+        let stroke_scale = (page_stroke_scale as f64 * self.stroke_scale() as f64) as f32;
+        let mut glyph_clip_depth = 0usize;
 
         for cmd in commands {
             match cmd {
-                RenderCommand::FillPath { path, rule, .. } => {
+                RenderCommand::PushClip { path, rule } => {
+                    let page_path = Self::type3_path_to_page(path, &glyph_to_page);
+                    self.push_clip(&page_path, rule);
+                    glyph_clip_depth += 1;
+                }
+                RenderCommand::PushClipStroke { path, style } => {
+                    let page_path = Self::type3_path_to_page(path, &glyph_to_page);
+                    let scaled = Self::scale_type3_stroke_style(style, page_stroke_scale);
+                    self.push_clip_stroke(&page_path, &scaled);
+                    glyph_clip_depth += 1;
+                }
+                RenderCommand::PopClip => {
+                    if glyph_clip_depth > 0 {
+                        self.pop_clip();
+                        glyph_clip_depth -= 1;
+                    }
+                }
+                RenderCommand::FillPath {
+                    path,
+                    rule,
+                    paint: cmd_paint,
+                    alpha,
+                    ..
+                } => {
+                    let cmd_alpha = if alpha.is_finite() {
+                        alpha.clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    if cmd_alpha <= 0.0 {
+                        continue;
+                    }
+                    let explicit_paint;
+                    let draw_paint = match cmd_paint {
+                        Paint::Solid(c) => {
+                            explicit_paint = Self::color_to_paint(c, alpha_override * cmd_alpha);
+                            &explicit_paint
+                        }
+                        Paint::Inherited => {
+                            if cmd_alpha < 1.0 {
+                                if let tiny_skia::Shader::SolidColor(sc) = paint.shader {
+                                    let mut p = paint.clone();
+                                    let mut c = sc;
+                                    c.set_alpha(c.alpha() * cmd_alpha);
+                                    p.shader = tiny_skia::Shader::SolidColor(c);
+                                    explicit_paint = p;
+                                    &explicit_paint
+                                } else {
+                                    paint
+                                }
+                            } else {
+                                paint
+                            }
+                        }
+                        _ => continue,
+                    };
                     if let Some(skia_path) = self.build_type3_transformed_path(
                         path,
                         &font_matrix,
                         font_size,
                         h_scale,
                         tm,
-                        glyph.x,
+                        (glyph.x, glyph.y),
                     ) {
                         if let Some(ref mut pixmap) = self.pixmap {
                             pixmap.fill_path(
                                 &skia_path,
-                                paint,
+                                draw_paint,
                                 Self::fill_rule_to_skia(rule),
                                 tiny_skia::Transform::identity(),
                                 self.current_clip.as_ref(),
@@ -6161,20 +6336,58 @@ impl<'a> CpuRenderer<'a> {
                         self.mark_painted(skia_path.bounds(), 1.0);
                     }
                 }
-                RenderCommand::StrokePath { path, style, .. } => {
+                RenderCommand::StrokePath {
+                    path,
+                    style,
+                    paint: cmd_paint,
+                    alpha,
+                    ..
+                } => {
+                    let cmd_alpha = if alpha.is_finite() {
+                        alpha.clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    if cmd_alpha <= 0.0 {
+                        continue;
+                    }
+                    let explicit_paint;
+                    let draw_paint = match cmd_paint {
+                        Paint::Solid(c) => {
+                            explicit_paint = Self::color_to_paint(c, alpha_override * cmd_alpha);
+                            &explicit_paint
+                        }
+                        Paint::Inherited => {
+                            if cmd_alpha < 1.0 {
+                                if let tiny_skia::Shader::SolidColor(sc) = paint.shader {
+                                    let mut p = paint.clone();
+                                    let mut c = sc;
+                                    c.set_alpha(c.alpha() * cmd_alpha);
+                                    p.shader = tiny_skia::Shader::SolidColor(c);
+                                    explicit_paint = p;
+                                    &explicit_paint
+                                } else {
+                                    paint
+                                }
+                            } else {
+                                paint
+                            }
+                        }
+                        _ => continue,
+                    };
                     if let Some(skia_path) = self.build_type3_transformed_path(
                         path,
                         &font_matrix,
                         font_size,
                         h_scale,
                         tm,
-                        glyph.x,
+                        (glyph.x, glyph.y),
                     ) {
                         let stroke = Self::skia_stroke(style, stroke_scale, 0.5);
                         if let Some(ref mut pixmap) = self.pixmap {
                             pixmap.stroke_path(
                                 &skia_path,
-                                paint,
+                                draw_paint,
                                 &stroke,
                                 tiny_skia::Transform::identity(),
                                 self.current_clip.as_ref(),
@@ -6185,21 +6398,7 @@ impl<'a> CpuRenderer<'a> {
                     }
                 }
                 RenderCommand::DrawImage(draw) => {
-                    let img_to_page = tm
-                        .concat(&zpdf_core::Matrix::translate(glyph.x as f64, 0.0))
-                        .concat(&zpdf_core::Matrix::scale(
-                            font_size as f64 * h_scale as f64,
-                            font_size as f64,
-                        ))
-                        .concat(&zpdf_core::Matrix::new(
-                            font_matrix[0],
-                            font_matrix[1],
-                            font_matrix[2],
-                            font_matrix[3],
-                            font_matrix[4],
-                            font_matrix[5],
-                        ))
-                        .concat(&draw.transform);
+                    let img_to_page = glyph_to_page.concat(&draw.transform);
                     let draw = ImageDraw {
                         image_id: draw.image_id,
                         transform: img_to_page,
@@ -6210,6 +6409,10 @@ impl<'a> CpuRenderer<'a> {
                 }
                 _ => {}
             }
+        }
+        while glyph_clip_depth > 0 {
+            self.pop_clip();
+            glyph_clip_depth -= 1;
         }
     }
 
@@ -6263,6 +6466,7 @@ impl<'a> CpuRenderer<'a> {
                 let glyph_rect = zpdf_core::Rect::new(0.0, -1000.0, 1000.0, 1000.0);
                 let mut images = ImageCache::new();
                 let mut interp = ContentInterpreter::new(glyph_rect)
+                    .for_type3_glyph()
                     .with_images(&mut images)
                     .with_limits(&self.parse_limits);
                 if let Some(deadline) = self.deadline {
@@ -6600,7 +6804,7 @@ impl<'a> CpuRenderer<'a> {
         font_size: f32,
         h_scale: f32,
         tm: &zpdf_core::Matrix,
-        glyph_x_offset: f32,
+        glyph_offset: (f32, f32),
     ) -> Option<tiny_skia::Path> {
         let mut pb = tiny_skia::PathBuilder::new();
 
@@ -6614,7 +6818,7 @@ impl<'a> CpuRenderer<'a> {
                         font_size,
                         h_scale,
                         tm,
-                        glyph_x_offset,
+                        glyph_offset,
                     );
                     pb.move_to(px, py);
                 }
@@ -6626,7 +6830,7 @@ impl<'a> CpuRenderer<'a> {
                         font_size,
                         h_scale,
                         tm,
-                        glyph_x_offset,
+                        glyph_offset,
                     );
                     pb.line_to(px, py);
                 }
@@ -6638,7 +6842,7 @@ impl<'a> CpuRenderer<'a> {
                         font_size,
                         h_scale,
                         tm,
-                        glyph_x_offset,
+                        glyph_offset,
                     );
                     let (x2, y2) = self.type3_to_pixel(
                         c2.x,
@@ -6647,7 +6851,7 @@ impl<'a> CpuRenderer<'a> {
                         font_size,
                         h_scale,
                         tm,
-                        glyph_x_offset,
+                        glyph_offset,
                     );
                     let (x, y) = self.type3_to_pixel(
                         end.x,
@@ -6656,7 +6860,7 @@ impl<'a> CpuRenderer<'a> {
                         font_size,
                         h_scale,
                         tm,
-                        glyph_x_offset,
+                        glyph_offset,
                     );
                     pb.cubic_to(x1, y1, x2, y2, x, y);
                 }
@@ -6676,7 +6880,7 @@ impl<'a> CpuRenderer<'a> {
         font_size: f32,
         h_scale: f32,
         tm: &zpdf_core::Matrix,
-        glyph_x_offset: f32,
+        glyph_offset: (f32, f32),
     ) -> (f32, f32) {
         // Step 1: FontMatrix * glyph_coord → text space
         let tx = font_matrix[0] * gx + font_matrix[2] * gy + font_matrix[4];
@@ -6686,8 +6890,9 @@ impl<'a> CpuRenderer<'a> {
         let tx = tx * font_size as f64 * h_scale as f64;
         let ty = ty * font_size as f64;
 
-        // Step 3: add glyph horizontal offset (text space, advance already incl. Th)
-        let tx = tx + glyph_x_offset as f64;
+        // Step 3: add glyph offset (text space, advance already incl. Th)
+        let tx = tx + glyph_offset.0 as f64;
+        let ty = ty + glyph_offset.1 as f64;
 
         // Step 4: apply text matrix (= CTM * Tm) to get page-space coords
         let page_x = tm.a * tx + tm.c * ty + tm.e;
@@ -10695,6 +10900,127 @@ mod tests {
         assert!(
             (118..=138).contains(&b_px[0]) && (118..=138).contains(&b_px[1]) && b_px[2] > 245,
             "d1 stencil with backdrop-dependent blue tiling at 0.5 alpha must be light blue, got {b_px:?}"
+        );
+    }
+
+    #[test]
+    fn type3_d0_explicit_vector_colors_and_glyph_clips_under_backdrop_tiling() {
+        // 'A' (`d0`): explicit red fill + explicit green stroke under backdrop-dependent blue tiling.
+        let d0_vec = b"1 0 d0 1 0 0 rg 0 0 0.5 1 re f 0 1 0 RG 0.3 w 0.75 0.1 m 0.75 0.9 l S";
+        // 'B' (`d1`): glyph-local clip on full-width image mask, restored with Q before second draw.
+        let d1_clip = b"1 0 0 0 1 1 d1 \
+            q 0 0 0.4 1 re W n \
+            BI /W 8 /H 8 /BPC 1 /IM true ID \x00\x00\x00\x00\x00\x00\x00\x00 EI \
+            Q 0.7 0 0.3 1 re f";
+        let font = zpdf_font::LoadedFont::new_with_data(
+            zpdf_font::PdfFontType::Type3 {
+                font_matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                char_procs: HashMap::from([
+                    ("A".into(), Arc::<[u8]>::from(&d0_vec[..])),
+                    ("B".into(), Arc::<[u8]>::from(&d1_clip[..])),
+                ]),
+                encoding: vec!["A".into(), "B".into()],
+                widths: vec![1.0, 1.0],
+                first_char: 0,
+            },
+            "Type3VecAndClip".into(),
+            Vec::new(),
+            zpdf_font::CidWidths::new(1.0),
+        );
+        let mut fonts = FontCache::new();
+        let font_id = fonts.insert("F1".into(), font);
+
+        let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 8.0, 8.0));
+        cell.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Multiply,
+            isolated: false,
+            knockout: false,
+            bounds: Rect::new(0.0, 0.0, 8.0, 8.0),
+            alpha: 1.0,
+            mask: None,
+        });
+        let mut r = Path::new();
+        r.rect(Rect::new(0.0, 0.0, 8.0, 8.0));
+        cell.push(RenderCommand::FillPath {
+            path: r,
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(0.0, 0.0, 1.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        cell.push(RenderCommand::PopBlendGroup);
+        let tiling = Arc::new(TilingPattern {
+            commands: Arc::new(cell),
+            bbox: Rect::new(0.0, 0.0, 8.0, 8.0),
+            x_step: 8.0,
+            y_step: 8.0,
+            matrix: zpdf_core::Matrix::identity(),
+            tiling_type: 1,
+        });
+
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 40.0));
+        dl.push(RenderCommand::DrawGlyphRun(GlyphRun {
+            font_id,
+            font_size: 40.0,
+            glyphs: vec![
+                PositionedGlyph {
+                    glyph_id: 0,
+                    code_len: 1,
+                    code: b'A' as u32,
+                    x: 0.0,
+                    y: 0.0,
+                    advance: 40.0,
+                },
+                PositionedGlyph {
+                    glyph_id: 1,
+                    code_len: 1,
+                    code: b'B' as u32,
+                    x: 40.0,
+                    y: 0.0,
+                    advance: 40.0,
+                },
+            ],
+            paint: Paint::Tiling(tiling),
+            alpha: 1.0,
+            overprint: None,
+            transform: zpdf_core::Matrix::translate(10.0, 0.0),
+            h_scale: 1.0,
+        }));
+
+        let rendered = CpuRenderer::new()
+            .with_fonts(&fonts)
+            .render_display_list(&dl, 1.0)
+            .expect("cpu render");
+        let px = |x: u32, y: u32| -> [u8; 3] {
+            let off = ((y * rendered.width + x) * 4) as usize;
+            [
+                rendered.data[off],
+                rendered.data[off + 1],
+                rendered.data[off + 2],
+            ]
+        };
+        // 'A' at x=[10..50]: red fill at x=20, green stroke at x=40.
+        assert!(
+            px(20, 20)[0] > 240 && px(20, 20)[2] < 15,
+            "{:?}",
+            px(20, 20)
+        );
+        assert!(
+            px(40, 20)[1] > 240 && px(40, 20)[2] < 15,
+            "{:?}",
+            px(40, 20)
+        );
+        // 'B' at x=[50..90]: clipped left=[50..66] blue, gap=[66..78] white, restored right=[78..90] blue.
+        assert!(
+            px(58, 20)[2] > 240 && px(58, 20)[0] < 15,
+            "{:?}",
+            px(58, 20)
+        );
+        assert_eq!(px(72, 20), [255, 255, 255]);
+        assert!(
+            px(84, 20)[2] > 240 && px(84, 20)[0] < 15,
+            "{:?}",
+            px(84, 20)
         );
     }
 }

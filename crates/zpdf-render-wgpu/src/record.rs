@@ -221,12 +221,22 @@ impl SyntheticTile {
     }
 
     pub fn uses_reset(&self) -> bool {
-        self.ops.iter().any(|o| matches!(o, PageOp::ResetStencil))
+        ops_uses_reset(&self.ops)
     }
 
     pub fn needs_fullscreen(&self) -> bool {
         self.uses_reset() || self.has_blend_groups()
     }
+}
+
+fn ops_uses_reset(ops: &[PageOp]) -> bool {
+    ops.iter().any(|o| match o {
+        PageOp::ResetStencil => true,
+        PageOp::PushBlend {
+            mask: Some(mask), ..
+        } => ops_uses_reset(&mask.ops),
+        _ => false,
+    })
 }
 
 /// Accumulates geometry + ops for one page.
@@ -499,6 +509,7 @@ impl PageRecorder {
         let rect = zpdf_core::Rect::new(0.0, -1000.0, 1000.0, 1000.0);
         let mut images = zpdf_image::ImageCache::new();
         let (dl, stats) = zpdf_content::interpreter::ContentInterpreter::new(rect)
+            .for_type3_glyph()
             .with_images(&mut images)
             .with_limits(&limits)
             .with_deadline(deadline)
@@ -1242,10 +1253,49 @@ impl PageRecorder {
             .any(|o| matches!(o, PageOp::PushBlend { .. } | PageOp::AffineTile { .. }))
     }
 
-    /// True if any `ResetStencil` op was recorded (i.e. clips were popped) and a
-    /// fullscreen reset quad must be appended before replay.
+    pub fn clip_depth(&self) -> u32 {
+        self.clip_depth
+    }
+
+    /// Mirror the most recently pushed clip entry into a non-empty sub-op mask
+    /// buffer so nested glyph-local clips stay synchronized with `self.clip_stack`.
+    pub fn mirror_top_clip_into(&self, dst: &mut Vec<PageOp>) {
+        if dst.is_empty() {
+            return;
+        }
+        if let Some(entry) = self.clip_stack.last() {
+            if entry.advanced {
+                if let Some(range) = entry.range {
+                    dst.push(PageOp::StampClip {
+                        range,
+                        ref_value: entry.ref_value,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Mirror a clip pop (stencil reset + re-stamp of remaining active clips)
+    /// into a non-empty sub-op mask buffer.
+    pub fn mirror_clip_rebuild_into(&self, dst: &mut Vec<PageOp>) {
+        if dst.is_empty() {
+            return;
+        }
+        dst.push(PageOp::ResetStencil);
+        for entry in &self.clip_stack {
+            if let Some(range) = entry.range {
+                dst.push(PageOp::StampClip {
+                    range,
+                    ref_value: entry.ref_value,
+                });
+            }
+        }
+    }
+
+    /// True if any `ResetStencil` op was recorded (including inside nested soft
+    /// or shape masks) and a fullscreen reset quad must be appended before replay.
     pub fn uses_reset(&self) -> bool {
-        self.ops.iter().any(|o| matches!(o, PageOp::ResetStencil))
+        ops_uses_reset(&self.ops)
     }
 
     /// Append a fullscreen quad in device pixels (for `ResetStencil`).

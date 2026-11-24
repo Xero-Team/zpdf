@@ -1563,6 +1563,10 @@ fn slice_is_backdrop_dependent_memo(
 #[derive(Debug, Clone)]
 pub enum Paint {
     Solid(Color),
+    /// Inherit the enclosing paint (used inside Type 3 glyph CharProcs before
+    /// an explicit `d0` color operator is executed, and for all marks inside a
+    /// `d1` CharProc per ISO 32000-1 §9.6.5).
+    Inherited,
     Pattern(u32),
     Shading(u32),
     Tiling(std::sync::Arc<TilingPattern>),

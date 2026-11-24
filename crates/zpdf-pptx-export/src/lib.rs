@@ -322,17 +322,27 @@ impl<'a> SlideConverter<'a> {
                             && glyph_run.alpha.is_finite()
                             && glyph_run.alpha > 0.0
                         {
-                            self.rasterize_pattern_command(
-                                cmd,
-                                self.page_rect,
-                                tiling,
-                                commands,
-                                idx,
-                                true,
-                            )?;
+                            let deadline = self
+                                .render_budget
+                                .map(|budget| zpdf_core::time::Instant::now() + budget);
+                            if let Some(bounds) =
+                                glyph_run_ink_bounds(self.font_cache, glyph_run, deadline)
+                            {
+                                self.rasterize_pattern_command(
+                                    cmd, bounds, tiling, commands, idx, true,
+                                )?;
+                            }
                         }
                     } else {
+                        let mat = &glyph_run.transform;
+                        let sx = mat.a.hypot(mat.b);
+                        let sy = mat.c.hypot(mat.d);
+                        let is_sheared = !mat.is_finite()
+                            || sx <= 0.0
+                            || sy <= 0.0
+                            || (mat.a * mat.c + mat.b * mat.d).abs() > 1e-4 * sx * sy;
                         let native_exact = self.clip_stack.is_empty()
+                            && !is_sheared
                             && glyph_run.overprint.is_none()
                             && glyph_run.alpha.is_finite()
                             && glyph_run.alpha >= 1.0
@@ -846,8 +856,15 @@ impl<'a> SlideConverter<'a> {
             } => (*isolated, *blend_mode, *knockout),
             _ => return Ok(()),
         };
-        let Some(raw_bounds) = slice_draw_bounds(&commands[start_idx..=end_idx], self.page_rect)
-        else {
+        let deadline = self
+            .render_budget
+            .map(|budget| zpdf_core::time::Instant::now() + budget);
+        let Some(raw_bounds) = slice_draw_bounds(
+            &commands[start_idx..=end_idx],
+            self.page_rect,
+            self.font_cache,
+            deadline,
+        ) else {
             return Ok(());
         };
         let Some(bounds) = self.clip_bounds_to_page(raw_bounds) else {
@@ -1131,9 +1148,6 @@ impl<'a> SlideConverter<'a> {
             .image_cache
             .get(image_draw.image_id)
             .ok_or_else(|| zpdf_core::Error::StreamDecode("Image not found".into()))?;
-        if !self.clip_stack.is_empty() || image.is_image_mask || image_draw.is_image_mask {
-            self.prefix_diverged = true;
-        }
 
         // Extract transform to get position and size
         let mat = &image_draw.transform;
@@ -1146,6 +1160,16 @@ impl<'a> SlideConverter<'a> {
         // Image transform: unit square [0,1]×[0,1] → page space
         let width = (mat.a * mat.a + mat.b * mat.b).sqrt();
         let height = (mat.c * mat.c + mat.d * mat.d).sqrt();
+        let is_sheared = width <= 0.0
+            || height <= 0.0
+            || (mat.a * mat.c + mat.b * mat.d).abs() > 1e-4 * width * height;
+        if !self.clip_stack.is_empty()
+            || image.is_image_mask
+            || image_draw.is_image_mask
+            || is_sheared
+        {
+            self.prefix_diverged = true;
+        }
 
         let center = zpdf_core::Point::new(0.5, 0.5).transform(mat);
         let (cx, cy) = self.pdf_to_ppt_coords(center.x, center.y);
@@ -1332,7 +1356,263 @@ fn union_rect(acc: Option<Rect>, r: Rect) -> Option<Rect> {
     })
 }
 
-fn slice_draw_bounds(commands: &[RenderCommand], page_rect: Rect) -> Option<Rect> {
+fn pad_rect(r: Rect, pad: f64) -> Option<Rect> {
+    let r = r.normalize();
+    if !(r.x0.is_finite()
+        && r.y0.is_finite()
+        && r.x1.is_finite()
+        && r.y1.is_finite()
+        && pad.is_finite()
+        && pad >= 0.0)
+    {
+        return None;
+    }
+    Some(Rect::new(r.x0 - pad, r.y0 - pad, r.x1 + pad, r.y1 + pad))
+}
+
+fn transformed_path_bounds(path: &Path, mat: &zpdf_core::Matrix) -> Option<Rect> {
+    let (mut x0, mut y0, mut x1, mut y1) = (
+        f64::INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NEG_INFINITY,
+    );
+    for p in path.points() {
+        let q = p.transform(mat);
+        if !q.x.is_finite() || !q.y.is_finite() {
+            return None;
+        }
+        x0 = x0.min(q.x);
+        y0 = y0.min(q.y);
+        x1 = x1.max(q.x);
+        y1 = y1.max(q.y);
+    }
+    (x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite())
+        .then(|| Rect::new(x0, y0, x1, y1))
+}
+
+fn stroke_overshoot_pt(style: &zpdf_display_list::StrokeStyle, stroke_scale: f64) -> f64 {
+    let width = if style.width.is_finite() && stroke_scale.is_finite() {
+        (style.width.max(0.0) as f64 * stroke_scale.max(0.0)).max(0.5)
+    } else {
+        1.0
+    };
+    let reach = match style.join {
+        zpdf_display_list::LineJoin::Miter => style.miter_limit.clamp(1.0, 100.0) as f64,
+        _ => std::f64::consts::SQRT_2,
+    };
+    (width * 0.5 * reach.max(std::f64::consts::SQRT_2)).max(1.0)
+}
+
+/// Conservative page-space ink bounding box of a [`zpdf_display_list::GlyphRun`]
+/// (both outline fonts and Type 3 CharProc fonts, honoring glyph-local clips).
+fn glyph_run_ink_bounds(
+    font_cache: &FontCache,
+    glyph_run: &zpdf_display_list::GlyphRun,
+    deadline: Option<zpdf_core::time::Instant>,
+) -> Option<Rect> {
+    if !glyph_run.transform.is_finite()
+        || !glyph_run.font_size.is_finite()
+        || !glyph_run.h_scale.is_finite()
+    {
+        return None;
+    }
+    let font = font_cache.get(glyph_run.font_id)?;
+    if !font.has_font_data() {
+        return None;
+    }
+
+    if font.is_type3() {
+        #[derive(Clone, Copy)]
+        enum ClipBound {
+            Unbounded,
+            Empty,
+            Rect(Rect),
+        }
+
+        let mut acc: Option<Rect> = None;
+        for glyph in &glyph_run.glyphs {
+            if deadline.is_some_and(|d| zpdf_core::time::Instant::now() >= d) {
+                break;
+            }
+            let Some((stream, fm)) = font.type3_glyph_stream(glyph.glyph_id) else {
+                continue;
+            };
+            let glyph_to_page = glyph_run
+                .transform
+                .concat(&zpdf_core::Matrix::translate(
+                    glyph.x as f64,
+                    glyph.y as f64,
+                ))
+                .concat(&zpdf_core::Matrix::scale(
+                    glyph_run.font_size as f64 * glyph_run.h_scale as f64,
+                    glyph_run.font_size as f64,
+                ))
+                .concat(&zpdf_core::Matrix::new(
+                    fm[0], fm[1], fm[2], fm[3], fm[4], fm[5],
+                ));
+            if !glyph_to_page.is_finite() {
+                continue;
+            }
+            let stroke_scale = (glyph_to_page.a * glyph_to_page.d
+                - glyph_to_page.b * glyph_to_page.c)
+                .abs()
+                .sqrt();
+            let glyph_rect = Rect::new(0.0, -1000.0, 1000.0, 1000.0);
+            let mut images = ImageCache::new();
+            let mut interp = zpdf_content::interpreter::ContentInterpreter::new(glyph_rect)
+                .for_type3_glyph()
+                .with_images(&mut images);
+            if let Some(d) = deadline {
+                interp = interp.with_deadline(d);
+            }
+            let dl = interp.interpret(stream);
+
+            let mut clips: Vec<ClipBound> = Vec::new();
+            let mut push_rect = |r: Rect, clips: &[ClipBound]| {
+                let effective = match clips.last().copied().unwrap_or(ClipBound::Unbounded) {
+                    ClipBound::Unbounded => Some(r),
+                    ClipBound::Empty => None,
+                    ClipBound::Rect(cb) => intersect_rect(r, cb),
+                };
+                if let Some(clipped) = effective {
+                    acc = union_rect(acc, clipped);
+                }
+            };
+
+            for cmd in &dl.commands {
+                match cmd {
+                    RenderCommand::PushClip { path, .. } => {
+                        let top = clips.last().copied().unwrap_or(ClipBound::Unbounded);
+                        let next = if path.is_empty() {
+                            ClipBound::Empty
+                        } else if let Some(cb) = transformed_path_bounds(path, &glyph_to_page)
+                            .and_then(|r| pad_rect(r, 1.0))
+                        {
+                            match top {
+                                ClipBound::Unbounded => ClipBound::Rect(cb),
+                                ClipBound::Empty => ClipBound::Empty,
+                                ClipBound::Rect(prev) => intersect_rect(prev, cb)
+                                    .map_or(ClipBound::Empty, ClipBound::Rect),
+                            }
+                        } else {
+                            top
+                        };
+                        clips.push(next);
+                    }
+                    RenderCommand::PushClipStroke { path, style } => {
+                        let top = clips.last().copied().unwrap_or(ClipBound::Unbounded);
+                        let pad = stroke_overshoot_pt(style, stroke_scale);
+                        let next = if path.is_empty() {
+                            ClipBound::Empty
+                        } else if let Some(cb) = transformed_path_bounds(path, &glyph_to_page)
+                            .and_then(|r| pad_rect(r, pad))
+                        {
+                            match top {
+                                ClipBound::Unbounded => ClipBound::Rect(cb),
+                                ClipBound::Empty => ClipBound::Empty,
+                                ClipBound::Rect(prev) => intersect_rect(prev, cb)
+                                    .map_or(ClipBound::Empty, ClipBound::Rect),
+                            }
+                        } else {
+                            top
+                        };
+                        clips.push(next);
+                    }
+                    RenderCommand::PopClip => {
+                        clips.pop();
+                    }
+                    RenderCommand::FillPath { path, .. } => {
+                        if let Some(r) = transformed_path_bounds(path, &glyph_to_page)
+                            .and_then(|b| pad_rect(b, 1.0))
+                        {
+                            push_rect(r, &clips);
+                        }
+                    }
+                    RenderCommand::StrokePath { path, style, .. } => {
+                        let pad = stroke_overshoot_pt(style, stroke_scale);
+                        if let Some(r) = transformed_path_bounds(path, &glyph_to_page)
+                            .and_then(|b| pad_rect(b, pad))
+                        {
+                            push_rect(r, &clips);
+                        }
+                    }
+                    RenderCommand::DrawImage(draw) => {
+                        let img_to_page = glyph_to_page.concat(&draw.transform);
+                        if img_to_page.is_finite() {
+                            let corners = [
+                                zpdf_core::Point::new(0.0, 0.0).transform(&img_to_page),
+                                zpdf_core::Point::new(1.0, 0.0).transform(&img_to_page),
+                                zpdf_core::Point::new(0.0, 1.0).transform(&img_to_page),
+                                zpdf_core::Point::new(1.0, 1.0).transform(&img_to_page),
+                            ];
+                            let (mut x0, mut y0) = (f64::INFINITY, f64::INFINITY);
+                            let (mut x1, mut y1) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+                            for p in corners {
+                                x0 = x0.min(p.x);
+                                y0 = y0.min(p.y);
+                                x1 = x1.max(p.x);
+                                y1 = y1.max(p.y);
+                            }
+                            if let Some(r) = pad_rect(Rect::new(x0, y0, x1, y1), 1.0) {
+                                push_rect(r, &clips);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        return acc;
+    }
+
+    let upem = font.units_per_em;
+    if !upem.is_finite() || upem <= 0.0 {
+        return None;
+    }
+    let (mut min_x, mut min_y) = (f64::INFINITY, f64::INFINITY);
+    let (mut max_x, mut max_y) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+    let mut touch = |gx: f64, gy: f64, gx_off: f32, gy_off: f32| {
+        let tx = gx / upem * glyph_run.font_size as f64 * glyph_run.h_scale as f64 + gx_off as f64;
+        let ty = gy / upem * glyph_run.font_size as f64 + gy_off as f64;
+        let p = zpdf_core::Point::new(tx, ty).transform(&glyph_run.transform);
+        if p.x.is_finite() && p.y.is_finite() {
+            min_x = min_x.min(p.x);
+            min_y = min_y.min(p.y);
+            max_x = max_x.max(p.x);
+            max_y = max_y.max(p.y);
+        }
+    };
+    for glyph in &glyph_run.glyphs {
+        let Some(outline) = font.glyph_outline(glyph.glyph_id) else {
+            continue;
+        };
+        for cmd in &outline.commands {
+            match *cmd {
+                zpdf_font::OutlineCommand::MoveTo(x, y)
+                | zpdf_font::OutlineCommand::LineTo(x, y) => touch(x, y, glyph.x, glyph.y),
+                zpdf_font::OutlineCommand::QuadTo(x1, y1, x, y) => {
+                    touch(x1, y1, glyph.x, glyph.y);
+                    touch(x, y, glyph.x, glyph.y);
+                }
+                zpdf_font::OutlineCommand::CurveTo(x1, y1, x2, y2, x, y) => {
+                    touch(x1, y1, glyph.x, glyph.y);
+                    touch(x2, y2, glyph.x, glyph.y);
+                    touch(x, y, glyph.x, glyph.y);
+                }
+                zpdf_font::OutlineCommand::Close => {}
+            }
+        }
+    }
+    pad_rect(Rect::new(min_x, min_y, max_x, max_y), 1.0)
+}
+
+fn slice_draw_bounds(
+    commands: &[RenderCommand],
+    page_rect: Rect,
+    font_cache: &FontCache,
+    deadline: Option<zpdf_core::time::Instant>,
+) -> Option<Rect> {
     let mut acc: Option<Rect> = None;
     for cmd in commands {
         match cmd {
@@ -1366,8 +1646,10 @@ fn slice_draw_bounds(commands: &[RenderCommand], page_rect: Rect) -> Option<Rect
                     acc = union_rect(acc, Rect::new(x0, y0, x1, y1));
                 }
             }
-            RenderCommand::DrawGlyphRun(_) => {
-                acc = union_rect(acc, page_rect);
+            RenderCommand::DrawGlyphRun(glyph_run) => {
+                if let Some(b) = glyph_run_ink_bounds(font_cache, glyph_run, deadline) {
+                    acc = union_rect(acc, b);
+                }
             }
             _ => {}
         }
@@ -1571,7 +1853,8 @@ fn intersect_rect(a: Rect, b: Rect) -> Option<Rect> {
     let y0 = a.y0.max(b.y0);
     let x1 = a.x1.min(b.x1);
     let y1 = a.y1.min(b.y1);
-    (x1 > x0 && y1 > y0).then(|| Rect::new(x0, y0, x1, y1))
+    (x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite() && x1 > x0 && y1 > y0)
+        .then(|| Rect::new(x0, y0, x1, y1))
 }
 
 #[cfg(test)]
@@ -4112,6 +4395,270 @@ mod export_tests {
             mid2,
             &image::Rgba([255, 255, 255, 255]),
             "diverged native fill prefix under white Screen pattern must replace affected region with white, got {mid2:?}"
+        );
+    }
+
+    #[test]
+    fn patterned_glyph_after_translucent_prefix_limits_replacement_to_glyph_ink_bounds() {
+        use std::sync::Arc;
+        use zpdf_core::Matrix;
+        use zpdf_display_list::{
+            BlendMode, FillRule, GlyphRun, Paint, Path, PositionedGlyph, RenderCommand,
+            TilingPattern,
+        };
+        use zpdf_font::{CidWidths, FontCache, LoadedFont, PdfFontType};
+
+        let charproc = b"1 0 0 0 1 1 d1 0 0 1 1 re f";
+        let mut encoding = vec![String::new(); 66];
+        encoding[65] = "A".into();
+        let type3_font = LoadedFont::new_with_data(
+            PdfFontType::Type3 {
+                font_matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                char_procs: std::collections::HashMap::from([(
+                    "A".into(),
+                    Arc::<[u8]>::from(&charproc[..]),
+                )]),
+                encoding,
+                widths: vec![1.0],
+                first_char: 65,
+            },
+            "Type3TightBounds".into(),
+            Vec::new(),
+            CidWidths::new(1.0),
+        );
+        let text_font = LoadedFont::new_standard("Helvetica".into()).expect("Helvetica font");
+        let mut fonts = FontCache::new();
+        let t3_id = fonts.insert("F1".into(), type3_font);
+        let text_id = fonts.insert("F2".into(), text_font);
+
+        // Backdrop-dependent Multiply blue tiling pattern.
+        let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 8.0, 8.0));
+        cell.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Multiply,
+            isolated: false,
+            knockout: false,
+            bounds: Rect::new(0.0, 0.0, 8.0, 8.0),
+            alpha: 1.0,
+            mask: None,
+        });
+        let mut r = Path::new();
+        r.rect(Rect::new(0.0, 0.0, 8.0, 8.0));
+        cell.push(RenderCommand::FillPath {
+            path: r,
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(0.0, 0.0, 1.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        cell.push(RenderCommand::PopBlendGroup);
+        let tiling = Arc::new(TilingPattern {
+            commands: Arc::new(cell),
+            bbox: Rect::new(0.0, 0.0, 8.0, 8.0),
+            x_step: 8.0,
+            y_step: 8.0,
+            matrix: Matrix::identity(),
+            tiling_type: 1,
+        });
+
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 300.0, 300.0));
+        // 1. Translucent native rectangle sets `prefix_diverged = true`.
+        let mut prefix_rect = Path::new();
+        prefix_rect.rect(Rect::new(10.0, 10.0, 60.0, 60.0));
+        dl.push(RenderCommand::FillPath {
+            path: prefix_rect,
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(1.0, 0.0, 0.0)),
+            alpha: 0.5,
+            overprint: None,
+        });
+        // 2. Distant native TextBox at (200, 200) that must stay exposed.
+        dl.push(RenderCommand::DrawGlyphRun(GlyphRun {
+            font_id: text_id,
+            font_size: 14.0,
+            glyphs: vec![
+                PositionedGlyph {
+                    glyph_id: b'O' as u16,
+                    code_len: 1,
+                    code: b'O' as u32,
+                    x: 0.0,
+                    y: 0.0,
+                    advance: 10.0,
+                },
+                PositionedGlyph {
+                    glyph_id: b'K' as u16,
+                    code_len: 1,
+                    code: b'K' as u32,
+                    x: 10.0,
+                    y: 0.0,
+                    advance: 10.0,
+                },
+            ],
+            paint: Paint::Solid(Color::black()),
+            alpha: 1.0,
+            overprint: None,
+            transform: Matrix::translate(200.0, 200.0),
+            h_scale: 1.0,
+        }));
+        // 3. Small unclipped backdrop-dependent patterned glyph at [20..44]×[20..44].
+        dl.push(RenderCommand::DrawGlyphRun(GlyphRun {
+            font_id: t3_id,
+            font_size: 24.0,
+            glyphs: vec![PositionedGlyph {
+                glyph_id: 65,
+                code_len: 1,
+                code: b'A' as u32,
+                x: 0.0,
+                y: 0.0,
+                advance: 24.0,
+            }],
+            paint: Paint::Tiling(tiling),
+            alpha: 1.0,
+            overprint: None,
+            transform: Matrix::translate(20.0, 20.0),
+            h_scale: 1.0,
+        }));
+
+        let slide = display_list_to_slide(
+            &dl,
+            0,
+            &fonts,
+            &ImageCache::new(),
+            &ConversionOptions::default(),
+        )
+        .expect("slide export");
+        let text_box = slide
+            .elements
+            .iter()
+            .find_map(|e| match e.base() {
+                SlideElement::TextBox {
+                    text,
+                    x_emu,
+                    y_emu,
+                    width_emu,
+                    height_emu,
+                    ..
+                } => Some((text.as_str(), *x_emu, *y_emu, *width_emu, *height_emu)),
+                _ => None,
+            })
+            .expect("distant native TextBox must remain on the slide");
+        assert_eq!(text_box.0, "OK");
+
+        let img_rect = slide
+            .elements
+            .iter()
+            .find_map(|e| match e.base() {
+                SlideElement::Image {
+                    x_emu,
+                    y_emu,
+                    width_emu,
+                    height_emu,
+                    ..
+                } => Some((*x_emu, *y_emu, *width_emu, *height_emu)),
+                _ => None,
+            })
+            .expect("patterned glyph replacement image");
+        // Image bounds must stay tightly bounded to the 24×24pt glyph (<= 30pt with padding)
+        // and must NOT overlap the distant TextBox at x=200pt.
+        assert!(
+            img_rect.2 < pt_to_emu(35.0) && img_rect.3 < pt_to_emu(35.0),
+            "replacement PNG must be bounded to glyph ink bounds (~26pt), got {}×{} pt",
+            img_rect.2 as f64 / 12700.0,
+            img_rect.3 as f64 / 12700.0
+        );
+        let img_x1 = img_rect.0 + img_rect.2;
+        assert!(
+            img_x1 < text_box.1,
+            "replacement PNG right edge ({}pt) must stay strictly left of distant TextBox ({}pt)",
+            img_x1 as f64 / 12700.0,
+            text_box.1 as f64 / 12700.0
+        );
+    }
+
+    #[test]
+    fn sheared_image_before_screen_pattern_replaces_pptx_corner() {
+        use std::sync::Arc;
+        use zpdf_core::Matrix;
+        use zpdf_display_list::{
+            BlendMode, FillRule, ImageDraw, Paint, Path, RenderCommand, TilingPattern,
+        };
+        use zpdf_image::DecodedImage;
+
+        let mut images = ImageCache::new();
+        let blue_id = images.insert(DecodedImage {
+            width: 2,
+            height: 2,
+            data: vec![
+                0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255,
+            ],
+            has_alpha: false,
+            is_image_mask: false,
+            premultiplied: false,
+        });
+
+        let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 10.0, 10.0));
+        cell.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Screen,
+            isolated: false,
+            knockout: false,
+            bounds: Rect::new(0.0, 0.0, 10.0, 10.0),
+            alpha: 1.0,
+            mask: None,
+        });
+        let mut r = Path::new();
+        r.rect(Rect::new(0.0, 0.0, 10.0, 10.0));
+        cell.push(RenderCommand::FillPath {
+            path: r,
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::white()),
+            alpha: 1.0,
+            overprint: None,
+        });
+        cell.push(RenderCommand::PopBlendGroup);
+        let white_screen = Arc::new(TilingPattern {
+            commands: Arc::new(cell),
+            bbox: Rect::new(0.0, 0.0, 10.0, 10.0),
+            x_step: 10.0,
+            y_step: 10.0,
+            matrix: Matrix::identity(),
+            tiling_type: 1,
+        });
+
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 100.0));
+        // Unclipped sheared opaque blue RGB image:
+        // PDF parallelogram corners: (10,20), (50,20), (30,60), (70,60).
+        // PowerPoint orthogonal rectangle: x=[20..60], PDF y=[17.64..62.36].
+        // PDF point (22, 56) is WHITE in CPU replay, but BLUE in PowerPoint's orthogonal image box.
+        dl.push(RenderCommand::DrawImage(ImageDraw {
+            image_id: blue_id,
+            transform: Matrix::new(40.0, 0.0, 20.0, 40.0, 10.0, 20.0),
+            alpha: 1.0,
+            is_image_mask: false,
+        }));
+        let mut corner = Path::new();
+        corner.rect(Rect::new(15.0, 45.0, 35.0, 65.0));
+        dl.push(RenderCommand::FillPath {
+            path: corner,
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(white_screen),
+            alpha: 1.0,
+            overprint: None,
+        });
+
+        let slide = display_list_to_slide(
+            &dl,
+            0,
+            &FontCache::new(),
+            &images,
+            &ConversionOptions::default(),
+        )
+        .expect("slide export");
+        let comp = composite_slide_over_white(&slide, 100.0, 100.0, 2.0);
+        // PDF (22, 56) -> PPT (22, 44) -> pixel (44, 88).
+        let px = comp.get_pixel(44, 88);
+        assert_eq!(
+            px,
+            &image::Rgba([255, 255, 255, 255]),
+            "white Screen pattern over corner covered only by PowerPoint's orthogonal sheared-image box must become white, got {px:?}"
         );
     }
 }

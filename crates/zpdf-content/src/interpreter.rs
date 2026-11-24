@@ -201,9 +201,15 @@ pub struct ContentInterpreter<'a> {
     /// pattern cell). Used to size shading rasters from their transformed
     /// page-space footprint while keeping their placement in cell coordinates.
     shading_space_to_page: Matrix,
-    /// Inside an uncolored (PaintType 2) tiling-pattern cell: color operators
-    /// are ignored so the cell paints with the pattern's `scn` color.
+    /// Inside an uncolored (PaintType 2) tiling-pattern cell or `d1` Type 3
+    /// glyph: color operators are ignored so marks inherit the enclosing paint.
     suppress_color_ops: bool,
+    /// True while interpreting a Type 3 glyph CharProc stream (ISO 32000-1
+    /// §9.6.5): marks painted before an explicit `d0` color operator — and all
+    /// marks inside a `d1` glyph — emit `Paint::Inherited` so backends apply
+    /// the enclosing text paint while preserving explicit `d0` fill/stroke
+    /// colors and stencils.
+    type3_glyph: bool,
     /// Default optional-content configuration; `None` renders everything.
     oc_config: Option<&'a zpdf_document::OcConfig>,
     /// Annotations painted after the page content (appearance streams).
@@ -961,6 +967,13 @@ struct GraphicsState {
     fill_colorant: Option<Colorant>,
     /// CMYK colorant projection of `stroke_color`.
     stroke_colorant: Option<Colorant>,
+    /// True once a non-suppressed nonstroking color operator ran in the active
+    /// graphics state (used in Type 3 `d0` CharProcs to distinguish explicit
+    /// glyph colors from the inherited text paint; saved/restored by `q`/`Q`).
+    fill_color_explicit: bool,
+    /// True once a non-suppressed stroking color operator ran in the active
+    /// graphics state (saved/restored by `q`/`Q`).
+    stroke_color_explicit: bool,
 }
 
 impl Default for GraphicsState {
@@ -1005,6 +1018,8 @@ impl Default for GraphicsState {
                 cmyk: [0.0, 0.0, 0.0, 1.0],
                 cmyk_device: false,
             }),
+            fill_color_explicit: false,
+            stroke_color_explicit: false,
         }
     }
 }
@@ -1123,6 +1138,7 @@ impl<'a> ContentInterpreter<'a> {
             base_font_id: None,
             shading_space_to_page: Matrix::identity(),
             suppress_color_ops: false,
+            type3_glyph: false,
             oc_config: None,
             annotations: None,
             mc_depth: 0,
@@ -1162,6 +1178,16 @@ impl<'a> ContentInterpreter<'a> {
     /// always collected and need no flag.
     pub fn with_work_timing(mut self, enabled: bool) -> Self {
         self.work_timing = enabled;
+        self
+    }
+
+    /// Interpret a Type 3 glyph CharProc stream (ISO 32000-1 §9.6.5):
+    /// `d1` suppresses color operators so every mark inherits the enclosing
+    /// text paint (`Paint::Inherited` / `is_image_mask: true`), whereas `d0`
+    /// preserves explicit fill/stroke colors (`Paint::Solid`) and explicit
+    /// stencil colors while still inheriting before any color operator runs.
+    pub fn for_type3_glyph(mut self) -> Self {
+        self.type3_glyph = true;
         self
     }
 
@@ -1982,6 +2008,7 @@ impl<'a> ContentInterpreter<'a> {
                 self.current.fill_cs = ActiveColorSpace::DeviceGray;
                 self.current.fill_pattern = None;
                 self.current.fill_colorant = Some(gray_colorant(gray));
+                self.current.fill_color_explicit = true;
             }
             "G" => {
                 let gray = self.pop_f64() as f32;
@@ -1989,6 +2016,7 @@ impl<'a> ContentInterpreter<'a> {
                 self.current.stroke_cs = ActiveColorSpace::DeviceGray;
                 self.current.stroke_pattern = None;
                 self.current.stroke_colorant = Some(gray_colorant(gray));
+                self.current.stroke_color_explicit = true;
             }
             "rg" => {
                 let b = self.pop_f64() as f32;
@@ -1998,6 +2026,7 @@ impl<'a> ContentInterpreter<'a> {
                 self.current.fill_cs = ActiveColorSpace::DeviceRGB;
                 self.current.fill_pattern = None;
                 self.current.fill_colorant = None;
+                self.current.fill_color_explicit = true;
             }
             "RG" => {
                 let b = self.pop_f64() as f32;
@@ -2007,6 +2036,7 @@ impl<'a> ContentInterpreter<'a> {
                 self.current.stroke_cs = ActiveColorSpace::DeviceRGB;
                 self.current.stroke_pattern = None;
                 self.current.stroke_colorant = None;
+                self.current.stroke_color_explicit = true;
             }
             "k" => {
                 let k_val = self.pop_f64();
@@ -2018,6 +2048,7 @@ impl<'a> ContentInterpreter<'a> {
                 self.current.fill_cs = ActiveColorSpace::DeviceCMYK;
                 self.current.fill_pattern = None;
                 self.current.fill_colorant = Some(cmyk_colorant(c_val, m_val, y_val, k_val));
+                self.current.fill_color_explicit = true;
             }
             "K" => {
                 let k_val = self.pop_f64();
@@ -2029,6 +2060,7 @@ impl<'a> ContentInterpreter<'a> {
                 self.current.stroke_cs = ActiveColorSpace::DeviceCMYK;
                 self.current.stroke_pattern = None;
                 self.current.stroke_colorant = Some(cmyk_colorant(c_val, m_val, y_val, k_val));
+                self.current.stroke_color_explicit = true;
             }
             "cs" => {
                 let name = self.pop_name();
@@ -2040,6 +2072,7 @@ impl<'a> ContentInterpreter<'a> {
                     self.current.fill_color = self.initial_color(&self.current.fill_cs);
                     let cs = self.current.fill_cs.clone();
                     self.current.fill_colorant = self.initial_colorant(&cs);
+                    self.current.fill_color_explicit = true;
                 } else {
                     // Pattern is not a colorant space; the colour (and overprint
                     // colorant) arrive with scn. Clear stale colorant meanwhile.
@@ -2054,6 +2087,7 @@ impl<'a> ContentInterpreter<'a> {
                     self.current.stroke_color = self.initial_color(&self.current.stroke_cs);
                     let cs = self.current.stroke_cs.clone();
                     self.current.stroke_colorant = self.initial_colorant(&cs);
+                    self.current.stroke_color_explicit = true;
                 } else {
                     self.current.stroke_colorant = None;
                 }
@@ -2076,6 +2110,7 @@ impl<'a> ContentInterpreter<'a> {
                     self.current.fill_color = color;
                     self.current.fill_colorant = colorant;
                 }
+                self.current.fill_color_explicit = true;
             }
             "SC" | "SCN" => {
                 if let ActiveColorSpace::Pattern { base } = self.current.stroke_cs.clone() {
@@ -2093,6 +2128,7 @@ impl<'a> ContentInterpreter<'a> {
                     self.current.stroke_color = color;
                     self.current.stroke_colorant = colorant;
                 }
+                self.current.stroke_color_explicit = true;
             }
 
             // -- Shading --
@@ -2238,10 +2274,21 @@ impl<'a> ContentInterpreter<'a> {
 
             // -- Type3 glyph operators --
             "d0" => {
-                // wx wy d0: set glyph width (2 operands, consume them)
+                // wx wy d0: colored glyph (ISO 32000-1 §9.6.5); explicit color
+                // operators inside the CharProc remain active.
+                if self.type3_glyph {
+                    self.suppress_color_ops = false;
+                }
             }
             "d1" => {
-                // wx wy llx lly urx ury d1: set glyph width and bbox (6 operands)
+                // wx wy llx lly urx ury d1: uncolored glyph (ISO 32000-1 §9.6.5);
+                // color operators in the CharProc are ignored so all marks
+                // inherit the enclosing text paint.
+                if self.type3_glyph {
+                    self.suppress_color_ops = true;
+                    self.current.fill_color_explicit = false;
+                    self.current.stroke_color_explicit = false;
+                }
             }
 
             // -- Marked content --
@@ -5090,7 +5137,12 @@ impl<'a> ContentInterpreter<'a> {
     fn emit_draw_image(&mut self, image: zpdf_image::DecodedImage) {
         let transform = self.current.ctm;
         let image = self.fit_image_to_footprint(image, &transform);
-        let is_image_mask = image.is_image_mask;
+        // Inside a Type 3 `d0` glyph, an `/ImageMask true` stencil drawn after
+        // an explicit fill color operator already had that color baked into its
+        // decoded RGBA pixels; clear `is_image_mask` so backends preserve the
+        // explicit `d0` color instead of re-tinting with the enclosing text paint.
+        let is_image_mask =
+            image.is_image_mask && !(self.type3_glyph && self.current.fill_color_explicit);
         let Some(image_id) = self.admit_image(image) else {
             return;
         };
@@ -5908,10 +5960,15 @@ impl<'a> ContentInterpreter<'a> {
                 }
             }
         }
+        let paint = if self.type3_glyph && !self.current.stroke_color_explicit {
+            Paint::Inherited
+        } else {
+            Paint::Solid(self.current.stroke_color)
+        };
         let cmd = RenderCommand::StrokePath {
             path: page_path,
             style,
-            paint: Paint::Solid(self.current.stroke_color),
+            paint,
             alpha: self.current.stroke_alpha,
             overprint: self
                 .overprint_descriptor(self.current.stroke_overprint, self.current.stroke_colorant),
@@ -6004,10 +6061,15 @@ impl<'a> ContentInterpreter<'a> {
                 }
             }
         }
+        let paint = if self.type3_glyph && !self.current.fill_color_explicit {
+            Paint::Inherited
+        } else {
+            Paint::Solid(self.current.fill_color)
+        };
         let cmd = RenderCommand::FillPath {
             path: page_path,
             rule,
-            paint: Paint::Solid(self.current.fill_color),
+            paint,
             alpha: self.current.fill_alpha,
             overprint: self
                 .overprint_descriptor(self.current.fill_overprint, self.current.fill_colorant),

@@ -256,6 +256,42 @@ pub fn fill_lyon_path(path: &LyonPath, rule: FillRule, color: [f32; 4]) -> Optio
     (!mesh.indices.is_empty()).then_some(mesh)
 }
 
+/// Tessellate an already-built device-pixel lyon path as a stroke using a
+/// display-list [`StrokeStyle`] scaled by `stroke_scale` (matching CPU
+/// `skia_stroke(style, stroke_scale, min_width)` for Type 3 glyphs).
+pub(crate) fn stroke_lyon_path_styled(
+    path: &LyonPath,
+    style: &StrokeStyle,
+    stroke_scale: f32,
+    min_width: f32,
+    color: [f32; 4],
+) -> Option<Mesh> {
+    if !style.width.is_finite() || !stroke_scale.is_finite() {
+        return None;
+    }
+    let width = (style.width.max(0.0) * stroke_scale.max(0.0)).max(min_width);
+    let mut dashed = None;
+    if let Some(dash) = &style.dash {
+        if !zpdf_render::dash::is_degenerate(&dash.array) && stroke_scale > 0.0 {
+            dashed = Some(dash_lyon_path(
+                path,
+                &dash.array,
+                dash.phase,
+                stroke_scale,
+                TOLERANCE,
+            )?);
+        }
+    }
+    let target = dashed.as_ref().unwrap_or(path);
+    let opts = StrokeOptions::tolerance(TOLERANCE)
+        .with_line_width(width)
+        .with_start_cap(map_cap(style.cap))
+        .with_end_cap(map_cap(style.cap))
+        .with_line_join(map_join(style.join))
+        .with_miter_limit(style.miter_limit.max(1.0));
+    stroke_lyon_path(target, &opts, color)
+}
+
 /// Tessellate an already-built lyon path as a stroke with the given options.
 pub fn stroke_lyon_path(path: &LyonPath, opts: &StrokeOptions, color: [f32; 4]) -> Option<Mesh> {
     if !path_is_safe(path) {

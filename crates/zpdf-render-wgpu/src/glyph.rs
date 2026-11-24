@@ -10,14 +10,13 @@
 
 use lyon::math::point;
 use lyon::path::Path as LyonPath;
-use lyon::tessellation::StrokeOptions;
 
 use zpdf_core::Matrix;
 use zpdf_display_list::{FillRule, GlyphRun, Paint, Path as DlPath, PathElement, RenderCommand};
 use zpdf_font::{FontCache, GlyphOutline, LoadedFont, OutlineCommand};
 
 use crate::glyph_atlas::{self, GlyphKey};
-use crate::path::{fill_lyon_path, stroke_lyon_path, TOLERANCE};
+use crate::path::{fill_lyon_path, stroke_lyon_path_styled};
 use crate::record::{PageOp, PageRecorder, Type3ImageKey};
 use crate::transform::{quantize_premul, PageMap};
 
@@ -345,10 +344,57 @@ fn build_outline_path(
     Some(b.build())
 }
 
+fn type3_glyph_to_page(
+    tm: &Matrix,
+    glyph_offset: (f32, f32),
+    font_size: f32,
+    h_scale: f32,
+    font_matrix: &[f64; 6],
+) -> Matrix {
+    tm.concat(&Matrix::translate(
+        glyph_offset.0 as f64,
+        glyph_offset.1 as f64,
+    ))
+    .concat(&Matrix::scale(
+        font_size as f64 * h_scale as f64,
+        font_size as f64,
+    ))
+    .concat(&Matrix::new(
+        font_matrix[0],
+        font_matrix[1],
+        font_matrix[2],
+        font_matrix[3],
+        font_matrix[4],
+        font_matrix[5],
+    ))
+}
+
+fn type3_stroke_scale(glyph_to_page: &Matrix, map_scale: f32) -> f32 {
+    ((glyph_to_page.a * glyph_to_page.d - glyph_to_page.b * glyph_to_page.c)
+        .abs()
+        .sqrt()
+        * map_scale as f64) as f32
+}
+
+fn scale_premul_color(color: [f32; 4], alpha: f32) -> [f32; 4] {
+    if alpha >= 1.0 {
+        color
+    } else if alpha <= 0.0 {
+        [0.0; 4]
+    } else {
+        [
+            color[0] * alpha,
+            color[1] * alpha,
+            color[2] * alpha,
+            color[3] * alpha,
+        ]
+    }
+}
+
 /// Render Type3 glyphs: each glyph is a content stream. Interpret it to a
-/// sub-display-list (same glyph_rect as the CPU), routing fills, strokes, and
-/// inline image masks (bitmap Type 3 stencils) transformed by FontMatrix.
-/// Mirrors `CpuRenderer::render_type3_glyphs`.
+/// sub-display-list (same glyph_rect as the CPU), routing fills, strokes,
+/// glyph-local clips, and inline image masks/RGB images transformed by
+/// FontMatrix. Mirrors `CpuRenderer::render_type3_glyphs`.
 #[allow(clippy::too_many_arguments)]
 fn render_type3(
     rec: &mut PageRecorder,
@@ -372,13 +418,52 @@ fn render_type3(
         let Some((glyph_dl, glyph_images)) = rec.interpret_type3_stream(stream) else {
             return;
         };
+        let glyph_to_page = type3_glyph_to_page(tm, (g.x, g.y), font_size, h_scale, &font_matrix);
+        let stroke_scale = type3_stroke_scale(&glyph_to_page, map.scale);
+        let mut glyph_clip_depth = 0usize;
 
         for cmd in &glyph_dl.commands {
             if !rec.can_record() {
-                return;
+                break;
             }
             match cmd {
-                RenderCommand::FillPath { path, rule, .. } => {
+                RenderCommand::PushClip { path, rule } => {
+                    rec.push_clip_transformed(path, *rule, &glyph_to_page, map);
+                    glyph_clip_depth += 1;
+                }
+                RenderCommand::PushClipStroke { path, style } => {
+                    rec.push_clip_stroke_transformed(path, style, &glyph_to_page, map);
+                    glyph_clip_depth += 1;
+                }
+                RenderCommand::PopClip => {
+                    if glyph_clip_depth > 0 {
+                        rec.pop_clip();
+                        glyph_clip_depth -= 1;
+                    }
+                }
+                RenderCommand::FillPath {
+                    path,
+                    rule,
+                    paint,
+                    alpha,
+                    ..
+                } => {
+                    let cmd_alpha = if alpha.is_finite() {
+                        alpha.clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    if cmd_alpha <= 0.0 {
+                        continue;
+                    }
+                    let draw_color = match paint {
+                        Paint::Solid(c) => quantize_premul(c, image_alpha * cmd_alpha),
+                        Paint::Inherited => scale_premul_color(color, cmd_alpha),
+                        _ => continue,
+                    };
+                    if draw_color[3] <= 0.0 {
+                        continue;
+                    }
                     if let Some(p) = build_type3_path(
                         path,
                         &font_matrix,
@@ -388,16 +473,34 @@ fn render_type3(
                         (g.x, g.y),
                         map,
                     ) {
-                        if let Some(mesh) = fill_lyon_path(&p, *rule, color) {
+                        if let Some(mesh) = fill_lyon_path(&p, *rule, draw_color) {
                             rec.add_mesh(mesh);
                         }
                     }
                 }
-                RenderCommand::StrokePath { path, style, .. } => {
-                    // Width matches the CPU: scaled by the FontMatrix x-scale and
-                    // font size, with a 0.5px floor.
-                    let width = (style.width * font_matrix[0].abs() as f32 * font_size * map.scale)
-                        .max(0.5);
+                RenderCommand::StrokePath {
+                    path,
+                    style,
+                    paint,
+                    alpha,
+                    ..
+                } => {
+                    let cmd_alpha = if alpha.is_finite() {
+                        alpha.clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    if cmd_alpha <= 0.0 {
+                        continue;
+                    }
+                    let draw_color = match paint {
+                        Paint::Solid(c) => quantize_premul(c, image_alpha * cmd_alpha),
+                        Paint::Inherited => scale_premul_color(color, cmd_alpha),
+                        _ => continue,
+                    };
+                    if draw_color[3] <= 0.0 {
+                        continue;
+                    }
                     if let Some(p) = build_type3_path(
                         path,
                         &font_matrix,
@@ -407,8 +510,9 @@ fn render_type3(
                         (g.x, g.y),
                         map,
                     ) {
-                        let opts = StrokeOptions::tolerance(TOLERANCE).with_line_width(width);
-                        if let Some(mesh) = stroke_lyon_path(&p, &opts, color) {
+                        if let Some(mesh) =
+                            stroke_lyon_path_styled(&p, style, stroke_scale, 0.5, draw_color)
+                        {
                             rec.add_mesh(mesh);
                         }
                     }
@@ -420,21 +524,7 @@ fn render_type3(
                     if !crate::image::is_valid_decoded_image(src_img) {
                         continue;
                     }
-                    let glyph_to_page = tm
-                        .concat(&Matrix::translate(g.x as f64, g.y as f64))
-                        .concat(&Matrix::scale(
-                            font_size as f64 * h_scale as f64,
-                            font_size as f64,
-                        ))
-                        .concat(&Matrix::new(
-                            font_matrix[0],
-                            font_matrix[1],
-                            font_matrix[2],
-                            font_matrix[3],
-                            font_matrix[4],
-                            font_matrix[5],
-                        ))
-                        .concat(&draw.transform);
+                    let img_to_page = glyph_to_page.concat(&draw.transform);
                     if draw.is_image_mask {
                         let a_scale = color[3].clamp(0.0, 1.0);
                         if a_scale <= 0.0 {
@@ -452,7 +542,7 @@ fn render_type3(
                         let quad = crate::image::image_quad(
                             src_img.width as f32,
                             src_img.height as f32,
-                            &glyph_to_page,
+                            &img_to_page,
                             map,
                             eff_alpha,
                         );
@@ -489,7 +579,7 @@ fn render_type3(
                         let quad = crate::image::image_quad(
                             src_img.width as f32,
                             src_img.height as f32,
-                            &glyph_to_page,
+                            &img_to_page,
                             map,
                             eff_alpha,
                         );
@@ -507,13 +597,18 @@ fn render_type3(
                 _ => {}
             }
         }
+        while glyph_clip_depth > 0 {
+            rec.pop_clip();
+            glyph_clip_depth -= 1;
+        }
     }
 }
 
 /// Record a Type 3 glyph run whose active paint is `Paint::Tiling`, keeping
-/// intrinsic colored (`d0`) non-mask images in their own RGB colors while
-/// batching inherited fills, strokes, and `/ImageMask true` stencils into
-/// alpha coverage masks passed to `paint_masked_batch` in exact painter's order.
+/// explicit (`d0`) colored vectors and non-mask images in their own colors
+/// while batching inherited fills, strokes, and `/ImageMask true` stencils into
+/// alpha coverage masks passed to `paint_masked_batch` in exact painter's order,
+/// preserving glyph-local clips.
 #[allow(clippy::too_many_arguments)]
 pub fn render_type3_tiling_transformed(
     rec: &mut PageRecorder,
@@ -537,7 +632,6 @@ pub fn render_type3_tiling_transformed(
     };
     let font_size = run.font_size;
     let h_scale = run.h_scale;
-    let white = [1.0f32, 1.0, 1.0, 1.0];
     let white_tint = Some([1.0f32.to_bits(); 3]);
 
     let mut mask_ops: Vec<PageOp> = Vec::new();
@@ -565,6 +659,22 @@ pub fn render_type3_tiling_transformed(
         None
     };
 
+    macro_rules! flush_mask_batch {
+        () => {
+            if mask_has_draws {
+                let bounds = finish_bounds(min_px, min_py, max_px, max_py);
+                paint_masked_batch(rec, std::mem::take(&mut mask_ops), bounds);
+                mask_has_draws = false;
+                min_px = f32::INFINITY;
+                min_py = f32::INFINITY;
+                max_px = f32::NEG_INFINITY;
+                max_py = f32::NEG_INFINITY;
+            } else {
+                mask_ops.clear();
+            }
+        };
+    }
+
     for g in &run.glyphs {
         if !rec.can_record() {
             return;
@@ -575,63 +685,191 @@ pub fn render_type3_tiling_transformed(
         let Some((glyph_dl, glyph_images)) = rec.interpret_type3_stream(stream) else {
             return;
         };
+        let glyph_to_page = type3_glyph_to_page(&tm, (g.x, g.y), font_size, h_scale, &font_matrix);
+        let stroke_scale = type3_stroke_scale(&glyph_to_page, map.scale);
+        let mut glyph_clip_depth = 0usize;
 
         for cmd in &glyph_dl.commands {
             if !rec.can_record() {
-                return;
+                break;
             }
             match cmd {
-                RenderCommand::FillPath { path, rule, .. } => {
-                    if let Some(p) = build_type3_path(
-                        path,
-                        &font_matrix,
-                        font_size,
-                        h_scale,
-                        &tm,
-                        (g.x, g.y),
-                        map,
-                    ) {
-                        if let Some(mesh) = fill_lyon_path(&p, *rule, white) {
-                            for v in &mesh.vertices {
-                                if v.pos[0].is_finite() && v.pos[1].is_finite() {
-                                    min_px = min_px.min(v.pos[0]);
-                                    min_py = min_py.min(v.pos[1]);
-                                    max_px = max_px.max(v.pos[0]);
-                                    max_py = max_py.max(v.pos[1]);
-                                }
-                            }
-                            if rec.record_subops_clipped_into(&mut mask_ops, |r| r.add_mesh(mesh)) {
-                                mask_has_draws = true;
-                            }
+                RenderCommand::PushClip { path, rule } => {
+                    let depth_before = rec.clip_depth();
+                    rec.push_clip_transformed(path, *rule, &glyph_to_page, map);
+                    if rec.clip_depth() > depth_before {
+                        rec.mirror_top_clip_into(&mut mask_ops);
+                    }
+                    glyph_clip_depth += 1;
+                }
+                RenderCommand::PushClipStroke { path, style } => {
+                    let depth_before = rec.clip_depth();
+                    rec.push_clip_stroke_transformed(path, style, &glyph_to_page, map);
+                    if rec.clip_depth() > depth_before {
+                        rec.mirror_top_clip_into(&mut mask_ops);
+                    }
+                    glyph_clip_depth += 1;
+                }
+                RenderCommand::PopClip => {
+                    if glyph_clip_depth > 0 {
+                        let depth_before = rec.clip_depth();
+                        rec.pop_clip();
+                        if rec.clip_depth() != depth_before {
+                            rec.mirror_clip_rebuild_into(&mut mask_ops);
                         }
+                        glyph_clip_depth -= 1;
                     }
                 }
-                RenderCommand::StrokePath { path, style, .. } => {
-                    let width = (style.width * font_matrix[0].abs() as f32 * font_size * map.scale)
-                        .max(0.5);
-                    if let Some(p) = build_type3_path(
-                        path,
-                        &font_matrix,
-                        font_size,
-                        h_scale,
-                        &tm,
-                        (g.x, g.y),
-                        map,
-                    ) {
-                        let opts = StrokeOptions::tolerance(TOLERANCE).with_line_width(width);
-                        if let Some(mesh) = stroke_lyon_path(&p, &opts, white) {
-                            for v in &mesh.vertices {
-                                if v.pos[0].is_finite() && v.pos[1].is_finite() {
-                                    min_px = min_px.min(v.pos[0]);
-                                    min_py = min_py.min(v.pos[1]);
-                                    max_px = max_px.max(v.pos[0]);
-                                    max_py = max_py.max(v.pos[1]);
+                RenderCommand::FillPath {
+                    path,
+                    rule,
+                    paint,
+                    alpha,
+                    ..
+                } => {
+                    let cmd_alpha = if alpha.is_finite() {
+                        alpha.clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    if cmd_alpha <= 0.0 {
+                        continue;
+                    }
+                    match paint {
+                        Paint::Solid(c) => {
+                            flush_mask_batch!();
+                            if !rec.can_record() {
+                                break;
+                            }
+                            let draw_color = quantize_premul(c, eff_opacity * cmd_alpha);
+                            if draw_color[3] <= 0.0 {
+                                continue;
+                            }
+                            if let Some(p) = build_type3_path(
+                                path,
+                                &font_matrix,
+                                font_size,
+                                h_scale,
+                                &tm,
+                                (g.x, g.y),
+                                map,
+                            ) {
+                                if let Some(mesh) = fill_lyon_path(&p, *rule, draw_color) {
+                                    rec.add_mesh(mesh);
                                 }
                             }
-                            if rec.record_subops_clipped_into(&mut mask_ops, |r| r.add_mesh(mesh)) {
-                                mask_has_draws = true;
+                        }
+                        Paint::Inherited => {
+                            let mask_color = [cmd_alpha; 4];
+                            if let Some(p) = build_type3_path(
+                                path,
+                                &font_matrix,
+                                font_size,
+                                h_scale,
+                                &tm,
+                                (g.x, g.y),
+                                map,
+                            ) {
+                                if let Some(mesh) = fill_lyon_path(&p, *rule, mask_color) {
+                                    for v in &mesh.vertices {
+                                        if v.pos[0].is_finite() && v.pos[1].is_finite() {
+                                            min_px = min_px.min(v.pos[0]);
+                                            min_py = min_py.min(v.pos[1]);
+                                            max_px = max_px.max(v.pos[0]);
+                                            max_py = max_py.max(v.pos[1]);
+                                        }
+                                    }
+                                    if rec.record_subops_clipped_into(&mut mask_ops, |r| {
+                                        r.add_mesh(mesh)
+                                    }) {
+                                        mask_has_draws = true;
+                                    }
+                                }
                             }
                         }
+                        _ => {}
+                    }
+                }
+                RenderCommand::StrokePath {
+                    path,
+                    style,
+                    paint,
+                    alpha,
+                    ..
+                } => {
+                    let cmd_alpha = if alpha.is_finite() {
+                        alpha.clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    if cmd_alpha <= 0.0 {
+                        continue;
+                    }
+                    match paint {
+                        Paint::Solid(c) => {
+                            flush_mask_batch!();
+                            if !rec.can_record() {
+                                break;
+                            }
+                            let draw_color = quantize_premul(c, eff_opacity * cmd_alpha);
+                            if draw_color[3] <= 0.0 {
+                                continue;
+                            }
+                            if let Some(p) = build_type3_path(
+                                path,
+                                &font_matrix,
+                                font_size,
+                                h_scale,
+                                &tm,
+                                (g.x, g.y),
+                                map,
+                            ) {
+                                if let Some(mesh) = stroke_lyon_path_styled(
+                                    &p,
+                                    style,
+                                    stroke_scale,
+                                    0.5,
+                                    draw_color,
+                                ) {
+                                    rec.add_mesh(mesh);
+                                }
+                            }
+                        }
+                        Paint::Inherited => {
+                            let mask_color = [cmd_alpha; 4];
+                            if let Some(p) = build_type3_path(
+                                path,
+                                &font_matrix,
+                                font_size,
+                                h_scale,
+                                &tm,
+                                (g.x, g.y),
+                                map,
+                            ) {
+                                if let Some(mesh) = stroke_lyon_path_styled(
+                                    &p,
+                                    style,
+                                    stroke_scale,
+                                    0.5,
+                                    mask_color,
+                                ) {
+                                    for v in &mesh.vertices {
+                                        if v.pos[0].is_finite() && v.pos[1].is_finite() {
+                                            min_px = min_px.min(v.pos[0]);
+                                            min_py = min_py.min(v.pos[1]);
+                                            max_px = max_px.max(v.pos[0]);
+                                            max_py = max_py.max(v.pos[1]);
+                                        }
+                                    }
+                                    if rec.record_subops_clipped_into(&mut mask_ops, |r| {
+                                        r.add_mesh(mesh)
+                                    }) {
+                                        mask_has_draws = true;
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 RenderCommand::DrawImage(draw) => {
@@ -641,21 +879,7 @@ pub fn render_type3_tiling_transformed(
                     if !crate::image::is_valid_decoded_image(src_img) {
                         continue;
                     }
-                    let glyph_to_page = tm
-                        .concat(&Matrix::translate(g.x as f64, g.y as f64))
-                        .concat(&Matrix::scale(
-                            font_size as f64 * h_scale as f64,
-                            font_size as f64,
-                        ))
-                        .concat(&Matrix::new(
-                            font_matrix[0],
-                            font_matrix[1],
-                            font_matrix[2],
-                            font_matrix[3],
-                            font_matrix[4],
-                            font_matrix[5],
-                        ))
-                        .concat(&draw.transform);
+                    let img_to_page = glyph_to_page.concat(&draw.transform);
 
                     if draw.is_image_mask {
                         let eff_alpha = if draw.alpha.is_finite() {
@@ -669,7 +893,7 @@ pub fn render_type3_tiling_transformed(
                         let quad = crate::image::image_quad(
                             src_img.width as f32,
                             src_img.height as f32,
-                            &glyph_to_page,
+                            &img_to_page,
                             map,
                             eff_alpha,
                         );
@@ -705,19 +929,9 @@ pub fn render_type3_tiling_transformed(
                         // Intrinsic colored (`d0`) image: flush any pending
                         // inherited-paint mask batch first to keep painter's
                         // order, then draw the RGB image directly.
-                        if mask_has_draws {
-                            let bounds = finish_bounds(min_px, min_py, max_px, max_py);
-                            paint_masked_batch(rec, std::mem::take(&mut mask_ops), bounds);
-                            mask_has_draws = false;
-                            min_px = f32::INFINITY;
-                            min_py = f32::INFINITY;
-                            max_px = f32::NEG_INFINITY;
-                            max_py = f32::NEG_INFINITY;
-                        } else {
-                            mask_ops.clear();
-                        }
+                        flush_mask_batch!();
                         if !rec.can_record() {
-                            return;
+                            break;
                         }
                         let eff_alpha = draw.alpha * eff_opacity;
                         if !(eff_alpha.is_finite() && eff_alpha > 0.0) {
@@ -726,7 +940,7 @@ pub fn render_type3_tiling_transformed(
                         let quad = crate::image::image_quad(
                             src_img.width as f32,
                             src_img.height as f32,
-                            &glyph_to_page,
+                            &img_to_page,
                             map,
                             eff_alpha,
                         );
@@ -743,6 +957,14 @@ pub fn render_type3_tiling_transformed(
                 }
                 _ => {}
             }
+        }
+        while glyph_clip_depth > 0 {
+            let depth_before = rec.clip_depth();
+            rec.pop_clip();
+            if rec.clip_depth() != depth_before {
+                rec.mirror_clip_rebuild_into(&mut mask_ops);
+            }
+            glyph_clip_depth -= 1;
         }
     }
 
