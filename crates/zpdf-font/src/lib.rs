@@ -937,15 +937,19 @@ impl LoadedFont {
         let mut builder = OutlineBuilder::new();
         face.outline_glyph(gid, &mut builder)?;
 
-        let effective_cff_matrix = if let Some(cff) = face.tables().cff {
-            cff_effective_font_matrix(data, self.face_index, actual_gid, cff.number_of_glyphs())
-        } else if face.tables().cff2.is_some() {
-            cff2_effective_font_matrix(data, self.face_index, actual_gid, face.number_of_glyphs())
-        } else {
-            None
-        };
-        if let Some(matrix) = effective_cff_matrix {
-            apply_font_matrix_commands(&mut builder.commands, matrix, self.units_per_em);
+        // CFF 1.0 (`CFF `) outlines may carry an arbitrary Top DICT and/or
+        // per-FD `FontMatrix` (non-1000 UPM, anisotropic, or sheared), which
+        // `ttf-parser` does not apply. CFF2 outlines already live in
+        // `head.unitsPerEm` design units (its Top DICT `FontMatrix` is a
+        // uniform reciprocal of `head.unitsPerEm`, and CFF2 FontDICTs permit
+        // only `Private`), so per-FD / post-outline matrix transforms apply
+        // solely to CFF 1.0.
+        if let Some(cff) = face.tables().cff {
+            if let Some(matrix) =
+                cff_effective_font_matrix(data, self.face_index, actual_gid, cff.number_of_glyphs())
+            {
+                apply_font_matrix_commands(&mut builder.commands, matrix, self.units_per_em);
+            }
         }
 
         // `Face::glyph_hor_advance` reads exclusively from OpenType `hmtx`
@@ -2989,8 +2993,8 @@ fn parse_cff_dict_font_matrix(dict_data: &[u8]) -> Option<[f64; 6]> {
     matrix
 }
 
-/// Look up the Font DICT index for `gid` in a CFF `FDSelect` table (Adobe TN
-/// #5176 §19: Format 0, Format 3, plus CFF2 Format 4).
+/// Look up the Font DICT index for `gid` in a CFF 1.0 `FDSelect` table (Adobe
+/// TN #5176 §19: Format 0 and Format 3).
 fn parse_cff_fd_select(cff: &[u8], offset: usize, gid: u16, num_glyphs: u16) -> Option<usize> {
     let format = *cff.get(offset)?;
     match format {
@@ -3046,52 +3050,6 @@ fn parse_cff_fd_select(cff: &[u8], offset: usize, gid: u16, num_glyphs: u16) -> 
                 None
             }
         }
-        4 => {
-            let n_ranges_pos = offset.checked_add(1)?;
-            let n_ranges = u32::from_be_bytes(
-                *cff.get(n_ranges_pos..n_ranges_pos + 4)?
-                    .first_chunk::<4>()?,
-            ) as usize;
-            if n_ranges == 0 {
-                return None;
-            }
-            let ranges_start = n_ranges_pos.checked_add(4)?;
-            let sentinel_pos = ranges_start.checked_add(n_ranges.checked_mul(6)?)?;
-            let sentinel = u32::from_be_bytes(
-                *cff.get(sentinel_pos..sentinel_pos + 4)?
-                    .first_chunk::<4>()?,
-            );
-            let gid32 = gid as u32;
-            if gid32 >= sentinel {
-                return None;
-            }
-            let range_first = |i: usize| -> u32 {
-                let p = ranges_start + i * 6;
-                u32::from_be_bytes([cff[p], cff[p + 1], cff[p + 2], cff[p + 3]])
-            };
-            let mut lo = 0usize;
-            let mut hi = n_ranges;
-            while lo < hi {
-                let mid = lo + (hi - lo) / 2;
-                if range_first(mid) <= gid32 {
-                    lo = mid + 1;
-                } else {
-                    hi = mid;
-                }
-            }
-            let idx = lo.checked_sub(1)?;
-            let next_first = if idx + 1 < n_ranges {
-                range_first(idx + 1)
-            } else {
-                sentinel
-            };
-            if gid32 < next_first {
-                let fd_pos = ranges_start + idx * 6 + 4;
-                Some(u16::from_be_bytes([cff[fd_pos], cff[fd_pos + 1]]) as usize)
-            } else {
-                None
-            }
-        }
         _ => None,
     }
 }
@@ -3130,77 +3088,6 @@ fn cff_effective_font_matrix(
         let fd_index = parse_cff_fd_select(cff, fd_select_offset, gid, num_glyphs)?;
         let fd_dict = cff_index_entry(cff, fd_array_offset, fd_index)?;
         parse_cff_dict_font_matrix(fd_dict)
-    } else {
-        None
-    };
-
-    // Per FreeType (`src/cff/cffobjs.c`) and `read-fonts`: only concatenate the
-    // FD matrix with the Top DICT matrix when the Top DICT explicitly specifies
-    // a `FontMatrix`; otherwise use the FD matrix directly so a CID font with
-    // omitted Top `FontMatrix` and an FD `[0.001 0 0 0.001 0 0]` is not
-    // double-scaled by 0.001.
-    let effective = match (info.font_matrix, fd_matrix) {
-        (Some(top), Some(fd)) => concat_cff_font_matrix(fd, top),
-        (Some(top), None) => top,
-        (None, Some(fd)) => fd,
-        (None, None) => return None,
-    };
-    effective.iter().all(|v| v.is_finite()).then_some(effective)
-}
-
-/// Entry `entry` from a CFF2 INDEX (4-byte `count: u32` per OpenType CFF2 §5).
-fn cff2_index_entry(cff2: &[u8], pos: usize, entry: usize) -> Option<&[u8]> {
-    let count_bytes = cff2.get(pos..pos.checked_add(4)?)?;
-    let count = u32::from_be_bytes([
-        count_bytes[0],
-        count_bytes[1],
-        count_bytes[2],
-        count_bytes[3],
-    ]) as usize;
-    if entry >= count {
-        return None;
-    }
-    let off_size = *cff2.get(pos.checked_add(4)?)? as usize;
-    if !(1..=4).contains(&off_size) {
-        return None;
-    }
-    let offsets_start = pos.checked_add(5)?;
-    let start_pos = offsets_start.checked_add(entry.checked_mul(off_size)?)?;
-    let end_pos = start_pos.checked_add(off_size)?;
-    let start = read_cff_offset(cff2, start_pos, off_size)?.checked_sub(1)?;
-    let end = read_cff_offset(cff2, end_pos, off_size)?.checked_sub(1)?;
-    if end < start {
-        return None;
-    }
-    let data_start = offsets_start.checked_add(count.checked_add(1)?.checked_mul(off_size)?)?;
-    let range_start = data_start.checked_add(start)?;
-    let range_end = data_start.checked_add(end)?;
-    cff2.get(range_start..range_end)
-}
-
-/// Compute the effective CFF2 `FontMatrix` (Top DICT × optional per-FD via
-/// `FDArray` and `FDSelect` formats 0, 3, or 4) for `gid`.
-fn cff2_effective_font_matrix(
-    font_data: &[u8],
-    face_index: u32,
-    gid: u16,
-    num_glyphs: u16,
-) -> Option<[f64; 6]> {
-    let cff2 = find_sfnt_table_for_face(font_data, face_index, b"CFF2")?;
-    if cff2.len() < 5 || cff2[0] != 2 {
-        return None;
-    }
-    let header_size = cff2[2] as usize;
-    let top_dict_len = u16::from_be_bytes([cff2[3], cff2[4]]) as usize;
-    let top_dict = cff2.get(header_size..header_size.checked_add(top_dict_len)?)?;
-    let info = parse_cff_top_dict_matrix_info(top_dict);
-
-    let fd_matrix = if let Some(fd_array_offset) = info.fd_array_offset {
-        let fd_index = match info.fd_select_offset {
-            Some(fd_select_offset) => parse_cff_fd_select(cff2, fd_select_offset, gid, num_glyphs)?,
-            None => 0,
-        };
-        cff2_index_entry(cff2, fd_array_offset, fd_index).and_then(parse_cff_dict_font_matrix)
     } else {
         None
     };
@@ -5075,7 +4962,7 @@ mod tests {
     }
 
     #[test]
-    fn cff2_effective_font_matrix_handles_top_dict_and_fdselect_format4() {
+    fn cff2_non_1000_upem_glyph_outline_uses_design_units_and_ignores_fd_font_matrix() {
         fn encode_cff2_index(items: &[&[u8]]) -> Vec<u8> {
             let mut out = Vec::new();
             out.extend_from_slice(&(items.len() as u32).to_be_bytes());
@@ -5095,70 +4982,186 @@ mod tests {
             out
         }
 
-        // Format 4 FDSelect: nRanges=2 (u32), [0..2)->FD 0, [2..4)->FD 1, sentinel=4 (u32).
-        let mut fd_select = vec![4u8];
-        fd_select.extend_from_slice(&2u32.to_be_bytes());
-        fd_select.extend_from_slice(&0u32.to_be_bytes());
-        fd_select.extend_from_slice(&0u16.to_be_bytes());
-        fd_select.extend_from_slice(&2u32.to_be_bytes());
-        fd_select.extend_from_slice(&1u16.to_be_bytes());
-        fd_select.extend_from_slice(&4u32.to_be_bytes());
+        // CFF2 charstring for gid 1: rectangle (200, 200) -> (600, 1000) in
+        // 2000-UPEM design units (no width operand and no `endchar` in CFF2).
+        fn encode_cs_int(out: &mut Vec<u8>, v: i32) {
+            if (-107..=107).contains(&v) {
+                out.push((v + 139) as u8);
+            } else if (108..=1131).contains(&v) {
+                let d = v - 108;
+                out.push((247 + d / 256) as u8);
+                out.push((d % 256) as u8);
+            } else if (-1131..=-108).contains(&v) {
+                let d = -v - 108;
+                out.push((251 + d / 256) as u8);
+                out.push((d % 256) as u8);
+            } else {
+                panic!("unexpected test charstring int {v}");
+            }
+        }
+        let mut rect_cs = Vec::new();
+        encode_cs_int(&mut rect_cs, 200);
+        encode_cs_int(&mut rect_cs, 200);
+        rect_cs.push(21); // rmoveto
+        encode_cs_int(&mut rect_cs, 400);
+        encode_cs_int(&mut rect_cs, 0);
+        rect_cs.push(5); // rlineto -> (600, 200)
+        encode_cs_int(&mut rect_cs, 0);
+        encode_cs_int(&mut rect_cs, 800);
+        rect_cs.push(5); // rlineto -> (600, 1000)
+        encode_cs_int(&mut rect_cs, -400);
+        encode_cs_int(&mut rect_cs, 0);
+        rect_cs.push(5); // rlineto -> (200, 1000)
 
-        let mut fd0 = Vec::new();
-        encode_cff_matrix(&mut fd0, &["0.001", "0", "0", "0.001", "0", "0"]);
-        let mut fd1 = Vec::new();
-        encode_cff_matrix(&mut fd1, &["0.0005", "0", "0", "0.0005", "0", "0"]);
-        let fd_array = encode_cff2_index(&[&fd0, &fd1]);
+        let char_strings = encode_cff2_index(&[&[], &rect_cs]);
+        let global_subrs = encode_cff2_index(&[]);
+        // Minimal CFF2 VariationStore (required by ttf-parser's CFF2 outliner
+        // to resolve default scalars at vsindex 0): 2-byte length + format-1
+        // ItemVariationStore with 0 axes, 0 regions, and 1 empty data subtable.
+        let mut vstore = Vec::new();
+        vstore.extend_from_slice(&22u16.to_be_bytes()); // length
+        vstore.extend_from_slice(&1u16.to_be_bytes()); // format = 1
+        vstore.extend_from_slice(&12u32.to_be_bytes()); // variationRegionListOffset = 12
+        vstore.extend_from_slice(&1u16.to_be_bytes()); // itemVariationDataCount = 1
+        vstore.extend_from_slice(&16u32.to_be_bytes()); // itemVariationDataOffsets[0] = 16
+        vstore.extend_from_slice(&0u16.to_be_bytes()); // axisCount = 0
+        vstore.extend_from_slice(&0u16.to_be_bytes()); // regionCount = 0
+        vstore.extend_from_slice(&0u16.to_be_bytes()); // itemCount = 0
+        vstore.extend_from_slice(&0u16.to_be_bytes()); // wordDeltaCount = 0
+        vstore.extend_from_slice(&0u16.to_be_bytes()); // regionIndexCount = 0
 
-        let wrap_cff2_sfnt = |include_top_matrix: bool| -> Vec<u8> {
-            let build_top = |fd_arr_off: usize, fd_sel_off: usize| -> Vec<u8> {
-                let mut d = Vec::new();
-                if include_top_matrix {
-                    encode_cff_matrix(&mut d, &["1", "0", "0", "1", "0", "0"]);
+        let build_cff2_sfnt = |include_unsupported_fd_matrix: bool| -> Vec<u8> {
+            // Fixed-width 5-byte DICT integers (`29 <i32>`) keep Top/Font DICT
+            // byte lengths invariant when plugging in final table offsets.
+            let push_i32 = |out: &mut Vec<u8>, v: i32| {
+                out.push(29);
+                out.extend_from_slice(&v.to_be_bytes());
+            };
+            let build_fd = |priv_off: usize| -> Vec<u8> {
+                let mut fd = Vec::new();
+                if include_unsupported_fd_matrix {
+                    // Unsupported in CFF2 FontDICT (OpenType CFF2 allows only
+                    // PrivateDICTOffset); must NOT rescale gid 1.
+                    encode_cff_matrix(&mut fd, &["0.002", "0", "0", "0.002", "0", "0"]);
                 }
-                encode_cff_int(&mut d, fd_arr_off as i32);
-                d.extend_from_slice(&[12, 36]);
-                encode_cff_int(&mut d, fd_sel_off as i32);
-                d.extend_from_slice(&[12, 37]);
+                push_i32(&mut fd, 0); // Private DICT size = 0
+                push_i32(&mut fd, priv_off as i32);
+                fd.push(18); // Private
+                fd
+            };
+            let build_top = |cs_off: usize, fd_arr_off: usize, vstore_off: usize| -> Vec<u8> {
+                let mut d = Vec::new();
+                // Conforming 2000-UPEM Top DICT FontMatrix = 1 / 2000.
+                encode_cff_matrix(&mut d, &["0.0005", "0", "0", "0.0005", "0", "0"]);
+                push_i32(&mut d, cs_off as i32);
+                d.push(17); // CharStrings
+                push_i32(&mut d, fd_arr_off as i32);
+                d.extend_from_slice(&[12, 36]); // FDArray
+                push_i32(&mut d, vstore_off as i32);
+                d.push(24); // vstore
                 d
             };
-            let top_len = build_top(0, 0).len();
-            let fd_sel_off = 5 + top_len;
-            let fd_arr_off = fd_sel_off + fd_select.len();
-            let top = build_top(fd_arr_off, fd_sel_off);
+
+            let top_len = build_top(0, 0, 0).len();
+            let cs_off = 5 + top_len + global_subrs.len();
+            let fd_arr_off = cs_off + char_strings.len();
+            let dummy_fd = build_fd(0);
+            let dummy_fd_array = encode_cff2_index(&[&dummy_fd]);
+            let vstore_off = fd_arr_off + dummy_fd_array.len();
+            let priv_off = vstore_off + vstore.len();
+            let fd = build_fd(priv_off);
+            let fd_array = encode_cff2_index(&[&fd]);
+            let top = build_top(cs_off, fd_arr_off, vstore_off);
             assert_eq!(top.len(), top_len);
+            assert_eq!(fd_array.len(), dummy_fd_array.len());
 
             let mut cff2 = vec![2u8, 0, 5];
             cff2.extend_from_slice(&(top.len() as u16).to_be_bytes());
             cff2.extend_from_slice(&top);
-            cff2.extend_from_slice(&fd_select);
+            cff2.extend_from_slice(&global_subrs);
+            cff2.extend_from_slice(&char_strings);
             cff2.extend_from_slice(&fd_array);
+            cff2.extend_from_slice(&vstore);
 
+            // Minimal conforming OpenType sfnt (`OTTO`) with `head` (UPEM=2000),
+            // `hhea`, `hmtx` (gid 1 advance=1200), `maxp` (v0.5, numGlyphs=2),
+            // and `CFF2`.
+            let mut head = vec![0u8; 54];
+            head[0..4].copy_from_slice(&0x0001_0000u32.to_be_bytes());
+            head[12..16].copy_from_slice(&0x5F0F_3CF5u32.to_be_bytes());
+            head[18..20].copy_from_slice(&2000u16.to_be_bytes()); // unitsPerEm = 2000
+            head[40..42].copy_from_slice(&2000i16.to_be_bytes());
+            head[42..44].copy_from_slice(&2000i16.to_be_bytes());
+
+            let mut hhea = vec![0u8; 36];
+            hhea[0..4].copy_from_slice(&0x0001_0000u32.to_be_bytes());
+            hhea[4..6].copy_from_slice(&1600i16.to_be_bytes()); // ascender
+            hhea[6..8].copy_from_slice(&(-400i16).to_be_bytes()); // descender
+            hhea[34..36].copy_from_slice(&2u16.to_be_bytes()); // numberOfHMetrics = 2
+
+            let mut hmtx = Vec::new();
+            hmtx.extend_from_slice(&1000u16.to_be_bytes()); // gid 0 advance
+            hmtx.extend_from_slice(&0i16.to_be_bytes());
+            hmtx.extend_from_slice(&1200u16.to_be_bytes()); // gid 1 advance
+            hmtx.extend_from_slice(&200i16.to_be_bytes());
+
+            let mut maxp = Vec::new();
+            maxp.extend_from_slice(&0x0000_5000u32.to_be_bytes()); // CFF/CFF2 version 0.5
+            maxp.extend_from_slice(&2u16.to_be_bytes()); // numGlyphs = 2
+
+            let tables: [(&[u8; 4], &[u8]); 5] = [
+                (b"CFF2", &cff2),
+                (b"head", &head),
+                (b"hhea", &hhea),
+                (b"hmtx", &hmtx),
+                (b"maxp", &maxp),
+            ];
+            let num_tables = tables.len() as u16;
             let mut sfnt = Vec::new();
             sfnt.extend_from_slice(b"OTTO");
-            sfnt.extend_from_slice(&1u16.to_be_bytes());
-            sfnt.extend_from_slice(&16u16.to_be_bytes());
-            sfnt.extend_from_slice(&0u16.to_be_bytes());
-            sfnt.extend_from_slice(&0u16.to_be_bytes());
-            sfnt.extend_from_slice(b"CFF2");
-            sfnt.extend_from_slice(&0u32.to_be_bytes());
-            sfnt.extend_from_slice(&28u32.to_be_bytes());
-            sfnt.extend_from_slice(&(cff2.len() as u32).to_be_bytes());
-            sfnt.extend_from_slice(&cff2);
+            sfnt.extend_from_slice(&num_tables.to_be_bytes());
+            sfnt.extend_from_slice(&64u16.to_be_bytes());
+            sfnt.extend_from_slice(&2u16.to_be_bytes());
+            sfnt.extend_from_slice(&(num_tables * 16 - 64).to_be_bytes());
+            let mut offset = 12 + tables.len() * 16;
+            for (tag, data) in tables {
+                sfnt.extend_from_slice(tag);
+                sfnt.extend_from_slice(&0u32.to_be_bytes());
+                sfnt.extend_from_slice(&(offset as u32).to_be_bytes());
+                sfnt.extend_from_slice(&(data.len() as u32).to_be_bytes());
+                offset += (data.len() + 3) & !3;
+            }
+            for (_, data) in tables {
+                sfnt.extend_from_slice(data);
+                while sfnt.len() % 4 != 0 {
+                    sfnt.push(0);
+                }
+            }
             sfnt
         };
 
-        for include_top_matrix in [true, false] {
-            let sfnt = wrap_cff2_sfnt(include_top_matrix);
-            assert_eq!(
-                cff2_effective_font_matrix(&sfnt, 0, 1, 4),
-                Some([0.001, 0.0, 0.0, 0.001, 0.0, 0.0])
+        for include_unsupported_fd_matrix in [false, true] {
+            let sfnt = build_cff2_sfnt(include_unsupported_fd_matrix);
+            let font = LoadedFont::new_with_data(
+                PdfFontType::TrueType,
+                "SyntheticCFF2".into(),
+                sfnt,
+                CidWidths::new(1000.0),
             );
-            assert_eq!(
-                cff2_effective_font_matrix(&sfnt, 0, 2, 4),
-                Some([0.0005, 0.0, 0.0, 0.0005, 0.0, 0.0])
+            assert_eq!(font.units_per_em, 2000.0);
+            let outline = font
+                .glyph_outline(1)
+                .expect("gid 1 CFF2 outline must extract through LoadedFont::glyph_outline");
+            assert_eq!(outline.advance_width, 1200.0);
+            let (x0, y0, x1, y1) = outline_bbox(&outline);
+            assert!(
+                (x0 - 200.0).abs() < 1e-6 && (x1 - 600.0).abs() < 1e-6,
+                "CFF2 x bbox must stay in 2000-UPEM design units (fd_matrix={include_unsupported_fd_matrix}): got ({x0}, {x1})"
             );
-            assert_eq!(cff2_effective_font_matrix(&sfnt, 0, 4, 4), None);
+            assert!(
+                (y0 - 200.0).abs() < 1e-6 && (y1 - 1000.0).abs() < 1e-6,
+                "CFF2 y bbox must stay in 2000-UPEM design units (fd_matrix={include_unsupported_fd_matrix}): got ({y0}, {y1})"
+            );
         }
     }
 
