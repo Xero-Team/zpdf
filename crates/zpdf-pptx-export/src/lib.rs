@@ -1781,7 +1781,11 @@ impl<'a> SlideConverter<'a> {
                 }
             }
             RenderCommand::FillPath {
-                path, paint, alpha, ..
+                path,
+                rule,
+                paint,
+                alpha,
+                ..
             } => {
                 let effective_alpha = effective_paint_alpha(paint, *alpha);
                 if effective_alpha <= 0.0 {
@@ -1789,7 +1793,10 @@ impl<'a> SlideConverter<'a> {
                 }
                 let clipped_artwork = in_artwork_range
                     && self.clip_stack_constrains_commands(std::slice::from_ref(cmd));
-                if clipped_artwork || (in_artwork_range && effective_alpha < 1.0 - 1e-3) {
+                let raster_artwork = in_artwork_range
+                    && (effective_alpha < 1.0 - 1e-3
+                        || artwork_fill_needs_raster(path, *rule, paint));
+                if clipped_artwork || raster_artwork {
                     self.flatten_commands_group(
                         std::slice::from_ref(cmd),
                         None,
@@ -3045,6 +3052,146 @@ fn effective_paint_alpha(paint: &zpdf_display_list::Paint, alpha: f32) -> f32 {
         _ => 1.0,
     };
     (alpha * paint_alpha).clamp(0.0, 1.0)
+}
+
+fn path_has_multiple_subpaths(path: &zpdf_display_list::Path) -> bool {
+    let mut subpaths = 0usize;
+    let mut in_subpath = false;
+    for elem in path.iter() {
+        match elem {
+            zpdf_display_list::PathElement::MoveTo(_) => {
+                subpaths += 1;
+                in_subpath = true;
+            }
+            zpdf_display_list::PathElement::LineTo(_)
+            | zpdf_display_list::PathElement::CurveTo(_, _, _) => {
+                if !in_subpath {
+                    subpaths += 1;
+                    in_subpath = true;
+                }
+            }
+            zpdf_display_list::PathElement::Close => {
+                in_subpath = false;
+            }
+        }
+        if subpaths > 1 {
+            return true;
+        }
+    }
+    false
+}
+
+fn segments_intersect_or_touch(
+    a0: zpdf_core::Point,
+    a1: zpdf_core::Point,
+    b0: zpdf_core::Point,
+    b1: zpdf_core::Point,
+) -> bool {
+    let ax_min = a0.x.min(a1.x);
+    let ax_max = a0.x.max(a1.x);
+    let ay_min = a0.y.min(a1.y);
+    let ay_max = a0.y.max(a1.y);
+    let bx_min = b0.x.min(b1.x);
+    let bx_max = b0.x.max(b1.x);
+    let by_min = b0.y.min(b1.y);
+    let by_max = b0.y.max(b1.y);
+    if ax_max < bx_min || bx_max < ax_min || ay_max < by_min || by_max < ay_min {
+        return false;
+    }
+    let cross = |o: zpdf_core::Point, p: zpdf_core::Point, q: zpdf_core::Point| {
+        (p.x - o.x) * (q.y - o.y) - (p.y - o.y) * (q.x - o.x)
+    };
+    let d1 = cross(a0, a1, b0);
+    let d2 = cross(a0, a1, b1);
+    let d3 = cross(b0, b1, a0);
+    let d4 = cross(b0, b1, a1);
+    if ((d1 > 0.0 && d2 < 0.0) || (d1 < 0.0 && d2 > 0.0))
+        && ((d3 > 0.0 && d4 < 0.0) || (d3 < 0.0 && d4 > 0.0))
+    {
+        return true;
+    }
+    let on_seg = |p: zpdf_core::Point, q: zpdf_core::Point, r: zpdf_core::Point| {
+        r.x >= p.x.min(q.x) - 1e-9
+            && r.x <= p.x.max(q.x) + 1e-9
+            && r.y >= p.y.min(q.y) - 1e-9
+            && r.y <= p.y.max(q.y) + 1e-9
+    };
+    (d1.abs() <= 1e-9 && on_seg(a0, a1, b0))
+        || (d2.abs() <= 1e-9 && on_seg(a0, a1, b1))
+        || (d3.abs() <= 1e-9 && on_seg(b0, b1, a0))
+        || (d4.abs() <= 1e-9 && on_seg(b0, b1, a1))
+}
+
+fn path_single_subpath_may_self_intersect(path: &zpdf_display_list::Path) -> bool {
+    let mut edges: Vec<(zpdf_core::Point, zpdf_core::Point)> = Vec::new();
+    let mut start: Option<zpdf_core::Point> = None;
+    let mut cur: Option<zpdf_core::Point> = None;
+    for elem in path.iter() {
+        match elem {
+            zpdf_display_list::PathElement::MoveTo(p) => {
+                start = Some(p);
+                cur = Some(p);
+            }
+            zpdf_display_list::PathElement::LineTo(p) => {
+                if let Some(prev) = cur {
+                    if (prev.x - p.x).abs() > 1e-9 || (prev.y - p.y).abs() > 1e-9 {
+                        edges.push((prev, p));
+                    }
+                } else {
+                    start = Some(p);
+                }
+                cur = Some(p);
+            }
+            zpdf_display_list::PathElement::CurveTo(_, _, _) => {
+                // Curved artwork outlines can self-intersect or depend on winding.
+                return true;
+            }
+            zpdf_display_list::PathElement::Close => {
+                if let (Some(prev), Some(st)) = (cur, start) {
+                    if (prev.x - st.x).abs() > 1e-9 || (prev.y - st.y).abs() > 1e-9 {
+                        edges.push((prev, st));
+                    }
+                }
+                cur = start;
+            }
+        }
+        if edges.len() > 64 {
+            return true;
+        }
+    }
+    if let (Some(prev), Some(st)) = (cur, start) {
+        if (prev.x - st.x).abs() > 1e-9 || (prev.y - st.y).abs() > 1e-9 {
+            edges.push((prev, st));
+        }
+    }
+    let n = edges.len();
+    if n < 4 {
+        return false;
+    }
+    for i in 0..n {
+        for j in (i + 2)..n {
+            if i == 0 && j == n - 1 {
+                continue;
+            }
+            if segments_intersect_or_touch(edges[i].0, edges[i].1, edges[j].0, edges[j].1) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Whether an artwork `FillPath` must use the CPU raster fallback to preserve
+/// its exact PDF fill rule (`NonZero` vs `EvenOdd`) or non-solid paint, because
+/// DrawingML `<a:custGeom><a:path>` has no fill-rule attribute.
+fn artwork_fill_needs_raster(
+    path: &zpdf_display_list::Path,
+    _rule: zpdf_display_list::FillRule,
+    paint: &zpdf_display_list::Paint,
+) -> bool {
+    !matches!(paint, zpdf_display_list::Paint::Solid(_))
+        || path_has_multiple_subpaths(path)
+        || path_single_subpath_may_self_intersect(path)
 }
 
 fn path_control_bounds(path: &zpdf_display_list::Path) -> Option<Rect> {
@@ -10893,6 +11040,172 @@ mod export_tests {
             stats.queued_clip_stack_allocations, 3,
             "100 queued snapshots across 3 clip states must allocate only 3 shared clip-stack handles, got {}",
             stats.queued_clip_stack_allocations
+        );
+    }
+
+    #[test]
+    fn type3_compound_glyph_preserves_nonzero_and_evenodd_fill_rules() {
+        let stream = |dict: &str, data: &[u8]| -> Vec<u8> {
+            let mut out = format!("<< {dict} /Length {} >>\nstream\n", data.len()).into_bytes();
+            out.extend_from_slice(data);
+            out.extend_from_slice(b"\nendstream");
+            out
+        };
+        let assemble = |objects: &[Vec<u8>]| -> Vec<u8> {
+            let mut pdf = b"%PDF-1.4\n".to_vec();
+            let mut offsets = Vec::with_capacity(objects.len());
+            for (i, body) in objects.iter().enumerate() {
+                offsets.push(pdf.len());
+                pdf.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+                pdf.extend_from_slice(body);
+                pdf.extend_from_slice(b"\nendobj\n");
+            }
+            let xref = pdf.len();
+            pdf.extend_from_slice(
+                format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+            );
+            for off in offsets {
+                pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+            }
+            pdf.extend_from_slice(
+                format!(
+                    "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                    objects.len() + 1
+                )
+                .as_bytes(),
+            );
+            pdf
+        };
+
+        // Five unmapped Type 3 glyphs:
+        // A (/nested_nz): two same-direction nested rectangles filled with `f` (NonZero -> center filled).
+        // B (/nested_eo): same two nested rectangles filled with `f*` (EvenOdd -> center hole).
+        // C (/star_nz): single-subpath 5-pointed star filled with `f` (NonZero -> center filled).
+        // D (/star_eo): same 5-pointed star filled with `f*` (EvenOdd -> center hole).
+        // E (/simple_rect): single simple rectangle filled with `f` (stays native Rectangle).
+        let star_path = b"500 900 m 200 100 l 900 600 l 100 600 l 800 100 l h ";
+        let mut star_nz = b"1000 0 d0 ".to_vec();
+        star_nz.extend_from_slice(star_path);
+        star_nz.push(b'f');
+        let mut star_eo = b"1000 0 d0 ".to_vec();
+        star_eo.extend_from_slice(star_path);
+        star_eo.extend_from_slice(b"f*");
+
+        let pdf = assemble(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 120] /Contents 4 0 R \
+              /Resources << /Font << /F1 5 0 R >> >> >>"
+                .to_vec(), // 3
+            stream("", b"0 0 1 rg BT /F1 100 Tf 10 10 Td (ABCDE) Tj ET"), // 4
+            b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] \
+              /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs 6 0 R /Encoding 7 0 R \
+              /FirstChar 65 /LastChar 69 /Widths [1000 1000 1000 1000 1000] /Resources << >> >>"
+                .to_vec(), // 5
+            b"<< /nested_nz 8 0 R /nested_eo 9 0 R /star_nz 10 0 R /star_eo 11 0 R /simple_rect 12 0 R >>"
+                .to_vec(), // 6
+            b"<< /Type /Encoding /Differences [65 /nested_nz /nested_eo /star_nz /star_eo /simple_rect] >>"
+                .to_vec(), // 7
+            stream("", b"1000 0 d0 0 0 800 800 re 200 200 400 400 re f"), // 8
+            stream("", b"1000 0 d0 0 0 800 800 re 200 200 400 400 re f*"), // 9
+            stream("", &star_nz),                                          // 10
+            stream("", &star_eo),                                          // 11
+            stream("", b"1000 0 d0 0 0 800 800 re f"),                     // 12
+        ]);
+
+        let doc = zpdf_document::PdfDocument::open(pdf).expect("open pdf");
+        let page = doc.page(0).expect("page 0");
+        let mut fonts = doc.load_page_fonts(&page);
+        let (content_bytes, _) = doc.page_content_with_diagnostics(&page).expect("content");
+        let mut images = ImageCache::new();
+        let (dl, _) = zpdf_content::interpreter::ContentInterpreter::new(page.effective_box())
+            .with_document(doc.file(), &page.resources)
+            .with_fonts(&mut fonts)
+            .with_images(&mut images)
+            .interpret_with_stats(&content_bytes);
+
+        let slide = display_list_to_slide(&dl, 0, &fonts, &images, &ConversionOptions::default())
+            .expect("slide export");
+        assert_eq!(slide.elements.len(), 5);
+
+        let decode_img = |idx: usize, label: &str| -> image::RgbaImage {
+            let SlideElement::Image { image_data, .. } = &slide.elements[idx] else {
+                panic!(
+                    "{label} must rasterize to preserve fill rule, got {:?}",
+                    slide.elements[idx]
+                );
+            };
+            image::load_from_memory(image_data)
+                .expect("decode PNG")
+                .to_rgba8()
+        };
+
+        let is_blue = |px: [u8; 4]| px[3] > 240 && px[2] > 240 && px[0] < 15 && px[1] < 15;
+
+        // A (/nested_nz): outer ring AND center must both be opaque blue.
+        let nested_nz = decode_img(0, "/nested_nz");
+        let (w, h) = nested_nz.dimensions();
+        assert!(
+            is_blue(nested_nz.get_pixel(w / 8, h / 2).0),
+            "/nested_nz outer ring must be blue, got {:?}",
+            nested_nz.get_pixel(w / 8, h / 2).0
+        );
+        assert!(
+            is_blue(nested_nz.get_pixel(w / 2, h / 2).0),
+            "/nested_nz (f / NonZero) center must be filled blue, got {:?}",
+            nested_nz.get_pixel(w / 2, h / 2).0
+        );
+
+        // B (/nested_eo): outer ring blue, center must be a transparent hole.
+        let nested_eo = decode_img(1, "/nested_eo");
+        let (w, h) = nested_eo.dimensions();
+        assert!(
+            is_blue(nested_eo.get_pixel(w / 8, h / 2).0),
+            "/nested_eo outer ring must be blue, got {:?}",
+            nested_eo.get_pixel(w / 8, h / 2).0
+        );
+        assert_eq!(
+            nested_eo.get_pixel(w / 2, h / 2).0[3],
+            0,
+            "/nested_eo (f* / EvenOdd) center must be a transparent hole, got {:?}",
+            nested_eo.get_pixel(w / 2, h / 2).0
+        );
+
+        // C (/star_nz): center pentagon filled blue.
+        let star_nz_img = decode_img(2, "/star_nz");
+        let (w, h) = star_nz_img.dimensions();
+        assert!(
+            is_blue(star_nz_img.get_pixel(w / 2, h / 2).0),
+            "/star_nz (f / NonZero) star center must be filled blue, got {:?}",
+            star_nz_img.get_pixel(w / 2, h / 2).0
+        );
+
+        // D (/star_eo): center pentagon transparent hole while top star tip is blue.
+        let star_eo_img = decode_img(3, "/star_eo");
+        let (w, h) = star_eo_img.dimensions();
+        assert_eq!(
+            star_eo_img.get_pixel(w / 2, h / 2).0[3],
+            0,
+            "/star_eo (f* / EvenOdd) star center must be a transparent hole, got {:?}",
+            star_eo_img.get_pixel(w / 2, h / 2).0
+        );
+        assert!(
+            is_blue(star_eo_img.get_pixel(w / 2, h / 6).0),
+            "/star_eo outer top tip must be filled blue, got {:?}",
+            star_eo_img.get_pixel(w / 2, h / 6).0
+        );
+
+        // E (/simple_rect): simple non-compound rectangle stays native SlideElement::Rectangle.
+        assert!(
+            matches!(
+                slide.elements[4],
+                SlideElement::Rectangle {
+                    fill_rgb: Some((0, 0, 255)),
+                    ..
+                }
+            ),
+            "/simple_rect must remain native SlideElement::Rectangle, got {:?}",
+            slide.elements[4]
         );
     }
 }
