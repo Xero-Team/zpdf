@@ -565,3 +565,119 @@ fn tagged_path_escapes_custom_role_name_and_rejects_empty_or_nul() {
     assert_eq!(tree.children.len(), 1);
     assert_eq!(tree.children[0].role.as_str(), hostile);
 }
+
+#[test]
+fn tagged_text_embedded_and_image_reject_invalid_role_without_mutating_page() {
+    let font_bytes = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../crates/zpdf-font/tests/fixtures/var.ttf"
+    ))
+    .expect("read var.ttf");
+    let mut builder = DocumentBuilder::new();
+    let p = builder.add_page(200.0, 200.0);
+    let font = builder.embed_font(font_bytes).expect("embed font");
+
+    builder
+        .add_tagged_text(
+            p,
+            "Valid earlier content",
+            20.0,
+            150.0,
+            "Helvetica",
+            12.0,
+            (0.0, 0.0, 0.0),
+            TagSpec {
+                role: StructRole::P,
+                alt: None,
+                actual_text: None,
+            },
+        )
+        .unwrap();
+    let before = builder.build().unwrap();
+
+    for bad_role in ["", "Role\0Injected"] {
+        let bad_tag = || TagSpec {
+            role: StructRole::Other(bad_role.into()),
+            alt: None,
+            actual_text: None,
+        };
+
+        assert!(
+            builder
+                .add_tagged_text(
+                    p,
+                    "Rejected standard text",
+                    20.0,
+                    120.0,
+                    "Helvetica",
+                    12.0,
+                    (0.0, 0.0, 0.0),
+                    bad_tag(),
+                )
+                .is_err(),
+            "add_tagged_text should reject role {bad_role:?}"
+        );
+        assert!(
+            builder
+                .add_tagged_text_embedded(
+                    p,
+                    "Rejected embedded text",
+                    20.0,
+                    100.0,
+                    font,
+                    12.0,
+                    (0.0, 0.0, 0.0),
+                    bad_tag(),
+                )
+                .is_err(),
+            "add_tagged_text_embedded should reject role {bad_role:?}"
+        );
+        assert!(
+            builder
+                .add_tagged_image(
+                    p,
+                    ImageData::Rgb8 {
+                        width: 1,
+                        height: 1,
+                        pixels: vec![255, 0, 0],
+                    },
+                    20.0,
+                    40.0,
+                    20.0,
+                    20.0,
+                    bad_tag(),
+                )
+                .is_err(),
+            "add_tagged_image should reject role {bad_role:?}"
+        );
+        assert!(
+            builder
+                .add_tagged_path(
+                    p,
+                    vec![PathSegment::Rect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 10.0,
+                        height: 10.0,
+                    }],
+                    PathStyle::default(),
+                    bad_tag(),
+                )
+                .is_err(),
+            "add_tagged_path should reject role {bad_role:?}"
+        );
+    }
+
+    // Earlier valid content must still build identically with no poisoned items.
+    let after = builder
+        .build()
+        .expect("earlier valid content must still build after rejected adds");
+    assert_eq!(
+        before, after,
+        "rejected tagged adds must not mutate builder state"
+    );
+    let doc = PdfDocument::open(after).unwrap();
+    let tree = doc.struct_tree().expect("struct tree present");
+    assert_eq!(tree.children.len(), 1);
+    assert_eq!(tree.children[0].role, StructRole::P);
+}

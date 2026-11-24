@@ -897,6 +897,7 @@ impl DocumentBuilder {
         color: (f64, f64, f64),
         tag: TagSpec,
     ) -> Result<()> {
+        validate_tag_role(&tag)?;
         if font.0 as usize >= self.embedded_fonts.len() {
             return Err(zpdf_core::Error::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -937,6 +938,7 @@ impl DocumentBuilder {
         color: (f64, f64, f64),
         tag: TagSpec,
     ) -> Result<()> {
+        validate_tag_role(&tag)?;
         // Reuse the standard-14 validation in add_text by calling it, then
         // patch in the tag.
         self.add_text(page, text, x, y, font_name, size, color)?;
@@ -960,6 +962,7 @@ impl DocumentBuilder {
         height: f64,
         tag: TagSpec,
     ) -> Result<()> {
+        validate_tag_role(&tag)?;
         self.add_image(page, image, x, y, width, height)?;
         if let Some(page_state) = self.pages.get_mut(page.0 as usize) {
             if let Some(PageItem::Image { tag: slot, .. }) = page_state.items.last_mut() {

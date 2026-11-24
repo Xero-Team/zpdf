@@ -176,35 +176,21 @@ fn multiply_highlighter_over_colored_path_image_text_and_overlapping_strokes() {
         )
         .unwrap();
 
-    // 3. Dark text row at y=80 (rendered via standard-14 Helvetica if system
-    // font is available) PLUS an opaque black bar acting as guaranteed ink
-    // under the highlight so pixel assertions are deterministic on fontless hosts.
+    // 3. Embedded checked-in geometric font (`coverage-primary.ttf`, upem=1000):
+    // every non-space ASCII glyph is a solid filled rectangle starting at x=40,
+    // y=0 with width >= 240 and height >= 420, advance = 1000. At size 40 placed
+    // at (20, 60), `'H'` (gid 41, width=401, height=652) fills [21.6..36.04] ×
+    // [60.0..86.08], leaving a white gap at x=[37..61] before `'I'`.
+    let font_bytes = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../zpdf-font/tests/fixtures/coverage-primary.ttf"
+    ))
+    .expect("read coverage-primary.ttf");
+    let font = builder
+        .embed_composite_font(font_bytes)
+        .expect("embed coverage-primary.ttf");
     builder
-        .add_text(
-            page,
-            "HIGHLIGHT",
-            20.0,
-            80.0,
-            "Helvetica",
-            20.0,
-            (0.0, 0.0, 0.0),
-        )
-        .unwrap();
-    builder
-        .add_path(
-            page,
-            vec![PathSegment::Rect {
-                x: 20.0,
-                y: 55.0,
-                width: 200.0,
-                height: 15.0,
-            }],
-            PathStyle {
-                fill: Some((0.0, 0.0, 0.0)),
-                stroke: None,
-                line_width: 1.0,
-            },
-        )
+        .add_text_embedded(page, "HIGH", 20.0, 60.0, font, 40.0, (0.0, 0.0, 0.0))
         .unwrap();
 
     // 4. First yellow Multiply highlighter stroke (1.0, 1.0, 0.0) with alpha 0.5
@@ -301,13 +287,22 @@ fn multiply_highlighter_over_colored_path_image_text_and_overlapping_strokes() {
         "highlight over magenta image",
     );
 
-    // Multiply(yellow, 0.5) over black ink (0, 0, 0): stays pure black [0, 0, 0]!
-    // (Unlike Normal alpha blending, which would wash black text out to [128, 128, 0].)
+    // Multiply(yellow, 0.5) over black glyph `'H'` interior at (29, 73): stays
+    // pure black [0, 0, 0]! (Removing the text yields [255, 255, 128]; Normal
+    // alpha blending would wash black text out to [128, 128, 0].)
     assert_rgb_near(
-        px(&rendered, 100, 62),
+        px(&rendered, 29, 73),
         [0, 0, 0],
         1,
-        "Multiply preserves black ink",
+        "Multiply preserves black glyph ink",
+    );
+    // Gap between `'H'` and `'I'` at (48, 73) has no glyph ink: single yellow
+    // Multiply highlight over white [255, 255, 128].
+    assert_rgb_near(
+        px(&rendered, 48, 73),
+        [255, 255, 128],
+        3,
+        "gap between glyphs shows highlight on white",
     );
 }
 
@@ -578,21 +573,17 @@ fn independent_poppler_renderer_matches_opacity_multiply_and_isolation() {
             60.0,
         )
         .unwrap();
+    // Embedded geometric font text (`'H'` interior at (29, 73), gap at (48, 73)).
+    let font_bytes = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../zpdf-font/tests/fixtures/coverage-primary.ttf"
+    ))
+    .expect("read coverage-primary.ttf");
+    let font = builder
+        .embed_composite_font(font_bytes)
+        .expect("embed coverage-primary.ttf");
     builder
-        .add_path(
-            page,
-            vec![PathSegment::Rect {
-                x: 20.0,
-                y: 55.0,
-                width: 200.0,
-                height: 15.0,
-            }],
-            PathStyle {
-                fill: Some((0.0, 0.0, 0.0)),
-                stroke: None,
-                line_width: 1.0,
-            },
-        )
+        .add_text_embedded(page, "HIGH", 20.0, 60.0, font, 40.0, (0.0, 0.0, 0.0))
         .unwrap();
     // Overlapping yellow Multiply highlighters (alpha 0.5).
     let highlight = PathPaintOptions::new()
@@ -670,15 +661,24 @@ fn independent_poppler_renderer_matches_opacity_multiply_and_isolation() {
     let pdf = builder.build().unwrap();
     let zpdf_img = render_page(pdf.clone(), 0);
 
-    let tmp_pdf =
-        std::env::temp_dir().join(format!("zpdf-issue196-poppler-{}.pdf", std::process::id()));
-    std::fs::write(&tmp_pdf, &pdf).expect("write temp pdf");
-    let out = std::process::Command::new("pdftoppm")
+    let mut child = std::process::Command::new("pdftoppm")
         .args(["-r", "72", "-f", "1", "-l", "1"])
-        .arg(&tmp_pdf)
-        .output()
-        .expect("run pdftoppm");
-    let _ = std::fs::remove_file(&tmp_pdf);
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn pdftoppm");
+    let mut stdin = child.stdin.take().expect("pdftoppm stdin");
+    let out = std::thread::scope(|s| {
+        let writer = s.spawn(move || {
+            use std::io::Write;
+            stdin.write_all(&pdf).expect("write pdf to pdftoppm stdin");
+            drop(stdin);
+        });
+        let out = child.wait_with_output().expect("wait for pdftoppm");
+        writer.join().expect("stdin writer thread");
+        out
+    });
     assert!(
         out.status.success(),
         "pdftoppm failed: {}",
@@ -720,13 +720,29 @@ fn independent_poppler_renderer_matches_opacity_multiply_and_isolation() {
         [rgb[off], rgb[off + 1], rgb[off + 2]]
     };
 
+    // Verify both renderers preserve black glyph ink under Multiply (and keep
+    // the adjacent inter-glyph gap at yellow highlight over white).
+    assert_rgb_near(
+        px(&zpdf_img, 29, 73),
+        [0, 0, 0],
+        1,
+        "zpdf Multiply preserves black glyph ink",
+    );
+    assert_rgb_near(
+        poppler_px(29, 73),
+        [0, 0, 0],
+        1,
+        "poppler Multiply preserves black glyph ink",
+    );
+
     for (label, x, pdf_y) in [
         ("single highlight on white", 30, 115),
         ("double highlight on white", 95, 115),
         ("single highlight on cyan", 40, 155),
         ("double highlight on cyan", 95, 155),
         ("highlight over magenta image", 190, 155),
-        ("Multiply preserves black ink", 100, 62),
+        ("Multiply preserves black glyph ink", 29, 73),
+        ("inter-glyph gap shows highlight on white", 48, 73),
         ("post-highlight opaque yellow over blue", 50, 22),
     ] {
         let actual_zpdf = px(&zpdf_img, x, pdf_y);
