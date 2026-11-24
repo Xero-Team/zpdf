@@ -143,6 +143,12 @@ enum Frame {
     Blend {
         open: bool,
         isolates: bool,
+        blend_mode: BlendMode,
+        isolated: bool,
+        alpha: f32,
+        mask_id: Option<u32>,
+        prev_out: String,
+        prev_pending: Option<PendingBackdrop>,
     },
 }
 
@@ -248,25 +254,52 @@ struct PatternDefKey {
 }
 
 /// Cap on separate `(overlap_copy × blend_segment)` SVG passes for one
-/// overlapping backdrop-dependent tiling fill or stroke.
+/// overlapping backdrop-dependent tiling fill or stroke before collapsing into
+/// the order-preserving two-tile affine filter fallback.
 const MAX_SVG_TILING_BLEND_PASSES: usize = 1024;
-/// Cap on sequential page-backdrop `<g id="b...">` snapshots when non-pattern
-/// draws interleave translucent multi-pass tiling patterns. Each snapshot
-/// references the prior `<g id="b...">` once (`SourceGraphic` of a linear
-/// `<filter>`), so chaining is `O(N)` with zero exponential `<use>` blowup.
+/// Cap on per-copy step evaluations inside the SVG affine tile collapse
+/// (`f(0)`, `f(1)`, `a_tile`), matching the CPU/GPU affine tile budget.
+const MAX_AFFINE_TILE_PASSES: usize = 4096;
+/// Cap on sequential page-backdrop `<g id="b...">` snapshots when filter
+/// batches reach [`MAX_BACKDROP_FILTER_PASSES`]. Normal draws and blend groups
+/// fold directly into the open filter batch as `Overlay` / `BlendOverlay` steps,
+/// keeping almost all pages at a single depth-1 snapshot.
 const MAX_BACKDROP_SNAPSHOTS: usize = 64;
-/// Cap on total `<feBlend>`/`<feComposite>` pattern passes batched inside a
-/// single SVG `<filter>` chain.
+/// Cap on total filter steps batched inside a single SVG `<filter>` chain.
 const MAX_BACKDROP_FILTER_PASSES: usize = 2048;
 
-struct BackdropBlendItem {
-    passes: Vec<(u32, BlendMode)>,
-    shape_id: u32,
+enum TilingPassPlan {
+    Passes(Vec<(u32, BlendMode)>),
+    Affine { k_id: u32, mk_id: u32, a_id: u32 },
+}
+
+enum BackdropStep {
+    /// Intervening Normal-blended content wrapped in `<g id="ov{id}">` and
+    /// composited with Porter-Duff `over` onto the running filter backdrop.
+    Overlay(u32),
+    /// Intervening non-Normal blended element/group wrapped in `<g id="ov{id}">`
+    /// and composited via `<feBlend mode="..."/>` onto the running backdrop.
+    BlendOverlay { ov_id: u32, blend_mode: BlendMode },
+    /// Multi-pass tiling pattern evaluated against the running backdrop and
+    /// mixed once through `<g id="s{shape_id}">`.
+    MultiPass {
+        passes: Vec<(u32, BlendMode)>,
+        shape_id: u32,
+    },
+    /// Order-preserving affine collapse `f(B) = K + (f(1) - K) * B` evaluated
+    /// from black-seeded `p{k_id}`, white-seeded `p{mk_id}`, and alpha-coverage
+    /// `p{a_id}`, mixed once through `<g id="s{shape_id}">`.
+    Affine {
+        k_id: u32,
+        mk_id: u32,
+        a_id: u32,
+        shape_id: u32,
+    },
 }
 
 struct PendingBackdrop {
     bg_id: u32,
-    items: Vec<BackdropBlendItem>,
+    steps: Vec<BackdropStep>,
     total_passes: usize,
 }
 
@@ -398,15 +431,9 @@ impl<'a> SvgWriter<'a> {
                     self.emit_stroke(path, style, paint, *alpha, depth);
                 }
                 RenderCommand::DrawGlyphRun(run) => {
-                    if depth == 0 && self.blend_depth == 0 {
-                        self.flush_pending_backdrop();
-                    }
-                    self.emit_glyph_run(run);
+                    self.emit_glyph_run(run, depth);
                 }
                 RenderCommand::DrawImage(draw) => {
-                    if depth == 0 && self.blend_depth == 0 {
-                        self.flush_pending_backdrop();
-                    }
                     self.emit_image(draw);
                 }
                 RenderCommand::PushClip { path, rule } => {
@@ -444,33 +471,77 @@ impl<'a> SvgWriter<'a> {
                     mask,
                     ..
                 } => {
-                    if depth == 0 && self.blend_depth == 0 {
-                        self.flush_pending_backdrop();
-                    }
                     if *knockout {
                         self.warn_knockout();
                     }
+                    let eff_alpha = if alpha.is_finite() {
+                        alpha.clamp(0.0, 1.0)
+                    } else {
+                        1.0
+                    };
+                    let mask_id = mask
+                        .as_ref()
+                        .and_then(|m| self.emit_soft_mask_def(m, depth));
+                    let blend = blend_css(*blend_mode);
                     let isolates =
-                        self.open_blend_group(*blend_mode, *isolated, *alpha, mask.as_ref(), depth);
-                    self.blend_depth += 1;
-                    if isolates {
+                        *isolated || eff_alpha < 1.0 || blend.is_some() || mask_id.is_some();
+                    if !isolates {
+                        // Full-opacity, non-isolated Normal group with no active soft mask
+                        // is a transparent passthrough: keep the active canvas backdrop and
+                        // `blend_depth` unchanged so nested translucent patterns preserve
+                        // the live backdrop instead of isolating.
+                        frames.push(Frame::Blend {
+                            open: false,
+                            isolates: false,
+                            blend_mode: BlendMode::Normal,
+                            isolated: false,
+                            alpha: 1.0,
+                            mask_id: None,
+                            prev_out: String::new(),
+                            prev_pending: None,
+                        });
+                    } else {
+                        let prev_out = std::mem::take(&mut self.out);
+                        let prev_pending = self.pending_backdrop.take();
+                        self.blend_depth += 1;
                         self.isolated_depth += 1;
+                        frames.push(Frame::Blend {
+                            open: true,
+                            isolates: true,
+                            blend_mode: *blend_mode,
+                            isolated: *isolated,
+                            alpha: eff_alpha,
+                            mask_id,
+                            prev_out,
+                            prev_pending,
+                        });
                     }
-                    frames.push(Frame::Blend {
-                        open: true,
-                        isolates,
-                    });
                 }
                 RenderCommand::PopBlendGroup => match frames.last() {
-                    Some(Frame::Blend { open, isolates }) => {
-                        if *open {
-                            self.out.push_str("</g>\n");
-                            self.blend_depth = self.blend_depth.saturating_sub(1);
-                            if *isolates {
-                                self.isolated_depth = self.isolated_depth.saturating_sub(1);
-                            }
+                    Some(Frame::Blend { .. }) => {
+                        if let Some(Frame::Blend {
+                            open,
+                            isolates,
+                            blend_mode,
+                            isolated,
+                            alpha,
+                            mask_id,
+                            prev_out,
+                            prev_pending,
+                        }) = frames.pop()
+                        {
+                            self.close_blend_group(
+                                open,
+                                isolates,
+                                blend_mode,
+                                isolated,
+                                alpha,
+                                mask_id,
+                                prev_out,
+                                prev_pending,
+                                depth,
+                            );
                         }
-                        frames.pop();
                     }
                     _ => tracing::warn!("unbalanced PopBlendGroup ignored"),
                 },
@@ -479,14 +550,27 @@ impl<'a> SvgWriter<'a> {
         // A malformed stream can leave frames unclosed; keep the SVG well-formed.
         for frame in frames.drain(..).rev() {
             match frame {
-                Frame::Blend { open, isolates } => {
-                    if open {
-                        self.out.push_str("</g>\n");
-                        self.blend_depth = self.blend_depth.saturating_sub(1);
-                        if isolates {
-                            self.isolated_depth = self.isolated_depth.saturating_sub(1);
-                        }
-                    }
+                Frame::Blend {
+                    open,
+                    isolates,
+                    blend_mode,
+                    isolated,
+                    alpha,
+                    mask_id,
+                    prev_out,
+                    prev_pending,
+                } => {
+                    self.close_blend_group(
+                        open,
+                        isolates,
+                        blend_mode,
+                        isolated,
+                        alpha,
+                        mask_id,
+                        prev_out,
+                        prev_pending,
+                        depth,
+                    );
                 }
                 Frame::Clip {
                     prev_clip,
@@ -719,6 +803,7 @@ impl<'a> SvgWriter<'a> {
         };
 
         let saved_out = std::mem::take(&mut self.out);
+        let saved_pending = self.pending_backdrop.take();
         let saved_x0 = self.x0;
         let saved_y1 = self.y1;
         let saved_scale = self.scale;
@@ -762,7 +847,9 @@ impl<'a> SvgWriter<'a> {
             }
         }
 
+        self.flush_pending_backdrop();
         let body = std::mem::replace(&mut self.out, saved_out);
+        self.pending_backdrop = saved_pending;
         self.x0 = saved_x0;
         self.y1 = saved_y1;
         self.scale = saved_scale;
@@ -895,6 +982,7 @@ impl<'a> SvgWriter<'a> {
         }
 
         let saved_out = std::mem::take(&mut self.out);
+        let saved_pending = self.pending_backdrop.take();
         let saved_x0 = self.x0;
         let saved_y1 = self.y1;
         let saved_scale = self.scale;
@@ -925,7 +1013,9 @@ impl<'a> SvgWriter<'a> {
             }
         }
 
+        self.flush_pending_backdrop();
         let body = std::mem::replace(&mut self.out, saved_out);
+        self.pending_backdrop = saved_pending;
         self.x0 = saved_x0;
         self.y1 = saved_y1;
         self.scale = saved_scale;
@@ -939,19 +1029,227 @@ impl<'a> SvgWriter<'a> {
         Some(id)
     }
 
-    /// Resolve a tiling pattern into one or more `(pattern_id, BlendMode)`
-    /// passes. Backdrop-independent cells reuse a single `<pattern>` with
-    /// `Normal`; backdrop-dependent cells collapse associative all-`Multiply`
-    /// or all-`Screen` multi-pass cells on an opaque backdrop into one
-    /// identity-seeded `<pattern>`, and otherwise emit per-segment (and
-    /// per-overlap copy in painter's order) `<pattern>` defs so the enclosing
-    /// path composites directly against the live SVG page backdrop
-    /// (ISO 32000-1 §11.6.7).
-    fn emit_tiling_passes(
+    #[allow(clippy::too_many_arguments)]
+    fn emit_affine_steps(
+        &mut self,
+        steps: &[zpdf_display_list::TilingBlendStep],
+        tiling: &zpdf_display_list::TilingPattern,
+        di: i64,
+        dj: i64,
+        alpha_only: bool,
+        remaining: &mut usize,
+        depth: u8,
+    ) {
+        for step in steps {
+            if *remaining == 0 || self.check_over_budget() {
+                break;
+            }
+            match step {
+                zpdf_display_list::TilingBlendStep::Segment(seg) => {
+                    if !seg.intersects_period(tiling, di, dj) {
+                        continue;
+                    }
+                    *remaining -= 1;
+                    if alpha_only {
+                        self.emit_commands(&seg.commands.commands, depth + 1);
+                    } else if let Some(css_name) = blend_css(seg.blend_mode) {
+                        let _ = writeln!(
+                            self.out,
+                            "<g style=\"mix-blend-mode:{css_name};isolation:isolate;\">"
+                        );
+                        self.emit_commands(&seg.commands.commands, depth + 1);
+                        self.out.push_str("</g>\n");
+                    } else {
+                        self.emit_commands(&seg.commands.commands, depth + 1);
+                    }
+                }
+                zpdf_display_list::TilingBlendStep::OpacityGroup {
+                    alpha,
+                    mask,
+                    steps: inner,
+                } => {
+                    if !zpdf_display_list::TilingBlendStep::any_intersects_period(
+                        inner, tiling, di, dj,
+                    ) {
+                        continue;
+                    }
+                    let a = if alpha.is_finite() {
+                        alpha.clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    if a <= 0.0 {
+                        continue;
+                    }
+                    if alpha_only {
+                        let mask_id = mask.as_ref().map(|m_seg| {
+                            let mid = self.fresh_id();
+                            let saved_out = std::mem::take(&mut self.out);
+                            self.emit_commands(&m_seg.commands.commands, depth + 1);
+                            let mask_body = std::mem::replace(&mut self.out, saved_out);
+                            let _ = write!(
+                                self.defs,
+                                "<mask id=\"m{mid}\" maskUnits=\"userSpaceOnUse\">\n{mask_body}</mask>\n"
+                            );
+                            mid
+                        });
+                        self.out.push_str("<g opacity=\"");
+                        push_num(&mut self.out, a as f64);
+                        if let Some(mid) = mask_id {
+                            let _ = write!(self.out, "\" mask=\"url(#m{mid})");
+                        }
+                        self.out.push_str("\">\n");
+                        self.emit_affine_steps(inner, tiling, di, dj, true, remaining, depth);
+                        self.out.push_str("</g>\n");
+                    } else {
+                        self.emit_affine_steps(inner, tiling, di, dj, false, remaining, depth);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Order-preserving bounded fallback for overlapping backdrop-dependent
+    /// cells exceeding [`MAX_SVG_TILING_BLEND_PASSES`]: evaluate all `(dj, di)`
+    /// overlap copies in exact copy order and all intersecting steps in exact
+    /// draw order onto black-seeded (`p_k = f(0)`), white-seeded (`p_mk = f(1)`),
+    /// and transparent coverage (`p_a`) `<pattern>` defs so the page `<filter>`
+    /// computes `f(B) = K + (f(1) - K) * B` without reordering copies or steps.
+    fn emit_tiling_pattern_def_affine(
+        &mut self,
+        tiling: &zpdf_display_list::TilingPattern,
+        steps: &[zpdf_display_list::TilingBlendStep],
+        depth: u8,
+    ) -> Option<(u32, u32, u32)> {
+        if depth >= MAX_MASK_DEPTH || steps.is_empty() {
+            return None;
+        }
+        let g = self.compute_tiling_pattern_geometry(tiling)?;
+
+        let make_key = |segment_index: usize| PatternDefKey {
+            commands: std::sync::Arc::as_ptr(&tiling.commands),
+            segment_index,
+            overlap_shift: None,
+            copy_blend_mode: BlendMode::Normal as u8,
+            bbox: [g.bx0, g.by0, g.bbox_x1, g.bbox_y1].map(f64::to_bits),
+            steps: [g.x_step, g.y_step].map(f64::to_bits),
+            tile_dims: [g.tile_w, g.tile_h].map(f64::to_bits),
+            matrix: [
+                g.matrix.a, g.matrix.b, g.matrix.c, g.matrix.d, g.matrix.e, g.matrix.f,
+            ]
+            .map(f64::to_bits),
+            depth,
+        };
+        let key_k = make_key(usize::MAX - 1);
+        let key_mk = make_key(usize::MAX - 2);
+        let key_a = make_key(usize::MAX - 3);
+        if let (Some(&(_, k_id)), Some(&(_, mk_id)), Some(&(_, a_id))) = (
+            self.pattern_defs.get(&key_k),
+            self.pattern_defs.get(&key_mk),
+            self.pattern_defs.get(&key_a),
+        ) {
+            return Some((k_id, mk_id, a_id));
+        }
+
+        let k_id = self.fresh_id();
+        let mk_id = self.fresh_id();
+        let a_id = self.fresh_id();
+        self.pattern_defs
+            .insert(key_k, (std::sync::Arc::clone(&tiling.commands), k_id));
+        self.pattern_defs
+            .insert(key_mk, (std::sync::Arc::clone(&tiling.commands), mk_id));
+        self.pattern_defs
+            .insert(key_a, (std::sync::Arc::clone(&tiling.commands), a_id));
+
+        let overlap = tiling.overlap_copy_ranges();
+        let saved_out = std::mem::take(&mut self.out);
+        let saved_pending = self.pending_backdrop.take();
+        let saved_x0 = self.x0;
+        let saved_y1 = self.y1;
+        let saved_scale = self.scale;
+        let saved_w = self.page_width;
+        let saved_h = self.page_height;
+        let saved_blend_depth = std::mem::replace(&mut self.blend_depth, 0);
+        let saved_isolated_depth = std::mem::replace(&mut self.isolated_depth, 0);
+        let (saved_clip, saved_mask) = (self.clip.take(), self.stroke_mask.take());
+        self.scale = g.cell_scale;
+        self.page_width = g.tile_w;
+        self.page_height = g.tile_h;
+
+        let mut remaining = MAX_AFFINE_TILE_PASSES;
+        for dj in overlap.dj.clone() {
+            for di in overlap.di.clone() {
+                if remaining == 0 || self.check_over_budget() {
+                    break;
+                }
+                if !zpdf_display_list::TilingBlendStep::any_intersects_period(steps, tiling, di, dj)
+                {
+                    continue;
+                }
+                self.x0 = g.bx0 - di as f64 * g.x_step;
+                self.y1 = g.by0 + g.abs_y - dj as f64 * g.y_step;
+                self.emit_affine_steps(steps, tiling, di, dj, false, &mut remaining, depth);
+            }
+        }
+        self.flush_pending_backdrop();
+        let blended_steps = std::mem::take(&mut self.out);
+
+        let mut remaining_a = MAX_AFFINE_TILE_PASSES;
+        for dj in overlap.dj.clone() {
+            for di in overlap.di.clone() {
+                if remaining_a == 0 || self.check_over_budget() {
+                    break;
+                }
+                if !zpdf_display_list::TilingBlendStep::any_intersects_period(steps, tiling, di, dj)
+                {
+                    continue;
+                }
+                self.x0 = g.bx0 - di as f64 * g.x_step;
+                self.y1 = g.by0 + g.abs_y - dj as f64 * g.y_step;
+                self.emit_affine_steps(steps, tiling, di, dj, true, &mut remaining_a, depth);
+            }
+        }
+        self.flush_pending_backdrop();
+        let body_a = std::mem::replace(&mut self.out, saved_out);
+        self.pending_backdrop = saved_pending;
+        self.x0 = saved_x0;
+        self.y1 = saved_y1;
+        self.scale = saved_scale;
+        self.page_width = saved_w;
+        self.page_height = saved_h;
+        self.blend_depth = saved_blend_depth;
+        self.isolated_depth = saved_isolated_depth;
+        self.clip = saved_clip;
+        self.stroke_mask = saved_mask;
+
+        let mut seed_prefix = String::from("<rect x=\"0\" y=\"0\" width=\"");
+        push_num(&mut seed_prefix, g.tile_w);
+        seed_prefix.push_str("\" height=\"");
+        push_num(&mut seed_prefix, g.tile_h);
+        let mut body_k = String::with_capacity(seed_prefix.len() + blended_steps.len() + 24);
+        body_k.push_str(&seed_prefix);
+        body_k.push_str("\" fill=\"#000000\"/>\n");
+        body_k.push_str(&blended_steps);
+
+        let mut body_mk = String::with_capacity(seed_prefix.len() + blended_steps.len() + 24);
+        body_mk.push_str(&seed_prefix);
+        body_mk.push_str("\" fill=\"#ffffff\"/>\n");
+        body_mk.push_str(&blended_steps);
+
+        self.write_pattern_def(k_id, &g, &body_k);
+        self.write_pattern_def(mk_id, &g, &body_mk);
+        self.write_pattern_def(a_id, &g, &body_a);
+        Some((k_id, mk_id, a_id))
+    }
+
+    /// Resolve a tiling pattern into either per-segment `(pattern_id, BlendMode)`
+    /// passes or an order-preserving affine collapse `(k_id, mk_id, a_id)` when
+    /// overlapping copies exceed [`MAX_SVG_TILING_BLEND_PASSES`].
+    fn emit_tiling_plan(
         &mut self,
         tiling: &zpdf_display_list::TilingPattern,
         depth: u8,
-    ) -> Vec<(u32, BlendMode)> {
+    ) -> TilingPassPlan {
         if self.tiling_is_backdrop_dependent(tiling) {
             if let Some(steps) = tiling.blend_steps() {
                 let overlap = tiling.overlap_copy_ranges();
@@ -982,7 +1280,7 @@ impl<'a> SvgWriter<'a> {
                         if let Some(id) =
                             self.emit_tiling_pattern_def_collapsed(tiling, &steps, mode, depth)
                         {
-                            return vec![(id, mode)];
+                            return TilingPassPlan::Passes(vec![(id, mode)]);
                         }
                     }
                 }
@@ -1018,6 +1316,13 @@ impl<'a> SvgWriter<'a> {
                             }
                         }
                         if total_passes > MAX_SVG_TILING_BLEND_PASSES {
+                            if depth == 0 {
+                                if let Some((k_id, mk_id, a_id)) =
+                                    self.emit_tiling_pattern_def_affine(tiling, &steps, depth)
+                                {
+                                    return TilingPassPlan::Affine { k_id, mk_id, a_id };
+                                }
+                            }
                             tracing::warn!(
                                 total_passes,
                                 limit = MAX_SVG_TILING_BLEND_PASSES,
@@ -1075,40 +1380,40 @@ impl<'a> SvgWriter<'a> {
                             }
                         }
                     }
-                    return passes;
+                    return TilingPassPlan::Passes(passes);
                 }
             }
             tracing::warn!(
                 "svg tiling pattern has unsegmentable backdrop-dependent marks; falling back to isolated pattern"
             );
         }
-        self.emit_tiling_pattern_def_for(
-            tiling,
-            &tiling.commands,
-            0,
-            None,
-            BlendMode::Normal,
-            None,
-            depth,
+        TilingPassPlan::Passes(
+            self.emit_tiling_pattern_def_for(
+                tiling,
+                &tiling.commands,
+                0,
+                None,
+                BlendMode::Normal,
+                None,
+                depth,
+            )
+            .map(|id| vec![(id, BlendMode::Normal)])
+            .unwrap_or_default(),
         )
-        .map(|id| vec![(id, BlendMode::Normal)])
-        .unwrap_or_default()
     }
 
-    /// Flush any open batch of translucent multi-pass tiling items into
-    /// `self.out` using a single linear premultiplied sRGB SVG `<filter>`
-    /// pipeline (`<feBlend>` / `<feComposite>` passes chained sequentially over
-    /// `SourceGraphic` = `#b{bg_id}`, each mixed with `R * w + B * (1 - w)`).
-    /// Handles both disjoint and overlapping fills/strokes in exact painter's
-    /// order, preserves live backdrop colors and translucent backdrop alpha in
-    /// unpainted gaps, and references `#b{bg_id}` only ONCE (zero exponential
-    /// `<use>` expansion).
+    /// Flush any open batch of backdrop-dependent filter steps into `self.out`
+    /// (preserving any trailing elements already accumulated in `self.out` in
+    /// exact painter's order). References `#b{bg_id}` only ONCE (zero
+    /// exponential `<use>` expansion).
     fn flush_pending_backdrop(&mut self) {
         let Some(pending) = self.pending_backdrop.take() else {
             return;
         };
-        if pending.items.is_empty() {
+        let trailing = std::mem::take(&mut self.out);
+        if pending.steps.is_empty() {
             let _ = writeln!(self.out, "<use href=\"#b{}\"/>", pending.bg_id);
+            self.out.push_str(&trailing);
             return;
         }
         let w = self.page_width;
@@ -1117,16 +1422,32 @@ impl<'a> SvgWriter<'a> {
         // Emit one reusable `<rect id="pr{rid}" ... fill="url(#p{pat_id})"/>`
         // per distinct pattern id referenced in this filter batch.
         let mut pat_rects: HashMap<u32, u32> = HashMap::new();
-        for item in &pending.items {
-            for &(pat_id, _) in &item.passes {
-                if let std::collections::hash_map::Entry::Vacant(e) = pat_rects.entry(pat_id) {
-                    let rid = self.fresh_id();
-                    let _ = write!(self.defs, "<rect id=\"pr{rid}\" x=\"0\" y=\"0\" width=\"");
-                    push_num(&mut self.defs, w);
-                    self.defs.push_str("\" height=\"");
-                    push_num(&mut self.defs, h);
-                    let _ = writeln!(self.defs, "\" fill=\"url(#p{pat_id})\"/>");
-                    e.insert(rid);
+        let mut register_pat = |defs: &mut String, next_id: &mut u32, pat_id: u32| {
+            if let std::collections::hash_map::Entry::Vacant(e) = pat_rects.entry(pat_id) {
+                *next_id += 1;
+                let rid = *next_id;
+                let _ = write!(defs, "<rect id=\"pr{rid}\" x=\"0\" y=\"0\" width=\"");
+                push_num(defs, w);
+                defs.push_str("\" height=\"");
+                push_num(defs, h);
+                let _ = writeln!(defs, "\" fill=\"url(#p{pat_id})\"/>");
+                e.insert(rid);
+            }
+        };
+        for step in &pending.steps {
+            match step {
+                BackdropStep::Overlay(_) | BackdropStep::BlendOverlay { .. } => {}
+                BackdropStep::MultiPass { passes, .. } => {
+                    for &(pat_id, _) in passes {
+                        register_pat(&mut self.defs, &mut self.next_id, pat_id);
+                    }
+                }
+                BackdropStep::Affine {
+                    k_id, mk_id, a_id, ..
+                } => {
+                    register_pat(&mut self.defs, &mut self.next_id, *k_id);
+                    register_pat(&mut self.defs, &mut self.next_id, *mk_id);
+                    register_pat(&mut self.defs, &mut self.next_id, *a_id);
                 }
             }
         }
@@ -1143,59 +1464,192 @@ impl<'a> SvgWriter<'a> {
             .push_str("\" color-interpolation-filters=\"sRGB\">\n");
 
         let mut cur = String::from("SourceGraphic");
-        for (idx, item) in pending.items.iter().enumerate() {
-            let mut acc = cur.clone();
-            for (p_idx, &(pat_id, blend_mode)) in item.passes.iter().enumerate() {
-                let rid = pat_rects[&pat_id];
-                let pat_res = format!("p{idx}_{p_idx}");
-                let next_acc = format!("a{idx}_{p_idx}");
-                let _ = write!(
-                    self.defs,
-                    "<feImage href=\"#pr{rid}\" x=\"0\" y=\"0\" width=\""
-                );
-                push_num(&mut self.defs, w);
-                self.defs.push_str("\" height=\"");
-                push_num(&mut self.defs, h);
-                let _ = writeln!(self.defs, "\" result=\"{pat_res}\"/>");
-                if let Some(name) = blend_css(blend_mode) {
+        for (idx, step) in pending.steps.iter().enumerate() {
+            match step {
+                BackdropStep::Overlay(ov_id) => {
+                    let ov_res = format!("ov{idx}");
+                    let next_cur = format!("c{idx}");
+                    let _ = write!(
+                        self.defs,
+                        "<feImage href=\"#ov{ov_id}\" x=\"0\" y=\"0\" width=\""
+                    );
+                    push_num(&mut self.defs, w);
+                    self.defs.push_str("\" height=\"");
+                    push_num(&mut self.defs, h);
+                    let _ = writeln!(self.defs, "\" result=\"{ov_res}\"/>");
                     let _ = writeln!(
                         self.defs,
-                        "<feBlend in=\"{pat_res}\" in2=\"{acc}\" mode=\"{name}\" result=\"{next_acc}\"/>"
+                        "<feComposite in=\"{ov_res}\" in2=\"{cur}\" operator=\"over\" result=\"{next_cur}\"/>"
                     );
-                } else {
-                    let _ = writeln!(
-                        self.defs,
-                        "<feComposite in=\"{pat_res}\" in2=\"{acc}\" operator=\"over\" result=\"{next_acc}\"/>"
-                    );
+                    cur = next_cur;
                 }
-                acc = next_acc;
+                BackdropStep::BlendOverlay { ov_id, blend_mode } => {
+                    let ov_res = format!("ov{idx}");
+                    let next_cur = format!("c{idx}");
+                    let _ = write!(
+                        self.defs,
+                        "<feImage href=\"#ov{ov_id}\" x=\"0\" y=\"0\" width=\""
+                    );
+                    push_num(&mut self.defs, w);
+                    self.defs.push_str("\" height=\"");
+                    push_num(&mut self.defs, h);
+                    let _ = writeln!(self.defs, "\" result=\"{ov_res}\"/>");
+                    if let Some(name) = blend_css(*blend_mode) {
+                        let _ = writeln!(
+                            self.defs,
+                            "<feBlend in=\"{ov_res}\" in2=\"{cur}\" mode=\"{name}\" result=\"{next_cur}\"/>"
+                        );
+                    } else {
+                        let _ = writeln!(
+                            self.defs,
+                            "<feComposite in=\"{ov_res}\" in2=\"{cur}\" operator=\"over\" result=\"{next_cur}\"/>"
+                        );
+                    }
+                    cur = next_cur;
+                }
+                BackdropStep::MultiPass { passes, shape_id } => {
+                    let mut acc = cur.clone();
+                    for (p_idx, &(pat_id, blend_mode)) in passes.iter().enumerate() {
+                        let rid = pat_rects[&pat_id];
+                        let pat_res = format!("p{idx}_{p_idx}");
+                        let next_acc = format!("a{idx}_{p_idx}");
+                        let _ = write!(
+                            self.defs,
+                            "<feImage href=\"#pr{rid}\" x=\"0\" y=\"0\" width=\""
+                        );
+                        push_num(&mut self.defs, w);
+                        self.defs.push_str("\" height=\"");
+                        push_num(&mut self.defs, h);
+                        let _ = writeln!(self.defs, "\" result=\"{pat_res}\"/>");
+                        if let Some(name) = blend_css(blend_mode) {
+                            let _ = writeln!(
+                                self.defs,
+                                "<feBlend in=\"{pat_res}\" in2=\"{acc}\" mode=\"{name}\" result=\"{next_acc}\"/>"
+                            );
+                        } else {
+                            let _ = writeln!(
+                                self.defs,
+                                "<feComposite in=\"{pat_res}\" in2=\"{acc}\" operator=\"over\" result=\"{next_acc}\"/>"
+                            );
+                        }
+                        acc = next_acc;
+                    }
+                    let wt_res = format!("w{idx}");
+                    let rw_res = format!("rw{idx}");
+                    let bw_res = format!("bw{idx}");
+                    let next_cur = format!("c{idx}");
+                    let _ = write!(
+                        self.defs,
+                        "<feImage href=\"#s{shape_id}\" x=\"0\" y=\"0\" width=\""
+                    );
+                    push_num(&mut self.defs, w);
+                    self.defs.push_str("\" height=\"");
+                    push_num(&mut self.defs, h);
+                    let _ = writeln!(self.defs, "\" result=\"{wt_res}\"/>");
+                    let _ = writeln!(
+                        self.defs,
+                        "<feComposite in=\"{acc}\" in2=\"{wt_res}\" operator=\"in\" result=\"{rw_res}\"/>"
+                    );
+                    let _ = writeln!(
+                        self.defs,
+                        "<feComposite in=\"{cur}\" in2=\"{wt_res}\" operator=\"out\" result=\"{bw_res}\"/>"
+                    );
+                    let _ = writeln!(
+                        self.defs,
+                        "<feComposite in=\"{rw_res}\" in2=\"{bw_res}\" operator=\"arithmetic\" k1=\"0\" k2=\"1\" k3=\"1\" k4=\"0\" result=\"{next_cur}\"/>"
+                    );
+                    cur = next_cur;
+                }
+                BackdropStep::Affine {
+                    k_id,
+                    mk_id,
+                    a_id,
+                    shape_id,
+                } => {
+                    let rk = pat_rects[k_id];
+                    let rmk = pat_rects[mk_id];
+                    let ra = pat_rects[a_id];
+                    let pk = format!("pk{idx}");
+                    let pmk = format!("pmk{idx}");
+                    let pa = format!("pa{idx}");
+                    let pkinv = format!("pki{idx}");
+                    let pm = format!("pm{idx}");
+                    let mb = format!("mb{idx}");
+                    let res = format!("ar{idx}");
+                    let panz = format!("pan{idx}");
+                    let wt_res = format!("w{idx}");
+                    let wte_res = format!("we{idx}");
+                    let rw_res = format!("rw{idx}");
+                    let bw_res = format!("bw{idx}");
+                    let next_cur = format!("c{idx}");
+                    for (rid, out_name) in [(rk, &pk), (rmk, &pmk), (ra, &pa)] {
+                        let _ = write!(
+                            self.defs,
+                            "<feImage href=\"#pr{rid}\" x=\"0\" y=\"0\" width=\""
+                        );
+                        push_num(&mut self.defs, w);
+                        self.defs.push_str("\" height=\"");
+                        push_num(&mut self.defs, h);
+                        let _ = writeln!(self.defs, "\" result=\"{out_name}\"/>");
+                    }
+                    // Keep alpha = 1.0 throughout M = (M + K) + (1 - K) - 1 so
+                    // premultiplied filter buffers never clamp RGB against alpha = 0.
+                    let _ = writeln!(
+                        self.defs,
+                        "<feComponentTransfer in=\"{pk}\" result=\"{pkinv}\">\
+                         <feFuncR type=\"linear\" slope=\"-1\" intercept=\"1\"/>\
+                         <feFuncG type=\"linear\" slope=\"-1\" intercept=\"1\"/>\
+                         <feFuncB type=\"linear\" slope=\"-1\" intercept=\"1\"/>\
+                         </feComponentTransfer>"
+                    );
+                    let _ = writeln!(
+                        self.defs,
+                        "<feComposite in=\"{pmk}\" in2=\"{pkinv}\" operator=\"arithmetic\" k1=\"0\" k2=\"1\" k3=\"1\" k4=\"-1\" result=\"{pm}\"/>"
+                    );
+                    let _ = writeln!(
+                        self.defs,
+                        "<feComposite in=\"{pm}\" in2=\"{cur}\" operator=\"arithmetic\" k1=\"1\" k2=\"0\" k3=\"0\" k4=\"0\" result=\"{mb}\"/>"
+                    );
+                    let _ = writeln!(
+                        self.defs,
+                        "<feComposite in=\"{mb}\" in2=\"{pk}\" operator=\"arithmetic\" k1=\"0\" k2=\"1\" k3=\"1\" k4=\"0\" result=\"{res}\"/>"
+                    );
+                    // Convert cell coverage alpha into a binary painted-pixel mask so
+                    // unpainted gaps (pa.a == 0) leave `cur` untouched while painted
+                    // pixels preserve `res` without double-attenuating semi-transparent marks.
+                    let _ = writeln!(
+                        self.defs,
+                        "<feComponentTransfer in=\"{pa}\" result=\"{panz}\">\
+                         <feFuncA type=\"linear\" slope=\"255\" intercept=\"0\"/>\
+                         </feComponentTransfer>"
+                    );
+                    let _ = write!(
+                        self.defs,
+                        "<feImage href=\"#s{shape_id}\" x=\"0\" y=\"0\" width=\""
+                    );
+                    push_num(&mut self.defs, w);
+                    self.defs.push_str("\" height=\"");
+                    push_num(&mut self.defs, h);
+                    let _ = writeln!(self.defs, "\" result=\"{wt_res}\"/>");
+                    let _ = writeln!(
+                        self.defs,
+                        "<feComposite in=\"{wt_res}\" in2=\"{panz}\" operator=\"in\" result=\"{wte_res}\"/>"
+                    );
+                    let _ = writeln!(
+                        self.defs,
+                        "<feComposite in=\"{res}\" in2=\"{wte_res}\" operator=\"in\" result=\"{rw_res}\"/>"
+                    );
+                    let _ = writeln!(
+                        self.defs,
+                        "<feComposite in=\"{cur}\" in2=\"{wte_res}\" operator=\"out\" result=\"{bw_res}\"/>"
+                    );
+                    let _ = writeln!(
+                        self.defs,
+                        "<feComposite in=\"{rw_res}\" in2=\"{bw_res}\" operator=\"arithmetic\" k1=\"0\" k2=\"1\" k3=\"1\" k4=\"0\" result=\"{next_cur}\"/>"
+                    );
+                    cur = next_cur;
+                }
             }
-            let wt_res = format!("w{idx}");
-            let rw_res = format!("rw{idx}");
-            let bw_res = format!("bw{idx}");
-            let next_cur = format!("c{idx}");
-            let _ = write!(
-                self.defs,
-                "<feImage href=\"#s{}\" x=\"0\" y=\"0\" width=\"",
-                item.shape_id
-            );
-            push_num(&mut self.defs, w);
-            self.defs.push_str("\" height=\"");
-            push_num(&mut self.defs, h);
-            let _ = writeln!(self.defs, "\" result=\"{wt_res}\"/>");
-            let _ = writeln!(
-                self.defs,
-                "<feComposite in=\"{acc}\" in2=\"{wt_res}\" operator=\"in\" result=\"{rw_res}\"/>"
-            );
-            let _ = writeln!(
-                self.defs,
-                "<feComposite in=\"{cur}\" in2=\"{wt_res}\" operator=\"out\" result=\"{bw_res}\"/>"
-            );
-            let _ = writeln!(
-                self.defs,
-                "<feComposite in=\"{rw_res}\" in2=\"{bw_res}\" operator=\"arithmetic\" k1=\"0\" k2=\"1\" k3=\"1\" k4=\"0\" result=\"{next_cur}\"/>"
-            );
-            cur = next_cur;
         }
 
         self.defs.push_str("</filter>\n");
@@ -1204,55 +1658,257 @@ impl<'a> SvgWriter<'a> {
             "<use href=\"#b{}\" filter=\"url(#f{fid})\"/>",
             pending.bg_id
         );
+        self.out.push_str(&trailing);
     }
 
-    /// Snapshot the current top-level canvas into `<defs><g id="b{id}">` without
-    /// re-emitting `<use>` into `self.out` (the caller's filter composition
+    /// Snapshot the current scope's accumulated content into `<defs><g id="b{id}">`
+    /// without re-emitting `<use>` into `self.out` (the caller's filter composition
     /// emits the sole `<use href="#b{id}" filter="..."/>` when flushed).
-    fn snapshot_page_backdrop(&mut self) -> Option<u32> {
-        self.backdrop_snapshots += 1;
-        if self.out.is_empty() {
+    fn snapshot_page_backdrop(&mut self, allow_empty: bool) -> Option<u32> {
+        if self.out.is_empty() && !allow_empty {
             return None;
         }
+        self.backdrop_snapshots += 1;
         let prior = std::mem::take(&mut self.out);
         let bg_id = self.fresh_id();
-        let _ = write!(self.defs, "<g id=\"b{bg_id}\">\n{prior}</g>\n");
+        if prior.is_empty() {
+            let _ = write!(
+                self.defs,
+                "<g id=\"b{bg_id}\"><rect x=\"0\" y=\"0\" width=\""
+            );
+            push_num(&mut self.defs, self.page_width);
+            self.defs.push_str("\" height=\"");
+            push_num(&mut self.defs, self.page_height);
+            self.defs
+                .push_str("\" fill=\"#000000\" fill-opacity=\"0\"/></g>\n");
+        } else {
+            let _ = write!(self.defs, "<g id=\"b{bg_id}\">\n{prior}</g>\n");
+        }
         Some(bg_id)
     }
 
-    /// Enqueue one translucent multi-pass tiling fill or stroke (`shape_id`
-    /// already written in `self.defs`) onto the active linear `<filter>` chain,
-    /// starting a new snapshot when needed within [`MAX_BACKDROP_SNAPSHOTS`].
-    /// Returns `true` if queued onto the live backdrop, or `false` when there
-    /// is no backdrop yet or the bounded cap is exhausted.
-    fn enqueue_backdrop_blend_item(
+    /// Fold any intervening Normal-blended content in `self.out` into an
+    /// `Overlay` step on the currently open `pending_backdrop` so subsequent
+    /// backdrop steps see it without starting a new snapshot.
+    fn absorb_out_into_pending(&mut self) {
+        if self.pending_backdrop.is_some() && !self.out.is_empty() {
+            let mid = std::mem::take(&mut self.out);
+            let ov_id = self.fresh_id();
+            let _ = write!(self.defs, "<g id=\"ov{ov_id}\">\n{mid}</g>\n");
+            if let Some(ref mut p) = self.pending_backdrop {
+                p.steps.push(BackdropStep::Overlay(ov_id));
+                p.total_passes = p.total_passes.saturating_add(1);
+            }
+        }
+    }
+
+    /// Enqueue one backdrop-dependent filter step onto the active linear
+    /// `<filter>` chain, absorbing intervening normal draws as `Overlay` steps
+    /// and starting a new snapshot only when needed within
+    /// [`MAX_BACKDROP_SNAPSHOTS`].
+    fn enqueue_backdrop_step(
         &mut self,
-        passes: Vec<(u32, BlendMode)>,
-        shape_id: u32,
+        step: BackdropStep,
+        step_cost: usize,
+        allow_empty: bool,
     ) -> bool {
-        let pass_count = passes.len();
-        if let Some(ref mut p) = self.pending_backdrop {
-            if p.total_passes.saturating_add(pass_count) <= MAX_BACKDROP_FILTER_PASSES {
-                p.total_passes += pass_count;
-                p.items.push(BackdropBlendItem { passes, shape_id });
+        if let Some(ref p) = self.pending_backdrop {
+            let extra = usize::from(!self.out.is_empty());
+            if p.total_passes
+                .saturating_add(extra)
+                .saturating_add(step_cost)
+                <= MAX_BACKDROP_FILTER_PASSES
+            {
+                self.absorb_out_into_pending();
+                if let Some(ref mut p) = self.pending_backdrop {
+                    p.total_passes = p.total_passes.saturating_add(step_cost);
+                    p.steps.push(step);
+                }
                 return true;
             }
             self.flush_pending_backdrop();
         }
-        if !self.out.is_empty()
+        if (allow_empty || !self.out.is_empty())
             && self.backdrop_snapshots < MAX_BACKDROP_SNAPSHOTS
-            && pass_count <= MAX_BACKDROP_FILTER_PASSES
+            && step_cost <= MAX_BACKDROP_FILTER_PASSES
         {
-            if let Some(bg_id) = self.snapshot_page_backdrop() {
+            if let Some(bg_id) = self.snapshot_page_backdrop(allow_empty) {
                 self.pending_backdrop = Some(PendingBackdrop {
                     bg_id,
-                    items: vec![BackdropBlendItem { passes, shape_id }],
-                    total_passes: pass_count,
+                    steps: vec![step],
+                    total_passes: step_cost,
                 });
                 return true;
             }
         }
         false
+    }
+
+    fn emit_tiling_fill_path_data(
+        &mut self,
+        d: &str,
+        rule: &FillRule,
+        tiling: &zpdf_display_list::TilingPattern,
+        opacity: f32,
+        depth: u8,
+    ) {
+        let plan = self.emit_tiling_plan(tiling, depth);
+        match plan {
+            TilingPassPlan::Affine { k_id, mk_id, a_id } => {
+                if depth == 0 {
+                    let shape_id = self.fresh_id();
+                    let placement = self.placement_attrs();
+                    let _ = write!(
+                        self.defs,
+                        "<g id=\"s{shape_id}\"><path d=\"{d}\" fill=\"#ffffff\""
+                    );
+                    if *rule == FillRule::EvenOdd {
+                        self.defs.push_str(" fill-rule=\"evenodd\"");
+                    }
+                    push_opacity(&mut self.defs, "fill-opacity", opacity);
+                    self.defs.push_str(&placement);
+                    self.defs.push_str("/></g>\n");
+                    if self.enqueue_backdrop_step(
+                        BackdropStep::Affine {
+                            k_id,
+                            mk_id,
+                            a_id,
+                            shape_id,
+                        },
+                        4,
+                        true,
+                    ) {
+                        return;
+                    }
+                    self.flush_pending_backdrop();
+                }
+                let placement = self.placement_attrs();
+                let _ = write!(self.out, "<path d=\"{d}\" fill=\"url(#p{k_id})\"");
+                if *rule == FillRule::EvenOdd {
+                    self.out.push_str(" fill-rule=\"evenodd\"");
+                }
+                push_opacity(&mut self.out, "fill-opacity", opacity);
+                self.out.push_str(&placement);
+                self.out.push_str("/>\n");
+            }
+            TilingPassPlan::Passes(passes) => {
+                if passes.is_empty() {
+                    return;
+                }
+                let has_non_normal = passes.iter().any(|&(_, m)| m != BlendMode::Normal);
+                if passes.len() > 1
+                    && (opacity < 1.0
+                        || (depth == 0 && self.pending_backdrop.is_some() && has_non_normal))
+                {
+                    if depth == 0 && (self.pending_backdrop.is_some() || !self.out.is_empty()) {
+                        let shape_id = self.fresh_id();
+                        let placement = self.placement_attrs();
+                        let _ = write!(
+                            self.defs,
+                            "<g id=\"s{shape_id}\"><path d=\"{d}\" fill=\"#ffffff\""
+                        );
+                        if *rule == FillRule::EvenOdd {
+                            self.defs.push_str(" fill-rule=\"evenodd\"");
+                        }
+                        push_opacity(&mut self.defs, "fill-opacity", opacity);
+                        self.defs.push_str(&placement);
+                        self.defs.push_str("/></g>\n");
+                        let pass_count = passes.len();
+                        if self.enqueue_backdrop_step(
+                            BackdropStep::MultiPass {
+                                passes: passes.clone(),
+                                shape_id,
+                            },
+                            pass_count,
+                            false,
+                        ) {
+                            return;
+                        }
+                    }
+
+                    // Bounded isolated single-opacity fallback (when there is no
+                    // backdrop yet, nested inside a pattern/mask, or past the
+                    // filter/snapshot budget): evaluate all passes at 1.0 inside
+                    // one isolated group and apply `opacity` ONCE.
+                    if depth == 0 {
+                        self.flush_pending_backdrop();
+                    }
+                    let clip_id = self.fresh_id();
+                    let _ = write!(self.defs, "<clipPath id=\"c{clip_id}\"");
+                    if let Some(outer) = self.clip {
+                        let _ = write!(self.defs, " clip-path=\"url(#c{outer})\"");
+                    }
+                    let _ = write!(self.defs, "><path d=\"{d}\"");
+                    if *rule == FillRule::EvenOdd {
+                        self.defs.push_str(" clip-rule=\"evenodd\"");
+                    }
+                    self.defs.push_str("/></clipPath>\n");
+                    self.out.push_str("<g");
+                    push_opacity(&mut self.out, "opacity", opacity);
+                    let _ = write!(
+                        self.out,
+                        " style=\"isolation:isolate;\" clip-path=\"url(#c{clip_id})\""
+                    );
+                    if let Some(m) = self.stroke_mask {
+                        let _ = write!(self.out, " mask=\"url(#m{m})\"");
+                    }
+                    self.out.push_str(">\n");
+                    for (id, blend_mode) in passes {
+                        self.out.push_str("<rect x=\"0\" y=\"0\" width=\"");
+                        push_num(&mut self.out, self.page_width);
+                        self.out.push_str("\" height=\"");
+                        push_num(&mut self.out, self.page_height);
+                        let _ = write!(self.out, "\" fill=\"url(#p{id})\"");
+                        if let Some(name) = blend_css(blend_mode) {
+                            let _ = write!(self.out, " style=\"mix-blend-mode:{name};\"");
+                        }
+                        self.out.push_str("/>\n");
+                    }
+                    self.out.push_str("</g>\n");
+                    return;
+                }
+                if depth == 0 && self.pending_backdrop.is_some() && has_non_normal {
+                    if let [(id, blend_mode)] = passes.as_slice() {
+                        let ov_id = self.fresh_id();
+                        let placement = self.placement_attrs();
+                        let _ = write!(
+                            self.defs,
+                            "<g id=\"ov{ov_id}\"><path d=\"{d}\" fill=\"url(#p{id})\""
+                        );
+                        if *rule == FillRule::EvenOdd {
+                            self.defs.push_str(" fill-rule=\"evenodd\"");
+                        }
+                        push_opacity(&mut self.defs, "fill-opacity", opacity);
+                        self.defs.push_str(&placement);
+                        self.defs.push_str("/></g>\n");
+                        if self.enqueue_backdrop_step(
+                            BackdropStep::BlendOverlay {
+                                ov_id,
+                                blend_mode: *blend_mode,
+                            },
+                            1,
+                            false,
+                        ) {
+                            return;
+                        }
+                    }
+                    self.flush_pending_backdrop();
+                }
+                let placement = self.placement_attrs();
+                for (id, blend_mode) in passes {
+                    let _ = write!(self.out, "<path d=\"{d}\" fill=\"url(#p{id})\"");
+                    if *rule == FillRule::EvenOdd {
+                        self.out.push_str(" fill-rule=\"evenodd\"");
+                    }
+                    push_opacity(&mut self.out, "fill-opacity", opacity);
+                    if let Some(name) = blend_css(blend_mode) {
+                        let _ = write!(self.out, " style=\"mix-blend-mode:{name};\"");
+                    }
+                    self.out.push_str(&placement);
+                    self.out.push_str("/>\n");
+                }
+            }
+        }
     }
 
     fn emit_fill(&mut self, path: &Path, rule: &FillRule, paint: &Paint, alpha: f32, depth: u8) {
@@ -1265,9 +1921,6 @@ impl<'a> SvgWriter<'a> {
                 let Some(d) = self.path_data(path) else {
                     return;
                 };
-                if depth == 0 && self.blend_depth == 0 {
-                    self.flush_pending_backdrop();
-                }
                 self.out.push_str("<path d=\"");
                 self.out.push_str(&d);
                 self.out.push_str("\" fill=\"");
@@ -1293,92 +1946,7 @@ impl<'a> SvgWriter<'a> {
                 let Some(d) = self.path_data(path) else {
                     return;
                 };
-                let passes = self.emit_tiling_passes(tiling, depth);
-                if passes.is_empty() {
-                    return;
-                }
-                if passes.len() > 1 && opacity < 1.0 {
-                    if depth == 0
-                        && self.blend_depth == 0
-                        && (self.pending_backdrop.is_some()
-                            || (!self.out.is_empty()
-                                && self.backdrop_snapshots < MAX_BACKDROP_SNAPSHOTS))
-                    {
-                        let shape_id = self.fresh_id();
-                        let placement = self.placement_attrs();
-                        let _ = write!(
-                            self.defs,
-                            "<g id=\"s{shape_id}\"><path d=\"{d}\" fill=\"#ffffff\""
-                        );
-                        if *rule == FillRule::EvenOdd {
-                            self.defs.push_str(" fill-rule=\"evenodd\"");
-                        }
-                        push_opacity(&mut self.defs, "fill-opacity", opacity);
-                        self.defs.push_str(&placement);
-                        self.defs.push_str("/></g>\n");
-                        if self.enqueue_backdrop_blend_item(passes.clone(), shape_id) {
-                            return;
-                        }
-                    }
-
-                    // Bounded isolated single-opacity fallback (when there is no
-                    // backdrop yet, nested inside a group, or past the chained
-                    // overlapping-snapshot limit): evaluate all passes at 1.0
-                    // inside one isolated group and apply `opacity` ONCE to the
-                    // completed object instead of repeating `fill-opacity` per pass.
-                    if depth == 0 && self.blend_depth == 0 {
-                        self.flush_pending_backdrop();
-                    }
-                    let clip_id = self.fresh_id();
-                    let _ = write!(self.defs, "<clipPath id=\"c{clip_id}\"");
-                    if let Some(outer) = self.clip {
-                        let _ = write!(self.defs, " clip-path=\"url(#c{outer})\"");
-                    }
-                    let _ = write!(self.defs, "><path d=\"{d}\"");
-                    if *rule == FillRule::EvenOdd {
-                        self.defs.push_str(" clip-rule=\"evenodd\"");
-                    }
-                    self.defs.push_str("/></clipPath>\n");
-                    self.out.push_str("<g opacity=\"");
-                    push_num(&mut self.out, opacity as f64);
-                    let _ = write!(
-                        self.out,
-                        "\" style=\"isolation:isolate;\" clip-path=\"url(#c{clip_id})\""
-                    );
-                    if let Some(m) = self.stroke_mask {
-                        let _ = write!(self.out, " mask=\"url(#m{m})\"");
-                    }
-                    self.out.push_str(">\n");
-                    for (id, blend_mode) in passes {
-                        self.out.push_str("<rect x=\"0\" y=\"0\" width=\"");
-                        push_num(&mut self.out, self.page_width);
-                        self.out.push_str("\" height=\"");
-                        push_num(&mut self.out, self.page_height);
-                        let _ = write!(self.out, "\" fill=\"url(#p{id})\"");
-                        if let Some(name) = blend_css(blend_mode) {
-                            let _ = write!(self.out, " style=\"mix-blend-mode:{name};\"");
-                        }
-                        self.out.push_str("/>\n");
-                    }
-                    self.out.push_str("</g>\n");
-                    return;
-                }
-                if depth == 0 && self.blend_depth == 0 {
-                    self.flush_pending_backdrop();
-                }
-                let placement = self.placement_attrs();
-                for (id, blend_mode) in passes {
-                    let _ = write!(self.out, "<path d=\"{d}\" fill=\"url(#p{id})\"");
-                    if *rule == FillRule::EvenOdd {
-                        self.out.push_str(" fill-rule=\"evenodd\"");
-                    }
-                    push_opacity(&mut self.out, "fill-opacity", opacity);
-                    if let Some(name) = blend_css(blend_mode) {
-                        let _ = write!(self.out, " style=\"mix-blend-mode:{name};\"");
-                    }
-                    self.out.push_str(&placement);
-                    self.out.push_str("/>\n");
-                }
+                self.emit_tiling_fill_path_data(&d, rule, tiling, opacity, depth);
             }
             _ => {
                 tracing::debug!("skipping non-solid fill paint (rasterized upstream)");
@@ -1403,9 +1971,6 @@ impl<'a> SvgWriter<'a> {
                 let Some(d) = self.path_data(path) else {
                     return;
                 };
-                if depth == 0 && self.blend_depth == 0 {
-                    self.flush_pending_backdrop();
-                }
                 self.out.push_str("<path d=\"");
                 self.out.push_str(&d);
                 self.out.push_str("\" fill=\"none\" stroke=\"");
@@ -1429,94 +1994,167 @@ impl<'a> SvgWriter<'a> {
                 let Some(d) = self.path_data(path) else {
                     return;
                 };
-                let passes = self.emit_tiling_passes(tiling, depth);
-                if passes.is_empty() {
-                    return;
-                }
-                if passes.len() > 1 && opacity < 1.0 {
-                    if depth == 0
-                        && self.blend_depth == 0
-                        && (self.pending_backdrop.is_some()
-                            || (!self.out.is_empty()
-                                && self.backdrop_snapshots < MAX_BACKDROP_SNAPSHOTS))
-                    {
-                        let shape_id = self.fresh_id();
+                let plan = self.emit_tiling_plan(tiling, depth);
+                match plan {
+                    TilingPassPlan::Affine { k_id, mk_id, a_id } => {
+                        if depth == 0 {
+                            let shape_id = self.fresh_id();
+                            let placement = self.placement_attrs();
+                            let _ = write!(
+                                self.defs,
+                                "<g id=\"s{shape_id}\"><path d=\"{d}\" fill=\"none\" stroke=\"#ffffff\""
+                            );
+                            push_opacity(&mut self.defs, "stroke-opacity", opacity);
+                            push_stroke_attrs(&mut self.defs, style, self.scale);
+                            self.defs.push_str(&placement);
+                            self.defs.push_str("/></g>\n");
+                            if self.enqueue_backdrop_step(
+                                BackdropStep::Affine {
+                                    k_id,
+                                    mk_id,
+                                    a_id,
+                                    shape_id,
+                                },
+                                4,
+                                true,
+                            ) {
+                                return;
+                            }
+                            self.flush_pending_backdrop();
+                        }
                         let placement = self.placement_attrs();
                         let _ = write!(
-                            self.defs,
-                            "<g id=\"s{shape_id}\"><path d=\"{d}\" fill=\"none\" stroke=\"#ffffff\""
+                            self.out,
+                            "<path d=\"{d}\" fill=\"none\" stroke=\"url(#p{k_id})\""
                         );
-                        push_opacity(&mut self.defs, "stroke-opacity", opacity);
-                        push_stroke_attrs(&mut self.defs, style, self.scale);
-                        self.defs.push_str(&placement);
-                        self.defs.push_str("/></g>\n");
-                        if self.enqueue_backdrop_blend_item(passes.clone(), shape_id) {
-                            return;
-                        }
-                    }
-
-                    // Bounded isolated single-opacity fallback for strokes.
-                    if depth == 0 && self.blend_depth == 0 {
-                        self.flush_pending_backdrop();
-                    }
-                    let mask_id = self.fresh_id();
-                    let _ = write!(
-                        self.defs,
-                        "<mask id=\"m{mask_id}\" maskUnits=\"userSpaceOnUse\">"
-                    );
-                    if let Some(outer) = self.stroke_mask {
-                        let _ = write!(self.defs, "<g mask=\"url(#m{outer})\">");
-                    }
-                    let _ = write!(
-                        self.defs,
-                        "<path d=\"{d}\" fill=\"none\" stroke=\"#ffffff\""
-                    );
-                    push_stroke_attrs(&mut self.defs, style, self.scale);
-                    if let Some(c) = self.clip {
-                        let _ = write!(self.defs, " clip-path=\"url(#c{c})\"");
-                    }
-                    self.defs.push_str("/>");
-                    if self.stroke_mask.is_some() {
-                        self.defs.push_str("</g>");
-                    }
-                    self.defs.push_str("</mask>\n");
-
-                    self.out.push_str("<g opacity=\"");
-                    push_num(&mut self.out, opacity as f64);
-                    let _ = writeln!(
-                        self.out,
-                        "\" style=\"isolation:isolate;\" mask=\"url(#m{mask_id})\">"
-                    );
-                    for (id, blend_mode) in passes {
-                        self.out.push_str("<rect x=\"0\" y=\"0\" width=\"");
-                        push_num(&mut self.out, self.page_width);
-                        self.out.push_str("\" height=\"");
-                        push_num(&mut self.out, self.page_height);
-                        let _ = write!(self.out, "\" fill=\"url(#p{id})\"");
-                        if let Some(name) = blend_css(blend_mode) {
-                            let _ = write!(self.out, " style=\"mix-blend-mode:{name};\"");
-                        }
+                        push_opacity(&mut self.out, "stroke-opacity", opacity);
+                        push_stroke_attrs(&mut self.out, style, self.scale);
+                        self.out.push_str(&placement);
                         self.out.push_str("/>\n");
                     }
-                    self.out.push_str("</g>\n");
-                    return;
-                }
-                if depth == 0 && self.blend_depth == 0 {
-                    self.flush_pending_backdrop();
-                }
-                let placement = self.placement_attrs();
-                for (id, blend_mode) in passes {
-                    let _ = write!(
-                        self.out,
-                        "<path d=\"{d}\" fill=\"none\" stroke=\"url(#p{id})\""
-                    );
-                    push_opacity(&mut self.out, "stroke-opacity", opacity);
-                    if let Some(name) = blend_css(blend_mode) {
-                        let _ = write!(self.out, " style=\"mix-blend-mode:{name};\"");
+                    TilingPassPlan::Passes(passes) => {
+                        if passes.is_empty() {
+                            return;
+                        }
+                        let has_non_normal = passes.iter().any(|&(_, m)| m != BlendMode::Normal);
+                        if passes.len() > 1
+                            && (opacity < 1.0
+                                || (depth == 0
+                                    && self.pending_backdrop.is_some()
+                                    && has_non_normal))
+                        {
+                            if depth == 0
+                                && (self.pending_backdrop.is_some() || !self.out.is_empty())
+                            {
+                                let shape_id = self.fresh_id();
+                                let placement = self.placement_attrs();
+                                let _ = write!(
+                                    self.defs,
+                                    "<g id=\"s{shape_id}\"><path d=\"{d}\" fill=\"none\" stroke=\"#ffffff\""
+                                );
+                                push_opacity(&mut self.defs, "stroke-opacity", opacity);
+                                push_stroke_attrs(&mut self.defs, style, self.scale);
+                                self.defs.push_str(&placement);
+                                self.defs.push_str("/></g>\n");
+                                let pass_count = passes.len();
+                                if self.enqueue_backdrop_step(
+                                    BackdropStep::MultiPass {
+                                        passes: passes.clone(),
+                                        shape_id,
+                                    },
+                                    pass_count,
+                                    false,
+                                ) {
+                                    return;
+                                }
+                            }
+
+                            // Bounded isolated single-opacity fallback for strokes.
+                            if depth == 0 {
+                                self.flush_pending_backdrop();
+                            }
+                            let mask_id = self.fresh_id();
+                            let _ = write!(
+                                self.defs,
+                                "<mask id=\"m{mask_id}\" maskUnits=\"userSpaceOnUse\">"
+                            );
+                            if let Some(outer) = self.stroke_mask {
+                                let _ = write!(self.defs, "<g mask=\"url(#m{outer})\">");
+                            }
+                            let _ = write!(
+                                self.defs,
+                                "<path d=\"{d}\" fill=\"none\" stroke=\"#ffffff\""
+                            );
+                            push_stroke_attrs(&mut self.defs, style, self.scale);
+                            if let Some(c) = self.clip {
+                                let _ = write!(self.defs, " clip-path=\"url(#c{c})\"");
+                            }
+                            self.defs.push_str("/>");
+                            if self.stroke_mask.is_some() {
+                                self.defs.push_str("</g>");
+                            }
+                            self.defs.push_str("</mask>\n");
+
+                            self.out.push_str("<g");
+                            push_opacity(&mut self.out, "opacity", opacity);
+                            let _ = writeln!(
+                                self.out,
+                                " style=\"isolation:isolate;\" mask=\"url(#m{mask_id})\">"
+                            );
+                            for (id, blend_mode) in passes {
+                                self.out.push_str("<rect x=\"0\" y=\"0\" width=\"");
+                                push_num(&mut self.out, self.page_width);
+                                self.out.push_str("\" height=\"");
+                                push_num(&mut self.out, self.page_height);
+                                let _ = write!(self.out, "\" fill=\"url(#p{id})\"");
+                                if let Some(name) = blend_css(blend_mode) {
+                                    let _ = write!(self.out, " style=\"mix-blend-mode:{name};\"");
+                                }
+                                self.out.push_str("/>\n");
+                            }
+                            self.out.push_str("</g>\n");
+                            return;
+                        }
+                        if depth == 0 && self.pending_backdrop.is_some() && has_non_normal {
+                            if let [(id, blend_mode)] = passes.as_slice() {
+                                let ov_id = self.fresh_id();
+                                let placement = self.placement_attrs();
+                                let _ = write!(
+                                    self.defs,
+                                    "<g id=\"ov{ov_id}\"><path d=\"{d}\" fill=\"none\" stroke=\"url(#p{id})\""
+                                );
+                                push_opacity(&mut self.defs, "stroke-opacity", opacity);
+                                push_stroke_attrs(&mut self.defs, style, self.scale);
+                                self.defs.push_str(&placement);
+                                self.defs.push_str("/></g>\n");
+                                if self.enqueue_backdrop_step(
+                                    BackdropStep::BlendOverlay {
+                                        ov_id,
+                                        blend_mode: *blend_mode,
+                                    },
+                                    1,
+                                    false,
+                                ) {
+                                    return;
+                                }
+                            }
+                            self.flush_pending_backdrop();
+                        }
+                        let placement = self.placement_attrs();
+                        for (id, blend_mode) in passes {
+                            let _ = write!(
+                                self.out,
+                                "<path d=\"{d}\" fill=\"none\" stroke=\"url(#p{id})\""
+                            );
+                            push_opacity(&mut self.out, "stroke-opacity", opacity);
+                            if let Some(name) = blend_css(blend_mode) {
+                                let _ = write!(self.out, " style=\"mix-blend-mode:{name};\"");
+                            }
+                            push_stroke_attrs(&mut self.out, style, self.scale);
+                            self.out.push_str(&placement);
+                            self.out.push_str("/>\n");
+                        }
                     }
-                    push_stroke_attrs(&mut self.out, style, self.scale);
-                    self.out.push_str(&placement);
-                    self.out.push_str("/>\n");
                 }
             }
             _ => {
@@ -1585,21 +2223,15 @@ impl<'a> SvgWriter<'a> {
 
     // -- transparency groups --
 
-    fn open_blend_group(
+    fn write_blend_group_tag(
         &mut self,
         blend_mode: BlendMode,
         isolated: bool,
         alpha: f32,
-        mask: Option<&SoftMask>,
-        depth: u8,
-    ) -> bool {
-        let mask_id = mask.and_then(|m| self.emit_soft_mask_def(m, depth));
+        mask_id: Option<u32>,
+        inner_body: &str,
+    ) {
         self.out.push_str("<g");
-        let alpha = if alpha.is_finite() {
-            alpha.clamp(0.0, 1.0)
-        } else {
-            1.0
-        };
         if alpha < 1.0 {
             self.out.push_str(" opacity=\"");
             push_num(&mut self.out, alpha as f64);
@@ -1620,7 +2252,57 @@ impl<'a> SvgWriter<'a> {
             let _ = write!(self.out, " mask=\"url(#m{id})\"");
         }
         self.out.push_str(">\n");
-        isolated || alpha < 1.0 || blend.is_some() || mask_id.is_some()
+        self.out.push_str(inner_body);
+        self.out.push_str("</g>\n");
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn close_blend_group(
+        &mut self,
+        open: bool,
+        isolates: bool,
+        blend_mode: BlendMode,
+        isolated: bool,
+        alpha: f32,
+        mask_id: Option<u32>,
+        prev_out: String,
+        prev_pending: Option<PendingBackdrop>,
+        depth: u8,
+    ) {
+        if !open {
+            return;
+        }
+        self.flush_pending_backdrop();
+        let inner_body = std::mem::replace(&mut self.out, prev_out);
+        self.pending_backdrop = prev_pending;
+        self.blend_depth = self.blend_depth.saturating_sub(1);
+        if isolates {
+            self.isolated_depth = self.isolated_depth.saturating_sub(1);
+        }
+        if depth == 0 && blend_css(blend_mode).is_some() && self.pending_backdrop.is_some() {
+            let ov_id = self.fresh_id();
+            let _ = write!(self.defs, "<g id=\"ov{ov_id}\"");
+            if alpha < 1.0 {
+                self.defs.push_str(" opacity=\"");
+                push_num(&mut self.defs, alpha as f64);
+                self.defs.push('"');
+            }
+            if let Some(id) = mask_id {
+                let _ = write!(self.defs, " mask=\"url(#m{id})\"");
+            }
+            self.defs.push_str(">\n");
+            self.defs.push_str(&inner_body);
+            self.defs.push_str("</g>\n");
+            if self.enqueue_backdrop_step(
+                BackdropStep::BlendOverlay { ov_id, blend_mode },
+                1,
+                false,
+            ) {
+                return;
+            }
+            self.flush_pending_backdrop();
+        }
+        self.write_blend_group_tag(blend_mode, isolated, alpha, mask_id, &inner_body);
     }
 
     /// Emit an ExtGState soft mask as an SVG `<mask>` def and return its id.
@@ -1649,6 +2331,7 @@ impl<'a> SvgWriter<'a> {
         self.mask_defs.insert(key, id);
 
         let saved_out = std::mem::take(&mut self.out);
+        let saved_pending = self.pending_backdrop.take();
         let saved_blend_depth = std::mem::replace(&mut self.blend_depth, 0);
         let saved_isolated_depth = std::mem::replace(&mut self.isolated_depth, 0);
         // Mask content is self-contained (geometry fixed at `gs` time); it must
@@ -1681,10 +2364,12 @@ impl<'a> SvgWriter<'a> {
             self.out.push_str(")\">\n");
         }
         self.emit_commands(&mask.commands.commands, depth + 1);
+        self.flush_pending_backdrop();
         if translated {
             self.out.push_str("</g>\n");
         }
         let body = std::mem::replace(&mut self.out, saved_out);
+        self.pending_backdrop = saved_pending;
         self.blend_depth = saved_blend_depth;
         self.isolated_depth = saved_isolated_depth;
         self.clip = saved_clip;
@@ -1702,17 +2387,9 @@ impl<'a> SvgWriter<'a> {
 
     // -- text --
 
-    fn emit_glyph_run(&mut self, run: &GlyphRun) {
-        let Paint::Solid(color) = &run.paint else {
-            tracing::debug!("skipping non-solid text paint (rasterized upstream)");
-            return;
-        };
+    fn emit_glyph_run(&mut self, run: &GlyphRun, depth: u8) {
         if run.overprint.is_some() {
             self.warn_overprint();
-        }
-        let opacity = (color.a * run.alpha).clamp(0.0, 1.0);
-        if opacity <= 0.0 {
-            return;
         }
         let Some(font) = self.fonts.get(run.font_id) else {
             tracing::warn!(font_id = run.font_id, "glyph run references unknown font");
@@ -1721,18 +2398,44 @@ impl<'a> SvgWriter<'a> {
         if !font.has_font_data() {
             return;
         }
-        if font.is_type3() {
-            self.emit_type3_run(run, font, color, opacity);
-        } else {
-            self.emit_outline_run(run, font, color, opacity);
+        match &run.paint {
+            Paint::Solid(color) => {
+                let opacity = (color.a * run.alpha).clamp(0.0, 1.0);
+                if opacity <= 0.0 {
+                    return;
+                }
+                if font.is_type3() {
+                    self.emit_type3_run(run, font, color, opacity);
+                } else {
+                    self.emit_outline_run(run, font, color, opacity);
+                }
+            }
+            Paint::Tiling(tiling) => {
+                let opacity = if run.alpha.is_finite() {
+                    run.alpha.clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                if opacity <= 0.0 {
+                    return;
+                }
+                if font.is_type3() {
+                    self.emit_tiling_type3_run(run, font, tiling, opacity, depth);
+                } else if let Some(d) = self.outline_run_path_data(run, font) {
+                    self.emit_tiling_fill_path_data(&d, &FillRule::NonZero, tiling, opacity, depth);
+                }
+            }
+            _ => {
+                tracing::debug!("skipping non-solid text paint (rasterized upstream)");
+            }
         }
     }
 
-    /// Outline fonts: all glyphs of the run merge into one nonzero-filled path.
-    fn emit_outline_run(&mut self, run: &GlyphRun, font: &LoadedFont, color: &Color, opacity: f32) {
+    /// Outline fonts: build one merged SVG path string for all glyphs of `run`.
+    fn outline_run_path_data(&mut self, run: &GlyphRun, font: &LoadedFont) -> Option<String> {
         let upem = font.units_per_em;
         if !(upem.is_finite() && upem > 0.0) {
-            return;
+            return None;
         }
         let mut d = String::new();
         'glyphs: for glyph in &run.glyphs {
@@ -1787,9 +2490,14 @@ impl<'a> SvgWriter<'a> {
                 d.push_str(&part);
             }
         }
-        if d.is_empty() {
+        (!d.is_empty()).then_some(d)
+    }
+
+    /// Outline fonts: all glyphs of the run merge into one nonzero-filled path.
+    fn emit_outline_run(&mut self, run: &GlyphRun, font: &LoadedFont, color: &Color, opacity: f32) {
+        let Some(d) = self.outline_run_path_data(run, font) else {
             return;
-        }
+        };
         self.out.push_str("<path d=\"");
         self.out.push_str(&d);
         self.out.push_str("\" fill=\"");
@@ -1799,6 +2507,137 @@ impl<'a> SvgWriter<'a> {
         let placement = self.placement_attrs();
         self.out.push_str(&placement);
         self.out.push_str("/>\n");
+    }
+
+    /// Type 3 glyph runs painted with a [`TilingPattern`]: render the glyph
+    /// coverage as opaque white into a shape/mask def and composite the pattern
+    /// through that coverage.
+    fn emit_tiling_type3_run(
+        &mut self,
+        run: &GlyphRun,
+        font: &LoadedFont,
+        tiling: &zpdf_display_list::TilingPattern,
+        opacity: f32,
+        depth: u8,
+    ) {
+        let saved_out = std::mem::take(&mut self.out);
+        let saved_pending = self.pending_backdrop.take();
+        self.emit_type3_run(run, font, &Color::white(), 1.0);
+        let shape_body = std::mem::replace(&mut self.out, saved_out);
+        self.pending_backdrop = saved_pending;
+        if shape_body.is_empty() {
+            return;
+        }
+        let plan = self.emit_tiling_plan(tiling, depth);
+        match plan {
+            TilingPassPlan::Affine { k_id, mk_id, a_id } => {
+                if depth == 0 {
+                    let shape_id = self.fresh_id();
+                    let _ = write!(self.defs, "<g id=\"s{shape_id}\"");
+                    push_opacity(&mut self.defs, "opacity", opacity);
+                    self.defs.push_str(">\n");
+                    self.defs.push_str(&shape_body);
+                    self.defs.push_str("</g>\n");
+                    if self.enqueue_backdrop_step(
+                        BackdropStep::Affine {
+                            k_id,
+                            mk_id,
+                            a_id,
+                            shape_id,
+                        },
+                        4,
+                        true,
+                    ) {
+                        return;
+                    }
+                    self.flush_pending_backdrop();
+                }
+                let mask_id = self.fresh_id();
+                let _ = write!(
+                    self.defs,
+                    "<mask id=\"m{mask_id}\" maskUnits=\"userSpaceOnUse\">\n{shape_body}</mask>\n"
+                );
+                self.out.push_str("<rect x=\"0\" y=\"0\" width=\"");
+                push_num(&mut self.out, self.page_width);
+                self.out.push_str("\" height=\"");
+                push_num(&mut self.out, self.page_height);
+                let _ = write!(
+                    self.out,
+                    "\" fill=\"url(#p{k_id})\" mask=\"url(#m{mask_id})\""
+                );
+                push_opacity(&mut self.out, "fill-opacity", opacity);
+                self.out.push_str("/>\n");
+            }
+            TilingPassPlan::Passes(passes) => {
+                if passes.is_empty() {
+                    return;
+                }
+                let has_non_normal = passes.iter().any(|&(_, m)| m != BlendMode::Normal);
+                if depth == 0
+                    && (passes.len() > 1 || (self.pending_backdrop.is_some() && has_non_normal))
+                {
+                    if self.pending_backdrop.is_some() || !self.out.is_empty() {
+                        let shape_id = self.fresh_id();
+                        let _ = write!(self.defs, "<g id=\"s{shape_id}\"");
+                        push_opacity(&mut self.defs, "opacity", opacity);
+                        self.defs.push_str(">\n");
+                        self.defs.push_str(&shape_body);
+                        self.defs.push_str("</g>\n");
+                        let pass_count = passes.len();
+                        if self.enqueue_backdrop_step(
+                            BackdropStep::MultiPass {
+                                passes: passes.clone(),
+                                shape_id,
+                            },
+                            pass_count,
+                            false,
+                        ) {
+                            return;
+                        }
+                    }
+                    self.flush_pending_backdrop();
+                }
+                let mask_id = self.fresh_id();
+                let _ = write!(
+                    self.defs,
+                    "<mask id=\"m{mask_id}\" maskUnits=\"userSpaceOnUse\">\n{shape_body}</mask>\n"
+                );
+                if passes.len() > 1 {
+                    self.out.push_str("<g");
+                    push_opacity(&mut self.out, "opacity", opacity);
+                    let _ = writeln!(
+                        self.out,
+                        " style=\"isolation:isolate;\" mask=\"url(#m{mask_id})\">"
+                    );
+                    for (id, blend_mode) in passes {
+                        self.out.push_str("<rect x=\"0\" y=\"0\" width=\"");
+                        push_num(&mut self.out, self.page_width);
+                        self.out.push_str("\" height=\"");
+                        push_num(&mut self.out, self.page_height);
+                        let _ = write!(self.out, "\" fill=\"url(#p{id})\"");
+                        if let Some(name) = blend_css(blend_mode) {
+                            let _ = write!(self.out, " style=\"mix-blend-mode:{name};\"");
+                        }
+                        self.out.push_str("/>\n");
+                    }
+                    self.out.push_str("</g>\n");
+                } else if let Some((id, blend_mode)) = passes.into_iter().next() {
+                    self.out.push_str("<rect x=\"0\" y=\"0\" width=\"");
+                    push_num(&mut self.out, self.page_width);
+                    self.out.push_str("\" height=\"");
+                    push_num(&mut self.out, self.page_height);
+                    let _ = write!(
+                        self.out,
+                        "\" fill=\"url(#p{id})\" mask=\"url(#m{mask_id})\""
+                    );
+                    push_opacity(&mut self.out, "fill-opacity", opacity);
+                    if let Some(name) = blend_css(blend_mode) {
+                        let _ = write!(self.out, " style=\"mix-blend-mode:{name};\"");
+                    }
+                    self.out.push_str("/>\n");
+                }
+            }
+        }
     }
 
     /// Append one SVG path verb whose points run through the glyph transform.
@@ -3998,21 +4837,20 @@ mod tests {
     fn tiling_pattern_dense_pass_budget_fallback_preserves_repeated_multiply() {
         // Cell B exceeding the 1,024 per-copy pass budget (175 alternating
         // Multiply/Darken spanning 6 horizontal steps = 1,050 > 1,024), with
-        // one spanning Multiply mark set to 50% gray (0.5, 0.5, 0.5) plus a
-        // trailing black detail confined to step 0. Six overlapping copies of
-        // 50% gray Multiply must reduce opaque blue from 255 to ~4 (NOT 128),
-        // and the black detail must remain black.
+        // an opaque 50%-gray Multiply mark followed immediately by an opaque
+        // 50%-gray Screen mark plus a trailing black detail confined to step 0.
+        // Six Multiply–Screen pairs over blue yield ~170 (NOT ~251 from running
+        // six Multiplies followed by six Screens), and the detail stays black.
         let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 12.0, 2.0));
         for k in 0..175 {
-            let mode = if k % 2 == 0 {
-                BlendMode::Multiply
+            let (mode, color) = if k == 20 {
+                (BlendMode::Multiply, Color::gray(0.5))
+            } else if k == 21 {
+                (BlendMode::Screen, Color::gray(0.5))
+            } else if k % 2 == 0 {
+                (BlendMode::Multiply, Color::white())
             } else {
-                BlendMode::Darken
-            };
-            let color = if k == 20 {
-                Color::gray(0.5)
-            } else {
-                Color::white()
+                (BlendMode::Darken, Color::white())
             };
             cell.push(RenderCommand::PushBlendGroup {
                 blend_mode: mode,
@@ -4080,30 +4918,326 @@ mod tests {
         );
         let tree = resvg::usvg::Tree::from_data(svg.as_bytes(), &resvg::usvg::Options::default())
             .expect("valid SVG");
-        let mut pixmap = resvg::tiny_skia::Pixmap::new(20, 20).expect("pixmap");
-        let sx = 20.0 / tree.size().width();
-        let sy = 20.0 / tree.size().height();
+        // Rasterize at exact 4 px/pt (80×80: `80 / (20 * 96/72) == 3.0` exact) so
+        // the 2pt×2pt cell maps to an exact 8×8 pixel tile with zero resvg
+        // `ceil(2.0000001) = 3` pattern-resampling blur across the 1pt stripe edge.
+        let mut pixmap = resvg::tiny_skia::Pixmap::new(80, 80).expect("pixmap");
+        let sx = 80.0 / tree.size().width();
+        let sy = 80.0 / tree.size().height();
         resvg::render(
             &tree,
             resvg::tiny_skia::Transform::from_scale(sx, sy),
             &mut pixmap.as_mut(),
         );
         let px = |x: u32, y_pdf: u32| -> [u8; 3] {
-            let p = pixmap.pixel(x, 19 - y_pdf).expect("in bounds");
+            let p = pixmap.pixel(x, 79 - y_pdf).expect("in bounds");
             [p.red(), p.green(), p.blue()]
         };
 
-        // Even column x=10 (x mod 2 == 0): black detail.
-        let detail = px(10, 10);
+        // Even stripe x_pdf in [10..11] -> px x=41: black detail.
+        let detail = px(41, 40);
         assert!(
             detail[0] <= 2 && detail[1] <= 2 && detail[2] <= 2,
             "SVG dense pass-budget fallback must preserve trailing black detail, got {detail:?}"
         );
-        // Odd column x=11 (x mod 2 == 1): 6x repeated 50%-gray Multiply over blue -> ~4 (NOT 128).
-        let repeated = px(11, 10);
+        // Odd stripe x_pdf in [11..12] -> px x=45: 6x Multiply–Screen pairs over blue -> ~[170,170,170] (NOT ~251).
+        let repeated = px(45, 40);
         assert!(
-            repeated[0] <= 2 && repeated[1] <= 2 && (2..=7).contains(&repeated[2]),
-            "SVG dense pass-budget fallback must preserve 6x repeated 50%-gray Multiply (~[0,0,4], NOT ~[0,0,128]), got {repeated:?}"
+            (165..=175).contains(&repeated[2])
+                && (165..=175).contains(&repeated[0])
+                && (165..=175).contains(&repeated[1]),
+            "SVG dense pass-budget fallback must preserve 6x Multiply–Screen copy order (~[170,170,170], NOT blue ~251), got {repeated:?}"
+        );
+    }
+
+    #[test]
+    fn tiling_pattern_passthrough_form_and_interleaved_draws_preserve_backdrop_in_svg() {
+        // Red Normal left half [0..10], white Multiply right half [10..20].
+        let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 20.0, 20.0));
+        cell.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 10.0, 20.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(1.0, 0.0, 0.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        cell.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Multiply,
+            isolated: true,
+            knockout: false,
+            bounds: Rect::new(0.0, 0.0, 20.0, 20.0),
+            alpha: 1.0,
+            mask: None,
+        });
+        cell.push(RenderCommand::FillPath {
+            path: rect_path(10.0, 0.0, 20.0, 20.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::white()),
+            alpha: 1.0,
+            overprint: None,
+        });
+        cell.push(RenderCommand::PopBlendGroup);
+        let tiling = std::sync::Arc::new(zpdf_display_list::TilingPattern {
+            commands: std::sync::Arc::new(cell),
+            bbox: Rect::new(0.0, 0.0, 20.0, 20.0),
+            x_step: 20.0,
+            y_step: 20.0,
+            matrix: zpdf_core::Matrix::identity(),
+            tiling_type: 1,
+        });
+
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 120.0, 120.0));
+        // Opaque blue backdrop across the entire page.
+        dl.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 120.0, 120.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(0.0, 0.0, 1.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+
+        // 1. Passthrough form (full-opacity, non-isolated Normal, no soft mask)
+        //    wrapping a 50%-opacity patterned fill (y=[80..120]) and stroke (y=[40..80]).
+        dl.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Normal,
+            isolated: false,
+            knockout: false,
+            bounds: Rect::new(0.0, 40.0, 120.0, 120.0),
+            alpha: 1.0,
+            mask: None,
+        });
+        dl.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 80.0, 40.0, 120.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(std::sync::Arc::clone(&tiling)),
+            alpha: 0.5,
+            overprint: None,
+        });
+        let mut line = Path::new();
+        line.move_to(Point::new(20.0, 40.0));
+        line.line_to(Point::new(20.0, 80.0));
+        dl.push(RenderCommand::StrokePath {
+            path: line,
+            style: StrokeStyle {
+                width: 40.0,
+                ..StrokeStyle::default()
+            },
+            paint: Paint::Tiling(std::sync::Arc::clone(&tiling)),
+            alpha: 0.5,
+            overprint: None,
+        });
+        dl.push(RenderCommand::PopBlendGroup);
+
+        // 2. 70 interleaved solid + translucent patterned fills (would exceed
+        //    MAX_BACKDROP_SNAPSHOTS = 64 if each solid draw forced a new snapshot),
+        //    followed by a 71st fill on x=[0..40], y=[0..40] over clean blue.
+        for i in 0..70 {
+            let x = 60.0 + (i % 10) as f64 * 4.0;
+            dl.push(RenderCommand::FillPath {
+                path: rect_path(x, 0.0, x + 2.0, 10.0),
+                rule: FillRule::NonZero,
+                paint: Paint::Solid(Color::rgb(0.0, 1.0, 0.0)),
+                alpha: 1.0,
+                overprint: None,
+            });
+            dl.push(RenderCommand::FillPath {
+                path: rect_path(x, 12.0, x + 2.0, 20.0),
+                rule: FillRule::NonZero,
+                paint: Paint::Tiling(std::sync::Arc::clone(&tiling)),
+                alpha: 0.5,
+                overprint: None,
+            });
+        }
+        dl.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 40.0, 40.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(tiling),
+            alpha: 0.5,
+            overprint: None,
+        });
+
+        let svg = display_list_to_svg(
+            &dl,
+            &FontCache::new(),
+            &ImageCache::new(),
+            &SvgOptions::default(),
+        );
+        let tree = resvg::usvg::Tree::from_data(svg.as_bytes(), &resvg::usvg::Options::default())
+            .expect("valid SVG");
+        let mut pixmap = resvg::tiny_skia::Pixmap::new(120, 120).expect("pixmap");
+        let sx = 120.0 / tree.size().width();
+        let sy = 120.0 / tree.size().height();
+        resvg::render(
+            &tree,
+            resvg::tiny_skia::Transform::from_scale(sx, sy),
+            &mut pixmap.as_mut(),
+        );
+        let px = |x: u32, y_pdf: u32| -> [u8; 3] {
+            let p = pixmap.pixel(x, 119 - y_pdf).expect("in bounds");
+            [p.red(), p.green(), p.blue()]
+        };
+
+        for (label, y_pdf) in [
+            ("passthrough form fill", 100),
+            ("passthrough form stroke", 60),
+            ("71st interleaved fill past old snapshot cap", 20),
+        ] {
+            let right_px = px(15, y_pdf);
+            assert!(
+                right_px[0] <= 2 && right_px[1] <= 2 && right_px[2] >= 253,
+                "{label}: white Multiply right half over blue must stay pure blue (NOT ~(128,128,255)), got {right_px:?}"
+            );
+            let left_px = px(5, y_pdf);
+            assert!(
+                (124..=132).contains(&left_px[0])
+                    && left_px[1] <= 2
+                    && (124..=132).contains(&left_px[2]),
+                "{label}: 50% red left half over blue must be ~(128,0,128), got {left_px:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tiling_pattern_direct_glyph_run_renders_visible_text_in_svg() {
+        // Exercise the exact direct `RenderCommand::DrawGlyphRun` with `Paint::Tiling`
+        // (two opaque black Multiply segments) fixture via SVG export + resvg.
+        let mut objects: Vec<Vec<u8>> = Vec::new();
+        let push_stream = |dict: &str, data: &[u8]| {
+            let mut out = Vec::new();
+            out.extend_from_slice(
+                format!("<< {dict} /Length {} >>\nstream\n", data.len()).as_bytes(),
+            );
+            out.extend_from_slice(data);
+            out.extend_from_slice(b"\nendstream");
+            out
+        };
+        let gs_mul = b"<< /Type /ExtGState /BM /Multiply >>".to_vec();
+        let cell = push_stream(
+            "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+             /BBox [0 0 10 10] /XStep 10 /YStep 10 \
+             /Resources << /ExtGState << /GM 7 0 R >> >>",
+            b"/GM gs 0 0 0 rg 0 0 10 10 re f\n/GM gs 0 0 0 rg 0 0 10 10 re f",
+        );
+        let font = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec();
+        let content = push_stream(
+            "",
+            b"/Pattern cs /P0 scn 0 0 10 10 re f\n\
+              0 0 0 rg BT /F1 60 Tf 70 25 Td (O) Tj ET",
+        );
+        objects.push(b"<< /Type /Catalog /Pages 2 0 R >>".to_vec());
+        objects.push(b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec());
+        objects.push(
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 120 120] /Contents 4 0 R \
+              /Resources << /Pattern << /P0 5 0 R >> /Font << /F1 6 0 R >> >> >>"
+                .to_vec(),
+        );
+        objects.push(content);
+        objects.push(cell);
+        objects.push(font);
+        objects.push(gs_mul);
+
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let mut offsets = vec![0usize];
+        for (i, body) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+            pdf.extend_from_slice(body);
+            pdf.extend_from_slice(b"\nendobj\n");
+        }
+        let xref = pdf.len();
+        pdf.extend_from_slice(
+            format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+        );
+        for &off in &offsets[1..] {
+            pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                objects.len() + 1
+            )
+            .as_bytes(),
+        );
+
+        let doc = zpdf::PdfDocument::open(pdf).expect("open pdf");
+        let page = doc.page(0).expect("page 0");
+        let mut fonts = doc.load_page_fonts(&page);
+        let content_bytes = doc.page_content_bytes(&page).expect("content bytes");
+        let mut images = ImageCache::new();
+        let dl = zpdf_content::interpreter::ContentInterpreter::new(page.media_box)
+            .with_fonts(&mut fonts)
+            .with_document(doc.file(), &page.resources)
+            .with_images(&mut images)
+            .interpret(&content_bytes);
+        let tiling_paint = dl
+            .commands
+            .iter()
+            .find_map(|c| match c {
+                RenderCommand::FillPath {
+                    paint: p @ Paint::Tiling(_),
+                    ..
+                } => Some(p.clone()),
+                _ => None,
+            })
+            .expect("tiling paint");
+        let mut solid_glyph_dl = DisplayList::new(page.media_box);
+        let mut tiling_glyph_dl = DisplayList::new(page.media_box);
+        for cmd in &dl.commands {
+            if let RenderCommand::DrawGlyphRun(run) = cmd {
+                solid_glyph_dl.push(RenderCommand::DrawGlyphRun(run.clone()));
+                let mut tiled = run.clone();
+                tiled.paint = tiling_paint.clone();
+                tiling_glyph_dl.push(RenderCommand::DrawGlyphRun(tiled));
+            }
+        }
+        assert!(
+            !tiling_glyph_dl.commands.is_empty(),
+            "expected DrawGlyphRun"
+        );
+
+        let render_svg = |list: &DisplayList| {
+            let svg = display_list_to_svg(list, &fonts, &images, &SvgOptions::default());
+            let tree =
+                resvg::usvg::Tree::from_data(svg.as_bytes(), &resvg::usvg::Options::default())
+                    .expect("valid SVG");
+            let mut pixmap = resvg::tiny_skia::Pixmap::new(120, 120).expect("pixmap");
+            let sx = 120.0 / tree.size().width();
+            let sy = 120.0 / tree.size().height();
+            resvg::render(
+                &tree,
+                resvg::tiny_skia::Transform::from_scale(sx, sy),
+                &mut pixmap.as_mut(),
+            );
+            pixmap
+        };
+        let solid_pm = render_svg(&solid_glyph_dl);
+        let tiling_pm = render_svg(&tiling_glyph_dl);
+
+        let mut dark_pixels = 0usize;
+        let mut aa_pixels = 0usize;
+        for y in 20..110u32 {
+            for x in 65..118u32 {
+                let r_ref = solid_pm.pixel(x, y).unwrap().red();
+                let r_pat = tiling_pm.pixel(x, y).unwrap().red();
+                if r_pat < 30 {
+                    dark_pixels += 1;
+                }
+                if (60..=200).contains(&r_ref) {
+                    aa_pixels += 1;
+                    assert!(
+                        (r_pat as i32 - r_ref as i32).abs() <= 4,
+                        "SVG DrawGlyphRun AA pixel ({x},{y}) diverged: solid={r_ref}, tiling={r_pat}"
+                    );
+                }
+            }
+        }
+        assert!(
+            dark_pixels >= 100,
+            "SVG DrawGlyphRun with Paint::Tiling must render visible 'O', found {dark_pixels} dark pixels"
+        );
+        assert!(
+            aa_pixels >= 10,
+            "expected anti-aliased edge pixels in SVG 'O', found {aa_pixels}"
         );
     }
 }

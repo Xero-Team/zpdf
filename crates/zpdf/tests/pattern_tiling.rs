@@ -2144,21 +2144,31 @@ fn dense_overlapping_cell_exceeding_pass_budget_preserves_trailing_detail() {
     );
 
     // Cell B: 175 non-coalesceable alternating Multiply/Darken spanning marks
-    // across 6 steps (6 × 175 = 1,050 > 1,024 pass budget), with one spanning
-    // Multiply mark set to 50% gray (0.5) so 6 repeated Multiply copies must
-    // reduce opaque blue from 255 to ~4 (NOT 128), plus a trailing black detail
-    // in step 0, on a 2×2 step (132×132 fill = 66×66 = 4,356 > 4,096 tiles).
+    // across 6 steps (6 × 175 = 1,050 > 1,024 pass budget), with a spanning
+    // opaque 50%-gray Multiply mark followed immediately by a spanning opaque
+    // 50%-gray Screen mark (so six Multiply–Screen pairs over blue yield
+    // ~170 in blue, whereas combining copies per segment yields ~251), plus a
+    // trailing black detail in step 0, on a 2×2 step (132×132 fill = 66×66 =
+    // 4,356 > 4,096 tiles).
+    let gs_screen = b"<< /Type /ExtGState /BM /Screen >>".to_vec();
     let mut cell_alt_stream = String::new();
     for k in 0..175 {
-        let gs = if k % 2 == 0 { "/GM" } else { "/GD" };
-        let rgb = if k == 20 { "0.5 0.5 0.5" } else { "1 1 1" };
+        let (gs, rgb) = if k == 20 {
+            ("/GM", "0.5 0.5 0.5")
+        } else if k == 21 {
+            ("/GS", "0.5 0.5 0.5")
+        } else if k % 2 == 0 {
+            ("/GM", "1 1 1")
+        } else {
+            ("/GD", "1 1 1")
+        };
         cell_alt_stream.push_str(&format!("{gs} gs {rgb} rg 0 0 12 2 re f\n"));
     }
     cell_alt_stream.push_str("/GM gs 0 0 0 rg 0 0 1 2 re f\n");
     let cell_alt = stream_obj(
         "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
          /BBox [0 0 12 2] /XStep 2 /YStep 2 \
-         /Resources << /ExtGState << /GM 7 0 R /GD 8 0 R >> >>",
+         /Resources << /ExtGState << /GM 7 0 R /GD 8 0 R /GS 9 0 R >> >>",
         cell_alt_stream.as_bytes(),
     );
 
@@ -2179,6 +2189,7 @@ fn dense_overlapping_cell_exceeding_pass_budget_preserves_trailing_detail() {
         cell_alt,                                      // 6
         gs_mul,                                        // 7
         gs_dark,                                       // 8
+        gs_screen,                                     // 9
     ]);
     let (_dl, _stats, page) = render_with_stats(pdf, 1.0);
 
@@ -2194,8 +2205,9 @@ fn dense_overlapping_cell_exceeding_pass_budget_preserves_trailing_detail() {
         "Cell A white Multiply marks must preserve blue backdrop",
     );
 
-    // Cell B (175 alternating Multiply/Darken > 1,024 passes): x mod 2 == 0 is black,
-    // x mod 2 == 1 gets 6 overlapping copies of 50%-gray Multiply over blue -> ~4 (NOT 128).
+    // Cell B (175 alternating Multiply/Darken + gray Multiply/Screen pair > 1,024 passes):
+    // x mod 2 == 0 is black detail; x mod 2 == 1 gets 6 Multiply–Screen pairs over blue -> ~170
+    // (NOT ~251 from running 6 Multiplies followed by 6 Screens).
     assert_rgbish(
         px_on(&page, 260.0, 1.0, 340.2, 66.5),
         [0, 0, 0],
@@ -2203,7 +2215,53 @@ fn dense_overlapping_cell_exceeding_pass_budget_preserves_trailing_detail() {
     );
     let bg_b = px_on(&page, 260.0, 1.0, 341.2, 66.5);
     assert!(
-        bg_b[0] <= 2 && bg_b[1] <= 2 && (2..=7).contains(&bg_b[2]),
-        "Cell B 6x overlapping 50%-gray Multiply over blue must be ~[0,0,4] (NOT ~[0,0,128]), got {bg_b:?}"
+        (165..=175).contains(&bg_b[2])
+            && (165..=175).contains(&bg_b[0])
+            && (165..=175).contains(&bg_b[1]),
+        "Cell B 6x Multiply–Screen pairs over blue must be ~[170,170,170] (NOT blue ~251), got {bg_b:?}"
+    );
+}
+
+/// Regression: a small outline-font glyph inside a non-isolated `/BM /Screen`
+/// group on a 7,000 × 7,000 raster must scope tightly to the glyph bounds (with
+/// live target dimensions available before `pixmap.take()`) rather than falling
+/// back to page-wide banding or dropping the group.
+#[test]
+fn small_outline_glyph_in_non_isolated_screen_group_on_7000x7000_raster() {
+    let gs_screen = b"<< /Type /ExtGState /BM /Screen >>".to_vec();
+    let font = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec();
+    let form = stream_obj(
+        "/Type /XObject /Subtype /Form /BBox [0 0 7000 7000] \
+         /Group << /S /Transparency /I false >> \
+         /Resources << /Font << /F1 6 0 R >> >>",
+        b"0.5 0.5 0.5 rg BT /F1 40 Tf 100 100 Td (I) Tj ET",
+    );
+    let content = stream_obj("", b"0.5 0.5 0.5 rg 0 0 7000 7000 re f\n/GS gs /FM Do");
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 7000 7000] /Contents 4 0 R \
+          /Resources << /XObject << /FM 5 0 R >> /ExtGState << /GS 7 0 R >> >> >>"
+            .to_vec(), // 3
+        content,                                       // 4
+        form,                                          // 5
+        font,                                          // 6
+        gs_screen,                                     // 7
+    ]);
+    let (_dl, _stats, page) = render_with_stats(pdf, 1.0);
+    assert_eq!((page.width, page.height), (7000, 7000));
+    // Check that the glyph 'I' painted visibly (Screen(0.5, 0.5) ≈ 191 over 128 gray).
+    let mut brightened = 0usize;
+    for y_pdf in 100..135 {
+        for x in 100..120 {
+            let p = px_on(&page, 7000.0, 1.0, x as f64 + 0.5, y_pdf as f64 + 0.5);
+            if p[0] >= 180 && p[1] >= 180 && p[2] >= 180 {
+                brightened += 1;
+            }
+        }
+    }
+    assert!(
+        brightened >= 20,
+        "outline glyph inside non-isolated Screen group on 7000x7000 raster must render ~191 pixels, found {brightened}"
     );
 }

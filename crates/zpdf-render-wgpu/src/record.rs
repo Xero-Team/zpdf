@@ -186,26 +186,52 @@ impl SyntheticTileKey {
     }
 }
 
+/// How a [`SyntheticTile`] is produced in `end_page`.
+pub enum SyntheticTileKind {
+    /// Standard recorded op stream rendered directly into the tile texture.
+    Direct(Vec<PageOp>),
+    /// Derived Multiply pass tile of an affine copy-order dense tiling collapse
+    /// (`f(1)` = `tile1`, `f(0)` = `tile0`, accumulated alpha = `tile_a`).
+    AffineMul { tile0: u32, tile1: u32, tile_a: u32 },
+    /// Derived Screen pass tile of an affine copy-order dense tiling collapse
+    /// (`f(0)` = `tile0`, accumulated alpha = `tile_a`).
+    AffineScr { tile0: u32, tile_a: u32 },
+}
+
 /// Recorded cell content for a dense tiling pattern (> 4,096 visible tiles),
 /// rendered once into an offscreen tile texture and sampled with `Repeat`.
 pub struct SyntheticTile {
     pub width: u32,
     pub height: u32,
     pub nearest: bool,
-    pub ops: Vec<PageOp>,
+    pub kind: SyntheticTileKind,
     /// Retains the source cell commands so `Arc::as_ptr` keys stay unique for the page.
     pub _keep_commands: std::sync::Arc<zpdf_display_list::DisplayList>,
 }
 
 impl SyntheticTile {
+    pub fn ops(&self) -> &[PageOp] {
+        match &self.kind {
+            SyntheticTileKind::Direct(ops) => ops.as_slice(),
+            SyntheticTileKind::AffineMul { .. } | SyntheticTileKind::AffineScr { .. } => &[],
+        }
+    }
+
     pub fn has_blend_groups(&self) -> bool {
-        self.ops
+        self.ops()
             .iter()
             .any(|o| matches!(o, PageOp::PushBlend { .. }))
     }
 
     pub fn uses_reset(&self) -> bool {
-        self.ops.iter().any(|o| matches!(o, PageOp::ResetStencil))
+        self.ops().iter().any(|o| matches!(o, PageOp::ResetStencil))
+    }
+
+    pub fn needs_fullscreen(&self) -> bool {
+        match &self.kind {
+            SyntheticTileKind::Direct(_) => self.uses_reset() || self.has_blend_groups(),
+            SyntheticTileKind::AffineMul { .. } | SyntheticTileKind::AffineScr { .. } => true,
+        }
     }
 }
 

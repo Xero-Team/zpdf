@@ -54,6 +54,83 @@ pub fn render_glyph_run_transformed(
     }
 }
 
+/// Render one glyph run's coverage as opaque white (`[1.0; 4]`) under `ctm`,
+/// ignoring `run.paint` and `run.alpha`, so `Paint::Tiling` glyph runs can use
+/// the glyph outlines / atlas / Type 3 shapes as an alpha coverage mask.
+pub fn render_glyph_run_mask_transformed(
+    rec: &mut PageRecorder,
+    fonts: &FontCache,
+    map: &PageMap,
+    run: &GlyphRun,
+    ctm: &Matrix,
+) {
+    let tm = if *ctm == Matrix::identity() {
+        run.transform
+    } else {
+        ctm.concat(&run.transform)
+    };
+    render_glyph_run_colored(rec, fonts, map, run, &tm, [1.0, 1.0, 1.0, 1.0]);
+}
+
+/// Conservative page-space bounding box of `run` under `ctm` for outline fonts.
+/// Returns `None` for Type 3 or unknown fonts (callers fall back to page rect).
+pub fn glyph_run_page_bounds_transformed(
+    fonts: &FontCache,
+    run: &GlyphRun,
+    ctm: &Matrix,
+) -> Option<zpdf_core::Rect> {
+    let font = fonts.get(run.font_id)?;
+    if !font.has_font_data() || font.is_type3() {
+        return None;
+    }
+    let upem = font.units_per_em;
+    if !(upem.is_finite() && upem > 0.0) {
+        return None;
+    }
+    let tm = if *ctm == Matrix::identity() {
+        run.transform
+    } else {
+        ctm.concat(&run.transform)
+    };
+    let (mut x0, mut y0) = (f64::INFINITY, f64::INFINITY);
+    let (mut x1, mut y1) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+    let mut visit = |gx: f64, gy: f64, off: (f32, f32)| {
+        let tx = gx / upem * run.font_size as f64 * run.h_scale as f64 + off.0 as f64;
+        let ty = gy / upem * run.font_size as f64 + off.1 as f64;
+        let px = tm.a * tx + tm.c * ty + tm.e;
+        let py = tm.b * tx + tm.d * ty + tm.f;
+        if px.is_finite() && py.is_finite() {
+            x0 = x0.min(px);
+            y0 = y0.min(py);
+            x1 = x1.max(px);
+            y1 = y1.max(py);
+        }
+    };
+    for g in &run.glyphs {
+        let Some(outline) = font.glyph_outline(g.glyph_id) else {
+            continue;
+        };
+        let off = (g.x, g.y);
+        for cmd in &outline.commands {
+            match *cmd {
+                OutlineCommand::MoveTo(x, y) | OutlineCommand::LineTo(x, y) => visit(x, y, off),
+                OutlineCommand::QuadTo(x1p, y1p, x, y) => {
+                    visit(x1p, y1p, off);
+                    visit(x, y, off);
+                }
+                OutlineCommand::CurveTo(x1p, y1p, x2p, y2p, x, y) => {
+                    visit(x1p, y1p, off);
+                    visit(x2p, y2p, off);
+                    visit(x, y, off);
+                }
+                OutlineCommand::Close => {}
+            }
+        }
+    }
+    (x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite() && x1 > x0 && y1 > y0)
+        .then(|| zpdf_core::Rect::new(x0 - 1.0, y0 - 1.0, x1 + 1.0, y1 + 1.0))
+}
+
 fn render_glyph_run_with_tm(
     rec: &mut PageRecorder,
     fonts: &FontCache,
@@ -61,18 +138,29 @@ fn render_glyph_run_with_tm(
     run: &GlyphRun,
     tm: &Matrix,
 ) {
-    let Some(font) = fonts.get(run.font_id) else {
-        return;
-    };
-    if !font.has_font_data() {
-        return;
-    }
     let Paint::Solid(c) = &run.paint else {
         return;
     };
     let color = quantize_premul(c, run.alpha);
     if color[3] == 0.0 {
         return; // fully transparent — contributes nothing (CPU draws invisibly)
+    }
+    render_glyph_run_colored(rec, fonts, map, run, tm, color);
+}
+
+fn render_glyph_run_colored(
+    rec: &mut PageRecorder,
+    fonts: &FontCache,
+    map: &PageMap,
+    run: &GlyphRun,
+    tm: &Matrix,
+    color: [f32; 4],
+) {
+    let Some(font) = fonts.get(run.font_id) else {
+        return;
+    };
+    if !font.has_font_data() {
+        return;
     }
 
     if font.is_type3() {

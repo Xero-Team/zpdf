@@ -103,7 +103,10 @@ fn referenced_image_ids(ops: &[PageOp], tiles: &[record::SyntheticTile]) -> Vec<
     let mut seen = std::collections::HashSet::new();
     let mut stack = vec![ops];
     for tile in tiles {
-        stack.push(tile.ops.as_slice());
+        let ops = tile.ops();
+        if !ops.is_empty() {
+            stack.push(ops);
+        }
     }
     while let Some(ops) = stack.pop() {
         for op in ops {
@@ -542,14 +545,30 @@ impl<'a> RenderBackend for WgpuRenderer<'a> {
             }
             RenderCommand::DrawGlyphRun(run) => {
                 if let Some(fonts) = self.font_cache {
-                    match run.overprint {
-                        Some(op) if op.active != 0 => {
-                            page.recorder.push_overprint(op);
-                            glyph::render_glyph_run(&mut page.recorder, fonts, &page.map, run);
-                            page.recorder.pop_blend();
+                    if let Paint::Tiling(tiling) = &run.paint {
+                        let id = zpdf_core::Matrix::identity();
+                        record_tiling_glyph_run(
+                            &mut page.recorder,
+                            run,
+                            tiling,
+                            &id,
+                            fonts,
+                            self.image_cache,
+                            &page.map,
+                            0,
+                        );
+                    } else {
+                        match run.overprint {
+                            Some(op) if op.active != 0 => {
+                                page.recorder.push_overprint(op);
+                                glyph::render_glyph_run(&mut page.recorder, fonts, &page.map, run);
+                                page.recorder.pop_blend();
+                            }
+                            Some(_) => {}
+                            None => {
+                                glyph::render_glyph_run(&mut page.recorder, fonts, &page.map, run)
+                            }
                         }
-                        Some(_) => {}
-                        None => glyph::render_glyph_run(&mut page.recorder, fonts, &page.map, run),
                     }
                 }
             }
@@ -687,8 +706,10 @@ impl<'a> WgpuRenderer<'a> {
         let mut synthetic_tiles = std::mem::take(&mut page.recorder.synthetic_tiles);
         let mut tile_fs_ranges = Vec::with_capacity(synthetic_tiles.len());
         for tile in &mut synthetic_tiles {
-            tile.ops = batch::batch_ops(std::mem::take(&mut tile.ops));
-            let tile_fs = if tile.uses_reset() || tile.has_blend_groups() {
+            if let record::SyntheticTileKind::Direct(ref mut ops) = tile.kind {
+                *ops = batch::batch_ops(std::mem::take(ops));
+            }
+            let tile_fs = if tile.needs_fullscreen() {
                 page.recorder
                     .append_fullscreen(tile.width as f32, tile.height as f32)
             } else {
@@ -879,10 +900,21 @@ impl<'a> WgpuRenderer<'a> {
         // Render dense tiling-pattern cells once into repeat-sampled textures
         // before the main page pass. Ordered bottom-up so nested dense tiles
         // are already present in `tile_bgs` when outer tiles sample them.
+        enum TileOutput {
+            Single(Box<blend::RenderLayer>),
+            Pooled(blend::LayerPool, usize),
+        }
+        impl TileOutput {
+            fn sampleable_view(&self) -> &wgpu::TextureView {
+                match self {
+                    Self::Single(layer) => layer.sampleable_view(),
+                    Self::Pooled(pool, idx) => pool.get(*idx).sampleable_view(),
+                }
+            }
+        }
         let mut tile_bgs: std::collections::HashMap<u32, wgpu::BindGroup> =
             std::collections::HashMap::with_capacity(synthetic_tiles.len());
-        let mut tile_layers: Vec<blend::RenderLayer> = Vec::new();
-        let mut tile_pools: Vec<blend::LayerPool> = Vec::new();
+        let mut tile_outputs: Vec<TileOutput> = Vec::with_capacity(synthetic_tiles.len());
         let mut keep_bgs: Vec<wgpu::BindGroup> = Vec::new();
         let mut keep_bufs: Vec<wgpu::Buffer> = Vec::new();
         let mut remaining_layer_budget = layer_budget;
@@ -926,88 +958,222 @@ impl<'a> WgpuRenderer<'a> {
             } else {
                 &ctx.pipelines.repeat_sampler
             };
-            let tile_bg = if tile.has_blend_groups() {
-                let tile_layer_bytes =
-                    blend::estimated_layer_bytes(tile.width, tile.height, ctx.sample_count);
-                let mut pool = blend::LayerPool::new(
-                    tile.width,
-                    tile.height,
-                    ctx.sample_count,
-                    tile_layer_bytes.saturating_add(remaining_layer_budget),
-                );
-                let base = pool.acquire(device)?;
-                encode_budget.charge_pass(1)?;
-                {
-                    let pass = begin_layer_pass(
-                        &mut encoder,
-                        pool.get(base),
-                        wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        wgpu::LoadOp::Clear(0),
+            let output = match &tile.kind {
+                record::SyntheticTileKind::Direct(ops) if tile.has_blend_groups() => {
+                    let tile_layer_bytes =
+                        blend::estimated_layer_bytes(tile.width, tile.height, ctx.sample_count);
+                    let mut pool = blend::LayerPool::new(
+                        tile.width,
+                        tile.height,
+                        ctx.sample_count,
+                        tile_layer_bytes.saturating_add(remaining_layer_budget),
                     );
-                    drop(pass);
-                }
-                let final_layer = composite_into(
-                    ctx,
-                    &mut encoder,
-                    &mut pool,
-                    base,
-                    &tile.ops,
-                    &tile_res,
-                    &mut keep_bgs,
-                    &mut keep_bufs,
-                    &mut encode_budget,
-                )?;
-                let extra_layers = pool.allocated().saturating_sub(1) as u64;
-                remaining_layer_budget = remaining_layer_budget
-                    .saturating_sub(extra_layers.saturating_mul(tile_layer_bytes));
-                let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("zpdf-tile-bg"),
-                    layout: &ctx.pipelines.tex_bgl,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::TextureView(
-                                pool.get(final_layer).sampleable_view(),
-                            ),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::Sampler(sampler),
-                        },
-                    ],
-                });
-                tile_pools.push(pool);
-                bg
-            } else {
-                encode_budget.charge_pass(tile.ops.len())?;
-                let layer =
-                    blend::RenderLayer::new(device, tile.width, tile.height, ctx.sample_count);
-                {
-                    let mut pass = begin_layer_pass(
+                    let base = pool.acquire(device)?;
+                    encode_budget.charge_pass(1)?;
+                    {
+                        let pass = begin_layer_pass(
+                            &mut encoder,
+                            pool.get(base),
+                            wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            wgpu::LoadOp::Clear(0),
+                        );
+                        drop(pass);
+                    }
+                    let final_layer = composite_into(
+                        ctx,
                         &mut encoder,
-                        &layer,
-                        wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        wgpu::LoadOp::Clear(0),
-                    );
-                    replay_ops(&mut pass, &tile.ops, &tile_res);
+                        &mut pool,
+                        base,
+                        ops,
+                        &tile_res,
+                        &mut keep_bgs,
+                        &mut keep_bufs,
+                        &mut encode_budget,
+                    )?;
+                    let extra_layers = pool.allocated().saturating_sub(1) as u64;
+                    remaining_layer_budget = remaining_layer_budget
+                        .saturating_sub(extra_layers.saturating_mul(tile_layer_bytes));
+                    TileOutput::Pooled(pool, final_layer)
                 }
-                let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("zpdf-tile-bg"),
-                    layout: &ctx.pipelines.tex_bgl,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::TextureView(layer.sampleable_view()),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::Sampler(sampler),
-                        },
-                    ],
-                });
-                tile_layers.push(layer);
-                bg
+                record::SyntheticTileKind::Direct(ops) => {
+                    encode_budget.charge_pass(ops.len())?;
+                    let layer =
+                        blend::RenderLayer::new(device, tile.width, tile.height, ctx.sample_count);
+                    {
+                        let mut pass = begin_layer_pass(
+                            &mut encoder,
+                            &layer,
+                            wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            wgpu::LoadOp::Clear(0),
+                        );
+                        replay_ops(&mut pass, ops, &tile_res);
+                    }
+                    TileOutput::Single(Box::new(layer))
+                }
+                record::SyntheticTileKind::AffineMul {
+                    tile0,
+                    tile1,
+                    tile_a,
+                } => {
+                    encode_budget.charge_pass(1)?;
+                    let layer =
+                        blend::RenderLayer::new(device, tile.width, tile.height, ctx.sample_count);
+                    let mask_u = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("zpdf-affine-mul-uniform"),
+                        contents: bytemuck::bytes_of(&MaskUniform {
+                            kind: 2,
+                            dx: 0,
+                            dy: 0,
+                            non_isolated: 3,
+                            backdrop_luma: 0.0,
+                            group_alpha: 1.0,
+                            _pad2: 0.0,
+                            _pad3: 0.0,
+                            lut: pack_transfer_lut(None),
+                        }),
+                        usage: wgpu::BufferUsages::UNIFORM,
+                    });
+                    let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("zpdf-affine-mul-bg"),
+                        layout: &ctx.pipelines.mask_apply_bgl,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: wgpu::BindingResource::TextureView(
+                                    tile_outputs[*tile1 as usize].sampleable_view(),
+                                ),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::TextureView(
+                                    tile_outputs[*tile0 as usize].sampleable_view(),
+                                ),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: mask_u.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 3,
+                                resource: wgpu::BindingResource::TextureView(
+                                    tile_outputs[*tile_a as usize].sampleable_view(),
+                                ),
+                            },
+                        ],
+                    });
+                    {
+                        let mut pass = begin_layer_pass(
+                            &mut encoder,
+                            &layer,
+                            wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            wgpu::LoadOp::Clear(0),
+                        );
+                        pass.set_bind_group(0, Some(&tile_page_bg), &[]);
+                        if let (Some(fs), Some((svb, sib))) = (tile_res.fs_range, tile_res.solid) {
+                            pass.set_pipeline(&ctx.pipelines.mask_apply);
+                            pass.set_bind_group(1, Some(&bg), &[]);
+                            pass.set_vertex_buffer(0, svb.slice(..));
+                            pass.set_index_buffer(sib.slice(..), wgpu::IndexFormat::Uint32);
+                            pass.set_stencil_reference(0);
+                            pass.draw_indexed(
+                                fs.first_index..fs.first_index + fs.index_count,
+                                fs.base_vertex,
+                                0..1,
+                            );
+                        }
+                    }
+                    keep_bgs.push(bg);
+                    keep_bufs.push(mask_u);
+                    TileOutput::Single(Box::new(layer))
+                }
+                record::SyntheticTileKind::AffineScr { tile0, tile_a } => {
+                    encode_budget.charge_pass(1)?;
+                    let layer =
+                        blend::RenderLayer::new(device, tile.width, tile.height, ctx.sample_count);
+                    let mask_u = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("zpdf-affine-scr-uniform"),
+                        contents: bytemuck::bytes_of(&MaskUniform {
+                            kind: 2,
+                            dx: 0,
+                            dy: 0,
+                            non_isolated: 4,
+                            backdrop_luma: 0.0,
+                            group_alpha: 1.0,
+                            _pad2: 0.0,
+                            _pad3: 0.0,
+                            lut: pack_transfer_lut(None),
+                        }),
+                        usage: wgpu::BufferUsages::UNIFORM,
+                    });
+                    let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("zpdf-affine-scr-bg"),
+                        layout: &ctx.pipelines.mask_apply_bgl,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: wgpu::BindingResource::TextureView(
+                                    tile_outputs[*tile0 as usize].sampleable_view(),
+                                ),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::TextureView(
+                                    tile_outputs[*tile0 as usize].sampleable_view(),
+                                ),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: mask_u.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 3,
+                                resource: wgpu::BindingResource::TextureView(
+                                    tile_outputs[*tile_a as usize].sampleable_view(),
+                                ),
+                            },
+                        ],
+                    });
+                    {
+                        let mut pass = begin_layer_pass(
+                            &mut encoder,
+                            &layer,
+                            wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            wgpu::LoadOp::Clear(0),
+                        );
+                        pass.set_bind_group(0, Some(&tile_page_bg), &[]);
+                        if let (Some(fs), Some((svb, sib))) = (tile_res.fs_range, tile_res.solid) {
+                            pass.set_pipeline(&ctx.pipelines.mask_apply);
+                            pass.set_bind_group(1, Some(&bg), &[]);
+                            pass.set_vertex_buffer(0, svb.slice(..));
+                            pass.set_index_buffer(sib.slice(..), wgpu::IndexFormat::Uint32);
+                            pass.set_stencil_reference(0);
+                            pass.draw_indexed(
+                                fs.first_index..fs.first_index + fs.index_count,
+                                fs.base_vertex,
+                                0..1,
+                            );
+                        }
+                    }
+                    keep_bgs.push(bg);
+                    keep_bufs.push(mask_u);
+                    TileOutput::Single(Box::new(layer))
+                }
             };
+            let tile_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("zpdf-tile-bg"),
+                layout: &ctx.pipelines.tex_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(output.sampleable_view()),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(sampler),
+                    },
+                ],
+            });
+            tile_outputs.push(output);
             keep_bgs.push(tile_page_bg);
             keep_bufs.push(tile_ubuf);
             tile_bgs.insert(idx as u32, tile_bg);
@@ -1091,8 +1257,7 @@ impl<'a> WgpuRenderer<'a> {
             self.last_encode_passes = encode_budget.passes_used;
         }
         ctx.queue.submit(Some(encoder.finish()));
-        drop(tile_layers);
-        drop(tile_pools);
+        drop(tile_outputs);
         drop(keep_bgs);
         drop(keep_bufs);
         let result = if readback {
@@ -1307,14 +1472,18 @@ fn record_dl_commands_at(
             }
             RenderCommand::DrawGlyphRun(run) => {
                 if let Some(f) = fonts {
-                    match run.overprint {
-                        Some(op) if op.active != 0 => {
-                            rec.push_overprint(op);
-                            glyph::render_glyph_run_transformed(rec, f, map, run, ctm);
-                            rec.pop_blend();
+                    if let Paint::Tiling(tiling) = &run.paint {
+                        record_tiling_glyph_run(rec, run, tiling, ctm, f, images, map, depth);
+                    } else {
+                        match run.overprint {
+                            Some(op) if op.active != 0 => {
+                                rec.push_overprint(op);
+                                glyph::render_glyph_run_transformed(rec, f, map, run, ctm);
+                                rec.pop_blend();
+                            }
+                            Some(_) => {}
+                            None => glyph::render_glyph_run_transformed(rec, f, map, run, ctm),
                         }
-                        Some(_) => {}
-                        None => glyph::render_glyph_run_transformed(rec, f, map, run, ctm),
                     }
                 }
             }
@@ -1870,7 +2039,7 @@ fn record_tiling_pattern_rasterized(
                 width: tile_w,
                 height: tile_h,
                 nearest: exact_1to1,
-                ops,
+                kind: record::SyntheticTileKind::Direct(ops),
                 _keep_commands: std::sync::Arc::clone(&tiling.commands),
             },
         )
@@ -2053,8 +2222,280 @@ fn record_tiling_pattern_rasterized(
                     tracing::warn!(
                         total_passes,
                         limit = MAX_DENSE_BLEND_PASSES,
-                        "dense GPU tiling blend plan exceeds pass budget; flattening overlap copies per step"
+                        "dense GPU tiling blend plan exceeds pass budget; collapsing overlapping copies into affine copy-order tiles"
                     );
+                    // Preserve exact per-copy draw order (all steps of copy 0,
+                    // then all steps of copy 1, ...) by evaluating the cell's
+                    // overlapping copies once onto tiny black (f(0)), white
+                    // (f(1)), and transparent (α_tile) tiles, then deriving
+                    // repeating Multiply + Screen tiles (2 page passes total).
+                    const MAX_AFFINE_TILE_PASSES: usize = 4096;
+                    #[allow(clippy::too_many_arguments)]
+                    fn record_tile_steps_copy(
+                        r: &mut PageRecorder,
+                        tiling: &zpdf_display_list::TilingPattern,
+                        steps: &[zpdf_display_list::TilingBlendStep],
+                        di: i64,
+                        dj: i64,
+                        copy_ctm: &zpdf_core::Matrix,
+                        fonts: Option<&zpdf_font::FontCache>,
+                        images: Option<&zpdf_image::ImageCache>,
+                        tile_map: &PageMap,
+                        depth: u8,
+                        alpha_only: bool,
+                        remaining: &mut usize,
+                    ) {
+                        for step in steps {
+                            if !r.can_record() || *remaining == 0 {
+                                return;
+                            }
+                            match step {
+                                zpdf_display_list::TilingBlendStep::Segment(seg) => {
+                                    if !seg.intersects_period(tiling, di, dj) {
+                                        continue;
+                                    }
+                                    *remaining = remaining.saturating_sub(1);
+                                    let wrap = !alpha_only
+                                        && seg.blend_mode != zpdf_display_list::BlendMode::Normal
+                                        && r.can_push_blend();
+                                    if wrap {
+                                        r.push_blend(seg.blend_mode, 1.0, None);
+                                    }
+                                    record_dl_commands_at(
+                                        r,
+                                        &seg.commands,
+                                        copy_ctm,
+                                        fonts,
+                                        images,
+                                        tile_map,
+                                        depth + 1,
+                                    );
+                                    r.pop_all_clips();
+                                    if wrap {
+                                        r.pop_blend();
+                                    }
+                                }
+                                zpdf_display_list::TilingBlendStep::OpacityGroup {
+                                    alpha,
+                                    mask,
+                                    steps: inner,
+                                } => {
+                                    if mask
+                                        .as_ref()
+                                        .is_some_and(|m| !m.intersects_period(tiling, di, dj))
+                                        || !zpdf_display_list::TilingBlendStep::any_intersects_period(
+                                            inner, tiling, di, dj,
+                                        )
+                                    {
+                                        continue;
+                                    }
+                                    let a = unit(*alpha);
+                                    if a <= 0.0 {
+                                        continue;
+                                    }
+                                    let mask_ops = mask.as_ref().map(|m_seg| {
+                                        let m_ops = r.record_subops(|mr| {
+                                            record_dl_commands_at(
+                                                mr,
+                                                &m_seg.commands,
+                                                copy_ctm,
+                                                fonts,
+                                                images,
+                                                tile_map,
+                                                depth + 1,
+                                            );
+                                            mr.pop_all_clips();
+                                        });
+                                        record::MaskOps {
+                                            ops: m_ops,
+                                            kind: zpdf_display_list::SoftMaskKind::Alpha,
+                                            backdrop_luma: 0.0,
+                                            dx: 0,
+                                            dy: 0,
+                                            transfer: None,
+                                        }
+                                    });
+                                    let wrap_group =
+                                        (a < 1.0 || mask_ops.is_some()) && r.can_push_blend();
+                                    if wrap_group {
+                                        if alpha_only {
+                                            r.push_blend(
+                                                zpdf_display_list::BlendMode::Normal,
+                                                a,
+                                                mask_ops,
+                                            );
+                                        } else {
+                                            r.push_non_isolated(a, mask_ops);
+                                        }
+                                    }
+                                    record_tile_steps_copy(
+                                        r, tiling, inner, di, dj, copy_ctm, fonts, images,
+                                        tile_map, depth, alpha_only, remaining,
+                                    );
+                                    if wrap_group {
+                                        r.pop_blend();
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    let build_affine_sample = |rec: &mut PageRecorder,
+                                               seed: Option<[f32; 4]>,
+                                               seg_idx: usize,
+                                               alpha_only: bool|
+                     -> Option<u32> {
+                        let key = record::SyntheticTileKey::new(
+                            tiling,
+                            seg_idx,
+                            None,
+                            zpdf_display_list::BlendMode::Normal,
+                            tile_w,
+                            tile_h,
+                            exact_1to1,
+                            rec.blend_depth_total(),
+                        );
+                        if let Some(id) = rec.cached_synthetic_tile(&key) {
+                            return Some(id);
+                        }
+                        let ops = rec.record_subops(|r| {
+                            let saved_rect = r.replace_page_rect(Some(tile_rect));
+                            if let Some(seed_color) = seed {
+                                let mut full = zpdf_display_list::Path::new();
+                                full.rect(tile_rect);
+                                r.add_fill(
+                                    &full,
+                                    zpdf_display_list::FillRule::NonZero,
+                                    seed_color,
+                                    &tile_map,
+                                );
+                            }
+                            let mut rem = MAX_AFFINE_TILE_PASSES;
+                            'copies: for dj in overlap.dj.clone() {
+                                for di in overlap.di.clone() {
+                                    if !r.can_record() || rem == 0 {
+                                        break 'copies;
+                                    }
+                                    let copy_ctm =
+                                        pat_to_tile.concat(&zpdf_core::Matrix::translate(
+                                            di as f64 * tiling.x_step,
+                                            dj as f64 * tiling.y_step,
+                                        ));
+                                    record_tile_steps_copy(
+                                        r, tiling, &steps, di, dj, &copy_ctm, fonts, images,
+                                        &tile_map, depth, alpha_only, &mut rem,
+                                    );
+                                    r.pop_all_clips();
+                                    r.close_open_blends();
+                                }
+                            }
+                            r.replace_page_rect(saved_rect);
+                        });
+                        if !rec.can_record() {
+                            return None;
+                        }
+                        rec.insert_synthetic_tile(
+                            key,
+                            record::SyntheticTile {
+                                width: tile_w,
+                                height: tile_h,
+                                nearest: exact_1to1,
+                                kind: record::SyntheticTileKind::Direct(ops),
+                                _keep_commands: std::sync::Arc::clone(&tiling.commands),
+                            },
+                        )
+                    };
+
+                    let mul_key = record::SyntheticTileKey::new(
+                        tiling,
+                        usize::MAX - 1,
+                        None,
+                        zpdf_display_list::BlendMode::Multiply,
+                        tile_w,
+                        tile_h,
+                        exact_1to1,
+                        rec.blend_depth_total(),
+                    );
+                    let scr_key = record::SyntheticTileKey::new(
+                        tiling,
+                        usize::MAX,
+                        None,
+                        zpdf_display_list::BlendMode::Screen,
+                        tile_w,
+                        tile_h,
+                        exact_1to1,
+                        rec.blend_depth_total(),
+                    );
+                    let affine_pair = match (
+                        rec.cached_synthetic_tile(&mul_key),
+                        rec.cached_synthetic_tile(&scr_key),
+                    ) {
+                        (Some(m_id), Some(s_id)) => Some((m_id, s_id)),
+                        _ => {
+                            let t0 = build_affine_sample(
+                                rec,
+                                Some([0.0, 0.0, 0.0, 1.0]),
+                                usize::MAX - 4,
+                                false,
+                            );
+                            let t1 = build_affine_sample(
+                                rec,
+                                Some([1.0, 1.0, 1.0, 1.0]),
+                                usize::MAX - 3,
+                                false,
+                            );
+                            let ta = build_affine_sample(rec, None, usize::MAX - 2, true);
+                            match (t0, t1, ta) {
+                                (Some(tile0), Some(tile1), Some(tile_a)) => {
+                                    let m_id = rec.insert_synthetic_tile(
+                                        mul_key,
+                                        record::SyntheticTile {
+                                            width: tile_w,
+                                            height: tile_h,
+                                            nearest: exact_1to1,
+                                            kind: record::SyntheticTileKind::AffineMul {
+                                                tile0,
+                                                tile1,
+                                                tile_a,
+                                            },
+                                            _keep_commands: std::sync::Arc::clone(&tiling.commands),
+                                        },
+                                    );
+                                    let s_id = rec.insert_synthetic_tile(
+                                        scr_key,
+                                        record::SyntheticTile {
+                                            width: tile_w,
+                                            height: tile_h,
+                                            nearest: exact_1to1,
+                                            kind: record::SyntheticTileKind::AffineScr {
+                                                tile0,
+                                                tile_a,
+                                            },
+                                            _keep_commands: std::sync::Arc::clone(&tiling.commands),
+                                        },
+                                    );
+                                    m_id.zip(s_id)
+                                }
+                                _ => None,
+                            }
+                        }
+                    };
+                    if let Some((mul_tile, scr_tile)) = affine_pair {
+                        if rec.can_push_blend() {
+                            rec.push_blend(zpdf_display_list::BlendMode::Multiply, seg_alpha, None);
+                            rec.add_tile(quad_opaque, mul_tile);
+                            rec.pop_blend();
+                            rec.push_blend(zpdf_display_list::BlendMode::Screen, seg_alpha, None);
+                            rec.add_tile(quad_opaque, scr_tile);
+                            rec.pop_blend();
+                        } else {
+                            rec.add_tile(seg_quad, mul_tile);
+                        }
+                        if wrap_alpha {
+                            rec.pop_blend();
+                        }
+                        return;
+                    }
                     false
                 } else {
                     true
@@ -2250,6 +2691,94 @@ fn record_tiling_stroke(
                 rec.pop_clip();
             }
         }
+    }
+}
+
+/// Record a `DrawGlyphRun` painted with a [`zpdf_display_list::TilingPattern`]
+/// by rasterizing the glyph outlines / atlas / Type 3 shapes into an alpha
+/// coverage mask and compositing the tiling pattern through that mask (both on
+/// top-level pages and nested inside tiling cells).
+#[allow(clippy::too_many_arguments)]
+fn record_tiling_glyph_run(
+    rec: &mut PageRecorder,
+    run: &zpdf_display_list::GlyphRun,
+    tiling: &zpdf_display_list::TilingPattern,
+    outer_ctm: &zpdf_core::Matrix,
+    fonts: &zpdf_font::FontCache,
+    images: Option<&zpdf_image::ImageCache>,
+    map: &PageMap,
+    depth: u8,
+) {
+    let opacity = unit(run.alpha);
+    if opacity <= 0.0 || !rec.can_record() {
+        return;
+    }
+    let bounds = glyph::glyph_run_page_bounds_transformed(fonts, run, outer_ctm)
+        .or_else(|| rec.page_rect())
+        .unwrap_or_else(|| zpdf_core::Rect::new(0.0, 0.0, 0.0, 0.0));
+    if bounds.width() <= 0.0 || bounds.height() <= 0.0 {
+        return;
+    }
+    let paint_masked = |rec: &mut PageRecorder, eff_opacity: f32| {
+        let shape_ops = rec.record_subops_clipped(|r| {
+            glyph::render_glyph_run_mask_transformed(r, fonts, map, run, outer_ctm);
+        });
+        if shape_ops.is_empty() {
+            return;
+        }
+        let shape_mask = record::MaskOps {
+            ops: shape_ops,
+            kind: zpdf_display_list::SoftMaskKind::Alpha,
+            backdrop_luma: 0.0,
+            dx: 0,
+            dy: 0,
+            transfer: None,
+        };
+        if !rec.can_push_blend() {
+            return;
+        }
+        if rec.tiling_is_backdrop_dependent(tiling) {
+            rec.with_non_isolated_shape_mask(eff_opacity, shape_mask, |r| {
+                record_tiling_pattern(
+                    r,
+                    tiling,
+                    outer_ctm,
+                    bounds,
+                    1.0,
+                    Some(fonts),
+                    images,
+                    map,
+                    depth,
+                );
+            });
+        } else {
+            rec.push_blend(
+                zpdf_display_list::BlendMode::Normal,
+                eff_opacity,
+                Some(shape_mask),
+            );
+            record_tiling_pattern(
+                rec,
+                tiling,
+                outer_ctm,
+                bounds,
+                1.0,
+                Some(fonts),
+                images,
+                map,
+                depth,
+            );
+            rec.pop_blend();
+        }
+    };
+    match run.overprint {
+        Some(op) if op.active != 0 => {
+            rec.push_overprint(op);
+            paint_masked(rec, opacity);
+            rec.pop_blend();
+        }
+        Some(_) => {}
+        None => paint_masked(rec, opacity),
     }
 }
 

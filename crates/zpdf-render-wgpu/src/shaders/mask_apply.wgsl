@@ -100,6 +100,39 @@ fn fs_mask(in: VsOut) -> @location(0) vec4<f32> {
         return vec4<f32>(c_g * ga, ga);
     }
 
+    if (mu.non_isolated == 3u) {
+        // Affine copy-order dense tiling collapse (Multiply pass tile):
+        // `group_tex` = f(1) over white, `mask_tex` = f(0) over black,
+        // `base_tex.a` = accumulated tile alpha `a_t`.
+        let a_t = textureLoad(base_tex, coord, 0).a;
+        if (a_t <= 0.0) {
+            return vec4<f32>(0.0);
+        }
+        let k = textureLoad(mask_tex, coord, 0).rgb;
+        let f1 = g.rgb;
+        let m = clamp(f1 - k, vec3<f32>(0.0), vec3<f32>(1.0) - k);
+        let one_minus_k = vec3<f32>(1.0) - k;
+        let t_mul = select(
+            vec3<f32>(0.0),
+            clamp(m / max(one_minus_k, vec3<f32>(1e-6)), vec3<f32>(0.0), vec3<f32>(1.0)),
+            one_minus_k > vec3<f32>(1e-6),
+        );
+        let r_mul = clamp(t_mul - vec3<f32>(1.0 - a_t), vec3<f32>(0.0), vec3<f32>(a_t));
+        return vec4<f32>(r_mul, a_t);
+    }
+
+    if (mu.non_isolated == 4u) {
+        // Affine copy-order dense tiling collapse (Screen pass tile):
+        // `mask_tex` = f(0) over black, `base_tex.a` = accumulated tile alpha `a_t`.
+        let a_t = textureLoad(base_tex, coord, 0).a;
+        if (a_t <= 0.0) {
+            return vec4<f32>(0.0);
+        }
+        let k = textureLoad(mask_tex, coord, 0).rgb;
+        let a_s = max(k.r, max(k.g, k.b));
+        return vec4<f32>(k, a_s);
+    }
+
     // Sample coverage at the destination shifted by the reuse offset. Reads
     // outside the built mask take the unpainted value — the /BC backdrop for a
     // luminosity mask, 0 for an alpha mask — which is what a fresh raster yields

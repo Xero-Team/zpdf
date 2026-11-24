@@ -1890,17 +1890,25 @@ fn gpu_dense_overlapping_cell_exceeding_pass_budget_preserves_trailing_detail() 
          /Resources << /ExtGState << /GM 7 0 R >> >>",
         cell_mul_stream.as_bytes(),
     );
+    let gs_screen = b"<< /Type /ExtGState /BM /Screen >>".to_vec();
     let mut cell_alt_stream = String::new();
     for k in 0..175 {
-        let gs = if k % 2 == 0 { "/GM" } else { "/GD" };
-        let rgb = if k == 20 { "0.5 0.5 0.5" } else { "1 1 1" };
+        let (gs, rgb) = if k == 20 {
+            ("/GM", "0.5 0.5 0.5")
+        } else if k == 21 {
+            ("/GS", "0.5 0.5 0.5")
+        } else if k % 2 == 0 {
+            ("/GM", "1 1 1")
+        } else {
+            ("/GD", "1 1 1")
+        };
         cell_alt_stream.push_str(&format!("{gs} gs {rgb} rg 0 0 12 2 re f\n"));
     }
     cell_alt_stream.push_str("/GM gs 0 0 0 rg 0 0 1 2 re f\n");
     let cell_alt = stream_obj(
         "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
          /BBox [0 0 12 2] /XStep 2 /YStep 2 \
-         /Resources << /ExtGState << /GM 7 0 R /GD 8 0 R >> >>",
+         /Resources << /ExtGState << /GM 7 0 R /GD 8 0 R /GS 9 0 R >> >>",
         cell_alt_stream.as_bytes(),
     );
     let content = stream_obj(
@@ -1920,6 +1928,7 @@ fn gpu_dense_overlapping_cell_exceeding_pass_budget_preserves_trailing_detail() 
         cell_alt,                                      // 6
         gs_mul,                                        // 7
         gs_dark,                                       // 8
+        gs_screen,                                     // 9
     ]);
 
     let doc = PdfDocument::open(pdf).expect("open pdf");
@@ -1966,8 +1975,223 @@ fn gpu_dense_overlapping_cell_exceeding_pass_budget_preserves_trailing_detail() 
     );
     let bg_b = px(341, 66);
     assert!(
-        bg_b[0] <= 2 && bg_b[1] <= 2 && (2..=7).contains(&bg_b[2]),
-        "GPU Cell B 6x overlapping 50%-gray Multiply over blue must be ~[0,0,4] (NOT ~[0,0,128]), got {bg_b:?}"
+        (165..=175).contains(&bg_b[2])
+            && (165..=175).contains(&bg_b[0])
+            && (165..=175).contains(&bg_b[1]),
+        "GPU Cell B 6x Multiply–Screen pairs over blue must be ~[170,170,170] (NOT blue ~251), got {bg_b:?}"
+    );
+}
+
+/// Regression: direct `RenderCommand::DrawGlyphRun` with `Paint::Tiling` must
+/// render visible patterned text on GPU for both page text and cell text
+/// (matching CPU and solid-black reference on AA edge pixels).
+#[test]
+fn gpu_tiling_glyph_run_renders_page_and_cell_text() {
+    let gs_mul = b"<< /Type /ExtGState /BM /Multiply >>".to_vec();
+    let cell = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 10 10] /XStep 10 /YStep 10 \
+         /Resources << /ExtGState << /GM 7 0 R >> >>",
+        b"/GM gs 0 0 0 rg 0 0 10 10 re f\n/GM gs 0 0 0 rg 0 0 10 10 re f",
+    );
+    let font = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec();
+    let build_pdf = |paint_cmds: &[u8]| {
+        let content = stream_obj("", paint_cmds);
+        assemble(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 120 120] /Contents 4 0 R \
+              /Resources << /Pattern << /P0 5 0 R >> /Font << /F1 6 0 R >> >> >>"
+                .to_vec(), // 3
+            content,                                       // 4
+            cell.clone(),                                  // 5
+            font.clone(),                                  // 6
+            gs_mul.clone(),                                // 7
+        ])
+    };
+
+    let pat_pdf = build_pdf(b"/Pattern cs /P0 scn 0 0 10 10 re f");
+    let doc_p = PdfDocument::open(pat_pdf).expect("open pat pdf");
+    let page_p = doc_p.page(0).expect("page 0");
+    let mut fonts_p = doc_p.load_page_fonts(&page_p);
+    let content_p = doc_p.page_content_bytes(&page_p).expect("content");
+    let mut images_p = ImageCache::new();
+    let pat_dl = ContentInterpreter::new(page_p.media_box)
+        .with_fonts(&mut fonts_p)
+        .with_document(doc_p.file(), &page_p.resources)
+        .with_images(&mut images_p)
+        .interpret(&content_p);
+    let tiling_paint = pat_dl
+        .commands
+        .iter()
+        .find_map(|c| match c {
+            zpdf::display_list::RenderCommand::FillPath {
+                paint: p @ zpdf::display_list::Paint::Tiling(_),
+                ..
+            } => Some(p.clone()),
+            _ => None,
+        })
+        .expect("tiling paint");
+
+    // 1. Direct page-level DrawGlyphRun with Paint::Tiling (matching pattern_tiling.rs fixture).
+    let glyph_pdf = build_pdf(b"0 0 0 rg BT /F1 60 Tf 70 25 Td (O) Tj ET");
+    let doc = PdfDocument::open(glyph_pdf).expect("open glyph pdf");
+    let page = doc.page(0).expect("page 0");
+    let mut fonts = doc.load_page_fonts(&page);
+    let content = doc.page_content_bytes(&page).expect("content");
+    let mut images = ImageCache::new();
+    let solid_dl = ContentInterpreter::new(page.media_box)
+        .with_fonts(&mut fonts)
+        .with_document(doc.file(), &page.resources)
+        .with_images(&mut images)
+        .interpret(&content);
+    let mut tiling_dl = solid_dl.clone();
+    let mut cell_glyph_run = None;
+    for cmd in &mut tiling_dl.commands {
+        if let zpdf::display_list::RenderCommand::DrawGlyphRun(run) = cmd {
+            run.paint = tiling_paint.clone();
+            let mut in_cell = run.clone();
+            in_cell.font_size = 40.0;
+            in_cell.transform = zpdf_core::Matrix::translate(5.0, 5.0);
+            cell_glyph_run = Some(in_cell);
+        }
+    }
+    let cell_glyph_run = cell_glyph_run.expect("glyph run");
+
+    let solid_gpu = match zpdf::gpu::WgpuRenderer::new()
+        .with_fonts(&fonts)
+        .with_images(&images)
+        .render_display_list(&solid_dl, 1.0)
+    {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("skipping GPU tiling DrawGlyphRun test (no adapter?): {e}");
+            return;
+        }
+    };
+    let tiling_gpu = zpdf::gpu::WgpuRenderer::new()
+        .with_fonts(&fonts)
+        .with_images(&images)
+        .render_display_list(&tiling_dl, 1.0)
+        .expect("tiling glyph gpu");
+    let mut dark_pixels = 0usize;
+    let mut aa_pixels = 0usize;
+    for y in 20..110u32 {
+        for x in 65..118u32 {
+            let off = ((y * solid_gpu.width + x) * 4) as usize;
+            let r_ref = solid_gpu.data[off];
+            let r_pat = tiling_gpu.data[off];
+            if r_pat < 30 {
+                dark_pixels += 1;
+            }
+            if (60..=200).contains(&r_ref) {
+                aa_pixels += 1;
+                assert!(
+                    (r_pat as i32 - r_ref as i32).abs() <= 16,
+                    "GPU DrawGlyphRun AA pixel ({x},{y}) diverged: solid={r_ref}, tiling={r_pat}"
+                );
+            }
+        }
+    }
+    assert!(
+        dark_pixels >= 100,
+        "GPU DrawGlyphRun with Paint::Tiling must render visible 'O', found {dark_pixels} dark pixels"
+    );
+    assert!(
+        aa_pixels >= 10,
+        "expected anti-aliased edge pixels in solid 'O', found {aa_pixels}"
+    );
+
+    // 2. Direct cell-level DrawGlyphRun with Paint::Tiling inside a repeating tiling cell.
+    let mut solid_cell_glyph_run = cell_glyph_run.clone();
+    solid_cell_glyph_run.paint =
+        zpdf::display_list::Paint::Solid(zpdf::display_list::Color::black());
+    let mut outer_cell =
+        zpdf::display_list::DisplayList::new(zpdf_core::Rect::new(0.0, 0.0, 60.0, 60.0));
+    outer_cell.push(zpdf::display_list::RenderCommand::DrawGlyphRun(
+        cell_glyph_run,
+    ));
+    let mut solid_outer_cell =
+        zpdf::display_list::DisplayList::new(zpdf_core::Rect::new(0.0, 0.0, 60.0, 60.0));
+    solid_outer_cell.push(zpdf::display_list::RenderCommand::DrawGlyphRun(
+        solid_cell_glyph_run,
+    ));
+    let build_cell_dl = |cell_dl: zpdf::display_list::DisplayList| {
+        let tiling = std::sync::Arc::new(zpdf::display_list::TilingPattern {
+            commands: std::sync::Arc::new(cell_dl),
+            bbox: zpdf_core::Rect::new(0.0, 0.0, 60.0, 60.0),
+            x_step: 60.0,
+            y_step: 60.0,
+            matrix: zpdf_core::Matrix::identity(),
+            tiling_type: 1,
+        });
+        let mut dl =
+            zpdf::display_list::DisplayList::new(zpdf_core::Rect::new(0.0, 0.0, 120.0, 120.0));
+        let mut full = zpdf::display_list::Path::new();
+        full.rect(zpdf_core::Rect::new(0.0, 0.0, 120.0, 120.0));
+        dl.push(zpdf::display_list::RenderCommand::FillPath {
+            path: full,
+            rule: zpdf::display_list::FillRule::NonZero,
+            paint: zpdf::display_list::Paint::Tiling(tiling),
+            alpha: 1.0,
+            overprint: None,
+        });
+        dl
+    };
+    let cell_text_dl = build_cell_dl(outer_cell);
+    let solid_cell_text_dl = build_cell_dl(solid_outer_cell);
+    let cell_gpu = zpdf::gpu::WgpuRenderer::new()
+        .with_fonts(&fonts)
+        .with_images(&images)
+        .render_display_list(&cell_text_dl, 1.0)
+        .expect("cell text gpu");
+    let solid_cell_gpu = zpdf::gpu::WgpuRenderer::new()
+        .with_fonts(&fonts)
+        .with_images(&images)
+        .render_display_list(&solid_cell_text_dl, 1.0)
+        .expect("solid cell text gpu");
+    let cell_cpu = zpdf::cpu::CpuRenderer::new()
+        .with_fonts(&fonts)
+        .with_images(&images)
+        .render_display_list(&cell_text_dl, 1.0)
+        .expect("cell text cpu");
+    let gpu_dark = cell_gpu
+        .data
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|px| px[0] < 30 && px[1] < 30 && px[2] < 30)
+        .count();
+    assert!(
+        gpu_dark >= 200,
+        "GPU cell-level DrawGlyphRun with Paint::Tiling must render repeated 'O' cells, found {gpu_dark} dark pixels"
+    );
+    // Tiled-paint cell text must match solid-paint cell text across every pixel on GPU,
+    // and match CPU across every interior/non-AA-edge pixel (no missing or shifted cells).
+    let total = (cell_cpu.width * cell_cpu.height) as usize;
+    let mut gpu_vs_solid_max = 0u32;
+    let mut gpu_vs_cpu_gt64 = 0usize;
+    for i in 0..total {
+        let b = i * 4;
+        for c in 0..3 {
+            let ds =
+                (cell_gpu.data[b + c] as i32 - solid_cell_gpu.data[b + c] as i32).unsigned_abs();
+            gpu_vs_solid_max = gpu_vs_solid_max.max(ds);
+        }
+        let dr = (cell_gpu.data[b] as i32 - cell_cpu.data[b] as i32).unsigned_abs();
+        let dg = (cell_gpu.data[b + 1] as i32 - cell_cpu.data[b + 1] as i32).unsigned_abs();
+        let db = (cell_gpu.data[b + 2] as i32 - cell_cpu.data[b + 2] as i32).unsigned_abs();
+        if dr.max(dg).max(db) > 64 {
+            gpu_vs_cpu_gt64 += 1;
+        }
+    }
+    assert!(
+        gpu_vs_solid_max <= 16,
+        "GPU cell-level tiling DrawGlyphRun must match GPU solid cell text within <=16, max diff={gpu_vs_solid_max}"
+    );
+    assert_eq!(
+        gpu_vs_cpu_gt64, 0,
+        "GPU cell-level tiling DrawGlyphRun must align with CPU across all 4 cells (found {gpu_vs_cpu_gt64} pixels differing by >64)"
     );
 }
 
