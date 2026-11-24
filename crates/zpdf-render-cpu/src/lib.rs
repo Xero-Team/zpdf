@@ -5657,7 +5657,8 @@ impl<'a> CpuRenderer<'a> {
     /// Compute retained memory bytes for caching `mask` in `soft_mask_planes`:
     /// coverage-plane bytes plus newly-retained `DisplayList` owned heap
     /// allocations (command vectors, path point/verb buffers, dash arrays,
-    /// glyph vectors) and newly-retained `Arc<InlineImage>` pixel buffers.
+    /// glyph vectors), newly-retained tiling pattern cells, and newly-retained
+    /// `Arc<InlineImage>` pixel buffers.
     fn soft_mask_retained_bytes(
         mask: &SoftMask,
         already_retained_dls: &std::collections::HashSet<usize>,
@@ -5669,14 +5670,17 @@ impl<'a> CpuRenderer<'a> {
         let mut seen_inlines = std::collections::HashSet::new();
         let mut new_dls = Vec::new();
         let mut new_inlines = Vec::new();
-        let mut stack: Vec<(&DisplayList, u8)> = vec![(&mask.commands, 0)];
-        while let Some((dl, depth)) = stack.pop() {
+        // Stack entries: (display_list, mask_depth, tile_depth, extra_wrapper_bytes)
+        let mut stack: Vec<(&DisplayList, u8, u8, u64)> = vec![(&mask.commands, 0, 0, 0)];
+        while let Some((dl, mask_depth, tile_depth, extra_bytes)) = stack.pop() {
             let dl_ptr = dl as *const DisplayList as usize;
-            if depth > 8 || !seen_dls.insert(dl_ptr) {
+            if mask_depth > 8 || tile_depth > 16 || !seen_dls.insert(dl_ptr) {
                 continue;
             }
             if !already_retained_dls.contains(&dl_ptr) {
-                bytes = bytes.saturating_add(dl.owned_heap_bytes());
+                bytes = bytes
+                    .saturating_add(extra_bytes)
+                    .saturating_add(dl.owned_heap_bytes());
                 new_dls.push(dl_ptr);
             }
             for cmd in &dl.commands {
@@ -5691,7 +5695,26 @@ impl<'a> CpuRenderer<'a> {
                     RenderCommand::PushBlendGroup {
                         mask: Some(sub), ..
                     } => {
-                        stack.push((&sub.commands, depth + 1));
+                        stack.push((&sub.commands, mask_depth + 1, tile_depth, 0));
+                    }
+                    RenderCommand::FillPath {
+                        paint: Paint::Tiling(tiling),
+                        ..
+                    }
+                    | RenderCommand::StrokePath {
+                        paint: Paint::Tiling(tiling),
+                        ..
+                    }
+                    | RenderCommand::DrawGlyphRun(GlyphRun {
+                        paint: Paint::Tiling(tiling),
+                        ..
+                    }) => {
+                        stack.push((
+                            &tiling.commands,
+                            mask_depth,
+                            tile_depth + 1,
+                            std::mem::size_of::<TilingPattern>() as u64,
+                        ));
                     }
                     _ => {}
                 }
@@ -7048,7 +7071,7 @@ impl<'a> CpuRenderer<'a> {
         let glyph = font
             .type3_glyph_stream(glyph_id)
             .map(|(stream, font_matrix)| {
-                let glyph_rect = zpdf_core::Rect::new(-1000.0, -1000.0, 1000.0, 1000.0);
+                let glyph_rect = font.type3_glyph_rect();
                 let mut images = ImageCache::new();
                 let mut interp = ContentInterpreter::new(glyph_rect)
                     .for_type3_glyph()
@@ -13500,5 +13523,161 @@ mod tests {
             page.data[idx] > 240 && page.data[idx + 1] < 15 && page.data[idx + 2] < 15,
             "uncached mask must still render red pixels accurately"
         );
+    }
+
+    #[test]
+    fn cpu_soft_mask_cache_accounts_for_tiling_cells_and_deduplicates_shared_cell() {
+        let make_tiling_with_vertices = |half_verts: usize| -> Arc<TilingPattern> {
+            let mut p = Path::new();
+            p.move_to(Point::new(0.0, 0.0));
+            for i in 1..=half_verts {
+                p.line_to(Point::new(10.0 * (i as f64) / (half_verts as f64), 0.0));
+            }
+            for i in 1..=half_verts {
+                p.line_to(Point::new(
+                    10.0 * (1.0 - (i as f64) / (half_verts as f64)),
+                    10.0,
+                ));
+            }
+            p.close();
+            let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 10.0, 10.0));
+            cell.push(RenderCommand::FillPath {
+                path: p,
+                rule: FillRule::NonZero,
+                paint: Paint::Solid(Color::white()),
+                alpha: 1.0,
+                overprint: None,
+            });
+            Arc::new(TilingPattern {
+                commands: Arc::new(cell),
+                bbox: Rect::new(0.0, 0.0, 10.0, 10.0),
+                x_step: 10.0,
+                y_step: 10.0,
+                matrix: zpdf_core::Matrix::identity(),
+                tiling_type: 1,
+            })
+        };
+
+        // Case 1: Single small rectangle fill carrying an oversized tiling cell
+        // (>8 KB of cell geometry) must be skipped by `soft_mask_planes`.
+        let oversized_tiling = make_tiling_with_vertices(260);
+        assert!(oversized_tiling.commands.owned_heap_bytes() > 4_096);
+        let mut mask_dl_big = DisplayList::new(Rect::new(0.0, 0.0, 20.0, 20.0));
+        mask_dl_big.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 20.0, 20.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(oversized_tiling),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let big_mask = SoftMask {
+            kind: SoftMaskKind::Luminosity,
+            commands: Arc::new(mask_dl_big),
+            offset: (0.0, 0.0),
+            backdrop_luma: 0.0,
+            transfer: None,
+        };
+        let mut dl_big = DisplayList::new(Rect::new(0.0, 0.0, 20.0, 20.0));
+        dl_big.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Normal,
+            isolated: true,
+            knockout: false,
+            bounds: Rect::new(0.0, 0.0, 20.0, 20.0),
+            alpha: 1.0,
+            mask: Some(big_mask),
+        });
+        dl_big.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 20.0, 20.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(1.0, 0.0, 0.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        dl_big.push(RenderCommand::PopBlendGroup);
+
+        let mut r_big = CpuRenderer::new();
+        r_big.max_soft_mask_cache_bytes = 2_048;
+        let info = PageRenderInfo {
+            page_rect: dl_big.page_rect,
+            scale: 1.0,
+            background: Color::white(),
+        };
+        r_big.begin_page(&info).expect("begin_page");
+        for cmd in &dl_big.commands {
+            r_big.execute(cmd).expect("execute");
+        }
+        assert!(
+            r_big.soft_mask_planes.is_empty() && r_big.soft_mask_cache_bytes == 0,
+            "oversized tiling cell inside soft mask must be skipped by cache"
+        );
+        let page_big = r_big.end_page().expect("end_page");
+        let idx = ((10 * page_big.width + 10) * 4) as usize;
+        assert!(
+            page_big.data[idx] > 240 && page_big.data[idx + 1] < 15 && page_big.data[idx + 2] < 15,
+            "uncached tiling mask must still render red"
+        );
+
+        // Case 2: Fitting tiling cell referenced TWICE inside one mask must be
+        // charged once and admitted when budget fits 1 copy (not 2 copies).
+        let shared_tiling = make_tiling_with_vertices(130);
+        let cell_bytes = shared_tiling.commands.owned_heap_bytes();
+        let mut mask_dl_shared = DisplayList::new(Rect::new(0.0, 0.0, 20.0, 20.0));
+        mask_dl_shared.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 10.0, 20.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(Arc::clone(&shared_tiling)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        mask_dl_shared.push(RenderCommand::FillPath {
+            path: rect_path(10.0, 0.0, 20.0, 20.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(shared_tiling),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let outer_bytes = mask_dl_shared.owned_heap_bytes();
+        // Plane is 400 bytes; budget fits 1 copy of cell + outer + plane, but
+        // strictly less than 2 copies of cell.
+        let budget = cell_bytes + outer_bytes + 400 + 256;
+        assert!(budget < 2 * cell_bytes);
+        let shared_mask = SoftMask {
+            kind: SoftMaskKind::Luminosity,
+            commands: Arc::new(mask_dl_shared),
+            offset: (0.0, 0.0),
+            backdrop_luma: 0.0,
+            transfer: None,
+        };
+        let mut dl_shared = DisplayList::new(Rect::new(0.0, 0.0, 20.0, 20.0));
+        dl_shared.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Normal,
+            isolated: true,
+            knockout: false,
+            bounds: Rect::new(0.0, 0.0, 20.0, 20.0),
+            alpha: 1.0,
+            mask: Some(shared_mask),
+        });
+        dl_shared.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 20.0, 20.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(1.0, 0.0, 0.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        dl_shared.push(RenderCommand::PopBlendGroup);
+
+        let mut r_shared = CpuRenderer::new();
+        r_shared.max_soft_mask_cache_bytes = budget;
+        r_shared.begin_page(&info).expect("begin_page");
+        for cmd in &dl_shared.commands {
+            r_shared.execute(cmd).expect("execute");
+        }
+        assert_eq!(
+            r_shared.soft_mask_planes.len(),
+            1,
+            "fitting tiling cell referenced twice must be charged once and cached"
+        );
+        assert!(r_shared.soft_mask_cache_bytes <= budget);
+        let _ = r_shared.end_page().expect("end_page");
     }
 }

@@ -1300,6 +1300,19 @@ fn load_type3_font(
         m
     };
 
+    // FontBBox: declared glyph-space bounds (`[0 0 0 0]` means unspecified per
+    // ISO 32000-1 Table 112).
+    let type3_font_bbox = resolve_array(file, dict, "FontBBox").and_then(|arr| {
+        let v: Vec<f64> = arr.iter().filter_map(|o| o.as_f64().ok()).collect();
+        if v.len() == 4 && v.iter().all(|c| c.is_finite()) {
+            let (x0, y0) = (v[0].min(v[2]), v[1].min(v[3]));
+            let (x1, y1) = (v[0].max(v[2]), v[1].max(v[3]));
+            (x1 > x0 && y1 > y0).then(|| zpdf_core::Rect::new(x0, y0, x1, y1))
+        } else {
+            None
+        }
+    });
+
     // Encoding: name or dict (/BaseEncoding + /Differences) → glyph name list.
     let mut encoding = Vec::new();
     if let Some(enc_obj) = dict.get("Encoding") {
@@ -1440,6 +1453,7 @@ fn load_type3_font(
         dw2: (880.0, -1000.0),
         variations: Vec::new(),
         type3_resources,
+        type3_font_bbox,
     };
 
     Ok(font)
@@ -1602,29 +1616,13 @@ struct Type3FormCache {
     /// Pre-resolved `/Shading` entries deduplicated by indirect object ID.
     shadings: std::collections::HashMap<ObjectId, std::sync::Arc<zpdf_font::Type3Shading>>,
     /// Pre-resolved PDF functions (shading `/Function` and `/SMask /TR`,
-    /// including stitching sub-functions) deduplicated by indirect object ID.
-    functions: std::collections::HashMap<ObjectId, std::sync::Arc<zpdf_font::Type3Function>>,
+    /// including stitching sub-functions) deduplicated by indirect object ID,
+    /// paired with their subtree height so cache hits enforce the same maximum
+    /// nesting depth as cold lookups.
+    functions: std::collections::HashMap<ObjectId, (std::sync::Arc<zpdf_font::Type3Function>, u8)>,
 }
 
-fn resolve_type3_function(
-    file: &PdfFile,
-    obj: &PdfObject,
-    remaining: &mut u64,
-    form_cache: &mut Type3FormCache,
-) -> Option<std::sync::Arc<zpdf_font::Type3Function>> {
-    let saved_rem = *remaining;
-    let mut newly_cached = Vec::new();
-    match resolve_type3_function_inner(file, obj, remaining, form_cache, &mut newly_cached, 0) {
-        Some(func) => Some(func),
-        None => {
-            *remaining = saved_rem;
-            for id in newly_cached {
-                form_cache.functions.remove(&id);
-            }
-            None
-        }
-    }
-}
+const MAX_TYPE3_FUNCTION_DEPTH: u8 = 8;
 
 fn resolve_type3_function_inner(
     file: &PdfFile,
@@ -1633,15 +1631,18 @@ fn resolve_type3_function_inner(
     form_cache: &mut Type3FormCache,
     newly_cached: &mut Vec<ObjectId>,
     depth: u8,
-) -> Option<std::sync::Arc<zpdf_font::Type3Function>> {
+) -> Option<(std::sync::Arc<zpdf_font::Type3Function>, u8)> {
     use std::sync::Arc;
-    if depth > 8 {
+    if depth > MAX_TYPE3_FUNCTION_DEPTH {
         return None;
     }
     let obj_id = match obj {
         PdfObject::Ref(id) => {
-            if let Some(cached) = form_cache.functions.get(id) {
-                return Some(Arc::clone(cached));
+            if let Some((cached, height)) = form_cache.functions.get(id) {
+                if depth.saturating_add(*height) > MAX_TYPE3_FUNCTION_DEPTH {
+                    return None;
+                }
+                return Some((Arc::clone(cached), *height));
             }
             Some(*id)
         }
@@ -1681,13 +1682,17 @@ fn resolve_type3_function_inner(
     let dict_cost = zpdf_font::estimated_pdf_dict_bytes_within(&clean_dict, *remaining)?;
     *remaining -= dict_cost;
 
-    let func = if let Some(data) = stream_bytes {
-        Arc::new(zpdf_font::Type3Function::Stream {
-            dict: clean_dict,
-            data,
-        })
+    let (func, height) = if let Some(data) = stream_bytes {
+        (
+            Arc::new(zpdf_font::Type3Function::Stream {
+                dict: clean_dict,
+                data,
+            }),
+            0u8,
+        )
     } else {
         let mut children = Vec::new();
+        let mut max_child_height = 0u8;
         if let Some(sub_funcs) = resolved_dict.get("Functions") {
             let sub_resolved = match sub_funcs {
                 PdfObject::Ref(id) => file.resolve(*id).ok(),
@@ -1695,7 +1700,7 @@ fn resolve_type3_function_inner(
             };
             if let Some(PdfObject::Array(arr)) = sub_resolved {
                 for item in &arr {
-                    let child = resolve_type3_function_inner(
+                    let (child, child_height) = resolve_type3_function_inner(
                         file,
                         item,
                         remaining,
@@ -1703,6 +1708,7 @@ fn resolve_type3_function_inner(
                         newly_cached,
                         depth + 1,
                     )?;
+                    max_child_height = max_child_height.max(child_height);
                     children.push(child);
                 }
                 let vec_cost = (children.capacity() as u64)
@@ -1711,17 +1717,25 @@ fn resolve_type3_function_inner(
                 *remaining = next;
             }
         }
-        Arc::new(zpdf_font::Type3Function::Dict {
-            dict: clean_dict,
-            children,
-        })
+        let height = if children.is_empty() {
+            0
+        } else {
+            max_child_height.saturating_add(1)
+        };
+        (
+            Arc::new(zpdf_font::Type3Function::Dict {
+                dict: clean_dict,
+                children,
+            }),
+            height,
+        )
     };
 
     if let Some(id) = obj_id {
-        form_cache.functions.insert(id, Arc::clone(&func));
+        form_cache.functions.insert(id, (Arc::clone(&func), height));
         newly_cached.push(id);
     }
-    Some(func)
+    Some((func, height))
 }
 
 fn resolve_type3_shading(
@@ -1829,7 +1843,7 @@ fn resolve_type3_shading(
         };
         if let Some(PdfObject::Array(arr)) = resolved_func_obj {
             for item in &arr {
-                let Some(f) = resolve_type3_function_inner(
+                let Some((f, _)) = resolve_type3_function_inner(
                     file,
                     item,
                     remaining,
@@ -1843,7 +1857,7 @@ fn resolve_type3_shading(
                 functions.push(f);
             }
         } else if let Some(item) = resolved_func_obj {
-            let Some(f) = resolve_type3_function_inner(
+            let Some((f, _)) = resolve_type3_function_inner(
                 file,
                 &item,
                 remaining,
@@ -2169,6 +2183,7 @@ fn resolve_type3_resources(
                                                     }
                                                 })
                                                 .unwrap_or(0.0);
+                                            let mut newly_cached_tr_funcs = Vec::new();
                                             let transfer = sm_dict.get("TR").and_then(|tr_obj| {
                                                 let is_identity = match tr_obj {
                                                     PdfObject::Ref(tr_id) => matches!(
@@ -2186,9 +2201,24 @@ fn resolve_type3_resources(
                                                 if is_identity {
                                                     return None;
                                                 }
-                                                resolve_type3_function(
-                                                    file, tr_obj, remaining, form_cache,
-                                                )
+                                                let tr_saved_rem = *remaining;
+                                                match resolve_type3_function_inner(
+                                                    file,
+                                                    tr_obj,
+                                                    remaining,
+                                                    form_cache,
+                                                    &mut newly_cached_tr_funcs,
+                                                    0,
+                                                ) {
+                                                    Some((func, _)) => Some(func),
+                                                    None => {
+                                                        *remaining = tr_saved_rem;
+                                                        for id in newly_cached_tr_funcs.drain(..) {
+                                                            form_cache.functions.remove(&id);
+                                                        }
+                                                        None
+                                                    }
+                                                }
                                             });
                                             let (group, form_limits) = resolve_type3_form(
                                                 file,
@@ -2214,6 +2244,9 @@ fn resolve_type3_resources(
                                                 );
                                             } else {
                                                 *remaining = saved_rem;
+                                                for id in newly_cached_tr_funcs {
+                                                    form_cache.functions.remove(&id);
+                                                }
                                             }
                                         }
                                     }
@@ -3197,5 +3230,197 @@ mod tests {
             "estimated cache bytes {} must stay within budget {budget}",
             res.estimated_cache_bytes()
         );
+    }
+
+    #[test]
+    fn type3_loader_rolls_back_cached_transfer_function_when_mask_group_rejected() {
+        // `/XObject` runs before `/ExtGState`, which runs before `/Shading`.
+        // 1. `/XObject /Keep` consumes ~2500 bytes (fits in 5000-byte budget).
+        // 2. `/ExtGState /GSReject` has `/TR 6 0 R` (2000-byte sampled stream —
+        //    fits in remaining ~2500!) followed by `/G 5 0 R` (10000-byte Form —
+        //    exceeds remaining budget, rejecting the mask!).
+        // 3. `/Shading /Later` references the SAME `6 0 R` (2000 bytes) AND
+        //    `7 0 R` (1500 bytes). If `6 0 R` were NOT rolled back from
+        //    `form_cache.functions` when `/G` failed, `/Later` would reuse
+        //    `6 0 R` for free, admit both streams, and exceed the 5000-byte
+        //    budget (`2500 + 2000 + 1500 = 6000 > 5000`).
+        let keep_data = vec![b' '; 2_500];
+        let big_group = vec![b' '; 10_000];
+        let tr_samples = vec![128u8; 2_000];
+        let extra_samples = vec![64u8; 1_500];
+
+        let stream_obj = |dict: &str, data: &[u8]| -> Vec<u8> {
+            let mut v = format!("<< {dict} /Length {} >>\nstream\n", data.len()).into_bytes();
+            v.extend_from_slice(data);
+            v.extend_from_slice(b"\nendstream");
+            v
+        };
+        let build_raw_pdf = |objs: &[Vec<u8>]| -> Vec<u8> {
+            let mut out = b"%PDF-1.4\n".to_vec();
+            let mut offsets = Vec::with_capacity(objs.len());
+            for (i, body) in objs.iter().enumerate() {
+                offsets.push(out.len());
+                out.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+                out.extend_from_slice(body);
+                out.extend_from_slice(b"\nendobj\n");
+            }
+            let xref = out.len();
+            let n = objs.len() + 1;
+            out.extend_from_slice(format!("xref\n0 {n}\n0000000000 65535 f \n").as_bytes());
+            for off in offsets {
+                out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+            }
+            out.extend_from_slice(
+                format!("trailer\n<< /Size {n} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n")
+                    .as_bytes(),
+            );
+            out
+        };
+
+        let pdf = build_raw_pdf(&[
+            b"<< /Type /Catalog >>".to_vec(), // 1
+            b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 10 10] \
+               /FontMatrix [1 0 0 1 0 0] /CharProcs << /A 3 0 R >> \
+               /Encoding << /Differences [65 /A] >> /FirstChar 65 /LastChar 65 /Widths [10] \
+               /Resources << \
+                 /XObject << /Keep 4 0 R >> \
+                 /ExtGState << /GSReject << /SMask << /S /Luminosity /G 5 0 R /TR 6 0 R >> >> >> \
+                 /Shading << /Later 8 0 R >> \
+               >> >>"
+                .to_vec(), // 2
+            stream_obj("", b"10 0 d0 0 0 10 10 re f"), // 3
+            stream_obj(
+                "/Type /XObject /Subtype /Form /BBox [0 0 10 10]",
+                &keep_data,
+            ), // 4 (2500 B)
+            stream_obj(
+                "/Type /XObject /Subtype /Form /BBox [0 0 10 10]",
+                &big_group,
+            ), // 5 (10000 B)
+            stream_obj(
+                "/FunctionType 0 /Domain [0 1] /Range [0 1] /Size [2000] /BitsPerSample 8",
+                &tr_samples,
+            ), // 6 (2000 B)
+            stream_obj(
+                "/FunctionType 0 /Domain [0 1] /Range [0 1] /Size [1500] /BitsPerSample 8",
+                &extra_samples,
+            ), // 7 (1500 B)
+            b"<< /ShadingType 2 /ColorSpace /DeviceGray /Coords [0 0 10 0] \
+               /Function << /FunctionType 3 /Domain [0 1] /Bounds [0.5] /Encode [0 1 0 1] \
+                            /Functions [6 0 R 7 0 R] >> >>"
+                .to_vec(), // 8
+        ]);
+
+        let budget = 5_000u64;
+        let limits = zpdf_core::ParseLimits {
+            max_font_cache_bytes: budget,
+            ..Default::default()
+        };
+        let file = PdfFile::parse_with_limits(pdf, limits).expect("parse");
+        let font = load_single_font(&file, ObjectId(2, 0)).expect("load type3");
+        let res = font.type3_resources().expect("must retain /Keep");
+        assert!(res.xobjects.contains_key("Keep"));
+        assert!(
+            !res.ext_g_state_smasks.contains_key("GSReject"),
+            "oversized mask group must be rejected"
+        );
+        assert!(
+            !res.shadings.contains_key("Later"),
+            "rolled-back /TR function must not remain cached free for a later shading"
+        );
+        assert!(
+            res.estimated_cache_bytes() <= budget,
+            "retained Type 3 resource bytes {} exceeded budget {budget}",
+            res.estimated_cache_bytes()
+        );
+    }
+
+    #[test]
+    fn type3_loader_enforces_function_depth_limit_equally_on_warm_and_cold_cache() {
+        // Build a 6-level stitching chain `Deep` (height = 6):
+        //   obj 10 (leaf, h=0) <- obj 11 (h=1) <- ... <- obj 16 (`Deep`, h=6)
+        // Plus:
+        //   - `MaxOk` (depth 0 -> 1 -> `Deep` at depth 2: 2 + 6 = 8 <= 8 -> ACCEPTED)
+        //   - `TooDeep` (depth 0 -> 1 -> 2 -> `Deep` at depth 3: 3 + 6 = 9 > 8 -> REJECTED)
+        // Compare cold cache (no `/ExtGState` warmup) vs warm cache (`/ExtGState
+        // /GSWarm /SMask /TR 16 0 R` runs BEFORE `/Shading`, caching `Deep` at depth 0).
+        let build_pdf = |warm_cache: bool| -> Vec<u8> {
+            let ext_gs = if warm_cache {
+                "/ExtGState << /GSWarm << /SMask << /S /Luminosity /G 4 0 R /TR 16 0 R >> >> >>"
+            } else {
+                ""
+            };
+            let mut objs: Vec<String> = vec![
+                "<< /Type /Catalog >>".into(), // 1
+                format!(
+                    "<< /Type /Font /Subtype /Type3 /FontBBox [0 0 10 10] \
+                     /FontMatrix [1 0 0 1 0 0] /CharProcs << /A 3 0 R >> \
+                     /Encoding << /Differences [65 /A] >> /FirstChar 65 /LastChar 65 /Widths [10] \
+                     /Resources << {ext_gs} /Shading << /MaxOk 5 0 R /TooDeep 6 0 R >> >> >>"
+                ), // 2
+                "<< /Length 23 >>\nstream\n10 0 d0 0 0 10 10 re f\nendstream".into(), // 3
+                "<< /Type /XObject /Subtype /Form /BBox [0 0 10 10] /Length 19 >>\n\
+                 stream\n1 g 0 0 10 10 re f\nendstream"
+                    .into(), // 4
+                "<< /ShadingType 2 /ColorSpace /DeviceGray /Coords [0 0 10 0] \
+                 /Function 18 0 R >>"
+                    .into(), // 5 (`MaxOk`, root depth 0 -> obj 18 -> obj 17 -> obj 16)
+                "<< /ShadingType 2 /ColorSpace /DeviceGray /Coords [0 0 10 0] \
+                 /Function 19 0 R >>"
+                    .into(), // 6 (`TooDeep`, root depth 0 -> obj 19 -> obj 18 -> obj 17 -> obj 16)
+                "<< >>".into(),                // 7 (padding)
+                "<< >>".into(),                // 8
+                "<< >>".into(),                // 9
+                // 10: leaf exponential function (height 0)
+                "<< /FunctionType 2 /Domain [0 1] /C0 [0] /C1 [1] /N 1 >>".into(),
+            ];
+            // 11..=16: 6 stitching wrappers (obj 16 has height 6).
+            for prev in 10..=15 {
+                objs.push(format!(
+                    "<< /FunctionType 3 /Domain [0 1] /Bounds [] /Encode [0 1] \
+                     /Functions [{prev} 0 R] >>"
+                ));
+            }
+            // 17: height 7 (wraps 16)
+            objs.push(
+                "<< /FunctionType 3 /Domain [0 1] /Bounds [] /Encode [0 1] \
+                 /Functions [16 0 R] >>"
+                    .into(),
+            );
+            // 18: height 8 (wraps 17 -> `MaxOk` at depth 0 has total depth 8)
+            objs.push(
+                "<< /FunctionType 3 /Domain [0 1] /Bounds [] /Encode [0 1] \
+                 /Functions [17 0 R] >>"
+                    .into(),
+            );
+            // 19: height 9 (wraps 18 -> `TooDeep` at depth 0 has total depth 9)
+            objs.push(
+                "<< /FunctionType 3 /Domain [0 1] /Bounds [] /Encode [0 1] \
+                 /Functions [18 0 R] >>"
+                    .into(),
+            );
+            let refs: Vec<&str> = objs.iter().map(String::as_str).collect();
+            crate::test_util::build_pdf(&refs)
+        };
+
+        for (label, warm) in [("cold", false), ("warm", true)] {
+            let file = PdfFile::parse(build_pdf(warm)).expect("parse");
+            let font = load_single_font(&file, ObjectId(2, 0)).expect("load type3");
+            let res = font.type3_resources().expect("resources");
+            if warm {
+                assert!(
+                    res.ext_g_state_smasks.contains_key("GSWarm"),
+                    "warm cache setup must retain /GSWarm"
+                );
+            }
+            assert!(
+                res.shadings.contains_key("MaxOk"),
+                "{label} cache must accept total function nesting depth 8"
+            );
+            assert!(
+                !res.shadings.contains_key("TooDeep"),
+                "{label} cache must reject total function nesting depth 9"
+            );
+        }
     }
 }

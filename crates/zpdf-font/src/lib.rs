@@ -198,6 +198,9 @@ pub struct LoadedFont {
     /// from a Type 3 font's `/Resources` dictionary so CharProcs can execute
     /// `/Name Do`, `/GS gs`, and named color spaces without a live `PdfFile`.
     pub type3_resources: Option<Arc<Type3Resources>>,
+    /// Declared non-degenerate `/FontBBox` of a Type 3 font in glyph space,
+    /// used as the shading/replay bounds when a CharProc has no explicit clip.
+    pub type3_font_bbox: Option<zpdf_core::Rect>,
 }
 
 /// Pre-resolved image XObject referenced by a Type 3 font's `/Resources`.
@@ -648,6 +651,7 @@ impl LoadedFont {
                 dw2: (880.0, -1000.0),
                 variations: Vec::new(),
                 type3_resources: None,
+                type3_font_bbox: None,
             }
         } else {
             Self::new_legacy_data(font_type, base_font, font_data, cid_widths)
@@ -689,6 +693,7 @@ impl LoadedFont {
                 dw2: (880.0, -1000.0),
                 variations: Vec::new(),
                 type3_resources: None,
+                type3_font_bbox: None,
             }
         } else {
             tracing::debug!(
@@ -716,6 +721,7 @@ impl LoadedFont {
                 dw2: (880.0, -1000.0),
                 variations: Vec::new(),
                 type3_resources: None,
+                type3_font_bbox: None,
             }
         }
     }
@@ -757,6 +763,7 @@ impl LoadedFont {
             dw2: (880.0, -1000.0),
             variations: Vec::new(),
             type3_resources: None,
+            type3_font_bbox: None,
         })
     }
 
@@ -869,6 +876,7 @@ impl LoadedFont {
             dw2: (880.0, -1000.0),
             variations: Vec::new(),
             type3_resources: None,
+            type3_font_bbox: None,
         })
     }
 
@@ -895,6 +903,7 @@ impl LoadedFont {
             dw2: (880.0, -1000.0),
             variations: Vec::new(),
             type3_resources: None,
+            type3_font_bbox: None,
         }
     }
 
@@ -943,6 +952,7 @@ impl LoadedFont {
             dw2: self.dw2,
             variations: self.variations.clone(),
             type3_resources: None,
+            type3_font_bbox: None,
         }
     }
 
@@ -2203,6 +2213,27 @@ impl LoadedFont {
     pub fn with_type3_resources(mut self, resources: Arc<Type3Resources>) -> Self {
         self.type3_resources = (!resources.is_empty()).then_some(resources);
         self
+    }
+
+    /// Set the declared `/FontBBox` of a Type 3 font (in glyph space).
+    pub fn with_type3_font_bbox(mut self, bbox: zpdf_core::Rect) -> Self {
+        let b = bbox.normalize();
+        self.type3_font_bbox = (b.x0.is_finite()
+            && b.y0.is_finite()
+            && b.x1.is_finite()
+            && b.y1.is_finite()
+            && b.x1 > b.x0
+            && b.y1 > b.y0)
+            .then_some(b);
+        self
+    }
+
+    /// Glyph-space bounds for standalone Type 3 CharProc replay: the font's
+    /// declared non-degenerate `/FontBBox` when present, otherwise a symmetric
+    /// 1000-unit fallback `[-1000, -1000, 1000, 1000]`.
+    pub fn type3_glyph_rect(&self) -> zpdf_core::Rect {
+        self.type3_font_bbox
+            .unwrap_or_else(|| zpdf_core::Rect::new(-1000.0, -1000.0, 1000.0, 1000.0))
     }
 
     /// True when this is a Type 3 font that still retains at least one decoded

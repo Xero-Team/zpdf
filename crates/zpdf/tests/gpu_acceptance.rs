@@ -5213,3 +5213,149 @@ fn type3_stitching_shading_reusing_sampled_subfunction_renders_both_intervals_wi
         "standalone CPU reused stitching subfunction must match live CPU within 3 LSB, max_diff={cpu_max_diff}"
     );
 }
+
+#[test]
+fn type3_unclipped_charproc_radial_shading_past_1000_units_matches_live() {
+    use zpdf::display_list::{Color, DisplayList, GlyphRun, Paint, PositionedGlyph, RenderCommand};
+    use zpdf_core::{Matrix, Rect};
+
+    // Unclipped `d0` CharProc (no `W` clip!) painting a non-extended radial
+    // gradient centered at (1800, 250) with radius 200 — completely outside the
+    // old [-1000..1000] placeholder rect, inside `/FontBBox [0 0 2500 500]`.
+    // `/FontMatrix [0.04 0 0 0.04 0 0]` maps glyph [0..2500, 0..500] onto the
+    // 100x20 page so the radial circle sits at page center (72, 10), radius 8.
+    let page_content = b"BT /F1 1 Tf (A) Tj ET";
+    let charproc = b"2500 0 d0 /Fade sh";
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 20] /Contents 4 0 R \
+          /Resources << /Font << /F1 5 0 R >> >> >>"
+            .to_vec(), // 3
+        stream_obj("", page_content),                  // 4
+        b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 2500 500] \
+          /FontMatrix [0.04 0 0 0.04 0 0] /CharProcs << /A 6 0 R >> \
+          /Encoding << /Type /Encoding /Differences [65 /A] >> \
+          /FirstChar 65 /LastChar 65 /Widths [2500] \
+          /Resources << /Shading << /Fade 7 0 R >> >> >>"
+            .to_vec(), // 5
+        stream_obj("", charproc),                      // 6
+        b"<< /ShadingType 3 /ColorSpace /DeviceRGB \
+          /Coords [1800 250 0 1800 250 200] /Function 8 0 R /Extend [false false] >>"
+            .to_vec(), // 7
+        b"<< /FunctionType 2 /Domain [0 1] /C0 [1 0 0] /C1 [0 0 1] /N 1 >>".to_vec(), // 8
+    ]);
+
+    let doc = PdfDocument::open(pdf).expect("open pdf");
+    let page = doc.page(0).expect("page 0");
+    let mut fonts = doc.load_page_fonts(&page);
+    let content = doc.page_content_bytes(&page).expect("content bytes");
+    let mut live_images = ImageCache::new();
+    let live_dl = ContentInterpreter::new(page.media_box)
+        .with_fonts(&mut fonts)
+        .with_document(doc.file(), &page.resources)
+        .with_images(&mut live_images)
+        .interpret(&content);
+    assert!(
+        !live_dl
+            .commands
+            .iter()
+            .any(|c| matches!(c, RenderCommand::DrawGlyphRun(_))),
+        "live interpretation should inline Type 3 glyph"
+    );
+    let live_cpu = zpdf_render_cpu::CpuRenderer::new()
+        .with_fonts(&fonts)
+        .with_images(&live_images)
+        .render_display_list(&live_dl, 1.0)
+        .expect("live CPU");
+
+    let (font_id, _) = fonts.get_by_name("F1").expect("loaded F1");
+    let mut standalone_dl = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 20.0));
+    standalone_dl.push(RenderCommand::DrawGlyphRun(GlyphRun {
+        font_id,
+        font_size: 1.0,
+        glyphs: vec![PositionedGlyph {
+            glyph_id: 65,
+            code_len: 1,
+            code: b'A' as u32,
+            x: 0.0,
+            y: 0.0,
+            advance: 100.0,
+        }],
+        paint: Paint::Solid(Color::black()),
+        alpha: 1.0,
+        overprint: None,
+        transform: Matrix::identity(),
+        h_scale: 1.0,
+    }));
+    let standalone_cpu = zpdf_render_cpu::CpuRenderer::new()
+        .with_fonts(&fonts)
+        .render_display_list(&standalone_dl, 1.0)
+        .expect("standalone CPU");
+
+    let px = |data: &[u8], w: u32, x: u32, y: u32| -> [u8; 3] {
+        let off = ((y * w + x) * 4) as usize;
+        [data[off], data[off + 1], data[off + 2]]
+    };
+    let assert_radial = |label: &str, data: &[u8], w: u32| {
+        let center = px(data, w, 72, 10);
+        let rim = px(data, w, 78, 10);
+        let outside = px(data, w, 20, 10);
+        assert!(
+            center[0] > 210 && center[1] < 25 && center[2] < 60,
+            "{label}: radial center (72, 10) must be red, got {center:?}"
+        );
+        assert!(
+            rim[2] > 150 && rim[1] < 25,
+            "{label}: radial rim (78, 10) must be bluish, got {rim:?}"
+        );
+        assert!(
+            outside[0] > 240 && outside[1] > 240 && outside[2] > 240,
+            "{label}: outside non-extended radial gradient must be white, got {outside:?}"
+        );
+    };
+    assert_radial("live CPU", &live_cpu.data, live_cpu.width);
+    assert_radial("standalone CPU", &standalone_cpu.data, standalone_cpu.width);
+
+    let assert_matches_live = |label: &str, data: &[u8]| {
+        // Interior and exterior samples must match closely; only anti-aliased
+        // boundary pixels on the sharp non-extended circle rim can differ due
+        // to live (200x40) vs standalone (768x154) shading raster resolutions.
+        for &(x, y) in &[(72u32, 10u32), (75, 10), (78, 10), (20, 10)] {
+            let a = px(&live_cpu.data, live_cpu.width, x, y);
+            let b = px(data, live_cpu.width, x, y);
+            for ch in 0..3 {
+                assert!(
+                    a[ch].abs_diff(b[ch]) <= 6,
+                    "{label}: sample ({x}, {y}) {b:?} must match live CPU {a:?}"
+                );
+            }
+        }
+        let total_px = (live_cpu.width * live_cpu.height) as usize;
+        let diff_px = live_cpu
+            .data
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(data.as_chunks::<4>().0.iter())
+            .filter(|(a, b)| (0..3).any(|c| a[c].abs_diff(b[c]) > 16))
+            .count();
+        let diff_pct = (diff_px as f64) * 100.0 / (total_px as f64);
+        assert!(
+            diff_pct < 2.0,
+            "{label}: differing pixels {diff_px}/{total_px} ({diff_pct:.2}%) must stay < 2% vs live CPU"
+        );
+    };
+    assert_matches_live("standalone CPU", &standalone_cpu.data);
+
+    match render_gpu_shared(&standalone_dl, Some(&fonts), None, 1.0) {
+        Ok(standalone_gpu) => {
+            assert_radial("standalone GPU", &standalone_gpu.data, standalone_gpu.width);
+            assert_matches_live("standalone GPU", &standalone_gpu.data);
+        }
+        Err(zpdf::gpu::WgpuRenderError::NoAdapter) => {
+            eprintln!("skipping GPU unclipped radial shading test (no adapter)");
+        }
+        Err(e) => panic!("GPU unclipped radial shading test failed: {e}"),
+    }
+}

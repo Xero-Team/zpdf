@@ -4729,8 +4729,14 @@ impl<'a> SvgWriter<'a> {
             new_inlines: Vec<usize>,
             bytes: u64,
         }
-        fn walk(list: &std::sync::Arc<DisplayList>, depth: u8, st: &mut WalkState<'_>) {
-            if depth >= MAX_MASK_DEPTH {
+        fn walk(
+            list: &std::sync::Arc<DisplayList>,
+            mask_depth: u8,
+            tile_depth: u8,
+            extra_bytes: u64,
+            st: &mut WalkState<'_>,
+        ) {
+            if mask_depth >= MAX_MASK_DEPTH || tile_depth > MAX_TILING_DEPTH {
                 return;
             }
             let ptr = std::sync::Arc::as_ptr(list) as usize;
@@ -4739,7 +4745,10 @@ impl<'a> SvgWriter<'a> {
             }
             if !st.retained_lists.contains(&ptr) {
                 st.new_lists.push(ptr);
-                st.bytes = st.bytes.saturating_add(list.owned_heap_bytes());
+                st.bytes = st
+                    .bytes
+                    .saturating_add(extra_bytes)
+                    .saturating_add(list.owned_heap_bytes());
             }
             for cmd in &list.commands {
                 match cmd {
@@ -4759,7 +4768,27 @@ impl<'a> SvgWriter<'a> {
                     RenderCommand::PushBlendGroup {
                         mask: Some(sub), ..
                     } => {
-                        walk(&sub.commands, depth + 1, st);
+                        walk(&sub.commands, mask_depth + 1, tile_depth, 0, st);
+                    }
+                    RenderCommand::FillPath {
+                        paint: Paint::Tiling(tiling),
+                        ..
+                    }
+                    | RenderCommand::StrokePath {
+                        paint: Paint::Tiling(tiling),
+                        ..
+                    }
+                    | RenderCommand::DrawGlyphRun(GlyphRun {
+                        paint: Paint::Tiling(tiling),
+                        ..
+                    }) => {
+                        walk(
+                            &tiling.commands,
+                            mask_depth,
+                            tile_depth + 1,
+                            std::mem::size_of::<zpdf_display_list::TilingPattern>() as u64,
+                            st,
+                        );
                     }
                     _ => {}
                 }
@@ -4774,7 +4803,7 @@ impl<'a> SvgWriter<'a> {
             new_inlines: Vec::new(),
             bytes: 0,
         };
-        walk(list, 0, &mut st);
+        walk(list, 0, 0, 0, &mut st);
         (st.bytes, st.new_lists, st.new_inlines)
     }
 
@@ -6475,7 +6504,7 @@ impl<'a> SvgWriter<'a> {
         let glyph = font
             .type3_glyph_stream(glyph_id)
             .map(|(stream, font_matrix)| {
-                let glyph_rect = zpdf_core::Rect::new(-1000.0, -1000.0, 1000.0, 1000.0);
+                let glyph_rect = font.type3_glyph_rect();
                 let mut images = ImageCache::new();
                 let mut interp = ContentInterpreter::new(glyph_rect)
                     .for_type3_glyph()
@@ -13779,6 +13808,308 @@ mod tests {
         assert!(
             right.red() < 20 && right.green() < 15 && right.blue() > 235,
             "SVG right side x=88 must be blue, got {right:?}"
+        );
+    }
+
+    #[test]
+    fn svg_soft_mask_cache_accounts_for_tiling_cells_and_deduplicates_shared_cell() {
+        use std::sync::Arc;
+
+        let make_tiling_with_vertices =
+            |half_verts: usize| -> Arc<zpdf_display_list::TilingPattern> {
+                let mut p = Path::new();
+                p.move_to(zpdf_core::Point::new(0.0, 0.0));
+                for i in 1..=half_verts {
+                    p.line_to(zpdf_core::Point::new(
+                        10.0 * (i as f64) / (half_verts as f64),
+                        0.0,
+                    ));
+                }
+                for i in 1..=half_verts {
+                    p.line_to(zpdf_core::Point::new(
+                        10.0 * (1.0 - (i as f64) / (half_verts as f64)),
+                        10.0,
+                    ));
+                }
+                p.close();
+                let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 10.0, 10.0));
+                cell.push(RenderCommand::FillPath {
+                    path: p,
+                    rule: FillRule::NonZero,
+                    paint: Paint::Solid(Color::white()),
+                    alpha: 1.0,
+                    overprint: None,
+                });
+                Arc::new(zpdf_display_list::TilingPattern {
+                    commands: Arc::new(cell),
+                    bbox: Rect::new(0.0, 0.0, 10.0, 10.0),
+                    x_step: 10.0,
+                    y_step: 10.0,
+                    matrix: zpdf_core::Matrix::identity(),
+                    tiling_type: 1,
+                })
+            };
+
+        let (fonts, images) = empty_caches();
+        let options = SvgOptions::default();
+
+        // Case 1: Oversized tiling cell in a single-rect soft mask must be skipped.
+        let oversized_tiling = make_tiling_with_vertices(260);
+        assert!(oversized_tiling.commands.owned_heap_bytes() > 4_096);
+        let mut mask_dl_big = DisplayList::new(Rect::new(0.0, 0.0, 20.0, 20.0));
+        mask_dl_big.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 20.0, 20.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(oversized_tiling),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let mut dl_big = DisplayList::new(Rect::new(0.0, 0.0, 20.0, 20.0));
+        dl_big.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Normal,
+            isolated: true,
+            knockout: false,
+            bounds: Rect::new(0.0, 0.0, 20.0, 20.0),
+            alpha: 1.0,
+            mask: Some(SoftMask {
+                kind: SoftMaskKind::Luminosity,
+                commands: Arc::new(mask_dl_big),
+                offset: (0.0, 0.0),
+                backdrop_luma: 0.0,
+                transfer: None,
+            }),
+        });
+        dl_big.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 20.0, 20.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(1.0, 0.0, 0.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        dl_big.push(RenderCommand::PopBlendGroup);
+
+        let mut w_big = SvgWriter::new(
+            dl_big.page_rect,
+            20.0,
+            20.0,
+            &dl_big.commands,
+            &fonts,
+            &images,
+            &options,
+        );
+        w_big.max_retained_mask_bytes = 2_048;
+        w_big.emit_commands(&dl_big.commands, EmitDepth::default());
+        assert!(
+            w_big.mask_defs.is_empty() && w_big.retained_mask_bytes == 0,
+            "oversized tiling cell inside SVG soft mask must not be retained in mask_defs"
+        );
+
+        // Case 2: Fitting tiling cell referenced twice must be charged once and cached.
+        let shared_tiling = make_tiling_with_vertices(130);
+        let cell_bytes = shared_tiling.commands.owned_heap_bytes();
+        let mut mask_dl_shared = DisplayList::new(Rect::new(0.0, 0.0, 20.0, 20.0));
+        mask_dl_shared.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 10.0, 20.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(Arc::clone(&shared_tiling)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        mask_dl_shared.push(RenderCommand::FillPath {
+            path: rect_path(10.0, 0.0, 20.0, 20.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Tiling(shared_tiling),
+            alpha: 1.0,
+            overprint: None,
+        });
+        let outer_bytes = mask_dl_shared.owned_heap_bytes();
+        let budget = cell_bytes + outer_bytes + 512;
+        assert!(budget < 2 * cell_bytes);
+        let mut dl_shared = DisplayList::new(Rect::new(0.0, 0.0, 20.0, 20.0));
+        dl_shared.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Normal,
+            isolated: true,
+            knockout: false,
+            bounds: Rect::new(0.0, 0.0, 20.0, 20.0),
+            alpha: 1.0,
+            mask: Some(SoftMask {
+                kind: SoftMaskKind::Luminosity,
+                commands: Arc::new(mask_dl_shared),
+                offset: (0.0, 0.0),
+                backdrop_luma: 0.0,
+                transfer: None,
+            }),
+        });
+        dl_shared.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 20.0, 20.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(1.0, 0.0, 0.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        dl_shared.push(RenderCommand::PopBlendGroup);
+
+        let mut w_shared = SvgWriter::new(
+            dl_shared.page_rect,
+            20.0,
+            20.0,
+            &dl_shared.commands,
+            &fonts,
+            &images,
+            &options,
+        );
+        w_shared.max_retained_mask_bytes = budget;
+        w_shared.emit_commands(&dl_shared.commands, EmitDepth::default());
+        assert_eq!(
+            w_shared.mask_defs.len(),
+            1,
+            "fitting tiling cell referenced twice must be charged once and cached in mask_defs"
+        );
+        assert!(w_shared.retained_mask_bytes <= budget);
+    }
+
+    #[test]
+    fn svg_type3_unclipped_radial_shading_past_1000_units_uses_font_bbox() {
+        use std::sync::Arc;
+        use zpdf_font::{Type3Function, Type3Resources, Type3Shading};
+
+        let mut func_dict = zpdf_core::PdfDict::new();
+        func_dict.insert(
+            zpdf_core::PdfName::new("FunctionType"),
+            zpdf_core::PdfObject::Integer(2),
+        );
+        func_dict.insert(
+            zpdf_core::PdfName::new("Domain"),
+            zpdf_core::PdfObject::Array(vec![
+                zpdf_core::PdfObject::Real(0.0),
+                zpdf_core::PdfObject::Real(1.0),
+            ]),
+        );
+        func_dict.insert(
+            zpdf_core::PdfName::new("C0"),
+            zpdf_core::PdfObject::Array(vec![
+                zpdf_core::PdfObject::Real(1.0),
+                zpdf_core::PdfObject::Real(0.0),
+                zpdf_core::PdfObject::Real(0.0),
+            ]),
+        );
+        func_dict.insert(
+            zpdf_core::PdfName::new("C1"),
+            zpdf_core::PdfObject::Array(vec![
+                zpdf_core::PdfObject::Real(0.0),
+                zpdf_core::PdfObject::Real(0.0),
+                zpdf_core::PdfObject::Real(1.0),
+            ]),
+        );
+        func_dict.insert(
+            zpdf_core::PdfName::new("N"),
+            zpdf_core::PdfObject::Real(1.0),
+        );
+        let mut sh_dict = zpdf_core::PdfDict::new();
+        sh_dict.insert(
+            zpdf_core::PdfName::new("ShadingType"),
+            zpdf_core::PdfObject::Integer(3),
+        );
+        sh_dict.insert(
+            zpdf_core::PdfName::new("ColorSpace"),
+            zpdf_core::PdfObject::Name(zpdf_core::PdfName::new("DeviceRGB")),
+        );
+        sh_dict.insert(
+            zpdf_core::PdfName::new("Coords"),
+            zpdf_core::PdfObject::Array(vec![
+                zpdf_core::PdfObject::Real(1800.0),
+                zpdf_core::PdfObject::Real(250.0),
+                zpdf_core::PdfObject::Real(0.0),
+                zpdf_core::PdfObject::Real(1800.0),
+                zpdf_core::PdfObject::Real(250.0),
+                zpdf_core::PdfObject::Real(200.0),
+            ]),
+        );
+        sh_dict.insert(
+            zpdf_core::PdfName::new("Extend"),
+            zpdf_core::PdfObject::Array(vec![
+                zpdf_core::PdfObject::Bool(false),
+                zpdf_core::PdfObject::Bool(false),
+            ]),
+        );
+        let mut t3_res = Type3Resources::default();
+        t3_res.shadings.insert(
+            "Fade".into(),
+            Arc::new(Type3Shading {
+                dict: sh_dict,
+                stream_data: None,
+                functions: vec![Arc::new(Type3Function::Dict {
+                    dict: func_dict,
+                    children: Vec::new(),
+                })],
+            }),
+        );
+        // Unclipped d0 CharProc painting radial shading centered at (1800, 250)
+        // outside [-1000..1000] but inside FontBBox [0 0 2500 500].
+        let charproc = b"2500 0 d0 /Fade sh";
+        let font = LoadedFont::new_with_data(
+            zpdf_font::PdfFontType::Type3 {
+                font_matrix: [0.04, 0.0, 0.0, 0.04, 0.0, 0.0],
+                char_procs: HashMap::from([("A".into(), Arc::<[u8]>::from(&charproc[..]))]),
+                encoding: vec!["A".into()],
+                widths: vec![2500.0],
+                first_char: 0,
+            },
+            "UnclippedRadialPast1000Svg".into(),
+            Vec::new(),
+            zpdf_font::CidWidths::new(2500.0),
+        )
+        .with_type3_resources(Arc::new(t3_res))
+        .with_type3_font_bbox(Rect::new(0.0, 0.0, 2500.0, 500.0));
+        let mut fonts = FontCache::new();
+        let font_id = fonts.insert("F1".into(), font);
+
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 20.0));
+        dl.push(RenderCommand::DrawGlyphRun(GlyphRun {
+            font_id,
+            font_size: 1.0,
+            glyphs: vec![PositionedGlyph {
+                glyph_id: 0,
+                code_len: 1,
+                code: b'A' as u32,
+                x: 0.0,
+                y: 0.0,
+                advance: 100.0,
+            }],
+            paint: Paint::Solid(Color::black()),
+            alpha: 1.0,
+            overprint: None,
+            transform: zpdf_core::Matrix::identity(),
+            h_scale: 1.0,
+        }));
+
+        let svg = display_list_to_svg(&dl, &fonts, &ImageCache::new(), &SvgOptions::default());
+        let tree = resvg::usvg::Tree::from_data(svg.as_bytes(), &resvg::usvg::Options::default())
+            .expect("valid SVG");
+        let mut pixmap = resvg::tiny_skia::Pixmap::new(100, 20).expect("pixmap");
+        resvg::render(
+            &tree,
+            resvg::tiny_skia::Transform::from_scale(
+                100.0 / tree.size().width(),
+                20.0 / tree.size().height(),
+            ),
+            &mut pixmap.as_mut(),
+        );
+        // Center (1800*0.04=72, 250*0.04=10): red; rim (x=78): blue; outside (x=20): white.
+        let center = pixmap.pixel(72, 10).expect("center");
+        let rim = pixmap.pixel(78, 10).expect("rim");
+        let outside = pixmap.pixel(20, 10).expect("outside");
+        assert!(
+            center.red() > 210 && center.green() < 25 && center.blue() < 60,
+            "SVG unclipped radial shading center must be red, got {center:?}"
+        );
+        assert!(
+            rim.blue() > 150 && rim.green() < 25,
+            "SVG unclipped radial shading rim must be bluish, got {rim:?}"
+        );
+        assert!(
+            outside.red() > 240 && outside.green() > 240 && outside.blue() > 240,
+            "SVG outside non-extended radial shading must be white, got {outside:?}"
         );
     }
 }

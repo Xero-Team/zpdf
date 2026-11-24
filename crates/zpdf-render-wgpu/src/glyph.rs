@@ -419,9 +419,11 @@ fn render_type3(
         let Some((stream, font_matrix)) = font.type3_glyph_stream(g.glyph_id) else {
             continue;
         };
-        let Some((glyph_dl, glyph_images)) =
-            rec.interpret_type3_stream(stream, font.type3_resources())
-        else {
+        let Some((glyph_dl, glyph_images)) = rec.interpret_type3_stream_in_rect(
+            stream,
+            font.type3_resources(),
+            font.type3_glyph_rect(),
+        ) else {
             return;
         };
         let glyph_to_page = type3_glyph_to_page(tm, (g.x, g.y), font_size, h_scale, &font_matrix);
@@ -734,9 +736,11 @@ pub fn render_type3_tiling_transformed(
         let Some((stream, font_matrix)) = font.type3_glyph_stream(g.glyph_id) else {
             continue;
         };
-        let Some((glyph_dl, glyph_images)) =
-            rec.interpret_type3_stream(stream, font.type3_resources())
-        else {
+        let Some((glyph_dl, glyph_images)) = rec.interpret_type3_stream_in_rect(
+            stream,
+            font.type3_resources(),
+            font.type3_glyph_rect(),
+        ) else {
             return;
         };
         let glyph_to_page = type3_glyph_to_page(&tm, (g.x, g.y), font_size, h_scale, &font_matrix);

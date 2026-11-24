@@ -1652,42 +1652,58 @@ impl<'a> ContentInterpreter<'a> {
     fn parse_type3_function(
         func: &std::sync::Arc<zpdf_font::Type3Function>,
     ) -> Option<zpdf_color::PdfFunction> {
+        const MAX_DEPTH: u8 = 8;
         type FuncEntry = (zpdf_core::PdfDict, Option<std::sync::Arc<[u8]>>);
         fn flatten(
             f: &std::sync::Arc<zpdf_font::Type3Function>,
+            depth: u8,
             table: &mut Vec<FuncEntry>,
-            seen: &mut std::collections::HashMap<usize, ObjectId>,
-        ) -> FuncEntry {
+            seen: &mut std::collections::HashMap<usize, (ObjectId, u8)>,
+        ) -> Option<(FuncEntry, u8)> {
+            if depth > MAX_DEPTH {
+                return None;
+            }
             match f.as_ref() {
                 zpdf_font::Type3Function::Stream { dict, data } => {
-                    (dict.clone(), Some(std::sync::Arc::clone(data)))
+                    Some(((dict.clone(), Some(std::sync::Arc::clone(data))), 0))
                 }
                 zpdf_font::Type3Function::Dict { dict, children } => {
                     let mut out = dict.clone();
+                    let mut max_child_height = 0u8;
                     if !children.is_empty() {
                         let mut refs = Vec::with_capacity(children.len());
                         for child in children {
                             let ptr = std::sync::Arc::as_ptr(child) as usize;
-                            let id = if let Some(&existing) = seen.get(&ptr) {
-                                existing
-                            } else {
-                                let entry = flatten(child, table, seen);
-                                let id = ObjectId(table.len() as u32, 0);
-                                table.push(entry);
-                                seen.insert(ptr, id);
-                                id
-                            };
+                            let (id, child_height) =
+                                if let Some(&(existing, height)) = seen.get(&ptr) {
+                                    if depth.saturating_add(1).saturating_add(height) > MAX_DEPTH {
+                                        return None;
+                                    }
+                                    (existing, height)
+                                } else {
+                                    let (entry, height) = flatten(child, depth + 1, table, seen)?;
+                                    let id = ObjectId(table.len() as u32, 0);
+                                    table.push(entry);
+                                    seen.insert(ptr, (id, height));
+                                    (id, height)
+                                };
+                            max_child_height = max_child_height.max(child_height);
                             refs.push(PdfObject::Ref(id));
                         }
                         out.insert(zpdf_core::PdfName::new("Functions"), PdfObject::Array(refs));
                     }
-                    (out, None)
+                    let height = if children.is_empty() {
+                        0
+                    } else {
+                        max_child_height.saturating_add(1)
+                    };
+                    Some(((out, None), height))
                 }
             }
         }
         let mut table = Vec::new();
         let mut seen = std::collections::HashMap::new();
-        let (root_dict, root_data) = flatten(func, &mut table, &mut seen);
+        let ((root_dict, root_data), _) = flatten(func, 0, &mut table, &mut seen)?;
         let mut resolve = |id: ObjectId| {
             table
                 .get(id.0 as usize)
@@ -2920,10 +2936,10 @@ impl<'a> ContentInterpreter<'a> {
                 // ISO 32000-1 Table 113, `d1` is only valid in a Type 3
                 // CharProc stream; ignore misplaced `d1` in page, Form, or
                 // pattern streams so it cannot lock outer colour operators.
-                let _ury = self.pop_f64();
-                let _urx = self.pop_f64();
-                let _lly = self.pop_f64();
-                let _llx = self.pop_f64();
+                let ury = self.pop_f64();
+                let urx = self.pop_f64();
+                let lly = self.pop_f64();
+                let llx = self.pop_f64();
                 let _wy = self.pop_f64();
                 let _wx = self.pop_f64();
                 if self.type3_inline_ctx.is_some() {
@@ -2938,6 +2954,15 @@ impl<'a> ContentInterpreter<'a> {
                     self.suppress_color_ops = true;
                     self.current.fill_color_explicit = false;
                     self.current.stroke_color_explicit = false;
+                    if llx.is_finite()
+                        && lly.is_finite()
+                        && urx.is_finite()
+                        && ury.is_finite()
+                        && urx > llx
+                        && ury > lly
+                    {
+                        self.display_list.page_rect = Rect::new(llx, lly, urx, ury);
+                    }
                 }
             }
 

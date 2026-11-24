@@ -500,10 +500,24 @@ impl PageRecorder {
     /// debit max(1, operators executed) from one render-page allowance. The
     /// minimum charge bounds children with no operators as well.
     /// Work timing is optional; the total operator counter is always available.
+    #[cfg(test)]
     pub fn interpret_type3_stream(
         &mut self,
         stream: &[u8],
         resources: Option<&zpdf_font::Type3Resources>,
+    ) -> Option<(zpdf_display_list::DisplayList, zpdf_image::ImageCache)> {
+        self.interpret_type3_stream_in_rect(
+            stream,
+            resources,
+            zpdf_core::Rect::new(-1000.0, -1000.0, 1000.0, 1000.0),
+        )
+    }
+
+    pub fn interpret_type3_stream_in_rect(
+        &mut self,
+        stream: &[u8],
+        resources: Option<&zpdf_font::Type3Resources>,
+        rect: zpdf_core::Rect,
     ) -> Option<(zpdf_display_list::DisplayList, zpdf_image::ImageCache)> {
         if !self.can_record() {
             return None;
@@ -519,7 +533,6 @@ impl PageRecorder {
         let deadline = *self
             .deadline
             .get_or_insert_with(|| Instant::now() + RECORD_BUDGET);
-        let rect = zpdf_core::Rect::new(-1000.0, -1000.0, 1000.0, 1000.0);
         let mut images = zpdf_image::ImageCache::new();
         let (dl, stats) = zpdf_content::interpreter::ContentInterpreter::new(rect)
             .for_type3_glyph()
