@@ -85,6 +85,13 @@ impl Path {
         }
     }
 
+    /// Heap bytes owned by this path's point/verb buffer.
+    pub fn heap_bytes(&self) -> usize {
+        self.slots
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Point>())
+    }
+
     pub fn move_to(&mut self, p: Point) {
         self.push_verb(MOVE, &[p]);
     }

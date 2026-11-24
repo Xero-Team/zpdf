@@ -113,10 +113,11 @@ pub struct CpuRenderer<'a> {
     /// optional `/TR` LUT alongside the coverage bytes so pointer keys stay
     /// unique for as long as the entry lives. Cleared per page.
     soft_mask_planes: HashMap<SoftMaskPlaneKey, SoftMaskPlaneEntry>,
-    /// Distinct `Arc<InlineImage>` addresses currently retained by
-    /// `soft_mask_planes` so shared mask images are charged once against
-    /// `max_soft_mask_cache_bytes` while uncached fresh allocations are charged
-    /// every time.
+    /// Distinct `Arc<DisplayList>` and `Arc<InlineImage>` addresses currently
+    /// retained by `soft_mask_planes` so shared mask lists and images are
+    /// charged once against `max_soft_mask_cache_bytes` while uncached fresh
+    /// allocations (including owned `Path` buffers) are charged every time.
+    soft_mask_dl_ptrs: std::collections::HashSet<usize>,
     soft_mask_inline_ptrs: std::collections::HashSet<usize>,
     soft_mask_cache_bytes: u64,
     /// Current recursive soft-mask depth (guards malicious/cyclic mask graphs).
@@ -669,6 +670,7 @@ impl<'a> CpuRenderer<'a> {
             deadline: None,
             over_budget: false,
             soft_mask_planes: HashMap::new(),
+            soft_mask_dl_ptrs: std::collections::HashSet::new(),
             soft_mask_inline_ptrs: std::collections::HashSet::new(),
             soft_mask_cache_bytes: 0,
             soft_mask_depth: 0,
@@ -733,6 +735,7 @@ impl<'a> CpuRenderer<'a> {
     /// so subsequent allocations cannot reuse an old `Arc::as_ptr` key.
     pub fn clear_soft_mask_cache(&mut self) {
         self.soft_mask_planes.clear();
+        self.soft_mask_dl_ptrs.clear();
         self.soft_mask_inline_ptrs.clear();
         self.soft_mask_cache_bytes = 0;
     }
@@ -1447,6 +1450,7 @@ impl<'a> CpuRenderer<'a> {
                 deadline: self.deadline,
                 over_budget: self.over_budget,
                 soft_mask_planes: HashMap::new(),
+                soft_mask_dl_ptrs: std::collections::HashSet::new(),
                 soft_mask_inline_ptrs: std::collections::HashSet::new(),
                 soft_mask_cache_bytes: 0,
                 soft_mask_depth: blend_depth,
@@ -1750,6 +1754,7 @@ impl<'a> CpuRenderer<'a> {
             deadline: self.deadline,
             over_budget: self.over_budget,
             soft_mask_planes: HashMap::new(),
+            soft_mask_dl_ptrs: std::collections::HashSet::new(),
             soft_mask_inline_ptrs: std::collections::HashSet::new(),
             soft_mask_cache_bytes: 0,
             soft_mask_depth: blend_depth,
@@ -2192,6 +2197,7 @@ impl<'a> CpuRenderer<'a> {
         let saved_clip_stack = std::mem::take(&mut self.clip_stack);
         let saved_mask_pool = std::mem::take(&mut self.mask_pool);
         let saved_soft_masks = std::mem::take(&mut self.soft_mask_planes);
+        let saved_soft_mask_dl_ptrs = std::mem::take(&mut self.soft_mask_dl_ptrs);
         let saved_soft_mask_inline_ptrs = std::mem::take(&mut self.soft_mask_inline_ptrs);
         let saved_soft_mask_bytes = std::mem::replace(&mut self.soft_mask_cache_bytes, 0);
         let saved_ox = self.dev_origin_x;
@@ -2426,6 +2432,7 @@ impl<'a> CpuRenderer<'a> {
         self.current_clip = saved_clip;
         self.clip_bounds = saved_clip_bounds;
         self.soft_mask_planes = saved_soft_masks;
+        self.soft_mask_dl_ptrs = saved_soft_mask_dl_ptrs;
         self.soft_mask_inline_ptrs = saved_soft_mask_inline_ptrs;
         self.soft_mask_cache_bytes = saved_soft_mask_bytes;
         self.dev_origin_x = saved_ox;
@@ -2959,6 +2966,7 @@ impl<'a> CpuRenderer<'a> {
         // command list so per-tile transformed mask Arcs never alias freed
         // heap addresses across translated tiles or pollute the page cache.
         let saved_mask_planes = std::mem::take(&mut self.soft_mask_planes);
+        let saved_mask_dl_ptrs = std::mem::take(&mut self.soft_mask_dl_ptrs);
         let saved_mask_inline_ptrs = std::mem::take(&mut self.soft_mask_inline_ptrs);
         let saved_mask_bytes = std::mem::replace(&mut self.soft_mask_cache_bytes, 0);
 
@@ -2998,6 +3006,7 @@ impl<'a> CpuRenderer<'a> {
             }
         }
         self.soft_mask_planes = saved_mask_planes;
+        self.soft_mask_dl_ptrs = saved_mask_dl_ptrs;
         self.soft_mask_inline_ptrs = saved_mask_inline_ptrs;
         self.soft_mask_cache_bytes = saved_mask_bytes;
         self.tiling_depth = self.tiling_depth.saturating_sub(1);
@@ -4803,6 +4812,7 @@ impl<'a> CpuRenderer<'a> {
         let saved_clip_stack = std::mem::take(&mut self.clip_stack);
         let saved_mask_pool = std::mem::take(&mut self.mask_pool);
         let saved_soft_masks = std::mem::take(&mut self.soft_mask_planes);
+        let saved_soft_mask_dl_ptrs = std::mem::take(&mut self.soft_mask_dl_ptrs);
         let saved_soft_mask_inline_ptrs = std::mem::take(&mut self.soft_mask_inline_ptrs);
         let saved_soft_mask_bytes = std::mem::replace(&mut self.soft_mask_cache_bytes, 0);
 
@@ -5152,6 +5162,7 @@ impl<'a> CpuRenderer<'a> {
         self.current_clip = saved_clip;
         self.clip_bounds = saved_clip_bounds;
         self.soft_mask_planes = saved_soft_masks;
+        self.soft_mask_dl_ptrs = saved_soft_mask_dl_ptrs;
         self.soft_mask_inline_ptrs = saved_soft_mask_inline_ptrs;
         self.soft_mask_cache_bytes = saved_soft_mask_bytes;
         self.dev_origin_x = saved_ox;
@@ -5601,15 +5612,24 @@ impl<'a> CpuRenderer<'a> {
             }
         };
         let base_bytes = base.len() as u64;
-        let (mut entry_bytes, mut new_inline_ptrs) =
-            Self::soft_mask_retained_bytes(mask, &self.soft_mask_inline_ptrs, base_bytes);
+        let (mut entry_bytes, mut new_dl_ptrs, mut new_inline_ptrs) =
+            Self::soft_mask_retained_bytes(
+                mask,
+                &self.soft_mask_dl_ptrs,
+                &self.soft_mask_inline_ptrs,
+                base_bytes,
+            );
         if entry_bytes <= self.max_soft_mask_cache_bytes {
             if self.soft_mask_cache_bytes.saturating_add(entry_bytes)
                 > self.max_soft_mask_cache_bytes
             {
                 self.clear_soft_mask_cache();
-                (entry_bytes, new_inline_ptrs) =
-                    Self::soft_mask_retained_bytes(mask, &self.soft_mask_inline_ptrs, base_bytes);
+                (entry_bytes, new_dl_ptrs, new_inline_ptrs) = Self::soft_mask_retained_bytes(
+                    mask,
+                    &self.soft_mask_dl_ptrs,
+                    &self.soft_mask_inline_ptrs,
+                    base_bytes,
+                );
             }
             if entry_bytes <= self.max_soft_mask_cache_bytes {
                 self.soft_mask_planes.insert(
@@ -5620,6 +5640,7 @@ impl<'a> CpuRenderer<'a> {
                         Arc::clone(&base),
                     ),
                 );
+                self.soft_mask_dl_ptrs.extend(new_dl_ptrs);
                 self.soft_mask_inline_ptrs.extend(new_inline_ptrs);
                 self.soft_mask_cache_bytes = self.soft_mask_cache_bytes.saturating_add(entry_bytes);
             }
@@ -5634,26 +5655,30 @@ impl<'a> CpuRenderer<'a> {
     }
 
     /// Compute retained memory bytes for caching `mask` in `soft_mask_planes`:
-    /// coverage-plane bytes plus command-list storage and any newly-retained
-    /// `Arc<InlineImage>` pixel buffers not already held by the cache.
+    /// coverage-plane bytes plus newly-retained `DisplayList` owned heap
+    /// allocations (command vectors, path point/verb buffers, dash arrays,
+    /// glyph vectors) and newly-retained `Arc<InlineImage>` pixel buffers.
     fn soft_mask_retained_bytes(
         mask: &SoftMask,
+        already_retained_dls: &std::collections::HashSet<usize>,
         already_retained_inlines: &std::collections::HashSet<usize>,
         plane_bytes: u64,
-    ) -> (u64, Vec<usize>) {
+    ) -> (u64, Vec<usize>, Vec<usize>) {
         let mut bytes = plane_bytes;
         let mut seen_dls = std::collections::HashSet::new();
         let mut seen_inlines = std::collections::HashSet::new();
+        let mut new_dls = Vec::new();
         let mut new_inlines = Vec::new();
         let mut stack: Vec<(&DisplayList, u8)> = vec![(&mask.commands, 0)];
         while let Some((dl, depth)) = stack.pop() {
-            if depth > 8 || !seen_dls.insert(dl as *const DisplayList as usize) {
+            let dl_ptr = dl as *const DisplayList as usize;
+            if depth > 8 || !seen_dls.insert(dl_ptr) {
                 continue;
             }
-            bytes = bytes.saturating_add(
-                (dl.commands.len() as u64)
-                    .saturating_mul(std::mem::size_of::<RenderCommand>() as u64),
-            );
+            if !already_retained_dls.contains(&dl_ptr) {
+                bytes = bytes.saturating_add(dl.owned_heap_bytes());
+                new_dls.push(dl_ptr);
+            }
             for cmd in &dl.commands {
                 match cmd {
                     RenderCommand::DrawInlineImage(draw) => {
@@ -5672,7 +5697,7 @@ impl<'a> CpuRenderer<'a> {
                 }
             }
         }
-        (bytes, new_inlines)
+        (bytes, new_dls, new_inlines)
     }
 
     fn current_page_bounds(&self) -> Option<Rect> {
@@ -5763,6 +5788,7 @@ impl<'a> CpuRenderer<'a> {
             deadline: self.deadline,
             over_budget: self.over_budget,
             soft_mask_planes: HashMap::new(),
+            soft_mask_dl_ptrs: std::collections::HashSet::new(),
             soft_mask_inline_ptrs: std::collections::HashSet::new(),
             soft_mask_cache_bytes: 0,
             // The mask belongs to the group currently being pushed, so carry
@@ -7022,7 +7048,7 @@ impl<'a> CpuRenderer<'a> {
         let glyph = font
             .type3_glyph_stream(glyph_id)
             .map(|(stream, font_matrix)| {
-                let glyph_rect = zpdf_core::Rect::new(0.0, -1000.0, 1000.0, 1000.0);
+                let glyph_rect = zpdf_core::Rect::new(-1000.0, -1000.0, 1000.0, 1000.0);
                 let mut images = ImageCache::new();
                 let mut interp = ContentInterpreter::new(glyph_rect)
                     .for_type3_glyph()
@@ -13389,5 +13415,90 @@ mod tests {
                 "glyph B (shifted half period) x={x} must be red dash"
             );
         }
+    }
+
+    #[test]
+    fn cpu_soft_mask_cache_skips_one_command_mask_whose_path_exceeds_budget() {
+        // Build a single FillPath command covering [0..20, 0..20] with 500
+        // vertices (>8 KB of owned Path slot storage) on a tiny 20x20 canvas
+        // whose coverage plane is only 400 bytes.
+        let mut big_path = Path::new();
+        big_path.move_to(Point::new(0.0, 0.0));
+        for i in 1..=250 {
+            let x = 20.0 * (i as f64) / 250.0;
+            big_path.line_to(Point::new(x, 0.0));
+        }
+        for i in 1..=250 {
+            let x = 20.0 * (1.0 - (i as f64) / 250.0);
+            big_path.line_to(Point::new(x, 20.0));
+        }
+        big_path.close();
+        assert!(
+            big_path.heap_bytes() > 4096,
+            "expected large path allocation, got {}",
+            big_path.heap_bytes()
+        );
+
+        let mut mask_dl = DisplayList::new(Rect::new(0.0, 0.0, 20.0, 20.0));
+        mask_dl.push(RenderCommand::FillPath {
+            path: big_path,
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::white()),
+            alpha: 1.0,
+            overprint: None,
+        });
+        assert_eq!(mask_dl.commands.len(), 1);
+        let mask = SoftMask {
+            kind: SoftMaskKind::Luminosity,
+            commands: Arc::new(mask_dl),
+            offset: (0.0, 0.0),
+            backdrop_luma: 0.0,
+            transfer: None,
+        };
+
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 20.0, 20.0));
+        dl.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Normal,
+            isolated: true,
+            knockout: false,
+            bounds: Rect::new(0.0, 0.0, 20.0, 20.0),
+            alpha: 1.0,
+            mask: Some(mask),
+        });
+        dl.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 20.0, 20.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(1.0, 0.0, 0.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        dl.push(RenderCommand::PopBlendGroup);
+
+        // Budget easily fits the 400-byte plane + fixed command struct, but is
+        // smaller than the single FillPath's owned point/verb allocation.
+        let mut renderer = CpuRenderer::new();
+        renderer.max_soft_mask_cache_bytes = 2_048;
+        let info = PageRenderInfo {
+            page_rect: dl.page_rect,
+            scale: 1.0,
+            background: Color::white(),
+        };
+        renderer.begin_page(&info).expect("begin_page");
+        for cmd in &dl.commands {
+            renderer.execute(cmd).expect("execute");
+        }
+        assert!(
+            renderer.soft_mask_planes.is_empty() && renderer.soft_mask_cache_bytes == 0,
+            "one-command mask whose path exceeds cache budget must be skipped by soft_mask_planes (cached {} entries, {} bytes)",
+            renderer.soft_mask_planes.len(),
+            renderer.soft_mask_cache_bytes
+        );
+
+        let page = renderer.end_page().expect("end_page");
+        let idx = ((10 * page.width + 10) * 4) as usize;
+        assert!(
+            page.data[idx] > 240 && page.data[idx + 1] < 15 && page.data[idx + 2] < 15,
+            "uncached mask must still render red pixels accurately"
+        );
     }
 }

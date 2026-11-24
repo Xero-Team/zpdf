@@ -198,6 +198,57 @@ impl DisplayList {
             .partition_point(|&(start, _)| start <= cmd_idx);
         pos > 0 && cmd_idx < self.type3_glyph_ranges[pos - 1].1
     }
+
+    /// Heap bytes exclusively owned by this display list (command buffer, range
+    /// vectors, and per-command owned geometry such as path point/verb buffers,
+    /// dash arrays, and glyph vectors), excluding ref-counted payloads such as
+    /// `Arc<InlineImage>` and nested `SoftMask` lists.
+    pub fn owned_heap_bytes(&self) -> u64 {
+        let mut bytes = (std::mem::size_of::<Self>() as u64)
+            .saturating_add(
+                (self.commands.capacity() as u64)
+                    .saturating_mul(std::mem::size_of::<RenderCommand>() as u64),
+            )
+            .saturating_add(
+                (self.expanded_glyph_runs.capacity() as u64)
+                    .saturating_mul(std::mem::size_of::<ExpandedGlyphRun>() as u64),
+            )
+            .saturating_add(
+                ((self.pattern_ranges.capacity() + self.type3_glyph_ranges.capacity()) as u64)
+                    .saturating_mul(std::mem::size_of::<(usize, usize)>() as u64),
+            );
+        for cmd in &self.commands {
+            bytes = bytes.saturating_add(cmd.owned_heap_bytes());
+        }
+        bytes
+    }
+}
+
+impl RenderCommand {
+    /// Heap bytes exclusively owned by this command (path buffers, dash arrays,
+    /// and glyph vectors), excluding ref-counted payloads.
+    pub fn owned_heap_bytes(&self) -> u64 {
+        let bytes = match self {
+            Self::FillPath { path, .. } | Self::PushClip { path, .. } => path.heap_bytes(),
+            Self::StrokePath { path, style, .. } | Self::PushClipStroke { path, style } => path
+                .heap_bytes()
+                .saturating_add(style.dash.as_ref().map_or(0, |d| {
+                    d.array
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<f32>())
+                })),
+            Self::DrawGlyphRun(run) => run
+                .glyphs
+                .capacity()
+                .saturating_mul(std::mem::size_of::<PositionedGlyph>()),
+            Self::DrawImage(_)
+            | Self::DrawInlineImage(_)
+            | Self::PopClip
+            | Self::PushBlendGroup { .. }
+            | Self::PopBlendGroup => 0,
+        };
+        bytes as u64
+    }
 }
 
 /// Semantic glyph run whose visual output has already been expanded into

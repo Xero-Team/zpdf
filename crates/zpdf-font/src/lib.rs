@@ -242,23 +242,23 @@ pub enum Type3SoftMask {
         group: Arc<Type3FormXObject>,
         /// Backdrop luminosity approximation from `/BC` in `[0, 1]`.
         backdrop_luma: f32,
-        /// Resolved `/TR` transfer function object (dict/array/name, plus
-        /// decoded stream payload when `/TR` is a stream function) when present
-        /// and not `/Identity`.
-        transfer: Option<(zpdf_core::PdfObject, Option<Arc<[u8]>>)>,
+        /// Pre-resolved `/TR` transfer function (including recursive stitching
+        /// sub-functions and stream payloads) when present and not `/Identity`.
+        transfer: Option<Arc<Type3Function>>,
     },
 }
 
 /// Pre-resolved PDF function node (dict, stream with decoded bytes, or
-/// stitching sub-functions) carried inside [`Type3Shading`] so standalone
-/// Type 3 replay can evaluate `/Function` without a live `PdfFile`.
+/// stitching sub-functions) carried inside [`Type3Shading`] and
+/// [`Type3SoftMask`] so standalone Type 3 replay can evaluate `/Function` and
+/// `/TR` without a live `PdfFile`.
 #[derive(Debug, Clone)]
 pub enum Type3Function {
     /// Non-stream function dictionary (Type 2 exponential, or Type 3 stitching
     /// whose child `/Functions` entries are stored in `children`).
     Dict {
         dict: zpdf_core::PdfDict,
-        children: Vec<Type3Function>,
+        children: Vec<Arc<Type3Function>>,
     },
     /// Stream-backed function (Type 0 sampled or Type 4 PostScript calculator).
     Stream {
@@ -279,7 +279,7 @@ pub struct Type3Shading {
     pub stream_data: Option<Arc<[u8]>>,
     /// Pre-resolved `/Function` entry (one multi-output function, N 1-output
     /// functions, or empty for mesh shadings with direct vertex colors).
-    pub functions: Vec<Type3Function>,
+    pub functions: Vec<Arc<Type3Function>>,
 }
 
 /// Resolved named resources carried by a Type 3 [`LoadedFont`] so CharProcs
@@ -308,23 +308,28 @@ struct Type3BytesVisited {
     form_ptrs: HashSet<usize>,
     /// Deduplicates shared `Arc<Type3Shading>` nodes.
     shading_ptrs: HashSet<usize>,
+    /// Deduplicates shared `Arc<Type3Function>` nodes.
+    function_ptrs: HashSet<usize>,
     /// Deduplicates shared `Type3Resources` maps.
     resource_ptrs: HashSet<usize>,
 }
 
 impl Type3Function {
-    fn estimated_bytes(&self, visited: &mut Type3BytesVisited) -> u64 {
+    fn estimated_bytes(root: &Arc<Self>, visited: &mut Type3BytesVisited) -> u64 {
         let mut bytes = 0u64;
-        let mut stack: Vec<&Self> = vec![self];
+        let mut stack: Vec<&Arc<Self>> = vec![root];
         while let Some(func) = stack.pop() {
+            if !visited.function_ptrs.insert(Arc::as_ptr(func) as usize) {
+                continue;
+            }
             bytes = bytes.saturating_add(std::mem::size_of::<Self>() as u64);
-            match func {
+            match func.as_ref() {
                 Self::Dict { dict, children } => {
                     bytes = bytes
                         .saturating_add(estimated_pdf_dict_bytes(dict))
                         .saturating_add(
                             (children.capacity() as u64)
-                                .saturating_mul(std::mem::size_of::<Self>() as u64),
+                                .saturating_mul(std::mem::size_of::<Arc<Self>>() as u64),
                         );
                     for child in children {
                         stack.push(child);
@@ -420,13 +425,9 @@ impl Type3Resources {
                             worklist.push(child_res.as_ref());
                         }
                     }
-                    if let Some((tr_obj, tr_data)) = transfer {
-                        bytes = bytes.saturating_add(estimated_pdf_object_bytes(tr_obj));
-                        if let Some(data) = tr_data {
-                            if visited.stream_ptrs.insert(data.as_ptr() as usize) {
-                                bytes = bytes.saturating_add(data.len() as u64);
-                            }
-                        }
+                    if let Some(tr) = transfer {
+                        bytes =
+                            bytes.saturating_add(Type3Function::estimated_bytes(tr, &mut visited));
                     }
                 }
             }
@@ -438,7 +439,7 @@ impl Type3Resources {
                         .saturating_add(estimated_pdf_dict_bytes(&shading.dict))
                         .saturating_add(
                             (shading.functions.capacity() as u64)
-                                .saturating_mul(std::mem::size_of::<Type3Function>() as u64),
+                                .saturating_mul(std::mem::size_of::<Arc<Type3Function>>() as u64),
                         );
                     if let Some(data) = &shading.stream_data {
                         if visited.stream_ptrs.insert(data.as_ptr() as usize) {
@@ -446,7 +447,8 @@ impl Type3Resources {
                         }
                     }
                     for func in &shading.functions {
-                        bytes = bytes.saturating_add(func.estimated_bytes(&mut visited));
+                        bytes = bytes
+                            .saturating_add(Type3Function::estimated_bytes(func, &mut visited));
                     }
                 }
             }

@@ -4739,11 +4739,7 @@ impl<'a> SvgWriter<'a> {
             }
             if !st.retained_lists.contains(&ptr) {
                 st.new_lists.push(ptr);
-                let list_bytes = (std::mem::size_of::<DisplayList>() as u64).saturating_add(
-                    (list.commands.len() as u64)
-                        .saturating_mul(std::mem::size_of::<RenderCommand>() as u64),
-                );
-                st.bytes = st.bytes.saturating_add(list_bytes);
+                st.bytes = st.bytes.saturating_add(list.owned_heap_bytes());
             }
             for cmd in &list.commands {
                 match cmd {
@@ -6479,7 +6475,7 @@ impl<'a> SvgWriter<'a> {
         let glyph = font
             .type3_glyph_stream(glyph_id)
             .map(|(stream, font_matrix)| {
-                let glyph_rect = zpdf_core::Rect::new(0.0, -1000.0, 1000.0, 1000.0);
+                let glyph_rect = zpdf_core::Rect::new(-1000.0, -1000.0, 1000.0, 1000.0);
                 let mut images = ImageCache::new();
                 let mut interp = ContentInterpreter::new(glyph_rect)
                     .for_type3_glyph()
@@ -13550,5 +13546,239 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn svg_soft_mask_cache_skips_one_command_mask_whose_path_exceeds_budget() {
+        use std::sync::Arc;
+
+        let mut big_path = Path::new();
+        big_path.move_to(zpdf_core::Point::new(0.0, 0.0));
+        for i in 1..=250 {
+            let x = 20.0 * (i as f64) / 250.0;
+            big_path.line_to(zpdf_core::Point::new(x, 0.0));
+        }
+        for i in 1..=250 {
+            let x = 20.0 * (1.0 - (i as f64) / 250.0);
+            big_path.line_to(zpdf_core::Point::new(x, 20.0));
+        }
+        big_path.close();
+        assert!(big_path.heap_bytes() > 4096);
+
+        let mut mask_dl = DisplayList::new(Rect::new(0.0, 0.0, 20.0, 20.0));
+        mask_dl.push(RenderCommand::FillPath {
+            path: big_path,
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::white()),
+            alpha: 1.0,
+            overprint: None,
+        });
+        assert_eq!(mask_dl.commands.len(), 1);
+        let mask = SoftMask {
+            kind: SoftMaskKind::Luminosity,
+            commands: Arc::new(mask_dl),
+            offset: (0.0, 0.0),
+            backdrop_luma: 0.0,
+            transfer: None,
+        };
+
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 20.0, 20.0));
+        dl.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Normal,
+            isolated: true,
+            knockout: false,
+            bounds: Rect::new(0.0, 0.0, 20.0, 20.0),
+            alpha: 1.0,
+            mask: Some(mask),
+        });
+        dl.push(RenderCommand::FillPath {
+            path: rect_path(0.0, 0.0, 20.0, 20.0),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(1.0, 0.0, 0.0)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        dl.push(RenderCommand::PopBlendGroup);
+
+        let (fonts, images) = empty_caches();
+        let options = SvgOptions::default();
+        let mut writer = SvgWriter::new(
+            dl.page_rect,
+            20.0,
+            20.0,
+            &dl.commands,
+            &fonts,
+            &images,
+            &options,
+        );
+        writer.max_retained_mask_bytes = 2_048;
+        writer
+            .out
+            .push_str("<rect width=\"20\" height=\"20\" fill=\"#ffffff\"/>\n");
+        writer.emit_commands(&dl.commands, EmitDepth::default());
+        assert!(
+            writer.mask_defs.is_empty() && writer.retained_mask_bytes == 0,
+            "one-command mask whose path exceeds SVG mask cache cap must not be retained in mask_defs"
+        );
+        let svg = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <svg xmlns=\"http://www.w3.org/2000/svg\" width=\"20pt\" height=\"20pt\" viewBox=\"0 0 20 20\">\n\
+             <defs>\n{}</defs>\n{}</svg>\n",
+            writer.defs, writer.out
+        );
+        let tree = resvg::usvg::Tree::from_data(svg.as_bytes(), &resvg::usvg::Options::default())
+            .expect("valid SVG");
+        let mut pixmap = resvg::tiny_skia::Pixmap::new(20, 20).expect("pixmap");
+        resvg::render(
+            &tree,
+            resvg::tiny_skia::Transform::from_scale(
+                20.0 / tree.size().width(),
+                20.0 / tree.size().height(),
+            ),
+            &mut pixmap.as_mut(),
+        );
+        let p = pixmap.pixel(10, 10).expect("center");
+        assert!(p.red() > 240 && p.green() < 15 && p.blue() < 15, "{svg}");
+    }
+
+    #[test]
+    fn svg_type3_charproc_shading_preserves_negative_left_overhang() {
+        use std::sync::Arc;
+        use zpdf_font::{Type3Function, Type3Resources, Type3Shading};
+
+        let mut func_dict = zpdf_core::PdfDict::new();
+        func_dict.insert(
+            zpdf_core::PdfName::new("FunctionType"),
+            zpdf_core::PdfObject::Integer(2),
+        );
+        func_dict.insert(
+            zpdf_core::PdfName::new("Domain"),
+            zpdf_core::PdfObject::Array(vec![
+                zpdf_core::PdfObject::Real(0.0),
+                zpdf_core::PdfObject::Real(1.0),
+            ]),
+        );
+        func_dict.insert(
+            zpdf_core::PdfName::new("C0"),
+            zpdf_core::PdfObject::Array(vec![
+                zpdf_core::PdfObject::Real(1.0),
+                zpdf_core::PdfObject::Real(0.0),
+                zpdf_core::PdfObject::Real(0.0),
+            ]),
+        );
+        func_dict.insert(
+            zpdf_core::PdfName::new("C1"),
+            zpdf_core::PdfObject::Array(vec![
+                zpdf_core::PdfObject::Real(0.0),
+                zpdf_core::PdfObject::Real(0.0),
+                zpdf_core::PdfObject::Real(1.0),
+            ]),
+        );
+        func_dict.insert(
+            zpdf_core::PdfName::new("N"),
+            zpdf_core::PdfObject::Real(1.0),
+        );
+        let mut sh_dict = zpdf_core::PdfDict::new();
+        sh_dict.insert(
+            zpdf_core::PdfName::new("ShadingType"),
+            zpdf_core::PdfObject::Integer(2),
+        );
+        sh_dict.insert(
+            zpdf_core::PdfName::new("ColorSpace"),
+            zpdf_core::PdfObject::Name(zpdf_core::PdfName::new("DeviceRGB")),
+        );
+        sh_dict.insert(
+            zpdf_core::PdfName::new("Coords"),
+            zpdf_core::PdfObject::Array(vec![
+                zpdf_core::PdfObject::Real(-40.0),
+                zpdf_core::PdfObject::Real(0.0),
+                zpdf_core::PdfObject::Real(40.0),
+                zpdf_core::PdfObject::Real(0.0),
+            ]),
+        );
+        sh_dict.insert(
+            zpdf_core::PdfName::new("Extend"),
+            zpdf_core::PdfObject::Array(vec![
+                zpdf_core::PdfObject::Bool(true),
+                zpdf_core::PdfObject::Bool(true),
+            ]),
+        );
+        let mut t3_res = Type3Resources::default();
+        t3_res.shadings.insert(
+            "Fade".into(),
+            Arc::new(Type3Shading {
+                dict: sh_dict,
+                stream_data: None,
+                functions: vec![Arc::new(Type3Function::Dict {
+                    dict: func_dict,
+                    children: Vec::new(),
+                })],
+            }),
+        );
+        let charproc = b"60 0 d0 -40 0 80 20 re W n /Fade sh";
+        let font = LoadedFont::new_with_data(
+            zpdf_font::PdfFontType::Type3 {
+                font_matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                char_procs: HashMap::from([("A".into(), Arc::<[u8]>::from(&charproc[..]))]),
+                encoding: vec!["A".into()],
+                widths: vec![60.0],
+                first_char: 0,
+            },
+            "NegLeftBearingShadingSvg".into(),
+            Vec::new(),
+            zpdf_font::CidWidths::new(60.0),
+        )
+        .with_type3_resources(Arc::new(t3_res));
+        let mut fonts = FontCache::new();
+        let font_id = fonts.insert("F1".into(), font);
+
+        let mut dl = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 20.0));
+        dl.push(RenderCommand::DrawGlyphRun(GlyphRun {
+            font_id,
+            font_size: 1.0,
+            glyphs: vec![PositionedGlyph {
+                glyph_id: 0,
+                code_len: 1,
+                code: b'A' as u32,
+                x: 50.0,
+                y: 0.0,
+                advance: 60.0,
+            }],
+            paint: Paint::Solid(Color::black()),
+            alpha: 1.0,
+            overprint: None,
+            transform: zpdf_core::Matrix::identity(),
+            h_scale: 1.0,
+        }));
+
+        let svg = display_list_to_svg(&dl, &fonts, &ImageCache::new(), &SvgOptions::default());
+        let tree = resvg::usvg::Tree::from_data(svg.as_bytes(), &resvg::usvg::Options::default())
+            .expect("valid SVG");
+        let mut pixmap = resvg::tiny_skia::Pixmap::new(100, 20).expect("pixmap");
+        resvg::render(
+            &tree,
+            resvg::tiny_skia::Transform::from_scale(
+                100.0 / tree.size().width(),
+                20.0 / tree.size().height(),
+            ),
+            &mut pixmap.as_mut(),
+        );
+        let left = pixmap.pixel(12, 10).expect("left overhang");
+        let center = pixmap.pixel(50, 10).expect("center");
+        let right = pixmap.pixel(88, 10).expect("right");
+        assert!(
+            left.red() > 235 && left.green() < 15 && left.blue() < 20,
+            "SVG negative left overhang x=12 must be red, got {left:?}: {svg}"
+        );
+        assert!(
+            center.red().abs_diff(128) <= 8
+                && center.green() < 15
+                && center.blue().abs_diff(128) <= 8,
+            "SVG center x=50 must be purple, got {center:?}"
+        );
+        assert!(
+            right.red() < 20 && right.green() < 15 && right.blue() > 235,
+            "SVG right side x=88 must be blue, got {right:?}"
+        );
     }
 }

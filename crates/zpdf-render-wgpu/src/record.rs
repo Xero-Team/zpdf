@@ -519,7 +519,7 @@ impl PageRecorder {
         let deadline = *self
             .deadline
             .get_or_insert_with(|| Instant::now() + RECORD_BUDGET);
-        let rect = zpdf_core::Rect::new(0.0, -1000.0, 1000.0, 1000.0);
+        let rect = zpdf_core::Rect::new(-1000.0, -1000.0, 1000.0, 1000.0);
         let mut images = zpdf_image::ImageCache::new();
         let (dl, stats) = zpdf_content::interpreter::ContentInterpreter::new(rect)
             .for_type3_glyph()

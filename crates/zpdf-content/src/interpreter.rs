@@ -1649,12 +1649,16 @@ impl<'a> ContentInterpreter<'a> {
             .and_then(|res| res.shadings.get(name).cloned())
     }
 
-    fn parse_type3_function(func: &zpdf_font::Type3Function) -> Option<zpdf_color::PdfFunction> {
+    fn parse_type3_function(
+        func: &std::sync::Arc<zpdf_font::Type3Function>,
+    ) -> Option<zpdf_color::PdfFunction> {
+        type FuncEntry = (zpdf_core::PdfDict, Option<std::sync::Arc<[u8]>>);
         fn flatten(
-            f: &zpdf_font::Type3Function,
-            table: &mut Vec<(zpdf_core::PdfDict, Option<std::sync::Arc<[u8]>>)>,
-        ) -> (zpdf_core::PdfDict, Option<std::sync::Arc<[u8]>>) {
-            match f {
+            f: &std::sync::Arc<zpdf_font::Type3Function>,
+            table: &mut Vec<FuncEntry>,
+            seen: &mut std::collections::HashMap<usize, ObjectId>,
+        ) -> FuncEntry {
+            match f.as_ref() {
                 zpdf_font::Type3Function::Stream { dict, data } => {
                     (dict.clone(), Some(std::sync::Arc::clone(data)))
                 }
@@ -1663,10 +1667,17 @@ impl<'a> ContentInterpreter<'a> {
                     if !children.is_empty() {
                         let mut refs = Vec::with_capacity(children.len());
                         for child in children {
-                            let entry = flatten(child, table);
-                            let idx = table.len() as u32;
-                            table.push(entry);
-                            refs.push(PdfObject::Ref(ObjectId(idx, 0)));
+                            let ptr = std::sync::Arc::as_ptr(child) as usize;
+                            let id = if let Some(&existing) = seen.get(&ptr) {
+                                existing
+                            } else {
+                                let entry = flatten(child, table, seen);
+                                let id = ObjectId(table.len() as u32, 0);
+                                table.push(entry);
+                                seen.insert(ptr, id);
+                                id
+                            };
+                            refs.push(PdfObject::Ref(id));
                         }
                         out.insert(zpdf_core::PdfName::new("Functions"), PdfObject::Array(refs));
                     }
@@ -1675,7 +1686,8 @@ impl<'a> ContentInterpreter<'a> {
             }
         }
         let mut table = Vec::new();
-        let (root_dict, root_data) = flatten(func, &mut table);
+        let mut seen = std::collections::HashMap::new();
+        let (root_dict, root_data) = flatten(func, &mut table, &mut seen);
         let mut resolve = |id: ObjectId| {
             table
                 .get(id.0 as usize)
@@ -4447,6 +4459,18 @@ impl<'a> ContentInterpreter<'a> {
     fn shading_region(&self) -> Rect {
         let page = self.display_list.page_rect.normalize();
         match self.current.clip_bounds {
+            Some(c) if self.file.is_none() => {
+                // Standalone Type 3 replay uses a placeholder glyph rect rather
+                // than a real page MediaBox; honor the effective glyph clip
+                // directly so negative overhangs (x < 0) and coordinates beyond
+                // the placeholder are preserved.
+                if c.x1 <= c.x0 || c.y1 <= c.y0 || !c.width().is_finite() || !c.height().is_finite()
+                {
+                    Rect::new(0.0, 0.0, 0.0, 0.0)
+                } else {
+                    c
+                }
+            }
             Some(c) => {
                 let c = c.normalize();
                 Rect::new(
@@ -5381,7 +5405,7 @@ impl<'a> ContentInterpreter<'a> {
         is_alpha: bool,
         group: &zpdf_font::Type3FormXObject,
         backdrop_luma: f32,
-        transfer_obj: Option<&(PdfObject, Option<std::sync::Arc<[u8]>>)>,
+        transfer_func: Option<&std::sync::Arc<zpdf_font::Type3Function>>,
     ) -> Option<SoftMask> {
         let kind = if is_alpha {
             SoftMaskKind::Alpha
@@ -5451,17 +5475,8 @@ impl<'a> ContentInterpreter<'a> {
         self.rule_sink = saved_rule_sink;
         let mask_dl = std::mem::replace(&mut self.display_list, saved_dl);
 
-        let transfer = transfer_obj.and_then(|(obj, stream_data)| {
-            if matches!(obj, PdfObject::Name(n) if n.as_str() == "Identity") {
-                return None;
-            }
-            let mut resolve = |_id: zpdf_core::ObjectId| None;
-            let f = if let Some(data) = stream_data {
-                let dict = obj.as_dict().ok()?;
-                zpdf_color::PdfFunction::parse(dict, Some(data.as_ref()), &mut resolve)
-            } else {
-                zpdf_color::PdfFunction::parse_object(obj, &mut resolve)
-            }?;
+        let transfer = transfer_func.and_then(|func| {
+            let f = Self::parse_type3_function(func)?;
             let mut lut = [0u8; 256];
             for (i, slot) in lut.iter_mut().enumerate() {
                 let out = f

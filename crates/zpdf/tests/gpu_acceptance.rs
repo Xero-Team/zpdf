@@ -4798,3 +4798,418 @@ fn type3_luminosity_mask_named_shading_matches_live_on_cpu_and_gpu() {
         Err(e) => panic!("GPU Type 3 shading mask test failed: {e}"),
     }
 }
+
+#[test]
+fn type3_charproc_shading_negative_left_bearing_matches_live_on_cpu_and_gpu() {
+    use zpdf::display_list::{Color, DisplayList, GlyphRun, Paint, PositionedGlyph, RenderCommand};
+    use zpdf_core::{Matrix, Rect};
+
+    // Colored Type 3 CharProc clipped to [-40..40, 0..20] (crossing x = 0)
+    // painting a red->blue axial shading directly via `/Fade sh`. Placed at
+    // x = 50 on a 100x20 page so page x = [10..90] is fully visible.
+    let page_content = b"BT /F1 1 Tf 50 0 Td (A) Tj ET";
+    let charproc = b"60 0 d0 -40 0 80 20 re W n /Fade sh";
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 20] /Contents 4 0 R \
+          /Resources << /Font << /F1 5 0 R >> >> >>"
+            .to_vec(), // 3
+        stream_obj("", page_content),                  // 4
+        b"<< /Type /Font /Subtype /Type3 /FontBBox [-40 0 40 20] \
+          /FontMatrix [1 0 0 1 0 0] /CharProcs << /A 6 0 R >> \
+          /Encoding << /Type /Encoding /Differences [65 /A] >> \
+          /FirstChar 65 /LastChar 65 /Widths [60] \
+          /Resources << /Shading << /Fade 7 0 R >> >> >>"
+            .to_vec(), // 5
+        stream_obj("", charproc),                      // 6
+        b"<< /ShadingType 2 /ColorSpace /DeviceRGB /Coords [-40 0 40 0] \
+          /Function 8 0 R /Extend [true true] >>"
+            .to_vec(), // 7
+        b"<< /FunctionType 2 /Domain [0 1] /C0 [1 0 0] /C1 [0 0 1] /N 1 >>".to_vec(), // 8
+    ]);
+
+    let doc = PdfDocument::open(pdf).expect("open pdf");
+    let page = doc.page(0).expect("page 0");
+    let mut fonts = doc.load_page_fonts(&page);
+    let content = doc.page_content_bytes(&page).expect("content bytes");
+    let mut live_images = ImageCache::new();
+    let live_dl = ContentInterpreter::new(page.media_box)
+        .with_fonts(&mut fonts)
+        .with_document(doc.file(), &page.resources)
+        .with_images(&mut live_images)
+        .interpret(&content);
+    assert!(
+        !live_dl
+            .commands
+            .iter()
+            .any(|c| matches!(c, RenderCommand::DrawGlyphRun(_))),
+        "live interpretation should inline Type 3 glyph"
+    );
+    let live_cpu = zpdf_render_cpu::CpuRenderer::new()
+        .with_fonts(&fonts)
+        .with_images(&live_images)
+        .render_display_list(&live_dl, 1.0)
+        .expect("live CPU");
+
+    let (font_id, _) = fonts.get_by_name("F1").expect("loaded F1");
+    let mut standalone_dl = DisplayList::new(Rect::new(0.0, 0.0, 100.0, 20.0));
+    standalone_dl.push(RenderCommand::DrawGlyphRun(GlyphRun {
+        font_id,
+        font_size: 1.0,
+        glyphs: vec![PositionedGlyph {
+            glyph_id: 65,
+            code_len: 1,
+            code: b'A' as u32,
+            x: 50.0,
+            y: 0.0,
+            advance: 60.0,
+        }],
+        paint: Paint::Solid(Color::black()),
+        alpha: 1.0,
+        overprint: None,
+        transform: Matrix::identity(),
+        h_scale: 1.0,
+    }));
+    let standalone_cpu = zpdf_render_cpu::CpuRenderer::new()
+        .with_fonts(&fonts)
+        .render_display_list(&standalone_dl, 1.0)
+        .expect("standalone CPU");
+
+    let px = |data: &[u8], w: u32, x: u32, y: u32| -> [u8; 3] {
+        let off = ((y * w + x) * 4) as usize;
+        [data[off], data[off + 1], data[off + 2]]
+    };
+    let assert_overhang = |label: &str, data: &[u8], w: u32| {
+        let left = px(data, w, 12, 10);
+        let center = px(data, w, 50, 10);
+        let right = px(data, w, 88, 10);
+        assert!(
+            left[0] > 235 && left[1] < 15 && left[2] < 20,
+            "{label}: negative left overhang x=12 must be red, got {left:?}"
+        );
+        assert!(
+            center[0].abs_diff(128) <= 8 && center[1] < 15 && center[2].abs_diff(128) <= 8,
+            "{label}: center x=50 must be purple, got {center:?}"
+        );
+        assert!(
+            right[0] < 20 && right[1] < 15 && right[2] > 235,
+            "{label}: right side x=88 must be blue, got {right:?}"
+        );
+    };
+    assert_overhang("live CPU", &live_cpu.data, live_cpu.width);
+    assert_overhang("standalone CPU", &standalone_cpu.data, standalone_cpu.width);
+
+    let cpu_max_diff = live_cpu
+        .data
+        .iter()
+        .zip(standalone_cpu.data.iter())
+        .map(|(a, b)| a.abs_diff(*b))
+        .max()
+        .unwrap_or(0);
+    assert!(
+        cpu_max_diff <= 3,
+        "standalone CPU negative-left-bearing shading must match live CPU within 3 LSB, max_diff={cpu_max_diff}"
+    );
+
+    match render_gpu_shared(&standalone_dl, Some(&fonts), None, 1.0) {
+        Ok(standalone_gpu) => {
+            assert_overhang("standalone GPU", &standalone_gpu.data, standalone_gpu.width);
+            let gpu_max_diff = live_cpu
+                .data
+                .iter()
+                .zip(standalone_gpu.data.iter())
+                .map(|(a, b)| a.abs_diff(*b))
+                .max()
+                .unwrap_or(0);
+            assert!(
+                gpu_max_diff <= 3,
+                "standalone GPU negative-left-bearing shading must match live CPU within 3 LSB, max_diff={gpu_max_diff}"
+            );
+        }
+        Err(zpdf::gpu::WgpuRenderError::NoAdapter) => {
+            eprintln!("skipping GPU negative-left-bearing shading test (no adapter)");
+        }
+        Err(e) => panic!("GPU negative-left-bearing shading test failed: {e}"),
+    }
+}
+
+#[test]
+fn type3_soft_mask_stitching_transfer_with_sampled_child_matches_live() {
+    use zpdf::display_list::{Color, DisplayList, GlyphRun, Paint, PositionedGlyph, RenderCommand};
+    use zpdf_core::{Matrix, Rect};
+
+    // Soft mask `/G` paints left half gray 0.25 and right half gray 0.75.
+    // `/TR` is a Type 3 stitching function whose two `/Functions` children are
+    // indirect Type 0 sampled streams:
+    //   - `[0.0..0.5]` -> sampled `[255, 255]` (maps 0.25 -> 1.0 -> full red)
+    //   - `[0.5..1.0]` -> sampled `[0, 0]`     (maps 0.75 -> 0.0 -> white)
+    // If the sampled children are dropped, `/TR` falls back to identity and
+    // paints pale red on left and dark red on right instead.
+    let page_content = b"BT /F1 1 Tf (A) Tj ET";
+    let charproc = b"40 0 d0 /GSMask gs 1 0 0 rg 0 0 40 20 re f";
+    let mask_group_stream = b"0.25 g 0 0 20 20 re f 0.75 g 20 0 20 20 re f";
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 40 20] /Contents 4 0 R \
+          /Resources << /Font << /F1 5 0 R >> >> >>"
+            .to_vec(), // 3
+        stream_obj("", page_content),                  // 4
+        b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 40 20] \
+          /FontMatrix [1 0 0 1 0 0] /CharProcs << /A 6 0 R >> \
+          /Encoding << /Type /Encoding /Differences [65 /A] >> \
+          /FirstChar 65 /LastChar 65 /Widths [40] \
+          /Resources << /ExtGState << /GSMask 7 0 R >> >> >>"
+            .to_vec(), // 5
+        stream_obj("", charproc),                      // 6
+        b"<< /Type /ExtGState /SMask << /S /Luminosity /G 8 0 R /TR 9 0 R >> >>".to_vec(), // 7
+        stream_obj(
+            "/Type /XObject /Subtype /Form /BBox [0 0 40 20] \
+             /Group << /Type /Group /S /Transparency /CS /DeviceGray >>",
+            mask_group_stream,
+        ), // 8
+        b"<< /FunctionType 3 /Domain [0 1] /Bounds [0.5] /Encode [0 1 0 1] \
+          /Functions [10 0 R 11 0 R] >>"
+            .to_vec(), // 9
+        stream_obj(
+            "/FunctionType 0 /Domain [0 1] /Range [0 1] /Size [2] /BitsPerSample 8",
+            &[255, 255],
+        ), // 10
+        stream_obj(
+            "/FunctionType 0 /Domain [0 1] /Range [0 1] /Size [2] /BitsPerSample 8",
+            &[0, 0],
+        ), // 11
+    ]);
+
+    let doc = PdfDocument::open(pdf).expect("open pdf");
+    let page = doc.page(0).expect("page 0");
+    let mut fonts = doc.load_page_fonts(&page);
+    let content = doc.page_content_bytes(&page).expect("content bytes");
+    let mut live_images = ImageCache::new();
+    let live_dl = ContentInterpreter::new(page.media_box)
+        .with_fonts(&mut fonts)
+        .with_document(doc.file(), &page.resources)
+        .with_images(&mut live_images)
+        .interpret(&content);
+    let live_cpu = zpdf_render_cpu::CpuRenderer::new()
+        .with_fonts(&fonts)
+        .with_images(&live_images)
+        .render_display_list(&live_dl, 1.0)
+        .expect("live CPU");
+
+    let (font_id, _) = fonts.get_by_name("F1").expect("loaded F1");
+    let mut standalone_dl = DisplayList::new(Rect::new(0.0, 0.0, 40.0, 20.0));
+    standalone_dl.push(RenderCommand::DrawGlyphRun(GlyphRun {
+        font_id,
+        font_size: 1.0,
+        glyphs: vec![PositionedGlyph {
+            glyph_id: 65,
+            code_len: 1,
+            code: b'A' as u32,
+            x: 0.0,
+            y: 0.0,
+            advance: 40.0,
+        }],
+        paint: Paint::Solid(Color::black()),
+        alpha: 1.0,
+        overprint: None,
+        transform: Matrix::identity(),
+        h_scale: 1.0,
+    }));
+    let standalone_cpu = zpdf_render_cpu::CpuRenderer::new()
+        .with_fonts(&fonts)
+        .render_display_list(&standalone_dl, 1.0)
+        .expect("standalone CPU");
+
+    let px = |data: &[u8], w: u32, x: u32, y: u32| -> [u8; 3] {
+        let off = ((y * w + x) * 4) as usize;
+        [data[off], data[off + 1], data[off + 2]]
+    };
+    let assert_transfer = |label: &str, data: &[u8], w: u32| {
+        let left = px(data, w, 10, 10);
+        let right = px(data, w, 30, 10);
+        assert!(
+            left[0] > 240 && left[1] < 15 && left[2] < 15,
+            "{label}: left half (0.25 -> 1.0 via sampled child) must be solid red, got {left:?}"
+        );
+        assert!(
+            right[0] > 240 && right[1] > 240 && right[2] > 240,
+            "{label}: right half (0.75 -> 0.0 via sampled child) must be white, got {right:?}"
+        );
+    };
+    assert_transfer("live CPU", &live_cpu.data, live_cpu.width);
+    assert_transfer("standalone CPU", &standalone_cpu.data, standalone_cpu.width);
+
+    let cpu_max_diff = live_cpu
+        .data
+        .iter()
+        .zip(standalone_cpu.data.iter())
+        .map(|(a, b)| a.abs_diff(*b))
+        .max()
+        .unwrap_or(0);
+    assert!(
+        cpu_max_diff <= 2,
+        "standalone CPU stitching /TR with sampled child must match live CPU within 2 LSB, max_diff={cpu_max_diff}"
+    );
+
+    match render_gpu_shared(&standalone_dl, Some(&fonts), None, 1.0) {
+        Ok(standalone_gpu) => {
+            assert_transfer("standalone GPU", &standalone_gpu.data, standalone_gpu.width);
+            let gpu_max_diff = live_cpu
+                .data
+                .iter()
+                .zip(standalone_gpu.data.iter())
+                .map(|(a, b)| a.abs_diff(*b))
+                .max()
+                .unwrap_or(0);
+            assert!(
+                gpu_max_diff <= 2,
+                "standalone GPU stitching /TR with sampled child must match live CPU within 2 LSB, max_diff={gpu_max_diff}"
+            );
+        }
+        Err(zpdf::gpu::WgpuRenderError::NoAdapter) => {
+            eprintln!("skipping GPU stitching /TR sampled-child test (no adapter)");
+        }
+        Err(e) => panic!("GPU stitching /TR sampled-child test failed: {e}"),
+    }
+}
+
+#[test]
+fn type3_stitching_shading_reusing_sampled_subfunction_renders_both_intervals_within_budget() {
+    use zpdf::display_list::{Color, DisplayList, GlyphRun, Paint, PositionedGlyph, RenderCommand};
+    use zpdf_core::{Matrix, ParseLimits, Rect};
+
+    // Axial shading using a Type 3 stitching function whose two intervals
+    // (`[0..0.5]` with Encode `[0 1]`, `[0.5..1]` with Encode `[1 0]`) BOTH
+    // reference the SAME 16384-byte Type 0 sampled ramp `11 0 R` -> creates a
+    // symmetric 0 -> 1 -> 0 luminosity fade under a tight 30000-byte font cache
+    // budget (fits one 16384-byte payload + font/encoding/form/mask overhead,
+    // strictly less than two copies = 32768+ bytes).
+    let samples: Vec<u8> = (0..16_384).map(|i| ((i * 255) / 16_383) as u8).collect();
+    let page_content = b"BT /F1 1 Tf (A) Tj ET";
+    let charproc = b"80 0 d0 /GSFade gs 1 0 0 rg 0 0 80 20 re f";
+    let mask_group_stream = b"/Fade sh";
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 80 20] /Contents 4 0 R \
+          /Resources << /Font << /F1 5 0 R >> >> >>"
+            .to_vec(), // 3
+        stream_obj("", page_content),                  // 4
+        b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 80 20] \
+          /FontMatrix [1 0 0 1 0 0] /CharProcs << /A 6 0 R >> \
+          /Encoding << /Type /Encoding /Differences [65 /A] >> \
+          /FirstChar 65 /LastChar 65 /Widths [80] \
+          /Resources << /ExtGState << /GSFade 7 0 R >> >> >>"
+            .to_vec(), // 5
+        stream_obj("", charproc),                      // 6
+        b"<< /Type /ExtGState /SMask << /S /Luminosity /G 8 0 R >> >>".to_vec(), // 7
+        stream_obj(
+            "/Type /XObject /Subtype /Form /BBox [0 0 80 20] \
+             /Group << /Type /Group /S /Transparency /CS /DeviceGray >> \
+             /Resources << /Shading << /Fade 9 0 R >> >>",
+            mask_group_stream,
+        ), // 8
+        b"<< /ShadingType 2 /ColorSpace /DeviceGray /Coords [0 0 80 0] \
+          /Function 10 0 R /Extend [true true] >>"
+            .to_vec(), // 9
+        b"<< /FunctionType 3 /Domain [0 1] /Bounds [0.5] /Encode [0 1 1 0] \
+          /Functions [11 0 R 11 0 R] >>"
+            .to_vec(), // 10
+        stream_obj(
+            "/FunctionType 0 /Domain [0 1] /Range [0 1] /Size [16384] /BitsPerSample 8",
+            &samples,
+        ), // 11
+    ]);
+
+    let limits = ParseLimits {
+        max_font_cache_bytes: 30_000,
+        ..Default::default()
+    };
+    let doc = PdfDocument::open_with_limits(pdf, limits).expect("open pdf with tight budget");
+    let page = doc.page(0).expect("page 0");
+    let mut fonts = doc.load_page_fonts(&page);
+    let content = doc.page_content_bytes(&page).expect("content bytes");
+    let mut live_images = ImageCache::new();
+    let live_dl = ContentInterpreter::new(page.media_box)
+        .with_fonts(&mut fonts)
+        .with_document(doc.file(), &page.resources)
+        .with_images(&mut live_images)
+        .interpret(&content);
+    let live_cpu = zpdf_render_cpu::CpuRenderer::new()
+        .with_fonts(&fonts)
+        .with_images(&live_images)
+        .render_display_list(&live_dl, 1.0)
+        .expect("live CPU");
+
+    let (font_id, _) = fonts.get_by_name("F1").expect("loaded F1");
+    let mut standalone_dl = DisplayList::new(Rect::new(0.0, 0.0, 80.0, 20.0));
+    standalone_dl.push(RenderCommand::DrawGlyphRun(GlyphRun {
+        font_id,
+        font_size: 1.0,
+        glyphs: vec![PositionedGlyph {
+            glyph_id: 65,
+            code_len: 1,
+            code: b'A' as u32,
+            x: 0.0,
+            y: 0.0,
+            advance: 80.0,
+        }],
+        paint: Paint::Solid(Color::black()),
+        alpha: 1.0,
+        overprint: None,
+        transform: Matrix::identity(),
+        h_scale: 1.0,
+    }));
+    let standalone_cpu = zpdf_render_cpu::CpuRenderer::new()
+        .with_fonts(&fonts)
+        .render_display_list(&standalone_dl, 1.0)
+        .expect("standalone CPU");
+
+    let px = |data: &[u8], w: u32, x: u32, y: u32| -> [u8; 3] {
+        let off = ((y * w + x) * 4) as usize;
+        [data[off], data[off + 1], data[off + 2]]
+    };
+    let assert_symmetric_fade = |label: &str, data: &[u8], w: u32| {
+        let left = px(data, w, 2, 10);
+        let q1 = px(data, w, 20, 10);
+        let mid = px(data, w, 40, 10);
+        let q3 = px(data, w, 60, 10);
+        let right = px(data, w, 78, 10);
+        assert!(
+            left[0] > 240 && left[1] > 225 && left[2] > 225,
+            "{label}: left edge must fade to white, got {left:?}"
+        );
+        assert!(
+            q1[0] > 240 && q1[1].abs_diff(128) <= 12 && q1[2].abs_diff(128) <= 12,
+            "{label}: first interval midpoint (x=20) must be ~half-red, got {q1:?}"
+        );
+        assert!(
+            mid[0] > 240 && mid[1] < 20 && mid[2] < 20,
+            "{label}: peak (x=40) must be solid red, got {mid:?}"
+        );
+        assert!(
+            q3[0] > 240 && q3[1].abs_diff(128) <= 12 && q3[2].abs_diff(128) <= 12,
+            "{label}: second interval midpoint (x=60) must be ~half-red, got {q3:?}"
+        );
+        assert!(
+            right[0] > 240 && right[1] > 225 && right[2] > 225,
+            "{label}: right edge must fade back to white, got {right:?}"
+        );
+    };
+    assert_symmetric_fade("live CPU", &live_cpu.data, live_cpu.width);
+    assert_symmetric_fade("standalone CPU", &standalone_cpu.data, standalone_cpu.width);
+
+    let cpu_max_diff = live_cpu
+        .data
+        .iter()
+        .zip(standalone_cpu.data.iter())
+        .map(|(a, b)| a.abs_diff(*b))
+        .max()
+        .unwrap_or(0);
+    assert!(
+        cpu_max_diff <= 3,
+        "standalone CPU reused stitching subfunction must match live CPU within 3 LSB, max_diff={cpu_max_diff}"
+    );
+}
