@@ -1891,3 +1891,80 @@ fn multi_segment_tiling_applies_outer_shape_coverage_once_for_fill_stroke_and_gl
         "expected anti-aliased DrawGlyphRun edge pixels in 'O', found {aa_run_pixels}"
     );
 }
+
+/// Regression: a 7,000 × 7,000 raster (49M pixels, within the default 64M-pixel
+/// limit) already uses 196 MB, so allocating two full-size RGBA scratch buffers
+/// (588 MB total) would exceed the 512 MiB blend budget and silently drop even a
+/// small 50%-opacity `Multiply` fill or stroke. Sizing the coverage buffers to
+/// the clipped affected region (and banding large regions) keeps these marks
+/// visible and accurate within the existing budget.
+#[test]
+fn small_patterned_mark_on_7000x7000_raster_fits_blend_budget() {
+    let gs_mul = b"<< /Type /ExtGState /BM /Multiply >>".to_vec();
+    let gs_half = b"<< /Type /ExtGState /ca 0.5 /CA 0.5 >>".to_vec();
+    let cell_black = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 10 10] /XStep 10 /YStep 10 \
+         /Resources << /ExtGState << /GM 7 0 R >> >>",
+        b"/GM gs 0 0 0 rg 0 0 10 10 re f\n/GM gs 0 0 0 rg 0 0 10 10 re f",
+    );
+    let cell_white = stream_obj(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+         /BBox [0 0 10 10] /XStep 10 /YStep 10 \
+         /Resources << /ExtGState << /GM 7 0 R >> >>",
+        b"/GM gs 1 1 1 rg 0 0 10 10 re f",
+    );
+    // 1. Small 20×20 50%-opacity 2-seg black Multiply fill on white at (100.5, 100).
+    // 2. Small 20×20 50%-opacity white Multiply fill over a blue patch at (200, 100).
+    // 3. Small 50%-opacity 2-seg black Multiply stroke on white at x=300, y=100..120.
+    let content = stream_obj(
+        "",
+        b"0 0 1 rg 200 100 20 20 re f\n\
+          /GH gs /Pattern cs /PB scn 100.5 100 20 20 re f\n\
+          /Pattern cs /PW scn 200 100 20 20 re f\n\
+          /Pattern CS /PB SCN 10 w 300 100 m 300 120 l S",
+    );
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 7000 7000] /Contents 4 0 R \
+          /Resources << /Pattern << /PB 5 0 R /PW 6 0 R >> /ExtGState << /GH 8 0 R >> >> >>"
+            .to_vec(), // 3
+        content,                                       // 4
+        cell_black,                                    // 5
+        cell_white,                                    // 6
+        gs_mul,                                        // 7
+        gs_half,                                       // 8
+    ]);
+
+    let (_dl, _stats, page) = render_with_stats(pdf, 1.0);
+    assert_eq!((page.width, page.height), (7000, 7000));
+
+    // 1. Interior of 50%-opacity 2-seg black Multiply on white: ~128 (NOT 255 dropped, NOT ~64).
+    let fill_mid = px_on(&page, 7000.0, 1.0, 110.5, 110.5);
+    assert!(
+        fill_mid.iter().all(|&c| (122..=134).contains(&c)),
+        "50%-opacity black Multiply fill on 7000x7000 raster must paint ~128, got {fill_mid:?}"
+    );
+    // Half-covered edge at x=100.5 with 50% opacity: 0.5 * 0.5 = 0.25 black over white → ~191.
+    let fill_edge = px_on(&page, 7000.0, 1.0, 100.2, 110.5);
+    assert!(
+        fill_edge.iter().all(|&c| (185..=197).contains(&c)),
+        "half-covered 50%-opacity fill edge on 7000x7000 raster must be ~191, got {fill_edge:?}"
+    );
+
+    // 2. White Multiply over blue patch must stay pure blue (backdrop preserved).
+    let blue_mid = px_on(&page, 7000.0, 1.0, 210.5, 110.5);
+    assert_rgbish(
+        blue_mid,
+        [0, 0, 255],
+        "50%-opacity white Multiply over blue on 7000x7000 raster must stay blue",
+    );
+
+    // 3. 50%-opacity 2-seg black Multiply stroke on white: ~128.
+    let stroke_mid = px_on(&page, 7000.0, 1.0, 300.5, 110.5);
+    assert!(
+        stroke_mid.iter().all(|&c| (122..=134).contains(&c)),
+        "50%-opacity black Multiply stroke on 7000x7000 raster must paint ~128, got {stroke_mid:?}"
+    );
+}

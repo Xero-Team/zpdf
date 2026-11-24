@@ -21,10 +21,16 @@ pub struct CpuRenderer<'a> {
     /// anisotropic tile-pixel snapping when rasterizing a [`TilingPattern`] cell.
     scale_y: f32,
     /// Page rect bounds (supports CropBox / nonzero MediaBox origins):
-    /// device x = (x - rect_x0) * scale, device y = (rect_y1 - y) * scale.
+    /// device x = (x - rect_x0) * scale - dev_origin_x,
+    /// device y = (rect_y1 - y) * scale_y - dev_origin_y.
     rect_x0: f32,
     rect_y0: f32,
     rect_y1: f32,
+    /// Integer device-pixel origin of the active target surface relative to the
+    /// page raster (`(0, 0)` on the page itself; non-zero while rendering into a
+    /// sub-region or horizontal/vertical band in `with_backdrop_shape_coverage`).
+    dev_origin_x: u32,
+    dev_origin_y: u32,
     font_cache: Option<&'a FontCache>,
     image_cache: Option<&'a ImageCache>,
     /// Maximum pixels in one output raster. Oversized pages are uniformly
@@ -464,6 +470,11 @@ const MAX_CLIP_MASK_BYTES: u64 = 128 * 1024 * 1024;
 
 const MAX_DOWNSCALED_IMAGE_CACHE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_BLEND_SURFACE_BYTES: u64 = 512 * 1024 * 1024;
+/// Maximum combined byte size of the `(shape_buf, scratch)` band pair in
+/// [`CpuRenderer::with_backdrop_shape_coverage`] (32 MiB = 4M pixels per band).
+/// Small marks allocate only their clipped extent; huge marks on large rasters
+/// process in bands so they stay well inside [`MAX_BLEND_SURFACE_BYTES`].
+const MAX_COVERAGE_BAND_BYTES: u64 = 32 * 1024 * 1024;
 /// Surfaces [`CpuRenderer::surface_pool`] keeps at most.
 const MAX_POOLED_SURFACES: usize = 4;
 
@@ -561,6 +572,8 @@ impl<'a> CpuRenderer<'a> {
             rect_x0: 0.0,
             rect_y0: 0.0,
             rect_y1: 0.0,
+            dev_origin_x: 0,
+            dev_origin_y: 0,
             font_cache: None,
             image_cache: None,
             max_page_pixels: limits.max_page_pixels,
@@ -711,13 +724,13 @@ impl<'a> CpuRenderer<'a> {
     }
 
     /// Convert PDF Y coordinate (origin bottom-left) to pixel Y (origin top-left),
-    /// relative to the page rect's top edge.
+    /// relative to the active surface's top edge.
     fn flip_y(&self, y: f32) -> f32 {
-        (self.rect_y1 - y) * self.scale_y
+        (self.rect_y1 - y) * self.scale_y - self.dev_origin_y as f32
     }
 
     fn to_pixel_x(&self, x: f32) -> f32 {
-        (x - self.rect_x0) * self.scale
+        (x - self.rect_x0) * self.scale - self.dev_origin_x as f32
     }
 
     fn stroke_scale(&self) -> f32 {
@@ -818,7 +831,14 @@ impl<'a> CpuRenderer<'a> {
             &unscaled
         };
         let stroked = source.stroke(&unscaled_stroke, res_scale)?;
-        let scale_xf = tiny_skia::Transform::from_scale(self.scale, self.scale_y);
+        let scale_xf = tiny_skia::Transform::from_row(
+            self.scale,
+            0.0,
+            0.0,
+            self.scale_y,
+            -(self.dev_origin_x as f32),
+            -(self.dev_origin_y as f32),
+        );
         let device = stroked.transform(scale_xf)?;
         self.check_path_limits(device)
     }
@@ -836,7 +856,14 @@ impl<'a> CpuRenderer<'a> {
         let unscaled = self.build_unscaled_skia_path(path)?;
         let res_scale = self.scale.max(self.scale_y).clamp(0.01, 1024.0);
         let dashed = unscaled.dash(&dash, res_scale)?;
-        let scale_xf = tiny_skia::Transform::from_scale(self.scale, self.scale_y);
+        let scale_xf = tiny_skia::Transform::from_row(
+            self.scale,
+            0.0,
+            0.0,
+            self.scale_y,
+            -(self.dev_origin_x as f32),
+            -(self.dev_origin_y as f32),
+        );
         let device = dashed.transform(scale_xf)?;
         self.check_path_limits(device)
     }
@@ -1062,8 +1089,8 @@ impl<'a> CpuRenderer<'a> {
             0.0,
             0.0,
             -(self.scale_y as f64),
-            -(self.rect_x0 as f64) * self.scale as f64,
-            (self.rect_y1 as f64) * self.scale_y as f64,
+            -(self.rect_x0 as f64) * self.scale as f64 - self.dev_origin_x as f64,
+            (self.rect_y1 as f64) * self.scale_y as f64 - self.dev_origin_y as f64,
         );
         let pat_to_dev = page_to_dev.concat(&tiling.matrix);
         if ![
@@ -1191,6 +1218,8 @@ impl<'a> CpuRenderer<'a> {
                 rect_x0: bx0 as f32,
                 rect_y0: by0 as f32,
                 rect_y1: (by0 + abs_y) as f32,
+                dev_origin_x: 0,
+                dev_origin_y: 0,
                 font_cache: self.font_cache,
                 image_cache: self.image_cache,
                 max_page_pixels: self.max_page_pixels,
@@ -1402,17 +1431,39 @@ impl<'a> CpuRenderer<'a> {
 
     /// Evaluate a backdrop-dependent tiling pattern at full coverage (`1.0`)
     /// onto a backdrop-seeded scratch surface, while rasterizing the outer
-    /// shape (fill path, stroke outline, or glyph run, intersected with the
-    /// active clip) ONCE into a coverage surface, then merge the completed
-    /// pattern back into `self.pixmap` ONCE with `w = opacity * shape_coverage`
+    /// shape (fill path, stroke outline, or glyph run) ONCE into a coverage
+    /// surface, then merge the completed pattern back into `self.pixmap` ONCE
+    /// with `w = opacity * shape_coverage * clip_coverage`
     /// (ISO 32000-1 §11.4.5 / §11.6.7). Prevents anti-aliased outer edges from
     /// double-blending across multiple segments, overlapping copies, or tiles.
+    ///
+    /// Scratch surfaces are sized to the clipped affected region (and split
+    /// into bands when large) so even a small patterned mark or a full-page
+    /// mark on a large raster (e.g. 7,000 × 7,000) stays well inside
+    /// [`MAX_BLEND_SURFACE_BYTES`].
     fn with_backdrop_shape_coverage(
         &mut self,
         alpha: f32,
         scope_region: Option<PaintedBounds>,
-        rasterize_shape: impl FnOnce(&mut Self) -> Option<PaintedBounds>,
-        draw_pattern: impl FnOnce(&mut Self, PaintedBounds) -> bool,
+        rasterize_shape: impl FnMut(&mut Self, tiny_skia::Transform),
+        draw_pattern: impl FnMut(&mut Self, PaintedBounds) -> bool,
+    ) -> bool {
+        self.with_backdrop_shape_coverage_budgeted(
+            alpha,
+            scope_region,
+            MAX_COVERAGE_BAND_BYTES,
+            rasterize_shape,
+            draw_pattern,
+        )
+    }
+
+    fn with_backdrop_shape_coverage_budgeted(
+        &mut self,
+        alpha: f32,
+        scope_region: Option<PaintedBounds>,
+        max_band_bytes: u64,
+        mut rasterize_shape: impl FnMut(&mut Self, tiny_skia::Transform),
+        mut draw_pattern: impl FnMut(&mut Self, PaintedBounds) -> bool,
     ) -> bool {
         let opacity = unit(alpha);
         if opacity <= 0.0 {
@@ -1432,133 +1483,281 @@ impl<'a> CpuRenderer<'a> {
             self.pixmap = Some(backdrop);
             return false;
         }
-        let surface_bytes = w as u64 * h as u64 * 4;
-        let pooled_count = self
-            .surface_pool
-            .iter()
-            .filter(|p| (p.width(), p.height()) == (w, h))
-            .count();
-        let needed_new_bytes = 2usize.saturating_sub(pooled_count) as u64 * surface_bytes;
-        if needed_new_bytes > 0 && !self.surface_room(needed_new_bytes) {
+
+        let rw = initial_region.x1 - initial_region.x0;
+        let rh = initial_region.y1 - initial_region.y0;
+        let max_live_avail = MAX_BLEND_SURFACE_BYTES.saturating_sub(self.blend_surface_bytes);
+        if max_live_avail < 8 {
             self.pixmap = Some(backdrop);
             tracing::warn!("tiling shape coverage scratch exceeds memory budget");
             return false;
         }
-        let Some(shape_buf) = self.take_surface(w, h) else {
-            self.pixmap = Some(backdrop);
-            return false;
+        // Leave headroom inside `MAX_BLEND_SURFACE_BYTES` for nested opacity
+        // groups and cell tiles drawn inside the band.
+        let cap = max_band_bytes.max(8);
+        let preferred = (max_live_avail / 2).min(cap);
+        let band_budget = if preferred >= 8 {
+            preferred
+        } else {
+            max_live_avail.min(cap)
         };
-        let Some(mut scratch) = self.take_surface(w, h) else {
-            self.recycle_surface(shape_buf, None);
-            self.pixmap = Some(backdrop);
-            return false;
+        let max_band_pixels = (band_budget / 8).max(1);
+        let (band_w, band_h) = if (rw as u64) <= max_band_pixels {
+            (rw, (max_band_pixels / rw as u64).clamp(1, rh as u64) as u32)
+        } else {
+            (max_band_pixels.min(rw as u64) as u32, 1)
         };
 
         let backdrop_dirty = self.dirty.take();
-        self.blend_surface_bytes = self
-            .blend_surface_bytes
-            .saturating_add(surface_bytes.saturating_mul(2));
-
-        // 1. Rasterize the outer shape (under `self.current_clip`) ONCE into
-        //    `shape_buf` so its alpha channel holds exact outer AA coverage.
-        self.pixmap = Some(shape_buf);
-        let shape_dirty = rasterize_shape(self);
-        let shape_buf = self.pixmap.take();
-        let raster_dirty = self.dirty.take();
-
-        let Some(shape_buf) = shape_buf else {
-            self.recycle_surface(scratch, None);
-            self.blend_surface_bytes = self
-                .blend_surface_bytes
-                .saturating_sub(surface_bytes.saturating_mul(2));
-            self.dirty = backdrop_dirty;
-            self.pixmap = Some(backdrop);
-            return false;
-        };
-
-        let active_region = shape_dirty
-            .or(raster_dirty)
-            .map(|r| r.intersect(initial_region))
-            .unwrap_or(initial_region);
-        if active_region.is_empty() {
-            self.recycle_surface(shape_buf, raster_dirty);
-            self.recycle_surface(scratch, None);
-            self.blend_surface_bytes = self
-                .blend_surface_bytes
-                .saturating_sub(surface_bytes.saturating_mul(2));
-            self.dirty = backdrop_dirty;
-            self.pixmap = Some(backdrop);
-            return false;
-        }
-
-        // 2. Seed `scratch` with the live backdrop across `active_region` and
-        //    evaluate the full pattern at unclipped 1.0 coverage.
-        for_region_rows(active_region, w, |range| {
-            scratch.data_mut()[range.clone()].copy_from_slice(&backdrop.data()[range]);
-        });
         let saved_clip = self.current_clip.take();
         let saved_clip_bounds = self.clip_bounds.take();
-        self.pixmap = Some(scratch);
-        let painted = draw_pattern(self, active_region);
-        let scratch = self.pixmap.take();
-        let draw_dirty = self.dirty.take();
-        self.current_clip = saved_clip;
-        self.clip_bounds = saved_clip_bounds;
-        self.blend_surface_bytes = self
-            .blend_surface_bytes
-            .saturating_sub(surface_bytes.saturating_mul(2));
+        let saved_clip_stack = std::mem::take(&mut self.clip_stack);
+        let saved_mask_pool = std::mem::take(&mut self.mask_pool);
+        let saved_soft_masks = std::mem::take(&mut self.soft_mask_planes);
+        let saved_soft_mask_bytes = std::mem::replace(&mut self.soft_mask_cache_bytes, 0);
+        let saved_ox = self.dev_origin_x;
+        let saved_oy = self.dev_origin_y;
 
-        if let Some(scratch) = scratch {
-            if painted {
-                let s_data = shape_buf.data();
-                let src_data = scratch.data();
-                let dst_data = backdrop.data_mut();
-                let stride = w as usize;
-                for y in active_region.y0 as usize..active_region.y1 as usize {
-                    let row = y * stride;
-                    for x in active_region.x0 as usize..active_region.x1 as usize {
-                        let base = (row + x) * 4;
-                        let cov = s_data[base + 3];
-                        if cov == 0 {
+        let mut shape_buf: Option<tiny_skia::Pixmap> = None;
+        let mut scratch: Option<tiny_skia::Pixmap> = None;
+        let mut live_bytes: u64 = 0;
+        let mut any_painted = false;
+        let mut merged_dirty: Option<PaintedBounds> = None;
+
+        'bands: for by0 in (initial_region.y0..initial_region.y1).step_by(band_h as usize) {
+            let by1 = (by0 + band_h).min(initial_region.y1);
+            let cur_h = by1 - by0;
+            for bx0 in (initial_region.x0..initial_region.x1).step_by(band_w as usize) {
+                if self.over_budget {
+                    break 'bands;
+                }
+                let bx1 = (bx0 + band_w).min(initial_region.x1);
+                let cur_w = bx1 - bx0;
+
+                // Reuse the band pair across equal-sized bands; reallocate only
+                // on the first band or a narrower/shorter trailing edge band.
+                let dims_match = shape_buf
+                    .as_ref()
+                    .is_some_and(|p| p.width() == cur_w && p.height() == cur_h)
+                    && scratch
+                        .as_ref()
+                        .is_some_and(|p| p.width() == cur_w && p.height() == cur_h);
+                if dims_match {
+                    if let Some(ref mut sb) = shape_buf {
+                        sb.data_mut().fill(0);
+                    }
+                    if let Some(ref mut sc) = scratch {
+                        sc.data_mut().fill(0);
+                    }
+                } else {
+                    shape_buf = None;
+                    scratch = None;
+                    self.blend_surface_bytes = self.blend_surface_bytes.saturating_sub(live_bytes);
+                    live_bytes = 0;
+                    let pair_bytes = cur_w as u64 * cur_h as u64 * 8;
+                    if !self.surface_room(pair_bytes) {
+                        tracing::warn!("tiling shape coverage band exceeds memory budget");
+                        break 'bands;
+                    }
+                    let Some(sb) = tiny_skia::Pixmap::new(cur_w, cur_h) else {
+                        break 'bands;
+                    };
+                    let Some(sc) = tiny_skia::Pixmap::new(cur_w, cur_h) else {
+                        break 'bands;
+                    };
+                    self.blend_surface_bytes = self.blend_surface_bytes.saturating_add(pair_bytes);
+                    live_bytes = pair_bytes;
+                    shape_buf = Some(sb);
+                    scratch = Some(sc);
+                }
+
+                let Some(sbuf) = shape_buf.take() else {
+                    break 'bands;
+                };
+                let Some(mut sc) = scratch.take() else {
+                    shape_buf = Some(sbuf);
+                    break 'bands;
+                };
+
+                self.dev_origin_x = saved_ox.saturating_add(bx0);
+                self.dev_origin_y = saved_oy.saturating_add(by0);
+                // Band-local soft-mask planes are origin-dependent.
+                if !self.soft_mask_planes.is_empty() {
+                    self.soft_mask_planes.clear();
+                    self.soft_mask_cache_bytes = 0;
+                }
+
+                // 1. Rasterize the outer shape into `shape_buf` (unclipped;
+                //    `saved_clip` is folded once in step 5 with zero extra mask copy).
+                self.pixmap = Some(sbuf);
+                self.dirty = None;
+                let band_offset =
+                    tiny_skia::Transform::from_translate(-(bx0 as f32), -(by0 as f32));
+                rasterize_shape(self, band_offset);
+                let Some(sbuf) = self.pixmap.take() else {
+                    scratch = Some(sc);
+                    break 'bands;
+                };
+                let _ = self.dirty.take();
+
+                // 2. Locate exact tight bounds in band coordinates where both
+                //    outer shape coverage and active clip coverage are non-zero.
+                let s_data = sbuf.data();
+                let mut min_x = cur_w;
+                let mut min_y = cur_h;
+                let mut max_x = 0u32;
+                let mut max_y = 0u32;
+                let mut found = false;
+                let page_w = w as usize;
+                let bw_usize = cur_w as usize;
+                for ly in 0..cur_h {
+                    let s_row = ly as usize * bw_usize;
+                    let c_row = (by0 + ly) as usize * page_w;
+                    for lx in 0..cur_w {
+                        if s_data[(s_row + lx as usize) * 4 + 3] == 0 {
                             continue;
                         }
-                        let w_eff = opacity * (cov as f32 / 255.0);
-                        if w_eff >= 1.0 {
-                            dst_data[base..base + 4].copy_from_slice(&src_data[base..base + 4]);
-                        } else {
-                            let inv = 1.0 - w_eff;
-                            for ch in 0..4 {
-                                dst_data[base + ch] = (dst_data[base + ch] as f32 * inv
-                                    + src_data[base + ch] as f32 * w_eff)
-                                    .round()
-                                    .clamp(0.0, 255.0)
-                                    as u8;
+                        if let Some(ref cm) = saved_clip {
+                            if cm.data()[c_row + (bx0 + lx) as usize] == 0 {
+                                continue;
+                            }
+                        }
+                        found = true;
+                        min_x = min_x.min(lx);
+                        min_y = min_y.min(ly);
+                        max_x = max_x.max(lx);
+                        max_y = max_y.max(ly);
+                    }
+                }
+                if !found {
+                    shape_buf = Some(sbuf);
+                    scratch = Some(sc);
+                    continue;
+                }
+                let active_local = PaintedBounds {
+                    x0: min_x,
+                    y0: min_y,
+                    x1: max_x + 1,
+                    y1: max_y + 1,
+                };
+
+                // 3. Seed `scratch` from `backdrop` over `active_local`.
+                let row_bytes = (active_local.x1 - active_local.x0) as usize * 4;
+                let backdrop_data = backdrop.data();
+                let sc_data = sc.data_mut();
+                for ly in active_local.y0..active_local.y1 {
+                    let dst_off = (ly as usize * bw_usize + active_local.x0 as usize) * 4;
+                    let src_off =
+                        ((by0 + ly) as usize * page_w + (bx0 + active_local.x0) as usize) * 4;
+                    sc_data[dst_off..dst_off + row_bytes]
+                        .copy_from_slice(&backdrop_data[src_off..src_off + row_bytes]);
+                }
+
+                // 4. Evaluate the full pattern onto `scratch` at 1.0 coverage.
+                self.pixmap = Some(sc);
+                self.dirty = None;
+                let band_painted = draw_pattern(self, active_local);
+                let Some(sc) = self.pixmap.take() else {
+                    shape_buf = Some(sbuf);
+                    break 'bands;
+                };
+                let _ = self.dirty.take();
+
+                // 5. Merge `scratch` back into `backdrop` ONCE with
+                //    `w_eff = opacity * mul255(shape_alpha, clip_alpha) / 255`.
+                if band_painted {
+                    any_painted = true;
+                    let src_data = sc.data();
+                    let dst_data = backdrop.data_mut();
+                    for ly in active_local.y0..active_local.y1 {
+                        let s_row = ly as usize * bw_usize;
+                        let d_row = (by0 + ly) as usize * page_w;
+                        for lx in active_local.x0..active_local.x1 {
+                            let s_base = (s_row + lx as usize) * 4;
+                            let s_a = s_data[s_base + 3];
+                            if s_a == 0 {
+                                continue;
+                            }
+                            let page_x = (bx0 + lx) as usize;
+                            let cov = match saved_clip.as_ref() {
+                                Some(cm) => mul255(s_a, cm.data()[d_row + page_x]),
+                                None => s_a,
+                            };
+                            if cov == 0 {
+                                continue;
+                            }
+                            let w_eff = opacity * (cov as f32 / 255.0);
+                            let d_base = (d_row + page_x) * 4;
+                            if w_eff >= 1.0 {
+                                dst_data[d_base..d_base + 4]
+                                    .copy_from_slice(&src_data[s_base..s_base + 4]);
+                            } else {
+                                let inv = 1.0 - w_eff;
+                                for ch in 0..4 {
+                                    dst_data[d_base + ch] = (dst_data[d_base + ch] as f32 * inv
+                                        + src_data[s_base + ch] as f32 * w_eff)
+                                        .round()
+                                        .clamp(0.0, 255.0)
+                                        as u8;
+                                }
                             }
                         }
                     }
+                    let page_active = PaintedBounds {
+                        x0: bx0 + active_local.x0,
+                        y0: by0 + active_local.y0,
+                        x1: bx0 + active_local.x1,
+                        y1: by0 + active_local.y1,
+                    };
+                    merged_dirty = Some(match merged_dirty {
+                        Some(m) => m.union(page_active),
+                        None => page_active,
+                    });
                 }
-                self.dirty = Some(match backdrop_dirty {
-                    Some(b) => b.union(active_region),
-                    None => active_region,
-                });
-            } else {
-                self.dirty = backdrop_dirty;
+
+                shape_buf = Some(sbuf);
+                scratch = Some(sc);
             }
-            let scratch_clear = match draw_dirty {
-                Some(d) if !d.is_empty() => active_region.union(d),
-                _ => active_region,
-            };
-            self.recycle_surface(scratch, Some(scratch_clear));
-        } else {
-            self.dirty = backdrop_dirty;
         }
-        let shape_clear = match raster_dirty {
-            Some(d) if !d.is_empty() => active_region.union(d),
-            _ => active_region,
+
+        drop(shape_buf);
+        drop(scratch);
+        self.blend_surface_bytes = self.blend_surface_bytes.saturating_sub(live_bytes);
+
+        // Drop any band-sized surfaces left in `surface_pool` by nested
+        // `with_backdrop_opacity` calls so they do not occupy page pool slots.
+        let mut kept_bytes = 0u64;
+        self.surface_pool.retain(|p| {
+            let keep = p.width() == w && p.height() == h;
+            if keep {
+                kept_bytes = kept_bytes.saturating_add(surface_bytes(p));
+            }
+            keep
+        });
+        self.pooled_surface_bytes = kept_bytes;
+
+        // Drop any band-local clip masks and restore the caller's clip/origin state.
+        let band_mask_bytes: u64 = self
+            .mask_pool
+            .iter()
+            .map(|m| m.width() as u64 * m.height() as u64)
+            .sum();
+        self.clip_mask_bytes = self.clip_mask_bytes.saturating_sub(band_mask_bytes);
+        self.mask_pool = saved_mask_pool;
+        self.clip_stack = saved_clip_stack;
+        self.current_clip = saved_clip;
+        self.clip_bounds = saved_clip_bounds;
+        self.soft_mask_planes = saved_soft_masks;
+        self.soft_mask_cache_bytes = saved_soft_mask_bytes;
+        self.dev_origin_x = saved_ox;
+        self.dev_origin_y = saved_oy;
+
+        self.dirty = match (backdrop_dirty, merged_dirty) {
+            (Some(b), Some(m)) => Some(b.union(m)),
+            (b, m) => b.or(m),
         };
-        self.recycle_surface(shape_buf, Some(shape_clear));
         self.pixmap = Some(backdrop);
-        painted
+        any_painted
     }
 
     /// Execute a [`TilingBlendStep`] tree onto `self.pixmap` across `region`
@@ -1720,9 +1919,11 @@ impl<'a> CpuRenderer<'a> {
             return true;
         }
         if let Some(p) = self.pixmap.as_ref() {
-            let surf_x0 = self.rect_x0 as f64;
+            let surf_x0 =
+                self.rect_x0 as f64 + self.dev_origin_x as f64 / self.scale.max(1e-6) as f64;
             let surf_x1 = surf_x0 + p.width() as f64 / self.scale.max(1e-6) as f64;
-            let surf_y1 = self.rect_y1 as f64;
+            let surf_y1 =
+                self.rect_y1 as f64 - self.dev_origin_y as f64 / self.scale_y.max(1e-6) as f64;
             let surf_y0 = surf_y1 - p.height() as f64 / self.scale_y.max(1e-6) as f64;
             let pad = 1.0 / self.scale.min(self.scale_y).max(1.0) as f64;
             let x0 = page_bounds.x0.max(surf_x0 - pad);
@@ -1900,18 +2101,10 @@ impl<'a> CpuRenderer<'a> {
         self.with_backdrop_shape_coverage(
             opacity,
             scope,
-            |renderer| {
+            |renderer, band_offset| {
                 if let Some(ref mut target) = renderer.pixmap {
-                    target.fill_path(
-                        skia_path,
-                        &white,
-                        fill_rule,
-                        tiny_skia::Transform::identity(),
-                        renderer.current_clip.as_ref(),
-                    );
-                    renderer.mark_painted(skia_path.bounds(), 1.0);
+                    target.fill_path(skia_path, &white, fill_rule, band_offset, None);
                 }
-                renderer.dirty
             },
             |renderer, region| {
                 if Self::tiling_is_non_overlapping(tiling) {
@@ -1985,33 +2178,16 @@ impl<'a> CpuRenderer<'a> {
 
         let draw_stroke_shape = |target: &mut tiny_skia::Pixmap,
                                  paint: &tiny_skia::Paint<'_>,
+                                 xf: tiny_skia::Transform,
                                  clip: Option<&tiny_skia::Mask>| {
             if let Some(outline) = anisotropic_outline {
-                target.fill_path(
-                    outline,
-                    paint,
-                    tiny_skia::FillRule::Winding,
-                    tiny_skia::Transform::identity(),
-                    clip,
-                );
+                target.fill_path(outline, paint, tiny_skia::FillRule::Winding, xf, clip);
             } else if let Some(hairline) = anisotropic_hairline {
                 let mut hairline_stroke = Self::skia_stroke(style, 1.0, 1.0);
                 hairline_stroke.dash = None;
-                target.stroke_path(
-                    hairline,
-                    paint,
-                    &hairline_stroke,
-                    tiny_skia::Transform::identity(),
-                    clip,
-                );
+                target.stroke_path(hairline, paint, &hairline_stroke, xf, clip);
             } else {
-                target.stroke_path(
-                    skia_path,
-                    paint,
-                    stroke,
-                    tiny_skia::Transform::identity(),
-                    clip,
-                );
+                target.stroke_path(skia_path, paint, stroke, xf, clip);
             }
         };
 
@@ -2034,7 +2210,12 @@ impl<'a> CpuRenderer<'a> {
                         ..Default::default()
                     };
                     if let Some(ref mut target) = self.pixmap {
-                        draw_stroke_shape(target, &paint, self.current_clip.as_ref());
+                        draw_stroke_shape(
+                            target,
+                            &paint,
+                            tiny_skia::Transform::identity(),
+                            self.current_clip.as_ref(),
+                        );
                         if let Some(outline) = anisotropic_outline {
                             self.mark_painted(outline.bounds(), 1.0);
                         } else {
@@ -2057,16 +2238,10 @@ impl<'a> CpuRenderer<'a> {
         self.with_backdrop_shape_coverage(
             opacity,
             scope,
-            |renderer| {
+            |renderer, band_offset| {
                 if let Some(ref mut target) = renderer.pixmap {
-                    draw_stroke_shape(target, &white, renderer.current_clip.as_ref());
-                    if let Some(outline) = anisotropic_outline {
-                        renderer.mark_painted(outline.bounds(), 1.0);
-                    } else {
-                        renderer.mark_painted(skia_path.bounds(), grow);
-                    }
+                    draw_stroke_shape(target, &white, band_offset, None);
                 }
-                renderer.dirty
             },
             |renderer, region| {
                 if Self::tiling_is_non_overlapping(tiling) {
@@ -2419,14 +2594,15 @@ impl<'a> CpuRenderer<'a> {
                     }
 
                     // Multi-pass / overlapping / translucent glyph run: rasterize
-                    // glyph coverage ONCE into a scratch alpha surface, evaluate
-                    // the full pattern plan at 1.0 coverage, and apply glyph AA
-                    // coverage × object opacity ONCE.
+                    // glyph coverage ONCE into a region-sized scratch alpha
+                    // surface, evaluate the full pattern plan at 1.0 coverage,
+                    // and apply glyph AA coverage × object opacity ONCE.
+                    let scope = self.outline_glyph_run_scope(run, font);
                     let white = Self::color_to_paint(&Color::white(), 1.0);
                     self.with_backdrop_shape_coverage(
                         opacity,
-                        None,
-                        |renderer| {
+                        scope,
+                        |renderer, _band_offset| {
                             if font.is_type3() {
                                 let t = renderer.tick();
                                 renderer.render_type3_glyphs(run, font, &white, 1.0);
@@ -2434,7 +2610,6 @@ impl<'a> CpuRenderer<'a> {
                             } else {
                                 renderer.render_outline_glyphs(run, font, &white);
                             }
-                            renderer.dirty
                         },
                         |renderer, region| {
                             renderer.paint_tiling_plan_in_region(tiling, &steps, region)
@@ -3430,6 +3605,8 @@ impl<'a> CpuRenderer<'a> {
             rect_x0: self.rect_x0,
             rect_y0: self.rect_y0,
             rect_y1: self.rect_y1,
+            dev_origin_x: self.dev_origin_x,
+            dev_origin_y: self.dev_origin_y,
             font_cache: self.font_cache,
             image_cache: self.image_cache,
             max_page_pixels: self.max_page_pixels,
@@ -3716,12 +3893,12 @@ impl<'a> CpuRenderer<'a> {
         // tiny-skia `Transform::from_row(sx, ky, kx, sy, tx, ty)` maps
         // (x,y) → (sx*x + kx*y + tx, ky*x + sy*y + ty).
         let transform = tiny_skia::Transform::from_row(
-            a * sx / iw,                 // sx: screen_x per ix
-            -b * sy / iw,                // ky: screen_y per ix
-            -c * sx / ih,                // kx: screen_x per iy
-            d * sy / ih,                 // sy: screen_y per iy
-            (c + e - self.rect_x0) * sx, // tx
-            (self.rect_y1 - d - f) * sy, // ty
+            a * sx / iw,                                            // sx: screen_x per ix
+            -b * sy / iw,                                           // ky: screen_y per ix
+            -c * sx / ih,                                           // kx: screen_x per iy
+            d * sy / ih,                                            // sy: screen_y per iy
+            (c + e - self.rect_x0) * sx - self.dev_origin_x as f32, // tx
+            (self.rect_y1 - d - f) * sy - self.dev_origin_y as f32, // ty
         );
 
         let paint = tiny_skia::PixmapPaint {
@@ -3759,6 +3936,58 @@ impl<'a> CpuRenderer<'a> {
 
     fn render_image(&mut self, draw: &ImageDraw) {
         self.render_image_with_alpha(draw, draw.alpha)
+    }
+
+    /// Conservative device-space bounding box of an outline [`GlyphRun`] on the
+    /// active target surface, so `with_backdrop_shape_coverage` sizes its scratch
+    /// buffers to the run rather than the whole page. Returns `None` for Type 3
+    /// fonts (whose arbitrary glyph streams fall back to clipped/banded bounds).
+    fn outline_glyph_run_scope(
+        &mut self,
+        run: &GlyphRun,
+        font: &zpdf_font::LoadedFont,
+    ) -> Option<PaintedBounds> {
+        if font.is_type3() {
+            return None;
+        }
+        let (pw, ph) = self.pixmap.as_ref().map(|p| (p.width(), p.height()))?;
+        let upem = font.units_per_em as f32;
+        let mut x0 = f32::INFINITY;
+        let mut y0 = f32::INFINITY;
+        let mut x1 = f32::NEG_INFINITY;
+        let mut y1 = f32::NEG_INFINITY;
+        let mut any = false;
+        for glyph in &run.glyphs {
+            let Some(outline) = self.glyph_outline(run.font_id, font, glyph.glyph_id) else {
+                continue;
+            };
+            if let Some(path) = self.build_outline_transformed_path(
+                &outline,
+                upem,
+                run.font_size,
+                run.h_scale,
+                &run.transform,
+                glyph.x,
+                glyph.y,
+            ) {
+                let b = path.bounds();
+                x0 = x0.min(b.left());
+                y0 = y0.min(b.top());
+                x1 = x1.max(b.right());
+                y1 = y1.max(b.bottom());
+                any = true;
+            }
+        }
+        if !any {
+            return Some(PaintedBounds {
+                x0: 0,
+                y0: 0,
+                x1: 0,
+                y1: 0,
+            });
+        }
+        let rect = tiny_skia::Rect::from_ltrb(x0, y0, x1, y1)?;
+        Some(Self::drawn_extent(rect, 1.0, pw, ph))
     }
 
     fn render_outline_glyphs(
@@ -3906,8 +4135,8 @@ impl<'a> CpuRenderer<'a> {
         // page space → pixel space. The CTM's own orientation (including a
         // negative `d`) is honored as ordinary geometry, then the one fixed page
         // Y-flip is applied — the same affine used for paths and images.
-        let px = (page_x as f32 - self.rect_x0) * self.scale;
-        let py = (self.rect_y1 - page_y as f32) * self.scale_y;
+        let px = (page_x as f32 - self.rect_x0) * self.scale - self.dev_origin_x as f32;
+        let py = (self.rect_y1 - page_y as f32) * self.scale_y - self.dev_origin_y as f32;
         (px, py)
     }
 
@@ -4249,8 +4478,8 @@ impl<'a> CpuRenderer<'a> {
 
         // Step 5: page space → pixel space. The CTM's orientation is ordinary
         // geometry; the one fixed page Y-flip then maps to device pixels.
-        let px = (page_x as f32 - self.rect_x0) * self.scale;
-        let py = (self.rect_y1 - page_y as f32) * self.scale_y;
+        let px = (page_x as f32 - self.rect_x0) * self.scale - self.dev_origin_x as f32;
+        let py = (self.rect_y1 - page_y as f32) * self.scale_y - self.dev_origin_y as f32;
 
         (px, py)
     }
@@ -4718,6 +4947,8 @@ impl<'a> RenderBackend for CpuRenderer<'a> {
         self.rect_x0 = info.page_rect.x0 as f32;
         self.rect_y0 = info.page_rect.y0 as f32;
         self.rect_y1 = info.page_rect.y1 as f32;
+        self.dev_origin_x = 0;
+        self.dev_origin_y = 0;
         // Fresh clip + blend state + budget for each page (a renderer may be
         // reused). An unbalanced group from a prior page must not leak through.
         self.clip_stack.clear();
@@ -7082,5 +7313,125 @@ mod tests {
             (None, 0),
             "an untouched raster has no content and nothing to leak"
         );
+    }
+
+    /// Banding `with_backdrop_shape_coverage_budgeted` into tiny horizontal and
+    /// vertical tiles (under an active anti-aliased clip and a half-pixel shape
+    /// edge) must produce pixel-for-pixel identical RGBA output to a single band.
+    #[test]
+    fn with_backdrop_shape_coverage_banded_matches_single_band_pixel_for_pixel() {
+        let mut cell = DisplayList::new(Rect::new(0.0, 0.0, 8.0, 8.0));
+        let mut r1 = Path::new();
+        r1.move_to(Point::new(0.0, 0.0));
+        r1.line_to(Point::new(8.0, 0.0));
+        r1.line_to(Point::new(8.0, 8.0));
+        r1.line_to(Point::new(0.0, 8.0));
+        r1.close();
+        cell.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Multiply,
+            isolated: false,
+            knockout: false,
+            alpha: 1.0,
+            mask: None,
+            bounds: Rect::new(0.0, 0.0, 8.0, 8.0),
+        });
+        cell.push(RenderCommand::FillPath {
+            path: r1.clone(),
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(0.5, 0.8, 0.2)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        cell.push(RenderCommand::PopBlendGroup);
+        cell.push(RenderCommand::PushBlendGroup {
+            blend_mode: BlendMode::Multiply,
+            isolated: false,
+            knockout: false,
+            alpha: 1.0,
+            mask: None,
+            bounds: Rect::new(0.0, 0.0, 8.0, 8.0),
+        });
+        cell.push(RenderCommand::FillPath {
+            path: r1,
+            rule: FillRule::NonZero,
+            paint: Paint::Solid(Color::rgb(0.4, 0.6, 0.9)),
+            alpha: 1.0,
+            overprint: None,
+        });
+        cell.push(RenderCommand::PopBlendGroup);
+
+        let tiling = TilingPattern {
+            bbox: Rect::new(0.0, 0.0, 8.0, 8.0),
+            x_step: 8.0,
+            y_step: 8.0,
+            matrix: zpdf_core::Matrix::identity(),
+            commands: Arc::new(cell),
+            tiling_type: 1,
+        };
+        let steps = tiling.blend_steps().expect("blend steps");
+
+        let mut clip_path = Path::new();
+        clip_path.move_to(Point::new(12.5, 10.5));
+        clip_path.line_to(Point::new(56.5, 14.5));
+        clip_path.line_to(Point::new(52.5, 58.5));
+        clip_path.line_to(Point::new(8.5, 54.5));
+        clip_path.close();
+
+        let mut shape_path = Path::new();
+        shape_path.move_to(Point::new(10.5, 12.5));
+        shape_path.line_to(Point::new(54.5, 12.5));
+        shape_path.line_to(Point::new(54.5, 56.5));
+        shape_path.line_to(Point::new(10.5, 56.5));
+        shape_path.close();
+
+        let render_with_budget = |max_band_bytes: u64| -> Vec<u8> {
+            let mut renderer = CpuRenderer::new();
+            renderer
+                .begin_page(&PageRenderInfo {
+                    page_rect: Rect::new(0.0, 0.0, 64.0, 64.0),
+                    scale: 1.0,
+                    background: Color::rgb(0.9, 0.7, 0.5),
+                })
+                .expect("page");
+            renderer.push_clip(&clip_path, &FillRule::NonZero);
+            let skia_path = renderer.build_skia_path(&shape_path).expect("path");
+            let scope = renderer
+                .pixmap
+                .as_ref()
+                .map(|p| CpuRenderer::drawn_extent(skia_path.bounds(), 1.0, p.width(), p.height()));
+            let white = CpuRenderer::color_to_paint(&Color::white(), 1.0);
+            let painted = renderer.with_backdrop_shape_coverage_budgeted(
+                0.5,
+                scope,
+                max_band_bytes,
+                |r, band_offset| {
+                    if let Some(ref mut target) = r.pixmap {
+                        target.fill_path(
+                            &skia_path,
+                            &white,
+                            tiny_skia::FillRule::Winding,
+                            band_offset,
+                            None,
+                        );
+                    }
+                },
+                |r, region| r.paint_tiling_plan_in_region(&tiling, &steps, region),
+            );
+            assert!(painted, "expected banded coverage pass to paint");
+            renderer.pop_clip();
+            renderer.end_page().expect("end").data
+        };
+
+        let single = render_with_budget(MAX_COVERAGE_BAND_BYTES);
+        // 512 bytes = 64 pixels per band → forces horizontal strips (width 46, height 1).
+        let horizontal_bands = render_with_budget(512);
+        // 128 bytes = 16 pixels per band → forces both X and Y tiling (16×1 tiles).
+        let xy_tiles = render_with_budget(128);
+
+        assert_eq!(single, horizontal_bands);
+        assert_eq!(single, xy_tiles);
+        // Confirm the pattern actually modified pixels inside the clipped region.
+        let sample = ((32 * 64 + 32) * 4) as usize;
+        assert_ne!(&single[sample..sample + 3], &[230, 179, 128]);
     }
 }
