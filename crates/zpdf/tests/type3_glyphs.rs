@@ -720,3 +720,58 @@ fn type3_glyph_strokes_and_thin_fills_are_isolated_from_table_rule_capture() {
     assert!((rules[0].start - 10.0).abs() < 1e-6);
     assert!((rules[0].end - 200.0).abs() < 1e-6);
 }
+
+#[test]
+fn misplaced_d1_outside_charproc_does_not_lock_colours() {
+    // Form invoked from a d0 Type 3 glyph contains a misplaced `d1` before
+    // setting green fill; neither the Form nor the glyph after `/Fm1 Do` may
+    // have its colour operators locked.
+    let form_with_d1 = stream_obj(
+        "/Type /XObject /Subtype /Form /BBox [0 0 500 1000]",
+        b"1000 0 0 0 1000 1000 d1\n0 1 0 rg 0 0 500 1000 re f",
+    );
+    let glyph_d0 = stream_obj(
+        "/Resources << /XObject << /Fm1 9 0 R >> >>",
+        b"1000 0 d0\n/Fm1 Do\n0 0 1 rg 500 0 500 1000 re f",
+    );
+    // Page stream itself has a misplaced `d1` before setting red fill and
+    // painting a page rectangle, then draws the Type 3 glyph.
+    let content = b"0 0 0 rg\n\
+                    1000 0 0 0 1000 1000 d1\n\
+                    1 0 0 rg 10 20 60 60 re f\n\
+                    BT /F1 60 Tf 90 20 Td (A) Tj ET";
+
+    let pdf = assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), // 1
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), // 2
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 170 100] /Contents 4 0 R \
+          /Resources << /Font << /F1 5 0 R >> >> >>"
+            .to_vec(), // 3
+        stream_obj("", content),                       // 4
+        b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] \
+          /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs 6 0 R /Encoding 7 0 R \
+          /FirstChar 65 /LastChar 65 /Widths [1000] /Resources << >> >>"
+            .to_vec(), // 5
+        b"<< /A 8 0 R >>".to_vec(),                    // 6
+        b"<< /Type /Encoding /Differences [65 /A] >>".to_vec(), // 7
+        glyph_d0,                                      // 8
+        form_with_d1,                                  // 9
+    ]);
+
+    let (rendered, _, _, _) = render_and_extract(pdf);
+    assert_eq!(
+        px(&rendered, 40, 50),
+        [255, 0, 0],
+        "misplaced d1 in page stream must not lock subsequent rg to black"
+    );
+    assert_eq!(
+        px(&rendered, 105, 50),
+        [0, 255, 0],
+        "misplaced d1 inside Form called by d0 glyph must not lock Form rg"
+    );
+    assert_eq!(
+        px(&rendered, 135, 50),
+        [0, 0, 255],
+        "misplaced d1 inside Form must not leak colour lock into enclosing d0 glyph"
+    );
+}

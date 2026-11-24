@@ -2164,20 +2164,25 @@ impl<'a> ContentInterpreter<'a> {
             }
             "d1" => {
                 // wx wy llx lly urx ury d1: set glyph width and bbox, and lock
-                // colours to the enclosing non-stroking (fill) paint.
+                // colours to the enclosing non-stroking (fill) paint. Per
+                // ISO 32000-1 Table 113, `d1` is only valid in a Type 3
+                // CharProc stream; ignore misplaced `d1` in page, Form, or
+                // pattern streams so it cannot lock outer colour operators.
                 let _ury = self.pop_f64();
                 let _urx = self.pop_f64();
                 let _lly = self.pop_f64();
                 let _llx = self.pop_f64();
                 let _wy = self.pop_f64();
                 let _wx = self.pop_f64();
-                self.suppress_color_ops = true;
-                self.current.stroke_color = self.current.fill_color;
-                self.current.stroke_alpha = self.current.fill_alpha;
-                self.current.stroke_cs = self.current.fill_cs.clone();
-                self.current.stroke_pattern = self.current.fill_pattern.clone();
-                self.current.stroke_overprint = self.current.fill_overprint;
-                self.current.stroke_colorant = self.current.fill_colorant;
+                if self.type3_inline_ctx.is_some() {
+                    self.suppress_color_ops = true;
+                    self.current.stroke_color = self.current.fill_color;
+                    self.current.stroke_alpha = self.current.fill_alpha;
+                    self.current.stroke_cs = self.current.fill_cs.clone();
+                    self.current.stroke_pattern = self.current.fill_pattern.clone();
+                    self.current.stroke_overprint = self.current.fill_overprint;
+                    self.current.stroke_colorant = self.current.fill_colorant;
+                }
             }
 
             // -- Marked content --
